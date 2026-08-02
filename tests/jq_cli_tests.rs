@@ -2694,3 +2694,100 @@ fn test_uncaught_break_after_output_keeps_the_prefix() -> Result<()> {
     assert_eq!(code, 5);
     Ok(())
 }
+
+/// A `NumberLiteral` that overflows to infinity (e.g. `1e400`) used to render
+/// as garbage like `"NaNE+2147483647"` in every non-JSON text format instead
+/// of `"inf"`/`"-inf"` (#561). `tostring` reaches the fix directly, but
+/// `@uri`/`@html`/`@sh`/string interpolation/`@csv` are dispatched through
+/// `eval_generic`'s cursor-reindexing bridge, which round-trips the value
+/// through JSON text -- and used to substitute `"null"` for the overflowed
+/// value before the fix ever saw it. This test exercises the real CLI (not
+/// `eval.rs::eval()` directly) so it actually covers that bridge.
+#[test]
+fn test_number_literal_overflow_text_formats_via_cli() -> Result<()> {
+    let (output, code) = run_jq_stdin("tostring", "1e400", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#""inf""#);
+
+    let (output, code) = run_jq_stdin("tostring", "-1e400", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#""-inf""#);
+
+    let (output, code) = run_jq_stdin("@uri", "1e400", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#""inf""#);
+
+    let (output, code) = run_jq_stdin("@html", "1e400", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#""inf""#);
+
+    let (output, code) = run_jq_stdin("@sh", "1e400", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#""inf""#);
+
+    let (output, code) = run_jq_stdin(r#""\(.)""#, "1e400", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#""inf""#);
+
+    let (output, code) = run_jq_stdin("@csv", "[1e400]", &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#""inf""#);
+
+    Ok(())
+}
+
+/// The CLI's identity/raw-print path is a separate code path from the jq
+/// evaluator (it prints source number bytes straight through
+/// `format_number_jq_compat`), and had the same overflow-renders-as-garbage
+/// bug (#561): unlike JSON output's established "NaN/Infinity -> null"
+/// convention (`OwnedValue::to_json`), it printed
+/// `"NaNE+2147483647"` for `1e400 | .` instead of `null`.
+#[test]
+fn test_number_literal_overflow_identity_prints_null_via_cli() -> Result<()> {
+    let (output, code) = run_jq_stdin(".", "1e400", &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "null");
+
+    let (output, code) = run_jq_stdin(".", "-1e400", &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "null");
+
+    Ok(())
+}
+
+/// `eval_owned_expr`/`eval_owned_input` (backing `reduce`/`foreach`/`as $x`
+/// variable binding) and `with_entries`'s `owned_to_json_bytes` each have
+/// their own serialize-and-reparse bridge, separate from `eval_generic`'s
+/// (already covered by `test_number_literal_overflow_text_formats_via_cli`).
+/// Before switching these to `to_json_for_reindex`, they too silently turned
+/// an overflowed `NumberLiteral` into JSON `null`, so `. as $x | $x |
+/// tostring` printed `"null"` instead of `"inf"` even though a direct
+/// `tostring` was already fixed (#561).
+#[test]
+fn test_number_literal_overflow_owned_reindex_bridges_via_cli() -> Result<()> {
+    let (output, code) = run_jq_stdin(". as $x | $x | tostring", "1e400", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#""inf""#);
+
+    let (output, code) = run_jq_stdin(". as $x | $x | tostring", "-1e400", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#""-inf""#);
+
+    let (output, code) = run_jq_stdin("reduce (1) as $x (.; .) | tostring", "1e400", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#""inf""#);
+
+    let (output, code) = run_jq_stdin("foreach (1) as $x (.; .) | tostring", "1e400", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#""inf""#);
+
+    let (output, code) = run_jq_stdin(
+        "with_entries(.value |= (. | tostring))",
+        r#"{"a":1e400}"#,
+        &["-c"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#"{"a":"inf"}"#);
+
+    Ok(())
+}

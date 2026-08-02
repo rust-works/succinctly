@@ -504,6 +504,58 @@ impl OwnedValue {
             }
         }
     }
+
+    /// Serialize this value as JSON for `eval_generic`'s cursor-reindexing
+    /// bridge, preserving ±Infinity via a self-overflowing literal
+    /// (`1e999`/`-1e999`) instead of [`to_json`](Self::to_json)'s `"null"`
+    /// substitution.
+    ///
+    /// `to_json()`'s "null" is correct for actual JSON *output* (RFC 8259
+    /// forbids Infinity/NaN), but wrong for this purely-internal round-trip:
+    /// it silently destroys the NaN/Infinity information
+    /// `numeric_display_string()` (in `src/jq/eval.rs`) needs downstream once
+    /// the bridge re-parses this text and hands the cursor to the full
+    /// evaluator (#561). NaN has no self-overflowing JSON number literal and
+    /// isn't reachable from any path in this crate today, so it still falls
+    /// back to `"null"` here, same as `to_json()`.
+    pub(crate) fn to_json_for_reindex(&self) -> String {
+        match self {
+            Self::Float(f) if f.is_infinite() => overflow_literal(*f).to_string(),
+            Self::NumberLiteral(NumberRepr::Float(f), _) if f.is_infinite() => {
+                overflow_literal(*f).to_string()
+            }
+            Self::Array(arr) => {
+                let elements: Vec<String> = arr.iter().map(Self::to_json_for_reindex).collect();
+                format!("[{}]", elements.join(","))
+            }
+            Self::Object(obj) => {
+                let entries: Vec<String> = obj
+                    .iter()
+                    .map(|(k, v)| {
+                        format!(
+                            "\"{}\":{}",
+                            escape_json_body(write_json_body_jq, k),
+                            v.to_json_for_reindex()
+                        )
+                    })
+                    .collect();
+                format!("{{{}}}", entries.join(","))
+            }
+            other => other.to_json(),
+        }
+    }
+}
+
+/// A JSON number literal guaranteed to overflow to the correctly-signed
+/// infinity when parsed as `f64`, used only by
+/// [`OwnedValue::to_json_for_reindex`] to smuggle ±Infinity through a
+/// JSON-text round-trip.
+fn overflow_literal(f: f64) -> &'static str {
+    if f.is_sign_negative() {
+        "-1e999"
+    } else {
+        "1e999"
+    }
 }
 
 /// jq value equality.

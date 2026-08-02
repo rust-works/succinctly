@@ -114,7 +114,7 @@ fn eval_on_owned<S: EvalSemantics, V: DocumentValue>(
     owned: OwnedValue,
     optional: bool,
 ) -> GenericResult<V> {
-    let json_str = owned.to_json();
+    let json_str = owned.to_json_for_reindex();
     let json_bytes = json_str.as_bytes();
     let index = JsonIndex::build(json_bytes);
     let cursor = index.root(json_bytes);
@@ -952,7 +952,7 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
         _ => {
             // Convert to OwnedValue, then to JSON, then evaluate with full evaluator
             let owned = to_owned(&value);
-            let json_str = owned.to_json();
+            let json_str = owned.to_json_for_reindex();
             let json_bytes = json_str.as_bytes();
             let index = JsonIndex::build(json_bytes);
             let cursor = index.root(json_bytes);
@@ -1743,6 +1743,7 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
 
 #[cfg(test)]
 mod tests {
+    use super::super::expr::FormatType;
     use super::*;
     use crate::json::JsonIndex;
 
@@ -1833,6 +1834,29 @@ mod tests {
         let value = cursor.value();
 
         let result = eval(&Expr::Builtin(Builtin::ToString), value);
+        let owned = result.into_owned().unwrap();
+
+        assert_eq!(owned, OwnedValue::String("inf".to_string()));
+    }
+
+    #[test]
+    fn test_generic_format_overflow_literal_via_reindex_bridge() {
+        // `Expr::Format` (unlike `Expr::Builtin(ToString)` above) has no
+        // native arm in the generic evaluator, so it falls through the
+        // catch-all bridge that reserializes the value to JSON text and
+        // re-parses it before handing off to the full evaluator. That
+        // reserialization used to call `OwnedValue::to_json()`, which
+        // substitutes "null" for ±Infinity (correct for real JSON output,
+        // but not for this internal round-trip) -- silently destroying the
+        // overflowed literal before `eval.rs`'s (already-fixed) `@uri`
+        // formatting ever saw it (#561). This exercises that bridge
+        // directly, independent of the CLI.
+        let json = br"1e400";
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+
+        let result = eval(&Expr::Format(FormatType::Uri), value);
         let owned = result.into_owned().unwrap();
 
         assert_eq!(owned, OwnedValue::String("inf".to_string()));
