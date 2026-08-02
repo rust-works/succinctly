@@ -1863,6 +1863,23 @@ mod tests {
     }
 
     #[test]
+    fn test_generic_format_overflow_literal_negative_via_reindex_bridge() {
+        // Mirrors the test above but with a negative overflow, exercising
+        // `overflow_literal`'s negative-sign branch (`-1e999`) in
+        // `OwnedValue::to_json_for_reindex`, which the positive-only case
+        // above never reaches (#561).
+        let json = br"-1e400";
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+
+        let result = eval(&Expr::Format(FormatType::Uri), value);
+        let owned = result.into_owned().unwrap();
+
+        assert_eq!(owned, OwnedValue::String("-inf".to_string()));
+    }
+
+    #[test]
     fn test_generic_length() {
         let json = br"[1, 2, 3, 4, 5]";
         let index = JsonIndex::build(json);
