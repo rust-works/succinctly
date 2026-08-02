@@ -17285,6 +17285,256 @@ mod tests {
         );
     }
 
+    /// Render a `Vec<OwnedValue>` prefix as compact JSON strings, for
+    /// comparing a `QueryResult::Partial`'s prefix the same way `outputs()`
+    /// compares a whole stream.
+    fn prefix_json(vs: &[OwnedValue]) -> Vec<String> {
+        vs.iter().map(OwnedValue::to_json).collect()
+    }
+
+    #[test]
+    fn regression_issue_400_comma_keeps_the_prefix_before_an_error() {
+        // The root cause: before #400, any sibling erroring collapsed the
+        // whole comma to a bare `Error`, discarding `1`.
+        query!(b"null", r#"1,error("x")"#,
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(prefix_json(&vs), ["1"]);
+                assert_eq!(e.message, "x");
+            }
+        );
+        // Same shape with more than one surviving output.
+        query!(b"null", r#"1,2,error("x"),4"#,
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(prefix_json(&vs), ["1", "2"]);
+                assert_eq!(e.message, "x");
+            }
+        );
+        // A zero-prefix error is unaffected: still the bare variant.
+        query!(b"null", r#"error("x"),1"#,
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "x");
+            }
+        );
+    }
+
+    #[test]
+    fn regression_issue_400_pipe_keeps_the_prefix_before_an_error() {
+        // Verified against jq 1.7.1: `(1,2,error("x")) | .+10` is `11`, `12`,
+        // then the error.
+        query!(b"null", r#"(1,2,error("x")) | .+10"#,
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(prefix_json(&vs), ["11", "12"]);
+                assert_eq!(e.message, "x");
+            }
+        );
+    }
+
+    #[test]
+    fn regression_issue_400_as_binding_keeps_the_prefix_before_an_error() {
+        // Verified against jq 1.7.1: `(1,2,error("x")) as $v | $v + 10` is
+        // `11`, `12`, then the error.
+        query!(b"null", r#"(1,2,error("x")) as $v | $v + 10"#,
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(prefix_json(&vs), ["11", "12"]);
+                assert_eq!(e.message, "x");
+            }
+        );
+    }
+
+    #[test]
+    fn regression_issue_400_alternative_keeps_the_prefix_before_an_error() {
+        // `(1,error("x")) // 2` is `1`, then the error — not `2` (the old
+        // whole-stream collapse made the left side look like a bare error,
+        // so `//` fell through to the right).
+        query!(b"null", r#"(1,error("x")) // 2"#,
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(prefix_json(&vs), ["1"]);
+                assert_eq!(e.message, "x");
+            }
+        );
+        // The prefix is still truthy-filtered like any `//` left operand:
+        // `false` does not survive, but the error still does.
+        query!(b"null", r#"(1,false,error("x")) // 2"#,
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(prefix_json(&vs), ["1"]);
+                assert_eq!(e.message, "x");
+            }
+        );
+        // If filtering empties the prefix, it collapses back to a bare
+        // error rather than a `Partial` with nothing in it.
+        query!(b"null", r#"(false,false,error("x")) // 2"#,
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "x");
+            }
+        );
+    }
+
+    #[test]
+    fn regression_issue_400_boolean_keeps_the_prefix_before_a_control() {
+        // Verified against jq 1.7.1: the first left output pairs against the
+        // right operand's own prefix (`1`, truthy) before the right
+        // operand's error/break surfaces.
+        query!(b"null", r#"(true,true) and (1,error("x"))"#,
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(prefix_json(&vs), ["true"]);
+                assert_eq!(e.message, "x");
+            }
+        );
+        // Raw shape (no enclosing label to catch the break): the pairing's
+        // truthy prefix survives alongside the still-propagating break.
+        query!(b"null", "(true,true) and (1, break $out)",
+            QueryResult::Partial(vs, Control::Break(label)) => {
+                assert_eq!(prefix_json(&vs), ["true"]);
+                assert_eq!(label, "out");
+            }
+        );
+        query!(b"null", "(false,false) or (1, break $out)",
+            QueryResult::Partial(vs, Control::Break(label)) => {
+                assert_eq!(prefix_json(&vs), ["true"]);
+                assert_eq!(label, "out");
+            }
+        );
+        // With an enclosing label, the matching break is caught and the
+        // prefix is what's left — the issue's own example.
+        query!(b"null", "label $out | ((true,true) and (1, break $out))",
+            QueryResult::Owned(OwnedValue::Bool(true)) => {}
+        );
+        query!(b"null", "label $out | ((false,false) or (1, break $out))",
+            QueryResult::Owned(OwnedValue::Bool(true)) => {}
+        );
+    }
+
+    #[test]
+    fn regression_issue_400_try_catch_emits_the_prefix_then_the_handler() {
+        // Verified against jq 1.7.1: `try (1,2,error("x")) catch "caught:
+        // \(.)"` is `1`, `2`, `"caught: x"`.
+        assert_eq!(
+            outputs(b"null", r#"try (1,2,error("x")) catch "caught: \(.)""#),
+            ["1", "2", "\"caught: x\""]
+        );
+        // `try` still does not catch `break` (a separate, pre-existing
+        // divergence from jq tracked by #562) — the prefix survives, but the
+        // break keeps propagating (unconverted, since nothing here catches
+        // it) rather than running the catch handler.
+        query!(b"null", r#"try (1,2,break $out) catch "c""#,
+            QueryResult::Partial(vs, Control::Break(label)) => {
+                assert_eq!(prefix_json(&vs), ["1", "2"]);
+                assert_eq!(label, "out");
+            }
+        );
+    }
+
+    #[test]
+    fn regression_issue_400_label_break_emits_the_prefix_and_drops_the_control() {
+        // The issue's own example.
+        assert_eq!(
+            outputs(b"null", "label $out | 1,2,break $out,4"),
+            ["1", "2"]
+        );
+    }
+
+    #[test]
+    fn regression_issue_494_foreach_keeps_the_prefix_before_an_error() {
+        // Verified against jq 1.7.1: the update loop's own error.
+        assert_eq!(
+            outputs(
+                b"null",
+                "foreach (1,2,3) as $x (0; if $x == 3 then error(\"boom\") else .+$x end)"
+            ),
+            ["1", "3"]
+        );
+        // Verified against jq 1.7.1: the *input stream*'s own error, reached
+        // after processing the input values that came before it.
+        assert_eq!(
+            outputs(b"null", r#"foreach (1,2,error("x"),4) as $v (0; .+$v)"#),
+            ["1", "3"]
+        );
+    }
+
+    #[test]
+    fn regression_issue_494_while_keeps_the_prefix_before_an_error() {
+        query!(b"1", "while(. < 5; if . == 3 then error(\"boom\") else .+1 end)",
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(prefix_json(&vs), ["1", "2", "3"]);
+                assert_eq!(e.message, "boom");
+            }
+        );
+    }
+
+    #[test]
+    fn regression_issue_494_limit_keeps_the_prefix_before_an_error() {
+        // `n` is not reached before the error, so it still surfaces.
+        query!(b"null", r#"limit(3; 1,2,error("boom"),4)"#,
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(prefix_json(&vs), ["1", "2"]);
+                assert_eq!(e.message, "boom");
+            }
+        );
+        // `limit` never asks its operand for values past `n` (verified
+        // against jq 1.7.1), so once `n` is satisfied by the prefix, the
+        // trailing error never surfaces at all.
+        assert_eq!(
+            outputs(b"null", r#"limit(2; 1,2,error("boom"))"#),
+            ["1", "2"]
+        );
+        // A `break` used to be silently swallowed here; it now reaches its
+        // label with the prefix intact (raw shape, no enclosing label).
+        query!(b"null", "limit(5; 1,2,(3|break $out),4)",
+            QueryResult::Partial(vs, Control::Break(label)) => {
+                assert_eq!(prefix_json(&vs), ["1", "2"]);
+                assert_eq!(label, "out");
+            }
+        );
+        // With an enclosing label, the break is caught — the issue's own
+        // example.
+        query!(b"null", "label $out | limit(5; 1,2,(3|break $out),4)",
+            QueryResult::ManyOwned(vs) => {
+                assert_eq!(prefix_json(&vs), ["1", "2"]);
+            }
+        );
+    }
+
+    #[test]
+    fn regression_issue_400_first_last_nth_short_circuit_semantics() {
+        // `first` and `nth` never ask their operand for values past what
+        // they need, so a non-empty-enough prefix drops the trailing error
+        // (verified against jq 1.7.1); `last` never short-circuits, so it
+        // always sees the error.
+        query!(b"null", r#"first(1,2,error("x"))"#,
+            QueryResult::Owned(OwnedValue::Int(1)) => {}
+        );
+        query!(b"null", r#"nth(1; 1,2,error("x"))"#,
+            QueryResult::Owned(OwnedValue::Int(2)) => {}
+        );
+        query!(b"null", r#"nth(5; 1,2,error("x"))"#,
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "x");
+            }
+        );
+        query!(b"null", r#"last(1,2,error("x"))"#,
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "x");
+            }
+        );
+    }
+
+    #[test]
+    fn regression_issue_400_array_and_object_construction_stay_atomic() {
+        // Verified against jq 1.7.1: construction is atomic — an error
+        // partway through aborts with no output at all, unlike a bare
+        // top-level comma.
+        query!(b"null", r#"[1,error("x"),3]"#,
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "x");
+            }
+        );
+        query!(b"null", r#"{a:1,b:error("x")}"#,
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "x");
+            }
+        );
+    }
+
     #[test]
     fn test_complex_expressions() {
         // Comparison with arithmetic
