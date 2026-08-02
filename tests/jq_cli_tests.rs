@@ -2559,6 +2559,31 @@ fn test_uncaught_error_names_the_file_and_line() -> Result<()> {
 }
 
 #[test]
+fn test_uncaught_error_line_number_without_trailing_newline() -> Result<()> {
+    // #524: `line_at` reported one line too many whenever the erroring value
+    // is the last one and the input lacks a trailing newline. Every
+    // expectation here was captured against pinned jq 1.7.1-apple.
+
+    // Multi-value input with no trailing newline after the last value: real
+    // jq reports line 1 for *both* values, not line 2 for the second.
+    let (_keep, path) = temp_json("1\n2")?;
+    let (_, stderr, code) = run_jq_full(&["-c", r#"error("boom")"#, &path], None)?;
+    assert_eq!(code, 5);
+    assert_eq!(
+        stderr.trim_end(),
+        format!("jq: error (at {path}:1): boom\njq: error (at {path}:1): boom")
+    );
+
+    // A container value spanning multiple lines with no trailing newline:
+    // real jq names its closing brace's line, not one past it.
+    let (_keep, path) = temp_json("{\n\"a\":1\n}")?;
+    let (_, stderr, code) = run_jq_full(&["-c", r#"error("boom")"#, &path], None)?;
+    assert_eq!(code, 5);
+    assert_eq!(stderr.trim_end(), format!("jq: error (at {path}:2): boom"));
+    Ok(())
+}
+
+#[test]
 fn test_uncaught_error_on_any_input_fails_the_run() -> Result<()> {
     // DELIBERATE DIVERGENCE FROM jq. jq's exit code reflects only the *last*
     // input, so an error on any earlier one exits 0 -- the exact

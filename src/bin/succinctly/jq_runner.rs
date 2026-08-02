@@ -2198,6 +2198,34 @@ mod tests {
     }
 
     #[test]
+    fn test_line_at() {
+        // Single value, no trailing newline: jq's counter never advances (#524).
+        let bytes = br#"{"a":1}"#;
+        assert_eq!(line_at(bytes, bytes.len()), 0);
+
+        // Multi-value, no trailing newline after the last value: both values
+        // report the same line jq does, not "line of value + 1" (#524).
+        let bytes = b"1\n2";
+        let ends = find_json_values(bytes);
+        assert_eq!(ends, vec![(0, 1), (2, 3)]);
+        assert_eq!(line_at(bytes, 1), 1); // "1" ends before the '\n' lookahead
+        assert_eq!(line_at(bytes, 3), 1); // "2" ends at EOF, no lookahead byte
+
+        // Container value spanning multiple lines, no trailing newline: jq
+        // names the line the value's closing brace is on, not one past it
+        // (#524 -- the naive "1 + newlines-before-end" formula overcounts).
+        let bytes = b"{\n\"a\":1\n}";
+        assert_eq!(line_at(bytes, bytes.len()), 2);
+
+        // With a trailing newline after every value, the lookahead-aware
+        // formula agrees with plain "count of newlines up to and including
+        // the delimiter" -- unaffected by this fix.
+        let bytes = b"1\n2\n";
+        assert_eq!(line_at(bytes, 1), 1);
+        assert_eq!(line_at(bytes, 3), 2);
+    }
+
+    #[test]
     fn test_trim_ascii_ws() {
         assert_eq!(trim_ascii_ws(b"  x  "), b"x");
         assert_eq!(trim_ascii_ws(b"abc"), b"abc");
