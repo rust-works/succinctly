@@ -19,8 +19,9 @@ use indexmap::IndexMap;
 
 use super::document::{DocumentCursor, DocumentElements, DocumentFields, DocumentValue};
 use super::eval::{
-    compare_values, eval as full_eval, index_one_owned as index_owned_by_key, numeric_key_to_index,
-    tonumber_from_str, Control, EvalError, EvalSemantics, JqSemantics, QueryResult,
+    compare_values, eval as full_eval, index_one_owned as index_owned_by_key,
+    numeric_display_string, numeric_key_to_index, tonumber_from_str, Control, EvalError,
+    EvalSemantics, JqSemantics, QueryResult,
 };
 use super::expr::{Builtin, CompareOp, Expr, Literal};
 use super::value::OwnedValue;
@@ -113,7 +114,7 @@ fn eval_on_owned<S: EvalSemantics, V: DocumentValue>(
     owned: OwnedValue,
     optional: bool,
 ) -> GenericResult<V> {
-    let json_str = owned.to_json();
+    let json_str = owned.to_json_for_reindex();
     let json_bytes = json_str.as_bytes();
     let index = JsonIndex::build(json_bytes);
     let cursor = index.root(json_bytes);
@@ -951,7 +952,7 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
         _ => {
             // Convert to OwnedValue, then to JSON, then evaluate with full evaluator
             let owned = to_owned(&value);
-            let json_str = owned.to_json();
+            let json_str = owned.to_json_for_reindex();
             let json_bytes = json_str.as_bytes();
             let index = JsonIndex::build(json_bytes);
             let cursor = index.root(json_bytes);
@@ -1579,7 +1580,7 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                 OwnedValue::Null => "null".to_string(),
                 OwnedValue::Bool(b) => b.to_string(),
                 OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..) => {
-                    owned.number_str().expect("numeric variant").into_owned()
+                    numeric_display_string(&owned)
                 }
                 OwnedValue::String(s) => s.clone(),
                 OwnedValue::Array(_) | OwnedValue::Object(_) => owned.to_json(),
@@ -1742,6 +1743,7 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
 
 #[cfg(test)]
 mod tests {
+    use super::super::expr::FormatType;
     use super::*;
     use crate::json::JsonIndex;
 
@@ -1820,6 +1822,61 @@ mod tests {
         let owned = result.into_owned().unwrap();
 
         assert_eq!(owned, OwnedValue::String("object".to_string()));
+    }
+
+    #[test]
+    fn test_generic_tostring_overflow_literal_renders_as_inf() {
+        // Mirrors eval.rs's test_number_literal_overflow_renders_as_inf_not_garbage
+        // (#561): the generic evaluator's ToString arm had the same bug.
+        let json = br"1e400";
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+
+        let result = eval(&Expr::Builtin(Builtin::ToString), value);
+        let owned = result.into_owned().unwrap();
+
+        assert_eq!(owned, OwnedValue::String("inf".to_string()));
+    }
+
+    #[test]
+    fn test_generic_format_overflow_literal_via_reindex_bridge() {
+        // `Expr::Format` (unlike `Expr::Builtin(ToString)` above) has no
+        // native arm in the generic evaluator, so it falls through the
+        // catch-all bridge that reserializes the value to JSON text and
+        // re-parses it before handing off to the full evaluator. That
+        // reserialization used to call `OwnedValue::to_json()`, which
+        // substitutes "null" for ±Infinity (correct for real JSON output,
+        // but not for this internal round-trip) -- silently destroying the
+        // overflowed literal before `eval.rs`'s (already-fixed) `@uri`
+        // formatting ever saw it (#561). This exercises that bridge
+        // directly, independent of the CLI.
+        let json = br"1e400";
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+
+        let result = eval(&Expr::Format(FormatType::Uri), value);
+        let owned = result.into_owned().unwrap();
+
+        assert_eq!(owned, OwnedValue::String("inf".to_string()));
+    }
+
+    #[test]
+    fn test_generic_format_overflow_literal_negative_via_reindex_bridge() {
+        // Mirrors the test above but with a negative overflow, exercising
+        // `overflow_literal`'s negative-sign branch (`-1e999`) in
+        // `OwnedValue::to_json_for_reindex`, which the positive-only case
+        // above never reaches (#561).
+        let json = br"-1e400";
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+
+        let result = eval(&Expr::Format(FormatType::Uri), value);
+        let owned = result.into_owned().unwrap();
+
+        assert_eq!(owned, OwnedValue::String("-inf".to_string()));
     }
 
     #[test]
