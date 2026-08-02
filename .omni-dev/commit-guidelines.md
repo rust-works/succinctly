@@ -1,4 +1,4 @@
-# omni-dev Commit Guidelines
+# succinctly Commit Guidelines
 
 This project follows conventional commit format with specific requirements.
 
@@ -47,15 +47,16 @@ be updated alongside it:
 - `json` - JSON semi-indexing and parsing
 - `yaml` - YAML semi-indexing and parsing
 - `jq` - jq query language parser and evaluator
+- `dsv` - DSV/CSV semi-indexing and parsing
 - `simd` - SIMD optimizations (x86, AVX2, NEON)
+- `core` - Core utilities (broadword, tables, binary ops, text/UTF-8 helpers)
 - `cli` - Command-line interface tool
 - `bench` - Benchmarks and performance testing
 - `test` - Test suite and property tests
 - `docs` - Documentation and optimization notes
-- `ci` - CI/CD pipelines and GitHub Actions
+- `ci` - CI/CD pipelines, GitHub Actions, and commit-lint configuration
 - `build` - Build configuration and feature flags
 - `scripts` - Developer and repository maintenance shell scripts
-- `core` - Core utilities (broadword, tables, binary ops)
 
 ## Subject Line
 
@@ -102,24 +103,24 @@ fix(cli): handle missing config file gracefully
 
 ### Feature with body
 ```
-feat(claude): add contextual intelligence for commit message improvement
+feat(yaml): stream YAML directly to JSON output
 
-Implements Phase 3 of the twiddle command enhancement with multi-layer
-context discovery including project conventions, branch analysis, and
-work pattern detection.
+Eliminates the intermediate OwnedValue DOM by streaming directly from
+the YAML cursor to JSON, avoiding a full in-memory materialization
+pass before output.
 
-- Add project context discovery from .omni-dev/ configuration
-- Implement branch naming pattern analysis
-- Add work pattern detection across commit ranges
-- Enhance Claude prompting with contextual intelligence
+- Add single-pass escape transcoding for string values
+- Wire the streaming path into the yq CLI identity query
+- Update benchmarks to reflect the new throughput
 
 Closes #12
 ```
 
 ### Breaking change
 ```
-feat(api)!: change amendment response format to YAML
+feat(jq)!: change tostream event shape to match jq's [path,value] form
 
-BREAKING CHANGE: The amendment API now returns YAML instead of JSON.
-Update clients to use a YAML parser for response handling.
+BREAKING CHANGE: tostream now emits jq's standard [path,value]/[path]
+event pairs instead of the previous non-standard shape. Update callers
+that pattern-match on tostream output.
 ```
