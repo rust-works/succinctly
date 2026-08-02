@@ -309,6 +309,10 @@ Two precedence divergences from jq remain:
 
 **Note:** Array slicing with steps (`.[::2]`) is intentionally not supported - it's Python syntax, not jq. Use `[range(0; length; 2) as $i | .[$i]]` instead.
 
+**`try`/`catch` does not catch `break`** (#562), where jq's `catch` does:
+`label $out | try break $out catch "c"` prints nothing here, but `"c"` in
+jq. A `break` still passes through `try` untouched to its enclosing `label`.
+
 **Multi-output expressions in non-fanout positions** parse but don't fan out
 the way jq does. Some silently take only the first output: `"\(1,2)"`,
 `{a: (1,2)}`, and `select(.==1, .==3)` (the condition's second branch is
@@ -318,26 +322,6 @@ numeric` and a computed object key `{(("a","b")): 1}` reports `key must be a
 string`, rather than jq's one result per output. Before #462 several of these
 were parse errors rather than wrong answers, since the comma could not be
 written without parens.
-
-**A bare top-level comma after `label $out |` can reach `break`**, which
-discards the comma siblings already emitted before it instead of keeping
-them: `label $out | 1,2,break $out,4` prints nothing, where jq prints `1`
-then `2`. This is the pre-existing `eval_comma`/`QueryResult`
-per-stream-not-per-output architectural gap tracked by #400, newly reachable
-now that `label` bodies accept commas without parens (#462).
-
-**An error also discards the outputs already emitted before it** — the same gap
-reached by an error rather than a `break`. jq streams what it produced and
-*then* fails; here the prefix is lost and only the failure survives. The exit
-code (5) and the diagnostic are byte-identical to jq, so stdout alone differs:
-`(1,error("x")) // 2` prints nothing where jq prints `1` (#400), and
-`limit(3; 1,2,error("boom"),4)`,
-`while(. < 5; if . == 3 then error("boom") else .+1 end)` and
-`foreach (1,2,3) as $x (0; if $x == 3 then error("boom") else .+$x end)`
-likewise print nothing where jq prints `1 2`, `1 2 3` and `1 3` (#494). All
-four are pinned as `*_error_after_output` golden cases, which assert the
-streamed prefix and the exit code together so neither half can be fixed alone
-unnoticed.
 
 **Computed keys in brackets** (#360) accept any expression, but two jq behaviours are not reproduced:
 
