@@ -110,7 +110,7 @@ pub enum QueryResult<'a, W = Vec<u64>> {
     ///
     /// `Error`/`Break` remain the zero-prefix case — every terminal raise
     /// deep in a builtin still constructs them directly, unchanged. The
-    /// prefix is always non-empty by construction (see [`partial`]); an
+    /// prefix is always non-empty by construction (see `partial`); an
     /// empty prefix normalizes to bare `Error`/`Break`.
     Partial(Vec<OwnedValue>, Control),
 }
