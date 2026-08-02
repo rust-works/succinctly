@@ -48,6 +48,15 @@
 # surfaced a distinct, pre-existing gap — try/catch not catching break — but
 # #562 fixed that separately (and landed first), and the #400/#494 branch
 # extended the same fix to a Partial-prefixed break, so the count stays 10.
+#
+# #572 added four more cases from #534's own body: reduce_update_zero_output,
+# foreach_extract_fanout, while_backtrack and until_backtrack. Unlike the
+# already-pinned INIT-forking pair above (silent wrong answers), the interim
+# parse_pipe_no_comma() restriction #534 describes rejects all four outright
+# — jq succeeds with real output, succinctly exits 1 on a compile error, so
+# no expected.status/expected.err is needed (those encode jq's own failure,
+# and jq doesn't fail here); the mismatch is the bare exit-code branch in
+# tests/jq_golden_tests.rs, taking the file to 14.
 
 comma_literal_before_document  comma              . evaluates before the literal 1 inside [1, .], reversing output order — #353
 object_construct_cartesian     object_construct   only the first output of each key/value generator is used instead of the cartesian product — #354
@@ -59,3 +68,7 @@ recurse_null_child             recurse            recurse on {"a":null} stops be
 slice_computed_bounds          slice              computed slice bounds (.a[.k:2]) are a parse error; only integer literals are accepted — #499
 reduce_multi_output_init       reduce             a multi-output reduce INIT forks in jq; only the first init output is used — #534
 foreach_multi_output_init      foreach            a multi-output foreach INIT forks in jq; only the first init output is used — #534
+reduce_update_zero_output      reduce             a comma in reduce's UPDATE clause is a compile error; jq keeps only UPDATE's last output as the new state, discarding earlier ones — #534
+foreach_extract_fanout         foreach            a comma in foreach's EXTRACT clause is a compile error; jq emits once per EXTRACT output instead of collapsing to one — #534
+while_backtrack                while              a comma in while's update expression is a compile error; jq backtracks through every fork of the condition/update chain — #534
+until_backtrack                until              a comma in until's update expression is a compile error; jq backtracks through every fork of the condition/update chain — #534
