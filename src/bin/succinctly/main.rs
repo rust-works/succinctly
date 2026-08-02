@@ -726,6 +726,9 @@ enum YamlPatternArg {
     /// Top-level sequence of childless bare-dash items (`-` alone on its own
     /// line, reads as `null`) — the shape #337 found quadratic
     EmptyItems,
+    /// Childless bare-dash items interleaved with items carrying inline
+    /// scalar content (`- x`)
+    HalfEmptyItems,
 }
 
 impl From<YamlPatternArg> for yaml_generators::YamlPattern {
@@ -748,6 +751,7 @@ impl From<YamlPatternArg> for yaml_generators::YamlPattern {
             YamlPatternArg::ExplicitKeys => Self::ExplicitKeys,
             YamlPatternArg::MultiDoc => Self::MultiDoc,
             YamlPatternArg::EmptyItems => Self::EmptyItems,
+            YamlPatternArg::HalfEmptyItems => Self::HalfEmptyItems,
         }
     }
 }

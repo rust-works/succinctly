@@ -31,13 +31,13 @@
 //!
 //! # Shape guards, not features (#516)
 //!
-//! `empty-items` does not carry a *construct* absent elsewhere — a childless
-//! bare-dash item parses the same as any other sequence item. It exists
-//! because #337 found that exact shape quadratic while every generator only
-//! ever emitted `- ` items with content nested underneath, so the regression
-//! (and its later, incidental fix) had zero benchmark coverage. Per
-//! `docs/guides/benchmarking.md` rule 7: a benchmark cannot measure a shape it
-//! does not generate.
+//! `empty-items` and `half-empty-items` do not carry a *construct* absent
+//! elsewhere — a childless bare-dash item parses the same as any other
+//! sequence item. They exist because #337 found that exact shape quadratic
+//! while every generator only ever emitted `- ` items with content nested
+//! underneath, so the regression (and its later, incidental fix) had zero
+//! benchmark coverage. Per `docs/guides/benchmarking.md` rule 7: a benchmark
+//! cannot measure a shape it does not generate.
 //!
 //! # Why this file exists in this shape (#327)
 //!
@@ -88,6 +88,9 @@ pub enum YamlPattern {
     /// Top-level sequence of childless bare-dash items (`-\n` repeated) — the
     /// shape #337 found quadratic and no other pattern generates
     EmptyItems,
+    /// Childless bare-dash items interleaved with items carrying inline
+    /// scalar content (`- x`)
+    HalfEmptyItems,
 }
 
 /// How the suite generator sizes a pattern.
@@ -153,6 +156,11 @@ pub const ALL_PATTERNS: &[(&str, YamlPattern, PatternScale)] = &[
         YamlPattern::EmptyItems,
         PatternScale::Scalable,
     ),
+    (
+        "half-empty-items",
+        YamlPattern::HalfEmptyItems,
+        PatternScale::Scalable,
+    ),
 ];
 
 /// Generate YAML of approximately target_size bytes
@@ -175,6 +183,7 @@ pub fn generate_yaml(target_size: usize, pattern: YamlPattern, seed: Option<u64>
         YamlPattern::ExplicitKeys => generate_explicit_keys(target_size, seed),
         YamlPattern::MultiDoc => generate_multidoc(target_size, seed),
         YamlPattern::EmptyItems => generate_empty_items(target_size),
+        YamlPattern::HalfEmptyItems => generate_half_empty_items(target_size),
     }
 }
 
@@ -926,6 +935,32 @@ fn generate_empty_items(target_size: usize) -> String {
     yaml
 }
 
+/// Generate a sequence interleaving childless bare-dash items with items
+/// carrying inline scalar content (`- x`).
+///
+/// `empty_items` alone is the uniform, easiest-to-optimize-for shape; #516
+/// asks for a mix as the more realistic case — a document with a run of
+/// populated entries interrupted by empty placeholders, which is what a
+/// quadratic-in-item-count bug would still show up on.
+fn generate_half_empty_items(target_size: usize) -> String {
+    let mut yaml = String::with_capacity(target_size);
+    yaml.push_str("# Half childless, half inline-content bare-dash items (#516)\n");
+
+    let start_len = yaml.len();
+    let mut count = 0;
+
+    while yaml.len().saturating_sub(start_len) < target_size {
+        if count % 2 == 0 {
+            yaml.push_str("-\n");
+        } else {
+            yaml.push_str(&format!("- item_{count}\n"));
+        }
+        count += 1;
+    }
+
+    yaml
+}
+
 // ============================================================================
 // Helper functions
 // ============================================================================
@@ -1457,6 +1492,16 @@ mod tests {
             }
             other => panic!("expected a top-level sequence, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_generate_half_empty_items() {
+        let yaml = generate_yaml(2048, YamlPattern::HalfEmptyItems, Some(42));
+        assert!(yaml.contains("\n-\n"), "no childless bare-dash item");
+        assert!(yaml.contains("- item_"), "no item carrying inline content");
+
+        succinctly::yaml::YamlIndex::build(yaml.as_bytes())
+            .unwrap_or_else(|e| panic!("generated half-empty-items does not parse: {e:?}"));
     }
 
     #[test]
