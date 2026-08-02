@@ -127,6 +127,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`del()` through an out-of-range index silently no-op'd where a `[]` tail
+  should raise** (#529): `[1,2] | del(.[5][])` returned `[1,2]` unchanged
+  where jq raises `Cannot iterate over null (null)` — the last two sites left
+  over from #527's fix, both from #477's original bounds check. The `else`
+  arm of `delete_expr_array_paths`' grouped/comma walker and
+  `delete_at_path`'s `Expr::Pipe` chain-walk `Index` arm skipped the tail
+  outright instead of walking it against a throwaway `null`, the same "reads
+  as `null`, keep walking" rule #527 applied at its own two sites — an
+  out-of-range index is only reachable through `Index`, never through a
+  missing field, so #527 could not have reached it. Both now call
+  `delete_expr_paths_through_absent`/`delete_at_path_through_absent`, #527's
+  own helpers, from their `else` branch instead of returning early. Covers
+  every way in: a positive or negative out-of-range index, and an
+  in-bounds-by-spelling index into an empty array (`[] | del(.[0][])`), with
+  the `[]` any distance past the dead end (`[1,2] | del(.[5].c[])`) and the
+  grouped/comma spelling agreeing with the single-path one
+  (`del(.[5][], .[6][])`). Every other tail keeps the #477 no-op it already
+  had. New coverage:
+  `test_del_through_an_out_of_range_index_still_raises_on_an_iterate_tail` in
+  `src/jq/eval.rs`; the `del_oob_index_iterate_tail`/
+  `del_oob_index_iterate_tail_nested` probes seeded pinning this bug come off
+  `tests/data/jq-error-known-divergences.txt`.
+
 - **jq: a mid-stream error or `break` discarded every output already produced
   by the same evaluation** (#400, #494): `QueryResult` (and its mirror
   `GenericResult`) modeled `Error`/`Break` as a property of the *whole*
@@ -318,10 +341,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   in `tests/jq_computed_key_tests.rs`, four
   `tests/data/jq-golden/cases/{,comma_}del_missing_*` fixtures captured from
   the pinned jq oracle, and an `iterate_del_through_missing_field` error probe
-  pinning the `[]`-tail sentence. **Not covered**: the two remaining sites
-  with the same shape are #477's out-of-range-index gates, which no missing
-  key can reach — `[1,2] | del(.[5][])` and `{"a":[1,2]} | del(.a[5][])` are
-  still silent no-ops where jq raises. Tracked in #529.
+  pinning the `[]`-tail sentence. The two remaining sites with the same
+  shape — #477's out-of-range-index gates, which no missing key can reach —
+  were fixed separately by #529, above.
 
 - **jq comma/pipe precedence was inverted, silently dropping outputs** (#462).
   `,` was parsed as the loosest operator, wrapping `|`; jq's grammar is the
