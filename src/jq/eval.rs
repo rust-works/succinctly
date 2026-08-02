@@ -1425,7 +1425,16 @@ fn eval_try<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             Some(catch_expr) => eval_owned_input::<W, S>(catch_expr, &e.payload(), optional),
             None => QueryResult::None,
         },
-        // Non-error results pass through
+        // jq's `catch` catches a `break` the same way it catches a raised
+        // error, regardless of which label it targets. Real jq binds the
+        // catch handler's input to its internal `{"__jq":N}` break marker —
+        // an implementation detail not worth replicating — so bind `null`
+        // instead.
+        QueryResult::Break(_) => match catch {
+            Some(catch_expr) => eval_owned_input::<W, S>(catch_expr, &OwnedValue::Null, optional),
+            None => QueryResult::None,
+        },
+        // Non-error, non-break results pass through
         other => other,
     }
 }
@@ -16998,6 +17007,27 @@ mod tests {
         // try with null catch on actual error
         query!(br"123", "try .foo catch null",
             QueryResult::Owned(OwnedValue::Null) => {}
+        );
+    }
+
+    #[test]
+    fn regression_issue_562_try_catches_break() {
+        // `eval_try` only matched `QueryResult::Error`; a `Break` fell
+        // through to the `other => other` arm and escaped an enclosing
+        // `try`/`catch` untouched. jq's `catch` catches `break` the same
+        // way it catches a raised error.
+        query!(b"null", r#"label $out | try break $out catch "c""#,
+            QueryResult::Owned(OwnedValue::String(s)) if s == "c" => {}
+        );
+    }
+
+    #[test]
+    fn regression_issue_562_try_without_catch_swallows_break() {
+        // A bare `try break $out` (no catch) also absorbs the break, same
+        // as it absorbs an uncaught error.
+        assert_eq!(
+            outputs(b"null", r#"label $out | (try break $out) , "after""#),
+            vec!["\"after\""]
         );
     }
 
