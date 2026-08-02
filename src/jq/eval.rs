@@ -17535,6 +17535,514 @@ mod tests {
         );
     }
 
+    /// Assert that `filter` on `json` collapses a `Partial` sub-stream to a
+    /// bare `Error` carrying `message`.
+    ///
+    /// The value-position constructs share one policy — "a sub-expression that
+    /// errors partway aborts outright rather than exposing a prefix" — so they
+    /// share one assertion helper. `divergence` records what jq 1.7.1 actually
+    /// prints for the same filter, so a case where succinctly is *not* the
+    /// oracle stays visibly labelled rather than reading as pinned-correct.
+    fn assert_collapses_to_error(json: &[u8], filter: &str, message: &str, divergence: &str) {
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let expr = parse(filter).unwrap();
+        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, message, "filter: {filter} ({divergence})");
+            }
+            other => panic!("{filter} ({divergence}): expected a bare Error, got {other:?}"),
+        }
+    }
+
+    /// Same as [`assert_collapses_to_error`] for a `Partial` ending in
+    /// `break $out` — every case here uses that one label.
+    fn assert_collapses_to_break(json: &[u8], filter: &str) {
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let expr = parse(filter).unwrap();
+        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+            QueryResult::Break(l) => assert_eq!(l, "out", "filter: {filter}"),
+            other => panic!("{filter}: expected a bare Break, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn partial_in_value_position_collapses_to_its_control() {
+        // Every construct that embeds a sub-expression's output *into a value*
+        // rather than forwarding it as a stream treats a `Partial` operand the
+        // same as a bare `Error`/`Break`: the prefix is dropped and the control
+        // surfaces alone.
+        //
+        // For array construction and `map`/`with_entries` (which desugar to it)
+        // that matches jq 1.7.1. For the rest it does not — jq emits the value
+        // built from the prefix and *then* fails. Those are recorded here as
+        // divergences so the arms are covered without the expectation reading
+        // as an oracle-backed one.
+        let atomic: &[(&[u8], &str, &str, &str)] = &[
+            // Matches jq 1.7.1: no output at all, then the error.
+            (b"null", r#"[1,(2,error("x")),3]"#, "x", "matches jq 1.7.1"),
+            (b"[1,2]", r#"map((.,error("x")))"#, "x", "matches jq 1.7.1"),
+            (
+                br#"{"a":1}"#,
+                r#"with_entries((.,error("x")))"#,
+                "x",
+                "matches jq 1.7.1",
+            ),
+            // Diverges from jq 1.7.1, which prints the value built from the
+            // prefix before failing.
+            (
+                b"null",
+                r#"{a:1,b:(2,error("x"))}"#,
+                "x",
+                r#"jq 1.7.1 prints {"a":1,"b":2}, then fails"#,
+            ),
+            (
+                b"5",
+                r#"select((true,error("x")))"#,
+                "x",
+                "jq 1.7.1 prints 5, then fails",
+            ),
+            (
+                b"null",
+                r#""v=\((1,error("x")))""#,
+                "x",
+                r#"jq 1.7.1 prints "v=1", then fails"#,
+            ),
+            (
+                b"null",
+                r#"if (1,error("x")) then "t" else "f" end"#,
+                "x",
+                r#"jq 1.7.1 prints "t", then fails"#,
+            ),
+            (
+                b"[10,20,30]",
+                r#".[(1,error("x"))]"#,
+                "x",
+                "jq 1.7.1 prints 20, then fails",
+            ),
+            (
+                b"[[7],[8]]",
+                r#"(.[0],(.[1],error("x")))[(0+0)]"#,
+                "x",
+                "jq 1.7.1 prints 7 and 8, then fails",
+            ),
+            // `map_values` keeps only each key's first output, so jq 1.7.1
+            // never reaches the error at all and exits 0.
+            (
+                br#"{"a":1}"#,
+                r#"map_values((.,error("x")))"#,
+                "x",
+                r#"jq 1.7.1 prints {"a":1} and exits 0"#,
+            ),
+            (
+                b"[1,2]",
+                r#"map_values((.,error("x")))"#,
+                "x",
+                "jq 1.7.1 prints [1,2] and exits 0",
+            ),
+            // `reduce` only ever emits its final accumulator, so there is no
+            // prefix to expose either way — this one matches jq 1.7.1.
+            (
+                b"null",
+                r#"reduce (1,2,error("x")) as $v (0;.+$v)"#,
+                "x",
+                "matches jq 1.7.1",
+            ),
+        ];
+        for (json, filter, message, divergence) in atomic {
+            assert_collapses_to_error(json, filter, message, divergence);
+        }
+
+        // The `break` counterpart of each arm above. A bare `Break` keeps
+        // propagating to its label, so these are the raw (unlabelled) shapes.
+        let atomic_break: &[(&[u8], &str)] = &[
+            (b"null", "[1,(2,break $out),3]"),
+            (b"[1,2]", "map((.,break $out))"),
+            (br#"{"a":1}"#, "with_entries((.,break $out))"),
+            (b"null", "{a:1,b:(2,break $out)}"),
+            (b"5", "select((true,break $out))"),
+            (b"null", r#""v=\((1,break $out))""#),
+            (b"null", r#"if (1,break $out) then "t" else "f" end"#),
+            (b"[10,20,30]", ".[(1,break $out)]"),
+            (b"[[7],[8]]", "(.[0],(.[1],break $out))[(0+0)]"),
+            (br#"{"a":1}"#, "map_values((.,break $out))"),
+            (b"[1,2]", "map_values((.,break $out))"),
+            (b"null", "reduce (1,2,break $out) as $v (0;.+$v)"),
+        ];
+        for (json, filter) in atomic_break {
+            assert_collapses_to_break(json, filter);
+        }
+
+        // With an enclosing label the break is caught, which is what makes the
+        // array/object split above observable end-to-end: jq 1.7.1 agrees that
+        // `[...]` yields nothing here, and disagrees about `{...}` (it prints
+        // the object).
+        assert!(outputs(b"null", "label $out | [1,(2,break $out),3]").is_empty());
+        assert!(outputs(b"null", "label $out | {a:1,b:(2,break $out)}").is_empty());
+    }
+
+    #[test]
+    fn partial_prefix_survives_the_stream_forwarding_constructs() {
+        // The mirror image of the test above: constructs that forward their
+        // operand as a *stream* keep the prefix and re-attach the control.
+        // Each expectation below matches jq 1.7.1.
+
+        // A comma sibling that is itself a `Partial`.
+        query!(b"null", r#"(1,error("x")), 9"#,
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(prefix_json(&vs), ["1"]);
+                assert_eq!(e.message, "x");
+            }
+        );
+
+        // `skip` always wants the rest of the stream, so the control always
+        // surfaces after whatever survived the skip.
+        query!(b"null", r#"skip(1; 1,2,error("x"))"#,
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(prefix_json(&vs), ["2"]);
+                assert_eq!(e.message, "x");
+            }
+        );
+
+        // A pipe whose *first* stage is a borrowed multi-element stream: the
+        // elements already piped through survive a later element's control.
+        query!(b"[1,2]", r#".[] | (., error("x"))"#,
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(prefix_json(&vs), ["1"]);
+                assert_eq!(e.message, "x");
+            }
+        );
+        query!(b"[1,2]", ".[] | if . == 2 then break $out else . end",
+            QueryResult::Partial(vs, Control::Break(label)) => {
+                assert_eq!(prefix_json(&vs), ["1"]);
+                assert_eq!(label, "out");
+            }
+        );
+
+        // A pipe whose first stage is a single *owned* value.
+        query!(b"null", r#"(1+1) | (., error("x"))"#,
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(prefix_json(&vs), ["2"]);
+                assert_eq!(e.message, "x");
+            }
+        );
+
+        // A `Partial` first stage: every already-produced value is piped
+        // through the rest before the held control is re-attached.
+        query!(b"null", r#"(1,2,error("x")) | (., .+100)"#,
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(prefix_json(&vs), ["1", "101", "2", "102"]);
+                assert_eq!(e.message, "x");
+            }
+        );
+        // A control hit *while* piping the prefix takes precedence: the
+        // generator never reaches the held one.
+        query!(b"null", r#"(1,2,error("x")) | if . == 2 then error("y") else . end"#,
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(prefix_json(&vs), ["1"]);
+                assert_eq!(e.message, "y");
+            }
+        );
+        query!(b"null", "(1,2,error(\"x\")) | if . == 2 then break $out else . end",
+            QueryResult::Partial(vs, Control::Break(label)) => {
+                assert_eq!(prefix_json(&vs), ["1"]);
+                assert_eq!(label, "out");
+            }
+        );
+        query!(b"null", r#"(1,2,error("x")) | (., error("z"))"#,
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(prefix_json(&vs), ["1"]);
+                assert_eq!(e.message, "z");
+            }
+        );
+        // Piping the prefix through `empty` leaves nothing, so the held
+        // control normalizes back to a bare `Error`.
+        query!(b"null", r#"(1,2,error("x")) | empty"#,
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "x");
+            }
+        );
+    }
+
+    #[test]
+    fn partial_flows_through_as_and_destructuring_binds() {
+        // `as` and its destructuring form both hold the bind expression's own
+        // control until the loop over its prefix has run. Verified against jq
+        // 1.7.1: `([1],[2],error("x")) as [$a] | $a` is `1`, `2`, then the
+        // error.
+        query!(b"null", r#"([1],[2],error("x")) as [$a] | $a"#,
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(prefix_json(&vs), ["1", "2"]);
+                assert_eq!(e.message, "x");
+            }
+        );
+        // A control raised by the *body* stops the loop, keeping the outputs
+        // the earlier bindings already produced — whether the body raises it
+        // bare or as the tail of its own `Partial`.
+        query!(b"null", r#"(1,2) as $v | if $v == 2 then error("y") else $v end"#,
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(prefix_json(&vs), ["1"]);
+                assert_eq!(e.message, "y");
+            }
+        );
+        query!(b"null", r#"([1],[2]) as [$a] | if $a == 2 then error("y") else $a end"#,
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(prefix_json(&vs), ["1"]);
+                assert_eq!(e.message, "y");
+            }
+        );
+        query!(b"null", r#"(1,2) as $v | ($v, error("q"))"#,
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(prefix_json(&vs), ["1"]);
+                assert_eq!(e.message, "q");
+            }
+        );
+        query!(b"null", "(1,2) as $v | if $v == 2 then break $out else $v end",
+            QueryResult::Partial(vs, Control::Break(label)) => {
+                assert_eq!(prefix_json(&vs), ["1"]);
+                assert_eq!(label, "out");
+            }
+        );
+        query!(b"null", r#"([1],[2]) as [$a] | ($a, error("z"))"#,
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(prefix_json(&vs), ["1"]);
+                assert_eq!(e.message, "z");
+            }
+        );
+        query!(b"null", "([1],[2]) as [$a] | if $a == 2 then break $out else $a end",
+            QueryResult::Partial(vs, Control::Break(label)) => {
+                assert_eq!(prefix_json(&vs), ["1"]);
+                assert_eq!(label, "out");
+            }
+        );
+
+        // The non-`Partial` bind shapes, which share the same match: a
+        // borrowed single value, a borrowed stream, an owned value, an empty
+        // stream, and a bind that is itself a bare control.
+        assert_eq!(outputs(b"5", ". as $v | $v"), ["5"]);
+        assert_eq!(outputs(b"null", "(1+1) as $v | $v"), ["2"]);
+        assert_eq!(outputs(b"[1,2]", ".[] as $v | $v"), ["1", "2"]);
+        assert_eq!(outputs(b"[[1],[2]]", ".[] as [$a] | $a"), ["1", "2"]);
+        for (json, filter) in [
+            (b"null".as_slice(), "empty as $v | 1"),
+            (b"null".as_slice(), "empty as [$a] | $a"),
+        ] {
+            let index = JsonIndex::build(json);
+            let cursor = index.root(json);
+            let expr = parse(filter).unwrap();
+            assert!(
+                matches!(
+                    eval::<Vec<u64>, JqSemantics>(&expr, cursor),
+                    QueryResult::None
+                ),
+                "filter: {filter}"
+            );
+        }
+        assert_collapses_to_error(b"null", r#"error("x") as $v | 1"#, "x", "matches jq 1.7.1");
+        assert_collapses_to_error(
+            b"null",
+            r#"error("x") as [$a] | $a"#,
+            "x",
+            "matches jq 1.7.1",
+        );
+        assert_collapses_to_break(b"null", "(break $out) as $v | 1");
+        assert_collapses_to_break(b"null", "(break $out) as [$a] | $a");
+    }
+
+    #[test]
+    fn partial_flows_through_foreach_input_and_state() {
+        // Every shape `foreach`'s input stream can take, all sharing one
+        // match: a borrowed single value, an owned value, an empty stream, and
+        // a bare control.
+        assert_eq!(outputs(b"null", "foreach . as $x (0; .+1)"), ["1"]);
+        assert_eq!(outputs(b"null", "foreach (1+1) as $x (0; .+$x)"), ["2"]);
+        assert!(outputs(b"null", "foreach empty as $x (0; .+$x)").is_empty());
+        assert_collapses_to_error(
+            b"null",
+            r#"foreach error("x") as $x (0; .+$x)"#,
+            "x",
+            "matches jq 1.7.1",
+        );
+        assert_collapses_to_break(b"null", "foreach (break $out) as $x (0; .+$x)");
+
+        // A multi-output UPDATE collapses to a single state — one output stays
+        // itself, several become an array — and the `Partial`'s trailing
+        // control is dropped, the same as a multi-output update has always
+        // been folded (a pre-existing limitation, not #400/#494's concern).
+        assert_eq!(
+            outputs(b"null", r#"foreach (1,2) as $x (0; (.+$x, error("q")))"#),
+            ["1", "3"]
+        );
+        query!(b"null", r#"foreach (1,2) as $x (0; (.+$x, .+100, error("q")))"#,
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(prefix_json(&vs), ["[1,100]"]);
+                // The folded array is then what the *next* step adds to,
+                // which is where this one actually fails.
+                assert!(e.message.contains("cannot be added"), "{}", e.message);
+            }
+        );
+        // A `Partial` INIT keeps only its first output, like any multi-output
+        // init (#534, separate).
+        assert_eq!(
+            outputs(b"null", r#"foreach (1,2) as $x ((0,error("i")); .+$x)"#),
+            ["1", "3"]
+        );
+
+        // A failing EXTRACT keeps the steps already emitted, the same as a
+        // failing UPDATE does. Verified against jq 1.7.1: `1`, then the error.
+        query!(b"null", r#"foreach (1,2) as $x (0; .+$x; if . == 3 then error("e") else . end)"#,
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(prefix_json(&vs), ["1"]);
+                assert_eq!(e.message, "e");
+            }
+        );
+    }
+
+    #[test]
+    fn partial_while_condition_error_keeps_the_values_already_output() {
+        // #494 covers `while`'s UPDATE erroring; its CONDITION has its own
+        // arm. Verified against jq 1.7.1: `1`, `2`, then the error.
+        query!(b"1", r#"while(if . == 3 then error("c") else . < 5 end; .+1)"#,
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(prefix_json(&vs), ["1", "2"]);
+                assert_eq!(e.message, "c");
+            }
+        );
+    }
+
+    #[test]
+    fn partial_short_circuit_split_across_first_last_nth_limit() {
+        // `last` cannot short-circuit, so a `Partial` ending in a break
+        // surfaces that break (the error case is already pinned above).
+        assert_collapses_to_break(b"null", "last(1,2,break $out)");
+        // `nth` stops at index `n`, so the break is reached only when the
+        // prefix is too short.
+        query!(b"null", "nth(1; 1,2,break $out)",
+            QueryResult::Owned(OwnedValue::Int(2)) => {}
+        );
+        assert_collapses_to_break(b"null", "nth(5; 1,2,break $out)");
+        // Same split for `first`.
+        query!(b"null", "first(1,2,break $out)",
+            QueryResult::Owned(OwnedValue::Int(1)) => {}
+        );
+        // A `limit` operand that is a *bare* break still reaches its label —
+        // the arm that used to swallow it.
+        assert_collapses_to_break(b"null", "limit(5; break $out)");
+    }
+
+    #[test]
+    fn try_splices_its_catch_handler_after_the_prefix() {
+        // `prepend` joins the body's prefix to whatever the catch handler
+        // yields, so each handler shape gets its own arm. All verified
+        // against jq 1.7.1 except the `break` case, which jq catches (#562).
+        assert_eq!(
+            outputs(b"null", r#"try (1,2,error("x")) catch empty"#),
+            ["1", "2"]
+        );
+        assert_eq!(
+            outputs(b"null", r#"try (1,2,error("x")) catch (., .)"#),
+            ["1", "2", "\"x\"", "\"x\""]
+        );
+        // No handler at all: the prefix is kept and the error swallowed.
+        assert_eq!(outputs(b"null", r#"try (1,2,error("x"))"#), ["1", "2"]);
+        assert_eq!(outputs(b"null", r#"(1,2,error("x"))?"#), ["1", "2"]);
+        // A handler that fails in turn: the two prefixes concatenate and the
+        // handler's own control terminates the stream.
+        query!(b"null", r#"try (1,2,error("x")) catch error("y")"#,
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(prefix_json(&vs), ["1", "2"]);
+                assert_eq!(e.message, "y");
+            }
+        );
+        query!(b"null", r#"try (1,2,error("x")) catch (1, error("y"))"#,
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(prefix_json(&vs), ["1", "2", "1"]);
+                assert_eq!(e.message, "y");
+            }
+        );
+        query!(b"null", r#"try (1,2,error("x")) catch break $out"#,
+            QueryResult::Partial(vs, Control::Break(label)) => {
+                assert_eq!(prefix_json(&vs), ["1", "2"]);
+                assert_eq!(label, "out");
+            }
+        );
+    }
+
+    #[test]
+    fn partial_reduced_to_a_single_value_keeps_its_first_output() {
+        // The "this position takes one value, not a stream" helpers all keep
+        // the prefix's first output and drop the trailing control.
+
+        // Assignment RHS. Diverges from jq 1.7.1, which prints {"a":1} and
+        // then *fails* (exit 5); succinctly exits 0.
+        query!(br#"{"a":0}"#, r#".a = (1,error("x"))"#,
+            QueryResult::Owned(OwnedValue::Object(m)) => {
+                assert_eq!(m.get("a"), Some(&OwnedValue::Int(1)));
+            }
+        );
+        // `pick`/`omit` key expressions. jq 1.7.1 rejects both filters
+        // outright ("Invalid path expression"), a separate pre-existing gap.
+        query!(br#"{"a":1,"b":2}"#, r#"pick((["a"],error("x")))"#,
+            QueryResult::Owned(OwnedValue::Object(m)) => {
+                assert_eq!(m.len(), 1);
+                assert!(m.contains_key("a"));
+            }
+        );
+        query!(br#"{"a":1,"b":2}"#, r#"omit((["a"],error("x")))"#,
+            QueryResult::Owned(OwnedValue::Object(m)) => {
+                assert_eq!(m.len(), 1);
+                assert!(m.contains_key("b"));
+            }
+        );
+    }
+
+    #[test]
+    fn boolean_operand_that_is_a_bare_error_propagates_it() {
+        // The zero-prefix counterpart of the `and`/`or` prefix cases already
+        // pinned above: with nothing accumulated, the operand's control is
+        // all that is left. Matches jq 1.7.1.
+        assert_collapses_to_error(b"null", r#"true and error("x")"#, "x", "matches jq 1.7.1");
+        assert_collapses_to_error(b"null", r#"false or error("x")"#, "x", "matches jq 1.7.1");
+    }
+
+    #[test]
+    fn query_result_partial_is_an_error_and_collects_its_prefix() {
+        // `is_error` answers "did evaluating this end in an error", so a
+        // `Partial` that ends in one counts; a `Partial` ending in a break
+        // does not. `collect_owned` keeps the prefix either way — that is the
+        // whole point of #400/#494.
+        let err: QueryResult<Vec<u64>> = QueryResult::Partial(
+            vec![OwnedValue::Int(1)],
+            Control::Error(EvalError::new("x")),
+        );
+        assert!(err.is_error());
+        assert_eq!(err.collect_owned(), vec![OwnedValue::Int(1)]);
+
+        let brk: QueryResult<Vec<u64>> = QueryResult::Partial(
+            vec![OwnedValue::Int(1), OwnedValue::Int(2)],
+            Control::Break("out".into()),
+        );
+        assert!(!brk.is_error());
+        assert_eq!(
+            brk.collect_owned(),
+            vec![OwnedValue::Int(1), OwnedValue::Int(2)]
+        );
+    }
+
+    #[test]
+    fn eval_lenient_drops_a_partial_prefix() {
+        // `eval_lenient` is the public "give me borrowed values, swallow the
+        // failures" entry point: an owned prefix has no borrowed
+        // representation, so a `Partial` yields nothing, exactly like the
+        // `Owned`/`ManyOwned`/`Break` arms beside it.
+        let json = b"null";
+        let index = JsonIndex::build(json);
+        let expr = parse(r#"1,error("x")"#).unwrap();
+        let out = eval_lenient::<Vec<u64>, JqSemantics>(&expr, index.root(json));
+        assert!(out.is_empty());
+    }
+
     #[test]
     fn test_complex_expressions() {
         // Comparison with arithmetic
