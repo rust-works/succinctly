@@ -723,6 +723,9 @@ enum YamlPatternArg {
     ExplicitKeys,
     /// Multi-document streams (`---` / `...`)
     MultiDoc,
+    /// Top-level sequence of childless bare-dash items (`-` alone on its own
+    /// line, reads as `null`) — the shape #337 found quadratic
+    EmptyItems,
 }
 
 impl From<YamlPatternArg> for yaml_generators::YamlPattern {
@@ -744,6 +747,7 @@ impl From<YamlPatternArg> for yaml_generators::YamlPattern {
             YamlPatternArg::BlockScalars => Self::BlockScalars,
             YamlPatternArg::ExplicitKeys => Self::ExplicitKeys,
             YamlPatternArg::MultiDoc => Self::MultiDoc,
+            YamlPatternArg::EmptyItems => Self::EmptyItems,
         }
     }
 }

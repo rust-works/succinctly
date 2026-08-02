@@ -29,6 +29,16 @@
 //! - **Tags (`!!str`, `!custom`)** — rejected outright in block context; a
 //!   documented non-support in `src/yaml/mod.rs`.
 //!
+//! # Shape guards, not features (#516)
+//!
+//! `empty-items` does not carry a *construct* absent elsewhere — a childless
+//! bare-dash item parses the same as any other sequence item. It exists
+//! because #337 found that exact shape quadratic while every generator only
+//! ever emitted `- ` items with content nested underneath, so the regression
+//! (and its later, incidental fix) had zero benchmark coverage. Per
+//! `docs/guides/benchmarking.md` rule 7: a benchmark cannot measure a shape it
+//! does not generate.
+//!
 //! # Why this file exists in this shape (#327)
 //!
 //! Until #327 none of the features above were generated at all, so "every
@@ -75,6 +85,9 @@ pub enum YamlPattern {
     ExplicitKeys,
     /// Multi-document streams (`---` / `...`)
     MultiDoc,
+    /// Top-level sequence of childless bare-dash items (`-\n` repeated) — the
+    /// shape #337 found quadratic and no other pattern generates
+    EmptyItems,
 }
 
 /// How the suite generator sizes a pattern.
@@ -135,6 +148,11 @@ pub const ALL_PATTERNS: &[(&str, YamlPattern, PatternScale)] = &[
         PatternScale::Scalable,
     ),
     ("multi-doc", YamlPattern::MultiDoc, PatternScale::Scalable),
+    (
+        "empty-items",
+        YamlPattern::EmptyItems,
+        PatternScale::Scalable,
+    ),
 ];
 
 /// Generate YAML of approximately target_size bytes
@@ -156,6 +174,7 @@ pub fn generate_yaml(target_size: usize, pattern: YamlPattern, seed: Option<u64>
         YamlPattern::BlockScalars => generate_block_scalars(target_size, seed),
         YamlPattern::ExplicitKeys => generate_explicit_keys(target_size, seed),
         YamlPattern::MultiDoc => generate_multidoc(target_size, seed),
+        YamlPattern::EmptyItems => generate_empty_items(target_size),
     }
 }
 
@@ -879,6 +898,35 @@ fn generate_multidoc(target_size: usize, seed: Option<u64>) -> String {
 }
 
 // ============================================================================
+// Shape-focused patterns (#516)
+// ============================================================================
+
+/// Generate a top-level sequence of childless bare-dash items: `-\n` repeated.
+///
+/// A bare `-` alone on its own line, with nothing following it, is valid YAML
+/// that reads as `null`. #337 found this exact shape quadratic (~3.9x per
+/// doubling, 2.5s for 800KB) while the visually similar `- x` was linear — and
+/// no generator produced it, so the regression (and its later, incidental fix)
+/// were both invisible to every end-to-end benchmark.
+///
+/// This is distinct from the `- \n` items `generate_users` and
+/// `generate_navigation` already emit: those always have mapping fields
+/// nested on the following lines, so the item is never actually childless.
+/// Deterministic (no seed): the shape is the entire point, and there is
+/// nothing to randomize.
+fn generate_empty_items(target_size: usize) -> String {
+    let mut yaml = String::with_capacity(target_size);
+    yaml.push_str("# Childless bare-dash items (#337, #516)\n");
+
+    let start_len = yaml.len();
+    while yaml.len().saturating_sub(start_len) < target_size {
+        yaml.push_str("-\n");
+    }
+
+    yaml
+}
+
+// ============================================================================
 // Helper functions
 // ============================================================================
 
@@ -1371,6 +1419,44 @@ mod tests {
             yaml.contains("  - ? valueless item key "),
             "no valueless explicit key at sequence-item position"
         );
+    }
+
+    #[test]
+    fn test_generate_empty_items() {
+        let yaml = generate_yaml(2048, YamlPattern::EmptyItems, Some(42));
+        let body = yaml.lines().skip(1); // drop the leading comment line
+        assert!(
+            body.clone().all(|line| line == "-"),
+            "every line must be a childless bare dash, got:\n{yaml}"
+        );
+
+        let index = succinctly::yaml::YamlIndex::build(yaml.as_bytes())
+            .unwrap_or_else(|e| panic!("generated empty-items does not parse: {e:?}"));
+        // `root()` is a virtual sequence of *documents*; descend into the sole
+        // document to reach our actual top-level sequence of childless items.
+        let doc = match index.root(yaml.as_bytes()).value() {
+            succinctly::yaml::YamlValue::Sequence(docs) => {
+                let (doc, rest) = docs.uncons_cursor().expect("no document");
+                assert!(rest.uncons_cursor().is_none(), "expected a single document");
+                doc
+            }
+            other => panic!("expected the virtual root sequence, got {other:?}"),
+        };
+        match doc.value() {
+            succinctly::yaml::YamlValue::Sequence(mut items) => {
+                let mut count = 0;
+                while let Some((item, rest)) = items.uncons_cursor() {
+                    assert!(
+                        matches!(item.value(), succinctly::yaml::YamlValue::Null),
+                        "item {count} is not null"
+                    );
+                    count += 1;
+                    items = rest;
+                }
+                assert!(count > 1, "must generate more than one childless item");
+            }
+            other => panic!("expected a top-level sequence, got {other:?}"),
+        }
     }
 
     #[test]
