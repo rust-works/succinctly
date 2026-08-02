@@ -17412,15 +17412,12 @@ mod tests {
             outputs(b"null", r#"try (1,2,error("x")) catch "caught: \(.)""#),
             ["1", "2", "\"caught: x\""]
         );
-        // `try` still does not catch `break` (a separate, pre-existing
-        // divergence from jq tracked by #562) — the prefix survives, but the
-        // break keeps propagating (unconverted, since nothing here catches
-        // it) rather than running the catch handler.
-        query!(b"null", r#"try (1,2,break $out) catch "c""#,
-            QueryResult::Partial(vs, Control::Break(label)) => {
-                assert_eq!(prefix_json(&vs), ["1", "2"]);
-                assert_eq!(label, "out");
-            }
+        // `try` catches `break` the same way it catches an error (#562),
+        // and a `Partial` ending in `Break` gets the same treatment as one
+        // ending in `Error` above: emit the prefix, then run the handler.
+        assert_eq!(
+            outputs(b"null", r#"try (1,2,break $out) catch "c""#),
+            ["1", "2", "\"c\""]
         );
     }
 

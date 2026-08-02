@@ -157,9 +157,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cases cover the family
   (`and`/`or`+`break`, a boolean operand erroring mid-cartesian, multi-output
   `try`/`catch`, `foreach` over an erroring input stream, `limit` satisfied
-  before an error would surface, and — a genuine, separately-tracked
-  divergence this verification pass surfaced — `try`/`catch` not catching
-  `break` at all where jq's `catch` does, filed as #562). **Not covered**:
+  before an error would surface, and `try`/`catch` not catching `break` at
+  all where jq's `catch` does — filed as #562, fixed there for the bare
+  `Break` case and here for a `Partial` ending in one). **Not covered**:
   computed indexing (`E[K]`)'s key/target forking, `if`/`select`'s
   first-output-only condition (#378) and a `Partial` prefix reaching
   `result_to_owned`/assignment-RHS/`pick`/`omit` all keep today's existing

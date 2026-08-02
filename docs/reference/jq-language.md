@@ -309,10 +309,6 @@ Two precedence divergences from jq remain:
 
 **Note:** Array slicing with steps (`.[::2]`) is intentionally not supported - it's Python syntax, not jq. Use `[range(0; length; 2) as $i | .[$i]]` instead.
 
-**`try`/`catch` does not catch `break`** (#562), where jq's `catch` does:
-`label $out | try break $out catch "c"` prints nothing here, but `"c"` in
-jq. A `break` still passes through `try` untouched to its enclosing `label`.
-
 **Multi-output expressions in non-fanout positions** parse but don't fan out
 the way jq does. Some silently take only the first output: `"\(1,2)"`,
 `{a: (1,2)}`, and `select(.==1, .==3)` (the condition's second branch is
