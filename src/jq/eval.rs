@@ -11360,9 +11360,15 @@ fn delete_expr_array_paths(
                         let slot = &mut arr[actual as usize];
                         let old = core::mem::replace(slot, OwnedValue::Null);
                         *slot = delete_expr_paths_at(old, group, start + 1)?;
+                    } else {
+                        // An out-of-range index names nothing to delete
+                        // through, so jq's delpaths silently skips the step
+                        // itself, `?` or not (#477) — but the tail still
+                        // decides: `del(.[5].a)` stays a no-op while
+                        // `del(.[5][])` raises `Cannot iterate over null
+                        // (null)` (#527/#529).
+                        delete_expr_paths_through_absent(group, start + 1)?;
                     }
-                    // An out-of-range index names nothing to delete through —
-                    // jq's delpaths silently skips it, `?` or not (#477).
                 }
                 // Deleting *through* a slice deletes inside the sub-array and
                 // splices it back: `[1,[2],[3]] | del(.[1:3][0])` is `[1,[3]]`.
@@ -11655,10 +11661,12 @@ fn delete_at_path(
                             if actual_idx >= 0 && (actual_idx as usize) < arr.len() {
                                 delete_at_path(&mut arr[actual_idx as usize], &rest, optional)
                             } else {
-                                // An out-of-range index resolves to null;
-                                // deleting further into null is always a
-                                // no-op, `?` or not (#477).
-                                Ok(())
+                                // An out-of-range index resolves to null, and
+                                // deleting further into null is a no-op for
+                                // most tails, `?` or not (#477) — but not
+                                // `[]`, which still raises `Cannot iterate
+                                // over null (null)` (#527/#529).
+                                delete_at_path_through_absent(&rest, optional)
                             }
                         }
                         // Same per-step `null` exemption as the `Field` case
@@ -23322,6 +23330,58 @@ mod tests {
         for filter in [r"del(.a.b)", r"del(.[0].a)", r"del(.[0:2].a)"] {
             query!(br"null", filter,
                 QueryResult::Owned(OwnedValue::Null) => {}
+            );
+        }
+    }
+
+    #[test]
+    fn test_del_through_an_out_of_range_index_still_raises_on_an_iterate_tail() {
+        // #529: an out-of-range index (positive, negative, or into an empty
+        // array) reads as `null` just like a missing field does (#527), and
+        // jq keeps walking the rest of the path against that `null` — so a
+        // `[]` tail still raises `Cannot iterate over null (null)` even
+        // though every other tail stays a no-op. Both `[1,2]`'s single-path
+        // walker (`delete_at_path`) and its grouped/comma walker
+        // (`delete_expr_array_paths`) must agree.
+        for (json, filter) in [
+            (&br"[1,2]"[..], r"del(.[5][])"),
+            (&br#"{"a":[1,2]}"#[..], r"del(.a[5][])"),
+            (&br"[1,2]"[..], r"del(.[-5][])"),
+            (&br"[]"[..], r"del(.[0][])"),
+            (&br#"{"a":[]}"#[..], r"del(.a[0][])"),
+            // The `[]` can sit further down than the very next component.
+            (&br"[1,2]"[..], r"del(.[5].c[])"),
+            (&br"[1,2]"[..], r"del(.[5][1:2][])"),
+            // A `?` on the out-of-range step does not suppress what the tail
+            // itself raises.
+            (&br"[1,2]"[..], r"del(.[5]?[])"),
+            // Grouped/comma spelling must land the same as the single path.
+            (&br"[1,2]"[..], r"del(.[5][], .[6][])"),
+        ] {
+            query!(json, filter,
+                QueryResult::Error(e) => {
+                    assert_eq!(e.message, "Cannot iterate over null (null)", "`{filter}`");
+                }
+            );
+        }
+        // `?` on the iterate step itself does suppress it.
+        query!(br"[1,2]", r"del(.[5][]?)",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr, vec![OwnedValue::Int(1), OwnedValue::Int(2)]);
+            }
+        );
+        // Every other tail keeps the #477 no-op it already had, single-path
+        // and grouped alike.
+        for filter in [
+            r"del(.[5])",
+            r"del(.[5].a)",
+            r"del(.[-5])",
+            r"del(.[5], .[6])",
+        ] {
+            query!(br"[1,2]", filter,
+                QueryResult::Owned(OwnedValue::Array(arr)) => {
+                    assert_eq!(arr, vec![OwnedValue::Int(1), OwnedValue::Int(2)], "`{filter}`");
+                }
             );
         }
     }

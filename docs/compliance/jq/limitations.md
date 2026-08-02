@@ -31,9 +31,9 @@ Measured against jq-1.7.1 over the 186 probes in
 
 | Dimension                                    | Result               | Meaning                                            |
 |----------------------------------------------|----------------------|----------------------------------------------------|
-| **Message text** (both evaluators, verbatim) | **181/186 = 97.3%**  | Byte-identical to jq                               |
+| **Message text** (both evaluators, verbatim) | **183/186 = 98.4%**  | Byte-identical to jq                               |
 | **Wording divergences**                      | **0**                | Every probe that errors in both errors identically |
-| **Behaviour / parser gaps**                  | **5**                | succinctly does not raise the error at all         |
+| **Behaviour / parser gaps**                  | **3**                | succinctly does not raise the error at all         |
 
 These three numbers are asserted, not maintained by hand: `jq_error_message_tests.rs`
 parses them back out of this page and fails if they drift from the corpus (they went stale
@@ -317,17 +317,13 @@ than needing `?` to swallow a failure). No write operator produces `index N out 
 longer a positive case for succinctly's own wording to cover.
 
 `del()` used to sit here too — `del(.[5])` and `del(.[-5])` on `[1,2]`, plus a missing
-intermediate key — but every one of those is a silent no-op now, matching jq, after
-[#477](https://github.com/rust-works/succinctly/issues/477) and
-[#527](https://github.com/rust-works/succinctly/issues/527). A step that reaches nothing
+intermediate key or an out-of-range index — but every one of those is a silent no-op now,
+matching jq, after [#477](https://github.com/rust-works/succinctly/issues/477),
+[#527](https://github.com/rust-works/succinctly/issues/527) and
+[#529](https://github.com/rust-works/succinctly/issues/529). A step that reaches nothing
 reads as `null` and the rest of the path is walked against it, so only an `[]` tail still
-raises (`{"a":{"x":1}} | del(.a.b[])` is `Cannot iterate over null (null)` in both).
-
-What is left of that family diverges in the *opposite* direction, so it does not belong in
-this table at all: after an out-of-range index specifically, succinctly still skips the tail
-instead of walking it, so `[1,2] | del(.[5][])` is a silent no-op where jq raises `Cannot
-iterate over null (null)` — [#529](https://github.com/rust-works/succinctly/issues/529),
-not yet seeded into the probe corpus.
+raises (`{"a":{"x":1}} | del(.a.b[])` and `[1,2] | del(.[5][])` are both `Cannot iterate over
+null (null)`).
 
 The two slice rows were added by [#366](https://github.com/rust-works/succinctly/issues/366)
 deliberately. Writing through a slice could have vivified `null` on its own — `setpath`
