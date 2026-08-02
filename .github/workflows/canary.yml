@@ -1,15 +1,19 @@
 name: Canary
 
 # Fires on the exact events issue #531 observed going missing: force-push
-# (synchronize) and reopen. Kept separate from ci.yml so it stays a fast,
-# independent signal of "did GitHub deliver *any* trigger event for this
-# SHA" rather than being entangled with the full matrix's health.
+# (synchronize) and reopen. Also covers merge-queue builds (#552) so the same
+# "did GitHub deliver *any* trigger event for this SHA" signal exists for
+# queued PRs, not just pre-merge review. Kept separate from ci.yml so it
+# stays a fast, independent signal rather than being entangled with the full
+# matrix's health.
 on:
   pull_request:
     branches: [main]
     types: [opened, reopened, synchronize]
   push:
     branches: [main]
+  merge_group:
+    types: [checks_requested]
   workflow_dispatch:
 
 concurrency:
