@@ -35,6 +35,42 @@ fn pattern_names() -> Vec<String> {
 
 const SIZES: &[&str] = &["1kb", "10kb", "100kb", "1mb"];
 
+/// Patterns deliberately excluded from this bench's size ladder. `config` is
+/// `PatternScale::Fixed` — it generates one `config.yaml`, not a `{size}.yaml`
+/// per rung — so it never has a file at `file_path("config", size)` for any
+/// `SIZES` entry (`dev bench yq` has the same gap).
+///
+/// Named here rather than left as a bare `!exists()` fallthrough (#517), so
+/// `check_skip_list` below can pin it: a *new* `PatternScale::Fixed` pattern
+/// that isn't added to this list fails loudly instead of silently vanishing
+/// into the same fallthrough.
+const SKIP: &[&str] = &["config"];
+
+/// #517 guard: every name in `SKIP` is a real pattern, and every
+/// `PatternScale::Fixed` pattern — the only kind with no per-size ladder — is
+/// in `SKIP`. Mirrors `check_parity()` in `jq_string_ops_bench.rs`: a
+/// `harness = false` bench has no libtest to run `#[test]`s, so this runs at
+/// the top of `bench_succinctly_identity` instead, on every `cargo bench` /
+/// `cargo test --bench yq_comparison`.
+fn check_skip_list() {
+    let names = pattern_names();
+    for skipped in SKIP {
+        assert!(
+            names.iter().any(|n| n == skipped),
+            "SKIP names {skipped:?}, which is not in ALL_PATTERNS"
+        );
+    }
+    for (name, _, scale) in yaml_pattern_registry::ALL_PATTERNS {
+        if *scale == yaml_pattern_registry::PatternScale::Fixed {
+            assert!(
+                SKIP.contains(name),
+                "{name} is PatternScale::Fixed (no {{size}}.yaml ladder) but is not in \
+                 SKIP — add it with a reason, or give it a size ladder"
+            );
+        }
+    }
+}
+
 // This process-spawns real `yq`/`succinctly` per iteration, so deriving the
 // full pattern list (#517, was a hardcoded 5-pattern subset) roughly triples
 // benchmark-id count. Trimmed from criterion's defaults (3s warm-up + 5s
@@ -71,6 +107,8 @@ fn has_system_yq() -> bool {
 
 /// Benchmark succinctly yq with identity filter
 fn bench_succinctly_identity(c: &mut Criterion) {
+    check_skip_list();
+
     let Some(binary) = get_succinctly_binary() else {
         eprintln!("Skipping benchmark: succinctly binary not found. Run `cargo build --release --features cli`");
         return;

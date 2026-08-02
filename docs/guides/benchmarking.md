@@ -361,8 +361,13 @@ full benchmark run.
 > `#[path]`, split out of `yaml_generators.rs` so the bench doesn't also
 > compile every `generate_*` function), the same source as the table below, so
 > a pattern registered here is benchmarked there without a second edit.
-> `config` is skipped as before (it generates one `config.yaml`, not a
-> `{size}.yaml` per rung of the size ladder — the same gap `dev bench yq` has).
+> `config` is skipped as before — it generates one `config.yaml`, not a
+> `{size}.yaml` per rung of the size ladder, the same gap `dev bench yq` has —
+> but now via a named `SKIP` list rather than a bare `!exists()` fallthrough; a
+> `check_skip_list()` guard (run at the top of `bench_succinctly_identity`, the
+> pattern `jq_string_ops_bench.rs`'s `check_parity()` uses for a
+> `harness = false` bench) fails loudly if `SKIP` drifts from the registry's
+> `PatternScale::Fixed` patterns.
 > Measured on Apple M1 Max: the identity-comparison groups' warm-up/measurement
 > time was trimmed from criterion's defaults (3s/5s) to 1s/2s to keep the full
 > 16-pattern x 4-size sweep from tripling runtime; the full `cargo bench --bench
