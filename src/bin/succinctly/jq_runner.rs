@@ -1819,12 +1819,12 @@ impl LiteralFormatter for JqCompatFormatter {
         // finite value and produces garbage like "NaNE+2147483647" for one
         // that isn't (#561). Match `format_float`'s guard below: JSON output
         // substitutes "null" for values RFC 8259 can't represent.
-        if let Ok(s) = core::str::from_utf8(raw) {
-            if let Ok(f) = s.parse::<f64>() {
-                if f.is_nan() || f.is_infinite() {
-                    return Cow::Borrowed("null");
-                }
-            }
+        let overflows = core::str::from_utf8(raw)
+            .ok()
+            .and_then(|s| s.parse::<f64>().ok())
+            .is_some_and(|f| f.is_nan() || f.is_infinite());
+        if overflows {
+            return Cow::Borrowed("null");
         }
         Cow::Owned(format_number_jq_compat(raw))
     }
@@ -2172,6 +2172,22 @@ fn format_json(value: &OwnedValue, config: &OutputConfig) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_jq_compat_formatter_format_raw_number() {
+        // Finite numbers fall through the NaN/Infinity guard unchanged.
+        assert_eq!(JqCompatFormatter.format_raw_number(b"42").as_ref(), "42");
+        // Overflowed literals substitute "null" instead of reaching
+        // `format_number_jq_compat`, which assumes a finite value (#561).
+        assert_eq!(
+            JqCompatFormatter.format_raw_number(b"1e400").as_ref(),
+            "null"
+        );
+        assert_eq!(
+            JqCompatFormatter.format_raw_number(b"-1e400").as_ref(),
+            "null"
+        );
+    }
 
     #[test]
     fn test_trim_ascii_ws() {
