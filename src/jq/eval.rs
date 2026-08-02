@@ -9348,17 +9348,15 @@ fn eval_repeat<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // Evaluate expr with the original input each time
         match eval_owned_expr::<S>(expr, &owned, optional) {
             Ok(new_val) => outputs.push(new_val),
-            Err(_) => break, // Stop on error
+            // The values already output no longer vanish, and an error with
+            // no prior output surfaces as an error rather than empty output
+            // (#495): `repeat(if . > 3 then error("boom") else .+1 end)` on
+            // `5` raises immediately with no output, matching jq exactly.
+            Err(e) => return partial(outputs, Control::Error(e)),
         }
     }
 
-    if outputs.is_empty() {
-        QueryResult::None
-    } else if outputs.len() == 1 {
-        QueryResult::Owned(outputs.pop().unwrap())
-    } else {
-        QueryResult::ManyOwned(outputs)
-    }
+    owned_vec_to_result(outputs)
 }
 
 /// A numeric argument to `range()`: kept as `i64` when exact so all-integer
