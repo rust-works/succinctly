@@ -370,6 +370,16 @@ fn evaluate_input(
             sink.report_break(DiagStyle::Yq, &label, &no_location());
             Ok(vec![])
         }
+        // The outputs already produced no longer vanish behind the failure
+        // (#400, #494).
+        QueryResult::Partial(vs, jq::Control::Error(e)) => {
+            sink.report(DiagStyle::Yq, &e, &no_location());
+            Ok(vs)
+        }
+        QueryResult::Partial(vs, jq::Control::Break(label)) => {
+            sink.report_break(DiagStyle::Yq, &label, &no_location());
+            Ok(vs)
+        }
     }
 }
 
@@ -399,6 +409,16 @@ fn evaluate_yaml_cursor<W: AsRef<[u64]> + Clone>(
         GenericResult::Break(label) => {
             sink.report_break(DiagStyle::Yq, &label, &no_location());
             Ok(vec![])
+        }
+        // The outputs already produced no longer vanish behind the failure
+        // (#400, #494).
+        GenericResult::Partial(vs, jq::Control::Error(e)) => {
+            sink.report(DiagStyle::Yq, &e, &no_location());
+            Ok(vs)
+        }
+        GenericResult::Partial(vs, jq::Control::Break(label)) => {
+            sink.report_break(DiagStyle::Yq, &label, &no_location());
+            Ok(vs)
         }
     }
 }

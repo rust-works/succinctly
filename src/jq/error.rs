@@ -43,6 +43,19 @@ pub struct EvalError {
     pub value: Option<OwnedValue>,
 }
 
+/// A stream terminator: what ended a sequence of outputs when it wasn't
+/// simple exhaustion.
+///
+/// Carried by `QueryResult::Partial`/`GenericResult::Partial` (#400, #494)
+/// alongside whatever outputs the stream produced before terminating, so a
+/// mid-stream `error(...)` or `break $label` no longer discards the prefix
+/// that came before it.
+#[derive(Debug, Clone)]
+pub enum Control {
+    Error(EvalError),
+    Break(String),
+}
+
 /// jq truncates values embedded in error messages to a fixed-width buffer
 /// (`jv_dump_string_trunc` with `char errbuf[15]`): a JSON dump of at most
 /// `DUMP_BUDGET` bytes is used verbatim, anything longer keeps its first

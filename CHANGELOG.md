@@ -127,6 +127,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **jq: a mid-stream error or `break` discarded every output already produced
+  by the same evaluation** (#400, #494): `QueryResult` (and its mirror
+  `GenericResult`) modeled `Error`/`Break` as a property of the *whole*
+  stream rather than of one output in it, so any stream-accumulating operator
+  — `,`, `|`, `and`/`or`, `//`, `try`/`catch`, `label`/`break`, `foreach`,
+  `while`, `limit` — threw away whatever it had already accumulated the
+  instant a later sibling raised or broke: `(1,error("x")) // 2` gave `2`
+  where jq gives `1` then the error, and `label $out | 1,2,break $out,4`
+  printed nothing where jq prints `1`, `2`. Both enums gained a
+  `Partial(Vec<OwnedValue>, Control)` terminal — a stream that produced
+  these outputs and then hit this error or break — kept distinct from the
+  existing zero-prefix `Error`/`Break` variants so the ~400 call sites that
+  only ever *raise* or *pass through* needed no change; the compiler's
+  exhaustiveness check found every site that did. Each operator's target
+  behavior was verified against jq 1.7.1 directly rather than assumed, and
+  several are not simply "always keep the prefix": `limit`/`first`/`nth`
+  never ask their operand for values past what they need, so
+  `limit(2; 1,2,error("boom"))` is `1`, `2` with the error never surfacing
+  at all, while `last` never short-circuits and always sees a trailing
+  error; `//` and `and`/`or` still filter/pair the prefix the same way they
+  already filter a complete stream; `try`/`catch` emits the prefix and then
+  splices in the catch handler's own result (`try (1,2,error("x")) catch
+  "c"` is `1`, `2`, `"c"`); array/object construction and `reduce`'s own
+  output stay atomic/whole-or-nothing, matching jq, since neither streams
+  partial output in the first place. `foreach`'s *input* stream and
+  `as`-bindings needed the same "process the produced prefix, defer the
+  trailing control" treatment as `eval_pipe`. Seven new pinned-`jq` golden
+  cases cover the family
+  (`and`/`or`+`break`, a boolean operand erroring mid-cartesian, multi-output
+  `try`/`catch`, `foreach` over an erroring input stream, `limit` satisfied
+  before an error would surface, and `try`/`catch` not catching `break` at
+  all where jq's `catch` does — filed as #562, fixed there for the bare
+  `Break` case and here for a `Partial` ending in one). **Not covered**:
+  computed indexing (`E[K]`)'s key/target forking, `if`/`select`'s
+  first-output-only condition (#378) and a `Partial` prefix reaching
+  `result_to_owned`/assignment-RHS/`pick`/`omit` all keep today's existing
+  "take the first output" simplification rather than gaining new fanout
+  semantics — none of those are what #400/#494 were about, and inventing
+  new behavior for them risked masking their own, differently-scoped issues.
+
 - **Assignment (`=`, `|=`, the compound family, `//=`) refused to build a
   missing container, and `?` on a write path swallowed the write itself**
   (#486, #498): `.a.b = 9` on `{}` raised `Cannot index null with string
@@ -322,10 +362,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tracked by #354/#378). Others error instead of fanning out: `range(1,2; 4)`
   (`Range bounds must be numeric`) and a computed object key
   `{(("a","b")): 1}` (`key must be a string`). Separately, a bare top-level
-  comma after `label $out |` can now reach `break`, which discards the comma
-  siblings already emitted before it instead of keeping them —
-  `label $out | 1,2,break $out,4` prints nothing instead of `1`, `2` — the
-  pre-existing `eval_comma`/`QueryResult` architectural gap tracked by #400.
+  comma after `label $out |` could reach `break` and discard the comma
+  siblings already emitted before it — `label $out | 1,2,break $out,4`
+  printed nothing instead of `1`, `2` — the `eval_comma`/`QueryResult`
+  architectural gap this paragraph originally flagged here, fixed above
+  (#400, #494).
 
 - **`%YAML`/`%TAG` directive lines were not recognized, and swallowed the
   following `---`** (#225): a directive fell through to the plain-scalar
@@ -1216,11 +1257,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   raises. Split out of #160, which deliberately left this arm unchanged to
   keep that fix scoped to the multi-output bug. `//` now propagates a
   left-hand error; `.a? // 3` is unaffected since `?` already resolves to
-  `None` before reaching the operator. **Not fixed**: the whole-stream error
-  model means `(1, error("x")) // 2` still yields `2` where jq yields `1` —
-  `QueryResult::Error` is a property of the stream, not of one output, so
-  partial-then-error is unrepresentable; a faithful fix is the same larger
-  change `eval_comma` needs for #400.
+  `None` before reaching the operator. The whole-stream error model this
+  paragraph originally flagged here — `(1, error("x")) // 2` yielding `2`
+  instead of `1` then the error — is fixed above (#400, #494).
 
 - **YAML alias used as a flow-mapping key rendered as the empty string** (#405):
   `{&x k: 1, *x: 2}` loaded as `{"k":1,"":2}` where `yq` gives `{"k":1,"k":2}`,
@@ -1509,14 +1548,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   values borrowed, so the zero-copy path survives. `succinctly yq` gets the fix
   too, since its evaluator delegates all three operators to this one. Ten new
   pinned-`jq` golden cases cover the family, and the known-failures manifest
-  drops to two entries. **Not fixed**: `QueryResult` still models an error or a
-  `break` as a property of the whole stream rather than of one output, so
-  `(1,error("x")) // 2` yields `2` where jq yields `1`, and a mid-stream error
-  or `break` in `and`/`or` discards the outputs already computed —
-  `label $out | ((true,true) and (1, break $out))` yields nothing where jq
-  yields `true` (#400); and `if`/`select` still collapse a multi-output condition
-  to its first output (#378, sibling of #354). `//` also suppressed left-hand
-  errors rather than propagating them; fixed separately below (#377).
+  drops to two entries. **Not fixed**: `if`/`select` still collapse a
+  multi-output condition to its first output (#378, sibling of #354). `//`
+  also suppressed left-hand errors rather than propagating them; fixed
+  separately below (#377). The deeper whole-stream `Error`/`Break` model this
+  paragraph originally flagged here — `(1,error("x")) // 2` yielding `2`
+  instead of `1` then the error, and `label $out | ((true,true) and (1,
+  break $out))` yielding nothing instead of `true` — is fixed above (#400,
+  #494).
 - **YAML: a tab after spaces in indentation was folded into the key** (#173):
   the loader rejected a tab only at column 0 and treated a tab following one or
   more spaces as start-of-content, so `a:\n \tb: 1` loaded as

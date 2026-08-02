@@ -38,6 +38,16 @@
 # and then fails. Exit code and stderr already match, so each fails on
 # stdout alone — and a fix that emits the prefix while losing the failure
 # would fail on status instead, which is the pairing #400/#494 need pinned.
+#
+# #400/#494 fixed: `QueryResult`/`GenericResult` gained a `Partial(prefix,
+# control)` terminal that lets a stream carry outputs *and then* an error or
+# break, instead of collapsing the whole stream to a bare `Error`/`Break`.
+# alt_error_after_output, label_break_after_comma, limit_error_after_output,
+# while_error_after_output and foreach_error_after_output all now match jq,
+# dropping the file to 10. Verifying that fix against the pinned oracle
+# surfaced a distinct, pre-existing gap — try/catch not catching break — but
+# #562 fixed that separately (and landed first), and the #400/#494 branch
+# extended the same fix to a Partial-prefixed break, so the count stays 10.
 
 comma_literal_before_document  comma              . evaluates before the literal 1 inside [1, .], reversing output order — #353
 object_construct_cartesian     object_construct   only the first output of each key/value generator is used instead of the cartesian product — #354
@@ -47,10 +57,5 @@ nan_type                       nan                nan | type reports "null" inst
 path_recursive_descent         path               path(..) returns only the root path instead of every descendant path — #483
 recurse_null_child             recurse            recurse on {"a":null} stops before visiting the null leaf — #490
 slice_computed_bounds          slice              computed slice bounds (.a[.k:2]) are a parse error; only integer literals are accepted — #499
-label_break_after_comma        label              break loses the already-emitted comma siblings that preceded it, producing no output — #400
 reduce_multi_output_init       reduce             a multi-output reduce INIT forks in jq; only the first init output is used — #534
 foreach_multi_output_init      foreach            a multi-output foreach INIT forks in jq; only the first init output is used — #534
-alt_error_after_output         alt                // discards the outputs the LHS already emitted before it errored — #400
-limit_error_after_output       limit              limit drops the outputs already emitted when a later one errors — #494
-while_error_after_output       while              while drops the outputs already emitted when a later iteration errors — #494
-foreach_error_after_output     foreach            foreach drops the outputs already emitted when a later state errors — #494

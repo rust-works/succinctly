@@ -20,7 +20,7 @@ use indexmap::IndexMap;
 use super::document::{DocumentCursor, DocumentElements, DocumentFields, DocumentValue};
 use super::eval::{
     compare_values, eval as full_eval, index_one_owned as index_owned_by_key, numeric_key_to_index,
-    tonumber_from_str, EvalError, EvalSemantics, JqSemantics, QueryResult,
+    tonumber_from_str, Control, EvalError, EvalSemantics, JqSemantics, QueryResult,
 };
 use super::expr::{Builtin, CompareOp, Expr, Literal};
 use super::value::OwnedValue;
@@ -137,7 +137,53 @@ fn eval_on_owned<S: EvalSemantics, V: DocumentValue>(
         QueryResult::Owned(v) => GenericResult::Owned(v),
         QueryResult::ManyOwned(vs) => GenericResult::ManyOwned(vs),
         QueryResult::Break(label) => GenericResult::Break(label),
+        QueryResult::Partial(vs, control) => GenericResult::Partial(vs, control),
     }
+}
+
+/// Normalize a prefix and its terminator into a `GenericResult` (#400, #494).
+/// Mirrors [`super::eval::partial`] (the `QueryResult` equivalent) — an empty
+/// prefix collapses to the bare `Error`/`Break` variant.
+fn partial_generic<V: DocumentValue>(
+    prefix: Vec<OwnedValue>,
+    control: Control,
+) -> GenericResult<V> {
+    if prefix.is_empty() {
+        match control {
+            Control::Error(e) => GenericResult::Error(e),
+            Control::Break(label) => GenericResult::Break(label),
+        }
+    } else {
+        GenericResult::Partial(prefix, control)
+    }
+}
+
+/// Flatten a batch of per-element results into one `Vec<OwnedValue>`.
+///
+/// `items` must never contain `Error`/`Break`/`Partial` — callers that build
+/// up a per-element batch route those variants to an early return (folding
+/// whatever was already flattened into a `Partial` of their own via
+/// [`partial_generic`]) instead of pushing them here, so this only ever sees
+/// the variants that still need materializing.
+fn flatten_generic_results<V: DocumentValue>(items: Vec<GenericResult<V>>) -> Vec<OwnedValue> {
+    let mut results = Vec::new();
+    for r in items {
+        match r {
+            GenericResult::One(v) => results.push(to_owned(&v)),
+            GenericResult::OneCursor(c) => results.push(to_owned(&c.value())),
+            GenericResult::Many(rs) => results.extend(rs.iter().map(to_owned)),
+            GenericResult::ManyCursor(cs) => {
+                results.extend(cs.iter().map(|c| to_owned(&c.value())));
+            }
+            GenericResult::None => {}
+            GenericResult::Owned(o) => results.push(o),
+            GenericResult::ManyOwned(os) => results.extend(os),
+            GenericResult::Error(_) | GenericResult::Break(_) | GenericResult::Partial(..) => {
+                unreachable!("Error/Break/Partial already routed to an early return above")
+            }
+        }
+    }
+    results
 }
 
 /// Evaluate an expression on multiple OwnedValues using the full evaluator.
@@ -156,10 +202,15 @@ fn eval_on_many_owned<S: EvalSemantics, V: DocumentValue>(
                 unreachable!("eval_on_owned never returns ManyCursor")
             }
             GenericResult::None => {}
-            GenericResult::Error(e) => return GenericResult::Error(e),
+            // The outputs already produced no longer vanish (#400, #494).
+            GenericResult::Error(e) => return partial_generic(results, Control::Error(e)),
             GenericResult::Owned(o) => results.push(o),
             GenericResult::ManyOwned(os) => results.extend(os),
-            GenericResult::Break(label) => return GenericResult::Break(label),
+            GenericResult::Break(label) => return partial_generic(results, Control::Break(label)),
+            GenericResult::Partial(vs, control) => {
+                results.extend(vs);
+                return partial_generic(results, control);
+            }
         }
     }
     if results.is_empty() {
@@ -199,6 +250,10 @@ pub enum GenericResult<V: DocumentValue> {
 
     /// Break from a labeled scope.
     Break(String),
+
+    /// One or more outputs were produced before the stream terminated in an
+    /// error or a `break` (#400, #494). Mirrors [`QueryResult::Partial`].
+    Partial(Vec<OwnedValue>, Control),
 }
 
 impl<V: DocumentValue> GenericResult<V> {
@@ -216,10 +271,16 @@ impl<V: DocumentValue> GenericResult<V> {
             Self::Owned(o) => Some(o),
             Self::ManyOwned(os) => Some(OwnedValue::Array(os)),
             Self::Break(_) => None,
+            // A `Partial` prefix is not representable as a single value —
+            // same "not representable" answer as `Break`/`Error` here.
+            Self::Partial(..) => None,
         }
     }
 
     /// Collect all results into a Vec of OwnedValues.
+    ///
+    /// A `Partial` collects its prefix — the whole point of #400/#494 is
+    /// that those outputs are no longer discarded.
     pub fn collect_owned(self) -> Vec<OwnedValue> {
         match self {
             Self::One(v) => vec![to_owned(&v)],
@@ -231,12 +292,15 @@ impl<V: DocumentValue> GenericResult<V> {
             Self::Owned(o) => vec![o],
             Self::ManyOwned(os) => os,
             Self::Break(_) => vec![],
+            Self::Partial(vs, _control) => vs,
         }
     }
 
     /// Check if this is an error.
+    ///
+    /// A `Partial` prefix followed by an error still counts.
     pub fn is_error(&self) -> bool {
-        matches!(self, Self::Error(_))
+        matches!(self, Self::Error(_) | Self::Partial(_, Control::Error(_)))
     }
 
     /// Get the error if this is an error result.
@@ -332,6 +396,25 @@ impl<V: DocumentValue> GenericResult<V> {
                     not_a_string: false,
                 });
             }
+            // The prefix streams like `ManyOwned` above, then the control is
+            // reported the same way `Error`/`Break` are (#400, #494) — the
+            // outputs already produced no longer vanish behind the failure.
+            Self::Partial(os, control) => {
+                for o in os {
+                    o.stream_json(out, indent_spaces)?;
+                    on_value(out)?;
+                    stats.last_was_falsy = o.is_falsy();
+                    stats.any_truthy |= !stats.last_was_falsy;
+                }
+                stats.count = os.len();
+                stats.error = Some(match control {
+                    Control::Error(e) => stream_error(e),
+                    Control::Break(label) => StreamError {
+                        message: format!("break ${label} not in label"),
+                        not_a_string: false,
+                    },
+                });
+            }
         }
 
         Ok(stats)
@@ -423,6 +506,24 @@ impl<V: DocumentValue> GenericResult<V> {
                 stats.error = Some(StreamError {
                     message: format!("break ${label} not in label"),
                     not_a_string: false,
+                });
+            }
+            // Same treatment as `stream_json` (#400, #494): the prefix
+            // streams first, then the control is reported.
+            Self::Partial(os, control) => {
+                for o in os {
+                    o.stream_yaml(out, indent_spaces)?;
+                    on_value(out)?;
+                    stats.last_was_falsy = o.is_falsy();
+                    stats.any_truthy |= !stats.last_was_falsy;
+                }
+                stats.count = os.len();
+                stats.error = Some(match control {
+                    Control::Error(e) => stream_error(e),
+                    Control::Break(label) => StreamError {
+                        message: format!("break ${label} not in label"),
+                        not_a_string: false,
+                    },
                 });
             }
         }
@@ -583,6 +684,25 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
 
             for (i, expr) in exprs.iter().enumerate().skip(1) {
                 current = match current {
+                    // The previous stage produced `vs` before terminating in
+                    // `outer_control` (#400, #494): pipe that prefix through
+                    // this stage first — `eval_on_many_owned` already
+                    // propagates any control the piping itself hits — and
+                    // only attach `outer_control` once that's done cleanly.
+                    GenericResult::Partial(vs, outer_control) => {
+                        match eval_on_many_owned::<S, _>(expr, vs, optional) {
+                            p @ (GenericResult::Partial(..)
+                            | GenericResult::Error(_)
+                            | GenericResult::Break(_)) => p,
+                            GenericResult::None => partial_generic(Vec::new(), outer_control),
+                            GenericResult::ManyOwned(results) => {
+                                partial_generic(results, outer_control)
+                            }
+                            _ => unreachable!(
+                                "eval_on_many_owned only returns None/ManyOwned/Error/Break/Partial"
+                            ),
+                        }
+                    }
                     GenericResult::One(v) => eval_single::<S, _>(expr, v, optional, None),
                     GenericResult::OneCursor(c) => {
                         eval_single::<S, _>(expr, c.value(), optional, Some(c))
@@ -600,10 +720,20 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                                     results.extend(cs.iter().map(|c| to_owned(&c.value())));
                                 }
                                 GenericResult::None => {}
-                                GenericResult::Error(e) => return GenericResult::Error(e),
+                                // The outputs already piped through no longer
+                                // vanish (#400, #494).
+                                GenericResult::Error(e) => {
+                                    return partial_generic(results, Control::Error(e));
+                                }
                                 GenericResult::Owned(o) => results.push(o),
                                 GenericResult::ManyOwned(os) => results.extend(os),
-                                GenericResult::Break(label) => return GenericResult::Break(label),
+                                GenericResult::Break(label) => {
+                                    return partial_generic(results, Control::Break(label));
+                                }
+                                GenericResult::Partial(vs2, control) => {
+                                    results.extend(vs2);
+                                    return partial_generic(results, control);
+                                }
                             }
                         }
                         if results.is_empty() {
@@ -633,8 +763,25 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                         let mut per_element = Vec::with_capacity(cs.len());
                         for c in cs {
                             match eval_single::<S, _>(&rest, c.value(), optional, Some(c)) {
-                                GenericResult::Error(e) => return GenericResult::Error(e),
-                                GenericResult::Break(label) => return GenericResult::Break(label),
+                                // The elements already piped through no
+                                // longer vanish (#400, #494).
+                                GenericResult::Error(e) => {
+                                    return partial_generic(
+                                        flatten_generic_results(per_element),
+                                        Control::Error(e),
+                                    );
+                                }
+                                GenericResult::Break(label) => {
+                                    return partial_generic(
+                                        flatten_generic_results(per_element),
+                                        Control::Break(label),
+                                    );
+                                }
+                                GenericResult::Partial(vs, control) => {
+                                    let mut prefix = flatten_generic_results(per_element);
+                                    prefix.extend(vs);
+                                    return partial_generic(prefix, control);
+                                }
                                 other => per_element.push(other),
                             }
                         }
@@ -655,27 +802,7 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                                     .collect(),
                             )
                         } else {
-                            let mut results = Vec::new();
-                            for r in per_element {
-                                match r {
-                                    GenericResult::One(v) => results.push(to_owned(&v)),
-                                    GenericResult::OneCursor(c) => {
-                                        results.push(to_owned(&c.value()));
-                                    }
-                                    GenericResult::Many(rs) => {
-                                        results.extend(rs.iter().map(to_owned));
-                                    }
-                                    GenericResult::ManyCursor(cs) => {
-                                        results.extend(cs.iter().map(|c| to_owned(&c.value())));
-                                    }
-                                    GenericResult::None => {}
-                                    GenericResult::Owned(o) => results.push(o),
-                                    GenericResult::ManyOwned(os) => results.extend(os),
-                                    GenericResult::Error(_) | GenericResult::Break(_) => {
-                                        unreachable!("Error/Break already returned above")
-                                    }
-                                }
-                            }
+                            let results = flatten_generic_results(per_element);
                             if results.is_empty() {
                                 GenericResult::None
                             } else {
@@ -751,6 +878,11 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                     }
                 }
                 GenericResult::Break(label) => return GenericResult::Break(label),
+                // Same "take the first output" policy as `Many`/`ManyOwned`
+                // above; the trailing control is dropped, consistent with
+                // how comparison already doesn't fork over a multi-output
+                // operand.
+                GenericResult::Partial(vs, _control) => vs.into_iter().next().unwrap(),
             };
 
             let right_owned = match right_result {
@@ -787,6 +919,9 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                     }
                 }
                 GenericResult::Break(label) => return GenericResult::Break(label),
+                // Same "take the first output" policy as `Many`/`ManyOwned`
+                // above; the trailing control is dropped.
+                GenericResult::Partial(vs, _control) => vs.into_iter().next().unwrap(),
             };
 
             // Perform the comparison
@@ -854,6 +989,7 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                 QueryResult::Owned(v) => GenericResult::Owned(v),
                 QueryResult::ManyOwned(vs) => GenericResult::ManyOwned(vs),
                 QueryResult::Break(label) => GenericResult::Break(label),
+                QueryResult::Partial(vs, control) => GenericResult::Partial(vs, control),
             }
         }
     }
@@ -946,6 +1082,12 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
         GenericResult::Error(e) => return GenericResult::Error(e),
         GenericResult::Break(label) => return GenericResult::Break(label),
         GenericResult::None => return GenericResult::None,
+        // Computed indexing's key/target forking isn't part of #400/#494's
+        // verified semantics — conservatively matching the Error/Break arms
+        // above rather than inventing new partial-target behavior, same as
+        // `eval::eval_index_expr`.
+        GenericResult::Partial(_, Control::Error(e)) => return GenericResult::Error(e),
+        GenericResult::Partial(_, Control::Break(label)) => return GenericResult::Break(label),
         GenericResult::One(v) => vec![v],
         GenericResult::Many(vs) => vs,
         GenericResult::OneCursor(c) => vec![c.value()],
@@ -1094,6 +1236,18 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                     pass()
                 }
                 GenericResult::Break(label) => GenericResult::Break(label),
+                // The condition is only ever consulted once here (see the
+                // `Many`/`ManyOwned`/`ManyCursor` arm above, a separate,
+                // already-existing limitation) — a `Partial` condition is
+                // conservatively treated the same as a bare `Error`/`Break`.
+                GenericResult::Partial(_, Control::Error(e)) => {
+                    if optional {
+                        GenericResult::None
+                    } else {
+                        GenericResult::Error(e)
+                    }
+                }
+                GenericResult::Partial(_, Control::Break(label)) => GenericResult::Break(label),
             }
         }
 
@@ -2466,6 +2620,14 @@ mod tests {
             GenericResult::None,
             GenericResult::Error(EvalError::new("boom")),
             GenericResult::Break("lbl".to_string()),
+            // #400/#494: a prefix that reached the caller, then a control.
+            // Both terminators get their own arm everywhere `Error`/`Break`
+            // do, so both shapes sit in the vec.
+            GenericResult::Partial(
+                vec![OwnedValue::Int(1), OwnedValue::Int(2)],
+                Control::Error(EvalError::new("late")),
+            ),
+            GenericResult::Partial(vec![OwnedValue::Int(3)], Control::Break("lbl".to_string())),
         ];
 
         // is_error / error / is_single_cursor (borrow &self)
@@ -2522,6 +2684,61 @@ mod tests {
             .as_ref()
             .is_some_and(|e| e.message.contains("not in label")));
 
+        // A `Partial` streams its prefix to `out` and reports the control
+        // through `stats.error` — the prefix is what #400/#494 stopped
+        // discarding, and the diagnostic still stays off stdout.
+        let mut partial_json = String::new();
+        let mut seen = 0usize;
+        let partial_stats = results[7]
+            .stream_json(&mut partial_json, 0, |_| {
+                seen += 1;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(partial_json, "12");
+        assert_eq!(seen, 2, "on_value runs once per streamed prefix value");
+        assert_eq!(partial_stats.count, 2);
+        assert!(partial_stats.any_truthy);
+        assert_eq!(
+            partial_stats.error.as_ref().map(|e| e.message.as_str()),
+            Some("late")
+        );
+
+        let mut partial_yaml = String::new();
+        let partial_stats = results[7]
+            .stream_yaml(&mut partial_yaml, 2, |w| {
+                use core::fmt::Write;
+                writeln!(w)
+            })
+            .unwrap();
+        assert_eq!(partial_yaml, "1\n2\n");
+        assert_eq!(partial_stats.count, 2);
+        assert_eq!(
+            partial_stats.error.as_ref().map(|e| e.message.as_str()),
+            Some("late")
+        );
+
+        // A `Partial` ending in a break reports the same "not in label"
+        // diagnostic the bare `Break` arm does, after its prefix.
+        let mut partial_brk = String::new();
+        let brk_stats = results[8]
+            .stream_json(&mut partial_brk, 0, |_| Ok(()))
+            .unwrap();
+        assert_eq!(partial_brk, "3");
+        assert!(brk_stats
+            .error
+            .as_ref()
+            .is_some_and(|e| e.message.contains("not in label")));
+        let mut partial_brk_yaml = String::new();
+        let brk_stats = results[8]
+            .stream_yaml(&mut partial_brk_yaml, 2, |_| Ok(()))
+            .unwrap();
+        assert_eq!(partial_brk_yaml, "3");
+        assert!(brk_stats
+            .error
+            .as_ref()
+            .is_some_and(|e| e.message.contains("not in label")));
+
         // into_owned consumes; check the owned-family variants.
         let owned: Vec<Option<OwnedValue>> =
             results.into_iter().map(GenericResult::into_owned).collect();
@@ -2536,6 +2753,12 @@ mod tests {
         assert_eq!(owned[4], None); // None
         assert_eq!(owned[5], None); // Error
         assert_eq!(owned[6], None); // Break
+
+        // A prefix plus a control is not representable as one value, so
+        // `into_owned` answers `None` the way `Error`/`Break` do — unlike
+        // `collect_owned`, which keeps the prefix (checked separately).
+        assert_eq!(owned[7], None); // Partial(_, Error)
+        assert_eq!(owned[8], None); // Partial(_, Break)
     }
 
     #[test]
@@ -2553,6 +2776,10 @@ mod tests {
             GenericResult::Error(EvalError::new("e")),
             GenericResult::Break("l".to_string()),
             GenericResult::Owned(OwnedValue::Bool(true)),
+            GenericResult::Partial(
+                vec![OwnedValue::Int(1), OwnedValue::Int(2)],
+                Control::Error(EvalError::new("late")),
+            ),
         ];
         let collected: Vec<Vec<OwnedValue>> = results
             .into_iter()
@@ -2564,6 +2791,9 @@ mod tests {
         assert!(collected[3].is_empty()); // Error
         assert!(collected[4].is_empty()); // Break
         assert_eq!(collected[5], vec![OwnedValue::Bool(true)]); // Owned
+
+        // Unlike `into_owned`, this keeps the prefix — #400/#494's whole point.
+        assert_eq!(collected[6], vec![OwnedValue::Int(1), OwnedValue::Int(2)]); // Partial
     }
 
     #[test]
@@ -2896,5 +3126,163 @@ mod tests {
 
         let result = eval_with_cursor(&expr, index.root(json));
         assert_eq!(result.into_owned(), Some(OwnedValue::Int(10)));
+    }
+
+    /// A `GenericResult` reduced to the parts these tests assert on, so the
+    /// borrowed document can be dropped before the comparison.
+    #[derive(Debug, PartialEq, Eq)]
+    enum Summary {
+        /// Every output, as compact JSON.
+        Values(Vec<String>),
+        Error(String),
+        Break(String),
+        /// The prefix (compact JSON) and the control that ended it.
+        Partial(Vec<String>, Box<Self>),
+        None,
+    }
+
+    /// Evaluate `filter` on `json` through the generic (CLI) evaluator.
+    fn summarize(json: &[u8], filter: &str) -> Summary {
+        let index = JsonIndex::build(json);
+        let expr = crate::jq::parse(filter).unwrap();
+        let json_of = |vs: &[OwnedValue]| vs.iter().map(OwnedValue::to_json).collect::<Vec<_>>();
+        match eval_with_cursor(&expr, index.root(json)) {
+            GenericResult::None => Summary::None,
+            GenericResult::Error(e) => Summary::Error(e.message),
+            GenericResult::Break(l) => Summary::Break(l),
+            GenericResult::Partial(vs, Control::Error(e)) => {
+                Summary::Partial(json_of(&vs), Box::new(Summary::Error(e.message)))
+            }
+            GenericResult::Partial(vs, Control::Break(l)) => {
+                Summary::Partial(json_of(&vs), Box::new(Summary::Break(l)))
+            }
+            other => Summary::Values(json_of(&other.collect_owned())),
+        }
+    }
+
+    /// `Summary::Partial` of `prefix` then an error with `message`.
+    fn partial_err(prefix: &[&str], message: &str) -> Summary {
+        Summary::Partial(
+            prefix.iter().map(|s| (*s).to_string()).collect(),
+            Box::new(Summary::Error(message.to_string())),
+        )
+    }
+
+    /// `Summary::Partial` of `prefix` then `break $out`.
+    fn partial_break(prefix: &[&str]) -> Summary {
+        Summary::Partial(
+            prefix.iter().map(|s| (*s).to_string()).collect(),
+            Box::new(Summary::Break("out".to_string())),
+        )
+    }
+
+    #[test]
+    fn generic_pipe_stages_keep_the_prefix_before_a_control() {
+        // The generic evaluator has its own copy of the #400/#494 pipe
+        // handling, one arm per shape the previous stage can take. Every
+        // expectation here was verified against jq 1.7.1.
+
+        // Previous stage is a `Partial`: its prefix is piped through this
+        // stage before the held control is re-attached.
+        assert_eq!(
+            summarize(b"null", r#"(1,2,error("x")) | .+10"#),
+            partial_err(&["11", "12"], "x")
+        );
+        // A control hit *while* piping the prefix wins over the held one.
+        assert_eq!(
+            summarize(b"null", r#"(1,2,error("x")) | (., error("z"))"#),
+            partial_err(&["1"], "z")
+        );
+        assert_eq!(
+            summarize(
+                b"null",
+                r#"(1,2,error("x")) | if . == 2 then error("y") else . end"#
+            ),
+            partial_err(&["1"], "y")
+        );
+        assert_eq!(
+            summarize(
+                b"null",
+                "(1,2,error(\"x\")) | if . == 2 then break $out else . end"
+            ),
+            partial_break(&["1"])
+        );
+        // Piping the prefix through `empty` leaves nothing, so `partial_generic`
+        // normalizes the held control back to a bare `Error`.
+        assert_eq!(
+            summarize(b"null", r#"(1,2,error("x")) | empty"#),
+            Summary::Error("x".to_string())
+        );
+
+        // Previous stage is a `ManyCursor` (`.[]` over a document array): the
+        // elements already piped through survive a later element's control.
+        assert_eq!(
+            summarize(b"[1,2]", r#".[] | (., error("x"))"#),
+            partial_err(&["1"], "x")
+        );
+        assert_eq!(
+            summarize(b"[1,2]", ".[] | if . == 2 then break $out else . end"),
+            partial_break(&["1"])
+        );
+
+        // Previous stage is a borrowed `Many` — produced by a computed index
+        // with more than one key, the only shape that reaches that arm.
+        assert_eq!(
+            summarize(b"[10,20,30]", r#".[(0,1)] | (., error("x"))"#),
+            partial_err(&["10"], "x")
+        );
+        assert_eq!(
+            summarize(
+                b"[10,20,30]",
+                r#".[(0,1)] | if . == 20 then error("y") else . end"#
+            ),
+            partial_err(&["10"], "y")
+        );
+        assert_eq!(
+            summarize(
+                b"[10,20,30]",
+                ".[(0,1)] | if . == 20 then break $out else . end"
+            ),
+            partial_break(&["10"])
+        );
+    }
+
+    #[test]
+    fn generic_value_position_partial_collapses_to_its_control() {
+        // Comparison, computed indexing and `select` each consult their
+        // operand once, so a `Partial` there is reduced the same way a
+        // multi-output operand already is.
+
+        // Comparison keeps the prefix's first output on either side and drops
+        // the control. (jq 1.7.1 prints `true` and *then* fails; succinctly
+        // exits 0 — a divergence this pins rather than endorses.)
+        let truthy = Summary::Values(vec!["true".to_string()]);
+        assert_eq!(summarize(b"null", r#"(1,error("x")) == 1"#), truthy);
+        assert_eq!(summarize(b"null", r#"1 == (1,error("x"))"#), truthy);
+
+        // A computed *target* that is a `Partial` surfaces the control alone.
+        // (jq 1.7.1 prints 7 and 8 first; pinned here, not endorsed.)
+        assert_eq!(
+            summarize(b"[[7],[8]]", r#"(.[0],(.[1],error("x")))[(0+0)]"#),
+            Summary::Error("x".to_string())
+        );
+        assert_eq!(
+            summarize(b"[[7],[8]]", "(.[0],(.[1],break $out))[(0+0)]"),
+            Summary::Break("out".to_string())
+        );
+
+        // `select`'s condition, in all three of its arms.
+        assert_eq!(
+            summarize(b"5", r#"select((true,error("x")))"#),
+            Summary::Error("x".to_string())
+        );
+        assert_eq!(
+            summarize(b"5", r#"select((true,error("x")))?"#),
+            Summary::None
+        );
+        assert_eq!(
+            summarize(b"5", "select((true,break $out))"),
+            Summary::Break("out".to_string())
+        );
     }
 }

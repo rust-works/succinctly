@@ -1588,6 +1588,17 @@ fn evaluate_input(
             sink.report_break(DiagStyle::Jq, &label, at);
             Ok(vec![])
         }
+        // The outputs already produced no longer vanish behind the failure
+        // (#400, #494): report the diagnostic (which drives the exit code
+        // via `sink`), but still return the prefix for the caller to print.
+        GenericResult::Partial(vs, jq::Control::Error(e)) => {
+            sink.report(DiagStyle::Jq, &e, at);
+            Ok(vs)
+        }
+        GenericResult::Partial(vs, jq::Control::Break(label)) => {
+            sink.report_break(DiagStyle::Jq, &label, at);
+            Ok(vs)
+        }
     }
 }
 
@@ -1638,6 +1649,16 @@ fn generic_result_to_jq_values<'a, W: Clone + AsRef<[u64]>>(
         GenericResult::Break(label) => {
             sink.report_break(DiagStyle::Jq, &label, at);
             vec![]
+        }
+        // The outputs already produced no longer vanish behind the failure
+        // (#400, #494).
+        GenericResult::Partial(vs, jq::Control::Error(e)) => {
+            sink.report(DiagStyle::Jq, &e, at);
+            vs.into_iter().map(JqValue::from_owned).collect()
+        }
+        GenericResult::Partial(vs, jq::Control::Break(label)) => {
+            sink.report_break(DiagStyle::Jq, &label, at);
+            vs.into_iter().map(JqValue::from_owned).collect()
         }
     }
 }
