@@ -2487,11 +2487,12 @@ fn temp_json(contents: &str) -> Result<(NamedTempFile, String)> {
 
 #[test]
 fn test_uncaught_error_exits_5() -> Result<()> {
-    // jq: `jq: error (at <stdin>:1): boom`, exit 5.
+    // jq: `jq: error (at <stdin>:0): boom`, exit 5. Line 0: the input has no
+    // trailing newline, so jq's zero-based counter never advances (#524).
     let (stdout, stderr, code) = run_jq_full(&["-c", r#"error("boom")"#], Some(r#"{"x":1}"#))?;
     assert_eq!(code, 5, "uncaught error must exit 5: {stderr}");
     assert_eq!(stdout, "", "a failed filter produces no output");
-    assert_eq!(stderr.trim_end(), "jq: error (at <stdin>:1): boom");
+    assert_eq!(stderr.trim_end(), "jq: error (at <stdin>:0): boom");
     Ok(())
 }
 
@@ -2503,7 +2504,8 @@ fn test_uncaught_type_error_exits_5() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(&["-c", "1|.foo"], Some(r#"{"x":1}"#))?;
     assert_eq!(code, 5, "uncaught type error must exit 5: {stderr}");
     assert_eq!(stdout, "");
-    assert!(stderr.starts_with("jq: error (at <stdin>:1): "), "{stderr}");
+    // Line 0: the input has no trailing newline (#524).
+    assert!(stderr.starts_with("jq: error (at <stdin>:0): "), "{stderr}");
     assert!(!stderr.contains("(not a string)"), "{stderr}");
     Ok(())
 }
@@ -2512,18 +2514,19 @@ fn test_uncaught_type_error_exits_5() -> Result<()> {
 fn test_uncaught_error_marks_non_string_payload() -> Result<()> {
     // jq flags a raised payload that is not a string. Needs the raw value at
     // the print site -- the rendered message alone cannot tell the two apart.
+    // Line 0 throughout: the input has no trailing newline (#524).
     for (filter, want) in [
         (
             r#"error({"a":1})"#,
-            r#"jq: error (at <stdin>:1) (not a string): {"a":1}"#,
+            r#"jq: error (at <stdin>:0) (not a string): {"a":1}"#,
         ),
         (
             "error(null)",
-            "jq: error (at <stdin>:1) (not a string): null",
+            "jq: error (at <stdin>:0) (not a string): null",
         ),
-        ("error(42)", "jq: error (at <stdin>:1) (not a string): 42"),
+        ("error(42)", "jq: error (at <stdin>:0) (not a string): 42"),
         // A string payload is *not* flagged.
-        (r#"error("boom")"#, "jq: error (at <stdin>:1): boom"),
+        (r#"error("boom")"#, "jq: error (at <stdin>:0): boom"),
     ] {
         let (_, stderr, code) = run_jq_full(&["-c", filter], Some(r#"{"x":1}"#))?;
         assert_eq!(code, 5, "{filter}");
@@ -2552,6 +2555,31 @@ fn test_uncaught_error_names_the_file_and_line() -> Result<()> {
     )?;
     assert_eq!(code, 5);
     assert_eq!(stderr.trim_end(), format!("jq: error (at {path}:6): bad"));
+    Ok(())
+}
+
+#[test]
+fn test_uncaught_error_line_number_without_trailing_newline() -> Result<()> {
+    // #524: `line_at` reported one line too many whenever the erroring value
+    // is the last one and the input lacks a trailing newline. Every
+    // expectation here was captured against pinned jq 1.7.1-apple.
+
+    // Multi-value input with no trailing newline after the last value: real
+    // jq reports line 1 for *both* values, not line 2 for the second.
+    let (_keep, path) = temp_json("1\n2")?;
+    let (_, stderr, code) = run_jq_full(&["-c", r#"error("boom")"#, &path], None)?;
+    assert_eq!(code, 5);
+    assert_eq!(
+        stderr.trim_end(),
+        format!("jq: error (at {path}:1): boom\njq: error (at {path}:1): boom")
+    );
+
+    // A container value spanning multiple lines with no trailing newline:
+    // real jq names its closing brace's line, not one past it.
+    let (_keep, path) = temp_json("{\n\"a\":1\n}")?;
+    let (_, stderr, code) = run_jq_full(&["-c", r#"error("boom")"#, &path], None)?;
+    assert_eq!(code, 5);
+    assert_eq!(stderr.trim_end(), format!("jq: error (at {path}:2): boom"));
     Ok(())
 }
 
