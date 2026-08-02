@@ -352,6 +352,24 @@ be measured end-to-end, so "the benchmarks are neutral" would say nothing about
 it — the gap that let the quadratic sequence-iteration bug of #106 survive a
 full benchmark run.
 
+> **Pattern coverage note (#517).** `benches/yq_comparison.rs` used to hardcode
+> a 5-pattern subset (`comprehensive`, `users`, `nested`, `sequences`,
+> `strings`) with no link to the table below, so every pattern added since
+> — including `flow`, the pattern #362's closing comment asked to be measured
+> end-to-end — was invisible to it. It now derives its pattern list from
+> `yaml_pattern_registry::ALL_PATTERNS` (shared with `dev bench yq` via
+> `#[path]`, split out of `yaml_generators.rs` so the bench doesn't also
+> compile every `generate_*` function), the same source as the table below, so
+> a pattern registered here is benchmarked there without a second edit.
+> `config` is skipped as before (it generates one `config.yaml`, not a
+> `{size}.yaml` per rung of the size ladder — the same gap `dev bench yq` has).
+> Measured on Apple M1 Max: the identity-comparison groups' warm-up/measurement
+> time was trimmed from criterion's defaults (3s/5s) to 1s/2s to keep the full
+> 16-pattern x 4-size sweep from tripling runtime; the full `cargo bench --bench
+> yq_comparison` run went from 7m50s (5 patterns, 46 benchmark ids, default
+> timing) to 10m41s (16 patterns/15 with generated data, 126 benchmark ids,
+> trimmed timing) — a 1.4x increase for roughly 3x the pattern coverage.
+
 | Pattern         | Shape                                                    |
 |-----------------|----------------------------------------------------------|
 | `comprehensive` | Mixed features, the default comparison target             |

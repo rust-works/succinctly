@@ -14,9 +14,35 @@
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
-const PATTERNS: &[&str] = &["comprehensive", "users", "nested", "sequences", "strings"];
+// Same source file the `succinctly` binary compiles, rather than a second
+// pattern list, so a pattern added to `ALL_PATTERNS` is benchmarked here
+// without a second edit (#517).
+#[path = "../src/bin/succinctly/yaml_pattern_registry.rs"]
+mod yaml_pattern_registry;
+
+/// Every generated suite pattern, alphabetically. Mirrors
+/// `yq_bench::pattern_names()` in `src/bin/succinctly/yq_bench.rs`.
+fn pattern_names() -> Vec<String> {
+    let mut names: Vec<String> = yaml_pattern_registry::ALL_PATTERNS
+        .iter()
+        .map(|(name, _, _)| (*name).to_string())
+        .collect();
+    names.sort_unstable();
+    names
+}
+
 const SIZES: &[&str] = &["1kb", "10kb", "100kb", "1mb"];
+
+// This process-spawns real `yq`/`succinctly` per iteration, so deriving the
+// full pattern list (#517, was a hardcoded 5-pattern subset) roughly triples
+// benchmark-id count. Trimmed from criterion's defaults (3s warm-up + 5s
+// measurement per id) to keep total runtime close to the old 5-pattern total
+// — see docs/guides/benchmarking.md#patterns-and-what-they-cover for the
+// measured before/after.
+const WARM_UP: Duration = Duration::from_secs(1);
+const MEASUREMENT: Duration = Duration::from_secs(2);
 
 fn file_path(pattern: &str, size: &str) -> String {
     format!("data/bench/generated/yaml/{pattern}/{size}.yaml")
@@ -51,10 +77,11 @@ fn bench_succinctly_identity(c: &mut Criterion) {
     };
 
     let mut group = c.benchmark_group("succinctly_yq_identity");
+    group.warm_up_time(WARM_UP).measurement_time(MEASUREMENT);
 
-    for pattern in PATTERNS {
+    for pattern in pattern_names() {
         for size in SIZES {
-            let path = file_path(pattern, size);
+            let path = file_path(&pattern, size);
             let path_obj = std::path::Path::new(&path);
 
             if !path_obj.exists() {
@@ -65,7 +92,7 @@ fn bench_succinctly_identity(c: &mut Criterion) {
             group.throughput(Throughput::Bytes(file_size));
 
             group.bench_with_input(
-                BenchmarkId::new(*pattern, *size),
+                BenchmarkId::new(pattern.as_str(), *size),
                 &(&binary, &path),
                 |b, (binary, path)| {
                     b.iter(|| {
@@ -94,10 +121,11 @@ fn bench_system_yq_identity(c: &mut Criterion) {
     }
 
     let mut group = c.benchmark_group("system_yq_identity");
+    group.warm_up_time(WARM_UP).measurement_time(MEASUREMENT);
 
-    for pattern in PATTERNS {
+    for pattern in pattern_names() {
         for size in SIZES {
-            let path = file_path(pattern, size);
+            let path = file_path(&pattern, size);
             let path_obj = std::path::Path::new(&path);
 
             if !path_obj.exists() {
@@ -107,18 +135,22 @@ fn bench_system_yq_identity(c: &mut Criterion) {
             let file_size = path_obj.metadata().map_or(0, |m| m.len());
             group.throughput(Throughput::Bytes(file_size));
 
-            group.bench_with_input(BenchmarkId::new(*pattern, *size), &path, |b, path| {
-                b.iter(|| {
-                    let output = Command::new("yq")
-                        .args(["-o=json", "-I=0", ".", path])
-                        .stdout(Stdio::piped())
-                        .stderr(Stdio::null())
-                        .output()
-                        .expect("Failed to execute yq");
-                    assert!(output.status.success(), "system yq failed on {path}");
-                    output.stdout
-                });
-            });
+            group.bench_with_input(
+                BenchmarkId::new(pattern.as_str(), *size),
+                &path,
+                |b, path| {
+                    b.iter(|| {
+                        let output = Command::new("yq")
+                            .args(["-o=json", "-I=0", ".", path])
+                            .stdout(Stdio::piped())
+                            .stderr(Stdio::null())
+                            .output()
+                            .expect("Failed to execute yq");
+                        assert!(output.status.success(), "system yq failed on {path}");
+                        output.stdout
+                    });
+                },
+            );
         }
     }
 
