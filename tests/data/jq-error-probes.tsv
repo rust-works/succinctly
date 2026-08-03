@@ -277,3 +277,7 @@ del_comma_group_iterate_error	del(.[], .a)	5
 path_non_path_literal	path(1)	{"a":1}
 path_non_path_builtin	path(length)	{"a":1}
 path_non_path_arithmetic	path(.a + 1)	{"a":1}
+path_non_path_keys	path(keys)	{"a":1}
+path_non_path_pipe_to_builtin	path(.a | tostring)	{"a":1}
+path_non_path_object_construction	path({a:1})	{"a":1}
+path_non_path_optional_not_suppressed	path(("a")?)	{"a":1}

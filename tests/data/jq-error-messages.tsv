@@ -188,3 +188,7 @@ del_comma_group_iterate_error	del(.[], .a)	5	Cannot iterate over number (5)
 path_non_path_literal	path(1)	{"a":1}	Invalid path expression with result 1
 path_non_path_builtin	path(length)	{"a":1}	Invalid path expression with result 1
 path_non_path_arithmetic	path(.a + 1)	{"a":1}	Invalid path expression with result 2
+path_non_path_keys	path(keys)	{"a":1}	Invalid path expression with result ["a"]
+path_non_path_pipe_to_builtin	path(.a | tostring)	{"a":1}	Invalid path expression with result "1"
+path_non_path_object_construction	path({a:1})	{"a":1}	Invalid path expression with result {"a":1}
+path_non_path_optional_not_suppressed	path(("a")?)	{"a":1}	Invalid path expression with result "a"

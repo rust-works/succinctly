@@ -1,0 +1,1 @@
+[path(if true then .a else .c end)]

@@ -45,7 +45,11 @@
 # negative-index bounds check now survives `?`, since `?` only ever suppressed
 # errors raised while *collecting* a path) landed together and took
 # `optional_write_negative_oob` with them: `.[-5]? = 9` now raises, matching jq.
-
-path_non_path_literal                path            path() answers with no output where jq refuses a non-path filter by name — #530
-path_non_path_builtin                path            same, through a builtin that returns a computed value — #530
-path_non_path_arithmetic             path            same, through an arithmetic expression — #530
+#
+# #483/#530 (the `path()` resolver's catch-all was split into "path-capable
+# but unimplemented" — routed through `resolve_node`, now covering `..`,
+# `recurse`, `select`, the typeof filters, `first`, `if`, `//`, `limit`,
+# `try`, `label`, `as`, and static `getpath` — versus "not a path expression
+# at all", which now raises `EvalError::invalid_path_expression`) took
+# `path_non_path_literal`, `path_non_path_builtin` and `path_non_path_arithmetic`
+# with them, emptying the list again.
