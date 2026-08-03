@@ -71,7 +71,9 @@ use super::expr::{
     ArithOp, AssignOp, Builtin, CompareOp, Expr, FormatType, Literal, ObjectEntry, ObjectKey,
     Pattern, StringPart,
 };
-use super::value::{cmp_f64, format_number_jq_compat, numeric_repr_cmp, NumberRepr, OwnedValue};
+use super::value::{
+    cmp_f64, format_number_jq_compat, is_nan_sentinel, numeric_repr_cmp, NumberRepr, OwnedValue,
+};
 
 /// Result of evaluating a jq expression.
 #[derive(Debug)]
@@ -247,11 +249,17 @@ fn to_owned<W: Clone + AsRef<[u64]>>(value: &StandardJson<'_, W>) -> OwnedValue 
     match value {
         StandardJson::Null => OwnedValue::Null,
         StandardJson::Bool(b) => OwnedValue::Bool(*b),
-        StandardJson::Number(n) => match core::str::from_utf8(n.raw_bytes()) {
-            Ok(s) => OwnedValue::from_number_literal(s),
-            // Fallback - shouldn't happen for valid JSON
-            Err(_) => OwnedValue::Float(0.0),
-        },
+        StandardJson::Number(n) => {
+            if is_nan_sentinel(n.raw_bytes()) {
+                OwnedValue::Float(f64::NAN)
+            } else {
+                match core::str::from_utf8(n.raw_bytes()) {
+                    Ok(s) => OwnedValue::from_number_literal(s),
+                    // Fallback - shouldn't happen for valid JSON
+                    Err(_) => OwnedValue::Float(0.0),
+                }
+            }
+        }
         StandardJson::String(s) => {
             if let Ok(cow) = s.as_str() {
                 OwnedValue::String(cow.into_owned())
@@ -2208,7 +2216,9 @@ fn builtin_length<W: Clone + AsRef<[u64]>>(
         StandardJson::Number(n) => {
             // Length of a number is its absolute value.
             // checked_abs: i64::MIN has no i64 absolute value; use f64
-            if let Ok(i) = n.as_i64() {
+            if is_nan_sentinel(n.raw_bytes()) {
+                QueryResult::Owned(OwnedValue::Float(f64::NAN))
+            } else if let Ok(i) = n.as_i64() {
                 QueryResult::Owned(match i.checked_abs() {
                     Some(a) => OwnedValue::Int(a),
                     None => OwnedValue::Float(-(i as f64)),
@@ -4346,9 +4356,13 @@ fn builtin_tonumber<W: Clone + AsRef<[u64]>>(
         StandardJson::Number(n) => {
             // Already a number, return as-is -- this is a passthrough, not a
             // computation, so (like `.`) it keeps the source literal.
-            QueryResult::Owned(match core::str::from_utf8(n.raw_bytes()) {
-                Ok(s) => OwnedValue::from_number_literal(s),
-                Err(_) => OwnedValue::Int(0),
+            QueryResult::Owned(if is_nan_sentinel(n.raw_bytes()) {
+                OwnedValue::Float(f64::NAN)
+            } else {
+                match core::str::from_utf8(n.raw_bytes()) {
+                    Ok(s) => OwnedValue::from_number_literal(s),
+                    Err(_) => OwnedValue::Int(0),
+                }
             })
         }
         StandardJson::String(s) => {
@@ -14439,7 +14453,9 @@ fn builtin_isnan<W: Clone + AsRef<[u64]>>(
 ) -> QueryResult<'_, W> {
     match &value {
         StandardJson::Number(n) => {
-            if let Ok(f) = n.as_f64() {
+            if is_nan_sentinel(n.raw_bytes()) {
+                QueryResult::Owned(OwnedValue::Bool(true))
+            } else if let Ok(f) = n.as_f64() {
                 QueryResult::Owned(OwnedValue::Bool(f.is_nan()))
             } else {
                 QueryResult::Owned(OwnedValue::Bool(false))
@@ -20709,6 +20725,87 @@ mod tests {
         });
         query!(b"null", "nan", QueryResult::Owned(OwnedValue::Float(n)) => {
             assert!(n.is_nan());
+        });
+    }
+
+    #[test]
+    fn test_nan_survives_reindex_bridge_472() {
+        // `nan` alone is a native `OwnedValue::Float(NaN)` (`test_infinite_nan`
+        // above), but every filter here pipes that result through at least one
+        // `to_json_for_reindex`/reparse hop before the next stage runs. Before
+        // #472's fix that hop lost the NaN-ness (JSON has no NaN literal, and
+        // the bridge fell back to `"null"`), so these all disagreed with real
+        // jq. Every expected value is jq-1.7.1's own output for the same query.
+        query!(b"null", "nan | isnan", QueryResult::Owned(OwnedValue::Bool(b)) => {
+            assert!(b);
+        });
+        query!(b"null", "nan | tonumber | isnan", QueryResult::Owned(OwnedValue::Bool(b)) => {
+            assert!(b);
+        });
+        query!(b"null", "nan | length | isnan", QueryResult::Owned(OwnedValue::Bool(b)) => {
+            assert!(b);
+        });
+        query!(b"null", "[nan] | sort | .[0] | isnan", QueryResult::Owned(OwnedValue::Bool(b)) => {
+            assert!(b);
+        });
+        query!(b"null", "[nan,1] | bsearch(nan)", QueryResult::Owned(OwnedValue::Int(idx)) => {
+            assert_eq!(idx, -2);
+        });
+        query!(b"null", "[nan,nan] | bsearch(nan)", QueryResult::Owned(OwnedValue::Int(idx)) => {
+            assert_eq!(idx, -3);
+        });
+        query!(b"null", "[nan,nan,nan] | bsearch(nan)", QueryResult::Owned(OwnedValue::Int(idx)) => {
+            assert_eq!(idx, -4);
+        });
+    }
+
+    #[test]
+    fn test_bsearch_single_nan_haystack_known_divergence_472() {
+        // Discovered while fixing #472, but a separate, narrower bug: not
+        // fixed by NaN-survival, and not a reindex-bridge problem at all.
+        //
+        // `compare_values` (shared with `sort`/`unique`/`group_by`, #421)
+        // treats every NaN as strictly less than every other value,
+        // including another NaN, so `builtin_bsearch`'s binary search always
+        // walks *past* a NaN run without ever reporting it "found" -- and
+        // for every haystack tested except a single-element one, that
+        // matches jq's own answer exactly: `[nan,nan]|bsearch(nan)` is `-3`
+        // in both, `[nan,nan,nan]|bsearch(nan)` is `-4` in both (see
+        // `test_nan_survives_reindex_bridge_472`).
+        //
+        // `[nan]|bsearch(nan)` alone is jq's `-1`, not `-2`. A single probe
+        // can only take one branch, so matching jq here would require
+        // `compare_values(NaN, NaN)` to answer `Greater` for a one-element
+        // haystack and `Less` for every longer one -- impossible for any
+        // comparator that doesn't see the surrounding array. This means
+        // jq's own answer isn't a coherent "insertion point" under any
+        // total order either; it's an artifact of whatever raw-double
+        // comparisons jq's particular C probe sequence happens to hit for a
+        // "sorted" array that (containing NaN) isn't actually well-ordered
+        // to begin with -- exactly the not-a-strict-weak-order territory
+        // `compare_values`'s own doc comment already flags. Not worth
+        // chasing bug-for-bug; pinning succinctly's current, consistent
+        // answer here rather than leaving it silently uncovered.
+        query!(b"null", "[nan] | bsearch(nan)", QueryResult::Owned(OwnedValue::Int(idx)) => {
+            assert_eq!(idx, -2);
+        });
+    }
+
+    #[test]
+    fn test_nan_sentinel_collision_with_real_document_is_well_defined() {
+        // #472's design tradeoff, made explicit: `NAN_SENTINEL` is reserved
+        // and unparseable by construction
+        // (`test_nan_sentinel_is_unparseable_as_a_real_number`), but it's
+        // still just number-shaped text, not a value that only the reindex
+        // bridge can produce -- a *real* document containing this exact byte
+        // sequence is affected too. Pin that this is well-defined (treated
+        // as NaN, consistently across builtins) rather than a panic or a
+        // silently different fallback per call site.
+        query!(br"9e999e999", "isnan", QueryResult::Owned(OwnedValue::Bool(b)) => {
+            assert!(b);
+        });
+        query!(br"9e999e999", "length", QueryResult::Owned(OwnedValue::Float(f)) => {
+            assert!(f.is_nan());
         });
     }
 
