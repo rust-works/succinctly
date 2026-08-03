@@ -578,7 +578,7 @@ fn bench_select_patterns(c: &mut Criterion) {
     let sequential_queries: Vec<usize> = (0..10_000.min(total_ones as usize)).collect();
 
     // Generate random queries
-    use rand::{Rng, SeedableRng};
+    use rand::{RngExt, SeedableRng};
     use rand_chacha::ChaCha8Rng;
     let mut rng = ChaCha8Rng::seed_from_u64(42);
     let random_queries: Vec<usize> = (0..10_000)

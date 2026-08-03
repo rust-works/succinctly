@@ -1,6 +1,6 @@
 //! JSON generators for comprehensive benchmarking.
 
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 
 #[derive(Debug, Clone, Copy)]
@@ -370,7 +370,7 @@ fn add_realistic_records(
         let score = rng.as_mut().map_or(count * 10, |r| r.random_range(0..1000));
         let active = rng
             .as_mut()
-            .map_or(count % 2 == 0, rand::Rng::random::<bool>);
+            .map_or(count % 2 == 0, rand::RngExt::random::<bool>);
         let salary = rng
             .as_mut()
             .map_or(50000.0, |r| r.random::<f64>() * 200000.0);

@@ -6,7 +6,7 @@
 //! - find_close, find_open, enclose operations
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use std::hint::black_box;
 use succinctly::bp::{self, BalancedParens};

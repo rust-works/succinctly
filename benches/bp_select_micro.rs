@@ -11,7 +11,7 @@
 #![allow(deprecated)] // benchmarks the deprecated WithSelect against its replacement
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use std::hint::black_box;
 use succinctly::trees::{BalancedParens, WithCsPoppy, WithSelect};

@@ -46,7 +46,7 @@
 //! same blind spot that let the quadratic sequence-iteration bug in #106
 //! survive a full benchmark run.
 
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 
 pub use crate::yaml_pattern_registry::{PatternScale, YamlPattern, ALL_PATTERNS};
@@ -1027,7 +1027,7 @@ fn add_mixed_nested(
     while yaml.len().saturating_sub(start_len) < target_size {
         let use_sequence = rng
             .as_mut()
-            .map_or(count % 2 == 0, rand::Rng::random::<bool>);
+            .map_or(count % 2 == 0, rand::RngExt::random::<bool>);
         let used = yaml.len().saturating_sub(start_len);
         let remaining = target_size.saturating_sub(used);
 
@@ -1139,7 +1139,7 @@ fn add_config_features(
     while yaml.len().saturating_sub(start_len) < target_size && count < feature_names.len() {
         let enabled = rng
             .as_mut()
-            .map_or(count % 2 == 0, rand::Rng::random::<bool>);
+            .map_or(count % 2 == 0, rand::RngExt::random::<bool>);
         let priority = rng.as_mut().map_or(count + 1, |r| r.random_range(1..10));
 
         yaml.push_str(&format!("{}{}:\n", ind, feature_names[count]));

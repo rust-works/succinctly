@@ -1117,7 +1117,7 @@ mod tests {
     /// `get_random`'s within-word case, the one an earlier (broken) version
     /// of the #171-review fix got wrong. Irregular gaps avoid that trap.
     fn irregular_positions(n: usize, seed: u64) -> Vec<u32> {
-        use rand::{Rng, SeedableRng};
+        use rand::{RngExt, SeedableRng};
         use rand_chacha::ChaCha8Rng;
 
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
@@ -1159,7 +1159,7 @@ mod tests {
 
     #[test]
     fn test_get_random_access_pattern_matches_reference() {
-        use rand::{Rng, SeedableRng};
+        use rand::{RngExt, SeedableRng};
         use rand_chacha::ChaCha8Rng;
 
         let positions = irregular_positions(3000, 2);
