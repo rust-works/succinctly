@@ -313,6 +313,11 @@ fn needs_path_context(expr: &Expr) -> bool {
         Expr::Optional(inner) => needs_path_context(inner),
         Expr::Comma(exprs) => exprs.iter().any(needs_path_context),
         Expr::IndexExpr { target, key } => needs_path_context(target) || needs_path_context(key),
+        Expr::SliceExpr { target, start, end } => {
+            needs_path_context(target)
+                || start.as_deref().is_some_and(needs_path_context)
+                || end.as_deref().is_some_and(needs_path_context)
+        }
         Expr::If {
             cond,
             then_branch,
@@ -343,6 +348,10 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Expr::Index(idx) => index_array_by_position::<W>(value, *idx, optional),
 
         Expr::IndexExpr { target, key } => eval_index_expr::<W, S>(target, key, value, optional),
+
+        Expr::SliceExpr { target, start, end } => {
+            eval_slice_expr::<W, S>(target, start, end, value, optional)
+        }
 
         Expr::Slice { start, end } => match value {
             StandardJson::Array(elements) => {
@@ -6765,6 +6774,187 @@ fn eval_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     }
 }
 
+/// Evaluate `E[S:T]` — slicing by computed bounds.
+///
+/// jq compiles this as `S as $s | T as $t | E | .[$s:$t]`, the same
+/// desugaring [`eval_index_expr`] documents for `E[K]`, with the same three
+/// load-bearing consequences (verified against jq 1.7.1):
+///
+/// 1. `S` and `T` are evaluated against *this node's* input, not `E`'s
+///    output.
+/// 2. The streams nest `S` outer, `T` middle, `E` inner:
+///    `[1,2,3,4,5][(0,1):(3,4)]` is
+///    `[[1,2,3],[1,2,3,4],[2,3],[2,3,4]]`.
+/// 3. An empty `S` or `T` stream short-circuits *before* the next stage
+///    runs: `(error("boom"))[0:empty]` is `[]`, not an error.
+///
+/// `optional` reaches only the final application of the resolved bounds to
+/// the target — the synthesized [`Expr::Slice`] this delegates to, which
+/// already carries the identical `optional`-gated "cannot index with type
+/// object" refusal a literal slice has. It reaches neither `S`/`T`'s
+/// evaluation nor a resolved-but-non-numeric bound: `"str" | .[0:.k]?` and
+/// `null | .[("x"):2]?` both still raise, matching a literal computed key
+/// (`.[.k]?` still raises on a string target) rather than
+/// `key_to_path_component`'s optional-gated type check.
+fn eval_slice_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    target: &Expr,
+    start: &Option<Box<Expr>>,
+    end: &Option<Box<Expr>>,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    let starts = match eval_slice_bound::<W, S>(start, value.clone(), f64::floor) {
+        Ok(v) => v,
+        Err(e) => return QueryResult::Error(e),
+    };
+    if starts.is_empty() {
+        return QueryResult::None;
+    }
+    let ends = match eval_slice_bound::<W, S>(end, value.clone(), f64::ceil) {
+        Ok(v) => v,
+        Err(e) => return QueryResult::Error(e),
+    };
+    if ends.is_empty() {
+        return QueryResult::None;
+    }
+
+    let targets = eval_single::<W, S>(target, value, false).materialize_cursor();
+
+    // Borrowed and owned targets are kept apart so the common (borrowed) case
+    // never materializes the document — mirrors `eval_index_expr`.
+    enum Targets<'a, W> {
+        Borrowed(Vec<StandardJson<'a, W>>),
+        Owned(Vec<OwnedValue>),
+    }
+    let targets = match targets {
+        QueryResult::One(v) => Targets::Borrowed(vec![v]),
+        QueryResult::Many(vs) => Targets::Borrowed(vs),
+        QueryResult::Owned(v) => Targets::Owned(vec![v]),
+        QueryResult::ManyOwned(vs) => Targets::Owned(vs),
+        QueryResult::None => return QueryResult::None,
+        QueryResult::Error(e) => return QueryResult::Error(e),
+        QueryResult::Break(label) => return QueryResult::Break(label),
+        QueryResult::OneCursor(_) => unreachable!("materialize_cursor should have converted this"),
+        QueryResult::Partial(_, Control::Error(e)) => return QueryResult::Error(e),
+        QueryResult::Partial(_, Control::Break(label)) => return QueryResult::Break(label),
+    };
+
+    // S outer, T middle, E inner (point 2 above). The result is always
+    // owned: slicing constructs a new array/string (see `eval_single`'s
+    // `Expr::Slice` arm), so there is nothing to borrow except its rare
+    // whole-value fast paths, which `to_owned` below just copies out of.
+    let mut out: Vec<OwnedValue> = Vec::with_capacity(starts.len() * ends.len());
+    match &targets {
+        Targets::Borrowed(ts) => {
+            for s in &starts {
+                for e in &ends {
+                    let slice_expr = Expr::Slice { start: *s, end: *e };
+                    for t in ts {
+                        match eval_single::<W, S>(&slice_expr, t.clone(), optional) {
+                            QueryResult::One(v) => out.push(to_owned(&v)),
+                            QueryResult::Owned(v) => out.push(v),
+                            QueryResult::None => {}
+                            QueryResult::Error(e) => return QueryResult::Error(e),
+                            _ => unreachable!("Expr::Slice yields only One/Owned/None/Error"),
+                        }
+                    }
+                }
+            }
+        }
+        Targets::Owned(ts) => {
+            for s in &starts {
+                for e in &ends {
+                    for t in ts {
+                        match slice_owned_value(t, *s, *e, optional) {
+                            Ok(Some(v)) => out.push(v),
+                            Ok(None) => {}
+                            Err(e) => return QueryResult::Error(e),
+                        }
+                    }
+                }
+            }
+        }
+    }
+    match out.len() {
+        1 => QueryResult::Owned(out.pop().expect("len checked")),
+        _ => QueryResult::ManyOwned(out),
+    }
+}
+
+/// Evaluate one slice bound (`start` or `end`) against `value`, collecting
+/// its output stream and rounding each resolved number the way
+/// `Expr::Slice` needs it stored — floor for a start bound, ceil for an end
+/// bound, so a fractional dynamic bound still widens the slice the way a
+/// literal one does (`SliceBounds::resolve` re-applies the same floor/ceil
+/// to whatever `Expr::Slice` carries, so rounding here first is transparent
+/// to it — see `slice.rs`'s doc comment). A missing bound (`None`) is a
+/// single `None` — "this side is open" — not an empty stream.
+fn eval_slice_bound<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    bound: &Option<Box<Expr>>,
+    value: StandardJson<'_, W>,
+    round: fn(f64) -> f64,
+) -> Result<Vec<Option<i64>>, EvalError> {
+    let Some(expr) = bound else {
+        return Ok(vec![None]);
+    };
+    let raw: Vec<OwnedValue> = match eval_single::<W, S>(expr, value, false).materialize_cursor() {
+        QueryResult::One(v) => vec![to_owned(&v)],
+        QueryResult::Many(vs) => vs.iter().map(to_owned).collect(),
+        QueryResult::Owned(v) => vec![v],
+        QueryResult::ManyOwned(vs) => vs,
+        QueryResult::None => return Ok(Vec::new()),
+        QueryResult::Error(e) => return Err(e),
+        QueryResult::Break(label) => {
+            return Err(EvalError::new(format!("break ${label} not in label")))
+        }
+        QueryResult::OneCursor(_) => unreachable!("materialize_cursor should have converted this"),
+        QueryResult::Partial(_, Control::Error(e)) => return Err(e),
+        QueryResult::Partial(_, Control::Break(label)) => {
+            return Err(EvalError::new(format!("break ${label} not in label")))
+        }
+    };
+    raw.iter().map(|v| owned_bound_to_i64(v, round)).collect()
+}
+
+/// Classify a resolved bound value the way jq's slice descriptor does
+/// (`SliceBounds::resolved_bound`), then round it to the integer
+/// `Expr::Slice` stores. Shared between [`eval_slice_bound`] (read mode) and
+/// `resolve_slice_bound` (path mode).
+fn owned_bound_to_i64(v: &OwnedValue, round: fn(f64) -> f64) -> Result<Option<i64>, EvalError> {
+    Ok(SliceBounds::resolved_bound(v)?.map(|f| round(f) as i64))
+}
+
+/// Apply a resolved slice directly to an owned value.
+///
+/// Slicing is a plain `Vec`/`&str` operation once the bounds are known, so
+/// this mirrors `eval_single`'s `Expr::Slice` arm (minus its cursor-only
+/// fast paths, which only matter for borrowed input) rather than paying for
+/// `eval_owned_input`'s serialize/reparse round-trip.
+fn slice_owned_value(
+    target: &OwnedValue,
+    start: Option<i64>,
+    end: Option<i64>,
+    optional: bool,
+) -> Result<Option<OwnedValue>, EvalError> {
+    match target {
+        OwnedValue::Array(items) => {
+            let range = SliceBounds::from_literals(start, end).resolve(items.len());
+            Ok(Some(OwnedValue::Array(items[range].to_vec())))
+        }
+        OwnedValue::Null => Ok(Some(OwnedValue::Null)),
+        OwnedValue::String(s) => {
+            let len = s.chars().count();
+            let range = SliceBounds::from_literals(start, end).resolve(len);
+            Ok(Some(OwnedValue::String(slice::slice_str(s, range))))
+        }
+        _ if optional => Ok(None),
+        other => Err(EvalError::cannot_index_with_type(
+            owned_type_name(other),
+            "object",
+        )),
+    }
+}
+
 /// Get element at index (supports negative indexing).
 ///
 /// Uses `get_fast` for O(n) BP operations + O(log n) IB select,
@@ -7184,6 +7374,9 @@ fn set_path(
         Expr::IndexExpr { .. } => Err(EvalError::new(
             "internal error: unresolved computed index in assignment path",
         )),
+        Expr::SliceExpr { .. } => Err(EvalError::new(
+            "internal error: unresolved computed slice in assignment path",
+        )),
         _ => Err(EvalError::new(
             "cannot use expression as assignment target".to_string(),
         )),
@@ -7364,6 +7557,11 @@ fn get_path_mut<'a>(
                     "internal error: unresolved computed index in path component",
                 ))
             }
+            Expr::SliceExpr { .. } => {
+                return Err(EvalError::new(
+                    "internal error: unresolved computed slice in path component",
+                ))
+            }
             _ => return Err(EvalError::new("invalid path component")),
         };
     }
@@ -7535,6 +7733,9 @@ fn update_path<S: EvalSemantics>(
         Expr::IndexExpr { .. } => Err(EvalError::new(
             "internal error: unresolved computed index in update path",
         )),
+        Expr::SliceExpr { .. } => Err(EvalError::new(
+            "internal error: unresolved computed slice in update path",
+        )),
         _ => Err(EvalError::new("cannot use expression as update target")),
     }
 }
@@ -7580,7 +7781,7 @@ fn owned_type_name(value: &OwnedValue) -> &'static str {
 /// so programs with neither shape skip the pre-pass entirely.
 fn needs_path_prepass(expr: &Expr) -> bool {
     match expr {
-        Expr::IndexExpr { .. } | Expr::Comma(_) => true,
+        Expr::IndexExpr { .. } | Expr::SliceExpr { .. } | Expr::Comma(_) => true,
         Expr::Pipe(exprs) => exprs.iter().any(needs_path_prepass),
         Expr::Optional(inner) | Expr::Paren(inner) => needs_path_prepass(inner),
         _ => false,
@@ -7698,6 +7899,13 @@ fn resolve_node<S: EvalSemantics>(
             // this arm still wants to see only the bare shape.
             Expr::IndexExpr { target, key } => resolve_index_expr::<S>(target, key, value, true),
 
+            // `E[S:T]?` is the same bare shape for slice bounds: only a
+            // failure to *slice* is covered, never `E`, `S`, or `T`'s own
+            // evaluation — see `resolve_slice_expr`'s doc comment.
+            Expr::SliceExpr { target, start, end } => {
+                resolve_slice_expr::<S>(target, start, end, value, true)
+            }
+
             // Every other `?`-wrapped node (`.foo?`, `.[0]?`, ...): evaluation
             // and indexing are the same step, so any failure anywhere
             // underneath is the failure to index, and `?` covers all of it.
@@ -7761,6 +7969,10 @@ fn resolve_node<S: EvalSemantics>(
         },
 
         Expr::IndexExpr { target, key } => resolve_index_expr::<S>(target, key, value, false),
+
+        Expr::SliceExpr { target, start, end } => {
+            resolve_slice_expr::<S>(target, start, end, value, false)
+        }
 
         // `..` fans out to every node in the tree (pre-order, self before
         // children), so each needs its own Field/Index chain rather than the
@@ -8021,6 +8233,86 @@ fn resolve_index_expr<S: EvalSemantics>(
     Ok(out)
 }
 
+/// Resolve `E[S:T]` in path context, with or without a trailing `?`.
+///
+/// The two spellings differ in one thing only, same as [`resolve_index_expr`]:
+/// what happens when the resolved bounds cannot be applied to the container
+/// they reached. `E[S:T]` propagates that failure; `E[S:T]?` prunes just
+/// that branch, because a failure to *slice* is exactly what `?` covers.
+///
+/// Two rules the shared body carries, both verified against jq 1.7.1 (see
+/// [`eval_slice_expr`]'s doc comment for the full detail):
+///
+/// - `S` and `T` are evaluated before `E`, in that order, and an empty bound
+///   stream short-circuits before the next stage runs — including before
+///   `E` runs at all.
+/// - `?` covers only the final application of the resolved bounds to the
+///   target, never `S`/`T`'s own evaluation nor a resolved-but-non-numeric
+///   bound (`Array/string slice indices must be integers` is not swallowed
+///   either) — unlike [`resolve_index_expr`]'s `key_to_path_component`,
+///   whose optional-gated type check is *not* the shape to copy here.
+fn resolve_slice_expr<S: EvalSemantics>(
+    target: &Expr,
+    start: &Option<Box<Expr>>,
+    end: &Option<Box<Expr>>,
+    value: &OwnedValue,
+    optional: bool,
+) -> Result<Vec<PathBranch>, EvalError> {
+    let starts = resolve_slice_bound::<S>(start, value, f64::floor)?;
+    if starts.is_empty() {
+        return Ok(Vec::new());
+    }
+    let ends = resolve_slice_bound::<S>(end, value, f64::ceil)?;
+    if ends.is_empty() {
+        return Ok(Vec::new());
+    }
+    let target_branches = resolve_node::<S>(target, value)?;
+
+    let mut out = Vec::with_capacity(starts.len() * ends.len() * target_branches.len());
+    for s in &starts {
+        for e in &ends {
+            let slice_expr = Expr::Slice { start: *s, end: *e };
+            for (components, target_value) in &target_branches {
+                // `false`, not `optional`: the failure has to arrive as an
+                // error for the two spellings to be told apart here, same
+                // as `resolve_index_expr`'s `index_one_owned` call.
+                let next_value = match slice_owned_value(target_value, *s, *e, false) {
+                    Ok(v) => v.expect("non-optional slice yields a value or errors"),
+                    Err(_) if optional => continue,
+                    Err(e) => return Err(e),
+                };
+                let mut path = components.clone();
+                path.push(if optional {
+                    Expr::Optional(Box::new(slice_expr.clone()))
+                } else {
+                    slice_expr.clone()
+                });
+                out.push((path, next_value));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Evaluate one slice bound (`start` or `end`) in path context.
+///
+/// Mirrors [`eval_slice_bound`] (read mode): a missing bound is a single
+/// `None` — "this side is open" — not an empty stream, and a resolved
+/// number is rounded the way [`owned_bound_to_i64`] documents.
+fn resolve_slice_bound<S: EvalSemantics>(
+    bound: &Option<Box<Expr>>,
+    value: &OwnedValue,
+    round: fn(f64) -> f64,
+) -> Result<Vec<Option<i64>>, EvalError> {
+    let Some(expr) = bound else {
+        return Ok(vec![None]);
+    };
+    eval_owned_multi::<S>(expr, value)?
+        .iter()
+        .map(|v| owned_bound_to_i64(v, round))
+        .collect()
+}
+
 /// Thread a value through a run of static path components, without expanding
 /// them.
 ///
@@ -8209,6 +8501,16 @@ fn substitute_var(expr: &Expr, var_name: &str, replacement: &OwnedValue) -> Expr
         Expr::IndexExpr { target, key } => Expr::IndexExpr {
             target: Box::new(substitute_var(target, var_name, replacement)),
             key: Box::new(substitute_var(key, var_name, replacement)),
+        },
+        // Same reasoning as `IndexExpr`: `$a`/`$b` in `.[$a:$b]` must resolve.
+        Expr::SliceExpr { target, start, end } => Expr::SliceExpr {
+            target: Box::new(substitute_var(target, var_name, replacement)),
+            start: start
+                .as_deref()
+                .map(|e| Box::new(substitute_var(e, var_name, replacement))),
+            end: end
+                .as_deref()
+                .map(|e| Box::new(substitute_var(e, var_name, replacement))),
         },
         Expr::RecursiveDescent => Expr::RecursiveDescent,
         Expr::Optional(e) => Expr::Optional(Box::new(substitute_var(e, var_name, replacement))),
@@ -10284,6 +10586,9 @@ fn walk_path<S: EvalSemantics>(
         Expr::IndexExpr { .. } => {
             debug_assert!(false, "unresolved computed index reached path tracking");
         }
+        Expr::SliceExpr { .. } => {
+            debug_assert!(false, "unresolved computed slice reached path tracking");
+        }
 
         // Expressions with no path-tracking arm — `..`, `recurse`, `select`,
         // arithmetic — name no path (#483). `builtin_path` renders that as no
@@ -11810,6 +12115,9 @@ fn delete_at_path(
         // of being reported as a user error.
         Expr::IndexExpr { .. } => Err(EvalError::new(
             "internal error: unresolved computed index in delete path",
+        )),
+        Expr::SliceExpr { .. } => Err(EvalError::new(
+            "internal error: unresolved computed slice in delete path",
         )),
         _ => Err(EvalError::new("cannot use expression as delete target")),
     }
@@ -15462,6 +15770,15 @@ fn expand_func_calls(expr: &Expr, func_name: &str, params: &[String], body: &Exp
             target: Box::new(expand_func_calls(target, func_name, params, body)),
             key: Box::new(expand_func_calls(key, func_name, params, body)),
         },
+        Expr::SliceExpr { target, start, end } => Expr::SliceExpr {
+            target: Box::new(expand_func_calls(target, func_name, params, body)),
+            start: start
+                .as_deref()
+                .map(|e| Box::new(expand_func_calls(e, func_name, params, body))),
+            end: end
+                .as_deref()
+                .map(|e| Box::new(expand_func_calls(e, func_name, params, body))),
+        },
         Expr::RecursiveDescent => Expr::RecursiveDescent,
         Expr::Optional(e) => {
             Expr::Optional(Box::new(expand_func_calls(e, func_name, params, body)))
@@ -15716,6 +16033,15 @@ fn substitute_func_param(expr: &Expr, param: &str, arg: &Expr) -> Expr {
         Expr::IndexExpr { target, key } => Expr::IndexExpr {
             target: Box::new(substitute_func_param(target, param, arg)),
             key: Box::new(substitute_func_param(key, param, arg)),
+        },
+        Expr::SliceExpr { target, start, end } => Expr::SliceExpr {
+            target: Box::new(substitute_func_param(target, param, arg)),
+            start: start
+                .as_deref()
+                .map(|e| Box::new(substitute_func_param(e, param, arg))),
+            end: end
+                .as_deref()
+                .map(|e| Box::new(substitute_func_param(e, param, arg))),
         },
         Expr::RecursiveDescent => Expr::RecursiveDescent,
         Expr::Optional(e) => Expr::Optional(Box::new(substitute_func_param(e, param, arg))),
@@ -23386,6 +23712,101 @@ mod tests {
             "(.a, .a.a?) = 7",
             Err(r#"Cannot index number with string "a""#),
         )]);
+    }
+
+    /// #499: slice bounds accept any expression, evaluated with the same
+    /// discipline as a computed index key (`resolve_index_expr`). Every case
+    /// here was checked against jq 1.7.1 directly.
+    #[test]
+    fn test_computed_slice_bounds() {
+        assert_outcomes(&[
+            // The issue's own repro: a computed start bound, evaluated
+            // against the root (not against `.a`).
+            (
+                br#"{"a":[1,2,3],"k":1}"#,
+                r#".a[.k:2]? = ["x"]"#,
+                Ok(r#"{"a":[1,"x",3],"k":1}"#),
+            ),
+            // A bound-evaluation failure is not covered by a trailing `?` —
+            // `.x` on an array raises before the slice is ever applied.
+            (
+                b"[1,2,3]",
+                r#".[(.x):2]? = ["y"]"#,
+                Err(r#"Cannot index array with string "x""#),
+            ),
+            // Same rule on the end bound, and on a string target.
+            (
+                br#""str""#,
+                ".[0:.k]? = 5",
+                Err(r#"Cannot index string with string "k""#),
+            ),
+            // A bound that resolves successfully but isn't a number is also
+            // not covered by `?` — unlike a computed key's `key_to_path_component`
+            // type check, which `?` *does* cover.
+            (
+                b"null",
+                r#".[("x"):2]? = 5"#,
+                Err("Array/string slice indices must be integers"),
+            ),
+            // Only the final "target isn't sliceable" failure is what `?`
+            // covers.
+            (b"5", r#".[0:2]? = ["x"]"#, Ok("5")),
+            // The target's own evaluation failure is not covered either.
+            (
+                br#""str""#,
+                r#".a[0:2]? = ["x"]"#,
+                Err(r#"Cannot index string with string "a""#),
+            ),
+            // An empty start (or end) bound stream short-circuits before the
+            // next stage runs — including before the target is ever touched.
+            (b"[1,2,3]", "[(error(\"boom\"))[0:empty]]", Ok("[]")),
+            (b"[1,2,3]", "[(error(\"boom\"))[empty:2]]", Ok("[]")),
+            // A `null` bound is "open on this side", same as an omitted one.
+            (b"[1,2,3,4,5]", ".[(null):(3)]", Ok("[1,2,3]")),
+            // A fractional dynamic bound still floors the start / ceils the
+            // end, exactly like a literal one.
+            (b"[1,2,3,4,5]", ".[(1.7):(2.9)]", Ok("[2,3]")),
+            // Multi-value bounds fan out start-outer, end-middle,
+            // target-inner — the same nesting order jq's `S as $s | T as $t
+            // | E | .[$s:$t]` desugaring produces.
+            (
+                b"[1,2,3,4,5]",
+                "[.[(0,1):(3,4)]]",
+                Ok("[[1,2,3],[1,2,3,4],[2,3],[2,3,4]]"),
+            ),
+            // `path()`, `del()` and `|=` all round-trip through a computed
+            // slice, the same as they do through a computed key.
+            (
+                br#"{"a":[1,2,3],"k1":0,"k2":2}"#,
+                "path(.a[.k1:.k2])",
+                Ok(r#"["a",{"start":0,"end":2}]"#),
+            ),
+            (
+                br#"{"a":[1,2,3],"k1":0,"k2":2}"#,
+                "del(.a[.k1:.k2])",
+                Ok(r#"{"a":[3],"k1":0,"k2":2}"#),
+            ),
+            (
+                br#"{"a":[1,2,3],"k1":0,"k2":2}"#,
+                ".a[.k1:.k2] |= map(.*10)",
+                Ok(r#"{"a":[10,20,3],"k1":0,"k2":2}"#),
+            ),
+            // A dynamic slice can be a mid-chain component, not just the
+            // final one — including under `?`, which (unlike the fully
+            // static `.a[1:2]?[0]` shape — a separate, pre-existing gap)
+            // goes through the computed-key prepass and so has its
+            // `Expr::Optional` wrapper stripped before `set_path` runs.
+            (
+                br#"{"a":[1,2,3,4],"k1":0,"k2":2}"#,
+                ".a[.k1:.k2][0] = 9",
+                Ok(r#"{"a":[9,2,3,4],"k1":0,"k2":2}"#),
+            ),
+            (
+                br#"{"a":[1,2,3,4],"k1":0,"k2":2}"#,
+                ".a[.k1:.k2]?[0] = 9",
+                Ok(r#"{"a":[9,2,3,4],"k1":0,"k2":2}"#),
+            ),
+        ]);
     }
 
     #[test]

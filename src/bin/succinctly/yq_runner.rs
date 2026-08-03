@@ -1166,6 +1166,13 @@ fn contains_split_doc(expr: &Expr) -> bool {
         // Terminal expressions that cannot contain split_doc
         // Both halves hold sub-expressions, so `split_doc` can hide in either.
         Expr::IndexExpr { target, key } => contains_split_doc(target) || contains_split_doc(key),
+        // Same reasoning as `IndexExpr`: `split_doc` can hide in the target
+        // or either bound.
+        Expr::SliceExpr { target, start, end } => {
+            contains_split_doc(target)
+                || start.as_deref().is_some_and(contains_split_doc)
+                || end.as_deref().is_some_and(contains_split_doc)
+        }
         Expr::Identity
         | Expr::Field(_)
         | Expr::Index(_)

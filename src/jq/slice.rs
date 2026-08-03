@@ -59,6 +59,17 @@ impl SliceBounds {
         })
     }
 
+    /// Classify one resolved bound value the way a descriptor slot is
+    /// classified — `null` is "open on this side", a number is that number,
+    /// anything else is jq's `Array/string slice indices must be integers`.
+    ///
+    /// Exposed for `E[S:T]` (`Expr::SliceExpr`), whose bounds are ordinary
+    /// expressions evaluated at runtime to an `OwnedValue`, not a
+    /// pre-validated descriptor object.
+    pub(crate) fn resolved_bound(v: &OwnedValue) -> Result<Option<f64>, EvalError> {
+        bound(Some(v))
+    }
+
     /// The element range this names against a container of length `len`.
     ///
     /// jq's `parse_slice`: floor the start and ceil the end (so a fractional

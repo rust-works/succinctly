@@ -59,6 +59,28 @@ pub enum Expr {
         key: Box<Self>,
     },
 
+    /// Slice by a computed bound: `.[$a:$b]`, `.[.k:2]`, `E[S:T]` where at
+    /// least one bound isn't an integer literal.
+    ///
+    /// jq compiles `E[S:T]` as `S as $s | T as $t | E | .[$s:$t]`, the same
+    /// desugaring [`Expr::IndexExpr`] documents for `E[K]` — `S`/`T` are
+    /// evaluated against *this node's* input, not `E`'s output, which is why
+    /// this variant carries its own `target` instead of flattening into
+    /// [`Expr::Pipe`]. `S` is evaluated outer, `T` middle, `E` inner.
+    ///
+    /// A bound that fully folds to an integer literal never reaches here:
+    /// the parser keeps producing plain [`Expr::Slice`] whenever *both*
+    /// present bounds are constant, so the existing fast path and every
+    /// [`Expr::Slice`] match site are untouched.
+    SliceExpr {
+        /// The value being sliced — the postfix chain so far.
+        target: Box<Self>,
+        /// The start bound, evaluated against this node's own input.
+        start: Option<Box<Self>>,
+        /// The end bound, evaluated against this node's own input.
+        end: Option<Box<Self>>,
+    },
+
     /// Optional access: `.foo?` - returns null instead of error if missing
     Optional(Box<Self>),
 
@@ -1060,6 +1082,15 @@ impl Expr {
     /// Create a slice expression.
     pub fn slice(start: Option<i64>, end: Option<i64>) -> Self {
         Self::Slice { start, end }
+    }
+
+    /// Create a computed-bounds slice expression: `target[start:end]`.
+    pub fn slice_by(target: Self, start: Option<Self>, end: Option<Self>) -> Self {
+        Self::SliceExpr {
+            target: Box::new(target),
+            start: start.map(Box::new),
+            end: end.map(Box::new),
+        }
     }
 
     /// Make this expression optional.

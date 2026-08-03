@@ -390,6 +390,13 @@ fn rewrite_namespaced_calls(expr: Expr) -> Expr {
             target: Box::new(rewrite_namespaced_calls(*target)),
             key: Box::new(rewrite_namespaced_calls(*key)),
         },
+        // Same reasoning as `IndexExpr`: a namespaced call can appear in the
+        // target or either bound — `.[ns::f():ns::g()]`.
+        Expr::SliceExpr { target, start, end } => Expr::SliceExpr {
+            target: Box::new(rewrite_namespaced_calls(*target)),
+            start: start.map(|e| Box::new(rewrite_namespaced_calls(*e))),
+            end: end.map(|e| Box::new(rewrite_namespaced_calls(*e))),
+        },
         // Expressions that don't contain sub-expressions - return as-is
         Expr::Identity
         | Expr::Field(_)
