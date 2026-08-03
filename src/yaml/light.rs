@@ -5127,7 +5127,7 @@ fn write_yaml_indent<Out: core::fmt::Write>(out: &mut Out, spaces: usize) -> cor
 /// Stream independent document cursors as a single YAML sequence (block or
 /// flow style), without materializing an `OwnedValue` DOM.
 ///
-/// Unlike [`YamlCursor::stream_yaml_value`]'s `Sequence` arm, the cursors
+/// Unlike `YamlCursor::stream_yaml_value`'s `Sequence` arm, the cursors
 /// here need not share one `YamlIndex` — each may come from its own
 /// document/source. This is what lets `--slurp` wrap multiple slurped
 /// documents into one array while preserving duplicate mapping keys within
