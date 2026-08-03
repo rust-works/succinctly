@@ -17017,6 +17017,51 @@ mod tests {
             .collect()
     }
 
+    // `eval_owned_multi`'s cardinality-preserving contract (#570), exercised
+    // directly rather than through any of the four call sites it was filed to
+    // unblock — `eval_owned_expr` collapses a multi-output result into a
+    // single value or an array; `eval_owned_multi` must not.
+
+    #[test]
+    fn eval_owned_multi_preserves_every_output_in_order() {
+        let expr = parse("1,2,3").unwrap();
+        let values = eval_owned_multi::<JqSemantics>(&expr, &OwnedValue::Null).unwrap();
+        assert_eq!(
+            values,
+            vec![OwnedValue::Int(1), OwnedValue::Int(2), OwnedValue::Int(3)]
+        );
+    }
+
+    #[test]
+    fn eval_owned_multi_keeps_a_single_array_output_as_one_element() {
+        // A single output that happens to be an array must come back as a
+        // one-element Vec containing that array, not get mistaken for
+        // multiple outputs and flattened into its elements (#490's bug in
+        // `eval_owned_expr`-based callers).
+        let expr = parse("[1,2]").unwrap();
+        let values = eval_owned_multi::<JqSemantics>(&expr, &OwnedValue::Null).unwrap();
+        assert_eq!(
+            values,
+            vec![OwnedValue::Array(vec![
+                OwnedValue::Int(1),
+                OwnedValue::Int(2)
+            ])]
+        );
+    }
+
+    #[test]
+    fn eval_owned_multi_produces_an_empty_vec_for_no_output() {
+        let expr = parse("empty").unwrap();
+        let values = eval_owned_multi::<JqSemantics>(&expr, &OwnedValue::Null).unwrap();
+        assert_eq!(values, Vec::<OwnedValue>::new());
+    }
+
+    #[test]
+    fn eval_owned_multi_propagates_an_error() {
+        let expr = parse(r#"error("boom")"#).unwrap();
+        assert!(eval_owned_multi::<JqSemantics>(&expr, &OwnedValue::Null).is_err());
+    }
+
     #[test]
     fn test_numeric_key_to_index_number_literal_387() {
         assert_eq!(
