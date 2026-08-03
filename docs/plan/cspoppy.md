@@ -340,10 +340,23 @@ twice what Step B saves. Poppy's actual trade is to omit the per-word level and
 popcount up to 7 words inside a basic block, which is exactly one 64-byte cache
 line, and one the query must load anyway for the partial word.
 
-Interacts with Step B: once select drives off `rank_l1`, `rank_l2` is used only
-by `rank1`. BP `rank1` is very hot (cursor navigation), so this is a genuine
-trade needing end-to-end measurement. Should follow Step B so the select path
-isn't confounded.
+Interacts with Step B — and **not** in the direction this plan first predicted.
+The original claim here was that once select drove off `rank_l1`, `rank_l2`
+would be left with `rank1` as its only consumer. That is wrong as implemented:
+`WithCsPoppy::select1` reads `rank_l2` as well, unpacking its 9-bit per-word
+offsets (step 3 of the query) to land on the exact word without popcounting.
+`rank_l2` therefore has *two* consumers now, not one.
+
+This makes F1 more expensive than "delete an array", not less. Dropping
+`rank_l2` forces `select1` back to popcounting up to 7 words inside the block —
+reintroducing precisely the word scanning Step B removed, and most likely
+widening the ARM select1 regression measured above. Budget for changing both
+query paths, and re-run `bp_select_micro` alongside the rank-side measurement
+rather than treating this as rank-only work.
+
+BP `rank1` is very hot (cursor navigation), so the rank side is a genuine trade
+needing end-to-end measurement. Should follow Step B so the select path isn't
+confounded.
 
 ### F2 — True Poppy rank layout as a standalone `CsPoppy` — issue #597
 
