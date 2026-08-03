@@ -659,3 +659,25 @@ For detailed documentation on optimization techniques used in this project, see 
   - `yaml_bench` build-side clean (< 2% on 38/39 groups, both platforms) except one x86-only `block_scalars` anomaly (12-28%, reproduced twice), investigated and attributed to binary code-layout rather than the new logic: the BP structure for that workload is a fixed 7 words regardless of document size, too small to mechanistically explain the delta, and the same workload is neutral on ARM — filed as #595
   - Also surfaced a pre-existing, unrelated `yaml_bench` bug: the `anchors` group panics with `UnknownAnchor` on unmodified `main` too — filed as #594
   - See [docs/plan/cspoppy.md](docs/plan/cspoppy.md#5a-results-2026-08-03) for full analysis
+
+**UTF-8 validation optimizations:**
+- ⚠️ Broadword (SWAR) UTF-8 accept scan: opt-in only, **not the default** — issue #134
+  - Clears ASCII in 32- and 8-byte strides with plain 64-bit arithmetic, then validates each multi-byte sequence with independent range comparisons
+  - **Corrected finding**: the original "2.01x/2.14x geomean vs scalar" claim was measured before #133 (which gave `validate_utf8_scalar` its own 8-byte ASCII skip) merged into `main`. This branch was rebased onto that merge with no conflict, so it went unnoticed — the doc numbers kept citing the pre-#133 scalar baseline. Against the *current* scalar validator, broadword's geomean is a **net loss**: ~0.89x on a 7950X, ~0.93x on an M4 Pro (interleaved, 9 runs, 11 realistic `generate-suite` patterns, 10MB, current `main` tip)
+  - Wins clearly only on long/pure ASCII (~1.67x on 7950X, ~2.0x on M4 Pro); every other realistic pattern — source code, logs, JSON, accented text, CJK, emoji — is a wash-to-loss, some over 30% (e.g. source_code: 0.68-0.70x)
+  - `validate_utf8()` therefore dispatches to AVX2 where available and to `validate_utf8_scalar` everywhere else (reverted from broadword); `validate_utf8_broadword` remains available for callers who know their input is ASCII-dominant
+  - `validate_utf8_scalar` (from #133, not this issue) already beats `core::str::from_utf8` in geomean (~1.18-1.25x); broadword only adds a small further edge over std (~1.05-1.16x), far short of the originally claimed 2.01x/2.14x
+  - Key insight: a wide ASCII-skip probe only pays for itself when runs are genuinely long; on realistic mixed content, attempting it is frequent, mostly-wasted overhead
+  - See [docs/benchmarks/utf8-validate.md#engine-comparison-134](docs/benchmarks/utf8-validate.md#engine-comparison-134) for full analysis
+- ❌ Höhrmann DFA for the multi-byte step: **REJECTED** — lost to whole-sequence validation on 9 of 11 realistic patterns, issue #134
+  - Implemented as specified in #134 (9 states × 12 byte classes, packed-nibble transition table verified against Höhrmann's published `utf8d`), benchmarked head-to-head, and removed
+  - Worst at emoji and mixed. The specific "x scalar" multipliers from that run predate #133's scalar ASCII skip and are not repeated here — but the relative finding (whole-sequence beats DFA) is unaffected, since both sides of that comparison shared the same denominator in the same run
+  - **Cause is dependency structure, not table size**: a DFA carries `state -> step -> state` around its loop, retiring one byte per 2-3 cycle chain however compact the table; whole-sequence validation issues its range comparisons independently and retires 3-4 bytes per iteration
+  - Same effect already visible in the baseline: the scalar validator was *faster* on emoji than on ASCII (pre-#133) precisely because it consumed a whole sequence per iteration
+  - **Also**: #134's proposed 10-class byte table cannot work — lumping all of `0x80-0xBF` into one class makes a `(state, class)` table unable to distinguish `E0 80` (overlong) from `E0 A0` (valid), silently accepting overlong encodings and surrogates. 12 classes (split at `0x90`/`0xA0`) are the minimum.
+  - Key lesson: for a validator, prefer the formulation with the shortest loop-carried dependency, not the smallest table
+  - **Second lesson (from the broadword reversal above)**: a benchmark claim is only as fresh as its baseline — a clean, conflict-free rebase can silently improve the "control" side and flip a documented win into a loss with nothing to flag it
+- ❌ Redundant-load removal in `broadword.rs`'s ASCII skip: **REJECTED** — 3.6x regression, issue #134
+  - Hypothesis: the 32-byte block probe reloads its first 8 bytes a second time on failure (`load_word` re-reads what `load_block`'s first chunk already read), so probing narrow-first and widening only after the first word proves clean should save loads on short/isolated ASCII runs
+  - Measured instead: ASCII throughput on an M-series Mac dropped from ~65 GiB/s to ~18 GiB/s — reproducible, not noise. Splitting one 4-word OR-reduction into "one word, then conditionally three more" likely defeated whatever auto-vectorization/unrolling LLVM was doing with the original single loop; load-count intuition does not predict codegen
+  - Reverted immediately; needs real profiling (`perf`/disassembly), not another guess

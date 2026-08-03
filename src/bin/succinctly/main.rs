@@ -467,6 +467,10 @@ struct BenchUtf8Args {
     /// Number of benchmark runs (median is taken)
     #[arg(long, default_value = "3")]
     runs: usize,
+
+    /// Validation engine to time: auto, scalar, broadword or std
+    #[arg(long, default_value = "auto")]
+    engine: String,
 }
 
 /// Generate synthetic JSON files for benchmarking and testing
@@ -1686,6 +1690,7 @@ fn run_utf8_benchmark(args: BenchUtf8Args) -> Result<()> {
         sizes,
         warmup_runs: args.warmup,
         benchmark_runs: args.runs,
+        engine: utf8_bench::Engine::parse(&args.engine)?,
     };
 
     // Use default output paths if not specified

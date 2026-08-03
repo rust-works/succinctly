@@ -120,8 +120,13 @@ impl core::fmt::Display for Utf8ErrorKind {
 #[inline]
 pub fn validate_utf8(input: &[u8]) -> Result<(), Utf8Error> {
     // On x86_64 with runtime feature detection available (std or test), prefer
-    // the AVX2 fast path, which falls back to the scalar validator on any error
-    // (and on non-AVX2 hardware) so the reported `Utf8Error` is identical.
+    // the AVX2 fast path. Everywhere else — aarch64, wasm, riscv, and any
+    // `no_std` build — use the scalar validator, which already skips ASCII
+    // runs eight bytes at a time (#133). `validate_utf8_broadword` is available
+    // separately for callers who know their input is ASCII-dominant: measured
+    // against the current scalar validator it wins clearly on long ASCII runs
+    // but loses geometric mean across realistic mixed content, so it is not
+    // the default — see docs/benchmarks/utf8-validate.md#engine-comparison-134.
     #[cfg(all(target_arch = "x86_64", any(test, feature = "std")))]
     {
         validate_utf8_simd(input)
@@ -418,159 +423,12 @@ fn is_continuation_byte(byte: u8) -> bool {
 #[cfg(all(target_arch = "x86_64", any(test, feature = "std")))]
 pub use self::simd_x86::validate_utf8_simd;
 
-/// x86_64 AVX2 UTF-8 validation.
-///
-/// This is a first-principles port of the Keiser–Lemire "Validating UTF-8 In
-/// Less Than One Instruction Per Byte" approach (<https://arxiv.org/abs/2010.03090>),
-/// expressed with explicit range comparisons rather than packed lookup tables so
-/// that every check maps directly onto the rules in [`validate_utf8_scalar`].
 #[cfg(all(target_arch = "x86_64", any(test, feature = "std")))]
-mod simd_x86 {
-    #![allow(unsafe_code)] // x86_64 AVX2 SIMD intrinsics
-    #![allow(clippy::cast_possible_wrap)] // u8 byte constants deliberately reinterpreted as i8 lanes
+mod simd_x86;
 
-    use super::{validate_utf8_scalar, Utf8Error};
-    use core::arch::x86_64::*;
+mod broadword;
 
-    /// Validate `input` as UTF-8 using AVX2 when available.
-    ///
-    /// Returns `Ok(())` only when the AVX2 accept scan proves the whole buffer
-    /// valid; otherwise defers to the scalar validator for the exact error.
-    pub fn validate_utf8_simd(input: &[u8]) -> Result<(), Utf8Error> {
-        // SAFETY: `validate_utf8_avx2` is only entered once the CPU is confirmed
-        // to support AVX2 by `is_x86_feature_detected!`.
-        if is_x86_feature_detected!("avx2") && unsafe { validate_utf8_avx2(input) } {
-            Ok(())
-        } else {
-            validate_utf8_scalar(input)
-        }
-    }
-
-    /// Unsigned `a >= k` per byte lane; result lanes are `0xFF` (true) or `0x00`.
-    #[inline]
-    #[target_feature(enable = "avx2")]
-    unsafe fn uge(a: __m256i, k: u8) -> __m256i {
-        // max_epu8(a, k) == a  iff  a >= k (unsigned). These register-only AVX2
-        // intrinsics are safe to call within a `#[target_feature]` fn.
-        let vk = _mm256_set1_epi8(k as i8);
-        _mm256_cmpeq_epi8(_mm256_max_epu8(a, vk), a)
-    }
-
-    /// Unsigned `a < k` per byte lane; result lanes are `0xFF` (true) or `0x00`.
-    #[inline]
-    #[target_feature(enable = "avx2")]
-    unsafe fn ult(a: __m256i, k: u8) -> __m256i {
-        unsafe { _mm256_xor_si256(uge(a, k), _mm256_set1_epi8(-1)) }
-    }
-
-    /// Accumulate UTF-8 errors for one 32-byte block into `error`.
-    ///
-    /// `prev_input` holds the previous block (zeros before the first block) so
-    /// that `prev1`/`prev2`/`prev3` — the bytes 1/2/3 positions back — are
-    /// available across the block boundary.
-    #[inline]
-    #[target_feature(enable = "avx2")]
-    unsafe fn check_block(chunk: __m256i, prev_input: __m256i, error: &mut __m256i) {
-        unsafe {
-            // Shift the 256-bit vector right by 1/2/3 bytes, pulling in the tail
-            // of `prev_input` (the canonical simdjson `prev<N>` idiom).
-            let shifted = _mm256_permute2x128_si256(prev_input, chunk, 0x21);
-            let prev1 = _mm256_alignr_epi8(chunk, shifted, 15);
-            let prev2 = _mm256_alignr_epi8(chunk, shifted, 14);
-            let prev3 = _mm256_alignr_epi8(chunk, shifted, 13);
-
-            // is_cont = (chunk & 0xC0) == 0x80
-            let c0 = _mm256_set1_epi8(0xC0u8 as i8);
-            let is_cont =
-                _mm256_cmpeq_epi8(_mm256_and_si256(chunk, c0), _mm256_set1_epi8(0x80u8 as i8));
-
-            // A byte MUST be a continuation iff the byte 1 back is any lead
-            // (>=0xC0), or 2 back is a 3/4-byte lead (>=0xE0), or 3 back is a
-            // 4-byte lead (>=0xF0). Missing OR stray continuations => is_cont
-            // disagrees with must_cont.
-            let must_cont = _mm256_or_si256(
-                _mm256_or_si256(uge(prev1, 0xC0), uge(prev2, 0xE0)),
-                uge(prev3, 0xF0),
-            );
-            let mut err = _mm256_xor_si256(is_cont, must_cont);
-
-            // Bytes that are never valid anywhere: 0xC0/0xC1 (overlong 2-byte
-            // leads) and 0xF5..=0xFF (beyond U+10FFFF / not UTF-8 lead bytes).
-            let invalid_c0c1 =
-                _mm256_cmpeq_epi8(_mm256_and_si256(chunk, _mm256_set1_epi8(0xFEu8 as i8)), c0);
-            err = _mm256_or_si256(err, _mm256_or_si256(invalid_c0c1, uge(chunk, 0xF5)));
-
-            // Special cases keyed on the lead byte (prev1) and the byte after it
-            // (chunk), each firing only within the continuation range:
-            //   E0 followed by <0xA0 -> overlong 3-byte
-            //   ED followed by >=0xA0 -> surrogate (U+D800..U+DFFF)
-            //   F0 followed by <0x90 -> overlong 4-byte
-            //   F4 followed by >=0x90 -> above U+10FFFF
-            let e0 = _mm256_cmpeq_epi8(prev1, _mm256_set1_epi8(0xE0u8 as i8));
-            let ed = _mm256_cmpeq_epi8(prev1, _mm256_set1_epi8(0xEDu8 as i8));
-            let f0 = _mm256_cmpeq_epi8(prev1, _mm256_set1_epi8(0xF0u8 as i8));
-            let f4 = _mm256_cmpeq_epi8(prev1, _mm256_set1_epi8(0xF4u8 as i8));
-            err = _mm256_or_si256(err, _mm256_and_si256(e0, ult(chunk, 0xA0)));
-            err = _mm256_or_si256(err, _mm256_and_si256(ed, uge(chunk, 0xA0)));
-            err = _mm256_or_si256(err, _mm256_and_si256(f0, ult(chunk, 0x90)));
-            err = _mm256_or_si256(err, _mm256_and_si256(f4, uge(chunk, 0x90)));
-
-            *error = _mm256_or_si256(*error, err);
-        }
-    }
-
-    /// Return `true` iff `input` is entirely valid UTF-8.
-    ///
-    /// End-of-input truncation is caught by always processing a final
-    /// zero-padded block: a dangling multi-byte lead's absent continuation lands
-    /// on a `0x00` pad byte, which fails the continuation requirement.
-    #[target_feature(enable = "avx2")]
-    unsafe fn validate_utf8_avx2(input: &[u8]) -> bool {
-        unsafe {
-            let len = input.len();
-            if len == 0 {
-                return true;
-            }
-
-            let mut error = _mm256_setzero_si256();
-            let mut prev_input = _mm256_setzero_si256();
-
-            let mut pos = 0;
-            while pos + 32 <= len {
-                let chunk = _mm256_loadu_si256(input.as_ptr().add(pos).cast::<__m256i>());
-                check_block(chunk, prev_input, &mut error);
-                prev_input = chunk;
-                pos += 32;
-            }
-
-            // Final zero-padded tail. Runs even when `len % 32 == 0` (tail all
-            // zeros) so a lead byte at the very end is still flagged as truncated
-            // via the carried `prev_input`.
-            let mut tail = [0u8; 32];
-            tail[..len - pos].copy_from_slice(&input[pos..]);
-            let chunk = _mm256_loadu_si256(tail.as_ptr().cast::<__m256i>());
-            check_block(chunk, prev_input, &mut error);
-
-            // Valid iff no error bit was set anywhere.
-            _mm256_testz_si256(error, error) == 1
-        }
-    }
-
-    /// Test-only: run the raw AVX2 kernel over `input`.
-    ///
-    /// The kernel-vs-std differential test gates on `is_x86_feature_detected!`
-    /// once and then calls this across its whole corpus. Exposing the raw kernel
-    /// verdict (rather than the scalar-fallback [`validate_utf8_simd`] wrapper)
-    /// lets the differential catch both false accepts *and* false rejects.
-    ///
-    /// # Safety
-    /// The CPU must support AVX2; the caller checks `is_x86_feature_detected!`.
-    #[cfg(test)]
-    pub(crate) unsafe fn validate_utf8_avx2_unchecked(input: &[u8]) -> bool {
-        // SAFETY: the caller guarantees AVX2 is available.
-        unsafe { validate_utf8_avx2(input) }
-    }
-}
+pub use self::broadword::validate_utf8_broadword;
 
 /// Get the expected sequence length from a lead byte.
 /// Returns 0 for invalid lead bytes (continuation bytes or 0xF8+).
@@ -1919,8 +1777,24 @@ mod validate_utf8_differential_tests {
         }
     }
 
+    /// Block-edge offsets shared by both fixture builders.
+    ///
+    /// `0..=7` covers every residue mod 8, which is what the broadword scan
+    /// needs: its ASCII skip can leave `pos` anywhere inside a word, and a bug
+    /// that only fires at, say, a 3-byte skip would otherwise go unseen. (The
+    /// original offsets were chosen for the 32-byte AVX2 blocks and hit only
+    /// residues 0, 1, 6 and 7.) `8..=17` adds a second word plus a guard for a
+    /// possible future 16-byte block, and the larger values keep the AVX2
+    /// 32/64-byte edges covered.
+    const BOUNDARY_OFFSETS: [usize; 26] = [
+        0, 1, 2, 3, 4, 5, 6, 7, // every residue mod 8 (broadword word edges)
+        8, 9, 10, 11, 12, 13, 14, 15, 16, 17, // second word / 16-byte guard
+        29, 30, 31, 32, 33, 62, 63, 64, // AVX2 32/64-byte block edges
+    ];
+
     /// Invalid fixtures: one per error kind, placed at offsets that straddle the
-    /// 32/64-byte SIMD block edges and land at end-of-input.
+    /// 8/16-byte broadword word edges and the 32/64-byte SIMD block edges, and
+    /// land at end-of-input.
     fn invalid_boundary_fixtures() -> Vec<Vec<u8>> {
         let bad_seqs: &[&[u8]] = &[
             &[0x80],                   // stray continuation
@@ -1936,10 +1810,9 @@ mod validate_utf8_differential_tests {
             &[0xE0, 0xA0],             // truncated 3-byte at EOF
             &[0xF0, 0x90, 0x80],       // truncated 4-byte at EOF
         ];
-        let offsets = [0usize, 1, 30, 31, 32, 33, 62, 63, 64, 65];
         let mut out = Vec::new();
         for seq in bad_seqs {
-            for &off in &offsets {
+            for &off in &BOUNDARY_OFFSETS {
                 let mut buf: Vec<u8> = core::iter::repeat(b'a').take(off).collect();
                 buf.extend_from_slice(seq);
                 out.push(buf);
@@ -1958,10 +1831,9 @@ mod validate_utf8_differential_tests {
             "\u{D7FF}".as_bytes(),   // just below surrogate range (3-byte)
             "\u{10FFFF}".as_bytes(), // maximum code point (4-byte)
         ];
-        let offsets = [0usize, 1, 29, 30, 31, 32, 33, 60, 61, 62, 63, 64, 65];
         let mut out = Vec::new();
         for seq in good_seqs {
-            for &off in &offsets {
+            for &off in &BOUNDARY_OFFSETS {
                 let mut buf: Vec<u8> = core::iter::repeat(b'a').take(off).collect();
                 buf.extend_from_slice(seq);
                 buf.push(b'z');
@@ -2436,5 +2308,116 @@ mod validate_utf8_differential_tests {
         }
 
         Ok(())
+    }
+
+    /// The broadword kernel agrees with std over a large corpus.
+    ///
+    /// The counterpart of [`avx2_kernel_matches_std`], but unguarded by any
+    /// `cfg` — the broadword scan is portable, so this gates it on every
+    /// architecture. It drives the raw `bool` kernels rather than the public
+    /// wrappers so that a false *reject* is caught too: the wrappers mask those
+    /// by falling back to the scalar validator, which would then return `Ok`
+    /// and hide the disagreement.
+    #[test]
+    fn broadword_kernel_matches_std() {
+        let mut rng = Rng(0xb70a_d000_d1a5_0007);
+        let check = |bytes: &[u8]| {
+            let expected = core::str::from_utf8(bytes).is_ok();
+            assert_eq!(
+                super::broadword::accepts(bytes),
+                expected,
+                "broadword kernel disagreed with std on {bytes:02x?}"
+            );
+        };
+
+        for _ in 0..50_000 {
+            let len = rng.below(140) as usize;
+            check(&random_bytes(&mut rng, len));
+        }
+        for _ in 0..10_000 {
+            let min_len = rng.below(300) as usize;
+            let mut bytes = random_valid_utf8(&mut rng, min_len);
+            if !bytes.is_empty() && rng.below(2) == 0 {
+                let i = rng.below(bytes.len() as u32) as usize;
+                bytes[i] = (rng.next_u32() & 0xFF) as u8;
+            }
+            check(&bytes);
+        }
+        for buf in invalid_boundary_fixtures() {
+            check(&buf);
+        }
+        for buf in valid_boundary_fixtures() {
+            check(&buf);
+        }
+    }
+
+    /// Every input of length 0, 1 or 2 — all 65,793 of them — validates the same
+    /// as std.
+    ///
+    /// Exhaustive rather than random, and short enough that the main loop never
+    /// runs, so it pins the sub-word tail path on its own.
+    #[test]
+    fn broadword_exhaustive_short_inputs() {
+        let check = |bytes: &[u8]| {
+            let expected = core::str::from_utf8(bytes).is_ok();
+            assert_eq!(super::broadword::accepts(bytes), expected, "{bytes:02x?}");
+        };
+
+        check(&[]);
+        for a in 0..=255u8 {
+            check(&[a]);
+            for b in 0..=255u8 {
+                check(&[a, b]);
+            }
+        }
+    }
+
+    /// Sequences cut off at end-of-input are rejected at every distance from a
+    /// word boundary.
+    ///
+    /// Truncation is the one condition the main loop cannot see coming — it is
+    /// detected by running out of bytes mid-sequence, or by the tail loop ending
+    /// in a non-ground state — so it is checked at every `len % 8`.
+    #[test]
+    fn broadword_truncation_at_word_boundaries() {
+        let truncated: &[&[u8]] = &[
+            &[0xC2],             // 2-byte lead, no continuation
+            &[0xE0, 0xA0],       // 3-byte, one continuation short
+            &[0xF0, 0x90, 0x80], // 4-byte, one continuation short
+            &[0xF1],             // 4-byte lead, three continuations short
+        ];
+        for seq in truncated {
+            for pad in 0..=17usize {
+                let mut buf: Vec<u8> = core::iter::repeat(b'a').take(pad).collect();
+                buf.extend_from_slice(seq);
+                assert!(
+                    core::str::from_utf8(&buf).is_err(),
+                    "fixture should be invalid: {buf:02x?}"
+                );
+                assert!(!super::broadword::accepts(&buf), "{buf:02x?}");
+            }
+        }
+    }
+
+    /// The broadword wrapper returns byte-identical `Utf8Error`s to the scalar
+    /// validator — offset, line, column and kind.
+    ///
+    /// True by construction today, since it delegates to
+    /// [`validate_utf8_scalar`] on rejection. The test exists so that any later
+    /// attempt to build errors inside the kernel fails loudly rather than
+    /// silently shifting a reported line or column.
+    #[test]
+    fn broadword_matches_scalar_including_error() {
+        let mut rng = Rng(0xb70a_d000_e770_0011);
+        for _ in 0..20_000 {
+            let len = rng.below(96) as usize;
+            let bytes = random_bytes(&mut rng, len);
+            let expected = validate_utf8_scalar(&bytes);
+            assert_eq!(
+                super::validate_utf8_broadword(&bytes),
+                expected,
+                "broadword differed from scalar on {bytes:02x?}"
+            );
+        }
     }
 }

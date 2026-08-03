@@ -13,7 +13,7 @@ The project contains **10 main benchmark documentation files** with approximatel
 | [jq.md](jq.md)                                 | JSON query performance vs system jq         | ~40      |
 | [yq.md](yq.md)                                 | YAML query performance vs system yq         | ~35      |
 | [json-validate.md](json-validate.md)           | JSON validation (RFC 8259) throughput       | ~12      |
-| [utf8-validate.md](utf8-validate.md)           | UTF-8 validation throughput (scalar)        | ~15      |
+| [utf8-validate.md](utf8-validate.md)           | UTF-8 validation throughput (4 engines)     | ~15      |
 | [dsv.md](dsv.md)                               | CSV/TSV parsing performance                 | ~8       |
 | [corpus-shape.md](corpus-shape.md)             | Real-workload input shape statistics (#301) | ~4       |
 | [yaml-shape-survey.md](yaml-shape-survey.md)   | Upstream YAML shape frequency (#326)        | ~9       |
@@ -132,7 +132,7 @@ Benchmarks for `succinctly json validate` - strict RFC 8259 JSON validation thro
 
 ## [utf8-validate.md](utf8-validate.md) - UTF-8 Validation Benchmarks
 
-Benchmarks for `succinctly text validate utf8` - UTF-8 validation throughput for both engines: the AVX2 SIMD kernel (x86_64 default) and the portable scalar validator with its broadword (SWAR) ASCII fast path, which is the only path on ARM64 and in `no_std` builds.
+Benchmarks for `succinctly text validate utf8`, comparing four engines — scalar, portable broadword (SWAR), x86_64 AVX2, and a `core::str::from_utf8` baseline — across synthetic Criterion groups and the eleven realistic `text generate-suite` patterns.
 
 Alongside the synthetic pattern ladder, the `utf8_corpus` group validates the real-workload corpus (#301) - `data/bench/corpus/` when synced, otherwise the committed seed - so throughput claims are gated on real input shapes rather than generator output.
 
@@ -749,6 +749,9 @@ cargo build --release --features bench-runner
 ./target/release/succinctly bench run yq_bench
 ./target/release/succinctly bench run dsv_bench
 ./target/release/succinctly bench run utf8_bench
+
+# Per-engine comparison over the realistic corpus (auto|scalar|broadword|std)
+./target/release/succinctly dev bench utf8 --engine broadword --sizes 10mb
 
 # Criterion benchmarks
 cargo bench --bench jq_comparison
