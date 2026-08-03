@@ -6004,6 +6004,29 @@ mod tests {
     }
 
     #[test]
+    fn test_stream_yaml_sequence_flow_style() {
+        // #478: `stream_yaml_sequence` mirrors `stream_yaml_value`'s Sequence
+        // flow/block duality, but its only caller (`--slurp`) always maps
+        // `-I0` to indent_spaces=2 (yq_runner.rs's documented compact-YAML
+        // quirk), so the flow-style (indent_spaces == 0) branch is
+        // unreachable from the CLI. Exercise it directly as a library
+        // caller would, combining cursors from two independent sources
+        // (the reason this function exists over reusing `stream_yaml_value`'s
+        // own Sequence arm, which requires one shared `YamlIndex`).
+        let bytes_a = b"a: 1\n".to_vec();
+        let index_a = YamlIndex::build(&bytes_a).unwrap();
+        let bytes_b = b"b: 2\n".to_vec();
+        let index_b = YamlIndex::build(&bytes_b).unwrap();
+
+        let cursor_a = index_a.root(&bytes_a).first_child().unwrap();
+        let cursor_b = index_b.root(&bytes_b).first_child().unwrap();
+
+        let mut out = String::new();
+        stream_yaml_sequence([cursor_a, cursor_b], &mut out, 0, 0).unwrap();
+        assert_eq!(out, "[{a: 1}, {b: 2}]");
+    }
+
+    #[test]
     fn test_stream_yaml_quoted_scalars_stay_quoted() {
         // #175: quoted source scalars are genuine strings and must keep their
         // quoting style so they don't turn into numbers/booleans on re-parse.
