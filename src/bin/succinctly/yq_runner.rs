@@ -1315,6 +1315,30 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
         && context.named.is_empty();
     let can_fast_path = can_json_fast_path || can_yaml_fast_path;
 
+    // `--inplace`'s own copy of the M2 gate (#478): identical conditions to
+    // `can_json_fast_path`/`can_yaml_fast_path` above, but requiring
+    // `args.inplace` instead of excluding it. Kept as a separate pair rather
+    // than folding into the gate above because inplace output targets a
+    // per-file buffer (then `fs::write`), not the shared stdout `writer`
+    // the block below uses — the two loops have different write targets and
+    // per-file `---` separator resets, so they stay as distinct branches
+    // that happen to share the same underlying `stream_cursor!` macro.
+    let can_inplace_json_fast_path = is_m2_streamable
+        && (output_config.compact || (can_stream_pretty && !args.ascii_output))
+        && output_config.output_format == OutputFormat::Json
+        && !args.null_input
+        && !args.raw_input
+        && args.inplace
+        && context.named.is_empty();
+    let can_inplace_yaml_fast_path = is_m2_streamable
+        && (output_config.compact || can_stream_pretty)
+        && output_config.output_format == OutputFormat::Yaml
+        && !args.null_input
+        && !args.raw_input
+        && args.inplace
+        && context.named.is_empty();
+    let can_inplace_fast_path = can_inplace_json_fast_path || can_inplace_yaml_fast_path;
+
     // Indent width for the fast path's streamers. YAML's `-I0` is a special
     // case: real `yq` treats it as "use the library default" (4 spaces),
     // and succinctly's existing (pre-#442) compact-YAML fast path hardcodes
@@ -1330,22 +1354,20 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
     };
     let json_indent_spaces: usize = args.indent as usize;
 
-    if can_fast_path {
-        // M2 streaming fast path: evaluate expression and stream results directly
-        // Track global document index across all files for --doc filtering
-        let mut global_doc_index: usize = 0;
-        // Whether any document has produced YAML output yet — drives `---`
-        // separator placement between documents (#175).
-        let mut yaml_doc_streamed = false;
-
-        // Helper macro to stream cursor results (avoiding closure borrow issues)
-        macro_rules! stream_cursor {
-            ($cursor:expr, $writer:expr) => {{
-                if can_yaml_fast_path {
+    // Helper macro to stream cursor results (avoiding closure borrow issues).
+    // Defined here (rather than inside the `if can_fast_path` block below) so
+    // both the stdout M2 path and `--inplace`'s fast path (#478) can reuse
+    // it. `$is_yaml` is threaded through explicitly rather than closing over
+    // `can_yaml_fast_path` by name, and `yaml_doc_streamed`/`any_truthy`/
+    // `sink` resolve, at each call site, to whichever same-named local is in
+    // scope there — each branch below declares its own `yaml_doc_streamed`.
+    macro_rules! stream_cursor {
+            ($cursor:expr, $writer:expr, $is_yaml:expr, $doc_streamed:expr) => {{
+                if $is_yaml {
                     // M2 YAML path: YAML output streaming
                     if is_identity {
                         // P9 path: stream directly without evaluation
-                        emit_yaml_doc_separator($writer, &mut yaml_doc_streamed, true)?;
+                        emit_yaml_doc_separator($writer, $doc_streamed, true)?;
                         $cursor
                             .stream_yaml(&mut FmtWriter($writer), yaml_indent_spaces)
                             .map_err(|_| anyhow::anyhow!("Write error"))?;
@@ -1364,7 +1386,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                         ) && !matches!(&result, GenericResult::Many(vs) if vs.is_empty())
                             && !matches!(&result, GenericResult::ManyCursor(cs) if cs.is_empty())
                             && !matches!(&result, GenericResult::ManyOwned(vs) if vs.is_empty());
-                        emit_yaml_doc_separator($writer, &mut yaml_doc_streamed, will_output)?;
+                        emit_yaml_doc_separator($writer, $doc_streamed, will_output)?;
                         let stats = result
                             .stream_yaml(&mut FmtWriter($writer), yaml_indent_spaces, |w| {
                                 w.write_str("\n")
@@ -1409,6 +1431,14 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
             }};
         }
 
+    if can_fast_path {
+        // M2 streaming fast path: evaluate expression and stream results directly
+        // Track global document index across all files for --doc filtering
+        let mut global_doc_index: usize = 0;
+        // Whether any document has produced YAML output yet — drives `---`
+        // separator placement between documents (#175).
+        let mut yaml_doc_streamed = false;
+
         if input_files.is_empty() {
             let yaml_bytes = read_stdin()?;
             let fmt = resolve_input_format(args.input_format, None);
@@ -1428,7 +1458,12 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                             .document
                             .map_or(true, |target| global_doc_index == target);
                         if should_process {
-                            stream_cursor!(cursor, &mut writer);
+                            stream_cursor!(
+                                cursor,
+                                &mut writer,
+                                can_yaml_fast_path,
+                                &mut yaml_doc_streamed
+                            );
                         }
                         global_doc_index += 1;
                         docs = rest;
@@ -1464,7 +1499,12 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                         } else {
                             // M2 path: need to get the actual document cursor
                             if let Some(doc_cursor) = root.first_child() {
-                                stream_cursor!(doc_cursor, &mut writer);
+                                stream_cursor!(
+                                    doc_cursor,
+                                    &mut writer,
+                                    can_yaml_fast_path,
+                                    &mut yaml_doc_streamed
+                                );
                             }
                         }
                     }
@@ -1492,7 +1532,12 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                                 .document
                                 .map_or(true, |target| global_doc_index == target);
                             if should_process {
-                                stream_cursor!(cursor, &mut writer);
+                                stream_cursor!(
+                                    cursor,
+                                    &mut writer,
+                                    can_yaml_fast_path,
+                                    &mut yaml_doc_streamed
+                                );
                             }
                             global_doc_index += 1;
                             docs = rest;
@@ -1532,7 +1577,12 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                             } else {
                                 // M2 path: need to get the actual document cursor
                                 if let Some(doc_cursor) = root.first_child() {
-                                    stream_cursor!(doc_cursor, &mut writer);
+                                    stream_cursor!(
+                                        doc_cursor,
+                                        &mut writer,
+                                        can_yaml_fast_path,
+                                        &mut yaml_doc_streamed
+                                    );
                                 }
                             }
                         }
@@ -1658,11 +1708,87 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
             {
                 return Ok(code);
             }
-            let inputs = parse_input(&input_bytes, format)?;
 
-            // Collect all output into a buffer
             let mut output_buffer = Vec::new();
-            {
+
+            if can_inplace_fast_path {
+                // M2 streaming fast path (#478): stream cursor results
+                // directly into this file's buffer, skipping the OwnedValue
+                // DOM (and its IndexMap, which cannot represent duplicate
+                // mapping keys) the same way the stdout M2 path above does.
+                let index = YamlIndex::build(&input_bytes)
+                    .map_err(|e| anyhow::anyhow!("YAML parse error in {file_path}: {e}"))?;
+                let root = index.root(&input_bytes);
+
+                {
+                    let mut buf_writer = BufWriter::new(&mut output_buffer);
+                    // `---` separators start fresh per file, unlike the
+                    // stdout path where they persist across all input files.
+                    let mut yaml_doc_streamed = false;
+
+                    match root.value() {
+                        YamlValue::Sequence(mut docs) => {
+                            while let Some((cursor, rest)) = docs.uncons_cursor() {
+                                let should_process = args
+                                    .document
+                                    .map_or(true, |target| global_doc_index == target);
+                                if should_process {
+                                    stream_cursor!(
+                                        cursor,
+                                        &mut buf_writer,
+                                        can_inplace_yaml_fast_path,
+                                        &mut yaml_doc_streamed
+                                    );
+                                }
+                                global_doc_index += 1;
+                                docs = rest;
+                            }
+                        }
+                        _ => {
+                            // Single document case. See the stdout M2 path's
+                            // identical fallback above: the root cursor
+                            // always reports the virtual document sequence,
+                            // so real documents go through the Sequence arm.
+                            let should_process = args
+                                .document
+                                .map_or(true, |target| global_doc_index == target);
+                            if should_process {
+                                if is_identity {
+                                    if can_inplace_yaml_fast_path {
+                                        root.stream_yaml_document(
+                                            &mut FmtWriter(&mut buf_writer),
+                                            yaml_indent_spaces,
+                                        )
+                                        .map_err(|_| anyhow::anyhow!("Write error"))?;
+                                    } else {
+                                        root.stream_json_document(
+                                            &mut FmtWriter(&mut buf_writer),
+                                            json_indent_spaces,
+                                        )
+                                        .map_err(|_| anyhow::anyhow!("Write error"))?;
+                                    }
+                                    writeln!(buf_writer)?;
+                                    if args.exit_status {
+                                        any_truthy |=
+                                            root.first_child().is_some_and(|c| !c.is_falsy());
+                                    }
+                                } else if let Some(doc_cursor) = root.first_child() {
+                                    stream_cursor!(
+                                        doc_cursor,
+                                        &mut buf_writer,
+                                        can_inplace_yaml_fast_path,
+                                        &mut yaml_doc_streamed
+                                    );
+                                }
+                            }
+                            global_doc_index += 1;
+                        }
+                    }
+                    buf_writer.flush()?;
+                }
+            } else {
+                let inputs = parse_input(&input_bytes, format)?;
+
                 let mut buf_writer = BufWriter::new(&mut output_buffer);
                 // Count matching docs for multi-doc separator logic
                 let matching_docs: usize = if let Some(target_doc) = args.document {
@@ -1704,8 +1830,8 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                     }
                 }
                 buf_writer.flush()?;
+                global_doc_index += inputs.len();
             }
-            global_doc_index += inputs.len();
 
             // Write the output back to the file
             std::fs::write(path, &output_buffer)
