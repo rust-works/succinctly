@@ -1507,6 +1507,27 @@ fn test_number_formatting_array_iteration() -> Result<()> {
     Ok(())
 }
 
+/// #478 item 3: `jq --preserve-input '.'` in pretty mode (no `-c`) used to
+/// collapse duplicate object keys via `standard_json_to_jq_value`'s
+/// `IndexMap`, unlike its own `-c` output. Fixed incidentally by #532's
+/// `Expr::Identity => GenericResult::OneCursor` change, which routes
+/// identity through the cursor-based `print_json` path in both modes —
+/// pinned here as a regression guard rather than a code change.
+#[test]
+fn test_preserve_input_pretty_preserves_duplicate_keys() -> Result<()> {
+    let input = r#"{"a":1,"a":2}"#;
+
+    let (compact, code) = run_jq_stdin(".", input, &["-c", "--preserve-input"])?;
+    assert_eq!(code, 0);
+    assert_eq!(compact.trim(), r#"{"a":1,"a":2}"#);
+
+    let (pretty, code) = run_jq_stdin(".", input, &["--preserve-input"])?;
+    assert_eq!(code, 0);
+    assert_eq!(pretty, "{\n  \"a\": 1,\n  \"a\": 2\n}\n");
+
+    Ok(())
+}
+
 #[test]
 fn test_jq_compat_default() -> Result<()> {
     // Test that jq-compat is now the default behavior
