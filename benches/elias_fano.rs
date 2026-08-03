@@ -337,6 +337,111 @@ fn bench_cursor_from(c: &mut Criterion) {
     group.finish();
 }
 
+/// Benchmark `EliasFano::predecessor` (issue #543 — the ADR-0012 query-time gap).
+///
+/// `predecessor` is an O(log n) binary search over `get`, with "no sequential
+/// fast path" per the type's own doc comment. Two query patterns exercise
+/// that claim directly:
+/// - `random`: no locality, the worst case.
+/// - `monotonic`: increasing queries — the shape `LineIndex::to_line_column`
+///   produces walking a document top to bottom, before any caller-side cache
+///   (see `benches/line_index.rs` for the cached, end-to-end version).
+///
+/// Baseline is `Vec<u32>::partition_point`, the same oracle
+/// `src/text/lines.rs`'s own tests use to check `LineIndex`.
+fn bench_predecessor(c: &mut Criterion) {
+    let mut group = c.benchmark_group("elias_fano/predecessor");
+
+    for n in [1_000, 10_000, 100_000] {
+        // Gaps shaped like real line lengths (corpus-shape.md: ~20-78 B/line).
+        let values = generate_bp_to_text(n, 42);
+        let ef = EliasFano::build(&values);
+        let universe = *values.last().unwrap();
+
+        let random_queries = generate_queries(10_000, universe as usize, 7);
+        let monotonic_queries: Vec<u32> = {
+            let mut rng = ChaCha8Rng::seed_from_u64(99);
+            let mut pos = 0u32;
+            (0..10_000)
+                .map(|_| {
+                    pos = pos.saturating_add(rng.random_range(1..50));
+                    pos.min(universe)
+                })
+                .collect()
+        };
+
+        group.throughput(Throughput::Elements(10_000));
+
+        group.bench_with_input(
+            BenchmarkId::new("ef_random", format!("{}K", n / 1000)),
+            &(&ef, &random_queries),
+            |b, (ef, queries)| {
+                b.iter(|| {
+                    let mut sum = 0u64;
+                    for &q in *queries {
+                        if let Some((idx, _)) = ef.predecessor(black_box(q as u32)) {
+                            sum += idx as u64;
+                        }
+                    }
+                    black_box(sum)
+                });
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("vec_random", format!("{}K", n / 1000)),
+            &(&values, &random_queries),
+            |b, (values, queries)| {
+                b.iter(|| {
+                    let mut sum = 0u64;
+                    for &q in *queries {
+                        match values.partition_point(|&x| x <= black_box(q as u32)) {
+                            0 => {}
+                            i => sum += (i - 1) as u64,
+                        }
+                    }
+                    black_box(sum)
+                });
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("ef_monotonic", format!("{}K", n / 1000)),
+            &(&ef, &monotonic_queries),
+            |b, (ef, queries)| {
+                b.iter(|| {
+                    let mut sum = 0u64;
+                    for &q in *queries {
+                        if let Some((idx, _)) = ef.predecessor(black_box(q)) {
+                            sum += idx as u64;
+                        }
+                    }
+                    black_box(sum)
+                });
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("vec_monotonic", format!("{}K", n / 1000)),
+            &(&values, &monotonic_queries),
+            |b, (values, queries)| {
+                b.iter(|| {
+                    let mut sum = 0u64;
+                    for &q in *queries {
+                        match values.partition_point(|&x| x <= black_box(q)) {
+                            0 => {}
+                            i => sum += (i - 1) as u64,
+                        }
+                    }
+                    black_box(sum)
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
 fn bench_memory(c: &mut Criterion) {
     let mut group = c.benchmark_group("elias_fano/memory");
 
@@ -376,6 +481,7 @@ criterion_group!(
     bench_skip_by_small,
     bench_seek,
     bench_cursor_from,
+    bench_predecessor,
     bench_memory,
 );
 criterion_main!(benches);
