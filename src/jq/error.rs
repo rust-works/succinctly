@@ -410,7 +410,7 @@ impl EvalError {
     /// `<type> (<dump>)`: `path(1)` reports `result 1`, not
     /// `result number (1)`. The dump is truncated the same way every other
     /// embedded value is (jq's shared `jv_dump_string_trunc`), so a long
-    /// result still previews to [`DUMP_KEEP`] bytes.
+    /// result still previews to `DUMP_KEEP` bytes.
     pub fn invalid_path_expression(value: &OwnedValue) -> Self {
         Self::new(format!(
             "{}{}",
