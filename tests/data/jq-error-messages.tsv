@@ -188,3 +188,17 @@ del_comma_group_iterate_error	del(.[], .a)	5	Cannot iterate over number (5)
 path_non_path_literal	path(1)	{"a":1}	Invalid path expression with result 1
 path_non_path_builtin	path(length)	{"a":1}	Invalid path expression with result 1
 path_non_path_arithmetic	path(.a + 1)	{"a":1}	Invalid path expression with result 2
+path_non_path_keys	path(keys)	{"a":1}	Invalid path expression with result ["a"]
+path_non_path_pipe_tail	path(.a | tostring)	{"a":1}	Invalid path expression with result "1"
+path_non_path_object	path({a:1})	{"a":1}	Invalid path expression with result {"a":1}
+path_non_path_array	path([.a])	{"a":1}	Invalid path expression with result [1]
+path_non_path_comparison	path(.a == 1)	{"a":1}	Invalid path expression with result true
+path_non_path_last_stream	path(last(.[]))	[1,2]	Invalid path expression with result 2
+path_non_path_first_output_only	path(1,2)	null	Invalid path expression with result 1
+path_non_path_inner_optional	path((.a + 1)?)	{"a":1}	Invalid path expression with result 2
+path_non_path_inner_error	path(1/0)	null	number (1) and number (0) cannot be divided because the divisor is zero
+path_non_path_dump_truncated	path("aaaaaaaaaaaaaaaaaaaaaaaaaaaa")	null	Invalid path expression with result "aaaaaaaaaaaaaaaaaaaaaaaaa...
+assign_non_path_target	.a + 1 = 5	{"a":1}	Invalid path expression with result 2
+update_non_path_target	.a + 1 |= .	{"a":1}	Invalid path expression with result 2
+del_non_path_target	del(.a + 1)	{"a":1}	Invalid path expression with result 2
+assign_non_path_builtin	length = 5	{"a":1}	Invalid path expression with result 1

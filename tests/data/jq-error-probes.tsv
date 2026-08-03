@@ -277,3 +277,24 @@ del_comma_group_iterate_error	del(.[], .a)	5
 path_non_path_literal	path(1)	{"a":1}
 path_non_path_builtin	path(length)	{"a":1}
 path_non_path_arithmetic	path(.a + 1)	{"a":1}
+path_non_path_keys	path(keys)	{"a":1}
+path_non_path_pipe_tail	path(.a | tostring)	{"a":1}
+path_non_path_object	path({a:1})	{"a":1}
+path_non_path_array	path([.a])	{"a":1}
+path_non_path_comparison	path(.a == 1)	{"a":1}
+path_non_path_last_stream	path(last(.[]))	[1,2]
+path_non_path_first_output_only	path(1,2)	null
+path_non_path_inner_optional	path((.a + 1)?)	{"a":1}
+path_non_path_inner_error	path(1/0)	null
+# One byte past the 29-byte verbatim budget of this message's `errbuf[30]`,
+# wider than every other message's `errbuf[15]` (#530).
+path_non_path_dump_truncated	path("aaaaaaaaaaaaaaaaaaaaaaaaaaaa")	null
+
+# ── write-side wording deferred (assign/update/del use succinctly's own ─────
+# sentence, not jq's "Invalid path expression with result <v>" — a follow-up
+# to #530, tracked as a known divergence rather than fixed here since
+# set_path/delete_at_path are not generic over the evaluator yet).
+assign_non_path_target	.a + 1 = 5	{"a":1}
+update_non_path_target	.a + 1 |= .	{"a":1}
+del_non_path_target	del(.a + 1)	{"a":1}
+assign_non_path_builtin	length = 5	{"a":1}

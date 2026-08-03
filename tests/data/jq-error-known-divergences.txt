@@ -45,7 +45,20 @@
 # negative-index bounds check now survives `?`, since `?` only ever suppressed
 # errors raised while *collecting* a path) landed together and took
 # `optional_write_negative_oob` with them: `.[-5]? = 9` now raises, matching jq.
+#
+# #530 fixed `path()`'s half of this — a filter that is not a path expression
+# at all now raises jq's "Invalid path expression with result <v>" by name
+# instead of silently answering with nothing — and took the three
+# `path_non_path_*` probes below with it.
+#
+# The write side (`=`, `|=`, `del()`) still uses its own invented wording
+# (`cannot use expression as {assignment,update,delete} target`) where jq
+# raises that same sentence, because `set_path`/`delete_at_path` are not
+# generic over the evaluator yet (unlike `update_path`) — aligning them needs
+# a bigger refactor than #530's scope, so it is deferred to a follow-up issue
+# and tracked here in the meantime.
 
-path_non_path_literal                path            path() answers with no output where jq refuses a non-path filter by name — #530
-path_non_path_builtin                path            same, through a builtin that returns a computed value — #530
-path_non_path_arithmetic             path            same, through an arithmetic expression — #530
+assign_non_path_target               assign          `.a + 1 = 5` says "cannot use expression as assignment target" where jq says "Invalid path expression with result 2" — follow-up to #530
+update_non_path_target               update          same, through `|=` — follow-up to #530
+del_non_path_target                  del             same, through `del()` — follow-up to #530
+assign_non_path_builtin              assign          same, through a builtin target (`length = 5`) — follow-up to #530
