@@ -4,6 +4,15 @@
 //! (`input.yaml`), a jq-style filter (`filter`), CLI arguments (`args`, one per
 //! line), and the expected stdout (`expected.out`).
 //!
+//! A case where the oracle *rejects* the input additionally carries
+//! `expected.status` (its exit code) and `expected.err` (its stderr), both
+//! asserted byte-for-byte; a passing case omits both and is asserted to exit
+//! 0. Without this, a case where yq is the one that fails has no oracle at
+//! all — the exit code and diagnostic are exactly what would diverge, and
+//! neither reaches stdout. `expected.out` may still be non-empty on a failing
+//! case: yq can stream output before erroring, and that prefix is compared
+//! unconditionally either way.
+//!
 //! # Golden provenance
 //!
 //! `expected.out` is captured from mikefarah/yq — the oracle — at the version
@@ -40,6 +49,12 @@ struct Case {
     filter: String,
     args: Vec<String>,
     expected: String,
+    /// yq's exit code, for a case where it rejects the input. `None` means
+    /// yq exits 0 and stderr is not asserted.
+    expected_status: Option<i32>,
+    /// yq's stderr, asserted byte-for-byte. Present exactly when
+    /// `expected_status` is.
+    expected_err: Option<String>,
 }
 
 /// Load every case directory, failing loudly on an incomplete or empty corpus
@@ -56,9 +71,30 @@ fn cases() -> Vec<Case> {
                 fs::read_to_string(dir.join(file))
                     .unwrap_or_else(|e| panic!("case {name} is missing {file}: {e}"))
             };
+            let opt_read = |file: &str| fs::read_to_string(dir.join(file)).ok();
             let expected = read("expected.out");
+            let expected_status = opt_read("expected.status").map(|s| {
+                s.trim()
+                    .parse::<i32>()
+                    .unwrap_or_else(|e| panic!("case {name} has a bad expected.status: {e}"))
+            });
+            let expected_err = opt_read("expected.err");
+            assert_eq!(
+                expected_status.is_some(),
+                expected_err.is_some(),
+                "case {name}: expected.status and expected.err must be present together \
+                 — rerun ./scripts/sync-yq-golden.sh"
+            );
             assert!(
-                !expected.is_empty(),
+                !matches!(expected_status, Some(0)),
+                "case {name}: expected.status must record a *failing* exit code; \
+                 a passing case omits it — rerun ./scripts/sync-yq-golden.sh"
+            );
+            // A failing case may legitimately produce no stdout (though it can
+            // also stream a prefix first); a passing one producing none means
+            // the fixture never got captured.
+            assert!(
+                !expected.is_empty() || expected_status.is_some(),
                 "case {name} has an empty expected.out — rerun ./scripts/sync-yq-golden.sh"
             );
             Case {
@@ -66,6 +102,8 @@ fn cases() -> Vec<Case> {
                 filter: read("filter").trim_end_matches('\n').to_string(),
                 args: read("args").lines().map(str::to_string).collect(),
                 expected,
+                expected_status,
+                expected_err,
                 name,
             }
         })
@@ -101,7 +139,8 @@ fn known_failures() -> BTreeMap<String, String> {
 }
 
 /// Run `succinctly yq <args> <filter>` with the case input on stdin and demand
-/// exit code 0 plus stdout byte-equal to the golden.
+/// stdout byte-equal to the golden, plus yq's exit code — 0, or the recorded
+/// failing code and stderr for a case where yq rejects the input.
 fn run_case(case: &Case) -> Result<(), String> {
     run_case_with_input(case, &case.input)
 }
@@ -125,12 +164,33 @@ fn run_case_with_input(case: &Case, input: &str) -> Result<(), String> {
         .map_err(|e| format!("write stdin: {e}"))?;
     let output = child.wait_with_output().map_err(|e| format!("wait: {e}"))?;
 
-    if !output.status.success() {
-        return Err(format!(
-            "exit {:?}, stderr: {}",
-            output.status.code(),
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
+    match case.expected_status {
+        None => {
+            if !output.status.success() {
+                return Err(format!(
+                    "exit {:?}, stderr: {}",
+                    output.status.code(),
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ));
+            }
+        }
+        Some(want) => {
+            if output.status.code() != Some(want) {
+                return Err(format!(
+                    "exit {:?}, yq exits {want}; stderr: {}",
+                    output.status.code(),
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ));
+            }
+            let want_err = case.expected_err.as_deref().unwrap_or_default();
+            if output.stderr != want_err.as_bytes() {
+                return Err(format!(
+                    "stderr differs from yq\n    expected: {:?}\n    actual:   {:?}",
+                    want_err,
+                    String::from_utf8_lossy(&output.stderr)
+                ));
+            }
+        }
     }
     if output.stdout != case.expected.as_bytes() {
         return Err(format!(
