@@ -1012,6 +1012,87 @@ fn bools_to_result<'a, W: Clone + AsRef<[u64]>>(mut bools: Vec<bool>) -> QueryRe
     }
 }
 
+/// Evaluate `body(bit)` once per truthy-bit of a condition stream, merging
+/// the results in order. Shared by `eval_if` and `builtin_select` so a
+/// multi-output condition (`if (true,false) then "a" else "b" end` /
+/// `select((false,false) and true)`) fans out the same way both call it,
+/// instead of only consulting the condition's first output (#378).
+///
+/// Same borrowed/owned promotion as `eval_comma` (#353): outputs stay
+/// borrowed until an owned/computed body result forces the accumulator to
+/// promote, and a sibling that errors or breaks keeps whatever was already
+/// produced as a `Partial` prefix (#400) rather than discarding it.
+fn eval_fanout<'a, W: Clone + AsRef<[u64]>>(
+    cond_result: QueryResult<'a, W>,
+    mut body: impl FnMut(bool) -> QueryResult<'a, W>,
+) -> QueryResult<'a, W> {
+    let mut bits = Vec::new();
+    let cond_control = push_truthiness(cond_result, &mut bits);
+
+    let mut borrowed: Vec<StandardJson<'a, W>> = Vec::new();
+    let mut owned: Option<Vec<OwnedValue>> = None;
+
+    for bit in bits {
+        match body(bit).materialize_cursor() {
+            QueryResult::One(v) => match owned.as_mut() {
+                Some(acc) => acc.push(to_owned(&v)),
+                None => borrowed.push(v),
+            },
+            QueryResult::OneCursor(_) => {
+                unreachable!("materialize_cursor should have converted this")
+            }
+            QueryResult::Many(vs) => match owned.as_mut() {
+                Some(acc) => acc.extend(vs.iter().map(to_owned)),
+                None => borrowed.extend(vs),
+            },
+            QueryResult::Owned(v) => owned
+                .get_or_insert_with(|| {
+                    core::mem::take(&mut borrowed)
+                        .iter()
+                        .map(to_owned)
+                        .collect()
+                })
+                .push(v),
+            QueryResult::ManyOwned(vs) => owned
+                .get_or_insert_with(|| {
+                    core::mem::take(&mut borrowed)
+                        .iter()
+                        .map(to_owned)
+                        .collect()
+                })
+                .extend(vs),
+            QueryResult::None => {}
+            QueryResult::Error(e) => {
+                return partial(
+                    merge_owned(borrowed, owned.unwrap_or_default()),
+                    Control::Error(e),
+                );
+            }
+            QueryResult::Break(label) => {
+                return partial(
+                    merge_owned(borrowed, owned.unwrap_or_default()),
+                    Control::Break(label),
+                );
+            }
+            QueryResult::Partial(vs, control) => {
+                let mut merged = merge_owned(borrowed, owned.unwrap_or_default());
+                merged.extend(vs);
+                return partial(merged, control);
+            }
+        }
+    }
+
+    match cond_control {
+        Some(control) => partial(merge_owned(borrowed, owned.unwrap_or_default()), control),
+        None => match owned {
+            Some(mut acc) if acc.len() == 1 => QueryResult::Owned(acc.pop().unwrap()),
+            Some(acc) => QueryResult::ManyOwned(acc),
+            None if borrowed.len() == 1 => QueryResult::One(borrowed.pop().unwrap()),
+            None => QueryResult::Many(borrowed),
+        },
+    }
+}
+
 /// Evaluate arithmetic operations.
 fn eval_arithmetic<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     op: ArithOp,
@@ -1545,6 +1626,10 @@ fn eval_alternative<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 }
 
 /// Evaluate if-then-else expression.
+///
+/// A multi-output condition forks the branches, one evaluation per output
+/// (`if (true,false) then "a" else "b" end` yields `"a"`, `"b"`) — jq
+/// semantics, restored by `eval_fanout` (#378).
 fn eval_if<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     cond: &Expr,
     then_branch: &Expr,
@@ -1552,37 +1637,14 @@ fn eval_if<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    // Evaluate condition
     let cond_result = eval_single::<W, S>(cond, value.clone(), optional);
-
-    // Check if condition is truthy
-    let is_truthy = match &cond_result {
-        QueryResult::One(v) => to_owned(v).is_truthy(),
-        QueryResult::OneCursor(_) => unreachable!("eval_single never produces OneCursor"),
-        QueryResult::Owned(v) => v.is_truthy(),
-        QueryResult::Many(vs) => vs.first().is_some_and(|v| to_owned(v).is_truthy()),
-        QueryResult::ManyOwned(vs) => vs.first().is_some_and(super::value::OwnedValue::is_truthy),
-        QueryResult::None => false,
-        QueryResult::Error(e) => return QueryResult::Error(e.clone()),
-        QueryResult::Break(label) => return QueryResult::Break(label.clone()),
-        // The condition is only ever consulted for its first output (#378,
-        // a separate, already-tracked limitation — a multi-output condition
-        // does not fork the branches). A `Partial` condition is treated the
-        // same as a bare `Error`/`Break` above: the condition is evaluated
-        // once, and — per array/object construction's precedent, verified
-        // against jq — a value-position sub-expression that errors partway
-        // aborts outright rather than exposing a prefix.
-        QueryResult::Partial(_, Control::Error(e)) => return QueryResult::Error(e.clone()),
-        QueryResult::Partial(_, Control::Break(label)) => {
-            return QueryResult::Break(label.clone());
+    eval_fanout(cond_result, |truthy| {
+        if truthy {
+            eval_single::<W, S>(then_branch, value.clone(), optional)
+        } else {
+            eval_single::<W, S>(else_branch, value.clone(), optional)
         }
-    };
-
-    if is_truthy {
-        eval_single::<W, S>(then_branch, value, optional)
-    } else {
-        eval_single::<W, S>(else_branch, value, optional)
-    }
+    })
 }
 
 /// Evaluate try-catch expression.
@@ -2333,42 +2395,24 @@ fn builtin_in<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 }
 
 /// Builtin: select(condition)
+///
+/// A multi-output condition republishes `value` once per truthy output
+/// (`select((false,false) and true)` yields nothing, matching jq — not the
+/// first-output-only answer `vs.first()` used to give) — restored by
+/// `eval_fanout` (#378).
 fn builtin_select<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     cond: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    // Evaluate condition
     let cond_result = eval_single::<W, S>(cond, value.clone(), optional);
-
-    // Check if condition is truthy
-    let is_truthy = match &cond_result {
-        QueryResult::One(v) => to_owned(v).is_truthy(),
-        QueryResult::OneCursor(_) => unreachable!("eval_single never produces OneCursor"),
-        QueryResult::Owned(v) => v.is_truthy(),
-        QueryResult::Many(vs) => vs.first().is_some_and(|v| to_owned(v).is_truthy()),
-        QueryResult::ManyOwned(vs) => vs.first().is_some_and(super::value::OwnedValue::is_truthy),
-        QueryResult::None => false,
-        QueryResult::Error(e) => return QueryResult::Error(e.clone()),
-        QueryResult::Break(label) => return QueryResult::Break(label.clone()),
-        // The condition is only ever consulted for its first output (#378,
-        // a separate, already-tracked limitation — a multi-output condition
-        // does not fork the branches). A `Partial` condition is treated the
-        // same as a bare `Error`/`Break` above: the condition is evaluated
-        // once, and — per array/object construction's precedent, verified
-        // against jq — a value-position sub-expression that errors partway
-        // aborts outright rather than exposing a prefix.
-        QueryResult::Partial(_, Control::Error(e)) => return QueryResult::Error(e.clone()),
-        QueryResult::Partial(_, Control::Break(label)) => {
-            return QueryResult::Break(label.clone());
+    eval_fanout(cond_result, |truthy| {
+        if truthy {
+            QueryResult::One(value.clone())
+        } else {
+            QueryResult::None
         }
-    };
-
-    if is_truthy {
-        QueryResult::One(value)
-    } else {
-        QueryResult::None
-    }
+    })
 }
 
 /// Builtin: map(f)
@@ -17679,23 +17723,15 @@ mod tests {
                 "x",
                 r#"jq 1.7.1 prints {"a":1,"b":2}, then fails"#,
             ),
-            (
-                b"5",
-                r#"select((true,error("x")))"#,
-                "x",
-                "jq 1.7.1 prints 5, then fails",
-            ),
+            // `select`/`if` fan out over their condition's outputs (#378) —
+            // they forward their operand as a stream, not a value, so they no
+            // longer belong in this list; see
+            // `partial_prefix_survives_the_stream_forwarding_constructs`.
             (
                 b"null",
                 r#""v=\((1,error("x")))""#,
                 "x",
                 r#"jq 1.7.1 prints "v=1", then fails"#,
-            ),
-            (
-                b"null",
-                r#"if (1,error("x")) then "t" else "f" end"#,
-                "x",
-                r#"jq 1.7.1 prints "t", then fails"#,
             ),
             (
                 b"[10,20,30]",
@@ -17743,9 +17779,8 @@ mod tests {
             (b"[1,2]", "map((.,break $out))"),
             (br#"{"a":1}"#, "with_entries((.,break $out))"),
             (b"null", "{a:1,b:(2,break $out)}"),
-            (b"5", "select((true,break $out))"),
+            // `select`/`if`: see the comment in `atomic` above.
             (b"null", r#""v=\((1,break $out))""#),
-            (b"null", r#"if (1,break $out) then "t" else "f" end"#),
             (b"[10,20,30]", ".[(1,break $out)]"),
             (b"[[7],[8]]", "(.[0],(.[1],break $out))[(0+0)]"),
             (br#"{"a":1}"#, "map_values((.,break $out))"),
@@ -17843,6 +17878,37 @@ mod tests {
         query!(b"null", r#"(1,2,error("x")) | empty"#,
             QueryResult::Error(e) => {
                 assert_eq!(e.message, "x");
+            }
+        );
+
+        // `select`/`if` fan out over their condition's outputs (#378), so —
+        // like every other construct in this test — a `Partial` condition
+        // keeps whatever the truthy bits already produced before the
+        // trailing control surfaces. Matches jq 1.7.1 (`select((true,error("x")))`
+        // on `5` prints `5`, then fails; `if (1,error("x")) then "t" else "f" end`
+        // prints `"t"`, then fails).
+        query!(b"5", r#"select((true,error("x")))"#,
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(prefix_json(&vs), ["5"]);
+                assert_eq!(e.message, "x");
+            }
+        );
+        query!(b"5", r"select((true,break $out))",
+            QueryResult::Partial(vs, Control::Break(label)) => {
+                assert_eq!(prefix_json(&vs), ["5"]);
+                assert_eq!(label, "out");
+            }
+        );
+        query!(b"null", r#"if (1,error("x")) then "t" else "f" end"#,
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(prefix_json(&vs), [r#""t""#]);
+                assert_eq!(e.message, "x");
+            }
+        );
+        query!(b"null", r#"if (1,break $out) then "t" else "f" end"#,
+            QueryResult::Partial(vs, Control::Break(label)) => {
+                assert_eq!(prefix_json(&vs), [r#""t""#]);
+                assert_eq!(label, "out");
             }
         );
     }
@@ -18211,6 +18277,23 @@ mod tests {
                 assert_eq!(n.as_i64().unwrap(), 1);
             }
         );
+    }
+
+    #[test]
+    fn test_if_multi_output_condition_forks_the_branches() {
+        // jq fans `if`/`select` out over every output of the condition,
+        // running the body once per output rather than consulting only the
+        // first one (#378). Pinned against jq 1.7.1.
+        assert_eq!(
+            outputs(b"null", r#"if (true,false) then "a" else "b" end"#),
+            [r#""a""#, r#""b""#]
+        );
+        assert_eq!(
+            outputs(b"null", r#"if (1==1, 1==2, 1==1) then "t" else "f" end"#),
+            [r#""t""#, r#""f""#, r#""t""#]
+        );
+        // An `empty` condition contributes no bits, so no branch runs at all.
+        assert!(outputs(b"null", r#"if empty then "t" else "f" end"#).is_empty());
     }
 
     #[test]
@@ -18627,10 +18710,21 @@ mod tests {
             }
         );
 
-        // select outputs nothing if condition is false
-        query!(br"2", "select(. > 3)",
-            QueryResult::None => {}
-        );
+        // select outputs nothing if condition is false. `eval_fanout` shares
+        // `eval_comma`'s empty-merge shape (`Many(vec![])`, not a bare
+        // `None`) — `outputs()` is deliberately variant-agnostic about that,
+        // per its own doc comment.
+        assert!(outputs(br"2", "select(. > 3)").is_empty());
+    }
+
+    #[test]
+    fn test_builtin_select_multi_output_condition_forks() {
+        // A multi-output condition republishes the input once per truthy
+        // output instead of only consulting the first one (#378). Pinned
+        // against jq 1.7.1.
+        assert!(outputs(b"1", "select((false,false) and true)").is_empty());
+        assert_eq!(outputs(b"1", "select((true,false) and true)"), ["1"]);
+        assert_eq!(outputs(b"1", "select((true,true))"), ["1", "1"]);
     }
 
     #[test]
