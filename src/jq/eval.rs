@@ -14629,7 +14629,9 @@ fn get_float_value<'a, W: Clone + AsRef<[u64]>>(
 ) -> Result<f64, QueryResult<'a, W>> {
     match value {
         StandardJson::Number(n) => {
-            if let Ok(f) = n.as_f64() {
+            if is_nan_sentinel(n.raw_bytes()) {
+                Ok(f64::NAN)
+            } else if let Ok(f) = n.as_f64() {
                 Ok(f)
             } else if optional {
                 Err(QueryResult::None)
@@ -14698,6 +14700,7 @@ fn builtin_floor<W: Clone + AsRef<[u64]>>(
     optional: bool,
 ) -> QueryResult<'_, W> {
     match get_float_value::<W>(&value, optional) {
+        Ok(n) if n.is_nan() => QueryResult::Owned(OwnedValue::Float(f64::NAN)),
         Ok(n) => QueryResult::Owned(OwnedValue::Int(floor_f64(n) as i64)),
         Err(r) => r,
     }
@@ -14709,6 +14712,7 @@ fn builtin_ceil<W: Clone + AsRef<[u64]>>(
     optional: bool,
 ) -> QueryResult<'_, W> {
     match get_float_value::<W>(&value, optional) {
+        Ok(n) if n.is_nan() => QueryResult::Owned(OwnedValue::Float(f64::NAN)),
         Ok(n) => QueryResult::Owned(OwnedValue::Int(ceil_f64(n) as i64)),
         Err(r) => r,
     }
@@ -14720,6 +14724,7 @@ fn builtin_round<W: Clone + AsRef<[u64]>>(
     optional: bool,
 ) -> QueryResult<'_, W> {
     match get_float_value::<W>(&value, optional) {
+        Ok(n) if n.is_nan() => QueryResult::Owned(OwnedValue::Float(f64::NAN)),
         Ok(n) => QueryResult::Owned(OwnedValue::Int(round_f64(n) as i64)),
         Err(r) => r,
     }
@@ -14731,6 +14736,7 @@ fn builtin_trunc<W: Clone + AsRef<[u64]>>(
     optional: bool,
 ) -> QueryResult<'_, W> {
     match get_float_value::<W>(&value, optional) {
+        Ok(n) if n.is_nan() => QueryResult::Owned(OwnedValue::Float(f64::NAN)),
         Ok(n) => QueryResult::Owned(OwnedValue::Int(libm::trunc(n) as i64)),
         Err(r) => r,
     }
@@ -14841,9 +14847,14 @@ fn get_number_from_result<W: Clone + AsRef<[u64]>>(
         QueryResult::Owned(v @ OwnedValue::NumberLiteral(..)) => v
             .as_f64()
             .ok_or_else(|| NumberError::Error(EvalError::new("invalid number"))),
-        QueryResult::One(StandardJson::Number(n)) => n
-            .as_f64()
-            .map_err(|_| NumberError::Error(EvalError::new("invalid number"))),
+        QueryResult::One(StandardJson::Number(n)) => {
+            if is_nan_sentinel(n.raw_bytes()) {
+                Ok(f64::NAN)
+            } else {
+                n.as_f64()
+                    .map_err(|_| NumberError::Error(EvalError::new("invalid number")))
+            }
+        }
         QueryResult::Error(e) => Err(NumberError::Error(e)),
         _ if optional => Err(NumberError::None),
         _ => Err(NumberError::Error(EvalError::new("expected number"))),
@@ -21462,6 +21473,62 @@ mod tests {
         // answer here rather than leaving it silently uncovered.
         query!(b"null", "[nan] | bsearch(nan)", QueryResult::Owned(OwnedValue::Int(idx)) => {
             assert_eq!(idx, -2);
+        });
+    }
+
+    #[test]
+    fn test_nan_math_builtins_survive_reindex_bridge_613() {
+        // Companion to `test_nan_survives_reindex_bridge_472`: that fix covered
+        // `to_owned`/`length`/`tonumber`/`isnan`, but `get_float_value` and
+        // `get_number_from_result` -- which back the whole math-builtin family --
+        // still read `n.as_f64()` directly with no sentinel check, so a bridged
+        // NaN through any of these errored ("invalid number") instead of
+        // propagating. Every expected value is jq-1.7.1's own output for the
+        // same query.
+        for filter in [
+            "nan | floor | isnan",
+            "nan | ceil | isnan",
+            "nan | round | isnan",
+            "nan | trunc | isnan",
+            "nan | sqrt | isnan",
+            "nan | fabs | isnan",
+            "nan | log | isnan",
+            "nan | log10 | isnan",
+            "nan | log2 | isnan",
+            "nan | exp | isnan",
+            "nan | exp10 | isnan",
+            "nan | exp2 | isnan",
+            "pow(nan; 2) | isnan",
+            "pow(2; nan) | isnan",
+            "nan | sin | isnan", // trig shares get_float_value; fixed for free
+        ] {
+            query!(b"null", filter, QueryResult::Owned(OwnedValue::Bool(b)) => {
+                assert!(b, "expected {filter:?} to be NaN");
+            });
+        }
+
+        // floor/ceil/round/trunc wrap their result as `OwnedValue::Int`, and
+        // `NaN as i64` saturates to 0 -- confirm the NaN case is special-cased
+        // before that cast so `type` stays "number", not silently coerced.
+        query!(b"null", "nan | floor | type", QueryResult::Owned(OwnedValue::String(s)) => {
+            assert_eq!(s, "number");
+        });
+    }
+
+    #[test]
+    fn test_nan_normals_isinfinite_isnormal_already_correct_613() {
+        // Unlike the math builtins above, `normals`/`isinfinite`/`isnormal`
+        // already match real jq for a bridged NaN today (verified against
+        // jq-1.7.1): the missing sentinel check makes `n.as_f64()` fail, and
+        // each of these three happens to treat that failure the same way jq
+        // treats NaN itself. Pinned here so it can't silently regress while
+        // nearby code is being touched for #613.
+        query!(b"null", "nan | normals", QueryResult::None => {});
+        query!(b"null", "nan | isinfinite", QueryResult::Owned(OwnedValue::Bool(b)) => {
+            assert!(!b);
+        });
+        query!(b"null", "nan | isnormal", QueryResult::Owned(OwnedValue::Bool(b)) => {
+            assert!(!b);
         });
     }
 
