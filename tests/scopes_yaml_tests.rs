@@ -316,48 +316,6 @@ fn every_src_subdirectory_has_a_scope() {
 }
 
 #[test]
-fn scope_list_matches_scopes_yaml() {
-    let yaml_scopes = parse_scopes_yaml(&scopes_yaml_text());
-    let yaml: BTreeMap<String, String> = yaml_scopes
-        .into_iter()
-        .map(|s| (s.name, s.description))
-        .collect();
-    let guidelines = commit_guidelines_text();
-    let markdown = markdown_scopes(section(&guidelines, "Scopes"));
-
-    let mut problems = Vec::new();
-    for (name, description) in &yaml {
-        match markdown.get(name) {
-            None => problems.push(format!(
-                "missing from commit-guidelines.md: `{name}` - {description}"
-            )),
-            Some(listed) if listed != description => problems.push(format!(
-                "description differs for `{name}`:\n\
-                 \x20   scopes.yaml:          {description}\n\
-                 \x20   commit-guidelines.md: {listed}"
-            )),
-            Some(_) => {}
-        }
-    }
-    for name in markdown.keys() {
-        if !yaml.contains_key(name) {
-            problems.push(format!(
-                "listed in commit-guidelines.md but not defined in scopes.yaml: `{name}`"
-            ));
-        }
-    }
-    problems.sort();
-
-    assert!(
-        problems.is_empty(),
-        "the `## Scopes` list in .omni-dev/commit-guidelines.md has drifted from \
-         .omni-dev/scopes.yaml (#568):\n  {}\n\n\
-         scopes.yaml is the single source of truth — update the markdown list to match it.",
-        problems.join("\n  ")
-    );
-}
-
-#[test]
 fn example_scopes_are_defined_in_scopes_yaml() {
     let yaml_scopes = parse_scopes_yaml(&scopes_yaml_text());
     let known: Vec<String> = yaml_scopes.into_iter().map(|s| s.name).collect();
@@ -381,14 +339,18 @@ fn example_scopes_are_defined_in_scopes_yaml() {
 
 #[test]
 fn skill_and_style_guide_point_at_scopes_yaml_instead_of_hardcoding_it() {
-    for path in [".claude/skills/commit-msg/SKILL.md", "docs/STYLE_GUIDE.md"] {
+    for path in [
+        ".claude/skills/commit-msg/SKILL.md",
+        "docs/STYLE_GUIDE.md",
+        ".omni-dev/commit-guidelines.md",
+    ] {
         let full_path = PathBuf::from(REPO_ROOT).join(path);
         let text = fs::read_to_string(&full_path)
             .unwrap_or_else(|e| panic!("read {}: {e}", full_path.display()));
         assert!(
             text.contains(".omni-dev/scopes.yaml"),
             "{path} should point at .omni-dev/scopes.yaml as the source of truth for commit \
-             scopes, not restate them (#568)"
+             scopes, not restate them (#568, #588)"
         );
     }
 
@@ -399,6 +361,15 @@ fn skill_and_style_guide_point_at_scopes_yaml_instead_of_hardcoding_it() {
         !skill_md.contains("## Scopes for This Project"),
         "SKILL.md has reintroduced a hardcoded scope table (#568) — point at \
          .omni-dev/scopes.yaml instead of a competing list"
+    );
+
+    let guidelines = commit_guidelines_text();
+    let markdown = markdown_scopes(section(&guidelines, "Scopes"));
+    assert!(
+        markdown.is_empty(),
+        "commit-guidelines.md's `## Scopes` section has reintroduced a hardcoded scope list \
+         (#588) — point at .omni-dev/scopes.yaml instead of a competing, drift-prone copy:\n  {}",
+        markdown.keys().cloned().collect::<Vec<_>>().join(", ")
     );
 }
 
