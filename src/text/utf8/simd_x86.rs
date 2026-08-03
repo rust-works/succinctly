@@ -8,26 +8,24 @@
 #![allow(unsafe_code)] // x86_64 AVX2 SIMD intrinsics
 #![allow(clippy::cast_possible_wrap)] // u8 byte constants deliberately reinterpreted as i8 lanes
 
-use super::{validate_utf8_broadword, validate_utf8_scalar, Utf8Error};
+use super::{validate_utf8_scalar, Utf8Error};
 use core::arch::x86_64::*;
 
 /// Validate `input` as UTF-8 using AVX2 when available.
 ///
 /// Returns `Ok(())` only when the AVX2 accept scan proves the whole buffer
-/// valid; otherwise defers to the scalar validator for the exact error. On CPUs
-/// without AVX2 the portable broadword scan takes over — it needs no feature
-/// detection and likewise falls back to the scalar validator for diagnostics,
-/// so the reported `Utf8Error` is the same on either path.
+/// valid; otherwise defers to the scalar validator for the exact error. On
+/// CPUs without AVX2 the scalar validator takes over directly — it already
+/// carries the #133 ASCII fast path, so the reported `Utf8Error` is the same
+/// on either path and pre-AVX2 x86_64 gets the same default as every other
+/// non-AVX2 target (see `validate_utf8` in the parent module).
 pub fn validate_utf8_simd(input: &[u8]) -> Result<(), Utf8Error> {
-    if is_x86_feature_detected!("avx2") {
-        // SAFETY: AVX2 is confirmed available by the check immediately above.
-        if unsafe { validate_utf8_avx2(input) } {
-            Ok(())
-        } else {
-            validate_utf8_scalar(input)
-        }
+    // SAFETY: `validate_utf8_avx2` is only entered once the CPU is confirmed
+    // to support AVX2 by `is_x86_feature_detected!`.
+    if is_x86_feature_detected!("avx2") && unsafe { validate_utf8_avx2(input) } {
+        Ok(())
     } else {
-        validate_utf8_broadword(input)
+        validate_utf8_scalar(input)
     }
 }
 

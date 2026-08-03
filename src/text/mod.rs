@@ -24,11 +24,14 @@
 //! error reporting including byte offset, line number, and column position.
 //!
 //! [`validate_utf8`](crate::text::validate_utf8) picks the fastest engine for
-//! the target: an AVX2 kernel on x86_64 with runtime feature detection, and a
-//! portable broadword (SWAR) scan everywhere else. Both are accept scans that
-//! defer to [`validate_utf8_scalar`](crate::text::validate_utf8_scalar) — the
-//! reference implementation — for the exact error, so diagnostics do not
-//! depend on which engine ran.
+//! the target: an AVX2 kernel on x86_64 with runtime feature detection, and
+//! [`validate_utf8_scalar`](crate::text::validate_utf8_scalar) — which already
+//! carries its own 8-byte ASCII skip — everywhere else. The AVX2 path is an
+//! accept scan that defers to the scalar validator for the exact error, so
+//! diagnostics do not depend on which engine ran.
+//! [`validate_utf8_broadword`](crate::text::validate_utf8_broadword) is also
+//! available for callers who know their input is ASCII-dominant; see its
+//! module docs for why it is not the default.
 //!
 //! ```
 //! use succinctly::text::utf8::{validate_utf8, Utf8Error, Utf8ErrorKind};

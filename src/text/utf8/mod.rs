@@ -121,16 +121,19 @@ impl core::fmt::Display for Utf8ErrorKind {
 pub fn validate_utf8(input: &[u8]) -> Result<(), Utf8Error> {
     // On x86_64 with runtime feature detection available (std or test), prefer
     // the AVX2 fast path. Everywhere else — aarch64, wasm, riscv, and any
-    // `no_std` build — use the portable broadword scan, which needs no feature
-    // detection. Both fall back to the scalar validator for the exact
-    // `Utf8Error`, so diagnostics are identical whichever engine ran.
+    // `no_std` build — use the scalar validator, which already skips ASCII
+    // runs eight bytes at a time (#133). `validate_utf8_broadword` is available
+    // separately for callers who know their input is ASCII-dominant: measured
+    // against the current scalar validator it wins clearly on long ASCII runs
+    // but loses geometric mean across realistic mixed content, so it is not
+    // the default — see docs/benchmarks/utf8-validate.md#engine-comparison-134.
     #[cfg(all(target_arch = "x86_64", any(test, feature = "std")))]
     {
         validate_utf8_simd(input)
     }
     #[cfg(not(all(target_arch = "x86_64", any(test, feature = "std"))))]
     {
-        validate_utf8_broadword(input)
+        validate_utf8_scalar(input)
     }
 }
 
