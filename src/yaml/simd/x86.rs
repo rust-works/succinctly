@@ -1278,9 +1278,11 @@ mod tests {
     /// over colons or hashes and the parse would silently change shape.
     #[test]
     fn test_classify_has_cr_gate_only_affects_the_cr_channel() {
-        // Every structural byte present at once, plus a `\r`, in both a 16-byte
-        // SSE2 chunk and a 32-byte AVX2 one.
-        let input = b"a\rb\nc:d-e f\"g'h\\i#jklmnopqrstuvwxyz0123456789";
+        // Every structural byte present at once, plus a `\r` at 1, 10, and 24 so
+        // every tested offset's minimum (16-byte SSE2) window contains one: [0,
+        // 16), [4, 20), and [16, 32) respectively. A single `\r` cannot satisfy
+        // all three — those windows don't share a common byte.
+        let input = b"a\rb\nc:d-e \r\"g'h\\i#jklmno\rqrstuvwxyz0123456789";
         for &offset in &[0usize, 4, 16] {
             let with = classify_yaml_chars::<true>(input, offset).unwrap();
             let without = classify_yaml_chars::<false>(input, offset).unwrap();
