@@ -23815,6 +23815,227 @@ mod tests {
         ]);
     }
 
+    /// #499: `needs_path_context` mirrors `IndexExpr`'s target/key check
+    /// (#360) for a computed slice's target and both bounds — a `path`/
+    /// `parent`/`key` builtin (yq's no-arg path-context extensions) hiding in
+    /// any of the three must still be found, or `eval_pipe` would run the
+    /// pipe without the path context those builtins read.
+    #[test]
+    fn test_needs_path_context_descends_into_slice_expr() {
+        let path_ctx = Expr::Builtin(Builtin::PathNoArg);
+        let plain = Expr::Literal(Literal::Int(0));
+
+        // Hidden in the target.
+        assert!(needs_path_context(&Expr::slice_by(
+            path_ctx.clone(),
+            Some(plain.clone()),
+            Some(plain.clone()),
+        )));
+        // Hidden in the start bound (target and end plain).
+        assert!(needs_path_context(&Expr::slice_by(
+            Expr::Identity,
+            Some(path_ctx.clone()),
+            Some(plain.clone()),
+        )));
+        // Hidden in the end bound (target and start plain).
+        assert!(needs_path_context(&Expr::slice_by(
+            Expr::Identity,
+            Some(plain.clone()),
+            Some(path_ctx),
+        )));
+        // None of the three need it.
+        assert!(!needs_path_context(&Expr::slice_by(
+            Expr::Identity,
+            Some(plain.clone()),
+            Some(plain),
+        )));
+    }
+
+    /// #499: `eval_slice_expr` (plain reads, no `=`/`|=`/`path()`/`del()`)
+    /// covering the shapes `test_computed_slice_bounds` doesn't reach — every
+    /// case there goes through path resolution (`resolve_slice_expr`), a
+    /// separate function with its own copy of this logic, so none of it
+    /// exercised the read-mode evaluator at all. `(0+0)`/`(2+0)` stand in for
+    /// a bound that must stay dynamic; a bare `(0)`/`(2)` folds back to the
+    /// literal `Expr::Slice` fast path (`test_slice_bounds_accept_the_same_
+    /// spellings`) and would silently test the wrong code entirely. Every
+    /// case was checked against jq 1.7.1 directly.
+    #[test]
+    fn test_computed_slice_bounds_read_mode() {
+        assert_outcomes(&[
+            // Fast path: a resolved `(0, None)` bound still returns the
+            // target unchanged, same as the literal `.[0:]` shape.
+            (b"[1,2,3,4,5]", ".[(0+0):]", Ok("[1,2,3,4,5]")),
+            // A bound that's a plain field read, not an arithmetic
+            // expression — unlike every `(n+0)` bound elsewhere in this
+            // test, this resolves to a *borrowed* value straight from the
+            // document rather than a freshly computed owned one.
+            (
+                br#"{"a":[1,2,3,4,5],"k1":1,"k2":3}"#,
+                ".a[.k1:.k2]",
+                Ok("[2,3]"),
+            ),
+            // A bound that fans out to more than one borrowed value.
+            (
+                br#"{"a":[1,2,3,4,5],"x":0,"y":1}"#,
+                "[.a[(.x,.y):(3+0)]]",
+                Ok("[[1,2,3],[2,3]]"),
+            ),
+            // A borrowed target that slices to `null` (slicing `null` is
+            // always `null`) and one that fails to slice at all.
+            (br#"{"a":null}"#, ".a[(0+0):(2+0)]", Ok("null")),
+            (
+                br#"{"a":5}"#,
+                ".a[(0+0):(2+0)]",
+                Err("Cannot index number with object"),
+            ),
+            // The same borrowed failure, but `?`-guarded: the slice attempt
+            // is pruned rather than propagated — the borrowed-value
+            // counterpart to the owned-boolean case below.
+            (br#"{"a":5}"#, ".a[(0+0):(2+0)]?", Ok("")),
+            // The target's own evaluation can fail before slicing is ever
+            // attempted — distinct from the case above, where `.a` resolves
+            // fine and it's the slice application that fails.
+            (
+                b"5",
+                ".a[(0+0):(2+0)]",
+                Err(r#"Cannot index number with string "a""#),
+            ),
+            // A target that fans out to more than one borrowed value.
+            (
+                br#"{"a":[1,2,3],"b":[4,5,6]}"#,
+                "[(.a,.b)[(0+0):(2+0)]]",
+                Ok("[[1,2],[4,5]]"),
+            ),
+            // An owned target (freshly constructed, not borrowed from the
+            // document): single value, then a fan-out of several.
+            (b"null", "([1,2,3])[(0+0):(2+0)]", Ok("[1,2]")),
+            (
+                b"null",
+                "[([1,2,3],[4,5,6])[(0+0):(2+0)]]",
+                Ok("[[1,2],[4,5]]"),
+            ),
+            // A target with no output at all.
+            (b"null", "empty[(0+0):(2+0)]", Ok("")),
+            // A target that breaks out of an enclosing label — the whole
+            // slice contributes nothing, same as `IndexExpr`'s identically
+            // conservative target handling (see `eval_index_expr`'s key
+            // stream, which this mirrors).
+            (b"null", "label $out | (break $out)[(0+0):(2+0)]", Ok("")),
+            (
+                b"null",
+                "label $out | (1,2,break $out)[(0+0):(2+0)]",
+                Ok(""),
+            ),
+            // A target whose stream errors part-way through: the error wins,
+            // and (like the break case above) the values already produced
+            // are not carried forward — the same conservative trade-off
+            // `eval_index_expr` already makes for its key/target streams.
+            (b"null", "(1,2,error(\"boom\"))[(0+0):(2+0)]", Err("boom")),
+            // Owned targets of every slice-able kind, plus the two ways an
+            // unsliceable one is refused.
+            (b"null", "(null)[(0+0):(2+0)]", Ok("null")),
+            (b"null", r#"("hello")[(0+0):(2+0)]"#, Ok(r#""he""#)),
+            (b"null", "(true)[(0+0):(2+0)]?", Ok("")),
+            (
+                b"null",
+                "(true)[(0+0):(2+0)]",
+                Err("Cannot index boolean with object"),
+            ),
+            // A start-bound evaluation failure, and the same on the end
+            // bound — each is its own call site in `eval_slice_expr`.
+            (
+                b"[1,2,3]",
+                r".[(.x+0):(2+0)]",
+                Err(r#"Cannot index array with string "x""#),
+            ),
+            (
+                b"[1,2,3]",
+                r".[(0+0):(.x+0)]",
+                Err(r#"Cannot index array with string "x""#),
+            ),
+            // A `break` from inside a bound must reach the enclosing label
+            // as a real break, not a synthetic "not in label" error — on
+            // both the start and the end bound.
+            (b"[1,2,3]", "label $out | .[(break $out):(2+0)]", Ok("")),
+            (b"[1,2,3]", "label $out | .[(0+0):(break $out)]", Ok("")),
+            // A bound whose stream breaks (or errors) after already
+            // producing values: same conservative trade-off as the target
+            // case above, applied to the bound stream instead.
+            (b"[1,2,3]", "label $out | .[(1,2,break $out):(2+0)]", Ok("")),
+            (b"[1,2,3]", r#".[(1,2,error("boom")):(2+0)]"#, Err("boom")),
+        ]);
+    }
+
+    /// #499: `resolve_slice_expr`/`resolve_slice_bound` (the path-mode
+    /// evaluator behind `=`, `|=`, `path()`, `del()`) shapes
+    /// `test_computed_slice_bounds` doesn't reach: every bound there either
+    /// resolves to a number or fails to *evaluate* at all, so the
+    /// empty-bound-stream short-circuit and the "resolved bounds don't apply
+    /// to this target" refusal never ran. Checked against jq 1.7.1 directly.
+    #[test]
+    fn test_computed_slice_bounds_path_mode_edge_cases() {
+        assert_outcomes(&[
+            // An empty start (or end) bound stream in path mode is a no-op,
+            // the same short-circuit `test_computed_slice_bounds` already
+            // covers for read mode.
+            (
+                br#"{"a":[1,2,3]}"#,
+                r#".a[empty:2] = ["x"]"#,
+                Ok(r#"{"a":[1,2,3]}"#),
+            ),
+            (
+                br#"{"a":[1,2,3]}"#,
+                r#".a[0:empty] = ["x"]"#,
+                Ok(r#"{"a":[1,2,3]}"#),
+            ),
+            // An omitted bound alongside a dynamic one on the other side —
+            // "open on this side" in path mode, same as read mode.
+            (
+                br#"{"a":[1,2,3,4,5],"k2":3}"#,
+                r#".a[:.k2] = ["x"]"#,
+                Ok(r#"{"a":["x",4,5],"k2":3}"#),
+            ),
+            (
+                br#"{"a":[1,2,3,4,5],"k1":2}"#,
+                r#".a[.k1:] = ["x"]"#,
+                Ok(r#"{"a":[1,2,"x"],"k1":2}"#),
+            ),
+            // Resolved bounds that reach an unsliceable target: `?` prunes
+            // just that branch, and its absence propagates the error — the
+            // same two spellings `resolve_index_expr` distinguishes for a
+            // computed key.
+            (b"5", r#".[(0+0):(2+0)]? = ["x"]"#, Ok("5")),
+            (
+                b"5",
+                r#".[(0+0):(2+0)] = ["x"]"#,
+                Err("Cannot index number with object"),
+            ),
+        ]);
+    }
+
+    /// #499: a computed slice's target and bounds must round-trip through
+    /// user-defined function expansion (`expand_func_calls`/
+    /// `substitute_func_param`) the same way `IndexExpr`'s target/key already
+    /// do — a call or parameter hiding in any of the three must still be
+    /// found and substituted.
+    #[test]
+    fn test_computed_slice_bounds_in_user_defined_functions() {
+        assert_outcomes(&[
+            // A function parameter used as a dynamic bound.
+            (b"[1,2,3,4]", "def f($n): .[$n:3]; f(1)", Ok("[2,3]")),
+            // A recursive-call site hiding in the bound of a different
+            // slice, and in its target.
+            (b"[1,2,3,4]", "def f: 1; .[(f):(3)]", Ok("[2,3]")),
+            (
+                br#"{"a":[1,2,3,4]}"#,
+                "def f: .a; (f)[(1):(3)]",
+                Ok("[2,3]"),
+            ),
+            (b"[1,2,3,4]", "def f: 3; .[(1):(f)]", Ok("[2,3]")),
+        ]);
+    }
+
     #[test]
     fn test_set_path_and_get_path_mut_autovivify_null_directly() {
         // Direct-function coverage for the three walkers `autovivify_object`/
@@ -25859,6 +26080,92 @@ mod tests {
         #[cfg(debug_assertions)]
         #[should_panic(expected = "unresolved computed index reached path tracking")]
         fn test_path_tracking_refuses_an_unresolved_key_mid_pipe() {
+            let mut reached = Vec::new();
+            let pipe = Expr::Pipe(vec![unresolved(), Expr::Field("a".to_string())]);
+            let _ = walk_path::<JqSemantics>(&pipe, &OwnedValue::Null, &[], &mut reached, false);
+        }
+    }
+
+    // ========== #499: the unresolved-computed-slice guards ==========
+
+    /// Same reasoning as [`computed_key_guards`], one level up: every path
+    /// walker refuses an unresolved [`Expr::SliceExpr`] just as loudly as it
+    /// refuses an unresolved [`Expr::IndexExpr`], and for the same reason —
+    /// [`resolve_dynamic_indexes`] rewrites a computed slice into its static
+    /// components before any of these run, so a hit here means a new path
+    /// context was wired up without going through that pre-pass.
+    mod computed_slice_guards {
+        use super::*;
+
+        /// `.[$a:$b]` left unresolved — what each walker below is handed.
+        fn unresolved() -> Expr {
+            Expr::slice_by(
+                Expr::Identity,
+                Some(Expr::Var("a".to_string())),
+                Some(Expr::Var("b".to_string())),
+            )
+        }
+
+        #[test]
+        fn test_set_path_refuses_an_unresolved_slice() {
+            let mut root = OwnedValue::Null;
+            let err = set_path(&mut root, &unresolved(), OwnedValue::Int(1)).unwrap_err();
+            assert_eq!(
+                err.message,
+                "internal error: unresolved computed slice in assignment path"
+            );
+        }
+
+        #[test]
+        fn test_get_path_mut_refuses_an_unresolved_slice() {
+            let mut root = OwnedValue::Null;
+            let err = get_path_mut(&mut root, &[unresolved()]).unwrap_err();
+            assert_eq!(
+                err.message,
+                "internal error: unresolved computed slice in path component"
+            );
+        }
+
+        #[test]
+        fn test_update_path_refuses_an_unresolved_slice() {
+            let mut root = OwnedValue::Null;
+            let err = update_path::<JqSemantics>(&mut root, &unresolved(), &Expr::Identity, false)
+                .unwrap_err();
+            assert_eq!(
+                err.message,
+                "internal error: unresolved computed slice in update path"
+            );
+        }
+
+        #[test]
+        fn test_delete_at_path_refuses_an_unresolved_slice() {
+            let mut root = OwnedValue::Null;
+            let err = delete_at_path(&mut root, &unresolved(), false).unwrap_err();
+            assert_eq!(
+                err.message,
+                "internal error: unresolved computed slice in delete path"
+            );
+        }
+
+        #[test]
+        #[cfg(debug_assertions)]
+        #[should_panic(expected = "unresolved computed slice reached path tracking")]
+        fn test_path_tracking_refuses_an_unresolved_slice() {
+            let mut reached = Vec::new();
+            let _ = walk_path::<JqSemantics>(
+                &unresolved(),
+                &OwnedValue::Null,
+                &[],
+                &mut reached,
+                false,
+            );
+        }
+
+        /// The same guard reached mid-pipe rather than as the last step.
+        #[test]
+        #[cfg(debug_assertions)]
+        #[should_panic(expected = "unresolved computed slice reached path tracking")]
+        fn test_path_tracking_refuses_an_unresolved_slice_mid_pipe() {
             let mut reached = Vec::new();
             let pipe = Expr::Pipe(vec![unresolved(), Expr::Field("a".to_string())]);
             let _ = walk_path::<JqSemantics>(&pipe, &OwnedValue::Null, &[], &mut reached, false);
