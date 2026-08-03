@@ -1,0 +1,15 @@
+# Deterministic commit-lint rules for `omni-dev git commit message lint`
+# (the local CLI and the "Commit Lint" CI job both read this, via
+# action-works/omni-dev-commit-check@v1.4, command: lint).
+#
+# Fields omitted here fall back to CommitRules::default() in omni-dev
+# (rust-works/omni-dev, src/data/context.rs) — types matching the `## Types`
+# table in commit-guidelines.md, require_scope: false, forbidden_footers:
+# ["Co-Authored-By"]. Before this file existed, `lint` silently used its
+# built-in subject_max_len (80), which didn't match what
+# commit-guidelines.md documented (72) — see #588.
+#
+# subject_max_len raised to 100: this project routinely stacks 2-3 scopes in
+# one subject (e.g. `test(bench, cli, docs): ...`), which the 80-char
+# built-in default regularly rejected.
+subject_max_len: 100
