@@ -159,6 +159,34 @@ fn partial_generic<V: DocumentValue>(
     }
 }
 
+/// Append one truthiness bit per output of a `GenericResult` stream to
+/// `out`. Mirrors [`super::eval::push_truthiness`] for the generic
+/// evaluator's cursor-aware result type — used to fan `select`'s condition
+/// out over every output instead of only its first (#378).
+fn push_generic_truthiness<V: DocumentValue>(
+    result: GenericResult<V>,
+    out: &mut Vec<bool>,
+) -> Option<Control> {
+    match result {
+        GenericResult::One(v) => out.push(to_owned(&v).is_truthy()),
+        GenericResult::OneCursor(c) => out.push(to_owned(&c.value()).is_truthy()),
+        GenericResult::Many(vs) => out.extend(vs.iter().map(|v| to_owned(v).is_truthy())),
+        GenericResult::ManyCursor(cs) => {
+            out.extend(cs.iter().map(|c| to_owned(&c.value()).is_truthy()));
+        }
+        GenericResult::None => {}
+        GenericResult::Owned(v) => out.push(v.is_truthy()),
+        GenericResult::ManyOwned(vs) => out.extend(vs.iter().map(OwnedValue::is_truthy)),
+        GenericResult::Error(e) => return Some(Control::Error(e)),
+        GenericResult::Break(label) => return Some(Control::Break(label)),
+        GenericResult::Partial(vs, control) => {
+            out.extend(vs.iter().map(OwnedValue::is_truthy));
+            return Some(control);
+        }
+    }
+    None
+}
+
 /// Flatten a batch of per-element results into one `Vec<OwnedValue>`.
 ///
 /// `items` must never contain `Error`/`Break`/`Partial` — callers that build
@@ -1181,74 +1209,51 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
         }
 
         Builtin::Select(cond) => {
-            // Evaluate condition with cursor context preserved
-            // This is critical for select(di == N) to work correctly
+            // Evaluate condition with cursor context preserved.
+            // This is critical for select(di == N) to work correctly.
             let cond_result = eval_single::<S, _>(cond, value.clone(), false, cursor);
 
-            // Helper to check if an OwnedValue is truthy
-            let is_truthy = |v: &OwnedValue| -> bool {
-                match v {
-                    OwnedValue::Bool(false) | OwnedValue::Null => false,
-                    _ => true, // All other values are truthy
+            let mut bits = Vec::new();
+            let cond_control = push_generic_truthiness(cond_result, &mut bits);
+            let truthy_count = bits.iter().filter(|&&b| b).count();
+
+            // `select` never changes position — every truthy output IS the
+            // input node, so forward the incoming cursor (if any) rather
+            // than dropping it via a plain `One`/`Many`. One republish per
+            // truthy output of a possibly multi-output condition (#378).
+            let pass_n = |n: usize| -> GenericResult<V> {
+                match (n, cursor) {
+                    (0, _) => GenericResult::None,
+                    (1, Some(c)) => GenericResult::OneCursor(c),
+                    (1, None) => GenericResult::One(value.clone()),
+                    (n, Some(c)) => {
+                        GenericResult::ManyCursor(core::iter::repeat(c).take(n).collect())
+                    }
+                    (n, None) => {
+                        GenericResult::Many(core::iter::repeat(value.clone()).take(n).collect())
+                    }
                 }
             };
 
-            // `select` never changes position — the truthy output IS the
-            // input node, so forward the incoming cursor (if any) rather
-            // than dropping it via a plain `One(value)`.
-            let pass =
-                || cursor.map_or(GenericResult::One(value.clone()), GenericResult::OneCursor);
-
-            match cond_result {
-                GenericResult::Owned(ref o) => {
-                    if is_truthy(o) {
-                        pass()
-                    } else {
-                        GenericResult::None
-                    }
+            match cond_control {
+                None => pass_n(truthy_count),
+                // `select(...)? ` swallows the condition's error the same
+                // way `try select(...) catch empty` would — per #400/#494,
+                // that keeps whatever the truthy bits already produced
+                // rather than discarding it too. `break` always propagates,
+                // `optional` or not.
+                Some(Control::Error(_)) if optional => pass_n(truthy_count),
+                Some(control) => {
+                    let prefix: Vec<OwnedValue> = match cursor {
+                        Some(c) => core::iter::repeat_with(|| to_owned(&c.value()))
+                            .take(truthy_count)
+                            .collect(),
+                        None => core::iter::repeat_with(|| to_owned(&value))
+                            .take(truthy_count)
+                            .collect(),
+                    };
+                    partial_generic(prefix, control)
                 }
-                GenericResult::One(v) => {
-                    if is_truthy(&to_owned(&v)) {
-                        pass()
-                    } else {
-                        GenericResult::None
-                    }
-                }
-                GenericResult::OneCursor(c) => {
-                    if is_truthy(&to_owned(&c.value())) {
-                        pass()
-                    } else {
-                        GenericResult::None
-                    }
-                }
-                GenericResult::Error(e) => {
-                    if optional {
-                        GenericResult::None
-                    } else {
-                        GenericResult::Error(e)
-                    }
-                }
-                GenericResult::None => GenericResult::None,
-                GenericResult::Many(_)
-                | GenericResult::ManyOwned(_)
-                | GenericResult::ManyCursor(_) => {
-                    // Multiple results from condition - this is unusual but treat first as condition
-                    // jq behavior: select with multiple outputs uses first truthy value
-                    pass()
-                }
-                GenericResult::Break(label) => GenericResult::Break(label),
-                // The condition is only ever consulted once here (see the
-                // `Many`/`ManyOwned`/`ManyCursor` arm above, a separate,
-                // already-existing limitation) — a `Partial` condition is
-                // conservatively treated the same as a bare `Error`/`Break`.
-                GenericResult::Partial(_, Control::Error(e)) => {
-                    if optional {
-                        GenericResult::None
-                    } else {
-                        GenericResult::Error(e)
-                    }
-                }
-                GenericResult::Partial(_, Control::Break(label)) => GenericResult::Break(label),
             }
         }
 
@@ -2501,6 +2506,30 @@ mod tests {
         assert_eq!(count, 2);
     }
 
+    #[test]
+    fn test_json_select_many_cursor_condition_forks() {
+        // A condition that iterates (`.[]`) evaluates through the
+        // `ManyCursor` arm of `push_generic_truthiness`. `select` forwards
+        // the *outer* cursor once per truthy element, not the elements
+        // themselves (#378). Pinned against jq 1.7.1.
+        let json = b"[true,false,true]";
+        let index = JsonIndex::build(json);
+        let expr = crate::jq::parse("select(.[])").unwrap();
+
+        let result = eval_with_cursor(&expr, index.root(json));
+        assert_eq!(
+            result.collect_owned(),
+            vec![
+                OwnedValue::Array(vec![
+                    OwnedValue::Bool(true),
+                    OwnedValue::Bool(false),
+                    OwnedValue::Bool(true)
+                ]);
+                2
+            ]
+        );
+    }
+
     // ========================================================================
     // Phase 23: Position-based navigation tests
     // ========================================================================
@@ -3302,6 +3331,26 @@ mod tests {
             ),
             partial_break(&["10"])
         );
+
+        // `select` fans out over its condition's outputs (#378), so — like
+        // every other stream-forwarding construct above — a `Partial`
+        // condition keeps whatever the truthy bits already produced before
+        // the trailing control surfaces. Matches jq 1.7.1
+        // (`select((true,error("x")))` on `5` prints `5`, then fails).
+        assert_eq!(
+            summarize(b"5", r#"select((true,error("x")))"#),
+            partial_err(&["5"], "x")
+        );
+        assert_eq!(
+            summarize(b"5", "select((true,break $out))"),
+            partial_break(&["5"])
+        );
+        // `select(...)? ` swallows the condition's error like `try select(...)
+        // catch empty` would, but still keeps the truthy bits' output.
+        assert_eq!(
+            summarize(b"5", r#"select((true,error("x")))?"#),
+            Summary::Values(vec!["5".to_string()])
+        );
     }
 
     #[test]
@@ -3325,20 +3374,6 @@ mod tests {
         );
         assert_eq!(
             summarize(b"[[7],[8]]", "(.[0],(.[1],break $out))[(0+0)]"),
-            Summary::Break("out".to_string())
-        );
-
-        // `select`'s condition, in all three of its arms.
-        assert_eq!(
-            summarize(b"5", r#"select((true,error("x")))"#),
-            Summary::Error("x".to_string())
-        );
-        assert_eq!(
-            summarize(b"5", r#"select((true,error("x")))?"#),
-            Summary::None
-        );
-        assert_eq!(
-            summarize(b"5", "select((true,break $out))"),
             Summary::Break("out".to_string())
         );
     }

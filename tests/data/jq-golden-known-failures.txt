@@ -60,9 +60,12 @@
 #
 # comma_literal_before_document (#353) has since been fixed and dropped,
 # leaving 13.
+#
+# if_multi_output_condition (#378) has since been fixed and dropped, leaving
+# 12: `if`/`select` now fan out over every output of the condition instead of
+# consulting only the first one, in both evaluators.
 
 object_construct_cartesian     object_construct   only the first output of each key/value generator is used instead of the cartesian product — #354
-if_multi_output_condition      if_condition       only the first output of a multi-output if-condition is used — #378
 assign_multi_output_rhs        assignment         .a = (1,2) only applies the first RHS output instead of forking once per output — #392
 nan_type                       nan                nan | type reports "null" instead of "number" — #472
 path_recursive_descent         path               path(..) returns only the root path instead of every descendant path — #483

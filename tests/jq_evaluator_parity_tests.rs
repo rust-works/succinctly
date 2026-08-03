@@ -54,28 +54,6 @@ fn assert_parity(json: &[u8], filter: &str) {
     );
 }
 
-/// Assert the two evaluators currently DISAGREE, pinning both observed outputs.
-/// When the referenced fix aligns them, the `assert_ne!` fails, forcing whoever
-/// lands the fix to convert this into `assert_parity`.
-fn assert_divergence(json: &[u8], filter: &str, full_expected: &[&str], generic_expected: &[&str]) {
-    let full = full_outputs(json, filter);
-    let generic = generic_outputs(json, filter);
-    assert_eq!(
-        as_strs(&full),
-        full_expected,
-        "full evaluator output changed for `{filter}`"
-    );
-    assert_eq!(
-        as_strs(&generic),
-        generic_expected,
-        "generic evaluator output changed for `{filter}`"
-    );
-    assert_ne!(
-        full, generic,
-        "evaluators now AGREE for `{filter}` -- convert to assert_parity"
-    );
-}
-
 #[test]
 fn test_parity_values_builtin() {
     // `values` drops null inputs.
@@ -218,21 +196,43 @@ fn test_stream_operator_parity_160() {
 
 #[test]
 fn test_multi_output_condition_in_select_parity_160() {
-    // `and`/`or` can now hand `select` a multi-output condition, where the two
-    // evaluators disagree: `builtin_select` (eval.rs) tests the first output,
-    // while eval_generic's `Builtin::Select` treats any multi-output condition
-    // as truthy outright. jq fans the condition out instead, emitting the input
-    // once per truthy output -- so both are wrong, in different ways.
+    // `and`/`or` can hand `select`/`if` a multi-output condition. Before
+    // #378, the two evaluators disagreed about it: `builtin_select`/`eval_if`
+    // (eval.rs) tested only the condition's first output, while eval_generic's
+    // `Builtin::Select` treated any multi-output condition as truthy outright.
+    // jq fans the condition out instead, running the body once per output --
+    // #378 makes both evaluators do that, so this is now `assert_parity`
+    // rather than the `assert_divergence` it was pinned as.
     //
-    // That drift predates #160; #160 only widened what can reach it. Pinned
-    // here rather than fixed, because fixing `select` is the separate
-    // follow-up. jq's answer for the filter below is no output at all, which
-    // is what the full evaluator happens to give.
+    // Every expectation is pinned against jq-1.7.1 first, so parity can't lock
+    // in an agreed-upon wrong answer (this file's header failure mode).
     assert_eq!(
         as_strs(&full_outputs(b"1", "[(false,false) and true]")),
         ["[false,false]"]
     );
-    assert_divergence(b"1", "select((false,false) and true)", &[], &["1"]);
+    assert_eq!(
+        as_strs(&full_outputs(b"1", "select((false,false) and true)")),
+        Vec::<&str>::new(),
+        "full evaluator disagrees with jq"
+    );
+    assert_parity(b"1", "select((false,false) and true)");
+
+    assert_eq!(
+        as_strs(&full_outputs(b"1", "select((true,false) and true)")),
+        ["1"],
+        "full evaluator disagrees with jq"
+    );
+    assert_parity(b"1", "select((true,false) and true)");
+
+    assert_eq!(
+        as_strs(&full_outputs(
+            b"null",
+            r#"if (true,false) then "a" else "b" end"#
+        )),
+        [r#""a""#, r#""b""#],
+        "full evaluator disagrees with jq"
+    );
+    assert_parity(b"null", r#"if (true,false) then "a" else "b" end"#);
 }
 
 #[test]
