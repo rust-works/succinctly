@@ -10,14 +10,19 @@
 //! - **Multi-byte Heavy**: Predominantly 2-4 byte UTF-8 sequences
 //! - **CJK Text**: Chinese/Japanese/Korean characters (3-byte sequences)
 //! - **Emoji Heavy**: Heavy use of 4-byte sequences (emojis)
+//! - **Corpus**: the committed real-workload seed (`tests/data/bench-corpus/seed/`),
+//!   whose ASCII-run/multi-byte mix the synthetic generators do not reproduce
 //!
+
 //! ## Sizes
 //!
 //! Benchmarks run at multiple sizes to show scaling characteristics:
 //! - 1KB, 10KB, 100KB, 1MB, 10MB
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use std::fs;
 use std::hint::black_box;
+use std::path::{Path, PathBuf};
 use succinctly::text::utf8::validate_utf8_scalar;
 #[cfg(target_arch = "x86_64")]
 use succinctly::text::utf8::validate_utf8_simd;
@@ -254,6 +259,84 @@ fn bench_sequence_types(c: &mut Criterion) {
     group.finish();
 }
 
+/// Validate the committed real-workload corpus seed.
+///
+/// The synthetic generators above are uniform by construction; real text mixes
+/// long ASCII runs with sparse multi-byte characters, which is exactly the shape
+/// the broadword ASCII fast path is tuned for. Gating throughput claims on this
+/// corpus is what #301 asks of its consumer issues (#133 among them).
+///
+/// Prefers the fully synced corpus at `data/bench/corpus/` (seed **plus** the
+/// larger fetched files, per `./scripts/sync-bench-corpus.sh`), falling back to
+/// the always-committed `tests/data/bench-corpus/seed/` so this group still runs
+/// offline — the seed alone is only 0.5-4.5 KB per file, which measures
+/// small-input behaviour rather than steady-state throughput.
+///
+/// Files are walked in sorted order to keep benchmark IDs stable across runs.
+fn bench_corpus(c: &mut Criterion) {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let synced = manifest.join("data").join("bench").join("corpus");
+    let seed = manifest
+        .join("tests")
+        .join("data")
+        .join("bench-corpus")
+        .join("seed");
+
+    let mut root = synced;
+    let mut files = Vec::new();
+    collect_files(&root, &mut files);
+    if files.is_empty() {
+        eprintln!(
+            "utf8_corpus: {} is empty; falling back to the committed seed \
+             (run ./scripts/sync-bench-corpus.sh for the full corpus)",
+            root.display()
+        );
+        root = seed;
+        collect_files(&root, &mut files);
+    }
+    files.sort();
+
+    if files.is_empty() {
+        eprintln!("utf8_corpus: no corpus files found; skipping");
+        return;
+    }
+
+    let mut group = c.benchmark_group("utf8_corpus");
+
+    for path in &files {
+        let Ok(data) = fs::read(path) else { continue };
+        if data.is_empty() {
+            continue;
+        }
+        // `<format>/<workload>/<file>` — e.g. `yaml/actions/prometheus-ci.yml`.
+        let name = path
+            .strip_prefix(&root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .into_owned();
+
+        group.throughput(Throughput::Bytes(data.len() as u64));
+        bench_engines!(group, &name, &data);
+    }
+
+    group.finish();
+}
+
+/// Recursively collect every regular file under `dir` into `out`.
+fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_files(&path, out);
+        } else {
+            out.push(path);
+        }
+    }
+}
+
 fn format_size(bytes: usize) -> String {
     if bytes >= 1024 * 1024 {
         format!("{}mb", bytes / (1024 * 1024))
@@ -273,6 +356,7 @@ criterion_group!(
     bench_2byte,
     bench_error_at_end,
     bench_sequence_types,
+    bench_corpus,
 );
 
 criterion_main!(benches);

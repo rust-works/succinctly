@@ -132,7 +132,9 @@ Benchmarks for `succinctly json validate` - strict RFC 8259 JSON validation thro
 
 ## [utf8-validate.md](utf8-validate.md) - UTF-8 Validation Benchmarks
 
-Benchmarks for `succinctly text validate utf8` - scalar UTF-8 validation throughput. Serves as baseline for future SIMD implementations.
+Benchmarks for `succinctly text validate utf8` - UTF-8 validation throughput for both engines: the AVX2 SIMD kernel (x86_64 default) and the portable scalar validator with its broadword (SWAR) ASCII fast path, which is the only path on ARM64 and in `no_std` builds.
+
+Alongside the synthetic pattern ladder, the `utf8_corpus` group validates the real-workload corpus (#301) - `data/bench/corpus/` when synced, otherwise the committed seed - so throughput claims are gated on real input shapes rather than generator output.
 
 ### Platforms Covered
 - Apple M4 Pro (ARM)
