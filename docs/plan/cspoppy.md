@@ -383,14 +383,24 @@ pub fn rank_at_word(&self, words: &[u64], word_idx: usize) -> usize {
 L2 stores counts of basic blocks 0–2; block 3's is never needed. Would make
 `BitVecCsPoppy` (original Phase 3) trivial to add on top.
 
-### F3 — Consolidate three rank implementations — issue #598
+### F3 — Consolidate this crate's rank implementations — issue #598
 
-The crate has three: `RankDirectory` (25%, cache-aligned, per-word L2),
-[`CompactRank`](../../src/bits/compact_rank.rs) (3.52%, two-level), and BP's
-inline `rank_l1`/`rank_l2` (18.75%). F2 would make four. Worth an ADR before it
-becomes five — the interesting question is whether one parameterised structure
-serves all callers, or whether the density/hotness spread genuinely justifies
-separate ones.
+**Corrected 2026-08-03**: this section originally claimed a third structure,
+`CompactRank` (3.52%, two-level), citing `src/bits/compact_rank.rs`. That file
+does not exist and never did in this form — `CompactRank` was deleted from the
+crate in #321, and the rank indices it replaced went back to cumulative
+`Vec<u32>` arrays. See
+[docs/plan/yaml-index-post-compactrank.md](yaml-index-post-compactrank.md) for
+the full history. Left standing rather than silently deleted, per this
+branch's own practice for corrected predictions (see the F1 note above).
+
+The crate currently has **two** rank implementations: `RankDirectory` (25%,
+cache-aligned, per-word L2, used by `BitVec`) and BP's inline
+`rank_l1`/`rank_l2` (18.75%). F2 would make a third. An ADR is still worth
+doing once F2 exists — the interesting question is whether one parameterised
+structure can serve all callers, or whether the density/hotness spread
+genuinely justifies keeping them separate — but the "before it becomes five"
+framing no longer applies with only two in play today.
 
 ### F4 — Migrate `BitVec` to a compact rank — issue #599
 
