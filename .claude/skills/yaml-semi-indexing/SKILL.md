@@ -144,7 +144,6 @@ Self::is_break(b)               // is_line_break, or `== b'\n'` under !HAS_CR
 self.break_len_at(pos)          // line_break_len, or the LF answer under !HAS_CR
 Self::is_ws_or_break(b)         // ' ' | '\t' | break
 Self::is_ws_break_or_eoi(next)  // the indicator lookahead: Option<u8>, EOI counts
-Self::is_flow_key_terminator(next) // the above plus , } ]
 self.at_break()
 self.skip_line_break()          // consumes exactly one break, whatever its width
 ```
