@@ -55,12 +55,13 @@ For a complete index of all benchmark reports by file and section, see:
 
 Located in `benches/`:
 
-| Benchmark               | Purpose                                    | Data Source      |
-|-------------------------|--------------------------------------------|------------------|
-| `rank_select`           | BitVec rank/select operations              | Generated inline |
-| `balanced_parens`       | Tree navigation operations                 | Generated inline |
-| `elias_fano`            | Elias-Fano encoding for monotone sequences | Generated inline |
-| `popcount_strategies`   | Popcount implementations                   | Generated inline |
+| Benchmark             | Purpose                                     | Data Source      |
+|-----------------------|---------------------------------------------|------------------|
+| `rank_select`         | BitVec rank/select operations               | Generated inline |
+| `balanced_parens`     | Tree navigation operations                  | Generated inline |
+| `elias_fano`          | Elias-Fano encoding for monotone sequences  | Generated inline |
+| `line_index`          | `to_line_column` vs pre-#228 dense `BitVec` | Generated inline |
+| `popcount_strategies` | Popcount implementations                    | Generated inline |
 
 ### 2. JSON Benchmarks
 
