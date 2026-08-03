@@ -572,56 +572,76 @@ fn eval_comma<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         return QueryResult::None;
     }
 
-    let mut all_results = Vec::new();
-    let mut all_owned = Vec::new();
-    let mut has_owned = false;
+    // Operands must reach the output in source order. While every operand so
+    // far is borrowed from the document they accumulate in `borrowed` and
+    // nothing is materialized — the fast path. The first owned operand promotes
+    // that prefix into `owned` in place, and every later operand appends there,
+    // so exactly one ordered accumulator is live at a time. Two parallel buckets
+    // concatenated at the end lost each operand's position and hoisted every
+    // borrowed one ahead of every owned one (#353). Same shape as the `Many` arm
+    // of `eval_pipe` (#295).
+    let mut borrowed: Vec<StandardJson<'a, W>> = Vec::new();
+    let mut owned: Option<Vec<OwnedValue>> = None;
 
     for expr in exprs {
         match eval_single::<W, S>(expr, value.clone(), optional).materialize_cursor() {
-            QueryResult::One(v) => all_results.push(v),
+            QueryResult::One(v) => match owned.as_mut() {
+                Some(acc) => acc.push(to_owned(&v)),
+                None => borrowed.push(v),
+            },
             QueryResult::OneCursor(_) => {
                 unreachable!("materialize_cursor should have converted this")
             }
-            QueryResult::Many(vs) => all_results.extend(vs),
-            QueryResult::Owned(v) => {
-                has_owned = true;
-                all_owned.push(v);
-            }
-            QueryResult::ManyOwned(vs) => {
-                has_owned = true;
-                all_owned.extend(vs);
-            }
+            QueryResult::Many(vs) => match owned.as_mut() {
+                Some(acc) => acc.extend(vs.iter().map(to_owned)),
+                None => borrowed.extend(vs),
+            },
+            QueryResult::Owned(v) => owned
+                .get_or_insert_with(|| {
+                    core::mem::take(&mut borrowed)
+                        .iter()
+                        .map(to_owned)
+                        .collect()
+                })
+                .push(v),
+            QueryResult::ManyOwned(vs) => owned
+                .get_or_insert_with(|| {
+                    core::mem::take(&mut borrowed)
+                        .iter()
+                        .map(to_owned)
+                        .collect()
+                })
+                .extend(vs),
             QueryResult::None => {}
             // A sibling that errors or breaks no longer discards the outputs
             // the earlier siblings already produced (#400): `(1,error("x"))`
             // now carries `1` forward as `Partial`'s prefix instead of
             // collapsing straight to a bare `Error`.
             QueryResult::Error(e) => {
-                return partial(merge_owned(all_results, all_owned), Control::Error(e));
+                return partial(
+                    merge_owned(borrowed, owned.unwrap_or_default()),
+                    Control::Error(e),
+                );
             }
             QueryResult::Break(label) => {
-                return partial(merge_owned(all_results, all_owned), Control::Break(label));
+                return partial(
+                    merge_owned(borrowed, owned.unwrap_or_default()),
+                    Control::Break(label),
+                );
             }
             QueryResult::Partial(vs, control) => {
-                all_owned.extend(vs);
-                return partial(merge_owned(all_results, all_owned), control);
+                let mut merged = merge_owned(borrowed, owned.unwrap_or_default());
+                merged.extend(vs);
+                return partial(merged, control);
             }
         }
     }
 
-    // If we have any owned values, we need to convert all results to owned
-    if has_owned {
-        let mut converted: Vec<OwnedValue> = all_results.iter().map(to_owned).collect();
-        converted.extend(all_owned);
-        if converted.len() == 1 {
-            QueryResult::Owned(converted.pop().unwrap())
-        } else {
-            QueryResult::ManyOwned(converted)
-        }
-    } else if all_results.len() == 1 {
-        QueryResult::One(all_results.pop().unwrap())
-    } else {
-        QueryResult::Many(all_results)
+    match owned {
+        Some(mut acc) if acc.len() == 1 => QueryResult::Owned(acc.pop().unwrap()),
+        Some(acc) => QueryResult::ManyOwned(acc),
+        None if borrowed.len() == 1 => QueryResult::One(borrowed.pop().unwrap()),
+        None => QueryResult::Many(borrowed),
     }
 }
 
@@ -16832,9 +16852,37 @@ mod tests {
 
     #[test]
     fn test_comma() {
+        // Every operand borrowed from the document: nothing is materialized and
+        // the borrowed fast path is taken.
         query!(br#"{"a": 1, "b": 2}"#, ".a, .b",
             QueryResult::Many(values) => {
-                assert_eq!(values.len(), 2);
+                let rendered: Vec<String> = values.iter().map(|v| to_owned(v).to_json()).collect();
+                assert_eq!(rendered, ["1", "2"]);
+            }
+        );
+
+        // A mix of literal and document-derived operands promotes the whole
+        // stream to owned. Source order must survive that promotion in either
+        // direction — a literal placed *before* a document-derived value used to
+        // come out after it, while the reverse order looked correct by accident
+        // (#353). Both orders are pinned so neither can regress alone.
+        query!(br#"{"a": 2}"#, "1, .a",
+            QueryResult::ManyOwned(values) => {
+                assert_eq!(values, [OwnedValue::Int(1), OwnedValue::Int(2)]);
+            }
+        );
+        query!(br#"{"a": 2}"#, ".a, 1",
+            QueryResult::ManyOwned(values) => {
+                assert_eq!(values, [OwnedValue::Int(2), OwnedValue::Int(1)]);
+            }
+        );
+
+        // A container operand arrives as `OneCursor` and takes the
+        // materialize-in-place path, so it must not jump the literals around it.
+        query!(br#"{"a": 2}"#, "1, ., 2",
+            QueryResult::ManyOwned(values) => {
+                let rendered: Vec<String> = values.iter().map(OwnedValue::to_json).collect();
+                assert_eq!(rendered, ["1", r#"{"a":2}"#, "2"]);
             }
         );
     }
