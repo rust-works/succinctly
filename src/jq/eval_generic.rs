@@ -710,6 +710,12 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
 
         Expr::Optional(inner) => eval_single::<S, _>(inner, value, true, cursor),
 
+        // Parens are transparent to cursor-based evaluation: handled natively
+        // (like `Expr::Optional` above) so `(.)` and friends keep threading
+        // the cursor instead of falling to the `to_owned()` bridge below,
+        // which collapses duplicate mapping keys (#614).
+        Expr::Paren(inner) => eval_single::<S, _>(inner, value, optional, cursor),
+
         Expr::Pipe(exprs) => {
             if exprs.is_empty() {
                 return GenericResult::One(value);

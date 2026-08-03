@@ -595,6 +595,35 @@ fn test_duplicate_mapping_key_survives_yaml_output() -> Result<()> {
     Ok(())
 }
 
+/// `(.)` is semantically identical to `.`, but before the fix for #614 it
+/// took a different code path: `can_use_m2_streaming` treated
+/// `Expr::Paren(Expr::Identity)` as streamable, yet the stricter
+/// `is_identity` check that unlocks direct cursor streaming required a bare
+/// `Expr::Identity`, so `(.)` fell through to `eval_generic::eval_single`'s
+/// `to_owned()` bridge and silently collapsed duplicate keys instead.
+#[test]
+fn test_duplicate_mapping_key_survives_parenthesized_identity() -> Result<()> {
+    let yaml = "a: 1\na: 2\n";
+
+    let (pretty, code) = run_yq_stdin("(.)", yaml, &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(pretty, "a: 1\na: 2\n");
+
+    let (compact, code) = run_yq_stdin("(.)", yaml, &["-I0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(compact, "a: 1\na: 2\n");
+
+    let (json_pretty, code) = run_yq_stdin("(.)", yaml, &["-o", "json"])?;
+    assert_eq!(code, 0);
+    assert_eq!(json_pretty, "{\n  \"a\": 1,\n  \"a\": 2\n}\n");
+
+    let (json_compact, code) = run_yq_stdin("(.)", yaml, &["-o", "json", "-I0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(json_compact, "{\"a\":1,\"a\":2}\n");
+
+    Ok(())
+}
+
 #[test]
 fn test_duplicate_mapping_key_to_entries_preserves_both() -> Result<()> {
     // Unlike `.a` field access (last-wins, #174), `to_entries` must pass
