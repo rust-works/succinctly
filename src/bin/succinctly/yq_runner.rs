@@ -15,7 +15,8 @@ use succinctly::jq::{self, Builtin, Expr, OwnedValue, QueryResult, YqSemantics};
 use succinctly::json::light::StandardJson;
 use succinctly::json::JsonIndex;
 use succinctly::yaml::{
-    format_float_with_fraction, resolve_plain, ResolvedScalar, YamlCursor, YamlIndex, YamlValue,
+    format_float_with_fraction, resolve_plain, stream_yaml_sequence, ResolvedScalar, YamlCursor,
+    YamlIndex, YamlValue,
 };
 
 use super::{InputFormat, OutputFormat, YqCommand};
@@ -1339,6 +1340,20 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
         && context.named.is_empty();
     let can_inplace_fast_path = can_inplace_json_fast_path || can_inplace_yaml_fast_path;
 
+    // `--slurp`'s fast path (#478) is narrower than the two gates above:
+    // scoped to plain identity only (`is_identity`, not the broader
+    // `is_m2_streamable` set), since a non-trivial filter over the slurped
+    // array needs real evaluation. `-o json --slurp` still uses the slow
+    // DOM path below — an explicit, documented scope limit rather than a
+    // silent gap, matching `sort_keys`/color/tab already being excluded
+    // from the gates above.
+    let can_slurp_fast_path = is_identity
+        && can_stream_pretty
+        && output_config.output_format == OutputFormat::Yaml
+        && !args.null_input
+        && !args.raw_input
+        && context.named.is_empty();
+
     // Indent width for the fast path's streamers. YAML's `-I0` is a special
     // case: real `yq` treats it as "use the library default" (4 spaces),
     // and succinctly's existing (pre-#442) compact-YAML fast path hardcodes
@@ -1640,7 +1655,6 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
         }
     } else if args.slurp {
         // Handle --slurp: collect all documents from all inputs into an array
-        let mut all_docs: Vec<OwnedValue> = Vec::new();
 
         // Collect input sources
         let input_sources: Vec<(Vec<u8>, InputFormat)> = if input_files.is_empty() {
@@ -1666,31 +1680,105 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
             sources
         };
 
-        // Parse all inputs and collect documents
-        let mut global_doc_index: usize = 0;
-        for (bytes, format) in &input_sources {
-            let inputs = parse_input(bytes, *format)?;
-            for input in inputs {
-                // Apply --doc filter if specified
-                if let Some(target_doc) = args.document {
-                    if global_doc_index == target_doc {
+        if can_slurp_fast_path {
+            // M2 streaming fast path (#478): stream each source's document
+            // cursor(s) directly into one combined YAML sequence, skipping
+            // the OwnedValue DOM. `evaluate_input`'s JSON round-trip below
+            // would otherwise re-collapse duplicate mapping keys even if the
+            // initial conversion into it didn't (the array-builder step
+            // has its own `IndexMap`-backed collapse).
+            //
+            // Two-phase: parse every source into an owned `(bytes, YamlIndex)`
+            // pair first, so all sources stay alive together — `YamlCursor`
+            // borrows both `text` and `index` with the same lifetime, so
+            // cursors from different sources can't be collected into one
+            // `Vec` unless their backing bytes/index all outlive that `Vec`.
+            let mut parsed_sources: Vec<(Vec<u8>, YamlIndex<Vec<u64>>)> =
+                Vec::with_capacity(input_sources.len());
+            for (bytes, _format) in input_sources {
+                let index = YamlIndex::build(&bytes)
+                    .map_err(|e| anyhow::anyhow!("YAML parse error: {e}"))?;
+                parsed_sources.push((bytes, index));
+            }
+
+            let mut cursors = Vec::new();
+            let mut global_doc_index: usize = 0;
+            for (bytes, index) in &parsed_sources {
+                let root = index.root(bytes);
+                match root.value() {
+                    YamlValue::Sequence(mut docs) => {
+                        while let Some((cursor, rest)) = docs.uncons_cursor() {
+                            let should_process = args
+                                .document
+                                .map_or(true, |target| global_doc_index == target);
+                            if should_process {
+                                cursors.push(cursor);
+                            }
+                            global_doc_index += 1;
+                            docs = rest;
+                        }
+                    }
+                    _ => {
+                        // Defensive fallback only, matching the stdout/inplace
+                        // M2 paths: the root cursor always reports the virtual
+                        // document sequence, so real documents go through the
+                        // Sequence arm above.
+                        let should_process = args
+                            .document
+                            .map_or(true, |target| global_doc_index == target);
+                        if should_process {
+                            if let Some(doc_cursor) = root.first_child() {
+                                cursors.push(doc_cursor);
+                            }
+                        }
+                        global_doc_index += 1;
+                    }
+                }
+            }
+
+            if args.exit_status {
+                // `--slurp '.'` always yields exactly one (array) result, and
+                // a non-empty array is truthy regardless of its elements —
+                // matching jq/yq `-e` semantics for arrays.
+                any_truthy = true;
+            }
+            stream_yaml_sequence(
+                cursors.iter().copied(),
+                &mut FmtWriter(&mut writer),
+                0,
+                yaml_indent_spaces,
+            )
+            .map_err(|_| anyhow::anyhow!("Write error"))?;
+            writeln!(writer)?;
+        } else {
+            let mut all_docs: Vec<OwnedValue> = Vec::new();
+
+            // Parse all inputs and collect documents
+            let mut global_doc_index: usize = 0;
+            for (bytes, format) in &input_sources {
+                let inputs = parse_input(bytes, *format)?;
+                for input in inputs {
+                    // Apply --doc filter if specified
+                    if let Some(target_doc) = args.document {
+                        if global_doc_index == target_doc {
+                            all_docs.push(input);
+                        }
+                    } else {
                         all_docs.push(input);
                     }
-                } else {
-                    all_docs.push(input);
+                    global_doc_index += 1;
                 }
-                global_doc_index += 1;
             }
-        }
 
-        // Create slurped array and evaluate
-        let slurped = OwnedValue::Array(all_docs);
-        let results = evaluate_input(&slurped, &program.expr, &mut sink)?;
-        let mut split_doc_state = SplitDocState::new(has_split_doc);
-        for result in results {
-            split_doc_state.write_separator(&mut writer, &output_config)?;
-            any_truthy |= !matches!(&result, OwnedValue::Null | OwnedValue::Bool(false));
-            output_value(&mut writer, &result, &output_config)?;
+            // Create slurped array and evaluate
+            let slurped = OwnedValue::Array(all_docs);
+            let results = evaluate_input(&slurped, &program.expr, &mut sink)?;
+            let mut split_doc_state = SplitDocState::new(has_split_doc);
+            for result in results {
+                split_doc_state.write_separator(&mut writer, &output_config)?;
+                any_truthy |= !matches!(&result, OwnedValue::Null | OwnedValue::Bool(false));
+                output_value(&mut writer, &result, &output_config)?;
+            }
         }
     } else if args.inplace {
         // Handle --inplace: process each file and write back to it
