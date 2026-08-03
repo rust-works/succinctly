@@ -3362,6 +3362,32 @@ fn test_computed_key_in_index_brackets() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn test_split_doc_hides_in_computed_slice_bounds() -> Result<()> {
+    // Same reasoning as `test_computed_key_in_index_brackets`, for a computed
+    // slice's target and bounds (#499). `contains_split_doc` has to descend
+    // into all three, or a `split_doc` hiding in one is scanned as an opaque
+    // leaf and the stream never gets its `---` separators.
+    let yaml = "[[1,2,3,4],[5,6,7,8]]\n";
+    let expected = "- 2\n- 3\n---\n- 6\n- 7\n";
+
+    // Hidden in the start bound.
+    let (output, code) = run_yq_stdin(".[] | .[(1|split_doc):(3)]", yaml, &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(output, expected);
+
+    // Hidden in the end bound.
+    let (output, code) = run_yq_stdin(".[] | .[(1):(3|split_doc)]", yaml, &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(output, expected);
+
+    // Hidden in the target.
+    let (output, code) = run_yq_stdin(".[] | (split_doc)[(1):(3)]", yaml, &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(output, expected);
+    Ok(())
+}
+
 // =============================================================================
 // Whole-float representation — #169
 // =============================================================================
