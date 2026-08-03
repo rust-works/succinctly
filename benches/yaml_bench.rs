@@ -157,13 +157,16 @@ fn generate_anchor_heavy(pairs: usize) -> Vec<u8> {
             // Medium anchor names (16-24 chars)
             yaml.extend_from_slice(format!("setting_{i}: &anchor_medium_{i} val{i}\n").as_bytes());
         } else {
-            // Reference previous anchors with aliases
-            let ref_idx = i.saturating_sub(3);
-            if ref_idx % 3 == 0 {
+            // Reference previous anchors with aliases. i % 3 == 2 here, so
+            // i - 1 (i%3==1, medium) and i - 2 (i%3==0, long) are always the
+            // two immediately preceding *definitions*, never references.
+            if (i / 3) % 2 == 0 {
+                let ref_idx = i - 2;
                 yaml.extend_from_slice(
                     format!("ref_{i}: *config_anchor_very_long_name_{ref_idx}\n").as_bytes(),
                 );
             } else {
+                let ref_idx = i - 1;
                 yaml.extend_from_slice(format!("ref_{i}: *anchor_medium_{ref_idx}\n").as_bytes());
             }
         }
