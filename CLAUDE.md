@@ -652,3 +652,10 @@ For detailed documentation on optimization techniques used in this project, see 
   - Outputs byte-identical pre↔post on all 80 yq A/B configurations
   - Key insight: derive, don't store, what the text already encodes; transient build allocations can dwarf the retained structure (2-bit-per-byte scratch was 6-13× the stored bitvector)
   - See [docs/parsing/yaml.md#o4-seq_items-bitvector-elimination--accepted-](docs/parsing/yaml.md#o4-seq_items-bitvector-elimination--accepted-) for full analysis
+- ✅ O5 (CS-Poppy Combined Sampling for BP Select): **4× smaller YAML select index**, mixed select1 speed by platform, issue #64
+  - Replaced `WithSelect`'s sampled `(word, cumulative)` pairs with `WithCsPoppy`: `u32` entry points into BP's own rank directory (`rank_l1`/`rank_l2`) instead of a parallel structure
+  - Step A (narrow `SelectIndex<u32>` for BP, `len <= u32::MAX` bits) + Step B (`WithCsPoppy`) together take the BP select index from 25% to 6.25% of the bitmap — a 4x reduction, measured via real `select_heap_size()`, not derived
+  - **select1 speed is platform-dependent**: neutral-to-faster on Zen 4 (7950X), 5-15% slower on Apple M4 Pro — both measured via full (non-`--quick`) `bp_select_micro` runs on pinned hardware. Accepted despite the ARM regression because `BalancedParens::select1` on YAML's BP is reached only once per `at_offset`/`at_position`/`yq-locate` call, never the `.foo.bar` navigation hot path
+  - `yaml_bench` build-side clean (< 2% on 38/39 groups, both platforms) except one x86-only `block_scalars` anomaly (12-28%, reproduced twice), investigated and attributed to binary code-layout rather than the new logic: the BP structure for that workload is a fixed 7 words regardless of document size, too small to mechanistically explain the delta, and the same workload is neutral on ARM
+  - Also surfaced a pre-existing, unrelated `yaml_bench` bug: the `anchors` group panics with `UnknownAnchor` on unmodified `main` too
+  - See [docs/plan/cspoppy.md](docs/plan/cspoppy.md#5a-results-2026-08-03) for full analysis

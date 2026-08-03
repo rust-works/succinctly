@@ -20,7 +20,7 @@ These plans are kept for:
 | [compact-index-investigation.md](compact-index-investigation.md) | Proposed    | `src/yaml/index.rs`               | Elias-Fano for position arrays |
 | [m2-benchmark-improvements.md](m2-benchmark-improvements.md)     | Proposed    | `yq_bench.rs`                     | Benchmark M2 streaming path    |
 | [simd-features.md](simd-features.md)                             | Current     | `src/yaml/simd/`                  | YAML SIMD feature flag matrix  |
-| [cspoppy.md](cspoppy.md)                                         | Proposed    | `src/trees/bp.rs`, `src/bits/`    | Combined sampling, BP select   |
+| [cspoppy.md](cspoppy.md)                                         | Implemented | `src/trees/bp.rs`, `src/bits/`    | Combined sampling, BP select   |
 
 ## Archived Plans
 

@@ -2,7 +2,7 @@
 
 [Home](../../) > [Docs](../) > [Plan](./) > CS-Poppy
 
-**Status**: Proposed · **Issue**: [#64](https://github.com/rust-works/succinctly/issues/64) ·
+**Status**: Implemented · **Issue**: [#64](https://github.com/rust-works/succinctly/issues/64) ·
 **Modules**: `src/trees/bp.rs`, `src/bits/select.rs`, `src/yaml/index.rs`
 
 Applies the *combined sampling* idea from Zhou, Andersen & Kaminsky,
@@ -224,6 +224,107 @@ is smallest. If select1 regresses, the memory win may still justify shipping;
 that is a judgement call to make with numbers in hand, not now.
 
 Step A is independently shippable. If Step B fails criterion 3, A still stands.
+
+---
+
+## 5a. Results (2026-08-03)
+
+Measured on the pinned benchmark hosts (Apple M4 Pro over Tailscale ssh, AMD
+Ryzen 9 7950X over Tailscale ssh), both idle and on AC/mains power, full
+`cargo bench --bench bp_select_micro` (no `--quick`, 100 samples/id).
+
+### Criterion 3: select1 speed — **platform-dependent, not a clean pass**
+
+| opens | Apple M4 Pro `select1` | M4 Pro `select1_cspoppy` | Δ (ARM)     | Zen 4 `select1` | Zen 4 `select1_cspoppy` | Δ (x86)     |
+|-------|-------------------------|---------------------------|-------------|-------------------|----------------------------|-------------|
+| 1K    | 157.84 µs               | 172.26 µs                 | **+9.1%**   | 147.83 µs          | 106.59 µs                  | −27.9%¹     |
+| 10K   | 159.30 µs               | 174.04 µs                 | **+9.3%**   | 107.19 µs          | 105.37 µs                  | −1.7%       |
+| 100K  | 153.77 µs               | 176.91 µs                 | **+15.0%**  | 107.53 µs          | 106.44 µs                  | −1.0%       |
+| 1M    | 183.28 µs               | 192.29 µs                 | **+4.9%**   | 124.77 µs          | 123.52 µs                  | −1.0%       |
+
+¹ The x86 1K `select1` (`WithSelect`) point is an outlier against its own
+10K/100K/1M neighbours (~107 µs flat) — both arms should be roughly
+size-independent since select1 is O(1) after the initial jump. Treat only the
+10K–1M x86 rows (consistently neutral-to-faster) as reliable; the 1K row is
+likely a first-benchmark-in-the-binary artifact, not a real effect.
+
+**ARM (M4 Pro) regresses 5–15%, consistently, with non-overlapping confidence
+intervals across two independent full runs. x86 (Zen 4) is neutral to slightly
+faster.** This is a real architecture-dependent divergence, not noise — see
+[A/B Benchmarking Method §5](../guides/benchmarking.md#5-measure-both-architectures--the-effect-size-differs-not-just-the-noise):
+cache/memory-bound effects do not port between platforms, and here the
+directions themselves differ, not just the magnitude. A plausible mechanism:
+`WithSelect`'s linear word scan is cheap on BP's dense bitmaps and benefits
+from ARM's efficient sequential access, while `WithCsPoppy`'s bracket +
+`partition_point` + 7-branch `rank_l2` unpack trades that scan for pointer-chasy
+control flow that predicts worse on this core.
+
+**Why this doesn't block shipping Step B**: `BalancedParens::select1` on YAML's
+BP is reached only through `find_bp_at_text_pos` — `yq-locate` / `at_offset` /
+`at_position` — **at most once per CLI invocation**, not on the `.foo.bar`
+navigation hot path (that path uses IB's separate rank/select). See
+[select-scan.md](../optimizations/select-scan.md), whose corpus scan recorded
+*zero* calls to this select support outside locate tooling. A 5–15% delta on a
+~150–190 µs function called once is worth low tens of microseconds against a
+CLI invocation's parse/IO time — below what any of this crate's end-to-end
+benchmarks can resolve. Criterion 3 is **not met as literally written** (ARM is
+slower, not "no slower"), but the acceptance criteria's own text anticipated
+this outcome and named the memory win as sufficient justification.
+
+### Criterion 2: memory — confirmed, 4×
+
+Already covered by `test_cspoppy_index_is_half_of_with_select` and
+`test_select_index_costs_one_eighth_of_bitmap` (real `select_heap_size()`
+measurements, not derived): 25.00% (pre-Step-A) → 12.50% (Step A) → 6.25%
+(Step B) of the BP bitmap — a 4× reduction, clearing the ≥3.5× bar.
+
+### Criterion 4: yaml_bench / yq_select — clean, with one investigated anomaly
+
+Full `yaml_bench` (`main` vs this branch, same machine, interleaved reruns),
+excluding `yaml/anchors/*` which panics with `UnknownAnchor` on **both**
+binaries — a pre-existing generator bug on `main`, unrelated to this branch
+(confirmed by reproducing it against unmodified `main`); worth its own issue.
+
+Of the 39 remaining benchmark ids, 38 are noise-level (< 2%) on both Zen 4 and
+M4 Pro. One group is not: **`yaml/block_scalars/*` is 12–28% slower on Zen 4**
+(`terminus`), reproduced identically across two independent interleaved
+reruns — e.g. `100x100lines` 144.6 µs → 184.4 µs, `long_100x100lines` 354.6 µs
+→ 407.7 µs. **The same group is neutral on the M4 Pro** (`100x100lines`
+161.9 µs → 160.3 µs, `long_100x100lines` 311.5 µs → 309.3 µs).
+
+Investigated rather than dismissed as noise, because it's large and
+reproducible. Built the exact `long_100x100lines` document (831 KB) and
+inspected the resulting BP structure directly: **7 words, 202 opens, 4-byte
+select index** — regardless of `lines_per_block`, since a block scalar's lines
+are leaf text, not BP nodes; the select support this branch touches is a fixed
+~7-word structure that cannot mechanistically cost 40 µs on an 831 KB build
+dominated by unrelated SIMD text scanning (P2.7). Combined with the M4 Pro
+result showing no effect at all on the identical workload, this is not
+attributable to the CS-Poppy select logic — the signature (x86-only, one
+group, size-independent within the group, structurally impossible for the
+changed code to cause) matches a binary code-layout artifact from the
+recompile (e.g. an icache/alignment shift next to the P2.7 AVX2 block-scalar
+loop, which this branch does not touch) rather than a real regression. Not
+chased further — `terminus`'s WSL2 lacks `perf`; a follow-up with a native
+Linux `perf stat`/objdump comparison would confirm instructions-retired parity,
+which would settle "layout, not logic" conclusively.
+
+`yq_select` was not run — it requires system `yq` (absent on the M4 Pro host)
+and mainly exercises `.users[:N]`-style slicing, which does not call
+`find_bp_at_text_pos`/`select1` at all; `yaml_bench`'s build-side coverage is
+the criterion this change can actually affect.
+
+### Verdict
+
+**Ship Step B.** The memory win (4×, unconditional on every `YamlIndex`) and
+the x86 select1 result (neutral-to-better) outweigh a real but cold-path-only
+ARM select1 regression. Build-side (criterion 4) is clean once the pre-existing
+`anchors` generator bug is excluded; the one x86-only `block_scalars` anomaly
+is investigated above and structurally cannot originate from this branch's
+code. This is the judgement call §5 deferred — recorded here with the numbers
+behind it so it can be revisited if `find_bp_at_text_pos` ever moves onto a
+hotter path, or if the `block_scalars` anomaly resurfaces with `perf` evidence
+attributing it to this change after all.
 
 ---
 
