@@ -325,6 +325,15 @@ pub static BENCHMARKS: &[BenchmarkInfo] = &[
     },
     // ========== TEXT ==========
     BenchmarkInfo {
+        name: "line_index",
+        description: "LineIndex::to_line_column vs the pre-#228 dense BitVec (#543)",
+        category: BenchmarkCategory::Text,
+        bench_type: BenchmarkType::Criterion,
+        criterion_name: Some("line_index"),
+        cli_subcommand: None,
+        working_dir: ".",
+    },
+    BenchmarkInfo {
         name: "utf8_validate_bench",
         description: "UTF-8 validation throughput (Criterion)",
         category: BenchmarkCategory::Text,

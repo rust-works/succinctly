@@ -199,6 +199,10 @@ name = "elias_fano"
 harness = false
 
 [[bench]]
+name = "line_index"
+harness = false
+
+[[bench]]
 name = "json_escape_micro"
 harness = false
 
