@@ -6805,14 +6805,16 @@ fn eval_slice_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 ) -> QueryResult<'a, W> {
     let starts = match eval_slice_bound::<W, S>(start, value.clone(), f64::floor) {
         Ok(v) => v,
-        Err(e) => return QueryResult::Error(e),
+        Err(Control::Error(e)) => return QueryResult::Error(e),
+        Err(Control::Break(label)) => return QueryResult::Break(label),
     };
     if starts.is_empty() {
         return QueryResult::None;
     }
     let ends = match eval_slice_bound::<W, S>(end, value.clone(), f64::ceil) {
         Ok(v) => v,
-        Err(e) => return QueryResult::Error(e),
+        Err(Control::Error(e)) => return QueryResult::Error(e),
+        Err(Control::Break(label)) => return QueryResult::Break(label),
     };
     if ends.is_empty() {
         return QueryResult::None;
@@ -6889,11 +6891,18 @@ fn eval_slice_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// to whatever `Expr::Slice` carries, so rounding here first is transparent
 /// to it — see `slice.rs`'s doc comment). A missing bound (`None`) is a
 /// single `None` — "this side is open" — not an empty stream.
+///
+/// Errors as [`Control`], not [`EvalError`], so a `break` inside the bound
+/// (`label $out | .[(break $out):2]`) reaches the enclosing label as a real
+/// break instead of degrading into a synthetic "break $out not in label"
+/// error — [`eval_index_expr`]'s key evaluation, which returns `QueryResult`
+/// directly, already gets this right; the narrower `Result<_, EvalError>`
+/// this shares with [`owned_bound_to_i64`] needs `Control` to keep up.
 fn eval_slice_bound<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     bound: &Option<Box<Expr>>,
     value: StandardJson<'_, W>,
     round: fn(f64) -> f64,
-) -> Result<Vec<Option<i64>>, EvalError> {
+) -> Result<Vec<Option<i64>>, Control> {
     let Some(expr) = bound else {
         return Ok(vec![None]);
     };
@@ -6903,17 +6912,14 @@ fn eval_slice_bound<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         QueryResult::Owned(v) => vec![v],
         QueryResult::ManyOwned(vs) => vs,
         QueryResult::None => return Ok(Vec::new()),
-        QueryResult::Error(e) => return Err(e),
-        QueryResult::Break(label) => {
-            return Err(EvalError::new(format!("break ${label} not in label")))
-        }
+        QueryResult::Error(e) => return Err(Control::Error(e)),
+        QueryResult::Break(label) => return Err(Control::Break(label)),
         QueryResult::OneCursor(_) => unreachable!("materialize_cursor should have converted this"),
-        QueryResult::Partial(_, Control::Error(e)) => return Err(e),
-        QueryResult::Partial(_, Control::Break(label)) => {
-            return Err(EvalError::new(format!("break ${label} not in label")))
-        }
+        QueryResult::Partial(_, control) => return Err(control),
     };
-    raw.iter().map(|v| owned_bound_to_i64(v, round)).collect()
+    raw.iter()
+        .map(|v| owned_bound_to_i64(v, round).map_err(Control::Error))
+        .collect()
 }
 
 /// Classify a resolved bound value the way jq's slice descriptor does
