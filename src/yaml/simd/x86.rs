@@ -1291,9 +1291,12 @@ mod tests {
                 "fixture must actually contain a CR in the chunk @{offset}"
             );
             assert_eq!(with.width, without.width, "width must not change @{offset}");
+            // carriage_returns is excluded: it is the one channel the gate is
+            // *supposed* to change, already pinned by the two assertions above.
             for ((a, name), (b, _)) in classify_channels(&with)
                 .iter()
                 .zip(classify_channels(&without).iter())
+                .filter(|((_, name), _)| *name != "carriage_returns")
             {
                 assert_eq!(a, b, "{name} channel changed under HAS_CR=false @{offset}");
             }
