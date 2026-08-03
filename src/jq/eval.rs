@@ -10465,7 +10465,19 @@ fn builtin_path<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let mut reached = Vec::new();
     for expr in &exprs {
         if let Err(e) = walk_path::<S>(expr, &owned, &[], &mut reached, optional) {
-            return QueryResult::Error(e);
+            // `path(f)?` suppresses this — the whole call is wrapped in `?` —
+            // but `path((f)?)` does not, because jq raises the "not a path
+            // expression" refusal when the path expression *ends*, outside
+            // whatever `?`/`try` scope sits inside it. `walk_path` already
+            // suppresses ordinary step errors internally when `optional` is
+            // set, so the only `Err` that can still reach here under
+            // `optional == true` is that refusal. Same shape as
+            // `eval_assign`/`eval_update`/`builtin_del`.
+            return if optional {
+                QueryResult::None
+            } else {
+                QueryResult::Error(e)
+            };
         }
     }
 
@@ -10592,13 +10604,99 @@ fn walk_path<S: EvalSemantics>(
             debug_assert!(false, "unresolved computed slice reached path tracking");
         }
 
-        // Expressions with no path-tracking arm — `..`, `recurse`, `select`,
-        // arithmetic — name no path (#483). `builtin_path` renders that as no
-        // output, which is still the wrong answer but no longer a path that
-        // resolves.
-        _ => {}
+        // Path-capable in jq, just not tracked here yet (#483): jq threads a
+        // path through these — `path(..)` is `[]`,`["a"]`, `path(if .a then
+        // .a else .b end)` is `["a"]`, `path(reduce .[] as $x (.;.))` is
+        // `[]` — so refusing them would reject filters jq answers. They
+        // still name no path; closing that gap is #483's job, not this
+        // arm's — see `test_path_capable_gaps_still_name_no_path`.
+        Expr::Comma(_)
+        | Expr::RecursiveDescent
+        | Expr::If { .. }
+        | Expr::Try { .. }
+        | Expr::Alternative(..)
+        | Expr::As { .. }
+        | Expr::AsPattern { .. }
+        | Expr::Var(_)
+        | Expr::Label { .. }
+        | Expr::Break(_)
+        | Expr::Limit { .. }
+        | Expr::FirstExpr(_)
+        | Expr::NthExpr { .. }
+        | Expr::Reduce { .. }
+        | Expr::Foreach { .. }
+        | Expr::Until { .. }
+        | Expr::While { .. }
+        | Expr::Repeat(_)
+        | Expr::FuncDef { .. }
+        | Expr::FuncCall { .. }
+        | Expr::NamespacedCall { .. } => {}
+
+        Expr::Builtin(builtin) if builtin_names_a_path(builtin) => {}
+
+        // Not a path expression at all: jq refuses it by name, quoting the
+        // filter's first output (#530) — `path(1)`, `path(length)`,
+        // `path(.a + 1)`, `path({a:1})`.
+        other => {
+            let values = match eval_owned_multi::<S>(other, value) {
+                Ok(values) => values,
+                // An error *raised while evaluating* the offending
+                // expression is that error, not the refusal — `path(1/0)`
+                // reports the division error. `?` covers it exactly as
+                // `step_into` covers an ordinary step error.
+                Err(_) if optional => return Ok(()),
+                Err(e) => return Err(e),
+            };
+            // The refusal itself is not covered by the *local* `optional`
+            // flag: jq raises it when the path expression ends, outside any
+            // `?`/`try` scope nested inside it, so `path((.a+1)?)` still
+            // raises even though `path(.a+1)?` does not. `builtin_path`
+            // applies that second, outer suppression at its own call site.
+            if let Some(result) = values.first() {
+                return Err(EvalError::invalid_path_expression(result));
+            }
+            // No output names no path and raises nothing — `path(empty)`.
+        }
     }
     Ok(())
+}
+
+/// Whether jq treats `builtin` as a *path expression* — one that names where
+/// its output came from — even though [`walk_path`] has no tracking arm for
+/// it yet (#483).
+///
+/// An allowlist, not a denylist: a builtin added later produces a value
+/// until someone shows jq threads a path through it, which is the safe
+/// default — silently naming no path for something jq refuses outright would
+/// reintroduce this issue's bug; refusing something jq's #483 gap should
+/// still answer is `walk_path`'s risk to take deliberately, not by omission.
+fn builtin_names_a_path(builtin: &Builtin) -> bool {
+    matches!(
+        builtin,
+        Builtin::Empty
+            | Builtin::Select(_)
+            | Builtin::Values
+            | Builtin::Nulls
+            | Builtin::Booleans
+            | Builtin::Numbers
+            | Builtin::Strings
+            | Builtin::Arrays
+            | Builtin::Objects
+            | Builtin::Iterables
+            | Builtin::Scalars
+            | Builtin::Recurse
+            | Builtin::RecurseDown
+            | Builtin::RecurseF(_)
+            | Builtin::RecurseCond(_, _)
+            | Builtin::GetPath(_)
+            | Builtin::First
+            | Builtin::Nth(_)
+            | Builtin::FirstStream(_)
+            | Builtin::Limit(_, _)
+            | Builtin::NthStream(_, _)
+            | Builtin::Debug
+            | Builtin::DebugMsg(_)
+    )
 }
 
 /// Walk a pipe of path steps, threading each value reached into the next step.
@@ -22801,6 +22899,132 @@ mod tests {
             query!(json, filter,
                 QueryResult::Error(e) => assert_eq!(e.message, message, "{filter}")
             );
+        }
+    }
+
+    /// A filter that is not a path expression at all is refused by name
+    /// rather than silently naming no path (#530) — `path(1)`, `path(length)`,
+    /// `path(.a + 1)`, `path({a:1})`.
+    ///
+    /// Distinct from [`test_unindexable_step_errors_instead_of_inventing_a_path`]
+    /// (#489): that is a step that *is* a path step but cannot be taken
+    /// against this value; this is an expression jq never considers a path
+    /// step in the first place, whatever the value.
+    #[test]
+    fn test_path_of_a_non_path_filter_is_refused_by_name() {
+        for (json, filter, message) in [
+            (
+                &br#"{"a": 1}"#[..],
+                "path(1)",
+                "Invalid path expression with result 1",
+            ),
+            (
+                &br#"{"a": 1}"#[..],
+                "path(length)",
+                "Invalid path expression with result 1",
+            ),
+            (
+                &br#"{"a": 1}"#[..],
+                "path(keys)",
+                r#"Invalid path expression with result ["a"]"#,
+            ),
+            (
+                &br#"{"a": 1}"#[..],
+                "path(.a + 1)",
+                "Invalid path expression with result 2",
+            ),
+            (
+                &br#"{"a": 1}"#[..],
+                "path(.a | tostring)",
+                r#"Invalid path expression with result "1""#,
+            ),
+            (
+                &br#"{"a": 1}"#[..],
+                "path({a: 1})",
+                r#"Invalid path expression with result {"a":1}"#,
+            ),
+            (
+                &br"[1, 2]"[..],
+                "path(last(.[]))",
+                "Invalid path expression with result 2",
+            ),
+            // jq names only the *first* output and never evaluates the rest.
+            (
+                &br"null"[..],
+                "path(1,2)",
+                "Invalid path expression with result 1",
+            ),
+        ] {
+            query!(json, filter,
+                QueryResult::Error(e) => assert_eq!(e.message, message, "{filter}")
+            );
+        }
+    }
+
+    /// `?` around just the offending subexpression does not suppress the
+    /// refusal — jq raises it when the path expression *ends*, outside any
+    /// `?` scope nested inside it. Only an outer `?` around the whole
+    /// `path(...)` call does (#530).
+    ///
+    /// `try (.a + 1)` is not a comparable case here: `Try` has no
+    /// path-tracking arm at all yet (#483, unrelated to this fix), so it
+    /// swallows everything inside it — including a legitimate path
+    /// (`path(try .a)` already answers `[]` instead of jq's `["a"]`) — not
+    /// just this refusal.
+    #[test]
+    fn test_the_refusal_survives_an_inner_question_mark_but_not_an_outer_one() {
+        query!(br#"{"a": 1}"#, "path((.a + 1)?)",
+            QueryResult::Error(e) => assert_eq!(e.message, "Invalid path expression with result 2")
+        );
+        assert_eq!(
+            outputs(br#"{"a": 1}"#, "path(.a + 1)?"),
+            Vec::<String>::new()
+        );
+    }
+
+    /// An error raised *while evaluating* the offending expression is that
+    /// error, not the refusal — `path(1/0)` reports the division error. `?`
+    /// suppresses it the same way it suppresses any other step error (#530).
+    #[test]
+    fn test_an_error_inside_the_filter_is_that_error_not_the_refusal() {
+        query!(br"null", "path(1/0)",
+            QueryResult::Error(e) => assert_eq!(
+                e.message,
+                "number (1) and number (0) cannot be divided because the divisor is zero"
+            )
+        );
+        assert_eq!(
+            outputs(br#"{"a": 1}"#, "path((.a | .b + 1)?)"),
+            Vec::<String>::new()
+        );
+    }
+
+    /// The #483 regression guard: expressions jq *does* treat as path
+    /// expressions, but `walk_path` has no tracking arm for yet, must keep
+    /// naming no path rather than start raising #530's new refusal. Flipping
+    /// any of these to an error would reject a filter jq answers.
+    #[test]
+    fn test_path_capable_gaps_still_name_no_path() {
+        for (json, filter) in [
+            (&br#"{"a": 1}"#[..], "path(..)"),
+            (&br#"{"a": 1}"#[..], "path(recurse)"),
+            (&br#"{"a": 1}"#[..], "path(recurse(.[]?))"),
+            (&br#"{"a": 1}"#[..], "path(select(.a))"),
+            (&br#"{"a": 1}"#[..], "path(values)"),
+            (&br"[1, 2]"[..], "path(first)"),
+            (&br"[1, 2]"[..], "path(first(.[]))"),
+            (&br"[1, 2]"[..], "path(limit(1; .[]))"),
+            (&br"[1, 2]"[..], "path(nth(0; .[]))"),
+            (&br#"{"a": 1}"#[..], "path(if .a then .a else .b end)"),
+            (&br#"{"a": 1}"#[..], "path(try .a)"),
+            (&br#"{"a": 1}"#[..], "path(.a // .b)"),
+            (&br#"{"a": 1}"#[..], "path(.a as $x | .a)"),
+            (&br#"{"a": 1}"#[..], "path(label $o | .a, break $o)"),
+            (&br#"{"a": 1}"#[..], r#"path(getpath(["a"]))"#),
+            (&br"[1, 2]"[..], "path(reduce .[] as $x (.; .))"),
+            (&br#"{"a": 1}"#[..], "path(def f: .a; f)"),
+        ] {
+            query!(json, filter, QueryResult::None => {});
         }
     }
 

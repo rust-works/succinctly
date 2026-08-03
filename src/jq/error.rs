@@ -63,6 +63,14 @@ pub enum Control {
 const DUMP_BUDGET: usize = 14;
 const DUMP_KEEP: usize = 11;
 
+/// `path()`'s refusal ([`EvalError::invalid_path_expression`]) gets a wider
+/// preview than every other message above: jq formats it into a
+/// `char errbuf[30]` where the rest use `errbuf[15]`. Bisected against the
+/// pinned binary: a 29-byte dump (27 `a`s in a JSON string) prints whole; a
+/// 30-byte dump (28 `a`s) keeps 26 bytes and gains `...`.
+const PATH_DUMP_BUDGET: usize = 29;
+const PATH_DUMP_KEEP: usize = 26;
+
 /// A value's JSON dump, truncated the way jq truncates it.
 ///
 /// Unlike jq — which builds the entire dump with `jv_dump_string` and then
@@ -86,7 +94,15 @@ const DUMP_KEEP: usize = 11;
 /// multi-byte character straddles byte `DUMP_KEEP` of the dump — see
 /// `docs/compliance/jq/limitations.md`.
 fn dump_truncated(value: &OwnedValue) -> String {
-    let mut sink = PreviewSink::new(DUMP_BUDGET);
+    dump_truncated_to(value, DUMP_BUDGET, DUMP_KEEP)
+}
+
+/// [`dump_truncated`], parameterized over the verbatim budget and the
+/// kept-prefix length — [`EvalError::invalid_path_expression`] uses a wider
+/// pair of its own ([`PATH_DUMP_BUDGET`]/[`PATH_DUMP_KEEP`]) than every other
+/// message here.
+fn dump_truncated_to(value: &OwnedValue, budget: usize, keep: usize) -> String {
+    let mut sink = PreviewSink::new(budget);
     // The sink stops the writer once the dump is known to exceed the budget;
     // writing into a `String` cannot fail for any other reason, so the returned
     // `Result` carries nothing `sink.overflowed` has not already recorded.
@@ -94,7 +110,7 @@ fn dump_truncated(value: &OwnedValue) -> String {
     if !sink.overflowed {
         return sink.buf;
     }
-    sink.truncate_to(DUMP_KEEP);
+    sink.truncate_to(keep);
     sink.buf.push_str("...");
     sink.buf
 }
@@ -319,6 +335,24 @@ impl EvalError {
     /// the call rather than deleting the entries that sort ahead of it.
     pub fn path_must_be_array_not(type_name: &str) -> Self {
         Self::new(format!("Path must be specified as array, not {type_name}"))
+    }
+
+    /// `Invalid path expression with result <v>`.
+    ///
+    /// jq's refusal of a filter that is not a path expression at all —
+    /// `path(1)`, `path(length)`, `path(.a + 1)` — where `v` is the filter's
+    /// *first* output. jq names only that one and never evaluates the rest,
+    /// so `path(1,2)` reports `1`.
+    ///
+    /// `v` is dumped bare, not through [`describe`] — jq's sentence is
+    /// `… with result {"a":1}`, not `… with result object ({"a":1})` — and at
+    /// the wider [`PATH_DUMP_BUDGET`]/[`PATH_DUMP_KEEP`] preview this message
+    /// alone uses.
+    pub fn invalid_path_expression(result: &OwnedValue) -> Self {
+        Self::new(format!(
+            "Invalid path expression with result {}",
+            dump_truncated_to(result, PATH_DUMP_BUDGET, PATH_DUMP_KEEP)
+        ))
     }
 
     /// `Cannot delete fields from <type>`.
