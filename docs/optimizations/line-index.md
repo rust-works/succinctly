@@ -136,12 +136,30 @@ forward query within `FORWARD_WALK_CAP` (16) lines resolves via bounded `EliasFa
 of a fresh binary search — the shape `.[] | line` produces when walking a document top to bottom,
 since sibling iteration visits offsets in increasing order. Anything else (first call, backward jump,
 or a forward jump past the cap) falls back to the binary search and refreshes the cache. The
-structural accelerator below remains unimplemented — the cache was enough once actually measured
-against the real access pattern.
+structural accelerator below remains unimplemented — the cache was judged enough at the time, ahead
+of any benchmark; see *Measured* below for the benchmark that eventually checked that judgement.
 
 The structural one, for reference, if the cache above is ever insufficient:
 `select_samples[j] - j * SAMPLE_RATE` is the high part of element `j*256` and is monotone in `j`, so
 binary-searching that plain `Vec<u32>` narrows to a 256-element block with zero select calls.
+
+### Measured (issue #543)
+
+`benches/line_index.rs` runs today's `LineIndex` against a same-binary reconstruction of the removed
+dense-`BitVec` `to_line_column` (`rank1(offset+1)` + `select1(line-2)`), across 1K-100K lines and two
+access patterns. Full numbers and interpretation are in
+[ADR-0012's *Not measured* section](../adrs/adr-0012.md#consequences); the summary:
+
+- **Sequential** (the cached path, `.[] | line`'s shape): flat 1K→100K lines on both platforms —
+  confirms the cache is genuinely O(1) amortized, not just usually fast. But the constant factor
+  against the old dense `BitVec` disagrees by platform: **~20% faster on Zen 4, ~60% slower on M4
+  Pro.** Cache/memory-bound effects do not port between these boxes; see
+  [benchmarking.md](../guides/benchmarking.md#ab-benchmarking-method) rule 5.
+- **Random** (the cache-miss path, the full `EliasFano::predecessor` binary search): **5.6-18x
+  slower** than the old dense `BitVec`, growing with line count on both platforms — the O(log n) term
+  this page predicted, now with a number attached instead of "not obviously a regression."
+
+Reproduce: `cargo bench --bench elias_fano -- predecessor` and `cargo bench --bench line_index`.
 
 ## Transient build memory
 
@@ -186,6 +204,11 @@ momentary, where the old cost was permanent. Removing the transient entirely wou
   YAML — but the rule is byte-identical for all three, so that was #341's duplication reintroduced
   one module over. The definition lives in [text::line_break](../../src/text/line_break.rs) and
   `yaml::line_break` re-exports it.
+- **A reactive fix can be right in shape and still unmeasured in size.** The `Cell` cache landed
+  before any benchmark existed and did deliver true O(1) amortized (#543 confirms it), but its
+  constant-factor cost against the structure it replaced was unknown until measured — and turned out
+  to flip sign by platform (faster on Zen 4, slower on M4 Pro). "It's O(1) now" and "it's fast now"
+  are different claims.
 
 ## See Also
 
