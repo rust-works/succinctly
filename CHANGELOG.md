@@ -156,6 +156,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`path()` silently accepted a filter that is not a path expression at all**
+  (#530): `path(1)`, `path(length)`, `path(.a + 1)` and `path({a:1})` all
+  answered with no output where jq raises `Invalid path expression with
+  result <v>` by name — before #489 these even resolved to the wrong
+  (root) path, and #489's fix only got as far as making the wrong answer
+  silent. `walk_path`'s catch-all (`_ => {}`) had conflated two things jq
+  distinguishes: expressions that genuinely are not path expressions (this
+  issue) and expressions that are, but have no tracking arm implemented yet
+  (#483 — `..`, `recurse`, `select`, `if`, `try`, `//`, `as $x |`, `label`,
+  `first`, `limit`, `reduce`/`foreach`, user-defined functions, and more).
+  Splitting it needed an explicit allowlist (`builtin_names_a_path` plus a
+  grouped match arm) naming every construct jq treats as path-capable, so an
+  unrecognized future construct now defaults to raising #530's refusal
+  rather than silently answering as a path — the safe, fail-closed default.
+  Everything else is evaluated for real (via the same `eval_owned_multi`
+  the rest of the walker already uses) and the new
+  `EvalError::invalid_path_expression` raised on its first output — jq
+  names only the first and never evaluates the rest, so `path(1,2)` reports
+  `1`. The refusal is not suppressed by a `?` nested *inside* the offending
+  expression (`path((.a+1)?)` still raises, because jq raises it when the
+  path expression *ends*, outside any `try`/`?` scope inside it) but is
+  suppressed by an outer `?` around the whole call (`path(.a+1)?` does
+  not), wired the same way `eval_assign`/`eval_update`/`builtin_del`
+  already catch their own walkers' errors at the call boundary. The
+  embedded value uses a wider truncation budget than every other message
+  in `error.rs` (29 bytes verbatim / 26 kept, bisected against the pinned
+  binary — jq's own `errbuf[30]` versus `errbuf[15]` elsewhere). Verified
+  against jq-1.7.1 as 14 new error probes, 2 new golden cases and 4 new
+  in-crate tests, one of which (`test_path_capable_gaps_still_name_no_path`)
+  exists specifically to guard #483's constructs against regressing into a
+  wrong error. **Not covered**: the write side (`=`, `|=`, `del()`) still
+  raises its own wording (`cannot use expression as {assignment, update,
+  delete} target`) for the same class of filter, where jq raises this same
+  sentence — `set_path`/`delete_at_path` are not generic over the evaluator
+  yet (unlike `update_path`), so aligning them is deferred to a follow-up
+  issue and tracked as four known divergences in the meantime.
+  `reduce`/`foreach` (only partially path-capable in jq) and a handful of
+  constructs that raise one of jq's *other* two "Invalid path expression"
+  sentences (`map_values`, `walk`, `|=` inside `path(...)`, non-short-circuiting
+  `and`/`or`) are left silent or on the `with result` wording rather than
+  chased exactly; see `docs/compliance/jq/limitations.md` for the full list,
+  including a small new divergence class of its own — a handful of
+  `jv_identical` cases (`path(null)` on `null`, `path(tostring)` on a
+  string that needs no conversion) that jq answers and succinctly now
+  errors on, not worth the complexity of jq's own bookkeeping to reproduce.
+
 - **`del()` through an out-of-range index silently no-op'd where a `[]` tail
   should raise** (#529): `[1,2] | del(.[5][])` returned `[1,2]` unchanged
   where jq raises `Cannot iterate over null (null)` — the last two sites left

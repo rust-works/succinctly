@@ -24,16 +24,16 @@ For jq *feature* coverage rather than error wording, see
 
 ## Summary
 
-Measured against jq-1.7.1 over the 186 probes in
+Measured against jq-1.7.1 over the 200 probes in
 [`tests/data/jq-error-probes.tsv`](../../../tests/data/jq-error-probes.tsv), through
 **both** evaluators — the full one (`src/jq/eval.rs`) and the generic one
 (`src/jq/eval_generic.rs`, which the CLI uses):
 
 | Dimension                                    | Result               | Meaning                                            |
 |----------------------------------------------|----------------------|----------------------------------------------------|
-| **Message text** (both evaluators, verbatim) | **183/186 = 98.4%**  | Byte-identical to jq                               |
-| **Wording divergences**                      | **0**                | Every probe that errors in both errors identically |
-| **Behaviour / parser gaps**                  | **3**                | succinctly does not raise the error at all         |
+| **Message text** (both evaluators, verbatim) | **196/200 = 98.0%**  | Byte-identical to jq                               |
+| **Wording divergences**                      | **4**                | succinctly raises an error, worded differently     |
+| **Behaviour / parser gaps**                  | **0**                | succinctly does not raise the error at all         |
 
 These three numbers are asserted, not maintained by hand: `jq_error_message_tests.rs`
 parses them back out of this page and fails if they drift from the corpus (they went stale
@@ -46,9 +46,14 @@ That file is the machine-readable source of truth; the test asserts it matches r
 exactly in both directions — a newly diverging probe and a newly matching one both break
 the build — so it cannot silently drift from this page.
 
-Crucially, **none of them is a wording bug**. In each case succinctly returns a value
-or fails to compile the filter, so there is no message to compare; the wording is already
-correct in `src/jq/error.rs` and will be reached once the underlying bug is fixed.
+All four remaining divergences are one gap, seen from four call sites: `=`, `|=` and
+`del()` each raise their *own* invented sentence (`cannot use expression as {assignment,
+update, delete} target`) for a filter that is not a path expression, where jq raises the
+same `Invalid path expression with result <v>` sentence
+[#530](https://github.com/rust-works/succinctly/issues/530) gave `path()`. `set_path` and
+`delete_at_path` are not generic over the evaluator yet (unlike `update_path`), so aligning
+them needs a bigger refactor than #530's scope and is deferred to a follow-up issue; see
+"Reading a path is indexing" below for what #530 did fix.
 
 What the corpus *cannot* see is the mirror image — a filter on which succinctly raises an
 error and jq returns a value — because a probe is only admitted if jq errors on it. Those
@@ -370,6 +375,25 @@ Unlike the positive case above, `?` does not suppress this one —
 [#498](https://github.com/rust-works/succinctly/issues/498) — because it is a write-time
 bounds check, not a failure to collect the path.
 
+[#530](https://github.com/rust-works/succinctly/issues/530) added a small group of its own,
+all variations on the same jq quirk: jq's refusal is a `jv_identical` check against the
+value at the current path, so a filter that happens to hand back the *exact same* immediate
+value it received reads as path-intact rather than as a computed result:
+
+| Filter               | Input   | jq        | succinctly                                        |
+|----------------------|---------|-----------|----------------------------------------------------|
+| `path(null)`         | `null`  | `[]`      | `Invalid path expression with result null`         |
+| `path(false)`        | `false` | `[]`      | `Invalid path expression with result false`        |
+| `path(tostring)`     | `"a"`   | `[]`      | `Invalid path expression with result "a"`          |
+| `path(.a and .b)`    | `{"a":false}` | `["a"]` | `Invalid path expression with result false`  |
+
+Reproducing this would mean tracking a mutable "value at path" register through evaluation
+the way jq's `execute.c` does, purely to special-case `null`/`true`/`false`/short-circuit
+results — `path(1)` and `path("a")` still (correctly) error in jq despite looking similar,
+so it is not a rule about *kinds* of value, only about object identity in jq's own
+representation. Not worth the complexity for four probe-sized cases; documented here
+instead of chased.
+
 ## Refusing an allocation jq does not survive
 
 `setpath` takes its array index from the document, so the array it pads is sized by the
@@ -451,10 +475,51 @@ Three rules, and none of them lives here any more:
 - **`?` suppresses that error and nothing else.** A pruned step names no path (it never
   happened), while a step that read `null` never errored and so is untouched by `?`.
 
-What remains is [#483](https://github.com/rust-works/succinctly/issues/483): `path(..)`,
-`path(recurse)` and `path(select(f))` have no arm in the walker, fall to its catch-all and
-name no path. They now produce *no output* rather than the root path — still the wrong
-answer, but no longer one that resolves.
+#489 left one arm — the walker's catch-all — covering two different things jq
+distinguishes, and [#530](https://github.com/rust-works/succinctly/issues/530) split it:
+
+| Filter          | Input     | jq                                              | before #530 | now              |
+|-----------------|-----------|--------------------------------------------------|-------------|-------------------|
+| `[path(1)]`     | `{"a":1}` | error: `Invalid path expression with result 1`   | `[]`        | the sentence      |
+| `[path(.a+1)]`  | `{"a":1}` | error: `Invalid path expression with result 2`   | `[]`        | the sentence      |
+| `[path({a:1})]` | `{"a":1}` | error: `...with result {"a":1}`                   | `[]`        | the sentence      |
+| `[path(..)]`    | `{"a":1}` | `[[],["a"]]`                                     | `[]`        | `[]` (#483, below) |
+
+The first three are filters jq refuses outright: not a path expression at all, whatever
+the value. `walk_path` now evaluates the expression for real (through the same
+`eval_owned_multi` the rest of the walker already uses) and raises
+`EvalError::invalid_path_expression` on its first output — jq names only the first and
+never evaluates the rest, so `path(1,2)` reports `1`. The refusal is not suppressed by a
+`?` nested *inside* the offending expression (`path((.a+1)?)` still raises, because jq
+raises it when the path expression *ends*, outside any `try`/`?` scope inside it) but is
+suppressed by an outer `?` around the whole call (`path(.a+1)?` does not) — the same
+two-level distinction `builtin_path` already needed for the walk's own `optional`
+parameter.
+
+What remains is [#483](https://github.com/rust-works/succinctly/issues/483) — the fourth
+row above: `path(..)`, `path(recurse)`, `path(select(f))`, and the other constructs jq
+*does* treat as path expressions (`if`, `try`, `//`, `as $x |`, `label`, `first`, `limit`,
+`nth`, comma, user-defined functions, `reduce`/`foreach` with an identity accumulator, …)
+have no path-tracking arm in the walker yet, so they still name no path rather than the
+path jq would find. #530 kept these on an explicit allowlist (`builtin_names_a_path` and a
+grouped match arm in `walk_path`) precisely so closing #483 later does not collide with
+this fix — an unrecognized construct defaults to #530's refusal, not to silence.
+
+Three shapes stay open, deliberately, as smaller gaps #530 did not chase:
+
+- **`reduce`/`foreach` are only partially path-capable.** jq threads a path through
+  `reduce .[] as $x (.; .)` (an identity accumulator) but not through one that computes a
+  new value, and the failing case there uses a *third* jq sentence
+  (`Invalid path expression near attempt to access element "a" of {...}`) that neither this
+  fix nor #483 reproduces. Both stay in the silent bucket rather than raising a wrong
+  message.
+- **`map_values`, `walk`, `|=` inside `path(...)`, and non-short-circuiting `and`/`or`**
+  raise one of jq's other two "Invalid path expression" sentences (`near attempt to access
+  element … of …` / `near attempt to iterate through …`), which would need emulating jq's
+  `path_intact`/`jv_identical` bookkeeping to reproduce exactly; succinctly raises the
+  `with result` sentence instead (`and`/`or`) or stays silent (the rest).
+- **A handful of `jv_identical` cases answer in jq and now error in succinctly** — see the
+  four-row addition to "Where succinctly errors and jq does not" below.
 
 ## Errors reach the CLI with the right text but the wrong exit code
 
