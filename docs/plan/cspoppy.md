@@ -283,7 +283,7 @@ measurements, not derived): 25.00% (pre-Step-A) → 12.50% (Step A) → 6.25%
 Full `yaml_bench` (`main` vs this branch, same machine, interleaved reruns),
 excluding `yaml/anchors/*` which panics with `UnknownAnchor` on **both**
 binaries — a pre-existing generator bug on `main`, unrelated to this branch
-(confirmed by reproducing it against unmodified `main`); worth its own issue.
+(confirmed by reproducing it against unmodified `main`) — filed as #594.
 
 Of the 39 remaining benchmark ids, 38 are noise-level (< 2%) on both Zen 4 and
 M4 Pro. One group is not: **`yaml/block_scalars/*` is 12–28% slower on Zen 4**
@@ -305,9 +305,9 @@ group, size-independent within the group, structurally impossible for the
 changed code to cause) matches a binary code-layout artifact from the
 recompile (e.g. an icache/alignment shift next to the P2.7 AVX2 block-scalar
 loop, which this branch does not touch) rather than a real regression. Not
-chased further — `terminus`'s WSL2 lacks `perf`; a follow-up with a native
-Linux `perf stat`/objdump comparison would confirm instructions-retired parity,
-which would settle "layout, not logic" conclusively.
+chased further — `terminus`'s WSL2 lacks `perf`; filed as #595 for a follow-up
+native-Linux `perf stat`/objdump comparison to confirm instructions-retired
+parity, which would settle "layout, not logic" conclusively.
 
 `yq_select` was not run — it requires system `yq` (absent on the M4 Pro host)
 and mainly exercises `.users[:N]`-style slicing, which does not call
@@ -333,7 +333,7 @@ attributing it to this change after all.
 Not scheduled. Recorded so the reasoning isn't lost; each is a candidate
 follow-up issue once #64 lands. Mirrored in the issue body.
 
-### F1 — Drop BP's `rank_l2` (largest remaining win)
+### F1 — Drop BP's `rank_l2` (largest remaining win) — issue #596
 
 `rank_l2: Vec<u64>` is 64 bits per 512-bit block = **12.5% of the BP bitmap** —
 twice what Step B saves. Poppy's actual trade is to omit the per-word level and
@@ -345,7 +345,7 @@ by `rank1`. BP `rank1` is very hot (cursor navigation), so this is a genuine
 trade needing end-to-end measurement. Should follow Step B so the select path
 isn't confounded.
 
-### F2 — True Poppy rank layout as a standalone `CsPoppy`
+### F2 — True Poppy rank layout as a standalone `CsPoppy` — issue #597
 
 L0 (`u64` per 2^32 bits) + L1/L2 packed into one `u64` per 2048-bit superblock
 (32-bit L1 + 3×10-bit per-basic-block counts) = **3.125%**, versus
@@ -370,7 +370,7 @@ pub fn rank_at_word(&self, words: &[u64], word_idx: usize) -> usize {
 L2 stores counts of basic blocks 0–2; block 3's is never needed. Would make
 `BitVecCsPoppy` (original Phase 3) trivial to add on top.
 
-### F3 — Consolidate three rank implementations
+### F3 — Consolidate three rank implementations — issue #598
 
 The crate has three: `RankDirectory` (25%, cache-aligned, per-word L2),
 [`CompactRank`](../../src/bits/compact_rank.rs) (3.52%, two-level), and BP's
@@ -379,14 +379,14 @@ becomes five — the interesting question is whether one parameterised structure
 serves all callers, or whether the density/hotness spread genuinely justifies
 separate ones.
 
-### F4 — Migrate `BitVec` to a compact rank
+### F4 — Migrate `BitVec` to a compact rank — issue #599
 
 Contingent on F2. Newline bitvecs in `json/locate.rs`, `json/light.rs` and
 `yaml/index.rs` are 1 bit per input byte, so on a 100 MB document the bitmap is
 12.5 MB and `RankDirectory` is 3.1 MB; Poppy would make that 0.4 MB. Real but
 modest, and CLI-only.
 
-### F5 — Elias-Fano-compressed select samples
+### F5 — Elias-Fano-compressed select samples — issue #600
 
 Sample block indices are monotonically increasing — exactly what
 [`EliasFano`](../../src/bits/elias_fano.rs) encodes. Could shrink the sample
@@ -394,7 +394,7 @@ array further beyond Step B's `u32`. Should be evaluated together with
 [compact-index-investigation.md](compact-index-investigation.md), which proposes
 EF for the YAML position arrays.
 
-### F6 — Sample rate as a tuning knob
+### F6 — Sample rate as a tuning knob — issue #601
 
 At `u32` samples the overhead is `32 × density / rate`:
 
@@ -409,7 +409,7 @@ Rate 512 halves Step B again, at the cost of a wider binary-search bracket.
 Cheap to expose via `Config` once B lands; needs measurement to justify a
 non-default. Default stays **256** so existing tuning keeps its meaning.
 
-### F7 — `select0`
+### F7 — `select0` — issue #602
 
 Unsupported crate-wide today. On BP it would find the k-th close, complementing
 `select1`. CS-Poppy supports both in the paper. No known consumer — recorded as
