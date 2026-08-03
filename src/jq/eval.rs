@@ -6925,8 +6925,13 @@ fn eval_slice_bound<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// Classify a resolved bound value the way jq's slice descriptor does
 /// (`SliceBounds::resolved_bound`), then round it to the integer
 /// `Expr::Slice` stores. Shared between [`eval_slice_bound`] (read mode) and
-/// `resolve_slice_bound` (path mode).
-fn owned_bound_to_i64(v: &OwnedValue, round: fn(f64) -> f64) -> Result<Option<i64>, EvalError> {
+/// `resolve_slice_bound` (path mode), and with `eval_generic`'s
+/// `eval_slice_bound` (#615), which needs the same OwnedValue-only classify
+/// step for its own bound resolution.
+pub(crate) fn owned_bound_to_i64(
+    v: &OwnedValue,
+    round: fn(f64) -> f64,
+) -> Result<Option<i64>, EvalError> {
     Ok(SliceBounds::resolved_bound(v)?.map(|f| round(f) as i64))
 }
 
@@ -6935,8 +6940,10 @@ fn owned_bound_to_i64(v: &OwnedValue, round: fn(f64) -> f64) -> Result<Option<i6
 /// Slicing is a plain `Vec`/`&str` operation once the bounds are known, so
 /// this mirrors `eval_single`'s `Expr::Slice` arm (minus its cursor-only
 /// fast paths, which only matter for borrowed input) rather than paying for
-/// `eval_owned_input`'s serialize/reparse round-trip.
-fn slice_owned_value(
+/// `eval_owned_input`'s serialize/reparse round-trip. Also reused by
+/// `eval_generic`'s owned-target `SliceExpr` path (#615), same as
+/// [`index_one_owned`] is reused by its `IndexExpr` counterpart.
+pub(crate) fn slice_owned_value(
     target: &OwnedValue,
     start: Option<i64>,
     end: Option<i64>,
