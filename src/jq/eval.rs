@@ -7114,8 +7114,8 @@ fn eval_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // inside the path.
     let paths = match resolve_dynamic_indexes::<S>(path_expr, &result) {
         Ok(paths) => paths,
-        Err(_) if optional => return QueryResult::None,
-        Err(e) => return QueryResult::Error(e),
+        Err((_, _)) if optional => return QueryResult::None,
+        Err((_, e)) => return QueryResult::Error(e),
     };
 
     let last = paths.len().saturating_sub(1);
@@ -7161,8 +7161,8 @@ fn eval_update<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // `Expr::Optional` node inside `path_expr` itself.
     let paths = match resolve_dynamic_indexes::<S>(path_expr, &result) {
         Ok(paths) => paths,
-        Err(_) if optional => return QueryResult::None,
-        Err(e) => return QueryResult::Error(e),
+        Err((_, _)) if optional => return QueryResult::None,
+        Err((_, e)) => return QueryResult::Error(e),
     };
 
     // Get current value at path, apply filter, and set back
@@ -7774,23 +7774,32 @@ fn owned_type_name(value: &OwnedValue) -> &'static str {
 // `{"a":"x","x":1,"y":1}` — the second key is `"y"`, read from the original
 // `.x`, not the `1` the first assignment just wrote.
 
-/// Does this expression need the multi-path pre-pass — a computed-key index
-/// anywhere in its *path* structure, or a `Comma` naming more than one path
-/// outright?
+/// Does this expression need the multi-path pre-pass — anything `resolve_node`
+/// has to run to turn it into concrete `Field`/`Index`/`Slice` components?
 ///
-/// A `Comma` needs the pre-pass even when every branch is static (`.a, .b`):
-/// none of the single-path walkers (`get_path_mut`, `set_path`, `update_path`,
-/// `delete_at_path`) have a `Comma` arm, so one handed through verbatim is
-/// rejected as an invalid path component. Only the shapes that can appear as a
-/// path expression are traversed; a computed key nested inside, say, an `if`
-/// is not a path component and cannot reach the walkers. Used as a cheap guard
-/// so programs with neither shape skip the pre-pass entirely.
+/// Written as an exclusion rather than a whitelist on purpose (#483): the
+/// single-path walkers (`walk_path`, `get_path_mut`, `set_path`,
+/// `update_path`, `delete_at_path`) only understand `Identity`/`Field`/
+/// `Index`/`Slice`/`Iterate`, nested arbitrarily under `Pipe`/`Paren`/
+/// `Optional` — so *everything else* needs `resolve_node` first, whether
+/// that is a computed-key `IndexExpr`, a `Comma` naming more than one path
+/// (needed even when every branch is static: `.a, .b` handed through
+/// verbatim has no `Comma` arm in the walkers and is rejected as an invalid
+/// path component), or a traversal/control-flow shape like `..`, `recurse`,
+/// `select`, `first`, `if`, `//`, `limit`, `try`, `label`, `as`, or
+/// `getpath` — every one of which `resolve_node` already or newly knows how
+/// to resolve. A whitelist here previously missed `RecursiveDescent`/
+/// `Select`/the typeof filters even after `resolve_node` grew arms for them,
+/// which is exactly the bug class this exclusion check is meant to make
+/// impossible for the *next* combinator too.
 fn needs_path_prepass(expr: &Expr) -> bool {
     match expr {
-        Expr::IndexExpr { .. } | Expr::SliceExpr { .. } | Expr::Comma(_) => true,
+        Expr::Identity | Expr::Field(_) | Expr::Index(_) | Expr::Slice { .. } | Expr::Iterate => {
+            false
+        }
         Expr::Pipe(exprs) => exprs.iter().any(needs_path_prepass),
         Expr::Optional(inner) | Expr::Paren(inner) => needs_path_prepass(inner),
-        _ => false,
+        _ => true,
     }
 }
 
@@ -7871,11 +7880,25 @@ fn key_to_path_component(key: &OwnedValue, container: &OwnedValue) -> Result<Exp
 /// found there (needed to resolve any computed key further along the chain).
 type PathBranch = (Vec<Expr>, OwnedValue);
 
+/// The result of resolving one path node: either every branch it fans out
+/// to, or — if resolution failed partway through several siblings (a
+/// `Comma`, a computed key with more than one output, ...) — whatever
+/// branches were already resolved before the failure, alongside the error.
+///
+/// jq's own generator-based evaluation never "un-emits" an output already
+/// produced before a later sibling errors: confirmed live, `path(.a, 1)`
+/// prints `["a"]` then raises, and `(.a, .b[0])?` prints `["a"]` and stops
+/// rather than losing it. Carrying the prefix here is what lets
+/// `builtin_path` reproduce that (folded into #530, since its new error is
+/// what makes the gap easy to hit — `path(GOOD, NON_PATH)` — even though
+/// neither issue's own repro list exercises it). Every other caller of
+/// `resolve_dynamic_indexes` (`=`, `|=`, `del()`) discards the prefix and
+/// treats this exactly like a plain `Err`, matching jq's atomic write-side
+/// semantics (confirmed live: `(.a, 1) = 5` produces no output at all).
+type PathResolveResult = Result<Vec<PathBranch>, (Vec<PathBranch>, EvalError)>;
+
 /// Resolve one path node against one value, yielding a branch per output.
-fn resolve_node<S: EvalSemantics>(
-    expr: &Expr,
-    value: &OwnedValue,
-) -> Result<Vec<PathBranch>, EvalError> {
+fn resolve_node<S: EvalSemantics>(expr: &Expr, value: &OwnedValue) -> PathResolveResult {
     match expr {
         Expr::Pipe(exprs) => resolve_seq::<S>(exprs, value),
         Expr::Paren(inner) => resolve_node::<S>(inner, value),
@@ -7883,7 +7906,13 @@ fn resolve_node<S: EvalSemantics>(
         Expr::Comma(exprs) => {
             let mut out = Vec::new();
             for e in exprs {
-                out.extend(resolve_node::<S>(e, value)?);
+                match resolve_node::<S>(e, value) {
+                    Ok(branches) => out.extend(branches),
+                    Err((prefix, e)) => {
+                        out.extend(prefix);
+                        return Err((out, e));
+                    }
+                }
             }
             Ok(out)
         }
@@ -7929,9 +7958,20 @@ fn resolve_node<S: EvalSemantics>(
             // container this branch needs, and that failure must propagate
             // regardless of this branch's own `?`).
             _ => {
-                // A failure under `?` prunes the branch instead of propagating.
-                let Ok(branches) = resolve_node::<S>(inner, value) else {
-                    return Ok(Vec::new());
+                // A failure under `?` prunes just the error, keeping whatever
+                // was already resolved before it (confirmed live: `(.a,
+                // .b[0])?` prints `["a"]` and silently stops) — except
+                // `invalid_path_expression` (#530), which `?` does not
+                // suppress in jq at all: it is a statement that the filter is
+                // not a path expression, not a value error raised while
+                // collecting one (confirmed live: `path(("a")?)` still
+                // raises in jq).
+                let branches = match resolve_node::<S>(inner, value) {
+                    Ok(branches) => branches,
+                    Err((prefix, e)) if e.is_invalid_path_expression() => {
+                        return Err((prefix, e));
+                    }
+                    Err((prefix, _)) => prefix,
                 };
                 Ok(branches
                     .into_iter()
@@ -7971,7 +8011,7 @@ fn resolve_node<S: EvalSemantics>(
                 .iter()
                 .map(|(k, v)| (vec![Expr::Field(k.clone())], v.clone()))
                 .collect()),
-            other => Err(EvalError::cannot_iterate(other)),
+            other => Err((Vec::new(), EvalError::cannot_iterate(other))),
         },
 
         Expr::IndexExpr { target, key } => resolve_index_expr::<S>(target, key, value, false),
@@ -8006,7 +8046,10 @@ fn resolve_node<S: EvalSemantics>(
         // unchanged or prune it, exactly like `Optional` above but driven by a
         // predicate instead of an error.
         Expr::Builtin(Builtin::Select(cond)) => {
-            if eval_owned_expr::<S>(cond, value, false)?.is_truthy() {
+            if eval_owned_expr::<S>(cond, value, false)
+                .map_err(|e| (Vec::new(), e))?
+                .is_truthy()
+            {
                 Ok(vec![(Vec::new(), value.clone())])
             } else {
                 Ok(Vec::new())
@@ -8030,25 +8073,219 @@ fn resolve_node<S: EvalSemantics>(
             }
         }
 
-        // A static leaf: keep it verbatim and thread its value through.
-        other => {
-            let mut components = Vec::new();
-            push_path_components(&mut components, other);
-            let mut values = eval_owned_multi::<S>(other, value)?;
-            match values.len() {
-                // No output prunes the branch.
-                0 => Ok(Vec::new()),
-                1 => Ok(vec![(components, values.pop().expect("len checked"))]),
-                // A multi-output component with no path-tracking arm above
-                // (an arbitrary function call, `getpath` with a computed
-                // argument, ...). jq resolves these via general bytecode path
-                // tracking; we do not (#412), so say so in the user's terms
-                // rather than the resolver's.
-                _ => Err(EvalError::new(
-                    "Cannot use a computed index after a multi-output path component",
-                )),
+        // `first(f)` keeps only the first branch `f` resolves to. Both
+        // internal spellings reach here: `Expr::FirstExpr` is what the
+        // dedicated `first(...)` parse path builds; `Builtin::FirstStream`
+        // is a second, older representation reachable from a different
+        // parser path. Keeping both arms means it does not matter which one
+        // a given call site produces.
+        Expr::FirstExpr(inner) | Expr::Builtin(Builtin::FirstStream(inner)) => {
+            Ok(resolve_node::<S>(inner, value)?
+                .into_iter()
+                .take(1)
+                .collect())
+        }
+
+        // `if cond then a else b end`: only the branch the runtime actually
+        // selects is checked for path-ness — the branch not taken is never
+        // evaluated at all, so a non-path `else` that is never reached
+        // raises nothing (matches jq).
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            if eval_owned_expr::<S>(cond, value, false)
+                .map_err(|e| (Vec::new(), e))?
+                .is_truthy()
+            {
+                resolve_node::<S>(then_branch, value)
+            } else {
+                resolve_node::<S>(else_branch, value)
             }
         }
+
+        // `a // b`: resolve `a`, keep only its truthy branches — jq's `//`
+        // filters a multi-output left side rather than choosing all-or-
+        // nothing (`retain_truthy` is this rule's value-only twin) — and
+        // fall back to `b` only when none survive. An error while resolving
+        // `a` propagates rather than falling back, matching `eval_alternative`:
+        // `//` only substitutes for falsy/absent output, never for a raised
+        // error, and the `?` here already gives us that for free.
+        Expr::Alternative(left, right) => {
+            let branches: Vec<PathBranch> = resolve_node::<S>(left, value)?
+                .into_iter()
+                .filter(|(_, v)| v.is_truthy())
+                .collect();
+            if branches.is_empty() {
+                resolve_node::<S>(right, value)
+            } else {
+                Ok(branches)
+            }
+        }
+
+        // `limit(n; f)`: same `n`-conversion rule as `eval_limit`, so
+        // `path(limit(...))` agrees with plain `limit(...)` in this
+        // evaluator — including anywhere `eval_limit` itself still diverges
+        // from jq (e.g. a negative `n`), which is that function's bug to
+        // fix, not this resolver's. Both internal spellings reach here for
+        // the same reason as `first` above.
+        Expr::Limit { n, expr } => resolve_limit::<S>(n, expr, value),
+        Expr::Builtin(Builtin::Limit(n, expr)) => resolve_limit::<S>(n, expr, value),
+
+        // `try expr catch handler` (and `expr?`, sugar for `try expr`):
+        // resolve `expr`; if that fails and there is no `catch`, prune the
+        // branch exactly like `Optional`'s blanket arm above. With a
+        // `catch`, jq runs the handler as a path expression too, against the
+        // raised value — confirmed live: `path(try .a catch "x")` on
+        // `{"a":1}` is `[["a"]]` when `.a` does not error, i.e. fully
+        // transparent. `invalid_path_expression` (#530) is neither pruned
+        // nor handed to `catch`, with or without one — confirmed live,
+        // `path(try 1 catch "x")` still raises the same message rather than
+        // running `"x"` — because it is a statement that the filter is not a
+        // path expression at all, not a value `catch` can bind and inspect.
+        // (jq's own wording for the handler *also* failing as a path —
+        // `Invalid path expression near attempt to access ...` — is its own
+        // message shape this resolver does not reproduce; the ordinary
+        // `#530` message surfaces instead, which is still a loud error
+        // rather than a silent wrong answer.)
+        Expr::Try { expr, catch } => match resolve_node::<S>(expr, value) {
+            Ok(branches) => Ok(branches),
+            Err((prefix, e)) if e.is_invalid_path_expression() => Err((prefix, e)),
+            // No catch: keep whatever was already resolved before the
+            // failure (confirmed live: `path(try (.a, .b[0]))` prints
+            // `["a"]` and stops), same as `?`'s matching fix above.
+            Err((prefix, e)) => match catch {
+                None => Ok(prefix),
+                Some(catch_expr) => resolve_node::<S>(catch_expr, &e.payload()),
+            },
+        },
+
+        // `label $x | body`: transparent. Path-tracking has no notion of
+        // `break` to catch here — an unmatched `break` inside `body` will
+        // already surface as an ordinary `EvalError` via `eval_owned_multi`
+        // (see its doc comment), which propagates as any other resolution
+        // failure would.
+        Expr::Label { body, .. } => resolve_node::<S>(body, value),
+
+        // `E as $x | body`: bind each output of `E` into `body` by
+        // substitution — reusing `substitute_var`, already relied on for
+        // `FirstExpr`/`IndexExpr` — then resolve the substituted body. This
+        // needs no new environment-threading in the resolver.
+        Expr::As { expr, var, body } => {
+            let mut out = Vec::new();
+            for bound in eval_owned_multi::<S>(expr, value).map_err(|e| (Vec::new(), e))? {
+                out.extend(resolve_node::<S>(
+                    &substitute_var(body, var, &bound),
+                    value,
+                )?);
+            }
+            Ok(out)
+        }
+
+        // `getpath([...])` with a literal array argument resolves to the
+        // equivalent `Field`/`Index` chain. A computed or multi-output
+        // argument is the same "arbitrary generator as a key" limitation
+        // `.[range(3)]` already has (#412) and stays out of scope here — it
+        // falls through to `resolve_leaf` below like any other
+        // non-primitive value-producing filter (which also naturally
+        // reproduces `getpath`'s own "Path must be specified as an array"
+        // refusal for a single non-array argument, since that re-evaluates
+        // the real `getpath` builtin).
+        Expr::Builtin(Builtin::GetPath(arg)) => {
+            let values = eval_owned_multi::<S>(arg, value).map_err(|e| (Vec::new(), e))?;
+            if let [OwnedValue::Array(keys)] = values.as_slice() {
+                let mut components = Vec::new();
+                let mut current = value.clone();
+                for key in keys {
+                    let component =
+                        key_to_path_component(key, &current).map_err(|e| (Vec::new(), e))?;
+                    current = index_one_owned(&current, key, false)
+                        .map_err(|e| (Vec::new(), e))?
+                        .expect("non-optional index yields a value or errors");
+                    components.push(component);
+                }
+                return Ok(vec![(components, current)]);
+            }
+            resolve_leaf::<S>(expr, value)
+        }
+
+        other => resolve_leaf::<S>(other, value),
+    }
+}
+
+/// Resolve `n; expr`'s `n` the same way `eval_limit` does, then take that
+/// many resolved branches of `expr`.
+fn resolve_limit<S: EvalSemantics>(
+    n_expr: &Expr,
+    expr: &Expr,
+    value: &OwnedValue,
+) -> PathResolveResult {
+    let n_value = eval_owned_expr::<S>(n_expr, value, false).map_err(|e| (Vec::new(), e))?;
+    let n = match n_value {
+        OwnedValue::Int(i) | OwnedValue::NumberLiteral(NumberRepr::Int(i), _) if i >= 0 => {
+            i as usize
+        }
+        _ => {
+            return Err((
+                Vec::new(),
+                EvalError::new("limit requires non-negative integer"),
+            ));
+        }
+    };
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    Ok(resolve_node::<S>(expr, value)?
+        .into_iter()
+        .take(n)
+        .collect())
+}
+
+/// Resolve an ordinary (non-combinator) filter: keep it as one opaque path
+/// component if it is one of the four primitives `walk_path` understands
+/// bare (`Identity`/`Field`/`Index`/`Slice`), and otherwise treat it as a
+/// plain value-producing filter that is not a path expression at all —
+/// raising jq's `Invalid path expression` on its first output (#530). Zero
+/// outputs still prunes silently either way, matching `path(empty)` → `[]`.
+fn resolve_leaf<S: EvalSemantics>(expr: &Expr, value: &OwnedValue) -> PathResolveResult {
+    let mut values = eval_owned_multi::<S>(expr, value).map_err(|e| (Vec::new(), e))?;
+    if matches!(
+        expr,
+        Expr::Identity | Expr::Field(_) | Expr::Index(_) | Expr::Slice { .. }
+    ) {
+        let mut components = Vec::new();
+        push_path_components(&mut components, expr);
+        return match values.len() {
+            // No output prunes the branch.
+            0 => Ok(Vec::new()),
+            1 => Ok(vec![(components, values.pop().expect("len checked"))]),
+            // A multi-output primitive is not actually reachable today —
+            // indexing/slicing a value always yields zero or one result —
+            // but keep this as a named error rather than a panic in case
+            // that invariant ever changes, mirroring the resolver's existing
+            // "no general bytecode path tracking" wording (#412).
+            _ => Err((
+                Vec::new(),
+                EvalError::new("Cannot use a computed index after a multi-output path component"),
+            )),
+        };
+    }
+    match values.len() {
+        0 => Ok(Vec::new()),
+        1 => Err((Vec::new(), EvalError::invalid_path_expression(&values[0]))),
+        // A multi-output non-primitive (`range(3)` used bare, not as an
+        // index prefix — #412's existing "arbitrary generator" refusal
+        // rather than #530's, which is specifically about a *single*
+        // resulting value that is not path-shaped; every #530 repro is
+        // single-output, and jq's own wording for the multi-output case
+        // (`Invalid path expression near attempt to access element ... of
+        // ...`) is its own message shape already deliberately not
+        // reproduced here, per `test_unsupported_path_prefixes_report_rather_than_misfire`).
+        _ => Err((
+            Vec::new(),
+            EvalError::new("Cannot use a computed index after a multi-output path component"),
+        )),
     }
 }
 
@@ -8111,7 +8348,7 @@ fn resolve_recurse<S: EvalSemantics>(
     f: &Expr,
     cond: Option<&Expr>,
     value: &OwnedValue,
-) -> Result<Vec<PathBranch>, EvalError> {
+) -> PathResolveResult {
     let mut outputs: Vec<PathBranch> = Vec::new();
     let mut queue: Vec<PathBranch> = vec![(Vec::new(), value.clone())];
     const MAX_ITEMS: usize = 10000;
@@ -8188,13 +8425,18 @@ fn resolve_index_expr<S: EvalSemantics>(
     key: &Expr,
     value: &OwnedValue,
     optional: bool,
-) -> Result<Vec<PathBranch>, EvalError> {
-    let keys = eval_owned_multi::<S>(key, value)?;
+) -> PathResolveResult {
+    let keys = eval_owned_multi::<S>(key, value).map_err(|e| (Vec::new(), e))?;
     if keys.is_empty() {
         return Ok(Vec::new());
     }
     let target_branches = resolve_node::<S>(target, value)?;
 
+    // `out` accumulates in the exact order jq streams (key outer, target
+    // inner — see the doc comment above), so a failure partway through
+    // returns it as-is: everything already pushed before the failing
+    // key/target combination, matching jq's own never-un-emit streaming
+    // (#530's sibling fix).
     let mut out = Vec::with_capacity(keys.len() * target_branches.len());
     for k in &keys {
         for (components, target_value) in &target_branches {
@@ -8211,12 +8453,12 @@ fn resolve_index_expr<S: EvalSemantics>(
             ) && numeric_key_to_index(k).is_none()
                 && matches!(target_value, OwnedValue::Array(_) | OwnedValue::Null)
             {
-                return Err(EvalError::new("Cannot set array element at NaN index"));
+                return Err((out, EvalError::new("Cannot set array element at NaN index")));
             }
             let component = match key_to_path_component(k, target_value) {
                 Ok(component) => component,
                 Err(_) if optional => continue,
-                Err(e) => return Err(e),
+                Err(e) => return Err((out, e)),
             };
             // `false`, not `optional`: the failure has to arrive as an error for
             // the two spellings to be told apart here, rather than as the `None`
@@ -8224,7 +8466,7 @@ fn resolve_index_expr<S: EvalSemantics>(
             let next_value = match index_one_owned(target_value, k, false) {
                 Ok(v) => v.expect("non-optional index yields a value or errors"),
                 Err(_) if optional => continue,
-                Err(e) => return Err(e),
+                Err(e) => return Err((out, e)),
             };
             // `resolve_dynamic_indexes` strips the `Expr::Optional` wrapper
             // below from every component before it ever reaches
@@ -8267,12 +8509,12 @@ fn resolve_slice_expr<S: EvalSemantics>(
     end: &Option<Box<Expr>>,
     value: &OwnedValue,
     optional: bool,
-) -> Result<Vec<PathBranch>, EvalError> {
-    let starts = resolve_slice_bound::<S>(start, value, f64::floor)?;
+) -> PathResolveResult {
+    let starts = resolve_slice_bound::<S>(start, value, f64::floor).map_err(|e| (Vec::new(), e))?;
     if starts.is_empty() {
         return Ok(Vec::new());
     }
-    let ends = resolve_slice_bound::<S>(end, value, f64::ceil)?;
+    let ends = resolve_slice_bound::<S>(end, value, f64::ceil).map_err(|e| (Vec::new(), e))?;
     if ends.is_empty() {
         return Ok(Vec::new());
     }
@@ -8289,7 +8531,7 @@ fn resolve_slice_expr<S: EvalSemantics>(
                 let next_value = match slice_owned_value(target_value, *s, *e, false) {
                     Ok(v) => v.expect("non-optional slice yields a value or errors"),
                     Err(_) if optional => continue,
-                    Err(e) => return Err(e),
+                    Err(e) => return Err((out, e)),
                 };
                 let mut path = components.clone();
                 path.push(if optional {
@@ -8358,10 +8600,7 @@ fn value_after_components<S: EvalSemantics>(
 /// *its* position, which is the document root only when it sits at the top of
 /// the path. `path(.x | .a[.k])` resolves `.k` against `.x`, giving
 /// `["x","a","a"]`.
-fn resolve_seq<S: EvalSemantics>(
-    exprs: &[Expr],
-    value: &OwnedValue,
-) -> Result<Vec<PathBranch>, EvalError> {
+fn resolve_seq<S: EvalSemantics>(exprs: &[Expr], value: &OwnedValue) -> PathResolveResult {
     let mut flat = Vec::new();
     for e in exprs {
         push_path_components(&mut flat, e);
@@ -8373,30 +8612,58 @@ fn resolve_seq<S: EvalSemantics>(
     // an enclosing `IndexExpr` indexes it: in `.a[.k].b[.j]`, `.j` applies to
     // `.a[.k].b`.
     let Some(last_dynamic) = flat.iter().rposition(needs_path_prepass) else {
-        let end = value_after_components::<S>(&flat, value)?;
+        let end = value_after_components::<S>(&flat, value).map_err(|e| (Vec::new(), e))?;
         return Ok(vec![(flat, end)]);
     };
 
+    // Fan out one pipe element at a time. Note this rebuilds `branches` stage
+    // by stage (every currently-active branch through element N, then all of
+    // those through element N+1, ...) rather than threading each branch
+    // depth-first through the *entire* remaining pipe the way jq's own
+    // generator composition does — so for a pipe with more than one dynamic
+    // element, a failure partway through preserves everything already
+    // completed in the *current* stage (this element, for the branches
+    // already processed) but not a later stage's contribution from an
+    // earlier-stage branch that had not yet reached it. That is a known
+    // simplification, not a byte-for-byte reproduction of jq's stream order;
+    // the single-dynamic-element case (the overwhelmingly common one, and
+    // the one every #530 sibling repro exercises) is exact.
     let mut branches: Vec<PathBranch> = vec![(Vec::new(), value.clone())];
     for element in &flat[..=last_dynamic] {
         let mut next = Vec::new();
         for (prefix, current) in &branches {
-            for (components, resulting) in resolve_node::<S>(element, current)? {
-                let mut path = prefix.clone();
-                path.extend(components);
-                next.push((path, resulting));
+            match resolve_node::<S>(element, current) {
+                Ok(resolved) => {
+                    for (components, resulting) in resolved {
+                        let mut path = prefix.clone();
+                        path.extend(components);
+                        next.push((path, resulting));
+                    }
+                }
+                Err((partial, e)) => {
+                    for (components, resulting) in partial {
+                        let mut path = prefix.clone();
+                        path.extend(components);
+                        next.push((path, resulting));
+                    }
+                    return Err((next, e));
+                }
             }
         }
         branches = next;
     }
 
     let tail = &flat[last_dynamic + 1..];
-    for (prefix, current) in &mut branches {
-        let end = value_after_components::<S>(tail, current)?;
-        *current = end;
+    let mut out = Vec::with_capacity(branches.len());
+    for (mut prefix, current) in branches {
+        let end = match value_after_components::<S>(tail, &current) {
+            Ok(end) => end,
+            Err(e) => return Err((out, e)),
+        };
         prefix.extend_from_slice(tail);
+        out.push((prefix, end));
     }
-    Ok(branches)
+    Ok(out)
 }
 
 /// Rewrite every computed key in a path expression into the static component it
@@ -8406,29 +8673,42 @@ fn resolve_seq<S: EvalSemantics>(
 /// jq applies *all* of them: `{"a":0,"b":0} | .[("a","b")] = 1` is
 /// `{"a":1,"b":1}`, and `path()` emits one output per resolved path. Likewise
 /// for a purely static `Comma` — `{"a":1,"b":2} | del(.a, .b)` is `{}`.
+///
+/// Returns whatever was already resolved as an `Err`-side prefix too, when
+/// resolution failed partway through several siblings — `path()` is the only
+/// caller that uses it (streaming that prefix out before the error, #530's
+/// sibling fix); the write-side callers (`=`, `|=`, `del()`) discard it and
+/// treat this exactly like a plain failure, matching jq's atomic write
+/// semantics.
 fn resolve_dynamic_indexes<S: EvalSemantics>(
     expr: &Expr,
     input: &OwnedValue,
-) -> Result<Vec<Expr>, EvalError> {
+) -> Result<Vec<Expr>, (Vec<Expr>, EvalError)> {
     if !needs_path_prepass(expr) {
         return Ok(vec![expr.clone()]);
     }
 
-    let branches = resolve_node::<S>(expr, input)?;
-    Ok(branches
-        .into_iter()
-        .map(|(components, _)| {
-            let components: Vec<Expr> = components
-                .into_iter()
-                .map(strip_resolved_optional)
-                .collect();
-            match components.len() {
-                0 => Expr::Identity,
-                1 => components.into_iter().next().expect("len checked"),
-                _ => Expr::Pipe(components),
-            }
-        })
-        .collect())
+    fn assemble(branches: Vec<PathBranch>) -> Vec<Expr> {
+        branches
+            .into_iter()
+            .map(|(components, _)| {
+                let components: Vec<Expr> = components
+                    .into_iter()
+                    .map(strip_resolved_optional)
+                    .collect();
+                match components.len() {
+                    0 => Expr::Identity,
+                    1 => components.into_iter().next().expect("len checked"),
+                    _ => Expr::Pipe(components),
+                }
+            })
+            .collect()
+    }
+
+    match resolve_node::<S>(expr, input) {
+        Ok(branches) => Ok(assemble(branches)),
+        Err((prefix, e)) => Err((assemble(prefix), e)),
+    }
 }
 
 /// Drop any `Expr::Optional` wrapper a resolved path component still
@@ -10457,15 +10737,28 @@ fn builtin_path<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // Computed keys must become static components before the tracker runs — it
     // ignores anything it does not recognise, so an unresolved one would
     // silently yield no paths at all.
-    let exprs = match resolve_dynamic_indexes::<S>(expr, &owned) {
-        Ok(exprs) => exprs,
-        Err(e) => return QueryResult::Error(e),
+    //
+    // A resolve-time failure partway through several siblings (`path(.a,
+    // 1)`, `path(.a, .b[0])`, ...) still carries whatever resolved before it
+    // — jq's own generator never un-emits an output already produced before
+    // a later one errors (confirmed live) — so that prefix is walked below
+    // exactly like a successful resolution, and only the *error* is deferred
+    // to the end.
+    let (exprs, resolve_error) = match resolve_dynamic_indexes::<S>(expr, &owned) {
+        Ok(exprs) => (exprs, None),
+        Err((exprs, e)) => (exprs, Some(e)),
     };
 
     let mut reached = Vec::new();
+    let mut walk_error = None;
     for expr in &exprs {
+        // A later walk-time failure (an unindexable step reached only once
+        // the expression is concretely walked) needs the same treatment:
+        // whatever earlier resolved expressions already streamed into
+        // `reached` survives, and only this one stops the walk.
         if let Err(e) = walk_path::<S>(expr, &owned, &[], &mut reached, optional) {
-            return QueryResult::Error(e);
+            walk_error = Some(e);
+            break;
         }
     }
 
@@ -10473,6 +10766,14 @@ fn builtin_path<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         .into_iter()
         .map(|(path, _)| OwnedValue::Array(path))
         .collect();
+
+    if let Some(e) = walk_error.or(resolve_error) {
+        return if paths.is_empty() {
+            QueryResult::Error(e)
+        } else {
+            partial(paths, Control::Error(e))
+        };
+    }
 
     match paths.len() {
         // "No paths at all" is *no output*, never `Array(vec![])`. The empty
@@ -11871,8 +12172,8 @@ fn builtin_del<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // `resolve_dynamic_indexes`).
     let paths = match resolve_dynamic_indexes::<S>(path_expr, &result) {
         Ok(paths) => paths,
-        Err(_) if optional => return QueryResult::None,
-        Err(e) => return QueryResult::Error(e),
+        Err((_, _)) if optional => return QueryResult::None,
+        Err((_, e)) => return QueryResult::Error(e),
     };
 
     // The overwhelmingly common case — no computed key at all, or one that
@@ -22802,6 +23103,134 @@ mod tests {
                 QueryResult::Error(e) => assert_eq!(e.message, message, "{filter}")
             );
         }
+    }
+
+    /// #483: shapes `resolve_node` already knew how to resolve, but that
+    /// `needs_path_prepass`'s old whitelist never routed to it, plus the
+    /// combinators added alongside the fix (`first`, `if`, `//`, `limit`,
+    /// `try`, `label`, `as`, static `getpath`). Every expectation here is
+    /// captured from real jq 1.7.1 and mirrored as a golden fixture under
+    /// `tests/data/jq-golden/cases/path_*`.
+    #[test]
+    fn test_path_resolves_recursive_descent_recurse_select_and_typeof() {
+        let doc = br#"{"a":{"b":1},"c":2}"#;
+        assert_eq!(
+            outputs(doc, "[path(..)]"),
+            [r#"[[],["a"],["a","b"],["c"]]"#]
+        );
+        assert_eq!(
+            outputs(doc, "[path(recurse)]"),
+            [r#"[[],["a"],["a","b"],["c"]]"#]
+        );
+        assert_eq!(
+            outputs(doc, "[path(.. | numbers)]"),
+            [r#"[["a","b"],["c"]]"#]
+        );
+        assert_eq!(
+            outputs(doc, r#"[path(.[] | select(type=="number"))]"#),
+            [r#"[["c"]]"#]
+        );
+        // The write-side operators share the same resolver, so they now
+        // succeed instead of refusing these same shapes outright.
+        query!(doc, "(.. | numbers) = 9",
+            QueryResult::Owned(v) => assert_eq!(v.to_json(), r#"{"a":{"b":9},"c":9}"#)
+        );
+        query!(doc, "del(.. | numbers)",
+            QueryResult::Owned(v) => assert_eq!(v.to_json(), r#"{"a":{}}"#)
+        );
+    }
+
+    #[test]
+    fn test_path_resolves_transparent_control_flow_combinators() {
+        let doc = br#"{"a":{"b":1},"c":[1,2]}"#;
+        assert_eq!(outputs(doc, "[path(first(.a,.c))]"), [r#"[["a"]]"#]);
+        assert_eq!(
+            outputs(doc, "[path(if true then .a else .c end)]"),
+            [r#"[["a"]]"#]
+        );
+        assert_eq!(outputs(doc, "[path(.a // .c)]"), [r#"[["a"]]"#]);
+        assert_eq!(outputs(doc, "[path(limit(1; .a))]"), [r#"[["a"]]"#]);
+        assert_eq!(outputs(doc, "[path(try .a)]"), [r#"[["a"]]"#]);
+        assert_eq!(outputs(doc, "[path(label $out | .a)]"), [r#"[["a"]]"#]);
+        assert_eq!(outputs(doc, "[path(.a as $x | .c)]"), [r#"[["c"]]"#]);
+        assert_eq!(outputs(doc, r#"[path(getpath(["a"]))]"#), [r#"[["a"]]"#]);
+    }
+
+    /// #530: a filter that is not a path expression at all — as opposed to
+    /// one jq recognises but this resolver does not (#483) — raises jq's own
+    /// sentence by name instead of answering `[]`.
+    #[test]
+    // `"path({a:1})"` is a jq filter literal, not a formatting string; clippy
+    // cannot tell the two apart from the brace shape alone.
+    #[allow(clippy::literal_string_with_formatting_args)]
+    fn test_path_of_a_non_path_expression_raises_invalid_path_expression() {
+        for (filter, message) in [
+            ("path(1)", "Invalid path expression with result 1"),
+            ("path(length)", "Invalid path expression with result 1"),
+            ("path(keys)", r#"Invalid path expression with result ["a"]"#),
+            ("path(.a + 1)", "Invalid path expression with result 2"),
+            (
+                "path(.a | tostring)",
+                r#"Invalid path expression with result "1""#,
+            ),
+            (
+                "path({a:1})",
+                r#"Invalid path expression with result {"a":1}"#,
+            ),
+        ] {
+            query!(br#"{"a":1}"#, filter,
+                QueryResult::Error(e) => assert_eq!(e.message, message, "{filter}")
+            );
+        }
+    }
+
+    /// `?` does not suppress `invalid_path_expression` — it is a statement
+    /// about the filter, not a value error raised while collecting a path
+    /// (confirmed live against jq 1.7.1: `path(("a")?)` still raises there).
+    /// `try` (with or without a `catch`) is the same rule under its other
+    /// spelling.
+    #[test]
+    fn test_invalid_path_expression_survives_optional_and_try() {
+        for filter in ["path((\"a\")?)", "path(try 1)", "path(try 1 catch \"x\")"] {
+            query!(br#"{"a":1}"#, filter,
+                QueryResult::Error(e) => {
+                    assert!(e.is_invalid_path_expression(), "{filter}: {}", e.message);
+                }
+            );
+        }
+    }
+
+    /// #530's sibling fix: `path()` streams every output its argument
+    /// produces as it resolves them, so a later sibling erroring does not
+    /// erase an earlier one that already succeeded — jq's own generator
+    /// semantics never "un-emit" an output. Verified against jq 1.7.1:
+    /// `path(.a, 1)` prints `["a"]` then raises; `(.a, .b[0])?` prints
+    /// `["a"]` and silently stops.
+    #[test]
+    fn test_path_keeps_the_prefix_before_a_later_sibling_errors() {
+        query!(br#"{"a":1}"#, "path(.a, 1)",
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(prefix_json(&vs), [r#"["a"]"#]);
+                assert_eq!(e.message, "Invalid path expression with result 1");
+            }
+        );
+        query!(br#"{"a":1,"b":"x"}"#, "path(.a, .b[0])",
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(prefix_json(&vs), [r#"["a"]"#]);
+                assert_eq!(e.message, "Cannot index string with number");
+            }
+        );
+        // `?` keeps the same prefix but swallows the error entirely.
+        assert_eq!(
+            outputs(br#"{"a":1,"b":"x"}"#, "[path((.a, .b[0])?)]"),
+            [r#"[["a"]]"#]
+        );
+        // `=`/`|=`/`del()` stay atomic: jq resolves every path against the
+        // original document before writing any of them, so one bad sibling
+        // means nothing is written at all — no partial prefix here.
+        query!(br#"{"a":1}"#, "(.a, 1) = 5",
+            QueryResult::Error(e) => assert_eq!(e.message, "Invalid path expression with result 1")
+        );
     }
 
     #[test]

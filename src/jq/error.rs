@@ -401,6 +401,39 @@ impl EvalError {
         Self::new(format!("Cannot iterate over {}", describe(value)))
     }
 
+    /// `Invalid path expression with result <value>` (#530).
+    ///
+    /// Raised by `path()` when the filter it was given is not a path
+    /// expression at all — `path(1)`, `path(length)`, `path({a:1})` — rather
+    /// than one jq recognises but leaves unresolved. Unlike the `describe`-
+    /// shaped messages above, jq embeds the bare dump here, not
+    /// `<type> (<dump>)`: `path(1)` reports `result 1`, not
+    /// `result number (1)`. The dump is truncated the same way every other
+    /// embedded value is (jq's shared `jv_dump_string_trunc`), so a long
+    /// result still previews to [`DUMP_KEEP`] bytes.
+    pub fn invalid_path_expression(value: &OwnedValue) -> Self {
+        Self::new(format!(
+            "{}{}",
+            Self::INVALID_PATH_EXPRESSION_PREFIX,
+            dump_truncated(value)
+        ))
+    }
+
+    const INVALID_PATH_EXPRESSION_PREFIX: &'static str = "Invalid path expression with result ";
+
+    /// Whether this is an [`Self::invalid_path_expression`] — a statement
+    /// that the *filter* is not a path expression, not a runtime value
+    /// error. `?` only suppresses failures raised while collecting a path
+    /// (a missing key, an out-of-range index, ...); this survives it, the
+    /// same way [`Self::is_negative_index_out_of_bounds`] does for the write
+    /// side (#530: confirmed live — `path(("a")?)` still raises in jq). The
+    /// lone call site that needs to tell the two apart is `resolve_node`'s
+    /// bare-`?` arm in `eval.rs`.
+    pub fn is_invalid_path_expression(&self) -> bool {
+        self.message
+            .starts_with(Self::INVALID_PATH_EXPRESSION_PREFIX)
+    }
+
     /// `Cannot check whether <container> has a <key type> key`.
     pub fn cannot_check_has(container_type: &str, key_type: &str) -> Self {
         Self::new(format!(
@@ -602,6 +635,32 @@ mod tests {
         assert_eq!(
             EvalError::cannot_index("object", &OwnedValue::Null).message,
             "Cannot index object with null"
+        );
+    }
+
+    /// `path(1)` reports `result 1`, not `result number (1)` — the bare
+    /// dump, unlike `describe`'s `<type> (<dump>)` shape used elsewhere.
+    #[test]
+    fn invalid_path_expression_embeds_the_bare_dump() {
+        assert_eq!(
+            EvalError::invalid_path_expression(&OwnedValue::Int(1)).message,
+            "Invalid path expression with result 1"
+        );
+        assert_eq!(
+            EvalError::invalid_path_expression(&s("ab")).message,
+            "Invalid path expression with result \"ab\""
+        );
+    }
+
+    /// Long results are truncated the same way every other embedded value is:
+    /// 11 bytes of the dump (opening quote plus 10 characters here) then `...`.
+    #[test]
+    fn invalid_path_expression_truncates_a_long_result() {
+        let long = "a".repeat(20);
+        let kept: String = "a".repeat(10);
+        assert_eq!(
+            EvalError::invalid_path_expression(&s(&long)).message,
+            format!("Invalid path expression with result \"{kept}...")
         );
     }
 
