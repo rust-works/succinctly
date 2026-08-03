@@ -44,8 +44,9 @@ happen in scans of 4+ words**. Counting calls alone would have rejected this;
 counting work said proceed. That is why `select-stats` reports both.
 
 Four of the five scan sites recorded nothing at all — `BitVec::select1`,
-`WithSelect::select1` and `EliasFano::select1` are reached only by `locate`
-tooling or have no in-crate consumer.
+BP's select support (`WithSelect::select1`, superseded by `WithCsPoppy::select1`
+in #64) and `EliasFano::select1` are reached only by `locate` tooling or have no
+in-crate consumer.
 
 ## Step 2: the kernel, and the crossover
 

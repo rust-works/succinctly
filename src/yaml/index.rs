@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 
 use core::cell::OnceCell;
 
-use crate::trees::{BalancedParens, WithSelect};
+use crate::trees::{BalancedParens, WithCsPoppy};
 use crate::util::broadword::select_in_word;
 
 use super::advance_positions::{build_cumulative_rank, OpenPositions};
@@ -29,7 +29,7 @@ use super::starts_seq_entry;
 /// - `Vec<u64>` for owned data (built from YAML text)
 /// - `&[u64]` for borrowed data (e.g., from mmap)
 ///
-/// Unlike JSON, YAML uses `WithSelect` for the balanced parentheses structure
+/// Unlike JSON, YAML uses [`WithCsPoppy`] for the balanced parentheses structure
 /// because YAML has more BP opens than IB bits (containers don't have IB bits),
 /// requiring efficient select1 queries for offset-to-BP lookups.
 #[derive(Clone, Debug)]
@@ -41,8 +41,8 @@ pub struct YamlIndex<W = Vec<u64>> {
     /// Cumulative popcount for IB. O(1) rank via single array lookup.
     ib_rank: Vec<u32>,
     /// Balanced parentheses - encodes the YAML structure as a tree.
-    /// Uses WithSelect for O(1) select1 queries needed by find_bp_at_text_pos.
-    bp: BalancedParens<W, WithSelect>,
+    /// Uses WithCsPoppy for O(1) select1 queries needed by find_bp_at_text_pos.
+    bp: BalancedParens<W, WithCsPoppy>,
     /// Type bits - 0 = mapping, 1 = sequence at each container position
     ty: W,
     /// Number of valid bits in TY
@@ -119,7 +119,7 @@ impl YamlIndex<Vec<u64>> {
             ib: semi.ib,
             ib_len,
             ib_rank,
-            bp: BalancedParens::new_with_select(semi.bp, semi.bp_len),
+            bp: BalancedParens::new_with_cspoppy(semi.bp, semi.bp_len),
             ty: semi.ty,
             ty_len: semi.ty_len,
             open_positions,
@@ -170,7 +170,7 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
             ib,
             ib_len,
             ib_rank,
-            bp: BalancedParens::from_words_with_select(bp, bp_len),
+            bp: BalancedParens::from_words_with_cspoppy(bp, bp_len),
             ty,
             ty_len,
             open_positions,
@@ -248,7 +248,7 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
 
     /// Get a reference to the balanced parentheses.
     #[inline]
-    pub fn bp(&self) -> &BalancedParens<W, WithSelect> {
+    pub fn bp(&self) -> &BalancedParens<W, WithCsPoppy> {
         &self.bp
     }
 

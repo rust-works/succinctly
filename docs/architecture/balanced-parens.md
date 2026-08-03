@@ -45,7 +45,7 @@ pub struct BalancedParens<W = Vec<u64>, S: SelectSupport = NoSelect> {
     rank_l1: Vec<u32>,         // absolute count per 512-bit block
     rank_l2: Vec<u64>,         // 7 x 9-bit within-block offsets
 
-    select: S,                 // ZST for NoSelect; SelectIndex for WithSelect (P11)
+    select: S,                 // ZST for NoSelect; WithCsPoppy (#64) or deprecated WithSelect (P11)
 }
 ```
 
@@ -131,7 +131,9 @@ See [SIMD Optimizations](../optimizations/simd.md#x86-sse41-horizontal-minimum-p
 
 `BalancedParens<W, S>` is generic over select support:
 - `NoSelect` (ZST) — used by JSON, zero overhead
-- `WithSelect` — used by YAML for `at_offset`/`yq-locate`, enables O(1) sampled select1
+- `WithCsPoppy` — used by YAML for `at_offset`/`yq-locate`: combined-sampling select1 that
+  reads entry points into BP's own rank directory instead of a parallel sampled index (#64)
+- `WithSelect` — deprecated in favour of `WithCsPoppy`; sampled `(word, cumulative)` pairs (P11)
 
 ## Used By
 
