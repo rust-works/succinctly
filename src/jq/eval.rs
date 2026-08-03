@@ -8086,23 +8086,27 @@ fn push_recursive_branches(prefix: &[Expr], value: &OwnedValue, out: &mut Vec<Pa
 /// Fan `recurse(f)` / `recurse(f; cond)` out into one branch per visited
 /// node. Follows `builtin_recurse_f`/`builtin_recurse_cond`'s breadth-first
 /// queue — including swallowing `f`'s errors, a falsy `cond` pruning rather
-/// than propagating, not queueing a null child, and the `MAX_ITEMS` cutoff —
-/// but resolves `f` through [`resolve_node`] at each step instead of
-/// [`eval_owned_expr`], so every queued value carries the path components that
-/// reach it.
+/// than propagating, and the `MAX_ITEMS` cutoff — but resolves `f` through
+/// [`resolve_node`] at each step instead of [`eval_owned_multi`], so every
+/// queued value carries the path components that reach it. Since #490,
+/// `builtin_recurse_f`/`builtin_recurse_cond` also resolve `f` through
+/// [`eval_owned_multi`] and agree with this function on not flattening an
+/// array-valued child into its elements.
 ///
-/// Not queueing a null child is the load-bearing one. `f` is arbitrary and
+/// One divergence remains, deliberately: this function still does not queue
+/// a null child, where the value evaluator now does. `f` is arbitrary and
 /// nothing says it makes progress: `recurse(.a?)` over `{"a":null}` reads
-/// `null` from `null` forever, and the queue would run to `MAX_ITEMS` with a
-/// prefix one component longer each round — quadratic, and measured at 9 GB
-/// for an 18-byte document before this guard existed.
-///
-/// One difference from those two is deliberate. When `f` yields an array they
-/// queue its *elements* (`queue.extend(arr)`), an artefact of
-/// [`eval_owned_expr`] collapsing a stream into one array — so `[recurse(.a?)]`
-/// descends into an array-valued `.a` where jq stops at the array itself.
-/// Resolving through [`resolve_node`] keeps the array, which is jq's answer;
-/// mirroring the value path here would mean mirroring its bug.
+/// `null` from `null` forever (confirmed hanging in real jq too — this is
+/// jq's actual semantics, not a bug). The value evaluator's queue holds bare
+/// `OwnedValue`s, so `MAX_ITEMS` bounds it in O(`MAX_ITEMS`) total. This
+/// function's queue holds `(path, value)` pairs, so the same non-terminating
+/// `f` would run to `MAX_ITEMS` with a prefix one component longer each
+/// round — quadratic, and measured at 9 GB for an 18-byte document before
+/// this guard existed. So the two evaluators can now disagree on this one
+/// adversarial shape (path-tracking prunes the null and stops; value
+/// evaluation runs to `MAX_ITEMS`) — both already deviate from unbounded
+/// true-jq semantics via their own `MAX_ITEMS`, so this is a narrower gap,
+/// not a new class of one.
 fn resolve_recurse<S: EvalSemantics>(
     f: &Expr,
     cond: Option<&Expr>,
@@ -8126,9 +8130,9 @@ fn resolve_recurse<S: EvalSemantics>(
         outputs.push((prefix.clone(), current.clone()));
 
         for (child_components, child_value) in resolve_node::<S>(f, &current).unwrap_or_default() {
-            // `builtin_recurse_f`'s `Ok(v) if !matches!(v, OwnedValue::Null)`:
-            // a null child ends that line of descent. See the note above on
-            // why this is what bounds the queue at all.
+            // A null child ends that line of descent here, unlike the value
+            // evaluator since #490. See the note above on why this function
+            // keeps the guard: it bounds path-prefix growth, not just count.
             if matches!(child_value, OwnedValue::Null) {
                 continue;
             }
@@ -9920,15 +9924,11 @@ fn builtin_recurse_f<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         let current = queue.remove(0);
         outputs.push(current.clone());
 
-        // Apply f to get children
-        match eval_owned_expr::<S>(f, &current, true) {
-            Ok(OwnedValue::Array(arr)) => {
-                queue.extend(arr);
-            }
-            Ok(v) if !matches!(v, OwnedValue::Null) => {
-                queue.push(v);
-            }
-            _ => {}
+        // Every output of `f` becomes exactly one queued child, in order — a
+        // null output is a real value (not "no child"), and an array output
+        // is visited as one node (not spliced into its elements) (#490).
+        if let Ok(children) = eval_owned_multi::<S>(f, &current) {
+            queue.extend(children);
         }
     }
 
@@ -9967,15 +9967,11 @@ fn builtin_recurse_cond<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
         outputs.push(current.clone());
 
-        // Apply f to get children
-        match eval_owned_expr::<S>(f, &current, true) {
-            Ok(OwnedValue::Array(arr)) => {
-                queue.extend(arr);
-            }
-            Ok(v) if !matches!(v, OwnedValue::Null) => {
-                queue.push(v);
-            }
-            _ => {}
+        // Every output of `f` becomes exactly one queued child, in order — a
+        // null output is a real value (not "no child"), and an array output
+        // is visited as one node (not spliced into its elements) (#490).
+        if let Ok(children) = eval_owned_multi::<S>(f, &current) {
+            queue.extend(children);
         }
     }
 
@@ -17015,6 +17011,51 @@ mod tests {
             .iter()
             .map(OwnedValue::to_json)
             .collect()
+    }
+
+    // `eval_owned_multi`'s cardinality-preserving contract (#570), exercised
+    // directly rather than through any of the four call sites it was filed to
+    // unblock — `eval_owned_expr` collapses a multi-output result into a
+    // single value or an array; `eval_owned_multi` must not.
+
+    #[test]
+    fn eval_owned_multi_preserves_every_output_in_order() {
+        let expr = parse("1,2,3").unwrap();
+        let values = eval_owned_multi::<JqSemantics>(&expr, &OwnedValue::Null).unwrap();
+        assert_eq!(
+            values,
+            vec![OwnedValue::Int(1), OwnedValue::Int(2), OwnedValue::Int(3)]
+        );
+    }
+
+    #[test]
+    fn eval_owned_multi_keeps_a_single_array_output_as_one_element() {
+        // A single output that happens to be an array must come back as a
+        // one-element Vec containing that array, not get mistaken for
+        // multiple outputs and flattened into its elements (#490's bug in
+        // `eval_owned_expr`-based callers).
+        let expr = parse("[1,2]").unwrap();
+        let values = eval_owned_multi::<JqSemantics>(&expr, &OwnedValue::Null).unwrap();
+        assert_eq!(
+            values,
+            vec![OwnedValue::Array(vec![
+                OwnedValue::Int(1),
+                OwnedValue::Int(2)
+            ])]
+        );
+    }
+
+    #[test]
+    fn eval_owned_multi_produces_an_empty_vec_for_no_output() {
+        let expr = parse("empty").unwrap();
+        let values = eval_owned_multi::<JqSemantics>(&expr, &OwnedValue::Null).unwrap();
+        assert_eq!(values, Vec::<OwnedValue>::new());
+    }
+
+    #[test]
+    fn eval_owned_multi_propagates_an_error() {
+        let expr = parse(r#"error("boom")"#).unwrap();
+        assert!(eval_owned_multi::<JqSemantics>(&expr, &OwnedValue::Null).is_err());
     }
 
     #[test]
