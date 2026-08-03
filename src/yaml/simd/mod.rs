@@ -216,10 +216,16 @@ pub fn count_leading_spaces(input: &[u8], start: usize) -> usize {
 /// This is the main P0 optimization for bulk character detection.
 ///
 /// Currently only available on x86_64. Returns None on other platforms.
+///
+/// `HAS_CR` gates the `\r` mask; see [`x86::classify_yaml_chars`] for why the
+/// const has to reach this far down (#340).
 #[inline]
 #[cfg(all(target_arch = "x86_64", not(feature = "scalar-yaml")))]
-pub fn classify_yaml_chars(input: &[u8], offset: usize) -> Option<YamlCharClass> {
-    x86::classify_yaml_chars(input, offset)
+pub fn classify_yaml_chars<const HAS_CR: bool>(
+    input: &[u8],
+    offset: usize,
+) -> Option<YamlCharClass> {
+    x86::classify_yaml_chars::<HAS_CR>(input, offset)
 }
 
 /// Classify 16 bytes of YAML structural characters using broadword (SWAR).

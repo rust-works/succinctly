@@ -1,24 +1,30 @@
 #![allow(unsafe_code)] // runtime SIMD feature dispatch for escape scanning
-//! Shared SIMD escape scanning.
+//! Shared SIMD byte scanning.
 //!
-//! Finds the next byte in a string that a text format would need to *escape* —
-//! the hot inner loop of streaming-output transcoders. Historically this lived in
-//! `yaml/simd/` while `jq/stream.rs` consumed it, making jq depend on yaml
-//! internals (#125). It now lives here as a neutral, shared utility that any
-//! consumer (jq streaming, jq/yq output escaping in #91, jq format functions in
-//! #124) can use without a cross-module dependency.
+//! Finds the next byte in a buffer matching a predicate. The original consumer —
+//! and the reason for the module's name — is "the next byte a text format would
+//! need to *escape*", the hot inner loop of streaming-output transcoders.
+//! Historically this lived in `yaml/simd/` while `jq/stream.rs` consumed it,
+//! making jq depend on yaml internals (#125). It now lives here as a neutral,
+//! shared utility that any consumer (jq streaming, jq/yq output escaping in #91,
+//! jq format functions in #124) can use without a cross-module dependency.
 //!
 //! ## The predicate seam
 //!
 //! The scanning machinery — the 16/32-byte SIMD chunk loop, the movemask +
 //! `trailing_zeros` position extraction, and the scalar remainder — is identical
-//! across escape predicates; only the *set of bytes considered special* differs
+//! across predicates; only the *set of bytes considered special* differs
 //! (JSON escapes `"` / `\` / `< 0x20`; a future `@html` scanner would want
 //! `<` / `>` / `&` / `'` / `"`, etc.). [`define_escape_scanner!`] captures the
 //! machinery once and takes the predicate as a parameter: a scalar `|b| ...`
 //! expression plus three per-backend mask helpers (NEON / AVX2 / SSE2). Adding a
 //! new scanner (#124) is a new macro invocation, not another refactor of this
-//! file. Only [`find_json_escape`] is instantiated today.
+//! file. [`find_json_escape`] is its only instantiation.
+//!
+//! [`contains_cr`] also lives here, but is hand-written rather than generated:
+//! it answers "is there a match anywhere" rather than "where is the first one",
+//! and skipping the per-chunk position extraction is worth several times the
+//! throughput. See the comment above its kernels (#340).
 //!
 //! ## Dispatch
 //!
@@ -403,6 +409,190 @@ pub fn find_json_escape(bytes: &[u8], start: usize) -> usize {
     json_escape::find(bytes, start)
 }
 
+// ---- Carriage-return existence scan -----------------------------------------
+//
+// The `has_cr` precheck the YAML oracle uses to pick its `HAS_CR`
+// monomorphization (#340). Deliberately NOT a `define_escape_scanner!`
+// instantiation, even though the predicate would fit in one line there.
+//
+// That machinery answers "where is the first match", and paying for the position
+// is what made the first attempt at this too slow to ship. Its per-chunk cost is
+// dominated by extracting a bitmask — on NEON that is the shift/multiply
+// movemask emulation, roughly eleven operations per sixteen bytes. The precheck
+// does not want a position; it wants one bit for the whole buffer. So it ORs the
+// per-chunk compares together and reduces once, which lets it run four chunks
+// per iteration and touch the reduction once per 64 (NEON/SSE2) or 128 (AVX2)
+// bytes.
+//
+// The difference is not academic. `yaml_bench`'s `long_strings/4096b` is 410 KB
+// that the parser bulk-skips at ~15 GB/s, so index build is ~28 µs; a
+// position-finding precheck added ~12 µs to that — a 42% regression on the very
+// benchmark the specialization was supposed to leave alone.
+//
+// The loop still early-exits, which costs nothing in the common case (a CR-free
+// document is scanned to the end either way) and helps CRLF documents, which
+// usually hit a `\r` in the first line.
+
+/// NEON: 64 bytes per iteration, one horizontal reduce.
+#[cfg(all(
+    target_arch = "aarch64",
+    not(feature = "broadword-yaml"),
+    not(feature = "scalar-yaml")
+))]
+#[target_feature(enable = "neon")]
+unsafe fn contains_cr_neon(bytes: &[u8]) -> bool {
+    let needle = vdupq_n_u8(b'\r');
+    let p = bytes.as_ptr();
+    let n = bytes.len();
+    let mut i = 0;
+
+    while i + 64 <= n {
+        let m = vorrq_u8(
+            vorrq_u8(
+                vceqq_u8(vld1q_u8(p.add(i)), needle),
+                vceqq_u8(vld1q_u8(p.add(i + 16)), needle),
+            ),
+            vorrq_u8(
+                vceqq_u8(vld1q_u8(p.add(i + 32)), needle),
+                vceqq_u8(vld1q_u8(p.add(i + 48)), needle),
+            ),
+        );
+        if vmaxvq_u8(m) != 0 {
+            return true;
+        }
+        i += 64;
+    }
+    while i + 16 <= n {
+        if vmaxvq_u8(vceqq_u8(vld1q_u8(p.add(i)), needle)) != 0 {
+            return true;
+        }
+        i += 16;
+    }
+    bytes[i..].contains(&b'\r')
+}
+
+/// AVX2: 128 bytes per iteration, one `vptest`.
+#[cfg(all(
+    target_arch = "x86_64",
+    not(feature = "scalar-yaml"),
+    any(test, feature = "std")
+))]
+#[target_feature(enable = "avx2")]
+unsafe fn contains_cr_avx2(bytes: &[u8]) -> bool {
+    let needle = _mm256_set1_epi8(b'\r' as i8);
+    let p = bytes.as_ptr();
+    let n = bytes.len();
+    let mut i = 0;
+
+    while i + 128 <= n {
+        let load = |off: usize| _mm256_loadu_si256(p.add(i + off).cast::<__m256i>());
+        let m = _mm256_or_si256(
+            _mm256_or_si256(
+                _mm256_cmpeq_epi8(load(0), needle),
+                _mm256_cmpeq_epi8(load(32), needle),
+            ),
+            _mm256_or_si256(
+                _mm256_cmpeq_epi8(load(64), needle),
+                _mm256_cmpeq_epi8(load(96), needle),
+            ),
+        );
+        // testz sets ZF when the AND is all-zero; m & m == m, so ZF == "no match".
+        if _mm256_testz_si256(m, m) == 0 {
+            return true;
+        }
+        i += 128;
+    }
+    while i + 32 <= n {
+        let m = _mm256_cmpeq_epi8(_mm256_loadu_si256(p.add(i).cast::<__m256i>()), needle);
+        if _mm256_testz_si256(m, m) == 0 {
+            return true;
+        }
+        i += 32;
+    }
+    bytes[i..].contains(&b'\r')
+}
+
+/// SSE2 baseline: 64 bytes per iteration, one movemask.
+#[cfg(all(target_arch = "x86_64", not(feature = "scalar-yaml")))]
+#[target_feature(enable = "sse2")]
+unsafe fn contains_cr_sse2(bytes: &[u8]) -> bool {
+    let needle = _mm_set1_epi8(b'\r' as i8);
+    let p = bytes.as_ptr();
+    let n = bytes.len();
+    let mut i = 0;
+
+    while i + 64 <= n {
+        let load = |off: usize| _mm_loadu_si128(p.add(i + off).cast::<__m128i>());
+        let m = _mm_or_si128(
+            _mm_or_si128(
+                _mm_cmpeq_epi8(load(0), needle),
+                _mm_cmpeq_epi8(load(16), needle),
+            ),
+            _mm_or_si128(
+                _mm_cmpeq_epi8(load(32), needle),
+                _mm_cmpeq_epi8(load(48), needle),
+            ),
+        );
+        if _mm_movemask_epi8(m) != 0 {
+            return true;
+        }
+        i += 64;
+    }
+    while i + 16 <= n {
+        let m = _mm_cmpeq_epi8(_mm_loadu_si128(p.add(i).cast::<__m128i>()), needle);
+        if _mm_movemask_epi8(m) != 0 {
+            return true;
+        }
+        i += 16;
+    }
+    bytes[i..].contains(&b'\r')
+}
+
+/// Does `input` contain a carriage return anywhere?
+///
+/// The YAML oracle calls this once per document to choose between its two
+/// `HAS_CR` monomorphizations (#340). A `false` answer means every `\r` arm in
+/// the parser is provably dead for this input, so the LF-only specialization can
+/// drop them and keep the pre-#324 codegen.
+///
+/// This runs on every `YamlIndex::build`, including the ones it cannot help, so
+/// its cost is charged against documents that never see a `\r`. See the note
+/// above the kernels for why it is hand-written rather than macro-generated.
+#[inline]
+pub fn contains_cr(input: &[u8]) -> bool {
+    #[cfg(all(
+        target_arch = "aarch64",
+        not(feature = "broadword-yaml"),
+        not(feature = "scalar-yaml")
+    ))]
+    {
+        // SAFETY: NEON is mandatory on aarch64.
+        unsafe { contains_cr_neon(input) }
+    }
+
+    #[cfg(all(target_arch = "x86_64", not(feature = "scalar-yaml")))]
+    {
+        #[cfg(any(test, feature = "std"))]
+        if avx2_enabled() {
+            // SAFETY: guarded by runtime detection.
+            return unsafe { contains_cr_avx2(input) };
+        }
+        // SAFETY: SSE2 is the x86_64 baseline.
+        unsafe { contains_cr_sse2(input) }
+    }
+
+    // Scalar: under `scalar-yaml`, on aarch64 under `broadword-yaml` (no
+    // broadword kernel here), and on every other target.
+    #[cfg(any(
+        feature = "scalar-yaml",
+        all(target_arch = "aarch64", feature = "broadword-yaml"),
+        not(any(target_arch = "aarch64", target_arch = "x86_64"))
+    ))]
+    {
+        input.contains(&b'\r')
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -752,6 +942,147 @@ mod tests {
         fn neon_returns_len_when_start_past_end() {
             // The kernel's own `start >= len` guard, not reached through find().
             assert_eq!(super::super::json_escape::neon(b"abc", 9), 3);
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // The `has_cr` precheck (#340).
+    //
+    // Both directions of a wrong answer matter, and only one of them is loud.
+    // Under-reporting (`false` when a `\r` is present) sends a CRLF document down
+    // the LF-only parser and silently corrupts it — `tests/yaml_crlf_tests.rs` and
+    // the CRLF/CR reruns in `tests/yq_golden_tests.rs` catch that. Over-reporting
+    // (`true` for a CR-free document) is *correct* and merely gives up the whole
+    // optimization, so nothing else in the suite would notice; that is what these
+    // exact-agreement tests are for.
+    // ------------------------------------------------------------------------
+    mod cr_precheck {
+        use super::super::contains_cr;
+
+        /// Independent reference, deliberately not `cr_scan::scalar`.
+        fn reference(bytes: &[u8]) -> bool {
+            bytes.contains(&b'\r')
+        }
+
+        #[test]
+        fn agrees_with_reference_on_shapes() {
+            let cases: Vec<Vec<u8>> = vec![
+                b"".to_vec(),
+                b"\r".to_vec(),
+                b"\n".to_vec(),
+                b"a: 1\n".to_vec(),
+                b"a: 1\r\n".to_vec(),
+                b"a: 1\rb: 2".to_vec(),
+                b"no breaks at all".to_vec(),
+                vec![b'a'; 1000],
+                // 0x0A and 0x0D differ in one bit; a mask built for the wrong
+                // constant would still "find line breaks" and read as working.
+                b"lots\nof\nline\nfeeds\nbut\nno\ncarriage\nreturns\n".to_vec(),
+            ];
+            for input in &cases {
+                assert_eq!(
+                    reference(input),
+                    contains_cr(input),
+                    "mismatch for {input:?}"
+                );
+            }
+        }
+
+        /// A `\r` anywhere must be seen, whichever kernel path covers that offset.
+        ///
+        /// The lengths straddle every boundary in the three kernels: the 64-byte
+        /// NEON/SSE2 main loop, the 128-byte AVX2 one, their 16- and 32-byte
+        /// secondary loops, and the scalar remainder past both. A `\r` living only
+        /// in a tail the main loop does not reach is exactly the miss that would
+        /// send a CRLF document down the LF-only parser.
+        #[test]
+        fn finds_a_cr_at_every_offset_and_length() {
+            for len in [
+                0usize, 1, 15, 16, 17, 31, 32, 33, 47, 48, 63, 64, 65, 95, 96, 127, 128, 129, 191,
+                256, 257,
+            ] {
+                let clean = vec![b'a'; len];
+                assert!(!contains_cr(&clean), "false positive at len {len}");
+                for pos in 0..len {
+                    let mut input = clean.clone();
+                    input[pos] = b'\r';
+                    assert!(contains_cr(&input), "missed CR at {pos} of {len}");
+                }
+            }
+        }
+
+        /// No other byte may be mistaken for `\r` — in particular not `\n`.
+        #[test]
+        fn no_other_byte_reports_as_cr() {
+            for byte in 0u8..=255 {
+                for pos in [0usize, 15, 16, 31, 32, 40] {
+                    let mut input = vec![b'a'; 48];
+                    input[pos] = byte;
+                    assert_eq!(
+                        byte == b'\r',
+                        contains_cr(&input),
+                        "byte {byte:#04x} at {pos}"
+                    );
+                }
+            }
+        }
+
+        /// Every kernel directly, not just the one this CPU dispatches to.
+        ///
+        /// `contains_cr` picks a single backend per machine, so on an AVX2 runner
+        /// the SSE2 kernel is never exercised by the tests above and on any x86
+        /// box the NEON one is not compiled at all (#193). Sweep each available
+        /// kernel over the same offsets the dispatcher test uses.
+        #[test]
+        fn every_available_kernel_agrees() {
+            let lengths = [0usize, 15, 16, 31, 33, 63, 64, 65, 127, 128, 130];
+
+            for len in lengths {
+                let clean = vec![b'a'; len];
+                let mut inputs = vec![(clean.clone(), false)];
+                for pos in 0..len {
+                    let mut dirty = clean.clone();
+                    dirty[pos] = b'\r';
+                    inputs.push((dirty, true));
+                }
+
+                for (input, want) in &inputs {
+                    #[cfg(all(
+                        target_arch = "aarch64",
+                        not(feature = "broadword-yaml"),
+                        not(feature = "scalar-yaml")
+                    ))]
+                    {
+                        // SAFETY: NEON is mandatory on aarch64.
+                        assert_eq!(
+                            unsafe { super::super::contains_cr_neon(input) },
+                            *want,
+                            "NEON, len {len}"
+                        );
+                    }
+                    #[cfg(all(target_arch = "x86_64", not(feature = "scalar-yaml")))]
+                    {
+                        // SAFETY: SSE2 is the x86_64 baseline.
+                        assert_eq!(
+                            unsafe { super::super::contains_cr_sse2(input) },
+                            *want,
+                            "SSE2, len {len}"
+                        );
+                        if crate::util::simd::note_simd_skip_unless(
+                            is_x86_feature_detected!("avx2"),
+                            "avx2",
+                        ) {
+                            // SAFETY: guarded by runtime detection.
+                            assert_eq!(
+                                unsafe { super::super::contains_cr_avx2(input) },
+                                *want,
+                                "AVX2, len {len}"
+                            );
+                        }
+                    }
+                    assert_eq!(input.contains(&b'\r'), *want, "scalar, len {len}");
+                }
+            }
         }
     }
 }

@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **YAML parsing specializes on whether the document contains a carriage return**
+  (#340), recovering most of the cost #324 paid for CRLF and lone-CR
+  correctness. `build_semi_index` runs one SIMD pass over the input and parses
+  with `Parser::<false>` or `Parser::<true>`; the LF-only monomorphization —
+  nearly every document — compiles out every `\r` arm and keeps the pre-#324
+  codegen. Interleaved `yaml_bench` versus `c5dab403`, excluding block scalars:
+  ARM (M4 Pro) +4.0% → **+0.7%**, x86 (7950X) +11.0% → **+4.7%**, with x86 block
+  scalars 31–34% *faster* than the pre-#324 baseline. End-to-end `yq` over 32
+  configurations recovers completely: x86 +5.0% → **+0.8%** median, ARM +2.3% →
+  **−0.2%**. CRLF documents are unchanged (+1.1% x86 / +0.5% ARM, the precheck
+  early-exiting). Output is byte-identical to #324 across 244 file × query
+  configurations on both architectures.
+
+  The one shape that regresses is long quoted scalars, +7% to +12%: the parser
+  bulk-skips those at ~15 GB/s, so the precheck's second pass over the input is
+  large next to the parse it precedes. That is the standing cost of the gate.
+
+  **Breaking** (low-level): `succinctly::yaml::simd::classify_yaml_chars` takes a
+  `const HAS_CR: bool` parameter — call it as `classify_yaml_chars::<true>(..)`
+  for the previous behaviour.
+
 ### Added
 
 - **jq streaming builtins `tostream`, `fromstream(f)`, `truncate_stream(f)`**
@@ -1775,8 +1798,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Correctness here has a measured price on LF input: `yaml_bench` index build is
   +14.9% median on x86 (7950X) and +6.9% on ARM (M4 Pro) excluding block scalars,
   which are 8–18% *faster* on x86; end-to-end `yq` on a 1 MB document moves
-  +1.8% (`.`) to +6.4% (`.[].name`). See `docs/parsing/yaml.md` for the
-  per-change attribution and the const-generic option that would buy it back.
+  +1.8% (`.`) to +6.4% (`.[].name`). Most of that is bought back in #340 (below);
+  see `docs/parsing/yaml.md` for the per-change attribution.
 - **YAML anchors on sequence items whose value is a collection** (#328): `- &m`
   followed by an indented mapping was read as a multi-line plain scalar, so
   `list:\n  - &m\n    k: v\n  - *m` came out as `{"list":["k"],"v":["k"]}` — a

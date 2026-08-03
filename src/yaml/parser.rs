@@ -124,7 +124,20 @@ pub struct SemiIndex {
 const MAX_NESTING_DEPTH: usize = 128;
 
 /// Parser state for the YAML-lite oracle.
-struct Parser<'a> {
+///
+/// `HAS_CR` says whether the input contains a carriage return anywhere.
+/// [`build_semi_index`] answers that with one SIMD pass before parsing and picks
+/// the matching monomorphization, so the LF-only specialization can drop every
+/// `\r` arm the CRLF correctness fix added and keep the pre-#324 codegen (#340).
+///
+/// The gate is a *performance* knob, not a correctness one, in one direction
+/// only. `HAS_CR == true` is always correct — it is exactly the #324 parser. It
+/// is `HAS_CR == false` that carries the obligation, and the precheck discharges
+/// it: no `\r` in the input means no CR arm can ever be reached, whatever the
+/// context. So a site left un-gated is merely a missed optimization, while a
+/// wrongly-`false` gate would corrupt the parse — which is why the flag is
+/// derived from the bytes rather than from any parser-state heuristic.
+struct Parser<'a, const HAS_CR: bool> {
     input: &'a [u8],
     pos: usize,
 
@@ -201,8 +214,13 @@ struct Parser<'a> {
     last_recorded_end: usize,
 }
 
-impl<'a> Parser<'a> {
+impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     fn new(input: &'a [u8]) -> Self {
+        debug_assert!(
+            HAS_CR || !crate::util::simd::escape::contains_cr(input),
+            "Parser::<false> built for input containing a carriage return: the \
+             LF-only specialization would silently mis-parse it (#340)"
+        );
         let ib_words = vec![0u64; input.len().div_ceil(64).max(1)];
         let bp_words = vec![0u64; input.len().div_ceil(32).max(1)]; // ~2x IB for BP
         let ty_words = vec![0u64; input.len().div_ceil(64).max(1)];
@@ -480,21 +498,69 @@ impl<'a> Parser<'a> {
         breaks + 1
     }
 
+    /// Is `b` a YAML line break, under this parser's `HAS_CR` specialization?
+    ///
+    /// Not a second spelling of [`is_line_break`] — #341 deleted that and was
+    /// right to. The `HAS_CR` arm *delegates* to it, so the rule still has one
+    /// definition; what this adds is the compile-time switch #340 needs. On a
+    /// document with no `\r` anywhere the `\r` compare is not merely never taken,
+    /// it is not emitted, and this is the per-byte test in the inlined scalar
+    /// loop where that matters.
+    #[inline]
+    fn is_break(b: u8) -> bool {
+        if HAS_CR {
+            is_line_break(b)
+        } else {
+            b == b'\n'
+        }
+    }
+
+    /// Width in bytes of the line break at `pos`, under this parser's `HAS_CR`
+    /// specialization: [`line_break_len`] when a `\r` may be present, and
+    /// otherwise the one-byte LF answer it collapses to.
+    #[inline]
+    fn break_len_at(&self, pos: usize) -> usize {
+        if HAS_CR {
+            line_break_len(self.input, pos)
+        } else {
+            usize::from(self.input.get(pos) == Some(&b'\n'))
+        }
+    }
+
     /// Is the current position at a line break?
     #[inline]
     fn at_break(&self) -> bool {
         self.peek().is_some_and(is_line_break)
     }
 
-    /// Does `next` terminate a `-` sequence indicator? That is whitespace, a
-    /// line break, or end of input.
-    ///
-    /// Delegates to the module-level definition the reader also uses, so the terminator
-    /// set has one spelling (#332). Kept as an associated fn because the guard it appears
-    /// in must stay on one line for `llvm-cov` to see it (#324).
+    /// Is `b` whitespace or a line break?
     #[inline]
-    fn is_seq_indicator_next(next: Option<u8>) -> bool {
-        super::is_seq_indicator_next(next)
+    fn is_ws_or_break(b: u8) -> bool {
+        matches!(b, b' ' | b'\t') || Self::is_break(b)
+    }
+
+    /// Does `next` terminate an indicator character — whitespace, a line break,
+    /// or end of input?
+    ///
+    /// This is the lookahead that separates a *structural* `-`/`?`/`:` from the
+    /// first byte of a plain scalar. It had seventeen inline `matches!` copies
+    /// before #340; one definition means the `HAS_CR` gate has a single place to
+    /// live and the copies cannot drift apart (#106). It also keeps the test off
+    /// its own source line, which a multi-line `matches!` in a match guard turns
+    /// into a coverage region that never reports as executed.
+    ///
+    /// This is the parser's spelling of the terminator set [`super::is_seq_indicator_next`]
+    /// gives the *reader* (#332). It cannot simply call it: the whole point of #340 is that
+    /// the `\r` arm here becomes compile-time gated, and the reader — which indexes into
+    /// text rather than scanning it under a `HAS_CR` specialization — has no such gate. The
+    /// two are therefore pinned by `is_ws_break_or_eoi_agrees_with_is_seq_indicator_next`
+    /// rather than by the compiler; change one acceptance set and that test fails.
+    #[inline]
+    fn is_ws_break_or_eoi(next: Option<u8>) -> bool {
+        match next {
+            Some(b) => Self::is_ws_or_break(b),
+            None => true,
+        }
     }
 
     /// Consume the line break at the current position, if any.
@@ -510,6 +576,13 @@ impl<'a> Parser<'a> {
     /// (#341). Change one and that test fails.
     #[inline]
     fn skip_line_break(&mut self) {
+        if !HAS_CR {
+            // Exactly the `if peek() == Some(b'\n') { advance() }` this replaced.
+            if self.input.get(self.pos) == Some(&b'\n') {
+                self.pos += 1;
+            }
+            return;
+        }
         match self.input.get(self.pos) {
             Some(b'\n') => self.pos += 1,
             Some(b'\r') => {
@@ -570,14 +643,21 @@ impl<'a> Parser<'a> {
     #[inline]
     fn skip_unquoted_simd(&self, _value_start: usize) -> Option<usize> {
         // Use classify_yaml_chars to scan 32 bytes at once
-        if let Some(class) = super::simd::classify_yaml_chars(self.input, self.pos) {
+        if let Some(class) = super::simd::classify_yaml_chars::<HAS_CR>(self.input, self.pos) {
             // Line break, colon, or hash — see `plain_scalar_terminators`, which
             // both this and the ARM variant below share so the two cannot drift
             // on what ends a scalar (#185). `\r` counts: it is a YAML 1.2 §5.4
             // line break, and without it the classifier skips straight over a
             // lone CR and swallows the rest of the document into one scalar
             // (#324).
-            let terminators = class.plain_scalar_terminators();
+            //
+            // The accessor takes the same `HAS_CR` the classifier did. Under
+            // `false` the classifier leaves `carriage_returns` zero, so the OR
+            // would be a no-op — but that promise is one the optimizer cannot
+            // verify across the `#[target_feature]` call, so the const gates
+            // both ends and the compare never reaches the instruction stream
+            // (#340).
+            let terminators = class.plain_scalar_terminators::<HAS_CR>();
 
             if terminators == 0 {
                 // No structural characters in the classified chunk — skip
@@ -719,7 +799,7 @@ impl<'a> Parser<'a> {
     fn current_column(&self) -> usize {
         // Find the start of the current line
         let mut line_start = self.pos;
-        while line_start > 0 && !is_line_break(self.input[line_start - 1]) {
+        while line_start > 0 && !Self::is_break(self.input[line_start - 1]) {
             line_start -= 1;
         }
         self.pos - line_start
@@ -730,9 +810,9 @@ impl<'a> Parser<'a> {
         let mut i = self.pos;
         while i < self.input.len() {
             match self.input[i] {
-                b'\n' | b'\r' => return true,
                 b'#' => return true, // Comment starts
                 b' ' => i += 1,
+                b if Self::is_break(b) => return true,
                 _ => return false,
             }
         }
@@ -749,7 +829,7 @@ impl<'a> Parser<'a> {
             // Empty key: `:` at start followed by whitespace/newline/EOF
             Some(b':') => {
                 let next = self.peek_at(1);
-                if matches!(next, Some(b' ' | b'\t' | b'\n' | b'\r') | None) {
+                if Self::is_ws_break_or_eoi(next) {
                     return true;
                 }
                 // Colon not followed by whitespace - continue checking
@@ -774,7 +854,7 @@ impl<'a> Parser<'a> {
                     break;
                 } else if self.input[i] == b'\\' && quote == b'"' {
                     i += 2; // Skip escape sequence in double-quoted
-                } else if is_line_break(self.input[i]) {
+                } else if Self::is_break(self.input[i]) {
                     return false; // Unclosed quote
                 } else {
                     i += 1;
@@ -791,7 +871,7 @@ impl<'a> Parser<'a> {
                 } else {
                     None
                 };
-                return matches!(next, Some(b' ' | b'\t' | b'\n' | b'\r') | None);
+                return Self::is_ws_break_or_eoi(next);
             }
             return false;
         }
@@ -799,7 +879,6 @@ impl<'a> Parser<'a> {
         // Scan for `: ` pattern in unquoted key
         while i < self.input.len() {
             match self.input[i] {
-                b'\n' | b'\r' => return false, // Line ended without finding `: `
                 b':' => {
                     // Check what follows the colon
                     let next = if i + 1 < self.input.len() {
@@ -807,11 +886,13 @@ impl<'a> Parser<'a> {
                     } else {
                         None
                     };
-                    match next {
-                        Some(b' ' | b'\t' | b'\n' | b'\r') | None => return true,
-                        _ => i += 1, // Colon not followed by whitespace, continue
+                    if Self::is_ws_break_or_eoi(next) {
+                        return true;
                     }
+                    i += 1; // Colon not followed by whitespace, continue
                 }
+                // Line ended without finding `: `
+                b if Self::is_break(b) => return false,
                 // Note: " and ' in the middle of a key are allowed (e.g., bla"keks: foo)
                 // Continue scanning past them.
                 _ => i += 1,
@@ -847,7 +928,7 @@ impl<'a> Parser<'a> {
     /// callers can consume it with `skip_line_break` (#324).
     #[inline]
     fn skip_to_eol(&mut self) {
-        while self.pos < self.input.len() && !is_line_break(self.input[self.pos]) {
+        while self.pos < self.input.len() && !Self::is_break(self.input[self.pos]) {
             self.pos += 1;
         }
     }
@@ -855,7 +936,7 @@ impl<'a> Parser<'a> {
     /// Skip newline and empty/comment lines.
     fn skip_newlines(&mut self) {
         while let Some(b) = self.peek() {
-            if is_line_break(b) {
+            if Self::is_break(b) {
                 self.skip_line_break();
             } else if b == b'#' {
                 // Comment line
@@ -920,7 +1001,7 @@ impl<'a> Parser<'a> {
         // validator's copy of this same check, already includes it, and
         // dropping it here meant `---\tfoo` was silently parsed as content
         // instead of a document boundary (#434).
-        matches!(self.peek_at(3), Some(b' ' | b'\t' | b'\n' | b'\r') | None)
+        Self::is_ws_break_or_eoi(self.peek_at(3))
     }
 
     /// Check if we're at a document end marker (`...`).
@@ -934,7 +1015,7 @@ impl<'a> Parser<'a> {
         }
         // Must be followed by white space (space or tab), a line break, or EOF.
         // See `is_document_start` for why the tab isn't optional (#434).
-        matches!(self.peek_at(3), Some(b' ' | b'\t' | b'\n' | b'\r') | None)
+        Self::is_ws_break_or_eoi(self.peek_at(3))
     }
 
     /// Skip past a document marker (`---` or `...`).
@@ -1199,7 +1280,6 @@ impl<'a> Parser<'a> {
             // Use inline scalar loop for common case, SIMD for long runs
             while let Some(b) = self.peek() {
                 match b {
-                    b'\n' | b'\r' => break,
                     b'#' => {
                         // # is only a comment if preceded by whitespace (space or tab)
                         if self.pos > start && matches!(self.input[self.pos - 1], b' ' | b'\t') {
@@ -1210,18 +1290,19 @@ impl<'a> Parser<'a> {
                     b':' => {
                         // Colon followed by whitespace, a line break, or EOF ends
                         // the value (could be a key). In value context, colons in
-                        // URLs etc. are allowed. The `| None` arm matters: without
+                        // URLs etc. are allowed. The EOF case matters: without
                         // it, a colon as the last byte of the document (no trailing
                         // newline) was absorbed as content instead of terminating
                         // the value, while `find_scalar_end` (the locate-path copy
                         // of this same boundary) already stopped there - eval and
                         // locate disagreed on the same node (#434, same shape as
                         // #370).
-                        if matches!(self.peek_at(1), Some(b' ' | b'\t' | b'\n' | b'\r') | None) {
+                        if Self::is_ws_break_or_eoi(self.peek_at(1)) {
                             break;
                         }
                         self.advance();
                     }
+                    b if Self::is_break(b) => break,
                     _ => {
                         // SIMD/broadword fast-path: skip long runs of regular characters
                         // Only use SIMD if we have enough remaining bytes to justify overhead
@@ -1257,7 +1338,7 @@ impl<'a> Parser<'a> {
             }
 
             // Look ahead to see if next line is a continuation
-            let mut lookahead = self.pos + line_break_len(self.input, self.pos); // Skip the line break
+            let mut lookahead = self.pos + self.break_len_at(self.pos); // Skip the line break
             let mut next_indent = 0;
 
             // Count indentation on next line (only spaces count as indent in YAML)
@@ -1276,14 +1357,14 @@ impl<'a> Parser<'a> {
 
             // If empty line (just whitespace then newline), skip it and continue
             // This includes lines with only spaces, tabs, or a mix
-            if matches!(next_char, b'\n' | b'\r' | b'\t') {
+            if Self::is_break(next_char) || next_char == b'\t' {
                 // Check if rest of line is whitespace
                 let mut check_pos = lookahead;
                 while check_pos < self.input.len() && matches!(self.input[check_pos], b' ' | b'\t')
                 {
                     check_pos += 1;
                 }
-                if check_pos >= self.input.len() || is_line_break(self.input[check_pos]) {
+                if check_pos >= self.input.len() || Self::is_break(self.input[check_pos]) {
                     // Empty line - skip it and continue
                     self.skip_line_break(); // Skip the current line break
                                             // Skip to end of empty line
@@ -1374,8 +1455,7 @@ impl<'a> Parser<'a> {
                 && !sequence_indicator_is_block_structure
                 && !is_document_marker
                 && !(next_char == b':'
-                    && (lookahead + 1 >= self.input.len()
-                        || matches!(self.input[lookahead + 1], b' ' | b'\t' | b'\n' | b'\r')))
+                    && Self::is_ws_break_or_eoi(self.input.get(lookahead + 1).copied()))
             {
                 // Continue to next line
                 self.skip_line_break();
@@ -1411,19 +1491,12 @@ impl<'a> Parser<'a> {
             match b {
                 b':' => {
                     // Check for colon + whitespace or colon + line break
-                    if matches!(self.peek_at(1), Some(b' ' | b'\t' | b'\n' | b'\r') | None) {
+                    if Self::is_ws_break_or_eoi(self.peek_at(1)) {
                         break;
                     }
                     // Colon not followed by whitespace is part of the key
                     // (e.g., "key::" or URLs like "http://example.com")
                     self.advance();
-                }
-                b'\n' | b'\r' => {
-                    // Key without colon
-                    return Err(YamlError::KeyWithoutValue {
-                        offset: start,
-                        line: self.current_line(),
-                    });
                 }
                 b'#' => {
                     // # starts a comment only after s-separate-in-line, and
@@ -1437,6 +1510,13 @@ impl<'a> Parser<'a> {
                         });
                     }
                     self.advance();
+                }
+                b if Self::is_break(b) => {
+                    // Key without colon
+                    return Err(YamlError::KeyWithoutValue {
+                        offset: start,
+                        line: self.current_line(),
+                    });
                 }
                 _ => {
                     // SIMD/broadword fast-path: skip long runs of regular characters
@@ -1695,9 +1775,7 @@ impl<'a> Parser<'a> {
         }
 
         // Check for nested sequence: `- - item` (sequence item containing a sequence)
-        if self.peek() == Some(b'-')
-            && matches!(self.peek_at(1), Some(b' ' | b'\t' | b'\n' | b'\r') | None)
-        {
+        if self.peek() == Some(b'-') && Self::is_ws_break_or_eoi(self.peek_at(1)) {
             // Nested sequence - the item value is another sequence.
             // Use the actual column position of the nested `-` as the indent.
             // This ensures that subsequent items at the same column (like `- d` after `- c`)
@@ -1869,8 +1947,8 @@ impl<'a> Parser<'a> {
                 // Check if next content is a sequence indicator
                 let saved_pos = self.pos;
                 self.advance_by(next_indent);
-                let is_sequence_indicator = matches!(self.peek(), Some(b'-'))
-                    && matches!(self.peek_at(1), Some(b' ' | b'\t' | b'\n' | b'\r') | None);
+                let is_sequence_indicator =
+                    matches!(self.peek(), Some(b'-')) && Self::is_ws_break_or_eoi(self.peek_at(1));
                 self.pos = saved_pos;
 
                 if next_indent < indent || (next_indent == indent && !is_sequence_indicator) {
@@ -1900,7 +1978,7 @@ impl<'a> Parser<'a> {
                     // into the plain scalar below.
                     self.parse_alias()?;
                 }
-                Some(b'-') if Self::is_seq_indicator_next(self.peek_at(1)) => {
+                Some(b'-') if Self::is_ws_break_or_eoi(self.peek_at(1)) => {
                     // Block sequence indicator inline with a compact mapping's own
                     // value (`- a: - x`): the same invalid-but-common shape #325
                     // fixed for a top-level mapping value, one level deeper. This
@@ -1979,7 +2057,7 @@ impl<'a> Parser<'a> {
         let key_end = if self.peek() == Some(b':') {
             // Empty key - check that it's followed by proper terminator
             let next = self.peek_at(1);
-            if matches!(next, Some(b' ' | b'\t' | b'\n' | b'\r') | None) {
+            if Self::is_ws_break_or_eoi(next) {
                 // Empty key case - key length is 0, don't advance yet
                 self.pos
             } else {
@@ -2053,8 +2131,8 @@ impl<'a> Parser<'a> {
             let saved_pos = self.pos;
             self.advance_by(next_indent);
             let next_char = self.peek();
-            let is_sequence_indicator = matches!(next_char, Some(b'-'))
-                && matches!(self.peek_at(1), Some(b' ' | b'\t' | b'\n' | b'\r') | None);
+            let is_sequence_indicator =
+                matches!(next_char, Some(b'-')) && Self::is_ws_break_or_eoi(self.peek_at(1));
             self.pos = saved_pos;
 
             if next_indent < indent {
@@ -2096,18 +2174,14 @@ impl<'a> Parser<'a> {
 
             // Check if this is a nested structure or a plain scalar value
             match self.peek() {
-                Some(b'-')
-                    if matches!(self.peek_at(1), Some(b' ' | b'\t' | b'\n' | b'\r') | None) =>
-                {
+                Some(b'-') if Self::is_ws_break_or_eoi(self.peek_at(1)) => {
                     // Sequence - will be handled by main loop
                     self.pos = saved_pos;
                     return Ok(());
                 }
                 // Tab included: the sibling `-` check just above uses the
                 // same 4-way terminator set (#434).
-                Some(b'?')
-                    if matches!(self.peek_at(1), Some(b' ' | b'\t' | b'\n' | b'\r') | None) =>
-                {
+                Some(b'?') if Self::is_ws_break_or_eoi(self.peek_at(1)) => {
                     // Explicit key - will be handled by main loop
                     self.pos = saved_pos;
                     return Ok(());
@@ -2197,8 +2271,7 @@ impl<'a> Parser<'a> {
                 let is_sequence_at_same_indent = {
                     // Skip past indent spaces to check what follows (SIMD accelerated)
                     self.skip_spaces_simd();
-                    matches!(self.peek(), Some(b'-'))
-                        && matches!(self.peek_at(1), Some(b' ' | b'\t' | b'\n' | b'\r') | None)
+                    matches!(self.peek(), Some(b'-')) && Self::is_ws_break_or_eoi(self.peek_at(1))
                 };
                 // Restore position after checking
                 self.pos = pos_before_check;
@@ -2245,7 +2318,7 @@ impl<'a> Parser<'a> {
                     // Block scalar - handles its own BP
                     self.parse_block_scalar(indent)?;
                 }
-                Some(b'-') if Self::is_seq_indicator_next(self.peek_at(1)) => {
+                Some(b'-') if Self::is_ws_break_or_eoi(self.peek_at(1)) => {
                     // Block sequence indicator inline with the mapping key (`a: - x`).
                     // This is invalid YAML (test-suite case 5U3A: a block sequence may
                     // not begin on the same line as its parent mapping key), and the
@@ -2358,9 +2431,8 @@ impl<'a> Parser<'a> {
                 // Next content is at same or lower indent
                 if next_char == Some(b':')
                     && (next_indent == indent)
-                    && matches!(
+                    && Self::is_ws_break_or_eoi(
                         self.input.get(saved_pos + next_indent + 1).copied(),
-                        Some(b' ' | b'\t' | b'\n' | b'\r') | None
                     )
                 {
                     // `: value` at same indent - empty key (null), value follows
@@ -2396,12 +2468,13 @@ impl<'a> Parser<'a> {
 
         // Parse the key value inline
         match self.peek() {
-            // Tab included: this is the same terminator set `is_seq_indicator_next`
-            // canonicalizes (#332) and every sibling `-` check in this file already
-            // uses it, but this site still hand-rolled a 3-way match missing the
-            // tab, so `? -\ta\n  -\tb\n: value` fell through to being parsed as a
-            // plain scalar key `-\ta` instead of a sequence key (#434).
-            Some(b'-') if Self::is_seq_indicator_next(self.peek_at(1)) => {
+            // Tab included: every sibling `-` check in this file uses the same
+            // 4-way terminator set (kept in sync with `super::is_seq_indicator_next`
+            // by `is_ws_break_or_eoi_agrees_with_is_seq_indicator_next`), but this
+            // site still hand-rolled a 3-way match missing the tab, so
+            // `? -\ta\n  -\tb\n: value` fell through to being parsed as a plain
+            // scalar key `-\ta` instead of a sequence key (#434).
+            Some(b'-') if Self::is_ws_break_or_eoi(self.peek_at(1)) => {
                 // Sequence as key - open key node and let sequence parsing continue
                 // The key will be a sequence
                 self.write_bp_open();
@@ -2547,7 +2620,7 @@ impl<'a> Parser<'a> {
 
         // Parse the value
         match self.peek() {
-            Some(b'-') if matches!(self.peek_at(1), Some(b' ' | b'\t' | b'\n' | b'\r') | None) => {
+            Some(b'-') if Self::is_ws_break_or_eoi(self.peek_at(1)) => {
                 // Sequence as value. Routed through the shared sequence-item
                 // parser rather than an inlined copy of its dispatch, so anchor
                 // handling (#328) and every future fix land here too — this was
@@ -2650,7 +2723,7 @@ impl<'a> Parser<'a> {
                 self.set_bp_text_end(self.pos);
                 self.write_bp_close();
             }
-            Some(b'-') if Self::is_seq_indicator_next(self.peek_at(1)) => {
+            Some(b'-') if Self::is_ws_break_or_eoi(self.peek_at(1)) => {
                 // Inline sequence item - this creates a nested sequence.
                 //
                 // This arm used to be a no-op on the theory that "the caller already
@@ -2851,8 +2924,7 @@ impl<'a> Parser<'a> {
 
     /// Check if we're looking at an explicit key indicator `?` in flow context
     fn looks_like_explicit_flow_key(&self) -> bool {
-        self.peek() == Some(b'?')
-            && matches!(self.peek_at(1), Some(b' ' | b'\t' | b'\n' | b'\r') | None)
+        self.peek() == Some(b'?') && Self::is_ws_break_or_eoi(self.peek_at(1))
     }
 
     /// Parse the key node of an explicit flow entry, with the `? ` indicator already
@@ -3357,7 +3429,7 @@ impl<'a> Parser<'a> {
                 b'\n' | b'\r' => {
                     // Multiline key - check if next line continues the key
                     // Skip the line break (CRLF counts as the one break it is)
-                    let mut lookahead = self.pos + line_break_len(self.input, self.pos);
+                    let mut lookahead = self.pos + self.break_len_at(self.pos);
                     // Skip leading whitespace on next line
                     while lookahead < self.input.len()
                         && matches!(self.input[lookahead], b' ' | b'\t')
@@ -3469,7 +3541,7 @@ impl<'a> Parser<'a> {
                 b'\n' | b'\r' => {
                     // Multiline value - check if next line continues the value
                     // Skip the line break (CRLF counts as the one break it is)
-                    let mut lookahead = self.pos + line_break_len(self.input, self.pos);
+                    let mut lookahead = self.pos + self.break_len_at(self.pos);
                     // Skip leading whitespace on next line
                     while lookahead < self.input.len()
                         && matches!(self.input[lookahead], b' ' | b'\t')
@@ -3563,8 +3635,7 @@ impl<'a> Parser<'a> {
                     // Only stop at `: ` or `:\n` or `:` at end. A flow indicator after
                     // the colon does *not* stop the key (#402) — `,`/`}`/`]` end it on
                     // their own arm, one byte later, with the colon kept.
-                    let next = self.peek_at(1);
-                    if matches!(next, Some(b' ' | b'\t' | b'\n' | b'\r') | None) {
+                    if Self::is_ws_break_or_eoi(self.peek_at(1)) {
                         break;
                     }
                     // Colon not followed by space - include it in the key
@@ -3573,7 +3644,7 @@ impl<'a> Parser<'a> {
                 b'\n' | b'\r' => {
                     // Multiline key - check if next line continues the key
                     // Skip the line break (CRLF counts as the one break it is)
-                    let mut lookahead = self.pos + line_break_len(self.input, self.pos);
+                    let mut lookahead = self.pos + self.break_len_at(self.pos);
                     // Skip leading whitespace on next line
                     while lookahead < self.input.len()
                         && matches!(self.input[lookahead], b' ' | b'\t')
@@ -3590,7 +3661,7 @@ impl<'a> Parser<'a> {
                     // Check for `: ` on next line (explicit value indicator)
                     if lookahead + 1 < self.input.len()
                         && self.input[lookahead] == b':'
-                        && matches!(self.input[lookahead + 1], b' ' | b'\t' | b'\n' | b'\r')
+                        && Self::is_ws_or_break(self.input[lookahead + 1])
                     {
                         // Explicit value indicator - stop key here
                         break;
@@ -3626,8 +3697,7 @@ impl<'a> Parser<'a> {
                                 } else {
                                     None
                                 };
-                                if matches!(after_colon, Some(b' ' | b'\t' | b'\n' | b'\r') | None)
-                                {
+                                if Self::is_ws_break_or_eoi(after_colon) {
                                     // Whitespace before `: ` - stop here
                                     break;
                                 }
@@ -3814,7 +3884,7 @@ impl<'a> Parser<'a> {
                 // Include one trailing line break if there was content — two
                 // bytes wide when that break is a CRLF (#324)
                 if last_content_end > 0 && trailing_newline_start > last_content_end {
-                    last_content_end + line_break_len(self.input, last_content_end)
+                    last_content_end + self.break_len_at(last_content_end)
                 } else {
                     last_content_end
                 }
@@ -4277,7 +4347,7 @@ impl<'a> Parser<'a> {
 
         // Check what kind of content this is
         match self.peek() {
-            Some(b'-') if matches!(self.peek_at(1), Some(b' ' | b'\t' | b'\n' | b'\r') | None) => {
+            Some(b'-') if Self::is_ws_break_or_eoi(self.peek_at(1)) => {
                 self.parse_sequence_item(indent)?;
             }
             // Tab included in both arms below: the sibling `-` arm just above
@@ -4285,11 +4355,11 @@ impl<'a> Parser<'a> {
             // tab meant `?\tkey` / `:\tvalue` fell through to
             // `looks_like_mapping_entry()` instead of being recognized here
             // (#434).
-            Some(b'?') if matches!(self.peek_at(1), Some(b' ' | b'\t' | b'\n' | b'\r') | None) => {
+            Some(b'?') if Self::is_ws_break_or_eoi(self.peek_at(1)) => {
                 // Explicit key indicator
                 self.parse_explicit_key(indent)?;
             }
-            Some(b':') if matches!(self.peek_at(1), Some(b' ' | b'\t' | b'\n' | b'\r') | None) => {
+            Some(b':') if Self::is_ws_break_or_eoi(self.peek_at(1)) => {
                 // Explicit value indicator (value for previous explicit key)
                 self.parse_explicit_value(indent)?;
             }
@@ -4335,7 +4405,7 @@ impl<'a> Parser<'a> {
                         // `matches!` across lines gives the opening line its own
                         // coverage region that never reports as executed, even
                         // though the arm body does.
-                        Some(b'-') if Self::is_seq_indicator_next(self.peek_at(1)) => {
+                        Some(b'-') if Self::is_ws_break_or_eoi(self.peek_at(1)) => {
                             // Anchor before block sequence on same line
                             self.parse_sequence_item(indent)?;
                         }
@@ -4444,8 +4514,16 @@ pub fn build_semi_index(input: &[u8]) -> Result<SemiIndex, YamlError> {
     if u32::try_from(input.len()).is_err() {
         return Err(YamlError::InputTooLarge { len: input.len() });
     }
-    let mut parser = Parser::new(input);
-    parser.parse()
+    // One SIMD pass to pick the parser's `HAS_CR` monomorphization (#340). LF-only
+    // documents — the overwhelming majority — then parse with every `\r` arm the
+    // #324 correctness fix added compiled out. The scan reads the input straight
+    // through at 16-32 bytes per iteration and leaves it warm in cache for the
+    // parse that follows.
+    if crate::util::simd::escape::contains_cr(input) {
+        Parser::<true>::new(input).parse()
+    } else {
+        Parser::<false>::new(input).parse()
+    }
 }
 
 #[cfg(test)]
@@ -5257,6 +5335,36 @@ mod tests {
             "nesting depth exceeds limit of 128 at offset 131"
         );
     }
+    /// The other #106 guard: [`Parser::is_ws_break_or_eoi`] is the parser's
+    /// spelling of the terminator set [`super::super::is_seq_indicator_next`]
+    /// gives the reader (#332), and the two are pinned by this test rather than
+    /// by the compiler — see the doc comment for why the parser cannot just call
+    /// it. Exhaustive over every byte plus end of input, so a divergence in the
+    /// acceptance set cannot hide in an untested byte.
+    ///
+    /// `Parser::<true>` is the unconditional rule and must match the reader
+    /// outright. `Parser::<false>` is the #340 specialization, and the only
+    /// licence it has is to drop `\r` — a document the precheck routed there
+    /// contains none, so the answer is unobservable. Pinning both directions
+    /// keeps the gate from quietly widening into some other byte.
+    #[test]
+    fn is_ws_break_or_eoi_agrees_with_is_seq_indicator_next() {
+        for next in (0..=u8::MAX).map(Some).chain(core::iter::once(None)) {
+            let reader = crate::yaml::is_seq_indicator_next(next);
+
+            assert_eq!(
+                Parser::<true>::is_ws_break_or_eoi(next),
+                reader,
+                "{next:?}: parser and reader disagree on the indicator terminator set"
+            );
+            assert_eq!(
+                Parser::<false>::is_ws_break_or_eoi(next),
+                reader && next != Some(b'\r'),
+                "{next:?}: the HAS_CR gate changed something other than the `\\r` arm"
+            );
+        }
+    }
+
     /// The #106 guard: `skip_line_break` is the one place in the crate that
     /// restates [`line_break_len`] instead of calling it, for the measured
     /// reason on its doc comment. A restated predicate diverges silently, so
@@ -5264,8 +5372,10 @@ mod tests {
     /// widths must agree byte for byte.
     #[test]
     fn skip_line_break_agrees_with_line_break_len() {
-        for input in [
-            b"a\r\nb\rc\nd".as_slice(),
+        // CR-bearing inputs only reach the `HAS_CR == true` parser, which is what
+        // `build_semi_index`'s precheck guarantees.
+        skip_line_break_agrees::<true>(&[
+            b"a\r\nb\rc\nd",
             b"\r\n",
             b"\n\r",
             b"\r\r\n",
@@ -5274,15 +5384,37 @@ mod tests {
             b"a\n",
             b"x",
             b"",
-        ] {
+        ]);
+        // The #340 specialization has to hold the same property against its own
+        // narrowed `break_len_at`, or its `skip_line_break` fast path would be a
+        // third spelling rather than a second one.
+        skip_line_break_agrees::<false>(&[b"a\nb\nc", b"\n\n", b"a\n", b"\n", b"x", b""]);
+    }
+
+    /// Shared body of the #106 guard, over both `HAS_CR` monomorphizations.
+    ///
+    /// Under `HAS_CR` the expected width is tied to [`line_break_len`] itself, so
+    /// the hand-rolled `skip_line_break`, the `break_len_at` dispatcher, and the
+    /// shared definition are all pinned to each other.
+    fn skip_line_break_agrees<const HAS_CR: bool>(inputs: &[&[u8]]) {
+        for input in inputs {
             for pos in 0..=input.len() {
-                let mut parser = Parser::new(input);
+                let want = Parser::<HAS_CR>::new(input).break_len_at(pos);
+                if HAS_CR {
+                    assert_eq!(
+                        want,
+                        line_break_len(input, pos),
+                        "{input:?} @ {pos}: break_len_at and line_break_len disagree"
+                    );
+                }
+                let mut parser = Parser::<HAS_CR>::new(input);
                 parser.pos = pos;
                 parser.skip_line_break();
                 assert_eq!(
                     parser.pos - pos,
-                    line_break_len(input, pos),
-                    "{input:?} @ {pos}: skip_line_break and line_break_len disagree"
+                    want,
+                    "{input:?} @ {pos} (HAS_CR={HAS_CR}): \
+                     skip_line_break and break_len_at disagree"
                 );
             }
         }
@@ -5292,7 +5424,7 @@ mod tests {
     /// never a byte when the cursor is not on one.
     #[test]
     fn skip_line_break_consumes_exactly_one_break() {
-        let mut parser = Parser::new(b"\r\n\r\nx");
+        let mut parser = Parser::<true>::new(b"\r\n\r\nx");
         parser.skip_line_break();
         assert_eq!(parser.pos, 2, "first CRLF consumed whole");
         parser.skip_line_break();
@@ -5300,7 +5432,7 @@ mod tests {
         parser.skip_line_break();
         assert_eq!(parser.pos, 4, "`x` is not a break, so nothing moves");
 
-        let mut lone = Parser::new(b"\r\rx");
+        let mut lone = Parser::<true>::new(b"\r\rx");
         lone.skip_line_break();
         assert_eq!(lone.pos, 1, "a lone CR is a complete break");
         assert!(lone.at_break());
@@ -5314,7 +5446,7 @@ mod tests {
     fn current_line_counts_a_crlf_once() {
         // b"a\r\nb\r\nc"
         //   0 1 2 3 4 5 6
-        let mut parser = Parser::new(b"a\r\nb\r\nc");
+        let mut parser = Parser::<true>::new(b"a\r\nb\r\nc");
         assert_eq!(parser.current_line(), 1);
         parser.pos = 3;
         assert_eq!(parser.current_line(), 2, "`b` is on line 2");
@@ -5329,8 +5461,83 @@ mod tests {
         parser.pos = 6;
         assert_eq!(parser.current_line(), 3, "`c` is on line 3");
 
-        let mut lone = Parser::new(b"a\rb\rc");
+        let mut lone = Parser::<true>::new(b"a\rb\rc");
         lone.pos = 4;
         assert_eq!(lone.current_line(), 3, "lone CRs each start a line");
+    }
+
+    /// The two `HAS_CR` monomorphizations must agree on every CR-free document.
+    ///
+    /// This is the test that pins the #340 gating. `HAS_CR == true` is the #324
+    /// parser verbatim, so it is the oracle here; `HAS_CR == false` is the
+    /// specialization, and the only way it can be wrong is by gating a site whose
+    /// `\r` arm was doing something *other* than handling a carriage return.
+    /// Nothing else in the suite would catch that: `tests/yaml_crlf_tests.rs` and
+    /// the CRLF reruns in `tests/yq_golden_tests.rs` exercise inputs that all
+    /// contain a `\r`, which is precisely the set that takes the `true` path.
+    #[test]
+    fn both_monomorphizations_agree_on_cr_free_input() {
+        // 4096 `a`s, so the plain-scalar case clears the 32-byte SIMD classifier
+        // threshold by a wide margin rather than only just.
+        let long_scalar = format!("long: {}\n", "a".repeat(4096));
+        let cases: &[&str] = &[
+            "",
+            "\n",
+            "name: Alice\nage: 30\n",
+            "person:\n  name: Alice\n  address:\n    city: Sydney\n",
+            "- one\n- two\n- three\n",
+            "- - nested\n  - items\n",
+            "quoted: \"has: colon\"\nsingle: 'and ''escaped'' quotes'\n",
+            "flow_map: {a: 1, b: 2}\nflow_seq: [1, 2, [3, 4]]\n",
+            "literal: |\n  line one\n  line two\nfolded: >\n  folded one\n\n  folded two\n",
+            "? explicit key\n: explicit value\n",
+            "base: &anchor\n  a: 1\nderived: *anchor\n",
+            "---\ndoc: one\n---\ndoc: two\n...\n",
+            "# leading comment\nkey: value # trailing comment\n\n\nafter: blanks\n",
+            "empty:\nnull_value: ~\nbool: true\nnum: 1.5\n",
+            "url: http://example.com/path\ntime: 12:30:00\n",
+            "  indented_root: value\n",
+            "no trailing newline: here",
+            "plain\nmultiline\nscalar\n",
+            "outer:\n- a\n- b\n",
+            &long_scalar,
+        ];
+
+        for case in cases {
+            let input = case.as_bytes();
+            assert!(!input.contains(&b'\r'), "fixture must be CR-free: {case:?}");
+
+            let with = Parser::<true>::new(input).parse();
+            let without = Parser::<false>::new(input).parse();
+
+            match (with, without) {
+                (Ok(a), Ok(b)) => {
+                    assert_eq!(a.ib, b.ib, "ib differs for {case:?}");
+                    assert_eq!(a.bp, b.bp, "bp differs for {case:?}");
+                    assert_eq!(a.ty, b.ty, "ty differs for {case:?}");
+                    assert_eq!(
+                        a.bp_to_text, b.bp_to_text,
+                        "bp_to_text differs for {case:?}"
+                    );
+                    assert_eq!(
+                        a.bp_to_text_end, b.bp_to_text_end,
+                        "bp_to_text_end differs for {case:?}"
+                    );
+                    assert_eq!(
+                        a.containers, b.containers,
+                        "containers differs for {case:?}"
+                    );
+                    assert_eq!(a.ib_len, b.ib_len, "ib_len differs for {case:?}");
+                    assert_eq!(a.bp_len, b.bp_len, "bp_len differs for {case:?}");
+                    assert_eq!(a.ty_len, b.ty_len, "ty_len differs for {case:?}");
+                    assert_eq!(a.anchors, b.anchors, "anchors differ for {case:?}");
+                    assert_eq!(a.aliases, b.aliases, "aliases differ for {case:?}");
+                }
+                (Err(a), Err(b)) => {
+                    assert_eq!(a.to_string(), b.to_string(), "errors differ for {case:?}");
+                }
+                (a, b) => panic!("acceptance differs for {case:?}: {a:?} vs {b:?}"),
+            }
+        }
     }
 }
