@@ -139,10 +139,10 @@ pub fn validate_utf8(input: &[u8]) -> Result<(), Utf8Error> {
 /// on x86_64 CPUs without AVX2, and behind the CLI's `--no-simd`; on AVX2 hosts
 /// it also backs [`validate_utf8`]'s error reporting.
 ///
-/// Runs of ASCII are skipped eight bytes at a time via [`skip_ascii`], while
+/// Runs of ASCII are skipped eight bytes at a time via `skip_ascii`, while
 /// multi-byte sequences are validated one character at a time. Errors carry the
 /// exact byte offset, line number, and column position, derived from the offset
-/// by [`line_and_column`] once an error is found — see its docs for why keeping
+/// by `line_and_column` once an error is found — see its docs for why keeping
 /// that state off the hot path is exact rather than approximate.
 pub fn validate_utf8_scalar(input: &[u8]) -> Result<(), Utf8Error> {
     let mut pos = 0;
