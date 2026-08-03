@@ -24,7 +24,7 @@ use super::eval::{
     EvalSemantics, JqSemantics, QueryResult,
 };
 use super::expr::{Builtin, CompareOp, Expr, Literal};
-use super::value::OwnedValue;
+use super::value::{is_nan_sentinel, OwnedValue};
 use crate::json::JsonIndex;
 
 /// Convert a DocumentValue to an OwnedValue.
@@ -79,10 +79,16 @@ fn standard_json_to_owned<W: Clone + AsRef<[u64]>>(
     match value {
         StandardJson::Null => OwnedValue::Null,
         StandardJson::Bool(b) => OwnedValue::Bool(*b),
-        StandardJson::Number(n) => match core::str::from_utf8(n.raw_bytes()) {
-            Ok(s) => OwnedValue::from_number_literal(s),
-            Err(_) => OwnedValue::Null,
-        },
+        StandardJson::Number(n) => {
+            if is_nan_sentinel(n.raw_bytes()) {
+                OwnedValue::Float(f64::NAN)
+            } else {
+                match core::str::from_utf8(n.raw_bytes()) {
+                    Ok(s) => OwnedValue::from_number_literal(s),
+                    Err(_) => OwnedValue::Null,
+                }
+            }
+        }
         StandardJson::String(s) => {
             OwnedValue::String(s.as_str().map(|c| c.to_string()).unwrap_or_default())
         }

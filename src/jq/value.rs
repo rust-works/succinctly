@@ -507,19 +507,19 @@ impl OwnedValue {
 
     /// Serialize this value as JSON for `eval_generic`'s cursor-reindexing
     /// bridge, preserving ±Infinity via a self-overflowing literal
-    /// (`1e999`/`-1e999`) instead of [`to_json`](Self::to_json)'s `"null"`
-    /// substitution.
+    /// (`1e999`/`-1e999`) and NaN via [`NAN_SENTINEL`] instead of
+    /// [`to_json`](Self::to_json)'s `"null"` substitution.
     ///
     /// `to_json()`'s "null" is correct for actual JSON *output* (RFC 8259
     /// forbids Infinity/NaN), but wrong for this purely-internal round-trip:
     /// it silently destroys the NaN/Infinity information
     /// `numeric_display_string()` (in `src/jq/eval.rs`) needs downstream once
     /// the bridge re-parses this text and hands the cursor to the full
-    /// evaluator (#561). NaN has no self-overflowing JSON number literal and
-    /// isn't reachable from any path in this crate today, so it still falls
-    /// back to `"null"` here, same as `to_json()`.
+    /// evaluator (#561, #472).
     pub(crate) fn to_json_for_reindex(&self) -> String {
         match self {
+            Self::Float(f) if f.is_nan() => NAN_SENTINEL.to_string(),
+            Self::NumberLiteral(NumberRepr::Float(f), _) if f.is_nan() => NAN_SENTINEL.to_string(),
             Self::Float(f) if f.is_infinite() => overflow_literal(*f).to_string(),
             Self::NumberLiteral(NumberRepr::Float(f), _) if f.is_infinite() => {
                 overflow_literal(*f).to_string()
@@ -556,6 +556,30 @@ fn overflow_literal(f: f64) -> &'static str {
     } else {
         "1e999"
     }
+}
+
+/// The reserved JSON number literal [`OwnedValue::to_json_for_reindex`]
+/// writes in place of NaN (see [`overflow_literal`] for the analogous,
+/// naturally-parsing ±Infinity trick, #561). NaN has no decimal literal that
+/// IEEE-754 overflow parses to, so this reserves an explicit,
+/// guaranteed-unparseable-as-a-real-number token instead (#472): digit-led,
+/// so `JsonCursor::value()`'s dispatcher (`src/json/light.rs`, which only
+/// recognizes `-`/an ASCII digit as the start of a `Number`) routes it to
+/// `StandardJson::Number` rather than `Error`; built entirely from
+/// `[0-9-+.eE]`, so `JsonNumber::find_end()`'s greedy span scan captures it
+/// whole; and carrying two exponent markers, so `str::parse::<f64>()`/
+/// `::<i64>()` both reject it outright rather than silently overflowing to
+/// something else -- see `test_nan_sentinel_is_unparseable_as_a_real_number`,
+/// the load-bearing proof this design depends on.
+pub(crate) const NAN_SENTINEL: &str = "9e999e999";
+
+/// True if `bytes` is exactly [`NAN_SENTINEL`] -- the one definition every
+/// jq-layer call site that reads a `to_json_for_reindex`-bridge number token
+/// must check before falling back to ordinary parsing, so the comparison
+/// can't diverge between call sites the way three copies of one predicate
+/// did in #106.
+pub(crate) fn is_nan_sentinel(bytes: &[u8]) -> bool {
+    bytes == NAN_SENTINEL.as_bytes()
 }
 
 /// jq value equality.
@@ -1194,6 +1218,29 @@ mod tests {
             OwnedValue::NumberLiteral(NumberRepr::Float(f), _) if f.is_infinite()
         ));
         assert_eq!(lit.to_json(), "null");
+    }
+
+    #[test]
+    fn test_nan_sentinel_is_unparseable_as_a_real_number() {
+        // Load-bearing for #472: `NAN_SENTINEL` is only safe to reserve as an
+        // out-of-band NaN marker because it can never arise from a
+        // legitimately formatted number -- both parses must fail today.
+        assert!(NAN_SENTINEL.parse::<f64>().is_err());
+        assert!(NAN_SENTINEL.parse::<i64>().is_err());
+    }
+
+    #[test]
+    fn test_to_json_for_reindex_preserves_nan() {
+        // Unlike ±Infinity (which self-overflows via `1e999`), NaN has no
+        // natural JSON-number spelling, so `to_json_for_reindex` must emit
+        // the reserved sentinel instead of falling back to `to_json`'s
+        // "null" substitution (#472).
+        assert_eq!(
+            OwnedValue::Float(f64::NAN).to_json_for_reindex(),
+            NAN_SENTINEL
+        );
+        let lit = OwnedValue::NumberLiteral(NumberRepr::Float(f64::NAN), "nan".into());
+        assert_eq!(lit.to_json_for_reindex(), NAN_SENTINEL);
     }
 
     #[test]

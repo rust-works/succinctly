@@ -317,44 +317,25 @@ fn test_nan_container_ordering_parity_421() {
         ("[1,nan] | max", "1"),
         ("[nan,1] | max", "1"),
         // A single NaN in the array needs no dedup/grouping decision against
-        // another NaN, so this one is unaffected by the separate defect below.
+        // another NaN, so this one needed no fix from #472's NaN-survival
+        // work below.
         ("[nan,1,2] | group_by(.)", "[[null],[1],[2]]"),
+        // These three used to collapse distinct NaNs into a single `null`
+        // (`[null]` / `[null,1]` / `[[null,null],[1]]`): a freshly
+        // constructed array is materialized through JSON text on its way to
+        // `unique`/`group_by` (JSON has no NaN literal), which turned each
+        // NaN into a genuine `Null` *before* `compare_values` ever ran, and
+        // two real `Null`s legitimately compare `Equal`. #472 preserves NaN
+        // through that round trip, so each NaN now stays distinct, exactly
+        // like jq's own `nan != nan`.
+        ("[nan,nan] | unique", "[null,null]"),
+        ("[nan,1,nan] | unique", "[null,null,1]"),
+        ("[nan,nan,1] | group_by(.)", "[[null],[null],[1]]"),
     ] {
         assert_eq!(
             as_strs(&full_outputs(b"null", filter)),
             [expected],
             "full evaluator disagrees with jq for `{filter}`"
-        );
-        assert_parity(b"null", filter);
-    }
-}
-
-#[test]
-fn test_nan_container_ordering_known_divergence_421() {
-    // jq keeps NaN a real NaN internally and only turns it into `null` at
-    // print time, so `[nan,nan] | unique` keeps both (jq: `[null,null]`).
-    // Here, a freshly-constructed array is materialized through JSON text on
-    // its way to `unique`/`group_by` (JSON has no NaN literal), which turns
-    // each NaN into a genuine `Null` *before* `compare_values` ever runs --
-    // and two real `Null`s legitimately compare `Equal`, so they collapse.
-    //
-    // This is the separate, pre-existing defect #421 calls out ("nan does
-    // not survive as a number") -- not a comparator bug, and out of scope for
-    // this fix. Pinning the current (wrong, but internally consistent
-    // between both evaluators) answer here so a fix for that defect has a
-    // failing test to flip, rather than silently dropping coverage.
-    for (filter, current_answer) in [
-        ("[nan,nan] | unique", "[null]"),
-        ("[nan,1,nan] | unique", "[null,1]"),
-        ("[nan,nan,1] | group_by(.)", "[[null,null],[1]]"),
-    ] {
-        assert_eq!(
-            as_strs(&full_outputs(b"null", filter)),
-            [current_answer],
-            "full evaluator answer changed for `{filter}` -- if this now matches jq \
-             (`[null,null]` / `[null,null,1]` / `[[null],[null],[1]]` respectively), \
-             the separate NaN-materialization defect is fixed: update this test's \
-             expectation and move the case into test_nan_container_ordering_parity_421"
         );
         assert_parity(b"null", filter);
     }
