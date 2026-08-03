@@ -1013,24 +1013,32 @@ fn test_write_clobber_through_a_static_optional_comma_raises_instead_of_swallowi
 /// `recurse(f)` for an `f` that never stops producing.
 ///
 /// `f` is arbitrary, so nothing guarantees progress: `.a?` reads `null` from
-/// `null` forever. `builtin_recurse_f` is bounded because it does not queue a
-/// null child, and `resolve_recurse` has to make the same choice — without it
-/// the queue runs to its 10,000-item cutoff with the path prefix one component
-/// longer each round, which is quadratic. Measured at 9 GB resident and 5s of
-/// CPU for this 18-byte document; it is a bound, not a preference.
+/// `null` forever — confirmed hanging in real jq too (`jq -c
+/// '[recurse(.a?)]'` on this input never returns; it is not a bug there).
 ///
-/// jq does not terminate here at all (it recurses until it cannot allocate),
-/// so the expectation is `builtin_recurse_f`'s, deliberately.
+/// Since #490/#570, `builtin_recurse_f` (the value evaluator, used by bare
+/// `[recurse(.a?)]`) queues a null child like any other value instead of
+/// filtering it out, so it is no longer bounded by pruning — it runs to its
+/// own 10,000-item `MAX_ITEMS` cutoff and emits the root followed by 9,999
+/// nulls. `resolve_recurse` (the path-tracking evaluator behind
+/// `path(recurse(f) | ...)`) still has to prune the null child instead: its
+/// queue holds `(path, value)` pairs, so running it to the same cutoff would
+/// grow the path prefix by one component every round — quadratic, and
+/// previously measured at 9 GB resident and 5s of CPU for this 18-byte
+/// document. So the two evaluators deliberately disagree on this one
+/// adversarial shape: the value form below hits `MAX_ITEMS`, the path form
+/// still terminates after one output.
 #[test]
-fn test_recurse_over_a_null_producing_filter_terminates() {
+fn test_recurse_over_a_null_producing_filter() {
     let doc = r#"{"k":"a","a":null}"#;
-    // Both sides visit the root and stop: `.a?` yields null, which ends that
-    // line of descent rather than seeding another round.
-    check(
-        doc,
-        r"[recurse(.a?)]",
-        Outcome::values(&[r#"[{"k":"a","a":null}]"#]),
-    );
+
+    // `builtin_recurse_f`'s `MAX_ITEMS` cutoff: the root, then 9,999 nulls.
+    let mut values = vec![r#"{"k":"a","a":null}"#.to_string()];
+    values.extend(std::iter::repeat(String::from("null")).take(9999));
+    let expected_out = format!("[{}]", values.join(","));
+    check(doc, r"[recurse(.a?)]", Outcome::values(&[&expected_out]));
+
+    // `resolve_recurse` prunes the null child and stops after one output.
     check(
         doc,
         r"[path(recurse(.a?) | objects | .[.k]?)]",
