@@ -298,25 +298,29 @@ fn first_high_byte_be(hi: u64) -> usize { (hi.leading_zeros()  >> 3) as usize }
 
 Guard the load on the current byte already being ASCII. Attempting the skip
 unconditionally costs a wasted load and test on every sequence of multi-byte-heavy
-text, which measured as a 2.7x regression against the scalar validator on emoji.
+text, which is pure loss on patterns like emoji or CJK where it can never fire.
 
-See [utf8-validate.md](../benchmarks/utf8-validate.md#engine-comparison-134) for
-the full engine comparison, including why a table-driven DFA lost to
-whole-sequence validation for the multi-byte step.
+Even guarded, this kernel is not a strict win: its wide probe pays off on long
+ASCII runs but loses geometric mean against the scalar validator's own 8-byte
+ASCII skip (from a separate change, #133) across realistic mixed content — see
+[utf8-validate.md](../benchmarks/utf8-validate.md#engine-comparison-134) for the
+measured numbers and why it ships as an opt-in engine rather than the default,
+alongside why a table-driven DFA lost to whole-sequence validation for the
+multi-byte step.
 
 ---
 
 ## Usage in Succinctly
 
-| Technique      | Location                     | Purpose                           |
-|----------------|------------------------------|-----------------------------------|
-| POPCNT         | `bits/popcount.rs`           | Rank queries, index building      |
-| CTZ loop       | `util/broadword.rs`          | Select-in-word                    |
-| Bit clearing   | `util/broadword.rs`          | Set bit iteration                 |
-| PDEP toggle    | `util/simd/x86.rs`           | Quote region masking (10x faster) |
-| Broadword      | `bits/popcount.rs`           | Portable popcount fallback        |
-| High-bit test  | `text/utf8/broadword.rs`     | ASCII run skipping (2.0x UTF-8)   |
-| CTZ >> 3       | `text/utf8/broadword.rs`     | First non-ASCII byte in a word    |
+| Technique     | Location                 | Purpose                           |
+|---------------|--------------------------|-----------------------------------|
+| POPCNT        | `bits/popcount.rs`       | Rank queries, index building      |
+| CTZ loop      | `util/broadword.rs`      | Select-in-word                    |
+| Bit clearing  | `util/broadword.rs`      | Set bit iteration                 |
+| PDEP toggle   | `util/simd/x86.rs`       | Quote region masking (10x faster) |
+| Broadword     | `bits/popcount.rs`       | Portable popcount fallback        |
+| High-bit test | `text/utf8/broadword.rs` | ASCII run skipping (opt-in, ~2x)  |
+| CTZ >> 3      | `text/utf8/broadword.rs` | First non-ASCII byte in a word    |
 
 ---
 
@@ -326,7 +330,7 @@ whole-sequence validation for the multi-byte step.
 2. **Profile before optimizing**: CTZ loop often beats "optimal" broadword due to branch prediction
 3. **Know your instructions**: PDEP is for sparse patterns, not consecutive bits
 4. **Bit clearing idiom**: `x &= x - 1` is fundamental for iteration
-5. **Shorten the loop-carried chain, not the table**: a compact DFA table still serializes one byte per `state -> step -> state` hop; independent range comparisons retire a whole sequence per iteration and won UTF-8 validation by 26%
+5. **Shorten the loop-carried chain, not the table**: a compact DFA table still serializes one byte per `state -> step -> state` hop; independent range comparisons retire a whole sequence per iteration and beat the DFA alternative for UTF-8 validation by ~26% in that head-to-head (a ratio unaffected by which scalar baseline was used for either side)
 
 ---
 

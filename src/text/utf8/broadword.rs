@@ -3,18 +3,25 @@
 //! A portable validation kernel that clears ASCII in 32- and 8-byte strides
 //! using ordinary 64-bit integer arithmetic — no SIMD intrinsics, no runtime
 //! feature detection, and available on every target including `no_std` builds.
-//! This is the default engine everywhere the AVX2 path in [`super::simd_x86`]
-//! is unavailable: aarch64, wasm, riscv, pre-AVX2 x86_64, and any build without
-//! the `std` feature.
+//!
+//! **Not the default.** [`super::validate_utf8_scalar`] already skips ASCII
+//! runs eight bytes at a time (#133), and beats this kernel's geometric mean
+//! across realistic content by a measured ~8-11% — this kernel only wins
+//! clearly on long, close-to-pure-ASCII runs. `validate_utf8` therefore
+//! dispatches to AVX2 where available and to `validate_utf8_scalar`
+//! everywhere else; this module is exposed separately
+//! ([`validate_utf8_broadword`]) for callers who know their input is
+//! ASCII-dominant. See
+//! `docs/benchmarks/utf8-validate.md#engine-comparison-134` for the numbers.
 //!
 //! ## Why this exists
 //!
-//! [`super::validate_utf8_scalar`] costs one loop iteration per *byte* of
-//! ASCII, so it is slower on ASCII-heavy input than on multi-byte input: a
-//! 4-byte emoji costs one iteration where four ASCII bytes cost four. Measured
-//! on an M4 Pro over the realistic corpus, that put pure ASCII at 1.81 GiB/s
-//! and log files at 1.38 GiB/s. Clearing 32 ASCII bytes with a single high-bit
-//! test attacks exactly that, taking those to 58.0 and 10.6 GiB/s.
+//! Clearing 32 ASCII bytes with one high-bit test beats scalar's 8-byte skip
+//! on long ASCII runs — roughly 1.7-2.0x on pure ASCII across the platforms
+//! measured — at the cost of losing on most other realistic patterns, where
+//! the wider probe rarely gets to pay for itself. That is a real, narrow win
+//! for a caller who knows their input shape, not a general-purpose
+//! replacement for the scalar validator.
 //!
 //! ## Diagnostics
 //!
@@ -30,10 +37,14 @@
 //! ## Why not a DFA
 //!
 //! Issue #134 specified a table-driven [Höhrmann] DFA for the multi-byte step.
-//! That was implemented, benchmarked head-to-head against the whole-sequence
-//! approach used here, and **rejected**: across the eleven realistic patterns on
-//! an M4 Pro it averaged 1.73x the scalar validator against this kernel's
-//! 2.18x, losing on nine of the eleven.
+//! That was implemented and benchmarked head-to-head against the whole-sequence
+//! approach used here, in the same run against the same baseline, and
+//! **rejected**: whole-sequence validation beat the DFA on nine of the eleven
+//! realistic patterns on an M4 Pro. (The absolute "x scalar" multipliers from
+//! that run are not repeated here — they predate #133's scalar ASCII skip and
+//! no longer reflect current numbers; the DFA itself was removed, so they
+//! cannot be recomputed against the current baseline. The relative finding,
+//! whole-sequence over DFA, does not depend on which scalar was used.)
 //!
 //! The cause is dependency structure. A DFA carries `state -> step -> state`
 //! around its loop, so one byte retires per two-to-three cycle chain no matter

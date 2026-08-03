@@ -9,14 +9,20 @@ interchangeable engines:
   fast accept scan that falls back to the scalar validator for the exact error
   position, so diagnostics are byte-identical either way. Selected at runtime via
   `is_x86_feature_detected!("avx2")`.
-- **Broadword (SWAR)** (default everywhere else) — a portable accept scan that
-  clears ASCII in 32- and 8-byte strides with ordinary 64-bit arithmetic, then
-  validates each multi-byte sequence with independent range comparisons. No
-  intrinsics and no feature detection, so it also serves `no_std` builds and
-  pre-AVX2 x86_64. Added by #134.
-- **Scalar** — the portable byte-by-byte validator. It remains the reference
-  implementation and the sole producer of `Utf8Error`: both accept scans re-run
-  it on rejection. Selected directly by `--no-simd`.
+- **Scalar** (default everywhere except x86_64 with AVX2) — the portable
+  validator. It is the reference implementation and the sole producer of
+  `Utf8Error`, and since #133 it already skips ASCII runs eight bytes at a
+  time, so it is not byte-at-a-time on ASCII despite the name. Selected
+  directly by `--no-simd`.
+- **Broadword (SWAR)** — a portable accept scan that clears ASCII in 32- and
+  8-byte strides with ordinary 64-bit arithmetic, then validates each
+  multi-byte sequence with independent range comparisons. No intrinsics and no
+  feature detection. Added by #134, but **not the default**: see
+  [Engine comparison](#engine-comparison-134) — it wins clearly only on
+  long/pure ASCII and loses geometric mean against the current scalar
+  validator on realistic mixed content. Available directly via
+  `validate_utf8_broadword` for callers who know their input is
+  ASCII-dominant.
 
 `benches/utf8_validate_bench.rs` reports a `std`, `scalar`, `broadword` and (on
 x86_64) `simd` arm per input (`cargo bench --bench utf8_validate_bench`). The
@@ -44,84 +50,115 @@ realistic generated corpus.
 
 Measured with `succinctly dev bench utf8`, which times each engine over the
 eleven realistic patterns produced by `succinctly text generate-suite` rather
-than the synthetic Criterion generators. 10MB files, median of 7 runs after 2
-warmups, one machine at a time.
+than the synthetic Criterion generators. 10MB files, median of 9 runs after 2
+warmups, interleaved per-engine, idle machine.
 
-Throughput in GiB/s; the final column is broadword against the scalar validator.
+> **⚠️ Revision history.** This section originally reported a "2.01x/2.14x
+> geometric mean" win for broadword over scalar. That was measured before #133
+> (which gave `validate_utf8_scalar` its own 8-byte ASCII skip) merged into
+> `main`; this branch was rebased onto that merge with no conflict, so the stale
+> numbers went uncaught. The tables and findings below are re-measured against
+> the current scalar validator and supersede the original figures. The
+> conclusion changed: broadword is **not** the default engine (see
+> `validate_utf8` in `src/text/utf8/mod.rs`) — it is available separately for
+> callers who know their input is ASCII-dominant.
+
+Throughput in GiB/s; the "vs scalar" column is broadword against the current
+scalar validator.
 
 ### Apple M4 Pro (aarch64)
 
-Broadword is what `validate_utf8` dispatches to here — there is no NEON kernel,
-so before #134 this platform ran the scalar validator.
+Scalar is what `validate_utf8` dispatches to here — there is no NEON kernel.
 
 | Pattern            |     scalar |        std |  broadword | vs scalar |
 |--------------------|------------|------------|------------|-----------|
-| ascii              |       1.81 |      51.51 |      57.25 |    31.70x |
-| source_code        |       1.62 |       4.83 |       4.68 |     2.89x |
-| log_file           |       1.72 |       9.25 |      11.03 |     6.42x |
-| json_like          |       1.57 |       3.48 |       3.66 |     2.33x |
-| mixed              |       1.58 |       2.21 |       2.51 |     1.59x |
-| latin              |       0.77 |       0.78 |       1.48 |     1.92x |
-| all_lengths        |       0.44 |       0.38 |       0.44 |     1.00x |
-| greek_cyrillic     |       1.23 |       1.16 |       1.02 |     0.83x |
-| cjk                |       1.50 |       1.28 |       1.12 |     0.75x |
-| emoji              |       1.01 |       0.88 |       0.83 |     0.83x |
-| pathological       |       2.88 |       2.92 |       2.92 |     1.01x |
-| **geometric mean** |      1.00x |      1.86x |      2.01x |           |
+| ascii              |      33.28 |      26.91 |      66.38 |     1.99x |
+| source_code        |       7.65 |       5.58 |       5.32 |     0.70x |
+| log_file           |      14.44 |      11.00 |      12.64 |     0.88x |
+| json_like          |       5.78 |       4.01 |       4.21 |     0.73x |
+| mixed              |       3.59 |       2.56 |       3.11 |     0.86x |
+| latin              |       1.83 |       0.90 |       1.70 |     0.93x |
+| all_lengths        |       0.53 |       0.43 |       0.49 |     0.93x |
+| greek_cyrillic     |       1.09 |       1.39 |       1.16 |     1.06x |
+| cjk                |       1.78 |       1.48 |       1.49 |     0.84x |
+| emoji              |       1.08 |       1.05 |       1.00 |     0.93x |
+| pathological       |       3.59 |       3.36 |       2.80 |     0.78x |
+| **geometric mean** |      1.00x |      0.80x |      0.92x |           |
 
 ### AMD Ryzen 9 7950X (x86_64)
 
-AVX2 remains the dispatch target here, so #134 changes nothing for this platform
-in practice; the broadword column is what a pre-AVX2 or `no_std` x86_64 build
-would get.
+AVX2 remains the dispatch target here, so #134 changes nothing for this
+platform in practice; the scalar and broadword columns are what a pre-AVX2 or
+`no_std` x86_64 build would get — scalar, after this correction.
 
 | Pattern            |     scalar |        std |  broadword |       AVX2 | vs scalar |
 |--------------------|------------|------------|------------|------------|-----------|
-| ascii              |       2.21 |      80.10 |      71.59 |      14.17 |    32.41x |
-| source_code        |       1.97 |       4.99 |       5.36 |      14.15 |     2.72x |
-| log_file           |       2.11 |      10.58 |      11.74 |      13.97 |     5.56x |
-| json_like          |       1.91 |       3.65 |       4.30 |      14.05 |     2.25x |
-| mixed              |       1.80 |       2.20 |       3.13 |      14.04 |     1.74x |
-| latin              |       0.84 |       0.86 |       1.84 |      14.08 |     2.18x |
-| all_lengths        |       0.49 |       0.47 |       0.52 |      14.02 |     1.07x |
-| greek_cyrillic     |       1.29 |       1.29 |       1.18 |      14.09 |     0.91x |
-| cjk                |       1.62 |       1.38 |       1.33 |      14.04 |     0.82x |
-| emoji              |       1.04 |       1.03 |       1.00 |      14.04 |     0.96x |
-| pathological       |       2.57 |       4.03 |       3.35 |      14.06 |     1.30x |
-| **geometric mean** |      1.00x |      1.93x |      2.14x |      9.52x |           |
+| ascii              |      40.72 |      79.57 |      67.92 |      14.17 |     1.67x |
+| source_code        |       7.87 |       5.24 |       5.32 |      14.02 |     0.68x |
+| log_file           |      15.18 |      11.10 |      11.02 |      14.06 |     0.73x |
+| json_like          |       5.65 |       3.85 |       4.21 |      14.09 |     0.75x |
+| mixed              |       3.82 |       2.38 |       3.12 |      14.00 |     0.82x |
+| latin              |       2.22 |       0.88 |       1.85 |      14.13 |     0.83x |
+| all_lengths        |       0.56 |       0.48 |       0.53 |      14.02 |     0.94x |
+| greek_cyrillic     |       1.23 |       1.31 |       1.15 |      14.16 |     0.93x |
+| cjk                |       1.61 |       1.39 |       1.21 |      14.00 |     0.75x |
+| emoji              |       1.07 |       1.07 |       1.00 |      14.00 |     0.94x |
+| pathological       |       3.01 |       4.02 |       3.36 |      14.11 |     1.12x |
+| **geometric mean** |      1.00x |      0.85x |      0.89x |      4.07x |           |
 
-These are the first measured AVX2 figures, replacing the "not yet measured"
-caveat this document previously carried. AVX2 throughput is essentially
-content-independent at ~14 GiB/s because it does the same work on every byte —
-which is also why the skip-based engines beat it by 5x on pure ASCII, where they
-read memory and do almost nothing else. Giving the AVX2 kernel an ASCII fast
-path is an open follow-up.
+AVX2 throughput is essentially content-independent at ~14 GiB/s because it does
+the same work on every byte. Against the *current* (post-#133) scalar
+validator its geomean edge is 4.07x, still decisive but well short of the 9.52x
+this section previously reported against the stale, pre-#133 scalar baseline.
 
 ### Findings
 
-**Broadword beats `core::str::from_utf8` on both platforms** (2.01x vs 1.86x,
-2.14x vs 1.93x geometric mean). This is the result that justifies a hand-written
-kernel at all: had std won, the correct answer to #134 would have been the
-two-line `if core::str::from_utf8(input).is_ok() { Ok(()) } else {
-validate_utf8_scalar(input) }`. std wins on long ASCII runs, where its wider
-aligned loop pays, but it cannot enter that loop at all on text with a non-ASCII
-byte every few bytes — hence `latin` at 1.48 GiB/s against std's 0.78.
+**`validate_utf8_scalar` already beats `core::str::from_utf8` in geometric
+mean** (1/0.80 ≈ 1.25x on M4 Pro, 1/0.85 ≈ 1.18x on the 7950X) — this is #133's
+result, not #134's, but it is the baseline every other engine here has to beat.
+It wins because its 8-byte ASCII skip lets it enter a fast path from any byte
+offset, where std's wider aligned loop cannot start until it reaches an
+alignment boundary.
 
-**The regression on multi-byte-dense content is real.** CJK, Greek/Cyrillic and
-emoji lose 17–25% against the scalar validator, because the ASCII skip cannot
-fire and is pure overhead. For a library whose inputs are JSON, YAML, DSV and
-log files that is the right side of the trade, but it is a cost, not a wash.
+**Broadword does not clearly improve on that baseline.** Its geomean against
+the current scalar validator is a **net loss** — 0.92x on the M4 Pro, 0.89x on
+the 7950X — driven by realistic mixed content: `source_code`, `log_file`,
+`json_like`, `mixed`, `latin`, and `cjk` are all a wash-to-loss, some over 30%.
+It wins clearly in exactly one regime: long or pure ASCII runs (1.99x / 1.67x),
+where its 32-byte probe amortizes over more bytes per high-bit test than
+scalar's 8-byte one. Against `std`, broadword's geomean is close to parity
+(0.92/0.80 ≈ 1.15x on M4 Pro, 0.89/0.85 ≈ 1.05x on the 7950X) — a modest edge,
+not the 2.01x/2.14x this section previously claimed.
 
-**The DFA that #134 specified was rejected.** A Höhrmann-style nine-state DFA was
-implemented and benchmarked head-to-head against whole-sequence validation; it
-averaged 1.73x the scalar validator against 2.18x, losing on nine of the eleven
-patterns, and was removed. The cause is dependency structure rather than table
-size: a DFA carries `state -> step -> state` around its loop and retires one byte
-per two-to-three cycle chain however compact the table, whereas validating a
-whole sequence issues its range comparisons independently and retires three or
-four bytes per iteration. That is the same effect that made the scalar validator
-*faster* on emoji (1.01 GiB/s) than on ASCII (1.81 GiB/s at one iteration per
-byte) in the first place.
+**Conclusion: broadword ships as an opt-in engine, not the default.**
+`validate_utf8()` dispatches to AVX2 where available and to
+`validate_utf8_scalar` everywhere else. `validate_utf8_broadword` remains
+public for callers who know their input is ASCII-dominant and want its wider
+skip specifically.
+
+**The DFA that #134 specified was rejected**, independent of the above. A
+Höhrmann-style nine-state DFA was implemented and benchmarked head-to-head
+against whole-sequence validation in the same run against the same baseline,
+losing on nine of the eleven patterns before being removed. That relative
+result does not depend on which scalar baseline was used — both sides of the
+comparison shared the same denominator — so it stands unmodified. The cause is
+dependency structure rather than table size: a DFA carries `state -> step ->
+state` around its loop and retires one byte per two-to-three cycle chain
+however compact the table, whereas validating a whole sequence issues its range
+comparisons independently and retires three or four bytes per iteration. That
+is the same effect visible in the table above: the scalar validator is *faster*
+on `cjk` than on `all_lengths` because it consumes a whole multi-byte sequence
+per iteration once past the ASCII skip.
+
+**A follow-up attempt to close broadword's mixed-content regression made it
+worse.** The 32-byte block probe reloads its first 8 bytes a second time on
+failure; probing narrow-first and widening only after the first word proved
+clean was expected to cut that waste on short/isolated ASCII runs. Measured
+instead: ASCII throughput on an M-series Mac dropped roughly 3.6x, reproducibly.
+Splitting one 4-word OR-reduction into a conditional two-step probe likely
+defeated auto-vectorization the compiler was doing on the single-loop original;
+load-count intuition did not predict the codegen. Reverted; closing the gap
+needs profiling, not another guess.
 
 **Note on the `std` arm and invalid input.** The comparison is only like-for-like
 on valid input. `core::str::from_utf8` returns `valid_up_to`/`error_len` from its
