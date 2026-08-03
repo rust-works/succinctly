@@ -39,28 +39,16 @@ Required. Must be one of:
 
 ## Scopes
 
-Required. `.omni-dev/scopes.yaml` is authoritative; this list mirrors it and must
-be updated alongside it:
-
-- `bitvec` - Bitvector data structure and rank/select operations
-- `bp` - Balanced parentheses tree navigation
-- `json` - JSON semi-indexing and parsing
-- `yaml` - YAML semi-indexing and parsing
-- `jq` - jq query language parser and evaluator
-- `dsv` - DSV/CSV semi-indexing and parsing
-- `simd` - SIMD optimizations (x86, AVX2, NEON)
-- `core` - Core utilities (broadword, tables, binary ops, text/UTF-8 helpers)
-- `cli` - Command-line interface tool
-- `bench` - Benchmarks and performance testing
-- `test` - Test suite and property tests
-- `docs` - Documentation and optimization notes
-- `ci` - CI/CD pipelines, GitHub Actions, and commit-lint configuration
-- `build` - Build configuration and feature flags
-- `scripts` - Developer and repository maintenance shell scripts
+Required. See [`.omni-dev/scopes.yaml`](scopes.yaml) for the canonical, enforced
+list — do not duplicate it here. `omni-dev` also silently accepts a handful of
+ecosystem-default scopes not listed there (for this repo: `cargo`, `lib`); run
+`omni-dev git commit message lint --verbose` to see the full resolved set.
 
 ## Subject Line
 
-- Keep under 72 characters total
+- Keep under 100 characters total (enforced by `.omni-dev/commit-rules.yaml`'s
+  `subject_max_len`; `omni-dev git commit message lint` is the source of truth if
+  this drifts)
 - Use imperative mood: "add feature" not "added feature" or "adds feature"
 - Be specific: avoid vague terms like "update", "fix stuff", "changes"
 
