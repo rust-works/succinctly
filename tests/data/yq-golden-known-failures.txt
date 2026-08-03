@@ -13,3 +13,9 @@
 # themselves always hold the correct (pinned yq) output; only this manifest
 # records where succinctly currently disagrees. See
 # tests/data/yaml-test-suite-known-failures.txt for the sibling manifest.
+#
+# Seeded by #573 with the first case whose golden carries expected.status/err
+# instead of a passing expected.out: yq rejects the input outright, and
+# succinctly instead exits 0 with corrupted output.
+
+seq_item_double_outdent_rejected  yaml_parser  a block sequence continuation that out-dents past its immediate enclosing frame is accepted with corrupted output instead of rejected like yq — #519
