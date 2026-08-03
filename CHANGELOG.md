@@ -717,17 +717,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   through cursor streaming: multi-file pretty output no longer emits a
   spurious leading `---` before the first document.
 
-  Not fixed by this change, since the M2 fast path only gives `Expr::Identity`
-  a true cursor result — `Field`/`Index`/`Iterate` still evaluate to an owned
-  `GenericResult::One`/`Many` and go through `to_owned()` when streamed, so a
-  duplicate key *nested inside* a navigated field (`.a` where `a`'s value has
-  a repeated key) still collapses, in both compact and pretty output, exactly
-  as before this fix (tracked as a comment on #443, which already covers the
-  same `to_owned()`/`IndexMap` mechanism for `to_entries`); `--slurp`,
-  `--inplace` (`yaml_to_owned_value`), and `jq --preserve-input` pretty output
-  (`standard_json_to_jq_value`, gated by `jq_runner.rs`'s
-  `can_use_raw_identity`) go through their own separate, still-`IndexMap`-backed
-  conversions and are tracked in #478.
+  Not fixed by this change at the time: the M2 fast path only gave
+  `Expr::Identity` a true cursor result — `Field`/`Index`/`Iterate` still
+  evaluated to an owned `GenericResult::One`/`Many` and went through
+  `to_owned()` when streamed, so a duplicate key *nested inside* a navigated
+  field (`.a` where `a`'s value has a repeated key) still collapsed, in both
+  compact and pretty output (tracked as a comment on #443, which already
+  covers the same `to_owned()`/`IndexMap` mechanism for `to_entries`).
+  **Since resolved by #532** (`Expr::Identity => GenericResult::OneCursor`,
+  which also converted `Field`/`Index`/`Iterate` to `OneCursor`/`ManyCursor`).
+  `--slurp`, `--inplace` (`yaml_to_owned_value`), and `jq --preserve-input`
+  pretty output (`standard_json_to_jq_value`, gated by `jq_runner.rs`'s
+  `can_use_raw_identity`) went through their own separate, still-`IndexMap`
+  -backed conversions — see #478 below for resolution.
+
+- **`yq --slurp '.'` and `yq --inplace '.'` still silently dropped duplicate
+  mapping keys after #442** (#478): `yq --slurp '.'` on `a: 1\na: 2` printed
+  `a: 2` instead of keeping both entries inside the slurped element, and
+  `yq --inplace '.'` on the same input wrote `a: 2` back to the file,
+  diverging from real `yq --inplace` v4.53.3's `a: 1\na: 2`. Cause: both
+  went through `yaml_to_owned_value()` (`yq_runner.rs`), and `--slurp`'s
+  result was re-collapsed a second time by the `IndexMap`-backed
+  `standard_json_to_owned()` inside `evaluate_input`'s JSON round-trip —
+  neither was reached by #442's fix, which only widened `Expr::Identity`'s
+  path to stdout. (#478's third listed site, `jq --preserve-input` pretty
+  output, turned out to already be fixed incidentally by #532, merged
+  before this fix; only a regression test was added for it here.)
+
+  Fix: `--inplace` now reuses the M2 cursor-streaming machinery for the same
+  shapes `can_use_m2_streaming` already accepts (`.`, `.field`, `.[n]`,
+  `.[]`, and pipes/parens/`?` of those), via new
+  `can_inplace_json_fast_path`/`can_inplace_yaml_fast_path` gates that mirror
+  `can_json_fast_path`/`can_yaml_fast_path` but write into a per-file buffer
+  instead of stdout before the existing `fs::write`. `--slurp` gets a
+  narrower, identity-only fast path (a non-trivial filter over the slurped
+  array still needs real evaluation) backed by a new
+  `yaml::stream_yaml_sequence()` helper: every source is parsed up front
+  into an owned `(bytes, YamlIndex)` pair so their cursors can share one
+  `Vec`'s lifetime, then streamed into a single YAML sequence using the same
+  container-vs-scalar block/flow rendering `stream_yaml_value`'s `Sequence`
+  arm already uses — reused rather than re-derived, so multi-document slurp
+  output matches single-document M2 streaming byte-for-byte. `-o json
+  --slurp` still uses the slow DOM path, the same explicit, documented scope
+  limit `sort_keys`/color/`--tab` already have on the gates above.
+
+  Not fixed by this change: `standard_json_to_jq_value()` is still reachable
+  and lossy through `Builtin::First`/`Builtin::Last` and `Pipe`'s
+  stage-advance re-entry (e.g. `jq --preserve-input 'first(.[])'` on
+  `[{"a":1,"a":2}]` collapses to one `"a"`), found while verifying the
+  `--preserve-input` fix above — filed as #607.
 
 - **The strict YAML validator accepted a flow-collection anchor immediately
   followed by an alias** (#452): `[&a *a]` and `{k: &a *a}` passed
