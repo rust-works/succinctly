@@ -622,6 +622,116 @@ fn test_duplicate_mapping_key_to_entries_json_compact() -> Result<()> {
     Ok(())
 }
 
+/// #478: `--slurp '.'` shares the same `IndexMap`-backed conversion
+/// (`yaml_to_owned_value`) #442 didn't touch, so it kept collapsing
+/// duplicate keys within each slurped element even after plain `yq '.'`
+/// was fixed. Must now match [`test_duplicate_mapping_key_survives_yaml_output`]
+/// on the same input, just wrapped in the slurped array.
+#[test]
+fn test_duplicate_mapping_key_survives_slurp() -> Result<()> {
+    let yaml = "a: 1\na: 2\n";
+
+    let (pretty, code) = run_yq_stdin(".", yaml, &["--slurp"])?;
+    assert_eq!(code, 0);
+    assert_eq!(pretty, "-\n  a: 1\n  a: 2\n");
+
+    let (compact, code) = run_yq_stdin(".", yaml, &["--slurp", "-I0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(compact, "-\n  a: 1\n  a: 2\n");
+
+    Ok(())
+}
+
+/// #478: like [`test_duplicate_mapping_key_survives_slurp`], `--slurp`
+/// combining documents from multiple sources into one array must preserve
+/// duplicate keys within each source, not just across sources.
+#[test]
+fn test_duplicate_mapping_key_survives_slurp_multiple_sources() -> Result<()> {
+    let mut file_a = NamedTempFile::new()?;
+    writeln!(file_a, "a: 1\na: 2")?;
+    let mut file_b = NamedTempFile::new()?;
+    writeln!(file_b, "b: 3")?;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .arg("yq")
+        .arg("--slurp")
+        .arg(".")
+        .arg(file_a.path())
+        .arg(file_b.path())
+        .stdin(Stdio::null())
+        .output()?;
+    let stdout = String::from_utf8(output.stdout)?;
+
+    assert!(output.status.success());
+    assert_eq!(stdout, "-\n  a: 1\n  a: 2\n-\n  b: 3\n");
+    Ok(())
+}
+
+/// #478: `--inplace '.'` went through the same lossy `yaml_to_owned_value`
+/// path as `--slurp`, unlike plain `yq '.'` which #442 already fixed.
+/// Real `yq --inplace` v4.53.3 keeps both `a:` entries on this input.
+#[test]
+fn test_duplicate_mapping_key_survives_inplace() -> Result<()> {
+    let mut input_file = NamedTempFile::new()?;
+    writeln!(input_file, "a: 1\na: 2")?;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .arg("yq")
+        .arg("-i")
+        .arg(".")
+        .arg(input_file.path())
+        .stdin(Stdio::null())
+        .output()?;
+
+    assert!(output.status.success());
+    let rewritten = std::fs::read_to_string(input_file.path())?;
+    assert_eq!(rewritten, "a: 1\na: 2\n");
+    Ok(())
+}
+
+/// #478: the `--inplace` fast path is scoped to M2-streamable expressions
+/// (identity/field/index/iterate); confirm field navigation still rewrites
+/// the file correctly, not just plain identity.
+#[test]
+fn test_inplace_field_navigation_still_works() -> Result<()> {
+    let mut input_file = NamedTempFile::new()?;
+    writeln!(input_file, "a:\n  b: 1\n  c: 2")?;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .arg("yq")
+        .arg("-i")
+        .arg(".a")
+        .arg(input_file.path())
+        .stdin(Stdio::null())
+        .output()?;
+
+    assert!(output.status.success());
+    let rewritten = std::fs::read_to_string(input_file.path())?;
+    assert_eq!(rewritten, "b: 1\nc: 2\n");
+    Ok(())
+}
+
+/// #478: filters outside `can_use_m2_streaming` (e.g. `keys`) must still
+/// fall back to the pre-existing DOM path for `--inplace`.
+#[test]
+fn test_inplace_non_m2_filter_still_works() -> Result<()> {
+    let mut input_file = NamedTempFile::new()?;
+    writeln!(input_file, "a: 1\nb: 2")?;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .arg("yq")
+        .arg("-i")
+        .arg("keys")
+        .arg(input_file.path())
+        .stdin(Stdio::null())
+        .output()?;
+
+    assert!(output.status.success());
+    let rewritten = std::fs::read_to_string(input_file.path())?;
+    assert_eq!(rewritten, "- a\n- b\n");
+    Ok(())
+}
+
 #[test]
 fn test_compact_json_output() -> Result<()> {
     let yaml = r"
