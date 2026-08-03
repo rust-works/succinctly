@@ -86,19 +86,36 @@ enum Bracket {
     Static(Expr),
     /// `[expr]` with a computed key; the caller supplies the target.
     Dynamic { key: Expr, optional: bool },
+    /// `[start:end]` with at least one computed bound; the caller supplies
+    /// the target. See [`Expr::SliceExpr`].
+    DynamicSlice {
+        start: Option<Expr>,
+        end: Option<Expr>,
+        optional: bool,
+    },
 }
 
 /// Attach a parsed bracket to the postfix chain built so far.
 ///
 /// A dynamic key captures the chain as its `target`, because the key is
 /// evaluated against the chain's *input* — `.a[.k]` reads `.k` from the chain
-/// input, not from `.a`.
+/// input, not from `.a`. A dynamic slice bound is the same rule applied to
+/// `.a[.k1:.k2]`.
 fn push_bracket(chain: &mut Vec<Expr>, bracket: Bracket) {
     match bracket {
         Bracket::Static(expr) => chain.push(expr),
         Bracket::Dynamic { key, optional } => {
             let target = Expr::pipe(core::mem::take(chain));
             let node = Expr::index_by(target, key);
+            chain.push(if optional { node.optional() } else { node });
+        }
+        Bracket::DynamicSlice {
+            start,
+            end,
+            optional,
+        } => {
+            let target = Expr::pipe(core::mem::take(chain));
+            let node = Expr::slice_by(target, start, end);
             chain.push(if optional { node.optional() } else { node });
         }
     }
@@ -623,16 +640,12 @@ impl<'a> Parser<'a> {
             let end = self.parse_slice_bound()?;
             self.skip_ws();
             self.expect(']')?;
-            return Ok(Bracket::Static(Expr::Slice {
-                start: None,
-                end: Some(end),
-            }));
+            return Ok(Self::finish_slice(None, Some(end)));
         }
 
         // Parse the bracket contents as a full expression. `:` can never be
         // consumed by an expression here — object construction needs `{`, and a
         // namespaced call needs `::` — so it reliably marks a slice.
-        let key_start = self.pos;
         let key = self.parse_expr()?;
         self.skip_ws();
 
@@ -648,30 +661,20 @@ impl<'a> Parser<'a> {
                 })
             }
             Some(':') => {
-                // `[n:]` or `[n:m]` - slice. Bounds must still fold to an
-                // integer literal; expression-valued bounds (`.[$a:$b]`) are
-                // not supported yet.
-                let first = Self::fold_int_literal(&key)
-                    .ok_or_else(|| Self::slice_bound_error(key_start))?;
+                // `[n:]` or `[n:m]` - slice.
                 self.next();
                 self.skip_ws();
 
                 if self.peek() == Some(']') {
                     // `[n:]` - slice from n to end
                     self.next();
-                    Ok(Bracket::Static(Expr::Slice {
-                        start: Some(first),
-                        end: None,
-                    }))
+                    Ok(Self::finish_slice(Some(key), None))
                 } else {
                     // `[n:m]` - slice from n to m
                     let second = self.parse_slice_bound()?;
                     self.skip_ws();
                     self.expect(']')?;
-                    Ok(Bracket::Static(Expr::Slice {
-                        start: Some(first),
-                        end: Some(second),
-                    }))
+                    Ok(Self::finish_slice(Some(key), Some(second)))
                 }
             }
             Some(c) => Err(ParseError::new(
@@ -682,6 +685,30 @@ impl<'a> Parser<'a> {
                 "expected ']' or ':', found end of input",
                 self.pos,
             )),
+        }
+    }
+
+    /// Decide whether a slice's bounds are both constant (the existing
+    /// [`Expr::Slice`] fast path) or need runtime evaluation
+    /// ([`Expr::SliceExpr`], attached to a target by the caller — see
+    /// [`Bracket::DynamicSlice`]). Each bound folds independently, so
+    /// `.[1:.k]` (one literal, one dynamic) still becomes dynamic.
+    fn finish_slice(start: Option<Expr>, end: Option<Expr>) -> Bracket {
+        let start_i64 = start.as_ref().and_then(Self::fold_int_literal);
+        let end_i64 = end.as_ref().and_then(Self::fold_int_literal);
+        let start_dynamic = start.is_some() && start_i64.is_none();
+        let end_dynamic = end.is_some() && end_i64.is_none();
+        if start_dynamic || end_dynamic {
+            Bracket::DynamicSlice {
+                start,
+                end,
+                optional: false,
+            }
+        } else {
+            Bracket::Static(Expr::Slice {
+                start: start_i64,
+                end: end_i64,
+            })
         }
     }
 
@@ -716,20 +743,15 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// The error both slice bounds report when they do not fold.
-    fn slice_bound_error(pos: usize) -> ParseError {
-        ParseError::new("slice bounds must be integer literals", pos)
-    }
-
     /// Parse one slice bound.
     ///
     /// Both bounds go through here so they accept the same spellings. Parsing
     /// only the *first* as an expression would let `.[(1):3]` compile while
-    /// `.[1:(3)]` did not — an asymmetry with no grammar behind it.
-    fn parse_slice_bound(&mut self) -> Result<i64, ParseError> {
-        let start = self.pos;
-        let bound = self.parse_expr()?;
-        Self::fold_int_literal(&bound).ok_or_else(|| Self::slice_bound_error(start))
+    /// `.[1:(3)]` did not — an asymmetry with no grammar behind it. The
+    /// caller (`Self::finish_slice`) decides whether the parsed expression
+    /// folds to a literal or needs runtime evaluation.
+    fn parse_slice_bound(&mut self) -> Result<Expr, ParseError> {
+        self.parse_expr()
     }
 
     /// Parse an index bracket and check for optional marker.
@@ -742,6 +764,11 @@ impl<'a> Parser<'a> {
                 Bracket::Static(expr) => Bracket::Static(Expr::Optional(expr.into())),
                 Bracket::Dynamic { key, .. } => Bracket::Dynamic {
                     key,
+                    optional: true,
+                },
+                Bracket::DynamicSlice { start, end, .. } => Bracket::DynamicSlice {
+                    start,
+                    end,
                     optional: true,
                 },
             })
@@ -4718,7 +4745,6 @@ mod tests {
         // Note: "foo" now parses as FuncCall{name:"foo", args:[]} - valid syntax for user functions
         assert!(parse(".[").is_err()); // unclosed bracket
         assert!(parse(".[1 2]").is_err()); // missing ']' after the key
-        assert!(parse(".[$a:$b]").is_err()); // slice bounds must be integer literals
         assert!(parse(".123").is_err()); // field starting with number
         assert!(parse("{").is_err()); // unclosed brace
         assert!(parse("[").is_err()); // unclosed bracket
@@ -5158,17 +5184,29 @@ mod tests {
             assert_eq!(parse(src).unwrap(), Expr::Slice { start, end }, "`{src}`");
         }
 
-        // A bound that does not fold is still rejected, on either side, and
-        // says why rather than complaining about a digit.
-        for src in [".[$a:1]", ".[1:$b]", ".[:$b]"] {
-            let err = parse(src).unwrap_err();
-            assert!(
-                err.message
-                    .contains("slice bounds must be integer literals"),
-                "`{src}` gave: {}",
-                err.message
-            );
-        }
+        // A bound that does not fold to a literal becomes `Expr::SliceExpr`
+        // instead of a parse error (#499), on either side, and independently
+        // of whether the other bound folds.
+        assert_eq!(
+            parse(".[$a:1]").unwrap(),
+            Expr::slice_by(
+                Expr::Identity,
+                Some(Expr::Var("a".into())),
+                Some(Expr::Literal(Literal::Int(1))),
+            )
+        );
+        assert_eq!(
+            parse(".[1:$b]").unwrap(),
+            Expr::slice_by(
+                Expr::Identity,
+                Some(Expr::Literal(Literal::Int(1))),
+                Some(Expr::Var("b".into())),
+            )
+        );
+        assert_eq!(
+            parse(".[:$b]").unwrap(),
+            Expr::slice_by(Expr::Identity, None, Some(Expr::Var("b".into())))
+        );
     }
 
     /// The nesting shape is what encodes jq's key scoping: every key in a
@@ -5224,6 +5262,70 @@ mod tests {
         assert_eq!(
             parse(".[$k]?").unwrap(),
             Expr::index_by(Expr::Identity, Expr::Var("k".into())).optional()
+        );
+    }
+
+    /// Same nesting shape as `test_dynamic_index_shapes`, for slice bounds
+    /// that don't fold to a literal (#499): `SliceExpr` carries its own
+    /// `target` for the same reason `IndexExpr` does — a bound is evaluated
+    /// against the chain's input, not against the target's output.
+    #[test]
+    fn test_dynamic_slice_shapes() {
+        assert_eq!(
+            parse(".[$a:$b]").unwrap(),
+            Expr::slice_by(
+                Expr::Identity,
+                Some(Expr::Var("a".into())),
+                Some(Expr::Var("b".into())),
+            )
+        );
+
+        // `.a[.k1:.k2]`: the bounds hang off the node, not off `.a`.
+        assert_eq!(
+            parse(".a[.k1:.k2]").unwrap(),
+            Expr::slice_by(
+                Expr::Field("a".into()),
+                Some(Expr::Field("k1".into())),
+                Some(Expr::Field("k2".into())),
+            )
+        );
+
+        // `.a[.k1:.k2].b[.j1:.j2]`: the second target is the whole chain so far.
+        assert_eq!(
+            parse(".a[.k1:.k2].b[.j1:.j2]").unwrap(),
+            Expr::slice_by(
+                Expr::Pipe(vec![
+                    Expr::slice_by(
+                        Expr::Field("a".into()),
+                        Some(Expr::Field("k1".into())),
+                        Some(Expr::Field("k2".into())),
+                    ),
+                    Expr::Field("b".into()),
+                ]),
+                Some(Expr::Field("j1".into())),
+                Some(Expr::Field("j2".into())),
+            )
+        );
+
+        // `?` wraps the whole node, not a bound.
+        assert_eq!(
+            parse(".[$a:$b]?").unwrap(),
+            Expr::slice_by(
+                Expr::Identity,
+                Some(Expr::Var("a".into())),
+                Some(Expr::Var("b".into())),
+            )
+            .optional()
+        );
+
+        // A dynamic bound composes with an `IndexExpr` target and vice versa.
+        assert_eq!(
+            parse(".[.k][$a:$b]").unwrap(),
+            Expr::slice_by(
+                Expr::index_by(Expr::Identity, Expr::Field("k".into())),
+                Some(Expr::Var("a".into())),
+                Some(Expr::Var("b".into())),
+            )
         );
     }
 
