@@ -344,9 +344,9 @@ impl EvalError {
     /// *first* output. jq names only that one and never evaluates the rest,
     /// so `path(1,2)` reports `1`.
     ///
-    /// `v` is dumped bare, not through [`describe`] — jq's sentence is
+    /// `v` is dumped bare, not through `describe` — jq's sentence is
     /// `… with result {"a":1}`, not `… with result object ({"a":1})` — and at
-    /// the wider [`PATH_DUMP_BUDGET`]/[`PATH_DUMP_KEEP`] preview this message
+    /// the wider `PATH_DUMP_BUDGET`/`PATH_DUMP_KEEP` preview this message
     /// alone uses.
     pub fn invalid_path_expression(result: &OwnedValue) -> Self {
         Self::new(format!(
