@@ -765,7 +765,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and lossy through `Builtin::First`/`Builtin::Last` and `Pipe`'s
   stage-advance re-entry (e.g. `jq --preserve-input 'first(.[])'` on
   `[{"a":1,"a":2}]` collapses to one `"a"`), found while verifying the
-  `--preserve-input` fix above — filed as #607.
+  `--preserve-input` fix above — filed as #607. **Since resolved by #607**,
+  though its actual root cause was different from this note's suspicion —
+  see below.
+
+- **`jq --preserve-input 'first(.[])'`/`'last(.[])'` still collapsed
+  duplicate keys inside the selected element** (#607): despite #478's note
+  above naming `Builtin::First`/`Builtin::Last` as the culprit, tracing
+  `first(.[])` through the parser found the real cause was one step earlier —
+  `first(f)`/`last(f)` compiles to `Expr::FirstExpr`/`LastExpr` (the
+  dedicated `first(...)` parse path) or, from a second older parser path, the
+  equivalent `Builtin::FirstStream`/`LastStream`, and *neither* had a native
+  arm in `eval_generic::eval_single`. Both fell through the catch-all
+  `to_owned()` bridge at the bottom of that function, which materializes the
+  entire input into an `IndexMap`-backed `OwnedValue` — collapsing the
+  duplicate key *before* `first`/`last` even ran, regardless of what
+  `Builtin::First`/`Builtin::Last` did. Fixed by giving `eval_single` and
+  `eval_builtin` native arms for all four spellings, delegating to a new
+  `eval_first_or_last_generic` helper that mirrors
+  `eval::eval_first_expr`/`eval_last_expr`'s control-flow (short-circuit on
+  first output vs. must-exhaust-the-stream for `last`) while preserving
+  `GenericResult::OneCursor`/`ManyCursor` through the extraction instead of
+  materializing.
+
+  The originally-suspected sites were real bugs too, just not *this* one:
+  `Builtin::First`/`Builtin::Last` (the bare zero-arg `first`/`last` keyword,
+  equivalent to `.[0]`/`.[-1]` — a different AST node from `first(f)`/
+  `last(f)`) called `elements.get(...)` instead of the `get_cursor(...)`
+  sibling `Expr::Index` already used, and `index_one_generic` (behind
+  computed-key indexing like `.[$k]`/`.[(expr)]`, via `Expr::IndexExpr`)
+  called `fields.find`/`elements.get` instead of `find_cursor`/`get_cursor`.
+  Both fixed the same one-line way, plus `eval_index_expr`'s accumulation
+  loop now collects `V::Cursor`s and emits `OneCursor`/`ManyCursor` instead
+  of a materialized `One`/`Many`. Audit bonus: `Builtin::SplitDoc` was
+  documented as "identity" but unconditionally returned
+  `GenericResult::Owned(to_owned(&value))` instead of forwarding the cursor
+  the way `Values`/`Iterables`/`Scalars`/`Identity` already do — fixed to
+  match.
+
+  Out of scope, and documented as such: the catch-all fallback itself (any
+  `Expr`/`Builtin` not natively handled by `eval_single`/`eval_builtin` --
+  arithmetic, `map`, `recurse`, `group_by`, construction, etc.) still
+  materializes via `to_owned()` first; narrowing it further is a much
+  larger-blast-radius change than this issue's scope. Also out of scope:
+  `yq`'s equivalent CLI paths (`evaluate_yaml_cursor` in `yq_runner.rs`)
+  convert *every* `GenericResult::OneCursor`/`One` through `to_owned()`
+  unconditionally, so `yq 'first(.[])'`/`'last(.[])'`/a computed index still
+  collapse duplicate keys even after this fix — confirmed pre-existing
+  (reproduces identically on `main`), unrelated to `standard_json_to_jq_value`
+  (JSON-only), and large enough in its own right to need separate
+  investigation.
 
 - **The strict YAML validator accepted a flow-collection anchor immediately
   followed by an alias** (#452): `[&a *a]` and `{k: &a *a}` passed
