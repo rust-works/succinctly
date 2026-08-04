@@ -8427,12 +8427,12 @@ fn push_recursive_branches(prefix: &[Expr], value: &OwnedValue, out: &mut Vec<Pa
 
 /// Fan `recurse(f)` / `recurse(f; cond)` out into one branch per visited
 /// node. Follows `builtin_recurse_f`/`builtin_recurse_cond`'s breadth-first
-/// queue — including swallowing `f`'s errors and the `MAX_ITEMS` cutoff —
-/// but resolves `f` through [`resolve_node`] at each step instead of
-/// [`eval_owned_multi`], so every queued value carries the path components
-/// that reach it. Since #490, `builtin_recurse_f`/`builtin_recurse_cond`
-/// also resolve `f` through [`eval_owned_multi`] and agree with this
-/// function on not flattening an array-valued child into its elements.
+/// queue — including the `MAX_ITEMS` cutoff — but resolves `f` through
+/// [`resolve_node`] at each step instead of [`eval_owned_multi`], so every
+/// queued value carries the path components that reach it. Since #490,
+/// `builtin_recurse_f`/`builtin_recurse_cond` also resolve `f` through
+/// [`eval_owned_multi`] and agree with this function on not flattening an
+/// array-valued child into its elements.
 ///
 /// `cond` mirrors `builtin_recurse_cond`'s semantics (#627): jq's own
 /// definition is `def r: ., (f | select(cond) | r); r;`, so `cond` gates
@@ -8442,6 +8442,12 @@ fn push_recursive_branches(prefix: &[Expr], value: &OwnedValue, out: &mut Vec<Pa
 /// child once per truthy output (confirmed against jq 1.7.1:
 /// `path(recurse(f; (true,true)))` duplicates that branch), so each truthy
 /// output pushes its own copy of `(path, child_value)`.
+///
+/// An error raised while evaluating `f` or `cond` aborts immediately —
+/// nothing in jq's own definition above catches one — returning whatever
+/// branches were already committed to `outputs`, mirroring `resolve_node`'s
+/// own `Comma` arm (#636; matches `builtin_recurse_f`/`builtin_recurse_cond`,
+/// fixed the same way).
 ///
 /// One divergence remains, deliberately: this function still does not queue
 /// a null child, where the value evaluator does. `f` is arbitrary and
@@ -8470,7 +8476,18 @@ fn resolve_recurse<S: EvalSemantics>(
         let (prefix, current) = queue.remove(0);
         outputs.push((prefix.clone(), current.clone()));
 
-        for (child_components, child_value) in resolve_node::<S>(f, &current).unwrap_or_default() {
+        // An `f` error aborts immediately rather than pruning `current`'s
+        // children — see the doc comment above (#636). The candidate
+        // children `resolve_node` may have already resolved before hitting
+        // that error are dropped rather than queued, matching
+        // `eval_owned_multi`'s all-or-nothing contract for
+        // `builtin_recurse_f`/`builtin_recurse_cond`.
+        let children = match resolve_node::<S>(f, &current) {
+            Ok(children) => children,
+            Err((_prefix, e)) => return Err((outputs, e)),
+        };
+
+        for (child_components, child_value) in children {
             // A null child ends that line of descent here, unlike the value
             // evaluator since #490. See the note above on why this function
             // keeps the guard: it bounds path-prefix growth, not just count.
@@ -8486,14 +8503,17 @@ fn resolve_recurse<S: EvalSemantics>(
                 Some(cond) => {
                     // `cond` gates the child, not `current`, and forks once
                     // per truthy output — see the doc comment above (#627).
-                    // An error prunes this child, same as a falsy cond;
-                    // neither propagates as a resolve error.
-                    if let Ok(cond_outputs) = eval_owned_multi::<S>(cond, &child_value) {
-                        for c in &cond_outputs {
-                            if c.is_truthy() {
-                                queue.push((path.clone(), child_value.clone()));
+                    // A `cond` error aborts immediately too (#636), same as
+                    // `f`'s error above.
+                    match eval_owned_multi::<S>(cond, &child_value) {
+                        Ok(cond_outputs) => {
+                            for c in &cond_outputs {
+                                if c.is_truthy() {
+                                    queue.push((path.clone(), child_value.clone()));
+                                }
                             }
                         }
+                        Err(e) => return Err((outputs, e)),
                     }
                 }
             }
@@ -10401,8 +10421,12 @@ fn builtin_recurse_f<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // Every output of `f` becomes exactly one queued child, in order — a
         // null output is a real value (not "no child"), and an array output
         // is visited as one node (not spliced into its elements) (#490).
-        if let Ok(children) = eval_owned_multi::<S>(f, &current) {
-            queue.extend(children);
+        // An error aborts immediately, same as jq's `def r: ., (f | r); r;`
+        // (#636) — the values already output no longer vanish, via the same
+        // `partial()` helper #495 uses for `repeat`/`while`.
+        match eval_owned_multi::<S>(f, &current) {
+            Ok(children) => queue.extend(children),
+            Err(e) => return partial(outputs, Control::Error(e)),
         }
     }
 
@@ -10450,17 +10474,23 @@ fn builtin_recurse_cond<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
         // Every output of `f` becomes exactly one candidate child, in order —
         // a null output is a real value (not "no child"), and an array output
-        // is visited as one node (not spliced into its elements) (#490).
-        let Ok(children) = eval_owned_multi::<S>(f, &current) else {
-            continue;
+        // is visited as one node (not spliced into its elements) (#490). An
+        // `f` error aborts immediately rather than pruning `current`'s
+        // children, matching jq's `def r: ., (f | select(cond) | r); r;`,
+        // where nothing catches an error from `f` (#636).
+        let children = match eval_owned_multi::<S>(f, &current) {
+            Ok(children) => children,
+            Err(e) => return partial(outputs, Control::Error(e)),
         };
 
         for child in children {
             // `cond` gates the child, not `current` (see doc comment above).
-            // A cond error prunes this child, same as a falsy cond — neither
-            // is propagated as a query error.
-            let Ok(cond_outputs) = eval_owned_multi::<S>(cond, &child) else {
-                continue;
+            // A `cond` error aborts immediately too — same jq definition,
+            // same reasoning as `f`'s error above (#636) — rather than
+            // pruning just this child the way a falsy `cond` does.
+            let cond_outputs = match eval_owned_multi::<S>(cond, &child) {
+                Ok(cond_outputs) => cond_outputs,
+                Err(e) => return partial(outputs, Control::Error(e)),
             };
             for c in &cond_outputs {
                 if c.is_truthy() {
