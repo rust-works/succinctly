@@ -7699,7 +7699,20 @@ fn update_path<S: EvalSemantics>(
             // filter` expression is handled by `eval_update`'s caller
             // instead, which is why `update_path` is always entered with
             // `optional: false` at the top.
-            let v = eval_owned_expr::<S>(filter_expr, root, false)?;
+            //
+            // `eval_owned_multi`, not `eval_owned_expr`: `|=` keeps only the
+            // filter's *first* output, never an array of every output
+            // (#392) -- `eval_owned_expr` collapsed a multi-output result
+            // into exactly that array (`.a |= (1,2)` produced
+            // `{"a":[1,2]}` instead of jq's `{"a":1}`). A zero-output
+            // filter still falls back to `Null` here -- `.a |= empty`
+            // leaves `"a":null` rather than deleting the key the way real
+            // jq does, a separate, pre-existing bug this fix does not
+            // change.
+            let v = eval_owned_multi::<S>(filter_expr, root)?
+                .into_iter()
+                .next()
+                .unwrap_or(OwnedValue::Null);
             *root = v;
             Ok(())
         }
@@ -24423,6 +24436,23 @@ mod tests {
                 assert_eq!(arr[2], OwnedValue::Int(6));
             }
         );
+    }
+
+    #[test]
+    fn test_update_assign_multi_output_rhs_keeps_only_the_first_output() {
+        // #392: `|=` takes only the RHS filter's first output, never an
+        // array of every output (which was the `Expr::Identity` arm's bug
+        // before this fix).
+        assert_eq!(outputs(b"{}", ".a |= (1,2)"), vec![r#"{"a":1}"#]);
+    }
+
+    #[test]
+    fn test_update_assign_empty_rhs_characterizes_preexisting_null_bug() {
+        // Real jq deletes the key when the update filter produces no output
+        // (`.a |= empty` on `{}` is `{}`); succinctly currently leaves it
+        // `null`. Pre-existing, out of scope for #392 -- if this is ever
+        // fixed, update this test.
+        assert_eq!(outputs(b"{}", ".a |= empty"), vec![r#"{"a":null}"#]);
     }
 
     #[test]
