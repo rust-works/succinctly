@@ -690,22 +690,154 @@ fn eval_array_construction<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     QueryResult::Owned(OwnedValue::Array(items))
 }
 
-/// jq's refusal of a non-string object key — or nothing at all under the
-/// `optional` flag, which is what jq's `?` suffix sets: `0 | {(.):1}?` prints
-/// nothing there.
+/// Non-local exit out of the object-construction recursion.
 ///
-/// Succinctly's parser does not yet accept `?` on anything but a path
-/// expression, so today the flag arrives only from within; the branch is
-/// covered directly by `test_optional_suppresses_the_object_key_refusal`.
-fn refuse_object_key<'a, W: Clone + AsRef<[u64]>>(
-    key: &OwnedValue,
-    optional: bool,
-) -> QueryResult<'a, W> {
-    if optional {
-        QueryResult::None
-    } else {
-        QueryResult::Error(EvalError::cannot_use_as_object_key(key))
+/// `Error` and `Break` are the two `QueryResult` variants that must abandon the
+/// product rather than contribute an output, so they travel as the `Err` side of
+/// the recursive builder instead of being re-matched at every level. `None` is a
+/// third: the `optional` flag (`?`) turns a non-string-key refusal into an empty
+/// result instead of an error, the same way it does for `from_entries` and
+/// `with_entries` — covered by `test_optional_suppresses_the_object_key_refusal`.
+enum ObjectEscape {
+    None,
+    Error(EvalError),
+    Break(String),
+}
+
+/// Materialize every output of a sub-expression, plus a deferred escape if its
+/// own generator terminates in an error or break.
+///
+/// jq doesn't stop early just because a generator is *going* to fail: `(1, 2,
+/// error("x"))` still yields `1` and `2` before the error propagates, and
+/// those outputs are real objects once combined with the rest of the entries
+/// (`{a: 1, b: (2, error("x"))}` is `{"a":1,"b":2}` *then* the error — verified
+/// against jq 1.7.1). So a `Partial` here is not an escape to peel off, the
+/// way a bare `Error`/`Break` is (those two carry no outputs at all); its
+/// prefix is exactly the outputs to combine, and its control is what fires
+/// once that prefix is exhausted. [`QueryResult::collect_owned`] isn't reused
+/// for the non-`Partial` cases because it would fold `Partial` down to just
+/// its prefix and silently drop the control that must fire after it.
+fn object_outputs<W: Clone + AsRef<[u64]>>(
+    result: QueryResult<'_, W>,
+) -> (Vec<OwnedValue>, Option<Control>) {
+    match result {
+        QueryResult::Error(e) => (Vec::new(), Some(Control::Error(e))),
+        QueryResult::Break(label) => (Vec::new(), Some(Control::Break(label))),
+        QueryResult::Partial(vs, control) => (vs, Some(control)),
+        other => (other.collect_owned(), None),
     }
+}
+
+impl From<Control> for ObjectEscape {
+    fn from(control: Control) -> Self {
+        match control {
+            Control::Error(e) => Self::Error(e),
+            Control::Break(label) => Self::Break(label),
+        }
+    }
+}
+
+/// Emit one object per combination of the remaining entries' key/value outputs.
+///
+/// Object construction is a generator in jq: an entry whose key or value yields
+/// *n* outputs multiplies the objects produced (#354). The nesting below is what
+/// gives jq's observable ordering and laziness:
+///
+/// - the *last* entry varies fastest, and within an entry the key varies slower
+///   than the value — hence entries recurse and the key loop encloses the value
+///   loop;
+/// - `rest` is only reached from inside the value loop, so an entry with zero
+///   outputs short-circuits every entry to its right without evaluating them
+///   (`{a: empty, b: error("boom")}` is empty, not an error);
+/// - the key's string-ness is checked at assembly time, after the value is in
+///   hand, so `{(.n): empty}` with a numeric `.n` raises nothing and
+///   `{(.n): error("VAL")}` reports `VAL` rather than the key-type error;
+/// - a key or value generator's own deferred control (see [`object_outputs`])
+///   is checked only after its whole prefix loop has run to completion, and
+///   is then returned via `?` — which unwinds every enclosing loop immediately
+///   rather than resuming them, matching jq's own all-or-nothing backtracking:
+///   `{a: (1,2), b: (10,error("x"))}` is `{"a":1,"b":10}` then the error, never
+///   `{"a":2,"b":10}` (jq 1.7.1).
+///
+/// `acc` is a push/pop stack rather than a map: the object is built once per
+/// combination via `collect()`, which gives jq's duplicate-key rule (last value
+/// wins, first position) for free from `IndexMap::insert`.
+///
+/// `sole` tracks whether every enclosing loop is running its one and only
+/// iteration — i.e. whether the product is a single object, which is the case
+/// for every query that predates #354. It exists purely so that case can move
+/// the accumulated values into the object instead of cloning them, keeping the
+/// common path allocation-for-allocation identical to the pre-#354 code. Without
+/// it, `{a: .big}` would deep-clone `.big` on the way out.
+fn build_object_entries<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    entries: &[super::expr::ObjectEntry],
+    value: &StandardJson<'_, W>,
+    optional: bool,
+    sole: bool,
+    acc: &mut Vec<(String, OwnedValue)>,
+    out: &mut Vec<OwnedValue>,
+) -> Result<(), ObjectEscape> {
+    let Some((entry, rest)) = entries.split_first() else {
+        let object = if sole {
+            // Only combination, so nothing will read `acc` again: every enclosing
+            // loop is on its final iteration, and the `acc.pop()` each one runs on
+            // the way out is a no-op on the emptied vector.
+            core::mem::take(acc).into_iter().collect::<IndexMap<_, _>>()
+        } else {
+            acc.iter().cloned().collect::<IndexMap<_, _>>()
+        };
+        out.push(OwnedValue::Object(object));
+        return Ok(());
+    };
+
+    let (keys, key_trailing) = match &entry.key {
+        ObjectKey::Literal(s) => (vec![OwnedValue::String(s.clone())], None),
+        ObjectKey::Expr(key_expr) => {
+            object_outputs(eval_single::<W, S>(key_expr, value.clone(), optional))
+        }
+    };
+    let sole = sole && keys.len() == 1;
+
+    for key in keys {
+        let (vals, val_trailing) =
+            object_outputs(eval_single::<W, S>(&entry.value, value.clone(), optional));
+        let sole = sole && vals.len() == 1;
+
+        for val in vals {
+            let OwnedValue::String(key_str) = &key else {
+                // A single non-string key is jq's `Cannot use <t> (<v>) as
+                // object key` — the same sentence `from_entries` raises,
+                // because jq *defines* `from_entries` as object construction
+                // over the entries (#391) — unless `optional` (`?`) is set, in
+                // which case it is suppressed into an empty result instead.
+                return Err(if optional {
+                    ObjectEscape::None
+                } else {
+                    ObjectEscape::Error(EvalError::cannot_use_as_object_key(&key))
+                });
+            };
+
+            acc.push((key_str.clone(), val));
+            let result = build_object_entries::<W, S>(rest, value, optional, sole, acc, out);
+            acc.pop();
+            result?;
+        }
+
+        // The value generator's own prefix is exhausted — now its deferred
+        // control fires, aborting every enclosing loop via `?` (never trying
+        // this entry's next key, nor an earlier entry's next value).
+        if let Some(control) = val_trailing {
+            return Err(control.into());
+        }
+    }
+
+    // Same deferred-control shape as above, one level up: only once every key
+    // this generator produced has had its value loop run to completion.
+    if let Some(control) = key_trailing {
+        return Err(control.into());
+    }
+
+    Ok(())
 }
 
 /// Evaluate object construction.
@@ -714,79 +846,40 @@ fn eval_object_construction<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    let mut map = IndexMap::new();
+    let mut objects = Vec::new();
+    let mut acc = Vec::new();
 
-    for entry in entries {
-        // Evaluate the key
-        let key_str = match &entry.key {
-            ObjectKey::Literal(s) => s.clone(),
-            ObjectKey::Expr(key_expr) => {
-                let key_result =
-                    eval_single::<W, S>(key_expr, value.clone(), optional).materialize_cursor();
-                match key_result {
-                    QueryResult::One(StandardJson::String(s)) => match s.as_str() {
-                        Ok(cow) => cow.into_owned(),
-                        // Not a condition jq has — its strings are always
-                        // valid UTF-8 — so this keeps succinctly's wording.
-                        Err(_) => {
-                            return QueryResult::Error(EvalError::new("key must be a string"))
-                        }
-                    },
-                    QueryResult::Owned(OwnedValue::String(s)) => s,
-                    QueryResult::Error(e) => return QueryResult::Error(e),
-                    QueryResult::Break(label) => return QueryResult::Break(label),
-                    // A single non-string key is jq's `Cannot use <t> (<v>) as
-                    // object key` — the same sentence `from_entries` raises,
-                    // because jq *defines* `from_entries` as object
-                    // construction over the entries (#391).
-                    QueryResult::One(v) => return refuse_object_key(&to_owned(&v), optional),
-                    QueryResult::Owned(v) => return refuse_object_key(&v, optional),
-                    // A key expression yielding no value, or more than one, is
-                    // a separate behavioural gap — jq gives `empty` and a
-                    // cartesian product respectively. See
-                    // docs/compliance/jq/limitations.md.
-                    _ => {
-                        return QueryResult::Error(EvalError::new("key must be a string"));
-                    }
-                }
-            }
-        };
-
-        // Evaluate the value
-        let val_result = eval_single::<W, S>(&entry.value, value.clone(), optional);
-        let owned_val = match val_result.materialize_cursor() {
-            QueryResult::One(v) => to_owned(&v),
-            QueryResult::OneCursor(_) => unreachable!(),
-            QueryResult::Owned(v) => v,
-            QueryResult::Many(vs) => {
-                // Multiple values - take the first one (jq behavior)
-                if let Some(v) = vs.first() {
-                    to_owned(v)
-                } else {
-                    OwnedValue::Null
-                }
-            }
-            QueryResult::ManyOwned(vs) => {
-                if let Some(v) = vs.into_iter().next() {
-                    v
-                } else {
-                    OwnedValue::Null
-                }
-            }
-            QueryResult::None => OwnedValue::Null,
-            QueryResult::Error(e) => return QueryResult::Error(e),
-            QueryResult::Break(label) => return QueryResult::Break(label),
-            // Object construction is atomic in jq (verified:
-            // `{a:1,b:error("x")}` produces no output at all) — a `Partial`
-            // value stream just surfaces its control, same as a bare one.
-            QueryResult::Partial(_, Control::Error(e)) => return QueryResult::Error(e),
-            QueryResult::Partial(_, Control::Break(label)) => return QueryResult::Break(label),
-        };
-
-        map.insert(key_str, owned_val);
+    // jq streams, so it emits the combinations produced before an error and
+    // only then fails: `try {("a",1):2}` is `{"a":2}` there, and here — the
+    // objects already pushed to `out` by the time `build_object_entries`
+    // returns `Err` travel onward as `QueryResult::Partial`'s prefix, the same
+    // carrier `eval_comma` uses for `(1,error("x"))` (#400/#494).
+    match build_object_entries::<W, S>(entries, &value, optional, true, &mut acc, &mut objects) {
+        Ok(()) => {}
+        Err(ObjectEscape::None) => return QueryResult::None,
+        Err(ObjectEscape::Break(label)) => {
+            return if objects.is_empty() {
+                QueryResult::Break(label)
+            } else {
+                QueryResult::Partial(objects, Control::Break(label))
+            };
+        }
+        Err(ObjectEscape::Error(e)) => {
+            return if objects.is_empty() {
+                QueryResult::Error(e)
+            } else {
+                QueryResult::Partial(objects, Control::Error(e))
+            };
+        }
     }
 
-    QueryResult::Owned(OwnedValue::Object(map))
+    if objects.is_empty() {
+        QueryResult::None
+    } else if objects.len() == 1 {
+        QueryResult::Owned(objects.pop().unwrap())
+    } else {
+        QueryResult::ManyOwned(objects)
+    }
 }
 
 /// Evaluate recursive descent.
@@ -3604,7 +3697,7 @@ fn builtin_from_entries<W: Clone + AsRef<[u64]>>(
         Ok(result) => QueryResult::Owned(OwnedValue::Object(result)),
         // The `?` suffix swallows the refusal outright in jq, as the arm
         // above already does for a non-array/non-object input. See
-        // `refuse_object_key` on why the flag is not yet reachable from
+        // `ObjectEscape`'s doc on why the flag is not yet reachable from
         // succinctly's own syntax.
         Err(_) if optional => QueryResult::None,
         Err(e) => QueryResult::Error(e),
@@ -6507,6 +6600,11 @@ fn eval_owned_pipe<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Expr::Pipe(exprs.to_vec())
     };
 
+    // Deliberately not `eval_owned_expr`: that returns a single `OwnedValue` and
+    // folds a multi-output rest-of-pipe into `OwnedValue::Array`, so `.a[]` after
+    // an owned stage answered `[1,2]` instead of `1` then `2`.
+    // `reduce`/`foreach`/path-tracking still want that single-value collapse, so
+    // only the pipe continuation is widened here.
     eval_owned_input::<W, S>(&rest_expr, &value, optional)
 }
 
@@ -17768,6 +17866,21 @@ mod tests {
     }
 
     #[test]
+    fn test_multi_output_preserved_across_owned_pipe() {
+        // Once a pipe stage produces an owned value, the rest of the pipe is
+        // re-evaluated against it. That continuation used to be squeezed through
+        // a single-`OwnedValue` signature, which folded a multi-output rest into
+        // one array -- `.a[]` below answered `[1,2]` instead of `1` then `2`.
+        assert_eq!(outputs(b"null", "{a:[1,2]} | .a[]"), ["1", "2"]);
+        assert_eq!(outputs(b"null", "{a:[1,2]} | .a | .[]"), ["1", "2"]);
+        assert_eq!(outputs(b"null", "{a:[1,2]} | .a[] | . + 1"), ["2", "3"]);
+
+        // Single-output and empty continuations are unaffected.
+        assert_eq!(outputs(b"null", "{a:[1,2]} | .a"), ["[1,2]"]);
+        assert_eq!(outputs(b"null", "{a:[]} | .a[]"), Vec::<String>::new());
+    }
+
+    #[test]
     fn test_slice() {
         // jq array slicing yields a single sub-array, not a stream of elements.
         query!(br"[0, 1, 2, 3, 4, 5]", ".[1:4]",
@@ -17889,6 +18002,82 @@ mod tests {
             QueryResult::Owned(OwnedValue::Object(obj)) => {
                 assert_eq!(obj.len(), 0);
             }
+        );
+    }
+
+    #[test]
+    fn test_object_construction_is_a_cartesian_product_354() {
+        // The last entry varies fastest; within an entry the key varies slower
+        // than the value. Pinned against jq-1.7.1 (#354).
+        assert_eq!(
+            outputs(b"null", "{a: (1,2), b: (3,4)}"),
+            [
+                r#"{"a":1,"b":3}"#,
+                r#"{"a":1,"b":4}"#,
+                r#"{"a":2,"b":3}"#,
+                r#"{"a":2,"b":4}"#
+            ]
+        );
+
+        // Multi-output keys multiply too, rather than erroring.
+        assert_eq!(
+            outputs(b"null", r#"{("x","y"): (1,2)}"#),
+            [r#"{"x":1}"#, r#"{"x":2}"#, r#"{"y":1}"#, r#"{"y":2}"#]
+        );
+
+        // Borrowed (document-derived) values, not just constructed ones.
+        assert_eq!(
+            outputs(br#"{"x":9,"y":8}"#, "{a: (.x,.y)}"),
+            [r#"{"a":9}"#, r#"{"a":8}"#]
+        );
+
+        // Duplicate keys are not deduplicated across combinations, and within
+        // one object the last value wins while the first position is kept.
+        assert_eq!(
+            outputs(b"null", r#"{("a","a"): (1,2)}"#),
+            [r#"{"a":1}"#, r#"{"a":2}"#, r#"{"a":1}"#, r#"{"a":2}"#]
+        );
+        assert_eq!(outputs(b"null", "{a:1, b:2, a:3}"), [r#"{"a":3,"b":2}"#]);
+    }
+
+    #[test]
+    fn test_object_construction_empty_entry_yields_no_objects_354() {
+        // An entry with zero outputs empties the product -- it does not become
+        // a null-valued field.
+        query!(br"null", "{a: empty, b: 1}", QueryResult::None => {});
+        query!(br"null", "{a: 1, b: empty}", QueryResult::None => {});
+
+        // ...and short-circuits every entry to its right, so the error below is
+        // never evaluated. jq agrees: exit 0, no output.
+        query!(br"null", r#"{a: empty, b: error("boom")}"#, QueryResult::None => {});
+    }
+
+    #[test]
+    fn test_object_construction_key_type_checked_at_assembly_354() {
+        // A non-string key raises nothing while the value stream is empty...
+        query!(br#"{"n":1}"#, "{(.n): empty}", QueryResult::None => {});
+
+        // ...loses to an error raised by the value...
+        query!(br#"{"n":1}"#, r#"{(.n): error("VAL")}"#,
+            QueryResult::Error(e) => assert_eq!(e.message, "VAL"));
+
+        // ...and otherwise names the offending type, in jq's own wording (#391).
+        query!(br#"{"n":1}"#, "{(.n): 2}",
+            QueryResult::Error(e) => assert_eq!(e.message, "Cannot use number (1) as object key"));
+
+        // The key expression is evaluated before the value expression.
+        query!(br#"{"n":1}"#, r#"{(error("KEY")): error("VAL")}"#,
+            QueryResult::Error(e) => assert_eq!(e.message, "KEY"));
+    }
+
+    #[test]
+    fn test_multi_output_object_after_owned_pipe_354() {
+        // The pipe's LHS is a constructed (owned) object, so the RHS is
+        // re-evaluated through the owned-pipe path, which used to fold a
+        // multi-output RHS into a single array.
+        assert_eq!(
+            outputs(b"null", r#"{"p":1} | {a: (2,3)}"#),
+            [r#"{"a":2}"#, r#"{"a":3}"#]
         );
     }
 
@@ -18552,9 +18741,14 @@ mod tests {
 
     #[test]
     fn regression_issue_400_array_and_object_construction_stay_atomic() {
-        // Verified against jq 1.7.1: construction is atomic — an error
-        // partway through aborts with no output at all, unlike a bare
-        // top-level comma.
+        // Verified against jq 1.7.1: an error with nothing yet successfully
+        // combined aborts with no output at all, unlike a bare top-level
+        // comma. Array construction is unconditionally atomic this way — see
+        // `partial_in_value_position_collapses_to_its_control`. Object
+        // construction only looks atomic here because neither entry has a
+        // completed sibling to combine with when `b` errors; once one does,
+        // it streams the completed combinations first (#354) — see
+        // `partial_prefix_survives_the_stream_forwarding_constructs`.
         query!(b"null", r#"[1,error("x"),3]"#,
             QueryResult::Error(e) => {
                 assert_eq!(e.message, "x");
@@ -18611,6 +18805,13 @@ mod tests {
         // built from the prefix and *then* fails. Those are recorded here as
         // divergences so the arms are covered without the expectation reading
         // as an oracle-backed one.
+        //
+        // Object construction *used* to be listed here too (`{a:1,b:(2,error("x"))}`
+        // collapsing straight to the error), but #354's rewrite made it a real
+        // generator like jq's: it now streams `{"a":1,"b":2}` before failing,
+        // the same as jq 1.7.1. See
+        // `partial_prefix_survives_the_stream_forwarding_constructs` for its
+        // coverage.
         let atomic: &[(&[u8], &str, &str, &str)] = &[
             // Matches jq 1.7.1: no output at all, then the error.
             (b"null", r#"[1,(2,error("x")),3]"#, "x", "matches jq 1.7.1"),
@@ -18620,14 +18821,6 @@ mod tests {
                 r#"with_entries((.,error("x")))"#,
                 "x",
                 "matches jq 1.7.1",
-            ),
-            // Diverges from jq 1.7.1, which prints the value built from the
-            // prefix before failing.
-            (
-                b"null",
-                r#"{a:1,b:(2,error("x"))}"#,
-                "x",
-                r#"jq 1.7.1 prints {"a":1,"b":2}, then fails"#,
             ),
             // `select`/`if` fan out over their condition's outputs (#378) —
             // they forward their operand as a stream, not a value, so they no
@@ -18684,7 +18877,6 @@ mod tests {
             (b"null", "[1,(2,break $out),3]"),
             (b"[1,2]", "map((.,break $out))"),
             (br#"{"a":1}"#, "with_entries((.,break $out))"),
-            (b"null", "{a:1,b:(2,break $out)}"),
             // `select`/`if`: see the comment in `atomic` above.
             (b"null", r#""v=\((1,break $out))""#),
             (b"[10,20,30]", ".[(1,break $out)]"),
@@ -18699,10 +18891,14 @@ mod tests {
 
         // With an enclosing label the break is caught, which is what makes the
         // array/object split above observable end-to-end: jq 1.7.1 agrees that
-        // `[...]` yields nothing here, and disagrees about `{...}` (it prints
-        // the object).
+        // `[...]` yields nothing here. Object construction used to match that
+        // (wrongly — see the comment above `atomic`); post-#354 it agrees with
+        // jq 1.7.1 instead, printing the object built from the prefix.
         assert!(outputs(b"null", "label $out | [1,(2,break $out),3]").is_empty());
-        assert!(outputs(b"null", "label $out | {a:1,b:(2,break $out)}").is_empty());
+        assert_eq!(
+            outputs(b"null", "label $out | {a:1,b:(2,break $out)}"),
+            [r#"{"a":1,"b":2}"#]
+        );
     }
 
     #[test]
@@ -18815,6 +19011,41 @@ mod tests {
             QueryResult::Partial(vs, Control::Break(label)) => {
                 assert_eq!(prefix_json(&vs), [r#""t""#]);
                 assert_eq!(label, "out");
+            }
+        );
+
+        // Object construction (#354): a value generator's own prefix is
+        // combined into objects before its trailing control surfaces.
+        // Matches jq 1.7.1 (`{a:1,b:(2,error("x"))}` prints `{"a":1,"b":2}`,
+        // then fails).
+        query!(b"null", r#"{a:1,b:(2,error("x"))}"#,
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(prefix_json(&vs), [r#"{"a":1,"b":2}"#]);
+                assert_eq!(e.message, "x");
+            }
+        );
+        query!(b"null", r"{a:1,b:(2,break $out)}",
+            QueryResult::Partial(vs, Control::Break(label)) => {
+                assert_eq!(prefix_json(&vs), [r#"{"a":1,"b":2}"#]);
+                assert_eq!(label, "out");
+            }
+        );
+        // A trailing control on an *earlier* entry aborts every enclosing
+        // loop outright rather than resuming it — jq 1.7.1 agrees `a`'s
+        // second branch is never tried once `b` fails on its first.
+        query!(b"null", r#"{a:(1,2),b:(10,error("x"))}"#,
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(prefix_json(&vs), [r#"{"a":1,"b":10}"#]);
+                assert_eq!(e.message, "x");
+            }
+        );
+        // A trailing control on the key generator: every key it already
+        // produced runs its full value loop first (jq 1.7.1: `{"x":10}` then
+        // `{"x":20}`, then the non-string-key error).
+        query!(b"null", r#"{("x",1):(10,20)}"#,
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(prefix_json(&vs), [r#"{"x":10}"#, r#"{"x":20}"#]);
+                assert_eq!(e.message, "Cannot use number (1) as object key");
             }
         );
     }

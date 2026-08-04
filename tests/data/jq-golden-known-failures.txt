@@ -79,8 +79,13 @@
 # `Identity`/`Field`/`Index`/`Slice`/`Iterate` primitives the walker already
 # handles natively needs the pre-pass) so a resolver arm existing without the
 # gate routing to it can't recur the same way for the next combinator (#483).
+#
+# #354 fixed object construction's cartesian product (`eval_object_construction`
+# now emits one object per key/value combination instead of taking each
+# generator's first output). object_construct_cartesian — seeded far earlier by
+# #513 and predating the fix's own five new golden cases — passes too, dropping
+# the file to 7.
 
-object_construct_cartesian     object_construct   only the first output of each key/value generator is used instead of the cartesian product — #354
 assign_multi_output_rhs        assignment         .a = (1,2) only applies the first RHS output instead of forking once per output — #392
 reduce_multi_output_init       reduce             a multi-output reduce INIT forks in jq; only the first init output is used — #534
 foreach_multi_output_init      foreach            a multi-output foreach INIT forks in jq; only the first init output is used — #534

@@ -715,3 +715,59 @@ fn slice_path_component_agrees_across_evaluators() {
         assert_parity(json, filter);
     }
 }
+
+#[test]
+fn test_object_construction_product_parity_354() {
+    // Object construction is a generator: an entry whose key or value yields n
+    // outputs multiplies the objects produced (#354). Both evaluators route
+    // `Expr::Object` through eval.rs -- eval_generic has no Object arm -- so
+    // parity alone cannot catch this bug. Every expectation below is therefore
+    // pinned against real jq-1.7.1 first, then locked in by assert_parity.
+    for (json, filter, expected) in [
+        // The LAST entry varies fastest; within an entry the key varies slower
+        // than the value. A transposed product would order these differently.
+        (
+            b"null".as_slice(),
+            "{a: (1,2), b: (3,4)}",
+            vec![
+                r#"{"a":1,"b":3}"#,
+                r#"{"a":1,"b":4}"#,
+                r#"{"a":2,"b":3}"#,
+                r#"{"a":2,"b":4}"#,
+            ],
+        ),
+        // Multi-output keys are a product too, not an error.
+        (
+            b"null",
+            r#"{("x","y"): (1,2)}"#,
+            vec![r#"{"x":1}"#, r#"{"x":2}"#, r#"{"y":1}"#, r#"{"y":2}"#],
+        ),
+        // Borrowed (document-derived) multi-output values, not just literals.
+        (
+            br#"{"x":9,"y":8}"#,
+            "{k: .[]}",
+            vec![r#"{"k":9}"#, r#"{"k":8}"#],
+        ),
+        // An entry with zero outputs empties the whole product.
+        (b"null", "{a: empty, b: 1}", vec![]),
+        // Duplicate keys: last value wins, first position kept.
+        (b"null", "{a:1, b:2, a:3}", vec![r#"{"a":3,"b":2}"#]),
+        // A multi-output object as the RHS of a pipe. The full evaluator reaches
+        // this via eval_owned_pipe, which used to fold the outputs into a single
+        // array while the generic path kept them -- so this case is what keeps
+        // the two evaluators honest after #354.
+        (
+            b"null",
+            r#"{"p":1} | {a: (2,3)}"#,
+            vec![r#"{"a":2}"#, r#"{"a":3}"#],
+        ),
+    ] {
+        let full = full_outputs(json, filter);
+        assert_eq!(
+            as_strs(&full),
+            expected,
+            "full evaluator disagrees with jq for `{filter}`"
+        );
+        assert_parity(json, filter);
+    }
+}
