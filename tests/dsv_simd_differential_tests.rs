@@ -27,7 +27,7 @@
 //! print a `SKIPPED` line so a fully-skipped run does not read as "passed". See
 //! #193 (x86) / #194 (SVE2).
 
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use succinctly::dsv::{build_index_scalar, DsvConfig, DsvIndex};
 

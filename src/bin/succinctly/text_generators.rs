@@ -3,7 +3,7 @@
 //! Generates various types of UTF-8 content for validating and benchmarking
 //! UTF-8 validation algorithms.
 
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 
 /// Pattern types for UTF-8 text generation.

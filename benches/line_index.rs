@@ -22,7 +22,7 @@
 //! Run with: cargo bench --bench line_index
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use std::hint::black_box;
 use succinctly::text::LineIndex;

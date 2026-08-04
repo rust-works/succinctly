@@ -15982,7 +15982,7 @@ fn builtin_shuffle<W: Clone + AsRef<[u64]>>(
             let mut items: Vec<OwnedValue> = elements.map(|e| to_owned(&e)).collect();
             // Use a seeded RNG for reproducibility in tests if needed,
             // but seed from system entropy for actual randomness
-            let mut rng = ChaCha8Rng::from_os_rng();
+            let mut rng = ChaCha8Rng::from_rng(&mut rand::rng());
             items.shuffle(&mut rng);
             QueryResult::Owned(OwnedValue::Array(items))
         }
