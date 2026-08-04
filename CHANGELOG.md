@@ -840,6 +840,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (JSON-only), and large enough in its own right to need separate
   investigation.
 
+- **`yq 'first(.[])'`/`'last(.[])'`/a computed index (`.[(expr)]`) still
+  collapsed duplicate mapping keys** (#631), the `yq`-side follow-up #607
+  above left open: `eval_generic.rs`'s evaluator already threaded
+  `GenericResult::OneCursor`/`ManyCursor` through these shapes correctly
+  (that was #607's fix, shared by both `jq` and `yq`), but `yq_runner.rs`
+  never had a `jq_runner.rs`-style `generic_result_to_jq_values` that could
+  take advantage of it — every expression not covered by `can_use_m2_streaming`
+  (identity/field/index/iterate navigation and pipes/parens/`?` of those) fell
+  through `evaluate_yaml_cursor`'s unconditional `to_owned()` DOM path instead,
+  the same `IndexMap`-backed bridge #442/#478 fixed for plain `.`/`.[0]` but
+  never widened past literal navigation.
+
+  Fixed by widening `can_use_m2_streaming` to also treat `Expr::FirstExpr`/
+  `LastExpr` (`first(f)`/`last(f)`), `Builtin::FirstStream`/`LastStream` (the
+  second AST spelling the parser produces for the same syntax, see #607's
+  note), and `Expr::IndexExpr` (computed indexing) as streamable — the
+  existing M2 fast path's non-identity branch already evaluates via
+  `eval_with_cursor_using` and renders through `GenericResult::stream_yaml`/
+  `stream_json`, which handle every `GenericResult` variant (cursor and owned
+  alike) uniformly, so no new rendering code was needed. `yq 'first(.[])'`
+  now streams through the exact same mechanism as `yq '.[0]'` on the same
+  input, matching it byte-for-byte instead of merely agreeing on the
+  duplicate-key count.
+
 - **The strict YAML validator accepted a flow-collection anchor immediately
   followed by an alias** (#452): `[&a *a]` and `{k: &a *a}` passed
   `succinctly yaml validate`, which `yq` rejects — an anchor property cannot

@@ -989,6 +989,19 @@ fn can_use_m2_streaming(expr: &Expr) -> bool {
         // Parentheses don't affect streamability
         Expr::Paren(inner) => can_use_m2_streaming(inner),
 
+        // first(f)/last(f) (both AST spellings the parser produces, see
+        // `Expr::FirstExpr`/`LastExpr` doc comments) and computed indexing
+        // `.[(expr)]` all thread a cursor through natively in
+        // `eval_generic.rs` (#607), so their `GenericResult` streams exactly
+        // like plain navigation instead of needing OwnedValue construction.
+        // Streaming through `eval_with_cursor_using` here (rather than
+        // `evaluate_yaml_cursor`'s unconditional `to_owned()` DOM path) is
+        // also what keeps duplicate mapping keys intact for these shapes,
+        // matching `.[0]` on the same input (#631).
+        Expr::FirstExpr(_) | Expr::LastExpr(_) => true,
+        Expr::Builtin(Builtin::FirstStream(_) | Builtin::LastStream(_)) => true,
+        Expr::IndexExpr { .. } => true,
+
         // Everything else requires OwnedValue
         _ => false,
     }

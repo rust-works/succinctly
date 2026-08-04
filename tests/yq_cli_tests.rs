@@ -757,6 +757,56 @@ fn test_duplicate_mapping_key_survives_inplace() -> Result<()> {
     Ok(())
 }
 
+/// #631: `first(.[])`/`last(.[])` (the `Expr::FirstExpr`/`LastExpr` one-arg
+/// stream form `first(f)`/`last(f)` compiles to) fell through
+/// `evaluate_yaml_cursor`'s unconditional `to_owned()` DOM path, unlike
+/// `.[0]` which #442 already routed through the M2 cursor-streaming fast
+/// path. `eval_generic.rs` itself threads `GenericResult::OneCursor`/
+/// `ManyCursor` through these shapes correctly since #607 — but that alone
+/// wasn't enough for `yq`: unlike `jq_runner.rs`'s
+/// `generic_result_to_jq_values`, `evaluate_yaml_cursor` never special-cased
+/// cursor results, so `yq` kept collapsing duplicate keys. Fixed by widening
+/// `can_use_m2_streaming` so these shapes stream through the same fast path
+/// `.[0]` uses, instead of expanding `evaluate_yaml_cursor` itself.
+#[test]
+fn test_duplicate_mapping_key_survives_first_last_stream() -> Result<()> {
+    let yaml = "- a: 1\n  a: 2\n- b: 3\n  b: 4\n";
+
+    let (first, code) = run_yq_stdin("first(.[])", yaml, &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(first, "a: 1\na: 2\n");
+
+    let (last, code) = run_yq_stdin("last(.[])", yaml, &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(last, "b: 3\nb: 4\n");
+
+    let (first_json, code) = run_yq_stdin("first(.[])", yaml, &["-o", "json", "-I0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(first_json, "{\"a\":1,\"a\":2}\n");
+
+    Ok(())
+}
+
+/// #631: computed indexing (`.[(expr)]`, `Expr::IndexExpr`) is the same bug
+/// class via a different AST node than `first`/`last` above. `.[0]`
+/// (`Expr::Index`, a literal the parser folds at parse time) already
+/// preserved duplicate keys, but `.[(1-1)]` — forced past that folding —
+/// did not, until `Expr::IndexExpr` was added to `can_use_m2_streaming` too.
+#[test]
+fn test_duplicate_mapping_key_survives_computed_index() -> Result<()> {
+    let yaml = "- a: 1\n  a: 2\n- b: 3\n  b: 4\n";
+
+    let (pretty, code) = run_yq_stdin(".[(1-1)]", yaml, &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(pretty, "a: 1\na: 2\n");
+
+    let (compact, code) = run_yq_stdin(".[(1-1)]", yaml, &["-I0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(compact, "a: 1\na: 2\n");
+
+    Ok(())
+}
+
 /// #478: the `--inplace` fast path is scoped to M2-streamable expressions
 /// (identity/field/index/iterate); confirm field navigation still rewrites
 /// the file correctly, not just plain identity.
