@@ -156,6 +156,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`recurse(f; cond)` checked `cond` against the wrong node, and collapsed a
+  multi-output `cond` into an always-truthy array** (#627):
+  `builtin_recurse_cond` and its path-tracking sibling `resolve_recurse`
+  evaluated `cond` via `eval_owned_expr` against the *current* node, wrapping
+  2+ outputs into one `OwnedValue::Array` — non-empty and therefore always
+  truthy regardless of the individual values, so
+  `1 | [limit(20; recurse(.+1; (false,false)))]` kept recursing forever
+  instead of stopping at `[1]`. Verified against jq 1.7.1's own definition,
+  `def r: ., (f | select(cond) | r); r;`: the current node is emitted
+  unconditionally (`5 | recurse(.+1; . < 5)` is `5`, not empty — `cond` never
+  gates the node about to be output), `cond` instead gates each *child* of
+  `f` before recursing into it, and a multi-output `cond` forks — `select`
+  re-emits the child once per truthy output, so
+  `1 | recurse(.+1; (.<3,.<3))` visits `2` twice and is `[1,2,2]`. Both
+  functions now check `cond` via `eval_owned_multi` against each child of
+  `f`, pushing that child once per truthy output, restructuring their BFS
+  queues to match; value and path evaluation agree again. Four new golden
+  fixtures pin the collapse, the root-bypass, and the fork cases. **Related,
+  not fixed here**: reviewing this fix surfaced that the same functions'
+  breadth-first queue diverges from jq's depth-first traversal order when a
+  node has 2+ children (#635), and that a `cond`/`f` error is silently
+  swallowed as a prune rather than propagated like jq's fatal error (#636) —
+  both filed as separate follow-ups.
+
 - **`del()` through an out-of-range index silently no-op'd where a `[]` tail
   should raise** (#529): `[1,2] | del(.[5][])` returned `[1,2]` unchanged
   where jq raises `Cannot iterate over null (null)` — the last two sites left
