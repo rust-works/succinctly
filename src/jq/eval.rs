@@ -9563,12 +9563,77 @@ fn eval_reduce<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     QueryResult::Owned(acc)
 }
 
+/// Fast path for the handful of expr shapes that dominate the cost of
+/// [`eval_owned_expr`]/[`eval_owned_input`]: bare `.`, `.foo`, `.[n]`. These
+/// never fan out and never touch anything but `input`'s own top-level shape,
+/// so they can be answered directly against the `OwnedValue` tree — no
+/// `to_json_for_reindex` + `JsonIndex::build` round trip needed. `None`
+/// defers to the general evaluator below, which every other expr shape
+/// (arbitrary filters, arithmetic, pipes, ...) still requires.
+///
+/// Mirrors `eval_single`'s `Identity`/`Field`/`Index` arms
+/// (`index_object_by_name`/`index_array_by_position`) exactly — same
+/// null-propagation, same `optional` behavior, same error text — so this is
+/// unobservable except in speed.
+///
+/// The two callers below are, between them, every step of `path()`'s
+/// computed-key resolution: `resolve_index_expr`'s key lookup and
+/// `resolve_leaf`/`value_after_components`'s static-step walk. Each runs
+/// once per node in a `..`/`recurse` fan-out, so a document with a linear
+/// nesting chain of depth *d* paid a full serialize-and-reparse of an
+/// O(*d*)-sized subtree at each of its *d* nodes — O(*d*²) work to resolve
+/// what is, for these shapes, an O(1) lookup (#491).
+fn eval_owned_fast_path(
+    expr: &Expr,
+    input: &OwnedValue,
+    optional: bool,
+) -> Option<Result<Option<OwnedValue>, EvalError>> {
+    match expr {
+        Expr::Identity => Some(Ok(Some(input.clone()))),
+        Expr::Field(name) => Some(match input {
+            OwnedValue::Object(map) => Ok(Some(map.get(name).cloned().unwrap_or(OwnedValue::Null))),
+            OwnedValue::Null => Ok(Some(OwnedValue::Null)),
+            _ if optional => Ok(None),
+            _ => Err(EvalError::cannot_index_with_field(
+                owned_type_name(input),
+                name,
+            )),
+        }),
+        Expr::Index(idx) => Some(match input {
+            OwnedValue::Array(items) => {
+                let resolved = if *idx < 0 {
+                    items.len() as i64 + idx
+                } else {
+                    *idx
+                };
+                let element = usize::try_from(resolved)
+                    .ok()
+                    .and_then(|i| items.get(i))
+                    .cloned()
+                    .unwrap_or(OwnedValue::Null);
+                Ok(Some(element))
+            }
+            OwnedValue::Null => Ok(Some(OwnedValue::Null)),
+            _ if optional => Ok(None),
+            _ => Err(EvalError::cannot_index_with_type(
+                owned_type_name(input),
+                "number",
+            )),
+        }),
+        _ => None,
+    }
+}
+
 /// Evaluate an expression with an OwnedValue as input.
 fn eval_owned_expr<S: EvalSemantics>(
     expr: &Expr,
     input: &OwnedValue,
     optional: bool,
 ) -> Result<OwnedValue, EvalError> {
+    if let Some(result) = eval_owned_fast_path(expr, input, optional) {
+        return result.map(|v| v.unwrap_or(OwnedValue::Null));
+    }
+
     // Create a synthetic JSON from the owned value
     // For simplicity, we'll serialize and reparse
     // This is inefficient but correct
@@ -9635,6 +9700,14 @@ fn eval_owned_input<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     input: &OwnedValue,
     optional: bool,
 ) -> QueryResult<'a, W> {
+    if let Some(result) = eval_owned_fast_path(expr, input, optional) {
+        return match result {
+            Ok(Some(v)) => QueryResult::Owned(v),
+            Ok(None) => QueryResult::None,
+            Err(e) => QueryResult::Error(e),
+        };
+    }
+
     // Serialize and reparse to obtain a document the evaluator can index into.
     //
     // `to_json_for_reindex` (not `to_json`): this round-trip is purely
@@ -17375,6 +17448,94 @@ mod tests {
     fn eval_owned_multi_propagates_an_error() {
         let expr = parse(r#"error("boom")"#).unwrap();
         assert!(eval_owned_multi::<JqSemantics>(&expr, &OwnedValue::Null).is_err());
+    }
+
+    /// Evaluate `Identity`/`Field`/`Index` against an `OwnedValue` the way
+    /// `eval_single` (backing every top-level query, via `index_object_by_name`/
+    /// `index_array_by_position`) does: serialize, build a real `JsonIndex`,
+    /// and index a `StandardJson` cursor. Independent of `eval_owned_fast_path`
+    /// -- this is the pre-#491 code path, kept alive here only as a reference.
+    fn via_cursor(
+        expr: &Expr,
+        input: &OwnedValue,
+        optional: bool,
+    ) -> Result<Option<OwnedValue>, EvalError> {
+        let json_str = input.to_json_for_reindex();
+        let json_bytes = json_str.as_bytes();
+        let index = JsonIndex::build(json_bytes);
+        let cursor = index.root(json_bytes);
+        let result = match expr {
+            Expr::Identity => QueryResult::One(cursor.value()),
+            Expr::Field(name) => index_object_by_name::<Vec<u64>>(cursor.value(), name, optional),
+            Expr::Index(idx) => index_array_by_position::<Vec<u64>>(cursor.value(), *idx, optional),
+            other => unreachable!("via_cursor only covers Identity/Field/Index, got {other:?}"),
+        };
+        match result {
+            QueryResult::One(v) => Ok(Some(to_owned(&v))),
+            QueryResult::None => Ok(None),
+            QueryResult::Error(e) => Err(e),
+            other => panic!("unexpected result from via_cursor: {other:?}"),
+        }
+    }
+
+    /// `eval_owned_fast_path` (#491) reimplements `index_object_by_name`/
+    /// `index_array_by_position`'s rules directly against `OwnedValue`, to
+    /// skip the serialize-and-reparse `eval_owned_expr`/`eval_owned_input`
+    /// otherwise pay on every node of a `..`/`recurse` fan-out. That makes it
+    /// a second implementation of the same rules, which can silently drift
+    /// out of sync with the original -- the exact failure mode #106 hit with
+    /// three copies of one predicate, one of them quadratic and unnoticed
+    /// because every test exercised only one copy at a time. This pins the
+    /// two together: run both on the same inputs and assert they agree.
+    #[test]
+    fn eval_owned_fast_path_agrees_with_index_object_by_name_and_index_array_by_position() {
+        let obj = || {
+            let mut m = indexmap::IndexMap::new();
+            m.insert("a".to_string(), OwnedValue::Int(1));
+            m.insert("b".to_string(), OwnedValue::Int(2));
+            OwnedValue::Object(m)
+        };
+        let arr = || {
+            OwnedValue::Array(vec![
+                OwnedValue::Int(10),
+                OwnedValue::Int(20),
+                OwnedValue::Int(30),
+            ])
+        };
+
+        let cases: Vec<(Expr, OwnedValue, bool)> = vec![
+            (Expr::Identity, obj(), false),
+            // Field: present key, missing key, on null, on a type that
+            // cannot be field-indexed at all (with and without `?`).
+            (Expr::Field("a".to_string()), obj(), false),
+            (Expr::Field("missing".to_string()), obj(), false),
+            (Expr::Field("a".to_string()), OwnedValue::Null, false),
+            (Expr::Field("a".to_string()), OwnedValue::Int(5), true),
+            (Expr::Field("a".to_string()), OwnedValue::Int(5), false),
+            (Expr::Field("a".to_string()), arr(), false),
+            // Index: in bounds, negative-from-end, out of bounds (positive
+            // and negative), on null, on a type that cannot be
+            // position-indexed at all (with and without `?`).
+            (Expr::Index(1), arr(), false),
+            (Expr::Index(-1), arr(), false),
+            (Expr::Index(10), arr(), false),
+            (Expr::Index(-10), arr(), false),
+            (Expr::Index(0), OwnedValue::Null, false),
+            (Expr::Index(0), OwnedValue::String("x".to_string()), true),
+            (Expr::Index(0), OwnedValue::String("x".to_string()), false),
+            (Expr::Index(0), obj(), false),
+        ];
+
+        for (expr, input, optional) in cases {
+            let fast = eval_owned_fast_path(&expr, &input, optional)
+                .expect("via_cursor's shapes are exactly the ones eval_owned_fast_path handles");
+            let reference = via_cursor(&expr, &input, optional);
+            assert_eq!(
+                fast, reference,
+                "eval_owned_fast_path disagrees with index_object_by_name/index_array_by_position \
+                 for {expr:?} on {input:?} (optional={optional})"
+            );
+        }
     }
 
     #[test]
