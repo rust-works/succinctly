@@ -3568,6 +3568,32 @@ mod tests {
         }
     }
 
+    /// Coverage stabilizer, same rationale as
+    /// `test_find_close_crosses_l2_block_boundary` above (issue #220): the
+    /// remaining flaky branch is `find_close_from`'s `State::FromL2` landing
+    /// exactly at `len` after skipping a whole L2 block (i.e. the search runs
+    /// off the end of the structure right on an L2-aligned boundary), which
+    /// proptest only stumbles into by chance.
+    ///
+    /// An all-opens bitvector spanning exactly two L2 blocks (2 * 65536 bits)
+    /// forces this deterministically: `find_close(0)` never finds a match, so
+    /// excess only grows and every level skips wholesale, and the second
+    /// (last) L2 block's skip lands pos exactly on `len`.
+    #[test]
+    fn test_find_close_l2_skip_lands_exactly_at_len() {
+        const L2_SPAN: usize = 64 * FACTOR_L1 * FACTOR_L2;
+        let len = 2 * L2_SPAN;
+        let words = vec![u64::MAX; len / 64];
+
+        let bp = BalancedParens::new(words.clone(), len);
+        assert_eq!(bp.find_close(0), None);
+        assert_eq!(
+            bp.find_close(0),
+            find_close(&words, len, 0),
+            "find_close(0) mismatch: accelerated vs linear scan"
+        );
+    }
+
     #[test]
     fn test_word_min_excess() {
         // "()" = 0b01 - open at 0, close at 1
