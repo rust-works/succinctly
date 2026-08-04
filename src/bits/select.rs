@@ -13,7 +13,10 @@
 //! - `SelectIndex<u32>` halves the samples array. It is only sound for callers
 //!   that bound their length to `u32::MAX` bits, which
 //!   [`BalancedParens`](crate::trees::BalancedParens) asserts at construction —
-//!   its rank directory stores absolute cumulative counts as `u32`.
+//!   its rank directory stores absolute cumulative counts as `u32`. The only
+//!   caller is the deprecated `WithSelect`; BP's live select path,
+//!   `WithCsPoppy`, answers queries from its own `rank_l1`/`rank_l2` and
+//!   never touches `SelectIndex` (see `docs/adrs/adr-0015.md`).
 
 #[cfg(not(test))]
 use alloc::vec::Vec;
