@@ -708,13 +708,20 @@ enum ObjectEscape {
 ///
 /// [`QueryResult::collect_owned`] already flattens all output-bearing variants
 /// (including `OneCursor`), but folds `Error`/`Break` into an empty `Vec` — so
-/// those two are peeled off first.
+/// those two are peeled off first. A `Partial` is peeled off too: object
+/// construction is a value-position construct, so a key/value sub-expression
+/// that errors partway collapses to the bare control instead of exposing its
+/// prefix (`{a:1,b:(2,error("x"))}` is the error, not `{"a":1,"b":2}`) —
+/// `collect_owned` would otherwise silently keep the prefix and drop the
+/// control, letting the error vanish.
 fn object_outputs_or_escape<W: Clone + AsRef<[u64]>>(
     result: QueryResult<'_, W>,
 ) -> Result<Vec<OwnedValue>, ObjectEscape> {
     match result {
         QueryResult::Error(e) => Err(ObjectEscape::Error(e)),
         QueryResult::Break(label) => Err(ObjectEscape::Break(label)),
+        QueryResult::Partial(_, Control::Error(e)) => Err(ObjectEscape::Error(e)),
+        QueryResult::Partial(_, Control::Break(label)) => Err(ObjectEscape::Break(label)),
         other => Ok(other.collect_owned()),
     }
 }
