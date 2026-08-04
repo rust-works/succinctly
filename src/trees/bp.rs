@@ -36,6 +36,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::bits::{scan_select, SelectIndex};
 use crate::util::broadword::select_in_word;
+use crate::Config;
 
 // ============================================================================
 // Select support traits for zero-cost abstraction
@@ -190,10 +191,12 @@ impl SelectSupport for WithSelect {
     }
 }
 
-/// Sample rate for [`WithCsPoppy`]: one sample per this many 1-bits.
+/// Default sample rate for [`WithCsPoppy`]: one sample per this many 1-bits.
 ///
 /// Matches [`SelectIndex`]'s default so existing tuning keeps its meaning.
-const CS_POPPY_SAMPLE_RATE: usize = 256;
+/// Override per-build via [`Config::select_sample_rate`] and
+/// [`WithCsPoppy::build_with_rate`] (#601).
+const CS_POPPY_SAMPLE_RATE: u32 = 256;
 
 /// Combined-sampling select support (CS-Poppy), the preferred choice for YAML.
 ///
@@ -214,9 +217,12 @@ const CS_POPPY_SAMPLE_RATE: usize = 256;
 ///
 /// # Space
 ///
-/// 4 bytes per `CS_POPPY_SAMPLE_RATE` ones: 6.25% of the bitmap at balanced-
-/// parenthesis density, against [`WithSelect`]'s 12.5% and the 25% that pair
-/// cost before it was narrowed (#64).
+/// 4 bytes per sample rate's worth of ones: 6.25% of the bitmap at balanced-
+/// parenthesis density and the default rate of 256, against [`WithSelect`]'s
+/// 12.5% and the 25% that pair cost before it was narrowed (#64). The rate is
+/// tunable — see [`build_with_rate`](WithCsPoppy::build_with_rate) and
+/// [`Config::select_sample_rate`] — trading index memory for a wider
+/// `select1` search bracket (#601).
 ///
 /// # Example
 ///
@@ -229,18 +235,40 @@ const CS_POPPY_SAMPLE_RATE: usize = 256;
 /// assert_eq!(bp.select1(2), Some(3)); // third open
 /// assert_eq!(bp.select1(3), None);    // only three opens
 /// ```
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct WithCsPoppy {
-    /// Rank-block index containing every `CS_POPPY_SAMPLE_RATE`-th 1-bit.
+    /// Rank-block index containing every `rate`-th 1-bit.
     ///
     /// `u32` is sound because `build_bp_index` asserts `len <= u32::MAX` bits,
     /// bounding the block count to 2^23.
     samples: Vec<u32>,
+    /// Sample rate this index was built with (see [`CS_POPPY_SAMPLE_RATE`]).
+    rate: u32,
 }
 
-impl SelectSupport for WithCsPoppy {
-    fn build(words: &[u64], total_ones: usize) -> Self {
+impl Default for WithCsPoppy {
+    fn default() -> Self {
+        Self {
+            samples: Vec::new(),
+            rate: CS_POPPY_SAMPLE_RATE,
+        }
+    }
+}
+
+impl WithCsPoppy {
+    /// Builds combined-sampling select support at a custom sample rate.
+    ///
+    /// [`SelectSupport::build`] calls this with [`CS_POPPY_SAMPLE_RATE`] (256).
+    /// Lower rates spend more memory for a narrower `select1` search bracket;
+    /// higher rates spend less memory for a wider one — see the module-level
+    /// space table (#601).
+    ///
+    /// A `rate` of 0 is treated as 1, matching [`SelectIndex::build`].
+    pub fn build_with_rate(words: &[u64], total_ones: usize, rate: u32) -> Self {
+        let rate = rate.max(1);
+        let rate_usize = rate as usize;
+
         // INVARIANT: as for WithSelect, `total_ones` counts only bits below
         // `len` (build_bp_index masks the final partial word, #188). Stray
         // 1-bits above `len` can therefore only appear above every sampled
@@ -248,10 +276,11 @@ impl SelectSupport for WithCsPoppy {
         if words.is_empty() || total_ones == 0 {
             return Self {
                 samples: Vec::new(),
+                rate,
             };
         }
 
-        let mut samples = Vec::with_capacity(total_ones / CS_POPPY_SAMPLE_RATE + 1);
+        let mut samples = Vec::with_capacity(total_ones / rate_usize + 1);
         let mut count: usize = 0;
         let mut next_sample = 0usize;
 
@@ -265,13 +294,26 @@ impl SelectSupport for WithCsPoppy {
                     "block index {block} exceeds u32; len must be <= u32::MAX bits (#188)"
                 );
                 samples.push(block as u32);
-                next_sample += CS_POPPY_SAMPLE_RATE;
+                next_sample += rate_usize;
             }
 
             count += pop;
         }
 
-        Self { samples }
+        Self { samples, rate }
+    }
+
+    /// Returns the sample rate this index was built with.
+    #[inline]
+    pub fn rate(&self) -> u32 {
+        self.rate
+    }
+}
+
+impl SelectSupport for WithCsPoppy {
+    #[inline]
+    fn build(words: &[u64], total_ones: usize) -> Self {
+        Self::build_with_rate(words, total_ones, CS_POPPY_SAMPLE_RATE)
     }
 
     fn select1(&self, ctx: BpSelectCtx<'_>, k: usize) -> Option<usize> {
@@ -280,9 +322,9 @@ impl SelectSupport for WithCsPoppy {
         }
 
         // 1. Bracket the answer between consecutive samples. sample[i] holds the
-        //    block of the (i * RATE)-th one, and k lies in [i*RATE, (i+1)*RATE),
+        //    block of the (i * rate)-th one, and k lies in [i*rate, (i+1)*rate),
         //    so the target block lies in [sample[i], sample[i+1]].
-        let sample_idx = k / CS_POPPY_SAMPLE_RATE;
+        let sample_idx = k / self.rate as usize;
         let last_block = ctx.rank_l1.len() - 1;
         let lo = *self
             .samples
@@ -2104,7 +2146,9 @@ impl BalancedParens<Vec<u64>, WithCsPoppy> {
     /// Build from an owned bitvector with combined-sampling select support.
     ///
     /// Preferred over [`new_with_select`](BalancedParens::new_with_select): same
-    /// queries, a quarter of the select-index memory (#64).
+    /// queries, a quarter of the select-index memory (#64). Uses the default
+    /// sample rate (256) — see
+    /// [`new_with_cspoppy_config`](Self::new_with_cspoppy_config) to tune it.
     ///
     /// Bits at or above `len` in the final word are cleared, so stray 1-bits
     /// cannot skew `total_ones`/`rank1`/`select1` (#188).
@@ -2113,9 +2157,29 @@ impl BalancedParens<Vec<u64>, WithCsPoppy> {
     ///
     /// Panics if `len` exceeds `u32::MAX` bits (#188): the rank directory
     /// stores absolute cumulative counts as `u32`.
-    pub fn new_with_cspoppy(mut words: Vec<u64>, len: usize) -> Self {
+    pub fn new_with_cspoppy(words: Vec<u64>, len: usize) -> Self {
+        Self::new_with_cspoppy_config(words, len, Config::default())
+    }
+
+    /// Build from an owned bitvector with combined-sampling select support,
+    /// at the sample rate given by [`Config::select_sample_rate`].
+    ///
+    /// A lower rate spends more memory for a narrower `select1` search
+    /// bracket; a higher rate spends less memory for a wider one (#601). The
+    /// default (256, [`new_with_cspoppy`](Self::new_with_cspoppy)) matches
+    /// this crate's other tuned indices — deviate only once measurement
+    /// justifies it.
+    ///
+    /// Bits at or above `len` in the final word are cleared, so stray 1-bits
+    /// cannot skew `total_ones`/`rank1`/`select1` (#188).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `len` exceeds `u32::MAX` bits (#188): the rank directory
+    /// stores absolute cumulative counts as `u32`.
+    pub fn new_with_cspoppy_config(mut words: Vec<u64>, len: usize, config: Config) -> Self {
         mask_final_word_in_place(&mut words, len);
-        Self::assemble(words, len)
+        Self::assemble_with_rate(words, len, config.select_sample_rate)
     }
 }
 
@@ -2125,7 +2189,9 @@ impl<W: AsRef<[u64]>> BalancedParens<W, WithCsPoppy> {
     /// Preferred over
     /// [`from_words_with_select`](BalancedParens::from_words_with_select): same
     /// queries, a quarter of the select-index memory (#64). Useful for borrowed
-    /// data, e.g. from mmap.
+    /// data, e.g. from mmap. Uses the default sample rate (256) — see
+    /// [`from_words_with_cspoppy_config`](Self::from_words_with_cspoppy_config)
+    /// to tune it.
     ///
     /// The storage is not mutated: stray 1-bits at or above `len` in the final
     /// word are ignored when counting (masked on read), so they cannot skew
@@ -2136,16 +2202,33 @@ impl<W: AsRef<[u64]>> BalancedParens<W, WithCsPoppy> {
     /// Panics if `len` exceeds `u32::MAX` bits (#188): the rank directory
     /// stores absolute cumulative counts as `u32`.
     pub fn from_words_with_cspoppy(words: W, len: usize) -> Self {
-        Self::assemble(words, len)
+        Self::from_words_with_cspoppy_config(words, len, Config::default())
     }
-}
 
-impl<W: AsRef<[u64]>, S: SelectSupport> BalancedParens<W, S> {
-    /// Build every index from `words`, without mutating the storage.
+    /// Build from a generic storage type with combined-sampling select
+    /// support, at the sample rate given by [`Config::select_sample_rate`].
     ///
-    /// Shared by the select-enabled constructors; the owned ones mask the final
-    /// word before calling in.
-    fn assemble(words: W, len: usize) -> Self {
+    /// See [`new_with_cspoppy_config`](BalancedParens::new_with_cspoppy_config)
+    /// for the rate trade-off (#601). Useful for borrowed data, e.g. from mmap.
+    ///
+    /// The storage is not mutated: stray 1-bits at or above `len` in the final
+    /// word are ignored when counting (masked on read), so they cannot skew
+    /// `total_ones`/`rank1`/`select1` (#188).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `len` exceeds `u32::MAX` bits (#188): the rank directory
+    /// stores absolute cumulative counts as `u32`.
+    pub fn from_words_with_cspoppy_config(words: W, len: usize, config: Config) -> Self {
+        Self::assemble_with_rate(words, len, config.select_sample_rate)
+    }
+
+    /// Build every index from `words` at a custom CS-Poppy sample rate,
+    /// without mutating the storage.
+    ///
+    /// Shared by every `WithCsPoppy` constructor; the owned ones mask the
+    /// final word before calling in.
+    fn assemble_with_rate(words: W, len: usize, rate: u32) -> Self {
         let (
             l0_min_excess,
             l0_word_excess,
@@ -2158,7 +2241,7 @@ impl<W: AsRef<[u64]>, S: SelectSupport> BalancedParens<W, S> {
             total_ones,
         ) = build_bp_index(words.as_ref(), len);
 
-        let select = S::build(words.as_ref(), total_ones);
+        let select = WithCsPoppy::build_with_rate(words.as_ref(), total_ones, rate);
 
         Self {
             words,
