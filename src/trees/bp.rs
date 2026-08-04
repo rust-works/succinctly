@@ -3308,6 +3308,148 @@ mod tests {
         );
     }
 
+    // ========================================================================
+    // WithCsPoppy sample rate as a tuning knob (#601)
+    // ========================================================================
+
+    /// `new_with_cspoppy_config(.., Config::default())` must be indistinguishable
+    /// from the plain constructor: same memory, same answers.
+    #[test]
+    fn test_cspoppy_config_default_matches_plain_constructor() {
+        let pairs = 10_000;
+        let (words, len) = balanced_words(pairs);
+
+        let plain = BalancedParens::new_with_cspoppy(words.clone(), len);
+        let configured = BalancedParens::new_with_cspoppy_config(words, len, Config::default());
+
+        assert_eq!(plain.select_heap_size(), configured.select_heap_size());
+        for k in [0, 1, 255, 256, 257, pairs - 1] {
+            assert_eq!(plain.select1(k), configured.select1(k), "select1({k})");
+        }
+    }
+
+    /// A non-default sample rate must not change a single `select1` answer —
+    /// only the density of the index built to answer it.
+    #[test]
+    fn test_cspoppy_custom_rate_matches_default_answers() {
+        for (label, words, len) in cspoppy_fixtures() {
+            let default_rate =
+                BalancedParens::<_, WithCsPoppy>::from_words_with_cspoppy(&words[..], len);
+
+            for rate in [1u32, 64, 512, 8192] {
+                let custom = BalancedParens::<_, WithCsPoppy>::from_words_with_cspoppy_config(
+                    &words[..],
+                    len,
+                    Config {
+                        select_sample_rate: rate,
+                    },
+                );
+
+                assert_eq!(
+                    custom.total_ones(),
+                    default_rate.total_ones(),
+                    "{label} @ rate {rate}: total_ones"
+                );
+                for k in 0..default_rate.total_ones() {
+                    assert_eq!(
+                        custom.select1(k),
+                        default_rate.select1(k),
+                        "{label} @ rate {rate}: select1({k})"
+                    );
+                }
+                assert_eq!(
+                    custom.select1(default_rate.total_ones()),
+                    default_rate.select1(default_rate.total_ones()),
+                    "{label} @ rate {rate}: select1(total_ones)"
+                );
+            }
+        }
+    }
+
+    /// Halving the rate should roughly double the index; doubling it should
+    /// roughly halve it — the density relationship #601 documents.
+    #[test]
+    fn test_cspoppy_custom_rate_scales_heap_size() {
+        let pairs = 100_000;
+        let (words, len) = balanced_words(pairs);
+
+        for rate in [64u32, 256, 512, 8192] {
+            let bp = BalancedParens::new_with_cspoppy_config(
+                words.clone(),
+                len,
+                Config {
+                    select_sample_rate: rate,
+                },
+            );
+            assert_eq!(
+                bp.select_heap_size(),
+                pairs.div_ceil(rate as usize) * 4,
+                "rate {rate}: unexpected select index size"
+            );
+        }
+    }
+
+    /// A configured rate of 0 must not hang or panic; it behaves like rate 1
+    /// (matches `SelectIndex::build`'s guard).
+    #[test]
+    fn test_cspoppy_rate_zero_treated_as_one() {
+        let (words, len) = balanced_words(100);
+        let total_ones = len / 2;
+
+        let zero = WithCsPoppy::build_with_rate(&words, total_ones, 0);
+        let one = WithCsPoppy::build_with_rate(&words, total_ones, 1);
+
+        assert_eq!(zero.rate(), 1);
+        assert_eq!(zero.rate(), one.rate());
+    }
+
+    /// `Default` must produce an empty index at the crate's default rate, the
+    /// same starting point `#[derive(Default)]` gave before the rate field
+    /// existed.
+    #[test]
+    fn test_cspoppy_default() {
+        let default = WithCsPoppy::default();
+        assert_eq!(default.rate(), CS_POPPY_SAMPLE_RATE);
+        assert_eq!(default.heap_size(), 0);
+    }
+
+    /// The `SelectSupport::build` trait method (used by any generic caller,
+    /// even though every concrete `WithCsPoppy` constructor in this crate
+    /// goes through `build_with_rate` directly) must match
+    /// `build_with_rate(.., CS_POPPY_SAMPLE_RATE)`.
+    #[test]
+    fn test_cspoppy_select_support_build_matches_default_rate() {
+        for (label, words, len) in cspoppy_fixtures() {
+            let indexed = BalancedParens::<_, NoSelect>::from_words(&words[..], len);
+            let total_ones = indexed.total_ones();
+
+            let via_trait = <WithCsPoppy as SelectSupport>::build(&words, total_ones);
+            let via_rate = WithCsPoppy::build_with_rate(&words, total_ones, CS_POPPY_SAMPLE_RATE);
+
+            assert_eq!(via_trait.rate(), via_rate.rate(), "{label}: rate");
+            assert_eq!(
+                via_trait.heap_size(),
+                via_rate.heap_size(),
+                "{label}: heap_size"
+            );
+
+            let ctx = BpSelectCtx {
+                words: &words,
+                len,
+                total_ones,
+                rank_l1: &indexed.rank_l1,
+                rank_l2: &indexed.rank_l2,
+            };
+            for k in 0..total_ones {
+                assert_eq!(
+                    via_trait.select1(ctx, k),
+                    via_rate.select1(ctx, k),
+                    "{label}: select1({k})"
+                );
+            }
+        }
+    }
+
     #[test]
     fn test_no_select_is_zero_sized() {
         // JSON's path must stay free: NoSelect is a ZST and retains nothing.
