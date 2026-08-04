@@ -259,7 +259,7 @@ impl Default for WithCsPoppy {
 impl WithCsPoppy {
     /// Builds combined-sampling select support at a custom sample rate.
     ///
-    /// [`SelectSupport::build`] calls this with [`CS_POPPY_SAMPLE_RATE`] (256).
+    /// [`SelectSupport::build`] calls this with `CS_POPPY_SAMPLE_RATE` (256).
     /// Lower rates spend more memory for a narrower `select1` search bracket;
     /// higher rates spend less memory for a wider one — see the module-level
     /// space table (#601).
