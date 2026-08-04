@@ -1528,6 +1528,72 @@ fn test_preserve_input_pretty_preserves_duplicate_keys() -> Result<()> {
     Ok(())
 }
 
+/// #607: `first(.[])`/`last(.[])` (the `Expr::FirstExpr`/`LastExpr` one-arg
+/// stream form `first(f)`/`last(f)` compiles to — distinct from the bare
+/// zero-arg `first`/`last` keyword, which is `Builtin::First`/`Last`) had no
+/// native arm in `eval_generic::eval_single`, so it fell through the
+/// catch-all `to_owned()` bridge and collapsed duplicate keys inside the
+/// selected element before the extraction even ran — unlike `.[0]`, which
+/// #532 already routed through the cursor-preserving path.
+#[test]
+fn test_preserve_input_first_last_expr_preserve_duplicate_keys() -> Result<()> {
+    let input = r#"[{"a":1,"a":2},{"b":3,"b":4}]"#;
+
+    let (first_compact, _, code) =
+        run_jq_full(&["-c", "--preserve-input", "first(.[])"], Some(input))?;
+    assert_eq!(code, 0);
+    assert_eq!(first_compact.trim(), r#"{"a":1,"a":2}"#);
+
+    let (first_pretty, _, code) = run_jq_full(&["--preserve-input", "first(.[])"], Some(input))?;
+    assert_eq!(code, 0);
+    assert_eq!(first_pretty, "{\n  \"a\": 1,\n  \"a\": 2\n}\n");
+
+    let (last_compact, _, code) =
+        run_jq_full(&["-c", "--preserve-input", "last(.[])"], Some(input))?;
+    assert_eq!(code, 0);
+    assert_eq!(last_compact.trim(), r#"{"b":3,"b":4}"#);
+
+    let (last_pretty, _, code) = run_jq_full(&["--preserve-input", "last(.[])"], Some(input))?;
+    assert_eq!(code, 0);
+    assert_eq!(last_pretty, "{\n  \"b\": 3,\n  \"b\": 4\n}\n");
+
+    Ok(())
+}
+
+/// #607: the bare zero-arg `first`/`last` keyword (`Builtin::First`/`Last`,
+/// equivalent to `.[0]`/`.[-1]`) called `elements.get(...)` instead of the
+/// `get_cursor(...)` sibling `.[0]`/`.[-1]` (`Expr::Index`) already used.
+#[test]
+fn test_preserve_input_bare_first_last_preserve_duplicate_keys() -> Result<()> {
+    let input = r#"[{"a":1,"a":2},{"b":3,"b":4}]"#;
+
+    let (first, _, code) = run_jq_full(&["-c", "--preserve-input", "first"], Some(input))?;
+    assert_eq!(code, 0);
+    assert_eq!(first.trim(), r#"{"a":1,"a":2}"#);
+
+    let (last, _, code) = run_jq_full(&["-c", "--preserve-input", "last"], Some(input))?;
+    assert_eq!(code, 0);
+    assert_eq!(last.trim(), r#"{"b":3,"b":4}"#);
+
+    Ok(())
+}
+
+/// #607: computed-key indexing (`.[$k]`/`.[(expr)]`, `Expr::IndexExpr`) went
+/// through `index_one_generic`'s old `fields.find`/`elements.get` calls —
+/// the same bug class as `first`/`last` above but reached via a different
+/// code path (`eval_index_expr`). `.[(1-1)]` forces a genuinely computed
+/// index rather than one the parser folds into a literal `Expr::Index`.
+#[test]
+fn test_preserve_input_computed_index_preserves_duplicate_keys() -> Result<()> {
+    let input = r#"[{"a":1,"a":2},{"b":3,"b":4}]"#;
+
+    let (compact, _, code) = run_jq_full(&["-c", "--preserve-input", ".[(1-1)]"], Some(input))?;
+    assert_eq!(code, 0);
+    assert_eq!(compact.trim(), r#"{"a":1,"a":2}"#);
+
+    Ok(())
+}
+
 #[test]
 fn test_jq_compat_default() -> Result<()> {
     // Test that jq-compat is now the default behavior
