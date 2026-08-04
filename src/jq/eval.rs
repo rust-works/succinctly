@@ -8329,16 +8329,24 @@ fn push_recursive_branches(prefix: &[Expr], value: &OwnedValue, out: &mut Vec<Pa
 
 /// Fan `recurse(f)` / `recurse(f; cond)` out into one branch per visited
 /// node. Follows `builtin_recurse_f`/`builtin_recurse_cond`'s breadth-first
-/// queue — including swallowing `f`'s errors, a falsy `cond` pruning rather
-/// than propagating, and the `MAX_ITEMS` cutoff — but resolves `f` through
-/// [`resolve_node`] at each step instead of [`eval_owned_multi`], so every
-/// queued value carries the path components that reach it. Since #490,
-/// `builtin_recurse_f`/`builtin_recurse_cond` also resolve `f` through
-/// [`eval_owned_multi`] and agree with this function on not flattening an
-/// array-valued child into its elements.
+/// queue — including swallowing `f`'s errors and the `MAX_ITEMS` cutoff —
+/// but resolves `f` through [`resolve_node`] at each step instead of
+/// [`eval_owned_multi`], so every queued value carries the path components
+/// that reach it. Since #490, `builtin_recurse_f`/`builtin_recurse_cond`
+/// also resolve `f` through [`eval_owned_multi`] and agree with this
+/// function on not flattening an array-valued child into its elements.
+///
+/// `cond` mirrors `builtin_recurse_cond`'s semantics (#627): jq's own
+/// definition is `def r: ., (f | select(cond) | r); r;`, so `cond` gates
+/// each *child* before recursing into it, never the node about to be
+/// output — the root, and every node already queued, is emitted
+/// unconditionally. A multi-output `cond` forks: `select` re-emits the
+/// child once per truthy output (confirmed against jq 1.7.1:
+/// `path(recurse(f; (true,true)))` duplicates that branch), so each truthy
+/// output pushes its own copy of `(path, child_value)`.
 ///
 /// One divergence remains, deliberately: this function still does not queue
-/// a null child, where the value evaluator now does. `f` is arbitrary and
+/// a null child, where the value evaluator does. `f` is arbitrary and
 /// nothing says it makes progress: `recurse(.a?)` over `{"a":null}` reads
 /// `null` from `null` forever (confirmed hanging in real jq too — this is
 /// jq's actual semantics, not a bug). The value evaluator's queue holds bare
@@ -8362,15 +8370,6 @@ fn resolve_recurse<S: EvalSemantics>(
 
     while !queue.is_empty() && outputs.len() < MAX_ITEMS {
         let (prefix, current) = queue.remove(0);
-
-        if let Some(cond) = cond {
-            let should_continue =
-                eval_owned_expr::<S>(cond, &current, false).is_ok_and(|v| v.is_truthy());
-            if !should_continue {
-                continue;
-            }
-        }
-
         outputs.push((prefix.clone(), current.clone()));
 
         for (child_components, child_value) in resolve_node::<S>(f, &current).unwrap_or_default() {
@@ -8380,9 +8379,26 @@ fn resolve_recurse<S: EvalSemantics>(
             if matches!(child_value, OwnedValue::Null) {
                 continue;
             }
+
             let mut path = prefix.clone();
             path.extend(child_components);
-            queue.push((path, child_value));
+
+            match cond {
+                None => queue.push((path, child_value)),
+                Some(cond) => {
+                    // `cond` gates the child, not `current`, and forks once
+                    // per truthy output — see the doc comment above (#627).
+                    // An error prunes this child, same as a falsy cond;
+                    // neither propagates as a resolve error.
+                    if let Ok(cond_outputs) = eval_owned_multi::<S>(cond, &child_value) {
+                        for c in &cond_outputs {
+                            if c.is_truthy() {
+                                queue.push((path.clone(), child_value.clone()));
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -10302,11 +10318,29 @@ fn builtin_recurse_f<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 }
 
 /// Builtin: recurse(f; cond)
+///
+/// jq defines this as `def r: ., (f | select(cond) | r); r;` (confirmed
+/// against jq 1.7.1): the current node is always emitted, unconditionally —
+/// `cond` never gates the node about to be output, only whether recursion
+/// *continues into a child*. So `5 | recurse(.+1; . < 5)` is `5`, not empty,
+/// even though `5 < 5` is false: the root bypasses `cond` entirely, and only
+/// the next candidate (`6`) would need to pass it.
+///
+/// `cond` therefore runs against each output of `f` (the candidate child),
+/// not against `current`. And because `select(cond)` forks over a
+/// multi-output `cond` — emitting the child once per truthy output — a
+/// `cond` like `(true, true)` visits (and re-recurses) that child twice; a
+/// `cond` like `(false, false)` collapsing to a truthy array is exactly
+/// #627's bug (`eval_owned_expr` used to wrap that into one
+/// `OwnedValue::Array`, which is always truthy regardless of the individual
+/// outputs, silently making recursion continue when it should stop).
+/// Switching to `eval_owned_multi` and checking each output keeps the true
+/// per-branch truthiness instead of collapsing it away.
 fn builtin_recurse_cond<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     f: &Expr,
     cond: &Expr,
     value: StandardJson<'a, W>,
-    optional: bool,
+    _optional: bool,
 ) -> QueryResult<'a, W> {
     let mut outputs: Vec<OwnedValue> = Vec::new();
     let mut queue: Vec<OwnedValue> = vec![to_owned(&value)];
@@ -10314,24 +10348,27 @@ fn builtin_recurse_cond<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
     while !queue.is_empty() && outputs.len() < MAX_ITEMS {
         let current = queue.remove(0);
-
-        // Check condition
-        let should_continue = match eval_owned_expr::<S>(cond, &current, optional) {
-            Ok(v) => v.is_truthy(),
-            Err(_) => false,
-        };
-
-        if !should_continue {
-            continue;
-        }
-
         outputs.push(current.clone());
 
-        // Every output of `f` becomes exactly one queued child, in order — a
-        // null output is a real value (not "no child"), and an array output
+        // Every output of `f` becomes exactly one candidate child, in order —
+        // a null output is a real value (not "no child"), and an array output
         // is visited as one node (not spliced into its elements) (#490).
-        if let Ok(children) = eval_owned_multi::<S>(f, &current) {
-            queue.extend(children);
+        let Ok(children) = eval_owned_multi::<S>(f, &current) else {
+            continue;
+        };
+
+        for child in children {
+            // `cond` gates the child, not `current` (see doc comment above).
+            // A cond error prunes this child, same as a falsy cond — neither
+            // is propagated as a query error.
+            let Ok(cond_outputs) = eval_owned_multi::<S>(cond, &child) else {
+                continue;
+            };
+            for c in &cond_outputs {
+                if c.is_truthy() {
+                    queue.push(child.clone());
+                }
+            }
         }
     }
 
