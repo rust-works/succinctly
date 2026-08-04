@@ -85,8 +85,15 @@
 # generator's first output). object_construct_cartesian — seeded far earlier by
 # #513 and predating the fix's own five new golden cases — passes too, dropping
 # the file to 7.
+#
+# assign_multi_output_rhs (#392) has since been fixed and dropped, leaving 6:
+# `eval_assign` now forks once per RHS output instead of collapsing to the
+# first, matching jq's own `value as $value | reduce path(paths) as $p
+# (...)` desugaring. `update_path`'s `Expr::Identity` arm was fixed the same
+# way for `|=`/`+=`/`-=`/`*=`/`/=`/`%=`/`//=`: it now takes the update
+# filter's first output via `eval_owned_multi` instead of collapsing every
+# output into an `OwnedValue::Array` via `eval_owned_expr`.
 
-assign_multi_output_rhs        assignment         .a = (1,2) only applies the first RHS output instead of forking once per output — #392
 reduce_multi_output_init       reduce             a multi-output reduce INIT forks in jq; only the first init output is used — #534
 foreach_multi_output_init      foreach            a multi-output foreach INIT forks in jq; only the first init output is used — #534
 reduce_update_zero_output      reduce             a comma in reduce's UPDATE clause is a compile error; jq keeps only UPDATE's last output as the new state, discarding earlier ones — #534
