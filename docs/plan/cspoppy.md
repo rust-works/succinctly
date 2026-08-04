@@ -417,7 +417,7 @@ array further beyond Step B's `u32`. Should be evaluated together with
 [compact-index-investigation.md](compact-index-investigation.md), which proposes
 EF for the YAML position arrays.
 
-### F6 — Sample rate as a tuning knob — issue #601
+### F6 — Sample rate as a tuning knob — issue #601 — **implemented** ✅
 
 At `u32` samples the overhead is `32 × density / rate`:
 
@@ -428,9 +428,19 @@ At `u32` samples the overhead is `32 × density / rate`:
 | 512         | 3.125%     | 0.781%  | 0.063%  |
 | 8192        | 0.195%     | 0.049%  | 0.004%  |
 
-Rate 512 halves Step B again, at the cost of a wider binary-search bracket.
-Cheap to expose via `Config` once B lands; needs measurement to justify a
-non-default. Default stays **256** so existing tuning keeps its meaning.
+Exposed exactly as this section predicted — via the existing crate-level
+`Config::select_sample_rate` (already `BitVec`'s knob for `SelectIndex`),
+not a new type. `WithCsPoppy::build_with_rate` takes the rate explicitly;
+`BalancedParens::new_with_cspoppy_config`/`from_words_with_cspoppy_config`
+thread a `Config` through to it, and the un-suffixed constructors stay
+`Config::default()` (rate 256) so #64's measured numbers keep their meaning.
+`WithCsPoppy` now stores the rate it was built with (`rate()` accessor)
+instead of assuming the crate-wide constant, so a stray 0 is clamped to 1
+(matches `SelectIndex::build`'s guard) rather than looping forever.
+
+Shipping the knob does not itself justify a non-default rate — that still
+needs the measurement this section originally called for. YAML's own
+`YamlIndex` construction is unchanged and keeps rate 256.
 
 ### F7 — `select0` — issue #602
 
