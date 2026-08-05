@@ -2882,6 +2882,49 @@ fn test_uncaught_break_after_output_keeps_the_prefix() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn regression_issue_575_break_in_loop_constructs_reaches_label() -> Result<()> {
+    // A `break $label` raised from inside `while`/`foreach`/`repeat`'s
+    // per-iteration expression used to degrade into a bogus
+    // "break $out not in label" error (exit 5) instead of unwinding to the
+    // enclosing `label` (real jq: clean output, exit 0) — the label never
+    // got a chance to catch it. All three transcripts here are verified
+    // against jq 1.7.1.
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            "label $out | while(true; if . >= 1 then break $out else .+1 end)",
+        ],
+        Some("1"),
+    )?;
+    assert_eq!(stdout, "1\n");
+    assert_eq!(stderr, "");
+    assert_eq!(code, 0);
+
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            "label $out | repeat(if . >= 1 then break $out else .+1 end)",
+        ],
+        Some("1"),
+    )?;
+    assert_eq!(stdout, "");
+    assert_eq!(stderr, "");
+    assert_eq!(code, 0);
+
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            "label $out | foreach (1,2,3) as $x (0; if $x == 2 then break $out else . + $x end)",
+        ],
+        Some("null"),
+    )?;
+    assert_eq!(stdout, "1\n");
+    assert_eq!(stderr, "");
+    assert_eq!(code, 0);
+    Ok(())
+}
+
 /// A `NumberLiteral` that overflows to infinity (e.g. `1e400`) used to render
 /// as garbage like `"NaNE+2147483647"` in every non-JSON text format instead
 /// of `"inf"`/`"-inf"` (#561). `tostring` reaches the fix directly, but
