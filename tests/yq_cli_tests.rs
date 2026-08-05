@@ -3913,3 +3913,32 @@ fn test_yq_outputs_before_an_error_or_break_survive() -> Result<()> {
     assert_eq!(code, 1);
     Ok(())
 }
+
+/// `path`/`parent`/`parent(n)`/`key` used to silently answer `[]`/`{}`/`null`
+/// (the root-level defaults) whenever they weren't the very first pipe stage
+/// (#554), because the CLI's streaming evaluator (`eval_generic.rs`, driving
+/// both `jq` and `yq`) bridged only the bare trailing builtin to the full
+/// evaluator, discarding the pipe structure `eval.rs`'s `needs_path_context`
+/// routing needs to see. This is the only automated coverage of the fix on
+/// the YAML/`YamlCursor` side of `eval_generic.rs` -- `jq_evaluator_parity_tests.rs`
+/// only exercises the JSON side.
+#[test]
+fn test_path_context_builtins_across_pipe_stages_554() -> Result<()> {
+    let (output, code) = run_yq_stdin(".a | path", "a: 1\n", &["-o", "json", "-I0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#"["a"]"#);
+
+    let (output, code) = run_yq_stdin(".a | parent", "a: 1\n", &["-o", "json", "-I0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#"{"a":1}"#);
+
+    let (output, code) = run_yq_stdin(".a | key", "a: 1\n", &["-o", "json", "-I0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#""a""#);
+
+    let (output, code) = run_yq_stdin(".a.b | parent", "a:\n  b: 1\n", &["-o", "json", "-I0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#"{"b":1}"#);
+
+    Ok(())
+}

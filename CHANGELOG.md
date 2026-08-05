@@ -156,6 +156,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`path`/`parent`/`parent(n)`/`key` (yq's path-context builtins) returned
+  the root-level defaults `[]`/`{}`/`null` instead of the real answer
+  whenever they appeared anywhere in a pipe other than the very first stage**
+  (#554): `.a | path` printed `[]` instead of `["a"]`, `.a | parent` printed
+  `{}` instead of `{"a":1}`. `eval.rs` (the library's full evaluator) tracks
+  path context correctly, threading a `current_path` accumulator through
+  every stage of `eval_pipe` whenever `needs_path_context` finds one of these
+  builtins anywhere in the pipe. But the CLI (`sjq`/`syq`) evaluates through
+  `eval_generic.rs`'s independent, cursor-based `Expr::Pipe` handling, which
+  has no path-accumulator of its own; once a preceding stage collapsed to a
+  plain value, its builtin dispatch bridged only the bare trailing builtin
+  (e.g. `Expr::Builtin(PathNoArg)`) to the full evaluator, discarding the
+  surrounding pipe that `needs_path_context` needs to see. `eval_generic.rs`'s
+  `Expr::Pipe` arm now runs the same `needs_path_context` check `eval_pipe`
+  does and, when it fires, bridges the *whole* remaining pipe (not just the
+  one builtin) to the full evaluator, so the existing path-tracking machinery
+  is reached with the pipe structure intact.
+
 - **`break $label` raised inside `while`/`foreach`/`repeat`/`reduce`/`until`'s
   per-iteration expression raised a spurious error instead of reaching the
   enclosing `label`** (#575): `eval_owned_expr` evaluated the per-iteration

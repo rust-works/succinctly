@@ -20,8 +20,9 @@ use indexmap::IndexMap;
 use super::document::{DocumentCursor, DocumentElements, DocumentFields, DocumentValue};
 use super::eval::{
     compare_values, eval as full_eval, format_owned, index_one_owned as index_owned_by_key,
-    numeric_display_string, numeric_key_to_index, owned_bound_to_i64, slice_owned_value,
-    tonumber_from_str, Control, EvalError, EvalSemantics, JqSemantics, QueryResult,
+    needs_path_context, numeric_display_string, numeric_key_to_index, owned_bound_to_i64,
+    slice_owned_value, tonumber_from_str, Control, EvalError, EvalSemantics, JqSemantics,
+    QueryResult,
 };
 use super::expr::{Builtin, CompareOp, Expr, FormatType, Literal};
 use super::slice::{slice_str, SliceBounds};
@@ -749,6 +750,17 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
         Expr::Paren(inner) => eval_single::<S, _>(inner, value, optional, cursor),
 
         Expr::Pipe(exprs) => {
+            // `path`/`parent`/`parent(n)`/`key` need the path accumulated
+            // across every stage of this pipe, which only the full evaluator
+            // tracks (`eval::eval_pipe`'s own `needs_path_context` routing,
+            // `eval.rs:6441-6444`). Bridge the *whole* pipe there rather than
+            // letting a later stage fall through `eval_builtin`'s per-builtin
+            // fallback in isolation, which has no path to give it (#554).
+            if exprs.iter().any(needs_path_context) {
+                let owned = to_owned(&value);
+                return eval_on_owned::<S, _>(&Expr::Pipe(exprs.clone()), owned, optional);
+            }
+
             if exprs.is_empty() {
                 return GenericResult::One(value);
             }
