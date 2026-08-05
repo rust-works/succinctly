@@ -156,6 +156,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`break $label` raised inside `while`/`foreach`/`repeat`/`reduce`/`until`'s
+  per-iteration expression raised a spurious error instead of reaching the
+  enclosing `label`** (#575): `eval_owned_expr` evaluated the per-iteration
+  sub-expression (`cond`/`update`/`extract`), then collapsed the resulting
+  `QueryResult` down to `Result<OwnedValue, EvalError>` — its `Break` arm
+  turned the control-flow signal into a synthetic `"break $label not in
+  label"` `EvalError`, indistinguishable by the time it reached `eval_label`,
+  which only recognizes a real `QueryResult::Break`. So `label $out |
+  while(true; if . >= 1 then break $out else .+1 end)` raised that bogus
+  error and exited 5 instead of matching jq's clean `1`, exit 0. Split
+  `eval_owned_expr` into `eval_owned_expr_ctrl` (returns `Result<OwnedValue,
+  Control>`, keeping `Break` distinct from `Error`, the same fix
+  `eval_slice_bound` already applies to slice bounds) with `eval_owned_expr`
+  now a thin wrapper over it, and switched `eval_while`/`eval_foreach`/
+  `eval_repeat`/`eval_reduce`/`eval_until`'s per-iteration evaluation to the
+  new function so a `break` now propagates as `Control::Break` to the
+  enclosing `label`. The issue named `while`/`foreach`/`repeat`; `reduce` and
+  `until` shared the identical defect via the same helper and are fixed
+  alongside them. Also fixes a secondary bug in `reduce`: `optional` (`?`)
+  used to swallow a `break` the same way it swallows a real error — it no
+  longer does, matching jq's `try`/`?` catching errors, not label breaks.
+
 - **`recurse(f)`/`recurse(f; cond)` swallowed an error raised while
   evaluating `f`/`cond`, treating it as a prune instead of jq's fatal
   error** (#636): `builtin_recurse_f`, `builtin_recurse_cond`, and their
