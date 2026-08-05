@@ -30,10 +30,11 @@ This document records all optimization attempts in the succinctly library, showi
 | P12-A Build Mitigation    | **11-85%** (yaml_bench build)               | All      | Deployed |
 | O1 Sequential Cursor      | **3-13%** (yq identity queries, 1-100KB)    | All      | Deployed |
 | O2 Gap-Skip rank1         | **2-6%** (yq identity queries, nested/users) | All      | Deployed |
+| jq Format Allocation (@csv/@tsv/@dsv/@sh) | **4-21%** (e2e, both platforms) | All | Deployed |
 
 > **Popcount build-flag caveat (#45):** The **AVX512-VPOPCNTDQ 5.2×** and **NEON 256-byte 1.10–1.15×** micro figures above are measured against a *baseline* build, where `count_ones()` stays scalar broadword. Under `-C target-cpu=native`, `count_ones()` auto-vectorizes and the x86 explicit path reaches **≈1× parity**; on Apple M4 Pro the NEON path re-measures at **1.56×**. Full measured data: [Popcount Strategies](simd.md#popcount-strategies-explicit-simd-vs-auto-vectorized-count_ones).
 
-**Total Successful**: 18 optimizations
+**Total Successful**: 19 optimizations
 **Best Result**: Cumulative index (627x)
 
 ### Failed Optimizations
@@ -660,6 +661,31 @@ The IB cursor state (`ib_word_idx`, `ib_ones_before`) remains valid after the ra
 **Key insight**: Green in memmem's target regime, but the scan is a minority of every candidate op's wall-time (all allocate output or materialize input), and there is no jq benchmark or realistic large-single-string workload (#301) to validate end-to-end. Per the #126 gate (>40% scan share + real workload), and the P2.6/P2.8/P3/P5/P8 micro-bench-win / end-to-end-reject precedents, the disciplined result is reject/defer. Full analysis in [jq-string-search.md](jq-string-search.md).
 
 **Files**: [benches/jq_string_ops_bench.rs](../../benches/jq_string_ops_bench.rs), [docs/optimizations/jq-string-search.md](jq-string-search.md)
+
+---
+
+### ✅ jq `@csv`/`@tsv`/`@dsv`/`@sh` Allocation Rewrite (August 2026)
+
+**Status**: Implemented and measured — [issue #647](https://github.com/rust-works/succinctly/issues/647), follow-up to [#124](https://github.com/rust-works/succinctly/issues/124)
+
+**Problem**: #124's byte-oriented rewrite covered `@uri`/`@html` only; `@csv`/`@tsv`/`@dsv`/`@sh` were left as `.replace()`/`format!()`-based code that benchmarked fast in isolation. #647 found three allocation-shape gaps anyway: `@tsv` chained four sequential `.replace()` passes; `@csv`/`@dsv` always allocated once for `.replace()` and again for `format!()`'s quote wrap, even with nothing to escape; all four built an intermediate `Vec<String>` and `.join()`-ed it.
+
+**Technique**: Applied #124's byte-scan-and-copy pattern (`write_quoted_csv_field`, `write_tsv_escaped_field`, `write_sh_quoted_field`) writing directly into one accumulating output buffer via a shared `write_joined_array` helper, eliminating the `Vec<String>`/`.join()` step for all four formats at once. `@csv`/`@dsv` share one quoting helper (previously duplicated verbatim). No SIMD — per #124's own finding, allocation/pass count is the bottleneck here, not a byte-scan bottleneck.
+
+**Benchmark Results** (`e2e/full` tier, 3 alternating before/after rounds × 3 record sizes, both machines):
+
+| Format | Apple M4 Pro | AMD Ryzen 9 7950X |
+|--------|--------------|--------------------|
+| `@csv` | -6.6% to -14.1% | -4.5% to -9.7% |
+| `@tsv` | -3.6% to -6.1%  | -2.3% to -9.7% |
+| `@dsv` | -6.5% to -8.7%  | -3.4% to -8.9% |
+| `@sh`  | -18.7% to -21.2% | -6.3% to -14.2% |
+
+Control (before-vs-before) settled to within ≈1-3% on both machines once the A/B method alternated before/after rather than running a single before→control→after sequence (which showed 5-15% drift from thermal/scheduling load, not the code change).
+
+**Key insight**: "Already fast in a micro-benchmark" is not the same claim as "no allocation-shape win available" — the allocation *count*, not raw throughput, was the actual lever. Full analysis in [jq-format-allocation.md](jq-format-allocation.md).
+
+**Files**: [src/jq/eval.rs](../../src/jq/eval.rs), [benches/jq_format_bench.rs](../../benches/jq_format_bench.rs), [docs/optimizations/jq-format-allocation.md](jq-format-allocation.md)
 
 ---
 

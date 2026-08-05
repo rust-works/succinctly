@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **jq `@csv`/`@tsv`/`@dsv`/`@sh` now scan bytes once and write directly into a
+  shared output buffer** (#647), following up on #124's `@uri`/`@html`
+  rewrite. Previously each string field paid for a `.replace()` allocation
+  (four chained passes for `@tsv`) plus a `format!()` wrap for `@csv`/`@dsv`,
+  and every array was collected into a `Vec<String>` and `.join()`-ed — a
+  second full copy. `@csv`/`@dsv` now share one quoting helper (previously
+  duplicated verbatim). Gated on the `e2e/full` benchmark tier across three
+  alternating before/after rounds: **-6.6% to -14.1%** (`@csv`), **-3.6% to
+  -6.1%** (`@tsv`), **-6.5% to -8.7%** (`@dsv`), **-18.7% to -21.2%** (`@sh`)
+  on Apple M4 Pro; **-4.5% to -9.7%**, **-2.3% to -9.7%**, **-3.4% to -8.9%**,
+  **-6.3% to -14.2%** respectively on AMD Ryzen 9 7950X. Output is
+  byte-identical to the prior implementation (existing unit/golden tests plus
+  new multibyte-boundary regression tests).
+
 - **YAML parsing specializes on whether the document contains a carriage return**
   (#340), recovering most of the cost #324 paid for CRLF and lone-CR
   correctness. `build_semi_index` runs one SIMD pass over the input and parses

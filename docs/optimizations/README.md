@@ -21,6 +21,7 @@ This directory documents optimization techniques used in the succinctly library,
 | **Compact encoding** | [end-positions.md](end-positions.md)                     | Bitmap encoding, advance index, sequential cursor|
 | **Sparse sets**      | [line-index.md](line-index.md)                           | Elias-Fano line starts, lazy build, crossover    |
 | **String search**    | [jq-string-search.md](jq-string-search.md)               | memmem vs std Two-Way for jq substring builtins   |
+| **jq allocation**    | [jq-format-allocation.md](jq-format-allocation.md)       | Byte-scan rewrite of @csv/@tsv/@dsv/@sh, no Vec+join |
 | **Select scan**      | [select-scan.md](select-scan.md)                         | #40 scan-length measurement, IB cursor O(n²) fix |
 | **Targets**          | [targets.md](targets.md)                                 | CPU target configurations, architecture flags    |
 | **SIMD Strategy**    | [simd-strategy.md](simd-strategy.md)                     | Per-module SIMD usage, platform support, lessons |
@@ -52,6 +53,7 @@ This directory documents optimization techniques used in the succinctly library,
 | O1 Sequential Cursor           | **3-13%** (query)  | Compact encoding | [end-positions.md](end-positions.md)                     |
 | O2 Gap-Skip rank1              | **2-6%** (query)   | Compact encoding | [end-positions.md](end-positions.md)                     |
 | jq Lazy String Slicing         | **8.5%** (vs regression), **2%** (vs baseline) | Control flow | src/jq/eval.rs |
+| jq Format Allocation (@csv/@tsv/@dsv/@sh) | **4-21%** (e2e, both platforms) | Allocation | [jq-format-allocation.md](jq-format-allocation.md) |
 
 ### Notable Failures (Instructive)
 
