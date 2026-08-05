@@ -302,7 +302,7 @@ fn json_is_truthy<W>(value: &StandardJson<'_, W>) -> bool {
 }
 
 /// Check if an expression contains PathNoArg, Parent, or Key builtins that need path context.
-fn needs_path_context(expr: &Expr) -> bool {
+pub(crate) fn needs_path_context(expr: &Expr) -> bool {
     match expr {
         Expr::Builtin(Builtin::PathNoArg) => true,
         Expr::Builtin(Builtin::Parent) => true,
