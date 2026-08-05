@@ -3021,3 +3021,38 @@ fn test_number_literal_overflow_owned_reindex_bridges_via_cli() -> Result<()> {
 
     Ok(())
 }
+
+/// `path`/`parent`/`parent(n)`/`key` used to silently answer `[]`/`{}`/`null`
+/// (the root-level defaults) whenever they weren't the very first pipe stage:
+/// the CLI's streaming evaluator (`eval_generic.rs`) bridged only the bare
+/// trailing builtin to the full evaluator, discarding the pipe structure
+/// `eval.rs`'s `needs_path_context` routing needs to see (#554). Uses
+/// `run_jq_full` (the pre-built binary), not the `cargo run`-based
+/// `run_jq_stdin`, so this is actually covered by `cargo llvm-cov`.
+#[test]
+fn test_path_context_builtins_across_pipe_stages_554() -> Result<()> {
+    let (output, _, code) = run_jq_full(&["-c", ".a | path"], Some(r#"{"a":1}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#"["a"]"#);
+
+    let (output, _, code) = run_jq_full(&["-c", ".a | parent"], Some(r#"{"a":1}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#"{"a":1}"#);
+
+    let (output, _, code) = run_jq_full(&["-c", ".a | key"], Some(r#"{"a":1}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#""a""#);
+
+    let (output, _, code) = run_jq_full(&["-c", ".a.b | parent"], Some(r#"{"a":{"b":1}}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#"{"b":1}"#);
+
+    let (output, _, code) = run_jq_full(
+        &["-c", ".a.b.c | parent(2)"],
+        Some(r#"{"a":{"b":{"c":1}}}"#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#"{"b":{"c":1}}"#);
+
+    Ok(())
+}

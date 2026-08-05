@@ -984,3 +984,57 @@ fn test_object_construction_product_parity_354() {
         assert_parity(json, filter);
     }
 }
+
+/// `path`/`parent`/`parent(n)`/`key` (yq's path-context builtins) only get
+/// their `current_path` threaded through `eval.rs`'s `eval_pipe`, reached
+/// when `needs_path_context` sees one of them anywhere in an `Expr::Pipe`
+/// list (#554). The generic (CLI/cursor) evaluator has its own independent
+/// `Expr::Pipe` handling with no path-accumulator of any kind, and used to
+/// bridge only the bare trailing builtin to the full evaluator once a
+/// preceding stage collapsed to a plain value -- discarding the very pipe
+/// structure `needs_path_context` needs to see. That silently returned the
+/// root-level defaults (`[]`/`{}`/null) for any of these builtins appearing
+/// anywhere but the first pipe stage. Every case here is wrong (mismatched
+/// with `full_outputs`) before the generic evaluator's `Expr::Pipe` arm also
+/// bridges the *whole* pipe once `needs_path_context` fires.
+#[test]
+fn test_path_context_builtins_survive_pipe_parity_554() {
+    for (json, filter, expected) in [
+        // The issue's own repro cases.
+        (br#"{"a":1}"#.as_slice(), ".a | path", r#"["a"]"#),
+        (br#"{"a":1}"#, ".a | parent", r#"{"a":1}"#),
+        (br#"{"a":1}"#, ".a | key", r#""a""#),
+        (br#"{"a":{"b":1}}"#, ".a.b | parent", r#"{"b":1}"#),
+        // `parent(n)`: n=1 matches bare `parent`; n=2 climbs one further.
+        (
+            br#"{"a":{"b":{"c":1}}}"#,
+            ".a.b.c | parent(1)",
+            r#"{"c":1}"#,
+        ),
+        (
+            br#"{"a":{"b":{"c":1}}}"#,
+            ".a.b.c | parent(2)",
+            r#"{"b":{"c":1}}"#,
+        ),
+        // A stage after the path-context builtin keeps consuming its output.
+        (br#"{"a":1}"#, ".a | path | .[0]", r#""a""#),
+        // A multi-output preceding stage (iteration): `key` reports each
+        // element's own key/index, not just the first.
+        (br"[10,20,30]", ".[] | key", "0"),
+        (br#"{"x":1,"y":2}"#, ".[] | key", r#""x""#),
+        // Bare, first-stage usage was already correct -- locked in here
+        // too so a future change can't silently regress it.
+        (br#"{"a":1}"#, "path", "[]"),
+        (br#"{"a":1}"#, "parent", "{}"),
+        (br#"{"a":1}"#, "key", "null"),
+    ] {
+        assert_parity(json, filter);
+        let generic = generic_outputs(json, filter);
+        assert_eq!(
+            as_strs(&generic)[0],
+            expected,
+            "unexpected CLI (generic evaluator) output for `{filter}` on `{}`",
+            String::from_utf8_lossy(json)
+        );
+    }
+}
