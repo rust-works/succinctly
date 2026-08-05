@@ -181,6 +181,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   here**: #635 (breadth-first vs jq's depth-first traversal order in these
   same functions) remains open and untouched.
 
+- **`resolve_node`'s `select(cond)` and `if cond then .. else .. end` arms
+  collapsed a multi-output `cond` into an always-truthy array, silently
+  treating an all-false `cond` as true** (#628, the "related pattern" #627
+  called out without confirming): both arms evaluated `cond` via
+  `eval_owned_expr`, which wraps 2+ outputs into one non-empty
+  `OwnedValue::Array` regardless of the individual values, so
+  `1 | [path(select((false,false)))]` returned `[[]]` instead of jq's `[]`,
+  and likewise for `if`. This is the path-tracking half reached via
+  `path(...)` and any write (`|=`, `del()`, ...) whose target passes through
+  a `select` or `if` — the value-context counterparts (`builtin_select` via
+  `eval_fanout`, and the value evaluator's `Expr::If` arm) were already
+  correct. Both arms now evaluate `cond` via `eval_owned_multi` and fork once
+  per truthy output, mirroring #627's fix to
+  `builtin_recurse_cond`/`resolve_recurse`: confirmed against jq 1.7.1,
+  `path(select((true,true)))` and `path(if (true,true) then . else empty
+  end)` both fork into `[[],[]]`. Six new golden fixtures pin the collapse
+  and fork cases for both builtins, including writes through them.
+
 - **`recurse(f; cond)` checked `cond` against the wrong node, and collapsed a
   multi-output `cond` into an always-truthy array** (#627):
   `builtin_recurse_cond` and its path-tracking sibling `resolve_recurse`

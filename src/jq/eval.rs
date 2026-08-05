@@ -8150,15 +8150,20 @@ fn resolve_node<S: EvalSemantics>(expr: &Expr, value: &OwnedValue) -> PathResolv
         // path component of their own — they either pass a branch through
         // unchanged or prune it, exactly like `Optional` above but driven by a
         // predicate instead of an error.
+        //
+        // `cond` runs through `eval_owned_multi`, not `eval_owned_expr`, and
+        // republishes `value` once per truthy output rather than collapsing
+        // every output into one always-truthy array (#628, mirroring #627's
+        // `builtin_recurse_cond`/`resolve_recurse` fix): confirmed against jq
+        // 1.7.1, `path(select((false,false)))` is empty (not `[[]]`), and
+        // `path(select((true,true)))` forks into two branches, `[[],[]]`.
         Expr::Builtin(Builtin::Select(cond)) => {
-            if eval_owned_expr::<S>(cond, value, false)
-                .map_err(|e| (Vec::new(), e))?
-                .is_truthy()
-            {
-                Ok(vec![(Vec::new(), value.clone())])
-            } else {
-                Ok(Vec::new())
-            }
+            let cond_outputs = eval_owned_multi::<S>(cond, value).map_err(|e| (Vec::new(), e))?;
+            Ok(cond_outputs
+                .into_iter()
+                .filter(OwnedValue::is_truthy)
+                .map(|_| (Vec::new(), value.clone()))
+                .collect())
         }
         Expr::Builtin(
             builtin @ (Builtin::Values
@@ -8195,19 +8200,35 @@ fn resolve_node<S: EvalSemantics>(expr: &Expr, value: &OwnedValue) -> PathResolv
         // selects is checked for path-ness — the branch not taken is never
         // evaluated at all, so a non-path `else` that is never reached
         // raises nothing (matches jq).
+        //
+        // `cond` runs through `eval_owned_multi`, not `eval_owned_expr`, and
+        // forks once per output rather than collapsing every output into one
+        // always-truthy array (#628, mirroring #627): confirmed against jq
+        // 1.7.1, `path(if (false,false) then . else empty end)` is empty
+        // (not `[[]]`), and `path(if (true,true) then . else empty end)`
+        // resolves `then_branch` once per truthy output, `[[],[]]`.
         Expr::If {
             cond,
             then_branch,
             else_branch,
         } => {
-            if eval_owned_expr::<S>(cond, value, false)
-                .map_err(|e| (Vec::new(), e))?
-                .is_truthy()
-            {
-                resolve_node::<S>(then_branch, value)
-            } else {
-                resolve_node::<S>(else_branch, value)
+            let cond_outputs = eval_owned_multi::<S>(cond, value).map_err(|e| (Vec::new(), e))?;
+            let mut out = Vec::new();
+            for c in cond_outputs {
+                let branch = if c.is_truthy() {
+                    then_branch
+                } else {
+                    else_branch
+                };
+                match resolve_node::<S>(branch, value) {
+                    Ok(branches) => out.extend(branches),
+                    Err((prefix, e)) => {
+                        out.extend(prefix);
+                        return Err((out, e));
+                    }
+                }
             }
+            Ok(out)
         }
 
         // `a // b`: resolve `a`, keep only its truthy branches — jq's `//`
