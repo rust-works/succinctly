@@ -442,11 +442,23 @@ Shipping the knob does not itself justify a non-default rate — that still
 needs the measurement this section originally called for. YAML's own
 `YamlIndex` construction is unchanged and keeps rate 256.
 
-### F7 — `select0` — issue #602
+### F7 — `select0` — issue #602 — **implemented** ✅
 
-Unsupported crate-wide today. On BP it would find the k-th close, complementing
-`select1`. CS-Poppy supports both in the paper. No known consumer — recorded as
-a gap.
+Landed as an O(log n) binary search over rank rather than a CS-Poppy-style
+dedicated 0-select sample array — the same call [ADR-0012](../adrs/adr-0012.md)
+made for `EliasFano::predecessor` "rather than a proper `select0`-based
+predecessor costing ~80 lines and a second sample array," for the same
+reason: no measured need. `BitVec::select0` binary-searches its existing
+O(1) `rank0`; `BalancedParens::select0` binary-searches its existing O(1)
+`rank1` via two new small accessors, `total_zeros()` and `rank0()`, mirroring
+`total_ones()`/`rank1()`. It works identically for every `SelectSupport`
+impl (`NoSelect`/`WithSelect`/`WithCsPoppy`) because it never touches
+`self.select` — `SelectSupport` itself is unchanged.
+
+Shipping the O(log n) version does not preclude a future O(1) sampled
+`select0` if a real consumer with a measured need for it shows up; this
+section's original "no known consumer" framing still applies to that
+follow-up.
 
 ---
 
