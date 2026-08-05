@@ -19,11 +19,11 @@ use indexmap::IndexMap;
 
 use super::document::{DocumentCursor, DocumentElements, DocumentFields, DocumentValue};
 use super::eval::{
-    compare_values, eval as full_eval, index_one_owned as index_owned_by_key,
+    compare_values, eval as full_eval, format_owned, index_one_owned as index_owned_by_key,
     numeric_display_string, numeric_key_to_index, owned_bound_to_i64, slice_owned_value,
     tonumber_from_str, Control, EvalError, EvalSemantics, JqSemantics, QueryResult,
 };
-use super::expr::{Builtin, CompareOp, Expr, Literal};
+use super::expr::{Builtin, CompareOp, Expr, FormatType, Literal};
 use super::slice::{slice_str, SliceBounds};
 use super::value::{is_nan_sentinel, OwnedValue};
 use crate::json::JsonIndex;
@@ -112,6 +112,18 @@ fn standard_json_to_owned<W: Clone + AsRef<[u64]>>(
     }
 }
 
+/// Apply a format to an owned value and wrap it as a `GenericResult`.
+fn format_result<V: DocumentValue>(
+    format_type: &FormatType,
+    owned: &OwnedValue,
+    optional: bool,
+) -> GenericResult<V> {
+    match format_owned(format_type, owned, optional) {
+        Ok(s) => GenericResult::Owned(OwnedValue::String(s)),
+        Err(e) => GenericResult::Error(e),
+    }
+}
+
 /// Evaluate an expression on an OwnedValue using the full evaluator.
 ///
 /// This converts the OwnedValue to JSON, evaluates using the full evaluator,
@@ -121,6 +133,17 @@ fn eval_on_owned<S: EvalSemantics, V: DocumentValue>(
     owned: OwnedValue,
     optional: bool,
 ) -> GenericResult<V> {
+    // Formats need neither an index nor a cursor, so the round-trip below is
+    // pure overhead for them (#124). No non-finite-float guard is needed here
+    // either: every non-JSON format bottoms out in `numeric_display_string`,
+    // `owned_to_yaml`, or `props_value_to_string` (eval.rs), which already
+    // render NaN/Infinity as `"inf"`/`".nan"`/etc. directly from an
+    // `OwnedValue::Float` or `NumberLiteral`, with no dependence on having
+    // passed through a JSON round-trip first.
+    if let Expr::Format(format_type) = expr {
+        return format_result(format_type, &owned, optional);
+    }
+
     let json_str = owned.to_json_for_reindex();
     let json_bytes = json_str.as_bytes();
     let index = JsonIndex::build(json_bytes);
@@ -898,6 +921,11 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
             Literal::Float(f) => GenericResult::Owned(OwnedValue::Float(*f)),
             Literal::String(s) => GenericResult::Owned(OwnedValue::String(s.clone())),
         },
+
+        // Formats are pure functions of the value, so evaluate them here rather
+        // than falling through to the catch-all, which would serialize the
+        // value to JSON and rebuild a `JsonIndex` for every one (#124).
+        Expr::Format(format_type) => format_result(format_type, &to_owned(&value), optional),
 
         Expr::Builtin(builtin) => eval_builtin::<S, _>(builtin, value, optional, cursor),
 
