@@ -7188,23 +7188,80 @@ fn eval_rhs_once<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
 /// Evaluate simple assignment: `.path = value`
 /// Sets the value at path and returns the modified input.
+///
+/// Unlike every other assignment operator, `=` forks: real jq's own
+/// desugaring is `value as $value | reduce path(paths) as $p (.; setpath($p;
+/// $value))`, so a `value` that produces more than one output runs the whole
+/// `reduce path(paths) as $p (...)` once per output, forking into one whole
+/// result document per RHS output (#392) -- not collapsing to the first the
+/// way `|=`/`+=`/`-=`/`//=`/etc. still correctly do via [`eval_rhs_once`]
+/// (unaffected by this function; it has its own callers). Every document is
+/// built by splicing that one RHS output into a fresh copy of the *original*
+/// input at every resolved path.
+///
+/// A zero-output RHS produces zero documents, not one with the path set to
+/// `null`: jq's `value as $value | ...` never even reaches `path(paths)`
+/// when `value` binds zero times (`.a = empty` produces no output; a bad
+/// path expression like `.[error("x")] = empty` is never even evaluated).
+///
+/// A `setpath` failure partway through one RHS output's own path list
+/// contributes nothing for that output, and -- since the failure then
+/// propagates out through the enclosing `value as $value | ...` the same way
+/// any generator's error terminates it mid-stream -- no later RHS output is
+/// attempted either. Earlier, already-completed documents are kept as a
+/// `Partial` prefix (#400, #494): `[1,2,3,4] | .[0:2] = ([8,8],1,[9,9])`
+/// streams `[8,8,3,4]`, then raises on `1` (not an array), and `[9,9]` never
+/// appears.
+///
+/// `optional` is `=`'s own `?` (`(.a = 1)?`) -- see `eval_update`'s matching
+/// comment for why it is caught here at the call boundary rather than
+/// threaded into `set_path` as a starting flag. It swallows a failure but
+/// still keeps whatever was already built rather than discarding it:
+/// `(.a = (1, error("boom"), 3))?` is `{"a":1}`, not nothing.
 fn eval_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     path_expr: &Expr,
     value_expr: &Expr,
     input: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    // First evaluate the value expression
-    let mut new_value = match eval_rhs_once::<W, S>(value_expr, input.clone(), optional) {
-        Ok(v) => v,
-        Err(early_return) => return early_return,
-    };
+    // Evaluate the RHS once, keeping every output instead of collapsing to
+    // the first (#392). `terminal` carries a trailing `Error`/`Break` when
+    // the stream didn't simply run out -- the same `Partial` shape every
+    // other multi-output combinator here uses (#400, #494), so the
+    // zero-prefix case (a bare `Error`/`Break`) and the nonzero-prefix case
+    // (`Partial`) share one code path below instead of two.
+    let (rhs_values, terminal): (Vec<OwnedValue>, Option<Control>) =
+        match eval_single::<W, S>(value_expr, input.clone(), optional).materialize_cursor() {
+            QueryResult::One(v) => (vec![to_owned(&v)], None),
+            QueryResult::OneCursor(_) => {
+                unreachable!("materialize_cursor should have converted this")
+            }
+            QueryResult::Owned(v) => (vec![v], None),
+            QueryResult::Many(vs) => (vs.iter().map(to_owned).collect(), None),
+            QueryResult::ManyOwned(vs) => (vs, None),
+            QueryResult::None => (Vec::new(), None),
+            QueryResult::Error(e) => (Vec::new(), Some(Control::Error(e))),
+            QueryResult::Break(label) => (Vec::new(), Some(Control::Break(label))),
+            QueryResult::Partial(vs, control) => (vs, Some(control)),
+        };
 
-    // Convert input to owned for modification
-    let mut result = to_owned(&input);
+    // A zero-output RHS produces zero documents (a genuine behavior change
+    // from before this fix, which forced a zero-output RHS to `Null` via
+    // `eval_rhs_once`) -- see the doc comment above.
+    if rhs_values.is_empty() {
+        return match terminal {
+            None => QueryResult::None,
+            Some(Control::Error(_)) if optional => QueryResult::None,
+            Some(control) => partial(Vec::new(), control), // normalizes to bare Error/Break
+        };
+    }
 
-    // Resolve computed keys against the *original* document, before any write,
-    // then apply every resolved path: `.[("a","b")] = 1` assigns both.
+    // Resolve computed keys against the *original* document, before any
+    // write, then apply them to every RHS output in turn: `.[("a","b")] =
+    // (1,2)` assigns both keys per output, forking into two whole documents
+    // (not four). Still resolved once, not once per RHS output: every
+    // output is spliced against its own fresh copy of the same pristine
+    // document, so the paths it resolves to are identical every time.
     //
     // `optional` here is `=`'s *own* `?` (`(.a = 1)?`), i.e. jq's ordinary
     // `try/catch` around the whole expression -- not a per-step tolerance. It
@@ -7217,30 +7274,61 @@ fn eval_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // into empty output when the whole call is optional -- mirroring how
     // `builtin_del` (#537) already separates `del(...)?` from a `?` written
     // inside the path.
-    let paths = match resolve_dynamic_indexes::<S>(path_expr, &result) {
+    let mut pristine = to_owned(&input);
+    let paths = match resolve_dynamic_indexes::<S>(path_expr, &pristine) {
         Ok(paths) => paths,
         Err((_, _)) if optional => return QueryResult::None,
         Err((_, e)) => return QueryResult::Error(e),
     };
 
     let last = paths.len().saturating_sub(1);
-    for (i, path) in paths.iter().enumerate() {
-        // Only the final application needs to own `new_value`.
-        let value = if i == last {
-            core::mem::replace(&mut new_value, OwnedValue::Null)
+    let rhs_last = rhs_values.len() - 1;
+    let mut docs: Vec<OwnedValue> = Vec::with_capacity(rhs_values.len());
+    for (j, mut new_value) in rhs_values.into_iter().enumerate() {
+        // Every output but the last needs its own copy of `pristine`; the
+        // last can just take it (nothing reads `pristine` after the loop),
+        // sparing the overwhelmingly common single-output case (`.a = 5`) a
+        // clone of the whole document it doesn't need. Same "only the final
+        // one needs to own it" trick as `new_value` below, just on the
+        // document instead of the RHS value.
+        let mut result = if j == rhs_last {
+            core::mem::replace(&mut pristine, OwnedValue::Null)
         } else {
-            new_value.clone()
+            pristine.clone()
         };
-        if let Err(e) = set_path(&mut result, path, value) {
-            return if optional {
-                QueryResult::None
+        for (i, path) in paths.iter().enumerate() {
+            // Only the final application needs to own `new_value`.
+            let value = if i == last {
+                core::mem::replace(&mut new_value, OwnedValue::Null)
             } else {
-                QueryResult::Error(e)
+                new_value.clone()
             };
+            if let Err(e) = set_path(&mut result, path, value) {
+                // Atomic per RHS output, like `reduce`: this value's own
+                // path list contributes nothing, and the whole fan-out
+                // terminates here -- `docs` (only the strictly earlier,
+                // already-completed outputs) is everything that survives.
+                return if optional {
+                    owned_vec_to_result(docs)
+                } else {
+                    partial(docs, Control::Error(e))
+                };
+            }
         }
+        docs.push(result);
     }
 
-    QueryResult::Owned(result)
+    match terminal {
+        None => owned_vec_to_result(docs),
+        Some(Control::Error(e)) => {
+            if optional {
+                owned_vec_to_result(docs)
+            } else {
+                partial(docs, Control::Error(e))
+            }
+        }
+        Some(Control::Break(label)) => partial(docs, Control::Break(label)),
+    }
 }
 
 /// Evaluate update assignment: `.path |= filter`
@@ -7699,7 +7787,20 @@ fn update_path<S: EvalSemantics>(
             // filter` expression is handled by `eval_update`'s caller
             // instead, which is why `update_path` is always entered with
             // `optional: false` at the top.
-            let v = eval_owned_expr::<S>(filter_expr, root, false)?;
+            //
+            // `eval_owned_multi`, not `eval_owned_expr`: `|=` keeps only the
+            // filter's *first* output, never an array of every output
+            // (#392) -- `eval_owned_expr` collapsed a multi-output result
+            // into exactly that array (`.a |= (1,2)` produced
+            // `{"a":[1,2]}` instead of jq's `{"a":1}`). A zero-output
+            // filter still falls back to `Null` here -- `.a |= empty`
+            // leaves `"a":null` rather than deleting the key the way real
+            // jq does, a separate, pre-existing bug this fix does not
+            // change.
+            let v = eval_owned_multi::<S>(filter_expr, root)?
+                .into_iter()
+                .next()
+                .unwrap_or(OwnedValue::Null);
             *root = v;
             Ok(())
         }
@@ -19309,14 +19410,14 @@ mod tests {
     fn partial_reduced_to_a_single_value_keeps_its_first_output() {
         // The "this position takes one value, not a stream" helpers all keep
         // the prefix's first output and drop the trailing control.
+        //
+        // Assignment RHS used to be pinned here too (`.a = (1,error("x"))`
+        // used to reduce to `Owned({"a":1})`, diverging from jq 1.7.1's
+        // `{"a":1}` then exit 5), but `=` no longer reduces its RHS to a
+        // single value (#392) — see
+        // `test_assign_multi_output_rhs_errors_after_partial_output`, which
+        // now pins the matching-jq `Partial` behavior instead.
 
-        // Assignment RHS. Diverges from jq 1.7.1, which prints {"a":1} and
-        // then *fails* (exit 5); succinctly exits 0.
-        query!(br#"{"a":0}"#, r#".a = (1,error("x"))"#,
-            QueryResult::Owned(OwnedValue::Object(m)) => {
-                assert_eq!(m.get("a"), Some(&OwnedValue::Int(1)));
-            }
-        );
         // `pick`/`omit` key expressions. jq 1.7.1 rejects both filters
         // outright ("Invalid path expression"), a separate pre-existing gap.
         query!(br#"{"a":1,"b":2}"#, r#"pick((["a"],error("x")))"#,
@@ -24423,6 +24524,109 @@ mod tests {
                 assert_eq!(arr[2], OwnedValue::Int(6));
             }
         );
+    }
+
+    #[test]
+    fn test_assign_multi_output_rhs_forks_once_per_output() {
+        // #392: `.a = (1,2)` forks into two whole documents, one per RHS
+        // output, each spliced into a fresh copy of the pristine input --
+        // not just the first output.
+        assert_eq!(
+            outputs(b"{}", ".a = (1,2)"),
+            vec![r#"{"a":1}"#, r#"{"a":2}"#]
+        );
+    }
+
+    #[test]
+    fn test_update_assign_multi_output_rhs_keeps_only_the_first_output() {
+        // #392's complementary rule: `|=` takes only the RHS filter's first
+        // output, never an array of every output (which was the
+        // `Expr::Identity` arm's bug before this fix).
+        assert_eq!(outputs(b"{}", ".a |= (1,2)"), vec![r#"{"a":1}"#]);
+    }
+
+    #[test]
+    fn test_assign_empty_rhs_produces_no_output() {
+        // Behavior change (#392): before this fix, a zero-output RHS was
+        // forced to `Null` (`{"a":null}`). Real jq's `_assign` never even
+        // reaches `path(paths)` when `value` binds zero times, so the whole
+        // expression yields nothing.
+        assert_eq!(outputs(b"{}", ".a = empty"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn test_assign_multi_output_rhs_errors_after_partial_output() {
+        // Confirmed against real jq: `.a = (1,error("boom"),3)` streams
+        // `{"a":1}`, then raises `boom` and exits 5 -- `3` is never reached.
+        query!(b"{}", r#".a = (1,error("boom"),3)"#,
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(prefix_json(&vs), [r#"{"a":1}"#]);
+                assert_eq!(e.message, "boom");
+            }
+        );
+    }
+
+    #[test]
+    fn test_assign_multi_path_with_multi_output_rhs_forks_per_output_not_per_path() {
+        // Paths are still resolved once, against the pristine input
+        // (unchanged); what's new is forking once per RHS output. Verified
+        // against real jq: `(.a,.b) = (10,20,30)` yields three whole
+        // documents, each with *both* paths set to the same output -- not
+        // nine (paths x outputs).
+        assert_eq!(
+            outputs(b"{}", "(.a,.b) = (10,20,30)"),
+            vec![
+                r#"{"a":10,"b":10}"#,
+                r#"{"a":20,"b":20}"#,
+                r#"{"a":30,"b":30}"#
+            ],
+        );
+    }
+
+    #[test]
+    fn test_assign_setpath_failure_mid_fanout_keeps_earlier_docs() {
+        // A `setpath` failure partway through the fan-out terminates it like
+        // any other mid-stream error (#400/#494's shape): earlier documents
+        // survive, later RHS outputs are never attempted. Confirmed against
+        // real jq: `.[0:2] = ([8,8],1,[9,9])` streams `[8,8,3,4]`, then
+        // raises, and `[9,9]` never appears.
+        query!(br"[1,2,3,4]", r".[0:2] = ([8,8],1,[9,9])",
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(prefix_json(&vs), ["[8,8,3,4]"]);
+                assert_eq!(e.message, "A slice of an array can only be assigned another array");
+            }
+        );
+    }
+
+    #[test]
+    fn test_optional_assign_swallows_setpath_failure_but_keeps_documents_already_built() {
+        // An outer `?` on the *whole* assignment only swallows the failure --
+        // it does not discard documents the fan-out already built, matching
+        // ordinary `try` semantics. Verified against real jq: `(.[0:2] =
+        // ([8,8],1,[9,9]))?` keeps `[8,8,3,4]` rather than producing nothing.
+        //
+        // (An RHS that itself errors under `?`, e.g. `(.a = (1,
+        // error("boom"), 3))?`, is not exercised here: `Expr::Optional`
+        // threads `optional` into every sibling of a comma independently
+        // rather than aborting the whole generator on its first error, so
+        // `error("boom")` is swallowed as `None` and `3` still runs --
+        // diverging from jq's `{"a":1}` there. That divergence predates and
+        // is independent of #392 -- `eval_rhs_once` threaded the same
+        // `optional` flag into the RHS the same way -- and is not something
+        // this fix changes or is responsible for.)
+        assert_eq!(
+            outputs(b"[1,2,3,4]", "(.[0:2] = ([8,8],1,[9,9]))?"),
+            vec!["[8,8,3,4]"],
+        );
+    }
+
+    #[test]
+    fn test_update_assign_empty_rhs_characterizes_preexisting_null_bug() {
+        // Real jq deletes the key when the update filter produces no output
+        // (`.a |= empty` on `{}` is `{}`); succinctly currently leaves it
+        // `null`. Pre-existing, out of scope for #392 -- if this is ever
+        // fixed, update this test.
+        assert_eq!(outputs(b"{}", ".a |= empty"), vec![r#"{"a":null}"#]);
     }
 
     #[test]
