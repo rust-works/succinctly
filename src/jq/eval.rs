@@ -9808,11 +9808,12 @@ fn eval_reduce<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // Substitute $var in update, then evaluate with acc as input
         let substituted = substitute_var(update, var, &input_val);
         // We need to evaluate with acc as the input
-        let acc_result = eval_owned_expr::<S>(&substituted, &acc, optional);
+        let acc_result = eval_owned_expr_ctrl::<S>(&substituted, &acc, optional);
         match acc_result {
             Ok(new_acc) => acc = new_acc,
-            Err(_) if optional => return QueryResult::None,
-            Err(e) => return QueryResult::Error(e),
+            Err(Control::Error(_)) if optional => return QueryResult::None,
+            Err(Control::Error(e)) => return QueryResult::Error(e),
+            Err(Control::Break(label)) => return QueryResult::Break(label),
         }
     }
 
@@ -9880,14 +9881,22 @@ fn eval_owned_fast_path(
     }
 }
 
-/// Evaluate an expression with an OwnedValue as input.
-fn eval_owned_expr<S: EvalSemantics>(
+/// Same evaluator as [`eval_owned_expr`], but keeps a `break` distinguishable
+/// from a real error via [`Control`] instead of collapsing it into a
+/// synthetic "break $label not in label" [`EvalError`] — needed by callers
+/// that run their operand through a loop of their own (`while`, `until`,
+/// `repeat`, `reduce`, `foreach`'s per-iteration UPDATE/EXTRACT) and must let
+/// a `break $label` inside that operand reach its enclosing `label` (#575).
+/// Same fix [`eval_slice_bound`] already applies to slice bounds.
+fn eval_owned_expr_ctrl<S: EvalSemantics>(
     expr: &Expr,
     input: &OwnedValue,
     optional: bool,
-) -> Result<OwnedValue, EvalError> {
+) -> Result<OwnedValue, Control> {
     if let Some(result) = eval_owned_fast_path(expr, input, optional) {
-        return result.map(|v| v.unwrap_or(OwnedValue::Null));
+        return result
+            .map(|v| v.unwrap_or(OwnedValue::Null))
+            .map_err(Control::Error);
     }
 
     // Create a synthetic JSON from the owned value
@@ -9924,8 +9933,8 @@ fn eval_owned_expr<S: EvalSemantics>(
             }
         }
         QueryResult::None => Ok(OwnedValue::Null),
-        QueryResult::Error(e) => Err(e),
-        QueryResult::Break(label) => Err(EvalError::new(format!("break ${label} not in label"))),
+        QueryResult::Error(e) => Err(Control::Error(e)),
+        QueryResult::Break(label) => Err(Control::Break(label)),
         // Same collapse-to-single-or-array policy as `Many`/`ManyOwned`
         // above; the trailing control is dropped, consistent with how this
         // function already doesn't fork over a multi-output update (a
@@ -9938,6 +9947,18 @@ fn eval_owned_expr<S: EvalSemantics>(
             }
         }
     }
+}
+
+/// Evaluate an expression with an OwnedValue as input.
+fn eval_owned_expr<S: EvalSemantics>(
+    expr: &Expr,
+    input: &OwnedValue,
+    optional: bool,
+) -> Result<OwnedValue, EvalError> {
+    eval_owned_expr_ctrl::<S>(expr, input, optional).map_err(|control| match control {
+        Control::Error(e) => e,
+        Control::Break(label) => EvalError::new(format!("break ${label} not in label")),
+    })
 }
 
 /// Evaluate an expression with an OwnedValue as input, preserving the full
@@ -10032,23 +10053,23 @@ fn eval_foreach<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     for input_val in input_values {
         // Substitute $var and evaluate update with state as input
         let substituted_update = substitute_var(update, var, &input_val);
-        match eval_owned_expr::<S>(&substituted_update, &state, optional) {
+        match eval_owned_expr_ctrl::<S>(&substituted_update, &state, optional) {
             Ok(new_state) => {
                 state = new_state;
                 // If there's an extract expression, evaluate it
                 if let Some(ext) = extract {
                     let substituted_extract = substitute_var(ext, var, &input_val);
-                    match eval_owned_expr::<S>(&substituted_extract, &state, optional) {
+                    match eval_owned_expr_ctrl::<S>(&substituted_extract, &state, optional) {
                         Ok(output) => outputs.push(output),
                         // The steps already produced no longer vanish (#494).
-                        Err(e) => return partial(outputs, Control::Error(e)),
+                        Err(control) => return partial(outputs, control),
                     }
                 } else {
                     // Without extract, output the current state
                     outputs.push(state.clone());
                 }
             }
-            Err(e) => return partial(outputs, Control::Error(e)),
+            Err(control) => return partial(outputs, control),
         }
     }
 
@@ -10279,19 +10300,21 @@ fn eval_until<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
     for _ in 0..MAX_ITERATIONS {
         // Check condition
-        match eval_owned_expr::<S>(cond, &current, optional) {
+        match eval_owned_expr_ctrl::<S>(cond, &current, optional) {
             Ok(cond_val) => {
                 if cond_val.is_truthy() {
                     return QueryResult::Owned(current);
                 }
             }
-            Err(e) => return QueryResult::Error(e),
+            Err(Control::Error(e)) => return QueryResult::Error(e),
+            Err(Control::Break(label)) => return QueryResult::Break(label),
         }
 
         // Apply update
-        match eval_owned_expr::<S>(update, &current, optional) {
+        match eval_owned_expr_ctrl::<S>(update, &current, optional) {
             Ok(new_val) => current = new_val,
-            Err(e) => return QueryResult::Error(e),
+            Err(Control::Error(e)) => return QueryResult::Error(e),
+            Err(Control::Break(label)) => return QueryResult::Break(label),
         }
     }
 
@@ -10311,25 +10334,27 @@ fn eval_while<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
     for _ in 0..MAX_ITERATIONS {
         // Check condition
-        match eval_owned_expr::<S>(cond, &current, optional) {
+        match eval_owned_expr_ctrl::<S>(cond, &current, optional) {
             Ok(cond_val) => {
                 if !cond_val.is_truthy() {
                     break;
                 }
             }
-            // The values already output no longer vanish (#494):
+            // The values already output no longer vanish (#494), and a
+            // `break $label` inside `cond` reaches its enclosing `label`
+            // instead of degrading into a synthetic error (#575).
             // `while(. < 5; if . == 3 then error("boom") else .+1 end)` on
             // `1` is `1`, `2`, `3`, then the error.
-            Err(e) => return partial(outputs, Control::Error(e)),
+            Err(control) => return partial(outputs, control),
         }
 
         // Output current value
         outputs.push(current.clone());
 
         // Apply update
-        match eval_owned_expr::<S>(update, &current, optional) {
+        match eval_owned_expr_ctrl::<S>(update, &current, optional) {
             Ok(new_val) => current = new_val,
-            Err(e) => return partial(outputs, Control::Error(e)),
+            Err(control) => return partial(outputs, control),
         }
     }
 
@@ -10352,13 +10377,15 @@ fn eval_repeat<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
     for _ in 0..MAX_ITERATIONS {
         // Evaluate expr with the original input each time
-        match eval_owned_expr::<S>(expr, &owned, optional) {
+        match eval_owned_expr_ctrl::<S>(expr, &owned, optional) {
             Ok(new_val) => outputs.push(new_val),
             // The values already output no longer vanish, and an error with
             // no prior output surfaces as an error rather than empty output
             // (#495): `repeat(if . > 3 then error("boom") else .+1 end)` on
             // `5` raises immediately with no output, matching jq exactly.
-            Err(e) => return partial(outputs, Control::Error(e)),
+            // A `break $label` reaches its enclosing `label` instead of
+            // degrading into a synthetic error (#575).
+            Err(control) => return partial(outputs, control),
         }
     }
 
@@ -18863,6 +18890,153 @@ mod tests {
         query!(b"null", "label $out | limit(5; 1,2,(3|break $out),4)",
             QueryResult::ManyOwned(vs) => {
                 assert_eq!(prefix_json(&vs), ["1", "2"]);
+            }
+        );
+    }
+
+    #[test]
+    fn regression_issue_575_while_break_reaches_enclosing_label() {
+        // The issue's own example, verified against jq 1.7.1: the label
+        // catches the break cleanly, keeping whatever the loop already
+        // output before it broke.
+        assert_eq!(
+            outputs(
+                b"1",
+                "label $out | while(true; if . >= 1 then break $out else .+1 end)"
+            ),
+            ["1"]
+        );
+        // Without an enclosing label, the break used to degrade into a
+        // synthetic "break $out not in label" error; it now surfaces as a
+        // real `Break`, with the value already output kept as a prefix
+        // (same shape #494 already gives an `error(...)` in this position).
+        query!(
+            b"1",
+            "while(true; if . >= 1 then break $out else .+1 end)",
+            QueryResult::Partial(vs, Control::Break(label)) => {
+                assert_eq!(prefix_json(&vs), ["1"]);
+                assert_eq!(label, "out");
+            }
+        );
+        // A break in `cond` (rather than `update`) is caught the same way,
+        // with no output at all since it fires before the first value would
+        // have been emitted.
+        assert_eq!(
+            outputs(b"1", "label $out | while(break $out; .+1)"),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn regression_issue_575_foreach_break_reaches_enclosing_label() {
+        // The issue's own example: break in UPDATE.
+        assert_eq!(
+            outputs(
+                b"null",
+                "label $out | foreach (1,2,3) as $x (0; if $x == 2 then break $out else . + $x end)"
+            ),
+            ["1"]
+        );
+        // Break in EXTRACT, verified against jq 1.7.1.
+        assert_eq!(
+            outputs(
+                b"null",
+                "label $out | foreach (1,2,3) as $x (0; .+$x; if $x == 2 then break $out else . end)"
+            ),
+            ["1"]
+        );
+        // Without an enclosing label, UPDATE's break surfaces as a real
+        // `Break`, keeping the outputs already extracted as a prefix.
+        query!(
+            b"null",
+            "foreach (1,2,3) as $x (0; if $x == 2 then break $out else . + $x end)",
+            QueryResult::Partial(vs, Control::Break(label)) => {
+                assert_eq!(prefix_json(&vs), ["1"]);
+                assert_eq!(label, "out");
+            }
+        );
+    }
+
+    #[test]
+    fn regression_issue_575_repeat_break_reaches_enclosing_label() {
+        // The issue's own example: breaks on the very first iteration, so
+        // nothing is ever output.
+        assert_eq!(
+            outputs(
+                b"1",
+                "label $out | repeat(if . >= 1 then break $out else .+1 end)"
+            ),
+            Vec::<String>::new()
+        );
+        // Without an enclosing label, the break surfaces as a real `Break`
+        // rather than a synthetic error.
+        query!(
+            b"1",
+            "repeat(if . >= 1 then break $out else .+1 end)",
+            QueryResult::Break(label) => {
+                assert_eq!(label, "out");
+            }
+        );
+    }
+
+    #[test]
+    fn regression_issue_575_reduce_break_reaches_enclosing_label() {
+        // Verified against jq 1.7.1.
+        assert_eq!(
+            outputs(
+                b"null",
+                "label $out | reduce (1,2,3) as $x (0; if $x == 2 then break $out else . + $x end)"
+            ),
+            Vec::<String>::new()
+        );
+        // `reduce` only ever emits its final accumulator, never
+        // intermediates, so without a label the break surfaces bare (no
+        // prefix to preserve) rather than as a synthetic error.
+        query!(
+            b"null",
+            "reduce (1,2,3) as $x (0; if $x == 2 then break $out else . + $x end)",
+            QueryResult::Break(label) => {
+                assert_eq!(label, "out");
+            }
+        );
+        // `optional` (`?`) must never swallow a `break` the way it swallows
+        // a real error — jq's `?` catches errors, not label breaks.
+        // Discriminating test: if the break were (incorrectly) swallowed as
+        // `None` by `optional`, the comma's second operand would still run
+        // and "reached" would be output; since the break must instead
+        // short-circuit the comma and reach the label, "reached" is never
+        // evaluated.
+        assert_eq!(
+            outputs(
+                b"null",
+                r#"label $out | ((reduce (1,2,3) as $x (0; if $x==2 then break $out else .+$x end))?, "reached")"#
+            ),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn regression_issue_575_until_break_reaches_enclosing_label() {
+        // Break in `cond`, verified against jq 1.7.1.
+        assert_eq!(
+            outputs(b"1", "label $out | until(break $out; .+1)"),
+            Vec::<String>::new()
+        );
+        // Break in `update`, verified against jq 1.7.1.
+        assert_eq!(
+            outputs(
+                b"1",
+                "label $out | until(. > 5; if . == 3 then break $out else .+1 end)"
+            ),
+            Vec::<String>::new()
+        );
+        // `until` only ever emits its final value, so without a label the
+        // break surfaces bare rather than as a synthetic error.
+        query!(
+            b"1",
+            "until(break $out; .+1)",
+            QueryResult::Break(label) => {
+                assert_eq!(label, "out");
             }
         );
     }
