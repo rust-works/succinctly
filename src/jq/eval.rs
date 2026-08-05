@@ -4175,17 +4175,29 @@ fn format_html(value: &OwnedValue, _optional: bool) -> Result<String, EvalError>
         _ => return Err(EvalError::type_error("string", value.type_name())),
     };
 
-    let mut result = String::new();
-    for c in s.chars() {
-        match c {
-            '<' => result.push_str("&lt;"),
-            '>' => result.push_str("&gt;"),
-            '&' => result.push_str("&amp;"),
-            '"' => result.push_str("&quot;"),
-            '\'' => result.push_str("&#39;"),
-            _ => result.push(c),
+    // Byte-oriented rather than char-oriented, same reasoning as `format_uri`:
+    // all five entities are single ASCII bytes, so a multi-byte character's
+    // continuation bytes (always >= 0x80) never collide with them, and a run
+    // of bytes between matches can be copied in one `push_str` (#124).
+    let bytes = s.as_bytes();
+    let mut result = String::with_capacity(bytes.len());
+    let mut start = 0;
+    for (i, &b) in bytes.iter().enumerate() {
+        let entity = match b {
+            b'<' => "&lt;",
+            b'>' => "&gt;",
+            b'&' => "&amp;",
+            b'"' => "&quot;",
+            b'\'' => "&#39;",
+            _ => continue,
+        };
+        if start < i {
+            result.push_str(&s[start..i]);
         }
+        result.push_str(entity);
+        start = i + 1;
     }
+    result.push_str(&s[start..]);
     Ok(result)
 }
 
@@ -21284,6 +21296,24 @@ mod tests {
         query!(br#""<script>alert('xss')</script>""#, "@html",
             QueryResult::Owned(OwnedValue::String(s)) => {
                 assert_eq!(s, "&lt;script&gt;alert(&#39;xss&#39;)&lt;/script&gt;");
+            }
+        );
+    }
+
+    #[test]
+    fn test_format_html_multibyte_boundary_124() {
+        // Regression for #124's byte-oriented rewrite: a multi-byte
+        // character directly adjacent to an entity-triggering byte, in
+        // either order, must not attempt an invalid slice.
+        query!(br#""\u00e9<b>""#, "@html",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "é&lt;b&gt;");
+            }
+        );
+
+        query!(br#""<\u00e9>""#, "@html",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "&lt;é&gt;");
             }
         );
     }
