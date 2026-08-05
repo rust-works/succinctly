@@ -3855,15 +3855,25 @@ pub(crate) fn numeric_display_string(value: &OwnedValue) -> String {
 
 /// Convert an owned value to a string representation (for interpolation).
 fn owned_to_string(value: &OwnedValue) -> String {
+    let mut out = String::new();
+    write_owned_to_string(&mut out, value);
+    out
+}
+
+/// Write an owned value's string representation directly into `out`, avoiding
+/// the intermediate allocation `owned_to_string` needs for its return value —
+/// used by the CSV/TSV/DSV/SH cell formatters, which already write straight
+/// into a shared output buffer (#647).
+fn write_owned_to_string(out: &mut String, value: &OwnedValue) {
     match value {
-        OwnedValue::Null => "null".to_string(),
-        OwnedValue::Bool(true) => "true".to_string(),
-        OwnedValue::Bool(false) => "false".to_string(),
+        OwnedValue::Null => out.push_str("null"),
+        OwnedValue::Bool(true) => out.push_str("true"),
+        OwnedValue::Bool(false) => out.push_str("false"),
         OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..) => {
-            numeric_display_string(value)
+            out.push_str(&numeric_display_string(value));
         }
-        OwnedValue::String(s) => s.clone(), // Don't quote strings in interpolation
-        OwnedValue::Array(_) | OwnedValue::Object(_) => value.to_json(),
+        OwnedValue::String(s) => out.push_str(s), // Don't quote strings in interpolation
+        OwnedValue::Array(_) | OwnedValue::Object(_) => out.push_str(&value.to_json()),
     }
 }
 
@@ -3999,23 +4009,84 @@ fn format_urid(value: &OwnedValue, optional: bool) -> Result<String, EvalError> 
     }
 }
 
+/// Join `arr` on `delimiter`, writing each field directly into one
+/// accumulating buffer via `write_field` instead of collecting a `Vec<String>`
+/// and `.join()`-ing it — the second full copy that shape needs (#647).
+fn write_joined_array(
+    arr: &[OwnedValue],
+    delimiter: &str,
+    mut write_field: impl FnMut(&mut String, &OwnedValue),
+) -> String {
+    let mut out = String::new();
+    for (i, v) in arr.iter().enumerate() {
+        if i > 0 {
+            out.push_str(delimiter);
+        }
+        write_field(&mut out, v);
+    }
+    out
+}
+
+/// Write `s` as a double-quoted CSV/DSV field, doubling any inner `"`, in one
+/// pass over the bytes — no `.replace()` allocation is made even when there's
+/// a `"` to escape (#647). Shared by `@csv` and `@dsv`, which use identical
+/// quoting so `@dsv(",")` stays byte-identical to `@csv` — see #306.
+///
+/// Byte-oriented rather than char-oriented, same reasoning as `format_uri`:
+/// `"` is a single ASCII byte, so a multi-byte character's continuation bytes
+/// (always >= 0x80) never collide with it, and a run of bytes between matches
+/// can be copied in one `push_str`.
+fn write_quoted_csv_field(out: &mut String, s: &str) {
+    out.push('"');
+    let bytes = s.as_bytes();
+    let mut start = 0;
+    for (i, &b) in bytes.iter().enumerate() {
+        if b != b'"' {
+            continue;
+        }
+        if start < i {
+            out.push_str(&s[start..i]);
+        }
+        out.push_str("\"\"");
+        start = i + 1;
+    }
+    out.push_str(&s[start..]);
+    out.push('"');
+}
+
+/// Write `s` as a TSV field, escaping `\`, `\t`, `\n`, `\r` in one pass over
+/// the bytes instead of `@tsv`'s previous four chained `.replace()` calls,
+/// each a full pass and a potential allocation (#647).
+fn write_tsv_escaped_field(out: &mut String, s: &str) {
+    let bytes = s.as_bytes();
+    let mut start = 0;
+    for (i, &b) in bytes.iter().enumerate() {
+        let escaped = match b {
+            b'\\' => "\\\\",
+            b'\t' => "\\t",
+            b'\n' => "\\n",
+            b'\r' => "\\r",
+            _ => continue,
+        };
+        if start < i {
+            out.push_str(&s[start..i]);
+        }
+        out.push_str(escaped);
+        start = i + 1;
+    }
+    out.push_str(&s[start..]);
+}
+
 /// @csv - CSV format (for arrays)
 fn format_csv(value: &OwnedValue, optional: bool) -> Result<String, EvalError> {
     match value {
-        OwnedValue::Array(arr) => {
-            let parts: Vec<String> = arr
-                .iter()
-                .map(|v| match v {
-                    // jq unconditionally double-quotes every string field
-                    // (inner `"` doubled), regardless of whether it contains a
-                    // delimiter — see #306.
-                    OwnedValue::String(s) => format!("\"{}\"", s.replace('"', "\"\"")),
-                    OwnedValue::Null => String::new(),
-                    other => owned_to_string(other),
-                })
-                .collect();
-            Ok(parts.join(","))
-        }
+        OwnedValue::Array(arr) => Ok(write_joined_array(arr, ",", |out, v| match v {
+            // jq unconditionally double-quotes every string field (inner `"`
+            // doubled), regardless of whether it contains a delimiter — #306.
+            OwnedValue::String(s) => write_quoted_csv_field(out, s),
+            OwnedValue::Null => {}
+            other => write_owned_to_string(out, other),
+        })),
         _ if optional => Ok(String::new()),
         _ => Err(EvalError::type_error("array", value.type_name())),
     }
@@ -4024,21 +4095,11 @@ fn format_csv(value: &OwnedValue, optional: bool) -> Result<String, EvalError> {
 /// @tsv - TSV format (for arrays)
 fn format_tsv(value: &OwnedValue, optional: bool) -> Result<String, EvalError> {
     match value {
-        OwnedValue::Array(arr) => {
-            let parts: Vec<String> = arr
-                .iter()
-                .map(|v| match v {
-                    OwnedValue::String(s) => s
-                        .replace('\\', "\\\\")
-                        .replace('\t', "\\t")
-                        .replace('\n', "\\n")
-                        .replace('\r', "\\r"),
-                    OwnedValue::Null => String::new(),
-                    other => owned_to_string(other),
-                })
-                .collect();
-            Ok(parts.join("\t"))
-        }
+        OwnedValue::Array(arr) => Ok(write_joined_array(arr, "\t", |out, v| match v {
+            OwnedValue::String(s) => write_tsv_escaped_field(out, s),
+            OwnedValue::Null => {}
+            other => write_owned_to_string(out, other),
+        })),
         _ if optional => Ok(String::new()),
         _ => Err(EvalError::type_error("array", value.type_name())),
     }
@@ -4047,19 +4108,13 @@ fn format_tsv(value: &OwnedValue, optional: bool) -> Result<String, EvalError> {
 /// @dsv(delimiter) - Generic DSV format with custom delimiter (for arrays)
 fn format_dsv(value: &OwnedValue, delimiter: &str, optional: bool) -> Result<String, EvalError> {
     match value {
-        OwnedValue::Array(arr) => {
-            let parts: Vec<String> = arr
-                .iter()
-                .map(|v| match v {
-                    // Match @csv: always double-quote string fields (inner `"`
-                    // doubled) so @dsv(",") stays byte-identical to @csv — #306.
-                    OwnedValue::String(s) => format!("\"{}\"", s.replace('"', "\"\"")),
-                    OwnedValue::Null => String::new(),
-                    other => owned_to_string(other),
-                })
-                .collect();
-            Ok(parts.join(delimiter))
-        }
+        OwnedValue::Array(arr) => Ok(write_joined_array(arr, delimiter, |out, v| match v {
+            // Match @csv: always double-quote string fields (inner `"`
+            // doubled) so @dsv(",") stays byte-identical to @csv — #306.
+            OwnedValue::String(s) => write_quoted_csv_field(out, s),
+            OwnedValue::Null => {}
+            other => write_owned_to_string(out, other),
+        })),
         _ if optional => Ok(String::new()),
         _ => Err(EvalError::type_error("array", value.type_name())),
     }
@@ -4201,31 +4256,46 @@ fn format_html(value: &OwnedValue, _optional: bool) -> Result<String, EvalError>
     Ok(result)
 }
 
-/// Shell-quote a single value for @sh
-fn shell_quote_value(value: &OwnedValue) -> String {
+/// Write `s` as a single-quoted shell field, escaping `'` as `'\''` in one
+/// pass over the bytes instead of a `.contains()` scan plus a conditional
+/// `.replace()` allocation (#647).
+///
+/// Byte-oriented rather than char-oriented, same reasoning as `format_uri`:
+/// `'` is a single ASCII byte, so a multi-byte character's continuation bytes
+/// (always >= 0x80) never collide with it.
+fn write_sh_quoted_field(out: &mut String, s: &str) {
+    out.push('\'');
+    let bytes = s.as_bytes();
+    let mut start = 0;
+    for (i, &b) in bytes.iter().enumerate() {
+        if b != b'\'' {
+            continue;
+        }
+        if start < i {
+            out.push_str(&s[start..i]);
+        }
+        out.push_str("'\\''");
+        start = i + 1;
+    }
+    out.push_str(&s[start..]);
+    out.push('\'');
+}
+
+/// Write a single `@sh` array element directly into `out` (replaces
+/// `shell_quote_value`, which returned an owned `String` per element for
+/// `format_sh`'s `Vec<String>` + `.join()` shape — #647).
+fn write_sh_value(out: &mut String, value: &OwnedValue) {
     match value {
         // jq always quotes strings in @sh array output
-        OwnedValue::String(s) => {
-            if s.contains('\'') {
-                let escaped = s.replace('\'', "'\\''");
-                format!("'{escaped}'")
-            } else {
-                format!("'{s}'")
-            }
-        }
+        OwnedValue::String(s) => write_sh_quoted_field(out, s),
         // Numbers, bools, null are NOT quoted in jq
         OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..) => {
-            numeric_display_string(value)
+            out.push_str(&numeric_display_string(value));
         }
-        OwnedValue::Bool(b) => {
-            if *b {
-                "true".to_string()
-            } else {
-                "false".to_string()
-            }
-        }
-        OwnedValue::Null => "null".to_string(),
-        _ => String::new(),
+        OwnedValue::Bool(true) => out.push_str("true"),
+        OwnedValue::Bool(false) => out.push_str("false"),
+        OwnedValue::Null => out.push_str("null"),
+        _ => {}
     }
 }
 
@@ -4233,19 +4303,12 @@ fn shell_quote_value(value: &OwnedValue) -> String {
 fn format_sh(value: &OwnedValue, _optional: bool) -> Result<String, EvalError> {
     match value {
         OwnedValue::String(s) => {
-            // Use single quotes and escape single quotes
-            if s.contains('\'') {
-                let escaped = s.replace('\'', "'\\''");
-                Ok(format!("'{escaped}'"))
-            } else {
-                Ok(format!("'{s}'"))
-            }
+            let mut out = String::with_capacity(s.len() + 2);
+            write_sh_quoted_field(&mut out, s);
+            Ok(out)
         }
         // jq: [1, 2, 3] | @sh => "1 2 3"
-        OwnedValue::Array(arr) => {
-            let parts: Vec<String> = arr.iter().map(shell_quote_value).collect();
-            Ok(parts.join(" "))
-        }
+        OwnedValue::Array(arr) => Ok(write_joined_array(arr, " ", write_sh_value)),
         // Numbers, bools, null are converted to strings
         OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..) => {
             Ok(numeric_display_string(value))
@@ -21220,10 +21283,46 @@ mod tests {
     }
 
     #[test]
+    fn test_format_csv_multibyte_boundary_647() {
+        // Regression for #647's byte-oriented rewrite of the quote scan: a
+        // multi-byte character directly adjacent to a `"` byte, in either
+        // order, must not attempt an invalid slice.
+        query!(br#"["\u00e9\"b"]"#, "@csv",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "\"é\"\"b\"");
+            }
+        );
+
+        query!(br#"["\"\u00e9"]"#, "@csv",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "\"\"\"é\"");
+            }
+        );
+    }
+
+    #[test]
     fn test_format_tsv() {
         query!(br#"["a", "b", "c"]"#, "@tsv",
             QueryResult::Owned(OwnedValue::String(s)) => {
                 assert_eq!(s, "a\tb\tc");
+            }
+        );
+    }
+
+    #[test]
+    fn test_format_tsv_escapes_all_four_chars_647() {
+        // #647's single-pass rewrite replaced four chained `.replace()` calls;
+        // this pins that all four escapes still fire together, including
+        // adjacent escapes with no safe span between them.
+        query!(br#"["a\\b\tc\nd\re"]"#, "@tsv",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, r"a\\b\tc\nd\re");
+            }
+        );
+
+        query!(br#"["\t\n\r\\"]"#, "@tsv",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, r"\t\n\r\\");
             }
         );
     }
@@ -21330,6 +21429,31 @@ mod tests {
         query!(br#""it's a test""#, "@sh",
             QueryResult::Owned(OwnedValue::String(s)) => {
                 assert_eq!(s, "'it'\\''s a test'");
+            }
+        );
+    }
+
+    #[test]
+    fn test_format_sh_multibyte_boundary_647() {
+        // Regression for #647's byte-oriented rewrite of the quote scan: a
+        // multi-byte character directly adjacent to a `'` byte, in either
+        // order, must not attempt an invalid slice.
+        query!(br#""\u00e9'b""#, "@sh",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "'é'\\''b'");
+            }
+        );
+
+        query!(br#""'\u00e9""#, "@sh",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "''\\''é'");
+            }
+        );
+
+        // Array form exercises write_sh_value's per-element buffer writes.
+        query!(br#"["it's", "caf\u00e9", 1, true, null]"#, "@sh",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "'it'\\''s' 'café' 1 true null");
             }
         );
     }
