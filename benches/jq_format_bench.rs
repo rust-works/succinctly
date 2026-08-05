@@ -263,6 +263,8 @@ fn bench_e2e(c: &mut Criterion) {
     const QUERIES: &[(&str, &str)] = &[
         ("csv_records", r".u[] | [.n,.v] | @csv"),
         ("tsv_records", r".u[] | [.n,.v] | @tsv"),
+        ("dsv_records", r#".u[] | [.n,.v] | @dsv("|")"#),
+        ("sh_field", r".u[] | .n | @sh"),
         ("uri_field", r".u[] | .n | @uri"),
         ("html_field", r".u[] | .n | @html"),
         ("json_field", r".u[] | .n | @json"),
