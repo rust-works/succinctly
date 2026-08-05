@@ -70,6 +70,26 @@ proptest! {
         }
     }
 
+    /// select0(k) returns strictly increasing positions
+    #[test]
+    fn prop_select0_monotonic(
+        words in prop::collection::vec(any::<u64>(), 1..20),
+    ) {
+        let len = words.len() * 64;
+        let bv = BitVec::from_words(words, len);
+        let zeros = bv.count_zeros();
+
+        let mut prev_pos: Option<usize> = None;
+        for k in 0..zeros {
+            let pos = bv.select0(k);
+            if let (Some(prev), Some(curr)) = (prev_pos, pos) {
+                prop_assert!(curr > prev,
+                    "select0({}) = {} <= select0({}) = {}", k, curr, k.saturating_sub(1), prev);
+            }
+            prev_pos = pos;
+        }
+    }
+
     /// rank1(select1(k) + 1) - 1 == k for valid k
     #[test]
     fn prop_rank_of_select(
@@ -106,6 +126,42 @@ proptest! {
             let rank = bv.rank1(i);
             prop_assert_eq!(bv.select1(rank), Some(i),
                 "select1(rank1({})) should equal {}", i, i);
+        }
+    }
+
+    /// rank0(select0(k) + 1) - 1 == k for valid k
+    #[test]
+    fn prop_rank0_of_select0(
+        words in prop::collection::vec(any::<u64>(), 1..50),
+        k_ratio in 0.0..1.0f64
+    ) {
+        let len = words.len() * 64;
+        let bv = BitVec::from_words(words, len);
+        let zeros = bv.count_zeros();
+
+        if zeros > 0 {
+            let k = ((k_ratio * zeros as f64) as usize).min(zeros - 1);
+            if let Some(pos) = bv.select0(k) {
+                prop_assert_eq!(bv.rank0(pos + 1).saturating_sub(1), k,
+                    "rank0(select0({}) + 1) - 1 should equal {}", k, k);
+            }
+        }
+    }
+
+    /// select0(rank0(i)) == i when bit at i is unset
+    #[test]
+    fn prop_select0_of_rank0(
+        words in prop::collection::vec(any::<u64>(), 1..50),
+        i_ratio in 0.0..1.0f64
+    ) {
+        let len = words.len() * 64;
+        let bv = BitVec::from_words(words.clone(), len);
+        let i = (i_ratio * len as f64) as usize;
+
+        if i < len && !bv.get(i) {
+            let rank = bv.rank0(i);
+            prop_assert_eq!(bv.select0(rank), Some(i),
+                "select0(rank0({})) should equal {}", i, i);
         }
     }
 
@@ -164,6 +220,23 @@ proptest! {
             }
         }
     }
+
+    /// select0 returns positions with bits unset
+    #[test]
+    fn prop_select0_coverage(
+        words in prop::collection::vec(any::<u64>(), 1..20),
+    ) {
+        let len = words.len() * 64;
+        let bv = BitVec::from_words(words, len);
+        let zeros = bv.count_zeros();
+
+        // Every select0 position should have bit unset
+        for k in 0..zeros {
+            if let Some(pos) = bv.select0(k) {
+                prop_assert!(!bv.get(pos), "select0({}) = {} but bit is set", k, pos);
+            }
+        }
+    }
 }
 
 /// Reference implementation for comparison
@@ -185,6 +258,22 @@ fn reference_select1(words: &[u64], len: usize, k: usize) -> Option<usize> {
         let word_idx = bit_pos / 64;
         let bit_idx = bit_pos % 64;
         if word_idx < words.len() && (words[word_idx] >> bit_idx) & 1 == 1 {
+            if count == k {
+                return Some(bit_pos);
+            }
+            count += 1;
+        }
+    }
+    None
+}
+
+fn reference_select0(words: &[u64], len: usize, k: usize) -> Option<usize> {
+    let mut count = 0;
+    for bit_pos in 0..len {
+        let word_idx = bit_pos / 64;
+        let bit_idx = bit_pos % 64;
+        let is_zero = word_idx >= words.len() || (words[word_idx] >> bit_idx) & 1 == 0;
+        if is_zero {
             if count == k {
                 return Some(bit_pos);
             }
@@ -225,6 +314,23 @@ proptest! {
             let expected = reference_select1(&words, len, k);
             let actual = bv.select1(k);
             prop_assert_eq!(actual, expected, "select1({}) mismatch", k);
+        }
+    }
+
+    /// select0 matches reference implementation
+    #[test]
+    fn prop_select0_matches_reference(
+        words in prop::collection::vec(any::<u64>(), 1..30),
+    ) {
+        let len = words.len() * 64;
+        let bv = BitVec::from_words(words.clone(), len);
+        let zeros = bv.count_zeros();
+
+        // Test at various k values
+        for k in (0..zeros).step_by(7) {
+            let expected = reference_select0(&words, len, k);
+            let actual = bv.select0(k);
+            prop_assert_eq!(actual, expected, "select0({}) mismatch", k);
         }
     }
 }

@@ -433,6 +433,43 @@ mod edge_cases {
 // Combined-sampling select support (#64 Step B)
 // ============================================================================
 
+/// Arbitrary bit patterns, not just balanced ones: select1/select0 are
+/// bitvector operations and must not depend on the parentheses being
+/// well-formed.
+///
+/// `len` is constrained so that `words.len() == len.div_ceil(64)`. That is
+/// the contract every caller of `build_bp_index` satisfies, and the one its
+/// masking assumes: only the *final* word is masked when counting, so a
+/// `words` slice longer than `len` implies would count ones above `len`
+/// into `total_ones` and make them unselectable. Within the contract the
+/// range still covers every non-word-aligned length, which is what
+/// exercises the partial final word and the stray bits above it.
+fn words_and_len(max_words: usize) -> impl Strategy<Value = (Vec<u64>, usize)> {
+    prop::collection::vec(any::<u64>(), 1..=max_words).prop_flat_map(|words| {
+        let lo = (words.len() - 1) * 64 + 1;
+        let hi = words.len() * 64;
+        (Just(words), lo..=hi)
+    })
+}
+
+/// Sparse patterns leave whole rank blocks empty, which is the case the
+/// "last block with rank <= k" search rule exists for.
+fn sparse_words_and_len(max_words: usize) -> impl Strategy<Value = (Vec<u64>, usize)> {
+    (
+        prop::collection::vec((0u32..64, 0u32..40), 1..=max_words),
+        1usize..=max_words,
+    )
+        .prop_map(|(spec, gap)| {
+            let mut words = Vec::with_capacity(spec.len() * gap);
+            for (bit, set) in spec {
+                words.push(if set == 0 { 1u64 << bit } else { 0 });
+                words.extend(core::iter::repeat(0u64).take(gap.min(8)));
+            }
+            let len = words.len() * 64;
+            (words, len)
+        })
+}
+
 /// `WithCsPoppy` replaces `WithSelect`'s parallel sample array with entry points
 /// into the rank directory. These properties pin the two together: whatever the
 /// shape of the input, the answers must be identical, and must invert rank1.
@@ -440,42 +477,6 @@ mod cspoppy_properties {
     use super::*;
     #[allow(deprecated)] // the point of these tests is agreement with the deprecated impl
     use succinctly::trees::{WithCsPoppy, WithSelect};
-
-    /// Arbitrary bit patterns, not just balanced ones: select1 is a bitvector
-    /// operation and must not depend on the parentheses being well-formed.
-    ///
-    /// `len` is constrained so that `words.len() == len.div_ceil(64)`. That is
-    /// the contract every caller of `build_bp_index` satisfies, and the one its
-    /// masking assumes: only the *final* word is masked when counting, so a
-    /// `words` slice longer than `len` implies would count ones above `len`
-    /// into `total_ones` and make them unselectable. Within the contract the
-    /// range still covers every non-word-aligned length, which is what
-    /// exercises the partial final word and the stray bits above it.
-    fn words_and_len(max_words: usize) -> impl Strategy<Value = (Vec<u64>, usize)> {
-        prop::collection::vec(any::<u64>(), 1..=max_words).prop_flat_map(|words| {
-            let lo = (words.len() - 1) * 64 + 1;
-            let hi = words.len() * 64;
-            (Just(words), lo..=hi)
-        })
-    }
-
-    /// Sparse patterns leave whole rank blocks empty, which is the case the
-    /// "last block with rank <= k" search rule exists for.
-    fn sparse_words_and_len(max_words: usize) -> impl Strategy<Value = (Vec<u64>, usize)> {
-        (
-            prop::collection::vec((0u32..64, 0u32..40), 1..=max_words),
-            1usize..=max_words,
-        )
-            .prop_map(|(spec, gap)| {
-                let mut words = Vec::with_capacity(spec.len() * gap);
-                for (bit, set) in spec {
-                    words.push(if set == 0 { 1u64 << bit } else { 0 });
-                    words.extend(core::iter::repeat(0u64).take(gap.min(8)));
-                }
-                let len = words.len() * 64;
-                (words, len)
-            })
-    }
 
     proptest! {
         /// The gate: combined sampling changes no answer, for any k.
@@ -531,6 +532,90 @@ mod cspoppy_properties {
                 let pos = bp.select1(k).expect("k < total_ones");
                 if let Some(prev) = previous {
                     prop_assert!(pos > prev, "select1({}) = {} did not advance past {}", k, pos, prev);
+                }
+                previous = Some(pos);
+            }
+        }
+    }
+}
+
+// ============================================================================
+// select0 (issue #602 / cspoppy.md F7)
+// ============================================================================
+
+/// `select0` finds the k-th close paren. Unlike `select1` it never touches
+/// `SelectSupport` (it's a binary search over the already-O(1) `rank1`), so
+/// these properties run once against the default (`NoSelect`) construction
+/// rather than once per select-support impl.
+mod select0_properties {
+    use super::*;
+
+    /// Naive reference: linear scan over `is_close`.
+    fn naive_select0(bp: &BalancedParens<Vec<u64>>, k: usize) -> Option<usize> {
+        let mut count = 0;
+        for p in 0..bp.len() {
+            if bp.is_close(p) {
+                if count == k {
+                    return Some(p);
+                }
+                count += 1;
+            }
+        }
+        None
+    }
+
+    proptest! {
+        /// select0 matches a naive linear scan over `is_close`.
+        ///
+        /// `k` is capped at 50: `naive_select0` is O(len) per call, and
+        /// `words_and_len(80)` allows `len` up to 5120, so the uncapped
+        /// `0..=total_zeros()` loop made this test take minutes.
+        #[test]
+        fn select0_matches_naive_scan((words, len) in words_and_len(80)) {
+            let bp = BalancedParens::<_>::from_words(words, len);
+
+            for k in 0..=bp.total_zeros().min(50) {
+                prop_assert_eq!(bp.select0(k), naive_select0(&bp, k), "select0({})", k);
+            }
+        }
+
+        /// Same, over inputs with long runs of empty rank blocks.
+        #[test]
+        fn select0_matches_naive_scan_when_sparse((words, len) in sparse_words_and_len(60)) {
+            let bp = BalancedParens::<_>::from_words(words, len);
+
+            for k in 0..=bp.total_zeros().min(50) {
+                prop_assert_eq!(bp.select0(k), naive_select0(&bp, k), "select0({})", k);
+            }
+        }
+
+        /// select0 inverts rank0, and never points outside the valid range.
+        #[test]
+        fn select0_inverts_rank0((words, len) in words_and_len(80)) {
+            let bp = BalancedParens::<_>::from_words(words, len);
+
+            for k in 0..bp.total_zeros() {
+                let pos = bp.select0(k);
+                prop_assert!(pos.is_some(), "select0({}) returned None below total_zeros", k);
+                let pos = pos.expect("checked above");
+                prop_assert!(pos < len, "select0({}) = {} is outside len {}", k, pos, len);
+                prop_assert!(bp.is_close(pos), "select0({}) = {} is not a 0-bit", k, pos);
+                prop_assert_eq!(bp.rank0(pos), k, "rank0(select0({}))", k);
+            }
+            // Beyond the last close there is nothing to find.
+            prop_assert_eq!(bp.select0(bp.total_zeros()), None);
+        }
+
+        /// select0 is strictly increasing in k.
+        #[test]
+        fn select0_is_monotonic((words, len) in words_and_len(80)) {
+            let bp = BalancedParens::<_>::from_words(words, len);
+
+            let mut previous: Option<usize> = None;
+            for k in 0..bp.total_zeros() {
+                let pos = bp.select0(k).expect("k < total_zeros");
+                if let Some(prev) = previous {
+                    prop_assert!(pos > prev, "select0({}) = {} did not advance past {}", k, pos, prev);
                 }
                 previous = Some(pos);
             }

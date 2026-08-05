@@ -2332,6 +2332,12 @@ impl<W: AsRef<[u64]>, S: SelectSupport> BalancedParens<W, S> {
         self.total_ones
     }
 
+    /// Get the total number of 0-bits (close parentheses).
+    #[inline]
+    pub fn total_zeros(&self) -> usize {
+        self.len - self.total_ones
+    }
+
     /// Find the position of the k-th 1-bit (0-indexed).
     ///
     /// Returns `None` if k >= total_ones.
@@ -2349,6 +2355,32 @@ impl<W: AsRef<[u64]>, S: SelectSupport> BalancedParens<W, S> {
             },
             k,
         )
+    }
+
+    /// Find the position of the k-th 0-bit / close parenthesis (0-indexed).
+    ///
+    /// Returns `None` if `k >= total_zeros()`.
+    ///
+    /// O(log n) binary search over `rank1` (already O(1)) — unlike `select1`
+    /// there is no dedicated close-paren sample index (issue #602: no known
+    /// consumer justifies one yet, same call as `EliasFano::predecessor` in
+    /// ADR-0012). Works identically for every [`SelectSupport`] impl since
+    /// it never touches `self.select`.
+    pub fn select0(&self, k: usize) -> Option<usize> {
+        if k >= self.total_zeros() {
+            return None;
+        }
+        let mut lo = 0usize;
+        let mut hi = self.len;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if self.rank0(mid + 1) > k {
+                hi = mid;
+            } else {
+                lo = mid + 1;
+            }
+        }
+        Some(lo)
     }
 
     /// Returns the heap bytes retained by the select index.
@@ -2436,6 +2468,12 @@ impl<W: AsRef<[u64]>, S: SelectSupport> BalancedParens<W, S> {
         };
 
         l1_rank + l2_rank + partial
+    }
+
+    /// O(1) rank0: Count 0-bits (closes) in positions [0, p).
+    #[inline]
+    pub fn rank0(&self, p: usize) -> usize {
+        p.min(self.len) - self.rank1(p)
     }
 
     /// Fallback slow rank1 for edge cases.
