@@ -3937,16 +3937,34 @@ fn format_uri(value: &OwnedValue, _optional: bool) -> Result<String, EvalError> 
         _ => return Err(EvalError::type_error("string", value.type_name())),
     };
 
-    let mut result = String::new();
-    for c in s.chars() {
-        if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' || c == '~' {
-            result.push(c);
-        } else {
-            for b in c.to_string().as_bytes() {
-                result.push_str(&format!("%{b:02X}"));
-            }
+    // Byte-oriented rather than char-oriented: percent-encoding acts on raw
+    // bytes anyway, and every safe byte is ASCII, so a multi-byte character's
+    // continuation bytes (always >= 0x80) never get mistaken for a safe byte.
+    // That lets a run of safe bytes be copied in one `push_str` instead of
+    // one `push` per char (#124) -- `start..i` is always a valid UTF-8
+    // boundary pair: either `start == i`, or the span in between is pure
+    // ASCII, which is a boundary by construction.
+    const HEX_DIGITS: &[u8; 16] = b"0123456789ABCDEF";
+    let bytes = s.as_bytes();
+    let mut result = String::with_capacity(bytes.len());
+    let mut start = 0;
+    for (i, &b) in bytes.iter().enumerate() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            continue;
         }
+        // `start == i` here is common (consecutive non-safe bytes, e.g. the
+        // continuation bytes of one multi-byte char) and must be skipped
+        // rather than sliced: `&s[i..i]` still panics if `i` isn't a char
+        // boundary, even though the slice would be empty.
+        if start < i {
+            result.push_str(&s[start..i]);
+        }
+        result.push('%');
+        result.push(HEX_DIGITS[(b >> 4) as usize] as char);
+        result.push(HEX_DIGITS[(b & 0x0F) as usize] as char);
+        start = i + 1;
     }
+    result.push_str(&s[start..]);
     Ok(result)
 }
 
@@ -21129,6 +21147,38 @@ mod tests {
         query!(br#""hello world""#, "@uri",
             QueryResult::Owned(OwnedValue::String(s)) => {
                 assert_eq!(s, "hello%20world");
+            }
+        );
+    }
+
+    #[test]
+    fn test_format_uri_multibyte_boundary_124() {
+        // Regression for #124's byte-oriented rewrite: every byte of a
+        // multi-byte character is individually "not safe" for @uri, so two
+        // such bytes in a row (or a multi-byte char directly followed by
+        // another non-safe byte) used to slice `&s[i..i]` at a non-boundary
+        // position and panic, even though the slice was empty.
+        // JSON `\u` escapes keep the byte string literal itself ASCII-only,
+        // as Rust requires. `é` = 'é' (2 UTF-8 bytes).
+        query!(br#""\u00e9/x""#, "@uri",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "%C3%A9%2Fx");
+            }
+        );
+
+        // Two consecutive multi-byte characters, no ASCII in between.
+        // `€` is the euro sign (3 UTF-8 bytes).
+        query!(br#""\u00e9\u20ac""#, "@uri",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "%C3%A9%E2%82%AC");
+            }
+        );
+
+        // A 4-byte character (U+1F389, as a UTF-16 surrogate pair) directly
+        // followed by an ASCII special.
+        query!(br#""\ud83c\udf89?""#, "@uri",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "%F0%9F%8E%89%3F");
             }
         );
     }
