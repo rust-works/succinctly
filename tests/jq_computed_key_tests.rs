@@ -1091,16 +1091,14 @@ fn test_recurse_variants_fan_out_like_their_value_paths() {
         Outcome::values(&[r#"[["x","v"],["y","w"]]"#]),
     );
 
-    // A cond that *errors* on some node prunes it, rather than propagating —
-    // `.k` on the string `"v"` cannot be indexed. jq instead raises `Cannot
-    // index string with string "k"`. This mirrors `builtin_recurse_cond`'s own
-    // `Err(_) => false`, i.e. the divergence is in the value path and predates
-    // #412; what is pinned here is that the path side agrees with it, because
-    // a resolver that propagated would make `path(f)` disagree with `f`.
+    // A cond that *errors* on some node now aborts the whole evaluation
+    // rather than pruning just that node — `.k` on the string `"v"` cannot
+    // be indexed, and jq raises `Cannot index string with string "k"` and
+    // stops (#636). Both evaluators now agree with jq.
     check(
         r#"{"k":"v","v":1,"deep":{"k":"w","w":2}}"#,
         r#"[path(recurse(.[]?; .k != "w") | objects | .[.k]?)]"#,
-        Outcome::values(&[r#"[["v"]]"#]),
+        Outcome::error(r#"Cannot index string with string "k""#),
     );
 }
 

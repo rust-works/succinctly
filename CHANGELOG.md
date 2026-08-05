@@ -156,6 +156,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`recurse(f)`/`recurse(f; cond)` swallowed an error raised while
+  evaluating `f`/`cond`, treating it as a prune instead of jq's fatal
+  error** (#636): `builtin_recurse_f`, `builtin_recurse_cond`, and their
+  path-tracking sibling `resolve_recurse` each discarded an `Err` from
+  evaluating `f`/`cond` (`if let Ok(...) = ...`, `let Ok(...) = ... else {
+  continue }`, `.unwrap_or_default()`), identically to an empty or falsy
+  result, so `1 | [limit(20; recurse(.+1; if . > 3 then error("boom") else
+  . < 10 end))]` returned `[1,2,3]` instead of erroring. jq's own
+  definition, `def r: ., (f | select(cond) | r); r;`, has nothing that
+  catches an error from `f` or `cond` — it aborts the whole pipeline.
+  Predates #627, which moved the `cond` check to per-child granularity but
+  explicitly kept the swallow (documented as deliberate at the time). All
+  three functions now propagate: the value evaluators return
+  `partial(outputs, Control::Error(e))` (the same helper #495 added for
+  `repeat`/`while`), and `resolve_recurse` returns `Err((outputs, e))`,
+  mirroring `resolve_node`'s own `Comma` arm — in both cases keeping
+  whatever was already committed as output before the error, same as jq's
+  own streamed-then-erroring behavior. Three new golden fixtures pin an
+  erroring `cond`, an erroring `f`, and the path-tracking side; one existing
+  test that had pinned the old swallow as an accepted divergence (comment:
+  "a resolver that propagated would make `path(f)` disagree with `f`") is
+  updated to expect the propagated error, matching jq. **Related, not fixed
+  here**: #635 (breadth-first vs jq's depth-first traversal order in these
+  same functions) remains open and untouched.
+
 - **`recurse(f; cond)` checked `cond` against the wrong node, and collapsed a
   multi-output `cond` into an always-truthy array** (#627):
   `builtin_recurse_cond` and its path-tracking sibling `resolve_recurse`
