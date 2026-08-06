@@ -326,6 +326,70 @@ behind it so it can be revisited if `find_bp_at_text_pos` ever moves onto a
 hotter path, or if the `block_scalars` anomaly resurfaces with `perf` evidence
 attributing it to this change after all.
 
+### 5b. Issue #595 follow-up (2026-08-06): confirmed layout artifact, not logic
+
+Settled the "layout, not logic" question the Verdict above deferred, using
+`valgrind --tool=cachegrind` (built from source into `~/local` on `terminus`,
+no root needed — WSL2 has neither `perf` hardware counters nor an installed
+`valgrind`) in place of the `perf stat -e instructions,cycles` comparison
+originally proposed: cachegrind's binary instrumentation needs no hardware
+counter access and directly simulates L1/LL instruction-cache misses, which
+is exactly the mechanism the layout theory needs to demonstrate.
+
+New tooling: `examples/block_scalars_harness.rs` (fixed-iteration
+`YamlIndex::build` loop per `block_scalars` shape — criterion's adaptive,
+timing-based sampling breaks under cachegrind's ~20-50x slowdown) and
+`scripts/perf-ab.py` (interleaved A/B over `cachegrind`/`perf`/wall-clock,
+same interleave/identity-gate/control-copy rules as `scripts/ab-cli.py`).
+Commits compared: `becd1b8d` (pre-CS-Poppy, PR #603's base) vs `09158571`
+(PR #603's merge) — the same range the Criterion 4 measurement above used.
+The checksum identity gate passed on all 7 shapes on every host (byte-for-byte
+identical `YamlIndex` structure before/after, confirming the BP-structure
+inspection above).
+
+**Zen 4 (`terminus`), `--tool cachegrind`, 5 interleaved reps × 50 iterations:**
+
+| shape             | Ir Δ  | I1mr Δ | ILmr Δ |
+|-------------------|-------|--------|--------|
+| 10x10lines        | -0.0% | +27.3% | -0.4%  |
+| 50x50lines        | -0.0% | +22.5% | -0.5%  |
+| 100x100lines      | -0.0% | +17.4% | -0.5%  |
+| 10x1000lines      | -0.0% | +23.4% | -0.5%  |
+| long_10x100lines  | -0.0% | +27.7% | -0.4%  |
+| long_50x100lines  | -0.0% | +14.2% | -0.4%  |
+| long_100x100lines | -0.0% | +11.8% | -0.4%  |
+
+Instructions retired (`Ir`) are flat to four significant figures on every
+shape — confirms CS-Poppy's `build()` does essentially zero extra work on this
+workload's fixed 7-word/404-bit BP, exactly as the manual inspection above
+predicted. **L1 instruction-cache misses (`I1mr`) rise 11.8-27.7%** — closely
+tracking the original 12-28% wall-clock regression range — while LL misses
+stay flat to slightly improved (the effect is L1-local, consistent with a
+hot-loop alignment/layout shift rather than a genuinely larger working set).
+This is the deciding signature issue #595 asked for: same work, different
+cache behaviour, not real extra work.
+
+A same-harness, same-binaries wall-clock reproduction on `terminus`
+immediately after (200 iterations × 9 reps) showed a smaller +2% median
+regression (range -0.8%..+6.2%) rather than the original 12-28% — plausibly
+because this harness's tight single-process loop reaches a hotter, more
+consistent icache steady-state than criterion's start/stop sampling harness.
+Reported for transparency; it doesn't affect the Ir/I1mr conclusion, which
+holds within a single cachegrind-instrumented run of the same loop.
+
+**M4 Pro (`johns-mac-mini`), `--tool wallclock`, 9 interleaved reps × 200
+iterations, reproduced twice:** `10x10lines`/`50x50lines`/`100x100lines`/
+`10x1000lines` neutral (-1.0%..+0.4%), matching the original finding above.
+Unexpectedly, the three `long_*` shapes (long lines, P2.7's SIMD stress
+variant) improved a reproducible **7.4-9.3%** — the opposite of a regression,
+and not something this branch's logic obviously explains. Flagged as a new,
+separate observation rather than chased further here — out of scope for #595,
+which only asked about the x86 regression.
+
+**Conclusion: #595 closed as "expected, no action" — confirmed binary
+code-layout artifact, not a CS-Poppy logic regression.** The ARM `long_*`
+improvement is worth its own follow-up issue if someone wants to chase it.
+
 ---
 
 ## 6. Future developments
