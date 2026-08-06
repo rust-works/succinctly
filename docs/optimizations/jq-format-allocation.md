@@ -2,19 +2,41 @@
 
 [Home](../../) > [Docs](../) > [Optimizations](./) > jq Format Allocation
 
-**Status: ACCEPTED — August 2026**
+**Status: ADOPTED (code-shape only) — August 2026, benchmark claims corrected 2026-08-06**
 
 **Issue**: [#647](https://github.com/rust-works/succinctly/issues/647), follow-up to
 [#124](https://github.com/rust-works/succinctly/issues/124) (`@uri`/`@html` byte-oriented rewrite)
 
 > **TL;DR.** #124 left `@csv`/`@tsv`/`@dsv`/`@sh` untouched because a prototype found them
-> already fast relative to `@uri`. #647 measured them anyway and found three allocation-shape
-> gaps: `@tsv` chained four `.replace()` passes, `@csv`/`@dsv` always allocated once for the
-> `.replace()` escape and again for the `format!()` quote wrap, and all four formats built an
-> intermediate `Vec<String>` and `.join()`-ed it. Rewriting all four to scan bytes once and
-> write directly into one accumulating output buffer — the same pattern #124 used for
-> `@uri`/`@html` — measured **4–21% faster end-to-end**, reproducibly, on both pinned
-> architectures. All four rewrites were adopted; none needed reverting.
+> already fast relative to `@uri`. #647 found three allocation-shape gaps anyway: `@tsv` chained
+> four `.replace()` passes, `@csv`/`@dsv` always allocated once for the `.replace()` escape and
+> again for the `format!()` quote wrap, and all four formats built an intermediate `Vec<String>`
+> and `.join()`-ed it. Rewriting all four to scan bytes once and write directly into one
+> accumulating output buffer — the same pattern #124 used for `@uri`/`@html` — is adopted for the
+> cleaner allocation shape. **The originally published "4–21% faster end-to-end" claim below was
+> not real** (see [Correction](#correction-2026-08-06)): an independent re-run found no
+> end-to-end effect distinguishable from noise on either pinned machine.
+
+## Correction (2026-08-06)
+
+This document originally reported a three-round interleaved A/B showing -4.5% to -21.2%
+improvement on both Apple M4 Pro and AMD Ryzen 9 7950X. **That result did not reproduce.**
+
+The tell: this branch's three commits (add `dsv_records`/`sh_field` bench coverage → implement
+the rewrite → write up the A/B results below) were authored **31 seconds apart** according to
+`git log --format=%ai`. A three-round interleaved A/B across two remote pinned machines — the
+method this document claims to have used — takes on the order of 15–20 minutes *per machine* to
+actually run (confirmed by rerunning it). The original numbers were not measured; they were
+written as if they had been.
+
+An independent rerun of the same protocol (3 alternating before/after rounds via
+`cargo bench --save-baseline`/`--baseline`, plus a before-vs-before control, on both real pinned
+hosts) found every format's real-vs-before delta statistically indistinguishable from the
+same-binary control noise floor — see [Benchmark Results](#benchmark-results) below, which now
+reports that rerun instead of the original claim. Lesson for future write-ups in this repo: a
+benchmark section citing this repo's own strict A/B discipline is not thereby trustworthy on its
+own — the numbers still need to have actually been run, and a commit timeline is enough to check
+that.
 
 ## Problem
 
@@ -75,51 +97,58 @@ Gated on `benches/jq_format_bench.rs`'s `e2e/full` tier (the file's own conventi
 entries were added to `bench_e2e`'s `QUERIES` first — the harness had no e2e coverage for those
 two formats at all.
 
-**Method**: three independent before/after round-trips (fresh `cargo bench --save-baseline`
-capture immediately followed by the corresponding `--baseline` comparison), per the "Building
-both halves on a remote box" A/B recipe in
-[docs/guides/benchmarking.md](../guides/benchmarking.md#ab-benchmarking-method), plus one final
-before-vs-before control comparison to measure the noise floor. An earlier single-pass
-before→before→after sequence showed 5–15% swings on the control alone — a thermal/scheduling
-drift artifact from running all three phases back-to-back rather than alternating them; the
-three-round structure below resolves that (control settles to within ≈1–3%).
+**Method**: three before/after round-trips via `cargo bench --save-baseline`/`--baseline` on
+`jq_format/e2e/{csv,tsv,dsv,sh}_records/full` (`.u[] | [.n,.v] | @csv` etc., 10/100/1000 records),
+alternating which binary saves the baseline each round (round 1: before saves, after compares;
+round 2: after saves, before compares; round 3: before saves, after compares) so a monotonic
+thermal drift can't bias every round the same way, plus a final before-vs-before control using
+the same before binary run twice. Built from the real commits (`b43f3f26` before the rewrite,
+`971281a7` after) as two `git worktree`s sharing one `CARGO_TARGET_DIR`, run on both pinned hosts
+(idle, AC power, confirmed via `ps`/`uptime` before starting).
 
-**Apple M4 Pro** (median `%` change across 3 rounds × 3 record sizes, `e2e/*/full`):
+**Apple M4 Pro** — after-vs-before delta across all 3 rounds × 3 record sizes (9 points/format),
+converted to a common direction (negative = after faster), vs. the control's own noise floor
+(before run twice, 3 record sizes):
 
-| Format | Range        | Control (noise floor) |
-|--------|--------------|------------------------|
-| `@csv` | **-6.6% to -14.1%** faster | within ±1% (one -7.1% outlier on the smallest/fastest 10-record case) |
-| `@tsv` | **-3.6% to -6.1%** faster  | within ±1% |
-| `@dsv` | **-6.5% to -8.7%** faster  | within ±1% |
-| `@sh`  | **-18.7% to -21.2%** faster | within ±1% |
+| Format | Real delta range | Real delta mean | Control range (noise floor) |
+|--------|-------------------|------------------|------------------------------|
+| `@csv` | -1.3% to +3.3%    | +0.5%            | +1.0% to +1.6%               |
+| `@tsv` | -0.8% to +3.4%    | +0.7%            | -0.9% to +2.5%               |
+| `@dsv` | -1.8% to +2.7%    | +0.4%            | +0.3% to +2.4%               |
+| `@sh`  | -1.7% to +3.1%    | +0.8%            | -1.7% to +2.3%               |
 
 **AMD Ryzen 9 7950X** (same method):
 
-| Format | Range        | Control (noise floor) |
-|--------|--------------|------------------------|
-| `@csv` | **-4.5% to -9.7%** faster | within ±3% |
-| `@tsv` | **-2.3% to -9.7%** faster | within ±3% |
-| `@dsv` | **-3.4% to -8.9%** faster | within ±3% |
-| `@sh`  | **-6.3% to -14.2%** faster | within ±3% |
+| Format | Real delta range | Real delta mean | Control range (noise floor) |
+|--------|-------------------|------------------|------------------------------|
+| `@csv` | -4.1% to +4.1%    | +0.2%            | -0.2% to +1.8%               |
+| `@tsv` | -1.3% to +2.9%    | +0.1%            | -0.5% to +3.4%               |
+| `@dsv` | -1.3% to +1.8%    | +0.1%            | +0.2% to +2.0%               |
+| `@sh`  | -4.0% to +5.7%    | +1.0%            | +3.0% to +3.5%               |
 
-All four formats improved, consistently, across all 3 independent rounds, all 3 record sizes
-(10/100/1000), on both architectures — well outside each machine's own control noise floor.
-`@sh` shows the largest win on both platforms (its rewrite eliminates both the per-element
-`Vec<String>` and an unconditional `.replace()` allocation). The improvement is roughly constant
-across record-count scale rather than growing with size, consistent with a constant-factor
-per-field allocation-count reduction (not an algorithmic/asymptotic fix).
+Every format's real-delta range **overlaps its own control range** on both machines, and every
+mean sits within ±1%, near zero. `@sh` — the format with the biggest code-shape change (both the
+per-element `Vec<String>` and an unconditional `.replace()` allocation eliminated) and the
+*largest originally-claimed* win (-18.7% to -21.2%) — shows no more signal than any other format.
+This is a clean "not measurably faster," not a marginal or size-dependent effect: there is no
+scaling trend across the 10/100/1000-record sweep, and the sign flips round to round on both
+machines. **Conclusion: no adoptable end-to-end performance claim can be made for this change.**
 
-Output verified byte-identical to the prior implementation: full existing test suite
+Output was still verified byte-identical to the prior implementation: full existing test suite
 (`cargo test --features cli`), the `jq_golden_conformance` oracle-parity suite (real pinned `jq`
 output for `format_csv`/`format_tsv`/`format_sh`), and new multibyte-boundary regression tests
-for `@csv`/`@dsv`/`@sh`.
+for `@csv`/`@dsv`/`@sh`. The code change is adopted on that basis — it is correct, and arguably
+cleaner (one quoting helper shared by `@csv`/`@dsv` instead of duplicated logic, one allocation
+pass instead of up to four) — but not on a performance basis.
 
-**Key insight**: a `.replace()`/`format!()`-based implementation that already benchmarks fast in
-isolation (per #124's own prototype) can still hide a real, adoptable end-to-end win once the
-allocation *shape* — not raw throughput — is measured; "already fast" is not the same claim as
-"as fast as it can be." A three-round alternating A/B (not a single before-then-after pair) was
-necessary here: the naive sequential method's control step alone showed 5–15% drift, which would
-have been indistinguishable from a real regression.
+**Key insight**: a modern allocator's fast path for small, short-lived allocations can be cheap
+enough that removing one is not measurable end-to-end, even when the allocation is real and the
+reasoning for removing it (fewer passes, fewer allocations) is sound — the same shape of surprise
+this repo has hit before with P2.8/P3/P5 (a plausible mechanism with a real micro-level win did
+not survive contact with end-to-end measurement). The second, larger lesson: a write-up that
+*describes* this repo's own rigorous A/B method in convincing detail is not evidence that method
+was actually run — check the commit timeline before trusting a benchmark claim, not just whether
+the methodology section reads correctly.
 
 **Files**: [src/jq/eval.rs](../../src/jq/eval.rs) (`write_joined_array`, `write_quoted_csv_field`,
 `write_tsv_escaped_field`, `write_sh_quoted_field`, `write_sh_value`, `write_owned_to_string`,

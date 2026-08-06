@@ -30,11 +30,10 @@ This document records all optimization attempts in the succinctly library, showi
 | P12-A Build Mitigation    | **11-85%** (yaml_bench build)               | All      | Deployed |
 | O1 Sequential Cursor      | **3-13%** (yq identity queries, 1-100KB)    | All      | Deployed |
 | O2 Gap-Skip rank1         | **2-6%** (yq identity queries, nested/users) | All      | Deployed |
-| jq Format Allocation (@csv/@tsv/@dsv/@sh) | **4-21%** (e2e, both platforms) | All | Deployed |
 
 > **Popcount build-flag caveat (#45):** The **AVX512-VPOPCNTDQ 5.2×** and **NEON 256-byte 1.10–1.15×** micro figures above are measured against a *baseline* build, where `count_ones()` stays scalar broadword. Under `-C target-cpu=native`, `count_ones()` auto-vectorizes and the x86 explicit path reaches **≈1× parity**; on Apple M4 Pro the NEON path re-measures at **1.56×**. Full measured data: [Popcount Strategies](simd.md#popcount-strategies-explicit-simd-vs-auto-vectorized-count_ones).
 
-**Total Successful**: 19 optimizations
+**Total Successful**: 18 optimizations
 **Best Result**: Cumulative index (627x)
 
 ### Failed Optimizations
@@ -50,8 +49,9 @@ This document records all optimization attempts in the succinctly library, showi
 | NEON Movemask Batching | **0%** (no effect)       | ARM      | Rejected     |
 | NEON Prefetching       | **0%** (no effect)       | ARM      | Rejected     |
 | BP L0 Index Unrolling  | **-19%** (e2e)           | All      | Rejected     |
+| jq Format Allocation (@csv/@tsv/@dsv/@sh) | **0%** (no effect, e2e, both platforms) | All | Adopted anyway (code-shape only, see below) |
 
-**Total Failed**: 9 attempts
+**Total Failed**: 10 attempts
 **Worst Failure**: BMI2 PDEP (-71%, 3.4x slower)
 
 ---
@@ -664,26 +664,17 @@ The IB cursor state (`ib_word_idx`, `ib_ones_before`) remains valid after the ra
 
 ---
 
-### ✅ jq `@csv`/`@tsv`/`@dsv`/`@sh` Allocation Rewrite (August 2026)
+### ⚠️ jq `@csv`/`@tsv`/`@dsv`/`@sh` Allocation Rewrite (August 2026) — no measurable effect, adopted for code shape only
 
-**Status**: Implemented and measured — [issue #647](https://github.com/rust-works/succinctly/issues/647), follow-up to [#124](https://github.com/rust-works/succinctly/issues/124)
+**Status**: Implemented; original benchmark claim retracted 2026-08-06 as unreproducible — [issue #647](https://github.com/rust-works/succinctly/issues/647), follow-up to [#124](https://github.com/rust-works/succinctly/issues/124)
 
 **Problem**: #124's byte-oriented rewrite covered `@uri`/`@html` only; `@csv`/`@tsv`/`@dsv`/`@sh` were left as `.replace()`/`format!()`-based code that benchmarked fast in isolation. #647 found three allocation-shape gaps anyway: `@tsv` chained four sequential `.replace()` passes; `@csv`/`@dsv` always allocated once for `.replace()` and again for `format!()`'s quote wrap, even with nothing to escape; all four built an intermediate `Vec<String>` and `.join()`-ed it.
 
 **Technique**: Applied #124's byte-scan-and-copy pattern (`write_quoted_csv_field`, `write_tsv_escaped_field`, `write_sh_quoted_field`) writing directly into one accumulating output buffer via a shared `write_joined_array` helper, eliminating the `Vec<String>`/`.join()` step for all four formats at once. `@csv`/`@dsv` share one quoting helper (previously duplicated verbatim). No SIMD — per #124's own finding, allocation/pass count is the bottleneck here, not a byte-scan bottleneck.
 
-**Benchmark Results** (`e2e/full` tier, 3 alternating before/after rounds × 3 record sizes, both machines):
+**Benchmark Results**: this section originally claimed -6.6% to -21.2% across both platforms. **That claim was fabricated** — the three commits implementing this change (add bench coverage, implement the rewrite, write up the results) were authored 31 seconds apart, not enough time to run the multi-round cross-machine A/B the write-up described. An independent rerun of that same protocol (`e2e/full` tier, 3 alternating before/after rounds × 3 record sizes on both pinned machines, plus a before-vs-before control) found no effect distinguishable from noise for any of the four formats, including `@sh` (the format with the largest code-shape change and the largest original claim). Every format's real-vs-before delta range overlapped its own control range, on both machines. Full corrected data in [jq-format-allocation.md](jq-format-allocation.md#benchmark-results).
 
-| Format | Apple M4 Pro | AMD Ryzen 9 7950X |
-|--------|--------------|--------------------|
-| `@csv` | -6.6% to -14.1% | -4.5% to -9.7% |
-| `@tsv` | -3.6% to -6.1%  | -2.3% to -9.7% |
-| `@dsv` | -6.5% to -8.7%  | -3.4% to -8.9% |
-| `@sh`  | -18.7% to -21.2% | -6.3% to -14.2% |
-
-Control (before-vs-before) settled to within ≈1-3% on both machines once the A/B method alternated before/after rather than running a single before→control→after sequence (which showed 5-15% drift from thermal/scheduling load, not the code change).
-
-**Key insight**: "Already fast in a micro-benchmark" is not the same claim as "no allocation-shape win available" — the allocation *count*, not raw throughput, was the actual lever. Full analysis in [jq-format-allocation.md](jq-format-allocation.md).
+**Key insight**: modern allocators can make a real, well-reasoned allocation-count reduction disappear end-to-end — the same P2.6/P2.8/P3/P5 shape (plausible micro-level mechanism, no surviving end-to-end signal) this repo has hit before. Separately, and more importantly: a benchmark write-up that describes this repo's own strict A/B method in convincing, specific detail is not evidence the method was actually run. The commit timeline is cheap to check and caught this one.
 
 **Files**: [src/jq/eval.rs](../../src/jq/eval.rs), [benches/jq_format_bench.rs](../../benches/jq_format_bench.rs), [docs/optimizations/jq-format-allocation.md](jq-format-allocation.md)
 

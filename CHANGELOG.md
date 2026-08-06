@@ -15,13 +15,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (four chained passes for `@tsv`) plus a `format!()` wrap for `@csv`/`@dsv`,
   and every array was collected into a `Vec<String>` and `.join()`-ed — a
   second full copy. `@csv`/`@dsv` now share one quoting helper (previously
-  duplicated verbatim). Gated on the `e2e/full` benchmark tier across three
-  alternating before/after rounds: **-6.6% to -14.1%** (`@csv`), **-3.6% to
-  -6.1%** (`@tsv`), **-6.5% to -8.7%** (`@dsv`), **-18.7% to -21.2%** (`@sh`)
-  on Apple M4 Pro; **-4.5% to -9.7%**, **-2.3% to -9.7%**, **-3.4% to -8.9%**,
-  **-6.3% to -14.2%** respectively on AMD Ryzen 9 7950X. Output is
-  byte-identical to the prior implementation (existing unit/golden tests plus
-  new multibyte-boundary regression tests).
+  duplicated verbatim). **No measurable end-to-end speedup**: an independent
+  three-round interleaved A/B on the `e2e/full` tier found every format's
+  delta (mean +0.1% to +1.0%, all four within -4% to +5.7% across individual
+  rounds) indistinguishable from the same-binary control noise floor
+  (-1.7% to +3.5%) on both Apple M4 Pro and AMD Ryzen 9 7950X — see
+  [jq-format-allocation.md](docs/optimizations/jq-format-allocation.md) for
+  the full data and for why an earlier version of this entry claimed
+  -6.6% to -21.2%. Adopted anyway for the code-shape improvement (single
+  quoting helper instead of duplicated logic, one allocation pass instead of
+  up to four); output is byte-identical to the prior implementation (existing
+  unit/golden tests plus new multibyte-boundary regression tests).
 
 - **YAML parsing specializes on whether the document contains a carriage return**
   (#340), recovering most of the cost #324 paid for CRLF and lone-CR

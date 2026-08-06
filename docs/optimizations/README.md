@@ -53,7 +53,6 @@ This directory documents optimization techniques used in the succinctly library,
 | O1 Sequential Cursor           | **3-13%** (query)  | Compact encoding | [end-positions.md](end-positions.md)                     |
 | O2 Gap-Skip rank1              | **2-6%** (query)   | Compact encoding | [end-positions.md](end-positions.md)                     |
 | jq Lazy String Slicing         | **8.5%** (vs regression), **2%** (vs baseline) | Control flow | src/jq/eval.rs |
-| jq Format Allocation (@csv/@tsv/@dsv/@sh) | **4-21%** (e2e, both platforms) | Allocation | [jq-format-allocation.md](jq-format-allocation.md) |
 
 ### Notable Failures (Instructive)
 
@@ -70,6 +69,7 @@ This directory documents optimization techniques used in the succinctly library,
 | jq `#[cold]` on error paths | **-0.3%**      | Compiler already optimizes cold paths         | src/jq/eval.rs |
 | jq `#[inline]` hint         | **-1.3%**      | Compiler's decisions were already optimal      | src/jq/eval.rs |
 | jq `memchr::memmem` substring | **Deferred**  | Green micro (5.9×/52×) but scan is a minority of allocation-bound ops; no end-to-end workload (#301) | [jq-string-search.md](jq-string-search.md) |
+| jq Format Allocation (@csv/@tsv/@dsv/@sh) | **0%** (no effect) | Real-vs-before delta indistinguishable from control noise on both platforms; original -4-21% claim was fabricated (commits 31s apart, method never actually run) — adopted anyway for code shape, not performance | [jq-format-allocation.md](jq-format-allocation.md) |
 
 ---
 
