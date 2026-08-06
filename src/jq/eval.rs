@@ -3999,6 +3999,15 @@ fn format_urid(value: &OwnedValue, optional: bool) -> Result<String, EvalError> 
     }
 }
 
+/// Quote a CSV/DSV string field: wrap in `"..."`, doubling inner `"`.
+///
+/// jq unconditionally double-quotes every string field (inner `"` doubled),
+/// regardless of whether it contains a delimiter — see #306. Shared by
+/// `format_csv` and `format_dsv` so the quoting rule has one definition — see #651.
+fn quote_csv_field(s: &str) -> String {
+    format!("\"{}\"", s.replace('"', "\"\""))
+}
+
 /// @csv - CSV format (for arrays)
 fn format_csv(value: &OwnedValue, optional: bool) -> Result<String, EvalError> {
     match value {
@@ -4006,10 +4015,7 @@ fn format_csv(value: &OwnedValue, optional: bool) -> Result<String, EvalError> {
             let parts: Vec<String> = arr
                 .iter()
                 .map(|v| match v {
-                    // jq unconditionally double-quotes every string field
-                    // (inner `"` doubled), regardless of whether it contains a
-                    // delimiter — see #306.
-                    OwnedValue::String(s) => format!("\"{}\"", s.replace('"', "\"\"")),
+                    OwnedValue::String(s) => quote_csv_field(s),
                     OwnedValue::Null => String::new(),
                     other => owned_to_string(other),
                 })
@@ -4051,9 +4057,7 @@ fn format_dsv(value: &OwnedValue, delimiter: &str, optional: bool) -> Result<Str
             let parts: Vec<String> = arr
                 .iter()
                 .map(|v| match v {
-                    // Match @csv: always double-quote string fields (inner `"`
-                    // doubled) so @dsv(",") stays byte-identical to @csv — #306.
-                    OwnedValue::String(s) => format!("\"{}\"", s.replace('"', "\"\"")),
+                    OwnedValue::String(s) => quote_csv_field(s),
                     OwnedValue::Null => String::new(),
                     other => owned_to_string(other),
                 })
