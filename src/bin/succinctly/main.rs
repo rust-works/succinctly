@@ -259,6 +259,14 @@ enum BenchRunnerSubcommand {
     List(bench_runner::ListArgs),
     /// Run one or more benchmarks
     Run(bench_runner::RunArgs),
+    /// Run benchmarks across configured SSH nodes (issue #98)
+    Orchestrate(bench_runner::OrchestrateArgs),
+    /// Cross-compile and deploy the release binary to configured nodes (issue #98)
+    Sync(bench_runner::SyncArgs),
+    /// Report node status, or start/stop EC2 instances (issue #98)
+    Nodes(bench_runner::NodesArgs),
+    /// Compare orchestrated results across nodes/architectures (issue #98)
+    Report(bench_runner::ReportArgs),
 }
 
 /// Default alias names installed by `install-aliases`.
@@ -1340,6 +1348,10 @@ fn main() -> Result<()> {
         Command::Bench(bench_cmd) => match bench_cmd.command {
             BenchRunnerSubcommand::List(args) => bench_runner::run_list(args),
             BenchRunnerSubcommand::Run(args) => bench_runner::run_benchmarks(args),
+            BenchRunnerSubcommand::Orchestrate(args) => bench_runner::run_orchestrate(args),
+            BenchRunnerSubcommand::Sync(args) => bench_runner::run_sync(args),
+            BenchRunnerSubcommand::Nodes(args) => bench_runner::run_nodes(args),
+            BenchRunnerSubcommand::Report(args) => bench_runner::run_report(args),
         },
         Command::Text(text_cmd) => match text_cmd.command {
             TextSubcommand::Validate(validate_cmd) => match validate_cmd.command {

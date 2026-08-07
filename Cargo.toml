@@ -66,8 +66,8 @@ scalar-yaml = []
 # kernel to pay for itself. See `succinctly dev select-stats`.
 select-stats = ["std"]
 
-# Unified benchmark runner (succinctly bench list/run)
-bench-runner = ["cli", "dep:chrono"]
+# Unified benchmark runner (succinctly bench list/run/orchestrate/nodes/sync/report)
+bench-runner = ["cli", "dep:chrono", "dep:serde_yaml"]
 
 [dependencies]
 bytemuck = { version = "1.14", features = ["derive"] }
@@ -87,6 +87,7 @@ serde_json = { version = "1.0", features = ["preserve_order"], optional = true }
 md5 = { version = "0.8", optional = true }
 ctrlc = { version = "3.4", optional = true }
 chrono = { version = "0.4", optional = true }
+serde_yaml = { version = "0.9", optional = true }
 
 [dev-dependencies]
 criterion = "0.8"

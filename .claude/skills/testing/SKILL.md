@@ -118,6 +118,25 @@ input text, assert it never disagrees with the balanced-parens structure the par
 oracle held across the whole real-workload corpus and all 279 valid YAML-suite cases when #106
 added it, and it catches classes of bug that example-based tests cannot reach.
 
+## Fakes Can't Verify Build-Time/Runtime Feature Agreement
+
+When a test double stands in for "produce an artifact, then invoke it" (cross-compile a binary
+then SSH-exec it, build a plugin then load it), the fake only proves the *orchestration logic* is
+correct — it can't prove the *real artifact* actually has what the invoker assumes. Issue #98's
+`bench sync` cross-compiled its deployed binary with `--features cli`, while `bench orchestrate`
+invoked `bench run <name>` on that binary — a subcommand gated behind `--features bench-runner`
+(`cli` is a strict subset). Every `sync.rs` unit test used a `BuildRunner` fake that returns a
+placeholder file, so none of them could have caught this: the fake never runs a real `cargo build`
+and is never invoked by a real remote exec. The gap stayed invisible until a live run against a
+real node failed at the one thing no fake exercises — running the artifact the real build command
+actually produced.
+
+**How to apply:** for any tool that builds-then-executes across a process/host boundary (cross-
+compilation, plugin loading, container images), budget at least one real end-to-end run before
+trusting it — not just fake-backed unit coverage. Unit tests over `BuildRunner`/`RemoteExec`-style
+abstractions verify scheduling and control flow; they cannot verify that the concrete command line
+used to build something produces something the concrete command line used to invoke it can run.
+
 ## Testing Levels
 
 ### Unit Tests (in-module)

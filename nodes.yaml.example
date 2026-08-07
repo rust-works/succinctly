@@ -1,0 +1,58 @@
+# Example configuration for `succinctly bench orchestrate` / `nodes` / `sync`
+# (issue #98). Copy this file to `nodes.yaml` (gitignored) and fill in your
+# own machines — don't commit the real file, it encodes machine-specific
+# hostnames/keys.
+#
+#   cp nodes.yaml.example nodes.yaml
+#   succinctly bench nodes --config nodes.yaml --status
+#   succinctly bench orchestrate --config nodes.yaml --all --dry-run
+
+coordinator:
+  # Where aggregated results are written, one subdirectory per run.
+  results_dir: data/bench/distributed
+
+  # "per-node": each node schedules its own work queue independently.
+  # "global": the coordinator manages one work queue across all nodes.
+  # (Read starting Phase 2's scheduler.)
+  parallelism: per-node
+
+  # Timeout for SSH connectivity checks, in seconds.
+  ssh_timeout: 30
+
+  # Timeout for a single benchmark's execution, in seconds.
+  benchmark_timeout: 3600
+
+nodes:
+  # The local machine: no `ssh` wrapper, commands run directly.
+  - name: local
+    host: localhost
+    arch: x86_64
+    features: [avx2, bmi2]
+    max_concurrent: 2
+
+  # A Tailscale-reachable machine. Tailscale handles auth itself, so no
+  # ssh_key is needed — just the MagicDNS name (or `user@host`).
+  - name: example-arm-mac
+    host: user@example-mac.tailnet-name.ts.net
+    arch: aarch64
+    features: [neon]
+    max_concurrent: 1
+    working_dir: /Users/user/succinctly
+    # Only needed if `arch` alone can't determine the right Rust target
+    # triple for cross-compilation (Phase 3) — e.g. aarch64 spans both
+    # aarch64-apple-darwin and aarch64-unknown-linux-gnu.
+    target_triple: aarch64-apple-darwin
+
+  # An EC2 instance reached over a real SSH key (Phase 4 EC2 start/stop is
+  # optional — omit ec2_instance_id/ec2_region for any node you manage
+  # outside this tool).
+  - name: example-ec2-graviton
+    host: ec2-user@ec2-XX-XX-XX-XX.ap-southeast-2.compute.amazonaws.com
+    arch: aarch64
+    features: [neon, sve2]
+    max_concurrent: 4
+    ssh_key: ~/.ssh/aws-example.pem
+    working_dir: /home/ec2-user/succinctly
+    target_triple: aarch64-unknown-linux-gnu
+    ec2_instance_id: i-0123456789abcdef0
+    ec2_region: ap-southeast-2
