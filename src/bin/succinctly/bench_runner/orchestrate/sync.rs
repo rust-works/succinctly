@@ -172,8 +172,8 @@ pub trait BuildRunner: Send + Sync {
     fn cross_compile(&self, target_triple: &str) -> Result<PathBuf>;
 }
 
-/// Real implementation: `cargo build --release --target <triple> --features cli`.
-/// Requires the target's toolchain to already be installed
+/// Real implementation: `cargo build --release --target <triple> --features
+/// bench-runner`. Requires the target's toolchain to already be installed
 /// (`rustup target add <triple>`) — that's a documented precondition, not
 /// something this tool installs.
 pub struct SystemBuild;
@@ -187,7 +187,7 @@ impl BuildRunner for SystemBuild {
                 "--target",
                 target_triple,
                 "--features",
-                "cli",
+                "bench-runner",
             ])
             .status()
             .context("failed to spawn cargo build")?;
