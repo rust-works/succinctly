@@ -390,6 +390,64 @@ which only asked about the x86 regression.
 code-layout artifact, not a CS-Poppy logic regression.** The ARM `long_*`
 improvement is worth its own follow-up issue if someone wants to chase it.
 
+### 5c. Issue #649 follow-up (2026-08-07): ARM improvement reproduced a third time, mechanism unconfirmed — no ARM instruction-counting tool available
+
+Filed as the ARM follow-up flagged at the end of §5b. Re-ran the exact
+`becd1b8d`/`09158571` `block_scalars_harness` binaries built for §5b's
+investigation — still present at `~/bench-scratch/issue-595/{wt-before,wt-after}`
+on `johns-mac-mini` — through `scripts/perf-ab.py --tool wallclock --reps 9
+--iterations 200`, the same parameters as the two prior M4 Pro runs recorded
+above. Reusing the identical binaries (not rebuilding) tests reproducibility
+of the *measurement*, not the build.
+
+**M4 Pro (`johns-mac-mini`), `--tool wallclock`, 9 interleaved reps × 200
+iterations, third independent run:**
+
+| shape              | min ms Δ | median ms Δ |
+|--------------------|----------|-------------|
+| 10x10lines         | +2.7%    | -2.9%       |
+| 50x50lines         | +0.4%    | -0.1%       |
+| 100x100lines       | +0.5%    | +0.6%       |
+| 10x1000lines       | +0.1%    | +0.1%       |
+| long_10x100lines   | -7.4%    | -7.2%       |
+| long_50x100lines   | -9.3%    | -8.8%       |
+| long_100x100lines  | -10.4%   | -9.2%       |
+
+Checksum identity gate: 7 shapes, 0 differences. The four short shapes stay
+neutral; the three `long_*` shapes improve again, in the same 7-10% band as
+both prior runs (§5b's original two: -7.4%..-9.3% and -7.4%..-8.0%) — a third
+independent run landing in the same range confirms this is a real,
+reproducible effect on this box, not one-off noise.
+
+`johns-mac-mini-1` (the second sanctioned ARM twin) responded to `tailscale
+ping` but not SSH (port 22 timed out twice) — asleep or Remote Login
+disabled, not a routing problem. Could not cross-check that the effect isn't
+specific to one twin this round; noted rather than silently dropped, per the
+issue's own suggested next step.
+
+**ARM instruction-counting tooling: none available without new
+infrastructure.** Checked `johns-mac-mini` directly for an ARM equivalent of
+the cachegrind approach that settled #595: no `valgrind`, no `perf`, no
+`xctrace`/Instruments, no Homebrew, no MacPorts installed. Upstream valgrind
+still has no native macOS/arm64 support as of its latest release (3.27.0,
+April 2026) — the only routes are an aarch64 Linux VM or a community fork
+(`valgrind-macos`), either of which means installing a new package manager
+and toolchain on the user's personal remote machine. `xctrace`/Instruments
+needs the full Xcode app (only Command Line Tools are installed); `perf` is
+Linux-only. Per the issue's own low-priority framing — an improvement, not a
+regression, so there's no user-facing harm in leaving the mechanism
+unexplained — chose not to stand up new profiling infrastructure to chase
+this further.
+
+**Conclusion: #649 closed as "confirmed, mechanism unconfirmed, no action
+needed."** The ARM `long_*` improvement is real and reproducible (three
+independent runs, consistent 7-10% magnitude, checksum-identity-gated) but,
+unlike #595's x86 regression, its mechanism can't be settled on the currently
+available hardware — whether it's the same code-layout artifact landing
+favourably (as #595's theory would predict) or something else stays an open
+question. Revisit if ARM instruction-counting tooling becomes available on
+the sanctioned bench hosts, or if the effect ever flips to a regression.
+
 ---
 
 ## 6. Future developments
