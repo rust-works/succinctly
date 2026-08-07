@@ -333,7 +333,9 @@ $EDITOR nodes.yaml                 # fill in real hostnames
 succinctly bench nodes --config nodes.yaml --status
 ```
 
-A node's `host` is whatever `ssh` accepts as a destination — a Tailscale MagicDNS name (`user@my-mac-mini.tailnet-name.ts.net`) needs no `ssh_key` (Tailscale handles auth) and no `ec2_*` fields; only EC2-backed nodes need `ec2_instance_id`/`ec2_region` (for `bench nodes --start/--stop`) and typically an explicit `ssh_key`. `host: localhost` (or `127.0.0.1`) runs commands directly with no `ssh` wrapper at all — useful both as the always-available "local" node and for a network-free dry run of the whole pipeline.
+A node's `host` is whatever `ssh` accepts as a destination; only EC2-backed nodes need `ec2_instance_id`/`ec2_region` (for `bench nodes --start/--stop`) and typically an explicit `ssh_key`. `host: localhost` (or `127.0.0.1`) runs commands directly with no `ssh` wrapper at all — useful both as the always-available "local" node and for a network-free dry run of the whole pipeline.
+
+**Always spell out the username** (`user@host`), even one that matches your local shell's default. Some SSH access layers (mesh VPNs with per-connection ACLs, bastion proxies) enforce their own username policy independent of key-based auth — an omitted username silently falls back to your local machine's username, which such a layer can reject even though the configured key is completely valid. The failure mode looks like a broken key ("permission denied") but is actually a policy check on the wrong identity; `bench nodes --status` reporting a node `unreachable` despite `ssh` working fine by hand is the tell.
 
 ### `bench nodes` — status, and EC2 start/stop
 
@@ -353,7 +355,9 @@ succinctly bench sync --config nodes.yaml --node sydney  # sync just one node
 succinctly bench sync --config nodes.yaml --force        # re-sync even if the version already matches
 ```
 
-Cross-compiling for a node requires that target's toolchain already installed locally (`rustup target add aarch64-unknown-linux-gnu`, etc.) — `bench sync` doesn't install it for you. A node's `target_triple` disambiguates cases `arch` alone can't (`aarch64-apple-darwin` vs `aarch64-unknown-linux-gnu` are both `aarch64`).
+Cross-compiling for a node requires that target's toolchain already installed locally (`rustup target add aarch64-unknown-linux-gnu`, etc.) **and** a linker that can produce that target's binaries — `rustup target add` alone is not enough for a cross-OS target (e.g. macOS host → Linux target; both being `aarch64` doesn't help, the linker still needs to emit ELF, not Mach-O). `bench sync` doesn't install either for you. A node's `target_triple` disambiguates cases `arch` alone can't (`aarch64-apple-darwin` vs `aarch64-unknown-linux-gnu` are both `aarch64`).
+
+If a working cross-linker isn't set up, skip `bench sync` (`--no-sync`) and build natively on the node instead: install a Rust toolchain there (`curl https://sh.rustup.rs | sh`, plus a C toolchain — e.g. `dnf install gcc` on Amazon Linux, needed by several dependencies' build scripts), copy the source over (`rsync -az --exclude .git --exclude target`), and run `cargo build --release --features bench-runner` directly on the node. `bench orchestrate` only cares that a binary with the `bench-runner` feature ends up at `<working_dir>/target/release/succinctly` — it doesn't care how it got there.
 
 ### `bench orchestrate` — run benchmarks across nodes
 
