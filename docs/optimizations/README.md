@@ -6,25 +6,25 @@ This directory documents optimization techniques used in the succinctly library,
 
 ## Quick Reference
 
-| Category             | Document                                                 | Key Techniques                                  |
-|----------------------|----------------------------------------------------------|-------------------------------------------------|
-| **Bit-level**        | [bit-manipulation.md](bit-manipulation.md)               | Popcount, CTZ/CLZ, broadword select, PDEP/PEXT  |
-| **Lookup tables**    | [lookup-tables.md](lookup-tables.md)                     | Byte tables, nibble tables, state machine tables |
-| **SIMD**             | [simd.md](simd.md)                                      | AVX2, AVX-512, SSE4.1, NEON                     |
-| **Memory**           | [cache-memory.md](cache-memory.md)                       | Alignment, layout, prefetching, bandwidth        |
-| **Data structures**  | [hierarchical-structures.md](hierarchical-structures.md) | Rank directory, select index, RangeMin           |
-| **Control flow**     | [branchless.md](branchless.md)                           | CMOV, arithmetic selection, SIMD masking         |
-| **Access patterns**  | [access-patterns.md](access-patterns.md)                 | Sequential, strided, random, search algorithms   |
-| **Allocation**       | [zero-copy.md](zero-copy.md)                             | Type punning, memory mapping, streaming          |
-| **Parallelism**      | [parallel-prefix.md](parallel-prefix.md)                 | Prefix XOR, cumulative index, carry propagation  |
-| **Parsing**          | [state-machines.md](state-machines.md)                   | PFSM, fast-path bypass, two-stage pipeline       |
-| **Compact encoding** | [end-positions.md](end-positions.md)                     | Bitmap encoding, advance index, sequential cursor|
-| **Sparse sets**      | [line-index.md](line-index.md)                           | Elias-Fano line starts, lazy build, crossover    |
-| **String search**    | [jq-string-search.md](jq-string-search.md)               | memmem vs std Two-Way for jq substring builtins   |
+| Category             | Document                                                 | Key Techniques                                                        |
+| -------------------- | -------------------------------------------------------- | ----------------------------------------------------------------------|
+| **Bit-level**        | [bit-manipulation.md](bit-manipulation.md)               | Popcount, CTZ/CLZ, broadword select, PDEP/PEXT                        |
+| **Lookup tables**    | [lookup-tables.md](lookup-tables.md)                     | Byte tables, nibble tables, state machine tables                      |
+| **SIMD**             | [simd.md](simd.md)                                       | AVX2, AVX-512, SSE4.1, NEON                                           |
+| **Memory**           | [cache-memory.md](cache-memory.md)                       | Alignment, layout, prefetching, bandwidth                             |
+| **Data structures**  | [hierarchical-structures.md](hierarchical-structures.md) | Rank directory, select index, RangeMin                                |
+| **Control flow**     | [branchless.md](branchless.md)                           | CMOV, arithmetic selection, SIMD masking                              |
+| **Access patterns**  | [access-patterns.md](access-patterns.md)                 | Sequential, strided, random, search algorithms                        |
+| **Allocation**       | [zero-copy.md](zero-copy.md)                             | Type punning, memory mapping, streaming                               |
+| **Parallelism**      | [parallel-prefix.md](parallel-prefix.md)                 | Prefix XOR, cumulative index, carry propagation                       |
+| **Parsing**          | [state-machines.md](state-machines.md)                   | PFSM, fast-path bypass, two-stage pipeline                            |
+| **Compact encoding** | [end-positions.md](end-positions.md)                     | Bitmap encoding, advance index, sequential cursor                     |
+| **Sparse sets**      | [line-index.md](line-index.md)                           | Elias-Fano line starts, lazy build, crossover                         |
+| **String search**    | [jq-string-search.md](jq-string-search.md)               | memmem vs std Two-Way for jq substring builtins                       |
 | **jq allocation**    | [jq-format-allocation.md](jq-format-allocation.md)       | `@csv`/`@tsv`/`@dsv`/`@sh` byte-scan rewrite — investigated, rejected |
-| **Select scan**      | [select-scan.md](select-scan.md)                         | #40 scan-length measurement, IB cursor O(n²) fix |
-| **Targets**          | [targets.md](targets.md)                                 | CPU target configurations, architecture flags    |
-| **SIMD Strategy**    | [simd-strategy.md](simd-strategy.md)                     | Per-module SIMD usage, platform support, lessons |
+| **Select scan**      | [select-scan.md](select-scan.md)                         | #40 scan-length measurement, IB cursor O(n²) fix                      |
+| **Targets**          | [targets.md](targets.md)                                 | CPU target configurations, architecture flags                         |
+| **SIMD Strategy**    | [simd-strategy.md](simd-strategy.md)                     | Per-module SIMD usage, platform support, lessons                      |
 
 ---
 

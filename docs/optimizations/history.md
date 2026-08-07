@@ -38,18 +38,18 @@ This document records all optimization attempts in the succinctly library, showi
 
 ### Failed Optimizations
 
-| Optimization           | Penalty                  | Platform | Action         |
-|------------------------|--------------------------|----------|----------------|
-| AVX-512 JSON Parser    | **-10%** (avg)           | x86_64   | Removed      |
-| BMI1 Mask Iteration    | **-26%** (avg)           | x86_64   | Reverted     |
-| BMI2 PDEP BitWriter    | **-71%** (3.4x slower!)  | x86_64   | Reverted     |
-| PFSM Batched           | **-25%** (vs production) | All      | Not deployed |
-| NEON PFSM Shuffle      | **-47%**                 | ARM      | Reverted     |
-| NEON Batched Popcount  | **-25%**                 | ARM      | Rejected     |
-| NEON Movemask Batching | **0%** (no effect)       | ARM      | Rejected     |
-| NEON Prefetching       | **0%** (no effect)       | ARM      | Rejected     |
-| BP L0 Index Unrolling  | **-19%** (e2e)           | All      | Rejected     |
-| jq Format Allocation   | **~0%** (in noise)       | All      | Rejected (investigated, no code adopted) |
+| Optimization           | Penalty                  | Platform | Action                                    |
+| ---------------------- | ------------------------ | -------- | ------------------------------------------|
+| AVX-512 JSON Parser    | **-10%** (avg)           | x86_64   | Removed                                   |
+| BMI1 Mask Iteration    | **-26%** (avg)           | x86_64   | Reverted                                  |
+| BMI2 PDEP BitWriter    | **-71%** (3.4x slower!)  | x86_64   | Reverted                                  |
+| PFSM Batched           | **-25%** (vs production) | All      | Not deployed                              |
+| NEON PFSM Shuffle      | **-47%**                 | ARM      | Reverted                                  |
+| NEON Batched Popcount  | **-25%**                 | ARM      | Rejected                                  |
+| NEON Movemask Batching | **0%** (no effect)       | ARM      | Rejected                                  |
+| NEON Prefetching       | **0%** (no effect)       | ARM      | Rejected                                  |
+| BP L0 Index Unrolling  | **-19%** (e2e)           | All      | Rejected                                  |
+| jq Format Allocation   | **~0%** (in noise)       | All      | Rejected (investigated, no code adopted)  |
 
 **Total Failed**: 10 attempts
 **Worst Failure**: BMI2 PDEP (-71%, 3.4x slower)
