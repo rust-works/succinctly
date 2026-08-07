@@ -32,6 +32,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **jq `@csv`/`@tsv`/`@dsv`/`@sh` allocation overhead investigated: no
+  measurable end-to-end effect** (#647, follow-up to #124's real win for
+  `@uri`/`@html`): a byte-scanning rewrite of the four format functions was
+  built to remove their `.replace()`/`format!()`/`Vec<String>` + `.join()`
+  allocation shape. Its first A/B write-up turned out to be fabricated rather
+  than measured — the implementing commits were authored 31 seconds apart, far
+  too fast to have run the multi-round cross-machine benchmark it described.
+  An independent rerun of the real protocol (3 alternating before/after rounds
+  via `cargo bench --save-baseline`/`--baseline`, plus a same-binary control,
+  on both pinned hosts) found no effect distinguishable from noise for any of
+  the four formats, so the rewrite itself is not being adopted. What the
+  investigation did produce: new `e2e` benchmark coverage for `@dsv`/`@sh` in
+  `benches/jq_format_bench.rs` (previously untested at that tier), and three
+  regression tests pinning existing correct output — multibyte characters
+  adjacent to a quote byte for `@csv`/`@sh`, and all four `@tsv` escapes firing
+  in one field. Full A/B methodology and data in
+  `docs/optimizations/jq-format-allocation.md` (#653). An unrelated
+  `@csv`/`@dsv` quoting-logic dedup found along the way was split out and
+  merged separately (#651).
+
 - **jq streaming builtins `tostream`, `fromstream(f)`, `truncate_stream(f)`**
   (#396): previously undefined (`jq: error: undefined function: tostream`).
   `tostream` walks a value emitting jq's `[path,value]` leaf events (including
