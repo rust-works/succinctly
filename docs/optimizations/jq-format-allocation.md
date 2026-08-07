@@ -119,14 +119,19 @@ was re-measured against.
   `quote_csv_field` helper. It has merit on its own (one definition of the quoting rule
   instead of two copies) and is **not part of this investigation's outcome** — it changes
   nothing about the allocation shape or the performance conclusion above.
-- **PR #650** — the branch this investigation was drafted on. It has been repurposed to drop
-  the byte-scan rewrite entirely; per [#647's closing comment](https://github.com/rust-works/succinctly/issues/647#issuecomment-5209766877),
-  it retains only new `e2e` benchmark coverage and regression tests pinning existing correct
-  output behavior, with no production code change.
+- **PR #650** — the branch this investigation was drafted on, **closed without merging**; none
+  of its byte-scan rewrite lands on `main`. Two pieces of it worth keeping independent of the
+  rewrite — `e2e` benchmark coverage for `@dsv`/`@sh` and regression tests pinning correct
+  multi-byte-boundary/escape output behavior — were salvaged separately; see
+  [#657](https://github.com/rust-works/succinctly/issues/657)/[PR #658](https://github.com/rust-works/succinctly/pull/658).
 - **[#652](https://github.com/rust-works/succinctly/issues/652)** — the `CHANGELOG.md` entry
   for this investigation's outcome.
 - **[#653](https://github.com/rust-works/succinctly/issues/653)** — the issue that corrected
   this document (and `history.md`/`README.md`) to match the real outcome above.
+- **[#657](https://github.com/rust-works/succinctly/issues/657)** — salvaged PR #650's
+  `dsv_records`/`sh_field` bench coverage and multi-byte regression tests into
+  [PR #658](https://github.com/rust-works/succinctly/pull/658) before PR #650 was closed, the
+  same pattern as #651.
 
 ## Reproduce
 
