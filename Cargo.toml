@@ -227,6 +227,10 @@ harness = false
 name = "jq_format_bench"
 harness = false
 
+[[bench]]
+name = "jq_recurse_depth_bench"
+harness = false
+
 # =============================================================================
 # Lints
 #
