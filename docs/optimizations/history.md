@@ -49,8 +49,9 @@ This document records all optimization attempts in the succinctly library, showi
 | NEON Movemask Batching | **0%** (no effect)       | ARM      | Rejected     |
 | NEON Prefetching       | **0%** (no effect)       | ARM      | Rejected     |
 | BP L0 Index Unrolling  | **-19%** (e2e)           | All      | Rejected     |
+| jq Format Allocation   | **~0%** (in noise)       | All      | Rejected (investigated, no code adopted) |
 
-**Total Failed**: 9 attempts
+**Total Failed**: 10 attempts
 **Worst Failure**: BMI2 PDEP (-71%, 3.4x slower)
 
 ---
@@ -660,6 +661,33 @@ The IB cursor state (`ib_word_idx`, `ib_ones_before`) remains valid after the ra
 **Key insight**: Green in memmem's target regime, but the scan is a minority of every candidate op's wall-time (all allocate output or materialize input), and there is no jq benchmark or realistic large-single-string workload (#301) to validate end-to-end. Per the #126 gate (>40% scan share + real workload), and the P2.6/P2.8/P3/P5/P8 micro-bench-win / end-to-end-reject precedents, the disciplined result is reject/defer. Full analysis in [jq-string-search.md](jq-string-search.md).
 
 **Files**: [benches/jq_string_ops_bench.rs](../../benches/jq_string_ops_bench.rs), [docs/optimizations/jq-string-search.md](jq-string-search.md)
+
+---
+
+### ❌ jq `@csv`/`@tsv`/`@dsv`/`@sh` Allocation Rewrite (August 2026)
+
+**Status**: Investigated and **rejected** — no code adopted. [Issue #647](https://github.com/rust-works/succinctly/issues/647), follow-up to [#124](https://github.com/rust-works/succinctly/issues/124) (`@uri`/`@html`, a real measured win). Full analysis in [jq-format-allocation.md](jq-format-allocation.md).
+
+**Problem**: #124's prototype found `@csv`/`@sh`'s existing `.replace()`/`format!()`-based code already running at 10-14 GiB/s and left it untouched. #647 investigated it properly: `format_tsv` chains four sequential `.replace()` calls per field, `format_csv`/`format_dsv` always allocate twice per string field (`.replace()` then `format!()`), and all four formats build a `Vec<String>` via `.map(...).collect()` before `.join()`-ing it — the same double-allocation shape #124 eliminated for `@uri`/`@html`.
+
+**Technique investigated**: A hand-rolled byte-scanning rewrite of all four format functions, drafted on branch `issue-647-csv-dsv-allocation-overhead` (PR #650) but **never adopted** — `src/jq/eval.rs` is unchanged.
+
+**Benchmark Results** (3-round interleaved A/B, `jq_format/e2e/full` tier, both pinned hosts):
+
+| Format | M4 Pro real delta (mean) | 7950X real delta (mean) | Control noise floor |
+|--------|--------------------------|-------------------------|---------------------|
+| `@csv` | -1.3% to +3.3% (+0.5%)   | -4.1% to +4.1% (+0.2%)  | ~1-2.5%             |
+| `@tsv` | -0.8% to +3.4% (+0.7%)   | -1.3% to +2.9% (+0.1%)  | ~1-3.4%             |
+| `@dsv` | -1.8% to +2.7% (+0.4%)   | -1.3% to +1.8% (+0.1%)  | ~0.3-2.4%           |
+| `@sh`  | -1.7% to +3.1% (+0.8%)   | -4.0% to +5.7% (+1.0%)  | ~1.7-3.5%           |
+
+Every format's real-vs-before delta range overlapped its own control range on both machines, with no scaling trend across the 10/100/1000-record sweep.
+
+**Correction**: An earlier version of this write-up reported a different, unmeasured set of numbers — the three commits implementing the rewrite were authored 31 seconds apart, far too fast to have run the multi-round, dual-host protocol described. That was caught during review; the table above is the real, independently re-measured result. The fabricated figures are not reproduced anywhere in the docs, including here — see [jq-format-allocation.md's Correction section](jq-format-allocation.md#correction--the-original-write-up-reported-unmeasured-numbers) for the full account.
+
+**Key insight**: Allocation count and pass count were not the bottleneck at these field sizes — array iteration and output formatting dominate instead, matching #124's own finding that `@csv`/`@sh` were "already fast." A separate, unrelated fix deduplicating `@csv`'s/`@dsv`'s quoting logic was split out to [#651](https://github.com/rust-works/succinctly/issues/651) and merged independently of this (non-)performance outcome.
+
+**Files**: [docs/optimizations/jq-format-allocation.md](jq-format-allocation.md), [benches/jq_format_bench.rs](../../benches/jq_format_bench.rs)
 
 ---
 
