@@ -21,6 +21,7 @@ This directory documents optimization techniques used in the succinctly library,
 | **Compact encoding** | [end-positions.md](end-positions.md)                     | Bitmap encoding, advance index, sequential cursor|
 | **Sparse sets**      | [line-index.md](line-index.md)                           | Elias-Fano line starts, lazy build, crossover    |
 | **String search**    | [jq-string-search.md](jq-string-search.md)               | memmem vs std Two-Way for jq substring builtins   |
+| **jq allocation**    | [jq-format-allocation.md](jq-format-allocation.md)       | `@csv`/`@tsv`/`@dsv`/`@sh` byte-scan rewrite — investigated, rejected |
 | **Select scan**      | [select-scan.md](select-scan.md)                         | #40 scan-length measurement, IB cursor O(n²) fix |
 | **Targets**          | [targets.md](targets.md)                                 | CPU target configurations, architecture flags    |
 | **SIMD Strategy**    | [simd-strategy.md](simd-strategy.md)                     | Per-module SIMD usage, platform support, lessons |
@@ -68,6 +69,7 @@ This directory documents optimization techniques used in the succinctly library,
 | jq `#[cold]` on error paths | **-0.3%**      | Compiler already optimizes cold paths         | src/jq/eval.rs |
 | jq `#[inline]` hint         | **-1.3%**      | Compiler's decisions were already optimal      | src/jq/eval.rs |
 | jq `memchr::memmem` substring | **Deferred**  | Green micro (5.9×/52×) but scan is a minority of allocation-bound ops; no end-to-end workload (#301) | [jq-string-search.md](jq-string-search.md) |
+| jq `@csv`/`@tsv`/`@dsv`/`@sh` byte-scan rewrite | **No effect** (in noise) | Already at 10-14 GiB/s pre-rewrite; allocation/pass count wasn't the bottleneck | [jq-format-allocation.md](jq-format-allocation.md) |
 
 ---
 
