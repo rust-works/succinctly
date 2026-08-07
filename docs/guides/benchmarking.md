@@ -11,6 +11,7 @@ This guide provides complete information for running, interpreting, and document
 - [Types of Benchmarks](#types-of-benchmarks)
 - [When to Run Benchmarks](#when-to-run-benchmarks)
 - [How to Run Benchmarks](#how-to-run-benchmarks)
+- [Distributed Benchmark Orchestration](#distributed-benchmark-orchestration-issue-98)
 - [A/B Benchmarking Method](#ab-benchmarking-method)
 - [Data Generation](#data-generation)
 - [Platforms and Hardware](#platforms-and-hardware)
@@ -311,6 +312,76 @@ cargo bench -- --sample-size 10
 # Warm-up iterations
 cargo bench -- --warm-up-time 1
 ```
+
+---
+
+## Distributed Benchmark Orchestration (issue #98)
+
+The unified benchmark runner (above) runs benchmarks on one machine. `succinctly bench orchestrate` and its companion commands (`nodes`, `sync`, `report`) automate the manual multi-machine workflow this guide otherwise describes by hand (§ "Building both halves on a remote box", § Platforms and Hardware): define your machines once in `nodes.yaml`, then fan the same `bench run` invocations out across all of them over SSH and compare the results.
+
+Requires the `bench-runner` feature (which now also pulls in `serde_yaml` for config parsing):
+
+```bash
+cargo build --release --features bench-runner
+```
+
+### Setup
+
+```bash
+cp nodes.yaml.example nodes.yaml   # gitignored — encodes your machine-specific hosts/keys
+$EDITOR nodes.yaml                 # fill in real hostnames
+succinctly bench nodes --config nodes.yaml --status
+```
+
+A node's `host` is whatever `ssh` accepts as a destination — a Tailscale MagicDNS name (`user@my-mac-mini.tailnet-name.ts.net`) needs no `ssh_key` (Tailscale handles auth) and no `ec2_*` fields; only EC2-backed nodes need `ec2_instance_id`/`ec2_region` (for `bench nodes --start/--stop`) and typically an explicit `ssh_key`. `host: localhost` (or `127.0.0.1`) runs commands directly with no `ssh` wrapper at all — useful both as the always-available "local" node and for a network-free dry run of the whole pipeline.
+
+### `bench nodes` — status, and EC2 start/stop
+
+```bash
+succinctly bench nodes --config nodes.yaml --status   # default when no flag given
+succinctly bench nodes --config nodes.yaml --start     # start any stopped EC2-backed nodes
+succinctly bench nodes --config nodes.yaml --stop      # stop them again (EC2 instances cost money while running)
+```
+
+`bench orchestrate` never auto-starts a stopped EC2 instance — that's a silent, cost-incurring side effect a user should choose explicitly via `--start`.
+
+### `bench sync` — cross-compile and deploy the release binary
+
+```bash
+succinctly bench sync --config nodes.yaml               # sync every node whose reported --version is stale
+succinctly bench sync --config nodes.yaml --node sydney  # sync just one node
+succinctly bench sync --config nodes.yaml --force        # re-sync even if the version already matches
+```
+
+Cross-compiling for a node requires that target's toolchain already installed locally (`rustup target add aarch64-unknown-linux-gnu`, etc.) — `bench sync` doesn't install it for you. A node's `target_triple` disambiguates cases `arch` alone can't (`aarch64-apple-darwin` vs `aarch64-unknown-linux-gnu` are both `aarch64`).
+
+### `bench orchestrate` — run benchmarks across nodes
+
+```bash
+succinctly bench orchestrate --config nodes.yaml --all --dry-run   # show the planned schedule, touch nothing
+succinctly bench orchestrate --config nodes.yaml --all              # sync (unless --no-sync), then run
+succinctly bench orchestrate --config nodes.yaml --arch aarch64 rank_select yaml_bench
+succinctly bench orchestrate --config nodes.yaml --node sydney --no-sync --collect-only
+```
+
+Each node runs on its own thread; within a node, benchmarks execute in isolation-aware "waves" — every benchmark defaults to `exclusive` (it gets a node to itself, since sharing a CPU while criterion measures wall time skews results), overridable per-name via `nodes.yaml`'s `benchmarks:` list:
+
+```yaml
+benchmarks:
+  - name: rank_select
+    isolation: concurrent   # may share a node's `max_concurrent` slots with other concurrent benchmarks
+```
+
+Results land under `coordinator.results_dir` (default `data/bench/distributed/`) as `<run_id>/<node>/<benchmark>/summary.json` (+ `.jsonl`/`.md` for CLI-type benchmarks), plus a per-node `node_info.json` (arch/features), a flattened `results.jsonl`, and a run-level `metadata.json`.
+
+### `bench report` — compare results across nodes/architectures
+
+```bash
+succinctly bench report --current data/bench/distributed/2026-08-07T12-00-00
+succinctly bench report --current <run> --baseline <prior-run> --threshold 0.10
+```
+
+Purely offline (no `nodes.yaml`, no SSH) — reads the `summary.json`/`node_info.json` files a `bench orchestrate` run already produced and writes `<current>/summary.md` with a per-benchmark node comparison table, a per-architecture average-duration table, and (with `--baseline`) a regression table for anything more than `--threshold` (default 10%) slower than the same benchmark on the same node in the baseline run. `--check` verifies the report file is up to date instead of rewriting it (exits non-zero on drift), for CI.
 
 ---
 

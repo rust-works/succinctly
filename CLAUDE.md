@@ -114,6 +114,13 @@ sjq --input-dsv ',' '.[] | select(.[0] == "Alice")' data.csv
 ./target/release/succinctly bench run yq_bench
 ./target/release/succinctly dev bench yq --queries all  # M2 streaming comparison (memory collected by default)
 ./target/release/succinctly bench run dsv_bench
+
+# Distributed benchmark orchestration across SSH nodes (issue #98)
+cp nodes.yaml.example nodes.yaml && $EDITOR nodes.yaml  # gitignored, machine-specific
+./target/release/succinctly bench nodes --config nodes.yaml --status
+./target/release/succinctly bench sync --config nodes.yaml
+./target/release/succinctly bench orchestrate --config nodes.yaml --all --dry-run
+./target/release/succinctly bench report --current data/bench/distributed/<run_id> --baseline <prior-run>
 ```
 
 ### Multi-call Aliases
