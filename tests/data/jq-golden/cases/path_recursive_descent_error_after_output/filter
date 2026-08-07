@@ -1,0 +1,1 @@
+path(..) as $p | if (getpath($p)|type)=="string" then error("boom") else $p end
