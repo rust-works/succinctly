@@ -21224,10 +21224,47 @@ mod tests {
     }
 
     #[test]
+    fn test_format_csv_multibyte_boundary_647() {
+        // Regression for #647's investigated byte-oriented rewrite of the
+        // quote scan: a multi-byte character directly adjacent to a `"`
+        // byte, in either order, must not attempt an invalid slice.
+        query!(br#"["\u00e9\"b"]"#, "@csv",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "\"é\"\"b\"");
+            }
+        );
+
+        query!(br#"["\"\u00e9"]"#, "@csv",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "\"\"\"é\"");
+            }
+        );
+    }
+
+    #[test]
     fn test_format_tsv() {
         query!(br#"["a", "b", "c"]"#, "@tsv",
             QueryResult::Owned(OwnedValue::String(s)) => {
                 assert_eq!(s, "a\tb\tc");
+            }
+        );
+    }
+
+    #[test]
+    fn test_format_tsv_escapes_all_four_chars_647() {
+        // #647's investigated single-pass rewrite replaced four chained
+        // `.replace()` calls; this pins that all four escapes still fire
+        // together, including adjacent escapes with no safe span between
+        // them, regardless of which implementation is in place.
+        query!(br#"["a\\b\tc\nd\re"]"#, "@tsv",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, r"a\\b\tc\nd\re");
+            }
+        );
+
+        query!(br#"["\t\n\r\\"]"#, "@tsv",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, r"\t\n\r\\");
             }
         );
     }
@@ -21334,6 +21371,31 @@ mod tests {
         query!(br#""it's a test""#, "@sh",
             QueryResult::Owned(OwnedValue::String(s)) => {
                 assert_eq!(s, "'it'\\''s a test'");
+            }
+        );
+    }
+
+    #[test]
+    fn test_format_sh_multibyte_boundary_647() {
+        // Regression for #647's investigated byte-oriented rewrite of the
+        // quote scan: a multi-byte character directly adjacent to a `'`
+        // byte, in either order, must not attempt an invalid slice.
+        query!(br#""\u00e9'b""#, "@sh",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "'é'\\''b'");
+            }
+        );
+
+        query!(br#""'\u00e9""#, "@sh",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "''\\''é'");
+            }
+        );
+
+        // Array form exercises per-element @sh formatting.
+        query!(br#"["it's", "caf\u00e9", 1, true, null]"#, "@sh",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "'it'\\''s' 'café' 1 true null");
             }
         );
     }
