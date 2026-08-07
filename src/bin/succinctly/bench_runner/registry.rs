@@ -73,8 +73,35 @@ impl fmt::Display for BenchmarkType {
     }
 }
 
+/// Isolation requirement for orchestrated (multi-node) execution (issue #98).
+///
+/// Every benchmark here is timing/RSS-sensitive, so the registry default is
+/// `Exclusive`; `nodes.yaml`'s `benchmarks[].isolation` overrides loosen
+/// specific benchmarks to `Concurrent` on beefy nodes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Isolation {
+    /// Needs the whole node — no other benchmark runs alongside it.
+    Exclusive,
+    /// May share the node with other `Concurrent` benchmarks.
+    Concurrent,
+}
+
+impl fmt::Display for Isolation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // `f.pad(..)`, not `write!(f, ..)` — the latter would silently
+        // ignore width/alignment specifiers like `{:<10}` (see Architecture's
+        // Display impl in orchestrate/config.rs for the same fix, caught by
+        // a real `bench nodes --status` misalignment).
+        f.pad(match self {
+            Self::Exclusive => "exclusive",
+            Self::Concurrent => "concurrent",
+        })
+    }
+}
+
 /// Benchmark metadata.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BenchmarkInfo {
     /// Unique identifier (e.g., "rank_select", "yaml_bench")
     pub name: &'static str,
@@ -90,6 +117,9 @@ pub struct BenchmarkInfo {
     pub cli_subcommand: Option<&'static str>,
     /// Working directory (relative to repo root)
     pub working_dir: &'static str,
+    /// Default orchestration isolation (issue #98); overridable per-name via
+    /// `nodes.yaml`'s `benchmarks[].isolation`.
+    pub default_isolation: Isolation,
 }
 
 /// Static registry of all benchmarks.
@@ -103,6 +133,7 @@ pub static BENCHMARKS: &[BenchmarkInfo] = &[
         criterion_name: Some("rank_select"),
         cli_subcommand: None,
         working_dir: ".",
+        default_isolation: Isolation::Exclusive,
     },
     BenchmarkInfo {
         name: "balanced_parens",
@@ -112,6 +143,7 @@ pub static BENCHMARKS: &[BenchmarkInfo] = &[
         criterion_name: Some("balanced_parens"),
         cli_subcommand: None,
         working_dir: ".",
+        default_isolation: Isolation::Exclusive,
     },
     BenchmarkInfo {
         name: "bp_select_micro",
@@ -121,6 +153,7 @@ pub static BENCHMARKS: &[BenchmarkInfo] = &[
         criterion_name: Some("bp_select_micro"),
         cli_subcommand: None,
         working_dir: ".",
+        default_isolation: Isolation::Exclusive,
     },
     BenchmarkInfo {
         name: "elias_fano",
@@ -130,6 +163,7 @@ pub static BENCHMARKS: &[BenchmarkInfo] = &[
         criterion_name: Some("elias_fano"),
         cli_subcommand: None,
         working_dir: ".",
+        default_isolation: Isolation::Exclusive,
     },
     BenchmarkInfo {
         name: "popcount_strategies",
@@ -139,6 +173,7 @@ pub static BENCHMARKS: &[BenchmarkInfo] = &[
         criterion_name: Some("popcount_strategies"),
         cli_subcommand: None,
         working_dir: ".",
+        default_isolation: Isolation::Exclusive,
     },
     BenchmarkInfo {
         name: "neon_movemask",
@@ -148,6 +183,7 @@ pub static BENCHMARKS: &[BenchmarkInfo] = &[
         criterion_name: Some("neon_movemask"),
         cli_subcommand: None,
         working_dir: ".",
+        default_isolation: Isolation::Exclusive,
     },
     // ========== JSON ==========
     BenchmarkInfo {
@@ -158,6 +194,7 @@ pub static BENCHMARKS: &[BenchmarkInfo] = &[
         criterion_name: Some("json_pipeline"),
         cli_subcommand: None,
         working_dir: ".",
+        default_isolation: Isolation::Exclusive,
     },
     BenchmarkInfo {
         name: "json_simd_indexing",
@@ -167,6 +204,7 @@ pub static BENCHMARKS: &[BenchmarkInfo] = &[
         criterion_name: Some("json_simd_indexing"),
         cli_subcommand: None,
         working_dir: ".",
+        default_isolation: Isolation::Exclusive,
     },
     BenchmarkInfo {
         name: "json_simd_cursor",
@@ -176,6 +214,7 @@ pub static BENCHMARKS: &[BenchmarkInfo] = &[
         criterion_name: Some("json_simd_cursor"),
         cli_subcommand: None,
         working_dir: ".",
+        default_isolation: Isolation::Exclusive,
     },
     BenchmarkInfo {
         name: "json_simd_full",
@@ -185,6 +224,7 @@ pub static BENCHMARKS: &[BenchmarkInfo] = &[
         criterion_name: Some("json_simd_full"),
         cli_subcommand: None,
         working_dir: ".",
+        default_isolation: Isolation::Exclusive,
     },
     BenchmarkInfo {
         name: "pfsm_vs_simd",
@@ -194,6 +234,7 @@ pub static BENCHMARKS: &[BenchmarkInfo] = &[
         criterion_name: Some("pfsm_vs_simd"),
         cli_subcommand: None,
         working_dir: ".",
+        default_isolation: Isolation::Exclusive,
     },
     BenchmarkInfo {
         name: "pfsm_vs_scalar",
@@ -203,6 +244,7 @@ pub static BENCHMARKS: &[BenchmarkInfo] = &[
         criterion_name: Some("pfsm_vs_scalar"),
         cli_subcommand: None,
         working_dir: ".",
+        default_isolation: Isolation::Exclusive,
     },
     BenchmarkInfo {
         name: "jq_comparison",
@@ -212,6 +254,7 @@ pub static BENCHMARKS: &[BenchmarkInfo] = &[
         criterion_name: Some("jq_comparison"),
         cli_subcommand: None,
         working_dir: ".",
+        default_isolation: Isolation::Exclusive,
     },
     BenchmarkInfo {
         name: "jq_string_ops_bench",
@@ -221,6 +264,7 @@ pub static BENCHMARKS: &[BenchmarkInfo] = &[
         criterion_name: Some("jq_string_ops_bench"),
         cli_subcommand: None,
         working_dir: ".",
+        default_isolation: Isolation::Exclusive,
     },
     BenchmarkInfo {
         name: "jq_bench",
@@ -230,6 +274,7 @@ pub static BENCHMARKS: &[BenchmarkInfo] = &[
         criterion_name: None,
         cli_subcommand: Some("jq"),
         working_dir: ".",
+        default_isolation: Isolation::Exclusive,
     },
     BenchmarkInfo {
         name: "json_validate_bench",
@@ -239,6 +284,7 @@ pub static BENCHMARKS: &[BenchmarkInfo] = &[
         criterion_name: Some("json_validate_bench"),
         cli_subcommand: None,
         working_dir: ".",
+        default_isolation: Isolation::Exclusive,
     },
     // ========== YAML ==========
     BenchmarkInfo {
@@ -249,6 +295,7 @@ pub static BENCHMARKS: &[BenchmarkInfo] = &[
         criterion_name: Some("yaml_bench"),
         cli_subcommand: None,
         working_dir: ".",
+        default_isolation: Isolation::Exclusive,
     },
     BenchmarkInfo {
         name: "yaml_anchor_micro",
@@ -258,6 +305,7 @@ pub static BENCHMARKS: &[BenchmarkInfo] = &[
         criterion_name: Some("yaml_anchor_micro"),
         cli_subcommand: None,
         working_dir: ".",
+        default_isolation: Isolation::Exclusive,
     },
     BenchmarkInfo {
         name: "yaml_transcode_micro",
@@ -267,6 +315,7 @@ pub static BENCHMARKS: &[BenchmarkInfo] = &[
         criterion_name: Some("yaml_transcode_micro"),
         cli_subcommand: None,
         working_dir: ".",
+        default_isolation: Isolation::Exclusive,
     },
     BenchmarkInfo {
         name: "yaml_type_stack_micro",
@@ -276,6 +325,7 @@ pub static BENCHMARKS: &[BenchmarkInfo] = &[
         criterion_name: Some("yaml_type_stack_micro"),
         cli_subcommand: None,
         working_dir: ".",
+        default_isolation: Isolation::Exclusive,
     },
     BenchmarkInfo {
         name: "yq_comparison",
@@ -285,6 +335,7 @@ pub static BENCHMARKS: &[BenchmarkInfo] = &[
         criterion_name: Some("yq_comparison"),
         cli_subcommand: None,
         working_dir: ".",
+        default_isolation: Isolation::Exclusive,
     },
     BenchmarkInfo {
         name: "yq_select",
@@ -294,6 +345,7 @@ pub static BENCHMARKS: &[BenchmarkInfo] = &[
         criterion_name: Some("yq_select"),
         cli_subcommand: None,
         working_dir: ".",
+        default_isolation: Isolation::Exclusive,
     },
     BenchmarkInfo {
         name: "yq_bench",
@@ -303,6 +355,7 @@ pub static BENCHMARKS: &[BenchmarkInfo] = &[
         criterion_name: None,
         cli_subcommand: Some("yq"),
         working_dir: ".",
+        default_isolation: Isolation::Exclusive,
     },
     // ========== DSV ==========
     BenchmarkInfo {
@@ -313,6 +366,7 @@ pub static BENCHMARKS: &[BenchmarkInfo] = &[
         criterion_name: Some("dsv_bench"),
         cli_subcommand: None,
         working_dir: ".",
+        default_isolation: Isolation::Exclusive,
     },
     BenchmarkInfo {
         name: "dsv_cli",
@@ -322,6 +376,7 @@ pub static BENCHMARKS: &[BenchmarkInfo] = &[
         criterion_name: None,
         cli_subcommand: Some("dsv"),
         working_dir: ".",
+        default_isolation: Isolation::Exclusive,
     },
     // ========== TEXT ==========
     BenchmarkInfo {
@@ -332,6 +387,7 @@ pub static BENCHMARKS: &[BenchmarkInfo] = &[
         criterion_name: Some("line_index"),
         cli_subcommand: None,
         working_dir: ".",
+        default_isolation: Isolation::Exclusive,
     },
     BenchmarkInfo {
         name: "utf8_validate_bench",
@@ -341,6 +397,7 @@ pub static BENCHMARKS: &[BenchmarkInfo] = &[
         criterion_name: Some("utf8_validate_bench"),
         cli_subcommand: None,
         working_dir: ".",
+        default_isolation: Isolation::Exclusive,
     },
     BenchmarkInfo {
         name: "utf8_bench",
@@ -350,6 +407,7 @@ pub static BENCHMARKS: &[BenchmarkInfo] = &[
         criterion_name: None,
         cli_subcommand: Some("utf8"),
         working_dir: ".",
+        default_isolation: Isolation::Exclusive,
     },
     // ========== CORPUS ==========
     BenchmarkInfo {
@@ -360,6 +418,7 @@ pub static BENCHMARKS: &[BenchmarkInfo] = &[
         criterion_name: None,
         cli_subcommand: Some("corpus-stats"),
         working_dir: ".",
+        default_isolation: Isolation::Exclusive,
     },
     // ========== CROSS-PARSER ==========
     BenchmarkInfo {
@@ -370,6 +429,7 @@ pub static BENCHMARKS: &[BenchmarkInfo] = &[
         criterion_name: Some("json_parsers"),
         cli_subcommand: None,
         working_dir: "bench-compare",
+        default_isolation: Isolation::Exclusive,
     },
     BenchmarkInfo {
         name: "yaml_parsers",
@@ -379,6 +439,7 @@ pub static BENCHMARKS: &[BenchmarkInfo] = &[
         criterion_name: Some("yaml_parsers"),
         cli_subcommand: None,
         working_dir: "bench-compare",
+        default_isolation: Isolation::Exclusive,
     },
     BenchmarkInfo {
         name: "succinct_libs",
@@ -388,6 +449,7 @@ pub static BENCHMARKS: &[BenchmarkInfo] = &[
         criterion_name: Some("succinct_libs"),
         cli_subcommand: None,
         working_dir: "bench-compare",
+        default_isolation: Isolation::Exclusive,
     },
 ];
 
