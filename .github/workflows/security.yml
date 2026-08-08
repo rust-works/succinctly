@@ -75,4 +75,7 @@ jobs:
       - name: TruffleHog (verified secrets)
         uses: trufflesecurity/trufflehog@main
         with:
-          extra_args: --only-verified
+          # lob excluded: its key-shape regex (test_/live_ + alnum) coincidentally
+          # matches Rust test fn names like `test_array_keys_unsorted_lazy_output_684`,
+          # and Lob's test-mode verification API "verifies" them regardless (#688).
+          extra_args: --only-verified --exclude-detectors=lob
