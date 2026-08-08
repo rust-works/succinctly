@@ -335,6 +335,12 @@ struct BenchJqArgs {
     #[arg(short, long, default_value = "all")]
     sizes: String,
 
+    /// Query types to benchmark (comma-separated, or "all")
+    /// Available: identity (.), keys_unsorted, keys_unsorted_length,
+    /// keys_unsorted_map, keys_unsorted_select, map, select
+    #[arg(short, long, default_value = "identity")]
+    queries: String,
+
     /// Number of warmup runs before benchmarking
     #[arg(long, default_value = "1")]
     warmup: usize,
@@ -1482,10 +1488,27 @@ fn run_jq_benchmark(args: BenchJqArgs) -> Result<()> {
             .collect()
     };
 
+    // Parse query types
+    let queries: Vec<jq_bench::QueryType> = if args.queries == "all" {
+        jq_bench::QueryType::all().to_vec()
+    } else {
+        args.queries
+            .split(',')
+            .filter_map(|s| jq_bench::QueryType::from_str(s.trim()))
+            .collect()
+    };
+
+    if queries.is_empty() {
+        anyhow::bail!(
+            "No valid query types specified. Available: identity, keys_unsorted, keys_unsorted_length, keys_unsorted_map, keys_unsorted_select, map, select"
+        );
+    }
+
     let config = jq_bench::BenchConfig {
         data_dir: args.data_dir,
         patterns,
         sizes,
+        queries,
         succinctly_binary: args.binary,
         warmup_runs: args.warmup,
         benchmark_runs: args.runs,
