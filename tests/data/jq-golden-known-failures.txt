@@ -104,9 +104,13 @@
 # first-encountered entry's whole subtree completes before the next
 # sibling is touched, matching jq exactly. Leaving 6.
 
-reduce_multi_output_init       reduce             a multi-output reduce INIT forks in jq; only the first init output is used — #534
-foreach_multi_output_init      foreach            a multi-output foreach INIT forks in jq; only the first init output is used — #534
-reduce_update_zero_output      reduce             a comma in reduce's UPDATE clause is a compile error; jq keeps only UPDATE's last output as the new state, discarding earlier ones — #534
-foreach_extract_fanout         foreach            a comma in foreach's EXTRACT clause is a compile error; jq emits once per EXTRACT output instead of collapsing to one — #534
-while_backtrack                while              a comma in while's update expression is a compile error; jq backtracks through every fork of the condition/update chain — #534
-until_backtrack                until              a comma in until's update expression is a compile error; jq backtracks through every fork of the condition/update chain — #534
+# #534 fixed: `reduce`/`foreach`/`while`/`until` now implement jq's real
+# per-output fanout/fold for INIT/UPDATE/COND/EXTRACT instead of assuming a
+# single output (#681 traced it to two shared choke points,
+# `eval_owned_expr_ctrl` and `result_to_owned`, replaced here by
+# `eval_owned_expr_fork`/`finish_fork`). `reduce_multi_output_init`,
+# `foreach_multi_output_init`, `reduce_update_zero_output`,
+# `foreach_extract_fanout`, `while_backtrack` and `until_backtrack` all now
+# match jq, and the `parser.rs` restriction to `parse_pipe_no_comma()` for
+# these four constructs' INIT/UPDATE/COND/EXTRACT slots is lifted back to
+# `parse_expr()`, dropping the file to 0.

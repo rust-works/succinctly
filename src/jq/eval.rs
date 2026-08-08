@@ -973,6 +973,51 @@ fn partial<'a, W>(prefix: Vec<OwnedValue>, control: Control) -> QueryResult<'a, 
     }
 }
 
+/// Evaluate `expr` against an owned `input`, returning every output it
+/// produces instead of collapsing them, plus any terminating `Control`
+/// (#534). Thin wrapper over [`eval_owned_input`], which already keeps
+/// `Many`/`ManyOwned`/`Partial` intact instead of folding — this just
+/// unpacks its `QueryResult` into the `(outputs, trailing control)` shape
+/// `reduce`/`foreach`/`while`/`until` build their fold/fork logic on top of.
+fn eval_owned_expr_fork<S: EvalSemantics>(
+    expr: &Expr,
+    input: &OwnedValue,
+    optional: bool,
+) -> (Vec<OwnedValue>, Option<Control>) {
+    match eval_owned_input::<Vec<u64>, S>(expr, input, optional) {
+        QueryResult::Owned(v) => (vec![v], None),
+        QueryResult::ManyOwned(vs) => (vs, None),
+        QueryResult::None => (Vec::new(), None),
+        QueryResult::Error(e) => (Vec::new(), Some(Control::Error(e))),
+        QueryResult::Break(label) => (Vec::new(), Some(Control::Break(label))),
+        QueryResult::Partial(vs, control) => (vs, Some(control)),
+        QueryResult::One(_) | QueryResult::OneCursor(_) | QueryResult::Many(_) => {
+            unreachable!(
+                "eval_owned_input always normalizes to Owned/ManyOwned/None/Error/Break/Partial"
+            )
+        }
+    }
+}
+
+/// Finalize a fork/fold construct's accumulated `outputs`, given an optional
+/// terminating `Control` (#534). Mirrors `partial()`'s "outputs already
+/// produced don't vanish" contract (#400, #494), plus `?`'s: verified
+/// against jq, `(1, error("x"), 2)?` still emits `1` — an optional context
+/// keeps a construct's own legitimate prior output and only silences the
+/// trailing error, it does not discard everything. A `Break` is never
+/// caught by `?`, so it always propagates via `partial`.
+fn finish_fork<'a, W>(
+    outputs: Vec<OwnedValue>,
+    control: Option<Control>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    match control {
+        None => owned_vec_to_result(outputs),
+        Some(Control::Error(_)) if optional => owned_vec_to_result(outputs),
+        Some(control) => partial(outputs, control),
+    }
+}
+
 /// Splice `prefix` in front of whatever `result` yields.
 ///
 /// Used by `try`/`catch` (#400): the body's outputs before the error, then
@@ -9884,29 +9929,58 @@ fn eval_reduce<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         QueryResult::Partial(_prefix, Control::Break(label)) => return QueryResult::Break(label),
     };
 
-    // Evaluate initial accumulator
+    // Evaluate INIT. Each of its outputs forks the whole reduce into a fully
+    // independent execution over `input_values` (#534): `reduce (1,2) as $x
+    // ((10,20); .+$x)` is `13`, `23`, one result per INIT output. A `Partial`
+    // INIT stream still forks over the prefix it did produce, mirroring
+    // `eval_reduce`'s own optional-aware policy on its `input` stream above.
     let init_result = eval_single::<W, S>(init, value.clone(), optional);
-    let mut acc = match result_to_owned(init_result) {
-        Ok(v) => v,
-        Err(_) if optional => return QueryResult::None,
-        Err(e) => return QueryResult::Error(e),
-    };
+    let (init_values, init_control): (Vec<OwnedValue>, Option<Control>) =
+        match init_result.materialize_cursor() {
+            QueryResult::One(v) => (vec![to_owned(&v)], None),
+            QueryResult::OneCursor(_) => unreachable!(),
+            QueryResult::Many(vs) => (vs.iter().map(to_owned).collect(), None),
+            QueryResult::Owned(v) => (vec![v], None),
+            QueryResult::ManyOwned(vs) => (vs, None),
+            QueryResult::None => (Vec::new(), None),
+            QueryResult::Error(_) if optional => return QueryResult::None,
+            QueryResult::Error(e) => return QueryResult::Error(e),
+            QueryResult::Break(label) => return QueryResult::Break(label),
+            QueryResult::Partial(_, Control::Error(_)) if optional => return QueryResult::None,
+            QueryResult::Partial(vs, control) => (vs, Some(control)),
+        };
 
-    // For each input value, update the accumulator
-    for input_val in input_values {
-        // Substitute $var in update, then evaluate with acc as input
-        let substituted = substitute_var(update, var, &input_val);
-        // We need to evaluate with acc as the input
-        let acc_result = eval_owned_expr_ctrl::<S>(&substituted, &acc, optional);
-        match acc_result {
-            Ok(new_acc) => acc = new_acc,
-            Err(Control::Error(_)) if optional => return QueryResult::None,
-            Err(Control::Error(e)) => return QueryResult::Error(e),
-            Err(Control::Break(label)) => return QueryResult::Break(label),
+    let mut outputs: Vec<OwnedValue> = Vec::new();
+    for init_val in init_values {
+        // The accumulator is a variable UPDATE rebinds; a step whose UPDATE
+        // produces zero outputs leaves it unbound rather than ending the
+        // fold — `None` here models that, read back as `null` (jq's
+        // `LOADVN`), not as "this fork produces nothing" (#534). Verified:
+        // `reduce (1,2) as $x (0; if $x==2 then empty else .+$x end)` is
+        // `null`, not empty output.
+        let mut acc: Option<OwnedValue> = Some(init_val);
+        let mut aborted: Option<Control> = None;
+        for input_val in &input_values {
+            let substituted = substitute_var(update, var, input_val);
+            let acc_input = acc.clone().unwrap_or(OwnedValue::Null);
+            let (update_vals, update_control) =
+                eval_owned_expr_fork::<S>(&substituted, &acc_input, optional);
+            // Only the last output of a multi-output UPDATE becomes the new
+            // accumulator — verified: `reduce (1,2) as $x (0; .+$x, .)` is
+            // `0`, not an error from folding an array.
+            acc = update_vals.into_iter().last();
+            if let Some(control) = update_control {
+                aborted = Some(control);
+                break;
+            }
+        }
+        match aborted {
+            Some(control) => return finish_fork(outputs, Some(control), optional),
+            None => outputs.push(acc.unwrap_or(OwnedValue::Null)),
         }
     }
 
-    QueryResult::Owned(acc)
+    finish_fork(outputs, init_control, optional)
 }
 
 /// Fast path for the handful of expr shapes that dominate the cost of
@@ -10130,42 +10204,78 @@ fn eval_foreach<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             QueryResult::Partial(vs, control) => (vs, Some(control)),
         };
 
-    // Evaluate initial state
+    // Evaluate INIT. Each of its outputs forks the whole foreach into a
+    // fully independent execution over `input_values` (#534): `[foreach
+    // (1,2) as $x ((10,20); .+$x)]` is `[11,13,21,23]`, the concatenation of
+    // one independent run per INIT output.
     let init_result = eval_single::<W, S>(init, value.clone(), optional);
-    let mut state = match result_to_owned(init_result) {
-        Ok(v) => v,
-        Err(e) => return QueryResult::Error(e),
-    };
+    let (init_values, init_control): (Vec<OwnedValue>, Option<Control>) =
+        match init_result.materialize_cursor() {
+            QueryResult::One(v) => (vec![to_owned(&v)], None),
+            QueryResult::OneCursor(_) => unreachable!(),
+            QueryResult::Many(vs) => (vs.iter().map(to_owned).collect(), None),
+            QueryResult::Owned(v) => (vec![v], None),
+            QueryResult::ManyOwned(vs) => (vs, None),
+            QueryResult::None => (Vec::new(), None),
+            QueryResult::Error(e) => return QueryResult::Error(e),
+            QueryResult::Break(label) => return QueryResult::Break(label),
+            QueryResult::Partial(vs, control) => (vs, Some(control)),
+        };
 
     let mut outputs: Vec<OwnedValue> = Vec::new();
-
-    for input_val in input_values {
-        // Substitute $var and evaluate update with state as input
-        let substituted_update = substitute_var(update, var, &input_val);
-        match eval_owned_expr_ctrl::<S>(&substituted_update, &state, optional) {
-            Ok(new_state) => {
-                state = new_state;
-                // If there's an extract expression, evaluate it
+    for init_val in init_values {
+        // The state is a variable UPDATE rebinds; a step whose UPDATE
+        // produces zero outputs leaves it unbound rather than ending the
+        // loop — `None` here models that, read back as `null` (jq's
+        // `LOADVN`), same rule as `reduce` (#534).
+        let mut state: Option<OwnedValue> = Some(init_val);
+        let mut aborted: Option<Control> = None;
+        'input: for input_val in &input_values {
+            let substituted_update = substitute_var(update, var, input_val);
+            let state_input = state.clone().unwrap_or(OwnedValue::Null);
+            let (update_vals, update_control) =
+                eval_owned_expr_fork::<S>(&substituted_update, &state_input, optional);
+            // EXTRACT (or the implicit identity when omitted) runs once per
+            // UPDATE output, fanning out independently of which output
+            // becomes the new state — verified: `[foreach (1,2) as $x (0;
+            // .+$x, .*100)]` is `[1,0,2,0]`.
+            for update_val in &update_vals {
                 if let Some(ext) = extract {
-                    let substituted_extract = substitute_var(ext, var, &input_val);
-                    match eval_owned_expr_ctrl::<S>(&substituted_extract, &state, optional) {
-                        Ok(output) => outputs.push(output),
-                        // The steps already produced no longer vanish (#494).
-                        Err(control) => return partial(outputs, control),
+                    let substituted_extract = substitute_var(ext, var, input_val);
+                    let (ext_vals, ext_control) =
+                        eval_owned_expr_fork::<S>(&substituted_extract, update_val, optional);
+                    // The steps already produced no longer vanish (#494).
+                    outputs.extend(ext_vals);
+                    if let Some(control) = ext_control {
+                        aborted = Some(control);
+                        break 'input;
                     }
                 } else {
-                    // Without extract, output the current state
-                    outputs.push(state.clone());
+                    outputs.push(update_val.clone());
                 }
             }
-            Err(control) => return partial(outputs, control),
+            // Only the last output of a multi-output UPDATE carries forward
+            // as the new state for the next source element — verified:
+            // `[foreach (1) as $x (0; .+$x, .*100)]` is `[1,0]` (both
+            // extracted), but a following step would continue from `0`.
+            state = update_vals.into_iter().last();
+            if let Some(control) = update_control {
+                aborted = Some(control);
+                break;
+            }
+        }
+        if let Some(control) = aborted {
+            return finish_fork(outputs, Some(control), optional);
         }
     }
 
-    match input_control {
-        Some(control) => partial(outputs, control),
-        None => owned_vec_to_result(outputs),
-    }
+    // Neither stream's own trailing control is independently verified
+    // against jq when *both* fire alongside multi-way INIT forking — an
+    // untested corner case. `input_control` (the source stream) keeps
+    // priority as the pre-existing, already-established policy for this
+    // function; `init_control` is only reached once every INIT fork's own
+    // loop has finished without one of its own.
+    finish_fork(outputs, input_control.or(init_control), optional)
 }
 
 /// Evaluate `limit(n; expr)` - take first n outputs.
@@ -10377,77 +10487,148 @@ fn eval_nth_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     }
 }
 
+/// Total recursive fork budget for `while`/`until` (#534): shared across the
+/// whole backtracking tree (decremented once per state visited, regardless
+/// of branching), not per-branch, so the common non-forking case bounds
+/// total work to the same 10000-step cap the old flat loop used.
+const WHILE_UNTIL_MAX_STEPS: usize = 10000;
+
 /// Evaluate `until(cond; update)` - apply update until cond is true.
+///
+/// jq defines this as a backtracking generator (`def _until: if cond then .
+/// else (update | _until) end;`), so a multi-output `cond`/`update` forks
+/// the rest of the loop per output rather than folding to one value (#534) —
+/// see [`until_step`].
 fn eval_until<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     cond: &Expr,
     update: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    let mut current = to_owned(&value);
-    const MAX_ITERATIONS: usize = 10000;
+    let mut outputs: Vec<OwnedValue> = Vec::new();
+    let mut budget = WHILE_UNTIL_MAX_STEPS;
+    let result = until_step::<S>(
+        cond,
+        update,
+        to_owned(&value),
+        optional,
+        &mut outputs,
+        &mut budget,
+    );
+    finish_fork(outputs, result.err(), optional)
+}
 
-    for _ in 0..MAX_ITERATIONS {
-        // Check condition
-        match eval_owned_expr_ctrl::<S>(cond, &current, optional) {
-            Ok(cond_val) => {
-                if cond_val.is_truthy() {
-                    return QueryResult::Owned(current);
-                }
+/// Recursive step for [`eval_until`] (#534): `E(s) = if cond(s) is truthy:
+/// emit(s), stop this branch; else: fork over update(s)'s outputs,
+/// recursing into each`. `cond` itself can also produce more than one
+/// output — each runs its own independent branch against the same `state`,
+/// mirroring how ordinary `if...then...else...end` already forks over a
+/// multi-output condition elsewhere in this evaluator (verified: `[if
+/// (true,false) then "T" else "F" end]` is `["T","F"]`). Verified against
+/// jq: `[until(.>3; .+1,.+2)]` on `null` is `[4,5,4,4,5,4,5,4]`, matching
+/// this recursion hand-traced as a tree.
+fn until_step<S: EvalSemantics>(
+    cond: &Expr,
+    update: &Expr,
+    state: OwnedValue,
+    optional: bool,
+    outputs: &mut Vec<OwnedValue>,
+    budget: &mut usize,
+) -> Result<(), Control> {
+    if *budget == 0 {
+        return Err(Control::Error(EvalError::new(
+            "until: maximum iterations exceeded",
+        )));
+    }
+    *budget -= 1;
+
+    let (cond_vals, cond_control) = eval_owned_expr_fork::<S>(cond, &state, optional);
+    for cond_val in &cond_vals {
+        if cond_val.is_truthy() {
+            outputs.push(state.clone());
+        } else {
+            let (update_vals, update_control) = eval_owned_expr_fork::<S>(update, &state, optional);
+            for update_val in update_vals {
+                until_step::<S>(cond, update, update_val, optional, outputs, budget)?;
             }
-            Err(Control::Error(e)) => return QueryResult::Error(e),
-            Err(Control::Break(label)) => return QueryResult::Break(label),
-        }
-
-        // Apply update
-        match eval_owned_expr_ctrl::<S>(update, &current, optional) {
-            Ok(new_val) => current = new_val,
-            Err(Control::Error(e)) => return QueryResult::Error(e),
-            Err(Control::Break(label)) => return QueryResult::Break(label),
+            if let Some(control) = update_control {
+                return Err(control);
+            }
         }
     }
-
-    QueryResult::Error(EvalError::new("until: maximum iterations exceeded"))
+    match cond_control {
+        Some(control) => Err(control),
+        None => Ok(()),
+    }
 }
 
 /// Evaluate `while(cond; update)` - output values while cond is true.
+///
+/// jq defines this as a backtracking generator (`def _while: if cond then
+/// ., (update | _while) else empty end;`), so a multi-output `cond`/`update`
+/// forks the rest of the loop per output rather than folding to one value
+/// (#534) — see [`while_step`].
 fn eval_while<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     cond: &Expr,
     update: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    let mut current = to_owned(&value);
     let mut outputs: Vec<OwnedValue> = Vec::new();
-    const MAX_ITERATIONS: usize = 10000;
+    let mut budget = WHILE_UNTIL_MAX_STEPS;
+    let result = while_step::<S>(
+        cond,
+        update,
+        to_owned(&value),
+        optional,
+        &mut outputs,
+        &mut budget,
+    );
+    finish_fork(outputs, result.err(), optional)
+}
 
-    for _ in 0..MAX_ITERATIONS {
-        // Check condition
-        match eval_owned_expr_ctrl::<S>(cond, &current, optional) {
-            Ok(cond_val) => {
-                if !cond_val.is_truthy() {
-                    break;
-                }
+/// Recursive step for [`eval_while`] (#534): `E(s) = if cond(s) is truthy:
+/// emit(s), then fork over update(s)'s outputs, recursing into each; else:
+/// nothing`. See [`until_step`] for the `cond`-forking rationale, shared
+/// here. Verified against jq: `[while(.<3; .+1,.+2)]` on `null` is
+/// `[null,1,2,2]`, matching this recursion hand-traced as a tree.
+fn while_step<S: EvalSemantics>(
+    cond: &Expr,
+    update: &Expr,
+    state: OwnedValue,
+    optional: bool,
+    outputs: &mut Vec<OwnedValue>,
+    budget: &mut usize,
+) -> Result<(), Control> {
+    if *budget == 0 {
+        // Matches this construct's own pre-existing cap; previously a
+        // silent truncation with no error at all, but now goes through
+        // `finish_fork` at the call site like every other termination
+        // cause, so `outputs` gathered before the cap no longer vanish
+        // (deliberate minor behavior change — not pinned by any test).
+        return Err(Control::Error(EvalError::new(
+            "while: maximum iterations exceeded",
+        )));
+    }
+    *budget -= 1;
+
+    let (cond_vals, cond_control) = eval_owned_expr_fork::<S>(cond, &state, optional);
+    for cond_val in &cond_vals {
+        if cond_val.is_truthy() {
+            outputs.push(state.clone());
+            let (update_vals, update_control) = eval_owned_expr_fork::<S>(update, &state, optional);
+            for update_val in update_vals {
+                while_step::<S>(cond, update, update_val, optional, outputs, budget)?;
             }
-            // The values already output no longer vanish (#494), and a
-            // `break $label` inside `cond` reaches its enclosing `label`
-            // instead of degrading into a synthetic error (#575).
-            // `while(. < 5; if . == 3 then error("boom") else .+1 end)` on
-            // `1` is `1`, `2`, `3`, then the error.
-            Err(control) => return partial(outputs, control),
-        }
-
-        // Output current value
-        outputs.push(current.clone());
-
-        // Apply update
-        match eval_owned_expr_ctrl::<S>(update, &current, optional) {
-            Ok(new_val) => current = new_val,
-            Err(control) => return partial(outputs, control),
+            if let Some(control) = update_control {
+                return Err(control);
+            }
         }
     }
-
-    owned_vec_to_result(outputs)
+    match cond_control {
+        Some(control) => Err(control),
+        None => Ok(()),
+    }
 }
 
 /// Evaluate `repeat(expr)` - repeatedly evaluate expr with the original input.
@@ -19583,27 +19764,36 @@ mod tests {
         );
         assert_collapses_to_break(b"null", "foreach (break $out) as $x (0; .+$x)");
 
-        // A multi-output UPDATE collapses to a single state — one output stays
-        // itself, several become an array — and the `Partial`'s trailing
-        // control is dropped, the same as a multi-output update has always
-        // been folded (a pre-existing limitation, not #400/#494's concern).
-        assert_eq!(
-            outputs(b"null", r#"foreach (1,2) as $x (0; (.+$x, error("q")))"#),
-            ["1", "3"]
-        );
-        query!(b"null", r#"foreach (1,2) as $x (0; (.+$x, .+100, error("q")))"#,
+        // A multi-output UPDATE fans out — each output is extracted on its
+        // own via the implicit identity EXTRACT — instead of folding into a
+        // single collapsed array, and a `Partial` UPDATE's trailing error
+        // still surfaces once the outputs it did produce are recorded
+        // (#534). Verified against jq 1.7.1: `1`, then the error, since the
+        // error happens mid-step (before `foreach` ever reaches $x=2).
+        query!(b"null", r#"foreach (1,2) as $x (0; (.+$x, error("q")))"#,
             QueryResult::Partial(vs, Control::Error(e)) => {
-                assert_eq!(prefix_json(&vs), ["[1,100]"]);
-                // The folded array is then what the *next* step adds to,
-                // which is where this one actually fails.
-                assert!(e.message.contains("cannot be added"), "{}", e.message);
+                assert_eq!(prefix_json(&vs), ["1"]);
+                assert_eq!(e.message, "q");
             }
         );
-        // A `Partial` INIT keeps only its first output, like any multi-output
-        // init (#534, separate).
-        assert_eq!(
-            outputs(b"null", r#"foreach (1,2) as $x ((0,error("i")); .+$x)"#),
-            ["1", "3"]
+        // Verified against jq 1.7.1: `1`, `100`, then the error — both of
+        // UPDATE's successful outputs are extracted individually, not
+        // folded into `[1,100]` first.
+        query!(b"null", r#"foreach (1,2) as $x (0; (.+$x, .+100, error("q")))"#,
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(prefix_json(&vs), ["1", "100"]);
+                assert_eq!(e.message, "q");
+            }
+        );
+        // A `Partial` INIT forks over every output it did produce before
+        // erroring — here just the one, `0` — and that fork's own complete
+        // output is kept ahead of INIT's own deferred error (#534). Verified
+        // against jq 1.7.1: `1`, `3`, then the error.
+        query!(b"null", r#"foreach (1,2) as $x ((0,error("i")); .+$x)"#,
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(prefix_json(&vs), ["1", "3"]);
+                assert_eq!(e.message, "i");
+            }
         );
 
         // A failing EXTRACT keeps the steps already emitted, the same as a
