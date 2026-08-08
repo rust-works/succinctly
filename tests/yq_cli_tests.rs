@@ -4154,3 +4154,33 @@ fn test_keys_unsorted_yaml_materialize_fallback_140() -> Result<()> {
 // against a YAML value directly (bypassing the `yq` CLI's parser dialect) by
 // `test_yaml_keys_sorted_lazy_length` in `eval_generic.rs`'s unit tests, to
 // prove the `Pipe` dispatch fast path is generic over `V: DocumentValue`.
+
+/// Array `keys`/`keys_unsorted` gained the same lazy `GenericResult` fast
+/// paths as the object case (#684), and hits the same YAML-side materialize
+/// fallback as `test_keys_unsorted_yaml_materialize_fallback_140` above.
+#[test]
+fn test_array_keys_unsorted_yaml_materialize_fallback_684() -> Result<()> {
+    let input = "- x\n- y\n- z\n";
+
+    let (output, code) = run_yq_stdin("keys", input, &["-o", "json", "-I0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "[0,1,2]");
+
+    let (output, code) = run_yq_stdin("keys_unsorted", input, &["-o", "json", "-I0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "[0,1,2]");
+
+    let (output, code) = run_yq_stdin("keys_unsorted | length", input, &["-o", "json", "-I0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "3");
+
+    let (output, code) = run_yq_stdin("keys_unsorted | .[0]", input, &["-o", "json", "-I0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "0");
+
+    let (output, code) = run_yq_stdin("keys_unsorted | last", input, &["-o", "json", "-I0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "2");
+
+    Ok(())
+}

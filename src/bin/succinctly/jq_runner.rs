@@ -1608,6 +1608,11 @@ fn evaluate_input(
                 keys.into_iter().map(OwnedValue::String).collect(),
             )])
         }
+        // Same reasoning as `LazyKeys` above, for array `keys`/
+        // `keys_unsorted` (#684).
+        GenericResult::LazyIndexRange(len) => Ok(vec![OwnedValue::Array(
+            (0..len).map(|i| OwnedValue::Int(i as i64)).collect(),
+        )]),
         GenericResult::None => Ok(vec![]),
         GenericResult::Error(e) => {
             sink.report(DiagStyle::Jq, &e, at);
@@ -1691,6 +1696,11 @@ fn generic_result_to_jq_values<'a, W: Clone + AsRef<[u64]>>(
                 keys.into_iter().map(OwnedValue::String).collect(),
             ))]
         }
+        // Same reasoning as `LazyKeys` above, for array `keys`/
+        // `keys_unsorted` (#684).
+        GenericResult::LazyIndexRange(len) => vec![JqValue::from_owned(OwnedValue::Array(
+            (0..len).map(|i| OwnedValue::Int(i as i64)).collect(),
+        ))],
         GenericResult::None => vec![],
         GenericResult::Error(e) => {
             sink.report(DiagStyle::Jq, &e, at);
