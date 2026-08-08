@@ -408,6 +408,11 @@ fn evaluate_yaml_cursor<W: AsRef<[u64]> + Clone>(
         GenericResult::LazyKeysUnsorted(fields) => Ok(vec![OwnedValue::Array(
             fields.keys().into_iter().map(OwnedValue::String).collect(),
         )]),
+        // Same reasoning as `LazyKeysUnsorted` above, for array `keys`/
+        // `keys_unsorted` (#684).
+        GenericResult::LazyIndexRange(len) => Ok(vec![OwnedValue::Array(
+            (0..len).map(|i| OwnedValue::Int(i as i64)).collect(),
+        )]),
         GenericResult::None => Ok(vec![]),
         GenericResult::Error(e) => {
             sink.report(DiagStyle::Yq, &e, &no_location());

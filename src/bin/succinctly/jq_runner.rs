@@ -1601,6 +1601,11 @@ fn evaluate_input(
         GenericResult::LazyKeysUnsorted(fields) => Ok(vec![OwnedValue::Array(
             fields.keys().into_iter().map(OwnedValue::String).collect(),
         )]),
+        // Same reasoning as `LazyKeysUnsorted` above, for array `keys`/
+        // `keys_unsorted` (#684).
+        GenericResult::LazyIndexRange(len) => Ok(vec![OwnedValue::Array(
+            (0..len).map(|i| OwnedValue::Int(i as i64)).collect(),
+        )]),
         GenericResult::None => Ok(vec![]),
         GenericResult::Error(e) => {
             sink.report(DiagStyle::Jq, &e, at);
@@ -1667,6 +1672,14 @@ fn generic_result_to_jq_values<'a, W: Clone + AsRef<[u64]>>(
         // materializes a `Vec<String>` — `write_json`/`print_json` stream
         // each key's raw bytes straight from `fields`.
         GenericResult::LazyKeysUnsorted(fields) => vec![JqValue::LazyKeysArray(fields)],
+        // Fallback: materialize. This runner boundary never sees a
+        // fast-pathed `keys_unsorted | length`/`.[]`/`.[n]`/`first`/`last`
+        // — those are fully resolved inside the evaluator's `Pipe` dispatch
+        // before it gets here — so this only fires for `keys`/`keys_unsorted`
+        // alone, or piped into something else (`map`, `select`, ...).
+        GenericResult::LazyIndexRange(len) => vec![JqValue::from_owned(OwnedValue::Array(
+            (0..len).map(|i| OwnedValue::Int(i as i64)).collect(),
+        ))],
         GenericResult::None => vec![],
         GenericResult::Error(e) => {
             sink.report(DiagStyle::Jq, &e, at);
