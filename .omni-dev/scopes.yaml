@@ -15,6 +15,10 @@ scopes:
     description: "YAML semi-indexing and parsing"
     examples: ["yaml: add block scalar support", "yaml: fix anchor resolution"]
     file_patterns: ["src/yaml/**"]
+  - name: "xml"
+    description: "XML semi-indexing and parsing (xq milestone 1, issue #667)"
+    examples: ["xml: add attribute navigation", "xml: fix entity decoding"]
+    file_patterns: ["src/xml/**"]
   - name: "jq"
     description: "jq query language parser and evaluator"
     examples: ["jq: add array slicing", "jq: fix negative index"]

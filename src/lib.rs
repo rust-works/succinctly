@@ -98,6 +98,9 @@ pub mod yaml;
 /// Text processing utilities (UTF-8 validation, etc.).
 pub mod text;
 
+/// XML semi-indexing (milestone 1: element/attribute/text navigation).
+pub mod xml;
+
 // =============================================================================
 // Public re-exports (convenience + backward compatibility)
 // =============================================================================
