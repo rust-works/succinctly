@@ -199,6 +199,55 @@ fn test_key_of_an_unindexable_kind_errors_even_on_a_container() {
     );
 }
 
+/// #626: an array/object key *navigated* out of the document (as opposed to
+/// a literal `[...]`/`{...}` key, which is already `Owned` and never reaches
+/// this code) used to be fully deep-copied via `to_owned` just to discover
+/// it is the wrong kind. The error message only ever names the key's type,
+/// never its contents, so the fix (`to_owned_key_shape` in `eval.rs`)
+/// materializes a cheap empty placeholder for a container key instead —
+/// this pins that the placeholder still reports the correct type and that a
+/// scalar key navigated the same way is unaffected.
+#[test]
+fn test_navigated_container_key_errors_on_type_without_needing_its_contents() {
+    check(
+        r#"{"a":1,"obj":{"x":1,"y":2,"z":3}}"#,
+        ".[.obj]",
+        Outcome::error("Cannot index object with object"),
+    );
+    check(
+        r#"{"a":1,"arr":[1,2,3]}"#,
+        ".[.arr]",
+        Outcome::error("Cannot index object with array"),
+    );
+    // `?` still suppresses it, same as a literal container key does above.
+    check(r#"{"a":1,"obj":{"x":1}}"#, ".[.obj]?", Outcome::values(&[]));
+    // A navigated *scalar* key is unaffected — still the real value, not a
+    // placeholder.
+    check(r#"{"a":1,"k":"a"}"#, ".[.k]", Outcome::values(&["1"]));
+}
+
+/// Same pattern, `eval_slice_bound`'s twin fix: a bound navigated to a large
+/// container only ever needs to be told apart from a number, never read.
+#[test]
+fn test_navigated_container_slice_bound_errors_without_needing_its_contents() {
+    check(
+        r#"{"list":[1,2,3],"bound":{"x":1,"y":2}}"#,
+        ".list[.bound:2]",
+        Outcome::error("Array/string slice indices must be integers"),
+    );
+    check(
+        r#"{"list":[1,2,3],"bound":[9,9,9]}"#,
+        ".list[.bound:2]",
+        Outcome::error("Array/string slice indices must be integers"),
+    );
+    // A navigated numeric bound still resolves normally.
+    check(
+        r#"{"list":[1,2,3],"bound":1}"#,
+        ".list[.bound:]",
+        Outcome::values(&["[2,3]"]),
+    );
+}
+
 #[test]
 fn test_optional_suppresses_the_indexing_error_only() {
     // `?` covers the indexing, so a bad container or a bad key kind yields no
