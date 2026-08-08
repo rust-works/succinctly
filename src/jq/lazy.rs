@@ -92,6 +92,12 @@ pub enum JqValue<'a, W = Vec<u64>> {
     /// `print_json` stream each key's raw bytes straight from its cursor,
     /// so a bare `keys_unsorted` output never materializes a `Vec<String>`.
     LazyKeysArray(crate::json::light::JsonFields<'a, W>),
+
+    /// Lazy array-index range: `keys`/`keys_unsorted` on an array (#684).
+    /// `[0, 1, ..., len-1]` is fully determined by `len` alone, so
+    /// `write_json`/`print_json` write the digits directly — no
+    /// `Vec<OwnedValue::Int>`/`Vec<Self>` ever built.
+    LazyIndexRange(usize),
 }
 
 impl<'a, W: Clone + AsRef<[u64]>> JqValue<'a, W> {
@@ -246,6 +252,7 @@ impl<'a, W: Clone + AsRef<[u64]>> JqValue<'a, W> {
             JqValue::Array(_) => "array",
             JqValue::Object(_) => "object",
             JqValue::LazyKeysArray(_) => "array",
+            JqValue::LazyIndexRange(_) => "array",
         }
     }
 
@@ -332,6 +339,11 @@ impl<'a, W: Clone + AsRef<[u64]>> JqValue<'a, W> {
             // `keys_unsorted | length` reaching `JqValue` directly would
             // silently answer `None` instead of the field count.
             JqValue::LazyKeysArray(fields) => Some((*fields).count()),
+            // No wildcard covers this case either, for the same reason as
+            // `LazyKeysArray` above: without it, `keys_unsorted | length` on
+            // an array reaching `JqValue` directly would silently answer
+            // `None` instead of `len` (#684).
+            JqValue::LazyIndexRange(len) => Some(*len),
             JqValue::Cursor(c) => match c.value() {
                 StandardJson::Null => Some(0),
                 StandardJson::String(s) => s.as_str().ok().map(|s| s.chars().count()),
@@ -392,6 +404,7 @@ impl<'a, W: Clone + AsRef<[u64]>> JqValue<'a, W> {
                     .collect(),
             ),
             JqValue::LazyKeysArray(fields) => lazy_keys_array_to_owned(fields),
+            JqValue::LazyIndexRange(len) => lazy_index_range_to_owned(*len),
         }
     }
 
@@ -416,6 +429,7 @@ impl<'a, W: Clone + AsRef<[u64]>> JqValue<'a, W> {
                 OwnedValue::Object(obj.into_iter().map(|(k, v)| (k, v.into_owned())).collect())
             }
             JqValue::LazyKeysArray(fields) => lazy_keys_array_to_owned(&fields),
+            JqValue::LazyIndexRange(len) => lazy_index_range_to_owned(len),
         }
     }
 
@@ -541,6 +555,19 @@ impl<'a, W: Clone + AsRef<[u64]>> JqValue<'a, W> {
                 }
                 out.write_char(']')
             }
+            // Genuinely lazy, same convention as `LazyKeysArray` above: no
+            // `Vec<OwnedValue::Int>` ever built, just digits written
+            // straight to `out` (#684).
+            JqValue::LazyIndexRange(len) => {
+                out.write_char('[')?;
+                for i in 0..*len {
+                    if i > 0 {
+                        out.write_char(',')?;
+                    }
+                    write!(out, "{i}")?;
+                }
+                out.write_char(']')
+            }
         }
     }
 
@@ -573,6 +600,13 @@ fn lazy_keys_array_to_owned<W: Clone + AsRef<[u64]>>(
         current = rest;
     }
     OwnedValue::Array(keys)
+}
+
+/// Materialize a `JqValue::LazyIndexRange` into the `[0, 1, ..., len-1]`
+/// array it would have been all along (#684) — the escape hatch for
+/// consumers that need a materialized value.
+fn lazy_index_range_to_owned(len: usize) -> OwnedValue {
+    OwnedValue::Array((0..len).map(|i| OwnedValue::Int(i as i64)).collect())
 }
 
 /// Convert a JsonCursor to an OwnedValue (full materialization).
