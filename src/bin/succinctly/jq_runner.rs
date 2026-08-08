@@ -1696,11 +1696,10 @@ fn generic_result_to_jq_values<'a, W: Clone + AsRef<[u64]>>(
                 keys.into_iter().map(OwnedValue::String).collect(),
             ))]
         }
-        // Same reasoning as `LazyKeys` above, for array `keys`/
-        // `keys_unsorted` (#684).
-        GenericResult::LazyIndexRange(len) => vec![JqValue::from_owned(OwnedValue::Array(
-            (0..len).map(|i| OwnedValue::Int(i as i64)).collect(),
-        ))],
+        // Same laziness as `LazyKeys` above, for array `keys`/
+        // `keys_unsorted` (#684): `write_json`/`print_json` write the
+        // `[0,1,...,len-1]` digits directly, no `Vec<OwnedValue::Int>`.
+        GenericResult::LazyIndexRange(len) => vec![JqValue::LazyIndexRange(len)],
         GenericResult::None => vec![],
         GenericResult::Error(e) => {
             sink.report(DiagStyle::Jq, &e, at);
@@ -2268,6 +2267,37 @@ where
                             out.write_all(raw)?;
                         }
                     }
+                }
+                out.write_all(separator.as_bytes())?;
+                out.write_all(current_indent.as_bytes())?;
+                out.write_all(b"]")?;
+            }
+        }
+        // Genuinely lazy, same convention as `LazyKeysArray` above: no
+        // `Vec<OwnedValue::Int>`/child `JqValue`s ever built, just ASCII
+        // digits written straight to `out` (#684).
+        JqValue::LazyIndexRange(len) => {
+            if *len == 0 {
+                out.write_all(b"[]")?;
+            } else if compact {
+                out.write_all(b"[")?;
+                for i in 0..*len {
+                    if i > 0 {
+                        out.write_all(b",")?;
+                    }
+                    write!(out, "{i}")?;
+                }
+                out.write_all(b"]")?;
+            } else {
+                out.write_all(b"[")?;
+                out.write_all(separator.as_bytes())?;
+                for i in 0..*len {
+                    if i > 0 {
+                        out.write_all(b",")?;
+                        out.write_all(separator.as_bytes())?;
+                    }
+                    out.write_all(next_indent.as_bytes())?;
+                    write!(out, "{i}")?;
                 }
                 out.write_all(separator.as_bytes())?;
                 out.write_all(current_indent.as_bytes())?;
