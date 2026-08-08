@@ -29,6 +29,7 @@ Options:
           - unicode:       Unicode-heavy strings (tests UTF-8 handling)
           - pathological:  Worst-case for parsing (maximum structural density)
           - pretty:        Indented, pretty-printed documents (tests whitespace skipping)
+          - wide:          Wide flat object: many distinct top-level keys, no nesting (tests keys_unsorted)
           
           [default: comprehensive]
 
