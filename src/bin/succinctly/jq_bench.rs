@@ -9,6 +9,99 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
+/// Query types for benchmarking different `eval_generic.rs` execution paths.
+///
+/// Added for issue #686: `keys_unsorted | map/select` (and general
+/// `map`/`select`) have no native lazy arm in `eval_generic.rs` and fall back
+/// to a `to_owned` + reserialize + reindex round trip. These variants measure
+/// whether that fallback is a real bottleneck at realistic sizes, mirroring
+/// how #666 measured the `length`/`.[]`/`first`/`last` win before #140 built
+/// the real lazy implementation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryType {
+    /// Identity query (`.`)
+    Identity,
+    /// `keys_unsorted` alone - already lazy (#678)
+    KeysUnsorted,
+    /// `keys_unsorted | length` - already lazy (#678), the achievable floor
+    KeysUnsortedLength,
+    /// `keys_unsorted | map(.)` - no native arm, hits the eager fallback
+    KeysUnsortedMap,
+    /// `keys_unsorted | select(true)` - hits the eager fallback too, since
+    /// the `LazyKeysUnsorted` pipe-fanout dispatch only special-cases
+    /// `length`/`.[]`/`.[n]`/`first`/`last`
+    KeysUnsortedSelect,
+    /// `map(.)` over a plain container - general-container comparison
+    Map,
+    /// `select(true)` over a plain container - general-container comparison
+    Select,
+}
+
+impl QueryType {
+    /// Get the jq query string for this query type
+    pub fn query(&self) -> &'static str {
+        match self {
+            Self::Identity => ".",
+            Self::KeysUnsorted => "keys_unsorted",
+            Self::KeysUnsortedLength => "keys_unsorted | length",
+            Self::KeysUnsortedMap => "keys_unsorted | map(.)",
+            Self::KeysUnsortedSelect => "keys_unsorted | select(true)",
+            Self::Map => "map(.)",
+            Self::Select => "select(true)",
+        }
+    }
+
+    /// Get a human-readable name for display
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Identity => "identity",
+            Self::KeysUnsorted => "keys_unsorted",
+            Self::KeysUnsortedLength => "keys_unsorted_length",
+            Self::KeysUnsortedMap => "keys_unsorted_map",
+            Self::KeysUnsortedSelect => "keys_unsorted_select",
+            Self::Map => "map",
+            Self::Select => "select",
+        }
+    }
+
+    /// Get the execution path description (per `eval_generic.rs`, not a timing claim)
+    pub fn path_description(&self) -> &'static str {
+        match self {
+            Self::Identity => "native",
+            Self::KeysUnsorted | Self::KeysUnsortedLength => "lazy (#678)",
+            Self::KeysUnsortedMap | Self::KeysUnsortedSelect | Self::Map => "eager fallback",
+            Self::Select => "native (single-value arm)",
+        }
+    }
+
+    /// Parse query type from string
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "identity" | "." => Some(Self::Identity),
+            "keys_unsorted" => Some(Self::KeysUnsorted),
+            "keys_unsorted_length" => Some(Self::KeysUnsortedLength),
+            "keys_unsorted_map" => Some(Self::KeysUnsortedMap),
+            "keys_unsorted_select" => Some(Self::KeysUnsortedSelect),
+            "map" => Some(Self::Map),
+            "select" => Some(Self::Select),
+            _ => None,
+        }
+    }
+
+    /// Get all available query types
+    pub fn all() -> &'static [Self] {
+        &[
+            Self::Identity,
+            Self::KeysUnsorted,
+            Self::KeysUnsortedLength,
+            Self::KeysUnsortedMap,
+            Self::KeysUnsortedSelect,
+            Self::Map,
+            Self::Select,
+        ]
+    }
+}
+
 /// Benchmark result for a single run
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BenchmarkResult {
@@ -16,6 +109,8 @@ pub struct BenchmarkResult {
     pub pattern: String,
     pub size: String,
     pub filesize: u64,
+    pub query: String,
+    pub query_path: String,
     pub status: String,
     pub jq: ToolResult,
     pub succinctly: ToolResult,
@@ -38,6 +133,7 @@ pub struct BenchConfig {
     pub data_dir: PathBuf,
     pub patterns: Vec<String>,
     pub sizes: Vec<String>,
+    pub queries: Vec<QueryType>,
     pub succinctly_binary: PathBuf,
     pub warmup_runs: usize,
     pub benchmark_runs: usize,
@@ -60,6 +156,7 @@ impl Default for BenchConfig {
                 "strings".into(),
                 "unicode".into(),
                 "users".into(),
+                "wide".into(),
             ],
             sizes: vec![
                 "1kb".into(),
@@ -69,6 +166,7 @@ impl Default for BenchConfig {
                 "10mb".into(),
                 "100mb".into(),
             ],
+            queries: vec![QueryType::Identity],
             succinctly_binary: PathBuf::from("./target/release/succinctly"),
             warmup_runs: 1,
             benchmark_runs: 3,
@@ -107,6 +205,15 @@ pub fn run_benchmark(
 
     eprintln!("Running jq benchmark suite...");
     eprintln!("  Data directory: {}", config.data_dir.display());
+    eprintln!(
+        "  Queries: {}",
+        config
+            .queries
+            .iter()
+            .map(|q| format!("{} ({})", q.name(), q.query()))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
     eprintln!("  Warmup runs: {}", config.warmup_runs);
     eprintln!("  Benchmark runs: {}", config.benchmark_runs);
     eprintln!();
@@ -118,59 +225,64 @@ pub fn run_benchmark(
         })
         .transpose()?;
 
-    'outer: for pattern in &config.patterns {
-        for size in &config.sizes {
-            // Check for Ctrl+C
-            if interrupted.load(Ordering::SeqCst) {
-                break 'outer;
-            }
+    'outer: for query_type in &config.queries {
+        eprintln!("Query: {} ({})", query_type.query(), query_type.name());
 
-            let file_path = config.data_dir.join(pattern).join(format!("{size}.json"));
-
-            if !file_path.exists() {
-                eprintln!("  Skipping {} (not found)", file_path.display());
-                continue;
-            }
-
-            let filesize = std::fs::metadata(&file_path)?.len();
-
-            eprint!(
-                "  {} {} ({})... ",
-                pattern,
-                size,
-                format_bytes(filesize as usize)
-            );
-            std::io::stderr().flush()?;
-
-            // Run benchmark
-            match benchmark_file(&file_path, config) {
-                Ok(result) => {
-                    let status_icon = if result.status == "match" {
-                        "✓"
-                    } else {
-                        "✗"
-                    };
-                    let speedup = result.jq.wall_time_ms / result.succinctly.wall_time_ms;
-                    eprintln!(
-                        "{} jq={:.1}ms succ={:.1}ms ({:.2}x)",
-                        status_icon,
-                        result.jq.wall_time_ms,
-                        result.succinctly.wall_time_ms,
-                        speedup
-                    );
-
-                    // Write to JSONL file immediately
-                    if let Some(ref mut f) = jsonl_file {
-                        writeln!(f, "{}", serde_json::to_string(&result)?)?;
-                    }
-
-                    results.push(result);
+        for pattern in &config.patterns {
+            for size in &config.sizes {
+                // Check for Ctrl+C
+                if interrupted.load(Ordering::SeqCst) {
+                    break 'outer;
                 }
-                Err(e) => {
-                    eprintln!("ERROR: {e}");
+
+                let file_path = config.data_dir.join(pattern).join(format!("{size}.json"));
+
+                if !file_path.exists() {
+                    eprintln!("  Skipping {} (not found)", file_path.display());
+                    continue;
+                }
+
+                let filesize = std::fs::metadata(&file_path)?.len();
+
+                eprint!(
+                    "  {} {} ({})... ",
+                    pattern,
+                    size,
+                    format_bytes(filesize as usize)
+                );
+                std::io::stderr().flush()?;
+
+                // Run benchmark
+                match benchmark_file(&file_path, config, *query_type) {
+                    Ok(result) => {
+                        let status_icon = if result.status == "match" {
+                            "✓"
+                        } else {
+                            "✗"
+                        };
+                        let speedup = result.jq.wall_time_ms / result.succinctly.wall_time_ms;
+                        eprintln!(
+                            "{} jq={:.1}ms succ={:.1}ms ({:.2}x)",
+                            status_icon,
+                            result.jq.wall_time_ms,
+                            result.succinctly.wall_time_ms,
+                            speedup
+                        );
+
+                        // Write to JSONL file immediately
+                        if let Some(ref mut f) = jsonl_file {
+                            writeln!(f, "{}", serde_json::to_string(&result)?)?;
+                        }
+
+                        results.push(result);
+                    }
+                    Err(e) => {
+                        eprintln!("ERROR: {e}");
+                    }
                 }
             }
         }
+        eprintln!();
     }
 
     let was_interrupted = interrupted.load(Ordering::SeqCst);
@@ -207,8 +319,8 @@ pub fn run_benchmark(
         eprintln!("\nHash mismatches detected ({}):", mismatches.len());
         for m in &mismatches {
             eprintln!(
-                "  {} {}: jq={} succinctly={}",
-                m.pattern, m.size, m.jq.hash, m.succinctly.hash
+                "  {} {} ({}): jq={} succinctly={}",
+                m.pattern, m.size, m.query, m.jq.hash, m.succinctly.hash
             );
         }
         anyhow::bail!(
@@ -220,8 +332,12 @@ pub fn run_benchmark(
     Ok(results)
 }
 
-/// Benchmark a single file
-fn benchmark_file(file_path: &Path, config: &BenchConfig) -> Result<BenchmarkResult> {
+/// Benchmark a single file with a specific query
+fn benchmark_file(
+    file_path: &Path,
+    config: &BenchConfig,
+    query_type: QueryType,
+) -> Result<BenchmarkResult> {
     let file_str = file_path.to_string_lossy().to_string();
     let pattern = file_path
         .parent()
@@ -233,23 +349,24 @@ fn benchmark_file(file_path: &Path, config: &BenchConfig) -> Result<BenchmarkRes
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_default();
     let filesize = std::fs::metadata(file_path)?.len();
+    let query = query_type.query();
 
     // Warmup runs
     for _ in 0..config.warmup_runs {
-        let _ = run_jq(file_path);
-        let _ = run_succinctly(file_path, &config.succinctly_binary);
+        let _ = run_jq(file_path, query);
+        let _ = run_succinctly(file_path, &config.succinctly_binary, query);
     }
 
     // Benchmark runs for jq
     let mut jq_results = Vec::new();
     for _ in 0..config.benchmark_runs {
-        jq_results.push(run_jq(file_path)?);
+        jq_results.push(run_jq(file_path, query)?);
     }
 
     // Benchmark runs for succinctly
     let mut succ_results = Vec::new();
     for _ in 0..config.benchmark_runs {
-        succ_results.push(run_succinctly(file_path, &config.succinctly_binary)?);
+        succ_results.push(run_succinctly(file_path, &config.succinctly_binary, query)?);
     }
 
     // Take median of wall time
@@ -268,6 +385,8 @@ fn benchmark_file(file_path: &Path, config: &BenchConfig) -> Result<BenchmarkRes
         pattern,
         size,
         filesize,
+        query: query.to_string(),
+        query_path: query_type.path_description().to_string(),
         status,
         jq: jq_result,
         succinctly: succ_result,
@@ -284,15 +403,15 @@ fn select_median(mut results: Vec<ToolResult>) -> ToolResult {
 }
 
 /// Run system jq and measure
-fn run_jq(file_path: &Path) -> Result<ToolResult> {
-    run_command_with_timing("jq", &[".", file_path.to_str().unwrap()])
+fn run_jq(file_path: &Path, query: &str) -> Result<ToolResult> {
+    run_command_with_timing("jq", &[query, file_path.to_str().unwrap()])
 }
 
 /// Run succinctly jq and measure
-fn run_succinctly(file_path: &Path, binary: &Path) -> Result<ToolResult> {
+fn run_succinctly(file_path: &Path, binary: &Path, query: &str) -> Result<ToolResult> {
     run_command_with_timing(
         binary.to_str().unwrap(),
-        &["jq", ".", file_path.to_str().unwrap()],
+        &["jq", query, file_path.to_str().unwrap()],
     )
 }
 
@@ -495,6 +614,39 @@ pub fn generate_markdown(results: &[BenchmarkResult], memory_mode: bool) -> Stri
     let cpu_info = get_cpu_info();
     md.push_str(&format!("**CPU**: {cpu_info}\n\n"));
 
+    // Collect unique queries from results, in QueryType::all() order
+    let queries: Vec<&str> = QueryType::all()
+        .iter()
+        .map(QueryType::query)
+        .filter(|q| results.iter().any(|r| r.query == *q))
+        .collect();
+
+    if queries.len() > 1 {
+        for query in &queries {
+            let query_path = QueryType::all()
+                .iter()
+                .find(|q| q.query() == *query)
+                .map(QueryType::path_description)
+                .unwrap_or_default();
+            md.push_str(&format!("## Query: `{query}` ({query_path})\n\n"));
+            let query_results: Vec<BenchmarkResult> = results
+                .iter()
+                .filter(|r| r.query == *query)
+                .cloned()
+                .collect();
+            md.push_str(&generate_pattern_tables(&query_results, memory_mode));
+        }
+    } else {
+        md.push_str(&generate_pattern_tables(results, memory_mode));
+    }
+
+    md
+}
+
+/// Generate the pattern x size tables for one query's results
+fn generate_pattern_tables(results: &[BenchmarkResult], memory_mode: bool) -> String {
+    let mut md = String::new();
+
     // Group by pattern (alphabetical order)
     let patterns = [
         "arrays",
@@ -507,6 +659,7 @@ pub fn generate_markdown(results: &[BenchmarkResult], memory_mode: bool) -> Stri
         "strings",
         "unicode",
         "users",
+        "wide",
     ];
 
     // Size order: largest to smallest
@@ -706,5 +859,22 @@ mod tests {
             !speedup_col.contains("** "),
             "Spaces should not be inside **: {speedup_col}"
         );
+    }
+
+    #[test]
+    fn test_query_type_from_str_round_trips_names() {
+        for q in QueryType::all() {
+            assert_eq!(QueryType::from_str(q.name()), Some(*q));
+        }
+    }
+
+    #[test]
+    fn test_query_type_from_str_rejects_unknown_query() {
+        assert_eq!(QueryType::from_str("not_a_real_query"), None);
+    }
+
+    #[test]
+    fn test_query_type_from_str_accepts_dot_alias_for_identity() {
+        assert_eq!(QueryType::from_str("."), Some(QueryType::Identity));
     }
 }

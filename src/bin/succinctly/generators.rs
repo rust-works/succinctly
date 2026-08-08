@@ -16,6 +16,7 @@ pub enum Pattern {
     Unicode,
     Pathological,
     Pretty,
+    Wide,
 }
 
 /// Generate JSON of approximately target_size bytes
@@ -40,6 +41,7 @@ pub fn generate_json(
         Pattern::Unicode => generate_unicode_json(target_size, seed),
         Pattern::Pathological => generate_pathological_json(target_size, seed),
         Pattern::Pretty => generate_pretty_json(target_size, seed),
+        Pattern::Wide => generate_wide_json(target_size, seed),
     }
 }
 
@@ -476,6 +478,34 @@ pub fn generate_users_json(target_size: usize, seed: Option<u64>) -> String {
     json
 }
 
+/// Generate a wide flat object: many distinct top-level scalar keys, no
+/// nesting. Exercises `keys_unsorted`'s field-iteration path (unlike every
+/// other pattern here, which wraps its content in a single top-level key).
+pub fn generate_wide_json(target_size: usize, seed: Option<u64>) -> String {
+    let mut rng = seed.map(ChaCha8Rng::seed_from_u64);
+    let mut json = String::with_capacity(target_size);
+    json.push('{');
+
+    let mut i = 0usize;
+    loop {
+        if i > 0 {
+            json.push(',');
+        }
+
+        let val = rng.as_mut().map_or(i, |r| r.random_range(0..1000));
+        json.push_str(&format!(r#""k{i}":{val}"#));
+
+        i += 1;
+
+        if json.len() >= target_size.saturating_sub(10) {
+            break;
+        }
+    }
+
+    json.push('}');
+    json
+}
+
 /// Generate deeply nested objects
 pub fn generate_nested_json(target_size: usize, _seed: Option<u64>, depth: usize) -> String {
     let mut json = String::with_capacity(target_size);
@@ -802,6 +832,54 @@ mod tests {
     fn test_generate_pretty_is_deterministic() {
         let a = generate_json(4096, Pattern::Pretty, Some(42), 5, 0.1);
         let b = generate_json(4096, Pattern::Pretty, Some(42), 5, 0.1);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn test_generate_wide_is_valid_json() {
+        for size in [1024, 10 * 1024, 100 * 1024] {
+            let json = generate_json(size, Pattern::Wide, Some(42), 5, 0.1);
+            serde_json::from_str::<serde_json::Value>(&json)
+                .unwrap_or_else(|e| panic!("wide/{size} generated invalid JSON: {e}"));
+            succinctly::json::validate::validate(json.as_bytes())
+                .unwrap_or_else(|e| panic!("wide/{size} failed strict validation: {e}"));
+        }
+    }
+
+    /// The whole point of this pattern: a flat object with many distinct
+    /// top-level keys, unlike every other pattern which wraps its content in
+    /// a single top-level key. Guards against it silently degenerating into
+    /// a single-key wrapper.
+    #[test]
+    fn test_generate_wide_has_many_top_level_keys() {
+        let json = generate_json(100 * 1024, Pattern::Wide, Some(42), 5, 0.1);
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let obj = value.as_object().expect("wide pattern must be an object");
+        assert!(
+            obj.len() > 1000,
+            "wide/100kb should have >1000 top-level keys, got {}",
+            obj.len()
+        );
+    }
+
+    #[test]
+    fn test_generate_wide_hits_target_size() {
+        for size in [1024, 10 * 1024, 100 * 1024] {
+            let json = generate_json(size, Pattern::Wide, Some(42), 5, 0.1);
+            let ratio = json.len() as f64 / size as f64;
+            assert!(
+                (0.95..1.15).contains(&ratio),
+                "wide/{size}: generated {} bytes ({:.2}x target)",
+                json.len(),
+                ratio
+            );
+        }
+    }
+
+    #[test]
+    fn test_generate_wide_is_deterministic() {
+        let a = generate_json(4096, Pattern::Wide, Some(42), 5, 0.1);
+        let b = generate_json(4096, Pattern::Wide, Some(42), 5, 0.1);
         assert_eq!(a, b);
     }
 }
