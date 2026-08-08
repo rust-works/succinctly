@@ -4118,18 +4118,28 @@ fn test_path_context_builtins_across_pipe_stages_554() -> Result<()> {
 }
 
 /// `keys_unsorted` gained a lazy `GenericResult`/evaluator path shared with
-/// `jq` (#140), but `yq_runner.rs` has no `JqValue`-equivalent lazy output
-/// concept, so its `evaluate_yaml_cursor` boundary still materializes
-/// unconditionally (deferred to a follow-up issue). This just confirms that
-/// materialize fallback still produces correct, unchanged output on the YAML
-/// side.
+/// `jq` (#140); `yq_runner.rs`'s CLI output boundary now streams it lazily
+/// too, via `can_use_m2_streaming` admitting `Builtin::KeysUnsorted` and
+/// `GenericResult::stream_json`/`stream_yaml`'s `LazyKeysUnsorted` arms
+/// writing each key straight from `fields` (#685) — no `Vec<String>` or
+/// `OwnedValue::Array` is built. Covers every M2-reachable output shape
+/// (compact/pretty JSON, compact/pretty YAML) plus `length`/`.[0]`, which
+/// were already lazy before this issue.
 #[test]
-fn test_keys_unsorted_yaml_materialize_fallback_140() -> Result<()> {
+fn test_keys_unsorted_yaml_lazy_output_685() -> Result<()> {
     let input = "b: 1\na: 2\nc: 3\n";
 
     let (output, code) = run_yq_stdin("keys_unsorted", input, &["-o", "json", "-I0"])?;
     assert_eq!(code, 0);
     assert_eq!(output.trim(), r#"["b","a","c"]"#);
+
+    let (output, code) = run_yq_stdin("keys_unsorted", input, &["-o", "json", "-I2"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "[\n  \"b\",\n  \"a\",\n  \"c\"\n]");
+
+    let (output, code) = run_yq_stdin("keys_unsorted", input, &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "- b\n- a\n- c");
 
     let (output, code) = run_yq_stdin("keys_unsorted | length", input, &["-o", "json", "-I0"])?;
     assert_eq!(code, 0);
@@ -4138,6 +4148,57 @@ fn test_keys_unsorted_yaml_materialize_fallback_140() -> Result<()> {
     let (output, code) = run_yq_stdin("keys_unsorted | .[0]", input, &["-o", "json", "-I0"])?;
     assert_eq!(code, 0);
     assert_eq!(output.trim(), r#""b""#);
+
+    Ok(())
+}
+
+/// Flags that force the DOM path must still agree byte-for-byte with the M2
+/// lazy path above — `evaluate_yaml_cursor`'s `LazyKeysUnsorted` arm
+/// ([yq_runner.rs]) stays a materializing fallback for those flag
+/// combinations rather than a `keys_unsorted`-specific gap (#685).
+///
+/// `-I0` (compact) satisfies `can_json_fast_path`/`can_yaml_fast_path` on its
+/// own (`output_config.compact || ...`), so `--sort-keys` alone does *not*
+/// force DOM in compact mode — only in pretty mode, where it's excluded via
+/// `can_stream_pretty`. `--arg` (an unused named variable) forces DOM
+/// unconditionally via `context.named.is_empty()`, so it's used for the
+/// compact case instead.
+#[test]
+fn test_keys_unsorted_yaml_dom_fallback_matches_lazy_685() -> Result<()> {
+    let input = "b: 1\na: 2\nc: 3\n";
+
+    let (lazy, _) = run_yq_stdin("keys_unsorted", input, &["-o", "json", "-I0"])?;
+    let (dom, code) = run_yq_stdin(
+        "keys_unsorted",
+        input,
+        &["--arg", "_unused", "x", "-o", "json", "-I0"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(lazy, dom);
+
+    let (lazy, _) = run_yq_stdin("keys_unsorted", input, &[])?;
+    let (dom, code) = run_yq_stdin("keys_unsorted", input, &["--sort-keys"])?;
+    assert_eq!(code, 0);
+    assert_eq!(lazy, dom);
+
+    Ok(())
+}
+
+/// `keys_unsorted` on a mapping resolved through a `<<: *anchor` merge key
+/// exercises `YamlFields`'s `Merged` variant (an `Rc`-shared entry list, the
+/// reason `YamlFields` can't be `Copy` the way `JsonFields` is) through the
+/// new lazy path — must still stream in merge-then-local order.
+#[test]
+fn test_keys_unsorted_yaml_merge_key_lazy_685() -> Result<()> {
+    let input = "defaults: &defaults\n  b: 1\n  a: 2\nitem:\n  <<: *defaults\n  c: 3\n";
+
+    let (output, code) = run_yq_stdin(".item | keys_unsorted", input, &["-o", "json", "-I0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#"["b","a","c"]"#);
+
+    let (output, code) = run_yq_stdin(".item | keys_unsorted", input, &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "- b\n- a\n- c");
 
     Ok(())
 }

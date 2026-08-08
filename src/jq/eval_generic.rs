@@ -465,20 +465,17 @@ impl<V: DocumentValue> GenericResult<V> {
                 }
                 stats.count = vs.len();
             }
-            // Fallback: materialize. `keys_unsorted`-involving expressions
-            // never reach M2 streaming today (`can_use_m2_streaming`'s
-            // whitelist excludes `Builtin::KeysUnsorted`, `yq_runner.rs`),
-            // so this arm exists only to keep the match exhaustive; a real
-            // streaming implementation (writing each key's raw bytes as
-            // it's pulled from `fields`) is future work if M2 ever grows to
-            // cover `keys_unsorted`.
+            // Genuinely lazy (#685): each key is pulled from `fields` and
+            // written straight to `out` as it's produced — no `Vec<String>`
+            // or `OwnedValue::Array` is ever built. Reachable from
+            // `yq_runner.rs`'s M2 fast path now that `can_use_m2_streaming`
+            // admits `Builtin::KeysUnsorted`. An array is never falsy.
             Self::LazyKeysUnsorted(fields) => {
-                let owned = materialize_lazy_keys::<V>(fields);
-                owned.stream_json(out, indent_spaces)?;
+                crate::jq::stream::stream_lazy_keys_json(fields, out, indent_spaces)?;
                 on_value(out)?;
                 stats.count = 1;
-                stats.last_was_falsy = owned.is_falsy();
-                stats.any_truthy = !stats.last_was_falsy;
+                stats.last_was_falsy = false;
+                stats.any_truthy = true;
             }
             Self::ManyCursor(cs) => {
                 for c in cs {
@@ -603,15 +600,14 @@ impl<V: DocumentValue> GenericResult<V> {
                 }
                 stats.count = cs.len();
             }
-            // Fallback: materialize. See `stream_json`'s `LazyKeysUnsorted`
-            // arm above — same reasoning (unreachable via M2 today).
+            // Genuinely lazy (#685): see `stream_json`'s `LazyKeysUnsorted`
+            // arm above — same reasoning, YAML target.
             Self::LazyKeysUnsorted(fields) => {
-                let owned = materialize_lazy_keys::<V>(fields);
-                owned.stream_yaml(out, indent_spaces)?;
+                crate::jq::stream::stream_lazy_keys_yaml(fields, out, indent_spaces)?;
                 on_value(out)?;
                 stats.count = 1;
-                stats.last_was_falsy = owned.is_falsy();
-                stats.any_truthy = !stats.last_was_falsy;
+                stats.last_was_falsy = false;
+                stats.any_truthy = true;
             }
             Self::None => {
                 // No output
@@ -2973,9 +2969,10 @@ mod tests {
     fn test_yaml_keys_unsorted_lazy_fast_paths() {
         // `LazyKeysUnsorted`/its `Pipe` fast paths are generic over
         // `V: DocumentValue`, so a YAML mapping goes through the exact same
-        // evaluator arms as a JSON object (#140) -- only `yq_runner.rs`'s
-        // CLI output boundary still materializes unconditionally, since
-        // YAML has no `JqValue`-equivalent lazy output today.
+        // evaluator arms as a JSON object (#140). The bare-array case (no
+        // `Pipe` fast path applies) is covered separately by
+        // `test_yaml_keys_unsorted_stream_lazy_685`, which now also streams
+        // lazily at the CLI output boundary (#685).
         use crate::yaml::YamlIndex;
 
         let yaml = b"b: 1\na: 2\nc: 3\n";
@@ -3018,6 +3015,70 @@ mod tests {
             eval_with_cursor(&expr, doc_cursor).into_owned().unwrap(),
             OwnedValue::String("c".to_string())
         );
+    }
+
+    #[test]
+    fn test_yaml_keys_unsorted_stream_lazy_685() {
+        // `GenericResult::stream_json`/`stream_yaml`'s `LazyKeysUnsorted` arm
+        // now writes each key straight from `fields` instead of falling back
+        // to `materialize_lazy_keys` — this asserts the exact bytes produced,
+        // for both output formats and both compact/indented modes (#685).
+        use crate::yaml::YamlIndex;
+
+        let yaml = b"b: 1\na: 2\nc: 3\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let doc_cursor = index
+            .root(yaml)
+            .first_child()
+            .expect("YAML document should have content");
+
+        let expr = crate::jq::parse("keys_unsorted").unwrap();
+        let result = eval_with_cursor(&expr, doc_cursor);
+        assert!(matches!(result, GenericResult::LazyKeysUnsorted(_)));
+
+        let mut out = String::new();
+        result.stream_json(&mut out, 0, |_| Ok(())).unwrap();
+        assert_eq!(out, r#"["b","a","c"]"#);
+
+        let mut out = String::new();
+        result.stream_json(&mut out, 2, |_| Ok(())).unwrap();
+        assert_eq!(out, "[\n  \"b\",\n  \"a\",\n  \"c\"\n]");
+
+        let mut out = String::new();
+        result.stream_yaml(&mut out, 0, |_| Ok(())).unwrap();
+        assert_eq!(out, "[b, a, c]");
+
+        let mut out = String::new();
+        result.stream_yaml(&mut out, 2, |_| Ok(())).unwrap();
+        assert_eq!(out, "- b\n- a\n- c");
+    }
+
+    #[test]
+    fn test_yaml_keys_unsorted_stream_lazy_merge_key_685() {
+        // Same as above but resolved through a `<<: *anchor` merge key,
+        // exercising `YamlFields`'s `Merged` variant (an `Rc`-shared entry
+        // list) through the new streaming path rather than the plain
+        // cursor-walk `Direct` variant JSON's `JsonFields` always uses.
+        use crate::yaml::YamlIndex;
+
+        let yaml = b"defaults: &defaults\n  b: 1\n  a: 2\nitem:\n  <<: *defaults\n  c: 3\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let doc_cursor = index
+            .root(yaml)
+            .first_child()
+            .expect("YAML document should have content");
+
+        let expr = crate::jq::parse(".item | keys_unsorted").unwrap();
+        let result = eval_with_cursor(&expr, doc_cursor);
+        assert!(matches!(result, GenericResult::LazyKeysUnsorted(_)));
+
+        let mut out = String::new();
+        result.stream_json(&mut out, 0, |_| Ok(())).unwrap();
+        assert_eq!(out, r#"["b","a","c"]"#);
+
+        let mut out = String::new();
+        result.stream_yaml(&mut out, 2, |_| Ok(())).unwrap();
+        assert_eq!(out, "- b\n- a\n- c");
     }
 
     #[test]

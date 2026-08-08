@@ -22,6 +22,7 @@
 
 use alloc::string::{String, ToString};
 
+use super::document::DocumentFields;
 use super::escape::{write_json_body_jq, write_json_body_yq};
 use super::value::{format_number_jq_compat, NumberRepr, OwnedValue};
 use crate::yaml::format_float_with_fraction;
@@ -275,6 +276,49 @@ fn stream_json_string<W: core::fmt::Write>(
     out.write_char('"')
 }
 
+/// Stream a `DocumentFields`' keys (`keys_unsorted`) as a JSON array without
+/// an intermediate `Vec<String>`/`OwnedValue::Array` (#685).
+///
+/// The lazy counterpart of `stream_owned_value_json_with`'s `Array` arm
+/// above, pulling one key at a time from `uncons()` instead of walking a
+/// materialized slice. `GenericResult::LazyKeysUnsorted` is always the
+/// entire top-level result (never nested inside another container), so
+/// unlike the function it mirrors this has no `current_indent` parameter —
+/// it's always 0.
+pub fn stream_lazy_keys_json<W: core::fmt::Write, F: DocumentFields>(
+    fields: &F,
+    out: &mut W,
+    indent_spaces: usize,
+) -> core::fmt::Result {
+    if fields.is_empty() {
+        return out.write_str("[]");
+    }
+    out.write_char('[')?;
+    let mut current = fields.clone();
+    let mut i = 0usize;
+    while let Some((field, rest)) = current.uncons() {
+        // `key_str()` is expected to always return `Some` (see its doc
+        // comment on `DocumentField`); a field with no stringifiable key is
+        // silently skipped, matching `DocumentFields::keys()`'s default walk.
+        if let Some(key) = field.key_str() {
+            if i > 0 {
+                out.write_char(',')?;
+            }
+            if indent_spaces > 0 {
+                out.write_char('\n')?;
+                write_indent(out, indent_spaces)?;
+            }
+            stream_json_string(out, &key, write_json_body_yq)?;
+            i += 1;
+        }
+        current = rest;
+    }
+    if indent_spaces > 0 {
+        out.write_char('\n')?;
+    }
+    out.write_char(']')
+}
+
 // ============================================================================
 // YAML Streaming
 // ============================================================================
@@ -446,6 +490,56 @@ pub fn stream_yaml_string<W: core::fmt::Write>(out: &mut W, s: &str) -> core::fm
         stream_yaml_double_quoted(out, s)
     } else {
         out.write_str(s)
+    }
+}
+
+/// Stream a `DocumentFields`' keys (`keys_unsorted`) as YAML without an
+/// intermediate `Vec<String>`/`OwnedValue::Array` (#685).
+///
+/// The YAML counterpart of `stream_lazy_keys_json` above, mirroring
+/// `stream_owned_value_yaml`'s `Array` arm. Keys are always plain strings,
+/// never nested containers, so this omits that arm's "nested container gets
+/// its own indented line" branch, and — like `stream_lazy_keys_json` — has no
+/// `current_indent` parameter, since `LazyKeysUnsorted` is always the entire
+/// top-level result.
+pub fn stream_lazy_keys_yaml<W: core::fmt::Write, F: DocumentFields>(
+    fields: &F,
+    out: &mut W,
+    indent_spaces: usize,
+) -> core::fmt::Result {
+    if fields.is_empty() {
+        return out.write_str("[]");
+    }
+    let mut current = fields.clone();
+    let mut i = 0usize;
+    if indent_spaces == 0 {
+        // Flow style
+        out.write_char('[')?;
+        while let Some((field, rest)) = current.uncons() {
+            if let Some(key) = field.key_str() {
+                if i > 0 {
+                    out.write_str(", ")?;
+                }
+                stream_yaml_string(out, &key)?;
+                i += 1;
+            }
+            current = rest;
+        }
+        out.write_char(']')
+    } else {
+        // Block style
+        while let Some((field, rest)) = current.uncons() {
+            if let Some(key) = field.key_str() {
+                if i > 0 {
+                    out.write_char('\n')?;
+                }
+                out.write_str("- ")?;
+                stream_yaml_string(out, &key)?;
+                i += 1;
+            }
+            current = rest;
+        }
+        Ok(())
     }
 }
 
