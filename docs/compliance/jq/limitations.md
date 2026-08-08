@@ -24,16 +24,16 @@ For jq *feature* coverage rather than error wording, see
 
 ## Summary
 
-Measured against jq-1.7.1 over the 186 probes in
+Measured against jq-1.7.1 over the 190 probes in
 [`tests/data/jq-error-probes.tsv`](../../../tests/data/jq-error-probes.tsv), through
 **both** evaluators — the full one (`src/jq/eval.rs`) and the generic one
 (`src/jq/eval_generic.rs`, which the CLI uses):
 
 | Dimension                                    | Result               | Meaning                                            |
 |----------------------------------------------|----------------------|----------------------------------------------------|
-| **Message text** (both evaluators, verbatim) | **181/186 = 97.3%**  | Byte-identical to jq                               |
+| **Message text** (both evaluators, verbatim) | **190/190 = 100.0%** | Byte-identical to jq                               |
 | **Wording divergences**                      | **0**                | Every probe that errors in both errors identically |
-| **Behaviour / parser gaps**                  | **5**                | succinctly does not raise the error at all         |
+| **Behaviour / parser gaps**                  | **0**                | succinctly does not raise the error at all         |
 
 These three numbers are asserted, not maintained by hand: `jq_error_message_tests.rs`
 parses them back out of this page and fails if they drift from the corpus (they went stale
@@ -84,6 +84,7 @@ iterate over number` for the same condition, and `cannot parse 'a' as number` ag
 | `Cannot check whether <t> has a <key-type> key`          | `cannot_check_has`                            |
 | `Cannot use <t> (<v>) as object key`                     | `cannot_use_as_object_key`                    |
 | `Invalid numeric literal at EOF at line 1, column <n> …` | `invalid_numeric_literal`                     |
+| `Invalid path expression with result <v>`                | `invalid_path_expression`                     |
 
 `EvalError::type_error` ("expected X, got Y") survives for the raise sites jq has no
 counterpart for — succinctly extensions (`at_offset`, `@dsv`, `pick`/`omit`, module
@@ -317,17 +318,13 @@ than needing `?` to swallow a failure). No write operator produces `index N out 
 longer a positive case for succinctly's own wording to cover.
 
 `del()` used to sit here too — `del(.[5])` and `del(.[-5])` on `[1,2]`, plus a missing
-intermediate key — but every one of those is a silent no-op now, matching jq, after
-[#477](https://github.com/rust-works/succinctly/issues/477) and
-[#527](https://github.com/rust-works/succinctly/issues/527). A step that reaches nothing
+intermediate key or an out-of-range index — but every one of those is a silent no-op now,
+matching jq, after [#477](https://github.com/rust-works/succinctly/issues/477),
+[#527](https://github.com/rust-works/succinctly/issues/527) and
+[#529](https://github.com/rust-works/succinctly/issues/529). A step that reaches nothing
 reads as `null` and the rest of the path is walked against it, so only an `[]` tail still
-raises (`{"a":{"x":1}} | del(.a.b[])` is `Cannot iterate over null (null)` in both).
-
-What is left of that family diverges in the *opposite* direction, so it does not belong in
-this table at all: after an out-of-range index specifically, succinctly still skips the tail
-instead of walking it, so `[1,2] | del(.[5][])` is a silent no-op where jq raises `Cannot
-iterate over null (null)` — [#529](https://github.com/rust-works/succinctly/issues/529),
-not yet seeded into the probe corpus.
+raises (`{"a":{"x":1}} | del(.a.b[])` and `[1,2] | del(.[5][])` are both `Cannot iterate over
+null (null)`).
 
 The two slice rows were added by [#366](https://github.com/rust-works/succinctly/issues/366)
 deliberately. Writing through a slice could have vivified `null` on its own — `setpath`
@@ -455,10 +452,45 @@ Three rules, and none of them lives here any more:
 - **`?` suppresses that error and nothing else.** A pruned step names no path (it never
   happened), while a step that read `null` never errored and so is untouched by `?`.
 
-What remains is [#483](https://github.com/rust-works/succinctly/issues/483): `path(..)`,
-`path(recurse)` and `path(select(f))` have no arm in the walker, fall to its catch-all and
-name no path. They now produce *no output* rather than the root path — still the wrong
-answer, but no longer one that resolves.
+What remained after that — [#483](https://github.com/rust-works/succinctly/issues/483) and
+[#530](https://github.com/rust-works/succinctly/issues/530) — was the walker's catch-all
+conflating two different questions. `resolve_node` (the pre-pass that turns a computed key
+or a control-flow shape into concrete `Field`/`Index`/`Slice` components before the walker
+ever runs) now has arms for every shape jq treats as path-capable: `..`, `recurse(f)`,
+`recurse(f; cond)`, `select(f)`, the typeof filters, `first(f)`, `if/then/else`, `//`,
+`limit(n; f)`, `try/catch`, `label $x | ...`, `E as $x | body`, and `getpath([...])` with a
+literal array argument. `needs_path_prepass` — the gate deciding whether that pre-pass runs
+at all — was rewritten from a whitelist of "known complex shapes" (which is what let
+`resolve_node` grow support for `..`/`recurse`/`select`/the typeof filters without the gate
+ever routing to it) to an exclusion check: everything needs the pre-pass except the bare
+primitives the walker already handles natively.
+
+Whatever is left over — a value-producing filter that is not a path expression at all, like
+`1`, `length`, `keys`, `.a + 1` or `{a:1}` — now raises `Invalid path expression with result
+<v>` (`EvalError::invalid_path_expression`, the `path_non_path_*` probes), matching jq by
+name rather than answering `[]`. Confirmed live: `?` does not suppress it (`path(("a")?)`
+still raises in jq, because this is a statement about the filter, not a value error raised
+while collecting a path), so neither does this resolver's — the one call site is
+`resolve_node`'s bare-`?` arm and `Expr::Try`'s, both checking
+`EvalError::is_invalid_path_expression`.
+
+One case stays out of scope on purpose: a *multi-output* non-path leaf used bare (`range(3)`
+with nothing consuming its outputs as a further computed index) still reports succinctly's
+existing "Cannot use a computed index after a multi-output path component" rather than
+`invalid_path_expression` or jq's own compound wording for that shape — the same
+`test_unsupported_path_prefixes_report_rather_than_misfire` boundary #412 already drew,
+which this fix does not move. Every `path_non_path_*` probe is single-output, matching
+#530's own repro list.
+
+A closely related gap surfaced while verifying this: `path()` used to discard outputs
+already streamed before a later sibling errors (`path(.a, 1)` produced nothing at all,
+where jq prints `["a"]` then raises). `resolve_node` and friends now carry that prefix
+alongside a resolve-time failure, and `builtin_path` reports it as a partial result
+(`QueryResult::Partial`) instead of a bare error — confirmed against jq for both the
+uncaught case and `?`/`try` suppressing just the trailing error while keeping the prefix.
+This does not extend to `=`/`|=`/`del()`: jq's write-side path resolution is atomic
+(`(.a, 1) = 5` produces no output at all in jq), so those three still discard any partial
+prefix exactly as before.
 
 ## Errors reach the CLI with the right text but the wrong exit code
 

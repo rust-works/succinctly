@@ -33,18 +33,10 @@ Generates and improves commit messages following conventional commits format.
 | `ci`       | CI/CD changes                                         |
 | `build`    | Build system changes                                  |
 
-## Scopes for This Project
+## Scopes
 
-| Scope  | Description                          |
-|--------|--------------------------------------|
-| bits   | BitVec, rank/select, popcount        |
-| bp     | Balanced parentheses                 |
-| json   | JSON semi-indexing                   |
-| jq     | jq query language                    |
-| simd   | SIMD implementations                 |
-| cli    | CLI tool                             |
-| bench  | Benchmarks                           |
-| docs   | Documentation                        |
+See [`.omni-dev/scopes.yaml`](../../../.omni-dev/scopes.yaml) for the canonical,
+enforced scope list — do not duplicate it here.
 
 ## Examples
 

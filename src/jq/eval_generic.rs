@@ -19,12 +19,14 @@ use indexmap::IndexMap;
 
 use super::document::{DocumentCursor, DocumentElements, DocumentFields, DocumentValue};
 use super::eval::{
-    compare_values, eval as full_eval, index_one_owned as index_owned_by_key,
-    numeric_display_string, numeric_key_to_index, tonumber_from_str, Control, EvalError,
-    EvalSemantics, JqSemantics, QueryResult,
+    compare_values, eval as full_eval, format_owned, index_one_owned as index_owned_by_key,
+    needs_path_context, numeric_display_string, numeric_key_to_index, owned_bound_to_i64,
+    slice_owned_value, tonumber_from_str, Control, EvalError, EvalSemantics, JqSemantics,
+    QueryResult,
 };
-use super::expr::{Builtin, CompareOp, Expr, Literal};
-use super::value::OwnedValue;
+use super::expr::{Builtin, CompareOp, Expr, FormatType, Literal};
+use super::slice::{slice_str, SliceBounds};
+use super::value::{is_nan_sentinel, OwnedValue};
 use crate::json::JsonIndex;
 
 /// Convert a DocumentValue to an OwnedValue.
@@ -79,10 +81,16 @@ fn standard_json_to_owned<W: Clone + AsRef<[u64]>>(
     match value {
         StandardJson::Null => OwnedValue::Null,
         StandardJson::Bool(b) => OwnedValue::Bool(*b),
-        StandardJson::Number(n) => match core::str::from_utf8(n.raw_bytes()) {
-            Ok(s) => OwnedValue::from_number_literal(s),
-            Err(_) => OwnedValue::Null,
-        },
+        StandardJson::Number(n) => {
+            if is_nan_sentinel(n.raw_bytes()) {
+                OwnedValue::Float(f64::NAN)
+            } else {
+                match core::str::from_utf8(n.raw_bytes()) {
+                    Ok(s) => OwnedValue::from_number_literal(s),
+                    Err(_) => OwnedValue::Null,
+                }
+            }
+        }
         StandardJson::String(s) => {
             OwnedValue::String(s.as_str().map(|c| c.to_string()).unwrap_or_default())
         }
@@ -105,6 +113,18 @@ fn standard_json_to_owned<W: Clone + AsRef<[u64]>>(
     }
 }
 
+/// Apply a format to an owned value and wrap it as a `GenericResult`.
+fn format_result<V: DocumentValue>(
+    format_type: &FormatType,
+    owned: &OwnedValue,
+    optional: bool,
+) -> GenericResult<V> {
+    match format_owned(format_type, owned, optional) {
+        Ok(s) => GenericResult::Owned(OwnedValue::String(s)),
+        Err(e) => GenericResult::Error(e),
+    }
+}
+
 /// Evaluate an expression on an OwnedValue using the full evaluator.
 ///
 /// This converts the OwnedValue to JSON, evaluates using the full evaluator,
@@ -114,6 +134,17 @@ fn eval_on_owned<S: EvalSemantics, V: DocumentValue>(
     owned: OwnedValue,
     optional: bool,
 ) -> GenericResult<V> {
+    // Formats need neither an index nor a cursor, so the round-trip below is
+    // pure overhead for them (#124). No non-finite-float guard is needed here
+    // either: every non-JSON format bottoms out in `numeric_display_string`,
+    // `owned_to_yaml`, or `props_value_to_string` (eval.rs), which already
+    // render NaN/Infinity as `"inf"`/`".nan"`/etc. directly from an
+    // `OwnedValue::Float` or `NumberLiteral`, with no dependence on having
+    // passed through a JSON round-trip first.
+    if let Expr::Format(format_type) = expr {
+        return format_result(format_type, &owned, optional);
+    }
+
     let json_str = owned.to_json_for_reindex();
     let json_bytes = json_str.as_bytes();
     let index = JsonIndex::build(json_bytes);
@@ -157,6 +188,34 @@ fn partial_generic<V: DocumentValue>(
     } else {
         GenericResult::Partial(prefix, control)
     }
+}
+
+/// Append one truthiness bit per output of a `GenericResult` stream to
+/// `out`. Mirrors [`super::eval::push_truthiness`] for the generic
+/// evaluator's cursor-aware result type — used to fan `select`'s condition
+/// out over every output instead of only its first (#378).
+fn push_generic_truthiness<V: DocumentValue>(
+    result: GenericResult<V>,
+    out: &mut Vec<bool>,
+) -> Option<Control> {
+    match result {
+        GenericResult::One(v) => out.push(to_owned(&v).is_truthy()),
+        GenericResult::OneCursor(c) => out.push(to_owned(&c.value()).is_truthy()),
+        GenericResult::Many(vs) => out.extend(vs.iter().map(|v| to_owned(v).is_truthy())),
+        GenericResult::ManyCursor(cs) => {
+            out.extend(cs.iter().map(|c| to_owned(&c.value()).is_truthy()));
+        }
+        GenericResult::None => {}
+        GenericResult::Owned(v) => out.push(v.is_truthy()),
+        GenericResult::ManyOwned(vs) => out.extend(vs.iter().map(OwnedValue::is_truthy)),
+        GenericResult::Error(e) => return Some(Control::Error(e)),
+        GenericResult::Break(label) => return Some(Control::Break(label)),
+        GenericResult::Partial(vs, control) => {
+            out.extend(vs.iter().map(OwnedValue::is_truthy));
+            return Some(control);
+        }
+    }
+    None
 }
 
 /// Flatten a batch of per-element results into one `Vec<OwnedValue>`.
@@ -647,6 +706,14 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
             eval_index_expr::<S, V>(target, key, value, optional, cursor)
         }
 
+        // Handled natively for the same two reasons as `Expr::IndexExpr`
+        // above: the fallback re-enters `full_eval`, which restarts with
+        // `optional = false` and so loses the `?` in `.[.a:.b]?`; and it
+        // serialises and re-indexes the whole document per evaluation (#615).
+        Expr::SliceExpr { target, start, end } => {
+            eval_slice_expr::<S, V>(target, start, end, value, optional, cursor)
+        }
+
         Expr::Iterate => {
             if let Some(elements) = value.as_array() {
                 let cursors = elements.collect_cursors();
@@ -676,7 +743,24 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
 
         Expr::Optional(inner) => eval_single::<S, _>(inner, value, true, cursor),
 
+        // Parens are transparent to cursor-based evaluation: handled natively
+        // (like `Expr::Optional` above) so `(.)` and friends keep threading
+        // the cursor instead of falling to the `to_owned()` bridge below,
+        // which collapses duplicate mapping keys (#614).
+        Expr::Paren(inner) => eval_single::<S, _>(inner, value, optional, cursor),
+
         Expr::Pipe(exprs) => {
+            // `path`/`parent`/`parent(n)`/`key` need the path accumulated
+            // across every stage of this pipe, which only the full evaluator
+            // tracks (`eval::eval_pipe`'s own `needs_path_context` routing,
+            // `eval.rs:6441-6444`). Bridge the *whole* pipe there rather than
+            // letting a later stage fall through `eval_builtin`'s per-builtin
+            // fallback in isolation, which has no path to give it (#554).
+            if exprs.iter().any(needs_path_context) {
+                let owned = to_owned(&value);
+                return eval_on_owned::<S, _>(&Expr::Pipe(exprs.clone()), owned, optional);
+            }
+
             if exprs.is_empty() {
                 return GenericResult::One(value);
             }
@@ -828,6 +912,20 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
             current
         }
 
+        // Handled natively rather than through the `_` fallback below: the
+        // fallback materializes the whole input via `to_owned()` before
+        // `expr` ever runs, so `first(.[])`/`last(.[])` on `[{"a":1,"a":2}]`
+        // lost the duplicate key before the first/last extraction even
+        // started (#607). `first`/`last` never change position -- the
+        // selected output IS one of `inner`'s own outputs -- so forward
+        // whatever cursor that output already carries.
+        Expr::FirstExpr(inner) => {
+            eval_first_or_last_generic::<S, _>(inner, value, optional, cursor, false)
+        }
+        Expr::LastExpr(inner) => {
+            eval_first_or_last_generic::<S, _>(inner, value, optional, cursor, true)
+        }
+
         Expr::Literal(lit) => match lit {
             Literal::Null => GenericResult::Owned(OwnedValue::Null),
             Literal::Bool(b) => GenericResult::Owned(OwnedValue::Bool(*b)),
@@ -835,6 +933,11 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
             Literal::Float(f) => GenericResult::Owned(OwnedValue::Float(*f)),
             Literal::String(s) => GenericResult::Owned(OwnedValue::String(s.clone())),
         },
+
+        // Formats are pure functions of the value, so evaluate them here rather
+        // than falling through to the catch-all, which would serialize the
+        // value to JSON and rebuild a `JsonIndex` for every one (#124).
+        Expr::Format(format_type) => format_result(format_type, &to_owned(&value), optional),
 
         Expr::Builtin(builtin) => eval_builtin::<S, _>(builtin, value, optional, cursor),
 
@@ -996,6 +1099,85 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
     }
 }
 
+/// Evaluate `first(inner)`/`last(inner)` (and the `Builtin::FirstStream`/
+/// `LastStream` spelling the parser sometimes produces for the same syntax --
+/// see the call sites in `eval_single`/`eval_builtin`), preserving a cursor
+/// through the extraction when `inner`'s stream carries one.
+///
+/// Mirrors `eval::eval_first_expr`/`eval::eval_last_expr`'s control-flow
+/// exactly (short-circuit-on-first-output vs must-exhaust-the-stream for
+/// `Partial`/`Error`/`Break`), just adding `OneCursor`/`ManyCursor` arms so a
+/// selected output that is itself a cursor-backed document node keeps its
+/// cursor -- and with it, any duplicate keys inside it -- instead of being
+/// forced through this module's `to_owned()` bridge (#607).
+fn eval_first_or_last_generic<S: EvalSemantics, V: DocumentValue>(
+    inner: &Expr,
+    value: V,
+    optional: bool,
+    cursor: Option<V::Cursor>,
+    want_last: bool,
+) -> GenericResult<V> {
+    let result = eval_single::<S, V>(inner, value, optional, cursor);
+    if want_last {
+        match result {
+            GenericResult::One(v) => GenericResult::One(v),
+            GenericResult::OneCursor(c) => GenericResult::OneCursor(c),
+            GenericResult::Many(vs) => match vs.into_iter().next_back() {
+                Some(v) => GenericResult::One(v),
+                None => GenericResult::None,
+            },
+            GenericResult::ManyCursor(cs) => match cs.into_iter().next_back() {
+                Some(c) => GenericResult::OneCursor(c),
+                None => GenericResult::None,
+            },
+            GenericResult::Owned(v) => GenericResult::Owned(v),
+            GenericResult::ManyOwned(vs) => match vs.into_iter().next_back() {
+                Some(v) => GenericResult::Owned(v),
+                None => GenericResult::None,
+            },
+            GenericResult::None => GenericResult::None,
+            GenericResult::Error(e) => GenericResult::Error(e),
+            GenericResult::Break(label) => GenericResult::Break(label),
+            // `last` cannot short-circuit -- it doesn't know a value is the
+            // last one until the stream is exhausted -- so a `Partial` just
+            // surfaces its trailing control, dropping the prefix (matches
+            // `eval::eval_last_expr`).
+            GenericResult::Partial(_, Control::Error(e)) => GenericResult::Error(e),
+            GenericResult::Partial(_, Control::Break(label)) => GenericResult::Break(label),
+        }
+    } else {
+        match result {
+            GenericResult::One(v) => GenericResult::One(v),
+            GenericResult::OneCursor(c) => GenericResult::OneCursor(c),
+            GenericResult::Many(vs) => match vs.into_iter().next() {
+                Some(v) => GenericResult::One(v),
+                None => GenericResult::None,
+            },
+            GenericResult::ManyCursor(cs) => match cs.into_iter().next() {
+                Some(c) => GenericResult::OneCursor(c),
+                None => GenericResult::None,
+            },
+            GenericResult::Owned(v) => GenericResult::Owned(v),
+            GenericResult::ManyOwned(vs) => match vs.into_iter().next() {
+                Some(v) => GenericResult::Owned(v),
+                None => GenericResult::None,
+            },
+            GenericResult::None => GenericResult::None,
+            GenericResult::Error(e) => GenericResult::Error(e),
+            GenericResult::Break(label) => GenericResult::Break(label),
+            // jq's generator-based `first` never asks for values past the
+            // first (verified: `first(1,2,error("x"))` is `1`, exit 0 -- the
+            // error is never reached), so a non-empty prefix always
+            // satisfies it and the trailing control is dropped. `Partial`'s
+            // prefix is never empty by construction (matches
+            // `eval::eval_first_expr`).
+            GenericResult::Partial(vs, _control) => {
+                GenericResult::Owned(vs.into_iter().next().expect("Partial prefix non-empty"))
+            }
+        }
+    }
+}
+
 /// Apply one resolved key to one target value.
 ///
 /// Mirrors `eval::index_one`: the key *kind* is checked before the container,
@@ -1010,8 +1192,8 @@ fn index_one_generic<V: DocumentValue>(
     match key {
         OwnedValue::String(s) => {
             if let Some(fields) = target.as_object() {
-                match fields.find(s) {
-                    Some(v) => GenericResult::One(v),
+                match fields.find_cursor(s) {
+                    Some(c) => GenericResult::OneCursor(c),
                     None => GenericResult::Owned(OwnedValue::Null),
                 }
             } else if target.is_null() {
@@ -1037,9 +1219,9 @@ fn index_one_generic<V: DocumentValue>(
                 });
                 match resolved
                     .and_then(|r| usize::try_from(r).ok())
-                    .and_then(|i| elements.get(i))
+                    .and_then(|i| elements.get_cursor(i))
                 {
-                    Some(v) => GenericResult::One(v),
+                    Some(c) => GenericResult::OneCursor(c),
                     // Out-of-bounds is null, not an error (#307).
                     None => GenericResult::Owned(OwnedValue::Null),
                 }
@@ -1116,30 +1298,30 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
     };
 
     // Key outer, target inner.
-    let mut borrowed: Vec<V> = Vec::new();
+    let mut cursors: Vec<V::Cursor> = Vec::new();
     let mut owned: Vec<OwnedValue> = Vec::new();
     let mut any_owned = false;
     for k in &keys {
         for t in &targets {
             match index_one_generic::<V>(t.clone(), k, optional) {
-                GenericResult::One(v) => {
+                GenericResult::OneCursor(c) => {
                     if any_owned {
-                        owned.push(to_owned(&v));
+                        owned.push(to_owned(&c.value()));
                     } else {
-                        borrowed.push(v);
+                        cursors.push(c);
                     }
                 }
                 GenericResult::Owned(v) => {
                     if !any_owned {
                         any_owned = true;
-                        owned = borrowed.iter().map(to_owned).collect();
-                        borrowed.clear();
+                        owned = cursors.iter().map(|c| to_owned(&c.value())).collect();
+                        cursors.clear();
                     }
                     owned.push(v);
                 }
                 GenericResult::None => {}
                 GenericResult::Error(e) => return GenericResult::Error(e),
-                _ => unreachable!("index_one_generic yields One/Owned/None/Error"),
+                _ => unreachable!("index_one_generic yields OneCursor/Owned/None/Error"),
             }
         }
     }
@@ -1150,10 +1332,170 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
             _ => GenericResult::ManyOwned(owned),
         }
     } else {
-        match borrowed.len() {
-            1 => GenericResult::One(borrowed.pop().expect("len checked")),
-            _ => GenericResult::Many(borrowed),
+        match cursors.len() {
+            1 => GenericResult::OneCursor(cursors.pop().expect("len checked")),
+            _ => GenericResult::ManyCursor(cursors),
         }
+    }
+}
+
+/// Evaluate `E[S:T]` — slicing by computed bounds.
+///
+/// The counterpart of `eval::eval_slice_expr`; mirrors `eval_index_expr`
+/// immediately above — `start`/`end` are evaluated first (outermost) against
+/// the original value/cursor, not the target's output, and an empty bound
+/// stream short-circuits before the target is evaluated at all. See #615.
+fn eval_slice_expr<S: EvalSemantics, V: DocumentValue>(
+    target: &Expr,
+    start: &Option<Box<Expr>>,
+    end: &Option<Box<Expr>>,
+    value: V,
+    optional: bool,
+    cursor: Option<V::Cursor>,
+) -> GenericResult<V> {
+    // Bounds first: an empty start or end stream must not evaluate the
+    // target at all.
+    let starts = match eval_slice_bound::<S, V>(start, value.clone(), cursor, f64::floor) {
+        Ok(v) => v,
+        Err(Control::Error(e)) => return GenericResult::Error(e),
+        Err(Control::Break(label)) => return GenericResult::Break(label),
+    };
+    if starts.is_empty() {
+        return GenericResult::None;
+    }
+    let ends = match eval_slice_bound::<S, V>(end, value.clone(), cursor, f64::ceil) {
+        Ok(v) => v,
+        Err(Control::Error(e)) => return GenericResult::Error(e),
+        Err(Control::Break(label)) => return GenericResult::Break(label),
+    };
+    if ends.is_empty() {
+        return GenericResult::None;
+    }
+
+    // Borrowed and owned targets are kept apart so the common (borrowed) case
+    // never materializes the document — mirrors `eval_index_expr`.
+    enum Targets<V> {
+        Borrowed(Vec<V>),
+        Owned(Vec<OwnedValue>),
+    }
+    let targets = match eval_single::<S, V>(target, value, false, cursor) {
+        GenericResult::Error(e) => return GenericResult::Error(e),
+        GenericResult::Break(label) => return GenericResult::Break(label),
+        GenericResult::None => return GenericResult::None,
+        // Same conservative Error/Break-only handling as `eval_index_expr`'s
+        // target Partial arm above.
+        GenericResult::Partial(_, Control::Error(e)) => return GenericResult::Error(e),
+        GenericResult::Partial(_, Control::Break(label)) => return GenericResult::Break(label),
+        GenericResult::One(v) => Targets::Borrowed(vec![v]),
+        GenericResult::Many(vs) => Targets::Borrowed(vs),
+        GenericResult::OneCursor(c) => Targets::Borrowed(vec![c.value()]),
+        GenericResult::ManyCursor(cs) => {
+            Targets::Borrowed(cs.iter().map(DocumentCursor::value).collect())
+        }
+        owned @ (GenericResult::Owned(_) | GenericResult::ManyOwned(_)) => {
+            Targets::Owned(owned.collect_owned())
+        }
+    };
+
+    // Start outer, end middle, target inner. The result is always owned:
+    // slicing constructs a fresh array/string, same invariant as
+    // `eval::eval_slice_expr`.
+    let mut out: Vec<OwnedValue> = Vec::with_capacity(starts.len() * ends.len());
+    match &targets {
+        Targets::Borrowed(ts) => {
+            for s in &starts {
+                for e in &ends {
+                    for t in ts {
+                        match slice_one_generic::<V>(t.clone(), *s, *e, optional) {
+                            GenericResult::Owned(v) => out.push(v),
+                            GenericResult::None => {}
+                            GenericResult::Error(e) => return GenericResult::Error(e),
+                            _ => unreachable!("slice_one_generic yields Owned/None/Error"),
+                        }
+                    }
+                }
+            }
+        }
+        Targets::Owned(ts) => {
+            for s in &starts {
+                for e in &ends {
+                    for t in ts {
+                        match slice_owned_value(t, *s, *e, optional) {
+                            Ok(Some(v)) => out.push(v),
+                            Ok(None) => {}
+                            Err(e) => return GenericResult::Error(e),
+                        }
+                    }
+                }
+            }
+        }
+    }
+    match out.len() {
+        1 => GenericResult::Owned(out.pop().expect("len checked")),
+        _ => GenericResult::ManyOwned(out),
+    }
+}
+
+/// Evaluate one slice bound (`start` or `end`) against `value`/`cursor`.
+/// `round` is `f64::floor` for a start bound, `f64::ceil` for an end bound, so
+/// a fractional dynamic bound still widens the slice the way a literal one
+/// does — see `eval::eval_slice_bound`. A missing bound (`None`) is a single
+/// `None` ("open on this side"), not an empty stream.
+fn eval_slice_bound<S: EvalSemantics, V: DocumentValue>(
+    bound: &Option<Box<Expr>>,
+    value: V,
+    cursor: Option<V::Cursor>,
+    round: fn(f64) -> f64,
+) -> Result<Vec<Option<i64>>, Control> {
+    let Some(expr) = bound else {
+        return Ok(vec![None]);
+    };
+    let raw = match eval_single::<S, V>(expr, value, false, cursor) {
+        GenericResult::Error(e) => return Err(Control::Error(e)),
+        GenericResult::Break(label) => return Err(Control::Break(label)),
+        GenericResult::None => return Ok(Vec::new()),
+        GenericResult::Partial(_, control) => return Err(control),
+        other => other.collect_owned(),
+    };
+    raw.iter()
+        .map(|v| owned_bound_to_i64(v, round).map_err(Control::Error))
+        .collect()
+}
+
+/// Apply resolved bounds to one borrowed target. Mirrors `eval::eval_single`'s
+/// `Expr::Slice` arm (arrays/strings/null) directly against `DocumentValue` —
+/// there is no native `Expr::Slice` arm here to delegate to, unlike the
+/// non-generic evaluator. Always returns owned, since slicing always
+/// constructs a fresh value; parallels `index_one_generic` returning `One` or
+/// `Owned`.
+fn slice_one_generic<V: DocumentValue>(
+    target: V,
+    start: Option<i64>,
+    end: Option<i64>,
+    optional: bool,
+) -> GenericResult<V> {
+    if let Some(elements) = target.as_array() {
+        let items = elements.collect_values();
+        let range = SliceBounds::from_literals(start, end).resolve(items.len());
+        return GenericResult::Owned(OwnedValue::Array(
+            items[range].iter().map(to_owned).collect(),
+        ));
+    }
+    if target.is_null() {
+        return GenericResult::Owned(OwnedValue::Null);
+    }
+    if let Some(s) = target.as_str() {
+        let len = s.chars().count();
+        let range = SliceBounds::from_literals(start, end).resolve(len);
+        return GenericResult::Owned(OwnedValue::String(slice_str(&s, range)));
+    }
+    if optional {
+        GenericResult::None
+    } else {
+        GenericResult::Error(EvalError::cannot_index_with_type(
+            target.type_name(),
+            "object",
+        ))
     }
 }
 
@@ -1181,74 +1523,51 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
         }
 
         Builtin::Select(cond) => {
-            // Evaluate condition with cursor context preserved
-            // This is critical for select(di == N) to work correctly
+            // Evaluate condition with cursor context preserved.
+            // This is critical for select(di == N) to work correctly.
             let cond_result = eval_single::<S, _>(cond, value.clone(), false, cursor);
 
-            // Helper to check if an OwnedValue is truthy
-            let is_truthy = |v: &OwnedValue| -> bool {
-                match v {
-                    OwnedValue::Bool(false) | OwnedValue::Null => false,
-                    _ => true, // All other values are truthy
+            let mut bits = Vec::new();
+            let cond_control = push_generic_truthiness(cond_result, &mut bits);
+            let truthy_count = bits.iter().filter(|&&b| b).count();
+
+            // `select` never changes position — every truthy output IS the
+            // input node, so forward the incoming cursor (if any) rather
+            // than dropping it via a plain `One`/`Many`. One republish per
+            // truthy output of a possibly multi-output condition (#378).
+            let pass_n = |n: usize| -> GenericResult<V> {
+                match (n, cursor) {
+                    (0, _) => GenericResult::None,
+                    (1, Some(c)) => GenericResult::OneCursor(c),
+                    (1, None) => GenericResult::One(value.clone()),
+                    (n, Some(c)) => {
+                        GenericResult::ManyCursor(core::iter::repeat(c).take(n).collect())
+                    }
+                    (n, None) => {
+                        GenericResult::Many(core::iter::repeat(value.clone()).take(n).collect())
+                    }
                 }
             };
 
-            // `select` never changes position — the truthy output IS the
-            // input node, so forward the incoming cursor (if any) rather
-            // than dropping it via a plain `One(value)`.
-            let pass =
-                || cursor.map_or(GenericResult::One(value.clone()), GenericResult::OneCursor);
-
-            match cond_result {
-                GenericResult::Owned(ref o) => {
-                    if is_truthy(o) {
-                        pass()
-                    } else {
-                        GenericResult::None
-                    }
+            match cond_control {
+                None => pass_n(truthy_count),
+                // `select(...)? ` swallows the condition's error the same
+                // way `try select(...) catch empty` would — per #400/#494,
+                // that keeps whatever the truthy bits already produced
+                // rather than discarding it too. `break` always propagates,
+                // `optional` or not.
+                Some(Control::Error(_)) if optional => pass_n(truthy_count),
+                Some(control) => {
+                    let prefix: Vec<OwnedValue> = match cursor {
+                        Some(c) => core::iter::repeat_with(|| to_owned(&c.value()))
+                            .take(truthy_count)
+                            .collect(),
+                        None => core::iter::repeat_with(|| to_owned(&value))
+                            .take(truthy_count)
+                            .collect(),
+                    };
+                    partial_generic(prefix, control)
                 }
-                GenericResult::One(v) => {
-                    if is_truthy(&to_owned(&v)) {
-                        pass()
-                    } else {
-                        GenericResult::None
-                    }
-                }
-                GenericResult::OneCursor(c) => {
-                    if is_truthy(&to_owned(&c.value())) {
-                        pass()
-                    } else {
-                        GenericResult::None
-                    }
-                }
-                GenericResult::Error(e) => {
-                    if optional {
-                        GenericResult::None
-                    } else {
-                        GenericResult::Error(e)
-                    }
-                }
-                GenericResult::None => GenericResult::None,
-                GenericResult::Many(_)
-                | GenericResult::ManyOwned(_)
-                | GenericResult::ManyCursor(_) => {
-                    // Multiple results from condition - this is unusual but treat first as condition
-                    // jq behavior: select with multiple outputs uses first truthy value
-                    pass()
-                }
-                GenericResult::Break(label) => GenericResult::Break(label),
-                // The condition is only ever consulted once here (see the
-                // `Many`/`ManyOwned`/`ManyCursor` arm above, a separate,
-                // already-existing limitation) — a `Partial` condition is
-                // conservatively treated the same as a bare `Error`/`Break`.
-                GenericResult::Partial(_, Control::Error(e)) => {
-                    if optional {
-                        GenericResult::None
-                    } else {
-                        GenericResult::Error(e)
-                    }
-                }
-                GenericResult::Partial(_, Control::Break(label)) => GenericResult::Break(label),
             }
         }
 
@@ -1262,7 +1581,7 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                 if let Some(elements) = value.as_array() {
                     let mut values: Vec<OwnedValue> =
                         elements.collect_values().iter().map(to_owned).collect();
-                    let mut rng = ChaCha8Rng::from_os_rng();
+                    let mut rng = ChaCha8Rng::from_rng(&mut rand::rng());
                     values.shuffle(&mut rng);
                     GenericResult::Owned(OwnedValue::Array(values))
                 } else {
@@ -1364,8 +1683,10 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
 
         Builtin::SplitDoc => {
             // split_doc is identity - the output formatting (--- separators)
-            // is handled by the yq runner, not here
-            GenericResult::Owned(to_owned(&value))
+            // is handled by the yq runner, not here. Forward the cursor when
+            // available so duplicate keys survive, same as Values/Iterables/
+            // Scalars/Identity above.
+            cursor.map_or(GenericResult::One(value), GenericResult::OneCursor)
         }
 
         Builtin::Type => {
@@ -1517,8 +1838,8 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
         Builtin::First => {
             // jq: first == .[0], so [] and null both yield null
             if let Some(elements) = value.as_array() {
-                match elements.get(0) {
-                    Some(v) => GenericResult::One(v),
+                match elements.get_cursor(0) {
+                    Some(c) => GenericResult::OneCursor(c),
                     None => GenericResult::Owned(OwnedValue::Null),
                 }
             } else if value.is_null() {
@@ -1537,8 +1858,8 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
             // jq: last == .[-1], so [] and null both yield null
             if let Some(elements) = value.as_array() {
                 let len = elements.len();
-                match len.checked_sub(1).and_then(|i| elements.get(i)) {
-                    Some(v) => GenericResult::One(v),
+                match len.checked_sub(1).and_then(|i| elements.get_cursor(i)) {
+                    Some(c) => GenericResult::OneCursor(c),
                     None => GenericResult::Owned(OwnedValue::Null),
                 }
             } else if value.is_null() {
@@ -1551,6 +1872,17 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                     "number",
                 ))
             }
+        }
+
+        // `first(f)`/`last(f)`: the parser's `parse_call` builtin-name path
+        // produces this spelling for the same syntax `Expr::FirstExpr`/
+        // `LastExpr` cover (see their arms in `eval_single`) -- both must
+        // stay cursor-preserving for the same reason (#607).
+        Builtin::FirstStream(inner) => {
+            eval_first_or_last_generic::<S, _>(inner, value, optional, cursor, false)
+        }
+        Builtin::LastStream(inner) => {
+            eval_first_or_last_generic::<S, _>(inner, value, optional, cursor, true)
         }
 
         Builtin::Reverse => {
@@ -2501,6 +2833,30 @@ mod tests {
         assert_eq!(count, 2);
     }
 
+    #[test]
+    fn test_json_select_many_cursor_condition_forks() {
+        // A condition that iterates (`.[]`) evaluates through the
+        // `ManyCursor` arm of `push_generic_truthiness`. `select` forwards
+        // the *outer* cursor once per truthy element, not the elements
+        // themselves (#378). Pinned against jq 1.7.1.
+        let json = b"[true,false,true]";
+        let index = JsonIndex::build(json);
+        let expr = crate::jq::parse("select(.[])").unwrap();
+
+        let result = eval_with_cursor(&expr, index.root(json));
+        assert_eq!(
+            result.collect_owned(),
+            vec![
+                OwnedValue::Array(vec![
+                    OwnedValue::Bool(true),
+                    OwnedValue::Bool(false),
+                    OwnedValue::Bool(true)
+                ]);
+                2
+            ]
+        );
+    }
+
     // ========================================================================
     // Phase 23: Position-based navigation tests
     // ========================================================================
@@ -3007,14 +3363,20 @@ mod tests {
     }
 
     #[test]
-    fn test_json_iterate_then_single_key_index_expr_yields_one() {
-        // Heterogeneous-flatten path of the `ManyCursor` stage arm: a
-        // computed single-key index yields a plain `One` per element rather
-        // than `OneCursor`, so the per-element results can't stay
-        // `ManyCursor` and must flatten through the `One` arm. Built directly
-        // as `Expr::IndexExpr` rather than parsed from `.["a"]`, since the
-        // parser folds a literal-string bracket index into a plain
-        // `Expr::Field` (which would instead take the all-`OneCursor` path).
+    fn test_json_iterate_then_single_key_index_expr_yields_many_cursor() {
+        // Fixed by #607: `index_one_generic` (behind computed indexing like
+        // `.["a"]`) used to call `fields.find`/`elements.get` instead of the
+        // `find_cursor`/`get_cursor` siblings `Expr::Field`/`Expr::Index`
+        // already used, so a computed single-key index yielded a plain `One`
+        // per element -- forcing the `ManyCursor` stage arm below to flatten
+        // through its heterogeneous-`One` branch instead of staying
+        // `ManyCursor`, which silently dropped duplicate keys inside the
+        // selected value. It now yields `OneCursor` per element just like
+        // `Expr::Field`/`Expr::Index`, so `all_single_cursor` holds and the
+        // whole pipe stays `ManyCursor`. Built directly as `Expr::IndexExpr`
+        // rather than parsed from `.["a"]`, since the parser folds a
+        // literal-string bracket index into a plain `Expr::Field` (which
+        // already took the all-`OneCursor` path before this fix).
         let json = br#"{"items": [{"a": 1}, {"a": 2}]}"#;
         let index = JsonIndex::build(json);
         let expr = Expr::Pipe(vec![
@@ -3027,6 +3389,7 @@ mod tests {
         ]);
 
         let result = eval_with_cursor(&expr, index.root(json));
+        assert!(matches!(result, GenericResult::ManyCursor(_)));
         assert_eq!(
             result.collect_owned(),
             vec![OwnedValue::Int(1), OwnedValue::Int(2)]
@@ -3034,11 +3397,391 @@ mod tests {
     }
 
     #[test]
-    fn test_json_iterate_then_multi_key_index_expr_yields_many_and_many_owned() {
+    fn test_json_first_expr_preserves_duplicate_keys_in_selected_element() {
+        // #607's actual root cause for its own `first(.[])` repro:
+        // `Expr::FirstExpr` (what `crate::jq::parse("first(...)")` builds --
+        // distinct from the zero-arg `Builtin::First` bare-keyword form) had
+        // no native arm in `eval_single`, so it fell through the catch-all
+        // `to_owned()` bridge, which collapses duplicate keys in *every*
+        // nested value -- including the selected element -- before `.[]`
+        // even ran. Now handled natively via `eval_first_or_last_generic`,
+        // forwarding whatever cursor `.[]`'s `ManyCursor` carries for its
+        // first element. `stream_json` (not `collect_owned`, which itself
+        // round-trips through `to_owned`) is the only way to observe this at
+        // the unit level.
+        let json = br#"[{"a":1,"a":2},{"b":3,"b":4}]"#;
+        let index = JsonIndex::build(json);
+        let expr = crate::jq::parse("first(.[])").unwrap();
+
+        let result = eval_with_cursor(&expr, index.root(json));
+        assert!(result.is_single_cursor());
+        let mut out = String::new();
+        result.stream_json(&mut out, 0, |_| Ok(())).unwrap();
+        assert_eq!(out, r#"{"a":1,"a":2}"#);
+    }
+
+    #[test]
+    fn test_json_last_expr_preserves_duplicate_keys_in_selected_element() {
+        // Mirror of the `first(.[])` test above for `last(.[])`.
+        let json = br#"[{"a":1,"a":2},{"b":3,"b":4}]"#;
+        let index = JsonIndex::build(json);
+        let expr = crate::jq::parse("last(.[])").unwrap();
+
+        let result = eval_with_cursor(&expr, index.root(json));
+        assert!(result.is_single_cursor());
+        let mut out = String::new();
+        result.stream_json(&mut out, 0, |_| Ok(())).unwrap();
+        assert_eq!(out, r#"{"b":3,"b":4}"#);
+    }
+
+    #[test]
+    fn test_json_first_stream_builtin_preserves_duplicate_keys() {
+        // `Builtin::FirstStream`/`LastStream` is the second, older internal
+        // spelling of `first(f)`/`last(f)` that `eval::resolve_node` already
+        // treats as equivalent to `Expr::FirstExpr` (see its comment at
+        // eval.rs's `Expr::FirstExpr(inner) | Expr::Builtin(Builtin::FirstStream(inner))`
+        // arm) -- not reachable from `crate::jq::parse` for top-level user
+        // syntax, so built directly here, mirroring how the `IndexExpr` test
+        // above bypasses the parser's own folding.
+        let json = br#"[{"a":1,"a":2},{"b":3,"b":4}]"#;
+        let index = JsonIndex::build(json);
+        let expr = Expr::Builtin(Builtin::FirstStream(Box::new(Expr::Iterate)));
+
+        let result = eval_with_cursor(&expr, index.root(json));
+        assert!(result.is_single_cursor());
+        let mut out = String::new();
+        result.stream_json(&mut out, 0, |_| Ok(())).unwrap();
+        assert_eq!(out, r#"{"a":1,"a":2}"#);
+    }
+
+    #[test]
+    fn test_json_last_stream_builtin_preserves_duplicate_keys() {
+        // Mirror of `test_json_first_stream_builtin_preserves_duplicate_keys`
+        // for `Builtin::LastStream` -- the other `eval_first_or_last_generic`
+        // call site, also unreachable from `crate::jq::parse` (see that
+        // test's comment), so built directly here too.
+        let json = br#"[{"a":1,"a":2},{"b":3,"b":4}]"#;
+        let index = JsonIndex::build(json);
+        let expr = Expr::Builtin(Builtin::LastStream(Box::new(Expr::Iterate)));
+
+        let result = eval_with_cursor(&expr, index.root(json));
+        assert!(result.is_single_cursor());
+        let mut out = String::new();
+        result.stream_json(&mut out, 0, |_| Ok(())).unwrap();
+        assert_eq!(out, r#"{"b":3,"b":4}"#);
+    }
+
+    #[test]
+    fn test_json_first_and_last_of_identity_without_cursor_yield_bare_one() {
+        // `eval_first_or_last_generic`'s `One(v) => One(v)` passthrough arm:
+        // reached when `inner` itself has no cursor to carry (the top-level
+        // `eval()` entry point starts with `cursor = None`, unlike
+        // `eval_with_cursor`), so `.`'s `cursor.map_or(One, OneCursor)`
+        // yields a bare `One` that `first`/`last` must forward unchanged.
+        let json = br#"{"a": 1}"#;
+        let index = JsonIndex::build(json);
+        let value = index.root(json).value();
+
+        let first = eval(&crate::jq::parse("first(.)").unwrap(), value.clone());
+        assert!(matches!(first, GenericResult::One(_)));
+        assert_eq!(
+            first.collect_owned(),
+            vec![OwnedValue::Object(
+                core::iter::once(("a".to_string(), OwnedValue::Int(1))).collect()
+            )]
+        );
+
+        let last = eval(&crate::jq::parse("last(.)").unwrap(), value);
+        assert!(matches!(last, GenericResult::One(_)));
+    }
+
+    #[test]
+    fn test_json_first_and_last_of_identity_with_cursor_yield_one_cursor() {
+        // Same shape as above, but with a cursor available: `.`'s
+        // `cursor.map_or` now takes the `OneCursor` side, exercising
+        // `eval_first_or_last_generic`'s `OneCursor(c) => OneCursor(c)`
+        // passthrough arm rather than its `One` sibling.
+        let json = br#"{"a":1,"a":2}"#;
+        let index = JsonIndex::build(json);
+
+        let first = eval_with_cursor(&crate::jq::parse("first(.)").unwrap(), index.root(json));
+        assert!(first.is_single_cursor());
+        let mut out = String::new();
+        first.stream_json(&mut out, 0, |_| Ok(())).unwrap();
+        assert_eq!(out, r#"{"a":1,"a":2}"#);
+
+        let last = eval_with_cursor(&crate::jq::parse("last(.)").unwrap(), index.root(json));
+        assert!(last.is_single_cursor());
+    }
+
+    #[test]
+    fn test_json_first_and_last_of_multi_truthy_select_without_cursor_yield_bare_many() {
+        // `eval_first_or_last_generic`'s `Many(vs) => One(...)` arm: reached
+        // when `inner` yields a bare (cursor-less) `Many`, which only
+        // happens when `select`'s own incoming cursor is `None` (see
+        // `Builtin::Select`'s `pass_n` closure) -- so this also goes through
+        // the cursor-less `eval()` entry point like the `One` case above.
+        let json = br"1";
+        let index = JsonIndex::build(json);
+        let value = index.root(json).value();
+
+        let first = eval(
+            &crate::jq::parse("first(select(true,true))").unwrap(),
+            value.clone(),
+        );
+        assert!(matches!(first, GenericResult::One(_)));
+        assert_eq!(first.collect_owned(), vec![OwnedValue::Int(1)]);
+
+        let last = eval(&crate::jq::parse("last(select(true,true))").unwrap(), value);
+        assert!(matches!(last, GenericResult::One(_)));
+        assert_eq!(last.collect_owned(), vec![OwnedValue::Int(1)]);
+    }
+
+    #[test]
+    fn test_json_first_and_last_of_single_literal_yield_owned() {
+        // `eval_first_or_last_generic`'s `Owned(v) => Owned(v)` passthrough
+        // arm: a literal falls through `eval_single`'s generic bridge
+        // straight to `GenericResult::Owned`, with no `Many`/cursor wrapping
+        // to unwrap.
+        let json = br"null";
+        let index = JsonIndex::build(json);
+        let value = index.root(json).value();
+
+        let first = eval(&crate::jq::parse("first(1)").unwrap(), value.clone());
+        assert!(matches!(first, GenericResult::Owned(OwnedValue::Int(1))));
+
+        let last = eval(&crate::jq::parse("last(1)").unwrap(), value);
+        assert!(matches!(last, GenericResult::Owned(OwnedValue::Int(1))));
+    }
+
+    #[test]
+    fn test_json_first_and_last_of_comma_literals_yield_many_owned() {
+        // `eval_first_or_last_generic`'s `ManyOwned(vs) => Owned(...)` arm:
+        // `1,2,3` falls through the generic bridge to `ManyOwned`, and
+        // `first`/`last` must pick the front/back element respectively.
+        let json = br"null";
+        let index = JsonIndex::build(json);
+        let value = index.root(json).value();
+
+        let first = eval(&crate::jq::parse("first(1,2,3)").unwrap(), value.clone());
+        assert!(matches!(first, GenericResult::Owned(OwnedValue::Int(1))));
+
+        let last = eval(&crate::jq::parse("last(1,2,3)").unwrap(), value);
+        assert!(matches!(last, GenericResult::Owned(OwnedValue::Int(3))));
+    }
+
+    #[test]
+    fn test_json_first_and_last_of_error_propagate_error() {
+        // `eval_first_or_last_generic`'s `Error(e) => Error(e)` arm in both
+        // directions: an inner expression that errors outright (no
+        // preceding successful output, so no `Partial` prefix) must still
+        // surface as `Error` through `first`/`last`.
+        let json = br"null";
+        let index = JsonIndex::build(json);
+        let value = index.root(json).value();
+
+        let first = eval(
+            &crate::jq::parse(r#"first(error("boom"))"#).unwrap(),
+            value.clone(),
+        );
+        assert!(first.is_error());
+
+        let last = eval(&crate::jq::parse(r#"last(error("boom"))"#).unwrap(), value);
+        assert!(last.is_error());
+    }
+
+    #[test]
+    fn test_json_first_and_last_of_break_propagate_break() {
+        // `eval_first_or_last_generic`'s `Break(label) => Break(label)` arm
+        // in both directions. Built directly as `Expr::Break`, same as
+        // `test_json_iterate_then_break_propagates` above, since a bare
+        // `break $out` needs no enclosing `label` to produce this signal at
+        // the `GenericResult` level -- label-catching happens above this
+        // module.
+        let json = br"null";
+        let index = JsonIndex::build(json);
+        let value = index.root(json).value();
+
+        let first = eval(
+            &Expr::FirstExpr(Box::new(Expr::Break("out".to_string()))),
+            value.clone(),
+        );
+        assert!(matches!(first, GenericResult::Break(label) if label == "out"));
+
+        let last = eval(
+            &Expr::LastExpr(Box::new(Expr::Break("out".to_string()))),
+            value,
+        );
+        assert!(matches!(last, GenericResult::Break(label) if label == "out"));
+    }
+
+    #[test]
+    fn test_json_first_of_partial_prefix_returns_first_owned_value() {
+        // `eval_first_or_last_generic`'s `Partial(vs, _control) =>
+        // Owned(vs[0])` arm (the `first` direction only -- `first` never
+        // asks for values past the first, so the trailing control is
+        // dropped; see the arm's own doc comment). `(1,2,error("x"))`
+        // produces outputs `1`,`2` before erroring, i.e. exactly the
+        // `Partial([1,2], Error)` this arm exists to handle.
+        let json = br"null";
+        let index = JsonIndex::build(json);
+        let value = index.root(json).value();
+
+        let result = eval(
+            &crate::jq::parse(r#"first(1,2,error("x"))"#).unwrap(),
+            value,
+        );
+        assert!(matches!(result, GenericResult::Owned(OwnedValue::Int(1))));
+    }
+
+    #[test]
+    fn test_json_last_of_partial_prefix_drops_prefix_and_keeps_control() {
+        // `eval_first_or_last_generic`'s two `Partial` arms in the `last`
+        // direction: `last` must exhaust the stream to know which output is
+        // last, so a `Partial` prefix can never be "the last output" -- only
+        // its trailing control (`Error` or `Break`) surfaces, with the
+        // prefix silently dropped.
+        let json = br"null";
+        let index = JsonIndex::build(json);
+        let value = index.root(json).value();
+
+        let error_case = eval(
+            &crate::jq::parse(r#"last(1,2,error("x"))"#).unwrap(),
+            value.clone(),
+        );
+        assert!(error_case.is_error());
+
+        let break_case = eval(
+            &Expr::LastExpr(Box::new(Expr::Comma(vec![
+                Expr::Literal(Literal::Int(1)),
+                Expr::Literal(Literal::Int(2)),
+                Expr::Break("out".to_string()),
+            ]))),
+            value,
+        );
+        assert!(matches!(break_case, GenericResult::Break(label) if label == "out"));
+    }
+
+    #[test]
+    fn test_json_split_doc_forwards_cursor() {
+        // Bonus finding from #607's audit: `Builtin::SplitDoc` was
+        // documented as "identity" but unconditionally returned
+        // `GenericResult::Owned(to_owned(&value))`, unlike `Values`/
+        // `Iterables`/`Scalars`/`Identity`, which all forward the incoming
+        // cursor via `cursor.map_or(...)`. Fixed to match.
+        let json = br#"{"a":1,"a":2}"#;
+        let index = JsonIndex::build(json);
+        let expr = Expr::Builtin(Builtin::SplitDoc);
+
+        let result = eval_with_cursor(&expr, index.root(json));
+        assert!(result.is_single_cursor());
+        let mut out = String::new();
+        result.stream_json(&mut out, 0, |_| Ok(())).unwrap();
+        assert_eq!(out, r#"{"a":1,"a":2}"#);
+    }
+
+    #[test]
+    fn test_json_multi_stage_pipe_first_stage_bare_one_without_cursor() {
+        // `eval_pipe_generic`'s `GenericResult::One(v) => eval_single(expr, v,
+        // optional, None)` arm: reached when an *earlier* pipe stage yields a
+        // bare (cursor-less) `One`, which only happens starting from the
+        // cursor-less `eval()` entry point (`eval_with_cursor` always starts
+        // with `Some`). Indirectly a #607-adjacent finding: before #607,
+        // computed-key indexing (`.[$k]`) used to feed this same arm
+        // regardless of cursor presence; after #607 it always carries a
+        // cursor instead, so this arm is now reachable only through a
+        // genuinely cursor-less root.
+        let json = br#"{"a": 1}"#;
+        let index = JsonIndex::build(json);
+        let value = index.root(json).value();
+
+        let result = eval(&crate::jq::parse(". | length").unwrap(), value);
+        assert!(matches!(result, GenericResult::Owned(OwnedValue::Int(1))));
+    }
+
+    #[test]
+    fn test_json_multi_stage_pipe_first_stage_bare_many_without_cursor() {
+        // Sibling of the `One` case above for `eval_pipe_generic`'s
+        // `GenericResult::Many(vs)` stage arm: each of `select`'s two
+        // cursor-less truthy outputs is piped independently into `length`,
+        // accumulating a `ManyOwned` result.
+        let json = br"1";
+        let index = JsonIndex::build(json);
+        let value = index.root(json).value();
+
+        let result = eval(
+            &crate::jq::parse("select(true,true) | length").unwrap(),
+            value,
+        );
+        // `length` of the integer `1` is its absolute value, `1`.
+        assert_eq!(
+            result.collect_owned(),
+            vec![OwnedValue::Int(1), OwnedValue::Int(1)]
+        );
+    }
+
+    #[test]
+    fn test_generic_result_collect_owned_bare_many_variant() {
+        // `GenericResult::collect_owned`'s `Many(vs)` arm: `first`/`last`
+        // always collapse a `Many` down to `One` internally (see
+        // `eval_first_or_last_generic`), so this arm needs a bare `Many`
+        // observed directly at the top level instead -- `select`'s two
+        // cursor-less truthy outputs, same source as the pipe test above.
+        let json = br"1";
+        let index = JsonIndex::build(json);
+        let value = index.root(json).value();
+
+        let result = eval(&crate::jq::parse("select(true,true)").unwrap(), value);
+        assert!(matches!(result, GenericResult::Many(_)));
+        assert_eq!(
+            result.collect_owned(),
+            vec![OwnedValue::Int(1), OwnedValue::Int(1)]
+        );
+    }
+
+    #[test]
+    fn test_json_slice_target_bare_one_and_many_without_cursor() {
+        // `eval_slice_expr`'s `Targets::Borrowed` construction from a bare
+        // `One`/`Many` target: same cursor-less-root precondition as the
+        // pipe-stage tests above, this time for the slice target position
+        // (`E[S:T]`'s `E`) rather than a pipe stage. `eval_slice_expr` (the
+        // `Expr::SliceExpr` arm) is only reachable when a bound doesn't fold
+        // to a literal (#499) -- `[0:2]` with literal bounds instead parses
+        // to the postfix `Expr::Slice` form, which isn't natively handled
+        // here at all and falls through the `to_owned()` bridge. `(1-1)`/
+        // `(1+1)` keep the *values* 0/2 while forcing the `SliceExpr` shape.
+        let json = br"[1, 2, 3]";
+        let index = JsonIndex::build(json);
+        let value = index.root(json).value();
+
+        let one = eval(&crate::jq::parse(".[(1-1):(1+1)]").unwrap(), value.clone());
+        assert_eq!(
+            one.collect_owned(),
+            vec![OwnedValue::Array(vec![
+                OwnedValue::Int(1),
+                OwnedValue::Int(2)
+            ])]
+        );
+
+        let many = eval(
+            &crate::jq::parse("select(true,true)[(1-1):(1+1)]").unwrap(),
+            value,
+        );
+        assert_eq!(
+            many.collect_owned(),
+            vec![
+                OwnedValue::Array(vec![OwnedValue::Int(1), OwnedValue::Int(2)]),
+                OwnedValue::Array(vec![OwnedValue::Int(1), OwnedValue::Int(2)]),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_json_iterate_then_multi_key_index_expr_yields_many_cursor_and_many_owned() {
         // Same flatten path, but the per-element computed index now yields
-        // `Many` (both keys found on the second item) or `ManyOwned` (a mix
-        // of found/missing keys forces the owned fallback on the first and
-        // third items), exercising both arms.
+        // `ManyCursor` (both keys found on the second item, #607) or
+        // `ManyOwned` (a mix of found/missing keys forces the owned fallback
+        // on the first and third items), exercising both arms.
         let json = br#"{"items": [{"a": 1}, {"a": 1, "b": 2}, {"c": 3}]}"#;
         let index = JsonIndex::build(json);
         let expr = crate::jq::parse(r#".items[] | .[("a","b")]"#).unwrap();
@@ -3054,6 +3797,311 @@ mod tests {
                 OwnedValue::Null,
                 OwnedValue::Null,
             ]
+        );
+    }
+
+    #[test]
+    fn test_json_computed_slice_bounds_via_eval_generic() {
+        // #615: exercises Expr::SliceExpr through eval_generic's actual
+        // dispatch path (eval_with_cursor), not eval.rs's outcome()/eval()
+        // helper — which is the path the CLI (jq_runner/yq_runner) actually
+        // uses, and which previously fell into the `_` fallback's full
+        // serialize-and-reindex round trip for every node visited.
+        let json = br#"{"a":[1,2,3,4,5],"k1":1,"k2":3}"#;
+        let index = JsonIndex::build(json);
+        let expr = crate::jq::parse(".a[.k1:.k2]").unwrap();
+
+        let result = eval_with_cursor(&expr, index.root(json));
+        assert_eq!(
+            result.collect_owned(),
+            vec![OwnedValue::Array(vec![
+                OwnedValue::Int(2),
+                OwnedValue::Int(3)
+            ])]
+        );
+    }
+
+    #[test]
+    fn test_json_computed_slice_bounds_realistic_iterate_pattern() {
+        // The issue's own motivating shape: `.items[] | .data[.from:.to]`,
+        // where bounds are computed per-element from sibling fields.
+        let json = br#"{"items": [
+            {"data": [1,2,3,4,5], "from": 0, "to": 2},
+            {"data": [10,20,30,40], "from": 1, "to": 3}
+        ]}"#;
+        let index = JsonIndex::build(json);
+        let expr = crate::jq::parse(".items[] | .data[.from:.to]").unwrap();
+
+        let result = eval_with_cursor(&expr, index.root(json));
+        assert_eq!(
+            result.collect_owned(),
+            vec![
+                OwnedValue::Array(vec![OwnedValue::Int(1), OwnedValue::Int(2)]),
+                OwnedValue::Array(vec![OwnedValue::Int(20), OwnedValue::Int(30)]),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_json_computed_slice_bounds_owned_target() {
+        // The target itself is computed (not a navigational path), so
+        // `eval_single(target, ...)` yields `Owned`/`ManyOwned` rather than a
+        // borrowed document value — exercises `eval_slice_expr`'s
+        // `Targets::Owned` branch, which delegates to `slice_owned_value`
+        // instead of `slice_one_generic`.
+        let json = br#"{"a":[1,2],"b":[3,4],"k1":1,"k2":3}"#;
+        let index = JsonIndex::build(json);
+        let expr = crate::jq::parse("(.a + .b)[.k1:.k2]").unwrap();
+
+        let result = eval_with_cursor(&expr, index.root(json));
+        assert_eq!(
+            result.collect_owned(),
+            vec![OwnedValue::Array(vec![
+                OwnedValue::Int(2),
+                OwnedValue::Int(3)
+            ])]
+        );
+    }
+
+    #[test]
+    fn test_json_computed_slice_bounds_optional_suppresses_non_sliceable_target() {
+        // A trailing `?` covers only the final "target isn't sliceable"
+        // refusal, same rule `eval::eval_slice_expr` documents. The bounds
+        // themselves (`.a`) resolve fine against the same root object.
+        let json = br#"{"a":0}"#;
+        let index = JsonIndex::build(json);
+        let expr = crate::jq::parse(".[(.a):2]?").unwrap();
+
+        let result = eval_with_cursor(&expr, index.root(json));
+        assert!(!result.is_error());
+        assert_eq!(result.collect_owned(), Vec::<OwnedValue>::new());
+    }
+
+    #[test]
+    fn test_json_computed_slice_bounds_empty_end_bound_short_circuits_before_target() {
+        // An empty bound stream must short-circuit *before* the target is
+        // evaluated: `error("boom")` here would raise if the target were
+        // reached at all.
+        let json = b"null";
+        let index = JsonIndex::build(json);
+        let expr = crate::jq::parse(r#"(error("boom"))[0:empty]"#).unwrap();
+
+        let result = eval_with_cursor(&expr, index.root(json));
+        assert!(!result.is_error());
+        assert_eq!(result.collect_owned(), Vec::<OwnedValue>::new());
+    }
+
+    #[test]
+    fn test_json_computed_slice_bounds_empty_start_bound_short_circuits_before_target() {
+        // Symmetric with the end-bound short circuit above: an empty
+        // *start* stream must return `None` before the target — and the end
+        // bound — are ever reached.
+        let json = b"null";
+        let index = JsonIndex::build(json);
+        let expr = crate::jq::parse(r#"(error("boom"))[empty:2]"#).unwrap();
+
+        let result = eval_with_cursor(&expr, index.root(json));
+        assert!(!result.is_error());
+        assert_eq!(result.collect_owned(), Vec::<OwnedValue>::new());
+    }
+
+    #[test]
+    fn test_json_computed_slice_bounds_bound_error_and_break() {
+        // A start or end bound that itself errors or breaks propagates
+        // directly out of `eval_slice_expr` — one arm per side, mirroring
+        // `eval_index_expr`'s key-evaluation `Error`/`Break` arms.
+        let json = br#"{"a":[1,2,3]}"#;
+        let index = JsonIndex::build(json);
+
+        let expr = crate::jq::parse(r#".a[(error("start-boom")):2]"#).unwrap();
+        assert!(eval_with_cursor(&expr, index.root(json)).is_error());
+
+        let expr = crate::jq::parse(".a[(break $out):2]").unwrap();
+        assert!(matches!(
+            eval_with_cursor(&expr, index.root(json)),
+            GenericResult::Break(label) if label == "out"
+        ));
+
+        let expr = crate::jq::parse(r#".a[0:(error("end-boom"))]"#).unwrap();
+        assert!(eval_with_cursor(&expr, index.root(json)).is_error());
+
+        let expr = crate::jq::parse(".a[0:(break $out)]").unwrap();
+        assert!(matches!(
+            eval_with_cursor(&expr, index.root(json)),
+            GenericResult::Break(label) if label == "out"
+        ));
+    }
+
+    #[test]
+    fn test_json_computed_slice_bounds_partial_bound_collapses_to_its_control() {
+        // A bound stream can itself be `Partial` (some outputs, then a
+        // control) — `eval_slice_bound` collapses that to the bare control,
+        // the same reduction a `Partial` *target* gets elsewhere (#400/#494).
+        let json = br#"{"a":[1,2,3]}"#;
+        let index = JsonIndex::build(json);
+
+        let expr = crate::jq::parse(r#".a[(1,2,error("x")):2]"#).unwrap();
+        assert!(eval_with_cursor(&expr, index.root(json)).is_error());
+
+        let expr = crate::jq::parse(".a[(1,2,break $out):2]").unwrap();
+        assert!(matches!(
+            eval_with_cursor(&expr, index.root(json)),
+            GenericResult::Break(label) if label == "out"
+        ));
+    }
+
+    #[test]
+    fn test_json_computed_slice_bounds_open_start_and_open_end() {
+        // A missing bound short-circuits `eval_slice_bound` to a single
+        // `None` ("open on this side") without evaluating anything — on
+        // either side, independently of which bound is the one forcing the
+        // `SliceExpr` fast path.
+        let json = br#"{"a":[1,2,3,4,5],"k1":1,"k2":3}"#;
+        let index = JsonIndex::build(json);
+
+        let expr = crate::jq::parse(".a[:.k2]").unwrap();
+        assert_eq!(
+            eval_with_cursor(&expr, index.root(json)).collect_owned(),
+            vec![OwnedValue::Array(vec![
+                OwnedValue::Int(1),
+                OwnedValue::Int(2),
+                OwnedValue::Int(3)
+            ])]
+        );
+
+        let expr = crate::jq::parse(".a[.k1:]").unwrap();
+        assert_eq!(
+            eval_with_cursor(&expr, index.root(json)).collect_owned(),
+            vec![OwnedValue::Array(vec![
+                OwnedValue::Int(2),
+                OwnedValue::Int(3),
+                OwnedValue::Int(4),
+                OwnedValue::Int(5)
+            ])]
+        );
+    }
+
+    #[test]
+    fn test_json_computed_slice_bounds_target_error_break_none() {
+        // The target's `Error`/`Break`/`None` arms — mirrors
+        // `eval_index_expr`'s own target-evaluation arms directly above
+        // `eval_slice_expr` in the source.
+        let json = b"null";
+        let index = JsonIndex::build(json);
+
+        let expr = crate::jq::parse(r#"(error("boom"))[(0+0):2]"#).unwrap();
+        assert!(eval_with_cursor(&expr, index.root(json)).is_error());
+
+        let expr = crate::jq::parse("(break $out)[(0+0):2]").unwrap();
+        assert!(matches!(
+            eval_with_cursor(&expr, index.root(json)),
+            GenericResult::Break(label) if label == "out"
+        ));
+
+        let expr = crate::jq::parse("(empty)[(0+0):2]").unwrap();
+        let result = eval_with_cursor(&expr, index.root(json));
+        assert!(!result.is_error());
+        assert_eq!(result.collect_owned(), Vec::<OwnedValue>::new());
+    }
+
+    #[test]
+    fn test_json_computed_slice_bounds_single_key_target_is_borrowed_one() {
+        // `.[(0+0)]` — a single computed key — collapses to `One(v)` inside
+        // `eval_index_expr`, so it lands in `eval_slice_expr`'s target match
+        // as a plain borrowed `One`, not `OneCursor`.
+        let json = br"[[1,2,3],[4,5]]";
+        let index = JsonIndex::build(json);
+        let expr = crate::jq::parse(".[(0+0)][(0+0):2]").unwrap();
+
+        let result = eval_with_cursor(&expr, index.root(json));
+        assert_eq!(
+            result.collect_owned(),
+            vec![OwnedValue::Array(vec![
+                OwnedValue::Int(1),
+                OwnedValue::Int(2)
+            ])]
+        );
+    }
+
+    #[test]
+    fn test_json_computed_slice_bounds_multi_key_target_is_borrowed_many_and_errors_per_element() {
+        // `.[(0,1)]` — a multi-key computed index — collapses to a plain
+        // borrowed `Many`, the only shape that reaches that arm (see the
+        // comment on `eval_index_expr`'s own `Many`-producing test). Slicing
+        // its elements (bare numbers) also exercises the borrowed loop's
+        // `Error` arm and `slice_one_generic`'s "not sliceable" refusal, in
+        // the same call.
+        let json = br"[10,20,30]";
+        let index = JsonIndex::build(json);
+        let expr = crate::jq::parse(".[(0,1)][(0+0):2]").unwrap();
+
+        assert!(eval_with_cursor(&expr, index.root(json)).is_error());
+    }
+
+    #[test]
+    fn test_json_computed_slice_bounds_iterate_target_is_many_cursor() {
+        // `.[]` over a document array yields `ManyCursor`, not a plain
+        // `Many` — built directly, since the parser has no bare `.[]`
+        // slice-target spelling to mirror the computed-index cases above.
+        let json = br"[[1,2,3],[4,5,6]]";
+        let index = JsonIndex::build(json);
+        let expr = Expr::slice_by(
+            Expr::Iterate,
+            Some(Expr::Literal(Literal::Int(0))),
+            Some(Expr::Literal(Literal::Int(2))),
+        );
+
+        let result = eval_with_cursor(&expr, index.root(json));
+        assert_eq!(
+            result.collect_owned(),
+            vec![
+                OwnedValue::Array(vec![OwnedValue::Int(1), OwnedValue::Int(2)]),
+                OwnedValue::Array(vec![OwnedValue::Int(4), OwnedValue::Int(5)]),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_json_computed_slice_bounds_owned_target_error_and_optional_none() {
+        // A computed, non-array/string/null owned target: `slice_owned_value`
+        // errors without `?`, and returns `None` (silently) with it —
+        // exercising the owned loop's two non-success arms.
+        let json = b"null";
+        let index = JsonIndex::build(json);
+
+        let expr = crate::jq::parse("(1+1)[(0+0):2]").unwrap();
+        assert!(eval_with_cursor(&expr, index.root(json)).is_error());
+
+        let expr = crate::jq::parse("(1+1)[(0+0):2]?").unwrap();
+        let result = eval_with_cursor(&expr, index.root(json));
+        assert!(!result.is_error());
+        assert_eq!(result.collect_owned(), Vec::<OwnedValue>::new());
+    }
+
+    #[test]
+    fn test_json_computed_slice_bounds_null_target_yields_null() {
+        // A borrowed target that resolves to `null` short-circuits inside
+        // `slice_one_generic` before the array/string checks below it.
+        let json = br#"{"a":null,"k1":0,"k2":1}"#;
+        let index = JsonIndex::build(json);
+        let expr = crate::jq::parse(".a[.k1:.k2]").unwrap();
+
+        let result = eval_with_cursor(&expr, index.root(json));
+        assert_eq!(result.collect_owned(), vec![OwnedValue::Null]);
+    }
+
+    #[test]
+    fn test_json_computed_slice_bounds_string_target() {
+        // A borrowed string target — the arm below the null check and above
+        // the "not sliceable" refusal in `slice_one_generic`.
+        let json = br#"{"a":"hello","k1":1,"k2":3}"#;
+        let index = JsonIndex::build(json);
+        let expr = crate::jq::parse(".a[.k1:.k2]").unwrap();
+
+        let result = eval_with_cursor(&expr, index.root(json));
+        assert_eq!(
+            result.collect_owned(),
+            vec![OwnedValue::String("el".to_string())]
         );
     }
 
@@ -3302,6 +4350,26 @@ mod tests {
             ),
             partial_break(&["10"])
         );
+
+        // `select` fans out over its condition's outputs (#378), so — like
+        // every other stream-forwarding construct above — a `Partial`
+        // condition keeps whatever the truthy bits already produced before
+        // the trailing control surfaces. Matches jq 1.7.1
+        // (`select((true,error("x")))` on `5` prints `5`, then fails).
+        assert_eq!(
+            summarize(b"5", r#"select((true,error("x")))"#),
+            partial_err(&["5"], "x")
+        );
+        assert_eq!(
+            summarize(b"5", "select((true,break $out))"),
+            partial_break(&["5"])
+        );
+        // `select(...)? ` swallows the condition's error like `try select(...)
+        // catch empty` would, but still keeps the truthy bits' output.
+        assert_eq!(
+            summarize(b"5", r#"select((true,error("x")))?"#),
+            Summary::Values(vec!["5".to_string()])
+        );
     }
 
     #[test]
@@ -3328,17 +4396,15 @@ mod tests {
             Summary::Break("out".to_string())
         );
 
-        // `select`'s condition, in all three of its arms.
+        // Computed slicing (#615) shares the same target-position `Partial`
+        // reduction as computed indexing above — one bound (`(0+0)`) is
+        // enough to force `eval_slice_expr`'s fast path.
         assert_eq!(
-            summarize(b"5", r#"select((true,error("x")))"#),
+            summarize(b"[[7],[8]]", r#"(.[0],(.[1],error("x")))[(0+0):2]"#),
             Summary::Error("x".to_string())
         );
         assert_eq!(
-            summarize(b"5", r#"select((true,error("x")))?"#),
-            Summary::None
-        );
-        assert_eq!(
-            summarize(b"5", "select((true,break $out))"),
+            summarize(b"[[7],[8]]", "(.[0],(.[1],break $out))[(0+0):2]"),
             Summary::Break("out".to_string())
         );
     }

@@ -429,7 +429,8 @@ Writing a commit message.
 
 Use [Conventional Commits](https://www.conventionalcommits.org/): `<type>(<scope>): <description>`
 with an optional body and footer. Types in use: `feat`, `fix`, `docs`, `style`, `refactor`, `perf`,
-`test`, `chore`. Scope names the touched area (`json`, `bp`, `yaml`, `dsv`, `bench`, …). For
+`test`, `chore`. Scope names the touched area — see
+[`.omni-dev/scopes.yaml`](../.omni-dev/scopes.yaml) for the canonical, enforced list. For
 performance commits, put the measured speedup in the body. Full detail and examples are in
 [CONTRIBUTING.md](../CONTRIBUTING.md#commit-messages); the
 [`commit-msg` skill](../.claude/skills/commit-msg/SKILL.md) analyses a diff and drafts a message.

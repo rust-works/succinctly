@@ -1,0 +1,1 @@
+[recurse(if . > 2 then error("boom") else .+1 end)]

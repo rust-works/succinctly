@@ -197,10 +197,17 @@ scalar content, so every scan that stops at `\n` must stop at `\r` too.
 | `\r\n` | 2 bytes | Windows — **one** break, so a scan must consume both       |
 | `\r`   | 1 byte  | Classic Mac — a break with no LF to backstop a `\n`-only scan |
 
-**Resolution**: `Parser::{is_break, break_len_at, at_break, skip_line_break}` are
-the single source of truth in the oracle; `light.rs` has the free-function pair
-`is_line_break` / `line_break_len` for the query side. Use them rather than
-testing `b'\n'` by hand.
+**Resolution**: `yaml/line_break.rs` holds the rule in one place —
+`is_line_break` and `line_break_len` — for every consumer of YAML text: the
+oracle, the cursor, the validator and the newline index (#341). Use them rather
+than testing `b'\n'` by hand.
+
+Two wrappers in the oracle look like exceptions and are not.
+`Parser::{is_break, break_len_at}` exist so the `HAS_CR` const generic has
+somewhere to switch (see below); their CR-aware arms call straight through to the
+shared pair, so the rule is still defined once. `Parser::skip_line_break` is the
+one genuine restatement, kept for the measured reason on its doc comment and
+pinned to `line_break_len` by `skip_line_break_agrees_with_line_break_len`.
 
 Two failure modes are worth naming, because [#324](https://github.com/rust-works/succinctly/issues/324)
 hit both:
@@ -257,10 +264,81 @@ too — a blank line between mapping entries makes `a: 1\r\n\r\nb: 2\r\n` resolv
 as `{"a": "1\n", …}` without them. "CRLF is nearly free, only lone CR costs" is
 an appealing theory that the differential harness disproves in 8 corpus cases.
 
-Recovering the rest would mean gating the parser on a `has_cr` flag via a const
-generic, so LF documents keep the original codegen exactly. That buys back the
-diffuse cost at the price of one input scan (~2%), a doubled parser
-monomorphization, and CR-conditioning roughly 25 call sites.
+#### Buying it back: the `HAS_CR` specialization
+
+[#340](https://github.com/rust-works/succinctly/issues/340) took the const-generic
+option this section used to describe as hypothetical. `build_semi_index` runs one
+SIMD pass to answer "is there a `\r` anywhere in this input", then parses with
+`Parser::<false>` or `Parser::<true>`. The LF-only monomorphization compiles every
+`\r` arm out; the CR one is the #324 parser verbatim.
+
+The gate is one-directional, which is what makes it safe to apply incrementally:
+`HAS_CR == true` is always correct, and the whole-input precheck discharges the
+obligation on `false` outright — no `\r` in the input means no `\r` arm is
+reachable, in any context. A site left un-gated is a missed optimization, never a
+bug. Match arms are the one place the const cannot reach (`b'\n' | b'\r' =>` is a
+pattern), so the hot loops use `b if Self::is_break(b) =>` guards and cold sites
+keep the literal.
+
+Interleaved A/B, 3 arms x 3 reps rotated so no arm keeps the thermally-loaded
+slot, `yaml_bench`, all three versus `c5dab403`:
+
+| Machine           | arm      | median | excl. block scalars | block scalars    |
+|-------------------|----------|--------|---------------------|------------------|
+| AMD Ryzen 9 7950X | #324     | +9.1%  | +11.0%              | −11% to −19%     |
+| AMD Ryzen 9 7950X | **#340** | +4.2%  | **+4.7%**           | **−31% to −34%** |
+| Apple M4 Pro      | #324     | +3.6%  | +4.0%               | −6% to +3%       |
+| Apple M4 Pro      | **#340** | +0.8%  | **+0.7%**           | −6% to +3%       |
+
+ARM recovers essentially completely; x86 gets about half back, and its block
+scalars end up well ahead of both baselines. The #324 arms here re-measure a
+little lower than the numbers recorded above (+10.3%/+14.9% and +5.0%/+6.9%),
+which is a different measurement session and shorter criterion sampling, not a
+change in the code — the point of re-measuring all three arms in one interleaved
+sweep is that only within-sweep comparisons are load-bearing.
+
+CRLF documents are unaffected: against the #324 parser the `yaml/crlf` group moves
++1.1% median on the 7950X and +0.5% on the M4 Pro, which is the precheck
+early-exiting on the first line and then doing exactly what #324 did.
+
+End-to-end recovers completely, because index build is only part of the pipeline
+and the query side was never regressed. `dev bench yq`, 4 patterns x {1mb, 10mb}
+x 4 queries = 32 configurations, same interleaving:
+
+| Machine           | arm      | median    | worst                             |
+|-------------------|----------|-----------|-----------------------------------|
+| AMD Ryzen 9 7950X | #324     | +5.0%     | +12.3% (`nested/10mb length`)     |
+| AMD Ryzen 9 7950X | **#340** | **+0.8%** | +4.5% (`comprehensive/10mb .[0]`) |
+| Apple M4 Pro      | #324     | +2.3%     | +8.0%                             |
+| Apple M4 Pro      | **#340** | **−0.2%** | +3.0% (`users/10mb .[0]`)         |
+
+Output identity was gated before any of these timings were believed: 244
+(file x query) configurations on both architectures, byte-identical between the
+#324 parser and #340, and the eight `.[0]` cases where succinctly diverges from
+real `yq` are the same eight in all three arms.
+
+Two things this cost that the estimate above got wrong:
+
+- **"One input scan (~2%)" holds only for documents the parser walks.** It does
+  not hold for ones it *skips*. `long_strings/4096b` is 410 KB of quoted content
+  bulk-skipped at ~15 GB/s, so index build is ~28 µs and a second pass over the
+  input is enormous next to it. The first implementation reused
+  `define_escape_scanner!`, which finds the *position* of a match and pays a
+  movemask extraction per chunk; it put that benchmark **+42%**. Rewriting the
+  precheck as an existence scan — OR the chunk compares, reduce once, 64 bytes
+  per reduction on NEON/SSE2 and 128 on AVX2 — brought it to +7% to +12% on both
+  machines. That residual is the honest floor for any approach that reads the
+  input twice, and `long_strings` is the one group where #340 is *worse* than
+  #324 rather than better. It is the price of the gate, paid by every document
+  including the ones the gate cannot help.
+- **The monomorphization is cheaper than feared.** The release binary grows
+  52 KB (+0.9%), not the doubling the word "doubled" suggests: only the code
+  reachable from both instantiations is duplicated.
+
+Analysed and *not* done: gating `parse_anchor_name`'s CR terminator. Real anchor
+names are 5-20 bytes, below the 32-byte AVX2 threshold, so the vector loop
+carrying the CR compare rarely runs at all — the P5 lesson about SIMD wins that
+do not exist at real input sizes.
 
 ---
 

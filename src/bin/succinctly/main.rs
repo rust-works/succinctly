@@ -259,6 +259,14 @@ enum BenchRunnerSubcommand {
     List(bench_runner::ListArgs),
     /// Run one or more benchmarks
     Run(bench_runner::RunArgs),
+    /// Run benchmarks across configured SSH nodes (issue #98)
+    Orchestrate(bench_runner::OrchestrateArgs),
+    /// Cross-compile and deploy the release binary to configured nodes (issue #98)
+    Sync(bench_runner::SyncArgs),
+    /// Report node status, or start/stop EC2 instances (issue #98)
+    Nodes(bench_runner::NodesArgs),
+    /// Compare orchestrated results across nodes/architectures (issue #98)
+    Report(bench_runner::ReportArgs),
 }
 
 /// Default alias names installed by `install-aliases`.
@@ -467,6 +475,10 @@ struct BenchUtf8Args {
     /// Number of benchmark runs (median is taken)
     #[arg(long, default_value = "3")]
     runs: usize,
+
+    /// Validation engine to time: auto, scalar, broadword or std
+    #[arg(long, default_value = "auto")]
+    engine: String,
 }
 
 /// Generate synthetic JSON files for benchmarking and testing
@@ -1336,6 +1348,10 @@ fn main() -> Result<()> {
         Command::Bench(bench_cmd) => match bench_cmd.command {
             BenchRunnerSubcommand::List(args) => bench_runner::run_list(args),
             BenchRunnerSubcommand::Run(args) => bench_runner::run_benchmarks(args),
+            BenchRunnerSubcommand::Orchestrate(args) => bench_runner::run_orchestrate(args),
+            BenchRunnerSubcommand::Sync(args) => bench_runner::run_sync(args),
+            BenchRunnerSubcommand::Nodes(args) => bench_runner::run_nodes(args),
+            BenchRunnerSubcommand::Report(args) => bench_runner::run_report(args),
         },
         Command::Text(text_cmd) => match text_cmd.command {
             TextSubcommand::Validate(validate_cmd) => match validate_cmd.command {
@@ -1686,6 +1702,7 @@ fn run_utf8_benchmark(args: BenchUtf8Args) -> Result<()> {
         sizes,
         warmup_runs: args.warmup,
         benchmark_runs: args.runs,
+        engine: utf8_bench::Engine::parse(&args.engine)?,
     };
 
     // Use default output paths if not specified
@@ -2161,6 +2178,7 @@ mod text_generators;
 mod text_validate;
 mod utf8_bench;
 mod yaml_generators;
+mod yaml_pattern_registry;
 mod yaml_validate;
 mod yq_bench;
 mod yq_locate;

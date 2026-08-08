@@ -7,7 +7,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **YAML parsing specializes on whether the document contains a carriage return**
+  (#340), recovering most of the cost #324 paid for CRLF and lone-CR
+  correctness. `build_semi_index` runs one SIMD pass over the input and parses
+  with `Parser::<false>` or `Parser::<true>`; the LF-only monomorphization —
+  nearly every document — compiles out every `\r` arm and keeps the pre-#324
+  codegen. Interleaved `yaml_bench` versus `c5dab403`, excluding block scalars:
+  ARM (M4 Pro) +4.0% → **+0.7%**, x86 (7950X) +11.0% → **+4.7%**, with x86 block
+  scalars 31–34% *faster* than the pre-#324 baseline. End-to-end `yq` over 32
+  configurations recovers completely: x86 +5.0% → **+0.8%** median, ARM +2.3% →
+  **−0.2%**. CRLF documents are unchanged (+1.1% x86 / +0.5% ARM, the precheck
+  early-exiting). Output is byte-identical to #324 across 244 file × query
+  configurations on both architectures.
+
+  The one shape that regresses is long quoted scalars, +7% to +12%: the parser
+  bulk-skips those at ~15 GB/s, so the precheck's second pass over the input is
+  large next to the parse it precedes. That is the standing cost of the gate.
+
+  **Breaking** (low-level): `succinctly::yaml::simd::classify_yaml_chars` takes a
+  `const HAS_CR: bool` parameter — call it as `classify_yaml_chars::<true>(..)`
+  for the previous behaviour.
+
 ### Added
+
+- **jq `@csv`/`@tsv`/`@dsv`/`@sh` allocation overhead investigated: no
+  measurable end-to-end effect** (#647, follow-up to #124's real win for
+  `@uri`/`@html`): a byte-scanning rewrite of the four format functions was
+  built to remove their `.replace()`/`format!()`/`Vec<String>` + `.join()`
+  allocation shape. Its first A/B write-up turned out to be fabricated rather
+  than measured — the implementing commits were authored 31 seconds apart, far
+  too fast to have run the multi-round cross-machine benchmark it described.
+  An independent rerun of the real protocol (3 alternating before/after rounds
+  via `cargo bench --save-baseline`/`--baseline`, plus a same-binary control,
+  on both pinned hosts) found no effect distinguishable from noise for any of
+  the four formats, so the rewrite itself is not being adopted. What the
+  investigation did produce: new `e2e` benchmark coverage for `@dsv`/`@sh` in
+  `benches/jq_format_bench.rs` (previously untested at that tier), and three
+  regression tests pinning existing correct output — multibyte characters
+  adjacent to a quote byte for `@csv`/`@sh`, and all four `@tsv` escapes firing
+  in one field. Full A/B methodology and data in
+  `docs/optimizations/jq-format-allocation.md` (#653). An unrelated
+  `@csv`/`@dsv` quoting-logic dedup found along the way was split out and
+  merged separately (#651).
 
 - **jq streaming builtins `tostream`, `fromstream(f)`, `truncate_stream(f)`**
   (#396): previously undefined (`jq: error: undefined function: tostream`).
@@ -99,6 +142,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
+- Removed the deprecated `succinctly::json::locate::NewlineIndex` alias
+  (#542), a compatibility re-export of `succinctly::text::LineIndex` kept
+  since #228. **Breaking**: code still importing `NewlineIndex` must switch
+  to `text::LineIndex` directly — `build`, `to_offset` and `to_line_column`
+  are unchanged.
+
 - Removed `succinctly::jq::EvalError::field_not_found` (#527), whose last two
   callers were the `del()` path walkers fixed below. **Breaking**: the
   constructor is gone from the public API. `field '<name>' not found` was
@@ -126,6 +175,136 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   surface.
 
 ### Fixed
+
+- **`path`/`parent`/`parent(n)`/`key` (yq's path-context builtins) returned
+  the root-level defaults `[]`/`{}`/`null` instead of the real answer
+  whenever they appeared anywhere in a pipe other than the very first stage**
+  (#554): `.a | path` printed `[]` instead of `["a"]`, `.a | parent` printed
+  `{}` instead of `{"a":1}`. `eval.rs` (the library's full evaluator) tracks
+  path context correctly, threading a `current_path` accumulator through
+  every stage of `eval_pipe` whenever `needs_path_context` finds one of these
+  builtins anywhere in the pipe. But the CLI (`sjq`/`syq`) evaluates through
+  `eval_generic.rs`'s independent, cursor-based `Expr::Pipe` handling, which
+  has no path-accumulator of its own; once a preceding stage collapsed to a
+  plain value, its builtin dispatch bridged only the bare trailing builtin
+  (e.g. `Expr::Builtin(PathNoArg)`) to the full evaluator, discarding the
+  surrounding pipe that `needs_path_context` needs to see. `eval_generic.rs`'s
+  `Expr::Pipe` arm now runs the same `needs_path_context` check `eval_pipe`
+  does and, when it fires, bridges the *whole* remaining pipe (not just the
+  one builtin) to the full evaluator, so the existing path-tracking machinery
+  is reached with the pipe structure intact.
+
+- **`break $label` raised inside `while`/`foreach`/`repeat`/`reduce`/`until`'s
+  per-iteration expression raised a spurious error instead of reaching the
+  enclosing `label`** (#575): `eval_owned_expr` evaluated the per-iteration
+  sub-expression (`cond`/`update`/`extract`), then collapsed the resulting
+  `QueryResult` down to `Result<OwnedValue, EvalError>` — its `Break` arm
+  turned the control-flow signal into a synthetic `"break $label not in
+  label"` `EvalError`, indistinguishable by the time it reached `eval_label`,
+  which only recognizes a real `QueryResult::Break`. So `label $out |
+  while(true; if . >= 1 then break $out else .+1 end)` raised that bogus
+  error and exited 5 instead of matching jq's clean `1`, exit 0. Split
+  `eval_owned_expr` into `eval_owned_expr_ctrl` (returns `Result<OwnedValue,
+  Control>`, keeping `Break` distinct from `Error`, the same fix
+  `eval_slice_bound` already applies to slice bounds) with `eval_owned_expr`
+  now a thin wrapper over it, and switched `eval_while`/`eval_foreach`/
+  `eval_repeat`/`eval_reduce`/`eval_until`'s per-iteration evaluation to the
+  new function so a `break` now propagates as `Control::Break` to the
+  enclosing `label`. The issue named `while`/`foreach`/`repeat`; `reduce` and
+  `until` shared the identical defect via the same helper and are fixed
+  alongside them. Also fixes a secondary bug in `reduce`: `optional` (`?`)
+  used to swallow a `break` the same way it swallows a real error — it no
+  longer does, matching jq's `try`/`?` catching errors, not label breaks.
+
+- **`recurse(f)`/`recurse(f; cond)` swallowed an error raised while
+  evaluating `f`/`cond`, treating it as a prune instead of jq's fatal
+  error** (#636): `builtin_recurse_f`, `builtin_recurse_cond`, and their
+  path-tracking sibling `resolve_recurse` each discarded an `Err` from
+  evaluating `f`/`cond` (`if let Ok(...) = ...`, `let Ok(...) = ... else {
+  continue }`, `.unwrap_or_default()`), identically to an empty or falsy
+  result, so `1 | [limit(20; recurse(.+1; if . > 3 then error("boom") else
+  . < 10 end))]` returned `[1,2,3]` instead of erroring. jq's own
+  definition, `def r: ., (f | select(cond) | r); r;`, has nothing that
+  catches an error from `f` or `cond` — it aborts the whole pipeline.
+  Predates #627, which moved the `cond` check to per-child granularity but
+  explicitly kept the swallow (documented as deliberate at the time). All
+  three functions now propagate: the value evaluators return
+  `partial(outputs, Control::Error(e))` (the same helper #495 added for
+  `repeat`/`while`), and `resolve_recurse` returns `Err((outputs, e))`,
+  mirroring `resolve_node`'s own `Comma` arm — in both cases keeping
+  whatever was already committed as output before the error, same as jq's
+  own streamed-then-erroring behavior. Three new golden fixtures pin an
+  erroring `cond`, an erroring `f`, and the path-tracking side; one existing
+  test that had pinned the old swallow as an accepted divergence (comment:
+  "a resolver that propagated would make `path(f)` disagree with `f`") is
+  updated to expect the propagated error, matching jq. **Related, not fixed
+  here**: #635 (breadth-first vs jq's depth-first traversal order in these
+  same functions) remains open and untouched.
+
+- **`resolve_node`'s `select(cond)` and `if cond then .. else .. end` arms
+  collapsed a multi-output `cond` into an always-truthy array, silently
+  treating an all-false `cond` as true** (#628, the "related pattern" #627
+  called out without confirming): both arms evaluated `cond` via
+  `eval_owned_expr`, which wraps 2+ outputs into one non-empty
+  `OwnedValue::Array` regardless of the individual values, so
+  `1 | [path(select((false,false)))]` returned `[[]]` instead of jq's `[]`,
+  and likewise for `if`. This is the path-tracking half reached via
+  `path(...)` and any write (`|=`, `del()`, ...) whose target passes through
+  a `select` or `if` — the value-context counterparts (`builtin_select` via
+  `eval_fanout`, and the value evaluator's `Expr::If` arm) were already
+  correct. Both arms now evaluate `cond` via `eval_owned_multi` and fork once
+  per truthy output, mirroring #627's fix to
+  `builtin_recurse_cond`/`resolve_recurse`: confirmed against jq 1.7.1,
+  `path(select((true,true)))` and `path(if (true,true) then . else empty
+  end)` both fork into `[[],[]]`. Six new golden fixtures pin the collapse
+  and fork cases for both builtins, including writes through them.
+
+- **`recurse(f; cond)` checked `cond` against the wrong node, and collapsed a
+  multi-output `cond` into an always-truthy array** (#627):
+  `builtin_recurse_cond` and its path-tracking sibling `resolve_recurse`
+  evaluated `cond` via `eval_owned_expr` against the *current* node, wrapping
+  2+ outputs into one `OwnedValue::Array` — non-empty and therefore always
+  truthy regardless of the individual values, so
+  `1 | [limit(20; recurse(.+1; (false,false)))]` kept recursing forever
+  instead of stopping at `[1]`. Verified against jq 1.7.1's own definition,
+  `def r: ., (f | select(cond) | r); r;`: the current node is emitted
+  unconditionally (`5 | recurse(.+1; . < 5)` is `5`, not empty — `cond` never
+  gates the node about to be output), `cond` instead gates each *child* of
+  `f` before recursing into it, and a multi-output `cond` forks — `select`
+  re-emits the child once per truthy output, so
+  `1 | recurse(.+1; (.<3,.<3))` visits `2` twice and is `[1,2,2]`. Both
+  functions now check `cond` via `eval_owned_multi` against each child of
+  `f`, pushing that child once per truthy output, restructuring their BFS
+  queues to match; value and path evaluation agree again. Four new golden
+  fixtures pin the collapse, the root-bypass, and the fork cases. **Related,
+  not fixed here**: reviewing this fix surfaced that the same functions'
+  breadth-first queue diverges from jq's depth-first traversal order when a
+  node has 2+ children (#635), and that a `cond`/`f` error is silently
+  swallowed as a prune rather than propagated like jq's fatal error (#636) —
+  both filed as separate follow-ups.
+
+- **`del()` through an out-of-range index silently no-op'd where a `[]` tail
+  should raise** (#529): `[1,2] | del(.[5][])` returned `[1,2]` unchanged
+  where jq raises `Cannot iterate over null (null)` — the last two sites left
+  over from #527's fix, both from #477's original bounds check. The `else`
+  arm of `delete_expr_array_paths`' grouped/comma walker and
+  `delete_at_path`'s `Expr::Pipe` chain-walk `Index` arm skipped the tail
+  outright instead of walking it against a throwaway `null`, the same "reads
+  as `null`, keep walking" rule #527 applied at its own two sites — an
+  out-of-range index is only reachable through `Index`, never through a
+  missing field, so #527 could not have reached it. Both now call
+  `delete_expr_paths_through_absent`/`delete_at_path_through_absent`, #527's
+  own helpers, from their `else` branch instead of returning early. Covers
+  every way in: a positive or negative out-of-range index, and an
+  in-bounds-by-spelling index into an empty array (`[] | del(.[0][])`), with
+  the `[]` any distance past the dead end (`[1,2] | del(.[5].c[])`) and the
+  grouped/comma spelling agreeing with the single-path one
+  (`del(.[5][], .[6][])`). Every other tail keeps the #477 no-op it already
+  had. New coverage:
+  `test_del_through_an_out_of_range_index_still_raises_on_an_iterate_tail` in
+  `src/jq/eval.rs`; the `del_oob_index_iterate_tail`/
+  `del_oob_index_iterate_tail_nested` probes seeded pinning this bug come off
+  `tests/data/jq-error-known-divergences.txt`.
 
 - **jq: a mid-stream error or `break` discarded every output already produced
   by the same evaluation** (#400, #494): `QueryResult` (and its mirror
@@ -318,10 +497,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   in `tests/jq_computed_key_tests.rs`, four
   `tests/data/jq-golden/cases/{,comma_}del_missing_*` fixtures captured from
   the pinned jq oracle, and an `iterate_del_through_missing_field` error probe
-  pinning the `[]`-tail sentence. **Not covered**: the two remaining sites
-  with the same shape are #477's out-of-range-index gates, which no missing
-  key can reach — `[1,2] | del(.[5][])` and `{"a":[1,2]} | del(.a[5][])` are
-  still silent no-ops where jq raises. Tracked in #529.
+  pinning the `[]`-tail sentence. The two remaining sites with the same
+  shape — #477's out-of-range-index gates, which no missing key can reach —
+  were fixed separately by #529, above.
 
 - **jq comma/pipe precedence was inverted, silently dropping outputs** (#462).
   `,` was parsed as the loosest operator, wrapping `|`; jq's grammar is the
@@ -666,17 +844,128 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   through cursor streaming: multi-file pretty output no longer emits a
   spurious leading `---` before the first document.
 
-  Not fixed by this change, since the M2 fast path only gives `Expr::Identity`
-  a true cursor result — `Field`/`Index`/`Iterate` still evaluate to an owned
-  `GenericResult::One`/`Many` and go through `to_owned()` when streamed, so a
-  duplicate key *nested inside* a navigated field (`.a` where `a`'s value has
-  a repeated key) still collapses, in both compact and pretty output, exactly
-  as before this fix (tracked as a comment on #443, which already covers the
-  same `to_owned()`/`IndexMap` mechanism for `to_entries`); `--slurp`,
-  `--inplace` (`yaml_to_owned_value`), and `jq --preserve-input` pretty output
-  (`standard_json_to_jq_value`, gated by `jq_runner.rs`'s
-  `can_use_raw_identity`) go through their own separate, still-`IndexMap`-backed
-  conversions and are tracked in #478.
+  Not fixed by this change at the time: the M2 fast path only gave
+  `Expr::Identity` a true cursor result — `Field`/`Index`/`Iterate` still
+  evaluated to an owned `GenericResult::One`/`Many` and went through
+  `to_owned()` when streamed, so a duplicate key *nested inside* a navigated
+  field (`.a` where `a`'s value has a repeated key) still collapsed, in both
+  compact and pretty output (tracked as a comment on #443, which already
+  covers the same `to_owned()`/`IndexMap` mechanism for `to_entries`).
+  **Since resolved by #532** (`Expr::Identity => GenericResult::OneCursor`,
+  which also converted `Field`/`Index`/`Iterate` to `OneCursor`/`ManyCursor`).
+  `--slurp`, `--inplace` (`yaml_to_owned_value`), and `jq --preserve-input`
+  pretty output (`standard_json_to_jq_value`, gated by `jq_runner.rs`'s
+  `can_use_raw_identity`) went through their own separate, still-`IndexMap`
+  -backed conversions — see #478 below for resolution.
+
+- **`yq --slurp '.'` and `yq --inplace '.'` still silently dropped duplicate
+  mapping keys after #442** (#478): `yq --slurp '.'` on `a: 1\na: 2` printed
+  `a: 2` instead of keeping both entries inside the slurped element, and
+  `yq --inplace '.'` on the same input wrote `a: 2` back to the file,
+  diverging from real `yq --inplace` v4.53.3's `a: 1\na: 2`. Cause: both
+  went through `yaml_to_owned_value()` (`yq_runner.rs`), and `--slurp`'s
+  result was re-collapsed a second time by the `IndexMap`-backed
+  `standard_json_to_owned()` inside `evaluate_input`'s JSON round-trip —
+  neither was reached by #442's fix, which only widened `Expr::Identity`'s
+  path to stdout. (#478's third listed site, `jq --preserve-input` pretty
+  output, turned out to already be fixed incidentally by #532, merged
+  before this fix; only a regression test was added for it here.)
+
+  Fix: `--inplace` now reuses the M2 cursor-streaming machinery for the same
+  shapes `can_use_m2_streaming` already accepts (`.`, `.field`, `.[n]`,
+  `.[]`, and pipes/parens/`?` of those), via new
+  `can_inplace_json_fast_path`/`can_inplace_yaml_fast_path` gates that mirror
+  `can_json_fast_path`/`can_yaml_fast_path` but write into a per-file buffer
+  instead of stdout before the existing `fs::write`. `--slurp` gets a
+  narrower, identity-only fast path (a non-trivial filter over the slurped
+  array still needs real evaluation) backed by a new
+  `yaml::stream_yaml_sequence()` helper: every source is parsed up front
+  into an owned `(bytes, YamlIndex)` pair so their cursors can share one
+  `Vec`'s lifetime, then streamed into a single YAML sequence using the same
+  container-vs-scalar block/flow rendering `stream_yaml_value`'s `Sequence`
+  arm already uses — reused rather than re-derived, so multi-document slurp
+  output matches single-document M2 streaming byte-for-byte. `-o json
+  --slurp` still uses the slow DOM path, the same explicit, documented scope
+  limit `sort_keys`/color/`--tab` already have on the gates above.
+
+  Not fixed by this change: `standard_json_to_jq_value()` is still reachable
+  and lossy through `Builtin::First`/`Builtin::Last` and `Pipe`'s
+  stage-advance re-entry (e.g. `jq --preserve-input 'first(.[])'` on
+  `[{"a":1,"a":2}]` collapses to one `"a"`), found while verifying the
+  `--preserve-input` fix above — filed as #607. **Since resolved by #607**,
+  though its actual root cause was different from this note's suspicion —
+  see below.
+
+- **`jq --preserve-input 'first(.[])'`/`'last(.[])'` still collapsed
+  duplicate keys inside the selected element** (#607): despite #478's note
+  above naming `Builtin::First`/`Builtin::Last` as the culprit, tracing
+  `first(.[])` through the parser found the real cause was one step earlier —
+  `first(f)`/`last(f)` compiles to `Expr::FirstExpr`/`LastExpr` (the
+  dedicated `first(...)` parse path) or, from a second older parser path, the
+  equivalent `Builtin::FirstStream`/`LastStream`, and *neither* had a native
+  arm in `eval_generic::eval_single`. Both fell through the catch-all
+  `to_owned()` bridge at the bottom of that function, which materializes the
+  entire input into an `IndexMap`-backed `OwnedValue` — collapsing the
+  duplicate key *before* `first`/`last` even ran, regardless of what
+  `Builtin::First`/`Builtin::Last` did. Fixed by giving `eval_single` and
+  `eval_builtin` native arms for all four spellings, delegating to a new
+  `eval_first_or_last_generic` helper that mirrors
+  `eval::eval_first_expr`/`eval_last_expr`'s control-flow (short-circuit on
+  first output vs. must-exhaust-the-stream for `last`) while preserving
+  `GenericResult::OneCursor`/`ManyCursor` through the extraction instead of
+  materializing.
+
+  The originally-suspected sites were real bugs too, just not *this* one:
+  `Builtin::First`/`Builtin::Last` (the bare zero-arg `first`/`last` keyword,
+  equivalent to `.[0]`/`.[-1]` — a different AST node from `first(f)`/
+  `last(f)`) called `elements.get(...)` instead of the `get_cursor(...)`
+  sibling `Expr::Index` already used, and `index_one_generic` (behind
+  computed-key indexing like `.[$k]`/`.[(expr)]`, via `Expr::IndexExpr`)
+  called `fields.find`/`elements.get` instead of `find_cursor`/`get_cursor`.
+  Both fixed the same one-line way, plus `eval_index_expr`'s accumulation
+  loop now collects `V::Cursor`s and emits `OneCursor`/`ManyCursor` instead
+  of a materialized `One`/`Many`. Audit bonus: `Builtin::SplitDoc` was
+  documented as "identity" but unconditionally returned
+  `GenericResult::Owned(to_owned(&value))` instead of forwarding the cursor
+  the way `Values`/`Iterables`/`Scalars`/`Identity` already do — fixed to
+  match.
+
+  Out of scope, and documented as such: the catch-all fallback itself (any
+  `Expr`/`Builtin` not natively handled by `eval_single`/`eval_builtin` --
+  arithmetic, `map`, `recurse`, `group_by`, construction, etc.) still
+  materializes via `to_owned()` first; narrowing it further is a much
+  larger-blast-radius change than this issue's scope. Also out of scope:
+  `yq`'s equivalent CLI paths (`evaluate_yaml_cursor` in `yq_runner.rs`)
+  convert *every* `GenericResult::OneCursor`/`One` through `to_owned()`
+  unconditionally, so `yq 'first(.[])'`/`'last(.[])'`/a computed index still
+  collapse duplicate keys even after this fix — confirmed pre-existing
+  (reproduces identically on `main`), unrelated to `standard_json_to_jq_value`
+  (JSON-only), and large enough in its own right to need separate
+  investigation.
+
+- **`yq 'first(.[])'`/`'last(.[])'`/a computed index (`.[(expr)]`) still
+  collapsed duplicate mapping keys** (#631), the `yq`-side follow-up #607
+  above left open: `eval_generic.rs`'s evaluator already threaded
+  `GenericResult::OneCursor`/`ManyCursor` through these shapes correctly
+  (that was #607's fix, shared by both `jq` and `yq`), but `yq_runner.rs`
+  never had a `jq_runner.rs`-style `generic_result_to_jq_values` that could
+  take advantage of it — every expression not covered by `can_use_m2_streaming`
+  (identity/field/index/iterate navigation and pipes/parens/`?` of those) fell
+  through `evaluate_yaml_cursor`'s unconditional `to_owned()` DOM path instead,
+  the same `IndexMap`-backed bridge #442/#478 fixed for plain `.`/`.[0]` but
+  never widened past literal navigation.
+
+  Fixed by widening `can_use_m2_streaming` to also treat `Expr::FirstExpr`/
+  `LastExpr` (`first(f)`/`last(f)`), `Builtin::FirstStream`/`LastStream` (the
+  second AST spelling the parser produces for the same syntax, see #607's
+  note), and `Expr::IndexExpr` (computed indexing) as streamable — the
+  existing M2 fast path's non-identity branch already evaluates via
+  `eval_with_cursor_using` and renders through `GenericResult::stream_yaml`/
+  `stream_json`, which handle every `GenericResult` variant (cursor and owned
+  alike) uniformly, so no new rendering code was needed. `yq 'first(.[])'`
+  now streams through the exact same mechanism as `yq '.[0]'` on the same
+  input, matching it byte-for-byte instead of merely agreeing on the
+  duplicate-key count.
 
 - **The strict YAML validator accepted a flow-collection anchor immediately
   followed by an alias** (#452): `[&a *a]` and `{k: &a *a}` passed
@@ -1747,8 +2036,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Correctness here has a measured price on LF input: `yaml_bench` index build is
   +14.9% median on x86 (7950X) and +6.9% on ARM (M4 Pro) excluding block scalars,
   which are 8–18% *faster* on x86; end-to-end `yq` on a 1 MB document moves
-  +1.8% (`.`) to +6.4% (`.[].name`). See `docs/parsing/yaml.md` for the
-  per-change attribution and the const-generic option that would buy it back.
+  +1.8% (`.`) to +6.4% (`.[].name`). Most of that is bought back in #340 (below);
+  see `docs/parsing/yaml.md` for the per-change attribution.
 - **YAML anchors on sequence items whose value is a collection** (#328): `- &m`
   followed by an indented mapping was read as a multi-line plain scalar, so
   `list:\n  - &m\n    k: v\n  - *m` came out as `{"list":["k"],"v":["k"]}` — a

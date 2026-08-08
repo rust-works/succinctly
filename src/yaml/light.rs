@@ -5124,6 +5124,69 @@ fn write_yaml_indent<Out: core::fmt::Write>(out: &mut Out, spaces: usize) -> cor
     Ok(())
 }
 
+/// Stream independent document cursors as a single YAML sequence (block or
+/// flow style), without materializing an `OwnedValue` DOM.
+///
+/// Unlike `YamlCursor::stream_yaml_value`'s `Sequence` arm, the cursors
+/// here need not share one `YamlIndex` — each may come from its own
+/// document/source. This is what lets `--slurp` wrap multiple slurped
+/// documents into one array while preserving duplicate mapping keys within
+/// each (#478); an `OwnedValue`-based `IndexMap` cannot represent those.
+///
+/// Mirrors the `Sequence` block/flow-style rendering in `stream_yaml_value`
+/// exactly (same container-vs-scalar branching, same empty-sequence `"[]"`
+/// shortcut) so multi-document slurped output matches single-document M2
+/// streaming byte-for-byte.
+pub fn stream_yaml_sequence<'a, W, I, Out>(
+    cursors: I,
+    out: &mut Out,
+    current_indent: usize,
+    indent_spaces: usize,
+) -> core::fmt::Result
+where
+    W: AsRef<[u64]> + 'a,
+    I: IntoIterator<Item = YamlCursor<'a, W>>,
+    Out: core::fmt::Write,
+{
+    let mut iter = cursors.into_iter().peekable();
+    if iter.peek().is_none() {
+        return out.write_str("[]");
+    }
+    if indent_spaces == 0 {
+        // Flow style
+        out.write_char('[')?;
+        let mut first = true;
+        for cursor in iter {
+            if !first {
+                out.write_str(", ")?;
+            }
+            first = false;
+            cursor.stream_yaml_value(out, 0, 0)?;
+        }
+        out.write_char(']')
+    } else {
+        // Block style
+        let mut first = true;
+        for cursor in iter {
+            if !first {
+                out.write_char('\n')?;
+                write_yaml_indent(out, current_indent)?;
+            }
+            first = false;
+            if is_yaml_cursor_container(&cursor) {
+                out.write_char('-')?;
+                out.write_char('\n')?;
+                write_yaml_indent(out, current_indent + indent_spaces)?;
+                cursor.stream_yaml_value(out, current_indent + indent_spaces, indent_spaces)?;
+            } else {
+                out.write_str("- ")?;
+                cursor.stream_yaml_value(out, current_indent + indent_spaces, indent_spaces)?;
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Stream a YAML string value with smart quoting.
 /// Write a non-`String` mapping key as a YAML scalar (issue #222).
 ///
@@ -5938,6 +6001,29 @@ mod tests {
             out,
             "a: 1\nb: true\nc: hello\nd: 1.0\ne: .5\nf: yes\ng: null"
         );
+    }
+
+    #[test]
+    fn test_stream_yaml_sequence_flow_style() {
+        // #478: `stream_yaml_sequence` mirrors `stream_yaml_value`'s Sequence
+        // flow/block duality, but its only caller (`--slurp`) always maps
+        // `-I0` to indent_spaces=2 (yq_runner.rs's documented compact-YAML
+        // quirk), so the flow-style (indent_spaces == 0) branch is
+        // unreachable from the CLI. Exercise it directly as a library
+        // caller would, combining cursors from two independent sources
+        // (the reason this function exists over reusing `stream_yaml_value`'s
+        // own Sequence arm, which requires one shared `YamlIndex`).
+        let bytes_a = b"a: 1\n".to_vec();
+        let index_a = YamlIndex::build(&bytes_a).unwrap();
+        let bytes_b = b"b: 2\n".to_vec();
+        let index_b = YamlIndex::build(&bytes_b).unwrap();
+
+        let cursor_a = index_a.root(&bytes_a).first_child().unwrap();
+        let cursor_b = index_b.root(&bytes_b).first_child().unwrap();
+
+        let mut out = String::new();
+        stream_yaml_sequence([cursor_a, cursor_b], &mut out, 0, 0).unwrap();
+        assert_eq!(out, "[{a: 1}, {b: 2}]");
     }
 
     #[test]

@@ -54,28 +54,6 @@ fn assert_parity(json: &[u8], filter: &str) {
     );
 }
 
-/// Assert the two evaluators currently DISAGREE, pinning both observed outputs.
-/// When the referenced fix aligns them, the `assert_ne!` fails, forcing whoever
-/// lands the fix to convert this into `assert_parity`.
-fn assert_divergence(json: &[u8], filter: &str, full_expected: &[&str], generic_expected: &[&str]) {
-    let full = full_outputs(json, filter);
-    let generic = generic_outputs(json, filter);
-    assert_eq!(
-        as_strs(&full),
-        full_expected,
-        "full evaluator output changed for `{filter}`"
-    );
-    assert_eq!(
-        as_strs(&generic),
-        generic_expected,
-        "generic evaluator output changed for `{filter}`"
-    );
-    assert_ne!(
-        full, generic,
-        "evaluators now AGREE for `{filter}` -- convert to assert_parity"
-    );
-}
-
 #[test]
 fn test_parity_values_builtin() {
     // `values` drops null inputs.
@@ -158,6 +136,219 @@ fn test_object_ordering_parity_162() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Format functions (#124)
+//
+// Formats are pure functions of the value, so the two evaluators must agree on
+// every one. The generic evaluator has no `Expr::Format` arm, so today it
+// reaches them only via the catch-all's `to_json` + `JsonIndex::build`
+// round-trip. These cases pin current behaviour so giving it a direct arm can
+// be proven output-neutral.
+// ---------------------------------------------------------------------------
+
+/// Formats that accept scalars, over every scalar shape.
+#[test]
+fn test_parity_formats_scalar_inputs() {
+    for filter in ["@text", "@json", "@uri", "@html", "@sh", "@yaml", "@props"] {
+        for json in [
+            b"null".as_slice(),
+            b"true",
+            b"false",
+            b"42",
+            b"-1.5",
+            br#""hello world/?&=x""#,
+            br#""<a href=\"x\">&y</a>""#,
+            br#""it's""#,
+            br#""""#,
+        ] {
+            assert_parity(json, filter);
+        }
+    }
+}
+
+/// Array-shaped formats, including the quoting/escaping edge cases.
+#[test]
+fn test_parity_formats_array_inputs() {
+    for json in [
+        br#"["a","b,c",1,true,null]"#.as_slice(),
+        br#"["q\"uote","tab\there","nl\nhere","back\\slash"]"#,
+        br#"["it's",-2.5]"#,
+        br"[]",
+    ] {
+        for filter in [
+            "@csv",
+            "@tsv",
+            r#"@dsv("|")"#,
+            r#"@dsv(",")"#,
+            "@sh",
+            "@json",
+            "@text",
+            "@yaml",
+            "@props",
+        ] {
+            assert_parity(json, filter);
+        }
+    }
+}
+
+/// Formats that only accept strings.
+#[test]
+fn test_parity_formats_string_only() {
+    for filter in ["@base64", "@base64d", "@urid"] {
+        for json in [
+            br#""hello""#.as_slice(),
+            br#""aGVsbG8=""#,
+            br#""%C3%A9""#,
+            br#""a%2Fb%20c""#,
+            br#""100%""#,
+            br#""""#,
+        ] {
+            assert_parity(json, filter);
+        }
+    }
+}
+
+/// A format that rejects its input must reject it identically in both.
+#[test]
+fn test_parity_formats_type_errors() {
+    for (json, filter) in [
+        (br#"{"a":1}"#.as_slice(), "@uri"),
+        (br#"{"a":1}"#, "@html"),
+        (br#"{"a":1}"#, "@sh"),
+        (b"42", "@csv"),
+        (b"42", "@tsv"),
+        (b"42", "@base64"),
+        (b"42", "@urid"),
+        (br#""notanarray""#, "@csv"),
+    ] {
+        assert_parity(json, filter);
+    }
+}
+
+/// The shape that matters most for #124: a *constructed* value piped into a
+/// format routes through `eval_on_owned`, not `eval_single`, so it needs its
+/// own coverage.
+#[test]
+fn test_parity_formats_piped_from_constructed() {
+    let json = br#"{"a":"x y","b":2,"c":"q\"uote"}"#;
+    for filter in [
+        r"[.a,.b] | @csv",
+        r"[.a,.c] | @csv",
+        r"[.a,.b] | @tsv",
+        r#"[.a,.b] | @dsv(";")"#,
+        r"[.a,.b] | @json",
+        r"[.a,.b] | @sh",
+        r"[.a,.b] | @text",
+        r".a | @uri",
+        r".a | @html",
+        r".c | @sh",
+    ] {
+        assert_parity(json, filter);
+    }
+}
+
+/// Formats applied per-element across an iteration -- the CLI's common shape.
+#[test]
+fn test_parity_formats_over_iteration() {
+    let json = br#"{"u":[{"n":"a b","v":1},{"n":"c&d","v":2}]}"#;
+    for filter in [
+        ".u[] | .n | @uri",
+        ".u[] | .n | @html",
+        ".u[] | [.n,.v] | @csv",
+        ".u[] | [.n,.v] | @tsv",
+        "[.u[].n] | @csv",
+        ".u[] | @json",
+    ] {
+        assert_parity(json, filter);
+    }
+}
+
+/// Non-finite floats exercise `numeric_display_string`/`owned_to_yaml`/
+/// `props_value_to_string` (eval.rs), which already rendered `"inf"`/`".nan"`/
+/// etc. correctly before #124 -- both evaluators agreed on these even when the
+/// generic evaluator had no direct `Expr::Format` arm, since its catch-all
+/// round-trip goes through `to_json_for_reindex` (preserving, #561), not plain
+/// `to_json` (nulling). #124's direct arm doesn't change that outcome, only
+/// how cheaply it's reached.
+///
+/// The pinned full-evaluator values below are asserted explicitly so parity
+/// can't silently re-agree on a *new* wrong answer.
+///
+/// Note neither evaluator matches real jq here: jq 1.7.1 preserves the source
+/// literal and prints `1E+400` for all of these. That literal-preservation gap
+/// is a separate pre-existing issue, out of scope for #124.
+#[test]
+fn test_formats_non_finite_parity_124() {
+    for (json, filter, expected) in [
+        (b"1e400".as_slice(), "@text", r#""inf""#),
+        (b"-1e400", "@text", r#""-inf""#),
+        (b"1e400", "@uri", r#""inf""#),
+        (b"1e400", "@html", r#""inf""#),
+        (b"1e400", "@yaml", r#"".inf""#),
+        (b"1e400", "@props", r#"".inf""#),
+        (b"[1e400]", "@csv", r#""inf""#),
+        (b"[1e400]", "@tsv", r#""inf""#),
+        (b"[1e400]", "@sh", r#""inf""#),
+    ] {
+        assert_eq!(
+            as_strs(&full_outputs(json, filter)),
+            [expected],
+            "full evaluator output changed for `{filter}`"
+        );
+        assert_parity(json, filter);
+    }
+}
+
+/// `@json` is immune: `format_json` calls `to_json`, which nulls non-finites
+/// itself, so both evaluators already agree.
+#[test]
+fn test_formats_non_finite_json_parity() {
+    assert_parity(b"1e400", "@json");
+    assert_parity(b"[1e400]", "@json");
+}
+
+/// When the format's input is a *constructed* value, the full evaluator also
+/// round-trips it through JSON (`eval_owned_pipe`/`eval_owned_input`), and that
+/// round-trip is likewise `to_json_for_reindex`-based rather than nulling
+/// (#561), so both evaluators already agree on the non-finite rendering here
+/// too. `eval_on_owned`'s `Format` fast path (#124) formats these directly with
+/// no guard, for the same reason `eval_single`'s arm needs none.
+#[test]
+fn test_formats_non_finite_owned_pipe_parity() {
+    assert_parity(b"[1e400]", "[.[]] | @csv");
+    assert_parity(b"[1e400]", "[.[]] | @tsv");
+    assert_parity(b"[1e400]", "[.[]] | @sh");
+    assert_parity(b"1e400", "[.] | @csv");
+}
+
+/// `?` on a format applied to a *constructed* value (arithmetic, array/object
+/// construction, ...) must still suppress a type-mismatch error. These formats
+/// suppress it internally (`format_csv`/`format_tsv`/`format_dsv`/
+/// `format_base64`/`format_base64d`/`format_urid` return `Ok("")` rather than
+/// `Err` when their `optional` argument is set) -- that is the only mechanism
+/// that makes `?` work here, there is no separate `Expr::Optional`-catches-
+/// `Error` fallback for this path. A constructed value reaches the format via
+/// `eval_on_owned`'s fast path (#124), which must therefore forward the real
+/// `optional` flag rather than hardcoding `false`.
+#[test]
+fn test_formats_optional_owned_type_error_parity_124() {
+    for (json, filter, expected) in [
+        (b"null".as_slice(), "(1+1 | @csv)?", r#""""#),
+        (b"null", "(1+1 | @tsv)?", r#""""#),
+        (b"null", r#"(1+1 | @dsv("|"))?"#, r#""""#),
+        (b"null", "(1+1 | @base64)?", r#""""#),
+        (b"null", "(1+1 | @base64d)?", r#""""#),
+        (b"null", "(1+1 | @urid)?", r#""""#),
+    ] {
+        assert_eq!(
+            as_strs(&full_outputs(json, filter)),
+            [expected],
+            "full evaluator output changed for `{filter}`"
+        );
+        assert_parity(json, filter);
+    }
+}
+
 #[test]
 fn test_numeric_equality_parity_156() {
     // `OwnedValue`'s equality is now numeric-aware (#156), so both evaluators
@@ -218,21 +409,43 @@ fn test_stream_operator_parity_160() {
 
 #[test]
 fn test_multi_output_condition_in_select_parity_160() {
-    // `and`/`or` can now hand `select` a multi-output condition, where the two
-    // evaluators disagree: `builtin_select` (eval.rs) tests the first output,
-    // while eval_generic's `Builtin::Select` treats any multi-output condition
-    // as truthy outright. jq fans the condition out instead, emitting the input
-    // once per truthy output -- so both are wrong, in different ways.
+    // `and`/`or` can hand `select`/`if` a multi-output condition. Before
+    // #378, the two evaluators disagreed about it: `builtin_select`/`eval_if`
+    // (eval.rs) tested only the condition's first output, while eval_generic's
+    // `Builtin::Select` treated any multi-output condition as truthy outright.
+    // jq fans the condition out instead, running the body once per output --
+    // #378 makes both evaluators do that, so this is now `assert_parity`
+    // rather than the `assert_divergence` it was pinned as.
     //
-    // That drift predates #160; #160 only widened what can reach it. Pinned
-    // here rather than fixed, because fixing `select` is the separate
-    // follow-up. jq's answer for the filter below is no output at all, which
-    // is what the full evaluator happens to give.
+    // Every expectation is pinned against jq-1.7.1 first, so parity can't lock
+    // in an agreed-upon wrong answer (this file's header failure mode).
     assert_eq!(
         as_strs(&full_outputs(b"1", "[(false,false) and true]")),
         ["[false,false]"]
     );
-    assert_divergence(b"1", "select((false,false) and true)", &[], &["1"]);
+    assert_eq!(
+        as_strs(&full_outputs(b"1", "select((false,false) and true)")),
+        Vec::<&str>::new(),
+        "full evaluator disagrees with jq"
+    );
+    assert_parity(b"1", "select((false,false) and true)");
+
+    assert_eq!(
+        as_strs(&full_outputs(b"1", "select((true,false) and true)")),
+        ["1"],
+        "full evaluator disagrees with jq"
+    );
+    assert_parity(b"1", "select((true,false) and true)");
+
+    assert_eq!(
+        as_strs(&full_outputs(
+            b"null",
+            r#"if (true,false) then "a" else "b" end"#
+        )),
+        [r#""a""#, r#""b""#],
+        "full evaluator disagrees with jq"
+    );
+    assert_parity(b"null", r#"if (true,false) then "a" else "b" end"#);
 }
 
 #[test]
@@ -317,44 +530,25 @@ fn test_nan_container_ordering_parity_421() {
         ("[1,nan] | max", "1"),
         ("[nan,1] | max", "1"),
         // A single NaN in the array needs no dedup/grouping decision against
-        // another NaN, so this one is unaffected by the separate defect below.
+        // another NaN, so this one needed no fix from #472's NaN-survival
+        // work below.
         ("[nan,1,2] | group_by(.)", "[[null],[1],[2]]"),
+        // These three used to collapse distinct NaNs into a single `null`
+        // (`[null]` / `[null,1]` / `[[null,null],[1]]`): a freshly
+        // constructed array is materialized through JSON text on its way to
+        // `unique`/`group_by` (JSON has no NaN literal), which turned each
+        // NaN into a genuine `Null` *before* `compare_values` ever ran, and
+        // two real `Null`s legitimately compare `Equal`. #472 preserves NaN
+        // through that round trip, so each NaN now stays distinct, exactly
+        // like jq's own `nan != nan`.
+        ("[nan,nan] | unique", "[null,null]"),
+        ("[nan,1,nan] | unique", "[null,null,1]"),
+        ("[nan,nan,1] | group_by(.)", "[[null],[null],[1]]"),
     ] {
         assert_eq!(
             as_strs(&full_outputs(b"null", filter)),
             [expected],
             "full evaluator disagrees with jq for `{filter}`"
-        );
-        assert_parity(b"null", filter);
-    }
-}
-
-#[test]
-fn test_nan_container_ordering_known_divergence_421() {
-    // jq keeps NaN a real NaN internally and only turns it into `null` at
-    // print time, so `[nan,nan] | unique` keeps both (jq: `[null,null]`).
-    // Here, a freshly-constructed array is materialized through JSON text on
-    // its way to `unique`/`group_by` (JSON has no NaN literal), which turns
-    // each NaN into a genuine `Null` *before* `compare_values` ever runs --
-    // and two real `Null`s legitimately compare `Equal`, so they collapse.
-    //
-    // This is the separate, pre-existing defect #421 calls out ("nan does
-    // not survive as a number") -- not a comparator bug, and out of scope for
-    // this fix. Pinning the current (wrong, but internally consistent
-    // between both evaluators) answer here so a fix for that defect has a
-    // failing test to flip, rather than silently dropping coverage.
-    for (filter, current_answer) in [
-        ("[nan,nan] | unique", "[null]"),
-        ("[nan,1,nan] | unique", "[null,1]"),
-        ("[nan,nan,1] | group_by(.)", "[[null,null],[1]]"),
-    ] {
-        assert_eq!(
-            as_strs(&full_outputs(b"null", filter)),
-            [current_answer],
-            "full evaluator answer changed for `{filter}` -- if this now matches jq \
-             (`[null,null]` / `[null,null,1]` / `[[null],[null],[1]]` respectively), \
-             the separate NaN-materialization defect is fixed: update this test's \
-             expectation and move the case into test_nan_container_ordering_parity_421"
         );
         assert_parity(b"null", filter);
     }
@@ -732,5 +926,115 @@ fn slice_path_component_agrees_across_evaluators() {
             String::from_utf8_lossy(json)
         );
         assert_parity(json, filter);
+    }
+}
+
+#[test]
+fn test_object_construction_product_parity_354() {
+    // Object construction is a generator: an entry whose key or value yields n
+    // outputs multiplies the objects produced (#354). Both evaluators route
+    // `Expr::Object` through eval.rs -- eval_generic has no Object arm -- so
+    // parity alone cannot catch this bug. Every expectation below is therefore
+    // pinned against real jq-1.7.1 first, then locked in by assert_parity.
+    for (json, filter, expected) in [
+        // The LAST entry varies fastest; within an entry the key varies slower
+        // than the value. A transposed product would order these differently.
+        (
+            b"null".as_slice(),
+            "{a: (1,2), b: (3,4)}",
+            vec![
+                r#"{"a":1,"b":3}"#,
+                r#"{"a":1,"b":4}"#,
+                r#"{"a":2,"b":3}"#,
+                r#"{"a":2,"b":4}"#,
+            ],
+        ),
+        // Multi-output keys are a product too, not an error.
+        (
+            b"null",
+            r#"{("x","y"): (1,2)}"#,
+            vec![r#"{"x":1}"#, r#"{"x":2}"#, r#"{"y":1}"#, r#"{"y":2}"#],
+        ),
+        // Borrowed (document-derived) multi-output values, not just literals.
+        (
+            br#"{"x":9,"y":8}"#,
+            "{k: .[]}",
+            vec![r#"{"k":9}"#, r#"{"k":8}"#],
+        ),
+        // An entry with zero outputs empties the whole product.
+        (b"null", "{a: empty, b: 1}", vec![]),
+        // Duplicate keys: last value wins, first position kept.
+        (b"null", "{a:1, b:2, a:3}", vec![r#"{"a":3,"b":2}"#]),
+        // A multi-output object as the RHS of a pipe. The full evaluator reaches
+        // this via eval_owned_pipe, which used to fold the outputs into a single
+        // array while the generic path kept them -- so this case is what keeps
+        // the two evaluators honest after #354.
+        (
+            b"null",
+            r#"{"p":1} | {a: (2,3)}"#,
+            vec![r#"{"a":2}"#, r#"{"a":3}"#],
+        ),
+    ] {
+        let full = full_outputs(json, filter);
+        assert_eq!(
+            as_strs(&full),
+            expected,
+            "full evaluator disagrees with jq for `{filter}`"
+        );
+        assert_parity(json, filter);
+    }
+}
+
+/// `path`/`parent`/`parent(n)`/`key` (yq's path-context builtins) only get
+/// their `current_path` threaded through `eval.rs`'s `eval_pipe`, reached
+/// when `needs_path_context` sees one of them anywhere in an `Expr::Pipe`
+/// list (#554). The generic (CLI/cursor) evaluator has its own independent
+/// `Expr::Pipe` handling with no path-accumulator of any kind, and used to
+/// bridge only the bare trailing builtin to the full evaluator once a
+/// preceding stage collapsed to a plain value -- discarding the very pipe
+/// structure `needs_path_context` needs to see. That silently returned the
+/// root-level defaults (`[]`/`{}`/null) for any of these builtins appearing
+/// anywhere but the first pipe stage. Every case here is wrong (mismatched
+/// with `full_outputs`) before the generic evaluator's `Expr::Pipe` arm also
+/// bridges the *whole* pipe once `needs_path_context` fires.
+#[test]
+fn test_path_context_builtins_survive_pipe_parity_554() {
+    for (json, filter, expected) in [
+        // The issue's own repro cases.
+        (br#"{"a":1}"#.as_slice(), ".a | path", r#"["a"]"#),
+        (br#"{"a":1}"#, ".a | parent", r#"{"a":1}"#),
+        (br#"{"a":1}"#, ".a | key", r#""a""#),
+        (br#"{"a":{"b":1}}"#, ".a.b | parent", r#"{"b":1}"#),
+        // `parent(n)`: n=1 matches bare `parent`; n=2 climbs one further.
+        (
+            br#"{"a":{"b":{"c":1}}}"#,
+            ".a.b.c | parent(1)",
+            r#"{"c":1}"#,
+        ),
+        (
+            br#"{"a":{"b":{"c":1}}}"#,
+            ".a.b.c | parent(2)",
+            r#"{"b":{"c":1}}"#,
+        ),
+        // A stage after the path-context builtin keeps consuming its output.
+        (br#"{"a":1}"#, ".a | path | .[0]", r#""a""#),
+        // A multi-output preceding stage (iteration): `key` reports each
+        // element's own key/index, not just the first.
+        (br"[10,20,30]", ".[] | key", "0"),
+        (br#"{"x":1,"y":2}"#, ".[] | key", r#""x""#),
+        // Bare, first-stage usage was already correct -- locked in here
+        // too so a future change can't silently regress it.
+        (br#"{"a":1}"#, "path", "[]"),
+        (br#"{"a":1}"#, "parent", "{}"),
+        (br#"{"a":1}"#, "key", "null"),
+    ] {
+        assert_parity(json, filter);
+        let generic = generic_outputs(json, filter);
+        assert_eq!(
+            as_strs(&generic)[0],
+            expected,
+            "unexpected CLI (generic evaluator) output for `{filter}` on `{}`",
+            String::from_utf8_lossy(json)
+        );
     }
 }

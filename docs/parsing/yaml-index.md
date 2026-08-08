@@ -43,7 +43,7 @@ Oracle output:
 | Component                 | Purpose                     | Notes                                         |
 |---------------------------|-----------------------------|-----------------------------------------------|
 | Interest Bits (IB)        | Structural positions        | Same as JSON                                  |
-| Balanced Parentheses (BP) | Tree structure              | With `WithSelect` for `at_offset`             |
+| Balanced Parentheses (BP) | Tree structure              | With `WithCsPoppy` for `at_offset` (#64)      |
 | Type Bits (TY)            | Distinguish container types | YAML-specific: maps vs sequences vs scalars   |
 | Advance Positions         | BP-to-text mapping          | Memory-efficient bitmap (P12)                 |
 | End Positions             | Node end boundaries         | For value extraction                          |
@@ -60,7 +60,7 @@ This eliminated the `OwnedValue` intermediate representation, yielding a **2.3x 
 
 ## Optimization Journey
 
-YAML parsing has an extensive documented optimization history (P0-P12, O1-O4):
+YAML parsing has an extensive documented optimization history (P0-P12, O1-O5):
 
 | Phase | Result          | Technique                                    |
 |-------|-----------------|----------------------------------------------|
@@ -74,6 +74,7 @@ YAML parsing has an extensive documented optimization history (P0-P12, O1-O4):
 | O1    | +3-13%          | Sequential cursor for AdvancePositions       |
 | O3    | 4-12x micro     | SIMD escape scanning (NEON)                  |
 | O4    | −12.5% peak mem | seq_items elimination (text-derived detection)|
+| O5    | 4x smaller select | CS-Poppy combined sampling for BP select1 (#64)|
 
 **Rejected** (with documented reasons): P2.6 (prefetching), P2.8 (threshold tuning), P3 (branchless), P5-P8 (various), all documented in [yaml.md](yaml.md).
 
@@ -99,7 +100,7 @@ list of unsupported features (tags, `%YAML`/`%TAG` directives).
 
 ## Depends On
 
-- [BalancedParens](../architecture/balanced-parens.md) — with `WithSelect` generic parameter
+- [BalancedParens](../architecture/balanced-parens.md) — with `WithCsPoppy` generic parameter
 - [LineIndex](../optimizations/line-index.md) — line/column lookup, built lazily on first use
 
 IB, TY and the container bits are plain `W: AsRef<[u64]>` with cumulative-rank `Vec<u32>`, not

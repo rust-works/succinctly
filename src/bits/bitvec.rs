@@ -145,6 +145,30 @@ impl BitVec {
         self.len - self.ones_count
     }
 
+    /// Find position of the k-th 0-bit (0-indexed).
+    ///
+    /// Returns `None` if fewer than `k+1` zeros exist.
+    ///
+    /// O(log n) binary search over `rank0`, which is already O(1) — unlike
+    /// `select1` there is no dedicated zero-sample index (issue #602: no
+    /// known consumer justifies building one yet).
+    pub fn select0(&self, k: usize) -> Option<usize> {
+        if k >= self.count_zeros() {
+            return None;
+        }
+        let mut lo = 0usize;
+        let mut hi = self.len;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if self.rank0(mid + 1) > k {
+                hi = mid;
+            } else {
+                lo = mid + 1;
+            }
+        }
+        Some(lo)
+    }
+
     /// Access the bit at position `i`.
     ///
     /// # Panics

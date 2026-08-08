@@ -70,6 +70,10 @@ pub struct YamlCharClass {
     /// YAML 1.2 §5.4 makes `\r` a line break in its own right, so scalar scans
     /// must stop at one exactly as they stop at `\n`. Kept separate from
     /// `newlines` so callers that genuinely mean LF still get LF (#324).
+    ///
+    /// Always `0` when the classifier was called with `HAS_CR == false`, which is
+    /// how a document with no carriage return in it avoids paying for the compare
+    /// (#340). Read it only under the same const the call site passed.
     pub carriage_returns: u32,
     /// Mask of bytes that are ':'
     pub colons: u32,
@@ -111,9 +115,20 @@ impl YamlCharClass {
     /// of `skip_unquoted_simd`. (Not an intra-doc link: that module is not
     /// compiled on x86_64.) The two disagreed until #185 — this one omitted
     /// `\r` before #324, and the broadword one added `spaces`.
+    ///
+    /// `HAS_CR` must be the one [`classify_yaml_chars`] was called with. Passing
+    /// `false` drops the `\r` arm at compile time, which is sound precisely
+    /// because that classifier left `carriage_returns` zero; the const is what
+    /// lets the optimizer *know* it, across a `#[target_feature]` call it cannot
+    /// see through (#340). The broadword twin takes no such parameter — the ARM
+    /// classifier is ungated, and the path that reads it is disabled anyway.
     #[inline(always)]
-    pub fn plain_scalar_terminators(&self) -> u32 {
-        self.newlines | self.carriage_returns | self.colons | self.hash
+    pub fn plain_scalar_terminators<const HAS_CR: bool>(&self) -> u32 {
+        let mut terminators = self.newlines | self.colons | self.hash;
+        if HAS_CR {
+            terminators |= self.carriage_returns;
+        }
+        terminators
     }
 }
 
@@ -121,8 +136,18 @@ impl YamlCharClass {
 ///
 /// This is the main P0 optimization - bulk classification of YAML characters.
 /// Falls back to SSE2 (16 bytes) for inputs smaller than 32 bytes.
+///
+/// `HAS_CR` selects whether the `\r` mask is computed at all. The kernels carry
+/// `#[target_feature]`, so they are never inlined into their caller and the
+/// optimizer cannot see that a caller ignores `carriage_returns` — the compare
+/// and its movemask survive to the instruction stream unless the const removes
+/// them here. That is the ~2pp the #324 attribution charges to this function
+/// (#340).
 #[inline]
-pub fn classify_yaml_chars(input: &[u8], offset: usize) -> Option<YamlCharClass> {
+pub fn classify_yaml_chars<const HAS_CR: bool>(
+    input: &[u8],
+    offset: usize,
+) -> Option<YamlCharClass> {
     // Require at least 16 bytes for SSE2
     if offset + 16 > input.len() {
         return None;
@@ -131,13 +156,13 @@ pub fn classify_yaml_chars(input: &[u8], offset: usize) -> Option<YamlCharClass>
     #[cfg(any(test, feature = "std"))]
     {
         if offset + 32 <= input.len() && avx2_enabled() {
-            return Some(unsafe { classify_yaml_chars_avx2(input, offset) });
+            return Some(unsafe { classify_yaml_chars_avx2::<HAS_CR>(input, offset) });
         }
     }
 
     // Fallback to SSE2 (requires 16 bytes minimum)
     if offset + 16 <= input.len() {
-        return Some(unsafe { classify_yaml_chars_sse2(input, offset) });
+        return Some(unsafe { classify_yaml_chars_sse2::<HAS_CR>(input, offset) });
     }
 
     None
@@ -146,12 +171,14 @@ pub fn classify_yaml_chars(input: &[u8], offset: usize) -> Option<YamlCharClass>
 /// AVX2 implementation of character classification (32 bytes at a time).
 #[cfg(any(test, feature = "std"))]
 #[target_feature(enable = "avx2")]
-unsafe fn classify_yaml_chars_avx2(input: &[u8], offset: usize) -> YamlCharClass {
+unsafe fn classify_yaml_chars_avx2<const HAS_CR: bool>(
+    input: &[u8],
+    offset: usize,
+) -> YamlCharClass {
     let chunk = _mm256_loadu_si256(input.as_ptr().add(offset).cast::<__m256i>());
 
     // Create comparison vectors for each character
     let v_newline = _mm256_set1_epi8(b'\n' as i8);
-    let v_carriage_return = _mm256_set1_epi8(b'\r' as i8);
     let v_colon = _mm256_set1_epi8(b':' as i8);
     let v_hyphen = _mm256_set1_epi8(b'-' as i8);
     let v_space = _mm256_set1_epi8(b' ' as i8);
@@ -162,7 +189,6 @@ unsafe fn classify_yaml_chars_avx2(input: &[u8], offset: usize) -> YamlCharClass
 
     // Compare and extract masks
     let eq_newline = _mm256_cmpeq_epi8(chunk, v_newline);
-    let eq_carriage_return = _mm256_cmpeq_epi8(chunk, v_carriage_return);
     let eq_colon = _mm256_cmpeq_epi8(chunk, v_colon);
     let eq_hyphen = _mm256_cmpeq_epi8(chunk, v_hyphen);
     let eq_space = _mm256_cmpeq_epi8(chunk, v_space);
@@ -173,7 +199,11 @@ unsafe fn classify_yaml_chars_avx2(input: &[u8], offset: usize) -> YamlCharClass
 
     YamlCharClass {
         newlines: _mm256_movemask_epi8(eq_newline) as u32,
-        carriage_returns: _mm256_movemask_epi8(eq_carriage_return) as u32,
+        carriage_returns: if HAS_CR {
+            _mm256_movemask_epi8(_mm256_cmpeq_epi8(chunk, _mm256_set1_epi8(b'\r' as i8))) as u32
+        } else {
+            0
+        },
         colons: _mm256_movemask_epi8(eq_colon) as u32,
         hyphens: _mm256_movemask_epi8(eq_hyphen) as u32,
         spaces: _mm256_movemask_epi8(eq_space) as u32,
@@ -187,12 +217,14 @@ unsafe fn classify_yaml_chars_avx2(input: &[u8], offset: usize) -> YamlCharClass
 
 /// SSE2 implementation of character classification (16 bytes at a time).
 #[target_feature(enable = "sse2")]
-unsafe fn classify_yaml_chars_sse2(input: &[u8], offset: usize) -> YamlCharClass {
+unsafe fn classify_yaml_chars_sse2<const HAS_CR: bool>(
+    input: &[u8],
+    offset: usize,
+) -> YamlCharClass {
     let chunk = _mm_loadu_si128(input.as_ptr().add(offset).cast::<__m128i>());
 
     // Create comparison vectors for each character
     let v_newline = _mm_set1_epi8(b'\n' as i8);
-    let v_carriage_return = _mm_set1_epi8(b'\r' as i8);
     let v_colon = _mm_set1_epi8(b':' as i8);
     let v_hyphen = _mm_set1_epi8(b'-' as i8);
     let v_space = _mm_set1_epi8(b' ' as i8);
@@ -203,7 +235,6 @@ unsafe fn classify_yaml_chars_sse2(input: &[u8], offset: usize) -> YamlCharClass
 
     // Compare and extract masks
     let eq_newline = _mm_cmpeq_epi8(chunk, v_newline);
-    let eq_carriage_return = _mm_cmpeq_epi8(chunk, v_carriage_return);
     let eq_colon = _mm_cmpeq_epi8(chunk, v_colon);
     let eq_hyphen = _mm_cmpeq_epi8(chunk, v_hyphen);
     let eq_space = _mm_cmpeq_epi8(chunk, v_space);
@@ -214,7 +245,11 @@ unsafe fn classify_yaml_chars_sse2(input: &[u8], offset: usize) -> YamlCharClass
 
     YamlCharClass {
         newlines: _mm_movemask_epi8(eq_newline) as u32,
-        carriage_returns: _mm_movemask_epi8(eq_carriage_return) as u32,
+        carriage_returns: if HAS_CR {
+            _mm_movemask_epi8(_mm_cmpeq_epi8(chunk, _mm_set1_epi8(b'\r' as i8))) as u32
+        } else {
+            0
+        },
         colons: _mm_movemask_epi8(eq_colon) as u32,
         hyphens: _mm_movemask_epi8(eq_hyphen) as u32,
         spaces: _mm_movemask_epi8(eq_space) as u32,
@@ -996,7 +1031,7 @@ mod tests {
     fn test_classify_yaml_chars_basic() {
         // Keep input under 16 bytes for SSE2 test
         let input = b"key: #val-item\nmore";
-        let class = classify_yaml_chars(input, 0).unwrap();
+        let class = classify_yaml_chars::<true>(input, 0).unwrap();
 
         // Check colon at position 3
         assert_ne!(class.colons & (1 << 3), 0, "Colon not found at position 3");
@@ -1025,7 +1060,7 @@ mod tests {
     #[test]
     fn test_classify_yaml_chars_quotes() {
         let input = b"a: \"val\" 'x'end."; // 16 bytes
-        let class = classify_yaml_chars(input, 0).unwrap();
+        let class = classify_yaml_chars::<true>(input, 0).unwrap();
 
         // Check double quote at position 3
         assert_ne!(
@@ -1059,7 +1094,7 @@ mod tests {
     #[test]
     fn test_classify_yaml_chars_backslash() {
         let input = b"text: \"esc\\n\"ok."; // 16 bytes
-        let class = classify_yaml_chars(input, 0).unwrap();
+        let class = classify_yaml_chars::<true>(input, 0).unwrap();
 
         // Check backslash at position 10
         assert_ne!(
@@ -1093,7 +1128,7 @@ mod tests {
     fn test_classify_context_sensitive() {
         // Test ": " pattern (colon followed by space)
         let input = b"key: val t:1:2x."; // 16 bytes
-        let class = classify_yaml_chars(input, 0).unwrap();
+        let class = classify_yaml_chars::<true>(input, 0).unwrap();
 
         // Colon at position N followed by space at N+1 means:
         // - Colon bit is set at position N
@@ -1126,7 +1161,7 @@ mod tests {
     fn test_classify_hyphen_space_pattern() {
         // Test "- " pattern (hyphen followed by space)
         let input = b"- item\nval-nosp."; // 16 bytes
-        let class = classify_yaml_chars(input, 0).unwrap();
+        let class = classify_yaml_chars::<true>(input, 0).unwrap();
 
         // Hyphen at position N followed by space at N+1
         let hyphen_space_pattern = class.hyphens & (class.spaces >> 1);
@@ -1181,7 +1216,7 @@ mod tests {
     #[test]
     fn test_succinctly_simd_env_contract() {
         let buf = [b'a'; 64];
-        let width = classify_yaml_chars(&buf, 0).unwrap().width;
+        let width = classify_yaml_chars::<true>(&buf, 0).unwrap().width;
 
         match std::env::var("SUCCINCTLY_SIMD") {
             Ok(v) => match parse_simd_clamp(&v) {
@@ -1235,6 +1270,41 @@ mod tests {
         ]
     }
 
+    /// `HAS_CR` must zero the `\r` channel and change *nothing* else (#340).
+    ///
+    /// Both halves matter. If the const failed to suppress the CR mask, the
+    /// optimization would be a no-op that still measured as a win by accident;
+    /// if it perturbed another channel, `skip_unquoted_simd` would start skipping
+    /// over colons or hashes and the parse would silently change shape.
+    #[test]
+    fn test_classify_has_cr_gate_only_affects_the_cr_channel() {
+        // Every structural byte present at once, plus a `\r` at 1, 10, and 24 so
+        // every tested offset's minimum (16-byte SSE2) window contains one: [0,
+        // 16), [4, 20), and [16, 32) respectively. A single `\r` cannot satisfy
+        // all three — those windows don't share a common byte.
+        let input = b"a\rb\nc:d-e \r\"g'h\\i#jklmno\rqrstuvwxyz0123456789";
+        for &offset in &[0usize, 4, 16] {
+            let with = classify_yaml_chars::<true>(input, offset).unwrap();
+            let without = classify_yaml_chars::<false>(input, offset).unwrap();
+
+            assert_eq!(without.carriage_returns, 0, "CR mask must vanish @{offset}");
+            assert_ne!(
+                with.carriage_returns, 0,
+                "fixture must actually contain a CR in the chunk @{offset}"
+            );
+            assert_eq!(with.width, without.width, "width must not change @{offset}");
+            // carriage_returns is excluded: it is the one channel the gate is
+            // *supposed* to change, already pinned by the two assertions above.
+            for ((a, name), (b, _)) in classify_channels(&with)
+                .iter()
+                .zip(classify_channels(&without).iter())
+                .filter(|((_, name), _)| *name != "carriage_returns")
+            {
+                assert_eq!(a, b, "{name} channel changed under HAS_CR=false @{offset}");
+            }
+        }
+    }
+
     /// Per-kernel differential sweep for the classify path (#247, option 2 of
     /// the issue): a lone structural byte at every position 0..40 of an
     /// otherwise-inert buffer, asserted against both kernels directly. The
@@ -1262,7 +1332,7 @@ mod tests {
                 buf[pos] = byte;
 
                 // SSE2 kernel at offset 0: sees bytes 0..16 only.
-                let sse2 = unsafe { classify_yaml_chars_sse2(&buf, 0) };
+                let sse2 = unsafe { classify_yaml_chars_sse2::<true>(&buf, 0) };
                 assert_eq!(sse2.width, 16, "SSE2 must report a 16-byte width");
                 for (i, (mask, name)) in classify_channels(&sse2).iter().enumerate() {
                     let expected = if i == channel && pos < 16 {
@@ -1277,7 +1347,7 @@ mod tests {
                 }
 
                 // SSE2 kernel at offset 16: covers the #231 window 16..31.
-                let sse2_hi = unsafe { classify_yaml_chars_sse2(&buf, 16) };
+                let sse2_hi = unsafe { classify_yaml_chars_sse2::<true>(&buf, 16) };
                 for (i, (mask, name)) in classify_channels(&sse2_hi).iter().enumerate() {
                     let expected = if i == channel && (16..32).contains(&pos) {
                         1u32 << (pos - 16)
@@ -1291,7 +1361,7 @@ mod tests {
                 }
 
                 if run_avx2 {
-                    let avx2 = unsafe { classify_yaml_chars_avx2(&buf, 0) };
+                    let avx2 = unsafe { classify_yaml_chars_avx2::<true>(&buf, 0) };
                     assert_eq!(avx2.width, 32, "AVX2 must report a 32-byte width");
                     let sse2_lo = classify_channels(&sse2);
                     for (i, (mask, name)) in classify_channels(&avx2).iter().enumerate() {
@@ -1337,8 +1407,8 @@ mod tests {
         for byte in terminating.into_iter().chain(passing) {
             let mut buf = [b'a'; 48];
             buf[3] = byte;
-            let class = classify_yaml_chars(&buf, 0).expect("48 bytes available");
-            let stops = class.plain_scalar_terminators() & (1 << 3) != 0;
+            let class = classify_yaml_chars::<true>(&buf, 0).expect("48 bytes available");
+            let stops = class.plain_scalar_terminators::<true>() & (1 << 3) != 0;
 
             assert_eq!(
                 stops,
@@ -1355,8 +1425,29 @@ mod tests {
 
         // An inert chunk sets nothing, so the mask is not simply always hot.
         let inert = [b'a'; 48];
-        let class = classify_yaml_chars(&inert, 0).expect("48 bytes available");
-        assert_eq!(class.plain_scalar_terminators(), 0);
+        let class = classify_yaml_chars::<true>(&inert, 0).expect("48 bytes available");
+        assert_eq!(class.plain_scalar_terminators::<true>(), 0);
+    }
+
+    /// The `HAS_CR == false` specialization drops `\r` from the terminator set —
+    /// the whole point of the const (#340). Sound only because the parser reaches
+    /// this arm only for documents with no `\r` in them at all, so pin the
+    /// remaining three bytes too: the gate must remove the CR arm and nothing
+    /// else.
+    #[test]
+    fn plain_scalar_terminators_without_cr_drops_only_the_cr_arm() {
+        for (byte, stops_ungated) in [(b'\n', true), (b'\r', true), (b':', true), (b'#', true)] {
+            let mut buf = [b'a'; 48];
+            buf[3] = byte;
+            let class = classify_yaml_chars::<false>(&buf, 0).expect("48 bytes available");
+
+            assert_eq!(
+                class.plain_scalar_terminators::<false>() & (1 << 3) != 0,
+                stops_ungated && byte != b'\r',
+                "0x{byte:02x} ({:?}) under HAS_CR == false",
+                byte as char
+            );
+        }
     }
 
     // ========================================================================

@@ -42,7 +42,7 @@ Bytes retained by `text::LineIndex` per corpus file, against what the dense-bitm
 
 ## YAML
 
-files: 7, total bytes: 17150, anchors: 41, aliases: 86, bare-dash items: 5
+files: 7, total bytes: 17150, anchors: 41, aliases: 86, bare-dash items: 5, CRLF/CR files: 0.00% (0/7)
 
 | metric               | unit         | n   | min  | p50  | p90  | p99  | max  |
 | -------------------- | ------------ | --- | ---- | ---- | ---- | ---- | ---- |
@@ -50,6 +50,7 @@ files: 7, total bytes: 17150, anchors: 41, aliases: 86, bare-dash items: 5
 | mapping keys         | keys/mapping | 234 | 0    | 2    | 3    | 9    | 69   |
 | sequence items       | items/seq    | 66  | 1    | 2    | 3    | 4    | 4    |
 | bare-dash seq items  | count/file   | 7   | 0    | 0    | 5    | 5    | 5    |
+| CR line breaks       | count/file   | 7   | 0    | 0    | 0    | 0    | 0    |
 | flow-collection size | bytes/flow   | 4   | 2    | 2    | 100  | 100  | 100  |
 | nesting depth        | levels/node  | 741 | 2    | 5    | 8    | 11   | 12   |
 | anchors              | count/file   | 7   | 0    | 0    | 41   | 41   | 41   |

@@ -36,22 +36,49 @@ use serde::{Deserialize, Serialize};
 
 use crate::bits::{scan_select, SelectIndex};
 use crate::util::broadword::select_in_word;
+use crate::Config;
 
 // ============================================================================
 // Select support traits for zero-cost abstraction
 // ============================================================================
 
+/// Everything a [`SelectSupport`] implementation may consult to answer a query.
+///
+/// Passing the rank directory alongside the words is what makes *combined
+/// sampling* possible: [`WithCsPoppy`] searches `rank_l1` directly instead of
+/// scanning bitmap words, so its samples only need to record a block index
+/// rather than a `(word, cumulative)` pair (#64).
+#[derive(Clone, Copy, Debug)]
+pub struct BpSelectCtx<'a> {
+    /// The parenthesis bits (1=open, 0=close).
+    pub words: &'a [u64],
+    /// Number of valid bits; positions at or above this are not real.
+    pub len: usize,
+    /// Total 1-bits below `len`.
+    pub total_ones: usize,
+    /// Absolute cumulative rank at the start of each 512-bit block.
+    pub rank_l1: &'a [u32],
+    /// Packed 7 x 9-bit per-word rank offsets within each 512-bit block.
+    pub rank_l2: &'a [u64],
+}
+
 /// Trait for optional select support on balanced parentheses.
 ///
 /// This enables zero-cost abstraction: JSON uses `NoSelect` (ZST, no overhead),
-/// while YAML uses `WithSelect` for O(1) select1 queries.
+/// while YAML uses [`WithCsPoppy`] for O(1) select1 queries.
 pub trait SelectSupport: Clone + Default {
     /// Build select support from word data.
     fn build(words: &[u64], total_ones: usize) -> Self;
 
     /// Perform select1 query: find the position of the k-th 1-bit (0-indexed).
-    /// Returns None if k >= total_ones.
-    fn select1(&self, words: &[u64], len: usize, total_ones: usize, k: usize) -> Option<usize>;
+    /// Returns None if k >= `ctx.total_ones`.
+    fn select1(&self, ctx: BpSelectCtx<'_>, k: usize) -> Option<usize>;
+
+    /// Returns the heap memory this select support retains, in bytes.
+    ///
+    /// Zero for [`NoSelect`]. Exposed so the space cost of select support can
+    /// be measured rather than derived (#64).
+    fn heap_size(&self) -> usize;
 }
 
 /// No select support (zero-sized type for JSON).
@@ -69,21 +96,48 @@ impl SelectSupport for NoSelect {
     }
 
     #[inline]
-    fn select1(&self, _words: &[u64], _len: usize, _total_ones: usize, _k: usize) -> Option<usize> {
+    fn select1(&self, _ctx: BpSelectCtx<'_>, _k: usize) -> Option<usize> {
         // NoSelect doesn't support select1 - caller should use binary search on rank1
         None
+    }
+
+    #[inline]
+    fn heap_size(&self) -> usize {
+        0
     }
 }
 
 /// Select support using sampled index (for YAML).
 ///
 /// Uses the existing SelectIndex from bits module for O(1) jump + short scan.
+///
+/// The samples are `u32`-wide: `build_bp_index` asserts `len <= u32::MAX` bits,
+/// so both a word index (`<= 2^26`) and a cumulative count (`<= len`) fit. That
+/// halves the index relative to the `u64` width `BitVec` needs, which matters
+/// here because balanced parens are ~50% ones by construction — the densest
+/// case, where a sampled select index is at its most expensive (#64).
+///
+/// # Deprecated
+///
+/// Superseded by [`WithCsPoppy`], which answers the same queries from half the
+/// memory by sampling into the rank directory instead of alongside it. Migrate
+/// by swapping the type parameter and the constructor:
+///
+/// ```text
+/// BalancedParens::new_with_select(words, len)        -> new_with_cspoppy
+/// BalancedParens::from_words_with_select(words, len) -> from_words_with_cspoppy
+/// ```
+#[deprecated(
+    since = "0.8.0",
+    note = "use `WithCsPoppy`: same queries, half the select-index memory (#64)"
+)]
 #[derive(Clone, Debug, Default)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct WithSelect {
-    select_idx: SelectIndex,
+    select_idx: SelectIndex<u32>,
 }
 
+#[allow(deprecated)] // STYLE-0004: keeps the deprecated WithSelect path compiling and tested
 impl SelectSupport for WithSelect {
     fn build(words: &[u64], total_ones: usize) -> Self {
         // INVARIANT: `total_ones` must count only the valid bits below `len`
@@ -94,14 +148,18 @@ impl SelectSupport for WithSelect {
         // masked popcount of the target word, so select_in_word never lands on
         // a stray bit (the `result < len` check backstops the rest).
         //
-        // Use default sample rate of 256 for ~3% overhead
+        // INVARIANT: the u32 sample width above is sound only because
+        // build_bp_index has already asserted len <= u32::MAX. Every caller
+        // reaches this through that assert.
+        //
+        // Use default sample rate of 256.
         Self {
             select_idx: SelectIndex::build(words, total_ones, 256),
         }
     }
 
-    fn select1(&self, words: &[u64], len: usize, total_ones: usize, k: usize) -> Option<usize> {
-        if k >= total_ones {
+    fn select1(&self, ctx: BpSelectCtx<'_>, k: usize) -> Option<usize> {
+        if k >= ctx.total_ones {
             return None;
         }
 
@@ -109,7 +167,7 @@ impl SelectSupport for WithSelect {
         let (start_word, remaining) = self.select_idx.jump_to(k);
 
         // Scan forward for the word holding the target bit.
-        let (word_idx, rem) = scan_select(words, start_word, remaining)?;
+        let (word_idx, rem) = scan_select(ctx.words, start_word, remaining)?;
 
         // #40: words popcounted by this scan, including the crossing word.
         #[cfg(feature = "select-stats")]
@@ -118,13 +176,217 @@ impl SelectSupport for WithSelect {
             word_idx - start_word + 1,
         );
 
-        let bit_pos = select_in_word(words[word_idx], rem as u32) as usize;
+        let bit_pos = select_in_word(ctx.words[word_idx], rem as u32) as usize;
         let result = word_idx * 64 + bit_pos;
-        if result < len {
+        if result < ctx.len {
             Some(result)
         } else {
             None
         }
+    }
+
+    #[inline]
+    fn heap_size(&self) -> usize {
+        self.select_idx.heap_size()
+    }
+}
+
+/// Default sample rate for [`WithCsPoppy`]: one sample per this many 1-bits.
+///
+/// Matches [`SelectIndex`]'s default so existing tuning keeps its meaning.
+/// Override per-build via [`Config::select_sample_rate`] and
+/// [`WithCsPoppy::build_with_rate`] (#601).
+const CS_POPPY_SAMPLE_RATE: u32 = 256;
+
+/// Combined-sampling select support (CS-Poppy), the preferred choice for YAML.
+///
+/// Stores a single `u32` **block index** per sampled 1-bit — the 512-bit rank
+/// block containing it — instead of [`WithSelect`]'s `(word, cumulative)` pair.
+/// The cumulative count is not stored because `rank_l1` already holds it
+/// absolutely, which is what makes the sampling "combined": the select index is
+/// a set of entry points into the rank directory rather than a parallel
+/// structure.
+///
+/// # Query
+///
+/// `select1(k)` brackets the answer between two samples, binary-searches
+/// `rank_l1` inside that bracket, then reads `rank_l2`'s 9-bit per-word offsets
+/// to land on the exact word. Only the final word is touched, so — unlike
+/// [`WithSelect`], which scans words counting ones — the cost does not grow as
+/// the bitvector gets sparser.
+///
+/// # Space
+///
+/// 4 bytes per sample rate's worth of ones: 6.25% of the bitmap at balanced-
+/// parenthesis density and the default rate of 256, against [`WithSelect`]'s
+/// 12.5% and the 25% that pair cost before it was narrowed (#64). The rate is
+/// tunable — see [`build_with_rate`](WithCsPoppy::build_with_rate) and
+/// [`Config::select_sample_rate`] — trading index memory for a wider
+/// `select1` search bracket (#601).
+///
+/// # Example
+///
+/// ```
+/// use succinctly::trees::{BalancedParens, WithCsPoppy};
+///
+/// // "(()())" = bits 0b001011
+/// let bp = BalancedParens::<Vec<u64>, WithCsPoppy>::new_with_cspoppy(vec![0b001011u64], 6);
+/// assert_eq!(bp.select1(0), Some(0)); // first open
+/// assert_eq!(bp.select1(2), Some(3)); // third open
+/// assert_eq!(bp.select1(3), None);    // only three opens
+/// ```
+#[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct WithCsPoppy {
+    /// Rank-block index containing every `rate`-th 1-bit.
+    ///
+    /// `u32` is sound because `build_bp_index` asserts `len <= u32::MAX` bits,
+    /// bounding the block count to 2^23.
+    samples: Vec<u32>,
+    /// Sample rate this index was built with (see [`CS_POPPY_SAMPLE_RATE`]).
+    rate: u32,
+}
+
+impl Default for WithCsPoppy {
+    fn default() -> Self {
+        Self {
+            samples: Vec::new(),
+            rate: CS_POPPY_SAMPLE_RATE,
+        }
+    }
+}
+
+impl WithCsPoppy {
+    /// Builds combined-sampling select support at a custom sample rate.
+    ///
+    /// [`SelectSupport::build`] calls this with `CS_POPPY_SAMPLE_RATE` (256).
+    /// Lower rates spend more memory for a narrower `select1` search bracket;
+    /// higher rates spend less memory for a wider one — see the module-level
+    /// space table (#601).
+    ///
+    /// A `rate` of 0 is treated as 1, matching [`SelectIndex::build`].
+    pub fn build_with_rate(words: &[u64], total_ones: usize, rate: u32) -> Self {
+        let rate = rate.max(1);
+        let rate_usize = rate as usize;
+
+        // INVARIANT: as for WithSelect, `total_ones` counts only bits below
+        // `len` (build_bp_index masks the final partial word, #188). Stray
+        // 1-bits above `len` can therefore only appear above every sampled
+        // position, and select1's `result < len` check backstops them.
+        if words.is_empty() || total_ones == 0 {
+            return Self {
+                samples: Vec::new(),
+                rate,
+            };
+        }
+
+        let mut samples = Vec::with_capacity(total_ones / rate_usize + 1);
+        let mut count: usize = 0;
+        let mut next_sample = 0usize;
+
+        for (word_idx, &word) in words.iter().enumerate() {
+            let pop = word.count_ones() as usize;
+
+            while next_sample < total_ones && count + pop > next_sample {
+                let block = word_idx / WORDS_PER_RANK_BLOCK;
+                debug_assert!(
+                    u32::try_from(block).is_ok(),
+                    "block index {block} exceeds u32; len must be <= u32::MAX bits (#188)"
+                );
+                samples.push(block as u32);
+                next_sample += rate_usize;
+            }
+
+            count += pop;
+        }
+
+        Self { samples, rate }
+    }
+
+    /// Returns the sample rate this index was built with.
+    #[inline]
+    pub fn rate(&self) -> u32 {
+        self.rate
+    }
+}
+
+impl SelectSupport for WithCsPoppy {
+    #[inline]
+    fn build(words: &[u64], total_ones: usize) -> Self {
+        Self::build_with_rate(words, total_ones, CS_POPPY_SAMPLE_RATE)
+    }
+
+    fn select1(&self, ctx: BpSelectCtx<'_>, k: usize) -> Option<usize> {
+        if k >= ctx.total_ones || self.samples.is_empty() || ctx.rank_l1.is_empty() {
+            return None;
+        }
+
+        // 1. Bracket the answer between consecutive samples. sample[i] holds the
+        //    block of the (i * rate)-th one, and k lies in [i*rate, (i+1)*rate),
+        //    so the target block lies in [sample[i], sample[i+1]].
+        let sample_idx = k / self.rate as usize;
+        let last_block = ctx.rank_l1.len() - 1;
+        let lo = *self
+            .samples
+            .get(sample_idx)
+            .unwrap_or_else(|| self.samples.last().expect("samples is non-empty"))
+            as usize;
+        let hi = self
+            .samples
+            .get(sample_idx + 1)
+            .map_or(last_block, |&b| b as usize)
+            .min(last_block);
+        let lo = lo.min(hi);
+
+        // 2. Last block whose absolute rank is still <= k. Taking the *last*
+        //    such block, rather than the first, correctly skips blocks holding
+        //    no ones at all.
+        let window = &ctx.rank_l1[lo..=hi];
+        let block = lo
+            + window
+                .partition_point(|&r| (r as usize) <= k)
+                .saturating_sub(1);
+        let block_rank = ctx.rank_l1[block] as usize;
+
+        // 3. Last word in that block whose rank is still <= k, from rank_l2's
+        //    9-bit cumulative offsets (word 0's offset is implicitly zero).
+        let block_start = block * WORDS_PER_RANK_BLOCK;
+        let words_in_block = ctx
+            .words
+            .len()
+            .checked_sub(block_start)?
+            .min(WORDS_PER_RANK_BLOCK);
+        let l2_packed = *ctx.rank_l2.get(block)?;
+
+        let mut word_in_block = 0usize;
+        let mut word_rank = block_rank;
+        for i in (1..words_in_block).rev() {
+            let offset = ((l2_packed >> ((i - 1) * 9)) & 0x1FF) as usize;
+            if block_rank + offset <= k {
+                word_in_block = i;
+                word_rank = block_rank + offset;
+                break;
+            }
+        }
+
+        // 4. Resolve within the word. Stray 1-bits above `len` sit above every
+        //    valid one, so `remaining` never reaches them; `result < len` is the
+        //    backstop for the final partial word.
+        let word_idx = block_start + word_in_block;
+        let word = *ctx.words.get(word_idx)?;
+        let remaining = k - word_rank;
+        let bit_pos = select_in_word(word, remaining as u32) as usize;
+        let result = word_idx * 64 + bit_pos;
+        if result < ctx.len {
+            Some(result)
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    fn heap_size(&self) -> usize {
+        self.samples.len() * core::mem::size_of::<u32>()
     }
 }
 
@@ -1790,6 +2052,7 @@ impl BalancedParens<Vec<u64>, NoSelect> {
     }
 }
 
+#[allow(deprecated)] // STYLE-0004: keeps the deprecated WithSelect path compiling and tested
 impl BalancedParens<Vec<u64>, WithSelect> {
     /// Build from an owned bitvector with select support enabled.
     ///
@@ -1879,6 +2142,125 @@ impl<W: AsRef<[u64]>> BalancedParens<W, NoSelect> {
     }
 }
 
+impl BalancedParens<Vec<u64>, WithCsPoppy> {
+    /// Build from an owned bitvector with combined-sampling select support.
+    ///
+    /// Preferred over [`new_with_select`](BalancedParens::new_with_select): same
+    /// queries, a quarter of the select-index memory (#64). Uses the default
+    /// sample rate (256) — see
+    /// [`new_with_cspoppy_config`](Self::new_with_cspoppy_config) to tune it.
+    ///
+    /// Bits at or above `len` in the final word are cleared, so stray 1-bits
+    /// cannot skew `total_ones`/`rank1`/`select1` (#188).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `len` exceeds `u32::MAX` bits (#188): the rank directory
+    /// stores absolute cumulative counts as `u32`.
+    pub fn new_with_cspoppy(words: Vec<u64>, len: usize) -> Self {
+        Self::new_with_cspoppy_config(words, len, Config::default())
+    }
+
+    /// Build from an owned bitvector with combined-sampling select support,
+    /// at the sample rate given by [`Config::select_sample_rate`].
+    ///
+    /// A lower rate spends more memory for a narrower `select1` search
+    /// bracket; a higher rate spends less memory for a wider one (#601). The
+    /// default (256, [`new_with_cspoppy`](Self::new_with_cspoppy)) matches
+    /// this crate's other tuned indices — deviate only once measurement
+    /// justifies it.
+    ///
+    /// Bits at or above `len` in the final word are cleared, so stray 1-bits
+    /// cannot skew `total_ones`/`rank1`/`select1` (#188).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `len` exceeds `u32::MAX` bits (#188): the rank directory
+    /// stores absolute cumulative counts as `u32`.
+    pub fn new_with_cspoppy_config(mut words: Vec<u64>, len: usize, config: Config) -> Self {
+        mask_final_word_in_place(&mut words, len);
+        Self::assemble_with_rate(words, len, config.select_sample_rate)
+    }
+}
+
+impl<W: AsRef<[u64]>> BalancedParens<W, WithCsPoppy> {
+    /// Build from a generic storage type with combined-sampling select support.
+    ///
+    /// Preferred over
+    /// [`from_words_with_select`](BalancedParens::from_words_with_select): same
+    /// queries, a quarter of the select-index memory (#64). Useful for borrowed
+    /// data, e.g. from mmap. Uses the default sample rate (256) — see
+    /// [`from_words_with_cspoppy_config`](Self::from_words_with_cspoppy_config)
+    /// to tune it.
+    ///
+    /// The storage is not mutated: stray 1-bits at or above `len` in the final
+    /// word are ignored when counting (masked on read), so they cannot skew
+    /// `total_ones`/`rank1`/`select1` (#188).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `len` exceeds `u32::MAX` bits (#188): the rank directory
+    /// stores absolute cumulative counts as `u32`.
+    pub fn from_words_with_cspoppy(words: W, len: usize) -> Self {
+        Self::from_words_with_cspoppy_config(words, len, Config::default())
+    }
+
+    /// Build from a generic storage type with combined-sampling select
+    /// support, at the sample rate given by [`Config::select_sample_rate`].
+    ///
+    /// See [`new_with_cspoppy_config`](BalancedParens::new_with_cspoppy_config)
+    /// for the rate trade-off (#601). Useful for borrowed data, e.g. from mmap.
+    ///
+    /// The storage is not mutated: stray 1-bits at or above `len` in the final
+    /// word are ignored when counting (masked on read), so they cannot skew
+    /// `total_ones`/`rank1`/`select1` (#188).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `len` exceeds `u32::MAX` bits (#188): the rank directory
+    /// stores absolute cumulative counts as `u32`.
+    pub fn from_words_with_cspoppy_config(words: W, len: usize, config: Config) -> Self {
+        Self::assemble_with_rate(words, len, config.select_sample_rate)
+    }
+
+    /// Build every index from `words` at a custom CS-Poppy sample rate,
+    /// without mutating the storage.
+    ///
+    /// Shared by every `WithCsPoppy` constructor; the owned ones mask the
+    /// final word before calling in.
+    fn assemble_with_rate(words: W, len: usize, rate: u32) -> Self {
+        let (
+            l0_min_excess,
+            l0_word_excess,
+            l1_min_excess,
+            l1_block_excess,
+            l2_min_excess,
+            l2_block_excess,
+            rank_l1,
+            rank_l2,
+            total_ones,
+        ) = build_bp_index(words.as_ref(), len);
+
+        let select = WithCsPoppy::build_with_rate(words.as_ref(), total_ones, rate);
+
+        Self {
+            words,
+            len,
+            total_ones,
+            l0_min_excess,
+            l0_word_excess,
+            l1_min_excess,
+            l1_block_excess,
+            l2_min_excess,
+            l2_block_excess,
+            rank_l1,
+            rank_l2,
+            select,
+        }
+    }
+}
+
+#[allow(deprecated)] // STYLE-0004: keeps the deprecated WithSelect path compiling and tested
 impl<W: AsRef<[u64]>> BalancedParens<W, WithSelect> {
     /// Build from a generic storage type with select support enabled.
     ///
@@ -1950,14 +2332,65 @@ impl<W: AsRef<[u64]>, S: SelectSupport> BalancedParens<W, S> {
         self.total_ones
     }
 
+    /// Get the total number of 0-bits (close parentheses).
+    #[inline]
+    pub fn total_zeros(&self) -> usize {
+        self.len - self.total_ones
+    }
+
     /// Find the position of the k-th 1-bit (0-indexed).
     ///
     /// Returns `None` if k >= total_ones.
-    /// Uses the select index if available (WithSelect), otherwise returns None.
+    /// Uses the select index if available ([`WithCsPoppy`] or [`WithSelect`]);
+    /// [`NoSelect`] always returns None.
     #[inline]
     pub fn select1(&self, k: usize) -> Option<usize> {
-        self.select
-            .select1(self.words.as_ref(), self.len, self.total_ones, k)
+        self.select.select1(
+            BpSelectCtx {
+                words: self.words.as_ref(),
+                len: self.len,
+                total_ones: self.total_ones,
+                rank_l1: &self.rank_l1,
+                rank_l2: &self.rank_l2,
+            },
+            k,
+        )
+    }
+
+    /// Find the position of the k-th 0-bit / close parenthesis (0-indexed).
+    ///
+    /// Returns `None` if `k >= total_zeros()`.
+    ///
+    /// O(log n) binary search over `rank1` (already O(1)) — unlike `select1`
+    /// there is no dedicated close-paren sample index (issue #602: no known
+    /// consumer justifies one yet, same call as `EliasFano::predecessor` in
+    /// ADR-0012). Works identically for every [`SelectSupport`] impl since
+    /// it never touches `self.select`.
+    pub fn select0(&self, k: usize) -> Option<usize> {
+        if k >= self.total_zeros() {
+            return None;
+        }
+        let mut lo = 0usize;
+        let mut hi = self.len;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if self.rank0(mid + 1) > k {
+                hi = mid;
+            } else {
+                lo = mid + 1;
+            }
+        }
+        Some(lo)
+    }
+
+    /// Returns the heap bytes retained by the select index.
+    ///
+    /// Zero for [`NoSelect`]. For [`WithSelect`] this is the sampled index,
+    /// whose size scales with the number of open parentheses rather than the
+    /// bit length — see [`SelectIndex`] for the density relationship.
+    #[inline]
+    pub fn select_heap_size(&self) -> usize {
+        self.select.heap_size()
     }
 
     /// Check if the bit at position p is a 1 (open parenthesis).
@@ -2035,6 +2468,12 @@ impl<W: AsRef<[u64]>, S: SelectSupport> BalancedParens<W, S> {
         };
 
         l1_rank + l2_rank + partial
+    }
+
+    /// O(1) rank0: Count 0-bits (closes) in positions [0, p).
+    #[inline]
+    pub fn rank0(&self, p: usize) -> usize {
+        p.min(self.len) - self.rank1(p)
     }
 
     /// Fallback slow rank1 for edge cases.
@@ -2737,6 +3176,7 @@ mod tests {
         assert_eq!(bp.find_close(0), Some(3));
     }
 
+    #[allow(deprecated)] // STYLE-0004: deliberately exercises the deprecated WithSelect path
     #[test]
     fn test_from_words_with_select_stray_bits() {
         // Two all-ones words with len = 68: 68 valid 1-bits plus 60 stray
@@ -2750,6 +3190,350 @@ mod tests {
         }
         assert_eq!(bp.select1(68), None);
         assert_eq!(bp.select1(69), None);
+    }
+
+    // ========================================================================
+    // Select index space cost (#64 Step A)
+    // ========================================================================
+
+    /// Builds `((((...))))`-style nested parens: n opens then n closes.
+    fn balanced_words(pairs: usize) -> (Vec<u64>, usize) {
+        let len = pairs * 2;
+        let mut words = vec![0u64; len.div_ceil(64)];
+        for i in 0..pairs {
+            words[i / 64] |= 1u64 << (i % 64);
+        }
+        (words, len)
+    }
+
+    // ========================================================================
+    // WithCsPoppy equivalence and space (#64 Step B)
+    // ========================================================================
+
+    /// Bit patterns chosen to stress the block search: empty blocks to skip,
+    /// runs longer than the 256-one sample interval, and partial final blocks.
+    fn cspoppy_fixtures() -> Vec<(&'static str, Vec<u64>, usize)> {
+        vec![
+            ("empty", vec![], 0),
+            ("single-word", vec![0b1011_0110u64], 8),
+            ("all-zero", vec![0u64; 40], 40 * 64),
+            ("all-ones", vec![u64::MAX; 40], 40 * 64),
+            ("alternating", vec![0xAAAA_AAAA_AAAA_AAAAu64; 40], 40 * 64),
+            // One bit per word: 8 ones per block, so samples span 32 blocks.
+            ("one-per-word", vec![1u64; 600], 600 * 64),
+            // One bit per 100 words: most blocks are empty, which is the case
+            // the "last block with rank <= k" rule exists for.
+            (
+                "sparse-empty-blocks",
+                (0..4000u64).map(|i| u64::from(i % 100 == 0)).collect(),
+                4000 * 64,
+            ),
+            // Dense then a long empty run then dense again.
+            (
+                "clustered",
+                (0..2000u64)
+                    .map(|i| {
+                        if (300..=1700).contains(&i) {
+                            0
+                        } else {
+                            u64::MAX
+                        }
+                    })
+                    .collect(),
+                2000 * 64,
+            ),
+            (
+                "irregular",
+                (0..500u64).map(|i| i.wrapping_mul(0x9E37_79B9)).collect(),
+                500 * 64,
+            ),
+            // len not word-aligned, so the final word is partial.
+            ("partial-final-word", vec![u64::MAX; 33], 33 * 64 - 17),
+            // Exactly one rank block, and one bit past it.
+            ("one-block", vec![u64::MAX; 8], 8 * 64),
+            ("one-block-plus", vec![u64::MAX; 9], 9 * 64),
+        ]
+    }
+
+    /// The gate for Step B: combined sampling must not change a single answer.
+    #[allow(deprecated)] // STYLE-0004: deliberately exercises the deprecated WithSelect path
+    #[test]
+    fn test_cspoppy_matches_with_select() {
+        for (label, words, len) in cspoppy_fixtures() {
+            let old = BalancedParens::<_, WithSelect>::from_words_with_select(&words[..], len);
+            let new = BalancedParens::<_, WithCsPoppy>::from_words_with_cspoppy(&words[..], len);
+
+            assert_eq!(new.total_ones(), old.total_ones(), "{label}: total_ones");
+
+            for k in 0..old.total_ones() {
+                assert_eq!(new.select1(k), old.select1(k), "{label}: select1({k})");
+            }
+            // Past the end, and far past it.
+            assert_eq!(
+                new.select1(old.total_ones()),
+                old.select1(old.total_ones()),
+                "{label}: select1(total_ones)"
+            );
+            assert_eq!(
+                new.select1(old.total_ones() + 5000),
+                old.select1(old.total_ones() + 5000),
+                "{label}: select1 far past the end"
+            );
+        }
+    }
+
+    /// select1 must invert rank1 for every set bit.
+    #[test]
+    fn test_cspoppy_inverts_rank1() {
+        for (label, words, len) in cspoppy_fixtures() {
+            let bp = BalancedParens::<_, WithCsPoppy>::from_words_with_cspoppy(&words[..], len);
+            for k in 0..bp.total_ones() {
+                let pos = bp
+                    .select1(k)
+                    .unwrap_or_else(|| panic!("{label}: select1({k}) = None"));
+                assert!(pos < len, "{label}: select1({k}) = {pos} >= len {len}");
+                assert!(bp.is_open(pos), "{label}: select1({k}) = {pos} is not a 1");
+                assert_eq!(bp.rank1(pos), k, "{label}: rank1(select1({k}))");
+            }
+        }
+    }
+
+    /// Borrowed storage keeps stray 1-bits above `len`; they must not be
+    /// selectable, exactly as for `WithSelect` (#188).
+    #[test]
+    fn test_cspoppy_ignores_stray_bits() {
+        let words = [u64::MAX, u64::MAX];
+        let bp = BalancedParens::<_, WithCsPoppy>::from_words_with_cspoppy(&words[..], 68);
+        assert_eq!(bp.total_ones(), 68);
+        for k in 0..68 {
+            assert_eq!(bp.select1(k), Some(k), "select1({k})");
+        }
+        assert_eq!(bp.select1(68), None);
+        assert_eq!(bp.select1(69), None);
+    }
+
+    #[test]
+    fn test_cspoppy_owned_constructor_masks_stray_bits() {
+        let word = 0b0011u64 | (u64::MAX << 4);
+        let bp = BalancedParens::new_with_cspoppy(vec![word], 4);
+        assert_eq!(bp.words()[0], 0b0011, "owned words must be masked");
+        assert_eq!(bp.total_ones(), 2);
+        assert_eq!(bp.select1(0), Some(0));
+        assert_eq!(bp.select1(1), Some(1));
+        assert_eq!(bp.select1(2), None);
+    }
+
+    /// Step B's claim: a quarter of what the pair cost before Step A, half of
+    /// what it costs after — 6.25% of the bitmap at parenthesis density.
+    #[allow(deprecated)] // STYLE-0004: deliberately exercises the deprecated WithSelect path
+    #[test]
+    fn test_cspoppy_index_is_half_of_with_select() {
+        let pairs = 100_000;
+        let (words, len) = balanced_words(pairs);
+        let bitmap_bytes = words.len() * 8;
+
+        let old = BalancedParens::new_with_select(words.clone(), len);
+        let new = BalancedParens::new_with_cspoppy(words, len);
+
+        assert_eq!(old.select_heap_size(), new.select_heap_size() * 2);
+        assert_eq!(new.select_heap_size(), pairs.div_ceil(256) * 4);
+
+        let ratio = new.select_heap_size() as f64 / bitmap_bytes as f64;
+        assert!(
+            (0.06..=0.065).contains(&ratio),
+            "select index is {:.2}% of the bitmap, expected ~6.25%",
+            ratio * 100.0
+        );
+    }
+
+    // ========================================================================
+    // WithCsPoppy sample rate as a tuning knob (#601)
+    // ========================================================================
+
+    /// `new_with_cspoppy_config(.., Config::default())` must be indistinguishable
+    /// from the plain constructor: same memory, same answers.
+    #[test]
+    fn test_cspoppy_config_default_matches_plain_constructor() {
+        let pairs = 10_000;
+        let (words, len) = balanced_words(pairs);
+
+        let plain = BalancedParens::new_with_cspoppy(words.clone(), len);
+        let configured = BalancedParens::new_with_cspoppy_config(words, len, Config::default());
+
+        assert_eq!(plain.select_heap_size(), configured.select_heap_size());
+        for k in [0, 1, 255, 256, 257, pairs - 1] {
+            assert_eq!(plain.select1(k), configured.select1(k), "select1({k})");
+        }
+    }
+
+    /// A non-default sample rate must not change a single `select1` answer —
+    /// only the density of the index built to answer it.
+    #[test]
+    fn test_cspoppy_custom_rate_matches_default_answers() {
+        for (label, words, len) in cspoppy_fixtures() {
+            let default_rate =
+                BalancedParens::<_, WithCsPoppy>::from_words_with_cspoppy(&words[..], len);
+
+            for rate in [1u32, 64, 512, 8192] {
+                let custom = BalancedParens::<_, WithCsPoppy>::from_words_with_cspoppy_config(
+                    &words[..],
+                    len,
+                    Config {
+                        select_sample_rate: rate,
+                    },
+                );
+
+                assert_eq!(
+                    custom.total_ones(),
+                    default_rate.total_ones(),
+                    "{label} @ rate {rate}: total_ones"
+                );
+                for k in 0..default_rate.total_ones() {
+                    assert_eq!(
+                        custom.select1(k),
+                        default_rate.select1(k),
+                        "{label} @ rate {rate}: select1({k})"
+                    );
+                }
+                assert_eq!(
+                    custom.select1(default_rate.total_ones()),
+                    default_rate.select1(default_rate.total_ones()),
+                    "{label} @ rate {rate}: select1(total_ones)"
+                );
+            }
+        }
+    }
+
+    /// Halving the rate should roughly double the index; doubling it should
+    /// roughly halve it — the density relationship #601 documents.
+    #[test]
+    fn test_cspoppy_custom_rate_scales_heap_size() {
+        let pairs = 100_000;
+        let (words, len) = balanced_words(pairs);
+
+        for rate in [64u32, 256, 512, 8192] {
+            let bp = BalancedParens::new_with_cspoppy_config(
+                words.clone(),
+                len,
+                Config {
+                    select_sample_rate: rate,
+                },
+            );
+            assert_eq!(
+                bp.select_heap_size(),
+                pairs.div_ceil(rate as usize) * 4,
+                "rate {rate}: unexpected select index size"
+            );
+        }
+    }
+
+    /// A configured rate of 0 must not hang or panic; it behaves like rate 1
+    /// (matches `SelectIndex::build`'s guard).
+    #[test]
+    fn test_cspoppy_rate_zero_treated_as_one() {
+        let (words, len) = balanced_words(100);
+        let total_ones = len / 2;
+
+        let zero = WithCsPoppy::build_with_rate(&words, total_ones, 0);
+        let one = WithCsPoppy::build_with_rate(&words, total_ones, 1);
+
+        assert_eq!(zero.rate(), 1);
+        assert_eq!(zero.rate(), one.rate());
+    }
+
+    /// `Default` must produce an empty index at the crate's default rate, the
+    /// same starting point `#[derive(Default)]` gave before the rate field
+    /// existed.
+    #[test]
+    fn test_cspoppy_default() {
+        let default = WithCsPoppy::default();
+        assert_eq!(default.rate(), CS_POPPY_SAMPLE_RATE);
+        assert_eq!(default.heap_size(), 0);
+    }
+
+    /// The `SelectSupport::build` trait method (used by any generic caller,
+    /// even though every concrete `WithCsPoppy` constructor in this crate
+    /// goes through `build_with_rate` directly) must match
+    /// `build_with_rate(.., CS_POPPY_SAMPLE_RATE)`.
+    #[test]
+    fn test_cspoppy_select_support_build_matches_default_rate() {
+        for (label, words, len) in cspoppy_fixtures() {
+            let indexed = BalancedParens::<_, NoSelect>::from_words(&words[..], len);
+            let total_ones = indexed.total_ones();
+
+            let via_trait = <WithCsPoppy as SelectSupport>::build(&words, total_ones);
+            let via_rate = WithCsPoppy::build_with_rate(&words, total_ones, CS_POPPY_SAMPLE_RATE);
+
+            assert_eq!(via_trait.rate(), via_rate.rate(), "{label}: rate");
+            assert_eq!(
+                via_trait.heap_size(),
+                via_rate.heap_size(),
+                "{label}: heap_size"
+            );
+
+            let ctx = BpSelectCtx {
+                words: &words,
+                len,
+                total_ones,
+                rank_l1: &indexed.rank_l1,
+                rank_l2: &indexed.rank_l2,
+            };
+            for k in 0..total_ones {
+                assert_eq!(
+                    via_trait.select1(ctx, k),
+                    via_rate.select1(ctx, k),
+                    "{label}: select1({k})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_no_select_is_zero_sized() {
+        // JSON's path must stay free: NoSelect is a ZST and retains nothing.
+        assert_eq!(core::mem::size_of::<NoSelect>(), 0);
+
+        let (words, len) = balanced_words(50_000);
+        let bp = BalancedParens::new(words, len);
+        assert_eq!(bp.select_heap_size(), 0);
+    }
+
+    /// Step A's actual claim: at BP density the sampled index costs 12.5% of
+    /// the bitmap, not the 25% it cost with `u64` sample fields.
+    ///
+    /// Balanced parens are exactly 50% ones, so with 8-byte entries every
+    /// `rate` ones the index is `8 * (len/2) / 256` bytes against a `len/8`
+    /// byte bitmap — one eighth.
+    #[allow(deprecated)] // STYLE-0004: deliberately exercises the deprecated WithSelect path
+    #[test]
+    fn test_select_index_costs_one_eighth_of_bitmap() {
+        let pairs = 100_000;
+        let (words, len) = balanced_words(pairs);
+        let bitmap_bytes = words.len() * 8;
+
+        let bp = BalancedParens::new_with_select(words, len);
+        assert_eq!(bp.total_ones(), pairs);
+
+        let select_bytes = bp.select_heap_size();
+        assert!(select_bytes > 0, "test data must produce samples");
+
+        // 8 bytes per sample, one sample per 256 ones.
+        let expected = pairs.div_ceil(256) * 8;
+        assert_eq!(select_bytes, expected);
+
+        // 12.5% of the bitmap, within one sample's rounding.
+        let ratio = select_bytes as f64 / bitmap_bytes as f64;
+        assert!(
+            (0.12..=0.13).contains(&ratio),
+            "select index is {:.2}% of the bitmap, expected ~12.5%",
+            ratio * 100.0
+        );
+
+        // Sanity: the narrowing did not break the queries it indexes.
+        for k in [0, 1, 255, 256, 257, pairs - 1] {
+            assert_eq!(bp.select1(k), Some(k), "select1({k})");
+        }
+        assert_eq!(bp.select1(pairs), None);
     }
 
     #[test]
@@ -2820,6 +3604,32 @@ mod tests {
                 "find_close({p}) mismatch: accelerated vs linear scan"
             );
         }
+    }
+
+    /// Coverage stabilizer, same rationale as
+    /// `test_find_close_crosses_l2_block_boundary` above (issue #220): the
+    /// remaining flaky branch is `find_close_from`'s `State::FromL2` landing
+    /// exactly at `len` after skipping a whole L2 block (i.e. the search runs
+    /// off the end of the structure right on an L2-aligned boundary), which
+    /// proptest only stumbles into by chance.
+    ///
+    /// An all-opens bitvector spanning exactly two L2 blocks (2 * 65536 bits)
+    /// forces this deterministically: `find_close(0)` never finds a match, so
+    /// excess only grows and every level skips wholesale, and the second
+    /// (last) L2 block's skip lands pos exactly on `len`.
+    #[test]
+    fn test_find_close_l2_skip_lands_exactly_at_len() {
+        const L2_SPAN: usize = 64 * FACTOR_L1 * FACTOR_L2;
+        let len = 2 * L2_SPAN;
+        let words = vec![u64::MAX; len / 64];
+
+        let bp = BalancedParens::new(words.clone(), len);
+        assert_eq!(bp.find_close(0), None);
+        assert_eq!(
+            bp.find_close(0),
+            find_close(&words, len, 0),
+            "find_close(0) mismatch: accelerated vs linear scan"
+        );
     }
 
     #[test]

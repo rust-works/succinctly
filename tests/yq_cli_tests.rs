@@ -595,6 +595,35 @@ fn test_duplicate_mapping_key_survives_yaml_output() -> Result<()> {
     Ok(())
 }
 
+/// `(.)` is semantically identical to `.`, but before the fix for #614 it
+/// took a different code path: `can_use_m2_streaming` treated
+/// `Expr::Paren(Expr::Identity)` as streamable, yet the stricter
+/// `is_identity` check that unlocks direct cursor streaming required a bare
+/// `Expr::Identity`, so `(.)` fell through to `eval_generic::eval_single`'s
+/// `to_owned()` bridge and silently collapsed duplicate keys instead.
+#[test]
+fn test_duplicate_mapping_key_survives_parenthesized_identity() -> Result<()> {
+    let yaml = "a: 1\na: 2\n";
+
+    let (pretty, code) = run_yq_stdin("(.)", yaml, &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(pretty, "a: 1\na: 2\n");
+
+    let (compact, code) = run_yq_stdin("(.)", yaml, &["-I0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(compact, "a: 1\na: 2\n");
+
+    let (json_pretty, code) = run_yq_stdin("(.)", yaml, &["-o", "json"])?;
+    assert_eq!(code, 0);
+    assert_eq!(json_pretty, "{\n  \"a\": 1,\n  \"a\": 2\n}\n");
+
+    let (json_compact, code) = run_yq_stdin("(.)", yaml, &["-o", "json", "-I0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(json_compact, "{\"a\":1,\"a\":2}\n");
+
+    Ok(())
+}
+
 #[test]
 fn test_duplicate_mapping_key_to_entries_preserves_both() -> Result<()> {
     // Unlike `.a` field access (last-wins, #174), `to_entries` must pass
@@ -619,6 +648,256 @@ fn test_duplicate_mapping_key_to_entries_json_compact() -> Result<()> {
         output.trim(),
         r#"[{"key":"a","value":1},{"key":"a","value":2}]"#
     );
+    Ok(())
+}
+
+/// #478: `--slurp '.'` shares the same `IndexMap`-backed conversion
+/// (`yaml_to_owned_value`) #442 didn't touch, so it kept collapsing
+/// duplicate keys within each slurped element even after plain `yq '.'`
+/// was fixed. Must now match [`test_duplicate_mapping_key_survives_yaml_output`]
+/// on the same input, just wrapped in the slurped array.
+#[test]
+fn test_duplicate_mapping_key_survives_slurp() -> Result<()> {
+    let yaml = "a: 1\na: 2\n";
+
+    let (pretty, code) = run_yq_stdin(".", yaml, &["--slurp"])?;
+    assert_eq!(code, 0);
+    assert_eq!(pretty, "-\n  a: 1\n  a: 2\n");
+
+    let (compact, code) = run_yq_stdin(".", yaml, &["--slurp", "-I0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(compact, "-\n  a: 1\n  a: 2\n");
+
+    Ok(())
+}
+
+/// #478: like [`test_duplicate_mapping_key_survives_slurp`], `--slurp`
+/// combining documents from multiple sources into one array must preserve
+/// duplicate keys within each source, not just across sources.
+#[test]
+fn test_duplicate_mapping_key_survives_slurp_multiple_sources() -> Result<()> {
+    let mut file_a = NamedTempFile::new()?;
+    writeln!(file_a, "a: 1\na: 2")?;
+    let mut file_b = NamedTempFile::new()?;
+    writeln!(file_b, "b: 3")?;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .arg("yq")
+        .arg("--slurp")
+        .arg(".")
+        .arg(file_a.path())
+        .arg(file_b.path())
+        .stdin(Stdio::null())
+        .output()?;
+    let stdout = String::from_utf8(output.stdout)?;
+
+    assert!(output.status.success());
+    assert_eq!(stdout, "-\n  a: 1\n  a: 2\n-\n  b: 3\n");
+    Ok(())
+}
+
+/// #478: `can_slurp_fast_path` tracks `-e`/`--exit-status` by inspecting the
+/// built cursor list directly (`any_truthy = true` whenever `--slurp`
+/// produces its one array result), a separate code path from the non-slurp
+/// M2 fast path's per-cursor `is_falsy()` check. Exercise it directly so
+/// that branch runs at least once.
+#[test]
+fn test_slurp_exit_status_fast_path() -> Result<()> {
+    let (output, code) = run_yq_stdin(".", "a: 1\n", &["--slurp", "-e"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "-\n  a: 1\n");
+    Ok(())
+}
+
+/// #478: when `--doc N` filters out every input document, `can_slurp_fast_path`
+/// builds an empty cursor list and streams it via `stream_yaml_sequence`,
+/// whose empty-iterator early return (`"[]"`) is otherwise never exercised
+/// by the duplicate-key-preservation tests above (they always match at
+/// least one document).
+#[test]
+fn test_slurp_doc_filter_no_match_yields_empty_array() -> Result<()> {
+    let (output, code) = run_yq_stdin(".", "a: 1\n", &["--slurp", "--doc", "5"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "[]\n");
+    Ok(())
+}
+
+/// #478: `stream_yaml_sequence`'s block-style rendering has a container vs.
+/// scalar branch per slurped item (mirroring `stream_yaml_value`'s `Sequence`
+/// arm); the tests above only slurp mapping documents, which always take the
+/// container branch. Bare scalar documents take the `"- "` scalar branch
+/// instead.
+#[test]
+fn test_slurp_scalar_documents_use_block_style_dash_items() -> Result<()> {
+    let (output, code) = run_yq_stdin(".", "a\n---\nb\n", &["--slurp"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "- a\n- b\n");
+    Ok(())
+}
+
+/// #478: `--inplace '.'` went through the same lossy `yaml_to_owned_value`
+/// path as `--slurp`, unlike plain `yq '.'` which #442 already fixed.
+/// Real `yq --inplace` v4.53.3 keeps both `a:` entries on this input.
+#[test]
+fn test_duplicate_mapping_key_survives_inplace() -> Result<()> {
+    let mut input_file = NamedTempFile::new()?;
+    writeln!(input_file, "a: 1\na: 2")?;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .arg("yq")
+        .arg("-i")
+        .arg(".")
+        .arg(input_file.path())
+        .stdin(Stdio::null())
+        .output()?;
+
+    assert!(output.status.success());
+    let rewritten = std::fs::read_to_string(input_file.path())?;
+    assert_eq!(rewritten, "a: 1\na: 2\n");
+    Ok(())
+}
+
+/// #631: `first(.[])`/`last(.[])` (the `Expr::FirstExpr`/`LastExpr` one-arg
+/// stream form `first(f)`/`last(f)` compiles to) fell through
+/// `evaluate_yaml_cursor`'s unconditional `to_owned()` DOM path, unlike
+/// `.[0]` which #442 already routed through the M2 cursor-streaming fast
+/// path. `eval_generic.rs` itself threads `GenericResult::OneCursor`/
+/// `ManyCursor` through these shapes correctly since #607 — but that alone
+/// wasn't enough for `yq`: unlike `jq_runner.rs`'s
+/// `generic_result_to_jq_values`, `evaluate_yaml_cursor` never special-cased
+/// cursor results, so `yq` kept collapsing duplicate keys. Fixed by widening
+/// `can_use_m2_streaming` so these shapes stream through the same fast path
+/// `.[0]` uses, instead of expanding `evaluate_yaml_cursor` itself.
+#[test]
+fn test_duplicate_mapping_key_survives_first_last_stream() -> Result<()> {
+    let yaml = "- a: 1\n  a: 2\n- b: 3\n  b: 4\n";
+
+    let (first, code) = run_yq_stdin("first(.[])", yaml, &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(first, "a: 1\na: 2\n");
+
+    let (last, code) = run_yq_stdin("last(.[])", yaml, &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(last, "b: 3\nb: 4\n");
+
+    let (first_json, code) = run_yq_stdin("first(.[])", yaml, &["-o", "json", "-I0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(first_json, "{\"a\":1,\"a\":2}\n");
+
+    Ok(())
+}
+
+/// #631: computed indexing (`.[(expr)]`, `Expr::IndexExpr`) is the same bug
+/// class via a different AST node than `first`/`last` above. `.[0]`
+/// (`Expr::Index`, a literal the parser folds at parse time) already
+/// preserved duplicate keys, but `.[(1-1)]` — forced past that folding —
+/// did not, until `Expr::IndexExpr` was added to `can_use_m2_streaming` too.
+#[test]
+fn test_duplicate_mapping_key_survives_computed_index() -> Result<()> {
+    let yaml = "- a: 1\n  a: 2\n- b: 3\n  b: 4\n";
+
+    let (pretty, code) = run_yq_stdin(".[(1-1)]", yaml, &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(pretty, "a: 1\na: 2\n");
+
+    let (compact, code) = run_yq_stdin(".[(1-1)]", yaml, &["-I0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(compact, "a: 1\na: 2\n");
+
+    Ok(())
+}
+
+/// #478: the `--inplace` fast path is scoped to M2-streamable expressions
+/// (identity/field/index/iterate); confirm field navigation still rewrites
+/// the file correctly, not just plain identity.
+#[test]
+fn test_inplace_field_navigation_still_works() -> Result<()> {
+    let mut input_file = NamedTempFile::new()?;
+    writeln!(input_file, "a:\n  b: 1\n  c: 2")?;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .arg("yq")
+        .arg("-i")
+        .arg(".a")
+        .arg(input_file.path())
+        .stdin(Stdio::null())
+        .output()?;
+
+    assert!(output.status.success());
+    let rewritten = std::fs::read_to_string(input_file.path())?;
+    assert_eq!(rewritten, "b: 1\nc: 2\n");
+    Ok(())
+}
+
+/// #478: the `--inplace` fast path's per-file loop iterates the root's
+/// virtual document sequence directly (`docs.uncons_cursor()`), rather than
+/// the `first_child()` single-document fallback the other `--inplace` tests
+/// above exercise implicitly. A multi-document file with a non-identity
+/// filter drives that loop through more than one `stream_cursor!` call.
+#[test]
+fn test_inplace_multi_doc_field_navigation() -> Result<()> {
+    let mut input_file = NamedTempFile::new()?;
+    writeln!(input_file, "a:\n  b: 1\n---\na:\n  b: 2")?;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .arg("yq")
+        .arg("-i")
+        .arg(".a")
+        .arg(input_file.path())
+        .stdin(Stdio::null())
+        .output()?;
+
+    assert!(output.status.success());
+    let rewritten = std::fs::read_to_string(input_file.path())?;
+    assert_eq!(rewritten, "b: 1\n---\nb: 2\n");
+    Ok(())
+}
+
+/// #478: filters outside `can_use_m2_streaming` (e.g. `keys`) must still
+/// fall back to the pre-existing DOM path for `--inplace`.
+#[test]
+fn test_inplace_non_m2_filter_still_works() -> Result<()> {
+    let mut input_file = NamedTempFile::new()?;
+    writeln!(input_file, "a: 1\nb: 2")?;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .arg("yq")
+        .arg("-i")
+        .arg("keys")
+        .arg(input_file.path())
+        .stdin(Stdio::null())
+        .output()?;
+
+    assert!(output.status.success());
+    let rewritten = std::fs::read_to_string(input_file.path())?;
+    assert_eq!(rewritten, "- a\n- b\n");
+    Ok(())
+}
+
+/// #478: `--inplace` has its own JSON-output M2 fast path gate
+/// (`can_inplace_json_fast_path`), separate from the YAML-output one
+/// (`can_inplace_yaml_fast_path`) exercised by the tests above, which all
+/// default to YAML output. Cover the JSON-output gate directly.
+#[test]
+fn test_inplace_json_output_fast_path() -> Result<()> {
+    let mut input_file = NamedTempFile::new()?;
+    writeln!(input_file, "a: 1\nb: 2")?;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .arg("yq")
+        .arg("-i")
+        .arg("-o")
+        .arg("json")
+        .arg("-I")
+        .arg("0")
+        .arg(".")
+        .arg(input_file.path())
+        .stdin(Stdio::null())
+        .output()?;
+
+    assert!(output.status.success());
+    let rewritten = std::fs::read_to_string(input_file.path())?;
+    assert_eq!(rewritten, "{\"a\":1,\"b\":2}\n");
     Ok(())
 }
 
@@ -3362,6 +3641,32 @@ fn test_computed_key_in_index_brackets() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn test_split_doc_hides_in_computed_slice_bounds() -> Result<()> {
+    // Same reasoning as `test_computed_key_in_index_brackets`, for a computed
+    // slice's target and bounds (#499). `contains_split_doc` has to descend
+    // into all three, or a `split_doc` hiding in one is scanned as an opaque
+    // leaf and the stream never gets its `---` separators.
+    let yaml = "[[1,2,3,4],[5,6,7,8]]\n";
+    let expected = "- 2\n- 3\n---\n- 6\n- 7\n";
+
+    // Hidden in the start bound.
+    let (output, code) = run_yq_stdin(".[] | .[(1|split_doc):(3)]", yaml, &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(output, expected);
+
+    // Hidden in the end bound.
+    let (output, code) = run_yq_stdin(".[] | .[(1):(3|split_doc)]", yaml, &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(output, expected);
+
+    // Hidden in the target.
+    let (output, code) = run_yq_stdin(".[] | (split_doc)[(1):(3)]", yaml, &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(output, expected);
+    Ok(())
+}
+
 // =============================================================================
 // Whole-float representation — #169
 // =============================================================================
@@ -3606,5 +3911,34 @@ fn test_yq_outputs_before_an_error_or_break_survive() -> Result<()> {
     assert_eq!(stdout, "1\n2\n");
     assert_eq!(stderr.trim_end(), "Error: break $out not in label");
     assert_eq!(code, 1);
+    Ok(())
+}
+
+/// `path`/`parent`/`parent(n)`/`key` used to silently answer `[]`/`{}`/`null`
+/// (the root-level defaults) whenever they weren't the very first pipe stage
+/// (#554), because the CLI's streaming evaluator (`eval_generic.rs`, driving
+/// both `jq` and `yq`) bridged only the bare trailing builtin to the full
+/// evaluator, discarding the pipe structure `eval.rs`'s `needs_path_context`
+/// routing needs to see. This is the only automated coverage of the fix on
+/// the YAML/`YamlCursor` side of `eval_generic.rs` -- `jq_evaluator_parity_tests.rs`
+/// only exercises the JSON side.
+#[test]
+fn test_path_context_builtins_across_pipe_stages_554() -> Result<()> {
+    let (output, code) = run_yq_stdin(".a | path", "a: 1\n", &["-o", "json", "-I0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#"["a"]"#);
+
+    let (output, code) = run_yq_stdin(".a | parent", "a: 1\n", &["-o", "json", "-I0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#"{"a":1}"#);
+
+    let (output, code) = run_yq_stdin(".a | key", "a: 1\n", &["-o", "json", "-I0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#""a""#);
+
+    let (output, code) = run_yq_stdin(".a.b | parent", "a:\n  b: 1\n", &["-o", "json", "-I0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#"{"b":1}"#);
+
     Ok(())
 }

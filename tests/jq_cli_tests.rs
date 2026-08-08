@@ -1278,6 +1278,78 @@ fn test_object_construction() -> Result<()> {
 }
 
 #[test]
+fn test_object_construction_cartesian_issue_354() -> Result<()> {
+    // `{...}` is a generator: an entry whose key or value yields n outputs
+    // multiplies the objects emitted. Object construction used to keep a single
+    // value per entry and reject multi-output keys outright (#354).
+    //
+    // Both reproducers from the issue. Same-source operands throughout, so these
+    // stay independent of the comma-ordering bug (#353).
+    let (output, code) = run_jq_stdin("{a: (.x,.y)}", r#"{"x":9,"y":8}"#, &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "{\"a\":9}\n{\"a\":8}\n");
+
+    let (output, code) = run_jq_stdin("{a: .[]}", r#"{"x":9,"y":8}"#, &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "{\"a\":9}\n{\"a\":8}\n");
+
+    // Multi-output keys used to error with "key must be a string" -- both keys
+    // ARE strings, there were simply two of them.
+    let (output, code) = run_jq_stdin(r#"{("a","b"): 1}"#, "null", &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "{\"a\":1}\n{\"b\":1}\n");
+
+    // The last entry varies fastest; within an entry the key varies slower than
+    // the value. A transposed product would reorder these.
+    let (output, code) = run_jq_stdin("{a: (1,2), b: (3,4)}", "null", &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(
+        output,
+        "{\"a\":1,\"b\":3}\n{\"a\":1,\"b\":4}\n{\"a\":2,\"b\":3}\n{\"a\":2,\"b\":4}\n"
+    );
+
+    // An entry with zero outputs empties the product, and short-circuits the
+    // entries to its right -- the `error("boom")` below is never evaluated.
+    let (output, code) = run_jq_stdin("{a: empty, b: 1}", "null", &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "");
+
+    let (output, code) = run_jq_stdin(r#"{a: empty, b: error("boom")}"#, "null", &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "");
+
+    // A non-string key still errors, but only once the value stream is non-empty
+    // -- `{(.n): empty}` raises nothing even though `.n` is a number.
+    let (output, code) = run_jq_stdin("{(.n): empty}", r#"{"n":1}"#, &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "");
+
+    // Once the value stream is non-empty the numeric key does raise, producing
+    // no output. Only stdout is asserted: the CLI exits 0 on every evaluation
+    // error (jq exits 5), which is a pre-existing gap unrelated to #354.
+    let (output, _) = run_jq_stdin("{(.n): 2}", r#"{"n":1}"#, &["-c"])?;
+    assert_eq!(output, "");
+
+    Ok(())
+}
+
+#[test]
+fn test_object_construction_multi_output_after_pipe_issue_354() -> Result<()> {
+    // A multi-output object on the RHS of a pipe stays a stream of objects
+    // rather than being folded into one array.
+    let (output, code) = run_jq_stdin(r#"{"p":1} | {a: (2,3)}"#, "null", &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "{\"a\":2}\n{\"a\":3}\n");
+
+    // ... and collapses back into a single array only when asked to.
+    let (output, code) = run_jq_stdin("[{a: (1,2)}]", "null", &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#"[{"a":1},{"a":2}]"#);
+
+    Ok(())
+}
+
+#[test]
 fn test_array_construction() -> Result<()> {
     let (output, code) = run_jq_stdin("[.a, .b, .c]", r#"{"a":1,"b":2,"c":3}"#, &["-c"])?;
     assert_eq!(code, 0);
@@ -1504,6 +1576,93 @@ fn test_number_formatting_array_iteration() -> Result<()> {
     let (output, code) = run_jq_stdin(".[]", r"[1e100, 2e-100]", &["-c", "--preserve-input"])?;
     assert_eq!(code, 0);
     assert_eq!(output.trim(), "1e100\n2e-100");
+    Ok(())
+}
+
+/// #478 item 3: `jq --preserve-input '.'` in pretty mode (no `-c`) used to
+/// collapse duplicate object keys via `standard_json_to_jq_value`'s
+/// `IndexMap`, unlike its own `-c` output. Fixed incidentally by #532's
+/// `Expr::Identity => GenericResult::OneCursor` change, which routes
+/// identity through the cursor-based `print_json` path in both modes —
+/// pinned here as a regression guard rather than a code change.
+#[test]
+fn test_preserve_input_pretty_preserves_duplicate_keys() -> Result<()> {
+    let input = r#"{"a":1,"a":2}"#;
+
+    let (compact, code) = run_jq_stdin(".", input, &["-c", "--preserve-input"])?;
+    assert_eq!(code, 0);
+    assert_eq!(compact.trim(), r#"{"a":1,"a":2}"#);
+
+    let (pretty, code) = run_jq_stdin(".", input, &["--preserve-input"])?;
+    assert_eq!(code, 0);
+    assert_eq!(pretty, "{\n  \"a\": 1,\n  \"a\": 2\n}\n");
+
+    Ok(())
+}
+
+/// #607: `first(.[])`/`last(.[])` (the `Expr::FirstExpr`/`LastExpr` one-arg
+/// stream form `first(f)`/`last(f)` compiles to — distinct from the bare
+/// zero-arg `first`/`last` keyword, which is `Builtin::First`/`Last`) had no
+/// native arm in `eval_generic::eval_single`, so it fell through the
+/// catch-all `to_owned()` bridge and collapsed duplicate keys inside the
+/// selected element before the extraction even ran — unlike `.[0]`, which
+/// #532 already routed through the cursor-preserving path.
+#[test]
+fn test_preserve_input_first_last_expr_preserve_duplicate_keys() -> Result<()> {
+    let input = r#"[{"a":1,"a":2},{"b":3,"b":4}]"#;
+
+    let (first_compact, _, code) =
+        run_jq_full(&["-c", "--preserve-input", "first(.[])"], Some(input))?;
+    assert_eq!(code, 0);
+    assert_eq!(first_compact.trim(), r#"{"a":1,"a":2}"#);
+
+    let (first_pretty, _, code) = run_jq_full(&["--preserve-input", "first(.[])"], Some(input))?;
+    assert_eq!(code, 0);
+    assert_eq!(first_pretty, "{\n  \"a\": 1,\n  \"a\": 2\n}\n");
+
+    let (last_compact, _, code) =
+        run_jq_full(&["-c", "--preserve-input", "last(.[])"], Some(input))?;
+    assert_eq!(code, 0);
+    assert_eq!(last_compact.trim(), r#"{"b":3,"b":4}"#);
+
+    let (last_pretty, _, code) = run_jq_full(&["--preserve-input", "last(.[])"], Some(input))?;
+    assert_eq!(code, 0);
+    assert_eq!(last_pretty, "{\n  \"b\": 3,\n  \"b\": 4\n}\n");
+
+    Ok(())
+}
+
+/// #607: the bare zero-arg `first`/`last` keyword (`Builtin::First`/`Last`,
+/// equivalent to `.[0]`/`.[-1]`) called `elements.get(...)` instead of the
+/// `get_cursor(...)` sibling `.[0]`/`.[-1]` (`Expr::Index`) already used.
+#[test]
+fn test_preserve_input_bare_first_last_preserve_duplicate_keys() -> Result<()> {
+    let input = r#"[{"a":1,"a":2},{"b":3,"b":4}]"#;
+
+    let (first, _, code) = run_jq_full(&["-c", "--preserve-input", "first"], Some(input))?;
+    assert_eq!(code, 0);
+    assert_eq!(first.trim(), r#"{"a":1,"a":2}"#);
+
+    let (last, _, code) = run_jq_full(&["-c", "--preserve-input", "last"], Some(input))?;
+    assert_eq!(code, 0);
+    assert_eq!(last.trim(), r#"{"b":3,"b":4}"#);
+
+    Ok(())
+}
+
+/// #607: computed-key indexing (`.[$k]`/`.[(expr)]`, `Expr::IndexExpr`) went
+/// through `index_one_generic`'s old `fields.find`/`elements.get` calls —
+/// the same bug class as `first`/`last` above but reached via a different
+/// code path (`eval_index_expr`). `.[(1-1)]` forces a genuinely computed
+/// index rather than one the parser folds into a literal `Expr::Index`.
+#[test]
+fn test_preserve_input_computed_index_preserves_duplicate_keys() -> Result<()> {
+    let input = r#"[{"a":1,"a":2},{"b":3,"b":4}]"#;
+
+    let (compact, _, code) = run_jq_full(&["-c", "--preserve-input", ".[(1-1)]"], Some(input))?;
+    assert_eq!(code, 0);
+    assert_eq!(compact.trim(), r#"{"a":1,"a":2}"#);
+
     Ok(())
 }
 
@@ -2723,6 +2882,49 @@ fn test_uncaught_break_after_output_keeps_the_prefix() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn regression_issue_575_break_in_loop_constructs_reaches_label() -> Result<()> {
+    // A `break $label` raised from inside `while`/`foreach`/`repeat`'s
+    // per-iteration expression used to degrade into a bogus
+    // "break $out not in label" error (exit 5) instead of unwinding to the
+    // enclosing `label` (real jq: clean output, exit 0) — the label never
+    // got a chance to catch it. All three transcripts here are verified
+    // against jq 1.7.1.
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            "label $out | while(true; if . >= 1 then break $out else .+1 end)",
+        ],
+        Some("1"),
+    )?;
+    assert_eq!(stdout, "1\n");
+    assert_eq!(stderr, "");
+    assert_eq!(code, 0);
+
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            "label $out | repeat(if . >= 1 then break $out else .+1 end)",
+        ],
+        Some("1"),
+    )?;
+    assert_eq!(stdout, "");
+    assert_eq!(stderr, "");
+    assert_eq!(code, 0);
+
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            "label $out | foreach (1,2,3) as $x (0; if $x == 2 then break $out else . + $x end)",
+        ],
+        Some("null"),
+    )?;
+    assert_eq!(stdout, "1\n");
+    assert_eq!(stderr, "");
+    assert_eq!(code, 0);
+    Ok(())
+}
+
 /// A `NumberLiteral` that overflows to infinity (e.g. `1e400`) used to render
 /// as garbage like `"NaNE+2147483647"` in every non-JSON text format instead
 /// of `"inf"`/`"-inf"` (#561). `tostring` reaches the fix directly, but
@@ -2816,6 +3018,41 @@ fn test_number_literal_overflow_owned_reindex_bridges_via_cli() -> Result<()> {
     )?;
     assert_eq!(code, 0);
     assert_eq!(output.trim(), r#"{"a":"inf"}"#);
+
+    Ok(())
+}
+
+/// `path`/`parent`/`parent(n)`/`key` used to silently answer `[]`/`{}`/`null`
+/// (the root-level defaults) whenever they weren't the very first pipe stage:
+/// the CLI's streaming evaluator (`eval_generic.rs`) bridged only the bare
+/// trailing builtin to the full evaluator, discarding the pipe structure
+/// `eval.rs`'s `needs_path_context` routing needs to see (#554). Uses
+/// `run_jq_full` (the pre-built binary), not the `cargo run`-based
+/// `run_jq_stdin`, so this is actually covered by `cargo llvm-cov`.
+#[test]
+fn test_path_context_builtins_across_pipe_stages_554() -> Result<()> {
+    let (output, _, code) = run_jq_full(&["-c", ".a | path"], Some(r#"{"a":1}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#"["a"]"#);
+
+    let (output, _, code) = run_jq_full(&["-c", ".a | parent"], Some(r#"{"a":1}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#"{"a":1}"#);
+
+    let (output, _, code) = run_jq_full(&["-c", ".a | key"], Some(r#"{"a":1}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#""a""#);
+
+    let (output, _, code) = run_jq_full(&["-c", ".a.b | parent"], Some(r#"{"a":{"b":1}}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#"{"b":1}"#);
+
+    let (output, _, code) = run_jq_full(
+        &["-c", ".a.b.c | parent(2)"],
+        Some(r#"{"a":{"b":{"c":1}}}"#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#"{"b":{"c":1}}"#);
 
     Ok(())
 }

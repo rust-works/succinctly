@@ -48,14 +48,55 @@
 # surfaced a distinct, pre-existing gap — try/catch not catching break — but
 # #562 fixed that separately (and landed first), and the #400/#494 branch
 # extended the same fix to a Partial-prefixed break, so the count stays 10.
+#
+# #572 added four more cases from #534's own body: reduce_update_zero_output,
+# foreach_extract_fanout, while_backtrack and until_backtrack. Unlike the
+# already-pinned INIT-forking pair above (silent wrong answers), the interim
+# parse_pipe_no_comma() restriction #534 describes rejects all four outright
+# — jq succeeds with real output, succinctly exits 1 on a compile error, so
+# no expected.status/expected.err is needed (those encode jq's own failure,
+# and jq doesn't fail here); the mismatch is the bare exit-code branch in
+# tests/jq_golden_tests.rs, taking the file to 14.
+#
+# comma_literal_before_document (#353) has since been fixed and dropped,
+# leaving 13.
+#
+# if_multi_output_condition (#378) has since been fixed and dropped, leaving
+# 12: `if`/`select` now fan out over every output of the condition instead of
+# consulting only the first one, in both evaluators.
+#
+# nan_type (#472), slice_computed_bounds (#499), recurse_null_child (#490) and
+# path_recursive_descent (#483) have since been fixed and dropped, leaving 8:
+# `builtin_recurse_f`/`builtin_recurse_cond` now resolve `f` through
+# `eval_owned_multi` instead of `eval_owned_expr`, so a null child is queued
+# like any other value instead of being filtered out, and a single
+# array-valued child is visited as one node instead of being spliced into its
+# elements (#570). Separately, `resolve_node`'s `..`/`recurse`/`select`/
+# typeof-filter arms already existed but were never reached, because
+# `needs_path_prepass` — the gate deciding whether the pre-pass runs at all —
+# only fired for a computed-key `IndexExpr` or a `Comma`. Rewritten as an
+# exclusion check (anything other than the bare
+# `Identity`/`Field`/`Index`/`Slice`/`Iterate` primitives the walker already
+# handles natively needs the pre-pass) so a resolver arm existing without the
+# gate routing to it can't recur the same way for the next combinator (#483).
+#
+# #354 fixed object construction's cartesian product (`eval_object_construction`
+# now emits one object per key/value combination instead of taking each
+# generator's first output). object_construct_cartesian — seeded far earlier by
+# #513 and predating the fix's own five new golden cases — passes too, dropping
+# the file to 7.
+#
+# assign_multi_output_rhs (#392) has since been fixed and dropped, leaving 6:
+# `eval_assign` now forks once per RHS output instead of collapsing to the
+# first, matching jq's own `value as $value | reduce path(paths) as $p
+# (...)` desugaring. `update_path`'s `Expr::Identity` arm was fixed the same
+# way for `|=`/`+=`/`-=`/`*=`/`/=`/`%=`/`//=`: it now takes the update
+# filter's first output via `eval_owned_multi` instead of collapsing every
+# output into an `OwnedValue::Array` via `eval_owned_expr`.
 
-comma_literal_before_document  comma              . evaluates before the literal 1 inside [1, .], reversing output order — #353
-object_construct_cartesian     object_construct   only the first output of each key/value generator is used instead of the cartesian product — #354
-if_multi_output_condition      if_condition       only the first output of a multi-output if-condition is used — #378
-assign_multi_output_rhs        assignment         .a = (1,2) only applies the first RHS output instead of forking once per output — #392
-nan_type                       nan                nan | type reports "null" instead of "number" — #472
-path_recursive_descent         path               path(..) returns only the root path instead of every descendant path — #483
-recurse_null_child             recurse            recurse on {"a":null} stops before visiting the null leaf — #490
-slice_computed_bounds          slice              computed slice bounds (.a[.k:2]) are a parse error; only integer literals are accepted — #499
 reduce_multi_output_init       reduce             a multi-output reduce INIT forks in jq; only the first init output is used — #534
 foreach_multi_output_init      foreach            a multi-output foreach INIT forks in jq; only the first init output is used — #534
+reduce_update_zero_output      reduce             a comma in reduce's UPDATE clause is a compile error; jq keeps only UPDATE's last output as the new state, discarding earlier ones — #534
+foreach_extract_fanout         foreach            a comma in foreach's EXTRACT clause is a compile error; jq emits once per EXTRACT output instead of collapsing to one — #534
+while_backtrack                while              a comma in while's update expression is a compile error; jq backtracks through every fork of the condition/update chain — #534
+until_backtrack                until              a comma in until's update expression is a compile error; jq backtracks through every fork of the condition/update chain — #534

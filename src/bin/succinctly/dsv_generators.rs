@@ -1,6 +1,6 @@
 //! DSV (CSV/TSV) generators for benchmarking and testing.
 
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 
 #[derive(Debug, Clone, Copy)]
@@ -75,7 +75,7 @@ fn generate_tabular(
             .map_or(row_id * 10, |r| r.random_range(0..10000));
         let active = rng
             .as_mut()
-            .map_or(row_id % 2 == 0, rand::Rng::random::<bool>);
+            .map_or(row_id % 2 == 0, rand::RngExt::random::<bool>);
         let day = (row_id % 28) + 1;
         let month = (row_id % 12) + 1;
 
@@ -455,7 +455,7 @@ fn generate_mixed(
             .map_or(row_id as f64 * 1.5, |r| r.random::<f64>() * 1000.0 - 500.0);
         let bool_val = rng
             .as_mut()
-            .map_or(row_id % 2 == 0, rand::Rng::random::<bool>);
+            .map_or(row_id % 2 == 0, rand::RngExt::random::<bool>);
         let day = (row_id % 28) + 1;
         let month = (row_id % 12) + 1;
 

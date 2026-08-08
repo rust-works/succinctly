@@ -71,7 +71,9 @@ use super::expr::{
     ArithOp, AssignOp, Builtin, CompareOp, Expr, FormatType, Literal, ObjectEntry, ObjectKey,
     Pattern, StringPart,
 };
-use super::value::{cmp_f64, format_number_jq_compat, numeric_repr_cmp, NumberRepr, OwnedValue};
+use super::value::{
+    cmp_f64, format_number_jq_compat, is_nan_sentinel, numeric_repr_cmp, NumberRepr, OwnedValue,
+};
 
 /// Result of evaluating a jq expression.
 #[derive(Debug)]
@@ -247,11 +249,17 @@ fn to_owned<W: Clone + AsRef<[u64]>>(value: &StandardJson<'_, W>) -> OwnedValue 
     match value {
         StandardJson::Null => OwnedValue::Null,
         StandardJson::Bool(b) => OwnedValue::Bool(*b),
-        StandardJson::Number(n) => match core::str::from_utf8(n.raw_bytes()) {
-            Ok(s) => OwnedValue::from_number_literal(s),
-            // Fallback - shouldn't happen for valid JSON
-            Err(_) => OwnedValue::Float(0.0),
-        },
+        StandardJson::Number(n) => {
+            if is_nan_sentinel(n.raw_bytes()) {
+                OwnedValue::Float(f64::NAN)
+            } else {
+                match core::str::from_utf8(n.raw_bytes()) {
+                    Ok(s) => OwnedValue::from_number_literal(s),
+                    // Fallback - shouldn't happen for valid JSON
+                    Err(_) => OwnedValue::Float(0.0),
+                }
+            }
+        }
         StandardJson::String(s) => {
             if let Ok(cow) = s.as_str() {
                 OwnedValue::String(cow.into_owned())
@@ -294,7 +302,7 @@ fn json_is_truthy<W>(value: &StandardJson<'_, W>) -> bool {
 }
 
 /// Check if an expression contains PathNoArg, Parent, or Key builtins that need path context.
-fn needs_path_context(expr: &Expr) -> bool {
+pub(crate) fn needs_path_context(expr: &Expr) -> bool {
     match expr {
         Expr::Builtin(Builtin::PathNoArg) => true,
         Expr::Builtin(Builtin::Parent) => true,
@@ -305,6 +313,11 @@ fn needs_path_context(expr: &Expr) -> bool {
         Expr::Optional(inner) => needs_path_context(inner),
         Expr::Comma(exprs) => exprs.iter().any(needs_path_context),
         Expr::IndexExpr { target, key } => needs_path_context(target) || needs_path_context(key),
+        Expr::SliceExpr { target, start, end } => {
+            needs_path_context(target)
+                || start.as_deref().is_some_and(needs_path_context)
+                || end.as_deref().is_some_and(needs_path_context)
+        }
         Expr::If {
             cond,
             then_branch,
@@ -335,6 +348,10 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Expr::Index(idx) => index_array_by_position::<W>(value, *idx, optional),
 
         Expr::IndexExpr { target, key } => eval_index_expr::<W, S>(target, key, value, optional),
+
+        Expr::SliceExpr { target, start, end } => {
+            eval_slice_expr::<W, S>(target, start, end, value, optional)
+        }
 
         Expr::Slice { start, end } => match value {
             StandardJson::Array(elements) => {
@@ -455,7 +472,7 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             eval_string_interpolation::<W, S>(parts, value, optional)
         }
 
-        Expr::Format(format_type) => eval_format::<W>(format_type.clone(), value, optional),
+        Expr::Format(format_type) => eval_format::<W>(format_type, value, optional),
 
         // Phase 8: Variables and Advanced Control Flow
         Expr::As { expr, var, body } => eval_as::<W, S>(expr, var, body, value, optional),
@@ -572,56 +589,76 @@ fn eval_comma<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         return QueryResult::None;
     }
 
-    let mut all_results = Vec::new();
-    let mut all_owned = Vec::new();
-    let mut has_owned = false;
+    // Operands must reach the output in source order. While every operand so
+    // far is borrowed from the document they accumulate in `borrowed` and
+    // nothing is materialized — the fast path. The first owned operand promotes
+    // that prefix into `owned` in place, and every later operand appends there,
+    // so exactly one ordered accumulator is live at a time. Two parallel buckets
+    // concatenated at the end lost each operand's position and hoisted every
+    // borrowed one ahead of every owned one (#353). Same shape as the `Many` arm
+    // of `eval_pipe` (#295).
+    let mut borrowed: Vec<StandardJson<'a, W>> = Vec::new();
+    let mut owned: Option<Vec<OwnedValue>> = None;
 
     for expr in exprs {
         match eval_single::<W, S>(expr, value.clone(), optional).materialize_cursor() {
-            QueryResult::One(v) => all_results.push(v),
+            QueryResult::One(v) => match owned.as_mut() {
+                Some(acc) => acc.push(to_owned(&v)),
+                None => borrowed.push(v),
+            },
             QueryResult::OneCursor(_) => {
                 unreachable!("materialize_cursor should have converted this")
             }
-            QueryResult::Many(vs) => all_results.extend(vs),
-            QueryResult::Owned(v) => {
-                has_owned = true;
-                all_owned.push(v);
-            }
-            QueryResult::ManyOwned(vs) => {
-                has_owned = true;
-                all_owned.extend(vs);
-            }
+            QueryResult::Many(vs) => match owned.as_mut() {
+                Some(acc) => acc.extend(vs.iter().map(to_owned)),
+                None => borrowed.extend(vs),
+            },
+            QueryResult::Owned(v) => owned
+                .get_or_insert_with(|| {
+                    core::mem::take(&mut borrowed)
+                        .iter()
+                        .map(to_owned)
+                        .collect()
+                })
+                .push(v),
+            QueryResult::ManyOwned(vs) => owned
+                .get_or_insert_with(|| {
+                    core::mem::take(&mut borrowed)
+                        .iter()
+                        .map(to_owned)
+                        .collect()
+                })
+                .extend(vs),
             QueryResult::None => {}
             // A sibling that errors or breaks no longer discards the outputs
             // the earlier siblings already produced (#400): `(1,error("x"))`
             // now carries `1` forward as `Partial`'s prefix instead of
             // collapsing straight to a bare `Error`.
             QueryResult::Error(e) => {
-                return partial(merge_owned(all_results, all_owned), Control::Error(e));
+                return partial(
+                    merge_owned(borrowed, owned.unwrap_or_default()),
+                    Control::Error(e),
+                );
             }
             QueryResult::Break(label) => {
-                return partial(merge_owned(all_results, all_owned), Control::Break(label));
+                return partial(
+                    merge_owned(borrowed, owned.unwrap_or_default()),
+                    Control::Break(label),
+                );
             }
             QueryResult::Partial(vs, control) => {
-                all_owned.extend(vs);
-                return partial(merge_owned(all_results, all_owned), control);
+                let mut merged = merge_owned(borrowed, owned.unwrap_or_default());
+                merged.extend(vs);
+                return partial(merged, control);
             }
         }
     }
 
-    // If we have any owned values, we need to convert all results to owned
-    if has_owned {
-        let mut converted: Vec<OwnedValue> = all_results.iter().map(to_owned).collect();
-        converted.extend(all_owned);
-        if converted.len() == 1 {
-            QueryResult::Owned(converted.pop().unwrap())
-        } else {
-            QueryResult::ManyOwned(converted)
-        }
-    } else if all_results.len() == 1 {
-        QueryResult::One(all_results.pop().unwrap())
-    } else {
-        QueryResult::Many(all_results)
+    match owned {
+        Some(mut acc) if acc.len() == 1 => QueryResult::Owned(acc.pop().unwrap()),
+        Some(acc) => QueryResult::ManyOwned(acc),
+        None if borrowed.len() == 1 => QueryResult::One(borrowed.pop().unwrap()),
+        None => QueryResult::Many(borrowed),
     }
 }
 
@@ -653,22 +690,154 @@ fn eval_array_construction<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     QueryResult::Owned(OwnedValue::Array(items))
 }
 
-/// jq's refusal of a non-string object key — or nothing at all under the
-/// `optional` flag, which is what jq's `?` suffix sets: `0 | {(.):1}?` prints
-/// nothing there.
+/// Non-local exit out of the object-construction recursion.
 ///
-/// Succinctly's parser does not yet accept `?` on anything but a path
-/// expression, so today the flag arrives only from within; the branch is
-/// covered directly by `test_optional_suppresses_the_object_key_refusal`.
-fn refuse_object_key<'a, W: Clone + AsRef<[u64]>>(
-    key: &OwnedValue,
-    optional: bool,
-) -> QueryResult<'a, W> {
-    if optional {
-        QueryResult::None
-    } else {
-        QueryResult::Error(EvalError::cannot_use_as_object_key(key))
+/// `Error` and `Break` are the two `QueryResult` variants that must abandon the
+/// product rather than contribute an output, so they travel as the `Err` side of
+/// the recursive builder instead of being re-matched at every level. `None` is a
+/// third: the `optional` flag (`?`) turns a non-string-key refusal into an empty
+/// result instead of an error, the same way it does for `from_entries` and
+/// `with_entries` — covered by `test_optional_suppresses_the_object_key_refusal`.
+enum ObjectEscape {
+    None,
+    Error(EvalError),
+    Break(String),
+}
+
+/// Materialize every output of a sub-expression, plus a deferred escape if its
+/// own generator terminates in an error or break.
+///
+/// jq doesn't stop early just because a generator is *going* to fail: `(1, 2,
+/// error("x"))` still yields `1` and `2` before the error propagates, and
+/// those outputs are real objects once combined with the rest of the entries
+/// (`{a: 1, b: (2, error("x"))}` is `{"a":1,"b":2}` *then* the error — verified
+/// against jq 1.7.1). So a `Partial` here is not an escape to peel off, the
+/// way a bare `Error`/`Break` is (those two carry no outputs at all); its
+/// prefix is exactly the outputs to combine, and its control is what fires
+/// once that prefix is exhausted. [`QueryResult::collect_owned`] isn't reused
+/// for the non-`Partial` cases because it would fold `Partial` down to just
+/// its prefix and silently drop the control that must fire after it.
+fn object_outputs<W: Clone + AsRef<[u64]>>(
+    result: QueryResult<'_, W>,
+) -> (Vec<OwnedValue>, Option<Control>) {
+    match result {
+        QueryResult::Error(e) => (Vec::new(), Some(Control::Error(e))),
+        QueryResult::Break(label) => (Vec::new(), Some(Control::Break(label))),
+        QueryResult::Partial(vs, control) => (vs, Some(control)),
+        other => (other.collect_owned(), None),
     }
+}
+
+impl From<Control> for ObjectEscape {
+    fn from(control: Control) -> Self {
+        match control {
+            Control::Error(e) => Self::Error(e),
+            Control::Break(label) => Self::Break(label),
+        }
+    }
+}
+
+/// Emit one object per combination of the remaining entries' key/value outputs.
+///
+/// Object construction is a generator in jq: an entry whose key or value yields
+/// *n* outputs multiplies the objects produced (#354). The nesting below is what
+/// gives jq's observable ordering and laziness:
+///
+/// - the *last* entry varies fastest, and within an entry the key varies slower
+///   than the value — hence entries recurse and the key loop encloses the value
+///   loop;
+/// - `rest` is only reached from inside the value loop, so an entry with zero
+///   outputs short-circuits every entry to its right without evaluating them
+///   (`{a: empty, b: error("boom")}` is empty, not an error);
+/// - the key's string-ness is checked at assembly time, after the value is in
+///   hand, so `{(.n): empty}` with a numeric `.n` raises nothing and
+///   `{(.n): error("VAL")}` reports `VAL` rather than the key-type error;
+/// - a key or value generator's own deferred control (see [`object_outputs`])
+///   is checked only after its whole prefix loop has run to completion, and
+///   is then returned via `?` — which unwinds every enclosing loop immediately
+///   rather than resuming them, matching jq's own all-or-nothing backtracking:
+///   `{a: (1,2), b: (10,error("x"))}` is `{"a":1,"b":10}` then the error, never
+///   `{"a":2,"b":10}` (jq 1.7.1).
+///
+/// `acc` is a push/pop stack rather than a map: the object is built once per
+/// combination via `collect()`, which gives jq's duplicate-key rule (last value
+/// wins, first position) for free from `IndexMap::insert`.
+///
+/// `sole` tracks whether every enclosing loop is running its one and only
+/// iteration — i.e. whether the product is a single object, which is the case
+/// for every query that predates #354. It exists purely so that case can move
+/// the accumulated values into the object instead of cloning them, keeping the
+/// common path allocation-for-allocation identical to the pre-#354 code. Without
+/// it, `{a: .big}` would deep-clone `.big` on the way out.
+fn build_object_entries<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    entries: &[super::expr::ObjectEntry],
+    value: &StandardJson<'_, W>,
+    optional: bool,
+    sole: bool,
+    acc: &mut Vec<(String, OwnedValue)>,
+    out: &mut Vec<OwnedValue>,
+) -> Result<(), ObjectEscape> {
+    let Some((entry, rest)) = entries.split_first() else {
+        let object = if sole {
+            // Only combination, so nothing will read `acc` again: every enclosing
+            // loop is on its final iteration, and the `acc.pop()` each one runs on
+            // the way out is a no-op on the emptied vector.
+            core::mem::take(acc).into_iter().collect::<IndexMap<_, _>>()
+        } else {
+            acc.iter().cloned().collect::<IndexMap<_, _>>()
+        };
+        out.push(OwnedValue::Object(object));
+        return Ok(());
+    };
+
+    let (keys, key_trailing) = match &entry.key {
+        ObjectKey::Literal(s) => (vec![OwnedValue::String(s.clone())], None),
+        ObjectKey::Expr(key_expr) => {
+            object_outputs(eval_single::<W, S>(key_expr, value.clone(), optional))
+        }
+    };
+    let sole = sole && keys.len() == 1;
+
+    for key in keys {
+        let (vals, val_trailing) =
+            object_outputs(eval_single::<W, S>(&entry.value, value.clone(), optional));
+        let sole = sole && vals.len() == 1;
+
+        for val in vals {
+            let OwnedValue::String(key_str) = &key else {
+                // A single non-string key is jq's `Cannot use <t> (<v>) as
+                // object key` — the same sentence `from_entries` raises,
+                // because jq *defines* `from_entries` as object construction
+                // over the entries (#391) — unless `optional` (`?`) is set, in
+                // which case it is suppressed into an empty result instead.
+                return Err(if optional {
+                    ObjectEscape::None
+                } else {
+                    ObjectEscape::Error(EvalError::cannot_use_as_object_key(&key))
+                });
+            };
+
+            acc.push((key_str.clone(), val));
+            let result = build_object_entries::<W, S>(rest, value, optional, sole, acc, out);
+            acc.pop();
+            result?;
+        }
+
+        // The value generator's own prefix is exhausted — now its deferred
+        // control fires, aborting every enclosing loop via `?` (never trying
+        // this entry's next key, nor an earlier entry's next value).
+        if let Some(control) = val_trailing {
+            return Err(control.into());
+        }
+    }
+
+    // Same deferred-control shape as above, one level up: only once every key
+    // this generator produced has had its value loop run to completion.
+    if let Some(control) = key_trailing {
+        return Err(control.into());
+    }
+
+    Ok(())
 }
 
 /// Evaluate object construction.
@@ -677,79 +846,40 @@ fn eval_object_construction<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    let mut map = IndexMap::new();
+    let mut objects = Vec::new();
+    let mut acc = Vec::new();
 
-    for entry in entries {
-        // Evaluate the key
-        let key_str = match &entry.key {
-            ObjectKey::Literal(s) => s.clone(),
-            ObjectKey::Expr(key_expr) => {
-                let key_result =
-                    eval_single::<W, S>(key_expr, value.clone(), optional).materialize_cursor();
-                match key_result {
-                    QueryResult::One(StandardJson::String(s)) => match s.as_str() {
-                        Ok(cow) => cow.into_owned(),
-                        // Not a condition jq has — its strings are always
-                        // valid UTF-8 — so this keeps succinctly's wording.
-                        Err(_) => {
-                            return QueryResult::Error(EvalError::new("key must be a string"))
-                        }
-                    },
-                    QueryResult::Owned(OwnedValue::String(s)) => s,
-                    QueryResult::Error(e) => return QueryResult::Error(e),
-                    QueryResult::Break(label) => return QueryResult::Break(label),
-                    // A single non-string key is jq's `Cannot use <t> (<v>) as
-                    // object key` — the same sentence `from_entries` raises,
-                    // because jq *defines* `from_entries` as object
-                    // construction over the entries (#391).
-                    QueryResult::One(v) => return refuse_object_key(&to_owned(&v), optional),
-                    QueryResult::Owned(v) => return refuse_object_key(&v, optional),
-                    // A key expression yielding no value, or more than one, is
-                    // a separate behavioural gap — jq gives `empty` and a
-                    // cartesian product respectively. See
-                    // docs/compliance/jq/limitations.md.
-                    _ => {
-                        return QueryResult::Error(EvalError::new("key must be a string"));
-                    }
-                }
-            }
-        };
-
-        // Evaluate the value
-        let val_result = eval_single::<W, S>(&entry.value, value.clone(), optional);
-        let owned_val = match val_result.materialize_cursor() {
-            QueryResult::One(v) => to_owned(&v),
-            QueryResult::OneCursor(_) => unreachable!(),
-            QueryResult::Owned(v) => v,
-            QueryResult::Many(vs) => {
-                // Multiple values - take the first one (jq behavior)
-                if let Some(v) = vs.first() {
-                    to_owned(v)
-                } else {
-                    OwnedValue::Null
-                }
-            }
-            QueryResult::ManyOwned(vs) => {
-                if let Some(v) = vs.into_iter().next() {
-                    v
-                } else {
-                    OwnedValue::Null
-                }
-            }
-            QueryResult::None => OwnedValue::Null,
-            QueryResult::Error(e) => return QueryResult::Error(e),
-            QueryResult::Break(label) => return QueryResult::Break(label),
-            // Object construction is atomic in jq (verified:
-            // `{a:1,b:error("x")}` produces no output at all) — a `Partial`
-            // value stream just surfaces its control, same as a bare one.
-            QueryResult::Partial(_, Control::Error(e)) => return QueryResult::Error(e),
-            QueryResult::Partial(_, Control::Break(label)) => return QueryResult::Break(label),
-        };
-
-        map.insert(key_str, owned_val);
+    // jq streams, so it emits the combinations produced before an error and
+    // only then fails: `try {("a",1):2}` is `{"a":2}` there, and here — the
+    // objects already pushed to `out` by the time `build_object_entries`
+    // returns `Err` travel onward as `QueryResult::Partial`'s prefix, the same
+    // carrier `eval_comma` uses for `(1,error("x"))` (#400/#494).
+    match build_object_entries::<W, S>(entries, &value, optional, true, &mut acc, &mut objects) {
+        Ok(()) => {}
+        Err(ObjectEscape::None) => return QueryResult::None,
+        Err(ObjectEscape::Break(label)) => {
+            return if objects.is_empty() {
+                QueryResult::Break(label)
+            } else {
+                QueryResult::Partial(objects, Control::Break(label))
+            };
+        }
+        Err(ObjectEscape::Error(e)) => {
+            return if objects.is_empty() {
+                QueryResult::Error(e)
+            } else {
+                QueryResult::Partial(objects, Control::Error(e))
+            };
+        }
     }
 
-    QueryResult::Owned(OwnedValue::Object(map))
+    if objects.is_empty() {
+        QueryResult::None
+    } else if objects.len() == 1 {
+        QueryResult::Owned(objects.pop().unwrap())
+    } else {
+        QueryResult::ManyOwned(objects)
+    }
 }
 
 /// Evaluate recursive descent.
@@ -989,6 +1119,87 @@ fn bools_to_result<'a, W: Clone + AsRef<[u64]>>(mut bools: Vec<bool>) -> QueryRe
         0 => QueryResult::None,
         1 => QueryResult::Owned(OwnedValue::Bool(bools.pop().unwrap())),
         _ => QueryResult::ManyOwned(bools.into_iter().map(OwnedValue::Bool).collect()),
+    }
+}
+
+/// Evaluate `body(bit)` once per truthy-bit of a condition stream, merging
+/// the results in order. Shared by `eval_if` and `builtin_select` so a
+/// multi-output condition (`if (true,false) then "a" else "b" end` /
+/// `select((false,false) and true)`) fans out the same way both call it,
+/// instead of only consulting the condition's first output (#378).
+///
+/// Same borrowed/owned promotion as `eval_comma` (#353): outputs stay
+/// borrowed until an owned/computed body result forces the accumulator to
+/// promote, and a sibling that errors or breaks keeps whatever was already
+/// produced as a `Partial` prefix (#400) rather than discarding it.
+fn eval_fanout<'a, W: Clone + AsRef<[u64]>>(
+    cond_result: QueryResult<'a, W>,
+    mut body: impl FnMut(bool) -> QueryResult<'a, W>,
+) -> QueryResult<'a, W> {
+    let mut bits = Vec::new();
+    let cond_control = push_truthiness(cond_result, &mut bits);
+
+    let mut borrowed: Vec<StandardJson<'a, W>> = Vec::new();
+    let mut owned: Option<Vec<OwnedValue>> = None;
+
+    for bit in bits {
+        match body(bit).materialize_cursor() {
+            QueryResult::One(v) => match owned.as_mut() {
+                Some(acc) => acc.push(to_owned(&v)),
+                None => borrowed.push(v),
+            },
+            QueryResult::OneCursor(_) => {
+                unreachable!("materialize_cursor should have converted this")
+            }
+            QueryResult::Many(vs) => match owned.as_mut() {
+                Some(acc) => acc.extend(vs.iter().map(to_owned)),
+                None => borrowed.extend(vs),
+            },
+            QueryResult::Owned(v) => owned
+                .get_or_insert_with(|| {
+                    core::mem::take(&mut borrowed)
+                        .iter()
+                        .map(to_owned)
+                        .collect()
+                })
+                .push(v),
+            QueryResult::ManyOwned(vs) => owned
+                .get_or_insert_with(|| {
+                    core::mem::take(&mut borrowed)
+                        .iter()
+                        .map(to_owned)
+                        .collect()
+                })
+                .extend(vs),
+            QueryResult::None => {}
+            QueryResult::Error(e) => {
+                return partial(
+                    merge_owned(borrowed, owned.unwrap_or_default()),
+                    Control::Error(e),
+                );
+            }
+            QueryResult::Break(label) => {
+                return partial(
+                    merge_owned(borrowed, owned.unwrap_or_default()),
+                    Control::Break(label),
+                );
+            }
+            QueryResult::Partial(vs, control) => {
+                let mut merged = merge_owned(borrowed, owned.unwrap_or_default());
+                merged.extend(vs);
+                return partial(merged, control);
+            }
+        }
+    }
+
+    match cond_control {
+        Some(control) => partial(merge_owned(borrowed, owned.unwrap_or_default()), control),
+        None => match owned {
+            Some(mut acc) if acc.len() == 1 => QueryResult::Owned(acc.pop().unwrap()),
+            Some(acc) => QueryResult::ManyOwned(acc),
+            None if borrowed.len() == 1 => QueryResult::One(borrowed.pop().unwrap()),
+            None => QueryResult::Many(borrowed),
+        },
     }
 }
 
@@ -1525,6 +1736,10 @@ fn eval_alternative<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 }
 
 /// Evaluate if-then-else expression.
+///
+/// A multi-output condition forks the branches, one evaluation per output
+/// (`if (true,false) then "a" else "b" end` yields `"a"`, `"b"`) — jq
+/// semantics, restored by `eval_fanout` (#378).
 fn eval_if<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     cond: &Expr,
     then_branch: &Expr,
@@ -1532,37 +1747,14 @@ fn eval_if<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    // Evaluate condition
     let cond_result = eval_single::<W, S>(cond, value.clone(), optional);
-
-    // Check if condition is truthy
-    let is_truthy = match &cond_result {
-        QueryResult::One(v) => to_owned(v).is_truthy(),
-        QueryResult::OneCursor(_) => unreachable!("eval_single never produces OneCursor"),
-        QueryResult::Owned(v) => v.is_truthy(),
-        QueryResult::Many(vs) => vs.first().is_some_and(|v| to_owned(v).is_truthy()),
-        QueryResult::ManyOwned(vs) => vs.first().is_some_and(super::value::OwnedValue::is_truthy),
-        QueryResult::None => false,
-        QueryResult::Error(e) => return QueryResult::Error(e.clone()),
-        QueryResult::Break(label) => return QueryResult::Break(label.clone()),
-        // The condition is only ever consulted for its first output (#378,
-        // a separate, already-tracked limitation — a multi-output condition
-        // does not fork the branches). A `Partial` condition is treated the
-        // same as a bare `Error`/`Break` above: the condition is evaluated
-        // once, and — per array/object construction's precedent, verified
-        // against jq — a value-position sub-expression that errors partway
-        // aborts outright rather than exposing a prefix.
-        QueryResult::Partial(_, Control::Error(e)) => return QueryResult::Error(e.clone()),
-        QueryResult::Partial(_, Control::Break(label)) => {
-            return QueryResult::Break(label.clone());
+    eval_fanout(cond_result, |truthy| {
+        if truthy {
+            eval_single::<W, S>(then_branch, value.clone(), optional)
+        } else {
+            eval_single::<W, S>(else_branch, value.clone(), optional)
         }
-    };
-
-    if is_truthy {
-        eval_single::<W, S>(then_branch, value, optional)
-    } else {
-        eval_single::<W, S>(else_branch, value, optional)
-    }
+    })
 }
 
 /// Evaluate try-catch expression.
@@ -2126,7 +2318,9 @@ fn builtin_length<W: Clone + AsRef<[u64]>>(
         StandardJson::Number(n) => {
             // Length of a number is its absolute value.
             // checked_abs: i64::MIN has no i64 absolute value; use f64
-            if let Ok(i) = n.as_i64() {
+            if is_nan_sentinel(n.raw_bytes()) {
+                QueryResult::Owned(OwnedValue::Float(f64::NAN))
+            } else if let Ok(i) = n.as_i64() {
                 QueryResult::Owned(match i.checked_abs() {
                     Some(a) => OwnedValue::Int(a),
                     None => OwnedValue::Float(-(i as f64)),
@@ -2313,42 +2507,24 @@ fn builtin_in<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 }
 
 /// Builtin: select(condition)
+///
+/// A multi-output condition republishes `value` once per truthy output
+/// (`select((false,false) and true)` yields nothing, matching jq — not the
+/// first-output-only answer `vs.first()` used to give) — restored by
+/// `eval_fanout` (#378).
 fn builtin_select<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     cond: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    // Evaluate condition
     let cond_result = eval_single::<W, S>(cond, value.clone(), optional);
-
-    // Check if condition is truthy
-    let is_truthy = match &cond_result {
-        QueryResult::One(v) => to_owned(v).is_truthy(),
-        QueryResult::OneCursor(_) => unreachable!("eval_single never produces OneCursor"),
-        QueryResult::Owned(v) => v.is_truthy(),
-        QueryResult::Many(vs) => vs.first().is_some_and(|v| to_owned(v).is_truthy()),
-        QueryResult::ManyOwned(vs) => vs.first().is_some_and(super::value::OwnedValue::is_truthy),
-        QueryResult::None => false,
-        QueryResult::Error(e) => return QueryResult::Error(e.clone()),
-        QueryResult::Break(label) => return QueryResult::Break(label.clone()),
-        // The condition is only ever consulted for its first output (#378,
-        // a separate, already-tracked limitation — a multi-output condition
-        // does not fork the branches). A `Partial` condition is treated the
-        // same as a bare `Error`/`Break` above: the condition is evaluated
-        // once, and — per array/object construction's precedent, verified
-        // against jq — a value-position sub-expression that errors partway
-        // aborts outright rather than exposing a prefix.
-        QueryResult::Partial(_, Control::Error(e)) => return QueryResult::Error(e.clone()),
-        QueryResult::Partial(_, Control::Break(label)) => {
-            return QueryResult::Break(label.clone());
+    eval_fanout(cond_result, |truthy| {
+        if truthy {
+            QueryResult::One(value.clone())
+        } else {
+            QueryResult::None
         }
-    };
-
-    if is_truthy {
-        QueryResult::One(value)
-    } else {
-        QueryResult::None
-    }
+    })
 }
 
 /// Builtin: map(f)
@@ -3521,7 +3697,7 @@ fn builtin_from_entries<W: Clone + AsRef<[u64]>>(
         Ok(result) => QueryResult::Owned(OwnedValue::Object(result)),
         // The `?` suffix swallows the refusal outright in jq, as the arm
         // above already does for a non-array/non-object input. See
-        // `refuse_object_key` on why the flag is not yet reachable from
+        // `ObjectEscape`'s doc on why the flag is not yet reachable from
         // succinctly's own syntax.
         Err(_) if optional => QueryResult::None,
         Err(e) => QueryResult::Error(e),
@@ -3691,31 +3867,42 @@ fn owned_to_string(value: &OwnedValue) -> String {
     }
 }
 
-/// Evaluate a format string: `@json`, `@uri`, etc.
-fn eval_format<W: Clone + AsRef<[u64]>>(
-    format_type: FormatType,
-    value: StandardJson<'_, W>,
+/// Apply a format (`@json`, `@uri`, ...) to an already-materialized value.
+///
+/// Split out of [`eval_format`] so the generic evaluator can format an
+/// `OwnedValue` directly, instead of serializing it back to JSON and rebuilding
+/// a `JsonIndex` purely to re-enter this evaluator (#124). Formats are pure
+/// functions of the value -- they touch neither the cursor nor the index -- so
+/// this is the whole of the work `Expr::Format` needs.
+pub(crate) fn format_owned(
+    format_type: &FormatType,
+    owned: &OwnedValue,
     optional: bool,
-) -> QueryResult<'_, W> {
-    let owned = to_owned(&value);
+) -> Result<String, EvalError> {
+    match format_type {
+        FormatType::Text => format_text(owned),
+        FormatType::Json => format_json(owned),
+        FormatType::Uri => format_uri(owned, optional),
+        FormatType::Csv => format_csv(owned, optional),
+        FormatType::Tsv => format_tsv(owned, optional),
+        FormatType::Dsv(delimiter) => format_dsv(owned, delimiter, optional),
+        FormatType::Base64 => format_base64(owned, optional),
+        FormatType::Base64d => format_base64d(owned, optional),
+        FormatType::Html => format_html(owned, optional),
+        FormatType::Sh => format_sh(owned, optional),
+        FormatType::Urid => format_urid(owned, optional),
+        FormatType::Yaml => format_yaml(owned),
+        FormatType::Props => format_props(owned),
+    }
+}
 
-    let result = match format_type {
-        FormatType::Text => format_text(&owned),
-        FormatType::Json => format_json(&owned),
-        FormatType::Uri => format_uri(&owned, optional),
-        FormatType::Csv => format_csv(&owned, optional),
-        FormatType::Tsv => format_tsv(&owned, optional),
-        FormatType::Dsv(delimiter) => format_dsv(&owned, &delimiter, optional),
-        FormatType::Base64 => format_base64(&owned, optional),
-        FormatType::Base64d => format_base64d(&owned, optional),
-        FormatType::Html => format_html(&owned, optional),
-        FormatType::Sh => format_sh(&owned, optional),
-        FormatType::Urid => format_urid(&owned, optional),
-        FormatType::Yaml => format_yaml(&owned),
-        FormatType::Props => format_props(&owned),
-    };
-
-    match result {
+/// Evaluate a format string: `@json`, `@uri`, etc.
+fn eval_format<'a, W: Clone + AsRef<[u64]>>(
+    format_type: &FormatType,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    match format_owned(format_type, &to_owned(&value), optional) {
         Ok(s) => QueryResult::Owned(OwnedValue::String(s)),
         Err(e) => QueryResult::Error(e),
     }
@@ -3750,16 +3937,34 @@ fn format_uri(value: &OwnedValue, _optional: bool) -> Result<String, EvalError> 
         _ => return Err(EvalError::type_error("string", value.type_name())),
     };
 
-    let mut result = String::new();
-    for c in s.chars() {
-        if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' || c == '~' {
-            result.push(c);
-        } else {
-            for b in c.to_string().as_bytes() {
-                result.push_str(&format!("%{b:02X}"));
-            }
+    // Byte-oriented rather than char-oriented: percent-encoding acts on raw
+    // bytes anyway, and every safe byte is ASCII, so a multi-byte character's
+    // continuation bytes (always >= 0x80) never get mistaken for a safe byte.
+    // That lets a run of safe bytes be copied in one `push_str` instead of
+    // one `push` per char (#124) -- `start..i` is always a valid UTF-8
+    // boundary pair: either `start == i`, or the span in between is pure
+    // ASCII, which is a boundary by construction.
+    const HEX_DIGITS: &[u8; 16] = b"0123456789ABCDEF";
+    let bytes = s.as_bytes();
+    let mut result = String::with_capacity(bytes.len());
+    let mut start = 0;
+    for (i, &b) in bytes.iter().enumerate() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            continue;
         }
+        // `start == i` here is common (consecutive non-safe bytes, e.g. the
+        // continuation bytes of one multi-byte char) and must be skipped
+        // rather than sliced: `&s[i..i]` still panics if `i` isn't a char
+        // boundary, even though the slice would be empty.
+        if start < i {
+            result.push_str(&s[start..i]);
+        }
+        result.push('%');
+        result.push(HEX_DIGITS[(b >> 4) as usize] as char);
+        result.push(HEX_DIGITS[(b & 0x0F) as usize] as char);
+        start = i + 1;
     }
+    result.push_str(&s[start..]);
     Ok(result)
 }
 
@@ -3794,6 +3999,15 @@ fn format_urid(value: &OwnedValue, optional: bool) -> Result<String, EvalError> 
     }
 }
 
+/// Quote a CSV/DSV string field: wrap in `"..."`, doubling inner `"`.
+///
+/// jq unconditionally double-quotes every string field (inner `"` doubled),
+/// regardless of whether it contains a delimiter — see #306. Shared by
+/// `format_csv` and `format_dsv` so the quoting rule has one definition — see #651.
+fn quote_csv_field(s: &str) -> String {
+    format!("\"{}\"", s.replace('"', "\"\""))
+}
+
 /// @csv - CSV format (for arrays)
 fn format_csv(value: &OwnedValue, optional: bool) -> Result<String, EvalError> {
     match value {
@@ -3801,10 +4015,7 @@ fn format_csv(value: &OwnedValue, optional: bool) -> Result<String, EvalError> {
             let parts: Vec<String> = arr
                 .iter()
                 .map(|v| match v {
-                    // jq unconditionally double-quotes every string field
-                    // (inner `"` doubled), regardless of whether it contains a
-                    // delimiter — see #306.
-                    OwnedValue::String(s) => format!("\"{}\"", s.replace('"', "\"\"")),
+                    OwnedValue::String(s) => quote_csv_field(s),
                     OwnedValue::Null => String::new(),
                     other => owned_to_string(other),
                 })
@@ -3846,9 +4057,7 @@ fn format_dsv(value: &OwnedValue, delimiter: &str, optional: bool) -> Result<Str
             let parts: Vec<String> = arr
                 .iter()
                 .map(|v| match v {
-                    // Match @csv: always double-quote string fields (inner `"`
-                    // doubled) so @dsv(",") stays byte-identical to @csv — #306.
-                    OwnedValue::String(s) => format!("\"{}\"", s.replace('"', "\"\"")),
+                    OwnedValue::String(s) => quote_csv_field(s),
                     OwnedValue::Null => String::new(),
                     other => owned_to_string(other),
                 })
@@ -3970,17 +4179,29 @@ fn format_html(value: &OwnedValue, _optional: bool) -> Result<String, EvalError>
         _ => return Err(EvalError::type_error("string", value.type_name())),
     };
 
-    let mut result = String::new();
-    for c in s.chars() {
-        match c {
-            '<' => result.push_str("&lt;"),
-            '>' => result.push_str("&gt;"),
-            '&' => result.push_str("&amp;"),
-            '"' => result.push_str("&quot;"),
-            '\'' => result.push_str("&#39;"),
-            _ => result.push(c),
+    // Byte-oriented rather than char-oriented, same reasoning as `format_uri`:
+    // all five entities are single ASCII bytes, so a multi-byte character's
+    // continuation bytes (always >= 0x80) never collide with them, and a run
+    // of bytes between matches can be copied in one `push_str` (#124).
+    let bytes = s.as_bytes();
+    let mut result = String::with_capacity(bytes.len());
+    let mut start = 0;
+    for (i, &b) in bytes.iter().enumerate() {
+        let entity = match b {
+            b'<' => "&lt;",
+            b'>' => "&gt;",
+            b'&' => "&amp;",
+            b'"' => "&quot;",
+            b'\'' => "&#39;",
+            _ => continue,
+        };
+        if start < i {
+            result.push_str(&s[start..i]);
         }
+        result.push_str(entity);
+        start = i + 1;
     }
+    result.push_str(&s[start..]);
     Ok(result)
 }
 
@@ -4282,9 +4503,13 @@ fn builtin_tonumber<W: Clone + AsRef<[u64]>>(
         StandardJson::Number(n) => {
             // Already a number, return as-is -- this is a passthrough, not a
             // computation, so (like `.`) it keeps the source literal.
-            QueryResult::Owned(match core::str::from_utf8(n.raw_bytes()) {
-                Ok(s) => OwnedValue::from_number_literal(s),
-                Err(_) => OwnedValue::Int(0),
+            QueryResult::Owned(if is_nan_sentinel(n.raw_bytes()) {
+                OwnedValue::Float(f64::NAN)
+            } else {
+                match core::str::from_utf8(n.raw_bytes()) {
+                    Ok(s) => OwnedValue::from_number_literal(s),
+                    Err(_) => OwnedValue::Int(0),
+                }
             })
         }
         StandardJson::String(s) => {
@@ -6420,6 +6645,11 @@ fn eval_owned_pipe<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Expr::Pipe(exprs.to_vec())
     };
 
+    // Deliberately not `eval_owned_expr`: that returns a single `OwnedValue` and
+    // folds a multi-output rest-of-pipe into `OwnedValue::Array`, so `.a[]` after
+    // an owned stage answered `[1,2]` instead of `1` then `2`.
+    // `reduce`/`foreach`/path-tracking still want that single-value collapse, so
+    // only the pipe continuation is widened here.
     eval_owned_input::<W, S>(&rest_expr, &value, optional)
 }
 
@@ -6687,6 +6917,200 @@ fn eval_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     }
 }
 
+/// Evaluate `E[S:T]` — slicing by computed bounds.
+///
+/// jq compiles this as `S as $s | T as $t | E | .[$s:$t]`, the same
+/// desugaring [`eval_index_expr`] documents for `E[K]`, with the same three
+/// load-bearing consequences (verified against jq 1.7.1):
+///
+/// 1. `S` and `T` are evaluated against *this node's* input, not `E`'s
+///    output.
+/// 2. The streams nest `S` outer, `T` middle, `E` inner:
+///    `[1,2,3,4,5][(0,1):(3,4)]` is
+///    `[[1,2,3],[1,2,3,4],[2,3],[2,3,4]]`.
+/// 3. An empty `S` or `T` stream short-circuits *before* the next stage
+///    runs: `(error("boom"))[0:empty]` is `[]`, not an error.
+///
+/// `optional` reaches only the final application of the resolved bounds to
+/// the target — the synthesized [`Expr::Slice`] this delegates to, which
+/// already carries the identical `optional`-gated "cannot index with type
+/// object" refusal a literal slice has. It reaches neither `S`/`T`'s
+/// evaluation nor a resolved-but-non-numeric bound: `"str" | .[0:.k]?` and
+/// `null | .[("x"):2]?` both still raise, matching a literal computed key
+/// (`.[.k]?` still raises on a string target) rather than
+/// `key_to_path_component`'s optional-gated type check.
+fn eval_slice_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    target: &Expr,
+    start: &Option<Box<Expr>>,
+    end: &Option<Box<Expr>>,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    let starts = match eval_slice_bound::<W, S>(start, value.clone(), f64::floor) {
+        Ok(v) => v,
+        Err(Control::Error(e)) => return QueryResult::Error(e),
+        Err(Control::Break(label)) => return QueryResult::Break(label),
+    };
+    if starts.is_empty() {
+        return QueryResult::None;
+    }
+    let ends = match eval_slice_bound::<W, S>(end, value.clone(), f64::ceil) {
+        Ok(v) => v,
+        Err(Control::Error(e)) => return QueryResult::Error(e),
+        Err(Control::Break(label)) => return QueryResult::Break(label),
+    };
+    if ends.is_empty() {
+        return QueryResult::None;
+    }
+
+    let targets = eval_single::<W, S>(target, value, false).materialize_cursor();
+
+    // Borrowed and owned targets are kept apart so the common (borrowed) case
+    // never materializes the document — mirrors `eval_index_expr`.
+    enum Targets<'a, W> {
+        Borrowed(Vec<StandardJson<'a, W>>),
+        Owned(Vec<OwnedValue>),
+    }
+    let targets = match targets {
+        QueryResult::One(v) => Targets::Borrowed(vec![v]),
+        QueryResult::Many(vs) => Targets::Borrowed(vs),
+        QueryResult::Owned(v) => Targets::Owned(vec![v]),
+        QueryResult::ManyOwned(vs) => Targets::Owned(vs),
+        QueryResult::None => return QueryResult::None,
+        QueryResult::Error(e) => return QueryResult::Error(e),
+        QueryResult::Break(label) => return QueryResult::Break(label),
+        QueryResult::OneCursor(_) => unreachable!("materialize_cursor should have converted this"),
+        QueryResult::Partial(_, Control::Error(e)) => return QueryResult::Error(e),
+        QueryResult::Partial(_, Control::Break(label)) => return QueryResult::Break(label),
+    };
+
+    // S outer, T middle, E inner (point 2 above). The result is always
+    // owned: slicing constructs a new array/string (see `eval_single`'s
+    // `Expr::Slice` arm), so there is nothing to borrow except its rare
+    // whole-value fast paths, which `to_owned` below just copies out of.
+    let mut out: Vec<OwnedValue> = Vec::with_capacity(starts.len() * ends.len());
+    match &targets {
+        Targets::Borrowed(ts) => {
+            for s in &starts {
+                for e in &ends {
+                    let slice_expr = Expr::Slice { start: *s, end: *e };
+                    for t in ts {
+                        match eval_single::<W, S>(&slice_expr, t.clone(), optional) {
+                            QueryResult::One(v) => out.push(to_owned(&v)),
+                            QueryResult::Owned(v) => out.push(v),
+                            QueryResult::None => {}
+                            QueryResult::Error(e) => return QueryResult::Error(e),
+                            _ => unreachable!("Expr::Slice yields only One/Owned/None/Error"),
+                        }
+                    }
+                }
+            }
+        }
+        Targets::Owned(ts) => {
+            for s in &starts {
+                for e in &ends {
+                    for t in ts {
+                        match slice_owned_value(t, *s, *e, optional) {
+                            Ok(Some(v)) => out.push(v),
+                            Ok(None) => {}
+                            Err(e) => return QueryResult::Error(e),
+                        }
+                    }
+                }
+            }
+        }
+    }
+    match out.len() {
+        1 => QueryResult::Owned(out.pop().expect("len checked")),
+        _ => QueryResult::ManyOwned(out),
+    }
+}
+
+/// Evaluate one slice bound (`start` or `end`) against `value`, collecting
+/// its output stream and rounding each resolved number the way
+/// `Expr::Slice` needs it stored — floor for a start bound, ceil for an end
+/// bound, so a fractional dynamic bound still widens the slice the way a
+/// literal one does (`SliceBounds::resolve` re-applies the same floor/ceil
+/// to whatever `Expr::Slice` carries, so rounding here first is transparent
+/// to it — see `slice.rs`'s doc comment). A missing bound (`None`) is a
+/// single `None` — "this side is open" — not an empty stream.
+///
+/// Errors as [`Control`], not [`EvalError`], so a `break` inside the bound
+/// (`label $out | .[(break $out):2]`) reaches the enclosing label as a real
+/// break instead of degrading into a synthetic "break $out not in label"
+/// error — [`eval_index_expr`]'s key evaluation, which returns `QueryResult`
+/// directly, already gets this right; the narrower `Result<_, EvalError>`
+/// this shares with [`owned_bound_to_i64`] needs `Control` to keep up.
+fn eval_slice_bound<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    bound: &Option<Box<Expr>>,
+    value: StandardJson<'_, W>,
+    round: fn(f64) -> f64,
+) -> Result<Vec<Option<i64>>, Control> {
+    let Some(expr) = bound else {
+        return Ok(vec![None]);
+    };
+    let raw: Vec<OwnedValue> = match eval_single::<W, S>(expr, value, false).materialize_cursor() {
+        QueryResult::One(v) => vec![to_owned(&v)],
+        QueryResult::Many(vs) => vs.iter().map(to_owned).collect(),
+        QueryResult::Owned(v) => vec![v],
+        QueryResult::ManyOwned(vs) => vs,
+        QueryResult::None => return Ok(Vec::new()),
+        QueryResult::Error(e) => return Err(Control::Error(e)),
+        QueryResult::Break(label) => return Err(Control::Break(label)),
+        QueryResult::OneCursor(_) => unreachable!("materialize_cursor should have converted this"),
+        QueryResult::Partial(_, control) => return Err(control),
+    };
+    raw.iter()
+        .map(|v| owned_bound_to_i64(v, round).map_err(Control::Error))
+        .collect()
+}
+
+/// Classify a resolved bound value the way jq's slice descriptor does
+/// (`SliceBounds::resolved_bound`), then round it to the integer
+/// `Expr::Slice` stores. Shared between [`eval_slice_bound`] (read mode) and
+/// `resolve_slice_bound` (path mode), and with `eval_generic`'s
+/// `eval_slice_bound` (#615), which needs the same OwnedValue-only classify
+/// step for its own bound resolution.
+pub(crate) fn owned_bound_to_i64(
+    v: &OwnedValue,
+    round: fn(f64) -> f64,
+) -> Result<Option<i64>, EvalError> {
+    Ok(SliceBounds::resolved_bound(v)?.map(|f| round(f) as i64))
+}
+
+/// Apply a resolved slice directly to an owned value.
+///
+/// Slicing is a plain `Vec`/`&str` operation once the bounds are known, so
+/// this mirrors `eval_single`'s `Expr::Slice` arm (minus its cursor-only
+/// fast paths, which only matter for borrowed input) rather than paying for
+/// `eval_owned_input`'s serialize/reparse round-trip. Also reused by
+/// `eval_generic`'s owned-target `SliceExpr` path (#615), same as
+/// [`index_one_owned`] is reused by its `IndexExpr` counterpart.
+pub(crate) fn slice_owned_value(
+    target: &OwnedValue,
+    start: Option<i64>,
+    end: Option<i64>,
+    optional: bool,
+) -> Result<Option<OwnedValue>, EvalError> {
+    match target {
+        OwnedValue::Array(items) => {
+            let range = SliceBounds::from_literals(start, end).resolve(items.len());
+            Ok(Some(OwnedValue::Array(items[range].to_vec())))
+        }
+        OwnedValue::Null => Ok(Some(OwnedValue::Null)),
+        OwnedValue::String(s) => {
+            let len = s.chars().count();
+            let range = SliceBounds::from_literals(start, end).resolve(len);
+            Ok(Some(OwnedValue::String(slice::slice_str(s, range))))
+        }
+        _ if optional => Ok(None),
+        other => Err(EvalError::cannot_index_with_type(
+            owned_type_name(other),
+            "object",
+        )),
+    }
+}
+
 /// Get element at index (supports negative indexing).
 ///
 /// Uses `get_fast` for O(n) BP operations + O(log n) IB select,
@@ -6809,23 +7233,80 @@ fn eval_rhs_once<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
 /// Evaluate simple assignment: `.path = value`
 /// Sets the value at path and returns the modified input.
+///
+/// Unlike every other assignment operator, `=` forks: real jq's own
+/// desugaring is `value as $value | reduce path(paths) as $p (.; setpath($p;
+/// $value))`, so a `value` that produces more than one output runs the whole
+/// `reduce path(paths) as $p (...)` once per output, forking into one whole
+/// result document per RHS output (#392) -- not collapsing to the first the
+/// way `|=`/`+=`/`-=`/`//=`/etc. still correctly do via [`eval_rhs_once`]
+/// (unaffected by this function; it has its own callers). Every document is
+/// built by splicing that one RHS output into a fresh copy of the *original*
+/// input at every resolved path.
+///
+/// A zero-output RHS produces zero documents, not one with the path set to
+/// `null`: jq's `value as $value | ...` never even reaches `path(paths)`
+/// when `value` binds zero times (`.a = empty` produces no output; a bad
+/// path expression like `.[error("x")] = empty` is never even evaluated).
+///
+/// A `setpath` failure partway through one RHS output's own path list
+/// contributes nothing for that output, and -- since the failure then
+/// propagates out through the enclosing `value as $value | ...` the same way
+/// any generator's error terminates it mid-stream -- no later RHS output is
+/// attempted either. Earlier, already-completed documents are kept as a
+/// `Partial` prefix (#400, #494): `[1,2,3,4] | .[0:2] = ([8,8],1,[9,9])`
+/// streams `[8,8,3,4]`, then raises on `1` (not an array), and `[9,9]` never
+/// appears.
+///
+/// `optional` is `=`'s own `?` (`(.a = 1)?`) -- see `eval_update`'s matching
+/// comment for why it is caught here at the call boundary rather than
+/// threaded into `set_path` as a starting flag. It swallows a failure but
+/// still keeps whatever was already built rather than discarding it:
+/// `(.a = (1, error("boom"), 3))?` is `{"a":1}`, not nothing.
 fn eval_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     path_expr: &Expr,
     value_expr: &Expr,
     input: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    // First evaluate the value expression
-    let mut new_value = match eval_rhs_once::<W, S>(value_expr, input.clone(), optional) {
-        Ok(v) => v,
-        Err(early_return) => return early_return,
-    };
+    // Evaluate the RHS once, keeping every output instead of collapsing to
+    // the first (#392). `terminal` carries a trailing `Error`/`Break` when
+    // the stream didn't simply run out -- the same `Partial` shape every
+    // other multi-output combinator here uses (#400, #494), so the
+    // zero-prefix case (a bare `Error`/`Break`) and the nonzero-prefix case
+    // (`Partial`) share one code path below instead of two.
+    let (rhs_values, terminal): (Vec<OwnedValue>, Option<Control>) =
+        match eval_single::<W, S>(value_expr, input.clone(), optional).materialize_cursor() {
+            QueryResult::One(v) => (vec![to_owned(&v)], None),
+            QueryResult::OneCursor(_) => {
+                unreachable!("materialize_cursor should have converted this")
+            }
+            QueryResult::Owned(v) => (vec![v], None),
+            QueryResult::Many(vs) => (vs.iter().map(to_owned).collect(), None),
+            QueryResult::ManyOwned(vs) => (vs, None),
+            QueryResult::None => (Vec::new(), None),
+            QueryResult::Error(e) => (Vec::new(), Some(Control::Error(e))),
+            QueryResult::Break(label) => (Vec::new(), Some(Control::Break(label))),
+            QueryResult::Partial(vs, control) => (vs, Some(control)),
+        };
 
-    // Convert input to owned for modification
-    let mut result = to_owned(&input);
+    // A zero-output RHS produces zero documents (a genuine behavior change
+    // from before this fix, which forced a zero-output RHS to `Null` via
+    // `eval_rhs_once`) -- see the doc comment above.
+    if rhs_values.is_empty() {
+        return match terminal {
+            None => QueryResult::None,
+            Some(Control::Error(_)) if optional => QueryResult::None,
+            Some(control) => partial(Vec::new(), control), // normalizes to bare Error/Break
+        };
+    }
 
-    // Resolve computed keys against the *original* document, before any write,
-    // then apply every resolved path: `.[("a","b")] = 1` assigns both.
+    // Resolve computed keys against the *original* document, before any
+    // write, then apply them to every RHS output in turn: `.[("a","b")] =
+    // (1,2)` assigns both keys per output, forking into two whole documents
+    // (not four). Still resolved once, not once per RHS output: every
+    // output is spliced against its own fresh copy of the same pristine
+    // document, so the paths it resolves to are identical every time.
     //
     // `optional` here is `=`'s *own* `?` (`(.a = 1)?`), i.e. jq's ordinary
     // `try/catch` around the whole expression -- not a per-step tolerance. It
@@ -6838,30 +7319,61 @@ fn eval_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // into empty output when the whole call is optional -- mirroring how
     // `builtin_del` (#537) already separates `del(...)?` from a `?` written
     // inside the path.
-    let paths = match resolve_dynamic_indexes::<S>(path_expr, &result) {
+    let mut pristine = to_owned(&input);
+    let paths = match resolve_dynamic_indexes::<S>(path_expr, &pristine) {
         Ok(paths) => paths,
-        Err(_) if optional => return QueryResult::None,
-        Err(e) => return QueryResult::Error(e),
+        Err((_, _)) if optional => return QueryResult::None,
+        Err((_, e)) => return QueryResult::Error(e),
     };
 
     let last = paths.len().saturating_sub(1);
-    for (i, path) in paths.iter().enumerate() {
-        // Only the final application needs to own `new_value`.
-        let value = if i == last {
-            core::mem::replace(&mut new_value, OwnedValue::Null)
+    let rhs_last = rhs_values.len() - 1;
+    let mut docs: Vec<OwnedValue> = Vec::with_capacity(rhs_values.len());
+    for (j, mut new_value) in rhs_values.into_iter().enumerate() {
+        // Every output but the last needs its own copy of `pristine`; the
+        // last can just take it (nothing reads `pristine` after the loop),
+        // sparing the overwhelmingly common single-output case (`.a = 5`) a
+        // clone of the whole document it doesn't need. Same "only the final
+        // one needs to own it" trick as `new_value` below, just on the
+        // document instead of the RHS value.
+        let mut result = if j == rhs_last {
+            core::mem::replace(&mut pristine, OwnedValue::Null)
         } else {
-            new_value.clone()
+            pristine.clone()
         };
-        if let Err(e) = set_path(&mut result, path, value) {
-            return if optional {
-                QueryResult::None
+        for (i, path) in paths.iter().enumerate() {
+            // Only the final application needs to own `new_value`.
+            let value = if i == last {
+                core::mem::replace(&mut new_value, OwnedValue::Null)
             } else {
-                QueryResult::Error(e)
+                new_value.clone()
             };
+            if let Err(e) = set_path(&mut result, path, value) {
+                // Atomic per RHS output, like `reduce`: this value's own
+                // path list contributes nothing, and the whole fan-out
+                // terminates here -- `docs` (only the strictly earlier,
+                // already-completed outputs) is everything that survives.
+                return if optional {
+                    owned_vec_to_result(docs)
+                } else {
+                    partial(docs, Control::Error(e))
+                };
+            }
         }
+        docs.push(result);
     }
 
-    QueryResult::Owned(result)
+    match terminal {
+        None => owned_vec_to_result(docs),
+        Some(Control::Error(e)) => {
+            if optional {
+                owned_vec_to_result(docs)
+            } else {
+                partial(docs, Control::Error(e))
+            }
+        }
+        Some(Control::Break(label)) => partial(docs, Control::Break(label)),
+    }
 }
 
 /// Evaluate update assignment: `.path |= filter`
@@ -6887,8 +7399,8 @@ fn eval_update<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // `Expr::Optional` node inside `path_expr` itself.
     let paths = match resolve_dynamic_indexes::<S>(path_expr, &result) {
         Ok(paths) => paths,
-        Err(_) if optional => return QueryResult::None,
-        Err(e) => return QueryResult::Error(e),
+        Err((_, _)) if optional => return QueryResult::None,
+        Err((_, e)) => return QueryResult::Error(e),
     };
 
     // Get current value at path, apply filter, and set back
@@ -7106,6 +7618,9 @@ fn set_path(
         Expr::IndexExpr { .. } => Err(EvalError::new(
             "internal error: unresolved computed index in assignment path",
         )),
+        Expr::SliceExpr { .. } => Err(EvalError::new(
+            "internal error: unresolved computed slice in assignment path",
+        )),
         _ => Err(EvalError::new(
             "cannot use expression as assignment target".to_string(),
         )),
@@ -7286,6 +7801,11 @@ fn get_path_mut<'a>(
                     "internal error: unresolved computed index in path component",
                 ))
             }
+            Expr::SliceExpr { .. } => {
+                return Err(EvalError::new(
+                    "internal error: unresolved computed slice in path component",
+                ))
+            }
             _ => return Err(EvalError::new("invalid path component")),
         };
     }
@@ -7312,7 +7832,20 @@ fn update_path<S: EvalSemantics>(
             // filter` expression is handled by `eval_update`'s caller
             // instead, which is why `update_path` is always entered with
             // `optional: false` at the top.
-            let v = eval_owned_expr::<S>(filter_expr, root, false)?;
+            //
+            // `eval_owned_multi`, not `eval_owned_expr`: `|=` keeps only the
+            // filter's *first* output, never an array of every output
+            // (#392) -- `eval_owned_expr` collapsed a multi-output result
+            // into exactly that array (`.a |= (1,2)` produced
+            // `{"a":[1,2]}` instead of jq's `{"a":1}`). A zero-output
+            // filter still falls back to `Null` here -- `.a |= empty`
+            // leaves `"a":null` rather than deleting the key the way real
+            // jq does, a separate, pre-existing bug this fix does not
+            // change.
+            let v = eval_owned_multi::<S>(filter_expr, root)?
+                .into_iter()
+                .next()
+                .unwrap_or(OwnedValue::Null);
             *root = v;
             Ok(())
         }
@@ -7457,6 +7990,9 @@ fn update_path<S: EvalSemantics>(
         Expr::IndexExpr { .. } => Err(EvalError::new(
             "internal error: unresolved computed index in update path",
         )),
+        Expr::SliceExpr { .. } => Err(EvalError::new(
+            "internal error: unresolved computed slice in update path",
+        )),
         _ => Err(EvalError::new("cannot use expression as update target")),
     }
 }
@@ -7489,23 +8025,32 @@ fn owned_type_name(value: &OwnedValue) -> &'static str {
 // `{"a":"x","x":1,"y":1}` — the second key is `"y"`, read from the original
 // `.x`, not the `1` the first assignment just wrote.
 
-/// Does this expression need the multi-path pre-pass — a computed-key index
-/// anywhere in its *path* structure, or a `Comma` naming more than one path
-/// outright?
+/// Does this expression need the multi-path pre-pass — anything `resolve_node`
+/// has to run to turn it into concrete `Field`/`Index`/`Slice` components?
 ///
-/// A `Comma` needs the pre-pass even when every branch is static (`.a, .b`):
-/// none of the single-path walkers (`get_path_mut`, `set_path`, `update_path`,
-/// `delete_at_path`) have a `Comma` arm, so one handed through verbatim is
-/// rejected as an invalid path component. Only the shapes that can appear as a
-/// path expression are traversed; a computed key nested inside, say, an `if`
-/// is not a path component and cannot reach the walkers. Used as a cheap guard
-/// so programs with neither shape skip the pre-pass entirely.
+/// Written as an exclusion rather than a whitelist on purpose (#483): the
+/// single-path walkers (`walk_path`, `get_path_mut`, `set_path`,
+/// `update_path`, `delete_at_path`) only understand `Identity`/`Field`/
+/// `Index`/`Slice`/`Iterate`, nested arbitrarily under `Pipe`/`Paren`/
+/// `Optional` — so *everything else* needs `resolve_node` first, whether
+/// that is a computed-key `IndexExpr`, a `Comma` naming more than one path
+/// (needed even when every branch is static: `.a, .b` handed through
+/// verbatim has no `Comma` arm in the walkers and is rejected as an invalid
+/// path component), or a traversal/control-flow shape like `..`, `recurse`,
+/// `select`, `first`, `if`, `//`, `limit`, `try`, `label`, `as`, or
+/// `getpath` — every one of which `resolve_node` already or newly knows how
+/// to resolve. A whitelist here previously missed `RecursiveDescent`/
+/// `Select`/the typeof filters even after `resolve_node` grew arms for them,
+/// which is exactly the bug class this exclusion check is meant to make
+/// impossible for the *next* combinator too.
 fn needs_path_prepass(expr: &Expr) -> bool {
     match expr {
-        Expr::IndexExpr { .. } | Expr::Comma(_) => true,
+        Expr::Identity | Expr::Field(_) | Expr::Index(_) | Expr::Slice { .. } | Expr::Iterate => {
+            false
+        }
         Expr::Pipe(exprs) => exprs.iter().any(needs_path_prepass),
         Expr::Optional(inner) | Expr::Paren(inner) => needs_path_prepass(inner),
-        _ => false,
+        _ => true,
     }
 }
 
@@ -7586,11 +8131,25 @@ fn key_to_path_component(key: &OwnedValue, container: &OwnedValue) -> Result<Exp
 /// found there (needed to resolve any computed key further along the chain).
 type PathBranch = (Vec<Expr>, OwnedValue);
 
+/// The result of resolving one path node: either every branch it fans out
+/// to, or — if resolution failed partway through several siblings (a
+/// `Comma`, a computed key with more than one output, ...) — whatever
+/// branches were already resolved before the failure, alongside the error.
+///
+/// jq's own generator-based evaluation never "un-emits" an output already
+/// produced before a later sibling errors: confirmed live, `path(.a, 1)`
+/// prints `["a"]` then raises, and `(.a, .b[0])?` prints `["a"]` and stops
+/// rather than losing it. Carrying the prefix here is what lets
+/// `builtin_path` reproduce that (folded into #530, since its new error is
+/// what makes the gap easy to hit — `path(GOOD, NON_PATH)` — even though
+/// neither issue's own repro list exercises it). Every other caller of
+/// `resolve_dynamic_indexes` (`=`, `|=`, `del()`) discards the prefix and
+/// treats this exactly like a plain `Err`, matching jq's atomic write-side
+/// semantics (confirmed live: `(.a, 1) = 5` produces no output at all).
+type PathResolveResult = Result<Vec<PathBranch>, (Vec<PathBranch>, EvalError)>;
+
 /// Resolve one path node against one value, yielding a branch per output.
-fn resolve_node<S: EvalSemantics>(
-    expr: &Expr,
-    value: &OwnedValue,
-) -> Result<Vec<PathBranch>, EvalError> {
+fn resolve_node<S: EvalSemantics>(expr: &Expr, value: &OwnedValue) -> PathResolveResult {
     match expr {
         Expr::Pipe(exprs) => resolve_seq::<S>(exprs, value),
         Expr::Paren(inner) => resolve_node::<S>(inner, value),
@@ -7598,7 +8157,13 @@ fn resolve_node<S: EvalSemantics>(
         Expr::Comma(exprs) => {
             let mut out = Vec::new();
             for e in exprs {
-                out.extend(resolve_node::<S>(e, value)?);
+                match resolve_node::<S>(e, value) {
+                    Ok(branches) => out.extend(branches),
+                    Err((prefix, e)) => {
+                        out.extend(prefix);
+                        return Err((out, e));
+                    }
+                }
             }
             Ok(out)
         }
@@ -7620,6 +8185,13 @@ fn resolve_node<S: EvalSemantics>(
             // this arm still wants to see only the bare shape.
             Expr::IndexExpr { target, key } => resolve_index_expr::<S>(target, key, value, true),
 
+            // `E[S:T]?` is the same bare shape for slice bounds: only a
+            // failure to *slice* is covered, never `E`, `S`, or `T`'s own
+            // evaluation — see `resolve_slice_expr`'s doc comment.
+            Expr::SliceExpr { target, start, end } => {
+                resolve_slice_expr::<S>(target, start, end, value, true)
+            }
+
             // Every other `?`-wrapped node (`.foo?`, `.[0]?`, ...): evaluation
             // and indexing are the same step, so any failure anywhere
             // underneath is the failure to index, and `?` covers all of it.
@@ -7637,9 +8209,20 @@ fn resolve_node<S: EvalSemantics>(
             // container this branch needs, and that failure must propagate
             // regardless of this branch's own `?`).
             _ => {
-                // A failure under `?` prunes the branch instead of propagating.
-                let Ok(branches) = resolve_node::<S>(inner, value) else {
-                    return Ok(Vec::new());
+                // A failure under `?` prunes just the error, keeping whatever
+                // was already resolved before it (confirmed live: `(.a,
+                // .b[0])?` prints `["a"]` and silently stops) — except
+                // `invalid_path_expression` (#530), which `?` does not
+                // suppress in jq at all: it is a statement that the filter is
+                // not a path expression, not a value error raised while
+                // collecting one (confirmed live: `path(("a")?)` still
+                // raises in jq).
+                let branches = match resolve_node::<S>(inner, value) {
+                    Ok(branches) => branches,
+                    Err((prefix, e)) if e.is_invalid_path_expression() => {
+                        return Err((prefix, e));
+                    }
+                    Err((prefix, _)) => prefix,
                 };
                 Ok(branches
                     .into_iter()
@@ -7679,10 +8262,14 @@ fn resolve_node<S: EvalSemantics>(
                 .iter()
                 .map(|(k, v)| (vec![Expr::Field(k.clone())], v.clone()))
                 .collect()),
-            other => Err(EvalError::cannot_iterate(other)),
+            other => Err((Vec::new(), EvalError::cannot_iterate(other))),
         },
 
         Expr::IndexExpr { target, key } => resolve_index_expr::<S>(target, key, value, false),
+
+        Expr::SliceExpr { target, start, end } => {
+            resolve_slice_expr::<S>(target, start, end, value, false)
+        }
 
         // `..` fans out to every node in the tree (pre-order, self before
         // children), so each needs its own Field/Index chain rather than the
@@ -7709,12 +8296,20 @@ fn resolve_node<S: EvalSemantics>(
         // path component of their own — they either pass a branch through
         // unchanged or prune it, exactly like `Optional` above but driven by a
         // predicate instead of an error.
+        //
+        // `cond` runs through `eval_owned_multi`, not `eval_owned_expr`, and
+        // republishes `value` once per truthy output rather than collapsing
+        // every output into one always-truthy array (#628, mirroring #627's
+        // `builtin_recurse_cond`/`resolve_recurse` fix): confirmed against jq
+        // 1.7.1, `path(select((false,false)))` is empty (not `[[]]`), and
+        // `path(select((true,true)))` forks into two branches, `[[],[]]`.
         Expr::Builtin(Builtin::Select(cond)) => {
-            if eval_owned_expr::<S>(cond, value, false)?.is_truthy() {
-                Ok(vec![(Vec::new(), value.clone())])
-            } else {
-                Ok(Vec::new())
-            }
+            let cond_outputs = eval_owned_multi::<S>(cond, value).map_err(|e| (Vec::new(), e))?;
+            Ok(cond_outputs
+                .into_iter()
+                .filter(OwnedValue::is_truthy)
+                .map(|_| (Vec::new(), value.clone()))
+                .collect())
         }
         Expr::Builtin(
             builtin @ (Builtin::Values
@@ -7734,25 +8329,235 @@ fn resolve_node<S: EvalSemantics>(
             }
         }
 
-        // A static leaf: keep it verbatim and thread its value through.
-        other => {
-            let mut components = Vec::new();
-            push_path_components(&mut components, other);
-            let mut values = eval_owned_multi::<S>(other, value)?;
-            match values.len() {
-                // No output prunes the branch.
-                0 => Ok(Vec::new()),
-                1 => Ok(vec![(components, values.pop().expect("len checked"))]),
-                // A multi-output component with no path-tracking arm above
-                // (an arbitrary function call, `getpath` with a computed
-                // argument, ...). jq resolves these via general bytecode path
-                // tracking; we do not (#412), so say so in the user's terms
-                // rather than the resolver's.
-                _ => Err(EvalError::new(
-                    "Cannot use a computed index after a multi-output path component",
-                )),
+        // `first(f)` keeps only the first branch `f` resolves to. Both
+        // internal spellings reach here: `Expr::FirstExpr` is what the
+        // dedicated `first(...)` parse path builds; `Builtin::FirstStream`
+        // is a second, older representation reachable from a different
+        // parser path. Keeping both arms means it does not matter which one
+        // a given call site produces.
+        Expr::FirstExpr(inner) | Expr::Builtin(Builtin::FirstStream(inner)) => {
+            Ok(resolve_node::<S>(inner, value)?
+                .into_iter()
+                .take(1)
+                .collect())
+        }
+
+        // `if cond then a else b end`: only the branch the runtime actually
+        // selects is checked for path-ness — the branch not taken is never
+        // evaluated at all, so a non-path `else` that is never reached
+        // raises nothing (matches jq).
+        //
+        // `cond` runs through `eval_owned_multi`, not `eval_owned_expr`, and
+        // forks once per output rather than collapsing every output into one
+        // always-truthy array (#628, mirroring #627): confirmed against jq
+        // 1.7.1, `path(if (false,false) then . else empty end)` is empty
+        // (not `[[]]`), and `path(if (true,true) then . else empty end)`
+        // resolves `then_branch` once per truthy output, `[[],[]]`.
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            let cond_outputs = eval_owned_multi::<S>(cond, value).map_err(|e| (Vec::new(), e))?;
+            let mut out = Vec::new();
+            for c in cond_outputs {
+                let branch = if c.is_truthy() {
+                    then_branch
+                } else {
+                    else_branch
+                };
+                match resolve_node::<S>(branch, value) {
+                    Ok(branches) => out.extend(branches),
+                    Err((prefix, e)) => {
+                        out.extend(prefix);
+                        return Err((out, e));
+                    }
+                }
+            }
+            Ok(out)
+        }
+
+        // `a // b`: resolve `a`, keep only its truthy branches — jq's `//`
+        // filters a multi-output left side rather than choosing all-or-
+        // nothing (`retain_truthy` is this rule's value-only twin) — and
+        // fall back to `b` only when none survive. An error while resolving
+        // `a` propagates rather than falling back, matching `eval_alternative`:
+        // `//` only substitutes for falsy/absent output, never for a raised
+        // error, and the `?` here already gives us that for free.
+        Expr::Alternative(left, right) => {
+            let branches: Vec<PathBranch> = resolve_node::<S>(left, value)?
+                .into_iter()
+                .filter(|(_, v)| v.is_truthy())
+                .collect();
+            if branches.is_empty() {
+                resolve_node::<S>(right, value)
+            } else {
+                Ok(branches)
             }
         }
+
+        // `limit(n; f)`: same `n`-conversion rule as `eval_limit`, so
+        // `path(limit(...))` agrees with plain `limit(...)` in this
+        // evaluator — including anywhere `eval_limit` itself still diverges
+        // from jq (e.g. a negative `n`), which is that function's bug to
+        // fix, not this resolver's. Both internal spellings reach here for
+        // the same reason as `first` above.
+        Expr::Limit { n, expr } => resolve_limit::<S>(n, expr, value),
+        Expr::Builtin(Builtin::Limit(n, expr)) => resolve_limit::<S>(n, expr, value),
+
+        // `try expr catch handler` (and `expr?`, sugar for `try expr`):
+        // resolve `expr`; if that fails and there is no `catch`, prune the
+        // branch exactly like `Optional`'s blanket arm above. With a
+        // `catch`, jq runs the handler as a path expression too, against the
+        // raised value — confirmed live: `path(try .a catch "x")` on
+        // `{"a":1}` is `[["a"]]` when `.a` does not error, i.e. fully
+        // transparent. `invalid_path_expression` (#530) is neither pruned
+        // nor handed to `catch`, with or without one — confirmed live,
+        // `path(try 1 catch "x")` still raises the same message rather than
+        // running `"x"` — because it is a statement that the filter is not a
+        // path expression at all, not a value `catch` can bind and inspect.
+        // (jq's own wording for the handler *also* failing as a path —
+        // `Invalid path expression near attempt to access ...` — is its own
+        // message shape this resolver does not reproduce; the ordinary
+        // `#530` message surfaces instead, which is still a loud error
+        // rather than a silent wrong answer.)
+        Expr::Try { expr, catch } => match resolve_node::<S>(expr, value) {
+            Ok(branches) => Ok(branches),
+            Err((prefix, e)) if e.is_invalid_path_expression() => Err((prefix, e)),
+            // No catch: keep whatever was already resolved before the
+            // failure (confirmed live: `path(try (.a, .b[0]))` prints
+            // `["a"]` and stops), same as `?`'s matching fix above.
+            Err((prefix, e)) => match catch {
+                None => Ok(prefix),
+                Some(catch_expr) => resolve_node::<S>(catch_expr, &e.payload()),
+            },
+        },
+
+        // `label $x | body`: transparent. Path-tracking has no notion of
+        // `break` to catch here — an unmatched `break` inside `body` will
+        // already surface as an ordinary `EvalError` via `eval_owned_multi`
+        // (see its doc comment), which propagates as any other resolution
+        // failure would.
+        Expr::Label { body, .. } => resolve_node::<S>(body, value),
+
+        // `E as $x | body`: bind each output of `E` into `body` by
+        // substitution — reusing `substitute_var`, already relied on for
+        // `FirstExpr`/`IndexExpr` — then resolve the substituted body. This
+        // needs no new environment-threading in the resolver.
+        Expr::As { expr, var, body } => {
+            let mut out = Vec::new();
+            for bound in eval_owned_multi::<S>(expr, value).map_err(|e| (Vec::new(), e))? {
+                out.extend(resolve_node::<S>(
+                    &substitute_var(body, var, &bound),
+                    value,
+                )?);
+            }
+            Ok(out)
+        }
+
+        // `getpath([...])` with a literal array argument resolves to the
+        // equivalent `Field`/`Index` chain. A computed or multi-output
+        // argument is the same "arbitrary generator as a key" limitation
+        // `.[range(3)]` already has (#412) and stays out of scope here — it
+        // falls through to `resolve_leaf` below like any other
+        // non-primitive value-producing filter (which also naturally
+        // reproduces `getpath`'s own "Path must be specified as an array"
+        // refusal for a single non-array argument, since that re-evaluates
+        // the real `getpath` builtin).
+        Expr::Builtin(Builtin::GetPath(arg)) => {
+            let values = eval_owned_multi::<S>(arg, value).map_err(|e| (Vec::new(), e))?;
+            if let [OwnedValue::Array(keys)] = values.as_slice() {
+                let mut components = Vec::new();
+                let mut current = value.clone();
+                for key in keys {
+                    let component =
+                        key_to_path_component(key, &current).map_err(|e| (Vec::new(), e))?;
+                    current = index_one_owned(&current, key, false)
+                        .map_err(|e| (Vec::new(), e))?
+                        .expect("non-optional index yields a value or errors");
+                    components.push(component);
+                }
+                return Ok(vec![(components, current)]);
+            }
+            resolve_leaf::<S>(expr, value)
+        }
+
+        other => resolve_leaf::<S>(other, value),
+    }
+}
+
+/// Resolve `n; expr`'s `n` the same way `eval_limit` does, then take that
+/// many resolved branches of `expr`.
+fn resolve_limit<S: EvalSemantics>(
+    n_expr: &Expr,
+    expr: &Expr,
+    value: &OwnedValue,
+) -> PathResolveResult {
+    let n_value = eval_owned_expr::<S>(n_expr, value, false).map_err(|e| (Vec::new(), e))?;
+    let n = match n_value {
+        OwnedValue::Int(i) | OwnedValue::NumberLiteral(NumberRepr::Int(i), _) if i >= 0 => {
+            i as usize
+        }
+        _ => {
+            return Err((
+                Vec::new(),
+                EvalError::new("limit requires non-negative integer"),
+            ));
+        }
+    };
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    Ok(resolve_node::<S>(expr, value)?
+        .into_iter()
+        .take(n)
+        .collect())
+}
+
+/// Resolve an ordinary (non-combinator) filter: keep it as one opaque path
+/// component if it is one of the four primitives `walk_path` understands
+/// bare (`Identity`/`Field`/`Index`/`Slice`), and otherwise treat it as a
+/// plain value-producing filter that is not a path expression at all —
+/// raising jq's `Invalid path expression` on its first output (#530). Zero
+/// outputs still prunes silently either way, matching `path(empty)` → `[]`.
+fn resolve_leaf<S: EvalSemantics>(expr: &Expr, value: &OwnedValue) -> PathResolveResult {
+    let mut values = eval_owned_multi::<S>(expr, value).map_err(|e| (Vec::new(), e))?;
+    if matches!(
+        expr,
+        Expr::Identity | Expr::Field(_) | Expr::Index(_) | Expr::Slice { .. }
+    ) {
+        let mut components = Vec::new();
+        push_path_components(&mut components, expr);
+        return match values.len() {
+            // No output prunes the branch.
+            0 => Ok(Vec::new()),
+            1 => Ok(vec![(components, values.pop().expect("len checked"))]),
+            // A multi-output primitive is not actually reachable today —
+            // indexing/slicing a value always yields zero or one result —
+            // but keep this as a named error rather than a panic in case
+            // that invariant ever changes, mirroring the resolver's existing
+            // "no general bytecode path tracking" wording (#412).
+            _ => Err((
+                Vec::new(),
+                EvalError::new("Cannot use a computed index after a multi-output path component"),
+            )),
+        };
+    }
+    match values.len() {
+        0 => Ok(Vec::new()),
+        1 => Err((Vec::new(), EvalError::invalid_path_expression(&values[0]))),
+        // A multi-output non-primitive (`range(3)` used bare, not as an
+        // index prefix — #412's existing "arbitrary generator" refusal
+        // rather than #530's, which is specifically about a *single*
+        // resulting value that is not path-shaped; every #530 repro is
+        // single-output, and jq's own wording for the multi-output case
+        // (`Invalid path expression near attempt to access element ... of
+        // ...`) is its own message shape already deliberately not
+        // reproduced here, per `test_unsupported_path_prefixes_report_rather_than_misfire`).
+        _ => Err((
+            Vec::new(),
+            EvalError::new("Cannot use a computed index after a multi-output path component"),
+        )),
     }
 }
 
@@ -7789,56 +8594,96 @@ fn push_recursive_branches(prefix: &[Expr], value: &OwnedValue, out: &mut Vec<Pa
 
 /// Fan `recurse(f)` / `recurse(f; cond)` out into one branch per visited
 /// node. Follows `builtin_recurse_f`/`builtin_recurse_cond`'s breadth-first
-/// queue — including swallowing `f`'s errors, a falsy `cond` pruning rather
-/// than propagating, not queueing a null child, and the `MAX_ITEMS` cutoff —
-/// but resolves `f` through [`resolve_node`] at each step instead of
-/// [`eval_owned_expr`], so every queued value carries the path components that
-/// reach it.
+/// queue — including the `MAX_ITEMS` cutoff — but resolves `f` through
+/// [`resolve_node`] at each step instead of [`eval_owned_multi`], so every
+/// queued value carries the path components that reach it. Since #490,
+/// `builtin_recurse_f`/`builtin_recurse_cond` also resolve `f` through
+/// [`eval_owned_multi`] and agree with this function on not flattening an
+/// array-valued child into its elements.
 ///
-/// Not queueing a null child is the load-bearing one. `f` is arbitrary and
+/// `cond` mirrors `builtin_recurse_cond`'s semantics (#627): jq's own
+/// definition is `def r: ., (f | select(cond) | r); r;`, so `cond` gates
+/// each *child* before recursing into it, never the node about to be
+/// output — the root, and every node already queued, is emitted
+/// unconditionally. A multi-output `cond` forks: `select` re-emits the
+/// child once per truthy output (confirmed against jq 1.7.1:
+/// `path(recurse(f; (true,true)))` duplicates that branch), so each truthy
+/// output pushes its own copy of `(path, child_value)`.
+///
+/// An error raised while evaluating `f` or `cond` aborts immediately —
+/// nothing in jq's own definition above catches one — returning whatever
+/// branches were already committed to `outputs`, mirroring `resolve_node`'s
+/// own `Comma` arm (#636; matches `builtin_recurse_f`/`builtin_recurse_cond`,
+/// fixed the same way).
+///
+/// One divergence remains, deliberately: this function still does not queue
+/// a null child, where the value evaluator does. `f` is arbitrary and
 /// nothing says it makes progress: `recurse(.a?)` over `{"a":null}` reads
-/// `null` from `null` forever, and the queue would run to `MAX_ITEMS` with a
-/// prefix one component longer each round — quadratic, and measured at 9 GB
-/// for an 18-byte document before this guard existed.
-///
-/// One difference from those two is deliberate. When `f` yields an array they
-/// queue its *elements* (`queue.extend(arr)`), an artefact of
-/// [`eval_owned_expr`] collapsing a stream into one array — so `[recurse(.a?)]`
-/// descends into an array-valued `.a` where jq stops at the array itself.
-/// Resolving through [`resolve_node`] keeps the array, which is jq's answer;
-/// mirroring the value path here would mean mirroring its bug.
+/// `null` from `null` forever (confirmed hanging in real jq too — this is
+/// jq's actual semantics, not a bug). The value evaluator's queue holds bare
+/// `OwnedValue`s, so `MAX_ITEMS` bounds it in O(`MAX_ITEMS`) total. This
+/// function's queue holds `(path, value)` pairs, so the same non-terminating
+/// `f` would run to `MAX_ITEMS` with a prefix one component longer each
+/// round — quadratic, and measured at 9 GB for an 18-byte document before
+/// this guard existed. So the two evaluators can now disagree on this one
+/// adversarial shape (path-tracking prunes the null and stops; value
+/// evaluation runs to `MAX_ITEMS`) — both already deviate from unbounded
+/// true-jq semantics via their own `MAX_ITEMS`, so this is a narrower gap,
+/// not a new class of one.
 fn resolve_recurse<S: EvalSemantics>(
     f: &Expr,
     cond: Option<&Expr>,
     value: &OwnedValue,
-) -> Result<Vec<PathBranch>, EvalError> {
+) -> PathResolveResult {
     let mut outputs: Vec<PathBranch> = Vec::new();
     let mut queue: Vec<PathBranch> = vec![(Vec::new(), value.clone())];
     const MAX_ITEMS: usize = 10000;
 
     while !queue.is_empty() && outputs.len() < MAX_ITEMS {
         let (prefix, current) = queue.remove(0);
-
-        if let Some(cond) = cond {
-            let should_continue =
-                eval_owned_expr::<S>(cond, &current, false).is_ok_and(|v| v.is_truthy());
-            if !should_continue {
-                continue;
-            }
-        }
-
         outputs.push((prefix.clone(), current.clone()));
 
-        for (child_components, child_value) in resolve_node::<S>(f, &current).unwrap_or_default() {
-            // `builtin_recurse_f`'s `Ok(v) if !matches!(v, OwnedValue::Null)`:
-            // a null child ends that line of descent. See the note above on
-            // why this is what bounds the queue at all.
+        // An `f` error aborts immediately rather than pruning `current`'s
+        // children — see the doc comment above (#636). The candidate
+        // children `resolve_node` may have already resolved before hitting
+        // that error are dropped rather than queued, matching
+        // `eval_owned_multi`'s all-or-nothing contract for
+        // `builtin_recurse_f`/`builtin_recurse_cond`.
+        let children = match resolve_node::<S>(f, &current) {
+            Ok(children) => children,
+            Err((_prefix, e)) => return Err((outputs, e)),
+        };
+
+        for (child_components, child_value) in children {
+            // A null child ends that line of descent here, unlike the value
+            // evaluator since #490. See the note above on why this function
+            // keeps the guard: it bounds path-prefix growth, not just count.
             if matches!(child_value, OwnedValue::Null) {
                 continue;
             }
+
             let mut path = prefix.clone();
             path.extend(child_components);
-            queue.push((path, child_value));
+
+            match cond {
+                None => queue.push((path, child_value)),
+                Some(cond) => {
+                    // `cond` gates the child, not `current`, and forks once
+                    // per truthy output — see the doc comment above (#627).
+                    // A `cond` error aborts immediately too (#636), same as
+                    // `f`'s error above.
+                    match eval_owned_multi::<S>(cond, &child_value) {
+                        Ok(cond_outputs) => {
+                            for c in &cond_outputs {
+                                if c.is_truthy() {
+                                    queue.push((path.clone(), child_value.clone()));
+                                }
+                            }
+                        }
+                        Err(e) => return Err((outputs, e)),
+                    }
+                }
+            }
         }
     }
 
@@ -7888,13 +8733,18 @@ fn resolve_index_expr<S: EvalSemantics>(
     key: &Expr,
     value: &OwnedValue,
     optional: bool,
-) -> Result<Vec<PathBranch>, EvalError> {
-    let keys = eval_owned_multi::<S>(key, value)?;
+) -> PathResolveResult {
+    let keys = eval_owned_multi::<S>(key, value).map_err(|e| (Vec::new(), e))?;
     if keys.is_empty() {
         return Ok(Vec::new());
     }
     let target_branches = resolve_node::<S>(target, value)?;
 
+    // `out` accumulates in the exact order jq streams (key outer, target
+    // inner — see the doc comment above), so a failure partway through
+    // returns it as-is: everything already pushed before the failing
+    // key/target combination, matching jq's own never-un-emit streaming
+    // (#530's sibling fix).
     let mut out = Vec::with_capacity(keys.len() * target_branches.len());
     for k in &keys {
         for (components, target_value) in &target_branches {
@@ -7911,12 +8761,12 @@ fn resolve_index_expr<S: EvalSemantics>(
             ) && numeric_key_to_index(k).is_none()
                 && matches!(target_value, OwnedValue::Array(_) | OwnedValue::Null)
             {
-                return Err(EvalError::new("Cannot set array element at NaN index"));
+                return Err((out, EvalError::new("Cannot set array element at NaN index")));
             }
             let component = match key_to_path_component(k, target_value) {
                 Ok(component) => component,
                 Err(_) if optional => continue,
-                Err(e) => return Err(e),
+                Err(e) => return Err((out, e)),
             };
             // `false`, not `optional`: the failure has to arrive as an error for
             // the two spellings to be told apart here, rather than as the `None`
@@ -7924,7 +8774,7 @@ fn resolve_index_expr<S: EvalSemantics>(
             let next_value = match index_one_owned(target_value, k, false) {
                 Ok(v) => v.expect("non-optional index yields a value or errors"),
                 Err(_) if optional => continue,
-                Err(e) => return Err(e),
+                Err(e) => return Err((out, e)),
             };
             // `resolve_dynamic_indexes` strips the `Expr::Optional` wrapper
             // below from every component before it ever reaches
@@ -7941,6 +8791,86 @@ fn resolve_index_expr<S: EvalSemantics>(
         }
     }
     Ok(out)
+}
+
+/// Resolve `E[S:T]` in path context, with or without a trailing `?`.
+///
+/// The two spellings differ in one thing only, same as [`resolve_index_expr`]:
+/// what happens when the resolved bounds cannot be applied to the container
+/// they reached. `E[S:T]` propagates that failure; `E[S:T]?` prunes just
+/// that branch, because a failure to *slice* is exactly what `?` covers.
+///
+/// Two rules the shared body carries, both verified against jq 1.7.1 (see
+/// [`eval_slice_expr`]'s doc comment for the full detail):
+///
+/// - `S` and `T` are evaluated before `E`, in that order, and an empty bound
+///   stream short-circuits before the next stage runs — including before
+///   `E` runs at all.
+/// - `?` covers only the final application of the resolved bounds to the
+///   target, never `S`/`T`'s own evaluation nor a resolved-but-non-numeric
+///   bound (`Array/string slice indices must be integers` is not swallowed
+///   either) — unlike [`resolve_index_expr`]'s `key_to_path_component`,
+///   whose optional-gated type check is *not* the shape to copy here.
+fn resolve_slice_expr<S: EvalSemantics>(
+    target: &Expr,
+    start: &Option<Box<Expr>>,
+    end: &Option<Box<Expr>>,
+    value: &OwnedValue,
+    optional: bool,
+) -> PathResolveResult {
+    let starts = resolve_slice_bound::<S>(start, value, f64::floor).map_err(|e| (Vec::new(), e))?;
+    if starts.is_empty() {
+        return Ok(Vec::new());
+    }
+    let ends = resolve_slice_bound::<S>(end, value, f64::ceil).map_err(|e| (Vec::new(), e))?;
+    if ends.is_empty() {
+        return Ok(Vec::new());
+    }
+    let target_branches = resolve_node::<S>(target, value)?;
+
+    let mut out = Vec::with_capacity(starts.len() * ends.len() * target_branches.len());
+    for s in &starts {
+        for e in &ends {
+            let slice_expr = Expr::Slice { start: *s, end: *e };
+            for (components, target_value) in &target_branches {
+                // `false`, not `optional`: the failure has to arrive as an
+                // error for the two spellings to be told apart here, same
+                // as `resolve_index_expr`'s `index_one_owned` call.
+                let next_value = match slice_owned_value(target_value, *s, *e, false) {
+                    Ok(v) => v.expect("non-optional slice yields a value or errors"),
+                    Err(_) if optional => continue,
+                    Err(e) => return Err((out, e)),
+                };
+                let mut path = components.clone();
+                path.push(if optional {
+                    Expr::Optional(Box::new(slice_expr.clone()))
+                } else {
+                    slice_expr.clone()
+                });
+                out.push((path, next_value));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Evaluate one slice bound (`start` or `end`) in path context.
+///
+/// Mirrors [`eval_slice_bound`] (read mode): a missing bound is a single
+/// `None` — "this side is open" — not an empty stream, and a resolved
+/// number is rounded the way [`owned_bound_to_i64`] documents.
+fn resolve_slice_bound<S: EvalSemantics>(
+    bound: &Option<Box<Expr>>,
+    value: &OwnedValue,
+    round: fn(f64) -> f64,
+) -> Result<Vec<Option<i64>>, EvalError> {
+    let Some(expr) = bound else {
+        return Ok(vec![None]);
+    };
+    eval_owned_multi::<S>(expr, value)?
+        .iter()
+        .map(|v| owned_bound_to_i64(v, round))
+        .collect()
 }
 
 /// Thread a value through a run of static path components, without expanding
@@ -7978,10 +8908,7 @@ fn value_after_components<S: EvalSemantics>(
 /// *its* position, which is the document root only when it sits at the top of
 /// the path. `path(.x | .a[.k])` resolves `.k` against `.x`, giving
 /// `["x","a","a"]`.
-fn resolve_seq<S: EvalSemantics>(
-    exprs: &[Expr],
-    value: &OwnedValue,
-) -> Result<Vec<PathBranch>, EvalError> {
+fn resolve_seq<S: EvalSemantics>(exprs: &[Expr], value: &OwnedValue) -> PathResolveResult {
     let mut flat = Vec::new();
     for e in exprs {
         push_path_components(&mut flat, e);
@@ -7993,30 +8920,58 @@ fn resolve_seq<S: EvalSemantics>(
     // an enclosing `IndexExpr` indexes it: in `.a[.k].b[.j]`, `.j` applies to
     // `.a[.k].b`.
     let Some(last_dynamic) = flat.iter().rposition(needs_path_prepass) else {
-        let end = value_after_components::<S>(&flat, value)?;
+        let end = value_after_components::<S>(&flat, value).map_err(|e| (Vec::new(), e))?;
         return Ok(vec![(flat, end)]);
     };
 
+    // Fan out one pipe element at a time. Note this rebuilds `branches` stage
+    // by stage (every currently-active branch through element N, then all of
+    // those through element N+1, ...) rather than threading each branch
+    // depth-first through the *entire* remaining pipe the way jq's own
+    // generator composition does — so for a pipe with more than one dynamic
+    // element, a failure partway through preserves everything already
+    // completed in the *current* stage (this element, for the branches
+    // already processed) but not a later stage's contribution from an
+    // earlier-stage branch that had not yet reached it. That is a known
+    // simplification, not a byte-for-byte reproduction of jq's stream order;
+    // the single-dynamic-element case (the overwhelmingly common one, and
+    // the one every #530 sibling repro exercises) is exact.
     let mut branches: Vec<PathBranch> = vec![(Vec::new(), value.clone())];
     for element in &flat[..=last_dynamic] {
         let mut next = Vec::new();
         for (prefix, current) in &branches {
-            for (components, resulting) in resolve_node::<S>(element, current)? {
-                let mut path = prefix.clone();
-                path.extend(components);
-                next.push((path, resulting));
+            match resolve_node::<S>(element, current) {
+                Ok(resolved) => {
+                    for (components, resulting) in resolved {
+                        let mut path = prefix.clone();
+                        path.extend(components);
+                        next.push((path, resulting));
+                    }
+                }
+                Err((partial, e)) => {
+                    for (components, resulting) in partial {
+                        let mut path = prefix.clone();
+                        path.extend(components);
+                        next.push((path, resulting));
+                    }
+                    return Err((next, e));
+                }
             }
         }
         branches = next;
     }
 
     let tail = &flat[last_dynamic + 1..];
-    for (prefix, current) in &mut branches {
-        let end = value_after_components::<S>(tail, current)?;
-        *current = end;
+    let mut out = Vec::with_capacity(branches.len());
+    for (mut prefix, current) in branches {
+        let end = match value_after_components::<S>(tail, &current) {
+            Ok(end) => end,
+            Err(e) => return Err((out, e)),
+        };
         prefix.extend_from_slice(tail);
+        out.push((prefix, end));
     }
-    Ok(branches)
+    Ok(out)
 }
 
 /// Rewrite every computed key in a path expression into the static component it
@@ -8026,29 +8981,42 @@ fn resolve_seq<S: EvalSemantics>(
 /// jq applies *all* of them: `{"a":0,"b":0} | .[("a","b")] = 1` is
 /// `{"a":1,"b":1}`, and `path()` emits one output per resolved path. Likewise
 /// for a purely static `Comma` — `{"a":1,"b":2} | del(.a, .b)` is `{}`.
+///
+/// Returns whatever was already resolved as an `Err`-side prefix too, when
+/// resolution failed partway through several siblings — `path()` is the only
+/// caller that uses it (streaming that prefix out before the error, #530's
+/// sibling fix); the write-side callers (`=`, `|=`, `del()`) discard it and
+/// treat this exactly like a plain failure, matching jq's atomic write
+/// semantics.
 fn resolve_dynamic_indexes<S: EvalSemantics>(
     expr: &Expr,
     input: &OwnedValue,
-) -> Result<Vec<Expr>, EvalError> {
+) -> Result<Vec<Expr>, (Vec<Expr>, EvalError)> {
     if !needs_path_prepass(expr) {
         return Ok(vec![expr.clone()]);
     }
 
-    let branches = resolve_node::<S>(expr, input)?;
-    Ok(branches
-        .into_iter()
-        .map(|(components, _)| {
-            let components: Vec<Expr> = components
-                .into_iter()
-                .map(strip_resolved_optional)
-                .collect();
-            match components.len() {
-                0 => Expr::Identity,
-                1 => components.into_iter().next().expect("len checked"),
-                _ => Expr::Pipe(components),
-            }
-        })
-        .collect())
+    fn assemble(branches: Vec<PathBranch>) -> Vec<Expr> {
+        branches
+            .into_iter()
+            .map(|(components, _)| {
+                let components: Vec<Expr> = components
+                    .into_iter()
+                    .map(strip_resolved_optional)
+                    .collect();
+                match components.len() {
+                    0 => Expr::Identity,
+                    1 => components.into_iter().next().expect("len checked"),
+                    _ => Expr::Pipe(components),
+                }
+            })
+            .collect()
+    }
+
+    match resolve_node::<S>(expr, input) {
+        Ok(branches) => Ok(assemble(branches)),
+        Err((prefix, e)) => Err((assemble(prefix), e)),
+    }
 }
 
 /// Drop any `Expr::Optional` wrapper a resolved path component still
@@ -8131,6 +9099,16 @@ fn substitute_var(expr: &Expr, var_name: &str, replacement: &OwnedValue) -> Expr
         Expr::IndexExpr { target, key } => Expr::IndexExpr {
             target: Box::new(substitute_var(target, var_name, replacement)),
             key: Box::new(substitute_var(key, var_name, replacement)),
+        },
+        // Same reasoning as `IndexExpr`: `$a`/`$b` in `.[$a:$b]` must resolve.
+        Expr::SliceExpr { target, start, end } => Expr::SliceExpr {
+            target: Box::new(substitute_var(target, var_name, replacement)),
+            start: start
+                .as_deref()
+                .map(|e| Box::new(substitute_var(e, var_name, replacement))),
+            end: end
+                .as_deref()
+                .map(|e| Box::new(substitute_var(e, var_name, replacement))),
         },
         Expr::RecursiveDescent => Expr::RecursiveDescent,
         Expr::Optional(e) => Expr::Optional(Box::new(substitute_var(e, var_name, replacement))),
@@ -8875,23 +9853,97 @@ fn eval_reduce<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // Substitute $var in update, then evaluate with acc as input
         let substituted = substitute_var(update, var, &input_val);
         // We need to evaluate with acc as the input
-        let acc_result = eval_owned_expr::<S>(&substituted, &acc, optional);
+        let acc_result = eval_owned_expr_ctrl::<S>(&substituted, &acc, optional);
         match acc_result {
             Ok(new_acc) => acc = new_acc,
-            Err(_) if optional => return QueryResult::None,
-            Err(e) => return QueryResult::Error(e),
+            Err(Control::Error(_)) if optional => return QueryResult::None,
+            Err(Control::Error(e)) => return QueryResult::Error(e),
+            Err(Control::Break(label)) => return QueryResult::Break(label),
         }
     }
 
     QueryResult::Owned(acc)
 }
 
-/// Evaluate an expression with an OwnedValue as input.
-fn eval_owned_expr<S: EvalSemantics>(
+/// Fast path for the handful of expr shapes that dominate the cost of
+/// [`eval_owned_expr`]/[`eval_owned_input`]: bare `.`, `.foo`, `.[n]`. These
+/// never fan out and never touch anything but `input`'s own top-level shape,
+/// so they can be answered directly against the `OwnedValue` tree — no
+/// `to_json_for_reindex` + `JsonIndex::build` round trip needed. `None`
+/// defers to the general evaluator below, which every other expr shape
+/// (arbitrary filters, arithmetic, pipes, ...) still requires.
+///
+/// Mirrors `eval_single`'s `Identity`/`Field`/`Index` arms
+/// (`index_object_by_name`/`index_array_by_position`) exactly — same
+/// null-propagation, same `optional` behavior, same error text — so this is
+/// unobservable except in speed.
+///
+/// The two callers below are, between them, every step of `path()`'s
+/// computed-key resolution: `resolve_index_expr`'s key lookup and
+/// `resolve_leaf`/`value_after_components`'s static-step walk. Each runs
+/// once per node in a `..`/`recurse` fan-out, so a document with a linear
+/// nesting chain of depth *d* paid a full serialize-and-reparse of an
+/// O(*d*)-sized subtree at each of its *d* nodes — O(*d*²) work to resolve
+/// what is, for these shapes, an O(1) lookup (#491).
+fn eval_owned_fast_path(
     expr: &Expr,
     input: &OwnedValue,
     optional: bool,
-) -> Result<OwnedValue, EvalError> {
+) -> Option<Result<Option<OwnedValue>, EvalError>> {
+    match expr {
+        Expr::Identity => Some(Ok(Some(input.clone()))),
+        Expr::Field(name) => Some(match input {
+            OwnedValue::Object(map) => Ok(Some(map.get(name).cloned().unwrap_or(OwnedValue::Null))),
+            OwnedValue::Null => Ok(Some(OwnedValue::Null)),
+            _ if optional => Ok(None),
+            _ => Err(EvalError::cannot_index_with_field(
+                owned_type_name(input),
+                name,
+            )),
+        }),
+        Expr::Index(idx) => Some(match input {
+            OwnedValue::Array(items) => {
+                let resolved = if *idx < 0 {
+                    items.len() as i64 + idx
+                } else {
+                    *idx
+                };
+                let element = usize::try_from(resolved)
+                    .ok()
+                    .and_then(|i| items.get(i))
+                    .cloned()
+                    .unwrap_or(OwnedValue::Null);
+                Ok(Some(element))
+            }
+            OwnedValue::Null => Ok(Some(OwnedValue::Null)),
+            _ if optional => Ok(None),
+            _ => Err(EvalError::cannot_index_with_type(
+                owned_type_name(input),
+                "number",
+            )),
+        }),
+        _ => None,
+    }
+}
+
+/// Same evaluator as [`eval_owned_expr`], but keeps a `break` distinguishable
+/// from a real error via [`Control`] instead of collapsing it into a
+/// synthetic "break $label not in label" [`EvalError`] — needed by callers
+/// that run their operand through a loop of their own (`while`, `until`,
+/// `repeat`, `reduce`, `foreach`'s per-iteration UPDATE/EXTRACT) and must let
+/// a `break $label` inside that operand reach its enclosing `label` (#575).
+/// Same fix [`eval_slice_bound`] already applies to slice bounds.
+fn eval_owned_expr_ctrl<S: EvalSemantics>(
+    expr: &Expr,
+    input: &OwnedValue,
+    optional: bool,
+) -> Result<OwnedValue, Control> {
+    if let Some(result) = eval_owned_fast_path(expr, input, optional) {
+        return result
+            .map(|v| v.unwrap_or(OwnedValue::Null))
+            .map_err(Control::Error);
+    }
+
     // Create a synthetic JSON from the owned value
     // For simplicity, we'll serialize and reparse
     // This is inefficient but correct
@@ -8926,8 +9978,8 @@ fn eval_owned_expr<S: EvalSemantics>(
             }
         }
         QueryResult::None => Ok(OwnedValue::Null),
-        QueryResult::Error(e) => Err(e),
-        QueryResult::Break(label) => Err(EvalError::new(format!("break ${label} not in label"))),
+        QueryResult::Error(e) => Err(Control::Error(e)),
+        QueryResult::Break(label) => Err(Control::Break(label)),
         // Same collapse-to-single-or-array policy as `Many`/`ManyOwned`
         // above; the trailing control is dropped, consistent with how this
         // function already doesn't fork over a multi-output update (a
@@ -8940,6 +9992,18 @@ fn eval_owned_expr<S: EvalSemantics>(
             }
         }
     }
+}
+
+/// Evaluate an expression with an OwnedValue as input.
+fn eval_owned_expr<S: EvalSemantics>(
+    expr: &Expr,
+    input: &OwnedValue,
+    optional: bool,
+) -> Result<OwnedValue, EvalError> {
+    eval_owned_expr_ctrl::<S>(expr, input, optional).map_err(|control| match control {
+        Control::Error(e) => e,
+        Control::Break(label) => EvalError::new(format!("break ${label} not in label")),
+    })
 }
 
 /// Evaluate an expression with an OwnedValue as input, preserving the full
@@ -8958,6 +10022,14 @@ fn eval_owned_input<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     input: &OwnedValue,
     optional: bool,
 ) -> QueryResult<'a, W> {
+    if let Some(result) = eval_owned_fast_path(expr, input, optional) {
+        return match result {
+            Ok(Some(v)) => QueryResult::Owned(v),
+            Ok(None) => QueryResult::None,
+            Err(e) => QueryResult::Error(e),
+        };
+    }
+
     // Serialize and reparse to obtain a document the evaluator can index into.
     //
     // `to_json_for_reindex` (not `to_json`): this round-trip is purely
@@ -9026,23 +10098,23 @@ fn eval_foreach<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     for input_val in input_values {
         // Substitute $var and evaluate update with state as input
         let substituted_update = substitute_var(update, var, &input_val);
-        match eval_owned_expr::<S>(&substituted_update, &state, optional) {
+        match eval_owned_expr_ctrl::<S>(&substituted_update, &state, optional) {
             Ok(new_state) => {
                 state = new_state;
                 // If there's an extract expression, evaluate it
                 if let Some(ext) = extract {
                     let substituted_extract = substitute_var(ext, var, &input_val);
-                    match eval_owned_expr::<S>(&substituted_extract, &state, optional) {
+                    match eval_owned_expr_ctrl::<S>(&substituted_extract, &state, optional) {
                         Ok(output) => outputs.push(output),
                         // The steps already produced no longer vanish (#494).
-                        Err(e) => return partial(outputs, Control::Error(e)),
+                        Err(control) => return partial(outputs, control),
                     }
                 } else {
                     // Without extract, output the current state
                     outputs.push(state.clone());
                 }
             }
-            Err(e) => return partial(outputs, Control::Error(e)),
+            Err(control) => return partial(outputs, control),
         }
     }
 
@@ -9273,19 +10345,21 @@ fn eval_until<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
     for _ in 0..MAX_ITERATIONS {
         // Check condition
-        match eval_owned_expr::<S>(cond, &current, optional) {
+        match eval_owned_expr_ctrl::<S>(cond, &current, optional) {
             Ok(cond_val) => {
                 if cond_val.is_truthy() {
                     return QueryResult::Owned(current);
                 }
             }
-            Err(e) => return QueryResult::Error(e),
+            Err(Control::Error(e)) => return QueryResult::Error(e),
+            Err(Control::Break(label)) => return QueryResult::Break(label),
         }
 
         // Apply update
-        match eval_owned_expr::<S>(update, &current, optional) {
+        match eval_owned_expr_ctrl::<S>(update, &current, optional) {
             Ok(new_val) => current = new_val,
-            Err(e) => return QueryResult::Error(e),
+            Err(Control::Error(e)) => return QueryResult::Error(e),
+            Err(Control::Break(label)) => return QueryResult::Break(label),
         }
     }
 
@@ -9305,25 +10379,27 @@ fn eval_while<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
     for _ in 0..MAX_ITERATIONS {
         // Check condition
-        match eval_owned_expr::<S>(cond, &current, optional) {
+        match eval_owned_expr_ctrl::<S>(cond, &current, optional) {
             Ok(cond_val) => {
                 if !cond_val.is_truthy() {
                     break;
                 }
             }
-            // The values already output no longer vanish (#494):
+            // The values already output no longer vanish (#494), and a
+            // `break $label` inside `cond` reaches its enclosing `label`
+            // instead of degrading into a synthetic error (#575).
             // `while(. < 5; if . == 3 then error("boom") else .+1 end)` on
             // `1` is `1`, `2`, `3`, then the error.
-            Err(e) => return partial(outputs, Control::Error(e)),
+            Err(control) => return partial(outputs, control),
         }
 
         // Output current value
         outputs.push(current.clone());
 
         // Apply update
-        match eval_owned_expr::<S>(update, &current, optional) {
+        match eval_owned_expr_ctrl::<S>(update, &current, optional) {
             Ok(new_val) => current = new_val,
-            Err(e) => return partial(outputs, Control::Error(e)),
+            Err(control) => return partial(outputs, control),
         }
     }
 
@@ -9346,13 +10422,15 @@ fn eval_repeat<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
     for _ in 0..MAX_ITERATIONS {
         // Evaluate expr with the original input each time
-        match eval_owned_expr::<S>(expr, &owned, optional) {
+        match eval_owned_expr_ctrl::<S>(expr, &owned, optional) {
             Ok(new_val) => outputs.push(new_val),
             // The values already output no longer vanish, and an error with
             // no prior output surfaces as an error rather than empty output
             // (#495): `repeat(if . > 3 then error("boom") else .+1 end)` on
             // `5` raises immediately with no output, matching jq exactly.
-            Err(e) => return partial(outputs, Control::Error(e)),
+            // A `break $label` reaches its enclosing `label` instead of
+            // degrading into a synthetic error (#575).
+            Err(control) => return partial(outputs, control),
         }
     }
 
@@ -9534,15 +10612,15 @@ fn builtin_recurse_f<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         let current = queue.remove(0);
         outputs.push(current.clone());
 
-        // Apply f to get children
-        match eval_owned_expr::<S>(f, &current, true) {
-            Ok(OwnedValue::Array(arr)) => {
-                queue.extend(arr);
-            }
-            Ok(v) if !matches!(v, OwnedValue::Null) => {
-                queue.push(v);
-            }
-            _ => {}
+        // Every output of `f` becomes exactly one queued child, in order — a
+        // null output is a real value (not "no child"), and an array output
+        // is visited as one node (not spliced into its elements) (#490).
+        // An error aborts immediately, same as jq's `def r: ., (f | r); r;`
+        // (#636) — the values already output no longer vanish, via the same
+        // `partial()` helper #495 uses for `repeat`/`while`.
+        match eval_owned_multi::<S>(f, &current) {
+            Ok(children) => queue.extend(children),
+            Err(e) => return partial(outputs, Control::Error(e)),
         }
     }
 
@@ -9556,11 +10634,29 @@ fn builtin_recurse_f<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 }
 
 /// Builtin: recurse(f; cond)
+///
+/// jq defines this as `def r: ., (f | select(cond) | r); r;` (confirmed
+/// against jq 1.7.1): the current node is always emitted, unconditionally —
+/// `cond` never gates the node about to be output, only whether recursion
+/// *continues into a child*. So `5 | recurse(.+1; . < 5)` is `5`, not empty,
+/// even though `5 < 5` is false: the root bypasses `cond` entirely, and only
+/// the next candidate (`6`) would need to pass it.
+///
+/// `cond` therefore runs against each output of `f` (the candidate child),
+/// not against `current`. And because `select(cond)` forks over a
+/// multi-output `cond` — emitting the child once per truthy output — a
+/// `cond` like `(true, true)` visits (and re-recurses) that child twice; a
+/// `cond` like `(false, false)` collapsing to a truthy array is exactly
+/// #627's bug (`eval_owned_expr` used to wrap that into one
+/// `OwnedValue::Array`, which is always truthy regardless of the individual
+/// outputs, silently making recursion continue when it should stop).
+/// Switching to `eval_owned_multi` and checking each output keeps the true
+/// per-branch truthiness instead of collapsing it away.
 fn builtin_recurse_cond<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     f: &Expr,
     cond: &Expr,
     value: StandardJson<'a, W>,
-    optional: bool,
+    _optional: bool,
 ) -> QueryResult<'a, W> {
     let mut outputs: Vec<OwnedValue> = Vec::new();
     let mut queue: Vec<OwnedValue> = vec![to_owned(&value)];
@@ -9568,28 +10664,33 @@ fn builtin_recurse_cond<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
     while !queue.is_empty() && outputs.len() < MAX_ITEMS {
         let current = queue.remove(0);
-
-        // Check condition
-        let should_continue = match eval_owned_expr::<S>(cond, &current, optional) {
-            Ok(v) => v.is_truthy(),
-            Err(_) => false,
-        };
-
-        if !should_continue {
-            continue;
-        }
-
         outputs.push(current.clone());
 
-        // Apply f to get children
-        match eval_owned_expr::<S>(f, &current, true) {
-            Ok(OwnedValue::Array(arr)) => {
-                queue.extend(arr);
+        // Every output of `f` becomes exactly one candidate child, in order —
+        // a null output is a real value (not "no child"), and an array output
+        // is visited as one node (not spliced into its elements) (#490). An
+        // `f` error aborts immediately rather than pruning `current`'s
+        // children, matching jq's `def r: ., (f | select(cond) | r); r;`,
+        // where nothing catches an error from `f` (#636).
+        let children = match eval_owned_multi::<S>(f, &current) {
+            Ok(children) => children,
+            Err(e) => return partial(outputs, Control::Error(e)),
+        };
+
+        for child in children {
+            // `cond` gates the child, not `current` (see doc comment above).
+            // A `cond` error aborts immediately too — same jq definition,
+            // same reasoning as `f`'s error above (#636) — rather than
+            // pruning just this child the way a falsy `cond` does.
+            let cond_outputs = match eval_owned_multi::<S>(cond, &child) {
+                Ok(cond_outputs) => cond_outputs,
+                Err(e) => return partial(outputs, Control::Error(e)),
+            };
+            for c in &cond_outputs {
+                if c.is_truthy() {
+                    queue.push(child.clone());
+                }
             }
-            Ok(v) if !matches!(v, OwnedValue::Null) => {
-                queue.push(v);
-            }
-            _ => {}
         }
     }
 
@@ -10075,15 +11176,28 @@ fn builtin_path<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // Computed keys must become static components before the tracker runs — it
     // ignores anything it does not recognise, so an unresolved one would
     // silently yield no paths at all.
-    let exprs = match resolve_dynamic_indexes::<S>(expr, &owned) {
-        Ok(exprs) => exprs,
-        Err(e) => return QueryResult::Error(e),
+    //
+    // A resolve-time failure partway through several siblings (`path(.a,
+    // 1)`, `path(.a, .b[0])`, ...) still carries whatever resolved before it
+    // — jq's own generator never un-emits an output already produced before
+    // a later one errors (confirmed live) — so that prefix is walked below
+    // exactly like a successful resolution, and only the *error* is deferred
+    // to the end.
+    let (exprs, resolve_error) = match resolve_dynamic_indexes::<S>(expr, &owned) {
+        Ok(exprs) => (exprs, None),
+        Err((exprs, e)) => (exprs, Some(e)),
     };
 
     let mut reached = Vec::new();
+    let mut walk_error = None;
     for expr in &exprs {
+        // A later walk-time failure (an unindexable step reached only once
+        // the expression is concretely walked) needs the same treatment:
+        // whatever earlier resolved expressions already streamed into
+        // `reached` survives, and only this one stops the walk.
         if let Err(e) = walk_path::<S>(expr, &owned, &[], &mut reached, optional) {
-            return QueryResult::Error(e);
+            walk_error = Some(e);
+            break;
         }
     }
 
@@ -10091,6 +11205,14 @@ fn builtin_path<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         .into_iter()
         .map(|(path, _)| OwnedValue::Array(path))
         .collect();
+
+    if let Some(e) = walk_error.or(resolve_error) {
+        return if paths.is_empty() {
+            QueryResult::Error(e)
+        } else {
+            partial(paths, Control::Error(e))
+        };
+    }
 
     match paths.len() {
         // "No paths at all" is *no output*, never `Array(vec![])`. The empty
@@ -10205,6 +11327,9 @@ fn walk_path<S: EvalSemantics>(
         // error, so an unresolved one would silently produce an empty result.
         Expr::IndexExpr { .. } => {
             debug_assert!(false, "unresolved computed index reached path tracking");
+        }
+        Expr::SliceExpr { .. } => {
+            debug_assert!(false, "unresolved computed slice reached path tracking");
         }
 
         // Expressions with no path-tracking arm — `..`, `recurse`, `select`,
@@ -11360,9 +12485,15 @@ fn delete_expr_array_paths(
                         let slot = &mut arr[actual as usize];
                         let old = core::mem::replace(slot, OwnedValue::Null);
                         *slot = delete_expr_paths_at(old, group, start + 1)?;
+                    } else {
+                        // An out-of-range index names nothing to delete
+                        // through, so jq's delpaths silently skips the step
+                        // itself, `?` or not (#477) — but the tail still
+                        // decides: `del(.[5].a)` stays a no-op while
+                        // `del(.[5][])` raises `Cannot iterate over null
+                        // (null)` (#527/#529).
+                        delete_expr_paths_through_absent(group, start + 1)?;
                     }
-                    // An out-of-range index names nothing to delete through —
-                    // jq's delpaths silently skips it, `?` or not (#477).
                 }
                 // Deleting *through* a slice deletes inside the sub-array and
                 // splices it back: `[1,[2],[3]] | del(.[1:3][0])` is `[1,[3]]`.
@@ -11480,8 +12611,8 @@ fn builtin_del<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // `resolve_dynamic_indexes`).
     let paths = match resolve_dynamic_indexes::<S>(path_expr, &result) {
         Ok(paths) => paths,
-        Err(_) if optional => return QueryResult::None,
-        Err(e) => return QueryResult::Error(e),
+        Err((_, _)) if optional => return QueryResult::None,
+        Err((_, e)) => return QueryResult::Error(e),
     };
 
     // The overwhelmingly common case — no computed key at all, or one that
@@ -11655,10 +12786,12 @@ fn delete_at_path(
                             if actual_idx >= 0 && (actual_idx as usize) < arr.len() {
                                 delete_at_path(&mut arr[actual_idx as usize], &rest, optional)
                             } else {
-                                // An out-of-range index resolves to null;
-                                // deleting further into null is always a
-                                // no-op, `?` or not (#477).
-                                Ok(())
+                                // An out-of-range index resolves to null, and
+                                // deleting further into null is a no-op for
+                                // most tails, `?` or not (#477) — but not
+                                // `[]`, which still raises `Cannot iterate
+                                // over null (null)` (#527/#529).
+                                delete_at_path_through_absent(&rest, optional)
                             }
                         }
                         // Same per-step `null` exemption as the `Field` case
@@ -11724,6 +12857,9 @@ fn delete_at_path(
         // of being reported as a user error.
         Expr::IndexExpr { .. } => Err(EvalError::new(
             "internal error: unresolved computed index in delete path",
+        )),
+        Expr::SliceExpr { .. } => Err(EvalError::new(
+            "internal error: unresolved computed slice in delete path",
         )),
         _ => Err(EvalError::new("cannot use expression as delete target")),
     }
@@ -13932,7 +15068,9 @@ fn get_float_value<'a, W: Clone + AsRef<[u64]>>(
 ) -> Result<f64, QueryResult<'a, W>> {
     match value {
         StandardJson::Number(n) => {
-            if let Ok(f) = n.as_f64() {
+            if is_nan_sentinel(n.raw_bytes()) {
+                Ok(f64::NAN)
+            } else if let Ok(f) = n.as_f64() {
                 Ok(f)
             } else if optional {
                 Err(QueryResult::None)
@@ -14001,6 +15139,7 @@ fn builtin_floor<W: Clone + AsRef<[u64]>>(
     optional: bool,
 ) -> QueryResult<'_, W> {
     match get_float_value::<W>(&value, optional) {
+        Ok(n) if n.is_nan() => QueryResult::Owned(OwnedValue::Float(f64::NAN)),
         Ok(n) => QueryResult::Owned(OwnedValue::Int(floor_f64(n) as i64)),
         Err(r) => r,
     }
@@ -14012,6 +15151,7 @@ fn builtin_ceil<W: Clone + AsRef<[u64]>>(
     optional: bool,
 ) -> QueryResult<'_, W> {
     match get_float_value::<W>(&value, optional) {
+        Ok(n) if n.is_nan() => QueryResult::Owned(OwnedValue::Float(f64::NAN)),
         Ok(n) => QueryResult::Owned(OwnedValue::Int(ceil_f64(n) as i64)),
         Err(r) => r,
     }
@@ -14023,6 +15163,7 @@ fn builtin_round<W: Clone + AsRef<[u64]>>(
     optional: bool,
 ) -> QueryResult<'_, W> {
     match get_float_value::<W>(&value, optional) {
+        Ok(n) if n.is_nan() => QueryResult::Owned(OwnedValue::Float(f64::NAN)),
         Ok(n) => QueryResult::Owned(OwnedValue::Int(round_f64(n) as i64)),
         Err(r) => r,
     }
@@ -14034,6 +15175,7 @@ fn builtin_trunc<W: Clone + AsRef<[u64]>>(
     optional: bool,
 ) -> QueryResult<'_, W> {
     match get_float_value::<W>(&value, optional) {
+        Ok(n) if n.is_nan() => QueryResult::Owned(OwnedValue::Float(f64::NAN)),
         Ok(n) => QueryResult::Owned(OwnedValue::Int(libm::trunc(n) as i64)),
         Err(r) => r,
     }
@@ -14144,9 +15286,14 @@ fn get_number_from_result<W: Clone + AsRef<[u64]>>(
         QueryResult::Owned(v @ OwnedValue::NumberLiteral(..)) => v
             .as_f64()
             .ok_or_else(|| NumberError::Error(EvalError::new("invalid number"))),
-        QueryResult::One(StandardJson::Number(n)) => n
-            .as_f64()
-            .map_err(|_| NumberError::Error(EvalError::new("invalid number"))),
+        QueryResult::One(StandardJson::Number(n)) => {
+            if is_nan_sentinel(n.raw_bytes()) {
+                Ok(f64::NAN)
+            } else {
+                n.as_f64()
+                    .map_err(|_| NumberError::Error(EvalError::new("invalid number")))
+            }
+        }
         QueryResult::Error(e) => Err(NumberError::Error(e)),
         _ if optional => Err(NumberError::None),
         _ => Err(NumberError::Error(EvalError::new("expected number"))),
@@ -14367,7 +15514,9 @@ fn builtin_isnan<W: Clone + AsRef<[u64]>>(
 ) -> QueryResult<'_, W> {
     match &value {
         StandardJson::Number(n) => {
-            if let Ok(f) = n.as_f64() {
+            if is_nan_sentinel(n.raw_bytes()) {
+                QueryResult::Owned(OwnedValue::Bool(true))
+            } else if let Ok(f) = n.as_f64() {
                 QueryResult::Owned(OwnedValue::Bool(f.is_nan()))
             } else {
                 QueryResult::Owned(OwnedValue::Bool(false))
@@ -15057,7 +16206,7 @@ fn builtin_shuffle<W: Clone + AsRef<[u64]>>(
             let mut items: Vec<OwnedValue> = elements.map(|e| to_owned(&e)).collect();
             // Use a seeded RNG for reproducibility in tests if needed,
             // but seed from system entropy for actual randomness
-            let mut rng = ChaCha8Rng::from_os_rng();
+            let mut rng = ChaCha8Rng::from_rng(&mut rand::rng());
             items.shuffle(&mut rng);
             QueryResult::Owned(OwnedValue::Array(items))
         }
@@ -15374,6 +16523,15 @@ fn expand_func_calls(expr: &Expr, func_name: &str, params: &[String], body: &Exp
             target: Box::new(expand_func_calls(target, func_name, params, body)),
             key: Box::new(expand_func_calls(key, func_name, params, body)),
         },
+        Expr::SliceExpr { target, start, end } => Expr::SliceExpr {
+            target: Box::new(expand_func_calls(target, func_name, params, body)),
+            start: start
+                .as_deref()
+                .map(|e| Box::new(expand_func_calls(e, func_name, params, body))),
+            end: end
+                .as_deref()
+                .map(|e| Box::new(expand_func_calls(e, func_name, params, body))),
+        },
         Expr::RecursiveDescent => Expr::RecursiveDescent,
         Expr::Optional(e) => {
             Expr::Optional(Box::new(expand_func_calls(e, func_name, params, body)))
@@ -15628,6 +16786,15 @@ fn substitute_func_param(expr: &Expr, param: &str, arg: &Expr) -> Expr {
         Expr::IndexExpr { target, key } => Expr::IndexExpr {
             target: Box::new(substitute_func_param(target, param, arg)),
             key: Box::new(substitute_func_param(key, param, arg)),
+        },
+        Expr::SliceExpr { target, start, end } => Expr::SliceExpr {
+            target: Box::new(substitute_func_param(target, param, arg)),
+            start: start
+                .as_deref()
+                .map(|e| Box::new(substitute_func_param(e, param, arg))),
+            end: end
+                .as_deref()
+                .map(|e| Box::new(substitute_func_param(e, param, arg))),
         },
         Expr::RecursiveDescent => Expr::RecursiveDescent,
         Expr::Optional(e) => Expr::Optional(Box::new(substitute_func_param(e, param, arg))),
@@ -16597,6 +17764,139 @@ mod tests {
             .collect()
     }
 
+    // `eval_owned_multi`'s cardinality-preserving contract (#570), exercised
+    // directly rather than through any of the four call sites it was filed to
+    // unblock — `eval_owned_expr` collapses a multi-output result into a
+    // single value or an array; `eval_owned_multi` must not.
+
+    #[test]
+    fn eval_owned_multi_preserves_every_output_in_order() {
+        let expr = parse("1,2,3").unwrap();
+        let values = eval_owned_multi::<JqSemantics>(&expr, &OwnedValue::Null).unwrap();
+        assert_eq!(
+            values,
+            vec![OwnedValue::Int(1), OwnedValue::Int(2), OwnedValue::Int(3)]
+        );
+    }
+
+    #[test]
+    fn eval_owned_multi_keeps_a_single_array_output_as_one_element() {
+        // A single output that happens to be an array must come back as a
+        // one-element Vec containing that array, not get mistaken for
+        // multiple outputs and flattened into its elements (#490's bug in
+        // `eval_owned_expr`-based callers).
+        let expr = parse("[1,2]").unwrap();
+        let values = eval_owned_multi::<JqSemantics>(&expr, &OwnedValue::Null).unwrap();
+        assert_eq!(
+            values,
+            vec![OwnedValue::Array(vec![
+                OwnedValue::Int(1),
+                OwnedValue::Int(2)
+            ])]
+        );
+    }
+
+    #[test]
+    fn eval_owned_multi_produces_an_empty_vec_for_no_output() {
+        let expr = parse("empty").unwrap();
+        let values = eval_owned_multi::<JqSemantics>(&expr, &OwnedValue::Null).unwrap();
+        assert_eq!(values, Vec::<OwnedValue>::new());
+    }
+
+    #[test]
+    fn eval_owned_multi_propagates_an_error() {
+        let expr = parse(r#"error("boom")"#).unwrap();
+        assert!(eval_owned_multi::<JqSemantics>(&expr, &OwnedValue::Null).is_err());
+    }
+
+    /// Evaluate `Identity`/`Field`/`Index` against an `OwnedValue` the way
+    /// `eval_single` (backing every top-level query, via `index_object_by_name`/
+    /// `index_array_by_position`) does: serialize, build a real `JsonIndex`,
+    /// and index a `StandardJson` cursor. Independent of `eval_owned_fast_path`
+    /// -- this is the pre-#491 code path, kept alive here only as a reference.
+    fn via_cursor(
+        expr: &Expr,
+        input: &OwnedValue,
+        optional: bool,
+    ) -> Result<Option<OwnedValue>, EvalError> {
+        let json_str = input.to_json_for_reindex();
+        let json_bytes = json_str.as_bytes();
+        let index = JsonIndex::build(json_bytes);
+        let cursor = index.root(json_bytes);
+        let result = match expr {
+            Expr::Identity => QueryResult::One(cursor.value()),
+            Expr::Field(name) => index_object_by_name::<Vec<u64>>(cursor.value(), name, optional),
+            Expr::Index(idx) => index_array_by_position::<Vec<u64>>(cursor.value(), *idx, optional),
+            other => unreachable!("via_cursor only covers Identity/Field/Index, got {other:?}"),
+        };
+        match result {
+            QueryResult::One(v) => Ok(Some(to_owned(&v))),
+            QueryResult::None => Ok(None),
+            QueryResult::Error(e) => Err(e),
+            other => panic!("unexpected result from via_cursor: {other:?}"),
+        }
+    }
+
+    /// `eval_owned_fast_path` (#491) reimplements `index_object_by_name`/
+    /// `index_array_by_position`'s rules directly against `OwnedValue`, to
+    /// skip the serialize-and-reparse `eval_owned_expr`/`eval_owned_input`
+    /// otherwise pay on every node of a `..`/`recurse` fan-out. That makes it
+    /// a second implementation of the same rules, which can silently drift
+    /// out of sync with the original -- the exact failure mode #106 hit with
+    /// three copies of one predicate, one of them quadratic and unnoticed
+    /// because every test exercised only one copy at a time. This pins the
+    /// two together: run both on the same inputs and assert they agree.
+    #[test]
+    fn eval_owned_fast_path_agrees_with_index_object_by_name_and_index_array_by_position() {
+        let obj = || {
+            let mut m = indexmap::IndexMap::new();
+            m.insert("a".to_string(), OwnedValue::Int(1));
+            m.insert("b".to_string(), OwnedValue::Int(2));
+            OwnedValue::Object(m)
+        };
+        let arr = || {
+            OwnedValue::Array(vec![
+                OwnedValue::Int(10),
+                OwnedValue::Int(20),
+                OwnedValue::Int(30),
+            ])
+        };
+
+        let cases: Vec<(Expr, OwnedValue, bool)> = vec![
+            (Expr::Identity, obj(), false),
+            // Field: present key, missing key, on null, on a type that
+            // cannot be field-indexed at all (with and without `?`).
+            (Expr::Field("a".to_string()), obj(), false),
+            (Expr::Field("missing".to_string()), obj(), false),
+            (Expr::Field("a".to_string()), OwnedValue::Null, false),
+            (Expr::Field("a".to_string()), OwnedValue::Int(5), true),
+            (Expr::Field("a".to_string()), OwnedValue::Int(5), false),
+            (Expr::Field("a".to_string()), arr(), false),
+            // Index: in bounds, negative-from-end, out of bounds (positive
+            // and negative), on null, on a type that cannot be
+            // position-indexed at all (with and without `?`).
+            (Expr::Index(1), arr(), false),
+            (Expr::Index(-1), arr(), false),
+            (Expr::Index(10), arr(), false),
+            (Expr::Index(-10), arr(), false),
+            (Expr::Index(0), OwnedValue::Null, false),
+            (Expr::Index(0), OwnedValue::String("x".to_string()), true),
+            (Expr::Index(0), OwnedValue::String("x".to_string()), false),
+            (Expr::Index(0), obj(), false),
+        ];
+
+        for (expr, input, optional) in cases {
+            let fast = eval_owned_fast_path(&expr, &input, optional)
+                .expect("via_cursor's shapes are exactly the ones eval_owned_fast_path handles");
+            let reference = via_cursor(&expr, &input, optional);
+            assert_eq!(
+                fast, reference,
+                "eval_owned_fast_path disagrees with index_object_by_name/index_array_by_position \
+                 for {expr:?} on {input:?} (optional={optional})"
+            );
+        }
+    }
+
     #[test]
     fn test_numeric_key_to_index_number_literal_387() {
         assert_eq!(
@@ -16790,6 +18090,21 @@ mod tests {
     }
 
     #[test]
+    fn test_multi_output_preserved_across_owned_pipe() {
+        // Once a pipe stage produces an owned value, the rest of the pipe is
+        // re-evaluated against it. That continuation used to be squeezed through
+        // a single-`OwnedValue` signature, which folded a multi-output rest into
+        // one array -- `.a[]` below answered `[1,2]` instead of `1` then `2`.
+        assert_eq!(outputs(b"null", "{a:[1,2]} | .a[]"), ["1", "2"]);
+        assert_eq!(outputs(b"null", "{a:[1,2]} | .a | .[]"), ["1", "2"]);
+        assert_eq!(outputs(b"null", "{a:[1,2]} | .a[] | . + 1"), ["2", "3"]);
+
+        // Single-output and empty continuations are unaffected.
+        assert_eq!(outputs(b"null", "{a:[1,2]} | .a"), ["[1,2]"]);
+        assert_eq!(outputs(b"null", "{a:[]} | .a[]"), Vec::<String>::new());
+    }
+
+    #[test]
     fn test_slice() {
         // jq array slicing yields a single sub-array, not a stream of elements.
         query!(br"[0, 1, 2, 3, 4, 5]", ".[1:4]",
@@ -16824,9 +18139,37 @@ mod tests {
 
     #[test]
     fn test_comma() {
+        // Every operand borrowed from the document: nothing is materialized and
+        // the borrowed fast path is taken.
         query!(br#"{"a": 1, "b": 2}"#, ".a, .b",
             QueryResult::Many(values) => {
-                assert_eq!(values.len(), 2);
+                let rendered: Vec<String> = values.iter().map(|v| to_owned(v).to_json()).collect();
+                assert_eq!(rendered, ["1", "2"]);
+            }
+        );
+
+        // A mix of literal and document-derived operands promotes the whole
+        // stream to owned. Source order must survive that promotion in either
+        // direction — a literal placed *before* a document-derived value used to
+        // come out after it, while the reverse order looked correct by accident
+        // (#353). Both orders are pinned so neither can regress alone.
+        query!(br#"{"a": 2}"#, "1, .a",
+            QueryResult::ManyOwned(values) => {
+                assert_eq!(values, [OwnedValue::Int(1), OwnedValue::Int(2)]);
+            }
+        );
+        query!(br#"{"a": 2}"#, ".a, 1",
+            QueryResult::ManyOwned(values) => {
+                assert_eq!(values, [OwnedValue::Int(2), OwnedValue::Int(1)]);
+            }
+        );
+
+        // A container operand arrives as `OneCursor` and takes the
+        // materialize-in-place path, so it must not jump the literals around it.
+        query!(br#"{"a": 2}"#, "1, ., 2",
+            QueryResult::ManyOwned(values) => {
+                let rendered: Vec<String> = values.iter().map(OwnedValue::to_json).collect();
+                assert_eq!(rendered, ["1", r#"{"a":2}"#, "2"]);
             }
         );
     }
@@ -16883,6 +18226,82 @@ mod tests {
             QueryResult::Owned(OwnedValue::Object(obj)) => {
                 assert_eq!(obj.len(), 0);
             }
+        );
+    }
+
+    #[test]
+    fn test_object_construction_is_a_cartesian_product_354() {
+        // The last entry varies fastest; within an entry the key varies slower
+        // than the value. Pinned against jq-1.7.1 (#354).
+        assert_eq!(
+            outputs(b"null", "{a: (1,2), b: (3,4)}"),
+            [
+                r#"{"a":1,"b":3}"#,
+                r#"{"a":1,"b":4}"#,
+                r#"{"a":2,"b":3}"#,
+                r#"{"a":2,"b":4}"#
+            ]
+        );
+
+        // Multi-output keys multiply too, rather than erroring.
+        assert_eq!(
+            outputs(b"null", r#"{("x","y"): (1,2)}"#),
+            [r#"{"x":1}"#, r#"{"x":2}"#, r#"{"y":1}"#, r#"{"y":2}"#]
+        );
+
+        // Borrowed (document-derived) values, not just constructed ones.
+        assert_eq!(
+            outputs(br#"{"x":9,"y":8}"#, "{a: (.x,.y)}"),
+            [r#"{"a":9}"#, r#"{"a":8}"#]
+        );
+
+        // Duplicate keys are not deduplicated across combinations, and within
+        // one object the last value wins while the first position is kept.
+        assert_eq!(
+            outputs(b"null", r#"{("a","a"): (1,2)}"#),
+            [r#"{"a":1}"#, r#"{"a":2}"#, r#"{"a":1}"#, r#"{"a":2}"#]
+        );
+        assert_eq!(outputs(b"null", "{a:1, b:2, a:3}"), [r#"{"a":3,"b":2}"#]);
+    }
+
+    #[test]
+    fn test_object_construction_empty_entry_yields_no_objects_354() {
+        // An entry with zero outputs empties the product -- it does not become
+        // a null-valued field.
+        query!(br"null", "{a: empty, b: 1}", QueryResult::None => {});
+        query!(br"null", "{a: 1, b: empty}", QueryResult::None => {});
+
+        // ...and short-circuits every entry to its right, so the error below is
+        // never evaluated. jq agrees: exit 0, no output.
+        query!(br"null", r#"{a: empty, b: error("boom")}"#, QueryResult::None => {});
+    }
+
+    #[test]
+    fn test_object_construction_key_type_checked_at_assembly_354() {
+        // A non-string key raises nothing while the value stream is empty...
+        query!(br#"{"n":1}"#, "{(.n): empty}", QueryResult::None => {});
+
+        // ...loses to an error raised by the value...
+        query!(br#"{"n":1}"#, r#"{(.n): error("VAL")}"#,
+            QueryResult::Error(e) => assert_eq!(e.message, "VAL"));
+
+        // ...and otherwise names the offending type, in jq's own wording (#391).
+        query!(br#"{"n":1}"#, "{(.n): 2}",
+            QueryResult::Error(e) => assert_eq!(e.message, "Cannot use number (1) as object key"));
+
+        // The key expression is evaluated before the value expression.
+        query!(br#"{"n":1}"#, r#"{(error("KEY")): error("VAL")}"#,
+            QueryResult::Error(e) => assert_eq!(e.message, "KEY"));
+    }
+
+    #[test]
+    fn test_multi_output_object_after_owned_pipe_354() {
+        // The pipe's LHS is a constructed (owned) object, so the RHS is
+        // re-evaluated through the owned-pipe path, which used to fold a
+        // multi-output RHS into a single array.
+        assert_eq!(
+            outputs(b"null", r#"{"p":1} | {a: (2,3)}"#),
+            [r#"{"a":2}"#, r#"{"a":3}"#]
         );
     }
 
@@ -17521,6 +18940,153 @@ mod tests {
     }
 
     #[test]
+    fn regression_issue_575_while_break_reaches_enclosing_label() {
+        // The issue's own example, verified against jq 1.7.1: the label
+        // catches the break cleanly, keeping whatever the loop already
+        // output before it broke.
+        assert_eq!(
+            outputs(
+                b"1",
+                "label $out | while(true; if . >= 1 then break $out else .+1 end)"
+            ),
+            ["1"]
+        );
+        // Without an enclosing label, the break used to degrade into a
+        // synthetic "break $out not in label" error; it now surfaces as a
+        // real `Break`, with the value already output kept as a prefix
+        // (same shape #494 already gives an `error(...)` in this position).
+        query!(
+            b"1",
+            "while(true; if . >= 1 then break $out else .+1 end)",
+            QueryResult::Partial(vs, Control::Break(label)) => {
+                assert_eq!(prefix_json(&vs), ["1"]);
+                assert_eq!(label, "out");
+            }
+        );
+        // A break in `cond` (rather than `update`) is caught the same way,
+        // with no output at all since it fires before the first value would
+        // have been emitted.
+        assert_eq!(
+            outputs(b"1", "label $out | while(break $out; .+1)"),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn regression_issue_575_foreach_break_reaches_enclosing_label() {
+        // The issue's own example: break in UPDATE.
+        assert_eq!(
+            outputs(
+                b"null",
+                "label $out | foreach (1,2,3) as $x (0; if $x == 2 then break $out else . + $x end)"
+            ),
+            ["1"]
+        );
+        // Break in EXTRACT, verified against jq 1.7.1.
+        assert_eq!(
+            outputs(
+                b"null",
+                "label $out | foreach (1,2,3) as $x (0; .+$x; if $x == 2 then break $out else . end)"
+            ),
+            ["1"]
+        );
+        // Without an enclosing label, UPDATE's break surfaces as a real
+        // `Break`, keeping the outputs already extracted as a prefix.
+        query!(
+            b"null",
+            "foreach (1,2,3) as $x (0; if $x == 2 then break $out else . + $x end)",
+            QueryResult::Partial(vs, Control::Break(label)) => {
+                assert_eq!(prefix_json(&vs), ["1"]);
+                assert_eq!(label, "out");
+            }
+        );
+    }
+
+    #[test]
+    fn regression_issue_575_repeat_break_reaches_enclosing_label() {
+        // The issue's own example: breaks on the very first iteration, so
+        // nothing is ever output.
+        assert_eq!(
+            outputs(
+                b"1",
+                "label $out | repeat(if . >= 1 then break $out else .+1 end)"
+            ),
+            Vec::<String>::new()
+        );
+        // Without an enclosing label, the break surfaces as a real `Break`
+        // rather than a synthetic error.
+        query!(
+            b"1",
+            "repeat(if . >= 1 then break $out else .+1 end)",
+            QueryResult::Break(label) => {
+                assert_eq!(label, "out");
+            }
+        );
+    }
+
+    #[test]
+    fn regression_issue_575_reduce_break_reaches_enclosing_label() {
+        // Verified against jq 1.7.1.
+        assert_eq!(
+            outputs(
+                b"null",
+                "label $out | reduce (1,2,3) as $x (0; if $x == 2 then break $out else . + $x end)"
+            ),
+            Vec::<String>::new()
+        );
+        // `reduce` only ever emits its final accumulator, never
+        // intermediates, so without a label the break surfaces bare (no
+        // prefix to preserve) rather than as a synthetic error.
+        query!(
+            b"null",
+            "reduce (1,2,3) as $x (0; if $x == 2 then break $out else . + $x end)",
+            QueryResult::Break(label) => {
+                assert_eq!(label, "out");
+            }
+        );
+        // `optional` (`?`) must never swallow a `break` the way it swallows
+        // a real error — jq's `?` catches errors, not label breaks.
+        // Discriminating test: if the break were (incorrectly) swallowed as
+        // `None` by `optional`, the comma's second operand would still run
+        // and "reached" would be output; since the break must instead
+        // short-circuit the comma and reach the label, "reached" is never
+        // evaluated.
+        assert_eq!(
+            outputs(
+                b"null",
+                r#"label $out | ((reduce (1,2,3) as $x (0; if $x==2 then break $out else .+$x end))?, "reached")"#
+            ),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn regression_issue_575_until_break_reaches_enclosing_label() {
+        // Break in `cond`, verified against jq 1.7.1.
+        assert_eq!(
+            outputs(b"1", "label $out | until(break $out; .+1)"),
+            Vec::<String>::new()
+        );
+        // Break in `update`, verified against jq 1.7.1.
+        assert_eq!(
+            outputs(
+                b"1",
+                "label $out | until(. > 5; if . == 3 then break $out else .+1 end)"
+            ),
+            Vec::<String>::new()
+        );
+        // `until` only ever emits its final value, so without a label the
+        // break surfaces bare rather than as a synthetic error.
+        query!(
+            b"1",
+            "until(break $out; .+1)",
+            QueryResult::Break(label) => {
+                assert_eq!(label, "out");
+            }
+        );
+    }
+
+    #[test]
     fn regression_issue_400_first_last_nth_short_circuit_semantics() {
         // `first` and `nth` never ask their operand for values past what
         // they need, so a non-empty-enough prefix drops the trailing error
@@ -17546,9 +19112,14 @@ mod tests {
 
     #[test]
     fn regression_issue_400_array_and_object_construction_stay_atomic() {
-        // Verified against jq 1.7.1: construction is atomic — an error
-        // partway through aborts with no output at all, unlike a bare
-        // top-level comma.
+        // Verified against jq 1.7.1: an error with nothing yet successfully
+        // combined aborts with no output at all, unlike a bare top-level
+        // comma. Array construction is unconditionally atomic this way — see
+        // `partial_in_value_position_collapses_to_its_control`. Object
+        // construction only looks atomic here because neither entry has a
+        // completed sibling to combine with when `b` errors; once one does,
+        // it streams the completed combinations first (#354) — see
+        // `partial_prefix_survives_the_stream_forwarding_constructs`.
         query!(b"null", r#"[1,error("x"),3]"#,
             QueryResult::Error(e) => {
                 assert_eq!(e.message, "x");
@@ -17605,6 +19176,13 @@ mod tests {
         // built from the prefix and *then* fails. Those are recorded here as
         // divergences so the arms are covered without the expectation reading
         // as an oracle-backed one.
+        //
+        // Object construction *used* to be listed here too (`{a:1,b:(2,error("x"))}`
+        // collapsing straight to the error), but #354's rewrite made it a real
+        // generator like jq's: it now streams `{"a":1,"b":2}` before failing,
+        // the same as jq 1.7.1. See
+        // `partial_prefix_survives_the_stream_forwarding_constructs` for its
+        // coverage.
         let atomic: &[(&[u8], &str, &str, &str)] = &[
             // Matches jq 1.7.1: no output at all, then the error.
             (b"null", r#"[1,(2,error("x")),3]"#, "x", "matches jq 1.7.1"),
@@ -17615,31 +19193,15 @@ mod tests {
                 "x",
                 "matches jq 1.7.1",
             ),
-            // Diverges from jq 1.7.1, which prints the value built from the
-            // prefix before failing.
-            (
-                b"null",
-                r#"{a:1,b:(2,error("x"))}"#,
-                "x",
-                r#"jq 1.7.1 prints {"a":1,"b":2}, then fails"#,
-            ),
-            (
-                b"5",
-                r#"select((true,error("x")))"#,
-                "x",
-                "jq 1.7.1 prints 5, then fails",
-            ),
+            // `select`/`if` fan out over their condition's outputs (#378) —
+            // they forward their operand as a stream, not a value, so they no
+            // longer belong in this list; see
+            // `partial_prefix_survives_the_stream_forwarding_constructs`.
             (
                 b"null",
                 r#""v=\((1,error("x")))""#,
                 "x",
                 r#"jq 1.7.1 prints "v=1", then fails"#,
-            ),
-            (
-                b"null",
-                r#"if (1,error("x")) then "t" else "f" end"#,
-                "x",
-                r#"jq 1.7.1 prints "t", then fails"#,
             ),
             (
                 b"[10,20,30]",
@@ -17686,10 +19248,8 @@ mod tests {
             (b"null", "[1,(2,break $out),3]"),
             (b"[1,2]", "map((.,break $out))"),
             (br#"{"a":1}"#, "with_entries((.,break $out))"),
-            (b"null", "{a:1,b:(2,break $out)}"),
-            (b"5", "select((true,break $out))"),
+            // `select`/`if`: see the comment in `atomic` above.
             (b"null", r#""v=\((1,break $out))""#),
-            (b"null", r#"if (1,break $out) then "t" else "f" end"#),
             (b"[10,20,30]", ".[(1,break $out)]"),
             (b"[[7],[8]]", "(.[0],(.[1],break $out))[(0+0)]"),
             (br#"{"a":1}"#, "map_values((.,break $out))"),
@@ -17702,10 +19262,14 @@ mod tests {
 
         // With an enclosing label the break is caught, which is what makes the
         // array/object split above observable end-to-end: jq 1.7.1 agrees that
-        // `[...]` yields nothing here, and disagrees about `{...}` (it prints
-        // the object).
+        // `[...]` yields nothing here. Object construction used to match that
+        // (wrongly — see the comment above `atomic`); post-#354 it agrees with
+        // jq 1.7.1 instead, printing the object built from the prefix.
         assert!(outputs(b"null", "label $out | [1,(2,break $out),3]").is_empty());
-        assert!(outputs(b"null", "label $out | {a:1,b:(2,break $out)}").is_empty());
+        assert_eq!(
+            outputs(b"null", "label $out | {a:1,b:(2,break $out)}"),
+            [r#"{"a":1,"b":2}"#]
+        );
     }
 
     #[test]
@@ -17787,6 +19351,72 @@ mod tests {
         query!(b"null", r#"(1,2,error("x")) | empty"#,
             QueryResult::Error(e) => {
                 assert_eq!(e.message, "x");
+            }
+        );
+
+        // `select`/`if` fan out over their condition's outputs (#378), so —
+        // like every other construct in this test — a `Partial` condition
+        // keeps whatever the truthy bits already produced before the
+        // trailing control surfaces. Matches jq 1.7.1 (`select((true,error("x")))`
+        // on `5` prints `5`, then fails; `if (1,error("x")) then "t" else "f" end`
+        // prints `"t"`, then fails).
+        query!(b"5", r#"select((true,error("x")))"#,
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(prefix_json(&vs), ["5"]);
+                assert_eq!(e.message, "x");
+            }
+        );
+        query!(b"5", r"select((true,break $out))",
+            QueryResult::Partial(vs, Control::Break(label)) => {
+                assert_eq!(prefix_json(&vs), ["5"]);
+                assert_eq!(label, "out");
+            }
+        );
+        query!(b"null", r#"if (1,error("x")) then "t" else "f" end"#,
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(prefix_json(&vs), [r#""t""#]);
+                assert_eq!(e.message, "x");
+            }
+        );
+        query!(b"null", r#"if (1,break $out) then "t" else "f" end"#,
+            QueryResult::Partial(vs, Control::Break(label)) => {
+                assert_eq!(prefix_json(&vs), [r#""t""#]);
+                assert_eq!(label, "out");
+            }
+        );
+
+        // Object construction (#354): a value generator's own prefix is
+        // combined into objects before its trailing control surfaces.
+        // Matches jq 1.7.1 (`{a:1,b:(2,error("x"))}` prints `{"a":1,"b":2}`,
+        // then fails).
+        query!(b"null", r#"{a:1,b:(2,error("x"))}"#,
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(prefix_json(&vs), [r#"{"a":1,"b":2}"#]);
+                assert_eq!(e.message, "x");
+            }
+        );
+        query!(b"null", r"{a:1,b:(2,break $out)}",
+            QueryResult::Partial(vs, Control::Break(label)) => {
+                assert_eq!(prefix_json(&vs), [r#"{"a":1,"b":2}"#]);
+                assert_eq!(label, "out");
+            }
+        );
+        // A trailing control on an *earlier* entry aborts every enclosing
+        // loop outright rather than resuming it — jq 1.7.1 agrees `a`'s
+        // second branch is never tried once `b` fails on its first.
+        query!(b"null", r#"{a:(1,2),b:(10,error("x"))}"#,
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(prefix_json(&vs), [r#"{"a":1,"b":10}"#]);
+                assert_eq!(e.message, "x");
+            }
+        );
+        // A trailing control on the key generator: every key it already
+        // produced runs its full value loop first (jq 1.7.1: `{"x":10}` then
+        // `{"x":20}`, then the non-string-key error).
+        query!(b"null", r#"{("x",1):(10,20)}"#,
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(prefix_json(&vs), [r#"{"x":10}"#, r#"{"x":20}"#]);
+                assert_eq!(e.message, "Cannot use number (1) as object key");
             }
         );
     }
@@ -17999,14 +19629,14 @@ mod tests {
     fn partial_reduced_to_a_single_value_keeps_its_first_output() {
         // The "this position takes one value, not a stream" helpers all keep
         // the prefix's first output and drop the trailing control.
+        //
+        // Assignment RHS used to be pinned here too (`.a = (1,error("x"))`
+        // used to reduce to `Owned({"a":1})`, diverging from jq 1.7.1's
+        // `{"a":1}` then exit 5), but `=` no longer reduces its RHS to a
+        // single value (#392) — see
+        // `test_assign_multi_output_rhs_errors_after_partial_output`, which
+        // now pins the matching-jq `Partial` behavior instead.
 
-        // Assignment RHS. Diverges from jq 1.7.1, which prints {"a":1} and
-        // then *fails* (exit 5); succinctly exits 0.
-        query!(br#"{"a":0}"#, r#".a = (1,error("x"))"#,
-            QueryResult::Owned(OwnedValue::Object(m)) => {
-                assert_eq!(m.get("a"), Some(&OwnedValue::Int(1)));
-            }
-        );
         // `pick`/`omit` key expressions. jq 1.7.1 rejects both filters
         // outright ("Invalid path expression"), a separate pre-existing gap.
         query!(br#"{"a":1,"b":2}"#, r#"pick((["a"],error("x")))"#,
@@ -18155,6 +19785,23 @@ mod tests {
                 assert_eq!(n.as_i64().unwrap(), 1);
             }
         );
+    }
+
+    #[test]
+    fn test_if_multi_output_condition_forks_the_branches() {
+        // jq fans `if`/`select` out over every output of the condition,
+        // running the body once per output rather than consulting only the
+        // first one (#378). Pinned against jq 1.7.1.
+        assert_eq!(
+            outputs(b"null", r#"if (true,false) then "a" else "b" end"#),
+            [r#""a""#, r#""b""#]
+        );
+        assert_eq!(
+            outputs(b"null", r#"if (1==1, 1==2, 1==1) then "t" else "f" end"#),
+            [r#""t""#, r#""f""#, r#""t""#]
+        );
+        // An `empty` condition contributes no bits, so no branch runs at all.
+        assert!(outputs(b"null", r#"if empty then "t" else "f" end"#).is_empty());
     }
 
     #[test]
@@ -18571,10 +20218,21 @@ mod tests {
             }
         );
 
-        // select outputs nothing if condition is false
-        query!(br"2", "select(. > 3)",
-            QueryResult::None => {}
-        );
+        // select outputs nothing if condition is false. `eval_fanout` shares
+        // `eval_comma`'s empty-merge shape (`Many(vec![])`, not a bare
+        // `None`) — `outputs()` is deliberately variant-agnostic about that,
+        // per its own doc comment.
+        assert!(outputs(br"2", "select(. > 3)").is_empty());
+    }
+
+    #[test]
+    fn test_builtin_select_multi_output_condition_forks() {
+        // A multi-output condition republishes the input once per truthy
+        // output instead of only consulting the first one (#378). Pinned
+        // against jq 1.7.1.
+        assert!(outputs(b"1", "select((false,false) and true)").is_empty());
+        assert_eq!(outputs(b"1", "select((true,false) and true)"), ["1"]);
+        assert_eq!(outputs(b"1", "select((true,true))"), ["1", "1"]);
     }
 
     #[test]
@@ -19510,6 +21168,38 @@ mod tests {
     }
 
     #[test]
+    fn test_format_uri_multibyte_boundary_124() {
+        // Regression for #124's byte-oriented rewrite: every byte of a
+        // multi-byte character is individually "not safe" for @uri, so two
+        // such bytes in a row (or a multi-byte char directly followed by
+        // another non-safe byte) used to slice `&s[i..i]` at a non-boundary
+        // position and panic, even though the slice was empty.
+        // JSON `\u` escapes keep the byte string literal itself ASCII-only,
+        // as Rust requires. `é` = 'é' (2 UTF-8 bytes).
+        query!(br#""\u00e9/x""#, "@uri",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "%C3%A9%2Fx");
+            }
+        );
+
+        // Two consecutive multi-byte characters, no ASCII in between.
+        // `€` is the euro sign (3 UTF-8 bytes).
+        query!(br#""\u00e9\u20ac""#, "@uri",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "%C3%A9%E2%82%AC");
+            }
+        );
+
+        // A 4-byte character (U+1F389, as a UTF-16 surrogate pair) directly
+        // followed by an ASCII special.
+        query!(br#""\ud83c\udf89?""#, "@uri",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "%F0%9F%8E%89%3F");
+            }
+        );
+    }
+
+    #[test]
     fn test_format_csv() {
         // jq always double-quotes every string field (#306).
         query!(br#"["a", "b", "c"]"#, "@csv",
@@ -19534,10 +21224,47 @@ mod tests {
     }
 
     #[test]
+    fn test_format_csv_multibyte_boundary_647() {
+        // Regression for #647's investigated byte-oriented rewrite of the
+        // quote scan: a multi-byte character directly adjacent to a `"`
+        // byte, in either order, must not attempt an invalid slice.
+        query!(br#"["\u00e9\"b"]"#, "@csv",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "\"é\"\"b\"");
+            }
+        );
+
+        query!(br#"["\"\u00e9"]"#, "@csv",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "\"\"\"é\"");
+            }
+        );
+    }
+
+    #[test]
     fn test_format_tsv() {
         query!(br#"["a", "b", "c"]"#, "@tsv",
             QueryResult::Owned(OwnedValue::String(s)) => {
                 assert_eq!(s, "a\tb\tc");
+            }
+        );
+    }
+
+    #[test]
+    fn test_format_tsv_escapes_all_four_chars_647() {
+        // #647's investigated single-pass rewrite replaced four chained
+        // `.replace()` calls; this pins that all four escapes still fire
+        // together, including adjacent escapes with no safe span between
+        // them, regardless of which implementation is in place.
+        query!(br#"["a\\b\tc\nd\re"]"#, "@tsv",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, r"a\\b\tc\nd\re");
+            }
+        );
+
+        query!(br#"["\t\n\r\\"]"#, "@tsv",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, r"\t\n\r\\");
             }
         );
     }
@@ -19615,6 +21342,24 @@ mod tests {
     }
 
     #[test]
+    fn test_format_html_multibyte_boundary_124() {
+        // Regression for #124's byte-oriented rewrite: a multi-byte
+        // character directly adjacent to an entity-triggering byte, in
+        // either order, must not attempt an invalid slice.
+        query!(br#""\u00e9<b>""#, "@html",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "é&lt;b&gt;");
+            }
+        );
+
+        query!(br#""<\u00e9>""#, "@html",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "&lt;é&gt;");
+            }
+        );
+    }
+
+    #[test]
     fn test_format_sh() {
         query!(br#""hello world""#, "@sh",
             QueryResult::Owned(OwnedValue::String(s)) => {
@@ -19626,6 +21371,31 @@ mod tests {
         query!(br#""it's a test""#, "@sh",
             QueryResult::Owned(OwnedValue::String(s)) => {
                 assert_eq!(s, "'it'\\''s a test'");
+            }
+        );
+    }
+
+    #[test]
+    fn test_format_sh_multibyte_boundary_647() {
+        // Regression for #647's investigated byte-oriented rewrite of the
+        // quote scan: a multi-byte character directly adjacent to a `'`
+        // byte, in either order, must not attempt an invalid slice.
+        query!(br#""\u00e9'b""#, "@sh",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "'é'\\''b'");
+            }
+        );
+
+        query!(br#""'\u00e9""#, "@sh",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "''\\''é'");
+            }
+        );
+
+        // Array form exercises per-element @sh formatting.
+        query!(br#"["it's", "caf\u00e9", 1, true, null]"#, "@sh",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "'it'\\''s' 'café' 1 true null");
             }
         );
     }
@@ -20559,6 +22329,143 @@ mod tests {
         });
         query!(b"null", "nan", QueryResult::Owned(OwnedValue::Float(n)) => {
             assert!(n.is_nan());
+        });
+    }
+
+    #[test]
+    fn test_nan_survives_reindex_bridge_472() {
+        // `nan` alone is a native `OwnedValue::Float(NaN)` (`test_infinite_nan`
+        // above), but every filter here pipes that result through at least one
+        // `to_json_for_reindex`/reparse hop before the next stage runs. Before
+        // #472's fix that hop lost the NaN-ness (JSON has no NaN literal, and
+        // the bridge fell back to `"null"`), so these all disagreed with real
+        // jq. Every expected value is jq-1.7.1's own output for the same query.
+        query!(b"null", "nan | isnan", QueryResult::Owned(OwnedValue::Bool(b)) => {
+            assert!(b);
+        });
+        query!(b"null", "nan | tonumber | isnan", QueryResult::Owned(OwnedValue::Bool(b)) => {
+            assert!(b);
+        });
+        query!(b"null", "nan | length | isnan", QueryResult::Owned(OwnedValue::Bool(b)) => {
+            assert!(b);
+        });
+        query!(b"null", "[nan] | sort | .[0] | isnan", QueryResult::Owned(OwnedValue::Bool(b)) => {
+            assert!(b);
+        });
+        query!(b"null", "[nan,1] | bsearch(nan)", QueryResult::Owned(OwnedValue::Int(idx)) => {
+            assert_eq!(idx, -2);
+        });
+        query!(b"null", "[nan,nan] | bsearch(nan)", QueryResult::Owned(OwnedValue::Int(idx)) => {
+            assert_eq!(idx, -3);
+        });
+        query!(b"null", "[nan,nan,nan] | bsearch(nan)", QueryResult::Owned(OwnedValue::Int(idx)) => {
+            assert_eq!(idx, -4);
+        });
+    }
+
+    #[test]
+    fn test_bsearch_single_nan_haystack_known_divergence_472() {
+        // Discovered while fixing #472, but a separate, narrower bug: not
+        // fixed by NaN-survival, and not a reindex-bridge problem at all.
+        //
+        // `compare_values` (shared with `sort`/`unique`/`group_by`, #421)
+        // treats every NaN as strictly less than every other value,
+        // including another NaN, so `builtin_bsearch`'s binary search always
+        // walks *past* a NaN run without ever reporting it "found" -- and
+        // for every haystack tested except a single-element one, that
+        // matches jq's own answer exactly: `[nan,nan]|bsearch(nan)` is `-3`
+        // in both, `[nan,nan,nan]|bsearch(nan)` is `-4` in both (see
+        // `test_nan_survives_reindex_bridge_472`).
+        //
+        // `[nan]|bsearch(nan)` alone is jq's `-1`, not `-2`. A single probe
+        // can only take one branch, so matching jq here would require
+        // `compare_values(NaN, NaN)` to answer `Greater` for a one-element
+        // haystack and `Less` for every longer one -- impossible for any
+        // comparator that doesn't see the surrounding array. This means
+        // jq's own answer isn't a coherent "insertion point" under any
+        // total order either; it's an artifact of whatever raw-double
+        // comparisons jq's particular C probe sequence happens to hit for a
+        // "sorted" array that (containing NaN) isn't actually well-ordered
+        // to begin with -- exactly the not-a-strict-weak-order territory
+        // `compare_values`'s own doc comment already flags. Not worth
+        // chasing bug-for-bug; pinning succinctly's current, consistent
+        // answer here rather than leaving it silently uncovered.
+        query!(b"null", "[nan] | bsearch(nan)", QueryResult::Owned(OwnedValue::Int(idx)) => {
+            assert_eq!(idx, -2);
+        });
+    }
+
+    #[test]
+    fn test_nan_math_builtins_survive_reindex_bridge_613() {
+        // Companion to `test_nan_survives_reindex_bridge_472`: that fix covered
+        // `to_owned`/`length`/`tonumber`/`isnan`, but `get_float_value` and
+        // `get_number_from_result` -- which back the whole math-builtin family --
+        // still read `n.as_f64()` directly with no sentinel check, so a bridged
+        // NaN through any of these errored ("invalid number") instead of
+        // propagating. Every expected value is jq-1.7.1's own output for the
+        // same query.
+        for filter in [
+            "nan | floor | isnan",
+            "nan | ceil | isnan",
+            "nan | round | isnan",
+            "nan | trunc | isnan",
+            "nan | sqrt | isnan",
+            "nan | fabs | isnan",
+            "nan | log | isnan",
+            "nan | log10 | isnan",
+            "nan | log2 | isnan",
+            "nan | exp | isnan",
+            "nan | exp10 | isnan",
+            "nan | exp2 | isnan",
+            "pow(nan; 2) | isnan",
+            "pow(2; nan) | isnan",
+            "nan | sin | isnan", // trig shares get_float_value; fixed for free
+        ] {
+            query!(b"null", filter, QueryResult::Owned(OwnedValue::Bool(b)) => {
+                assert!(b, "expected {filter:?} to be NaN");
+            });
+        }
+
+        // floor/ceil/round/trunc wrap their result as `OwnedValue::Int`, and
+        // `NaN as i64` saturates to 0 -- confirm the NaN case is special-cased
+        // before that cast so `type` stays "number", not silently coerced.
+        query!(b"null", "nan | floor | type", QueryResult::Owned(OwnedValue::String(s)) => {
+            assert_eq!(s, "number");
+        });
+    }
+
+    #[test]
+    fn test_nan_normals_isinfinite_isnormal_already_correct_613() {
+        // Unlike the math builtins above, `normals`/`isinfinite`/`isnormal`
+        // already match real jq for a bridged NaN today (verified against
+        // jq-1.7.1): the missing sentinel check makes `n.as_f64()` fail, and
+        // each of these three happens to treat that failure the same way jq
+        // treats NaN itself. Pinned here so it can't silently regress while
+        // nearby code is being touched for #613.
+        query!(b"null", "nan | normals", QueryResult::None => {});
+        query!(b"null", "nan | isinfinite", QueryResult::Owned(OwnedValue::Bool(b)) => {
+            assert!(!b);
+        });
+        query!(b"null", "nan | isnormal", QueryResult::Owned(OwnedValue::Bool(b)) => {
+            assert!(!b);
+        });
+    }
+
+    #[test]
+    fn test_nan_sentinel_collision_with_real_document_is_well_defined() {
+        // #472's design tradeoff, made explicit: `NAN_SENTINEL` is reserved
+        // and unparseable by construction
+        // (`test_nan_sentinel_is_unparseable_as_a_real_number`), but it's
+        // still just number-shaped text, not a value that only the reindex
+        // bridge can produce -- a *real* document containing this exact byte
+        // sequence is affected too. Pin that this is well-defined (treated
+        // as NaN, consistently across builtins) rather than a panic or a
+        // silently different fallback per call site.
+        query!(br"9e999e999", "isnan", QueryResult::Owned(OwnedValue::Bool(b)) => {
+            assert!(b);
+        });
+        query!(br"9e999e999", "length", QueryResult::Owned(OwnedValue::Float(f)) => {
+            assert!(f.is_nan());
         });
     }
 
@@ -22184,6 +24091,134 @@ mod tests {
         }
     }
 
+    /// #483: shapes `resolve_node` already knew how to resolve, but that
+    /// `needs_path_prepass`'s old whitelist never routed to it, plus the
+    /// combinators added alongside the fix (`first`, `if`, `//`, `limit`,
+    /// `try`, `label`, `as`, static `getpath`). Every expectation here is
+    /// captured from real jq 1.7.1 and mirrored as a golden fixture under
+    /// `tests/data/jq-golden/cases/path_*`.
+    #[test]
+    fn test_path_resolves_recursive_descent_recurse_select_and_typeof() {
+        let doc = br#"{"a":{"b":1},"c":2}"#;
+        assert_eq!(
+            outputs(doc, "[path(..)]"),
+            [r#"[[],["a"],["a","b"],["c"]]"#]
+        );
+        assert_eq!(
+            outputs(doc, "[path(recurse)]"),
+            [r#"[[],["a"],["a","b"],["c"]]"#]
+        );
+        assert_eq!(
+            outputs(doc, "[path(.. | numbers)]"),
+            [r#"[["a","b"],["c"]]"#]
+        );
+        assert_eq!(
+            outputs(doc, r#"[path(.[] | select(type=="number"))]"#),
+            [r#"[["c"]]"#]
+        );
+        // The write-side operators share the same resolver, so they now
+        // succeed instead of refusing these same shapes outright.
+        query!(doc, "(.. | numbers) = 9",
+            QueryResult::Owned(v) => assert_eq!(v.to_json(), r#"{"a":{"b":9},"c":9}"#)
+        );
+        query!(doc, "del(.. | numbers)",
+            QueryResult::Owned(v) => assert_eq!(v.to_json(), r#"{"a":{}}"#)
+        );
+    }
+
+    #[test]
+    fn test_path_resolves_transparent_control_flow_combinators() {
+        let doc = br#"{"a":{"b":1},"c":[1,2]}"#;
+        assert_eq!(outputs(doc, "[path(first(.a,.c))]"), [r#"[["a"]]"#]);
+        assert_eq!(
+            outputs(doc, "[path(if true then .a else .c end)]"),
+            [r#"[["a"]]"#]
+        );
+        assert_eq!(outputs(doc, "[path(.a // .c)]"), [r#"[["a"]]"#]);
+        assert_eq!(outputs(doc, "[path(limit(1; .a))]"), [r#"[["a"]]"#]);
+        assert_eq!(outputs(doc, "[path(try .a)]"), [r#"[["a"]]"#]);
+        assert_eq!(outputs(doc, "[path(label $out | .a)]"), [r#"[["a"]]"#]);
+        assert_eq!(outputs(doc, "[path(.a as $x | .c)]"), [r#"[["c"]]"#]);
+        assert_eq!(outputs(doc, r#"[path(getpath(["a"]))]"#), [r#"[["a"]]"#]);
+    }
+
+    /// #530: a filter that is not a path expression at all — as opposed to
+    /// one jq recognises but this resolver does not (#483) — raises jq's own
+    /// sentence by name instead of answering `[]`.
+    #[test]
+    // `"path({a:1})"` is a jq filter literal, not a formatting string; clippy
+    // cannot tell the two apart from the brace shape alone.
+    #[allow(clippy::literal_string_with_formatting_args)]
+    fn test_path_of_a_non_path_expression_raises_invalid_path_expression() {
+        for (filter, message) in [
+            ("path(1)", "Invalid path expression with result 1"),
+            ("path(length)", "Invalid path expression with result 1"),
+            ("path(keys)", r#"Invalid path expression with result ["a"]"#),
+            ("path(.a + 1)", "Invalid path expression with result 2"),
+            (
+                "path(.a | tostring)",
+                r#"Invalid path expression with result "1""#,
+            ),
+            (
+                "path({a:1})",
+                r#"Invalid path expression with result {"a":1}"#,
+            ),
+        ] {
+            query!(br#"{"a":1}"#, filter,
+                QueryResult::Error(e) => assert_eq!(e.message, message, "{filter}")
+            );
+        }
+    }
+
+    /// `?` does not suppress `invalid_path_expression` — it is a statement
+    /// about the filter, not a value error raised while collecting a path
+    /// (confirmed live against jq 1.7.1: `path(("a")?)` still raises there).
+    /// `try` (with or without a `catch`) is the same rule under its other
+    /// spelling.
+    #[test]
+    fn test_invalid_path_expression_survives_optional_and_try() {
+        for filter in ["path((\"a\")?)", "path(try 1)", "path(try 1 catch \"x\")"] {
+            query!(br#"{"a":1}"#, filter,
+                QueryResult::Error(e) => {
+                    assert!(e.is_invalid_path_expression(), "{filter}: {}", e.message);
+                }
+            );
+        }
+    }
+
+    /// #530's sibling fix: `path()` streams every output its argument
+    /// produces as it resolves them, so a later sibling erroring does not
+    /// erase an earlier one that already succeeded — jq's own generator
+    /// semantics never "un-emit" an output. Verified against jq 1.7.1:
+    /// `path(.a, 1)` prints `["a"]` then raises; `(.a, .b[0])?` prints
+    /// `["a"]` and silently stops.
+    #[test]
+    fn test_path_keeps_the_prefix_before_a_later_sibling_errors() {
+        query!(br#"{"a":1}"#, "path(.a, 1)",
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(prefix_json(&vs), [r#"["a"]"#]);
+                assert_eq!(e.message, "Invalid path expression with result 1");
+            }
+        );
+        query!(br#"{"a":1,"b":"x"}"#, "path(.a, .b[0])",
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(prefix_json(&vs), [r#"["a"]"#]);
+                assert_eq!(e.message, "Cannot index string with number");
+            }
+        );
+        // `?` keeps the same prefix but swallows the error entirely.
+        assert_eq!(
+            outputs(br#"{"a":1,"b":"x"}"#, "[path((.a, .b[0])?)]"),
+            [r#"[["a"]]"#]
+        );
+        // `=`/`|=`/`del()` stay atomic: jq resolves every path against the
+        // original document before writing any of them, so one bad sibling
+        // means nothing is written at all — no partial prefix here.
+        query!(br#"{"a":1}"#, "(.a, 1) = 5",
+            QueryResult::Error(e) => assert_eq!(e.message, "Invalid path expression with result 1")
+        );
+    }
+
     #[test]
     fn test_paths_filter() {
         // paths(filter) streams paths where values match filter
@@ -22823,6 +24858,109 @@ mod tests {
     }
 
     #[test]
+    fn test_assign_multi_output_rhs_forks_once_per_output() {
+        // #392: `.a = (1,2)` forks into two whole documents, one per RHS
+        // output, each spliced into a fresh copy of the pristine input --
+        // not just the first output.
+        assert_eq!(
+            outputs(b"{}", ".a = (1,2)"),
+            vec![r#"{"a":1}"#, r#"{"a":2}"#]
+        );
+    }
+
+    #[test]
+    fn test_update_assign_multi_output_rhs_keeps_only_the_first_output() {
+        // #392's complementary rule: `|=` takes only the RHS filter's first
+        // output, never an array of every output (which was the
+        // `Expr::Identity` arm's bug before this fix).
+        assert_eq!(outputs(b"{}", ".a |= (1,2)"), vec![r#"{"a":1}"#]);
+    }
+
+    #[test]
+    fn test_assign_empty_rhs_produces_no_output() {
+        // Behavior change (#392): before this fix, a zero-output RHS was
+        // forced to `Null` (`{"a":null}`). Real jq's `_assign` never even
+        // reaches `path(paths)` when `value` binds zero times, so the whole
+        // expression yields nothing.
+        assert_eq!(outputs(b"{}", ".a = empty"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn test_assign_multi_output_rhs_errors_after_partial_output() {
+        // Confirmed against real jq: `.a = (1,error("boom"),3)` streams
+        // `{"a":1}`, then raises `boom` and exits 5 -- `3` is never reached.
+        query!(b"{}", r#".a = (1,error("boom"),3)"#,
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(prefix_json(&vs), [r#"{"a":1}"#]);
+                assert_eq!(e.message, "boom");
+            }
+        );
+    }
+
+    #[test]
+    fn test_assign_multi_path_with_multi_output_rhs_forks_per_output_not_per_path() {
+        // Paths are still resolved once, against the pristine input
+        // (unchanged); what's new is forking once per RHS output. Verified
+        // against real jq: `(.a,.b) = (10,20,30)` yields three whole
+        // documents, each with *both* paths set to the same output -- not
+        // nine (paths x outputs).
+        assert_eq!(
+            outputs(b"{}", "(.a,.b) = (10,20,30)"),
+            vec![
+                r#"{"a":10,"b":10}"#,
+                r#"{"a":20,"b":20}"#,
+                r#"{"a":30,"b":30}"#
+            ],
+        );
+    }
+
+    #[test]
+    fn test_assign_setpath_failure_mid_fanout_keeps_earlier_docs() {
+        // A `setpath` failure partway through the fan-out terminates it like
+        // any other mid-stream error (#400/#494's shape): earlier documents
+        // survive, later RHS outputs are never attempted. Confirmed against
+        // real jq: `.[0:2] = ([8,8],1,[9,9])` streams `[8,8,3,4]`, then
+        // raises, and `[9,9]` never appears.
+        query!(br"[1,2,3,4]", r".[0:2] = ([8,8],1,[9,9])",
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(prefix_json(&vs), ["[8,8,3,4]"]);
+                assert_eq!(e.message, "A slice of an array can only be assigned another array");
+            }
+        );
+    }
+
+    #[test]
+    fn test_optional_assign_swallows_setpath_failure_but_keeps_documents_already_built() {
+        // An outer `?` on the *whole* assignment only swallows the failure --
+        // it does not discard documents the fan-out already built, matching
+        // ordinary `try` semantics. Verified against real jq: `(.[0:2] =
+        // ([8,8],1,[9,9]))?` keeps `[8,8,3,4]` rather than producing nothing.
+        //
+        // (An RHS that itself errors under `?`, e.g. `(.a = (1,
+        // error("boom"), 3))?`, is not exercised here: `Expr::Optional`
+        // threads `optional` into every sibling of a comma independently
+        // rather than aborting the whole generator on its first error, so
+        // `error("boom")` is swallowed as `None` and `3` still runs --
+        // diverging from jq's `{"a":1}` there. That divergence predates and
+        // is independent of #392 -- `eval_rhs_once` threaded the same
+        // `optional` flag into the RHS the same way -- and is not something
+        // this fix changes or is responsible for.)
+        assert_eq!(
+            outputs(b"[1,2,3,4]", "(.[0:2] = ([8,8],1,[9,9]))?"),
+            vec!["[8,8,3,4]"],
+        );
+    }
+
+    #[test]
+    fn test_update_assign_empty_rhs_characterizes_preexisting_null_bug() {
+        // Real jq deletes the key when the update filter produces no output
+        // (`.a |= empty` on `{}` is `{}`); succinctly currently leaves it
+        // `null`. Pre-existing, out of scope for #392 -- if this is ever
+        // fixed, update this test.
+        assert_eq!(outputs(b"{}", ".a |= empty"), vec![r#"{"a":null}"#]);
+    }
+
+    #[test]
     fn test_compound_assign_add() {
         // Compound assignment: .a += 10
         query!(br#"{"a": 5}"#, r".a += 10",
@@ -23141,6 +25279,322 @@ mod tests {
         )]);
     }
 
+    /// #499: slice bounds accept any expression, evaluated with the same
+    /// discipline as a computed index key (`resolve_index_expr`). Every case
+    /// here was checked against jq 1.7.1 directly.
+    #[test]
+    fn test_computed_slice_bounds() {
+        assert_outcomes(&[
+            // The issue's own repro: a computed start bound, evaluated
+            // against the root (not against `.a`).
+            (
+                br#"{"a":[1,2,3],"k":1}"#,
+                r#".a[.k:2]? = ["x"]"#,
+                Ok(r#"{"a":[1,"x",3],"k":1}"#),
+            ),
+            // A bound-evaluation failure is not covered by a trailing `?` —
+            // `.x` on an array raises before the slice is ever applied.
+            (
+                b"[1,2,3]",
+                r#".[(.x):2]? = ["y"]"#,
+                Err(r#"Cannot index array with string "x""#),
+            ),
+            // Same rule on the end bound, and on a string target.
+            (
+                br#""str""#,
+                ".[0:.k]? = 5",
+                Err(r#"Cannot index string with string "k""#),
+            ),
+            // A bound that resolves successfully but isn't a number is also
+            // not covered by `?` — unlike a computed key's `key_to_path_component`
+            // type check, which `?` *does* cover.
+            (
+                b"null",
+                r#".[("x"):2]? = 5"#,
+                Err("Array/string slice indices must be integers"),
+            ),
+            // Only the final "target isn't sliceable" failure is what `?`
+            // covers.
+            (b"5", r#".[0:2]? = ["x"]"#, Ok("5")),
+            // The target's own evaluation failure is not covered either.
+            (
+                br#""str""#,
+                r#".a[0:2]? = ["x"]"#,
+                Err(r#"Cannot index string with string "a""#),
+            ),
+            // An empty start (or end) bound stream short-circuits before the
+            // next stage runs — including before the target is ever touched.
+            (b"[1,2,3]", "[(error(\"boom\"))[0:empty]]", Ok("[]")),
+            (b"[1,2,3]", "[(error(\"boom\"))[empty:2]]", Ok("[]")),
+            // A `null` bound is "open on this side", same as an omitted one.
+            (b"[1,2,3,4,5]", ".[(null):(3)]", Ok("[1,2,3]")),
+            // A fractional dynamic bound still floors the start / ceils the
+            // end, exactly like a literal one.
+            (b"[1,2,3,4,5]", ".[(1.7):(2.9)]", Ok("[2,3]")),
+            // Multi-value bounds fan out start-outer, end-middle,
+            // target-inner — the same nesting order jq's `S as $s | T as $t
+            // | E | .[$s:$t]` desugaring produces.
+            (
+                b"[1,2,3,4,5]",
+                "[.[(0,1):(3,4)]]",
+                Ok("[[1,2,3],[1,2,3,4],[2,3],[2,3,4]]"),
+            ),
+            // `path()`, `del()` and `|=` all round-trip through a computed
+            // slice, the same as they do through a computed key.
+            (
+                br#"{"a":[1,2,3],"k1":0,"k2":2}"#,
+                "path(.a[.k1:.k2])",
+                Ok(r#"["a",{"start":0,"end":2}]"#),
+            ),
+            (
+                br#"{"a":[1,2,3],"k1":0,"k2":2}"#,
+                "del(.a[.k1:.k2])",
+                Ok(r#"{"a":[3],"k1":0,"k2":2}"#),
+            ),
+            (
+                br#"{"a":[1,2,3],"k1":0,"k2":2}"#,
+                ".a[.k1:.k2] |= map(.*10)",
+                Ok(r#"{"a":[10,20,3],"k1":0,"k2":2}"#),
+            ),
+            // A dynamic slice can be a mid-chain component, not just the
+            // final one — including under `?`, which (unlike the fully
+            // static `.a[1:2]?[0]` shape — a separate, pre-existing gap)
+            // goes through the computed-key prepass and so has its
+            // `Expr::Optional` wrapper stripped before `set_path` runs.
+            (
+                br#"{"a":[1,2,3,4],"k1":0,"k2":2}"#,
+                ".a[.k1:.k2][0] = 9",
+                Ok(r#"{"a":[9,2,3,4],"k1":0,"k2":2}"#),
+            ),
+            (
+                br#"{"a":[1,2,3,4],"k1":0,"k2":2}"#,
+                ".a[.k1:.k2]?[0] = 9",
+                Ok(r#"{"a":[9,2,3,4],"k1":0,"k2":2}"#),
+            ),
+        ]);
+    }
+
+    /// #499: `needs_path_context` mirrors `IndexExpr`'s target/key check
+    /// (#360) for a computed slice's target and both bounds — a `path`/
+    /// `parent`/`key` builtin (yq's no-arg path-context extensions) hiding in
+    /// any of the three must still be found, or `eval_pipe` would run the
+    /// pipe without the path context those builtins read.
+    #[test]
+    fn test_needs_path_context_descends_into_slice_expr() {
+        let path_ctx = Expr::Builtin(Builtin::PathNoArg);
+        let plain = Expr::Literal(Literal::Int(0));
+
+        // Hidden in the target.
+        assert!(needs_path_context(&Expr::slice_by(
+            path_ctx.clone(),
+            Some(plain.clone()),
+            Some(plain.clone()),
+        )));
+        // Hidden in the start bound (target and end plain).
+        assert!(needs_path_context(&Expr::slice_by(
+            Expr::Identity,
+            Some(path_ctx.clone()),
+            Some(plain.clone()),
+        )));
+        // Hidden in the end bound (target and start plain).
+        assert!(needs_path_context(&Expr::slice_by(
+            Expr::Identity,
+            Some(plain.clone()),
+            Some(path_ctx),
+        )));
+        // None of the three need it.
+        assert!(!needs_path_context(&Expr::slice_by(
+            Expr::Identity,
+            Some(plain.clone()),
+            Some(plain),
+        )));
+    }
+
+    /// #499: `eval_slice_expr` (plain reads, no `=`/`|=`/`path()`/`del()`)
+    /// covering the shapes `test_computed_slice_bounds` doesn't reach — every
+    /// case there goes through path resolution (`resolve_slice_expr`), a
+    /// separate function with its own copy of this logic, so none of it
+    /// exercised the read-mode evaluator at all. `(0+0)`/`(2+0)` stand in for
+    /// a bound that must stay dynamic; a bare `(0)`/`(2)` folds back to the
+    /// literal `Expr::Slice` fast path (`test_slice_bounds_accept_the_same_
+    /// spellings`) and would silently test the wrong code entirely. Every
+    /// case was checked against jq 1.7.1 directly.
+    #[test]
+    fn test_computed_slice_bounds_read_mode() {
+        assert_outcomes(&[
+            // Fast path: a resolved `(0, None)` bound still returns the
+            // target unchanged, same as the literal `.[0:]` shape.
+            (b"[1,2,3,4,5]", ".[(0+0):]", Ok("[1,2,3,4,5]")),
+            // A bound that's a plain field read, not an arithmetic
+            // expression — unlike every `(n+0)` bound elsewhere in this
+            // test, this resolves to a *borrowed* value straight from the
+            // document rather than a freshly computed owned one.
+            (
+                br#"{"a":[1,2,3,4,5],"k1":1,"k2":3}"#,
+                ".a[.k1:.k2]",
+                Ok("[2,3]"),
+            ),
+            // A bound that fans out to more than one borrowed value.
+            (
+                br#"{"a":[1,2,3,4,5],"x":0,"y":1}"#,
+                "[.a[(.x,.y):(3+0)]]",
+                Ok("[[1,2,3],[2,3]]"),
+            ),
+            // A borrowed target that slices to `null` (slicing `null` is
+            // always `null`) and one that fails to slice at all.
+            (br#"{"a":null}"#, ".a[(0+0):(2+0)]", Ok("null")),
+            (
+                br#"{"a":5}"#,
+                ".a[(0+0):(2+0)]",
+                Err("Cannot index number with object"),
+            ),
+            // The same borrowed failure, but `?`-guarded: the slice attempt
+            // is pruned rather than propagated — the borrowed-value
+            // counterpart to the owned-boolean case below.
+            (br#"{"a":5}"#, ".a[(0+0):(2+0)]?", Ok("")),
+            // The target's own evaluation can fail before slicing is ever
+            // attempted — distinct from the case above, where `.a` resolves
+            // fine and it's the slice application that fails.
+            (
+                b"5",
+                ".a[(0+0):(2+0)]",
+                Err(r#"Cannot index number with string "a""#),
+            ),
+            // A target that fans out to more than one borrowed value.
+            (
+                br#"{"a":[1,2,3],"b":[4,5,6]}"#,
+                "[(.a,.b)[(0+0):(2+0)]]",
+                Ok("[[1,2],[4,5]]"),
+            ),
+            // An owned target (freshly constructed, not borrowed from the
+            // document): single value, then a fan-out of several.
+            (b"null", "([1,2,3])[(0+0):(2+0)]", Ok("[1,2]")),
+            (
+                b"null",
+                "[([1,2,3],[4,5,6])[(0+0):(2+0)]]",
+                Ok("[[1,2],[4,5]]"),
+            ),
+            // A target with no output at all.
+            (b"null", "empty[(0+0):(2+0)]", Ok("")),
+            // A target that breaks out of an enclosing label — the whole
+            // slice contributes nothing, same as `IndexExpr`'s identically
+            // conservative target handling (see `eval_index_expr`'s key
+            // stream, which this mirrors).
+            (b"null", "label $out | (break $out)[(0+0):(2+0)]", Ok("")),
+            (
+                b"null",
+                "label $out | (1,2,break $out)[(0+0):(2+0)]",
+                Ok(""),
+            ),
+            // A target whose stream errors part-way through: the error wins,
+            // and (like the break case above) the values already produced
+            // are not carried forward — the same conservative trade-off
+            // `eval_index_expr` already makes for its key/target streams.
+            (b"null", "(1,2,error(\"boom\"))[(0+0):(2+0)]", Err("boom")),
+            // Owned targets of every slice-able kind, plus the two ways an
+            // unsliceable one is refused.
+            (b"null", "(null)[(0+0):(2+0)]", Ok("null")),
+            (b"null", r#"("hello")[(0+0):(2+0)]"#, Ok(r#""he""#)),
+            (b"null", "(true)[(0+0):(2+0)]?", Ok("")),
+            (
+                b"null",
+                "(true)[(0+0):(2+0)]",
+                Err("Cannot index boolean with object"),
+            ),
+            // A start-bound evaluation failure, and the same on the end
+            // bound — each is its own call site in `eval_slice_expr`.
+            (
+                b"[1,2,3]",
+                r".[(.x+0):(2+0)]",
+                Err(r#"Cannot index array with string "x""#),
+            ),
+            (
+                b"[1,2,3]",
+                r".[(0+0):(.x+0)]",
+                Err(r#"Cannot index array with string "x""#),
+            ),
+            // A `break` from inside a bound must reach the enclosing label
+            // as a real break, not a synthetic "not in label" error — on
+            // both the start and the end bound.
+            (b"[1,2,3]", "label $out | .[(break $out):(2+0)]", Ok("")),
+            (b"[1,2,3]", "label $out | .[(0+0):(break $out)]", Ok("")),
+            // A bound whose stream breaks (or errors) after already
+            // producing values: same conservative trade-off as the target
+            // case above, applied to the bound stream instead.
+            (b"[1,2,3]", "label $out | .[(1,2,break $out):(2+0)]", Ok("")),
+            (b"[1,2,3]", r#".[(1,2,error("boom")):(2+0)]"#, Err("boom")),
+        ]);
+    }
+
+    /// #499: `resolve_slice_expr`/`resolve_slice_bound` (the path-mode
+    /// evaluator behind `=`, `|=`, `path()`, `del()`) shapes
+    /// `test_computed_slice_bounds` doesn't reach: every bound there either
+    /// resolves to a number or fails to *evaluate* at all, so the
+    /// empty-bound-stream short-circuit and the "resolved bounds don't apply
+    /// to this target" refusal never ran. Checked against jq 1.7.1 directly.
+    #[test]
+    fn test_computed_slice_bounds_path_mode_edge_cases() {
+        assert_outcomes(&[
+            // An empty start (or end) bound stream in path mode is a no-op,
+            // the same short-circuit `test_computed_slice_bounds` already
+            // covers for read mode.
+            (
+                br#"{"a":[1,2,3]}"#,
+                r#".a[empty:2] = ["x"]"#,
+                Ok(r#"{"a":[1,2,3]}"#),
+            ),
+            (
+                br#"{"a":[1,2,3]}"#,
+                r#".a[0:empty] = ["x"]"#,
+                Ok(r#"{"a":[1,2,3]}"#),
+            ),
+            // An omitted bound alongside a dynamic one on the other side —
+            // "open on this side" in path mode, same as read mode.
+            (
+                br#"{"a":[1,2,3,4,5],"k2":3}"#,
+                r#".a[:.k2] = ["x"]"#,
+                Ok(r#"{"a":["x",4,5],"k2":3}"#),
+            ),
+            (
+                br#"{"a":[1,2,3,4,5],"k1":2}"#,
+                r#".a[.k1:] = ["x"]"#,
+                Ok(r#"{"a":[1,2,"x"],"k1":2}"#),
+            ),
+            // Resolved bounds that reach an unsliceable target: `?` prunes
+            // just that branch, and its absence propagates the error — the
+            // same two spellings `resolve_index_expr` distinguishes for a
+            // computed key.
+            (b"5", r#".[(0+0):(2+0)]? = ["x"]"#, Ok("5")),
+            (
+                b"5",
+                r#".[(0+0):(2+0)] = ["x"]"#,
+                Err("Cannot index number with object"),
+            ),
+        ]);
+    }
+
+    /// #499: a computed slice's target and bounds must round-trip through
+    /// user-defined function expansion (`expand_func_calls`/
+    /// `substitute_func_param`) the same way `IndexExpr`'s target/key already
+    /// do — a call or parameter hiding in any of the three must still be
+    /// found and substituted.
+    #[test]
+    fn test_computed_slice_bounds_in_user_defined_functions() {
+        assert_outcomes(&[
+            // A function parameter used as a dynamic bound.
+            (b"[1,2,3,4]", "def f($n): .[$n:3]; f(1)", Ok("[2,3]")),
+            // A recursive-call site hiding in the bound of a different
+            // slice, and in its target.
+            (b"[1,2,3,4]", "def f: 1; .[(f):(3)]", Ok("[2,3]")),
+            (
+                br#"{"a":[1,2,3,4]}"#,
+                "def f: .a; (f)[(1):(3)]",
+                Ok("[2,3]"),
+            ),
+            (b"[1,2,3,4]", "def f: 3; .[(1):(f)]", Ok("[2,3]")),
+        ]);
+    }
+
     #[test]
     fn test_set_path_and_get_path_mut_autovivify_null_directly() {
         // Direct-function coverage for the three walkers `autovivify_object`/
@@ -23322,6 +25776,58 @@ mod tests {
         for filter in [r"del(.a.b)", r"del(.[0].a)", r"del(.[0:2].a)"] {
             query!(br"null", filter,
                 QueryResult::Owned(OwnedValue::Null) => {}
+            );
+        }
+    }
+
+    #[test]
+    fn test_del_through_an_out_of_range_index_still_raises_on_an_iterate_tail() {
+        // #529: an out-of-range index (positive, negative, or into an empty
+        // array) reads as `null` just like a missing field does (#527), and
+        // jq keeps walking the rest of the path against that `null` — so a
+        // `[]` tail still raises `Cannot iterate over null (null)` even
+        // though every other tail stays a no-op. Both `[1,2]`'s single-path
+        // walker (`delete_at_path`) and its grouped/comma walker
+        // (`delete_expr_array_paths`) must agree.
+        for (json, filter) in [
+            (&br"[1,2]"[..], r"del(.[5][])"),
+            (&br#"{"a":[1,2]}"#[..], r"del(.a[5][])"),
+            (&br"[1,2]"[..], r"del(.[-5][])"),
+            (&br"[]"[..], r"del(.[0][])"),
+            (&br#"{"a":[]}"#[..], r"del(.a[0][])"),
+            // The `[]` can sit further down than the very next component.
+            (&br"[1,2]"[..], r"del(.[5].c[])"),
+            (&br"[1,2]"[..], r"del(.[5][1:2][])"),
+            // A `?` on the out-of-range step does not suppress what the tail
+            // itself raises.
+            (&br"[1,2]"[..], r"del(.[5]?[])"),
+            // Grouped/comma spelling must land the same as the single path.
+            (&br"[1,2]"[..], r"del(.[5][], .[6][])"),
+        ] {
+            query!(json, filter,
+                QueryResult::Error(e) => {
+                    assert_eq!(e.message, "Cannot iterate over null (null)", "`{filter}`");
+                }
+            );
+        }
+        // `?` on the iterate step itself does suppress it.
+        query!(br"[1,2]", r"del(.[5][]?)",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr, vec![OwnedValue::Int(1), OwnedValue::Int(2)]);
+            }
+        );
+        // Every other tail keeps the #477 no-op it already had, single-path
+        // and grouped alike.
+        for filter in [
+            r"del(.[5])",
+            r"del(.[5].a)",
+            r"del(.[-5])",
+            r"del(.[5], .[6])",
+        ] {
+            query!(br"[1,2]", filter,
+                QueryResult::Owned(OwnedValue::Array(arr)) => {
+                    assert_eq!(arr, vec![OwnedValue::Int(1), OwnedValue::Int(2)], "`{filter}`");
+                }
             );
         }
     }
@@ -25133,6 +27639,92 @@ mod tests {
         #[cfg(debug_assertions)]
         #[should_panic(expected = "unresolved computed index reached path tracking")]
         fn test_path_tracking_refuses_an_unresolved_key_mid_pipe() {
+            let mut reached = Vec::new();
+            let pipe = Expr::Pipe(vec![unresolved(), Expr::Field("a".to_string())]);
+            let _ = walk_path::<JqSemantics>(&pipe, &OwnedValue::Null, &[], &mut reached, false);
+        }
+    }
+
+    // ========== #499: the unresolved-computed-slice guards ==========
+
+    /// Same reasoning as [`computed_key_guards`], one level up: every path
+    /// walker refuses an unresolved [`Expr::SliceExpr`] just as loudly as it
+    /// refuses an unresolved [`Expr::IndexExpr`], and for the same reason —
+    /// [`resolve_dynamic_indexes`] rewrites a computed slice into its static
+    /// components before any of these run, so a hit here means a new path
+    /// context was wired up without going through that pre-pass.
+    mod computed_slice_guards {
+        use super::*;
+
+        /// `.[$a:$b]` left unresolved — what each walker below is handed.
+        fn unresolved() -> Expr {
+            Expr::slice_by(
+                Expr::Identity,
+                Some(Expr::Var("a".to_string())),
+                Some(Expr::Var("b".to_string())),
+            )
+        }
+
+        #[test]
+        fn test_set_path_refuses_an_unresolved_slice() {
+            let mut root = OwnedValue::Null;
+            let err = set_path(&mut root, &unresolved(), OwnedValue::Int(1)).unwrap_err();
+            assert_eq!(
+                err.message,
+                "internal error: unresolved computed slice in assignment path"
+            );
+        }
+
+        #[test]
+        fn test_get_path_mut_refuses_an_unresolved_slice() {
+            let mut root = OwnedValue::Null;
+            let err = get_path_mut(&mut root, &[unresolved()]).unwrap_err();
+            assert_eq!(
+                err.message,
+                "internal error: unresolved computed slice in path component"
+            );
+        }
+
+        #[test]
+        fn test_update_path_refuses_an_unresolved_slice() {
+            let mut root = OwnedValue::Null;
+            let err = update_path::<JqSemantics>(&mut root, &unresolved(), &Expr::Identity, false)
+                .unwrap_err();
+            assert_eq!(
+                err.message,
+                "internal error: unresolved computed slice in update path"
+            );
+        }
+
+        #[test]
+        fn test_delete_at_path_refuses_an_unresolved_slice() {
+            let mut root = OwnedValue::Null;
+            let err = delete_at_path(&mut root, &unresolved(), false).unwrap_err();
+            assert_eq!(
+                err.message,
+                "internal error: unresolved computed slice in delete path"
+            );
+        }
+
+        #[test]
+        #[cfg(debug_assertions)]
+        #[should_panic(expected = "unresolved computed slice reached path tracking")]
+        fn test_path_tracking_refuses_an_unresolved_slice() {
+            let mut reached = Vec::new();
+            let _ = walk_path::<JqSemantics>(
+                &unresolved(),
+                &OwnedValue::Null,
+                &[],
+                &mut reached,
+                false,
+            );
+        }
+
+        /// The same guard reached mid-pipe rather than as the last step.
+        #[test]
+        #[cfg(debug_assertions)]
+        #[should_panic(expected = "unresolved computed slice reached path tracking")]
+        fn test_path_tracking_refuses_an_unresolved_slice_mid_pipe() {
             let mut reached = Vec::new();
             let pipe = Expr::Pipe(vec![unresolved(), Expr::Field("a".to_string())]);
             let _ = walk_path::<JqSemantics>(&pipe, &OwnedValue::Null, &[], &mut reached, false);

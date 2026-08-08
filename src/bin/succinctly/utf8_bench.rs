@@ -22,6 +22,63 @@ pub struct BenchmarkResult {
     pub valid: bool,
     pub wall_time_ms: f64,
     pub throughput_mib_s: f64,
+    #[serde(default)]
+    pub engine: String,
+}
+
+/// Which validation engine to time.
+///
+/// The realistic patterns in [`BenchConfig::default`] — `log_file`,
+/// `source_code`, `json_like`, `latin` and friends — are the arbiter for
+/// engine selection, because the synthetic Criterion groups only cover the
+/// extremes. Being able to point each engine at the same corpus is what makes
+/// that comparison possible on a single machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Engine {
+    /// Whatever `validate_utf8` dispatches to on this target.
+    Auto,
+    /// Portable byte-at-a-time reference validator.
+    Scalar,
+    /// Portable broadword ASCII skip with whole-sequence multi-byte validation.
+    Broadword,
+    /// `core::str::from_utf8` — the standard library's own validator.
+    Std,
+}
+
+impl Engine {
+    /// Parse an engine name, as accepted by `--engine`.
+    pub fn parse(name: &str) -> Result<Self> {
+        match name {
+            "auto" => Ok(Self::Auto),
+            "scalar" => Ok(Self::Scalar),
+            "broadword" => Ok(Self::Broadword),
+            "std" => Ok(Self::Std),
+            other => {
+                anyhow::bail!("unknown engine {other:?}: expected auto, scalar, broadword or std")
+            }
+        }
+    }
+
+    /// Name as it appears in `--engine` and in the result records.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Scalar => "scalar",
+            Self::Broadword => "broadword",
+            Self::Std => "std",
+        }
+    }
+
+    /// Validate `data`, returning whether it is well-formed UTF-8.
+    #[inline]
+    fn validate(self, data: &[u8]) -> bool {
+        match self {
+            Self::Auto => succinctly::text::utf8::validate_utf8(data).is_ok(),
+            Self::Scalar => succinctly::text::utf8::validate_utf8_scalar(data).is_ok(),
+            Self::Broadword => succinctly::text::utf8::validate_utf8_broadword(data).is_ok(),
+            Self::Std => std::str::from_utf8(data).is_ok(),
+        }
+    }
 }
 
 /// Configuration for the benchmark
@@ -32,6 +89,8 @@ pub struct BenchConfig {
     pub sizes: Vec<String>,
     pub warmup_runs: usize,
     pub benchmark_runs: usize,
+    /// Which validation engine to time.
+    pub engine: Engine,
 }
 
 impl Default for BenchConfig {
@@ -61,6 +120,7 @@ impl Default for BenchConfig {
             ],
             warmup_runs: 1,
             benchmark_runs: 3,
+            engine: Engine::Auto,
         }
     }
 }
@@ -86,6 +146,7 @@ pub fn run_benchmark(
     eprintln!("  Data directory: {}", config.data_dir.display());
     eprintln!("  Warmup runs: {}", config.warmup_runs);
     eprintln!("  Benchmark runs: {}", config.benchmark_runs);
+    eprintln!("  Engine: {}", config.engine.name());
     eprintln!();
 
     // Open JSONL file for streaming output if requested
@@ -177,7 +238,7 @@ fn benchmark_file(file_path: &Path, config: &BenchConfig) -> Result<BenchmarkRes
 
     // Warmup
     for _ in 0..config.warmup_runs {
-        let _ = succinctly::text::utf8::validate_utf8(&data);
+        let _ = config.engine.validate(&data);
     }
 
     // Benchmark
@@ -185,7 +246,7 @@ fn benchmark_file(file_path: &Path, config: &BenchConfig) -> Result<BenchmarkRes
     let mut valid = false;
     for _ in 0..config.benchmark_runs {
         let start = Instant::now();
-        valid = succinctly::text::utf8::validate_utf8(&data).is_ok();
+        valid = config.engine.validate(&data);
         times.push(start.elapsed().as_secs_f64() * 1000.0);
     }
     times.sort_by(|a, b| a.partial_cmp(b).unwrap());
@@ -202,6 +263,7 @@ fn benchmark_file(file_path: &Path, config: &BenchConfig) -> Result<BenchmarkRes
         valid,
         wall_time_ms: median,
         throughput_mib_s: throughput,
+        engine: config.engine.name().to_string(),
     })
 }
 
@@ -256,6 +318,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn engine_parse_accepts_every_documented_name_and_round_trips_through_name() {
+        for (input, expected) in [
+            ("auto", Engine::Auto),
+            ("scalar", Engine::Scalar),
+            ("broadword", Engine::Broadword),
+            ("std", Engine::Std),
+        ] {
+            let parsed = Engine::parse(input).expect("documented engine name");
+            assert_eq!(parsed, expected);
+            assert_eq!(parsed.name(), input);
+        }
+    }
+
+    #[test]
+    fn engine_parse_rejects_unknown_names() {
+        let err = Engine::parse("avx2").unwrap_err();
+        assert!(
+            err.to_string().contains("avx2"),
+            "error should name the bad input: {err}"
+        );
+    }
+
+    #[test]
     fn test_format_bytes() {
         assert_eq!(format_bytes(512), "512 B");
         assert_eq!(format_bytes(1024), "1.00 KB");
@@ -274,6 +359,7 @@ mod tests {
                 valid: true,
                 wall_time_ms: 0.5,
                 throughput_mib_s: 2000.0,
+                engine: "auto".into(),
             },
             BenchmarkResult {
                 file: "mixed-1kb.txt".into(),
@@ -283,6 +369,7 @@ mod tests {
                 valid: true,
                 wall_time_ms: 0.7,
                 throughput_mib_s: 1400.0,
+                engine: "auto".into(),
             },
         ];
 

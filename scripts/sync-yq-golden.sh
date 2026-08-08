@@ -8,6 +8,11 @@
 # would enshrine succinctly's bugs as "correct" and reduce the suite to a
 # regression test with no oracle value.
 #
+# A case where yq rejects the input additionally gets expected.status (its
+# exit code) and expected.err (its stderr) instead of a passing expected.out,
+# so a case that exercises input yq refuses to process has an oracle for that
+# too.
+#
 # Usage:
 #   ./scripts/sync-yq-golden.sh              # regenerate expected.out files
 #   ./scripts/sync-yq-golden.sh --check      # verify goldens match pinned yq
@@ -52,25 +57,62 @@ for dir in "$GOLDEN_DIR"/cases/*/; do
   done
 
   # One CLI arg per line; blank lines ignored. (bash 3.2 compatible — no mapfile.)
+  #
+  # `|| [[ -n "$arg" ]]` keeps a last line with no trailing newline: `read`
+  # returns non-zero on it, so a plain `while read` loop would silently drop
+  # it, while the Rust loader's `.lines()` keeps it — the two disagreeing
+  # would capture a golden with the args omitted, then compare it against a
+  # run that applied them.
   args=()
-  while IFS= read -r arg; do
+  while IFS= read -r arg || [[ -n "$arg" ]]; do
     [[ -n "$arg" ]] && args+=("$arg")
   done < "$dir/args"
   filter="$(cat "$dir/filter")"
 
-  yq "${args[@]}" "$filter" < "$dir/input.yaml" > "$work_dir/out" || {
-    echo "error: yq failed on case $name" >&2
-    exit 1
-  }
+  # `${args[@]+...}` guards the empty-array case under `set -u` on bash 3.2
+  # (macOS), where a case with no CLI args would otherwise trip "unbound
+  # variable".
+  # A non-zero exit is a legitimate fixture, not a script failure: a case
+  # that exercises input yq rejects captures yq's exit code and stderr too,
+  # and those are the only oracle for a failure — neither reaches stdout.
+  set +e
+  yq ${args[@]+"${args[@]}"} "$filter" < "$dir/input.yaml" \
+    > "$work_dir/out" 2> "$work_dir/err"
+  status=$?
+  set -e
 
   if $check_only; then
     if ! diff -u "$dir/expected.out" "$work_dir/out"; then
       echo "error: case $name expected.out does not match yq $PIN" >&2
       stale=$((stale + 1))
     fi
+    if [[ $status -eq 0 ]]; then
+      if [[ -f "$dir/expected.status" || -f "$dir/expected.err" ]]; then
+        echo "error: case $name now passes under yq $PIN but has expected.status/err" >&2
+        stale=$((stale + 1))
+      fi
+    else
+      if [[ "$(cat "$dir/expected.status" 2>/dev/null)" != "$status" ]]; then
+        echo "error: case $name exits $status under yq $PIN, expected.status says" \
+             "$(cat "$dir/expected.status" 2>/dev/null || echo '<missing>')" >&2
+        stale=$((stale + 1))
+      fi
+      if ! diff -u "$dir/expected.err" "$work_dir/err" 2>/dev/null; then
+        echo "error: case $name expected.err does not match yq $PIN" >&2
+        stale=$((stale + 1))
+      fi
+    fi
   else
     cp "$work_dir/out" "$dir/expected.out"
-    echo "wrote cases/$name/expected.out" >&2
+    if [[ $status -eq 0 ]]; then
+      # A case that used to fail and now passes sheds its failure fixtures.
+      rm -f "$dir/expected.status" "$dir/expected.err"
+      echo "wrote cases/$name/expected.out" >&2
+    else
+      echo "$status" > "$dir/expected.status"
+      cp "$work_dir/err" "$dir/expected.err"
+      echo "wrote cases/$name/expected.{out,err,status} (yq exit $status)" >&2
+    fi
   fi
 done
 

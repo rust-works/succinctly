@@ -157,13 +157,16 @@ fn generate_anchor_heavy(pairs: usize) -> Vec<u8> {
             // Medium anchor names (16-24 chars)
             yaml.extend_from_slice(format!("setting_{i}: &anchor_medium_{i} val{i}\n").as_bytes());
         } else {
-            // Reference previous anchors with aliases
-            let ref_idx = i.saturating_sub(3);
-            if ref_idx % 3 == 0 {
+            // Reference previous anchors with aliases. i % 3 == 2 here, so
+            // i - 1 (i%3==1, medium) and i - 2 (i%3==0, long) are always the
+            // two immediately preceding *definitions*, never references.
+            if (i / 3) % 2 == 0 {
+                let ref_idx = i - 2;
                 yaml.extend_from_slice(
                     format!("ref_{i}: *config_anchor_very_long_name_{ref_idx}\n").as_bytes(),
                 );
             } else {
+                let ref_idx = i - 1;
                 yaml.extend_from_slice(format!("ref_{i}: *anchor_medium_{ref_idx}\n").as_bytes());
             }
         }
@@ -466,6 +469,54 @@ fn bench_prose_scalars(c: &mut Criterion) {
     group.finish();
 }
 
+/// Rewrite every LF as a CRLF, as `tests/yaml_crlf_tests.rs` does.
+fn to_crlf(yaml: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(yaml.len() + yaml.len() / 16);
+    for &b in yaml {
+        if b == b'\n' {
+            out.push(b'\r');
+        }
+        out.push(b);
+    }
+    out
+}
+
+/// The CRLF arm of the `HAS_CR` specialization (#340).
+///
+/// Every other generator in this file emits LF only, so without this group the
+/// `HAS_CR == true` path is not measured at all — and "all benchmarks neutral"
+/// is not evidence about a shape the suite does not generate (see
+/// `docs/guides/benchmarking.md` § A/B, rule 7). These cases exist to show that
+/// CRLF documents did not *lose* anything to the specialization; the LF-only
+/// gain is what the other groups measure.
+///
+/// Deliberately not a full mirror of the suite: the CR path is the #324 parser
+/// unchanged, so a representative slice of the shapes whose LF counterparts moved
+/// most is what is worth the bench time.
+fn bench_crlf(c: &mut Criterion) {
+    let mut group = c.benchmark_group("yaml/crlf");
+
+    let cases: [(&str, Vec<u8>); 4] = [
+        ("simple_kv/1000", generate_simple_kv(1000)),
+        ("sequences/1000", generate_sequence(1000)),
+        ("large/100kb", generate_mixed_yaml(100_000)),
+        ("large/1mb", generate_mixed_yaml(1_000_000)),
+    ];
+
+    for (label, lf) in &cases {
+        let yaml = to_crlf(lf);
+        group.throughput(Throughput::Bytes(yaml.len() as u64));
+        group.bench_with_input(BenchmarkId::from_parameter(label), &yaml, |b, yaml| {
+            b.iter(|| {
+                let index = YamlIndex::build(black_box(yaml)).unwrap();
+                black_box(index)
+            });
+        });
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_simple_kv,
@@ -477,5 +528,6 @@ criterion_group!(
     bench_block_scalars,
     bench_anchors,
     bench_prose_scalars,
+    bench_crlf,
 );
 criterion_main!(benches);

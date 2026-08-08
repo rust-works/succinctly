@@ -1,4 +1,4 @@
-# omni-dev Commit Guidelines
+# succinctly Commit Guidelines
 
 This project follows conventional commit format with specific requirements.
 
@@ -39,27 +39,16 @@ Required. Must be one of:
 
 ## Scopes
 
-Required. `.omni-dev/scopes.yaml` is authoritative; this list mirrors it and must
-be updated alongside it:
-
-- `bitvec` - Bitvector data structure and rank/select operations
-- `bp` - Balanced parentheses tree navigation
-- `json` - JSON semi-indexing and parsing
-- `yaml` - YAML semi-indexing and parsing
-- `jq` - jq query language parser and evaluator
-- `simd` - SIMD optimizations (x86, AVX2, NEON)
-- `cli` - Command-line interface tool
-- `bench` - Benchmarks and performance testing
-- `test` - Test suite and property tests
-- `docs` - Documentation and optimization notes
-- `ci` - CI/CD pipelines and GitHub Actions
-- `build` - Build configuration and feature flags
-- `scripts` - Developer and repository maintenance shell scripts
-- `core` - Core utilities (broadword, tables, binary ops)
+Required. See [`.omni-dev/scopes.yaml`](scopes.yaml) for the canonical, enforced
+list — do not duplicate it here. `omni-dev` also silently accepts a handful of
+ecosystem-default scopes not listed there (for this repo: `cargo`, `lib`); run
+`omni-dev git commit message lint --verbose` to see the full resolved set.
 
 ## Subject Line
 
-- Keep under 72 characters total
+- Keep under 100 characters total (enforced by `.omni-dev/commit-rules.yaml`'s
+  `subject_max_len`; `omni-dev git commit message lint` is the source of truth if
+  this drifts)
 - Use imperative mood: "add feature" not "added feature" or "adds feature"
 - Be specific: avoid vague terms like "update", "fix stuff", "changes"
 
@@ -102,24 +91,24 @@ fix(cli): handle missing config file gracefully
 
 ### Feature with body
 ```
-feat(claude): add contextual intelligence for commit message improvement
+feat(yaml): stream YAML directly to JSON output
 
-Implements Phase 3 of the twiddle command enhancement with multi-layer
-context discovery including project conventions, branch analysis, and
-work pattern detection.
+Eliminates the intermediate OwnedValue DOM by streaming directly from
+the YAML cursor to JSON, avoiding a full in-memory materialization
+pass before output.
 
-- Add project context discovery from .omni-dev/ configuration
-- Implement branch naming pattern analysis
-- Add work pattern detection across commit ranges
-- Enhance Claude prompting with contextual intelligence
+- Add single-pass escape transcoding for string values
+- Wire the streaming path into the yq CLI identity query
+- Update benchmarks to reflect the new throughput
 
 Closes #12
 ```
 
 ### Breaking change
 ```
-feat(api)!: change amendment response format to YAML
+feat(jq)!: change tostream event shape to match jq's [path,value] form
 
-BREAKING CHANGE: The amendment API now returns YAML instead of JSON.
-Update clients to use a YAML parser for response handling.
+BREAKING CHANGE: tostream now emits jq's standard [path,value]/[path]
+event pairs instead of the previous non-standard shape. Update callers
+that pattern-match on tostream output.
 ```

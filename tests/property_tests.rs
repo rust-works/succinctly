@@ -136,6 +136,59 @@ proptest! {
         prop_assert!(bv.select1(ones + 1).is_none(), "select1({}) should be None", ones + 1);
     }
 
+    /// Galois connection: rank0(select0(k) + 1) == k + 1
+    #[test]
+    fn rank_select0_galois_connection(words in prop::collection::vec(0u64..u64::MAX, 1..30)) {
+        let len = words.len() * 64;
+        let bv = BitVec::from_words(words, len);
+        let zeros = bv.count_zeros();
+
+        for k in 0..zeros.min(100) {
+            if let Some(pos) = bv.select0(k) {
+                // The bit at pos should be a 0
+                prop_assert!(!bv.get(pos), "select0({}) = {} but bit is 1", k, pos);
+                // rank0(pos + 1) should equal k + 1
+                prop_assert_eq!(bv.rank0(pos + 1), k + 1,
+                    "rank0(select0({}) + 1) != {} + 1", k, k);
+            }
+        }
+    }
+
+    /// select0 returns positions in strictly increasing order
+    #[test]
+    fn select0_is_strictly_increasing(words in prop::collection::vec(0u64..u64::MAX, 1..20)) {
+        let len = words.len() * 64;
+        let bv = BitVec::from_words(words, len);
+        let zeros = bv.count_zeros();
+
+        let mut prev = None;
+        for k in 0..zeros.min(100) {
+            if let Some(pos) = bv.select0(k) {
+                if let Some(p) = prev {
+                    prop_assert!(pos > p, "select0({}) = {} <= select0({}) = {}", k, pos, k - 1, p);
+                }
+                prev = Some(pos);
+            }
+        }
+    }
+
+    /// select0(k) returns None iff k >= count_zeros
+    #[test]
+    fn select0_none_iff_k_ge_zeros(words in prop::collection::vec(any::<u64>(), 1..20)) {
+        let len = words.len() * 64;
+        let bv = BitVec::from_words(words, len);
+        let zeros = bv.count_zeros();
+
+        // Should succeed for k < zeros
+        for k in 0..zeros.min(10) {
+            prop_assert!(bv.select0(k).is_some(), "select0({}) should be Some", k);
+        }
+
+        // Should fail for k >= zeros
+        prop_assert!(bv.select0(zeros).is_none(), "select0({}) should be None", zeros);
+        prop_assert!(bv.select0(zeros + 1).is_none(), "select0({}) should be None", zeros + 1);
+    }
+
     /// Partial word masking works correctly
     #[test]
     fn partial_word_masking(
@@ -184,6 +237,22 @@ fn naive_select1(words: &[u64], len: usize, k: usize) -> Option<usize> {
     None
 }
 
+/// Naive select0 implementation for comparison
+fn naive_select0(words: &[u64], len: usize, k: usize) -> Option<usize> {
+    let mut count = 0;
+    for bit_pos in 0..len {
+        let word_idx = bit_pos / 64;
+        let bit_idx = bit_pos % 64;
+        if (words[word_idx] >> bit_idx) & 1 == 0 {
+            if count == k {
+                return Some(bit_pos);
+            }
+            count += 1;
+        }
+    }
+    None
+}
+
 proptest! {
     /// BitVec rank1 matches naive implementation
     #[test]
@@ -211,6 +280,20 @@ proptest! {
             let expected = naive_select1(&words, len, k);
             let actual = bv.select1(k);
             prop_assert_eq!(actual, expected, "select1({}) mismatch", k);
+        }
+    }
+
+    /// BitVec select0 matches naive implementation
+    #[test]
+    fn select0_matches_naive(words in prop::collection::vec(any::<u64>(), 1..20)) {
+        let len = words.len() * 64;
+        let bv = BitVec::from_words(words.clone(), len);
+        let zeros = bv.count_zeros();
+
+        for k in 0..zeros.min(50) {
+            let expected = naive_select0(&words, len, k);
+            let actual = bv.select0(k);
+            prop_assert_eq!(actual, expected, "select0({}) mismatch", k);
         }
     }
 }

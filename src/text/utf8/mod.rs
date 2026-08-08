@@ -29,6 +29,8 @@
 
 use alloc::string::String;
 
+use crate::util::broadword::{H8, L8};
+
 /// Error information for UTF-8 validation failures.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Utf8Error {
@@ -118,8 +120,13 @@ impl core::fmt::Display for Utf8ErrorKind {
 #[inline]
 pub fn validate_utf8(input: &[u8]) -> Result<(), Utf8Error> {
     // On x86_64 with runtime feature detection available (std or test), prefer
-    // the AVX2 fast path, which falls back to the scalar validator on any error
-    // (and on non-AVX2 hardware) so the reported `Utf8Error` is identical.
+    // the AVX2 fast path. Everywhere else — aarch64, wasm, riscv, and any
+    // `no_std` build — use the scalar validator, which already skips ASCII
+    // runs eight bytes at a time (#133). `validate_utf8_broadword` is available
+    // separately for callers who know their input is ASCII-dominant: measured
+    // against the current scalar validator it wins clearly on long ASCII runs
+    // but loses geometric mean across realistic mixed content, so it is not
+    // the default — see docs/benchmarks/utf8-validate.md#engine-comparison-134.
     #[cfg(all(target_arch = "x86_64", any(test, feature = "std")))]
     {
         validate_utf8_simd(input)
@@ -130,41 +137,35 @@ pub fn validate_utf8(input: &[u8]) -> Result<(), Utf8Error> {
     }
 }
 
-/// Validate UTF-8 using a scalar (byte-by-byte) algorithm.
+/// Validate UTF-8 using a portable scalar algorithm with a broadword (SWAR)
+/// ASCII fast path.
 ///
-/// This is a portable implementation that works on all platforms.
-/// It provides detailed error information including the exact byte offset,
-/// line number, and column position of any error.
+/// This is the only validation path on non-x86_64 targets, in `no_std` builds,
+/// on x86_64 CPUs without AVX2, and behind the CLI's `--no-simd`; on AVX2 hosts
+/// it also backs [`validate_utf8`]'s error reporting.
+///
+/// Runs of ASCII are skipped eight bytes at a time via `skip_ascii`, while
+/// multi-byte sequences are validated one character at a time. Errors carry the
+/// exact byte offset, line number, and column position, derived from the offset
+/// by `line_and_column` once an error is found — see its docs for why keeping
+/// that state off the hot path is exact rather than approximate.
 pub fn validate_utf8_scalar(input: &[u8]) -> Result<(), Utf8Error> {
     let mut pos = 0;
-    let mut line = 1;
-    let mut line_start = 0;
     let len = input.len();
 
     while pos < len {
         let byte = input[pos];
 
-        // Track newlines for error reporting
-        if pos > 0 && input[pos - 1] == b'\n' {
-            line += 1;
-            line_start = pos;
-        }
-
         // Determine sequence length from lead byte
         let seq_len = match byte {
-            // ASCII: 0x00-0x7F (single byte)
+            // ASCII: 0x00-0x7F (single byte). Skip the whole run at once.
             0x00..=0x7F => {
-                pos += 1;
+                pos = skip_ascii(input, pos + 1);
                 continue;
             }
             // Continuation bytes appearing as lead: invalid
             0x80..=0xBF => {
-                return Err(Utf8Error {
-                    offset: pos,
-                    line,
-                    column: pos - line_start + 1,
-                    kind: Utf8ErrorKind::InvalidLeadByte,
-                });
+                return Err(err_at(input, pos, Utf8ErrorKind::InvalidLeadByte));
             }
             // 2-byte sequence: 0xC0-0xDF
             0xC0..=0xDF => 2,
@@ -174,23 +175,13 @@ pub fn validate_utf8_scalar(input: &[u8]) -> Result<(), Utf8Error> {
             0xF0..=0xF7 => 4,
             // Invalid lead bytes: 0xF8-0xFF
             0xF8..=0xFF => {
-                return Err(Utf8Error {
-                    offset: pos,
-                    line,
-                    column: pos - line_start + 1,
-                    kind: Utf8ErrorKind::InvalidLeadByte,
-                });
+                return Err(err_at(input, pos, Utf8ErrorKind::InvalidLeadByte));
             }
         };
 
         // Check for truncation
         if pos + seq_len > len {
-            return Err(Utf8Error {
-                offset: pos,
-                line,
-                column: pos - line_start + 1,
-                kind: Utf8ErrorKind::TruncatedSequence,
-            });
+            return Err(err_at(input, pos, Utf8ErrorKind::TruncatedSequence));
         }
 
         // Validate continuation bytes and decode code point
@@ -198,24 +189,18 @@ pub fn validate_utf8_scalar(input: &[u8]) -> Result<(), Utf8Error> {
             2 => {
                 let b1 = input[pos + 1];
                 if !is_continuation_byte(b1) {
-                    return Err(Utf8Error {
-                        offset: pos + 1,
-                        line,
-                        column: pos + 1 - line_start + 1,
-                        kind: Utf8ErrorKind::InvalidContinuationByte,
-                    });
+                    return Err(err_at(
+                        input,
+                        pos + 1,
+                        Utf8ErrorKind::InvalidContinuationByte,
+                    ));
                 }
 
                 // Check for overlong encoding (code points < 0x80 must use 1 byte)
                 // 2-byte sequences must encode U+0080 or higher
                 // Lead byte 0xC0 or 0xC1 would encode < 0x80
                 if byte <= 0xC1 {
-                    return Err(Utf8Error {
-                        offset: pos,
-                        line,
-                        column: pos - line_start + 1,
-                        kind: Utf8ErrorKind::OverlongEncoding,
-                    });
+                    return Err(err_at(input, pos, Utf8ErrorKind::OverlongEncoding));
                 }
             }
             3 => {
@@ -223,20 +208,18 @@ pub fn validate_utf8_scalar(input: &[u8]) -> Result<(), Utf8Error> {
                 let b2 = input[pos + 2];
 
                 if !is_continuation_byte(b1) {
-                    return Err(Utf8Error {
-                        offset: pos + 1,
-                        line,
-                        column: pos + 1 - line_start + 1,
-                        kind: Utf8ErrorKind::InvalidContinuationByte,
-                    });
+                    return Err(err_at(
+                        input,
+                        pos + 1,
+                        Utf8ErrorKind::InvalidContinuationByte,
+                    ));
                 }
                 if !is_continuation_byte(b2) {
-                    return Err(Utf8Error {
-                        offset: pos + 2,
-                        line,
-                        column: pos + 2 - line_start + 1,
-                        kind: Utf8ErrorKind::InvalidContinuationByte,
-                    });
+                    return Err(err_at(
+                        input,
+                        pos + 2,
+                        Utf8ErrorKind::InvalidContinuationByte,
+                    ));
                 }
 
                 // Decode code point for validation
@@ -245,22 +228,12 @@ pub fn validate_utf8_scalar(input: &[u8]) -> Result<(), Utf8Error> {
 
                 // Check for overlong encoding (code points < 0x800 must use 2 bytes)
                 if cp < 0x800 {
-                    return Err(Utf8Error {
-                        offset: pos,
-                        line,
-                        column: pos - line_start + 1,
-                        kind: Utf8ErrorKind::OverlongEncoding,
-                    });
+                    return Err(err_at(input, pos, Utf8ErrorKind::OverlongEncoding));
                 }
 
                 // Check for surrogate code points (U+D800-U+DFFF)
                 if (0xD800..=0xDFFF).contains(&cp) {
-                    return Err(Utf8Error {
-                        offset: pos,
-                        line,
-                        column: pos - line_start + 1,
-                        kind: Utf8ErrorKind::SurrogateCodepoint,
-                    });
+                    return Err(err_at(input, pos, Utf8ErrorKind::SurrogateCodepoint));
                 }
             }
             4 => {
@@ -269,28 +242,25 @@ pub fn validate_utf8_scalar(input: &[u8]) -> Result<(), Utf8Error> {
                 let b3 = input[pos + 3];
 
                 if !is_continuation_byte(b1) {
-                    return Err(Utf8Error {
-                        offset: pos + 1,
-                        line,
-                        column: pos + 1 - line_start + 1,
-                        kind: Utf8ErrorKind::InvalidContinuationByte,
-                    });
+                    return Err(err_at(
+                        input,
+                        pos + 1,
+                        Utf8ErrorKind::InvalidContinuationByte,
+                    ));
                 }
                 if !is_continuation_byte(b2) {
-                    return Err(Utf8Error {
-                        offset: pos + 2,
-                        line,
-                        column: pos + 2 - line_start + 1,
-                        kind: Utf8ErrorKind::InvalidContinuationByte,
-                    });
+                    return Err(err_at(
+                        input,
+                        pos + 2,
+                        Utf8ErrorKind::InvalidContinuationByte,
+                    ));
                 }
                 if !is_continuation_byte(b3) {
-                    return Err(Utf8Error {
-                        offset: pos + 3,
-                        line,
-                        column: pos + 3 - line_start + 1,
-                        kind: Utf8ErrorKind::InvalidContinuationByte,
-                    });
+                    return Err(err_at(
+                        input,
+                        pos + 3,
+                        Utf8ErrorKind::InvalidContinuationByte,
+                    ));
                 }
 
                 // Decode code point for validation
@@ -301,22 +271,12 @@ pub fn validate_utf8_scalar(input: &[u8]) -> Result<(), Utf8Error> {
 
                 // Check for overlong encoding (code points < 0x10000 must use 3 bytes)
                 if cp < 0x10000 {
-                    return Err(Utf8Error {
-                        offset: pos,
-                        line,
-                        column: pos - line_start + 1,
-                        kind: Utf8ErrorKind::OverlongEncoding,
-                    });
+                    return Err(err_at(input, pos, Utf8ErrorKind::OverlongEncoding));
                 }
 
                 // Check for out of range (> U+10FFFF)
                 if cp > 0x10FFFF {
-                    return Err(Utf8Error {
-                        offset: pos,
-                        line,
-                        column: pos - line_start + 1,
-                        kind: Utf8ErrorKind::OutOfRangeCodepoint,
-                    });
+                    return Err(err_at(input, pos, Utf8ErrorKind::OutOfRangeCodepoint));
                 }
             }
             _ => unreachable!(),
@@ -326,6 +286,124 @@ pub fn validate_utf8_scalar(input: &[u8]) -> Result<(), Utf8Error> {
     }
 
     Ok(())
+}
+
+/// Advance past a run of ASCII bytes starting at `pos`, eight at a time.
+///
+/// Returns the index of the first non-ASCII byte at or after `pos`, or
+/// `input.len()` if the rest of the input is ASCII.
+///
+/// A byte is ASCII exactly when its high bit is clear, so a whole 8-byte word is
+/// ASCII iff `word & H8 == 0` — one load, one AND and one test per eight bytes
+/// instead of per byte. When the word does contain a non-ASCII byte, its index
+/// is `trailing_zeros() / 8`: `from_le_bytes` maps byte *k* to bits *8k..8k+7*
+/// on every host, so this is endian-independent.
+///
+/// The caller only reaches this from the ASCII arm of the lead-byte dispatch, so
+/// multi-byte-heavy input never executes the word loop at all.
+///
+/// `#[inline(never)]` is deliberate and measured. Inlining the word loop into the
+/// dispatch bloats the enclosing loop body and costs multi-byte-heavy input
+/// 5-12%: on an M4 Pro over three repetitions, the inlined form ranged from
+/// -10.6% to +11.8% against the byte-at-a-time baseline (regressing pure emoji in
+/// three of four runs), while keeping it out of line was faster on all twelve
+/// (benchmark, repetition) pairs, median -13.0%. The call is amortised over a
+/// whole ASCII run, so the ASCII path gives up under 1% for it.
+#[inline(never)]
+fn skip_ascii(input: &[u8], mut pos: usize) -> usize {
+    let len = input.len();
+
+    while pos + 8 <= len {
+        let word = u64::from_le_bytes(input[pos..pos + 8].try_into().unwrap());
+        let non_ascii = word & H8;
+        if non_ascii != 0 {
+            return pos + (non_ascii.trailing_zeros() as usize >> 3);
+        }
+        pos += 8;
+    }
+
+    // Fewer than 8 bytes left: finish byte-at-a-time.
+    while pos < len && input[pos] < 0x80 {
+        pos += 1;
+    }
+    pos
+}
+
+/// Build a [`Utf8Error`] for `offset`, resolving its line and column.
+///
+/// Marked `#[cold]` so the optimizer lays this out away from the validation loop
+/// and keeps `line`/`column` bookkeeping out of the hot path entirely.
+#[cold]
+#[inline(never)]
+fn err_at(input: &[u8], offset: usize, kind: Utf8ErrorKind) -> Utf8Error {
+    let (line, column) = line_and_column(input, offset);
+    Utf8Error {
+        offset,
+        line,
+        column,
+        kind,
+    }
+}
+
+/// The 1-indexed line and column (in bytes) of `offset` within `input`.
+///
+/// Called only when validation has already failed, so this single backward-
+/// looking scan replaces per-byte `line`/`line_start` bookkeeping in the hot
+/// loop. That substitution is exact, not approximate:
+///
+/// - The line of `offset` is `1 + (newlines in input[..offset])`, because `\n` is
+///   a one-byte character and so is always counted exactly once.
+/// - Errors reported at `pos + k` inside a multi-byte sequence still resolve to
+///   the same line as the sequence start `pos`: `input[pos]` is a lead byte
+///   (`>= 0xC0`) and `input[pos + 1..pos + k]` have already been checked as
+///   continuation bytes (`0x80..=0xBF`), so no `\n` can occur between them.
+///
+/// Newlines are located eight bytes at a time by XORing against a broadcast `\n`
+/// — turning every match into a zero byte — and then applying an exact broadword
+/// zero-byte test.
+fn line_and_column(input: &[u8], offset: usize) -> (usize, usize) {
+    /// `\n` broadcast to all eight byte lanes.
+    const NEWLINES: u64 = L8.wrapping_mul(b'\n' as u64);
+    /// The low seven bits of each byte lane (the complement of [`H8`]).
+    const LOW7: u64 = !H8;
+
+    let prefix = &input[..offset];
+    let mut line = 1;
+    let mut line_start = 0;
+    let mut pos = 0;
+
+    while pos + 8 <= prefix.len() {
+        let word = u64::from_le_bytes(prefix[pos..pos + 8].try_into().unwrap());
+        let zeros = word ^ NEWLINES;
+
+        // Exact per-byte zero test: `(b & 0x7F) + 0x7F` sets a byte's high bit
+        // iff its low seven bits are non-zero, and OR-ing `b` back in covers the
+        // high bit, so the negation leaves a set high bit exactly where a byte
+        // was zero. Because `(b & 0x7F) + 0x7F <= 0xFE`, no carry escapes a lane.
+        //
+        // The cheaper `(x - L8) & !x & H8` form is *not* usable here: it answers
+        // "does this word contain a zero byte?" correctly, but borrow
+        // propagation also flags the byte following a zero byte when that byte
+        // is 0x01 — i.e. a `\n` followed by `\v` — which would over-count lines.
+        let mask = !((zeros & LOW7).wrapping_add(LOW7) | zeros) & H8;
+
+        if mask != 0 {
+            // Exactly one bit is set per newline byte, so popcount is the count;
+            // the highest set bit locates the last newline in the word.
+            line += mask.count_ones() as usize;
+            line_start = pos + (63 - mask.leading_zeros() as usize) / 8 + 1;
+        }
+        pos += 8;
+    }
+
+    for (i, &byte) in prefix[pos..].iter().enumerate() {
+        if byte == b'\n' {
+            line += 1;
+            line_start = pos + i + 1;
+        }
+    }
+
+    (line, offset - line_start + 1)
 }
 
 /// Check if a byte is a valid UTF-8 continuation byte (0x80-0xBF).
@@ -345,159 +423,12 @@ fn is_continuation_byte(byte: u8) -> bool {
 #[cfg(all(target_arch = "x86_64", any(test, feature = "std")))]
 pub use self::simd_x86::validate_utf8_simd;
 
-/// x86_64 AVX2 UTF-8 validation.
-///
-/// This is a first-principles port of the Keiser–Lemire "Validating UTF-8 In
-/// Less Than One Instruction Per Byte" approach (<https://arxiv.org/abs/2010.03090>),
-/// expressed with explicit range comparisons rather than packed lookup tables so
-/// that every check maps directly onto the rules in [`validate_utf8_scalar`].
 #[cfg(all(target_arch = "x86_64", any(test, feature = "std")))]
-mod simd_x86 {
-    #![allow(unsafe_code)] // x86_64 AVX2 SIMD intrinsics
-    #![allow(clippy::cast_possible_wrap)] // u8 byte constants deliberately reinterpreted as i8 lanes
+mod simd_x86;
 
-    use super::{validate_utf8_scalar, Utf8Error};
-    use core::arch::x86_64::*;
+mod broadword;
 
-    /// Validate `input` as UTF-8 using AVX2 when available.
-    ///
-    /// Returns `Ok(())` only when the AVX2 accept scan proves the whole buffer
-    /// valid; otherwise defers to the scalar validator for the exact error.
-    pub fn validate_utf8_simd(input: &[u8]) -> Result<(), Utf8Error> {
-        // SAFETY: `validate_utf8_avx2` is only entered once the CPU is confirmed
-        // to support AVX2 by `is_x86_feature_detected!`.
-        if is_x86_feature_detected!("avx2") && unsafe { validate_utf8_avx2(input) } {
-            Ok(())
-        } else {
-            validate_utf8_scalar(input)
-        }
-    }
-
-    /// Unsigned `a >= k` per byte lane; result lanes are `0xFF` (true) or `0x00`.
-    #[inline]
-    #[target_feature(enable = "avx2")]
-    unsafe fn uge(a: __m256i, k: u8) -> __m256i {
-        // max_epu8(a, k) == a  iff  a >= k (unsigned). These register-only AVX2
-        // intrinsics are safe to call within a `#[target_feature]` fn.
-        let vk = _mm256_set1_epi8(k as i8);
-        _mm256_cmpeq_epi8(_mm256_max_epu8(a, vk), a)
-    }
-
-    /// Unsigned `a < k` per byte lane; result lanes are `0xFF` (true) or `0x00`.
-    #[inline]
-    #[target_feature(enable = "avx2")]
-    unsafe fn ult(a: __m256i, k: u8) -> __m256i {
-        unsafe { _mm256_xor_si256(uge(a, k), _mm256_set1_epi8(-1)) }
-    }
-
-    /// Accumulate UTF-8 errors for one 32-byte block into `error`.
-    ///
-    /// `prev_input` holds the previous block (zeros before the first block) so
-    /// that `prev1`/`prev2`/`prev3` — the bytes 1/2/3 positions back — are
-    /// available across the block boundary.
-    #[inline]
-    #[target_feature(enable = "avx2")]
-    unsafe fn check_block(chunk: __m256i, prev_input: __m256i, error: &mut __m256i) {
-        unsafe {
-            // Shift the 256-bit vector right by 1/2/3 bytes, pulling in the tail
-            // of `prev_input` (the canonical simdjson `prev<N>` idiom).
-            let shifted = _mm256_permute2x128_si256(prev_input, chunk, 0x21);
-            let prev1 = _mm256_alignr_epi8(chunk, shifted, 15);
-            let prev2 = _mm256_alignr_epi8(chunk, shifted, 14);
-            let prev3 = _mm256_alignr_epi8(chunk, shifted, 13);
-
-            // is_cont = (chunk & 0xC0) == 0x80
-            let c0 = _mm256_set1_epi8(0xC0u8 as i8);
-            let is_cont =
-                _mm256_cmpeq_epi8(_mm256_and_si256(chunk, c0), _mm256_set1_epi8(0x80u8 as i8));
-
-            // A byte MUST be a continuation iff the byte 1 back is any lead
-            // (>=0xC0), or 2 back is a 3/4-byte lead (>=0xE0), or 3 back is a
-            // 4-byte lead (>=0xF0). Missing OR stray continuations => is_cont
-            // disagrees with must_cont.
-            let must_cont = _mm256_or_si256(
-                _mm256_or_si256(uge(prev1, 0xC0), uge(prev2, 0xE0)),
-                uge(prev3, 0xF0),
-            );
-            let mut err = _mm256_xor_si256(is_cont, must_cont);
-
-            // Bytes that are never valid anywhere: 0xC0/0xC1 (overlong 2-byte
-            // leads) and 0xF5..=0xFF (beyond U+10FFFF / not UTF-8 lead bytes).
-            let invalid_c0c1 =
-                _mm256_cmpeq_epi8(_mm256_and_si256(chunk, _mm256_set1_epi8(0xFEu8 as i8)), c0);
-            err = _mm256_or_si256(err, _mm256_or_si256(invalid_c0c1, uge(chunk, 0xF5)));
-
-            // Special cases keyed on the lead byte (prev1) and the byte after it
-            // (chunk), each firing only within the continuation range:
-            //   E0 followed by <0xA0 -> overlong 3-byte
-            //   ED followed by >=0xA0 -> surrogate (U+D800..U+DFFF)
-            //   F0 followed by <0x90 -> overlong 4-byte
-            //   F4 followed by >=0x90 -> above U+10FFFF
-            let e0 = _mm256_cmpeq_epi8(prev1, _mm256_set1_epi8(0xE0u8 as i8));
-            let ed = _mm256_cmpeq_epi8(prev1, _mm256_set1_epi8(0xEDu8 as i8));
-            let f0 = _mm256_cmpeq_epi8(prev1, _mm256_set1_epi8(0xF0u8 as i8));
-            let f4 = _mm256_cmpeq_epi8(prev1, _mm256_set1_epi8(0xF4u8 as i8));
-            err = _mm256_or_si256(err, _mm256_and_si256(e0, ult(chunk, 0xA0)));
-            err = _mm256_or_si256(err, _mm256_and_si256(ed, uge(chunk, 0xA0)));
-            err = _mm256_or_si256(err, _mm256_and_si256(f0, ult(chunk, 0x90)));
-            err = _mm256_or_si256(err, _mm256_and_si256(f4, uge(chunk, 0x90)));
-
-            *error = _mm256_or_si256(*error, err);
-        }
-    }
-
-    /// Return `true` iff `input` is entirely valid UTF-8.
-    ///
-    /// End-of-input truncation is caught by always processing a final
-    /// zero-padded block: a dangling multi-byte lead's absent continuation lands
-    /// on a `0x00` pad byte, which fails the continuation requirement.
-    #[target_feature(enable = "avx2")]
-    unsafe fn validate_utf8_avx2(input: &[u8]) -> bool {
-        unsafe {
-            let len = input.len();
-            if len == 0 {
-                return true;
-            }
-
-            let mut error = _mm256_setzero_si256();
-            let mut prev_input = _mm256_setzero_si256();
-
-            let mut pos = 0;
-            while pos + 32 <= len {
-                let chunk = _mm256_loadu_si256(input.as_ptr().add(pos).cast::<__m256i>());
-                check_block(chunk, prev_input, &mut error);
-                prev_input = chunk;
-                pos += 32;
-            }
-
-            // Final zero-padded tail. Runs even when `len % 32 == 0` (tail all
-            // zeros) so a lead byte at the very end is still flagged as truncated
-            // via the carried `prev_input`.
-            let mut tail = [0u8; 32];
-            tail[..len - pos].copy_from_slice(&input[pos..]);
-            let chunk = _mm256_loadu_si256(tail.as_ptr().cast::<__m256i>());
-            check_block(chunk, prev_input, &mut error);
-
-            // Valid iff no error bit was set anywhere.
-            _mm256_testz_si256(error, error) == 1
-        }
-    }
-
-    /// Test-only: run the raw AVX2 kernel over `input`.
-    ///
-    /// The kernel-vs-std differential test gates on `is_x86_feature_detected!`
-    /// once and then calls this across its whole corpus. Exposing the raw kernel
-    /// verdict (rather than the scalar-fallback [`validate_utf8_simd`] wrapper)
-    /// lets the differential catch both false accepts *and* false rejects.
-    ///
-    /// # Safety
-    /// The CPU must support AVX2; the caller checks `is_x86_feature_detected!`.
-    #[cfg(test)]
-    pub(crate) unsafe fn validate_utf8_avx2_unchecked(input: &[u8]) -> bool {
-        // SAFETY: the caller guarantees AVX2 is available.
-        unsafe { validate_utf8_avx2(input) }
-    }
-}
+pub use self::broadword::validate_utf8_broadword;
 
 /// Get the expected sequence length from a lead byte.
 /// Returns 0 for invalid lead bytes (continuation bytes or 0xF8+).
@@ -1726,7 +1657,7 @@ mod tests {
 mod validate_utf8_differential_tests {
     #![allow(unsafe_code)] // the x86_64 test drives the raw AVX2 kernel directly
 
-    use super::{validate_utf8, validate_utf8_scalar};
+    use super::{validate_utf8, validate_utf8_scalar, Utf8Error, Utf8ErrorKind};
     use alloc::string::String;
     use alloc::vec::Vec;
 
@@ -1846,8 +1777,24 @@ mod validate_utf8_differential_tests {
         }
     }
 
+    /// Block-edge offsets shared by both fixture builders.
+    ///
+    /// `0..=7` covers every residue mod 8, which is what the broadword scan
+    /// needs: its ASCII skip can leave `pos` anywhere inside a word, and a bug
+    /// that only fires at, say, a 3-byte skip would otherwise go unseen. (The
+    /// original offsets were chosen for the 32-byte AVX2 blocks and hit only
+    /// residues 0, 1, 6 and 7.) `8..=17` adds a second word plus a guard for a
+    /// possible future 16-byte block, and the larger values keep the AVX2
+    /// 32/64-byte edges covered.
+    const BOUNDARY_OFFSETS: [usize; 26] = [
+        0, 1, 2, 3, 4, 5, 6, 7, // every residue mod 8 (broadword word edges)
+        8, 9, 10, 11, 12, 13, 14, 15, 16, 17, // second word / 16-byte guard
+        29, 30, 31, 32, 33, 62, 63, 64, // AVX2 32/64-byte block edges
+    ];
+
     /// Invalid fixtures: one per error kind, placed at offsets that straddle the
-    /// 32/64-byte SIMD block edges and land at end-of-input.
+    /// 8/16-byte broadword word edges and the 32/64-byte SIMD block edges, and
+    /// land at end-of-input.
     fn invalid_boundary_fixtures() -> Vec<Vec<u8>> {
         let bad_seqs: &[&[u8]] = &[
             &[0x80],                   // stray continuation
@@ -1863,10 +1810,9 @@ mod validate_utf8_differential_tests {
             &[0xE0, 0xA0],             // truncated 3-byte at EOF
             &[0xF0, 0x90, 0x80],       // truncated 4-byte at EOF
         ];
-        let offsets = [0usize, 1, 30, 31, 32, 33, 62, 63, 64, 65];
         let mut out = Vec::new();
         for seq in bad_seqs {
-            for &off in &offsets {
+            for &off in &BOUNDARY_OFFSETS {
                 let mut buf: Vec<u8> = core::iter::repeat(b'a').take(off).collect();
                 buf.extend_from_slice(seq);
                 out.push(buf);
@@ -1885,10 +1831,9 @@ mod validate_utf8_differential_tests {
             "\u{D7FF}".as_bytes(),   // just below surrogate range (3-byte)
             "\u{10FFFF}".as_bytes(), // maximum code point (4-byte)
         ];
-        let offsets = [0usize, 1, 29, 30, 31, 32, 33, 60, 61, 62, 63, 64, 65];
         let mut out = Vec::new();
         for seq in good_seqs {
-            for &off in &offsets {
+            for &off in &BOUNDARY_OFFSETS {
                 let mut buf: Vec<u8> = core::iter::repeat(b'a').take(off).collect();
                 buf.extend_from_slice(seq);
                 buf.push(b'z');
@@ -2010,6 +1955,469 @@ mod validate_utf8_differential_tests {
         for buf in valid_boundary_fixtures() {
             assert!(core::str::from_utf8(&buf).is_ok());
             assert!(validate_utf8_scalar(&buf).is_ok(), "scalar: {buf:02x?}");
+        }
+    }
+
+    /// Invalid fixtures carrying newlines, so the `line`/`column` fields of the
+    /// reported [`Utf8Error`] — not just its `offset` — are exercised.
+    ///
+    /// Newlines are placed at strides that straddle the 8-byte word boundary the
+    /// broadword ASCII fast path steps over, and errors land on the first line,
+    /// immediately after a newline, and several lines in.
+    fn newline_error_fixtures() -> Vec<Vec<u8>> {
+        let bad_seqs: &[&[u8]] = &[
+            &[0x80],                   // stray continuation
+            &[0xC0, 0x80],             // overlong 2-byte
+            &[0xE0, 0x80, 0x80],       // overlong 3-byte
+            &[0xED, 0xA0, 0x80],       // surrogate U+D800
+            &[0xF0, 0x80, 0x80, 0x80], // overlong 4-byte
+            &[0xF4, 0x90, 0x80, 0x80], // above U+10FFFF
+            &[0xFF],                   // invalid lead
+            &[0xC2],                   // truncated 2-byte at EOF
+            &[0xE0, 0xA0],             // truncated 3-byte at EOF
+            &[0xF0, 0x90, 0x80],       // truncated 4-byte at EOF
+            &[0xC2, 0x41],             // bad continuation in 2-byte
+            &[0xE0, 0xA0, 0x41],       // bad continuation in 3-byte
+            &[0xF0, 0x90, 0x80, 0x41], // bad continuation in 4-byte
+        ];
+
+        // Prefix shapes, each `n` bytes long, covering: no newline at all; a
+        // newline every k bytes (k straddling the 8-byte word); a single newline
+        // at the very start; and one immediately before the error.
+        let prefix = |n: usize, shape: u8| -> Vec<u8> {
+            (0..n)
+                .map(|i| match shape {
+                    0 => b'a',
+                    1 => {
+                        if i % 3 == 2 {
+                            b'\n'
+                        } else {
+                            b'a'
+                        }
+                    }
+                    2 => {
+                        if i % 8 == 7 {
+                            b'\n'
+                        } else {
+                            b'a'
+                        }
+                    }
+                    3 => {
+                        if i == 0 {
+                            b'\n'
+                        } else {
+                            b'a'
+                        }
+                    }
+                    _ => {
+                        if i + 1 == n {
+                            b'\n'
+                        } else {
+                            b'a'
+                        }
+                    }
+                })
+                .collect()
+        };
+
+        let mut out = Vec::new();
+        for seq in bad_seqs {
+            for n in 0..24usize {
+                for shape in 0..5u8 {
+                    let mut buf = prefix(n, shape);
+                    buf.extend_from_slice(seq);
+                    out.push(buf);
+                }
+            }
+            // Multi-byte characters before the error: the derived `line_start`
+            // must not be confused by continuation bytes.
+            for n in 0..6usize {
+                let mut buf = Vec::new();
+                for i in 0..n {
+                    buf.extend_from_slice(if i % 2 == 0 {
+                        "日".as_bytes()
+                    } else {
+                        "é\n".as_bytes()
+                    });
+                }
+                buf.extend_from_slice(seq);
+                out.push(buf);
+            }
+            // CRLF line endings.
+            for n in 0..4usize {
+                let mut buf = Vec::new();
+                for _ in 0..n {
+                    buf.extend_from_slice(b"line\r\n");
+                }
+                buf.extend_from_slice(seq);
+                out.push(buf);
+            }
+        }
+        out
+    }
+
+    /// The scalar validator agrees with the byte-by-byte reference on the *whole*
+    /// `Result` — `offset`, `line`, `column` and `kind`, not merely validity.
+    ///
+    /// This is the safety net for deriving `line`/`column` from the error offset
+    /// instead of tracking them per byte: any drift in either field fails here.
+    #[test]
+    fn scalar_matches_reference_including_error() {
+        // Widest `line` / `column` an errored fixture reported, asserted at the
+        // end so this test can never pass vacuously on all-valid or all-line-1
+        // inputs — the very cases that would hide a line-tracking regression.
+        let mut max_line = 0usize;
+        let mut max_column = 0usize;
+        let mut check = |bytes: &[u8]| {
+            let actual = validate_utf8_scalar(bytes);
+            assert_eq!(
+                actual,
+                validate_utf8_scalar_reference(bytes),
+                "scalar diverged from reference on {bytes:02x?}"
+            );
+            if let Err(e) = actual {
+                max_line = max_line.max(e.line);
+                max_column = max_column.max(e.column);
+            }
+        };
+
+        for buf in newline_error_fixtures() {
+            check(&buf);
+        }
+        for buf in invalid_boundary_fixtures() {
+            check(&buf);
+        }
+        for buf in valid_boundary_fixtures() {
+            check(&buf);
+        }
+
+        let mut rng = Rng(0xfeed_face_0133_0001);
+        for _ in 0..20_000 {
+            let len = rng.below(96) as usize;
+            check(&random_bytes(&mut rng, len));
+        }
+        // Byte soup biased towards ASCII and newlines, so long ASCII runs (the
+        // broadword fast path) precede the error rather than random high bytes.
+        for _ in 0..20_000 {
+            let len = rng.below(96) as usize;
+            let mut bytes: Vec<u8> = (0..len)
+                .map(|_| match rng.below(10) {
+                    0 => b'\n',
+                    1 => (rng.next_u32() & 0xFF) as u8,
+                    _ => b'a' + (rng.below(26) as u8),
+                })
+                .collect();
+            if !bytes.is_empty() && rng.below(2) == 0 {
+                let i = rng.below(bytes.len() as u32) as usize;
+                bytes[i] = 0x80 | (rng.below(0x80) as u8);
+            }
+            check(&bytes);
+        }
+        for _ in 0..5_000 {
+            let min_len = rng.below(200) as usize;
+            let mut bytes = random_valid_utf8(&mut rng, min_len);
+            if !bytes.is_empty() {
+                let i = rng.below(bytes.len() as u32) as usize;
+                bytes[i] = if rng.below(2) == 0 {
+                    b'\n'
+                } else {
+                    (rng.next_u32() & 0xFF) as u8
+                };
+            }
+            check(&bytes);
+        }
+
+        assert!(
+            max_line > 5,
+            "fixtures never produced an error past line 5 (max {max_line}); \
+             line tracking is not actually being exercised"
+        );
+        assert!(
+            max_column > 5,
+            "fixtures never produced an error past column 5 (max {max_column}); \
+             column derivation is not actually being exercised"
+        );
+    }
+
+    /// The original byte-at-a-time scalar validator, kept verbatim as the oracle
+    /// for [`scalar_matches_reference_including_error`]. It tracks `line` and
+    /// `line_start` incrementally on the hot path; the shipping validator derives
+    /// them from the error offset instead, and this pins the two to agree.
+    // STYLE-0005: reference impl kept for correctness comparison
+    fn validate_utf8_scalar_reference(input: &[u8]) -> Result<(), Utf8Error> {
+        let mut pos = 0;
+        let mut line = 1;
+        let mut line_start = 0;
+        let len = input.len();
+
+        while pos < len {
+            let byte = input[pos];
+
+            if pos > 0 && input[pos - 1] == b'\n' {
+                line += 1;
+                line_start = pos;
+            }
+
+            let seq_len = match byte {
+                0x00..=0x7F => {
+                    pos += 1;
+                    continue;
+                }
+                0x80..=0xBF => {
+                    return Err(Utf8Error {
+                        offset: pos,
+                        line,
+                        column: pos - line_start + 1,
+                        kind: Utf8ErrorKind::InvalidLeadByte,
+                    });
+                }
+                0xC0..=0xDF => 2,
+                0xE0..=0xEF => 3,
+                0xF0..=0xF7 => 4,
+                0xF8..=0xFF => {
+                    return Err(Utf8Error {
+                        offset: pos,
+                        line,
+                        column: pos - line_start + 1,
+                        kind: Utf8ErrorKind::InvalidLeadByte,
+                    });
+                }
+            };
+
+            if pos + seq_len > len {
+                return Err(Utf8Error {
+                    offset: pos,
+                    line,
+                    column: pos - line_start + 1,
+                    kind: Utf8ErrorKind::TruncatedSequence,
+                });
+            }
+
+            match seq_len {
+                2 => {
+                    let b1 = input[pos + 1];
+                    if (b1 & 0xC0) != 0x80 {
+                        return Err(Utf8Error {
+                            offset: pos + 1,
+                            line,
+                            column: pos + 1 - line_start + 1,
+                            kind: Utf8ErrorKind::InvalidContinuationByte,
+                        });
+                    }
+                    if byte <= 0xC1 {
+                        return Err(Utf8Error {
+                            offset: pos,
+                            line,
+                            column: pos - line_start + 1,
+                            kind: Utf8ErrorKind::OverlongEncoding,
+                        });
+                    }
+                }
+                3 => {
+                    let b1 = input[pos + 1];
+                    let b2 = input[pos + 2];
+                    if (b1 & 0xC0) != 0x80 {
+                        return Err(Utf8Error {
+                            offset: pos + 1,
+                            line,
+                            column: pos + 1 - line_start + 1,
+                            kind: Utf8ErrorKind::InvalidContinuationByte,
+                        });
+                    }
+                    if (b2 & 0xC0) != 0x80 {
+                        return Err(Utf8Error {
+                            offset: pos + 2,
+                            line,
+                            column: pos + 2 - line_start + 1,
+                            kind: Utf8ErrorKind::InvalidContinuationByte,
+                        });
+                    }
+                    let cp = ((byte as u32 & 0x0F) << 12)
+                        | ((b1 as u32 & 0x3F) << 6)
+                        | (b2 as u32 & 0x3F);
+                    if cp < 0x800 {
+                        return Err(Utf8Error {
+                            offset: pos,
+                            line,
+                            column: pos - line_start + 1,
+                            kind: Utf8ErrorKind::OverlongEncoding,
+                        });
+                    }
+                    if (0xD800..=0xDFFF).contains(&cp) {
+                        return Err(Utf8Error {
+                            offset: pos,
+                            line,
+                            column: pos - line_start + 1,
+                            kind: Utf8ErrorKind::SurrogateCodepoint,
+                        });
+                    }
+                }
+                4 => {
+                    let b1 = input[pos + 1];
+                    let b2 = input[pos + 2];
+                    let b3 = input[pos + 3];
+                    if (b1 & 0xC0) != 0x80 {
+                        return Err(Utf8Error {
+                            offset: pos + 1,
+                            line,
+                            column: pos + 1 - line_start + 1,
+                            kind: Utf8ErrorKind::InvalidContinuationByte,
+                        });
+                    }
+                    if (b2 & 0xC0) != 0x80 {
+                        return Err(Utf8Error {
+                            offset: pos + 2,
+                            line,
+                            column: pos + 2 - line_start + 1,
+                            kind: Utf8ErrorKind::InvalidContinuationByte,
+                        });
+                    }
+                    if (b3 & 0xC0) != 0x80 {
+                        return Err(Utf8Error {
+                            offset: pos + 3,
+                            line,
+                            column: pos + 3 - line_start + 1,
+                            kind: Utf8ErrorKind::InvalidContinuationByte,
+                        });
+                    }
+                    let cp = ((byte as u32 & 0x07) << 18)
+                        | ((b1 as u32 & 0x3F) << 12)
+                        | ((b2 as u32 & 0x3F) << 6)
+                        | (b3 as u32 & 0x3F);
+                    if cp < 0x10000 {
+                        return Err(Utf8Error {
+                            offset: pos,
+                            line,
+                            column: pos - line_start + 1,
+                            kind: Utf8ErrorKind::OverlongEncoding,
+                        });
+                    }
+                    if cp > 0x10FFFF {
+                        return Err(Utf8Error {
+                            offset: pos,
+                            line,
+                            column: pos - line_start + 1,
+                            kind: Utf8ErrorKind::OutOfRangeCodepoint,
+                        });
+                    }
+                }
+                _ => unreachable!(),
+            }
+
+            pos += seq_len;
+        }
+
+        Ok(())
+    }
+
+    /// The broadword kernel agrees with std over a large corpus.
+    ///
+    /// The counterpart of [`avx2_kernel_matches_std`], but unguarded by any
+    /// `cfg` — the broadword scan is portable, so this gates it on every
+    /// architecture. It drives the raw `bool` kernels rather than the public
+    /// wrappers so that a false *reject* is caught too: the wrappers mask those
+    /// by falling back to the scalar validator, which would then return `Ok`
+    /// and hide the disagreement.
+    #[test]
+    fn broadword_kernel_matches_std() {
+        let mut rng = Rng(0xb70a_d000_d1a5_0007);
+        let check = |bytes: &[u8]| {
+            let expected = core::str::from_utf8(bytes).is_ok();
+            assert_eq!(
+                super::broadword::accepts(bytes),
+                expected,
+                "broadword kernel disagreed with std on {bytes:02x?}"
+            );
+        };
+
+        for _ in 0..50_000 {
+            let len = rng.below(140) as usize;
+            check(&random_bytes(&mut rng, len));
+        }
+        for _ in 0..10_000 {
+            let min_len = rng.below(300) as usize;
+            let mut bytes = random_valid_utf8(&mut rng, min_len);
+            if !bytes.is_empty() && rng.below(2) == 0 {
+                let i = rng.below(bytes.len() as u32) as usize;
+                bytes[i] = (rng.next_u32() & 0xFF) as u8;
+            }
+            check(&bytes);
+        }
+        for buf in invalid_boundary_fixtures() {
+            check(&buf);
+        }
+        for buf in valid_boundary_fixtures() {
+            check(&buf);
+        }
+    }
+
+    /// Every input of length 0, 1 or 2 — all 65,793 of them — validates the same
+    /// as std.
+    ///
+    /// Exhaustive rather than random, and short enough that the main loop never
+    /// runs, so it pins the sub-word tail path on its own.
+    #[test]
+    fn broadword_exhaustive_short_inputs() {
+        let check = |bytes: &[u8]| {
+            let expected = core::str::from_utf8(bytes).is_ok();
+            assert_eq!(super::broadword::accepts(bytes), expected, "{bytes:02x?}");
+        };
+
+        check(&[]);
+        for a in 0..=255u8 {
+            check(&[a]);
+            for b in 0..=255u8 {
+                check(&[a, b]);
+            }
+        }
+    }
+
+    /// Sequences cut off at end-of-input are rejected at every distance from a
+    /// word boundary.
+    ///
+    /// Truncation is the one condition the main loop cannot see coming — it is
+    /// detected by running out of bytes mid-sequence, or by the tail loop ending
+    /// in a non-ground state — so it is checked at every `len % 8`.
+    #[test]
+    fn broadword_truncation_at_word_boundaries() {
+        let truncated: &[&[u8]] = &[
+            &[0xC2],             // 2-byte lead, no continuation
+            &[0xE0, 0xA0],       // 3-byte, one continuation short
+            &[0xF0, 0x90, 0x80], // 4-byte, one continuation short
+            &[0xF1],             // 4-byte lead, three continuations short
+        ];
+        for seq in truncated {
+            for pad in 0..=17usize {
+                let mut buf: Vec<u8> = core::iter::repeat(b'a').take(pad).collect();
+                buf.extend_from_slice(seq);
+                assert!(
+                    core::str::from_utf8(&buf).is_err(),
+                    "fixture should be invalid: {buf:02x?}"
+                );
+                assert!(!super::broadword::accepts(&buf), "{buf:02x?}");
+            }
+        }
+    }
+
+    /// The broadword wrapper returns byte-identical `Utf8Error`s to the scalar
+    /// validator — offset, line, column and kind.
+    ///
+    /// True by construction today, since it delegates to
+    /// [`validate_utf8_scalar`] on rejection. The test exists so that any later
+    /// attempt to build errors inside the kernel fails loudly rather than
+    /// silently shifting a reported line or column.
+    #[test]
+    fn broadword_matches_scalar_including_error() {
+        let mut rng = Rng(0xb70a_d000_e770_0011);
+        for _ in 0..20_000 {
+            let len = rng.below(96) as usize;
+            let bytes = random_bytes(&mut rng, len);
+            let expected = validate_utf8_scalar(&bytes);
+            assert_eq!(
+                super::validate_utf8_broadword(&bytes),
+                expected,
+                "broadword differed from scalar on {bytes:02x?}"
+            );
         }
     }
 }

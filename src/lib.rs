@@ -104,7 +104,9 @@ pub mod text;
 
 // Core types
 pub use bits::BitVec;
-pub use bits::{popcount_word, popcount_word_portable, popcount_words, RankDirectory, SelectIndex};
+pub use bits::{
+    popcount_word, popcount_word_portable, popcount_words, RankDirectory, SampleWord, SelectIndex,
+};
 pub use trees::BalancedParens;
 pub use util::select_in_word;
 
