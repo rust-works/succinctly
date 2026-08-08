@@ -400,19 +400,23 @@ fn evaluate_yaml_cursor<W: AsRef<[u64]> + Clone>(
         GenericResult::OneCursor(c) => Ok(vec![to_owned(&c.value())]),
         GenericResult::Many(vs) => Ok(vs.iter().map(to_owned).collect()),
         GenericResult::ManyCursor(cs) => Ok(cs.iter().map(|c| to_owned(&c.value())).collect()),
-        // Fallback: materialize. YAML has no lazy-output concept today —
-        // `yq_runner.rs` never builds a `JqValue` — so unlike the JSON `jq`
-        // runner, this is the only path available here; a genuinely lazy
-        // YAML `keys_unsorted` output is deferred to a follow-up issue
-        // (#140). Sort iff `sorted` (#683), matching eager `Keys` -- though
-        // in practice `sorted` is always `false` here: `run_yq` always
-        // parses in `ParserMode::Yq`, where the `keys` keyword itself
-        // resolves to `Builtin::KeysUnsorted` (matching real yq's document-
-        // order semantics, see `parser.rs`'s `keys`/`keys_unsorted`
-        // handling), so `Builtin::Keys` can never reach this arm through the
-        // `yq` CLI. Handled anyway for exhaustiveness and because the
-        // generic evaluator is shared with `jq` (#140's `Pipe` dispatch is
-        // generic over `V: DocumentValue`).
+        // This is the DOM/slow path (`evaluate_yaml_direct_filtered`'s
+        // fallback), reached only when `can_use_m2_streaming` rejects the
+        // expression or a flag (`--sort-keys`, color, `--tab`, `--slurp`,
+        // `--null-input`, named vars, ...) forces DOM output for every query
+        // shape, not just `keys_unsorted`. `syq 'keys_unsorted'` under
+        // default flags takes the M2 fast path instead, which streams each
+        // key from `fields` without materializing (#685); this arm stays a
+        // plain materializing fallback since the DOM path materializes
+        // everything else here too. Sort iff `sorted` (#683) -- though in
+        // practice `sorted` is always `false` here: `run_yq` always parses
+        // in `ParserMode::Yq`, where the `keys` keyword itself resolves to
+        // `Builtin::KeysUnsorted` (matching real yq's document-order
+        // semantics, see `parser.rs`'s `keys`/`keys_unsorted` handling), so
+        // `Builtin::Keys` can never reach this arm through the `yq` CLI.
+        // Handled anyway for exhaustiveness and because the generic
+        // evaluator is shared with `jq` (#140's `Pipe` dispatch is generic
+        // over `V: DocumentValue`).
         GenericResult::LazyKeys { fields, sorted } => {
             let mut keys = fields.keys();
             if sorted {
@@ -992,9 +996,10 @@ fn build_args_var(context: &EvalContext) -> OwnedValue {
 /// - Iteration: `.[]`
 /// - Chained navigation: `.field[0].name`
 /// - Optional variants: `.field?`, `.[0]?`, `.[]?`
+/// - `keys_unsorted` (streams lazily via `GenericResult::LazyKeys { sorted: false, .. }`, #685)
 ///
 /// Expressions that require OwnedValue construction cannot use M2:
-/// - Builtins like `length`, `keys`, `map`
+/// - Builtins like `length`, `keys` (sorted), `map`
 /// - Array/object construction: `[...]`, `{...}`
 /// - Arithmetic, comparison, and logic operators
 /// - String interpolation
@@ -1028,6 +1033,13 @@ fn can_use_m2_streaming(expr: &Expr) -> bool {
         Expr::FirstExpr(_) | Expr::LastExpr(_) => true,
         Expr::Builtin(Builtin::FirstStream(_) | Builtin::LastStream(_)) => true,
         Expr::IndexExpr { .. } => true,
+
+        // `keys_unsorted` on a mapping produces `GenericResult::LazyKeys { sorted: false, .. }`,
+        // which `GenericResult::stream_json`/`stream_yaml` now stream directly
+        // from the field cursor (#685) instead of materializing a `Vec<String>`
+        // first. On an array input it already returns `GenericResult::Owned`
+        // cheaply, so this only changes routing for the mapping case.
+        Expr::Builtin(Builtin::KeysUnsorted) => true,
 
         // Everything else requires OwnedValue
         _ => false,
