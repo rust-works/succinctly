@@ -1382,11 +1382,13 @@ fn test_yaml_anchored_tag_in_seq_item_is_rejected() -> Result<()> {
 
 #[test]
 fn test_yaml_flow_context_rejects_tags_like_block_context() -> Result<()> {
-    // #369. Block context has always errored on `!` via `check_unsupported`;
-    // flow context fell through to the plain-scalar readers and absorbed the
-    // tag as text, so `a: [!!str x]` yielded the *string* `"!!str x"`. Silently
-    // wrong data is worse than a refusal, which is why this is a bug in its own
-    // right rather than something that waits for tag support (#224).
+    // #369. Flow context fell through to the plain-scalar readers and absorbed
+    // the tag as text, so `a: [!!str x]` yielded the *string* `"!!str x"`.
+    // Silently wrong data is worse than a refusal, which is why this is a bug
+    // in its own right rather than something that waits for tag support
+    // (#224). Flow context is fully gated for every position tested below —
+    // unlike block context, which is not: see the `test_yaml_tag_gate_gap_*`
+    // tests following this one, added by the #664 audit.
     //
     // Every flow position that reaches a plain-scalar reader. The last two are
     // the ones no other case covers: an implicit `k: v` entry inside a flow
@@ -1412,6 +1414,178 @@ fn test_yaml_flow_context_rejects_tags_like_block_context() -> Result<()> {
             stderr.contains("tags (!) not supported"),
             "{name}: stderr should name the tag: {stderr}"
         );
+    }
+    Ok(())
+}
+
+// The following `test_yaml_tag_gate_gap_*` tests are the #664 audit's output:
+// they pin *today's wrong* behavior (`exit_code == 0`, tag text silently
+// absorbed) for every block-context path found ungated against
+// `check_unsupported` (`src/yaml/parser.rs`). Each is expected to start
+// failing once #224 implements real tag support and these paths reject or
+// handle the tag instead of absorbing it — that failure is the signal a gap
+// closed. See `docs/compliance/yaml/limitations.md` for the full audit
+// (root causes, file:line references, and the complete gated/ungated table).
+
+#[test]
+fn test_yaml_tag_gate_gap_document_root_indented_scalar() -> Result<()> {
+    // Root cause 1: `parse_document_line`'s `check_unsupported` call
+    // (`parser.rs:4269`) runs before indentation is skipped, so it peeks the
+    // line's literal first byte — a space for any indented line — not the
+    // node's first byte. A column-0 bare scalar is rejected; the same scalar
+    // indented is not.
+    let (out, code) = run_yq_stdin(".", "!!str x\n", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 1, "control (column 0) should still be rejected");
+    let _ = out;
+
+    let (out, code) = run_yq_stdin(".", "  !!str x\n", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0, "indented bare scalar: gap not yet closed");
+    assert_eq!(out.trim(), "\"!!str x\"");
+    Ok(())
+}
+
+#[test]
+fn test_yaml_tag_gate_gap_document_start_two_documents() -> Result<()> {
+    // The `J7PZ` corpus shape (`--- !!omap`). `parse_inline_document_value`
+    // (root cause 2) absorbs the tag as a complete document-root scalar, so
+    // the sequence content on the following lines starts a *second*
+    // document — one YAML input streams as two JSON documents instead of
+    // erroring.
+    let (out, code) = run_yq_stdin(".", "--- !!omap\n- a: 1\n", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0, "gap not yet closed");
+    assert_eq!(out.trim(), "\"!!omap\"\n[{\"a\":1}]");
+    Ok(())
+}
+
+#[test]
+fn test_yaml_tag_gate_gap_document_start_inline_value() -> Result<()> {
+    // Root cause 2: `parse_inline_document_value` (`parser.rs:1061-1081`)
+    // dispatches content after `---` through `parse_block_node` directly,
+    // never calling `check_unsupported` itself. Its own doc comment already
+    // names this as #224's to settle.
+    for (name, input, expected) in [
+        ("plain tag", "--- !!str x\n", "\"!!str x\""),
+        ("anchor then tag", "--- &a !!str x\n", "\"!!str x\""),
+    ] {
+        let (out, code) = run_yq_stdin(".", input, &["-o=json", "-I=0"])?;
+        assert_eq!(code, 0, "{name}: gap not yet closed");
+        assert_eq!(out.trim(), expected, "{name}");
+    }
+    Ok(())
+}
+
+#[test]
+fn test_yaml_tag_gate_gap_value_deferred_to_next_line() -> Result<()> {
+    // Root causes 2/3: a value deferred to the next line eventually lands in
+    // `parse_block_node`'s scalar-dispatch arms (`4416-4441`, `4457-4490`),
+    // neither of which calls `check_unsupported`. `parse_mapping_entry`'s own
+    // gate (`2237`) only guards its *same-line* value branch, not this one
+    // (`2204-2232`).
+    for (name, input, expected) in [
+        (
+            "mapping value",
+            "key:\n  !!str value\n",
+            "{\"key\":\"!!str value\"}",
+        ),
+        ("sequence item", "- \n  !!str x\n", "[\"!!str x\"]"),
+        (
+            "compact mapping value",
+            "- k:\n    !!str v\n",
+            "[{\"k\":\"!!str v\"}]",
+        ),
+        (
+            "anchor-prefixed block value",
+            "a: &b\n  !!str x\n",
+            "{\"a\":\"!!str x\"}",
+        ),
+    ] {
+        let (out, code) = run_yq_stdin(".", input, &["-o=json", "-I=0"])?;
+        assert_eq!(code, 0, "{name}: gap not yet closed");
+        assert_eq!(out.trim(), expected, "{name}");
+    }
+    Ok(())
+}
+
+#[test]
+fn test_yaml_tag_gate_gap_anchor_then_tag_same_line() -> Result<()> {
+    // Root cause 4: `parse_mapping_entry` (`2237`) and
+    // `parse_compact_mapping_entry` (`1926`) each call `check_unsupported`
+    // once, *before* checking for a `&anchor`, then dispatch the
+    // post-anchor value inline with no second check. Contrast
+    // `parse_sequence_item`/flow context, which consume the anchor
+    // themselves and delegate to `parse_value`/`parse_flow_scalar` — both of
+    // which re-check independently at their own entry, so the anchor never
+    // leaves a stale check behind there (see
+    // `test_yaml_anchored_tag_in_seq_item_is_rejected` above).
+    for (name, input, expected) in [
+        (
+            "mapping entry",
+            "key: &a !!str x\n",
+            "{\"key\":\"!!str x\"}",
+        ),
+        (
+            "compact mapping entry",
+            "- k: &a !!str v\n",
+            "[{\"k\":\"!!str v\"}]",
+        ),
+    ] {
+        let (out, code) = run_yq_stdin(".", input, &["-o=json", "-I=0"])?;
+        assert_eq!(code, 0, "{name}: gap not yet closed");
+        assert_eq!(out.trim(), expected, "{name}");
+    }
+    Ok(())
+}
+
+#[test]
+fn test_yaml_tag_gate_gap_explicit_value() -> Result<()> {
+    // Root cause 5: `parse_explicit_value` (`parser.rs:2582`, the `: value`
+    // half of `? key` / `: value`) has zero `check_unsupported` calls in the
+    // entire function, for its scalar arm, its anchor-then-value arm, or its
+    // compact-mapping-value arm.
+    for (name, input, expected) in [
+        ("plain value", "? k\n: !!str v\n", "{\"k\":\"!!str v\"}"),
+        (
+            "anchor then tag",
+            "? k\n: &a !!str v\n",
+            "{\"k\":\"!!str v\"}",
+        ),
+        (
+            "compact mapping value, tag on its key",
+            "? k\n: !!str b: c\n",
+            "{\"k\":{\"!!str b\":\"c\"}}",
+        ),
+    ] {
+        let (out, code) = run_yq_stdin(".", input, &["-o=json", "-I=0"])?;
+        assert_eq!(code, 0, "{name}: gap not yet closed");
+        assert_eq!(out.trim(), expected, "{name}");
+    }
+    Ok(())
+}
+
+#[test]
+fn test_yaml_tag_gate_gap_key_position() -> Result<()> {
+    // Root cause 6: no block-context key parser gates the key itself —
+    // `parse_mapping_entry` and `parse_explicit_key` (`2364`, whose inline-key
+    // dispatch at `2566-2572` has no gate at all) never call
+    // `check_unsupported` on key text. The mapping-entry case is indented so
+    // root cause 1's column-0 accident doesn't incidentally catch it.
+    //
+    // A compact-mapping key reached via a sequence item (`- !!str k: v`) is
+    // *not* included here — it's already gated, because
+    // `parse_sequence_item`'s own `check_unsupported` (`1734`) runs
+    // unconditionally right after `- `, before the compact-mapping dispatch
+    // is even decided.
+    for (name, input, expected) in [
+        (
+            "nested mapping key",
+            "outer:\n  !!str key: value\n",
+            "{\"outer\":{\"!!str key\":\"value\"}}",
+        ),
+        ("explicit key", "? !!str k\n: v\n", "{\"!!str k\":\"v\"}"),
+    ] {
+        let (out, code) = run_yq_stdin(".", input, &["-o=json", "-I=0"])?;
+        assert_eq!(code, 0, "{name}: gap not yet closed");
+        assert_eq!(out.trim(), expected, "{name}");
     }
     Ok(())
 }
