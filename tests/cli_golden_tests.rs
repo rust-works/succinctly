@@ -280,6 +280,32 @@ fn test_json_generate_pathological() -> Result<()> {
 }
 
 #[test]
+fn test_json_generate_wide() -> Result<()> {
+    let output = run_cli(&[
+        "json",
+        "generate",
+        "500",
+        "--pattern",
+        "wide",
+        "--seed",
+        "42",
+    ])?;
+
+    // Verify it's valid JSON, and a flat object with many top-level keys -
+    // the whole point of this pattern (see generators.rs).
+    let value: serde_json::Value = serde_json::from_str(&output)?;
+    let obj = value.as_object().expect("wide pattern must be an object");
+    assert!(
+        obj.len() > 1,
+        "wide pattern should have multiple top-level keys, got {}",
+        obj.len()
+    );
+
+    insta::assert_snapshot!("json_generate_wide_500b_seed42", output);
+    Ok(())
+}
+
+#[test]
 fn test_json_generate_escape_density() -> Result<()> {
     // Test with higher escape density
     let output = run_cli(&[
