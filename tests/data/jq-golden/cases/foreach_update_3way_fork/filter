@@ -1,0 +1,1 @@
+[foreach (1,2,3) as $x (0; if $x==1 then 10,20,30 else .+$x end; .)]
