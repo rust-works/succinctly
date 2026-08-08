@@ -1,24 +1,37 @@
 //! Depth-scaling benchmark for `..`/`recurse` path resolution (#661).
 //!
-//! De-risk step for #626: `push_recursive_branches` (bare `..`/`recurse`) and
-//! `resolve_recurse` (`recurse(f)`/`recurse(f;cond)`), both in
-//! `src/jq/eval.rs`, clone the value at every visited node to build that
-//! node's `PathBranch`. On a linear-nesting document that clone is
-//! O(subtree), so the total cost across all nodes is O(depth^2). This
-//! reproduces #626's own synthetic document and query so a before/after run
-//! of that fix produces numbers directly comparable to the table in that
-//! issue.
+//! De-risk step for #626, validating PR #670's fix: `eval_index_expr`/
+//! `eval_slice_bound` (`src/jq/eval.rs`) used to materialize a computed
+//! index/bound's full subtree before checking whether it was even usable. On
+//! a linear-nesting document that materialization is O(subtree), so the
+//! total cost across all nodes is O(depth^2). This reproduces #626's own
+//! synthetic document and query so a before/after run of that fix produces
+//! numbers directly comparable to the table in that issue — #670 took the
+//! depth-400 case from 11.7ms to 93µs.
+//!
+//! **This benchmark does not cover #668.** It was originally written
+//! attributing the O(depth^2) cost to `push_recursive_branches`/
+//! `resolve_recurse` (the `..`/`recurse` fan-out itself) rather than to
+//! `eval_index_expr`'s computed-key handling — plausible since the query
+//! below combines both, but wrong: PR #670 fixed `eval_index_expr` only, and
+//! that alone reproduced the full speedup, so the fan-out was never the
+//! bottleneck this benchmark measures. `push_recursive_branches`/
+//! `resolve_recurse` do still clone the value at every visited node
+//! (`eval.rs:8595`, `8659`, `8664`), independently of this benchmark's
+//! query — that's #668, and #675 tracks adding a benchmark that isolates it
+//! (a query with no computed index, so it can't route through
+//! `eval_index_expr`).
 //!
 //! The document — `{"k": {"k": ... "pad": {"a":{},"b":{},"c":{}}}}` — and
 //! the query — `.. | .[.k]?` — are chosen so the query never errors and
 //! never produces output: every `.k` lookup either finds the next nesting
 //! level (an object, so `.[<object>]` fails and `?` suppresses it) or misses
-//! (null, same suppression). That isolates the fan-out/per-node clone cost
-//! #626 targets from any output-formatting cost.
+//! (null, same suppression). That isolates the computed-index cost #626
+//! targets from any output-formatting cost.
 //!
 //! This file makes **no timing assertion** — it is a Criterion benchmark for
 //! manual before/after comparison, not a CI gate. Run it interleaved
-//! before/after #626 lands, per the A/B method in
+//! before/after a relevant fix lands, per the A/B method in
 //! `docs/guides/benchmarking.md#ab-benchmarking-method`, and record the
 //! resulting table in that issue/PR rather than here.
 //!

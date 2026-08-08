@@ -1,0 +1,106 @@
+//! Depth-scaling benchmark for `push_recursive_branches`/`resolve_recurse`'s
+//! per-node clone cost (#668), split out of #675.
+//!
+//! `jq_recurse_depth_bench`'s query, `.. | .[.k]?`, does **not** reach
+//! `push_recursive_branches`/`resolve_recurse` (`src/jq/eval.rs`): bare `..`
+//! in value position dispatches to `eval_recursive_descent`/
+//! `collect_recursive`, which clones a cheap `StandardJson` cursor per node,
+//! not the materialized `OwnedValue` — see that benchmark's own corrected
+//! docstring. `push_recursive_branches`/`resolve_recurse` are reachable only
+//! through `resolve_node`, which `resolve_dynamic_indexes` calls solely when
+//! `needs_path_prepass` is true — true for `..`/`recurse` themselves, so only
+//! a *path-context* use (`path(..)`, `path(recurse(...))`, `=`, `|=`,
+//! `del()`) reaches them (#668's own description of its four callers).
+//!
+//! **Why `del(..)`, not `path(..)`.** `path(..)`, the more obvious trigger,
+//! turns out to be a poor isolator: `builtin_path` calls
+//! `resolve_dynamic_indexes` (which drives `push_recursive_branches`) and
+//! *then* re-walks every one of the `depth + 1` resolved paths from the
+//! document root via `walk_path`/`step_into`, each step of which clones the
+//! value reached so far. That second pass was measured (`temp_probe`-style,
+//! not checked in) to cost **~250x** `push_recursive_branches`'s own share at
+//! depth 400 (1.9s vs 7-8ms) and scales worse than quadratically — so a
+//! `path(..)` benchmark would be dominated by `walk_path`, not by the
+//! function #668 targets, near-invisible to that fix, and would repeat
+//! exactly the mistake #675 was filed to correct in the first place.
+//! `del(..)` instead reaches `resolve_dynamic_indexes` and then applies
+//! `delete_at_path`/`delete_expr_paths_at` directly to the already-assembled
+//! static paths — no second walk of the original tree — so its cost tracks
+//! `push_recursive_branches`'s own share closely (measured: `del(..)`
+//! end-to-end 12.8ms vs `resolve_dynamic_indexes` 9.7ms at depth 400, both
+//! dominated by `push_recursive_branches`'s 8.2ms).
+//!
+//! `del(..)` also has no computed index anywhere in the query, so — like
+//! `path(..)` — it can never route through `eval_index_expr`/
+//! `eval_slice_bound` (#626/#670's already-fixed target).
+//!
+//! On the linear-nesting document below (one child per level, depth `d`),
+//! `push_recursive_branches` visits `d + 1` nodes pre-order and clones the
+//! full subtree rooted at each: the node at depth `i` clones a subtree of
+//! size `O(d - i)`. Summed over all nodes, that's `O(d^2)` — the signature
+//! #668 targets. `resolve_dynamic_indexes`, `del(..)`'s sole consumer of this
+//! machinery, discards every branch's cloned value once it has read the
+//! branch's path components (`delete_at_path` only needs the path, not the
+//! value that was sitting there), so that clone cost is pure waste — exactly
+//! the waste #668 describes.
+//!
+//! This file makes **no timing assertion** — it is a Criterion benchmark for
+//! manual before/after comparison, not a CI gate. Run it interleaved
+//! before/after #668's fix lands, per the A/B method in
+//! `docs/guides/benchmarking.md#ab-benchmarking-method`, and record the
+//! resulting table in that issue/PR rather than here.
+//!
+//! Run with:
+//! ```bash
+//! cargo bench --bench jq_recurse_clone_bench
+//! ```
+
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use std::hint::black_box;
+use succinctly::jq::{eval, parse, JqSemantics, OwnedValue, QueryResult};
+use succinctly::json::JsonIndex;
+
+/// `{"k": {"k": ... {} ... }}`, `depth` levels of `"k"` nesting, no other
+/// fields — nothing here needs a computed index to reach, unlike
+/// `jq_recurse_depth_bench`'s `pad` sibling (added there only to give
+/// `.[.k]?` a non-nesting object to fail an index into).
+fn linear_nest(depth: usize) -> Vec<u8> {
+    let open = "{\"k\":".repeat(depth);
+    let close = "}".repeat(depth);
+    format!("{open}{{}}{close}").into_bytes()
+}
+
+fn bench_recurse_clone_depth(c: &mut Criterion) {
+    let mut group = c.benchmark_group("jq_recurse_clone_depth");
+    // Matches #661/#626's depths so results stay comparable across this
+    // benchmark family.
+    for &depth in &[100usize, 200, 300, 400] {
+        let json = linear_nest(depth);
+        let index = JsonIndex::build(&json);
+        let expr = parse("del(..)").expect("filter parses");
+        // Guard the premise: deleting every node including the root
+        // collapses the whole document to `null` — confirmed against real
+        // jq (`jq 'del(..)'`) — regardless of depth. A different result
+        // would mean this fixture stopped exercising the full `d + 1`-node
+        // fan-out `push_recursive_branches` walks.
+        let cursor = index.root(&json);
+        let probe: QueryResult<Vec<u64>> = eval::<Vec<u64>, JqSemantics>(&expr, cursor);
+        assert!(
+            matches!(probe, QueryResult::Owned(OwnedValue::Null)),
+            "depth {depth} fixture must delete down to null"
+        );
+
+        group.throughput(Throughput::Elements(depth as u64));
+        group.bench_with_input(BenchmarkId::from_parameter(depth), &json, |b, json| {
+            b.iter(|| {
+                let cursor = index.root(black_box(json));
+                let result: QueryResult<Vec<u64>> = eval::<Vec<u64>, JqSemantics>(&expr, cursor);
+                black_box(result.collect_owned().len())
+            });
+        });
+    }
+    group.finish();
+}
+
+criterion_group!(benches, bench_recurse_clone_depth);
+criterion_main!(benches);
