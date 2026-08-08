@@ -93,6 +93,15 @@
 # way for `|=`/`+=`/`-=`/`*=`/`/=`/`%=`/`//=`: it now takes the update
 # filter's first output via `eval_owned_multi` instead of collapsing every
 # output into an `OwnedValue::Array` via `eval_owned_expr`.
+#
+# recurse_f_dfs_sibling_order seeded by #676, ahead of #635:
+# `resolve_recurse`/`builtin_recurse_f`/`builtin_recurse_cond` drive
+# recursion with an explicit FIFO queue (`queue.remove(0)`), which visits a
+# branching node's children level-by-level instead of jq's depth-first `def
+# r: ., (f | r); r;` definition — a node with 2+ children finishes its whole
+# subtree in jq before the next sibling is touched, but this codebase
+# interleaves siblings' subtrees instead. The prior `test_recurse_with_filter`
+# unit test only asserted output length, so it could not catch this.
 
 reduce_multi_output_init       reduce             a multi-output reduce INIT forks in jq; only the first init output is used — #534
 foreach_multi_output_init      foreach            a multi-output foreach INIT forks in jq; only the first init output is used — #534
@@ -100,3 +109,4 @@ reduce_update_zero_output      reduce             a comma in reduce's UPDATE cla
 foreach_extract_fanout         foreach            a comma in foreach's EXTRACT clause is a compile error; jq emits once per EXTRACT output instead of collapsing to one — #534
 while_backtrack                while              a comma in while's update expression is a compile error; jq backtracks through every fork of the condition/update chain — #534
 until_backtrack                until              a comma in until's update expression is a compile error; jq backtracks through every fork of the condition/update chain — #534
+recurse_f_dfs_sibling_order    recurse            recurse(f) visits siblings breadth-first via a FIFO queue instead of jq's depth-first recursive definition — #635
