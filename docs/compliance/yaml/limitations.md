@@ -227,15 +227,18 @@ These are absent rather than wrong, and account for 33 of the 44 load failures.
 ### Tags — 35 cases (33 load, 2 parse)
 
 `!!str`, `!custom`, and verbatim `!<tag:...>` are not supported. In block context the
-parser rejects them outright:
+parser rejects *some* positions:
 
 ```
 $ echo 'a: !!str 1' | succinctly yq '.'
 Error: YAML parse error: tags (!) not supported at offset 3
 ```
 
-Flow context rejects them the same way, in every position — sequence item, mapping value,
-mapping key, and the explicit `? k : v` form
+— but not all of them; see [Tag rejection is not uniform in block context](#tag-rejection-is-not-uniform-in-block-context-664)
+below for the paths that silently absorb the tag as scalar text instead of rejecting it.
+
+Flow context rejects them the same way, in every position tested — sequence item, mapping
+value, mapping key, and the explicit `? k : v` form
 ([#369](https://github.com/rust-works/succinctly/issues/369); before that fix flow context
 absorbed the tag into the scalar, so `[!!str a]` yielded the string `"!!str a"`):
 
@@ -253,6 +256,93 @@ these 35 cases stay failures until it lands. Two of them (`CC74`, `P76L`) are `%
 directive cases: the directive line itself is recognized (see
 [Directives — resolved](#directives--resolved) below), but the shorthand tag it defines is
 still rejected when applied to a node, the same as any other tag.
+
+### Tag rejection is not uniform in block context (#664)
+
+[#664](https://github.com/rust-works/succinctly/issues/664) audited every scalar/key entry
+path in `src/yaml/parser.rs` against `check_unsupported` (the single function meant to reject
+a leading `!` everywhere) ahead of #224 landing real tag support — so #224 closes actual gaps
+rather than papering over ones nobody enumerated. It is audit-and-test-only; the gaps below
+are pinned with regression tests in `tests/yq_cli_tests.rs` (the `test_yaml_tag_gate_gap_*`
+tests) rather than fixed, since fixing them is #224's job.
+
+**19 distinct entry paths were enumerated; 13 are ungated**, collapsing into 6 root causes:
+
+1. **`parse_document_line`'s gate runs before indentation is skipped**
+   (`parser.rs:4269` vs. `count_indent`/`advance_by` at `4272-4303`). It peeks the line's
+   literal first byte — a space for any indented line — not the node's first byte.
+   `!!str x` (column 0) is rejected; `  !!str x` (indented, still a bare document scalar) is
+   not, and yields `"!!str x"`.
+2. **`parse_block_node`'s two scalar-dispatch arms never call `check_unsupported`
+   themselves** (the anchor arm at `4416-4441`, the plain catch-all at `4457-4490`). This is
+   the shared block-context dispatcher — `parse_document_line` and `parse_inline_document_value`
+   both funnel into it — and it's where every "value deferred to the next line" case from
+   `parse_sequence_item`, `parse_mapping_entry`, `parse_compact_mapping_entry`,
+   `parse_explicit_key`, and `parse_explicit_value` eventually lands, ungated and (per root
+   cause 1) not reliably backstopped either. This includes `parse_inline_document_value`
+   (`1061-1081`, content after `---`) — already flagged in its own doc comment as #224's to
+   settle, and the mechanism behind the `J7PZ` corpus case (`--- !!omap`): the tag is absorbed
+   as a complete document-root scalar, so the sequence on the following lines starts a
+   *second* document — one YAML input streams as two JSON documents.
+3. **`parse_mapping_entry`'s next-line plain-scalar branch (`2204-2232`)** parses the
+   deferred value inline, bypassing the function's own gate at `2237` (which only guards the
+   sibling same-line branch).
+4. **Anchor-then-value asymmetry** in `parse_mapping_entry` (`2237` before the `&anchor`
+   check at `2240`) and `parse_compact_mapping_entry` (`1926` before `1927`): both check once,
+   *before* testing for an anchor, then dispatch the value inline with no second check after
+   consuming it. `parse_sequence_item` and the flow-context inner loops avoid this by
+   construction — they consume the anchor themselves, then delegate the scalar dispatch to
+   `parse_value` or `parse_flow_scalar`, which re-check independently at their own entry.
+5. **`parse_explicit_value` (`2582`) has zero `check_unsupported` calls**, for the same-line
+   value, the next-line value, the anchor-then-value form, or its compact-mapping-value arm.
+6. **No block-context key parser gates the key itself** (`parse_mapping_entry`,
+   `parse_compact_mapping_entry`, `parse_explicit_key` at `2364`, whose inline-key dispatch at
+   `2566-2572` has no gate at all). Every currently-rejected tagged key is explained by root
+   cause 1's column-0 accident or `parse_sequence_item`'s pre-dispatch check (`1734`, which
+   runs unconditionally right after `- `, before any compact-mapping-key dispatch is even
+   decided) — not by deliberate key gating.
+
+Flow context (mapping/sequence values, implicit and explicit keys, including every
+anchor-then-tag combination) is **fully gated**: `parse_flow_scalar`,
+`parse_flow_unquoted_key`, and `parse_explicit_flow_unquoted_key` each re-check
+`check_unsupported` at their own entry, so anchor consumption never leaves a stale check
+behind the way it does in block context. This matches the existing
+`test_yaml_flow_context_rejects_tags_like_block_context` (#369) coverage.
+
+| #  | Entry path                                               | Owning function                                              | Gated?                                                                      |
+|----|----------------------------------------------------------|--------------------------------------------------------------|-----------------------------------------------------------------------------|
+| 1  | Sequence item value, right after `- `                    | `parse_sequence_item` → `parse_sequence_item_inner` (`1682`) | Yes (`1734`)                                                                |
+| 2  | Sequence item value deferred to next line                | `parse_sequence_item` → `parse_block_node`                   | No (root cause 2)                                                           |
+| 3  | Compact mapping key                                      | `parse_compact_mapping_entry` (`1860`)                       | No in general (root cause 6); yes when reached via `- ` (root cause 6 note) |
+| 4  | Compact mapping value, same line, no anchor              | `parse_compact_mapping_entry`                                | Yes (`1926`)                                                                |
+| 5  | Compact mapping value, same line, after `&anchor`        | `parse_compact_mapping_entry`                                | No (root cause 4)                                                           |
+| 6  | Compact mapping value, next line                         | `parse_compact_mapping_entry` → `parse_block_node`           | No (root cause 2)                                                           |
+| 7  | Mapping key                                              | `parse_mapping_entry` (`2015`)                               | No (root cause 6)                                                           |
+| 8  | Mapping value, same line, no anchor                      | `parse_mapping_entry`                                        | Yes (`2237`)                                                                |
+| 9  | Mapping value, same line, after `&anchor`                | `parse_mapping_entry`                                        | No (root cause 4)                                                           |
+| 10 | Mapping value, next line, plain-scalar catch-all         | `parse_mapping_entry` (`2204-2232`)                          | No (root cause 3)                                                           |
+| 11 | Mapping value, next line, sequence/flow/anchor lookahead | `parse_mapping_entry` → `parse_block_node`                   | No (root cause 2)                                                           |
+| 12 | Explicit key                                             | `parse_explicit_key` (`2364`)                                | No (root cause 6)                                                           |
+| 13 | Explicit key, sequence-as-key value dispatch             | `parse_explicit_key` → `parse_value`                         | Yes (`2698`)                                                                |
+| 14 | Explicit value (all forms)                               | `parse_explicit_value` (`2582`)                              | No (root cause 5)                                                           |
+| 15 | General block value dispatcher                           | `parse_value` (`2697`)                                       | Yes (`2698`)                                                                |
+| 16 | Per-line block dispatch entry                            | `parse_document_line` (`4268`)                               | Partially (root cause 1)                                                    |
+| 17 | Anchor-prefixed scalar, non-mapping-key                  | `parse_block_node` (`4416-4441`)                             | No (root cause 2)                                                           |
+| 18 | Plain scalar catch-all                                   | `parse_block_node` (`4457-4490`)                             | No (root cause 2)                                                           |
+| 19 | Content after `---` on the same line                     | `parse_inline_document_value` (`1061-1081`)                  | No (root cause 2)                                                           |
+
+**Explicitly excluded from this audit's fixes:**
+- `src/yaml/mod.rs`'s module doc comment and `parser.rs`'s own comments (e.g.
+  `parse_inline_document_value`'s doc comment, and
+  `test_yaml_flow_context_rejects_tags_like_block_context`'s old claim that "block context has
+  always errored on `!`") were also stale or imprecise; the test comment was corrected as part
+  of #664, but `src/` comments were left for #224 since #664 makes no `src/` changes.
+- `src/yaml/validate.rs`'s `check_block_indent`/`check_root_kind` reuse the same indicator
+  bytes (`&`, `*`, `!`) for a structural check, but that's the separate, opt-in strict
+  validator, not `check_unsupported` — out of scope here.
+- Whether *all* key positions (row 6 above) belong in this gate, versus only the
+  explicit-key case the original issue text called out, is a judgment call #664 left open
+  rather than deciding unilaterally; #224 (or a follow-up) should settle it.
 
 ### A flow collection as a same-line explicit key
 
