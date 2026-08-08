@@ -10,6 +10,7 @@ use std::io::{BufWriter, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 
 use succinctly::dsv::{build_index as build_dsv_index, DsvConfig, DsvRows};
+use succinctly::jq::document::DocumentFields;
 use succinctly::jq::eval_generic::{eval_with_cursor, to_owned as generic_to_owned, GenericResult};
 use succinctly::jq::{self, format_number_jq_compat, Expr, JqValue, OwnedValue, Program};
 use succinctly::json::light::{JsonCursor, StandardJson};
@@ -1592,6 +1593,14 @@ fn evaluate_input(
         GenericResult::ManyCursor(cs) => {
             Ok(cs.iter().map(|c| generic_to_owned(&c.value())).collect())
         }
+        // Fallback: materialize. This runner boundary never sees a
+        // fast-pathed `keys_unsorted | length`/`.[]`/`.[n]`/`first`/`last`
+        // — those are fully resolved inside the evaluator's `Pipe` dispatch
+        // before it gets here — so this only fires for `keys_unsorted`
+        // alone, or piped into something else (`map`, `select`, ...).
+        GenericResult::LazyKeysUnsorted(fields) => Ok(vec![OwnedValue::Array(
+            fields.keys().into_iter().map(OwnedValue::String).collect(),
+        )]),
         GenericResult::None => Ok(vec![]),
         GenericResult::Error(e) => {
             sink.report(DiagStyle::Jq, &e, at);
@@ -1654,6 +1663,14 @@ fn generic_result_to_jq_values<'a, W: Clone + AsRef<[u64]>>(
             .collect(),
         // ManyCursor: same lazy-cursor efficiency as OneCursor, per element.
         GenericResult::ManyCursor(cs) => cs.into_iter().map(JqValue::Cursor).collect(),
+        // Fallback: materialize. This runner boundary never sees a
+        // fast-pathed `keys_unsorted | length`/`.[]`/`.[n]`/`first`/`last`
+        // — those are fully resolved inside the evaluator's `Pipe` dispatch
+        // before it gets here — so this only fires for `keys_unsorted`
+        // alone, or piped into something else (`map`, `select`, ...).
+        GenericResult::LazyKeysUnsorted(fields) => vec![JqValue::from_owned(OwnedValue::Array(
+            fields.keys().into_iter().map(OwnedValue::String).collect(),
+        ))],
         GenericResult::None => vec![],
         GenericResult::Error(e) => {
             sink.report(DiagStyle::Jq, &e, at);

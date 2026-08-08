@@ -4116,3 +4116,28 @@ fn test_path_context_builtins_across_pipe_stages_554() -> Result<()> {
 
     Ok(())
 }
+
+/// `keys_unsorted` gained a lazy `GenericResult`/evaluator path shared with
+/// `jq` (#140), but `yq_runner.rs` has no `JqValue`-equivalent lazy output
+/// concept, so its `evaluate_yaml_cursor` boundary still materializes
+/// unconditionally (deferred to a follow-up issue). This just confirms that
+/// materialize fallback still produces correct, unchanged output on the YAML
+/// side.
+#[test]
+fn test_keys_unsorted_yaml_materialize_fallback_140() -> Result<()> {
+    let input = "b: 1\na: 2\nc: 3\n";
+
+    let (output, code) = run_yq_stdin("keys_unsorted", input, &["-o", "json", "-I0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#"["b","a","c"]"#);
+
+    let (output, code) = run_yq_stdin("keys_unsorted | length", input, &["-o", "json", "-I0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "3");
+
+    let (output, code) = run_yq_stdin("keys_unsorted | .[0]", input, &["-o", "json", "-I0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#""b""#);
+
+    Ok(())
+}
