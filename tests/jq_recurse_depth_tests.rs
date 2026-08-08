@@ -77,7 +77,7 @@ fn bare_recurse_correct_at_depth() {
     assert_eq!(run_paths(&json, "path(recurse)"), expected_paths(DEPTH));
 }
 
-/// `recurse(f; cond)` — the `resolve_recurse` BFS-queue path. `cond` stops
+/// `recurse(f; cond)` — the `resolve_recurse` stack-based path. `cond` stops
 /// exactly at the `{}` leaf (its `.k` is `null`, not an object), producing
 /// the same path set as the bare form on this document.
 #[test]
