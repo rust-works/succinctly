@@ -287,6 +287,26 @@ fn to_owned<W: Clone + AsRef<[u64]>>(value: &StandardJson<'_, W>) -> OwnedValue 
     }
 }
 
+/// Materialize a key/slice-bound candidate just enough to classify it.
+///
+/// `index_one`/[`EvalError::cannot_index`] and `SliceBounds::resolved_bound`
+/// never inspect an Array/Object candidate's *contents* — only its type
+/// name, to build the `Cannot index ... with array/object`/`Array or string
+/// slice indices must be integers` message — so a full recursive [`to_owned`]
+/// of a large navigated container candidate is pure waste when it can only
+/// ever be rejected on type. Mirrors [`json_is_truthy`]'s existing "classify
+/// without paying for `to_owned`'s full deep copy" idiom, for the same
+/// reason: `.. | .[.k]?` visits every node in a tree, and on a
+/// linear-nesting document `.k`'s value at depth *i* is the entire
+/// remaining subtree (#626).
+fn to_owned_key_shape<W: Clone + AsRef<[u64]>>(value: &StandardJson<'_, W>) -> OwnedValue {
+    match value {
+        StandardJson::Array(_) => OwnedValue::Array(Vec::new()),
+        StandardJson::Object(_) => OwnedValue::Object(IndexMap::new()),
+        other => to_owned(other),
+    }
+}
+
 /// jq truthiness of a borrowed value: everything except `null` and `false`.
 ///
 /// Equivalent to `to_owned(value).is_truthy()` — [`to_owned`] maps
@@ -6839,8 +6859,8 @@ fn eval_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 ) -> QueryResult<'a, W> {
     // (3) Keys first: an empty key stream must not evaluate the target.
     let keys = match eval_single::<W, S>(key, value.clone(), false).materialize_cursor() {
-        QueryResult::One(v) => vec![to_owned(&v)],
-        QueryResult::Many(vs) => vs.iter().map(to_owned).collect(),
+        QueryResult::One(v) => vec![to_owned_key_shape(&v)],
+        QueryResult::Many(vs) => vs.iter().map(to_owned_key_shape).collect(),
         QueryResult::Owned(v) => vec![v],
         QueryResult::ManyOwned(vs) => vs,
         QueryResult::None => return QueryResult::None,
@@ -7050,8 +7070,8 @@ fn eval_slice_bound<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         return Ok(vec![None]);
     };
     let raw: Vec<OwnedValue> = match eval_single::<W, S>(expr, value, false).materialize_cursor() {
-        QueryResult::One(v) => vec![to_owned(&v)],
-        QueryResult::Many(vs) => vs.iter().map(to_owned).collect(),
+        QueryResult::One(v) => vec![to_owned_key_shape(&v)],
+        QueryResult::Many(vs) => vs.iter().map(to_owned_key_shape).collect(),
         QueryResult::Owned(v) => vec![v],
         QueryResult::ManyOwned(vs) => vs,
         QueryResult::None => return Ok(Vec::new()),
