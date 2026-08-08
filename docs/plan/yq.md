@@ -486,7 +486,63 @@ fn yaml_to_owned_value(index: &YamlIndex) -> OwnedValue {
 }
 ```
 
-Future optimization: lazy cursor-based evaluation (like JSON implementation).
+Lazy cursor-based evaluation (like the JSON implementation) landed as the M2/M2.5
+streaming fast path (`GenericResult::stream_json`/`stream_yaml`, `can_use_m2_streaming`
+in `src/bin/succinctly/yq_runner.rs`) — see the note immediately below for how
+`keys_unsorted` specifically was made to fit it.
+
+### Lazy `keys_unsorted` output (#685)
+
+`keys_unsorted` on a YAML mapping already produced a lazy `GenericResult::LazyKeysUnsorted`
+(#140/#678), but `yq_runner.rs`'s CLI output boundary always materialized it into an owned
+`Vec<String>` before printing — unlike JSON's `jq`, which streams it via `JqValue::LazyKeysArray`
+(`src/jq/lazy.rs`). Issue #685 framed the fix as a choice between (A) a YAML-specific lazy
+value type parallel to `JqValue`, or (B) generalizing `JqValue` over cursor type.
+
+Neither was used. `JqValue::LazyKeysArray`'s streaming loop depends on `JsonFields: Copy`
+(`let mut current = *fields`); `YamlFields` can never be `Copy` — its `FieldsInner` is
+`Direct(Option<YamlCursor>)` *or* `Merged { entries: Rc<Vec<(YamlCursor, YamlCursor)>>, index }`
+for `<<: *anchor` merge-key resolution, and the `Rc`-holding variant rules out a bitwise copy.
+Generalizing `JqValue` over cursor type would mean changing that bound to `Clone` throughout
+`jq_runner.rs`'s hot path too, for a type that didn't need to change.
+
+Instead, `GenericResult::stream_json`/`stream_yaml` (`src/jq/eval_generic.rs`) — already
+generic over `V: DocumentValue`, already the exact machinery `yq_runner.rs`'s M2/M2.5 fast
+path calls — got real implementations for their one remaining eager arm
+(`LazyKeysUnsorted`), added as `stream_lazy_keys_json`/`stream_lazy_keys_yaml` in
+`src/jq/stream.rs`. Both mirror the `Array` arms of `stream_owned_value_json_with`/
+`stream_owned_value_yaml` exactly (same empty-check, same flow/block/indent framing), but
+pull one key at a time from `fields.clone()` + `uncons()` instead of walking a pre-built
+slice — no `Vec<String>`/`OwnedValue::Array` is ever built. `can_use_m2_streaming` was
+extended to admit `Builtin::KeysUnsorted`, so `syq 'keys_unsorted'` (and pipe compositions
+like `.foo | keys_unsorted`) now route through this path under the same default-flag
+conditions every other M2 query already requires.
+
+This is effectively option (B) — generalizing over value/cursor type — just realized at the
+streaming-function layer that was already generic, rather than by generalizing the `JqValue`
+enum tree. It reuses tested escaping logic (`stream_json_string`/`stream_yaml_string`),
+leaves `jq_runner.rs`/`JqValue` untouched, and is a much smaller diff than either option the
+issue proposed. `evaluate_yaml_cursor`'s DOM-path `LazyKeysUnsorted` arm is intentionally
+unchanged: it remains the correct materializing fallback for flag combinations
+(`--sort-keys`, color, `--tab`, `--slurp`, `--null-input`, named vars) that already force
+the DOM path for every other query shape, not a `keys_unsorted`-specific gap. Note that
+`-I0` (compact) satisfies the M2 gate on its own regardless of those flags
+(`output_config.compact || ...`), so exercising the DOM path in compact mode specifically
+needs `--arg` (an unused named variable), not `--sort-keys` — `--sort-keys` alone only forces
+DOM in pretty mode.
+
+Sanity-checked (not a formal interleaved A/B benchmark) on a 500K-key flat mapping (8.8 MB):
+`syq -o json -I0 'keys_unsorted'` (M2 lazy path) peaked at 84 MB / 0.14s versus 136 MB / 0.20s
+for the same query forced onto the DOM path via `--arg` — output byte-identical in both, ~40%
+less peak memory and ~30% faster, consistent with no longer building a 500K-entry `Vec<String>`.
+
+One casualty: `keys_unsorted` has no yq golden-fixture coverage (`tests/data/yq-golden/`)
+because the pinned oracle, `mikefarah/yq v4.53.3`, rejects the identifier at the lexer level
+(`Error: 1:5: lexer: invalid input text "_unsorted"`) — it doesn't implement this builtin at
+all. Coverage instead lives in `tests/yq_cli_tests.rs` (byte-identity checks between the M2
+lazy path and the DOM path forced via `--arg`/`--sort-keys`) and direct unit tests in
+`src/jq/eval_generic.rs` (`test_yaml_keys_unsorted_stream_lazy_685` and its merge-key
+counterpart).
 
 ---
 
