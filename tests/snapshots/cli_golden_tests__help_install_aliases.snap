@@ -1,9 +1,8 @@
 ---
 source: tests/cli_golden_tests.rs
-assertion_line: 64
 expression: output
 ---
-Install short alias symlinks (sjq, syq, sjq-locate, syq-locate)
+Install short alias symlinks (sjq, syq, sxq, sjq-locate, syq-locate, sxq-locate)
 
 Usage: succinctly install-aliases [OPTIONS]
 

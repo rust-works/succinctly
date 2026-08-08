@@ -33,25 +33,29 @@ pub mod exit_codes {
 
 /// Which tool's diagnostic conventions to follow.
 ///
-/// The two upstreams disagree, and both are drop-in targets for us:
+/// The two upstreams disagree, and both are drop-in targets for us. `Xq` has
+/// no upstream to match (there's no reference `xq` tool) — it follows jq's
+/// conventions verbatim (issue #667's own framing: xq is "XML query language
+/// using jq syntax"), just with an `xq:` prefix instead of `jq:`.
 ///
-/// | | jq 1.7.1 | mikefarah/yq v4 |
-/// |---|---|---|
-/// | text | `jq: error (at <stdin>:1): boom` | `Error: boom` |
-/// | position marker | yes | no |
-/// | `(not a string)` marker | yes | no |
-/// | exit code | 5 | 1 |
+/// | | jq 1.7.1 | mikefarah/yq v4 | xq (this crate) |
+/// |---|---|---|---|
+/// | text | `jq: error (at <stdin>:1): boom` | `Error: boom` | `xq: error (at <stdin>:1): boom` |
+/// | position marker | yes | no | yes |
+/// | `(not a string)` marker | yes | no | yes |
+/// | exit code | 5 | 1 | 5 |
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiagStyle {
     Jq,
     Yq,
+    Xq,
 }
 
 impl DiagStyle {
     /// Process exit code for an uncaught evaluation error in this style.
     pub fn error_exit_code(self) -> i32 {
         match self {
-            Self::Jq => exit_codes::RUNTIME_ERROR,
+            Self::Jq | Self::Xq => exit_codes::RUNTIME_ERROR,
             Self::Yq => exit_codes::YQ_FAILURE,
         }
     }
@@ -137,6 +141,10 @@ impl ErrorSink {
             DiagStyle::Jq => {
                 let marker = if not_a_string { " (not a string)" } else { "" };
                 eprintln!("jq: error (at {at}){marker}: {message}");
+            }
+            DiagStyle::Xq => {
+                let marker = if not_a_string { " (not a string)" } else { "" };
+                eprintln!("xq: error (at {at}){marker}: {message}");
             }
             // yq carries neither marker; `Error:` matches the prefix already
             // used for its "no matches found" failure.

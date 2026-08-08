@@ -25,13 +25,17 @@ enum Command {
     Jq(JqCommand),
     /// Command-line YAML processor (jq-compatible syntax)
     Yq(YqCommand),
+    /// Command-line XML processor (jq-compatible syntax)
+    Xq(XqCommand),
     /// Find jq expression for a position in a JSON file
     JqLocate(jq_locate::JqLocateArgs),
     /// Find yq expression for a position in a YAML file
     YqLocate(yq_locate::YqLocateArgs),
+    /// Find xq expression for a position in an XML file
+    XqLocate(xq_locate::XqLocateArgs),
     /// Developer tools (benchmarking, profiling)
     Dev(DevCommand),
-    /// Install short alias symlinks (sjq, syq, sjq-locate, syq-locate)
+    /// Install short alias symlinks (sjq, syq, sxq, sjq-locate, syq-locate, sxq-locate)
     InstallAliases(InstallAliasesArgs),
     /// Unified benchmark runner (list and run all benchmarks)
     #[cfg(feature = "bench-runner")]
@@ -270,7 +274,14 @@ enum BenchRunnerSubcommand {
 }
 
 /// Default alias names installed by `install-aliases`.
-const MULTICALL_ALIASES: &[&str] = &["sjq", "syq", "sjq-locate", "syq-locate"];
+const MULTICALL_ALIASES: &[&str] = &[
+    "sjq",
+    "syq",
+    "sxq",
+    "sjq-locate",
+    "syq-locate",
+    "sxq-locate",
+];
 
 #[derive(Debug, Parser)]
 struct BenchCommand {
@@ -1103,6 +1114,102 @@ pub struct YqCommand {
     pub build_configuration: bool,
 }
 
+/// Command-line XML processor (jq-compatible syntax).
+///
+/// Milestone 1 of the `xq` XML query tool (issue #667, MVP carve-out of
+/// #85): plain `.foo.bar`-style navigation and `at_offset`/`at_position`
+/// against basic XML. Deliberately a smaller surface than [`JqCommand`]/
+/// [`YqCommand`] — no DSV/JSON-seq/module-path/slurpfile/positional-args
+/// extensions (jq-only concerns that don't apply to a new format), and no
+/// output-format-conversion flags (no XML re-serialization in this
+/// milestone, so no `-o`/`-p`/`--doc`/`-P`/`-i` the way `yq` has).
+#[derive(Debug, Parser)]
+#[command(name = "xq")]
+#[command(about = "Command-line XML processor (jq-compatible syntax)", long_about = None)]
+pub struct XqCommand {
+    /// jq filter expression (e.g., ".", ".foo", ".foo.bar")
+    /// If not provided, uses "." (identity)
+    pub filter: Option<String>,
+
+    /// Input files (reads from stdin if none provided)
+    #[arg(trailing_var_arg = true)]
+    pub files: Vec<String>,
+
+    // === Input Options ===
+    /// Don't read any input; use null as the single input value
+    #[arg(short = 'n', long)]
+    pub null_input: bool,
+
+    // === Output Options ===
+    /// Compact output (no pretty printing)
+    #[arg(short = 'c', long)]
+    pub compact_output: bool,
+
+    /// Output raw strings without quotes
+    #[arg(short = 'r', long)]
+    pub raw_output: bool,
+
+    /// Like -r but don't print newline after each output
+    #[arg(short = 'j', long)]
+    pub join_output: bool,
+
+    /// Like -r but print NUL instead of newline after each output
+    #[arg(long)]
+    pub raw_output0: bool,
+
+    /// Output ASCII only, escaping non-ASCII as \uXXXX
+    #[arg(short = 'a', long)]
+    pub ascii_output: bool,
+
+    /// Colorize output (default if stdout is a terminal)
+    #[arg(short = 'C', long)]
+    pub color_output: bool,
+
+    /// Disable colorized output
+    #[arg(short = 'M', long)]
+    pub monochrome_output: bool,
+
+    /// Sort keys of each object on output
+    #[arg(short = 'S', long)]
+    pub sort_keys: bool,
+
+    /// Use tabs for indentation
+    #[arg(long)]
+    pub tab: bool,
+
+    /// Use n spaces for indentation (max 7)
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u8).range(0..=7))]
+    pub indent: Option<u8>,
+
+    // === Program Input ===
+    /// Read filter from file instead of command line
+    #[arg(short = 'f', long, value_name = "FILE")]
+    pub from_file: Option<PathBuf>,
+
+    // === Variables ===
+    /// Set $name to the string value
+    #[arg(long, value_names = ["NAME", "VALUE"], num_args = 2, action = clap::ArgAction::Append)]
+    pub arg: Vec<String>,
+
+    /// Set $name to the JSON value
+    #[arg(long, value_names = ["NAME", "VALUE"], num_args = 2, action = clap::ArgAction::Append)]
+    pub argjson: Vec<String>,
+
+    // === Exit Status ===
+    /// Set exit status based on output (0 if last output != false/null)
+    #[arg(short = 'e', long)]
+    pub exit_status: bool,
+
+    // === Info ===
+    /// Show version information
+    #[arg(short = 'V', long)]
+    pub version: bool,
+
+    /// Show build configuration
+    #[arg(long)]
+    pub build_configuration: bool,
+}
+
 impl From<PatternArg> for generators::Pattern {
     fn from(arg: PatternArg) -> Self {
         match arg {
@@ -1190,6 +1297,12 @@ fn try_multicall() -> Result<Option<i32>> {
             );
             Ok(Some(yq_runner::run_yq(cmd)?))
         }
+        "sxq" | "xq" => {
+            let cmd = XqCommand::parse_from(
+                std::iter::once(name.to_string()).chain(std::env::args().skip(1)),
+            );
+            Ok(Some(xq_runner::run_xq(cmd)?))
+        }
         "sjq-locate" | "jq-locate" => {
             let cmd = jq_locate::JqLocateArgs::parse_from(
                 std::iter::once(name.to_string()).chain(std::env::args().skip(1)),
@@ -1201,6 +1314,12 @@ fn try_multicall() -> Result<Option<i32>> {
                 std::iter::once(name.to_string()).chain(std::env::args().skip(1)),
             );
             Ok(Some(yq_locate::run_yq_locate(cmd)?))
+        }
+        "sxq-locate" | "xq-locate" => {
+            let cmd = xq_locate::XqLocateArgs::parse_from(
+                std::iter::once(name.to_string()).chain(std::env::args().skip(1)),
+            );
+            Ok(Some(xq_locate::run_xq_locate(cmd)?))
         }
         _ => Ok(None),
     }
@@ -1223,12 +1342,20 @@ fn main() -> Result<()> {
             let exit_code = yq_runner::run_yq(args)?;
             std::process::exit(exit_code);
         }
+        Command::Xq(args) => {
+            let exit_code = xq_runner::run_xq(args)?;
+            std::process::exit(exit_code);
+        }
         Command::JqLocate(args) => {
             let exit_code = jq_locate::run_jq_locate(args)?;
             std::process::exit(exit_code);
         }
         Command::YqLocate(args) => {
             let exit_code = yq_locate::run_yq_locate(args)?;
+            std::process::exit(exit_code);
+        }
+        Command::XqLocate(args) => {
+            let exit_code = xq_locate::run_xq_locate(args)?;
             std::process::exit(exit_code);
         }
         Command::Json(json_cmd) => match json_cmd.command {
@@ -2206,6 +2333,8 @@ mod select_stats_report;
 mod text_generators;
 mod text_validate;
 mod utf8_bench;
+mod xq_locate;
+mod xq_runner;
 mod yaml_generators;
 mod yaml_pattern_registry;
 mod yaml_validate;
