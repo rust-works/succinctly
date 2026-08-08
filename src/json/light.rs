@@ -1087,6 +1087,15 @@ impl<'a, W: AsRef<[u64]>> JsonField<'a, W> {
     pub fn value_cursor(&self) -> JsonCursor<'a, W> {
         self.value_cursor
     }
+
+    /// Get the key cursor directly.
+    ///
+    /// This allows raw-byte access to the key (`raw_bytes()`) without
+    /// decoding through `StandardJson::String` first.
+    #[inline]
+    pub fn key_cursor(&self) -> JsonCursor<'a, W> {
+        self.key_cursor
+    }
 }
 
 // ============================================================================

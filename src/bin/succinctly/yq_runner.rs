@@ -9,7 +9,7 @@ use indexmap::IndexMap;
 use std::io::{BufWriter, IsTerminal, Read, Write};
 use std::path::Path;
 
-use succinctly::jq::document::DocumentCursor;
+use succinctly::jq::document::{DocumentCursor, DocumentFields};
 use succinctly::jq::eval_generic::{eval_with_cursor_using, to_owned, GenericResult};
 use succinctly::jq::{self, Builtin, Expr, OwnedValue, QueryResult, YqSemantics};
 use succinctly::json::light::StandardJson;
@@ -400,6 +400,14 @@ fn evaluate_yaml_cursor<W: AsRef<[u64]> + Clone>(
         GenericResult::OneCursor(c) => Ok(vec![to_owned(&c.value())]),
         GenericResult::Many(vs) => Ok(vs.iter().map(to_owned).collect()),
         GenericResult::ManyCursor(cs) => Ok(cs.iter().map(|c| to_owned(&c.value())).collect()),
+        // Fallback: materialize (issue #666 spike). YAML has no lazy-output
+        // concept today — `yq_runner.rs` never builds a `JqValue` — so
+        // unlike the JSON `jq` runner, this is the only path available
+        // here; a genuinely lazy YAML `keys_unsorted` output is out of
+        // scope for this slice.
+        GenericResult::LazyKeysUnsorted(fields) => Ok(vec![OwnedValue::Array(
+            fields.keys().into_iter().map(OwnedValue::String).collect(),
+        )]),
         GenericResult::None => Ok(vec![]),
         GenericResult::Error(e) => {
             sink.report(DiagStyle::Yq, &e, &no_location());

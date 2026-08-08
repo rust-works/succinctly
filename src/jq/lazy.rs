@@ -86,6 +86,13 @@ pub enum JqValue<'a, W = Vec<u64>> {
     /// Created when constructing objects with `{a: .x, b: .y + 1}`.
     /// Keys are always strings, values can be lazy or materialized.
     Object(IndexMap<String, Self>),
+
+    /// Lazy array of `keys_unsorted` results, backed by an object field
+    /// iterator — not yet decoded into `String`s. Spike for issue #666 /
+    /// #140: `write_json` streams each key's raw bytes straight from its
+    /// cursor, so a bare `keys_unsorted` output never materializes a
+    /// `Vec<String>`.
+    LazyKeysArray(crate::json::light::JsonFields<'a, W>),
 }
 
 impl<'a, W: Clone + AsRef<[u64]>> JqValue<'a, W> {
@@ -239,6 +246,7 @@ impl<'a, W: Clone + AsRef<[u64]>> JqValue<'a, W> {
             JqValue::String(_) => "string",
             JqValue::Array(_) => "array",
             JqValue::Object(_) => "object",
+            JqValue::LazyKeysArray(_) => "array",
         }
     }
 
@@ -321,6 +329,10 @@ impl<'a, W: Clone + AsRef<[u64]>> JqValue<'a, W> {
             JqValue::String(s) => Some(s.chars().count()),
             JqValue::Array(arr) => Some(arr.len()),
             JqValue::Object(obj) => Some(obj.len()),
+            // No wildcard covers this case (issue #666 spike): without this
+            // arm, `keys_unsorted | length` reaching `JqValue` directly would
+            // silently answer `None` instead of the field count.
+            JqValue::LazyKeysArray(fields) => Some((*fields).count()),
             JqValue::Cursor(c) => match c.value() {
                 StandardJson::Null => Some(0),
                 StandardJson::String(s) => s.as_str().ok().map(|s| s.chars().count()),
@@ -380,6 +392,7 @@ impl<'a, W: Clone + AsRef<[u64]>> JqValue<'a, W> {
                     .map(|(k, v)| (k.clone(), v.materialize()))
                     .collect(),
             ),
+            JqValue::LazyKeysArray(fields) => lazy_keys_array_to_owned(fields),
         }
     }
 
@@ -403,6 +416,7 @@ impl<'a, W: Clone + AsRef<[u64]>> JqValue<'a, W> {
             JqValue::Object(obj) => {
                 OwnedValue::Object(obj.into_iter().map(|(k, v)| (k, v.into_owned())).collect())
             }
+            JqValue::LazyKeysArray(fields) => lazy_keys_array_to_owned(&fields),
         }
     }
 
@@ -491,6 +505,43 @@ impl<'a, W: Clone + AsRef<[u64]>> JqValue<'a, W> {
                 }
                 out.write_char('}')
             }
+            // Genuinely lazy (issue #666 spike): each key's raw bytes come
+            // straight from its cursor — already a valid, already-escaped
+            // JSON string token — so this never allocates a `String` per
+            // key, unlike `JqValue::Object`/`Array` above.
+            JqValue::LazyKeysArray(fields) => {
+                out.write_char('[')?;
+                let mut current = *fields;
+                let mut first = true;
+                while let Some((field, rest)) = current.uncons() {
+                    if !first {
+                        out.write_char(',')?;
+                    }
+                    first = false;
+                    match field.key_cursor().raw_bytes() {
+                        Some(bytes) => {
+                            let s = core::str::from_utf8(bytes).map_err(|_| core::fmt::Error)?;
+                            out.write_str(s)?;
+                        }
+                        // Defensive fallback; JSON object keys are always
+                        // string tokens with a text range, so this is not
+                        // expected to be reached.
+                        None => {
+                            if let StandardJson::String(k) = field.key() {
+                                out.write_char('"')?;
+                                if let Ok(s) = k.as_str() {
+                                    write_json_body_jq(out, &s)?;
+                                }
+                                out.write_char('"')?;
+                            } else {
+                                out.write_str("null")?;
+                            }
+                        }
+                    }
+                    current = rest;
+                }
+                out.write_char(']')
+            }
         }
     }
 
@@ -504,6 +555,24 @@ impl<'a, W: Clone + AsRef<[u64]>> JqValue<'a, W> {
         let _ = self.write_json(&mut out);
         out
     }
+}
+
+/// Materialize a `JqValue::LazyKeysArray` into the `Vec<String>` array it
+/// would have been all along (issue #666 spike escape hatch).
+fn lazy_keys_array_to_owned<W: Clone + AsRef<[u64]>>(
+    fields: &crate::json::light::JsonFields<'_, W>,
+) -> OwnedValue {
+    let mut keys = Vec::new();
+    let mut current = *fields;
+    while let Some((field, rest)) = current.uncons() {
+        if let StandardJson::String(k) = field.key() {
+            if let Ok(s) = k.as_str() {
+                keys.push(OwnedValue::String(s.into_owned()));
+            }
+        }
+        current = rest;
+    }
+    OwnedValue::Array(keys)
 }
 
 /// Convert a JsonCursor to an OwnedValue (full materialization).
