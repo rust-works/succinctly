@@ -10,6 +10,7 @@ use std::io::{BufWriter, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 
 use succinctly::dsv::{build_index as build_dsv_index, DsvConfig, DsvRows};
+use succinctly::jq::document::DocumentFields;
 use succinctly::jq::eval_generic::{eval_with_cursor, to_owned as generic_to_owned, GenericResult};
 use succinctly::jq::{self, format_number_jq_compat, Expr, JqValue, OwnedValue, Program};
 use succinctly::json::light::{JsonCursor, StandardJson};
@@ -1592,6 +1593,14 @@ fn evaluate_input(
         GenericResult::ManyCursor(cs) => {
             Ok(cs.iter().map(|c| generic_to_owned(&c.value())).collect())
         }
+        // Fallback: materialize (issue #666 spike). This runner boundary
+        // never sees a fast-pathed `keys_unsorted | length` — that's fully
+        // resolved to `Owned(Int(..))` inside the evaluator before it gets
+        // here — so this only fires for `keys_unsorted` alone or piped into
+        // something other than `length`.
+        GenericResult::LazyKeysUnsorted(fields) => Ok(vec![OwnedValue::Array(
+            fields.keys().into_iter().map(OwnedValue::String).collect(),
+        )]),
         GenericResult::None => Ok(vec![]),
         GenericResult::Error(e) => {
             sink.report(DiagStyle::Jq, &e, at);
@@ -1654,6 +1663,10 @@ fn generic_result_to_jq_values<'a, W: Clone + AsRef<[u64]>>(
             .collect(),
         // ManyCursor: same lazy-cursor efficiency as OneCursor, per element.
         GenericResult::ManyCursor(cs) => cs.into_iter().map(JqValue::Cursor).collect(),
+        // Stays lazy all the way to output (issue #666 spike): a bare
+        // `keys_unsorted` never materializes a `Vec<String>` — `write_json`
+        // streams each key's raw bytes straight from `fields`.
+        GenericResult::LazyKeysUnsorted(fields) => vec![JqValue::LazyKeysArray(fields)],
         GenericResult::None => vec![],
         GenericResult::Error(e) => {
             sink.report(DiagStyle::Jq, &e, at);
@@ -2156,6 +2169,55 @@ where
                 out.write_all(separator.as_bytes())?;
                 out.write_all(current_indent.as_bytes())?;
                 out.write_all(b"}")?;
+            }
+        }
+        // Genuinely lazy (issue #666 spike): stream each key's raw bytes
+        // straight from its cursor, same zero-copy convention as
+        // `JqValue::Cursor`'s `StandardJson::Object` arm above — never
+        // collects a `Vec<String>` first.
+        JqValue::LazyKeysArray(fields) => {
+            use succinctly::json::light::StandardJson as SJ;
+            if fields.is_empty() {
+                out.write_all(b"[]")?;
+            } else {
+                out.write_all(b"[")?;
+                if !compact {
+                    out.write_all(separator.as_bytes())?;
+                }
+                for (i, field) in (*fields).enumerate() {
+                    if i > 0 {
+                        out.write_all(b",")?;
+                        if !compact {
+                            out.write_all(separator.as_bytes())?;
+                        }
+                    }
+                    if !compact {
+                        out.write_all(next_indent.as_bytes())?;
+                    }
+                    if let SJ::String(k) = field.key() {
+                        let raw = k.raw_bytes();
+                        let content = &raw[1..raw.len().saturating_sub(1)];
+                        if !config.ascii_output && !content.contains(&b'\\') {
+                            out.write_all(raw)?;
+                        } else if let Ok(decoded) = k.as_str() {
+                            out.write_all(b"\"")?;
+                            let escaped = if config.ascii_output {
+                                escape_json_string_ascii(&decoded)
+                            } else {
+                                escape_json_string(&decoded)
+                            };
+                            out.write_all(escaped.as_bytes())?;
+                            out.write_all(b"\"")?;
+                        } else {
+                            out.write_all(raw)?;
+                        }
+                    }
+                }
+                if !compact {
+                    out.write_all(separator.as_bytes())?;
+                    out.write_all(current_indent.as_bytes())?;
+                }
+                out.write_all(b"]")?;
             }
         }
     }
