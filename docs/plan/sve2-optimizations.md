@@ -188,7 +188,7 @@ for prefix XOR instead of the 6-shift scalar algorithm. This works on ALL ARM64 
 
 ### Current State (January 2026)
 
-From [Rust Project Goals](https://rust-lang.github.io/rust-project-goals/2025h2/scalable-vectors.html):
+From [Rust Project Goals](https://rust-lang.github.io/goals/2025h2/scalable-vectors.html):
 
 - **Status**: Experimental, nightly-only
 - **Intrinsics**: PR [stdarch#1509](https://github.com/rust-lang/stdarch/pull/1509) pending
@@ -469,7 +469,7 @@ Based on Phase 3 benchmarks:
 
 ## References
 
-- [Rust SVE2 Project Goal](https://rust-lang.github.io/rust-project-goals/2025h2/scalable-vectors.html)
+- [Rust SVE2 Project Goal](https://rust-lang.github.io/goals/2025h2/scalable-vectors.html)
 - [ARM SVE2 Intrinsics](https://developer.arm.com/documentation/102340/latest/New-features-in-SVE2)
 - [PDEP/PEXT Cross-Architecture](https://gist.github.com/Validark/9455d410ccc8e4bfd1c1c5c4fa38f934)
 - [GitHub Actions ARM64 Runners](https://github.com/orgs/community/discussions/148648)
