@@ -239,6 +239,10 @@ harness = false
 name = "jq_recurse_clone_bench"
 harness = false
 
+[[bench]]
+name = "jq_generic_index_bench"
+harness = false
+
 # =============================================================================
 # Lints
 #
