@@ -42,6 +42,7 @@ by Michael Nygard.
 | [ADR-0013](adr-0013.md) | ✅ Accepted | 2026-07-25 | Reject the SIMD Chunk-Scanner JSON Validator (#130)      |
 | [ADR-0014](adr-0014.md) | ✅ Accepted | 2026-08-03 | Reject Consolidating This Crate's Rank Implementations   |
 | [ADR-0015](adr-0015.md) | ✅ Accepted | 2026-08-05 | Keep BitVec, RankDirectory, and SelectIndex As-Is        |
+| [ADR-0016](adr-0016.md) | ✅ Accepted | 2026-08-08 | Reject SIMD Escape Scanning for jq Format Functions      |
 
 The inventory is maintained by the [`update-adr-inventory`](../../.claude/skills/update-adr-inventory/SKILL.md)
 skill, which scans `adr-*.md` for the title and status and derives the date from git history.
