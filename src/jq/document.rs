@@ -296,6 +296,8 @@ pub struct DocumentField<V, C> {
     pub key: V,
     /// The field value.
     pub value: V,
+    /// Cursor to the key (for lazy key-array navigation, e.g. `keys_unsorted`).
+    pub key_cursor: C,
     /// Cursor to the value (for efficient sub-navigation).
     pub value_cursor: C,
 }

@@ -3499,6 +3499,15 @@ impl<'a, W: AsRef<[u64]>> YamlField<'a, W> {
     pub fn value_cursor(&self) -> YamlCursor<'a, W> {
         self.value_cursor
     }
+
+    /// Get the key cursor directly.
+    ///
+    /// This allows raw-byte access to the key without decoding through
+    /// `YamlValue` first.
+    #[inline]
+    pub fn key_cursor(&self) -> YamlCursor<'a, W> {
+        self.key_cursor
+    }
 }
 
 // ============================================================================
@@ -5063,6 +5072,7 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentFields for YamlFields<'a, W> {
             DocumentField {
                 key: field.key(),
                 value: field.value(),
+                key_cursor: field.key_cursor(),
                 value_cursor: field.value_cursor(),
             },
             rest,

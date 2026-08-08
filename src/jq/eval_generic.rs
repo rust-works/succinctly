@@ -73,6 +73,32 @@ pub fn to_owned<V: DocumentValue>(value: &V) -> OwnedValue {
     }
 }
 
+/// Materialize a `GenericResult::LazyKeysUnsorted` fallback: decode every key
+/// exactly as `Builtin::KeysUnsorted` did before it stayed lazy.
+///
+/// Every consumer other than the native fast paths (`length`, `.[]`, `.[n]`,
+/// `first`, `last` — see the `Pipe` dispatch below) goes through here; this
+/// is the escape hatch #140 anticipated for everything else (`map`,
+/// `select`, comparisons, ...).
+fn materialize_lazy_keys<V: DocumentValue>(fields: &V::Fields) -> OwnedValue {
+    OwnedValue::Array(fields.keys().into_iter().map(OwnedValue::String).collect())
+}
+
+/// Unwrap any number of `(...)`-parens to reach the underlying expression.
+///
+/// The `Pipe` dispatch below pattern-matches the *literal* AST shape of the
+/// next stage to decide whether a `LazyKeysUnsorted` fast path applies —
+/// without this, `keys_unsorted | (length)` would miss the fast path that
+/// `keys_unsorted | length` hits, even though parens are semantically
+/// transparent everywhere else in this evaluator (see `Expr::Paren`'s own
+/// arm above).
+fn unwrap_paren(mut expr: &Expr) -> &Expr {
+    while let Expr::Paren(inner) = expr {
+        expr = inner;
+    }
+    expr
+}
+
 /// Convert a StandardJson value to an OwnedValue.
 fn standard_json_to_owned<W: Clone + AsRef<[u64]>>(
     value: &crate::json::light::StandardJson<'_, W>,
@@ -205,6 +231,10 @@ fn push_generic_truthiness<V: DocumentValue>(
         GenericResult::ManyCursor(cs) => {
             out.extend(cs.iter().map(|c| to_owned(&c.value()).is_truthy()));
         }
+        // An unsorted-keys array, materialized or not, is array-shaped and
+        // therefore always truthy in jq (only `null`/`false` are falsy) — no
+        // need to materialize just to answer this.
+        GenericResult::LazyKeysUnsorted(_) => out.push(true),
         GenericResult::None => {}
         GenericResult::Owned(v) => out.push(v.is_truthy()),
         GenericResult::ManyOwned(vs) => out.extend(vs.iter().map(OwnedValue::is_truthy)),
@@ -235,6 +265,9 @@ fn flatten_generic_results<V: DocumentValue>(items: Vec<GenericResult<V>>) -> Ve
             GenericResult::ManyCursor(cs) => {
                 results.extend(cs.iter().map(|c| to_owned(&c.value())));
             }
+            GenericResult::LazyKeysUnsorted(fields) => {
+                results.push(materialize_lazy_keys::<V>(&fields));
+            }
             GenericResult::None => {}
             GenericResult::Owned(o) => results.push(o),
             GenericResult::ManyOwned(os) => results.extend(os),
@@ -260,6 +293,13 @@ fn eval_on_many_owned<S: EvalSemantics, V: DocumentValue>(
             GenericResult::Many(_) => unreachable!("eval_on_owned never returns Many"),
             GenericResult::ManyCursor(_) => {
                 unreachable!("eval_on_owned never returns ManyCursor")
+            }
+            // `eval_on_owned` re-evaluates through the JSON-only `QueryResult`
+            // path (`eval.rs`), which has no lazy-keys concept — only this
+            // module's own `Builtin::KeysUnsorted` arm ever produces
+            // `LazyKeysUnsorted`.
+            GenericResult::LazyKeysUnsorted(_) => {
+                unreachable!("eval_on_owned never returns LazyKeysUnsorted")
             }
             GenericResult::None => {}
             // The outputs already produced no longer vanish (#400, #494).
@@ -296,6 +336,13 @@ pub enum GenericResult<V: DocumentValue> {
     /// e.g. `.[]`), enabling `line`/`column` on each element.
     ManyCursor(Vec<V::Cursor>),
 
+    /// Lazy, unsorted object keys (`keys_unsorted` on an object), not yet
+    /// materialized into strings (#140). `length`, `.[]`, `.[n]`, `first`,
+    /// and `last` all answer directly from the field iterator (no `Vec`, no
+    /// per-key decode) via the `Pipe` dispatch below; every other consumer
+    /// falls back to materializing exactly as eager `keys_unsorted` did.
+    LazyKeysUnsorted(V::Fields),
+
     /// No result (optional that was missing).
     None,
 
@@ -326,6 +373,7 @@ impl<V: DocumentValue> GenericResult<V> {
             Self::ManyCursor(cs) => Some(OwnedValue::Array(
                 cs.iter().map(|c| to_owned(&c.value())).collect(),
             )),
+            Self::LazyKeysUnsorted(fields) => Some(materialize_lazy_keys::<V>(&fields)),
             Self::None => None,
             Self::Error(_) => None,
             Self::Owned(o) => Some(o),
@@ -347,6 +395,7 @@ impl<V: DocumentValue> GenericResult<V> {
             Self::OneCursor(c) => vec![to_owned(&c.value())],
             Self::Many(vs) => vs.iter().map(to_owned).collect(),
             Self::ManyCursor(cs) => cs.iter().map(|c| to_owned(&c.value())).collect(),
+            Self::LazyKeysUnsorted(fields) => vec![materialize_lazy_keys::<V>(&fields)],
             Self::None => vec![],
             Self::Error(_) => vec![],
             Self::Owned(o) => vec![o],
@@ -415,6 +464,21 @@ impl<V: DocumentValue> GenericResult<V> {
                     stats.any_truthy |= !stats.last_was_falsy;
                 }
                 stats.count = vs.len();
+            }
+            // Fallback: materialize. `keys_unsorted`-involving expressions
+            // never reach M2 streaming today (`can_use_m2_streaming`'s
+            // whitelist excludes `Builtin::KeysUnsorted`, `yq_runner.rs`),
+            // so this arm exists only to keep the match exhaustive; a real
+            // streaming implementation (writing each key's raw bytes as
+            // it's pulled from `fields`) is future work if M2 ever grows to
+            // cover `keys_unsorted`.
+            Self::LazyKeysUnsorted(fields) => {
+                let owned = materialize_lazy_keys::<V>(fields);
+                owned.stream_json(out, indent_spaces)?;
+                on_value(out)?;
+                stats.count = 1;
+                stats.last_was_falsy = owned.is_falsy();
+                stats.any_truthy = !stats.last_was_falsy;
             }
             Self::ManyCursor(cs) => {
                 for c in cs {
@@ -538,6 +602,16 @@ impl<V: DocumentValue> GenericResult<V> {
                     stats.any_truthy |= !stats.last_was_falsy;
                 }
                 stats.count = cs.len();
+            }
+            // Fallback: materialize. See `stream_json`'s `LazyKeysUnsorted`
+            // arm above — same reasoning (unreachable via M2 today).
+            Self::LazyKeysUnsorted(fields) => {
+                let owned = materialize_lazy_keys::<V>(fields);
+                owned.stream_yaml(out, indent_spaces)?;
+                on_value(out)?;
+                stats.count = 1;
+                stats.last_was_falsy = owned.is_falsy();
+                stats.any_truthy = !stats.last_was_falsy;
             }
             Self::None => {
                 // No output
@@ -804,6 +878,9 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                                 GenericResult::ManyCursor(cs) => {
                                     results.extend(cs.iter().map(|c| to_owned(&c.value())));
                                 }
+                                GenericResult::LazyKeysUnsorted(fields) => {
+                                    results.push(materialize_lazy_keys::<V>(&fields));
+                                }
                                 GenericResult::None => {}
                                 // The outputs already piped through no longer
                                 // vanish (#400, #494).
@@ -895,6 +972,97 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                             }
                         };
                     }
+                    // The whole point of `LazyKeysUnsorted`: `length`, `.[]`,
+                    // `.[n]`, `first`, and `last` all answer directly from
+                    // the field iterator (no decode, no `Vec`, no
+                    // reserialize/reindex round-trip) by mirroring the same
+                    // shapes' handling for real arrays elsewhere in this
+                    // file (`Expr::Index`/`Expr::Iterate` above,
+                    // `Builtin::First`/`Builtin::Last`/`Builtin::Length` in
+                    // `eval_builtin`). `map`/`select` and everything else
+                    // fall back to materializing exactly as eager
+                    // `KeysUnsorted` did — `eval_generic.rs` has no native
+                    // lazy `map`/`select` for *any* value today (even a
+                    // materialized array's `map` round-trips through
+                    // `eval_on_owned`), so there's no cheap win available
+                    // here without a broader, unrelated architecture change.
+                    GenericResult::LazyKeysUnsorted(fields) => match unwrap_paren(expr) {
+                        Expr::Builtin(Builtin::Length) => {
+                            GenericResult::Owned(OwnedValue::Int(fields.len() as i64))
+                        }
+                        Expr::Iterate => {
+                            let mut cursors = Vec::new();
+                            let mut current = fields;
+                            while let Some((field, rest)) = current.uncons() {
+                                cursors.push(field.key_cursor);
+                                current = rest;
+                            }
+                            if cursors.is_empty() {
+                                GenericResult::None
+                            } else {
+                                GenericResult::ManyCursor(cursors)
+                            }
+                        }
+                        Expr::Index(idx) => {
+                            // Negative indices need the length to normalize
+                            // against, same as `Expr::Index`'s array arm
+                            // above; positive indices skip straight to the
+                            // walk. Out-of-bounds is `null`, never an error
+                            // (#307), matching that same arm.
+                            let target = if *idx < 0 {
+                                let len = fields.len();
+                                let normalized = len as i64 + idx;
+                                if normalized < 0 {
+                                    None
+                                } else {
+                                    Some(normalized as usize)
+                                }
+                            } else {
+                                Some(*idx as usize)
+                            };
+                            match target {
+                                Some(target) => {
+                                    let mut current = fields;
+                                    let mut found = None;
+                                    let mut i = 0usize;
+                                    while let Some((field, rest)) = current.uncons() {
+                                        if i == target {
+                                            found = Some(field.key_cursor);
+                                            break;
+                                        }
+                                        current = rest;
+                                        i += 1;
+                                    }
+                                    match found {
+                                        Some(c) => GenericResult::OneCursor(c),
+                                        None => GenericResult::Owned(OwnedValue::Null),
+                                    }
+                                }
+                                None => GenericResult::Owned(OwnedValue::Null),
+                            }
+                        }
+                        Expr::Builtin(Builtin::First) => match fields.uncons() {
+                            Some((field, _)) => GenericResult::OneCursor(field.key_cursor),
+                            None => GenericResult::Owned(OwnedValue::Null),
+                        },
+                        Expr::Builtin(Builtin::Last) => {
+                            let mut current = fields;
+                            let mut last_cursor = None;
+                            while let Some((field, rest)) = current.uncons() {
+                                last_cursor = Some(field.key_cursor);
+                                current = rest;
+                            }
+                            match last_cursor {
+                                Some(c) => GenericResult::OneCursor(c),
+                                None => GenericResult::Owned(OwnedValue::Null),
+                            }
+                        }
+                        _ => {
+                            let owned_keys: Vec<OwnedValue> =
+                                fields.keys().into_iter().map(OwnedValue::String).collect();
+                            eval_on_owned::<S, _>(expr, OwnedValue::Array(owned_keys), optional)
+                        }
+                    },
                     GenericResult::None => GenericResult::None,
                     GenericResult::Error(e) => return GenericResult::Error(e),
                     GenericResult::Owned(o) => {
@@ -952,6 +1120,7 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                 GenericResult::Owned(o) => o,
                 GenericResult::One(v) => to_owned(&v),
                 GenericResult::OneCursor(c) => to_owned(&c.value()),
+                GenericResult::LazyKeysUnsorted(fields) => materialize_lazy_keys::<V>(&fields),
                 GenericResult::Error(e) => {
                     return if optional {
                         GenericResult::None
@@ -993,6 +1162,7 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                 GenericResult::Owned(o) => o,
                 GenericResult::One(v) => to_owned(&v),
                 GenericResult::OneCursor(c) => to_owned(&c.value()),
+                GenericResult::LazyKeysUnsorted(fields) => materialize_lazy_keys::<V>(&fields),
                 GenericResult::Error(e) => {
                     return if optional {
                         GenericResult::None
@@ -1135,6 +1305,10 @@ fn eval_first_or_last_generic<S: EvalSemantics, V: DocumentValue>(
                 Some(v) => GenericResult::Owned(v),
                 None => GenericResult::None,
             },
+            // `inner`'s stream has exactly one output (the whole
+            // `keys_unsorted` result) — forward it unchanged, same as
+            // `Owned`/`OneCursor` above, so laziness survives `last(...)`.
+            GenericResult::LazyKeysUnsorted(fields) => GenericResult::LazyKeysUnsorted(fields),
             GenericResult::None => GenericResult::None,
             GenericResult::Error(e) => GenericResult::Error(e),
             GenericResult::Break(label) => GenericResult::Break(label),
@@ -1162,6 +1336,8 @@ fn eval_first_or_last_generic<S: EvalSemantics, V: DocumentValue>(
                 Some(v) => GenericResult::Owned(v),
                 None => GenericResult::None,
             },
+            // Same forwarding as the `want_last` branch above.
+            GenericResult::LazyKeysUnsorted(fields) => GenericResult::LazyKeysUnsorted(fields),
             GenericResult::None => GenericResult::None,
             GenericResult::Error(e) => GenericResult::Error(e),
             GenericResult::Break(label) => GenericResult::Break(label),
@@ -1278,7 +1454,9 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
         // An owned target (a computed, non-navigational left side) has no
         // borrowed representation here; round-trip it through the shared
         // owned-value path by re-entering with the materialized document.
-        owned @ (GenericResult::Owned(_) | GenericResult::ManyOwned(_)) => {
+        owned @ (GenericResult::Owned(_)
+        | GenericResult::ManyOwned(_)
+        | GenericResult::LazyKeysUnsorted(_)) => {
             let targets = owned.collect_owned();
             let mut out = Vec::with_capacity(keys.len() * targets.len());
             for k in &keys {
@@ -1392,9 +1570,9 @@ fn eval_slice_expr<S: EvalSemantics, V: DocumentValue>(
         GenericResult::ManyCursor(cs) => {
             Targets::Borrowed(cs.iter().map(DocumentCursor::value).collect())
         }
-        owned @ (GenericResult::Owned(_) | GenericResult::ManyOwned(_)) => {
-            Targets::Owned(owned.collect_owned())
-        }
+        owned @ (GenericResult::Owned(_)
+        | GenericResult::ManyOwned(_)
+        | GenericResult::LazyKeysUnsorted(_)) => Targets::Owned(owned.collect_owned()),
     };
 
     // Start outer, end middle, target inner. The result is always owned:
@@ -1739,10 +1917,12 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
 
         Builtin::KeysUnsorted => {
             if let Some(fields) = value.as_object() {
-                let keys = fields.keys();
-                let owned_keys: Vec<OwnedValue> =
-                    keys.into_iter().map(OwnedValue::String).collect();
-                GenericResult::Owned(OwnedValue::Array(owned_keys))
+                // Stay lazy here — don't decode every key into an owned
+                // String yet. `length`, `.[]`, `.[n]`, `first`, and `last`
+                // can all answer directly from `fields` (see the `Pipe`
+                // dispatch below); anything else falls back to materializing
+                // exactly as before (#140).
+                GenericResult::LazyKeysUnsorted(fields)
             } else if let Some(elements) = value.as_array() {
                 let len = elements.len();
                 let indices: Vec<OwnedValue> =
@@ -2246,6 +2426,222 @@ mod tests {
     }
 
     #[test]
+    fn test_generic_keys_unsorted_lazy_length() {
+        let json = br#"{"b": 1, "a": 2, "c": 3}"#;
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+
+        let expr = crate::jq::parse("keys_unsorted | length").unwrap();
+        let result = eval(&expr, value);
+        assert_eq!(result.into_owned().unwrap(), OwnedValue::Int(3));
+    }
+
+    #[test]
+    fn test_generic_keys_unsorted_lazy_length_through_parens() {
+        // Regression: the `Pipe` fast path must unwrap `(...)` so
+        // `keys_unsorted | (length)` hits the same lazy path as
+        // `keys_unsorted | length`, not the materialize fallback.
+        let json = br#"{"b": 1, "a": 2, "c": 3}"#;
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+
+        let expr = crate::jq::parse("keys_unsorted | (length)").unwrap();
+        let result = eval(&expr, value);
+        assert_eq!(result.into_owned().unwrap(), OwnedValue::Int(3));
+    }
+
+    #[test]
+    fn test_generic_keys_unsorted_lazy_iterate() {
+        let json = br#"{"b": 1, "a": 2, "c": 3}"#;
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+
+        let expr = crate::jq::parse("keys_unsorted | .[]").unwrap();
+        let result = eval(&expr, value);
+        assert_eq!(
+            result.collect_owned(),
+            vec![
+                OwnedValue::String("b".to_string()),
+                OwnedValue::String("a".to_string()),
+                OwnedValue::String("c".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_generic_keys_unsorted_lazy_iterate_empty_object() {
+        let json = br"{}";
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+
+        let expr = crate::jq::parse("keys_unsorted | .[]").unwrap();
+        let result = eval(&expr, value);
+        assert_eq!(result.collect_owned(), Vec::<OwnedValue>::new());
+    }
+
+    #[test]
+    fn test_generic_keys_unsorted_lazy_index() {
+        let json = br#"{"b": 1, "a": 2, "c": 3}"#;
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+
+        let expr = crate::jq::parse("keys_unsorted | .[0]").unwrap();
+        assert_eq!(
+            eval(&expr, value.clone()).into_owned().unwrap(),
+            OwnedValue::String("b".to_string())
+        );
+
+        let expr = crate::jq::parse("keys_unsorted | .[-1]").unwrap();
+        assert_eq!(
+            eval(&expr, value.clone()).into_owned().unwrap(),
+            OwnedValue::String("c".to_string())
+        );
+
+        // Out of bounds is `null`, never an error (#307), matching plain
+        // array indexing.
+        let expr = crate::jq::parse("keys_unsorted | .[10]").unwrap();
+        assert_eq!(eval(&expr, value).into_owned().unwrap(), OwnedValue::Null);
+    }
+
+    #[test]
+    fn test_generic_keys_unsorted_lazy_first_last() {
+        let json = br#"{"b": 1, "a": 2, "c": 3}"#;
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+
+        let expr = crate::jq::parse("keys_unsorted | first").unwrap();
+        assert_eq!(
+            eval(&expr, value.clone()).into_owned().unwrap(),
+            OwnedValue::String("b".to_string())
+        );
+
+        let expr = crate::jq::parse("keys_unsorted | last").unwrap();
+        assert_eq!(
+            eval(&expr, value).into_owned().unwrap(),
+            OwnedValue::String("c".to_string())
+        );
+    }
+
+    #[test]
+    fn test_generic_keys_unsorted_lazy_first_last_empty_object() {
+        let json = br"{}";
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+
+        let expr = crate::jq::parse("keys_unsorted | first").unwrap();
+        assert_eq!(
+            eval(&expr, value.clone()).into_owned().unwrap(),
+            OwnedValue::Null
+        );
+
+        let expr = crate::jq::parse("keys_unsorted | last").unwrap();
+        assert_eq!(eval(&expr, value).into_owned().unwrap(), OwnedValue::Null);
+    }
+
+    #[test]
+    fn test_generic_keys_unsorted_lazy_index_then_continue() {
+        // The fast path must produce a real cursor, not just a bare value
+        // -- downstream operations (`ascii_upcase` here) need to keep
+        // working after `.[]`/`.[0]` on a lazy keys array.
+        let json = br#"{"b": 1, "a": 2, "c": 3}"#;
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+
+        let expr = crate::jq::parse("keys_unsorted | .[] | ascii_upcase").unwrap();
+        let result = eval(&expr, value.clone());
+        assert_eq!(
+            result.collect_owned(),
+            vec![
+                OwnedValue::String("B".to_string()),
+                OwnedValue::String("A".to_string()),
+                OwnedValue::String("C".to_string()),
+            ]
+        );
+
+        let expr = crate::jq::parse("keys_unsorted | .[0] | ascii_upcase").unwrap();
+        assert_eq!(
+            eval(&expr, value).into_owned().unwrap(),
+            OwnedValue::String("B".to_string())
+        );
+    }
+
+    #[test]
+    fn test_generic_keys_unsorted_fallback_map_select() {
+        // `map`/`select` have no native lazy path -- `eval_generic.rs` has
+        // no native `Builtin::Map` arm at all (see the `Pipe` dispatch's
+        // `LazyKeysUnsorted` arm doc comment) -- so these must still
+        // materialize correctly via the fallback.
+        let json = br#"{"b": 1, "a": 2, "c": 3}"#;
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+
+        let expr = crate::jq::parse("keys_unsorted | map(ascii_upcase)").unwrap();
+        assert_eq!(
+            eval(&expr, value.clone()).into_owned().unwrap(),
+            OwnedValue::Array(vec![
+                OwnedValue::String("B".to_string()),
+                OwnedValue::String("A".to_string()),
+                OwnedValue::String("C".to_string()),
+            ])
+        );
+
+        let expr = crate::jq::parse("keys_unsorted | select(length == 3)").unwrap();
+        assert_eq!(
+            eval(&expr, value).into_owned().unwrap(),
+            OwnedValue::Array(vec![
+                OwnedValue::String("b".to_string()),
+                OwnedValue::String("a".to_string()),
+                OwnedValue::String("c".to_string()),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_generic_keys_unsorted_lazy_large_object() {
+        // No allocation-count assertion here (that's covered by the A/B
+        // memory measurement) -- just correctness at a size well past any
+        // small-N special case.
+        let mut json = String::from("{");
+        for i in 0..10_000 {
+            if i > 0 {
+                json.push(',');
+            }
+            json.push_str(&format!(r#""k{i}":{i}"#));
+        }
+        json.push('}');
+        let index = JsonIndex::build(json.as_bytes());
+        let cursor = index.root(json.as_bytes());
+        let value = cursor.value();
+
+        let expr = crate::jq::parse("keys_unsorted | length").unwrap();
+        assert_eq!(
+            eval(&expr, value.clone()).into_owned().unwrap(),
+            OwnedValue::Int(10_000)
+        );
+
+        let expr = crate::jq::parse("keys_unsorted | .[9999]").unwrap();
+        assert_eq!(
+            eval(&expr, value.clone()).into_owned().unwrap(),
+            OwnedValue::String("k9999".to_string())
+        );
+
+        let expr = crate::jq::parse("keys_unsorted | last").unwrap();
+        assert_eq!(
+            eval(&expr, value).into_owned().unwrap(),
+            OwnedValue::String("k9999".to_string())
+        );
+    }
+
+    #[test]
     fn test_generic_pipe() {
         let json = br#"{"users": [{"name": "Alice"}, {"name": "Bob"}]}"#;
         let index = JsonIndex::build(json);
@@ -2570,6 +2966,57 @@ mod tests {
                 OwnedValue::Int(2),
                 OwnedValue::Int(3),
             ])
+        );
+    }
+
+    #[test]
+    fn test_yaml_keys_unsorted_lazy_fast_paths() {
+        // `LazyKeysUnsorted`/its `Pipe` fast paths are generic over
+        // `V: DocumentValue`, so a YAML mapping goes through the exact same
+        // evaluator arms as a JSON object (#140) -- only `yq_runner.rs`'s
+        // CLI output boundary still materializes unconditionally, since
+        // YAML has no `JqValue`-equivalent lazy output today.
+        use crate::yaml::YamlIndex;
+
+        let yaml = b"b: 1\na: 2\nc: 3\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let doc_cursor = index
+            .root(yaml)
+            .first_child()
+            .expect("YAML document should have content");
+
+        let expr = crate::jq::parse("keys_unsorted | length").unwrap();
+        assert_eq!(
+            eval_with_cursor(&expr, doc_cursor).into_owned().unwrap(),
+            OwnedValue::Int(3)
+        );
+
+        let expr = crate::jq::parse("keys_unsorted | .[]").unwrap();
+        assert_eq!(
+            eval_with_cursor(&expr, doc_cursor).collect_owned(),
+            vec![
+                OwnedValue::String("b".to_string()),
+                OwnedValue::String("a".to_string()),
+                OwnedValue::String("c".to_string()),
+            ]
+        );
+
+        let expr = crate::jq::parse("keys_unsorted | .[0]").unwrap();
+        assert_eq!(
+            eval_with_cursor(&expr, doc_cursor).into_owned().unwrap(),
+            OwnedValue::String("b".to_string())
+        );
+
+        let expr = crate::jq::parse("keys_unsorted | first").unwrap();
+        assert_eq!(
+            eval_with_cursor(&expr, doc_cursor).into_owned().unwrap(),
+            OwnedValue::String("b".to_string())
+        );
+
+        let expr = crate::jq::parse("keys_unsorted | last").unwrap();
+        assert_eq!(
+            eval_with_cursor(&expr, doc_cursor).into_owned().unwrap(),
+            OwnedValue::String("c".to_string())
         );
     }
 
@@ -3022,6 +3469,7 @@ mod tests {
         let index = JsonIndex::build(doc);
         let c0 = index.root(doc);
         let c1 = index.root(doc);
+        let c2 = index.root(doc);
         let results = vec![
             eval(&Expr::Field("a".to_string()), c0.value()), // single value
             eval(
@@ -3041,6 +3489,12 @@ mod tests {
                 Control::Error(EvalError::new("late")),
             ),
             GenericResult::Partial(vec![OwnedValue::Int(3)], Control::Break("lbl".to_string())),
+            // Appended at the end (#140) so it doesn't disturb the fixed
+            // positional indices every other assertion in this test relies
+            // on: LazyKeysUnsorted, exercised the same way as every other
+            // variant by the `stream_json`/`stream_yaml`/`into_owned` loops
+            // below.
+            eval(&Expr::Builtin(Builtin::KeysUnsorted), c2.value()),
         ];
 
         // is_error / error / is_single_cursor (borrow &self)
@@ -3172,6 +3626,13 @@ mod tests {
         // `collect_owned`, which keeps the prefix (checked separately).
         assert_eq!(owned[7], None); // Partial(_, Error)
         assert_eq!(owned[8], None); // Partial(_, Break)
+        assert_eq!(
+            owned[9],
+            Some(OwnedValue::Array(vec![
+                OwnedValue::String("a".to_string()),
+                OwnedValue::String("b".to_string()),
+            ]))
+        ); // LazyKeysUnsorted
     }
 
     #[test]
