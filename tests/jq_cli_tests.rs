@@ -3056,3 +3056,80 @@ fn test_path_context_builtins_across_pipe_stages_554() -> Result<()> {
 
     Ok(())
 }
+
+/// `keys_unsorted` stays lazy through `length`/`.[]`/`.[n]`/`first`/`last`
+/// (#140), backed by a new `JqValue::LazyKeysArray` output writer in
+/// `print_json`. Uses `run_jq_full` (the pre-built binary) to exercise that
+/// writer directly, both compact and pretty, rather than just the evaluator
+/// (already covered by `eval_generic.rs`'s unit tests).
+#[test]
+fn test_keys_unsorted_lazy_output_140() -> Result<()> {
+    let input = r#"{"b":1,"a":2,"c":3}"#;
+
+    let (output, _, code) = run_jq_full(&["-c", "keys_unsorted"], Some(input))?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#"["b","a","c"]"#);
+
+    let (output, _, code) = run_jq_full(&["--indent", "2", "keys_unsorted"], Some(input))?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "[\n  \"b\",\n  \"a\",\n  \"c\"\n]");
+
+    let (output, _, code) = run_jq_full(&["-c", "keys_unsorted | length"], Some(input))?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "3");
+
+    let (output, _, code) = run_jq_full(&["-c", "keys_unsorted | (length)"], Some(input))?;
+    assert_eq!(code, 0);
+    assert_eq!(
+        output.trim(),
+        "3",
+        "parenthesized length must still hit the fast path"
+    );
+
+    let (output, _, code) = run_jq_full(&["-c", "keys_unsorted | .[]"], Some(input))?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "\"b\"\n\"a\"\n\"c\"");
+
+    let (output, _, code) = run_jq_full(&["-c", "keys_unsorted | .[0]"], Some(input))?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#""b""#);
+
+    let (output, _, code) = run_jq_full(&["-c", "keys_unsorted | .[10]"], Some(input))?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "null", "out of bounds is null, not an error");
+
+    let (output, _, code) = run_jq_full(&["-c", "keys_unsorted | first"], Some(input))?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#""b""#);
+
+    let (output, _, code) = run_jq_full(&["-c", "keys_unsorted | last"], Some(input))?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#""c""#);
+
+    let (output, _, code) = run_jq_full(&["-c", "keys_unsorted | first"], Some("{}"))?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "null");
+
+    // `map`/`select` have no native lazy path and must still materialize
+    // correctly through the fallback.
+    let (output, _, code) = run_jq_full(&["-c", "keys_unsorted | map(ascii_upcase)"], Some(input))?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#"["B","A","C"]"#);
+
+    // Escaped/non-ASCII keys go through the zero-copy raw-bytes path only
+    // when safe; otherwise decode-and-reescape, same as a regular object's
+    // keys.
+    let escaped_input = "{\"a\\\"b\":1,\"caf\u{e9}\":2}";
+    let (output, _, code) = run_jq_full(&["-c", "keys_unsorted"], Some(escaped_input))?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "[\"a\\\"b\",\"caf\u{e9}\"]");
+
+    let (output, _, code) = run_jq_full(
+        &["-c", "--ascii-output", "keys_unsorted"],
+        Some(escaped_input),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "[\"a\\\"b\",\"caf\\u00e9\"]");
+
+    Ok(())
+}
