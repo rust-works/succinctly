@@ -108,7 +108,7 @@ jobs:
 
       - name: Cache cargo
         if: needs.gate.outputs.code == 'true'
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/bin/
@@ -209,7 +209,7 @@ jobs:
 
       - name: Cache cargo
         if: needs.gate.outputs.code == 'true'
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/bin/
@@ -322,7 +322,7 @@ jobs:
 
       - name: Cache cargo
         if: needs.gate.outputs.code == 'true'
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/bin/
@@ -387,7 +387,7 @@ jobs:
           toolchain: ${{ matrix.rust }}
 
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/bin/
@@ -444,7 +444,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/bin/

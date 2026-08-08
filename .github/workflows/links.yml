@@ -28,7 +28,7 @@ jobs:
       # retry or re-run only re-checks links that actually failed. lychee
       # never caches failures, so a flake can't stick.
       - name: Restore lychee cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: .lycheecache
           key: cache-lychee-${{ github.sha }}
@@ -106,7 +106,7 @@ jobs:
       # explicitly so successes from a failing run still make the next run cheap.
       - name: Save lychee cache
         if: always()
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v6
         with:
           path: .lycheecache
           key: cache-lychee-${{ github.sha }}
