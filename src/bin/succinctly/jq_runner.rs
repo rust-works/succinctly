@@ -1594,13 +1594,20 @@ fn evaluate_input(
             Ok(cs.iter().map(|c| generic_to_owned(&c.value())).collect())
         }
         // Fallback: materialize. This runner boundary never sees a
-        // fast-pathed `keys_unsorted | length`/`.[]`/`.[n]`/`first`/`last`
-        // — those are fully resolved inside the evaluator's `Pipe` dispatch
-        // before it gets here — so this only fires for `keys_unsorted`
-        // alone, or piped into something else (`map`, `select`, ...).
-        GenericResult::LazyKeysUnsorted(fields) => Ok(vec![OwnedValue::Array(
-            fields.keys().into_iter().map(OwnedValue::String).collect(),
-        )]),
+        // fast-pathed `keys`/`keys_unsorted | length`/`.[]`/`.[n]`/`first`/
+        // `last` — those are fully resolved inside the evaluator's `Pipe`
+        // dispatch before it gets here — so this only fires for `keys`/
+        // `keys_unsorted` alone, or piped into something else (`map`,
+        // `select`, ...). Sort iff `sorted` (#683), matching eager `Keys`.
+        GenericResult::LazyKeys { fields, sorted } => {
+            let mut keys = fields.keys();
+            if sorted {
+                keys.sort();
+            }
+            Ok(vec![OwnedValue::Array(
+                keys.into_iter().map(OwnedValue::String).collect(),
+            )])
+        }
         GenericResult::None => Ok(vec![]),
         GenericResult::Error(e) => {
             sink.report(DiagStyle::Jq, &e, at);
@@ -1665,8 +1672,25 @@ fn generic_result_to_jq_values<'a, W: Clone + AsRef<[u64]>>(
         GenericResult::ManyCursor(cs) => cs.into_iter().map(JqValue::Cursor).collect(),
         // Stays lazy all the way to output: a bare `keys_unsorted` never
         // materializes a `Vec<String>` — `write_json`/`print_json` stream
-        // each key's raw bytes straight from `fields`.
-        GenericResult::LazyKeysUnsorted(fields) => vec![JqValue::LazyKeysArray(fields)],
+        // each key's raw bytes straight from `fields`. `JqValue::LazyKeysArray`
+        // is document-order-only (no sort concept in its writer), so a
+        // sorted `keys` result must never be routed there (#683) — it
+        // materializes and sorts here instead, same as eager `Keys` always
+        // did.
+        GenericResult::LazyKeys {
+            fields,
+            sorted: false,
+        } => vec![JqValue::LazyKeysArray(fields)],
+        GenericResult::LazyKeys {
+            fields,
+            sorted: true,
+        } => {
+            let mut keys = fields.keys();
+            keys.sort();
+            vec![JqValue::from_owned(OwnedValue::Array(
+                keys.into_iter().map(OwnedValue::String).collect(),
+            ))]
+        }
         GenericResult::None => vec![],
         GenericResult::Error(e) => {
             sink.report(DiagStyle::Jq, &e, at);

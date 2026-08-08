@@ -4141,3 +4141,16 @@ fn test_keys_unsorted_yaml_materialize_fallback_140() -> Result<()> {
 
     Ok(())
 }
+
+// Note (#683): there is no sorted-`keys` CLI test mirroring
+// `test_keys_unsorted_yaml_materialize_fallback_140` here, because `keys` is
+// unreachable via the `yq` CLI's own dialect -- `run_yq` always parses in
+// `ParserMode::Yq`, where the `keys` keyword itself resolves to
+// `Builtin::KeysUnsorted` (matching real yq's document-order semantics; see
+// `parser.rs`), so `yq 'keys'` and `yq 'keys_unsorted'` are already the same
+// query and both exercised by the test above. The generic evaluator's
+// `sorted: true` path is still real and reachable via the `jq` CLI/JSON
+// (`test_keys_lazy_length_output_683`, `jq_cli_tests.rs`), and is exercised
+// against a YAML value directly (bypassing the `yq` CLI's parser dialect) by
+// `test_yaml_keys_sorted_lazy_length` in `eval_generic.rs`'s unit tests, to
+// prove the `Pipe` dispatch fast path is generic over `V: DocumentValue`.
