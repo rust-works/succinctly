@@ -77,7 +77,7 @@ omni-dev coverage diff
 ```bash
 cargo build --release --features cli
 
-# Install short aliases (sjq, syq, sjq-locate, syq-locate)
+# Install short aliases (sjq, syq, sxq, sjq-locate, syq-locate, sxq-locate)
 ./target/release/succinctly install-aliases          # symlinks next to binary
 ./target/release/succinctly install-aliases --dir ~/bin  # or specify directory
 
@@ -100,6 +100,14 @@ syq '.spec.containers[]' k8s.yaml
 syq --doc 0 '.' multi-doc.yaml      # First document only
 syq-locate config.yaml --offset 42
 syq-locate config.yaml --line 5 --column 10
+
+# XML operations (sxq is an alias for succinctly xq — milestone 1, issue #667)
+# Element/attribute/text navigation only: no @xml, no namespaces, no combinators (full vision: #85)
+sxq '.foo.bar' input.xml
+sxq -r '.user."+@id"' input.xml     # attributes: key is "+@attrname"
+sxq -r '.user.name."+content"' input.xml  # element text: key is "+content"
+sxq-locate input.xml --offset 42
+sxq-locate input.xml --line 5 --column 10
 
 # DSV/CSV operations
 sjq --input-dsv ',' '.[] | select(.[0] == "Alice")' data.csv
@@ -131,10 +139,13 @@ The binary supports multi-call invocation via symlinks. When invoked as `sjq`, `
 |---------------|-------------------------|----------------------|
 | `sjq`         | `succinctly jq`         | Yes                  |
 | `syq`         | `succinctly yq`         | Yes                  |
+| `sxq`         | `succinctly xq`         | Yes                  |
 | `sjq-locate`  | `succinctly jq-locate`  | Yes                  |
 | `syq-locate`  | `succinctly yq-locate`  | Yes                  |
+| `sxq-locate`  | `succinctly xq-locate`  | Yes                  |
 | `jq`          | `succinctly jq`         | No (recognized only) |
 | `yq`          | `succinctly yq`         | No (recognized only) |
+| `xq`          | `succinctly xq`         | No (recognized only) |
 
 Run `succinctly install-aliases` to create symlinks, or create them manually:
 
@@ -154,8 +165,9 @@ src/
 ├── json/               # JSON semi-indexing (PFSM default)
 ├── yaml/               # YAML semi-indexing (oracle parser)
 ├── dsv/                # DSV/CSV semi-indexing (BMI2/SIMD)
+├── xml/                # XML semi-indexing (element/attribute/text; milestone 1, #667)
 ├── jq/                 # jq query language and evaluator
-└── bin/                # CLI tool (jq, yq, jq-locate, yq-locate)
+└── bin/                # CLI tool (jq, yq, xq, jq-locate, yq-locate, xq-locate)
 ```
 
 ### Public API
@@ -166,18 +178,20 @@ use succinctly::trees::BalancedParens;
 use succinctly::json::JsonIndex;
 use succinctly::yaml::YamlIndex;
 use succinctly::dsv::DsvIndex;
+use succinctly::xml::XmlIndex;
 use succinctly::jq::{parse, eval};
 ```
 
 ### Core Data Structures
 
-| Structure         | Description                            | Performance (x86_64 Zen 4) |
-|-------------------|----------------------------------------|----------------------------|
-| **BitVec**        | O(1) rank, O(log n) select             | ~28-48% overhead           |
-| **BalancedParens**| Succinct tree navigation               | ~6% overhead               |
-| **JsonIndex**     | JSON semi-indexing with PFSM parser    | ~880 MiB/s                 |
-| **YamlIndex**     | YAML semi-indexing with oracle parser  | ~250-400 MiB/s             |
-| **DsvIndex**      | DSV semi-indexing with lightweight rank| 85-1676 MiB/s (API)        |
+| Structure          | Description                             | Performance (x86_64 Zen 4) |
+|--------------------|-----------------------------------------|----------------------------|
+| **BitVec**         | O(1) rank, O(log n) select              | ~28-48% overhead           |
+| **BalancedParens** | Succinct tree navigation                | ~6% overhead               |
+| **JsonIndex**      | JSON semi-indexing with PFSM parser     | ~880 MiB/s                 |
+| **YamlIndex**      | YAML semi-indexing with oracle parser   | ~250-400 MiB/s             |
+| **DsvIndex**       | DSV semi-indexing with lightweight rank | 85-1676 MiB/s (API)        |
+| **XmlIndex**       | XML semi-indexing, scalar (no SIMD yet) | not yet benchmarked        |
 
 ### jq Format Functions
 
@@ -274,6 +288,9 @@ echo '{
 
 # Works with YAML via yq
 succinctly yq 'at_offset(6)' config.yaml
+
+# Works with XML via xq (milestone 1, issue #667)
+succinctly xq 'at_offset(6)' input.xml
 
 # Combine with other jq operations
 echo '{"data": {"nested": {"value": 42}}}' | succinctly jq 'at_offset(9) | .nested.value'
