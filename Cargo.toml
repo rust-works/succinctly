@@ -188,6 +188,10 @@ name = "bp_select_micro"
 harness = false
 
 [[bench]]
+name = "bp_rank_micro"
+harness = false
+
+[[bench]]
 name = "select_scan_micro"
 harness = false
 
