@@ -8613,22 +8613,40 @@ fn push_recursive_branches(prefix: &[Expr], value: &OwnedValue, out: &mut Vec<Pa
 }
 
 /// Fan `recurse(f)` / `recurse(f; cond)` out into one branch per visited
-/// node. Follows `builtin_recurse_f`/`builtin_recurse_cond`'s breadth-first
-/// queue — including the `MAX_ITEMS` cutoff — but resolves `f` through
-/// [`resolve_node`] at each step instead of [`eval_owned_multi`], so every
-/// queued value carries the path components that reach it. Since #490,
+/// node, depth-first. Uses the same explicit stack
+/// `builtin_recurse_f`/`builtin_recurse_cond` do — including the
+/// `MAX_ITEMS` cutoff — but resolves `f` through [`resolve_node`] at each
+/// step instead of [`eval_owned_multi`], so every stacked value carries the
+/// path components that reach it. Since #490,
 /// `builtin_recurse_f`/`builtin_recurse_cond` also resolve `f` through
 /// [`eval_owned_multi`] and agree with this function on not flattening an
 /// array-valued child into its elements.
 ///
+/// Traversal order matches jq's own recursive definition, `def r: .,
+/// (f | r); r;` (#635): a node's *entire* subtree is visited before its
+/// next sibling is touched. The loop below is iterative, not recursive, so
+/// it tracks this with an explicit LIFO stack rather than the call stack:
+/// each visited node collects its own ordered list of next-to-visit
+/// entries (`f`'s children, with a forking `cond` flattened in encounter
+/// order) into a local `next` buffer, then pushes `next` onto `stack`
+/// *reversed* — so the first-computed entry ends up on top and is the next
+/// one popped. Because the stack is LIFO, that entry's own subtree runs to
+/// completion (pushing and popping its own descendants the same way)
+/// before the second entry is ever reached. A prior revision popped from
+/// the front of this list instead, visiting siblings level-by-level; on a
+/// tree with 2+ children it produced `["root","a","c","b"]` where jq gives
+/// `["root","a","b","c"]` — #635, pinned by the
+/// `recurse_f_dfs_sibling_order`/`recurse_cond_dfs_sibling_order` goldens.
+///
 /// `cond` mirrors `builtin_recurse_cond`'s semantics (#627): jq's own
 /// definition is `def r: ., (f | select(cond) | r); r;`, so `cond` gates
 /// each *child* before recursing into it, never the node about to be
-/// output — the root, and every node already queued, is emitted
+/// output — the root, and every node already on the stack, is emitted
 /// unconditionally. A multi-output `cond` forks: `select` re-emits the
 /// child once per truthy output (confirmed against jq 1.7.1:
 /// `path(recurse(f; (true,true)))` duplicates that branch), so each truthy
-/// output pushes its own copy of `(path, child_value)`.
+/// output pushes its own copy of `(path, child_value)` into `next`, in the
+/// order `cond`'s outputs were produced.
 ///
 /// An error raised while evaluating `f` or `cond` aborts immediately —
 /// nothing in jq's own definition above catches one — returning whatever
@@ -8636,37 +8654,37 @@ fn push_recursive_branches(prefix: &[Expr], value: &OwnedValue, out: &mut Vec<Pa
 /// own `Comma` arm (#636; matches `builtin_recurse_f`/`builtin_recurse_cond`,
 /// fixed the same way).
 ///
-/// One divergence remains, deliberately: this function still does not queue
-/// a null child, where the value evaluator does. `f` is arbitrary and
-/// nothing says it makes progress: `recurse(.a?)` over `{"a":null}` reads
-/// `null` from `null` forever (confirmed hanging in real jq too — this is
-/// jq's actual semantics, not a bug). The value evaluator's queue holds bare
-/// `OwnedValue`s, so `MAX_ITEMS` bounds it in O(`MAX_ITEMS`) total. This
-/// function's queue holds `(path, value)` pairs, so the same non-terminating
-/// `f` would run to `MAX_ITEMS` with a prefix one component longer each
-/// round — quadratic, and measured at 9 GB for an 18-byte document before
-/// this guard existed. So the two evaluators can now disagree on this one
-/// adversarial shape (path-tracking prunes the null and stops; value
-/// evaluation runs to `MAX_ITEMS`) — both already deviate from unbounded
-/// true-jq semantics via their own `MAX_ITEMS`, so this is a narrower gap,
-/// not a new class of one.
+/// One divergence remains, deliberately: this function still does not
+/// stack a null child, where the value evaluator does. `f` is arbitrary
+/// and nothing says it makes progress: `recurse(.a?)` over `{"a":null}`
+/// reads `null` from `null` forever (confirmed hanging in real jq too —
+/// this is jq's actual semantics, not a bug). The value evaluator's stack
+/// holds bare `OwnedValue`s, so `MAX_ITEMS` bounds it in O(`MAX_ITEMS`)
+/// total. This function's stack holds `(path, value)` pairs, so the same
+/// non-terminating `f` would run to `MAX_ITEMS` with a prefix one
+/// component longer each round — quadratic, and measured at 9 GB for an
+/// 18-byte document before this guard existed. So the two evaluators can
+/// now disagree on this one adversarial shape (path-tracking prunes the
+/// null and stops; value evaluation runs to `MAX_ITEMS`) — both already
+/// deviate from unbounded true-jq semantics via their own `MAX_ITEMS`, so
+/// this is a narrower gap, not a new class of one.
 fn resolve_recurse<S: EvalSemantics>(
     f: &Expr,
     cond: Option<&Expr>,
     value: &OwnedValue,
 ) -> PathResolveResult {
     let mut outputs: Vec<PathBranch> = Vec::new();
-    let mut queue: Vec<PathBranch> = vec![(Vec::new(), value.clone())];
+    let mut stack: Vec<PathBranch> = vec![(Vec::new(), value.clone())];
     const MAX_ITEMS: usize = 10000;
 
-    while !queue.is_empty() && outputs.len() < MAX_ITEMS {
-        let (prefix, current) = queue.remove(0);
+    while !stack.is_empty() && outputs.len() < MAX_ITEMS {
+        let (prefix, current) = stack.pop().unwrap();
         outputs.push((prefix.clone(), current.clone()));
 
         // An `f` error aborts immediately rather than pruning `current`'s
         // children — see the doc comment above (#636). The candidate
         // children `resolve_node` may have already resolved before hitting
-        // that error are dropped rather than queued, matching
+        // that error are dropped rather than stacked, matching
         // `eval_owned_multi`'s all-or-nothing contract for
         // `builtin_recurse_f`/`builtin_recurse_cond`.
         let children = match resolve_node::<S>(f, &current) {
@@ -8674,6 +8692,11 @@ fn resolve_recurse<S: EvalSemantics>(
             Err((_prefix, e)) => return Err((outputs, e)),
         };
 
+        // Collected in encounter order, then pushed onto `stack` reversed
+        // (see the doc comment above) so the first entry here is the next
+        // one popped, and its whole subtree completes before the second
+        // entry is even reached.
+        let mut next: Vec<PathBranch> = Vec::new();
         for (child_components, child_value) in children {
             // A null child ends that line of descent here, unlike the value
             // evaluator since #490. See the note above on why this function
@@ -8686,7 +8709,7 @@ fn resolve_recurse<S: EvalSemantics>(
             path.extend(child_components);
 
             match cond {
-                None => queue.push((path, child_value)),
+                None => next.push((path, child_value)),
                 Some(cond) => {
                     // `cond` gates the child, not `current`, and forks once
                     // per truthy output — see the doc comment above (#627).
@@ -8696,7 +8719,7 @@ fn resolve_recurse<S: EvalSemantics>(
                         Ok(cond_outputs) => {
                             for c in &cond_outputs {
                                 if c.is_truthy() {
-                                    queue.push((path.clone(), child_value.clone()));
+                                    next.push((path.clone(), child_value.clone()));
                                 }
                             }
                         }
@@ -8705,6 +8728,7 @@ fn resolve_recurse<S: EvalSemantics>(
                 }
             }
         }
+        stack.extend(next.into_iter().rev());
     }
 
     Ok(outputs)
@@ -10625,21 +10649,25 @@ fn builtin_recurse_f<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     _optional: bool,
 ) -> QueryResult<'a, W> {
     let mut outputs: Vec<OwnedValue> = Vec::new();
-    let mut queue: Vec<OwnedValue> = vec![to_owned(&value)];
+    let mut stack: Vec<OwnedValue> = vec![to_owned(&value)];
     const MAX_ITEMS: usize = 10000;
 
-    while !queue.is_empty() && outputs.len() < MAX_ITEMS {
-        let current = queue.remove(0);
+    while !stack.is_empty() && outputs.len() < MAX_ITEMS {
+        let current = stack.pop().unwrap();
         outputs.push(current.clone());
 
-        // Every output of `f` becomes exactly one queued child, in order — a
-        // null output is a real value (not "no child"), and an array output
-        // is visited as one node (not spliced into its elements) (#490).
-        // An error aborts immediately, same as jq's `def r: ., (f | r); r;`
-        // (#636) — the values already output no longer vanish, via the same
-        // `partial()` helper #495 uses for `repeat`/`while`.
+        // Every output of `f` becomes exactly one stacked child, in order —
+        // a null output is a real value (not "no child"), and an array
+        // output is visited as one node (not spliced into its elements)
+        // (#490). Pushed reversed so the first child stays on top and its
+        // whole subtree completes before the next sibling is reached
+        // (#635) — see `resolve_recurse`'s doc comment for the general
+        // shape this mirrors. An error aborts immediately, same as jq's
+        // `def r: ., (f | r); r;` (#636) — the values already output no
+        // longer vanish, via the same `partial()` helper #495 uses for
+        // `repeat`/`while`.
         match eval_owned_multi::<S>(f, &current) {
-            Ok(children) => queue.extend(children),
+            Ok(children) => stack.extend(children.into_iter().rev()),
             Err(e) => return partial(outputs, Control::Error(e)),
         }
     }
@@ -10672,6 +10700,14 @@ fn builtin_recurse_f<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// outputs, silently making recursion continue when it should stop).
 /// Switching to `eval_owned_multi` and checking each output keeps the true
 /// per-branch truthiness instead of collapsing it away.
+///
+/// Traversal is depth-first, matching jq's own `def r: ., (f | select(cond)
+/// | r); r;`: each visited node collects its own next-to-visit entries
+/// (`f`'s children, with `cond`'s fork flattened in encounter order) into a
+/// local `next` buffer, then pushes `next` onto the stack reversed, so the
+/// first entry — and its whole subtree — is visited before the next one
+/// (#635). See `resolve_recurse`'s doc comment for the same mechanism
+/// spelled out in more depth.
 fn builtin_recurse_cond<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     f: &Expr,
     cond: &Expr,
@@ -10679,11 +10715,11 @@ fn builtin_recurse_cond<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     _optional: bool,
 ) -> QueryResult<'a, W> {
     let mut outputs: Vec<OwnedValue> = Vec::new();
-    let mut queue: Vec<OwnedValue> = vec![to_owned(&value)];
+    let mut stack: Vec<OwnedValue> = vec![to_owned(&value)];
     const MAX_ITEMS: usize = 10000;
 
-    while !queue.is_empty() && outputs.len() < MAX_ITEMS {
-        let current = queue.remove(0);
+    while !stack.is_empty() && outputs.len() < MAX_ITEMS {
+        let current = stack.pop().unwrap();
         outputs.push(current.clone());
 
         // Every output of `f` becomes exactly one candidate child, in order —
@@ -10697,6 +10733,10 @@ fn builtin_recurse_cond<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             Err(e) => return partial(outputs, Control::Error(e)),
         };
 
+        // Collected in encounter order, then pushed onto `stack` reversed —
+        // see `resolve_recurse`'s doc comment (#635) — so the first entry's
+        // whole subtree completes before the next is reached.
+        let mut next: Vec<OwnedValue> = Vec::new();
         for child in children {
             // `cond` gates the child, not `current` (see doc comment above).
             // A `cond` error aborts immediately too — same jq definition,
@@ -10708,10 +10748,11 @@ fn builtin_recurse_cond<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             };
             for c in &cond_outputs {
                 if c.is_truthy() {
-                    queue.push(child.clone());
+                    next.push(child.clone());
                 }
             }
         }
+        stack.extend(next.into_iter().rev());
     }
 
     if outputs.is_empty() {
@@ -26779,12 +26820,20 @@ mod tests {
 
     #[test]
     fn test_recurse_with_filter() {
-        // recurse(.children[]?) - follow .children at each level
+        // recurse(.children[]?) - follow .children at each level, depth-first:
+        // `a`'s whole subtree (`b`) completes before its sibling `c` is visited.
         query!(br#"{"name": "root", "children": [{"name": "a", "children": [{"name": "b"}]}, {"name": "c"}]}"#,
             "[recurse(.children[]?) | .name]",
             QueryResult::Owned(OwnedValue::Array(arr)) => {
-                // Should collect: root, a, b, c
-                assert_eq!(arr.len(), 4);
+                assert_eq!(
+                    arr,
+                    vec![
+                        OwnedValue::String("root".into()),
+                        OwnedValue::String("a".into()),
+                        OwnedValue::String("b".into()),
+                        OwnedValue::String("c".into()),
+                    ]
+                );
             }
         );
     }

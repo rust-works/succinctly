@@ -1,0 +1,1 @@
+[recurse(.children[]?; if .fork then (true,true) else true end) | .name]

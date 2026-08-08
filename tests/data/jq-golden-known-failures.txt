@@ -93,6 +93,16 @@
 # way for `|=`/`+=`/`-=`/`*=`/`/=`/`%=`/`//=`: it now takes the update
 # filter's first output via `eval_owned_multi` instead of collapsing every
 # output into an `OwnedValue::Array` via `eval_owned_expr`.
+#
+# recurse_f_dfs_sibling_order — seeded by #676 ahead of #635, pinning
+# `resolve_recurse`/`builtin_recurse_f`/`builtin_recurse_cond`'s
+# breadth-first FIFO queue (`queue.remove(0)`), which visited a branching
+# node's children level-by-level instead of jq's depth-first `def r: .,
+# (f | r); r;` definition — has since been fixed and dropped: all three
+# now drive recursion with an explicit LIFO stack instead, collecting each
+# node's next-to-visit entries and pushing them reversed so the
+# first-encountered entry's whole subtree completes before the next
+# sibling is touched, matching jq exactly. Leaving 6.
 
 reduce_multi_output_init       reduce             a multi-output reduce INIT forks in jq; only the first init output is used — #534
 foreach_multi_output_init      foreach            a multi-output foreach INIT forks in jq; only the first init output is used — #534

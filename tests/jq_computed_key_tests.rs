@@ -891,8 +891,8 @@ fn test_multi_output_path_components_fan_out() {
         Outcome::values(&[r#"{"x":{"k":"v"},"y":{"k":"w"}}"#]),
     );
 
-    // `recurse` (BFS order) and `select(f)` generalise the same way as `..`
-    // and `objects`.
+    // `recurse` and `select(f)` generalise the same way as `..` and
+    // `objects`.
     check(
         doc,
         r"[path(recurse | objects | .[.k]?)]",
