@@ -22395,11 +22395,96 @@ mod tests {
     }
 
     #[test]
+    fn test_builtin_explode_round_trips_max_valid_codepoint() {
+        query!("[\"\u{10FFFF}\"]".as_bytes(), ".[0] | explode",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr, vec![OwnedValue::Int(1114111)]);
+            }
+        );
+    }
+
+    #[test]
     fn test_builtin_implode() {
         query!(br"[97, 98, 99]", "implode",
             QueryResult::Owned(OwnedValue::String(s)) => {
                 assert_eq!(s, "abc");
             }
+        );
+    }
+
+    /// jq.test's codepoint boundary table (surrogates, max valid codepoint,
+    /// overflow, fractional truncation) — see issue #706. Every expected
+    /// value below is captured from live jq 1.7.1, not derived.
+    #[test]
+    fn test_builtin_implode_boundary_table() {
+        for (codepoint, expected) in [
+            ("-1", "\u{FFFD}"), // negative -> replacement char
+            ("0", "\u{0}"),
+            ("1", "\u{1}"),
+            ("2", "\u{2}"),
+            ("3", "\u{3}"),
+            ("1114111", "\u{10FFFF}"), // max valid codepoint: round-trips
+            ("1114112", "\u{FFFD}"),   // one past max -> replacement char
+            ("55295", "\u{D7FF}"),     // just below surrogate range: valid
+            ("55296", "\u{FFFD}"),     // low surrogate boundary -> replacement char
+            ("57343", "\u{FFFD}"),     // high surrogate boundary -> replacement char
+            ("57344", "\u{E000}"),     // just above surrogate range: valid
+            ("1.1", "\u{1}"),          // fractional codepoints truncate
+            ("1.9", "\u{1}"),
+        ] {
+            let json = format!("[{codepoint}]");
+            query!(json.as_bytes(), "implode",
+                QueryResult::Owned(OwnedValue::String(s)) => {
+                    assert_eq!(s, expected, "implode([{codepoint}])");
+                }
+            );
+        }
+
+        // The full table round-tripped through one call, matching jq.test's
+        // single-array-literal shape and jq 1.7.1's exact output.
+        query!(
+            br"[-1, 0, 1, 2, 3, 1114111, 1114112, 55295, 55296, 57343, 57344, 1.1, 1.9]",
+            "implode",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(
+                    s,
+                    "\u{FFFD}\u{0}\u{1}\u{2}\u{3}\u{10FFFF}\u{FFFD}\u{D7FF}\u{FFFD}\u{FFFD}\u{E000}\u{1}\u{1}"
+                );
+            }
+        );
+    }
+
+    /// implode's error messages are type-specific per invalid element, not a
+    /// generic "invalid codepoint" — see issue #706.
+    #[test]
+    fn test_builtin_implode_element_errors() {
+        for (json, filter, message) in [
+            (&br"1"[..], "implode", "implode input must be an array"),
+            (
+                &br#"["a", 98, 99]"#[..],
+                "implode",
+                r#"string ("a") can't be imploded, unicode codepoint needs to be numeric"#,
+            ),
+            (
+                &br"null"[..],
+                "[97, nan] | implode",
+                "number (null) can't be imploded, unicode codepoint needs to be numeric",
+            ),
+        ] {
+            query!(json, filter,
+                QueryResult::Error(e) => assert_eq!(e.message, message, "{filter}")
+            );
+        }
+    }
+
+    /// `implode?` on an array with an invalid element backtracks to no
+    /// output at all, not a partial string built from the valid elements —
+    /// live-verified against jq 1.7.1 (`echo '["a",98,99]' | jq 'implode?'`
+    /// prints nothing).
+    #[test]
+    fn test_builtin_implode_optional_suppresses_whole_result() {
+        query!(br#"["a", 98, 99]"#, "implode?",
+            QueryResult::None => {}
         );
     }
 

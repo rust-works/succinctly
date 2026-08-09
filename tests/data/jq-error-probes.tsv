@@ -223,6 +223,10 @@ in_object_on_number	in({})	1
 # ── Fixed-sentence builtin errors ────────────────────────────────────────────
 explode_on_number	explode	1
 implode_on_number	implode	1
+# implode's per-element error is type-specific, distinct from the whole-array
+# "implode input must be an array" sentence above — see issue #706.
+implode_string_element	implode	["a",98,99]
+implode_nan_element	[97, nan] | implode	null
 ascii_downcase_on_number	ascii_downcase	1
 # Same jq definition as `ascii_downcase`, so the same sentence — probed
 # because the two had drifted apart here.
