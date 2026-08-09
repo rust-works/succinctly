@@ -492,6 +492,14 @@ impl EvalError {
         Self::subject(value, "cannot be matched, as it is not a string")
     }
 
+    /// `<v> can't be imploded, unicode codepoint needs to be numeric`.
+    pub fn cannot_be_imploded(value: &OwnedValue) -> Self {
+        Self::subject(
+            value,
+            "can't be imploded, unicode codepoint needs to be numeric",
+        )
+    }
+
     /// `<type> not a string or array`.
     ///
     /// jq's wording when test/match/capture's *pattern* argument is neither a

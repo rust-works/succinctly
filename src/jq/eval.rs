@@ -5234,19 +5234,36 @@ fn builtin_implode<W: Clone + AsRef<[u64]>>(
         StandardJson::Array(elements) => {
             let mut result = String::new();
             for elem in *elements {
-                if let StandardJson::Number(n) = elem {
-                    if let Ok(codepoint) = n.as_i64() {
-                        if let Some(c) = char::from_u32(codepoint as u32) {
-                            result.push(c);
-                        } else if optional {
-                            continue;
+                let codepoint = match &elem {
+                    StandardJson::Number(n) => match n.as_i64() {
+                        Ok(i) => i,
+                        // Not a strict integer: either a fractional literal (jq
+                        // truncates it) or the NaN sentinel (jq errors on it,
+                        // matched below since `as_f64` fails for it too).
+                        Err(_) => match n.as_f64() {
+                            Ok(f) => f.trunc() as i64,
+                            Err(_) => {
+                                return if optional {
+                                    QueryResult::None
+                                } else {
+                                    QueryResult::Error(EvalError::cannot_be_imploded(&to_owned(
+                                        &elem,
+                                    )))
+                                };
+                            }
+                        },
+                    },
+                    _ => {
+                        return if optional {
+                            QueryResult::None
                         } else {
-                            return QueryResult::Error(EvalError::new(format!(
-                                "invalid codepoint: {codepoint}"
-                            )));
-                        }
+                            QueryResult::Error(EvalError::cannot_be_imploded(&to_owned(&elem)))
+                        };
                     }
-                }
+                };
+                // jq substitutes U+FFFD for any codepoint char::from_u32 rejects
+                // (surrogates, >0x10FFFF, negative), rather than erroring.
+                result.push(char::from_u32(codepoint as u32).unwrap_or('\u{FFFD}'));
             }
             QueryResult::Owned(OwnedValue::String(result))
         }
