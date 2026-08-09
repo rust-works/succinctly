@@ -3593,6 +3593,47 @@ mod tests {
     }
 
     #[test]
+    fn test_generic_optional_around_native_pipe_fanout_empty_prefix() {
+        // Sibling to the test above: the error hits on the very *first*
+        // fan-out element, so the `Partial` prefix collected before it is
+        // empty. Exercises `Expr::Optional`'s `prefix.len() == 0` arm
+        // (eval_generic.rs), which the `.==2` case above can't reach since
+        // it always leaves a one-element prefix. Confirmed against real jq
+        // 1.7.1: `(.[] | if .==1 then error("boom") else . end)?` on
+        // `[1,2,3]` prints nothing.
+        let json = br"[1, 2, 3]";
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+
+        let expr = crate::jq::parse(r#"(.[] | if .==1 then error("boom") else . end)?"#).unwrap();
+        let result = eval(&expr, value);
+        assert_eq!(result.collect_owned(), Vec::<OwnedValue>::new());
+    }
+
+    #[test]
+    fn test_generic_optional_around_native_pipe_fanout_multi_element_prefix() {
+        // Sibling to the two tests above: the error hits after more than
+        // one fan-out element has already succeeded, so the `Partial`
+        // prefix holds multiple values. Exercises `Expr::Optional`'s
+        // `prefix.len() > 1` arm (eval_generic.rs), which neither the
+        // one-element nor the zero-element case above can reach. Confirmed
+        // against real jq 1.7.1: `(.[] | if .==3 then error("boom") else .
+        // end)?` on `[1,2,3,4]` prints `1` then `2`.
+        let json = br"[1, 2, 3, 4]";
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+
+        let expr = crate::jq::parse(r#"(.[] | if .==3 then error("boom") else . end)?"#).unwrap();
+        let result = eval(&expr, value);
+        assert_eq!(
+            result.collect_owned(),
+            vec![OwnedValue::Int(1), OwnedValue::Int(2)]
+        );
+    }
+
+    #[test]
     fn test_yaml_generic_array() {
         use crate::yaml::YamlIndex;
 
