@@ -86,6 +86,7 @@ const REQUIRED: &[Feature] = &[
     Feature::ExplicitKey,
     Feature::MultiDocument,
     Feature::MergeKey,
+    Feature::Tag,
 ];
 
 /// Constructs deliberately kept out of the suite, with the reason. Generating
@@ -95,10 +96,10 @@ const REQUIRED: &[Feature] = &[
 /// When one is fixed, delete its row here and give it a pattern: this test
 /// turns the fix into a required edit rather than leaving the coverage gap in
 /// place.
-const OUT_OF_SCOPE: &[(Feature, &str)] = &[(
-    Feature::Tag,
-    "rejected outright in block context (documented non-support in src/yaml/mod.rs)",
-)];
+///
+/// Empty since #224: tags (the only entry) resolve now, matching `yq`, so
+/// they moved to `REQUIRED` and got a pattern (`generate_anchors`) instead.
+const OUT_OF_SCOPE: &[(Feature, &str)] = &[];
 
 /// The feature each pattern added by #327 exists to carry.
 const HEADLINE: &[(&str, &[Feature])] = &[
@@ -225,6 +226,9 @@ fn features_of(pattern: &str, bytes: &[u8]) -> BTreeSet<Feature> {
         if index.is_alias(p) {
             found.insert(Feature::Alias);
         }
+        if index.get_tag(p).is_some() {
+            found.insert(Feature::Tag);
+        }
     }
 
     // The root is a virtual sequence of documents: more than one child means a
@@ -245,17 +249,15 @@ fn features_of(pattern: &str, bytes: &[u8]) -> BTreeSet<Feature> {
         _ => walk(root, &mut found),
     }
 
-    // Three constructs the index does not distinguish after the fact: an
-    // explicit key is an ordinary key once indexed, a tag would have failed
-    // the build above, and a merge key (#171) is resolved away into ordinary
-    // fields by `YamlFields` — a successfully merged mapping has no literal
-    // "<<" left for a tree walk to find.
+    // Two constructs the index does not distinguish after the fact: an
+    // explicit key is an ordinary key once indexed, and a merge key (#171) is
+    // resolved away into ordinary fields by `YamlFields` — a successfully
+    // merged mapping has no literal "<<" left for a tree walk to find. A tag
+    // *is* index-visible (`YamlIndex::get_tag`, #224) and detected in the BP
+    // scan above, unlike these two.
     let text = String::from_utf8_lossy(bytes);
     if text.starts_with("? ") || text.contains("\n? ") {
         found.insert(Feature::ExplicitKey);
-    }
-    if text.contains("!!") {
-        found.insert(Feature::Tag);
     }
     if text.contains("<<:") {
         found.insert(Feature::MergeKey);
@@ -295,6 +297,10 @@ fn detector_finds_every_feature_it_claims_to() {
         (Feature::ExplicitKey, "? key\n: value\n"),
         (Feature::MultiDocument, "---\na: 1\n---\nb: 2\n"),
         (Feature::MergeKey, "base: &b\n  a: 1\nc:\n  <<: *b\n"),
+        // Tags resolve now (#224) and are index-visible via
+        // `YamlIndex::get_tag`, detected in the same BP scan as anchors and
+        // aliases rather than the text-based fallback the other two still need.
+        (Feature::Tag, "a: !!str 1\n"),
     ];
 
     for (feature, yaml) in cases {
@@ -305,13 +311,6 @@ fn detector_finds_every_feature_it_claims_to() {
             feature.name()
         );
     }
-
-    // Tags never reach the index — the parser rejects them — so the tag check
-    // is text-based and is pinned separately.
-    assert!(
-        YamlIndex::build(b"a: !!str 1\n").is_err(),
-        "tags now parse; the Tag detection here needs to move to the index"
-    );
 }
 
 #[test]

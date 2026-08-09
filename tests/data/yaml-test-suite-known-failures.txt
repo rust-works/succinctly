@@ -10,7 +10,10 @@
 #
 # Categories
 # ----------
-#   tags        !!str / !custom / verbatim tags are not supported at all. -> #224
+#   tags        Tag *support* landed in #224. One case remains: S4JQ, where the
+#               spec and `yq` disagree on what a bare `!` (non-specific tag)
+#               resolves to and we follow `yq` (same policy as FRK4/JEF9/02
+#               below) — not an absent feature.
 #   lax:*       Invalid input that indexing accepts because it does not validate.
 #               This is a property of the default mode, not a defect: succinctly
 #               is a non-validating loader. Rejecting these is the job of the
@@ -19,78 +22,53 @@
 #               must-fail case as handled if the loader OR that validator rejects
 #               it, so the `lax:*` entries that remain here are the cases the
 #               validator does not yet reject (deeper structural analysis). -> #223
+#               `lax:tags` (LHL4, U99R) is the tag-specific slice of this: a
+#               malformed tag (disallowed characters, a `%TAG`-mid-stream
+#               placement) is absorbed rather than rejected, the same as every
+#               other `lax:*` construct — #224 implemented tag *resolution*,
+#               not tag *validation*, matching the rest of this loader.
 #   scalars     Scalar content or block-scalar folding differs from the spec.
 #               Not yet individually triaged.
 #   structure   Document or block structure differs from the spec. Not yet
 #               individually triaged.
 
-2AUY      tags              tags (!) not supported — #224
 2CMS      lax:mapping       mapping/key rules not validated — #223
 2SXE      structure         document/block structure differs from spec
-2XXW      tags              tag shorthand emitted as scalar text — #224
-33X3      tags              tags (!) not supported — #224
-35KP      tags              tags (!) not supported — #224
 4JVG      lax:anchors       anchor/alias rules not validated — #223
-52DL      tags              tags (!) not supported — #224
-565N      tags              tags (!) not supported — #224
-57H4      tags              tags (!) not supported — #224
 5LLU      lax:indentation   indentation not validated — #223
-5TYM      tags              tags (!) not supported — #224
-6CK3      tags              tags (!) not supported — #224
-6JWB      tags              tags (!) not supported — #224
-6WLZ      tags              tags (!) not supported — #224
-735Y      tags              tags (!) not supported — #224
-74H7      tags              tags (!) not supported — #224
-7FWL      tags              tags (!) not supported — #224
-8MK2      tags              tags (!) not supported — #224
 8XDJ      lax:comments      comment placement not validated — #223
 9C9N      lax:indentation   indentation not validated — #223
-9KAX      tags              tags (!) not supported — #224
+9HCY      lax:documents     mid-stream `%TAG` directive (no `...` footer before it) absorbed as scalar text rather than rejected — #223 (surfaced by #224: previously masked by tags erroring at column 0 before the directive was ever reached)
 9KBC      lax:mapping       mapping/key rules not validated — #223
-9WXW      tags              tags (!) not supported — #224
 AVM7      scalars           scalar content/folding differs from spec
 BF9H      lax:comments      comment placement not validated — #223
-BU8L      tags              tag shorthand emitted as scalar text — #224
 C2SP      lax:flow          flow syntax not validated — #223
-C4HZ      tags              tags (!) not supported — #224
-CC74      tags              tags (!) not supported — #224
-CUP7      tags              tags (!) not supported — #224
 CXX2      lax:anchors       anchor/alias rules not validated — #223
 DK3J      scalars           scalar content/folding differs from spec
 DK4H      lax:mapping       mapping/key rules not validated — #223
-EHF6      tags              tags (!) not supported — #224
 EW3V      lax:mapping       mapping/key rules not validated — #223
-F2C7      tags              tags (!) not supported — #224
-FH7J      tags              tags (!) not supported — #224
 FP8R      scalars           scalar content/folding differs from spec
 G9HC      lax:indentation   indentation not validated — #223
 GT5M      lax:anchors       anchor/alias rules not validated — #223
-HMQ5      tags              tags (!) not supported — #224
+H7J7      lax:anchors       anchored key's value on the next line, unindented relative to the key (`key: &x` / `!!map` at the same column) — read as null per indentation, but the tag's own deferred mapping content is then dropped rather than rejected — #223 (surfaced by #224 the same way as 9HCY)
 HU3P      lax:mapping       mapping/key rules not validated — #223
-J7PZ      tags              tag shorthand emitted as scalar text — #224
 JEF9/02   scalars           blank final line with no break — follows yq, which gives "" — #344
 KS4U      lax:flow          flow syntax not validated — #223
 L24T/00   scalars           scalar content/folding differs from spec
-L94M      tags              tag shorthand emitted as scalar text — #224
-LE5A      tags              tags (!) not supported — #224
+LHL4      lax:tags          tag containing a disallowed flow indicator (`!invalid{}tag`) absorbed as text/flow-mapping rather than rejected — #224
 M5C3      scalars           scalar content/folding differs from spec
 M7A3      structure         bare document / `...` end-marker mis-parsed (both paths agree)
 MUS6/01   lax:documents     directive/document rules not validated — #223
-P76L      tags              tags (!) not supported — #224
 QLJ7      lax:documents     directive/document rules not validated — #223
-S4JQ      tags              tags (!) not supported — #224
+S4JQ      tags              non-specific tag (`!` alone) resolution: spec's "conventional resolution" forces `!!str`, but real yq v4.53.3 leaves the content's natural type untouched (`! 12` stays the number 12) — we follow yq, the same policy as FRK4/JEF9/02 — #224
 S98Z      lax:block-scalar  block scalar header not validated — #223
 T833      lax:flow          flow syntax not validated — #223
-U3C3      tags              tags (!) not supported — #224
 U44R      lax:indentation   indentation not validated — #223
+U99R      lax:tags          tag containing a disallowed flow indicator (`!!str,`) absorbed as text (block context has no special meaning for `,`) rather than rejected — #224
 UGM3      structure         document/block structure differs from spec
-UKK6/02   tags              tags (!) not supported — #224
 VJP3/00   lax:flow          flow syntax not validated — #223
 W4TN      scalars           scalar content/folding differs from spec
 W5VH      structure         document/block structure differs from spec
 W9L4      lax:block-scalar  block scalar header not validated — #223
-WZ62      tags              tag shorthand emitted as scalar text — #224
 Y79Y/003  lax:tabs          tab handling not validated — #223
-Z67P      tags              tags (!) not supported — #224
-Z9M4      tags              tags (!) not supported — #224
 ZVH3      lax:indentation   indentation not validated — #223
