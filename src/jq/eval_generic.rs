@@ -5931,4 +5931,88 @@ mod tests {
             Summary::Break("out".to_string())
         );
     }
+
+    #[test]
+    fn test_computed_index_key_bare_one_and_many_via_cursor_less_entry() {
+        // `eval_index_expr`'s key match has a `One`/`Many` arm alongside its
+        // `OneCursor`/`ManyCursor` ones (#699 coverage gap): a key stream
+        // whose values aren't attached to any cursor at all, not just one
+        // whose per-element cursor was dropped. That only happens when the
+        // *ambient* ("." at the point the whole `IndexExpr` is evaluated)
+        // cursor is `None` to begin with -- i.e. entering through the
+        // cursor-less `eval()`/`eval_using()` API (as plenty of this
+        // module's own tests do, e.g. `test_generic_identity` above) rather
+        // than `eval_with_cursor()`. `Expr::Identity` under a `None` ambient
+        // cursor returns bare `One(value)`; `select(true,true)` (whose
+        // `pass_n` also forwards the ambient cursor) returns bare `Many`.
+        let json = b"0";
+        let index = JsonIndex::build(json);
+        let value = index.root(json).value();
+
+        let expr = crate::jq::parse("([10,20,30])[.]").unwrap();
+        assert_eq!(
+            eval(&expr, value.clone()).collect_owned(),
+            vec![OwnedValue::Int(10)]
+        );
+
+        let expr = crate::jq::parse("([10,20,30])[select(true,true)]").unwrap();
+        assert_eq!(
+            eval(&expr, value).collect_owned(),
+            vec![OwnedValue::Int(10), OwnedValue::Int(10)]
+        );
+    }
+
+    #[test]
+    fn test_computed_slice_bound_bare_one_and_many_via_cursor_less_entry() {
+        // Mirrors the `eval_index_expr` key case directly above, but for
+        // `eval_slice_bound`'s own `One`/`Many` arms (#699 coverage gap) --
+        // same cursor-less-entry mechanism, same `.`/`select(true,true)`
+        // bound expressions, just feeding a slice's start bound instead of
+        // an index key.
+        let json = b"0";
+        let index = JsonIndex::build(json);
+        let value = index.root(json).value();
+
+        let expr = crate::jq::parse("([10,20,30])[.:2]").unwrap();
+        assert_eq!(
+            eval(&expr, value.clone()).collect_owned(),
+            vec![OwnedValue::Array(vec![
+                OwnedValue::Int(10),
+                OwnedValue::Int(20)
+            ])]
+        );
+
+        let expr = crate::jq::parse("([10,20,30])[select(true,true):2]").unwrap();
+        assert_eq!(
+            eval(&expr, value).collect_owned(),
+            vec![
+                OwnedValue::Array(vec![OwnedValue::Int(10), OwnedValue::Int(20)]),
+                OwnedValue::Array(vec![OwnedValue::Int(10), OwnedValue::Int(20)]),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_computed_slice_bound_many_cursor() {
+        // `eval_slice_bound`'s `ManyCursor` arm (#699 coverage gap): unlike
+        // the `One`/`Many` cases above, this needs no cursor-less trickery --
+        // `.starts[]` iterating a real document array yields cursors
+        // regardless of the ambient cursor, so a normal `eval_with_cursor`
+        // call reaches it directly.
+        let json = br#"{"arr":[1,2,3,4,5],"starts":[0,1]}"#;
+        let index = JsonIndex::build(json);
+        let expr = crate::jq::parse(".arr[.starts[]:3]").unwrap();
+
+        assert_eq!(
+            eval_with_cursor(&expr, index.root(json)).collect_owned(),
+            vec![
+                OwnedValue::Array(vec![
+                    OwnedValue::Int(1),
+                    OwnedValue::Int(2),
+                    OwnedValue::Int(3)
+                ]),
+                OwnedValue::Array(vec![OwnedValue::Int(2), OwnedValue::Int(3)]),
+            ]
+        );
+    }
 }
