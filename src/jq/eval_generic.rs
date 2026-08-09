@@ -2537,6 +2537,117 @@ mod tests {
         );
     }
 
+    /// `GenericResult::LazyIndexRange`'s `collect_owned()` (#684) -- the
+    /// fallback path used by consumers other than the `Pipe`/M2-streaming
+    /// fast paths covered by the CLI-level tests in `tests/jq_cli_tests.rs`.
+    #[test]
+    fn test_generic_lazy_index_range_collect_owned() {
+        let json = br"[10, 20, 30]";
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+
+        let result = eval(&Expr::Builtin(Builtin::KeysUnsorted), value);
+        assert!(matches!(result, GenericResult::LazyIndexRange(3)));
+
+        assert_eq!(
+            result.collect_owned(),
+            vec![OwnedValue::Array(vec![
+                OwnedValue::Int(0),
+                OwnedValue::Int(1),
+                OwnedValue::Int(2)
+            ])]
+        );
+
+        let empty_json = br"[]";
+        let empty_index = JsonIndex::build(empty_json);
+        let empty_cursor = empty_index.root(empty_json);
+        let empty_result = eval(&Expr::Builtin(Builtin::KeysUnsorted), empty_cursor.value());
+        assert_eq!(
+            empty_result.collect_owned(),
+            vec![OwnedValue::Array(vec![])]
+        );
+    }
+
+    /// `GenericResult::LazyIndexRange`'s `stream_json`/`stream_yaml` (#684).
+    /// Unreachable via the yq CLI today -- `can_use_m2_streaming`'s
+    /// whitelist excludes `Builtin::Keys`/`Builtin::KeysUnsorted`, same as
+    /// `LazyKeys`'s sibling fallback arm -- so this exercises the writer
+    /// directly, covering both the compact/flow and indented/block styles
+    /// plus the empty-array short circuit.
+    #[test]
+    fn test_generic_lazy_index_range_stream_json_and_yaml() {
+        let json = br"[10, 20, 30]";
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+        let result = eval(&Expr::Builtin(Builtin::KeysUnsorted), value);
+        assert!(matches!(result, GenericResult::LazyIndexRange(3)));
+
+        let mut compact_json = String::new();
+        result
+            .stream_json(&mut compact_json, 0, |_| Ok(()))
+            .unwrap();
+        assert_eq!(compact_json, "[0,1,2]");
+
+        let mut indented_json = String::new();
+        result
+            .stream_json(&mut indented_json, 2, |_| Ok(()))
+            .unwrap();
+        assert_eq!(indented_json, "[\n  0,\n  1,\n  2\n]");
+
+        let mut flow_yaml = String::new();
+        result.stream_yaml(&mut flow_yaml, 0, |_| Ok(())).unwrap();
+        assert_eq!(flow_yaml, "[0, 1, 2]");
+
+        let mut block_yaml = String::new();
+        result.stream_yaml(&mut block_yaml, 2, |_| Ok(())).unwrap();
+        assert_eq!(block_yaml, "- 0\n- 1\n- 2");
+
+        let empty_json = br"[]";
+        let empty_index = JsonIndex::build(empty_json);
+        let empty_cursor = empty_index.root(empty_json);
+        let empty_result = eval(&Expr::Builtin(Builtin::KeysUnsorted), empty_cursor.value());
+
+        let mut empty_json_out = String::new();
+        empty_result
+            .stream_json(&mut empty_json_out, 2, |_| Ok(()))
+            .unwrap();
+        assert_eq!(empty_json_out, "[]");
+
+        let mut empty_yaml_out = String::new();
+        empty_result
+            .stream_yaml(&mut empty_yaml_out, 2, |_| Ok(()))
+            .unwrap();
+        assert_eq!(empty_yaml_out, "[]");
+    }
+
+    /// `eval_pipe_generic`'s `GenericResult::Many(vs)` stage arm's own
+    /// `LazyIndexRange` sub-arm (#684): each of `select`'s two cursor-less
+    /// truthy outputs (an array, so a bare `Many` rather than `ManyCursor` --
+    /// see `test_json_multi_stage_pipe_first_stage_bare_many_without_cursor`
+    /// above) is piped independently into `keys_unsorted`, which resolves to
+    /// `LazyIndexRange` per element and must be materialized before folding
+    /// into the accumulated `ManyOwned` result.
+    #[test]
+    fn test_json_multi_stage_pipe_first_stage_bare_many_lazy_index_range_684() {
+        let json = br"[10, 20]";
+        let index = JsonIndex::build(json);
+        let value = index.root(json).value();
+
+        let result = eval(
+            &crate::jq::parse("select(true,true) | keys_unsorted").unwrap(),
+            value,
+        );
+        assert_eq!(
+            result.collect_owned(),
+            vec![
+                OwnedValue::Array(vec![OwnedValue::Int(0), OwnedValue::Int(1)]),
+                OwnedValue::Array(vec![OwnedValue::Int(0), OwnedValue::Int(1)]),
+            ]
+        );
+    }
+
     #[test]
     fn test_generic_type() {
         let json = br#"{"name": "Alice"}"#;

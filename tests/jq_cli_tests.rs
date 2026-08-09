@@ -3295,5 +3295,80 @@ fn test_array_keys_unsorted_lazy_output_684() -> Result<()> {
     assert_eq!(code, 0);
     assert_eq!(output.trim(), "[0,10,20]");
 
+    // Far out-of-bounds negative index (normalizes below zero, not just
+    // negative-in-range like `.[-1]` above) is still `null`, not an error.
+    let (output, _, code) = run_jq_full(&["-c", "keys_unsorted | .[-100]"], Some(input))?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "null");
+
+    Ok(())
+}
+
+/// `GenericResult::LazyIndexRange` fallback paths #684 that the `Pipe`/M2
+/// fast paths above never reach: `select`'s truthiness check, the
+/// `.[] | keys_unsorted`-shaped per-element degrade from `ManyCursor`,
+/// `==` comparison against a lazy operand, and `first(...)`/`last(...)`
+/// function-call syntax (as opposed to the bare `first`/`last` builtins
+/// already covered above).
+#[test]
+fn test_array_keys_unsorted_lazy_fallback_paths_684() -> Result<()> {
+    let input = r#"["x","y","z"]"#;
+
+    // `select`'s condition only needs truthiness -- an array is always
+    // truthy in jq -- so this never materializes the index range.
+    let (output, _, code) = run_jq_full(&["-c", "select(keys_unsorted)"], Some(input))?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#"["x","y","z"]"#);
+
+    // Each element of the outer iteration degrades from `ManyCursor` to a
+    // materialized `LazyIndexRange` per element, since `keys_unsorted` on an
+    // array element isn't itself a single cursor.
+    let (output, _, code) = run_jq_full(
+        &["-c", ".[] | keys_unsorted"],
+        Some(r#"[["a","b"],["c","d","e"]]"#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "[0,1]\n[0,1,2]");
+
+    // Both operands of `==` are lazy index ranges here.
+    let (output, _, code) = run_jq_full(&["-c", "keys_unsorted == keys_unsorted"], Some(input))?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "true");
+
+    let (output, _, code) = run_jq_full(&["-c", "keys_unsorted == [0,1]"], Some(input))?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "false");
+
+    // `first(...)`/`last(...)` function-call syntax, distinct from the bare
+    // `first`/`last` builtins the `Pipe` dispatch fast-paths above. Unlike
+    // `keys_unsorted | first` (which iterates the array), `keys_unsorted`
+    // itself is a generator with exactly one output -- the whole array --
+    // so `first(keys_unsorted)`/`last(keys_unsorted)` both forward that one
+    // `LazyIndexRange` output unchanged.
+    let (output, _, code) = run_jq_full(&["-c", "first(keys_unsorted)"], Some(input))?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "[0,1,2]");
+
+    let (output, _, code) = run_jq_full(&["-c", "last(keys_unsorted)"], Some(input))?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "[0,1,2]");
+
+    Ok(())
+}
+
+/// The "original"/serde_json path (`evaluate_input` in `jq_runner.rs`,
+/// forced whenever `--sort-keys` disables the lazy-bytes path) has its own
+/// `GenericResult::LazyIndexRange` arm distinct from the lazy path's --
+/// exercise it directly rather than relying on incidental coverage from
+/// another flag combination.
+#[test]
+fn test_array_keys_unsorted_sort_keys_path_684() -> Result<()> {
+    let (output, _, code) = run_jq_full(
+        &["--sort-keys", "-c", "keys_unsorted"],
+        Some(r#"["x","y","z"]"#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "[0,1,2]");
+
     Ok(())
 }

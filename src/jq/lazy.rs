@@ -961,6 +961,52 @@ mod tests {
     }
 
     #[test]
+    fn test_jqvalue_lazy_index_range_type_name_and_length() {
+        let empty: JqValue<'_, Vec<u64>> = JqValue::LazyIndexRange(0);
+        assert_eq!(empty.type_name(), "array");
+        assert_eq!(empty.length(), Some(0));
+
+        let three: JqValue<'_, Vec<u64>> = JqValue::LazyIndexRange(3);
+        assert_eq!(three.type_name(), "array");
+        assert_eq!(three.length(), Some(3));
+    }
+
+    #[test]
+    fn test_jqvalue_lazy_index_range_materialize_and_into_owned() {
+        let empty: JqValue<'_, Vec<u64>> = JqValue::LazyIndexRange(0);
+        assert_eq!(empty.materialize(), OwnedValue::Array(vec![]));
+
+        let three: JqValue<'_, Vec<u64>> = JqValue::LazyIndexRange(3);
+        assert_eq!(
+            three.materialize(),
+            OwnedValue::Array(vec![
+                OwnedValue::Int(0),
+                OwnedValue::Int(1),
+                OwnedValue::Int(2)
+            ])
+        );
+
+        let three: JqValue<'_, Vec<u64>> = JqValue::LazyIndexRange(3);
+        assert_eq!(
+            three.into_owned(),
+            OwnedValue::Array(vec![
+                OwnedValue::Int(0),
+                OwnedValue::Int(1),
+                OwnedValue::Int(2)
+            ])
+        );
+    }
+
+    #[test]
+    fn test_jqvalue_lazy_index_range_write_json() {
+        let empty: JqValue<'_, Vec<u64>> = JqValue::LazyIndexRange(0);
+        assert_eq!(empty.to_json_string(), "[]");
+
+        let three: JqValue<'_, Vec<u64>> = JqValue::LazyIndexRange(3);
+        assert_eq!(three.to_json_string(), "[0,1,2]");
+    }
+
+    #[test]
     fn test_jqvalue_cursor_number_materialize_and_into_owned() {
         use crate::json::JsonIndex;
 
