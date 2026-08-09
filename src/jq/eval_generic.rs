@@ -1647,6 +1647,10 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
         GenericResult::Error(e) => return GenericResult::Error(e),
         GenericResult::Break(label) => return GenericResult::Break(label),
         GenericResult::None => return GenericResult::None,
+        // A `Partial`'s trailing control must abort here too, not silently
+        // truncate to its prefix (#694) -- mirrors the target match below.
+        GenericResult::Partial(_, Control::Error(e)) => return GenericResult::Error(e),
+        GenericResult::Partial(_, Control::Break(label)) => return GenericResult::Break(label),
         other => other.collect_owned(),
     };
     if keys.is_empty() {
@@ -2483,6 +2487,7 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
 mod tests {
     use super::super::expr::FormatType;
     use super::*;
+    use crate::jq::parse;
     use crate::json::JsonIndex;
 
     #[test]
@@ -2579,6 +2584,44 @@ mod tests {
             empty_result.collect_owned(),
             vec![OwnedValue::Array(vec![])]
         );
+    }
+
+    /// `eval_index_expr`'s `keys` match (#694): a `Partial`'s trailing
+    /// control was silently dropped there, keeping only its prefix instead
+    /// of propagating the error. Confirmed against real jq 1.7.1:
+    /// `.[("a", error("boom"))]` on `{"a":1,"b":2}` errors with "boom".
+    #[test]
+    fn test_generic_computed_index_read_propagates_partial_error_694() {
+        let json = br#"{"a":1,"b":2}"#;
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+
+        let expr = parse(r#".[("a", error("boom"))]"#).unwrap();
+        let result = eval_using::<JqSemantics, _>(&expr, value);
+        if let GenericResult::Error(e) | GenericResult::Partial(_, Control::Error(e)) = result {
+            assert_eq!(e.message, "boom");
+        } else {
+            panic!("unexpected result: {result:?}");
+        }
+    }
+
+    /// `eval_index_expr`'s `keys` match, `Partial`+`Break` sibling to the
+    /// `Partial`+`Error` case above (#694): a `break` after some keys have
+    /// already streamed collapses to the bare control instead of resolving
+    /// those keys against the target. Confirmed against real jq 1.7.1:
+    /// `label $out | .[("a", break $out)]` on `{"a":1,"b":2}` breaks out of
+    /// the label rather than indexing with `"a"`.
+    #[test]
+    fn test_generic_computed_index_read_propagates_partial_break_694() {
+        let json = br#"{"a":1,"b":2}"#;
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+
+        let expr = parse(r#".[("a", break $out)]"#).unwrap();
+        let result = eval_using::<JqSemantics, _>(&expr, value);
+        assert!(matches!(result, GenericResult::Break(ref label) if label == "out"));
     }
 
     /// `GenericResult::LazyIndexRange`'s `stream_json`/`stream_yaml` (#684).
