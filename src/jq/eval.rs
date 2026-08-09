@@ -444,7 +444,42 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             _ => QueryResult::Error(EvalError::cannot_iterate(&to_owned(&value))),
         },
 
-        Expr::Optional(inner) => eval_single::<W, S>(inner, value, true),
+        // `.[EXPR]?`/`.[S:E]?`: jq's `?` here guards only the *final*
+        // indexing/slicing operation, not evaluation of the bracket's own
+        // key/bounds sub-expression — verified against jq 1.7.1:
+        // `echo '"a"' | jq '.[.k]?'` still raises (exit 5, "Cannot index
+        // string with string \"k\""), even though the whole `.[.k]` is
+        // syntactically inside the `?`. Wrapping in one more layer (a paren,
+        // a pipe stage, or plain `try`) *does* catch it — `jq '(.[.k])?'`,
+        // `jq '(.[.k] | .+1)?'`, and `jq 'try .[.k]'` all exit 0 — so this is
+        // specific to the bare bracket-then-`?` postfix form, which is the
+        // only shape that reaches here (that form and no other parses
+        // straight to `Expr::Optional(Expr::IndexExpr { .. })` /
+        // `Expr::Optional(Expr::SliceExpr { .. })`; every other spelling
+        // interposes a `Paren`/`Pipe`/`Try` node this arm doesn't match).
+        // `eval_index_expr`/`eval_slice_expr` already implement this split
+        // (they evaluate the key/bounds with a hardcoded `optional: false`
+        // and only consult the ambient `optional` for their own final
+        // index/slice step), so preserve the direct "just forward
+        // `optional`, don't wrap in a catch" dispatch here — routing it
+        // through `eval_try` below like every other expression would catch
+        // the key/bounds error too, which is too broad.
+        Expr::Optional(inner)
+            if matches!(**inner, Expr::IndexExpr { .. } | Expr::SliceExpr { .. }) =>
+        {
+            eval_single::<W, S>(inner, value, true)
+        }
+
+        // `E?` is sugar for `try E` (no catch handler): evaluate `inner`
+        // with the ambient `optional` — not forced `true` — so nested
+        // leaves raise real errors instead of each independently
+        // self-suppressing, and let `eval_try`'s existing catch-once logic
+        // decide whether to swallow the *aggregate* result. Forcing
+        // `optional = true` down the whole subtree (the old behavior) let a
+        // masked error inside a combinator (comma, reduce/foreach/while/
+        // until) look exactly like ordinary `empty` to that combinator,
+        // which then wrongly kept going instead of stopping (#693).
+        Expr::Optional(inner) => eval_try::<W, S>(inner, None, value, optional),
 
         Expr::Pipe(exprs) => eval_pipe::<W, S>(exprs, value, optional),
 
@@ -1005,15 +1040,16 @@ fn eval_owned_expr_fork<S: EvalSemantics>(
 /// a construct's own legitimate prior output and only silences a trailing
 /// `Error`, it does not discard everything.
 ///
-/// A `Break` always propagates via `partial` here, uncaught by `optional`.
-/// That is *not* what real jq does — `label $out | (1, (reduce (1,2) as $x
-/// (0; break $out))?, 4)` gives jq's `1`, `4` (its `?` does swallow an
-/// escaping `break` whose matching `label` sits outside it) — but this
-/// codebase's `?`/`try` machinery doesn't catch a `break` anywhere else
-/// either (`Expr::Optional`'s own dispatch has the identical gap, confirmed
-/// reproducible on `main`, i.e. predating #534). This function deliberately
-/// stays consistent with that pre-existing, cross-cutting limitation rather
-/// than fixing it in isolation for just these four constructs.
+/// A `Break` always propagates via `partial` here, uncaught by `optional` —
+/// deliberately: `label $out | (1, (reduce (1,2) as $x (0; break $out))?,
+/// 4)` gives jq's `1`, `4` (its `?` does swallow an escaping `break` whose
+/// matching `label` sits outside it), and this codebase now matches that
+/// too (#693), but the catch happens one level up, at the `?`/`try`
+/// boundary wrapping whichever fork construct raised the `Break` —
+/// `eval_try`/`Expr::Optional`'s dispatch, not here. This function only
+/// ever sees `optional` after that boundary has already had its chance to
+/// react, so it correctly leaves `Break` alone and only ever silences a
+/// trailing `Error`.
 fn finish_fork<'a, W>(
     outputs: Vec<OwnedValue>,
     control: Option<Control>,
@@ -19558,19 +19594,30 @@ mod tests {
                 assert_eq!(label, "out");
             }
         );
-        // `optional` (`?`) must never swallow a `break` the way it swallows
-        // a real error — jq's `?` catches errors, not label breaks.
-        // Discriminating test: if the break were (incorrectly) swallowed as
-        // `None` by `optional`, the comma's second operand would still run
-        // and "reached" would be output; since the break must instead
-        // short-circuit the comma and reach the label, "reached" is never
-        // evaluated.
+        // Corrected by #693 (was asserted the other way, unverified — see
+        // below): `?` *does* swallow an escaping `break` the same way it
+        // swallows a real error, exactly like `try` already does (#562) —
+        // jq defines `E?` as sugar for `try E`, and it does not
+        // special-case `break`. Re-verified directly against jq 1.7.1 three
+        // ways (`?`, `try` with no catch, and the bare/uncaught form for
+        // contrast) immediately before writing this assertion:
+        // `jq -n 'label $out | ((reduce (1,2,3) as $x (0; if $x==2 then
+        // break $out else .+$x end))?, "reached")'` prints `"reached"`
+        // (`?` catches the break, so the comma continues); the `try`
+        // spelling prints the same; the bare form with no `?`/`try` at all
+        // prints nothing (the break escapes uncaught to `label $out`,
+        // which then discards the rest of the comma). This test previously
+        // asserted the *bare* form's behavior for the `?`-wrapped query —
+        // an assumption that went unverified because, pre-#693, this
+        // codebase's `Expr::Optional` never caught a `break` at all, so the
+        // (wrong) expectation and the (buggy) implementation happened to
+        // agree.
         assert_eq!(
             outputs(
                 b"null",
                 r#"label $out | ((reduce (1,2,3) as $x (0; if $x==2 then break $out else .+$x end))?, "reached")"#
             ),
-            Vec::<String>::new()
+            ["\"reached\""]
         );
     }
 
@@ -22775,12 +22822,29 @@ mod tests {
     }
 
     #[test]
-    fn test_reduce_init_partial_error_swallowed_when_optional() {
-        // INIT `(1,$nope)` produces `Partial([1], Control::Error(_))` — under
-        // `?` this whole prefix is discarded, not just the error.
+    fn test_reduce_init_partial_error_still_runs_the_fork_from_its_prefix_value() {
+        // Corrected by #693 (was asserted the other way, unverified — see
+        // below): INIT `(1,$nope)` produces `Partial([1], Control::Error(_))`
+        // — under `?` only the trailing error is swallowed; the `1` INIT
+        // already validly produced still forks and runs to completion,
+        // matching this codebase's own "outputs already produced don't
+        // vanish" contract (`partial()`/`prepend()`/`finish_fork`'s doc
+        // comments) and jq's actual behavior. `$nope` (an undefined
+        // variable) is a *compile*-time error in real jq, so it can't be
+        // run directly there to check; re-verified the identical shape with
+        // a *runtime* error instead immediately before writing this
+        // assertion: `jq -n '[1,2,3] | (reduce .[] as $x ((1,error("boom"));
+        // .+$x))?'` prints `7` — i.e. the fork from INIT's `1` runs
+        // `1+1=2, 2+2=4, 4+3=7` to completion, exactly like this test now
+        // expects. This test previously asserted the whole prefix was
+        // discarded — an assumption that went unverified because, pre-#693,
+        // this codebase's `Expr::Optional` self-suppressed every leaf error
+        // it wrapped (including `$nope`'s—see the `$nope` explainer above),
+        // so the (wrong) expectation and the (buggy) implementation
+        // happened to agree.
         assert_eq!(
             outputs(b"[1,2,3]", "(reduce .[] as $x ((1,$nope); .+$x))?"),
-            Vec::<String>::new()
+            ["7"]
         );
     }
 

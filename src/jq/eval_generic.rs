@@ -948,7 +948,42 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
             }
         }
 
-        Expr::Optional(inner) => eval_single::<S, _>(inner, value, true, cursor),
+        // `.[EXPR]?`/`.[S:E]?`: mirrors `eval::eval_single`'s identical
+        // special case (see its comment for the jq-1.7.1-verified reasoning)
+        // — `?` on a bare bracket-index/slice postfix guards only the final
+        // index/slice step, not the bracket's own key/bounds sub-expression.
+        // This file's own `eval_index_expr`/`eval_slice_expr` (below)
+        // already evaluate key/bounds with a hardcoded `optional: false` and
+        // only consult the ambient `optional` for their final step, so
+        // preserve the direct forwarding dispatch here instead of the
+        // catch-everything arm below, which would catch the key/bounds
+        // error too.
+        Expr::Optional(inner)
+            if matches!(**inner, Expr::IndexExpr { .. } | Expr::SliceExpr { .. }) =>
+        {
+            eval_single::<S, _>(inner, value, true, cursor)
+        }
+
+        // `E?` is sugar for `try E`: evaluate `inner` with the ambient
+        // `optional` (not forced `true`) and catch the aggregate result
+        // exactly once here, mirroring `eval::eval_try` (there is no local
+        // `Expr::Try`/combinator handling in this file to delegate to —
+        // those already bridge to `eval::eval`, which implements this same
+        // pattern). Forcing `optional = true` down the whole subtree let a
+        // masked error inside a natively-evaluated `Pipe` fan-out look like
+        // ordinary `empty`, so the fan-out wrongly kept going instead of
+        // stopping (#693).
+        Expr::Optional(inner) => match eval_single::<S, _>(inner, value, optional, cursor) {
+            GenericResult::Error(_) | GenericResult::Break(_) => GenericResult::None,
+            GenericResult::Partial(prefix, Control::Error(_) | Control::Break(_)) => {
+                match prefix.len() {
+                    0 => GenericResult::None,
+                    1 => GenericResult::Owned(prefix.into_iter().next().unwrap()),
+                    _ => GenericResult::ManyOwned(prefix),
+                }
+            }
+            other => other,
+        },
 
         // Parens are transparent to cursor-based evaluation: handled natively
         // (like `Expr::Optional` above) so `(.)` and friends keep threading
