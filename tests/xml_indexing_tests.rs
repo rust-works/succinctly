@@ -8,6 +8,7 @@
 //! `DocumentCursor` trait implementations actually work end-to-end, not just
 //! their own inherent methods.
 
+use succinctly::jq::document::DocumentFields;
 use succinctly::jq::eval_generic::{eval_with_cursor, to_owned, GenericResult};
 use succinctly::jq::{parse, OwnedValue};
 use succinctly::xml::{locate_offset, locate_offset_detailed, XmlIndex};
@@ -24,6 +25,9 @@ fn eval_xml(xml: &[u8], filter: &str) -> Vec<OwnedValue> {
         GenericResult::OneCursor(c) => vec![to_owned(&c.value())],
         GenericResult::Many(vs) => vs.iter().map(to_owned).collect(),
         GenericResult::ManyCursor(cs) => cs.iter().map(|c| to_owned(&c.value())).collect(),
+        GenericResult::LazyKeysUnsorted(fields) => vec![OwnedValue::Array(
+            fields.keys().into_iter().map(OwnedValue::String).collect(),
+        )],
         GenericResult::None => vec![],
         GenericResult::Owned(v) => vec![v],
         GenericResult::ManyOwned(vs) => vs,

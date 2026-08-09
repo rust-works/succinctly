@@ -16,7 +16,7 @@ use std::io::{IsTerminal, Read, Write};
 
 use anyhow::{Context, Result};
 
-use succinctly::jq::document::{DocumentCursor, DocumentValue};
+use succinctly::jq::document::{DocumentCursor, DocumentFields, DocumentValue};
 use succinctly::jq::eval_generic::{
     eval_with_cursor_using, to_owned as generic_to_owned, GenericResult,
 };
@@ -123,6 +123,11 @@ fn generic_result_values<V: DocumentValue>(
         GenericResult::OneCursor(c) => vec![generic_to_owned(&c.value())],
         GenericResult::Many(vs) => vs.iter().map(generic_to_owned).collect(),
         GenericResult::ManyCursor(cs) => cs.iter().map(|c| generic_to_owned(&c.value())).collect(),
+        // This runner has no lazy-streaming fast path (unlike jq_runner.rs's
+        // `LazyKeysArray`), so `keys_unsorted` is always materialized here.
+        GenericResult::LazyKeysUnsorted(fields) => vec![OwnedValue::Array(
+            fields.keys().into_iter().map(OwnedValue::String).collect(),
+        )],
         GenericResult::None => vec![],
         GenericResult::Error(e) => {
             sink.report(DiagStyle::Xq, &e, at);
