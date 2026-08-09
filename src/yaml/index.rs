@@ -66,6 +66,12 @@ pub struct YamlIndex<W = Vec<u64>> {
     bp_to_anchor: BTreeMap<usize, String>,
     /// Alias references: BP position of alias → target BP position (resolved at parse time)
     aliases: BTreeMap<usize, usize>,
+    /// Explicit source tags: BP position → raw tag text (`"!!str"`, `"!custom"`, etc.).
+    ///
+    /// Unlike anchors, a tag has no forward name→position map: nothing
+    /// resolves to a tag by reference the way an alias resolves to an
+    /// anchor, so this is a single side table, not three (#224).
+    tags: BTreeMap<usize, String>,
     /// Line starts for line/column lookup (built lazily on first use).
     /// Only needed by `to_line_column()` and `to_offset()` (used by the
     /// `yq-locate` CLI and the `at_position` jq builtin).
@@ -129,6 +135,7 @@ impl YamlIndex<Vec<u64>> {
             anchors: semi.anchors,
             bp_to_anchor,
             aliases: semi.aliases,
+            tags: semi.tags,
             lines: OnceCell::new(),
         };
         index.validate_alias_acyclicity()?;
@@ -153,6 +160,7 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
         containers: W,
         anchors: BTreeMap<String, usize>,
         aliases: BTreeMap<usize, usize>,
+        tags: BTreeMap<usize, String>,
     ) -> Self {
         let ib_rank = build_ib_rank(ib.as_ref());
         let containers_rank = build_containers_rank(containers.as_ref());
@@ -180,6 +188,7 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
             anchors,
             bp_to_anchor,
             aliases,
+            tags,
             lines: OnceCell::new(),
         }
     }
@@ -447,6 +456,18 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
         self.bp_to_anchor
             .get(&bp_pos)
             .map(alloc::string::String::as_str)
+    }
+
+    /// Get the explicit source tag for a BP position (`"!!str"`, `"!custom"`,
+    /// `"!<tag:example.com,2000:foo>"`, etc.).
+    ///
+    /// Returns `None` if the node has no explicit tag. Distinct from
+    /// [`YamlCursor::tag`](super::light::YamlCursor::tag), which returns an
+    /// *inferred* type label derived from the value's shape rather than the
+    /// source text.
+    #[inline]
+    pub fn get_tag(&self, bp_pos: usize) -> Option<&str> {
+        self.tags.get(&bp_pos).map(alloc::string::String::as_str)
     }
 
     /// Resolve an alias at the given BP position to a cursor pointing to

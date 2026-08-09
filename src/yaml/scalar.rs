@@ -202,6 +202,61 @@ fn parse_float(s: &str) -> ResolvedScalar {
     }
 }
 
+/// Force-resolves a scalar's value under an explicit YAML tag.
+///
+/// Handles the 5 core-schema tags (`!!str`, `!!null`, `!!bool`, `!!int`,
+/// `!!float`), matching real `yq`'s behavior of applying tag coercion
+/// *regardless of quoting style* — even a quoted `!!int "5"` becomes the
+/// number `5`, not the string `"5"`. Returns `None` for any other tag (a
+/// custom tag, `!!seq`, `!!map`, `!!set`, `!!omap`, verbatim, or no tag at
+/// all), meaning "no override — resolve naturally instead" (`resolve_plain`
+/// for a plain scalar, `Str` for quoted/block).
+///
+/// Divergence from `yq`: content that cannot be coerced to the forced numeric
+/// type (`!!int "abc"`, `!!int -0x2A`) resolves to [`Str`](ResolvedScalar::Str)
+/// here rather than reproducing `yq`'s behavior for that input, which is to
+/// accept it at parse time and then crash formatting JSON output
+/// (`strconv.ParseInt: parsing "abc": invalid syntax`). This loader is
+/// non-validating by design and absorbs what it cannot make sense of rather
+/// than erroring — see `docs/compliance/yaml/limitations.md`.
+///
+/// `!!int`/`!!float` reuse [`resolve_plain`]'s core-schema numeric grammar
+/// (so `!!int 0x2A` is `42`, matching `yq`) rather than a bare
+/// `str::parse`, and `!!float` additionally accepts int-shaped text
+/// (`!!float 5` is `5.0`, matching `yq`) by widening a resolved `Int` —
+/// including a hex/octal one (`!!float 0x2A` is `42.0`), where real `yq`
+/// instead crashes: its float parser, unlike its int parser, does not
+/// understand the `0x`/`0o` prefix.
+///
+/// `!!bool` matches the classic YAML 1.1 word list
+/// (`y`/`yes`/`true`/`on`, and their `n`/`no`/`false`/`off` negatives)
+/// case-insensitively, which is *broader* than `resolve_plain`'s core
+/// schema `true`/`True`/`TRUE`/`false`/`False`/`FALSE` — an explicit `!!bool`
+/// tag opts back into the legacy spellings the core schema otherwise
+/// excludes to avoid the Norway problem. Anything else (`t`, `1`, `xyz`, …)
+/// resolves to `false`, matching `yq`'s zero-value fallback.
+#[must_use]
+pub fn resolve_tagged(text: &str, tag: &str) -> Option<ResolvedScalar> {
+    match tag {
+        "!!str" => Some(ResolvedScalar::Str),
+        "!!null" => Some(ResolvedScalar::Null),
+        "!!bool" => Some(ResolvedScalar::Bool(matches!(
+            text.to_ascii_lowercase().as_str(),
+            "y" | "yes" | "true" | "on"
+        ))),
+        "!!int" => Some(match resolve_plain(text) {
+            ResolvedScalar::Int(n) => ResolvedScalar::Int(n),
+            _ => ResolvedScalar::Str,
+        }),
+        "!!float" => Some(match resolve_plain(text) {
+            ResolvedScalar::Float(f) => ResolvedScalar::Float(f),
+            ResolvedScalar::Int(n) => ResolvedScalar::Float(n as f64),
+            _ => ResolvedScalar::Str,
+        }),
+        _ => None,
+    }
+}
+
 /// Returns true if a plain scalar could resolve to null or bool at all.
 ///
 /// A cheap pre-filter for callers that only need the null/bool answer
@@ -370,5 +425,100 @@ mod tests {
         assert_eq!(Int(1).type_name(), "number");
         assert_eq!(Float(1.0).type_name(), "number");
         assert_eq!(Str.type_name(), "string");
+    }
+
+    // Every case below was checked against real `yq` v4.53.3
+    // (`echo 'a: !!TAG CONTENT' | yq -o=json -`) while writing `resolve_tagged`.
+
+    #[test]
+    fn tagged_str_forces_string_regardless_of_content() {
+        assert_eq!(resolve_tagged("1", "!!str"), Some(Str));
+        assert_eq!(resolve_tagged("true", "!!str"), Some(Str));
+        assert_eq!(resolve_tagged("null", "!!str"), Some(Str));
+        assert_eq!(resolve_tagged("", "!!str"), Some(Str));
+    }
+
+    #[test]
+    fn tagged_null_forces_null_regardless_of_content() {
+        assert_eq!(resolve_tagged("foo", "!!null"), Some(Null));
+        assert_eq!(resolve_tagged("", "!!null"), Some(Null));
+        assert_eq!(resolve_tagged("~", "!!null"), Some(Null));
+    }
+
+    #[test]
+    fn tagged_bool_accepts_the_yaml_11_word_list_case_insensitively() {
+        for s in [
+            "y", "Y", "yes", "Yes", "YES", "true", "True", "TrUe", "on", "On", "ON",
+        ] {
+            assert_eq!(
+                resolve_tagged(s, "!!bool"),
+                Some(Bool(true)),
+                "input: {s:?}"
+            );
+        }
+        for s in [
+            "n",
+            "no",
+            "No",
+            "NO",
+            "false",
+            "False",
+            "off",
+            "Off",
+            "OFF",
+            "t",
+            "T",
+            "1",
+            "0",
+            "randomjunk",
+            "",
+        ] {
+            assert_eq!(
+                resolve_tagged(s, "!!bool"),
+                Some(Bool(false)),
+                "input: {s:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn tagged_int_reuses_core_schema_numeric_grammar() {
+        assert_eq!(resolve_tagged("5", "!!int"), Some(Int(5)));
+        assert_eq!(resolve_tagged("-5", "!!int"), Some(Int(-5)));
+        assert_eq!(resolve_tagged("0x2A", "!!int"), Some(Int(42)));
+        // Content that doesn't parse as an int falls back to Str rather than
+        // reproducing yq's marshal-time crash for this input.
+        assert_eq!(resolve_tagged("abc", "!!int"), Some(Str));
+        assert_eq!(resolve_tagged("3.5", "!!int"), Some(Str));
+        assert_eq!(resolve_tagged("", "!!int"), Some(Str));
+        assert_eq!(resolve_tagged("-0x2A", "!!int"), Some(Str));
+    }
+
+    #[test]
+    fn tagged_float_widens_int_shaped_text_and_falls_back_on_failure() {
+        assert_eq!(resolve_tagged("3", "!!float"), Some(Float(3.0)));
+        assert_eq!(resolve_tagged("3.5", "!!float"), Some(Float(3.5)));
+        assert_eq!(resolve_tagged("abc", "!!float"), Some(Str));
+        // Widening reuses resolve_plain's Int arm uniformly, so a hex int
+        // widens too - real `yq`'s plain float parser cannot read "0x2A" and
+        // crashes formatting output for it, one of the divergences this
+        // function's doc comment calls out.
+        assert_eq!(resolve_tagged("0x2A", "!!float"), Some(Float(42.0)));
+    }
+
+    #[test]
+    fn untagged_and_non_core_schema_tags_return_none() {
+        // No override for a custom tag, a collection tag, or no tag at all -
+        // the caller falls back to natural resolution.
+        for tag in [
+            "!custom",
+            "!!set",
+            "!!omap",
+            "!!map",
+            "!!seq",
+            "!<tag:x,2000:y>",
+        ] {
+            assert_eq!(resolve_tagged("1", tag), None, "tag: {tag}");
+        }
     }
 }

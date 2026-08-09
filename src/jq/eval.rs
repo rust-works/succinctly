@@ -14922,20 +14922,23 @@ fn builtin_load<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 let root = index.root(&file_bytes);
                 // YAML documents are wrapped in a sequence at the root
                 match root.value() {
-                    crate::yaml::YamlValue::Sequence(docs) => {
+                    crate::yaml::YamlValue::Sequence(mut docs) => {
                         // If single document, return it directly; otherwise return array
-                        let doc_values: Vec<OwnedValue> =
-                            docs.into_iter().map(|v| yaml_value_to_owned(v)).collect();
+                        let mut doc_values = Vec::new();
+                        while let Some((doc_cursor, rest)) = docs.uncons_cursor() {
+                            doc_values.push(yaml_value_to_owned(doc_cursor));
+                            docs = rest;
+                        }
                         if doc_values.len() == 1 {
                             QueryResult::Owned(doc_values.into_iter().next().unwrap())
                         } else {
                             QueryResult::Owned(OwnedValue::Array(doc_values))
                         }
                     }
-                    other => {
-                        // Single value at root
-                        QueryResult::Owned(yaml_value_to_owned(other))
-                    }
+                    // Documents are always wrapped in a virtual root sequence,
+                    // so this is defensive; `root` itself is this single
+                    // document's cursor either way.
+                    _ => QueryResult::Owned(yaml_value_to_owned(root)),
                 }
             }
             Err(_) if optional => QueryResult::None,
@@ -14946,25 +14949,42 @@ fn builtin_load<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     }
 }
 
-/// Convert a YAML value to OwnedValue (helper for load)
+/// Convert a YAML value to OwnedValue (helper for `load`).
+///
+/// Takes a cursor rather than a bare `YamlValue`: an explicit tag (`!!str`,
+/// `!!int`, …) lives on the cursor's `bp_pos` (`YamlCursor::explicit_tag`),
+/// not on the extracted value, and forces resolution regardless of quoting
+/// style — mirrors `yq_runner.rs`'s `yaml_to_owned_value` (#224).
 #[cfg(feature = "std")]
 fn yaml_value_to_owned<W: Clone + AsRef<[u64]>>(
-    value: crate::yaml::YamlValue<'_, W>,
+    cursor: crate::yaml::YamlCursor<'_, W>,
 ) -> OwnedValue {
-    use crate::yaml::{resolve_plain, ResolvedScalar, YamlValue};
+    use crate::yaml::{resolve_plain, resolve_tagged, ResolvedScalar, YamlValue};
 
-    match value {
+    match cursor.value() {
         YamlValue::Null => OwnedValue::Null,
         YamlValue::String(s) => {
             // Get the string value
             let str_value = match s.as_str() {
-                Ok(cow) => cow.into_owned(),
+                Ok(cow) => cow,
                 Err(_) => return OwnedValue::Null,
             };
 
+            if let Some(explicit) = cursor.explicit_tag() {
+                if let Some(resolved) = resolve_tagged(&str_value, explicit) {
+                    return match resolved {
+                        ResolvedScalar::Null => OwnedValue::Null,
+                        ResolvedScalar::Bool(b) => OwnedValue::Bool(b),
+                        ResolvedScalar::Int(n) => OwnedValue::Int(n),
+                        ResolvedScalar::Float(f) => OwnedValue::Float(f),
+                        ResolvedScalar::Str => OwnedValue::String(str_value.into_owned()),
+                    };
+                }
+            }
+
             // Quoted strings are kept as strings
             if !s.is_unquoted() {
-                return OwnedValue::String(str_value);
+                return OwnedValue::String(str_value.into_owned());
             }
 
             // Resolve plain scalars per the YAML 1.2 core schema
@@ -14973,11 +14993,15 @@ fn yaml_value_to_owned<W: Clone + AsRef<[u64]>>(
                 ResolvedScalar::Bool(b) => OwnedValue::Bool(b),
                 ResolvedScalar::Int(n) => OwnedValue::Int(n),
                 ResolvedScalar::Float(f) => OwnedValue::Float(f),
-                ResolvedScalar::Str => OwnedValue::String(str_value),
+                ResolvedScalar::Str => OwnedValue::String(str_value.into_owned()),
             }
         }
-        YamlValue::Sequence(elements) => {
-            let items: Vec<OwnedValue> = elements.into_iter().map(yaml_value_to_owned).collect();
+        YamlValue::Sequence(mut elements) => {
+            let mut items = Vec::new();
+            while let Some((elem_cursor, rest)) = elements.uncons_cursor() {
+                items.push(yaml_value_to_owned(elem_cursor));
+                elements = rest;
+            }
             OwnedValue::Array(items)
         }
         YamlValue::Mapping(fields) => {
@@ -14988,13 +15012,13 @@ fn yaml_value_to_owned<W: Clone + AsRef<[u64]>>(
                         Ok(cow) => cow.into_owned(),
                         Err(_) => continue,
                     },
-                    other => {
+                    _ => {
                         // Non-string keys - convert to string representation
-                        let v = yaml_value_to_owned(other);
+                        let v = yaml_value_to_owned(field.key_cursor());
                         v.to_json()
                     }
                 };
-                let value = yaml_value_to_owned(field.value());
+                let value = yaml_value_to_owned(field.value_cursor());
                 map.insert(key, value);
             }
             OwnedValue::Object(map)
@@ -15002,7 +15026,7 @@ fn yaml_value_to_owned<W: Clone + AsRef<[u64]>>(
         YamlValue::Alias { target, .. } => {
             // Resolve alias by following the target cursor
             if let Some(target_cursor) = target {
-                yaml_value_to_owned(target_cursor.value())
+                yaml_value_to_owned(target_cursor)
             } else {
                 OwnedValue::Null
             }

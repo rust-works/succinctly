@@ -6,6 +6,7 @@
 use anyhow::{Context, Result};
 use core::fmt::Write as FmtWrite;
 use indexmap::IndexMap;
+use std::borrow::Cow;
 use std::io::{BufWriter, IsTerminal, Read, Write};
 use std::path::Path;
 
@@ -15,8 +16,8 @@ use succinctly::jq::{self, Builtin, Expr, OwnedValue, QueryResult, YqSemantics};
 use succinctly::json::light::StandardJson;
 use succinctly::json::JsonIndex;
 use succinctly::yaml::{
-    format_float_with_fraction, resolve_plain, stream_yaml_sequence, ResolvedScalar, YamlCursor,
-    YamlIndex, YamlValue,
+    format_float_with_fraction, resolve_plain, resolve_tagged, stream_yaml_sequence,
+    ResolvedScalar, YamlCursor, YamlIndex, YamlValue,
 };
 
 use super::{InputFormat, OutputFormat, YqCommand};
@@ -98,13 +99,39 @@ impl OutputConfig {
     }
 }
 
+/// Convert an already-resolved scalar to `OwnedValue`. `str_value` is the
+/// original source text, used only for the `Str` case.
+fn resolved_scalar_to_owned(resolved: ResolvedScalar, str_value: Cow<'_, str>) -> OwnedValue {
+    match resolved {
+        ResolvedScalar::Null => OwnedValue::Null,
+        ResolvedScalar::Bool(b) => OwnedValue::Bool(b),
+        ResolvedScalar::Int(n) => OwnedValue::Int(n),
+        ResolvedScalar::Float(f) => OwnedValue::Float(f),
+        ResolvedScalar::Str => OwnedValue::String(str_value.into_owned()),
+    }
+}
+
 /// Convert a YAML value to an OwnedValue for jq evaluation.
-fn yaml_to_owned_value<W: AsRef<[u64]>>(value: YamlValue<'_, W>) -> Result<OwnedValue> {
-    match value {
+///
+/// Takes a cursor rather than a bare `YamlValue`: an explicit tag
+/// (`!!str`, `!!int`, …) lives on the cursor's `bp_pos`
+/// ([`YamlCursor::explicit_tag`]), not on the extracted value, and forces
+/// resolution regardless of quoting style — `!!int "5"` converts to the
+/// number 5, matching real `yq` (#224). Every recursive call passes a
+/// cursor too (`field.value_cursor()`, `YamlElements::uncons_cursor`), so a
+/// tag on a nested element is never lost.
+fn yaml_to_owned_value<W: AsRef<[u64]>>(cursor: YamlCursor<'_, W>) -> Result<OwnedValue> {
+    match cursor.value() {
         YamlValue::String(s) => {
             let str_value = s
                 .as_str()
                 .map_err(|e| anyhow::anyhow!("invalid YAML string: {e}"))?;
+
+            if let Some(explicit) = cursor.explicit_tag() {
+                if let Some(resolved) = resolve_tagged(&str_value, explicit) {
+                    return Ok(resolved_scalar_to_owned(resolved, str_value));
+                }
+            }
 
             // Quoted strings should always be treated as strings (yq-compatible behavior)
             // Only unquoted scalars should undergo type detection
@@ -113,13 +140,10 @@ fn yaml_to_owned_value<W: AsRef<[u64]>>(value: YamlValue<'_, W>) -> Result<Owned
             }
 
             // Resolve plain scalars per the YAML 1.2 core schema
-            Ok(match resolve_plain(&str_value) {
-                ResolvedScalar::Null => OwnedValue::Null,
-                ResolvedScalar::Bool(b) => OwnedValue::Bool(b),
-                ResolvedScalar::Int(n) => OwnedValue::Int(n),
-                ResolvedScalar::Float(f) => OwnedValue::Float(f),
-                ResolvedScalar::Str => OwnedValue::String(str_value.into_owned()),
-            })
+            Ok(resolved_scalar_to_owned(
+                resolve_plain(&str_value),
+                str_value,
+            ))
         }
         YamlValue::Mapping(fields) => {
             let mut map = IndexMap::new();
@@ -128,22 +152,24 @@ fn yaml_to_owned_value<W: AsRef<[u64]>>(value: YamlValue<'_, W>) -> Result<Owned
                 // its content, any other complex key stringifies to "", and the
                 // entry is always kept — matching the streaming/DOM emit paths.
                 let key = field.key().key_string().into_owned();
-                let value = yaml_to_owned_value(field.value())?;
+                let value = yaml_to_owned_value(field.value_cursor())?;
                 map.insert(key, value);
             }
             Ok(OwnedValue::Object(map))
         }
         YamlValue::Sequence(elements) => {
             let mut arr = Vec::new();
-            for elem in elements {
-                arr.push(yaml_to_owned_value(elem)?);
+            let mut rest = elements;
+            while let Some((elem_cursor, next)) = rest.uncons_cursor() {
+                arr.push(yaml_to_owned_value(elem_cursor)?);
+                rest = next;
             }
             Ok(OwnedValue::Array(arr))
         }
         YamlValue::Alias { target, .. } => {
             // Resolve alias by following the target cursor
             if let Some(target_cursor) = target {
-                yaml_to_owned_value(target_cursor.value())
+                yaml_to_owned_value(target_cursor)
             } else {
                 // Unresolved alias - treat as null
                 Ok(OwnedValue::Null)
@@ -260,12 +286,17 @@ fn parse_input(bytes: &[u8], format: InputFormat) -> Result<Vec<OwnedValue>> {
             match root.value() {
                 YamlValue::Sequence(docs) => {
                     let mut values = Vec::new();
-                    for doc in docs {
-                        values.push(yaml_to_owned_value(doc)?);
+                    let mut rest = docs;
+                    while let Some((doc_cursor, next)) = rest.uncons_cursor() {
+                        values.push(yaml_to_owned_value(doc_cursor)?);
+                        rest = next;
                     }
                     Ok(values)
                 }
-                other => Ok(vec![yaml_to_owned_value(other)?]),
+                // Documents are always wrapped in a virtual root sequence, so
+                // this is defensive; `root` itself is this single document's
+                // cursor either way.
+                _ => Ok(vec![yaml_to_owned_value(root)?]),
             }
         }
     }
@@ -2104,7 +2135,7 @@ mod tests {
 
         // Root is a document array, get first doc
         if let YamlValue::Sequence(docs) = root.value() {
-            if let Some(doc) = docs.into_iter().next() {
+            if let Some((doc, _)) = docs.uncons_cursor() {
                 let value = yaml_to_owned_value(doc).unwrap();
                 if let OwnedValue::Object(map) = value {
                     assert_eq!(
@@ -2125,7 +2156,7 @@ mod tests {
         let root = index.root(yaml);
 
         if let YamlValue::Sequence(docs) = root.value() {
-            if let Some(doc) = docs.into_iter().next() {
+            if let Some((doc, _)) = docs.uncons_cursor() {
                 let value = yaml_to_owned_value(doc).unwrap();
                 if let OwnedValue::Object(map) = value {
                     assert_eq!(map.get("age"), Some(&OwnedValue::Int(30)));
@@ -2173,7 +2204,7 @@ mod tests {
         let root = index.root(yaml);
 
         if let YamlValue::Sequence(docs) = root.value() {
-            if let Some(doc) = docs.into_iter().next() {
+            if let Some((doc, _)) = docs.uncons_cursor() {
                 let value = yaml_to_owned_value(doc).unwrap();
                 if let OwnedValue::Object(map) = value {
                     assert_eq!(map.get("active"), Some(&OwnedValue::Bool(true)));
@@ -2191,7 +2222,7 @@ mod tests {
         let root = index.root(yaml);
 
         if let YamlValue::Sequence(docs) = root.value() {
-            if let Some(doc) = docs.into_iter().next() {
+            if let Some((doc, _)) = docs.uncons_cursor() {
                 let value = yaml_to_owned_value(doc).unwrap();
                 if let OwnedValue::Object(map) = value {
                     assert_eq!(map.get("value"), Some(&OwnedValue::Null));
@@ -2210,7 +2241,7 @@ mod tests {
         let root = index.root(yaml);
 
         if let YamlValue::Sequence(docs) = root.value() {
-            if let Some(doc) = docs.into_iter().next() {
+            if let Some((doc, _)) = docs.uncons_cursor() {
                 let value = yaml_to_owned_value(doc).unwrap();
                 if let OwnedValue::Object(map) = value {
                     if let Some(OwnedValue::Array(arr)) = map.get("items") {
@@ -2236,7 +2267,7 @@ mod tests {
         let root = index.root(yaml);
 
         if let YamlValue::Sequence(docs) = root.value() {
-            if let Some(doc) = docs.into_iter().next() {
+            if let Some((doc, _)) = docs.uncons_cursor() {
                 let value = yaml_to_owned_value(doc).unwrap();
                 if let OwnedValue::Object(map) = value {
                     if let Some(OwnedValue::Object(person)) = map.get("person") {
@@ -2263,7 +2294,7 @@ mod tests {
         let root = index.root(yaml);
 
         if let YamlValue::Sequence(docs) = root.value() {
-            if let Some(doc) = docs.into_iter().next() {
+            if let Some((doc, _)) = docs.uncons_cursor() {
                 let value = yaml_to_owned_value(doc).unwrap();
                 if let OwnedValue::Object(map) = value {
                     if let Some(OwnedValue::Array(arr)) = map.get("items") {
@@ -2289,7 +2320,7 @@ mod tests {
         let root = index.root(yaml);
 
         if let YamlValue::Sequence(docs) = root.value() {
-            if let Some(doc) = docs.into_iter().next() {
+            if let Some((doc, _)) = docs.uncons_cursor() {
                 let value = yaml_to_owned_value(doc).unwrap();
                 if let OwnedValue::Object(map) = value {
                     if let Some(OwnedValue::Object(person)) = map.get("person") {
@@ -2316,7 +2347,7 @@ mod tests {
         let root = index.root(yaml);
 
         if let YamlValue::Sequence(docs) = root.value() {
-            if let Some(doc) = docs.into_iter().next() {
+            if let Some((doc, _)) = docs.uncons_cursor() {
                 let value = yaml_to_owned_value(doc).unwrap();
                 if let OwnedValue::Object(map) = value {
                     if let Some(OwnedValue::Object(level1)) = map.get("root") {
