@@ -404,10 +404,24 @@ fn evaluate_yaml_cursor<W: AsRef<[u64]> + Clone>(
         // `yq_runner.rs` never builds a `JqValue` — so unlike the JSON `jq`
         // runner, this is the only path available here; a genuinely lazy
         // YAML `keys_unsorted` output is deferred to a follow-up issue
-        // (#140).
-        GenericResult::LazyKeysUnsorted(fields) => Ok(vec![OwnedValue::Array(
-            fields.keys().into_iter().map(OwnedValue::String).collect(),
-        )]),
+        // (#140). Sort iff `sorted` (#683), matching eager `Keys` -- though
+        // in practice `sorted` is always `false` here: `run_yq` always
+        // parses in `ParserMode::Yq`, where the `keys` keyword itself
+        // resolves to `Builtin::KeysUnsorted` (matching real yq's document-
+        // order semantics, see `parser.rs`'s `keys`/`keys_unsorted`
+        // handling), so `Builtin::Keys` can never reach this arm through the
+        // `yq` CLI. Handled anyway for exhaustiveness and because the
+        // generic evaluator is shared with `jq` (#140's `Pipe` dispatch is
+        // generic over `V: DocumentValue`).
+        GenericResult::LazyKeys { fields, sorted } => {
+            let mut keys = fields.keys();
+            if sorted {
+                keys.sort();
+            }
+            Ok(vec![OwnedValue::Array(
+                keys.into_iter().map(OwnedValue::String).collect(),
+            )])
+        }
         GenericResult::None => Ok(vec![]),
         GenericResult::Error(e) => {
             sink.report(DiagStyle::Yq, &e, &no_location());

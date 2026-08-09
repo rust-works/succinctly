@@ -3133,3 +3133,93 @@ fn test_keys_unsorted_lazy_output_140() -> Result<()> {
 
     Ok(())
 }
+
+/// Sorted `keys | length` mirror of `test_keys_unsorted_lazy_output_140`
+/// above (#683): `length` now answers from the field iterator without
+/// decoding or sorting, while bare `keys`/`.[]`/`.[n]`/`first`/`last` stay
+/// byte-identical to today's eager-sorted output (`JqValue::LazyKeysArray`
+/// is document-order-only, so a sorted result never reaches it -- see the
+/// `generic_result_to_jq_values` fix in `jq_runner.rs`). Uses `run_jq_full`
+/// (the pre-built binary), not `cargo run` (invisible to coverage).
+#[test]
+fn test_keys_lazy_length_output_683() -> Result<()> {
+    let input = r#"{"b":1,"a":2,"c":3}"#;
+
+    let (output, _, code) = run_jq_full(&["-c", "keys"], Some(input))?;
+    assert_eq!(code, 0);
+    assert_eq!(
+        output.trim(),
+        r#"["a","b","c"]"#,
+        "no regression: still sorted"
+    );
+
+    let (output, _, code) = run_jq_full(&["--indent", "2", "keys"], Some(input))?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "[\n  \"a\",\n  \"b\",\n  \"c\"\n]");
+
+    let (output, _, code) = run_jq_full(&["-c", "keys | length"], Some(input))?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "3");
+
+    let (output, _, code) = run_jq_full(&["-c", "keys | (length)"], Some(input))?;
+    assert_eq!(
+        output.trim(),
+        "3",
+        "parenthesized length must still hit the fast path"
+    );
+    assert_eq!(code, 0);
+
+    let (output, _, code) = run_jq_full(&["-c", "keys | .[]"], Some(input))?;
+    assert_eq!(code, 0);
+    assert_eq!(
+        output.trim(),
+        "\"a\"\n\"b\"\n\"c\"",
+        "sorted order, not document order"
+    );
+
+    let (output, _, code) = run_jq_full(&["-c", "keys | .[0]"], Some(input))?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#""a""#);
+
+    let (output, _, code) = run_jq_full(&["-c", "keys | .[-1]"], Some(input))?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#""c""#);
+
+    let (output, _, code) = run_jq_full(&["-c", "keys | .[10]"], Some(input))?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "null", "out of bounds is null, not an error");
+
+    let (output, _, code) = run_jq_full(&["-c", "keys | first"], Some(input))?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#""a""#, "sorted first, not document first");
+
+    let (output, _, code) = run_jq_full(&["-c", "keys | last"], Some(input))?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#""c""#);
+
+    let (output, _, code) = run_jq_full(&["-c", "keys | first"], Some("{}"))?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "null");
+
+    // `map`/`select` have no native lazy path and must still materialize
+    // correctly, sorted, through the fallback.
+    let (output, _, code) = run_jq_full(&["-c", "keys | map(ascii_upcase)"], Some(input))?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#"["A","B","C"]"#);
+
+    // Escaped/non-ASCII keys still decode-and-reescape correctly when
+    // sorted (this pair happens to sort in the same order as document
+    // order -- `a"b` < `café` either way -- so it exercises the escape path
+    // without duplicating the sort-order regression guard, which lives in
+    // `eval_generic.rs`'s `test_generic_keys_sorted_still_fully_sorted`).
+    let escaped_input = "{\"a\\\"b\":1,\"caf\u{e9}\":2}";
+    let (output, _, code) = run_jq_full(&["-c", "keys"], Some(escaped_input))?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "[\"a\\\"b\",\"caf\u{e9}\"]");
+
+    let (output, _, code) = run_jq_full(&["-c", "--ascii-output", "keys"], Some(escaped_input))?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "[\"a\\\"b\",\"caf\\u00e9\"]");
+
+    Ok(())
+}
