@@ -22578,6 +22578,33 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "regex")]
+    #[test]
+    fn test_regex_invalid_pattern_errors() {
+        // #703: a malformed pattern must surface as an evaluator error, not
+        // panic or silently return a bogus result.
+        query!(br#""x""#, r#"test("[")"#,
+            QueryResult::Error(e) => {
+                assert!(e.to_string().contains("invalid regex"));
+            }
+        );
+    }
+
+    #[cfg(feature = "regex")]
+    #[test]
+    fn test_regex_lookahead_unsupported() {
+        // #703: jq's oniguruma backend supports lookahead (`(?=...)`), but
+        // succinctly's `regex` crate does not implement lookaround at all —
+        // this is a permanent constraint of the crate choice, not a bug to
+        // fix here. Pinned so nobody "fixes" it later by attempting
+        // lookahead support inside `build_regex`.
+        query!(br#""aubub""#, r#"gsub("(?=u)"; "u")"#,
+            QueryResult::Error(e) => {
+                assert!(e.to_string().contains("invalid regex"));
+            }
+        );
+    }
+
     // =========================================================================
     // Phase 8 Tests: Variables and Advanced Control Flow
     // =========================================================================
