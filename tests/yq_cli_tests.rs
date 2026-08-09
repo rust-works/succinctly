@@ -4142,6 +4142,40 @@ fn test_yq_outputs_before_an_error_or_break_survive() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn test_693_optional_around_stream_stops_at_the_first_error() -> Result<()> {
+    // Mirrors `test_yq_outputs_before_an_error_or_break_survive`'s two-route
+    // pattern: yq's default (non-null-input) route evaluates through the
+    // same native `eval_generic` cursor-based evaluator jq's default route
+    // does (`yq_runner.rs`'s `evaluate_yaml_cursor`), while `--null-input`
+    // goes through the `eval.rs`-level `eval()` route instead. Both were
+    // independently affected by #693 (a masked error inside a `?`-wrapped
+    // stream self-suppressed instead of stopping it) and both are exercised
+    // here. Verified against jq 1.7.1 (`yq` itself has no `if`/`then`/`else`):
+    // `jq -n '[1,2,3] | (.[] | if .==2 then error("boom") else . end)?'`
+    // prints only `1`.
+
+    // Default YAML input goes through the direct-cursor (generic) route.
+    let (stdout, code) = run_yq_stdin(
+        r#"(.[] | if .==2 then error("boom") else . end)?"#,
+        "- 1\n- 2\n- 3\n",
+        &[],
+    )?;
+    assert_eq!(stdout, "1\n");
+    assert_eq!(code, 0);
+
+    // `--null-input` takes the OwnedValue/full-evaluator route.
+    let (stdout, code) = run_yq_stdin(
+        r#"[1,2,3] | (.[] | if .==2 then error("boom") else . end)?"#,
+        "",
+        &["-n"],
+    )?;
+    assert_eq!(stdout, "1\n");
+    assert_eq!(code, 0);
+
+    Ok(())
+}
+
 /// `path`/`parent`/`parent(n)`/`key` used to silently answer `[]`/`{}`/`null`
 /// (the root-level defaults) whenever they weren't the very first pipe stage
 /// (#554), because the CLI's streaming evaluator (`eval_generic.rs`, driving

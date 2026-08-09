@@ -322,27 +322,40 @@ fn test_formats_non_finite_owned_pipe_parity() {
 }
 
 /// `?` on a format applied to a *constructed* value (arithmetic, array/object
-/// construction, ...) must still suppress a type-mismatch error. These formats
-/// suppress it internally (`format_csv`/`format_tsv`/`format_dsv`/
-/// `format_base64`/`format_base64d`/`format_urid` return `Ok("")` rather than
-/// `Err` when their `optional` argument is set) -- that is the only mechanism
-/// that makes `?` work here, there is no separate `Expr::Optional`-catches-
-/// `Error` fallback for this path. A constructed value reaches the format via
-/// `eval_on_owned`'s fast path (#124), which must therefore forward the real
-/// `optional` flag rather than hardcoding `false`.
+/// construction, ...) must still suppress a type-mismatch error, producing no
+/// output at all -- verified against jq 1.7.1 (`jq -n '(1+1 | @csv)?'` and
+/// the `@tsv`/`@base64`/`@base64d`/`@urid` siblings all produce nothing, exit
+/// 0; `@dsv` has no jq equivalent to check directly, since it's this crate's
+/// own extension, but shares `format_csv`'s exact suppression code path).
+///
+/// Before #693, `format_csv`/`format_tsv`/`format_dsv`/`format_base64`/
+/// `format_base64d`/`format_urid`'s own `_ if optional => Ok(String::new())`
+/// arm was the *only* thing that made `?` work here -- there was no separate
+/// `Expr::Optional`-catches-`Error` fallback for this path, so a suppressed
+/// format fell back to the empty *string* `""` (a real output) rather than
+/// true suppression (no output), because `format_owned` returns `Result<
+/// String, EvalError>` with no way to spell "no result". That workaround is
+/// still in place (a constructed value still reaches the format via
+/// `eval_on_owned`'s fast path (#124), forwarding the real ambient
+/// `optional`) but is now moot for the bare `(EXPR | @format)?` shape tested
+/// here: `Expr::Optional`'s new catch-after-the-fact dispatch evaluates the
+/// pipe with `optional` forced to `false`, so the format leaf raises a real
+/// `Error` instead of self-suppressing to `""`, and that real error is what
+/// gets caught -- correctly producing no output, matching jq. The old
+/// pinned `""` was never jq-verified and was wrong.
 #[test]
 fn test_formats_optional_owned_type_error_parity_124() {
-    for (json, filter, expected) in [
-        (b"null".as_slice(), "(1+1 | @csv)?", r#""""#),
-        (b"null", "(1+1 | @tsv)?", r#""""#),
-        (b"null", r#"(1+1 | @dsv("|"))?"#, r#""""#),
-        (b"null", "(1+1 | @base64)?", r#""""#),
-        (b"null", "(1+1 | @base64d)?", r#""""#),
-        (b"null", "(1+1 | @urid)?", r#""""#),
+    for (json, filter) in [
+        (b"null".as_slice(), "(1+1 | @csv)?"),
+        (b"null", "(1+1 | @tsv)?"),
+        (b"null", r#"(1+1 | @dsv("|"))?"#),
+        (b"null", "(1+1 | @base64)?"),
+        (b"null", "(1+1 | @base64d)?"),
+        (b"null", "(1+1 | @urid)?"),
     ] {
         assert_eq!(
-            as_strs(&full_outputs(json, filter)),
-            [expected],
+            full_outputs(json, filter),
+            Vec::<String>::new(),
             "full evaluator output changed for `{filter}`"
         );
         assert_parity(json, filter);

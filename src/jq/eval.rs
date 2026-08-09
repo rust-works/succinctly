@@ -444,7 +444,42 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             _ => QueryResult::Error(EvalError::cannot_iterate(&to_owned(&value))),
         },
 
-        Expr::Optional(inner) => eval_single::<W, S>(inner, value, true),
+        // `.[EXPR]?`/`.[S:E]?`: jq's `?` here guards only the *final*
+        // indexing/slicing operation, not evaluation of the bracket's own
+        // key/bounds sub-expression — verified against jq 1.7.1:
+        // `echo '"a"' | jq '.[.k]?'` still raises (exit 5, "Cannot index
+        // string with string \"k\""), even though the whole `.[.k]` is
+        // syntactically inside the `?`. Wrapping in one more layer (a paren,
+        // a pipe stage, or plain `try`) *does* catch it — `jq '(.[.k])?'`,
+        // `jq '(.[.k] | .+1)?'`, and `jq 'try .[.k]'` all exit 0 — so this is
+        // specific to the bare bracket-then-`?` postfix form, which is the
+        // only shape that reaches here (that form and no other parses
+        // straight to `Expr::Optional(Expr::IndexExpr { .. })` /
+        // `Expr::Optional(Expr::SliceExpr { .. })`; every other spelling
+        // interposes a `Paren`/`Pipe`/`Try` node this arm doesn't match).
+        // `eval_index_expr`/`eval_slice_expr` already implement this split
+        // (they evaluate the key/bounds with a hardcoded `optional: false`
+        // and only consult the ambient `optional` for their own final
+        // index/slice step), so preserve the direct "just forward
+        // `optional`, don't wrap in a catch" dispatch here — routing it
+        // through `eval_try` below like every other expression would catch
+        // the key/bounds error too, which is too broad.
+        Expr::Optional(inner)
+            if matches!(**inner, Expr::IndexExpr { .. } | Expr::SliceExpr { .. }) =>
+        {
+            eval_single::<W, S>(inner, value, true)
+        }
+
+        // `E?` is sugar for `try E` (no catch handler): evaluate `inner`
+        // with the ambient `optional` — not forced `true` — so nested
+        // leaves raise real errors instead of each independently
+        // self-suppressing, and let `eval_try`'s existing catch-once logic
+        // decide whether to swallow the *aggregate* result. Forcing
+        // `optional = true` down the whole subtree (the old behavior) let a
+        // masked error inside a combinator (comma, reduce/foreach/while/
+        // until) look exactly like ordinary `empty` to that combinator,
+        // which then wrongly kept going instead of stopping (#693).
+        Expr::Optional(inner) => eval_try::<W, S>(inner, None, value, optional),
 
         Expr::Pipe(exprs) => eval_pipe::<W, S>(exprs, value, optional),
 
@@ -1005,15 +1040,16 @@ fn eval_owned_expr_fork<S: EvalSemantics>(
 /// a construct's own legitimate prior output and only silences a trailing
 /// `Error`, it does not discard everything.
 ///
-/// A `Break` always propagates via `partial` here, uncaught by `optional`.
-/// That is *not* what real jq does — `label $out | (1, (reduce (1,2) as $x
-/// (0; break $out))?, 4)` gives jq's `1`, `4` (its `?` does swallow an
-/// escaping `break` whose matching `label` sits outside it) — but this
-/// codebase's `?`/`try` machinery doesn't catch a `break` anywhere else
-/// either (`Expr::Optional`'s own dispatch has the identical gap, confirmed
-/// reproducible on `main`, i.e. predating #534). This function deliberately
-/// stays consistent with that pre-existing, cross-cutting limitation rather
-/// than fixing it in isolation for just these four constructs.
+/// A `Break` always propagates via `partial` here, uncaught by `optional` —
+/// deliberately: `label $out | (1, (reduce (1,2) as $x (0; break $out))?,
+/// 4)` gives jq's `1`, `4` (its `?` does swallow an escaping `break` whose
+/// matching `label` sits outside it), and this codebase now matches that
+/// too (#693), but the catch happens one level up, at the `?`/`try`
+/// boundary wrapping whichever fork construct raised the `Break` —
+/// `eval_try`/`Expr::Optional`'s dispatch, not here. This function only
+/// ever sees `optional` after that boundary has already had its chance to
+/// react, so it correctly leaves `Break` alone and only ever silences a
+/// trailing `Error`.
 fn finish_fork<'a, W>(
     outputs: Vec<OwnedValue>,
     control: Option<Control>,
@@ -19558,19 +19594,30 @@ mod tests {
                 assert_eq!(label, "out");
             }
         );
-        // `optional` (`?`) must never swallow a `break` the way it swallows
-        // a real error — jq's `?` catches errors, not label breaks.
-        // Discriminating test: if the break were (incorrectly) swallowed as
-        // `None` by `optional`, the comma's second operand would still run
-        // and "reached" would be output; since the break must instead
-        // short-circuit the comma and reach the label, "reached" is never
-        // evaluated.
+        // Corrected by #693 (was asserted the other way, unverified — see
+        // below): `?` *does* swallow an escaping `break` the same way it
+        // swallows a real error, exactly like `try` already does (#562) —
+        // jq defines `E?` as sugar for `try E`, and it does not
+        // special-case `break`. Re-verified directly against jq 1.7.1 three
+        // ways (`?`, `try` with no catch, and the bare/uncaught form for
+        // contrast) immediately before writing this assertion:
+        // `jq -n 'label $out | ((reduce (1,2,3) as $x (0; if $x==2 then
+        // break $out else .+$x end))?, "reached")'` prints `"reached"`
+        // (`?` catches the break, so the comma continues); the `try`
+        // spelling prints the same; the bare form with no `?`/`try` at all
+        // prints nothing (the break escapes uncaught to `label $out`,
+        // which then discards the rest of the comma). This test previously
+        // asserted the *bare* form's behavior for the `?`-wrapped query —
+        // an assumption that went unverified because, pre-#693, this
+        // codebase's `Expr::Optional` never caught a `break` at all, so the
+        // (wrong) expectation and the (buggy) implementation happened to
+        // agree.
         assert_eq!(
             outputs(
                 b"null",
                 r#"label $out | ((reduce (1,2,3) as $x (0; if $x==2 then break $out else .+$x end))?, "reached")"#
             ),
-            Vec::<String>::new()
+            ["\"reached\""]
         );
     }
 
@@ -20126,6 +20173,13 @@ mod tests {
         // No handler at all: the prefix is kept and the error swallowed.
         assert_eq!(outputs(b"null", r#"try (1,2,error("x"))"#), ["1", "2"]);
         assert_eq!(outputs(b"null", r#"(1,2,error("x"))?"#), ["1", "2"]);
+        // The error-in-last-position cases above happen to be numerically
+        // correct even under #693's bug (nothing follows the error to wrongly
+        // continue to). An operand *after* the masked error is the case that
+        // actually distinguishes correct behavior: jq stops at the error and
+        // never reaches `2`.
+        assert_eq!(outputs(b"null", r#"try (1,error("x"),2)"#), ["1"]);
+        assert_eq!(outputs(b"null", r#"(1,error("x"),2)?"#), ["1"]);
         // A handler that fails in turn: the two prefixes concatenate and the
         // handler's own control terminates the stream.
         query!(b"null", r#"try (1,2,error("x")) catch error("y")"#,
@@ -22775,12 +22829,29 @@ mod tests {
     }
 
     #[test]
-    fn test_reduce_init_partial_error_swallowed_when_optional() {
-        // INIT `(1,$nope)` produces `Partial([1], Control::Error(_))` — under
-        // `?` this whole prefix is discarded, not just the error.
+    fn test_reduce_init_partial_error_still_runs_the_fork_from_its_prefix_value() {
+        // Corrected by #693 (was asserted the other way, unverified — see
+        // below): INIT `(1,$nope)` produces `Partial([1], Control::Error(_))`
+        // — under `?` only the trailing error is swallowed; the `1` INIT
+        // already validly produced still forks and runs to completion,
+        // matching this codebase's own "outputs already produced don't
+        // vanish" contract (`partial()`/`prepend()`/`finish_fork`'s doc
+        // comments) and jq's actual behavior. `$nope` (an undefined
+        // variable) is a *compile*-time error in real jq, so it can't be
+        // run directly there to check; re-verified the identical shape with
+        // a *runtime* error instead immediately before writing this
+        // assertion: `jq -n '[1,2,3] | (reduce .[] as $x ((1,error("boom"));
+        // .+$x))?'` prints `7` — i.e. the fork from INIT's `1` runs
+        // `1+1=2, 2+2=4, 4+3=7` to completion, exactly like this test now
+        // expects. This test previously asserted the whole prefix was
+        // discarded — an assumption that went unverified because, pre-#693,
+        // this codebase's `Expr::Optional` self-suppressed every leaf error
+        // it wrapped (including `$nope`'s—see the `$nope` explainer above),
+        // so the (wrong) expectation and the (buggy) implementation
+        // happened to agree.
         assert_eq!(
             outputs(b"[1,2,3]", "(reduce .[] as $x ((1,$nope); .+$x))?"),
-            Vec::<String>::new()
+            ["7"]
         );
     }
 
@@ -22853,6 +22924,73 @@ mod tests {
                 "label $lbl | foreach .[] as $x (break $lbl; .+$x)"
             ),
             Vec::<String>::new()
+        );
+    }
+
+    // #693: `$nope` (above) is the *one* leaf that never self-suppressed via
+    // the old ambient-`optional` bug, so the tests above never actually
+    // exercised the failure mode from the issue — a `?`-wrapped fork
+    // construct whose UPDATE/COND step raises via `error(...)` (the
+    // realistic case). These pin that directly, against pinned `jq 1.7.1`
+    // output.
+
+    #[test]
+    fn test_693_reduce_update_error_swallowed_by_optional() {
+        // Before the fix: UPDATE's `error("boom")` self-suppressed to `None`
+        // at the leaf (ambient `optional = true`), so `eval_reduce` never saw
+        // an `Error`/`Partial` to abort on, and `.` (the unbound accumulator)
+        // read back as `null` — `(reduce (1) as $x (0; error("boom")))?`
+        // wrongly produced `null` instead of stopping with no output.
+        assert_eq!(
+            outputs(b"null", r#"(reduce (1) as $x (0; error("boom")))?"#),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn test_693_foreach_update_error_aborts_every_fork_not_just_the_current_one() {
+        // Multi-output INIT `(10,20)` forks foreach over two accumulators.
+        // Before the fix, fork 1's masked error "recovered" to a bound
+        // `null` instead of aborting, and fork 2 — which real jq's `?` never
+        // attempts once fork 1 errors — ran anyway, wrongly producing
+        // `[2,21,23]`.
+        assert_eq!(
+            outputs(
+                b"null",
+                r#"(foreach (1,2) as $x ((10,20); if .==10 then error("boom") else .+$x end))?"#
+            ),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn test_693_while_stops_at_the_masked_error_instead_of_burning_the_step_budget() {
+        // Before the fix, the masked error inside `while`'s UPDATE never
+        // reached `until_step`/`while_step`'s abort check, so the loop spun
+        // through `0..12` repeatedly until `WHILE_UNTIL_MAX_STEPS` tripped.
+        assert_eq!(
+            outputs(
+                b"null",
+                "(10|while(. < 30; if . == 12 then error(\"boom\"), 0 else .+1 end))?"
+            ),
+            ["10", "11", "12"]
+        );
+    }
+
+    #[test]
+    fn test_693_optional_around_a_fork_construct_also_catches_an_escaping_break() {
+        // `finish_fork` deliberately never special-cases `Break` (see its doc
+        // comment) — catching one is the wrapping `?`/`try` boundary's job.
+        // Before this fix, `Expr::Optional`'s dispatch had no such boundary
+        // logic, so the `break $out` inside the `reduce` escaped straight
+        // past the `?` and was caught by `label $out` one step too early,
+        // wrongly producing `[1]` instead of jq's `[1,4]`.
+        assert_eq!(
+            outputs(
+                b"null",
+                "label $out | (1, (reduce (1,2) as $x (0; break $out))?, 4)"
+            ),
+            ["1", "4"]
         );
     }
 
@@ -23035,6 +23173,96 @@ mod tests {
         query!(br"123", r"isvalid(.foo)",
             QueryResult::Owned(OwnedValue::Bool(false)) => {}
         );
+    }
+
+    #[test]
+    fn test_isvalid_reaches_every_builtins_own_optional_guard() {
+        // `isvalid(EXPR)` is the one surviving construct that still evaluates
+        // `EXPR` with `optional` forced `true` for the whole subtree
+        // (`builtin_isvalid` does this deliberately, not by accident: without
+        // it, a fork construct — comma/reduce/foreach — that errors partway
+        // through would come back as `Partial`, which `isvalid`'s own
+        // three-arm match doesn't special-case and would wrongly count as
+        // "valid"). Every other route to `optional = true` was removed by
+        // #693 — `E?`/`try E` now evaluate `E` with the *ambient* `optional`
+        // and catch the aggregate result once via `eval_try`, rather than
+        // broadcasting `true` down the whole subtree the way the pre-#693
+        // bug did. That leaves each of these builtins' own internal
+        // `_ if optional => ...` arm reachable only through `isvalid`, so
+        // this is regression coverage for #698 (indirect coverage lost by
+        // #693's fix, all of it real behavior — `isvalid` correctly
+        // reporting `false` — not dead code): pin one case per remaining
+        // caller so a future refactor can't silently make `isvalid` stop
+        // noticing one of these error shapes.
+        for expr in [
+            "isvalid(.[])",
+            "isvalid(keys)",
+            "isvalid(keys_unsorted)",
+            r#"isvalid(contains("a"))"#,
+            r#"isvalid(inside("a"))"#,
+            "isvalid(bsearch(2))",
+        ] {
+            query!(br"1", expr,
+                QueryResult::Owned(OwnedValue::Bool(false)) => {}
+            );
+        }
+
+        // The `@format` builtins' own `_ if optional` arm is unlike the
+        // others above: it doesn't produce `None`, it produces `Ok(String::
+        // new())` — under `optional`, a value the format can't handle
+        // renders as `""` rather than failing at all, so `isvalid` sees a
+        // genuine success and reports `true`, not `false`.
+        for expr in [
+            "isvalid(@urid)",
+            "isvalid(@csv)",
+            "isvalid(@tsv)",
+            r#"isvalid(@dsv("|"))"#,
+            "isvalid(@base64)",
+            "isvalid(@base64d)",
+        ] {
+            query!(br"1", expr,
+                QueryResult::Owned(OwnedValue::Bool(true)) => {}
+            );
+        }
+
+        // `error(...)` itself.
+        query!(br"1", r#"isvalid(error("x"))"#,
+            QueryResult::Owned(OwnedValue::Bool(false)) => {}
+        );
+
+        // Assignment/update/del: the write-time path traversal fails one
+        // level down (`.a` is `1`, not an object, so `.b` can't be written
+        // into it), and `set_path`/`update_path`/`delete_at_path` have no
+        // `optional` of their own — it's `eval_assign`/`eval_update`/
+        // `builtin_del`'s *own* ambient `optional` (forced by `isvalid`)
+        // that decides whether the failure is swallowed.
+        for expr in [
+            "isvalid(.a.b = 5)",
+            r#"isvalid(.a |= error("x"))"#,
+            "isvalid(del(.a.b))",
+        ] {
+            query!(br#"{"a":1}"#, expr,
+                QueryResult::Owned(OwnedValue::Bool(false)) => {}
+            );
+        }
+
+        // reduce/foreach: `limit(-1; 1)` errors unconditionally (it has no
+        // `optional` arm of its own), so it's the one construct that can
+        // still leak a genuine `Error`/`Partial` control past a leaf's own
+        // self-suppression and into `eval_reduce`/`eval_foreach`/
+        // `finish_fork`'s own optional-guards, one per INIT/SOURCE/fork-loop
+        // site.
+        for expr in [
+            "isvalid(reduce (1,2) as $x (0; limit(-1;1)))",
+            "isvalid(reduce (1,2) as $x (limit(-1;1); .+$x))",
+            "isvalid(reduce (1,2) as $x ((1,limit(-1;1)); .+$x))",
+            "isvalid(foreach limit(-1;1) as $x (0; .+$x))",
+            "isvalid(foreach (1,2) as $x (limit(-1;1); .+$x))",
+        ] {
+            query!(br"1", expr,
+                QueryResult::Owned(OwnedValue::Bool(false)) => {}
+            );
+        }
     }
 
     // =========================================================================
