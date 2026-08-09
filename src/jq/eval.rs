@@ -7906,16 +7906,22 @@ fn update_path<S: EvalSemantics>(
             // instead, which is why `update_path` is always entered with
             // `optional: false` at the top.
             //
-            // `eval_owned_multi`, not `eval_owned_expr`: `|=` keeps only the
-            // filter's *first* output, never an array of every output
-            // (#392) -- `eval_owned_expr` collapsed a multi-output result
-            // into exactly that array (`.a |= (1,2)` produced
+            // `eval_owned_multi_first`, not `eval_owned_expr`: `|=` keeps
+            // only the filter's *first* output, never an array of every
+            // output (#392) -- `eval_owned_expr` collapsed a multi-output
+            // result into exactly that array (`.a |= (1,2)` produced
             // `{"a":[1,2]}` instead of jq's `{"a":1}`). A zero-output
             // filter still falls back to `Null` here -- `.a |= empty`
             // leaves `"a":null` rather than deleting the key the way real
             // jq does, a separate, pre-existing bug this fix does not
             // change.
-            let v = eval_owned_multi::<S>(filter_expr, root)?
+            //
+            // `_first`, not the plain `eval_owned_multi` (#694): jq's
+            // `_modify` only ever observes the update filter's first
+            // output, so a trailing `error(...)`/`break` after it must not
+            // surface -- `.a |= (1, error("x"))` is `{"a":1}` in jq 1.7.1,
+            // not an error.
+            let v = eval_owned_multi_first::<S>(filter_expr, root)?
                 .into_iter()
                 .next()
                 .unwrap_or(OwnedValue::Null);
@@ -8153,9 +8159,45 @@ fn push_path_components(out: &mut Vec<Expr>, expr: &Expr) {
 /// [`eval_owned_expr`] cannot be used for keys: it collapses a multi-output
 /// result into a single `OwnedValue::Array`, which would turn `.[("a","b")]`
 /// into one array-valued key. `QueryResult::collect_owned` is likewise unsafe
-/// on its own because it silently maps `Error` to an empty vec, so both `Error`
-/// and `Break` are intercepted first.
+/// on its own because it silently maps `Error`/`Break` — including a
+/// `Partial`'s trailing one — to an empty vec or a truncated prefix, so
+/// `Error`, `Break`, and a `Partial`'s embedded `Control` are all intercepted
+/// first (#694): an error/break mid-stream aborts the whole expression here,
+/// it does not silently degrade into "however many outputs came before it."
+///
+/// The one caller that must NOT use this — `update_path`'s `Expr::Identity`
+/// arm, i.e. `|=`'s own update-filter evaluation — uses
+/// [`eval_owned_multi_first`] instead; see that function's doc comment for
+/// why.
 fn eval_owned_multi<S: EvalSemantics>(
+    expr: &Expr,
+    input: &OwnedValue,
+) -> Result<Vec<OwnedValue>, EvalError> {
+    match eval_owned_input::<Vec<u64>, S>(expr, input, false) {
+        QueryResult::Error(e) => Err(e),
+        QueryResult::Break(label) => Err(EvalError::new(format!("break ${label} not in label"))),
+        QueryResult::Partial(_, Control::Error(e)) => Err(e),
+        QueryResult::Partial(_, Control::Break(label)) => {
+            Err(EvalError::new(format!("break ${label} not in label")))
+        }
+        other => Ok(other.collect_owned()),
+    }
+}
+
+/// Like [`eval_owned_multi`], but keeps `collect_owned`'s old "just give me
+/// the prefix" policy for a `Partial` instead of surfacing its trailing
+/// control as an error (#694).
+///
+/// The only correct caller is `update_path`'s `Expr::Identity` arm (`|=`'s
+/// own update-filter evaluation): jq's `_modify` wraps each per-path update
+/// in `label $out | ... | ., break $out`, so only the *first* output of the
+/// update filter is ever observed — anything after it, including a trailing
+/// `error(...)`, is never evaluated by real jq and must not surface here
+/// either. Verified against jq 1.7.1: `.a |= (1, error("x"))` is `{"a":1}`,
+/// not an error, while `.a |= (error("x"), 1)` — nothing produced before the
+/// error — does raise it, which the plain `Error`/`Break` arms below already
+/// cover.
+fn eval_owned_multi_first<S: EvalSemantics>(
     expr: &Expr,
     input: &OwnedValue,
 ) -> Result<Vec<OwnedValue>, EvalError> {
@@ -11898,10 +11940,15 @@ fn builtin_fromstream<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    let events = match eval_single::<W, S>(f, value, optional) {
+    // A `Partial`'s trailing control is not intercepted here (#694): its
+    // prefix of events is processed below like any other, and the control
+    // is re-attached to whatever it produced via `partial()` at the end,
+    // instead of being silently dropped.
+    let (events, control) = match eval_single::<W, S>(f, value, optional) {
         QueryResult::Error(e) => return QueryResult::Error(e),
         QueryResult::Break(label) => return QueryResult::Break(label),
-        result => result.collect_owned(),
+        QueryResult::Partial(vs, control) => (vs, Some(control)),
+        result => (result.collect_owned(), None),
     };
 
     let mut outputs = Vec::new();
@@ -11933,10 +11980,13 @@ fn builtin_fromstream<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         }
     }
 
-    match outputs.len() {
-        0 => QueryResult::None,
-        1 => QueryResult::Owned(outputs.pop().unwrap()),
-        _ => QueryResult::ManyOwned(outputs),
+    match control {
+        Some(control) => partial(outputs, control),
+        None => match outputs.len() {
+            0 => QueryResult::None,
+            1 => QueryResult::Owned(outputs.pop().unwrap()),
+            _ => QueryResult::ManyOwned(outputs),
+        },
     }
 }
 
@@ -11960,10 +12010,15 @@ fn builtin_truncate_stream<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 ) -> QueryResult<'a, W> {
     let depth = to_owned(&value);
 
-    let events = match eval_single::<W, S>(stream_expr, value, optional) {
+    // A `Partial`'s trailing control is not intercepted here (#694): its
+    // prefix of events is processed below like any other, and the control
+    // is re-attached to whatever it produced via `partial()` at the end,
+    // instead of being silently dropped.
+    let (events, control) = match eval_single::<W, S>(stream_expr, value, optional) {
         QueryResult::Error(e) => return QueryResult::Error(e),
         QueryResult::Break(label) => return QueryResult::Break(label),
-        result => result.collect_owned(),
+        QueryResult::Partial(vs, control) => (vs, Some(control)),
+        result => (result.collect_owned(), None),
     };
 
     let mut outputs = Vec::new();
@@ -11991,10 +12046,13 @@ fn builtin_truncate_stream<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         }
     }
 
-    match outputs.len() {
-        0 => QueryResult::None,
-        1 => QueryResult::Owned(outputs.pop().unwrap()),
-        _ => QueryResult::ManyOwned(outputs),
+    match control {
+        Some(control) => partial(outputs, control),
+        None => match outputs.len() {
+            0 => QueryResult::None,
+            1 => QueryResult::Owned(outputs.pop().unwrap()),
+            _ => QueryResult::ManyOwned(outputs),
+        },
     }
 }
 
@@ -18217,6 +18275,52 @@ mod tests {
     fn eval_owned_multi_propagates_an_error() {
         let expr = parse(r#"error("boom")"#).unwrap();
         assert!(eval_owned_multi::<JqSemantics>(&expr, &OwnedValue::Null).is_err());
+    }
+
+    // #694: a `Partial`'s trailing `Control` was silently dropped, keeping
+    // only its prefix as if evaluation had completed normally.
+
+    #[test]
+    fn eval_owned_multi_propagates_a_partial_error() {
+        // `1, error("boom")` produces `Partial([1], Control::Error(_))` --
+        // before this fix, this returned `Ok(vec![1])`, swallowing "boom".
+        let expr = parse(r#"1, error("boom")"#).unwrap();
+        let err = eval_owned_multi::<JqSemantics>(&expr, &OwnedValue::Null).unwrap_err();
+        assert_eq!(err.message, "boom");
+    }
+
+    #[test]
+    fn eval_owned_multi_propagates_a_partial_break() {
+        // `1, break $foo` with no enclosing `label $foo` in scope produces
+        // `Partial([1], Control::Break("foo"))` -- same fix as the error
+        // case, folded into the same synthetic "break $label not in label"
+        // `EvalError` the bare (non-`Partial`) `Break` arm already used.
+        let expr = parse("1, break $foo").unwrap();
+        let err = eval_owned_multi::<JqSemantics>(&expr, &OwnedValue::Null).unwrap_err();
+        assert!(err.message.contains("break $foo not in label"));
+    }
+
+    #[test]
+    fn eval_owned_multi_first_drops_partial_error_keeping_prefix() {
+        // `update_path`'s `Expr::Identity` arm (i.e. `|=`'s own update
+        // filter) is the one caller that must keep this old, otherwise-fixed
+        // behavior: jq's `_modify` only ever observes the update filter's
+        // first output, so a trailing error must not surface here.
+        let expr = parse(r#"1, error("boom")"#).unwrap();
+        let values = eval_owned_multi_first::<JqSemantics>(&expr, &OwnedValue::Null).unwrap();
+        assert_eq!(values, vec![OwnedValue::Int(1)]);
+    }
+
+    #[test]
+    fn eval_owned_multi_first_propagates_a_bare_break() {
+        // `break $foo` alone (no preceding output, so no `Partial` wrapper --
+        // `eval_owned_input` returns a bare `QueryResult::Break` directly)
+        // still shares its own dedicated arm with the plain
+        // `eval_owned_multi`, unlike the `Partial` case above which
+        // `eval_owned_multi_first` deliberately keeps un-fixed.
+        let expr = parse("break $foo").unwrap();
+        let err = eval_owned_multi_first::<JqSemantics>(&expr, &OwnedValue::Null).unwrap_err();
+        assert!(err.message.contains("break $foo not in label"));
     }
 
     /// Evaluate `Identity`/`Field`/`Index` against an `OwnedValue` the way
@@ -28530,5 +28634,143 @@ mod tests {
             let pipe = Expr::Pipe(vec![unresolved(), Expr::Field("a".to_string())]);
             let _ = walk_path::<JqSemantics>(&pipe, &OwnedValue::Null, &[], &mut reached, false);
         }
+    }
+
+    // #694: `collect_owned()`/`eval_owned_multi` silently dropped a
+    // `Partial`'s trailing `Control::Error`/`Control::Break`, keeping only
+    // its prefix as if evaluation had completed normally -- so a mid-stream
+    // error/break through any of ~15 call sites (dynamic indexing, path
+    // resolution, `recurse`, `as`-binding, ...) silently wrote a value or
+    // continued a traversal instead of raising the error jq raises. These
+    // pin the issue's own repros plus a representative sample of the other
+    // fixed call sites, and a guard that `|=` itself was deliberately left
+    // unfixed (see `eval_owned_multi_first`).
+
+    #[test]
+    fn test_dynamic_index_assignment_propagates_partial_error_694() {
+        // Issue #694's primary repro. Confirmed against real jq 1.7.1:
+        // `echo '{"a":{}}' | jq '.a[(foreach (1,2) as $x ("x"; .+"y",
+        // error("boom")))] = 99'` raises "boom" -- before this fix,
+        // succinctly silently wrote `{"a":{"xy":99}}` and exited 0.
+        query!(
+            br#"{"a":{}}"#,
+            r#".a[(foreach (1,2) as $x ("x"; .+"y", error("boom")))] = 99"#,
+            QueryResult::Error(e) | QueryResult::Partial(_, Control::Error(e)) => {
+                assert_eq!(e.message, "boom");
+            }
+        );
+    }
+
+    #[test]
+    fn test_recurse_propagates_partial_error_from_condition_694() {
+        // Issue #694's second repro. Confirmed against real jq 1.7.1: errors
+        // with "boom" -- before this fix, succinctly silently continued the
+        // traversal to `[null,1]`, contradicting `builtin_recurse`'s own
+        // doc comment ("An error aborts immediately", #636).
+        query!(
+            b"null",
+            r#"[recurse(if . == null then (foreach (1,2) as $x (0; .+$x, error("boom"))) else empty end)]"#,
+            QueryResult::Error(e) | QueryResult::Partial(_, Control::Error(e)) => {
+                assert_eq!(e.message, "boom");
+            }
+        );
+    }
+
+    #[test]
+    fn test_update_assign_ignores_trailing_error_after_first_output_694() {
+        // The one call site that must NOT be "fixed" by #694: jq's `_modify`
+        // (backing `|=`) only ever observes the update filter's first
+        // output. Confirmed against real jq 1.7.1: `.a |= (1, error("x"))`
+        // is `{"a":1}`, not an error -- `eval_owned_multi_first` must keep
+        // the pre-#694 "drop the tail" behavior here.
+        assert_eq!(
+            outputs(b"{}", r#".a |= (1, error("boom"))"#),
+            vec![r#"{"a":1}"#]
+        );
+    }
+
+    #[test]
+    fn test_del_computed_key_propagates_partial_error_694() {
+        // Confirmed against real jq 1.7.1: errors with "boom".
+        query!(
+            br#"{"a":{"x":1,"y":2}}"#,
+            r#"del(.a[("x", error("boom"))])"#,
+            QueryResult::Error(e) | QueryResult::Partial(_, Control::Error(e)) => {
+                assert_eq!(e.message, "boom");
+            }
+        );
+    }
+
+    #[test]
+    fn test_slice_assignment_dynamic_bound_propagates_partial_error_694() {
+        // `resolve_slice_bound`, one of the call sites fixed for free by the
+        // central `eval_owned_multi` fix. Confirmed against real jq 1.7.1:
+        // errors with "boom".
+        query!(
+            br#"{"a":[1,2,3,4,5]}"#,
+            r#".a[(1,error("boom")):4] = ["Z"]"#,
+            QueryResult::Error(e) | QueryResult::Partial(_, Control::Error(e)) => {
+                assert_eq!(e.message, "boom");
+            }
+        );
+    }
+
+    #[test]
+    fn test_fromstream_propagates_partial_error_694() {
+        // `builtin_fromstream` doesn't route through `eval_owned_multi` --
+        // it calls `collect_owned()` directly and needed its own fix.
+        // Confirmed against real jq 1.7.1: `fromstream(1|tostream,
+        // error("boom"))` errors with "boom".
+        query!(
+            b"null",
+            r#"[fromstream(1|tostream, error("boom"))]"#,
+            QueryResult::Error(e) | QueryResult::Partial(_, Control::Error(e)) => {
+                assert_eq!(e.message, "boom");
+            }
+        );
+    }
+
+    #[test]
+    fn test_truncate_stream_propagates_partial_error_694() {
+        // Same fix shape as `fromstream` above, applied to
+        // `builtin_truncate_stream`. Confirmed against real jq 1.7.1: errors
+        // with "boom".
+        query!(
+            b"1",
+            r#"[truncate_stream(1|tostream, error("boom"))]"#,
+            QueryResult::Error(e) | QueryResult::Partial(_, Control::Error(e)) => {
+                assert_eq!(e.message, "boom");
+            }
+        );
+    }
+
+    #[test]
+    fn test_fromstream_empty_stream_produces_no_output() {
+        // A stream expression with no events and no trailing control at all
+        // -- `control` is `None` and `outputs` stays empty, the ordinary
+        // (non-`Partial`) empty case `builtin_fromstream` still has to
+        // handle on its own now that the `Partial` control is intercepted
+        // separately above.
+        assert_eq!(outputs(b"null", "[fromstream(empty)]"), vec!["[]"]);
+    }
+
+    #[test]
+    fn test_truncate_stream_empty_stream_produces_no_output() {
+        // Same "no events, no control" case as `fromstream` above, for
+        // `builtin_truncate_stream`.
+        assert_eq!(outputs(b"1", "[truncate_stream(empty)]"), vec!["[]"]);
+    }
+
+    #[test]
+    fn test_truncate_stream_single_kept_event_produces_one_output() {
+        // Every other `truncate_stream` test above keeps zero, two, or three
+        // events -- this pins the `outputs.len() == 1` case (no control) so
+        // it isn't only reached via the two- and three-event tests' `_ =>`
+        // arm. A single-event stream literal whose path is longer than the
+        // depth is kept, truncated, and returned as the lone output.
+        assert_eq!(
+            outputs(b"1", r#"truncate_stream(([[["a","b"],1]])|.[])"#),
+            vec![r#"[["b"],1]"#]
+        );
     }
 }
