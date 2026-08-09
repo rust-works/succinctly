@@ -30,6 +30,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `const HAS_CR: bool` parameter — call it as `classify_yaml_chars::<true>(..)`
   for the previous behaviour.
 
+- **`reduce`/`foreach` no longer redo `substitute_var`'s AST rebuild once per
+  INIT fork, and drop a dead `acc`/`state` clone every step** (#695, a #534
+  follow-up): `substitute_var(update, ...)` (and `foreach`'s
+  `substitute_var(ext, ...)`) depends only on the current input element,
+  never on which INIT fork is running, but sat inside the INIT-fork loop and
+  was recomputed on every `(init_val, input_val)` visit — worse for
+  `foreach`'s EXTRACT substitution, nested one level deeper still inside the
+  UPDATE-fanout loop, so a k-way UPDATE fanout rebuilt it k times per input
+  element. Both are now precomputed once per input element before the
+  INIT-fork loop runs. `acc`/`state`'s `.clone().unwrap_or(...)` — immediately
+  followed by an unconditional overwrite with no read in between — is now
+  `.take()`, dropping a full-value clone every step.
+
 ### Added
 
 - **jq `@csv`/`@tsv`/`@dsv`/`@sh` allocation overhead investigated: no

@@ -9958,6 +9958,19 @@ fn eval_reduce<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             QueryResult::Partial(vs, control) => (vs, Some(control)),
         };
 
+    // Substituting `$var` into UPDATE only depends on `input_val`, not on
+    // which INIT fork is running — hoist it out of the INIT-fork loop so a
+    // query with N INIT outputs pays for `substitute_var`'s AST rebuild
+    // once per input element, not N times (#695). Skipped entirely when
+    // there are no INIT forks to consume it.
+    if init_values.is_empty() {
+        return finish_fork(Vec::new(), init_control, optional);
+    }
+    let substituted_updates: Vec<Expr> = input_values
+        .iter()
+        .map(|v| substitute_var(update, var, v))
+        .collect();
+
     let mut outputs: Vec<OwnedValue> = Vec::new();
     for init_val in init_values {
         // The accumulator is a variable UPDATE rebinds; a step whose UPDATE
@@ -9968,11 +9981,13 @@ fn eval_reduce<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // `null`, not empty output.
         let mut acc: Option<OwnedValue> = Some(init_val);
         let mut aborted: Option<Control> = None;
-        for input_val in &input_values {
-            let substituted = substitute_var(update, var, input_val);
-            let acc_input = acc.clone().unwrap_or(OwnedValue::Null);
+        for substituted in &substituted_updates {
+            // `acc` is unconditionally overwritten below, so moving it out
+            // (rather than cloning) is sound — nothing reads the old value
+            // again (#695).
+            let acc_input = acc.take().unwrap_or(OwnedValue::Null);
             let (update_vals, update_control) =
-                eval_owned_expr_fork::<S>(&substituted, &acc_input, optional);
+                eval_owned_expr_fork::<S>(substituted, &acc_input, optional);
             // Only the last output of a multi-output UPDATE becomes the new
             // accumulator — verified: `reduce (1,2) as $x (0; .+$x, .)` is
             // `0`, not an error from folding an array.
@@ -10239,6 +10254,24 @@ fn eval_foreach<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             QueryResult::Partial(vs, control) => (vs, Some(control)),
         };
 
+    // Same hoist as `eval_reduce`, plus EXTRACT: both only depend on
+    // `input_val`, never on which INIT fork or which UPDATE output is
+    // current (#695). Skipped entirely when there are no INIT forks to
+    // consume it.
+    if init_values.is_empty() {
+        return finish_fork(Vec::new(), init_control, optional);
+    }
+    let substituted_updates: Vec<Expr> = input_values
+        .iter()
+        .map(|v| substitute_var(update, var, v))
+        .collect();
+    let substituted_extracts: Option<Vec<Expr>> = extract.map(|ext| {
+        input_values
+            .iter()
+            .map(|v| substitute_var(ext, var, v))
+            .collect()
+    });
+
     let mut outputs: Vec<OwnedValue> = Vec::new();
     for init_val in init_values {
         // The state is a variable UPDATE rebinds; a step whose UPDATE
@@ -10247,20 +10280,21 @@ fn eval_foreach<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // `LOADVN`), same rule as `reduce` (#534).
         let mut state: Option<OwnedValue> = Some(init_val);
         let mut aborted: Option<Control> = None;
-        'input: for input_val in &input_values {
-            let substituted_update = substitute_var(update, var, input_val);
-            let state_input = state.clone().unwrap_or(OwnedValue::Null);
+        'input: for (idx, substituted_update) in substituted_updates.iter().enumerate() {
+            // `state` is unconditionally overwritten below, so moving it
+            // out (rather than cloning) is sound — nothing reads the old
+            // value again (#695).
+            let state_input = state.take().unwrap_or(OwnedValue::Null);
             let (update_vals, update_control) =
-                eval_owned_expr_fork::<S>(&substituted_update, &state_input, optional);
+                eval_owned_expr_fork::<S>(substituted_update, &state_input, optional);
             // EXTRACT (or the implicit identity when omitted) runs once per
             // UPDATE output, fanning out independently of which output
             // becomes the new state — verified: `[foreach (1,2) as $x (0;
             // .+$x, .*100)]` is `[1,0,2,0]`.
             for update_val in &update_vals {
-                if let Some(ext) = extract {
-                    let substituted_extract = substitute_var(ext, var, input_val);
+                if let Some(extracts) = &substituted_extracts {
                     let (ext_vals, ext_control) =
-                        eval_owned_expr_fork::<S>(&substituted_extract, update_val, optional);
+                        eval_owned_expr_fork::<S>(&extracts[idx], update_val, optional);
                     // The steps already produced no longer vanish (#494).
                     outputs.extend(ext_vals);
                     if let Some(control) = ext_control {
@@ -10296,10 +10330,9 @@ fn eval_foreach<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         }
     }
 
-    // Only reachable with zero INIT forks (`init_values` empty): every
-    // non-empty fork above already resolves `input_control` itself before
-    // this point, so there is nothing left to apply here except INIT's own
-    // trailing control.
+    // Reached once every INIT fork (there is at least one, per the
+    // `init_values.is_empty()` guard above) ran to completion without
+    // aborting — the only trailing control left to apply is INIT's own.
     finish_fork(outputs, init_control, optional)
 }
 
@@ -22665,6 +22698,18 @@ mod tests {
                 "label $lbl | foreach .[] as $x (break $lbl; .+$x)"
             ),
             Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn test_foreach_hoisted_extract_substitution_stays_aligned_per_input_val() {
+        // Regression test for the #695 substitute_var hoist: EXTRACT must
+        // see the *matching* input_val's substitution at each position
+        // (via the idx-based lookup into the precomputed side array), not
+        // a neighboring one.
+        assert_eq!(
+            outputs(b"null", "foreach (10,20,30) as $x (0; .+$x; [$x, .])"),
+            ["[10,10]", "[20,30]", "[30,60]"]
         );
     }
 
