@@ -2656,6 +2656,26 @@ fn test_uncaught_error_exits_5() -> Result<()> {
 }
 
 #[test]
+fn test_693_optional_around_stream_stops_at_the_first_error() -> Result<()> {
+    // The `jq`/`yq` CLIs' default path evaluates through `eval_generic`'s
+    // native cursor-based evaluator (`jq_runner.rs`'s `evaluate_input`/
+    // `evaluate_bytes_lazy`), not the `eval.rs`-level `eval()` API directly
+    // — so a fix that only touched `eval.rs` would leave this reachable
+    // through the shipped binary. Verified against jq 1.7.1: `jq -n '[1,2,3]
+    // | (.[] | if .==2 then error("boom") else . end)?'` prints only `1`.
+    // Pre-#693 this codebase's binary printed `1` and `3` (the masked error
+    // at the second element self-suppressed instead of stopping the
+    // fan-out).
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r#"(.[] | if .==2 then error("boom") else . end)?"#],
+        Some("[1,2,3]"),
+    )?;
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout, "1\n");
+    Ok(())
+}
+
+#[test]
 fn test_uncaught_type_error_exits_5() -> Result<()> {
     // Internal errors carry no payload, so no `(not a string)` marker. The
     // wording still differs from jq's ("Cannot index number with string") --

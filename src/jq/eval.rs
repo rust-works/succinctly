@@ -20173,6 +20173,13 @@ mod tests {
         // No handler at all: the prefix is kept and the error swallowed.
         assert_eq!(outputs(b"null", r#"try (1,2,error("x"))"#), ["1", "2"]);
         assert_eq!(outputs(b"null", r#"(1,2,error("x"))?"#), ["1", "2"]);
+        // The error-in-last-position cases above happen to be numerically
+        // correct even under #693's bug (nothing follows the error to wrongly
+        // continue to). An operand *after* the masked error is the case that
+        // actually distinguishes correct behavior: jq stops at the error and
+        // never reaches `2`.
+        assert_eq!(outputs(b"null", r#"try (1,error("x"),2)"#), ["1"]);
+        assert_eq!(outputs(b"null", r#"(1,error("x"),2)?"#), ["1"]);
         // A handler that fails in turn: the two prefixes concatenate and the
         // handler's own control terminates the stream.
         query!(b"null", r#"try (1,2,error("x")) catch error("y")"#,
@@ -22917,6 +22924,73 @@ mod tests {
                 "label $lbl | foreach .[] as $x (break $lbl; .+$x)"
             ),
             Vec::<String>::new()
+        );
+    }
+
+    // #693: `$nope` (above) is the *one* leaf that never self-suppressed via
+    // the old ambient-`optional` bug, so the tests above never actually
+    // exercised the failure mode from the issue — a `?`-wrapped fork
+    // construct whose UPDATE/COND step raises via `error(...)` (the
+    // realistic case). These pin that directly, against pinned `jq 1.7.1`
+    // output.
+
+    #[test]
+    fn test_693_reduce_update_error_swallowed_by_optional() {
+        // Before the fix: UPDATE's `error("boom")` self-suppressed to `None`
+        // at the leaf (ambient `optional = true`), so `eval_reduce` never saw
+        // an `Error`/`Partial` to abort on, and `.` (the unbound accumulator)
+        // read back as `null` — `(reduce (1) as $x (0; error("boom")))?`
+        // wrongly produced `null` instead of stopping with no output.
+        assert_eq!(
+            outputs(b"null", r#"(reduce (1) as $x (0; error("boom")))?"#),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn test_693_foreach_update_error_aborts_every_fork_not_just_the_current_one() {
+        // Multi-output INIT `(10,20)` forks foreach over two accumulators.
+        // Before the fix, fork 1's masked error "recovered" to a bound
+        // `null` instead of aborting, and fork 2 — which real jq's `?` never
+        // attempts once fork 1 errors — ran anyway, wrongly producing
+        // `[2,21,23]`.
+        assert_eq!(
+            outputs(
+                b"null",
+                r#"(foreach (1,2) as $x ((10,20); if .==10 then error("boom") else .+$x end))?"#
+            ),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn test_693_while_stops_at_the_masked_error_instead_of_burning_the_step_budget() {
+        // Before the fix, the masked error inside `while`'s UPDATE never
+        // reached `until_step`/`while_step`'s abort check, so the loop spun
+        // through `0..12` repeatedly until `WHILE_UNTIL_MAX_STEPS` tripped.
+        assert_eq!(
+            outputs(
+                b"null",
+                "(10|while(. < 30; if . == 12 then error(\"boom\"), 0 else .+1 end))?"
+            ),
+            ["10", "11", "12"]
+        );
+    }
+
+    #[test]
+    fn test_693_optional_around_a_fork_construct_also_catches_an_escaping_break() {
+        // `finish_fork` deliberately never special-cases `Break` (see its doc
+        // comment) — catching one is the wrapping `?`/`try` boundary's job.
+        // Before this fix, `Expr::Optional`'s dispatch had no such boundary
+        // logic, so the `break $out` inside the `reduce` escaped straight
+        // past the `?` and was caught by `label $out` one step too early,
+        // wrongly producing `[1]` instead of jq's `[1,4]`.
+        assert_eq!(
+            outputs(
+                b"null",
+                "label $out | (1, (reduce (1,2) as $x (0; break $out))?, 4)"
+            ),
+            ["1", "4"]
         );
     }
 

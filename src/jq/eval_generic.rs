@@ -3570,6 +3570,29 @@ mod tests {
     }
 
     #[test]
+    fn test_generic_optional_around_native_pipe_fanout_stops_at_the_first_error() {
+        // #693: `Expr::Optional`'s own native arm (not the `eval_on_owned`/
+        // wildcard bridge to `eval::eval`) used to force `optional = true`
+        // down the whole wrapped subtree, so each element of the native
+        // `Iterate` -> `Pipe` fan-out independently self-suppressed its own
+        // error via the bridge's own `optional`-aware wrapping, and the
+        // fan-out wrongly kept going past it. Confirmed reachable through
+        // the actual `succinctly jq`/`yq` CLIs, which call this native path
+        // (`eval_with_cursor`) by default, not just via `eval()` directly:
+        // `echo '[1,2,3]' | succinctly jq '(.[] | if .==2 then
+        // error("boom") else . end)?'` printed `1` and `3` pre-fix; real jq
+        // 1.7.1 prints only `1`.
+        let json = br"[1, 2, 3]";
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+
+        let expr = crate::jq::parse(r#"(.[] | if .==2 then error("boom") else . end)?"#).unwrap();
+        let result = eval(&expr, value);
+        assert_eq!(result.collect_owned(), vec![OwnedValue::Int(1)]);
+    }
+
+    #[test]
     fn test_yaml_generic_array() {
         use crate::yaml::YamlIndex;
 
