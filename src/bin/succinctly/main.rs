@@ -335,6 +335,12 @@ struct BenchJqArgs {
     #[arg(short, long, default_value = "all")]
     sizes: String,
 
+    /// Query types to benchmark (comma-separated, or "all")
+    /// Available: identity (.), keys_unsorted, keys_unsorted_length,
+    /// keys_unsorted_map, keys_unsorted_select, map, select
+    #[arg(short, long, default_value = "identity")]
+    queries: String,
+
     /// Number of warmup runs before benchmarking
     #[arg(long, default_value = "1")]
     warmup: usize,
@@ -542,6 +548,8 @@ enum PatternArg {
     Pathological,
     /// Indented, pretty-printed documents (tests whitespace skipping)
     Pretty,
+    /// Wide flat object: many distinct top-level keys, no nesting (tests keys_unsorted)
+    Wide,
 }
 
 /// Generate a suite of JSON files with various sizes and patterns for benchmarking
@@ -1108,6 +1116,7 @@ impl From<PatternArg> for generators::Pattern {
             PatternArg::Unicode => Self::Unicode,
             PatternArg::Pathological => Self::Pathological,
             PatternArg::Pretty => Self::Pretty,
+            PatternArg::Wide => Self::Wide,
         }
     }
 }
@@ -1457,6 +1466,7 @@ fn run_jq_benchmark(args: BenchJqArgs) -> Result<()> {
         "strings",
         "unicode",
         "users",
+        "wide",
     ];
     let all_sizes = vec!["1kb", "10kb", "100kb", "1mb", "10mb", "100mb"];
 
@@ -1478,10 +1488,27 @@ fn run_jq_benchmark(args: BenchJqArgs) -> Result<()> {
             .collect()
     };
 
+    // Parse query types
+    let queries: Vec<jq_bench::QueryType> = if args.queries == "all" {
+        jq_bench::QueryType::all().to_vec()
+    } else {
+        args.queries
+            .split(',')
+            .filter_map(|s| jq_bench::QueryType::from_str(s.trim()))
+            .collect()
+    };
+
+    if queries.is_empty() {
+        anyhow::bail!(
+            "No valid query types specified. Available: identity, keys_unsorted, keys_unsorted_length, keys_unsorted_map, keys_unsorted_select, map, select"
+        );
+    }
+
     let config = jq_bench::BenchConfig {
         data_dir: args.data_dir,
         patterns,
         sizes,
+        queries,
         succinctly_binary: args.binary,
         warmup_runs: args.warmup,
         benchmark_runs: args.runs,
@@ -1740,6 +1767,7 @@ const SUITE_PATTERNS: &[(&str, generators::Pattern)] = &[
     ("unicode", generators::Pattern::Unicode),
     ("pathological", generators::Pattern::Pathological),
     ("pretty", generators::Pattern::Pretty),
+    ("wide", generators::Pattern::Wide),
 ];
 
 /// Sizes to generate for each pattern (name, bytes)
@@ -2227,5 +2255,65 @@ mod tests {
         assert!(parse_size("99999999999gb").is_err());
         assert!(parse_size(&format!("{}kb", usize::MAX)).is_err());
         assert_eq!(parse_size(&format!("{}b", usize::MAX)).unwrap(), usize::MAX);
+    }
+
+    #[test]
+    fn test_pattern_arg_wide_maps_to_generator_pattern() {
+        assert!(matches!(
+            generators::Pattern::from(PatternArg::Wide),
+            generators::Pattern::Wide
+        ));
+    }
+
+    fn bench_jq_args(patterns: &str, sizes: &str, queries: &str, binary: &str) -> BenchJqArgs {
+        BenchJqArgs {
+            data_dir: PathBuf::from("data/bench/generated"),
+            output: None,
+            markdown: None,
+            patterns: patterns.to_string(),
+            sizes: sizes.to_string(),
+            queries: queries.to_string(),
+            warmup: 0,
+            runs: 1,
+            binary: PathBuf::from(binary),
+            no_memory: true,
+        }
+    }
+
+    #[test]
+    fn test_run_jq_benchmark_rejects_invalid_queries() {
+        // Fails during argument parsing, before any jq/succinctly subprocess
+        // or file I/O - deterministic regardless of the test environment.
+        let args = bench_jq_args(
+            "arrays",
+            "1kb",
+            "not_a_real_query",
+            "./target/release/succinctly",
+        );
+        let err = run_jq_benchmark(args).unwrap_err();
+        assert!(
+            err.to_string().contains("No valid query types specified"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_run_jq_benchmark_builds_config_for_all_queries() {
+        // "all" must resolve to a non-empty query list and reach the
+        // jq/binary availability checks - it can't succeed without a real jq
+        // and succinctly binary, but a nonexistent binary path still
+        // guarantees a clean, specific error rather than a panic.
+        let args = bench_jq_args(
+            "arrays",
+            "1kb",
+            "all",
+            "/nonexistent/succinctly-coverage-test-binary",
+        );
+        let err = run_jq_benchmark(args).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("jq not found") || msg.contains("binary not found"),
+            "unexpected error: {msg}"
+        );
     }
 }
