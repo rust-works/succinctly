@@ -4726,6 +4726,21 @@ mod tests {
         assert!(parse("\"unterminated").is_err()); // unterminated string
     }
 
+    /// `ParseError`'s `Display` impl is what the CLI prints for every real
+    /// syntax error (`jq_runner.rs`'s `eprintln!("jq: compile error: {e}")`),
+    /// but nothing exercised it directly: the only source of a genuine parse
+    /// error in the golden corpus was #534's now-lifted restriction against
+    /// a comma in reduce/foreach/until/while's init/update/cond/extract
+    /// slots (`test_comma_accepted_in_reduce_foreach_until_while` above).
+    #[test]
+    fn test_parse_error_display_includes_position_and_message() {
+        let err = parse(".[").unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!("parse error at position {}: {}", err.position, err.message)
+        );
+    }
+
     #[test]
     fn test_arithmetic() {
         // Addition
