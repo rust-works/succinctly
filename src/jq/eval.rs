@@ -3,6 +3,8 @@
 //! Evaluates expressions against JSON using the cursor-based navigation API.
 
 #[cfg(not(test))]
+use alloc::borrow::Cow;
+#[cfg(not(test))]
 use alloc::boxed::Box;
 // `BTreeSet`, not `HashSet`: this crate is `no_std`, and `alloc` has no hasher.
 use alloc::collections::BTreeSet;
@@ -14,6 +16,8 @@ use alloc::string::{String, ToString};
 use alloc::vec;
 #[cfg(not(test))]
 use alloc::vec::Vec;
+#[cfg(test)]
+use std::borrow::Cow;
 
 use indexmap::IndexMap;
 
@@ -8280,7 +8284,20 @@ fn key_to_path_component(key: &OwnedValue, container: &OwnedValue) -> Result<Exp
 
 /// One resolved branch: the static path components reaching it, and the value
 /// found there (needed to resolve any computed key further along the chain).
-type PathBranch = (Vec<Expr>, OwnedValue);
+///
+/// The value half is `Cow<'a, OwnedValue>`, not an owned `OwnedValue`: the
+/// overwhelming majority of branch producers (`..`/`recurse`, `.[]`, static
+/// field/index chains, `select`/type-filter builtins, ...) are pure
+/// navigation and can borrow straight from wherever the value already lives
+/// in the input tree — no clone. Only a genuinely freshly-computed value (a
+/// slice, a `getpath` walk, anything routed through
+/// `eval_owned_multi`/`eval_owned_expr`) pays `Cow::Owned`, exactly as much
+/// as it always did. See `resolve_against_cow` for the one wrinkle: a value
+/// computed mid-chain (e.g. inside `recurse(f)` when `f` itself constructs
+/// something new) can only lend references for as long as it lives, so
+/// branches built from it are forced back to `Cow::Owned` before they escape
+/// that scope (#668).
+type PathBranch<'a> = (Vec<Expr>, Cow<'a, OwnedValue>);
 
 /// The result of resolving one path node: either every branch it fans out
 /// to, or — if resolution failed partway through several siblings (a
@@ -8297,10 +8314,10 @@ type PathBranch = (Vec<Expr>, OwnedValue);
 /// `resolve_dynamic_indexes` (`=`, `|=`, `del()`) discards the prefix and
 /// treats this exactly like a plain `Err`, matching jq's atomic write-side
 /// semantics (confirmed live: `(.a, 1) = 5` produces no output at all).
-type PathResolveResult = Result<Vec<PathBranch>, (Vec<PathBranch>, EvalError)>;
+type PathResolveResult<'a> = Result<Vec<PathBranch<'a>>, (Vec<PathBranch<'a>>, EvalError)>;
 
 /// Resolve one path node against one value, yielding a branch per output.
-fn resolve_node<S: EvalSemantics>(expr: &Expr, value: &OwnedValue) -> PathResolveResult {
+fn resolve_node<'a, S: EvalSemantics>(expr: &Expr, value: &'a OwnedValue) -> PathResolveResult<'a> {
     match expr {
         Expr::Pipe(exprs) => resolve_seq::<S>(exprs, value),
         Expr::Paren(inner) => resolve_node::<S>(inner, value),
@@ -8407,11 +8424,11 @@ fn resolve_node<S: EvalSemantics>(expr: &Expr, value: &OwnedValue) -> PathResolv
             OwnedValue::Array(items) => Ok(items
                 .iter()
                 .enumerate()
-                .map(|(i, v)| (vec![Expr::Index(i as i64)], v.clone()))
+                .map(|(i, v)| (vec![Expr::Index(i as i64)], Cow::Borrowed(v)))
                 .collect()),
             OwnedValue::Object(map) => Ok(map
                 .iter()
-                .map(|(k, v)| (vec![Expr::Field(k.clone())], v.clone()))
+                .map(|(k, v)| (vec![Expr::Field(k.clone())], Cow::Borrowed(v)))
                 .collect()),
             other => Err((Vec::new(), EvalError::cannot_iterate(other))),
         },
@@ -8459,7 +8476,7 @@ fn resolve_node<S: EvalSemantics>(expr: &Expr, value: &OwnedValue) -> PathResolv
             Ok(cond_outputs
                 .into_iter()
                 .filter(OwnedValue::is_truthy)
-                .map(|_| (Vec::new(), value.clone()))
+                .map(|_| (Vec::new(), Cow::Borrowed(value)))
                 .collect())
         }
         Expr::Builtin(
@@ -8474,7 +8491,7 @@ fn resolve_node<S: EvalSemantics>(expr: &Expr, value: &OwnedValue) -> PathResolv
             | Builtin::Scalars),
         ) => {
             if type_filter_matches(builtin, value) {
-                Ok(vec![(Vec::new(), value.clone())])
+                Ok(vec![(Vec::new(), Cow::Borrowed(value))])
             } else {
                 Ok(Vec::new())
             }
@@ -8536,7 +8553,7 @@ fn resolve_node<S: EvalSemantics>(expr: &Expr, value: &OwnedValue) -> PathResolv
         // `//` only substitutes for falsy/absent output, never for a raised
         // error, and the `?` here already gives us that for free.
         Expr::Alternative(left, right) => {
-            let branches: Vec<PathBranch> = resolve_node::<S>(left, value)?
+            let branches: Vec<PathBranch<'a>> = resolve_node::<S>(left, value)?
                 .into_iter()
                 .filter(|(_, v)| v.is_truthy())
                 .collect();
@@ -8580,7 +8597,12 @@ fn resolve_node<S: EvalSemantics>(expr: &Expr, value: &OwnedValue) -> PathResolv
             // `["a"]` and stops), same as `?`'s matching fix above.
             Err((prefix, e)) => match catch {
                 None => Ok(prefix),
-                Some(catch_expr) => resolve_node::<S>(catch_expr, &e.payload()),
+                // `e.payload()` is a fresh, function-local `OwnedValue` (the
+                // error consumes itself to produce it) — it cannot lend a
+                // reference with this function's own `'a`, so resolution
+                // against it goes through `resolve_against_cow`, which
+                // forces the result back to `Cow::Owned` before it escapes.
+                Some(catch_expr) => resolve_against_cow::<S>(catch_expr, Cow::Owned(e.payload())),
             },
         },
 
@@ -8619,13 +8641,19 @@ fn resolve_node<S: EvalSemantics>(expr: &Expr, value: &OwnedValue) -> PathResolv
             let values = eval_owned_multi::<S>(arg, value).map_err(|e| (Vec::new(), e))?;
             if let [OwnedValue::Array(keys)] = values.as_slice() {
                 let mut components = Vec::new();
-                let mut current = value.clone();
+                // Starts borrowed — an empty `keys` (a bare `getpath([])`)
+                // then costs nothing at all; each step after the first
+                // necessarily produces a fresh owned value from
+                // `index_one_owned`, so it becomes `Cow::Owned` from there.
+                let mut current: Cow<'a, OwnedValue> = Cow::Borrowed(value);
                 for key in keys {
                     let component =
                         key_to_path_component(key, &current).map_err(|e| (Vec::new(), e))?;
-                    current = index_one_owned(&current, key, false)
-                        .map_err(|e| (Vec::new(), e))?
-                        .expect("non-optional index yields a value or errors");
+                    current = Cow::Owned(
+                        index_one_owned(&current, key, false)
+                            .map_err(|e| (Vec::new(), e))?
+                            .expect("non-optional index yields a value or errors"),
+                    );
                     components.push(component);
                 }
                 return Ok(vec![(components, current)]);
@@ -8639,11 +8667,11 @@ fn resolve_node<S: EvalSemantics>(expr: &Expr, value: &OwnedValue) -> PathResolv
 
 /// Resolve `n; expr`'s `n` the same way `eval_limit` does, then take that
 /// many resolved branches of `expr`.
-fn resolve_limit<S: EvalSemantics>(
+fn resolve_limit<'a, S: EvalSemantics>(
     n_expr: &Expr,
     expr: &Expr,
-    value: &OwnedValue,
-) -> PathResolveResult {
+    value: &'a OwnedValue,
+) -> PathResolveResult<'a> {
     let n_value = eval_owned_expr::<S>(n_expr, value, false).map_err(|e| (Vec::new(), e))?;
     let n = match n_value {
         OwnedValue::Int(i) | OwnedValue::NumberLiteral(NumberRepr::Int(i), _) if i >= 0 => {
@@ -8671,7 +8699,7 @@ fn resolve_limit<S: EvalSemantics>(
 /// plain value-producing filter that is not a path expression at all —
 /// raising jq's `Invalid path expression` on its first output (#530). Zero
 /// outputs still prunes silently either way, matching `path(empty)` → `[]`.
-fn resolve_leaf<S: EvalSemantics>(expr: &Expr, value: &OwnedValue) -> PathResolveResult {
+fn resolve_leaf<'a, S: EvalSemantics>(expr: &Expr, value: &'a OwnedValue) -> PathResolveResult<'a> {
     let mut values = eval_owned_multi::<S>(expr, value).map_err(|e| (Vec::new(), e))?;
     if matches!(
         expr,
@@ -8682,7 +8710,10 @@ fn resolve_leaf<S: EvalSemantics>(expr: &Expr, value: &OwnedValue) -> PathResolv
         return match values.len() {
             // No output prunes the branch.
             0 => Ok(Vec::new()),
-            1 => Ok(vec![(components, values.pop().expect("len checked"))]),
+            1 => Ok(vec![(
+                components,
+                Cow::Owned(values.pop().expect("len checked")),
+            )]),
             // A multi-output primitive is not actually reachable today —
             // indexing/slicing a value always yields zero or one result —
             // but keep this as a named error rather than a panic in case
@@ -8716,14 +8747,31 @@ fn resolve_leaf<S: EvalSemantics>(expr: &Expr, value: &OwnedValue) -> PathResolv
 /// children in the same pre-order `collect_recursive` uses for the value-only
 /// `..`, so `path(..)`-derived branches visit values in the same order
 /// `[.. ]` would output them.
-fn resolve_recursive_descent(value: &OwnedValue) -> Vec<PathBranch> {
+fn resolve_recursive_descent(value: &OwnedValue) -> Vec<PathBranch<'_>> {
     let mut out = Vec::new();
     push_recursive_branches(&[], value, &mut out);
     out
 }
 
-fn push_recursive_branches(prefix: &[Expr], value: &OwnedValue, out: &mut Vec<PathBranch>) {
-    out.push((prefix.to_vec(), value.clone()));
+/// There is no user filter here — only structural descent into `Array`
+/// /`Object` — so every value this function ever visits is a live sub-part
+/// of the *original* top-level `value` `resolve_recursive_descent` was
+/// called with. That makes the lifetime uniform throughout the whole
+/// recursion, so every branch can borrow directly (`Cow::Borrowed`) instead
+/// of deep-cloning its remaining subtree: an O(1) pointer copy per node
+/// instead of the O(subtree)-per-node cost that made this function (and its
+/// `..`/bare-`recurse` callers) O(d²) on a depth-`d` linear-nesting document
+/// (#668). `prefix.to_vec()` just below is a separate, still-unfixed O(path
+/// length)-per-node cost — also O(d²) summed over the tree, but over
+/// `Vec<Expr>` path components rather than the value — tracked separately as
+/// #701 since it needs a different technique (structural sharing over the
+/// path list, not `Cow`) and #668 never scoped it in.
+fn push_recursive_branches<'a>(
+    prefix: &[Expr],
+    value: &'a OwnedValue,
+    out: &mut Vec<PathBranch<'a>>,
+) {
+    out.push((prefix.to_vec(), Cow::Borrowed(value)));
     match value {
         OwnedValue::Array(items) => {
             for (i, item) in items.iter().enumerate() {
@@ -8740,6 +8788,46 @@ fn push_recursive_branches(prefix: &[Expr], value: &OwnedValue, out: &mut Vec<Pa
             }
         }
         _ => {}
+    }
+}
+
+/// Resolve `expr` against a value that may be borrowed from the original
+/// input (`Cow::Borrowed`) or may have been newly computed partway through a
+/// `recurse(f)`/`try ... catch` chain (`Cow::Owned`) — the one place
+/// `PathBranch`'s `'a` lifetime can't just be threaded through uniformly
+/// (#668).
+///
+/// `resolve_node` needs `value: &'a OwnedValue` to hand back branches that
+/// still carry the caller's own `'a` — but an owned, locally-computed value
+/// can only lend references for as long as it lives (typically one loop
+/// iteration or match arm), never `'a`. Matching `current` *by value* (not
+/// through `&current`, which would cap everything at the short borrow of
+/// `current` itself regardless of what it holds) recovers the best lifetime
+/// available: when `current` is `Borrowed`, its inner reference already *is*
+/// `&'a OwnedValue`, moved out intact, so resolution proceeds at full `'a`
+/// and the common, pure-navigation case pays no clone at all. When `current`
+/// is `Owned`, resolution can only borrow from that local copy, so every
+/// resulting branch is forced back to `Cow::Owned` before it can escape —
+/// exactly the clone cost this path always paid, neither more nor less.
+fn resolve_against_cow<'a, S: EvalSemantics>(
+    expr: &Expr,
+    current: Cow<'a, OwnedValue>,
+) -> PathResolveResult<'a> {
+    match current {
+        Cow::Borrowed(r) => resolve_node::<S>(expr, r),
+        Cow::Owned(v) => match resolve_node::<S>(expr, &v) {
+            Ok(branches) => Ok(branches
+                .into_iter()
+                .map(|(c, cv)| (c, Cow::Owned(cv.into_owned())))
+                .collect()),
+            Err((partial, e)) => Err((
+                partial
+                    .into_iter()
+                    .map(|(c, cv)| (c, Cow::Owned(cv.into_owned())))
+                    .collect(),
+                e,
+            )),
+        },
     }
 }
 
@@ -8799,17 +8887,30 @@ fn push_recursive_branches(prefix: &[Expr], value: &OwnedValue, out: &mut Vec<Pa
 /// null and stops; value evaluation runs to `MAX_ITEMS`) — both already
 /// deviate from unbounded true-jq semantics via their own `MAX_ITEMS`, so
 /// this is a narrower gap, not a new class of one.
-fn resolve_recurse<S: EvalSemantics>(
+///
+/// `current.clone()`/`child_value.clone()` below are `Cow::clone()`, not a
+/// deep copy: cheap (a pointer copy) whenever the value in hand is still
+/// `Cow::Borrowed`, which is every step of the overwhelmingly common case —
+/// default `recurse` (`recurse(.[]?)`), `recurse(.foo)`, `recurse(.a.b)` —
+/// where `f` is pure navigation the whole way down (#668). The win is
+/// conditional, not unconditional: if `f` itself constructs a genuinely new
+/// value at a given node (e.g. `recurse(map(.+1))`), `resolve_against_cow`
+/// forces that node's branch back to `Cow::Owned`, so it costs exactly what
+/// it always did — no regression, but no improvement either, since a real
+/// per-node computation dominates over the clone anyway.
+fn resolve_recurse<'a, S: EvalSemantics>(
     f: &Expr,
     cond: Option<&Expr>,
-    value: &OwnedValue,
-) -> PathResolveResult {
-    let mut outputs: Vec<PathBranch> = Vec::new();
-    let mut stack: Vec<PathBranch> = vec![(Vec::new(), value.clone())];
+    value: &'a OwnedValue,
+) -> PathResolveResult<'a> {
+    let mut outputs: Vec<PathBranch<'a>> = Vec::new();
+    let mut stack: Vec<PathBranch<'a>> = vec![(Vec::new(), Cow::Borrowed(value))];
     const MAX_ITEMS: usize = 10000;
 
     while !stack.is_empty() && outputs.len() < MAX_ITEMS {
         let (prefix, current) = stack.pop().unwrap();
+        // `current.clone()` is cheap (`Cow`, #668). `prefix.clone()` is not —
+        // still `O(path length)` per node, `O(d²)` total; #701, unfixed here.
         outputs.push((prefix.clone(), current.clone()));
 
         // An `f` error aborts immediately rather than pruning `current`'s
@@ -8817,8 +8918,11 @@ fn resolve_recurse<S: EvalSemantics>(
         // children `resolve_node` may have already resolved before hitting
         // that error are dropped rather than stacked, matching
         // `eval_owned_multi`'s all-or-nothing contract for
-        // `builtin_recurse_f`/`builtin_recurse_cond`.
-        let children = match resolve_node::<S>(f, &current) {
+        // `builtin_recurse_f`/`builtin_recurse_cond`. Goes through
+        // `resolve_against_cow`, not `resolve_node` directly, because
+        // `current` may itself be a `Cow::Owned` value from an earlier
+        // step — see that function's doc comment (#668).
+        let children = match resolve_against_cow::<S>(f, current) {
             Ok(children) => children,
             Err((_prefix, e)) => return Err((outputs, e)),
         };
@@ -8827,12 +8931,12 @@ fn resolve_recurse<S: EvalSemantics>(
         // (see the doc comment above) so the first entry here is the next
         // one popped, and its whole subtree completes before the second
         // entry is even reached.
-        let mut next: Vec<PathBranch> = Vec::new();
+        let mut next: Vec<PathBranch<'a>> = Vec::new();
         for (child_components, child_value) in children {
             // A null child ends that line of descent here, unlike the value
             // evaluator since #490. See the note above on why this function
             // keeps the guard: it bounds path-prefix growth, not just count.
-            if matches!(child_value, OwnedValue::Null) {
+            if matches!(child_value.as_ref(), OwnedValue::Null) {
                 continue;
             }
 
@@ -8903,12 +9007,12 @@ fn type_filter_matches(builtin: &Builtin, value: &OwnedValue) -> bool {
 ///   reached, and `5 | .a[empty] = 9` is `5` rather than an error.
 /// - The key stream is outer and the target stream inner, so
 ///   `path(.[("a","b")])` emits `["a"]` then `["b"]`.
-fn resolve_index_expr<S: EvalSemantics>(
+fn resolve_index_expr<'a, S: EvalSemantics>(
     target: &Expr,
     key: &Expr,
-    value: &OwnedValue,
+    value: &'a OwnedValue,
     optional: bool,
-) -> PathResolveResult {
+) -> PathResolveResult<'a> {
     let keys = eval_owned_multi::<S>(key, value).map_err(|e| (Vec::new(), e))?;
     if keys.is_empty() {
         return Ok(Vec::new());
@@ -8934,7 +9038,10 @@ fn resolve_index_expr<S: EvalSemantics>(
                 k,
                 OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..)
             ) && numeric_key_to_index(k).is_none()
-                && matches!(target_value, OwnedValue::Array(_) | OwnedValue::Null)
+                && matches!(
+                    target_value.as_ref(),
+                    OwnedValue::Array(_) | OwnedValue::Null
+                )
             {
                 return Err((out, EvalError::new("Cannot set array element at NaN index")));
             }
@@ -8962,7 +9069,7 @@ fn resolve_index_expr<S: EvalSemantics>(
             } else {
                 component
             });
-            out.push((path, next_value));
+            out.push((path, Cow::Owned(next_value)));
         }
     }
     Ok(out)
@@ -8986,13 +9093,13 @@ fn resolve_index_expr<S: EvalSemantics>(
 ///   bound (`Array/string slice indices must be integers` is not swallowed
 ///   either) — unlike [`resolve_index_expr`]'s `key_to_path_component`,
 ///   whose optional-gated type check is *not* the shape to copy here.
-fn resolve_slice_expr<S: EvalSemantics>(
+fn resolve_slice_expr<'a, S: EvalSemantics>(
     target: &Expr,
     start: &Option<Box<Expr>>,
     end: &Option<Box<Expr>>,
-    value: &OwnedValue,
+    value: &'a OwnedValue,
     optional: bool,
-) -> PathResolveResult {
+) -> PathResolveResult<'a> {
     let starts = resolve_slice_bound::<S>(start, value, f64::floor).map_err(|e| (Vec::new(), e))?;
     if starts.is_empty() {
         return Ok(Vec::new());
@@ -9022,7 +9129,7 @@ fn resolve_slice_expr<S: EvalSemantics>(
                 } else {
                     slice_expr.clone()
                 });
-                out.push((path, next_value));
+                out.push((path, Cow::Owned(next_value)));
             }
         }
     }
@@ -9083,7 +9190,10 @@ fn value_after_components<S: EvalSemantics>(
 /// *its* position, which is the document root only when it sits at the top of
 /// the path. `path(.x | .a[.k])` resolves `.k` against `.x`, giving
 /// `["x","a","a"]`.
-fn resolve_seq<S: EvalSemantics>(exprs: &[Expr], value: &OwnedValue) -> PathResolveResult {
+fn resolve_seq<'a, S: EvalSemantics>(
+    exprs: &[Expr],
+    value: &'a OwnedValue,
+) -> PathResolveResult<'a> {
     let mut flat = Vec::new();
     for e in exprs {
         push_path_components(&mut flat, e);
@@ -9096,7 +9206,7 @@ fn resolve_seq<S: EvalSemantics>(exprs: &[Expr], value: &OwnedValue) -> PathReso
     // `.a[.k].b`.
     let Some(last_dynamic) = flat.iter().rposition(needs_path_prepass) else {
         let end = value_after_components::<S>(&flat, value).map_err(|e| (Vec::new(), e))?;
-        return Ok(vec![(flat, end)]);
+        return Ok(vec![(flat, Cow::Owned(end))]);
     };
 
     // Fan out one pipe element at a time. Note this rebuilds `branches` stage
@@ -9111,11 +9221,15 @@ fn resolve_seq<S: EvalSemantics>(exprs: &[Expr], value: &OwnedValue) -> PathReso
     // simplification, not a byte-for-byte reproduction of jq's stream order;
     // the single-dynamic-element case (the overwhelmingly common one, and
     // the one every #530 sibling repro exercises) is exact.
-    let mut branches: Vec<PathBranch> = vec![(Vec::new(), value.clone())];
+    let mut branches: Vec<PathBranch<'a>> = vec![(Vec::new(), Cow::Borrowed(value))];
     for element in &flat[..=last_dynamic] {
         let mut next = Vec::new();
-        for (prefix, current) in &branches {
-            match resolve_node::<S>(element, current) {
+        // Consumes `branches` (not `&branches`) so each `current` arrives by
+        // value: only then can `resolve_against_cow` recover the branch's
+        // full `'a` when it's still `Cow::Borrowed`, rather than capping it
+        // at this loop iteration's own short borrow (#668).
+        for (prefix, current) in branches {
+            match resolve_against_cow::<S>(element, current) {
                 Ok(resolved) => {
                     for (components, resulting) in resolved {
                         let mut path = prefix.clone();
@@ -9139,9 +9253,17 @@ fn resolve_seq<S: EvalSemantics>(exprs: &[Expr], value: &OwnedValue) -> PathReso
     let tail = &flat[last_dynamic + 1..];
     let mut out = Vec::with_capacity(branches.len());
     for (mut prefix, current) in branches {
-        let end = match value_after_components::<S>(tail, &current) {
-            Ok(end) => end,
-            Err(e) => return Err((out, e)),
+        // A dynamic element as the pipe's last component (e.g. `.a[.k]`) is
+        // the common shape here, and leaves `tail` empty — reuse `current`
+        // directly rather than paying `value_after_components`'s own
+        // unconditional clone-then-return-unchanged for a no-op walk.
+        let end: Cow<'a, OwnedValue> = if tail.is_empty() {
+            current
+        } else {
+            match value_after_components::<S>(tail, &current) {
+                Ok(end) => Cow::Owned(end),
+                Err(e) => return Err((out, e)),
+            }
         };
         prefix.extend_from_slice(tail);
         out.push((prefix, end));
@@ -9171,7 +9293,7 @@ fn resolve_dynamic_indexes<S: EvalSemantics>(
         return Ok(vec![expr.clone()]);
     }
 
-    fn assemble(branches: Vec<PathBranch>) -> Vec<Expr> {
+    fn assemble(branches: Vec<PathBranch<'_>>) -> Vec<Expr> {
         branches
             .into_iter()
             .map(|(components, _)| {
