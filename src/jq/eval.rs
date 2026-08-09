@@ -1001,11 +1001,19 @@ fn eval_owned_expr_fork<S: EvalSemantics>(
 
 /// Finalize a fork/fold construct's accumulated `outputs`, given an optional
 /// terminating `Control` (#534). Mirrors `partial()`'s "outputs already
-/// produced don't vanish" contract (#400, #494), plus `?`'s: verified
-/// against jq, `(1, error("x"), 2)?` still emits `1` — an optional context
-/// keeps a construct's own legitimate prior output and only silences the
-/// trailing error, it does not discard everything. A `Break` is never
-/// caught by `?`, so it always propagates via `partial`.
+/// produced don't vanish" contract (#400, #494): an optional context keeps
+/// a construct's own legitimate prior output and only silences a trailing
+/// `Error`, it does not discard everything.
+///
+/// A `Break` always propagates via `partial` here, uncaught by `optional`.
+/// That is *not* what real jq does — `label $out | (1, (reduce (1,2) as $x
+/// (0; break $out))?, 4)` gives jq's `1`, `4` (its `?` does swallow an
+/// escaping `break` whose matching `label` sits outside it) — but this
+/// codebase's `?`/`try` machinery doesn't catch a `break` anywhere else
+/// either (`Expr::Optional`'s own dispatch has the identical gap, confirmed
+/// reproducible on `main`, i.e. predating #534). This function deliberately
+/// stays consistent with that pre-existing, cross-cutting limitation rather
+/// than fixing it in isolation for just these four constructs.
 fn finish_fork<'a, W>(
     outputs: Vec<OwnedValue>,
     control: Option<Control>,
@@ -10199,6 +10207,12 @@ fn eval_foreach<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             QueryResult::Owned(v) => (vec![v], None),
             QueryResult::ManyOwned(vs) => (vs, None),
             QueryResult::None => (Vec::new(), None),
+            // An immediate (non-`Partial`) error has no prefix to salvage,
+            // so `?` suppresses it the same way `eval_reduce`'s equivalent
+            // arm already does — this one was missing it, letting an
+            // ambient `?` fail to catch an error in the source stream
+            // (#534 follow-up).
+            QueryResult::Error(_) if optional => return QueryResult::None,
             QueryResult::Error(e) => return QueryResult::Error(e),
             QueryResult::Break(label) => return QueryResult::Break(label),
             QueryResult::Partial(vs, control) => (vs, Some(control)),
@@ -10217,6 +10231,9 @@ fn eval_foreach<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             QueryResult::Owned(v) => (vec![v], None),
             QueryResult::ManyOwned(vs) => (vs, None),
             QueryResult::None => (Vec::new(), None),
+            // Same missing-guard fix as the source stream above, mirroring
+            // `eval_reduce`'s INIT handling.
+            QueryResult::Error(_) if optional => return QueryResult::None,
             QueryResult::Error(e) => return QueryResult::Error(e),
             QueryResult::Break(label) => return QueryResult::Break(label),
             QueryResult::Partial(vs, control) => (vs, Some(control)),
@@ -10264,18 +10281,26 @@ fn eval_foreach<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 break;
             }
         }
+        // The source stream's own trailing control belongs to *this* fork
+        // too, not just whichever fork happens to run last (#534 follow-up):
+        // jq's search hits it while advancing this fork's own iteration over
+        // `input`, aborting the entire foreach before any untried INIT fork
+        // is ever attempted. Deferring it until after every fork had already
+        // run let later, never-should-have-started forks contribute output
+        // jq never produces — verified: `foreach (1,2,error("x")) as $x
+        // ((10,20); .+$x)` is `11`, `13`, then the error; the second INIT
+        // fork (`20`) is never reached, whereas the old code tried it anyway.
+        let aborted = aborted.or_else(|| input_control.clone());
         if let Some(control) = aborted {
             return finish_fork(outputs, Some(control), optional);
         }
     }
 
-    // Neither stream's own trailing control is independently verified
-    // against jq when *both* fire alongside multi-way INIT forking — an
-    // untested corner case. `input_control` (the source stream) keeps
-    // priority as the pre-existing, already-established policy for this
-    // function; `init_control` is only reached once every INIT fork's own
-    // loop has finished without one of its own.
-    finish_fork(outputs, input_control.or(init_control), optional)
+    // Only reachable with zero INIT forks (`init_values` empty): every
+    // non-empty fork above already resolves `input_control` itself before
+    // this point, so there is nothing left to apply here except INIT's own
+    // trailing control.
+    finish_fork(outputs, init_control, optional)
 }
 
 /// Evaluate `limit(n; expr)` - take first n outputs.
@@ -10527,38 +10552,73 @@ fn eval_until<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// (true,false) then "T" else "F" end]` is `["T","F"]`). Verified against
 /// jq: `[until(.>3; .+1,.+2)]` on `null` is `[4,5,4,4,5,4,5,4]`, matching
 /// this recursion hand-traced as a tree.
+///
+/// The overwhelmingly common case — a single-output `cond`/`update` at every
+/// step, i.e. every `until` expressible before #534 — loops in place instead
+/// of recursing: a purely recursive version used native stack depth
+/// proportional to the number of steps, so a plain, non-forking
+/// `until(. >= 5000; . + 1)` could already overflow the stack in a debug
+/// build (a flat loop never could, at any step count). Recursion is now
+/// reserved for the genuinely branching case, where depth tracks how much
+/// the query actually forks rather than how many steps it runs — the same
+/// residual depth risk jq's own backtracking-generator implementation has
+/// for a pathologically all-forking loop, not a regression this rewrite
+/// introduces for ordinary queries. Follow-up: #534 efficiency issue tracks
+/// this alongside the `WHILE_UNTIL_MAX_STEPS` cap's other rough edges.
 fn until_step<S: EvalSemantics>(
     cond: &Expr,
     update: &Expr,
-    state: OwnedValue,
+    mut state: OwnedValue,
     optional: bool,
     outputs: &mut Vec<OwnedValue>,
     budget: &mut usize,
 ) -> Result<(), Control> {
-    if *budget == 0 {
-        return Err(Control::Error(EvalError::new(
-            "until: maximum iterations exceeded",
-        )));
-    }
-    *budget -= 1;
+    loop {
+        if *budget == 0 {
+            return Err(Control::Error(EvalError::new(
+                "until: maximum iterations exceeded",
+            )));
+        }
+        *budget -= 1;
 
-    let (cond_vals, cond_control) = eval_owned_expr_fork::<S>(cond, &state, optional);
-    for cond_val in &cond_vals {
-        if cond_val.is_truthy() {
-            outputs.push(state.clone());
-        } else {
+        let (cond_vals, cond_control) = eval_owned_expr_fork::<S>(cond, &state, optional);
+
+        // Fast path: exactly one falsy `cond` output and exactly one
+        // `update` output — continue the loop in place rather than
+        // recursing, so this step costs no stack depth.
+        if cond_control.is_none() && cond_vals.len() == 1 && !cond_vals[0].is_truthy() {
             let (update_vals, update_control) = eval_owned_expr_fork::<S>(update, &state, optional);
+            if update_control.is_none() && update_vals.len() == 1 {
+                state = update_vals.into_iter().next().unwrap();
+                continue;
+            }
             for update_val in update_vals {
                 until_step::<S>(cond, update, update_val, optional, outputs, budget)?;
             }
-            if let Some(control) = update_control {
-                return Err(control);
+            return match update_control {
+                Some(control) => Err(control),
+                None => Ok(()),
+            };
+        }
+
+        for cond_val in &cond_vals {
+            if cond_val.is_truthy() {
+                outputs.push(state.clone());
+            } else {
+                let (update_vals, update_control) =
+                    eval_owned_expr_fork::<S>(update, &state, optional);
+                for update_val in update_vals {
+                    until_step::<S>(cond, update, update_val, optional, outputs, budget)?;
+                }
+                if let Some(control) = update_control {
+                    return Err(control);
+                }
             }
         }
-    }
-    match cond_control {
-        Some(control) => Err(control),
-        None => Ok(()),
+        return match cond_control {
+            Some(control) => Err(control),
+            None => Ok(()),
+        };
     }
 }
 
@@ -10589,45 +10649,69 @@ fn eval_while<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
 /// Recursive step for [`eval_while`] (#534): `E(s) = if cond(s) is truthy:
 /// emit(s), then fork over update(s)'s outputs, recursing into each; else:
-/// nothing`. See [`until_step`] for the `cond`-forking rationale, shared
-/// here. Verified against jq: `[while(.<3; .+1,.+2)]` on `null` is
-/// `[null,1,2,2]`, matching this recursion hand-traced as a tree.
+/// nothing`. See [`until_step`] for the `cond`-forking rationale and the
+/// iterative fast path's stack-safety rationale, both shared here. Verified
+/// against jq: `[while(.<3; .+1,.+2)]` on `null` is `[null,1,2,2]`, matching
+/// this recursion hand-traced as a tree.
 fn while_step<S: EvalSemantics>(
     cond: &Expr,
     update: &Expr,
-    state: OwnedValue,
+    mut state: OwnedValue,
     optional: bool,
     outputs: &mut Vec<OwnedValue>,
     budget: &mut usize,
 ) -> Result<(), Control> {
-    if *budget == 0 {
-        // Matches this construct's own pre-existing cap; previously a
-        // silent truncation with no error at all, but now goes through
-        // `finish_fork` at the call site like every other termination
-        // cause, so `outputs` gathered before the cap no longer vanish
-        // (deliberate minor behavior change — not pinned by any test).
-        return Err(Control::Error(EvalError::new(
-            "while: maximum iterations exceeded",
-        )));
-    }
-    *budget -= 1;
+    loop {
+        if *budget == 0 {
+            // Matches this construct's own pre-existing cap; previously a
+            // silent truncation with no error at all, but now goes through
+            // `finish_fork` at the call site like every other termination
+            // cause, so `outputs` gathered before the cap no longer vanish
+            // (deliberate minor behavior change — not pinned by any test).
+            return Err(Control::Error(EvalError::new(
+                "while: maximum iterations exceeded",
+            )));
+        }
+        *budget -= 1;
 
-    let (cond_vals, cond_control) = eval_owned_expr_fork::<S>(cond, &state, optional);
-    for cond_val in &cond_vals {
-        if cond_val.is_truthy() {
+        let (cond_vals, cond_control) = eval_owned_expr_fork::<S>(cond, &state, optional);
+
+        // Fast path: exactly one truthy `cond` output and exactly one
+        // `update` output — continue the loop in place rather than
+        // recursing, so this step costs no stack depth (see [`until_step`]).
+        if cond_control.is_none() && cond_vals.len() == 1 && cond_vals[0].is_truthy() {
             outputs.push(state.clone());
             let (update_vals, update_control) = eval_owned_expr_fork::<S>(update, &state, optional);
+            if update_control.is_none() && update_vals.len() == 1 {
+                state = update_vals.into_iter().next().unwrap();
+                continue;
+            }
             for update_val in update_vals {
                 while_step::<S>(cond, update, update_val, optional, outputs, budget)?;
             }
-            if let Some(control) = update_control {
-                return Err(control);
+            return match update_control {
+                Some(control) => Err(control),
+                None => Ok(()),
+            };
+        }
+
+        for cond_val in &cond_vals {
+            if cond_val.is_truthy() {
+                outputs.push(state.clone());
+                let (update_vals, update_control) =
+                    eval_owned_expr_fork::<S>(update, &state, optional);
+                for update_val in update_vals {
+                    while_step::<S>(cond, update, update_val, optional, outputs, budget)?;
+                }
+                if let Some(control) = update_control {
+                    return Err(control);
+                }
             }
         }
-    }
-    match cond_control {
-        Some(control) => Err(control),
-        None => Ok(()),
+        return match cond_control {
+            Some(control) => Err(control),
+            None => Ok(()),
+        };
     }
 }
 
@@ -22195,6 +22279,58 @@ mod tests {
         );
     }
 
+    /// `reduce`'s INIT/UPDATE slots now accept a top-level comma (#534): the
+    /// parser previously rejected these outright, so this pins the
+    /// evaluator's actual fanout/fold behavior now that it's reachable.
+    #[test]
+    fn test_reduce_comma_slots() {
+        // UPDATE-comma: only the last output of each step becomes the next
+        // accumulator (verified against jq 1.7.1: `0`).
+        assert_eq!(outputs(b"[1,2,3]", "reduce .[] as $x (0; .+$x, .)"), ["0"]);
+
+        // INIT-comma: each INIT output independently forks the whole
+        // reduce, re-running over the *same* source stream. Real jq 1.7.1
+        // diverges here for a reason unrelated to this evaluator: its own
+        // bytecode re-enters `SOURCE` on the second INIT fork with `.`
+        // already clobbered by the first fork's own iteration (`jq -n
+        // 'reduce .[] as $x (0,1; .+$x)' <<<'[1,2,3]'` prints `6` then
+        // errors "Cannot iterate over null"). This codebase's INIT-forking
+        // doesn't share that quirk — pinning succinctly's own consistent
+        // value here, not jq's, so a future refactor doesn't silently
+        // change it either way without a failing test to flag it.
+        assert_eq!(
+            outputs(b"[1,2,3]", "reduce .[] as $x (0,1; .+$x)"),
+            ["6", "7"]
+        );
+    }
+
+    /// `foreach`'s INIT/UPDATE/EXTRACT slots now accept a top-level comma
+    /// (#534) — same parser widening as `reduce` above.
+    #[test]
+    fn test_foreach_comma_slots() {
+        // UPDATE-comma, no EXTRACT: every UPDATE output is emitted (not
+        // folded), and the *last* one carries forward as the next state
+        // (verified against jq 1.7.1: `1,0,2,0,3,0`).
+        assert_eq!(
+            outputs(b"[1,2,3]", "foreach .[] as $x (0; .+$x, .)"),
+            ["1", "0", "2", "0", "3", "0"]
+        );
+
+        // EXTRACT-comma: EXTRACT's own outputs fan out per step (verified
+        // against jq 1.7.1: `1,2,3,6,6,12`).
+        assert_eq!(
+            outputs(b"[1,2,3]", "foreach .[] as $x (0; .+$x; ., .*2)"),
+            ["1", "2", "3", "6", "6", "12"]
+        );
+
+        // INIT-comma: same jq-engine-quirk divergence as `reduce` above
+        // (jq prints `1,3,6` then errors; pinning succinctly's own value).
+        assert_eq!(
+            outputs(b"[1,2,3]", "foreach .[] as $x (0,1; .+$x)"),
+            ["1", "3", "6", "2", "4", "7"]
+        );
+    }
+
     #[test]
     fn test_range() {
         // range(n) - generates 0 to n-1
@@ -22328,6 +22464,44 @@ mod tests {
                     OwnedValue::Int(8),
                 ]);
             }
+        );
+    }
+
+    /// `until`'s COND/UPDATE slots now accept a top-level comma (#534) —
+    /// each additional `cond`/`update` output forks the rest of the
+    /// backtracking search, verified against jq 1.7.1.
+    #[test]
+    fn test_until_comma_slots() {
+        // UPDATE-comma: a 2-output UPDATE forks the remaining search once
+        // per output (verified against jq 1.7.1: `1,10`).
+        assert_eq!(outputs(b"0", "until(.>=1; .+1,.+10)"), ["1", "10"]);
+
+        // COND-comma: a 2-output COND runs each output as its own
+        // independent branch against the same state — both are truthy at
+        // every state visited here, and each duplicates the branches below
+        // it, so the final state (`1`) is emitted 4 times (verified against
+        // jq 1.7.1).
+        assert_eq!(
+            outputs(b"0", "until((.>=1,.>=1); .+1)"),
+            ["1", "1", "1", "1"]
+        );
+    }
+
+    /// `while`'s COND/UPDATE slots now accept a top-level comma (#534) —
+    /// same fanout rule as `until` above.
+    #[test]
+    fn test_while_comma_slots() {
+        // UPDATE-comma: forks the rest of the loop per output (verified
+        // against jq 1.7.1: `0,1` — the `.+10` branch immediately fails
+        // `cond` and contributes nothing further).
+        assert_eq!(outputs(b"0", "while(.<2; .+1,.+10)"), ["0", "1"]);
+
+        // COND-comma: matches the already-pinned `while_cond_forks` golden
+        // case's shape (`tests/data/jq-golden/cases/while_cond_forks`), kept
+        // here too as a fast, in-tree eval-level regression alongside it.
+        assert_eq!(
+            outputs(b"null", "[while((.<3,.<1); .+1)]"),
+            [r"[null,1,2,null,1,2]"]
         );
     }
 
