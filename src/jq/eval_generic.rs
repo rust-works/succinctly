@@ -73,6 +73,23 @@ pub fn to_owned<V: DocumentValue>(value: &V) -> OwnedValue {
     }
 }
 
+/// Materialize a key/slice-bound candidate just enough to classify it.
+///
+/// Mirrors `eval::to_owned_key_shape` (#626/#670): `index_one_generic`'s
+/// Array/Object rejection and `slice::bound`'s non-numeric rejection never
+/// inspect a candidate's *contents*, only its shape, so a full recursive
+/// `to_owned` of a large navigated container is pure waste when it can only
+/// ever be rejected on type (#669).
+fn to_owned_key_shape<V: DocumentValue>(value: &V) -> OwnedValue {
+    if value.is_array() {
+        OwnedValue::Array(Vec::new())
+    } else if value.is_object() {
+        OwnedValue::Object(IndexMap::new())
+    } else {
+        to_owned(value)
+    }
+}
+
 /// Materialize a `GenericResult::LazyKeys` fallback: decode every key exactly
 /// as eager `Builtin::Keys`/`Builtin::KeysUnsorted` did before either stayed
 /// lazy, sorting first iff `sorted` (#683).
@@ -1698,6 +1715,12 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
         // truncate to its prefix (#694) -- mirrors the target match below.
         GenericResult::Partial(_, Control::Error(e)) => return GenericResult::Error(e),
         GenericResult::Partial(_, Control::Break(label)) => return GenericResult::Break(label),
+        GenericResult::One(v) => vec![to_owned_key_shape(&v)],
+        GenericResult::OneCursor(c) => vec![to_owned_key_shape(&c.value())],
+        GenericResult::Many(vs) => vs.iter().map(to_owned_key_shape).collect(),
+        GenericResult::ManyCursor(cs) => {
+            cs.iter().map(|c| to_owned_key_shape(&c.value())).collect()
+        }
         other => other.collect_owned(),
     };
     if keys.is_empty() {
@@ -1902,6 +1925,12 @@ fn eval_slice_bound<S: EvalSemantics, V: DocumentValue>(
         GenericResult::Break(label) => return Err(Control::Break(label)),
         GenericResult::None => return Ok(Vec::new()),
         GenericResult::Partial(_, control) => return Err(control),
+        GenericResult::One(v) => vec![to_owned_key_shape(&v)],
+        GenericResult::OneCursor(c) => vec![to_owned_key_shape(&c.value())],
+        GenericResult::Many(vs) => vs.iter().map(to_owned_key_shape).collect(),
+        GenericResult::ManyCursor(cs) => {
+            cs.iter().map(|c| to_owned_key_shape(&c.value())).collect()
+        }
         other => other.collect_owned(),
     };
     raw.iter()
@@ -5900,6 +5929,90 @@ mod tests {
         assert_eq!(
             summarize(b"[[7],[8]]", "(.[0],(.[1],break $out))[(0+0):2]"),
             Summary::Break("out".to_string())
+        );
+    }
+
+    #[test]
+    fn test_computed_index_key_bare_one_and_many_via_cursor_less_entry() {
+        // `eval_index_expr`'s key match has a `One`/`Many` arm alongside its
+        // `OneCursor`/`ManyCursor` ones (#699 coverage gap): a key stream
+        // whose values aren't attached to any cursor at all, not just one
+        // whose per-element cursor was dropped. That only happens when the
+        // *ambient* ("." at the point the whole `IndexExpr` is evaluated)
+        // cursor is `None` to begin with -- i.e. entering through the
+        // cursor-less `eval()`/`eval_using()` API (as plenty of this
+        // module's own tests do, e.g. `test_generic_identity` above) rather
+        // than `eval_with_cursor()`. `Expr::Identity` under a `None` ambient
+        // cursor returns bare `One(value)`; `select(true,true)` (whose
+        // `pass_n` also forwards the ambient cursor) returns bare `Many`.
+        let json = b"0";
+        let index = JsonIndex::build(json);
+        let value = index.root(json).value();
+
+        let expr = crate::jq::parse("([10,20,30])[.]").unwrap();
+        assert_eq!(
+            eval(&expr, value.clone()).collect_owned(),
+            vec![OwnedValue::Int(10)]
+        );
+
+        let expr = crate::jq::parse("([10,20,30])[select(true,true)]").unwrap();
+        assert_eq!(
+            eval(&expr, value).collect_owned(),
+            vec![OwnedValue::Int(10), OwnedValue::Int(10)]
+        );
+    }
+
+    #[test]
+    fn test_computed_slice_bound_bare_one_and_many_via_cursor_less_entry() {
+        // Mirrors the `eval_index_expr` key case directly above, but for
+        // `eval_slice_bound`'s own `One`/`Many` arms (#699 coverage gap) --
+        // same cursor-less-entry mechanism, same `.`/`select(true,true)`
+        // bound expressions, just feeding a slice's start bound instead of
+        // an index key.
+        let json = b"0";
+        let index = JsonIndex::build(json);
+        let value = index.root(json).value();
+
+        let expr = crate::jq::parse("([10,20,30])[.:2]").unwrap();
+        assert_eq!(
+            eval(&expr, value.clone()).collect_owned(),
+            vec![OwnedValue::Array(vec![
+                OwnedValue::Int(10),
+                OwnedValue::Int(20)
+            ])]
+        );
+
+        let expr = crate::jq::parse("([10,20,30])[select(true,true):2]").unwrap();
+        assert_eq!(
+            eval(&expr, value).collect_owned(),
+            vec![
+                OwnedValue::Array(vec![OwnedValue::Int(10), OwnedValue::Int(20)]),
+                OwnedValue::Array(vec![OwnedValue::Int(10), OwnedValue::Int(20)]),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_computed_slice_bound_many_cursor() {
+        // `eval_slice_bound`'s `ManyCursor` arm (#699 coverage gap): unlike
+        // the `One`/`Many` cases above, this needs no cursor-less trickery --
+        // `.starts[]` iterating a real document array yields cursors
+        // regardless of the ambient cursor, so a normal `eval_with_cursor`
+        // call reaches it directly.
+        let json = br#"{"arr":[1,2,3,4,5],"starts":[0,1]}"#;
+        let index = JsonIndex::build(json);
+        let expr = crate::jq::parse(".arr[.starts[]:3]").unwrap();
+
+        assert_eq!(
+            eval_with_cursor(&expr, index.root(json)).collect_owned(),
+            vec![
+                OwnedValue::Array(vec![
+                    OwnedValue::Int(1),
+                    OwnedValue::Int(2),
+                    OwnedValue::Int(3)
+                ]),
+                OwnedValue::Array(vec![OwnedValue::Int(2), OwnedValue::Int(3)]),
+            ]
         );
     }
 }
