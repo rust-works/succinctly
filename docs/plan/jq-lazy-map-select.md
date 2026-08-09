@@ -85,7 +85,8 @@ them:
   observing every key before emitting the first one — a different complexity class, not a
   narrower version of the same problem. Falls back to the eager path indefinitely; this does
   not contradict the "general" scope decision above.
-- **YAML merge-key mappings** (`YamlFields::Merged`, already eager today). Stays eager;
+- **YAML merge-key mappings** (`YamlFields`'s private `FieldsInner::Merged`, already eager
+  today). Stays eager;
   forcing it lazy conflicts with the forward-only constraint below.
 - **Recursive laziness** (`map(map(f))` where the *inner* `map` also stays lazy),
   **`map_values`**, and **any backward/lookahead access on YAML**.
@@ -96,22 +97,33 @@ JSON tolerates real random access cheaply (interest-bit rank/select, O(log n) wo
 penalty for jumping around). YAML does not — `AdvancePositions`/`CompactEndPositions`
 (`src/yaml/advance_positions.rs`, `src/yaml/end_positions.rs`) keep one document-wide
 *sequential* cursor optimized for monotonically-increasing access; any backward/out-of-order
-access falls to `get_random`, which resets the incremental scan to position zero, penalizing
-whatever sequential access follows.
+access falls to `get_random`. As of the O1/O2 optimizations (issue #74), `get_random` does
+*not* reset the scan to position zero — it resumes the cursor from the jump point via an O(1)
+rank-directory lookup plus a bounded sampled-select scan (`end_positions.rs:419-449`,
+`advance_positions.rs` equivalent), specifically to avoid the O(n²) pathology a zero-reset
+would cause. But each such jump still pays a real, nonzero per-call cost that a pure
+sequential walk avoids entirely, and repeated jump/rewind patterns forfeit the amortized O(1)
+benefit `get_sequential` is documented to have. More fundamentally, the cons-list traits this
+design builds on (`DocumentFields`/`DocumentElements`, below) have no backward-moving method
+at all — `uncons()` only ever consumes forward and returns "the rest" as a new `Self`. Any
+design that needed backward access would have to route around those traits entirely, not
+merely pay a performance tax.
 
 **The design must be forward-only, single-pass, with no buffering of earlier elements.** This
-is a hard constraint, not a nice-to-have — a violation is invisible in JSON-only benchmarks
-and only shows up as a YAML-specific regression, the same category of trap this repo's
-benchmarking discipline (`docs/guides/benchmarking.md`) already warns about for
-memory-bound effects across architectures.
+is a hard constraint, not a nice-to-have — both because it matches the underlying traits'
+forward-only contract and because a violation is invisible in JSON-only benchmarks and only
+shows up as a YAML-specific regression, the same category of trap this repo's benchmarking
+discipline (`docs/guides/benchmarking.md`) already warns about for memory-bound effects across
+architectures.
 
 ## Building blocks already in the codebase
 
 `src/jq/document.rs`'s `DocumentFields`/`DocumentElements` traits expose cons-list `uncons()`
 (pop one, return "the rest" as a new `Self`) — genuinely lazy per-step for both JSON
 (`JsonFields`/`JsonElements`, thin `Copy` wrappers over a BP cursor, `src/json/light.rs`) and
-YAML (`YamlFields`/`YamlElements`, same, except merge-key mappings which are already-eager
-and `Rc`-shared, `src/yaml/light.rs`). These traits are **not dyn-compatible** (`Self: Sized`
+YAML (`YamlFields`/`YamlElements`, `src/yaml/light.rs` — `Clone` but not `Copy`, since a field
+walk may hold an `Rc`-shared, already-eagerly-resolved merge-key entry list rather than a bare
+cursor). These traits are **not dyn-compatible** (`Self: Sized`
 bounds throughout, several methods return `Self` by value) — the design below stays in fully
 static generics, no `Box<dyn Iterator>`.
 
