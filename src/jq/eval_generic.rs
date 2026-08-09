@@ -188,14 +188,17 @@ fn eval_on_owned<S: EvalSemantics, V: DocumentValue>(
     let index = JsonIndex::build(json_bytes);
     let cursor = index.root(json_bytes);
 
-    let wrapped;
-    let expr = if optional {
-        wrapped = Expr::Optional(Box::new(expr.clone()));
-        &wrapped
-    } else {
-        expr
-    };
-
+    // No `if optional { wrap in Expr::Optional }` here: every public entry
+    // point (`eval`/`eval_using`/`eval_with_cursor`/`eval_with_cursor_using`)
+    // starts a fresh evaluation at `optional = false`, and after #693 the
+    // only place this module ever forces `optional = true` is the
+    // `IndexExpr`/`SliceExpr` special case in `eval_single`'s `Expr::
+    // Optional` arm — which only threads it into `index_one_generic`/
+    // `slice_one_generic`/`index_owned_by_key`, never into a call that
+    // reaches this function. So `optional` is always `false` here; an
+    // `Error` this bridge returns is caught, if at all, by the *caller's*
+    // own `Expr::Optional`/`eval_try`-style boundary, not by wrapping it a
+    // second time here.
     match full_eval::<Vec<u64>, S>(expr, cursor) {
         QueryResult::One(v) => GenericResult::Owned(standard_json_to_owned(&v)),
         QueryResult::OneCursor(c) => GenericResult::Owned(standard_json_to_owned(&c.value())),
@@ -895,9 +898,17 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                 // errored while `null | .[$n]` — the same query, and the same
                 // rule in `index_one_generic` — returned null.
                 GenericResult::Owned(OwnedValue::Null)
-            } else if optional {
-                GenericResult::None
             } else {
+                // No `optional`-guarded arm here (unlike `index_one_generic`,
+                // the computed-key sibling this literal `.[N]` form doesn't
+                // share code with): `.[N]?` parses straight to
+                // `Expr::Optional(Expr::Index(N))`, which isn't
+                // `IndexExpr`/`SliceExpr`, so #693's dispatch never forces
+                // `optional = true` into this arm — it evaluates `Expr::
+                // Index` at the ambient `optional` (normally `false`) and
+                // lets the outer `Expr::Optional`/`eval_try`-style catch
+                // convert the resulting `Error` to `None` once, same
+                // externally-observable result via a different path.
                 GenericResult::Error(EvalError::cannot_index_with_type(
                     value.type_name(),
                     "number",
@@ -1480,21 +1491,17 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
             let index = JsonIndex::build(json_bytes);
             let cursor = index.root(json_bytes);
 
-            // The full evaluator always starts a fresh `eval()` with
-            // `optional = false`, so an ambient `optional = true` here (e.g.
-            // `(.a + .b)?`, `first(.[])?`) would otherwise be silently
-            // dropped at this bridge instead of suppressing the error, as it
-            // does for the natively-handled arms above. Re-wrap in
-            // `Expr::Optional` so the full evaluator's own (nuanced) handling
-            // of `?` sees it, same as the `eval_on_owned` builtin-fallback
-            // bridge below (#367, #386).
-            let wrapped;
-            let expr = if optional {
-                wrapped = Expr::Optional(Box::new(expr.clone()));
-                &wrapped
-            } else {
-                expr
-            };
+            // No `if optional { wrap in Expr::Optional }` here (see
+            // `eval_on_owned`'s matching comment): this `_` arm is only
+            // reached when `expr` itself isn't one of the natively-matched
+            // variants above, and after #693 the only way this function
+            // (`eval_single`) is ever called with `optional = true` is the
+            // `IndexExpr`/`SliceExpr` special case a few arms up — which
+            // matches *before* falling through to this wildcard, so it never
+            // lands here. Every other caller threads the ambient `optional`,
+            // which starts `false` at every public entry point. Whatever
+            // `Error` `full_eval` returns below is caught, if at all, by the
+            // *caller's* own `Expr::Optional`/`eval_try`-style boundary.
 
             // Evaluate using the full evaluator
             match full_eval::<Vec<u64>, S>(expr, cursor) {
@@ -1991,12 +1998,19 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
 
             match cond_control {
                 None => pass_n(truthy_count),
-                // `select(...)? ` swallows the condition's error the same
-                // way `try select(...) catch empty` would — per #400/#494,
-                // that keeps whatever the truthy bits already produced
-                // rather than discarding it too. `break` always propagates,
-                // `optional` or not.
-                Some(Control::Error(_)) if optional => pass_n(truthy_count),
+                // No `optional`-guarded arm here: `eval_builtin`'s own
+                // `optional` (as opposed to `cond`'s, which is hardcoded
+                // `false` above regardless) is never `true` for
+                // `Builtin::Select` after #693 — `select(...)?` isn't
+                // `IndexExpr`/`SliceExpr`, so it goes through the generic
+                // `Expr::Optional`/`eval_try`-style catch below at the
+                // *ambient* `optional`, not a forced one. That catch takes
+                // the `Partial` this arm below still constructs and keeps
+                // only its prefix — cursor-preserving `pass_n(truthy_count)`
+                // would have been the more precise answer (line/column
+                // survive on the already-produced outputs), but nothing can
+                // observe the difference: reinstate it if some future
+                // dispatch path starts forcing `optional = true` here.
                 Some(control) => {
                     let prefix: Vec<OwnedValue> = match cursor {
                         Some(c) => core::iter::repeat_with(|| to_owned(&c.value()))
@@ -2248,9 +2262,13 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                     f = rest;
                 }
                 GenericResult::Owned(OwnedValue::Array(entries))
-            } else if optional {
-                GenericResult::None
             } else {
+                // No `optional`-guarded arm here: `Builtin::ToEntries` isn't
+                // `IndexExpr`/`SliceExpr`, so #693's dispatch never forces
+                // `optional = true` into this native arm — `to_entries?`
+                // evaluates it at the ambient `optional` (normally `false`)
+                // and lets the outer `Expr::Optional`/`eval_try`-style catch
+                // convert the resulting `Error` to `None` once instead.
                 GenericResult::Error(EvalError::has_no_keys(&to_owned(&value)))
             }
         }

@@ -23175,6 +23175,96 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_isvalid_reaches_every_builtins_own_optional_guard() {
+        // `isvalid(EXPR)` is the one surviving construct that still evaluates
+        // `EXPR` with `optional` forced `true` for the whole subtree
+        // (`builtin_isvalid` does this deliberately, not by accident: without
+        // it, a fork construct — comma/reduce/foreach — that errors partway
+        // through would come back as `Partial`, which `isvalid`'s own
+        // three-arm match doesn't special-case and would wrongly count as
+        // "valid"). Every other route to `optional = true` was removed by
+        // #693 — `E?`/`try E` now evaluate `E` with the *ambient* `optional`
+        // and catch the aggregate result once via `eval_try`, rather than
+        // broadcasting `true` down the whole subtree the way the pre-#693
+        // bug did. That leaves each of these builtins' own internal
+        // `_ if optional => ...` arm reachable only through `isvalid`, so
+        // this is regression coverage for #698 (indirect coverage lost by
+        // #693's fix, all of it real behavior — `isvalid` correctly
+        // reporting `false` — not dead code): pin one case per remaining
+        // caller so a future refactor can't silently make `isvalid` stop
+        // noticing one of these error shapes.
+        for expr in [
+            "isvalid(.[])",
+            "isvalid(keys)",
+            "isvalid(keys_unsorted)",
+            r#"isvalid(contains("a"))"#,
+            r#"isvalid(inside("a"))"#,
+            "isvalid(bsearch(2))",
+        ] {
+            query!(br"1", expr,
+                QueryResult::Owned(OwnedValue::Bool(false)) => {}
+            );
+        }
+
+        // The `@format` builtins' own `_ if optional` arm is unlike the
+        // others above: it doesn't produce `None`, it produces `Ok(String::
+        // new())` — under `optional`, a value the format can't handle
+        // renders as `""` rather than failing at all, so `isvalid` sees a
+        // genuine success and reports `true`, not `false`.
+        for expr in [
+            "isvalid(@urid)",
+            "isvalid(@csv)",
+            "isvalid(@tsv)",
+            r#"isvalid(@dsv("|"))"#,
+            "isvalid(@base64)",
+            "isvalid(@base64d)",
+        ] {
+            query!(br"1", expr,
+                QueryResult::Owned(OwnedValue::Bool(true)) => {}
+            );
+        }
+
+        // `error(...)` itself.
+        query!(br"1", r#"isvalid(error("x"))"#,
+            QueryResult::Owned(OwnedValue::Bool(false)) => {}
+        );
+
+        // Assignment/update/del: the write-time path traversal fails one
+        // level down (`.a` is `1`, not an object, so `.b` can't be written
+        // into it), and `set_path`/`update_path`/`delete_at_path` have no
+        // `optional` of their own — it's `eval_assign`/`eval_update`/
+        // `builtin_del`'s *own* ambient `optional` (forced by `isvalid`)
+        // that decides whether the failure is swallowed.
+        for expr in [
+            "isvalid(.a.b = 5)",
+            r#"isvalid(.a |= error("x"))"#,
+            "isvalid(del(.a.b))",
+        ] {
+            query!(br#"{"a":1}"#, expr,
+                QueryResult::Owned(OwnedValue::Bool(false)) => {}
+            );
+        }
+
+        // reduce/foreach: `limit(-1; 1)` errors unconditionally (it has no
+        // `optional` arm of its own), so it's the one construct that can
+        // still leak a genuine `Error`/`Partial` control past a leaf's own
+        // self-suppression and into `eval_reduce`/`eval_foreach`/
+        // `finish_fork`'s own optional-guards, one per INIT/SOURCE/fork-loop
+        // site.
+        for expr in [
+            "isvalid(reduce (1,2) as $x (0; limit(-1;1)))",
+            "isvalid(reduce (1,2) as $x (limit(-1;1); .+$x))",
+            "isvalid(reduce (1,2) as $x ((1,limit(-1;1)); .+$x))",
+            "isvalid(foreach limit(-1;1) as $x (0; .+$x))",
+            "isvalid(foreach (1,2) as $x (limit(-1;1); .+$x))",
+        ] {
+            query!(br"1", expr,
+                QueryResult::Owned(OwnedValue::Bool(false)) => {}
+            );
+        }
+    }
+
     // =========================================================================
     // Phase 9 Tests: Destructuring and Function Definitions
     // =========================================================================
