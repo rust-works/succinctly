@@ -22487,6 +22487,239 @@ mod tests {
         );
     }
 
+    // The #534/#692 fork-control rewrite added several branches — INIT/INPUT
+    // materialization arms in `eval_reduce`/`eval_foreach`, `eval_owned_expr_fork`,
+    // `finish_fork`, and the `until_step`/`while_step` budget cap and forking-branch
+    // control propagation — that the golden-file suite exercises (they run the CLI
+    // binary as a subprocess, invisible to `cargo llvm-cov`'s instrumentation) but no
+    // in-process unit test reaches. These pin the exact same scenarios directly
+    // through `eval()` so they count.
+    //
+    // `$nope` (an unresolved variable) is the key to several of these: unlike
+    // `error(...)`/arithmetic/type errors, `Expr::Var`'s undefined-variable arm
+    // doesn't consult the ambient `optional` flag, so it's one of the few ways to
+    // get a genuine `QueryResult::Error` out of `eval_single` while `optional` is
+    // still `true` — everything else this codebase raises checks `optional` at its
+    // own raise site and resolves straight to `None` instead (#693/#694 track this
+    // ambient-`optional` architecture more broadly).
+
+    #[test]
+    fn test_reduce_update_empty_step_yields_unbound_null() {
+        // `eval_owned_expr_fork`'s `QueryResult::None` arm: a zero-output UPDATE
+        // step leaves the accumulator unbound, read back as `null` on the next
+        // step (same scenario as the `reduce_update_unbound_null` golden case).
+        assert_eq!(
+            outputs(
+                b"null",
+                "reduce (1,2) as $x (0; if $x==2 then empty else .+$x end)"
+            ),
+            ["null"]
+        );
+    }
+
+    #[test]
+    fn eval_owned_expr_fork_empty_update_yields_no_outputs_directly() {
+        let expr = parse("empty").unwrap();
+        let (vals, control) = eval_owned_expr_fork::<JqSemantics>(&expr, &OwnedValue::Null, false);
+        assert_eq!(vals, Vec::<OwnedValue>::new());
+        assert!(control.is_none());
+    }
+
+    #[test]
+    fn test_reduce_optional_swallows_update_error() {
+        // `finish_fork`'s `Some(Control::Error(_)) if optional` arm: the UPDATE
+        // step errors via `$nope`, and the whole `reduce` being wrapped in `?`
+        // swallows it rather than letting it escape.
+        assert_eq!(
+            outputs(b"[1,2,3]", "(reduce .[] as $x (0; $nope))?"),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn test_reduce_init_many_borrowed_refs() {
+        // INIT `(.a,.b)` resolves to two borrowed document refs — exercises the
+        // `QueryResult::Many` (not `ManyOwned`) arm of INIT materialization.
+        assert_eq!(
+            outputs(br#"{"a":1,"b":2}"#, "reduce range(2) as $x ((.a,.b); .+$x)"),
+            ["2", "3"]
+        );
+    }
+
+    #[test]
+    fn test_reduce_init_empty_yields_no_output() {
+        // Zero INIT outputs fork zero times, so the whole reduce produces
+        // nothing at all.
+        assert_eq!(
+            outputs(b"[1,2,3]", "reduce .[] as $x (empty; .+$x)"),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn test_reduce_init_error_swallowed_when_optional() {
+        assert_eq!(
+            outputs(b"[1,2,3]", "(reduce .[] as $x ($nope; .+$x))?"),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn test_reduce_init_error_propagates() {
+        query!(b"[1,2,3]", r"reduce .[] as $x ($nope; .+$x)",
+            QueryResult::Error(e) => {
+                assert!(e.message.contains("undefined variable"));
+            }
+        );
+    }
+
+    #[test]
+    fn test_reduce_init_break_propagates() {
+        // A bare (non-`Partial`) `Break` out of INIT propagates directly out of
+        // `reduce`, caught here by the enclosing `label`.
+        assert_eq!(
+            outputs(
+                b"[1,2,3]",
+                "label $lbl | reduce .[] as $x (break $lbl; .+$x)"
+            ),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn test_reduce_init_partial_error_swallowed_when_optional() {
+        // INIT `(1,$nope)` produces `Partial([1], Control::Error(_))` — under
+        // `?` this whole prefix is discarded, not just the error.
+        assert_eq!(
+            outputs(b"[1,2,3]", "(reduce .[] as $x ((1,$nope); .+$x))?"),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn test_reduce_init_partial_break_keeps_prefix() {
+        // INIT `(1, break $lbl)` produces `Partial([1], Control::Break(_))` —
+        // the fallback arm keeps the prefix (`1`) as the one INIT fork, and the
+        // trailing break is caught by the enclosing label after that fork runs.
+        assert_eq!(
+            outputs(
+                b"[1,2,3]",
+                "label $lbl | reduce .[] as $x ((1, break $lbl); .+$x)"
+            ),
+            ["7"]
+        );
+    }
+
+    #[test]
+    fn test_foreach_input_error_swallowed_when_optional() {
+        // Mirrors `eval_reduce`'s equivalent guard on the INPUT stream: an
+        // immediate (non-`Partial`) error there has no prefix to salvage, so
+        // `?` suppresses it.
+        assert_eq!(
+            outputs(b"null", "(foreach ($nope) as $x (0; .+$x))?"),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn test_foreach_init_many_borrowed_refs() {
+        assert_eq!(
+            outputs(
+                br#"{"a":1,"b":2}"#,
+                "foreach range(2) as $x ((.a,.b); .+$x)"
+            ),
+            ["1", "2", "2", "3"]
+        );
+    }
+
+    #[test]
+    fn test_foreach_init_empty_yields_no_output() {
+        assert_eq!(
+            outputs(b"[1,2,3]", "foreach .[] as $x (empty; .+$x)"),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn test_foreach_init_error_swallowed_when_optional() {
+        assert_eq!(
+            outputs(b"[1,2,3]", "(foreach .[] as $x ($nope; .+$x))?"),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn test_foreach_init_error_propagates() {
+        query!(b"[1,2,3]", r"foreach .[] as $x ($nope; .+$x)",
+            QueryResult::Error(e) => {
+                assert!(e.message.contains("undefined variable"));
+            }
+        );
+    }
+
+    #[test]
+    fn test_foreach_init_break_propagates() {
+        assert_eq!(
+            outputs(
+                b"[1,2,3]",
+                "label $lbl | foreach .[] as $x (break $lbl; .+$x)"
+            ),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn test_until_budget_exceeded_errors() {
+        // `cond` is always falsy, so `until_step`'s single-output fast path
+        // never emits anything before the `WHILE_UNTIL_MAX_STEPS` cap trips.
+        query!(b"1", r"until(false; .)",
+            QueryResult::Error(e) => {
+                assert!(e.message.contains("until: maximum iterations exceeded"));
+            }
+        );
+    }
+
+    #[test]
+    fn test_until_forking_cond_propagates_update_error() {
+        // A 2-output COND forces `until_step`'s forking (non-fast-path) branch;
+        // the falsy output's UPDATE errors via `$nope`, which must propagate
+        // immediately rather than being dropped once the loop over `cond_vals`
+        // moves on.
+        query!(b"1", r"until((true,false); $nope)",
+            QueryResult::Partial(prefix, Control::Error(e)) => {
+                assert_eq!(prefix, vec![OwnedValue::Int(1)]);
+                assert!(e.message.contains("undefined variable"));
+            }
+        );
+    }
+
+    #[test]
+    fn test_while_budget_exceeded_errors() {
+        // `cond` is always truthy, so `while_step`'s single-output fast path
+        // emits every step before the cap trips.
+        query!(b"1", r"while(true; .)",
+            QueryResult::Partial(prefix, Control::Error(e)) => {
+                assert_eq!(prefix.len(), WHILE_UNTIL_MAX_STEPS);
+                assert!(prefix.iter().all(|v| *v == OwnedValue::Int(1)));
+                assert!(e.message.contains("while: maximum iterations exceeded"));
+            }
+        );
+    }
+
+    #[test]
+    fn test_while_forking_cond_propagates_update_error() {
+        // A 2-output COND forces `while_step`'s forking (non-fast-path) branch;
+        // the first (truthy) output's UPDATE errors via `$nope`, which must
+        // propagate immediately rather than being dropped once the loop over
+        // `cond_vals` moves on.
+        query!(b"1", r"while((true,true); $nope)",
+            QueryResult::Partial(prefix, Control::Error(e)) => {
+                assert_eq!(prefix, vec![OwnedValue::Int(1)]);
+                assert!(e.message.contains("undefined variable"));
+            }
+        );
+    }
+
     /// `while`'s COND/UPDATE slots now accept a top-level comma (#534) —
     /// same fanout rule as `until` above.
     #[test]
