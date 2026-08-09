@@ -9906,6 +9906,33 @@ fn eval_as<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     }
 }
 
+/// Total step budget for `reduce`/`foreach` (#695): shared across every
+/// INIT fork, mirroring `WHILE_UNTIL_MAX_STEPS`'s "whole tree, not
+/// per-branch" accounting. Charged once per UPDATE eval, and — in
+/// `foreach` only — once more per EXTRACT eval (a genuine evaluator
+/// invocation, not free output-copying).
+///
+/// Kept separate from `WHILE_UNTIL_MAX_STEPS`: the two pairs of
+/// constructs charge budget at different granularity (up to two
+/// evaluator calls per source element here vs. one combined cond+update
+/// pair per recursion-tree node there), so the shared numeric value
+/// today is coincidence, not a relationship a shared symbol should
+/// encode.
+const REDUCE_FOREACH_MAX_STEPS: usize = 10000;
+
+/// Check-and-charge one unit against a shared step budget (#695), the
+/// same check `until_step`/`while_step` each inline for their own cap.
+/// `what` names the construct in the resulting error message.
+fn charge_budget(budget: &mut usize, what: &str) -> Option<Control> {
+    if *budget == 0 {
+        return Some(Control::Error(EvalError::new(format!(
+            "{what}: maximum iterations exceeded"
+        ))));
+    }
+    *budget -= 1;
+    None
+}
+
 /// Evaluate `reduce`: `reduce EXPR as $var (INIT; UPDATE)`.
 fn eval_reduce<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     input: &Expr,
@@ -9972,6 +9999,9 @@ fn eval_reduce<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         .collect();
 
     let mut outputs: Vec<OwnedValue> = Vec::new();
+    // Shared across every INIT fork (#695), the same "whole tree, not
+    // per-branch" accounting `WHILE_UNTIL_MAX_STEPS` uses.
+    let mut budget = REDUCE_FOREACH_MAX_STEPS;
     for init_val in init_values {
         // The accumulator is a variable UPDATE rebinds; a step whose UPDATE
         // produces zero outputs leaves it unbound rather than ending the
@@ -9982,6 +10012,10 @@ fn eval_reduce<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         let mut acc: Option<OwnedValue> = Some(init_val);
         let mut aborted: Option<Control> = None;
         for substituted in &substituted_updates {
+            if let Some(control) = charge_budget(&mut budget, "reduce") {
+                aborted = Some(control);
+                break;
+            }
             // `acc` is unconditionally overwritten below, so moving it out
             // (rather than cloning) is sound — nothing reads the old value
             // again (#695).
@@ -10273,6 +10307,9 @@ fn eval_foreach<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     });
 
     let mut outputs: Vec<OwnedValue> = Vec::new();
+    // Shared across every INIT fork (#695), the same "whole tree, not
+    // per-branch" accounting `WHILE_UNTIL_MAX_STEPS` uses.
+    let mut budget = REDUCE_FOREACH_MAX_STEPS;
     for init_val in init_values {
         // The state is a variable UPDATE rebinds; a step whose UPDATE
         // produces zero outputs leaves it unbound rather than ending the
@@ -10281,6 +10318,10 @@ fn eval_foreach<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         let mut state: Option<OwnedValue> = Some(init_val);
         let mut aborted: Option<Control> = None;
         'input: for (idx, substituted_update) in substituted_updates.iter().enumerate() {
+            if let Some(control) = charge_budget(&mut budget, "foreach") {
+                aborted = Some(control);
+                break;
+            }
             // `state` is unconditionally overwritten below, so moving it
             // out (rather than cloning) is sound — nothing reads the old
             // value again (#695).
@@ -10293,6 +10334,16 @@ fn eval_foreach<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // .+$x, .*100)]` is `[1,0,2,0]`.
             for update_val in &update_vals {
                 if let Some(extracts) = &substituted_extracts {
+                    // Charged separately from the UPDATE step above: a
+                    // single UPDATE can fan out into far more EXTRACT evals
+                    // than there are source elements (#695), and that
+                    // width needs its own accounting or a single-element
+                    // input stream could still drive unbounded EXTRACT
+                    // work.
+                    if let Some(control) = charge_budget(&mut budget, "foreach") {
+                        aborted = Some(control);
+                        break 'input;
+                    }
                     let (ext_vals, ext_control) =
                         eval_owned_expr_fork::<S>(&extracts[idx], update_val, optional);
                     // The steps already produced no longer vanish (#494).
@@ -22698,6 +22749,45 @@ mod tests {
                 "label $lbl | foreach .[] as $x (break $lbl; .+$x)"
             ),
             Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn test_reduce_budget_exceeded_errors() {
+        // 10001 UPDATE evals against a single INIT fork exceeds
+        // REDUCE_FOREACH_MAX_STEPS; `reduce` only pushes output after its
+        // fold completes, so no output survives to make this a `Partial`.
+        query!(b"null", r"reduce range(10001) as $x (0; .+$x)",
+            QueryResult::Error(e) => {
+                assert!(e.message.contains("reduce: maximum iterations exceeded"));
+            }
+        );
+    }
+
+    #[test]
+    fn test_foreach_budget_exceeded_errors() {
+        // No EXTRACT, so only the per-input-element UPDATE charge fires;
+        // outputs already produced survive as the `Partial` prefix.
+        query!(b"null", r"foreach range(20000) as $x (0; .+1)",
+            QueryResult::Partial(prefix, Control::Error(e)) => {
+                assert_eq!(prefix.len(), REDUCE_FOREACH_MAX_STEPS);
+                assert!(e.message.contains("foreach: maximum iterations exceeded"));
+            }
+        );
+    }
+
+    #[test]
+    fn test_foreach_extract_fanout_charged_independently_of_input_length() {
+        // A single input element whose UPDATE fans out far past the
+        // budget; each output gets its own EXTRACT eval (#695). Pins that
+        // EXTRACT fanout is charged on its own — a design charging only
+        // once per input element would never trip here, since there is
+        // only one.
+        query!(b"null", r"foreach (1) as $x (0; range(20000); .)",
+            QueryResult::Partial(prefix, Control::Error(e)) => {
+                assert_eq!(prefix.len(), REDUCE_FOREACH_MAX_STEPS - 1);
+                assert!(e.message.contains("foreach: maximum iterations exceeded"));
+            }
         );
     }
 

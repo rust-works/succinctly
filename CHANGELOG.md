@@ -43,6 +43,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   followed by an unconditional overwrite with no read in between — is now
   `.take()`, dropping a full-value clone every step.
 
+- **`reduce`/`foreach` gained a shared step budget bounding their INIT ×
+  UPDATE × EXTRACT fanout** (#695, a #534 follow-up): `while`/`until` got a
+  `WHILE_UNTIL_MAX_STEPS` cap (10,000) in #534 to bound their new fanout, but
+  `reduce`/`foreach` got no equivalent, so a query shaped like `reduce
+  (range(100000)) as $x ((range(100000)); .+$x)` ran unbounded — a finite but
+  enormous product of INIT-fork count × input length × UPDATE/EXTRACT width,
+  slow rather than hanging, but an easily-typed resource-exhaustion vector.
+  A new `REDUCE_FOREACH_MAX_STEPS` cap (10,000, shared across every INIT
+  fork, mirroring `WHILE_UNTIL_MAX_STEPS`'s "whole tree, not per-branch"
+  accounting) now errors with `reduce: maximum iterations exceeded` /
+  `foreach: maximum iterations exceeded` instead. Charged once per UPDATE
+  eval, and — in `foreach` only — once more per EXTRACT eval, since a single
+  UPDATE output can fan out into far more EXTRACT evals than there are
+  source elements; the plain-copy path when `foreach` has no EXTRACT clause
+  is left unbudgeted, since it does no evaluator work of its own and
+  charging it too would wrongly cap legitimate high-cardinality output.
+
 ### Added
 
 - **jq `@csv`/`@tsv`/`@dsv`/`@sh` allocation overhead investigated: no
