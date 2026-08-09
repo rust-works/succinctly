@@ -73,6 +73,23 @@ pub fn to_owned<V: DocumentValue>(value: &V) -> OwnedValue {
     }
 }
 
+/// Materialize a key/slice-bound candidate just enough to classify it.
+///
+/// Mirrors `eval::to_owned_key_shape` (#626/#670): `index_one_generic`'s
+/// Array/Object rejection and `slice::bound`'s non-numeric rejection never
+/// inspect a candidate's *contents*, only its shape, so a full recursive
+/// `to_owned` of a large navigated container is pure waste when it can only
+/// ever be rejected on type (#669).
+fn to_owned_key_shape<V: DocumentValue>(value: &V) -> OwnedValue {
+    if value.is_array() {
+        OwnedValue::Array(Vec::new())
+    } else if value.is_object() {
+        OwnedValue::Object(IndexMap::new())
+    } else {
+        to_owned(value)
+    }
+}
+
 /// Materialize a `GenericResult::LazyKeys` fallback: decode every key exactly
 /// as eager `Builtin::Keys`/`Builtin::KeysUnsorted` did before either stayed
 /// lazy, sorting first iff `sorted` (#683).
@@ -1698,6 +1715,12 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
         // truncate to its prefix (#694) -- mirrors the target match below.
         GenericResult::Partial(_, Control::Error(e)) => return GenericResult::Error(e),
         GenericResult::Partial(_, Control::Break(label)) => return GenericResult::Break(label),
+        GenericResult::One(v) => vec![to_owned_key_shape(&v)],
+        GenericResult::OneCursor(c) => vec![to_owned_key_shape(&c.value())],
+        GenericResult::Many(vs) => vs.iter().map(to_owned_key_shape).collect(),
+        GenericResult::ManyCursor(cs) => {
+            cs.iter().map(|c| to_owned_key_shape(&c.value())).collect()
+        }
         other => other.collect_owned(),
     };
     if keys.is_empty() {
@@ -1902,6 +1925,12 @@ fn eval_slice_bound<S: EvalSemantics, V: DocumentValue>(
         GenericResult::Break(label) => return Err(Control::Break(label)),
         GenericResult::None => return Ok(Vec::new()),
         GenericResult::Partial(_, control) => return Err(control),
+        GenericResult::One(v) => vec![to_owned_key_shape(&v)],
+        GenericResult::OneCursor(c) => vec![to_owned_key_shape(&c.value())],
+        GenericResult::Many(vs) => vs.iter().map(to_owned_key_shape).collect(),
+        GenericResult::ManyCursor(cs) => {
+            cs.iter().map(|c| to_owned_key_shape(&c.value())).collect()
+        }
         other => other.collect_owned(),
     };
     raw.iter()
