@@ -853,10 +853,64 @@ fn test_inplace_multi_doc_field_navigation() -> Result<()> {
     Ok(())
 }
 
-/// #478: filters outside `can_use_m2_streaming` (e.g. `keys`) must still
-/// fall back to the pre-existing DOM path for `--inplace`.
+/// #478: filters outside `can_use_m2_streaming` must still fall back to the
+/// pre-existing DOM path for `--inplace`. `keys` was the original example
+/// here, but #685 admitted `Builtin::KeysUnsorted` (what `keys` parses to in
+/// `ParserMode::Yq`) into the M2 whitelist, so it no longer exercises this
+/// fallback -- `length` still requires `OwnedValue` construction (see
+/// `can_use_m2_streaming`'s doc comment) and stands in instead. A two-document
+/// file also drives the DOM loop's multi-doc `---` separator logic, which a
+/// single document can't reach.
 #[test]
 fn test_inplace_non_m2_filter_still_works() -> Result<()> {
+    let mut input_file = NamedTempFile::new()?;
+    writeln!(input_file, "a: 1\nb: 2\n---\nc: 3")?;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .arg("yq")
+        .arg("-i")
+        .arg("length")
+        .arg(input_file.path())
+        .stdin(Stdio::null())
+        .output()?;
+
+    assert!(output.status.success());
+    let rewritten = std::fs::read_to_string(input_file.path())?;
+    assert_eq!(rewritten, "---\n2\n---\n1\n");
+    Ok(())
+}
+
+/// `--inplace`'s DOM fallback loop applies `--doc` filtering with its own
+/// `continue`-past-non-matching-documents branch, separate from the
+/// multi-doc `---` separator logic `test_inplace_non_m2_filter_still_works`
+/// covers -- exercise it too so both branches of that loop are reached.
+#[test]
+fn test_inplace_non_m2_filter_doc_filter_still_works() -> Result<()> {
+    let mut input_file = NamedTempFile::new()?;
+    writeln!(input_file, "a: 1\nb: 2\n---\nc: 3")?;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .arg("yq")
+        .arg("-i")
+        .arg("--doc")
+        .arg("1")
+        .arg("length")
+        .arg(input_file.path())
+        .stdin(Stdio::null())
+        .output()?;
+
+    assert!(output.status.success());
+    let rewritten = std::fs::read_to_string(input_file.path())?;
+    assert_eq!(rewritten, "1\n");
+    Ok(())
+}
+
+/// #685: `keys`/`keys_unsorted` becoming M2-eligible means `--inplace 'keys'`
+/// now takes the fast path above (`can_inplace_yaml_fast_path`) instead of
+/// the DOM fallback `test_inplace_non_m2_filter_still_works` covers --
+/// confirm that path still rewrites the file correctly.
+#[test]
+fn test_inplace_keys_unsorted_m2_fast_path_685() -> Result<()> {
     let mut input_file = NamedTempFile::new()?;
     writeln!(input_file, "a: 1\nb: 2")?;
 
@@ -4118,18 +4172,28 @@ fn test_path_context_builtins_across_pipe_stages_554() -> Result<()> {
 }
 
 /// `keys_unsorted` gained a lazy `GenericResult`/evaluator path shared with
-/// `jq` (#140), but `yq_runner.rs` has no `JqValue`-equivalent lazy output
-/// concept, so its `evaluate_yaml_cursor` boundary still materializes
-/// unconditionally (deferred to a follow-up issue). This just confirms that
-/// materialize fallback still produces correct, unchanged output on the YAML
-/// side.
+/// `jq` (#140); `yq_runner.rs`'s CLI output boundary now streams it lazily
+/// too, via `can_use_m2_streaming` admitting `Builtin::KeysUnsorted` and
+/// `GenericResult::stream_json`/`stream_yaml`'s `LazyKeys { sorted: false, .. }` arms
+/// writing each key straight from `fields` (#685) — no `Vec<String>` or
+/// `OwnedValue::Array` is built. Covers every M2-reachable output shape
+/// (compact/pretty JSON, compact/pretty YAML) plus `length`/`.[0]`, which
+/// were already lazy before this issue.
 #[test]
-fn test_keys_unsorted_yaml_materialize_fallback_140() -> Result<()> {
+fn test_keys_unsorted_yaml_lazy_output_685() -> Result<()> {
     let input = "b: 1\na: 2\nc: 3\n";
 
     let (output, code) = run_yq_stdin("keys_unsorted", input, &["-o", "json", "-I0"])?;
     assert_eq!(code, 0);
     assert_eq!(output.trim(), r#"["b","a","c"]"#);
+
+    let (output, code) = run_yq_stdin("keys_unsorted", input, &["-o", "json", "-I2"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "[\n  \"b\",\n  \"a\",\n  \"c\"\n]");
+
+    let (output, code) = run_yq_stdin("keys_unsorted", input, &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "- b\n- a\n- c");
 
     let (output, code) = run_yq_stdin("keys_unsorted | length", input, &["-o", "json", "-I0"])?;
     assert_eq!(code, 0);
@@ -4142,8 +4206,35 @@ fn test_keys_unsorted_yaml_materialize_fallback_140() -> Result<()> {
     Ok(())
 }
 
+/// `stream_lazy_keys_json`/`stream_lazy_keys_yaml`'s empty-`fields` early
+/// return (`"[]"`, skipping the `uncons()` loop entirely) is only reachable
+/// with zero mapping entries -- `test_keys_unsorted_yaml_lazy_output_685`'s
+/// fixture always has three, so it never exercises this arm (#685).
+#[test]
+fn test_keys_unsorted_yaml_lazy_output_empty_685() -> Result<()> {
+    let input = "{}\n";
+
+    let (output, code) = run_yq_stdin("keys_unsorted", input, &["-o", "json", "-I0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "[]");
+
+    let (output, code) = run_yq_stdin("keys_unsorted", input, &["-o", "json", "-I2"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "[]");
+
+    let (output, code) = run_yq_stdin("keys_unsorted", input, &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "[]");
+
+    let (output, code) = run_yq_stdin("keys_unsorted", input, &["-I0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "[]");
+
+    Ok(())
+}
+
 // Note (#683): there is no sorted-`keys` CLI test mirroring
-// `test_keys_unsorted_yaml_materialize_fallback_140` here, because `keys` is
+// `test_keys_unsorted_yaml_lazy_output_685` here, because `keys` is
 // unreachable via the `yq` CLI's own dialect -- `run_yq` always parses in
 // `ParserMode::Yq`, where the `keys` keyword itself resolves to
 // `Builtin::KeysUnsorted` (matching real yq's document-order semantics; see
@@ -4181,6 +4272,57 @@ fn test_array_keys_unsorted_yaml_materialize_fallback_684() -> Result<()> {
     let (output, code) = run_yq_stdin("keys_unsorted | last", input, &["-o", "json", "-I0"])?;
     assert_eq!(code, 0);
     assert_eq!(output.trim(), "2");
+
+    Ok(())
+}
+
+/// Flags that force the DOM path must still agree byte-for-byte with the M2
+/// lazy path above — `evaluate_yaml_cursor`'s `LazyKeys { sorted: false, .. }`
+/// arm ([yq_runner.rs]) stays a materializing fallback for those flag
+/// combinations rather than a `keys_unsorted`-specific gap (#685).
+///
+/// `-I0` (compact) satisfies `can_json_fast_path`/`can_yaml_fast_path` on its
+/// own (`output_config.compact || ...`), so `--sort-keys` alone does *not*
+/// force DOM in compact mode — only in pretty mode, where it's excluded via
+/// `can_stream_pretty`. `--arg` (an unused named variable) forces DOM
+/// unconditionally via `context.named.is_empty()`, so it's used for the
+/// compact case instead.
+#[test]
+fn test_keys_unsorted_yaml_dom_fallback_matches_lazy_685() -> Result<()> {
+    let input = "b: 1\na: 2\nc: 3\n";
+
+    let (lazy, _) = run_yq_stdin("keys_unsorted", input, &["-o", "json", "-I0"])?;
+    let (dom, code) = run_yq_stdin(
+        "keys_unsorted",
+        input,
+        &["--arg", "_unused", "x", "-o", "json", "-I0"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(lazy, dom);
+
+    let (lazy, _) = run_yq_stdin("keys_unsorted", input, &[])?;
+    let (dom, code) = run_yq_stdin("keys_unsorted", input, &["--sort-keys"])?;
+    assert_eq!(code, 0);
+    assert_eq!(lazy, dom);
+
+    Ok(())
+}
+
+/// `keys_unsorted` on a mapping resolved through a `<<: *anchor` merge key
+/// exercises `YamlFields`'s `Merged` variant (an `Rc`-shared entry list, the
+/// reason `YamlFields` can't be `Copy` the way `JsonFields` is) through the
+/// new lazy path — must still stream in merge-then-local order.
+#[test]
+fn test_keys_unsorted_yaml_merge_key_lazy_685() -> Result<()> {
+    let input = "defaults: &defaults\n  b: 1\n  a: 2\nitem:\n  <<: *defaults\n  c: 3\n";
+
+    let (output, code) = run_yq_stdin(".item | keys_unsorted", input, &["-o", "json", "-I0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#"["b","a","c"]"#);
+
+    let (output, code) = run_yq_stdin(".item | keys_unsorted", input, &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "- b\n- a\n- c");
 
     Ok(())
 }
