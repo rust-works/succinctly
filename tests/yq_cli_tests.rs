@@ -5925,6 +5925,64 @@ fn test_front_matter_process_rejects_json_output() -> Result<()> {
     Ok(())
 }
 
+/// Regression test: `output_value` treats anything other than `Yaml` as
+/// JSON output (including `Auto`), but the compat guard only checked for
+/// the explicit `Json` variant -- `-o auto` slipped through and wrapped a
+/// JSON body in `---` fences (#715 follow-up).
+#[test]
+fn test_front_matter_process_rejects_auto_output() -> Result<()> {
+    let (_output, stderr, code) = run_yq_stdin_with_stderr(
+        ".",
+        FRONT_MATTER_FIXTURE,
+        &["--front-matter", "process", "-o", "auto"],
+    )?;
+    assert_ne!(code, 0);
+    assert!(stderr.contains("auto"), "stderr: {stderr}");
+    Ok(())
+}
+
+/// Regression test: reattaching a body that doesn't end in a newline used
+/// to run straight into the next file's opening fence with no separator,
+/// e.g. `Body A---` -- corrupting the stream (#715 follow-up).
+#[test]
+fn test_front_matter_process_multi_file_separates_body_from_next_fence() -> Result<()> {
+    let mut file1 = NamedTempFile::new()?;
+    write!(file1, "---\ntitle: A\n---\nBody A")?; // no trailing newline
+    let mut file2 = NamedTempFile::new()?;
+    write!(file2, "---\ntitle: B\n---\nBody B\n")?;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .arg("yq")
+        .args(["--front-matter", "process"])
+        .arg(".title = \"X\"")
+        .arg(file1.path())
+        .arg(file2.path())
+        .stdin(Stdio::null())
+        .output()?;
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout)?;
+    assert_eq!(
+        stdout,
+        "---\ntitle: X\n---\nBody A\n---\ntitle: X\n---\nBody B\n"
+    );
+    Ok(())
+}
+
+/// Regression test: the closing `---` fence injected right before a
+/// reattached body was always LF-only, even when the body itself was CRLF
+/// -- producing a file with mixed line endings (#715 follow-up).
+#[test]
+fn test_front_matter_process_preserves_crlf_line_endings() -> Result<()> {
+    let (output, stderr, code) = run_yq_stdin_with_stderr(
+        ".title = \"X\"",
+        "---\r\ntitle: A\r\n---\r\nBody\r\ntext\r\n",
+        &["--front-matter", "process"],
+    )?;
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(output, "---\ntitle: X\n---\r\nBody\r\ntext\r\n");
+    Ok(())
+}
+
 #[test]
 fn test_front_matter_extract_allows_slurp_across_files() -> Result<()> {
     let mut file1 = NamedTempFile::new()?;

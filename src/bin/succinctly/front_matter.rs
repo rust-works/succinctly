@@ -74,6 +74,19 @@ pub fn split_front_matter(input: &[u8]) -> Result<FrontMatter<'_>, FrontMatterEr
     }
 }
 
+/// The line-ending convention `body` uses, detected from its first line
+/// terminator. `--front-matter=process` reattaches `body` byte-for-byte, so
+/// a fence line injected right before it (the closing `---`) must match --
+/// otherwise a CRLF body ends up preceded by a bare-LF fence, producing a
+/// file with mixed line endings. Falls back to `\n` for a body with no line
+/// break to sniff (nothing to mismatch).
+pub(crate) fn body_line_ending(body: &[u8]) -> &'static [u8] {
+    match body.iter().position(|&b| b == b'\n') {
+        Some(nl) if nl > 0 && body[nl - 1] == b'\r' => b"\r\n",
+        _ => b"\n",
+    }
+}
+
 fn is_fence_line(content: &[u8]) -> bool {
     trim_trailing_ws(content) == b"---"
 }
@@ -233,5 +246,21 @@ mod tests {
         let fm = split_front_matter(b"---\nkey:\n  ---\n---\nBody\n").unwrap();
         assert_eq!(fm.yaml, b"key:\n  ---\n");
         assert_eq!(fm.body, b"Body\n");
+    }
+
+    #[test]
+    fn body_line_ending_detects_lf() {
+        assert_eq!(body_line_ending(b"line one\nline two\n"), b"\n");
+    }
+
+    #[test]
+    fn body_line_ending_detects_crlf() {
+        assert_eq!(body_line_ending(b"line one\r\nline two\r\n"), b"\r\n");
+    }
+
+    #[test]
+    fn body_line_ending_defaults_to_lf_with_no_newline() {
+        assert_eq!(body_line_ending(b"no newline here"), b"\n");
+        assert_eq!(body_line_ending(b""), b"\n");
     }
 }

@@ -1700,9 +1700,19 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
             if args.slurp {
                 anyhow::bail!("--front-matter=process and --slurp are incompatible");
             }
-            if args.output_format == OutputFormat::Json {
+            // `output_value` treats anything other than `Yaml` as JSON
+            // output (including `Auto`, which has no YAML/Markdown-file
+            // detection of its own) -- so the guard must reject everything
+            // but `Yaml`, not just the explicit `Json` variant, or `-o auto`
+            // silently slips through and wraps a JSON body in `---` fences.
+            if args.output_format != OutputFormat::Yaml {
                 anyhow::bail!(
-                    "--front-matter=process requires YAML output (got -o/--output-format json)"
+                    "--front-matter=process requires YAML output (got -o/--output-format {})",
+                    if args.output_format == OutputFormat::Json {
+                        "json"
+                    } else {
+                        "auto"
+                    }
                 );
             }
         }
@@ -2689,7 +2699,8 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
             }
 
             if let Some(body) = &front_matter_body {
-                output_buffer.extend_from_slice(b"---\n");
+                output_buffer.extend_from_slice(b"---");
+                output_buffer.extend_from_slice(front_matter::body_line_ending(body));
                 output_buffer.extend_from_slice(body);
             }
 
@@ -2822,8 +2833,17 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                 }
             }
             if let Some(body) = front_matter_body {
-                writer.write_all(b"---\n")?;
+                let line_ending = front_matter::body_line_ending(body);
+                writer.write_all(b"---")?;
+                writer.write_all(line_ending)?;
                 writer.write_all(body)?;
+                // A body with no trailing line break would otherwise run
+                // straight into the next file's opening fence (or whatever
+                // follows), corrupting the stream -- ensure one separates
+                // them, matching this body's own line-ending convention.
+                if !body.is_empty() && !body.ends_with(b"\n") {
+                    writer.write_all(line_ending)?;
+                }
             }
         }
     }
