@@ -21,8 +21,9 @@
 //! | `length`, complex | OwnedValue | 5-8x input |
 
 use alloc::string::{String, ToString};
+use alloc::vec::Vec;
 
-use super::document::DocumentFields;
+use super::document::{DocumentFields, IndentSpec};
 use super::escape::{write_json_body_jq, write_json_body_yq};
 use super::value::{format_number_jq_compat, NumberRepr, OwnedValue};
 use crate::yaml::format_float_with_fraction;
@@ -36,22 +37,25 @@ pub trait StreamableValue {
     /// Stream this value as JSON to the output.
     ///
     /// The output should be valid JSON without trailing newlines or separators.
-    /// For pretty-printed output, pass indent_spaces > 0. For compact output,
-    /// pass indent_spaces = 0.
+    /// `indent` selects width/unit (`IndentSpec::COMPACT` for compact output);
+    /// `sort_keys` sorts object keys before writing (`-S`/`--sort-keys`).
     fn stream_json<W: core::fmt::Write>(
         &self,
         out: &mut W,
-        indent_spaces: usize,
+        indent: IndentSpec,
+        sort_keys: bool,
     ) -> core::fmt::Result;
 
     /// Stream this value as YAML to the output.
     ///
-    /// The output should be valid YAML. For block style, pass indent_spaces > 0.
-    /// For flow style (compact), pass indent_spaces = 0.
+    /// The output should be valid YAML. `indent` selects width/unit
+    /// (`IndentSpec::COMPACT` for flow style); `sort_keys` sorts object keys
+    /// before writing (`-S`/`--sort-keys`).
     fn stream_yaml<W: core::fmt::Write>(
         &self,
         out: &mut W,
-        indent_spaces: usize,
+        indent: IndentSpec,
+        sort_keys: bool,
     ) -> core::fmt::Result;
 
     /// Check if this value is falsy (null or false).
@@ -100,17 +104,19 @@ impl StreamableValue for OwnedValue {
     fn stream_json<W: core::fmt::Write>(
         &self,
         out: &mut W,
-        indent_spaces: usize,
+        indent: IndentSpec,
+        sort_keys: bool,
     ) -> core::fmt::Result {
-        stream_owned_value_json(self, out, 0, indent_spaces)
+        stream_owned_value_json(self, out, 0, indent.width, indent.unit, sort_keys)
     }
 
     fn stream_yaml<W: core::fmt::Write>(
         &self,
         out: &mut W,
-        indent_spaces: usize,
+        indent: IndentSpec,
+        sort_keys: bool,
     ) -> core::fmt::Result {
-        stream_owned_value_yaml(self, out, 0, indent_spaces)
+        stream_owned_value_yaml(self, out, 0, indent.width, indent.unit, sort_keys)
     }
 
     fn is_falsy(&self) -> bool {
@@ -134,12 +140,16 @@ fn stream_owned_value_json<W: core::fmt::Write>(
     out: &mut W,
     current_indent: usize,
     indent_spaces: usize,
+    unit: char,
+    sort_keys: bool,
 ) -> core::fmt::Result {
     stream_owned_value_json_with(
         value,
         out,
         current_indent,
         indent_spaces,
+        unit,
+        sort_keys,
         write_json_body_yq,
         format_float_with_fraction,
     )
@@ -164,20 +174,28 @@ pub fn stream_owned_value_json_jq<W: core::fmt::Write>(
 ) -> core::fmt::Result {
     // Always compact: this is the jq-error-message convention, which never
     // pretty-prints.
-    stream_owned_value_json_with(value, out, 0, 0, write_json_body_jq, |f| f.to_string())
+    stream_owned_value_json_with(value, out, 0, 0, ' ', false, write_json_body_jq, |f| {
+        f.to_string()
+    })
 }
 
 /// Stream an OwnedValue as JSON without intermediate string allocation, using
 /// `escape` for every string body and `float_fmt` for every float — the two
 /// places the `yq`/jq-error conventions differ.
 ///
-/// - `current_indent`: Current indentation level (number of spaces)
-/// - `indent_spaces`: Spaces per indentation level (0 for compact)
+/// - `current_indent`: Current indentation level (number of `unit` characters)
+/// - `indent_spaces`: `unit` characters per indentation level (0 for compact)
+/// - `unit`: the character repeated `indent_spaces` times per level (`' '`
+///   normally, `'\t'` for `--tab`)
+/// - `sort_keys`: sort object keys before writing (`-S`/`--sort-keys`)
+#[allow(clippy::too_many_arguments)]
 fn stream_owned_value_json_with<W: core::fmt::Write>(
     value: &OwnedValue,
     out: &mut W,
     current_indent: usize,
     indent_spaces: usize,
+    unit: char,
+    sort_keys: bool,
     escape: fn(&mut W, &str) -> core::fmt::Result,
     float_fmt: fn(f64) -> String,
 ) -> core::fmt::Result {
@@ -214,20 +232,22 @@ fn stream_owned_value_json_with<W: core::fmt::Write>(
                 }
                 if indent_spaces > 0 {
                     out.write_char('\n')?;
-                    write_indent(out, next_indent)?;
+                    write_indent(out, next_indent, unit)?;
                 }
                 stream_owned_value_json_with(
                     elem,
                     out,
                     next_indent,
                     indent_spaces,
+                    unit,
+                    sort_keys,
                     escape,
                     float_fmt,
                 )?;
             }
             if indent_spaces > 0 {
                 out.write_char('\n')?;
-                write_indent(out, current_indent)?;
+                write_indent(out, current_indent, unit)?;
             }
             out.write_char(']')
         }
@@ -237,13 +257,17 @@ fn stream_owned_value_json_with<W: core::fmt::Write>(
             }
             out.write_char('{')?;
             let next_indent = current_indent + indent_spaces;
-            for (i, (key, value)) in obj.iter().enumerate() {
+            let mut entries: Vec<(&String, &OwnedValue)> = obj.iter().collect();
+            if sort_keys {
+                entries.sort_by(|a, b| a.0.cmp(b.0));
+            }
+            for (i, (key, value)) in entries.into_iter().enumerate() {
                 if i > 0 {
                     out.write_char(',')?;
                 }
                 if indent_spaces > 0 {
                     out.write_char('\n')?;
-                    write_indent(out, next_indent)?;
+                    write_indent(out, next_indent, unit)?;
                 }
                 stream_json_string(out, key, escape)?;
                 out.write_str(if indent_spaces > 0 { ": " } else { ":" })?;
@@ -252,13 +276,15 @@ fn stream_owned_value_json_with<W: core::fmt::Write>(
                     out,
                     next_indent,
                     indent_spaces,
+                    unit,
+                    sort_keys,
                     escape,
                     float_fmt,
                 )?;
             }
             if indent_spaces > 0 {
                 out.write_char('\n')?;
-                write_indent(out, current_indent)?;
+                write_indent(out, current_indent, unit)?;
             }
             out.write_char('}')
         }
@@ -288,7 +314,7 @@ fn stream_json_string<W: core::fmt::Write>(
 pub fn stream_lazy_keys_json<W: core::fmt::Write, F: DocumentFields>(
     fields: &F,
     out: &mut W,
-    indent_spaces: usize,
+    indent: IndentSpec,
 ) -> core::fmt::Result {
     if fields.is_empty() {
         return out.write_str("[]");
@@ -304,16 +330,16 @@ pub fn stream_lazy_keys_json<W: core::fmt::Write, F: DocumentFields>(
             if i > 0 {
                 out.write_char(',')?;
             }
-            if indent_spaces > 0 {
+            if indent.width > 0 {
                 out.write_char('\n')?;
-                write_indent(out, indent_spaces)?;
+                write_indent(out, indent.width, indent.unit)?;
             }
             stream_json_string(out, &key, write_json_body_yq)?;
             i += 1;
         }
         current = rest;
     }
-    if indent_spaces > 0 {
+    if indent.width > 0 {
         out.write_char('\n')?;
     }
     out.write_char(']')
@@ -325,13 +351,18 @@ pub fn stream_lazy_keys_json<W: core::fmt::Write, F: DocumentFields>(
 
 /// Stream an OwnedValue as YAML without intermediate string allocation.
 ///
-/// - `current_indent`: Current indentation level (number of spaces)
-/// - `indent_spaces`: Spaces per indentation level (0 for flow style)
+/// - `current_indent`: Current indentation level (number of `unit` characters)
+/// - `indent_spaces`: `unit` characters per indentation level (0 for flow style)
+/// - `unit`: the character repeated `indent_spaces` times per level (`' '`
+///   normally, `'\t'` for `--tab`)
+/// - `sort_keys`: sort object keys before writing (`-S`/`--sort-keys`)
 fn stream_owned_value_yaml<W: core::fmt::Write>(
     value: &OwnedValue,
     out: &mut W,
     current_indent: usize,
     indent_spaces: usize,
+    unit: char,
+    sort_keys: bool,
 ) -> core::fmt::Result {
     match value {
         OwnedValue::Null => out.write_str("null"),
@@ -372,7 +403,7 @@ fn stream_owned_value_yaml<W: core::fmt::Write>(
                     if i > 0 {
                         out.write_str(", ")?;
                     }
-                    stream_owned_value_yaml(elem, out, 0, 0)?;
+                    stream_owned_value_yaml(elem, out, 0, 0, unit, sort_keys)?;
                 }
                 out.write_char(']')
             } else {
@@ -380,7 +411,7 @@ fn stream_owned_value_yaml<W: core::fmt::Write>(
                 for (i, elem) in arr.iter().enumerate() {
                     if i > 0 {
                         out.write_char('\n')?;
-                        write_indent(out, current_indent)?;
+                        write_indent(out, current_indent, unit)?;
                     }
                     out.write_str("- ")?;
                     // For nested containers, put on next line with extra indent
@@ -388,12 +419,14 @@ fn stream_owned_value_yaml<W: core::fmt::Write>(
                         && !is_empty_container(elem)
                     {
                         out.write_char('\n')?;
-                        write_indent(out, current_indent + indent_spaces)?;
+                        write_indent(out, current_indent + indent_spaces, unit)?;
                         stream_owned_value_yaml(
                             elem,
                             out,
                             current_indent + indent_spaces,
                             indent_spaces,
+                            unit,
+                            sort_keys,
                         )?;
                     } else {
                         stream_owned_value_yaml(
@@ -401,6 +434,8 @@ fn stream_owned_value_yaml<W: core::fmt::Write>(
                             out,
                             current_indent + indent_spaces,
                             indent_spaces,
+                            unit,
+                            sort_keys,
                         )?;
                     }
                 }
@@ -409,25 +444,30 @@ fn stream_owned_value_yaml<W: core::fmt::Write>(
         }
         OwnedValue::Object(obj) => {
             if obj.is_empty() {
-                out.write_str("{}")
-            } else if indent_spaces == 0 {
+                return out.write_str("{}");
+            }
+            let mut entries: Vec<(&String, &OwnedValue)> = obj.iter().collect();
+            if sort_keys {
+                entries.sort_by(|a, b| a.0.cmp(b.0));
+            }
+            if indent_spaces == 0 {
                 // Flow style
                 out.write_char('{')?;
-                for (i, (key, val)) in obj.iter().enumerate() {
+                for (i, (key, val)) in entries.into_iter().enumerate() {
                     if i > 0 {
                         out.write_str(", ")?;
                     }
                     stream_yaml_string(out, key)?;
                     out.write_str(": ")?;
-                    stream_owned_value_yaml(val, out, 0, 0)?;
+                    stream_owned_value_yaml(val, out, 0, 0, unit, sort_keys)?;
                 }
                 out.write_char('}')
             } else {
                 // Block style
-                for (i, (key, val)) in obj.iter().enumerate() {
+                for (i, (key, val)) in entries.into_iter().enumerate() {
                     if i > 0 {
                         out.write_char('\n')?;
-                        write_indent(out, current_indent)?;
+                        write_indent(out, current_indent, unit)?;
                     }
                     stream_yaml_string(out, key)?;
                     out.write_str(":")?;
@@ -436,12 +476,14 @@ fn stream_owned_value_yaml<W: core::fmt::Write>(
                         && !is_empty_container(val)
                     {
                         out.write_char('\n')?;
-                        write_indent(out, current_indent + indent_spaces)?;
+                        write_indent(out, current_indent + indent_spaces, unit)?;
                         stream_owned_value_yaml(
                             val,
                             out,
                             current_indent + indent_spaces,
                             indent_spaces,
+                            unit,
+                            sort_keys,
                         )?;
                     } else {
                         out.write_char(' ')?;
@@ -450,6 +492,8 @@ fn stream_owned_value_yaml<W: core::fmt::Write>(
                             out,
                             current_indent + indent_spaces,
                             indent_spaces,
+                            unit,
+                            sort_keys,
                         )?;
                     }
                 }
@@ -468,10 +512,11 @@ fn is_empty_container(value: &OwnedValue) -> bool {
     }
 }
 
-/// Write indentation spaces.
-fn write_indent<W: core::fmt::Write>(out: &mut W, spaces: usize) -> core::fmt::Result {
-    for _ in 0..spaces {
-        out.write_char(' ')?;
+/// Write `width` copies of `unit` as indentation (`unit` is `' '` for
+/// space-indented output, `'\t'` for `--tab`).
+fn write_indent<W: core::fmt::Write>(out: &mut W, width: usize, unit: char) -> core::fmt::Result {
+    for _ in 0..width {
+        out.write_char(unit)?;
     }
     Ok(())
 }
@@ -505,14 +550,14 @@ pub fn stream_yaml_string<W: core::fmt::Write>(out: &mut W, s: &str) -> core::fm
 pub fn stream_lazy_keys_yaml<W: core::fmt::Write, F: DocumentFields>(
     fields: &F,
     out: &mut W,
-    indent_spaces: usize,
+    indent: IndentSpec,
 ) -> core::fmt::Result {
     if fields.is_empty() {
         return out.write_str("[]");
     }
     let mut current = fields.clone();
     let mut i = 0usize;
-    if indent_spaces == 0 {
+    if indent.is_compact() {
         // Flow style
         out.write_char('[')?;
         while let Some((field, rest)) = current.uncons() {
@@ -684,36 +729,48 @@ mod tests {
     #[test]
     fn test_stream_null() {
         let mut buf = String::new();
-        OwnedValue::Null.stream_json(&mut buf, 0).unwrap();
+        OwnedValue::Null
+            .stream_json(&mut buf, IndentSpec::COMPACT, false)
+            .unwrap();
         assert_eq!(buf, "null");
     }
 
     #[test]
     fn test_stream_bool() {
         let mut buf = String::new();
-        OwnedValue::Bool(true).stream_json(&mut buf, 0).unwrap();
+        OwnedValue::Bool(true)
+            .stream_json(&mut buf, IndentSpec::COMPACT, false)
+            .unwrap();
         assert_eq!(buf, "true");
 
         buf.clear();
-        OwnedValue::Bool(false).stream_json(&mut buf, 0).unwrap();
+        OwnedValue::Bool(false)
+            .stream_json(&mut buf, IndentSpec::COMPACT, false)
+            .unwrap();
         assert_eq!(buf, "false");
     }
 
     #[test]
     fn test_stream_int() {
         let mut buf = String::new();
-        OwnedValue::Int(42).stream_json(&mut buf, 0).unwrap();
+        OwnedValue::Int(42)
+            .stream_json(&mut buf, IndentSpec::COMPACT, false)
+            .unwrap();
         assert_eq!(buf, "42");
 
         buf.clear();
-        OwnedValue::Int(-123).stream_json(&mut buf, 0).unwrap();
+        OwnedValue::Int(-123)
+            .stream_json(&mut buf, IndentSpec::COMPACT, false)
+            .unwrap();
         assert_eq!(buf, "-123");
     }
 
     #[test]
     fn test_stream_float() {
         let mut buf = String::new();
-        OwnedValue::Float(3.125).stream_json(&mut buf, 0).unwrap();
+        OwnedValue::Float(3.125)
+            .stream_json(&mut buf, IndentSpec::COMPACT, false)
+            .unwrap();
         assert_eq!(buf, "3.125");
     }
 
@@ -723,16 +780,20 @@ mod tests {
     #[test]
     fn test_stream_json_whole_float_keeps_decimal_point() {
         let mut buf = String::new();
-        OwnedValue::Float(1.0).stream_json(&mut buf, 0).unwrap();
+        OwnedValue::Float(1.0)
+            .stream_json(&mut buf, IndentSpec::COMPACT, false)
+            .unwrap();
         assert_eq!(buf, "1.0");
 
         buf.clear();
-        OwnedValue::Float(-0.0).stream_json(&mut buf, 0).unwrap();
+        OwnedValue::Float(-0.0)
+            .stream_json(&mut buf, IndentSpec::COMPACT, false)
+            .unwrap();
         assert_eq!(buf, "-0.0");
 
         buf.clear();
         OwnedValue::Array(vec![OwnedValue::Float(1.0), OwnedValue::Float(2.5)])
-            .stream_json(&mut buf, 0)
+            .stream_json(&mut buf, IndentSpec::COMPACT, false)
             .unwrap();
         assert_eq!(buf, "[1.0,2.5]");
     }
@@ -741,7 +802,9 @@ mod tests {
     #[test]
     fn test_stream_yaml_whole_float_keeps_decimal_point() {
         let mut buf = String::new();
-        OwnedValue::Float(1.0).stream_yaml(&mut buf, 0).unwrap();
+        OwnedValue::Float(1.0)
+            .stream_yaml(&mut buf, IndentSpec::COMPACT, false)
+            .unwrap();
         assert_eq!(buf, "1.0");
     }
 
@@ -761,7 +824,7 @@ mod tests {
     fn test_stream_json_number_literal() {
         let mut buf = String::new();
         OwnedValue::NumberLiteral(NumberRepr::Float(1.2e3), "1.2e3".into())
-            .stream_json(&mut buf, 0)
+            .stream_json(&mut buf, IndentSpec::COMPACT, false)
             .unwrap();
         assert_eq!(buf, "1.2E+3");
     }
@@ -773,13 +836,13 @@ mod tests {
         // non-finite Float does, not fall through to `format_number_jq_compat`.
         let mut buf = String::new();
         OwnedValue::NumberLiteral(NumberRepr::Float(f64::NAN), "nan".into())
-            .stream_json(&mut buf, 0)
+            .stream_json(&mut buf, IndentSpec::COMPACT, false)
             .unwrap();
         assert_eq!(buf, "null");
 
         buf.clear();
         OwnedValue::NumberLiteral(NumberRepr::Float(f64::INFINITY), "1e400".into())
-            .stream_json(&mut buf, 0)
+            .stream_json(&mut buf, IndentSpec::COMPACT, false)
             .unwrap();
         assert_eq!(buf, "null");
     }
@@ -788,19 +851,19 @@ mod tests {
     fn test_stream_yaml_number_literal_nan_and_infinite() {
         let mut buf = String::new();
         OwnedValue::NumberLiteral(NumberRepr::Float(f64::NAN), "nan".into())
-            .stream_yaml(&mut buf, 0)
+            .stream_yaml(&mut buf, IndentSpec::COMPACT, false)
             .unwrap();
         assert_eq!(buf, ".nan");
 
         buf.clear();
         OwnedValue::NumberLiteral(NumberRepr::Float(f64::INFINITY), "1e400".into())
-            .stream_yaml(&mut buf, 0)
+            .stream_yaml(&mut buf, IndentSpec::COMPACT, false)
             .unwrap();
         assert_eq!(buf, ".inf");
 
         buf.clear();
         OwnedValue::NumberLiteral(NumberRepr::Float(f64::NEG_INFINITY), "-1e400".into())
-            .stream_yaml(&mut buf, 0)
+            .stream_yaml(&mut buf, IndentSpec::COMPACT, false)
             .unwrap();
         assert_eq!(buf, "-.inf");
     }
@@ -809,7 +872,7 @@ mod tests {
     fn test_stream_string() {
         let mut buf = String::new();
         OwnedValue::String("hello".to_string())
-            .stream_json(&mut buf, 0)
+            .stream_json(&mut buf, IndentSpec::COMPACT, false)
             .unwrap();
         assert_eq!(buf, "\"hello\"");
     }
@@ -818,19 +881,19 @@ mod tests {
     fn test_stream_string_escaping() {
         let mut buf = String::new();
         OwnedValue::String("hello\nworld".to_string())
-            .stream_json(&mut buf, 0)
+            .stream_json(&mut buf, IndentSpec::COMPACT, false)
             .unwrap();
         assert_eq!(buf, "\"hello\\nworld\"");
 
         buf.clear();
         OwnedValue::String("tab\there".to_string())
-            .stream_json(&mut buf, 0)
+            .stream_json(&mut buf, IndentSpec::COMPACT, false)
             .unwrap();
         assert_eq!(buf, "\"tab\\there\"");
 
         buf.clear();
         OwnedValue::String("quote\"here".to_string())
-            .stream_json(&mut buf, 0)
+            .stream_json(&mut buf, IndentSpec::COMPACT, false)
             .unwrap();
         assert_eq!(buf, "\"quote\\\"here\"");
     }
@@ -843,7 +906,7 @@ mod tests {
             OwnedValue::Int(2),
             OwnedValue::Int(3),
         ])
-        .stream_json(&mut buf, 0)
+        .stream_json(&mut buf, IndentSpec::COMPACT, false)
         .unwrap();
         assert_eq!(buf, "[1,2,3]");
     }
@@ -854,7 +917,9 @@ mod tests {
         let mut map = IndexMap::new();
         map.insert("name".to_string(), OwnedValue::String("Alice".to_string()));
         map.insert("age".to_string(), OwnedValue::Int(30));
-        OwnedValue::Object(map).stream_json(&mut buf, 0).unwrap();
+        OwnedValue::Object(map)
+            .stream_json(&mut buf, IndentSpec::COMPACT, false)
+            .unwrap();
         assert_eq!(buf, "{\"name\":\"Alice\",\"age\":30}");
     }
 
@@ -872,7 +937,9 @@ mod tests {
             "tags".to_string(),
             OwnedValue::Array(vec![OwnedValue::Int(1), OwnedValue::Int(2)]),
         );
-        OwnedValue::Object(outer).stream_json(&mut buf, 2).unwrap();
+        OwnedValue::Object(outer)
+            .stream_json(&mut buf, IndentSpec::spaces(2), false)
+            .unwrap();
         assert_eq!(
             buf,
             "{\n  \"user\": {\n    \"name\": \"Alice\"\n  },\n  \"tags\": [\n    1,\n    2\n  ]\n}"
@@ -904,7 +971,7 @@ mod tests {
         let mut map = IndexMap::new();
         map.insert("a".to_string(), OwnedValue::String("boom".to_string()));
         let mut out = FailOnMarker { marker: "boom" };
-        let result = OwnedValue::Object(map).stream_json(&mut out, 2);
+        let result = OwnedValue::Object(map).stream_json(&mut out, IndentSpec::spaces(2), false);
         assert!(result.is_err());
     }
 

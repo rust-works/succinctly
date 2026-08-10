@@ -1148,16 +1148,18 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
     ///         self.0.write_all(s.as_bytes()).map_err(|_| core::fmt::Error)
     ///     }
     /// }
-    /// cursor.stream_json(&mut FmtWriter(&mut output), 0).unwrap();
+    /// cursor.stream_json(&mut FmtWriter(&mut output), IndentSpec::COMPACT, false).unwrap();
     /// ```
     ///
-    /// - `indent_spaces`: Spaces per indentation level (0 for compact)
+    /// - `indent`: indentation width/unit (`IndentSpec::COMPACT` for compact)
+    /// - `sort_keys`: sort mapping keys before writing (`-S`/`--sort-keys`)
     pub fn stream_json<Out: core::fmt::Write>(
         &self,
         out: &mut Out,
-        indent_spaces: usize,
+        indent: IndentSpec,
+        sort_keys: bool,
     ) -> core::fmt::Result {
-        self.stream_json_value(out, 0, indent_spaces)
+        self.stream_json_value(out, 0, indent.width, indent.unit, sort_keys)
     }
 
     /// Stream YAML as JSON, unwrapping single documents (matches yq behavior).
@@ -1165,11 +1167,13 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
     /// If the root is a single-document array `[doc]`, outputs just `doc` as JSON.
     /// If there are multiple documents, outputs the array `[doc1, doc2, ...]`.
     ///
-    /// - `indent_spaces`: Spaces per indentation level (0 for compact)
+    /// - `indent`: indentation width/unit (`IndentSpec::COMPACT` for compact)
+    /// - `sort_keys`: sort mapping keys before writing (`-S`/`--sort-keys`)
     pub fn stream_json_document<Out: core::fmt::Write>(
         &self,
         out: &mut Out,
-        indent_spaces: usize,
+        indent: IndentSpec,
+        sort_keys: bool,
     ) -> core::fmt::Result {
         // Check if this is the root document array with a single document
         if self.bp_pos == 0 {
@@ -1180,19 +1184,26 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                         // wrapper. Via the cursor, not the extracted
                         // `YamlValue`: the document's own tag lives on its
                         // cursor's `bp_pos` (#224).
-                        return first_cursor.stream_json_value(out, 0, indent_spaces);
+                        return first_cursor.stream_json_value(
+                            out,
+                            0,
+                            indent.width,
+                            indent.unit,
+                            sort_keys,
+                        );
                     }
                 }
             }
         }
 
         // Multiple documents or not at root - output as-is
-        self.stream_json_value(out, 0, indent_spaces)
+        self.stream_json_value(out, 0, indent.width, indent.unit, sort_keys)
     }
 
     /// Stream this cursor's value as YAML.
     ///
-    /// - `indent_spaces`: Spaces per indentation level (0 for flow style)
+    /// - `indent`: indentation width/unit (`IndentSpec::COMPACT` for flow style)
+    /// - `sort_keys`: sort mapping keys before writing (`-S`/`--sort-keys`)
     ///
     /// This enables M2.5 streaming optimization for YAML output format,
     /// allowing navigation query results to be written directly without
@@ -1200,9 +1211,10 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
     pub fn stream_yaml<Out: core::fmt::Write>(
         &self,
         out: &mut Out,
-        indent_spaces: usize,
+        indent: IndentSpec,
+        sort_keys: bool,
     ) -> core::fmt::Result {
-        self.stream_yaml_value(out, 0, indent_spaces)
+        self.stream_yaml_value(out, 0, indent.width, indent.unit, sort_keys)
     }
 
     /// Stream YAML, unwrapping single documents (matches yq behavior).
@@ -1211,7 +1223,8 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
     pub fn stream_yaml_document<Out: core::fmt::Write>(
         &self,
         out: &mut Out,
-        indent_spaces: usize,
+        indent: IndentSpec,
+        sort_keys: bool,
     ) -> core::fmt::Result {
         // Check if this is the root document array with a single document
         if self.bp_pos == 0 {
@@ -1219,22 +1232,38 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                 if let Some((cursor, rest)) = elements.uncons_cursor() {
                     if rest.is_empty() {
                         // Single document - output it directly without array wrapper
-                        return cursor.stream_yaml_value(out, 0, indent_spaces);
+                        return cursor.stream_yaml_value(
+                            out,
+                            0,
+                            indent.width,
+                            indent.unit,
+                            sort_keys,
+                        );
                     }
                 }
             }
         }
 
         // Multiple documents or not at root - output as-is
-        self.stream_yaml_value(out, 0, indent_spaces)
+        self.stream_yaml_value(out, 0, indent.width, indent.unit, sort_keys)
     }
 
     /// Internal: stream this cursor's value as YAML.
+    ///
+    /// - `unit`: the character repeated `indent_spaces` times per level
+    ///   (`' '` normally, `'\t'` for `--tab`).
+    /// - `sort_keys`: sort each mapping's fields before writing (`-S`).
+    ///   `YamlField` is `Copy`, so materializing a mapping's fields into a
+    ///   `Vec` to sort them is cheap — cursor structs only, no value data —
+    ///   and this branch is only taken when `-S` is actually requested, so
+    ///   the default (unsorted) path below is untouched.
     fn stream_yaml_value<Out: core::fmt::Write>(
         &self,
         out: &mut Out,
         current_indent: usize,
         indent_spaces: usize,
+        unit: char,
+        sort_keys: bool,
     ) -> core::fmt::Result {
         match self.value() {
             YamlValue::Null => out.write_str("null"),
@@ -1258,62 +1287,135 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                     // Flow style
                     out.write_char('{')?;
                     let mut first = true;
-                    for field in fields {
-                        if !first {
-                            out.write_str(", ")?;
-                        }
-                        first = false;
-                        // Write key
-                        if let YamlValue::String(s) = field.key() {
-                            if let Some(tag) = field.key_cursor().explicit_tag() {
-                                out.write_str(tag)?;
-                                out.write_char(' ')?;
+                    if sort_keys {
+                        let mut sorted: Vec<_> = fields.into_iter().collect();
+                        sorted.sort_by(|a, b| a.key().key_string().cmp(&b.key().key_string()));
+                        for field in sorted {
+                            if !first {
+                                out.write_str(", ")?;
                             }
-                            stream_yaml_string_value(out, &s)?;
-                        } else {
-                            stream_yaml_nonstring_key(out, &field.key())?;
+                            first = false;
+                            if let YamlValue::String(s) = field.key() {
+                                if let Some(tag) = field.key_cursor().explicit_tag() {
+                                    out.write_str(tag)?;
+                                    out.write_char(' ')?;
+                                }
+                                stream_yaml_string_value(out, &s)?;
+                            } else {
+                                stream_yaml_nonstring_key(out, &field.key())?;
+                            }
+                            out.write_str(": ")?;
+                            field
+                                .value_cursor()
+                                .stream_yaml_value(out, 0, 0, unit, sort_keys)?;
                         }
-                        out.write_str(": ")?;
-                        field.value_cursor().stream_yaml_value(out, 0, 0)?;
+                    } else {
+                        for field in fields {
+                            if !first {
+                                out.write_str(", ")?;
+                            }
+                            first = false;
+                            // Write key
+                            if let YamlValue::String(s) = field.key() {
+                                if let Some(tag) = field.key_cursor().explicit_tag() {
+                                    out.write_str(tag)?;
+                                    out.write_char(' ')?;
+                                }
+                                stream_yaml_string_value(out, &s)?;
+                            } else {
+                                stream_yaml_nonstring_key(out, &field.key())?;
+                            }
+                            out.write_str(": ")?;
+                            field
+                                .value_cursor()
+                                .stream_yaml_value(out, 0, 0, unit, sort_keys)?;
+                        }
                     }
                     out.write_char('}')
                 } else {
                     // Block style
                     let mut first = true;
-                    for field in fields {
-                        if !first {
-                            out.write_char('\n')?;
-                            write_yaml_indent(out, current_indent)?;
-                        }
-                        first = false;
-                        // Write key
-                        if let YamlValue::String(s) = field.key() {
-                            if let Some(tag) = field.key_cursor().explicit_tag() {
-                                out.write_str(tag)?;
-                                out.write_char(' ')?;
+                    if sort_keys {
+                        let mut sorted: Vec<_> = fields.into_iter().collect();
+                        sorted.sort_by(|a, b| a.key().key_string().cmp(&b.key().key_string()));
+                        for field in sorted {
+                            if !first {
+                                out.write_char('\n')?;
+                                write_yaml_indent(out, current_indent, unit)?;
                             }
-                            stream_yaml_string_value(out, &s)?;
-                        } else {
-                            stream_yaml_nonstring_key(out, &field.key())?;
+                            first = false;
+                            if let YamlValue::String(s) = field.key() {
+                                if let Some(tag) = field.key_cursor().explicit_tag() {
+                                    out.write_str(tag)?;
+                                    out.write_char(' ')?;
+                                }
+                                stream_yaml_string_value(out, &s)?;
+                            } else {
+                                stream_yaml_nonstring_key(out, &field.key())?;
+                            }
+                            out.write_char(':')?;
+                            let value = field.value_cursor();
+                            if is_yaml_cursor_container(&value) && value.style() != "flow" {
+                                out.write_char('\n')?;
+                                write_yaml_indent(out, current_indent + indent_spaces, unit)?;
+                                value.stream_yaml_value(
+                                    out,
+                                    current_indent + indent_spaces,
+                                    indent_spaces,
+                                    unit,
+                                    sort_keys,
+                                )?;
+                            } else {
+                                out.write_char(' ')?;
+                                value.stream_yaml_value(
+                                    out,
+                                    current_indent + indent_spaces,
+                                    indent_spaces,
+                                    unit,
+                                    sort_keys,
+                                )?;
+                            }
                         }
-                        out.write_char(':')?;
-                        // Check if value needs newline
-                        let value = field.value_cursor();
-                        if is_yaml_cursor_container(&value) && value.style() != "flow" {
-                            out.write_char('\n')?;
-                            write_yaml_indent(out, current_indent + indent_spaces)?;
-                            value.stream_yaml_value(
-                                out,
-                                current_indent + indent_spaces,
-                                indent_spaces,
-                            )?;
-                        } else {
-                            out.write_char(' ')?;
-                            value.stream_yaml_value(
-                                out,
-                                current_indent + indent_spaces,
-                                indent_spaces,
-                            )?;
+                    } else {
+                        for field in fields {
+                            if !first {
+                                out.write_char('\n')?;
+                                write_yaml_indent(out, current_indent, unit)?;
+                            }
+                            first = false;
+                            // Write key
+                            if let YamlValue::String(s) = field.key() {
+                                if let Some(tag) = field.key_cursor().explicit_tag() {
+                                    out.write_str(tag)?;
+                                    out.write_char(' ')?;
+                                }
+                                stream_yaml_string_value(out, &s)?;
+                            } else {
+                                stream_yaml_nonstring_key(out, &field.key())?;
+                            }
+                            out.write_char(':')?;
+                            // Check if value needs newline
+                            let value = field.value_cursor();
+                            if is_yaml_cursor_container(&value) && value.style() != "flow" {
+                                out.write_char('\n')?;
+                                write_yaml_indent(out, current_indent + indent_spaces, unit)?;
+                                value.stream_yaml_value(
+                                    out,
+                                    current_indent + indent_spaces,
+                                    indent_spaces,
+                                    unit,
+                                    sort_keys,
+                                )?;
+                            } else {
+                                out.write_char(' ')?;
+                                value.stream_yaml_value(
+                                    out,
+                                    current_indent + indent_spaces,
+                                    indent_spaces,
+                                    unit,
+                                    sort_keys,
+                                )?;
+                            }
                         }
                     }
                     Ok(())
@@ -1333,7 +1435,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                             out.write_str(", ")?;
                         }
                         first = false;
-                        cursor.stream_yaml_value(out, 0, 0)?;
+                        cursor.stream_yaml_value(out, 0, 0, unit, sort_keys)?;
                         elems = rest;
                     }
                     out.write_char(']')
@@ -1344,7 +1446,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                     while let Some((cursor, rest)) = elems.uncons_cursor() {
                         if !first {
                             out.write_char('\n')?;
-                            write_yaml_indent(out, current_indent)?;
+                            write_yaml_indent(out, current_indent, unit)?;
                         }
                         first = false;
                         // Check if value needs newline. A container value
@@ -1355,11 +1457,13 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                         if is_yaml_cursor_container(&cursor) && cursor.style() != "flow" {
                             out.write_char('-')?;
                             out.write_char('\n')?;
-                            write_yaml_indent(out, current_indent + indent_spaces)?;
+                            write_yaml_indent(out, current_indent + indent_spaces, unit)?;
                             cursor.stream_yaml_value(
                                 out,
                                 current_indent + indent_spaces,
                                 indent_spaces,
+                                unit,
+                                sort_keys,
                             )?;
                         } else {
                             out.write_str("- ")?;
@@ -1367,6 +1471,8 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                                 out,
                                 current_indent + indent_spaces,
                                 indent_spaces,
+                                unit,
+                                sort_keys,
                             )?;
                         }
                         elems = rest;
@@ -1376,7 +1482,13 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
             }
             YamlValue::Alias { target, .. } => {
                 if let Some(target_cursor) = target {
-                    target_cursor.stream_yaml_value(out, current_indent, indent_spaces)
+                    target_cursor.stream_yaml_value(
+                        out,
+                        current_indent,
+                        indent_spaces,
+                        unit,
+                        sort_keys,
+                    )
                 } else {
                     out.write_str("null")
                 }
@@ -1388,11 +1500,18 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
     /// Internal: stream this cursor's value as JSON.
     ///
     /// - `indent_spaces`: Spaces per indentation level (0 for compact)
+    /// - `unit`: the character repeated `indent_spaces` times per level
+    ///   (`' '` normally, `'\t'` for `--tab`).
+    /// - `sort_keys`: sort each mapping's fields before writing (`-S`). See
+    ///   `stream_yaml_value`'s doc comment for why materializing into a
+    ///   `Vec<YamlField>` to sort is cheap and only paid when requested.
     fn stream_json_value<Out: core::fmt::Write>(
         &self,
         out: &mut Out,
         current_indent: usize,
         indent_spaces: usize,
+        unit: char,
+        sort_keys: bool,
     ) -> core::fmt::Result {
         match self.value() {
             YamlValue::Null => out.write_str("null"),
@@ -1435,42 +1554,83 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                 out.write_char('{')?;
                 let next_indent = current_indent + indent_spaces;
                 let mut first = true;
-                for field in fields {
-                    if !first {
-                        out.write_char(',')?;
-                    }
-                    first = false;
-                    if indent_spaces > 0 {
-                        out.write_char('\n')?;
-                        write_yaml_indent(out, next_indent)?;
-                    }
-
-                    // Write key
-                    if let YamlValue::String(s) = field.key() {
-                        match stream_yaml_string_to_json(out, &s) {
-                            Ok(true) => {} // Written directly
-                            Ok(false) | Err(_) => {
-                                if let Ok(key_str) = s.as_str() {
-                                    stream_json_string(out, &key_str)?;
-                                } else {
-                                    out.write_str("\"\"")?;
+                if sort_keys {
+                    let mut sorted: Vec<_> = fields.into_iter().collect();
+                    sorted.sort_by(|a, b| a.key().key_string().cmp(&b.key().key_string()));
+                    for field in sorted {
+                        if !first {
+                            out.write_char(',')?;
+                        }
+                        first = false;
+                        if indent_spaces > 0 {
+                            out.write_char('\n')?;
+                            write_yaml_indent(out, next_indent, unit)?;
+                        }
+                        if let YamlValue::String(s) = field.key() {
+                            match stream_yaml_string_to_json(out, &s) {
+                                Ok(true) => {} // Written directly
+                                Ok(false) | Err(_) => {
+                                    if let Ok(key_str) = s.as_str() {
+                                        stream_json_string(out, &key_str)?;
+                                    } else {
+                                        out.write_str("\"\"")?;
+                                    }
                                 }
                             }
+                        } else {
+                            stream_json_string(out, &field.key().key_string())?;
                         }
-                    } else {
-                        // Alias/complex key (#222): resolve alias-to-scalar,
-                        // else "" — the entry is kept, never dropped
-                        stream_json_string(out, &field.key().key_string())?;
+                        out.write_str(if indent_spaces > 0 { ": " } else { ":" })?;
+                        field.value_cursor().stream_json_value(
+                            out,
+                            next_indent,
+                            indent_spaces,
+                            unit,
+                            sort_keys,
+                        )?;
                     }
+                } else {
+                    for field in fields {
+                        if !first {
+                            out.write_char(',')?;
+                        }
+                        first = false;
+                        if indent_spaces > 0 {
+                            out.write_char('\n')?;
+                            write_yaml_indent(out, next_indent, unit)?;
+                        }
 
-                    out.write_str(if indent_spaces > 0 { ": " } else { ":" })?;
-                    field
-                        .value_cursor()
-                        .stream_json_value(out, next_indent, indent_spaces)?;
+                        // Write key
+                        if let YamlValue::String(s) = field.key() {
+                            match stream_yaml_string_to_json(out, &s) {
+                                Ok(true) => {} // Written directly
+                                Ok(false) | Err(_) => {
+                                    if let Ok(key_str) = s.as_str() {
+                                        stream_json_string(out, &key_str)?;
+                                    } else {
+                                        out.write_str("\"\"")?;
+                                    }
+                                }
+                            }
+                        } else {
+                            // Alias/complex key (#222): resolve alias-to-scalar,
+                            // else "" — the entry is kept, never dropped
+                            stream_json_string(out, &field.key().key_string())?;
+                        }
+
+                        out.write_str(if indent_spaces > 0 { ": " } else { ":" })?;
+                        field.value_cursor().stream_json_value(
+                            out,
+                            next_indent,
+                            indent_spaces,
+                            unit,
+                            sort_keys,
+                        )?;
+                    }
                 }
                 if indent_spaces > 0 {
                     out.write_char('\n')?;
-                    write_yaml_indent(out, current_indent)?;
+                    write_yaml_indent(out, current_indent, unit)?;
                 }
                 out.write_char('}')
             }
@@ -1490,22 +1650,28 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                     rest = next;
                     if indent_spaces > 0 {
                         out.write_char('\n')?;
-                        write_yaml_indent(out, next_indent)?;
+                        write_yaml_indent(out, next_indent, unit)?;
                     }
                     // Recurse via the cursor, not the extracted `YamlValue`:
                     // an element's own tag lives on its cursor's `bp_pos`,
                     // which a bare `YamlValue` has already lost (#224).
-                    cursor.stream_json_value(out, next_indent, indent_spaces)?;
+                    cursor.stream_json_value(out, next_indent, indent_spaces, unit, sort_keys)?;
                 }
                 if indent_spaces > 0 {
                     out.write_char('\n')?;
-                    write_yaml_indent(out, current_indent)?;
+                    write_yaml_indent(out, current_indent, unit)?;
                 }
                 out.write_char(']')
             }
             YamlValue::Alias { target, .. } => {
                 if let Some(target_cursor) = target {
-                    target_cursor.stream_json_value(out, current_indent, indent_spaces)
+                    target_cursor.stream_json_value(
+                        out,
+                        current_indent,
+                        indent_spaces,
+                        unit,
+                        sort_keys,
+                    )
                 } else {
                     out.write_str("null")
                 }
@@ -4826,7 +4992,7 @@ impl core::fmt::Display for YamlNumberError {
 // ============================================================================
 
 use crate::jq::document::{
-    DocumentCursor, DocumentElements, DocumentField, DocumentFields, DocumentValue,
+    DocumentCursor, DocumentElements, DocumentField, DocumentFields, DocumentValue, IndentSpec,
 };
 
 impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
@@ -4901,18 +5067,20 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
     fn stream_json<Out: core::fmt::Write>(
         &self,
         out: &mut Out,
-        indent_spaces: usize,
+        indent: IndentSpec,
+        sort_keys: bool,
     ) -> core::fmt::Result {
-        YamlCursor::stream_json(self, out, indent_spaces)
+        YamlCursor::stream_json(self, out, indent, sort_keys)
     }
 
     #[inline]
     fn stream_yaml<Out: core::fmt::Write>(
         &self,
         out: &mut Out,
-        indent_spaces: usize,
+        indent: IndentSpec,
+        sort_keys: bool,
     ) -> core::fmt::Result {
-        YamlCursor::stream_yaml(self, out, indent_spaces)
+        YamlCursor::stream_yaml(self, out, indent, sort_keys)
     }
 
     #[inline]
@@ -5199,10 +5367,15 @@ fn is_yaml_cursor_container<W: AsRef<[u64]>>(cursor: &YamlCursor<'_, W>) -> bool
     }
 }
 
-/// Write indentation spaces.
-fn write_yaml_indent<Out: core::fmt::Write>(out: &mut Out, spaces: usize) -> core::fmt::Result {
-    for _ in 0..spaces {
-        out.write_char(' ')?;
+/// Write `width` copies of `unit` as indentation (`unit` is `' '` for
+/// space-indented output, `'\t'` for `--tab`).
+fn write_yaml_indent<Out: core::fmt::Write>(
+    out: &mut Out,
+    width: usize,
+    unit: char,
+) -> core::fmt::Result {
+    for _ in 0..width {
+        out.write_char(unit)?;
     }
     Ok(())
 }
@@ -5225,6 +5398,8 @@ pub fn stream_yaml_sequence<'a, W, I, Out>(
     out: &mut Out,
     current_indent: usize,
     indent_spaces: usize,
+    unit: char,
+    sort_keys: bool,
 ) -> core::fmt::Result
 where
     W: AsRef<[u64]> + 'a,
@@ -5244,7 +5419,7 @@ where
                 out.write_str(", ")?;
             }
             first = false;
-            cursor.stream_yaml_value(out, 0, 0)?;
+            cursor.stream_yaml_value(out, 0, 0, unit, sort_keys)?;
         }
         out.write_char(']')
     } else {
@@ -5253,17 +5428,29 @@ where
         for cursor in iter {
             if !first {
                 out.write_char('\n')?;
-                write_yaml_indent(out, current_indent)?;
+                write_yaml_indent(out, current_indent, unit)?;
             }
             first = false;
             if is_yaml_cursor_container(&cursor) {
                 out.write_char('-')?;
                 out.write_char('\n')?;
-                write_yaml_indent(out, current_indent + indent_spaces)?;
-                cursor.stream_yaml_value(out, current_indent + indent_spaces, indent_spaces)?;
+                write_yaml_indent(out, current_indent + indent_spaces, unit)?;
+                cursor.stream_yaml_value(
+                    out,
+                    current_indent + indent_spaces,
+                    indent_spaces,
+                    unit,
+                    sort_keys,
+                )?;
             } else {
                 out.write_str("- ")?;
-                cursor.stream_yaml_value(out, current_indent + indent_spaces, indent_spaces)?;
+                cursor.stream_yaml_value(
+                    out,
+                    current_indent + indent_spaces,
+                    indent_spaces,
+                    unit,
+                    sort_keys,
+                )?;
             }
         }
         Ok(())
@@ -5746,7 +5933,10 @@ mod tests {
         let yaml = b"s: \"caf\\xe9\"\ni: +123\nf: +1.5\n";
         let index = YamlIndex::build(yaml).unwrap();
         let mut out = String::new();
-        index.root(yaml).stream_json_document(&mut out, 0).unwrap();
+        index
+            .root(yaml)
+            .stream_json_document(&mut out, IndentSpec::COMPACT, false)
+            .unwrap();
         assert!(out.contains("\"i\":123"), "got {out}");
         assert!(out.contains("\"f\":1.5"), "got {out}");
     }
@@ -5762,7 +5952,10 @@ mod tests {
         let yaml = b"s: \"next\\Nline\"\nt: \"non\\_break\"\n";
         let index = YamlIndex::build(yaml).unwrap();
         let mut out = String::new();
-        index.root(yaml).stream_json_document(&mut out, 0).unwrap();
+        index
+            .root(yaml)
+            .stream_json_document(&mut out, IndentSpec::COMPACT, false)
+            .unwrap();
         assert!(out.contains("\"s\":\"next\u{0085}line\""), "got {out}");
         assert!(out.contains("\"t\":\"non\u{00a0}break\""), "got {out}");
     }
@@ -5776,7 +5969,10 @@ mod tests {
         let yaml = b"s: \"line\\Lsep\"\nt: \"para\\Psep\"\n";
         let index = YamlIndex::build(yaml).unwrap();
         let mut out = String::new();
-        index.root(yaml).stream_json_document(&mut out, 0).unwrap();
+        index
+            .root(yaml)
+            .stream_json_document(&mut out, IndentSpec::COMPACT, false)
+            .unwrap();
         assert!(out.contains("\"s\":\"line\\u2028sep\""), "got {out}");
         assert!(out.contains("\"t\":\"para\\u2029sep\""), "got {out}");
     }
@@ -5810,7 +6006,7 @@ mod tests {
             let mut streamed = String::new();
             index
                 .root(yaml)
-                .stream_json_document(&mut streamed, 0)
+                .stream_json_document(&mut streamed, IndentSpec::COMPACT, false)
                 .unwrap();
             let input = core::str::from_utf8(yaml).unwrap();
             assert_eq!(json, *expected, "to_json mismatch for {input:?}");
@@ -5830,7 +6026,8 @@ mod tests {
 
         let json = root.to_json_document();
         let mut streamed = String::new();
-        root.stream_json_document(&mut streamed, 0).unwrap();
+        root.stream_json_document(&mut streamed, IndentSpec::COMPACT, false)
+            .unwrap();
 
         assert_eq!(json, r#"[{"a":1},{"b":2}]"#);
         assert_eq!(streamed, json);
@@ -5858,7 +6055,7 @@ mod tests {
             let mut streamed = String::new();
             index
                 .root(yaml)
-                .stream_json_document(&mut streamed, 0)
+                .stream_json_document(&mut streamed, IndentSpec::COMPACT, false)
                 .unwrap();
             let input = core::str::from_utf8(yaml).unwrap();
             assert_eq!(json, *expected, "to_json mismatch for {input:?}");
@@ -5919,7 +6116,7 @@ mod tests {
             let mut streamed = String::new();
             index
                 .root(yaml)
-                .stream_json_document(&mut streamed, 0)
+                .stream_json_document(&mut streamed, IndentSpec::COMPACT, false)
                 .unwrap();
             let input = core::str::from_utf8(yaml).unwrap();
             assert_eq!(json, *expected, "to_json mismatch for {input:?}");
@@ -5993,7 +6190,7 @@ mod tests {
             let mut streamed = String::new();
             index
                 .root(yaml)
-                .stream_json_document(&mut streamed, 0)
+                .stream_json_document(&mut streamed, IndentSpec::COMPACT, false)
                 .unwrap();
             let mut expected_json = String::new();
             write_json_string(&mut expected_json, expected);
@@ -6061,7 +6258,10 @@ mod tests {
         let yaml = multibyte_yaml();
         let index = YamlIndex::build(&yaml).unwrap();
         let mut out = String::new();
-        index.root(&yaml).stream_json_document(&mut out, 0).unwrap();
+        index
+            .root(&yaml)
+            .stream_json_document(&mut out, IndentSpec::COMPACT, false)
+            .unwrap();
         for expect in MULTIBYTE_JSON_VALUES {
             assert!(
                 out.contains(expect),
@@ -6079,7 +6279,10 @@ mod tests {
         let yaml = b"a: 1\nb: true\nc: hello\nd: 1.0\ne: .5\nf: yes\ng: null\n";
         let index = YamlIndex::build(yaml).unwrap();
         let mut out = String::new();
-        index.root(yaml).stream_yaml_document(&mut out, 2).unwrap();
+        index
+            .root(yaml)
+            .stream_yaml_document(&mut out, IndentSpec::spaces(2), false)
+            .unwrap();
         assert_eq!(
             out,
             "a: 1\nb: true\nc: hello\nd: 1.0\ne: .5\nf: yes\ng: null"
@@ -6094,7 +6297,10 @@ mod tests {
         let yaml = b"a: [1, 2, 3]\nb: {c: 1, d: 2}\n";
         let index = YamlIndex::build(yaml).unwrap();
         let mut out = String::new();
-        index.root(yaml).stream_yaml_document(&mut out, 2).unwrap();
+        index
+            .root(yaml)
+            .stream_yaml_document(&mut out, IndentSpec::spaces(2), false)
+            .unwrap();
         assert_eq!(out, "a: [1, 2, 3]\nb: {c: 1, d: 2}");
     }
 
@@ -6105,7 +6311,10 @@ mod tests {
         let yaml = b"top:\n  a: [1, 2, 3]\n";
         let index = YamlIndex::build(yaml).unwrap();
         let mut out = String::new();
-        index.root(yaml).stream_yaml_document(&mut out, 2).unwrap();
+        index
+            .root(yaml)
+            .stream_yaml_document(&mut out, IndentSpec::spaces(2), false)
+            .unwrap();
         assert_eq!(out, "top:\n  a: [1, 2, 3]");
     }
 
@@ -6116,7 +6325,10 @@ mod tests {
         let yaml = b"a:\n  - [1, 2]\n  - 3\n";
         let index = YamlIndex::build(yaml).unwrap();
         let mut out = String::new();
-        index.root(yaml).stream_yaml_document(&mut out, 2).unwrap();
+        index
+            .root(yaml)
+            .stream_yaml_document(&mut out, IndentSpec::spaces(2), false)
+            .unwrap();
         assert_eq!(out, "a:\n  - [1, 2]\n  - 3");
     }
 
@@ -6127,7 +6339,10 @@ mod tests {
         let yaml = b"a:\n  b: {x: 1, y: 2}\n  c: 3\n";
         let index = YamlIndex::build(yaml).unwrap();
         let mut out = String::new();
-        index.root(yaml).stream_yaml_document(&mut out, 2).unwrap();
+        index
+            .root(yaml)
+            .stream_yaml_document(&mut out, IndentSpec::spaces(2), false)
+            .unwrap();
         assert_eq!(out, "a:\n  b: {x: 1, y: 2}\n  c: 3");
     }
 
@@ -6138,7 +6353,10 @@ mod tests {
         let yaml = b"a: [1, 2, 3]\nb:\n  x: 1\n  y: 2\n";
         let index = YamlIndex::build(yaml).unwrap();
         let mut out = String::new();
-        index.root(yaml).stream_yaml_document(&mut out, 2).unwrap();
+        index
+            .root(yaml)
+            .stream_yaml_document(&mut out, IndentSpec::spaces(2), false)
+            .unwrap();
         assert_eq!(out, "a: [1, 2, 3]\nb:\n  x: 1\n  y: 2");
     }
 
@@ -6150,7 +6368,10 @@ mod tests {
         let yaml = b"a: {b: [1, 2], c: {d: 3}}\n";
         let index = YamlIndex::build(yaml).unwrap();
         let mut out = String::new();
-        index.root(yaml).stream_yaml_document(&mut out, 2).unwrap();
+        index
+            .root(yaml)
+            .stream_yaml_document(&mut out, IndentSpec::spaces(2), false)
+            .unwrap();
         assert_eq!(out, "a: {b: [1, 2], c: {d: 3}}");
     }
 
@@ -6161,7 +6382,10 @@ mod tests {
         let yaml = b"a: []\nb: {}\n";
         let index = YamlIndex::build(yaml).unwrap();
         let mut out = String::new();
-        index.root(yaml).stream_yaml_document(&mut out, 2).unwrap();
+        index
+            .root(yaml)
+            .stream_yaml_document(&mut out, IndentSpec::spaces(2), false)
+            .unwrap();
         assert_eq!(out, "a: []\nb: {}");
     }
 
@@ -6184,7 +6408,7 @@ mod tests {
         let cursor_b = index_b.root(&bytes_b).first_child().unwrap();
 
         let mut out = String::new();
-        stream_yaml_sequence([cursor_a, cursor_b], &mut out, 0, 0).unwrap();
+        stream_yaml_sequence([cursor_a, cursor_b], &mut out, 0, 0, ' ', false).unwrap();
         assert_eq!(out, "[{a: 1}, {b: 2}]");
     }
 
@@ -6195,7 +6419,10 @@ mod tests {
         let yaml = b"a: \"1\"\nb: 'true'\nc: \"hello\"\n";
         let index = YamlIndex::build(yaml).unwrap();
         let mut out = String::new();
-        index.root(yaml).stream_yaml_document(&mut out, 2).unwrap();
+        index
+            .root(yaml)
+            .stream_yaml_document(&mut out, IndentSpec::spaces(2), false)
+            .unwrap();
         assert_eq!(out, "a: \"1\"\nb: 'true'\nc: \"hello\"");
     }
 
@@ -6208,7 +6435,10 @@ mod tests {
         let yaml = b"a: |-\n  hello\n  world\nb: |-\n  plain\nc: |-\n  true\nd: |-\n  123\ne: |-\n  1.5e+3\nf: |-\n  12x\ng: |-\n  1.5.5\nh: |-\n  +\ni: |-\n  +x\nj: |-\n  +5x\nk: >-\n  folded here\nl: |-\n  -foo\n";
         let index = YamlIndex::build(yaml).unwrap();
         let mut out = String::new();
-        index.root(yaml).stream_yaml_document(&mut out, 2).unwrap();
+        index
+            .root(yaml)
+            .stream_yaml_document(&mut out, IndentSpec::spaces(2), false)
+            .unwrap();
         assert_eq!(
             out,
             "a: \"hello\\nworld\"\n\
@@ -6233,7 +6463,10 @@ mod tests {
         let yaml = b"t: |-\n  x \n";
         let index = YamlIndex::build(yaml).unwrap();
         let mut out = String::new();
-        index.root(yaml).stream_yaml_document(&mut out, 2).unwrap();
+        index
+            .root(yaml)
+            .stream_yaml_document(&mut out, IndentSpec::spaces(2), false)
+            .unwrap();
         assert_eq!(out, "t: \"x \"");
     }
 
@@ -6246,7 +6479,10 @@ mod tests {
         let yaml = b"a: one\n  two\nb: one\n\n  two\n";
         let index = YamlIndex::build(yaml).unwrap();
         let mut out = String::new();
-        index.root(yaml).stream_yaml_document(&mut out, 2).unwrap();
+        index
+            .root(yaml)
+            .stream_yaml_document(&mut out, IndentSpec::spaces(2), false)
+            .unwrap();
         assert_eq!(out, "a: one two\nb: \"one\\ntwo\"");
     }
 
@@ -6749,7 +6985,8 @@ mod tests {
             );
 
             let mut streamed = String::new();
-            root.stream_json_document(&mut streamed, 0).unwrap();
+            root.stream_json_document(&mut streamed, IndentSpec::COMPACT, false)
+                .unwrap();
             assert_eq!(
                 streamed,
                 *expected,
@@ -7116,7 +7353,7 @@ mod tests {
             let mut streamed = String::new();
             index
                 .root(yaml)
-                .stream_json_document(&mut streamed, 0)
+                .stream_json_document(&mut streamed, IndentSpec::COMPACT, false)
                 .unwrap();
             let input = core::str::from_utf8(yaml).unwrap();
             assert_eq!(json, *expected, "to_json mismatch for {input:?}");
@@ -7231,7 +7468,7 @@ mod tests {
             let mut streamed = String::new();
             index
                 .root(yaml)
-                .stream_json_document(&mut streamed, 0)
+                .stream_json_document(&mut streamed, IndentSpec::COMPACT, false)
                 .unwrap();
             let input = core::str::from_utf8(yaml).unwrap();
             assert_eq!(json, *expected, "to_json mismatch for {input:?}");
@@ -7335,7 +7572,7 @@ mod tests {
             let mut streamed = String::new();
             index
                 .root(yaml)
-                .stream_json_document(&mut streamed, 0)
+                .stream_json_document(&mut streamed, IndentSpec::COMPACT, false)
                 .unwrap();
             let input = core::str::from_utf8(yaml).unwrap();
             assert_eq!(json, *expected, "to_json mismatch for {input:?}");
@@ -7384,7 +7621,7 @@ mod tests {
             let mut streamed = String::new();
             index
                 .root(yaml)
-                .stream_json_document(&mut streamed, 0)
+                .stream_json_document(&mut streamed, IndentSpec::COMPACT, false)
                 .unwrap();
             let input = core::str::from_utf8(yaml).unwrap();
             assert_eq!(json, *expected, "to_json mismatch for {input:?}");
@@ -8845,7 +9082,9 @@ mod tests {
                 let cursor = field.value_cursor();
                 assert_eq!(cursor.to_json(), "\"hello\"");
                 let mut streamed = String::new();
-                cursor.stream_json(&mut streamed, 0).expect("streams");
+                cursor
+                    .stream_json(&mut streamed, IndentSpec::COMPACT, false)
+                    .expect("streams");
                 assert_eq!(streamed, "\"hello\"");
                 return;
             }
@@ -9502,7 +9741,9 @@ mod tests {
 
         let buffered = cursor.to_json();
         let mut streamed = String::new();
-        cursor.stream_json(&mut streamed, 0).expect("streams");
+        cursor
+            .stream_json(&mut streamed, IndentSpec::COMPACT, false)
+            .expect("streams");
         let what = String::from_utf8_lossy(yaml);
         assert_eq!(
             buffered, streamed,
@@ -9741,7 +9982,8 @@ mod tests {
             let index = YamlIndex::build(yaml).expect("builds");
             let root = index.root(yaml);
             let mut out = String::new();
-            root.stream_yaml_document(&mut out, 2).expect("streams");
+            root.stream_yaml_document(&mut out, IndentSpec::spaces(2), false)
+                .expect("streams");
             let what = String::from_utf8_lossy(yaml);
             assert_eq!(out, expected, "for {what}");
 
@@ -9773,7 +10015,9 @@ mod tests {
             if let Some(field) = fields.into_iter().next() {
                 let cursor = field.value_cursor();
                 let mut out = String::new();
-                cursor.stream_yaml(&mut out, 0).expect("streams");
+                cursor
+                    .stream_yaml(&mut out, IndentSpec::COMPACT, false)
+                    .expect("streams");
                 assert_eq!(out, "{!!str k: v}");
                 return;
             }

@@ -9,6 +9,42 @@ use alloc::{borrow::Cow, string::String, vec::Vec};
 #[cfg(test)]
 use std::borrow::Cow;
 
+/// Indentation configuration for cursor/lazy streaming output.
+///
+/// `width` is the number of `unit` characters written per nesting level;
+/// `width == 0` means compact/flow style (no newlines, no indentation).
+/// `unit` is `' '` for ordinary space-indented output and `'\t'` for
+/// `--tab` — mirroring `OutputConfig::indent_str` in
+/// `src/bin/succinctly/yq_runner.rs`, which the `OwnedValue` DOM path
+/// already builds this way (`if args.tab { "\t" } else { "
+/// ".repeat(args.indent) }`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IndentSpec {
+    /// Number of `unit` characters per indentation level.
+    pub width: usize,
+    /// The character repeated `width` times per level.
+    pub unit: char,
+}
+
+impl IndentSpec {
+    /// Compact/flow style: no indentation, no newlines.
+    pub const COMPACT: Self = Self {
+        width: 0,
+        unit: ' ',
+    };
+
+    /// `width` spaces per indentation level.
+    pub fn spaces(width: usize) -> Self {
+        Self { width, unit: ' ' }
+    }
+
+    /// Whether this spec requests compact/flow-style output (no newlines).
+    #[inline]
+    pub fn is_compact(&self) -> bool {
+        self.width == 0
+    }
+}
+
 /// A cursor for navigating an indexed document.
 ///
 /// Provides tree navigation operations that work in O(1) time
@@ -107,13 +143,15 @@ pub trait DocumentCursor: Sized + Copy + Clone {
     ///
     /// This enables M2 streaming optimization where navigation query results
     /// can be written directly to output without materializing OwnedValue.
-    /// - `indent_spaces`: Spaces per indentation level (0 for compact)
+    /// - `indent`: indentation width/unit (`IndentSpec::COMPACT` for compact)
+    /// - `sort_keys`: sort mapping/object keys before writing (`-S`/`--sort-keys`)
     ///
     /// Default implementation returns an error indicating streaming is not supported.
     fn stream_json<W: core::fmt::Write>(
         &self,
         _out: &mut W,
-        _indent_spaces: usize,
+        _indent: IndentSpec,
+        _sort_keys: bool,
     ) -> core::fmt::Result {
         Err(core::fmt::Error)
     }
@@ -121,15 +159,17 @@ pub trait DocumentCursor: Sized + Copy + Clone {
     /// Stream this cursor's value as YAML to the output.
     ///
     /// This enables M2.5 streaming optimization for YAML output format.
-    /// - `indent_spaces`: Spaces per indentation level for block style (0
-    ///   forces flow style for the whole subtree); a node whose source used
-    ///   flow style renders as flow regardless of `indent_spaces` (#707).
+    /// - `indent`: indentation width/unit (`IndentSpec::COMPACT` forces flow
+    ///   style for the whole subtree); a node whose source used flow style
+    ///   renders as flow regardless of `indent` (#707).
+    /// - `sort_keys`: sort mapping/object keys before writing (`-S`/`--sort-keys`)
     ///
     /// Default implementation returns an error indicating streaming is not supported.
     fn stream_yaml<W: core::fmt::Write>(
         &self,
         _out: &mut W,
-        _indent_spaces: usize,
+        _indent: IndentSpec,
+        _sort_keys: bool,
     ) -> core::fmt::Result {
         Err(core::fmt::Error)
     }

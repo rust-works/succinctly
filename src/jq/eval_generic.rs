@@ -17,7 +17,9 @@ use alloc::vec::Vec;
 
 use indexmap::IndexMap;
 
-use super::document::{DocumentCursor, DocumentElements, DocumentFields, DocumentValue};
+use super::document::{
+    DocumentCursor, DocumentElements, DocumentFields, DocumentValue, IndentSpec,
+};
 use super::eval::{
     compare_values, eval as full_eval, format_owned, index_one_owned as index_owned_by_key,
     needs_path_context, numeric_display_string, numeric_key_to_index, owned_bound_to_i64,
@@ -480,13 +482,15 @@ impl<V: DocumentValue> GenericResult<V> {
     ///
     /// This is the M2 streaming fast path that avoids OwnedValue materialization
     /// for cursor-based results. For owned results, uses the StreamableValue impl.
-    /// - `indent_spaces`: Spaces per indentation level (0 for compact)
+    /// - `indent`: indentation width/unit (`IndentSpec::COMPACT` for compact)
+    /// - `sort_keys`: sort mapping/object keys before writing (`-S`/`--sort-keys`)
     ///
     /// Returns the number of values streamed and whether the last was falsy.
     pub fn stream_json<W: core::fmt::Write>(
         &self,
         out: &mut W,
-        indent_spaces: usize,
+        indent: IndentSpec,
+        sort_keys: bool,
         mut on_value: impl FnMut(&mut W) -> core::fmt::Result,
     ) -> Result<crate::jq::stream::StreamStats, core::fmt::Error> {
         use crate::jq::stream::{StreamError, StreamStats, StreamableValue};
@@ -497,7 +501,7 @@ impl<V: DocumentValue> GenericResult<V> {
             Self::One(v) => {
                 // Convert to owned for streaming
                 let owned = to_owned(v);
-                owned.stream_json(out, indent_spaces)?;
+                owned.stream_json(out, indent, sort_keys)?;
                 on_value(out)?;
                 stats.count = 1;
                 stats.last_was_falsy = owned.is_falsy();
@@ -505,7 +509,7 @@ impl<V: DocumentValue> GenericResult<V> {
             }
             Self::OneCursor(c) => {
                 // Stream directly from cursor using DocumentCursor trait
-                c.stream_json(out, indent_spaces)?;
+                c.stream_json(out, indent, sort_keys)?;
                 on_value(out)?;
                 stats.count = 1;
                 stats.last_was_falsy = c.is_falsy();
@@ -514,7 +518,7 @@ impl<V: DocumentValue> GenericResult<V> {
             Self::Many(vs) => {
                 for v in vs {
                     let owned = to_owned(v);
-                    owned.stream_json(out, indent_spaces)?;
+                    owned.stream_json(out, indent, sort_keys)?;
                     on_value(out)?;
                     stats.last_was_falsy = owned.is_falsy();
                     stats.any_truthy |= !stats.last_was_falsy;
@@ -527,15 +531,17 @@ impl<V: DocumentValue> GenericResult<V> {
                     // every key first, so this can't stream lazily like the
                     // unsorted case below.
                     let owned = materialize_lazy_keys::<V>(fields, true);
-                    owned.stream_json(out, indent_spaces)?;
+                    owned.stream_json(out, indent, sort_keys)?;
                 } else {
                     // Genuinely lazy (#685): each key is pulled from
                     // `fields` and written straight to `out` as it's
                     // produced — no `Vec<String>` or `OwnedValue::Array` is
                     // ever built. Reachable from `yq_runner.rs`'s M2 fast
                     // path now that `can_use_m2_streaming` admits
-                    // `Builtin::KeysUnsorted`.
-                    crate::jq::stream::stream_lazy_keys_json(fields, out, indent_spaces)?;
+                    // `Builtin::KeysUnsorted`. `sort_keys` (`-S`) is a no-op
+                    // here: this is a flat array of key names, not a
+                    // mapping, so there's nothing for `-S` to reorder.
+                    crate::jq::stream::stream_lazy_keys_json(fields, out, indent)?;
                 }
                 on_value(out)?;
                 stats.count = 1;
@@ -547,7 +553,7 @@ impl<V: DocumentValue> GenericResult<V> {
             // Arrays are always truthy in jq, even `[]` (only `null`/`false`
             // are falsy), so `last_was_falsy` is unconditionally `false`.
             Self::LazyIndexRange(len) => {
-                write_index_range_json(out, *len, indent_spaces)?;
+                write_index_range_json(out, *len, indent)?;
                 on_value(out)?;
                 stats.count = 1;
                 stats.last_was_falsy = false;
@@ -555,7 +561,7 @@ impl<V: DocumentValue> GenericResult<V> {
             }
             Self::ManyCursor(cs) => {
                 for c in cs {
-                    c.stream_json(out, indent_spaces)?;
+                    c.stream_json(out, indent, sort_keys)?;
                     on_value(out)?;
                     stats.last_was_falsy = c.is_falsy();
                     stats.any_truthy |= !stats.last_was_falsy;
@@ -572,7 +578,7 @@ impl<V: DocumentValue> GenericResult<V> {
                 stats.error = Some(stream_error(e));
             }
             Self::Owned(o) => {
-                o.stream_json(out, indent_spaces)?;
+                o.stream_json(out, indent, sort_keys)?;
                 on_value(out)?;
                 stats.count = 1;
                 stats.last_was_falsy = o.is_falsy();
@@ -580,7 +586,7 @@ impl<V: DocumentValue> GenericResult<V> {
             }
             Self::ManyOwned(os) => {
                 for o in os {
-                    o.stream_json(out, indent_spaces)?;
+                    o.stream_json(out, indent, sort_keys)?;
                     on_value(out)?;
                     stats.last_was_falsy = o.is_falsy();
                     stats.any_truthy |= !stats.last_was_falsy;
@@ -598,7 +604,7 @@ impl<V: DocumentValue> GenericResult<V> {
             // outputs already produced no longer vanish behind the failure.
             Self::Partial(os, control) => {
                 for o in os {
-                    o.stream_json(out, indent_spaces)?;
+                    o.stream_json(out, indent, sort_keys)?;
                     on_value(out)?;
                     stats.last_was_falsy = o.is_falsy();
                     stats.any_truthy |= !stats.last_was_falsy;
@@ -633,7 +639,8 @@ impl<V: DocumentValue> GenericResult<V> {
     pub fn stream_yaml<W: core::fmt::Write>(
         &self,
         out: &mut W,
-        indent_spaces: usize,
+        indent: IndentSpec,
+        sort_keys: bool,
         mut on_value: impl FnMut(&mut W) -> core::fmt::Result,
     ) -> Result<crate::jq::stream::StreamStats, core::fmt::Error> {
         use crate::jq::stream::{StreamError, StreamStats, StreamableValue};
@@ -643,7 +650,7 @@ impl<V: DocumentValue> GenericResult<V> {
         match self {
             Self::One(v) => {
                 let owned = to_owned(v);
-                owned.stream_yaml(out, indent_spaces)?;
+                owned.stream_yaml(out, indent, sort_keys)?;
                 on_value(out)?;
                 stats.count = 1;
                 stats.last_was_falsy = owned.is_falsy();
@@ -651,7 +658,7 @@ impl<V: DocumentValue> GenericResult<V> {
             }
             Self::OneCursor(c) => {
                 // Stream directly from cursor using DocumentCursor trait
-                c.stream_yaml(out, indent_spaces)?;
+                c.stream_yaml(out, indent, sort_keys)?;
                 on_value(out)?;
                 stats.count = 1;
                 stats.last_was_falsy = c.is_falsy();
@@ -660,7 +667,7 @@ impl<V: DocumentValue> GenericResult<V> {
             Self::Many(vs) => {
                 for v in vs {
                     let owned = to_owned(v);
-                    owned.stream_yaml(out, indent_spaces)?;
+                    owned.stream_yaml(out, indent, sort_keys)?;
                     on_value(out)?;
                     stats.last_was_falsy = owned.is_falsy();
                     stats.any_truthy |= !stats.last_was_falsy;
@@ -669,7 +676,7 @@ impl<V: DocumentValue> GenericResult<V> {
             }
             Self::ManyCursor(cs) => {
                 for c in cs {
-                    c.stream_yaml(out, indent_spaces)?;
+                    c.stream_yaml(out, indent, sort_keys)?;
                     on_value(out)?;
                     stats.last_was_falsy = c.is_falsy();
                     stats.any_truthy |= !stats.last_was_falsy;
@@ -681,11 +688,11 @@ impl<V: DocumentValue> GenericResult<V> {
                     // Fallback: materialize+sort. See `stream_json`'s
                     // `LazyKeys` arm above — same reasoning.
                     let owned = materialize_lazy_keys::<V>(fields, true);
-                    owned.stream_yaml(out, indent_spaces)?;
+                    owned.stream_yaml(out, indent, sort_keys)?;
                 } else {
                     // Genuinely lazy (#685): see `stream_json`'s
                     // `LazyKeys` arm above — same reasoning, YAML target.
-                    crate::jq::stream::stream_lazy_keys_yaml(fields, out, indent_spaces)?;
+                    crate::jq::stream::stream_lazy_keys_yaml(fields, out, indent)?;
                 }
                 on_value(out)?;
                 stats.count = 1;
@@ -694,7 +701,7 @@ impl<V: DocumentValue> GenericResult<V> {
             }
             // Same allocation-free approach as `stream_json` above (#684).
             Self::LazyIndexRange(len) => {
-                write_index_range_yaml(out, *len, indent_spaces)?;
+                write_index_range_yaml(out, *len, indent)?;
                 on_value(out)?;
                 stats.count = 1;
                 stats.last_was_falsy = false;
@@ -708,7 +715,7 @@ impl<V: DocumentValue> GenericResult<V> {
                 stats.error = Some(stream_error(e));
             }
             Self::Owned(o) => {
-                o.stream_yaml(out, indent_spaces)?;
+                o.stream_yaml(out, indent, sort_keys)?;
                 on_value(out)?;
                 stats.count = 1;
                 stats.last_was_falsy = o.is_falsy();
@@ -716,7 +723,7 @@ impl<V: DocumentValue> GenericResult<V> {
             }
             Self::ManyOwned(os) => {
                 for o in os {
-                    o.stream_yaml(out, indent_spaces)?;
+                    o.stream_yaml(out, indent, sort_keys)?;
                     on_value(out)?;
                     stats.last_was_falsy = o.is_falsy();
                     stats.any_truthy |= !stats.last_was_falsy;
@@ -733,7 +740,7 @@ impl<V: DocumentValue> GenericResult<V> {
             // streams first, then the control is reported.
             Self::Partial(os, control) => {
                 for o in os {
-                    o.stream_yaml(out, indent_spaces)?;
+                    o.stream_yaml(out, indent, sort_keys)?;
                     on_value(out)?;
                     stats.last_was_falsy = o.is_falsy();
                     stats.any_truthy |= !stats.last_was_falsy;
@@ -762,7 +769,7 @@ impl<V: DocumentValue> GenericResult<V> {
 fn write_index_range_json<W: core::fmt::Write>(
     out: &mut W,
     len: usize,
-    indent_spaces: usize,
+    indent: IndentSpec,
 ) -> core::fmt::Result {
     if len == 0 {
         return out.write_str("[]");
@@ -772,15 +779,15 @@ fn write_index_range_json<W: core::fmt::Write>(
         if i > 0 {
             out.write_char(',')?;
         }
-        if indent_spaces > 0 {
+        if indent.width > 0 {
             out.write_char('\n')?;
-            for _ in 0..indent_spaces {
-                out.write_char(' ')?;
+            for _ in 0..indent.width {
+                out.write_char(indent.unit)?;
             }
         }
         write!(out, "{i}")?;
     }
-    if indent_spaces > 0 {
+    if indent.width > 0 {
         out.write_char('\n')?;
     }
     out.write_char(']')
@@ -793,12 +800,12 @@ fn write_index_range_json<W: core::fmt::Write>(
 fn write_index_range_yaml<W: core::fmt::Write>(
     out: &mut W,
     len: usize,
-    indent_spaces: usize,
+    indent: IndentSpec,
 ) -> core::fmt::Result {
     if len == 0 {
         return out.write_str("[]");
     }
-    if indent_spaces == 0 {
+    if indent.is_compact() {
         out.write_char('[')?;
         for i in 0..len {
             if i > 0 {
@@ -2742,22 +2749,26 @@ mod tests {
 
         let mut compact_json = String::new();
         result
-            .stream_json(&mut compact_json, 0, |_| Ok(()))
+            .stream_json(&mut compact_json, IndentSpec::COMPACT, false, |_| Ok(()))
             .unwrap();
         assert_eq!(compact_json, "[0,1,2]");
 
         let mut indented_json = String::new();
         result
-            .stream_json(&mut indented_json, 2, |_| Ok(()))
+            .stream_json(&mut indented_json, IndentSpec::spaces(2), false, |_| Ok(()))
             .unwrap();
         assert_eq!(indented_json, "[\n  0,\n  1,\n  2\n]");
 
         let mut flow_yaml = String::new();
-        result.stream_yaml(&mut flow_yaml, 0, |_| Ok(())).unwrap();
+        result
+            .stream_yaml(&mut flow_yaml, IndentSpec::COMPACT, false, |_| Ok(()))
+            .unwrap();
         assert_eq!(flow_yaml, "[0, 1, 2]");
 
         let mut block_yaml = String::new();
-        result.stream_yaml(&mut block_yaml, 2, |_| Ok(())).unwrap();
+        result
+            .stream_yaml(&mut block_yaml, IndentSpec::spaces(2), false, |_| Ok(()))
+            .unwrap();
         assert_eq!(block_yaml, "- 0\n- 1\n- 2");
 
         let empty_json = br"[]";
@@ -2767,13 +2778,23 @@ mod tests {
 
         let mut empty_json_out = String::new();
         empty_result
-            .stream_json(&mut empty_json_out, 2, |_| Ok(()))
+            .stream_json(
+                &mut empty_json_out,
+                IndentSpec::spaces(2),
+                false,
+                |_| Ok(()),
+            )
             .unwrap();
         assert_eq!(empty_json_out, "[]");
 
         let mut empty_yaml_out = String::new();
         empty_result
-            .stream_yaml(&mut empty_yaml_out, 2, |_| Ok(()))
+            .stream_yaml(
+                &mut empty_yaml_out,
+                IndentSpec::spaces(2),
+                false,
+                |_| Ok(()),
+            )
             .unwrap();
         assert_eq!(empty_yaml_out, "[]");
     }
@@ -4174,19 +4195,27 @@ mod tests {
         ));
 
         let mut out = String::new();
-        result.stream_json(&mut out, 0, |_| Ok(())).unwrap();
+        result
+            .stream_json(&mut out, IndentSpec::COMPACT, false, |_| Ok(()))
+            .unwrap();
         assert_eq!(out, r#"["b","a","c"]"#);
 
         let mut out = String::new();
-        result.stream_json(&mut out, 2, |_| Ok(())).unwrap();
+        result
+            .stream_json(&mut out, IndentSpec::spaces(2), false, |_| Ok(()))
+            .unwrap();
         assert_eq!(out, "[\n  \"b\",\n  \"a\",\n  \"c\"\n]");
 
         let mut out = String::new();
-        result.stream_yaml(&mut out, 0, |_| Ok(())).unwrap();
+        result
+            .stream_yaml(&mut out, IndentSpec::COMPACT, false, |_| Ok(()))
+            .unwrap();
         assert_eq!(out, "[b, a, c]");
 
         let mut out = String::new();
-        result.stream_yaml(&mut out, 2, |_| Ok(())).unwrap();
+        result
+            .stream_yaml(&mut out, IndentSpec::spaces(2), false, |_| Ok(()))
+            .unwrap();
         assert_eq!(out, "- b\n- a\n- c");
     }
 
@@ -4213,11 +4242,15 @@ mod tests {
         ));
 
         let mut out = String::new();
-        result.stream_json(&mut out, 0, |_| Ok(())).unwrap();
+        result
+            .stream_json(&mut out, IndentSpec::COMPACT, false, |_| Ok(()))
+            .unwrap();
         assert_eq!(out, r#"["b","a","c"]"#);
 
         let mut out = String::new();
-        result.stream_yaml(&mut out, 2, |_| Ok(())).unwrap();
+        result
+            .stream_yaml(&mut out, IndentSpec::spaces(2), false, |_| Ok(()))
+            .unwrap();
         assert_eq!(out, "- b\n- a\n- c");
     }
 
@@ -4710,14 +4743,16 @@ mod tests {
         // stream_json / stream_yaml exercise every variant's match arm.
         for r in &results {
             let mut j = String::new();
-            r.stream_json(&mut j, 0, |_| Ok(())).unwrap();
+            r.stream_json(&mut j, IndentSpec::COMPACT, false, |_| Ok(()))
+                .unwrap();
             let mut y = String::new();
-            r.stream_yaml(&mut y, 2, |_| Ok(())).unwrap();
+            r.stream_yaml(&mut y, IndentSpec::spaces(2), false, |_| Ok(()))
+                .unwrap();
         }
         // Spot-check the owned and error stream output.
         let mut owned_json = String::new();
         results[2]
-            .stream_json(&mut owned_json, 0, |_| Ok(()))
+            .stream_json(&mut owned_json, IndentSpec::COMPACT, false, |_| Ok(()))
             .unwrap();
         assert_eq!(owned_json, "5");
         // An error writes nothing to `out` — `out` is stdout, and a diagnostic
@@ -4725,7 +4760,7 @@ mod tests {
         // `stats.error` instead, for the caller to print to stderr (#355).
         let mut err_json = String::new();
         let err_stats = results[5]
-            .stream_json(&mut err_json, 0, |_| Ok(()))
+            .stream_json(&mut err_json, IndentSpec::COMPACT, false, |_| Ok(()))
             .unwrap();
         assert_eq!(err_json, "", "diagnostics must never reach stdout");
         assert_eq!(
@@ -4736,7 +4771,7 @@ mod tests {
 
         let mut err_yaml = String::new();
         let err_stats = results[5]
-            .stream_yaml(&mut err_yaml, 2, |_| Ok(()))
+            .stream_yaml(&mut err_yaml, IndentSpec::spaces(2), false, |_| Ok(()))
             .unwrap();
         assert_eq!(err_yaml, "", "diagnostics must never reach stdout");
         assert_eq!(
@@ -4747,7 +4782,9 @@ mod tests {
         // Break escapes its label: an uncaught error like any other, and it too
         // stays off stdout.
         let mut brk = String::new();
-        let brk_stats = results[6].stream_json(&mut brk, 0, |_| Ok(())).unwrap();
+        let brk_stats = results[6]
+            .stream_json(&mut brk, IndentSpec::COMPACT, false, |_| Ok(()))
+            .unwrap();
         assert_eq!(brk, "");
         assert!(brk_stats
             .error
@@ -4760,7 +4797,7 @@ mod tests {
         let mut partial_json = String::new();
         let mut seen = 0usize;
         let partial_stats = results[7]
-            .stream_json(&mut partial_json, 0, |_| {
+            .stream_json(&mut partial_json, IndentSpec::COMPACT, false, |_| {
                 seen += 1;
                 Ok(())
             })
@@ -4776,7 +4813,7 @@ mod tests {
 
         let mut partial_yaml = String::new();
         let partial_stats = results[7]
-            .stream_yaml(&mut partial_yaml, 2, |w| {
+            .stream_yaml(&mut partial_yaml, IndentSpec::spaces(2), false, |w| {
                 use core::fmt::Write;
                 writeln!(w)
             })
@@ -4792,7 +4829,7 @@ mod tests {
         // diagnostic the bare `Break` arm does, after its prefix.
         let mut partial_brk = String::new();
         let brk_stats = results[8]
-            .stream_json(&mut partial_brk, 0, |_| Ok(()))
+            .stream_json(&mut partial_brk, IndentSpec::COMPACT, false, |_| Ok(()))
             .unwrap();
         assert_eq!(partial_brk, "3");
         assert!(brk_stats
@@ -4801,7 +4838,9 @@ mod tests {
             .is_some_and(|e| e.message.contains("not in label")));
         let mut partial_brk_yaml = String::new();
         let brk_stats = results[8]
-            .stream_yaml(&mut partial_brk_yaml, 2, |_| Ok(()))
+            .stream_yaml(&mut partial_brk_yaml, IndentSpec::spaces(2), false, |_| {
+                Ok(())
+            })
             .unwrap();
         assert_eq!(partial_brk_yaml, "3");
         assert!(brk_stats
@@ -4891,10 +4930,14 @@ mod tests {
         let result = eval_with_cursor(&expr, index.root(json));
         assert!(result.is_single_cursor());
         let mut j = String::new();
-        result.stream_json(&mut j, 0, |_| Ok(())).unwrap();
+        result
+            .stream_json(&mut j, IndentSpec::COMPACT, false, |_| Ok(()))
+            .unwrap();
         assert_eq!(j, "1");
         let mut y = String::new();
-        result.stream_yaml(&mut y, 2, |_| Ok(())).unwrap();
+        result
+            .stream_yaml(&mut y, IndentSpec::spaces(2), false, |_| Ok(()))
+            .unwrap();
 
         let result2 = eval_with_cursor(&expr, index.root(json));
         assert_eq!(result2.collect_owned(), vec![OwnedValue::Int(1)]);
@@ -4913,7 +4956,9 @@ mod tests {
         let result = eval_with_cursor(&expr, index.root(json));
         assert!(result.is_single_cursor());
         let mut j = String::new();
-        assert!(result.stream_json(&mut j, 2, |_| Ok(())).is_err());
+        assert!(result
+            .stream_json(&mut j, IndentSpec::spaces(2), false, |_| Ok(()))
+            .is_err());
     }
 
     #[test]
@@ -4932,10 +4977,14 @@ mod tests {
         let result = eval_with_cursor(&expr, index.root(yaml));
         assert!(result.is_single_cursor());
         let mut j = String::new();
-        result.stream_json(&mut j, 0, |_| Ok(())).unwrap();
+        result
+            .stream_json(&mut j, IndentSpec::COMPACT, false, |_| Ok(()))
+            .unwrap();
         assert_eq!(j, "1");
         let mut y = String::new();
-        result.stream_yaml(&mut y, 2, |_| Ok(())).unwrap();
+        result
+            .stream_yaml(&mut y, IndentSpec::spaces(2), false, |_| Ok(()))
+            .unwrap();
         assert_eq!(y, "1");
     }
 
@@ -5087,7 +5136,9 @@ mod tests {
         let result = eval_with_cursor(&expr, index.root(json));
         assert!(result.is_single_cursor());
         let mut out = String::new();
-        result.stream_json(&mut out, 0, |_| Ok(())).unwrap();
+        result
+            .stream_json(&mut out, IndentSpec::COMPACT, false, |_| Ok(()))
+            .unwrap();
         assert_eq!(out, r#"{"a":1,"a":2}"#);
     }
 
@@ -5101,7 +5152,9 @@ mod tests {
         let result = eval_with_cursor(&expr, index.root(json));
         assert!(result.is_single_cursor());
         let mut out = String::new();
-        result.stream_json(&mut out, 0, |_| Ok(())).unwrap();
+        result
+            .stream_json(&mut out, IndentSpec::COMPACT, false, |_| Ok(()))
+            .unwrap();
         assert_eq!(out, r#"{"b":3,"b":4}"#);
     }
 
@@ -5121,7 +5174,9 @@ mod tests {
         let result = eval_with_cursor(&expr, index.root(json));
         assert!(result.is_single_cursor());
         let mut out = String::new();
-        result.stream_json(&mut out, 0, |_| Ok(())).unwrap();
+        result
+            .stream_json(&mut out, IndentSpec::COMPACT, false, |_| Ok(()))
+            .unwrap();
         assert_eq!(out, r#"{"a":1,"a":2}"#);
     }
 
@@ -5138,7 +5193,9 @@ mod tests {
         let result = eval_with_cursor(&expr, index.root(json));
         assert!(result.is_single_cursor());
         let mut out = String::new();
-        result.stream_json(&mut out, 0, |_| Ok(())).unwrap();
+        result
+            .stream_json(&mut out, IndentSpec::COMPACT, false, |_| Ok(()))
+            .unwrap();
         assert_eq!(out, r#"{"b":3,"b":4}"#);
     }
 
@@ -5178,7 +5235,9 @@ mod tests {
         let first = eval_with_cursor(&crate::jq::parse("first(.)").unwrap(), index.root(json));
         assert!(first.is_single_cursor());
         let mut out = String::new();
-        first.stream_json(&mut out, 0, |_| Ok(())).unwrap();
+        first
+            .stream_json(&mut out, IndentSpec::COMPACT, false, |_| Ok(()))
+            .unwrap();
         assert_eq!(out, r#"{"a":1,"a":2}"#);
 
         let last = eval_with_cursor(&crate::jq::parse("last(.)").unwrap(), index.root(json));
@@ -5347,7 +5406,9 @@ mod tests {
         let result = eval_with_cursor(&expr, index.root(json));
         assert!(result.is_single_cursor());
         let mut out = String::new();
-        result.stream_json(&mut out, 0, |_| Ok(())).unwrap();
+        result
+            .stream_json(&mut out, IndentSpec::COMPACT, false, |_| Ok(()))
+            .unwrap();
         assert_eq!(out, r#"{"a":1,"a":2}"#);
     }
 
