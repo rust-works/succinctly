@@ -83,7 +83,7 @@ mod value;
 
 pub use error::{BinOp, Control, EvalError};
 pub use eval::{
-    eval, eval_lenient, substitute_vars, sync_aliased_paths, EvalSemantics, JqSemantics,
+    eval, eval_lenient, substitute_vars, sync_aliased_paths, EvalSemantics, EvalTag, JqSemantics,
     QueryResult, YqSemantics,
 };
 pub use expr::{
