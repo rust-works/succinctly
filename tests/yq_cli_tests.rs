@@ -1991,6 +1991,18 @@ fn test_yaml_assign_then_map_through_anchor_still_excluded() -> Result<()> {
 }
 
 #[test]
+fn test_yaml_paren_wrapped_optional_assign_through_anchor_updates_alias() -> Result<()> {
+    // `(.a = 99)?` -- `Optional` wrapping `Paren` wrapping `Assign` -- must
+    // still count as alias-sensitive: `is_alias_sensitive_assign` unwraps
+    // both `Paren` and `Optional` before checking for a write underneath.
+    let input = "a: &x 1\nb: *x\n";
+    let (output, exit_code) = run_yq_stdin("(.a = 99)?", input, &["-o=json", "-I=0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), r#"{"a":99,"b":99}"#);
+    Ok(())
+}
+
+#[test]
 fn test_yaml_bare_select_without_assign_is_unaffected() -> Result<()> {
     // Regression guard: a pass-through stage with *no* assignment anywhere
     // in the pipe must not trigger alias-sync snapshotting at all -- there's
@@ -6004,6 +6016,27 @@ fn test_front_matter_extract_allows_slurp_across_files() -> Result<()> {
     Ok(())
 }
 
+/// A top-level `break` with no enclosing `label` reaches
+/// `query_result_to_owned_values` as a bare `QueryResult::Break`, distinct
+/// from the `Partial(_, Control::Break(_))` case an escaping break-after-
+/// some-output takes -- exercised elsewhere via `--eval-all`'s
+/// `write_split_result`, but not through the plain evaluation path.
+#[test]
+fn test_bare_break_outside_label_reports_error() -> Result<()> {
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .arg("yq")
+        .args(["-n", "break $foo"])
+        .stdin(Stdio::null())
+        .output()?;
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(
+        stderr.contains("break $foo not in label"),
+        "stderr: {stderr}"
+    );
+    Ok(())
+}
+
 // ============================================================================
 // --split-exp Tests (#715)
 // ============================================================================
@@ -6227,6 +6260,165 @@ fn test_split_exp_with_identity_filter_not_bypassed_by_m2() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn test_split_exp_empty_result_errors() -> Result<()> {
+    let (_stdout, stderr, code) = run_yq_split(".", "a: 1\n", &["--split-exp", "empty"])?;
+    assert_ne!(code, 0);
+    assert!(stderr.contains("produced no output"), "stderr: {stderr}");
+    Ok(())
+}
+
+#[test]
+fn test_split_exp_many_results_errors() -> Result<()> {
+    let (_stdout, stderr, code) = run_yq_split(".", "a: 1\n", &["--split-exp", "$index, $index"])?;
+    assert_ne!(code, 0);
+    assert!(
+        stderr.contains("exactly one string") && stderr.contains("2 results"),
+        "stderr: {stderr}"
+    );
+    Ok(())
+}
+
+/// Regression coverage for `write_split_result`'s own `std::fs::write`
+/// failure path (distinct from the filename-evaluation error paths above):
+/// a directory that doesn't exist makes the actual file write fail, which
+/// must surface as a normal CLI error rather than a panic, across all three
+/// input-gathering branches (`-n`/null-input, YAML, JSON).
+#[test]
+fn test_split_exp_write_failure_reports_error_null_input() -> Result<()> {
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .arg("yq")
+        .args(["-n", "--split-exp", "\"/nonexistent-dir-715/out.yml\""])
+        .arg("1")
+        .stdin(Stdio::null())
+        .output()?;
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(
+        stderr.contains("failed to write --split-exp output file"),
+        "stderr: {stderr}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_split_exp_write_failure_reports_error_yaml_input() -> Result<()> {
+    let (_stdout, stderr, code) = run_yq_split(
+        ".",
+        "a: 1\n",
+        &["--split-exp", "\"/nonexistent-dir-715/out.yml\""],
+    )?;
+    assert_ne!(code, 0);
+    assert!(
+        stderr.contains("failed to write --split-exp output file"),
+        "stderr: {stderr}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_split_exp_write_failure_reports_error_json_input() -> Result<()> {
+    let (_stdout, stderr, code) = run_yq_split(
+        ".",
+        "{\"a\":1}",
+        &[
+            "--split-exp",
+            "\"/nonexistent-dir-715/out.yml\"",
+            "-p",
+            "json",
+        ],
+    )?;
+    assert_ne!(code, 0);
+    assert!(
+        stderr.contains("failed to write --split-exp output file"),
+        "stderr: {stderr}"
+    );
+    Ok(())
+}
+
+/// `--split-exp` combined with `--doc`/`document` filtering for JSON input:
+/// with two JSON files and `--doc 1`, the first file's document must be
+/// skipped (not written) and only the second file's document processed.
+#[test]
+fn test_split_exp_document_filter_skips_earlier_json_files() -> Result<()> {
+    let dir = TempDir::new()?;
+    let mut file1 = NamedTempFile::new()?;
+    write!(file1, "{{\"which\":\"one\"}}")?;
+    let mut file2 = NamedTempFile::new()?;
+    write!(file2, "{{\"which\":\"two\"}}")?;
+    let pattern = format!("\"{}/out.json\"", dir.path().display());
+
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .arg("yq")
+        .args([
+            "--split-exp",
+            &pattern,
+            "-p",
+            "json",
+            "-o",
+            "json",
+            "-I0",
+            "--doc",
+            "1",
+        ])
+        .arg(".")
+        .arg(file1.path())
+        .arg(file2.path())
+        .stdin(Stdio::null())
+        .output()?;
+    assert!(output.status.success());
+
+    let content = std::fs::read_to_string(dir.path().join("out.json"))?;
+    assert_eq!(content.trim(), r#"{"which":"two"}"#);
+    Ok(())
+}
+
+/// `--split-exp` reading from stdin with `--validate` set must reject
+/// invalid YAML before ever reaching the split-write loop.
+#[test]
+fn test_split_exp_validate_rejects_invalid_yaml_from_stdin() -> Result<()> {
+    let (_stdout, stderr, code) = run_yq_split(
+        ".",
+        "a: b: c: d\n",
+        &["--split-exp", "\"f.yml\"", "--validate"],
+    )?;
+    assert_ne!(code, 0);
+    assert!(stderr.contains("validation error"), "stderr: {stderr}");
+    Ok(())
+}
+
+/// Same as above, but reading from a file (exercises the file-gathering
+/// branch of `--split-exp`'s input collection rather than the stdin one).
+#[test]
+fn test_split_exp_validate_rejects_invalid_yaml_from_file() -> Result<()> {
+    let mut input_file = NamedTempFile::new()?;
+    writeln!(input_file, "a: b: c: d")?;
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .arg("yq")
+        .args(["--split-exp", "\"f.yml\"", "--validate"])
+        .arg(".")
+        .arg(input_file.path())
+        .stdin(Stdio::null())
+        .output()?;
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(stderr.contains("validation error"), "stderr: {stderr}");
+    Ok(())
+}
+
+/// A hard parse failure (as opposed to `--validate`'s opt-in strict check)
+/// from the loose YAML loader itself, e.g. tab-indentation, must still
+/// surface as a normal CLI error under `--split-exp`'s YAML branch, not a
+/// panic -- exercises `evaluate_yaml_direct_filtered`'s own `Err` path
+/// rather than `write_split_result`'s.
+#[test]
+fn test_split_exp_hard_yaml_parse_error_propagates() -> Result<()> {
+    let (_stdout, stderr, code) = run_yq_split(".", "a:\n\t- 1\n", &["--split-exp", "\"f.yml\""])?;
+    assert_ne!(code, 0);
+    assert!(stderr.contains("YAML parse error"), "stderr: {stderr}");
+    Ok(())
+}
+
 // ============================================================================
 // --eval-all / file_index Tests (#715)
 // ============================================================================
@@ -6263,6 +6455,18 @@ fn test_eval_all_combines_documents_across_files() -> Result<()> {
     let (stdout, _stderr, code) = run_yq_files("length", &[f1.path(), f2.path()], &["--eval-all"])?;
     assert_eq!(code, 0);
     assert_eq!(stdout.trim(), "2");
+    Ok(())
+}
+
+/// `--eval-all` reading a single document from stdin (no input files at
+/// all) is a distinct input-gathering branch from the file-list one every
+/// other `--eval-all` test above exercises.
+#[test]
+fn test_eval_all_works_from_stdin() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_yq_stdin_with_stderr(".", "a: 1\n", &["--eval-all", "-o", "json", "-I0"])?;
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout.trim(), r#"[{"a":1}]"#);
     Ok(())
 }
 
@@ -6524,6 +6728,30 @@ fn test_eval_all_rejects_front_matter() -> Result<()> {
     )?;
     assert_ne!(code, 0);
     assert!(stderr.contains("--front-matter"), "stderr: {stderr}");
+    Ok(())
+}
+
+/// `--eval-all` reading from stdin with `--validate` set must reject invalid
+/// YAML before combining it into the evaluation array.
+#[test]
+fn test_eval_all_validate_rejects_invalid_yaml_from_stdin() -> Result<()> {
+    let (_stdout, stderr, code) =
+        run_yq_stdin_with_stderr(".", "a: b: c: d\n", &["--eval-all", "--validate"])?;
+    assert_ne!(code, 0);
+    assert!(stderr.contains("validation error"), "stderr: {stderr}");
+    Ok(())
+}
+
+/// Same as above, but reading from files (exercises the file-gathering
+/// branch of `--eval-all`'s input collection rather than the stdin one).
+#[test]
+fn test_eval_all_validate_rejects_invalid_yaml_from_file() -> Result<()> {
+    let mut bad_file = NamedTempFile::new()?;
+    writeln!(bad_file, "a: b: c: d")?;
+    let (_stdout, stderr, code) =
+        run_yq_files(".", &[bad_file.path()], &["--eval-all", "--validate"])?;
+    assert_ne!(code, 0);
+    assert!(stderr.contains("validation error"), "stderr: {stderr}");
     Ok(())
 }
 
