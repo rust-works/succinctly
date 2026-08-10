@@ -1005,6 +1005,75 @@ fn test_inplace_json_output_fast_path() -> Result<()> {
     Ok(())
 }
 
+/// #224: `--slurp` with `-o json` is the one combination `can_slurp_fast_path`
+/// always excludes (it requires YAML output), so it routes through the slow
+/// `parse_input` -> `yaml_to_owned_value` -> `resolved_scalar_to_owned` DOM
+/// path instead of the M2 cursor streamer. The extensive tag/alias tests
+/// added by #224 elsewhere in this file all exercise the direct/M2 path
+/// (`-o=json` without `--slurp`), leaving this DOM path's
+/// `ResolvedScalar::Float` arm uncovered.
+#[test]
+fn test_slurp_json_float_scalar_through_dom_path() -> Result<()> {
+    let (output, code) = run_yq_stdin(".", "pi: 3.14\n", &["--slurp", "-o", "json", "-I0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#"[{"pi":3.14}]"#);
+    Ok(())
+}
+
+/// #224: like [`test_slurp_json_float_scalar_through_dom_path`], forces the
+/// DOM path via `--slurp -o json`, but exercises `yaml_to_owned_value`'s
+/// explicit-tag check (`cursor.explicit_tag()` + `resolve_tagged`) instead —
+/// the DOM path's copy of the core fix under test in this PR. Mirrors the
+/// already-tested direct-path case (`test_yaml_anchored_tag_in_seq_item_resolves`,
+/// `test_yaml_default_output_preserves_the_literal_tag`'s "value, quoted"
+/// case) where a core-schema tag forces resolution regardless of quoting:
+/// `!!int "5"` becomes the number `5`, not the string `"5"`.
+#[test]
+fn test_slurp_json_explicit_tag_through_dom_path() -> Result<()> {
+    let (output, code) = run_yq_stdin(".", "a: !!int \"5\"\n", &["--slurp", "-o", "json", "-I0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#"[{"a":5}]"#);
+    Ok(())
+}
+
+/// #224: sibling of the test above, but the explicit tag (`!custom`) isn't
+/// one of the 5 core-schema tags, so `resolve_tagged` returns `None` and
+/// `yaml_to_owned_value` must fall through past the tag check to the
+/// quoted-string-preservation check below it, rather than resolving.
+#[test]
+fn test_slurp_json_custom_tag_falls_through_on_dom_path() -> Result<()> {
+    let (output, code) =
+        run_yq_stdin(".", "a: !custom \"5\"\n", &["--slurp", "-o", "json", "-I0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#"[{"a":"5"}]"#);
+    Ok(())
+}
+
+/// #224: like the two tests above, forces `--slurp -o json`'s DOM path, this
+/// time through `yaml_to_owned_value`'s `YamlValue::Alias` arm. That arm now
+/// recurses on the target *cursor* rather than a bare `YamlValue`, since a
+/// tag on the aliased node lives on the cursor's `bp_pos` and a bare value
+/// has already lost it. Checks a plain aliased scalar first, then — mirroring
+/// the direct-path `test_yaml_anchored_tag_in_seq_item_resolves` — an aliased
+/// node whose *source* carries an explicit tag, which is the only case that
+/// can tell "cursor passed through" apart from "bare value passed through".
+#[test]
+fn test_slurp_json_alias_through_dom_path() -> Result<()> {
+    let (plain, code) = run_yq_stdin(".", "a: &x 1\nb: *x\n", &["--slurp", "-o", "json", "-I0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(plain.trim(), r#"[{"a":1,"b":1}]"#);
+
+    let (tagged, code) = run_yq_stdin(
+        ".",
+        "items:\n  - &a !!str x\n  - *a\n",
+        &["--slurp", "-o", "json", "-I0"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(tagged.trim(), r#"[{"items":["x","x"]}]"#);
+
+    Ok(())
+}
+
 #[test]
 fn test_compact_json_output() -> Result<()> {
     let yaml = r"
