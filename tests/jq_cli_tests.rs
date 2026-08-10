@@ -3392,3 +3392,56 @@ fn test_array_keys_unsorted_sort_keys_path_684() -> Result<()> {
 
     Ok(())
 }
+
+/// The top-level materializing boundary on the *lazy-bytes* path
+/// (`generic_result_to_jq_values` in `jq_runner.rs`) has its own
+/// `GenericResult::LazySeq` arm, reached only when the whole parsed query is
+/// itself `map(f)`/`keys_unsorted | map(f)` -- with no further pipe stage to
+/// resolve it into a narrower shape first (#725). Exercise all three
+/// outcomes (success, error, break) directly against the real binary rather
+/// than relying on incidental coverage from another test's query shape.
+#[test]
+fn test_top_level_map_lazy_seq_materializes_at_cli_boundary_725() -> Result<()> {
+    let (output, _, code) = run_jq_full(&["-c", "map(. + 1)"], Some("[1,2,3]"))?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "[2,3,4]");
+
+    let (output, stderr, code) = run_jq_full(&["-c", "map(. + 1)"], Some(r#"[1,2,"x"]"#))?;
+    assert_eq!(code, 5);
+    assert_eq!(output, "");
+    assert!(stderr.contains("cannot be added"), "{stderr}");
+
+    let (output, stderr, code) = run_jq_full(&["-c", "map(break $out)"], Some("[1,2,3]"))?;
+    assert_eq!(code, 5);
+    assert_eq!(output, "");
+    assert!(stderr.contains("break $out not in label"), "{stderr}");
+
+    Ok(())
+}
+
+/// Same `GenericResult::LazySeq` fast path, but reached through the
+/// "original"/serde_json evaluator (`evaluate_input`'s
+/// `query_result_to_owned_values`) instead -- forced by `--sort-keys`,
+/// mirroring `test_array_keys_unsorted_sort_keys_path_684` above. This is a
+/// distinct match arm from the lazy-bytes path's, not just a different flag
+/// combination reaching the same code.
+#[test]
+fn test_top_level_map_lazy_seq_sort_keys_path_725() -> Result<()> {
+    let (output, _, code) = run_jq_full(&["--sort-keys", "-c", "map(. + 1)"], Some("[1,2,3]"))?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "[2,3,4]");
+
+    let (output, stderr, code) =
+        run_jq_full(&["--sort-keys", "-c", "map(. + 1)"], Some(r#"[1,2,"x"]"#))?;
+    assert_eq!(code, 5);
+    assert_eq!(output, "");
+    assert!(stderr.contains("cannot be added"), "{stderr}");
+
+    let (output, stderr, code) =
+        run_jq_full(&["--sort-keys", "-c", "map(break $out)"], Some("[1,2,3]"))?;
+    assert_eq!(code, 5);
+    assert_eq!(output, "");
+    assert!(stderr.contains("break $out not in label"), "{stderr}");
+
+    Ok(())
+}

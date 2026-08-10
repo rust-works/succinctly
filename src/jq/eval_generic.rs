@@ -1401,6 +1401,22 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                     _ => GenericResult::ManyOwned(prefix),
                 }
             }
+            // A `LazySeq` hasn't necessarily failed *yet* -- it's lazy, so
+            // it never matches the `Error`/`Break`/`Partial` arms above even
+            // when pulling it would fail (#724, #725). `E?` needs to know
+            // *now* whether `E` fails, so force it here -- same one-pass
+            // cost `materialize_atomic` already pays at every other
+            // materializing boundary in this file. Without this arm, `inner`
+            // falls through to `other => other` below and escapes this `?`
+            // entirely: the error only surfaces later, at whatever
+            // downstream site finally pulls the `LazySeq`, by which point
+            // this `try`/`catch` boundary is long gone (confirmed against
+            // real jq: `[1,2,"x"]|map(.+1)?` is empty/exit-0 in jq, but
+            // errored/exit-5 here before this arm existed).
+            GenericResult::LazySeq(seq) => match seq.materialize_atomic() {
+                Ok(owned) => GenericResult::Owned(owned),
+                Err(Control::Error(_) | Control::Break(_)) => GenericResult::None,
+            },
             other => other,
         },
 
@@ -1794,29 +1810,36 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                             GenericResult::Owned(OwnedValue::Int(count))
                         }
 
-                        // `.[]` is a generator, NOT array construction:
-                        // already-yielded elements survive a later element's
-                        // error -- `Partial` semantics, mirroring the
-                        // existing `ManyCursor` arm's own convention above.
-                        // Deliberately a different atomicity boundary than
-                        // `Length`/the `_` fallback below.
+                        // `.[]` iterates the array `map`'s own construction
+                        // already built, not the raw source -- and that
+                        // construction is atomic in real jq
+                        // (`[1,2,"x"]|map(.+1)` prints nothing on error, not
+                        // a truncated prefix), so a failure here discards
+                        // every already-yielded element too, same atomicity
+                        // boundary as `Length`/the `_` fallback below. This
+                        // is NOT the same case as elementwise
+                        // `.[] | select(g)` (a structurally distinct,
+                        // out-of-scope case per the design doc): there,
+                        // `.[]` is the *source* of the pipe and each element
+                        // is independent; here it's a *consumer* of an
+                        // already-atomic `map` result.
                         Expr::Iterate => {
                             let mut items = Vec::new();
-                            let mut control = None;
                             for item in seq {
                                 match item {
                                     Ok(elem) => items.push(elem),
-                                    Err(c) => {
-                                        control = Some(c);
-                                        break;
+                                    Err(Control::Error(e)) => return GenericResult::Error(e),
+                                    Err(Control::Break(label)) => {
+                                        return GenericResult::Break(label)
                                     }
                                 }
                             }
                             let all_cursor =
                                 items.iter().all(|item| matches!(item, LazyElem::Cursor(_)));
-                            match control {
-                                None if items.is_empty() => GenericResult::None,
-                                None if all_cursor => GenericResult::ManyCursor(
+                            if items.is_empty() {
+                                GenericResult::None
+                            } else if all_cursor {
+                                GenericResult::ManyCursor(
                                     items
                                         .into_iter()
                                         .map(|item| match item {
@@ -1826,8 +1849,9 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                                             }
                                         })
                                         .collect(),
-                                ),
-                                None => GenericResult::ManyOwned(
+                                )
+                            } else {
+                                GenericResult::ManyOwned(
                                     items
                                         .into_iter()
                                         .map(|item| match item {
@@ -1835,22 +1859,24 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                                             LazyElem::Owned(o) => o,
                                         })
                                         .collect(),
-                                ),
-                                Some(control) => {
-                                    let prefix = items
-                                        .into_iter()
-                                        .map(|item| match item {
-                                            LazyElem::Cursor(c) => to_owned(&c.value()),
-                                            LazyElem::Owned(o) => o,
-                                        })
-                                        .collect();
-                                    partial_generic(prefix, control)
-                                }
+                                )
                             }
                         }
 
                         // Pull-one-and-stop: at most one element of `seq` is
-                        // ever evaluated.
+                        // ever evaluated. Accepted, deliberate divergence
+                        // from real jq's strict semantics: real jq's `map`
+                        // eagerly builds the *whole* array before `first`/
+                        // `.[0]` can observe it, so `map(f)|first` errors if
+                        // *any* element of `f` fails, even ones past the
+                        // first. This fast path only evaluates what's
+                        // actually needed, so `[1,2,"x"]|map(.+1)|first`
+                        // succeeds here (returns `2`) where real jq raises a
+                        // type error -- the entire point of making `first`/
+                        // `.[0]` lazy is to skip evaluating elements that
+                        // don't affect the requested output, and an error on
+                        // a skipped element is one such element. Pinned by
+                        // `test_generic_lazy_seq_first_after_map_skips_later_error_725`.
                         Expr::Builtin(Builtin::First) | Expr::Index(0) => match seq.next() {
                             None => GenericResult::Owned(OwnedValue::Null),
                             Some(Ok(LazyElem::Cursor(c))) => GenericResult::OneCursor(c),
@@ -4145,6 +4171,55 @@ mod tests {
     }
 
     #[test]
+    fn test_generic_lazy_seq_optional_suppresses_map_error() {
+        // Regression test: `map(f)?` must suppress an error raised inside
+        // `f`, same as any other `try`/`?` boundary. Before the
+        // `GenericResult::LazySeq` arm was added to `Expr::Optional`'s match,
+        // evaluating `inner` (here, bare `Builtin::Map`) returned an
+        // unmaterialized `LazySeq` that matched neither `Error`/`Break`/
+        // `Partial` nor got forced -- it fell through the `other => other`
+        // arm and escaped the `?` entirely, so the error only surfaced later
+        // at whatever site finally pulled the `LazySeq`, well past this
+        // `try`/`catch` boundary. Verified against real jq (`jq 1.7.1`):
+        // `[1,2,"x"]|map(.+1)?` is empty, exit 0.
+        let json = br#"[1,2,"x"]"#;
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+
+        let expr = crate::jq::parse("map(. + 1)?").unwrap();
+        let result = eval(&expr, value);
+        assert!(!result.is_error());
+        assert_eq!(result.into_owned(), None);
+
+        // Non-erroring case still returns the mapped array, not suppressed.
+        let expr = crate::jq::parse("map(. + 1)").unwrap();
+        let json_ok = br"[1,2,3]";
+        let index_ok = JsonIndex::build(json_ok);
+        let value_ok = index_ok.root(json_ok).value();
+        assert_eq!(
+            eval(&expr, value_ok).into_owned().unwrap(),
+            OwnedValue::Array(vec![
+                OwnedValue::Int(2),
+                OwnedValue::Int(3),
+                OwnedValue::Int(4),
+            ])
+        );
+
+        // `keys_unsorted | map(f)?` -- Slice 1's composed chain -- suppresses
+        // the same way.
+        let json2 = br#"{"a":1,"b":2}"#;
+        let index2 = JsonIndex::build(json2);
+        let value2 = index2.root(json2).value();
+        let expr2 =
+            crate::jq::parse(r#"keys_unsorted | map(if . == "a" then error("x") else . end)?"#)
+                .unwrap();
+        let result2 = eval(&expr2, value2);
+        assert!(!result2.is_error());
+        assert_eq!(result2.into_owned(), None);
+    }
+
+    #[test]
     fn test_generic_plain_map_atomicity_725() {
         // Real jq's array construction is all-or-nothing: `map`'s error
         // partway through discards the whole in-progress array, mirroring
@@ -4171,6 +4246,33 @@ mod tests {
         assert_eq!(out, "");
         assert!(stats.error.is_some());
         assert_eq!(stats.count, 0);
+    }
+
+    #[test]
+    fn test_generic_lazy_seq_map_pipe_iterate_atomicity_725() {
+        // Regression test: `.[]` piped after a plain `map(f)` must not leak
+        // the already-succeeded prefix before `map`'s own atomic-construction
+        // error -- `.[]` here iterates the array `map` already built, not
+        // the raw source, so it inherits `map`'s atomicity. Verified against
+        // real jq (`jq 1.7.1`): `[1,2,"x"]|map(.+1)|.[]` prints nothing to
+        // stdout, only the diagnostic.
+        let json = br#"[1,2,"x"]"#;
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+
+        let expr = crate::jq::parse("map(. + 1) | .[]").unwrap();
+        let result = eval(&expr, value.clone());
+        assert!(result.is_error());
+        assert_eq!(result.collect_owned(), Vec::<OwnedValue>::new());
+
+        // Same check at the `stream_json` boundary the CLI actually uses:
+        // nothing streams to `out` before the diagnostic.
+        let expr = crate::jq::parse("map(. + 1) | .[]").unwrap();
+        let result = eval(&expr, value);
+        let mut out = String::new();
+        result.stream_json(&mut out, 0, |_| Ok(())).unwrap();
+        assert_eq!(out, "");
     }
 
     #[test]
@@ -4253,6 +4355,33 @@ mod tests {
     }
 
     #[test]
+    fn test_generic_lazy_seq_first_after_map_skips_later_error_725() {
+        // Accepted, deliberate divergence from real jq (see the
+        // `Expr::Builtin(Builtin::First) | Expr::Index(0)` arm's own doc
+        // comment above `eval_single`'s `Pipe` fold): real jq's `map`
+        // eagerly builds the whole array first, so `map(f)|first` errors if
+        // *any* element fails, even ones past the first. `first`/`.[0]`'s
+        // pull-one-and-stop fast path only evaluates what's needed, so a
+        // failure on a later, un-pulled element is invisible here -- verified
+        // against real jq (`jq 1.7.1`): `[1,2,"x"]|map(.+1)|first` errors
+        // there (`string ("x") and number (1) cannot be added`) but succeeds
+        // below.
+        let json = br#"[1,2,"x"]"#;
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+
+        let expr = crate::jq::parse("map(. + 1) | first").unwrap();
+        assert_eq!(
+            eval(&expr, value.clone()).into_owned().unwrap(),
+            OwnedValue::Int(2)
+        );
+
+        let expr = crate::jq::parse("map(. + 1) | .[0]").unwrap();
+        assert_eq!(eval(&expr, value).into_owned().unwrap(), OwnedValue::Int(2));
+    }
+
+    #[test]
     fn test_generic_lazy_seq_composability_keys_unsorted_map_select_724() {
         // The actual point of this design: `keys_unsorted | map(f) | select(g)`
         // stays lazy through the `map` stage, materializes once at `select`.
@@ -4274,10 +4403,16 @@ mod tests {
     }
 
     #[test]
-    fn test_generic_lazy_seq_atomicity_vs_iterate_contrast_724() {
-        // `map`'s array construction is atomic; `.[]` over the same failing
-        // chain is a generator and keeps its already-yielded prefix instead
-        // -- two different, both-correct atomicity boundaries.
+    fn test_generic_lazy_seq_map_atomicity_extends_through_iterate_724() {
+        // `map`'s array construction is atomic in real jq
+        // (`[1,2,"x"]|map(.+1)` prints nothing on error, not a truncated
+        // prefix) -- and `.[]` piped after `map` iterates the array `map`
+        // already built, not the raw source, so that same atomicity applies
+        // whether or not a `.[]` follows. Verified against real jq
+        // (`jq 1.7.1`): `{"a":1,"b":2,"c":3}|keys_unsorted|map(if .=="b" then
+        // error("boom") else . end)|.[]` prints nothing to stdout, only the
+        // diagnostic -- even though `"a"` (document order's first key)
+        // already succeeded before `"b"` failed.
         let json = br#"{"a":1,"b":2,"c":3}"#;
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
@@ -4288,9 +4423,7 @@ mod tests {
                 .unwrap();
         let result = eval(&expr, value.clone());
         assert!(matches!(result, GenericResult::LazySeq(_)));
-        // Atomic: `map`'s own array construction discards the whole
-        // in-progress array on the first error -- no partial prefix, even
-        // though `"a"` (document order's first key) already succeeded.
+        // No partial prefix, even though `"a"` already succeeded.
         assert_eq!(result.collect_owned(), Vec::<OwnedValue>::new());
         assert!(eval(&expr, value.clone()).materialize_lazy().is_error());
 
@@ -4299,16 +4432,10 @@ mod tests {
         )
         .unwrap();
         let result = eval(&expr, value);
-        // Non-atomic: `.[]` is a generator over the `map` chain's own
-        // per-element outputs, not array construction -- `"a"` (which the
-        // `map` stage already resolved successfully before `"b"` failed)
-        // survives as a `Partial` prefix instead of being discarded, the
-        // opposite of the `map`-alone case just above.
+        // Same atomicity boundary as the `map`-alone case above: `"a"` does
+        // NOT survive as a partial prefix once `.[]` is piped after `map`.
         assert!(result.is_error());
-        assert_eq!(
-            result.collect_owned(),
-            vec![OwnedValue::String("a".to_string())]
-        );
+        assert_eq!(result.collect_owned(), Vec::<OwnedValue>::new());
     }
 
     /// Known, narrow, pre-existing gap (not a new regression from #724):
@@ -7252,5 +7379,589 @@ mod tests {
                 OwnedValue::Array(vec![OwnedValue::Int(2), OwnedValue::Int(3)]),
             ]
         );
+    }
+
+    // Coverage follow-ups for #725: the tests above pin the common
+    // `LazySeq` shapes (plain `map`, composed `map | map`, `keys_unsorted |
+    // map`, atomicity), but a handful of less-common `GenericResult`
+    // combinations the `LazySeq` machinery touches weren't reached by any
+    // existing test.
+
+    #[test]
+    fn test_generic_lazy_seq_debug_format_725() {
+        // `LazySeq`/`LazySource`'s hand-written `Debug` impls (see their doc
+        // comments for why they're not derived) were never exercised by any
+        // `{:?}` formatting -- pin the shape for all four `LazySource`
+        // variants (`Elements`/`Values`/`Keys`/`IndexRange`).
+        let json = br"[1,2,3]";
+        let index = JsonIndex::build(json);
+        let value = index.root(json).value();
+        let expr = crate::jq::parse("map(.)").unwrap();
+        let result = eval(&expr, value);
+        let GenericResult::LazySeq(seq) = result else {
+            panic!("expected LazySeq");
+        };
+        let debug = format!("{seq:?}");
+        assert!(debug.contains("LazySource::Elements"), "{debug}");
+        assert!(debug.contains("pending_len"), "{debug}");
+
+        let json = br#"{"a":1,"b":2}"#;
+        let index = JsonIndex::build(json);
+        let value = index.root(json).value();
+        let expr = crate::jq::parse("map(.)").unwrap();
+        let GenericResult::LazySeq(seq) = eval(&expr, value) else {
+            panic!("expected LazySeq");
+        };
+        assert!(format!("{seq:?}").contains("LazySource::Values"));
+
+        let expr = crate::jq::parse("keys_unsorted | map(.)").unwrap();
+        let json = br#"{"a":1,"b":2}"#;
+        let index = JsonIndex::build(json);
+        let value = index.root(json).value();
+        let GenericResult::LazySeq(seq) = eval(&expr, value) else {
+            panic!("expected LazySeq");
+        };
+        assert!(format!("{seq:?}").contains("LazySource::Keys"));
+
+        let json = br#"["x","y"]"#;
+        let index = JsonIndex::build(json);
+        let value = index.root(json).value();
+        let GenericResult::LazySeq(seq) = eval(&expr, value) else {
+            panic!("expected LazySeq");
+        };
+        let debug = format!("{seq:?}");
+        assert!(debug.contains("LazySource::IndexRange"), "{debug}");
+        assert!(debug.contains("next"), "{debug}");
+        assert!(debug.contains("len"), "{debug}");
+    }
+
+    #[test]
+    fn test_generic_lazy_elem_debug_format_725() {
+        // `LazyElem`'s hand-written `Debug` impl (see its doc comment: it's
+        // `pub` because anyone who can name the `pub` `LazySeq` type can call
+        // `.next()` on it and observe a `LazyElem`) -- pull one element of
+        // each kind directly and format it, since `LazySeq`'s own `Debug`
+        // above only ever prints `pending`'s *length*, never its elements.
+        let json = br"[1,2,3]";
+        let index = JsonIndex::build(json);
+        let value = index.root(json).value();
+        // `map(.)`: identity preserves the cursor, so the first pulled item
+        // is `LazyElem::Cursor`.
+        let expr = crate::jq::parse("map(.)").unwrap();
+        let GenericResult::LazySeq(mut seq) = eval(&expr, value.clone()) else {
+            panic!("expected LazySeq");
+        };
+        let elem = seq.next().unwrap().unwrap();
+        assert_eq!(format!("{elem:?}"), "LazyElem::Cursor(..)");
+
+        // `map(.+1)`: arithmetic computes a fresh value, so the first pulled
+        // item is `LazyElem::Owned`.
+        let expr = crate::jq::parse("map(. + 1)").unwrap();
+        let GenericResult::LazySeq(mut seq) = eval(&expr, value) else {
+            panic!("expected LazySeq");
+        };
+        let elem = seq.next().unwrap().unwrap();
+        assert_eq!(format!("{elem:?}"), "LazyElem::Owned(Int(2))");
+    }
+
+    #[test]
+    fn test_generic_lazy_seq_yq_semantics_threaded_725() {
+        // `LazySeq::eval_one` re-dispatches per `Instruction::tag`
+        // (`EvalTag::Jq` vs `EvalTag::Yq`) so yq keeps yq arithmetic
+        // semantics through a lazy `map` chain -- neither tagged arm's
+        // `Yq` branch (`LazyElem::Cursor`+`Yq` for the first stage,
+        // `LazyElem::Owned`+`Yq` for the second, composed stage) was
+        // exercised by any test using `eval_using`/`eval_with_cursor` (both
+        // hardcode `JqSemantics`).
+        let json = br"[10.5]";
+        let index = JsonIndex::build(json);
+        let value = index.root(json).value();
+
+        // First stage runs on `LazyElem::Cursor` (from the array source);
+        // second stage runs on `LazyElem::Owned` (the first stage's output).
+        let expr = crate::jq::parse("map(. % 3) | map(. + 0)").unwrap();
+        let result = eval_using::<YqSemantics, _>(&expr, value);
+        assert!(matches!(result, GenericResult::LazySeq(_)));
+        assert_eq!(
+            result.into_owned().unwrap(),
+            // yq keeps float modulo (1.5), unlike jq's truncating modulo (1).
+            OwnedValue::Array(vec![OwnedValue::Float(1.5)])
+        );
+    }
+
+    #[test]
+    fn test_generic_plain_map_materializes_cursor_elements_725() {
+        // `LazySeq::materialize_atomic`'s `LazyElem::Cursor` arm, and
+        // `into_lazy_items`'s `GenericResult::OneCursor` arm: `map(.)` on
+        // an empty container (the existing #725 empty-container test) never
+        // actually iterates, so neither line ever ran. A non-empty array
+        // does: `.` preserves the cursor for every element.
+        let json = br"[1,2,3]";
+        let index = JsonIndex::build(json);
+        let value = index.root(json).value();
+
+        let expr = crate::jq::parse("map(.)").unwrap();
+        assert_eq!(
+            eval(&expr, value).into_owned().unwrap(),
+            OwnedValue::Array(vec![
+                OwnedValue::Int(1),
+                OwnedValue::Int(2),
+                OwnedValue::Int(3),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_generic_lazy_seq_inner_map_result_shapes_725() {
+        // `into_lazy_items` normalizes every `GenericResult` shape a `map`
+        // stage's function can produce for one element -- most of its arms
+        // were never reached by any existing test (only `Owned` and
+        // `Error` were, via plain arithmetic/`error(...)`).
+
+        // `keys_unsorted` on an object element -> `LazyKeys`.
+        let json = br#"[{"a":1},{"bb":2,"c":3}]"#;
+        let index = JsonIndex::build(json);
+        let value = index.root(json).value();
+        let expr = crate::jq::parse("map(keys_unsorted)").unwrap();
+        assert_eq!(
+            eval(&expr, value).into_owned().unwrap(),
+            OwnedValue::Array(vec![
+                OwnedValue::Array(vec![OwnedValue::String("a".to_string())]),
+                OwnedValue::Array(vec![
+                    OwnedValue::String("bb".to_string()),
+                    OwnedValue::String("c".to_string()),
+                ]),
+            ])
+        );
+
+        // `keys_unsorted` on an array element -> `LazyIndexRange`.
+        let json = br"[[1,2],[3,4,5]]";
+        let index = JsonIndex::build(json);
+        let value = index.root(json).value();
+        let expr = crate::jq::parse("map(keys_unsorted)").unwrap();
+        assert_eq!(
+            eval(&expr, value).into_owned().unwrap(),
+            OwnedValue::Array(vec![
+                OwnedValue::Array(vec![OwnedValue::Int(0), OwnedValue::Int(1)]),
+                OwnedValue::Array(vec![
+                    OwnedValue::Int(0),
+                    OwnedValue::Int(1),
+                    OwnedValue::Int(2)
+                ]),
+            ])
+        );
+
+        // `empty` -> `GenericResult::None`, dropping the element entirely.
+        let json = br"[1,2,3]";
+        let index = JsonIndex::build(json);
+        let value = index.root(json).value();
+        let expr = crate::jq::parse("map(select(. > 1))").unwrap();
+        assert_eq!(
+            eval(&expr, value).into_owned().unwrap(),
+            OwnedValue::Array(vec![OwnedValue::Int(2), OwnedValue::Int(3)])
+        );
+
+        // A comma of literals -> `GenericResult::ManyOwned`, fanning one
+        // source element into several output elements.
+        let json = br"[1]";
+        let index = JsonIndex::build(json);
+        let value = index.root(json).value();
+        let expr = crate::jq::parse("map(1, 2)").unwrap();
+        assert_eq!(
+            eval(&expr, value).into_owned().unwrap(),
+            OwnedValue::Array(vec![OwnedValue::Int(1), OwnedValue::Int(2)])
+        );
+
+        // `.[]` on an array-valued element -> `GenericResult::ManyCursor`
+        // (the native `Expr::Iterate` arm), fanning one source element into
+        // several *cursor* output elements -- distinct from the comma case
+        // above, which only ever produces owned values.
+        let json = br"[[1,2],[3]]";
+        let index = JsonIndex::build(json);
+        let value = index.root(json).value();
+        let expr = crate::jq::parse("map(.[])").unwrap();
+        assert_eq!(
+            eval(&expr, value).into_owned().unwrap(),
+            OwnedValue::Array(vec![
+                OwnedValue::Int(1),
+                OwnedValue::Int(2),
+                OwnedValue::Int(3),
+            ])
+        );
+
+        // A per-element function that is itself `keys_unsorted | map(g)`
+        // -> `GenericResult::LazySeq` (recursive laziness). Explicit non-goal
+        // (see `into_lazy_items`'s doc comment): forced via `materialize_atomic`
+        // right there instead of composing further.
+        let json = br#"[{"a":1},{"bb":2,"c":3}]"#;
+        let index = JsonIndex::build(json);
+        let value = index.root(json).value();
+        let expr = crate::jq::parse("map(keys_unsorted | map(ascii_upcase))").unwrap();
+        assert_eq!(
+            eval(&expr, value).into_owned().unwrap(),
+            OwnedValue::Array(vec![
+                OwnedValue::Array(vec![OwnedValue::String("A".to_string())]),
+                OwnedValue::Array(vec![
+                    OwnedValue::String("BB".to_string()),
+                    OwnedValue::String("C".to_string()),
+                ]),
+            ])
+        );
+
+        // A per-element function whose own output is itself `Partial`
+        // (some outputs before an error) -> the whole `map` construction
+        // discards them and fails, same atomicity as a bare error.
+        let json = br"[1]";
+        let index = JsonIndex::build(json);
+        let value = index.root(json).value();
+        let expr = crate::jq::parse(r#"map(1, 2, error("x"))"#).unwrap();
+        assert!(eval(&expr, value).materialize_lazy().is_error());
+    }
+
+    #[test]
+    fn test_generic_plain_map_optional_on_non_container_is_unreachable_via_parser_725() {
+        // `Builtin::Map`'s own `optional`-guarded arm mirrors `Expr::Iterate`'s
+        // (both fall back to `None` instead of erroring when `optional` is
+        // set) but, unlike `Expr::Iterate`, is provably unreachable through
+        // the parser: `map(f)?` always parses to `Expr::Optional(Builtin::Map(f))`
+        // (see `parser.rs`), and `Expr::Optional`'s own generic catch (above
+        // in this file) evaluates its inner expression at the *ambient*
+        // `optional` -- never forcing `true` into a bare `Builtin::Map` --
+        // then converts the resulting `Error` to `None` itself. So this arm
+        // never sees `optional = true` from any real query; call the
+        // (private, module-internal) dispatcher directly to pin it anyway,
+        // matching the same observation already made about `Builtin::Select`
+        // just above this arm in the source.
+        let json = br"5";
+        let index = JsonIndex::build(json);
+        let value = index.root(json).value();
+
+        let expr = crate::jq::parse("map(. + 1)").unwrap();
+        let result = eval_single::<JqSemantics, _>(&expr, value, true, None);
+        assert!(matches!(result, GenericResult::None));
+    }
+
+    #[test]
+    fn test_generic_select_condition_lazy_seq_725() {
+        // `select(map(f))`: the condition itself takes the `LazySeq` fast
+        // path, so `push_generic_truthiness` must materialize it once to
+        // answer truthiness -- distinct from `LazyKeys`/`LazyIndexRange`'s
+        // truthy-without-materializing shortcut just above it (a `LazySeq`
+        // can fail, so it can't reuse that shortcut).
+        let json = br"[1,2]";
+        let index = JsonIndex::build(json);
+        let value = index.root(json).value();
+
+        let expr = crate::jq::parse("select(map(. + 1))").unwrap();
+        assert_eq!(
+            eval(&expr, value.clone()).into_owned().unwrap(),
+            OwnedValue::Array(vec![OwnedValue::Int(1), OwnedValue::Int(2)])
+        );
+
+        let expr = crate::jq::parse(r#"select(map(error("boom")))"#).unwrap();
+        assert!(eval(&expr, value).is_error());
+    }
+
+    #[test]
+    fn test_generic_lazy_seq_length_propagates_control_725() {
+        // The composability arm's `length`: count-and-discard over the
+        // `LazySeq`, but an error/break partway through must still surface
+        // as `length`'s own result, not a partial count.
+        let json = br#"["a","b"]"#;
+        let index = JsonIndex::build(json);
+        let value = index.root(json).value();
+
+        let expr = crate::jq::parse(r#"map(error("boom")) | length"#).unwrap();
+        assert!(eval(&expr, value.clone()).is_error());
+
+        let expr = crate::jq::parse(r"map(break $out) | length").unwrap();
+        let result = eval(&expr, value);
+        assert!(matches!(result, GenericResult::Break(ref label) if label == "out"));
+    }
+
+    #[test]
+    fn test_generic_lazy_seq_iterate_all_cursor_725() {
+        // The composability arm's `.[]`: when every pulled element stayed a
+        // cursor (e.g. `map(.)`'s identity), the whole thing answers as
+        // `GenericResult::ManyCursor` -- no `to_owned` round trip.
+        let json = br"[1,2,3]";
+        let index = JsonIndex::build(json);
+        let value = index.root(json).value();
+
+        let expr = crate::jq::parse("map(.) | .[]").unwrap();
+        let result = eval(&expr, value);
+        assert!(matches!(result, GenericResult::ManyCursor(_)));
+        assert_eq!(
+            result.collect_owned(),
+            vec![OwnedValue::Int(1), OwnedValue::Int(2), OwnedValue::Int(3)]
+        );
+    }
+
+    #[test]
+    fn test_generic_lazy_seq_iterate_mixed_cursor_and_owned_725() {
+        // Same `.[]` arm, heterogeneous case: one element resolves to a
+        // cursor (`.foo` present), another to a computed/missing value
+        // (`.foo` absent is owned `null`) -- not all-cursor, so the whole
+        // thing materializes to `GenericResult::ManyOwned`, exercising the
+        // `LazyElem::Cursor` sub-arm of that conversion (the existing
+        // `map(ascii_upcase) | .[]` test only ever produced `Owned` items).
+        let json = br#"[{"foo":1},{"other":2}]"#;
+        let index = JsonIndex::build(json);
+        let value = index.root(json).value();
+
+        let expr = crate::jq::parse("map(.foo) | .[]").unwrap();
+        let result = eval(&expr, value);
+        assert!(!matches!(result, GenericResult::ManyCursor(_)));
+        assert_eq!(
+            result.collect_owned(),
+            vec![OwnedValue::Int(1), OwnedValue::Null]
+        );
+    }
+
+    #[test]
+    fn test_generic_lazy_seq_iterate_atomicity_discards_cursor_prefix_725() {
+        // Same `.[]` arm, failing case: the already-succeeded prefix (here,
+        // one element whose `.foo` access resolved to a cursor, not an owned
+        // value -- unlike the other atomicity test's `if/else` map function,
+        // which isn't cursor-preserving) is discarded, not kept, on a later
+        // element's error -- `map`'s array construction is atomic in real
+        // jq, and `.[]` piped after `map` iterates the array `map` already
+        // built, so it inherits that atomicity regardless of whether the
+        // discarded items were cursors or owned values.
+        let json = br#"[{"foo":1},42]"#;
+        let index = JsonIndex::build(json);
+        let value = index.root(json).value();
+
+        let expr = crate::jq::parse("map(.foo) | .[]").unwrap();
+        let result = eval(&expr, value);
+        assert!(result.is_error());
+        assert_eq!(result.collect_owned(), Vec::<OwnedValue>::new());
+    }
+
+    #[test]
+    fn test_generic_lazy_seq_first_and_index_zero_all_shapes_725() {
+        // The composability arm's `first`/`.[0]` ("pull-one-and-stop"):
+        // every arm of its own `match seq.next()` -- empty, cursor, error,
+        // break -- but the existing test only ever exercised the `Owned`
+        // shape (`map(ascii_upcase) | first`).
+        let json = br"[]";
+        let index = JsonIndex::build(json);
+        let value = index.root(json).value();
+        let expr = crate::jq::parse("map(.) | first").unwrap();
+        assert_eq!(eval(&expr, value).into_owned().unwrap(), OwnedValue::Null);
+
+        let json = br"[1,2,3]";
+        let index = JsonIndex::build(json);
+        let value = index.root(json).value();
+        let expr = crate::jq::parse("map(.) | first").unwrap();
+        let result = eval(&expr, value);
+        assert!(matches!(result, GenericResult::OneCursor(_)));
+        assert_eq!(result.into_owned().unwrap(), OwnedValue::Int(1));
+
+        let json = br"[42]";
+        let index = JsonIndex::build(json);
+        let value = index.root(json).value();
+        let expr = crate::jq::parse("map(.foo) | first").unwrap();
+        assert!(eval(&expr, value).is_error());
+
+        let json = br"[1]";
+        let index = JsonIndex::build(json);
+        let value = index.root(json).value();
+        let expr = crate::jq::parse("map(break $out) | first").unwrap();
+        let result = eval(&expr, value);
+        assert!(matches!(result, GenericResult::Break(ref label) if label == "out"));
+    }
+
+    #[test]
+    fn test_generic_first_last_expr_forward_lazy_seq_725() {
+        // `first(EXPR)`/`last(EXPR)` (the explicit-argument form, distinct
+        // from the no-argument `first`/`last` builtins covered above):
+        // `eval_first_or_last_generic` forwards a `LazySeq` result
+        // unchanged in both directions instead of materializing it, since
+        // it only needs to know *which* output this is, not inspect it.
+        let json = br"[1,2,3]";
+        let index = JsonIndex::build(json);
+        let value = index.root(json).value();
+
+        let expr = crate::jq::parse("first(map(. * 2))").unwrap();
+        let result = eval(&expr, value.clone());
+        assert!(matches!(result, GenericResult::LazySeq(_)));
+        assert_eq!(
+            result.into_owned().unwrap(),
+            OwnedValue::Array(vec![
+                OwnedValue::Int(2),
+                OwnedValue::Int(4),
+                OwnedValue::Int(6),
+            ])
+        );
+
+        let expr = crate::jq::parse("last(map(. * 2))").unwrap();
+        let result = eval(&expr, value);
+        assert!(matches!(result, GenericResult::LazySeq(_)));
+        assert_eq!(
+            result.into_owned().unwrap(),
+            OwnedValue::Array(vec![
+                OwnedValue::Int(2),
+                OwnedValue::Int(4),
+                OwnedValue::Int(6),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_generic_lazy_seq_stream_json_yaml_725() {
+        // `GenericResult::stream_json`/`stream_yaml`'s own `LazySeq` arm
+        // (distinct from `LazyKeys`/`LazyIndexRange`'s zero-buffer writers
+        // just above it -- `map`'s array construction is atomic, so this one
+        // pulls the whole `LazySeq` via `materialize_atomic` first): neither
+        // the success nor the `break`-control path was exercised by any
+        // existing test (only the `error`-control path, via
+        // `test_generic_plain_map_atomicity_725`).
+        let json = br"[1,2,3]";
+        let index = JsonIndex::build(json);
+        let value = index.root(json).value();
+
+        let expr = crate::jq::parse("map(. + 1)").unwrap();
+        let result = eval(&expr, value.clone());
+        let mut out = String::new();
+        let stats = result.stream_json(&mut out, 0, |_| Ok(())).unwrap();
+        assert_eq!(out, "[2,3,4]");
+        assert_eq!(stats.count, 1);
+        assert!(stats.any_truthy);
+
+        let mut out = String::new();
+        let stats = result.stream_yaml(&mut out, 0, |_| Ok(())).unwrap();
+        assert_eq!(out, "[2, 3, 4]");
+        assert_eq!(stats.count, 1);
+        assert!(stats.any_truthy);
+
+        let expr = crate::jq::parse("map(break $out)").unwrap();
+        let result = eval(&expr, value.clone());
+        let mut out = String::new();
+        let stats = result.stream_json(&mut out, 0, |_| Ok(())).unwrap();
+        assert_eq!(out, "");
+        assert_eq!(stats.count, 0);
+        assert!(stats.error.is_some());
+
+        let result = eval(&expr, value);
+        let mut out = String::new();
+        let stats = result.stream_yaml(&mut out, 0, |_| Ok(())).unwrap();
+        assert_eq!(out, "");
+        assert!(stats.error.is_some());
+    }
+
+    #[test]
+    fn test_generic_lazy_seq_materialize_lazy_break_725() {
+        // `GenericResult::materialize_lazy`'s own `LazySeq` arm converts a
+        // `Control::Break` into `Self::Break` -- distinct from `stream_json`/
+        // `stream_yaml`'s own bespoke `LazySeq` handling above (which never
+        // calls `materialize_lazy`), and from the composability arm's
+        // native `length`/`first` short-circuits (which return `Break`
+        // directly, before `materialize_lazy` ever runs). `into_owned`/
+        // `collect_owned` are the only two callers that reach it, and both
+        // route through the plain fallback shape (`_ =>
+        // materialize_atomic()+eval_on_owned`), not through a top-level bare
+        // `map`.
+        let json = br"[1,2,3]";
+        let index = JsonIndex::build(json);
+        let value = index.root(json).value();
+
+        let expr = crate::jq::parse("map(break $out) | last").unwrap();
+        let result = eval(&expr, value);
+        assert!(matches!(result, GenericResult::Break(ref label) if label == "out"));
+    }
+
+    #[test]
+    fn test_generic_lazy_seq_composability_fallback_propagates_control_725() {
+        // The composability arm's final `_` fallback (`last`, `.[n]` for
+        // `n != 0`, `select`, comparisons, ...): one atomic
+        // `materialize_atomic` pull, then hand off to `eval_on_owned` -- but
+        // an error/break during that pull must surface directly, never
+        // reaching `eval_on_owned` at all. The existing test for this
+        // fallback (`test_generic_lazy_seq_composability_native_consumers_725`)
+        // only ever exercised the success path.
+        let json = br#"[1,2,"x"]"#;
+        let index = JsonIndex::build(json);
+        let value = index.root(json).value();
+        let expr = crate::jq::parse("map(. + 1) | last").unwrap();
+        assert!(eval(&expr, value).is_error());
+
+        let json = br"[1,2,3]";
+        let index = JsonIndex::build(json);
+        let value = index.root(json).value();
+        let expr = crate::jq::parse("map(break $out) | last").unwrap();
+        let result = eval(&expr, value);
+        assert!(matches!(result, GenericResult::Break(ref label) if label == "out"));
+    }
+
+    #[test]
+    fn test_generic_lazy_seq_pipe_continuation_earlier_lazy_failure_wins_725() {
+        // `Expr::Pipe`'s `ManyCursor` continuation (`.[] | REST`, `REST`
+        // itself producing a fresh `LazySeq` per element via `keys_unsorted |
+        // map(f)`): each cursor element is evaluated independently and
+        // buffered into `per_element`. When materializing that buffer
+        // (`flatten_generic_results`) later discovers an *earlier* buffered
+        // `LazySeq` also fails, that earlier failure must win over whatever
+        // triggered the buffer to be flattened -- it's chronologically first
+        // in evaluation order. None of these interactions (earlier-fails
+        // alongside a later immediate error, or alongside a normal
+        // non-early-returning flatten) were exercised by any existing test.
+        let json = br#"[{"b":1,"a":2}, 42]"#;
+        let index = JsonIndex::build(json);
+        let value = index.root(json).value();
+
+        // Element 0 (`{"b":1,"a":2}`) takes the `keys_unsorted | map(f)`
+        // fast path and stays a raw, unmaterialized `LazySeq` in
+        // `per_element` -- `f` fails once actually pulled (on key `"b"`).
+        // Element 1 (`42`, not an object/array) fails `keys_unsorted`
+        // immediately, triggering the early return that must first flatten
+        // (and thus fail on) element 0's still-buffered `LazySeq` -- whose
+        // error wins over element 1's own.
+        let expr = crate::jq::parse(
+            r#".[] | (keys_unsorted | map(if . == "b" then error("early") else . end))"#,
+        )
+        .unwrap();
+        let result = eval(&expr, value.clone());
+        assert!(result.is_error());
+        assert_eq!(result.error().unwrap().message, "early");
+
+        // Same shape, but element 0's buffered `LazySeq` fails via `break`
+        // instead of `error` -- the earlier `Break` must still win over
+        // element 1's immediate `Error`.
+        let expr = crate::jq::parse(
+            r#".[] | (keys_unsorted | map(if . == "b" then break $out else . end))"#,
+        )
+        .unwrap();
+        let result = eval(&expr, value);
+        assert!(matches!(result, GenericResult::Break(ref label) if label == "out"));
+    }
+
+    #[test]
+    fn test_generic_lazy_seq_pipe_continuation_flatten_after_full_scan_725() {
+        // Same `ManyCursor` continuation as above, but with no element
+        // triggering an early return at all: every element resolves to a
+        // raw, buffered `LazySeq`, so `flatten_generic_results` only runs
+        // once, after the loop over every cursor finishes. A failure
+        // discovered there (as opposed to the early-return paths covered by
+        // `..._earlier_lazy_failure_wins_725` above) is a distinct code
+        // path (the fallthrough at the bottom of the `ManyCursor` arm).
+        let json = br#"[{"b":1},{"a":2}]"#;
+        let index = JsonIndex::build(json);
+        let value = index.root(json).value();
+
+        let expr = crate::jq::parse(
+            r#".[] | (keys_unsorted | map(if . == "b" then error("boom") else . end))"#,
+        )
+        .unwrap();
+        let result = eval(&expr, value.clone());
+        assert!(result.is_error());
+        assert_eq!(result.error().unwrap().message, "boom");
+
+        let expr = crate::jq::parse(
+            r#".[] | (keys_unsorted | map(if . == "b" then break $out else . end))"#,
+        )
+        .unwrap();
+        let result = eval(&expr, value);
+        assert!(matches!(result, GenericResult::Break(ref label) if label == "out"));
     }
 }
