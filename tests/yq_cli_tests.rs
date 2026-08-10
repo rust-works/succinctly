@@ -5212,3 +5212,43 @@ fn test_assignment_does_not_yet_preserve_comments_710() -> Result<()> {
     assert_eq!(out, "a: 1\nb: 5\n");
     Ok(())
 }
+
+/// A standalone comment on the line right after a block scalar's content
+/// belongs to whatever follows it, not to the block scalar - it must not be
+/// misattributed to `a`. `set_bp_text_end`'s generic same-line capture used
+/// `self.pos`, which by the time block-scalar content parsing finishes has
+/// already advanced past the block region (see
+/// `set_bp_text_end_position`'s doc comment); this stole `b`'s comment and
+/// attached it to `a`. Real `yq` drops this comment entirely (it's not a
+/// same-line trailing comment for anything in this document, and
+/// `head_comment` isn't implemented), so this pins the correct "drop, don't
+/// steal" behavior rather than replicating misattribution.
+#[test]
+fn test_block_scalar_does_not_steal_following_comment_710() -> Result<()> {
+    let (out, code) = run_yq_stdin(".", "a: |\n  line one\n# comment for b\nb: 2\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "a: \"line one\\n\"\nb: 2\n");
+    Ok(())
+}
+
+/// Same misattribution risk for an empty block scalar (no content lines at
+/// all): `detect_block_content_indent` also leaves `self.pos` at the start
+/// of the following line before returning `None`.
+#[test]
+fn test_empty_block_scalar_does_not_steal_following_comment_710() -> Result<()> {
+    let (out, code) = run_yq_stdin(".", "a: |\n# comment for b\nb: 2\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "a: \"\"\nb: 2\n");
+    Ok(())
+}
+
+/// The block scalar's own trailing comment on the header line itself
+/// (`| # text`, captured explicitly before content parsing) must still work
+/// after splitting `set_bp_text_end` into capture/no-capture variants.
+#[test]
+fn test_block_scalar_header_comment_still_preserved_710() -> Result<()> {
+    let (out, code) = run_yq_stdin(".a | line_comment", "a: | # keep this\n  line one\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "keep this");
+    Ok(())
+}

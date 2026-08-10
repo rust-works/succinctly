@@ -408,6 +408,33 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     /// their leading `[`, `{` or `*`. So don't call this after them.
     #[inline]
     fn set_bp_text_end(&mut self, end_pos: usize) {
+        self.set_bp_text_end_position(end_pos);
+        // The node whose end was just recorded is the one that owns a
+        // trailing same-line comment, if `self.pos` (left wherever scanning
+        // for this value stopped) has nothing but inline whitespace before
+        // a `#`. Every scalar-parsing call site invokes `set_bp_text_end`
+        // immediately after its own scan loop returns, with no intervening
+        // advance, so `self.pos` still reflects exactly where that scan
+        // stopped (#710).
+        let owner_bp_pos = self.last_open_bp_pos;
+        self.maybe_capture_line_comment(owner_bp_pos);
+    }
+
+    /// Record `end_pos` as the text end for the node currently open, without
+    /// attempting trailing-comment capture (#710). Block scalars call this
+    /// directly: their own trailing comment, if any, was already captured
+    /// explicitly on the header line (`| # text`) before content was
+    /// consumed, and by the time content parsing finishes `self.pos` sits at
+    /// the start of a following line — possibly several blank lines, or a
+    /// comment line belonging to the next sibling, past the block region
+    /// (`consume_block_scalar_content`/`detect_block_content_indent` both
+    /// advance `self.pos` past it). `set_bp_text_end`'s same-line capture
+    /// would misattribute that unrelated following comment to this block
+    /// scalar; skipping it here is always safe since `self.pos` is at column
+    /// 0 of a fresh line, never mid-line, so there is no legitimate
+    /// same-line comment left to find.
+    #[inline]
+    fn set_bp_text_end_position(&mut self, end_pos: usize) {
         #[cfg(debug_assertions)]
         debug_assert!(
             self.wrapper_slots.last() != Some(&true),
@@ -423,15 +450,6 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         {
             self.last_recorded_end = end_pos;
         }
-        // The node whose end was just recorded is the one that owns a
-        // trailing same-line comment, if `self.pos` (left wherever scanning
-        // for this value stopped) has nothing but inline whitespace before
-        // a `#`. Every scalar-parsing call site invokes `set_bp_text_end`
-        // immediately after its own scan loop returns, with no intervening
-        // advance, so `self.pos` still reflects exactly where that scan
-        // stopped (#710).
-        let owner_bp_pos = self.last_open_bp_pos;
-        self.maybe_capture_line_comment(owner_bp_pos);
     }
 
     /// Capture a trailing same-line comment for `owner_bp_pos`, if `self.pos`
@@ -3990,8 +4008,12 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             match self.detect_block_content_indent(base_indent) {
                 Some(indent) => indent,
                 None => {
-                    // Empty block scalar
-                    self.set_bp_text_end(self.pos);
+                    // Empty block scalar. `self.pos` sits at the start of the
+                    // line following the header (see `detect_block_content_indent`),
+                    // so a `#` there belongs to a following comment/sibling
+                    // line, not this scalar — use the no-capture variant
+                    // (#710, see `set_bp_text_end_position`'s doc comment).
+                    self.set_bp_text_end_position(self.pos);
                     self.write_bp_close();
                     return Ok(());
                 }
@@ -4001,8 +4023,13 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         // Consume content lines
         let content_end = self.consume_block_scalar_content(content_indent, header.chomping);
 
-        // Close the block scalar node
-        self.set_bp_text_end(content_end);
+        // Close the block scalar node. `self.pos` has been advanced past the
+        // block region (potentially past blank lines or a following
+        // sibling's comment line) by `consume_block_scalar_content`, so use
+        // the no-capture variant — the block's own trailing comment, if any,
+        // was already captured on the header line above (#710, see
+        // `set_bp_text_end_position`'s doc comment).
+        self.set_bp_text_end_position(content_end);
         self.write_bp_close();
 
         Ok(())
