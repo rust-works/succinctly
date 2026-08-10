@@ -1057,7 +1057,8 @@ pub struct YqCommand {
     #[arg(long = "doc", value_name = "N")]
     pub document: Option<usize>,
 
-    /// Pretty print, expand flow styles to block style
+    /// Pretty print, expand flow styles to block style (currently a no-op:
+    /// output is already always block-style pending style preservation, #707)
     #[arg(short = 'P', long = "prettyPrint")]
     pub pretty_print: bool,
 

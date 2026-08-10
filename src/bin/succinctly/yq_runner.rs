@@ -1486,16 +1486,20 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
     // Supports both JSON and YAML output formats.
     let is_identity = matches!(program.expr, Expr::Identity);
     let is_m2_streamable = can_use_m2_streaming(&program.expr);
-    // Color isn't implemented by the cursor streamers, so it still falls
-    // back to the DOM path, unchanged, rather than silently ignoring the
-    // flag the way compact mode already does today. `sort_keys` and `tab`
-    // (#733) are now implemented directly by the cursor/lazy streamers —
-    // see `IndentSpec` and the `sort_keys` parameter threaded through
-    // `DocumentCursor::stream_json`/`stream_yaml` and `GenericResult::
+    // Color and pretty_print aren't implemented by the cursor streamers, so
+    // they still fall back to the DOM path, unchanged, rather than silently
+    // ignoring the flag the way compact mode already does today. `sort_keys`
+    // and `tab` (#733) are now implemented directly by the cursor/lazy
+    // streamers — see `IndentSpec` and the `sort_keys` parameter threaded
+    // through `DocumentCursor::stream_json`/`stream_yaml` and `GenericResult::
     // stream_json`/`stream_yaml` — so routing them through the DOM would
     // needlessly reintroduce #442's duplicate-mapping-key collapse
     // (`OwnedValue::Object`'s `IndexMap` cannot represent duplicate keys).
-    let can_stream_pretty = !output_config.use_color;
+    // pretty_print's DOM-path rendering is currently indistinguishable from
+    // the default (style preservation doesn't exist yet — #707); routing it
+    // through DOM now gives it a single seam to implement real
+    // style-clearing against once #707 lands (#705).
+    let can_stream_pretty = !output_config.use_color && !args.pretty_print;
     let can_json_fast_path = is_m2_streamable
         && (output_config.compact || (can_stream_pretty && !args.ascii_output))
         && output_config.output_format == OutputFormat::Json

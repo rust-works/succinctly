@@ -4724,6 +4724,56 @@ fn test_keys_unsorted_yaml_dom_fallback_matches_lazy_685() -> Result<()> {
     Ok(())
 }
 
+/// `-P`/`--prettyPrint` (#705) was previously read nowhere at all — parsed
+/// into `YqCommand::pretty_print` and then silently ignored on every path.
+/// It's now wired into `can_stream_pretty` (`yq_runner.rs`), forcing the DOM
+/// fallback exactly like `--sort-keys` above (`test_keys_unsorted_yaml_dom_fallback_matches_lazy_685`).
+///
+/// #707 (flow-style preservation) has since landed on the M2 cursor-streaming
+/// path only — the DOM fallback path `-P` forces was never touched by it and
+/// still renders unconditionally block-style. So for flow-style input, `-P`
+/// now diverges from the default (which preserves the input's flow style)
+/// and produces real block-style pretty-printing, matching real yq's `-P`
+/// semantics.
+#[test]
+fn test_pretty_print_flag_forces_block_style_705() -> Result<()> {
+    let input = "a: [1, 2, 3]\nb: {c: 1, d: 2}\n";
+
+    // YAML output: default preserves the input's flow style (#707); -P
+    // forces the DOM path, which unconditionally renders block-style.
+    let (default_out, code) = run_yq_stdin(".", input, &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(default_out, "a: [1, 2, 3]\nb: {c: 1, d: 2}\n");
+    let (pretty_out, code) = run_yq_stdin(".", input, &["-P"])?;
+    assert_eq!(code, 0);
+    assert_eq!(pretty_out, "a:\n  - 1\n  - 2\n  - 3\nb:\n  c: 1\n  d: 2\n");
+    assert_ne!(default_out, pretty_out);
+
+    // Long-flag form parses identically to -P.
+    let (pretty_long_out, code) = run_yq_stdin(".", input, &["--prettyPrint"])?;
+    assert_eq!(code, 0);
+    assert_eq!(pretty_out, pretty_long_out);
+
+    // JSON output: the DOM detour -P forces doesn't affect the JSON path.
+    let (default_json, code) = run_yq_stdin(".", input, &["-o", "json"])?;
+    assert_eq!(code, 0);
+    let (pretty_json, code) = run_yq_stdin(".", input, &["-o", "json", "-P"])?;
+    assert_eq!(code, 0);
+    assert_eq!(default_json, pretty_json);
+
+    // -I0 (compact) satisfies the fast-path gate on its own
+    // (`output_config.compact || ...`), so -P alone does *not* force DOM in
+    // compact mode — mirroring --sort-keys' documented compact-mode
+    // exemption above. Still must produce identical output either way.
+    let (default_compact, code) = run_yq_stdin(".", input, &["-I0"])?;
+    assert_eq!(code, 0);
+    let (pretty_compact, code) = run_yq_stdin(".", input, &["-I0", "-P"])?;
+    assert_eq!(code, 0);
+    assert_eq!(default_compact, pretty_compact);
+
+    Ok(())
+}
+
 /// `keys_unsorted` on a mapping resolved through a `<<: *anchor` merge key
 /// exercises `YamlFields`'s `Merged` variant (an `Rc`-shared entry list, the
 /// reason `YamlFields` can't be `Copy` the way `JsonFields` is) through the
