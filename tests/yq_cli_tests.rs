@@ -5752,3 +5752,36 @@ fn test_713_jq_mode_unaffected() -> Result<()> {
 
     Ok(())
 }
+
+/// A null (or absent, which evaluates to null) merge target is the most
+/// common way `*=n`/`*=?` get invoked in practice. `arith_mul` must route
+/// null operands through the same flag-gated merge machinery as a real
+/// container pair instead of short-circuiting to `null` before flags apply
+/// — otherwise `n`/`?` silently do nothing on a fresh/absent field, which is
+/// exactly the case #713's own examples lead with. Expected values
+/// cross-checked against real yq v4.53.3.
+#[test]
+fn test_713_merge_flags_on_null_or_absent_target() -> Result<()> {
+    // `n` on an explicit null target: writes the full rhs, same as a null
+    // nested field would.
+    let (output, code) = run_yq_stdin(
+        ".a *=n .b",
+        "a: null\nb: {x: 1, y: 2}\n",
+        &["-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#"{"a":{"x":1,"y":2},"b":{"x":1,"y":2}}"#);
+
+    // `?` on an absent target: never creates new fields, so it merges into
+    // an empty object and every field is blocked, leaving `a: {}`.
+    let (output, code) = run_yq_stdin(".a *=? .b", "b: {x: 1, y: 2}\n", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#"{"b":{"x":1,"y":2},"a":{}}"#);
+
+    // A null right operand is a no-op regardless of flags.
+    let (output, code) = run_yq_stdin(".a *=+ null", "a: [1, 2]\n", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#"{"a":[1,2]}"#);
+
+    Ok(())
+}
