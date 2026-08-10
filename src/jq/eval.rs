@@ -21283,6 +21283,13 @@ mod tests {
                 assert_eq!(n, 1);
             }
         );
+
+        // Prefix equal to the whole string trims to the empty string.
+        query!(br#""foobar""#, r#"ltrimstr("foobar")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "");
+            }
+        );
     }
 
     #[test]
@@ -21314,6 +21321,13 @@ mod tests {
                 assert_eq!(n, 1);
             }
         );
+
+        // Suffix equal to the whole string trims to the empty string.
+        query!(br#""foobar""#, r#"rtrimstr("foobar")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "");
+            }
+        );
     }
 
     #[test]
@@ -21329,6 +21343,28 @@ mod tests {
                 assert!(!b);
             }
         );
+
+        // Substring that isn't a prefix is still false.
+        query!(br#""foobar""#, r#"startswith("oob")"#,
+            QueryResult::Owned(OwnedValue::Bool(b)) => {
+                assert!(!b);
+            }
+        );
+
+        // Unlike ltrimstr/rtrimstr, startswith is not total: a non-string
+        // argument errors.
+        query!(br#""abc""#, "startswith(1)",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "startswith() requires string inputs");
+            }
+        );
+
+        // A non-string input errors too.
+        query!(b"1", r#"startswith("a")"#,
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "startswith() requires string inputs");
+            }
+        );
     }
 
     #[test]
@@ -21342,6 +21378,28 @@ mod tests {
         query!(br#""hello world""#, r#"endswith("hello")"#,
             QueryResult::Owned(OwnedValue::Bool(b)) => {
                 assert!(!b);
+            }
+        );
+
+        // Substring that isn't a suffix is still false.
+        query!(br#""foobar""#, r#"endswith("oob")"#,
+            QueryResult::Owned(OwnedValue::Bool(b)) => {
+                assert!(!b);
+            }
+        );
+
+        // Unlike ltrimstr/rtrimstr, endswith is not total: a non-string
+        // argument errors.
+        query!(br#""abc""#, "endswith(1)",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "endswith() requires string inputs");
+            }
+        );
+
+        // A non-string input errors too.
+        query!(b"1", r#"endswith("a")"#,
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "endswith() requires string inputs");
             }
         );
     }
@@ -23866,6 +23924,23 @@ mod tests {
         query!(br#""  hello world  ""#, "trim", QueryResult::Owned(OwnedValue::String(s)) => {
             assert_eq!(s, "hello world");
         });
+
+        // Interior whitespace is preserved; only leading/trailing is stripped.
+        query!(br#""  a  b  ""#, "trim", QueryResult::Owned(OwnedValue::String(s)) => {
+            assert_eq!(s, "a  b");
+        });
+
+        // Already-trimmed input is a no-op.
+        query!(br#""hello""#, "trim", QueryResult::Owned(OwnedValue::String(s)) => {
+            assert_eq!(s, "hello");
+        });
+
+        // Non-string input errors.
+        query!(b"1", "trim",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "trim requires string");
+            }
+        );
     }
 
     #[test]
@@ -23873,6 +23948,23 @@ mod tests {
         query!(br#""  hello""#, "ltrim", QueryResult::Owned(OwnedValue::String(s)) => {
             assert_eq!(s, "hello");
         });
+
+        // Trailing whitespace is preserved; only leading is stripped.
+        query!(br#""  hello  ""#, "ltrim", QueryResult::Owned(OwnedValue::String(s)) => {
+            assert_eq!(s, "hello  ");
+        });
+
+        // Already-trimmed input is a no-op.
+        query!(br#""hello""#, "ltrim", QueryResult::Owned(OwnedValue::String(s)) => {
+            assert_eq!(s, "hello");
+        });
+
+        // Non-string input errors.
+        query!(b"1", "ltrim",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "ltrim requires string");
+            }
+        );
     }
 
     #[test]
@@ -23880,6 +23972,23 @@ mod tests {
         query!(br#""hello  ""#, "rtrim", QueryResult::Owned(OwnedValue::String(s)) => {
             assert_eq!(s, "hello");
         });
+
+        // Leading whitespace is preserved; only trailing is stripped.
+        query!(br#""  hello  ""#, "rtrim", QueryResult::Owned(OwnedValue::String(s)) => {
+            assert_eq!(s, "  hello");
+        });
+
+        // Already-trimmed input is a no-op.
+        query!(br#""hello""#, "rtrim", QueryResult::Owned(OwnedValue::String(s)) => {
+            assert_eq!(s, "hello");
+        });
+
+        // Non-string input errors.
+        query!(b"1", "rtrim",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "rtrim requires string");
+            }
+        );
     }
 
     #[test]
