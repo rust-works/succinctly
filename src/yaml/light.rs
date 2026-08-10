@@ -1419,6 +1419,10 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                             out.write_char(':')?;
                             let value = field.value_cursor();
                             if is_yaml_cursor_container(&value) && value.style() != "flow" {
+                                // A comment trailing the key's own line, when
+                                // the value is deferred to the next line,
+                                // belongs to the key, not the value (#765).
+                                write_line_comment(out, field.key_cursor().line_comment_raw())?;
                                 // The anchor (if any) belongs on the same
                                 // line as the key, before the newline that
                                 // starts the container's own contents.
@@ -1466,6 +1470,10 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                             // Check if value needs newline
                             let value = field.value_cursor();
                             if is_yaml_cursor_container(&value) && value.style() != "flow" {
+                                // A comment trailing the key's own line, when
+                                // the value is deferred to the next line,
+                                // belongs to the key, not the value (#765).
+                                write_line_comment(out, field.key_cursor().line_comment_raw())?;
                                 // The anchor (if any) belongs on the same
                                 // line as the key, before the newline that
                                 // starts the container's own contents.
