@@ -1,0 +1,1 @@
+jq: error (at <stdin>:0): date "not-a-date" does not match format "%Y-%m-%d"
