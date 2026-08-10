@@ -114,10 +114,13 @@ pub enum CommentTree {
     /// line when its value is deferred to a following line (issue #765,
     /// e.g. `a: # comment\n  b: 1`) - distinct from the field's value
     /// subtree's own comment, which `.a | line_comment` etc. read instead.
+    /// The `bool` alongside each comment is whether the deferred value
+    /// materialized as nothing at all (a sibling key follows, or EOF) -
+    /// see [`Self::key_comment_if_value_absent`].
     Object(
         Option<String>,
         IndexMap<String, Self>,
-        IndexMap<String, String>,
+        IndexMap<String, (String, bool)>,
     ),
 }
 
@@ -161,7 +164,27 @@ impl CommentTree {
     /// trailing comment (issue #710).
     pub fn key_comment(&self, key: &str) -> Option<&str> {
         match self {
-            Self::Object(_, _, key_comments) => key_comments.get(key).map(String::as_str),
+            Self::Object(_, _, key_comments) => key_comments.get(key).map(|(c, _)| c.as_str()),
+            _ => None,
+        }
+    }
+
+    /// The same key-scoped comment as [`Self::key_comment`], but only when
+    /// the deferred value itself materialized as nothing at all (issue
+    /// #765) - a sibling key follows at the same or lower indent, or EOF.
+    ///
+    /// `None` both when there's no key comment at all, and when there is
+    /// one but the deferred value has real content of its own (a
+    /// container - use `key_comment` plus the value's own rendering there
+    /// instead - or a folded scalar continuation like `a: # c\n  null`,
+    /// which real `yq` places the comment after rather than right after
+    /// the key, a different, unhandled case).
+    pub fn key_comment_if_value_absent(&self, key: &str) -> Option<&str> {
+        match self {
+            Self::Object(_, _, key_comments) => key_comments
+                .get(key)
+                .filter(|(_, absent)| *absent)
+                .map(|(c, _)| c.as_str()),
             _ => None,
         }
     }
@@ -199,8 +222,19 @@ pub fn to_owned_with_comments<V: DocumentValue>(
                 // A comment trailing the key's own line, when the value is
                 // deferred to a following line (issue #765) - distinct from
                 // `c`'s own comment above, which belongs to the value.
+                // Recorded alongside whether the deferred value
+                // materialized as nothing at all (a sibling key follows, or
+                // EOF): a folded scalar continuation that merely *reads* as
+                // null (`a: # c\n  null`) is a different, unhandled case
+                // where real yq places the comment after the folded value
+                // instead of right after the key, which `v`/`is_null()`
+                // alone can't tell apart from true absence - both collapse
+                // through the same semantic check `to_owned` uses - so this
+                // also checks the raw text is empty, not just null-ish.
                 if let Some(kc) = field.key_cursor.line_comment_raw() {
-                    key_comment_map.insert(key, kc);
+                    let value_absent = field.value.is_null()
+                        && field.value.as_str().map_or(true, |s| s.is_empty());
+                    key_comment_map.insert(key, (kc, value_absent));
                 }
             }
             f = rest;

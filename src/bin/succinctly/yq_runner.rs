@@ -994,6 +994,11 @@ fn emit_yaml_value(
                             // For nested containers, emit at depth+1 which handles its own indentation
                             let val = emit_yaml_value(v, field_comments, config, depth + 1, false);
                             format!("{indent}{key}:{key_comment_suffix}\n{val}{comment_suffix}")
+                        } else if let Some(kc) = comments.key_comment_if_value_absent(k) {
+                            // The deferred value materialized as nothing at
+                            // all - the key's own comment stands alone with
+                            // no value token, matching real yq (#765).
+                            format!("{indent}{key}: {kc}")
                         } else {
                             let val = emit_yaml_value(v, field_comments, config, depth + 1, false);
                             format!("{indent}{key}: {val}{comment_suffix}")
