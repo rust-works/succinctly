@@ -2627,6 +2627,28 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
             }
         }
 
+        // Slice 2 (#725): `Builtin::Map`'s first-ever native arm -- plain
+        // `arr | map(f)` / `obj | map(f)` on containers that never touch
+        // `keys_unsorted`/`keys`, the dominant 75-95% share of the
+        // to_owned->reserialize->reindex->re-evaluate fallback's measured
+        // cost (#686). `map(f)` is `[.[] | f]`; `.[]` over an object
+        // iterates its *values* (#422), matching `eval.rs`'s
+        // `builtin_map`/`map_over`. `Builtin::MapValues` is an explicit
+        // non-goal and stays on the wildcard fallback below.
+        Builtin::Map(f) => {
+            if let Some(elements) = value.as_array() {
+                GenericResult::LazySeq(
+                    LazySeq::new(LazySource::Elements(elements)).push_map(f, S::TAG),
+                )
+            } else if let Some(fields) = value.as_object() {
+                GenericResult::LazySeq(LazySeq::new(LazySource::Values(fields)).push_map(f, S::TAG))
+            } else if optional {
+                GenericResult::None
+            } else {
+                GenericResult::Error(EvalError::cannot_iterate(&to_owned(&value)))
+            }
+        }
+
         Builtin::Shuffle => {
             #[cfg(feature = "cli")]
             {
@@ -4035,6 +4057,202 @@ mod tests {
     }
 
     #[test]
+    fn test_generic_plain_array_map_stays_lazy_725() {
+        // Slice 2 (#725): `Builtin::Map`'s first-ever native arm -- plain
+        // `arr | map(f)`, no `keys_unsorted` involved at all.
+        let json = br"[1,2,3]";
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+
+        let expr = crate::jq::parse("map(. * 2)").unwrap();
+        let result = eval(&expr, value);
+        assert!(matches!(result, GenericResult::LazySeq(_)));
+        assert_eq!(
+            result.into_owned().unwrap(),
+            OwnedValue::Array(vec![
+                OwnedValue::Int(2),
+                OwnedValue::Int(4),
+                OwnedValue::Int(6),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_generic_plain_object_map_stays_lazy_725() {
+        // `obj | map(f)` is `[.[] | f]`; `.[]` over an object iterates its
+        // *values* (#422), matching `eval.rs`'s `builtin_map`.
+        let json = br#"{"a":1,"b":2,"c":3}"#;
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+
+        let expr = crate::jq::parse("map(. * 2)").unwrap();
+        let result = eval(&expr, value);
+        assert!(matches!(result, GenericResult::LazySeq(_)));
+        assert_eq!(
+            result.into_owned().unwrap(),
+            OwnedValue::Array(vec![
+                OwnedValue::Int(2),
+                OwnedValue::Int(4),
+                OwnedValue::Int(6),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_generic_plain_map_empty_containers_725() {
+        let json = br"[]";
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+        let expr = crate::jq::parse("map(.)").unwrap();
+        assert_eq!(
+            eval(&expr, value).into_owned().unwrap(),
+            OwnedValue::Array(vec![])
+        );
+
+        let json = br"{}";
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+        let expr = crate::jq::parse("map(.)").unwrap();
+        assert_eq!(
+            eval(&expr, value).into_owned().unwrap(),
+            OwnedValue::Array(vec![])
+        );
+    }
+
+    #[test]
+    fn test_generic_plain_map_non_container_errors_725() {
+        // Message must match `eval.rs`'s `builtin_map`/`map_over` exactly
+        // (both dispatch through `EvalError::cannot_iterate`).
+        let json = br"1";
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+
+        let expr = crate::jq::parse("map(.)").unwrap();
+        let result = eval(&expr, value.clone());
+        assert!(result.is_error());
+
+        let owned = crate::jq::eval_generic::to_owned(&value);
+        let expected = EvalError::cannot_iterate(&owned);
+        match result {
+            GenericResult::Error(e) => assert_eq!(e.message, expected.message),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_generic_plain_map_atomicity_725() {
+        // Real jq's array construction is all-or-nothing: `map`'s error
+        // partway through discards the whole in-progress array, mirroring
+        // `eval::map_over` (#725's `materialize_atomic`).
+        let json = br#"[1,2,"x"]"#;
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+
+        let expr = crate::jq::parse("map(. + 1)").unwrap();
+        let result = eval(&expr, value.clone());
+        // Errors only surface once pulled -- laziness means construction
+        // alone can't have failed yet.
+        assert!(matches!(result, GenericResult::LazySeq(_)));
+        assert!(result.materialize_lazy().is_error());
+
+        // Nothing streams to `out` for a failing `map` -- matches real jq's
+        // own all-or-nothing output and this file's `#355` convention that
+        // diagnostics never go to `out`.
+        let expr = crate::jq::parse("map(. + 1)").unwrap();
+        let result = eval(&expr, value);
+        let mut out = String::new();
+        let stats = result.stream_json(&mut out, 0, |_| Ok(())).unwrap();
+        assert_eq!(out, "");
+        assert!(stats.error.is_some());
+        assert_eq!(stats.count, 0);
+    }
+
+    #[test]
+    fn test_generic_lazy_seq_composability_map_map_725() {
+        // `arr | map(f) | map(g)`: two pushed instructions on one `LazySeq`
+        // -- composability without materializing between stages.
+        let json = br"[1,2,3]";
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+
+        let expr = crate::jq::parse("map(. + 1) | map(. * 10)").unwrap();
+        let result = eval(&expr, value);
+        assert!(matches!(result, GenericResult::LazySeq(_)));
+        assert_eq!(
+            result.into_owned().unwrap(),
+            OwnedValue::Array(vec![
+                OwnedValue::Int(20),
+                OwnedValue::Int(30),
+                OwnedValue::Int(40),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_generic_lazy_seq_composability_native_consumers_725() {
+        // `length`, `.[]`, `first`, `.[0]` after a `map` all get a native,
+        // single-forward-pass path in the composability arm (asserted by
+        // shape, not just correctness): none of these materialize to
+        // `Owned`/`Error` via the generic `_ => materialize_atomic()`
+        // fallback in a way that would be indistinguishable from the
+        // dedicated arms, so this mainly pins the returned *values*.
+        let json = br#"["b","a","c"]"#;
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+
+        let expr = crate::jq::parse("map(ascii_upcase) | length").unwrap();
+        assert_eq!(
+            eval(&expr, value.clone()).into_owned().unwrap(),
+            OwnedValue::Int(3)
+        );
+
+        let expr = crate::jq::parse("map(ascii_upcase) | .[]").unwrap();
+        assert_eq!(
+            eval(&expr, value.clone()).collect_owned(),
+            vec![
+                OwnedValue::String("B".to_string()),
+                OwnedValue::String("A".to_string()),
+                OwnedValue::String("C".to_string()),
+            ]
+        );
+
+        let expr = crate::jq::parse("map(ascii_upcase) | first").unwrap();
+        assert_eq!(
+            eval(&expr, value.clone()).into_owned().unwrap(),
+            OwnedValue::String("B".to_string())
+        );
+
+        let expr = crate::jq::parse("map(ascii_upcase) | .[0]").unwrap();
+        assert_eq!(
+            eval(&expr, value.clone()).into_owned().unwrap(),
+            OwnedValue::String("B".to_string())
+        );
+
+        // `.[2]`/`last` intentionally fall to `materialize_atomic` +
+        // `eval_on_owned` in this initial design (open risk (c)) --
+        // asserting correctness only, not laziness.
+        let expr = crate::jq::parse("map(ascii_upcase) | .[2]").unwrap();
+        assert_eq!(
+            eval(&expr, value.clone()).into_owned().unwrap(),
+            OwnedValue::String("C".to_string())
+        );
+
+        let expr = crate::jq::parse("map(ascii_upcase) | last").unwrap();
+        assert_eq!(
+            eval(&expr, value).into_owned().unwrap(),
+            OwnedValue::String("C".to_string())
+        );
+    }
+
+    #[test]
     fn test_generic_lazy_seq_composability_keys_unsorted_map_select_724() {
         // The actual point of this design: `keys_unsorted | map(f) | select(g)`
         // stays lazy through the `map` stage, materializes once at `select`.
@@ -4979,6 +5197,32 @@ mod tests {
                 OwnedValue::String("B".to_string()),
                 OwnedValue::String("A".to_string()),
                 OwnedValue::String("C".to_string()),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_yaml_plain_map_stays_lazy_725() {
+        // YAML counterpart of `test_generic_plain_array_map_stays_lazy_725`
+        // -- plain `arr | map(f)` on YAML, no `keys_unsorted` involved.
+        use crate::yaml::YamlIndex;
+
+        let yaml = b"- 1\n- 2\n- 3\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let doc_cursor = index
+            .root(yaml)
+            .first_child()
+            .expect("YAML document should have content");
+
+        let expr = crate::jq::parse("map(. * 2)").unwrap();
+        let result = eval_with_cursor(&expr, doc_cursor);
+        assert!(matches!(result, GenericResult::LazySeq(_)));
+        assert_eq!(
+            result.into_owned().unwrap(),
+            OwnedValue::Array(vec![
+                OwnedValue::Int(2),
+                OwnedValue::Int(4),
+                OwnedValue::Int(6),
             ])
         );
     }

@@ -33,8 +33,8 @@ pub enum QueryType {
     /// `select` arm here by design -- see `docs/plan/jq-lazy-map-select.md`'s
     /// "select: no new code path")
     KeysUnsortedSelect,
-    /// `map(.)` over a plain container - no native arm yet, hits the eager
-    /// fallback (tracked separately as #725, the dominant cost share)
+    /// `map(.)` over a plain container - lazy via `GenericResult::LazySeq`
+    /// (#725), `eval_builtin`'s first-ever native `Builtin::Map` arm
     Map,
     /// `select(true)` over a plain container - general-container comparison
     Select,
@@ -73,7 +73,8 @@ impl QueryType {
             Self::Identity => "native",
             Self::KeysUnsorted | Self::KeysUnsortedLength => "lazy (#678)",
             Self::KeysUnsortedMap => "lazy (#724)",
-            Self::KeysUnsortedSelect | Self::Map => "eager fallback",
+            Self::KeysUnsortedSelect => "eager fallback",
+            Self::Map => "lazy (#725)",
             Self::Select => "native (single-value arm)",
         }
     }
@@ -914,7 +915,7 @@ mod tests {
             QueryType::KeysUnsortedSelect.path_description(),
             "eager fallback"
         );
-        assert_eq!(QueryType::Map.path_description(), "eager fallback");
+        assert_eq!(QueryType::Map.path_description(), "lazy (#725)");
         assert_eq!(
             QueryType::Select.path_description(),
             "native (single-value arm)"
