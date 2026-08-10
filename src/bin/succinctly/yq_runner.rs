@@ -739,8 +739,18 @@ fn output_value<W: Write>(
         // *parent* during `emit_yaml_value`'s recursion (see its Array/Object
         // arms), but the root has no parent call site to do that for it —
         // append it here instead, or a comment trailing the jq result's own
-        // top-level node (e.g. `42 # trailing`) is silently dropped (#710).
-        let root_comment_suffix = comments.own().map_or_else(String::new, |c| format!(" {c}"));
+        // top-level node (e.g. `[1, 2, 3] # trailing`) is silently dropped
+        // (#710). Scalars are excluded: verified against the pinned real
+        // `yq` binary, a bare scalar document (`42 # trailing`) drops its
+        // own trailing comment from output on both identity and `select`,
+        // even though `line_comment` still returns it — real `yq`'s own
+        // quirk, not a succinctly gap, so replicated here rather than
+        // "fixed" into a new divergence.
+        let root_comment_suffix = if matches!(value, OwnedValue::Array(_) | OwnedValue::Object(_)) {
+            comments.own().map_or_else(String::new, |c| format!(" {c}"))
+        } else {
+            String::new()
+        };
         let output = format!("{body}{root_comment_suffix}");
         if config.use_color {
             write!(writer, "{}", colorize_yaml(&output))?;
@@ -1654,10 +1664,14 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                 if $is_yaml {
                     // M2 YAML path: YAML output streaming
                     if is_identity {
-                        // P9 path: stream directly without evaluation
+                        // P9 path: stream directly without evaluation.
+                        // `stream_yaml_as_document` (not `stream_yaml`) since
+                        // `$cursor` here is the whole document being
+                        // redisplayed as itself - its own trailing comment,
+                        // if any, must be kept (#710).
                         emit_yaml_doc_separator($writer, $doc_streamed, true)?;
                         $cursor
-                            .stream_yaml(&mut FmtWriter($writer), yaml_indent, sort_keys)
+                            .stream_yaml_as_document(&mut FmtWriter($writer), yaml_indent, sort_keys)
                             .map_err(|_| anyhow::anyhow!("Write error"))?;
                         writeln!($writer)?;
                         // Streaming skips evaluation, so inspect the document

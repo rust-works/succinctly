@@ -5252,3 +5252,88 @@ fn test_block_scalar_header_comment_still_preserved_710() -> Result<()> {
     assert_eq!(out.trim(), "keep this");
     Ok(())
 }
+
+// Root-node trailing comments (#710 follow-up). Every expected string here
+// was verified byte-for-byte against the pinned real `yq` binary. Real `yq`
+// has a quirk worth pinning explicitly: a comment trailing a *scalar*
+// document root is dropped from output (though still readable via
+// `line_comment`), but a comment trailing an *array/object* document root is
+// kept - this is replicated exactly, not "improved into" a new divergence.
+
+/// A comment trailing the whole document's own array/object root (not a
+/// child field) was previously dropped everywhere - `emit_yaml_value`'s
+/// scalar/root arms only ever append a *child's* comment, appended by the
+/// child's parent during recursion; nothing appended the outermost value's
+/// own comment. Matches real `yq`, which keeps this for container roots.
+#[test]
+fn test_root_array_comment_preserved_on_identity_710() -> Result<()> {
+    let (out, code) = run_yq_stdin(".", "[1, 2, 3] # trailing\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "[1, 2, 3] # trailing\n");
+    Ok(())
+}
+
+#[test]
+fn test_root_object_comment_preserved_on_identity_710() -> Result<()> {
+    let (out, code) = run_yq_stdin(".", "{a: 1} # trailing\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "{a: 1} # trailing\n");
+    Ok(())
+}
+
+/// Same fix, but through the DOM/`select` path (`output_value` in
+/// `yq_runner.rs`) rather than the M2/P9 streaming path exercised by plain
+/// identity above.
+#[test]
+fn test_root_array_comment_preserved_on_select_710() -> Result<()> {
+    let (out, code) = run_yq_stdin("select(true)", "{a: 1} # trailing\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim_end(), "a: 1 # trailing");
+    Ok(())
+}
+
+/// A comment trailing a *scalar* document root is a known real-`yq` quirk
+/// (verified empirically): it's dropped from output on both identity and
+/// `select`, unlike an array/object root. `line_comment` still returns it
+/// (the data isn't lost internally, just not re-emitted) - pinning this
+/// exact behavior rather than "fixing" it into a new divergence from real
+/// `yq`.
+#[test]
+fn test_root_scalar_comment_dropped_on_identity_matches_real_yq_710() -> Result<()> {
+    let (out, code) = run_yq_stdin(".", "42 # trailing\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "42");
+
+    let (out, code) = run_yq_stdin("select(true)", "42 # trailing\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "42");
+
+    let (out, code) = run_yq_stdin(". | line_comment", "42 # trailing\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "trailing");
+    Ok(())
+}
+
+/// Field/index navigation extracts a bare value and must NOT gain the
+/// parent-context comment, even where the M2 path shares its streaming
+/// entry point with plain identity - `stream_yaml_as_document` (identity
+/// only) vs. `stream_yaml` (bare navigated results) must stay distinct.
+/// Matches real `yq`: `.a` on `a: 1 # keep this` outputs bare `1`.
+#[test]
+fn test_field_navigation_still_drops_comment_after_root_fix_710() -> Result<()> {
+    let (out, code) = run_yq_stdin(".a", "a: 1 # keep this\nb: 2\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "1");
+    Ok(())
+}
+
+/// A comment trailing the first document's scalar root in a multi-document
+/// stream is dropped by real `yq` too (verified empirically) - not a
+/// regression to "fix" here.
+#[test]
+fn test_multi_doc_root_scalar_comment_dropped_matches_real_yq_710() -> Result<()> {
+    let (out, code) = run_yq_stdin(".", "42 # trailing\n---\nfoo: bar\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "42\n---\nfoo: bar\n");
+    Ok(())
+}

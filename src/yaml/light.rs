@@ -1218,6 +1218,46 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
         self.stream_yaml_value(out, 0, indent.width, indent.unit, sort_keys)
     }
 
+    /// Like [`Self::stream_yaml`], but also appends this cursor's own
+    /// trailing comment (#710) - for callers displaying this cursor's value
+    /// as an entire document (identity), as opposed to a bare navigated
+    /// result. `stream_yaml_value`'s Mapping/Sequence arms already append
+    /// each *child's* own comment as they recurse, but nothing does that for
+    /// the outermost value, since every recursive call goes straight to the
+    /// private `stream_yaml_value` rather than back through a public entry
+    /// point.
+    ///
+    /// This must stay separate from `stream_yaml` rather than folded into
+    /// it: real `yq` keeps a comment when redisplaying the whole document
+    /// unmodified, but drops it when the very same node is extracted alone
+    /// via field/index navigation (`.a` on `a: 1 # keep this` outputs a bare
+    /// `1`, no comment - verified against the pinned real `yq` binary).
+    /// `stream_yaml` is also what `GenericResult::stream_yaml`'s
+    /// `OneCursor`/`ManyCursor` arms use for exactly those navigated
+    /// results, so it must keep the bare (no-comment) behavior.
+    ///
+    /// Scalar/null/alias document roots are excluded even here: verified
+    /// against the pinned real `yq` binary, a bare scalar document
+    /// (`42 # trailing`) drops its own trailing comment from output, even
+    /// though `line_comment` still returns it - real `yq`'s own quirk, not a
+    /// succinctly gap, so replicated rather than "fixed" into a new
+    /// divergence. Only `Mapping`/`Sequence` roots (e.g. `[1, 2, 3] # c`)
+    /// keep it.
+    pub fn stream_yaml_as_document<Out: core::fmt::Write>(
+        &self,
+        out: &mut Out,
+        indent: IndentSpec,
+        sort_keys: bool,
+    ) -> core::fmt::Result {
+        self.write_leading_anchor(out)?;
+        let value = self.value();
+        self.stream_yaml_value(out, 0, indent.width, indent.unit, sort_keys)?;
+        if matches!(value, YamlValue::Mapping(_) | YamlValue::Sequence(_)) {
+            write_line_comment(out, self.line_comment_raw())?;
+        }
+        Ok(())
+    }
+
     /// Stream YAML, unwrapping single documents (matches yq behavior).
     ///
     /// If the root is a single-document array `[doc]`, outputs just `doc` as YAML.
@@ -1232,15 +1272,13 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
             if let YamlValue::Sequence(elements) = self.value() {
                 if let Some((cursor, rest)) = elements.uncons_cursor() {
                     if rest.is_empty() {
-                        // Single document - output it directly without array wrapper
-                        cursor.write_leading_anchor(out)?;
-                        return cursor.stream_yaml_value(
-                            out,
-                            0,
-                            indent.width,
-                            indent.unit,
-                            sort_keys,
-                        );
+                        // Single document - output it directly without array
+                        // wrapper. `stream_yaml_as_document` (not
+                        // `stream_yaml`/`stream_yaml_value`) so the
+                        // document's own trailing comment, if any, is
+                        // included too (#710); it writes the leading anchor
+                        // itself, matching `stream_yaml`.
+                        return cursor.stream_yaml_as_document(out, indent, sort_keys);
                     }
                 }
             }
