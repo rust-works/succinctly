@@ -1767,12 +1767,9 @@ impl<'a> Parser<'a> {
     fn parse_format_string(&mut self) -> Result<Expr, ParseError> {
         self.expect('@')?;
 
-        // Parse the format name
+        // Parse the format name (an alphanumeric identifier, e.g. `base64`)
         let format_start = self.pos;
-        while self
-            .peek()
-            .is_some_and(|c| c.is_ascii_alphabetic() || c == '6' || c == '4')
-        {
+        while self.peek().is_some_and(|c| c.is_ascii_alphanumeric()) {
             self.next();
         }
 
