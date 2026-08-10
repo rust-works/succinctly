@@ -1268,8 +1268,16 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
     /// `.item` -> `&x\na: 1`). Nested scalar anchors (a mapping field's or
     /// sequence element's *value*) are unaffected — those go through the
     /// `stream_yaml_value` loops above, not this function.
+    ///
+    /// Uses `is_container()` rather than `is_yaml_cursor_container()`: the
+    /// latter also requires a non-empty `first_child()`, which is right for
+    /// choosing block-vs-inline layout but wrong here — an *empty* container
+    /// still keeps its own anchor (`item: &x {}` selected via `.item` ->
+    /// `&x {}`, verified against yq v4.53.3), it just always renders inline
+    /// (`{}`/`[]` are the only way to write an empty mapping/sequence, so the
+    /// `style() != "flow"` check below still picks the right separator).
     fn write_leading_anchor<Out: core::fmt::Write>(&self, out: &mut Out) -> core::fmt::Result {
-        if is_yaml_cursor_container(self) {
+        if self.is_container() {
             if let Some(anchor) = self.anchor() {
                 out.write_char('&')?;
                 out.write_str(anchor)?;

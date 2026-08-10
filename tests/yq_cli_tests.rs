@@ -1882,6 +1882,40 @@ fn test_yaml_bare_scalar_anchor_dropped_on_query_result_712() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn test_yaml_empty_mapping_anchor_preserved_on_query_result_712() -> Result<()> {
+    // An *empty* container still keeps its own anchor at the top level, same
+    // as a non-empty one (see test_yaml_mapping_anchor_preserved_on_query_result_712
+    // above) - only a bare scalar's anchor is dropped in this position.
+    // Verified: `printf 'item: &x {}\n' | yq '.item'` -> `&x {}`.
+    let input = "item: &x {}\n";
+    let (output, exit_code) = run_yq_stdin(".item", input, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "&x {}\n");
+    Ok(())
+}
+
+#[test]
+fn test_yaml_empty_sequence_anchor_preserved_on_query_result_712() -> Result<()> {
+    // Verified: `printf 'item: &x []\n' | yq '.item'` -> `&x []`.
+    let input = "item: &x []\n";
+    let (output, exit_code) = run_yq_stdin(".item", input, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "&x []\n");
+    Ok(())
+}
+
+#[test]
+fn test_yaml_empty_mapping_anchor_preserved_on_whole_document_root_712() -> Result<()> {
+    // Same as above, but the anchor is on the document root itself (`.`
+    // identity). Verified: `printf '&root {}\n' | yq '.'` -> `&root {}`.
+    let input = "&root {}\n";
+    let (output, exit_code) = run_yq_stdin(".", input, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, input);
+    Ok(())
+}
+
 // =============================================================================
 // Anchored sequence items (#328) - an anchor on `- ` binds to the item's value
 // whatever its kind. Expectations are mikefarah/yq v4.53.3 output.
