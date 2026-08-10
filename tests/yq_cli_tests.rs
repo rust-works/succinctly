@@ -1489,6 +1489,145 @@ fn test_yaml_anchor_alias_without_merge() -> Result<()> {
 }
 
 // =============================================================================
+// Assignment through an anchor propagates to aliases (#711) - real yq treats
+// an anchor/alias pair as one shared node in the representation graph, so a
+// write through the anchor must be visible through every alias. succinctly
+// deliberately does not reproduce the `&x`/`*x` syntax on output (a separate,
+// already-tracked gap, #709) -- only value propagation is in scope here, so
+// these assert on values (via `-o=json`) rather than YAML anchor syntax.
+// =============================================================================
+
+#[test]
+fn test_yaml_assign_through_anchor_updates_alias() -> Result<()> {
+    // The issue's own repro: `.a = 99` must be visible through `.b`'s alias.
+    let input = "a: &x 1\nb: *x\n";
+    let (output, exit_code) = run_yq_stdin(".a = 99", input, &["-o=json", "-I=0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), r#"{"a":99,"b":99}"#);
+    Ok(())
+}
+
+#[test]
+fn test_yaml_assign_through_alias_does_not_clobber_anchor() -> Result<()> {
+    // Writing directly to the alias detaches it -- the anchor's own value
+    // must be left alone, matching real yq.
+    let input = "a: &x 1\nb: *x\n";
+    let (output, exit_code) = run_yq_stdin(".b = 5", input, &["-o=json", "-I=0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), r#"{"a":1,"b":5}"#);
+    Ok(())
+}
+
+#[test]
+fn test_yaml_assign_unrelated_key_does_not_sync_alias() -> Result<()> {
+    // Writing an unrelated key must not perturb an anchor/alias pair it
+    // never touched.
+    let input = "a: &x 1\nb: *x\n";
+    let (output, exit_code) = run_yq_stdin(".c = 5", input, &["-o=json", "-I=0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), r#"{"a":1,"b":1,"c":5}"#);
+    Ok(())
+}
+
+#[test]
+fn test_yaml_assign_nested_field_through_anchor_updates_alias() -> Result<()> {
+    // A write nested inside the anchored subtree must propagate the whole
+    // updated subtree to every alias, not just a top-level scalar.
+    let input = "a: &x\n  p: 1\nb: *x\n";
+    let (output, exit_code) = run_yq_stdin(".a.p = 9", input, &["-o=json", "-I=0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), r#"{"a":{"p":9},"b":{"p":9}}"#);
+    Ok(())
+}
+
+#[test]
+fn test_yaml_assign_through_anchor_updates_multiple_aliases() -> Result<()> {
+    let input = "a: &x 1\nb: *x\nc: *x\n";
+    let (output, exit_code) = run_yq_stdin(".a = 99", input, &["-o=json", "-I=0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), r#"{"a":99,"b":99,"c":99}"#);
+    Ok(())
+}
+
+#[test]
+fn test_yaml_update_assign_through_anchor_updates_alias() -> Result<()> {
+    // `|=` goes through the same fallback path as `=` and must sync too.
+    let input = "a: &x 1\nb: *x\n";
+    let (output, exit_code) = run_yq_stdin(".a |= . + 100", input, &["-o=json", "-I=0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), r#"{"a":101,"b":101}"#);
+    Ok(())
+}
+
+#[test]
+fn test_yaml_compound_assign_through_anchor_updates_alias() -> Result<()> {
+    let input = "a: &x 1\nb: *x\n";
+    let (output, exit_code) = run_yq_stdin(".a += 100", input, &["-o=json", "-I=0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), r#"{"a":101,"b":101}"#);
+    Ok(())
+}
+
+#[test]
+fn test_yaml_del_nested_field_through_anchor_updates_alias() -> Result<()> {
+    // Deleting a field inside the anchored subtree shrinks every alias's
+    // copy too -- the shared node lost a field, not just the `.a` view.
+    let input = "a: &x\n  p: 1\n  q: 2\nb: *x\n";
+    let (output, exit_code) = run_yq_stdin("del(.a.q)", input, &["-o=json", "-I=0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), r#"{"a":{"p":1},"b":{"p":1}}"#);
+    Ok(())
+}
+
+#[test]
+fn test_yaml_del_anchor_key_leaves_alias_at_last_value() -> Result<()> {
+    // Deleting the anchor's own key removes it from the document; there's
+    // nothing left to propagate, so the alias keeps its last-resolved value
+    // -- matching how a detached graph node behaves in real yq.
+    let input = "a: &x 1\nb: *x\n";
+    let (output, exit_code) = run_yq_stdin("del(.a)", input, &["-o=json", "-I=0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), r#"{"b":1}"#);
+    Ok(())
+}
+
+#[test]
+fn test_yaml_plain_alias_read_unaffected_by_assign_gating() -> Result<()> {
+    // Regression check: a plain read of an alias (no assignment involved)
+    // must remain unaffected by the new alias-sync gating check.
+    let input = "a: &x 1\nb: *x\n";
+    let (output, exit_code) = run_yq_stdin(".b", input, &["-o=json"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), "1");
+    Ok(())
+}
+
+#[test]
+fn test_yaml_pipe_chained_assigns_through_anchor_updates_alias() -> Result<()> {
+    // A chain of assignments joined by `|` -- the common `yq -i '.a = 1 |
+    // .b = 2' file` idiom -- must sync aliases too, not just a single
+    // top-level assignment. Each `|` stage here rewrites `.a` in place, so
+    // the whole chain still qualifies as alias-sensitive.
+    let input = "a: &x 1\nb: *x\n";
+    let (output, exit_code) = run_yq_stdin(".a = 5 | .a = 10", input, &["-o=json", "-I=0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), r#"{"a":10,"b":10}"#);
+    Ok(())
+}
+
+#[test]
+fn test_yaml_pipe_chained_assigns_to_different_paths_through_anchor_updates_alias() -> Result<()> {
+    // The stages don't need to touch the same path -- as long as every
+    // stage is itself alias-sensitive, later stages can read the
+    // already-synced value.
+    let input = "a: &x 1\nb: *x\n";
+    let (output, exit_code) = run_yq_stdin(".a = 99 | .c = .a + 1", input, &["-o=json", "-I=0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), r#"{"a":99,"b":99,"c":100}"#);
+    Ok(())
+}
+
+// =============================================================================
 // Anchored sequence items (#328) - an anchor on `- ` binds to the item's value
 // whatever its kind. Expectations are mikefarah/yq v4.53.3 output.
 // =============================================================================

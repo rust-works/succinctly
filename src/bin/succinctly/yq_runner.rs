@@ -12,7 +12,9 @@ use std::path::Path;
 
 use succinctly::jq::document::{DocumentCursor, DocumentFields};
 use succinctly::jq::eval_generic::{eval_with_cursor_using, to_owned, GenericResult};
-use succinctly::jq::{self, Builtin, Expr, OwnedValue, QueryResult, YqSemantics};
+use succinctly::jq::{
+    self, sync_aliased_paths, Builtin, Expr, OwnedValue, QueryResult, YqSemantics,
+};
 use succinctly::json::light::StandardJson;
 use succinctly::json::JsonIndex;
 use succinctly::yaml::{
@@ -415,6 +417,96 @@ fn evaluate_input(
     }
 }
 
+/// Whether `expr`'s top-level shape is "rewrite the document at specific
+/// paths, leaving everything else identical" -- the class of expression for
+/// which comparing a path's value before and after the write is meaningful.
+/// Unwraps `Paren`/`Optional` so `(.a = 1)?` still matches, and recurses into
+/// `Pipe` so a chain of assignments like `.a = 1 | .b = 2` (the common
+/// `yq -i '... | ...'` idiom) matches when every stage does.
+///
+/// Used to gate the alias-sync post-process (#711): outside this class (a
+/// bare `map`, `select`, `.a, .b`, ...) the result document doesn't
+/// necessarily share the input's shape at all, so diffing "the same path" in
+/// both would be meaningless at best and could clobber it at worst. A pipe
+/// with even one non-assign stage (`.a = 1 | select(...)`) is conservatively
+/// excluded for the same reason, even though some such stages would in fact
+/// preserve paths -- that's left for a future extension, not assumed here.
+fn is_alias_sensitive_assign(expr: &Expr) -> bool {
+    match expr {
+        Expr::Assign { .. }
+        | Expr::Update { .. }
+        | Expr::CompoundAssign { .. }
+        | Expr::AlternativeAssign { .. }
+        | Expr::Builtin(Builtin::Del(_)) => true,
+        Expr::Paren(inner) | Expr::Optional(inner) => is_alias_sensitive_assign(inner),
+        Expr::Pipe(stages) => stages.iter().all(is_alias_sensitive_assign),
+        _ => false,
+    }
+}
+
+/// Walk `cursor`'s document collecting, for every anchor with at least one
+/// alias, its definition path and the path of every alias that resolves to
+/// it (#711). Paths are plain `String`/`i64` key sequences -- the same shape
+/// `sync_aliased_paths` (and jq's own `getpath`/`setpath`) use -- so they
+/// line up with coordinates in the `OwnedValue` tree `to_owned` builds from
+/// this same document.
+///
+/// Mirrors `yaml_to_owned_value`'s recursion, including its treatment of
+/// merge keys (`<<: *base`): `Mapping`'s `fields` iterator already resolves
+/// them transparently, so this walk does too, unchanged. Fixing merge-key/
+/// anchor interaction is issue #712's territory, not this one.
+fn collect_alias_groups<W: AsRef<[u64]> + Clone>(
+    cursor: YamlCursor<'_, W>,
+) -> Vec<(Vec<OwnedValue>, Vec<Vec<OwnedValue>>)> {
+    let mut defs: IndexMap<String, Vec<OwnedValue>> = IndexMap::new();
+    let mut aliases: IndexMap<String, Vec<Vec<OwnedValue>>> = IndexMap::new();
+    let mut path = Vec::new();
+    walk_alias_groups(cursor, &mut path, &mut defs, &mut aliases);
+    defs.into_iter()
+        .filter_map(|(name, def_path)| Some((def_path, aliases.swap_remove(&name)?)))
+        .collect()
+}
+
+fn walk_alias_groups<W: AsRef<[u64]> + Clone>(
+    cursor: YamlCursor<'_, W>,
+    path: &mut Vec<OwnedValue>,
+    defs: &mut IndexMap<String, Vec<OwnedValue>>,
+    aliases: &mut IndexMap<String, Vec<Vec<OwnedValue>>>,
+) {
+    // `anchor()` returns `None` for alias nodes, so an alias is never
+    // mistaken for its own definition here.
+    if let Some(name) = cursor.anchor() {
+        defs.insert(name.to_string(), path.clone());
+    }
+    match cursor.value() {
+        YamlValue::Mapping(fields) => {
+            for field in fields {
+                path.push(OwnedValue::String(field.key().key_string().into_owned()));
+                walk_alias_groups(field.value_cursor(), path, defs, aliases);
+                path.pop();
+            }
+        }
+        YamlValue::Sequence(elements) => {
+            let mut idx = 0i64;
+            let mut rest = elements;
+            while let Some((elem_cursor, next_rest)) = rest.uncons_cursor() {
+                path.push(OwnedValue::Int(idx));
+                walk_alias_groups(elem_cursor, path, defs, aliases);
+                path.pop();
+                idx += 1;
+                rest = next_rest;
+            }
+        }
+        YamlValue::Alias { anchor_name, .. } => {
+            aliases
+                .entry(anchor_name.to_string())
+                .or_default()
+                .push(path.clone());
+        }
+        _ => {}
+    }
+}
+
 /// Evaluate a jq expression directly on a YAML cursor.
 ///
 /// This uses the generic evaluator to preserve position metadata (line/column).
@@ -423,10 +515,18 @@ fn evaluate_yaml_cursor<W: AsRef<[u64]> + Clone>(
     expr: &Expr,
     sink: &mut ErrorSink,
 ) -> Result<Vec<OwnedValue>> {
+    // Snapshot alias-sync context from the pristine document *before*
+    // evaluation, only when it could possibly matter (#711): an
+    // assignment-family expression against a document that actually has
+    // aliases. Everything else (JSON, plain reads, alias-free YAML) pays
+    // nothing beyond this one bool check.
+    let alias_sync_ctx = (is_alias_sensitive_assign(expr) && cursor.index().has_aliases())
+        .then(|| (to_owned(&cursor.value()), collect_alias_groups(cursor)));
+
     let result = eval_with_cursor_using::<YqSemantics, _>(expr, cursor);
 
     // Convert GenericResult to Vec<OwnedValue>
-    match result {
+    let mut docs = match result {
         GenericResult::One(v) => Ok(vec![to_owned(&v)]),
         GenericResult::OneCursor(c) => Ok(vec![to_owned(&c.value())]),
         GenericResult::Many(vs) => Ok(vs.iter().map(to_owned).collect()),
@@ -483,7 +583,17 @@ fn evaluate_yaml_cursor<W: AsRef<[u64]> + Clone>(
             sink.report_break(DiagStyle::Yq, &label, &no_location());
             Ok(vs)
         }
+    };
+
+    if let Some((pristine, groups)) = &alias_sync_ctx {
+        if let Ok(docs) = &mut docs {
+            for doc in docs.iter_mut() {
+                sync_aliased_paths(doc, pristine, groups);
+            }
+        }
     }
+
+    docs
 }
 
 /// Convert a StandardJson value to an OwnedValue.
