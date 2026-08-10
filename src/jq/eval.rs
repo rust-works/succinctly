@@ -1608,16 +1608,23 @@ fn merge_existing(existing: OwnedValue, incoming: OwnedValue, flags: MergeFlags)
 /// Decide the merged value for one position (an object field or array
 /// index) of a `*`/`*=` merge, honoring `?`/`n` gating. `existing` is
 /// `None` when the position isn't present in `left` yet. Returns `None` to
-/// mean "leave `left` unchanged here" (blocked by `?`/`n`), `Some(v)` to
-/// mean "set it to `v`".
+/// mean "leave `left` unchanged here" (blocked by `?`), `Some(v)` to mean
+/// "set it to `v`".
+///
+/// `only_existing_applies` scopes `?` to object fields: real yq's `?` never
+/// blocks creating a brand-new *array* index, only a brand-new *object*
+/// key — so callers merging array positions ([`merge_arrays_by_index`])
+/// pass `false`, while object-field callers ([`merge_object_fields`]) pass
+/// `true`.
 fn merge_position(
     existing: Option<OwnedValue>,
     incoming: OwnedValue,
     flags: MergeFlags,
+    only_existing_applies: bool,
 ) -> Option<OwnedValue> {
     match existing {
         None => {
-            if flags.only_existing {
+            if flags.only_existing && only_existing_applies {
                 None
             } else {
                 Some(incoming)
@@ -1636,7 +1643,7 @@ fn merge_object_fields(
 ) -> IndexMap<String, OwnedValue> {
     for (k, v) in right {
         let existing = left.get(&k).cloned();
-        if let Some(new_value) = merge_position(existing, v, flags) {
+        if let Some(new_value) = merge_position(existing, v, flags, true) {
             left.insert(k, new_value);
         }
     }
@@ -1645,7 +1652,8 @@ fn merge_object_fields(
 
 /// Deep-merge two arrays by index (the `d` flag): treats the array like an
 /// object keyed by index, one position at a time via [`merge_position`].
-/// Indices only present in `right` extend `left`.
+/// Indices only present in `right` extend `left` (real yq's `?` never
+/// blocks this — see [`merge_position`]'s doc comment).
 fn merge_arrays_by_index(
     mut left: Vec<OwnedValue>,
     right: Vec<OwnedValue>,
@@ -1653,7 +1661,7 @@ fn merge_arrays_by_index(
 ) -> Vec<OwnedValue> {
     for (i, v) in right.into_iter().enumerate() {
         let existing = left.get(i).cloned();
-        if let Some(new_value) = merge_position(existing, v, flags) {
+        if let Some(new_value) = merge_position(existing, v, flags, false) {
             if i < left.len() {
                 left[i] = new_value;
             } else {
