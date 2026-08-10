@@ -3674,17 +3674,20 @@ mod tests {
     }
 
     #[test]
-    fn test_generic_keys_unsorted_fallback_map_select() {
-        // `map`/`select` have no native lazy path -- `eval_generic.rs` has
-        // no native `Builtin::Map` arm at all (see the `Pipe` dispatch's
-        // `LazyKeys` arm doc comment) -- so these must still materialize
-        // correctly via the fallback.
+    fn test_generic_keys_unsorted_lazy_map_select() {
+        // #724: `keys_unsorted | map(f)` now stays lazy (`GenericResult::
+        // LazySeq`) instead of falling back to the eager `to_owned` +
+        // reserialize + reindex + re-evaluate round trip.
         let json = br#"{"b": 1, "a": 2, "c": 3}"#;
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let value = cursor.value();
 
         let expr = crate::jq::parse("keys_unsorted | map(ascii_upcase)").unwrap();
+        assert!(
+            matches!(eval(&expr, value.clone()), GenericResult::LazySeq(_)),
+            "keys_unsorted | map(f) should stay lazy, not fall back"
+        );
         assert_eq!(
             eval(&expr, value.clone()).into_owned().unwrap(),
             OwnedValue::Array(vec![
@@ -3694,6 +3697,11 @@ mod tests {
             ])
         );
 
+        // No `map` here, so this doesn't exercise `LazySeq` -- `select`
+        // itself still has no new lazy code path (see the design doc's
+        // "select: no new code path" section) and reaches `Builtin::
+        // Select`'s native arm only via `LazyKeys`'s own pre-existing
+        // materializing fallback.
         let expr = crate::jq::parse("keys_unsorted | select(length == 3)").unwrap();
         assert_eq!(
             eval(&expr, value).into_owned().unwrap(),
@@ -3701,6 +3709,141 @@ mod tests {
                 OwnedValue::String("b".to_string()),
                 OwnedValue::String("a".to_string()),
                 OwnedValue::String("c".to_string()),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_generic_keys_unsorted_lazy_map_chain() {
+        // #724: `keys_unsorted | map(f) | map(g)` composes onto the *same*
+        // `LazySeq` (`instructions.len() == 2`), not a materializing fallback
+        // after the first `map`.
+        let json = br#"{"b": 1, "a": 2, "c": 3}"#;
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+
+        let expr = crate::jq::parse("keys_unsorted | map(ascii_upcase) | map(. + \"!\")").unwrap();
+        assert_eq!(
+            eval(&expr, value.clone()).into_owned().unwrap(),
+            OwnedValue::Array(vec![
+                OwnedValue::String("B!".to_string()),
+                OwnedValue::String("A!".to_string()),
+                OwnedValue::String("C!".to_string()),
+            ])
+        );
+
+        // The chain #724 exists for: `map(f) | select(g)` stays lazy through
+        // the `map` stage, only materializing (once, in one forward pass)
+        // when `select` is reached.
+        let expr =
+            crate::jq::parse("keys_unsorted | map(ascii_upcase) | select(length == 3)").unwrap();
+        assert!(matches!(
+            eval(
+                &crate::jq::parse("keys_unsorted | map(ascii_upcase)").unwrap(),
+                value.clone()
+            ),
+            GenericResult::LazySeq(_)
+        ));
+        assert_eq!(
+            eval(&expr, value).into_owned().unwrap(),
+            OwnedValue::Array(vec![
+                OwnedValue::String("B".to_string()),
+                OwnedValue::String("A".to_string()),
+                OwnedValue::String("C".to_string()),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_generic_keys_unsorted_lazy_map_atomicity() {
+        // #724 / design doc risk #2: a mid-map error discards the whole
+        // array, matching `eval::map_over`'s atomicity -- not a `Partial`
+        // with the successfully-mapped prefix. `"c"` is *last* in document
+        // order (`b, a, c`), so this only fails correctly if every element
+        // is actually visited -- an implementation that stopped early after
+        // the first success/error would miss it. `| length` forces
+        // materialization through the `LazySeq` composability arm's own
+        // `Length` fast path, which must still propagate the error as a
+        // bare `GenericResult::Error`, not silently answer with a count.
+        let json = br#"{"b": 1, "a": 2, "c": 3}"#;
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+
+        let expr = crate::jq::parse(
+            r#"keys_unsorted | map(if . == "c" then error("boom") else . end) | length"#,
+        )
+        .unwrap();
+        assert!(eval(&expr, value).is_error());
+    }
+
+    #[test]
+    fn test_generic_keys_unsorted_lazy_map_first_index_error_visibility() {
+        // #724 correctness fix (see the plan's "Decisions and corrections"
+        // #3): bare `first`/`.[0]` after a `map(f)` must still surface an
+        // error from a *later* element -- `map(f)` is an eager, atomic array
+        // construction in real jq (`[.[] | f]`), so a fast path that
+        // literally stopped after the first successful pull would wrongly
+        // return `"a"` here instead of propagating the `"b"`-triggered error.
+        let json = br#"{"a": 1, "b": 2}"#;
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+
+        let expr = crate::jq::parse(
+            r#"keys_unsorted | map(if . == "b" then error("x") else . end) | .[0]"#,
+        )
+        .unwrap();
+        assert!(eval(&expr, value.clone()).is_error());
+
+        let expr = crate::jq::parse(
+            r#"keys_unsorted | map(if . == "b" then error("x") else . end) | first"#,
+        )
+        .unwrap();
+        assert!(eval(&expr, value).is_error());
+    }
+
+    #[test]
+    fn test_generic_keys_unsorted_lazy_map_index_boundary() {
+        // Design doc risk #3: `.[0]` gets a lazy fast path; nonzero `.[n]`
+        // still falls back to materializing (documented scope, not a bug) --
+        // both must stay correct.
+        let json = br#"{"b": 1, "a": 2, "c": 3}"#;
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+
+        let expr = crate::jq::parse("keys_unsorted | map(ascii_upcase) | .[0]").unwrap();
+        assert_eq!(
+            eval(&expr, value.clone()).into_owned().unwrap(),
+            OwnedValue::String("B".to_string())
+        );
+
+        let expr = crate::jq::parse("keys_unsorted | map(ascii_upcase) | .[2]").unwrap();
+        assert_eq!(
+            eval(&expr, value).into_owned().unwrap(),
+            OwnedValue::String("C".to_string())
+        );
+    }
+
+    #[test]
+    fn test_generic_keys_unsorted_lazy_map_yq_semantics() {
+        // #724: `EvalTag::Yq` is genuinely exercised, not just defined.
+        let json = br#"{"b": 1, "a": 2, "c": 3}"#;
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+
+        let expr = crate::jq::parse("keys_unsorted | map(ascii_upcase)").unwrap();
+        assert_eq!(
+            eval_using::<YqSemantics, _>(&expr, value)
+                .into_owned()
+                .unwrap(),
+            OwnedValue::Array(vec![
+                OwnedValue::String("B".to_string()),
+                OwnedValue::String("A".to_string()),
+                OwnedValue::String("C".to_string()),
             ])
         );
     }
@@ -3838,6 +3981,11 @@ mod tests {
 
     #[test]
     fn test_generic_keys_sorted_fallback_map_select() {
+        // Unlike `keys_unsorted`, sorted `keys | map/select` is an explicit
+        // non-goal of #724 (sorting requires seeing every key before
+        // emitting the first one -- a different complexity class, not a
+        // narrower version of `keys_unsorted`'s problem) -- so this stays on
+        // the eager materializing fallback indefinitely, unchanged by #724.
         let json = br#"{"b": 1, "a": 2, "c": 3}"#;
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
@@ -4032,15 +4180,20 @@ mod tests {
     }
 
     #[test]
-    fn test_generic_array_keys_unsorted_fallback_map_select() {
-        // `map`/`select` have no native lazy path here either -- must still
-        // materialize correctly via the fallback.
+    fn test_generic_array_keys_unsorted_lazy_map_select() {
+        // #724: the `LazyIndexRange` counterpart of
+        // `test_generic_keys_unsorted_lazy_map_select` -- array
+        // `keys_unsorted | map(f)` also stays lazy now.
         let json = br#"["x","y","z"]"#;
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let value = cursor.value();
 
         let expr = crate::jq::parse("keys_unsorted | map(. * 10)").unwrap();
+        assert!(
+            matches!(eval(&expr, value.clone()), GenericResult::LazySeq(_)),
+            "array keys_unsorted | map(f) should stay lazy, not fall back"
+        );
         assert_eq!(
             eval(&expr, value.clone()).into_owned().unwrap(),
             OwnedValue::Array(vec![
@@ -4050,6 +4203,7 @@ mod tests {
             ])
         );
 
+        // No `map` here -- unaffected by #724, same as the object case above.
         let expr = crate::jq::parse("keys_unsorted | select(length == 3)").unwrap();
         assert_eq!(
             eval(&expr, value).into_owned().unwrap(),
@@ -4677,6 +4831,52 @@ mod tests {
         assert_eq!(
             eval_with_cursor(&expr, doc_cursor).into_owned().unwrap(),
             OwnedValue::String("c".to_string())
+        );
+    }
+
+    #[test]
+    fn test_yaml_keys_unsorted_lazy_map_select() {
+        // #724: `LazySeq` is generic over `V: DocumentValue`, so this must
+        // hold under `YamlFields`'s `Clone`-not-`Copy` cons-list walk, not
+        // just JSON's `Copy` one (the design doc's whole "format-access
+        // asymmetry" section exists because of this distinction — a
+        // JSON-only suite could pass while silently relying on `Copy`-cheap
+        // re-cloning that's wrong/expensive for YAML).
+        use crate::yaml::YamlIndex;
+
+        let yaml = b"b: 1\na: 2\nc: 3\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let doc_cursor = index
+            .root(yaml)
+            .first_child()
+            .expect("YAML document should have content");
+
+        let expr = crate::jq::parse("keys_unsorted | map(ascii_upcase)").unwrap();
+        assert!(
+            matches!(
+                eval_with_cursor(&expr, doc_cursor),
+                GenericResult::LazySeq(_)
+            ),
+            "YAML keys_unsorted | map(f) should stay lazy, not fall back"
+        );
+        assert_eq!(
+            eval_with_cursor(&expr, doc_cursor).into_owned().unwrap(),
+            OwnedValue::Array(vec![
+                OwnedValue::String("B".to_string()),
+                OwnedValue::String("A".to_string()),
+                OwnedValue::String("C".to_string()),
+            ])
+        );
+
+        // `instructions.len() == 2` under YAML's `Clone`-not-`Copy` fields.
+        let expr = crate::jq::parse("keys_unsorted | map(ascii_upcase) | map(. + \"!\")").unwrap();
+        assert_eq!(
+            eval_with_cursor(&expr, doc_cursor).into_owned().unwrap(),
+            OwnedValue::Array(vec![
+                OwnedValue::String("B!".to_string()),
+                OwnedValue::String("A!".to_string()),
+                OwnedValue::String("C!".to_string()),
+            ])
         );
     }
 
