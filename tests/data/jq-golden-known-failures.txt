@@ -138,9 +138,18 @@ regex_test_z_unknown_flag      regex-flags   unknown flag characters are silentl
 # (see estimate_local_offset in src/jq/eval.rs) and real jq's localtime output
 # depends on the capturing host's timezone, so a golden captured on one
 # machine would spuriously fail the jq-drift CI check on another.
+#
+# strftime_unsupported_specifiers originally also covered `%s`, but real jq's
+# `%s` round-trips through libc mktime() on the (UTC-valued) broken-down time,
+# which mktime treats as *local* time — so its output shifts by the capturing
+# host's UTC offset, the exact `localtime` problem above in a second builtin.
+# Caught when this golden, captured under AEST (UTC+10), failed the jq-drift
+# check on a UTC CI runner. Dropped `%s` from the filter; %U/%V/%W/%G/%g are
+# ordinary calendar week/year specifiers with no TZ dependency and still pin
+# succinctly's non-implementation of all six.
 strftime_raw_number_input          datetime   strftime requires an array; real jq accepts a raw timestamp number too — #759
 date_roundtrip_leap_year_torture   datetime   same root cause as strftime_raw_number_input — #759
-strftime_unsupported_specifiers    datetime   %s/%U/%V/%W/%G/%g are not implemented — #760
+strftime_unsupported_specifiers    datetime   %U/%V/%W/%G/%g are not implemented — #760
 gmtime_type_error_on_string        datetime   error wording diverges from jq's "gmtime() requires numeric inputs" — #761
 mktime_type_error_on_number        datetime   error wording diverges from jq's "mktime requires array inputs" — #761
 strptime_no_match_error            datetime   error wording diverges from jq's `date "..." does not match format "..."` — #761

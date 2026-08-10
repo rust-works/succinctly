@@ -1,1 +1,1 @@
-gmtime|strftime("%s %U %V %W %G %g")
+gmtime|strftime("%U %V %W %G %g")
