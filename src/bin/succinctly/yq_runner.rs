@@ -420,12 +420,17 @@ fn evaluate_input(
 /// Whether `expr`'s top-level shape is "rewrite the document at specific
 /// paths, leaving everything else identical" -- the class of expression for
 /// which comparing a path's value before and after the write is meaningful.
-/// Unwraps `Paren`/`Optional` so `(.a = 1)?` still matches.
+/// Unwraps `Paren`/`Optional` so `(.a = 1)?` still matches, and recurses into
+/// `Pipe` so a chain of assignments like `.a = 1 | .b = 2` (the common
+/// `yq -i '... | ...'` idiom) matches when every stage does.
 ///
 /// Used to gate the alias-sync post-process (#711): outside this class (a
 /// bare `map`, `select`, `.a, .b`, ...) the result document doesn't
 /// necessarily share the input's shape at all, so diffing "the same path" in
-/// both would be meaningless at best and could clobber it at worst.
+/// both would be meaningless at best and could clobber it at worst. A pipe
+/// with even one non-assign stage (`.a = 1 | select(...)`) is conservatively
+/// excluded for the same reason, even though some such stages would in fact
+/// preserve paths -- that's left for a future extension, not assumed here.
 fn is_alias_sensitive_assign(expr: &Expr) -> bool {
     match expr {
         Expr::Assign { .. }
@@ -434,6 +439,7 @@ fn is_alias_sensitive_assign(expr: &Expr) -> bool {
         | Expr::AlternativeAssign { .. }
         | Expr::Builtin(Builtin::Del(_)) => true,
         Expr::Paren(inner) | Expr::Optional(inner) => is_alias_sensitive_assign(inner),
+        Expr::Pipe(stages) => stages.iter().all(is_alias_sensitive_assign),
         _ => false,
     }
 }

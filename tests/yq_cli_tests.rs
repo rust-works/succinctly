@@ -1602,6 +1602,31 @@ fn test_yaml_plain_alias_read_unaffected_by_assign_gating() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn test_yaml_pipe_chained_assigns_through_anchor_updates_alias() -> Result<()> {
+    // A chain of assignments joined by `|` -- the common `yq -i '.a = 1 |
+    // .b = 2' file` idiom -- must sync aliases too, not just a single
+    // top-level assignment. Each `|` stage here rewrites `.a` in place, so
+    // the whole chain still qualifies as alias-sensitive.
+    let input = "a: &x 1\nb: *x\n";
+    let (output, exit_code) = run_yq_stdin(".a = 5 | .a = 10", input, &["-o=json", "-I=0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), r#"{"a":10,"b":10}"#);
+    Ok(())
+}
+
+#[test]
+fn test_yaml_pipe_chained_assigns_to_different_paths_through_anchor_updates_alias() -> Result<()> {
+    // The stages don't need to touch the same path -- as long as every
+    // stage is itself alias-sensitive, later stages can read the
+    // already-synced value.
+    let input = "a: &x 1\nb: *x\n";
+    let (output, exit_code) = run_yq_stdin(".a = 99 | .c = .a + 1", input, &["-o=json", "-I=0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), r#"{"a":99,"b":99,"c":100}"#);
+    Ok(())
+}
+
 // =============================================================================
 // Anchored sequence items (#328) - an anchor on `- ` binds to the item's value
 // whatever its kind. Expectations are mikefarah/yq v4.53.3 output.
