@@ -206,6 +206,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`gmtime`, `mktime`, and `strptime` raised the right exit code but the
+  wrong message on bad input** (#761): `gmtime`/`localtime` on a non-number
+  reported the generic `"math function requires number"` (shared with
+  `floor`/`sqrt`/etc.) instead of jq's `"gmtime() requires numeric
+  inputs"`/`"localtime() requires numeric inputs"`; `mktime` on a non-array
+  reported `EvalError::type_error`'s `"expected array, got mktime"` instead
+  of jq's `"mktime requires array inputs"`; and `strptime` on a
+  non-matching format surfaced whichever low-level parser diagnostic failed
+  first (`"expected digits"`, `"expected '-'"`, ...) instead of jq's single
+  `date "<input>" does not match format "<fmt>"` for every failure mode.
+  Since #158, `catch` binds the raised value, so this wording is part of the
+  observable filter surface, not just stderr decoration. Added
+  `EvalError::datetime_requires_number`/`::mktime_requires_array`/
+  `::strptime_no_match` named constructors matching jq byte for byte,
+  and gave `get_float_value` a `get_float_value_with` sibling so
+  `gmtime`/`localtime` can supply their own message without touching the
+  other ~27 math builtins that share the generic one. Un-pins
+  `gmtime_type_error_on_string`, `mktime_type_error_on_number`, and
+  `strptime_no_match_error` from `tests/data/jq-golden-known-failures.txt`.
+
 - **`path`/`parent`/`parent(n)`/`key` (yq's path-context builtins) returned
   the root-level defaults `[]`/`{}`/`null` instead of the real answer
   whenever they appeared anywhere in a pipe other than the very first stage**
