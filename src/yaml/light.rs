@@ -1492,10 +1492,9 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                         out.write_char('\n')?;
                         write_yaml_indent(out, next_indent)?;
                     }
-                    // Recurse via the cursor, not `stream_yaml_value_as_json`
-                    // on the extracted `YamlValue`: an element's own tag
-                    // lives on its cursor's `bp_pos`, which a bare
-                    // `YamlValue` has already lost (#224).
+                    // Recurse via the cursor, not the extracted `YamlValue`:
+                    // an element's own tag lives on its cursor's `bp_pos`,
+                    // which a bare `YamlValue` has already lost (#224).
                     cursor.stream_json_value(out, next_indent, indent_spaces)?;
                 }
                 if indent_spaces > 0 {
@@ -2625,120 +2624,6 @@ fn write_resolved_scalar_as_json(output: &mut String, resolved: ResolvedScalar, 
 // ============================================================================
 // Streaming JSON Output (core::fmt::Write based)
 // ============================================================================
-
-/// Stream a YAML value as JSON from a bare `YamlValue` with no cursor of its
-/// own. The streaming twin of [`write_yaml_value_as_json`] - see its doc
-/// comment for why no production call site reaches this anymore (#224).
-#[allow(dead_code)] // STYLE-0005: used in tests
-fn stream_yaml_value_as_json<W: AsRef<[u64]>, Out: core::fmt::Write>(
-    out: &mut Out,
-    value: YamlValue<'_, W>,
-    current_indent: usize,
-    indent_spaces: usize,
-) -> core::fmt::Result {
-    match value {
-        YamlValue::Null => out.write_str("null"),
-        YamlValue::String(s) => match stream_yaml_string_to_json(out, &s) {
-            Ok(true) => Ok(()),
-            Ok(false) => {
-                if let Ok(str_val) = s.as_str() {
-                    if s.is_unquoted() {
-                        // Plain scalar - resolve per the core schema
-                        stream_yaml_scalar_as_json(out, &str_val)
-                    } else {
-                        // Block scalars are always strings
-                        stream_json_string(out, &str_val)
-                    }
-                } else {
-                    out.write_str("null")
-                }
-            }
-            Err(_) => out.write_str("null"),
-        },
-        YamlValue::Mapping(fields) => {
-            if fields.is_empty() {
-                return out.write_str("{}");
-            }
-            out.write_char('{')?;
-            let next_indent = current_indent + indent_spaces;
-            let mut first = true;
-            for field in fields {
-                if !first {
-                    out.write_char(',')?;
-                }
-                first = false;
-                if indent_spaces > 0 {
-                    out.write_char('\n')?;
-                    write_yaml_indent(out, next_indent)?;
-                }
-
-                if let YamlValue::String(s) = field.key() {
-                    match stream_yaml_string_to_json(out, &s) {
-                        Ok(true) => {}
-                        Ok(false) | Err(_) => {
-                            if let Ok(key_str) = s.as_str() {
-                                stream_json_string(out, &key_str)?;
-                            } else {
-                                out.write_str("\"\"")?;
-                            }
-                        }
-                    }
-                } else {
-                    // Alias/complex key (#222): resolve alias-to-scalar,
-                    // else "" — the entry is kept, never dropped
-                    stream_json_string(out, &field.key().key_string())?;
-                }
-
-                out.write_str(if indent_spaces > 0 { ": " } else { ":" })?;
-                field
-                    .value_cursor()
-                    .stream_json_value(out, next_indent, indent_spaces)?;
-            }
-            if indent_spaces > 0 {
-                out.write_char('\n')?;
-                write_yaml_indent(out, current_indent)?;
-            }
-            out.write_char('}')
-        }
-        YamlValue::Sequence(elements) => {
-            if elements.is_empty() {
-                return out.write_str("[]");
-            }
-            out.write_char('[')?;
-            let next_indent = current_indent + indent_spaces;
-            let mut first = true;
-            let mut rest = elements;
-            while let Some((cursor, next)) = rest.uncons_cursor() {
-                if !first {
-                    out.write_char(',')?;
-                }
-                first = false;
-                rest = next;
-                if indent_spaces > 0 {
-                    out.write_char('\n')?;
-                    write_yaml_indent(out, next_indent)?;
-                }
-                // A child element does have a cursor even though this
-                // function's own top-level `value` doesn't - use it so a
-                // nested element's tag isn't lost either.
-                cursor.stream_json_value(out, next_indent, indent_spaces)?;
-            }
-            if indent_spaces > 0 {
-                out.write_char('\n')?;
-                write_yaml_indent(out, current_indent)?;
-            }
-            out.write_char(']')
-        }
-        YamlValue::Alias { target, .. } => {
-            if let Some(target_cursor) = target {
-                target_cursor.stream_json_value(out, current_indent, indent_spaces)
-            } else {
-                out.write_str("null")
-            }
-        }
-        YamlValue::Error(_) => out.write_str("null"),
-    }
-}
 
 /// Stream a string with JSON escaping.
 fn stream_json_string<Out: core::fmt::Write>(out: &mut Out, s: &str) -> core::fmt::Result {
