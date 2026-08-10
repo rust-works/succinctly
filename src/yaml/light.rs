@@ -1392,6 +1392,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                                     unit,
                                     sort_keys,
                                 )?;
+                                write_line_comment(out, value.line_comment_raw())?;
                             } else {
                                 out.write_char(' ')?;
                                 if let Some(anchor) = value.anchor() {
@@ -1406,6 +1407,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                                     unit,
                                     sort_keys,
                                 )?;
+                                write_line_comment(out, value.line_comment_raw())?;
                             }
                         }
                     } else {
@@ -1437,6 +1439,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                                     unit,
                                     sort_keys,
                                 )?;
+                                write_line_comment(out, value.line_comment_raw())?;
                             } else {
                                 out.write_char(' ')?;
                                 if let Some(anchor) = value.anchor() {
@@ -1451,6 +1454,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                                     unit,
                                     sort_keys,
                                 )?;
+                                write_line_comment(out, value.line_comment_raw())?;
                             }
                         }
                     }
@@ -1506,6 +1510,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                                 unit,
                                 sort_keys,
                             )?;
+                            write_line_comment(out, cursor.line_comment_raw())?;
                         } else {
                             out.write_str("- ")?;
                             if let Some(anchor) = cursor.anchor() {
@@ -1520,6 +1525,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                                 unit,
                                 sort_keys,
                             )?;
+                            write_line_comment(out, cursor.line_comment_raw())?;
                         }
                         elems = rest;
                     }
@@ -1859,6 +1865,39 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
     #[inline]
     pub fn explicit_tag(&self) -> Option<&str> {
         self.index.get_tag(self.bp_pos)
+    }
+
+    /// Get the raw trailing same-line comment for this node, `#` and all,
+    /// exactly as it appears in the source (issue #710).
+    ///
+    /// Returns `None` if this node has no trailing comment. Used by the
+    /// write path, which re-emits the bytes verbatim after a single
+    /// normalized space (matching real `yq`'s output, verified empirically:
+    /// the gap before `#` is normalized to one space, but everything from
+    /// `#` onward — including internal/trailing whitespace — is preserved
+    /// as-is). See [`Self::line_comment`] for the stripped getter form.
+    #[inline]
+    pub fn line_comment_raw(&self) -> Option<&str> {
+        let (start, end) = self.index.get_line_comment(self.bp_pos)?;
+        core::str::from_utf8(&self.text[start as usize..end as usize]).ok()
+    }
+
+    /// Get this node's trailing same-line comment text (the `line_comment`
+    /// jq builtin, issue #710), with the leading `#` and at most one
+    /// following space stripped — matching real `yq`: `# keep this` →
+    /// `"keep this"`, but `#keep this` (no space after `#`) → `"#keep this"`
+    /// unchanged, since there's nothing to strip.
+    ///
+    /// Returns `None` if this node has no trailing comment; the builtin
+    /// itself maps that to `""`, matching real `yq`.
+    #[inline]
+    pub fn line_comment(&self) -> Option<&str> {
+        let raw = self.line_comment_raw()?;
+        // `raw` always starts with '#'. Only strip it (plus one following
+        // space) when a space actually follows — otherwise the '#' is part
+        // of the text with nothing to strip, e.g. `#keep this` stays
+        // `"#keep this"` unchanged (verified against real `yq`).
+        Some(raw.strip_prefix("# ").unwrap_or(raw))
     }
 
     /// Get the anchor name that this alias references.
@@ -5094,6 +5133,16 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
     }
 
     #[inline]
+    fn line_comment(&self) -> Option<String> {
+        YamlCursor::line_comment(self).map(ToString::to_string)
+    }
+
+    #[inline]
+    fn line_comment_raw(&self) -> Option<String> {
+        YamlCursor::line_comment_raw(self).map(ToString::to_string)
+    }
+
+    #[inline]
     fn cursor_at_offset(&self, offset: usize) -> Option<Self> {
         YamlCursor::cursor_at_offset(self, offset)
     }
@@ -5468,6 +5517,27 @@ fn write_yaml_child_inline<W: AsRef<[u64]>, Out: core::fmt::Write>(
         out.write_char(' ')?;
     }
     value.stream_yaml_value(out, 0, 0, unit, sort_keys)
+}
+
+/// Write a trailing same-line comment after a value, if present (issue
+/// #710). `comment` is the raw text as returned by
+/// [`YamlCursor::line_comment_raw`] — starting with `#`, un-stripped — and
+/// is written verbatim after a single normalized space, matching real
+/// `yq`'s output (empirically verified: the gap before `#` is always
+/// exactly one space regardless of the source's original spacing, but
+/// everything from `#` onward, including internal/trailing whitespace, is
+/// preserved as-is).
+fn write_line_comment<Out: core::fmt::Write>(
+    out: &mut Out,
+    comment: Option<&str>,
+) -> core::fmt::Result {
+    match comment {
+        Some(c) => {
+            out.write_char(' ')?;
+            out.write_str(c)
+        }
+        None => Ok(()),
+    }
 }
 
 /// Stream independent document cursors as a single YAML sequence (block or

@@ -816,6 +816,8 @@ pub enum Builtin {
     Column,
     /// `document_index` / `di` - return the 0-indexed document position in multi-doc stream (yq)
     DocumentIndex,
+    /// `line_comment` - return the trailing same-line comment text, or "" (yq, #710)
+    LineComment,
     /// `shuffle` - randomly shuffle array elements (yq)
     Shuffle,
     /// `pivot` - transpose arrays/objects (yq)

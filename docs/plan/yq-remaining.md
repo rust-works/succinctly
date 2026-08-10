@@ -23,14 +23,14 @@ See [yq Language Reference](../reference/yq-language.md) for implemented feature
 | Flag                   | Description                              |
 |------------------------|------------------------------------------|
 | `--explode-anchors`    | Expand anchor/alias references inline    |
-| `--preserve-comments`  | Preserve comments in YAML output         |
+| `--preserve-comments`  | Preserve comments in YAML output — partial (#710): always-on for trailing same-line comments on cursor-preserving paths (identity, navigation, filters, sort-keys); not yet for assignment |
 
 ## YAML Features (Low Priority)
 
 | Feature          | Description                              | Notes                    |
 |------------------|------------------------------------------|--------------------------|
 | Merge keys       | `<<: *alias` syntax                      | Complex semantics        |
-| Comment storage  | Store and query comments                 | Requires index changes   |
+| Comment storage  | Store and query trailing same-line comments | Implemented (#710) — `bp_to_line_comment` in the YAML semi-index, `line_comment` builtin. Standalone `head_comment`/`foot_comment` and assignment-path preservation remain open |
 
 ## Date Arithmetic (Low Priority)
 

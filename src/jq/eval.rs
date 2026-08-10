@@ -2352,6 +2352,7 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Builtin::Line => builtin_line::<W>(),
         Builtin::Column => builtin_column::<W>(),
         Builtin::DocumentIndex => builtin_document_index::<W>(),
+        Builtin::LineComment => builtin_line_comment::<W>(),
         Builtin::Shuffle => builtin_shuffle::<W>(value, optional),
         Builtin::Pivot => builtin_pivot::<W>(value, optional),
         Builtin::SplitDoc => {
@@ -9971,6 +9972,7 @@ fn substitute_var_in_builtin(
         Builtin::Line => Builtin::Line,
         Builtin::Column => Builtin::Column,
         Builtin::DocumentIndex => Builtin::DocumentIndex,
+        Builtin::LineComment => Builtin::LineComment,
         Builtin::Shuffle => Builtin::Shuffle,
         Builtin::Pivot => Builtin::Pivot,
         Builtin::SplitDoc => Builtin::SplitDoc,
@@ -15450,6 +15452,7 @@ fn builtin_builtins<'a, W: Clone + AsRef<[u64]>>() -> QueryResult<'a, W> {
         "key/0",
         "line/0",
         "column/0",
+        "line_comment/0",
         "parent/0",
         "parent/1",
     ];
@@ -16927,6 +16930,15 @@ fn builtin_document_index<'a, W: Clone + AsRef<[u64]>>() -> QueryResult<'a, W> {
     QueryResult::Owned(OwnedValue::Int(0))
 }
 
+/// `line_comment` - returns the trailing same-line comment text, or `""` (yq, #710)
+///
+/// See [`builtin_line`]: same reason, same evaluator, same permanent `""`
+/// (matching real `yq`'s empty-string default, verified empirically — not
+/// `null`).
+fn builtin_line_comment<'a, W: Clone + AsRef<[u64]>>() -> QueryResult<'a, W> {
+    QueryResult::Owned(OwnedValue::String(String::new()))
+}
+
 /// `shuffle` - randomly shuffle array elements (yq)
 /// Uses non-cryptographic RNG for performance.
 #[cfg(feature = "cli")]
@@ -18079,6 +18091,7 @@ fn expand_func_calls_in_builtin(
         Builtin::Line => Builtin::Line,
         Builtin::Column => Builtin::Column,
         Builtin::DocumentIndex => Builtin::DocumentIndex,
+        Builtin::LineComment => Builtin::LineComment,
         Builtin::Shuffle => Builtin::Shuffle,
         Builtin::Pivot => Builtin::Pivot,
         Builtin::SplitDoc => Builtin::SplitDoc,
@@ -18379,6 +18392,7 @@ fn substitute_func_param_in_builtin(builtin: &Builtin, param: &str, arg: &Expr) 
         Builtin::Line => Builtin::Line,
         Builtin::Column => Builtin::Column,
         Builtin::DocumentIndex => Builtin::DocumentIndex,
+        Builtin::LineComment => Builtin::LineComment,
         Builtin::Shuffle => Builtin::Shuffle,
         Builtin::Pivot => Builtin::Pivot,
         Builtin::SplitDoc => Builtin::SplitDoc,
