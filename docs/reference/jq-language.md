@@ -233,7 +233,7 @@ The implementation covers ~95% of jq functionality and is production-ready.
 - [x] `split_doc` - mark outputs as separate YAML documents
 - [x] `load(file)` - load external YAML/JSON file
 
-**Note on metadata builtins**: The `anchor`, `style`, `line`, and `column` builtins work best with direct cursor access. When YAML is converted to JSON for complex jq operations, some metadata may be lost. Direct YamlCursor methods (`cursor.anchor()`, `cursor.style()`, etc.) always preserve full metadata.
+**Note on metadata builtins**: The `anchor`, `style`, `line`, and `column` builtins resolve real source metadata when a cursor is available — ordinary navigation (`.foo`, `.[]`, `select(...)`, chained field/index access) on YAML input forwards the cursor and resolves real values. They return their zero value (`""` for `anchor`/`style`, `0` for `line`/`column`) whenever there's no cursor to consult: JSON input (which has no YAML anchor/style concept), or evaluation paths that materialize to `OwnedValue` before evaluating (`-n`, `--slurp`, and similar). Direct YamlCursor methods (`cursor.anchor()`, `cursor.style()`, etc.) always preserve full metadata since they operate on the cursor directly.
 
 **YamlCursor API** (for programmatic access):
 - `cursor.anchor()` → `Option<&str>` - anchor name (e.g., "myanchor" for `&myanchor value`)
@@ -395,7 +395,7 @@ cargo test --features cli,regex --test jq_error_message_tests
 | 2026-01-19 | Added parent / parent(n) for yq (✅ complete)|
 | 2026-01-19 | Added type filters: values, nulls, booleans, numbers, strings, arrays, objects, iterables, scalars (✅ complete)|
 | 2026-01-19 | Added tojson / fromjson for JSON string conversion (✅ complete)|
-| 2026-01-19 | Added YAML metadata functions: tag, anchor, style for yq (✅ partial - tag works fully, anchor/style return defaults)|
+| 2026-01-19 | Added YAML metadata functions: tag, anchor, style for yq (✅ partial - tag works fully, anchor/style returned defaults until #709)|
 | 2026-01-19 | Added kind function for yq - returns node kind: scalar, seq, map (✅ complete)|
 | 2026-01-19 | Added key function for yq - returns current key when iterating (✅ complete)|
 | 2026-01-19 | Added quoted field access `."key"` and bracket notation `.["key"]` (✅ complete)|
@@ -429,3 +429,4 @@ cargo test --features cli,regex --test jq_error_message_tests
 | 2026-01-24 | Document audit: Added `omit(keys)`, `load(file)`, `at_offset(n)`, `at_position(line; col)` to docs|
 | 2026-01-24 | Clarified YAML metadata: `alias` is cursor-level API only (not a jq builtin)|
 | 2026-01-24 | Updated coverage to 100% for most categories after comprehensive code review|
+| 2026-08-10 | Fixed `anchor`/`style` jq builtins to resolve real YAML metadata via cursor (previously hardcoded to always return `""`) (#709, ✅ complete)|

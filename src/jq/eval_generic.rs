@@ -1998,6 +1998,20 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
             GenericResult::Owned(OwnedValue::Int(doc_index as i64))
         }
 
+        Builtin::Anchor => {
+            // `c.anchor()`'s `&str` borrows from `c`, a value local to this
+            // closure — must own it via `to_string` before it escapes.
+            let anchor = cursor
+                .and_then(|c| c.anchor().map(str::to_string))
+                .unwrap_or_default();
+            GenericResult::Owned(OwnedValue::String(anchor))
+        }
+
+        Builtin::Style => {
+            let style = cursor.map_or("", |c| c.style());
+            GenericResult::Owned(OwnedValue::String(style.to_string()))
+        }
+
         Builtin::Select(cond) => {
             // Evaluate condition with cursor context preserved.
             // This is critical for select(di == N) to work correctly.
@@ -3767,6 +3781,140 @@ mod tests {
 
         // Mapping starts at column 1
         assert_eq!(owned, OwnedValue::Int(1));
+    }
+
+    // Regression tests for #709: `anchor`/`style` had no cursor-aware arm at
+    // all in this evaluator, so they always fell through to the OwnedValue
+    // fallback (`eval_on_owned`) and lost YAML metadata even for direct,
+    // un-navigated cursor access.
+
+    #[test]
+    fn test_yaml_anchor_builtin_with_cursor() {
+        use crate::yaml::YamlIndex;
+
+        let yaml = b"a: &x 1\nb: *x\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let doc_cursor = index
+            .root(yaml)
+            .first_child()
+            .expect("YAML document should have content");
+
+        let expr = crate::jq::parse(".a | anchor").unwrap();
+        let result = eval_with_cursor(&expr, doc_cursor);
+        assert_eq!(
+            result.into_owned().unwrap(),
+            OwnedValue::String("x".to_string())
+        );
+    }
+
+    #[test]
+    fn test_yaml_anchor_builtin_empty_when_absent() {
+        use crate::yaml::YamlIndex;
+
+        let yaml = b"a: 1\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let doc_cursor = index
+            .root(yaml)
+            .first_child()
+            .expect("YAML document should have content");
+
+        let expr = crate::jq::parse(".a | anchor").unwrap();
+        let result = eval_with_cursor(&expr, doc_cursor);
+        assert_eq!(
+            result.into_owned().unwrap(),
+            OwnedValue::String(String::new())
+        );
+    }
+
+    #[test]
+    fn test_yaml_style_builtin_with_cursor() {
+        use crate::yaml::YamlIndex;
+
+        let yaml = b"a: [1, 2, 3]\nb: \"quoted\"\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let doc_cursor = index
+            .root(yaml)
+            .first_child()
+            .expect("YAML document should have content");
+
+        let expr = crate::jq::parse(".a | style").unwrap();
+        let result = eval_with_cursor(&expr, doc_cursor);
+        assert_eq!(
+            result.into_owned().unwrap(),
+            OwnedValue::String("flow".to_string())
+        );
+
+        let expr = crate::jq::parse(".b | style").unwrap();
+        let result = eval_with_cursor(&expr, doc_cursor);
+        assert_eq!(
+            result.into_owned().unwrap(),
+            OwnedValue::String("double".to_string())
+        );
+    }
+
+    #[test]
+    fn test_yaml_anchor_style_without_cursor() {
+        use crate::yaml::YamlIndex;
+
+        let yaml = b"&x [1, 2, 3]\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let doc_cursor = index
+            .root(yaml)
+            .first_child()
+            .expect("YAML document should have content");
+        let value = doc_cursor.value();
+
+        // Using eval (not eval_with_cursor) loses anchor/style metadata,
+        // same as `line`/`column` above.
+        let result = eval(&Expr::Builtin(Builtin::Anchor), value.clone());
+        assert_eq!(
+            result.into_owned().unwrap(),
+            OwnedValue::String(String::new())
+        );
+
+        let result = eval(&Expr::Builtin(Builtin::Style), value);
+        assert_eq!(
+            result.into_owned().unwrap(),
+            OwnedValue::String(String::new())
+        );
+    }
+
+    // JSON has no anchor/style concept, so `JsonCursor` doesn't override
+    // `DocumentCursor::anchor`/`style` and falls through to the trait's
+    // default `None`/`""` impl (`document.rs`). The YAML tests above only
+    // exercise the *overridden* impls in `yaml/light.rs` — these cover the
+    // default itself, reached here via a real navigated cursor (not the
+    // cursor-less fallback `test_yaml_anchor_style_without_cursor` covers).
+    #[test]
+    fn test_json_anchor_builtin_default_empty() {
+        use crate::json::JsonIndex;
+
+        let json = br#"{"a": 1}"#;
+        let index = JsonIndex::build(json);
+        let doc_cursor = index.root(json);
+
+        let expr = parse(".a | anchor").unwrap();
+        let result = eval_with_cursor(&expr, doc_cursor);
+        assert_eq!(
+            result.into_owned().unwrap(),
+            OwnedValue::String(String::new())
+        );
+    }
+
+    #[test]
+    fn test_json_style_builtin_default_empty() {
+        use crate::json::JsonIndex;
+
+        let json = br#"{"a": [1, 2, 3]}"#;
+        let index = JsonIndex::build(json);
+        let doc_cursor = index.root(json);
+
+        let expr = parse(".a | style").unwrap();
+        let result = eval_with_cursor(&expr, doc_cursor);
+        assert_eq!(
+            result.into_owned().unwrap(),
+            OwnedValue::String(String::new())
+        );
     }
 
     #[test]

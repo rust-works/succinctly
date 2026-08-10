@@ -67,6 +67,22 @@ pub trait DocumentCursor: Sized + Copy + Clone {
         None
     }
 
+    /// Get the YAML anchor name at this node, if any.
+    ///
+    /// Returns `None` when the node has no anchor, and for formats without
+    /// an anchor concept (JSON). Only YAML cursors override this.
+    fn anchor(&self) -> Option<&str> {
+        None
+    }
+
+    /// Get the YAML style indicator for this node (e.g. `"flow"`, `"double"`).
+    ///
+    /// Returns `""` (no explicit style) by default; only YAML cursors
+    /// override this to report block/flow/quote style from the source text.
+    fn style(&self) -> &'static str {
+        ""
+    }
+
     /// Create a cursor at the specified byte offset (0-indexed).
     ///
     /// Returns None if:
