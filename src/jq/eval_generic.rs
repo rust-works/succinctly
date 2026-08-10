@@ -901,7 +901,7 @@ impl<V: DocumentValue> GenericResult<V> {
             // final array was never it.
             Self::LazySeq(seq) => match seq.clone().materialize_atomic() {
                 Ok(owned) => {
-                    owned.stream_json(out, indent_spaces)?;
+                    owned.stream_json(out, indent, sort_keys)?;
                     on_value(out)?;
                     stats.count = 1;
                     stats.last_was_falsy = owned.is_falsy();
@@ -1070,7 +1070,7 @@ impl<V: DocumentValue> GenericResult<V> {
             // reuse `OwnedValue::stream_yaml`.
             Self::LazySeq(seq) => match seq.clone().materialize_atomic() {
                 Ok(owned) => {
-                    owned.stream_yaml(out, indent_spaces)?;
+                    owned.stream_yaml(out, indent, sort_keys)?;
                     on_value(out)?;
                     stats.count = 1;
                     stats.last_was_falsy = owned.is_falsy();
@@ -4242,7 +4242,7 @@ mod tests {
         let expr = crate::jq::parse("map(. + 1)").unwrap();
         let result = eval(&expr, value);
         let mut out = String::new();
-        let stats = result.stream_json(&mut out, 0, |_| Ok(())).unwrap();
+        let stats = result.stream_json(&mut out, IndentSpec::COMPACT, false, |_| Ok(())).unwrap();
         assert_eq!(out, "");
         assert!(stats.error.is_some());
         assert_eq!(stats.count, 0);
@@ -4271,7 +4271,7 @@ mod tests {
         let expr = crate::jq::parse("map(. + 1) | .[]").unwrap();
         let result = eval(&expr, value);
         let mut out = String::new();
-        result.stream_json(&mut out, 0, |_| Ok(())).unwrap();
+        result.stream_json(&mut out, IndentSpec::COMPACT, false, |_| Ok(())).unwrap();
         assert_eq!(out, "");
     }
 
@@ -7824,13 +7824,13 @@ mod tests {
         let expr = crate::jq::parse("map(. + 1)").unwrap();
         let result = eval(&expr, value.clone());
         let mut out = String::new();
-        let stats = result.stream_json(&mut out, 0, |_| Ok(())).unwrap();
+        let stats = result.stream_json(&mut out, IndentSpec::COMPACT, false, |_| Ok(())).unwrap();
         assert_eq!(out, "[2,3,4]");
         assert_eq!(stats.count, 1);
         assert!(stats.any_truthy);
 
         let mut out = String::new();
-        let stats = result.stream_yaml(&mut out, 0, |_| Ok(())).unwrap();
+        let stats = result.stream_yaml(&mut out, IndentSpec::COMPACT, false, |_| Ok(())).unwrap();
         assert_eq!(out, "[2, 3, 4]");
         assert_eq!(stats.count, 1);
         assert!(stats.any_truthy);
@@ -7838,14 +7838,14 @@ mod tests {
         let expr = crate::jq::parse("map(break $out)").unwrap();
         let result = eval(&expr, value.clone());
         let mut out = String::new();
-        let stats = result.stream_json(&mut out, 0, |_| Ok(())).unwrap();
+        let stats = result.stream_json(&mut out, IndentSpec::COMPACT, false, |_| Ok(())).unwrap();
         assert_eq!(out, "");
         assert_eq!(stats.count, 0);
         assert!(stats.error.is_some());
 
         let result = eval(&expr, value);
         let mut out = String::new();
-        let stats = result.stream_yaml(&mut out, 0, |_| Ok(())).unwrap();
+        let stats = result.stream_yaml(&mut out, IndentSpec::COMPACT, false, |_| Ok(())).unwrap();
         assert_eq!(out, "");
         assert!(stats.error.is_some());
     }
