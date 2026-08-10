@@ -426,31 +426,74 @@ fn evaluate_input(
     }
 }
 
-/// Whether `expr`'s top-level shape is "rewrite the document at specific
-/// paths, leaving everything else identical" -- the class of expression for
-/// which comparing a path's value before and after the write is meaningful.
-/// Unwraps `Paren`/`Optional` so `(.a = 1)?` still matches, and recurses into
-/// `Pipe` so a chain of assignments like `.a = 1 | .b = 2` (the common
-/// `yq -i '... | ...'` idiom) matches when every stage does.
+/// Whether `expr` is itself an assignment-family write: `.path = value`,
+/// `|=`, a compound assign, `//=`, or `del(...)`. Unwraps `Paren`/`Optional`
+/// so `(.a = 1)?` still counts, and recurses into `Pipe` so a chain counts
+/// as soon as *any* stage writes.
 ///
-/// Used to gate the alias-sync post-process (#711): outside this class (a
-/// bare `map`, `select`, `.a, .b`, ...) the result document doesn't
-/// necessarily share the input's shape at all, so diffing "the same path" in
-/// both would be meaningless at best and could clobber it at worst. A pipe
-/// with even one non-assign stage (`.a = 1 | select(...)`) is conservatively
-/// excluded for the same reason, even though some such stages would in fact
-/// preserve paths -- that's left for a future extension, not assumed here.
-fn is_alias_sensitive_assign(expr: &Expr) -> bool {
+/// Split out from [`is_alias_sensitive_assign`] so a pipe made entirely of
+/// pass-through stages (`select(true) | debug`, no write at all) doesn't
+/// pay for alias-sync snapshotting -- only a pipe that both preserves shape
+/// *and* actually writes somewhere needs the pristine-vs-result diff.
+fn contains_assign(expr: &Expr) -> bool {
     match expr {
         Expr::Assign { .. }
         | Expr::Update { .. }
         | Expr::CompoundAssign { .. }
         | Expr::AlternativeAssign { .. }
         | Expr::Builtin(Builtin::Del(_)) => true,
-        Expr::Paren(inner) | Expr::Optional(inner) => is_alias_sensitive_assign(inner),
-        Expr::Pipe(stages) => stages.iter().all(is_alias_sensitive_assign),
+        Expr::Paren(inner) | Expr::Optional(inner) => contains_assign(inner),
+        Expr::Pipe(stages) => stages.iter().any(contains_assign),
         _ => false,
     }
+}
+
+/// Whether `expr`'s top-level shape is "rewrite the document at specific
+/// paths, leaving everything else identical" -- the class of expression for
+/// which comparing a path's value before and after the write is meaningful.
+/// Unwraps `Paren`/`Optional` so `(.a = 1)?` still matches, and recurses into
+/// `Pipe` so a chain matches when every stage does, whether the stage is a
+/// write (`.a = 1 | .b = 2`) or one of a small allow-list of pass-through
+/// stages that provably either emit the input document completely unchanged
+/// or emit nothing at all: `.` (`Identity`), `select(...)`, `empty`,
+/// `debug`/`debug(msg)`. Mixing one into an assignment pipe (`.a = 1 |
+/// select(.a > 0)`, the guard-style `yq -i` idiom from #764) still leaves
+/// "the same path means the same thing" true for every document that comes
+/// out the other end, since none of these four ever rewrite or reshape the
+/// value they pass through -- unlike `map`, `select`'s own predicate or
+/// `debug`'s own message expression never appear in the pipeline's output,
+/// only their pass/fail or side-effect result does, so `contains_assign`
+/// deliberately does not recurse into either.
+///
+/// Used to gate the alias-sync post-process (#711): outside this class (a
+/// bare `map`, `.a, .b`, ...) the result document doesn't necessarily share
+/// the input's shape at all, so diffing "the same path" in both would be
+/// meaningless at best and could clobber it at worst. A pipe with a stage
+/// outside both the write list and this pass-through allow-list is
+/// conservatively excluded for the same reason -- verifying more stages
+/// preserve paths is left for a future extension, not assumed here.
+fn is_alias_sensitive_assign(expr: &Expr) -> bool {
+    fn is_shape_preserving(expr: &Expr) -> bool {
+        match expr {
+            Expr::Assign { .. }
+            | Expr::Update { .. }
+            | Expr::CompoundAssign { .. }
+            | Expr::AlternativeAssign { .. }
+            | Expr::Identity
+            | Expr::Builtin(
+                Builtin::Del(_)
+                | Builtin::Select(_)
+                | Builtin::Empty
+                | Builtin::Debug
+                | Builtin::DebugMsg(_),
+            ) => true,
+            Expr::Paren(inner) | Expr::Optional(inner) => is_shape_preserving(inner),
+            Expr::Pipe(stages) => stages.iter().all(is_shape_preserving),
+            _ => false,
+        }
+    }
+
+    is_shape_preserving(expr) && contains_assign(expr)
 }
 
 /// Walk `cursor`'s document collecting, for every anchor with at least one
