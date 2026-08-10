@@ -12383,7 +12383,8 @@ fn collect_leaf_paths(
 }
 
 /// Builtin: leaf_paths - paths to scalar (non-container) values
-/// Returns each path as a separate output (streaming), matching jq's paths(scalars) behavior
+/// Returns each path as a separate output (streaming). Diverges from jq's
+/// `paths(scalars)` idiom for `null` and empty containers — see #771.
 fn builtin_leaf_paths<W: Clone + AsRef<[u64]>>(
     value: StandardJson<'_, W>,
     _optional: bool,
