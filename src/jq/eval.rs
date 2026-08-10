@@ -7575,7 +7575,7 @@ pub fn eval_lenient<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 ///
 /// Routes through the ordinary evaluator, untouched, whenever `expr`
 /// doesn't reference `file_index`/`key`/`parent`/`path` anywhere
-/// [`needs_path_context`] can see -- the overwhelming majority of
+/// `needs_path_context` can see -- the overwhelming majority of
 /// `--eval-all` filters pay zero extra cost over a normal `evaluate_input`.
 pub fn eval_owned_with_file_index<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     expr: &Expr,
