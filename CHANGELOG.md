@@ -997,6 +997,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   input, matching it byte-for-byte instead of merely agreeing on the
   duplicate-key count.
 
+- **`yq -S`/`--sort-keys` and `--tab` still collapsed duplicate mapping
+  keys** (#733), the last gap #442 left open: both flags were excluded from
+  `can_stream_pretty` (`yq_runner.rs`), so any identity/navigation query
+  under either flag fell through to the `OwnedValue::Object`/`IndexMap`
+  DOM path and lost all but the last occurrence of a repeated key — e.g.
+  `yq -S '.'` on `a: 1\na: 2` printed `a: 2`. Unlike #442/#478/#607/#631,
+  this wasn't a missing expression shape in `can_use_m2_streaming`; it was
+  the cursor/lazy streamers themselves not supporting sort or a non-space
+  indent unit, exactly as the code comment at the time predicted ("`tab`
+  indentation needs a string-based indent unit they don't accept yet").
+
+  Fixed by teaching the streamers both features instead of excluding the
+  flags: `DocumentCursor::stream_json`/`stream_yaml` (and every concrete
+  implementation and caller — `YamlCursor`'s mapping/sequence streamers,
+  `GenericResult::stream_json`/`stream_yaml`, `jq/stream.rs`'s
+  `OwnedValue`/lazy-keys streamers) now take an `IndentSpec { width, unit }`
+  (`unit` is `'\t'` for `--tab`, `' '` otherwise) instead of a bare space
+  count, plus a `sort_keys` flag. `YamlCursor`'s mapping arm sorts by
+  materializing that mapping's fields into a `Vec<YamlField>` (`YamlField`
+  is `Copy`, so this is cursor-only, no value data) and stable-sorting by
+  key — duplicate keys stay adjacent in original relative order rather than
+  merging, since a `Vec` sort, unlike an `IndexMap` insert, never collapses
+  equal keys. `can_stream_pretty` now only excludes color (`use_color`),
+  which has the same latent bug but is out of scope here (unreported,
+  tracked as a follow-up). Also closes a `--tab`-only correctness gap the
+  widened gate would otherwise have introduced: `keys_unsorted` is also
+  `can_use_m2_streaming`-eligible and streams through a separate helper
+  (`stream_lazy_keys_json`/`_yaml`) with its own indent-writing code, which
+  needed the same `unit` threading to avoid emitting spaces under `--tab`.
+
 - **The strict YAML validator accepted a flow-collection anchor immediately
   followed by an alias** (#452): `[&a *a]` and `{k: &a *a}` passed
   `succinctly yaml validate`, which `yq` rejects — an anchor property cannot
