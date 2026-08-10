@@ -144,6 +144,57 @@ succinctly yq '. + {config: load("defaults.yaml")}' input.yaml
 succinctly yq '.. | select(.name == "target") | parent' file.yaml
 ```
 
+### Merge-Flag Suffixes on `*`/`*=`
+
+Real yq extends the `*`/`*=` merge operator with combinable flag suffixes.
+They go directly after `*` for the plain (non-assign) form, or after `*=`
+for the in-place form — never between `*` and `=` (`.a *+= .b` is not
+valid; the flags belong after the `=`, e.g. `.a *=+ .b`). Flags combine
+freely in any order and duplicates are harmless (`*+d` ≡ `*d+` ≡ `*++dd`).
+
+| Flag | Meaning                                                                                    |
+|------|--------------------------------------------------------------------------------------------|
+| `+`  | Append arrays instead of replacing them                                                    |
+| `?`  | Only update fields/indices that already exist; never create new                            |
+| `n`  | Only write fields/indices that don't already exist (or are `null`)                         |
+| `d`  | Deep-merge arrays: treat them like objects, merging by index                               |
+| `c`  | Clobber custom tags (parsed but a no-op today — no tag data exists to preserve or clobber) |
+
+```bash
+printf 'a: [1, 2]\nb: [3, 4]\n' | succinctly yq '.a *=+ .b'
+# a: [1, 2, 3, 4]
+
+printf 'a:\n  thing: one\n  cat: frog\nb:\n  missing: two\n  thing: two\n' \
+  | succinctly yq '.a *=? .b'
+# a: {thing: two, cat: frog}          — ? blocks new key "missing"
+
+printf 'a:\n  thing: one\n  cat: frog\nb:\n  missing: two\n  thing: two\n' \
+  | succinctly yq '.a *=n .b'
+# a: {thing: one, cat: frog, missing: two}   — n blocks overwriting existing "thing"
+
+# d: deep-merge arrays by index, like objects keyed by index
+printf 'a: [{name: fred, age: 12}, {name: bob, age: 32}]\nb: [{name: fred, age: 34}]\n' \
+  | succinctly yq '.a *=d .b'
+# a: [{name: fred, age: 34}, {name: bob, age: 32}]
+```
+
+**Notes and known divergences from real yq:**
+
+- Plain unflagged `*`/`*=` on two arrays replaces the left side wholesale
+  with the right — this is yq-only; `succinctly jq` still errors on array
+  `*` (real jq has no array-merge concept at all).
+- `?`/`n` propagate through every nesting depth: a parent key that already
+  exists still gets recursed into so its own new children can be added or
+  blocked individually. Combining `?` and `n` is an AND of both gates (net
+  effect: only touch a field that already exists and is currently `null`).
+- `+`/`d` combined on the same array is a deliberate simplification: real
+  yq's own combined behavior here is an undocumented, untested-upstream
+  quirk. succinctly makes `+` take clean priority instead (pure append, `d`
+  ignored).
+- `c` requires custom YAML tag preservation, which succinctly doesn't
+  support anywhere yet (the parser rejects custom tags outright) — it's
+  parsed for forward compatibility but has no observable effect.
+
 ### Date/Time Extensions
 
 Beyond jq's standard date functions (`now`, `gmtime`, `strftime`, `strptime`), yq adds:

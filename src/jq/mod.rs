@@ -26,6 +26,7 @@
 //! | `"string"` | String literal |
 //! | `123`, `3.14` | Number literal |
 //! | `.a + .b` | Arithmetic (+, -, *, /, %) |
+//! | `.a * .b` | Recursive object merge (both jq and yq); yq also replaces on array `*`, with flag suffixes `*+`/`*?`/`*n`/`*d`/`*c` controlling merge semantics (yq mode only) |
 //! | `.a == .b` | Comparison (==, !=, <, <=, >, >=) |
 //! | `.a and .b` | Boolean AND |
 //! | `.a or .b` | Boolean OR |
