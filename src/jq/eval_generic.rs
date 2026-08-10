@@ -5185,6 +5185,29 @@ mod tests {
         );
     }
 
+    /// `to_owned_with_comments` reads the raw (`#`-and-all) form via
+    /// [`DocumentCursor::line_comment_raw`] (issue #710), not the stripped
+    /// `line_comment` builtin getter the test above exercises. JSON never
+    /// overrides `line_comment_raw` (only `YamlCursor` does), so this is the
+    /// only route that reaches the trait's default `None` implementation for
+    /// that method - unlike `line_comment`, which the plain `jq` `line_comment`
+    /// builtin already exercises on JSON above.
+    #[test]
+    fn test_json_to_owned_with_comments_uses_line_comment_raw_default() {
+        let json = b"{\"a\": 1}";
+        let index = crate::json::JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+
+        let (owned, comments) = to_owned_with_comments(&value, Some(&cursor));
+        assert_eq!(
+            owned,
+            OwnedValue::Object(IndexMap::from([("a".to_string(), OwnedValue::Int(1))]))
+        );
+        assert_eq!(comments.own(), None);
+        assert_eq!(comments.field("a").own(), None);
+    }
+
     // Regression tests for #532: `line`/`column` returned 0 for anything
     // downstream of `.foo`/`.[]`/`select(...)`, because those Expr/Builtin
     // arms received a cursor but never forwarded it — only a bare `line`
