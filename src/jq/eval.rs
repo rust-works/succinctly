@@ -1635,38 +1635,47 @@ fn merge_position(
 }
 
 /// Merge `right`'s fields into `left`, one position at a time via
-/// [`merge_position`].
+/// [`merge_position`]. Uses the `Entry` API rather than
+/// `left.get(&k).cloned()` + `left.insert(..)` so an existing value that's
+/// itself a large nested container moves into the merge instead of being
+/// deep-cloned first.
 fn merge_object_fields(
     mut left: IndexMap<String, OwnedValue>,
     right: IndexMap<String, OwnedValue>,
     flags: MergeFlags,
 ) -> IndexMap<String, OwnedValue> {
     for (k, v) in right {
-        let existing = left.get(&k).cloned();
-        if let Some(new_value) = merge_position(existing, v, flags, true) {
-            left.insert(k, new_value);
+        match left.entry(k) {
+            indexmap::map::Entry::Occupied(mut e) => {
+                let existing = e.insert(OwnedValue::Null);
+                e.insert(merge_existing(existing, v, flags));
+            }
+            indexmap::map::Entry::Vacant(e) => {
+                if let Some(new_value) = merge_position(None, v, flags, true) {
+                    e.insert(new_value);
+                }
+            }
         }
     }
     left
 }
 
 /// Deep-merge two arrays by index (the `d` flag): treats the array like an
-/// object keyed by index, one position at a time via [`merge_position`].
-/// Indices only present in `right` extend `left` (real yq's `?` never
-/// blocks this — see [`merge_position`]'s doc comment).
+/// object keyed by index, one position at a time via [`merge_existing`].
+/// Indices only present in `right` extend `left` — real yq's `?` never
+/// blocks this (see [`merge_position`]'s doc comment), so extension is
+/// unconditional here rather than routed through `merge_position`.
 fn merge_arrays_by_index(
     mut left: Vec<OwnedValue>,
     right: Vec<OwnedValue>,
     flags: MergeFlags,
 ) -> Vec<OwnedValue> {
     for (i, v) in right.into_iter().enumerate() {
-        let existing = left.get(i).cloned();
-        if let Some(new_value) = merge_position(existing, v, flags, false) {
-            if i < left.len() {
-                left[i] = new_value;
-            } else {
-                left.push(new_value);
-            }
+        if i < left.len() {
+            let existing = core::mem::replace(&mut left[i], OwnedValue::Null);
+            left[i] = merge_existing(existing, v, flags);
+        } else {
+            left.push(v);
         }
     }
     left
