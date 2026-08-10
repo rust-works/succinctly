@@ -8582,6 +8582,53 @@ mod tests {
     }
 
     #[test]
+    fn test_style_value_with_anchor_and_tag_is_unaffected() {
+        // A value cursor's `text_position()` already resolves past any
+        // leading `&anchor`/`!tag` property, so `style()` reports the
+        // underlying scalar's/container's own style regardless of what
+        // precedes it (#224).
+        for (name, yaml, expected) in [
+            ("anchor only", &b"key: &a \"quoted\"\n"[..], "double"),
+            ("tag only", &b"key: !!str \"quoted\"\n"[..], "double"),
+            (
+                "anchor then tag",
+                &b"key: &a !!str \"quoted\"\n"[..],
+                "double",
+            ),
+            ("anchor on flow mapping", &b"key: &a {a: 1}\n"[..], "flow"),
+        ] {
+            let index = YamlIndex::build(yaml).unwrap();
+            let root = index.root(yaml);
+            if let YamlValue::Mapping(fields) = first_doc(root) {
+                if let Some(field) = fields.into_iter().next() {
+                    let cursor = field.value_cursor();
+                    assert_eq!(cursor.style(), expected, "{name}");
+                    continue;
+                }
+            }
+            panic!("Could not find value for {name}");
+        }
+    }
+
+    #[test]
+    fn test_style_tagged_flow_key_skips_the_property_prefix() {
+        // Unlike value cursors, a *key* cursor's `text_position()` points
+        // straight at a leading `!tag` rather than past it - `style()` must
+        // call `skip_properties_and_whitespace` itself to find the key's
+        // actual quoting style (#224).
+        let yaml = b"{!!str \"k\": v}\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let root = index.root(yaml);
+        if let YamlValue::Mapping(fields) = first_doc(root) {
+            if let Some(field) = fields.into_iter().next() {
+                assert_eq!(field.key_cursor().style(), "double");
+                return;
+            }
+        }
+        panic!("Could not find field");
+    }
+
+    #[test]
     fn test_tag_string() {
         let yaml = b"key: hello";
         let index = YamlIndex::build(yaml).unwrap();
@@ -8697,6 +8744,58 @@ mod tests {
         assert_eq!(value_tag(b"key: .5"), "!!float");
     }
 
+    /// `test_tag_string`/`_int`/`_bool`/`_null`/`_float`/`_core_schema_resolution`
+    /// above all use untagged plain scalars, so none of them exercise the
+    /// `explicit_tag()` branch inside `tag()` - only its plain-scalar
+    /// fallback. An explicit core-schema tag forces that resolution
+    /// regardless of the content's own shape or quoting; a non-core-schema
+    /// tag does not, and falls through to the same plain-scalar inference
+    /// instead (#224).
+    #[test]
+    fn test_tag_explicit_core_schema_tag_forces_resolution() {
+        assert_eq!(value_tag(b"key: !!str 1"), "!!str");
+        assert_eq!(value_tag(b"key: !!int \"5\""), "!!int");
+        // A custom tag doesn't change tag(); "v" is plain, so it still infers
+        // !!str from resolve_plain.
+        assert_eq!(value_tag(b"key: !custom v"), "!!str");
+    }
+
+    /// `is_falsy` (the `DocumentCursor` trait method backing `select`,
+    /// `if/then/else`, and `//`) must honor an explicit tag's resolution, not
+    /// the scalar's own quoting - a quoted non-empty string is ordinarily
+    /// truthy, but `!!bool "false"` and `!!null "~"` are both falsy because
+    /// the tag forces that resolution (#224).
+    #[test]
+    fn test_is_falsy_uses_the_resolved_tagged_value() {
+        for (name, yaml, expect_falsy) in [
+            (
+                "tagged bool false, quoted",
+                &b"a: !!bool \"false\"\n"[..],
+                true,
+            ),
+            ("tagged null, quoted", &b"a: !!null \"~\"\n"[..], true),
+            (
+                "tagged bool true, quoted",
+                &b"a: !!bool \"true\"\n"[..],
+                false,
+            ),
+            // Sanity check: the same quoted content, untagged, is truthy -
+            // the behavior the tagged cases above must diverge from.
+            ("untagged quoted false", &b"a: \"false\"\n"[..], false),
+        ] {
+            let index = YamlIndex::build(yaml).unwrap();
+            let root = index.root(yaml);
+            if let YamlValue::Mapping(fields) = first_doc(root) {
+                if let Some(field) = fields.into_iter().next() {
+                    let cursor = field.value_cursor();
+                    assert_eq!(cursor.is_falsy(), expect_falsy, "{name}");
+                    continue;
+                }
+            }
+            panic!("Could not find value for {name}");
+        }
+    }
+
     /// Returns `to_json` for a document (exercises the buffer transcoder).
     /// The root wraps documents in an implicit sequence, hence `[...]`.
     #[track_caller]
@@ -8729,6 +8828,29 @@ mod tests {
         assert_eq!(doc_json(b"a: |-\n  true\n"), r#"[{"a":"true"}]"#);
         assert_eq!(doc_json(b"a: |-\n  null\n"), r#"[{"a":"null"}]"#);
         assert_eq!(doc_json(b"a: >-\n  42\n"), r#"[{"a":"42"}]"#);
+    }
+
+    /// A tag that isn't one of the 5 core-schema tags (`!custom`) makes
+    /// `resolve_tagged` return `None`, so both JSON emitters must fall
+    /// through to ordinary scalar transcoding rather than resolving -
+    /// exercised on both the buffered (`to_json`/`write_json_to`) and
+    /// streaming (`stream_json`/`stream_json_value`) paths (#224).
+    #[test]
+    fn test_custom_tag_falls_through_to_plain_transcoding() {
+        let yaml = b"a: !custom hello\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let root = index.root(yaml);
+        if let YamlValue::Mapping(fields) = first_doc(root) {
+            if let Some(field) = fields.into_iter().next() {
+                let cursor = field.value_cursor();
+                assert_eq!(cursor.to_json(), "\"hello\"");
+                let mut streamed = String::new();
+                cursor.stream_json(&mut streamed, 0).expect("streams");
+                assert_eq!(streamed, "\"hello\"");
+                return;
+            }
+        }
+        panic!("Could not find value");
     }
 
     #[test]
@@ -9540,6 +9662,20 @@ mod tests {
             b"a:\n  -\n  - y\n  - k: v\n",
             b"[\n  - x,\n  y\n]\n",
             b"- &a x\n- *a\n",
+            // A quoted string element: hits `write_yaml_value_as_json`'s
+            // direct-transcode-succeeds fast path for a quoted *value*
+            // (#224).
+            b"- \"q\"\n- y\n",
+            // A mapping element with a quoted key: same fast path, for a
+            // quoted *key* this time.
+            b"- \"k\": v\n",
+            // A mapping element whose key is an alias (not a `YamlValue::String`):
+            // the non-string-key fallback branch (resolves via `key_string()`).
+            b"- &a x\n- *a: v\n",
+            // A nested sequence with 2+ items as a top-level element: hits
+            // the comma-insertion branch for the second+ item of a *nested*
+            // sequence.
+            b"- - a\n  - b\n- y\n",
         ];
         for yaml in inputs {
             let index = YamlIndex::build(yaml).expect("builds");
@@ -9617,6 +9753,32 @@ mod tests {
                 "round-trip changed {what}"
             );
         }
+    }
+
+    /// Flow-style sibling of `tests/yq_cli_tests.rs`'s
+    /// `test_yaml_default_output_preserves_the_literal_tag`, which only
+    /// covers the block-style key case (`!!str key: value`). A flow
+    /// mapping's key has its own, separate
+    /// `field.key_cursor().explicit_tag()` check in `stream_yaml_value`'s
+    /// `indent_spaces == 0` arm - reached only by flow-style output, which
+    /// the CLI's default YAML output never produces (`-I0` is remapped to
+    /// `-I2` for YAML, matching real `yq`), so this calls `stream_yaml`
+    /// directly instead of going through the CLI (#224).
+    #[test]
+    fn test_stream_yaml_flow_mapping_preserves_tagged_key() {
+        let yaml = b"a: {!!str k: v}\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let root = index.root(yaml);
+        if let YamlValue::Mapping(fields) = first_doc(root) {
+            if let Some(field) = fields.into_iter().next() {
+                let cursor = field.value_cursor();
+                let mut out = String::new();
+                cursor.stream_yaml(&mut out, 0).expect("streams");
+                assert_eq!(out, "{!!str k: v}");
+                return;
+            }
+        }
+        panic!("Could not find value");
     }
 
     /// Helper: render a `YamlValue` as JSON, matching `to_json`'s output.
