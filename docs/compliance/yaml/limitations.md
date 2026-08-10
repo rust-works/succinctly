@@ -285,7 +285,8 @@ storage design (a `BTreeMap<usize, String>` on `YamlIndex`, mirroring the anchor
 one documented gap: the lazy, cursor-free half of the jq evaluator (`src/jq/eval_generic.rs`'s
 `to_owned`, shared with JSON) is not tag-aware, so `succinctly yq '.a | type'` on a tagged
 scalar can still answer from untagged inference even though `succinctly yq '.'`'s JSON output
-for the same input is always correct.
+for the same input is always correct. Tracked as
+[#747](https://github.com/rust-works/succinctly/issues/747).
 
 ### How the gaps were closed (#664 → #224)
 

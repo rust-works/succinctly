@@ -726,7 +726,8 @@ still answer from the untagged inference. Documented as a known limitation at th
 `to_owned`'s recursion (the pieces exist: `DocumentField::value_cursor`,
 `DocumentElements::uncons_cursor`) or embedding the tag in `YamlValue::String` itself, which
 fans out to ~90 pattern-match sites across 6 files — left as a follow-up rather than an
-under-tested change to an evaluator shared with JSON.
+under-tested change to an evaluator shared with JSON. Tracked as
+[#747](https://github.com/rust-works/succinctly/issues/747).
 
 ### 7. Testing Strategy
 

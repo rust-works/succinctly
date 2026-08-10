@@ -4973,10 +4973,10 @@ impl<'a, W: AsRef<[u64]>> YamlValue<'a, W> {
     }
 }
 
-// KNOWN LIMITATION (#224): the typed getters below (`is_null`, `as_bool`,
-// `as_i64`, `as_f64`, `type_name`) are not tag-aware, unlike every JSON
-// output path (`write_json_to`/`stream_json_value`) and the CLI's
-// `yaml_to_owned_value`. A bare `YamlValue` has no `bp_pos` to look an
+// KNOWN LIMITATION (#224, tracked as #747): the typed getters below
+// (`is_null`, `as_bool`, `as_i64`, `as_f64`, `type_name`) are not tag-aware,
+// unlike every JSON output path (`write_json_to`/`stream_json_value`) and the
+// CLI's `yaml_to_owned_value`. A bare `YamlValue` has no `bp_pos` to look an
 // explicit tag up with — only a `YamlCursor` does (`explicit_tag()`) — and
 // `crate::jq::eval_generic::to_owned`, the generic evaluator's lazy
 // materializer backing `select`, `==`, arithmetic, and `type` on the
