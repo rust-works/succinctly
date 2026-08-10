@@ -5267,6 +5267,62 @@ mod tests {
         assert_eq!(last.collect_owned(), vec![OwnedValue::Int(1)]);
     }
 
+    // `GenericResult::stream_json`/`stream_yaml`'s `Self::One`/`Self::Many`
+    // arms (bare, cursor-less `V`) convert to `OwnedValue` via `to_owned`
+    // and stream that -- distinct from `Self::OneCursor`/`ManyCursor`'s
+    // direct cursor streaming, which is what the M2 CLI fast path actually
+    // exercises for real navigation queries. Reached the same way as
+    // `test_json_first_and_last_of_identity_without_cursor_yield_bare_one`/
+    // `..._of_multi_truthy_select_without_cursor_yield_bare_many` above: via
+    // the cursor-less `eval()` entry point.
+    #[test]
+    fn test_stream_json_and_yaml_bare_one_streams_via_owned_value() {
+        let json = br#"{"b": 1, "a": 2}"#;
+        let index = JsonIndex::build(json);
+        let value = index.root(json).value();
+
+        let result = eval(&crate::jq::parse("first(.)").unwrap(), value);
+        assert!(matches!(result, GenericResult::One(_)));
+
+        let mut json_out = String::new();
+        result
+            .stream_json(&mut json_out, IndentSpec::COMPACT, true, |_| Ok(()))
+            .unwrap();
+        assert_eq!(json_out, r#"{"a":2,"b":1}"#);
+
+        let mut yaml_out = String::new();
+        result
+            .stream_yaml(&mut yaml_out, IndentSpec::COMPACT, true, |_| Ok(()))
+            .unwrap();
+        assert_eq!(yaml_out, "{a: 2, b: 1}");
+    }
+
+    #[test]
+    fn test_stream_json_and_yaml_bare_many_streams_via_owned_values() {
+        let json = br#"{"b": 1, "a": 2}"#;
+        let index = JsonIndex::build(json);
+        let value = index.root(json).value();
+
+        let result = eval(&crate::jq::parse("select(true,true)").unwrap(), value);
+        assert!(matches!(result, GenericResult::Many(_)));
+
+        let mut json_out = String::new();
+        result
+            .stream_json(&mut json_out, IndentSpec::COMPACT, true, |w| {
+                core::fmt::Write::write_str(w, ";")
+            })
+            .unwrap();
+        assert_eq!(json_out, r#"{"a":2,"b":1};{"a":2,"b":1};"#);
+
+        let mut yaml_out = String::new();
+        result
+            .stream_yaml(&mut yaml_out, IndentSpec::COMPACT, true, |w| {
+                core::fmt::Write::write_str(w, ";")
+            })
+            .unwrap();
+        assert_eq!(yaml_out, "{a: 2, b: 1};{a: 2, b: 1};");
+    }
+
     #[test]
     fn test_json_first_and_last_of_single_literal_yield_owned() {
         // `eval_first_or_last_generic`'s `Owned(v) => Owned(v)` passthrough

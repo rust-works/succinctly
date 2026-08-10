@@ -6413,6 +6413,216 @@ mod tests {
     }
 
     #[test]
+    fn test_stream_yaml_sequence_block_style_mixed_container_and_scalar() {
+        // Companion to `test_stream_yaml_sequence_flow_style` above: that one
+        // covers the flow branch, this covers block style's two element
+        // kinds (nested container vs. plain scalar) in the same pass.
+        let bytes_a = b"a: 1\n".to_vec();
+        let index_a = YamlIndex::build(&bytes_a).unwrap();
+        let bytes_b = b"2\n".to_vec();
+        let index_b = YamlIndex::build(&bytes_b).unwrap();
+
+        let cursor_a = index_a.root(&bytes_a).first_child().unwrap();
+        let cursor_b = index_b.root(&bytes_b).first_child().unwrap();
+
+        let mut out = String::new();
+        stream_yaml_sequence([cursor_a, cursor_b], &mut out, 0, 2, ' ', false).unwrap();
+        assert_eq!(out, "-\n  a: 1\n- 2");
+    }
+
+    #[test]
+    fn test_stream_yaml_multi_document_identity_streams_as_block_sequence() {
+        // #746's `sort_keys`/`IndentSpec` threading touched
+        // `stream_yaml_document`'s multi-document fallback line even though
+        // its logic didn't change; exercise it directly rather than relying
+        // on the single-document unwrap every other `stream_yaml_document`
+        // test above takes.
+        let yaml = b"a: 1\n---\nb: 2\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let mut out = String::new();
+        index
+            .root(yaml)
+            .stream_yaml_document(&mut out, IndentSpec::spaces(2), false)
+            .unwrap();
+        assert_eq!(out, "-\n  a: 1\n-\n  b: 2");
+    }
+
+    #[test]
+    fn test_stream_yaml_flow_mapping_sorts_keys_with_nonstring_key() {
+        // `-S` with `IndentSpec::COMPACT` (forces flow style regardless of
+        // source style, since `indent.width == 0`) and a non-string key,
+        // covering `stream_yaml_value`'s flow-style `sort_keys` branch end
+        // to end.
+        //
+        // A plain scalar key like `2` is *not* a non-string key here:
+        // `YamlValue` has no `Int`/`Bool` variant at all (see its doc
+        // comment) -- every scalar, key or value, resolves to `String`
+        // (the `YamlString` sub-variant only distinguishes quote style),
+        // and type resolution happens later at render time. An explicit
+        // complex key (`? {a: 1}`) is genuinely outside the `String`
+        // variant, and `key_string()`'s documented fallback for it is `""`.
+        let yaml = b"k: hello\n? {a: 1}\n: v\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let mut out = String::new();
+        index
+            .root(yaml)
+            .stream_yaml_document(&mut out, IndentSpec::COMPACT, true)
+            .unwrap();
+        assert_eq!(out, "{\"\": v, k: hello}");
+    }
+
+    #[test]
+    fn test_stream_yaml_flow_mapping_unsorted_with_nonstring_key() {
+        // Same shape as above without `-S`: covers the flow style's
+        // unsorted-loop non-string-key branch, which the sorted-loop test
+        // above doesn't reach.
+        let yaml = b"k: hello\n? {a: 1}\n: v\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let mut out = String::new();
+        index
+            .root(yaml)
+            .stream_yaml_document(&mut out, IndentSpec::COMPACT, false)
+            .unwrap();
+        assert_eq!(out, "{k: hello, \"\": v}");
+    }
+
+    #[test]
+    fn test_stream_yaml_block_mapping_sorted_nested_and_nonstring_key() {
+        // `-S` on a block-style mapping with an explicit complex key (see
+        // the flow test above for why a plain scalar key doesn't exercise
+        // this) that sorts before its string-keyed sibling (`key_string()`'s
+        // `""` sorts first) and whose value is itself a nested non-empty
+        // mapping: covers the sorted block loop's non-string-key branch and
+        // its "nested container gets its own indented line" branch
+        // together.
+        let yaml = b"k: hello\n? {a: 1}\n:\n  y: 3\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let mut out = String::new();
+        index
+            .root(yaml)
+            .stream_yaml_document(&mut out, IndentSpec::spaces(2), true)
+            .unwrap();
+        assert_eq!(out, "\"\":\n  y: 3\nk: hello");
+    }
+
+    #[test]
+    fn test_stream_yaml_block_mapping_unsorted_nested_and_nonstring_key() {
+        // Same shape as above without `-S`: covers the unsorted block
+        // loop's non-string-key and nested-container branches, which the
+        // sorted-loop test above doesn't reach (it's a separate code path,
+        // not shared, since sorting needs to materialize into a `Vec` first).
+        let yaml = b"k: hello\n? {a: 1}\n:\n  y: 3\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let mut out = String::new();
+        index
+            .root(yaml)
+            .stream_yaml_document(&mut out, IndentSpec::spaces(2), false)
+            .unwrap();
+        assert_eq!(out, "k: hello\n\"\":\n  y: 3");
+    }
+
+    #[test]
+    fn test_stream_yaml_alias_streams_as_yaml() {
+        // `test_alias_resolves_wherever_the_anchor_is_in_scope` (below)
+        // exercises `stream_json_value`'s `Alias` arm exclusively (its
+        // cases assert JSON output); this covers the same resolution
+        // through `stream_yaml_value`'s own `Alias` arm, reached only via
+        // YAML-formatted output.
+        let yaml = b"a: &x 1\nb: *x\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let mut out = String::new();
+        index
+            .root(yaml)
+            .stream_yaml_document(&mut out, IndentSpec::spaces(2), false)
+            .unwrap();
+        assert_eq!(out, "a: 1\nb: 1");
+    }
+
+    #[test]
+    fn test_stream_json_pretty_sorts_keys_with_quoted_and_nonstring_keys() {
+        // `-S -o json` (pretty) on a *navigated* mapping cursor -- reached
+        // via `stream_json` (what the M2 fast path calls for `.field`/
+        // `.[0]`-style navigation results), not `stream_json_document`
+        // (identity's `.` path): that one unwraps a single document through
+        // the free function `stream_yaml_value_as_json` instead, never
+        // touching `stream_json_value`'s own copy of this sort/key logic.
+        //
+        // A quoted key ("z") exercises the direct-transcode `Ok(true)` arm;
+        // an explicit complex key (`? {a: 1}`) -- `YamlValue` has no
+        // `Int`/`Bool` variant, so a plain scalar key like `2` is still
+        // `String`, see
+        // `test_stream_yaml_flow_mapping_sorts_keys_with_nonstring_key` --
+        // exercises the non-string-key branch, together with the sorted
+        // loop's indentation.
+        let yaml = b"\"z\": 1\n? {a: 1}\n: 2\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let doc_cursor = index.root(yaml).first_child().unwrap();
+        let mut out = String::new();
+        doc_cursor
+            .stream_json(&mut out, IndentSpec::spaces(2), true)
+            .unwrap();
+        assert_eq!(out, "{\n  \"\": 2,\n  \"z\": 1\n}");
+    }
+
+    #[test]
+    fn test_stream_json_pretty_unsorted_with_quoted_and_nonstring_keys() {
+        // Same shape as above without `-S`: covers `stream_json_value`'s
+        // *unsorted* loop indentation, quoted-key, and non-string-key
+        // branches, which the sorted-loop test above doesn't reach (it's a
+        // separate code path, not shared).
+        let yaml = b"\"z\": 1\n? {a: 1}\n: 2\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let doc_cursor = index.root(yaml).first_child().unwrap();
+        let mut out = String::new();
+        doc_cursor
+            .stream_json(&mut out, IndentSpec::spaces(2), false)
+            .unwrap();
+        assert_eq!(out, "{\n  \"z\": 1,\n  \"\": 2\n}");
+    }
+
+    #[test]
+    fn test_stream_json_sequence_of_mappings_sorts_keys_with_quoted_and_nonstring_keys() {
+        // A mapping *nested inside a sequence* converts through the
+        // free-function `stream_yaml_value_as_json` (not the cursor-method
+        // `stream_json_value` the two tests above cover) --
+        // `stream_json_value`'s own `Sequence` arm delegates to it per
+        // element. Same key-shape coverage goal as those tests, plus a
+        // plain unquoted key ("k") that the two tests above don't need: it
+        // exercises this path's `Ok(false)`-then-`as_str`-success arm,
+        // distinct from the quoted key's direct-transcode `Ok(true)`.
+        let yaml = b"- \"z\": 1\n  k: 2\n  ? {a: 1}\n  : 3\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let mut out = String::new();
+        index
+            .root(yaml)
+            .stream_json_document(&mut out, IndentSpec::spaces(2), true)
+            .unwrap();
+        assert_eq!(
+            out,
+            "[\n  {\n    \"\": 3,\n    \"k\": 2,\n    \"z\": 1\n  }\n]"
+        );
+    }
+
+    #[test]
+    fn test_stream_json_sequence_of_mappings_unsorted_with_nonstring_key() {
+        // Same shape as above without `-S`: covers
+        // `stream_yaml_value_as_json`'s *unsorted* loop indentation,
+        // plain-key, and non-string-key branches, which the sorted-loop
+        // test above doesn't reach (it's a separate code path, not shared).
+        let yaml = b"- \"z\": 1\n  k: 2\n  ? {a: 1}\n  : 3\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let mut out = String::new();
+        index
+            .root(yaml)
+            .stream_json_document(&mut out, IndentSpec::spaces(2), false)
+            .unwrap();
+        assert_eq!(
+            out,
+            "[\n  {\n    \"z\": 1,\n    \"k\": 2,\n    \"\": 3\n  }\n]"
+        );
+    }
+
+    #[test]
     fn test_stream_yaml_quoted_scalars_stay_quoted() {
         // #175: quoted source scalars are genuine strings and must keep their
         // quoting style so they don't turn into numbers/booleans on re-parse.

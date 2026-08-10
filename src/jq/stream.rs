@@ -975,6 +975,94 @@ mod tests {
         assert!(result.is_err());
     }
 
+    // The `sort_keys` (`-S`) parameter was threaded through
+    // `stream_owned_value_json_with`/`stream_owned_value_yaml` in #746, but
+    // nothing exercised its actual sort branch: the M2 CLI fast path only
+    // ever reaches these `OwnedValue` streamers via `GenericResult::Owned`/
+    // `ManyOwned`/`One`/`Many`, and no existing test carried a
+    // multi-key object through one of those with `sort_keys: true`.
+    #[test]
+    fn test_stream_json_object_sorts_keys() {
+        let mut map = IndexMap::new();
+        map.insert("b".to_string(), OwnedValue::Int(1));
+        map.insert("a".to_string(), OwnedValue::Int(2));
+        let mut buf = String::new();
+        OwnedValue::Object(map)
+            .stream_json(&mut buf, IndentSpec::COMPACT, true)
+            .unwrap();
+        assert_eq!(buf, "{\"a\":2,\"b\":1}");
+    }
+
+    #[test]
+    fn test_stream_yaml_empty_object() {
+        let mut buf = String::new();
+        OwnedValue::Object(IndexMap::new())
+            .stream_yaml(&mut buf, IndentSpec::spaces(2), false)
+            .unwrap();
+        assert_eq!(buf, "{}");
+    }
+
+    #[test]
+    fn test_stream_yaml_array_flow_style_multiple_elements() {
+        let mut buf = String::new();
+        OwnedValue::Array(vec![OwnedValue::Int(1), OwnedValue::Int(2)])
+            .stream_yaml(&mut buf, IndentSpec::COMPACT, false)
+            .unwrap();
+        assert_eq!(buf, "[1, 2]");
+    }
+
+    #[test]
+    fn test_stream_yaml_array_block_style_nested_container() {
+        // Covers the "nested containers get their own indented line" branch,
+        // distinct from the plain-scalar-element branch `test_stream_array`-
+        // style tests already exercise.
+        let mut buf = String::new();
+        OwnedValue::Array(vec![
+            OwnedValue::Array(vec![OwnedValue::Int(1)]),
+            OwnedValue::Int(2),
+        ])
+        .stream_yaml(&mut buf, IndentSpec::spaces(2), false)
+        .unwrap();
+        assert_eq!(buf, "- \n  - 1\n- 2");
+    }
+
+    #[test]
+    fn test_stream_yaml_object_flow_style_sorts_keys() {
+        let mut map = IndexMap::new();
+        map.insert("b".to_string(), OwnedValue::Int(1));
+        map.insert("a".to_string(), OwnedValue::Int(2));
+        let mut buf = String::new();
+        OwnedValue::Object(map.clone())
+            .stream_yaml(&mut buf, IndentSpec::COMPACT, true)
+            .unwrap();
+        assert_eq!(buf, "{a: 2, b: 1}");
+
+        // `sort_keys: false` skips the `sort_by` call above but shares the
+        // rest of this function -- covers that branch too.
+        buf.clear();
+        OwnedValue::Object(map)
+            .stream_yaml(&mut buf, IndentSpec::COMPACT, false)
+            .unwrap();
+        assert_eq!(buf, "{b: 1, a: 2}");
+    }
+
+    #[test]
+    fn test_stream_yaml_object_block_style_sorts_keys_with_nested_and_scalar_values() {
+        // Sorts "b" before "a" out of insertion order, and covers both the
+        // nested-container-gets-its-own-line branch (key "a") and the
+        // plain-scalar-value branch (key "b") in the same pass.
+        let mut map = IndexMap::new();
+        map.insert("b".to_string(), OwnedValue::Int(1));
+        let mut nested = IndexMap::new();
+        nested.insert("x".to_string(), OwnedValue::Int(9));
+        map.insert("a".to_string(), OwnedValue::Object(nested));
+        let mut buf = String::new();
+        OwnedValue::Object(map)
+            .stream_yaml(&mut buf, IndentSpec::spaces(2), true)
+            .unwrap();
+        assert_eq!(buf, "a:\n  x: 9\nb: 1");
+    }
+
     #[test]
     fn test_is_falsy() {
         assert!(OwnedValue::Null.is_falsy());
