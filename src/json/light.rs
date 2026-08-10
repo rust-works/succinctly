@@ -1580,16 +1580,18 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for JsonCursor<'a, W> {
         &self,
         out: &mut Out,
         indent: IndentSpec,
-        _sort_keys: bool,
+        sort_keys: bool,
     ) -> core::fmt::Result {
         // Compact only: echo the raw bytes verbatim, since they're already
         // valid JSON. Indented (pretty) JSON->JSON streaming isn't
         // implemented here — callers fall back to the DOM path (#442 only
         // extended the YAML-target and YAML-cursor-to-JSON pretty paths).
-        // `sort_keys` is unused: `jq`'s own M2 gate (src/bin/succinctly/
-        // jq_runner.rs) excludes `-S` independently of this trait, so this
-        // is never reached with `sort_keys: true`.
-        if !indent.is_compact() {
+        // `sort_keys` isn't implemented here either: `jq`'s own M2 gate
+        // (src/bin/succinctly/jq_runner.rs) excludes `-S` independently of
+        // this trait, so this is never reached with `sort_keys: true` today.
+        // Guard it explicitly so a future gate relaxation fails safe (falls
+        // back to the DOM path) instead of silently emitting unsorted keys.
+        if !indent.is_compact() || sort_keys {
             return Err(core::fmt::Error);
         }
         if let Some(bytes) = self.raw_bytes() {
@@ -1606,10 +1608,16 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for JsonCursor<'a, W> {
         &self,
         out: &mut Out,
         indent: IndentSpec,
-        _sort_keys: bool,
+        sort_keys: bool,
     ) -> core::fmt::Result {
         // For JSON->YAML conversion, we need to format as YAML. `sort_keys`
-        // is unused for the same reason as `stream_json` above.
+        // (and `indent.unit`, e.g. `--tab`) aren't implemented here for the
+        // same reason as `stream_json` above; guard explicitly so a future
+        // caller fails safe instead of silently getting unsorted,
+        // always-space-indented output.
+        if sort_keys {
+            return Err(core::fmt::Error);
+        }
         stream_json_as_yaml(out, self.value(), 0, indent.width)
     }
 
@@ -2104,6 +2112,51 @@ mod tests {
         let index = JsonIndex::build(json);
         let root = index.root(json);
         assert_eq!(root.bp_position(), 0);
+    }
+
+    // #749: `JsonCursor::stream_json`/`stream_yaml` don't implement
+    // `sort_keys` (they echo raw bytes / delegate to `stream_json_as_yaml`,
+    // neither of which reorders keys). Both must error rather than silently
+    // emit unsorted output, so a caller falls back to the DOM path instead
+    // of getting wrong output with no error.
+    #[test]
+    fn test_stream_json_rejects_sort_keys() {
+        let json = br#"{"b": 1, "a": 2}"#;
+        let index = JsonIndex::build(json);
+        let root = index.root(json);
+
+        let mut out = String::new();
+        assert!(root
+            .stream_json(&mut out, IndentSpec::COMPACT, true)
+            .is_err());
+
+        // sort_keys: false on the same input still takes the normal path.
+        out.clear();
+        assert!(root
+            .stream_json(&mut out, IndentSpec::COMPACT, false)
+            .is_ok());
+        assert_eq!(out, r#"{"b": 1, "a": 2}"#);
+    }
+
+    #[test]
+    fn test_stream_yaml_rejects_sort_keys() {
+        let json = br#"{"b": 1, "a": 2}"#;
+        let index = JsonIndex::build(json);
+        let root = index.root(json);
+
+        let mut out = String::new();
+        assert!(root
+            .stream_yaml(&mut out, IndentSpec::COMPACT, true)
+            .is_err());
+
+        // sort_keys: false on the same input still takes the normal path
+        // (exact formatting of JSON->YAML conversion is covered elsewhere;
+        // this just confirms the new guard doesn't reject the false case).
+        out.clear();
+        assert!(root
+            .stream_yaml(&mut out, IndentSpec::COMPACT, false)
+            .is_ok());
+        assert!(!out.is_empty());
     }
 
     #[test]
