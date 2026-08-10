@@ -23759,6 +23759,18 @@ mod tests {
     }
 
     #[test]
+    fn test_trunc() {
+        // Truncation toward zero — distinct from floor at negative values,
+        // where floor(-2.7) == -3 but trunc(-2.7) == -2.
+        query!(b"2.7", "trunc", QueryResult::Owned(OwnedValue::Int(n)) => {
+            assert_eq!(n, 2);
+        });
+        query!(b"-2.7", "trunc", QueryResult::Owned(OwnedValue::Int(n)) => {
+            assert_eq!(n, -2);
+        });
+    }
+
+    #[test]
     fn test_sqrt() {
         query!(b"9", "sqrt", QueryResult::Owned(OwnedValue::Float(n)) => {
             assert!((n - 3.0).abs() < f64::EPSILON);
