@@ -1,0 +1,6 @@
+a:
+  thing: one
+  cat: frog
+b:
+  missing: two
+  thing: two

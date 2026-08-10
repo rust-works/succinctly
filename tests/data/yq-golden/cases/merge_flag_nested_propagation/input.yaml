@@ -1,0 +1,8 @@
+a:
+  inner:
+    thing: one
+    cat: frog
+b:
+  inner:
+    missing: two
+    thing: two

@@ -1,0 +1,5 @@
+a:
+  thing: [1, 2]
+b:
+  thing: [3, 4]
+  another: [1]

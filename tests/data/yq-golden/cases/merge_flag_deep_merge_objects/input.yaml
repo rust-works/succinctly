@@ -1,0 +1,8 @@
+a:
+  - name: fred
+    age: 12
+  - name: bob
+    age: 32
+b:
+  - name: fred
+    age: 34
