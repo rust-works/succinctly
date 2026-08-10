@@ -14922,20 +14922,23 @@ fn builtin_load<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 let root = index.root(&file_bytes);
                 // YAML documents are wrapped in a sequence at the root
                 match root.value() {
-                    crate::yaml::YamlValue::Sequence(docs) => {
+                    crate::yaml::YamlValue::Sequence(mut docs) => {
                         // If single document, return it directly; otherwise return array
-                        let doc_values: Vec<OwnedValue> =
-                            docs.into_iter().map(|v| yaml_value_to_owned(v)).collect();
+                        let mut doc_values = Vec::new();
+                        while let Some((doc_cursor, rest)) = docs.uncons_cursor() {
+                            doc_values.push(yaml_value_to_owned(doc_cursor));
+                            docs = rest;
+                        }
                         if doc_values.len() == 1 {
                             QueryResult::Owned(doc_values.into_iter().next().unwrap())
                         } else {
                             QueryResult::Owned(OwnedValue::Array(doc_values))
                         }
                     }
-                    other => {
-                        // Single value at root
-                        QueryResult::Owned(yaml_value_to_owned(other))
-                    }
+                    // Documents are always wrapped in a virtual root sequence,
+                    // so this is defensive; `root` itself is this single
+                    // document's cursor either way.
+                    _ => QueryResult::Owned(yaml_value_to_owned(root)),
                 }
             }
             Err(_) if optional => QueryResult::None,
@@ -14946,38 +14949,61 @@ fn builtin_load<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     }
 }
 
-/// Convert a YAML value to OwnedValue (helper for load)
+/// Convert a YAML value to OwnedValue (helper for `load`).
+///
+/// Takes a cursor rather than a bare `YamlValue`: an explicit tag (`!!str`,
+/// `!!int`, …) lives on the cursor's `bp_pos` (`YamlCursor::explicit_tag`),
+/// not on the extracted value, and forces resolution regardless of quoting
+/// style — mirrors `yq_runner.rs`'s `yaml_to_owned_value` (#224).
 #[cfg(feature = "std")]
 fn yaml_value_to_owned<W: Clone + AsRef<[u64]>>(
-    value: crate::yaml::YamlValue<'_, W>,
+    cursor: crate::yaml::YamlCursor<'_, W>,
 ) -> OwnedValue {
-    use crate::yaml::{resolve_plain, ResolvedScalar, YamlValue};
+    use crate::yaml::{resolve_plain, resolve_tagged, ResolvedScalar, YamlValue};
 
-    match value {
+    // Convert an already-resolved scalar to `OwnedValue`. `str_value` is the
+    // original source text, used only for the `Str` case. Mirrors
+    // `yq_runner.rs`'s `resolved_scalar_to_owned`, which can't be shared
+    // directly since that lives in the CLI binary, not this library crate.
+    fn resolved_scalar_to_owned(resolved: ResolvedScalar, str_value: Cow<'_, str>) -> OwnedValue {
+        match resolved {
+            ResolvedScalar::Null => OwnedValue::Null,
+            ResolvedScalar::Bool(b) => OwnedValue::Bool(b),
+            ResolvedScalar::Int(n) => OwnedValue::Int(n),
+            ResolvedScalar::Float(f) => OwnedValue::Float(f),
+            ResolvedScalar::Str => OwnedValue::String(str_value.into_owned()),
+        }
+    }
+
+    match cursor.value() {
         YamlValue::Null => OwnedValue::Null,
         YamlValue::String(s) => {
             // Get the string value
             let str_value = match s.as_str() {
-                Ok(cow) => cow.into_owned(),
+                Ok(cow) => cow,
                 Err(_) => return OwnedValue::Null,
             };
 
+            if let Some(explicit) = cursor.explicit_tag() {
+                if let Some(resolved) = resolve_tagged(&str_value, explicit) {
+                    return resolved_scalar_to_owned(resolved, str_value);
+                }
+            }
+
             // Quoted strings are kept as strings
             if !s.is_unquoted() {
-                return OwnedValue::String(str_value);
+                return OwnedValue::String(str_value.into_owned());
             }
 
             // Resolve plain scalars per the YAML 1.2 core schema
-            match resolve_plain(&str_value) {
-                ResolvedScalar::Null => OwnedValue::Null,
-                ResolvedScalar::Bool(b) => OwnedValue::Bool(b),
-                ResolvedScalar::Int(n) => OwnedValue::Int(n),
-                ResolvedScalar::Float(f) => OwnedValue::Float(f),
-                ResolvedScalar::Str => OwnedValue::String(str_value),
-            }
+            resolved_scalar_to_owned(resolve_plain(&str_value), str_value)
         }
-        YamlValue::Sequence(elements) => {
-            let items: Vec<OwnedValue> = elements.into_iter().map(yaml_value_to_owned).collect();
+        YamlValue::Sequence(mut elements) => {
+            let mut items = Vec::new();
+            while let Some((elem_cursor, rest)) = elements.uncons_cursor() {
+                items.push(yaml_value_to_owned(elem_cursor));
+                elements = rest;
+            }
             OwnedValue::Array(items)
         }
         YamlValue::Mapping(fields) => {
@@ -14988,13 +15014,13 @@ fn yaml_value_to_owned<W: Clone + AsRef<[u64]>>(
                         Ok(cow) => cow.into_owned(),
                         Err(_) => continue,
                     },
-                    other => {
+                    _ => {
                         // Non-string keys - convert to string representation
-                        let v = yaml_value_to_owned(other);
+                        let v = yaml_value_to_owned(field.key_cursor());
                         v.to_json()
                     }
                 };
-                let value = yaml_value_to_owned(field.value());
+                let value = yaml_value_to_owned(field.value_cursor());
                 map.insert(key, value);
             }
             OwnedValue::Object(map)
@@ -15002,7 +15028,7 @@ fn yaml_value_to_owned<W: Clone + AsRef<[u64]>>(
         YamlValue::Alias { target, .. } => {
             // Resolve alias by following the target cursor
             if let Some(target_cursor) = target {
-                yaml_value_to_owned(target_cursor.value())
+                yaml_value_to_owned(target_cursor)
             } else {
                 OwnedValue::Null
             }
@@ -29077,6 +29103,162 @@ mod tests {
                     other => panic!("unexpected result: {other:?}"),
                 }
             });
+        }
+
+        // ========== #224: explicit tag resolution in yaml_value_to_owned ==========
+
+        #[test]
+        fn test_load_yaml_explicit_tag_resolution() {
+            // An explicit core-schema tag forces the resolved type regardless of
+            // what the quoting/plain-scalar shape would otherwise imply: `!!null
+            // "~"` and `!!bool "yes"` are quoted (so unquoted plain-scalar
+            // resolution never runs), and `!!str 1` is unquoted (so plain-scalar
+            // resolution would otherwise produce a number) - the tag wins in
+            // every case.
+            // `12.5` rather than `3.14`: clippy's `approx_constant` lint flags
+            // float literals close to well-known math constants like PI.
+            // `f: !custom "5"` isn't one of the 5 core-schema tags, so
+            // `resolve_tagged` returns `None` and the code must fall through
+            // past the tag check to the quoted-string-preservation check
+            // below it, staying a string rather than resolving.
+            let yaml = "a: !!null \"~\"\n\
+                        b: !!bool \"yes\"\n\
+                        c: !!int \"42\"\n\
+                        d: !!float \"12.5\"\n\
+                        e: !!str 1\n\
+                        f: !custom \"5\"\n";
+            with_temp_file("load_test_explicit_tags.yaml", yaml, |path| {
+                let json_bytes: &[u8] = b"null";
+                let index = JsonIndex::build(json_bytes);
+                let cursor = index.root(json_bytes);
+                let query = format!(r#"load("{path}")"#);
+                let expr = parse(&query).unwrap();
+                match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+                    QueryResult::Owned(OwnedValue::Object(obj)) => {
+                        assert_eq!(obj.get("a"), Some(&OwnedValue::Null));
+                        assert_eq!(obj.get("b"), Some(&OwnedValue::Bool(true)));
+                        assert_eq!(obj.get("c"), Some(&OwnedValue::Int(42)));
+                        assert_eq!(obj.get("d"), Some(&OwnedValue::Float(12.5)));
+                        assert_eq!(obj.get("e"), Some(&OwnedValue::String("1".to_string())));
+                        assert_eq!(obj.get("f"), Some(&OwnedValue::String("5".to_string())));
+                    }
+                    other => panic!("unexpected result: {other:?}"),
+                }
+            });
+        }
+
+        #[test]
+        fn test_load_yaml_quoted_string_not_coerced_without_tag() {
+            // Without an explicit tag, a quoted scalar is kept as a string even
+            // though its content looks numeric - only an untagged *plain*
+            // scalar goes through resolve_plain's type inference.
+            with_temp_file(
+                "load_test_quoted_no_tag.yaml",
+                "quoted: \"42\"\nplain: 42\n",
+                |path| {
+                    let json_bytes: &[u8] = b"null";
+                    let index = JsonIndex::build(json_bytes);
+                    let cursor = index.root(json_bytes);
+                    let query = format!(r#"load("{path}")"#);
+                    let expr = parse(&query).unwrap();
+                    match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+                        QueryResult::Owned(OwnedValue::Object(obj)) => {
+                            assert_eq!(
+                                obj.get("quoted"),
+                                Some(&OwnedValue::String("42".to_string()))
+                            );
+                            assert_eq!(obj.get("plain"), Some(&OwnedValue::Int(42)));
+                        }
+                        other => panic!("unexpected result: {other:?}"),
+                    }
+                },
+            );
+        }
+
+        #[test]
+        fn test_load_yaml_non_string_mapping_key() {
+            // A non-scalar (sequence) explicit key falls through the
+            // `YamlValue::String` arm of the key match and is instead converted
+            // recursively via yaml_value_to_owned(...).to_json() - so the
+            // resulting object key is the compact JSON rendering of the key,
+            // `[1,2]` (no spaces; see OwnedValue::to_json's Array case).
+            //
+            // Uses a block-sequence explicit key (`? - 1` / `  - 2`) rather
+            // than a flow-sequence key (`? [1, 2]`): `parse_explicit_key`'s `[`/`{`
+            // arms wrap `parse_flow_sequence`/`parse_flow_mapping` in an extra,
+            // untyped `write_bp_open`/`write_bp_close` pair even though those
+            // callees already open and close their own container node, so a
+            // flow-sequence explicit key currently decodes as a sequence
+            // wrapping the real sequence (`[[1,2]]`) instead of the key itself.
+            // That double-wrap predates this PR (`a7384db6`, explicit-key
+            // support) and is unrelated to tag resolution, so it's left alone
+            // here - reported separately rather than fixed as a drive-by.
+            with_temp_file(
+                "load_test_complex_key.yaml",
+                "? - 1\n  - 2\n: value\n",
+                |path| {
+                    let json_bytes: &[u8] = b"null";
+                    let index = JsonIndex::build(json_bytes);
+                    let cursor = index.root(json_bytes);
+                    let query = format!(r#"load("{path}")"#);
+                    let expr = parse(&query).unwrap();
+                    match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+                        QueryResult::Owned(OwnedValue::Object(obj)) => {
+                            assert_eq!(obj.len(), 1);
+                            assert_eq!(
+                                obj.get("[1,2]"),
+                                Some(&OwnedValue::String("value".to_string()))
+                            );
+                        }
+                        other => panic!("unexpected result: {other:?}"),
+                    }
+                },
+            );
+        }
+
+        #[test]
+        fn test_load_yaml_alias_resolution() {
+            with_temp_file("load_test_alias.yaml", "a: &x hello\nb: *x\n", |path| {
+                let json_bytes: &[u8] = b"null";
+                let index = JsonIndex::build(json_bytes);
+                let cursor = index.root(json_bytes);
+                let query = format!(r#"load("{path}")"#);
+                let expr = parse(&query).unwrap();
+                match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+                    QueryResult::Owned(OwnedValue::Object(obj)) => {
+                        assert_eq!(obj.get("a"), Some(&OwnedValue::String("hello".to_string())));
+                        assert_eq!(obj.get("b"), Some(&OwnedValue::String("hello".to_string())));
+                    }
+                    other => panic!("unexpected result: {other:?}"),
+                }
+            });
+        }
+
+        #[test]
+        fn test_load_yaml_alias_preserves_tag_on_anchored_node() {
+            // yaml_value_to_owned's Alias arm recurses on the *target cursor*
+            // (`yaml_value_to_owned(target_cursor)`), not a bare value, so a tag
+            // sitting on the anchored node survives the alias hop - matching
+            // yq_runner.rs's yaml_to_owned_value and
+            // tests/yq_cli_tests.rs::test_yaml_anchored_tag_in_seq_item_resolves.
+            with_temp_file(
+                "load_test_alias_tag.yaml",
+                "a: &x !!int \"5\"\nb: *x\n",
+                |path| {
+                    let json_bytes: &[u8] = b"null";
+                    let index = JsonIndex::build(json_bytes);
+                    let cursor = index.root(json_bytes);
+                    let query = format!(r#"load("{path}")"#);
+                    let expr = parse(&query).unwrap();
+                    match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+                        QueryResult::Owned(OwnedValue::Object(obj)) => {
+                            assert_eq!(obj.get("a"), Some(&OwnedValue::Int(5)));
+                            assert_eq!(obj.get("b"), Some(&OwnedValue::Int(5)));
+                        }
+                        other => panic!("unexpected result: {other:?}"),
+                    }
+                },
+            );
         }
     }
 

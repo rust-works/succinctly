@@ -563,6 +563,10 @@ fn generate_anchors(target_size: usize, seed: Option<u64>) -> String {
             yaml.push_str(&format!("  policy: &{}\n", long(group)));
             yaml.push_str("    enabled: true\n");
             yaml.push_str(&format!("    weight: {}\n", group % 10));
+            // A tagged scalar (#224): forces a number-shaped value to stay a
+            // string, the realistic reason `!!str` shows up in hand-written
+            // YAML (a zone/version code that must not be parsed as a number).
+            yaml.push_str(&format!("  zone: !!str {group}\n"));
             // Anchored scalars as sequence items
             yaml.push_str("  shared:\n");
             yaml.push_str(&format!("    - &s{group} shared-value-{group}\n"));

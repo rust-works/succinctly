@@ -24,7 +24,7 @@ use std::string::ToString;
 
 use super::index::YamlIndex;
 use super::line_break::{is_line_break, line_break_len, line_break_len_before};
-use super::scalar::{could_be_null_or_bool, resolve_plain, ResolvedScalar};
+use super::scalar::{could_be_null_or_bool, resolve_plain, resolve_tagged, ResolvedScalar};
 use super::{starts_inline_seq_entry, starts_seq_entry};
 use crate::util::simd::escape::find_json_escape;
 
@@ -203,15 +203,15 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
             return self.parse_alias_value(text_pos);
         }
 
-        // Check for anchor - if present, skip past it to get the actual value
-        // Anchors look like: &anchor_name value
-        let effective_text_pos = if byte == b'&' {
-            self.skip_anchor_and_whitespace(text_pos)
+        // Check for a property (anchor and/or tag) - if present, skip past it
+        // to get the actual value. Anchors look like: &anchor_name value
+        let effective_text_pos = if matches!(byte, b'&' | b'!') {
+            self.skip_properties_and_whitespace(text_pos)
         } else {
             text_pos
         };
 
-        // If we're past the end after skipping anchor, this is an anchored null
+        // If we're past the end after skipping the property, this is a null
         if effective_text_pos >= self.text.len() {
             return YamlValue::Null;
         }
@@ -363,31 +363,50 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
         }
     }
 
-    /// Skip past an anchor definition and any following whitespace.
+    /// Skip past a leading `&anchor` and/or `!tag` (either order, each at
+    /// most once) and any following whitespace.
     ///
     /// Anchor syntax: `&name` where name can contain alphanumerics, underscores,
     /// hyphens, and colons.
     ///
-    /// Returns the position of the first non-whitespace character after the anchor,
-    /// or the end of text if nothing follows.
-    fn skip_anchor_and_whitespace(&self, start: usize) -> usize {
-        // Skip the '&'
-        let mut pos = start + 1;
-
-        // Skip anchor name characters (per YAML spec, anchors can contain
-        // alphanumerics, underscores, hyphens, and also colons in some contexts)
-        while pos < self.text.len() {
-            match self.text[pos] {
-                b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'-' | b':' => pos += 1,
+    /// A key's or value's BP node can be opened *before* its property is
+    /// consumed (`record_key_tag`/`record_key_anchor`'s `bp_pos - 1`
+    /// convention in `parser.rs`), so the node's recorded text span still
+    /// starts at the property text — this is where that gets stripped away
+    /// at decode time. `parser.rs`'s `parse_node_properties` is the
+    /// parse-time analogue for nodes whose BP opens *after* property
+    /// consumption (#224 generalized this from anchor-only).
+    ///
+    /// Returns the position of the first non-whitespace character after the
+    /// last property, or the end of text if nothing follows.
+    fn skip_properties_and_whitespace(&self, start: usize) -> usize {
+        let mut pos = start;
+        loop {
+            match self.text.get(pos) {
+                Some(b'&') => {
+                    pos += 1;
+                    // Anchor name characters (per YAML spec, anchors can
+                    // contain alphanumerics, underscores, hyphens, and also
+                    // colons in some contexts).
+                    while pos < self.text.len() {
+                        match self.text[pos] {
+                            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'-' | b':' => {
+                                pos += 1;
+                            }
+                            _ => break,
+                        }
+                    }
+                }
+                Some(b'!') => {
+                    let (end, _) = super::parser::scan_tag_extent(self.text, pos);
+                    pos = end;
+                }
                 _ => break,
             }
+            while pos < self.text.len() && matches!(self.text[pos], b' ' | b'\t') {
+                pos += 1;
+            }
         }
-
-        // Skip whitespace after anchor name
-        while pos < self.text.len() && (self.text[pos] == b' ' || self.text[pos] == b'\t') {
-            pos += 1;
-        }
-
         pos
     }
 
@@ -1095,11 +1114,13 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
         // Check if this is the root document array with a single document
         if self.bp_pos == 0 {
             if let YamlValue::Sequence(elements) = self.value() {
-                let mut iter = elements.into_iter();
-                if let Some(first) = iter.next() {
-                    if iter.next().is_none() {
-                        // Single document - output it directly without array wrapper
-                        write_yaml_value_as_json(&mut output, first);
+                if let Some((first_cursor, rest)) = elements.uncons_cursor() {
+                    if rest.uncons_cursor().is_none() {
+                        // Single document - output it directly without array
+                        // wrapper. Via the cursor, not the extracted
+                        // `YamlValue`: the document's own tag lives on its
+                        // cursor's `bp_pos` (#224).
+                        first_cursor.write_json_to(&mut output);
                         return output;
                     }
                 }
@@ -1153,11 +1174,13 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
         // Check if this is the root document array with a single document
         if self.bp_pos == 0 {
             if let YamlValue::Sequence(elements) = self.value() {
-                let mut iter = elements.into_iter();
-                if let Some(first) = iter.next() {
-                    if iter.next().is_none() {
-                        // Single document - output it directly without array wrapper
-                        return stream_yaml_value_as_json(out, first, 0, indent_spaces);
+                if let Some((first_cursor, rest)) = elements.uncons_cursor() {
+                    if rest.uncons_cursor().is_none() {
+                        // Single document - output it directly without array
+                        // wrapper. Via the cursor, not the extracted
+                        // `YamlValue`: the document's own tag lives on its
+                        // cursor's `bp_pos` (#224).
+                        return first_cursor.stream_json_value(out, 0, indent_spaces);
                     }
                 }
             }
@@ -1215,7 +1238,18 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
     ) -> core::fmt::Result {
         match self.value() {
             YamlValue::Null => out.write_str("null"),
-            YamlValue::String(s) => stream_yaml_string_value(out, &s),
+            YamlValue::String(s) => {
+                // YAML output (unlike JSON) has tag syntax, so an explicit
+                // tag is preserved verbatim rather than dropped - matching
+                // real `yq`, which re-emits `!!str 1`/`!!int "5"`/`!custom v`
+                // as-is rather than only letting the tag affect resolution
+                // (#224).
+                if let Some(tag) = self.explicit_tag() {
+                    out.write_str(tag)?;
+                    out.write_char(' ')?;
+                }
+                stream_yaml_string_value(out, &s)
+            }
             YamlValue::Mapping(fields) => {
                 if fields.is_empty() {
                     return out.write_str("{}");
@@ -1231,6 +1265,10 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                         first = false;
                         // Write key
                         if let YamlValue::String(s) = field.key() {
+                            if let Some(tag) = field.key_cursor().explicit_tag() {
+                                out.write_str(tag)?;
+                                out.write_char(' ')?;
+                            }
                             stream_yaml_string_value(out, &s)?;
                         } else {
                             stream_yaml_nonstring_key(out, &field.key())?;
@@ -1250,6 +1288,10 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                         first = false;
                         // Write key
                         if let YamlValue::String(s) = field.key() {
+                            if let Some(tag) = field.key_cursor().explicit_tag() {
+                                out.write_str(tag)?;
+                                out.write_char(' ')?;
+                            }
                             stream_yaml_string_value(out, &s)?;
                         } else {
                             stream_yaml_nonstring_key(out, &field.key())?;
@@ -1355,6 +1397,18 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
         match self.value() {
             YamlValue::Null => out.write_str("null"),
             YamlValue::String(s) => {
+                // An explicit core-schema tag (`!!str`, `!!int`, …) forces
+                // resolution regardless of quoting style - `!!int "5"` is the
+                // number 5, not the string "5" - so it's checked before the
+                // direct transcoding optimization below, which otherwise
+                // always treats a quoted/block scalar as a string (#224).
+                if let Some(explicit) = self.explicit_tag() {
+                    if let Ok(str_val) = s.as_str() {
+                        if let Some(resolved) = resolve_tagged(&str_val, explicit) {
+                            return stream_resolved_scalar_as_json(out, resolved, &str_val);
+                        }
+                    }
+                }
                 // Direct transcoding optimization
                 match stream_yaml_string_to_json(out, &s) {
                     Ok(true) => Ok(()), // Written directly as JSON string
@@ -1427,16 +1481,21 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                 out.write_char('[')?;
                 let next_indent = current_indent + indent_spaces;
                 let mut first = true;
-                for elem in elements {
+                let mut rest = elements;
+                while let Some((cursor, next)) = rest.uncons_cursor() {
                     if !first {
                         out.write_char(',')?;
                     }
                     first = false;
+                    rest = next;
                     if indent_spaces > 0 {
                         out.write_char('\n')?;
                         write_yaml_indent(out, next_indent)?;
                     }
-                    stream_yaml_value_as_json(out, elem, next_indent, indent_spaces)?;
+                    // Recurse via the cursor, not the extracted `YamlValue`:
+                    // an element's own tag lives on its cursor's `bp_pos`,
+                    // which a bare `YamlValue` has already lost (#224).
+                    cursor.stream_json_value(out, next_indent, indent_spaces)?;
                 }
                 if indent_spaces > 0 {
                     out.write_char('\n')?;
@@ -1460,6 +1519,16 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
         match self.value() {
             YamlValue::Null => output.push_str("null"),
             YamlValue::String(s) => {
+                // An explicit core-schema tag forces resolution regardless of
+                // quoting style - see the mirrored check in `stream_json_value` (#224).
+                if let Some(explicit) = self.explicit_tag() {
+                    if let Ok(str_val) = s.as_str() {
+                        if let Some(resolved) = resolve_tagged(&str_val, explicit) {
+                            write_resolved_scalar_as_json(output, resolved, &str_val);
+                            return;
+                        }
+                    }
+                }
                 // Direct transcoding optimization (avoids intermediate allocation for quoted strings)
                 match write_yaml_string_to_json(output, &s) {
                     Ok(true) => {} // Written directly as JSON string
@@ -1517,14 +1586,19 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
             YamlValue::Sequence(elements) => {
                 output.push('[');
                 let mut first = true;
-                for elem in elements {
+                let mut rest = elements;
+                while let Some((cursor, next)) = rest.uncons_cursor() {
                     if !first {
                         output.push(',');
                     }
                     first = false;
+                    rest = next;
 
-                    // For sequences, we get YamlValue not cursor, so need to handle inline
-                    write_yaml_value_as_json(output, elem);
+                    // Recurse via the cursor, not `write_yaml_value_as_json`
+                    // on the extracted `YamlValue`: an element's own tag
+                    // lives on its cursor's `bp_pos`, which a bare
+                    // `YamlValue` has already lost (#224).
+                    cursor.write_json_to(output);
                 }
                 output.push(']');
             }
@@ -1560,6 +1634,25 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
     #[inline]
     pub fn anchor(&self) -> Option<&str> {
         self.index.get_anchor_name(self.bp_pos)
+    }
+
+    /// Get the explicit YAML tag written on this node in the source
+    /// (`"!!str"`, `"!custom"`, `"!<tag:example.com,2000:foo>"`, …).
+    ///
+    /// Returns `None` if the node has no explicit tag. Distinct from
+    /// [`Self::tag`], which returns an *inferred* type label derived from the
+    /// value's shape rather than the source text, and never reflects an
+    /// explicit tag even when one is present (#224).
+    ///
+    /// # Example
+    /// ```ignore
+    /// let yaml = b"a: !!str 1";
+    /// let index = YamlIndex::build(yaml).unwrap();
+    /// // Navigate to the value and call .explicit_tag() to get Some("!!str")
+    /// ```
+    #[inline]
+    pub fn explicit_tag(&self) -> Option<&str> {
+        self.index.get_tag(self.bp_pos)
     }
 
     /// Get the anchor name that this alias references.
@@ -1721,9 +1814,9 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
             return "";
         }
 
-        // Skip anchor if present
-        let effective_pos = if self.text[text_pos] == b'&' {
-            self.skip_anchor_and_whitespace(text_pos)
+        // Skip a leading property (anchor and/or tag) if present
+        let effective_pos = if matches!(self.text[text_pos], b'&' | b'!') {
+            self.skip_properties_and_whitespace(text_pos)
         } else {
             text_pos
         };
@@ -1753,13 +1846,29 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
     /// - `"!!seq"` for sequences (arrays)
     /// - `"!!map"` for mappings (objects)
     ///
-    /// Note: This returns inferred tags. Explicit tags in the YAML source
-    /// (like `!mytag`) are not currently preserved.
+    /// Note: This is the tag of the node's *resolved* value, not necessarily
+    /// its literal source text. One of the 5 core-schema tags (`!!str`,
+    /// `!!null`, `!!bool`, `!!int`, `!!float`) written explicitly in the
+    /// source forces that resolution (`!!str 1` returns `"!!str"`, not the
+    /// `"!!int"` the bare content would infer); any other explicit tag (a
+    /// custom tag, `!!seq`, `!!map`, …) does not change it, and this falls
+    /// through to inferring from the content instead. Use
+    /// [`Self::explicit_tag`] for the literal source-level tag text, which is
+    /// `None` unless one was actually written (#224).
     pub fn tag(&self) -> &'static str {
         match self.value() {
             YamlValue::Null => "!!null",
             YamlValue::String(s) => {
-                // Infer type from plain scalars per the YAML 1.2 core schema
+                if let Some(explicit) = self.explicit_tag() {
+                    if let Ok(str_val) = s.as_str() {
+                        if let Some(resolved) = resolve_tagged(&str_val, explicit) {
+                            return resolved.tag();
+                        }
+                    }
+                }
+                // No explicit tag, or not one of the 5 core-schema tags -
+                // infer type from plain scalars per the YAML 1.2 core
+                // schema; quoted/block scalars are always strings.
                 if s.is_unquoted() {
                     if let Ok(str_val) = s.as_str() {
                         return resolve_plain(&str_val).tag();
@@ -1889,7 +1998,16 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
     }
 }
 
-/// Write a YAML value as JSON (for sequence elements where we don't have a cursor).
+/// Write a YAML value as JSON from a bare `YamlValue` with no cursor of its
+/// own — e.g. one already extracted via `YamlElements::uncons`/`get`.
+///
+/// No production call site reaches this anymore (#224): every real path
+/// recurses via a cursor instead (`YamlElements::uncons_cursor` +
+/// `YamlCursor::write_json_to`), since a node's own tag lives on its
+/// `bp_pos`, which a bare `YamlValue` has already lost. Kept as the
+/// value-only half of `test_sequence_element_accessors_agree`, which asserts
+/// `uncons`/`get`/`uncons_cursor` all produce identical JSON (#332).
+#[allow(dead_code)] // STYLE-0005: used in tests
 fn write_yaml_value_as_json<W: AsRef<[u64]>>(output: &mut String, value: YamlValue<'_, W>) {
     match value {
         YamlValue::Null => output.push_str("null"),
@@ -1949,12 +2067,17 @@ fn write_yaml_value_as_json<W: AsRef<[u64]>>(output: &mut String, value: YamlVal
         YamlValue::Sequence(elements) => {
             output.push('[');
             let mut first = true;
-            for elem in elements {
+            let mut rest = elements;
+            while let Some((cursor, next)) = rest.uncons_cursor() {
                 if !first {
                     output.push(',');
                 }
                 first = false;
-                write_yaml_value_as_json(output, elem);
+                rest = next;
+                // A child element does have a cursor even though this
+                // function's own top-level `value` doesn't - use it so a
+                // nested element's tag isn't lost either.
+                cursor.write_json_to(output);
             }
             output.push(']');
         }
@@ -2478,7 +2601,15 @@ fn write_f64(output: &mut String, f: f64) {
 /// source text (hex/octal like `0x2A` must appear as `42` in JSON).
 #[inline]
 fn write_yaml_scalar_as_json(output: &mut String, str_val: &str) {
-    match resolve_plain(str_val) {
+    write_resolved_scalar_as_json(output, resolve_plain(str_val), str_val);
+}
+
+/// Write an already-resolved scalar as JSON. `str_val` is the original
+/// source text, used only for the `Str` case (and only if `resolved` didn't
+/// come from resolving it, e.g. tag-forced `!!str` on non-string content).
+#[inline]
+fn write_resolved_scalar_as_json(output: &mut String, resolved: ResolvedScalar, str_val: &str) {
+    match resolved {
         ResolvedScalar::Null => output.push_str("null"),
         ResolvedScalar::Bool(true) => output.push_str("true"),
         ResolvedScalar::Bool(false) => output.push_str("false"),
@@ -2493,112 +2624,6 @@ fn write_yaml_scalar_as_json(output: &mut String, str_val: &str) {
 // ============================================================================
 // Streaming JSON Output (core::fmt::Write based)
 // ============================================================================
-
-/// Stream a YAML value as JSON (for sequence elements where we don't have a cursor).
-fn stream_yaml_value_as_json<W: AsRef<[u64]>, Out: core::fmt::Write>(
-    out: &mut Out,
-    value: YamlValue<'_, W>,
-    current_indent: usize,
-    indent_spaces: usize,
-) -> core::fmt::Result {
-    match value {
-        YamlValue::Null => out.write_str("null"),
-        YamlValue::String(s) => match stream_yaml_string_to_json(out, &s) {
-            Ok(true) => Ok(()),
-            Ok(false) => {
-                if let Ok(str_val) = s.as_str() {
-                    if s.is_unquoted() {
-                        // Plain scalar - resolve per the core schema
-                        stream_yaml_scalar_as_json(out, &str_val)
-                    } else {
-                        // Block scalars are always strings
-                        stream_json_string(out, &str_val)
-                    }
-                } else {
-                    out.write_str("null")
-                }
-            }
-            Err(_) => out.write_str("null"),
-        },
-        YamlValue::Mapping(fields) => {
-            if fields.is_empty() {
-                return out.write_str("{}");
-            }
-            out.write_char('{')?;
-            let next_indent = current_indent + indent_spaces;
-            let mut first = true;
-            for field in fields {
-                if !first {
-                    out.write_char(',')?;
-                }
-                first = false;
-                if indent_spaces > 0 {
-                    out.write_char('\n')?;
-                    write_yaml_indent(out, next_indent)?;
-                }
-
-                if let YamlValue::String(s) = field.key() {
-                    match stream_yaml_string_to_json(out, &s) {
-                        Ok(true) => {}
-                        Ok(false) | Err(_) => {
-                            if let Ok(key_str) = s.as_str() {
-                                stream_json_string(out, &key_str)?;
-                            } else {
-                                out.write_str("\"\"")?;
-                            }
-                        }
-                    }
-                } else {
-                    // Alias/complex key (#222): resolve alias-to-scalar,
-                    // else "" — the entry is kept, never dropped
-                    stream_json_string(out, &field.key().key_string())?;
-                }
-
-                out.write_str(if indent_spaces > 0 { ": " } else { ":" })?;
-                field
-                    .value_cursor()
-                    .stream_json_value(out, next_indent, indent_spaces)?;
-            }
-            if indent_spaces > 0 {
-                out.write_char('\n')?;
-                write_yaml_indent(out, current_indent)?;
-            }
-            out.write_char('}')
-        }
-        YamlValue::Sequence(elements) => {
-            if elements.is_empty() {
-                return out.write_str("[]");
-            }
-            out.write_char('[')?;
-            let next_indent = current_indent + indent_spaces;
-            let mut first = true;
-            for elem in elements {
-                if !first {
-                    out.write_char(',')?;
-                }
-                first = false;
-                if indent_spaces > 0 {
-                    out.write_char('\n')?;
-                    write_yaml_indent(out, next_indent)?;
-                }
-                stream_yaml_value_as_json(out, elem, next_indent, indent_spaces)?;
-            }
-            if indent_spaces > 0 {
-                out.write_char('\n')?;
-                write_yaml_indent(out, current_indent)?;
-            }
-            out.write_char(']')
-        }
-        YamlValue::Alias { target, .. } => {
-            if let Some(target_cursor) = target {
-                target_cursor.stream_json_value(out, current_indent, indent_spaces)
-            } else {
-                out.write_str("null")
-            }
-        }
-        YamlValue::Error(_) => out.write_str("null"),
-    }
-}
 
 /// Stream a string with JSON escaping.
 fn stream_json_string<Out: core::fmt::Write>(out: &mut Out, s: &str) -> core::fmt::Result {
@@ -3021,7 +3046,18 @@ fn stream_yaml_scalar_as_json<Out: core::fmt::Write>(
     out: &mut Out,
     str_val: &str,
 ) -> core::fmt::Result {
-    match resolve_plain(str_val) {
+    stream_resolved_scalar_as_json(out, resolve_plain(str_val), str_val)
+}
+
+/// Stream an already-resolved scalar as JSON. `str_val` is the original
+/// source text, used only for the `Str` case (and only if `resolved` didn't
+/// come from resolving it, e.g. tag-forced `!!str` on non-string content).
+fn stream_resolved_scalar_as_json<Out: core::fmt::Write>(
+    out: &mut Out,
+    resolved: ResolvedScalar,
+    str_val: &str,
+) -> core::fmt::Result {
+    match resolved {
         ResolvedScalar::Null => out.write_str("null"),
         ResolvedScalar::Bool(true) => out.write_str("true"),
         ResolvedScalar::Bool(false) => out.write_str("false"),
@@ -4884,16 +4920,24 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
         // A value is falsy if it's null or false
         match self.value() {
             YamlValue::Null => true,
-            YamlValue::String(s) if s.is_unquoted() => {
-                if let Ok(str_val) = s.as_str() {
-                    could_be_null_or_bool(&str_val)
-                        && matches!(
-                            resolve_plain(&str_val),
+            YamlValue::String(s) => {
+                let Ok(str_val) = s.as_str() else {
+                    return false;
+                };
+                if let Some(explicit) = self.explicit_tag() {
+                    if let Some(resolved) = resolve_tagged(&str_val, explicit) {
+                        return matches!(
+                            resolved,
                             ResolvedScalar::Null | ResolvedScalar::Bool(false)
-                        )
-                } else {
-                    false
+                        );
+                    }
                 }
+                s.is_unquoted()
+                    && could_be_null_or_bool(&str_val)
+                    && matches!(
+                        resolve_plain(&str_val),
+                        ResolvedScalar::Null | ResolvedScalar::Bool(false)
+                    )
             }
             _ => false,
         }
@@ -4929,6 +4973,22 @@ impl<'a, W: AsRef<[u64]>> YamlValue<'a, W> {
     }
 }
 
+// KNOWN LIMITATION (#224, tracked as #747): the typed getters below
+// (`is_null`, `as_bool`, `as_i64`, `as_f64`, `type_name`) are not tag-aware,
+// unlike every JSON output path (`write_json_to`/`stream_json_value`) and the
+// CLI's `yaml_to_owned_value`. A bare `YamlValue` has no `bp_pos` to look an
+// explicit tag up with — only a `YamlCursor` does (`explicit_tag()`) — and
+// `crate::jq::eval_generic::to_owned`, the generic evaluator's lazy
+// materializer backing `select`, `==`, arithmetic, and `type` on the
+// cursor-evaluator path, calls these directly on a `DocumentValue` with no
+// cursor in scope. So `echo 'a: !!str 1' | succinctly yq '.a | type'` says
+// `"number"`, not `"string"` — while `succinctly yq '.'`'s JSON output for
+// the same input is correct. Fixing this needs either threading a cursor
+// through `to_owned`'s recursion (it can: `DocumentField::value_cursor` and
+// `DocumentElements::uncons_cursor` already exist) or embedding the tag in
+// `YamlValue::String` itself, which fans out to ~90 pattern-match sites
+// across 6 files. Scoped out of #224 as a follow-up rather than risking an
+// under-tested change to a evaluator shared with JSON this late.
 impl<'a, W: AsRef<[u64]> + Clone> DocumentValue for YamlValue<'a, W> {
     type Cursor = YamlCursor<'a, W>;
     type Fields = YamlFields<'a, W>;
@@ -8522,6 +8582,53 @@ mod tests {
     }
 
     #[test]
+    fn test_style_value_with_anchor_and_tag_is_unaffected() {
+        // A value cursor's `text_position()` already resolves past any
+        // leading `&anchor`/`!tag` property, so `style()` reports the
+        // underlying scalar's/container's own style regardless of what
+        // precedes it (#224).
+        for (name, yaml, expected) in [
+            ("anchor only", &b"key: &a \"quoted\"\n"[..], "double"),
+            ("tag only", &b"key: !!str \"quoted\"\n"[..], "double"),
+            (
+                "anchor then tag",
+                &b"key: &a !!str \"quoted\"\n"[..],
+                "double",
+            ),
+            ("anchor on flow mapping", &b"key: &a {a: 1}\n"[..], "flow"),
+        ] {
+            let index = YamlIndex::build(yaml).unwrap();
+            let root = index.root(yaml);
+            if let YamlValue::Mapping(fields) = first_doc(root) {
+                if let Some(field) = fields.into_iter().next() {
+                    let cursor = field.value_cursor();
+                    assert_eq!(cursor.style(), expected, "{name}");
+                    continue;
+                }
+            }
+            panic!("Could not find value for {name}");
+        }
+    }
+
+    #[test]
+    fn test_style_tagged_flow_key_skips_the_property_prefix() {
+        // Unlike value cursors, a *key* cursor's `text_position()` points
+        // straight at a leading `!tag` rather than past it - `style()` must
+        // call `skip_properties_and_whitespace` itself to find the key's
+        // actual quoting style (#224).
+        let yaml = b"{!!str \"k\": v}\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let root = index.root(yaml);
+        if let YamlValue::Mapping(fields) = first_doc(root) {
+            if let Some(field) = fields.into_iter().next() {
+                assert_eq!(field.key_cursor().style(), "double");
+                return;
+            }
+        }
+        panic!("Could not find field");
+    }
+
+    #[test]
     fn test_tag_string() {
         let yaml = b"key: hello";
         let index = YamlIndex::build(yaml).unwrap();
@@ -8637,6 +8744,58 @@ mod tests {
         assert_eq!(value_tag(b"key: .5"), "!!float");
     }
 
+    /// `test_tag_string`/`_int`/`_bool`/`_null`/`_float`/`_core_schema_resolution`
+    /// above all use untagged plain scalars, so none of them exercise the
+    /// `explicit_tag()` branch inside `tag()` - only its plain-scalar
+    /// fallback. An explicit core-schema tag forces that resolution
+    /// regardless of the content's own shape or quoting; a non-core-schema
+    /// tag does not, and falls through to the same plain-scalar inference
+    /// instead (#224).
+    #[test]
+    fn test_tag_explicit_core_schema_tag_forces_resolution() {
+        assert_eq!(value_tag(b"key: !!str 1"), "!!str");
+        assert_eq!(value_tag(b"key: !!int \"5\""), "!!int");
+        // A custom tag doesn't change tag(); "v" is plain, so it still infers
+        // !!str from resolve_plain.
+        assert_eq!(value_tag(b"key: !custom v"), "!!str");
+    }
+
+    /// `is_falsy` (the `DocumentCursor` trait method backing `select`,
+    /// `if/then/else`, and `//`) must honor an explicit tag's resolution, not
+    /// the scalar's own quoting - a quoted non-empty string is ordinarily
+    /// truthy, but `!!bool "false"` and `!!null "~"` are both falsy because
+    /// the tag forces that resolution (#224).
+    #[test]
+    fn test_is_falsy_uses_the_resolved_tagged_value() {
+        for (name, yaml, expect_falsy) in [
+            (
+                "tagged bool false, quoted",
+                &b"a: !!bool \"false\"\n"[..],
+                true,
+            ),
+            ("tagged null, quoted", &b"a: !!null \"~\"\n"[..], true),
+            (
+                "tagged bool true, quoted",
+                &b"a: !!bool \"true\"\n"[..],
+                false,
+            ),
+            // Sanity check: the same quoted content, untagged, is truthy -
+            // the behavior the tagged cases above must diverge from.
+            ("untagged quoted false", &b"a: \"false\"\n"[..], false),
+        ] {
+            let index = YamlIndex::build(yaml).unwrap();
+            let root = index.root(yaml);
+            if let YamlValue::Mapping(fields) = first_doc(root) {
+                if let Some(field) = fields.into_iter().next() {
+                    let cursor = field.value_cursor();
+                    assert_eq!(cursor.is_falsy(), expect_falsy, "{name}");
+                    continue;
+                }
+            }
+            panic!("Could not find value for {name}");
+        }
+    }
+
     /// Returns `to_json` for a document (exercises the buffer transcoder).
     /// The root wraps documents in an implicit sequence, hence `[...]`.
     #[track_caller]
@@ -8669,6 +8828,29 @@ mod tests {
         assert_eq!(doc_json(b"a: |-\n  true\n"), r#"[{"a":"true"}]"#);
         assert_eq!(doc_json(b"a: |-\n  null\n"), r#"[{"a":"null"}]"#);
         assert_eq!(doc_json(b"a: >-\n  42\n"), r#"[{"a":"42"}]"#);
+    }
+
+    /// A tag that isn't one of the 5 core-schema tags (`!custom`) makes
+    /// `resolve_tagged` return `None`, so both JSON emitters must fall
+    /// through to ordinary scalar transcoding rather than resolving -
+    /// exercised on both the buffered (`to_json`/`write_json_to`) and
+    /// streaming (`stream_json`/`stream_json_value`) paths (#224).
+    #[test]
+    fn test_custom_tag_falls_through_to_plain_transcoding() {
+        let yaml = b"a: !custom hello\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let root = index.root(yaml);
+        if let YamlValue::Mapping(fields) = first_doc(root) {
+            if let Some(field) = fields.into_iter().next() {
+                let cursor = field.value_cursor();
+                assert_eq!(cursor.to_json(), "\"hello\"");
+                let mut streamed = String::new();
+                cursor.stream_json(&mut streamed, 0).expect("streams");
+                assert_eq!(streamed, "\"hello\"");
+                return;
+            }
+        }
+        panic!("Could not find value");
     }
 
     #[test]
@@ -9480,6 +9662,20 @@ mod tests {
             b"a:\n  -\n  - y\n  - k: v\n",
             b"[\n  - x,\n  y\n]\n",
             b"- &a x\n- *a\n",
+            // A quoted string element: hits `write_yaml_value_as_json`'s
+            // direct-transcode-succeeds fast path for a quoted *value*
+            // (#224).
+            b"- \"q\"\n- y\n",
+            // A mapping element with a quoted key: same fast path, for a
+            // quoted *key* this time.
+            b"- \"k\": v\n",
+            // A mapping element whose key is an alias (not a `YamlValue::String`):
+            // the non-string-key fallback branch (resolves via `key_string()`).
+            b"- &a x\n- *a: v\n",
+            // A nested sequence with 2+ items as a top-level element: hits
+            // the comma-insertion branch for the second+ item of a *nested*
+            // sequence.
+            b"- - a\n  - b\n- y\n",
         ];
         for yaml in inputs {
             let index = YamlIndex::build(yaml).expect("builds");
@@ -9557,6 +9753,32 @@ mod tests {
                 "round-trip changed {what}"
             );
         }
+    }
+
+    /// Flow-style sibling of `tests/yq_cli_tests.rs`'s
+    /// `test_yaml_default_output_preserves_the_literal_tag`, which only
+    /// covers the block-style key case (`!!str key: value`). A flow
+    /// mapping's key has its own, separate
+    /// `field.key_cursor().explicit_tag()` check in `stream_yaml_value`'s
+    /// `indent_spaces == 0` arm - reached only by flow-style output, which
+    /// the CLI's default YAML output never produces (`-I0` is remapped to
+    /// `-I2` for YAML, matching real `yq`), so this calls `stream_yaml`
+    /// directly instead of going through the CLI (#224).
+    #[test]
+    fn test_stream_yaml_flow_mapping_preserves_tagged_key() {
+        let yaml = b"a: {!!str k: v}\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let root = index.root(yaml);
+        if let YamlValue::Mapping(fields) = first_doc(root) {
+            if let Some(field) = fields.into_iter().next() {
+                let cursor = field.value_cursor();
+                let mut out = String::new();
+                cursor.stream_yaml(&mut out, 0).expect("streams");
+                assert_eq!(out, "{!!str k: v}");
+                return;
+            }
+        }
+        panic!("Could not find value");
     }
 
     /// Helper: render a `YamlValue` as JSON, matching `to_json`'s output.

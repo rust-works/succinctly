@@ -113,6 +113,8 @@ pub struct SemiIndex {
     pub anchors: BTreeMap<String, usize>,
     /// Alias references: BP position of alias → target BP position (resolved at parse time)
     pub aliases: BTreeMap<usize, usize>,
+    /// Explicit source tags: BP position → raw tag text (see [`YamlIndex::get_tag`](super::index::YamlIndex::get_tag))
+    pub tags: BTreeMap<usize, String>,
 }
 
 /// Maximum nesting depth for recursively-parsed constructs (flow collections
@@ -168,6 +170,8 @@ struct Parser<'a, const HAS_CR: bool> {
     anchors: BTreeMap<String, usize>,
     /// Aliases collected during parsing: bp_pos → target bp_pos (resolved at parse time)
     aliases: BTreeMap<usize, usize>,
+    /// Explicit source tags collected during parsing: bp_pos → raw tag text
+    tags: BTreeMap<usize, String>,
 
     // Document tracking
     /// Whether we're currently inside a document
@@ -249,6 +253,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             current_type: None,
             anchors: BTreeMap::new(),
             aliases: BTreeMap::new(),
+            tags: BTreeMap::new(),
             in_document: false,
             document_start_bp_pos: 0,
             pending_explicit_key: None,
@@ -901,20 +906,40 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         false
     }
 
-    /// Check whether an anchor at the current position prefixes a mapping entry
-    /// rather than the anchored node itself, as in `&a k: v`. In that shape the
-    /// anchor binds to the *key*, so the caller must leave it for the mapping
-    /// parser instead of consuming it (see `parse_mapping_entry`, which records
-    /// the key's own BP position).
+    /// Check whether the node property/properties (`&anchor`, `!tag`, or both,
+    /// in either order) at the current position prefix a mapping entry rather
+    /// than the node itself, as in `&a k: v` or `!!str k: v`. In that shape
+    /// the property binds to the *key*, so the caller must leave it for the
+    /// mapping parser instead of consuming it (see `parse_mapping_entry`,
+    /// which records the key's own BP position) — generalizes what was
+    /// `anchor_prefixes_mapping_entry` (anchor-only) before #224 gave tags
+    /// the same "prefixes a key" ambiguity anchors already had.
     ///
-    /// Assumes `self.peek() == Some(b'&')`. Restores `self.pos` before returning.
-    fn anchor_prefixes_mapping_entry(&mut self) -> bool {
+    /// Assumes `self.peek()` is `Some(b'&')` or `Some(b'!')`. Restores
+    /// `self.pos` before returning.
+    fn node_properties_prefix_mapping_entry(&mut self) -> bool {
         let saved_pos = self.pos;
-        // Skip `&` and the anchor name. Deliberately uses the scanner rather
-        // than `parse_anchor_name`, which errors on an empty name and would turn
-        // this speculative lookahead into a hard parse failure on `- & x: y`.
-        self.pos = super::simd::parse_anchor_name(self.input, self.pos + 1);
-        self.skip_inline_whitespace();
+        loop {
+            match self.peek() {
+                Some(b'&') => {
+                    // Skip `&` and the anchor name. Deliberately uses the
+                    // scanner rather than `parse_anchor_name`, which errors on
+                    // an empty name and would turn this speculative lookahead
+                    // into a hard parse failure on `- & x: y`.
+                    self.pos = super::simd::parse_anchor_name(self.input, self.pos + 1);
+                    self.skip_inline_whitespace();
+                }
+                Some(b'!') => {
+                    // Permissive twin of `parse_tag`, for the same reason:
+                    // a malformed tag must not turn this speculative
+                    // lookahead into a hard parse failure.
+                    let (end, _) = scan_tag_extent(self.input, self.pos);
+                    self.pos = end;
+                    self.skip_inline_whitespace();
+                }
+                _ => break,
+            }
+        }
         // `looks_like_mapping_entry` does not stop at `#`, so a trailing comment
         // containing `: ` would otherwise read as a mapping entry.
         let result = !self.at_line_end() && self.looks_like_mapping_entry();
@@ -958,33 +983,6 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 break;
             }
         }
-    }
-
-    /// Check for unsupported YAML features (Phase 4: anchors and aliases now supported).
-    fn check_unsupported(&self) -> Result<(), YamlError> {
-        if let Some(b) = self.peek() {
-            match b {
-                // Flow style is supported in Phase 2+
-                b'{' | b'[' => {
-                    // Allowed - will be parsed by parse_flow_*
-                }
-                // Block scalars are supported in Phase 3+
-                b'|' | b'>' => {
-                    // Allowed - will be parsed by parse_block_scalar()
-                }
-                // Anchors and aliases are supported in Phase 4+
-                b'&' | b'*' => {
-                    // Allowed - will be parsed by parse_anchor() or parse_alias()
-                }
-                // Explicit keys (`?`) are now supported
-                b'?' => {}
-                b'!' => {
-                    return Err(YamlError::TagNotSupported { offset: self.pos });
-                }
-                _ => {}
-            }
-        }
-        Ok(())
     }
 
     /// Check if we're at a document start marker (`---`).
@@ -1069,10 +1067,14 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         // materialized. Calling `parse_block_scalar` directly keeps `--- |` on
         // the path it has always taken.
         //
-        // A tag is the other asymmetry, and deliberately left alone here:
-        // `check_unsupported` runs in `parse_document_line` but not on this
-        // path, so `--- !!str x` indexes as a scalar where a bare `!!str x` is
-        // rejected. That is #224's to settle, not this dispatch's.
+        // A tag is resolved the same way an anchor already is here: this
+        // dispatch has no arm of its own for either, so `--- !!str x` (like
+        // `--- &a x`) falls through to `parse_block_node(0)`, whose combined
+        // `&`/`!` arm consumes it before dispatching the value (#224). That
+        // also means a tag immediately before `|`/`>` on this line
+        // (`--- !!str |`) takes the same generic-scalar path an anchor in
+        // that position already does, rather than this function's dedicated
+        // block-scalar arm — parity with the anchor case, not a new gap.
         if matches!(self.peek(), Some(b'|' | b'>')) {
             return self.parse_block_scalar(0);
         }
@@ -1731,19 +1733,22 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         self.advance(); // -
         self.skip_inline_whitespace();
 
-        self.check_unsupported()?;
-
-        // An anchor prefixes the item's value, so consume it here — before the
-        // dispatch below, which would otherwise test its predicates against the
-        // `&name` instead of the value and mis-classify the item (#328).
+        // A node property (`&anchor` and/or `!tag`, either order) prefixes the
+        // item's value, so consume it here — before the dispatch below, which
+        // would otherwise test its predicates against the property text
+        // instead of the value and mis-classify the item (#328; tags follow
+        // the same rule, #224).
         //
-        // The exception is `- &a k: v`, where the anchor binds to the *key* of
-        // the compact mapping (matching yq); that shape is left for
-        // parse_compact_mapping_entry to record.
-        let anchored_item = self.peek() == Some(b'&') && !self.anchor_prefixes_mapping_entry();
-        if anchored_item {
-            self.parse_anchor()?;
-        }
+        // The exception is `- &a k: v` / `- !!str k: v`, where the property
+        // binds to the *key* of the compact mapping (matching yq); that shape
+        // is left for parse_compact_mapping_entry to record.
+        let prefixed_item = matches!(self.peek(), Some(b'&' | b'!'))
+            && !self.node_properties_prefix_mapping_entry();
+        let had_property = if prefixed_item {
+            self.parse_node_properties()?
+        } else {
+            false
+        };
 
         // Track the sequence item on the stack so close_deeper_indents can close it.
         // We use indent + 1 as a virtual indent - any content at indent > indent
@@ -1756,12 +1761,16 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
 
         // Check what follows
         if self.at_line_end() {
-            // An anchor records the *next* BP position as its target, so an
-            // anchored item whose value turns out to be null needs an explicit
-            // empty node to point at — otherwise the anchor would land on a
-            // sibling's open, or on a close bit. parse_mapping_entry does the
-            // same for `key: &a` with no value.
-            if anchored_item && self.following_value_is_null(indent) {
+            // An anchor records the *next* BP position as its target, and a
+            // tag is looked up *at* that position (`self.tags`), so a
+            // property-prefixed item whose value turns out to be null needs
+            // an explicit empty node for either to resolve against —
+            // otherwise the anchor/tag would land on a sibling's open, on a
+            // close bit, or (for a tag) nowhere at all, silently dropping it
+            // (corpus case LE5A: `- !!str` with nothing after must resolve
+            // to `""`, not `null` — #224). parse_mapping_entry does the same
+            // for `key: &a` / `key: !!str` with no value.
+            if had_property && self.following_value_is_null(indent) {
                 self.set_ib();
                 self.write_bp_open();
                 self.write_bp_close();
@@ -1870,10 +1879,9 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         // Open key node
         self.write_bp_open();
 
-        // Check for anchor on key (`- &a k: v`) - record it pointing to this key
-        if self.peek() == Some(b'&') {
-            self.record_key_anchor()?;
-        }
+        // Check for a property on the key (`- &a k: v` / `- !!str k: v`) -
+        // record it pointing to this key.
+        self.record_key_properties()?;
 
         // Parse the key
         let key_end = match self.peek() {
@@ -1921,12 +1929,9 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         // `  b: 1` was always right. This was the last one that did not.
         //
         // `- k: &a 1` also never registered the anchor before this, so a later
-        // `*a` resolved to nothing (#372).
+        // `*a` resolved to nothing (#372). Tags follow the same rule (#224).
         if !self.at_line_end() {
-            self.check_unsupported()?;
-            if self.peek() == Some(b'&') {
-                self.parse_anchor()?;
-            }
+            self.parse_node_properties()?;
         }
 
         // Parse value
@@ -1970,7 +1975,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             // placeholder is conditional. `test_every_anchor_targets_an_open_bit`
             // is the whole-corpus guard on that.
         } else {
-            // Inline value (`check_unsupported` ran above)
+            // Inline value (`parse_node_properties` ran above)
             match self.peek() {
                 Some(b'*') => {
                     // `parse_alias` opens and closes its own node. `- k: *a` never
@@ -2048,10 +2053,8 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         // Open key node
         self.write_bp_open();
 
-        // Check for anchor on key - record it pointing to this key BP
-        if self.peek() == Some(b'&') {
-            self.record_key_anchor()?;
-        }
+        // Check for a property on the key - record it pointing to this key BP
+        self.record_key_properties()?;
 
         // Parse the key - check for empty key first (colon at start)
         let key_end = if self.peek() == Some(b':') {
@@ -2196,8 +2199,13 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                     self.pos = saved_pos;
                     return Ok(());
                 }
-                Some(b'&' | b'*') => {
-                    // Anchor or alias on its own line - will be handled by main loop
+                Some(b'&' | b'*' | b'!') => {
+                    // Anchor, alias, or tag on its own line - will be handled
+                    // by main loop (parse_block_node, which calls
+                    // parse_node_properties). Without `!` here a tagged
+                    // deferred value fell to the `_` catch-all below and was
+                    // parsed inline instead, bypassing property consumption
+                    // (#224, #664 root cause 3).
                     self.pos = saved_pos;
                     return Ok(());
                 }
@@ -2234,14 +2242,9 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         }
 
         {
-            self.check_unsupported()?;
-
-            // Check for anchor first - it prefixes the actual value
-            let anchor_name = if self.peek() == Some(b'&') {
-                Some(self.parse_anchor()?)
-            } else {
-                None
-            };
+            // Consume any leading `&anchor` and/or `!tag` - they prefix the
+            // actual value.
+            self.parse_node_properties()?;
 
             // After anchor, check if value continues on next line
             if self.at_line_end() {
@@ -2351,9 +2354,6 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                     self.write_bp_close();
                 }
             }
-
-            // Suppress unused warning for anchor_name
-            let _ = anchor_name;
         }
 
         Ok(())
@@ -2392,11 +2392,8 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         // Skip whitespace/comments after `?`
         self.skip_inline_whitespace();
 
-        // Check for anchor before key
-        if self.peek() == Some(b'&') {
-            let _ = self.parse_anchor()?;
-            self.skip_inline_whitespace();
-        }
+        // Check for a property before the key
+        self.parse_node_properties()?;
 
         // Check what the key is
         if self.at_line_end() {
@@ -2592,22 +2589,20 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         // Skip whitespace after `:`
         self.skip_inline_whitespace();
 
-        // Check for anchor
-        let anchored_value = self.peek() == Some(b'&');
-        if anchored_value {
-            let _ = self.parse_anchor()?;
-            self.skip_inline_whitespace();
-        }
+        // Check for a property (anchor and/or tag)
+        let had_property = self.parse_node_properties()?;
 
         // Check if value is on this line or next
         if self.at_line_end() {
-            // An anchor on a value that turns out to be null needs an explicit
-            // node to point at, or it dangles on whatever BP bit comes next -
-            // a close, or the open of an unrelated node. `? e` / `: &a` then
-            // `z: *a` resolved the alias to the *key* `z`, and inside a
-            // sequence the anchor landed on the alias's own open and tripped a
-            // spurious cycle rejection.
-            if anchored_value && self.following_value_is_null(indent) {
+            // A property on a value that turns out to be null needs an
+            // explicit node to resolve against, or it dangles on whatever BP
+            // bit comes next - a close, or the open of an unrelated node.
+            // `? e` / `: &a` then `z: *a` resolved the alias to the *key*
+            // `z`, and inside a sequence the anchor landed on the alias's
+            // own open and tripped a spurious cycle rejection. A tag with
+            // nothing after it (`? e` / `: !!str`) needs the same treatment
+            // so it resolves to `""` rather than being dropped (#224).
+            if had_property && self.following_value_is_null(indent) {
                 self.set_ib();
                 self.write_bp_open();
                 self.write_bp_close();
@@ -2695,13 +2690,11 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
 
     /// Parse a value (could be scalar or nested structure).
     fn parse_value(&mut self, min_indent: usize) -> Result<(), YamlError> {
-        self.check_unsupported()?;
-
-        // Check for anchor first - it prefixes the actual value
-        if self.peek() == Some(b'&') {
-            self.parse_anchor()?;
-            // Now parse the actual value that follows
-        }
+        // Check for a property first - it prefixes the actual value. Callers
+        // that already consumed one (e.g. parse_sequence_item_inner) leave
+        // nothing here, so this is a no-op re-check rather than a second
+        // consumption.
+        self.parse_node_properties()?;
 
         // Check for alias - this IS the value (no value follows)
         if self.peek() == Some(b'*') {
@@ -3152,12 +3145,11 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 // keys. This is an implicit single-pair mapping: [ key : value ]
                 self.parse_implicit_flow_mapping_entry()?;
             } else {
-                // Not a key:value pair - an anchor or alias here prefixes a
-                // standalone value instead (`[&x a, *x]`), so it's consumed
-                // only now that the pair check has ruled that out.
-                if self.peek() == Some(b'&') {
-                    self.parse_anchor()?;
-                }
+                // Not a key:value pair - a property (anchor and/or tag) or an
+                // alias here prefixes a standalone value instead
+                // (`[&x a, *x]`, `[!!str a]`), so it's consumed only now that
+                // the pair check has ruled that out.
+                self.parse_flow_node_properties()?;
                 if self.peek() == Some(b'*') {
                     self.parse_alias()?;
                 } else {
@@ -3273,13 +3265,9 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 self.advance(); // Skip `:`
                 self.skip_flow_whitespace();
 
-                // Parse value - check for anchor or alias first
-                // Check for anchor prefix on value
-                let _anchor_name = if self.peek() == Some(b'&') {
-                    Some(self.parse_anchor()?)
-                } else {
-                    None
-                };
+                // Parse value - check for a property or alias first
+                // Check for a property prefix on the value
+                self.parse_flow_node_properties()?;
 
                 // Check for alias (standalone value)
                 if self.peek() == Some(b'*') {
@@ -3348,12 +3336,18 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     /// The caller must **not** record an end position in that case — see
     /// [`Self::set_bp_text_end`].
     fn parse_flow_key(&mut self) -> Result<bool, YamlError> {
-        // Check for anchor on key. The caller already opened the key's BP node,
-        // so this records `bp_pos - 1`; using `parse_anchor` here bound the
-        // anchor to the key's close bit, and aliases to it resolved to the
-        // *value* instead of the key (corpus case CN3R).
-        if self.peek() == Some(b'&') {
-            self.record_key_anchor()?;
+        // Check for a property (anchor and/or tag, either order) on the key.
+        // The caller already opened the key's BP node, so this records
+        // `bp_pos - 1`; using `parse_anchor` here bound the anchor to the
+        // key's close bit, and aliases to it resolved to the *value* instead
+        // of the key (corpus case CN3R). Tags follow the same convention
+        // (#224).
+        loop {
+            match self.peek() {
+                Some(b'&') => self.record_key_anchor()?,
+                Some(b'!') => self.record_key_tag()?,
+                _ => break,
+            }
             self.skip_flow_whitespace();
         }
 
@@ -3397,13 +3391,14 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     /// Stops at `:`, `,`, `}`, `]`, or whitespace before those.
     /// Handles multiline keys (continues across newlines with proper indentation).
     fn parse_flow_unquoted_key(&mut self) -> Result<usize, YamlError> {
-        // #369: reject a tag at the start of a flow key. `parse_flow_key` is
-        // the only caller, from two call sites (the flow-mapping key and,
-        // since #409, the flow-sequence implicit-entry key); it dispatches
-        // anchors, aliases and nested containers first and lands here with
-        // `pos` at the key's first byte, so this one gate covers the whole
-        // plain-key path from both sites.
-        self.check_unsupported()?;
+        // #224 (was #369's reject-only gate): consume a tag at the start of a
+        // flow key. `parse_flow_key` is the only caller, from two call sites
+        // (the flow-mapping key and, since #409, the flow-sequence
+        // implicit-entry key); it already loops over `&`/`!` and lands here
+        // with `pos` at the key's first byte, so this is a no-op re-check in
+        // practice — kept so this function stays self-sufficient the way
+        // `parse_flow_scalar` and `parse_explicit_flow_unquoted_key` are.
+        self.record_flow_tag()?;
 
         let start = self.pos;
 
@@ -3500,13 +3495,18 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
 
     /// Parse a scalar value in flow context (string or unquoted).
     fn parse_flow_scalar(&mut self) -> Result<usize, YamlError> {
-        // #369: reject a tag at the start of a flow node, the way block context
-        // always has. Without this the `_` arm below reads `!!str x` as plain
-        // scalar *content*, silently yielding the string "!!str x". `pos` is at
-        // a node start here — anchors, aliases and nested containers are all
-        // dispatched by the caller before this point — so a leading `!` is an
-        // indicator, while a `!` inside content is never seen by this check.
-        self.check_unsupported()?;
+        // #224 (was #369's reject-only gate): consume a tag at the start of a
+        // flow node, the way block context does. Without this the `_` arm
+        // below reads `!!str x` as plain scalar *content*, yielding the
+        // string "!!str x" instead of resolving the tag. `pos` is at a node
+        // start here — anchors, aliases and nested containers are all
+        // dispatched by the caller before this point, though not on every
+        // path (some callers, like the flow-sequence `[k: v]` shorthand's
+        // value, don't strip an anchor first) — so this stays self-sufficient
+        // rather than assuming the caller always did it, the same reason
+        // `record_key_tag` exists alongside `parse_node_properties`. A `!`
+        // inside content is never seen by this check.
+        self.record_flow_tag()?;
 
         let end = match self.peek() {
             Some(b'"') => {
@@ -3608,9 +3608,12 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     /// #402; `test_yaml_flow_explicit_key_colon_before_a_flow_indicator_is_content` is
     /// the only guard, since FRK4 is a parses-only corpus case.
     fn parse_explicit_flow_unquoted_key(&mut self) -> Result<usize, YamlError> {
-        // #369: the `? key : value` form in flow context is a fourth way to
-        // reach a plain scalar at node start.
-        self.check_unsupported()?;
+        // #224 (was #369's reject-only gate): the `? key : value` form in flow
+        // context is a fourth way to reach a plain scalar at node start.
+        // `parse_explicit_flow_key_node` dispatches here with nothing
+        // stripped first (it has no anchor/tag handling of its own), so this
+        // is where a leading tag genuinely gets consumed for this form.
+        self.record_flow_tag()?;
 
         let start = self.pos;
 
@@ -4083,6 +4086,150 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         Ok(())
     }
 
+    // =========================================================================
+    // Tag parsing (#224)
+    // =========================================================================
+
+    /// Parse a tag (`!`, `!!suffix`, `!suffix`, `!handle!suffix`, or
+    /// `!<verbatim>`) at the current position, returning its raw text
+    /// (including the leading `!`/`!!`/`!<...>`).
+    ///
+    /// Does not record it anywhere or skip trailing whitespace — callers
+    /// combine this with anchor handling and decide the right `bp_pos`
+    /// convention (see [`Self::parse_node_properties`] and
+    /// [`Self::record_key_tag`]), the same split `parse_anchor_name` has from
+    /// `parse_anchor`/`record_key_anchor`.
+    fn parse_tag(&mut self) -> Result<String, YamlError> {
+        let start = self.pos;
+        let (end, ok) = scan_tag_extent(self.input, start);
+        if !ok {
+            return Err(YamlError::InvalidTag {
+                offset: start,
+                reason: "unterminated verbatim tag (missing closing '>')",
+            });
+        }
+        self.pos = end;
+        core::str::from_utf8(&self.input[start..end])
+            .map(str::to_string)
+            .map_err(|_| YamlError::InvalidUtf8 { offset: start })
+    }
+
+    /// Consume any combination of a leading `&anchor` and/or `!tag` before a
+    /// node not yet opened, in either order (YAML 1.2's node properties,
+    /// `c-ns-properties`), skipping whitespace after each. Anchors are
+    /// recorded via [`Self::parse_anchor`] as before; the tag, if present, is
+    /// recorded into `self.tags` at the current `self.bp_pos` — the position
+    /// the node that follows will occupy once opened, the same assumption
+    /// `parse_anchor` alone already made.
+    ///
+    /// Returns whether any property was present. Some callers need that to
+    /// synthesize an empty node for an otherwise-null value: an anchor
+    /// records the *next* BP position as its target, and a tag is looked up
+    /// *at* that position (`self.tags`), so either would otherwise land on a
+    /// sibling's open, on a close bit, or nowhere at all — silently dropping
+    /// a bare `!!str` with no value instead of resolving it to `""` (corpus
+    /// case LE5A, #224).
+    ///
+    /// Callers that have already opened the node (a mapping key) want
+    /// [`Self::record_key_properties`] instead.
+    fn parse_node_properties(&mut self) -> Result<bool, YamlError> {
+        let mut had_property = false;
+        loop {
+            match self.peek() {
+                Some(b'&') => {
+                    self.parse_anchor()?;
+                    had_property = true;
+                }
+                Some(b'!') => {
+                    let tag = self.parse_tag()?;
+                    self.tags.insert(self.bp_pos, tag);
+                    self.skip_inline_whitespace();
+                    had_property = true;
+                }
+                _ => break,
+            }
+        }
+        Ok(had_property)
+    }
+
+    /// Flow-context twin of [`Self::parse_node_properties`]: same loop and
+    /// `bp_pos` convention, but skips flow whitespace (which, unlike inline
+    /// whitespace, crosses line breaks) after each property instead of only
+    /// same-line whitespace.
+    ///
+    /// Without this, `k: !!seq\n  [a, b]` inside a flow mapping left `pos` on
+    /// the line break after the tag, so the `[`/`{` check the caller makes
+    /// next saw `\n` instead and fell to the scalar arm, absorbing the
+    /// literal `[a, b]` as unquoted text (corpus case EHF6). The same gap
+    /// already existed for a bare anchor in this position — `parse_anchor`'s
+    /// own internal skip is inline-only too — so this fixes both together
+    /// rather than leaving tags inconsistent with anchors.
+    fn parse_flow_node_properties(&mut self) -> Result<bool, YamlError> {
+        let mut had_property = false;
+        loop {
+            match self.peek() {
+                Some(b'&') => {
+                    self.parse_anchor()?;
+                    self.skip_flow_whitespace();
+                    had_property = true;
+                }
+                Some(b'!') => {
+                    let tag = self.parse_tag()?;
+                    self.tags.insert(self.bp_pos, tag);
+                    self.skip_flow_whitespace();
+                    had_property = true;
+                }
+                _ => break,
+            }
+        }
+        Ok(had_property)
+    }
+
+    /// Record a tag that prefixes a mapping key whose BP node is already
+    /// open, as in `!!str k: v`. Mirrors [`Self::record_key_anchor`]'s
+    /// `bp_pos - 1` convention: the key's open was already written, so the
+    /// tag names *that* position, not the position a fresh [`Self::parse_tag`]
+    /// caller (not yet opened) would use.
+    fn record_key_tag(&mut self) -> Result<(), YamlError> {
+        debug_assert_eq!(self.peek(), Some(b'!'));
+        let tag = self.parse_tag()?;
+        self.skip_inline_whitespace();
+        self.tags.insert(self.bp_pos - 1, tag);
+        Ok(())
+    }
+
+    /// Consume any combination of a leading `&anchor` and/or `!tag` prefixing
+    /// a mapping key whose BP node is already open, in either order — the
+    /// already-open twin of [`Self::parse_node_properties`], combining
+    /// [`Self::record_key_anchor`] and [`Self::record_key_tag`].
+    fn record_key_properties(&mut self) -> Result<(), YamlError> {
+        loop {
+            match self.peek() {
+                Some(b'&') => self.record_key_anchor()?,
+                Some(b'!') => self.record_key_tag()?,
+                _ => break,
+            }
+        }
+        Ok(())
+    }
+
+    /// Consume a leading `!tag` when the enclosing node's BP is already open
+    /// (`bp_pos - 1`), recording it and skipping flow whitespace after. The
+    /// flow-context, value-or-key-agnostic twin of [`Self::record_key_tag`],
+    /// shared by [`Self::parse_flow_unquoted_key`], [`Self::parse_flow_scalar`],
+    /// and [`Self::parse_explicit_flow_unquoted_key`] — each of those
+    /// independently re-checks at its own entry so property consumption never
+    /// leaves a stale check behind, the same reason `check_unsupported` used
+    /// to be called at all three (#369).
+    fn record_flow_tag(&mut self) -> Result<(), YamlError> {
+        if self.peek() == Some(b'!') {
+            let tag = self.parse_tag()?;
+            self.tags.insert(self.bp_pos - 1, tag);
+            self.skip_flow_whitespace();
+        }
+        Ok(())
+    }
+
     /// Main parsing loop.
     fn parse(&mut self) -> Result<SemiIndex, YamlError> {
         if self.input.is_empty() {
@@ -4149,6 +4296,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             ty_len: self.ty_pos,
             anchors: core::mem::take(&mut self.anchors),
             aliases: core::mem::take(&mut self.aliases),
+            tags: core::mem::take(&mut self.tags),
         })
     }
 
@@ -4266,8 +4414,6 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
 
     /// Parse a single line of document content.
     fn parse_document_line(&mut self) -> Result<(), YamlError> {
-        self.check_unsupported()?;
-
         // Count indentation - but handle tabs specially for flow structures
         let indent = match self.count_indent() {
             Ok(n) => n,
@@ -4381,36 +4527,43 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 self.close_deeper_indents(indent);
                 self.parse_value(indent)?;
             }
-            Some(b'&') => {
-                // Anchor - check if this is `&anchor key: value` (anchor on mapping key)
-                // In that case, let parse_mapping_entry handle the anchor so it points
-                // to the key, not the mapping container.
+            Some(b'&' | b'!') => {
+                // Anchor and/or tag (either order) - check if this is
+                // `&anchor key: value` / `!!str key: value` (property on a
+                // mapping key). In that case, let parse_mapping_entry handle
+                // it so it points to the key, not the mapping container.
+                //
+                // This is the shared block-context dispatcher — every "value
+                // deferred to the next line" case from parse_sequence_item,
+                // parse_mapping_entry, parse_compact_mapping_entry,
+                // parse_explicit_key, and parse_explicit_value eventually
+                // lands here, so fixing property consumption in this one arm
+                // closes most of #664's audit at once (#224).
                 self.close_deeper_indents(indent);
 
-                // Look ahead to see if this is `&anchor key:` pattern
-                if self.anchor_prefixes_mapping_entry() {
-                    // Let parse_mapping_entry handle the anchor
+                // Look ahead to see if this is a `key:` pattern
+                if self.node_properties_prefix_mapping_entry() {
+                    // Let parse_mapping_entry handle the property
                     self.parse_mapping_entry(indent)?;
                 } else {
-                    // Parse anchor here for non-mapping-key cases
-                    let _anchor_name = self.parse_anchor()?;
-                    // Skip any whitespace after anchor
-                    self.skip_inline_whitespace();
+                    // Consume any leading `&anchor` and/or `!tag`, in either
+                    // order, for non-mapping-key cases
+                    self.parse_node_properties()?;
                     // Check what follows
                     match self.peek() {
                         Some(b'\n' | b'\r') | None => {
-                            // Anchor with value on next line - will be parsed in next iteration
+                            // Property with value on next line - will be parsed in next iteration
                         }
                         // Keep this guard on one line: rustfmt splitting the
                         // `matches!` across lines gives the opening line its own
                         // coverage region that never reports as executed, even
                         // though the arm body does.
                         Some(b'-') if Self::is_ws_break_or_eoi(self.peek_at(1)) => {
-                            // Anchor before block sequence on same line
+                            // Property before block sequence on same line
                             self.parse_sequence_item(indent)?;
                         }
                         Some(b'{' | b'[') => {
-                            // Anchor before flow collection
+                            // Property before flow collection
                             self.parse_value(indent)?;
                         }
                         _ => {
@@ -4493,6 +4646,69 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
 
         Ok(())
     }
+}
+
+/// Scan a tag's raw extent starting at a `!` in `bytes[start..]` (must be
+/// `b'!'`), returning `(end, ok)`.
+///
+/// `ok` is `false` only for a verbatim tag (`!<...>`) that never finds its
+/// closing `>` before whitespace, a line break, or end of input — every
+/// other shape (`!`, `!!suffix`, `!suffix`, `!handle!suffix`) always
+/// succeeds, since a short or empty suffix is still a valid (if unusual)
+/// tag. A bare `!` alone is the YAML 1.2 non-specific tag.
+///
+/// A suffix ends at whitespace, a line break, end of input, or a flow
+/// indicator (`,[]{}`) — excluded from `ns-tag-char` everywhere per YAML 1.2
+/// §5.5, not just inside flow collections, so this one scan serves both
+/// block and flow context.
+///
+/// A free function (not a `Parser` method) so `light.rs`'s decode-time value
+/// reader can share it too: a mapping key's BP node is opened *before* its
+/// property is consumed (`record_key_tag`'s `bp_pos - 1` convention), so the
+/// key's recorded text span still starts at the tag, exactly as it already
+/// does for anchors — `YamlCursor::value`'s `skip_anchor_and_whitespace`
+/// exists for the same reason and this is its tag counterpart.
+///
+/// Permissive by design: shared by the strict [`Parser::parse_tag`] (which
+/// turns `ok == false` into `InvalidTag`) and the speculative
+/// [`Parser::node_properties_prefix_mapping_entry`] lookahead, which cannot
+/// error mid-peek — the same reason `parse_anchor_name` has a permissive
+/// twin in [`simd::parse_anchor_name`].
+pub(crate) fn scan_tag_extent(bytes: &[u8], start: usize) -> (usize, bool) {
+    debug_assert_eq!(bytes.get(start), Some(&b'!'));
+    let mut i = start + 1;
+
+    if bytes.get(i) == Some(&b'<') {
+        i += 1;
+        loop {
+            match bytes.get(i) {
+                Some(b'>') => return (i + 1, true),
+                Some(b) if !matches!(b, b' ' | b'\t' | b'\n' | b'\r') => i += 1,
+                _ => return (i, false), // whitespace/break/EOF before `>`
+            }
+        }
+    }
+
+    if bytes.get(i) == Some(&b'!') {
+        i += 1; // secondary handle `!!`
+    } else {
+        let word_start = i;
+        while matches!(bytes.get(i), Some(b) if b.is_ascii_alphanumeric() || *b == b'-') {
+            i += 1;
+        }
+        if i > word_start && bytes.get(i) == Some(&b'!') {
+            i += 1; // named handle `!handle!`
+        }
+    }
+
+    while matches!(
+        bytes.get(i),
+        Some(b) if !matches!(b, b' ' | b'\t' | b'\n' | b'\r' | b',' | b'[' | b']' | b'{' | b'}')
+    ) {
+        i += 1;
+    }
+
+    (i, true)
 }
 
 /// Build a semi-index from YAML input.
@@ -5538,6 +5754,147 @@ mod tests {
                 }
                 (a, b) => panic!("acceptance differs for {case:?}: {a:?} vs {b:?}"),
             }
+        }
+    }
+
+    /// A verbatim tag (`!<...>`) that hits whitespace before its closing `>`
+    /// is malformed - `scan_tag_extent` bails out at the space rather than
+    /// treating it as part of the tag, and `parse_tag` turns that into
+    /// `InvalidTag`.
+    #[test]
+    fn verbatim_tag_unterminated_before_whitespace_is_invalid_tag() {
+        let err = build_semi_index(b"a: !<foo bar\n").unwrap_err();
+        assert!(
+            matches!(
+                err,
+                YamlError::InvalidTag {
+                    offset: 3,
+                    reason: "unterminated verbatim tag (missing closing '>')",
+                }
+            ),
+            "expected InvalidTag at offset 3, got {err:?}"
+        );
+    }
+
+    /// Same malformed-verbatim-tag case, but the input ends before the
+    /// closing `>` is ever found - `scan_tag_extent`'s scan loop must reject
+    /// end-of-input the same way it rejects whitespace, not run off the end
+    /// of the buffer.
+    #[test]
+    fn verbatim_tag_unterminated_at_eof_is_invalid_tag() {
+        let err = build_semi_index(b"a: !<foo").unwrap_err();
+        assert!(
+            matches!(
+                err,
+                YamlError::InvalidTag {
+                    offset: 3,
+                    reason: "unterminated verbatim tag (missing closing '>')",
+                }
+            ),
+            "expected InvalidTag at offset 3, got {err:?}"
+        );
+    }
+
+    /// A multi-line plain scalar must stop folding when the next line is a
+    /// lone `: ` (explicit-key value indicator), rather than swallowing it as
+    /// scalar content - the guard in
+    /// `parse_unquoted_value_with_indent_impl` that checks
+    /// `next_char == b':' && is_ws_break_or_eoi(..)` alongside
+    /// `indent_allows_continuation`.
+    ///
+    /// The extra indentation on both lines matters for actually exercising
+    /// that guard: `indent_allows_continuation` only becomes `true` (and the
+    /// `&&`-chain only reaches the colon check) when the next line is
+    /// indented *past* the key's `start_indent` (here, past the mapping's
+    /// indent of 0) - a bare `"? a\n: 1\n"` never reaches the check at all,
+    /// since `next_indent (0) > start_indent (0)` is already false and the
+    /// rest of the condition short-circuits. `"  : 1"` is still less
+    /// indented than the key `a` itself (column 4), matching the YAML-1.2
+    /// corpus shape (id `35KP`, "Tags for Root Objects") that used to
+    /// exercise this before this PR's tag-support change routed that corpus
+    /// case through a different path (#224).
+    #[test]
+    fn multiline_plain_scalar_stops_before_explicit_value_indicator() {
+        let yaml: &[u8] = b"?   a\n  : 1\n";
+        let index = crate::yaml::YamlIndex::build(yaml).unwrap();
+        let cursor = index.root(yaml);
+        assert_eq!(
+            cursor.to_json(),
+            r#"[{"a":1}]"#,
+            "explicit key 'a' must map to 1, not swallow the ': 1' line into the key scalar"
+        );
+    }
+
+    /// `parse_value`'s `Some(b'-') if is_ws_break_or_eoi(..)` arm — an
+    /// inline-sequence-item fallback for a `-` that reaches `parse_value`
+    /// itself rather than being intercepted by a caller's own copy of the
+    /// same check — is still reachable after this PR replaced single
+    /// `parse_anchor()` calls with looping `parse_node_properties()` calls in
+    /// both `parse_value` and `parse_sequence_item_inner`.
+    ///
+    /// That refactor *does* make the arm dead for the scenario the arm's own
+    /// comment names (`- &a &b - x`, a sequence item): `parse_sequence_item_inner`
+    /// now consumes *both* leading anchors in one loop and its own `Some(b'-')`
+    /// check (just above the property loop's result) catches the inner dash
+    /// directly, never delegating to `parse_value` at all - confirmed by
+    /// coverage (`- &a &b - x\n` alone does not hit this arm).
+    ///
+    /// It stays reachable through a different caller: `parse_explicit_key`'s
+    /// "sequence as key" arm (`? - ...`) skips only the *first* `-` and then
+    /// calls `parse_value` unconditionally for whatever follows, with no
+    /// dash-precheck of its own (unlike `parse_sequence_item_inner` and
+    /// `parse_mapping_entry`). A second `-` there - anchored or not - lands
+    /// on this exact arm. Confirmed via `cargo llvm-cov`: this input hits
+    /// parser.rs:2741-2742, `"- &a &b - x\n"` alone does not.
+    #[test]
+    fn explicit_key_double_anchored_nested_dash_reaches_parse_value_dash_arm() {
+        let yaml: &[u8] = b"? - &a &b - x\n: v\n";
+        let index = crate::yaml::YamlIndex::build(yaml).expect("should parse");
+        let root = index.root(yaml);
+        let doc0 = match root.value() {
+            crate::yaml::YamlValue::Sequence(mut docs) => docs.next().expect("one document"),
+            other => panic!("expected root sequence, got {other:?}"),
+        };
+        let fields = match doc0 {
+            crate::yaml::YamlValue::Mapping(fields) => fields,
+            other => panic!("expected mapping, got {other:?}"),
+        };
+        let (field, rest) = fields.uncons().expect("mapping has one field");
+        assert!(rest.is_empty(), "mapping must have exactly one field");
+
+        // Key: a sequence (from `? - ...`) whose single element is itself a
+        // sequence (the nested `- x`, opened by this PR's arm) containing "x".
+        match field.key() {
+            crate::yaml::YamlValue::Sequence(mut outer) => {
+                let inner = outer.next().expect("outer sequence has one element");
+                assert!(
+                    outer.next().is_none(),
+                    "outer sequence has only one element"
+                );
+                match inner {
+                    crate::yaml::YamlValue::Sequence(mut inner_seq) => {
+                        let x = inner_seq.next().expect("inner sequence has one element");
+                        assert!(
+                            inner_seq.next().is_none(),
+                            "inner sequence has only one element"
+                        );
+                        match x {
+                            crate::yaml::YamlValue::String(s) => {
+                                assert_eq!(s.as_str().unwrap(), "x");
+                            }
+                            other => panic!("expected string 'x', got {other:?}"),
+                        }
+                    }
+                    other => panic!("expected nested sequence key, got {other:?}"),
+                }
+            }
+            other => panic!("expected sequence key, got {other:?}"),
+        }
+
+        // Value: the explicit value `v` on the following line.
+        match field.value_cursor().value() {
+            crate::yaml::YamlValue::String(s) => assert_eq!(s.as_str().unwrap(), "v"),
+            other => panic!("expected string 'v' value, got {other:?}"),
         }
     }
 }

@@ -26,24 +26,34 @@ path:
 
 | Dimension                              | Result              | Meaning                                        |
 |----------------------------------------|---------------------|------------------------------------------------|
-| **Load** (valid YAML, output compared) | **235/279 = 84.2%** | Parses and produces the JSON the suite expects |
-| **Reject** (invalid YAML, must fail)   | **70/94 = 74.5%**   | Refused by the loader or the opt-in validator  |
-| **Parse** (valid YAML, no JSON form)   | **27/29 = 93.1%**   | Parses without error                           |
+| **Load** (valid YAML, output compared) | **267/279 = 95.7%** | Parses and produces the JSON the suite expects |
+| **Reject** (invalid YAML, must fail)   | **66/94 = 70.2%**   | Refused by the loader or the opt-in validator  |
+| **Parse** (valid YAML, no JSON form)   | **29/29 = 100.0%**  | Parses without error                           |
 
 The **Reject** figure is what the conformance harness rejects with the opt-in
 validator enabled (loader OR validator, see below). The *default non-validating
-loader alone* still rejects only 12/94 (12.8%) by design — the opt-in validator
+loader alone* rejects only 8/94 (8.5%) by design — the opt-in validator
 ([#223](https://github.com/rust-works/succinctly/issues/223)) closes 58 more.
 
-The 70 non-passing cases are enumerated individually, with a category and reason, in
+[#224](https://github.com/rust-works/succinctly/issues/224) (tag support) moved the Load
+figure from 235/279 (84.2%) to 267/279, the largest single jump on this page, and closed
+both `parse` failures. It also *cost* 4 cases on the Reject side: `check_unsupported`'s
+blanket `!` rejection used to incidentally reject 4 documents whose real defect is
+something else entirely (a malformed tag, an unindented anchor target, a directive with no
+document footer before it) — implementing real tag resolution means those 4 are structurally
+absorbed like any other invalid input the non-validating loader doesn't check for, dropping
+the loader-alone figure from 12/94 to 8/94. See
+[Tags — resolved](#tags--resolved-224) below.
+
+The 40 non-passing cases are enumerated individually, with a category and reason, in
 [`tests/data/yaml-test-suite-known-failures.txt`](../../../tests/data/yaml-test-suite-known-failures.txt).
 That file is the machine-readable source of truth; the test asserts it matches reality
 exactly, so it cannot silently drift from this page.
 
 ## Validation: default loader vs. the opt-in validator
 
-**The default loader is non-validating by design.** `YamlIndex::build` rejects 12 of the
-suite's 94 invalid documents; the other 82 are accepted and produce a value.
+**The default loader is non-validating by design.** `YamlIndex::build` rejects 8 of the
+suite's 94 invalid documents; the other 86 are accepted and produce a value.
 
 This follows from semi-indexing. The index records *structure* — where values start and
 end, and how they nest — not grammar conformance. The parser is a structure recognizer:
@@ -56,37 +66,43 @@ it is 5-10x faster than `yq`.
 [`succinctly yaml validate`](../../guides/cli.md) / `syq --validate` runs a separate strict
 pass ([`src/yaml/validate.rs`](../../../src/yaml/validate.rs)) before indexing — mirroring
 `json validate` / `sjq --validate`, so the default path pays nothing. It rejects **58 of
-the 82** documents below with zero false positives on the valid corpus (a guardrail test,
+the 86** documents below with zero false positives on the valid corpus (a guardrail test,
 `validator_accepts_all_valid_cases`, enforces that). The conformance harness treats a
 must-fail case as handled if the loader *or* the validator rejects it, which is why the
-Reject figure above is 70/94 rather than 12/94.
+Reject figure above is 66/94 rather than 8/94.
 
-The 24 documents the validator does not yet reject (marked `lax:*` in the manifest) need
+The 28 documents the validator does not yet reject (marked `lax:*` in the manifest) need
 deeper structural analysis — cross-line anchor binding, block-scalar content indentation,
-flow multi-line implicit keys — and are tracked in
-[#223](https://github.com/rust-works/succinctly/issues/223).
+flow multi-line implicit keys, malformed tag syntax — and are tracked in
+[#223](https://github.com/rust-works/succinctly/issues/223) (`lax:tags` under #224, see
+below).
 
-The 82 accepted-but-invalid documents (of which the validator now rejects 58) break down as:
+The 28 documents still lax today (neither the loader nor the validator rejects them) break
+down as:
 
-| Category           | Cases | What is not checked                          |
-|--------------------|-------|----------------------------------------------|
-| `lax:mapping`      | 14    | Mapping and implicit-key rules               |
-| `lax:documents`    | 12    | Directive and document-marker placement      |
-| `lax:flow`         | 11    | Flow collection syntax                       |
-| `lax:tabs`         | 8     | Tabs where indentation is expected           |
-| `lax:indentation`  | 7     | Indentation consistency                      |
-| `lax:other`        | 7     | Assorted                                     |
-| `lax:quoting`      | 6     | Quoting and escape sequences                 |
-| `lax:block-scalar` | 6     | Block scalar header validity (`\|--` parses) |
-| `lax:anchors`      | 6     | Anchor and alias rules                       |
-| `lax:comments`     | 5     | Comment placement                            |
+| Category           | Cases | What is not checked                                     |
+|---------------------|------|-----------------------------------------------------------|
+| `lax:mapping`      | 5     | Mapping and implicit-key rules                          |
+| `lax:indentation`  | 5     | Indentation consistency                                 |
+| `lax:flow`         | 4     | Flow collection syntax                                  |
+| `lax:anchors`      | 4     | Anchor and alias rules, incl. an unindented tag target (#224) |
+| `lax:documents`    | 3     | Directive and document-marker placement, incl. a mid-stream `%TAG` (#224) |
+| `lax:tags`         | 2     | Malformed tag syntax (disallowed flow indicators) — #224 |
+| `lax:comments`     | 2     | Comment placement                                       |
+| `lax:block-scalar` | 2     | Block scalar header validity (`\|--` parses)             |
+| `lax:tabs`         | 1     | Tabs where indentation is expected                       |
+
+This table is the current *remainder* — cases the validator has not yet caught up to — not
+a fixed accounting of the original 86; earlier revisions of this page also carried
+`lax:other` and `lax:quoting` rows that the validator has since closed out entirely.
 
 The opt-in validation mode now exists ([#223](https://github.com/rust-works/succinctly/issues/223)),
 mirroring the JSON side's `succinctly json validate` / `sjq --validate`. Validation is a
 separate pass run before indexing, so the default path pays nothing for it — see
-[`src/yaml/validate.rs`](../../../src/yaml/validate.rs). The 82 cases above were its
+[`src/yaml/validate.rs`](../../../src/yaml/validate.rs). The 86 cases above were its
 acceptance criteria; it rejects 58 of them today (each `lax:*` line removed from the
-manifest is a case now rejected), with the 24 harder cases still tracked in #223.
+manifest is a case now rejected), with the 28 harder cases still tracked in #223 (`lax:tags`
+under #224).
 
 ### What "accepted" means: the text is kept, not dropped
 
@@ -180,8 +196,8 @@ input breaks a rule the index could otherwise ignore. Rejecting the rest of what
 calls invalid is the validator's job.
 
 Neither costs this page's conformance numbers anything: no case in the corpus contains an
-alias to an out-of-scope anchor, so the 12/94 loader figure, the 82 accepted-but-invalid
-documents and the `lax:anchors` row are unmoved by #372.
+alias to an out-of-scope anchor, so the loader-alone reject figure, the accepted-but-invalid
+document count, and the `lax:anchors` row are unmoved by #372.
 
 ### The other ways `YamlIndex::build` fails
 
@@ -189,10 +205,10 @@ Structure aside, `build` still refuses input it has no reading for at all. None 
 a conformance check either — they are an absent feature, bytes it cannot tokenize, and the
 index's own ceilings:
 
-| Rejected                                        | Example      | `YamlError`           |
-|-------------------------------------------------|--------------|-----------------------|
-| A tag in node position (absent feature, below)  | `a: !!str 1` | `TagNotSupported`     |
-| A tab where block structure expects indentation | `\ta: 1`     | `TabIndentation`      |
+| Rejected                                        | Example        | `YamlError`           |
+|-------------------------------------------------|----------------|-----------------------|
+| An unterminated verbatim tag                    | `a: !<foo b: 1`| `InvalidTag`          |
+| A tab where block structure expects indentation | `\ta: 1`       | `TabIndentation`      |
 | A quote with no close before end of input       | `a: "x`      | `UnclosedQuote`       |
 | Input ending inside a flow collection or escape | `a: {k: 1`   | `UnexpectedEof`       |
 | A flow item not followed by `,` or its closer   | `a: [[1] 2]` | `UnexpectedCharacter` |
@@ -218,133 +234,102 @@ $ printf 'a: [1 2]\n' | succinctly yq -o json -I0 '.'
 ```
 
 The loader stops where it cannot continue, not where a rule is broken — which is why the
-11 `lax:flow` cases above survive it.
+`lax:flow` cases above survive it.
 
-## Unsupported features
+## Tags — resolved (#224)
 
-These are absent rather than wrong, and account for 33 of the 44 load failures.
+`!!str`, `!custom`, and verbatim `!<tag:...>` resolve now, matching real `yq`. The 5
+core-schema tags (`!!str`/`!!null`/`!!bool`/`!!int`/`!!float`) force scalar-type coercion —
+regardless of quoting style, so `!!int "5"` is the number `5`, not the string `"5"`. Any
+other tag (a custom tag, `!!seq`/`!!map`/`!!set`/`!!omap`, a `%TAG`-shorthand tag, verbatim
+`!<...>`) does not change resolution — JSON has no way to represent those distinctly from an
+ordinary map/seq/scalar anyway.
 
-### Tags — 35 cases (33 load, 2 parse)
-
-`!!str`, `!custom`, and verbatim `!<tag:...>` are not supported. In block context the
-parser rejects *some* positions:
+**Output**: JSON drops every tag, since JSON has no tag syntax. YAML output re-emits the tag
+verbatim on the scalar or key it decorated, matching `yq` — but not yet on a whole tagged
+mapping/sequence (`!!seq [1, 2]`), which YAML output still drops; JSON was unaffected by this
+gap either way, since it drops collection tags too.
 
 ```
 $ echo 'a: !!str 1' | succinctly yq '.'
-Error: YAML parse error: tags (!) not supported at offset 3
-```
-
-— but not all of them; see [Tag rejection is not uniform in block context](#tag-rejection-is-not-uniform-in-block-context-664)
-below for the paths that silently absorb the tag as scalar text instead of rejecting it.
-
-Flow context rejects them the same way, in every position tested — sequence item, mapping
-value, mapping key, and the explicit `? k : v` form
-([#369](https://github.com/rust-works/succinctly/issues/369); before that fix flow context
-absorbed the tag into the scalar, so `[!!str a]` yielded the string `"!!str a"`):
-
-```
-$ echo 'a: [!!str x]' | succinctly yq '.'
-Error: YAML parse error: tags (!) not supported at offset 4
+a: !!str 1
+$ echo 'a: !!str 1' | succinctly yq -o json -I0 '.'
+{"a":"1"}
+$ echo 'a: [!!str x]' | succinctly yq -o json -I0 '.'
+{"a":["x"]}
 ```
 
 A `!` *inside* plain scalar content is not an indicator and remains ordinary text in both
-contexts — `[x!y]` is `["x!y"]`, `a: hello!world` is `"hello!world"`. Only a `!` starting a
-node is a tag.
+block and flow context — `[x!y]` is `["x!y"]`, `a: hello!world` is `"hello!world"`. Only a
+`!` starting a node is a tag.
 
-Tag *support* is tracked in [#224](https://github.com/rust-works/succinctly/issues/224);
-these 35 cases stay failures until it lands. Two of them (`CC74`, `P76L`) are `%TAG`
-directive cases: the directive line itself is recognized (see
-[Directives — resolved](#directives--resolved) below), but the shorthand tag it defines is
-still rejected when applied to a node, the same as any other tag.
+`CC74`/`P76L` (`%TAG`-defined shorthand tags applied to a node) and the flow-context cases
+[#369](https://github.com/rust-works/succinctly/issues/369) closed (sequence item, mapping
+value, mapping key, explicit `? k : v`) all resolve the same way — `%TAG` handle resolution
+to a full URI was not implemented, since JSON output never surfaces it; a shorthand tag like
+`!e!foo` is tokenized and dropped exactly like any other non-core-schema tag, which is
+sufficient for both cases to pass.
 
-### Tag rejection is not uniform in block context (#664)
+One divergence remains, tracked as `tags`/`S4JQ` in the manifest: YAML 1.2's "conventional
+resolution" for a bare `!` (the non-specific tag, no suffix) forces `!!str`, but real `yq`
+v4.53.3 leaves the content's natural type untouched (`! 12` stays the number `12`, not
+`"12"`). We follow `yq`, the same policy as [`FRK4`](#frk4-a-divergence-the-ledger-cannot-see)/
+[`JEF9/02`](#jef902-the-one-case-where-we-follow-yq-over-the-suite) below.
 
-[#664](https://github.com/rust-works/succinctly/issues/664) audited every scalar/key entry
-path in `src/yaml/parser.rs` against `check_unsupported` (the single function meant to reject
-a leading `!` everywhere) ahead of #224 landing real tag support — so #224 closes actual gaps
-rather than papering over ones nobody enumerated. It is audit-and-test-only; the gaps below
-are pinned with regression tests in `tests/yq_cli_tests.rs` (the `test_yaml_tag_gate_gap_*`
-tests) rather than fixed, since fixing them is #224's job.
+**Explicit tag introspection**: `YamlCursor::explicit_tag() -> Option<&str>`
+(`src/yaml/light.rs`) returns the literal source tag, distinct from the pre-existing
+`YamlCursor::tag()`, which returns an *inferred* type label from the resolved value's shape
+(now consistent with `explicit_tag`'s effect, since an explicit core-schema tag changes what
+gets inferred). See [docs/parsing/yaml.md § Tag Resolution](../../parsing/yaml.md) for the
+storage design (a `BTreeMap<usize, String>` on `YamlIndex`, mirroring the anchor table) and
+one documented gap: the lazy, cursor-free half of the jq evaluator (`src/jq/eval_generic.rs`'s
+`to_owned`, shared with JSON) is not tag-aware, so `succinctly yq '.a | type'` on a tagged
+scalar can still answer from untagged inference even though `succinctly yq '.'`'s JSON output
+for the same input is always correct. Tracked as
+[#747](https://github.com/rust-works/succinctly/issues/747).
 
-**19 distinct entry paths were enumerated; 13 are ungated**, collapsing into 6 root causes:
+### How the gaps were closed (#664 → #224)
 
-1. **`parse_document_line`'s gate runs before indentation is skipped**
-   (`parser.rs:4269` vs. `count_indent`/`advance_by` at `4272-4303`). It peeks the line's
-   literal first byte — a space for any indented line — not the node's first byte.
-   `!!str x` (column 0) is rejected; `  !!str x` (indented, still a bare document scalar) is
-   not, and yields `"!!str x"`.
-2. **`parse_block_node`'s two scalar-dispatch arms never call `check_unsupported`
-   themselves** (the anchor arm at `4416-4441`, the plain catch-all at `4457-4490`). This is
-   the shared block-context dispatcher — `parse_document_line` and `parse_inline_document_value`
-   both funnel into it — and it's where every "value deferred to the next line" case from
-   `parse_sequence_item`, `parse_mapping_entry`, `parse_compact_mapping_entry`,
-   `parse_explicit_key`, and `parse_explicit_value` eventually lands, ungated and (per root
-   cause 1) not reliably backstopped either. This includes `parse_inline_document_value`
-   (`1061-1081`, content after `---`) — already flagged in its own doc comment as #224's to
-   settle, and the mechanism behind the `J7PZ` corpus case (`--- !!omap`): the tag is absorbed
-   as a complete document-root scalar, so the sequence on the following lines starts a
-   *second* document — one YAML input streams as two JSON documents.
-3. **`parse_mapping_entry`'s next-line plain-scalar branch (`2204-2232`)** parses the
-   deferred value inline, bypassing the function's own gate at `2237` (which only guards the
-   sibling same-line branch).
-4. **Anchor-then-value asymmetry** in `parse_mapping_entry` (`2237` before the `&anchor`
-   check at `2240`) and `parse_compact_mapping_entry` (`1926` before `1927`): both check once,
-   *before* testing for an anchor, then dispatch the value inline with no second check after
-   consuming it. `parse_sequence_item` and the flow-context inner loops avoid this by
-   construction — they consume the anchor themselves, then delegate the scalar dispatch to
-   `parse_value` or `parse_flow_scalar`, which re-check independently at their own entry.
-5. **`parse_explicit_value` (`2582`) has zero `check_unsupported` calls**, for the same-line
-   value, the next-line value, the anchor-then-value form, or its compact-mapping-value arm.
-6. **No block-context key parser gates the key itself** (`parse_mapping_entry`,
-   `parse_compact_mapping_entry`, `parse_explicit_key` at `2364`, whose inline-key dispatch at
-   `2566-2572` has no gate at all). Every currently-rejected tagged key is explained by root
-   cause 1's column-0 accident or `parse_sequence_item`'s pre-dispatch check (`1734`, which
-   runs unconditionally right after `- `, before any compact-mapping-key dispatch is even
-   decided) — not by deliberate key gating.
+Landing this took two issues. [#664](https://github.com/rust-works/succinctly/issues/664)
+audited every scalar/key entry path in `src/yaml/parser.rs` against `check_unsupported` (the
+single function that used to reject a leading `!` everywhere) and found 19 distinct entry
+paths, 13 of them ungated — meaning 13 different places silently absorbed a tag as scalar
+text instead of rejecting it, collapsing into 6 root causes: indentation-skip ordering in
+`parse_document_line`; `parse_block_node`'s two scalar-dispatch arms never gating themselves
+(the highest-leverage gap, since most deferred-value paths funnel through it — including the
+mechanism behind corpus case `J7PZ`, `--- !!omap`, where the tag used to be absorbed as a
+complete document-root scalar and the sequence on the following lines started a *second*
+document); a next-line branch in `parse_mapping_entry` bypassing its own same-line-only gate;
+anchor-then-value ordering checking the gate before consuming the anchor with no second check
+after; `parse_explicit_value` having zero gates anywhere; and no block-context key parser
+gating the key itself. Flow context was already fully gated at every position by contrast —
+[#369](https://github.com/rust-works/succinctly/issues/369) had closed it earlier. #664 was
+audit-and-test-only: it pinned every gap with a regression test in `tests/yq_cli_tests.rs`
+(`test_yaml_tag_gate_gap_*`) rather than fixing them, so #224 would close *actual* gaps
+rather than paper over ones nobody had enumerated.
 
-Flow context (mapping/sequence values, implicit and explicit keys, including every
-anchor-then-tag combination) is **fully gated**: `parse_flow_scalar`,
-`parse_flow_unquoted_key`, and `parse_explicit_flow_unquoted_key` each re-check
-`check_unsupported` at their own entry, so anchor consumption never leaves a stale check
-behind the way it does in block context. This matches the existing
-`test_yaml_flow_context_rejects_tags_like_block_context` (#369) coverage.
+#224 replaced `check_unsupported` (deleted; every one of its non-`!` arms was already a
+no-op, so once `!` stopped erroring the function did nothing at all) with real tag parsing —
+`Parser::parse_tag`/`scan_tag_extent` for the lexer, `parse_node_properties`/
+`record_key_properties` for consuming `&anchor` and/or `!tag` together, in either order, at
+every node-start position (mirroring how anchors were already consumed, and fixing all 6 root
+causes as one shared change rather than 13 separate patches). The `test_yaml_tag_gate_gap_*`
+tests now assert the closed behavior instead of pinning the gap, under their original names.
 
-| #  | Entry path                                               | Owning function                                              | Gated?                                                                      |
-|----|----------------------------------------------------------|--------------------------------------------------------------|-----------------------------------------------------------------------------|
-| 1  | Sequence item value, right after `- `                    | `parse_sequence_item` → `parse_sequence_item_inner` (`1682`) | Yes (`1734`)                                                                |
-| 2  | Sequence item value deferred to next line                | `parse_sequence_item` → `parse_block_node`                   | No (root cause 2)                                                           |
-| 3  | Compact mapping key                                      | `parse_compact_mapping_entry` (`1860`)                       | No in general (root cause 6); yes when reached via `- ` (root cause 6 note) |
-| 4  | Compact mapping value, same line, no anchor              | `parse_compact_mapping_entry`                                | Yes (`1926`)                                                                |
-| 5  | Compact mapping value, same line, after `&anchor`        | `parse_compact_mapping_entry`                                | No (root cause 4)                                                           |
-| 6  | Compact mapping value, next line                         | `parse_compact_mapping_entry` → `parse_block_node`           | No (root cause 2)                                                           |
-| 7  | Mapping key                                              | `parse_mapping_entry` (`2015`)                               | No (root cause 6)                                                           |
-| 8  | Mapping value, same line, no anchor                      | `parse_mapping_entry`                                        | Yes (`2237`)                                                                |
-| 9  | Mapping value, same line, after `&anchor`                | `parse_mapping_entry`                                        | No (root cause 4)                                                           |
-| 10 | Mapping value, next line, plain-scalar catch-all         | `parse_mapping_entry` (`2204-2232`)                          | No (root cause 3)                                                           |
-| 11 | Mapping value, next line, sequence/flow/anchor lookahead | `parse_mapping_entry` → `parse_block_node`                   | No (root cause 2)                                                           |
-| 12 | Explicit key                                             | `parse_explicit_key` (`2364`)                                | No (root cause 6)                                                           |
-| 13 | Explicit key, sequence-as-key value dispatch             | `parse_explicit_key` → `parse_value`                         | Yes (`2698`)                                                                |
-| 14 | Explicit value (all forms)                               | `parse_explicit_value` (`2582`)                              | No (root cause 5)                                                           |
-| 15 | General block value dispatcher                           | `parse_value` (`2697`)                                       | Yes (`2698`)                                                                |
-| 16 | Per-line block dispatch entry                            | `parse_document_line` (`4268`)                               | Partially (root cause 1)                                                    |
-| 17 | Anchor-prefixed scalar, non-mapping-key                  | `parse_block_node` (`4416-4441`)                             | No (root cause 2)                                                           |
-| 18 | Plain scalar catch-all                                   | `parse_block_node` (`4457-4490`)                             | No (root cause 2)                                                           |
-| 19 | Content after `---` on the same line                     | `parse_inline_document_value` (`1061-1081`)                  | No (root cause 2)                                                           |
+Two bugs surfaced only once tags could reach positions anchors already could:
+- A tag immediately before a multi-line flow value (`k: !!seq\n  [a, b]`) left the parser
+  positioned on the line break, so the following `[`/`{` check missed and absorbed the
+  bracket as scalar text (corpus case `EHF6`). The same gap already existed for a bare
+  anchor in that position, since `parse_anchor`'s own whitespace skip is inline-only too;
+  fixed for both by adding a flow-whitespace-aware property-consumption path
+  (`parse_flow_node_properties`) at the two flow call sites that need it.
+- A bare tag with nothing after it (`- !!str` as the last sequence item) needs a real BP node
+  to resolve against, the same as an anchor does — but the null-value-synthesis check that
+  used to gate only on "was there an anchor" silently dropped a tag-only property instead of
+  resolving it to `""` (corpus case `LE5A`). Fixed by widening that check to "was there any
+  property."
 
-**Explicitly excluded from this audit's fixes:**
-- `src/yaml/mod.rs`'s module doc comment and `parser.rs`'s own comments (e.g.
-  `parse_inline_document_value`'s doc comment, and
-  `test_yaml_flow_context_rejects_tags_like_block_context`'s old claim that "block context has
-  always errored on `!`") were also stale or imprecise; the test comment was corrected as part
-  of #664, but `src/` comments were left for #224 since #664 makes no `src/` changes.
-- `src/yaml/validate.rs`'s `check_block_indent`/`check_root_kind` reuse the same indicator
-  bytes (`&`, `*`, `!`) for a structural check, but that's the separate, opt-in strict
-  validator, not `check_unsupported` — out of scope here.
-- Whether *all* key positions (row 6 above) belong in this gate, versus only the
-  explicit-key case the original issue text called out, is a judgment call #664 left open
-  rather than deciding unilaterally; #224 (or a follow-up) should settle it.
-
-### A flow collection as a same-line explicit key
+## A flow collection as a same-line explicit key
 
 `? []: x` — a *flow* collection followed by a value indicator on the same line —
 still diverges from `yq`. The whole `[]: x` is a compact block mapping used as the
@@ -473,13 +458,18 @@ floats render as integers on the streaming path, `1.0` → `1` —
 [#168](https://github.com/rust-works/succinctly/issues/168) /
 [#170](https://github.com/rust-works/succinctly/issues/170)).
 
-## Full accounting of the 44 load failures
+## Full accounting of the 12 load failures
 
 | Category     | Cases | Cause                                                             |
 |--------------|-------|-------------------------------------------------------------------|
-| `tags`       | 33    | Tags not supported (above)                                        |
-| `structure`  | 4     | Document end markers; anchors with colons in the name             |
 | `scalars`    | 7     | Zero-indented block scalars; tabs; trailing whitespace            |
+| `structure`  | 4     | Document end markers; anchors with colons in the name             |
+| `tags`       | 1     | `S4JQ`: non-specific `!` resolution follows `yq` over the spec (above) |
+
+`tags` was 33 (31 load, 2 parse) until [#224](https://github.com/rust-works/succinctly/issues/224)
+implemented real tag resolution (see [Tags — resolved](#tags--resolved-224) above); 32 of
+those 33 load cases cleared outright, and the 2 parse failures (`FH7J`, `UKK6/02`) cleared
+too. Only `S4JQ` remains, for the yq-vs-spec divergence described above.
 
 `directives` was 16 until [#225](https://github.com/rust-works/succinctly/issues/225) (see
 [Directives — resolved](#directives--resolved) above); the category no longer exists.
@@ -534,8 +524,6 @@ spaces-only line (`>1+` over `   ` gives `""`, `yq` gives `"  "`). And a content
 with an explicit indicator swallows the line after it, dropping that key outright — `a: |2+`
 over `b: 2` loses `b`, which is why the `empty_block_scalars_keep_contentless` fixture orders
 its `explicit_indent` case last.
-
-The two `parse` failures (`FH7J`, `UKK6/02`) are also tags.
 
 ### `FRK4`: a divergence the ledger cannot see
 

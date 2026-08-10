@@ -19,12 +19,17 @@
 //! - Comments (ignored in block context)
 //! - `%YAML` / `%TAG` directives — recognized and consumed; a directive's version/handle
 //!   is not surfaced (issue #225)
-//!
-//! # Not supported
-//!
-//! - Tags (`!!str`, `!custom`, verbatim `!<...>`) — rejected in block context, absorbed
-//!   as scalar text in flow context, including a shorthand tag defined by a `%TAG`
-//!   directive (issue #224)
+//! - Tags (`!!str`, `!custom`, verbatim `!<...>`) — resolved, matching `yq`: the 5
+//!   core-schema tags (`!!str`/`!!null`/`!!bool`/`!!int`/`!!float`) force scalar-type
+//!   coercion regardless of quoting style; any other tag (a custom tag,
+//!   `!!seq`/`!!map`/`!!set`/`!!omap`, a `%TAG`-shorthand tag, verbatim) does not change
+//!   resolution (issue #224). JSON output drops the tag either way, since JSON has no tag
+//!   syntax; YAML output re-emits it verbatim on the scalar or key it decorated (matching
+//!   `yq`), though a tag on a whole mapping/sequence (`!!seq [1, 2]`) is not yet preserved
+//!   on that path. The explicit source tag, if any, is available via
+//!   `YamlCursor::explicit_tag` — distinct from the pre-existing `YamlCursor::tag`, which
+//!   is an *inferred* type label derived from the resolved value's shape, not the
+//!   source text.
 //!
 //! # Validation
 //!
@@ -274,7 +279,7 @@ pub use light::{
     YamlField, YamlFields, YamlNumber, YamlString, YamlValue,
 };
 pub use locate::{locate_offset, locate_offset_detailed, LocateResult};
-pub use scalar::{resolve_plain, ResolvedScalar};
+pub use scalar::{resolve_plain, resolve_tagged, ResolvedScalar};
 
 #[cfg(test)]
 mod tests {

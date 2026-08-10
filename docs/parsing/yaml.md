@@ -667,40 +667,67 @@ For efficient key extraction, store key end positions:
 
 **Note**: Value type interpretation (is `true` a boolean or string?) is handled at a higher level than the cursor API. The semi-index is concerned only with structure, not semantics.
 
-### 6. Tag Resolution
+### 6. Tag Resolution — implemented (#224)
 
-**Decision**: The cursor API is type-agnostic. Tags are recorded structurally but interpretation is deferred.
-
-YAML tags affect interpretation:
+**Shipped decision**: an explicit tag is recorded structurally, exactly like an anchor, and
+resolution happens where the cursor already resolves plain scalars — not deferred to a
+separate higher-level type the way this section originally proposed.
 
 ```yaml
-date: 2024-01-15      # Might be Date or String
-explicit: !!str 2024-01-15  # Definitely String
+date: 2024-01-15            # core-schema inference: unquoted, not tagged -> string (no date type)
+explicit: !!str 2024-01-15  # tag forces string, regardless of what inference would say
+quoted: !!int "42"          # tag forces int even though quoting would otherwise force string
 ```
 
-**Cursor API Scope**:
+**Storage**: `YamlIndex` holds `tags: BTreeMap<usize, String>` (BP position → raw tag text,
+e.g. `"!!str"`), populated during parsing by `Parser::parse_tag`/`parse_node_properties`. This
+mirrors the anchor table's own `BTreeMap<usize, String>` precedent (§1 above) rather than a
+bitpacked structure — a tag, like an anchor, is comparatively rare and has no fixed-width
+encoding, so the succinct-structure bar the rest of the index holds to does not apply here
+either. Unlike anchors, a tag needs no reverse name→position map: nothing resolves to a tag by
+reference the way an alias resolves to an anchor.
 
-The semi-index cursor provides:
-- `raw_value() -> &[u8]` - Raw bytes of scalar
-- `has_tag() -> bool` - Whether explicit tag present
-- `tag() -> Option<&str>` - The tag if present (`!!str`, `!custom`, etc.)
+**Cursor API** (`src/yaml/light.rs`):
+- `YamlCursor::explicit_tag() -> Option<&str>` — the literal source tag, or `None`. This is
+  the method this section originally called `tag()`; that name was already taken by an
+  *inferred* type label (`"!!str"`/`"!!int"`/… derived from the resolved value's shape, used
+  before #224 for introspection) which `explicit_tag` does not replace — `YamlCursor::tag()`
+  now checks `explicit_tag()` first and falls back to inference, so the two stay consistent
+  rather than able to disagree.
+- `src/yaml/scalar.rs`'s `resolve_tagged(text, tag) -> Option<ResolvedScalar>` forces
+  resolution for the 5 core-schema tags (`!!str`/`!!null`/`!!bool`/`!!int`/`!!float`),
+  matching `yq`'s behavior of applying tag coercion regardless of quoting style. Returns
+  `None` for any other tag (custom, `!!seq`/`!!map`/`!!set`/`!!omap`, verbatim, or no tag),
+  meaning "resolve naturally instead" via the existing `resolve_plain`.
 
-The cursor does **not** provide:
-- `as_bool()`, `as_int()`, `as_date()` - Type coercion
-- Automatic type inference based on YAML 1.2 core schema
+**Output surfaces differ**: JSON has no tag syntax, so `write_json_to`/`stream_json_value`
+always drop the tag (after using it for resolution). YAML output
+(`YamlCursor::stream_yaml_value`) has tag syntax, and matches `yq` by re-emitting the tag
+verbatim ahead of the scalar/key it decorated — `a: !!str 1` round-trips as `a: !!str 1`, not
+`a: 1`. That re-emission covers scalars and keys but not yet a tag on a whole
+mapping/sequence (`!!seq [1, 2]`), left as a follow-up since it needs the tag written on the
+*key's* line for block-style output rather than at the collection's own recursive call.
 
-**Rationale**:
+**What did *not* change**: the cursor still has no `as_bool()`/`as_int()`/`as_date()` —
+resolution stays scalar-*type* coercion (does this text read as a bool/int/float/string/null),
+not schema validation or domain types. That boundary, and the reasoning for it, is exactly
+what this section originally argued for; only the tag-storage mechanism and the API surface
+(`explicit_tag()`, not `has_tag()`/`tag()`) differ from the original proposal.
 
-| Concern              | Cursor API | Higher-level API |
-|----------------------|------------|------------------|
-| Structure navigation | ✓          | ✓                |
-| Byte ranges          | ✓          | ✓                |
-| Raw value access     | ✓          | ✓                |
-| Tag presence         | ✓          | ✓                |
-| Type coercion        | ✗          | ✓                |
-| Schema validation    | ✗          | ✓                |
-
-This separation keeps the index small and fast. A higher-level `YamlValue` type can implement schema-aware parsing on top of the cursor.
+**One consumer this section didn't anticipate**: the jq-integrated evaluator has two paths —
+materializing to `OwnedValue` (`yaml_to_owned_value` in `src/bin/succinctly/yq_runner.rs`,
+`yaml_value_to_owned` in `src/jq/eval.rs`) and a lazy cursor-based evaluator
+(`src/jq/eval_generic.rs`'s `to_owned`, generic over `DocumentValue` for both JSON and YAML).
+The materializing path is tag-aware; the lazy path is not, since `DocumentValue` operates on
+an already-extracted `YamlValue` with no `bp_pos` to look a tag up with. So `succinctly yq
+'.'`'s JSON output is always correct, but `succinctly yq '.a | type'` on a tagged scalar can
+still answer from the untagged inference. Documented as a known limitation at the
+`DocumentValue for YamlValue` impl in `light.rs`; fixing it needs threading a cursor through
+`to_owned`'s recursion (the pieces exist: `DocumentField::value_cursor`,
+`DocumentElements::uncons_cursor`) or embedding the tag in `YamlValue::String` itself, which
+fans out to ~90 pattern-match sites across 6 files — left as a follow-up rather than an
+under-tested change to an evaluator shared with JSON. Tracked as
+[#747](https://github.com/rust-works/succinctly/issues/747).
 
 ### 7. Testing Strategy
 

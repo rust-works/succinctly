@@ -93,10 +93,23 @@ pub enum YamlError {
         name: String,
     },
 
-    /// Tag not supported.
+    /// Tag not supported - kept for backwards compatibility but no longer used.
+    #[deprecated(note = "Tags are now supported (#224)")]
     TagNotSupported {
         /// Byte offset of the `!`
         offset: usize,
+    },
+
+    /// Malformed tag syntax (e.g. an unterminated verbatim `!<...>` tag).
+    ///
+    /// A bare `!` alone is the YAML 1.2 non-specific tag and is valid, not an
+    /// error - this variant is only for syntax the tag lexer cannot make
+    /// sense of at all.
+    InvalidTag {
+        /// Byte offset of the `!`
+        offset: usize,
+        /// Reason for invalidity
+        reason: &'static str,
     },
 
     /// Empty input.
@@ -202,8 +215,13 @@ impl fmt::Display for YamlError {
             Self::UnknownAnchor { offset, name } => {
                 write!(f, "unknown anchor '{name}' referenced at offset {offset}")
             }
+            #[allow(deprecated)]
+            // STYLE-0004: Display arm for a deprecated error variant kept for back-compat
             Self::TagNotSupported { offset } => {
                 write!(f, "tags (!) not supported at offset {offset}")
+            }
+            Self::InvalidTag { offset, reason } => {
+                write!(f, "invalid tag at offset {offset}: {reason}")
             }
             Self::EmptyInput => {
                 write!(f, "empty input")
@@ -339,9 +357,22 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)] // STYLE-0004: test intentionally exercises a deprecated variant's Display arm
     fn test_tag_not_supported_display() {
         let err = YamlError::TagNotSupported { offset: 8 };
         assert_eq!(err.to_string(), "tags (!) not supported at offset 8");
+    }
+
+    #[test]
+    fn test_invalid_tag_display() {
+        let err = YamlError::InvalidTag {
+            offset: 4,
+            reason: "unterminated verbatim tag",
+        };
+        assert_eq!(
+            err.to_string(),
+            "invalid tag at offset 4: unterminated verbatim tag"
+        );
     }
 
     #[test]

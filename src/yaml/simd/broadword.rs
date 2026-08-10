@@ -64,6 +64,31 @@ const fn extract_mask_u64(x: u64) -> u8 {
     ((x >> 7).wrapping_mul(MAGIC) >> 56) as u8
 }
 
+/// Find bytes equal to `target` in `chunk`, returning an exact per-byte
+/// mask (bit `i` set iff byte `i` equals `target`).
+///
+/// `has_zero_byte`'s subtraction trick never misses a real match, but it can
+/// report a false positive in the byte immediately following one: the borrow
+/// chain from a genuine zero byte ripples into the next byte and sets its
+/// high bit too, whenever that next byte's XOR distance from `target` is
+/// exactly 1 (e.g. two spaces then `!`, since `'!' ^ ' ' == 0x01`). Real
+/// match runs are the uncommon case, so re-checking only the candidate bits
+/// against the source bytes is cheap and makes the mask exact.
+#[inline(always)]
+fn find_byte_mask(chunk: u64, target: u8) -> u8 {
+    let candidate = extract_mask_u64(find_byte(chunk, target));
+    let mut verified = candidate;
+    let mut bits = candidate;
+    while bits != 0 {
+        let i = bits.trailing_zeros();
+        if ((chunk >> (8 * i)) & 0xFF) as u8 != target {
+            verified &= !(1 << i);
+        }
+        bits &= bits - 1;
+    }
+    verified
+}
+
 /// YAML character classification result using broadword operations.
 /// Each field is a u8 bitmask for 8 bytes (one bit per byte position).
 #[derive(Debug, Clone, Copy, Default)]
@@ -126,27 +151,16 @@ pub fn classify_yaml_chars_broadword(
     // Load 8 bytes as a u64
     let chunk = u64::from_le_bytes(input[offset..offset + 8].try_into().unwrap());
 
-    // Find each character type using broadword operations
-    let newlines = find_byte(chunk, b'\n');
-    let carriage_returns = find_byte(chunk, b'\r');
-    let colons = find_byte(chunk, b':');
-    let hyphens = find_byte(chunk, b'-');
-    let spaces = find_byte(chunk, b' ');
-    let quotes_double = find_byte(chunk, b'"');
-    let quotes_single = find_byte(chunk, b'\'');
-    let backslashes = find_byte(chunk, b'\\');
-    let hash = find_byte(chunk, b'#');
-
     Some(YamlCharClassBroadword {
-        newlines: extract_mask_u64(newlines),
-        carriage_returns: extract_mask_u64(carriage_returns),
-        colons: extract_mask_u64(colons),
-        hyphens: extract_mask_u64(hyphens),
-        spaces: extract_mask_u64(spaces),
-        quotes_double: extract_mask_u64(quotes_double),
-        quotes_single: extract_mask_u64(quotes_single),
-        backslashes: extract_mask_u64(backslashes),
-        hash: extract_mask_u64(hash),
+        newlines: find_byte_mask(chunk, b'\n'),
+        carriage_returns: find_byte_mask(chunk, b'\r'),
+        colons: find_byte_mask(chunk, b':'),
+        hyphens: find_byte_mask(chunk, b'-'),
+        spaces: find_byte_mask(chunk, b' '),
+        quotes_double: find_byte_mask(chunk, b'"'),
+        quotes_single: find_byte_mask(chunk, b'\''),
+        backslashes: find_byte_mask(chunk, b'\\'),
+        hash: find_byte_mask(chunk, b'#'),
     })
 }
 
@@ -205,8 +219,8 @@ pub fn classify_yaml_chars_16(input: &[u8], offset: usize) -> Option<YamlCharCla
     // Process both chunks for each character type
     #[inline(always)]
     fn classify_both(c0: u64, c1: u64, target: u8) -> u16 {
-        let m0 = extract_mask_u64(find_byte(c0, target)) as u16;
-        let m1 = extract_mask_u64(find_byte(c1, target)) as u16;
+        let m0 = find_byte_mask(c0, target) as u16;
+        let m1 = find_byte_mask(c1, target) as u16;
         m0 | (m1 << 8)
     }
 
@@ -240,13 +254,13 @@ pub fn find_quote_or_escape_broadword(input: &[u8], start: usize, end: usize) ->
     // Process 8 bytes at a time
     while offset + 8 <= len {
         let chunk = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
-        let quotes = find_byte(chunk, b'"');
-        let backslashes = find_byte(chunk, b'\\');
+        let quotes = find_byte_mask(chunk, b'"');
+        let backslashes = find_byte_mask(chunk, b'\\');
         let matches = quotes | backslashes;
 
         if matches != 0 {
             // Found a match - return position of first match
-            return Some(offset + (matches.trailing_zeros() / 8) as usize);
+            return Some(offset + matches.trailing_zeros() as usize);
         }
 
         offset += 8;
@@ -276,10 +290,10 @@ pub fn find_single_quote_broadword(input: &[u8], start: usize, end: usize) -> Op
     // Process 8 bytes at a time
     while offset + 8 <= len {
         let chunk = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
-        let matches = find_byte(chunk, b'\'');
+        let matches = find_byte_mask(chunk, b'\'');
 
         if matches != 0 {
-            return Some(offset + (matches.trailing_zeros() / 8) as usize);
+            return Some(offset + matches.trailing_zeros() as usize);
         }
 
         offset += 8;
@@ -310,17 +324,13 @@ pub fn count_leading_spaces_broadword(input: &[u8], start: usize) -> usize {
     while offset + 8 <= len {
         let chunk = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
 
-        // `find_byte` sets the high bit of every byte that IS a space, so all
-        // eight being spaces means exactly `HI_BYTES`.
-        let space_matches = find_byte(chunk, b' ');
-        if space_matches != HI_BYTES {
-            // Found a non-space - count spaces up to it
-            // Invert the mask: spaces have high bit set, non-spaces don't
-            // We want to find the first non-space
-            let non_space_mask = !space_matches & HI_BYTES;
-            if non_space_mask != 0 {
-                return offset + (non_space_mask.trailing_zeros() / 8) as usize;
-            }
+        // `find_byte_mask` sets bit `i` iff byte `i` is a space, so all eight
+        // being spaces means exactly `0xFF`.
+        let space_mask = find_byte_mask(chunk, b' ');
+        if space_mask != 0xFF {
+            // Found a non-space - count spaces up to it.
+            let non_space_mask = !space_mask;
+            return offset + non_space_mask.trailing_zeros() as usize;
         }
 
         offset += 8;
@@ -342,10 +352,10 @@ pub fn find_newline_broadword(input: &[u8], start: usize) -> Option<usize> {
     // Process 8 bytes at a time
     while offset + 8 <= len {
         let chunk = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
-        let matches = find_byte(chunk, b'\n');
+        let matches = find_byte_mask(chunk, b'\n');
 
         if matches != 0 {
-            return Some(offset + (matches.trailing_zeros() / 8) as usize);
+            return Some(offset + matches.trailing_zeros() as usize);
         }
 
         offset += 8;
@@ -369,6 +379,53 @@ mod tests {
         let colon_mask = find_byte(chunk, b':');
         assert_ne!(colon_mask, 0);
         assert_eq!(colon_mask.trailing_zeros() / 8, 5);
+    }
+
+    /// `has_zero_byte`'s subtraction trick can produce a false-positive
+    /// candidate bit in the byte immediately after a genuine match, whenever
+    /// that byte's XOR distance from the target is exactly 1 (e.g. a space
+    /// then `!`, since `'!' ^ ' ' == 0x01`) -- the borrow chain from the real
+    /// match ripples forward and flips the next byte's high bit too. This
+    /// mismatch fed straight into `count_leading_spaces_broadword`, which
+    /// under-detected the indentation-ending byte and corrupted YAML tag
+    /// parsing (yaml-test-suite cases BU8L / HMQ5 / 7FWL) under the
+    /// `broadword-yaml` feature. `find_byte_mask` re-verifies candidate bits
+    /// against the source bytes to correct this; this test checks it against
+    /// a plain byte-by-byte scan for every rotation of the adjacency.
+    #[test]
+    fn find_byte_mask_matches_scalar_reference_for_adjacent_matches() {
+        fn scalar_mask(bytes: &[u8; 8], target: u8) -> u8 {
+            let mut mask = 0u8;
+            for (i, &b) in bytes.iter().enumerate() {
+                if b == target {
+                    mask |= 1 << i;
+                }
+            }
+            mask
+        }
+
+        let cases: &[(&[u8; 8], u8)] = &[
+            (b"  !!!!!!", b' '),
+            (b" !!!!!!!", b' '),
+            (b"!!!!!!! ", b' '),
+            (b"!  !!!!!", b' '),
+            (b"!!!!!!!!", b' '),
+            (b"        ", b' '),
+            (b"a!bcdefg", b' '),
+        ];
+
+        for (bytes, target) in cases {
+            let chunk = u64::from_le_bytes(**bytes);
+            let expected = scalar_mask(bytes, *target);
+            let actual = find_byte_mask(chunk, *target);
+            assert_eq!(
+                actual,
+                expected,
+                "mismatch for {:?} target {:?}: got {actual:08b}, want {expected:08b}",
+                core::str::from_utf8(*bytes),
+                *target as char,
+            );
+        }
     }
 
     #[test]
@@ -459,6 +516,19 @@ mod tests {
         let mut input = vec![b' '; 50];
         input.extend_from_slice(b"content");
         assert_eq!(count_leading_spaces_broadword(&input, 0), 50);
+    }
+
+    /// Regression test: a tag marker (`!`) right after leading spaces used to
+    /// get swallowed as if it were more indentation, because `find_byte`'s
+    /// false-positive on the byte after a match (see
+    /// `find_byte_mask_matches_scalar_reference_for_adjacent_matches`) made
+    /// `count_leading_spaces_broadword` overcount. This mirrors the
+    /// yaml-test-suite BU8L/HMQ5 failures, which lost the `!` entirely under
+    /// the `broadword-yaml` feature.
+    #[test]
+    fn test_broadword_count_leading_spaces_stops_at_tag_marker() {
+        assert_eq!(count_leading_spaces_broadword(b"  !!bar baz", 0), 2);
+        assert_eq!(count_leading_spaces_broadword(b" !!str bar", 0), 1);
     }
 
     #[test]
