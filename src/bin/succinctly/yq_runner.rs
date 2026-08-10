@@ -562,6 +562,20 @@ fn evaluate_yaml_cursor<W: AsRef<[u64]> + Clone>(
         GenericResult::LazyIndexRange(len) => Ok(vec![OwnedValue::Array(
             (0..len).map(|i| OwnedValue::Int(i as i64)).collect(),
         )]),
+        // Same reasoning as `LazyKeys`/`LazyIndexRange` above, for a
+        // composed `map` chain (#724, #725) that never resolved into a
+        // narrower shape before reaching this materializing DOM boundary.
+        GenericResult::LazySeq(seq) => match seq.materialize_atomic() {
+            Ok(v) => Ok(vec![v]),
+            Err(jq::Control::Error(e)) => {
+                sink.report(DiagStyle::Yq, &e, &no_location());
+                Ok(vec![])
+            }
+            Err(jq::Control::Break(label)) => {
+                sink.report_break(DiagStyle::Yq, &label, &no_location());
+                Ok(vec![])
+            }
+        },
         GenericResult::None => Ok(vec![]),
         GenericResult::Error(e) => {
             sink.report(DiagStyle::Yq, &e, &no_location());

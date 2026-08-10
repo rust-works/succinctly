@@ -23,6 +23,22 @@ use indexmap::IndexMap;
 
 use super::slice::{self, SliceBounds};
 
+/// Which `EvalSemantics` implementor a value carries, as a runtime tag.
+///
+/// `eval_generic.rs`'s `GenericResult<V>`/`LazySeq<V>` are deliberately generic
+/// over `V` alone, not `V` and `S: EvalSemantics` — adding `S` as a second type
+/// parameter would ripple through every function naming `GenericResult`, the
+/// same cost the design doc's rejected `Box<dyn Iterator>` alternative pays for
+/// a lifetime parameter. A buffered `Instruction::Map` stage in a `LazySeq`
+/// still needs to know which semantics to replay with once pulled, with no `S`
+/// in scope at that point — this tag plus a 2-way match at the pull site is the
+/// bridge (see `docs/plan/jq-lazy-map-select.md`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvalTag {
+    Jq,
+    Yq,
+}
+
 /// Trait for evaluation semantics - determines behavior for edge cases.
 ///
 /// jq and yq (mikefarah/yq) have different behaviors for some operations.
@@ -37,6 +53,10 @@ pub trait EvalSemantics: Copy + Default {
     const NEGATIVE_INDEX_IN_HAS: bool;
     /// If true, `%` truncates float operands to integers (jq). If false, float modulo (yq).
     const MOD_TRUNCATES_FLOATS: bool;
+    /// Runtime identity of this semantics, for erased/re-dispatched contexts
+    /// (`LazySeq`'s buffered `Instruction`s) that can't carry `Self` as a type
+    /// parameter.
+    const TAG: EvalTag;
 }
 
 /// jq-compatible evaluation semantics (default).
@@ -52,6 +72,7 @@ impl EvalSemantics for JqSemantics {
     const DIV_BY_ZERO_IS_INFINITY: bool = false;
     const NEGATIVE_INDEX_IN_HAS: bool = false;
     const MOD_TRUNCATES_FLOATS: bool = true;
+    const TAG: EvalTag = EvalTag::Jq;
 }
 
 /// yq-compatible evaluation semantics.
@@ -67,6 +88,7 @@ impl EvalSemantics for YqSemantics {
     const DIV_BY_ZERO_IS_INFINITY: bool = true;
     const NEGATIVE_INDEX_IN_HAS: bool = true;
     const MOD_TRUNCATES_FLOATS: bool = false;
+    const TAG: EvalTag = EvalTag::Yq;
 }
 
 use crate::json::light::{JsonCursor, JsonElements, JsonFields, StandardJson};

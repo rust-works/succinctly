@@ -25,13 +25,16 @@ pub enum QueryType {
     KeysUnsorted,
     /// `keys_unsorted | length` - already lazy (#678), the achievable floor
     KeysUnsortedLength,
-    /// `keys_unsorted | map(.)` - no native arm, hits the eager fallback
+    /// `keys_unsorted | map(.)` - lazy via `GenericResult::LazySeq` (#724)
     KeysUnsortedMap,
-    /// `keys_unsorted | select(true)` - hits the eager fallback too, since
-    /// the `LazyKeysUnsorted` pipe-fanout dispatch only special-cases
-    /// `length`/`.[]`/`.[n]`/`first`/`last`
+    /// `keys_unsorted | select(true)` - still hits the eager fallback: the
+    /// `LazyKeys` pipe-fanout dispatch only special-cases
+    /// `length`/`.[]`/`.[n]`/`first`/`last`/`map` (#724 adds no dedicated
+    /// `select` arm here by design -- see `docs/plan/jq-lazy-map-select.md`'s
+    /// "select: no new code path")
     KeysUnsortedSelect,
-    /// `map(.)` over a plain container - general-container comparison
+    /// `map(.)` over a plain container - no native arm yet, hits the eager
+    /// fallback (tracked separately as #725, the dominant cost share)
     Map,
     /// `select(true)` over a plain container - general-container comparison
     Select,
@@ -69,7 +72,8 @@ impl QueryType {
         match self {
             Self::Identity => "native",
             Self::KeysUnsorted | Self::KeysUnsortedLength => "lazy (#678)",
-            Self::KeysUnsortedMap | Self::KeysUnsortedSelect | Self::Map => "eager fallback",
+            Self::KeysUnsortedMap => "lazy (#724)",
+            Self::KeysUnsortedSelect | Self::Map => "eager fallback",
             Self::Select => "native (single-value arm)",
         }
     }
@@ -905,10 +909,7 @@ mod tests {
             QueryType::KeysUnsortedLength.path_description(),
             "lazy (#678)"
         );
-        assert_eq!(
-            QueryType::KeysUnsortedMap.path_description(),
-            "eager fallback"
-        );
+        assert_eq!(QueryType::KeysUnsortedMap.path_description(), "lazy (#724)");
         assert_eq!(
             QueryType::KeysUnsortedSelect.path_description(),
             "eager fallback"

@@ -9,11 +9,15 @@ use alloc::boxed::Box;
 #[cfg(not(test))]
 use alloc::format;
 #[cfg(not(test))]
+use alloc::rc::Rc;
+#[cfg(not(test))]
 use alloc::string::{String, ToString};
 #[cfg(not(test))]
 use alloc::vec;
 #[cfg(not(test))]
 use alloc::vec::Vec;
+#[cfg(test)]
+use std::rc::Rc;
 
 use indexmap::IndexMap;
 
@@ -23,8 +27,8 @@ use super::document::{
 use super::eval::{
     compare_values, eval as full_eval, format_owned, index_one_owned as index_owned_by_key,
     needs_path_context, numeric_display_string, numeric_key_to_index, owned_bound_to_i64,
-    slice_owned_value, tonumber_from_str, Control, EvalError, EvalSemantics, JqSemantics,
-    QueryResult,
+    slice_owned_value, tonumber_from_str, Control, EvalError, EvalSemantics, EvalTag, JqSemantics,
+    QueryResult, YqSemantics,
 };
 use super::expr::{Builtin, CompareOp, Expr, FormatType, Literal};
 use super::slice::{slice_str, SliceBounds};
@@ -128,6 +132,277 @@ fn unwrap_paren(mut expr: &Expr) -> &Expr {
         expr = inner;
     }
     expr
+}
+
+/// One pending element of a `LazySeq`: still a live pointer into the source
+/// document, or a value an earlier `map` stage computed that no longer
+/// corresponds to one node in the source.
+///
+/// Must be `pub`, like `LazySeq` itself: it's the `Item` of `LazySeq`'s
+/// `Iterator` impl below, and `Iterator` is a standard-library trait always
+/// in scope, so anyone who can name the (necessarily `pub`) `LazySeq` type
+/// can call `.next()` on it and observe this type.
+#[derive(Clone)]
+pub enum LazyElem<V: DocumentValue> {
+    Cursor(V::Cursor),
+    Owned(OwnedValue),
+}
+
+// Hand-written rather than derived: deriving would require `V::Cursor: Debug`
+// generically, which `DocumentCursor` doesn't guarantee (unlike `Clone`, which
+// it does via a supertrait bound). Kept opaque on purpose, not just to satisfy
+// the compiler -- printing a cursor's full backing state is a real footgun in
+// this codebase (a YAML cursor's `Debug` walks the whole shared index,
+// including the O1/O2 sequential-cursor `Cell` cache).
+impl<V: DocumentValue> core::fmt::Debug for LazyElem<V> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Cursor(_) => f.write_str("LazyElem::Cursor(..)"),
+            Self::Owned(o) => f.debug_tuple("LazyElem::Owned").field(o).finish(),
+        }
+    }
+}
+
+/// The starting point of a `LazySeq` chain — forward-only by construction
+/// (consumed cons cells are simply gone, no rewind method exists on any
+/// variant).
+#[derive(Clone)]
+enum LazySource<V: DocumentValue> {
+    /// Bare `arr | map(f)` (#725).
+    Elements(V::Elements),
+    /// Bare `obj | map(f)` (#725).
+    Values(V::Fields),
+    /// `keys_unsorted | map(f)` (#724).
+    Keys(V::Fields),
+    /// Array `keys_unsorted | map(f)` (#724) — synthetic `[0, 1, ..., len-1]`,
+    /// no cursor to point at.
+    IndexRange { next: usize, len: usize },
+}
+
+// See `LazyElem`'s `Debug` impl above for why this is hand-written, not derived.
+impl<V: DocumentValue> core::fmt::Debug for LazySource<V> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Elements(_) => f.write_str("LazySource::Elements(..)"),
+            Self::Values(_) => f.write_str("LazySource::Values(..)"),
+            Self::Keys(_) => f.write_str("LazySource::Keys(..)"),
+            Self::IndexRange { next, len } => f
+                .debug_struct("LazySource::IndexRange")
+                .field("next", next)
+                .field("len", len)
+                .finish(),
+        }
+    }
+}
+
+impl<V: DocumentValue> LazySource<V> {
+    /// Pull one element forward, storing "the rest" back into `self`. Once a
+    /// variant's underlying cons-list is empty (or `next == len`), every
+    /// subsequent call returns `None` forever.
+    fn advance(&mut self) -> Option<LazyElem<V>> {
+        match self {
+            Self::Elements(elements) => {
+                let (cursor, rest) = elements.uncons_cursor()?;
+                *elements = rest;
+                Some(LazyElem::Cursor(cursor))
+            }
+            Self::Values(fields) => {
+                let (field, rest) = fields.uncons()?;
+                *fields = rest;
+                Some(LazyElem::Cursor(field.value_cursor))
+            }
+            Self::Keys(fields) => {
+                let (field, rest) = fields.uncons()?;
+                *fields = rest;
+                Some(LazyElem::Cursor(field.key_cursor))
+            }
+            Self::IndexRange { next, len } => {
+                if *next >= *len {
+                    return None;
+                }
+                let i = *next;
+                *next += 1;
+                Some(LazyElem::Owned(OwnedValue::Int(i as i64)))
+            }
+        }
+    }
+}
+
+/// One deferred `map(f)` stage. `select(g)` composes as a plain pipe stage
+/// evaluating `g` and testing truthiness the same way `Builtin::Select`
+/// already does elsewhere — this design adds no dedicated `select` variant.
+#[derive(Debug, Clone)]
+struct Instruction {
+    f: Rc<Expr>,
+    tag: EvalTag,
+}
+
+/// A composed, not-yet-materialized `map` chain (#724, #725).
+///
+/// See `docs/plan/jq-lazy-map-select.md`. `source` never rewinds.
+/// `instructions` grows by one `Rc`-shared entry per composed stage, so an
+/// arbitrary-length chain (`map(f) | map(g) | map(h)`) is one value, not one
+/// type per depth. `pending` buffers only the current source element's own
+/// fan-out (0..N outputs from `,`/`empty` inside one stage), never an
+/// earlier or later element — in reverse push order so `Vec::pop` yields
+/// them in original order.
+///
+/// Must be `pub`: it appears inside the public `GenericResult::LazySeq`
+/// variant, and the CLI binary crate (`jq_runner.rs`/`yq_runner.rs`) depends
+/// on this library crate, so cross-crate reachability is a real constraint.
+/// Fields stay private; only `materialize_atomic` is `pub`.
+#[derive(Clone)]
+pub struct LazySeq<V: DocumentValue> {
+    source: LazySource<V>,
+    instructions: Rc<Vec<Instruction>>,
+    pending: Vec<LazyElem<V>>,
+}
+
+// See `LazyElem`'s `Debug` impl above for why this is hand-written, not
+// derived -- and why it stays opaque rather than exposing `pending`'s
+// buffered elements.
+impl<V: DocumentValue> core::fmt::Debug for LazySeq<V> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("LazySeq")
+            .field("source", &self.source)
+            .field("instructions_len", &self.instructions.len())
+            .field("pending_len", &self.pending.len())
+            .finish()
+    }
+}
+
+impl<V: DocumentValue> LazySeq<V> {
+    fn new(source: LazySource<V>) -> Self {
+        Self {
+            source,
+            instructions: Rc::new(Vec::new()),
+            pending: Vec::new(),
+        }
+    }
+
+    /// Push one more `map(f)` stage onto this chain. `f` is cloned once per
+    /// *stage* (not per element) into a fresh `Rc` — `Builtin::Map` only ever
+    /// hands us a borrowed `&Expr` (from `unwrap_paren` in the `Pipe` fold, or
+    /// `&Builtin` in `eval_builtin`), so there is nothing to move out of.
+    fn push_map(mut self, f: &Expr, tag: EvalTag) -> Self {
+        Rc::make_mut(&mut self.instructions).push(Instruction {
+            f: Rc::new(f.clone()),
+            tag,
+        });
+        self
+    }
+
+    /// Run one `Instruction` against one pending item, re-dispatching to
+    /// whichever `EvalSemantics` the stage was pushed with. `LazyElem::Cursor`
+    /// stays inside the generic cursor evaluator — the actual win;
+    /// `LazyElem::Owned` bridges through `eval_on_owned`, only ever asked to
+    /// reindex one already-small computed/synthetic scalar (a map-produced
+    /// value or an array-`keys_unsorted` index), never the whole document.
+    fn eval_one(instr: &Instruction, elem: LazyElem<V>) -> GenericResult<V> {
+        match (elem, instr.tag) {
+            (LazyElem::Cursor(c), EvalTag::Jq) => {
+                eval_single::<JqSemantics, V>(&instr.f, c.value(), false, Some(c))
+            }
+            (LazyElem::Cursor(c), EvalTag::Yq) => {
+                eval_single::<YqSemantics, V>(&instr.f, c.value(), false, Some(c))
+            }
+            (LazyElem::Owned(o), EvalTag::Jq) => {
+                eval_on_owned::<JqSemantics, V>(&instr.f, o, false)
+            }
+            (LazyElem::Owned(o), EvalTag::Yq) => {
+                eval_on_owned::<YqSemantics, V>(&instr.f, o, false)
+            }
+        }
+    }
+
+    /// Fold one source element through every instruction in order, fanning
+    /// out via `,`/dropping via `empty` at each stage. Atomic at *this
+    /// element's own* granularity: any stage's error/break for this one
+    /// element aborts the whole element, mirroring `eval::map_over`'s
+    /// per-array-construction atomicity.
+    fn fold_one(&self, elem: LazyElem<V>) -> Result<Vec<LazyElem<V>>, Control> {
+        let mut items = vec![elem];
+        for instr in self.instructions.iter() {
+            let mut next_items = Vec::with_capacity(items.len());
+            for item in items {
+                next_items.extend(into_lazy_items(Self::eval_one(instr, item))?);
+            }
+            items = next_items;
+        }
+        Ok(items)
+    }
+
+    /// Pull every remaining element to completion, discarding the whole
+    /// in-progress array on the first error/break (mirrors `map_over`'s
+    /// atomicity — real jq's array construction is all-or-nothing:
+    /// `[1,2,"x"]|map(.+1)` prints nothing to stdout, only the stderr
+    /// diagnostic).
+    pub fn materialize_atomic(self) -> Result<OwnedValue, Control> {
+        let mut out = Vec::new();
+        for item in self {
+            match item {
+                Ok(LazyElem::Cursor(c)) => out.push(to_owned(&c.value())),
+                Ok(LazyElem::Owned(o)) => out.push(o),
+                Err(control) => return Err(control),
+            }
+        }
+        Ok(OwnedValue::Array(out))
+    }
+}
+
+impl<V: DocumentValue> Iterator for LazySeq<V> {
+    type Item = Result<LazyElem<V>, Control>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(item) = self.pending.pop() {
+                return Some(Ok(item));
+            }
+            let elem = self.source.advance()?;
+            match self.fold_one(elem) {
+                Ok(mut items) => {
+                    items.reverse();
+                    self.pending = items;
+                }
+                Err(control) => return Some(Err(control)),
+            }
+        }
+    }
+}
+
+/// Normalize any `GenericResult<V>` shape a `map` stage can produce into the
+/// `LazyElem` items it contributes to the chain — the single point every
+/// stage's output funnels through.
+fn into_lazy_items<V: DocumentValue>(
+    result: GenericResult<V>,
+) -> Result<Vec<LazyElem<V>>, Control> {
+    match result {
+        GenericResult::One(v) => Ok(vec![LazyElem::Owned(to_owned(&v))]),
+        // Stays lazy: a `map(.foo)`-style navigational sub-expr keeps
+        // composing without forcing materialization.
+        GenericResult::OneCursor(c) => Ok(vec![LazyElem::Cursor(c)]),
+        GenericResult::Many(vs) => Ok(vs.iter().map(|v| LazyElem::Owned(to_owned(v))).collect()),
+        GenericResult::ManyCursor(cs) => Ok(cs.into_iter().map(LazyElem::Cursor).collect()),
+        GenericResult::LazyKeys { fields, sorted } => Ok(vec![LazyElem::Owned(
+            materialize_lazy_keys::<V>(&fields, sorted),
+        )]),
+        GenericResult::LazyIndexRange(len) => {
+            Ok(vec![LazyElem::Owned(materialize_lazy_index_range(len))])
+        }
+        // Recursive laziness (`map(map(f))` where the *inner* `map` also
+        // stays lazy) is an explicit non-goal — force it here, same
+        // one-forward-pass cost `materialize_atomic` pays elsewhere.
+        GenericResult::LazySeq(seq) => Ok(vec![LazyElem::Owned(seq.materialize_atomic()?)]),
+        GenericResult::None => Ok(vec![]),
+        GenericResult::Owned(o) => Ok(vec![LazyElem::Owned(o)]),
+        GenericResult::ManyOwned(os) => Ok(os.into_iter().map(LazyElem::Owned).collect()),
+        GenericResult::Error(e) => Err(Control::Error(e)),
+        GenericResult::Break(label) => Err(Control::Break(label)),
+        // Same atomicity as `map_over`: a `Partial`'s already-succeeded
+        // prefix is discarded, not kept, when it's one stage's output inside
+        // a larger atomic array construction.
+        GenericResult::Partial(_, control) => Err(control),
+    }
 }
 
 /// Convert a StandardJson value to an OwnedValue.
@@ -272,6 +547,17 @@ fn push_generic_truthiness<V: DocumentValue>(
         // Same reasoning as `LazyKeys` above — the array-index-range result
         // of `keys`/`keys_unsorted` on an array is always truthy.
         GenericResult::LazyIndexRange(_) => out.push(true),
+        // Unlike `LazyKeys`/`LazyIndexRange` above, a `LazySeq` CAN fail
+        // (arbitrary `map(f)`), and that failure must surface here rather
+        // than being reported as "truthy" before construction is even known
+        // to succeed — do NOT replace this with a blind
+        // `.materialize_lazy()` call, which would also force materializing
+        // the two variants above on every `select`, undoing their whole
+        // point.
+        GenericResult::LazySeq(seq) => match seq.materialize_atomic() {
+            Ok(_array) => out.push(true),
+            Err(control) => return Some(control),
+        },
         GenericResult::None => {}
         GenericResult::Owned(v) => out.push(v.is_truthy()),
         GenericResult::ManyOwned(vs) => out.extend(vs.iter().map(OwnedValue::is_truthy)),
@@ -287,36 +573,48 @@ fn push_generic_truthiness<V: DocumentValue>(
 
 /// Flatten a batch of per-element results into one `Vec<OwnedValue>`.
 ///
-/// `items` must never contain `Error`/`Break`/`Partial` — callers that build
-/// up a per-element batch route those variants to an early return (folding
-/// whatever was already flattened into a `Partial` of their own via
-/// [`partial_generic`]) instead of pushing them here, so this only ever sees
-/// the variants that still need materializing.
-fn flatten_generic_results<V: DocumentValue>(items: Vec<GenericResult<V>>) -> Vec<OwnedValue> {
+/// A bare `Error`/`Break`/`Partial` must never appear in `items` — callers
+/// that build up a per-element batch route those variants to an early return
+/// (folding whatever was already flattened into a `Partial` of their own via
+/// [`partial_generic`]) instead of pushing them here. A `LazySeq` item CAN
+/// still fail once materialized here, though (its failure isn't known until
+/// `materialize_lazy()` actually pulls it) — that's why this returns
+/// `Result`, not a plain `Vec` as it used to before `LazySeq` existed (#725):
+/// unlike `LazyKeys`/`LazyIndexRange`, which can never fail to materialize, a
+/// `LazySeq` runs arbitrary `map(f)` and can be reached here (e.g. via
+/// `.[] | (keys_unsorted | map(f))`) before any materialization has
+/// happened.
+fn flatten_generic_results<V: DocumentValue>(
+    items: Vec<GenericResult<V>>,
+) -> Result<Vec<OwnedValue>, Control> {
     let mut results = Vec::new();
     for r in items {
-        match r {
+        match r.materialize_lazy() {
             GenericResult::One(v) => results.push(to_owned(&v)),
             GenericResult::OneCursor(c) => results.push(to_owned(&c.value())),
             GenericResult::Many(rs) => results.extend(rs.iter().map(to_owned)),
             GenericResult::ManyCursor(cs) => {
                 results.extend(cs.iter().map(|c| to_owned(&c.value())));
             }
-            GenericResult::LazyKeys { fields, sorted } => {
-                results.push(materialize_lazy_keys::<V>(&fields, sorted));
-            }
-            GenericResult::LazyIndexRange(len) => {
-                results.push(materialize_lazy_index_range(len));
-            }
             GenericResult::None => {}
             GenericResult::Owned(o) => results.push(o),
             GenericResult::ManyOwned(os) => results.extend(os),
-            GenericResult::Error(_) | GenericResult::Break(_) | GenericResult::Partial(..) => {
-                unreachable!("Error/Break/Partial already routed to an early return above")
+            // Only reachable via a `LazySeq` item that failed to
+            // materialize — a bare `Error`/`Break` still can't appear here
+            // per this function's own precondition above.
+            GenericResult::Error(e) => return Err(Control::Error(e)),
+            GenericResult::Break(label) => return Err(Control::Break(label)),
+            GenericResult::Partial(..) => {
+                unreachable!("Partial already routed to an early return above")
+            }
+            GenericResult::LazyKeys { .. }
+            | GenericResult::LazyIndexRange(_)
+            | GenericResult::LazySeq(_) => {
+                unreachable!("materialize_lazy() already normalized every lazy variant")
             }
         }
     }
-    results
+    Ok(results)
 }
 
 /// Evaluate an expression on multiple OwnedValues using the full evaluator.
@@ -344,6 +642,7 @@ fn eval_on_many_owned<S: EvalSemantics, V: DocumentValue>(
             GenericResult::LazyIndexRange(_) => {
                 unreachable!("eval_on_owned never returns LazyIndexRange")
             }
+            GenericResult::LazySeq(_) => unreachable!("eval_on_owned never returns LazySeq"),
             GenericResult::None => {}
             // The outputs already produced no longer vanish (#400, #494).
             GenericResult::Error(e) => return partial_generic(results, Control::Error(e)),
@@ -399,6 +698,13 @@ pub enum GenericResult<V: DocumentValue> {
     /// `keys`/`keys_unsorted` did.
     LazyIndexRange(usize),
 
+    /// A composed, not-yet-materialized `map` chain (#724, #725) — plain
+    /// `arr`/`obj | map(f)` and `keys_unsorted | map(f)` alike, and any
+    /// further `| map(g)` stages pushed onto the same chain by the `Pipe`
+    /// fold's composability arm below. See `LazySeq`'s own docs for the
+    /// mechanism and `docs/plan/jq-lazy-map-select.md` for the design.
+    LazySeq(LazySeq<V>),
+
     /// No result (optional that was missing).
     None,
 
@@ -420,17 +726,36 @@ pub enum GenericResult<V: DocumentValue> {
 }
 
 impl<V: DocumentValue> GenericResult<V> {
+    /// Materialize any lazy variant (`LazyKeys`/`LazyIndexRange`/`LazySeq`)
+    /// into `Owned`/`Error`/`Break`, leaving every other variant unchanged.
+    /// The shared collapse point for every consumer that was always going to
+    /// materialize a lazy result anyway (as opposed to `push_generic_truthiness`
+    /// and `eval_first_or_last_generic`, which have their own bespoke `LazySeq`
+    /// handling below specifically to avoid forcing materialization here).
+    fn materialize_lazy(self) -> Self {
+        match self {
+            Self::LazyKeys { fields, sorted } => {
+                Self::Owned(materialize_lazy_keys::<V>(&fields, sorted))
+            }
+            Self::LazyIndexRange(len) => Self::Owned(materialize_lazy_index_range(len)),
+            Self::LazySeq(seq) => match seq.materialize_atomic() {
+                Ok(owned) => Self::Owned(owned),
+                Err(Control::Error(e)) => Self::Error(e),
+                Err(Control::Break(label)) => Self::Break(label),
+            },
+            other => other,
+        }
+    }
+
     /// Convert to OwnedValue for output.
     pub fn into_owned(self) -> Option<OwnedValue> {
-        match self {
+        match self.materialize_lazy() {
             Self::One(v) => Some(to_owned(&v)),
             Self::OneCursor(c) => Some(to_owned(&c.value())),
             Self::Many(vs) => Some(OwnedValue::Array(vs.iter().map(to_owned).collect())),
             Self::ManyCursor(cs) => Some(OwnedValue::Array(
                 cs.iter().map(|c| to_owned(&c.value())).collect(),
             )),
-            Self::LazyKeys { fields, sorted } => Some(materialize_lazy_keys::<V>(&fields, sorted)),
-            Self::LazyIndexRange(len) => Some(materialize_lazy_index_range(len)),
             Self::None => None,
             Self::Error(_) => None,
             Self::Owned(o) => Some(o),
@@ -439,6 +764,9 @@ impl<V: DocumentValue> GenericResult<V> {
             // A `Partial` prefix is not representable as a single value —
             // same "not representable" answer as `Break`/`Error` here.
             Self::Partial(..) => None,
+            Self::LazyKeys { .. } | Self::LazyIndexRange(_) | Self::LazySeq(_) => {
+                unreachable!("materialize_lazy() already normalized every lazy variant")
+            }
         }
     }
 
@@ -447,19 +775,20 @@ impl<V: DocumentValue> GenericResult<V> {
     /// A `Partial` collects its prefix — the whole point of #400/#494 is
     /// that those outputs are no longer discarded.
     pub fn collect_owned(self) -> Vec<OwnedValue> {
-        match self {
+        match self.materialize_lazy() {
             Self::One(v) => vec![to_owned(&v)],
             Self::OneCursor(c) => vec![to_owned(&c.value())],
             Self::Many(vs) => vs.iter().map(to_owned).collect(),
             Self::ManyCursor(cs) => cs.iter().map(|c| to_owned(&c.value())).collect(),
-            Self::LazyKeys { fields, sorted } => vec![materialize_lazy_keys::<V>(&fields, sorted)],
-            Self::LazyIndexRange(len) => vec![materialize_lazy_index_range(len)],
             Self::None => vec![],
             Self::Error(_) => vec![],
             Self::Owned(o) => vec![o],
             Self::ManyOwned(os) => os,
             Self::Break(_) => vec![],
             Self::Partial(vs, _control) => vs,
+            Self::LazyKeys { .. } | Self::LazyIndexRange(_) | Self::LazySeq(_) => {
+                unreachable!("materialize_lazy() already normalized every lazy variant")
+            }
         }
     }
 
@@ -559,6 +888,35 @@ impl<V: DocumentValue> GenericResult<V> {
                 stats.last_was_falsy = false;
                 stats.any_truthy = true;
             }
+            // Deliberately NOT a zero-buffer writer like `LazyKeys`'s
+            // unsorted arm above: `map`'s array construction is atomic in
+            // real jq (`[1,2,"x"]|map(.+1)` prints nothing to stdout, only
+            // the stderr diagnostic), but a byte-at-a-time writer would
+            // already have flushed `[1,2,` to `out` before discovering
+            // element 3 fails — wrong, unfixable-after-the-fact output. One
+            // atomic forward pass via `materialize_atomic`, then reuse the
+            // already-tested `OwnedValue::stream_json` — this still avoids
+            // the reserialize+reindex+separate-evaluator round trip that was
+            // the actual expensive part; a single `Vec<OwnedValue>` for the
+            // final array was never it.
+            Self::LazySeq(seq) => match seq.clone().materialize_atomic() {
+                Ok(owned) => {
+                    owned.stream_json(out, indent_spaces)?;
+                    on_value(out)?;
+                    stats.count = 1;
+                    stats.last_was_falsy = owned.is_falsy();
+                    stats.any_truthy = !stats.last_was_falsy;
+                }
+                Err(control) => {
+                    stats.error = Some(match control {
+                        Control::Error(e) => stream_error(&e),
+                        Control::Break(label) => StreamError {
+                            message: format!("break ${label} not in label"),
+                            not_a_string: false,
+                        },
+                    });
+                }
+            },
             Self::ManyCursor(cs) => {
                 for c in cs {
                     c.stream_json(out, indent, sort_keys)?;
@@ -707,6 +1065,27 @@ impl<V: DocumentValue> GenericResult<V> {
                 stats.last_was_falsy = false;
                 stats.any_truthy = true;
             }
+            // Same atomicity reasoning as `stream_json`'s `LazySeq` arm
+            // above — no zero-buffer writer, one atomic forward pass then
+            // reuse `OwnedValue::stream_yaml`.
+            Self::LazySeq(seq) => match seq.clone().materialize_atomic() {
+                Ok(owned) => {
+                    owned.stream_yaml(out, indent_spaces)?;
+                    on_value(out)?;
+                    stats.count = 1;
+                    stats.last_was_falsy = owned.is_falsy();
+                    stats.any_truthy = !stats.last_was_falsy;
+                }
+                Err(control) => {
+                    stats.error = Some(match control {
+                        Control::Error(e) => stream_error(&e),
+                        Control::Break(label) => StreamError {
+                            message: format!("break ${label} not in label"),
+                            not_a_string: false,
+                        },
+                    });
+                }
+            },
             Self::None => {
                 // No output
             }
@@ -1077,7 +1456,7 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                     GenericResult::Many(vs) => {
                         let mut results = Vec::new();
                         for v in vs {
-                            match eval_single::<S, _>(expr, v, optional, None) {
+                            match eval_single::<S, _>(expr, v, optional, None).materialize_lazy() {
                                 GenericResult::One(r) => results.push(to_owned(&r)),
                                 GenericResult::OneCursor(c) => results.push(to_owned(&c.value())),
                                 GenericResult::Many(rs) => {
@@ -1085,12 +1464,6 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                                 }
                                 GenericResult::ManyCursor(cs) => {
                                     results.extend(cs.iter().map(|c| to_owned(&c.value())));
-                                }
-                                GenericResult::LazyKeys { fields, sorted } => {
-                                    results.push(materialize_lazy_keys::<V>(&fields, sorted));
-                                }
-                                GenericResult::LazyIndexRange(len) => {
-                                    results.push(materialize_lazy_index_range(len));
                                 }
                                 GenericResult::None => {}
                                 // The outputs already piped through no longer
@@ -1106,6 +1479,13 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                                 GenericResult::Partial(vs2, control) => {
                                     results.extend(vs2);
                                     return partial_generic(results, control);
+                                }
+                                GenericResult::LazyKeys { .. }
+                                | GenericResult::LazyIndexRange(_)
+                                | GenericResult::LazySeq(_) => {
+                                    unreachable!(
+                                        "materialize_lazy() already normalized every lazy variant"
+                                    )
                                 }
                             }
                         }
@@ -1137,23 +1517,44 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                         for c in cs {
                             match eval_single::<S, _>(&rest, c.value(), optional, Some(c)) {
                                 // The elements already piped through no
-                                // longer vanish (#400, #494).
+                                // longer vanish (#400, #494). If an earlier
+                                // element's own buffered `LazySeq` also fails
+                                // once `flatten_generic_results` materializes
+                                // it, that earlier failure wins -- it's
+                                // chronologically first in evaluation order.
                                 GenericResult::Error(e) => {
-                                    return partial_generic(
-                                        flatten_generic_results(per_element),
-                                        Control::Error(e),
-                                    );
+                                    return match flatten_generic_results(per_element) {
+                                        Ok(prefix) => partial_generic(prefix, Control::Error(e)),
+                                        Err(Control::Error(earlier)) => {
+                                            GenericResult::Error(earlier)
+                                        }
+                                        Err(Control::Break(label)) => GenericResult::Break(label),
+                                    };
                                 }
                                 GenericResult::Break(label) => {
-                                    return partial_generic(
-                                        flatten_generic_results(per_element),
-                                        Control::Break(label),
-                                    );
+                                    return match flatten_generic_results(per_element) {
+                                        Ok(prefix) => {
+                                            partial_generic(prefix, Control::Break(label))
+                                        }
+                                        Err(Control::Error(earlier)) => {
+                                            GenericResult::Error(earlier)
+                                        }
+                                        Err(Control::Break(earlier_label)) => {
+                                            GenericResult::Break(earlier_label)
+                                        }
+                                    };
                                 }
                                 GenericResult::Partial(vs, control) => {
-                                    let mut prefix = flatten_generic_results(per_element);
-                                    prefix.extend(vs);
-                                    return partial_generic(prefix, control);
+                                    return match flatten_generic_results(per_element) {
+                                        Ok(mut prefix) => {
+                                            prefix.extend(vs);
+                                            partial_generic(prefix, control)
+                                        }
+                                        Err(Control::Error(earlier)) => {
+                                            GenericResult::Error(earlier)
+                                        }
+                                        Err(Control::Break(label)) => GenericResult::Break(label),
+                                    };
                                 }
                                 other => per_element.push(other),
                             }
@@ -1175,11 +1576,11 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                                     .collect(),
                             )
                         } else {
-                            let results = flatten_generic_results(per_element);
-                            if results.is_empty() {
-                                GenericResult::None
-                            } else {
-                                GenericResult::ManyOwned(results)
+                            match flatten_generic_results(per_element) {
+                                Ok(results) if results.is_empty() => GenericResult::None,
+                                Ok(results) => GenericResult::ManyOwned(results),
+                                Err(Control::Error(e)) => GenericResult::Error(e),
+                                Err(Control::Break(label)) => GenericResult::Break(label),
                             }
                         };
                     }
@@ -1278,6 +1679,16 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                                 None => GenericResult::Owned(OwnedValue::Null),
                             }
                         }
+                        // Slice 1 (#724): stay lazy instead of falling
+                        // through to the `_` materializing fallback below —
+                        // reuses the composability arm (`GenericResult::LazySeq`
+                        // below) for everything past this first `map` stage.
+                        // Same `!sorted` guard as the other fast-path arms
+                        // above: sorted `keys` still needs a full decode+sort
+                        // first.
+                        Expr::Builtin(Builtin::Map(f)) if !sorted => GenericResult::LazySeq(
+                            LazySeq::new(LazySource::Keys(fields)).push_map(f, S::TAG),
+                        ),
                         _ => eval_on_owned::<S, _>(
                             expr,
                             materialize_lazy_keys::<V>(&fields, sorted),
@@ -1338,9 +1749,129 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                                 GenericResult::Owned(OwnedValue::Int(len as i64 - 1))
                             }
                         }
+                        // Slice 1 (#724), array counterpart of `LazyKeys`'s
+                        // own `Builtin::Map` arm above. No `!sorted` guard —
+                        // array "keys" are never sorted.
+                        Expr::Builtin(Builtin::Map(f)) => GenericResult::LazySeq(
+                            LazySeq::new(LazySource::IndexRange { next: 0, len })
+                                .push_map(f, S::TAG),
+                        ),
                         _ => {
                             eval_on_owned::<S, _>(expr, materialize_lazy_index_range(len), optional)
                         }
+                    },
+                    // The composability engine (#724, #725): every further
+                    // `| map(g)` stage just pushes onto the same chain
+                    // (self-recursive by construction — an arbitrary-length
+                    // `map(f) | map(g) | map(h)` stays one `LazySeq`, not one
+                    // type per depth). A handful of consumers get a genuine
+                    // single-forward-pass native fast path; everything else
+                    // materializes once (`materialize_atomic`) and hands off
+                    // to the full evaluator — still one pass, not the
+                    // original four-pass round trip.
+                    GenericResult::LazySeq(mut seq) => match unwrap_paren(expr) {
+                        Expr::Builtin(Builtin::Map(h)) => {
+                            GenericResult::LazySeq(seq.push_map(h, S::TAG))
+                        }
+
+                        // Count-and-discard: every element still runs (so a
+                        // `map(f)` that errors partway still errors), but no
+                        // `OwnedValue` is ever built for any of them. Atomic,
+                        // same as `materialize_atomic` -- `length` of an
+                        // array construction that fails is itself a failure,
+                        // not a partial count.
+                        Expr::Builtin(Builtin::Length) => {
+                            let mut count: i64 = 0;
+                            for item in seq {
+                                match item {
+                                    Ok(_) => count += 1,
+                                    Err(Control::Error(e)) => return GenericResult::Error(e),
+                                    Err(Control::Break(label)) => {
+                                        return GenericResult::Break(label)
+                                    }
+                                }
+                            }
+                            GenericResult::Owned(OwnedValue::Int(count))
+                        }
+
+                        // `.[]` is a generator, NOT array construction:
+                        // already-yielded elements survive a later element's
+                        // error -- `Partial` semantics, mirroring the
+                        // existing `ManyCursor` arm's own convention above.
+                        // Deliberately a different atomicity boundary than
+                        // `Length`/the `_` fallback below.
+                        Expr::Iterate => {
+                            let mut items = Vec::new();
+                            let mut control = None;
+                            for item in seq {
+                                match item {
+                                    Ok(elem) => items.push(elem),
+                                    Err(c) => {
+                                        control = Some(c);
+                                        break;
+                                    }
+                                }
+                            }
+                            let all_cursor =
+                                items.iter().all(|item| matches!(item, LazyElem::Cursor(_)));
+                            match control {
+                                None if items.is_empty() => GenericResult::None,
+                                None if all_cursor => GenericResult::ManyCursor(
+                                    items
+                                        .into_iter()
+                                        .map(|item| match item {
+                                            LazyElem::Cursor(c) => c,
+                                            LazyElem::Owned(_) => {
+                                                unreachable!("checked all_cursor above")
+                                            }
+                                        })
+                                        .collect(),
+                                ),
+                                None => GenericResult::ManyOwned(
+                                    items
+                                        .into_iter()
+                                        .map(|item| match item {
+                                            LazyElem::Cursor(c) => to_owned(&c.value()),
+                                            LazyElem::Owned(o) => o,
+                                        })
+                                        .collect(),
+                                ),
+                                Some(control) => {
+                                    let prefix = items
+                                        .into_iter()
+                                        .map(|item| match item {
+                                            LazyElem::Cursor(c) => to_owned(&c.value()),
+                                            LazyElem::Owned(o) => o,
+                                        })
+                                        .collect();
+                                    partial_generic(prefix, control)
+                                }
+                            }
+                        }
+
+                        // Pull-one-and-stop: at most one element of `seq` is
+                        // ever evaluated.
+                        Expr::Builtin(Builtin::First) | Expr::Index(0) => match seq.next() {
+                            None => GenericResult::Owned(OwnedValue::Null),
+                            Some(Ok(LazyElem::Cursor(c))) => GenericResult::OneCursor(c),
+                            Some(Ok(LazyElem::Owned(o))) => GenericResult::Owned(o),
+                            Some(Err(Control::Error(e))) => GenericResult::Error(e),
+                            Some(Err(Control::Break(label))) => GenericResult::Break(label),
+                        },
+
+                        // `last`, nonzero `.[n]`, whole-value `select`,
+                        // comparisons, everything else: one atomic forward
+                        // pass, then hand off to the full evaluator -- still
+                        // one pass, not the original four-pass round trip.
+                        // `select` deliberately gets no dedicated arm here —
+                        // it materializes once and runs through
+                        // `eval_on_owned`'s already-correct `Builtin::Select`
+                        // handling, same as any other computed value.
+                        _ => match seq.materialize_atomic() {
+                            Ok(owned) => eval_on_owned::<S, _>(expr, owned, optional),
+                            Err(Control::Error(e)) => GenericResult::Error(e),
+                            Err(Control::Break(label)) => GenericResult::Break(label),
+                        },
                     },
                     GenericResult::None => GenericResult::None,
                     GenericResult::Error(e) => return GenericResult::Error(e),
@@ -1395,14 +1926,15 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
             let right_result = eval_single::<S, _>(right, value, false, cursor);
 
             // Convert results to OwnedValue for comparison
-            let left_owned = match left_result {
+            let left_owned = match left_result.materialize_lazy() {
                 GenericResult::Owned(o) => o,
                 GenericResult::One(v) => to_owned(&v),
                 GenericResult::OneCursor(c) => to_owned(&c.value()),
-                GenericResult::LazyKeys { fields, sorted } => {
-                    materialize_lazy_keys::<V>(&fields, sorted)
+                GenericResult::LazyKeys { .. }
+                | GenericResult::LazyIndexRange(_)
+                | GenericResult::LazySeq(_) => {
+                    unreachable!("materialize_lazy() already normalized every lazy variant")
                 }
-                GenericResult::LazyIndexRange(len) => materialize_lazy_index_range(len),
                 GenericResult::Error(e) => {
                     return if optional {
                         GenericResult::None
@@ -1440,14 +1972,15 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                 GenericResult::Partial(vs, _control) => vs.into_iter().next().unwrap(),
             };
 
-            let right_owned = match right_result {
+            let right_owned = match right_result.materialize_lazy() {
                 GenericResult::Owned(o) => o,
                 GenericResult::One(v) => to_owned(&v),
                 GenericResult::OneCursor(c) => to_owned(&c.value()),
-                GenericResult::LazyKeys { fields, sorted } => {
-                    materialize_lazy_keys::<V>(&fields, sorted)
+                GenericResult::LazyKeys { .. }
+                | GenericResult::LazyIndexRange(_)
+                | GenericResult::LazySeq(_) => {
+                    unreachable!("materialize_lazy() already normalized every lazy variant")
                 }
-                GenericResult::LazyIndexRange(len) => materialize_lazy_index_range(len),
                 GenericResult::Error(e) => {
                     return if optional {
                         GenericResult::None
@@ -1593,6 +2126,12 @@ fn eval_first_or_last_generic<S: EvalSemantics, V: DocumentValue>(
                 GenericResult::LazyKeys { fields, sorted }
             }
             GenericResult::LazyIndexRange(len) => GenericResult::LazyIndexRange(len),
+            // Same forwarding, same reasoning: `first(inner)`/`last(inner)`
+            // only need to know *which* of `inner`'s outputs this is, never
+            // inspect the value itself, so forwarding doesn't swallow
+            // anything -- whoever consumes the returned `LazySeq` next
+            // materializes it, and any error surfaces there.
+            GenericResult::LazySeq(seq) => GenericResult::LazySeq(seq),
             GenericResult::None => GenericResult::None,
             GenericResult::Error(e) => GenericResult::Error(e),
             GenericResult::Break(label) => GenericResult::Break(label),
@@ -1625,6 +2164,7 @@ fn eval_first_or_last_generic<S: EvalSemantics, V: DocumentValue>(
                 GenericResult::LazyKeys { fields, sorted }
             }
             GenericResult::LazyIndexRange(len) => GenericResult::LazyIndexRange(len),
+            GenericResult::LazySeq(seq) => GenericResult::LazySeq(seq),
             GenericResult::None => GenericResult::None,
             GenericResult::Error(e) => GenericResult::Error(e),
             GenericResult::Break(label) => GenericResult::Break(label),
@@ -1751,10 +2291,19 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
         // An owned target (a computed, non-navigational left side) has no
         // borrowed representation here; round-trip it through the shared
         // owned-value path by re-entering with the materialized document.
+        // `LazySeq` shares this arm too: `collect_owned()` materializes it
+        // (via `materialize_lazy()`) the same as the other lazy variants.
+        // Known, narrow, pre-existing gap, not a new regression:
+        // `collect_owned()` already silently swallows any error into an
+        // empty `Vec` for every variant that can error (`Partial`, and now
+        // a failing `LazySeq`) -- `(keys_unsorted|map(error("x")))[$k]`
+        // swallows the error into "no results" rather than propagating it,
+        // same as it already did for other error-producing shapes here.
         owned @ (GenericResult::Owned(_)
         | GenericResult::ManyOwned(_)
         | GenericResult::LazyKeys { .. }
-        | GenericResult::LazyIndexRange(_)) => {
+        | GenericResult::LazyIndexRange(_)
+        | GenericResult::LazySeq(_)) => {
             let targets = owned.collect_owned();
             let mut out = Vec::with_capacity(keys.len() * targets.len());
             for k in &keys {
@@ -1868,10 +2417,13 @@ fn eval_slice_expr<S: EvalSemantics, V: DocumentValue>(
         GenericResult::ManyCursor(cs) => {
             Targets::Borrowed(cs.iter().map(DocumentCursor::value).collect())
         }
+        // See `eval_index_expr`'s identical arm for the accepted, pre-existing
+        // error-swallowing note that also applies to `LazySeq` here.
         owned @ (GenericResult::Owned(_)
         | GenericResult::ManyOwned(_)
         | GenericResult::LazyKeys { .. }
-        | GenericResult::LazyIndexRange(_)) => Targets::Owned(owned.collect_owned()),
+        | GenericResult::LazyIndexRange(_)
+        | GenericResult::LazySeq(_)) => Targets::Owned(owned.collect_owned()),
     };
 
     // Start outer, end middle, target inner. The result is always owned:
@@ -3076,19 +3628,22 @@ mod tests {
     }
 
     #[test]
-    fn test_generic_keys_unsorted_fallback_map_select() {
-        // `map`/`select` have no native lazy path -- `eval_generic.rs` has
-        // no native `Builtin::Map` arm at all (see the `Pipe` dispatch's
-        // `LazyKeys` arm doc comment) -- so these must still materialize
-        // correctly via the fallback.
+    fn test_generic_keys_unsorted_map_stays_lazy_724() {
+        // `keys_unsorted | map(f)` now takes the `LazySeq` fast path (#724)
+        // instead of the `to_owned`->reserialize->reindex->re-evaluate
+        // fallback -- assert the intermediate shape *before* materializing,
+        // then confirm materializing still produces the same values the old
+        // fallback-pinning version of this test checked.
         let json = br#"{"b": 1, "a": 2, "c": 3}"#;
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let value = cursor.value();
 
         let expr = crate::jq::parse("keys_unsorted | map(ascii_upcase)").unwrap();
+        let result = eval(&expr, value.clone());
+        assert!(matches!(result, GenericResult::LazySeq(_)));
         assert_eq!(
-            eval(&expr, value.clone()).into_owned().unwrap(),
+            result.into_owned().unwrap(),
             OwnedValue::Array(vec![
                 OwnedValue::String("B".to_string()),
                 OwnedValue::String("A".to_string()),
@@ -3096,6 +3651,10 @@ mod tests {
             ])
         );
 
+        // `select` gets no dedicated lazy arm by design (it materializes
+        // once via the composability arm's `_` fallback, then runs through
+        // the already-correct `Builtin::Select`) -- still correct, still one
+        // pass instead of the four-pass round trip.
         let expr = crate::jq::parse("keys_unsorted | select(length == 3)").unwrap();
         assert_eq!(
             eval(&expr, value).into_owned().unwrap(),
@@ -3239,15 +3798,24 @@ mod tests {
     }
 
     #[test]
-    fn test_generic_keys_sorted_fallback_map_select() {
+    fn test_generic_keys_sorted_map_select_stays_eager() {
+        // Sorted `keys | map/select` deliberately stays on the eager
+        // fallback (#724 doesn't change this): sorting requires observing
+        // every key before emitting the first one, a different complexity
+        // class than the `!sorted` guard's document-order fast path -- see
+        // the non-goals in docs/plan/jq-lazy-map-select.md. Confirm the
+        // guard actually excludes this: `keys` (sorted) must NOT produce a
+        // `LazySeq`.
         let json = br#"{"b": 1, "a": 2, "c": 3}"#;
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let value = cursor.value();
 
         let expr = crate::jq::parse("keys | map(ascii_upcase)").unwrap();
+        let result = eval(&expr, value.clone());
+        assert!(!matches!(result, GenericResult::LazySeq(_)));
         assert_eq!(
-            eval(&expr, value.clone()).into_owned().unwrap(),
+            result.into_owned().unwrap(),
             OwnedValue::Array(vec![
                 OwnedValue::String("A".to_string()),
                 OwnedValue::String("B".to_string()),
@@ -3434,17 +4002,20 @@ mod tests {
     }
 
     #[test]
-    fn test_generic_array_keys_unsorted_fallback_map_select() {
-        // `map`/`select` have no native lazy path here either -- must still
-        // materialize correctly via the fallback.
+    fn test_generic_array_keys_unsorted_map_stays_lazy_724() {
+        // Array counterpart of `test_generic_keys_unsorted_map_stays_lazy_724`
+        // above: `keys_unsorted | map(f)` on an array's synthetic index
+        // range also takes the `LazySeq` fast path (#724).
         let json = br#"["x","y","z"]"#;
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let value = cursor.value();
 
         let expr = crate::jq::parse("keys_unsorted | map(. * 10)").unwrap();
+        let result = eval(&expr, value.clone());
+        assert!(matches!(result, GenericResult::LazySeq(_)));
         assert_eq!(
-            eval(&expr, value.clone()).into_owned().unwrap(),
+            result.into_owned().unwrap(),
             OwnedValue::Array(vec![
                 OwnedValue::Int(0),
                 OwnedValue::Int(10),
@@ -3461,6 +4032,83 @@ mod tests {
                 OwnedValue::Int(2),
             ])
         );
+    }
+
+    #[test]
+    fn test_generic_lazy_seq_composability_keys_unsorted_map_select_724() {
+        // The actual point of this design: `keys_unsorted | map(f) | select(g)`
+        // stays lazy through the `map` stage, materializes once at `select`.
+        let json = br#"{"bb": 1, "a": 2, "ccc": 3}"#;
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+
+        let expr =
+            crate::jq::parse("keys_unsorted | map(ascii_upcase) | select(length == 3)").unwrap();
+        assert_eq!(
+            eval(&expr, value).into_owned().unwrap(),
+            OwnedValue::Array(vec![
+                OwnedValue::String("BB".to_string()),
+                OwnedValue::String("A".to_string()),
+                OwnedValue::String("CCC".to_string()),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_generic_lazy_seq_atomicity_vs_iterate_contrast_724() {
+        // `map`'s array construction is atomic; `.[]` over the same failing
+        // chain is a generator and keeps its already-yielded prefix instead
+        // -- two different, both-correct atomicity boundaries.
+        let json = br#"{"a":1,"b":2,"c":3}"#;
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+
+        let expr =
+            crate::jq::parse(r#"keys_unsorted | map(if . == "b" then error("boom") else . end)"#)
+                .unwrap();
+        let result = eval(&expr, value.clone());
+        assert!(matches!(result, GenericResult::LazySeq(_)));
+        // Atomic: `map`'s own array construction discards the whole
+        // in-progress array on the first error -- no partial prefix, even
+        // though `"a"` (document order's first key) already succeeded.
+        assert_eq!(result.collect_owned(), Vec::<OwnedValue>::new());
+        assert!(eval(&expr, value.clone()).materialize_lazy().is_error());
+
+        let expr = crate::jq::parse(
+            r#"keys_unsorted | map(if . == "b" then error("boom") else . end) | .[]"#,
+        )
+        .unwrap();
+        let result = eval(&expr, value);
+        // Non-atomic: `.[]` is a generator over the `map` chain's own
+        // per-element outputs, not array construction -- `"a"` (which the
+        // `map` stage already resolved successfully before `"b"` failed)
+        // survives as a `Partial` prefix instead of being discarded, the
+        // opposite of the `map`-alone case just above.
+        assert!(result.is_error());
+        assert_eq!(
+            result.collect_owned(),
+            vec![OwnedValue::String("a".to_string())]
+        );
+    }
+
+    /// Known, narrow, pre-existing gap (not a new regression from #724):
+    /// `collect_owned()` already silently swallows any error into an empty
+    /// `Vec` for every variant that can error -- a failing `LazySeq` reached
+    /// through a computed index just adds one more path into that same
+    /// accepted lossy contract. Documented here, not fixed.
+    #[test]
+    fn test_generic_lazy_seq_computed_index_swallows_error_724() {
+        let json = br#"{"a":1,"b":2}"#;
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+
+        let expr =
+            crate::jq::parse(r#"(keys_unsorted | map(error("x")))[("a" | length - 1)]"#).unwrap();
+        let result = eval(&expr, value);
+        assert!(!result.is_error());
     }
 
     #[test]
@@ -4252,6 +4900,87 @@ mod tests {
             .stream_yaml(&mut out, IndentSpec::spaces(2), false, |_| Ok(()))
             .unwrap();
         assert_eq!(out, "- b\n- a\n- c");
+    }
+
+    #[test]
+    fn test_yaml_keys_unsorted_map_stays_lazy_724() {
+        // YAML counterpart of `test_generic_keys_unsorted_map_stays_lazy_724`
+        // -- the `LazySeq`/`Pipe`-fold fast path is generic over
+        // `V: DocumentValue`, so a YAML mapping goes through the exact same
+        // evaluator arms as a JSON object.
+        use crate::yaml::YamlIndex;
+
+        let yaml = b"b: 1\na: 2\nc: 3\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let doc_cursor = index
+            .root(yaml)
+            .first_child()
+            .expect("YAML document should have content");
+
+        let expr = crate::jq::parse("keys_unsorted | map(ascii_upcase)").unwrap();
+        let result = eval_with_cursor(&expr, doc_cursor);
+        assert!(matches!(result, GenericResult::LazySeq(_)));
+        assert_eq!(
+            result.into_owned().unwrap(),
+            OwnedValue::Array(vec![
+                OwnedValue::String("B".to_string()),
+                OwnedValue::String("A".to_string()),
+                OwnedValue::String("C".to_string()),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_yaml_array_keys_unsorted_map_stays_lazy_724() {
+        use crate::yaml::YamlIndex;
+
+        let yaml = b"- x\n- y\n- z\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let doc_cursor = index
+            .root(yaml)
+            .first_child()
+            .expect("YAML document should have content");
+
+        let expr = crate::jq::parse("keys_unsorted | map(. * 10)").unwrap();
+        let result = eval_with_cursor(&expr, doc_cursor);
+        assert!(matches!(result, GenericResult::LazySeq(_)));
+        assert_eq!(
+            result.into_owned().unwrap(),
+            OwnedValue::Array(vec![
+                OwnedValue::Int(0),
+                OwnedValue::Int(10),
+                OwnedValue::Int(20),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_yaml_keys_unsorted_map_merge_key_lazy_724() {
+        // Same as `test_yaml_keys_unsorted_map_stays_lazy_724` but resolved
+        // through a `<<: *anchor` merge key, exercising `YamlFields`'s
+        // `Merged` variant (an `Rc`-shared entry list, `Clone` but not
+        // `Copy`) through `LazySource::Keys`'s forward-only `uncons()`
+        // pulling, not just the plain cursor-walk `Direct` variant.
+        use crate::yaml::YamlIndex;
+
+        let yaml = b"defaults: &defaults\n  b: 1\n  a: 2\nitem:\n  <<: *defaults\n  c: 3\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let doc_cursor = index
+            .root(yaml)
+            .first_child()
+            .expect("YAML document should have content");
+
+        let expr = crate::jq::parse(".item | keys_unsorted | map(ascii_upcase)").unwrap();
+        let result = eval_with_cursor(&expr, doc_cursor);
+        assert!(matches!(result, GenericResult::LazySeq(_)));
+        assert_eq!(
+            result.into_owned().unwrap(),
+            OwnedValue::Array(vec![
+                OwnedValue::String("B".to_string()),
+                OwnedValue::String("A".to_string()),
+                OwnedValue::String("C".to_string()),
+            ])
+        );
     }
 
     #[test]
