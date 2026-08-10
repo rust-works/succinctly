@@ -384,9 +384,16 @@ pub fn stream_lazy_seq_json<V: DocumentValue>(
                     buf.write_char('\n')?;
                     write_indent(&mut buf, indent.width, indent.unit)?;
                 }
-                match elem {
-                    LazyElem::Cursor(c) => c.stream_json(&mut buf, indent, sort_keys)?,
-                    LazyElem::Owned(o) => o.stream_json(&mut buf, indent, sort_keys)?,
+                if indent.width == 0 {
+                    stream_lazy_elem_json(&elem, &mut buf, indent, sort_keys)?;
+                } else {
+                    // The element sits one level inside this array (depth
+                    // `indent.width`), but `stream_json` always renders
+                    // starting at nominal depth 0 — render into a scratch
+                    // buffer, then shift it into place (#724).
+                    let mut scratch = String::new();
+                    stream_lazy_elem_json(&elem, &mut scratch, indent, sort_keys)?;
+                    append_reindented(&mut buf, indent.width, indent.unit, &scratch);
                 }
                 i += 1;
             }
@@ -582,6 +589,80 @@ fn write_indent<W: core::fmt::Write>(out: &mut W, width: usize, unit: char) -> c
     Ok(())
 }
 
+/// Append `rendered` — already rendered starting at nominal indent 0, e.g.
+/// via `StreamableValue::stream_json`/`stream_yaml`, which always start
+/// there and have no `current_indent` parameter to override it — to `buf`,
+/// shifting every line but the first right by `indent_spaces`.
+///
+/// This produces exactly what rendering the same value with `current_indent
+/// = indent_spaces` from the start would have (the internal `Array`/`Object`
+/// recursion above only ever writes an indent prefix for lines *after* the
+/// first — the first line's own prefix is always the caller's
+/// responsibility, one level up), without needing a `current_indent`-aware
+/// entry point on `StreamableValue`/`DocumentCursor`. Used by
+/// `stream_lazy_seq_json`/`_yaml` (#724) to correctly indent a `LazySeq`
+/// element's own nested containers one level inside the array.
+fn append_reindented(buf: &mut String, width: usize, unit: char, rendered: &str) {
+    let mut lines = rendered.split('\n');
+    if let Some(first) = lines.next() {
+        buf.push_str(first);
+    }
+    for line in lines {
+        buf.push('\n');
+        for _ in 0..width {
+            buf.push(unit);
+        }
+        buf.push_str(line);
+    }
+}
+
+/// Stream one `LazySeq` element as JSON, dispatching on whether it's still a
+/// live cursor into the source document or an owned value a stage computed.
+fn stream_lazy_elem_json<V: DocumentValue, W: core::fmt::Write>(
+    elem: &LazyElem<V>,
+    out: &mut W,
+    indent: IndentSpec,
+    sort_keys: bool,
+) -> core::fmt::Result {
+    match elem {
+        LazyElem::Cursor(c) => c.stream_json(out, indent, sort_keys),
+        LazyElem::Owned(o) => o.stream_json(out, indent, sort_keys),
+    }
+}
+
+/// The YAML counterpart of `stream_lazy_elem_json` above.
+fn stream_lazy_elem_yaml<V: DocumentValue, W: core::fmt::Write>(
+    elem: &LazyElem<V>,
+    out: &mut W,
+    indent: IndentSpec,
+    sort_keys: bool,
+) -> core::fmt::Result {
+    match elem {
+        LazyElem::Cursor(c) => c.stream_yaml(out, indent, sort_keys),
+        LazyElem::Owned(o) => o.stream_yaml(out, indent, sort_keys),
+    }
+}
+
+/// Whether a `LazySeq` element should get its own indented line in YAML
+/// block style, mirroring `stream_owned_value_yaml`'s `Array`/`Object` arms'
+/// "nested containers go on the next line" convention (empty containers
+/// render as the one-line `[]`/`{}`, so they stay inline like scalars).
+///
+/// Source elements from `keys_unsorted`/array `keys_unsorted` are always
+/// scalar key/index cursors (see `stream_lazy_keys_yaml`'s own doc comment),
+/// but a composed `map(f)` stage can produce or forward a cursor into an
+/// arbitrary, possibly-container part of the document (e.g. `map($doc.foo)`
+/// closing over an unrelated cursor) — so this can't assume `Cursor` is
+/// always scalar just because today's only production `LazySource`s are.
+fn lazy_elem_is_nonempty_container<V: DocumentValue>(elem: &LazyElem<V>) -> bool {
+    match elem {
+        LazyElem::Cursor(c) => c.is_container() && c.first_child().is_some(),
+        LazyElem::Owned(o) => {
+            matches!(o, OwnedValue::Array(_) | OwnedValue::Object(_)) && !is_empty_container(o)
+        }
+    }
+}
+
 /// Stream a string as YAML with smart quoting.
 ///
 /// Uses double quotes if the string contains special characters,
@@ -667,10 +748,7 @@ pub fn stream_lazy_seq_yaml<V: DocumentValue>(
                     if i > 0 {
                         buf.write_str(", ")?;
                     }
-                    match elem {
-                        LazyElem::Cursor(c) => c.stream_yaml(&mut buf, indent, sort_keys)?,
-                        LazyElem::Owned(o) => o.stream_yaml(&mut buf, indent, sort_keys)?,
-                    }
+                    stream_lazy_elem_yaml(&elem, &mut buf, indent, sort_keys)?;
                     i += 1;
                 }
                 Err(control) => return Ok(Err(control)),
@@ -691,16 +769,34 @@ pub fn stream_lazy_seq_yaml<V: DocumentValue>(
                         buf.write_char('\n')?;
                     }
                     buf.write_str("- ")?;
-                    match elem {
-                        LazyElem::Cursor(c) => c.stream_yaml(&mut buf, indent, sort_keys)?,
-                        LazyElem::Owned(o) => o.stream_yaml(&mut buf, indent, sort_keys)?,
+                    // Mirrors `stream_owned_value_yaml`'s `Array` arm: a
+                    // nested non-empty container goes on its own indented
+                    // line, everything else stays inline after `- `.
+                    let own_line = lazy_elem_is_nonempty_container(&elem);
+                    // The element sits one level inside this array (depth
+                    // `indent.width`), but `stream_yaml` always renders
+                    // starting at nominal depth 0 — render into a scratch
+                    // buffer, then shift it into place (#724).
+                    let mut scratch = String::new();
+                    stream_lazy_elem_yaml(&elem, &mut scratch, indent, sort_keys)?;
+                    if own_line {
+                        buf.write_char('\n')?;
+                        write_indent(&mut buf, indent.width, indent.unit)?;
                     }
+                    append_reindented(&mut buf, indent.width, indent.unit, &scratch);
                     i += 1;
                 }
                 Err(control) => return Ok(Err(control)),
             }
         }
-        out.write_str(&buf)?;
+        // Unlike flow style above, an empty block-style array previously
+        // fell through to `out.write_str(&buf)` with `buf` still empty,
+        // writing nothing instead of `[]` (#724).
+        if i == 0 {
+            out.write_str("[]")?;
+        } else {
+            out.write_str(&buf)?;
+        }
     }
     Ok(Ok(()))
 }

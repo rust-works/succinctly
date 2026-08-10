@@ -3884,6 +3884,99 @@ mod tests {
         );
     }
 
+    /// `stream_lazy_seq_json`/`_yaml` (#724) must indent a mapped element's
+    /// own nested containers relative to the element's true depth (one level
+    /// inside the array), not nominal depth 0 -- verified by requiring the
+    /// lazy `LazySeq` streaming path to byte-match the eager `OwnedValue`
+    /// streaming path for the exact same query, rather than a hand-computed
+    /// expected string.
+    #[test]
+    fn test_generic_keys_unsorted_lazy_map_stream_json_nested_indent() {
+        use crate::jq::stream::StreamableValue;
+
+        let json = br#"{"b": 1, "a": 2}"#;
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+
+        let expr = crate::jq::parse(r"keys_unsorted | map({x: ., y: [1, 2]})").unwrap();
+
+        let lazy = eval(&expr, value.clone());
+        assert!(matches!(lazy, GenericResult::LazySeq(_)));
+        let mut lazy_buf = String::new();
+        lazy.stream_json(&mut lazy_buf, IndentSpec::spaces(2), false, |_| Ok(()))
+            .unwrap();
+
+        let eager = eval(&expr, value).into_owned().unwrap();
+        let mut eager_buf = String::new();
+        eager
+            .stream_json(&mut eager_buf, IndentSpec::spaces(2), false)
+            .unwrap();
+
+        assert_eq!(lazy_buf, eager_buf);
+        // Pin the actual shape too, so a future change to *both* paths in
+        // the same wrong way can't cancel out.
+        assert_eq!(
+            lazy_buf,
+            "[\n  {\n    \"x\": \"b\",\n    \"y\": [\n      1,\n      2\n    ]\n  },\n  {\n    \"x\": \"a\",\n    \"y\": [\n      1,\n      2\n    ]\n  }\n]"
+        );
+    }
+
+    /// YAML counterpart of the JSON indent test above -- also exercises the
+    /// block-style "nested container gets its own line after `- `"
+    /// convention (`stream_owned_value_yaml`'s `Array` arm), which
+    /// `stream_lazy_seq_yaml` previously skipped entirely.
+    #[test]
+    fn test_generic_keys_unsorted_lazy_map_stream_yaml_nested_indent() {
+        use crate::jq::stream::StreamableValue;
+
+        let json = br#"{"b": 1, "a": 2}"#;
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+
+        let expr = crate::jq::parse(r"keys_unsorted | map({x: ., y: [1, 2]})").unwrap();
+
+        let lazy = eval(&expr, value.clone());
+        assert!(matches!(lazy, GenericResult::LazySeq(_)));
+        let mut lazy_buf = String::new();
+        lazy.stream_yaml(&mut lazy_buf, IndentSpec::spaces(2), false, |_| Ok(()))
+            .unwrap();
+
+        let eager = eval(&expr, value).into_owned().unwrap();
+        let mut eager_buf = String::new();
+        eager
+            .stream_yaml(&mut eager_buf, IndentSpec::spaces(2), false)
+            .unwrap();
+
+        assert_eq!(lazy_buf, eager_buf);
+        assert_eq!(
+            lazy_buf,
+            "- \n  x: b\n  y:\n    - 1\n    - 2\n- \n  x: a\n  y:\n    - 1\n    - 2"
+        );
+    }
+
+    /// `stream_lazy_seq_yaml`'s block-style branch previously had no `i ==
+    /// 0` short circuit (unlike its own flow-style branch just above it and
+    /// the sibling `stream_lazy_keys_yaml`), so an empty `LazySeq` wrote
+    /// nothing instead of `[]` (#724).
+    #[test]
+    fn test_generic_keys_unsorted_lazy_map_stream_yaml_empty_block() {
+        let json = br"{}";
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+
+        let expr = crate::jq::parse("keys_unsorted | map(.)").unwrap();
+        let lazy = eval(&expr, value);
+        assert!(matches!(lazy, GenericResult::LazySeq(_)));
+
+        let mut block_yaml = String::new();
+        lazy.stream_yaml(&mut block_yaml, IndentSpec::spaces(2), false, |_| Ok(()))
+            .unwrap();
+        assert_eq!(block_yaml, "[]");
+    }
+
     #[test]
     fn test_generic_keys_unsorted_lazy_large_object() {
         // No allocation-count assertion here (that's covered by the A/B
