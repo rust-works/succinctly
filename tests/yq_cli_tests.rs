@@ -4858,3 +4858,31 @@ fn test_style_builtin_anchor_prefix_does_not_mask_style() -> Result<()> {
 
     Ok(())
 }
+
+/// The DOM path's `evaluate_yaml_cursor` (`yq_runner.rs`) has its own
+/// `GenericResult::LazySeq` arm. `can_use_m2_streaming` rejects
+/// `Builtin::Map` outright, so any top-level `map(f)` query takes this DOM
+/// fallback rather than the M2 streaming path -- no special flag needed
+/// (unlike `keys_unsorted`, which the M2 path *does* accept) (#725).
+/// Exercise all three outcomes (success, error, break) against the real
+/// binary rather than relying on incidental coverage elsewhere.
+#[test]
+fn test_top_level_map_lazy_seq_dom_fallback_725() -> Result<()> {
+    let input = "a: 1\nb: 2\nc: 3\n";
+
+    let (output, code) = run_yq_stdin("map(. + 1)", input, &["-o", "json", "-I0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "[2,3,4]");
+
+    let (output, stderr, code) = run_yq_stdin_with_stderr("map(. + 1)", "a: 1\nb: two\n", &[])?;
+    assert_eq!(code, 1);
+    assert_eq!(output, "");
+    assert!(stderr.contains("cannot be added"), "{stderr}");
+
+    let (output, stderr, code) = run_yq_stdin_with_stderr("map(break $out)", input, &[])?;
+    assert_eq!(code, 1);
+    assert_eq!(output, "");
+    assert!(stderr.contains("break $out not in label"), "{stderr}");
+
+    Ok(())
+}

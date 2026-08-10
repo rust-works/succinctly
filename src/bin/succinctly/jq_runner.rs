@@ -1613,6 +1613,20 @@ fn evaluate_input(
         GenericResult::LazyIndexRange(len) => Ok(vec![OwnedValue::Array(
             (0..len).map(|i| OwnedValue::Int(i as i64)).collect(),
         )]),
+        // Same reasoning as `LazyKeys`/`LazyIndexRange` above, for a
+        // composed `map` chain (#724, #725) that never resolved into a
+        // narrower shape before reaching this materializing boundary.
+        GenericResult::LazySeq(seq) => match seq.materialize_atomic() {
+            Ok(v) => Ok(vec![v]),
+            Err(jq::Control::Error(e)) => {
+                sink.report(DiagStyle::Jq, &e, at);
+                Ok(vec![])
+            }
+            Err(jq::Control::Break(label)) => {
+                sink.report_break(DiagStyle::Jq, &label, at);
+                Ok(vec![])
+            }
+        },
         GenericResult::None => Ok(vec![]),
         GenericResult::Error(e) => {
             sink.report(DiagStyle::Jq, &e, at);
@@ -1700,6 +1714,22 @@ fn generic_result_to_jq_values<'a, W: Clone + AsRef<[u64]>>(
         // `keys_unsorted` (#684): `write_json`/`print_json` write the
         // `[0,1,...,len-1]` digits directly, no `Vec<OwnedValue::Int>`.
         GenericResult::LazyIndexRange(len) => vec![JqValue::LazyIndexRange(len)],
+        // `JqValue` needs no new variant for a composed `map` chain (#724,
+        // #725): `JqValue::Array` already stores per-element cursors (its
+        // own "Phase 1 Lazy Optimization"), so materializing once here and
+        // wrapping via `from_owned` reuses the existing `write_json` path
+        // entirely.
+        GenericResult::LazySeq(seq) => match seq.materialize_atomic() {
+            Ok(v) => vec![JqValue::from_owned(v)],
+            Err(jq::Control::Error(e)) => {
+                sink.report(DiagStyle::Jq, &e, at);
+                vec![]
+            }
+            Err(jq::Control::Break(label)) => {
+                sink.report_break(DiagStyle::Jq, &label, at);
+                vec![]
+            }
+        },
         GenericResult::None => vec![],
         GenericResult::Error(e) => {
             sink.report(DiagStyle::Jq, &e, at);
