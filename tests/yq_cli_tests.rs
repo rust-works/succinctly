@@ -5497,3 +5497,86 @@ fn test_line_comment_builtin_through_param_substitution_710() -> Result<()> {
     assert_eq!(out, "1\n\"\"\n");
     Ok(())
 }
+
+// Key-scoped trailing line comment preservation (#765), a follow-up to
+// #710: a comment trailing a mapping *key*'s own line, when the value is
+// deferred to a following line (nested mapping/sequence), belongs to the
+// key, not the value - #710's `line_comments`/`CommentTree` machinery was
+// entirely value-node-scoped and dropped it silently. Every expected string
+// here was verified byte-for-byte against the pinned real `yq` binary
+// before being pinned, same as the #710 block above.
+
+/// The issue's own repro: a key-trailing comment, value deferred to a
+/// nested mapping.
+#[test]
+fn test_key_comment_preserved_with_nested_mapping_value_765() -> Result<()> {
+    let (out, code) = run_yq_stdin(".", "a: # comment on key\n  b: 1\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "a: # comment on key\n  b: 1\n");
+    Ok(())
+}
+
+/// Same shape, but the deferred value is a nested sequence rather than a
+/// nested mapping.
+#[test]
+fn test_key_comment_preserved_with_nested_sequence_value_765() -> Result<()> {
+    let (out, code) = run_yq_stdin(".", "a: # comment on key\n  - 1\n  - 2\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "a: # comment on key\n  - 1\n  - 2\n");
+    Ok(())
+}
+
+/// Real `yq` doesn't expose this comment through any getter - it only
+/// survives via full-tree re-serialization (see the issue's own
+/// investigation). `line_comment` on the value (`.a`) or a descendant
+/// (`.a.b`) must stay blank; this is the non-goal the issue explicitly
+/// pins down. (`head_comment`/`foot_comment` aren't implemented by
+/// succinctly at all - `Error: undefined function` - so there's nothing
+/// to pin for them here.)
+#[test]
+fn test_key_comment_not_exposed_via_line_comment_getter_765() -> Result<()> {
+    let input = "a: # comment on key\n  b: 1\n";
+
+    let (out, code) = run_yq_stdin(".a | line_comment", input, &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "''\n");
+
+    let (out, code) = run_yq_stdin(".a.b | line_comment", input, &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "''\n");
+
+    Ok(())
+}
+
+/// A cursor-preserving filter (the DOM/`CommentTree` path, not bare
+/// identity's M2 streaming path) must also place the key's comment right
+/// after `key:`, not just plain `.`.
+#[test]
+fn test_key_comment_preserved_via_select_dom_path_765() -> Result<()> {
+    let (out, code) = run_yq_stdin("select(true)", "a: # comment on key\n  b: 1\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "a: # comment on key\n  b: 1\n");
+    Ok(())
+}
+
+/// `-S`/`--sort-keys` reorders siblings but must still resolve the key
+/// comment by field name, same as #710's value-comment equivalent
+/// (`test_sort_keys_preserves_comments_710`).
+#[test]
+fn test_key_comment_preserved_with_sort_keys_765() -> Result<()> {
+    let (out, code) = run_yq_stdin(".", "z: 9\na: # comment on key\n  b: 1\n", &["-S"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "a: # comment on key\n  b: 1\nz: 9\n");
+    Ok(())
+}
+
+/// Regression guard: a comment trailing a same-line (not deferred) value
+/// keeps belonging to the value (#710), not the key - the new #765 capture
+/// point is only reached when the value is deferred to a following line.
+#[test]
+fn test_key_comment_not_captured_for_same_line_value_765() -> Result<()> {
+    let (out, code) = run_yq_stdin(".", "a: 1 # keep this\nb: 2\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "a: 1 # keep this\nb: 2\n");
+    Ok(())
+}
