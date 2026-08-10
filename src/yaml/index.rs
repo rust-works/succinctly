@@ -1345,4 +1345,66 @@ mod tests {
             );
         }
     }
+
+    // ------------------------------------------------------------------------
+    // from_parts (#224: tags round-trip)
+    // ------------------------------------------------------------------------
+
+    /// `from_parts` is the public constructor for loading pre-serialized index
+    /// data (mirrors `SimpleJsonIndex::from_parts` in `json/simple_light.rs`).
+    /// Unlike its JSON siblings it had no direct test at all - build a
+    /// `YamlIndex` normally, tear it back down into the raw parts via
+    /// `build_semi_index` (the same function `YamlIndex::build` itself calls),
+    /// reconstruct through `from_parts`, and check the reconstructed index
+    /// behaves identically. The `tags` map is this PR's new field, so the
+    /// fixture carries an explicit tag (`!!str`) specifically to exercise it,
+    /// not just the fields `from_parts` already had before #224.
+    #[test]
+    fn test_from_parts_round_trip_with_tags() {
+        let yaml: &[u8] = b"a: !!str 1\n";
+
+        let built = YamlIndex::build(yaml).expect("should parse");
+
+        let semi = build_semi_index(yaml).expect("should parse");
+        let reconstructed = YamlIndex::from_parts(
+            semi.ib,
+            semi.ib_len,
+            semi.bp,
+            semi.bp_len,
+            semi.ty,
+            semi.ty_len,
+            semi.bp_to_text,
+            semi.bp_to_text_end,
+            semi.containers,
+            semi.anchors,
+            semi.aliases,
+            semi.tags,
+        );
+
+        // Same document either way, and the tag did its job: `!!str` forces
+        // the plain scalar `1` to resolve as the string "1", not the number 1.
+        let expected_json = r#"[{"a":"1"}]"#;
+        assert_eq!(built.root(yaml).to_json(), expected_json);
+        assert_eq!(reconstructed.root(yaml).to_json(), expected_json);
+
+        // The tag itself must survive the round trip too, not just its
+        // effect on resolution - look it up by the tagged value's own BP
+        // position on both indexes.
+        let fields = match built.root(yaml).value() {
+            crate::yaml::YamlValue::Sequence(mut docs) => match docs.next().expect("one doc") {
+                crate::yaml::YamlValue::Mapping(fields) => fields,
+                other => panic!("expected mapping, got {other:?}"),
+            },
+            other => panic!("expected root sequence, got {other:?}"),
+        };
+        let (field, _rest) = fields.uncons().expect("one field");
+        let value_bp_pos = field.value_cursor().bp_position();
+
+        assert_eq!(built.get_tag(value_bp_pos), Some("!!str"));
+        assert_eq!(
+            reconstructed.get_tag(value_bp_pos),
+            Some("!!str"),
+            "tags map must survive from_parts round trip"
+        );
+    }
 }
