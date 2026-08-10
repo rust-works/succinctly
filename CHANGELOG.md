@@ -2209,6 +2209,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   input is bound to `null` rather than jq's own internal `{"__jq":N}` break
   marker, which is an implementation detail not worth replicating.
 
+- **`paths(node_filter)` only kept a path when `node_filter` evaluated to the
+  literal boolean `true`, instead of any truthy output** (#718): real jq
+  defines `paths(node_filter)` as `path(recurse|select(node_filter))`, so a
+  path is kept whenever `node_filter` — a general filter, not necessarily a
+  boolean expression — produces at least one truthy value. `builtin_paths_filter`
+  instead required `eval_owned_expr` to return exactly `Ok(OwnedValue::Bool(true))`,
+  which happened to work for boolean-producing filters like `type ==
+  "number"` (the only shape the existing golden/unit coverage exercised) but
+  silently dropped every path for the far more common category of filters
+  that yield the value itself — `scalars`, `numbers`, `strings`, `arrays`,
+  `objects`, `values`, `nulls`, or any user `select()`-style filter. `[1,2] |
+  paths(scalars)` no longer returns `[]` where jq returns `[[0],[1]]`. Found
+  while adding oracle-verified golden coverage for bare `paths`/`leaf_paths`;
+  fixed by checking `OwnedValue::is_truthy()` instead of exact equality with
+  `Bool(true)`.
+
 ### Changed
 
 - **A tag on an anchored sequence item is now rejected** (#328): `- &a !!str x`

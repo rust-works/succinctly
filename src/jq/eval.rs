@@ -12288,11 +12288,15 @@ fn builtin_paths_filter<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         if let OwnedValue::Array(path_arr) = &path {
             // Get the value at this path
             if let Some(val_at_path) = get_value_at_path(&owned, path_arr) {
-                // Check if filter matches
-                if let Ok(OwnedValue::Bool(true)) =
-                    eval_owned_expr::<S>(filter, &val_at_path, optional)
-                {
-                    filtered_paths.push(path);
+                // jq's `paths(node_filter)` is `path(recurse|select(node_filter))`:
+                // the path is kept whenever node_filter's result is truthy, not only
+                // when it's the literal boolean `true`. This matters for filters like
+                // `scalars`/`numbers`/`values` that yield the value itself rather than
+                // a boolean.
+                if let Ok(result) = eval_owned_expr::<S>(filter, &val_at_path, optional) {
+                    if result.is_truthy() {
+                        filtered_paths.push(path);
+                    }
                 }
             }
         }
@@ -12379,7 +12383,8 @@ fn collect_leaf_paths(
 }
 
 /// Builtin: leaf_paths - paths to scalar (non-container) values
-/// Returns each path as a separate output (streaming), matching jq's paths(scalars) behavior
+/// Returns each path as a separate output (streaming). Diverges from jq's
+/// `paths(scalars)` idiom for `null` and empty containers — see #771.
 fn builtin_leaf_paths<W: Clone + AsRef<[u64]>>(
     value: StandardJson<'_, W>,
     _optional: bool,
@@ -24373,6 +24378,41 @@ mod tests {
     }
 
     #[test]
+    fn test_leaf_paths_nested_mixed() {
+        // Object key inside array inside array, per jq.test:992-995's stress shape
+        // (see paths_bare_nested_mixed / paths_scalars_nested_mixed golden cases).
+        // Diverges from real jq's `paths(scalars)` idiom by also treating the null
+        // at "d" as a leaf — see #771.
+        query!(br#"{"a":[{"b":1},{"c":[2,3]}],"d":null}"#, "[leaf_paths]",
+            QueryResult::Owned(OwnedValue::Array(paths)) => {
+                assert_eq!(paths, vec![
+                    OwnedValue::Array(vec![OwnedValue::String("a".into()), OwnedValue::Int(0), OwnedValue::String("b".into())]),
+                    OwnedValue::Array(vec![OwnedValue::String("a".into()), OwnedValue::Int(1), OwnedValue::String("c".into()), OwnedValue::Int(0)]),
+                    OwnedValue::Array(vec![OwnedValue::String("a".into()), OwnedValue::Int(1), OwnedValue::String("c".into()), OwnedValue::Int(1)]),
+                    OwnedValue::Array(vec![OwnedValue::String("d".into())]),
+                ]);
+            }
+        );
+    }
+
+    #[test]
+    fn test_leaf_paths_object_in_array_in_array() {
+        // jq's own jq.test:992-995 shape (see paths_bare_object_in_array_in_array /
+        // paths_scalars_object_in_array_in_array golden cases). Diverges from real
+        // jq's `paths(scalars)` idiom by also treating the empty array at [1,0] as
+        // a leaf — see #771.
+        query!(br#"[1,[[],{"a":2}]]"#, "[leaf_paths]",
+            QueryResult::Owned(OwnedValue::Array(paths)) => {
+                assert_eq!(paths, vec![
+                    OwnedValue::Array(vec![OwnedValue::Int(0)]),
+                    OwnedValue::Array(vec![OwnedValue::Int(1), OwnedValue::Int(0)]),
+                    OwnedValue::Array(vec![OwnedValue::Int(1), OwnedValue::Int(1), OwnedValue::String("a".into())]),
+                ]);
+            }
+        );
+    }
+
+    #[test]
     fn test_setpath() {
         query!(br#"{"a": 1}"#, r#"setpath(["b"]; 2)"#,
             QueryResult::Owned(OwnedValue::Object(obj)) => {
@@ -25872,6 +25912,37 @@ mod tests {
         query!(br#"{"a": 1, "b": "hello", "c": 2}"#, "[paths(type == \"number\")]",
             QueryResult::Owned(OwnedValue::Array(arr)) => {
                 assert_eq!(arr.len(), 2);
+            }
+        );
+    }
+
+    #[test]
+    fn test_paths_filter_scalars_regression() {
+        // Regression: paths(f) used to only keep a path when f evaluated to the
+        // literal `true`, not any truthy value — this broke every node_filter
+        // that yields the value itself instead of a boolean (scalars, numbers,
+        // values, ...). See paths_scalars_object_in_array_in_array golden case
+        // (#718), matching real jq's `[paths(scalars)]` on the same input.
+        query!(br#"[1,[[],{"a":2}]]"#, "[paths(scalars)]",
+            QueryResult::Owned(OwnedValue::Array(paths)) => {
+                assert_eq!(paths, vec![
+                    OwnedValue::Array(vec![OwnedValue::Int(0)]),
+                    OwnedValue::Array(vec![OwnedValue::Int(1), OwnedValue::Int(1), OwnedValue::String("a".into())]),
+                ]);
+            }
+        );
+    }
+
+    #[test]
+    fn test_paths_filter_numbers_regression() {
+        // Same bug as test_paths_filter_scalars_regression, a different
+        // non-boolean node_filter.
+        query!(br#"{"a": 1, "b": "x", "c": 2.5}"#, "[paths(numbers)]",
+            QueryResult::Owned(OwnedValue::Array(paths)) => {
+                assert_eq!(paths, vec![
+                    OwnedValue::Array(vec![OwnedValue::String("a".into())]),
+                    OwnedValue::Array(vec![OwnedValue::String("c".into())]),
+                ]);
             }
         );
     }
