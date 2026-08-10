@@ -2325,7 +2325,7 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // YAML metadata functions (yq)
         Builtin::Tag => builtin_tag::<W>(value),
         Builtin::Anchor => builtin_anchor::<W>(),
-        Builtin::Style => builtin_style::<W>(value),
+        Builtin::Style => builtin_style::<W>(),
         Builtin::Kind => builtin_kind::<W>(value),
         Builtin::Line => builtin_line::<W>(),
         Builtin::Column => builtin_column::<W>(),
@@ -16762,28 +16762,28 @@ fn builtin_tag<W: Clone + AsRef<[u64]>>(value: StandardJson<'_, W>) -> QueryResu
     QueryResult::Owned(OwnedValue::String(tag.to_string()))
 }
 
-// Builtin: anchor - return anchor name if present
-// Since YAML metadata is lost during conversion to OwnedValue, this always returns empty string.
-// In a full yq implementation, this would require tracking anchor metadata through the pipeline.
+/// `anchor` - returns the YAML anchor name at the current node (yq)
+///
+/// Always `""` here: this is the "full"/`OwnedValue` evaluator (`eval` in
+/// this file), whose `eval_single` never carries a cursor at all — see
+/// [`builtin_line`]'s doc comment for why. YAML anchor names live only in
+/// the source text via [`YamlCursor::anchor`](crate::yaml::light::YamlCursor::anchor),
+/// which `src/jq/eval_generic.rs`'s cursor-carrying `Builtin::Anchor` arm
+/// (#709) reaches for real YAML input; this permanently-empty answer is
+/// also correct for JSON input, which has no anchor concept at all.
 fn builtin_anchor<'a, W: Clone + AsRef<[u64]>>() -> QueryResult<'a, W> {
-    // Currently YAML anchors are not preserved through the OwnedValue conversion.
-    // Return empty string to match yq behavior for values without anchors.
     QueryResult::Owned(OwnedValue::String(String::new()))
 }
 
-// Builtin: style - return scalar/collection style
-// Since YAML style metadata is lost during conversion to OwnedValue, this returns
-// reasonable defaults based on the JSON structure.
-fn builtin_style<W: Clone + AsRef<[u64]>>(value: StandardJson<'_, W>) -> QueryResult<'_, W> {
-    let style = match &value {
-        // Collections: yq returns "flow" for flow-style, empty for block-style
-        // Since we lose this info, we return empty string (block-style is more common)
-        StandardJson::Array(_) | StandardJson::Object(_) => "",
-        // Scalars: yq returns "double", "single", "literal", "folded", or empty for plain
-        // Since we lose quote info, we return empty string (plain scalar)
-        _ => "",
-    };
-    QueryResult::Owned(OwnedValue::String(style.to_string()))
+/// `style` - returns the YAML style indicator at the current node (yq)
+///
+/// Always `""` here, for the same reason as [`builtin_anchor`]: no cursor,
+/// so no access to [`YamlCursor::style`](crate::yaml::light::YamlCursor::style).
+/// `src/jq/eval_generic.rs`'s `Builtin::Style` arm (#709) resolves the real
+/// block/flow/quote style for YAML input; `""` is also correct here for
+/// JSON input, which has no style concept.
+fn builtin_style<'a, W: Clone + AsRef<[u64]>>() -> QueryResult<'a, W> {
+    QueryResult::Owned(OwnedValue::String(String::new()))
 }
 
 /// `kind` - returns the node kind: "scalar", "seq", or "map"
@@ -27543,8 +27543,11 @@ mod tests {
     }
 
     #[test]
-    fn test_anchor_returns_empty() {
-        // anchor always returns empty string (metadata not preserved)
+    fn test_anchor_returns_empty_for_json() {
+        // JSON has no anchor concept, so "" is correct here — this is not
+        // exercising the stub `eval.rs` used to hard-code (#709); real YAML
+        // anchor resolution is covered by
+        // `eval_generic::tests::test_yaml_anchor_builtin_with_cursor`.
         query!(br#"{"a": 1}"#, "anchor",
             QueryResult::Owned(OwnedValue::String(s)) => {
                 assert_eq!(s, "");
@@ -27553,8 +27556,10 @@ mod tests {
     }
 
     #[test]
-    fn test_style_returns_empty() {
-        // style always returns empty string (metadata not preserved)
+    fn test_style_returns_empty_for_json() {
+        // JSON has no style concept, so "" is correct here — see
+        // `test_anchor_returns_empty_for_json`; real YAML style resolution
+        // is covered by `eval_generic::tests::test_yaml_style_builtin_with_cursor`.
         query!(br#""hello""#, "style",
             QueryResult::Owned(OwnedValue::String(s)) => {
                 assert_eq!(s, "");

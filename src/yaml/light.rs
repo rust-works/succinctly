@@ -4842,6 +4842,16 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
     }
 
     #[inline]
+    fn anchor(&self) -> Option<&str> {
+        YamlCursor::anchor(self)
+    }
+
+    #[inline]
+    fn style(&self) -> &'static str {
+        YamlCursor::style(self)
+    }
+
+    #[inline]
     fn cursor_at_offset(&self, offset: usize) -> Option<Self> {
         YamlCursor::cursor_at_offset(self, offset)
     }
