@@ -150,6 +150,3 @@ regex_test_z_unknown_flag      regex-flags   unknown flag characters are silentl
 strftime_raw_number_input          datetime   strftime requires an array; real jq accepts a raw timestamp number too — #759
 date_roundtrip_leap_year_torture   datetime   same root cause as strftime_raw_number_input — #759
 strftime_unsupported_specifiers    datetime   %U/%V/%W/%G/%g are not implemented — #760
-gmtime_type_error_on_string        datetime   error wording diverges from jq's "gmtime() requires numeric inputs" — #761
-mktime_type_error_on_number        datetime   error wording diverges from jq's "mktime requires array inputs" — #761
-strptime_no_match_error            datetime   error wording diverges from jq's `date "..." does not match format "..."` — #761
