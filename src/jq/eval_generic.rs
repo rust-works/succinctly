@@ -599,6 +599,37 @@ impl<V: DocumentValue> Iterator for LazySeq<V> {
     }
 }
 
+/// Convert a `Control` signal into the `GenericResult` variant that reports
+/// it — the shared tail of every `LazySeq`/`materialize_atomic` drain site
+/// in this file (#724), previously hand-duplicated as a two-arm
+/// `Err(Control::Error(e)) => return GenericResult::Error(e), Err(Control::
+/// Break(label)) => return GenericResult::Break(label)` at each site. Not
+/// for sites that need `optional`-aware Error handling — see
+/// [`control_into_generic_optional`] for those.
+fn control_into_generic<V: DocumentValue>(control: Control) -> GenericResult<V> {
+    match control {
+        Control::Error(e) => GenericResult::Error(e),
+        Control::Break(label) => GenericResult::Break(label),
+    }
+}
+
+/// [`control_into_generic`]'s counterpart for the handful of sites (`Expr::
+/// Compare`'s operand materialization) where an ambient `optional` should
+/// swallow an `Error` into `GenericResult::None` — mirroring how every other
+/// `GenericResult::Error` arm at those same sites already treats `optional`.
+/// `Break` is never `optional`-gated anywhere in this file, so this always
+/// propagates it unconditionally, same as the non-`optional` variant above.
+fn control_into_generic_optional<V: DocumentValue>(
+    control: Control,
+    optional: bool,
+) -> GenericResult<V> {
+    match control {
+        Control::Error(_) if optional => GenericResult::None,
+        Control::Error(e) => GenericResult::Error(e),
+        Control::Break(label) => GenericResult::Break(label),
+    }
+}
+
 /// Fully evaluate a `LazySeq` in one forward pass.
 ///
 /// Mirrors `eval::map_over`'s atomicity: a mid-stream error/break discards
@@ -1762,10 +1793,7 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                             for item in seq {
                                 match item {
                                     Ok(_) => count += 1,
-                                    Err(Control::Error(e)) => return GenericResult::Error(e),
-                                    Err(Control::Break(label)) => {
-                                        return GenericResult::Break(label)
-                                    }
+                                    Err(control) => return control_into_generic(control),
                                 }
                             }
                             GenericResult::Owned(OwnedValue::Int(count))
@@ -1799,10 +1827,7 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                                         }
                                         owned.push(o);
                                     }
-                                    Err(Control::Error(e)) => return GenericResult::Error(e),
-                                    Err(Control::Break(label)) => {
-                                        return GenericResult::Break(label)
-                                    }
+                                    Err(control) => return control_into_generic(control),
                                 }
                             }
                             if any_owned {
@@ -1833,10 +1858,7 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                                             first = Some(elem);
                                         }
                                     }
-                                    Err(Control::Error(e)) => return GenericResult::Error(e),
-                                    Err(Control::Break(label)) => {
-                                        return GenericResult::Break(label)
-                                    }
+                                    Err(control) => return control_into_generic(control),
                                 }
                             }
                             match first {
@@ -1858,10 +1880,7 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                             for item in seq {
                                 match item {
                                     Ok(elem) => last = Some(elem),
-                                    Err(Control::Error(e)) => return GenericResult::Error(e),
-                                    Err(Control::Break(label)) => {
-                                        return GenericResult::Break(label)
-                                    }
+                                    Err(control) => return control_into_generic(control),
                                 }
                             }
                             match last {
@@ -1876,8 +1895,7 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                         // `LazyKeys`/`LazyIndexRange`'s own fallback arms.
                         _ => match materialize_atomic(seq) {
                             Ok(owned) => eval_on_owned::<S, _>(expr, owned, optional),
-                            Err(Control::Error(e)) => GenericResult::Error(e),
-                            Err(Control::Break(label)) => GenericResult::Break(label),
+                            Err(control) => control_into_generic(control),
                         },
                     },
                     GenericResult::None => GenericResult::None,
@@ -1946,14 +1964,7 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                 // "operand failed" outcome, just discovered a pass later.
                 GenericResult::LazySeq(seq) => match materialize_atomic(seq) {
                     Ok(o) => o,
-                    Err(Control::Error(e)) => {
-                        return if optional {
-                            GenericResult::None
-                        } else {
-                            GenericResult::Error(e)
-                        }
-                    }
-                    Err(Control::Break(label)) => return GenericResult::Break(label),
+                    Err(control) => return control_into_generic_optional(control, optional),
                 },
                 GenericResult::Error(e) => {
                     return if optional {
@@ -2003,14 +2014,7 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                 // Mirrors the left-operand arm above.
                 GenericResult::LazySeq(seq) => match materialize_atomic(seq) {
                     Ok(o) => o,
-                    Err(Control::Error(e)) => {
-                        return if optional {
-                            GenericResult::None
-                        } else {
-                            GenericResult::Error(e)
-                        }
-                    }
-                    Err(Control::Break(label)) => return GenericResult::Break(label),
+                    Err(control) => return control_into_generic_optional(control, optional),
                 },
                 GenericResult::Error(e) => {
                     return if optional {
@@ -2309,8 +2313,7 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
         // match.
         GenericResult::LazySeq(seq) => match materialize_atomic(seq) {
             Ok(o) => vec![o],
-            Err(Control::Error(e)) => return GenericResult::Error(e),
-            Err(Control::Break(label)) => return GenericResult::Break(label),
+            Err(control) => return control_into_generic(control),
         },
         other => other.collect_owned(),
     };
@@ -2362,8 +2365,7 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
         GenericResult::LazySeq(seq) => {
             let targets = match materialize_atomic(seq) {
                 Ok(o) => vec![o],
-                Err(Control::Error(e)) => return GenericResult::Error(e),
-                Err(Control::Break(label)) => return GenericResult::Break(label),
+                Err(control) => return control_into_generic(control),
             };
             let mut out = Vec::with_capacity(keys.len() * targets.len());
             for k in &keys {
@@ -2488,8 +2490,7 @@ fn eval_slice_expr<S: EvalSemantics, V: DocumentValue>(
         // equivalent fix).
         GenericResult::LazySeq(seq) => match materialize_atomic(seq) {
             Ok(o) => Targets::Owned(vec![o]),
-            Err(Control::Error(e)) => return GenericResult::Error(e),
-            Err(Control::Break(label)) => return GenericResult::Break(label),
+            Err(control) => return control_into_generic(control),
         },
     };
 
