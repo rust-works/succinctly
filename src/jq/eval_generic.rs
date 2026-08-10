@@ -3879,6 +3879,44 @@ mod tests {
         );
     }
 
+    // JSON has no anchor/style concept, so `JsonCursor` doesn't override
+    // `DocumentCursor::anchor`/`style` and falls through to the trait's
+    // default `None`/`""` impl (`document.rs`). The YAML tests above only
+    // exercise the *overridden* impls in `yaml/light.rs` — these cover the
+    // default itself, reached here via a real navigated cursor (not the
+    // cursor-less fallback `test_yaml_anchor_style_without_cursor` covers).
+    #[test]
+    fn test_json_anchor_builtin_default_empty() {
+        use crate::json::JsonIndex;
+
+        let json = br#"{"a": 1}"#;
+        let index = JsonIndex::build(json);
+        let doc_cursor = index.root(json);
+
+        let expr = parse(".a | anchor").unwrap();
+        let result = eval_with_cursor(&expr, doc_cursor);
+        assert_eq!(
+            result.into_owned().unwrap(),
+            OwnedValue::String(String::new())
+        );
+    }
+
+    #[test]
+    fn test_json_style_builtin_default_empty() {
+        use crate::json::JsonIndex;
+
+        let json = br#"{"a": [1, 2, 3]}"#;
+        let index = JsonIndex::build(json);
+        let doc_cursor = index.root(json);
+
+        let expr = parse(".a | style").unwrap();
+        let result = eval_with_cursor(&expr, doc_cursor);
+        assert_eq!(
+            result.into_owned().unwrap(),
+            OwnedValue::String(String::new())
+        );
+    }
+
     #[test]
     fn test_yaml_line_without_cursor() {
         use crate::yaml::YamlIndex;
