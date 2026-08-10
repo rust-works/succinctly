@@ -21126,6 +21126,9 @@ mod tests {
                 assert_eq!(obj.get("a"), Some(&OwnedValue::Int(1)));
             }
         );
+        query!(br"[]", "min_by(.a)",
+            QueryResult::Owned(OwnedValue::Null) => {}
+        );
     }
 
     #[test]
@@ -21133,6 +21136,33 @@ mod tests {
         query!(br#"[{"a": 3}, {"a": 1}, {"a": 2}]"#, "max_by(.a)",
             QueryResult::Owned(OwnedValue::Object(obj)) => {
                 assert_eq!(obj.get("a"), Some(&OwnedValue::Int(3)));
+            }
+        );
+        query!(br"[]", "max_by(.a)",
+            QueryResult::Owned(OwnedValue::Null) => {}
+        );
+    }
+
+    /// #708: min_by/max_by's tie-break direction was untested and relied on
+    /// an incidental property of `Iterator::min_by`/`max_by` (first/last
+    /// among ties) rather than an explicit, verified choice. This matches
+    /// jq's own documented rule: `min_by` keeps the first-encountered
+    /// element on a tie, `max_by` keeps the last-encountered one.
+    #[test]
+    fn test_builtin_min_by_max_by_tie_break() {
+        // Two elements tie for the min key (a: 1) and two tie for the max
+        // key (a: 2); "id" distinguishes which tied element was returned.
+        const DATA: &[u8] =
+            br#"[{"a": 1, "id": "x"}, {"a": 2, "id": "y"}, {"a": 1, "id": "z"}, {"a": 2, "id": "w"}]"#;
+
+        query!(DATA, "min_by(.a)",
+            QueryResult::Owned(OwnedValue::Object(obj)) => {
+                assert_eq!(obj.get("id"), Some(&OwnedValue::String("x".to_string())));
+            }
+        );
+        query!(DATA, "max_by(.a)",
+            QueryResult::Owned(OwnedValue::Object(obj)) => {
+                assert_eq!(obj.get("id"), Some(&OwnedValue::String("w".to_string())));
             }
         );
     }
