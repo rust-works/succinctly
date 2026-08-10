@@ -1374,9 +1374,12 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                     out.write_char('{')?;
                     let mut first = true;
                     if sort_keys {
-                        let mut sorted: Vec<_> = fields.into_iter().collect();
-                        sorted.sort_by(|a, b| a.key().key_string().cmp(&b.key().key_string()));
-                        for field in sorted {
+                        let mut sorted: Vec<_> = fields
+                            .into_iter()
+                            .map(|field| (field.key().key_string(), field))
+                            .collect();
+                        sorted.sort_by(|a, b| a.0.cmp(&b.0));
+                        for (_, field) in sorted {
                             if !first {
                                 out.write_str(", ")?;
                             }
@@ -1401,9 +1404,12 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                     // Block style
                     let mut first = true;
                     if sort_keys {
-                        let mut sorted: Vec<_> = fields.into_iter().collect();
-                        sorted.sort_by(|a, b| a.key().key_string().cmp(&b.key().key_string()));
-                        for field in sorted {
+                        let mut sorted: Vec<_> = fields
+                            .into_iter()
+                            .map(|field| (field.key().key_string(), field))
+                            .collect();
+                        sorted.sort_by(|a, b| a.0.cmp(&b.0));
+                        for (_, field) in sorted {
                             if !first {
                                 out.write_char('\n')?;
                                 write_yaml_indent(out, current_indent, unit)?;
@@ -1639,9 +1645,12 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                 let next_indent = current_indent + indent_spaces;
                 let mut first = true;
                 if sort_keys {
-                    let mut sorted: Vec<_> = fields.into_iter().collect();
-                    sorted.sort_by(|a, b| a.key().key_string().cmp(&b.key().key_string()));
-                    for field in sorted {
+                    let mut sorted: Vec<_> = fields
+                        .into_iter()
+                        .map(|field| (field.key().key_string(), field))
+                        .collect();
+                    sorted.sort_by(|a, b| a.0.cmp(&b.0));
+                    for (_, field) in sorted {
                         if !first {
                             out.write_char(',')?;
                         }
