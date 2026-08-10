@@ -464,7 +464,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     #[inline]
     fn maybe_capture_line_comment(&mut self, owner_bp_pos: usize) {
         let mut p = self.pos;
-        while p < self.input.len() && matches!(self.input[p], b' ' | b'\t') {
+        while p < self.input.len() && Self::is_inline_whitespace(self.input[p]) {
             p += 1;
         }
         if p < self.input.len() && self.input[p] == b'#' {
@@ -597,6 +597,16 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         }
     }
 
+    /// A space or tab - YAML's "inline whitespace", separation within a
+    /// line rather than between them. Shared by [`Self::skip_inline_whitespace`]
+    /// (which consumes it) and [`Self::maybe_capture_line_comment`] (which
+    /// only peeks past it, since its caller still needs to consume the run
+    /// itself).
+    #[inline]
+    fn is_inline_whitespace(b: u8) -> bool {
+        matches!(b, b' ' | b'\t')
+    }
+
     /// Width in bytes of the line break at `pos`, under this parser's `HAS_CR`
     /// specialization: [`line_break_len`] when a `\r` may be present, and
     /// otherwise the one-byte LF answer it collapses to.
@@ -680,11 +690,8 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     /// Skip whitespace on the current line (spaces and tabs, not newlines).
     #[inline]
     fn skip_inline_whitespace(&mut self) {
-        while self.pos < self.input.len() {
-            match self.input[self.pos] {
-                b' ' | b'\t' => self.pos += 1,
-                _ => break,
-            }
+        while self.pos < self.input.len() && Self::is_inline_whitespace(self.input[self.pos]) {
+            self.pos += 1;
         }
     }
 
