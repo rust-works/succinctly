@@ -140,6 +140,20 @@ fn generic_result_values<V: DocumentValue>(
         GenericResult::LazyIndexRange(len) => vec![OwnedValue::Array(
             (0..len).map(|i| OwnedValue::Int(i as i64)).collect(),
         )],
+        // Same reasoning as `LazyKeys`/`LazyIndexRange` above, for a
+        // composed `map` chain (#724, #725) that never resolved into a
+        // narrower shape before reaching this materializing fallback.
+        GenericResult::LazySeq(seq) => match seq.materialize_atomic() {
+            Ok(v) => vec![v],
+            Err(jq::Control::Error(e)) => {
+                sink.report(DiagStyle::Xq, &e, at);
+                vec![]
+            }
+            Err(jq::Control::Break(label)) => {
+                sink.report_break(DiagStyle::Xq, &label, at);
+                vec![]
+            }
+        },
         GenericResult::None => vec![],
         GenericResult::Error(e) => {
             sink.report(DiagStyle::Xq, &e, at);

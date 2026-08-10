@@ -37,6 +37,13 @@ fn eval_xml(xml: &[u8], filter: &str) -> Vec<OwnedValue> {
         GenericResult::LazyIndexRange(len) => vec![OwnedValue::Array(
             (0..len).map(|i| OwnedValue::Int(i as i64)).collect(),
         )],
+        GenericResult::LazySeq(seq) => match seq.materialize_atomic() {
+            Ok(v) => vec![v],
+            Err(succinctly::jq::Control::Error(e)) => {
+                panic!("unexpected eval error: {}", e.message)
+            }
+            Err(succinctly::jq::Control::Break(label)) => panic!("unexpected break: {label}"),
+        },
         GenericResult::None => vec![],
         GenericResult::Owned(v) => vec![v],
         GenericResult::ManyOwned(vs) => vs,
