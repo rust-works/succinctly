@@ -1802,6 +1802,8 @@ impl<'a> Parser<'a> {
             }
             "base64" => FormatType::Base64,
             "base64d" => FormatType::Base64d,
+            "base32" => FormatType::Base32,
+            "base32d" => FormatType::Base32d,
             "html" => FormatType::Html,
             "sh" => FormatType::Sh,
             "urid" => FormatType::Urid,

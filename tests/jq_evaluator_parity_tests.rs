@@ -194,10 +194,11 @@ fn test_parity_formats_array_inputs() {
 /// Formats that only accept strings.
 #[test]
 fn test_parity_formats_string_only() {
-    for filter in ["@base64", "@base64d", "@urid"] {
+    for filter in ["@base64", "@base64d", "@base32", "@base32d", "@urid"] {
         for json in [
             br#""hello""#.as_slice(),
             br#""aGVsbG8=""#,
+            br#""NBSWY3DP""#,
             br#""%C3%A9""#,
             br#""a%2Fb%20c""#,
             br#""100%""#,
@@ -218,6 +219,7 @@ fn test_parity_formats_type_errors() {
         (b"42", "@csv"),
         (b"42", "@tsv"),
         (b"42", "@base64"),
+        (b"42", "@base32"),
         (b"42", "@urid"),
         (br#""notanarray""#, "@csv"),
     ] {
@@ -351,6 +353,8 @@ fn test_formats_optional_owned_type_error_parity_124() {
         (b"null", r#"(1+1 | @dsv("|"))?"#),
         (b"null", "(1+1 | @base64)?"),
         (b"null", "(1+1 | @base64d)?"),
+        (b"null", "(1+1 | @base32)?"),
+        (b"null", "(1+1 | @base32d)?"),
         (b"null", "(1+1 | @urid)?"),
     ] {
         assert_eq!(

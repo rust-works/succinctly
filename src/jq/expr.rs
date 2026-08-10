@@ -473,6 +473,10 @@ pub enum FormatType {
     Base64,
     /// @base64d - base64 decode
     Base64d,
+    /// @base32 - base32 encode (RFC 4648)
+    Base32,
+    /// @base32d - base32 decode (RFC 4648)
+    Base32d,
     /// @html - HTML entity escape
     Html,
     /// @sh - shell quote

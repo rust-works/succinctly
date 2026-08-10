@@ -4001,6 +4001,8 @@ pub(crate) fn format_owned(
         FormatType::Dsv(delimiter) => format_dsv(owned, delimiter, optional),
         FormatType::Base64 => format_base64(owned, optional),
         FormatType::Base64d => format_base64d(owned, optional),
+        FormatType::Base32 => format_base32(owned, optional),
+        FormatType::Base32d => format_base32d(owned, optional),
         FormatType::Html => format_html(owned, optional),
         FormatType::Sh => format_sh(owned, optional),
         FormatType::Urid => format_urid(owned, optional),
@@ -4267,6 +4269,110 @@ fn format_base64d(value: &OwnedValue, optional: bool) -> Result<String, EvalErro
             }
 
             String::from_utf8(result).map_err(|_| EvalError::new("invalid UTF-8 in decoded base64"))
+        }
+        _ if optional => Ok(String::new()),
+        _ => Err(EvalError::type_error("string", value.type_name())),
+    }
+}
+
+/// @base32 - Base32 encode (RFC 4648)
+fn format_base32(value: &OwnedValue, optional: bool) -> Result<String, EvalError> {
+    match value {
+        OwnedValue::String(s) => {
+            const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+            let bytes = s.as_bytes();
+            let mut result = String::new();
+
+            for chunk in bytes.chunks(5) {
+                let mut buf = [0u8; 5];
+                buf[..chunk.len()].copy_from_slice(chunk);
+                let quintet = (buf[0] as u64) << 32
+                    | (buf[1] as u64) << 24
+                    | (buf[2] as u64) << 16
+                    | (buf[3] as u64) << 8
+                    | (buf[4] as u64);
+
+                // RFC 4648 §6: how many of the 8 output characters carry real
+                // data (the rest are `=` padding) depends on the input chunk
+                // length, since 5 bytes (40 bits) split evenly into 8x 5-bit
+                // groups but shorter chunks don't.
+                let char_count = match chunk.len() {
+                    1 => 2,
+                    2 => 4,
+                    3 => 5,
+                    4 => 7,
+                    5 => 8,
+                    _ => unreachable!("chunks(5) yields at most 5 bytes"),
+                };
+
+                for i in 0..8 {
+                    if i < char_count {
+                        let shift = 35 - i * 5;
+                        let index = ((quintet >> shift) & 0x1F) as usize;
+                        result.push(ALPHABET[index] as char);
+                    } else {
+                        result.push('=');
+                    }
+                }
+            }
+
+            Ok(result)
+        }
+        _ if optional => Ok(String::new()),
+        _ => Err(EvalError::type_error("string", value.type_name())),
+    }
+}
+
+/// @base32d - Base32 decode (RFC 4648)
+fn format_base32d(value: &OwnedValue, optional: bool) -> Result<String, EvalError> {
+    match value {
+        OwnedValue::String(s) => {
+            fn decode_char(c: u8) -> Option<u8> {
+                match c {
+                    b'A'..=b'Z' => Some(c - b'A'),
+                    b'2'..=b'7' => Some(c - b'2' + 26),
+                    b'=' => Some(0), // Padding
+                    _ => None,
+                }
+            }
+
+            let s = s.replace(|c: char| c.is_whitespace(), "");
+            let bytes: Vec<u8> = s.bytes().collect();
+            let mut result = Vec::new();
+
+            for chunk in bytes.chunks(8) {
+                if chunk.len() < 8 {
+                    break;
+                }
+
+                let mut quintet: u64 = 0;
+                for &b in chunk {
+                    let v = decode_char(b).ok_or_else(|| EvalError::new("invalid base32"))?;
+                    quintet = (quintet << 5) | (v as u64);
+                }
+
+                let data_chars = chunk.iter().filter(|&&b| b != b'=').count();
+                let n_out = match data_chars {
+                    2 => 1,
+                    4 => 2,
+                    5 => 3,
+                    7 => 4,
+                    8 => 5,
+                    _ => return Err(EvalError::new("invalid base32 padding")),
+                };
+
+                let out_bytes = [
+                    ((quintet >> 32) & 0xFF) as u8,
+                    ((quintet >> 24) & 0xFF) as u8,
+                    ((quintet >> 16) & 0xFF) as u8,
+                    ((quintet >> 8) & 0xFF) as u8,
+                    (quintet & 0xFF) as u8,
+                ];
+
+                result.extend_from_slice(&out_bytes[..n_out]);
+            }
+
+            String::from_utf8(result).map_err(|_| EvalError::new("invalid UTF-8 in decoded base32"))
         }
         _ if optional => Ok(String::new()),
         _ => Err(EvalError::type_error("string", value.type_name())),
@@ -22204,6 +22310,24 @@ mod tests {
     }
 
     #[test]
+    fn test_format_base32() {
+        query!(br#""hello""#, "@base32",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "NBSWY3DP");
+            }
+        );
+    }
+
+    #[test]
+    fn test_format_base32d() {
+        query!(br#""NBSWY3DP""#, "@base32d",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "hello");
+            }
+        );
+    }
+
+    #[test]
     fn test_format_html() {
         query!(br#""<script>alert('xss')</script>""#, "@html",
             QueryResult::Owned(OwnedValue::String(s)) => {
@@ -23625,6 +23749,8 @@ mod tests {
             r#"isvalid(@dsv("|"))"#,
             "isvalid(@base64)",
             "isvalid(@base64d)",
+            "isvalid(@base32)",
+            "isvalid(@base32d)",
         ] {
             query!(br"1", expr,
                 QueryResult::Owned(OwnedValue::Bool(true)) => {}

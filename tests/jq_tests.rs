@@ -1350,6 +1350,30 @@ fn test_base64_encode() {
 }
 
 // =============================================================================
+// Compatibility tests - @base32d edge cases
+// =============================================================================
+
+#[test]
+fn test_base32_roundtrip() {
+    // jq: "hello" | @base32 | @base32d => "hello"
+    query!(br#""hello""#, "@base32 | @base32d",
+        QueryResult::Owned(OwnedValue::String(s)) => {
+            assert_eq!(s, "hello");
+        }
+    );
+}
+
+#[test]
+fn test_base32_encode() {
+    // jq: "hello" | @base32 => "NBSWY3DP"
+    query!(br#""hello""#, "@base32",
+        QueryResult::Owned(OwnedValue::String(s)) => {
+            assert_eq!(s, "NBSWY3DP");
+        }
+    );
+}
+
+// =============================================================================
 // Compatibility tests - Comparison edge cases
 // =============================================================================
 
