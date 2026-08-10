@@ -154,6 +154,8 @@ has_number_on_object	has(1)	{"a":1}	Cannot check whether object has a number key
 in_object_on_number	in({})	1	Cannot check whether object has a number key
 explode_on_number	explode	1	explode input must be a string
 implode_on_number	implode	1	implode input must be an array
+implode_string_element	implode	["a",98,99]	string ("a") can't be imploded, unicode codepoint needs to be numeric
+implode_nan_element	[97, nan] | implode	null	number (null) can't be imploded, unicode codepoint needs to be numeric
 ascii_downcase_on_number	ascii_downcase	1	explode input must be a string
 ascii_upcase_on_number	ascii_upcase	1	explode input must be a string
 split_on_number	split(",")	1	split input and separator must be strings
