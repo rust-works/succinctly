@@ -1498,14 +1498,19 @@ fn arith_mul<S: EvalSemantics>(
         }
         // Object recursive merge (yq's `*`/`*=` merge operator; also jq's
         // plain object multiply, which has always done the same thing).
-        (a @ OwnedValue::Object(_), b @ OwnedValue::Object(_)) => Ok(merge_values(a, b, flags)),
+        // Uses merge_existing (not merge_values) because `a`/`b` are the
+        // direct `.path *= value` assignment target: `a` already "exists"
+        // as a concrete value, so `n`-gating must consider it (see
+        // merge_existing) — unlike the null-derived-empty-container arms
+        // below, which merge_values still handles unconditionally.
+        (a @ OwnedValue::Object(_), b @ OwnedValue::Object(_)) => Ok(merge_existing(a, b, flags)),
         // Array merge is yq-only: real jq has no array-merge concept and
         // errors here too (falls through to the generic error arm below).
         // Unflagged: rhs replaces lhs wholesale. `+`/`d` flags change that
         // (see merge_values) — flags are unreachable in jq-mode ASTs, so
         // this arm and its flag handling only ever fire for yq.
         (a @ OwnedValue::Array(_), b @ OwnedValue::Array(_)) if S::ARRAY_MULTIPLY_MERGES => {
-            Ok(merge_values(a, b, flags))
+            Ok(merge_existing(a, b, flags))
         }
         // yq: null is an empty container for merge purposes. A null right
         // operand is a no-op regardless of flags (real yq: `x *= null`
@@ -1531,15 +1536,13 @@ fn arith_mul<S: EvalSemantics>(
     }
 }
 
-/// Merge two values for `*`/`*=` (yq's merge operator; also jq's plain
-/// object multiply) where both operands are unconditionally present — the
-/// top-level entry point (from `arith_mul`), and also what a matching
-/// container pair recurses into once [`merge_position`] has already decided
-/// the pair is reachable. Matching containers (`Object`+`Object`, or
-/// `Array`+`Array` under `d` without `+`) always merge structurally here;
-/// `?`/`n` field-existence gating only applies to individual positions
-/// *within* that recursion (see [`merge_position`]), never to whether the
-/// recursion itself happens.
+/// Merge two values for `*`/`*=` where `right` merges into a position
+/// synthesized to stand in for an absent/null `left` (the
+/// `NULL_MERGES_AS_EMPTY` arms of `arith_mul`) — so unlike [`merge_existing`],
+/// there is no real prior value to gate `n` against. Matching containers
+/// (`Object`+`Object`, or `Array`+`Array` under `d` without `+`) merge
+/// structurally, recursing into positions gated individually by
+/// [`merge_position`]; anything else is a plain leaf replace.
 fn merge_values(left: OwnedValue, right: OwnedValue, flags: MergeFlags) -> OwnedValue {
     match (left, right) {
         (OwnedValue::Object(a), OwnedValue::Object(b)) => {
@@ -1568,50 +1571,59 @@ fn merge_leaf(existing: OwnedValue, incoming: OwnedValue, flags: MergeFlags) -> 
     }
 }
 
+/// Merge `incoming` into a position known to already hold `existing` —
+/// shared by [`merge_position`] (a nested field/index reached via
+/// recursion) and `arith_mul`'s top-level `Object`/`Array` arms (the direct
+/// `.path *= value` assignment target, which already "exists" as a concrete
+/// value once the `NULL_MERGES_AS_EMPTY` absent/null case has been ruled
+/// out). A matching container pair always recurses structurally regardless
+/// of `?`/`n` — those flags only gate genuine leaf writes, not whether an
+/// existing nested container gets walked. This is what makes `n`/`?`
+/// propagate correctly through nested merges: a parent key that already
+/// exists still gets recursed into, so *its* new children can be added (or
+/// blocked) individually.
+fn merge_existing(existing: OwnedValue, incoming: OwnedValue, flags: MergeFlags) -> OwnedValue {
+    match (existing, incoming) {
+        (OwnedValue::Object(a), OwnedValue::Object(b)) => {
+            OwnedValue::Object(merge_object_fields(a, b, flags))
+        }
+        (OwnedValue::Array(a), OwnedValue::Array(b))
+            if flags.deep_merge_arrays && !flags.append_arrays =>
+        {
+            OwnedValue::Array(merge_arrays_by_index(a, b, flags))
+        }
+        (existing, incoming) => {
+            // `n`: only write if the existing value is already null. `?`
+            // never blocks here — it only blocks brand-new positions, and
+            // `existing` is already known to be present.
+            if flags.only_new && !matches!(existing, OwnedValue::Null) {
+                existing
+            } else {
+                merge_leaf(existing, incoming, flags)
+            }
+        }
+    }
+}
+
 /// Decide the merged value for one position (an object field or array
 /// index) of a `*`/`*=` merge, honoring `?`/`n` gating. `existing` is
 /// `None` when the position isn't present in `left` yet. Returns `None` to
 /// mean "leave `left` unchanged here" (blocked by `?`/`n`), `Some(v)` to
 /// mean "set it to `v`".
-///
-/// A matching container pair (`Object`+`Object`, or deep-merging
-/// `Array`+`Array`) always recurses via [`merge_values`] regardless of
-/// `?`/`n` — those flags only gate genuine leaf writes and brand-new
-/// positions, not whether an existing nested container gets walked. This is
-/// what makes `n`/`?` propagate correctly through nested merges: a parent
-/// key that already exists still gets recursed into, so *its* new children
-/// can be added (or blocked) individually.
 fn merge_position(
     existing: Option<OwnedValue>,
     incoming: OwnedValue,
     flags: MergeFlags,
 ) -> Option<OwnedValue> {
-    let Some(existing) = existing else {
-        return if flags.only_existing {
-            None
-        } else {
-            Some(incoming)
-        };
-    };
-    match (existing, incoming) {
-        (OwnedValue::Object(a), OwnedValue::Object(b)) => {
-            Some(OwnedValue::Object(merge_object_fields(a, b, flags)))
-        }
-        (OwnedValue::Array(a), OwnedValue::Array(b))
-            if flags.deep_merge_arrays && !flags.append_arrays =>
-        {
-            Some(OwnedValue::Array(merge_arrays_by_index(a, b, flags)))
-        }
-        (existing, incoming) => {
-            // `n`: only write if the existing value is absent (handled
-            // above) or already null. `?` never blocks here — it only
-            // blocks brand-new positions, and `existing` is already Some.
-            if flags.only_new && !matches!(existing, OwnedValue::Null) {
+    match existing {
+        None => {
+            if flags.only_existing {
                 None
             } else {
-                Some(merge_leaf(existing, incoming, flags))
+                Some(incoming)
             }
         }
+        Some(existing) => Some(merge_existing(existing, incoming, flags)),
     }
 }
 
