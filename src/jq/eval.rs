@@ -14961,6 +14961,20 @@ fn yaml_value_to_owned<W: Clone + AsRef<[u64]>>(
 ) -> OwnedValue {
     use crate::yaml::{resolve_plain, resolve_tagged, ResolvedScalar, YamlValue};
 
+    // Convert an already-resolved scalar to `OwnedValue`. `str_value` is the
+    // original source text, used only for the `Str` case. Mirrors
+    // `yq_runner.rs`'s `resolved_scalar_to_owned`, which can't be shared
+    // directly since that lives in the CLI binary, not this library crate.
+    fn resolved_scalar_to_owned(resolved: ResolvedScalar, str_value: Cow<'_, str>) -> OwnedValue {
+        match resolved {
+            ResolvedScalar::Null => OwnedValue::Null,
+            ResolvedScalar::Bool(b) => OwnedValue::Bool(b),
+            ResolvedScalar::Int(n) => OwnedValue::Int(n),
+            ResolvedScalar::Float(f) => OwnedValue::Float(f),
+            ResolvedScalar::Str => OwnedValue::String(str_value.into_owned()),
+        }
+    }
+
     match cursor.value() {
         YamlValue::Null => OwnedValue::Null,
         YamlValue::String(s) => {
@@ -14972,13 +14986,7 @@ fn yaml_value_to_owned<W: Clone + AsRef<[u64]>>(
 
             if let Some(explicit) = cursor.explicit_tag() {
                 if let Some(resolved) = resolve_tagged(&str_value, explicit) {
-                    return match resolved {
-                        ResolvedScalar::Null => OwnedValue::Null,
-                        ResolvedScalar::Bool(b) => OwnedValue::Bool(b),
-                        ResolvedScalar::Int(n) => OwnedValue::Int(n),
-                        ResolvedScalar::Float(f) => OwnedValue::Float(f),
-                        ResolvedScalar::Str => OwnedValue::String(str_value.into_owned()),
-                    };
+                    return resolved_scalar_to_owned(resolved, str_value);
                 }
             }
 
@@ -14988,13 +14996,7 @@ fn yaml_value_to_owned<W: Clone + AsRef<[u64]>>(
             }
 
             // Resolve plain scalars per the YAML 1.2 core schema
-            match resolve_plain(&str_value) {
-                ResolvedScalar::Null => OwnedValue::Null,
-                ResolvedScalar::Bool(b) => OwnedValue::Bool(b),
-                ResolvedScalar::Int(n) => OwnedValue::Int(n),
-                ResolvedScalar::Float(f) => OwnedValue::Float(f),
-                ResolvedScalar::Str => OwnedValue::String(str_value.into_owned()),
-            }
+            resolved_scalar_to_owned(resolve_plain(&str_value), str_value)
         }
         YamlValue::Sequence(mut elements) => {
             let mut items = Vec::new();
