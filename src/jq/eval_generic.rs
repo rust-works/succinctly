@@ -1322,6 +1322,16 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
         // stopping (#693).
         Expr::Optional(inner) => match eval_single::<S, _>(inner, value, optional, cursor) {
             GenericResult::Error(_) | GenericResult::Break(_) => GenericResult::None,
+            // A `LazySeq` is deferred, so the `Error`/`Break` arm above
+            // never sees it — `map`'s error (if any) only appears once the
+            // chain is actually drained. `?` is itself an error boundary, so
+            // it must force that drain here to know whether to catch
+            // anything; mirrors this same arm's eager Error/Break handling
+            // immediately above (#724).
+            GenericResult::LazySeq(seq) => match materialize_atomic(seq) {
+                Ok(o) => GenericResult::Owned(o),
+                Err(Control::Error(_) | Control::Break(_)) => GenericResult::None,
+            },
             // `prefix` is never empty here: `partial_generic` (and
             // `eval::partial`, its mirror) already collapse an empty prefix
             // to the bare `Error`/`Break` variant above before a `Partial`
@@ -3776,6 +3786,32 @@ mod tests {
         )
         .unwrap();
         assert!(eval(&expr, value).is_error());
+    }
+
+    /// #724 fix: `(keys_unsorted | map(f))?` must catch an error raised
+    /// inside the deferred `map(f)` chain. Before the fix, `Expr::Optional`
+    /// matched the *immediate* `GenericResult` of `inner` to decide whether
+    /// to catch anything -- but for a `LazySeq`-producing pipe that
+    /// immediate result is the deferred sequence itself, not yet drained, so
+    /// it fell through the catch-all `other => other` arm unevaluated and
+    /// the error only surfaced later when something else finally drained
+    /// it, past where `?` could still catch it.
+    #[test]
+    fn test_generic_keys_unsorted_lazy_map_try_catches_error() {
+        let json = br#"{"b": 1, "a": 2}"#;
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+
+        let expr = crate::jq::parse(
+            r#"(keys_unsorted | map(if . == "b" then error("boom") else . end))?"#,
+        )
+        .unwrap();
+        let result = eval(&expr, value);
+        assert!(
+            matches!(result, GenericResult::None),
+            "expected `?` to catch the map error and yield no output, got {result:?}"
+        );
     }
 
     #[test]
