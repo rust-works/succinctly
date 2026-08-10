@@ -6152,6 +6152,35 @@ fn test_split_exp_duplicate_filename_warns_and_overwrites() -> Result<()> {
     Ok(())
 }
 
+/// Regression test: `ErrorSink::hit()` is sticky for the whole run, so
+/// comparing it before/after each call only correctly detects "this call
+/// just reported" for the very first error -- every later real error was
+/// double-reported with a spurious extra "produced no output" message
+/// (#715 follow-up). Fixed via `report_count()`, which can be compared
+/// per-call regardless of earlier hits.
+#[test]
+fn test_split_exp_reports_each_error_exactly_once() -> Result<()> {
+    let dir = TempDir::new()?;
+    let pattern = format!(
+        "if . == 1 then error(\"boom1\") elif . == 2 then error(\"boom2\") else \"{}/f3.yml\" end",
+        dir.path().display()
+    );
+    let (_stdout, stderr, code) =
+        run_yq_split(".[]", "[1, 2, 3]", &["--split-exp", &pattern, "-p", "json"])?;
+    assert_ne!(code, 0);
+    let error_lines: Vec<&str> = stderr.lines().filter(|l| l.starts_with("Error:")).collect();
+    assert_eq!(
+        error_lines,
+        vec!["Error: boom1", "Error: boom2"],
+        "stderr: {stderr}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("f3.yml"))?.trim(),
+        "3"
+    );
+    Ok(())
+}
+
 #[test]
 fn test_split_exp_output_format_respected() -> Result<()> {
     let dir = TempDir::new()?;

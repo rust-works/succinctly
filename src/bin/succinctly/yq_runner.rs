@@ -613,14 +613,19 @@ fn write_split_result(
     let index_val = OwnedValue::Int(output_index);
     let per_result_expr = jq::substitute_vars(split_expr, [("index", &index_val)]);
 
-    let sink_was_hit = sink.hit();
+    let reports_before = sink.report_count();
     let filename_results = evaluate_input(result, &per_result_expr, sink)?;
 
     let filename = match filename_results.as_slice() {
         [OwnedValue::String(s)] => s.clone(),
         // `evaluate_input` already reported the underlying error (e.g. an
         // undefined variable, or an explicit `error(...)`) via `sink`.
-        [] if sink.hit() && !sink_was_hit => return Ok(()),
+        // `report_count()` (not `hit()`, which is sticky for the whole run)
+        // is what lets this tell "this call just reported" from "some
+        // earlier result already tripped the sink" -- otherwise every
+        // result after the first real error in the run double-reports here
+        // (#715 follow-up).
+        [] if sink.report_count() > reports_before => return Ok(()),
         [] => {
             sink.report(
                 DiagStyle::Yq,
