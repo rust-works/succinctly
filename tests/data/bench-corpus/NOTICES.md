@@ -80,5 +80,7 @@ Either way, regenerate both reports afterwards — the commands are in
 Test-parse any candidate before committing it (`succinctly yq -o json '.' <file>`).
 `ingest_yaml` turns a parse failure into an error that aborts the whole report, and
 plausible-looking sources do fail: the densest bare-dash file found during the #326
-search was an AWS CloudFormation template, which is unusable here because its
-`!Ref`/`!GetAtt` shorthand tags hit `YamlError::TagNotSupported`.
+search was an AWS CloudFormation template, excluded at the time because its
+`!Ref`/`!GetAtt` shorthand tags hit `YamlError::TagNotSupported`. Tags resolve instead
+of erroring as of #224, so that specific reason no longer applies — re-test-parse before
+assuming the file is a viable candidate now, since it was never otherwise vetted.
