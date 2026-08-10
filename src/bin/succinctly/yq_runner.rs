@@ -354,7 +354,10 @@ fn evaluate_yaml_direct_filtered(
             Ok((doc_results, local_idx))
         }
         _ => {
-            // Single document - navigate to actual content
+            // Defensive fallback only, same as the inplace fast path's
+            // identical `_ =>` arm below: `root.value()` always reports the
+            // virtual document sequence (single documents included), so
+            // this arm is unreachable through any real input today.
             let should_eval = match doc_filter {
                 Some((target_doc, global_offset)) => global_offset == target_doc,
                 None => true,
@@ -549,6 +552,14 @@ fn evaluate_yaml_cursor<W: AsRef<[u64]> + Clone>(
     };
 
     // Convert GenericResult to Vec<ResultWithComments>
+    //
+    // `One`/`Many` (as opposed to `OneCursor`/`ManyCursor`) only ever arise
+    // from `eval_generic.rs`'s cursor-loss cascade, which requires an
+    // already-cursor-less value to begin with (e.g. via the cursor-less
+    // `eval()` entry point `jq`'s DOM path uses) — this function always
+    // starts `eval_with_cursor_using` from a real `cursor`, so these two
+    // arms are defensive/unreachable here today, kept for exhaustiveness
+    // over the shared `GenericResult` enum.
     let mut docs = match result {
         GenericResult::One(v) => Ok(vec![no_comments(to_owned(&v))]),
         GenericResult::OneCursor(c) => Ok(vec![owned_with_comments(&c)]),
