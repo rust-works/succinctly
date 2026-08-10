@@ -1334,9 +1334,9 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
     ///   (`' '` normally, `'\t'` for `--tab`).
     /// - `sort_keys`: sort each mapping's fields before writing (`-S`).
     ///   `YamlField` is `Copy`, so materializing a mapping's fields into a
-    ///   `Vec` to sort them is cheap — cursor structs only, no value data —
-    ///   and this branch is only taken when `-S` is actually requested, so
-    ///   the default (unsorted) path below is untouched.
+    ///   `Vec` is cheap — cursor structs only, no value data — and is done
+    ///   unconditionally so the sorted and unsorted cases share one loop
+    ///   body; the `Vec` is only actually sorted when `-S` is requested.
     fn stream_yaml_value<Out: core::fmt::Write>(
         &self,
         out: &mut Out,
@@ -1373,161 +1373,95 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                     // Flow style
                     out.write_char('{')?;
                     let mut first = true;
+                    let mut items: Vec<_> = fields.into_iter().collect();
                     if sort_keys {
-                        let mut sorted: Vec<_> = fields
+                        let mut keyed: Vec<_> = items
                             .into_iter()
                             .map(|field| (field.key().key_string(), field))
                             .collect();
-                        sorted.sort_by(|a, b| a.0.cmp(&b.0));
-                        for (_, field) in sorted {
-                            if !first {
-                                out.write_str(", ")?;
-                            }
-                            first = false;
-                            write_yaml_field_key(out, field)?;
-                            out.write_str(": ")?;
-                            write_yaml_child_inline(out, field.value_cursor(), unit, sort_keys)?;
+                        keyed.sort_by(|a, b| a.0.cmp(&b.0));
+                        items = keyed.into_iter().map(|(_, field)| field).collect();
+                    }
+                    for field in items {
+                        if !first {
+                            out.write_str(", ")?;
                         }
-                    } else {
-                        for field in fields {
-                            if !first {
-                                out.write_str(", ")?;
-                            }
-                            first = false;
-                            write_yaml_field_key(out, field)?;
-                            out.write_str(": ")?;
-                            write_yaml_child_inline(out, field.value_cursor(), unit, sort_keys)?;
-                        }
+                        first = false;
+                        write_yaml_field_key(out, field)?;
+                        out.write_str(": ")?;
+                        write_yaml_child_inline(out, field.value_cursor(), unit, sort_keys)?;
                     }
                     out.write_char('}')
                 } else {
                     // Block style
                     let mut first = true;
+                    let mut items: Vec<_> = fields.into_iter().collect();
                     if sort_keys {
-                        let mut sorted: Vec<_> = fields
+                        let mut keyed: Vec<_> = items
                             .into_iter()
                             .map(|field| (field.key().key_string(), field))
                             .collect();
-                        sorted.sort_by(|a, b| a.0.cmp(&b.0));
-                        for (_, field) in sorted {
-                            if !first {
-                                out.write_char('\n')?;
-                                write_yaml_indent(out, current_indent, unit)?;
-                            }
-                            first = false;
-                            write_yaml_field_key(out, field)?;
-                            out.write_char(':')?;
-                            let value = field.value_cursor();
-                            if is_yaml_cursor_container(&value) && value.style() != "flow" {
-                                // A comment trailing the key's own line, when
-                                // the value is deferred to the next line,
-                                // belongs to the key, not the value (#765).
-                                write_line_comment(out, field.key_cursor().line_comment_raw())?;
-                                // The anchor (if any) belongs on the same
-                                // line as the key, before the newline that
-                                // starts the container's own contents.
-                                if let Some(anchor) = value.anchor() {
-                                    out.write_char(' ')?;
-                                    out.write_char('&')?;
-                                    out.write_str(anchor)?;
-                                }
-                                out.write_char('\n')?;
-                                write_yaml_indent(out, current_indent + indent_spaces, unit)?;
-                                value.stream_yaml_value(
-                                    out,
-                                    current_indent + indent_spaces,
-                                    indent_spaces,
-                                    unit,
-                                    sort_keys,
-                                )?;
-                                write_line_comment(out, value.line_comment_raw())?;
-                            } else if let Some(kc) = field
-                                .key_cursor()
-                                .line_comment_raw()
-                                .filter(|_| is_deferred_value_absent(&value))
-                            {
-                                // The deferred value materialized as nothing
-                                // at all - the key's own comment stands
-                                // alone with no value token, matching real
-                                // yq (#765).
-                                write_line_comment(out, Some(kc))?;
-                            } else {
-                                out.write_char(' ')?;
-                                if let Some(anchor) = value.anchor() {
-                                    out.write_char('&')?;
-                                    out.write_str(anchor)?;
-                                    out.write_char(' ')?;
-                                }
-                                value.stream_yaml_value(
-                                    out,
-                                    current_indent + indent_spaces,
-                                    indent_spaces,
-                                    unit,
-                                    sort_keys,
-                                )?;
-                                write_line_comment(out, value.line_comment_raw())?;
-                            }
+                        keyed.sort_by(|a, b| a.0.cmp(&b.0));
+                        items = keyed.into_iter().map(|(_, field)| field).collect();
+                    }
+                    for field in items {
+                        if !first {
+                            out.write_char('\n')?;
+                            write_yaml_indent(out, current_indent, unit)?;
                         }
-                    } else {
-                        for field in fields {
-                            if !first {
-                                out.write_char('\n')?;
-                                write_yaml_indent(out, current_indent, unit)?;
-                            }
-                            first = false;
-                            write_yaml_field_key(out, field)?;
-                            out.write_char(':')?;
-                            // Check if value needs newline
-                            let value = field.value_cursor();
-                            if is_yaml_cursor_container(&value) && value.style() != "flow" {
-                                // A comment trailing the key's own line, when
-                                // the value is deferred to the next line,
-                                // belongs to the key, not the value (#765).
-                                write_line_comment(out, field.key_cursor().line_comment_raw())?;
-                                // The anchor (if any) belongs on the same
-                                // line as the key, before the newline that
-                                // starts the container's own contents.
-                                if let Some(anchor) = value.anchor() {
-                                    out.write_char(' ')?;
-                                    out.write_char('&')?;
-                                    out.write_str(anchor)?;
-                                }
-                                out.write_char('\n')?;
-                                write_yaml_indent(out, current_indent + indent_spaces, unit)?;
-                                value.stream_yaml_value(
-                                    out,
-                                    current_indent + indent_spaces,
-                                    indent_spaces,
-                                    unit,
-                                    sort_keys,
-                                )?;
-                                write_line_comment(out, value.line_comment_raw())?;
-                            } else if let Some(kc) = field
-                                .key_cursor()
-                                .line_comment_raw()
-                                .filter(|_| is_deferred_value_absent(&value))
-                            {
-                                // The deferred value materialized as nothing
-                                // at all - the key's own comment stands
-                                // alone with no value token, matching real
-                                // yq (#765).
-                                write_line_comment(out, Some(kc))?;
-                            } else {
+                        first = false;
+                        write_yaml_field_key(out, field)?;
+                        out.write_char(':')?;
+                        // Check if value needs newline
+                        let value = field.value_cursor();
+                        if is_yaml_cursor_container(&value) && value.style() != "flow" {
+                            // A comment trailing the key's own line, when
+                            // the value is deferred to the next line,
+                            // belongs to the key, not the value (#765).
+                            write_line_comment(out, field.key_cursor().line_comment_raw())?;
+                            // The anchor (if any) belongs on the same
+                            // line as the key, before the newline that
+                            // starts the container's own contents.
+                            if let Some(anchor) = value.anchor() {
                                 out.write_char(' ')?;
-                                if let Some(anchor) = value.anchor() {
-                                    out.write_char('&')?;
-                                    out.write_str(anchor)?;
-                                    out.write_char(' ')?;
-                                }
-                                value.stream_yaml_value(
-                                    out,
-                                    current_indent + indent_spaces,
-                                    indent_spaces,
-                                    unit,
-                                    sort_keys,
-                                )?;
-                                write_line_comment(out, value.line_comment_raw())?;
+                                out.write_char('&')?;
+                                out.write_str(anchor)?;
                             }
+                            out.write_char('\n')?;
+                            write_yaml_indent(out, current_indent + indent_spaces, unit)?;
+                            value.stream_yaml_value(
+                                out,
+                                current_indent + indent_spaces,
+                                indent_spaces,
+                                unit,
+                                sort_keys,
+                            )?;
+                            write_line_comment(out, value.line_comment_raw())?;
+                        } else if let Some(kc) = field
+                            .key_cursor()
+                            .line_comment_raw()
+                            .filter(|_| is_deferred_value_absent(&value))
+                        {
+                            // The deferred value materialized as nothing
+                            // at all - the key's own comment stands
+                            // alone with no value token, matching real
+                            // yq (#765).
+                            write_line_comment(out, Some(kc))?;
+                        } else {
+                            out.write_char(' ')?;
+                            if let Some(anchor) = value.anchor() {
+                                out.write_char('&')?;
+                                out.write_str(anchor)?;
+                                out.write_char(' ')?;
+                            }
+                            value.stream_yaml_value(
+                                out,
+                                current_indent + indent_spaces,
+                                indent_spaces,
+                                unit,
+                                sort_keys,
+                            )?;
+                            write_line_comment(out, value.line_comment_raw())?;
                         }
                     }
                     Ok(())
@@ -1622,7 +1556,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
     ///   (`' '` normally, `'\t'` for `--tab`).
     /// - `sort_keys`: sort each mapping's fields before writing (`-S`). See
     ///   `stream_yaml_value`'s doc comment for why materializing into a
-    ///   `Vec<YamlField>` to sort is cheap and only paid when requested.
+    ///   `Vec<YamlField>` is cheap even when unsorted.
     fn stream_json_value<Out: core::fmt::Write>(
         &self,
         out: &mut Out,
@@ -1672,82 +1606,51 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                 out.write_char('{')?;
                 let next_indent = current_indent + indent_spaces;
                 let mut first = true;
+                let mut items: Vec<_> = fields.into_iter().collect();
                 if sort_keys {
-                    let mut sorted: Vec<_> = fields
+                    let mut keyed: Vec<_> = items
                         .into_iter()
                         .map(|field| (field.key().key_string(), field))
                         .collect();
-                    sorted.sort_by(|a, b| a.0.cmp(&b.0));
-                    for (_, field) in sorted {
-                        if !first {
-                            out.write_char(',')?;
-                        }
-                        first = false;
-                        if indent_spaces > 0 {
-                            out.write_char('\n')?;
-                            write_yaml_indent(out, next_indent, unit)?;
-                        }
-                        if let YamlValue::String(s) = field.key() {
-                            match stream_yaml_string_to_json(out, &s) {
-                                Ok(true) => {} // Written directly
-                                Ok(false) | Err(_) => {
-                                    if let Ok(key_str) = s.as_str() {
-                                        stream_json_string(out, &key_str)?;
-                                    } else {
-                                        out.write_str("\"\"")?;
-                                    }
+                    keyed.sort_by(|a, b| a.0.cmp(&b.0));
+                    items = keyed.into_iter().map(|(_, field)| field).collect();
+                }
+                for field in items {
+                    if !first {
+                        out.write_char(',')?;
+                    }
+                    first = false;
+                    if indent_spaces > 0 {
+                        out.write_char('\n')?;
+                        write_yaml_indent(out, next_indent, unit)?;
+                    }
+
+                    // Write key
+                    if let YamlValue::String(s) = field.key() {
+                        match stream_yaml_string_to_json(out, &s) {
+                            Ok(true) => {} // Written directly
+                            Ok(false) | Err(_) => {
+                                if let Ok(key_str) = s.as_str() {
+                                    stream_json_string(out, &key_str)?;
+                                } else {
+                                    out.write_str("\"\"")?;
                                 }
                             }
-                        } else {
-                            stream_json_string(out, &field.key().key_string())?;
                         }
-                        out.write_str(if indent_spaces > 0 { ": " } else { ":" })?;
-                        field.value_cursor().stream_json_value(
-                            out,
-                            next_indent,
-                            indent_spaces,
-                            unit,
-                            sort_keys,
-                        )?;
+                    } else {
+                        // Alias/complex key (#222): resolve alias-to-scalar,
+                        // else "" — the entry is kept, never dropped
+                        stream_json_string(out, &field.key().key_string())?;
                     }
-                } else {
-                    for field in fields {
-                        if !first {
-                            out.write_char(',')?;
-                        }
-                        first = false;
-                        if indent_spaces > 0 {
-                            out.write_char('\n')?;
-                            write_yaml_indent(out, next_indent, unit)?;
-                        }
 
-                        // Write key
-                        if let YamlValue::String(s) = field.key() {
-                            match stream_yaml_string_to_json(out, &s) {
-                                Ok(true) => {} // Written directly
-                                Ok(false) | Err(_) => {
-                                    if let Ok(key_str) = s.as_str() {
-                                        stream_json_string(out, &key_str)?;
-                                    } else {
-                                        out.write_str("\"\"")?;
-                                    }
-                                }
-                            }
-                        } else {
-                            // Alias/complex key (#222): resolve alias-to-scalar,
-                            // else "" — the entry is kept, never dropped
-                            stream_json_string(out, &field.key().key_string())?;
-                        }
-
-                        out.write_str(if indent_spaces > 0 { ": " } else { ":" })?;
-                        field.value_cursor().stream_json_value(
-                            out,
-                            next_indent,
-                            indent_spaces,
-                            unit,
-                            sort_keys,
-                        )?;
-                    }
+                    out.write_str(if indent_spaces > 0 { ": " } else { ":" })?;
+                    field.value_cursor().stream_json_value(
+                        out,
+                        next_indent,
+                        indent_spaces,
+                        unit,
+                        sort_keys,
+                    )?;
                 }
                 if indent_spaces > 0 {
                     out.write_char('\n')?;
