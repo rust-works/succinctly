@@ -11680,6 +11680,56 @@ fn eval_pipe_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     eval_pipe_with_path_context_internal::<W, S>(exprs, value, value, None, current_path, optional)
 }
 
+/// Fold one fan-out step's result into `results`, matching the project's
+/// #400/#494 guarantee: an `Error`/`Break` produced partway through a
+/// fan-out must not discard outputs already produced by earlier steps. Every
+/// fan-out loop in `eval_pipe_with_path_context_internal` (`Iterate`, `If`'s
+/// multi-valued `cond`, `Comma`, `Select`'s continuation) and
+/// `continue_rest_with_context` shares this exact accumulate-or-stop shape;
+/// this is the one place it's implemented (#715 follow-up -- six near-copies
+/// of this loop each independently collapsed `Break`/`Partial` to a bare
+/// `None`, silently dropping both the escaping control signal and any output
+/// already produced).
+///
+/// Returns `Some(result)` when the loop must stop and propagate that result
+/// immediately (an error, an escaping `break`, or a nested partial result);
+/// `None` to keep iterating.
+fn accumulate_path_context_step<'a, W: Clone + AsRef<[u64]>>(
+    results: &mut Vec<OwnedValue>,
+    step: QueryResult<'a, W>,
+) -> Option<QueryResult<'a, W>> {
+    match step.materialize_cursor() {
+        QueryResult::Owned(v) => {
+            results.push(v);
+            None
+        }
+        QueryResult::ManyOwned(vs) => {
+            results.extend(vs);
+            None
+        }
+        // `eval_fanout` (used by `Select`) returns these borrowed-cursor
+        // variants even from an all-owned-value call site -- e.g. a `select`
+        // whose condition matched nothing produces `Many(vec![])`, not
+        // `None` -- so this must convert, not treat them as unreachable.
+        QueryResult::One(v) => {
+            results.push(to_owned(&v));
+            None
+        }
+        QueryResult::Many(vs) => {
+            results.extend(vs.iter().map(to_owned));
+            None
+        }
+        QueryResult::None => None,
+        QueryResult::Error(e) => Some(partial(core::mem::take(results), Control::Error(e))),
+        QueryResult::Break(label) => Some(partial(core::mem::take(results), Control::Break(label))),
+        QueryResult::Partial(vs, control) => {
+            results.extend(vs);
+            Some(partial(core::mem::take(results), control))
+        }
+        QueryResult::OneCursor(_) => unreachable!("materialize_cursor removes OneCursor"),
+    }
+}
+
 /// Continue evaluating `rest` for each output of an already-computed
 /// intermediate `QueryResult`, preserving `root`/`current_path` (the
 /// intermediate stage doesn't move navigational position -- e.g. a
@@ -11687,9 +11737,7 @@ fn eval_pipe_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// "at" the position it was computed from) and fanning a multi-valued
 /// result back out over `rest` the same way `Iterate` does above. Shared by
 /// `If`/`Comma`/`Try`/`Label` below to avoid re-deriving this fan-out loop
-/// at each call site. `Break`/`Partial` inputs collapse to `None` here,
-/// matching `Select`'s pre-existing fan-out policy just above (not a
-/// regression this helper introduces).
+/// at each call site.
 fn continue_rest_with_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     intermediate: QueryResult<'a, W>,
     rest: &[Expr],
@@ -11698,7 +11746,11 @@ fn continue_rest_with_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     current_path: &[OwnedValue],
     optional: bool,
 ) -> QueryResult<'a, W> {
-    match intermediate {
+    // `eval_fanout` (reached via `Select`) can hand back its borrowed-cursor
+    // variants (`One`/`Many`) even here, not just Owned/ManyOwned -- e.g. a
+    // `select` that matched nothing produces `Many(vec![])` -- so those
+    // convert via `to_owned` instead of being treated as unreachable.
+    match intermediate.materialize_cursor() {
         QueryResult::Owned(v) => eval_pipe_with_path_context_internal::<W, S>(
             rest,
             &v,
@@ -11707,35 +11759,54 @@ fn continue_rest_with_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             current_path,
             optional,
         ),
+        QueryResult::One(v) => eval_pipe_with_path_context_internal::<W, S>(
+            rest,
+            &to_owned(&v),
+            root,
+            file_origin,
+            current_path,
+            optional,
+        ),
         QueryResult::ManyOwned(vs) => {
             let mut results = Vec::new();
             for v in vs {
-                match eval_pipe_with_path_context_internal::<W, S>(
+                let step = eval_pipe_with_path_context_internal::<W, S>(
                     rest,
                     &v,
                     root,
                     file_origin,
                     current_path,
                     optional,
-                ) {
-                    QueryResult::Owned(r) => results.push(r),
-                    QueryResult::ManyOwned(rs) => results.extend(rs),
-                    QueryResult::None => {}
-                    QueryResult::Error(e) => return QueryResult::Error(e),
-                    _ => {}
+                );
+                if let Some(stop) = accumulate_path_context_step(&mut results, step) {
+                    return stop;
                 }
             }
-            if results.is_empty() {
-                QueryResult::None
-            } else if results.len() == 1 {
-                QueryResult::Owned(results.pop().unwrap())
-            } else {
-                QueryResult::ManyOwned(results)
+            owned_vec_to_result(results)
+        }
+        QueryResult::Many(vs) => {
+            let mut results = Vec::new();
+            for v in vs {
+                let owned_v = to_owned(&v);
+                let step = eval_pipe_with_path_context_internal::<W, S>(
+                    rest,
+                    &owned_v,
+                    root,
+                    file_origin,
+                    current_path,
+                    optional,
+                );
+                if let Some(stop) = accumulate_path_context_step(&mut results, step) {
+                    return stop;
+                }
             }
+            owned_vec_to_result(results)
         }
         QueryResult::None => QueryResult::None,
         QueryResult::Error(e) => QueryResult::Error(e),
-        _ => QueryResult::None,
+        QueryResult::Break(label) => QueryResult::Break(label),
+        QueryResult::Partial(vs, control) => partial(vs, control),
+        QueryResult::OneCursor(_) => unreachable!("materialize_cursor removes OneCursor"),
     }
 }
 
@@ -12010,19 +12081,16 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
                         if rest.is_empty() {
                             results.push(v.clone());
                         } else {
-                            match eval_pipe_with_path_context_internal::<W, S>(
+                            let step = eval_pipe_with_path_context_internal::<W, S>(
                                 rest,
                                 v,
                                 root,
                                 file_origin,
                                 &new_path,
                                 optional,
-                            ) {
-                                QueryResult::Owned(r) => results.push(r),
-                                QueryResult::ManyOwned(rs) => results.extend(rs),
-                                QueryResult::None => {}
-                                QueryResult::Error(e) => return QueryResult::Error(e),
-                                _ => {}
+                            );
+                            if let Some(stop) = accumulate_path_context_step(&mut results, step) {
+                                return stop;
                             }
                         }
                     }
@@ -12034,19 +12102,16 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
                         if rest.is_empty() {
                             results.push(v.clone());
                         } else {
-                            match eval_pipe_with_path_context_internal::<W, S>(
+                            let step = eval_pipe_with_path_context_internal::<W, S>(
                                 rest,
                                 v,
                                 root,
                                 file_origin,
                                 &new_path,
                                 optional,
-                            ) {
-                                QueryResult::Owned(r) => results.push(r),
-                                QueryResult::ManyOwned(rs) => results.extend(rs),
-                                QueryResult::None => {}
-                                QueryResult::Error(e) => return QueryResult::Error(e),
-                                _ => {}
+                            );
+                            if let Some(stop) = accumulate_path_context_step(&mut results, step) {
+                                return stop;
                             }
                         }
                     }
@@ -12054,13 +12119,7 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
                 _ if optional => return QueryResult::None,
                 _ => return QueryResult::Error(EvalError::cannot_iterate(value)),
             }
-            if results.is_empty() {
-                QueryResult::None
-            } else if results.len() == 1 {
-                QueryResult::Owned(results.pop().unwrap())
-            } else {
-                QueryResult::ManyOwned(results)
-            }
+            owned_vec_to_result(results)
         }
         Expr::Paren(inner) => {
             // Parentheses don't change path, just evaluate inner
@@ -12266,50 +12325,20 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
                 return select_result;
             }
             // `select` doesn't navigate, so continue `rest` from `value`'s
-            // existing path/root for each surviving (truthy) output --
-            // mirrors the `Iterate` arm's accumulate-then-collapse pattern
-            // above for fanning a multi-valued result back through `rest`.
-            match select_result {
-                QueryResult::Owned(v) => eval_pipe_with_path_context_internal::<W, S>(
-                    rest,
-                    &v,
-                    root,
-                    file_origin,
-                    current_path,
-                    optional,
-                ),
-                QueryResult::ManyOwned(vs) => {
-                    let mut results = Vec::new();
-                    for v in vs {
-                        match eval_pipe_with_path_context_internal::<W, S>(
-                            rest,
-                            &v,
-                            root,
-                            file_origin,
-                            current_path,
-                            optional,
-                        ) {
-                            QueryResult::Owned(r) => results.push(r),
-                            QueryResult::ManyOwned(rs) => results.extend(rs),
-                            QueryResult::None => {}
-                            QueryResult::Error(e) => return QueryResult::Error(e),
-                            _ => {}
-                        }
-                    }
-                    if results.is_empty() {
-                        QueryResult::None
-                    } else if results.len() == 1 {
-                        QueryResult::Owned(results.pop().unwrap())
-                    } else {
-                        QueryResult::ManyOwned(results)
-                    }
-                }
-                QueryResult::None => QueryResult::None,
-                QueryResult::Error(e) => QueryResult::Error(e),
-                // `eval_fanout` above only ever produces Owned/ManyOwned/
-                // None/Error from an Owned-only `body` closure.
-                _ => QueryResult::None,
-            }
+            // existing path/root for each surviving (truthy) output.
+            // `eval_fanout` above can produce `Partial`/`Break` (e.g. when
+            // `cond` itself fans out and errors partway through), not just
+            // Owned/ManyOwned/None/Error, so this delegates to
+            // `continue_rest_with_context` instead of re-deriving (and
+            // mis-deriving, #715 follow-up) the same fan-out loop here.
+            continue_rest_with_context::<W, S>(
+                select_result,
+                rest,
+                root,
+                file_origin,
+                current_path,
+                optional,
+            )
         }
         Expr::Builtin(builtin) => {
             // Handle other builtins that don't need special path handling
@@ -12376,56 +12405,53 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
                 current_path,
                 optional,
             );
-            let branch_result = match cond_result {
-                QueryResult::Owned(v) => {
-                    let branch = if v.is_truthy() {
-                        then_branch
-                    } else {
-                        else_branch
-                    };
-                    eval_pipe_with_path_context_internal::<W, S>(
-                        core::slice::from_ref(branch),
-                        value,
-                        root,
-                        file_origin,
-                        current_path,
-                        optional,
+            // Unpack `cond_result` into its truthy/falsy values plus any
+            // trailing control (#400/#494) -- `cond` itself can produce more
+            // than one value (e.g. `if .[] then ... end`) and/or end in an
+            // error/break after producing some, and both must still drive a
+            // branch evaluation per value with the control propagated after.
+            let (cond_values, cond_control): (Vec<OwnedValue>, Option<Control>) = match cond_result
+            {
+                QueryResult::Owned(v) => (vec![v], None),
+                QueryResult::ManyOwned(vs) => (vs, None),
+                QueryResult::None => (Vec::new(), None),
+                QueryResult::Error(e) => (Vec::new(), Some(Control::Error(e))),
+                QueryResult::Break(label) => (Vec::new(), Some(Control::Break(label))),
+                QueryResult::Partial(vs, control) => (vs, Some(control)),
+                QueryResult::One(_) | QueryResult::OneCursor(_) | QueryResult::Many(_) => {
+                    unreachable!(
+                        "eval_pipe_with_path_context_internal only ever produces \
+                         Owned/ManyOwned/None/Error/Break/Partial"
                     )
                 }
-                QueryResult::ManyOwned(vs) => {
-                    let mut results = Vec::new();
-                    for v in vs {
-                        let branch = if v.is_truthy() {
-                            then_branch
-                        } else {
-                            else_branch
-                        };
-                        match eval_pipe_with_path_context_internal::<W, S>(
-                            core::slice::from_ref(branch),
-                            value,
-                            root,
-                            file_origin,
-                            current_path,
-                            optional,
-                        ) {
-                            QueryResult::Owned(r) => results.push(r),
-                            QueryResult::ManyOwned(rs) => results.extend(rs),
-                            QueryResult::None => {}
-                            QueryResult::Error(e) => return QueryResult::Error(e),
-                            _ => {}
-                        }
-                    }
-                    if results.is_empty() {
-                        QueryResult::None
-                    } else if results.len() == 1 {
-                        QueryResult::Owned(results.pop().unwrap())
-                    } else {
-                        QueryResult::ManyOwned(results)
-                    }
+            };
+            let mut results = Vec::new();
+            let mut stopped = None;
+            for v in cond_values {
+                let branch = if v.is_truthy() {
+                    then_branch
+                } else {
+                    else_branch
+                };
+                let step = eval_pipe_with_path_context_internal::<W, S>(
+                    core::slice::from_ref(branch),
+                    value,
+                    root,
+                    file_origin,
+                    current_path,
+                    optional,
+                );
+                if let Some(stop) = accumulate_path_context_step(&mut results, step) {
+                    stopped = Some(stop);
+                    break;
                 }
-                QueryResult::None => QueryResult::None,
-                QueryResult::Error(e) => QueryResult::Error(e),
-                _ => QueryResult::None,
+            }
+            let branch_result = if let Some(stop) = stopped {
+                stop
+            } else if let Some(control) = cond_control {
+                partial(results, control)
+            } else {
+                owned_vec_to_result(results)
             };
             if rest.is_empty() {
                 return branch_result;
@@ -12445,43 +12471,27 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
             // resolve correctly per-branch instead of falling back to the
             // stub (#715 follow-up; `needs_path_context` already recurses
             // into `Comma`, but there was no matching interpreter arm).
-            // Collapses more-than-one output into an array -- matching
-            // `eval_owned_expr_ctrl`'s existing multi-output policy for
-            // this position, since that's what the generic fallback below
-            // (which this arm replaces for path-context pipes) already
-            // delegated to; comma not fanning out to independent top-level
-            // outputs here is a separate, pre-existing limitation, left
-            // unchanged.
+            // Fans out independently and preserves output already produced
+            // before a later branch errors/breaks, matching the plain
+            // evaluator's `eval_comma` (line ~690) instead of re-deriving a
+            // different (collapse-to-array, discard-on-error) policy here.
             let mut branch_outputs = Vec::new();
-            let mut branch_error = None;
+            let mut stopped = None;
             for sub_expr in exprs {
-                match eval_pipe_with_path_context_internal::<W, S>(
+                let step = eval_pipe_with_path_context_internal::<W, S>(
                     core::slice::from_ref(sub_expr),
                     value,
                     root,
                     file_origin,
                     current_path,
                     optional,
-                ) {
-                    QueryResult::Owned(v) => branch_outputs.push(v),
-                    QueryResult::ManyOwned(vs) => branch_outputs.extend(vs),
-                    QueryResult::None => {}
-                    QueryResult::Error(e) => {
-                        branch_error = Some(e);
-                        break;
-                    }
-                    _ => {}
+                );
+                if let Some(stop) = accumulate_path_context_step(&mut branch_outputs, step) {
+                    stopped = Some(stop);
+                    break;
                 }
             }
-            let comma_result = if let Some(e) = branch_error {
-                QueryResult::Error(e)
-            } else if branch_outputs.is_empty() {
-                QueryResult::Owned(OwnedValue::Null)
-            } else if branch_outputs.len() == 1 {
-                QueryResult::Owned(branch_outputs.pop().unwrap())
-            } else {
-                QueryResult::Owned(OwnedValue::Array(branch_outputs))
-            };
+            let comma_result = stopped.unwrap_or_else(|| owned_vec_to_result(branch_outputs));
             if rest.is_empty() {
                 return comma_result;
             }
@@ -12612,6 +12622,17 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
                 optional,
             )
         }
+        // `break` is a control signal, not a value -- `rest` (anything
+        // structurally following it once a flattened pipe is split at
+        // `exprs.split_first()`) never runs; the `Label` arm above is what
+        // catches this. Without this arm, `Expr::Break` fell into the
+        // generic fallback below, which unconditionally converts any
+        // `Control::Break` into a synthetic "break $label not in label"
+        // `EvalError` (`eval_owned_expr`, above) -- wrongly reporting a
+        // label miss even when a real enclosing `label` was present, just
+        // not visible to that fallback's single-expression evaluation
+        // (#715 follow-up).
+        Expr::Break(name) => QueryResult::Break(name.clone()),
         _ => {
             // For other expressions, evaluate normally and continue
             // Note: This loses path context for complex expressions
@@ -29107,9 +29128,16 @@ mod tests {
 
     #[test]
     fn test_key_survives_comma_branches() {
+        // `(key, key)` fans out to independent top-level outputs, matching
+        // plain jq's `(a, b)` comma semantics -- not a single `[key, key]`
+        // array per element (#715 follow-up: the path-context `Comma` arm
+        // used to collapse every branch's outputs into one array and
+        // silently discard anything already produced once a later branch
+        // errored; fixed to reuse the same accumulate-independently policy
+        // `eval_comma` already has).
         assert_eq!(
             outputs(b"[10,20]", ".[] | (key, key)"),
-            vec!["[0,0]", "[1,1]"]
+            vec!["0", "0", "1", "1"]
         );
     }
 
