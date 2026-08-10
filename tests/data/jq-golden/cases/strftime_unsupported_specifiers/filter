@@ -1,0 +1,1 @@
+gmtime|strftime("%s %U %V %W %G %g")
