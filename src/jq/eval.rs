@@ -12550,6 +12550,47 @@ fn set_value_at_path(
     }
 }
 
+/// Propagate a write through a YAML anchor to every alias sharing it (#711).
+///
+/// YAML anchor/alias pairs are the same node in the representation graph: a
+/// write through the anchor's own path must be visible through every alias
+/// that points to it, matching real `yq`. `OwnedValue` itself has no notion
+/// of shared identity, so this is applied as a post-process instead: `groups`
+/// is a list of `(anchor_definition_path, [alias_paths...])` pairs, computed
+/// by the caller from the pre-mutation document. For each group, if the
+/// value at the definition path differs between `pristine` (before the
+/// write) and `result` (after), every alias path is overwritten with a clone
+/// of the new value.
+///
+/// A group whose definition path no longer resolves in `result` (e.g. the
+/// anchored key was deleted) is left untouched, so its aliases keep their
+/// last-resolved value -- matching how a detached graph node behaves in real
+/// yq. Likewise, a write that lands on an alias path directly rather than
+/// the anchor's own path leaves every other member of the group alone, since
+/// the anchor's own value never changed.
+pub fn sync_aliased_paths(
+    result: &mut OwnedValue,
+    pristine: &OwnedValue,
+    groups: &[(Vec<OwnedValue>, Vec<Vec<OwnedValue>>)],
+) {
+    for (def_path, alias_paths) in groups {
+        let (Some(old), Some(new)) = (
+            get_value_at_path(pristine, def_path),
+            get_value_at_path(result, def_path),
+        ) else {
+            continue;
+        };
+        if old == new {
+            continue;
+        }
+        for alias_path in alias_paths {
+            if let Ok(updated) = set_value_at_path(result.clone(), alias_path, new.clone()) {
+                *result = updated;
+            }
+        }
+    }
+}
+
 /// Builtin: setpath(path; value) - set value at path
 fn builtin_setpath<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     path_expr: &Expr,

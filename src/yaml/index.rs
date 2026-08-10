@@ -360,6 +360,15 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
         self.aliases.contains_key(&bp_pos)
     }
 
+    /// Whether this document has any alias (`*name`) references at all.
+    ///
+    /// Used to skip alias-sensitive post-processing entirely for the
+    /// overwhelmingly common case of a document with no aliases (#711).
+    #[inline]
+    pub fn has_aliases(&self) -> bool {
+        !self.aliases.is_empty()
+    }
+
     /// Check if a BP position is a sequence item wrapper.
     ///
     /// Sequence items have BP open/close but no TY entry.
