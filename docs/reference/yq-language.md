@@ -112,6 +112,33 @@ succinctly yq '.items[] | split_doc' file.yaml
 # item3
 ```
 
+### Cross-File Operations (Succinctly Extension)
+
+`--eval-all`/`--ea` combines every document from every input file into one evaluation context (default `eval` mode evaluates each document independently, low memory). `file_index`/`fileIndex`/`fi` returns the 0-indexed origin file position, resolvable only within that combined context.
+
+| Function/Flag        | Description                                                      |
+|----------------------|------------------------------------------------------------------|
+| `--eval-all`, `--ea` | Combine all documents from all files into one evaluation context |
+| `file_index`         | 0-indexed origin file position (within `--eval-all`)             |
+| `fileIndex`          | Alias for `file_index` (real yq's own spelling)                  |
+| `fi`                 | Short alias for `file_index`                                     |
+
+```bash
+# Combine documents across files, count them
+succinctly yq --eval-all 'length' f1.yaml f2.yaml
+
+# Select only documents from the first file
+succinctly yq --eval-all '.[] | select(file_index == 0)' f1.yaml f2.yaml
+
+# General merge across any number of files
+succinctly yq --eval-all 'reduce .[] as $item ({}; . * $item)' f1.yaml f2.yaml f3.yaml
+
+# Merge exactly two files (correct only when each contributes one document)
+succinctly yq --eval-all '(.[] | select(file_index == 0)) * (.[] | select(file_index == 1))' f1.yaml f2.yaml
+```
+
+**Deviation from real yq**: real yq's `eval-all` treats the combined documents as an implicit node list that most operators broadcast over, so `select(fileIndex == 0) * select(fileIndex == 1)` works with no `.[]`. succinctly's evaluator has one scalar value per evaluation instead, so `.[]` must be explicit — `.[] | select(file_index == 0)`, not the bare `select(fileIndex == 0)`. `file_index`/`key`/`document_index` resolve correctly through `.`/`.[]`/`.field` navigation, comparisons, and `select(...)`, matching what `document_index` already supports — but not inside `map(...)`, `if/then/else`, array/object literals, `any`/`all`, or user-defined functions, where they fall back to `0` (see [Known Limitations](#known-limitations)). `--eval-all` is incompatible with `--slurp`, `--inplace`, `--raw-input`, `--split-exp`, and `--front-matter`.
+
 ### yq-Specific Operators
 
 | Operator      | Description                                  | Example                        |
@@ -285,25 +312,56 @@ succinctly yq 'at_position(5; 3)' config.yaml
 
 ### Input Options
 
-| Flag                  | Description                              |
-|-----------------------|------------------------------------------|
-| `-n, --null-input`    | Don't read input; use null               |
-| `-p, --input-format`  | Input format: `auto`, `yaml`, `json`     |
-| `-s, --slurp`         | Read all inputs into array               |
-| `-R, --raw-input`     | Read lines as strings instead of YAML    |
-| `--doc N`             | Select Nth document (0-indexed)          |
+| Flag                  | Description                                      |
+|-----------------------|--------------------------------------------------|
+| `-n, --null-input`    | Don't read input; use null                       |
+| `-p, --input-format`  | Input format: `auto`, `yaml`, `json`             |
+| `-s, --slurp`         | Read all inputs into array                       |
+| `-R, --raw-input`     | Read lines as strings instead of YAML            |
+| `--doc N`             | Select Nth document (0-indexed)                  |
+| `--eval-all`, `--ea`  | Combine docs/files into one eval context (below) |
+| `--front-matter MODE` | Extract/process YAML front matter (below)        |
 
 ### Output Options
 
-| Flag                  | Description                              |
-|-----------------------|------------------------------------------|
-| `-r, --unwrapScalar`  | Output raw strings without quotes        |
-| `-I, --indent N`      | Indent level (0 for compact)             |
-| `-o, --output-format` | Output format: `yaml`, `json`, `auto`    |
-| `-i, --inplace`       | Update file in place                     |
-| `-0, --nul-output`    | Use NUL separator instead of newline     |
-| `--no-doc`            | Omit document separators (`---`)         |
-| `--tab`               | Use tabs for indentation                 |
+| Flag                  | Description                                   |
+|-----------------------|-----------------------------------------------|
+| `-r, --unwrapScalar`  | Output raw strings without quotes             |
+| `-I, --indent N`      | Indent level (0 for compact)                  |
+| `-o, --output-format` | Output format: `yaml`, `json`, `auto`         |
+| `-i, --inplace`       | Update file in place                          |
+| `-0, --nul-output`    | Use NUL separator instead of newline          |
+| `--no-doc`            | Omit document separators (`---`)              |
+| `--tab`               | Use tabs for indentation                      |
+| `--split-exp EXPR`    | Split output into one file per result (below) |
+
+### `--front-matter` (Succinctly Extension)
+
+Real yq can operate on YAML embedded as front matter inside another file (e.g. Markdown with a `---`-delimited YAML header). `--front-matter extract` evaluates the expression against just the front matter and discards the trailing content; `--front-matter process` re-emits the transformed front matter (re-fenced) followed by the original trailing content, unchanged.
+
+```bash
+# Extract: read only the front matter
+succinctly yq --front-matter extract '.title' post.md
+
+# Process: rewrite the front matter in place, body untouched
+succinctly yq --front-matter process --inplace '.tags += ["new"]' post.md
+```
+
+A file without a leading `---` line errors. `--front-matter` is incompatible with `--doc`, `--null-input`, `--raw-input`, and `--eval-all`; `--front-matter=process` additionally requires YAML output and is incompatible with `--slurp` (a slurped array can't reattach a body per input file).
+
+### `--split-exp` (Succinctly Extension)
+
+Splits output into one file per result instead of printing to stdout, named by evaluating `EXPR` against that result (`.` is the result; `$index` is its zero-based output index across the whole run).
+
+```bash
+# One file per array element, named by index
+succinctly yq --split-exp '"out_" + ($index|tostring) + ".yml"' '.[]' data.yaml
+
+# Named by a field of the result itself
+succinctly yq --split-exp '.name + ".yml"' '.[]' data.yaml
+```
+
+**Deliberately long-only**, unlike real yq's `-s`/`--split-exp`: succinctly's `-s` is already `--slurp`. A non-string result errors; a duplicate filename overwrites with a warning. Incompatible with `--slurp`, `--inplace`, and `--front-matter`; `--raw-input` is not yet supported.
 
 ### Variables
 
@@ -358,6 +416,8 @@ See [yq Remaining Work](../plan/yq-remaining.md) for incomplete features.
 
 1. **`line`/`column` in complex expressions** - Work best with direct cursor access; may return 0 after DOM conversion
 2. **Anchor metadata** - Available at cursor level; may be lost after complex jq operations
+3. **`file_index`/`key`/`document_index` in complex expressions** - Resolve through `.`/`.[]`/`.field` navigation, comparisons, and `select(...)`; return `0` inside `map(...)`, `if/then/else`, array/object literals, `any`/`all`, or user-defined functions
+4. **`*`/`+` are not cartesian generators** - `(a, b) * (c, d)` takes only the first value of each side, unlike real jq/yq's cartesian-product combination; this bounds the `--eval-all` two-file merge idiom (`select(file_index == 0) * select(file_index == 1)`) to inputs where each file contributes exactly one matching document
 
 ---
 
@@ -409,12 +469,13 @@ succinctly yq '.services | to_entries[] | select(.value.image | contains("postgr
 
 ## Changelog
 
-| Date       | Change                                                   |
-|------------|----------------------------------------------------------|
-| 2026-01-20 | Initial yq implementation complete                       |
-| 2026-01-20 | Added date/time extensions: `from_unix`, `to_unix`, `tz` |
-| 2026-01-20 | Added `@yaml`, `@props` format encoders                  |
-| 2026-01-20 | Added `load(file)` operator                              |
-| 2026-01-20 | Added `split_doc` operator                               |
-| 2026-01-20 | Added multi-document support with `--doc N`              |
-| 2026-01-24 | Document created from plan/yq.md                         |
+| Date       | Change                                                                  |
+|------------|-------------------------------------------------------------------------|
+| 2026-01-20 | Initial yq implementation complete                                      |
+| 2026-01-20 | Added date/time extensions: `from_unix`, `to_unix`, `tz`                |
+| 2026-01-20 | Added `@yaml`, `@props` format encoders                                 |
+| 2026-01-20 | Added `load(file)` operator                                             |
+| 2026-01-20 | Added `split_doc` operator                                              |
+| 2026-01-20 | Added multi-document support with `--doc N`                             |
+| 2026-01-24 | Document created from plan/yq.md                                        |
+| 2026-08-10 | Added `--front-matter`, `--split-exp`, `--eval-all`/`file_index` (#715) |

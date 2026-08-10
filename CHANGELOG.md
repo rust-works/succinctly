@@ -62,6 +62,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`yq` gains `--front-matter`, `--split-exp`, and `--eval-all`/`file_index`**
+  (#715), closing three real `yq` CLI gaps found by a systematic gap-audit:
+  - `--front-matter=extract|process` operates on YAML embedded as front
+    matter in another file (e.g. a Markdown post's `---`-fenced header):
+    `extract` evaluates the expression against just the front matter,
+    discarding the body; `process` re-emits the transformed front matter
+    followed by the original body, byte-for-byte unchanged.
+  - `--split-exp EXPR` splits output into one file per result, named by
+    evaluating `EXPR` against it (`.` is the result, `$index` its 0-based
+    output index). Deliberately long-only, unlike real yq's `-s`/
+    `--split-exp`: succinctly's `-s` is already `--slurp`.
+  - `--eval-all`/`--ea` combines every document from every file into one
+    evaluation context, exposing a new `file_index`/`fileIndex`/`fi`
+    builtin for cross-file merges (`.[] | select(file_index == 0)`).
+    Requires explicit `.[]` iteration, unlike real yq's implicit
+    node-list broadcast (`select(fileIndex == 0)` with no `.[]`) — a
+    deliberate, documented scope boundary given succinctly's evaluator has
+    one scalar value per evaluation, not a broadcasting node list.
+    Building it surfaced and fixed a pre-existing gap: `key`/
+    `document_index` (and now `file_index`) inside a `select(...)`
+    condition or a comparison (`select(key >= 1)`, `document_index == 0`)
+    previously fell back to their 0/null stub instead of resolving via
+    path context, because `needs_path_context` never recursed into
+    `Expr::Select`/`Expr::Compare`/`Expr::Arithmetic`.
+  - See [yq Language Reference](docs/reference/yq-language.md#cross-file-operations-succinctly-extension)
+    for the full `--eval-all` deviation and supported idioms.
+
 - **jq `@csv`/`@tsv`/`@dsv`/`@sh` allocation overhead investigated: no
   measurable end-to-end effect** (#647, follow-up to #124's real win for
   `@uri`/`@html`): a byte-scanning rewrite of the four format functions was

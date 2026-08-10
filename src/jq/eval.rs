@@ -367,6 +367,26 @@ pub(crate) fn needs_path_context(expr: &Expr) -> bool {
         Expr::Builtin(Builtin::Parent) => true,
         Expr::Builtin(Builtin::ParentN(_)) => true,
         Expr::Builtin(Builtin::Key) => true,
+        // `--eval-all`'s `file_index`/`fileIndex`/`fi` (#715) needs the same
+        // path-context routing as `Key` above -- it resolves via
+        // `current_path`, not a cursor.
+        Expr::Builtin(Builtin::FileIndex) => true,
+        // Neither `Compare` nor `Select` carries path context on its own,
+        // but a `key`/`document_index`/`file_index` nested in one of their
+        // operands does -- e.g. `select(file_index == 0)`, the headline
+        // `--eval-all` idiom. Recursing here is what makes
+        // `eval_pipe`/`eval_pipe_with_path_context_internal` route the whole
+        // pipe through path-context evaluation instead of losing it (#715;
+        // this closes a pre-existing gap for `key`/`document_index` too,
+        // e.g. `.[] | select(key >= 1)` previously produced no output).
+        Expr::Compare { left, right, .. } => needs_path_context(left) || needs_path_context(right),
+        // `*`-merge (`select(file_index==0) * select(file_index==1)`) is the
+        // other headline `--eval-all` idiom (#715) -- both operands need the
+        // same recursion as `Compare` above.
+        Expr::Arithmetic { left, right, .. } => {
+            needs_path_context(left) || needs_path_context(right)
+        }
+        Expr::Builtin(Builtin::Select(cond)) => needs_path_context(cond),
         Expr::Pipe(exprs) => exprs.iter().any(needs_path_context),
         Expr::Paren(inner) => needs_path_context(inner),
         Expr::Optional(inner) => needs_path_context(inner),
@@ -1834,16 +1854,27 @@ fn eval_compare<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Err(e) => return QueryResult::Error(e),
     };
 
-    let result = match op {
-        CompareOp::Eq => left_val == right_val,
-        CompareOp::Ne => left_val != right_val,
-        CompareOp::Lt => compare_values(&left_val, &right_val) == core::cmp::Ordering::Less,
-        CompareOp::Le => compare_values(&left_val, &right_val) != core::cmp::Ordering::Greater,
-        CompareOp::Gt => compare_values(&left_val, &right_val) == core::cmp::Ordering::Greater,
-        CompareOp::Ge => compare_values(&left_val, &right_val) != core::cmp::Ordering::Less,
-    };
+    QueryResult::Owned(OwnedValue::Bool(apply_compare_op(
+        op, &left_val, &right_val,
+    )))
+}
 
-    QueryResult::Owned(OwnedValue::Bool(result))
+/// Apply a comparison operator to two already-evaluated values.
+///
+/// Factored out of [`eval_compare`] so the path-context evaluator's own
+/// `Expr::Compare` arm (`eval_pipe_with_path_context_internal`, #715) can
+/// reuse the exact same operator semantics rather than a second, divergence-
+/// prone copy -- see the project's own "one definition, plus a test that call
+/// sites agree" convention (already applied to `compare_values` itself).
+fn apply_compare_op(op: CompareOp, left: &OwnedValue, right: &OwnedValue) -> bool {
+    match op {
+        CompareOp::Eq => left == right,
+        CompareOp::Ne => left != right,
+        CompareOp::Lt => compare_values(left, right) == core::cmp::Ordering::Less,
+        CompareOp::Le => compare_values(left, right) != core::cmp::Ordering::Greater,
+        CompareOp::Gt => compare_values(left, right) == core::cmp::Ordering::Greater,
+        CompareOp::Ge => compare_values(left, right) != core::cmp::Ordering::Less,
+    }
 }
 
 /// Compare two values using jq ordering: null < bool < number < string < array < object.
@@ -2524,6 +2555,14 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Builtin::Column => builtin_column::<W>(),
         Builtin::DocumentIndex => builtin_document_index::<W>(),
         Builtin::LineComment => builtin_line_comment::<W>(),
+        Builtin::FileIndex => {
+            // Requires the `--eval-all` path-context evaluator to resolve to
+            // anything but 0; reached here means either outside `--eval-all`
+            // or nested in a shape that evaluator doesn't cover (#715), the
+            // same documented "0 outside supported context" contract
+            // `document_index` already has.
+            QueryResult::Owned(OwnedValue::Int(0))
+        }
         Builtin::Shuffle => builtin_shuffle::<W>(value, optional),
         Builtin::Pivot => builtin_pivot::<W>(value, optional),
         Builtin::SplitDoc => {
@@ -7522,6 +7561,41 @@ pub fn eval_lenient<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     }
 }
 
+/// Evaluate `expr` against a combined `--eval-all` array (succinctly
+/// extension, #715).
+///
+/// Makes `file_index`/`fileIndex`/`fi` resolve via `file_origin` -- a side
+/// table mapping each top-level array position to its originating file
+/// index, built by the yq CLI driver -- wherever
+/// `eval_pipe_with_path_context_internal` can reach it: plain
+/// `.`/`.[]`/`.field` navigation, comparisons, and `select(...)` (the same
+/// capability level `key`/`document_index` already have; `map`/`if`/
+/// literals/user functions are documented out of scope, matching those
+/// builtins' own existing limits).
+///
+/// Routes through the ordinary evaluator, untouched, whenever `expr`
+/// doesn't reference `file_index`/`key`/`parent`/`path` anywhere
+/// [`needs_path_context`] can see -- the overwhelming majority of
+/// `--eval-all` filters pay zero extra cost over a normal `evaluate_input`.
+pub fn eval_owned_with_file_index<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    expr: &Expr,
+    input: &OwnedValue,
+    file_origin: &[usize],
+) -> QueryResult<'a, W> {
+    if needs_path_context(expr) {
+        eval_pipe_with_path_context_internal::<W, S>(
+            core::slice::from_ref(expr),
+            input,
+            input,
+            Some(file_origin),
+            &[],
+            false,
+        )
+    } else {
+        eval_owned_input::<W, S>(expr, input, false)
+    }
+}
+
 // =============================================================================
 // Assignment Operators Implementation
 // =============================================================================
@@ -10144,6 +10218,7 @@ fn substitute_var_in_builtin(
         Builtin::Column => Builtin::Column,
         Builtin::DocumentIndex => Builtin::DocumentIndex,
         Builtin::LineComment => Builtin::LineComment,
+        Builtin::FileIndex => Builtin::FileIndex,
         Builtin::Shuffle => Builtin::Shuffle,
         Builtin::Pivot => Builtin::Pivot,
         Builtin::SplitDoc => Builtin::SplitDoc,
@@ -11592,15 +11667,21 @@ fn eval_pipe_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     current_path: &[OwnedValue],
     optional: bool,
 ) -> QueryResult<'a, W> {
-    // Call the internal version with root value
-    eval_pipe_with_path_context_internal::<W, S>(exprs, value, value, current_path, optional)
+    // Call the internal version with root value. `file_origin` is only ever
+    // `Some` for `--eval-all`'s combined-array evaluation, which calls
+    // `eval_pipe_with_path_context_internal` directly (see
+    // `eval_owned_with_file_index`) rather than through this wrapper.
+    eval_pipe_with_path_context_internal::<W, S>(exprs, value, value, None, current_path, optional)
 }
 
-/// Internal helper that also tracks the root value for parent navigation.
+/// Internal helper that also tracks the root value for parent navigation,
+/// and (for `--eval-all`, #715) an optional origin-file-index side table
+/// keyed by top-level array position, resolving `file_index`/`fileIndex`/`fi`.
 fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     exprs: &[Expr],
     value: &OwnedValue,
     root: &OwnedValue,
+    file_origin: Option<&[usize]>,
     current_path: &[OwnedValue],
     optional: bool,
 ) -> QueryResult<'a, W> {
@@ -11622,6 +11703,7 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
                 rest,
                 &v,
                 root,
+                file_origin,
                 current_path,
                 optional,
             );
@@ -11646,6 +11728,38 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
                 rest,
                 &v,
                 root,
+                file_origin,
+                current_path,
+                optional,
+            );
+        }
+    }
+
+    // Handle FileIndex - return the origin file index of the top-level
+    // element `current_path` descends from (#715). Reads `current_path[0]`
+    // (the outermost index), not `.last()` like `Key` does: `file_index`
+    // answers "which file did this whole document come from", unaffected by
+    // further navigation. Falls back to 0 outside `--eval-all` (`file_origin`
+    // is `None`) or once past the top level's index (defensive; `.first()`
+    // always exists once inside an `--eval-all` array), matching
+    // `document_index`'s existing "0 outside supported context" contract.
+    if matches!(first, Expr::Builtin(Builtin::FileIndex)) {
+        let file_idx = current_path
+            .first()
+            .and_then(OwnedValue::as_i64)
+            .and_then(|i| usize::try_from(i).ok())
+            .and_then(|i| file_origin.and_then(|origins| origins.get(i).copied()))
+            .unwrap_or(0);
+        let file_index_result = QueryResult::Owned(OwnedValue::Int(file_idx as i64));
+        if rest.is_empty() {
+            return file_index_result;
+        }
+        if let QueryResult::Owned(v) = file_index_result {
+            return eval_pipe_with_path_context_internal::<W, S>(
+                rest,
+                &v,
+                root,
+                file_origin,
                 current_path,
                 optional,
             );
@@ -11680,6 +11794,7 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
                 rest,
                 &v,
                 root,
+                file_origin,
                 &parent_path,
                 optional,
             );
@@ -11725,6 +11840,7 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
                 rest,
                 &v,
                 root,
+                file_origin,
                 &parent_path,
                 optional,
             );
@@ -11735,7 +11851,14 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
     match first {
         Expr::Identity => {
             // Identity doesn't change the path
-            eval_pipe_with_path_context_internal::<W, S>(rest, value, root, current_path, optional)
+            eval_pipe_with_path_context_internal::<W, S>(
+                rest,
+                value,
+                root,
+                file_origin,
+                current_path,
+                optional,
+            )
         }
         Expr::Field(name) => {
             // Extend path with field name
@@ -11749,7 +11872,12 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
                         return QueryResult::Owned(v.clone());
                     }
                     return eval_pipe_with_path_context_internal::<W, S>(
-                        rest, v, root, &new_path, optional,
+                        rest,
+                        v,
+                        root,
+                        file_origin,
+                        &new_path,
+                        optional,
                     );
                 }
                 // jq returns null for missing fields on objects (not an error)
@@ -11784,7 +11912,12 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
                         return QueryResult::Owned(v.clone());
                     }
                     return eval_pipe_with_path_context_internal::<W, S>(
-                        rest, v, root, &new_path, optional,
+                        rest,
+                        v,
+                        root,
+                        file_origin,
+                        &new_path,
+                        optional,
                     );
                 }
             }
@@ -11813,7 +11946,12 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
                             results.push(v.clone());
                         } else {
                             match eval_pipe_with_path_context_internal::<W, S>(
-                                rest, v, root, &new_path, optional,
+                                rest,
+                                v,
+                                root,
+                                file_origin,
+                                &new_path,
+                                optional,
                             ) {
                                 QueryResult::Owned(r) => results.push(r),
                                 QueryResult::ManyOwned(rs) => results.extend(rs),
@@ -11832,7 +11970,12 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
                             results.push(v.clone());
                         } else {
                             match eval_pipe_with_path_context_internal::<W, S>(
-                                rest, v, root, &new_path, optional,
+                                rest,
+                                v,
+                                root,
+                                file_origin,
+                                &new_path,
+                                optional,
                             ) {
                                 QueryResult::Owned(r) => results.push(r),
                                 QueryResult::ManyOwned(rs) => results.extend(rs),
@@ -11861,6 +12004,7 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
                     &[(**inner).clone()],
                     value,
                     root,
+                    file_origin,
                     current_path,
                     optional,
                 )
@@ -11871,6 +12015,7 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
                     &combined,
                     value,
                     root,
+                    file_origin,
                     current_path,
                     optional,
                 )
@@ -11883,6 +12028,7 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
                     &[(**inner).clone()],
                     value,
                     root,
+                    file_origin,
                     current_path,
                     true,
                 )
@@ -11893,6 +12039,7 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
                     &combined,
                     value,
                     root,
+                    file_origin,
                     current_path,
                     true,
                 )
@@ -11906,9 +12053,190 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
                 &combined,
                 value,
                 root,
+                file_origin,
                 current_path,
                 optional,
             )
+        }
+        Expr::Arithmetic { op, left, right } => {
+            // Evaluate both sides through the path-context evaluator too --
+            // without this, `select(file_index==0) * select(file_index==1)`
+            // (the other headline `--eval-all` merge idiom, #715) silently
+            // evaluates both `select`s against the 0-stub, so the
+            // `file_index==1` side always comes back empty.
+            let left_val = match result_to_owned(eval_pipe_with_path_context_internal::<W, S>(
+                core::slice::from_ref(left),
+                value,
+                root,
+                file_origin,
+                current_path,
+                optional,
+            )) {
+                Ok(v) => v,
+                Err(e) => return QueryResult::Error(e),
+            };
+            let right_val = match result_to_owned(eval_pipe_with_path_context_internal::<W, S>(
+                core::slice::from_ref(right),
+                value,
+                root,
+                file_origin,
+                current_path,
+                optional,
+            )) {
+                Ok(v) => v,
+                Err(e) => return QueryResult::Error(e),
+            };
+            let arith_result = match op {
+                ArithOp::Add => arith_add::<S>(left_val, right_val),
+                ArithOp::Sub => arith_sub::<S>(left_val, right_val),
+                ArithOp::Mul(flags) => arith_mul::<S>(left_val, right_val, *flags),
+                ArithOp::Div => arith_div::<S>(left_val, right_val),
+                ArithOp::Mod => arith_mod::<S>(left_val, right_val),
+            };
+            let arith_result = match arith_result {
+                Ok(v) => QueryResult::Owned(v),
+                Err(_) if optional => QueryResult::None,
+                Err(e) => QueryResult::Error(e),
+            };
+            if rest.is_empty() {
+                return arith_result;
+            }
+            match arith_result {
+                QueryResult::Owned(v) => {
+                    // Fresh computed value -- reset path/root, same as `Compare`.
+                    eval_pipe_with_path_context_internal::<W, S>(
+                        rest,
+                        &v,
+                        &v,
+                        file_origin,
+                        &[],
+                        optional,
+                    )
+                }
+                QueryResult::None => QueryResult::None,
+                QueryResult::Error(e) => QueryResult::Error(e),
+                _ => unreachable!("arith_result was just constructed above as Owned/None/Error"),
+            }
+        }
+        Expr::Compare { op, left, right } => {
+            // Evaluate both sides through the path-context evaluator too, so
+            // `key`/`document_index`/`file_index` resolve correctly inside a
+            // comparison (e.g. `file_index == 0`) rather than falling back to
+            // their 0/null stubs (#715 -- this was already a latent gap for
+            // `key`/`document_index`, not something `file_index` introduces).
+            let left_val = match result_to_owned(eval_pipe_with_path_context_internal::<W, S>(
+                core::slice::from_ref(left),
+                value,
+                root,
+                file_origin,
+                current_path,
+                optional,
+            )) {
+                Ok(v) => v,
+                Err(e) => return QueryResult::Error(e),
+            };
+            let right_val = match result_to_owned(eval_pipe_with_path_context_internal::<W, S>(
+                core::slice::from_ref(right),
+                value,
+                root,
+                file_origin,
+                current_path,
+                optional,
+            )) {
+                Ok(v) => v,
+                Err(e) => return QueryResult::Error(e),
+            };
+            let compare_result = QueryResult::Owned(OwnedValue::Bool(apply_compare_op(
+                *op, &left_val, &right_val,
+            )));
+            if rest.is_empty() {
+                return compare_result;
+            }
+            if let QueryResult::Owned(v) = compare_result {
+                // A comparison produces a fresh boolean, unrelated to
+                // `value`'s position -- reset path/root like the
+                // `Object`/`Array`/`Literal` arm below does.
+                return eval_pipe_with_path_context_internal::<W, S>(
+                    rest,
+                    &v,
+                    &v,
+                    file_origin,
+                    &[],
+                    optional,
+                );
+            }
+            unreachable!("QueryResult::Owned was just constructed above")
+        }
+        Expr::Builtin(Builtin::Select(cond)) => {
+            // Evaluate the condition through the path-context evaluator too,
+            // so `select(file_index == 0)` -- the headline `--eval-all` idiom
+            // -- resolves correctly instead of falling back to the 0 stub
+            // (#715; same latent gap `Compare` above closes for `key`/
+            // `document_index`). Mirrors `builtin_select`'s `eval_fanout`
+            // structure so multi-valued conditions still fan out identically.
+            let cond_result = eval_pipe_with_path_context_internal::<W, S>(
+                core::slice::from_ref(cond),
+                value,
+                root,
+                file_origin,
+                current_path,
+                optional,
+            );
+            let select_result = eval_fanout(cond_result, |truthy| {
+                if truthy {
+                    QueryResult::Owned(value.clone())
+                } else {
+                    QueryResult::None
+                }
+            });
+            if rest.is_empty() {
+                return select_result;
+            }
+            // `select` doesn't navigate, so continue `rest` from `value`'s
+            // existing path/root for each surviving (truthy) output --
+            // mirrors the `Iterate` arm's accumulate-then-collapse pattern
+            // above for fanning a multi-valued result back through `rest`.
+            match select_result {
+                QueryResult::Owned(v) => eval_pipe_with_path_context_internal::<W, S>(
+                    rest,
+                    &v,
+                    root,
+                    file_origin,
+                    current_path,
+                    optional,
+                ),
+                QueryResult::ManyOwned(vs) => {
+                    let mut results = Vec::new();
+                    for v in vs {
+                        match eval_pipe_with_path_context_internal::<W, S>(
+                            rest,
+                            &v,
+                            root,
+                            file_origin,
+                            current_path,
+                            optional,
+                        ) {
+                            QueryResult::Owned(r) => results.push(r),
+                            QueryResult::ManyOwned(rs) => results.extend(rs),
+                            QueryResult::None => {}
+                            QueryResult::Error(e) => return QueryResult::Error(e),
+                            _ => {}
+                        }
+                    }
+                    if results.is_empty() {
+                        QueryResult::None
+                    } else if results.len() == 1 {
+                        QueryResult::Owned(results.pop().unwrap())
+                    } else {
+                        QueryResult::ManyOwned(results)
+                    }
+                }
+                QueryResult::None => QueryResult::None,
+                QueryResult::Error(e) => QueryResult::Error(e),
+                // `eval_fanout` above only ever produces Owned/ManyOwned/
+                // None/Error from an Owned-only `body` closure.
+                _ => QueryResult::None,
+            }
         }
         Expr::Builtin(builtin) => {
             // Handle other builtins that don't need special path handling
@@ -11921,6 +12249,7 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
                             rest,
                             &result,
                             root,
+                            file_origin,
                             current_path,
                             optional,
                         )
@@ -11943,6 +12272,7 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
                             rest,
                             &result,
                             &result,
+                            file_origin,
                             &[],
                             optional,
                         )
@@ -11964,6 +12294,7 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
                             rest,
                             &result,
                             root,
+                            file_origin,
                             current_path,
                             optional,
                         )
@@ -18290,6 +18621,7 @@ fn expand_func_calls_in_builtin(
         Builtin::Column => Builtin::Column,
         Builtin::DocumentIndex => Builtin::DocumentIndex,
         Builtin::LineComment => Builtin::LineComment,
+        Builtin::FileIndex => Builtin::FileIndex,
         Builtin::Shuffle => Builtin::Shuffle,
         Builtin::Pivot => Builtin::Pivot,
         Builtin::SplitDoc => Builtin::SplitDoc,
@@ -18591,6 +18923,7 @@ fn substitute_func_param_in_builtin(builtin: &Builtin, param: &str, arg: &Expr) 
         Builtin::Column => Builtin::Column,
         Builtin::DocumentIndex => Builtin::DocumentIndex,
         Builtin::LineComment => Builtin::LineComment,
+        Builtin::FileIndex => Builtin::FileIndex,
         Builtin::Shuffle => Builtin::Shuffle,
         Builtin::Pivot => Builtin::Pivot,
         Builtin::SplitDoc => Builtin::SplitDoc,
