@@ -1519,7 +1519,7 @@ pub type BorrowedJsonCursor<'a> = JsonCursor<'a, &'a [u64]>;
 // ============================================================================
 
 use crate::jq::document::{
-    DocumentCursor, DocumentElements, DocumentField, DocumentFields, DocumentValue,
+    DocumentCursor, DocumentElements, DocumentField, DocumentFields, DocumentValue, IndentSpec,
 };
 
 impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for JsonCursor<'a, W> {
@@ -1579,13 +1579,17 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for JsonCursor<'a, W> {
     fn stream_json<Out: core::fmt::Write>(
         &self,
         out: &mut Out,
-        indent_spaces: usize,
+        indent: IndentSpec,
+        _sort_keys: bool,
     ) -> core::fmt::Result {
         // Compact only: echo the raw bytes verbatim, since they're already
         // valid JSON. Indented (pretty) JSON->JSON streaming isn't
         // implemented here — callers fall back to the DOM path (#442 only
         // extended the YAML-target and YAML-cursor-to-JSON pretty paths).
-        if indent_spaces != 0 {
+        // `sort_keys` is unused: `jq`'s own M2 gate (src/bin/succinctly/
+        // jq_runner.rs) excludes `-S` independently of this trait, so this
+        // is never reached with `sort_keys: true`.
+        if !indent.is_compact() {
             return Err(core::fmt::Error);
         }
         if let Some(bytes) = self.raw_bytes() {
@@ -1601,10 +1605,12 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for JsonCursor<'a, W> {
     fn stream_yaml<Out: core::fmt::Write>(
         &self,
         out: &mut Out,
-        indent_spaces: usize,
+        indent: IndentSpec,
+        _sort_keys: bool,
     ) -> core::fmt::Result {
-        // For JSON->YAML conversion, we need to format as YAML
-        stream_json_as_yaml(out, self.value(), 0, indent_spaces)
+        // For JSON->YAML conversion, we need to format as YAML. `sort_keys`
+        // is unused for the same reason as `stream_json` above.
+        stream_json_as_yaml(out, self.value(), 0, indent.width)
     }
 
     #[inline]

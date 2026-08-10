@@ -857,6 +857,104 @@ fn test_duplicate_mapping_key_survives_computed_index() -> Result<()> {
     Ok(())
 }
 
+/// #733: `-S`/`--sort-keys` excluded identity/navigation queries from the M2
+/// cursor-streaming fast path, forcing them through the `OwnedValue` DOM
+/// (`IndexMap`-backed), which silently collapsed duplicate keys — the same
+/// bug class #442 fixed for the unadorned fast path. Fixed by teaching the
+/// YAML mapping cursor streamer to sort fields itself (materializing into a
+/// `Vec<YamlField>`, which stays duplicate-key-safe since sorting is stable
+/// and doesn't merge same-key entries) rather than excluding `-S` from the
+/// fast path. Uses an extra out-of-order, non-duplicate key (`b`) alongside
+/// the duplicate `a` pair so the test also confirms sorting still happens.
+#[test]
+fn test_duplicate_mapping_key_survives_sort_keys() -> Result<()> {
+    let yaml = "b: 1\na: 2\na: 3\n";
+
+    let (output, code) = run_yq_stdin(".", yaml, &["-S"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "a: 2\na: 3\nb: 1\n");
+
+    Ok(())
+}
+
+/// Same as [`test_duplicate_mapping_key_survives_sort_keys`], for `-o json`.
+#[test]
+fn test_duplicate_mapping_key_survives_sort_keys_json_output() -> Result<()> {
+    let yaml = "b: 1\na: 2\na: 3\n";
+
+    let (output, code) = run_yq_stdin(".", yaml, &["-S", "-o", "json"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "{\n  \"a\": 2,\n  \"a\": 3,\n  \"b\": 1\n}\n");
+
+    Ok(())
+}
+
+/// #733: `--tab` excluded identity/navigation queries from the M2
+/// cursor-streaming fast path for the same reason as `-S` above (the
+/// streamers only accepted a numeric space count, not a string/char indent
+/// unit), forcing the same `IndexMap`-backed DOM collapse. Fixed by
+/// threading an indent unit character through the streamers instead of a
+/// bare space count.
+#[test]
+fn test_duplicate_mapping_key_survives_tab() -> Result<()> {
+    let yaml = "a: 1\na: 2\n";
+
+    let (output, code) = run_yq_stdin(".", yaml, &["--tab"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "a: 1\na: 2\n");
+
+    Ok(())
+}
+
+/// Same as [`test_duplicate_mapping_key_survives_tab`], for `-o json` —
+/// also confirms nested indentation actually uses a literal tab character.
+#[test]
+fn test_duplicate_mapping_key_survives_tab_json_output() -> Result<()> {
+    let yaml = "a: 1\na: 2\n";
+
+    let (output, code) = run_yq_stdin(".", yaml, &["--tab", "-o", "json"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "{\n\t\"a\": 1,\n\t\"a\": 2\n}\n");
+
+    Ok(())
+}
+
+/// `-S` and `--tab` combined: both flags widen the same `can_stream_pretty`
+/// gate (#733), so confirm they compose correctly rather than one silently
+/// overriding the other.
+#[test]
+fn test_duplicate_mapping_key_survives_sort_keys_and_tab() -> Result<()> {
+    let yaml = "b: 1\na: 2\na: 3\n";
+
+    let (output, code) = run_yq_stdin(".", yaml, &["-S", "--tab"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "a: 2\na: 3\nb: 1\n");
+
+    let (json, code) = run_yq_stdin(".", yaml, &["-S", "--tab", "-o", "json"])?;
+    assert_eq!(code, 0);
+    assert_eq!(json, "{\n\t\"a\": 2,\n\t\"a\": 3,\n\t\"b\": 1\n}\n");
+
+    Ok(())
+}
+
+/// `--tab`'s fix (#733) widened `can_stream_pretty`, which also covers
+/// `keys_unsorted` (part of `can_use_m2_streaming`) — not a duplicate-key
+/// case (keys_unsorted returns an array of key names, so nothing to
+/// collapse), but its lazy streamer (`stream_lazy_keys_json`/`_yaml` in
+/// `src/jq/stream.rs`) has its own indentation helper, independent of the
+/// mapping cursor streamer's. Guards against that helper silently emitting
+/// spaces instead of tabs now that this path is reachable with `--tab`.
+#[test]
+fn test_tab_indent_keys_unsorted() -> Result<()> {
+    let yaml = "b: 1\na: 2\n";
+
+    let (output, code) = run_yq_stdin("keys_unsorted", yaml, &["--tab", "-o", "json"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "[\n\t\"b\",\n\t\"a\"\n]\n");
+
+    Ok(())
+}
+
 /// #478: the `--inplace` fast path is scoped to M2-streamable expressions
 /// (identity/field/index/iterate); confirm field navigation still rewrites
 /// the file correctly, not just plain identity.
