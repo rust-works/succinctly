@@ -11,7 +11,9 @@ use std::io::{BufWriter, IsTerminal, Read, Write};
 use std::path::Path;
 
 use succinctly::jq::document::{DocumentCursor, DocumentFields, IndentSpec};
-use succinctly::jq::eval_generic::{eval_with_cursor_using, to_owned, GenericResult};
+use succinctly::jq::eval_generic::{
+    eval_with_cursor_using, to_owned, to_owned_with_comments, CommentTree, GenericResult,
+};
 use succinctly::jq::{
     self, sync_aliased_paths, Builtin, Expr, OwnedValue, QueryResult, YqSemantics,
 };
@@ -304,6 +306,9 @@ fn parse_input(bytes: &[u8], format: InputFormat) -> Result<Vec<OwnedValue>> {
     }
 }
 
+/// A single jq result value paired with its parallel [`CommentTree`] (issue #710).
+type ResultWithComments = (OwnedValue, CommentTree);
+
 /// Evaluate YAML input directly using the generic evaluator with per-document processing.
 ///
 /// This processes YAML documents directly without intermediate OwnedValue conversion,
@@ -318,7 +323,8 @@ fn evaluate_yaml_direct_filtered(
     expr: &Expr,
     doc_filter: Option<(usize, usize)>,
     sink: &mut ErrorSink,
-) -> Result<(Vec<Vec<OwnedValue>>, usize)> {
+    need_comments: bool,
+) -> Result<(Vec<Vec<ResultWithComments>>, usize)> {
     let index = YamlIndex::build(bytes).map_err(|e| anyhow::anyhow!("YAML parse error: {e}"))?;
     let root = index.root(bytes);
 
@@ -335,7 +341,7 @@ fn evaluate_yaml_direct_filtered(
                 };
 
                 if should_eval {
-                    let results = evaluate_yaml_cursor(cursor, expr, sink)?;
+                    let results = evaluate_yaml_cursor(cursor, expr, sink, need_comments)?;
                     // Only include documents that have results (select may filter them out)
                     if !results.is_empty() {
                         doc_results.push(results);
@@ -348,7 +354,10 @@ fn evaluate_yaml_direct_filtered(
             Ok((doc_results, local_idx))
         }
         _ => {
-            // Single document - navigate to actual content
+            // Defensive fallback only, same as the inplace fast path's
+            // identical `_ =>` arm below: `root.value()` always reports the
+            // virtual document sequence (single documents included), so
+            // this arm is unreachable through any real input today.
             let should_eval = match doc_filter {
                 Some((target_doc, global_offset)) => global_offset == target_doc,
                 None => true,
@@ -356,7 +365,7 @@ fn evaluate_yaml_direct_filtered(
 
             if should_eval {
                 if let Some(content_cursor) = root.first_child() {
-                    let results = evaluate_yaml_cursor(content_cursor, expr, sink)?;
+                    let results = evaluate_yaml_cursor(content_cursor, expr, sink, need_comments)?;
                     Ok((vec![results], 1))
                 } else {
                     // Empty document
@@ -510,11 +519,16 @@ fn walk_alias_groups<W: AsRef<[u64]> + Clone>(
 /// Evaluate a jq expression directly on a YAML cursor.
 ///
 /// This uses the generic evaluator to preserve position metadata (line/column).
+/// Each result carries its parallel [`CommentTree`] (issue #710) — real for
+/// `OneCursor`/`ManyCursor` (still-live cursor), [`CommentTree::empty`]
+/// everywhere else (an already-materialized/computed value, comment-less by
+/// construction — see [`CommentTree`]'s own doc comment for why).
 fn evaluate_yaml_cursor<W: AsRef<[u64]> + Clone>(
     cursor: YamlCursor<'_, W>,
     expr: &Expr,
     sink: &mut ErrorSink,
-) -> Result<Vec<OwnedValue>> {
+    need_comments: bool,
+) -> Result<Vec<ResultWithComments>> {
     // Snapshot alias-sync context from the pristine document *before*
     // evaluation, only when it could possibly matter (#711): an
     // assignment-family expression against a document that actually has
@@ -524,13 +538,33 @@ fn evaluate_yaml_cursor<W: AsRef<[u64]> + Clone>(
         .then(|| (to_owned(&cursor.value()), collect_alias_groups(cursor)));
 
     let result = eval_with_cursor_using::<YqSemantics, _>(expr, cursor);
+    let no_comments = |v| (v, CommentTree::empty());
+    // `to_owned_with_comments` builds a full parallel `IndexMap`/`Vec` tree
+    // alongside the `OwnedValue` one, just to carry comment text - wasted
+    // work when the caller can't use it (`-o json`'s output never reads
+    // `CommentTree` at all; see `output_value`'s JSON branch) (#710).
+    let owned_with_comments = |c: &YamlCursor<'_, W>| {
+        if need_comments {
+            to_owned_with_comments(&c.value(), Some(c))
+        } else {
+            no_comments(to_owned(&c.value()))
+        }
+    };
 
-    // Convert GenericResult to Vec<OwnedValue>
+    // Convert GenericResult to Vec<ResultWithComments>
+    //
+    // `One`/`Many` (as opposed to `OneCursor`/`ManyCursor`) only ever arise
+    // from `eval_generic.rs`'s cursor-loss cascade, which requires an
+    // already-cursor-less value to begin with (e.g. via the cursor-less
+    // `eval()` entry point `jq`'s DOM path uses) — this function always
+    // starts `eval_with_cursor_using` from a real `cursor`, so these two
+    // arms are defensive/unreachable here today, kept for exhaustiveness
+    // over the shared `GenericResult` enum.
     let mut docs = match result {
-        GenericResult::One(v) => Ok(vec![to_owned(&v)]),
-        GenericResult::OneCursor(c) => Ok(vec![to_owned(&c.value())]),
-        GenericResult::Many(vs) => Ok(vs.iter().map(to_owned).collect()),
-        GenericResult::ManyCursor(cs) => Ok(cs.iter().map(|c| to_owned(&c.value())).collect()),
+        GenericResult::One(v) => Ok(vec![no_comments(to_owned(&v))]),
+        GenericResult::OneCursor(c) => Ok(vec![owned_with_comments(&c)]),
+        GenericResult::Many(vs) => Ok(vs.iter().map(to_owned).map(no_comments).collect()),
+        GenericResult::ManyCursor(cs) => Ok(cs.iter().map(owned_with_comments).collect()),
         // This is the DOM/slow path (`evaluate_yaml_direct_filtered`'s
         // fallback), reached only when `can_use_m2_streaming` rejects the
         // expression or a flag (`--sort-keys`, color, `--tab`, `--slurp`,
@@ -553,20 +587,20 @@ fn evaluate_yaml_cursor<W: AsRef<[u64]> + Clone>(
             if sorted {
                 keys.sort();
             }
-            Ok(vec![OwnedValue::Array(
+            Ok(vec![no_comments(OwnedValue::Array(
                 keys.into_iter().map(OwnedValue::String).collect(),
-            )])
+            ))])
         }
         // Same reasoning as `LazyKeys` above, for array `keys`/
         // `keys_unsorted` (#684).
-        GenericResult::LazyIndexRange(len) => Ok(vec![OwnedValue::Array(
+        GenericResult::LazyIndexRange(len) => Ok(vec![no_comments(OwnedValue::Array(
             (0..len).map(|i| OwnedValue::Int(i as i64)).collect(),
-        )]),
+        ))]),
         // Same reasoning as `LazyKeys`/`LazyIndexRange` above, for a
         // composed `map` chain (#724, #725) that never resolved into a
         // narrower shape before reaching this materializing DOM boundary.
         GenericResult::LazySeq(seq) => match seq.materialize_atomic() {
-            Ok(v) => Ok(vec![v]),
+            Ok(v) => Ok(vec![no_comments(v)]),
             Err(jq::Control::Error(e)) => {
                 sink.report(DiagStyle::Yq, &e, &no_location());
                 Ok(vec![])
@@ -581,8 +615,8 @@ fn evaluate_yaml_cursor<W: AsRef<[u64]> + Clone>(
             sink.report(DiagStyle::Yq, &e, &no_location());
             Ok(vec![])
         }
-        GenericResult::Owned(v) => Ok(vec![v]),
-        GenericResult::ManyOwned(vs) => Ok(vs),
+        GenericResult::Owned(v) => Ok(vec![no_comments(v)]),
+        GenericResult::ManyOwned(vs) => Ok(vs.into_iter().map(no_comments).collect()),
         GenericResult::Break(label) => {
             sink.report_break(DiagStyle::Yq, &label, &no_location());
             Ok(vec![])
@@ -591,18 +625,18 @@ fn evaluate_yaml_cursor<W: AsRef<[u64]> + Clone>(
         // (#400, #494).
         GenericResult::Partial(vs, jq::Control::Error(e)) => {
             sink.report(DiagStyle::Yq, &e, &no_location());
-            Ok(vs)
+            Ok(vs.into_iter().map(no_comments).collect())
         }
         GenericResult::Partial(vs, jq::Control::Break(label)) => {
             sink.report_break(DiagStyle::Yq, &label, &no_location());
-            Ok(vs)
+            Ok(vs.into_iter().map(no_comments).collect())
         }
     };
 
     if let Some((pristine, groups)) = &alias_sync_ctx {
         if let Ok(docs) = &mut docs {
-            for doc in docs.iter_mut() {
-                sync_aliased_paths(doc, pristine, groups);
+            for (value, _comments) in docs.iter_mut() {
+                sync_aliased_paths(value, pristine, groups);
             }
         }
     }
@@ -699,8 +733,16 @@ fn write_terminator<W: Write>(writer: &mut W, config: &OutputConfig) -> Result<(
     Ok(())
 }
 
-/// Format and output a value.
-fn output_value<W: Write>(writer: &mut W, value: &OwnedValue, config: &OutputConfig) -> Result<()> {
+/// Format and output a value, threading `comments` through to `emit_yaml_value`
+/// (issue #710). Callers with no cursor-derived comment data (JSON input,
+/// `--null-input`, `--raw-input`, `--slurp`, `--inplace`'s slow path) pass
+/// `&CommentTree::empty()`.
+fn output_value<W: Write>(
+    writer: &mut W,
+    value: &OwnedValue,
+    comments: &CommentTree,
+    config: &OutputConfig,
+) -> Result<()> {
     // Handle raw output for scalars
     if config.raw_output {
         if let OwnedValue::String(s) = value {
@@ -713,7 +755,24 @@ fn output_value<W: Write>(writer: &mut W, value: &OwnedValue, config: &OutputCon
     // For YAML output format (default)
     if config.output_format == OutputFormat::Yaml {
         // For YAML, scalars are printed without quotes by default (like -r in yq)
-        let output = emit_yaml_value(value, config, 0, false);
+        let body = emit_yaml_value(value, comments, config, 0, false);
+        // Every non-root node's own trailing comment is appended by its
+        // *parent* during `emit_yaml_value`'s recursion (see its Array/Object
+        // arms), but the root has no parent call site to do that for it —
+        // append it here instead, or a comment trailing the jq result's own
+        // top-level node (e.g. `[1, 2, 3] # trailing`) is silently dropped
+        // (#710). Scalars are excluded: verified against the pinned real
+        // `yq` binary, a bare scalar document (`42 # trailing`) drops its
+        // own trailing comment from output on both identity and `select`,
+        // even though `line_comment` still returns it — real `yq`'s own
+        // quirk, not a succinctly gap, so replicated here rather than
+        // "fixed" into a new divergence.
+        let root_comment_suffix = if matches!(value, OwnedValue::Array(_) | OwnedValue::Object(_)) {
+            trailing_comment_suffix(comments)
+        } else {
+            String::new()
+        };
+        let output = format!("{body}{root_comment_suffix}");
         if config.use_color {
             write!(writer, "{}", colorize_yaml(&output))?;
         } else {
@@ -763,9 +822,20 @@ fn output_value<W: Write>(writer: &mut W, value: &OwnedValue, config: &OutputCon
     Ok(())
 }
 
-/// Emit a YAML value as a string.
+/// Format a node's own trailing comment (issue #710) as `" # text"`, or
+/// `""` if it has none — the single point of change for the separator
+/// convention shared by every `emit_yaml_value` call site that appends one.
+fn trailing_comment_suffix(comments: &CommentTree) -> String {
+    comments.own().map_or_else(String::new, |c| format!(" {c}"))
+}
+
+/// Emit a YAML value as a string, appending each node's trailing same-line
+/// comment from the parallel `comments` tree (issue #710). Flow-style
+/// (`in_flow`) contexts never append one — flow items are comma-joined on
+/// one line, so there's no meaningful "trailing" position between them.
 fn emit_yaml_value(
     value: &OwnedValue,
+    comments: &CommentTree,
     config: &OutputConfig,
     depth: usize,
     in_flow: bool,
@@ -808,7 +878,8 @@ fn emit_yaml_value(
                 // Flow style for nested in flow context
                 let items: Vec<_> = arr
                     .iter()
-                    .map(|v| emit_yaml_value(v, config, depth, true))
+                    .enumerate()
+                    .map(|(i, v)| emit_yaml_value(v, comments.at_index(i), config, depth, true))
                     .collect();
                 format!("[{}]", items.join(", "))
             } else {
@@ -816,17 +887,20 @@ fn emit_yaml_value(
                 let indent = config.indent_str.repeat(depth);
                 let items: Vec<_> = arr
                     .iter()
-                    .map(|v| {
-                        let item = emit_yaml_value(v, config, depth + 1, false);
+                    .enumerate()
+                    .map(|(i, v)| {
+                        let elem_comments = comments.at_index(i);
+                        let item = emit_yaml_value(v, elem_comments, config, depth + 1, false);
+                        let comment_suffix = trailing_comment_suffix(elem_comments);
                         // Check if it's a multi-line value (mapping or sequence)
                         if matches!(v, OwnedValue::Object(_) | OwnedValue::Array(_))
                             && !item.starts_with('[')
                             && !item.starts_with('{')
                         {
                             // Multi-line value - emit nested content which handles its own indentation
-                            format!("{indent}-\n{item}")
+                            format!("{indent}-\n{item}{comment_suffix}")
                         } else {
-                            format!("{indent}- {item}")
+                            format!("{indent}- {item}{comment_suffix}")
                         }
                     })
                     .collect();
@@ -842,7 +916,7 @@ fn emit_yaml_value(
                     .iter()
                     .map(|(k, v)| {
                         let key = yaml_quote_key(k);
-                        let val = emit_yaml_value(v, config, depth, true);
+                        let val = emit_yaml_value(v, comments.field(k), config, depth, true);
                         format!("{key}: {val}")
                     })
                     .collect();
@@ -862,16 +936,18 @@ fn emit_yaml_value(
                     .iter()
                     .map(|(k, v)| {
                         let key = yaml_quote_key(k);
+                        let field_comments = comments.field(k);
+                        let comment_suffix = trailing_comment_suffix(field_comments);
                         // Check if value needs to be on next line
                         if matches!(v, OwnedValue::Object(m) if !m.is_empty())
                             || matches!(v, OwnedValue::Array(a) if !a.is_empty())
                         {
                             // For nested containers, emit at depth+1 which handles its own indentation
-                            let val = emit_yaml_value(v, config, depth + 1, false);
-                            format!("{indent}{key}:\n{val}")
+                            let val = emit_yaml_value(v, field_comments, config, depth + 1, false);
+                            format!("{indent}{key}:\n{val}{comment_suffix}")
                         } else {
-                            let val = emit_yaml_value(v, config, depth + 1, false);
-                            format!("{indent}{key}: {val}")
+                            let val = emit_yaml_value(v, field_comments, config, depth + 1, false);
+                            format!("{indent}{key}: {val}{comment_suffix}")
                         }
                     })
                     .collect();
@@ -1612,10 +1688,14 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                 if $is_yaml {
                     // M2 YAML path: YAML output streaming
                     if is_identity {
-                        // P9 path: stream directly without evaluation
+                        // P9 path: stream directly without evaluation.
+                        // `stream_yaml_as_document` (not `stream_yaml`) since
+                        // `$cursor` here is the whole document being
+                        // redisplayed as itself - its own trailing comment,
+                        // if any, must be kept (#710).
                         emit_yaml_doc_separator($writer, $doc_streamed, true)?;
                         $cursor
-                            .stream_yaml(&mut FmtWriter($writer), yaml_indent, sort_keys)
+                            .stream_yaml_as_document(&mut FmtWriter($writer), yaml_indent, sort_keys)
                             .map_err(|_| anyhow::anyhow!("Write error"))?;
                         writeln!($writer)?;
                         // Streaming skips evaluation, so inspect the document
@@ -1848,7 +1928,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
         for result in results {
             split_doc_state.write_separator(&mut writer, &output_config)?;
             any_truthy |= !matches!(&result, OwnedValue::Null | OwnedValue::Bool(false));
-            output_value(&mut writer, &result, &output_config)?;
+            output_value(&mut writer, &result, &CommentTree::empty(), &output_config)?;
         }
     } else if args.raw_input {
         // Handle --raw-input: read each line as a string instead of parsing as YAML
@@ -1874,7 +1954,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
             for result in results {
                 split_doc_state.write_separator(&mut writer, &output_config)?;
                 any_truthy |= !matches!(&result, OwnedValue::Null | OwnedValue::Bool(false));
-                output_value(&mut writer, &result, &output_config)?;
+                output_value(&mut writer, &result, &CommentTree::empty(), &output_config)?;
             }
         } else {
             // Without --slurp, process each line independently
@@ -1884,7 +1964,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                 for result in results {
                     split_doc_state.write_separator(&mut writer, &output_config)?;
                     any_truthy |= !matches!(&result, OwnedValue::Null | OwnedValue::Bool(false));
-                    output_value(&mut writer, &result, &output_config)?;
+                    output_value(&mut writer, &result, &CommentTree::empty(), &output_config)?;
                 }
             }
         }
@@ -2014,7 +2094,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
             for result in results {
                 split_doc_state.write_separator(&mut writer, &output_config)?;
                 any_truthy |= !matches!(&result, OwnedValue::Null | OwnedValue::Bool(false));
-                output_value(&mut writer, &result, &output_config)?;
+                output_value(&mut writer, &result, &CommentTree::empty(), &output_config)?;
             }
         }
     } else if args.inplace {
@@ -2153,7 +2233,12 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                         split_doc_state.write_separator(&mut buf_writer, &no_color_config)?;
                         any_truthy |=
                             !matches!(&result, OwnedValue::Null | OwnedValue::Bool(false));
-                        output_value(&mut buf_writer, &result, &no_color_config)?;
+                        output_value(
+                            &mut buf_writer,
+                            &result,
+                            &CommentTree::empty(),
+                            &no_color_config,
+                        )?;
                     }
                 }
                 buf_writer.flush()?;
@@ -2195,8 +2280,10 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
 
         // Process all inputs first to collect results, then determine multi-doc status
         // This avoids double-parsing YAML for document counting
-        // Each entry in all_results is a Vec of document results from one file
-        let mut all_results: Vec<Vec<Vec<OwnedValue>>> = Vec::new();
+        // Each entry in all_results is a Vec of document results from one file.
+        // Each result carries its parallel CommentTree (issue #710); JSON
+        // input has none, so it's paired with CommentTree::empty().
+        let mut all_results: Vec<Vec<Vec<ResultWithComments>>> = Vec::new();
         let mut global_doc_index: usize = 0;
         for (bytes, format) in &input_sources {
             match format {
@@ -2205,8 +2292,16 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                     // Filter at evaluation time to avoid evaluating (and printing errors for)
                     // documents that don't match the --doc filter
                     let doc_filter = args.document.map(|target| (target, global_doc_index));
-                    let (doc_results, num_docs) =
-                        evaluate_yaml_direct_filtered(bytes, &program.expr, doc_filter, &mut sink)?;
+                    // JSON output never reads `CommentTree` (see
+                    // `output_value`'s JSON branch), so don't build one (#710).
+                    let need_comments = output_config.output_format == OutputFormat::Yaml;
+                    let (doc_results, num_docs) = evaluate_yaml_direct_filtered(
+                        bytes,
+                        &program.expr,
+                        doc_filter,
+                        &mut sink,
+                        need_comments,
+                    )?;
                     global_doc_index += num_docs;
                     all_results.push(doc_results);
                 }
@@ -2223,7 +2318,12 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                             }
                         }
                         let results = evaluate_input(&input, &program.expr, &mut sink)?;
-                        json_results.push(results);
+                        json_results.push(
+                            results
+                                .into_iter()
+                                .map(|v| (v, CommentTree::empty()))
+                                .collect::<Vec<_>>(),
+                        );
                         global_doc_index += 1;
                     }
                     all_results.push(json_results);
@@ -2249,10 +2349,10 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                 {
                     writeln!(writer, "---")?;
                 }
-                for result in results {
+                for (result, comments) in results {
                     split_doc_state.write_separator(&mut writer, &output_config)?;
                     any_truthy |= !matches!(&result, OwnedValue::Null | OwnedValue::Bool(false));
-                    output_value(&mut writer, &result, &output_config)?;
+                    output_value(&mut writer, &result, &comments, &output_config)?;
                 }
             }
         }
@@ -2343,14 +2443,72 @@ mod tests {
         };
 
         let nan = OwnedValue::NumberLiteral(NumberRepr::Float(f64::NAN), "nan".into());
-        assert_eq!(emit_yaml_value(&nan, &config, 0, false), ".nan");
+        assert_eq!(
+            emit_yaml_value(&nan, &CommentTree::empty(), &config, 0, false),
+            ".nan"
+        );
 
         let pos_inf = OwnedValue::NumberLiteral(NumberRepr::Float(f64::INFINITY), "1e400".into());
-        assert_eq!(emit_yaml_value(&pos_inf, &config, 0, false), ".inf");
+        assert_eq!(
+            emit_yaml_value(&pos_inf, &CommentTree::empty(), &config, 0, false),
+            ".inf"
+        );
 
         let neg_inf =
             OwnedValue::NumberLiteral(NumberRepr::Float(f64::NEG_INFINITY), "-1e400".into());
-        assert_eq!(emit_yaml_value(&neg_inf, &config, 0, false), "-.inf");
+        assert_eq!(
+            emit_yaml_value(&neg_inf, &CommentTree::empty(), &config, 0, false),
+            "-.inf"
+        );
+    }
+
+    /// `in_flow: true` is never reached through any CLI-observable path
+    /// today (`output_value`'s only call site always starts at `false`, and
+    /// nothing downstream re-enters flow style) - `can_use_m2_streaming`'s
+    /// doc comment notes there's no `--flow`-style output flag yet. Call the
+    /// private helper directly, mirroring the NaN/Infinity test above, to
+    /// pin the flow-style Array/Object arms' comment threading (#710):
+    /// `comments.at_index`/`comments.field` must recurse correctly even
+    /// though flow style never appends a trailing comment of its own (see
+    /// `emit_yaml_value`'s own doc comment for why).
+    #[test]
+    fn test_emit_yaml_value_flow_style_threads_comments_without_appending_them() {
+        let config = OutputConfig {
+            output_format: OutputFormat::Yaml,
+            compact: true,
+            raw_output: false,
+            join_output: false,
+            nul_output: false,
+            ascii_output: false,
+            sort_keys: false,
+            no_doc: false,
+            indent_str: String::new(),
+            use_color: false,
+        };
+
+        let mut obj = IndexMap::new();
+        obj.insert("k".to_string(), OwnedValue::Int(1));
+        let value = OwnedValue::Array(vec![OwnedValue::Object(obj)]);
+
+        let mut obj_comments = IndexMap::new();
+        obj_comments.insert(
+            "k".to_string(),
+            CommentTree::Leaf(Some("# k trailing".to_string())),
+        );
+        let comments = CommentTree::Array(
+            None,
+            vec![CommentTree::Object(
+                Some("# obj trailing".to_string()),
+                obj_comments,
+            )],
+        );
+
+        // Flow style renders compactly and drops every trailing comment,
+        // whether on the nested object or its field - unlike block style.
+        assert_eq!(
+            emit_yaml_value(&value, &comments, &config, 0, true),
+            "[{k: 1}]"
+        );
     }
 
     #[test]
@@ -2533,8 +2691,18 @@ mod tests {
 
     /// Evaluate YAML through the production path and flatten per-document groups.
     fn eval_yaml(bytes: &[u8], expr: &Expr) -> Vec<OwnedValue> {
+        eval_yaml_with_comments(bytes, expr)
+            .into_iter()
+            .map(|(v, _)| v)
+            .collect()
+    }
+
+    /// Like [`eval_yaml`], but keeps each result's parallel `CommentTree`
+    /// (issue #710) instead of discarding it.
+    fn eval_yaml_with_comments(bytes: &[u8], expr: &Expr) -> Vec<ResultWithComments> {
         let (groups, _) =
-            evaluate_yaml_direct_filtered(bytes, expr, None, &mut ErrorSink::default()).unwrap();
+            evaluate_yaml_direct_filtered(bytes, expr, None, &mut ErrorSink::default(), true)
+                .unwrap();
         groups.into_iter().flatten().collect()
     }
 

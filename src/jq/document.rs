@@ -119,6 +119,34 @@ pub trait DocumentCursor: Sized + Copy + Clone {
         ""
     }
 
+    /// Get this node's trailing same-line comment text, with the leading
+    /// `#`/space stripped (the `line_comment` jq builtin, issue #710).
+    ///
+    /// Returns `None` if this node has no trailing comment, or for formats
+    /// without comments at all (e.g. JSON) — the "not available" contract
+    /// mirrors [`line`](Self::line)/[`column`](Self::column): the builtin
+    /// itself maps `None` to `""`, matching real `yq`.
+    ///
+    /// Owned rather than borrowed: a trait method's `&self` elides to a
+    /// lifetime scoped to the borrow at the call site, which for a `Copy`
+    /// cursor obtained from e.g. `Option<V::Cursor>::and_then` can be
+    /// shorter than the cursor's own internal `'a` — too short to hand back
+    /// a `&str` slice of the source text. Comments are rare enough per
+    /// document that the allocation only on actual read is not a concern.
+    fn line_comment(&self) -> Option<String> {
+        None
+    }
+
+    /// Get this node's trailing same-line comment, `#` and all, exactly as
+    /// it appears in the source (issue #710) — used by the write path
+    /// ([`crate::jq::eval_generic::to_owned_with_comments`]) to re-emit it
+    /// verbatim. See [`line_comment`](Self::line_comment) for the stripped
+    /// getter form the jq builtin uses; the two intentionally differ (this
+    /// one keeps the `#`, that one usually doesn't).
+    fn line_comment_raw(&self) -> Option<String> {
+        None
+    }
+
     /// Create a cursor at the specified byte offset (0-indexed).
     ///
     /// Returns None if:

@@ -228,6 +228,7 @@ The implementation covers ~95% of jq functionality and is production-ready.
 - [x] `line` - return 1-based line number of current node
 - [x] `column` - return 1-based column number of current node
 - [x] `document_index` / `di` - return 0-indexed document position in multi-doc stream
+- [x] `line_comment` - return trailing same-line comment text (e.g. `"keep this"` for `a: 1 # keep this`), or `""` if absent (#710)
 - [x] `shuffle` - randomly shuffle array elements
 - [x] `pivot` - transpose arrays/objects
 - [x] `split_doc` - mark outputs as separate YAML documents
@@ -244,6 +245,21 @@ The implementation covers ~95% of jq functionality and is production-ready.
 - `cursor.kind()` → `&'static str` - structural kind ("scalar", "seq", "map", "alias")
 - `cursor.line()` → `usize` - 1-based line number
 - `cursor.column()` → `usize` - 1-based column number
+- `cursor.line_comment()` → `Option<&str>` - trailing same-line comment, stripped of leading `#`/space (#710)
+- `cursor.line_comment_raw()` → `Option<&str>` - the same comment, `#` and all, as written to output
+
+**`line_comment` scope (#710)**: like `line`/`column`, works correctly on any
+path that keeps a live cursor — identity, field/index navigation
+(`.foo`, `.[0]`, `.[]`), `select(...)`, and other pure-navigation filters.
+Output preservation (not just the getter) shares this scope: identity,
+navigation, filters, and `-S`/`--sort-keys` all correctly keep trailing
+comments in their output. Assignment (`=`, `|=`, `+=`, ...) and other
+value-constructing expressions fall through a JSON-round-trip evaluation
+path with no comment data to carry, so comments are dropped there — for the
+whole document, not just the assigned field. This is a known gap, not
+silent data loss introduced by this feature; see the tracking issue for the
+planned follow-up. `head_comment`/`foot_comment` (standalone-line comments,
+as opposed to a trailing same-line comment) are not implemented at all.
 
 ### Module System
 - [x] `import "path" as name;` - Import module with namespace
@@ -430,3 +446,4 @@ cargo test --features cli,regex --test jq_error_message_tests
 | 2026-01-24 | Clarified YAML metadata: `alias` is cursor-level API only (not a jq builtin)|
 | 2026-01-24 | Updated coverage to 100% for most categories after comprehensive code review|
 | 2026-08-10 | Fixed `anchor`/`style` jq builtins to resolve real YAML metadata via cursor (previously hardcoded to always return `""`) (#709, ✅ complete)|
+| 2026-08-10 | Added `line_comment` yq builtin and trailing same-line comment preservation on cursor-preserving output paths (#710, ✅ partial - assignment paths not yet covered)|

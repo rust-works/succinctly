@@ -5077,3 +5077,337 @@ fn test_top_level_map_lazy_seq_dom_fallback_725() -> Result<()> {
 
     Ok(())
 }
+
+// Trailing line comment preservation (#710). Every expected string here was
+// verified byte-for-byte against the pinned real `yq` binary
+// (tests/data/yq-golden/YQ_VERSION) before being pinned.
+
+/// Identity on a document with a trailing comment must keep it verbatim,
+/// with the gap before `#` normalized to one space (matching real `yq`,
+/// which does the same regardless of the source's original spacing).
+#[test]
+fn test_identity_preserves_line_comment_710() -> Result<()> {
+    let (out, code) = run_yq_stdin(".", "a: 1 # keep this\nb: 2\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "a: 1 # keep this\nb: 2\n");
+    Ok(())
+}
+
+/// A scalar extracted alone (not as part of its parent mapping) does not
+/// carry its former sibling comment - it belongs to the mapping entry, not
+/// the bare value. Matches real `yq`.
+#[test]
+fn test_field_navigation_drops_the_comment_like_real_yq_710() -> Result<()> {
+    let (out, code) = run_yq_stdin(".a", "a: 1 # keep this\nb: 2\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "1");
+    Ok(())
+}
+
+#[test]
+fn test_sequence_item_comments_preserved_710() -> Result<()> {
+    let (out, code) = run_yq_stdin(".", "items:\n  - 1 # first\n  - 2 # second\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "items:\n  - 1 # first\n  - 2 # second\n");
+    Ok(())
+}
+
+#[test]
+fn test_nested_mapping_comment_preserved_710() -> Result<()> {
+    let (out, code) = run_yq_stdin(".", "a:\n  b: 1 # nested\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "a:\n  b: 1 # nested\n");
+    Ok(())
+}
+
+/// A comment trailing a whole flow collection (not between its elements)
+/// attaches to the field that owns it, same as a scalar value would.
+#[test]
+fn test_flow_collection_trailing_comment_preserved_710() -> Result<()> {
+    let (out, code) = run_yq_stdin(".", "a: [1, 2, 3] # flow comment\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "a: [1, 2, 3] # flow comment\n");
+    Ok(())
+}
+
+#[test]
+fn test_quoted_scalar_comment_preserved_710() -> Result<()> {
+    let (out, code) = run_yq_stdin(".", "a: \"hello\" # quoted\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "a: \"hello\" # quoted\n");
+    Ok(())
+}
+
+/// A cursor-preserving filter (stays on the P9/DOM path via a live cursor,
+/// not a JSON round-trip) keeps comments too, not just bare identity.
+#[test]
+fn test_select_true_preserves_comments_710() -> Result<()> {
+    let (out, code) = run_yq_stdin("select(true)", "a: 1 # keep this\nb: 2\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "a: 1 # keep this\nb: 2\n");
+    Ok(())
+}
+
+/// `-S`/`--sort-keys` forces the DOM output path but doesn't rebuild the
+/// underlying `IndexMap`, just its display order - comments still resolve
+/// by field name.
+#[test]
+fn test_sort_keys_preserves_comments_710() -> Result<()> {
+    let (out, code) = run_yq_stdin(".", "b: 2\na: 1 # keep this\n", &["-S"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "a: 1 # keep this\nb: 2\n");
+    Ok(())
+}
+
+/// `line_comment` getter: strips `# ` (hash + one space) when present.
+#[test]
+fn test_line_comment_builtin_710() -> Result<()> {
+    let (out, code) = run_yq_stdin(".a | line_comment", "a: 1 # keep this\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "keep this");
+    Ok(())
+}
+
+/// No space after `#` - nothing to strip, matching real `yq`'s value. The
+/// result is quoted (`"#keep this"`) because an unquoted string starting
+/// with `#` would itself look like a comment in the re-parsed YAML.
+#[test]
+fn test_line_comment_builtin_no_space_after_hash_710() -> Result<()> {
+    let (out, code) = run_yq_stdin(".a | line_comment", "a: 1 #keep this\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "\"#keep this\"");
+    Ok(())
+}
+
+/// No comment at all - the getter returns `""`, not `null` (matches real
+/// `yq`'s value, verified empirically - this is not the same default as
+/// `line`/`column`, which return `0`). Output is `''` rather than a blank
+/// line because succinctly quotes empty-string scalars by default, unlike
+/// real `yq` - a pre-existing, unrelated discrepancy (`yq '""'` shows the
+/// same gap on unmodified `main`), not something this feature introduces.
+#[test]
+fn test_line_comment_builtin_empty_when_absent_710() -> Result<()> {
+    let (out, code) = run_yq_stdin(".a | line_comment", "a: 1\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "''\n");
+    Ok(())
+}
+
+/// Known gap, not a silent regression: assignment (`=`, `|=`, ...) isn't
+/// natively handled by the cursor-aware evaluator, so it falls through a
+/// JSON-round-trip fallback (`eval_generic.rs`'s catch-all) that discards
+/// cursor/comment data for the *entire* document - not just the assigned
+/// field. `.b = 5` here never touches `a`, yet `a`'s comment is still gone.
+/// Fixing this needs comment-aware assignment logic, not just write-path
+/// wiring; tracked as a follow-up rather than solved here so the gap is
+/// pinned and visible instead of an undocumented surprise.
+#[test]
+fn test_assignment_does_not_yet_preserve_comments_710() -> Result<()> {
+    let (out, code) = run_yq_stdin(".a = 5", "a: 1 # keep this\nb: 2\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "a: 5\nb: 2\n");
+
+    let (out, code) = run_yq_stdin(".b = 5", "a: 1 # keep this\nb: 2\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "a: 1\nb: 5\n");
+    Ok(())
+}
+
+/// A standalone comment on the line right after a block scalar's content
+/// belongs to whatever follows it, not to the block scalar - it must not be
+/// misattributed to `a`. `set_bp_text_end`'s generic same-line capture used
+/// `self.pos`, which by the time block-scalar content parsing finishes has
+/// already advanced past the block region (see
+/// `set_bp_text_end_position`'s doc comment); this stole `b`'s comment and
+/// attached it to `a`. Real `yq` drops this comment entirely (it's not a
+/// same-line trailing comment for anything in this document, and
+/// `head_comment` isn't implemented), so this pins the correct "drop, don't
+/// steal" behavior rather than replicating misattribution.
+#[test]
+fn test_block_scalar_does_not_steal_following_comment_710() -> Result<()> {
+    let (out, code) = run_yq_stdin(".", "a: |\n  line one\n# comment for b\nb: 2\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "a: \"line one\\n\"\nb: 2\n");
+    Ok(())
+}
+
+/// Same misattribution risk for an empty block scalar (no content lines at
+/// all): `detect_block_content_indent` also leaves `self.pos` at the start
+/// of the following line before returning `None`.
+#[test]
+fn test_empty_block_scalar_does_not_steal_following_comment_710() -> Result<()> {
+    let (out, code) = run_yq_stdin(".", "a: |\n# comment for b\nb: 2\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "a: \"\"\nb: 2\n");
+    Ok(())
+}
+
+/// The block scalar's own trailing comment on the header line itself
+/// (`| # text`, captured explicitly before content parsing) must still work
+/// after splitting `set_bp_text_end` into capture/no-capture variants.
+#[test]
+fn test_block_scalar_header_comment_still_preserved_710() -> Result<()> {
+    let (out, code) = run_yq_stdin(".a | line_comment", "a: | # keep this\n  line one\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "keep this");
+    Ok(())
+}
+
+// Root-node trailing comments (#710 follow-up). Every expected string here
+// was verified byte-for-byte against the pinned real `yq` binary. Real `yq`
+// has a quirk worth pinning explicitly: a comment trailing a *scalar*
+// document root is dropped from output (though still readable via
+// `line_comment`), but a comment trailing an *array/object* document root is
+// kept - this is replicated exactly, not "improved into" a new divergence.
+
+/// A comment trailing the whole document's own array/object root (not a
+/// child field) was previously dropped everywhere - `emit_yaml_value`'s
+/// scalar/root arms only ever append a *child's* comment, appended by the
+/// child's parent during recursion; nothing appended the outermost value's
+/// own comment. Matches real `yq`, which keeps this for container roots.
+#[test]
+fn test_root_array_comment_preserved_on_identity_710() -> Result<()> {
+    let (out, code) = run_yq_stdin(".", "[1, 2, 3] # trailing\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "[1, 2, 3] # trailing\n");
+    Ok(())
+}
+
+#[test]
+fn test_root_object_comment_preserved_on_identity_710() -> Result<()> {
+    let (out, code) = run_yq_stdin(".", "{a: 1} # trailing\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "{a: 1} # trailing\n");
+    Ok(())
+}
+
+/// Same fix, but through the DOM/`select` path (`output_value` in
+/// `yq_runner.rs`) rather than the M2/P9 streaming path exercised by plain
+/// identity above.
+#[test]
+fn test_root_array_comment_preserved_on_select_710() -> Result<()> {
+    let (out, code) = run_yq_stdin("select(true)", "{a: 1} # trailing\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim_end(), "a: 1 # trailing");
+    Ok(())
+}
+
+/// A comment trailing a *scalar* document root is a known real-`yq` quirk
+/// (verified empirically): it's dropped from output on both identity and
+/// `select`, unlike an array/object root. `line_comment` still returns it
+/// (the data isn't lost internally, just not re-emitted) - pinning this
+/// exact behavior rather than "fixing" it into a new divergence from real
+/// `yq`.
+#[test]
+fn test_root_scalar_comment_dropped_on_identity_matches_real_yq_710() -> Result<()> {
+    let (out, code) = run_yq_stdin(".", "42 # trailing\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "42");
+
+    let (out, code) = run_yq_stdin("select(true)", "42 # trailing\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "42");
+
+    let (out, code) = run_yq_stdin(". | line_comment", "42 # trailing\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "trailing");
+    Ok(())
+}
+
+/// Field/index navigation extracts a bare value and must NOT gain the
+/// parent-context comment, even where the M2 path shares its streaming
+/// entry point with plain identity - `stream_yaml_as_document` (identity
+/// only) vs. `stream_yaml` (bare navigated results) must stay distinct.
+/// Matches real `yq`: `.a` on `a: 1 # keep this` outputs bare `1`.
+#[test]
+fn test_field_navigation_still_drops_comment_after_root_fix_710() -> Result<()> {
+    let (out, code) = run_yq_stdin(".a", "a: 1 # keep this\nb: 2\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "1");
+    Ok(())
+}
+
+/// A comment trailing the first document's scalar root in a multi-document
+/// stream is dropped by real `yq` too (verified empirically) - not a
+/// regression to "fix" here.
+#[test]
+fn test_multi_doc_root_scalar_comment_dropped_matches_real_yq_710() -> Result<()> {
+    let (out, code) = run_yq_stdin(".", "42 # trailing\n---\nfoo: bar\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "42\n---\nfoo: bar\n");
+    Ok(())
+}
+
+/// `-o json` never reads `CommentTree` (JSON has no comment syntax), so
+/// `evaluate_yaml_cursor` skips building one for JSON output (#710
+/// follow-up efficiency fix) - this just pins that the skip doesn't change
+/// JSON output correctness for a document that does have comments.
+#[test]
+fn test_json_output_unaffected_by_comment_tree_skip_710() -> Result<()> {
+    let (out, code) = run_yq_stdin("select(true)", "a: 1 # keep this\nb: 2\n", &["-o", "json"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "{\n  \"a\": 1,\n  \"b\": 2\n}\n");
+    Ok(())
+}
+
+/// A named variable (`--arg`) forces every document through
+/// `evaluate_yaml_cursor`'s DOM-ish fallback (`can_yaml_fast_path` requires
+/// `context.named.is_empty()`), same as a non-M2-streamable expression.
+/// `keys_unsorted` on a top-level array still resolves to
+/// `GenericResult::LazyIndexRange` there (#684) even though nothing forced
+/// materialization for its own sake - this pins that fallback arm produces
+/// the same `[0, 1, ..., len-1]` a plain `syq keys` would.
+#[test]
+fn test_keys_unsorted_lazy_index_range_via_dom_fallback_710() -> Result<()> {
+    let (out, code) = run_yq_stdin("keys_unsorted", "- a\n- b\n- c\n", &["--arg", "x", "y"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "- 0\n- 1\n- 2\n");
+    Ok(())
+}
+
+/// `--input-format json` (`-p json`) routes evaluation through
+/// `evaluate_input`/`jq::eval` - the plain, cursor-generic-free evaluator in
+/// `eval.rs`, distinct from `eval_generic.rs`'s `Builtin::LineComment` arm
+/// the earlier `line_comment` tests in this file exercise via the normal
+/// YAML M2 path. `builtin_line_comment` there is a permanent `""` regardless
+/// of cursor, matching `builtin_line`/`builtin_column`'s same contract.
+#[test]
+fn test_line_comment_builtin_via_json_input_dom_path_710() -> Result<()> {
+    let (out, code) = run_yq_stdin(".a | line_comment", "{\"a\": 1}", &["-p", "json"])?;
+    assert_eq!(code, 0);
+    // Default output stays YAML (`-p` only sets the *input* format), so an
+    // empty string renders as YAML's `''`, not JSON's `""`.
+    assert_eq!(out, "''\n");
+    Ok(())
+}
+
+/// Same DOM path as above, but with `line_comment` reached only after
+/// `def`-expansion substitutes a zero-arg function's body into the call
+/// site - exercises `expand_func_calls_in_builtin`'s `Builtin::LineComment`
+/// passthrough arm, which `eval.rs`'s plain evaluator (unlike
+/// `eval_generic.rs`, which has no `def` AST-rewriting of its own) uses to
+/// inline every `def` before evaluation.
+#[test]
+fn test_line_comment_builtin_through_def_expansion_710() -> Result<()> {
+    let (out, code) = run_yq_stdin("def f: line_comment; .a | f", "{\"a\": 1}", &["-p", "json"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "''\n");
+    Ok(())
+}
+
+/// A parameterized `def` forces the call site's argument to be substituted
+/// into the function body via `substitute_func_param_in_builtin` - which,
+/// like `expand_func_calls_in_builtin` above, walks every `Builtin` node in
+/// the body (including a `line_comment` that doesn't reference the param at
+/// all) and must pass `Builtin::LineComment` through unchanged.
+#[test]
+fn test_line_comment_builtin_through_param_substitution_710() -> Result<()> {
+    let (out, code) = run_yq_stdin(
+        "def f($x): $x, line_comment; f(.a)",
+        "{\"a\": 1}",
+        &["-p", "json", "-o", "json", "-I0"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "1\n\"\"\n");
+    Ok(())
+}

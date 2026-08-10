@@ -89,7 +89,7 @@ succinctly yq '.spec.containers[]' deployment.yaml service.yaml
 |------|-------------|--------|
 | `--output-format yaml` | Output format: `json` (default), `yaml` | ✅ |
 | `--no-doc` | Omit document separators (`---`) | ✅ |
-| `--preserve-comments` | Preserve comments in YAML output | ❌ Not planned |
+| `--preserve-comments` | Preserve comments in YAML output | 🟡 Partial, always-on (#710) — no flag; see notes below |
 | `--explode-anchors` | Expand anchor/alias references | ❌ Not planned |
 | `--doc N` | Select Nth document from multi-doc stream (0-indexed) | ✅ |
 | `--all-documents` | Process all documents | ✅ Default behavior |
@@ -137,8 +137,15 @@ succinctly yq '.spec.containers[]' deployment.yaml service.yaml
 
 **Not Implemented** (low priority):
 - [ ] `--explode-anchors` flag
-- [ ] `--preserve-comments` flag
 - [ ] Merge keys (`<<: *alias`)
+
+**Partial** (#710): trailing same-line comments (`a: 1 # comment`) are
+captured and preserved through output, always-on (no `--preserve-comments`
+flag needed or planned) — but only on paths that keep a live YAML cursor
+(identity, field/index navigation, filters like `select`, `-S`/sort-keys).
+Assignment (`=`, `|=`, ...) and other value-constructing expressions fall
+through a JSON-round-trip evaluator path that has no comment data to carry;
+see the `comments` row below and the tracking issue for the follow-up.
 
 ---
 
@@ -179,13 +186,15 @@ succinctly yq '.spec.containers[]' deployment.yaml service.yaml
 - [x] `style` - Return scalar/collection style (double, single, literal, folded, flow, or empty)
 - [x] `kind` - Return node kind (scalar, seq, map, alias)
 - [x] `key` - Return current key when iterating (string for objects, int for arrays)
+- [x] `line_comment` - Return trailing same-line comment text, or `""` (#710)
 
 **Not Implemented** (low priority):
 
 | Operator | Description | Status |
 |----------|-------------|--------|
 | `has_anchor` | Check if node has anchor | ❌ (use `anchor != ""`) |
-| `comments` | Get associated comments | ❌ (not stored in index) |
+| `head_comment` / `foot_comment` | Get standalone-line comments before/after a node | ❌ (deferred, #710 scoped to trailing line comments only) |
+| `comments` (get/set forms beyond `line_comment`) | Full comment API parity with real `yq` | ❌ (deferred) |
 
 ---
 
@@ -693,6 +702,13 @@ This plan depends on the YAML parser implementation phases defined in [parsing/y
 
 3. **Comment handling**: How to expose comments in queries?
    - *Decision*: Deferred - implement on user demand
+   - *Update (#710)*: Implemented for trailing same-line comments — capture
+     in the semi-index, a `line_comment` getter builtin, and preservation
+     through output, always-on by default (matching real `yq`, no flag).
+     Scoped to paths that keep a live cursor (identity, navigation, filters,
+     sort-keys); assignment and other value-constructing expressions are a
+     tracked follow-up. `head_comment`/`foot_comment` (standalone-line
+     comments) remain deferred.
 
 4. **Schema validation**: Should yq validate against YAML schemas?
    - *Decision*: Out of scope (separate tool concern)

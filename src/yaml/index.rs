@@ -72,6 +72,9 @@ pub struct YamlIndex<W = Vec<u64>> {
     /// resolves to a tag by reference the way an alias resolves to an
     /// anchor, so this is a single side table, not three (#224).
     tags: BTreeMap<usize, String>,
+    /// Trailing same-line comments: BP position of the owning node → `(start, end)`
+    /// byte range of the raw `#...` comment text (issue #710).
+    line_comments: BTreeMap<usize, (u32, u32)>,
     /// Line starts for line/column lookup (built lazily on first use).
     /// Only needed by `to_line_column()` and `to_offset()` (used by the
     /// `yq-locate` CLI and the `at_position` jq builtin).
@@ -136,6 +139,7 @@ impl YamlIndex<Vec<u64>> {
             bp_to_anchor,
             aliases: semi.aliases,
             tags: semi.tags,
+            line_comments: semi.line_comments,
             lines: OnceCell::new(),
         };
         index.validate_alias_acyclicity()?;
@@ -189,6 +193,10 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
             bp_to_anchor,
             aliases,
             tags,
+            // `from_parts` predates line-comment tracking and has no caller
+            // in this codebase today; a future caller that needs it can be
+            // given an explicit parameter then.
+            line_comments: BTreeMap::new(),
             lines: OnceCell::new(),
         }
     }
@@ -477,6 +485,19 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
     #[inline]
     pub fn get_tag(&self, bp_pos: usize) -> Option<&str> {
         self.tags.get(&bp_pos).map(alloc::string::String::as_str)
+    }
+
+    /// Get the raw trailing-comment byte range for a BP position, if the
+    /// node at that position has a same-line comment (issue #710).
+    ///
+    /// The range starts at `#` and runs to end of line, exclusive of the
+    /// line break — the caller slices it out of the original source text
+    /// and strips the leading `#`/space at the point of use, mirroring how
+    /// [`YamlCursor::style`](super::light::YamlCursor::style) reads from
+    /// already-retained text rather than a stored string.
+    #[inline]
+    pub fn get_line_comment(&self, bp_pos: usize) -> Option<(u32, u32)> {
+        self.line_comments.get(&bp_pos).copied()
     }
 
     /// Resolve an alias at the given BP position to a cursor pointing to
@@ -795,6 +816,132 @@ mod tests {
         let yaml = b"- item1\n- item2";
         let index = YamlIndex::build(yaml);
         assert!(index.is_ok());
+    }
+
+    // ------------------------------------------------------------------------
+    // Trailing line comment capture (#710)
+    // ------------------------------------------------------------------------
+
+    /// Helper: build an index, navigate to `.<key>`'s value cursor via the
+    /// virtual-document-root -> mapping -> field path every YAML document
+    /// shares, and return its raw `#`-prefixed line comment (if any).
+    fn field_line_comment_raw(yaml: &[u8], key: &str) -> Option<String> {
+        use crate::yaml::light::YamlValue;
+
+        let index = YamlIndex::build(yaml).expect("valid YAML");
+        let root = index.root(yaml);
+        let YamlValue::Sequence(docs) = root.value() else {
+            panic!("root is always the virtual document sequence");
+        };
+        let (doc_cursor, _) = docs.uncons_cursor().expect("at least one document");
+        let YamlValue::Mapping(fields) = doc_cursor.value() else {
+            panic!("expected a mapping document");
+        };
+        for field in fields {
+            if let YamlValue::String(k) = field.key() {
+                if k.raw_bytes() == key.as_bytes() {
+                    return field
+                        .value_cursor()
+                        .line_comment_raw()
+                        .map(alloc::string::ToString::to_string);
+                }
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn test_line_comment_captured_on_plain_scalar() {
+        let yaml = b"a: 1 # keep this\nb: 2\n";
+        assert_eq!(
+            field_line_comment_raw(yaml, "a").as_deref(),
+            Some("# keep this")
+        );
+        assert_eq!(field_line_comment_raw(yaml, "b"), None);
+    }
+
+    #[test]
+    fn test_line_comment_captured_on_quoted_scalar() {
+        let yaml = b"a: \"hello\" # quoted\n";
+        assert_eq!(
+            field_line_comment_raw(yaml, "a").as_deref(),
+            Some("# quoted")
+        );
+    }
+
+    #[test]
+    fn test_line_comment_captured_on_flow_collection_close() {
+        let yaml = b"a: [1, 2, 3] # flow comment\n";
+        assert_eq!(
+            field_line_comment_raw(yaml, "a").as_deref(),
+            Some("# flow comment")
+        );
+    }
+
+    #[test]
+    fn test_line_comment_captured_on_flow_mapping_close() {
+        let yaml = b"a: {b: 1} # flow mapping comment\n";
+        assert_eq!(
+            field_line_comment_raw(yaml, "a").as_deref(),
+            Some("# flow mapping comment")
+        );
+    }
+
+    #[test]
+    fn test_line_comment_captured_on_block_scalar_header() {
+        let yaml = b"a: | # header comment\n  line one\n  line two\n";
+        assert_eq!(
+            field_line_comment_raw(yaml, "a").as_deref(),
+            Some("# header comment")
+        );
+    }
+
+    #[test]
+    fn test_line_comment_not_preceded_by_space_is_not_a_comment() {
+        // '#' immediately after non-whitespace content is part of the scalar,
+        // not a comment start (pre-existing rule, #437/#410).
+        let yaml = b"a: 1#notacomment\n";
+        assert_eq!(field_line_comment_raw(yaml, "a"), None);
+    }
+
+    #[test]
+    fn test_line_comment_no_comment_returns_none() {
+        let yaml = b"a: 1\nb: 2\n";
+        assert_eq!(field_line_comment_raw(yaml, "a"), None);
+        assert_eq!(field_line_comment_raw(yaml, "b"), None);
+    }
+
+    #[test]
+    fn test_line_comment_field_not_found_returns_none() {
+        // Every other case above queries a key that's actually present, so
+        // `field_line_comment_raw`'s loop always returns from inside the
+        // `for` — this is the only test that lets it run out of fields and
+        // fall through to the `None` after the loop.
+        let yaml = b"a: 1 # keep this\n";
+        assert_eq!(field_line_comment_raw(yaml, "nonexistent"), None);
+    }
+
+    #[test]
+    fn test_line_comment_on_sequence_items() {
+        let yaml = b"a:\n  - 1 # first\n  - 2 # second\n";
+        let index = YamlIndex::build(yaml).expect("valid YAML");
+        let root = index.root(yaml);
+        use crate::yaml::light::YamlValue;
+        let YamlValue::Sequence(docs) = root.value() else {
+            panic!("root is always the virtual document sequence");
+        };
+        let (doc_cursor, _) = docs.uncons_cursor().expect("at least one document");
+        let YamlValue::Mapping(fields) = doc_cursor.value() else {
+            panic!("expected a mapping document");
+        };
+        let (field, _) = fields.uncons().expect("field 'a'");
+        let YamlValue::Sequence(elements) = field.value_cursor().value() else {
+            panic!("expected a sequence value");
+        };
+        let (first, rest) = elements.uncons_cursor().expect("first element");
+        assert_eq!(first.line_comment_raw(), Some("# first"));
+        let (second, _) = rest.uncons_cursor().expect("second element");
+        assert_eq!(second.line_comment_raw(), Some("# second"));
     }
 
     // ------------------------------------------------------------------------

@@ -2916,6 +2916,12 @@ impl<'a> Parser<'a> {
             return Ok(Some(Builtin::Column));
         }
 
+        // line_comment - yq: return trailing same-line comment text, or "" (#710)
+        if self.matches_keyword("line_comment") {
+            self.consume_keyword("line_comment");
+            return Ok(Some(Builtin::LineComment));
+        }
+
         // document_index / di - yq: return 0-indexed document position in multi-doc stream
         if self.matches_keyword("document_index") {
             self.consume_keyword("document_index");

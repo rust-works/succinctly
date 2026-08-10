@@ -1218,6 +1218,46 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
         self.stream_yaml_value(out, 0, indent.width, indent.unit, sort_keys)
     }
 
+    /// Like [`Self::stream_yaml`], but also appends this cursor's own
+    /// trailing comment (#710) - for callers displaying this cursor's value
+    /// as an entire document (identity), as opposed to a bare navigated
+    /// result. `stream_yaml_value`'s Mapping/Sequence arms already append
+    /// each *child's* own comment as they recurse, but nothing does that for
+    /// the outermost value, since every recursive call goes straight to the
+    /// private `stream_yaml_value` rather than back through a public entry
+    /// point.
+    ///
+    /// This must stay separate from `stream_yaml` rather than folded into
+    /// it: real `yq` keeps a comment when redisplaying the whole document
+    /// unmodified, but drops it when the very same node is extracted alone
+    /// via field/index navigation (`.a` on `a: 1 # keep this` outputs a bare
+    /// `1`, no comment - verified against the pinned real `yq` binary).
+    /// `stream_yaml` is also what `GenericResult::stream_yaml`'s
+    /// `OneCursor`/`ManyCursor` arms use for exactly those navigated
+    /// results, so it must keep the bare (no-comment) behavior.
+    ///
+    /// Scalar/null/alias document roots are excluded even here: verified
+    /// against the pinned real `yq` binary, a bare scalar document
+    /// (`42 # trailing`) drops its own trailing comment from output, even
+    /// though `line_comment` still returns it - real `yq`'s own quirk, not a
+    /// succinctly gap, so replicated rather than "fixed" into a new
+    /// divergence. Only `Mapping`/`Sequence` roots (e.g. `[1, 2, 3] # c`)
+    /// keep it.
+    pub fn stream_yaml_as_document<Out: core::fmt::Write>(
+        &self,
+        out: &mut Out,
+        indent: IndentSpec,
+        sort_keys: bool,
+    ) -> core::fmt::Result {
+        self.write_leading_anchor(out)?;
+        let value = self.value();
+        self.stream_yaml_value(out, 0, indent.width, indent.unit, sort_keys)?;
+        if matches!(value, YamlValue::Mapping(_) | YamlValue::Sequence(_)) {
+            write_line_comment(out, self.line_comment_raw())?;
+        }
+        Ok(())
+    }
+
     /// Stream YAML, unwrapping single documents (matches yq behavior).
     ///
     /// If the root is a single-document array `[doc]`, outputs just `doc` as YAML.
@@ -1232,15 +1272,13 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
             if let YamlValue::Sequence(elements) = self.value() {
                 if let Some((cursor, rest)) = elements.uncons_cursor() {
                     if rest.is_empty() {
-                        // Single document - output it directly without array wrapper
-                        cursor.write_leading_anchor(out)?;
-                        return cursor.stream_yaml_value(
-                            out,
-                            0,
-                            indent.width,
-                            indent.unit,
-                            sort_keys,
-                        );
+                        // Single document - output it directly without array
+                        // wrapper. `stream_yaml_as_document` (not
+                        // `stream_yaml`/`stream_yaml_value`) so the
+                        // document's own trailing comment, if any, is
+                        // included too (#710); it writes the leading anchor
+                        // itself, matching `stream_yaml`.
+                        return cursor.stream_yaml_as_document(out, indent, sort_keys);
                     }
                 }
             }
@@ -1392,6 +1430,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                                     unit,
                                     sort_keys,
                                 )?;
+                                write_line_comment(out, value.line_comment_raw())?;
                             } else {
                                 out.write_char(' ')?;
                                 if let Some(anchor) = value.anchor() {
@@ -1406,6 +1445,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                                     unit,
                                     sort_keys,
                                 )?;
+                                write_line_comment(out, value.line_comment_raw())?;
                             }
                         }
                     } else {
@@ -1437,6 +1477,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                                     unit,
                                     sort_keys,
                                 )?;
+                                write_line_comment(out, value.line_comment_raw())?;
                             } else {
                                 out.write_char(' ')?;
                                 if let Some(anchor) = value.anchor() {
@@ -1451,6 +1492,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                                     unit,
                                     sort_keys,
                                 )?;
+                                write_line_comment(out, value.line_comment_raw())?;
                             }
                         }
                     }
@@ -1506,6 +1548,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                                 unit,
                                 sort_keys,
                             )?;
+                            write_line_comment(out, cursor.line_comment_raw())?;
                         } else {
                             out.write_str("- ")?;
                             if let Some(anchor) = cursor.anchor() {
@@ -1520,6 +1563,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                                 unit,
                                 sort_keys,
                             )?;
+                            write_line_comment(out, cursor.line_comment_raw())?;
                         }
                         elems = rest;
                     }
@@ -1859,6 +1903,39 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
     #[inline]
     pub fn explicit_tag(&self) -> Option<&str> {
         self.index.get_tag(self.bp_pos)
+    }
+
+    /// Get the raw trailing same-line comment for this node, `#` and all,
+    /// exactly as it appears in the source (issue #710).
+    ///
+    /// Returns `None` if this node has no trailing comment. Used by the
+    /// write path, which re-emits the bytes verbatim after a single
+    /// normalized space (matching real `yq`'s output, verified empirically:
+    /// the gap before `#` is normalized to one space, but everything from
+    /// `#` onward — including internal/trailing whitespace — is preserved
+    /// as-is). See [`Self::line_comment`] for the stripped getter form.
+    #[inline]
+    pub fn line_comment_raw(&self) -> Option<&str> {
+        let (start, end) = self.index.get_line_comment(self.bp_pos)?;
+        core::str::from_utf8(&self.text[start as usize..end as usize]).ok()
+    }
+
+    /// Get this node's trailing same-line comment text (the `line_comment`
+    /// jq builtin, issue #710), with the leading `#` and at most one
+    /// following space stripped — matching real `yq`: `# keep this` →
+    /// `"keep this"`, but `#keep this` (no space after `#`) → `"#keep this"`
+    /// unchanged, since there's nothing to strip.
+    ///
+    /// Returns `None` if this node has no trailing comment; the builtin
+    /// itself maps that to `""`, matching real `yq`.
+    #[inline]
+    pub fn line_comment(&self) -> Option<&str> {
+        let raw = self.line_comment_raw()?;
+        // `raw` always starts with '#'. Only strip it (plus one following
+        // space) when a space actually follows — otherwise the '#' is part
+        // of the text with nothing to strip, e.g. `#keep this` stays
+        // `"#keep this"` unchanged (verified against real `yq`).
+        Some(raw.strip_prefix("# ").unwrap_or(raw))
     }
 
     /// Get the anchor name that this alias references.
@@ -5094,6 +5171,16 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
     }
 
     #[inline]
+    fn line_comment(&self) -> Option<String> {
+        YamlCursor::line_comment(self).map(ToString::to_string)
+    }
+
+    #[inline]
+    fn line_comment_raw(&self) -> Option<String> {
+        YamlCursor::line_comment_raw(self).map(ToString::to_string)
+    }
+
+    #[inline]
     fn cursor_at_offset(&self, offset: usize) -> Option<Self> {
         YamlCursor::cursor_at_offset(self, offset)
     }
@@ -5468,6 +5555,27 @@ fn write_yaml_child_inline<W: AsRef<[u64]>, Out: core::fmt::Write>(
         out.write_char(' ')?;
     }
     value.stream_yaml_value(out, 0, 0, unit, sort_keys)
+}
+
+/// Write a trailing same-line comment after a value, if present (issue
+/// #710). `comment` is the raw text as returned by
+/// [`YamlCursor::line_comment_raw`] — starting with `#`, un-stripped — and
+/// is written verbatim after a single normalized space, matching real
+/// `yq`'s output (empirically verified: the gap before `#` is always
+/// exactly one space regardless of the source's original spacing, but
+/// everything from `#` onward, including internal/trailing whitespace, is
+/// preserved as-is).
+fn write_line_comment<Out: core::fmt::Write>(
+    out: &mut Out,
+    comment: Option<&str>,
+) -> core::fmt::Result {
+    match comment {
+        Some(c) => {
+            out.write_char(' ')?;
+            out.write_str(c)
+        }
+        None => Ok(()),
+    }
 }
 
 /// Stream independent document cursors as a single YAML sequence (block or

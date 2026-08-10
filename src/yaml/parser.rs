@@ -115,6 +115,12 @@ pub struct SemiIndex {
     pub aliases: BTreeMap<usize, usize>,
     /// Explicit source tags: BP position → raw tag text (see [`YamlIndex::get_tag`](super::index::YamlIndex::get_tag))
     pub tags: BTreeMap<usize, String>,
+    /// Trailing same-line comments: BP position of the node the comment trails →
+    /// `(start, end)` byte range of the raw comment text, starting at `#` and
+    /// running to end of line (exclusive of the line break, inclusive of any
+    /// trailing whitespace). Only line comments (issue #710) — standalone
+    /// head/foot comments are not captured.
+    pub line_comments: BTreeMap<usize, (u32, u32)>,
 }
 
 /// Maximum nesting depth for recursively-parsed constructs (flow collections
@@ -172,6 +178,10 @@ struct Parser<'a, const HAS_CR: bool> {
     aliases: BTreeMap<usize, usize>,
     /// Explicit source tags collected during parsing: bp_pos → raw tag text
     tags: BTreeMap<usize, String>,
+    /// Trailing same-line comments collected during parsing: bp_pos of the
+    /// owning node → `(start, end)` byte range of the raw `#...` comment text.
+    /// See [`SemiIndex::line_comments`].
+    line_comments: BTreeMap<usize, (u32, u32)>,
 
     // Document tracking
     /// Whether we're currently inside a document
@@ -216,6 +226,17 @@ struct Parser<'a, const HAS_CR: bool> {
     /// Asserted in [`Self::write_bp_open_seq_item`].
     #[cfg(debug_assertions)]
     last_recorded_end: usize,
+
+    /// The raw BP bit position ([`Self::bp_pos`] before increment) most
+    /// recently assigned by [`Self::write_bp_open_at`].
+    ///
+    /// `bp_to_text_end.len() - 1` is *not* this value in general — it counts
+    /// opens only, while `bp_pos` counts opens and closes together, so the
+    /// two diverge by the number of closes that happened before this node's
+    /// own open. [`Self::set_bp_text_end`]'s trailing-comment capture
+    /// (#710) needs the real bit position, since that's what every
+    /// `YamlCursor` method (`self.bp_pos`) keys its lookups on.
+    last_open_bp_pos: usize,
 }
 
 impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
@@ -254,6 +275,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             anchors: BTreeMap::new(),
             aliases: BTreeMap::new(),
             tags: BTreeMap::new(),
+            line_comments: BTreeMap::new(),
             in_document: false,
             document_start_bp_pos: 0,
             pending_explicit_key: None,
@@ -262,6 +284,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             wrapper_slots: Vec::with_capacity(estimated_opens),
             #[cfg(debug_assertions)]
             last_recorded_end: 0,
+            last_open_bp_pos: 0,
         }
     }
 
@@ -331,6 +354,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             self.bp_words.push(0);
         }
         self.bp_words[word_idx] |= 1u64 << bit_idx;
+        self.last_open_bp_pos = self.bp_pos;
         // Record the text position for this BP open
         self.bp_to_text.push(text_pos as u32);
         // Placeholder for end position (will be set by set_bp_text_end for scalars)
@@ -384,6 +408,33 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     /// their leading `[`, `{` or `*`. So don't call this after them.
     #[inline]
     fn set_bp_text_end(&mut self, end_pos: usize) {
+        self.set_bp_text_end_position(end_pos);
+        // The node whose end was just recorded is the one that owns a
+        // trailing same-line comment, if `self.pos` (left wherever scanning
+        // for this value stopped) has nothing but inline whitespace before
+        // a `#`. Every scalar-parsing call site invokes `set_bp_text_end`
+        // immediately after its own scan loop returns, with no intervening
+        // advance, so `self.pos` still reflects exactly where that scan
+        // stopped (#710).
+        let owner_bp_pos = self.last_open_bp_pos;
+        self.maybe_capture_line_comment(owner_bp_pos);
+    }
+
+    /// Record `end_pos` as the text end for the node currently open, without
+    /// attempting trailing-comment capture (#710). Block scalars call this
+    /// directly: their own trailing comment, if any, was already captured
+    /// explicitly on the header line (`| # text`) before content was
+    /// consumed, and by the time content parsing finishes `self.pos` sits at
+    /// the start of a following line — possibly several blank lines, or a
+    /// comment line belonging to the next sibling, past the block region
+    /// (`consume_block_scalar_content`/`detect_block_content_indent` both
+    /// advance `self.pos` past it). `set_bp_text_end`'s same-line capture
+    /// would misattribute that unrelated following comment to this block
+    /// scalar; skipping it here is always safe since `self.pos` is at column
+    /// 0 of a fresh line, never mid-line, so there is no legitimate
+    /// same-line comment left to find.
+    #[inline]
+    fn set_bp_text_end_position(&mut self, end_pos: usize) {
         #[cfg(debug_assertions)]
         debug_assert!(
             self.wrapper_slots.last() != Some(&true),
@@ -398,6 +449,32 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         #[cfg(debug_assertions)]
         {
             self.last_recorded_end = end_pos;
+        }
+    }
+
+    /// Capture a trailing same-line comment for `owner_bp_pos`, if `self.pos`
+    /// is separated from a `#` only by inline whitespace (spaces/tabs) on the
+    /// current line. Does not consume any input — callers still run their own
+    /// `skip_to_eol`/`skip_newlines` afterward to actually advance past it.
+    ///
+    /// Uses `entry().or_insert()` rather than unconditional `insert()` so a
+    /// node captured explicitly at a more specific point (e.g. a block
+    /// scalar's header-line comment, captured before its content is parsed)
+    /// is never clobbered by a later, spurious call for the same bp_pos.
+    #[inline]
+    fn maybe_capture_line_comment(&mut self, owner_bp_pos: usize) {
+        let mut p = self.pos;
+        while p < self.input.len() && Self::is_inline_whitespace(self.input[p]) {
+            p += 1;
+        }
+        if p < self.input.len() && self.input[p] == b'#' {
+            let start = p;
+            while p < self.input.len() && !Self::is_break(self.input[p]) {
+                p += 1;
+            }
+            self.line_comments
+                .entry(owner_bp_pos)
+                .or_insert((start as u32, p as u32));
         }
     }
 
@@ -520,6 +597,16 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         }
     }
 
+    /// A space or tab - YAML's "inline whitespace", separation within a
+    /// line rather than between them. Shared by [`Self::skip_inline_whitespace`]
+    /// (which consumes it) and [`Self::maybe_capture_line_comment`] (which
+    /// only peeks past it, since its caller still needs to consume the run
+    /// itself).
+    #[inline]
+    fn is_inline_whitespace(b: u8) -> bool {
+        matches!(b, b' ' | b'\t')
+    }
+
     /// Width in bytes of the line break at `pos`, under this parser's `HAS_CR`
     /// specialization: [`line_break_len`] when a `\r` may be present, and
     /// otherwise the one-byte LF answer it collapses to.
@@ -603,11 +690,8 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     /// Skip whitespace on the current line (spaces and tabs, not newlines).
     #[inline]
     fn skip_inline_whitespace(&mut self) {
-        while self.pos < self.input.len() {
-            match self.input[self.pos] {
-                b' ' | b'\t' => self.pos += 1,
-                _ => break,
-            }
+        while self.pos < self.input.len() && Self::is_inline_whitespace(self.input[self.pos]) {
+            self.pos += 1;
         }
     }
 
@@ -3101,6 +3185,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         self.set_ib();
 
         // Open sequence container
+        let container_bp_pos = self.bp_pos;
         self.write_bp_open();
         self.write_ty(true); // 1 = sequence
 
@@ -3181,6 +3266,10 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             self.advance();
         }
 
+        // A trailing comment right after `]` belongs to this sequence as a
+        // whole (#710), e.g. `a: [1, 2, 3] # comment`.
+        self.maybe_capture_line_comment(container_bp_pos);
+
         // Close sequence
         self.write_bp_close();
 
@@ -3200,6 +3289,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         self.set_ib();
 
         // Open mapping container
+        let container_bp_pos = self.bp_pos;
         self.write_bp_open();
         self.write_ty(false); // 0 = mapping
 
@@ -3313,6 +3403,10 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             self.set_ib();
             self.advance();
         }
+
+        // A trailing comment right after `}` belongs to this mapping as a
+        // whole (#710), e.g. `a: {b: 1} # comment`.
+        self.maybe_capture_line_comment(container_bp_pos);
 
         // Close mapping
         self.write_bp_close();
@@ -3905,7 +3999,11 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         // Parse the header
         let header = self.parse_block_scalar_header()?;
 
-        // Skip to end of indicator line (may have trailing comment)
+        // Skip to end of indicator line, capturing a trailing comment as this
+        // block scalar's own line comment first (#710) — `self.last_open_bp_pos`
+        // is still this node's bp_pos here since no content/children are
+        // parsed yet.
+        self.maybe_capture_line_comment(self.last_open_bp_pos);
         self.skip_to_eol();
         self.skip_line_break();
 
@@ -3917,8 +4015,12 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             match self.detect_block_content_indent(base_indent) {
                 Some(indent) => indent,
                 None => {
-                    // Empty block scalar
-                    self.set_bp_text_end(self.pos);
+                    // Empty block scalar. `self.pos` sits at the start of the
+                    // line following the header (see `detect_block_content_indent`),
+                    // so a `#` there belongs to a following comment/sibling
+                    // line, not this scalar — use the no-capture variant
+                    // (#710, see `set_bp_text_end_position`'s doc comment).
+                    self.set_bp_text_end_position(self.pos);
                     self.write_bp_close();
                     return Ok(());
                 }
@@ -3928,8 +4030,13 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         // Consume content lines
         let content_end = self.consume_block_scalar_content(content_indent, header.chomping);
 
-        // Close the block scalar node
-        self.set_bp_text_end(content_end);
+        // Close the block scalar node. `self.pos` has been advanced past the
+        // block region (potentially past blank lines or a following
+        // sibling's comment line) by `consume_block_scalar_content`, so use
+        // the no-capture variant — the block's own trailing comment, if any,
+        // was already captured on the header line above (#710, see
+        // `set_bp_text_end_position`'s doc comment).
+        self.set_bp_text_end_position(content_end);
         self.write_bp_close();
 
         Ok(())
@@ -4297,6 +4404,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             anchors: core::mem::take(&mut self.anchors),
             aliases: core::mem::take(&mut self.aliases),
             tags: core::mem::take(&mut self.tags),
+            line_comments: core::mem::take(&mut self.line_comments),
         })
     }
 

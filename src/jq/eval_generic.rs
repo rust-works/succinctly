@@ -79,6 +79,131 @@ pub fn to_owned<V: DocumentValue>(value: &V) -> OwnedValue {
     }
 }
 
+/// A shape-parallel tree of trailing same-line comments (issue #710), built
+/// alongside an `OwnedValue` by [`to_owned_with_comments`].
+///
+/// `OwnedValue` itself carries no metadata — extending its enum would ripple
+/// through every match site in both the JSON and YAML evaluators for a
+/// feature only the YAML write path needs. This tree is a separate,
+/// additive structure consulted only by `emit_yaml_value` in
+/// `yq_runner.rs`, the DOM writer used once a query's `GenericResult` has
+/// been materialized to `OwnedValue` (`yq_runner.rs`'s
+/// `evaluate_yaml_cursor`, the only place that calls
+/// `to_owned_with_comments`). It is a distinct mechanism from
+/// `YamlCursor::stream_yaml_value`/`stream_yaml_as_document` in
+/// `light.rs`, which stream comments straight from a *live cursor* via
+/// `write_line_comment` and never go through `CommentTree` at all —
+/// `stream_owned_value_yaml` in `stream.rs` streams plain `OwnedValue`
+/// (no cursor, no comment data) and isn't part of either mechanism.
+/// A query that reshapes the tree (`map`, `del`, array construction, ...)
+/// simply has no `to_owned_with_comments` call in its chain, so comments are
+/// dropped there exactly as they are today — not a new regression, and out
+/// of scope for this issue (see the issue's own scope note).
+#[derive(Debug, Clone)]
+pub enum CommentTree {
+    /// A scalar (or any node with no comment-bearing children): this node's
+    /// own trailing comment, if any.
+    Leaf(Option<String>),
+    /// An array: this node's own trailing comment (e.g. `a: [1,2] # c`,
+    /// which trails the whole array, not an element), plus one subtree per
+    /// element in order.
+    Array(Option<String>, Vec<Self>),
+    /// An object: this node's own trailing comment, plus one subtree per
+    /// field, keyed the same as the parallel `OwnedValue::Object`.
+    Object(Option<String>, IndexMap<String, Self>),
+}
+
+impl CommentTree {
+    /// The empty tree: no comment at this node, and (for containers) no
+    /// children — used where a caller has no cursor at all (comment-less by
+    /// construction, e.g. a computed value).
+    pub const fn empty() -> Self {
+        Self::Leaf(None)
+    }
+
+    /// This node's own trailing comment, if any.
+    pub fn own(&self) -> Option<&str> {
+        match self {
+            Self::Leaf(c) | Self::Array(c, _) | Self::Object(c, _) => c.as_deref(),
+        }
+    }
+
+    /// The subtree for array index `i`, or the empty tree if this isn't an
+    /// `Array` or the index is out of range.
+    pub fn at_index(&self, i: usize) -> &Self {
+        match self {
+            Self::Array(_, items) => items.get(i).unwrap_or(&EMPTY_COMMENT_TREE),
+            _ => &EMPTY_COMMENT_TREE,
+        }
+    }
+
+    /// The subtree for object key `key`, or the empty tree if this isn't an
+    /// `Object` or has no such key.
+    pub fn field(&self, key: &str) -> &Self {
+        match self {
+            Self::Object(_, fields) => fields.get(key).unwrap_or(&EMPTY_COMMENT_TREE),
+            _ => &EMPTY_COMMENT_TREE,
+        }
+    }
+}
+
+/// The empty tree, as a genuine `'static` place (not a local `const`, which
+/// can't be borrowed as `'static` from inside a generic method call
+/// argument like `Option::unwrap_or`) — used by [`CommentTree::at_index`]/
+/// [`CommentTree::field`] wherever there's no comment data to return.
+static EMPTY_COMMENT_TREE: CommentTree = CommentTree::Leaf(None);
+
+/// Convert a `DocumentValue` to an `OwnedValue` alongside a parallel [`CommentTree`].
+///
+/// Uses a live cursor to read each node's trailing comment (issue #710).
+/// See [`to_owned`] for the value-only conversion this mirrors and
+/// delegates scalar handling to.
+pub fn to_owned_with_comments<V: DocumentValue>(
+    value: &V,
+    cursor: Option<&V::Cursor>,
+) -> (OwnedValue, CommentTree) {
+    // The raw (`#`-prefixed) form, not the stripped `line_comment` builtin
+    // getter: the write path re-emits this verbatim after one space.
+    let own_comment = cursor.and_then(DocumentCursor::line_comment_raw);
+    if let Some(fields) = value.as_object() {
+        let mut map = IndexMap::new();
+        let mut comment_map = IndexMap::new();
+        let mut f = fields;
+        while let Some((field, rest)) = f.uncons() {
+            if let Some(key) = field.key_str() {
+                let key = key.into_owned();
+                let (v, c) = to_owned_with_comments(&field.value, Some(&field.value_cursor));
+                map.insert(key.clone(), v);
+                comment_map.insert(key, c);
+            }
+            f = rest;
+        }
+        (
+            OwnedValue::Object(map),
+            CommentTree::Object(own_comment, comment_map),
+        )
+    } else if let Some(elements) = value.as_array() {
+        let mut items = Vec::new();
+        let mut comment_items = Vec::new();
+        // Iterate by cursor (`uncons_cursor`, not `uncons`, which yields
+        // values only) so each element's own comment is reachable.
+        let mut elems = elements;
+        while let Some((elem_cursor, rest)) = elems.uncons_cursor() {
+            let elem_value = elem_cursor.value();
+            let (v, c) = to_owned_with_comments(&elem_value, Some(&elem_cursor));
+            items.push(v);
+            comment_items.push(c);
+            elems = rest;
+        }
+        (
+            OwnedValue::Array(items),
+            CommentTree::Array(own_comment, comment_items),
+        )
+    } else {
+        (to_owned(value), CommentTree::Leaf(own_comment))
+    }
+}
+
 /// Materialize a key/slice-bound candidate just enough to classify it.
 ///
 /// Mirrors `eval::to_owned_key_shape` (#626/#670): `index_one_generic`'s
@@ -2597,6 +2722,11 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
             GenericResult::Owned(OwnedValue::String(style.to_string()))
         }
 
+        Builtin::LineComment => {
+            let comment = cursor.and_then(|c| c.line_comment()).unwrap_or_default();
+            GenericResult::Owned(OwnedValue::String(comment))
+        }
+
         Builtin::Select(cond) => {
             // Evaluate condition with cursor context preserved.
             // This is critical for select(di == N) to work correctly.
@@ -4953,6 +5083,129 @@ mod tests {
 
         // Without cursor, line returns 0
         assert_eq!(owned, OwnedValue::Int(0));
+    }
+
+    // Tests for `line_comment` (#710): a getter for a node's trailing
+    // same-line comment. Unlike `line`/`column`, the "not available"
+    // default is `""`, matching real `yq` (verified empirically), not `0`.
+
+    #[test]
+    fn test_yaml_line_comment_builtin_with_cursor() {
+        use crate::yaml::YamlIndex;
+
+        let yaml = b"a: 1 # keep this\nb: 2\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let doc_cursor = index
+            .root(yaml)
+            .first_child()
+            .expect("YAML document should have content");
+
+        let expr = crate::jq::parse(".a | line_comment").unwrap();
+        let result = eval_with_cursor(&expr, doc_cursor);
+        assert_eq!(
+            result.into_owned().unwrap(),
+            OwnedValue::String("keep this".to_string())
+        );
+    }
+
+    #[test]
+    fn test_yaml_line_comment_builtin_no_comment() {
+        use crate::yaml::YamlIndex;
+
+        let yaml = b"a: 1\nb: 2\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let doc_cursor = index
+            .root(yaml)
+            .first_child()
+            .expect("YAML document should have content");
+
+        let expr = crate::jq::parse(".a | line_comment").unwrap();
+        let result = eval_with_cursor(&expr, doc_cursor);
+        assert_eq!(
+            result.into_owned().unwrap(),
+            OwnedValue::String(String::new())
+        );
+    }
+
+    #[test]
+    fn test_yaml_line_comment_builtin_no_space_after_hash_keeps_hash() {
+        use crate::yaml::YamlIndex;
+
+        // No space after '#' means nothing to strip - the whole thing,
+        // '#' included, is the comment text (verified against real yq).
+        let yaml = b"a: 1 #keep this\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let doc_cursor = index
+            .root(yaml)
+            .first_child()
+            .expect("YAML document should have content");
+
+        let expr = crate::jq::parse(".a | line_comment").unwrap();
+        let result = eval_with_cursor(&expr, doc_cursor);
+        assert_eq!(
+            result.into_owned().unwrap(),
+            OwnedValue::String("#keep this".to_string())
+        );
+    }
+
+    #[test]
+    fn test_yaml_line_comment_without_cursor() {
+        use crate::yaml::YamlIndex;
+
+        let yaml = b"a: 1 # keep this\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let cursor = index.root(yaml);
+        let mapping_cursor = cursor
+            .first_child()
+            .expect("YAML document should have content");
+        let value = mapping_cursor.value();
+
+        // Using eval (not eval_with_cursor) loses position metadata, so
+        // line_comment falls back to "" even though the source has one.
+        let result = eval(&Expr::Builtin(Builtin::LineComment), value);
+        let owned = result.into_owned().unwrap();
+        assert_eq!(owned, OwnedValue::String(String::new()));
+    }
+
+    #[test]
+    fn test_json_line_comment_is_always_empty() {
+        // JSON has no comments; the DocumentCursor default (None) applies
+        // unconditionally regardless of cursor presence.
+        let json = b"{\"a\": 1}";
+        let index = crate::json::JsonIndex::build(json);
+        let cursor = index.root(json);
+        let field_cursor = cursor
+            .first_child()
+            .expect("JSON object should have a field");
+
+        let result = eval_with_cursor(&Expr::Builtin(Builtin::LineComment), field_cursor);
+        assert_eq!(
+            result.into_owned().unwrap(),
+            OwnedValue::String(String::new())
+        );
+    }
+
+    /// `to_owned_with_comments` reads the raw (`#`-and-all) form via
+    /// [`DocumentCursor::line_comment_raw`] (issue #710), not the stripped
+    /// `line_comment` builtin getter the test above exercises. JSON never
+    /// overrides `line_comment_raw` (only `YamlCursor` does), so this is the
+    /// only route that reaches the trait's default `None` implementation for
+    /// that method - unlike `line_comment`, which the plain `jq` `line_comment`
+    /// builtin already exercises on JSON above.
+    #[test]
+    fn test_json_to_owned_with_comments_uses_line_comment_raw_default() {
+        let json = b"{\"a\": 1}";
+        let index = crate::json::JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+
+        let (owned, comments) = to_owned_with_comments(&value, Some(&cursor));
+        assert_eq!(
+            owned,
+            OwnedValue::Object(IndexMap::from([("a".to_string(), OwnedValue::Int(1))]))
+        );
+        assert_eq!(comments.own(), None);
+        assert_eq!(comments.field("a").own(), None);
     }
 
     // Regression tests for #532: `line`/`column` returned 0 for anything
