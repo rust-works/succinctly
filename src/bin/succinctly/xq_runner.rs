@@ -124,9 +124,21 @@ fn generic_result_values<V: DocumentValue>(
         GenericResult::Many(vs) => vs.iter().map(generic_to_owned).collect(),
         GenericResult::ManyCursor(cs) => cs.iter().map(|c| generic_to_owned(&c.value())).collect(),
         // This runner has no lazy-streaming fast path (unlike jq_runner.rs's
-        // `LazyKeysArray`), so `keys_unsorted` is always materialized here.
-        GenericResult::LazyKeysUnsorted(fields) => vec![OwnedValue::Array(
-            fields.keys().into_iter().map(OwnedValue::String).collect(),
+        // `LazyKeysArray`), so `keys`/`keys_unsorted` are always materialized
+        // here. Sort iff `sorted` (#683), matching eager `Keys`.
+        GenericResult::LazyKeys { fields, sorted } => {
+            let mut keys = fields.keys();
+            if sorted {
+                keys.sort();
+            }
+            vec![OwnedValue::Array(
+                keys.into_iter().map(OwnedValue::String).collect(),
+            )]
+        }
+        // Same reasoning as `LazyKeys` above, for array `keys`/
+        // `keys_unsorted` (#684).
+        GenericResult::LazyIndexRange(len) => vec![OwnedValue::Array(
+            (0..len).map(|i| OwnedValue::Int(i as i64)).collect(),
         )],
         GenericResult::None => vec![],
         GenericResult::Error(e) => {

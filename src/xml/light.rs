@@ -134,6 +134,7 @@ impl<W: AsRef<[u64]>> XmlIndex<W> {
             text,
             index: self,
             bp_pos: 0,
+            as_key: false,
         }
     }
 
@@ -230,11 +231,24 @@ impl<W: AsRef<[u64]>> XmlIndex<W> {
 ///
 /// Lightweight (a BP position integer plus borrowed references) and cheap
 /// to copy, like `JsonCursor`/`YamlCursor`.
+///
+/// `as_key` distinguishes a cursor used as a `DocumentField::key_cursor`
+/// from an ordinary navigational cursor at the exact same BP position. JSON
+/// and YAML's `key_cursor` points at a *separate* document node whose
+/// `.value()` naturally is the key string; XML has no such node — the key
+/// is synthesized from the value node's own kind (module docs above). Two
+/// distinct `XmlCursor`s at the same `bp_pos`, differing only in `as_key`,
+/// let [`value`](Self::value) return the synthesized key
+/// ([`XmlValue::Key`]) instead of the field's real value when navigation
+/// code (`eval_generic.rs`'s `LazyKeysUnsorted` fast path) forwards a
+/// `key_cursor` and later calls `.value()` on it, exactly as it does for
+/// JSON/YAML.
 #[derive(Debug)]
 pub struct XmlCursor<'a, W = Vec<u64>> {
     text: &'a [u8],
     index: &'a XmlIndex<W>,
     bp_pos: usize,
+    as_key: bool,
 }
 
 impl<W> Clone for XmlCursor<'_, W> {
@@ -255,6 +269,18 @@ impl<'a, W: AsRef<[u64]>> XmlCursor<'a, W> {
             text,
             index,
             bp_pos,
+            as_key: false,
+        }
+    }
+
+    /// A cursor at this same position, whose [`value`](Self::value) returns
+    /// the synthesized key ([`XmlValue::Key`]) instead of the field's real
+    /// value. See the struct docs' `as_key` note.
+    #[inline]
+    fn as_key_view(&self) -> Self {
+        Self {
+            as_key: true,
+            ..*self
         }
     }
 
@@ -313,6 +339,7 @@ impl<'a, W: AsRef<[u64]>> XmlCursor<'a, W> {
             text: self.text,
             index: self.index,
             bp_pos: new_pos,
+            as_key: false,
         })
     }
 
@@ -324,6 +351,7 @@ impl<'a, W: AsRef<[u64]>> XmlCursor<'a, W> {
             text: self.text,
             index: self.index,
             bp_pos: new_pos,
+            as_key: false,
         })
     }
 
@@ -335,15 +363,34 @@ impl<'a, W: AsRef<[u64]>> XmlCursor<'a, W> {
             text: self.text,
             index: self.index,
             bp_pos: new_pos,
+            as_key: false,
         })
     }
 
-    /// Get the XML value at this cursor position.
+    /// Get the XML value at this cursor position — the synthesized key
+    /// ([`XmlValue::Key`]) if this cursor came from
+    /// [`as_key_view`](Self::as_key_view), otherwise the field's real value.
     pub fn value(&self) -> XmlValue<'a, W> {
-        match self.kind() {
-            XmlNodeKind::Element => XmlValue::Element(*self),
-            XmlNodeKind::Attribute => XmlValue::Attribute(*self),
-            XmlNodeKind::Text { .. } => XmlValue::Text(*self),
+        let kind = self.kind();
+        if self.as_key {
+            // Same synthesis as `XmlValue::key_string()`'s match arms
+            // (inlined rather than shared: that trait method needs `W:
+            // Clone`, which this inherent method doesn't otherwise require).
+            let name = match kind {
+                XmlNodeKind::Element => self.tag_name().map(Cow::Borrowed),
+                XmlNodeKind::Attribute => self.attr_name().map(|n| Cow::Owned(format!("+@{n}"))),
+                XmlNodeKind::Text { .. } => Some(Cow::Borrowed("+content")),
+            };
+            match name {
+                Some(name) => XmlValue::Key(name),
+                None => XmlValue::Error("missing key"),
+            }
+        } else {
+            match kind {
+                XmlNodeKind::Element => XmlValue::Element(*self),
+                XmlNodeKind::Attribute => XmlValue::Attribute(*self),
+                XmlNodeKind::Text { .. } => XmlValue::Text(*self),
+            }
         }
     }
 
@@ -497,6 +544,7 @@ impl<'a, W: AsRef<[u64]>> XmlCursor<'a, W> {
                 text: self.text,
                 index: self.index,
                 bp_pos: lo,
+                as_key: false,
             })
         } else {
             None
@@ -596,6 +644,10 @@ pub enum XmlValue<'a, W = Vec<u64>> {
     Attribute(XmlCursor<'a, W>),
     /// A text or CDATA run's value.
     Text(XmlCursor<'a, W>),
+    /// A field's synthesized key, materialized from an
+    /// [`XmlCursor::as_key_view`] cursor's [`value`](XmlCursor::value) —
+    /// see `XmlCursor`'s `as_key` doc note. Always a string.
+    Key(Cow<'a, str>),
     /// An error encountered during navigation.
     Error(&'static str),
 }
@@ -637,6 +689,7 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentValue for XmlValue<'a, W> {
         match self {
             XmlValue::Attribute(cursor) => cursor.attr_value_str(),
             XmlValue::Text(cursor) => cursor.text_str(),
+            XmlValue::Key(s) => Some(s.clone()),
             _ => None,
         }
     }
@@ -646,6 +699,7 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentValue for XmlValue<'a, W> {
             XmlValue::Element(cursor) => cursor.tag_name().map(Cow::Borrowed),
             XmlValue::Attribute(cursor) => cursor.attr_name().map(|n| Cow::Owned(format!("+@{n}"))),
             XmlValue::Text(_) => Some(Cow::Borrowed("+content")),
+            XmlValue::Key(s) => Some(s.clone()),
             XmlValue::Error(_) => None,
         }
     }
@@ -665,7 +719,7 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentValue for XmlValue<'a, W> {
     fn type_name(&self) -> &'static str {
         match self {
             XmlValue::Element(_) => "object",
-            XmlValue::Attribute(_) | XmlValue::Text(_) => "string",
+            XmlValue::Attribute(_) | XmlValue::Text(_) | XmlValue::Key(_) => "string",
             XmlValue::Error(_) => "error",
         }
     }
@@ -785,7 +839,7 @@ impl<'a, W: AsRef<[u64]> + Clone> XmlFields<'a, W> {
             DocumentField {
                 key,
                 value,
-                key_cursor: cursor,
+                key_cursor: cursor.as_key_view(),
                 value_cursor: cursor,
             },
             rest,

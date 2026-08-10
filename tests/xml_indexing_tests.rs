@@ -25,8 +25,17 @@ fn eval_xml(xml: &[u8], filter: &str) -> Vec<OwnedValue> {
         GenericResult::OneCursor(c) => vec![to_owned(&c.value())],
         GenericResult::Many(vs) => vs.iter().map(to_owned).collect(),
         GenericResult::ManyCursor(cs) => cs.iter().map(|c| to_owned(&c.value())).collect(),
-        GenericResult::LazyKeysUnsorted(fields) => vec![OwnedValue::Array(
-            fields.keys().into_iter().map(OwnedValue::String).collect(),
+        GenericResult::LazyKeys { fields, sorted } => {
+            let mut keys = fields.keys();
+            if sorted {
+                keys.sort();
+            }
+            vec![OwnedValue::Array(
+                keys.into_iter().map(OwnedValue::String).collect(),
+            )]
+        }
+        GenericResult::LazyIndexRange(len) => vec![OwnedValue::Array(
+            (0..len).map(|i| OwnedValue::Int(i as i64)).collect(),
         )],
         GenericResult::None => vec![],
         GenericResult::Owned(v) => vec![v],
@@ -34,15 +43,6 @@ fn eval_xml(xml: &[u8], filter: &str) -> Vec<OwnedValue> {
         GenericResult::Error(e) => panic!("unexpected eval error: {}", e.message),
         GenericResult::Break(label) => panic!("unexpected break: {label}"),
         GenericResult::Partial(_, ctrl) => panic!("unexpected partial result: {ctrl:?}"),
-        // `keys`/`keys_unsorted` (#683) and array-index `keys` (#684) are
-        // generic over any `DocumentValue`, including `XmlValue` — reachable
-        // from these tests (e.g. `.user | keys`), not just JSON/YAML.
-        // `materialize_lazy_keys`/`materialize_lazy_index_range` are private
-        // to `eval_generic`, so go through the public `collect_owned` (the
-        // same materialization `into_owned` uses) instead.
-        result @ (GenericResult::LazyKeys { .. } | GenericResult::LazyIndexRange(_)) => {
-            result.collect_owned()
-        }
     }
 }
 
@@ -118,6 +118,43 @@ fn keys_lists_attributes_and_children_with_the_documented_prefix_convention() {
         .collect();
     assert!(keys.contains(&"+@id"));
     assert!(keys.contains(&"name"));
+}
+
+/// Regression test: `keys_unsorted`'s `LazyKeysUnsorted` fast path
+/// (`eval_generic.rs`, #140) forwards `DocumentField::key_cursor` and later
+/// calls `.value()` on it for `.[]`/`.[n]`/`first`/`last`. JSON/YAML's
+/// `key_cursor` points at a real key node, so that's correct there; XML has
+/// no separate key node, so `XmlFields::uncons` must hand back a cursor
+/// whose `.value()` yields the synthesized key (`XmlValue::Key`), not the
+/// field's real value — otherwise these all silently return field values
+/// instead of key names (caught by manual CLI testing, not by this suite
+/// before this test existed).
+#[test]
+fn keys_unsorted_iteration_yields_key_names_not_field_values() {
+    let xml = br#"<root id="1" name="x"><child>hi</child></root>"#;
+
+    let via_iterate = eval_xml(xml, "keys_unsorted | .[]");
+    assert_eq!(
+        via_iterate,
+        vec![
+            OwnedValue::String("+@id".to_string()),
+            OwnedValue::String("+@name".to_string()),
+            OwnedValue::String("child".to_string()),
+        ]
+    );
+
+    assert_eq!(
+        eval_xml(xml, "keys_unsorted | first"),
+        vec![OwnedValue::String("+@id".to_string())]
+    );
+    assert_eq!(
+        eval_xml(xml, "keys_unsorted | last"),
+        vec![OwnedValue::String("child".to_string())]
+    );
+    assert_eq!(
+        eval_xml(xml, "keys_unsorted | .[1]"),
+        vec![OwnedValue::String("+@name".to_string())]
+    );
 }
 
 #[test]
