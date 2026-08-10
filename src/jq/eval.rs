@@ -12288,11 +12288,15 @@ fn builtin_paths_filter<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         if let OwnedValue::Array(path_arr) = &path {
             // Get the value at this path
             if let Some(val_at_path) = get_value_at_path(&owned, path_arr) {
-                // Check if filter matches
-                if let Ok(OwnedValue::Bool(true)) =
-                    eval_owned_expr::<S>(filter, &val_at_path, optional)
-                {
-                    filtered_paths.push(path);
+                // jq's `paths(node_filter)` is `path(recurse|select(node_filter))`:
+                // the path is kept whenever node_filter's result is truthy, not only
+                // when it's the literal boolean `true`. This matters for filters like
+                // `scalars`/`numbers`/`values` that yield the value itself rather than
+                // a boolean.
+                if let Ok(result) = eval_owned_expr::<S>(filter, &val_at_path, optional) {
+                    if result.is_truthy() {
+                        filtered_paths.push(path);
+                    }
                 }
             }
         }
@@ -25872,6 +25876,37 @@ mod tests {
         query!(br#"{"a": 1, "b": "hello", "c": 2}"#, "[paths(type == \"number\")]",
             QueryResult::Owned(OwnedValue::Array(arr)) => {
                 assert_eq!(arr.len(), 2);
+            }
+        );
+    }
+
+    #[test]
+    fn test_paths_filter_scalars_regression() {
+        // Regression: paths(f) used to only keep a path when f evaluated to the
+        // literal `true`, not any truthy value — this broke every node_filter
+        // that yields the value itself instead of a boolean (scalars, numbers,
+        // values, ...). See paths_scalars_object_in_array_in_array golden case
+        // (#718), matching real jq's `[paths(scalars)]` on the same input.
+        query!(br#"[1,[[],{"a":2}]]"#, "[paths(scalars)]",
+            QueryResult::Owned(OwnedValue::Array(paths)) => {
+                assert_eq!(paths, vec![
+                    OwnedValue::Array(vec![OwnedValue::Int(0)]),
+                    OwnedValue::Array(vec![OwnedValue::Int(1), OwnedValue::Int(1), OwnedValue::String("a".into())]),
+                ]);
+            }
+        );
+    }
+
+    #[test]
+    fn test_paths_filter_numbers_regression() {
+        // Same bug as test_paths_filter_scalars_regression, a different
+        // non-boolean node_filter.
+        query!(br#"{"a": 1, "b": "x", "c": 2.5}"#, "[paths(numbers)]",
+            QueryResult::Owned(OwnedValue::Array(paths)) => {
+                assert_eq!(paths, vec![
+                    OwnedValue::Array(vec![OwnedValue::String("a".into())]),
+                    OwnedValue::Array(vec![OwnedValue::String("c".into())]),
+                ]);
             }
         );
     }
