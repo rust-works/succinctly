@@ -6229,6 +6229,54 @@ fn test_eval_all_file_index_select_then_field() -> Result<()> {
     Ok(())
 }
 
+/// Regression test: `needs_path_context` recurses into `Expr::If`, but
+/// `eval_pipe_with_path_context_internal` had no matching arm, so it fell
+/// into the generic (non-path-context) fallback and silently lost
+/// `file_index` for anything nested in `then`/`else` (#715 follow-up).
+#[test]
+fn test_eval_all_file_index_in_if_then_else() -> Result<()> {
+    let (f1, f2) = two_doc_fixtures()?;
+    let (stdout, _stderr, code) = run_yq_files(
+        r#".[] | if file_index == 0 then "from-f1" else "from-f2" end"#,
+        &[f1.path(), f2.path()],
+        &["--eval-all"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "from-f1\n---\nfrom-f2\n");
+    Ok(())
+}
+
+/// Regression test: same gap as `test_eval_all_file_index_in_if_then_else`,
+/// for `Expr::Try` (#715 follow-up).
+#[test]
+fn test_eval_all_file_index_in_try_catch() -> Result<()> {
+    let (f1, f2) = two_doc_fixtures()?;
+    let (stdout, _stderr, code) = run_yq_files(
+        r#".[] | try select(file_index == 1) catch "err""#,
+        &[f1.path(), f2.path()],
+        &["--eval-all"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "b: 2\nname: second\n");
+    Ok(())
+}
+
+/// Regression test: `label $x | ...` is otherwise inert, but wrapping a
+/// `file_index`-using pipe in one silently dropped path context on both the
+/// `needs_path_context` predicate and the interpreter side (#715 follow-up).
+#[test]
+fn test_eval_all_file_index_survives_label_wrapper() -> Result<()> {
+    let (f1, f2) = two_doc_fixtures()?;
+    let (stdout, _stderr, code) = run_yq_files(
+        "label $out | .[] | file_index",
+        &[f1.path(), f2.path()],
+        &["--eval-all", "-o", "json"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "0\n1");
+    Ok(())
+}
+
 #[test]
 fn test_eval_all_file_index_outside_eval_all_is_zero() -> Result<()> {
     let (f1, _f2) = two_doc_fixtures()?;

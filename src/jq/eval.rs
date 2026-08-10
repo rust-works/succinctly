@@ -409,6 +409,12 @@ pub(crate) fn needs_path_context(expr: &Expr) -> bool {
         Expr::Try { expr, catch } => {
             needs_path_context(expr) || catch.as_ref().is_some_and(|c| needs_path_context(c))
         }
+        // `label $x | ...` is otherwise inert wrt path context, but a
+        // `key`/`document_index`/`file_index` inside its body still needs
+        // the same recursion as `If`/`Try` above -- without it,
+        // `label $out | file_index` silently dropped path context (#715
+        // follow-up).
+        Expr::Label { body, .. } => needs_path_context(body),
         _ => false,
     }
 }
@@ -11674,6 +11680,65 @@ fn eval_pipe_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     eval_pipe_with_path_context_internal::<W, S>(exprs, value, value, None, current_path, optional)
 }
 
+/// Continue evaluating `rest` for each output of an already-computed
+/// intermediate `QueryResult`, preserving `root`/`current_path` (the
+/// intermediate stage doesn't move navigational position -- e.g. a
+/// comparison, an `if`/`then`/`else`, or a `try`/`catch` result is still
+/// "at" the position it was computed from) and fanning a multi-valued
+/// result back out over `rest` the same way `Iterate` does above. Shared by
+/// `If`/`Comma`/`Try`/`Label` below to avoid re-deriving this fan-out loop
+/// at each call site. `Break`/`Partial` inputs collapse to `None` here,
+/// matching `Select`'s pre-existing fan-out policy just above (not a
+/// regression this helper introduces).
+fn continue_rest_with_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    intermediate: QueryResult<'a, W>,
+    rest: &[Expr],
+    root: &OwnedValue,
+    file_origin: Option<&[usize]>,
+    current_path: &[OwnedValue],
+    optional: bool,
+) -> QueryResult<'a, W> {
+    match intermediate {
+        QueryResult::Owned(v) => eval_pipe_with_path_context_internal::<W, S>(
+            rest,
+            &v,
+            root,
+            file_origin,
+            current_path,
+            optional,
+        ),
+        QueryResult::ManyOwned(vs) => {
+            let mut results = Vec::new();
+            for v in vs {
+                match eval_pipe_with_path_context_internal::<W, S>(
+                    rest,
+                    &v,
+                    root,
+                    file_origin,
+                    current_path,
+                    optional,
+                ) {
+                    QueryResult::Owned(r) => results.push(r),
+                    QueryResult::ManyOwned(rs) => results.extend(rs),
+                    QueryResult::None => {}
+                    QueryResult::Error(e) => return QueryResult::Error(e),
+                    _ => {}
+                }
+            }
+            if results.is_empty() {
+                QueryResult::None
+            } else if results.len() == 1 {
+                QueryResult::Owned(results.pop().unwrap())
+            } else {
+                QueryResult::ManyOwned(results)
+            }
+        }
+        QueryResult::None => QueryResult::None,
+        QueryResult::Error(e) => QueryResult::Error(e),
+        _ => QueryResult::None,
+    }
+}
+
 /// Internal helper that also tracks the root value for parent navigation,
 /// and (for `--eval-all`, #715) an optional origin-file-index side table
 /// keyed by top-level array position, resolving `file_index`/`fileIndex`/`fi`.
@@ -12103,13 +12168,16 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
             }
             match arith_result {
                 QueryResult::Owned(v) => {
-                    // Fresh computed value -- reset path/root, same as `Compare`.
+                    // Preserve root/current_path, same as `Compare` above --
+                    // arithmetic is typically a mid-pipe computation, not the
+                    // pipe's final value, so later `key`/`file_index` calls
+                    // must still resolve against the pre-arithmetic position.
                     eval_pipe_with_path_context_internal::<W, S>(
                         rest,
                         &v,
-                        &v,
+                        root,
                         file_origin,
-                        &[],
+                        current_path,
                         optional,
                     )
                 }
@@ -12153,15 +12221,20 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
                 return compare_result;
             }
             if let QueryResult::Owned(v) = compare_result {
-                // A comparison produces a fresh boolean, unrelated to
-                // `value`'s position -- reset path/root like the
-                // `Object`/`Array`/`Literal` arm below does.
+                // Unlike `Object`/`Array`/`Literal`, a comparison is
+                // typically a mid-pipe filter/test, not the pipe's final
+                // value -- `key`/`document_index`/`file_index` later in the
+                // same pipe must still resolve against the position the
+                // comparison was evaluated at, so `root`/`current_path` are
+                // preserved (matching the generic fallback below, and
+                // `main`'s pre-#715 behavior: `.[] | (1==1) | key` must keep
+                // returning the original index, not `null`).
                 return eval_pipe_with_path_context_internal::<W, S>(
                     rest,
                     &v,
-                    &v,
+                    root,
                     file_origin,
-                    &[],
+                    current_path,
                     optional,
                 );
             }
@@ -12281,6 +12354,263 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
                 Err(_) if optional => QueryResult::None,
                 Err(e) => QueryResult::Error(e),
             }
+        }
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            // Evaluate cond/then/else through the path-context evaluator
+            // too, so `if file_index == 0 then ... end` -- a natural
+            // `--eval-all` idiom -- resolves correctly instead of falling
+            // back to the 0/null stub. `needs_path_context` already
+            // recurses into `If`; this arm is what actually honors that
+            // (#715 follow-up: previously there was no explicit `If` arm
+            // here, so it fell into the generic fallback below and lost
+            // path context for anything nested in cond/then/else).
+            let cond_result = eval_pipe_with_path_context_internal::<W, S>(
+                core::slice::from_ref(cond),
+                value,
+                root,
+                file_origin,
+                current_path,
+                optional,
+            );
+            let branch_result = match cond_result {
+                QueryResult::Owned(v) => {
+                    let branch = if v.is_truthy() {
+                        then_branch
+                    } else {
+                        else_branch
+                    };
+                    eval_pipe_with_path_context_internal::<W, S>(
+                        core::slice::from_ref(branch),
+                        value,
+                        root,
+                        file_origin,
+                        current_path,
+                        optional,
+                    )
+                }
+                QueryResult::ManyOwned(vs) => {
+                    let mut results = Vec::new();
+                    for v in vs {
+                        let branch = if v.is_truthy() {
+                            then_branch
+                        } else {
+                            else_branch
+                        };
+                        match eval_pipe_with_path_context_internal::<W, S>(
+                            core::slice::from_ref(branch),
+                            value,
+                            root,
+                            file_origin,
+                            current_path,
+                            optional,
+                        ) {
+                            QueryResult::Owned(r) => results.push(r),
+                            QueryResult::ManyOwned(rs) => results.extend(rs),
+                            QueryResult::None => {}
+                            QueryResult::Error(e) => return QueryResult::Error(e),
+                            _ => {}
+                        }
+                    }
+                    if results.is_empty() {
+                        QueryResult::None
+                    } else if results.len() == 1 {
+                        QueryResult::Owned(results.pop().unwrap())
+                    } else {
+                        QueryResult::ManyOwned(results)
+                    }
+                }
+                QueryResult::None => QueryResult::None,
+                QueryResult::Error(e) => QueryResult::Error(e),
+                _ => QueryResult::None,
+            };
+            if rest.is_empty() {
+                return branch_result;
+            }
+            continue_rest_with_context::<W, S>(
+                branch_result,
+                rest,
+                root,
+                file_origin,
+                current_path,
+                optional,
+            )
+        }
+        Expr::Comma(exprs) => {
+            // Evaluate every branch through the path-context evaluator too,
+            // so `key`/`document_index`/`file_index` nested in a comma
+            // resolve correctly per-branch instead of falling back to the
+            // stub (#715 follow-up; `needs_path_context` already recurses
+            // into `Comma`, but there was no matching interpreter arm).
+            // Collapses more-than-one output into an array -- matching
+            // `eval_owned_expr_ctrl`'s existing multi-output policy for
+            // this position, since that's what the generic fallback below
+            // (which this arm replaces for path-context pipes) already
+            // delegated to; comma not fanning out to independent top-level
+            // outputs here is a separate, pre-existing limitation, left
+            // unchanged.
+            let mut branch_outputs = Vec::new();
+            let mut branch_error = None;
+            for sub_expr in exprs {
+                match eval_pipe_with_path_context_internal::<W, S>(
+                    core::slice::from_ref(sub_expr),
+                    value,
+                    root,
+                    file_origin,
+                    current_path,
+                    optional,
+                ) {
+                    QueryResult::Owned(v) => branch_outputs.push(v),
+                    QueryResult::ManyOwned(vs) => branch_outputs.extend(vs),
+                    QueryResult::None => {}
+                    QueryResult::Error(e) => {
+                        branch_error = Some(e);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            let comma_result = if let Some(e) = branch_error {
+                QueryResult::Error(e)
+            } else if branch_outputs.is_empty() {
+                QueryResult::Owned(OwnedValue::Null)
+            } else if branch_outputs.len() == 1 {
+                QueryResult::Owned(branch_outputs.pop().unwrap())
+            } else {
+                QueryResult::Owned(OwnedValue::Array(branch_outputs))
+            };
+            if rest.is_empty() {
+                return comma_result;
+            }
+            continue_rest_with_context::<W, S>(
+                comma_result,
+                rest,
+                root,
+                file_origin,
+                current_path,
+                optional,
+            )
+        }
+        Expr::Try {
+            expr: try_expr,
+            catch,
+        } => {
+            // Evaluate the try body (and catch handler) through the
+            // path-context evaluator too, so `try select(file_index == 1)
+            // catch ...` -- a natural `--eval-all` idiom -- resolves
+            // correctly instead of falling back to the stub (#715
+            // follow-up). Mirrors `eval_try`'s Error/Break/Partial handling
+            // above, just routed through path context instead of
+            // `eval_single`.
+            let result = eval_pipe_with_path_context_internal::<W, S>(
+                core::slice::from_ref(try_expr),
+                value,
+                root,
+                file_origin,
+                current_path,
+                optional,
+            );
+            let try_result = match result {
+                QueryResult::Error(e) => match catch.as_deref() {
+                    Some(catch_expr) => eval_pipe_with_path_context_internal::<W, S>(
+                        core::slice::from_ref(catch_expr),
+                        &e.payload(),
+                        root,
+                        file_origin,
+                        current_path,
+                        optional,
+                    ),
+                    None => QueryResult::None,
+                },
+                QueryResult::Break(_) => match catch.as_deref() {
+                    Some(catch_expr) => eval_pipe_with_path_context_internal::<W, S>(
+                        core::slice::from_ref(catch_expr),
+                        &OwnedValue::Null,
+                        root,
+                        file_origin,
+                        current_path,
+                        optional,
+                    ),
+                    None => QueryResult::None,
+                },
+                QueryResult::Partial(prefix, Control::Error(e)) => {
+                    let handled = match catch.as_deref() {
+                        Some(catch_expr) => eval_pipe_with_path_context_internal::<W, S>(
+                            core::slice::from_ref(catch_expr),
+                            &e.payload(),
+                            root,
+                            file_origin,
+                            current_path,
+                            optional,
+                        ),
+                        None => QueryResult::None,
+                    };
+                    prepend(prefix, handled)
+                }
+                QueryResult::Partial(prefix, Control::Break(_)) => {
+                    let handled = match catch.as_deref() {
+                        Some(catch_expr) => eval_pipe_with_path_context_internal::<W, S>(
+                            core::slice::from_ref(catch_expr),
+                            &OwnedValue::Null,
+                            root,
+                            file_origin,
+                            current_path,
+                            optional,
+                        ),
+                        None => QueryResult::None,
+                    };
+                    prepend(prefix, handled)
+                }
+                other => other,
+            };
+            if rest.is_empty() {
+                return try_result;
+            }
+            continue_rest_with_context::<W, S>(
+                try_result,
+                rest,
+                root,
+                file_origin,
+                current_path,
+                optional,
+            )
+        }
+        Expr::Label { name, body } => {
+            // Evaluate the label body through the path-context evaluator
+            // too, so `label $out | ... file_index ...` -- a natural (if
+            // inert) wrapper -- resolves correctly instead of silently
+            // falling back to the 0/null stub. Paired with the
+            // `needs_path_context` fix for `Label`: one without the other
+            // still drops path context silently (#715 follow-up).
+            let result = eval_pipe_with_path_context_internal::<W, S>(
+                core::slice::from_ref(body),
+                value,
+                root,
+                file_origin,
+                current_path,
+                optional,
+            );
+            let label_result = match result {
+                QueryResult::Break(label) if &label == name => QueryResult::None,
+                QueryResult::Partial(prefix, Control::Break(label)) if &label == name => {
+                    owned_vec_to_result(prefix)
+                }
+                other => other,
+            };
+            if rest.is_empty() {
+                return label_result;
+            }
+            continue_rest_with_context::<W, S>(
+                label_result,
+                rest,
+                root,
+                file_origin,
+                current_path,
+                optional,
+            )
         }
         _ => {
             // For other expressions, evaluate normally and continue
@@ -28726,6 +29056,60 @@ mod tests {
             QueryResult::Owned(OwnedValue::String(s)) => {
                 assert_eq!(s, "inner");
             }
+        );
+    }
+
+    // Regression tests (#715 follow-up): `eval_pipe_with_path_context_internal`
+    // gained `Compare`/`Arithmetic`/`Select` arms for `--eval-all`'s
+    // `file_index`, but the `Compare`/`Arithmetic` arms unconditionally reset
+    // `current_path`/`root` for the rest of the pipe, breaking `key` (and
+    // `document_index`/`file_index`) in plain `jq` usage that has nothing to
+    // do with `--eval-all` -- e.g. `.[] | (1==1) | key`. Fixed by preserving
+    // path context instead, matching the pre-existing generic fallback.
+    // `If`/`Try`/`Comma`/`Label` had the same gap for a different reason: no
+    // explicit arm at all, so they fell into that same generic fallback
+    // which evaluates via the *plain* (non-path-context) evaluator, losing
+    // `key`/`file_index` for anything nested inside.
+
+    #[test]
+    fn test_key_survives_comparison_mid_pipe() {
+        assert_eq!(outputs(b"[10,20]", ".[] | (1==1) | key"), vec!["0", "1"]);
+    }
+
+    #[test]
+    fn test_key_survives_arithmetic_mid_pipe() {
+        assert_eq!(outputs(b"[10,20]", ".[] | (1+1) | key"), vec!["0", "1"]);
+    }
+
+    #[test]
+    fn test_key_survives_if_then_else_mid_pipe() {
+        assert_eq!(
+            outputs(b"[10,20]", ".[] | if true then key else null end"),
+            vec!["0", "1"]
+        );
+    }
+
+    #[test]
+    fn test_key_survives_try_catch_mid_pipe() {
+        assert_eq!(
+            outputs(b"[10,20]", ".[] | try key catch \"err\""),
+            vec!["0", "1"]
+        );
+    }
+
+    #[test]
+    fn test_key_survives_label_wrapper() {
+        assert_eq!(
+            outputs(b"[10,20]", "label $out | .[] | key"),
+            vec!["0", "1"]
+        );
+    }
+
+    #[test]
+    fn test_key_survives_comma_branches() {
+        assert_eq!(
+            outputs(b"[10,20]", ".[] | (key, key)"),
+            vec!["[0,0]", "[1,1]"]
         );
     }
 
