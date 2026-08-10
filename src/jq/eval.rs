@@ -29206,6 +29206,725 @@ mod tests {
         );
     }
 
+    // Coverage-gap regression tests (PR #770 review): `--eval-all`'s
+    // path-context plumbing (`eval_pipe_with_path_context_internal`,
+    // `accumulate_path_context_step`, `continue_rest_with_context`) grew a
+    // lot of branches for `file_index`/`Compare`/`Arithmetic`/`Select`/
+    // `Map`/`If`/`Comma`/`Try`/`Label`, most reachable only through
+    // combinations the CLI-level `--eval-all` tests above don't happen to
+    // hit (e.g. a builtin followed by *more* pipe stages, an operand that
+    // itself errors, a condition that fans out to multiple values). These
+    // exercise them directly.
+
+    /// Every output of `filter` against `json`, evaluated through
+    /// `eval_owned_with_file_index` with `file_index` resolving against
+    /// `file_origin` -- the same entry point the `--eval-all` CLI driver
+    /// uses. Mirrors `outputs`, but for the path-context evaluator; panics
+    /// on `Error`/`Break`/`Partial` since those are asserted on directly via
+    /// `eval_all_result` where expected.
+    fn eval_all_outputs(json: &[u8], file_origin: &[usize], filter: &str) -> Vec<String> {
+        match eval_all_result(json, file_origin, filter) {
+            QueryResult::Owned(v) => vec![v.to_json()],
+            QueryResult::ManyOwned(vs) => vs.iter().map(OwnedValue::to_json).collect(),
+            QueryResult::None => vec![],
+            other => panic!("expected a successful result, got {other:?}"),
+        }
+    }
+
+    /// Like `eval_all_outputs`, but returns the raw `QueryResult` so a test
+    /// can assert on `Error`/`Break`/`Partial` too. `json` is fed straight
+    /// in as `eval_owned_with_file_index`'s `input` -- i.e. it plays the
+    /// role of the already-combined `--eval-all` array the yq CLI driver
+    /// builds, with `file_origin[i]` naming array element `i`'s origin file.
+    fn eval_all_result<'a>(
+        json: &[u8],
+        file_origin: &[usize],
+        filter: &str,
+    ) -> QueryResult<'a, Vec<u64>> {
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let input = to_owned(&cursor.value());
+        let expr = parse(filter).unwrap();
+        eval_owned_with_file_index::<Vec<u64>, JqSemantics>(&expr, &input, file_origin)
+    }
+
+    #[test]
+    fn test_key_continues_pipe_after_itself() {
+        assert_eq!(
+            outputs(b"[10,20]", ".[] | key | tostring"),
+            vec![r#""0""#, r#""1""#]
+        );
+    }
+
+    #[test]
+    fn test_file_index_continues_pipe_after_itself() {
+        assert_eq!(
+            eval_all_outputs(b"[10,20]", &[7, 8], ".[] | file_index | tostring"),
+            vec![r#""7""#, r#""8""#]
+        );
+    }
+
+    #[test]
+    fn test_generic_builtin_continues_pipe_with_path_context() {
+        // `tostring` (any builtin without its own dedicated path-context
+        // arm) followed by yet another stage, not just used as the pipe's
+        // final value.
+        assert_eq!(
+            eval_all_outputs(
+                b"[10,20]",
+                &[100, 8],
+                ".[] | file_index | tostring | length"
+            ),
+            vec!["3", "1"]
+        );
+    }
+
+    #[test]
+    fn test_array_construction_continues_pipe_with_path_context() {
+        // An array literal resets path/root to the newly constructed value
+        // (it's not navigation), but must still continue the rest of the
+        // pipe rather than short-circuiting.
+        assert_eq!(
+            eval_all_outputs(b"[10,20]", &[7, 8], ".[] | file_index | [., 1] | length"),
+            vec!["2", "2"]
+        );
+    }
+
+    #[test]
+    fn test_parent_continues_pipe_with_path_context() {
+        assert_eq!(
+            eval_all_outputs(
+                br#"[{"a":1},{"a":2}]"#,
+                &[7, 8],
+                ".[] | .a | parent | file_index"
+            ),
+            vec!["7", "8"]
+        );
+    }
+
+    #[test]
+    fn test_parent_n_continues_pipe_with_path_context() {
+        assert_eq!(
+            eval_all_outputs(
+                br#"[{"a":1},{"a":2}]"#,
+                &[7, 8],
+                ".[] | .a | parent(1) | file_index"
+            ),
+            vec!["7", "8"]
+        );
+    }
+
+    #[test]
+    fn test_identity_continues_pipe_with_path_context() {
+        assert_eq!(
+            eval_all_outputs(b"[10,20]", &[7, 8], ".[] | . | file_index"),
+            vec!["7", "8"]
+        );
+    }
+
+    #[test]
+    fn test_optional_as_final_pipe_stage_with_path_context() {
+        assert_eq!(
+            eval_all_outputs(b"[10,20]", &[7, 8], ".[] | (file_index)?"),
+            vec!["7", "8"]
+        );
+    }
+
+    #[test]
+    fn test_optional_continues_pipe_with_path_context() {
+        assert_eq!(
+            eval_all_outputs(b"[10,20]", &[7, 8], ".[] | (file_index)? | tostring"),
+            vec![r#""7""#, r#""8""#]
+        );
+    }
+
+    #[test]
+    fn test_object_iterate_path_context_stops_on_error() {
+        // Same "stop early, don't discard the escaping control" contract
+        // the array-`.[]` loop above already has a test for, but for the
+        // `OwnedValue::Object` iteration branch specifically.
+        let expr = parse(r#".[] | if key == "a" then error("boom") else file_index end"#).unwrap();
+        let input = OwnedValue::Object(IndexMap::from([
+            ("a".to_string(), OwnedValue::Int(1)),
+            ("b".to_string(), OwnedValue::Int(2)),
+        ]));
+        match eval_owned_with_file_index::<Vec<u64>, JqSemantics>(&expr, &input, &[]) {
+            QueryResult::Error(e) => assert_eq!(e.message, "boom"),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_arithmetic_left_operand_error_propagates() {
+        match eval_all_result(b"[1]", &[0], r#".[] | (error("boom") + 1) | file_index"#) {
+            QueryResult::Error(e) => assert_eq!(e.message, "boom"),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_arithmetic_right_operand_error_propagates() {
+        match eval_all_result(b"[1]", &[0], r#".[] | (1 + error("boom")) | file_index"#) {
+            QueryResult::Error(e) => assert_eq!(e.message, "boom"),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_arithmetic_every_op_reachable_with_path_context() {
+        assert_eq!(
+            eval_all_outputs(b"[10]", &[0], ".[] | (file_index - 1) | tostring"),
+            vec![r#""-1""#]
+        );
+        assert_eq!(
+            eval_all_outputs(b"[10]", &[6], ".[] | (file_index % 4) | tostring"),
+            vec![r#""2""#]
+        );
+    }
+
+    #[test]
+    fn test_arithmetic_division_error_propagates_with_path_context() {
+        match eval_all_result(b"[1]", &[0], ".[] | (1 / 0) | file_index") {
+            QueryResult::Error(_) => {}
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_arithmetic_optional_division_error_becomes_none_with_path_context() {
+        assert_eq!(
+            eval_all_outputs(b"[1]", &[0], ".[] | (1 / 0)? | file_index"),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn test_compare_left_operand_error_propagates() {
+        match eval_all_result(b"[1]", &[0], r#".[] | (error("boom") == 1) | file_index"#) {
+            QueryResult::Error(e) => assert_eq!(e.message, "boom"),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_compare_right_operand_error_propagates() {
+        match eval_all_result(b"[1]", &[0], r#".[] | (1 == error("boom")) | file_index"#) {
+            QueryResult::Error(e) => assert_eq!(e.message, "boom"),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_map_over_object_with_path_context() {
+        assert_eq!(
+            eval_all_outputs(br#"[{"a":1,"b":2}]"#, &[9], ".[] | map(file_index)"),
+            vec!["[9,9]"]
+        );
+    }
+
+    #[test]
+    fn test_map_over_non_container_errors_with_path_context() {
+        match eval_all_result(b"[5]", &[0], ".[] | map(file_index)") {
+            QueryResult::Error(_) => {}
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_map_over_non_container_optional_is_none_with_path_context() {
+        assert_eq!(
+            eval_all_outputs(b"[5]", &[0], ".[] | map(file_index)?"),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn test_map_element_partial_error_propagates_with_path_context() {
+        match eval_all_result(
+            b"[[1]]",
+            &[0],
+            r#".[] | map((1, error("boom"))) | file_index"#,
+        ) {
+            QueryResult::Error(e) => assert_eq!(e.message, "boom"),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_map_element_partial_break_propagates_with_path_context() {
+        match eval_all_result(b"[[1]]", &[0], ".[] | map((1, break $out)) | file_index") {
+            QueryResult::Break(label) => assert_eq!(label, "out"),
+            other => panic!("expected Break, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_map_continues_pipe_with_path_context() {
+        assert_eq!(
+            eval_all_outputs(b"[[1,2]]", &[9], ".[] | map(file_index) | length"),
+            vec!["2"]
+        );
+    }
+
+    #[test]
+    fn test_if_cond_empty_produces_none_with_path_context() {
+        // `.arr[]` on an empty array produces bare `QueryResult::None`
+        // directly, so the `If` cond -- and thus the whole `if`/`then`/
+        // `else` -- does too, feeding `continue_rest_with_context`'s
+        // top-level `None` arm (rather than the "false, take else" case a
+        // non-empty falsy cond would).
+        assert_eq!(
+            eval_all_outputs(
+                br#"[{"arr":[]}]"#,
+                &[3],
+                ".[] | (if .arr[] then 1 else 2 end) | file_index"
+            ),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn test_if_branch_error_propagates_through_continuation_with_path_context() {
+        match eval_all_result(
+            b"[1]",
+            &[0],
+            r#".[] | (if true then error("boom") else 1 end) | file_index"#,
+        ) {
+            QueryResult::Error(e) => assert_eq!(e.message, "boom"),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_if_branch_break_propagates_through_continuation_with_path_context() {
+        match eval_all_result(
+            b"[1]",
+            &[0],
+            ".[] | (if true then break $out else 1 end) | file_index",
+        ) {
+            QueryResult::Break(label) => assert_eq!(label, "out"),
+            other => panic!("expected Break, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_if_cond_many_owned_with_path_context() {
+        // `cond` itself fans out to more than one value with no error at
+        // all (`.arr[]` over two truthy elements) -- the `ManyOwned` arm of
+        // the cond-unpacking match, sibling to the `Owned`/`None`/`Error`/
+        // `Break`/`Partial` ones the other `test_if_cond_*` tests cover.
+        assert_eq!(
+            eval_all_outputs(
+                br#"[{"arr":[1,2]}]"#,
+                &[5],
+                ".[] | (if .arr[] then 1 else 2 end) | file_index"
+            ),
+            vec!["5", "5"]
+        );
+    }
+
+    #[test]
+    fn test_if_cond_bare_error_with_path_context() {
+        // `cond` itself is a bare error (not a `Comma` that produced some
+        // output first), so the cond-unpacking match's `Error` arm builds
+        // an empty-values, `Some(Control::Error(_))` pair directly, unlike
+        // `test_if_cond_partial_error_drives_partial_branch_result_with_path_context`'s
+        // `Partial` cond result.
+        match eval_all_result(
+            b"[1]",
+            &[0],
+            r#".[] | (if error("boom") then 1 else 2 end) | file_index"#,
+        ) {
+            QueryResult::Error(e) => assert_eq!(e.message, "boom"),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_if_cond_bare_break_with_path_context() {
+        match eval_all_result(
+            b"[1]",
+            &[0],
+            ".[] | (if break $out then 1 else 2 end) | file_index",
+        ) {
+            QueryResult::Break(label) => assert_eq!(label, "out"),
+            other => panic!("expected Break, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_if_cond_partial_error_drives_partial_branch_result_with_path_context() {
+        // `cond` itself fans out to more than one value and then errors
+        // (`(true, error("boom"))`): the branch loop finishes normally for
+        // every value `cond` did produce, so the trailing control has to be
+        // reapplied *after* the loop rather than short-circuiting it.
+        match eval_all_result(
+            b"[1]",
+            &[0],
+            r#".[] | (if (true, error("boom")) then 1 else 2 end) | file_index"#,
+        ) {
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(vs, vec![OwnedValue::Int(1)]);
+                assert_eq!(e.message, "boom");
+            }
+            other => panic!("expected Partial, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_comma_partial_error_propagates_through_continuation_with_path_context() {
+        match eval_all_result(b"[1]", &[0], r#".[] | (1, error("boom")) | file_index"#) {
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(vs, vec![OwnedValue::Int(1)]);
+                assert_eq!(e.message, "boom");
+            }
+            other => panic!("expected Partial, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_select_fanout_produces_many_owned_with_path_context() {
+        // `select(.tags[])` on an element whose `.tags` has two truthy
+        // entries fans `cond` out to two truthy bits, so `select`'s own
+        // `eval_fanout` accumulates a genuine `ManyOwned` (not the
+        // single-`Owned`/empty-`Many` shapes every other `select` test in
+        // this file produces) -- routed onward through
+        // `continue_rest_with_context`'s `ManyOwned` loop since `|
+        // file_index` follows.
+        assert_eq!(
+            eval_all_outputs(
+                br#"[{"tags":["a","b"]}]"#,
+                &[9],
+                ".[] | select(.tags[]) | file_index"
+            ),
+            vec!["9", "9"]
+        );
+    }
+
+    #[test]
+    fn test_try_catches_error_with_path_context() {
+        assert_eq!(
+            eval_all_outputs(
+                b"[10,20]",
+                &[7, 8],
+                r#".[] | try error("boom") catch file_index"#
+            ),
+            vec!["7", "8"]
+        );
+    }
+
+    #[test]
+    fn test_try_without_catch_swallows_error_with_path_context() {
+        assert_eq!(
+            eval_all_outputs(
+                b"[10,20]",
+                &[7, 8],
+                r#".[] | (try error("boom")) | file_index"#
+            ),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn test_try_catches_break_with_path_context() {
+        assert_eq!(
+            eval_all_outputs(
+                b"[10,20]",
+                &[7, 8],
+                ".[] | try (break $out) catch file_index"
+            ),
+            vec!["7", "8"]
+        );
+    }
+
+    #[test]
+    fn test_try_without_catch_swallows_break_with_path_context() {
+        assert_eq!(
+            eval_all_outputs(b"[10,20]", &[7, 8], ".[] | (try (break $out)) | file_index"),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn test_try_catches_partial_error_with_path_context() {
+        assert_eq!(
+            eval_all_outputs(
+                b"[10,20]",
+                &[7, 8],
+                r#".[] | try (1, error("boom")) catch file_index"#
+            ),
+            vec!["1", "7", "1", "8"]
+        );
+    }
+
+    #[test]
+    fn test_try_without_catch_prepends_partial_error_prefix_with_path_context() {
+        assert_eq!(
+            eval_all_outputs(
+                b"[10,20]",
+                &[7, 8],
+                r#".[] | (try (1, error("boom"))) | file_index"#
+            ),
+            vec!["7", "8"]
+        );
+    }
+
+    #[test]
+    fn test_try_catches_partial_break_with_path_context() {
+        assert_eq!(
+            eval_all_outputs(
+                b"[10,20]",
+                &[7, 8],
+                ".[] | try (1, break $out) catch file_index"
+            ),
+            vec!["1", "7", "1", "8"]
+        );
+    }
+
+    #[test]
+    fn test_try_without_catch_prepends_partial_break_prefix_with_path_context() {
+        assert_eq!(
+            eval_all_outputs(
+                b"[10,20]",
+                &[7, 8],
+                ".[] | (try (1, break $out)) | file_index"
+            ),
+            vec!["7", "8"]
+        );
+    }
+
+    #[test]
+    fn test_label_catches_its_own_bare_break_with_path_context() {
+        // The break fires on the very first element, so the enclosing
+        // `.[]` loop's fan-out aborts with zero accumulated output --
+        // `result` is a bare `Break`, not a `Partial`.
+        assert_eq!(
+            eval_all_outputs(
+                b"[10,20]",
+                &[7, 8],
+                "label $out | .[] | if key == 0 then break $out else file_index end"
+            ),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn test_label_catches_partial_break_with_path_context() {
+        // The break fires on the second element, after the first already
+        // produced output -- `result` is `Partial(prefix, Break(_))`, and
+        // catching it must keep the prefix rather than discarding it.
+        assert_eq!(
+            eval_all_outputs(
+                b"[10,20]",
+                &[7, 8],
+                "label $out | .[] | if key == 1 then break $out else file_index end"
+            ),
+            vec!["7"]
+        );
+    }
+
+    #[test]
+    fn test_label_continues_pipe_with_path_context() {
+        assert_eq!(
+            eval_all_outputs(
+                b"[10,20]",
+                &[7, 8],
+                ".[] | (label $out | file_index) | tostring"
+            ),
+            vec![r#""7""#, r#""8""#]
+        );
+    }
+
+    #[test]
+    fn test_file_index_inside_user_defined_function() {
+        // `eval_owned_with_file_index`'s own doc comment: user-defined
+        // functions are out of scope for `--eval-all` path-context
+        // resolution, the same pre-existing limit `key`/`document_index`
+        // already have -- `needs_path_context` doesn't see through a
+        // `FuncCall`, so `.[] | f` never routes through path-context
+        // evaluation and `file_index` inside `f`'s body falls back to its
+        // default (0) rather than resolving per-element. This exercises
+        // `expand_func_calls`'s `FileIndex` arm (hit while inlining `f`'s
+        // body at call time), not per-element resolution --
+        // `test_file_index_continues_pipe_after_itself` covers that.
+        assert_eq!(
+            eval_all_outputs(b"[10,20]", &[3, 4], "def f: file_index; .[] | f"),
+            vec!["0", "0"]
+        );
+    }
+
+    #[test]
+    fn test_file_index_inside_parameterized_user_defined_function() {
+        // Same scope boundary as above, via `substitute_func_param`'s
+        // `FileIndex` arm instead of `expand_func_calls`'s.
+        assert_eq!(
+            eval_all_outputs(b"[10]", &[9], "def f($x): (file_index, $x); .[] | f(1)"),
+            vec!["0", "1"]
+        );
+    }
+
+    // The remaining branches in this plumbing are provably unreachable
+    // through any real filter, so they're exercised directly against the
+    // private functions instead of via a filter: `accumulate_path_context_step`'s
+    // `One` and `continue_rest_with_context`'s `One`/non-empty-`Many` exist
+    // only because `eval_fanout` (shared with plain `select`) is generic
+    // over borrowed-cursor results, but the `Select` arm's own fan-out body
+    // (`Owned`/`None` only, never `One`/`Many`) can never construct a
+    // non-empty borrowed variant.
+
+    #[test]
+    fn test_accumulate_path_context_step_handles_borrowed_one() {
+        let bytes: &[u8] = b"42";
+        let index = JsonIndex::build(bytes);
+        let cursor = index.root(bytes);
+        let sj = cursor.value();
+
+        let mut results = Vec::new();
+        let stop = accumulate_path_context_step::<Vec<u64>>(&mut results, QueryResult::One(sj));
+        assert!(stop.is_none());
+        assert_eq!(results, vec![OwnedValue::Int(42)]);
+    }
+
+    #[test]
+    fn test_continue_rest_with_context_handles_borrowed_one() {
+        let bytes: &[u8] = b"42";
+        let index = JsonIndex::build(bytes);
+        let cursor = index.root(bytes);
+        let sj = cursor.value();
+        let rest_expr = parse("tostring").unwrap();
+
+        let result = continue_rest_with_context::<Vec<u64>, JqSemantics>(
+            QueryResult::One(sj),
+            core::slice::from_ref(&rest_expr),
+            &OwnedValue::Null,
+            None,
+            &[],
+            false,
+        );
+        match result {
+            QueryResult::Owned(OwnedValue::String(s)) => assert_eq!(s, "42"),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_continue_rest_with_context_handles_borrowed_many() {
+        let bytes: &[u8] = br#"{"a": [1, false, 2]}"#;
+        let index = JsonIndex::build(bytes);
+        let cursor = index.root(bytes);
+        let many = match eval::<Vec<u64>, JqSemantics>(&parse(".a[] // 9").unwrap(), cursor) {
+            QueryResult::Many(vs) => vs,
+            other => panic!("expected Many, got {other:?}"),
+        };
+        assert_eq!(many.len(), 2);
+
+        let rest_expr = parse("tostring").unwrap();
+        let result = continue_rest_with_context::<Vec<u64>, JqSemantics>(
+            QueryResult::Many(many),
+            core::slice::from_ref(&rest_expr),
+            &OwnedValue::Null,
+            None,
+            &[],
+            false,
+        );
+        match result {
+            QueryResult::ManyOwned(vs) => {
+                assert_eq!(
+                    vs,
+                    vec![
+                        OwnedValue::String("1".to_string()),
+                        OwnedValue::String("2".to_string())
+                    ]
+                );
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_continue_rest_with_context_many_owned_loop_stops_on_error() {
+        // `(1, 2)` (a `Comma`, evaluated with no error at all) hands
+        // `continue_rest_with_context` a genuine `ManyOwned([1, 2])`
+        // intermediate; erroring on the *second* value while continuing
+        // `rest` per-element exercises the loop's early-return "stop" path
+        // rather than the case (`test_select_fanout_produces_many_owned_with_path_context`)
+        // where every element's continuation succeeds.
+        match eval_all_result(
+            b"1",
+            &[0],
+            r#"(1, 2) | if . == 2 then error("boom") else file_index end"#,
+        ) {
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(vs, vec![OwnedValue::Int(0)]);
+                assert_eq!(e.message, "boom");
+            }
+            other => panic!("expected Partial, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_continue_rest_with_context_borrowed_many_loop_stops_on_error() {
+        // Same "stop early, keep the prefix" contract as the `ManyOwned`
+        // loop above, for the borrowed-cursor `Many` loop -- reachable
+        // only via a direct call (see the borrowed-`One`/`Many` tests
+        // above for why).
+        let bytes: &[u8] = br#"{"a": [1, 2]}"#;
+        let index = JsonIndex::build(bytes);
+        let cursor = index.root(bytes);
+        let many = match eval::<Vec<u64>, JqSemantics>(&parse(".a[]").unwrap(), cursor) {
+            QueryResult::Many(vs) => vs,
+            other => panic!("expected Many, got {other:?}"),
+        };
+        assert_eq!(many.len(), 2);
+
+        let rest_expr = parse(r#"if . == 2 then error("boom") else tostring end"#).unwrap();
+        let result = continue_rest_with_context::<Vec<u64>, JqSemantics>(
+            QueryResult::Many(many),
+            core::slice::from_ref(&rest_expr),
+            &OwnedValue::Null,
+            None,
+            &[],
+            false,
+        );
+        match result {
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(vs, vec![OwnedValue::String("1".to_string())]);
+                assert_eq!(e.message, "boom");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_generic_fallback_continues_pipe_with_path_context() {
+        // `1 as $x | $x` (`Expr::As`) has no dedicated path-context arm, so
+        // it falls into the generic `_` fallback -- which must still
+        // continue the rest of the pipe (here, `file_index`) rather than
+        // treating itself as the pipe's final value.
+        assert_eq!(
+            eval_all_outputs(b"[10,20]", &[7, 8], ".[] | (1 as $x | $x) | file_index"),
+            vec!["7", "8"]
+        );
+    }
+
+    #[test]
+    fn test_key_continues_pipe_after_itself_yq_semantics() {
+        // Same shape as `test_key_continues_pipe_after_itself`, but through
+        // `YqSemantics` -- the generic path-context functions are
+        // monomorphized per `EvalSemantics` impl, and the yq CLI (the only
+        // real caller of the eval-all-adjacent parts of this file) always
+        // uses `YqSemantics`, never `JqSemantics`.
+        let index = JsonIndex::build(b"[10,20]");
+        let cursor = index.root(b"[10,20]");
+        let expr = parse(".[] | key | tostring").unwrap();
+        let out: Vec<String> = eval::<Vec<u64>, YqSemantics>(&expr, cursor)
+            .collect_owned()
+            .iter()
+            .map(OwnedValue::to_json)
+            .collect();
+        assert_eq!(out, vec![r#""0""#, r#""1""#]);
+    }
+
     // Phase 12 tests: Additional builtins
 
     #[test]
