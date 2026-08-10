@@ -5364,3 +5364,50 @@ fn test_keys_unsorted_lazy_index_range_via_dom_fallback_710() -> Result<()> {
     assert_eq!(out, "- 0\n- 1\n- 2\n");
     Ok(())
 }
+
+/// `--input-format json` (`-p json`) routes evaluation through
+/// `evaluate_input`/`jq::eval` - the plain, cursor-generic-free evaluator in
+/// `eval.rs`, distinct from `eval_generic.rs`'s `Builtin::LineComment` arm
+/// the earlier `line_comment` tests in this file exercise via the normal
+/// YAML M2 path. `builtin_line_comment` there is a permanent `""` regardless
+/// of cursor, matching `builtin_line`/`builtin_column`'s same contract.
+#[test]
+fn test_line_comment_builtin_via_json_input_dom_path_710() -> Result<()> {
+    let (out, code) = run_yq_stdin(".a | line_comment", "{\"a\": 1}", &["-p", "json"])?;
+    assert_eq!(code, 0);
+    // Default output stays YAML (`-p` only sets the *input* format), so an
+    // empty string renders as YAML's `''`, not JSON's `""`.
+    assert_eq!(out, "''\n");
+    Ok(())
+}
+
+/// Same DOM path as above, but with `line_comment` reached only after
+/// `def`-expansion substitutes a zero-arg function's body into the call
+/// site - exercises `expand_func_calls_in_builtin`'s `Builtin::LineComment`
+/// passthrough arm, which `eval.rs`'s plain evaluator (unlike
+/// `eval_generic.rs`, which has no `def` AST-rewriting of its own) uses to
+/// inline every `def` before evaluation.
+#[test]
+fn test_line_comment_builtin_through_def_expansion_710() -> Result<()> {
+    let (out, code) = run_yq_stdin("def f: line_comment; .a | f", "{\"a\": 1}", &["-p", "json"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "''\n");
+    Ok(())
+}
+
+/// A parameterized `def` forces the call site's argument to be substituted
+/// into the function body via `substitute_func_param_in_builtin` - which,
+/// like `expand_func_calls_in_builtin` above, walks every `Builtin` node in
+/// the body (including a `line_comment` that doesn't reference the param at
+/// all) and must pass `Builtin::LineComment` through unchanged.
+#[test]
+fn test_line_comment_builtin_through_param_substitution_710() -> Result<()> {
+    let (out, code) = run_yq_stdin(
+        "def f($x): $x, line_comment; f(.a)",
+        "{\"a\": 1}",
+        &["-p", "json", "-o", "json", "-I0"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "1\n\"\"\n");
+    Ok(())
+}
