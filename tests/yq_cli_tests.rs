@@ -1837,6 +1837,51 @@ fn test_yaml_merge_key_field_access_still_resolves_712() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn test_yaml_mapping_anchor_preserved_on_query_result_712() -> Result<()> {
+    // A query result whose OWN cursor carries the anchor (not a nested
+    // mapping/sequence field's value) must still print it. Verified against
+    // real yq v4.53.3: `printf 'item: &x\n  a: 1\n' | yq '.item'` -> `&x\na: 1`.
+    let input = "item: &x\n  a: 1\n";
+    let (output, exit_code) = run_yq_stdin(".item", input, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "&x\na: 1\n");
+    Ok(())
+}
+
+#[test]
+fn test_yaml_whole_document_anchor_preserved_on_identity_712() -> Result<()> {
+    // Same as above, but the anchor is on the document root itself (`.`
+    // identity, not a sub-query). Verified against real yq v4.53.3.
+    let input = "&root\na: 1\nb: 2\n";
+    let (output, exit_code) = run_yq_stdin(".", input, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, input);
+    Ok(())
+}
+
+#[test]
+fn test_yaml_sequence_anchor_preserved_on_query_result_712() -> Result<()> {
+    let input = "item: &s\n  - 1\n  - 2\n";
+    let (output, exit_code) = run_yq_stdin(".item", input, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "&s\n- 1\n- 2\n");
+    Ok(())
+}
+
+#[test]
+fn test_yaml_bare_scalar_anchor_dropped_on_query_result_712() -> Result<()> {
+    // Real yq (v4.53.3) drops a *scalar's* own anchor when the scalar itself
+    // is the top-level output (unlike a mapping/sequence in the same
+    // position, which keeps its anchor - see the tests above). Verified:
+    // `printf 'item: &y 1\n' | yq '.item'` -> `1`, no `&y`.
+    let input = "item: &y 1\n";
+    let (output, exit_code) = run_yq_stdin(".item", input, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), "1");
+    Ok(())
+}
+
 // =============================================================================
 // Anchored sequence items (#328) - an anchor on `- ` binds to the item's value
 // whatever its kind. Expectations are mikefarah/yq v4.53.3 output.

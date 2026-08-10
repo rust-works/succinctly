@@ -1214,6 +1214,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
         indent: IndentSpec,
         sort_keys: bool,
     ) -> core::fmt::Result {
+        self.write_leading_anchor(out)?;
         self.stream_yaml_value(out, 0, indent.width, indent.unit, sort_keys)
     }
 
@@ -1232,6 +1233,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                 if let Some((cursor, rest)) = elements.uncons_cursor() {
                     if rest.is_empty() {
                         // Single document - output it directly without array wrapper
+                        cursor.write_leading_anchor(out)?;
                         return cursor.stream_yaml_value(
                             out,
                             0,
@@ -1245,7 +1247,39 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
         }
 
         // Multiple documents or not at root - output as-is
+        self.write_leading_anchor(out)?;
         self.stream_yaml_value(out, 0, indent.width, indent.unit, sort_keys)
+    }
+
+    /// Write this cursor's own `&anchor` before streaming it as a YAML root.
+    ///
+    /// `stream_yaml_value`'s nested mapping/sequence loops write a value's
+    /// anchor themselves (before recursing) since they know whether it's
+    /// following a `key:`/`- ` prefix that needs a trailing space, or opening
+    /// a block container that needs a trailing newline instead. A cursor
+    /// streamed as the top-level root (whole document, or a query result via
+    /// `stream_yaml`) has no such prefix, so it needs the same anchor written
+    /// here first — otherwise its own anchor is silently dropped (#712).
+    ///
+    /// Only containers get this treatment: real yq (v4.53.3) drops a bare
+    /// scalar's own anchor when the scalar itself is the top-level output
+    /// (`printf '&x 1' | yq '.'` -> `1`, no anchor), while a mapping/sequence
+    /// in the same position keeps its anchor (`item: &x\n  a: 1` selected via
+    /// `.item` -> `&x\na: 1`). Nested scalar anchors (a mapping field's or
+    /// sequence element's *value*) are unaffected — those go through the
+    /// `stream_yaml_value` loops above, not this function.
+    fn write_leading_anchor<Out: core::fmt::Write>(&self, out: &mut Out) -> core::fmt::Result {
+        if is_yaml_cursor_container(self) {
+            if let Some(anchor) = self.anchor() {
+                out.write_char('&')?;
+                out.write_str(anchor)?;
+                if self.style() != "flow" {
+                    return out.write_char('\n');
+                }
+                return out.write_char(' ');
+            }
+        }
+        Ok(())
     }
 
     /// Internal: stream this cursor's value as YAML.
@@ -5358,18 +5392,18 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentElements for YamlElements<'a, W> {
 
 /// Check if a cursor points to a non-empty container.
 ///
-/// Mapping emptiness is checked against the raw (merge-unaware) field walk,
-/// not `resolve_merge_keys`'s merged view: `stream_yaml_value` now writes
-/// mappings from the raw walk too (#712), so a mapping whose only field is
-/// an unresolvable `<<` must still be treated as non-empty here, or it would
+/// Uses `is_container()` + `first_child()` directly rather than `cursor.value()`:
+/// for a mapping, `value()` builds the merge-resolved field list via
+/// `resolve_merge_keys` (a `Vec`/`BTreeMap` walk decoding every field), just to
+/// answer a question `first_child()` alone already answers. Emptiness is
+/// still checked against the raw (merge-unaware) field walk, not
+/// `resolve_merge_keys`'s merged view: `stream_yaml_value` writes mappings
+/// from the raw walk (#712), so a mapping whose only field is an
+/// unresolvable `<<` must still be treated as non-empty here, or it would
 /// wrongly take the empty-mapping `"{}"` shortcut instead of rendering its
 /// literal `<<` field.
 fn is_yaml_cursor_container<W: AsRef<[u64]>>(cursor: &YamlCursor<'_, W>) -> bool {
-    match cursor.value() {
-        YamlValue::Mapping(_) => cursor.first_child().is_some(),
-        YamlValue::Sequence(elements) => !elements.is_empty(),
-        _ => false,
-    }
+    cursor.is_container() && cursor.first_child().is_some()
 }
 
 /// Write `width` copies of `unit` as indentation (`unit` is `' '` for
