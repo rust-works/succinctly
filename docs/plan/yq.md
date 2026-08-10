@@ -143,9 +143,13 @@ succinctly yq '.spec.containers[]' deployment.yaml service.yaml
 captured and preserved through output, always-on (no `--preserve-comments`
 flag needed or planned) — but only on paths that keep a live YAML cursor
 (identity, field/index navigation, filters like `select`, `-S`/sort-keys).
-Assignment (`=`, `|=`, ...) and other value-constructing expressions fall
-through a JSON-round-trip evaluator path that has no comment data to carry;
-see the `comments` row below and the tracking issue for the follow-up.
+A comment trailing a mapping *key*'s own line, when its value is deferred to
+a following line (`a: # comment\n  b: 1`), is preserved the same way (#765)
+— it's key-scoped, not value-scoped, so it stays invisible to `line_comment`
+and friends, matching real `yq`. Assignment (`=`, `|=`, ...) and other
+value-constructing expressions fall through a JSON-round-trip evaluator path
+that has no comment data to carry; see the `comments` row below and the
+tracking issue for the follow-up.
 
 ---
 
