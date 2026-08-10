@@ -34,8 +34,8 @@ use alloc::collections::BTreeMap;
 use std::collections::BTreeMap;
 
 use super::expr::{
-    ArithOp, AssignOp, Builtin, CompareOp, Expr, FormatType, Import, Include, Literal, MetaValue,
-    ModuleMeta, ObjectEntry, ObjectKey, Pattern, PatternEntry, Program, StringPart,
+    ArithOp, AssignOp, Builtin, CompareOp, Expr, FormatType, Import, Include, Literal, MergeFlags,
+    MetaValue, ModuleMeta, ObjectEntry, ObjectKey, Pattern, PatternEntry, Program, StringPart,
 };
 
 /// Parser mode controls syntax differences between jq and yq.
@@ -231,6 +231,27 @@ impl<'a> Parser<'a> {
         }
         let next_char = self.input[after..].chars().next();
         !matches!(next_char, Some(c) if c.is_alphanumeric() || c == '_')
+    }
+
+    /// Scan a run of yq merge-flag characters (`+ ? n d c`, any order,
+    /// repeats allowed) starting at the current position. Matches real yq's
+    /// lexer, which greedily consumes these characters with no regard for
+    /// what follows (e.g. `*nan` tokenizes as flag `n` + leftover `an`, a
+    /// lex error in real yq too — not a jq `nan` literal).
+    fn scan_merge_flags(&mut self) -> MergeFlags {
+        let mut flags = MergeFlags::default();
+        while let Some(c) = self.peek() {
+            match c {
+                '+' => flags.append_arrays = true,
+                '?' => flags.only_existing = true,
+                'n' => flags.only_new = true,
+                'd' => flags.deep_merge_arrays = true,
+                'c' => flags.clobber_tags = true,
+                _ => break,
+            }
+            self.next();
+        }
+        flags
     }
 
     /// Check if after consuming a keyword, the next non-whitespace character is '('.
@@ -3330,18 +3351,33 @@ impl<'a> Parser<'a> {
                 break;
             }
             let op = match self.peek() {
-                Some('*') => ArithOp::Mul,
+                Some('*') => {
+                    self.next(); // consume '*'
+                                 // yq merge-flag suffixes (*+, *?, *n, *d, *c, combinable)
+                                 // are only recognized in yq mode — real jq has no such
+                                 // syntax, so jq mode leaves them for the next parse step
+                                 // to reject, same as today.
+                    let flags = if self.mode == ParserMode::Yq {
+                        self.scan_merge_flags()
+                    } else {
+                        MergeFlags::default()
+                    };
+                    ArithOp::Mul(flags)
+                }
                 Some('/') => {
                     // Check it's not `//` (alternative operator)
                     if self.peek_str(2) == "//" {
                         break;
                     }
+                    self.next();
                     ArithOp::Div
                 }
-                Some('%') => ArithOp::Mod,
+                Some('%') => {
+                    self.next();
+                    ArithOp::Mod
+                }
                 _ => break,
             };
-            self.next();
             self.skip_ws();
             let right = self.parse_primary()?;
             left = Expr::Arithmetic {
@@ -3517,13 +3553,33 @@ impl<'a> Parser<'a> {
             });
         }
 
-        // Check for compound assignments: +=, -=, *=, /=, %=
+        // Check for *= (merge assignment), with optional yq merge-flag
+        // suffixes after the '=': *=, *=+, *=?, *=n, *=d, *=c, combinable
+        // (e.g. *=+d). Flags come after '=', never before it — `.a *+= .b`
+        // is not the append-merge-assign spelling in real yq either.
+        if peek2 == "*=" {
+            self.next(); // *
+            self.next(); // =
+            let flags = if self.mode == ParserMode::Yq {
+                self.scan_merge_flags()
+            } else {
+                MergeFlags::default()
+            };
+            self.skip_ws();
+            let value = self.parse_alternative()?;
+            return Ok(Expr::CompoundAssign {
+                op: AssignOp::Mul(flags),
+                path: Box::new(left),
+                value: Box::new(value),
+            });
+        }
+
+        // Check for compound assignments: +=, -=, /=, %=
         if peek2.len() == 2 && peek2.ends_with('=') {
             let op_char = peek2.chars().next().unwrap();
             let assign_op = match op_char {
                 '+' => Some(AssignOp::Add),
                 '-' => Some(AssignOp::Sub),
-                '*' => Some(AssignOp::Mul),
                 '/' => Some(AssignOp::Div),
                 '%' => Some(AssignOp::Mod),
                 _ => None,
@@ -4774,7 +4830,7 @@ mod tests {
         assert!(matches!(
             expr,
             Expr::Arithmetic {
-                op: ArithOp::Mul,
+                op: ArithOp::Mul(_),
                 ..
             }
         ));
@@ -4810,7 +4866,7 @@ mod tests {
                 assert!(matches!(
                     *right,
                     Expr::Arithmetic {
-                        op: ArithOp::Mul,
+                        op: ArithOp::Mul(_),
                         ..
                     }
                 ));
@@ -5443,6 +5499,177 @@ mod tests {
         assert_eq!(
             parse_with_mode(".my-key?", ParserMode::Yq).unwrap(),
             Expr::Optional(Box::new(Expr::Field("my-key".into())))
+        );
+    }
+
+    #[test]
+    fn test_yq_merge_flags_non_assign() {
+        // Plain `*` still parses with default (all-false) flags.
+        assert_eq!(
+            parse_with_mode(".a * .b", ParserMode::Yq).unwrap(),
+            Expr::Arithmetic {
+                op: ArithOp::Mul(MergeFlags::default()),
+                left: Box::new(Expr::Field("a".into())),
+                right: Box::new(Expr::Field("b".into())),
+            }
+        );
+
+        // Single flags.
+        let cases: &[(&str, MergeFlags)] = &[
+            (
+                "*+",
+                MergeFlags {
+                    append_arrays: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                "*?",
+                MergeFlags {
+                    only_existing: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                "*n",
+                MergeFlags {
+                    only_new: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                "*d",
+                MergeFlags {
+                    deep_merge_arrays: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                "*c",
+                MergeFlags {
+                    clobber_tags: true,
+                    ..Default::default()
+                },
+            ),
+        ];
+        for (op, expected_flags) in cases {
+            let expr = parse_with_mode(&format!(".a {op} .b"), ParserMode::Yq).unwrap();
+            assert_eq!(
+                expr,
+                Expr::Arithmetic {
+                    op: ArithOp::Mul(*expected_flags),
+                    left: Box::new(Expr::Field("a".into())),
+                    right: Box::new(Expr::Field("b".into())),
+                },
+                "parsing '.a {op} .b'"
+            );
+        }
+
+        // Combined flags, and order/duplicates don't matter.
+        let combined = MergeFlags {
+            append_arrays: true,
+            deep_merge_arrays: true,
+            ..Default::default()
+        };
+        for op in ["*+d", "*d+", "*++dd"] {
+            let expr = parse_with_mode(&format!(".a {op} .b"), ParserMode::Yq).unwrap();
+            assert_eq!(
+                expr,
+                Expr::Arithmetic {
+                    op: ArithOp::Mul(combined),
+                    left: Box::new(Expr::Field("a".into())),
+                    right: Box::new(Expr::Field("b".into())),
+                },
+                "parsing '.a {op} .b'"
+            );
+        }
+
+        // All five flags combined.
+        let expr = parse_with_mode(".a *+?ndc .b", ParserMode::Yq).unwrap();
+        assert_eq!(
+            expr,
+            Expr::Arithmetic {
+                op: ArithOp::Mul(MergeFlags {
+                    append_arrays: true,
+                    only_existing: true,
+                    only_new: true,
+                    deep_merge_arrays: true,
+                    clobber_tags: true,
+                }),
+                left: Box::new(Expr::Field("a".into())),
+                right: Box::new(Expr::Field("b".into())),
+            }
+        );
+    }
+
+    #[test]
+    fn test_yq_merge_flags_assign() {
+        // Plain `*=` still parses with default (all-false) flags.
+        assert_eq!(
+            parse_with_mode(".a *= .b", ParserMode::Yq).unwrap(),
+            Expr::CompoundAssign {
+                op: AssignOp::Mul(MergeFlags::default()),
+                path: Box::new(Expr::Field("a".into())),
+                value: Box::new(Expr::Field("b".into())),
+            }
+        );
+
+        // Flags go after '=', e.g. `*=+`, `*=nd`, order/duplicates don't matter.
+        let combined = MergeFlags {
+            only_new: true,
+            deep_merge_arrays: true,
+            ..Default::default()
+        };
+        for op in ["*=nd", "*=dn", "*=nnd"] {
+            let expr = parse_with_mode(&format!(".a {op} .b"), ParserMode::Yq).unwrap();
+            assert_eq!(
+                expr,
+                Expr::CompoundAssign {
+                    op: AssignOp::Mul(combined),
+                    path: Box::new(Expr::Field("a".into())),
+                    value: Box::new(Expr::Field("b".into())),
+                },
+                "parsing '.a {op} .b'"
+            );
+        }
+
+        // `*+=` (flags BEFORE '=') is NOT the assign spelling — real yq
+        // doesn't recognize it either (it's a dyadic-operator arity error
+        // there). We should at least fail to parse it as a merge-assign;
+        // exact error text need not match real yq.
+        assert!(parse_with_mode(".a *+= .b", ParserMode::Yq).is_err());
+    }
+
+    #[test]
+    fn test_yq_merge_flags_unknown_char_is_error() {
+        // An unrecognized flag character is a lex/parse error, same as real yq.
+        assert!(parse_with_mode(".a *=x .b", ParserMode::Yq).is_err());
+        assert!(parse_with_mode(".a *x .b", ParserMode::Yq).is_err());
+    }
+
+    #[test]
+    fn test_jq_mode_rejects_merge_flags() {
+        // Real jq has no merge-flag syntax at all — jq mode must not
+        // recognize these tokens, regardless of what yq mode does.
+        assert!(parse(".a *+ .b").is_err());
+        assert!(parse(".a *=n .b").is_err());
+
+        // Plain `*`/`*=` still work in jq mode, with default (all-false) flags.
+        assert_eq!(
+            parse(".a * .b").unwrap(),
+            Expr::Arithmetic {
+                op: ArithOp::Mul(MergeFlags::default()),
+                left: Box::new(Expr::Field("a".into())),
+                right: Box::new(Expr::Field("b".into())),
+            }
+        );
+        assert_eq!(
+            parse(".a *= .b").unwrap(),
+            Expr::CompoundAssign {
+                op: AssignOp::Mul(MergeFlags::default()),
+                path: Box::new(Expr::Field("a".into())),
+                value: Box::new(Expr::Field("b".into())),
+            }
         );
     }
 

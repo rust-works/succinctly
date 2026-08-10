@@ -979,12 +979,33 @@ pub enum ArithOp {
     Add,
     /// Subtraction: `-`
     Sub,
-    /// Multiplication: `*`
-    Mul,
+    /// Multiplication: `*`, or yq's merge operator with optional flag suffixes
+    /// (`*+`, `*?`, `*n`, `*d`, `*c`, combinable, e.g. `*+d`).
+    Mul(MergeFlags),
     /// Division: `/`
     Div,
     /// Modulo: `%`
     Mod,
+}
+
+/// yq merge-flag suffixes on the `*`/`*=` merge operator (e.g. `*+d`, `*=nd`).
+/// Combinable and order-independent — each flag is an independent switch.
+///
+/// `clobber_tags` (`c`) is parsed and carried here but currently has no
+/// observable effect: succinctly's YAML parser rejects custom tags outright,
+/// so there is no tag data to clobber or preserve either way (issue #713).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MergeFlags {
+    /// `+` — append arrays instead of merging/replacing by index.
+    pub append_arrays: bool,
+    /// `?` — only update fields/indices that already exist; never create new ones.
+    pub only_existing: bool,
+    /// `n` — only write fields/indices that don't already exist (or are `null`).
+    pub only_new: bool,
+    /// `d` — deep-merge arrays: treat them like objects, merging by index.
+    pub deep_merge_arrays: bool,
+    /// `c` — clobber custom tags (default preserves the left side's tag). No-op today.
+    pub clobber_tags: bool,
 }
 
 /// Comparison operators.
@@ -1011,8 +1032,9 @@ pub enum AssignOp {
     Add,
     /// Subtraction assignment: `-=`
     Sub,
-    /// Multiplication assignment: `*=`
-    Mul,
+    /// Multiplication/merge assignment: `*=`, with optional yq flag suffixes
+    /// after the `=` (`*=+`, `*=?`, `*=n`, `*=d`, `*=c`, combinable, e.g. `*=+d`).
+    Mul(MergeFlags),
     /// Division assignment: `/=`
     Div,
     /// Modulo assignment: `%=`
