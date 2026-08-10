@@ -24377,6 +24377,41 @@ mod tests {
     }
 
     #[test]
+    fn test_leaf_paths_nested_mixed() {
+        // Object key inside array inside array, per jq.test:992-995's stress shape
+        // (see paths_bare_nested_mixed / paths_scalars_nested_mixed golden cases).
+        // Diverges from real jq's `paths(scalars)` idiom by also treating the null
+        // at "d" as a leaf — see #771.
+        query!(br#"{"a":[{"b":1},{"c":[2,3]}],"d":null}"#, "[leaf_paths]",
+            QueryResult::Owned(OwnedValue::Array(paths)) => {
+                assert_eq!(paths, vec![
+                    OwnedValue::Array(vec![OwnedValue::String("a".into()), OwnedValue::Int(0), OwnedValue::String("b".into())]),
+                    OwnedValue::Array(vec![OwnedValue::String("a".into()), OwnedValue::Int(1), OwnedValue::String("c".into()), OwnedValue::Int(0)]),
+                    OwnedValue::Array(vec![OwnedValue::String("a".into()), OwnedValue::Int(1), OwnedValue::String("c".into()), OwnedValue::Int(1)]),
+                    OwnedValue::Array(vec![OwnedValue::String("d".into())]),
+                ]);
+            }
+        );
+    }
+
+    #[test]
+    fn test_leaf_paths_object_in_array_in_array() {
+        // jq's own jq.test:992-995 shape (see paths_bare_object_in_array_in_array /
+        // paths_scalars_object_in_array_in_array golden cases). Diverges from real
+        // jq's `paths(scalars)` idiom by also treating the empty array at [1,0] as
+        // a leaf — see #771.
+        query!(br#"[1,[[],{"a":2}]]"#, "[leaf_paths]",
+            QueryResult::Owned(OwnedValue::Array(paths)) => {
+                assert_eq!(paths, vec![
+                    OwnedValue::Array(vec![OwnedValue::Int(0)]),
+                    OwnedValue::Array(vec![OwnedValue::Int(1), OwnedValue::Int(0)]),
+                    OwnedValue::Array(vec![OwnedValue::Int(1), OwnedValue::Int(1), OwnedValue::String("a".into())]),
+                ]);
+            }
+        );
+    }
+
+    #[test]
     fn test_setpath() {
         query!(br#"{"a": 1}"#, r#"setpath(["b"]; 2)"#,
             QueryResult::Owned(OwnedValue::Object(obj)) => {
