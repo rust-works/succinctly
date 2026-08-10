@@ -1797,9 +1797,11 @@ fn stream_json_as_yaml<W: AsRef<[u64]> + Clone, Out: core::fmt::Write>(
             }
         }
         StandardJson::String(s) => {
-            // SAFETY: JSON strings are valid UTF-8
-            let str_val = core::str::from_utf8(s.raw_bytes()).map_err(|_| core::fmt::Error)?;
-            stream_json_string_as_yaml(out, str_val)
+            // Decoded content, not `raw_bytes()` -- the latter includes the
+            // source's surrounding quotes and escape sequences verbatim,
+            // which would then get YAML-quoted a second time on top.
+            let str_val = s.as_str().map_err(|_| core::fmt::Error)?;
+            stream_json_string_as_yaml(out, &str_val)
         }
         StandardJson::Array(elements) => {
             if elements.is_empty() {
@@ -1861,11 +1863,11 @@ fn stream_json_as_yaml<W: AsRef<[u64]> + Clone, Out: core::fmt::Write>(
                         out.write_str(", ")?;
                     }
                     first = false;
-                    // Key
+                    // Key -- decoded content, not `raw_bytes()` (see the
+                    // scalar `String` arm above for why).
                     if let StandardJson::String(k) = field.key() {
-                        let key_str =
-                            core::str::from_utf8(k.raw_bytes()).map_err(|_| core::fmt::Error)?;
-                        stream_json_string_as_yaml(out, key_str)?;
+                        let key_str = k.as_str().map_err(|_| core::fmt::Error)?;
+                        stream_json_string_as_yaml(out, &key_str)?;
                     } else {
                         out.write_str("\"\"")?;
                     }
@@ -1882,11 +1884,11 @@ fn stream_json_as_yaml<W: AsRef<[u64]> + Clone, Out: core::fmt::Write>(
                         write_json_yaml_indent(out, current_indent)?;
                     }
                     first = false;
-                    // Key
+                    // Key -- decoded content, not `raw_bytes()` (see the
+                    // scalar `String` arm above for why).
                     if let StandardJson::String(k) = field.key() {
-                        let key_str =
-                            core::str::from_utf8(k.raw_bytes()).map_err(|_| core::fmt::Error)?;
-                        stream_json_string_as_yaml(out, key_str)?;
+                        let key_str = k.as_str().map_err(|_| core::fmt::Error)?;
+                        stream_json_string_as_yaml(out, &key_str)?;
                     } else {
                         out.write_str("\"\"")?;
                     }
@@ -2095,6 +2097,58 @@ mod tests {
         let json = br#"{"a": 1}"#;
         let index = JsonIndex::build(json);
         assert!(!index.bp().is_empty());
+    }
+
+    /// `stream_json_as_yaml`'s scalar-string arm previously read
+    /// `raw_bytes()` (the source JSON bytes, quotes and escapes included)
+    /// instead of the decoded `as_str()` content, so a plain string value
+    /// got YAML-quoted a second time on top of its own JSON quoting --
+    /// `"hi"` came out as the four-character string `"hi"` (quotes as
+    /// content), which then needed its own YAML quoting: `"\"hi\""`.
+    #[test]
+    fn test_stream_json_as_yaml_string_value_not_double_quoted() {
+        let json = br#"{"a": "hi"}"#;
+        let index = JsonIndex::build(json);
+        let root = index.root(json);
+        let StandardJson::Object(fields) = root.value() else {
+            panic!("expected object");
+        };
+        let (field, _) = fields.uncons().unwrap();
+        let mut buf = String::new();
+        stream_json_as_yaml(&mut buf, field.value(), 0, 0).unwrap();
+        assert_eq!(buf, "hi");
+    }
+
+    /// Same bug, but for an object key rather than a value -- a separate
+    /// (and separately buggy) code path in `stream_json_as_yaml`'s `Object`
+    /// arm, covering both its flow-style and block-style branches.
+    #[test]
+    fn test_stream_json_as_yaml_object_key_not_double_quoted() {
+        let json = br#"{"a": 1}"#;
+        let index = JsonIndex::build(json);
+        let value = index.root(json).value();
+
+        let mut flow = String::new();
+        stream_json_as_yaml(&mut flow, value.clone(), 0, 0).unwrap();
+        assert_eq!(flow, "{a: 1}");
+
+        let mut block = String::new();
+        stream_json_as_yaml(&mut block, value, 0, 2).unwrap();
+        assert_eq!(block, "a: 1");
+    }
+
+    /// A key/value that itself needs YAML quoting (leading `:`, one of
+    /// `needs_json_yaml_quoting`'s special first characters) must be quoted
+    /// exactly once -- not left raw (ambiguous with a YAML mapping) and not
+    /// double-quoted by the bug the tests above pin.
+    #[test]
+    fn test_stream_json_as_yaml_string_needing_quotes_is_quoted_once() {
+        let json = br#"{":a": ":b"}"#;
+        let index = JsonIndex::build(json);
+        let value = index.root(json).value();
+        let mut buf = String::new();
+        stream_json_as_yaml(&mut buf, value, 0, 0).unwrap();
+        assert_eq!(buf, r#"{":a": ":b"}"#);
     }
 
     #[test]
