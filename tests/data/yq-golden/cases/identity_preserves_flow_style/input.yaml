@@ -1,0 +1,6 @@
+a: [1, 2, 3]
+b: {c: 1, d: 2}
+nested:
+  seq: [4, 5]
+  map: {x: 1, y: 2}
+  plain: 3

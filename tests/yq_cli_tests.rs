@@ -541,6 +541,56 @@ fn test_yaml_output_format() -> Result<()> {
     Ok(())
 }
 
+/// #707: `yq '.'` on flow-styled input must preserve flow style, matching
+/// real yq. Before the fix, every container was forced to block style on
+/// every query, even a pure identity pass-through.
+#[test]
+fn test_identity_preserves_top_level_flow_style() -> Result<()> {
+    let yaml = "a: [1, 2, 3]\nb: {c: 1, d: 2}\n";
+    let (output, code) = run_yq_stdin(".", yaml, &[])?;
+
+    assert_eq!(code, 0);
+    assert_eq!(output, "a: [1, 2, 3]\nb: {c: 1, d: 2}\n");
+    Ok(())
+}
+
+/// #707: flow style nested under a block sequence must stay flow and inline
+/// (`- [1, 2]`), not get exploded onto its own indented block lines.
+#[test]
+fn test_identity_preserves_flow_nested_under_block_sequence() -> Result<()> {
+    let yaml = "a:\n  - [1, 2]\n  - 3\n";
+    let (output, code) = run_yq_stdin(".", yaml, &[])?;
+
+    assert_eq!(code, 0);
+    assert_eq!(output, "a:\n  - [1, 2]\n  - 3\n");
+    Ok(())
+}
+
+/// #707: flow style nested under a block mapping key must stay flow and
+/// inline (`b: {x: 1, y: 2}`), not get exploded onto its own block lines.
+#[test]
+fn test_identity_preserves_flow_nested_under_block_mapping() -> Result<()> {
+    let yaml = "a:\n  b: {x: 1, y: 2}\n  c: 3\n";
+    let (output, code) = run_yq_stdin(".", yaml, &[])?;
+
+    assert_eq!(code, 0);
+    assert_eq!(output, "a:\n  b: {x: 1, y: 2}\n  c: 3\n");
+    Ok(())
+}
+
+/// #707: the fix applies to any pure-navigation query, not just the bare
+/// identity `.` P9 fast path — `.top` still routes through the same
+/// cursor-streaming `stream_yaml_value` and must preserve style too.
+#[test]
+fn test_field_navigation_preserves_flow_style() -> Result<()> {
+    let yaml = "top:\n  a: [1, 2, 3]\n";
+    let (output, code) = run_yq_stdin(".top", yaml, &[])?;
+
+    assert_eq!(code, 0);
+    assert_eq!(output, "a: [1, 2, 3]\n");
+    Ok(())
+}
+
 #[test]
 fn test_duplicate_mapping_key_is_last_wins() -> Result<()> {
     // YAML 1.2 / yq: a mapping with a duplicate key resolves `.key` to the
@@ -3674,11 +3724,15 @@ fn test_empty_block_sequence_items_remain_null() -> Result<()> {
 
 #[test]
 fn test_flow_dash_space_scalar_round_trips_through_yaml_output() -> Result<()> {
-    // Default `-o yaml` must quote the scalar: emitted bare under a `- ` marker
-    // it would read back as a nested sequence.
+    // Default `-o yaml` must quote the scalar regardless of container style:
+    // emitted bare under a `- ` marker it would read back as a nested
+    // sequence. Since #707 fixed flow-style preservation, this flow-style
+    // source now correctly stays flow on output (previously forced to
+    // block) — the quoting obligation itself is unconditional and still
+    // applies.
     let (yaml_out, code) = run_yq_stdin(".", "[- x]\n", &[])?;
     assert_eq!(code, 0);
-    assert_eq!(yaml_out, "- \"- x\"\n");
+    assert_eq!(yaml_out, "[\"- x\"]\n");
 
     let (json_out, code) = run_yq_stdin(".", &yaml_out, &["-o=json", "-I=0"])?;
     assert_eq!(code, 0);

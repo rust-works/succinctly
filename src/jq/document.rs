@@ -105,7 +105,9 @@ pub trait DocumentCursor: Sized + Copy + Clone {
     /// Stream this cursor's value as YAML to the output.
     ///
     /// This enables M2.5 streaming optimization for YAML output format.
-    /// - `indent_spaces`: Spaces per indentation level (0 for flow style)
+    /// - `indent_spaces`: Spaces per indentation level for block style (0
+    ///   forces flow style for the whole subtree); a node whose source used
+    ///   flow style renders as flow regardless of `indent_spaces` (#707).
     ///
     /// Default implementation returns an error indicating streaming is not supported.
     fn stream_yaml<W: core::fmt::Write>(

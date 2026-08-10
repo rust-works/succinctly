@@ -1220,7 +1220,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                 if fields.is_empty() {
                     return out.write_str("{}");
                 }
-                if indent_spaces == 0 {
+                if indent_spaces == 0 || self.style() == "flow" {
                     // Flow style
                     out.write_char('{')?;
                     let mut first = true;
@@ -1257,7 +1257,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                         out.write_char(':')?;
                         // Check if value needs newline
                         let value = field.value_cursor();
-                        if is_yaml_cursor_container(&value) {
+                        if is_yaml_cursor_container(&value) && value.style() != "flow" {
                             out.write_char('\n')?;
                             write_yaml_indent(out, current_indent + indent_spaces)?;
                             value.stream_yaml_value(
@@ -1281,7 +1281,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                 if elements.is_empty() {
                     return out.write_str("[]");
                 }
-                if indent_spaces == 0 {
+                if indent_spaces == 0 || self.style() == "flow" {
                     // Flow style
                     out.write_char('[')?;
                     let mut first = true;
@@ -1310,7 +1310,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                         // own indented line — matching real yq and the
                         // DOM/pretty-printer, and avoiding a stray trailing
                         // space before the newline.
-                        if is_yaml_cursor_container(&cursor) {
+                        if is_yaml_cursor_container(&cursor) && cursor.style() != "flow" {
                             out.write_char('-')?;
                             out.write_char('\n')?;
                             write_yaml_indent(out, current_indent + indent_spaces)?;
@@ -1709,6 +1709,9 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
     ///
     /// Note: This is a simplified implementation that infers style from
     /// the text representation rather than preserving original metadata.
+    /// It skips a leading anchor (`&name`) but not an explicit tag; explicit
+    /// tags are currently rejected by the parser entirely, so this is not
+    /// reachable today, but would need addressing alongside tag support.
     pub fn style(&self) -> &'static str {
         let Some(text_pos) = self.text_position() else {
             return "";
@@ -6014,6 +6017,85 @@ mod tests {
     }
 
     #[test]
+    fn test_stream_yaml_preserves_top_level_flow_container_style() {
+        // #707: a node whose source used flow style must render as flow even
+        // under the CLI's normal block `indent_spaces` (2), not just when the
+        // whole document is forced flow via indent_spaces=0.
+        let yaml = b"a: [1, 2, 3]\nb: {c: 1, d: 2}\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let mut out = String::new();
+        index.root(yaml).stream_yaml_document(&mut out, 2).unwrap();
+        assert_eq!(out, "a: [1, 2, 3]\nb: {c: 1, d: 2}");
+    }
+
+    #[test]
+    fn test_stream_yaml_preserves_flow_sequence_nested_under_block_mapping() {
+        // #707: a flow-styled value nested under a block mapping key stays
+        // flow and inline, not exploded onto its own indented block lines.
+        let yaml = b"top:\n  a: [1, 2, 3]\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let mut out = String::new();
+        index.root(yaml).stream_yaml_document(&mut out, 2).unwrap();
+        assert_eq!(out, "top:\n  a: [1, 2, 3]");
+    }
+
+    #[test]
+    fn test_stream_yaml_preserves_flow_sequence_item_nested_under_block_sequence() {
+        // #707: a flow-styled sequence item nested under a block sequence
+        // renders inline after `- `, not as its own nested block sequence.
+        let yaml = b"a:\n  - [1, 2]\n  - 3\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let mut out = String::new();
+        index.root(yaml).stream_yaml_document(&mut out, 2).unwrap();
+        assert_eq!(out, "a:\n  - [1, 2]\n  - 3");
+    }
+
+    #[test]
+    fn test_stream_yaml_preserves_flow_mapping_nested_under_block_mapping() {
+        // #707: same as the sequence case above, but for a flow-styled
+        // mapping value nested under a block mapping key.
+        let yaml = b"a:\n  b: {x: 1, y: 2}\n  c: 3\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let mut out = String::new();
+        index.root(yaml).stream_yaml_document(&mut out, 2).unwrap();
+        assert_eq!(out, "a:\n  b: {x: 1, y: 2}\n  c: 3");
+    }
+
+    #[test]
+    fn test_stream_yaml_flow_and_block_siblings_are_independent() {
+        // #707: per-node style, not a single document-wide switch — one
+        // sibling stays flow while the other stays block.
+        let yaml = b"a: [1, 2, 3]\nb:\n  x: 1\n  y: 2\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let mut out = String::new();
+        index.root(yaml).stream_yaml_document(&mut out, 2).unwrap();
+        assert_eq!(out, "a: [1, 2, 3]\nb:\n  x: 1\n  y: 2");
+    }
+
+    #[test]
+    fn test_stream_yaml_flow_in_flow_still_flow() {
+        // Regression guard: flow nested inside flow (already-correct
+        // pre-#707 behavior) keeps working once nodes can independently
+        // opt into flow.
+        let yaml = b"a: {b: [1, 2], c: {d: 3}}\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let mut out = String::new();
+        index.root(yaml).stream_yaml_document(&mut out, 2).unwrap();
+        assert_eq!(out, "a: {b: [1, 2], c: {d: 3}}");
+    }
+
+    #[test]
+    fn test_stream_yaml_empty_flow_and_block_containers_unaffected() {
+        // Empty containers are a special-cased early return regardless of
+        // style, untouched by the #707 fix.
+        let yaml = b"a: []\nb: {}\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let mut out = String::new();
+        index.root(yaml).stream_yaml_document(&mut out, 2).unwrap();
+        assert_eq!(out, "a: []\nb: {}");
+    }
+
+    #[test]
     fn test_stream_yaml_sequence_flow_style() {
         // #478: `stream_yaml_sequence` mirrors `stream_yaml_value`'s Sequence
         // flow/block duality, but its only caller (`--slurp`) always maps
@@ -9434,13 +9516,21 @@ mod tests {
 
     /// A plain scalar that begins `- ` cannot be re-emitted bare: written under a
     /// `- ` item marker it would read back as a nested sequence. Before #332 no
-    /// unquoted scalar could start that way, so this is a new obligation.
+    /// unquoted scalar could start that way, so this is a new obligation. The
+    /// `Unquoted` branch's `starts_seq_entry` check is unconditional (not
+    /// gated on "currently a block sequence item"), so it still quotes here
+    /// even though these three sources are flow-style and — since #707 fixed
+    /// flow-style preservation — now correctly stay flow on output instead of
+    /// being forced to block. There is no block-style source spelling that
+    /// parses to this same `Unquoted` value: `- - x` parses as a nested
+    /// sequence, not a scalar, so the block-sequence-item collision this
+    /// guards against is presently only reachable via flow-style sources.
     #[test]
     fn test_dash_space_plain_scalar_is_quoted_in_yaml_output() {
         for (yaml, expected) in [
-            (&b"[- x]\n"[..], "- \"- x\""),
-            (&b"{a: - x}\n"[..], "a: \"- x\""),
-            (&b"[- x, 1]\n"[..], "- \"- x\"\n- 1"),
+            (&b"[- x]\n"[..], "[\"- x\"]"),
+            (&b"{a: - x}\n"[..], "{a: \"- x\"}"),
+            (&b"[- x, 1]\n"[..], "[\"- x\", 1]"),
         ] {
             let index = YamlIndex::build(yaml).expect("builds");
             let root = index.root(yaml);
