@@ -276,11 +276,12 @@ fn push_generic_truthiness<V: DocumentValue>(
         // user `map(f)` that can genuinely error (#724) — e.g.
         // `select(keys_unsorted | map(error("x")))` must propagate that
         // error, not silently treat any array-shaped result as truthy. So
-        // this arm can't skip evaluation, only skip *inspecting the
+        // this arm can't skip evaluation, only skip *materializing the
         // result* once evaluation succeeds (array-shaped is still always
-        // truthy).
-        GenericResult::LazySeq(seq) => match materialize_atomic(seq) {
-            Ok(_) => out.push(true),
+        // truthy) — `drain_for_error` runs every element's `map(f)` but
+        // never collects the output, unlike `materialize_atomic`.
+        GenericResult::LazySeq(seq) => match drain_for_error(seq) {
+            Ok(()) => out.push(true),
             Err(control) => return Some(control),
         },
         GenericResult::None => {}
@@ -614,6 +615,23 @@ pub fn materialize_atomic<V: DocumentValue>(seq: LazySeq<V>) -> Result<OwnedValu
         }
     }
     Ok(OwnedValue::Array(results))
+}
+
+/// Drive a `LazySeq` to completion without materializing any element, only
+/// surfacing a mid-stream error/break.
+///
+/// For consumers that only need to know *whether* evaluation succeeded, not
+/// the resulting array — e.g. [`push_generic_truthiness`], where an
+/// array-shaped result is always truthy in jq regardless of its contents.
+/// Every element's `map(f)` still runs (that's unavoidable — it's the only
+/// way to know whether a later element errors), but skips
+/// `materialize_atomic`'s per-`Cursor`-element `to_owned()` deep clone and
+/// its `Vec<OwnedValue>` accumulation, which the caller would only discard.
+fn drain_for_error<V: DocumentValue>(seq: LazySeq<V>) -> Result<(), Control> {
+    for item in seq {
+        item?;
+    }
+    Ok(())
 }
 
 /// Result of evaluating a generic jq expression.
@@ -3721,6 +3739,38 @@ mod tests {
                 OwnedValue::String("c".to_string()),
             ])
         );
+    }
+
+    /// `select(keys_unsorted | map(f))` -- unlike the plain-`select` case
+    /// above, the *condition* here is a `LazySeq`, so it goes through
+    /// `push_generic_truthiness`'s `LazySeq` arm (#724 fix: `drain_for_error`
+    /// instead of `materialize_atomic`, so a truthy array-shaped condition no
+    /// longer gets deep-cloned into a throwaway `Vec<OwnedValue>` just to
+    /// answer "is this truthy"). Covers both sides: a non-erroring `map`
+    /// leaves the original value untouched (array-shaped is always truthy),
+    /// and a mid-map error must still surface through the boolean condition,
+    /// not get silently swallowed by an "array is always truthy" shortcut.
+    #[test]
+    fn test_generic_keys_unsorted_lazy_map_select_condition() {
+        let json = br#"{"b": 1, "a": 2}"#;
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+
+        let expr = crate::jq::parse("select(keys_unsorted | map(.))").unwrap();
+        assert_eq!(
+            eval(&expr, value.clone()).into_owned().unwrap(),
+            OwnedValue::Object(IndexMap::from_iter([
+                ("b".to_string(), OwnedValue::Int(1)),
+                ("a".to_string(), OwnedValue::Int(2)),
+            ]))
+        );
+
+        let expr = crate::jq::parse(
+            r#"select(keys_unsorted | map(if . == "b" then error("boom") else . end))"#,
+        )
+        .unwrap();
+        assert!(eval(&expr, value).is_error());
     }
 
     #[test]
