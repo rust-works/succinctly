@@ -60,6 +60,12 @@ pub trait EvalSemantics: Copy + Default {
     /// If true, unflagged array `*`/`*=` replaces/merges instead of erroring (yq).
     /// If false, array * array is a type error (jq) — real jq has no array-merge concept.
     const ARRAY_MULTIPLY_MERGES: bool;
+    /// If true, `null` acts as an empty container on either side of `*`/`*=`:
+    /// a null right operand is a no-op (left passes through unchanged), and a
+    /// null left operand merging with an object/array merges as if starting
+    /// from `{}`/`[]` (yq). If false, any null operand short-circuits to
+    /// `null` (jq).
+    const NULL_MERGES_AS_EMPTY: bool;
 }
 
 /// jq-compatible evaluation semantics (default).
@@ -77,6 +83,7 @@ impl EvalSemantics for JqSemantics {
     const MOD_TRUNCATES_FLOATS: bool = true;
     const TAG: EvalTag = EvalTag::Jq;
     const ARRAY_MULTIPLY_MERGES: bool = false;
+    const NULL_MERGES_AS_EMPTY: bool = false;
 }
 
 /// yq-compatible evaluation semantics.
@@ -94,6 +101,7 @@ impl EvalSemantics for YqSemantics {
     const MOD_TRUNCATES_FLOATS: bool = false;
     const TAG: EvalTag = EvalTag::Yq;
     const ARRAY_MULTIPLY_MERGES: bool = true;
+    const NULL_MERGES_AS_EMPTY: bool = true;
 }
 
 use crate::json::light::{JsonCursor, JsonElements, JsonFields, StandardJson};
@@ -1498,6 +1506,24 @@ fn arith_mul<S: EvalSemantics>(
         // this arm and its flag handling only ever fire for yq.
         (a @ OwnedValue::Array(_), b @ OwnedValue::Array(_)) if S::ARRAY_MULTIPLY_MERGES => {
             Ok(merge_values(a, b, flags))
+        }
+        // yq: null is an empty container for merge purposes. A null right
+        // operand is a no-op regardless of flags (real yq: `x *= null`
+        // leaves `x` untouched, whatever `x` is). A null left operand
+        // merging with an object/array merges as if it started from
+        // `{}`/`[]`, routing through the same merge_values() call as a real
+        // container pair — so `?`/`n` gating (which only takes effect once
+        // merge_values recurses into positions) behaves exactly as if the
+        // target already existed as an empty container. This is what makes
+        // the merge-flag suffixes (#713) work on a top-level target that's
+        // `null` or entirely absent (`.a` on a missing key evaluates to
+        // `null`), not just on nested fields within an existing container.
+        (left, OwnedValue::Null) if S::NULL_MERGES_AS_EMPTY => Ok(left),
+        (OwnedValue::Null, b @ OwnedValue::Object(_)) if S::NULL_MERGES_AS_EMPTY => {
+            Ok(merge_values(OwnedValue::Object(IndexMap::new()), b, flags))
+        }
+        (OwnedValue::Null, b @ OwnedValue::Array(_)) if S::NULL_MERGES_AS_EMPTY => {
+            Ok(merge_values(OwnedValue::Array(Vec::new()), b, flags))
         }
         // null * x = null
         (OwnedValue::Null, _) | (_, OwnedValue::Null) => Ok(OwnedValue::Null),
@@ -19480,6 +19506,73 @@ mod tests {
                 let OwnedValue::Array(a) = o.get("a").unwrap() else { panic!("expected array") };
                 assert_eq!(a.len(), 3, "expected pure append (2 + 1 elements), got {a:?}");
             }
+        );
+    }
+
+    #[test]
+    fn test_yq_merge_flags_null_or_absent_target() {
+        // A null (or absent, which evaluates to null via `.a`) merge target
+        // is the most common way to invoke `*=n`/`*=?` in practice — e.g.
+        // "add this key only if it's not already set". `arith_mul`'s null
+        // handling must route through the same flag-gated merge machinery
+        // as a real container pair, not short-circuit to `null` before
+        // flags ever apply. All expected values here were cross-checked
+        // against real yq v4.53.3.
+
+        // `n` on a null target: null counts as "doesn't exist or is null",
+        // so the full rhs is written in (matches a null nested field).
+        yq_query!(br#"{"a": null, "b": {"x": 1, "y": 2}}"#, ".a *=n .b",
+            QueryResult::Owned(OwnedValue::Object(o)) => {
+                let OwnedValue::Object(a) = o.get("a").unwrap() else { panic!("expected object") };
+                assert_eq!(a.get("x"), Some(&OwnedValue::Int(1)));
+                assert_eq!(a.get("y"), Some(&OwnedValue::Int(2)));
+            }
+        );
+
+        // `?` on an absent target: `.a` evaluates to null (there's no `a`
+        // key at all), and `?` never creates new fields — so merging
+        // recurses into an empty object and every field is blocked,
+        // leaving `a: {}` (not `a: null`, and not the full rhs).
+        yq_query!(br#"{"b": {"x": 1, "y": 2}}"#, ".a *=? .b",
+            QueryResult::Owned(OwnedValue::Object(o)) => {
+                assert_eq!(o.get("a"), Some(&OwnedValue::Object(IndexMap::new())));
+            }
+        );
+
+        // Unflagged `*=` on a null target still merges in the full rhs
+        // (null is transparent, not a hard stop).
+        yq_query!(br#"{"a": null, "b": {"x": 1, "y": 2}}"#, ".a *= .b",
+            QueryResult::Owned(OwnedValue::Object(o)) => {
+                let OwnedValue::Object(a) = o.get("a").unwrap() else { panic!("expected object") };
+                assert_eq!(a.get("x"), Some(&OwnedValue::Int(1)));
+                assert_eq!(a.get("y"), Some(&OwnedValue::Int(2)));
+            }
+        );
+
+        // A null *right* operand is a no-op: the left is returned
+        // untouched, regardless of flags.
+        yq_query!(br#"{"a": {"x": 1}}"#, ".a *= null",
+            QueryResult::Owned(OwnedValue::Object(o)) => {
+                let OwnedValue::Object(a) = o.get("a").unwrap() else { panic!("expected object") };
+                assert_eq!(a.get("x"), Some(&OwnedValue::Int(1)));
+            }
+        );
+        yq_query!(br#"{"a": [1, 2]}"#, ".a *=+ null",
+            QueryResult::Owned(OwnedValue::Object(o)) => {
+                assert_eq!(
+                    o.get("a"),
+                    Some(&OwnedValue::Array(vec![OwnedValue::Int(1), OwnedValue::Int(2)]))
+                );
+            }
+        );
+
+        // jq mode is unaffected: null is still a hard `null` result on
+        // either side, matching jq mode's pre-existing (non-merge) behavior.
+        query!(br#"{"a": null, "b": {"x": 1}}"#, ".a * .b",
+            QueryResult::Owned(OwnedValue::Null) => {}
+        );
+        query!(br#"{"a": {"x": 1}}"#, ".a * null",
+            QueryResult::Owned(OwnedValue::Null) => {}
         );
     }
 
