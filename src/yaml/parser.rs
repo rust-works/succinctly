@@ -5756,4 +5756,145 @@ mod tests {
             }
         }
     }
+
+    /// A verbatim tag (`!<...>`) that hits whitespace before its closing `>`
+    /// is malformed - `scan_tag_extent` bails out at the space rather than
+    /// treating it as part of the tag, and `parse_tag` turns that into
+    /// `InvalidTag`.
+    #[test]
+    fn verbatim_tag_unterminated_before_whitespace_is_invalid_tag() {
+        let err = build_semi_index(b"a: !<foo bar\n").unwrap_err();
+        assert!(
+            matches!(
+                err,
+                YamlError::InvalidTag {
+                    offset: 3,
+                    reason: "unterminated verbatim tag (missing closing '>')",
+                }
+            ),
+            "expected InvalidTag at offset 3, got {err:?}"
+        );
+    }
+
+    /// Same malformed-verbatim-tag case, but the input ends before the
+    /// closing `>` is ever found - `scan_tag_extent`'s scan loop must reject
+    /// end-of-input the same way it rejects whitespace, not run off the end
+    /// of the buffer.
+    #[test]
+    fn verbatim_tag_unterminated_at_eof_is_invalid_tag() {
+        let err = build_semi_index(b"a: !<foo").unwrap_err();
+        assert!(
+            matches!(
+                err,
+                YamlError::InvalidTag {
+                    offset: 3,
+                    reason: "unterminated verbatim tag (missing closing '>')",
+                }
+            ),
+            "expected InvalidTag at offset 3, got {err:?}"
+        );
+    }
+
+    /// A multi-line plain scalar must stop folding when the next line is a
+    /// lone `: ` (explicit-key value indicator), rather than swallowing it as
+    /// scalar content - the guard in
+    /// `parse_unquoted_value_with_indent_impl` that checks
+    /// `next_char == b':' && is_ws_break_or_eoi(..)` alongside
+    /// `indent_allows_continuation`.
+    ///
+    /// The extra indentation on both lines matters for actually exercising
+    /// that guard: `indent_allows_continuation` only becomes `true` (and the
+    /// `&&`-chain only reaches the colon check) when the next line is
+    /// indented *past* the key's `start_indent` (here, past the mapping's
+    /// indent of 0) - a bare `"? a\n: 1\n"` never reaches the check at all,
+    /// since `next_indent (0) > start_indent (0)` is already false and the
+    /// rest of the condition short-circuits. `"  : 1"` is still less
+    /// indented than the key `a` itself (column 4), matching the YAML-1.2
+    /// corpus shape (id `35KP`, "Tags for Root Objects") that used to
+    /// exercise this before this PR's tag-support change routed that corpus
+    /// case through a different path (#224).
+    #[test]
+    fn multiline_plain_scalar_stops_before_explicit_value_indicator() {
+        let yaml: &[u8] = b"?   a\n  : 1\n";
+        let index = crate::yaml::YamlIndex::build(yaml).unwrap();
+        let cursor = index.root(yaml);
+        assert_eq!(
+            cursor.to_json(),
+            r#"[{"a":1}]"#,
+            "explicit key 'a' must map to 1, not swallow the ': 1' line into the key scalar"
+        );
+    }
+
+    /// `parse_value`'s `Some(b'-') if is_ws_break_or_eoi(..)` arm — an
+    /// inline-sequence-item fallback for a `-` that reaches `parse_value`
+    /// itself rather than being intercepted by a caller's own copy of the
+    /// same check — is still reachable after this PR replaced single
+    /// `parse_anchor()` calls with looping `parse_node_properties()` calls in
+    /// both `parse_value` and `parse_sequence_item_inner`.
+    ///
+    /// That refactor *does* make the arm dead for the scenario the arm's own
+    /// comment names (`- &a &b - x`, a sequence item): `parse_sequence_item_inner`
+    /// now consumes *both* leading anchors in one loop and its own `Some(b'-')`
+    /// check (just above the property loop's result) catches the inner dash
+    /// directly, never delegating to `parse_value` at all - confirmed by
+    /// coverage (`- &a &b - x\n` alone does not hit this arm).
+    ///
+    /// It stays reachable through a different caller: `parse_explicit_key`'s
+    /// "sequence as key" arm (`? - ...`) skips only the *first* `-` and then
+    /// calls `parse_value` unconditionally for whatever follows, with no
+    /// dash-precheck of its own (unlike `parse_sequence_item_inner` and
+    /// `parse_mapping_entry`). A second `-` there - anchored or not - lands
+    /// on this exact arm. Confirmed via `cargo llvm-cov`: this input hits
+    /// parser.rs:2741-2742, `"- &a &b - x\n"` alone does not.
+    #[test]
+    fn explicit_key_double_anchored_nested_dash_reaches_parse_value_dash_arm() {
+        let yaml: &[u8] = b"? - &a &b - x\n: v\n";
+        let index = crate::yaml::YamlIndex::build(yaml).expect("should parse");
+        let root = index.root(yaml);
+        let doc0 = match root.value() {
+            crate::yaml::YamlValue::Sequence(mut docs) => docs.next().expect("one document"),
+            other => panic!("expected root sequence, got {other:?}"),
+        };
+        let fields = match doc0 {
+            crate::yaml::YamlValue::Mapping(fields) => fields,
+            other => panic!("expected mapping, got {other:?}"),
+        };
+        let (field, rest) = fields.uncons().expect("mapping has one field");
+        assert!(rest.is_empty(), "mapping must have exactly one field");
+
+        // Key: a sequence (from `? - ...`) whose single element is itself a
+        // sequence (the nested `- x`, opened by this PR's arm) containing "x".
+        match field.key() {
+            crate::yaml::YamlValue::Sequence(mut outer) => {
+                let inner = outer.next().expect("outer sequence has one element");
+                assert!(
+                    outer.next().is_none(),
+                    "outer sequence has only one element"
+                );
+                match inner {
+                    crate::yaml::YamlValue::Sequence(mut inner_seq) => {
+                        let x = inner_seq.next().expect("inner sequence has one element");
+                        assert!(
+                            inner_seq.next().is_none(),
+                            "inner sequence has only one element"
+                        );
+                        match x {
+                            crate::yaml::YamlValue::String(s) => {
+                                assert_eq!(s.as_str().unwrap(), "x");
+                            }
+                            other => panic!("expected string 'x', got {other:?}"),
+                        }
+                    }
+                    other => panic!("expected nested sequence key, got {other:?}"),
+                }
+            }
+            other => panic!("expected sequence key, got {other:?}"),
+        }
+
+        // Value: the explicit value `v` on the following line.
+        match field.value_cursor().value() {
+            crate::yaml::YamlValue::String(s) => assert_eq!(s.as_str().unwrap(), "v"),
+            other => panic!("expected string 'v' value, got {other:?}"),
+        }
+    }
 }
