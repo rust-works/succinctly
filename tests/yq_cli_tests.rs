@@ -5337,3 +5337,15 @@ fn test_multi_doc_root_scalar_comment_dropped_matches_real_yq_710() -> Result<()
     assert_eq!(out, "42\n---\nfoo: bar\n");
     Ok(())
 }
+
+/// `-o json` never reads `CommentTree` (JSON has no comment syntax), so
+/// `evaluate_yaml_cursor` skips building one for JSON output (#710
+/// follow-up efficiency fix) - this just pins that the skip doesn't change
+/// JSON output correctness for a document that does have comments.
+#[test]
+fn test_json_output_unaffected_by_comment_tree_skip_710() -> Result<()> {
+    let (out, code) = run_yq_stdin("select(true)", "a: 1 # keep this\nb: 2\n", &["-o", "json"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "{\n  \"a\": 1,\n  \"b\": 2\n}\n");
+    Ok(())
+}

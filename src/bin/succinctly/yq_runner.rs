@@ -323,6 +323,7 @@ fn evaluate_yaml_direct_filtered(
     expr: &Expr,
     doc_filter: Option<(usize, usize)>,
     sink: &mut ErrorSink,
+    need_comments: bool,
 ) -> Result<(Vec<Vec<ResultWithComments>>, usize)> {
     let index = YamlIndex::build(bytes).map_err(|e| anyhow::anyhow!("YAML parse error: {e}"))?;
     let root = index.root(bytes);
@@ -340,7 +341,7 @@ fn evaluate_yaml_direct_filtered(
                 };
 
                 if should_eval {
-                    let results = evaluate_yaml_cursor(cursor, expr, sink)?;
+                    let results = evaluate_yaml_cursor(cursor, expr, sink, need_comments)?;
                     // Only include documents that have results (select may filter them out)
                     if !results.is_empty() {
                         doc_results.push(results);
@@ -361,7 +362,7 @@ fn evaluate_yaml_direct_filtered(
 
             if should_eval {
                 if let Some(content_cursor) = root.first_child() {
-                    let results = evaluate_yaml_cursor(content_cursor, expr, sink)?;
+                    let results = evaluate_yaml_cursor(content_cursor, expr, sink, need_comments)?;
                     Ok((vec![results], 1))
                 } else {
                     // Empty document
@@ -523,6 +524,7 @@ fn evaluate_yaml_cursor<W: AsRef<[u64]> + Clone>(
     cursor: YamlCursor<'_, W>,
     expr: &Expr,
     sink: &mut ErrorSink,
+    need_comments: bool,
 ) -> Result<Vec<ResultWithComments>> {
     // Snapshot alias-sync context from the pristine document *before*
     // evaluation, only when it could possibly matter (#711): an
@@ -534,16 +536,24 @@ fn evaluate_yaml_cursor<W: AsRef<[u64]> + Clone>(
 
     let result = eval_with_cursor_using::<YqSemantics, _>(expr, cursor);
     let no_comments = |v| (v, CommentTree::empty());
+    // `to_owned_with_comments` builds a full parallel `IndexMap`/`Vec` tree
+    // alongside the `OwnedValue` one, just to carry comment text - wasted
+    // work when the caller can't use it (`-o json`'s output never reads
+    // `CommentTree` at all; see `output_value`'s JSON branch) (#710).
+    let owned_with_comments = |c: &YamlCursor<'_, W>| {
+        if need_comments {
+            to_owned_with_comments(&c.value(), Some(c))
+        } else {
+            no_comments(to_owned(&c.value()))
+        }
+    };
 
     // Convert GenericResult to Vec<ResultWithComments>
     let mut docs = match result {
         GenericResult::One(v) => Ok(vec![no_comments(to_owned(&v))]),
-        GenericResult::OneCursor(c) => Ok(vec![to_owned_with_comments(&c.value(), Some(&c))]),
+        GenericResult::OneCursor(c) => Ok(vec![owned_with_comments(&c)]),
         GenericResult::Many(vs) => Ok(vs.iter().map(to_owned).map(no_comments).collect()),
-        GenericResult::ManyCursor(cs) => Ok(cs
-            .iter()
-            .map(|c| to_owned_with_comments(&c.value(), Some(c)))
-            .collect()),
+        GenericResult::ManyCursor(cs) => Ok(cs.iter().map(owned_with_comments).collect()),
         // This is the DOM/slow path (`evaluate_yaml_direct_filtered`'s
         // fallback), reached only when `can_use_m2_streaming` rejects the
         // expression or a flag (`--sort-keys`, color, `--tab`, `--slurp`,
@@ -2268,8 +2278,16 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                     // Filter at evaluation time to avoid evaluating (and printing errors for)
                     // documents that don't match the --doc filter
                     let doc_filter = args.document.map(|target| (target, global_doc_index));
-                    let (doc_results, num_docs) =
-                        evaluate_yaml_direct_filtered(bytes, &program.expr, doc_filter, &mut sink)?;
+                    // JSON output never reads `CommentTree` (see
+                    // `output_value`'s JSON branch), so don't build one (#710).
+                    let need_comments = output_config.output_format == OutputFormat::Yaml;
+                    let (doc_results, num_docs) = evaluate_yaml_direct_filtered(
+                        bytes,
+                        &program.expr,
+                        doc_filter,
+                        &mut sink,
+                        need_comments,
+                    )?;
                     global_doc_index += num_docs;
                     all_results.push(doc_results);
                 }
@@ -2620,7 +2638,8 @@ mod tests {
     /// (issue #710) instead of discarding it.
     fn eval_yaml_with_comments(bytes: &[u8], expr: &Expr) -> Vec<ResultWithComments> {
         let (groups, _) =
-            evaluate_yaml_direct_filtered(bytes, expr, None, &mut ErrorSink::default()).unwrap();
+            evaluate_yaml_direct_filtered(bytes, expr, None, &mut ErrorSink::default(), true)
+                .unwrap();
         groups.into_iter().flatten().collect()
     }
 
