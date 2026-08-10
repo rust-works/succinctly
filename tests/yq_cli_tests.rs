@@ -1726,6 +1726,197 @@ fn test_yaml_pipe_chained_assigns_to_different_paths_through_anchor_updates_alia
 }
 
 // =============================================================================
+// Issue #712 - merge keys and anchors/aliases must survive verbatim in YAML
+// (not JSON) output on a query that doesn't touch the affected mapping.
+// Expected strings are all pinned against mikefarah/yq v4.53.3 output,
+// verified directly (not copied from the issue text, which paraphrased away
+// yq's `!!merge` tag).
+// =============================================================================
+
+#[test]
+fn test_yaml_merge_key_preserved_on_identity_output_712() -> Result<()> {
+    let input = "default: &d\n  a: 1\nitem:\n  <<: *d\n  b: 2\n";
+    let (output, exit_code) = run_yq_stdin(".", input, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(
+        output,
+        "default: &d\n  a: 1\nitem:\n  !!merge <<: *d\n  b: 2\n"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_yaml_scalar_anchor_alias_round_trip_on_identity_output_712() -> Result<()> {
+    let input = "a: &x 1\nb: *x\n";
+    let (output, exit_code) = run_yq_stdin(".", input, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, input);
+    Ok(())
+}
+
+#[test]
+fn test_yaml_anchored_sequence_item_round_trip_on_identity_output_712() -> Result<()> {
+    let input = "items:\n  - &x\n    a: 1\n  - *x\n";
+    let (output, exit_code) = run_yq_stdin(".", input, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, input);
+    Ok(())
+}
+
+#[test]
+fn test_yaml_flow_style_anchor_alias_round_trip_on_identity_output_712() -> Result<()> {
+    let input = "a: {x: &y 1, z: *y}\n";
+    let (output, exit_code) = run_yq_stdin(".", input, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, input);
+    Ok(())
+}
+
+#[test]
+fn test_yaml_merge_key_inline_mapping_source_preserved_712() -> Result<()> {
+    let input = "item:\n  <<: {a: 1}\n  b: 2\n";
+    let (output, exit_code) = run_yq_stdin(".", input, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "item:\n  !!merge <<: {a: 1}\n  b: 2\n");
+    Ok(())
+}
+
+#[test]
+fn test_yaml_merge_key_multiple_sources_preserved_712() -> Result<()> {
+    let input = "a: &a\n  x: 1\nb: &b\n  y: 2\nitem:\n  <<: [*a, *b]\n  c: 3\n";
+    let (output, exit_code) = run_yq_stdin(".", input, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(
+        output,
+        "a: &a\n  x: 1\nb: &b\n  y: 2\nitem:\n  !!merge <<: [*a, *b]\n  c: 3\n"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_yaml_duplicate_merge_keys_each_tagged_712() -> Result<()> {
+    let input = "a: &a\n  x: 1\nb: &b\n  y: 2\nitem:\n  <<: *a\n  <<: *b\n  c: 3\n";
+    let (output, exit_code) = run_yq_stdin(".", input, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(
+        output,
+        "a: &a\n  x: 1\nb: &b\n  y: 2\nitem:\n  !!merge <<: *a\n  !!merge <<: *b\n  c: 3\n"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_yaml_quoted_merge_key_not_tagged_712() -> Result<()> {
+    // A quoted "<<" is an ordinary string key, not a merge key - no `!!merge` tag.
+    let input = "item:\n  \"<<\": 5\n  b: 2\n";
+    let (output, exit_code) = run_yq_stdin(".", input, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, input);
+    Ok(())
+}
+
+#[test]
+fn test_yaml_merge_key_untouched_across_partial_selection_712() -> Result<()> {
+    // Selecting a sub-path that doesn't include the merge key's own anchor
+    // definition still preserves the merge key literally (a "dangling" alias
+    // reference in the printed subtree) - matches real yq's own behavior.
+    let input = "default: &d\n  a: 1\nitem:\n  <<: *d\n  b: 2\n";
+    let (output, exit_code) = run_yq_stdin(".item", input, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "!!merge <<: *d\nb: 2\n");
+    Ok(())
+}
+
+#[test]
+fn test_yaml_merge_key_field_access_still_resolves_712() -> Result<()> {
+    // Output preservation must not break actual field lookup through a merge.
+    let input = "default: &d\n  a: 1\nitem:\n  <<: *d\n  b: 2\n";
+    let (output, exit_code) = run_yq_stdin(".item.a", input, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), "1");
+    Ok(())
+}
+
+#[test]
+fn test_yaml_mapping_anchor_preserved_on_query_result_712() -> Result<()> {
+    // A query result whose OWN cursor carries the anchor (not a nested
+    // mapping/sequence field's value) must still print it. Verified against
+    // real yq v4.53.3: `printf 'item: &x\n  a: 1\n' | yq '.item'` -> `&x\na: 1`.
+    let input = "item: &x\n  a: 1\n";
+    let (output, exit_code) = run_yq_stdin(".item", input, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "&x\na: 1\n");
+    Ok(())
+}
+
+#[test]
+fn test_yaml_whole_document_anchor_preserved_on_identity_712() -> Result<()> {
+    // Same as above, but the anchor is on the document root itself (`.`
+    // identity, not a sub-query). Verified against real yq v4.53.3.
+    let input = "&root\na: 1\nb: 2\n";
+    let (output, exit_code) = run_yq_stdin(".", input, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, input);
+    Ok(())
+}
+
+#[test]
+fn test_yaml_sequence_anchor_preserved_on_query_result_712() -> Result<()> {
+    let input = "item: &s\n  - 1\n  - 2\n";
+    let (output, exit_code) = run_yq_stdin(".item", input, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "&s\n- 1\n- 2\n");
+    Ok(())
+}
+
+#[test]
+fn test_yaml_bare_scalar_anchor_dropped_on_query_result_712() -> Result<()> {
+    // Real yq (v4.53.3) drops a *scalar's* own anchor when the scalar itself
+    // is the top-level output (unlike a mapping/sequence in the same
+    // position, which keeps its anchor - see the tests above). Verified:
+    // `printf 'item: &y 1\n' | yq '.item'` -> `1`, no `&y`.
+    let input = "item: &y 1\n";
+    let (output, exit_code) = run_yq_stdin(".item", input, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), "1");
+    Ok(())
+}
+
+#[test]
+fn test_yaml_empty_mapping_anchor_preserved_on_query_result_712() -> Result<()> {
+    // An *empty* container still keeps its own anchor at the top level, same
+    // as a non-empty one (see test_yaml_mapping_anchor_preserved_on_query_result_712
+    // above) - only a bare scalar's anchor is dropped in this position.
+    // Verified: `printf 'item: &x {}\n' | yq '.item'` -> `&x {}`.
+    let input = "item: &x {}\n";
+    let (output, exit_code) = run_yq_stdin(".item", input, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "&x {}\n");
+    Ok(())
+}
+
+#[test]
+fn test_yaml_empty_sequence_anchor_preserved_on_query_result_712() -> Result<()> {
+    // Verified: `printf 'item: &x []\n' | yq '.item'` -> `&x []`.
+    let input = "item: &x []\n";
+    let (output, exit_code) = run_yq_stdin(".item", input, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "&x []\n");
+    Ok(())
+}
+
+#[test]
+fn test_yaml_empty_mapping_anchor_preserved_on_whole_document_root_712() -> Result<()> {
+    // Same as above, but the anchor is on the document root itself (`.`
+    // identity). Verified: `printf '&root {}\n' | yq '.'` -> `&root {}`.
+    let input = "&root {}\n";
+    let (output, exit_code) = run_yq_stdin(".", input, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, input);
+    Ok(())
+}
+
+// =============================================================================
 // Anchored sequence items (#328) - an anchor on `- ` binds to the item's value
 // whatever its kind. Expectations are mikefarah/yq v4.53.3 output.
 // =============================================================================

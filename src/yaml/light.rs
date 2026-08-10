@@ -1214,6 +1214,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
         indent: IndentSpec,
         sort_keys: bool,
     ) -> core::fmt::Result {
+        self.write_leading_anchor(out)?;
         self.stream_yaml_value(out, 0, indent.width, indent.unit, sort_keys)
     }
 
@@ -1232,6 +1233,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                 if let Some((cursor, rest)) = elements.uncons_cursor() {
                     if rest.is_empty() {
                         // Single document - output it directly without array wrapper
+                        cursor.write_leading_anchor(out)?;
                         return cursor.stream_yaml_value(
                             out,
                             0,
@@ -1245,7 +1247,47 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
         }
 
         // Multiple documents or not at root - output as-is
+        self.write_leading_anchor(out)?;
         self.stream_yaml_value(out, 0, indent.width, indent.unit, sort_keys)
+    }
+
+    /// Write this cursor's own `&anchor` before streaming it as a YAML root.
+    ///
+    /// `stream_yaml_value`'s nested mapping/sequence loops write a value's
+    /// anchor themselves (before recursing) since they know whether it's
+    /// following a `key:`/`- ` prefix that needs a trailing space, or opening
+    /// a block container that needs a trailing newline instead. A cursor
+    /// streamed as the top-level root (whole document, or a query result via
+    /// `stream_yaml`) has no such prefix, so it needs the same anchor written
+    /// here first — otherwise its own anchor is silently dropped (#712).
+    ///
+    /// Only containers get this treatment: real yq (v4.53.3) drops a bare
+    /// scalar's own anchor when the scalar itself is the top-level output
+    /// (`printf '&x 1' | yq '.'` -> `1`, no anchor), while a mapping/sequence
+    /// in the same position keeps its anchor (`item: &x\n  a: 1` selected via
+    /// `.item` -> `&x\na: 1`). Nested scalar anchors (a mapping field's or
+    /// sequence element's *value*) are unaffected — those go through the
+    /// `stream_yaml_value` loops above, not this function.
+    ///
+    /// Uses `is_container()` rather than `is_yaml_cursor_container()`: the
+    /// latter also requires a non-empty `first_child()`, which is right for
+    /// choosing block-vs-inline layout but wrong here — an *empty* container
+    /// still keeps its own anchor (`item: &x {}` selected via `.item` ->
+    /// `&x {}`, verified against yq v4.53.3), it just always renders inline
+    /// (`{}`/`[]` are the only way to write an empty mapping/sequence, so the
+    /// `style() != "flow"` check below still picks the right separator).
+    fn write_leading_anchor<Out: core::fmt::Write>(&self, out: &mut Out) -> core::fmt::Result {
+        if self.is_container() {
+            if let Some(anchor) = self.anchor() {
+                out.write_char('&')?;
+                out.write_str(anchor)?;
+                if self.style() != "flow" {
+                    return out.write_char('\n');
+                }
+                return out.write_char(' ');
+            }
+        }
+        Ok(())
     }
 
     /// Internal: stream this cursor's value as YAML.
@@ -1279,7 +1321,13 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                 }
                 stream_yaml_string_value(out, &s)
             }
-            YamlValue::Mapping(fields) => {
+            YamlValue::Mapping(_) => {
+                // Raw (merge-unaware) walk, not `self.value()`'s merge-resolved
+                // fields: re-serializing to YAML must preserve a literal `<<`
+                // key rather than silently expanding it (issue #712) — merge
+                // resolution stays reserved for field *lookup* (`find`,
+                // `keys()`, ...), which still goes through `from_mapping_cursor`.
+                let fields = YamlFields::raw(self.first_child());
                 if fields.is_empty() {
                     return out.write_str("{}");
                 }
@@ -1295,19 +1343,9 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                                 out.write_str(", ")?;
                             }
                             first = false;
-                            if let YamlValue::String(s) = field.key() {
-                                if let Some(tag) = field.key_cursor().explicit_tag() {
-                                    out.write_str(tag)?;
-                                    out.write_char(' ')?;
-                                }
-                                stream_yaml_string_value(out, &s)?;
-                            } else {
-                                stream_yaml_nonstring_key(out, &field.key())?;
-                            }
+                            write_yaml_field_key(out, field)?;
                             out.write_str(": ")?;
-                            field
-                                .value_cursor()
-                                .stream_yaml_value(out, 0, 0, unit, sort_keys)?;
+                            write_yaml_child_inline(out, field.value_cursor(), unit, sort_keys)?;
                         }
                     } else {
                         for field in fields {
@@ -1315,20 +1353,9 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                                 out.write_str(", ")?;
                             }
                             first = false;
-                            // Write key
-                            if let YamlValue::String(s) = field.key() {
-                                if let Some(tag) = field.key_cursor().explicit_tag() {
-                                    out.write_str(tag)?;
-                                    out.write_char(' ')?;
-                                }
-                                stream_yaml_string_value(out, &s)?;
-                            } else {
-                                stream_yaml_nonstring_key(out, &field.key())?;
-                            }
+                            write_yaml_field_key(out, field)?;
                             out.write_str(": ")?;
-                            field
-                                .value_cursor()
-                                .stream_yaml_value(out, 0, 0, unit, sort_keys)?;
+                            write_yaml_child_inline(out, field.value_cursor(), unit, sort_keys)?;
                         }
                     }
                     out.write_char('}')
@@ -1344,18 +1371,18 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                                 write_yaml_indent(out, current_indent, unit)?;
                             }
                             first = false;
-                            if let YamlValue::String(s) = field.key() {
-                                if let Some(tag) = field.key_cursor().explicit_tag() {
-                                    out.write_str(tag)?;
-                                    out.write_char(' ')?;
-                                }
-                                stream_yaml_string_value(out, &s)?;
-                            } else {
-                                stream_yaml_nonstring_key(out, &field.key())?;
-                            }
+                            write_yaml_field_key(out, field)?;
                             out.write_char(':')?;
                             let value = field.value_cursor();
                             if is_yaml_cursor_container(&value) && value.style() != "flow" {
+                                // The anchor (if any) belongs on the same
+                                // line as the key, before the newline that
+                                // starts the container's own contents.
+                                if let Some(anchor) = value.anchor() {
+                                    out.write_char(' ')?;
+                                    out.write_char('&')?;
+                                    out.write_str(anchor)?;
+                                }
                                 out.write_char('\n')?;
                                 write_yaml_indent(out, current_indent + indent_spaces, unit)?;
                                 value.stream_yaml_value(
@@ -1367,6 +1394,11 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                                 )?;
                             } else {
                                 out.write_char(' ')?;
+                                if let Some(anchor) = value.anchor() {
+                                    out.write_char('&')?;
+                                    out.write_str(anchor)?;
+                                    out.write_char(' ')?;
+                                }
                                 value.stream_yaml_value(
                                     out,
                                     current_indent + indent_spaces,
@@ -1383,20 +1415,19 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                                 write_yaml_indent(out, current_indent, unit)?;
                             }
                             first = false;
-                            // Write key
-                            if let YamlValue::String(s) = field.key() {
-                                if let Some(tag) = field.key_cursor().explicit_tag() {
-                                    out.write_str(tag)?;
-                                    out.write_char(' ')?;
-                                }
-                                stream_yaml_string_value(out, &s)?;
-                            } else {
-                                stream_yaml_nonstring_key(out, &field.key())?;
-                            }
+                            write_yaml_field_key(out, field)?;
                             out.write_char(':')?;
                             // Check if value needs newline
                             let value = field.value_cursor();
                             if is_yaml_cursor_container(&value) && value.style() != "flow" {
+                                // The anchor (if any) belongs on the same
+                                // line as the key, before the newline that
+                                // starts the container's own contents.
+                                if let Some(anchor) = value.anchor() {
+                                    out.write_char(' ')?;
+                                    out.write_char('&')?;
+                                    out.write_str(anchor)?;
+                                }
                                 out.write_char('\n')?;
                                 write_yaml_indent(out, current_indent + indent_spaces, unit)?;
                                 value.stream_yaml_value(
@@ -1408,6 +1439,11 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                                 )?;
                             } else {
                                 out.write_char(' ')?;
+                                if let Some(anchor) = value.anchor() {
+                                    out.write_char('&')?;
+                                    out.write_str(anchor)?;
+                                    out.write_char(' ')?;
+                                }
                                 value.stream_yaml_value(
                                     out,
                                     current_indent + indent_spaces,
@@ -1435,7 +1471,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                             out.write_str(", ")?;
                         }
                         first = false;
-                        cursor.stream_yaml_value(out, 0, 0, unit, sort_keys)?;
+                        write_yaml_child_inline(out, cursor, unit, sort_keys)?;
                         elems = rest;
                     }
                     out.write_char(']')
@@ -1456,6 +1492,11 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                         // space before the newline.
                         if is_yaml_cursor_container(&cursor) && cursor.style() != "flow" {
                             out.write_char('-')?;
+                            if let Some(anchor) = cursor.anchor() {
+                                out.write_char(' ')?;
+                                out.write_char('&')?;
+                                out.write_str(anchor)?;
+                            }
                             out.write_char('\n')?;
                             write_yaml_indent(out, current_indent + indent_spaces, unit)?;
                             cursor.stream_yaml_value(
@@ -1467,6 +1508,11 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                             )?;
                         } else {
                             out.write_str("- ")?;
+                            if let Some(anchor) = cursor.anchor() {
+                                out.write_char('&')?;
+                                out.write_str(anchor)?;
+                                out.write_char(' ')?;
+                            }
                             cursor.stream_yaml_value(
                                 out,
                                 current_indent + indent_spaces,
@@ -1480,18 +1526,12 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                     Ok(())
                 }
             }
-            YamlValue::Alias { target, .. } => {
-                if let Some(target_cursor) = target {
-                    target_cursor.stream_yaml_value(
-                        out,
-                        current_indent,
-                        indent_spaces,
-                        unit,
-                        sort_keys,
-                    )
-                } else {
-                    out.write_str("null")
-                }
+            YamlValue::Alias { anchor_name, .. } => {
+                // Preserve the alias literally rather than resolving to the
+                // target's value — an unmodified/re-serialized document must
+                // keep `*name` verbatim, matching real yq (issue #712).
+                out.write_char('*')?;
+                out.write_str(anchor_name)
             }
             YamlValue::Error(_) => out.write_str("null"),
         }
@@ -5359,12 +5399,19 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentElements for YamlElements<'a, W> {
 // ============================================================================
 
 /// Check if a cursor points to a non-empty container.
+///
+/// Uses `is_container()` + `first_child()` directly rather than `cursor.value()`:
+/// for a mapping, `value()` builds the merge-resolved field list via
+/// `resolve_merge_keys` (a `Vec`/`BTreeMap` walk decoding every field), just to
+/// answer a question `first_child()` alone already answers. Emptiness is
+/// still checked against the raw (merge-unaware) field walk, not
+/// `resolve_merge_keys`'s merged view: `stream_yaml_value` writes mappings
+/// from the raw walk (#712), so a mapping whose only field is an
+/// unresolvable `<<` must still be treated as non-empty here, or it would
+/// wrongly take the empty-mapping `"{}"` shortcut instead of rendering its
+/// literal `<<` field.
 fn is_yaml_cursor_container<W: AsRef<[u64]>>(cursor: &YamlCursor<'_, W>) -> bool {
-    match cursor.value() {
-        YamlValue::Mapping(fields) => !fields.is_empty(),
-        YamlValue::Sequence(elements) => !elements.is_empty(),
-        _ => false,
-    }
+    cursor.is_container() && cursor.first_child().is_some()
 }
 
 /// Write `width` copies of `unit` as indentation (`unit` is `' '` for
@@ -5378,6 +5425,49 @@ fn write_yaml_indent<Out: core::fmt::Write>(
         out.write_char(unit)?;
     }
     Ok(())
+}
+
+/// Write a mapping field's key.
+///
+/// An explicit source tag (`!!str`, `!custom`, …) is preserved verbatim,
+/// matching real `yq` (#224). Otherwise, a literal (unquoted) `<<` merge
+/// key is tagged with `!!merge `, again matching real yq (a quoted `"<<"`
+/// is an ordinary string key and gets no tag — verified against yq
+/// v4.53.3).
+fn write_yaml_field_key<W: AsRef<[u64]>, Out: core::fmt::Write>(
+    out: &mut Out,
+    field: YamlField<'_, W>,
+) -> core::fmt::Result {
+    let key = field.key();
+    if let YamlValue::String(s) = &key {
+        if let Some(tag) = field.key_cursor().explicit_tag() {
+            out.write_str(tag)?;
+            out.write_char(' ')?;
+        } else if matches!(s, YamlString::Unquoted { .. })
+            && matches!(s.as_str(), Ok(v) if v == "<<")
+        {
+            out.write_str("!!merge ")?;
+        }
+        stream_yaml_string_value(out, s)
+    } else {
+        stream_yaml_nonstring_key(out, &key)
+    }
+}
+
+/// Write a child value that is always inline (flow-style mapping/sequence
+/// entries), prefixing its anchor if it has one.
+fn write_yaml_child_inline<W: AsRef<[u64]>, Out: core::fmt::Write>(
+    out: &mut Out,
+    value: YamlCursor<'_, W>,
+    unit: char,
+    sort_keys: bool,
+) -> core::fmt::Result {
+    if let Some(anchor) = value.anchor() {
+        out.write_char('&')?;
+        out.write_str(anchor)?;
+        out.write_char(' ')?;
+    }
+    value.stream_yaml_value(out, 0, 0, unit, sort_keys)
 }
 
 /// Stream independent document cursors as a single YAML sequence (block or
@@ -5419,7 +5509,7 @@ where
                 out.write_str(", ")?;
             }
             first = false;
-            cursor.stream_yaml_value(out, 0, 0, unit, sort_keys)?;
+            write_yaml_child_inline(out, cursor, unit, sort_keys)?;
         }
         out.write_char(']')
     } else {
@@ -5433,6 +5523,11 @@ where
             first = false;
             if is_yaml_cursor_container(&cursor) {
                 out.write_char('-')?;
+                if let Some(anchor) = cursor.anchor() {
+                    out.write_char(' ')?;
+                    out.write_char('&')?;
+                    out.write_str(anchor)?;
+                }
                 out.write_char('\n')?;
                 write_yaml_indent(out, current_indent + indent_spaces, unit)?;
                 cursor.stream_yaml_value(
@@ -5444,6 +5539,11 @@ where
                 )?;
             } else {
                 out.write_str("- ")?;
+                if let Some(anchor) = cursor.anchor() {
+                    out.write_char('&')?;
+                    out.write_str(anchor)?;
+                    out.write_char(' ')?;
+                }
                 cursor.stream_yaml_value(
                     out,
                     current_indent + indent_spaces,
@@ -6525,9 +6625,11 @@ mod tests {
     fn test_stream_yaml_alias_streams_as_yaml() {
         // `test_alias_resolves_wherever_the_anchor_is_in_scope` (below)
         // exercises `stream_json_value`'s `Alias` arm exclusively (its
-        // cases assert JSON output); this covers the same resolution
-        // through `stream_yaml_value`'s own `Alias` arm, reached only via
-        // YAML-formatted output.
+        // cases assert JSON output, which has no alias syntax and so must
+        // resolve); this covers the same input through `stream_yaml_value`'s
+        // own `Alias` arm, reached via YAML-formatted output, which instead
+        // preserves the alias literally rather than resolving it, matching
+        // real yq (issue #712).
         let yaml = b"a: &x 1\nb: *x\n";
         let index = YamlIndex::build(yaml).unwrap();
         let mut out = String::new();
@@ -6535,7 +6637,7 @@ mod tests {
             .root(yaml)
             .stream_yaml_document(&mut out, IndentSpec::spaces(2), false)
             .unwrap();
-        assert_eq!(out, "a: 1\nb: 1");
+        assert_eq!(out, "a: &x 1\nb: *x");
     }
 
     #[test]
@@ -10412,6 +10514,124 @@ mod tests {
         assert_eq!(item.len(), 2);
         assert!(!item.is_empty());
     }
+
+    // ========================================================================
+    // YAML output preserves merge keys, anchors, and aliases verbatim on an
+    // untouched mapping — issue #712. Expected strings captured directly
+    // from mikefarah/yq v4.53.3 (same oracle as the merge-key tests above),
+    // including the `!!merge` tag real yq emits that the issue text itself
+    // omitted.
+    // ========================================================================
+
+    #[test]
+    fn test_stream_yaml_merge_key_preserved_not_expanded_712() {
+        let yaml = b"default: &d\n  a: 1\nitem:\n  <<: *d\n  b: 2\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let mut out = String::new();
+        index
+            .root(yaml)
+            .stream_yaml_document(&mut out, IndentSpec::spaces(2), false)
+            .unwrap();
+        assert_eq!(out, "default: &d\n  a: 1\nitem:\n  !!merge <<: *d\n  b: 2");
+    }
+
+    #[test]
+    fn test_stream_yaml_merge_key_preserved_flow_style_712() {
+        // Forcing flow output (indent_spaces = 0) must still tag and preserve
+        // the merge key, not just the default block-style path.
+        let yaml = b"default: &d\n  a: 1\nitem:\n  <<: *d\n  b: 2\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let mut out = String::new();
+        index
+            .root(yaml)
+            .stream_yaml_document(&mut out, IndentSpec::COMPACT, false)
+            .unwrap();
+        assert_eq!(out, "{default: &d {a: 1}, item: {!!merge <<: *d, b: 2}}");
+    }
+
+    #[test]
+    fn test_stream_yaml_scalar_anchor_alias_round_trip_712() {
+        let yaml = b"a: &x 1\nb: *x\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let mut out = String::new();
+        index
+            .root(yaml)
+            .stream_yaml_document(&mut out, IndentSpec::spaces(2), false)
+            .unwrap();
+        assert_eq!(out, "a: &x 1\nb: *x");
+    }
+
+    #[test]
+    fn test_stream_yaml_anchored_sequence_item_round_trip_712() {
+        let yaml = b"items:\n  - &x\n    a: 1\n  - *x\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let mut out = String::new();
+        index
+            .root(yaml)
+            .stream_yaml_document(&mut out, IndentSpec::spaces(2), false)
+            .unwrap();
+        assert_eq!(out, "items:\n  - &x\n    a: 1\n  - *x");
+    }
+
+    #[test]
+    fn test_stream_yaml_quoted_merge_key_not_tagged_712() {
+        // A quoted "<<" is an ordinary string key (not merge syntax) even
+        // though `resolve_merge_keys`'s field-lookup path still merges it
+        // (`test_merge_key_quoted_still_merges` above) — output tagging and
+        // field-resolution are governed by different, deliberately
+        // divergent rules (matches real yq's own inconsistency here).
+        let yaml = b"item:\n  \"<<\": 5\n  b: 2\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let mut out = String::new();
+        index
+            .root(yaml)
+            .stream_yaml_document(&mut out, IndentSpec::spaces(2), false)
+            .unwrap();
+        assert_eq!(out, "item:\n  \"<<\": 5\n  b: 2");
+    }
+
+    #[test]
+    fn test_stream_yaml_merge_key_field_access_unaffected_712() {
+        // Output preservation must not change what `find` resolves through
+        // a merge — only whole-mapping re-serialization changed.
+        let yaml = b"default: &d\n  a: 1\nitem:\n  <<: *d\n  b: 2\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let YamlValue::Mapping(root) = first_doc(index.root(yaml)) else {
+            panic!("root document must be a mapping");
+        };
+        let Some(YamlValue::Mapping(item)) = root.find("item") else {
+            panic!("item must be a mapping");
+        };
+        let Some(a_value) = item.find("a") else {
+            panic!("field access through the merge must still resolve");
+        };
+        assert_eq!(write_yaml_value_as_json_string(a_value), "1");
+    }
+
+    #[test]
+    fn test_stream_yaml_sequence_preserves_anchor_alias_712() {
+        // `stream_yaml_sequence` (--slurp path) must mirror `stream_yaml_value`'s
+        // Sequence-arm anchor handling, per its own doc comment's parity claim.
+        // Each slurped document is independently indexed/validated (an alias
+        // can't cross documents), so each carries its own self-contained
+        // anchor/alias pair.
+        let bytes_a = b"a: &x 1\nc: *x\n".to_vec();
+        let index_a = YamlIndex::build(&bytes_a).unwrap();
+        let bytes_b = b"b: &y 2\nd: *y\n".to_vec();
+        let index_b = YamlIndex::build(&bytes_b).unwrap();
+
+        let cursor_a = index_a.root(&bytes_a).first_child().unwrap();
+        let cursor_b = index_b.root(&bytes_b).first_child().unwrap();
+
+        let mut out = String::new();
+        stream_yaml_sequence([cursor_a, cursor_b], &mut out, 0, 2, ' ', false).unwrap();
+        // `stream_yaml_sequence`'s block branch always puts a mapping item on
+        // its own line (unlike `stream_yaml_value`'s Sequence arm, it doesn't
+        // gate on `.style() != "flow"` — pre-existing, unrelated to #712);
+        // the anchor/alias preservation itself is what's under test here.
+        assert_eq!(out, "-\n  a: &x 1\n  c: *x\n-\n  b: &y 2\n  d: *y");
+    }
+
     // =========================================================================
     // Inline block sequence as a mapping value (#325)
     // =========================================================================
