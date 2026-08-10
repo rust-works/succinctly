@@ -912,6 +912,16 @@ mod tests {
     }
 
     #[test]
+    fn test_line_comment_field_not_found_returns_none() {
+        // Every other case above queries a key that's actually present, so
+        // `field_line_comment_raw`'s loop always returns from inside the
+        // `for` — this is the only test that lets it run out of fields and
+        // fall through to the `None` after the loop.
+        let yaml = b"a: 1 # keep this\n";
+        assert_eq!(field_line_comment_raw(yaml, "nonexistent"), None);
+    }
+
+    #[test]
     fn test_line_comment_on_sequence_items() {
         let yaml = b"a:\n  - 1 # first\n  - 2 # second\n";
         let index = YamlIndex::build(yaml).expect("valid YAML");
