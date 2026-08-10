@@ -1917,6 +1917,92 @@ fn test_yaml_empty_mapping_anchor_preserved_on_whole_document_root_712() -> Resu
 }
 
 // =============================================================================
+// Alias-sync survives a pass-through stage mixed into the pipe (#764) - the
+// #711 gate originally required *every* pipe stage to be assignment-family,
+// so `.a = 99 | select(true)` fell outside it and `.b` went stale again. `.`,
+// `select(...)`, `debug`, and `empty` never rewrite or reshape the document
+// they pass through, so mixing one into an assignment pipe is now allowed.
+// =============================================================================
+
+#[test]
+fn test_yaml_assign_then_select_true_through_anchor_updates_alias() -> Result<()> {
+    // The issue's own repro.
+    let input = "a: &x 1\nb: *x\n";
+    let (output, exit_code) = run_yq_stdin(".a = 99 | select(true)", input, &["-o=json", "-I=0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), r#"{"a":99,"b":99}"#);
+    Ok(())
+}
+
+#[test]
+fn test_yaml_assign_then_select_false_produces_no_output() -> Result<()> {
+    // `select(false)` drops the document entirely -- there's nothing to
+    // sync, and nothing should be printed.
+    let input = "a: &x 1\nb: *x\n";
+    let (output, exit_code) = run_yq_stdin(".a = 99 | select(false)", input, &["-o=json", "-I=0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), "");
+    Ok(())
+}
+
+#[test]
+fn test_yaml_select_guard_then_assign_through_anchor_updates_alias() -> Result<()> {
+    // The guard-style idiom named in #764: a leading `select` filters, then
+    // the assignment writes.
+    let input = "a: &x 1\nb: *x\n";
+    let (output, exit_code) = run_yq_stdin("select(.a > 0) | .a = 5", input, &["-o=json", "-I=0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), r#"{"a":5,"b":5}"#);
+    Ok(())
+}
+
+#[test]
+fn test_yaml_assign_then_debug_through_anchor_updates_alias() -> Result<()> {
+    // `debug` passes its input through unchanged (aside from the stderr
+    // side effect), so it must not block the sync either.
+    let input = "a: &x 1\nb: *x\n";
+    let (output, exit_code) = run_yq_stdin(".a = 99 | debug", input, &["-o=json", "-I=0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), r#"{"a":99,"b":99}"#);
+    Ok(())
+}
+
+#[test]
+fn test_yaml_assign_then_empty_produces_no_output() -> Result<()> {
+    // `empty` drops the document -- same as `select(false)`, nothing to
+    // sync and nothing to print.
+    let input = "a: &x 1\nb: *x\n";
+    let (output, exit_code) = run_yq_stdin(".a = 99 | empty", input, &["-o=json", "-I=0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), "");
+    Ok(())
+}
+
+#[test]
+fn test_yaml_assign_then_map_through_anchor_still_excluded() -> Result<()> {
+    // Regression guard: `map` is not on the pass-through allow-list (it can
+    // reshape the document), so a pipe mixing it with an assignment must
+    // stay excluded from alias-sync, exactly as before #764.
+    let input = "a: &x 1\nb: *x\n";
+    let (output, exit_code) = run_yq_stdin(".a = 99 | map(.)", input, &["-o=json", "-I=0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), r"[99,1]");
+    Ok(())
+}
+
+#[test]
+fn test_yaml_bare_select_without_assign_is_unaffected() -> Result<()> {
+    // Regression guard: a pass-through stage with *no* assignment anywhere
+    // in the pipe must not trigger alias-sync snapshotting at all -- there's
+    // nothing to diff, so the plain read behavior from before #764 holds.
+    let input = "a: &x 1\nb: *x\n";
+    let (output, exit_code) = run_yq_stdin("select(true)", input, &["-o=json", "-I=0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), r#"{"a":1,"b":1}"#);
+    Ok(())
+}
+
+// =============================================================================
 // Anchored sequence items (#328) - an anchor on `- ` binds to the item's value
 // whatever its kind. Expectations are mikefarah/yq v4.53.3 output.
 // =============================================================================
