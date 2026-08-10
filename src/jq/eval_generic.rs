@@ -85,10 +85,16 @@ pub fn to_owned<V: DocumentValue>(value: &V) -> OwnedValue {
 /// `OwnedValue` itself carries no metadata — extending its enum would ripple
 /// through every match site in both the JSON and YAML evaluators for a
 /// feature only the YAML write path needs. This tree is a separate,
-/// additive structure consulted only by the DOM/owned YAML writers
-/// (`emit_yaml_value` in `yq_runner.rs`, `stream_owned_value_yaml` in
-/// `stream.rs`), and only at the two call sites that still have a live
-/// cursor when they materialize (`yq_runner.rs`'s `evaluate_yaml_cursor`).
+/// additive structure consulted only by `emit_yaml_value` in
+/// `yq_runner.rs`, the DOM writer used once a query's `GenericResult` has
+/// been materialized to `OwnedValue` (`yq_runner.rs`'s
+/// `evaluate_yaml_cursor`, the only place that calls
+/// `to_owned_with_comments`). It is a distinct mechanism from
+/// `YamlCursor::stream_yaml_value`/`stream_yaml_as_document` in
+/// `light.rs`, which stream comments straight from a *live cursor* via
+/// `write_line_comment` and never go through `CommentTree` at all —
+/// `stream_owned_value_yaml` in `stream.rs` streams plain `OwnedValue`
+/// (no cursor, no comment data) and isn't part of either mechanism.
 /// A query that reshapes the tree (`map`, `del`, array construction, ...)
 /// simply has no `to_owned_with_comments` call in its chain, so comments are
 /// dropped there exactly as they are today — not a new regression, and out
