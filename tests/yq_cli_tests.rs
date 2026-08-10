@@ -4414,3 +4414,69 @@ fn test_keys_unsorted_yaml_merge_key_lazy_685() -> Result<()> {
 
     Ok(())
 }
+
+// ============================================================================
+// anchor/style builtins (#709) - previously hardcoded to always return ""
+// ============================================================================
+
+#[test]
+fn test_anchor_builtin_returns_real_anchor_name() -> Result<()> {
+    let input = "a: &x 1\nb: *x\n";
+    let (output, code) = run_yq_stdin(".a | anchor", input, &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "x");
+
+    Ok(())
+}
+
+#[test]
+fn test_anchor_builtin_empty_when_no_anchor() -> Result<()> {
+    let input = "a: 1\n";
+    let (output, code) = run_yq_stdin(".a | anchor", input, &["-o=json"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "\"\"");
+
+    Ok(())
+}
+
+#[test]
+fn test_style_builtin_flow_collection() -> Result<()> {
+    let input = "a: [1, 2, 3]\n";
+    let (output, code) = run_yq_stdin(".a | style", input, &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "flow");
+
+    Ok(())
+}
+
+#[test]
+fn test_style_builtin_scalar_quote_styles() -> Result<()> {
+    let cases = [
+        ("a: \"hi\"\n", "\"double\""),
+        ("a: 'hi'\n", "\"single\""),
+        ("a: |\n  hi\n", "\"literal\""),
+        ("a: >\n  hi\n", "\"folded\""),
+        ("a: hi\n", "\"\""),
+        ("a: {b: 1}\n", "\"flow\""),
+    ];
+
+    for (input, expected) in cases {
+        let (output, code) = run_yq_stdin(".a | style", input, &["-o=json"])?;
+        assert_eq!(code, 0, "input: {input:?}");
+        assert_eq!(output.trim(), expected, "input: {input:?}");
+    }
+
+    Ok(())
+}
+
+/// An anchored scalar's `style` must still reflect its own style, not the
+/// anchor indicator preceding it in the source text.
+#[test]
+fn test_style_builtin_anchor_prefix_does_not_mask_style() -> Result<()> {
+    let input = "a: &x \"hi\"\n";
+    let (output, code) = run_yq_stdin(".a | style", input, &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "double");
+
+    Ok(())
+}
