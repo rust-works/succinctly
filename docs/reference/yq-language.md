@@ -137,7 +137,7 @@ succinctly yq --eval-all 'reduce .[] as $item ({}; . * $item)' f1.yaml f2.yaml f
 succinctly yq --eval-all '(.[] | select(file_index == 0)) * (.[] | select(file_index == 1))' f1.yaml f2.yaml
 ```
 
-**Deviation from real yq**: real yq's `eval-all` treats the combined documents as an implicit node list that most operators broadcast over, so `select(fileIndex == 0) * select(fileIndex == 1)` works with no `.[]`. succinctly's evaluator has one scalar value per evaluation instead, so `.[]` must be explicit — `.[] | select(file_index == 0)`, not the bare `select(fileIndex == 0)`. `file_index`/`key`/`document_index` resolve correctly through `.`/`.[]`/`.field` navigation, comparisons, and `select(...)`, matching what `document_index` already supports — but not inside `map(...)`, `if/then/else`, array/object literals, `any`/`all`, or user-defined functions, where they fall back to `0` (see [Known Limitations](#known-limitations)). `--eval-all` is incompatible with `--slurp`, `--inplace`, `--raw-input`, `--split-exp`, and `--front-matter`.
+**Deviation from real yq**: real yq's `eval-all` treats the combined documents as an implicit node list that most operators broadcast over, so `select(fileIndex == 0) * select(fileIndex == 1)` works with no `.[]`. succinctly's evaluator has one scalar value per evaluation instead, so `.[]` must be explicit — `.[] | select(file_index == 0)`, not the bare `select(fileIndex == 0)`. `file_index`/`key`/`document_index` resolve correctly through `.`/`.[]`/`.field` navigation, comparisons, `select(...)`, `map(...)`, `if/then/else`, `try/catch`, comma, and `label`, matching what `document_index` already supports — but not inside array/object literals, `any`/`all`, or user-defined functions, where they fall back to `0` (see [Known Limitations](#known-limitations)). `--eval-all` is incompatible with `--slurp`, `--inplace`, `--raw-input`, `--split-exp`, and `--front-matter`.
 
 ### yq-Specific Operators
 
@@ -416,7 +416,7 @@ See [yq Remaining Work](../plan/yq-remaining.md) for incomplete features.
 
 1. **`line`/`column` in complex expressions** - Work best with direct cursor access; may return 0 after DOM conversion
 2. **Anchor metadata** - Available at cursor level; may be lost after complex jq operations
-3. **`file_index`/`key`/`document_index` in complex expressions** - Resolve through `.`/`.[]`/`.field` navigation, comparisons, and `select(...)`; return `0` inside `map(...)`, `if/then/else`, array/object literals, `any`/`all`, or user-defined functions
+3. **`file_index`/`key`/`document_index` in complex expressions** - Resolve through `.`/`.[]`/`.field` navigation, comparisons, `select(...)`, `map(...)`, `if/then/else`, `try/catch`, comma, and `label`; return `0` inside array/object literals, `any`/`all`, or user-defined functions
 4. **`*`/`+` are not cartesian generators** - `(a, b) * (c, d)` takes only the first value of each side, unlike real jq/yq's cartesian-product combination; this bounds the `--eval-all` two-file merge idiom (`select(file_index == 0) * select(file_index == 1)`) to inputs where each file contributes exactly one matching document
 
 ---

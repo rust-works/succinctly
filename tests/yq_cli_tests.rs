@@ -6364,6 +6364,41 @@ fn test_eval_all_file_index_survives_label_wrapper() -> Result<()> {
     Ok(())
 }
 
+/// Regression test: same gap as `test_eval_all_file_index_in_if_then_else`,
+/// for `map(...)` -- `file_index` silently stubbed to 0 for every element
+/// instead of resolving, so `map(select(file_index == 0))` returned every
+/// document from every file instead of filtering to file 0's (#715
+/// follow-up).
+#[test]
+fn test_eval_all_file_index_in_map() -> Result<()> {
+    let (f1, f2) = two_doc_fixtures()?;
+    let (stdout, _stderr, code) = run_yq_files(
+        "map(select(file_index == 0))",
+        &[f1.path(), f2.path()],
+        &["--eval-all"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "-\n  a: 1\n  name: first\n");
+    Ok(())
+}
+
+/// `map(f)` is `[.[] | f]`, so it must stay atomic on error like real array
+/// construction (`[1,error("x"),3]` produces no output at all) rather than
+/// leaking an in-progress array (#715 follow-up).
+#[test]
+fn test_eval_all_file_index_in_map_is_atomic_on_error() -> Result<()> {
+    let (f1, f2) = two_doc_fixtures()?;
+    let (stdout, stderr, code) = run_yq_files(
+        r#"map(if file_index == 0 then error("boom") else . end)"#,
+        &[f1.path(), f2.path()],
+        &["--eval-all"],
+    )?;
+    assert_eq!(stdout, "");
+    assert!(stderr.contains("boom"), "expected the error, got: {stderr}");
+    assert_eq!(code, 1);
+    Ok(())
+}
+
 #[test]
 fn test_eval_all_file_index_outside_eval_all_is_zero() -> Result<()> {
     let (f1, _f2) = two_doc_fixtures()?;

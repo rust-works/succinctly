@@ -387,6 +387,11 @@ pub(crate) fn needs_path_context(expr: &Expr) -> bool {
             needs_path_context(left) || needs_path_context(right)
         }
         Expr::Builtin(Builtin::Select(cond)) => needs_path_context(cond),
+        // `map(f)` needs the same recursion as `Select` above -- e.g.
+        // `map(select(file_index == 0))`, previously silently stubbed to 0
+        // for every element instead of resolving or erroring (#715
+        // follow-up).
+        Expr::Builtin(Builtin::Map(f)) => needs_path_context(f),
         Expr::Pipe(exprs) => exprs.iter().any(needs_path_context),
         Expr::Paren(inner) => needs_path_context(inner),
         Expr::Optional(inner) => needs_path_context(inner),
@@ -7574,9 +7579,10 @@ pub fn eval_lenient<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// table mapping each top-level array position to its originating file
 /// index, built by the yq CLI driver -- wherever
 /// `eval_pipe_with_path_context_internal` can reach it: plain
-/// `.`/`.[]`/`.field` navigation, comparisons, and `select(...)` (the same
-/// capability level `key`/`document_index` already have; `map`/`if`/
-/// literals/user functions are documented out of scope, matching those
+/// `.`/`.[]`/`.field` navigation, comparisons, `select(...)`, `map(...)`,
+/// `if`/`then`/`else`, `try`/`catch`, comma, and `label` (the same
+/// capability level `key`/`document_index` already have; array/object
+/// literals and user-defined functions remain out of scope, matching those
 /// builtins' own existing limits).
 ///
 /// Routes through the ordinary evaluator, untouched, whenever `expr`
@@ -12333,6 +12339,65 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
             // mis-deriving, #715 follow-up) the same fan-out loop here.
             continue_rest_with_context::<W, S>(
                 select_result,
+                rest,
+                root,
+                file_origin,
+                current_path,
+                optional,
+            )
+        }
+        Expr::Builtin(Builtin::Map(f)) => {
+            // Evaluate `map(f)` through the path-context evaluator too, so
+            // `file_index`/`key`/`document_index` inside `f` resolve
+            // correctly per-element instead of falling back to the 0/null
+            // stub (#715 follow-up) -- `map(f)` is `[.[] | f]`, mirroring
+            // `builtin_map`'s element-source handling (object values too,
+            // #422) and `eval_array_construction`'s atomicity (a mid-way
+            // error/break discards the in-progress array rather than
+            // surfacing a partial one, verified: `[1,error("x"),3]`
+            // produces no output at all).
+            let elements: Vec<(OwnedValue, OwnedValue)> = match value {
+                OwnedValue::Array(arr) => arr
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| (OwnedValue::Int(i as i64), v.clone()))
+                    .collect(),
+                OwnedValue::Object(entries) => entries
+                    .iter()
+                    .map(|(k, v)| (OwnedValue::String(k.clone()), v.clone()))
+                    .collect(),
+                _ if optional => return QueryResult::None,
+                _ => return QueryResult::Error(EvalError::cannot_iterate(value)),
+            };
+            let mut results = Vec::new();
+            let mut stopped = None;
+            for (key, elem) in elements {
+                let mut new_path = current_path.to_vec();
+                new_path.push(key);
+                let step = eval_pipe_with_path_context_internal::<W, S>(
+                    core::slice::from_ref(f),
+                    &elem,
+                    root,
+                    file_origin,
+                    &new_path,
+                    optional,
+                );
+                if let Some(stop) = accumulate_path_context_step(&mut results, step) {
+                    stopped = Some(stop);
+                    break;
+                }
+            }
+            let map_result = match stopped {
+                Some(QueryResult::Partial(_, Control::Error(e))) => QueryResult::Error(e),
+                Some(QueryResult::Partial(_, Control::Break(label))) => QueryResult::Break(label),
+                Some(other) => other,
+                None => QueryResult::Owned(OwnedValue::Array(results)),
+            };
+            if rest.is_empty() {
+                return map_result;
+            }
+            continue_rest_with_context::<W, S>(
+                map_result,
                 rest,
                 root,
                 file_origin,
