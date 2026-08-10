@@ -5580,3 +5580,63 @@ fn test_key_comment_not_captured_for_same_line_value_765() -> Result<()> {
     assert_eq!(out, "a: 1 # keep this\nb: 2\n");
     Ok(())
 }
+
+// A key's deferred value can also resolve to nothing at all - the "next
+// line" turns out to be a sibling key (at the same or a lower indent) or
+// EOF, rather than the nested mapping/sequence the cases above cover. Real
+// yq keeps the key's comment with no value token in every one of these
+// shapes too; succinctly's first #765 pass only wired up the non-empty
+// container case, silently dropping the comment here just like before the
+// fix (verified byte-for-byte against the pinned real `yq` binary, same as
+// every other block in this file).
+
+/// A sibling key immediately follows at the same indent - `a`'s deferred
+/// value is null.
+#[test]
+fn test_key_comment_preserved_with_null_value_sibling_same_indent_765() -> Result<()> {
+    let (out, code) = run_yq_stdin(".", "a: # comment on key\nb: 2\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "a: # comment on key\nb: 2\n");
+    Ok(())
+}
+
+/// Same shape, but nested: the sibling that ends `a`'s deferred value sits
+/// at a lower indent than `a` itself.
+#[test]
+fn test_key_comment_preserved_with_null_value_sibling_lower_indent_765() -> Result<()> {
+    let (out, code) = run_yq_stdin(".", "x:\n  a: # comment on key\ny: 2\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "x:\n  a: # comment on key\ny: 2\n");
+    Ok(())
+}
+
+/// The deferred key is the last thing in the document - EOF ends it,
+/// leaving a null value.
+#[test]
+fn test_key_comment_preserved_with_null_value_at_eof_765() -> Result<()> {
+    let (out, code) = run_yq_stdin(".", "a: # comment on key\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "a: # comment on key\n");
+    Ok(())
+}
+
+/// The DOM/`CommentTree` path (`select`, not bare identity's M2 streaming
+/// path) must also keep the comment for a null deferred value.
+#[test]
+fn test_key_comment_preserved_with_null_value_via_select_dom_path_765() -> Result<()> {
+    let (out, code) = run_yq_stdin("select(true)", "a: # comment on key\nb: 2\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "a: # comment on key\nb: 2\n");
+    Ok(())
+}
+
+/// `-S`/`--sort-keys` must resolve a null-valued key's comment by field
+/// name too, same as `test_key_comment_preserved_with_sort_keys_765` above
+/// for the non-empty-container case.
+#[test]
+fn test_key_comment_preserved_with_null_value_and_sort_keys_765() -> Result<()> {
+    let (out, code) = run_yq_stdin(".", "z: 9\na: # comment on key\nb: 2\n", &["-S"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "a: # comment on key\nb: 2\nz: 9\n");
+    Ok(())
+}
