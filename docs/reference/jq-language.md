@@ -128,6 +128,7 @@ The implementation covers ~95% of jq functionality and is production-ready.
 - [x] `@csv` / `@tsv` - Delimited formats
 - [x] `@dsv(delimiter)` - Custom delimiter; string fields always quoted (like `@csv`)
 - [x] `@base64` / `@base64d`
+- [x] `@base32` / `@base32d` - RFC 4648
 - [x] `@uri` / `@urid` - Percent encoding / decoding
 - [x] `@html` - HTML entity escaping
 - [x] `@sh` - Shell quoting

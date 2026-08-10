@@ -194,6 +194,8 @@ The jq implementation supports format functions for converting values to strings
 | **@urid**    | `@urid`             | URI percent decoding                              | `hello world`       |
 | **@base64**  | `@base64`           | Base64 encoding                                   | `aGVsbG8=`          |
 | **@base64d** | `@base64d`          | Base64 decoding                                   | `hello`             |
+| **@base32**  | `@base32`           | Base32 encoding (RFC 4648)                        | `NBSWY3DP`          |
+| **@base32d** | `@base32d`          | Base32 decoding (RFC 4648)                        | `hello`             |
 | **@html**    | `@html`             | HTML entity escaping                              | `&lt;script&gt;`    |
 | **@sh**      | `@sh`               | Shell quoting                                     | `'hello world'`     |
 | **@yaml**    | `@yaml`             | YAML flow-style encoding (yq)                     | `{a: 1, b: 2}`      |

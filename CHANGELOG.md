@@ -62,6 +62,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **jq `@base32`/`@base32d` format functions** (#719): RFC 4648 base32
+  encoding/decoding, alongside the existing `@base64`/`@base64d`. Output
+  matches jq 1.6+ and the RFC's own test vectors (`"f"` → `"MY======"`,
+  `"foobar"` → `"MZXW6YTBOI======"`, etc.). Fixed a latent parser bug found
+  along the way: `parse_format_string`'s format-name scanner hardcoded `'6'`
+  and `'4'` as the only digits allowed in a format identifier (to admit
+  `base64`), so `@base32` truncated to `@base` before this fix — generalized
+  to `is_ascii_alphanumeric()`.
+
 - **jq `@csv`/`@tsv`/`@dsv`/`@sh` allocation overhead investigated: no
   measurable end-to-end effect** (#647, follow-up to #124's real win for
   `@uri`/`@html`): a byte-scanning rewrite of the four format functions was
