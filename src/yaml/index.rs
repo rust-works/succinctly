@@ -945,6 +945,78 @@ mod tests {
     }
 
     // ------------------------------------------------------------------------
+    // Key-scoped trailing line comment capture (#765)
+    // ------------------------------------------------------------------------
+
+    /// Helper: the twin of [`field_line_comment_raw`], reading the *key*
+    /// cursor's line comment instead of the value cursor's.
+    fn field_key_line_comment_raw(yaml: &[u8], key: &str) -> Option<String> {
+        use crate::yaml::light::YamlValue;
+
+        let index = YamlIndex::build(yaml).expect("valid YAML");
+        let root = index.root(yaml);
+        let YamlValue::Sequence(docs) = root.value() else {
+            panic!("root is always the virtual document sequence");
+        };
+        let (doc_cursor, _) = docs.uncons_cursor().expect("at least one document");
+        let YamlValue::Mapping(fields) = doc_cursor.value() else {
+            panic!("expected a mapping document");
+        };
+        for field in fields {
+            if let YamlValue::String(k) = field.key() {
+                if k.raw_bytes() == key.as_bytes() {
+                    return field
+                        .key_cursor()
+                        .line_comment_raw()
+                        .map(alloc::string::ToString::to_string);
+                }
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn test_key_line_comment_captured_when_value_deferred_to_nested_mapping_765() {
+        let yaml = b"a: # comment on key\n  b: 1\n";
+        assert_eq!(
+            field_key_line_comment_raw(yaml, "a").as_deref(),
+            Some("# comment on key")
+        );
+        // The value cursor (what `.a | line_comment` navigates to) must NOT
+        // see it - it's scoped to the key, matching real yq's getters.
+        assert_eq!(field_line_comment_raw(yaml, "a"), None);
+    }
+
+    #[test]
+    fn test_key_line_comment_captured_when_value_deferred_to_nested_sequence_765() {
+        let yaml = b"a: # comment on key\n  - 1\n  - 2\n";
+        assert_eq!(
+            field_key_line_comment_raw(yaml, "a").as_deref(),
+            Some("# comment on key")
+        );
+        assert_eq!(field_line_comment_raw(yaml, "a"), None);
+    }
+
+    #[test]
+    fn test_key_line_comment_none_when_absent_765() {
+        let yaml = b"a:\n  b: 1\n";
+        assert_eq!(field_key_line_comment_raw(yaml, "a"), None);
+    }
+
+    #[test]
+    fn test_key_line_comment_not_captured_for_same_line_value_765() {
+        // A comment trailing a same-line value belongs to the value (#710),
+        // not the key - the new #765 capture point is only reached when the
+        // value is deferred to a following line.
+        let yaml = b"a: 1 # keep this\nb: 2\n";
+        assert_eq!(field_key_line_comment_raw(yaml, "a"), None);
+        assert_eq!(
+            field_line_comment_raw(yaml, "a").as_deref(),
+            Some("# keep this")
+        );
+    }
+
+    // ------------------------------------------------------------------------
     // Anchor targeting (#328)
     // ------------------------------------------------------------------------
 
