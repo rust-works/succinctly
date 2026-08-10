@@ -757,7 +757,7 @@ fn output_value<W: Write>(
         // quirk, not a succinctly gap, so replicated here rather than
         // "fixed" into a new divergence.
         let root_comment_suffix = if matches!(value, OwnedValue::Array(_) | OwnedValue::Object(_)) {
-            comments.own().map_or_else(String::new, |c| format!(" {c}"))
+            trailing_comment_suffix(comments)
         } else {
             String::new()
         };
@@ -809,6 +809,13 @@ fn output_value<W: Write>(
     write_terminator(writer, config)?;
 
     Ok(())
+}
+
+/// Format a node's own trailing comment (issue #710) as `" # text"`, or
+/// `""` if it has none — the single point of change for the separator
+/// convention shared by every `emit_yaml_value` call site that appends one.
+fn trailing_comment_suffix(comments: &CommentTree) -> String {
+    comments.own().map_or_else(String::new, |c| format!(" {c}"))
 }
 
 /// Emit a YAML value as a string, appending each node's trailing same-line
@@ -873,9 +880,7 @@ fn emit_yaml_value(
                     .map(|(i, v)| {
                         let elem_comments = comments.at_index(i);
                         let item = emit_yaml_value(v, elem_comments, config, depth + 1, false);
-                        let comment_suffix = elem_comments
-                            .own()
-                            .map_or_else(String::new, |c| format!(" {c}"));
+                        let comment_suffix = trailing_comment_suffix(elem_comments);
                         // Check if it's a multi-line value (mapping or sequence)
                         if matches!(v, OwnedValue::Object(_) | OwnedValue::Array(_))
                             && !item.starts_with('[')
@@ -921,9 +926,7 @@ fn emit_yaml_value(
                     .map(|(k, v)| {
                         let key = yaml_quote_key(k);
                         let field_comments = comments.field(k);
-                        let comment_suffix = field_comments
-                            .own()
-                            .map_or_else(String::new, |c| format!(" {c}"));
+                        let comment_suffix = trailing_comment_suffix(field_comments);
                         // Check if value needs to be on next line
                         if matches!(v, OwnedValue::Object(m) if !m.is_empty())
                             || matches!(v, OwnedValue::Array(a) if !a.is_empty())
