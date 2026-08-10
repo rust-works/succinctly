@@ -5349,3 +5349,18 @@ fn test_json_output_unaffected_by_comment_tree_skip_710() -> Result<()> {
     assert_eq!(out, "{\n  \"a\": 1,\n  \"b\": 2\n}\n");
     Ok(())
 }
+
+/// A named variable (`--arg`) forces every document through
+/// `evaluate_yaml_cursor`'s DOM-ish fallback (`can_yaml_fast_path` requires
+/// `context.named.is_empty()`), same as a non-M2-streamable expression.
+/// `keys_unsorted` on a top-level array still resolves to
+/// `GenericResult::LazyIndexRange` there (#684) even though nothing forced
+/// materialization for its own sake - this pins that fallback arm produces
+/// the same `[0, 1, ..., len-1]` a plain `syq keys` would.
+#[test]
+fn test_keys_unsorted_lazy_index_range_via_dom_fallback_710() -> Result<()> {
+    let (out, code) = run_yq_stdin("keys_unsorted", "- a\n- b\n- c\n", &["--arg", "x", "y"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "- 0\n- 1\n- 2\n");
+    Ok(())
+}
