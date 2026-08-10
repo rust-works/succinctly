@@ -2462,6 +2462,55 @@ mod tests {
         );
     }
 
+    /// `in_flow: true` is never reached through any CLI-observable path
+    /// today (`output_value`'s only call site always starts at `false`, and
+    /// nothing downstream re-enters flow style) - `can_use_m2_streaming`'s
+    /// doc comment notes there's no `--flow`-style output flag yet. Call the
+    /// private helper directly, mirroring the NaN/Infinity test above, to
+    /// pin the flow-style Array/Object arms' comment threading (#710):
+    /// `comments.at_index`/`comments.field` must recurse correctly even
+    /// though flow style never appends a trailing comment of its own (see
+    /// `emit_yaml_value`'s own doc comment for why).
+    #[test]
+    fn test_emit_yaml_value_flow_style_threads_comments_without_appending_them() {
+        let config = OutputConfig {
+            output_format: OutputFormat::Yaml,
+            compact: true,
+            raw_output: false,
+            join_output: false,
+            nul_output: false,
+            ascii_output: false,
+            sort_keys: false,
+            no_doc: false,
+            indent_str: String::new(),
+            use_color: false,
+        };
+
+        let mut obj = IndexMap::new();
+        obj.insert("k".to_string(), OwnedValue::Int(1));
+        let value = OwnedValue::Array(vec![OwnedValue::Object(obj)]);
+
+        let mut obj_comments = IndexMap::new();
+        obj_comments.insert(
+            "k".to_string(),
+            CommentTree::Leaf(Some("# k trailing".to_string())),
+        );
+        let comments = CommentTree::Array(
+            None,
+            vec![CommentTree::Object(
+                Some("# obj trailing".to_string()),
+                obj_comments,
+            )],
+        );
+
+        // Flow style renders compactly and drops every trailing comment,
+        // whether on the nested object or its field - unlike block style.
+        assert_eq!(
+            emit_yaml_value(&value, &comments, &config, 0, true),
+            "[{k: 1}]"
+        );
+    }
+
     #[test]
     fn test_yaml_to_owned_value_bool() {
         let yaml = b"active: true";
