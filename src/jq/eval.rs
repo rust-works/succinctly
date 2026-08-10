@@ -23,6 +23,24 @@ use indexmap::IndexMap;
 
 use super::slice::{self, SliceBounds};
 
+/// Runtime tag identifying which concrete [`EvalSemantics`] impl produced a
+/// deferred closure.
+///
+/// Used by `eval_generic::Instruction` (#724): `Instruction` can't carry a
+/// generic `S` parameter without rippling one onto `GenericResult<V>` itself
+/// (see the design doc, `docs/plan/jq-lazy-map-select.md`), so this is how a
+/// `LazySeq`'s queued `map(f)` gets re-dispatched to the right concrete
+/// `eval_single::<S,_>` from contexts where `S` has already been erased
+/// (`GenericResult`'s inherent methods, none of which are generic over `S`).
+/// Exactly two variants because exactly two `EvalSemantics` impls exist
+/// (grep-verified) — a third impl must extend both this enum and every match
+/// on it in `eval_generic.rs`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvalTag {
+    Jq,
+    Yq,
+}
+
 /// Trait for evaluation semantics - determines behavior for edge cases.
 ///
 /// jq and yq (mikefarah/yq) have different behaviors for some operations.
@@ -37,6 +55,9 @@ pub trait EvalSemantics: Copy + Default {
     const NEGATIVE_INDEX_IN_HAS: bool;
     /// If true, `%` truncates float operands to integers (jq). If false, float modulo (yq).
     const MOD_TRUNCATES_FLOATS: bool;
+
+    /// See [`EvalTag`].
+    fn tag() -> EvalTag;
 }
 
 /// jq-compatible evaluation semantics (default).
@@ -52,6 +73,10 @@ impl EvalSemantics for JqSemantics {
     const DIV_BY_ZERO_IS_INFINITY: bool = false;
     const NEGATIVE_INDEX_IN_HAS: bool = false;
     const MOD_TRUNCATES_FLOATS: bool = true;
+
+    fn tag() -> EvalTag {
+        EvalTag::Jq
+    }
 }
 
 /// yq-compatible evaluation semantics.
@@ -67,6 +92,10 @@ impl EvalSemantics for YqSemantics {
     const DIV_BY_ZERO_IS_INFINITY: bool = true;
     const NEGATIVE_INDEX_IN_HAS: bool = true;
     const MOD_TRUNCATES_FLOATS: bool = false;
+
+    fn tag() -> EvalTag {
+        EvalTag::Yq
+    }
 }
 
 use crate::json::light::{JsonCursor, JsonElements, JsonFields, StandardJson};

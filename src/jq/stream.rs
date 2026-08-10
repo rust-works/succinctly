@@ -22,9 +22,12 @@
 
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
+use core::fmt::Write as _;
 
-use super::document::{DocumentFields, IndentSpec};
+use super::document::{DocumentCursor, DocumentFields, DocumentValue, IndentSpec};
+use super::error::Control;
 use super::escape::{write_json_body_jq, write_json_body_yq};
+use super::eval_generic::{LazyElem, LazySeq};
 use super::value::{format_number_jq_compat, NumberRepr, OwnedValue};
 use crate::yaml::format_float_with_fraction;
 
@@ -345,6 +348,64 @@ pub fn stream_lazy_keys_json<W: core::fmt::Write, F: DocumentFields>(
     out.write_char(']')
 }
 
+/// Stream a [`LazySeq`]'s (#724) composed `map` chain as a JSON array in one
+/// forward pass, without ever materializing an `OwnedValue` tree, rebuilding
+/// a `JsonIndex`, or re-entering the full evaluator.
+///
+/// Unlike `stream_lazy_keys_json` above, this genuinely can fail (`f` is
+/// arbitrary user code) — and `map(f)` is atomic in jq (see
+/// `eval_generic::materialize_atomic`'s own doc comment): a mid-stream error
+/// must not leave a truncated-but-valid `[...]` on `out`, since real jq never
+/// emits a partial array for a failed `map`. `core::fmt::Write` has no
+/// rewind, so this renders into a local buffer first and only transfers it to
+/// `out` once the whole array is confirmed good — still one forward pass over
+/// the document, still no tree, just not zero-buffer (that combination is
+/// impossible while staying atomicity-correct). On failure `out` is left
+/// completely untouched, mirroring `GenericResult::stream_json`'s existing
+/// `Error`/`Break` arms (nothing goes to `out`, the caller reports via
+/// `StreamStats::error`) rather than its `Partial` arm's "stream a prefix,
+/// then report" UX, which is for independent top-level `,`-outputs, not one
+/// array's atomic construction.
+pub fn stream_lazy_seq_json<V: DocumentValue>(
+    seq: LazySeq<V>,
+    out: &mut impl core::fmt::Write,
+    indent: IndentSpec,
+    sort_keys: bool,
+) -> Result<Result<(), Control>, core::fmt::Error> {
+    let mut buf = String::new();
+    let mut i = 0usize;
+    for item in seq {
+        match item {
+            Ok(elem) => {
+                if i > 0 {
+                    buf.write_char(',')?;
+                }
+                if indent.width > 0 {
+                    buf.write_char('\n')?;
+                    write_indent(&mut buf, indent.width, indent.unit)?;
+                }
+                match elem {
+                    LazyElem::Cursor(c) => c.stream_json(&mut buf, indent, sort_keys)?,
+                    LazyElem::Owned(o) => o.stream_json(&mut buf, indent, sort_keys)?,
+                }
+                i += 1;
+            }
+            Err(control) => return Ok(Err(control)), // `out` untouched
+        }
+    }
+    if i == 0 {
+        out.write_str("[]")?;
+    } else {
+        out.write_char('[')?;
+        out.write_str(&buf)?;
+        if indent.width > 0 {
+            out.write_char('\n')?;
+        }
+        out.write_char(']')?;
+    }
+    Ok(Ok(()))
+}
+
 // ============================================================================
 // YAML Streaming
 // ============================================================================
@@ -586,6 +647,62 @@ pub fn stream_lazy_keys_yaml<W: core::fmt::Write, F: DocumentFields>(
         }
         Ok(())
     }
+}
+
+/// The YAML counterpart of `stream_lazy_seq_json` above — same atomicity
+/// constraint (buffer locally, transfer to `out` only on full success), same
+/// flow/block split as `stream_lazy_keys_yaml`.
+pub fn stream_lazy_seq_yaml<V: DocumentValue>(
+    seq: LazySeq<V>,
+    out: &mut impl core::fmt::Write,
+    indent: IndentSpec,
+    sort_keys: bool,
+) -> Result<Result<(), Control>, core::fmt::Error> {
+    let mut buf = String::new();
+    let mut i = 0usize;
+    if indent.width == 0 {
+        for item in seq {
+            match item {
+                Ok(elem) => {
+                    if i > 0 {
+                        buf.write_str(", ")?;
+                    }
+                    match elem {
+                        LazyElem::Cursor(c) => c.stream_yaml(&mut buf, indent, sort_keys)?,
+                        LazyElem::Owned(o) => o.stream_yaml(&mut buf, indent, sort_keys)?,
+                    }
+                    i += 1;
+                }
+                Err(control) => return Ok(Err(control)),
+            }
+        }
+        if i == 0 {
+            out.write_str("[]")?;
+        } else {
+            out.write_char('[')?;
+            out.write_str(&buf)?;
+            out.write_char(']')?;
+        }
+    } else {
+        for item in seq {
+            match item {
+                Ok(elem) => {
+                    if i > 0 {
+                        buf.write_char('\n')?;
+                    }
+                    buf.write_str("- ")?;
+                    match elem {
+                        LazyElem::Cursor(c) => c.stream_yaml(&mut buf, indent, sort_keys)?,
+                        LazyElem::Owned(o) => o.stream_yaml(&mut buf, indent, sort_keys)?,
+                    }
+                    i += 1;
+                }
+                Err(control) => return Ok(Err(control)),
+            }
+        }
+        out.write_str(&buf)?;
+    }
+    Ok(Ok(()))
 }
 
 /// Check if a string needs quoting in YAML.

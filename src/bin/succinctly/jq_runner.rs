@@ -11,7 +11,9 @@ use std::path::{Path, PathBuf};
 
 use succinctly::dsv::{build_index as build_dsv_index, DsvConfig, DsvRows};
 use succinctly::jq::document::DocumentFields;
-use succinctly::jq::eval_generic::{eval_with_cursor, to_owned as generic_to_owned, GenericResult};
+use succinctly::jq::eval_generic::{
+    eval_with_cursor, materialize_atomic, to_owned as generic_to_owned, GenericResult, LazyElem,
+};
 use succinctly::jq::{self, format_number_jq_compat, Expr, JqValue, OwnedValue, Program};
 use succinctly::json::light::{JsonCursor, StandardJson};
 use succinctly::json::validate::{self, ValidationError};
@@ -1613,6 +1615,21 @@ fn evaluate_input(
         GenericResult::LazyIndexRange(len) => Ok(vec![OwnedValue::Array(
             (0..len).map(|i| OwnedValue::Int(i as i64)).collect(),
         )]),
+        // `keys_unsorted | map(f)` (#724) reaches this runner boundary as a
+        // not-yet-materialized `LazySeq` the same way `LazyKeys`/
+        // `LazyIndexRange` above do — one forward pass here, same
+        // sink-reporting shape as the `Error`/`Break` arms below.
+        GenericResult::LazySeq(seq) => match materialize_atomic(seq) {
+            Ok(o) => Ok(vec![o]),
+            Err(jq::Control::Error(e)) => {
+                sink.report(DiagStyle::Jq, &e, at);
+                Ok(vec![])
+            }
+            Err(jq::Control::Break(label)) => {
+                sink.report_break(DiagStyle::Jq, &label, at);
+                Ok(vec![])
+            }
+        },
         GenericResult::None => Ok(vec![]),
         GenericResult::Error(e) => {
             sink.report(DiagStyle::Jq, &e, at);
@@ -1700,6 +1717,30 @@ fn generic_result_to_jq_values<'a, W: Clone + AsRef<[u64]>>(
         // `keys_unsorted` (#684): `write_json`/`print_json` write the
         // `[0,1,...,len-1]` digits directly, no `Vec<OwnedValue::Int>`.
         GenericResult::LazyIndexRange(len) => vec![JqValue::LazyIndexRange(len)],
+        // `keys_unsorted | map(f)` (#724): one forward pass, wrapping each
+        // element as a lazy `JqValue::Cursor` where possible (matching
+        // `standard_json_to_jq_value`'s own "Phase 1 Lazy" shell-eager/
+        // leaf-lazy pattern below) — `JqValue::Array`'s existing
+        // `write_json` already streams each element without further
+        // change, so no new `JqValue` variant is needed for this.
+        GenericResult::LazySeq(seq) => {
+            let mut items = Vec::new();
+            for item in seq {
+                match item {
+                    Ok(LazyElem::Cursor(c)) => items.push(JqValue::Cursor(c)),
+                    Ok(LazyElem::Owned(o)) => items.push(JqValue::from_owned(o)),
+                    Err(jq::Control::Error(e)) => {
+                        sink.report(DiagStyle::Jq, &e, at);
+                        return vec![];
+                    }
+                    Err(jq::Control::Break(label)) => {
+                        sink.report_break(DiagStyle::Jq, &label, at);
+                        return vec![];
+                    }
+                }
+            }
+            vec![JqValue::Array(items)]
+        }
         GenericResult::None => vec![],
         GenericResult::Error(e) => {
             sink.report(DiagStyle::Jq, &e, at);

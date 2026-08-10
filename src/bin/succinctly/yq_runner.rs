@@ -11,7 +11,9 @@ use std::io::{BufWriter, IsTerminal, Read, Write};
 use std::path::Path;
 
 use succinctly::jq::document::{DocumentCursor, DocumentFields, IndentSpec};
-use succinctly::jq::eval_generic::{eval_with_cursor_using, to_owned, GenericResult};
+use succinctly::jq::eval_generic::{
+    eval_with_cursor_using, materialize_atomic, to_owned, GenericResult,
+};
 use succinctly::jq::{
     self, sync_aliased_paths, Builtin, Expr, OwnedValue, QueryResult, YqSemantics,
 };
@@ -562,6 +564,21 @@ fn evaluate_yaml_cursor<W: AsRef<[u64]> + Clone>(
         GenericResult::LazyIndexRange(len) => Ok(vec![OwnedValue::Array(
             (0..len).map(|i| OwnedValue::Int(i as i64)).collect(),
         )]),
+        // `keys_unsorted | map(f)` (#724) reaches this DOM-path boundary as
+        // a not-yet-materialized `LazySeq` the same way `LazyKeys`/
+        // `LazyIndexRange` above do — one forward pass here, same
+        // sink-reporting shape as the `Error`/`Break` arms below.
+        GenericResult::LazySeq(seq) => match materialize_atomic(seq) {
+            Ok(o) => Ok(vec![o]),
+            Err(jq::Control::Error(e)) => {
+                sink.report(DiagStyle::Yq, &e, &no_location());
+                Ok(vec![])
+            }
+            Err(jq::Control::Break(label)) => {
+                sink.report_break(DiagStyle::Yq, &label, &no_location());
+                Ok(vec![])
+            }
+        },
         GenericResult::None => Ok(vec![]),
         GenericResult::Error(e) => {
             sink.report(DiagStyle::Yq, &e, &no_location());
