@@ -6173,20 +6173,30 @@ fn ends_with_single_trailing_newline(input: &str) -> bool {
 /// the whole pattern — full per-branch flag-scope tracking is out of scope.
 /// This is a documented simplification, not a correctness bug: at worst it
 /// skips the trailing-newline fix for that one (rare) pattern.
+///
+/// `(?<name>...)` / `(?P<name>...)` named-capture groups are *not* flag
+/// groups — `P`/`<` are not flag letters, so `(?` followed by either can
+/// only start a named group — and must not be scanned for a literal `m`
+/// byte: a capture name like `time`/`name`/`amount`/`comment` would
+/// otherwise be misread as enabling multiline, silently disabling this
+/// whole fix for a pattern that never touched the `m` flag at all.
 #[cfg(feature = "regex")]
 fn pattern_may_enable_multiline(pattern: &str) -> bool {
     let bytes = pattern.as_bytes();
     let mut search_from = 0;
     while let Some(rel) = pattern[search_from..].find("(?") {
         let mut j = search_from + rel + 2;
-        while j < bytes.len() && bytes[j] != b')' && bytes[j] != b':' {
-            if bytes[j] == b'm' {
-                return true;
+        let is_named_group = matches!(bytes.get(j), Some(b'<' | b'P'));
+        if !is_named_group {
+            while j < bytes.len() && bytes[j] != b')' && bytes[j] != b':' {
+                if bytes[j] == b'm' {
+                    return true;
+                }
+                if bytes[j] == b'-' {
+                    break; // rest of this run only *disables* flags
+                }
+                j += 1;
             }
-            if bytes[j] == b'-' {
-                break; // rest of this run only *disables* flags
-            }
-            j += 1;
         }
         search_from += rel + 2;
     }
