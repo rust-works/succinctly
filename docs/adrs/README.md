@@ -24,25 +24,26 @@ by Michael Nygard.
 
 ## Inventory
 
-| ADR                     | Status      | Date       | Title                                                    |
-|-------------------------|-------------|------------|-----------------------------------------------------------|
-| [ADR-0000](adr-0000.md) | ✅ Accepted | 2026-07-12 | Use Architecture Decision Records                        |
-| [ADR-0001](adr-0001.md) | ✅ Accepted | 2026-07-12 | Semi-Indexing over DOM Parsing                           |
-| [ADR-0002](adr-0002.md) | ✅ Accepted | 2026-07-12 | Table-Driven PFSM as the Portable JSON Parser            |
-| [ADR-0003](adr-0003.md) | ✅ Accepted | 2026-07-12 | Oracle Parser for YAML                                   |
-| [ADR-0004](adr-0004.md) | ✅ Accepted | 2026-07-12 | Reject Software Prefetching for Large YAML Files (P2.6)  |
-| [ADR-0005](adr-0005.md) | ✅ Accepted | 2026-07-12 | Reject SIMD Threshold Tuning (P2.8)                      |
-| [ADR-0006](adr-0006.md) | ✅ Accepted | 2026-07-12 | Reject Branchless Character Classification (P3)          |
-| [ADR-0007](adr-0007.md) | ✅ Accepted | 2026-07-12 | Reject the Flow-Collection SIMD Fast Path (P5)           |
-| [ADR-0008](adr-0008.md) | ✅ Accepted | 2026-07-12 | Reject BMI2 Quote-Indexing for YAML (P6)                 |
-| [ADR-0009](adr-0009.md) | ✅ Accepted | 2026-07-12 | Reject a Parse-Time Newline Index (P7)                   |
-| [ADR-0010](adr-0010.md) | ✅ Accepted | 2026-07-12 | Reject AVX-512 SIMD Variants (P8)                        |
-| [ADR-0011](adr-0011.md) | ✅ Accepted | 2026-07-15 | Custom Succinct Structures over Existing Rust Crates     |
-| [ADR-0012](adr-0012.md) | ✅ Accepted | 2026-07-25 | Elias-Fano Line Index over a Dense Bitmap                |
-| [ADR-0013](adr-0013.md) | ✅ Accepted | 2026-07-25 | Reject the SIMD Chunk-Scanner JSON Validator (#130)      |
-| [ADR-0014](adr-0014.md) | ✅ Accepted | 2026-08-03 | Reject Consolidating This Crate's Rank Implementations   |
-| [ADR-0015](adr-0015.md) | ✅ Accepted | 2026-08-05 | Keep BitVec, RankDirectory, and SelectIndex As-Is        |
-| [ADR-0016](adr-0016.md) | ✅ Accepted | 2026-08-08 | Reject SIMD Escape Scanning for jq Format Functions      |
+| ADR                     | Status     | Date       | Title                                                         |
+|-------------------------|------------|------------|---------------------------------------------------------------|
+| [ADR-0000](adr-0000.md) | ✅ Accepted | 2026-07-12 | Use Architecture Decision Records                             |
+| [ADR-0001](adr-0001.md) | ✅ Accepted | 2026-07-12 | Semi-Indexing over DOM Parsing                                |
+| [ADR-0002](adr-0002.md) | ✅ Accepted | 2026-07-12 | Table-Driven PFSM as the Portable JSON Parser                 |
+| [ADR-0003](adr-0003.md) | ✅ Accepted | 2026-07-12 | Oracle Parser for YAML                                        |
+| [ADR-0004](adr-0004.md) | ✅ Accepted | 2026-07-12 | Reject Software Prefetching for Large YAML Files (P2.6)       |
+| [ADR-0005](adr-0005.md) | ✅ Accepted | 2026-07-12 | Reject SIMD Threshold Tuning (P2.8)                           |
+| [ADR-0006](adr-0006.md) | ✅ Accepted | 2026-07-12 | Reject Branchless Character Classification (P3)               |
+| [ADR-0007](adr-0007.md) | ✅ Accepted | 2026-07-12 | Reject the Flow-Collection SIMD Fast Path (P5)                |
+| [ADR-0008](adr-0008.md) | ✅ Accepted | 2026-07-12 | Reject BMI2 Quote-Indexing for YAML (P6)                      |
+| [ADR-0009](adr-0009.md) | ✅ Accepted | 2026-07-12 | Reject a Parse-Time Newline Index (P7)                        |
+| [ADR-0010](adr-0010.md) | ✅ Accepted | 2026-07-12 | Reject AVX-512 SIMD Variants (P8)                             |
+| [ADR-0011](adr-0011.md) | ✅ Accepted | 2026-07-15 | Custom Succinct Structures over Existing Rust Crates          |
+| [ADR-0012](adr-0012.md) | ✅ Accepted | 2026-07-25 | Elias-Fano Line Index over a Dense Bitmap                     |
+| [ADR-0013](adr-0013.md) | ✅ Accepted | 2026-07-25 | Reject the SIMD Chunk-Scanner JSON Validator (#130)           |
+| [ADR-0014](adr-0014.md) | ✅ Accepted | 2026-08-03 | Reject Consolidating This Crate's Rank Implementations        |
+| [ADR-0015](adr-0015.md) | ✅ Accepted | 2026-08-05 | Keep BitVec, RankDirectory, and SelectIndex As-Is             |
+| [ADR-0016](adr-0016.md) | ✅ Accepted | 2026-08-08 | Reject SIMD Escape Scanning for jq Format Functions           |
+| [ADR-0017](adr-0017.md) | ✅ Accepted | 2026-08-11 | Presentation-Metadata Side-Trees over a Mutable YAML Document |
 
 The inventory is maintained by the [`update-adr-inventory`](../../.claude/skills/update-adr-inventory/SKILL.md)
 skill, which scans `adr-*.md` for the title and status and derives the date from git history.
