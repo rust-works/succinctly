@@ -6535,6 +6535,7 @@ fn builtin_test_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // Evaluate the flags expression
     let flags = match result_to_owned(eval_single::<W, S>(flags_expr, value.clone(), optional)) {
         Ok(OwnedValue::String(s)) => s,
+        Ok(OwnedValue::Null) => String::new(),
         Ok(_) if optional => return QueryResult::None,
         Ok(_) => return QueryResult::Error(EvalError::type_error("string", "flags")),
         Err(e) => return QueryResult::Error(e),
@@ -6581,6 +6582,7 @@ fn builtin_match_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // Evaluate the flags expression
     let flags = match result_to_owned(eval_single::<W, S>(flags_expr, value.clone(), optional)) {
         Ok(OwnedValue::String(s)) => s,
+        Ok(OwnedValue::Null) => String::new(),
         Ok(_) if optional => return QueryResult::None,
         Ok(_) => return QueryResult::Error(EvalError::type_error("string", "flags")),
         Err(e) => return QueryResult::Error(e),
@@ -6600,6 +6602,7 @@ fn builtin_capture_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // Evaluate the flags expression
     let flags = match result_to_owned(eval_single::<W, S>(flags_expr, value.clone(), optional)) {
         Ok(OwnedValue::String(s)) => s,
+        Ok(OwnedValue::Null) => String::new(),
         Ok(_) if optional => return QueryResult::None,
         Ok(_) => return QueryResult::Error(EvalError::type_error("string", "flags")),
         Err(e) => return QueryResult::Error(e),
@@ -6690,6 +6693,7 @@ fn builtin_sub_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // Evaluate the flags expression
     let flags = match result_to_owned(eval_single::<W, S>(flags_expr, value.clone(), optional)) {
         Ok(OwnedValue::String(s)) => s,
+        Ok(OwnedValue::Null) => String::new(),
         Ok(_) if optional => return QueryResult::None,
         Ok(_) => return QueryResult::Error(EvalError::type_error("string", "flags")),
         Err(e) => return QueryResult::Error(e),
@@ -6765,6 +6769,7 @@ fn builtin_gsub_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // Evaluate the flags expression
     let flags = match result_to_owned(eval_single::<W, S>(flags_expr, value.clone(), optional)) {
         Ok(OwnedValue::String(s)) => s,
+        Ok(OwnedValue::Null) => String::new(),
         Ok(_) if optional => return QueryResult::None,
         Ok(_) => return QueryResult::Error(EvalError::type_error("string", "flags")),
         Err(e) => return QueryResult::Error(e),
@@ -6839,6 +6844,7 @@ fn builtin_scan_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // Evaluate the flags expression
     let flags = match result_to_owned(eval_single::<W, S>(flags_expr, value.clone(), optional)) {
         Ok(OwnedValue::String(s)) => s,
+        Ok(OwnedValue::Null) => String::new(),
         Ok(_) if optional => return QueryResult::None,
         Ok(_) => return QueryResult::Error(EvalError::type_error("string", "flags")),
         Err(e) => return QueryResult::Error(e),
@@ -6921,6 +6927,7 @@ fn builtin_split_regex<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // Evaluate the flags expression
     let flags = match result_to_owned(eval_single::<W, S>(flags_expr, value.clone(), optional)) {
         Ok(OwnedValue::String(s)) => s,
+        Ok(OwnedValue::Null) => String::new(),
         Ok(_) if optional => return QueryResult::None,
         Ok(_) => return QueryResult::Error(EvalError::type_error("string", "flags")),
         Err(e) => return QueryResult::Error(e),
@@ -6972,6 +6979,7 @@ fn builtin_splits_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // Evaluate the flags expression
     let flags = match result_to_owned(eval_single::<W, S>(flags_expr, value.clone(), optional)) {
         Ok(OwnedValue::String(s)) => s,
+        Ok(OwnedValue::Null) => String::new(),
         Ok(_) if optional => return QueryResult::None,
         Ok(_) => return QueryResult::Error(EvalError::type_error("string", "flags")),
         Err(e) => return QueryResult::Error(e),
@@ -24495,6 +24503,67 @@ mod tests {
         query!(br#""aubub""#, r#"gsub("(?=u)"; "u")"#,
             QueryResult::Error(e) => {
                 assert!(e.to_string().contains("invalid regex"));
+            }
+        );
+    }
+
+    #[cfg(feature = "regex")]
+    #[test]
+    fn test_regex_flags_null_treated_as_no_flags() {
+        // #804: jq treats a `null` flags argument identically to `""`/absent
+        // flags across every regex builtin, rather than erroring.
+        query!(br#""abc""#, r#"test("a"; null)"#,
+            QueryResult::Owned(OwnedValue::Bool(b)) => {
+                assert!(b);
+            }
+        );
+
+        query!(br#""abc""#, r#"match("a"; null)"#,
+            QueryResult::Owned(OwnedValue::Object(obj)) => {
+                assert_eq!(obj.get("string"), Some(&OwnedValue::String("a".to_string())));
+            }
+        );
+
+        query!(br#""foo bar""#, r#"capture("(?P<first>\\w+) (?P<second>\\w+)"; null)"#,
+            QueryResult::Owned(OwnedValue::Object(obj)) => {
+                assert_eq!(obj.get("first"), Some(&OwnedValue::String("foo".to_string())));
+            }
+        );
+
+        query!(br#""abc""#, r#"sub("a"; "b"; null)"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "bbc");
+            }
+        );
+
+        query!(br#""abcabc""#, r#"gsub("a"; "b"; null)"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "bbcbbc");
+            }
+        );
+
+        query!(br#""test abc test""#, r#"scan("test"; null)"#,
+            QueryResult::ManyOwned(matches) => {
+                assert_eq!(matches.len(), 2);
+            }
+        );
+
+        query!(br#""a1b2c3d""#, r#"split("[0-9]"; null)"#,
+            QueryResult::Owned(OwnedValue::Array(parts)) => {
+                assert_eq!(parts.len(), 4);
+            }
+        );
+
+        query!(br#""a1b2c3d""#, r#"[splits("[0-9]"; null)]"#,
+            QueryResult::Owned(OwnedValue::Array(parts)) => {
+                assert_eq!(parts.len(), 4);
+            }
+        );
+
+        // Non-string, non-null flags must still error.
+        query!(br#""abc""#, r#"test("a"; 5)"#,
+            QueryResult::Error(e) => {
+                assert!(e.to_string().contains("flags"));
             }
         );
     }
