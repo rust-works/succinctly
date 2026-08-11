@@ -1350,6 +1350,118 @@ fn test_object_construction_multi_output_after_pipe_issue_354() -> Result<()> {
 }
 
 #[test]
+fn test_arithmetic_compare_cartesian_fanout_issue_768() -> Result<()> {
+    // Every arithmetic/comparison operator used to collapse a multi-output
+    // operand to its first value via `result_to_owned`, instead of jq's
+    // cartesian-product fanout (#768). All 11 operators, from the issue's
+    // own reproduction table.
+    let (stdout, _, code) = run_jq_full(&["-c", "[(1,2,3) + 2]"], Some("null"))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "[3,4,5]");
+
+    let (stdout, _, code) = run_jq_full(&["-c", "[(1,2,3) - 2]"], Some("null"))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "[-1,0,1]");
+
+    let (stdout, _, code) = run_jq_full(&["-c", "[(1,2,3) * 2]"], Some("null"))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "[2,4,6]");
+
+    let (stdout, _, code) = run_jq_full(&["-c", "[(1,2,3) / 2]"], Some("null"))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "[0.5,1,1.5]");
+
+    let (stdout, _, code) = run_jq_full(&["-c", "[(1,2,3) % 2]"], Some("null"))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "[1,0,1]");
+
+    let (stdout, _, code) = run_jq_full(&["-c", "[(1,2,3) == 2]"], Some("null"))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "[false,true,false]");
+
+    let (stdout, _, code) = run_jq_full(&["-c", "[(1,2,3) != 2]"], Some("null"))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "[true,false,true]");
+
+    let (stdout, _, code) = run_jq_full(&["-c", "[(1,2,3) < 2]"], Some("null"))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "[true,false,false]");
+
+    let (stdout, _, code) = run_jq_full(&["-c", "[(1,2,3) <= 2]"], Some("null"))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "[true,true,false]");
+
+    let (stdout, _, code) = run_jq_full(&["-c", "[(1,2,3) > 2]"], Some("null"))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "[false,false,true]");
+
+    let (stdout, _, code) = run_jq_full(&["-c", "[(1,2,3) >= 2]"], Some("null"))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "[false,true,true]");
+
+    // A generator operand streams directly (not just under an array
+    // constructor): `.[] + 1` on `[1,2,3]` is `2`, `3`, `4`.
+    let (stdout, _, code) = run_jq_full(&["-c", ".[] + 1"], Some("[1,2,3]"))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "2\n3\n4\n");
+
+    let (stdout, _, code) = run_jq_full(&["-c", "[.[] > 1]"], Some("[1,2,3]"))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "[false,true,true]");
+
+    // Cartesian ordering when both sides are generators: right operand
+    // outer, left operand inner (jq's actual order, verified against the
+    // pinned oracle -- NOT the reverse `eval_boolean`/`and`/`or` uses).
+    let (stdout, _, code) = run_jq_full(&["-c", "[(1,2) + (10,20)]"], Some("null"))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "[11,12,21,22]");
+
+    let (stdout, _, code) = run_jq_full(&["-c", "[(1,2) == (1,2)]"], Some("null"))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "[true,false,false,true]");
+
+    Ok(())
+}
+
+#[test]
+fn test_arithmetic_compare_cartesian_fanout_error_and_break_issue_768() -> Result<()> {
+    // A raised error anywhere in the fanout aborts the whole computation
+    // rather than skipping just that pairing -- jq doesn't retry a
+    // generator past a fatal error. `[...]` only prints once its full
+    // stream is known, so an error mid-collection leaves stdout empty
+    // (verified against the pinned oracle: exit 5, no stdout).
+    let (stdout, _, code) = run_jq_full(&["-c", r#"[(1,2,error("x")) + 1]"#], Some("null"))?;
+    assert_eq!(code, 5);
+    assert_eq!(stdout, "");
+
+    let (stdout, _, code) = run_jq_full(&["-c", r#"[(1,"a",3) + 1]"#], Some("null"))?;
+    assert_eq!(code, 5);
+    assert_eq!(stdout, "");
+
+    // `?` preserves the prefix already produced before the abort, rather
+    // than discarding it -- it doesn't skip-and-continue past the failing
+    // pairing either.
+    let (stdout, _, code) = run_jq_full(&["-c", r#"[((1,2,error("x")) + 1)?]"#], Some("null"))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "[2,3]");
+
+    // Same abort-with-prefix behavior for an op-application error (not an
+    // operand-evaluation error): `"a" + 1` fails, but `1 + 1` already ran.
+    let (stdout, _, code) = run_jq_full(&["-c", r#"[((1,"a",3) + 1)?]"#], Some("null"))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "[2]");
+
+    // A `break` from an operand also aborts after the pairings already
+    // emitted, without erroring.
+    let (stdout, _, code) =
+        run_jq_full(&["-c", "label $out | (1,2,break $out,4) + 1"], Some("null"))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "2\n3\n");
+
+    Ok(())
+}
+
+#[test]
 fn test_array_construction() -> Result<()> {
     let (output, code) = run_jq_stdin("[.a, .b, .c]", r#"{"a":1,"b":2,"c":3}"#, &["-c"])?;
     assert_eq!(code, 0);
