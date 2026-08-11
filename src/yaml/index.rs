@@ -904,6 +904,25 @@ mod tests {
         // Present but not valid UTF-8 - must be `Err`, not silently `Ok(None)`
         // like the tolerant `line_comment_raw` getter.
         assert!(field_line_comment_checked(b"a: 1 # caf\xE9\n", "a").is_err());
+        // A key that isn't the first field - exercises the helper's
+        // skip-and-continue loop, not just its immediate-match return.
+        assert_eq!(
+            field_line_comment_checked(b"a: 1\nb: 2 # keep this\n", "b"),
+            Ok(Some("keep this".to_string()))
+        );
+        // A key that's absent entirely - the helper's own fallback, as
+        // opposed to a present-but-commentless value (the "Absent" case
+        // above).
+        assert_eq!(field_line_comment_checked(b"a: 1\n", "z"), Ok(None));
+        // A preceding field with a non-scalar (explicit complex) key -
+        // `field.key()` returns `YamlValue::Sequence`, not `String`, so the
+        // helper's `if let YamlValue::String(k) = field.key()` pattern
+        // match itself fails and skips the field, distinct from the
+        // scalar-key-that-just-doesn't-match case above.
+        assert_eq!(
+            field_line_comment_checked(b"? [1, 2]\n: 1\na: 2 # keep this\n", "a"),
+            Ok(Some("keep this".to_string()))
+        );
     }
 
     #[test]

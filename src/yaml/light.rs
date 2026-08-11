@@ -1390,12 +1390,9 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                         out.write_str(": ")?;
                         write_yaml_child_inline(out, field.value_cursor(), unit, sort_keys)?;
                         if i == last_index {
-                            write_flow_last_item_comment(
-                                out,
-                                field.value_cursor().line_comment_raw(),
-                                current_indent,
-                                unit,
-                            )?;
+                            let value_cursor = field.value_cursor();
+                            let comment = value_cursor.line_comment_raw();
+                            write_flow_last_item_comment(out, comment, current_indent, unit)?;
                         }
                     }
                     out.write_char('}')
@@ -1482,12 +1479,10 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                             // for `a: v # c` is always the value, never
                             // the key.
                             let key_cursor = field.key_cursor();
-                            write_line_comment(
-                                out,
-                                value
-                                    .line_comment_raw()
-                                    .or_else(|| key_cursor.line_comment_raw()),
-                            )?;
+                            let comment = value
+                                .line_comment_raw()
+                                .or_else(|| key_cursor.line_comment_raw());
+                            write_line_comment(out, comment)?;
                         }
                     }
                     Ok(())
@@ -1509,12 +1504,8 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                         first = false;
                         write_yaml_child_inline(out, cursor, unit, sort_keys)?;
                         if rest.is_empty() {
-                            write_flow_last_item_comment(
-                                out,
-                                cursor.line_comment_raw(),
-                                current_indent,
-                                unit,
-                            )?;
+                            let comment = cursor.line_comment_raw();
+                            write_flow_last_item_comment(out, comment, current_indent, unit)?;
                         }
                         elems = rest;
                     }
@@ -10513,6 +10504,59 @@ mod tests {
                     .stream_yaml(&mut out, IndentSpec::COMPACT, false)
                     .expect("streams");
                 assert_eq!(out, "{!!str k: v}");
+                return;
+            }
+        }
+        panic!("Could not find value");
+    }
+
+    /// Direct coverage for `DocumentCursor::stream_yaml`'s `YamlCursor`
+    /// delegation. Its only production caller (`GenericResult::stream_yaml`'s
+    /// `OneCursor`/`ManyCursor` arms, `eval_generic.rs`) switched to
+    /// `stream_yaml_as_document` for #793a (a navigated container keeps its
+    /// own trailing comment, unlike a navigated scalar) - this pins the
+    /// bare, no-own-comment contract directly (trait-qualified, same
+    /// pattern as `test_stream_yaml_flow_mapping_preserves_tagged_key`
+    /// above for the inherent method), since nothing else reaches it
+    /// anymore.
+    #[test]
+    fn test_document_cursor_stream_yaml_trait_delegation_drops_own_comment() {
+        let yaml = b"a: [1, 2, 3] # trailing\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let root = index.root(yaml);
+        if let YamlValue::Mapping(fields) = first_doc(root) {
+            if let Some(field) = fields.into_iter().next() {
+                let cursor = field.value_cursor();
+                let mut out = String::new();
+                DocumentCursor::stream_yaml(&cursor, &mut out, IndentSpec::COMPACT, false)
+                    .expect("streams");
+                assert_eq!(out, "[1, 2, 3]");
+                return;
+            }
+        }
+        panic!("Could not find value");
+    }
+
+    /// Direct coverage for the stripped `line_comment` getter (issue #710)
+    /// and its `DocumentCursor` trait delegation. Both lost their only
+    /// caller when the `line_comment` jq builtin switched to
+    /// `line_comment_checked`, which distinguishes "absent" from "invalid
+    /// UTF-8" where this getter collapses both to `None` (issue #797) -
+    /// pinned directly here since nothing in the CLI reaches either form
+    /// anymore.
+    #[test]
+    fn test_line_comment_getter_and_trait_delegation_direct() {
+        let yaml = b"a: 1 # keep this\nb: 2\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let root = index.root(yaml);
+        if let YamlValue::Mapping(fields) = first_doc(root) {
+            if let Some(field) = fields.into_iter().next() {
+                let cursor = field.value_cursor();
+                assert_eq!(cursor.line_comment(), Some("keep this"));
+                assert_eq!(
+                    DocumentCursor::line_comment(&cursor),
+                    Some("keep this".to_string())
+                );
                 return;
             }
         }

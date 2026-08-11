@@ -5977,12 +5977,14 @@ fn test_key_comment_not_exposed_via_line_comment_getter_765() -> Result<()> {
     Ok(())
 }
 
-/// A cursor-preserving filter (the DOM/`CommentTree` path, not bare
-/// identity's M2 streaming path) must also place the key's comment right
-/// after `key:`, not just plain `.`.
+/// The DOM/`CommentTree` path must also place the key's comment right
+/// after `key:`, not just plain `.` on the M2 streaming path (`--arg`
+/// forces the DOM path, since `select(...)` now routes through M2 after
+/// #796 and would no longer exercise this code for a query shape this
+/// simple - same reasoning as `test_explicit_key_comment_preserved_via_dom_path_795`).
 #[test]
-fn test_key_comment_preserved_via_select_dom_path_765() -> Result<()> {
-    let (out, code) = run_yq_stdin("select(true)", "a: # comment on key\n  b: 1\n", &[])?;
+fn test_key_comment_preserved_via_dom_path_765() -> Result<()> {
+    let (out, code) = run_yq_stdin(".", "a: # comment on key\n  b: 1\n", &["--arg", "x", "y"])?;
     assert_eq!(code, 0);
     assert_eq!(out, "a: # comment on key\n  b: 1\n");
     Ok(())
@@ -6049,11 +6051,12 @@ fn test_key_comment_preserved_with_null_value_at_eof_765() -> Result<()> {
     Ok(())
 }
 
-/// The DOM/`CommentTree` path (`select`, not bare identity's M2 streaming
-/// path) must also keep the comment for a null deferred value.
+/// The DOM/`CommentTree` path (`--arg` forces it, since `select(...)` now
+/// routes through M2 after #796 - see `test_key_comment_preserved_via_dom_path_765`
+/// above) must also keep the comment for a null deferred value.
 #[test]
-fn test_key_comment_preserved_with_null_value_via_select_dom_path_765() -> Result<()> {
-    let (out, code) = run_yq_stdin("select(true)", "a: # comment on key\nb: 2\n", &[])?;
+fn test_key_comment_preserved_with_null_value_via_dom_path_765() -> Result<()> {
+    let (out, code) = run_yq_stdin(".", "a: # comment on key\nb: 2\n", &["--arg", "x", "y"])?;
     assert_eq!(code, 0);
     assert_eq!(out, "a: # comment on key\nb: 2\n");
     Ok(())
@@ -6111,6 +6114,18 @@ fn test_explicit_key_comment_preserved_via_dom_path_795() -> Result<()> {
 #[test]
 fn test_implicit_key_same_line_value_comment_unaffected_by_795_fallback() -> Result<()> {
     let (out, code) = run_yq_stdin(".", "a: v # normal\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "a: v # normal\n");
+    Ok(())
+}
+
+/// Same regression guard, but through the DOM/`CommentTree` path (`--arg`
+/// forces it, same as the other `_765`/`_795` DOM-path variants above) -
+/// the value's own comment must win outright on this path too, rather than
+/// falling back to a (non-existent, for this shape) key comment.
+#[test]
+fn test_implicit_key_same_line_value_comment_unaffected_by_795_fallback_dom_path() -> Result<()> {
+    let (out, code) = run_yq_stdin(".", "a: v # normal\n", &["--arg", "x", "y"])?;
     assert_eq!(code, 0);
     assert_eq!(out, "a: v # normal\n");
     Ok(())

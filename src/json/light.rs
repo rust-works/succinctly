@@ -2099,6 +2099,21 @@ mod tests {
         assert!(!index.bp().is_empty());
     }
 
+    /// `DocumentCursor::line_comment`'s default impl (`document.rs`,
+    /// unconditionally `None`) is what every JSON cursor uses - JSON has no
+    /// comment syntax, so `JsonCursor` never overrides it. Its only
+    /// production caller (the `line_comment` jq builtin) switched to
+    /// `line_comment_checked` for YAML's #797 fix, which has its own
+    /// JSON-side default (`Ok(None)`) - this pins the older, still-public
+    /// default directly, since nothing else reaches it anymore.
+    #[test]
+    fn test_document_cursor_line_comment_default_is_none_for_json() {
+        let json = br#"{"a": 1}"#;
+        let index = JsonIndex::build(json);
+        let root = index.root(json);
+        assert_eq!(DocumentCursor::line_comment(&root), None);
+    }
+
     /// `stream_json_as_yaml`'s scalar-string arm previously read
     /// `raw_bytes()` (the source JSON bytes, quotes and escapes included)
     /// instead of the decoded `as_str()` content, so a plain string value
