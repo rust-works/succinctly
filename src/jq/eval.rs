@@ -2339,6 +2339,8 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Builtin::KeysUnsorted => builtin_keys::<W>(value, optional, false),
         Builtin::Has(key_expr) => builtin_has::<W, S>(key_expr, value, optional),
         Builtin::In(obj_expr) => builtin_in::<W, S>(obj_expr, value, optional),
+        Builtin::UpperIn(s) => builtin_upper_in::<W, S>(s, value, optional),
+        Builtin::UpperInSrc(src, s) => builtin_upper_in_src::<W, S>(src, s, value, optional),
 
         // Selection & Filtering
         Builtin::Select(cond) => builtin_select::<W, S>(cond, value, optional),
@@ -2407,6 +2409,10 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Builtin::Indices(s) => builtin_indices::<W, S>(s, value, optional),
         Builtin::Index(s) => builtin_index::<W, S>(s, value, optional),
         Builtin::Rindex(s) => builtin_rindex::<W, S>(s, value, optional),
+        Builtin::UpperIndex(idx_expr) => builtin_upper_index::<W, S>(idx_expr, value, optional),
+        Builtin::UpperIndexStream(stream, idx_expr) => {
+            builtin_upper_index_stream::<W, S>(stream, idx_expr, value, optional)
+        }
         Builtin::ToJsonStream => builtin_tojsonstream::<W>(value, optional),
         Builtin::FromJsonStream => builtin_fromjsonstream::<W>(value, optional),
         Builtin::ToStream => builtin_tostream::<W>(value, optional),
@@ -2865,6 +2871,50 @@ fn builtin_in<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             key_owned.type_name(),
         )),
     }
+}
+
+/// Builtin: `IN(s)` - true if any output of `s` (run against the current
+/// value) equals the current value. Matches jq's `any(s == .; .)`.
+fn builtin_upper_in<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    s: &Expr,
+    value: StandardJson<'a, W>,
+    _optional: bool,
+) -> QueryResult<'a, W> {
+    let current = to_owned(&value);
+    let candidates = match eval_owned_multi::<S>(s, &current) {
+        Ok(c) => c,
+        Err(e) => return QueryResult::Error(e),
+    };
+    QueryResult::Owned(OwnedValue::Bool(candidates.contains(&current)))
+}
+
+/// Builtin: `IN(src; s)` - true if any output of `src` equals any output of
+/// `s`, both run independently against the current value.
+///
+/// Note: this is *not* a literal translation of upstream's documented
+/// `def IN(src; s): any(src|s == .; .);` — that def's `.` inside `s == .`
+/// gets rebound by the `src|` pipe before `s` ever runs, so it can never see
+/// the original current value and (verified against real jq 1.7.1) does not
+/// reproduce the oracle's actual output. The cartesian-equality form here
+/// (`any(src == s; .)`) was verified to match the real builtin's behavior
+/// across a battery of cases (see issue #722).
+fn builtin_upper_in_src<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    src: &Expr,
+    s: &Expr,
+    value: StandardJson<'a, W>,
+    _optional: bool,
+) -> QueryResult<'a, W> {
+    let current = to_owned(&value);
+    let haystack = match eval_owned_multi::<S>(src, &current) {
+        Ok(v) => v,
+        Err(e) => return QueryResult::Error(e),
+    };
+    let needles = match eval_owned_multi::<S>(s, &current) {
+        Ok(v) => v,
+        Err(e) => return QueryResult::Error(e),
+    };
+    let found = haystack.iter().any(|h| needles.iter().any(|n| n == h));
+    QueryResult::Owned(OwnedValue::Bool(found))
 }
 
 /// Builtin: select(condition)
@@ -5854,6 +5904,58 @@ fn builtin_index<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         }
         _ => unsearchable_input(&value, &pattern, optional),
     }
+}
+
+/// Builtin: `INDEX(idx_expr)` - build an object keyed by `idx_expr` from
+/// `.[]`. Equivalent to `INDEX(.[]; idx_expr)`.
+fn builtin_upper_index<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    idx_expr: &Expr,
+    value: StandardJson<'a, W>,
+    _optional: bool,
+) -> QueryResult<'a, W> {
+    let current = to_owned(&value);
+    match eval_owned_multi::<S>(&Expr::Iterate, &current) {
+        Ok(rows) => build_upper_index::<W, S>(rows, idx_expr),
+        Err(e) => QueryResult::Error(e),
+    }
+}
+
+/// Builtin: `INDEX(stream; idx_expr)` - build an object keyed by `idx_expr`
+/// from each row `stream` produces. Matches jq's
+/// `reduce stream as $row ({}; .[$row|idx_expr|tostring] = $row)`.
+fn builtin_upper_index_stream<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    stream: &Expr,
+    idx_expr: &Expr,
+    value: StandardJson<'a, W>,
+    _optional: bool,
+) -> QueryResult<'a, W> {
+    let current = to_owned(&value);
+    match eval_owned_multi::<S>(stream, &current) {
+        Ok(rows) => build_upper_index::<W, S>(rows, idx_expr),
+        Err(e) => QueryResult::Error(e),
+    }
+}
+
+/// Shared fold for `INDEX`/`INDEX(stream; ...)`: assigns each row into an
+/// accumulator object under `row|idx_expr|tostring`, later duplicate keys
+/// overwriting earlier ones (matches `.[key] = row`'s last-write-wins). An
+/// `idx_expr` error aborts with no partial object, matching `reduce`'s
+/// "only the final value is observable" semantics.
+fn build_upper_index<'a, W, S: EvalSemantics>(
+    rows: Vec<OwnedValue>,
+    idx_expr: &Expr,
+) -> QueryResult<'a, W> {
+    let mut obj = IndexMap::new();
+    for row in &rows {
+        let keys = match eval_owned_multi::<S>(idx_expr, row) {
+            Ok(k) => k,
+            Err(e) => return QueryResult::Error(e),
+        };
+        for k in keys {
+            obj.insert(owned_to_string(&k), row.clone());
+        }
+    }
+    QueryResult::Owned(OwnedValue::Object(obj))
 }
 
 /// Builtin: rindex(s) - last index of substring/element s, or null
@@ -10195,6 +10297,11 @@ fn substitute_var_in_builtin(
         Builtin::KeysUnsorted => Builtin::KeysUnsorted,
         Builtin::Has(e) => Builtin::Has(Box::new(substitute_var(e, var_name, replacement))),
         Builtin::In(e) => Builtin::In(Box::new(substitute_var(e, var_name, replacement))),
+        Builtin::UpperIn(e) => Builtin::UpperIn(Box::new(substitute_var(e, var_name, replacement))),
+        Builtin::UpperInSrc(src, s) => Builtin::UpperInSrc(
+            Box::new(substitute_var(src, var_name, replacement)),
+            Box::new(substitute_var(s, var_name, replacement)),
+        ),
         Builtin::Select(e) => Builtin::Select(Box::new(substitute_var(e, var_name, replacement))),
         Builtin::Empty => Builtin::Empty,
         Builtin::Map(e) => Builtin::Map(Box::new(substitute_var(e, var_name, replacement))),
@@ -10268,6 +10375,13 @@ fn substitute_var_in_builtin(
         Builtin::Indices(e) => Builtin::Indices(Box::new(substitute_var(e, var_name, replacement))),
         Builtin::Index(e) => Builtin::Index(Box::new(substitute_var(e, var_name, replacement))),
         Builtin::Rindex(e) => Builtin::Rindex(Box::new(substitute_var(e, var_name, replacement))),
+        Builtin::UpperIndex(e) => {
+            Builtin::UpperIndex(Box::new(substitute_var(e, var_name, replacement)))
+        }
+        Builtin::UpperIndexStream(stream, idx_expr) => Builtin::UpperIndexStream(
+            Box::new(substitute_var(stream, var_name, replacement)),
+            Box::new(substitute_var(idx_expr, var_name, replacement)),
+        ),
         Builtin::ToJsonStream => Builtin::ToJsonStream,
         Builtin::FromJsonStream => Builtin::FromJsonStream,
         Builtin::ToStream => Builtin::ToStream,
@@ -16437,6 +16551,8 @@ fn builtin_builtins<'a, W: Clone + AsRef<[u64]>>() -> QueryResult<'a, W> {
         // has/in (arity 1)
         "has/1",
         "in/1",
+        "IN/1",
+        "IN/2",
         // Selection (arity 0-1)
         "select/1",
         "empty/0",
@@ -16500,6 +16616,8 @@ fn builtin_builtins<'a, W: Clone + AsRef<[u64]>>() -> QueryResult<'a, W> {
         "indices/1",
         "index/1",
         "rindex/1",
+        "INDEX/1",
+        "INDEX/2",
         "tojsonstream/0",
         "fromjsonstream/0",
         "tostream/0",
@@ -19008,6 +19126,13 @@ fn expand_func_calls_in_builtin(
         Builtin::KeysUnsorted => Builtin::KeysUnsorted,
         Builtin::Has(e) => Builtin::Has(Box::new(expand_func_calls(e, func_name, params, body))),
         Builtin::In(e) => Builtin::In(Box::new(expand_func_calls(e, func_name, params, body))),
+        Builtin::UpperIn(e) => {
+            Builtin::UpperIn(Box::new(expand_func_calls(e, func_name, params, body)))
+        }
+        Builtin::UpperInSrc(src, s) => Builtin::UpperInSrc(
+            Box::new(expand_func_calls(src, func_name, params, body)),
+            Box::new(expand_func_calls(s, func_name, params, body)),
+        ),
         Builtin::Select(e) => {
             Builtin::Select(Box::new(expand_func_calls(e, func_name, params, body)))
         }
@@ -19101,6 +19226,13 @@ fn expand_func_calls_in_builtin(
         Builtin::Rindex(e) => {
             Builtin::Rindex(Box::new(expand_func_calls(e, func_name, params, body)))
         }
+        Builtin::UpperIndex(e) => {
+            Builtin::UpperIndex(Box::new(expand_func_calls(e, func_name, params, body)))
+        }
+        Builtin::UpperIndexStream(stream, idx_expr) => Builtin::UpperIndexStream(
+            Box::new(expand_func_calls(stream, func_name, params, body)),
+            Box::new(expand_func_calls(idx_expr, func_name, params, body)),
+        ),
         Builtin::ToJsonStream => Builtin::ToJsonStream,
         Builtin::FromJsonStream => Builtin::FromJsonStream,
         Builtin::ToStream => Builtin::ToStream,
@@ -19376,6 +19508,11 @@ fn substitute_func_param_in_builtin(builtin: &Builtin, param: &str, arg: &Expr) 
         Builtin::KeysUnsorted => Builtin::KeysUnsorted,
         Builtin::Has(e) => Builtin::Has(Box::new(substitute_func_param(e, param, arg))),
         Builtin::In(e) => Builtin::In(Box::new(substitute_func_param(e, param, arg))),
+        Builtin::UpperIn(e) => Builtin::UpperIn(Box::new(substitute_func_param(e, param, arg))),
+        Builtin::UpperInSrc(src, s) => Builtin::UpperInSrc(
+            Box::new(substitute_func_param(src, param, arg)),
+            Box::new(substitute_func_param(s, param, arg)),
+        ),
         Builtin::Select(e) => Builtin::Select(Box::new(substitute_func_param(e, param, arg))),
         Builtin::Empty => Builtin::Empty,
         Builtin::Map(e) => Builtin::Map(Box::new(substitute_func_param(e, param, arg))),
@@ -19437,6 +19574,13 @@ fn substitute_func_param_in_builtin(builtin: &Builtin, param: &str, arg: &Expr) 
         Builtin::Indices(e) => Builtin::Indices(Box::new(substitute_func_param(e, param, arg))),
         Builtin::Index(e) => Builtin::Index(Box::new(substitute_func_param(e, param, arg))),
         Builtin::Rindex(e) => Builtin::Rindex(Box::new(substitute_func_param(e, param, arg))),
+        Builtin::UpperIndex(e) => {
+            Builtin::UpperIndex(Box::new(substitute_func_param(e, param, arg)))
+        }
+        Builtin::UpperIndexStream(stream, idx_expr) => Builtin::UpperIndexStream(
+            Box::new(substitute_func_param(stream, param, arg)),
+            Box::new(substitute_func_param(idx_expr, param, arg)),
+        ),
         Builtin::ToJsonStream => Builtin::ToJsonStream,
         Builtin::FromJsonStream => Builtin::FromJsonStream,
         Builtin::ToStream => Builtin::ToStream,
@@ -24258,6 +24402,74 @@ mod tests {
             QueryResult::Owned(OwnedValue::Int(n)) => {
                 assert_eq!(n, 4);
             }
+        );
+    }
+
+    #[test]
+    fn test_builtin_upper_in_single_arg() {
+        query!(br"5", "IN(1,2,3,5)",
+            QueryResult::Owned(OwnedValue::Bool(b)) => {
+                assert!(b);
+            }
+        );
+        query!(br"7", "IN(1,2,3,5)",
+            QueryResult::Owned(OwnedValue::Bool(b)) => {
+                assert!(!b);
+            }
+        );
+    }
+
+    #[test]
+    fn test_builtin_upper_in_src_two_arg() {
+        // Verified against the real jq-1.7.1 oracle (issue #722): `IN(src; s)`
+        // is a cartesian equality check between src's and s's outputs, both
+        // run against the *original* current value — not the naive
+        // `any(src|s == .; .)` reading, whose pipe rebinds `.` before `s`
+        // (and the trailing `.`) ever see it, so it can never actually
+        // depend on the original input. `5 | IN(10,20,30; .)` pins that: the
+        // naive reading is always `true` regardless of input, but real jq
+        // (and this implementation) says `false` here since 5 is not among
+        // 10,20,30.
+        query!(br"5", "IN(10,20,30; .)",
+            QueryResult::Owned(OwnedValue::Bool(b)) => {
+                assert!(!b);
+            }
+        );
+        query!(br"10", "IN(10,20,30; .)",
+            QueryResult::Owned(OwnedValue::Bool(b)) => {
+                assert!(b);
+            }
+        );
+    }
+
+    #[test]
+    fn test_builtin_upper_index_single_arg_groups_by_field() {
+        assert_eq!(
+            outputs(br#"[{"id":1,"v":"a"},{"id":2,"v":"b"}]"#, "INDEX(.id)"),
+            [r#"{"1":{"id":1,"v":"a"},"2":{"id":2,"v":"b"}}"#]
+        );
+    }
+
+    #[test]
+    fn test_builtin_upper_index_duplicate_key_last_write_wins() {
+        assert_eq!(
+            outputs(br#"[{"id":"a","v":1},{"id":"a","v":2}]"#, "INDEX(.id)"),
+            [r#"{"a":{"id":"a","v":2}}"#]
+        );
+    }
+
+    #[test]
+    fn test_builtin_upper_index_stream_two_arg_matches_one_arg() {
+        assert_eq!(
+            outputs(br#"[{"id":"a"},{"id":"b"}]"#, "INDEX(.[]; .id)"),
+            outputs(br#"[{"id":"a"},{"id":"b"}]"#, "INDEX(.id)"),
+        );
+    }
+
+    #[test]
+    fn test_builtin_upper_index_propagates_idx_expr_error() {
+        query!(br"[1,2,3]", "INDEX(.foo)",
+            QueryResult::Error(_) => {}
         );
     }
 

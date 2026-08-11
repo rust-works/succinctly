@@ -537,6 +537,10 @@ pub enum Builtin {
     Has(Box<Expr>),
     /// `in(obj)` - check if key exists in object
     In(Box<Expr>),
+    /// `IN(s)` - true if any output of s equals the current value
+    UpperIn(Box<Expr>),
+    /// `IN(src; s)` - true if any output of src equals any output of s
+    UpperInSrc(Box<Expr>, Box<Expr>),
 
     // Selection & Filtering
     /// `select(condition)` - output input only if condition is truthy
@@ -651,6 +655,10 @@ pub enum Builtin {
     Index(Box<Expr>),
     /// `rindex(s)` - last index of s, or null
     Rindex(Box<Expr>),
+    /// `INDEX(idx_expr)` - build an object keyed by idx_expr from `.[]`
+    UpperIndex(Box<Expr>),
+    /// `INDEX(stream; idx_expr)` - build an object keyed by idx_expr from stream
+    UpperIndexStream(Box<Expr>, Box<Expr>),
     /// `tojsonstream` - convert to JSON stream format
     ToJsonStream,
     /// `fromjsonstream` - convert from JSON stream format

@@ -2093,6 +2093,27 @@ impl<'a> Parser<'a> {
             return Ok(Some(Builtin::In(Box::new(obj))));
         }
 
+        // IN(s) - true if any output of s equals the current value
+        // IN(src; s) - true if any output of src equals any output of s
+        if self.matches_keyword("IN") {
+            self.consume_keyword("IN");
+            self.skip_ws();
+            self.expect('(')?;
+            self.skip_ws();
+            let first = self.parse_expr()?;
+            self.skip_ws();
+            if self.peek() == Some(';') {
+                self.next();
+                self.skip_ws();
+                let s = self.parse_expr()?;
+                self.skip_ws();
+                self.expect(')')?;
+                return Ok(Some(Builtin::UpperInSrc(Box::new(first), Box::new(s))));
+            }
+            self.expect(')')?;
+            return Ok(Some(Builtin::UpperIn(Box::new(first))));
+        }
+
         // Phase 5: String Functions
         if self.matches_keyword("ascii_downcase") {
             self.consume_keyword("ascii_downcase");
@@ -2479,6 +2500,29 @@ impl<'a> Parser<'a> {
             self.skip_ws();
             self.expect(')')?;
             return Ok(Some(Builtin::Index(Box::new(s))));
+        }
+        // INDEX(idx_expr) - build an object keyed by idx_expr from `.[]`
+        // INDEX(stream; idx_expr) - build an object keyed by idx_expr from stream
+        if self.matches_keyword("INDEX") {
+            self.consume_keyword("INDEX");
+            self.skip_ws();
+            self.expect('(')?;
+            self.skip_ws();
+            let first = self.parse_expr()?;
+            self.skip_ws();
+            if self.peek() == Some(';') {
+                self.next();
+                self.skip_ws();
+                let idx_expr = self.parse_expr()?;
+                self.skip_ws();
+                self.expect(')')?;
+                return Ok(Some(Builtin::UpperIndexStream(
+                    Box::new(first),
+                    Box::new(idx_expr),
+                )));
+            }
+            self.expect(')')?;
+            return Ok(Some(Builtin::UpperIndex(Box::new(first))));
         }
         if self.matches_keyword("tojsonstream") {
             self.consume_keyword("tojsonstream");
