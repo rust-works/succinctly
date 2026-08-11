@@ -778,6 +778,17 @@ pub enum Builtin {
     /// `debug(msg)` - output message and value to stderr
     DebugMsg(Box<Expr>),
 
+    // Process control (#791)
+    /// `halt` - stop the interpreter immediately, exit code 0, no output
+    Halt,
+    /// `stderr` - print input in raw/compact mode to stderr (no trailing
+    /// newline, not even for the passed-through value), pass through unchanged
+    Stderr,
+    /// `halt_error` - print input to stderr and exit (default code 5)
+    HaltError,
+    /// `halt_error(exit_code)` - print input to stderr and exit with the given code
+    HaltErrorCode(Box<Expr>),
+
     // Phase 10: Environment
     /// `env` - object of all environment variables
     Env,

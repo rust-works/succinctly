@@ -66,6 +66,12 @@ pub trait EvalSemantics: Copy + Default {
     /// from `{}`/`[]` (yq). If false, any null operand short-circuits to
     /// `null` (jq).
     const NULL_MERGES_AS_EMPTY: bool;
+    /// Exit code for a bare `halt_error` (no explicit argument). Mirrors
+    /// `DiagStyle::error_exit_code()` in the CLI's `output.rs` (5 for jq's
+    /// distinguishable-uncaught-error convention, 1 for yq's uniform failure
+    /// code) so the library and CLI agree without the library depending on
+    /// the CLI binary crate.
+    const DEFAULT_HALT_ERROR_CODE: i32;
 }
 
 /// jq-compatible evaluation semantics (default).
@@ -84,6 +90,7 @@ impl EvalSemantics for JqSemantics {
     const TAG: EvalTag = EvalTag::Jq;
     const ARRAY_MULTIPLY_MERGES: bool = false;
     const NULL_MERGES_AS_EMPTY: bool = false;
+    const DEFAULT_HALT_ERROR_CODE: i32 = 5;
 }
 
 /// yq-compatible evaluation semantics.
@@ -102,6 +109,7 @@ impl EvalSemantics for YqSemantics {
     const TAG: EvalTag = EvalTag::Yq;
     const ARRAY_MULTIPLY_MERGES: bool = true;
     const NULL_MERGES_AS_EMPTY: bool = true;
+    const DEFAULT_HALT_ERROR_CODE: i32 = 1;
 }
 
 use crate::json::light::{JsonCursor, JsonElements, JsonFields, StandardJson};
@@ -146,13 +154,17 @@ pub enum QueryResult<'a, W = Vec<u64>> {
     /// Contains the label name to match against enclosing Label expressions.
     Break(String),
 
+    /// `halt`/`halt_error(n)`: exit the whole process with this code (#791).
+    /// Not caught by `try`/`catch` or `label`/`break`, unlike `Error`/`Break`.
+    Halt(i32),
+
     /// One or more outputs were produced before the stream terminated in an
-    /// error or a `break` (#400, #494).
+    /// error, a `break`, or a `halt` (#400, #494, #791).
     ///
-    /// `Error`/`Break` remain the zero-prefix case — every terminal raise
-    /// deep in a builtin still constructs them directly, unchanged. The
-    /// prefix is always non-empty by construction (see `partial`); an
-    /// empty prefix normalizes to bare `Error`/`Break`.
+    /// `Error`/`Break`/`Halt` remain the zero-prefix case — every terminal
+    /// raise deep in a builtin still constructs them directly, unchanged. The
+    /// prefix is always non-empty by construction (see `partial`); an empty
+    /// prefix normalizes to bare `Error`/`Break`/`Halt`.
     Partial(Vec<OwnedValue>, Control),
 }
 
@@ -199,6 +211,7 @@ impl<W: Clone + AsRef<[u64]>> QueryResult<'_, W> {
             QueryResult::Owned(o) => vec![o],
             QueryResult::ManyOwned(os) => os,
             QueryResult::Break(_) => Vec::new(),
+            QueryResult::Halt(_) => Vec::new(),
             QueryResult::Partial(vs, _control) => vs,
         }
     }
@@ -771,6 +784,12 @@ fn eval_comma<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     Control::Break(label),
                 );
             }
+            QueryResult::Halt(code) => {
+                return partial(
+                    merge_owned(borrowed, owned.unwrap_or_default()),
+                    Control::Halt(code),
+                );
+            }
             QueryResult::Partial(vs, control) => {
                 let mut merged = merge_owned(borrowed, owned.unwrap_or_default());
                 merged.extend(vs);
@@ -805,11 +824,13 @@ fn eval_array_construction<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         QueryResult::None => vec![],
         QueryResult::Error(e) => return QueryResult::Error(e),
         QueryResult::Break(label) => return QueryResult::Break(label),
+        QueryResult::Halt(code) => return QueryResult::Halt(code),
         // Array construction is atomic in jq (verified: `[1,error("x"),3]`
         // produces no output at all, not a partial array) — a `Partial`
         // inner stream just surfaces its control, same as a bare one.
         QueryResult::Partial(_, Control::Error(e)) => return QueryResult::Error(e),
         QueryResult::Partial(_, Control::Break(label)) => return QueryResult::Break(label),
+        QueryResult::Partial(_, Control::Halt(code)) => return QueryResult::Halt(code),
     };
 
     QueryResult::Owned(OwnedValue::Array(items))
@@ -827,6 +848,7 @@ enum ObjectEscape {
     None,
     Error(EvalError),
     Break(String),
+    Halt(i32),
 }
 
 /// Materialize every output of a sub-expression, plus a deferred escape if its
@@ -858,6 +880,7 @@ impl From<Control> for ObjectEscape {
         match control {
             Control::Error(e) => Self::Error(e),
             Control::Break(label) => Self::Break(label),
+            Control::Halt(code) => Self::Halt(code),
         }
     }
 }
@@ -989,6 +1012,13 @@ fn eval_object_construction<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 QueryResult::Partial(objects, Control::Break(label))
             };
         }
+        Err(ObjectEscape::Halt(code)) => {
+            return if objects.is_empty() {
+                QueryResult::Halt(code)
+            } else {
+                QueryResult::Partial(objects, Control::Halt(code))
+            };
+        }
         Err(ObjectEscape::Error(e)) => {
             return if objects.is_empty() {
                 QueryResult::Error(e)
@@ -1064,14 +1094,15 @@ fn owned_vec_to_result<'a, W>(mut vs: Vec<OwnedValue>) -> QueryResult<'a, W> {
 
 /// Normalize a prefix and its terminator into a `QueryResult` (#400, #494).
 ///
-/// An empty prefix collapses to the bare `Error`/`Break` variant, so callers
-/// that had nothing accumulated before hitting a control signal produce
-/// exactly what they did before `Partial` existed.
+/// An empty prefix collapses to the bare `Error`/`Break`/`Halt` variant, so
+/// callers that had nothing accumulated before hitting a control signal
+/// produce exactly what they did before `Partial` existed.
 fn partial<'a, W>(prefix: Vec<OwnedValue>, control: Control) -> QueryResult<'a, W> {
     if prefix.is_empty() {
         match control {
             Control::Error(e) => QueryResult::Error(e),
             Control::Break(label) => QueryResult::Break(label),
+            Control::Halt(code) => QueryResult::Halt(code),
         }
     } else {
         QueryResult::Partial(prefix, control)
@@ -1095,10 +1126,11 @@ fn eval_owned_expr_fork<S: EvalSemantics>(
         QueryResult::None => (Vec::new(), None),
         QueryResult::Error(e) => (Vec::new(), Some(Control::Error(e))),
         QueryResult::Break(label) => (Vec::new(), Some(Control::Break(label))),
+        QueryResult::Halt(code) => (Vec::new(), Some(Control::Halt(code))),
         QueryResult::Partial(vs, control) => (vs, Some(control)),
         QueryResult::One(_) | QueryResult::OneCursor(_) | QueryResult::Many(_) => {
             unreachable!(
-                "eval_owned_input always normalizes to Owned/ManyOwned/None/Error/Break/Partial"
+                "eval_owned_input always normalizes to Owned/ManyOwned/None/Error/Break/Halt/Partial"
             )
         }
     }
@@ -1165,6 +1197,7 @@ fn prepend<W: Clone + AsRef<[u64]>>(
         }
         QueryResult::Error(e) => partial(prefix, Control::Error(e)),
         QueryResult::Break(label) => partial(prefix, Control::Break(label)),
+        QueryResult::Halt(code) => partial(prefix, Control::Halt(code)),
         QueryResult::Partial(vs, control) => {
             prefix.extend(vs);
             partial(prefix, control)
@@ -1201,6 +1234,15 @@ fn result_to_owned<W: Clone + AsRef<[u64]>>(
         QueryResult::None => Err(EvalError::new("no value")),
         QueryResult::Error(e) => Err(e),
         QueryResult::Break(label) => Err(EvalError::new(format!("break ${label} not in label"))),
+        // This function's signature (`Result<OwnedValue, EvalError>`) has no
+        // way to carry a `Control` through, so a `halt` reached through an
+        // operand context (e.g. `1 + halt`) comes back out as a plain
+        // `EvalError`, which an enclosing `try`/`catch` could then swallow —
+        // in tension with `halt` never being catchable elsewhere. This
+        // mirrors `Break`'s pre-existing identical lossy conversion just
+        // above (already in the same tension with `break $out` for the same
+        // reason), not a new gap introduced for `halt` (#791).
+        QueryResult::Halt(code) => Err(EvalError::new(format!("halt({code}) not propagated"))),
     }
 }
 
@@ -1254,7 +1296,10 @@ fn retain_truthy<W: Clone + AsRef<[u64]>>(result: QueryResult<'_, W>) -> QueryRe
             vs.retain(OwnedValue::is_truthy);
             partial(vs, control)
         }
-        other @ (QueryResult::None | QueryResult::Error(_) | QueryResult::Break(_)) => other,
+        other @ (QueryResult::None
+        | QueryResult::Error(_)
+        | QueryResult::Break(_)
+        | QueryResult::Halt(_)) => other,
     }
 }
 
@@ -1284,6 +1329,7 @@ fn push_truthiness<W: Clone + AsRef<[u64]>>(
         QueryResult::None => {}
         QueryResult::Error(e) => return Some(Control::Error(e)),
         QueryResult::Break(label) => return Some(Control::Break(label)),
+        QueryResult::Halt(code) => return Some(Control::Halt(code)),
         QueryResult::Partial(vs, control) => {
             out.extend(vs.iter().map(OwnedValue::is_truthy));
             return Some(control);
@@ -1320,6 +1366,7 @@ fn push_owned_values<W: Clone + AsRef<[u64]>>(
         QueryResult::None => {}
         QueryResult::Error(e) => return Some(Control::Error(e)),
         QueryResult::Break(label) => return Some(Control::Break(label)),
+        QueryResult::Halt(code) => return Some(Control::Halt(code)),
         QueryResult::Partial(vs, control) => {
             out.extend(vs);
             return Some(control);
@@ -1388,6 +1435,12 @@ fn eval_fanout<'a, W: Clone + AsRef<[u64]>>(
                 return partial(
                     merge_owned(borrowed, owned.unwrap_or_default()),
                     Control::Break(label),
+                );
+            }
+            QueryResult::Halt(code) => {
+                return partial(
+                    merge_owned(borrowed, owned.unwrap_or_default()),
+                    Control::Halt(code),
                 );
             }
             QueryResult::Partial(vs, control) => {
@@ -2617,6 +2670,12 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Builtin::Debug => builtin_debug::<W>(value, optional),
         Builtin::DebugMsg(msg) => builtin_debug_msg::<W>(msg, value, optional),
 
+        // Process control (#791)
+        Builtin::Halt => builtin_halt::<W>(),
+        Builtin::Stderr => builtin_stderr::<W>(value, optional),
+        Builtin::HaltError => builtin_halt_error::<W, S>(None, value, optional),
+        Builtin::HaltErrorCode(code) => builtin_halt_error::<W, S>(Some(code), value, optional),
+
         // Phase 10: Environment
         Builtin::Env => builtin_env::<W>(value, optional),
         Builtin::EnvVar(var) => builtin_envvar::<W, S>(var, value, optional),
@@ -3031,11 +3090,13 @@ fn map_over<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             QueryResult::None => {}
             QueryResult::Error(e) => return QueryResult::Error(e),
             QueryResult::Break(label) => return QueryResult::Break(label),
+            QueryResult::Halt(code) => return QueryResult::Halt(code),
             // `map(f)` is `[.[] | f]` — array construction, atomic in jq
             // (see `eval_array_construction`) — so a `Partial` just
             // surfaces its control, same as a bare one.
             QueryResult::Partial(_, Control::Error(e)) => return QueryResult::Error(e),
             QueryResult::Partial(_, Control::Break(label)) => return QueryResult::Break(label),
+            QueryResult::Partial(_, Control::Halt(code)) => return QueryResult::Halt(code),
         }
     }
     QueryResult::Owned(OwnedValue::Array(results))
@@ -3102,12 +3163,16 @@ fn builtin_map_values<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     QueryResult::None => {}
                     QueryResult::Error(e) => return QueryResult::Error(e),
                     QueryResult::Break(label) => return QueryResult::Break(label),
+                    QueryResult::Halt(code) => return QueryResult::Halt(code),
                     // Object construction is atomic in jq (see
                     // `eval_object_construction`) — a `Partial` field value
                     // just surfaces its control, same as a bare one.
                     QueryResult::Partial(_, Control::Error(e)) => return QueryResult::Error(e),
                     QueryResult::Partial(_, Control::Break(label)) => {
                         return QueryResult::Break(label);
+                    }
+                    QueryResult::Partial(_, Control::Halt(code)) => {
+                        return QueryResult::Halt(code);
                     }
                 }
             }
@@ -3134,12 +3199,16 @@ fn builtin_map_values<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     QueryResult::None => {}
                     QueryResult::Error(e) => return QueryResult::Error(e),
                     QueryResult::Break(label) => return QueryResult::Break(label),
+                    QueryResult::Halt(code) => return QueryResult::Halt(code),
                     // Array construction is atomic in jq — a `Partial`
                     // element value just surfaces its control, same as a
                     // bare one.
                     QueryResult::Partial(_, Control::Error(e)) => return QueryResult::Error(e),
                     QueryResult::Partial(_, Control::Break(label)) => {
                         return QueryResult::Break(label);
+                    }
+                    QueryResult::Partial(_, Control::Halt(code)) => {
+                        return QueryResult::Halt(code);
                     }
                 }
             }
@@ -3262,6 +3331,7 @@ fn control_to_result<'a, W: Clone + AsRef<[u64]>>(control: Control) -> QueryResu
     match control {
         Control::Error(e) => QueryResult::Error(e),
         Control::Break(label) => QueryResult::Break(label),
+        Control::Halt(code) => QueryResult::Halt(code),
     }
 }
 
@@ -3423,7 +3493,10 @@ fn builtin_min_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     QueryResult::Owned(v) => keyed.push((v, item)),
                     QueryResult::Error(e) => return QueryResult::Error(e),
                     QueryResult::Break(label) => return QueryResult::Break(label),
-                    _ => unreachable!("eval_array_construction only returns Owned/Error/Break"),
+                    QueryResult::Halt(code) => return QueryResult::Halt(code),
+                    _ => {
+                        unreachable!("eval_array_construction only returns Owned/Error/Break/Halt")
+                    }
                 }
             }
 
@@ -3461,7 +3534,10 @@ fn builtin_max_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     QueryResult::Owned(v) => keyed.push((v, item)),
                     QueryResult::Error(e) => return QueryResult::Error(e),
                     QueryResult::Break(label) => return QueryResult::Break(label),
-                    _ => unreachable!("eval_array_construction only returns Owned/Error/Break"),
+                    QueryResult::Halt(code) => return QueryResult::Halt(code),
+                    _ => {
+                        unreachable!("eval_array_construction only returns Owned/Error/Break/Halt")
+                    }
                 }
             }
 
@@ -3996,7 +4072,10 @@ fn builtin_group_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     QueryResult::Owned(v) => v,
                     QueryResult::Error(e) => return QueryResult::Error(e),
                     QueryResult::Break(label) => return QueryResult::Break(label),
-                    _ => unreachable!("eval_array_construction only returns Owned/Error/Break"),
+                    QueryResult::Halt(code) => return QueryResult::Halt(code),
+                    _ => {
+                        unreachable!("eval_array_construction only returns Owned/Error/Break/Halt")
+                    }
                 };
                 keyed.push((key, to_owned(&item)));
             }
@@ -4076,7 +4155,10 @@ fn builtin_unique_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     QueryResult::Owned(v) => v,
                     QueryResult::Error(e) => return QueryResult::Error(e),
                     QueryResult::Break(label) => return QueryResult::Break(label),
-                    _ => unreachable!("eval_array_construction only returns Owned/Error/Break"),
+                    QueryResult::Halt(code) => return QueryResult::Halt(code),
+                    _ => {
+                        unreachable!("eval_array_construction only returns Owned/Error/Break/Halt")
+                    }
                 };
                 keyed.push((key, to_owned(&item)));
             }
@@ -4131,7 +4213,10 @@ fn builtin_sort_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     QueryResult::Owned(v) => v,
                     QueryResult::Error(e) => return QueryResult::Error(e),
                     QueryResult::Break(label) => return QueryResult::Break(label),
-                    _ => unreachable!("eval_array_construction only returns Owned/Error/Break"),
+                    QueryResult::Halt(code) => return QueryResult::Halt(code),
+                    _ => {
+                        unreachable!("eval_array_construction only returns Owned/Error/Break/Halt")
+                    }
                 };
                 keyed.push((key, to_owned(&item)));
             }
@@ -4327,6 +4412,7 @@ fn builtin_with_entries<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         QueryResult::None => return QueryResult::None,
         QueryResult::Error(e) => return QueryResult::Error(e),
         QueryResult::Break(label) => return QueryResult::Break(label),
+        QueryResult::Halt(code) => return QueryResult::Halt(code),
         // `to_entries` yields an owned array on every success path today, so
         // this is dead — but it is *its* invariant, not one visible here, so a
         // change over there should degrade rather than abort a caller.
@@ -4357,11 +4443,13 @@ fn builtin_with_entries<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             QueryResult::None => {}
             QueryResult::Error(e) => return QueryResult::Error(e),
             QueryResult::Break(label) => return QueryResult::Break(label),
+            QueryResult::Halt(code) => return QueryResult::Halt(code),
             // `with_entries(f)` is `from_entries(map(f))` — array
             // construction, atomic in jq — so a `Partial` just surfaces its
             // control, same as a bare one.
             QueryResult::Partial(_, Control::Error(e)) => return QueryResult::Error(e),
             QueryResult::Partial(_, Control::Break(label)) => return QueryResult::Break(label),
+            QueryResult::Partial(_, Control::Halt(code)) => return QueryResult::Halt(code),
         }
     }
 
@@ -4421,12 +4509,16 @@ fn eval_string_interpolation<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     QueryResult::None => String::new(),
                     QueryResult::Error(e) => return QueryResult::Error(e),
                     QueryResult::Break(label) => return QueryResult::Break(label),
+                    QueryResult::Halt(code) => return QueryResult::Halt(code),
                     // String interpolation is atomic (a "\(...)" slot embeds
                     // one value into the string) — a `Partial` just surfaces
                     // its control, same as a bare one.
                     QueryResult::Partial(_, Control::Error(e)) => return QueryResult::Error(e),
                     QueryResult::Partial(_, Control::Break(label)) => {
                         return QueryResult::Break(label);
+                    }
+                    QueryResult::Partial(_, Control::Halt(code)) => {
+                        return QueryResult::Halt(code);
                     }
                 };
                 result.push_str(&s);
@@ -5264,6 +5356,7 @@ fn builtin_skip<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         QueryResult::None => QueryResult::None,
         QueryResult::Error(e) => QueryResult::Error(e),
         QueryResult::Break(label) => QueryResult::Break(label),
+        QueryResult::Halt(code) => QueryResult::Halt(code),
         // Unlike `limit`, `skip` always wants the rest of the stream — it
         // never reaches a point where it can stop asking for more values —
         // so the trailing control always surfaces, after whatever survived
@@ -7520,6 +7613,10 @@ fn eval_pipe<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                         let prefix = owned.unwrap_or_else(|| merge_owned(borrowed, Vec::new()));
                         return partial(prefix, Control::Break(label));
                     }
+                    QueryResult::Halt(code) => {
+                        let prefix = owned.unwrap_or_else(|| merge_owned(borrowed, Vec::new()));
+                        return partial(prefix, Control::Halt(code));
+                    }
                     QueryResult::Partial(rs, control) => {
                         let mut prefix = owned.unwrap_or_else(|| merge_owned(borrowed, Vec::new()));
                         prefix.extend(rs);
@@ -7535,6 +7632,7 @@ fn eval_pipe<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         QueryResult::None => QueryResult::None,
         QueryResult::Error(e) => QueryResult::Error(e),
         QueryResult::Break(label) => QueryResult::Break(label),
+        QueryResult::Halt(code) => QueryResult::Halt(code),
         QueryResult::Owned(v) => {
             // Continue piping with owned value using eval_owned_pipe
             // Convert the result type since eval_owned_pipe uses Vec<u64> internally
@@ -7544,6 +7642,7 @@ fn eval_pipe<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 QueryResult::None => QueryResult::None,
                 QueryResult::ManyOwned(vs) => QueryResult::ManyOwned(vs),
                 QueryResult::Break(label) => QueryResult::Break(label),
+                QueryResult::Halt(code) => QueryResult::Halt(code),
                 QueryResult::Partial(vs, control) => QueryResult::Partial(vs, control),
                 _ => unreachable!("eval_owned_pipe only returns Owned-family variants"),
             }
@@ -7584,6 +7683,7 @@ fn pipe_owned_prefix<'a, S: EvalSemantics, W>(
             QueryResult::None => {}
             QueryResult::Error(e) => return partial(all_results, Control::Error(e)),
             QueryResult::Break(label) => return partial(all_results, Control::Break(label)),
+            QueryResult::Halt(code) => return partial(all_results, Control::Halt(code)),
             QueryResult::Partial(rs, control) => {
                 all_results.extend(rs);
                 return partial(all_results, control);
@@ -7815,12 +7915,14 @@ fn eval_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         QueryResult::None => return QueryResult::None,
         QueryResult::Error(e) => return QueryResult::Error(e),
         QueryResult::Break(label) => return QueryResult::Break(label),
+        QueryResult::Halt(code) => return QueryResult::Halt(code),
         QueryResult::OneCursor(_) => unreachable!("materialize_cursor should have converted this"),
         // Computed indexing's key/target forking isn't part of #400/#494's
         // verified semantics — conservatively matching the existing
         // Error/Break arms rather than inventing new partial-key behavior.
         QueryResult::Partial(_, Control::Error(e)) => return QueryResult::Error(e),
         QueryResult::Partial(_, Control::Break(label)) => return QueryResult::Break(label),
+        QueryResult::Partial(_, Control::Halt(code)) => return QueryResult::Halt(code),
     };
     if keys.is_empty() {
         return QueryResult::None;
@@ -7842,10 +7944,12 @@ fn eval_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         QueryResult::None => return QueryResult::None,
         QueryResult::Error(e) => return QueryResult::Error(e),
         QueryResult::Break(label) => return QueryResult::Break(label),
+        QueryResult::Halt(code) => return QueryResult::Halt(code),
         QueryResult::OneCursor(_) => unreachable!("materialize_cursor should have converted this"),
         // Same conservative treatment as the key stream above.
         QueryResult::Partial(_, Control::Error(e)) => return QueryResult::Error(e),
         QueryResult::Partial(_, Control::Break(label)) => return QueryResult::Break(label),
+        QueryResult::Partial(_, Control::Halt(code)) => return QueryResult::Halt(code),
     };
 
     // (2) Key outer, target inner.
@@ -7919,6 +8023,7 @@ fn eval_slice_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Ok(v) => v,
         Err(Control::Error(e)) => return QueryResult::Error(e),
         Err(Control::Break(label)) => return QueryResult::Break(label),
+        Err(Control::Halt(code)) => return QueryResult::Halt(code),
     };
     if starts.is_empty() {
         return QueryResult::None;
@@ -7927,6 +8032,7 @@ fn eval_slice_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Ok(v) => v,
         Err(Control::Error(e)) => return QueryResult::Error(e),
         Err(Control::Break(label)) => return QueryResult::Break(label),
+        Err(Control::Halt(code)) => return QueryResult::Halt(code),
     };
     if ends.is_empty() {
         return QueryResult::None;
@@ -7948,9 +8054,11 @@ fn eval_slice_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         QueryResult::None => return QueryResult::None,
         QueryResult::Error(e) => return QueryResult::Error(e),
         QueryResult::Break(label) => return QueryResult::Break(label),
+        QueryResult::Halt(code) => return QueryResult::Halt(code),
         QueryResult::OneCursor(_) => unreachable!("materialize_cursor should have converted this"),
         QueryResult::Partial(_, Control::Error(e)) => return QueryResult::Error(e),
         QueryResult::Partial(_, Control::Break(label)) => return QueryResult::Break(label),
+        QueryResult::Partial(_, Control::Halt(code)) => return QueryResult::Halt(code),
     };
 
     // S outer, T middle, E inner (point 2 above). The result is always
@@ -8026,6 +8134,7 @@ fn eval_slice_bound<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         QueryResult::None => return Ok(Vec::new()),
         QueryResult::Error(e) => return Err(Control::Error(e)),
         QueryResult::Break(label) => return Err(Control::Break(label)),
+        QueryResult::Halt(code) => return Err(Control::Halt(code)),
         QueryResult::OneCursor(_) => unreachable!("materialize_cursor should have converted this"),
         QueryResult::Partial(_, control) => return Err(control),
     };
@@ -8163,6 +8272,7 @@ pub fn eval_lenient<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         QueryResult::Owned(_) => Vec::new(), // Owned values not returned as StandardJson
         QueryResult::ManyOwned(_) => Vec::new(),
         QueryResult::Break(_) => Vec::new(), // Break without matching label
+        QueryResult::Halt(_) => Vec::new(),  // Halt: not representable as borrowed StandardJson
         QueryResult::Partial(..) => Vec::new(), // Same: not representable as borrowed StandardJson
     }
 }
@@ -8228,6 +8338,7 @@ fn eval_rhs_once<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         QueryResult::ManyOwned(vs) => Ok(vs.into_iter().next().unwrap_or(OwnedValue::Null)),
         QueryResult::OneCursor(_) => unreachable!("materialize_cursor should have converted this"),
         QueryResult::Break(label) => Err(QueryResult::Break(label)),
+        QueryResult::Halt(code) => Err(QueryResult::Halt(code)),
         // Same "take the first output, ignore the rest" policy as `ManyOwned`
         // above; the trailing control is dropped, consistent with how this
         // function already doesn't fork over a multi-output RHS (#392, a
@@ -8292,6 +8403,7 @@ fn eval_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             QueryResult::None => (Vec::new(), None),
             QueryResult::Error(e) => (Vec::new(), Some(Control::Error(e))),
             QueryResult::Break(label) => (Vec::new(), Some(Control::Break(label))),
+            QueryResult::Halt(code) => (Vec::new(), Some(Control::Halt(code))),
             QueryResult::Partial(vs, control) => (vs, Some(control)),
         };
 
@@ -8378,6 +8490,7 @@ fn eval_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             }
         }
         Some(Control::Break(label)) => partial(docs, Control::Break(label)),
+        Some(Control::Halt(code)) => partial(docs, Control::Halt(code)),
     }
 }
 
@@ -10823,6 +10936,12 @@ fn substitute_var_in_builtin(
         Builtin::DebugMsg(e) => {
             Builtin::DebugMsg(Box::new(substitute_var(e, var_name, replacement)))
         }
+        Builtin::Halt => Builtin::Halt,
+        Builtin::Stderr => Builtin::Stderr,
+        Builtin::HaltError => Builtin::HaltError,
+        Builtin::HaltErrorCode(e) => {
+            Builtin::HaltErrorCode(Box::new(substitute_var(e, var_name, replacement)))
+        }
         Builtin::Env => Builtin::Env,
         Builtin::EnvVar(e) => Builtin::EnvVar(Box::new(substitute_var(e, var_name, replacement))),
         Builtin::EnvObject(name) => Builtin::EnvObject(name.clone()),
@@ -10991,6 +11110,7 @@ fn eval_as<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             QueryResult::None => return QueryResult::None,
             QueryResult::Error(e) => return QueryResult::Error(e),
             QueryResult::Break(label) => return QueryResult::Break(label),
+            QueryResult::Halt(code) => return QueryResult::Halt(code),
             QueryResult::Partial(vs, control) => (vs, Some(control)),
         };
 
@@ -11009,6 +11129,7 @@ fn eval_as<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // The outputs already produced no longer vanish (#400, #494).
             QueryResult::Error(e) => return partial(all_results, Control::Error(e)),
             QueryResult::Break(label) => return partial(all_results, Control::Break(label)),
+            QueryResult::Halt(code) => return partial(all_results, Control::Halt(code)),
             QueryResult::Partial(vs, control) => {
                 all_results.extend(vs);
                 return partial(all_results, control);
@@ -11070,6 +11191,7 @@ fn eval_reduce<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         QueryResult::Error(_) if optional => return QueryResult::None,
         QueryResult::Error(e) => return QueryResult::Error(e),
         QueryResult::Break(label) => return QueryResult::Break(label),
+        QueryResult::Halt(code) => return QueryResult::Halt(code),
         // `reduce`'s own output is always single-shot — it only ever emits
         // the final accumulator, never intermediate values (verified against
         // jq: `reduce (1,2,error("x"),4) as $v (0;.+$v)` produces no output
@@ -11078,6 +11200,7 @@ fn eval_reduce<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         QueryResult::Partial(_prefix, Control::Error(_)) if optional => return QueryResult::None,
         QueryResult::Partial(_prefix, Control::Error(e)) => return QueryResult::Error(e),
         QueryResult::Partial(_prefix, Control::Break(label)) => return QueryResult::Break(label),
+        QueryResult::Partial(_prefix, Control::Halt(code)) => return QueryResult::Halt(code),
     };
 
     // Evaluate INIT. Each of its outputs forks the whole reduce into a fully
@@ -11097,6 +11220,7 @@ fn eval_reduce<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             QueryResult::Error(_) if optional => return QueryResult::None,
             QueryResult::Error(e) => return QueryResult::Error(e),
             QueryResult::Break(label) => return QueryResult::Break(label),
+            QueryResult::Halt(code) => return QueryResult::Halt(code),
             QueryResult::Partial(_, Control::Error(_)) if optional => return QueryResult::None,
             QueryResult::Partial(vs, control) => (vs, Some(control)),
         };
@@ -11271,6 +11395,7 @@ fn eval_owned_expr_ctrl<S: EvalSemantics>(
         QueryResult::None => Ok(OwnedValue::Null),
         QueryResult::Error(e) => Err(Control::Error(e)),
         QueryResult::Break(label) => Err(Control::Break(label)),
+        QueryResult::Halt(code) => Err(Control::Halt(code)),
         // Same collapse-to-single-or-array policy as `Many`/`ManyOwned`
         // above; the trailing control is dropped, consistent with how this
         // function already doesn't fork over a multi-output update (a
@@ -11294,6 +11419,15 @@ fn eval_owned_expr<S: EvalSemantics>(
     eval_owned_expr_ctrl::<S>(expr, input, optional).map_err(|control| match control {
         Control::Error(e) => e,
         Control::Break(label) => EvalError::new(format!("break ${label} not in label")),
+        // Same lossy-conversion tension as `result_to_owned`'s `Halt` arm
+        // (#791): this function's signature (`Result<OwnedValue, EvalError>`)
+        // has no way to carry `Control` through, so a `halt` reached here
+        // (e.g. inside `reduce`/`foreach`'s INIT/UPDATE via a caller that
+        // uses `eval_owned_expr` rather than `eval_owned_expr_ctrl`, which
+        // *does* carry `Control` through losslessly) comes back out as a
+        // plain `EvalError` an enclosing `try`/`catch` could swallow — the
+        // same pre-existing tension `Break` already has here, not a new gap.
+        Control::Halt(code) => EvalError::new(format!("halt({code}) not propagated")),
     })
 }
 
@@ -11342,6 +11476,7 @@ fn eval_owned_input<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         QueryResult::None => QueryResult::None,
         QueryResult::Error(e) => QueryResult::Error(e),
         QueryResult::Break(label) => QueryResult::Break(label),
+        QueryResult::Halt(code) => QueryResult::Halt(code),
         // Stream-preserving, so a `Partial` passes straight through — this
         // function's whole point is keeping the shape intact.
         QueryResult::Partial(vs, control) => QueryResult::Partial(vs, control),
@@ -11380,6 +11515,7 @@ fn eval_foreach<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             QueryResult::Error(_) if optional => return QueryResult::None,
             QueryResult::Error(e) => return QueryResult::Error(e),
             QueryResult::Break(label) => return QueryResult::Break(label),
+            QueryResult::Halt(code) => return QueryResult::Halt(code),
             QueryResult::Partial(vs, control) => (vs, Some(control)),
         };
 
@@ -11401,6 +11537,7 @@ fn eval_foreach<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             QueryResult::Error(_) if optional => return QueryResult::None,
             QueryResult::Error(e) => return QueryResult::Error(e),
             QueryResult::Break(label) => return QueryResult::Break(label),
+            QueryResult::Halt(code) => return QueryResult::Halt(code),
             QueryResult::Partial(vs, control) => (vs, Some(control)),
         };
 
@@ -11557,6 +11694,7 @@ fn eval_limit<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // wildcard arm below) instead of reaching its label — fixed
         // alongside #494, the same "limit drops what it shouldn't" family.
         QueryResult::Break(label) => QueryResult::Break(label),
+        QueryResult::Halt(code) => QueryResult::Halt(code),
         // jq's generator-based `limit` never asks its operand for values
         // past `n` (verified: `limit(2; 1,2,error("boom"))` is `1`, `2`,
         // exit 0 — the error is never even reached). So once `n` outputs are
@@ -11609,6 +11747,7 @@ fn eval_first_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         QueryResult::None => QueryResult::None,
         QueryResult::Error(e) => QueryResult::Error(e),
         QueryResult::Break(label) => QueryResult::Break(label),
+        QueryResult::Halt(code) => QueryResult::Halt(code),
         // jq's generator-based `first` never asks for values past the
         // first (verified: `first(1,2,error("x"))` is `1`, exit 0 — the
         // error is never reached), so a non-empty prefix always satisfies
@@ -11646,6 +11785,7 @@ fn eval_last_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         QueryResult::None => QueryResult::None,
         QueryResult::Error(e) => QueryResult::Error(e),
         QueryResult::Break(label) => QueryResult::Break(label),
+        QueryResult::Halt(code) => QueryResult::Halt(code),
         // Unlike `first`, `last` cannot short-circuit — it doesn't know a
         // value is the last one until the stream is exhausted (verified:
         // `last(1,2,error("x"))` raises, it does not answer `2`) — so a
@@ -11653,6 +11793,7 @@ fn eval_last_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // same as `reduce`'s input-stream handling.
         QueryResult::Partial(_, Control::Error(e)) => QueryResult::Error(e),
         QueryResult::Partial(_, Control::Break(label)) => QueryResult::Break(label),
+        QueryResult::Partial(_, Control::Halt(code)) => QueryResult::Halt(code),
     }
 }
 
@@ -11697,6 +11838,7 @@ fn eval_nth_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         QueryResult::None => QueryResult::None,
         QueryResult::Error(e) => QueryResult::Error(e),
         QueryResult::Break(label) => QueryResult::Break(label),
+        QueryResult::Halt(code) => QueryResult::Halt(code),
         // Like `first`/`limit`, `nth` never asks for values past index `n`
         // (verified: `nth(1; 1,2,error("x"))` is `2`, exit 0, but
         // `nth(5; 1,2,error("x"))` raises — index 5 was never reached). So
@@ -11707,6 +11849,7 @@ fn eval_nth_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             None => match control {
                 Control::Error(e) => QueryResult::Error(e),
                 Control::Break(label) => QueryResult::Break(label),
+                Control::Halt(code) => QueryResult::Halt(code),
             },
         },
     }
@@ -12345,6 +12488,7 @@ fn accumulate_path_context_step<'a, W: Clone + AsRef<[u64]>>(
         QueryResult::None => None,
         QueryResult::Error(e) => Some(partial(core::mem::take(results), Control::Error(e))),
         QueryResult::Break(label) => Some(partial(core::mem::take(results), Control::Break(label))),
+        QueryResult::Halt(code) => Some(partial(core::mem::take(results), Control::Halt(code))),
         QueryResult::Partial(vs, control) => {
             results.extend(vs);
             Some(partial(core::mem::take(results), control))
@@ -12428,6 +12572,7 @@ fn continue_rest_with_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         QueryResult::None => QueryResult::None,
         QueryResult::Error(e) => QueryResult::Error(e),
         QueryResult::Break(label) => QueryResult::Break(label),
+        QueryResult::Halt(code) => QueryResult::Halt(code),
         // `intermediate` produced `vs` before terminating in `outer_control`
         // (#400, #494): pipe each already-produced value through `rest`
         // first -- mirroring `pipe_owned_prefix`'s handling of the same
@@ -13165,6 +13310,7 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
                 QueryResult::None => (Vec::new(), None),
                 QueryResult::Error(e) => (Vec::new(), Some(Control::Error(e))),
                 QueryResult::Break(label) => (Vec::new(), Some(Control::Break(label))),
+                QueryResult::Halt(code) => (Vec::new(), Some(Control::Halt(code))),
                 QueryResult::Partial(vs, control) => (vs, Some(control)),
                 QueryResult::One(_) | QueryResult::OneCursor(_) | QueryResult::Many(_) => {
                     unreachable!(
@@ -17041,6 +17187,11 @@ fn builtin_builtins<'a, W: Clone + AsRef<[u64]>>() -> QueryResult<'a, W> {
         // Debug (arity 0-1)
         "debug/0",
         "debug/1",
+        // Process control (#791)
+        "halt/0",
+        "halt_error/0",
+        "halt_error/1",
+        "stderr/0",
         // Environment (arity 0-1)
         "env/0",
         "env/1",
@@ -17173,6 +17324,7 @@ fn builtin_limit<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         QueryResult::None => QueryResult::None,
         QueryResult::Error(e) => QueryResult::Error(e),
         QueryResult::Break(label) => QueryResult::Break(label),
+        QueryResult::Halt(code) => QueryResult::Halt(code),
         // Same semantics as `eval_limit`: jq's generator-based `limit` never
         // asks for values past `n`, so a prefix that already reaches `n`
         // drops the trailing control; only a shorter prefix still surfaces it.
@@ -17216,6 +17368,7 @@ fn builtin_first_stream<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         QueryResult::None => QueryResult::None,
         QueryResult::Error(e) => QueryResult::Error(e),
         QueryResult::Break(label) => QueryResult::Break(label),
+        QueryResult::Halt(code) => QueryResult::Halt(code),
         // Same semantics as `eval_first_expr`: a non-empty prefix always
         // satisfies `first`, so the trailing control is dropped.
         QueryResult::Partial(vs, _control) => QueryResult::Owned(vs.into_iter().next().unwrap()),
@@ -17250,10 +17403,12 @@ fn builtin_last_stream<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         QueryResult::None => QueryResult::None,
         QueryResult::Error(e) => QueryResult::Error(e),
         QueryResult::Break(label) => QueryResult::Break(label),
+        QueryResult::Halt(code) => QueryResult::Halt(code),
         // Same semantics as `eval_last_expr`: `last` cannot short-circuit,
         // so a `Partial` just surfaces its control, dropping the prefix.
         QueryResult::Partial(_, Control::Error(e)) => QueryResult::Error(e),
         QueryResult::Partial(_, Control::Break(label)) => QueryResult::Break(label),
+        QueryResult::Partial(_, Control::Halt(code)) => QueryResult::Halt(code),
     }
 }
 
@@ -17307,6 +17462,7 @@ fn builtin_nth_stream<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         | QueryResult::None => QueryResult::None,
         QueryResult::Error(e) => QueryResult::Error(e),
         QueryResult::Break(label) => QueryResult::Break(label),
+        QueryResult::Halt(code) => QueryResult::Halt(code),
         // Same semantics as `eval_nth_expr`: the trailing control is dropped
         // once the prefix reaches index `n`, and surfaces otherwise.
         QueryResult::Partial(vs, control) => match vs.into_iter().nth(n) {
@@ -17314,6 +17470,7 @@ fn builtin_nth_stream<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             None => match control {
                 Control::Error(e) => QueryResult::Error(e),
                 Control::Break(label) => QueryResult::Break(label),
+                Control::Halt(code) => QueryResult::Halt(code),
             },
         },
     }
@@ -17953,6 +18110,92 @@ fn builtin_debug_msg<'a, W: Clone + AsRef<[u64]>>(
     QueryResult::Owned(to_owned(&value))
 }
 
+// Process control functions (#791)
+//
+// Unlike `debug`/`debug(msg)` above, these genuinely write to stderr rather
+// than staying a library-context no-op: `stderr`'s write has to fire *during*
+// generator iteration (e.g. `(1,2,3) | stderr` needs three separate
+// interleaved writes as each value streams through), which can't be deferred
+// to a CLI-layer batch print the way `ErrorSink`'s diagnostics are. Gated the
+// same way `$ENV`/`env` gate their (read-only) OS interaction below.
+
+/// Write raw bytes to stderr. No-op under `no_std` (mirrors `eval_env`'s
+/// std/no_std split just below — there is no OS stderr to write to there).
+#[cfg(feature = "std")]
+fn write_stderr(s: &str) {
+    use std::io::Write;
+    let _ = std::io::stderr().write_all(s.as_bytes());
+}
+
+#[cfg(not(feature = "std"))]
+fn write_stderr(_s: &str) {}
+
+/// Builtin: halt - stop the interpreter immediately, exit code 0, no output.
+///
+/// Carried as `Control::Halt`, which — unlike `Control::Error`/`Control::Break`
+/// — `try`/`catch` and `label`/`break` deliberately do not intercept (verified
+/// live against real jq: both bypass it entirely). See `Control::Halt`'s doc
+/// comment for why a dedicated variant makes that automatic.
+fn builtin_halt<'a, W: Clone + AsRef<[u64]>>() -> QueryResult<'a, W> {
+    partial(vec![], Control::Halt(0))
+}
+
+/// Builtin: stderr - print input in raw-and-compact mode to stderr (raw
+/// content for strings, compact JSON otherwise, `null` prints literal
+/// `null`), with no trailing newline ever, then pass the value through
+/// unchanged. Byte-for-byte behavior verified against real jq.
+fn builtin_stderr<W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'_, W>,
+    _optional: bool,
+) -> QueryResult<'_, W> {
+    let owned = to_owned(&value);
+    write_stderr(&owned_to_string(&owned));
+    QueryResult::Owned(owned)
+}
+
+/// Builtin: halt_error / halt_error(exit_code) - print input to stderr and
+/// halt. `null` prints nothing; a string prints raw with no trailing newline;
+/// anything else prints compact JSON with a trailing newline (all verified
+/// byte-for-byte against real jq — this differs from `stderr`'s formatting in
+/// both respects, so it isn't implemented by calling `stderr` first).
+///
+/// Default exit code (no explicit argument) is `S::DEFAULT_HALT_ERROR_CODE`
+/// (5 for jq, 1 for yq, mirroring `DiagStyle::error_exit_code()` in the CLI);
+/// an explicit `halt_error(n)` always wins verbatim in either mode, matching
+/// real jq.
+fn builtin_halt_error<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    code_expr: Option<&Expr>,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    let code = match code_expr {
+        Some(expr) => {
+            let n_result = eval_single::<W, S>(expr, value.clone(), optional);
+            match result_to_owned(n_result) {
+                Ok(OwnedValue::Int(i) | OwnedValue::NumberLiteral(NumberRepr::Int(i), _)) => {
+                    i as i32
+                }
+                Ok(OwnedValue::Float(f)) => f as i32,
+                Ok(_) => {
+                    return QueryResult::Error(EvalError::new(
+                        "halt_error/1 requires a number exit code",
+                    ));
+                }
+                Err(e) => return QueryResult::Error(e),
+            }
+        }
+        None => S::DEFAULT_HALT_ERROR_CODE,
+    };
+
+    let owned = to_owned(&value);
+    match &owned {
+        OwnedValue::Null => {}
+        OwnedValue::String(s) => write_stderr(s),
+        other => write_stderr(&format!("{}\n", other.to_json())),
+    }
+    partial(vec![], Control::Halt(code))
+}
+
 // Environment functions
 
 /// $ENV expression - returns object of all environment variables
@@ -18290,6 +18533,7 @@ fn builtin_pick<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         }
         QueryResult::Error(e) => return QueryResult::Error(e),
         QueryResult::Break(label) => return QueryResult::Break(label),
+        QueryResult::Halt(code) => return QueryResult::Halt(code),
         QueryResult::None if optional => return QueryResult::None,
         QueryResult::None => {
             return QueryResult::Error(EvalError::new("pick: keys expression produced no output"))
@@ -18380,6 +18624,7 @@ fn builtin_omit<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         }
         QueryResult::Error(e) => return QueryResult::Error(e),
         QueryResult::Break(label) => return QueryResult::Break(label),
+        QueryResult::Halt(code) => return QueryResult::Halt(code),
         QueryResult::None if optional => return QueryResult::None,
         QueryResult::None => {
             return QueryResult::Error(EvalError::new("omit: keys expression produced no output"))
@@ -18757,6 +19002,7 @@ fn eval_as_pattern<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             QueryResult::None => return QueryResult::None,
             QueryResult::Error(e) => return QueryResult::Error(e),
             QueryResult::Break(label) => return QueryResult::Break(label),
+            QueryResult::Halt(code) => return QueryResult::Halt(code),
             QueryResult::Partial(vs, control) => (vs, Some(control)),
         };
 
@@ -18785,6 +19031,7 @@ fn eval_as_pattern<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // The outputs already produced no longer vanish (#400, #494).
             QueryResult::Error(e) => return partial(all_results, Control::Error(e)),
             QueryResult::Break(label) => return partial(all_results, Control::Break(label)),
+            QueryResult::Halt(code) => return partial(all_results, Control::Halt(code)),
             QueryResult::Partial(vs, control) => {
                 all_results.extend(vs);
                 return partial(all_results, control);
@@ -19724,6 +19971,12 @@ fn expand_func_calls_in_builtin(
         Builtin::DebugMsg(e) => {
             Builtin::DebugMsg(Box::new(expand_func_calls(e, func_name, params, body)))
         }
+        Builtin::Halt => Builtin::Halt,
+        Builtin::Stderr => Builtin::Stderr,
+        Builtin::HaltError => Builtin::HaltError,
+        Builtin::HaltErrorCode(e) => {
+            Builtin::HaltErrorCode(Box::new(expand_func_calls(e, func_name, params, body)))
+        }
         Builtin::Env => Builtin::Env,
         Builtin::EnvVar(e) => {
             Builtin::EnvVar(Box::new(expand_func_calls(e, func_name, params, body)))
@@ -20052,6 +20305,12 @@ fn substitute_func_param_in_builtin(builtin: &Builtin, param: &str, arg: &Expr) 
         Builtin::IsFinite => Builtin::IsFinite,
         Builtin::Debug => Builtin::Debug,
         Builtin::DebugMsg(e) => Builtin::DebugMsg(Box::new(substitute_func_param(e, param, arg))),
+        Builtin::Halt => Builtin::Halt,
+        Builtin::Stderr => Builtin::Stderr,
+        Builtin::HaltError => Builtin::HaltError,
+        Builtin::HaltErrorCode(e) => {
+            Builtin::HaltErrorCode(Box::new(substitute_func_param(e, param, arg)))
+        }
         Builtin::Env => Builtin::Env,
         Builtin::EnvVar(e) => Builtin::EnvVar(Box::new(substitute_func_param(e, param, arg))),
         Builtin::EnvObject(name) => Builtin::EnvObject(name.clone()),
@@ -22695,6 +22954,113 @@ mod tests {
         // try without catch - error is suppressed
         query!(br"{}", "try error(\"oops\")",
             QueryResult::None => {}
+        );
+    }
+
+    /// `halt`, `halt_error`/`halt_error(n)`, and `stderr` (#791). These tests
+    /// only exercise `eval.rs`'s `QueryResult`/`Control` shape — `eval.rs`
+    /// never calls `process::exit` itself (only `main.rs` does, once the CLI
+    /// runner sees the exit code), so asserting on `Control::Halt` here can't
+    /// terminate the test process. `stderr`'s real write (std-gated) does
+    /// fire during these tests, same as any other test exercising it; that's
+    /// harmless, just not asserted on here (see the CLI-level tests in
+    /// `tests/jq_cli_tests.rs`/`tests/yq_cli_tests.rs` for the actual byte
+    /// content of what gets written).
+    #[test]
+    fn test_halt_basic() {
+        // Bare `halt`: no output, exit code 0, no prior prefix.
+        query!(b"null", "halt",
+            QueryResult::Halt(0) => {}
+        );
+    }
+
+    #[test]
+    fn test_halt_keeps_prior_output_as_a_partial_prefix() {
+        // Verified against jq 1.7.1: `jq -n '1,2,halt,3'` prints `1` and `2`
+        // then exits 0 -- outputs already produced before `halt` survive,
+        // same #400/#494 mechanism as `error`/`break`, but nothing after it
+        // runs.
+        query!(b"null", "1,2,halt,3",
+            QueryResult::Partial(vs, Control::Halt(0)) => {
+                assert_eq!(prefix_json(&vs), ["1", "2"]);
+            }
+        );
+    }
+
+    #[test]
+    fn test_halt_not_caught_by_try_catch() {
+        // Verified live against jq 1.7.1: `jq -n 'try (halt) catch "caught"'`
+        // exits 0 and never prints "caught" -- unlike `error`, `halt` is not
+        // catchable.
+        query!(b"null", r#"try (halt) catch "caught""#,
+            QueryResult::Halt(0) => {}
+        );
+    }
+
+    #[test]
+    fn test_halt_not_caught_by_label_break() {
+        // Verified live against jq 1.7.1: `jq -n 'label $out | (halt, break
+        // $out)'` exits 0 -- the label's own `break $out` never gets a chance
+        // to run, and even if it did, `halt` wouldn't be caught by it either.
+        query!(b"null", "label $out | (halt, break $out)",
+            QueryResult::Halt(0) => {}
+        );
+    }
+
+    #[test]
+    fn test_halt_error_default_exit_code() {
+        // Bare `halt_error` defaults to jq's exit code 5 under `JqSemantics`
+        // (`query!` always evaluates with `JqSemantics`; the yq-mode default
+        // of 1 is exercised by `yq_query!` in the sibling test below).
+        query!(br#""x""#, "halt_error",
+            QueryResult::Halt(5) => {}
+        );
+    }
+
+    #[test]
+    fn test_halt_error_custom_exit_code() {
+        // Verified against jq 1.7.1: `"foo" | halt_error(7)` exits 7, not 5.
+        query!(br#""x""#, "halt_error(7)",
+            QueryResult::Halt(7) => {}
+        );
+    }
+
+    #[test]
+    fn test_halt_error_not_caught_by_try_catch() {
+        // Verified live against jq 1.7.1: `try ("x"|halt_error) catch
+        // "caught"` exits 5 and never prints "caught".
+        query!(b"null", r#"try ("x"|halt_error) catch "caught""#,
+            QueryResult::Halt(5) => {}
+        );
+    }
+
+    #[test]
+    fn test_stderr_passes_through_unchanged() {
+        // `stderr`'s whole point is a real side effect the evaluator alone
+        // can't observe in-process (see this block's doc comment) -- what
+        // *can* be asserted here is the passthrough contract: the returned
+        // value is exactly the input, unchanged.
+        query!(br#""hello""#, "stderr",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "hello");
+            }
+        );
+        query!(b"[1,2]", "stderr",
+            QueryResult::Owned(OwnedValue::Array(vs)) => {
+                assert_eq!(vs, vec![OwnedValue::Int(1), OwnedValue::Int(2)]);
+            }
+        );
+    }
+
+    #[test]
+    fn test_yq_halt_error_default_exit_code() {
+        // yq mode's bare `halt_error` defaults to 1 (yq's uniform failure
+        // code, `DiagStyle::error_exit_code()`'s yq arm in `output.rs`), not
+        // jq's 5 -- there is no real `yq` to verify this against (mikefarah/yq
+        // has no `halt_error`; this is this codebase's own documented
+        // extension), so this pins the deliberate design choice instead.
+        yq_query!(br#""x""#, "halt_error",
+            QueryResult::Halt(1) => {}
         );
     }
 

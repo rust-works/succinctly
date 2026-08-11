@@ -54,6 +54,13 @@ pub struct EvalError {
 pub enum Control {
     Error(EvalError),
     Break(String),
+    /// `halt`/`halt_error(n)`: exit the whole process with this code. Unlike
+    /// `Error`/`Break`, this must NOT be caught by `try`/`catch` or
+    /// `label`/`break` (confirmed against real jq: both bypass it entirely) —
+    /// carried as its own variant rather than reusing `Error` so those two
+    /// handlers' existing `other => other` fallthrough passes it through
+    /// unchanged without needing to special-case it.
+    Halt(i32),
 }
 
 /// jq truncates values embedded in error messages to a fixed-width buffer

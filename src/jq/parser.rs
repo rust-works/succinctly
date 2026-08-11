@@ -1976,6 +1976,31 @@ impl<'a> Parser<'a> {
             return Ok(Some(Builtin::Empty));
         }
 
+        // Process control (#791)
+        if self.matches_keyword("halt_error") {
+            // Check halt_error before halt so "halt_error" isn't parsed as
+            // "halt" followed by a stray "_error".
+            self.consume_keyword("halt_error");
+            self.skip_ws();
+            if self.peek() == Some('(') {
+                self.next();
+                self.skip_ws();
+                let code = self.parse_expr()?;
+                self.skip_ws();
+                self.expect(')')?;
+                return Ok(Some(Builtin::HaltErrorCode(Box::new(code))));
+            }
+            return Ok(Some(Builtin::HaltError));
+        }
+        if self.matches_keyword("halt") {
+            self.consume_keyword("halt");
+            return Ok(Some(Builtin::Halt));
+        }
+        if self.matches_keyword("stderr") {
+            self.consume_keyword("stderr");
+            return Ok(Some(Builtin::Stderr));
+        }
+
         // Map functions
         if self.matches_keyword("map_values") {
             // Check map_values before map
