@@ -233,6 +233,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`yq --front-matter`/`--split-exp`/`--eval-all` correctness fixes found
+  reviewing #715 before merge**:
+  - `--front-matter=extract --inplace` overwrote the target file with just
+    the transformed front matter, discarding everything after the closing
+    fence — `extract` mode captures no body to reattach (only `process`
+    does). Now rejected with a clear error; use `--front-matter=process` to
+    edit in place.
+  - The path-context evaluator's shared `Partial`-result continuation
+    (`continue_rest_with_context`, reached by `Select`/`Map`/`If`/`Comma`/
+    `Try`/`Label`) skipped piping its already-produced values through the
+    rest of the pipe: `.[] | (1, error("boom")) | file_index` returned the
+    raw `1` instead of `file_index`'s resolved value, and silently dropped
+    any error the rest of the pipe would itself have raised.
+  - `--eval-all` never routed its output through the `SplitDocState` state
+    machine every other output path uses, so `--eval-all '... | split_doc'`
+    silently merged every result with zero `---` separators.
+  - `--split-exp`'s expression never received `--arg`/`--argjson`/`$ARGS`
+    substitution (only `$index` was bound per result), so a filename
+    expression referencing an `--arg` value failed as an undefined variable
+    even though the same `--arg` works for the main filter.
+  - `--front-matter`'s fence detection scanned only for `\n`, so a file with
+    classic-Mac (`\r`-only) line endings collapsed into one "line" and its
+    front matter was misreported as unterminated — the same failure class
+    #324 already fixed for the YAML parser — and a leading UTF-8 BOM
+    defeated fence detection entirely, both now fixed by routing through
+    the shared `text::line_break` rule.
+  - `apply_front_matter` silently forced `InputFormat::Yaml` even when the
+    caller explicitly passed `--input-format json`; now rejected instead.
+
+  Also documented two pre-existing behaviors, not bugs, found along the
+  way: `--slurp`/`--eval-all` output carries no comments (both combine
+  documents through the `OwnedValue` DOM, which has none to carry), and
+  `--front-matter`'s position builtins (`at_offset`/`at_position`/`line`/
+  `column`) resolve against the extracted YAML block's own coordinates,
+  not the original file.
+
 - **`gmtime`, `mktime`, and `strptime` raised the right exit code but the
   wrong message on bad input** (#761): `gmtime`/`localtime` on a non-number
   reported the generic `"math function requires number"` (shared with
