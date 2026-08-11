@@ -539,6 +539,24 @@ impl EvalError {
         ))
     }
 
+    /// `<builtin>() requires numeric inputs` — `gmtime`/`localtime` on a
+    /// non-number input.
+    pub fn datetime_requires_number(builtin: &str) -> Self {
+        Self::new(format!("{builtin}() requires numeric inputs"))
+    }
+
+    /// `mktime requires array inputs`.
+    pub fn mktime_requires_array() -> Self {
+        Self::new("mktime requires array inputs")
+    }
+
+    /// `date "<input>" does not match format "<fmt>"` — any `strptime`
+    /// parse failure. jq reports this one wording regardless of which
+    /// format specifier the input failed to satisfy.
+    pub fn strptime_no_match(input: &str, fmt: &str) -> Self {
+        Self::new(format!(r#"date "{input}" does not match format "{fmt}""#))
+    }
+
     /// `<a> and <b> <phrase>`.
     fn pair(left: &OwnedValue, right: &OwnedValue, phrase: &str) -> Self {
         Self::new(format!(

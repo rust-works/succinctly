@@ -13603,7 +13603,9 @@ fn builtin_gmtime<W: Clone + AsRef<[u64]>>(
     value: StandardJson<'_, W>,
     optional: bool,
 ) -> QueryResult<'_, W> {
-    let timestamp = match get_float_value::<W>(&value, optional) {
+    let timestamp = match get_float_value_with::<W>(&value, optional, || {
+        EvalError::datetime_requires_number("gmtime")
+    }) {
         Ok(f) => f,
         Err(r) => return r,
     };
@@ -13670,7 +13672,9 @@ fn builtin_localtime<W: Clone + AsRef<[u64]>>(
 ) -> QueryResult<'_, W> {
     #[cfg(feature = "std")]
     {
-        let timestamp = match get_float_value::<W>(&value, optional) {
+        let timestamp = match get_float_value_with::<W>(&value, optional, || {
+            EvalError::datetime_requires_number("localtime")
+        }) {
             Ok(f) => f,
             Err(r) => return r,
         };
@@ -13821,7 +13825,7 @@ fn builtin_mktime<W: Clone + AsRef<[u64]>>(
     let arr = match to_owned(&value) {
         OwnedValue::Array(a) => a,
         _ if optional => return QueryResult::None,
-        _ => return QueryResult::Error(EvalError::type_error("array", "mktime")),
+        _ => return QueryResult::Error(EvalError::mktime_requires_array()),
     };
 
     // Need at least 6 elements: [year, month, day, hour, minute, second]
@@ -14096,7 +14100,7 @@ fn builtin_strptime<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             QueryResult::Owned(OwnedValue::Array(result))
         }
         Err(_) if optional => QueryResult::None,
-        Err(e) => QueryResult::Error(EvalError::new(e)),
+        Err(_) => QueryResult::Error(EvalError::strptime_no_match(&input, &fmt)),
     }
 }
 
@@ -15806,6 +15810,19 @@ fn get_float_value<'a, W: Clone + AsRef<[u64]>>(
     value: &StandardJson<'a, W>,
     optional: bool,
 ) -> Result<f64, QueryResult<'a, W>> {
+    get_float_value_with(value, optional, || {
+        EvalError::new("math function requires number")
+    })
+}
+
+/// Like [`get_float_value`], but with a caller-supplied error for the
+/// non-number case — used by `gmtime`/`localtime` to raise jq's own wording
+/// instead of the generic math-function message.
+fn get_float_value_with<'a, W: Clone + AsRef<[u64]>>(
+    value: &StandardJson<'a, W>,
+    optional: bool,
+    not_a_number: impl FnOnce() -> EvalError,
+) -> Result<f64, QueryResult<'a, W>> {
     match value {
         StandardJson::Number(n) => {
             if is_nan_sentinel(n.raw_bytes()) {
@@ -15819,9 +15836,7 @@ fn get_float_value<'a, W: Clone + AsRef<[u64]>>(
             }
         }
         _ if optional => Err(QueryResult::None),
-        _ => Err(QueryResult::Error(EvalError::new(
-            "math function requires number",
-        ))),
+        _ => Err(QueryResult::Error(not_a_number())),
     }
 }
 
