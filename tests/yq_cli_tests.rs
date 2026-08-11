@@ -5518,6 +5518,51 @@ fn test_flow_collection_trailing_comment_preserved_710() -> Result<()> {
     Ok(())
 }
 
+/// #794: unlike the comment-after-the-closing-bracket case just above, a
+/// comment between the *last element* and the closing bracket *on a
+/// following line* used to be silently dropped from identity output
+/// entirely (not merely reformatted differently). The parser already
+/// attributes it to the last element (verified via the DOM path, which
+/// showed it correctly before this fix - see #793's own repro); the bug was
+/// that flow-style rendering never emitted an item's own trailing comment
+/// at all. A newline before the closing bracket is required for validity -
+/// `#` would otherwise consume the bracket into the comment text - so exact
+/// formatting isn't expected to byte-match real `yq`'s own reformatting.
+#[test]
+fn test_flow_sequence_comment_before_closing_bracket_on_next_line_794() -> Result<()> {
+    let (out, code) = run_yq_stdin(".", "a: [1, 2, 3 # trailing\n]\n", &[])?;
+    assert_eq!(code, 0);
+    assert!(out.contains("# trailing"), "comment missing: {out:?}");
+    // Must still be valid YAML that round-trips without losing the comment.
+    let (out2, code2) = run_yq_stdin(".", &out, &[])?;
+    assert_eq!(code2, 0);
+    assert_eq!(out2, out);
+    Ok(())
+}
+
+/// Same shape, but for a flow mapping rather than a flow sequence.
+#[test]
+fn test_flow_mapping_comment_before_closing_brace_on_next_line_794() -> Result<()> {
+    let (out, code) = run_yq_stdin(".", "a: {b: 1, c: 2 # trailing\n}\n", &[])?;
+    assert_eq!(code, 0);
+    assert!(out.contains("# trailing"), "comment missing: {out:?}");
+    let (out2, code2) = run_yq_stdin(".", &out, &[])?;
+    assert_eq!(code2, 0);
+    assert_eq!(out2, out);
+    Ok(())
+}
+
+/// Regression guard: a *single*-element flow collection with the comment
+/// before the closing bracket on the next line hits the same "last item"
+/// code path as the multi-element cases above.
+#[test]
+fn test_flow_sequence_single_element_comment_before_closing_bracket_794() -> Result<()> {
+    let (out, code) = run_yq_stdin(".", "a: [1 # trailing\n]\n", &[])?;
+    assert_eq!(code, 0);
+    assert!(out.contains("# trailing"), "comment missing: {out:?}");
+    Ok(())
+}
+
 #[test]
 fn test_quoted_scalar_comment_preserved_710() -> Result<()> {
     let (out, code) = run_yq_stdin(".", "a: \"hello\" # quoted\n", &[])?;

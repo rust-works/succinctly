@@ -1372,7 +1372,6 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                 if indent_spaces == 0 || self.style() == "flow" {
                     // Flow style
                     out.write_char('{')?;
-                    let mut first = true;
                     let mut items: Vec<_> = fields.into_iter().collect();
                     if sort_keys {
                         let mut keyed: Vec<_> = items
@@ -1382,14 +1381,22 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                         keyed.sort_by(|a, b| a.0.cmp(&b.0));
                         items = keyed.into_iter().map(|(_, field)| field).collect();
                     }
-                    for field in items {
-                        if !first {
+                    let last_index = items.len() - 1;
+                    for (i, field) in items.into_iter().enumerate() {
+                        if i != 0 {
                             out.write_str(", ")?;
                         }
-                        first = false;
                         write_yaml_field_key(out, field)?;
                         out.write_str(": ")?;
                         write_yaml_child_inline(out, field.value_cursor(), unit, sort_keys)?;
+                        if i == last_index {
+                            write_flow_last_item_comment(
+                                out,
+                                field.value_cursor().line_comment_raw(),
+                                current_indent,
+                                unit,
+                            )?;
+                        }
                     }
                     out.write_char('}')
                 } else {
@@ -1482,6 +1489,14 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                         }
                         first = false;
                         write_yaml_child_inline(out, cursor, unit, sort_keys)?;
+                        if rest.is_empty() {
+                            write_flow_last_item_comment(
+                                out,
+                                cursor.line_comment_raw(),
+                                current_indent,
+                                unit,
+                            )?;
+                        }
                         elems = rest;
                     }
                     out.write_char(']')
@@ -5587,6 +5602,35 @@ fn write_line_comment<Out: core::fmt::Write>(
         }
         None => Ok(()),
     }
+}
+
+/// Write the last item's own trailing comment in a flow-style sequence or
+/// mapping, if present, followed by a newline and reindent to the
+/// container's own indentation (issue #794).
+///
+/// A comment can't be followed by the closing `]`/`}` on the same line -
+/// `#` would consume the bracket into the comment text, corrupting the
+/// YAML - so unlike a comment elsewhere in a flow collection, the last
+/// item's own comment forces a line break before the close, mirroring real
+/// `yq`'s own reformatting for this shape (which also adds a trailing
+/// comma; that's not replicated here, as it's cosmetic and comma-before-
+/// comment isn't required by the grammar). Only the *last* item is handled
+/// this way - a comment on a middle item would need to avoid also
+/// swallowing the following `,` onto the same line, which no filed issue
+/// currently asks for.
+fn write_flow_last_item_comment<Out: core::fmt::Write>(
+    out: &mut Out,
+    comment: Option<&str>,
+    current_indent: usize,
+    unit: char,
+) -> core::fmt::Result {
+    if let Some(c) = comment {
+        out.write_char(' ')?;
+        out.write_str(c)?;
+        out.write_char('\n')?;
+        write_yaml_indent(out, current_indent, unit)?;
+    }
+    Ok(())
 }
 
 /// Stream independent document cursors as a single YAML sequence (block or
