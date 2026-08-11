@@ -6445,10 +6445,10 @@ fn builtin_match<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             QueryResult::ManyOwned(matches)
         }
     } else {
-        // Return first match or null
+        // Return first match, or no output (not `null`) when there's no match.
         match re.captures(&input) {
             Some(caps) => QueryResult::Owned(build_match_object(&re, &caps)),
-            None => QueryResult::Owned(OwnedValue::Null),
+            None => QueryResult::None,
         }
     }
 }
@@ -25133,10 +25133,27 @@ mod tests {
                 assert_eq!(obj.get("length"), Some(&OwnedValue::Int(3)));
             }
         );
+    }
 
-        // No match returns null
-        query!(br#""hello""#, r#"match("[0-9]+")"#,
-            QueryResult::Owned(OwnedValue::Null) => {}
+    // #810: match(re) produced `null` on no match, diverging from real jq's
+    // "no output" (empty stream) behavior -- the same defect class #805 fixed
+    // for capture. match(re; flags) delegates to the same implementation, so
+    // both forms are covered here (verified against pinned jq-1.7.1: all four
+    // combinations below produce zero outputs).
+    #[cfg(feature = "regex")]
+    #[test]
+    fn test_regex_match_no_match_produces_no_output() {
+        query!(br#""abc""#, r#"match("[0-9]+")"#,
+            QueryResult::None => {}
+        );
+        query!(br#""abc""#, r#"match("[0-9]+")?"#,
+            QueryResult::None => {}
+        );
+        query!(br#""abc""#, r#"match("[0-9]+"; "")"#,
+            QueryResult::None => {}
+        );
+        query!(br#""abc""#, r#"match("[0-9]+"; "")?"#,
+            QueryResult::None => {}
         );
     }
 
