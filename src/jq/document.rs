@@ -214,6 +214,26 @@ pub trait DocumentCursor: Sized + Copy + Clone {
         Err(core::fmt::Error)
     }
 
+    /// Like [`stream_yaml`](Self::stream_yaml), but also appends this
+    /// cursor's own trailing comment (#710/#793) when it's a container -
+    /// for callers displaying this cursor's value as a complete result in
+    /// its own right (a navigated query result, or the whole document), as
+    /// opposed to a value nested inside a parent that already appends its
+    /// children's comments as it recurses.
+    ///
+    /// Default: delegates to `stream_yaml` unchanged. Correct for formats
+    /// without a comment concept (JSON) and as a fallback for any
+    /// `DocumentCursor` impl that doesn't override it; only YAML cursors
+    /// need to override this.
+    fn stream_yaml_as_document<W: core::fmt::Write>(
+        &self,
+        out: &mut W,
+        indent: IndentSpec,
+        sort_keys: bool,
+    ) -> core::fmt::Result {
+        self.stream_yaml(out, indent, sort_keys)
+    }
+
     /// Check if the value at this cursor is falsy (null or false).
     ///
     /// Used for `--exit-status` flag handling without requiring full materialization.

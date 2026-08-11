@@ -5688,6 +5688,31 @@ fn test_field_navigation_still_drops_comment_after_root_fix_710() -> Result<()> 
     Ok(())
 }
 
+/// #793a: unlike a navigated *scalar* (dropped, see above - matches real
+/// `yq`), a navigated *container* keeps its own trailing comment, the same
+/// as when that container is the whole document's root. Before the fix,
+/// `GenericResult::stream_yaml`'s `OneCursor`/`ManyCursor` arms always used
+/// the bare (comment-less) `stream_yaml`, so `.a` alone silently dropped it
+/// even though plain `.` on the same document already kept it.
+#[test]
+fn test_navigated_container_keeps_own_comment_793a() -> Result<()> {
+    let (out, code) = run_yq_stdin(".a", "a: [1, 2, 3] # trailing\nb: 2\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "[1, 2, 3] # trailing\n");
+    Ok(())
+}
+
+/// Same fix, but for a multi-result stream (`.[]`) rather than a single
+/// navigated result - each streamed container result keeps its own comment
+/// independently.
+#[test]
+fn test_iterated_containers_keep_own_comments_793a() -> Result<()> {
+    let (out, code) = run_yq_stdin(".[]", "- [1, 2] # x\n- [3, 4] # y\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "[1, 2] # x\n[3, 4] # y\n");
+    Ok(())
+}
+
 /// A comment trailing the first document's scalar root in a multi-document
 /// stream is dropped by real `yq` too (verified empirically) - not a
 /// regression to "fix" here.

@@ -5190,6 +5190,16 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
     }
 
     #[inline]
+    fn stream_yaml_as_document<Out: core::fmt::Write>(
+        &self,
+        out: &mut Out,
+        indent: IndentSpec,
+        sort_keys: bool,
+    ) -> core::fmt::Result {
+        YamlCursor::stream_yaml_as_document(self, out, indent, sort_keys)
+    }
+
+    #[inline]
     fn is_falsy(&self) -> bool {
         // A value is falsy if it's null or false
         match self.value() {

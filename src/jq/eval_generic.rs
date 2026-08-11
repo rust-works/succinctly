@@ -1201,8 +1201,12 @@ impl<V: DocumentValue> GenericResult<V> {
                 stats.any_truthy = !stats.last_was_falsy;
             }
             Self::OneCursor(c) => {
-                // Stream directly from cursor using DocumentCursor trait
-                c.stream_yaml(out, indent, sort_keys)?;
+                // Stream directly from cursor using DocumentCursor trait.
+                // `stream_yaml_as_document` (not the bare `stream_yaml`): a
+                // navigated container result keeps its own trailing comment
+                // just like the whole document does, unlike a navigated
+                // scalar (#793a).
+                c.stream_yaml_as_document(out, indent, sort_keys)?;
                 on_value(out)?;
                 stats.count = 1;
                 stats.last_was_falsy = c.is_falsy();
@@ -1220,7 +1224,9 @@ impl<V: DocumentValue> GenericResult<V> {
             }
             Self::ManyCursor(cs) => {
                 for c in cs {
-                    c.stream_yaml(out, indent, sort_keys)?;
+                    // See `OneCursor` above: each streamed result keeps its
+                    // own trailing comment if it's a container (#793a).
+                    c.stream_yaml_as_document(out, indent, sort_keys)?;
                     on_value(out)?;
                     stats.last_was_falsy = c.is_falsy();
                     stats.any_truthy |= !stats.last_was_falsy;
