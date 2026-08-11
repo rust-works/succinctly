@@ -2937,6 +2937,196 @@ fn test_halt_not_caught_by_try_catch_or_label() -> Result<()> {
     Ok(())
 }
 
+// Follow-up fixes to #791's halt-propagation sweep: a code-review pass found
+// several `eval_single`-consuming sites that read `QueryResult` directly via
+// a wildcard match instead of the new `result_to_owned`/`query_result_from_error`
+// helpers, so a halt reaching them was misreported as an ordinary error, a
+// bogus boolean, or silently swallowed. Every expectation below was verified
+// live against jq 1.7.1.
+
+#[test]
+fn test_halt_not_caught_by_try_catch_in_path_expression() -> Result<()> {
+    // `resolve_node`'s `Expr::Try` arm (the separate path-expression resolver
+    // behind `path()`, `=`, `|=`, `del()`) used to treat a halt smuggled back
+    // through `EvalError::halt_escape` as an ordinary catchable error.
+    // Verified against jq 1.7.1: `jq -n '1, del(try halt_error(9) catch empty), 2'`
+    // prints `1` and exits 9 -- the halt is never caught, so `2` never runs.
+    let (stdout, stderr, code) =
+        run_jq_full(&["-n", "1, del(try halt_error(9) catch empty), 2"], None)?;
+    assert_eq!(code, 9, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "1\n");
+    Ok(())
+}
+
+#[test]
+fn test_halt_not_caught_by_bare_optional_in_path_expression() -> Result<()> {
+    // `resolve_node`'s `Expr::Optional` blanket arm used to discard the
+    // error object entirely -- including any halt marker inside it -- as if
+    // it were a suppressed `?` failure. Verified against jq 1.7.1:
+    // `jq -n 'del((halt_error(4))?)'` exits 4, not 0.
+    let (stdout, stderr, code) = run_jq_full(&["-n", "del((halt_error(4))?)"], None)?;
+    assert_eq!(code, 4, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_halt_not_caught_by_try_catch_in_update_assignment() -> Result<()> {
+    // Same root cause as the `path()`/`del()` cases above, reached via `|=`:
+    // `eval_update`'s own top-level halt check never fires because the halt
+    // is already gone by the time `resolve_node` returns. Verified against
+    // jq 1.7.1: exits 9 after printing `1`.
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-n",
+            "{\"a\":1} | 1, ((try halt_error(9) catch empty) |= .+1), 2",
+        ],
+        None,
+    )?;
+    assert_eq!(code, 9, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "1\n");
+    Ok(())
+}
+
+#[test]
+fn test_isempty_propagates_halt_instead_of_answering_false() -> Result<()> {
+    // `builtin_isempty`'s wildcard arm used to answer `false` for a halt
+    // with zero prior outputs, exiting 0. Verified against jq 1.7.1:
+    // `jq -n 'isempty(halt_error(14))'` exits 14 with no output.
+    let (stdout, stderr, code) = run_jq_full(&["-n", "isempty(halt_error(14))"], None)?;
+    assert_eq!(code, 14, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_setpath_propagates_halt_in_path_argument() -> Result<()> {
+    // `builtin_setpath`'s path-array argument used to misreport a halt as
+    // "Path must be specified as an array". Verified against jq 1.7.1:
+    // `jq -n 'setpath([(halt_error(6))]; 1)'` exits 6.
+    let (stdout, stderr, code) = run_jq_full(&["-n", "setpath([(halt_error(6))]; 1)"], None)?;
+    assert_eq!(code, 6, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_setpath_propagates_halt_in_value_argument() -> Result<()> {
+    // `builtin_setpath`'s value argument used to fall through to `null`,
+    // silently writing `null` instead of halting. Verified against jq 1.7.1:
+    // `jq -n '{} | setpath(["a"]; halt_error(13))'` exits 13 with no output.
+    let (stdout, stderr, code) =
+        run_jq_full(&["-n", r#"{} | setpath(["a"]; halt_error(13))"#], None)?;
+    assert_eq!(code, 13, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_delpaths_propagates_halt_in_paths_argument() -> Result<()> {
+    // `builtin_delpaths` had the identical gap as `builtin_setpath` above.
+    // Verified against jq 1.7.1: `jq -n '{"a":1} | delpaths([(halt_error(7))])'`
+    // exits 7.
+    let (stdout, stderr, code) =
+        run_jq_full(&["-n", "{\"a\":1} | delpaths([(halt_error(7))])"], None)?;
+    assert_eq!(code, 7, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_nth_stream_propagates_halt_in_n_argument() -> Result<()> {
+    // The two-argument `nth(n; expr)` form matched its `n` argument's result
+    // directly; the wildcard arm turned a halt into a generic type error.
+    // Verified against jq 1.7.1: `jq -n 'nth(halt_error(12); 1,2,3)'` exits 12.
+    let (stdout, stderr, code) = run_jq_full(&["-n", "nth(halt_error(12); 1,2,3)"], None)?;
+    assert_eq!(code, 12, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_bsearch_propagates_halt_in_target_argument() -> Result<()> {
+    // `builtin_bsearch`'s target-expression wildcard swallowed a halt as if
+    // the target produced no value. Verified against jq 1.7.1:
+    // `jq -n '[1,2,3] | bsearch(halt_error(15))'` exits 15.
+    let (stdout, stderr, code) = run_jq_full(&["-n", "[1,2,3] | bsearch(halt_error(15))"], None)?;
+    assert_eq!(code, 15, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_halt_error_negative_exit_code_floors_to_zero() -> Result<()> {
+    // Real jq clamps any negative `halt_error(n)` argument to exit code 0,
+    // rather than letting the OS's usual two's-complement byte-truncation of
+    // a negative process-exit status produce a nonzero code. Verified live
+    // against jq 1.7.1 for every value below.
+    for filter in [
+        r#""x" | halt_error(-1)"#,
+        r#""x" | halt_error(-100)"#,
+        r#""x" | halt_error(-2147483648)"#,
+        r#""x" | halt_error(-infinite)"#,
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-n", filter], None)?;
+        assert_eq!(code, 0, "{filter}: stdout: {stdout:?} stderr: {stderr:?}");
+    }
+    Ok(())
+}
+
+#[test]
+fn test_halt_error_positive_and_special_exit_codes_unaffected() -> Result<()> {
+    // Sanity check that the negative-floor fix above didn't disturb the
+    // already-correct positive/NaN/+infinity handling. Verified against jq
+    // 1.7.1.
+    for (filter, want_code) in [
+        (r#""x" | halt_error(4294967296)"#, 255),
+        (r#""x" | halt_error(nan)"#, 0),
+        (r#""x" | halt_error(infinite)"#, 255),
+        (r#""x" | halt_error(7)"#, 7),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-n", filter], None)?;
+        assert_eq!(
+            code, want_code,
+            "{filter}: stdout: {stdout:?} stderr: {stderr:?}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn test_computed_index_streams_keys_produced_before_halt() -> Result<()> {
+    // `eval_index_expr`'s key stream used to discard already-produced keys
+    // when the key generator itself later halted, printing nothing instead
+    // of the indexed values for the keys already yielded. Verified against
+    // jq 1.7.1: `echo '[10,20,30]' | jq '.[(1,2,halt)]'` prints `20` then
+    // `30` before halting. Piped stdin input exercises the cursor-based
+    // evaluator (`eval_generic.rs`), distinct from the `-n` literal-array
+    // path (`eval.rs`) -- both must agree.
+    let (stdout, stderr, code) = run_jq_full(&[".[(1,2,halt)]"], Some("[10,20,30]"))?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout, "20\n30\n");
+
+    let (stdout, stderr, code) = run_jq_full(&["-n", "[10,20,30] | .[(1,2,halt)]"], None)?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout, "20\n30\n");
+    Ok(())
+}
+
+#[test]
+fn test_computed_index_still_conservative_on_error_and_break() -> Result<()> {
+    // The fix above is deliberately halt-specific: `Error`/`Break` keep the
+    // pre-existing, documented conservative behavior (discard the prefix
+    // rather than stream it), matching real jq's own gap here -- see
+    // `eval_index_expr`'s doc comment. `Error` still aborts the whole
+    // process (exit 5), it just doesn't print `20`/`30` first.
+    let (stdout, stderr, code) = run_jq_full(&[r#".[(1,2,error("boom"))]"#], Some("[10,20,30]"))?;
+    assert_eq!(code, 5);
+    assert_eq!(stdout, "");
+    assert!(stderr.contains("boom"));
+    Ok(())
+}
+
 #[test]
 fn test_693_optional_around_stream_stops_at_the_first_error() -> Result<()> {
     // The `jq`/`yq` CLIs' default path evaluates through `eval_generic`'s

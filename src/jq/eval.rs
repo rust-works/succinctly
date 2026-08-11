@@ -7933,6 +7933,16 @@ fn eval_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     optional: bool,
 ) -> QueryResult<'a, W> {
     // (3) Keys first: an empty key stream must not evaluate the target.
+    //
+    // `pending_halt` carries a halt that arrived after some keys were
+    // already produced (`.[(1,2,halt)]`) — unlike `Error`/`Break`, which stay
+    // conservative (see the comment below), a halt's already-produced keys
+    // still owe real jq's output before the process exits: real jq's
+    // key-outer/target-inner generator model (see this function's own outer
+    // doc comment) evaluates `target` once per key already yielded before
+    // the key generator halts on its *next* attempt, so those keys' indexed
+    // output must still reach stdout (#791).
+    let mut pending_halt = None;
     let keys = match eval_single::<W, S>(key, value.clone(), false).materialize_cursor() {
         QueryResult::One(v) => vec![to_owned_key_shape(&v)],
         QueryResult::Many(vs) => vs.iter().map(to_owned_key_shape).collect(),
@@ -7948,9 +7958,14 @@ fn eval_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // Error/Break arms rather than inventing new partial-key behavior.
         QueryResult::Partial(_, Control::Error(e)) => return QueryResult::Error(e),
         QueryResult::Partial(_, Control::Break(label)) => return QueryResult::Break(label),
-        QueryResult::Partial(_, Control::Halt(code)) => return QueryResult::Halt(code),
+        QueryResult::Partial(vs, Control::Halt(code)) => {
+            pending_halt = Some(code);
+            vs
+        }
     };
     if keys.is_empty() {
+        // `partial`'s invariant (a non-empty prefix by construction) means
+        // this is only reachable with `pending_halt` unset.
         return QueryResult::None;
     }
 
@@ -7967,7 +7982,20 @@ fn eval_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         QueryResult::Many(vs) => Targets::Borrowed(vs),
         QueryResult::Owned(v) => Targets::Owned(vec![v]),
         QueryResult::ManyOwned(vs) => Targets::Owned(vs),
-        QueryResult::None => return QueryResult::None,
+        // A target with zero outputs indexes to zero results for every key
+        // — not an error, break, or halt of its own — so it has nothing
+        // that "happens first" to preempt a pending halt from the key side
+        // (unlike the `Error`/`Break`/`Halt` arms below, each of which is
+        // itself a terminating event during target evaluation for the first
+        // already-known key, and so legitimately preempts a key halt that
+        // has not been reached yet). The key generator's own halt is still
+        // the only terminating event here and must still fire (#791).
+        QueryResult::None => {
+            return match pending_halt {
+                Some(code) => QueryResult::Halt(code),
+                None => QueryResult::None,
+            };
+        }
         QueryResult::Error(e) => return QueryResult::Error(e),
         QueryResult::Break(label) => return QueryResult::Break(label),
         QueryResult::Halt(code) => return QueryResult::Halt(code),
@@ -7992,9 +8020,12 @@ fn eval_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     }
                 }
             }
-            match out.len() {
-                1 => QueryResult::One(out.pop().expect("len checked")),
-                _ => QueryResult::Many(out),
+            match pending_halt {
+                Some(code) => partial(out.iter().map(to_owned).collect(), Control::Halt(code)),
+                None => match out.len() {
+                    1 => QueryResult::One(out.pop().expect("len checked")),
+                    _ => QueryResult::Many(out),
+                },
             }
         }
         Targets::Owned(ts) => {
@@ -8008,9 +8039,12 @@ fn eval_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     }
                 }
             }
-            match out.len() {
-                1 => QueryResult::Owned(out.pop().expect("len checked")),
-                _ => QueryResult::ManyOwned(out),
+            match pending_halt {
+                Some(code) => partial(out, Control::Halt(code)),
+                None => match out.len() {
+                    1 => QueryResult::Owned(out.pop().expect("len checked")),
+                    _ => QueryResult::ManyOwned(out),
+                },
             }
         }
     }
@@ -9451,6 +9485,11 @@ fn resolve_node<'a, S: EvalSemantics>(expr: &Expr, value: &'a OwnedValue) -> Pat
                 // raises in jq).
                 let branches = match resolve_node::<S>(inner, value) {
                     Ok(branches) => branches,
+                    // `halt`/`halt_error(n)` is never caught by `?`, in path
+                    // expressions any more than in value position (#791) —
+                    // propagate the smuggled-back halt marker unchanged
+                    // rather than treating it as a suppressible failure.
+                    Err((prefix, e)) if e.halt.is_some() => return Err((prefix, e)),
                     Err((prefix, e)) if e.is_invalid_path_expression() => {
                         return Err((prefix, e));
                     }
@@ -9655,6 +9694,12 @@ fn resolve_node<'a, S: EvalSemantics>(expr: &Expr, value: &'a OwnedValue) -> Pat
         // rather than a silent wrong answer.)
         Expr::Try { expr, catch } => match resolve_node::<S>(expr, value) {
             Ok(branches) => Ok(branches),
+            // `halt`/`halt_error(n)` is never caught by `try`/`catch`, in
+            // path expressions any more than in value position (#791) —
+            // propagate the smuggled-back halt marker unchanged instead of
+            // running `catch` (or the no-catch prefix-keeping fallback) on
+            // it.
+            Err((prefix, e)) if e.halt.is_some() => Err((prefix, e)),
             Err((prefix, e)) if e.is_invalid_path_expression() => Err((prefix, e)),
             // No catch: keep whatever was already resolved before the
             // failure (confirmed live: `path(try (.a, .b[0]))` prints
@@ -13286,6 +13331,15 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
             let map_result = match stopped {
                 Some(QueryResult::Partial(_, Control::Error(e))) => QueryResult::Error(e),
                 Some(QueryResult::Partial(_, Control::Break(label))) => QueryResult::Break(label),
+                // `map(f)` is array construction, atomic in jq (see
+                // `eval_array_construction`'s matching comment) — a `Halt`
+                // partway through must discard the elements mapped so far,
+                // same as `Error`/`Break` just above, not let them leak out
+                // as this arm's result (#791). The bare `QueryResult::Halt`
+                // case (no elements mapped yet) already falls through
+                // `Some(other) => other` correctly, since there is nothing
+                // to discard.
+                Some(QueryResult::Partial(_, Control::Halt(code))) => QueryResult::Halt(code),
                 Some(other) => other,
                 None => QueryResult::Owned(OwnedValue::Array(results)),
             };
@@ -14480,6 +14534,11 @@ fn builtin_setpath<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // A suppressed sub-result (e.g. `setpath((.a)?; 1)` on a value `.a`
         // can't index) propagates as a suppressed whole, not `null`/an error.
         QueryResult::None => return QueryResult::None,
+        // A halt must propagate, not be misreported as "path must be an
+        // array" (#791) — checked ahead of the generic wildcard below the
+        // same way `eval_index_expr` and friends already do.
+        QueryResult::Halt(code) => return QueryResult::Halt(code),
+        QueryResult::Partial(_, Control::Halt(code)) => return QueryResult::Halt(code),
         _ if optional => return QueryResult::None,
         _ => return QueryResult::Error(EvalError::path_must_be_array()),
     };
@@ -14498,6 +14557,9 @@ fn builtin_setpath<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // Same reasoning as the path result above: `setpath(["a"]; error)?`
         // suppresses the whole call rather than setting `"a"` to `null` (#367).
         QueryResult::None => return QueryResult::None,
+        // A halt must propagate, not be silently written as `null` (#791).
+        QueryResult::Halt(code) => return QueryResult::Halt(code),
+        QueryResult::Partial(_, Control::Halt(code)) => return QueryResult::Halt(code),
         _ => OwnedValue::Null,
     };
 
@@ -17520,6 +17582,10 @@ fn builtin_nth_stream<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             ref owned @ (OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..)),
         ) => owned.as_f64().unwrap_or(0.0) as usize,
         QueryResult::Error(e) => return QueryResult::Error(e),
+        // A halt while evaluating `n` must propagate, not be misreported as
+        // a type error (#791).
+        QueryResult::Halt(code) => return QueryResult::Halt(code),
+        QueryResult::Partial(_, Control::Halt(code)) => return QueryResult::Halt(code),
         _ => return QueryResult::Error(EvalError::type_error("number", "null")),
     };
 
@@ -17575,6 +17641,13 @@ fn builtin_isempty<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         QueryResult::Many(ref v) if v.is_empty() => true,
         QueryResult::ManyOwned(ref v) if v.is_empty() => true,
         QueryResult::Error(_) => true, // Errors count as empty
+        // A halt with zero prior outputs must propagate rather than answer
+        // `false` — but a `Partial`'s halt always has a non-empty prefix (see
+        // `partial`), meaning `g` already produced an output before halting,
+        // so the wildcard arm below correctly still answers `false` for that
+        // case, same as it already does for `Partial(_, Control::Error(_))`
+        // (#791).
+        QueryResult::Halt(code) => return QueryResult::Halt(code),
         _ => false,
     };
     QueryResult::Owned(OwnedValue::Bool(is_empty))
@@ -17592,6 +17665,10 @@ fn builtin_delpaths<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         QueryResult::One(v) => to_owned(&v),
         QueryResult::Owned(v) => v,
         QueryResult::Error(e) => return QueryResult::Error(e),
+        // A halt must propagate, not be misreported as "paths must be an
+        // array" (#791).
+        QueryResult::Halt(code) => return QueryResult::Halt(code),
+        QueryResult::Partial(_, Control::Halt(code)) => return QueryResult::Halt(code),
         _ => return QueryResult::Error(EvalError::paths_must_be_array()),
     };
 
@@ -18261,19 +18338,23 @@ fn builtin_halt_error<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Some(expr) => {
             let n_result = eval_single::<W, S>(expr, value.clone(), optional);
             match result_to_owned(n_result) {
-                // Saturating, not wrapping, to match real jq: verified
-                // against jq 1.7.1 on arm64 that an out-of-`i32`-range exit
-                // code clamps to `i32::MIN`/`i32::MAX` rather than wrapping
-                // (e.g. `halt_error(4294967296)` exits 255, `i32::MAX`'s low
-                // byte — not 0, which a wrapping `as i32` cast would give).
-                // `f as i32` below already saturates this way by default
-                // (Rust's cast semantics since 1.45); the `i64`-typed arm
-                // needs an explicit `clamp` for the same behavior, since
-                // `as i32` on an integer wraps instead (#791).
+                // Clamped into `0..=i32::MAX`, not wrapped, to match real jq:
+                // verified live against jq 1.7.1 that an out-of-range
+                // positive exit code clamps to `i32::MAX` (e.g.
+                // `halt_error(4294967296)` exits 255, `i32::MAX`'s low byte —
+                // not 0, which a wrapping `as i32` cast would give), and that
+                // every negative `halt_error(n)`, from `-1` through `-1e300`,
+                // exits 0 rather than the OS's usual two's-complement
+                // byte-truncation of a negative process-exit status (#791).
+                // The `i64`-typed arm needs an explicit `clamp` for this,
+                // since `as i32` on an integer wraps instead; the `f64` arm's
+                // `.max(0.0)` (floors before the saturating `as i32` cast,
+                // which already handles the upper bound, NaN, and +/-infinity
+                // by Rust's cast semantics since 1.45) is the float twin.
                 Ok(OwnedValue::Int(i) | OwnedValue::NumberLiteral(NumberRepr::Int(i), _)) => {
-                    i.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
+                    i.clamp(0, i64::from(i32::MAX)) as i32
                 }
-                Ok(OwnedValue::Float(f)) => f as i32,
+                Ok(OwnedValue::Float(f)) => f.max(0.0) as i32,
                 Ok(_) => {
                     return QueryResult::Error(EvalError::new(
                         "halt_error/1 requires a number exit code",
@@ -18549,6 +18630,10 @@ fn builtin_bsearch<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         QueryResult::One(v) => to_owned(&v),
         QueryResult::Owned(v) => v,
         QueryResult::Error(e) => return QueryResult::Error(e),
+        // A halt in the target expression must propagate, not be treated as
+        // an absent target (#791).
+        QueryResult::Halt(code) => return QueryResult::Halt(code),
+        QueryResult::Partial(_, Control::Halt(code)) => return QueryResult::Halt(code),
         _ => return QueryResult::None,
     };
 

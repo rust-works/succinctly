@@ -2542,6 +2542,16 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
     cursor: Option<V::Cursor>,
 ) -> GenericResult<V> {
     // Keys first: an empty key stream must not evaluate the target at all.
+    //
+    // `pending_halt` carries a halt that arrived after some keys were
+    // already produced (`.[(1,2,halt)]`) — unlike `Error`/`Break`, which stay
+    // conservative (see the comment on the `Partial` arm below), a halt's
+    // already-produced keys still owe real jq's output before the process
+    // exits: real jq's key-outer/target-inner generator model (see
+    // `eval::eval_index_expr`'s doc comment) evaluates `target` once per key
+    // already yielded before the key generator halts on its *next* attempt,
+    // so those keys' indexed output must still reach stdout (#791).
+    let mut pending_halt: Option<i32> = None;
     let keys = match eval_single::<S, V>(key, value.clone(), false, cursor) {
         GenericResult::Error(e) => return GenericResult::Error(e),
         GenericResult::Break(label) => return GenericResult::Break(label),
@@ -2557,7 +2567,15 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
         // truncate to its prefix (#694) -- mirrors the target match below.
         GenericResult::Partial(_, Control::Error(e)) => return GenericResult::Error(e),
         GenericResult::Partial(_, Control::Break(label)) => return GenericResult::Break(label),
-        GenericResult::Partial(_, Control::Halt(code)) => return GenericResult::Halt(code),
+        // Computed indexing's key/target forking isn't part of #400/#494's
+        // verified semantics for `Error`/`Break` — conservatively matching
+        // those arms rather than inventing new partial-key behavior for
+        // them. `Halt` is different: its prefix is kept and threaded through
+        // as `pending_halt` instead of discarded, per the comment above.
+        GenericResult::Partial(vs, Control::Halt(code)) => {
+            pending_halt = Some(code);
+            vs
+        }
         GenericResult::One(v) => vec![to_owned_key_shape(&v)],
         GenericResult::OneCursor(c) => vec![to_owned_key_shape(&c.value())],
         GenericResult::Many(vs) => vs.iter().map(to_owned_key_shape).collect(),
@@ -2567,6 +2585,8 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
         other => other.collect_owned(),
     };
     if keys.is_empty() {
+        // `partial_generic`'s invariant (a non-empty prefix by construction)
+        // means this is only reachable with `pending_halt` unset.
         return GenericResult::None;
     }
 
@@ -2577,7 +2597,20 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
         // `owned @ (...)` group below, whose `collect_owned()` call would
         // otherwise quietly turn a halted target stream into an empty `Vec`.
         GenericResult::Halt(code) => return GenericResult::Halt(code),
-        GenericResult::None => return GenericResult::None,
+        // A target with zero outputs indexes to zero results for every key
+        // — not an error, break, or halt of its own — so it has nothing
+        // that "happens first" to preempt a pending halt from the key side
+        // (unlike the other arms here, each itself a terminating event
+        // during target evaluation for the first already-known key, and so
+        // legitimately preempting a key halt not yet reached). The key
+        // generator's own halt is still the only terminating event here and
+        // must still fire (#791) — mirrors `eval::eval_index_expr`.
+        GenericResult::None => {
+            return match pending_halt {
+                Some(code) => GenericResult::Halt(code),
+                None => GenericResult::None,
+            };
+        }
         // Computed indexing's key/target forking isn't part of #400/#494's
         // verified semantics — conservatively matching the Error/Break arms
         // above rather than inventing new partial-target behavior, same as
@@ -2616,9 +2649,12 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
                     }
                 }
             }
-            return match out.len() {
-                1 => GenericResult::Owned(out.pop().expect("len checked")),
-                _ => GenericResult::ManyOwned(out),
+            return match pending_halt {
+                Some(code) => partial_generic(out, Control::Halt(code)),
+                None => match out.len() {
+                    1 => GenericResult::Owned(out.pop().expect("len checked")),
+                    _ => GenericResult::ManyOwned(out),
+                },
             };
         }
     };
@@ -2650,6 +2686,15 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
                 _ => unreachable!("index_one_generic yields OneCursor/Owned/None/Error"),
             }
         }
+    }
+
+    if let Some(code) = pending_halt {
+        let out = if any_owned {
+            owned
+        } else {
+            cursors.iter().map(|c| to_owned(&c.value())).collect()
+        };
+        return partial_generic(out, Control::Halt(code));
     }
 
     if any_owned {
