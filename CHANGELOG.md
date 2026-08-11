@@ -269,6 +269,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `column`) resolve against the extracted YAML block's own coordinates,
   not the original file.
 
+- **`yq -C`/`--color` still collapsed duplicate mapping keys** (#748), the
+  gap #733's own commit message flagged as a follow-up: `can_stream_pretty`
+  (`yq_runner.rs`) excluded `use_color`, so any identity/navigation query
+  under `-C` fell through to the `OwnedValue::Object`/`IndexMap` DOM path and
+  lost all but the last occurrence of a repeated key — `yq -C '.'` on
+  `a: 1\na: 2` printed only `a: 2` (with color).
+
+  Unlike #733, this didn't need the cursor/lazy streamers taught anything
+  new: `colorize_yaml`/`output::colorize_json` are pure text-level
+  re-lexers over an already fully-rendered string, unrelated to *how* that
+  string was produced. Fixed by buffering the still-duplicate-key-safe
+  cursor-streamed output into a `String` (a new `ColorSink` enum implementing
+  `core::fmt::Write`, alongside `stream_maybe_colored`) and running the
+  buffer through the existing colorizers unmodified, instead of threading a
+  color parameter through the ~49 `core::fmt::Write`-generic functions
+  `IndentSpec`/`sort_keys` were threaded through for #733 — six independent
+  recursive writers with no shared "write a key"/"write punctuation"
+  primitive to hang color onto, plus `ColorScheme` living in the `std`-only
+  binary crate while the streamers live in the `no_std` library crate, made
+  that shape of fix considerably more invasive here.
+
+  `can_stream_pretty` itself is unchanged and still excludes color for
+  `--slurp`'s and `--inplace`'s fast paths, which don't get the new
+  buffer-and-colorize plumbing — an explicit, narrower scope limit than
+  #733 left, not a silent gap (`--inplace` already forces color off on its
+  own DOM branch regardless, so `-i -C` only loses duplicate keys in the
+  file it writes, not color itself).
+
+  Side effect: compact output (`-I0`) already took the fast path regardless
+  of color (predating this fix), so `-C -I0` silently produced uncolored
+  output; the buffer-and-colorize decision keys only on `use_color`, so
+  compact mode is now colorized too.
+
 - **`gmtime`, `mktime`, and `strptime` raised the right exit code but the
   wrong message on bad input** (#761): `gmtime`/`localtime` on a non-number
   reported the generic `"math function requires number"` (shared with

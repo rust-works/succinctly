@@ -47,6 +47,51 @@ impl<W: Write> core::fmt::Write for FmtWriter<W> {
     }
 }
 
+/// Either a direct passthrough to the real output writer, or an in-memory
+/// buffer collecting output to be colorized afterward. `colorize_yaml`/
+/// `output::colorize_json` are pure text-level re-lexers over an already
+/// fully-rendered string, so buffering the duplicate-key-safe cursor
+/// streamer's output and running it through them unmodified reuses that
+/// existing coloring code without teaching the streamers anything about
+/// ANSI codes (#748).
+enum ColorSink<'a, W: Write> {
+    Buffered(String),
+    Direct(FmtWriter<&'a mut W>),
+}
+
+impl<W: Write> core::fmt::Write for ColorSink<'_, W> {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        match self {
+            ColorSink::Buffered(buf) => buf.write_str(s),
+            ColorSink::Direct(w) => w.write_str(s),
+        }
+    }
+}
+
+/// Streams through `render` directly when `use_color` is false. When true,
+/// renders into a buffer instead (still via the duplicate-key-safe cursor
+/// streamer passed in as `render`), then runs the buffer through `colorize`
+/// before writing the colorized result (#748).
+fn stream_maybe_colored<W: Write, T>(
+    writer: &mut W,
+    use_color: bool,
+    colorize: impl FnOnce(&str) -> String,
+    render: impl FnOnce(&mut ColorSink<'_, W>) -> Result<T, core::fmt::Error>,
+) -> anyhow::Result<T> {
+    if use_color {
+        let mut sink = ColorSink::Buffered(String::new());
+        let value = render(&mut sink).map_err(|_| anyhow::anyhow!("Write error"))?;
+        let ColorSink::Buffered(buf) = sink else {
+            unreachable!("stream_maybe_colored always constructs ColorSink::Buffered here")
+        };
+        write!(writer, "{}", colorize(&buf))?;
+        Ok(value)
+    } else {
+        let mut sink = ColorSink::Direct(FmtWriter(writer));
+        render(&mut sink).map_err(|_| anyhow::anyhow!("Write error"))
+    }
+}
+
 /// Evaluation context for passing variables to the jq evaluator.
 #[derive(Debug, Default)]
 pub struct EvalContext {
@@ -1897,12 +1942,12 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
     // Supports both JSON and YAML output formats.
     let is_identity = matches!(program.expr, Expr::Identity);
     let is_m2_streamable = can_use_m2_streaming(&program.expr);
-    // Color and pretty_print aren't implemented by the cursor streamers, so
-    // they still fall back to the DOM path, unchanged, rather than silently
-    // ignoring the flag the way compact mode already does today. `sort_keys`
-    // and `tab` (#733) are now implemented directly by the cursor/lazy
-    // streamers — see `IndentSpec` and the `sort_keys` parameter threaded
-    // through `DocumentCursor::stream_json`/`stream_yaml` and `GenericResult::
+    // pretty_print isn't implemented by the cursor streamers, so it still
+    // falls back to the DOM path, unchanged, rather than silently ignoring
+    // the flag the way compact mode already does today. `sort_keys` and
+    // `tab` (#733) are implemented directly by the cursor/lazy streamers —
+    // see `IndentSpec` and the `sort_keys` parameter threaded through
+    // `DocumentCursor::stream_json`/`stream_yaml` and `GenericResult::
     // stream_json`/`stream_yaml` — so routing them through the DOM would
     // needlessly reintroduce #442's duplicate-mapping-key collapse
     // (`OwnedValue::Object`'s `IndexMap` cannot represent duplicate keys).
@@ -1910,9 +1955,22 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
     // the default (style preservation doesn't exist yet — #707); routing it
     // through DOM now gives it a single seam to implement real
     // style-clearing against once #707 lands (#705).
+    //
+    // `can_stream_pretty` still excludes color: it also gates `--slurp`'s
+    // and `--inplace`'s fast paths below, neither of which has the
+    // buffer-and-colorize plumbing `stream_maybe_colored` adds for the
+    // plain stdout path. `can_stream_pretty_or_colored` is the same
+    // condition minus that exclusion, used only by `can_json_fast_path`/
+    // `can_yaml_fast_path`: color, when requested, is handled by
+    // `stream_maybe_colored` buffering the (still duplicate-key-safe)
+    // cursor-streamed output and running it through the existing
+    // `colorize_yaml`/`colorize_json` post-processors, rather than falling
+    // back to the DOM/IndexMap path that would collapse duplicate mapping
+    // keys (#442, #748).
     let can_stream_pretty = !output_config.use_color && !args.pretty_print;
+    let can_stream_pretty_or_colored = !args.pretty_print;
     let can_json_fast_path = is_m2_streamable
-        && (output_config.compact || (can_stream_pretty && !args.ascii_output))
+        && (output_config.compact || (can_stream_pretty_or_colored && !args.ascii_output))
         && output_config.output_format == OutputFormat::Json
         && !args.null_input
         && !args.raw_input
@@ -1923,7 +1981,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
         && !args.eval_all
         && context.named.is_empty();
     let can_yaml_fast_path = is_m2_streamable
-        && (output_config.compact || can_stream_pretty)
+        && (output_config.compact || can_stream_pretty_or_colored)
         && output_config.output_format == OutputFormat::Yaml
         && !args.null_input
         && !args.raw_input
@@ -1966,8 +2024,10 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
     // `is_m2_streamable` set), since a non-trivial filter over the slurped
     // array needs real evaluation. `-o json --slurp` still uses the slow
     // DOM path below — an explicit, documented scope limit rather than a
-    // silent gap, matching color already being excluded from the gates
-    // above.
+    // silent gap. Also still excludes color (`can_stream_pretty`, not
+    // `can_stream_pretty_or_colored`) — buffer-and-colorize support (#748)
+    // wasn't added to `stream_yaml_sequence`, so `--slurp --color` stays on
+    // the DOM path, unchanged.
     let can_slurp_fast_path = is_identity
         && can_stream_pretty
         && output_config.output_format == OutputFormat::Yaml
@@ -2024,9 +2084,9 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                         // redisplayed as itself - its own trailing comment,
                         // if any, must be kept (#710).
                         emit_yaml_doc_separator($writer, $doc_streamed, true)?;
-                        $cursor
-                            .stream_yaml_as_document(&mut FmtWriter($writer), yaml_indent, sort_keys)
-                            .map_err(|_| anyhow::anyhow!("Write error"))?;
+                        stream_maybe_colored($writer, output_config.use_color, colorize_yaml, |out| {
+                            $cursor.stream_yaml_as_document(out, yaml_indent, sort_keys)
+                        })?;
                         writeln!($writer)?;
                         // Streaming skips evaluation, so inspect the document
                         // value directly to keep `-e` falsy tracking (#178).
@@ -2043,11 +2103,10 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                             && !matches!(&result, GenericResult::ManyCursor(cs) if cs.is_empty())
                             && !matches!(&result, GenericResult::ManyOwned(vs) if vs.is_empty());
                         emit_yaml_doc_separator($writer, $doc_streamed, will_output)?;
-                        let stats = result
-                            .stream_yaml(&mut FmtWriter($writer), yaml_indent, sort_keys, |w| {
-                                w.write_str("\n")
-                            })
-                            .map_err(|_| anyhow::anyhow!("Write error"))?;
+                        let stats =
+                            stream_maybe_colored($writer, output_config.use_color, colorize_yaml, |out| {
+                                result.stream_yaml(out, yaml_indent, sort_keys, |w| w.write_str("\n"))
+                            })?;
                         any_truthy |= stats.any_truthy;
                         // Streaming never writes a diagnostic to stdout; it hands
                         // the error back here so it reaches stderr and fails the run (#355).
@@ -2059,9 +2118,12 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                     // M2 path: JSON output streaming
                     if is_identity {
                         // P9 path: stream directly without evaluation
-                        $cursor
-                            .stream_json(&mut FmtWriter($writer), json_indent, sort_keys)
-                            .map_err(|_| anyhow::anyhow!("Write error"))?;
+                        stream_maybe_colored(
+                            $writer,
+                            output_config.use_color,
+                            |s| output::colorize_json(s, &ColorScheme::default()),
+                            |out| $cursor.stream_json(out, json_indent, sort_keys),
+                        )?;
                         writeln!($writer)?;
                         // Streaming skips evaluation, so inspect the document
                         // value directly to keep `-e` falsy tracking (#178).
@@ -2071,11 +2133,12 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                     } else {
                         // M2 path: evaluate and stream results
                         let result = eval_with_cursor_using::<YqSemantics, _>(&program.expr, $cursor);
-                        let stats = result
-                            .stream_json(&mut FmtWriter($writer), json_indent, sort_keys, |w| {
-                                w.write_str("\n")
-                            })
-                            .map_err(|_| anyhow::anyhow!("Write error"))?;
+                        let stats = stream_maybe_colored(
+                            $writer,
+                            output_config.use_color,
+                            |s| output::colorize_json(s, &ColorScheme::default()),
+                            |out| result.stream_json(out, json_indent, sort_keys, |w| w.write_str("\n")),
+                        )?;
                         any_truthy |= stats.any_truthy;
                         // Streaming never writes a diagnostic to stdout; it hands
                         // the error back here so it reaches stderr and fails the run (#355).
@@ -2134,19 +2197,19 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                         if is_identity {
                             // P9 path for identity on single doc
                             if can_yaml_fast_path {
-                                root.stream_yaml_document(
-                                    &mut FmtWriter(&mut writer),
-                                    yaml_indent,
-                                    sort_keys,
-                                )
-                                .map_err(|_| anyhow::anyhow!("Write error"))?;
+                                stream_maybe_colored(
+                                    &mut writer,
+                                    output_config.use_color,
+                                    colorize_yaml,
+                                    |out| root.stream_yaml_document(out, yaml_indent, sort_keys),
+                                )?;
                             } else {
-                                root.stream_json_document(
-                                    &mut FmtWriter(&mut writer),
-                                    json_indent,
-                                    sort_keys,
-                                )
-                                .map_err(|_| anyhow::anyhow!("Write error"))?;
+                                stream_maybe_colored(
+                                    &mut writer,
+                                    output_config.use_color,
+                                    |s| output::colorize_json(s, &ColorScheme::default()),
+                                    |out| root.stream_json_document(out, json_indent, sort_keys),
+                                )?;
                             }
                             writeln!(writer)?;
                             // `root` is the virtual document sequence; falsiness
@@ -2214,19 +2277,23 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                             if is_identity {
                                 // P9 path for identity on single doc
                                 if can_yaml_fast_path {
-                                    root.stream_yaml_document(
-                                        &mut FmtWriter(&mut writer),
-                                        yaml_indent,
-                                        sort_keys,
-                                    )
-                                    .map_err(|_| anyhow::anyhow!("Write error"))?;
+                                    stream_maybe_colored(
+                                        &mut writer,
+                                        output_config.use_color,
+                                        colorize_yaml,
+                                        |out| {
+                                            root.stream_yaml_document(out, yaml_indent, sort_keys)
+                                        },
+                                    )?;
                                 } else {
-                                    root.stream_json_document(
-                                        &mut FmtWriter(&mut writer),
-                                        json_indent,
-                                        sort_keys,
-                                    )
-                                    .map_err(|_| anyhow::anyhow!("Write error"))?;
+                                    stream_maybe_colored(
+                                        &mut writer,
+                                        output_config.use_color,
+                                        |s| output::colorize_json(s, &ColorScheme::default()),
+                                        |out| {
+                                            root.stream_json_document(out, json_indent, sort_keys)
+                                        },
+                                    )?;
                                 }
                                 writeln!(writer)?;
                                 // `root` is the virtual document sequence; falsiness
