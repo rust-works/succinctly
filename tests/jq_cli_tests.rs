@@ -2821,6 +2821,122 @@ fn test_uncaught_error_exits_5() -> Result<()> {
     Ok(())
 }
 
+// `halt`, `halt_error`/`halt_error(n)`, and `stderr` (#791). Every byte-exact
+// expectation below was captured directly from real `jq` (1.7.1 and 1.8.2,
+// via `xxd` on separately-redirected stdout/stderr -- `2>&1` interleaves the
+// two streams misleadingly, since stdout is buffered when piped but stderr
+// is not) rather than assumed from the manual page wording.
+
+#[test]
+fn test_halt_exits_0_with_no_output() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-n", "halt"], None)?;
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout, "");
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
+#[test]
+fn test_halt_prints_outputs_produced_before_it() -> Result<()> {
+    // Verified against jq 1.7.1/1.8.2: `jq -n '1,2,halt,3'` prints `1` and
+    // `2` then exits 0 -- nothing after `halt` runs.
+    let (stdout, stderr, code) = run_jq_full(&["-n", "1,2,halt,3"], None)?;
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout, "1\n2\n");
+    Ok(())
+}
+
+#[test]
+fn test_halt_error_string_prints_raw_with_no_trailing_newline() -> Result<()> {
+    // Verified against jq 1.7.1/1.8.2: stderr is exactly `foo` (no quotes,
+    // no newline); stdout is empty (halt_error never passes its value
+    // through, unlike `stderr`); exit code defaults to 5.
+    let (stdout, stderr, code) = run_jq_full(&["-n", r#""foo" | halt_error"#], None)?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(stderr, "foo");
+    Ok(())
+}
+
+#[test]
+fn test_halt_error_non_string_prints_compact_json_with_trailing_newline() -> Result<()> {
+    // Verified against jq 1.7.1/1.8.2: non-string, non-null values print as
+    // compact JSON *with* a trailing newline -- unlike the string case above.
+    for (filter, want_stderr) in [
+        (r#"[1,2,"a b"] | halt_error"#, "[1,2,\"a b\"]\n"),
+        (r#"{"a":1} | halt_error"#, "{\"a\":1}\n"),
+        ("false | halt_error", "false\n"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-n", filter], None)?;
+        assert_eq!(code, 5, "{filter}: stdout: {stdout:?} stderr: {stderr:?}");
+        assert_eq!(stdout, "", "{filter}");
+        assert_eq!(stderr, want_stderr, "{filter}");
+    }
+    Ok(())
+}
+
+#[test]
+fn test_halt_error_null_prints_nothing() -> Result<()> {
+    // Verified against jq 1.7.1/1.8.2: `null` is the one value `halt_error`
+    // special-cases to print *nothing* at all (not even "null").
+    let (stdout, stderr, code) = run_jq_full(&["-n", "null | halt_error(9)"], None)?;
+    assert_eq!(code, 9, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
+#[test]
+fn test_halt_error_custom_exit_code() -> Result<()> {
+    // Verified against jq 1.7.1/1.8.2: `halt_error(n)` exits with `n`, not
+    // the default 5.
+    let (stdout, stderr, code) = run_jq_full(&["-n", r#""foo" | halt_error(7)"#], None)?;
+    assert_eq!(code, 7, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(stderr, "foo");
+    Ok(())
+}
+
+#[test]
+fn test_stderr_passes_through_and_prints_raw_compact_with_no_newline() -> Result<()> {
+    // Verified against jq 1.7.1/1.8.2: `stderr` always writes with no
+    // trailing newline (unlike halt_error's non-string case), raw for
+    // strings and compact JSON for everything else including `null` (unlike
+    // halt_error's null-skips-entirely rule) -- and passes its input through
+    // unchanged to stdout via the normal output path.
+    for (filter, want_stdout, want_stderr) in [
+        (r#""hello" | stderr"#, "\"hello\"\n", "hello"),
+        ("[1,2] | stderr", "[1,2]\n", "[1,2]"),
+        ("null | stderr", "null\n", "null"),
+        ("false | stderr", "false\n", "false"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-n", "-c", filter], None)?;
+        assert_eq!(code, 0, "{filter}: stderr: {stderr:?}");
+        assert_eq!(stdout, want_stdout, "{filter}");
+        assert_eq!(stderr, want_stderr, "{filter}");
+    }
+    Ok(())
+}
+
+#[test]
+fn test_halt_not_caught_by_try_catch_or_label() -> Result<()> {
+    // Verified live against jq 1.7.1/1.8.2: none of these ever print
+    // "caught", and the exit code is `halt`/`halt_error`'s own, not
+    // whatever `try`/`catch`/`label` would otherwise produce.
+    for (filter, want_code) in [
+        (r#"try (halt) catch "caught""#, 0),
+        (r#"try ("x"|halt_error) catch "caught""#, 5),
+        (r"label $out | (halt, break $out)", 0),
+        (r#"("x"|halt_error)? // "fallback""#, 5),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-n", filter], None)?;
+        assert_eq!(code, want_code, "{filter}: stderr: {stderr:?}");
+        assert!(!stdout.contains("caught"), "{filter}: stdout: {stdout:?}");
+        assert!(!stdout.contains("fallback"), "{filter}: stdout: {stdout:?}");
+    }
+    Ok(())
+}
+
 #[test]
 fn test_693_optional_around_stream_stops_at_the_first_error() -> Result<()> {
     // The `jq`/`yq` CLIs' default path evaluates through `eval_generic`'s

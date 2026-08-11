@@ -4973,6 +4973,79 @@ fn test_uncaught_error_exits_1_yq_style() -> Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// `halt`, `halt_error`/`halt_error(n)`, and `stderr` (#791). Byte-exact
+// stderr/exit-code expectations are inherited from `tests/jq_cli_tests.rs`'s
+// (verified live against real jq) since these are jq-language builtins, not
+// yq-specific diagnostics -- the one yq-specific piece is bare `halt_error`'s
+// *default* exit code (1, matching yq's uniform failure code, not jq's 5);
+// there is no real `yq` to check that default against (mikefarah/yq has no
+// `halt_error` at all -- this is this codebase's own documented extension).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_yq_halt_exits_0_with_no_output() -> Result<()> {
+    let (stdout, stderr, code) = run_yq_stdin_with_stderr("halt", "x: 1\n", &[])?;
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout, "");
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
+#[test]
+fn test_yq_halt_error_default_exit_code_is_1() -> Result<()> {
+    // yq's uniform failure code (`DiagStyle::error_exit_code()`'s yq arm),
+    // not jq's 5 -- see this section's header comment.
+    let (stdout, stderr, code) = run_yq_stdin_with_stderr(r#""foo" | halt_error"#, "x: 1\n", &[])?;
+    assert_eq!(code, 1, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(stderr, "foo");
+    Ok(())
+}
+
+#[test]
+fn test_yq_halt_error_custom_exit_code_overrides_the_yq_default() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_yq_stdin_with_stderr(r#""foo" | halt_error(7)"#, "x: 1\n", &[])?;
+    assert_eq!(code, 7, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(stderr, "foo");
+    Ok(())
+}
+
+#[test]
+fn test_yq_halt_error_null_prints_nothing() -> Result<()> {
+    let (stdout, stderr, code) = run_yq_stdin_with_stderr("null | halt_error(9)", "x: 1\n", &[])?;
+    assert_eq!(code, 9, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
+#[test]
+fn test_yq_stderr_passes_through_and_prints_raw_compact_with_no_newline() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_yq_stdin_with_stderr(r#""hello" | stderr"#, "x: 1\n", &["-o", "json"])?;
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout, "\"hello\"\n");
+    assert_eq!(stderr, "hello");
+    Ok(())
+}
+
+#[test]
+fn test_yq_halt_not_caught_by_try_catch_or_label() -> Result<()> {
+    for (filter, want_code) in [
+        (r#"try (halt) catch "caught""#, 0),
+        (r#"try ("x"|halt_error) catch "caught""#, 1),
+        (r"label $out | (halt, break $out)", 0),
+    ] {
+        let (stdout, stderr, code) = run_yq_stdin_with_stderr(filter, "x: 1\n", &[])?;
+        assert_eq!(code, want_code, "{filter}: stderr: {stderr:?}");
+        assert!(!stdout.contains("caught"), "{filter}: stdout: {stdout:?}");
+    }
+    Ok(())
+}
+
 /// The diagnostic must never reach stdout.
 ///
 /// The YAML and JSON streaming fast paths used to `write!` it into the output
