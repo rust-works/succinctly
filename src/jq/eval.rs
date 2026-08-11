@@ -12517,7 +12517,16 @@ fn get_value_at_path(value: &OwnedValue, path: &[OwnedValue]) -> Option<OwnedVal
     }
 }
 
-/// Helper to collect leaf paths (paths to scalars)
+/// Helper to collect leaf paths: paths to values with no children to recurse
+/// into. "Leaf" here is a tree-structural notion, not jq's type-based
+/// `scalars` filter — so `null` and empty `{}`/`[]` count as leaves too,
+/// since there's nothing further to descend into.
+///
+/// This is a deliberate divergence from the community recipe
+/// `def leaf_paths: paths(scalars);`, which excludes `null` (an accidental
+/// side effect of `select()`'s falsy handling, not a design choice) and
+/// empty containers (whose `type` isn't scalar even though they have no
+/// children either). See #771.
 fn collect_leaf_paths(
     value: &OwnedValue,
     current_path: &[OwnedValue],
@@ -12555,9 +12564,12 @@ fn collect_leaf_paths(
     }
 }
 
-/// Builtin: leaf_paths - paths to scalar (non-container) values
-/// Returns each path as a separate output (streaming). Diverges from jq's
-/// `paths(scalars)` idiom for `null` and empty containers — see #771.
+/// Builtin: leaf_paths - paths to every leaf (childless) node in the tree.
+/// A succinctly extension, not a real jq builtin — modeled on the community
+/// recipe `def leaf_paths: paths(scalars);` but intentionally broader: it
+/// also yields paths to `null` values and empty `{}`/`[]`, which that
+/// recipe's `scalars` filter excludes. See `collect_leaf_paths` and #771.
+/// Returns each path as a separate output (streaming).
 fn builtin_leaf_paths<W: Clone + AsRef<[u64]>>(
     value: StandardJson<'_, W>,
     _optional: bool,

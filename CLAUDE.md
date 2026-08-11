@@ -319,6 +319,37 @@ echo '{"data": {"nested": {"value": 42}}}' | succinctly jq 'at_offset(9) | .nest
 - Returns error if offset/position is out of bounds or doesn't correspond to a valid node
 - Use `at_offset(n)?` or `at_position(l; c)?` for optional (returns empty on invalid position)
 
+### jq `leaf_paths` (succinctly extension)
+
+`leaf_paths` is **not a real jq builtin** — it errors with `leaf_paths/0 is
+not defined` in real jq (confirmed against jq 1.7.1 and 1.8.2). It's a
+succinctly extension modeled on the community recipe
+`def leaf_paths: paths(scalars);`, but intentionally broader: it returns
+paths to every **leaf** (childless) node in the tree, not just paths whose
+`type` is scalar.
+
+```bash
+echo '{"a": {"b": 1, "c": null}, "d": [], "e": [2, 3]}' | succinctly jq -c 'leaf_paths'
+# ["a","b"]
+# ["a","c"]
+# ["d"]
+# ["e",0]
+# ["e",1]
+```
+
+**Diverges from `paths(scalars)` on two cases:**
+- `null` counts as a leaf here; `paths(scalars)` excludes it (an accidental
+  side effect of `select()` treating a `null` yield as falsy, not a
+  deliberate design choice in jq).
+- Empty `{}`/`[]` count as leaves here; `paths(scalars)` excludes them too,
+  since their `type` is `"object"`/`"array"`, not scalar — even though they
+  have no children to recurse into either.
+
+This divergence is intentional: `leaf_paths` uses a tree-structural
+definition of "leaf" (no children), which the community recipe's
+type-based `scalars` filter doesn't fully capture. See
+[collect_leaf_paths](src/jq/eval.rs) and issue #771 for the full rationale.
+
 ## Feature Flags
 
 | Feature             | Description                               |
