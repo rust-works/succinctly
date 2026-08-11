@@ -3669,6 +3669,46 @@ fn test_color_output_survives_iteration_with_duplicate_keys_json() -> Result<()>
     Ok(())
 }
 
+/// `--slurp --color` intentionally still routes through the `OwnedValue`/
+/// `IndexMap` DOM path — `can_slurp_fast_path` only checks `can_stream_pretty`,
+/// not `can_stream_pretty_or_colored`, since `stream_yaml_sequence` never got
+/// `stream_maybe_colored` support (a documented scope limit, not a silent
+/// gap — #748). That means `--slurp -C` still collapses duplicate mapping
+/// keys within each slurped document, unlike plain `--slurp` (see
+/// [`test_duplicate_mapping_key_survives_slurp`]). Exercises `output_value`'s
+/// `config.use_color` YAML branch, which #748's M2-fast-path color fix made
+/// unreachable from every other angle.
+#[test]
+fn test_slurp_color_output_yaml() -> Result<()> {
+    let yaml = "a: 1\na: 2\n";
+
+    let (output, code) = run_yq_stdin(".", yaml, &["--slurp", "-C"])?;
+    assert_eq!(code, 0);
+    assert_eq!(
+        output,
+        "\u{1b}[33m-\u{1b}[0m\n  \u{1b}[36ma\u{1b}[0m: 2\u{1b}[0m\n"
+    );
+
+    Ok(())
+}
+
+/// Same as [`test_slurp_color_output_yaml`], for `-o json`: exercises
+/// `output_value`'s `config.use_color` JSON branch, the `--slurp` DOM-path
+/// counterpart to [`test_slurp_color_output_yaml`].
+#[test]
+fn test_slurp_color_output_json() -> Result<()> {
+    let yaml = "a: 1\na: 2\n";
+
+    let (output, code) = run_yq_stdin(".", yaml, &["--slurp", "-C", "-o", "json", "-I0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(
+        output,
+        "\u{1b}[1;39m[\u{1b}[0m\u{1b}[1;39m{\u{1b}[0m\u{1b}[1;34m\"a\"\u{1b}[0m:\u{1b}[0;39m2\u{1b}[0m\u{1b}[1;39m}\u{1b}[0m\u{1b}[1;39m]\u{1b}[0m\n"
+    );
+
+    Ok(())
+}
+
 // ============================================================================
 // Special float values (NaN / Infinity)
 // ============================================================================
