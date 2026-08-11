@@ -39,8 +39,11 @@ pub(crate) fn is_line_break(b: u8) -> bool {
 /// Zero doubles as "not at a break", so `pos += line_break_len(text, pos)` is a
 /// safe unconditional advance only when the caller has already established that
 /// it is at one; otherwise test the width before stepping.
+///
+/// `pub`, not `pub(crate)`, so the `src/bin` binary crate can share this rule
+/// too (e.g. `front_matter.rs`'s line scanning) instead of re-deriving it.
 #[inline]
-pub(crate) fn line_break_len(text: &[u8], pos: usize) -> usize {
+pub fn line_break_len(text: &[u8], pos: usize) -> usize {
     match text.get(pos) {
         Some(b'\r') if text.get(pos + 1) == Some(&b'\n') => 2,
         Some(b'\r' | b'\n') => 1,

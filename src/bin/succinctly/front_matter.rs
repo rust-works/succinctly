@@ -6,6 +6,8 @@
 
 use std::fmt;
 
+use succinctly::text::line_break::line_break_len;
+
 /// The result of successfully splitting front matter from an input.
 #[derive(Debug)]
 pub struct FrontMatter<'a> {
@@ -46,13 +48,19 @@ impl fmt::Display for FrontMatterError {
 
 impl std::error::Error for FrontMatterError {}
 
+/// A leading UTF-8 BOM, if present, sits before the `---` fence rather than
+/// inside it -- common in Markdown files saved by Windows editors.
+const UTF8_BOM: &[u8] = &[0xEF, 0xBB, 0xBF];
+
 /// Split `input` into its YAML front matter and trailing body.
 ///
 /// The input must start with a line that is exactly `---` (trailing
-/// whitespace/`\r` ignored). The front matter ends at the next line that is
-/// exactly `---` or `...` (mirroring YAML's own end-of-document marker).
-/// Everything after that line is returned as the body, unparsed.
+/// whitespace/`\r` ignored, and a leading UTF-8 BOM skipped). The front
+/// matter ends at the next line that is exactly `---` or `...` (mirroring
+/// YAML's own end-of-document marker). Everything after that line is
+/// returned as the body, unparsed.
 pub fn split_front_matter(input: &[u8]) -> Result<FrontMatter<'_>, FrontMatterError> {
+    let input = input.strip_prefix(UTF8_BOM).unwrap_or(input);
     let mut lines = LineScanner::new(input);
 
     let first = lines.next().ok_or(FrontMatterError::NoFrontMatter)?;
@@ -77,14 +85,18 @@ pub fn split_front_matter(input: &[u8]) -> Result<FrontMatter<'_>, FrontMatterEr
 /// The line-ending convention `body` uses, detected from its first line
 /// terminator. `--front-matter=process` reattaches `body` byte-for-byte, so
 /// a fence line injected right before it (the closing `---`) must match --
-/// otherwise a CRLF body ends up preceded by a bare-LF fence, producing a
+/// otherwise a CRLF body ends up preceded by a mismatched fence, producing a
 /// file with mixed line endings. Falls back to `\n` for a body with no line
 /// break to sniff (nothing to mismatch).
 pub(crate) fn body_line_ending(body: &[u8]) -> &'static [u8] {
-    match body.iter().position(|&b| b == b'\n') {
-        Some(nl) if nl > 0 && body[nl - 1] == b'\r' => b"\r\n",
-        _ => b"\n",
+    for (i, &b) in body.iter().enumerate() {
+        match line_break_len(body, i) {
+            2 => return b"\r\n",
+            1 => return if b == b'\r' { b"\r" } else { b"\n" },
+            _ => {}
+        }
     }
+    b"\n"
 }
 
 fn is_fence_line(content: &[u8]) -> bool {
@@ -131,26 +143,26 @@ impl<'a> Iterator for LineScanner<'a> {
             return None;
         }
         let start = self.pos;
-        match self.input[start..].iter().position(|&b| b == b'\n') {
-            Some(rel) => {
-                let content_end = start + rel;
-                let end = content_end + 1;
+        let mut i = start;
+        while i < self.input.len() {
+            let len = line_break_len(self.input, i);
+            if len > 0 {
+                let end = i + len;
                 self.pos = end;
-                Some(Line {
-                    content: &self.input[start..content_end],
+                return Some(Line {
+                    content: &self.input[start..i],
                     start,
                     end,
-                })
+                });
             }
-            None => {
-                self.pos = self.input.len();
-                Some(Line {
-                    content: &self.input[start..],
-                    start,
-                    end: self.input.len(),
-                })
-            }
+            i += 1;
         }
+        self.pos = self.input.len();
+        Some(Line {
+            content: &self.input[start..],
+            start,
+            end: self.input.len(),
+        })
     }
 }
 
@@ -225,6 +237,23 @@ mod tests {
     }
 
     #[test]
+    fn bare_cr_line_endings() {
+        // Classic-Mac (`\r`-only) line endings: a `\n`-only scan would run
+        // straight past every break and collapse the whole input into one
+        // "line", the same failure class #324 fixed for the YAML parser.
+        let fm = split_front_matter(b"---\rtitle: foo\r---\rBody\r").unwrap();
+        assert_eq!(fm.yaml, b"title: foo\r");
+        assert_eq!(fm.body, b"Body\r");
+    }
+
+    #[test]
+    fn leading_utf8_bom_is_skipped() {
+        let fm = split_front_matter(b"\xEF\xBB\xBF---\ntitle: foo\n---\nBody\n").unwrap();
+        assert_eq!(fm.yaml, b"title: foo\n");
+        assert_eq!(fm.body, b"Body\n");
+    }
+
+    #[test]
     fn multiple_yaml_lines_preserved_verbatim() {
         let fm = split_front_matter(b"---\ntitle: foo\ntags: [a, b]\n---\nBody\n").unwrap();
         assert_eq!(fm.yaml, b"title: foo\ntags: [a, b]\n");
@@ -256,6 +285,11 @@ mod tests {
     #[test]
     fn body_line_ending_detects_crlf() {
         assert_eq!(body_line_ending(b"line one\r\nline two\r\n"), b"\r\n");
+    }
+
+    #[test]
+    fn body_line_ending_detects_bare_cr() {
+        assert_eq!(body_line_ending(b"line one\rline two\r"), b"\r");
     }
 
     #[test]
