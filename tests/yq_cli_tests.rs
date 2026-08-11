@@ -3716,6 +3716,100 @@ fn test_slurp_color_output_json() -> Result<()> {
     Ok(())
 }
 
+/// #809: `-C --inplace` fell through to the `OwnedValue`/`IndexMap` DOM
+/// path for any non-compact indent (`can_inplace_yaml_fast_path` excluded
+/// color via `can_stream_pretty`), collapsing duplicate keys — mirrors
+/// [`test_duplicate_mapping_key_survives_inplace`], plus `-C`. `--inplace`
+/// still never writes ANSI to the file even once the fast path is taken:
+/// the fast-path branch passes `false` as `stream_cursor!`'s `$use_color`
+/// argument explicitly, since a bare `output_config.use_color` reference
+/// inside that macro resolves against the *original* binding from where the
+/// macro was defined, not a later same-named shadow at the call site — see
+/// the code comment above `macro_rules! stream_cursor` in `yq_runner.rs`.
+#[test]
+fn test_duplicate_mapping_key_survives_color_inplace() -> Result<()> {
+    let mut input_file = NamedTempFile::new()?;
+    writeln!(input_file, "a: 1\na: 2")?;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .arg("yq")
+        .arg("-i")
+        .arg("-C")
+        .arg(".")
+        .arg(input_file.path())
+        .stdin(Stdio::null())
+        .output()?;
+
+    assert!(output.status.success());
+    let rewritten = std::fs::read_to_string(input_file.path())?;
+    assert_eq!(rewritten, "a: 1\na: 2\n");
+    assert!(
+        !rewritten.contains('\u{1b}'),
+        "inplace must never write ANSI color codes to disk"
+    );
+    Ok(())
+}
+
+/// Same as [`test_duplicate_mapping_key_survives_color_inplace`], for
+/// `-o json`.
+#[test]
+fn test_duplicate_mapping_key_survives_color_inplace_json_output() -> Result<()> {
+    let mut input_file = NamedTempFile::new()?;
+    writeln!(input_file, "a: 1\na: 2")?;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .arg("yq")
+        .arg("-i")
+        .arg("-C")
+        .arg("-o")
+        .arg("json")
+        .arg(".")
+        .arg(input_file.path())
+        .stdin(Stdio::null())
+        .output()?;
+
+    assert!(output.status.success());
+    let rewritten = std::fs::read_to_string(input_file.path())?;
+    assert_eq!(rewritten, "{\n  \"a\": 1,\n  \"a\": 2\n}\n");
+    assert!(
+        !rewritten.contains('\u{1b}'),
+        "inplace must never write ANSI color codes to disk"
+    );
+    Ok(())
+}
+
+/// #809 bonus finding: compact output (`-I0`) already took `--inplace`'s
+/// fast path unconditionally, since the gate is `compact || (color-aware
+/// condition)` and `compact ||` short-circuits before color is ever
+/// checked. Before this fix, that meant `-C -I0 --inplace` wrote raw ANSI
+/// escape bytes straight into the file — worse than the non-compact case,
+/// which never colored its (collapsed) DOM-path output. Regression test:
+/// compact + color + inplace must never leak ANSI into the file.
+#[test]
+fn test_inplace_color_compact_does_not_write_ansi_to_file() -> Result<()> {
+    let mut input_file = NamedTempFile::new()?;
+    writeln!(input_file, "a: 1\na: 2")?;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .arg("yq")
+        .arg("-i")
+        .arg("-C")
+        .arg("-I0")
+        .arg(".")
+        .arg(input_file.path())
+        .stdin(Stdio::null())
+        .output()?;
+
+    assert!(output.status.success());
+    let rewritten = std::fs::read_to_string(input_file.path())?;
+    assert_eq!(rewritten, "a: 1\na: 2\n");
+    assert!(
+        !rewritten.contains('\u{1b}'),
+        "inplace must never write ANSI color codes to disk"
+    );
+    Ok(())
+}
+
 // ============================================================================
 // Special float values (NaN / Infinity)
 // ============================================================================
