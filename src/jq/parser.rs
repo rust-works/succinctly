@@ -2005,12 +2005,48 @@ impl<'a> Parser<'a> {
             self.consume_keyword("add");
             return Ok(Some(Builtin::Add));
         }
-        if self.matches_keyword("any") && !self.peek_after_keyword_is_paren("any") {
+        // any, any(cond), any(gen; cond)
+        if self.matches_keyword("any") {
             self.consume_keyword("any");
+            self.skip_ws();
+            if self.peek() == Some('(') {
+                self.next();
+                self.skip_ws();
+                let f = self.parse_expr()?;
+                self.skip_ws();
+                if self.peek() == Some(';') {
+                    self.next();
+                    self.skip_ws();
+                    let cond = self.parse_expr()?;
+                    self.skip_ws();
+                    self.expect(')')?;
+                    return Ok(Some(Builtin::AnyCond(Box::new(f), Box::new(cond))));
+                }
+                self.expect(')')?;
+                return Ok(Some(Builtin::AnyF(Box::new(f))));
+            }
             return Ok(Some(Builtin::Any));
         }
-        if self.matches_keyword("all") && !self.peek_after_keyword_is_paren("all") {
+        // all, all(cond), all(gen; cond)
+        if self.matches_keyword("all") {
             self.consume_keyword("all");
+            self.skip_ws();
+            if self.peek() == Some('(') {
+                self.next();
+                self.skip_ws();
+                let f = self.parse_expr()?;
+                self.skip_ws();
+                if self.peek() == Some(';') {
+                    self.next();
+                    self.skip_ws();
+                    let cond = self.parse_expr()?;
+                    self.skip_ws();
+                    self.expect(')')?;
+                    return Ok(Some(Builtin::AllCond(Box::new(f), Box::new(cond))));
+                }
+                self.expect(')')?;
+                return Ok(Some(Builtin::AllF(Box::new(f))));
+            }
             return Ok(Some(Builtin::All));
         }
         if self.matches_keyword("min_by") {
