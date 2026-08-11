@@ -293,6 +293,17 @@ impl EvalError {
         Self::new(format!("Cannot use {} as object key", describe(key)))
     }
 
+    /// `invalid UTF-8 in comment`.
+    ///
+    /// Raised by the `line_comment` builtin (issue #797) when a node's
+    /// trailing comment bytes aren't valid UTF-8. Mirrors
+    /// `YamlValue::Error("invalid UTF-8 in anchor name")`'s handling of the
+    /// identical situation for anchor names, so "invalid" surfaces as an
+    /// error here too, rather than silently reading back as "no comment".
+    pub fn invalid_utf8_in_comment() -> Self {
+        Self::new("invalid UTF-8 in comment")
+    }
+
     /// `Path must be specified as an array`.
     ///
     /// Raised by the path builtins when their path argument is not an array at

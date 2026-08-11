@@ -1845,19 +1845,37 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
         self.index.get_tag(self.bp_pos)
     }
 
+    /// Get the raw byte range of this node's trailing same-line comment and
+    /// decode it as UTF-8, distinguishing "no comment" (`Ok(None)`) from
+    /// "comment present but not valid UTF-8" (`Err(_)`) — the shared
+    /// decode point for [`Self::line_comment_raw`] (tolerant: invalid bytes
+    /// collapse to `None`, for output/write paths that must keep rendering
+    /// the rest of the document) and [`Self::line_comment_checked`] (strict:
+    /// invalid bytes surface as an error, issue #797).
+    #[inline]
+    fn line_comment_raw_checked(&self) -> Result<Option<&str>, core::str::Utf8Error> {
+        let Some((start, end)) = self.index.get_line_comment(self.bp_pos) else {
+            return Ok(None);
+        };
+        core::str::from_utf8(&self.text[start as usize..end as usize]).map(Some)
+    }
+
     /// Get the raw trailing same-line comment for this node, `#` and all,
     /// exactly as it appears in the source (issue #710).
     ///
-    /// Returns `None` if this node has no trailing comment. Used by the
-    /// write path, which re-emits the bytes verbatim after a single
-    /// normalized space (matching real `yq`'s output, verified empirically:
-    /// the gap before `#` is normalized to one space, but everything from
-    /// `#` onward — including internal/trailing whitespace — is preserved
+    /// Returns `None` if this node has no trailing comment *or* if the
+    /// comment bytes aren't valid UTF-8 — this tolerant getter is for
+    /// output/write paths that must keep rendering the rest of the document
+    /// either way; use [`Self::line_comment_checked`] where "absent" and
+    /// "invalid" need to be told apart (issue #797). Used by the write
+    /// path, which re-emits the bytes verbatim after a single normalized
+    /// space (matching real `yq`'s output, verified empirically: the gap
+    /// before `#` is normalized to one space, but everything from `#`
+    /// onward — including internal/trailing whitespace — is preserved
     /// as-is). See [`Self::line_comment`] for the stripped getter form.
     #[inline]
     pub fn line_comment_raw(&self) -> Option<&str> {
-        let (start, end) = self.index.get_line_comment(self.bp_pos)?;
-        core::str::from_utf8(&self.text[start as usize..end as usize]).ok()
+        self.line_comment_raw_checked().ok().flatten()
     }
 
     /// Get this node's trailing same-line comment text (the `line_comment`
@@ -1867,7 +1885,9 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
     /// unchanged, since there's nothing to strip.
     ///
     /// Returns `None` if this node has no trailing comment; the builtin
-    /// itself maps that to `""`, matching real `yq`.
+    /// itself maps that to `""`, matching real `yq`. Invalid UTF-8 also
+    /// collapses to `None` here — use [`Self::line_comment_checked`] to
+    /// tell the two apart (issue #797).
     #[inline]
     pub fn line_comment(&self) -> Option<&str> {
         let raw = self.line_comment_raw()?;
@@ -1876,6 +1896,20 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
         // of the text with nothing to strip, e.g. `#keep this` stays
         // `"#keep this"` unchanged (verified against real `yq`).
         Some(raw.strip_prefix("# ").unwrap_or(raw))
+    }
+
+    /// Get this node's trailing same-line comment, distinguishing "no
+    /// comment" (`Ok(None)`) from "comment present but not valid UTF-8"
+    /// (`Err(_)`) — unlike [`Self::line_comment`], which silently collapses
+    /// both to `None`, indistinguishable from each other (issue #797).
+    /// Mirrors `parse_alias_value`'s `YamlValue::Error` handling of the
+    /// identical situation for an invalid-UTF-8 anchor name.
+    #[inline]
+    pub fn line_comment_checked(&self) -> Result<Option<&str>, core::str::Utf8Error> {
+        match self.line_comment_raw_checked()? {
+            Some(raw) => Ok(Some(raw.strip_prefix("# ").unwrap_or(raw))),
+            None => Ok(None),
+        }
     }
 
     /// Get the anchor name that this alias references.
@@ -5118,6 +5152,11 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
     #[inline]
     fn line_comment_raw(&self) -> Option<String> {
         YamlCursor::line_comment_raw(self).map(ToString::to_string)
+    }
+
+    #[inline]
+    fn line_comment_checked(&self) -> Result<Option<String>, core::str::Utf8Error> {
+        YamlCursor::line_comment_checked(self).map(|opt| opt.map(ToString::to_string))
     }
 
     #[inline]

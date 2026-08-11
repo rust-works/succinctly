@@ -147,6 +147,18 @@ pub trait DocumentCursor: Sized + Copy + Clone {
         None
     }
 
+    /// Get this node's trailing same-line comment, distinguishing "no
+    /// comment" (`Ok(None)`) from "comment present but not valid UTF-8"
+    /// (`Err(_)`) — unlike [`line_comment`](Self::line_comment), which
+    /// silently collapses both to `None` (issue #797).
+    ///
+    /// Default `Ok(None)`: formats without a comment concept (JSON) never
+    /// have an invalid-UTF-8 comment to report. Only YAML cursors override
+    /// this.
+    fn line_comment_checked(&self) -> Result<Option<String>, core::str::Utf8Error> {
+        Ok(None)
+    }
+
     /// Create a cursor at the specified byte offset (0-indexed).
     ///
     /// Returns None if:

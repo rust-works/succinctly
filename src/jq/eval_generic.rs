@@ -2783,10 +2783,13 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
             GenericResult::Owned(OwnedValue::String(style.to_string()))
         }
 
-        Builtin::LineComment => {
-            let comment = cursor.and_then(|c| c.line_comment()).unwrap_or_default();
-            GenericResult::Owned(OwnedValue::String(comment))
-        }
+        Builtin::LineComment => match cursor.map(|c| c.line_comment_checked()) {
+            Some(Err(_)) => GenericResult::Error(EvalError::invalid_utf8_in_comment()),
+            Some(Ok(comment)) => {
+                GenericResult::Owned(OwnedValue::String(comment.unwrap_or_default()))
+            }
+            None => GenericResult::Owned(OwnedValue::String(String::new())),
+        },
 
         Builtin::Select(cond) => {
             // Evaluate condition with cursor context preserved.
@@ -5186,6 +5189,25 @@ mod tests {
             result.into_owned().unwrap(),
             OwnedValue::String(String::new())
         );
+    }
+
+    #[test]
+    fn test_yaml_line_comment_builtin_invalid_utf8_is_error_797() {
+        use crate::yaml::YamlIndex;
+
+        // "caf\xE9" - a comment with an invalid UTF-8 byte. Must surface as
+        // an error, not silently collapse to "" as if there were no comment
+        // at all (issue #797).
+        let yaml = b"a: 1 # caf\xE9\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let doc_cursor = index
+            .root(yaml)
+            .first_child()
+            .expect("YAML document should have content");
+
+        let expr = crate::jq::parse(".a | line_comment").unwrap();
+        let result = eval_with_cursor(&expr, doc_cursor);
+        assert!(result.is_error());
     }
 
     #[test]
