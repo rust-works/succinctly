@@ -1534,6 +1534,17 @@ fn can_use_m2_streaming(expr: &Expr) -> bool {
         Expr::Builtin(Builtin::FirstStream(_) | Builtin::LastStream(_)) => true,
         Expr::IndexExpr { .. } => true,
 
+        // `select(...)` never changes position - a truthy output is always
+        // the input node unchanged - and `eval_generic.rs`'s own
+        // `Builtin::Select` arm already forwards the incoming cursor as-is
+        // (`OneCursor`/`ManyCursor`) rather than rebuilding a value. Routing
+        // it here rather than through `evaluate_yaml_cursor`'s unconditional
+        // `to_owned()` DOM path is what keeps duplicate mapping keys (and
+        // their comments) intact, matching `FirstExpr`/`LastExpr` above
+        // (#631) and `-S`/`--tab` (#733) - `select()` had the same latent
+        // gap (#796).
+        Expr::Builtin(Builtin::Select(_)) => true,
+
         // `keys_unsorted` on a mapping produces `GenericResult::LazyKeys { sorted: false, .. }`,
         // which `GenericResult::stream_json`/`stream_yaml` now stream directly
         // from the field cursor (#685) instead of materializing a `Vec<String>`

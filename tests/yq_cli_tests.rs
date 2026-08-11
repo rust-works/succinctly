@@ -857,6 +857,33 @@ fn test_duplicate_mapping_key_survives_computed_index() -> Result<()> {
     Ok(())
 }
 
+/// #796: `select(...)` had the same latent bug as #631's `first`/`last`/
+/// computed-indexing - `eval_generic.rs`'s own `Builtin::Select` arm already
+/// forwarded the incoming cursor unchanged, but `can_use_m2_streaming` never
+/// had an arm for it, so `yq` always fell through to `evaluate_yaml_cursor`'s
+/// `to_owned()` DOM path and silently collapsed duplicate keys (and, since
+/// #710, the earlier key's own comment right along with it).
+#[test]
+fn test_duplicate_mapping_key_survives_select_796() -> Result<()> {
+    let yaml = "a: 1 # first\na: 2 # second\n";
+
+    let (out, code) = run_yq_stdin("select(true)", yaml, &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "a: 1 # first\na: 2 # second\n");
+
+    // A real (non-`true`) predicate must still evaluate correctly through
+    // the new M2 path, not just pass everything through unconditionally.
+    let (filtered_out, code) = run_yq_stdin("select(.a == 2) | .a", yaml, &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(filtered_out, "2\n");
+
+    let (json_out, code) = run_yq_stdin("select(true)", yaml, &["-o", "json", "-I0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(json_out, "{\"a\":1,\"a\":2}\n");
+
+    Ok(())
+}
+
 /// #733: `-S`/`--sort-keys` excluded identity/navigation queries from the M2
 /// cursor-streaming fast path, forcing them through the `OwnedValue` DOM
 /// (`IndexMap`-backed), which silently collapsed duplicate keys — the same
@@ -5642,14 +5669,23 @@ fn test_root_object_comment_preserved_on_identity_710() -> Result<()> {
     Ok(())
 }
 
-/// Same fix, but through the DOM/`select` path (`output_value` in
-/// `yq_runner.rs`) rather than the M2/P9 streaming path exercised by plain
-/// identity above.
+/// Same fix, but for `select(true)` rather than plain identity above.
+///
+/// Before #796, `select(...)` always fell through to the DOM path
+/// (`output_value`'s `root_comment_suffix` in `yq_runner.rs`), which
+/// reserializes every container to block style regardless of the source's
+/// own style - so this used to assert the reformatted `"a: 1 # trailing"`.
+/// #796 routes `select(...)` through the same cursor-native M2 path plain
+/// identity already used, which preserves the source's original flow/block
+/// style instead of always reformatting to block - so the expected output
+/// here changed to match, and now agrees with real `yq` byte-for-byte
+/// (verified against the pinned v4.53.3 binary), where the old block-style
+/// expectation did not.
 #[test]
 fn test_root_array_comment_preserved_on_select_710() -> Result<()> {
     let (out, code) = run_yq_stdin("select(true)", "{a: 1} # trailing\n", &[])?;
     assert_eq!(code, 0);
-    assert_eq!(out.trim_end(), "a: 1 # trailing");
+    assert_eq!(out.trim_end(), "{a: 1} # trailing");
     Ok(())
 }
 
