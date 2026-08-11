@@ -3669,15 +3669,16 @@ fn test_color_output_survives_iteration_with_duplicate_keys_json() -> Result<()>
     Ok(())
 }
 
-/// `--slurp --color` intentionally still routes through the `OwnedValue`/
-/// `IndexMap` DOM path — `can_slurp_fast_path` only checks `can_stream_pretty`,
-/// not `can_stream_pretty_or_colored`, since `stream_yaml_sequence` never got
-/// `stream_maybe_colored` support (a documented scope limit, not a silent
-/// gap — #748). That means `--slurp -C` still collapses duplicate mapping
-/// keys within each slurped document, unlike plain `--slurp` (see
-/// [`test_duplicate_mapping_key_survives_slurp`]). Exercises `output_value`'s
-/// `config.use_color` YAML branch, which #748's M2-fast-path color fix made
-/// unreachable from every other angle.
+/// #809: `--slurp -C` used to intentionally route through the `OwnedValue`/
+/// `IndexMap` DOM path — `can_slurp_fast_path` only checked
+/// `can_stream_pretty`, not `can_stream_pretty_or_colored`, since
+/// `stream_yaml_sequence` never got `stream_maybe_colored` support (a
+/// documented scope limit, not a silent gap — #748). That collapsed
+/// duplicate mapping keys within each slurped document, unlike plain
+/// `--slurp` (see [`test_duplicate_mapping_key_survives_slurp`]). Fixed by
+/// wrapping the `stream_yaml_sequence` call in `stream_maybe_colored`,
+/// mirroring the stdout path's own fix — `stream_yaml_sequence` needed no
+/// changes itself, since it's already generic over `core::fmt::Write`.
 #[test]
 fn test_slurp_color_output_yaml() -> Result<()> {
     let yaml = "a: 1\na: 2\n";
@@ -3686,15 +3687,21 @@ fn test_slurp_color_output_yaml() -> Result<()> {
     assert_eq!(code, 0);
     assert_eq!(
         output,
-        "\u{1b}[33m-\u{1b}[0m\n  \u{1b}[36ma\u{1b}[0m: 2\u{1b}[0m\n"
+        "\u{1b}[33m-\u{1b}[0m\n  \u{1b}[36ma\u{1b}[0m: 1\n  \u{1b}[36ma\u{1b}[0m: 2\u{1b}[0m\n"
     );
 
     Ok(())
 }
 
-/// Same as [`test_slurp_color_output_yaml`], for `-o json`: exercises
-/// `output_value`'s `config.use_color` JSON branch, the `--slurp` DOM-path
-/// counterpart to [`test_slurp_color_output_yaml`].
+/// Unlike [`test_slurp_color_output_yaml`], `-o json --slurp` stays on the
+/// `OwnedValue`/`IndexMap` DOM path regardless of `-C` — `can_slurp_fast_path`
+/// requires YAML output, so `-o json --slurp` is unaffected by #809's fix and
+/// still collapses duplicate keys, exactly as it did (with or without color)
+/// before #809. This is the same pre-existing, separately-scoped `-o json
+/// --slurp` limitation the `can_slurp_fast_path` code comment documents, not
+/// a `-C`-specific gap. Exercises `output_value`'s `config.use_color` JSON
+/// branch, which #748's M2-fast-path color fix made unreachable from every
+/// other angle.
 #[test]
 fn test_slurp_color_output_json() -> Result<()> {
     let yaml = "a: 1\na: 2\n";
@@ -3706,6 +3713,115 @@ fn test_slurp_color_output_json() -> Result<()> {
         "\u{1b}[1;39m[\u{1b}[0m\u{1b}[1;39m{\u{1b}[0m\u{1b}[1;34m\"a\"\u{1b}[0m:\u{1b}[0;39m2\u{1b}[0m\u{1b}[1;39m}\u{1b}[0m\u{1b}[1;39m]\u{1b}[0m\n"
     );
 
+    Ok(())
+}
+
+/// #809 follow-up: before this fix, `--slurp -C`'s identity query was the
+/// only thing exercising `output_value`'s YAML `config.use_color` branch.
+/// Once `can_slurp_fast_path` started accepting color (this PR), that query
+/// moved onto the new fast path and stopped covering it. `--null-input` has
+/// no cursor to stream from, so it bypasses the M2 fast path entirely
+/// regardless of query shape and keeps hitting `output_value` — pinning it
+/// here so the DOM-path YAML color branch stays covered.
+#[test]
+fn test_null_input_color_output_yaml() -> Result<()> {
+    let (output, code) = run_yq_stdin("{a: 1}", "", &["-n", "-C"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "\u{1b}[36ma\u{1b}[0m: 1\u{1b}[0m\n");
+    Ok(())
+}
+
+/// #809: `-C --inplace` fell through to the `OwnedValue`/`IndexMap` DOM
+/// path for any non-compact indent (`can_inplace_yaml_fast_path` excluded
+/// color via `can_stream_pretty`), collapsing duplicate keys — mirrors
+/// [`test_duplicate_mapping_key_survives_inplace`], plus `-C`. `--inplace`
+/// still never writes ANSI to the file even once the fast path is taken:
+/// the fast-path branch passes `false` as `stream_cursor!`'s `$use_color`
+/// argument explicitly, since a bare `output_config.use_color` reference
+/// inside that macro resolves against the *original* binding from where the
+/// macro was defined, not a later same-named shadow at the call site — see
+/// the code comment above `macro_rules! stream_cursor` in `yq_runner.rs`.
+#[test]
+fn test_duplicate_mapping_key_survives_color_inplace() -> Result<()> {
+    let mut input_file = NamedTempFile::new()?;
+    writeln!(input_file, "a: 1\na: 2")?;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .arg("yq")
+        .arg("-i")
+        .arg("-C")
+        .arg(".")
+        .arg(input_file.path())
+        .stdin(Stdio::null())
+        .output()?;
+
+    assert!(output.status.success());
+    let rewritten = std::fs::read_to_string(input_file.path())?;
+    assert_eq!(rewritten, "a: 1\na: 2\n");
+    assert!(
+        !rewritten.contains('\u{1b}'),
+        "inplace must never write ANSI color codes to disk"
+    );
+    Ok(())
+}
+
+/// Same as [`test_duplicate_mapping_key_survives_color_inplace`], for
+/// `-o json`.
+#[test]
+fn test_duplicate_mapping_key_survives_color_inplace_json_output() -> Result<()> {
+    let mut input_file = NamedTempFile::new()?;
+    writeln!(input_file, "a: 1\na: 2")?;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .arg("yq")
+        .arg("-i")
+        .arg("-C")
+        .arg("-o")
+        .arg("json")
+        .arg(".")
+        .arg(input_file.path())
+        .stdin(Stdio::null())
+        .output()?;
+
+    assert!(output.status.success());
+    let rewritten = std::fs::read_to_string(input_file.path())?;
+    assert_eq!(rewritten, "{\n  \"a\": 1,\n  \"a\": 2\n}\n");
+    assert!(
+        !rewritten.contains('\u{1b}'),
+        "inplace must never write ANSI color codes to disk"
+    );
+    Ok(())
+}
+
+/// #809 bonus finding: compact output (`-I0`) already took `--inplace`'s
+/// fast path unconditionally, since the gate is `compact || (color-aware
+/// condition)` and `compact ||` short-circuits before color is ever
+/// checked. Before this fix, that meant `-C -I0 --inplace` wrote raw ANSI
+/// escape bytes straight into the file — worse than the non-compact case,
+/// which never colored its (collapsed) DOM-path output. Regression test:
+/// compact + color + inplace must never leak ANSI into the file.
+#[test]
+fn test_inplace_color_compact_does_not_write_ansi_to_file() -> Result<()> {
+    let mut input_file = NamedTempFile::new()?;
+    writeln!(input_file, "a: 1\na: 2")?;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .arg("yq")
+        .arg("-i")
+        .arg("-C")
+        .arg("-I0")
+        .arg(".")
+        .arg(input_file.path())
+        .stdin(Stdio::null())
+        .output()?;
+
+    assert!(output.status.success());
+    let rewritten = std::fs::read_to_string(input_file.path())?;
+    assert_eq!(rewritten, "a: 1\na: 2\n");
+    assert!(
+        !rewritten.contains('\u{1b}'),
+        "inplace must never write ANSI color codes to disk"
+    );
     Ok(())
 }
 
