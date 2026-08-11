@@ -13,8 +13,9 @@
 //! predicates diverge silently, and the next edge case would have landed in one
 //! copy and not the others. #341 collapsed them onto `yaml::line_break`; #228
 //! added a fourth consumer outside `yaml`, so the definition moved here and
-//! [`crate::yaml::line_break`] re-exports it. Callers that need a different
-//! *shape* adapt around these three functions rather than restating the rule.
+//! `yaml::line_break` (a private module, not doc-linkable from here) re-exports
+//! it. Callers that need a different *shape* adapt around these three
+//! functions rather than restating the rule.
 //!
 //! Two exceptions survive, both in YAML and both documented at their sites:
 //! `yaml::parser::Parser::skip_line_break` keeps a hand-rolled dispatch for a
