@@ -3669,15 +3669,16 @@ fn test_color_output_survives_iteration_with_duplicate_keys_json() -> Result<()>
     Ok(())
 }
 
-/// `--slurp --color` intentionally still routes through the `OwnedValue`/
-/// `IndexMap` DOM path — `can_slurp_fast_path` only checks `can_stream_pretty`,
-/// not `can_stream_pretty_or_colored`, since `stream_yaml_sequence` never got
-/// `stream_maybe_colored` support (a documented scope limit, not a silent
-/// gap — #748). That means `--slurp -C` still collapses duplicate mapping
-/// keys within each slurped document, unlike plain `--slurp` (see
-/// [`test_duplicate_mapping_key_survives_slurp`]). Exercises `output_value`'s
-/// `config.use_color` YAML branch, which #748's M2-fast-path color fix made
-/// unreachable from every other angle.
+/// #809: `--slurp -C` used to intentionally route through the `OwnedValue`/
+/// `IndexMap` DOM path — `can_slurp_fast_path` only checked
+/// `can_stream_pretty`, not `can_stream_pretty_or_colored`, since
+/// `stream_yaml_sequence` never got `stream_maybe_colored` support (a
+/// documented scope limit, not a silent gap — #748). That collapsed
+/// duplicate mapping keys within each slurped document, unlike plain
+/// `--slurp` (see [`test_duplicate_mapping_key_survives_slurp`]). Fixed by
+/// wrapping the `stream_yaml_sequence` call in `stream_maybe_colored`,
+/// mirroring the stdout path's own fix — `stream_yaml_sequence` needed no
+/// changes itself, since it's already generic over `core::fmt::Write`.
 #[test]
 fn test_slurp_color_output_yaml() -> Result<()> {
     let yaml = "a: 1\na: 2\n";
@@ -3686,15 +3687,21 @@ fn test_slurp_color_output_yaml() -> Result<()> {
     assert_eq!(code, 0);
     assert_eq!(
         output,
-        "\u{1b}[33m-\u{1b}[0m\n  \u{1b}[36ma\u{1b}[0m: 2\u{1b}[0m\n"
+        "\u{1b}[33m-\u{1b}[0m\n  \u{1b}[36ma\u{1b}[0m: 1\n  \u{1b}[36ma\u{1b}[0m: 2\u{1b}[0m\n"
     );
 
     Ok(())
 }
 
-/// Same as [`test_slurp_color_output_yaml`], for `-o json`: exercises
-/// `output_value`'s `config.use_color` JSON branch, the `--slurp` DOM-path
-/// counterpart to [`test_slurp_color_output_yaml`].
+/// Unlike [`test_slurp_color_output_yaml`], `-o json --slurp` stays on the
+/// `OwnedValue`/`IndexMap` DOM path regardless of `-C` — `can_slurp_fast_path`
+/// requires YAML output, so `-o json --slurp` is unaffected by #809's fix and
+/// still collapses duplicate keys, exactly as it did (with or without color)
+/// before #809. This is the same pre-existing, separately-scoped `-o json
+/// --slurp` limitation the `can_slurp_fast_path` code comment documents, not
+/// a `-C`-specific gap. Exercises `output_value`'s `config.use_color` JSON
+/// branch, which #748's M2-fast-path color fix made unreachable from every
+/// other angle.
 #[test]
 fn test_slurp_color_output_json() -> Result<()> {
     let yaml = "a: 1\na: 2\n";

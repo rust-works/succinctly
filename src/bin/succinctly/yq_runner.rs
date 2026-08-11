@@ -1956,18 +1956,13 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
     // through DOM now gives it a single seam to implement real
     // style-clearing against once #707 lands (#705).
     //
-    // `can_stream_pretty` still excludes color: it also gates `--slurp`'s
-    // and `--inplace`'s fast paths below, neither of which has the
-    // buffer-and-colorize plumbing `stream_maybe_colored` adds for the
-    // plain stdout path. `can_stream_pretty_or_colored` is the same
-    // condition minus that exclusion, used only by `can_json_fast_path`/
-    // `can_yaml_fast_path`: color, when requested, is handled by
-    // `stream_maybe_colored` buffering the (still duplicate-key-safe)
-    // cursor-streamed output and running it through the existing
-    // `colorize_yaml`/`colorize_json` post-processors, rather than falling
-    // back to the DOM/IndexMap path that would collapse duplicate mapping
-    // keys (#442, #748).
-    let can_stream_pretty = !output_config.use_color && !args.pretty_print;
+    // `can_stream_pretty_or_colored` gates every M2 fast path below,
+    // stdout, `--slurp`, and `--inplace` alike: color, when requested, is
+    // handled by `stream_maybe_colored` buffering the (still
+    // duplicate-key-safe) cursor-streamed output and running it through the
+    // existing `colorize_yaml`/`colorize_json` post-processors, rather than
+    // falling back to the DOM/IndexMap path that would collapse duplicate
+    // mapping keys (#442, #748, #809).
     let can_stream_pretty_or_colored = !args.pretty_print;
     let can_json_fast_path = is_m2_streamable
         && (output_config.compact || (can_stream_pretty_or_colored && !args.ascii_output))
@@ -2000,9 +1995,15 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
     // per-file buffer (then `fs::write`), not the shared stdout `writer`
     // the block below uses — the two loops have different write targets and
     // per-file `---` separator resets, so they stay as distinct branches
-    // that happen to share the same underlying `stream_cursor!` macro.
+    // that happen to share the same underlying `stream_cursor!` macro. Color
+    // no longer excludes the fast path here (#809): the inplace write loop
+    // below passes `false` as `stream_cursor!`'s `$use_color` argument (and
+    // shadows `output_config.use_color` to `false` for its own DOM-branch
+    // writes), so `-C` reaching the fast path still never writes ANSI to
+    // disk, but no longer forces a fallback to the duplicate-key-collapsing
+    // DOM path either.
     let can_inplace_json_fast_path = is_m2_streamable
-        && (output_config.compact || (can_stream_pretty && !args.ascii_output))
+        && (output_config.compact || (can_stream_pretty_or_colored && !args.ascii_output))
         && output_config.output_format == OutputFormat::Json
         && !args.null_input
         && !args.raw_input
@@ -2010,7 +2011,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
         && args.front_matter.is_none()
         && context.named.is_empty();
     let can_inplace_yaml_fast_path = is_m2_streamable
-        && (output_config.compact || can_stream_pretty)
+        && (output_config.compact || can_stream_pretty_or_colored)
         && output_config.output_format == OutputFormat::Yaml
         && !args.null_input
         && !args.raw_input
@@ -2024,12 +2025,11 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
     // `is_m2_streamable` set), since a non-trivial filter over the slurped
     // array needs real evaluation. `-o json --slurp` still uses the slow
     // DOM path below — an explicit, documented scope limit rather than a
-    // silent gap. Also still excludes color (`can_stream_pretty`, not
-    // `can_stream_pretty_or_colored`) — buffer-and-colorize support (#748)
-    // wasn't added to `stream_yaml_sequence`, so `--slurp --color` stays on
-    // the DOM path, unchanged.
+    // silent gap. Color no longer excludes this gate either (#809): the
+    // call site now wraps `stream_yaml_sequence` in `stream_maybe_colored`,
+    // same as the stdout/inplace paths.
     let can_slurp_fast_path = is_identity
-        && can_stream_pretty
+        && can_stream_pretty_or_colored
         && output_config.output_format == OutputFormat::Yaml
         && !args.null_input
         && !args.raw_input
@@ -2069,12 +2069,20 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
     // Helper macro to stream cursor results (avoiding closure borrow issues).
     // Defined here (rather than inside the `if can_fast_path` block below) so
     // both the stdout M2 path and `--inplace`'s fast path (#478) can reuse
-    // it. `$is_yaml` is threaded through explicitly rather than closing over
-    // `can_yaml_fast_path` by name, and `yaml_doc_streamed`/`any_truthy`/
-    // `sink` resolve, at each call site, to whichever same-named local is in
-    // scope there — each branch below declares its own `yaml_doc_streamed`.
+    // it. `$is_yaml`/`$use_color` are threaded through explicitly rather than
+    // closing over `can_yaml_fast_path`/`output_config.use_color` by name:
+    // both of those differ per call site (`--inplace` always forces color
+    // off, #809), and — unlike `yaml_doc_streamed`/`any_truthy`/`sink`,
+    // which each call site's enclosing block declares fresh right before
+    // invoking this macro — `output_config` already existed when this macro
+    // was *defined*, so a `let output_config = ...` shadow introduced later,
+    // at a given call site, is invisible to a bare (non-`$`) reference here:
+    // `macro_rules!` resolves such free identifiers against whatever was in
+    // scope at definition time, not at each expansion site. `$fragment:expr`
+    // parameters don't have that problem — they always evaluate in the
+    // caller's own scope — hence passing color as `$use_color:expr`.
     macro_rules! stream_cursor {
-            ($cursor:expr, $writer:expr, $is_yaml:expr, $doc_streamed:expr) => {{
+            ($cursor:expr, $writer:expr, $is_yaml:expr, $doc_streamed:expr, $use_color:expr) => {{
                 if $is_yaml {
                     // M2 YAML path: YAML output streaming
                     if is_identity {
@@ -2084,7 +2092,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                         // redisplayed as itself - its own trailing comment,
                         // if any, must be kept (#710).
                         emit_yaml_doc_separator($writer, $doc_streamed, true)?;
-                        stream_maybe_colored($writer, output_config.use_color, colorize_yaml, |out| {
+                        stream_maybe_colored($writer, $use_color, colorize_yaml, |out| {
                             $cursor.stream_yaml_as_document(out, yaml_indent, sort_keys)
                         })?;
                         writeln!($writer)?;
@@ -2104,7 +2112,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                             && !matches!(&result, GenericResult::ManyOwned(vs) if vs.is_empty());
                         emit_yaml_doc_separator($writer, $doc_streamed, will_output)?;
                         let stats =
-                            stream_maybe_colored($writer, output_config.use_color, colorize_yaml, |out| {
+                            stream_maybe_colored($writer, $use_color, colorize_yaml, |out| {
                                 result.stream_yaml(out, yaml_indent, sort_keys, |w| w.write_str("\n"))
                             })?;
                         any_truthy |= stats.any_truthy;
@@ -2120,7 +2128,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                         // P9 path: stream directly without evaluation
                         stream_maybe_colored(
                             $writer,
-                            output_config.use_color,
+                            $use_color,
                             |s| output::colorize_json(s, &ColorScheme::default()),
                             |out| $cursor.stream_json(out, json_indent, sort_keys),
                         )?;
@@ -2135,7 +2143,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                         let result = eval_with_cursor_using::<YqSemantics, _>(&program.expr, $cursor);
                         let stats = stream_maybe_colored(
                             $writer,
-                            output_config.use_color,
+                            $use_color,
                             |s| output::colorize_json(s, &ColorScheme::default()),
                             |out| result.stream_json(out, json_indent, sort_keys, |w| w.write_str("\n")),
                         )?;
@@ -2181,7 +2189,8 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                                 cursor,
                                 &mut writer,
                                 can_yaml_fast_path,
-                                &mut yaml_doc_streamed
+                                &mut yaml_doc_streamed,
+                                output_config.use_color
                             );
                         }
                         global_doc_index += 1;
@@ -2224,7 +2233,8 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                                     doc_cursor,
                                     &mut writer,
                                     can_yaml_fast_path,
-                                    &mut yaml_doc_streamed
+                                    &mut yaml_doc_streamed,
+                                    output_config.use_color
                                 );
                             }
                         }
@@ -2257,7 +2267,8 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                                     cursor,
                                     &mut writer,
                                     can_yaml_fast_path,
-                                    &mut yaml_doc_streamed
+                                    &mut yaml_doc_streamed,
+                                    output_config.use_color
                                 );
                             }
                             global_doc_index += 1;
@@ -2308,7 +2319,8 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                                         doc_cursor,
                                         &mut writer,
                                         can_yaml_fast_path,
-                                        &mut yaml_doc_streamed
+                                        &mut yaml_doc_streamed,
+                                        output_config.use_color
                                     );
                                 }
                             }
@@ -2612,15 +2624,19 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                 // matching jq/yq `-e` semantics for arrays.
                 any_truthy = true;
             }
-            stream_yaml_sequence(
-                cursors.iter().copied(),
-                &mut FmtWriter(&mut writer),
-                0,
-                yaml_indent_spaces,
-                indent_unit,
-                sort_keys,
-            )
-            .map_err(|_| anyhow::anyhow!("Write error"))?;
+            // Buffer-and-colorize (#748, extended to `--slurp` by #809):
+            // `stream_yaml_sequence` is generic over `core::fmt::Write`, so
+            // it slots into `stream_maybe_colored` unmodified.
+            stream_maybe_colored(&mut writer, output_config.use_color, colorize_yaml, |out| {
+                stream_yaml_sequence(
+                    cursors.iter().copied(),
+                    out,
+                    0,
+                    yaml_indent_spaces,
+                    indent_unit,
+                    sort_keys,
+                )
+            })?;
             writeln!(writer)?;
         } else {
             let mut all_docs: Vec<OwnedValue> = Vec::new();
@@ -2673,6 +2689,23 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
 
             let mut output_buffer = Vec::new();
 
+            // `--inplace` never writes ANSI to disk (#809): shadow
+            // `output_config` for the rest of this file's write so the DOM
+            // branch below sees `use_color: false` regardless of `-C` (the
+            // fast-path branch instead passes `false` explicitly as
+            // `stream_cursor!`'s `$use_color` argument — a bare
+            // `output_config.use_color` reference inside that macro would
+            // resolve against the *original*, unshadowed binding, since
+            // `output_config` already existed when the macro was defined).
+            // Forcing color off here also closes a live bug: compact mode
+            // (`-I0`) already took the fast path unconditionally (the
+            // `compact ||` gate short-circuits before color is checked),
+            // and nothing forced color off on that path, so
+            // `-C -I0 --inplace` wrote raw ANSI bytes straight into the
+            // file.
+            let mut output_config = output_config.clone();
+            output_config.use_color = false;
+
             if can_inplace_fast_path {
                 // M2 streaming fast path (#478): stream cursor results
                 // directly into this file's buffer, skipping the OwnedValue
@@ -2699,7 +2732,8 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                                         cursor,
                                         &mut buf_writer,
                                         can_inplace_yaml_fast_path,
-                                        &mut yaml_doc_streamed
+                                        &mut yaml_doc_streamed,
+                                        false
                                     );
                                 }
                                 global_doc_index += 1;
@@ -2741,7 +2775,8 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                                         doc_cursor,
                                         &mut buf_writer,
                                         can_inplace_yaml_fast_path,
-                                        &mut yaml_doc_streamed
+                                        &mut yaml_doc_streamed,
+                                        false
                                     );
                                 }
                             }
@@ -2791,18 +2826,18 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                         writeln!(buf_writer, "---")?;
                     }
                     let results = evaluate_input(input, &program.expr, &mut sink)?;
-                    // Write without color for inplace editing
-                    let mut no_color_config = output_config.clone();
-                    no_color_config.use_color = false;
+                    // `output_config` was already shadowed to `use_color:
+                    // false` above — reused here rather than building a
+                    // second, parallel no-color config.
                     for result in results {
-                        split_doc_state.write_separator(&mut buf_writer, &no_color_config)?;
+                        split_doc_state.write_separator(&mut buf_writer, &output_config)?;
                         any_truthy |=
                             !matches!(&result, OwnedValue::Null | OwnedValue::Bool(false));
                         output_value(
                             &mut buf_writer,
                             &result,
                             &CommentTree::empty(),
-                            &no_color_config,
+                            &output_config,
                         )?;
                     }
                 }

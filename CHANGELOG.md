@@ -302,6 +302,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   output; the buffer-and-colorize decision keys only on `use_color`, so
   compact mode is now colorized too.
 
+- **`yq -C` combined with `--slurp` or `--inplace` still collapsed duplicate
+  mapping keys** (#809), the follow-up gap #748 itself flagged as scope,
+  not a silent regression: `can_slurp_fast_path`/`can_inplace_json_fast_path`/
+  `can_inplace_yaml_fast_path` still gated on the color-excluding
+  `can_stream_pretty`, so `-C` combined with either flag fell through to the
+  `OwnedValue`/`IndexMap` DOM path and lost all but the last occurrence of a
+  repeated key — `yq -C --slurp '.'` on `a: 1\na: 2` printed only `a: 2`
+  (with color), and `yq -C -i '.'` wrote only `a: 2` to the file (uncolored,
+  since `--inplace` already forced color off on that path).
+
+  Fixed by switching all three gates to the color-inclusive
+  `can_stream_pretty_or_colored` (removing the now-redundant
+  `can_stream_pretty`) and, for `--slurp`, wrapping the existing
+  `stream_yaml_sequence` call in `stream_maybe_colored` — no changes needed
+  in `stream_yaml_sequence` itself, since it was already generic over
+  `core::fmt::Write`. `-o json --slurp` is unaffected: it stays on the DOM
+  path regardless of color, a separate, pre-existing scope limit.
+
+  `--inplace`'s fast path shares its cursor-streaming code
+  (`stream_cursor!`) with the plain stdout path, which does need color, so
+  the macro now takes an explicit `$use_color` argument instead of reading
+  `output_config.use_color` directly — a same-named `output_config` shadowed
+  to `use_color: false` at the `--inplace` call site is invisible to a bare
+  reference inside the macro, since `macro_rules!` resolves such free
+  identifiers against whatever was visible when the macro was *defined*, not
+  a later local shadow at the call site. Stdout call sites pass
+  `output_config.use_color` through unchanged; `--inplace`'s two call sites
+  pass `false` explicitly.
+
+  Fixing this also closed a second, previously-unnoticed bug: compact output
+  (`-I0`) already took `--inplace`'s fast path unconditionally (`compact ||`
+  short-circuited before color was checked), and nothing forced color off on
+  that path, so `-C -I0 --inplace` wrote raw ANSI escape bytes straight into
+  the file on disk.
+
 - **`gmtime`, `mktime`, and `strptime` raised the right exit code but the
   wrong message on bad input** (#761): `gmtime`/`localtime` on a non-number
   reported the generic `"math function requires number"` (shared with
