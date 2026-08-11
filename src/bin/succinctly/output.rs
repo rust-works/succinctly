@@ -115,12 +115,33 @@ impl core::fmt::Display for InputLocation {
 pub struct ErrorSink {
     hit: bool,
     report_count: usize,
+    halt: Option<i32>,
 }
 
 impl ErrorSink {
     /// Report an uncaught evaluation error and mark the run as failed.
     pub fn report(&mut self, style: DiagStyle, err: &EvalError, at: &InputLocation) {
         self.emit(style, &err.message, err.payload_is_not_a_string(), at);
+    }
+
+    /// Record a `halt`/`halt_error` request with its exit code (#791).
+    ///
+    /// Unlike `report`/`report_break`, this is not a diagnostic: no message
+    /// is printed here (`halt_error`'s stderr write already happened inside
+    /// the evaluator, and bare `halt` prints nothing), and `hit`/
+    /// `report_count` are left untouched — `halt` outranks every other exit
+    /// code path (uncaught errors, `-e`) rather than participating in their
+    /// bookkeeping. First halt seen wins; callers are expected to stop
+    /// evaluating further input immediately after this is set, so a second
+    /// call should never happen in practice.
+    pub fn request_halt(&mut self, exit_code: i32) {
+        self.halt = self.halt.or(Some(exit_code));
+    }
+
+    /// The exit code requested by `halt`/`halt_error` during this run, if
+    /// any. Once set, it takes precedence over every other exit code path.
+    pub fn halted(&self) -> Option<i32> {
+        self.halt
     }
 
     /// Report an error surfaced by a streaming operation ([`StreamError`]).

@@ -472,6 +472,13 @@ fn evaluate_yaml_direct_filtered(
 
                 local_idx += 1;
                 docs = rest;
+
+                // halt/halt_error (#791) outranks evaluating any further
+                // documents in this file — the caller checks `sink.halted()`
+                // too, to stop further *files*.
+                if sink.halted().is_some() {
+                    break;
+                }
             }
             Ok((doc_results, local_idx))
         }
@@ -547,6 +554,13 @@ fn query_result_to_owned_values(
             sink.report_break(DiagStyle::Yq, &label, &no_location());
             vec![]
         }
+        // `halt`/`halt_error` (#791): not a diagnostic, so no `sink.report*`
+        // call — `request_halt` records the exit code for the caller's loop
+        // to short-circuit on, without touching `hit`/`report_count`.
+        QueryResult::Halt(code) => {
+            sink.request_halt(code);
+            vec![]
+        }
         // The outputs already produced no longer vanish behind the failure
         // (#400, #494).
         QueryResult::Partial(vs, jq::Control::Error(e)) => {
@@ -555,6 +569,10 @@ fn query_result_to_owned_values(
         }
         QueryResult::Partial(vs, jq::Control::Break(label)) => {
             sink.report_break(DiagStyle::Yq, &label, &no_location());
+            vs
+        }
+        QueryResult::Partial(vs, jq::Control::Halt(code)) => {
+            sink.request_halt(code);
             vs
         }
     }
@@ -717,6 +735,13 @@ fn write_split_result(
     let reports_before = sink.report_count();
     let filename_results = evaluate_input(result, &per_result_expr, sink)?;
 
+    // halt/halt_error (#791) inside the split expression: not a diagnostic
+    // (no `report_count` bump), so it must be checked before the `[]` arms
+    // below, or it would be misreported as "produced no output".
+    if sink.halted().is_some() {
+        return Ok(());
+    }
+
     let filename = match filename_results.as_slice() {
         [OwnedValue::String(s)] => s.clone(),
         // `evaluate_input` already reported the underlying error (e.g. an
@@ -867,6 +892,10 @@ fn evaluate_yaml_cursor<W: AsRef<[u64]> + Clone>(
                 sink.report_break(DiagStyle::Yq, &label, &no_location());
                 Ok(vec![])
             }
+            Err(jq::Control::Halt(code)) => {
+                sink.request_halt(code);
+                Ok(vec![])
+            }
         },
         GenericResult::None => Ok(vec![]),
         GenericResult::Error(e) => {
@@ -879,6 +908,13 @@ fn evaluate_yaml_cursor<W: AsRef<[u64]> + Clone>(
             sink.report_break(DiagStyle::Yq, &label, &no_location());
             Ok(vec![])
         }
+        // `halt`/`halt_error` (#791): not a diagnostic, so no `sink.report*`
+        // call — `request_halt` records the exit code for the caller's loop
+        // to short-circuit on, without touching `hit`/`report_count`.
+        GenericResult::Halt(code) => {
+            sink.request_halt(code);
+            Ok(vec![])
+        }
         // The outputs already produced no longer vanish behind the failure
         // (#400, #494).
         GenericResult::Partial(vs, jq::Control::Error(e)) => {
@@ -887,6 +923,10 @@ fn evaluate_yaml_cursor<W: AsRef<[u64]> + Clone>(
         }
         GenericResult::Partial(vs, jq::Control::Break(label)) => {
             sink.report_break(DiagStyle::Yq, &label, &no_location());
+            Ok(vs.into_iter().map(no_comments).collect())
+        }
+        GenericResult::Partial(vs, jq::Control::Halt(code)) => {
+            sink.request_halt(code);
             Ok(vs.into_iter().map(no_comments).collect())
         }
     };
@@ -2485,6 +2525,10 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                     &mut sink,
                 )?;
                 output_index += 1;
+                // halt/halt_error (#791) outranks writing any further split files.
+                if sink.halted().is_some() {
+                    break;
+                }
             }
         } else {
             // `--front-matter` is rejected in combination above, so every
@@ -2500,7 +2544,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
             };
 
             let mut global_doc_index: usize = 0;
-            for (bytes, format, _) in &input_sources {
+            'files: for (bytes, format, _) in &input_sources {
                 match format {
                     InputFormat::Yaml | InputFormat::Auto => {
                         let doc_filter = args.document.map(|target| (target, global_doc_index));
@@ -2529,7 +2573,16 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                                     &mut sink,
                                 )?;
                                 output_index += 1;
+                                // halt/halt_error (#791) outranks writing any
+                                // further split files or evaluating any
+                                // further documents/inputs/files.
+                                if sink.halted().is_some() {
+                                    break 'files;
+                                }
                             }
+                        }
+                        if sink.halted().is_some() {
+                            break 'files;
                         }
                     }
                     InputFormat::Json => {
@@ -2555,8 +2608,14 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                                     &mut sink,
                                 )?;
                                 output_index += 1;
+                                if sink.halted().is_some() {
+                                    break 'files;
+                                }
                             }
                             global_doc_index += 1;
+                            if sink.halted().is_some() {
+                                break 'files;
+                            }
                         }
                     }
                 }
@@ -2606,6 +2665,10 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                     split_doc_state.write_separator(&mut writer, &output_config)?;
                     any_truthy |= !matches!(&result, OwnedValue::Null | OwnedValue::Bool(false));
                     output_value(&mut writer, &result, &CommentTree::empty(), &output_config)?;
+                }
+                // halt/halt_error (#791) outranks evaluating any further lines.
+                if sink.halted().is_some() {
+                    break;
                 }
             }
         }
@@ -2739,7 +2802,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
         }
 
         let mut global_doc_index: usize = 0;
-        for file_path in &input_files {
+        'inplace_files: for file_path in &input_files {
             let path = Path::new(file_path);
             let raw_bytes = read_file(path)?;
             let resolved_format = resolve_input_format(args.input_format, Some(path));
@@ -2904,6 +2967,13 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                             &output_config,
                         )?;
                     }
+                    // halt/halt_error (#791): still write this file's buffer
+                    // so far (below, matching the "prefix already output
+                    // survives" rule elsewhere), but evaluate no further
+                    // documents in this file or any other.
+                    if sink.halted().is_some() {
+                        break;
+                    }
                 }
                 buf_writer.flush()?;
                 global_doc_index += inputs.len();
@@ -2918,6 +2988,11 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
             // Write the output back to the file
             std::fs::write(path, &output_buffer)
                 .with_context(|| format!("failed to write to file: {}", path.display()))?;
+
+            // halt/halt_error (#791) outranks editing any further files.
+            if sink.halted().is_some() {
+                break 'inplace_files;
+            }
         }
     } else {
         // Standard path: evaluate inputs
@@ -2946,7 +3021,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
         // input has none, so it's paired with CommentTree::empty().
         let mut all_results: Vec<Vec<Vec<ResultWithComments>>> = Vec::new();
         let mut global_doc_index: usize = 0;
-        for (bytes, format, _) in &input_sources {
+        'collect: for (bytes, format, _) in &input_sources {
             match format {
                 InputFormat::Yaml | InputFormat::Auto => {
                     // Use direct YAML evaluation to preserve position metadata
@@ -2965,11 +3040,17 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                     )?;
                     global_doc_index += num_docs;
                     all_results.push(doc_results);
+                    // halt/halt_error (#791) outranks evaluating any further
+                    // files — whatever was collected so far still prints below.
+                    if sink.halted().is_some() {
+                        break 'collect;
+                    }
                 }
                 InputFormat::Json => {
                     // Use OwnedValue path for JSON
                     let inputs = parse_input(bytes, InputFormat::Json)?;
                     let mut json_results = Vec::new();
+                    let mut halted = false;
                     for input in inputs {
                         // Apply --doc filter if specified
                         if let Some(target_doc) = args.document {
@@ -2986,8 +3067,18 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                                 .collect::<Vec<_>>(),
                         );
                         global_doc_index += 1;
+                        // halt/halt_error (#791): stop evaluating further
+                        // inputs in this file (and, below, further files) —
+                        // whatever was collected so far still prints below.
+                        if sink.halted().is_some() {
+                            halted = true;
+                            break;
+                        }
                     }
                     all_results.push(json_results);
+                    if halted {
+                        break 'collect;
+                    }
                 }
             }
         }
@@ -3043,6 +3134,13 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
     }
 
     writer.flush()?;
+
+    // halt/halt_error (#791) outranks everything below — every branch above
+    // stops evaluating further input as soon as it's requested, but still
+    // finishes writing whatever output it already had buffered/collected.
+    if let Some(code) = sink.halted() {
+        return Ok(code);
+    }
 
     // Determine exit code. An uncaught error outranks -e: the filter failed,
     // which is not the same as it succeeding with a falsy result (#355 vs #178).
