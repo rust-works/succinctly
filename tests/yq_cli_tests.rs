@@ -6694,6 +6694,21 @@ fn test_eval_all_doc_separator_between_results() -> Result<()> {
     Ok(())
 }
 
+/// Regression test: `--eval-all` never routed through `SplitDocState` (the
+/// state machine every other output path uses to honor an explicit
+/// `split_doc` marker), so `--eval-all '... | split_doc'` silently merged
+/// every result with zero `---` separators instead of one per result
+/// (#715 follow-up).
+#[test]
+fn test_eval_all_split_doc_emits_separators() -> Result<()> {
+    let (f1, f2) = two_doc_fixtures()?;
+    let (stdout, _stderr, code) =
+        run_yq_files(".[] | split_doc", &[f1.path(), f2.path()], &["--eval-all"])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "a: 1\nname: first\n---\nb: 2\nname: second\n");
+    Ok(())
+}
+
 #[test]
 fn test_eval_all_doc_flag_interaction() -> Result<()> {
     let mut multi = NamedTempFile::new()?;

@@ -2243,16 +2243,22 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
         );
         let results = query_result_to_owned_values(query_result, &mut sink);
 
+        let mut split_doc_state = SplitDocState::new(has_split_doc);
         for (i, result) in results.iter().enumerate() {
-            // `---` BETWEEN results (not before the first) -- deliberately
-            // different from --slurp's no-separator convention, since
-            // eval-all is explicitly a multi-document-stream feature (#715).
-            if !has_split_doc
-                && output_config.output_format == OutputFormat::Yaml
+            if has_split_doc {
+                // The filter explicitly marks its outputs as separate
+                // documents (`split_doc`); route through the same state
+                // machine every other output path uses for that, or no
+                // separator is ever written here at all.
+                split_doc_state.write_separator(&mut writer, &output_config)?;
+            } else if output_config.output_format == OutputFormat::Yaml
                 && !output_config.no_doc
                 && results.len() > 1
                 && i > 0
             {
+                // `---` BETWEEN results (not before the first) -- deliberately
+                // different from --slurp's no-separator convention, since
+                // eval-all is explicitly a multi-document-stream feature (#715).
                 writeln!(writer, "---")?;
             }
             any_truthy |= !matches!(result, OwnedValue::Null | OwnedValue::Bool(false));
