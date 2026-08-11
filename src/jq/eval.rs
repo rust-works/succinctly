@@ -29643,7 +29643,7 @@ mod tests {
         match eval_all_result(
             b"[1]",
             &[0],
-            r#".[] | (label $out | (1, break $out)) | file_index"#,
+            r".[] | (label $out | (1, break $out)) | file_index",
         ) {
             QueryResult::Owned(v) => assert_eq!(v, OwnedValue::Int(0)),
             other => panic!("expected Owned, got {other:?}"),
