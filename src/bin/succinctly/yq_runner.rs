@@ -2222,7 +2222,14 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                         any_truthy |= stats.any_truthy;
                         // Streaming never writes a diagnostic to stdout; it hands
                         // the error back here so it reaches stderr and fails the run (#355).
-                        if let Some(err) = &stats.error {
+                        // A halt is checked first (#791): `StreamStats::halt` carries
+                        // the real exit code and must reach `sink.request_halt`
+                        // directly, never `report_stream` — that path would
+                        // both misreport the exit code and print a spurious
+                        // "not propagated" diagnostic no real jq/yq ever emits.
+                        if let Some(code) = stats.halt {
+                            sink.request_halt(code);
+                        } else if let Some(err) = &stats.error {
                             sink.report_stream(DiagStyle::Yq, err, &no_location());
                         }
                     }
@@ -2254,7 +2261,14 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                         any_truthy |= stats.any_truthy;
                         // Streaming never writes a diagnostic to stdout; it hands
                         // the error back here so it reaches stderr and fails the run (#355).
-                        if let Some(err) = &stats.error {
+                        // A halt is checked first (#791): `StreamStats::halt` carries
+                        // the real exit code and must reach `sink.request_halt`
+                        // directly, never `report_stream` — that path would
+                        // both misreport the exit code and print a spurious
+                        // "not propagated" diagnostic no real jq/yq ever emits.
+                        if let Some(code) = stats.halt {
+                            sink.request_halt(code);
+                        } else if let Some(err) = &stats.error {
                             sink.report_stream(DiagStyle::Yq, err, &no_location());
                         }
                     }
@@ -2296,6 +2310,10 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                                 &mut yaml_doc_streamed,
                                 output_config.use_color
                             );
+                            // See the matching check in the per-file loop below.
+                            if sink.halted().is_some() {
+                                break;
+                            }
                         }
                         global_doc_index += 1;
                         docs = rest;
@@ -2346,7 +2364,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                 }
             }
         } else {
-            for file_path in &input_files {
+            'm2_files: for file_path in &input_files {
                 let path = Path::new(file_path);
                 let yaml_bytes = read_file(path)?;
                 let fmt = resolve_input_format(args.input_format, Some(path));
@@ -2374,6 +2392,17 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                                     &mut yaml_doc_streamed,
                                     output_config.use_color
                                 );
+                                // Halt outranks every remaining document and
+                                // file (#791): without this, a `halt` nested
+                                // inside `first(...)`/`last(...)`/a computed
+                                // index — the only shapes that reach the M2
+                                // path with a halt at all, see
+                                // `can_use_m2_streaming` — would keep
+                                // streaming further documents and files
+                                // instead of stopping immediately.
+                                if sink.halted().is_some() {
+                                    break 'm2_files;
+                                }
                             }
                             global_doc_index += 1;
                             docs = rest;
@@ -2426,6 +2455,10 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                                         &mut yaml_doc_streamed,
                                         output_config.use_color
                                     );
+                                    // See the matching check in the `Sequence` arm above.
+                                    if sink.halted().is_some() {
+                                        break 'm2_files;
+                                    }
                                 }
                             }
                         }
@@ -2862,6 +2895,17 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                                         &mut yaml_doc_streamed,
                                         false
                                     );
+                                    // halt/halt_error (#791): matches the DOM
+                                    // `--inplace` branch below — stop
+                                    // streaming further documents into this
+                                    // file, but still let the shared
+                                    // write-back-then-break-'inplace_files
+                                    // logic after this `if`/`else` run, so
+                                    // the prefix already streamed is still
+                                    // committed to disk.
+                                    if sink.halted().is_some() {
+                                        break;
+                                    }
                                 }
                                 global_doc_index += 1;
                                 docs = rest;

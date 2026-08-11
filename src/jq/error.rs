@@ -41,6 +41,16 @@ pub struct EvalError {
     /// the payload can decide — `message` has already lost the distinction
     /// (#355).
     pub value: Option<OwnedValue>,
+
+    /// Set when this `EvalError` is not a genuine error at all, but a
+    /// `halt`/`halt_error(n)` escape smuggled through a helper whose
+    /// signature (`Result<_, EvalError>`) has no channel for [`Control`]
+    /// (#791). Every site that turns such a helper's `Err` back into a
+    /// `QueryResult`/`Control` must check this field first and produce
+    /// `Halt(code)` instead of `Error(self)` — otherwise a `try`/`catch` or
+    /// `label`/`break` upstream would swallow the halt, which must never
+    /// happen. `None` for every ordinary error.
+    pub halt: Option<i32>,
 }
 
 /// A stream terminator: what ended a sequence of outputs when it wasn't
@@ -204,6 +214,7 @@ impl EvalError {
         Self {
             message: message.into(),
             value: None,
+            halt: None,
         }
     }
 
@@ -220,6 +231,22 @@ impl EvalError {
         Self {
             message,
             value: Some(value),
+            halt: None,
+        }
+    }
+
+    /// Build the `halt` escape marker documented on the `halt` field: a
+    /// `Control::Halt(code)` a `Result<_, EvalError>`-typed helper caught
+    /// while it had no way to carry `Control` through its own signature.
+    ///
+    /// Never construct this any other way — every reader of `halt` assumes
+    /// it is only ever `Some` via this constructor, carrying the real exit
+    /// code and nothing else.
+    pub fn halt_escape(code: i32) -> Self {
+        Self {
+            message: format!("halt({code}) not propagated"),
+            value: None,
+            halt: Some(code),
         }
     }
 

@@ -870,6 +870,7 @@ fn object_outputs<W: Clone + AsRef<[u64]>>(
     match result {
         QueryResult::Error(e) => (Vec::new(), Some(Control::Error(e))),
         QueryResult::Break(label) => (Vec::new(), Some(Control::Break(label))),
+        QueryResult::Halt(code) => (Vec::new(), Some(Control::Halt(code))),
         QueryResult::Partial(vs, control) => (vs, Some(control)),
         other => (other.collect_owned(), None),
     }
@@ -1109,6 +1110,30 @@ fn partial<'a, W>(prefix: Vec<OwnedValue>, control: Control) -> QueryResult<'a, 
     }
 }
 
+/// Promote an [`EvalError`] carrying a halt marker (see [`EvalError::halt`])
+/// to `QueryResult::Halt` instead of wrapping it as a catchable error.
+///
+/// The escape hatch for sites consuming a `Result<_, EvalError>`-typed
+/// helper (`eval_owned_multi` and friends) that has no channel of its own
+/// for `Control` — without this, a halt smuggled through as `Err` would
+/// surface as an ordinary `QueryResult::Error`, catchable by `try`/`catch`
+/// and reported as a spurious diagnostic instead of halting (#791).
+fn query_result_from_error<'a, W>(e: EvalError) -> QueryResult<'a, W> {
+    match e.halt {
+        Some(code) => QueryResult::Halt(code),
+        None => QueryResult::Error(e),
+    }
+}
+
+/// Same promotion as [`query_result_from_error`], for sites building a
+/// [`Control`] instead (typically to hand to [`partial`]).
+fn control_from_error(e: EvalError) -> Control {
+    match e.halt {
+        Some(code) => Control::Halt(code),
+        None => Control::Error(e),
+    }
+}
+
 /// Evaluate `expr` against an owned `input`, returning every output it
 /// produces instead of collapsing them, plus any terminating `Control`
 /// (#534). Thin wrapper over [`eval_owned_input`], which already keeps
@@ -1235,14 +1260,15 @@ fn result_to_owned<W: Clone + AsRef<[u64]>>(
         QueryResult::Error(e) => Err(e),
         QueryResult::Break(label) => Err(EvalError::new(format!("break ${label} not in label"))),
         // This function's signature (`Result<OwnedValue, EvalError>`) has no
-        // way to carry a `Control` through, so a `halt` reached through an
-        // operand context (e.g. `1 + halt`) comes back out as a plain
-        // `EvalError`, which an enclosing `try`/`catch` could then swallow —
-        // in tension with `halt` never being catchable elsewhere. This
-        // mirrors `Break`'s pre-existing identical lossy conversion just
-        // above (already in the same tension with `break $out` for the same
-        // reason), not a new gap introduced for `halt` (#791).
-        QueryResult::Halt(code) => Err(EvalError::new(format!("halt({code}) not propagated"))),
+        // way to carry a `Control` through directly, so a `halt` reached
+        // through an operand context (e.g. `1 + halt`) is smuggled back out
+        // as `EvalError::halt_escape` instead of a plain error — every
+        // caller above this function that turns its `Err` into a
+        // `QueryResult`/`Control` promotes that marker back to `Halt`
+        // (`query_result_from_error`/`control_from_error`), so `try`/`catch`
+        // still never sees it, matching `halt` never being catchable
+        // elsewhere (#791).
+        QueryResult::Halt(code) => Err(EvalError::halt_escape(code)),
     }
 }
 
@@ -1509,7 +1535,7 @@ fn eval_binary_fanout<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         for left_val in left_vals {
             match combine(left_val, right_val.clone()) {
                 Ok(v) => out.push(v),
-                Err(e) => return finish_fork(out, Some(Control::Error(e)), optional),
+                Err(e) => return finish_fork(out, Some(control_from_error(e)), optional),
             }
         }
 
@@ -2325,7 +2351,7 @@ fn eval_error<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             match result_to_owned(msg_result) {
                 Ok(v) => v,
                 Err(_) if optional => return QueryResult::None,
-                Err(e) => return QueryResult::Error(e),
+                Err(e) => return query_result_from_error(e),
             }
         }
         None => to_owned(&value),
@@ -2896,7 +2922,7 @@ fn builtin_has<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let key_result = eval_single::<W, S>(key_expr, value.clone(), optional);
     let key_owned = match result_to_owned(key_result) {
         Ok(v) => v,
-        Err(e) => return QueryResult::Error(e),
+        Err(e) => return query_result_from_error(e),
     };
 
     match (&value, &key_owned) {
@@ -3015,7 +3041,7 @@ fn builtin_upper_in<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let current = to_owned(&value);
     let candidates = match eval_owned_multi::<S>(s, &current) {
         Ok(c) => c,
-        Err(e) => return QueryResult::Error(e),
+        Err(e) => return query_result_from_error(e),
     };
     QueryResult::Owned(OwnedValue::Bool(candidates.contains(&current)))
 }
@@ -3039,11 +3065,11 @@ fn builtin_upper_in_src<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let current = to_owned(&value);
     let haystack = match eval_owned_multi::<S>(src, &current) {
         Ok(v) => v,
-        Err(e) => return QueryResult::Error(e),
+        Err(e) => return query_result_from_error(e),
     };
     let needles = match eval_owned_multi::<S>(s, &current) {
         Ok(v) => v,
-        Err(e) => return QueryResult::Error(e),
+        Err(e) => return query_result_from_error(e),
     };
     let found = haystack.iter().any(|h| needles.iter().any(|n| n == h));
     QueryResult::Owned(OwnedValue::Bool(found))
@@ -3243,7 +3269,7 @@ fn builtin_add<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
     match result {
         Ok(v) => QueryResult::Owned(v),
-        Err(e) => QueryResult::Error(e),
+        Err(e) => query_result_from_error(e),
     }
 }
 
@@ -3609,7 +3635,7 @@ fn builtin_ltrimstr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Ok(OwnedValue::String(s)) => s,
         // jq's ltrimstr is total: a non-string argument leaves input unchanged.
         Ok(_) => return QueryResult::Owned(to_owned(&value)),
-        Err(e) => return QueryResult::Error(e),
+        Err(e) => return query_result_from_error(e),
     };
 
     match &value {
@@ -3642,7 +3668,7 @@ fn builtin_rtrimstr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Ok(OwnedValue::String(s)) => s,
         // jq's rtrimstr is total: a non-string argument leaves input unchanged.
         Ok(_) => return QueryResult::Owned(to_owned(&value)),
-        Err(e) => return QueryResult::Error(e),
+        Err(e) => return query_result_from_error(e),
     };
 
     match &value {
@@ -3674,7 +3700,7 @@ fn builtin_startswith<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let prefix = match result_to_owned(prefix_result) {
         Ok(OwnedValue::String(s)) => s,
         Ok(_) => return QueryResult::Error(EvalError::new("startswith() requires string inputs")),
-        Err(e) => return QueryResult::Error(e),
+        Err(e) => return query_result_from_error(e),
     };
 
     match &value {
@@ -3701,7 +3727,7 @@ fn builtin_endswith<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let suffix = match result_to_owned(suffix_result) {
         Ok(OwnedValue::String(s)) => s,
         Ok(_) => return QueryResult::Error(EvalError::new("endswith() requires string inputs")),
-        Err(e) => return QueryResult::Error(e),
+        Err(e) => return query_result_from_error(e),
     };
 
     match &value {
@@ -3730,7 +3756,7 @@ fn builtin_split<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Ok(_) => {
             return QueryResult::Error(EvalError::new("split input and separator must be strings"))
         }
-        Err(e) => return QueryResult::Error(e),
+        Err(e) => return query_result_from_error(e),
     };
 
     match &value {
@@ -3796,7 +3822,7 @@ fn builtin_join<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let sep = match result_to_owned(sep_result) {
         Ok(OwnedValue::String(s)) => s,
         Ok(_) => return QueryResult::Error(EvalError::type_error("string", "non-string")),
-        Err(e) => return QueryResult::Error(e),
+        Err(e) => return query_result_from_error(e),
     };
 
     match value {
@@ -3821,7 +3847,7 @@ fn builtin_contains<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let b_result = eval_single::<W, S>(b_expr, value.clone(), optional);
     let b = match result_to_owned(b_result) {
         Ok(v) => v,
-        Err(e) => return QueryResult::Error(e),
+        Err(e) => return query_result_from_error(e),
     };
 
     let input = to_owned(&value);
@@ -3869,7 +3895,7 @@ fn builtin_inside<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let b_result = eval_single::<W, S>(b_expr, value.clone(), optional);
     let b = match result_to_owned(b_result) {
         Ok(v) => v,
-        Err(e) => return QueryResult::Error(e),
+        Err(e) => return query_result_from_error(e),
     };
 
     let input = to_owned(&value);
@@ -3949,7 +3975,7 @@ fn builtin_nth<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let n = match result_to_owned(n_result) {
         Ok(OwnedValue::Int(i) | OwnedValue::NumberLiteral(NumberRepr::Int(i), _)) => i,
         Ok(_) => return QueryResult::Error(EvalError::type_error("number", "non-number")),
-        Err(e) => return QueryResult::Error(e),
+        Err(e) => return query_result_from_error(e),
     };
 
     match value {
@@ -4046,7 +4072,7 @@ fn builtin_flatten_depth<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             return QueryResult::Error(EvalError::new("depth must be non-negative"));
         }
         Ok(_) => return QueryResult::Error(EvalError::type_error("number", "non-number")),
-        Err(e) => return QueryResult::Error(e),
+        Err(e) => return query_result_from_error(e),
     };
 
     builtin_flatten::<W>(value, optional, depth)
@@ -4388,7 +4414,7 @@ fn builtin_from_entries<W: Clone + AsRef<[u64]>>(
         // `ObjectEscape`'s doc on why the flag is not yet reachable from
         // succinctly's own syntax.
         Err(_) if optional => QueryResult::None,
-        Err(e) => QueryResult::Error(e),
+        Err(e) => query_result_from_error(e),
     }
 }
 
@@ -4457,7 +4483,7 @@ fn builtin_with_entries<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     match entries_to_object(transformed) {
         Ok(result) => QueryResult::Owned(OwnedValue::Object(result)),
         Err(_) if optional => QueryResult::None,
-        Err(e) => QueryResult::Error(e),
+        Err(e) => query_result_from_error(e),
     }
 }
 
@@ -4599,7 +4625,7 @@ fn eval_format<'a, W: Clone + AsRef<[u64]>>(
 ) -> QueryResult<'a, W> {
     match format_owned(format_type, &to_owned(&value), optional) {
         Ok(s) => QueryResult::Owned(OwnedValue::String(s)),
-        Err(e) => QueryResult::Error(e),
+        Err(e) => query_result_from_error(e),
     }
 }
 
@@ -5212,7 +5238,7 @@ fn builtin_tonumber<W: Clone + AsRef<[u64]>>(
                 match tonumber_from_str(cow.as_ref()) {
                     Ok(n) => QueryResult::Owned(n),
                     Err(_) if optional => QueryResult::None,
-                    Err(e) => QueryResult::Error(e),
+                    Err(e) => query_result_from_error(e),
                 }
             } else if optional {
                 QueryResult::None
@@ -5867,7 +5893,7 @@ fn builtin_test<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Ok(OwnedValue::String(s)) => s,
         Ok(_) if optional => return QueryResult::None,
         Ok(v) => return QueryResult::Error(EvalError::not_string_or_array(v.type_name())),
-        Err(e) => return QueryResult::Error(e),
+        Err(e) => return query_result_from_error(e),
     };
 
     // Check if the input string contains the pattern (simple substring match)
@@ -5964,7 +5990,7 @@ fn builtin_indices<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // Evaluate the pattern (can be any type for arrays, must be string for strings)
     let pattern = match result_to_owned(eval_single::<W, S>(s_expr, value.clone(), optional)) {
         Ok(v) => v,
-        Err(e) => return QueryResult::Error(e),
+        Err(e) => return query_result_from_error(e),
     };
 
     match &value {
@@ -5975,7 +6001,7 @@ fn builtin_indices<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 return match sliced {
                     Ok(v) => QueryResult::Owned(v),
                     Err(_) if optional => QueryResult::None,
-                    Err(e) => QueryResult::Error(e),
+                    Err(e) => query_result_from_error(e),
                 };
             }
             // For strings, pattern must be a string
@@ -6024,7 +6050,7 @@ fn builtin_index<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // Evaluate the pattern (can be any type for arrays, must be string for strings)
     let pattern = match result_to_owned(eval_single::<W, S>(s_expr, value.clone(), optional)) {
         Ok(v) => v,
-        Err(e) => return QueryResult::Error(e),
+        Err(e) => return query_result_from_error(e),
     };
 
     match &value {
@@ -6035,7 +6061,7 @@ fn builtin_index<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             if let Some(sliced) = string_slice_pattern(&value, &pattern) {
                 return match sliced {
                     _ if optional => QueryResult::None,
-                    Err(e) => QueryResult::Error(e),
+                    Err(e) => query_result_from_error(e),
                     Ok(_) => {
                         QueryResult::Error(EvalError::cannot_index_with_type("string", "number"))
                     }
@@ -6082,7 +6108,7 @@ fn builtin_upper_index<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let current = to_owned(&value);
     match eval_owned_multi::<S>(&Expr::Iterate, &current) {
         Ok(rows) => build_upper_index::<W, S>(rows, idx_expr),
-        Err(e) => QueryResult::Error(e),
+        Err(e) => query_result_from_error(e),
     }
 }
 
@@ -6098,7 +6124,7 @@ fn builtin_upper_index_stream<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let current = to_owned(&value);
     match eval_owned_multi::<S>(stream, &current) {
         Ok(rows) => build_upper_index::<W, S>(rows, idx_expr),
-        Err(e) => QueryResult::Error(e),
+        Err(e) => query_result_from_error(e),
     }
 }
 
@@ -6115,7 +6141,7 @@ fn build_upper_index<'a, W, S: EvalSemantics>(
     for row in &rows {
         let keys = match eval_owned_multi::<S>(idx_expr, row) {
             Ok(k) => k,
-            Err(e) => return QueryResult::Error(e),
+            Err(e) => return query_result_from_error(e),
         };
         for k in keys {
             obj.insert(owned_to_string(&k), row.clone());
@@ -6133,7 +6159,7 @@ fn builtin_rindex<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // Evaluate the pattern (can be any type for arrays, must be string for strings)
     let pattern = match result_to_owned(eval_single::<W, S>(s_expr, value.clone(), optional)) {
         Ok(v) => v,
-        Err(e) => return QueryResult::Error(e),
+        Err(e) => return query_result_from_error(e),
     };
 
     match &value {
@@ -6144,7 +6170,7 @@ fn builtin_rindex<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             if let Some(sliced) = string_slice_pattern(&value, &pattern) {
                 return match sliced {
                     _ if optional => QueryResult::None,
-                    Err(e) => QueryResult::Error(e),
+                    Err(e) => query_result_from_error(e),
                     Ok(_) => {
                         QueryResult::Error(EvalError::cannot_index_with_type("string", "number"))
                     }
@@ -6260,7 +6286,7 @@ fn builtin_getpath<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Ok(OwnedValue::Array(arr)) => arr,
         Ok(_) if optional => return QueryResult::None,
         Ok(_) => return QueryResult::Error(EvalError::path_must_be_array()),
-        Err(e) => return QueryResult::Error(e),
+        Err(e) => return query_result_from_error(e),
     };
 
     let mut current = to_owned(&value);
@@ -6289,7 +6315,7 @@ fn builtin_getpath<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 let range = match SliceBounds::from_descriptor(desc) {
                     Ok(bounds) => bounds.resolve(arr.len()),
                     Err(_) if optional => return QueryResult::None,
-                    Err(e) => return QueryResult::Error(e),
+                    Err(e) => return query_result_from_error(e),
                 };
                 current = OwnedValue::Array(arr[range].to_vec());
             }
@@ -6297,7 +6323,7 @@ fn builtin_getpath<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 let range = match SliceBounds::from_descriptor(desc) {
                     Ok(bounds) => bounds.resolve(s.chars().count()),
                     Err(_) if optional => return QueryResult::None,
-                    Err(e) => return QueryResult::Error(e),
+                    Err(e) => return query_result_from_error(e),
                 };
                 current = OwnedValue::String(slice::slice_str(s, range));
             }
@@ -6538,7 +6564,7 @@ fn builtin_test_regex<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Ok(OwnedValue::String(s)) => s,
         Ok(_) if optional => return QueryResult::None,
         Ok(v) => return QueryResult::Error(EvalError::not_string_or_array(v.type_name())),
-        Err(e) => return QueryResult::Error(e),
+        Err(e) => return query_result_from_error(e),
     };
 
     // Get the input string
@@ -6556,7 +6582,7 @@ fn builtin_test_regex<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let re = match build_regex(&pattern, None) {
         Ok(r) => r,
         Err(_e) if optional => return QueryResult::None,
-        Err(e) => return QueryResult::Error(e),
+        Err(e) => return query_result_from_error(e),
     };
 
     QueryResult::Owned(OwnedValue::Bool(re.is_match(&input)))
@@ -6575,7 +6601,7 @@ fn builtin_match<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Ok(OwnedValue::String(s)) => s,
         Ok(_) if optional => return QueryResult::None,
         Ok(v) => return QueryResult::Error(EvalError::not_string_or_array(v.type_name())),
-        Err(e) => return QueryResult::Error(e),
+        Err(e) => return query_result_from_error(e),
     };
 
     // Get the input string
@@ -6593,7 +6619,7 @@ fn builtin_match<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let re = match build_regex(&pattern, flags) {
         Ok(r) => r,
         Err(_e) if optional => return QueryResult::None,
-        Err(e) => return QueryResult::Error(e),
+        Err(e) => return query_result_from_error(e),
     };
 
     // Check if global flag is set
@@ -6776,7 +6802,7 @@ fn builtin_scan<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Ok(OwnedValue::String(s)) => s,
         Ok(_) if optional => return QueryResult::None,
         Ok(_) => return QueryResult::Error(EvalError::type_error("string", "pattern")),
-        Err(e) => return QueryResult::Error(e),
+        Err(e) => return query_result_from_error(e),
     };
 
     // Get the input string
@@ -6794,7 +6820,7 @@ fn builtin_scan<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let re = match build_regex(&pattern, None) {
         Ok(r) => r,
         Err(_e) if optional => return QueryResult::None,
-        Err(e) => return QueryResult::Error(e),
+        Err(e) => return query_result_from_error(e),
     };
 
     // Find all matches
@@ -6823,7 +6849,7 @@ fn builtin_splits<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Ok(OwnedValue::String(s)) => s,
         Ok(_) if optional => return QueryResult::None,
         Ok(_) => return QueryResult::Error(EvalError::type_error("string", "pattern")),
-        Err(e) => return QueryResult::Error(e),
+        Err(e) => return query_result_from_error(e),
     };
 
     // Get the input string
@@ -6841,7 +6867,7 @@ fn builtin_splits<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let re = match build_regex(&pattern, None) {
         Ok(r) => r,
         Err(_e) if optional => return QueryResult::None,
-        Err(e) => return QueryResult::Error(e),
+        Err(e) => return query_result_from_error(e),
     };
 
     // Split by regex
@@ -6867,7 +6893,7 @@ fn builtin_sub<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Ok(OwnedValue::String(s)) => s,
         Ok(_) if optional => return QueryResult::None,
         Ok(_) => return QueryResult::Error(EvalError::type_error("string", "pattern")),
-        Err(e) => return QueryResult::Error(e),
+        Err(e) => return query_result_from_error(e),
     };
 
     // Get the replacement
@@ -6879,7 +6905,7 @@ fn builtin_sub<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Ok(OwnedValue::String(s)) => s,
         Ok(_) if optional => return QueryResult::None,
         Ok(_) => return QueryResult::Error(EvalError::type_error("string", "replacement")),
-        Err(e) => return QueryResult::Error(e),
+        Err(e) => return query_result_from_error(e),
     };
 
     // Get the input string
@@ -6897,7 +6923,7 @@ fn builtin_sub<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let re = match build_regex(&pattern, None) {
         Ok(r) => r,
         Err(_e) if optional => return QueryResult::None,
-        Err(e) => return QueryResult::Error(e),
+        Err(e) => return query_result_from_error(e),
     };
 
     // Replace first match
@@ -6930,7 +6956,7 @@ fn builtin_gsub<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Ok(OwnedValue::String(s)) => s,
         Ok(_) if optional => return QueryResult::None,
         Ok(_) => return QueryResult::Error(EvalError::type_error("string", "pattern")),
-        Err(e) => return QueryResult::Error(e),
+        Err(e) => return query_result_from_error(e),
     };
 
     // Get the replacement
@@ -6942,7 +6968,7 @@ fn builtin_gsub<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Ok(OwnedValue::String(s)) => s,
         Ok(_) if optional => return QueryResult::None,
         Ok(_) => return QueryResult::Error(EvalError::type_error("string", "replacement")),
-        Err(e) => return QueryResult::Error(e),
+        Err(e) => return query_result_from_error(e),
     };
 
     // Get the input string
@@ -6960,7 +6986,7 @@ fn builtin_gsub<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let re = match build_regex(&pattern, None) {
         Ok(r) => r,
         Err(_e) if optional => return QueryResult::None,
-        Err(e) => return QueryResult::Error(e),
+        Err(e) => return query_result_from_error(e),
     };
 
     // Replace all matches
@@ -6983,7 +7009,7 @@ fn builtin_test_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Ok(OwnedValue::Null) => String::new(),
         Ok(_) if optional => return QueryResult::None,
         Ok(_) => return QueryResult::Error(EvalError::type_error("string", "flags")),
-        Err(e) => return QueryResult::Error(e),
+        Err(e) => return query_result_from_error(e),
     };
 
     // Get the pattern
@@ -6991,7 +7017,7 @@ fn builtin_test_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Ok(OwnedValue::String(s)) => s,
         Ok(_) if optional => return QueryResult::None,
         Ok(v) => return QueryResult::Error(EvalError::not_string_or_array(v.type_name())),
-        Err(e) => return QueryResult::Error(e),
+        Err(e) => return query_result_from_error(e),
     };
 
     // Get the input string
@@ -7009,7 +7035,7 @@ fn builtin_test_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let re = match build_regex(&pattern, Some(&flags)) {
         Ok(r) => r,
         Err(_e) if optional => return QueryResult::None,
-        Err(e) => return QueryResult::Error(e),
+        Err(e) => return query_result_from_error(e),
     };
 
     // Test if regex matches
@@ -7030,7 +7056,7 @@ fn builtin_match_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Ok(OwnedValue::Null) => String::new(),
         Ok(_) if optional => return QueryResult::None,
         Ok(_) => return QueryResult::Error(EvalError::type_error("string", "flags")),
-        Err(e) => return QueryResult::Error(e),
+        Err(e) => return query_result_from_error(e),
     };
 
     builtin_match::<W, S>(re_expr, Some(&flags), value, optional)
@@ -7050,7 +7076,7 @@ fn builtin_capture_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Ok(OwnedValue::Null) => String::new(),
         Ok(_) if optional => return QueryResult::None,
         Ok(_) => return QueryResult::Error(EvalError::type_error("string", "flags")),
-        Err(e) => return QueryResult::Error(e),
+        Err(e) => return query_result_from_error(e),
     };
 
     builtin_capture_with_flags::<W, S>(re_expr, Some(&flags), value, optional)
@@ -7069,7 +7095,7 @@ fn builtin_capture_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Ok(OwnedValue::String(s)) => s,
         Ok(_) if optional => return QueryResult::None,
         Ok(v) => return QueryResult::Error(EvalError::not_string_or_array(v.type_name())),
-        Err(e) => return QueryResult::Error(e),
+        Err(e) => return query_result_from_error(e),
     };
 
     // Get the input string
@@ -7087,7 +7113,7 @@ fn builtin_capture_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let re = match build_regex(&pattern, flags) {
         Ok(r) => r,
         Err(_e) if optional => return QueryResult::None,
-        Err(e) => return QueryResult::Error(e),
+        Err(e) => return query_result_from_error(e),
     };
 
     // Check if global flag is set
@@ -7140,7 +7166,7 @@ fn builtin_sub_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Ok(OwnedValue::Null) => String::new(),
         Ok(_) if optional => return QueryResult::None,
         Ok(_) => return QueryResult::Error(EvalError::type_error("string", "flags")),
-        Err(e) => return QueryResult::Error(e),
+        Err(e) => return query_result_from_error(e),
     };
 
     builtin_sub_with_flags::<W, S>(re_expr, replacement_expr, Some(&flags), value, optional)
@@ -7160,7 +7186,7 @@ fn builtin_sub_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Ok(OwnedValue::String(s)) => s,
         Ok(_) if optional => return QueryResult::None,
         Ok(_) => return QueryResult::Error(EvalError::type_error("string", "pattern")),
-        Err(e) => return QueryResult::Error(e),
+        Err(e) => return query_result_from_error(e),
     };
 
     // Get the replacement
@@ -7172,7 +7198,7 @@ fn builtin_sub_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Ok(OwnedValue::String(s)) => s,
         Ok(_) if optional => return QueryResult::None,
         Ok(_) => return QueryResult::Error(EvalError::type_error("string", "replacement")),
-        Err(e) => return QueryResult::Error(e),
+        Err(e) => return query_result_from_error(e),
     };
 
     // Get the input string
@@ -7190,7 +7216,7 @@ fn builtin_sub_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let re = match build_regex(&pattern, flags) {
         Ok(r) => r,
         Err(_e) if optional => return QueryResult::None,
-        Err(e) => return QueryResult::Error(e),
+        Err(e) => return query_result_from_error(e),
     };
 
     // Convert jq replacement syntax (\(.name)) to regex replacement syntax ($name)
@@ -7228,7 +7254,7 @@ fn builtin_gsub_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Ok(OwnedValue::Null) => String::new(),
         Ok(_) if optional => return QueryResult::None,
         Ok(_) => return QueryResult::Error(EvalError::type_error("string", "flags")),
-        Err(e) => return QueryResult::Error(e),
+        Err(e) => return query_result_from_error(e),
     };
 
     builtin_gsub_with_flags::<W, S>(re_expr, replacement_expr, Some(&flags), value, optional)
@@ -7248,7 +7274,7 @@ fn builtin_gsub_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Ok(OwnedValue::String(s)) => s,
         Ok(_) if optional => return QueryResult::None,
         Ok(_) => return QueryResult::Error(EvalError::type_error("string", "pattern")),
-        Err(e) => return QueryResult::Error(e),
+        Err(e) => return query_result_from_error(e),
     };
 
     // Get the replacement
@@ -7260,7 +7286,7 @@ fn builtin_gsub_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Ok(OwnedValue::String(s)) => s,
         Ok(_) if optional => return QueryResult::None,
         Ok(_) => return QueryResult::Error(EvalError::type_error("string", "replacement")),
-        Err(e) => return QueryResult::Error(e),
+        Err(e) => return query_result_from_error(e),
     };
 
     // Get the input string
@@ -7278,7 +7304,7 @@ fn builtin_gsub_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let re = match build_regex(&pattern, flags) {
         Ok(r) => r,
         Err(_e) if optional => return QueryResult::None,
-        Err(e) => return QueryResult::Error(e),
+        Err(e) => return query_result_from_error(e),
     };
 
     // Convert jq replacement syntax (\(.name)) to regex replacement syntax ($name)
@@ -7304,7 +7330,7 @@ fn builtin_scan_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Ok(OwnedValue::Null) => String::new(),
         Ok(_) if optional => return QueryResult::None,
         Ok(_) => return QueryResult::Error(EvalError::type_error("string", "flags")),
-        Err(e) => return QueryResult::Error(e),
+        Err(e) => return query_result_from_error(e),
     };
 
     builtin_scan_with_flags::<W, S>(re_expr, Some(&flags), value, optional)
@@ -7323,7 +7349,7 @@ fn builtin_scan_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Ok(OwnedValue::String(s)) => s,
         Ok(_) if optional => return QueryResult::None,
         Ok(_) => return QueryResult::Error(EvalError::type_error("string", "pattern")),
-        Err(e) => return QueryResult::Error(e),
+        Err(e) => return query_result_from_error(e),
     };
 
     // Get the input string
@@ -7341,7 +7367,7 @@ fn builtin_scan_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let re = match build_regex(&pattern, flags) {
         Ok(r) => r,
         Err(_e) if optional => return QueryResult::None,
-        Err(e) => return QueryResult::Error(e),
+        Err(e) => return query_result_from_error(e),
     };
 
     // Find all matches
@@ -7387,7 +7413,7 @@ fn builtin_split_regex<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Ok(OwnedValue::Null) => String::new(),
         Ok(_) if optional => return QueryResult::None,
         Ok(_) => return QueryResult::Error(EvalError::type_error("string", "flags")),
-        Err(e) => return QueryResult::Error(e),
+        Err(e) => return query_result_from_error(e),
     };
 
     // Get the pattern
@@ -7395,7 +7421,7 @@ fn builtin_split_regex<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Ok(OwnedValue::String(s)) => s,
         Ok(_) if optional => return QueryResult::None,
         Ok(_) => return QueryResult::Error(EvalError::type_error("string", "pattern")),
-        Err(e) => return QueryResult::Error(e),
+        Err(e) => return query_result_from_error(e),
     };
 
     // Get the input string
@@ -7413,7 +7439,7 @@ fn builtin_split_regex<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let re = match build_regex(&pattern, Some(&flags)) {
         Ok(r) => r,
         Err(_e) if optional => return QueryResult::None,
-        Err(e) => return QueryResult::Error(e),
+        Err(e) => return query_result_from_error(e),
     };
 
     // Split by regex
@@ -7440,7 +7466,7 @@ fn builtin_splits_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Ok(OwnedValue::Null) => String::new(),
         Ok(_) if optional => return QueryResult::None,
         Ok(_) => return QueryResult::Error(EvalError::type_error("string", "flags")),
-        Err(e) => return QueryResult::Error(e),
+        Err(e) => return query_result_from_error(e),
     };
 
     builtin_splits_with_flags::<W, S>(re_expr, Some(&flags), value, optional)
@@ -7459,7 +7485,7 @@ fn builtin_splits_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Ok(OwnedValue::String(s)) => s,
         Ok(_) if optional => return QueryResult::None,
         Ok(_) => return QueryResult::Error(EvalError::type_error("string", "pattern")),
-        Err(e) => return QueryResult::Error(e),
+        Err(e) => return query_result_from_error(e),
     };
 
     // Get the input string
@@ -7477,7 +7503,7 @@ fn builtin_splits_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let re = match build_regex(&pattern, flags) {
         Ok(r) => r,
         Err(_e) if optional => return QueryResult::None,
-        Err(e) => return QueryResult::Error(e),
+        Err(e) => return query_result_from_error(e),
     };
 
     // Split by regex and return as stream
@@ -7978,7 +8004,7 @@ fn eval_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     match index_one_owned(t, k, optional) {
                         Ok(Some(v)) => out.push(v),
                         Ok(None) => {}
-                        Err(e) => return QueryResult::Error(e),
+                        Err(e) => return query_result_from_error(e),
                     }
                 }
             }
@@ -8090,7 +8116,7 @@ fn eval_slice_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                         match slice_owned_value(t, *s, *e, optional) {
                             Ok(Some(v)) => out.push(v),
                             Ok(None) => {}
-                            Err(e) => return QueryResult::Error(e),
+                            Err(e) => return query_result_from_error(e),
                         }
                     }
                 }
@@ -8324,6 +8350,11 @@ pub fn eval_owned_with_file_index<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>
 /// jq evaluates as a single value rather than once per updated path.
 /// `Err` carries a `QueryResult` the caller should return immediately
 /// (an error or an in-flight `break`).
+#[allow(clippy::result_large_err)] // STYLE-0004: `EvalError` grew by the
+                                   // `halt` marker field (#791), pushing this
+                                   // already-near-threshold `Err` over 128
+                                   // bytes; boxing would ripple through this
+                                   // cold, error-only path for no real gain.
 fn eval_rhs_once<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     expr: &Expr,
     value: StandardJson<'a, W>,
@@ -8439,6 +8470,10 @@ fn eval_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let mut pristine = to_owned(&input);
     let paths = match resolve_dynamic_indexes::<S>(path_expr, &pristine) {
         Ok(paths) => paths,
+        // Halt outranks `?` — checked before the `optional` swallow below,
+        // so `(.[(halt_error(3))] = 1)?` still halts instead of becoming
+        // `QueryResult::None` (#791).
+        Err((_, e)) if e.halt.is_some() => return query_result_from_error(e),
         Err((_, _)) if optional => return QueryResult::None,
         Err((_, e)) => return QueryResult::Error(e),
     };
@@ -8517,6 +8552,8 @@ fn eval_update<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // `Expr::Optional` node inside `path_expr` itself.
     let paths = match resolve_dynamic_indexes::<S>(path_expr, &result) {
         Ok(paths) => paths,
+        // Halt outranks `?` — see the matching comment in `eval_assign`.
+        Err((_, e)) if e.halt.is_some() => return query_result_from_error(e),
         Err((_, _)) if optional => return QueryResult::None,
         Err((_, e)) => return QueryResult::Error(e),
     };
@@ -8524,6 +8561,9 @@ fn eval_update<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // Get current value at path, apply filter, and set back
     for path in &paths {
         if let Err(e) = update_path::<S>(&mut result, path, filter_expr, false) {
+            if let Some(code) = e.halt {
+                return QueryResult::Halt(code);
+            }
             return if optional {
                 QueryResult::None
             } else {
@@ -9221,10 +9261,20 @@ fn eval_owned_multi<S: EvalSemantics>(
     match eval_owned_input::<Vec<u64>, S>(expr, input, false) {
         QueryResult::Error(e) => Err(e),
         QueryResult::Break(label) => Err(EvalError::new(format!("break ${label} not in label"))),
+        // A halt must abort this expression exactly like `Error`/`Break`
+        // above rather than falling into `collect_owned()`'s "no outputs"
+        // treatment below — that would make `del(.[(halt_error(3))])` or a
+        // computed key `.[(halt)]` a silent no-op instead of halting (#791).
+        // [`EvalError::halt_escape`] carries the code back out through this
+        // `Result<_, EvalError>` signature; every caller above this function
+        // that turns its `Err` into a `QueryResult`/`Control` must check for
+        // it (see that constructor's doc comment).
+        QueryResult::Halt(code) => Err(EvalError::halt_escape(code)),
         QueryResult::Partial(_, Control::Error(e)) => Err(e),
         QueryResult::Partial(_, Control::Break(label)) => {
             Err(EvalError::new(format!("break ${label} not in label")))
         }
+        QueryResult::Partial(_, Control::Halt(code)) => Err(EvalError::halt_escape(code)),
         other => Ok(other.collect_owned()),
     }
 }
@@ -9249,6 +9299,14 @@ fn eval_owned_multi_first<S: EvalSemantics>(
     match eval_owned_input::<Vec<u64>, S>(expr, input, false) {
         QueryResult::Error(e) => Err(e),
         QueryResult::Break(label) => Err(EvalError::new(format!("break ${label} not in label"))),
+        // Unlike a `Partial`'s trailing control (kept as "just give me the
+        // prefix" per this function's doc comment, since real jq's `_modify`
+        // never evaluates far enough to see it), a *bare* halt has no prior
+        // output to fall back to — `collect_owned()` would turn it into
+        // `Ok(vec![])`, which `update_path`'s `Expr::Identity` arm then reads
+        // as an empty filter and silently assigns `null` instead of halting
+        // (#791). See [`EvalError::halt_escape`].
+        QueryResult::Halt(code) => Err(EvalError::halt_escape(code)),
         other => Ok(other.collect_owned()),
     }
 }
@@ -9322,6 +9380,7 @@ type PathBranch<'a> = (Vec<Expr>, Cow<'a, OwnedValue>);
 type PathResolveResult<'a> = Result<Vec<PathBranch<'a>>, (Vec<PathBranch<'a>>, EvalError)>;
 
 /// Resolve one path node against one value, yielding a branch per output.
+#[allow(clippy::result_large_err)] // STYLE-0004: see `eval_rhs_once`.
 fn resolve_node<'a, S: EvalSemantics>(expr: &Expr, value: &'a OwnedValue) -> PathResolveResult<'a> {
     match expr {
         Expr::Pipe(exprs) => resolve_seq::<S>(exprs, value),
@@ -9672,6 +9731,7 @@ fn resolve_node<'a, S: EvalSemantics>(expr: &Expr, value: &'a OwnedValue) -> Pat
 
 /// Resolve `n; expr`'s `n` the same way `eval_limit` does, then take that
 /// many resolved branches of `expr`.
+#[allow(clippy::result_large_err)] // STYLE-0004: see `eval_rhs_once`.
 fn resolve_limit<'a, S: EvalSemantics>(
     n_expr: &Expr,
     expr: &Expr,
@@ -9704,6 +9764,7 @@ fn resolve_limit<'a, S: EvalSemantics>(
 /// plain value-producing filter that is not a path expression at all —
 /// raising jq's `Invalid path expression` on its first output (#530). Zero
 /// outputs still prunes silently either way, matching `path(empty)` → `[]`.
+#[allow(clippy::result_large_err)] // STYLE-0004: see `eval_rhs_once`.
 fn resolve_leaf<'a, S: EvalSemantics>(expr: &Expr, value: &'a OwnedValue) -> PathResolveResult<'a> {
     let mut values = eval_owned_multi::<S>(expr, value).map_err(|e| (Vec::new(), e))?;
     if matches!(
@@ -9814,6 +9875,7 @@ fn push_recursive_branches<'a>(
 /// is `Owned`, resolution can only borrow from that local copy, so every
 /// resulting branch is forced back to `Cow::Owned` before it can escape —
 /// exactly the clone cost this path always paid, neither more nor less.
+#[allow(clippy::result_large_err)] // STYLE-0004: see `eval_rhs_once`.
 fn resolve_against_cow<'a, S: EvalSemantics>(
     expr: &Expr,
     current: Cow<'a, OwnedValue>,
@@ -9903,6 +9965,7 @@ fn resolve_against_cow<'a, S: EvalSemantics>(
 /// forces that node's branch back to `Cow::Owned`, so it costs exactly what
 /// it always did — no regression, but no improvement either, since a real
 /// per-node computation dominates over the clone anyway.
+#[allow(clippy::result_large_err)] // STYLE-0004: see `eval_rhs_once`.
 fn resolve_recurse<'a, S: EvalSemantics>(
     f: &Expr,
     cond: Option<&Expr>,
@@ -10012,6 +10075,7 @@ fn type_filter_matches(builtin: &Builtin, value: &OwnedValue) -> bool {
 ///   reached, and `5 | .a[empty] = 9` is `5` rather than an error.
 /// - The key stream is outer and the target stream inner, so
 ///   `path(.[("a","b")])` emits `["a"]` then `["b"]`.
+#[allow(clippy::result_large_err)] // STYLE-0004: see `eval_rhs_once`.
 fn resolve_index_expr<'a, S: EvalSemantics>(
     target: &Expr,
     key: &Expr,
@@ -10098,6 +10162,7 @@ fn resolve_index_expr<'a, S: EvalSemantics>(
 ///   bound (`Array/string slice indices must be integers` is not swallowed
 ///   either) — unlike [`resolve_index_expr`]'s `key_to_path_component`,
 ///   whose optional-gated type check is *not* the shape to copy here.
+#[allow(clippy::result_large_err)] // STYLE-0004: see `eval_rhs_once`.
 fn resolve_slice_expr<'a, S: EvalSemantics>(
     target: &Expr,
     start: &Option<Box<Expr>>,
@@ -10195,6 +10260,7 @@ fn value_after_components<S: EvalSemantics>(
 /// *its* position, which is the document root only when it sits at the top of
 /// the path. `path(.x | .a[.k])` resolves `.k` against `.x`, giving
 /// `["x","a","a"]`.
+#[allow(clippy::result_large_err)] // STYLE-0004: see `eval_rhs_once`.
 fn resolve_seq<'a, S: EvalSemantics>(
     exprs: &[Expr],
     value: &'a OwnedValue,
@@ -10290,6 +10356,7 @@ fn resolve_seq<'a, S: EvalSemantics>(
 /// sibling fix); the write-side callers (`=`, `|=`, `del()`) discard it and
 /// treat this exactly like a plain failure, matching jq's atomic write
 /// semantics.
+#[allow(clippy::result_large_err)] // STYLE-0004: see `eval_rhs_once`.
 fn resolve_dynamic_indexes<S: EvalSemantics>(
     expr: &Expr,
     input: &OwnedValue,
@@ -11419,15 +11486,16 @@ fn eval_owned_expr<S: EvalSemantics>(
     eval_owned_expr_ctrl::<S>(expr, input, optional).map_err(|control| match control {
         Control::Error(e) => e,
         Control::Break(label) => EvalError::new(format!("break ${label} not in label")),
-        // Same lossy-conversion tension as `result_to_owned`'s `Halt` arm
+        // Same escape-marker treatment as `result_to_owned`'s `Halt` arm
         // (#791): this function's signature (`Result<OwnedValue, EvalError>`)
-        // has no way to carry `Control` through, so a `halt` reached here
-        // (e.g. inside `reduce`/`foreach`'s INIT/UPDATE via a caller that
-        // uses `eval_owned_expr` rather than `eval_owned_expr_ctrl`, which
-        // *does* carry `Control` through losslessly) comes back out as a
-        // plain `EvalError` an enclosing `try`/`catch` could swallow — the
-        // same pre-existing tension `Break` already has here, not a new gap.
-        Control::Halt(code) => EvalError::new(format!("halt({code}) not propagated")),
+        // has no way to carry `Control` through directly, so a `halt` reached
+        // here (e.g. inside `reduce`/`foreach`'s INIT/UPDATE via a caller
+        // that uses `eval_owned_expr` rather than `eval_owned_expr_ctrl`,
+        // which *does* carry `Control` through losslessly) is smuggled back
+        // out via `EvalError::halt_escape` and promoted back to `Halt` by
+        // every caller above this function, so `try`/`catch` still never
+        // sees it.
+        Control::Halt(code) => EvalError::halt_escape(code),
     })
 }
 
@@ -11451,7 +11519,7 @@ fn eval_owned_input<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         return match result {
             Ok(Some(v)) => QueryResult::Owned(v),
             Ok(None) => QueryResult::None,
-            Err(e) => QueryResult::Error(e),
+            Err(e) => query_result_from_error(e),
         };
     }
 
@@ -11656,7 +11724,7 @@ fn eval_limit<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Ok(_) => {
             return QueryResult::Error(EvalError::new("limit requires non-negative integer"));
         }
-        Err(e) => return QueryResult::Error(e),
+        Err(e) => return query_result_from_error(e),
     };
 
     if n == 0 {
@@ -11811,7 +11879,7 @@ fn eval_nth_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Ok(_) => {
             return QueryResult::Error(EvalError::new("nth requires non-negative integer"));
         }
-        Err(e) => return QueryResult::Error(e),
+        Err(e) => return query_result_from_error(e),
     };
 
     let result = eval_single::<W, S>(expr, value, optional);
@@ -12139,13 +12207,13 @@ fn eval_range<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 ) -> QueryResult<'a, W> {
     let from_val = match range_arg(eval_single::<W, S>(from, value.clone(), optional)) {
         Ok(n) => n,
-        Err(e) => return QueryResult::Error(e),
+        Err(e) => return query_result_from_error(e),
     };
 
     let to_val = if let Some(to_expr) = to {
         match range_arg(eval_single::<W, S>(to_expr, value.clone(), optional)) {
             Ok(n) => n,
-            Err(e) => return QueryResult::Error(e),
+            Err(e) => return query_result_from_error(e),
         }
     } else {
         // range(n) means range(0; n)
@@ -12158,7 +12226,7 @@ fn eval_range<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let step_val = if let Some(step_expr) = step {
         match range_arg(eval_single::<W, S>(step_expr, value, optional)) {
             Ok(n) => n,
-            Err(e) => return QueryResult::Error(e),
+            Err(e) => return query_result_from_error(e),
         }
     } else {
         RangeNum::Int(1)
@@ -12276,7 +12344,7 @@ fn builtin_recurse_f<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // `repeat`/`while`.
         match eval_owned_multi::<S>(f, &current) {
             Ok(children) => stack.extend(children.into_iter().rev()),
-            Err(e) => return partial(outputs, Control::Error(e)),
+            Err(e) => return partial(outputs, control_from_error(e)),
         }
     }
 
@@ -12338,7 +12406,7 @@ fn builtin_recurse_cond<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // where nothing catches an error from `f` (#636).
         let children = match eval_owned_multi::<S>(f, &current) {
             Ok(children) => children,
-            Err(e) => return partial(outputs, Control::Error(e)),
+            Err(e) => return partial(outputs, control_from_error(e)),
         };
 
         // Collected in encounter order, then pushed onto `stack` reversed —
@@ -12352,7 +12420,7 @@ fn builtin_recurse_cond<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // pruning just this child the way a falsy `cond` does.
             let cond_outputs = match eval_owned_multi::<S>(cond, &child) {
                 Ok(cond_outputs) => cond_outputs,
-                Err(e) => return partial(outputs, Control::Error(e)),
+                Err(e) => return partial(outputs, control_from_error(e)),
             };
             for c in &cond_outputs {
                 if c.is_truthy() {
@@ -12381,7 +12449,7 @@ fn builtin_walk<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let owned = to_owned(&value);
     match walk_impl::<S>(f, owned, optional) {
         Ok(result) => QueryResult::Owned(result),
-        Err(e) => QueryResult::Error(e),
+        Err(e) => query_result_from_error(e),
     }
 }
 
@@ -12659,7 +12727,7 @@ fn eval_binary_fanout_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSema
         for left_val in left_vals {
             match combine(left_val, right_val.clone()) {
                 Ok(v) => out.push(v),
-                Err(e) => return finish_fork(out, Some(Control::Error(e)), optional),
+                Err(e) => return finish_fork(out, Some(control_from_error(e)), optional),
             }
         }
 
@@ -12812,7 +12880,7 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
             Ok(_) if optional => return QueryResult::None,
             Ok(_) => return QueryResult::Error(EvalError::type_error("number", "other")),
             Err(_) if optional => return QueryResult::None,
-            Err(e) => return QueryResult::Error(e),
+            Err(e) => return query_result_from_error(e),
         };
 
         // Calculate parent path (n levels up)
@@ -13251,7 +13319,7 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
                     }
                 }
                 Err(_) if optional => QueryResult::None,
-                Err(e) => QueryResult::Error(e),
+                Err(e) => query_result_from_error(e),
             }
         }
         Expr::Object(_) | Expr::Array(_) | Expr::Literal(_) => {
@@ -13274,7 +13342,7 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
                     }
                 }
                 Err(_) if optional => QueryResult::None,
-                Err(e) => QueryResult::Error(e),
+                Err(e) => query_result_from_error(e),
             }
         }
         Expr::If {
@@ -13546,7 +13614,7 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
                     }
                 }
                 Err(_) if optional => QueryResult::None,
-                Err(e) => QueryResult::Error(e),
+                Err(e) => query_result_from_error(e),
             }
         }
     }
@@ -13606,9 +13674,9 @@ fn builtin_path<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
     if let Some(e) = walk_error.or(resolve_error) {
         return if paths.is_empty() {
-            QueryResult::Error(e)
+            query_result_from_error(e)
         } else {
-            partial(paths, Control::Error(e))
+            partial(paths, control_from_error(e))
         };
     }
 
@@ -13893,6 +13961,11 @@ fn builtin_fromstream<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let (events, control) = match eval_single::<W, S>(f, value, optional) {
         QueryResult::Error(e) => return QueryResult::Error(e),
         QueryResult::Break(label) => return QueryResult::Break(label),
+        // A bare halt has no prior events to fall back to, unlike a
+        // `Partial`'s trailing control below — falling into
+        // `result.collect_owned()` would silently treat it as "zero events"
+        // instead of halting (#791).
+        QueryResult::Halt(code) => return QueryResult::Halt(code),
         QueryResult::Partial(vs, control) => (vs, Some(control)),
         result => (result.collect_owned(), None),
     };
@@ -13963,6 +14036,8 @@ fn builtin_truncate_stream<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let (events, control) = match eval_single::<W, S>(stream_expr, value, optional) {
         QueryResult::Error(e) => return QueryResult::Error(e),
         QueryResult::Break(label) => return QueryResult::Break(label),
+        // See the matching arm in `builtin_fromstream`.
+        QueryResult::Halt(code) => return QueryResult::Halt(code),
         QueryResult::Partial(vs, control) => (vs, Some(control)),
         result => (result.collect_owned(), None),
     };
@@ -14042,10 +14117,20 @@ fn builtin_paths_filter<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 // when it's the literal boolean `true`. This matters for filters like
                 // `scalars`/`numbers`/`values` that yield the value itself rather than
                 // a boolean.
-                if let Ok(result) = eval_owned_expr::<S>(filter, &val_at_path, optional) {
-                    if result.is_truthy() {
-                        filtered_paths.push(path);
+                match eval_owned_expr::<S>(filter, &val_at_path, optional) {
+                    Ok(result) => {
+                        if result.is_truthy() {
+                            filtered_paths.push(path);
+                        }
                     }
+                    // Every other error here is pre-existing, silently
+                    // swallowed behavior this fix does not change (`if let
+                    // Ok(..)` above), but a halt must never be silently
+                    // ignored (#791): `paths(halt_error(3))` has to actually
+                    // halt, not just skip the node as if the filter were
+                    // falsy.
+                    Err(e) if e.halt.is_some() => return query_result_from_error(e),
+                    Err(_) => {}
                 }
             }
         }
@@ -14422,7 +14507,7 @@ fn builtin_setpath<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // An optional context swallows the refusal, as it does for every other
         // builtin here.
         Err(_) if optional => QueryResult::None,
-        Err(e) => QueryResult::Error(e),
+        Err(e) => query_result_from_error(e),
     }
 }
 
@@ -15083,6 +15168,8 @@ fn builtin_del<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // `resolve_dynamic_indexes`).
     let paths = match resolve_dynamic_indexes::<S>(path_expr, &result) {
         Ok(paths) => paths,
+        // Halt outranks `?` — see the matching comment in `eval_assign`.
+        Err((_, e)) if e.halt.is_some() => return query_result_from_error(e),
         Err((_, _)) if optional => return QueryResult::None,
         Err((_, e)) => return QueryResult::Error(e),
     };
@@ -15124,7 +15211,7 @@ fn builtin_del<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     match delete_expr_paths_at(result, &refs, 0) {
         Ok(result) => QueryResult::Owned(result),
         Err(_) if optional => QueryResult::None,
-        Err(e) => QueryResult::Error(e),
+        Err(e) => query_result_from_error(e),
     }
 }
 
@@ -15612,32 +15699,32 @@ fn builtin_mktime<W: Clone + AsRef<[u64]>>(
     let year = match get_int(0) {
         Ok(y) => y,
         Err(_) if optional => return QueryResult::None,
-        Err(e) => return QueryResult::Error(e),
+        Err(e) => return query_result_from_error(e),
     };
     let month = match get_int(1) {
         Ok(m) => m + 1, // jq uses 0-indexed months
         Err(_) if optional => return QueryResult::None,
-        Err(e) => return QueryResult::Error(e),
+        Err(e) => return query_result_from_error(e),
     };
     let day = match get_int(2) {
         Ok(d) => d,
         Err(_) if optional => return QueryResult::None,
-        Err(e) => return QueryResult::Error(e),
+        Err(e) => return query_result_from_error(e),
     };
     let hour = match get_int(3) {
         Ok(h) => h,
         Err(_) if optional => return QueryResult::None,
-        Err(e) => return QueryResult::Error(e),
+        Err(e) => return query_result_from_error(e),
     };
     let minute = match get_int(4) {
         Ok(m) => m,
         Err(_) if optional => return QueryResult::None,
-        Err(e) => return QueryResult::Error(e),
+        Err(e) => return query_result_from_error(e),
     };
     let second = match get_int(5) {
         Ok(s) => s,
         Err(_) if optional => return QueryResult::None,
-        Err(e) => return QueryResult::Error(e),
+        Err(e) => return query_result_from_error(e),
     };
 
     // Convert to Unix timestamp using inverse of the gmtime algorithm
@@ -15667,7 +15754,7 @@ fn builtin_strftime<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Ok(OwnedValue::String(s)) => s,
         Ok(_) if optional => return QueryResult::None,
         Ok(_) => return QueryResult::Error(EvalError::type_error("string", "strftime format")),
-        Err(e) => return QueryResult::Error(e),
+        Err(e) => return query_result_from_error(e),
     };
 
     // Value should be a broken-down time array
@@ -15830,7 +15917,7 @@ fn builtin_strptime<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Ok(OwnedValue::String(s)) => s,
         Ok(_) if optional => return QueryResult::None,
         Ok(_) => return QueryResult::Error(EvalError::type_error("string", "strptime format")),
-        Err(e) => return QueryResult::Error(e),
+        Err(e) => return query_result_from_error(e),
     };
 
     // Value should be a string
@@ -16687,7 +16774,7 @@ fn builtin_tz<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Ok(OwnedValue::String(s)) => s,
         Ok(_) if optional => return QueryResult::None,
         Ok(_) => return QueryResult::Error(EvalError::type_error("string", "tz zone argument")),
-        Err(e) => return QueryResult::Error(e),
+        Err(e) => return query_result_from_error(e),
     };
 
     // Get the timezone offset
@@ -16719,7 +16806,7 @@ fn builtin_load<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Ok(OwnedValue::String(s)) => s,
         Ok(_) if optional => return QueryResult::None,
         Ok(_) => return QueryResult::Error(EvalError::type_error("string", "load filename")),
-        Err(e) => return QueryResult::Error(e),
+        Err(e) => return query_result_from_error(e),
     };
 
     // Read the file contents
@@ -16951,7 +17038,7 @@ fn builtin_combinations_n<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         }
         Ok(_) if optional => return QueryResult::None,
         Ok(_) => return QueryResult::Error(EvalError::type_error("number", "n")),
-        Err(e) => return QueryResult::Error(e),
+        Err(e) => return query_result_from_error(e),
     };
 
     // Input must be an array
@@ -17577,13 +17664,14 @@ fn builtin_delpaths<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     match result {
         Ok(v) => QueryResult::Owned(v),
         Err(_) if optional => QueryResult::None,
-        Err(e) => QueryResult::Error(e),
+        Err(e) => query_result_from_error(e),
     }
 }
 
 // Phase 10: Math Functions
 
 /// Helper to get float value from input
+#[allow(clippy::result_large_err)] // STYLE-0004: see `eval_rhs_once`.
 fn get_float_value<'a, W: Clone + AsRef<[u64]>>(
     value: &StandardJson<'a, W>,
     optional: bool,
@@ -17596,6 +17684,7 @@ fn get_float_value<'a, W: Clone + AsRef<[u64]>>(
 /// Like [`get_float_value`], but with a caller-supplied error for the
 /// non-number case — used by `gmtime`/`localtime` to raise jq's own wording
 /// instead of the generic math-function message.
+#[allow(clippy::result_large_err)] // STYLE-0004: see `eval_rhs_once`.
 fn get_float_value_with<'a, W: Clone + AsRef<[u64]>>(
     value: &StandardJson<'a, W>,
     optional: bool,
@@ -18172,8 +18261,17 @@ fn builtin_halt_error<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Some(expr) => {
             let n_result = eval_single::<W, S>(expr, value.clone(), optional);
             match result_to_owned(n_result) {
+                // Saturating, not wrapping, to match real jq: verified
+                // against jq 1.7.1 on arm64 that an out-of-`i32`-range exit
+                // code clamps to `i32::MIN`/`i32::MAX` rather than wrapping
+                // (e.g. `halt_error(4294967296)` exits 255, `i32::MAX`'s low
+                // byte — not 0, which a wrapping `as i32` cast would give).
+                // `f as i32` below already saturates this way by default
+                // (Rust's cast semantics since 1.45); the `i64`-typed arm
+                // needs an explicit `clamp` for the same behavior, since
+                // `as i32` on an integer wraps instead (#791).
                 Ok(OwnedValue::Int(i) | OwnedValue::NumberLiteral(NumberRepr::Int(i), _)) => {
-                    i as i32
+                    i.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
                 }
                 Ok(OwnedValue::Float(f)) => f as i32,
                 Ok(_) => {
@@ -18181,7 +18279,7 @@ fn builtin_halt_error<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                         "halt_error/1 requires a number exit code",
                     ));
                 }
-                Err(e) => return QueryResult::Error(e),
+                Err(e) => return query_result_from_error(e),
             }
         }
         None => S::DEFAULT_HALT_ERROR_CODE,
@@ -18248,6 +18346,11 @@ fn builtin_envvar<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let var_result = eval_owned_expr::<S>(var, &owned_value, optional);
     let var_name = match var_result {
         Ok(OwnedValue::String(s)) => s,
+        // Checked ahead of the generic fallback below (which would
+        // otherwise flatten it into a misleading "must be a string"
+        // message and, when `optional`, silently swallow it): a halt must
+        // never be silently downgraded (#791).
+        Err(e) if e.halt.is_some() => return query_result_from_error(e),
         _ if optional => return QueryResult::None,
         _ => return QueryResult::Error(EvalError::new("env variable name must be a string")),
     };
@@ -19012,7 +19115,7 @@ fn eval_as_pattern<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // Extract bindings from the pattern
         let bindings = match extract_pattern_bindings(pattern, &bound_val) {
             Ok(b) => b,
-            Err(e) => return QueryResult::Error(e),
+            Err(e) => return query_result_from_error(e),
         };
 
         // Substitute all bindings in the body

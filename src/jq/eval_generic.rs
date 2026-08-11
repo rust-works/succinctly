@@ -1171,17 +1171,9 @@ impl<V: DocumentValue> GenericResult<V> {
                     stats.any_truthy = !stats.last_was_falsy;
                 }
                 Err(control) => {
-                    stats.error = Some(match control {
-                        Control::Error(e) => stream_error(&e),
-                        Control::Break(label) => StreamError {
-                            message: format!("break ${label} not in label"),
-                            not_a_string: false,
-                        },
-                        Control::Halt(code) => StreamError {
-                            message: format!("halt({code}) not propagated"),
-                            not_a_string: false,
-                        },
-                    });
+                    let (error, halt) = control_to_stream_outcome(control);
+                    stats.error = error;
+                    stats.halt = halt;
                 }
             },
             Self::ManyCursor(cs) => {
@@ -1225,10 +1217,7 @@ impl<V: DocumentValue> GenericResult<V> {
                 });
             }
             Self::Halt(code) => {
-                stats.error = Some(StreamError {
-                    message: format!("halt({code}) not propagated"),
-                    not_a_string: false,
-                });
+                stats.halt = Some(*code);
             }
             // The prefix streams like `ManyOwned` above, then the control is
             // reported the same way `Error`/`Break` are (#400, #494) — the
@@ -1241,17 +1230,9 @@ impl<V: DocumentValue> GenericResult<V> {
                     stats.any_truthy |= !stats.last_was_falsy;
                 }
                 stats.count = os.len();
-                stats.error = Some(match control {
-                    Control::Error(e) => stream_error(e),
-                    Control::Break(label) => StreamError {
-                        message: format!("break ${label} not in label"),
-                        not_a_string: false,
-                    },
-                    Control::Halt(code) => StreamError {
-                        message: format!("halt({code}) not propagated"),
-                        not_a_string: false,
-                    },
-                });
+                let (error, halt) = control_to_stream_outcome(control.clone());
+                stats.error = error;
+                stats.halt = halt;
             }
         }
 
@@ -1360,17 +1341,9 @@ impl<V: DocumentValue> GenericResult<V> {
                     stats.any_truthy = !stats.last_was_falsy;
                 }
                 Err(control) => {
-                    stats.error = Some(match control {
-                        Control::Error(e) => stream_error(&e),
-                        Control::Break(label) => StreamError {
-                            message: format!("break ${label} not in label"),
-                            not_a_string: false,
-                        },
-                        Control::Halt(code) => StreamError {
-                            message: format!("halt({code}) not propagated"),
-                            not_a_string: false,
-                        },
-                    });
+                    let (error, halt) = control_to_stream_outcome(control);
+                    stats.error = error;
+                    stats.halt = halt;
                 }
             },
             Self::None => {
@@ -1403,10 +1376,7 @@ impl<V: DocumentValue> GenericResult<V> {
                 });
             }
             Self::Halt(code) => {
-                stats.error = Some(StreamError {
-                    message: format!("halt({code}) not propagated"),
-                    not_a_string: false,
-                });
+                stats.halt = Some(*code);
             }
             // Same treatment as `stream_json` (#400, #494): the prefix
             // streams first, then the control is reported.
@@ -1418,17 +1388,9 @@ impl<V: DocumentValue> GenericResult<V> {
                     stats.any_truthy |= !stats.last_was_falsy;
                 }
                 stats.count = os.len();
-                stats.error = Some(match control {
-                    Control::Error(e) => stream_error(e),
-                    Control::Break(label) => StreamError {
-                        message: format!("break ${label} not in label"),
-                        not_a_string: false,
-                    },
-                    Control::Halt(code) => StreamError {
-                        message: format!("halt({code}) not propagated"),
-                        not_a_string: false,
-                    },
-                });
+                let (error, halt) = control_to_stream_outcome(control.clone());
+                stats.error = error;
+                stats.halt = halt;
             }
         }
 
@@ -1508,6 +1470,33 @@ fn stream_error(e: &EvalError) -> crate::jq::stream::StreamError {
     crate::jq::stream::StreamError {
         message: e.message.clone(),
         not_a_string: e.payload_is_not_a_string(),
+    }
+}
+
+/// Split a terminating [`Control`] into the `(error, halt)` pair
+/// [`crate::jq::stream::StreamStats`] carries.
+///
+/// A halt must not become a `StreamError`: that channel is a rendered
+/// message string with no room for the real exit code, so a caller that only
+/// checked `error` would report it as an ordinary uncaught failure instead of
+/// halting with the right code (#791) — see `StreamStats::halt`'s doc
+/// comment. Shared by every `stream_json`/`stream_yaml` site that terminates
+/// on a `Control` (`Break`'s message is duplicated here too, purely to keep
+/// all three arms of the match in one place rather than splitting `Break`
+/// out on its own).
+fn control_to_stream_outcome(
+    control: Control,
+) -> (Option<crate::jq::stream::StreamError>, Option<i32>) {
+    match control {
+        Control::Error(e) => (Some(stream_error(&e)), None),
+        Control::Break(label) => (
+            Some(crate::jq::stream::StreamError {
+                message: format!("break ${label} not in label"),
+                not_a_string: false,
+            }),
+            None,
+        ),
+        Control::Halt(code) => (None, Some(code)),
     }
 }
 
@@ -2801,6 +2790,11 @@ fn eval_slice_bound<S: EvalSemantics, V: DocumentValue>(
     let raw = match eval_single::<S, V>(expr, value, false, cursor) {
         GenericResult::Error(e) => return Err(Control::Error(e)),
         GenericResult::Break(label) => return Err(Control::Break(label)),
+        // Falling into `other => other.collect_owned()` below would discard
+        // the halt into an empty bound list instead of propagating it, so a
+        // dynamic slice bound like `.[:halt_error(3)]` would silently exit 0
+        // (#791).
+        GenericResult::Halt(code) => return Err(Control::Halt(code)),
         GenericResult::None => return Ok(Vec::new()),
         GenericResult::Partial(_, control) => return Err(control),
         GenericResult::One(v) => vec![to_owned_key_shape(&v)],
