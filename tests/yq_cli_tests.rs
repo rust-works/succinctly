@@ -3562,6 +3562,95 @@ fn test_colorized_yaml_output_sequence_dash() -> Result<()> {
     Ok(())
 }
 
+/// #748: `-C`/`--color` excluded identity/navigation queries from the M2
+/// cursor-streaming fast path (`can_stream_pretty` in `yq_runner.rs`),
+/// forcing them through the `OwnedValue` DOM (`IndexMap`-backed), which
+/// silently collapsed duplicate keys — the same bug class #442 fixed for the
+/// unadorned fast path and #733 fixed for `-S`/`--tab`. Unlike #733, color
+/// doesn't need the streamers taught anything new: `colorize_yaml`/
+/// `colorize_json` are pure text-level re-lexers, so the fix buffers the
+/// still-duplicate-key-safe cursor-streamed output and colorizes the buffer,
+/// reusing the existing colorizers unmodified.
+#[test]
+fn test_duplicate_mapping_key_survives_color_yaml_output() -> Result<()> {
+    let yaml = "a: 1\na: 2\n";
+
+    let (output, code) = run_yq_stdin(".", yaml, &["-C"])?;
+    assert_eq!(code, 0);
+    assert_eq!(
+        output,
+        "\u{1b}[36ma\u{1b}[0m: 1\n\u{1b}[36ma\u{1b}[0m: 2\u{1b}[0m\n"
+    );
+
+    Ok(())
+}
+
+/// Same as [`test_duplicate_mapping_key_survives_color_yaml_output`], for
+/// `-o json`.
+#[test]
+fn test_duplicate_mapping_key_survives_color_json_output() -> Result<()> {
+    let yaml = "a: 1\na: 2\n";
+
+    let (output, code) = run_yq_stdin(".", yaml, &["-C", "-o", "json"])?;
+    assert_eq!(code, 0);
+    assert_eq!(
+        output,
+        "\u{1b}[1;39m{\u{1b}[0m\n  \u{1b}[1;34m\"a\"\u{1b}[0m: \u{1b}[0;39m1\u{1b}[0m,\n  \u{1b}[1;34m\"a\"\u{1b}[0m: \u{1b}[0;39m2\u{1b}[0m\n\u{1b}[1;39m}\u{1b}[0m\n"
+    );
+
+    Ok(())
+}
+
+/// Compact output (`-I0`) already took the fast path regardless of color
+/// (`can_json_fast_path`/`can_yaml_fast_path`'s `output_config.compact ||`
+/// short-circuit predates #748), which meant `-C -I0` silently produced
+/// uncolored output — a separate quirk from the duplicate-key collapse this
+/// issue is about, but resolved as a side effect since #748's fix keys the
+/// buffer-and-colorize decision only on `use_color`, not on which condition
+/// let the fast path through. Guards both the color and duplicate-key fixes
+/// together in compact mode, YAML and JSON.
+#[test]
+fn test_duplicate_mapping_key_survives_color_compact() -> Result<()> {
+    let yaml = "a: 1\na: 2\n";
+
+    let (output, code) = run_yq_stdin(".", yaml, &["-C", "-I0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(
+        output,
+        "\u{1b}[36ma\u{1b}[0m: 1\n\u{1b}[36ma\u{1b}[0m: 2\u{1b}[0m\n"
+    );
+
+    let (json, code) = run_yq_stdin(".", yaml, &["-C", "-o", "json", "-I0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(
+        json,
+        "\u{1b}[1;39m{\u{1b}[0m\u{1b}[1;34m\"a\"\u{1b}[0m:\u{1b}[0;39m1\u{1b}[0m,\u{1b}[1;34m\"a\"\u{1b}[0m:\u{1b}[0;39m2\u{1b}[0m\u{1b}[1;39m}\u{1b}[0m\n"
+    );
+
+    Ok(())
+}
+
+/// `stream_maybe_colored` (#748) buffers a whole `stream_yaml`/`stream_json`
+/// call's output — which, for an iterating query, can be several
+/// concatenated top-level documents, not just one — before handing it to
+/// `colorize_yaml`/`colorize_json`. Neither colorizer is exercised on
+/// multi-document buffers anywhere else (the DOM path colorizes one value
+/// per call), so this guards that the re-lexers still track state correctly
+/// across a document boundary instead of only ever seeing a single value.
+#[test]
+fn test_color_output_survives_iteration_with_duplicate_keys() -> Result<()> {
+    let yaml = "- a: 1\n  a: 2\n- b: 3\n";
+
+    let (output, code) = run_yq_stdin(".[]", yaml, &["-C"])?;
+    assert_eq!(code, 0);
+    assert_eq!(
+        output,
+        "\u{1b}[36ma\u{1b}[0m: 1\n\u{1b}[36ma\u{1b}[0m: 2\n\u{1b}[36mb\u{1b}[0m: 3\n\u{1b}[0m"
+    );
+
+    Ok(())
+}
+
 // ============================================================================
 // Special float values (NaN / Infinity)
 // ============================================================================
