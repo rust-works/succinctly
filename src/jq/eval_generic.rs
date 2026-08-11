@@ -108,9 +108,20 @@ pub enum CommentTree {
     /// which trails the whole array, not an element), plus one subtree per
     /// element in order.
     Array(Option<String>, Vec<Self>),
-    /// An object: this node's own trailing comment, plus one subtree per
-    /// field, keyed the same as the parallel `OwnedValue::Object`.
-    Object(Option<String>, IndexMap<String, Self>),
+    /// An object: this node's own trailing comment, one subtree per field
+    /// (keyed the same as the parallel `OwnedValue::Object`), plus one
+    /// key-scoped comment per field for a comment trailing the *key's* own
+    /// line when its value is deferred to a following line (issue #765,
+    /// e.g. `a: # comment\n  b: 1`) - distinct from the field's value
+    /// subtree's own comment, which `.a | line_comment` etc. read instead.
+    /// The `bool` alongside each comment is whether the deferred value
+    /// materialized as nothing at all (a sibling key follows, or EOF) -
+    /// see [`Self::key_comment_if_value_absent`].
+    Object(
+        Option<String>,
+        IndexMap<String, Self>,
+        IndexMap<String, (String, bool)>,
+    ),
 }
 
 impl CommentTree {
@@ -124,7 +135,7 @@ impl CommentTree {
     /// This node's own trailing comment, if any.
     pub fn own(&self) -> Option<&str> {
         match self {
-            Self::Leaf(c) | Self::Array(c, _) | Self::Object(c, _) => c.as_deref(),
+            Self::Leaf(c) | Self::Array(c, _) | Self::Object(c, _, _) => c.as_deref(),
         }
     }
 
@@ -141,8 +152,40 @@ impl CommentTree {
     /// `Object` or has no such key.
     pub fn field(&self, key: &str) -> &Self {
         match self {
-            Self::Object(_, fields) => fields.get(key).unwrap_or(&EMPTY_COMMENT_TREE),
+            Self::Object(_, fields, _) => fields.get(key).unwrap_or(&EMPTY_COMMENT_TREE),
             _ => &EMPTY_COMMENT_TREE,
+        }
+    }
+
+    /// A comment trailing object field `key`'s own *key* line, when its
+    /// value is deferred to a following line (issue #765) - or `None` if
+    /// this isn't an `Object`, has no such key, or the key has no such
+    /// comment. Distinct from `field(key).own()`, which is the value's own
+    /// trailing comment (issue #710).
+    pub fn key_comment(&self, key: &str) -> Option<&str> {
+        match self {
+            Self::Object(_, _, key_comments) => key_comments.get(key).map(|(c, _)| c.as_str()),
+            _ => None,
+        }
+    }
+
+    /// The same key-scoped comment as [`Self::key_comment`], but only when
+    /// the deferred value itself materialized as nothing at all (issue
+    /// #765) - a sibling key follows at the same or lower indent, or EOF.
+    ///
+    /// `None` both when there's no key comment at all, and when there is
+    /// one but the deferred value has real content of its own (a
+    /// container - use `key_comment` plus the value's own rendering there
+    /// instead - or a folded scalar continuation like `a: # c\n  null`,
+    /// which real `yq` places the comment after rather than right after
+    /// the key, a different, unhandled case).
+    pub fn key_comment_if_value_absent(&self, key: &str) -> Option<&str> {
+        match self {
+            Self::Object(_, _, key_comments) => key_comments
+                .get(key)
+                .filter(|(_, absent)| *absent)
+                .map(|(c, _)| c.as_str()),
+            _ => None,
         }
     }
 }
@@ -168,19 +211,37 @@ pub fn to_owned_with_comments<V: DocumentValue>(
     if let Some(fields) = value.as_object() {
         let mut map = IndexMap::new();
         let mut comment_map = IndexMap::new();
+        let mut key_comment_map = IndexMap::new();
         let mut f = fields;
         while let Some((field, rest)) = f.uncons() {
             if let Some(key) = field.key_str() {
                 let key = key.into_owned();
                 let (v, c) = to_owned_with_comments(&field.value, Some(&field.value_cursor));
                 map.insert(key.clone(), v);
-                comment_map.insert(key, c);
+                comment_map.insert(key.clone(), c);
+                // A comment trailing the key's own line, when the value is
+                // deferred to a following line (issue #765) - distinct from
+                // `c`'s own comment above, which belongs to the value.
+                // Recorded alongside whether the deferred value
+                // materialized as nothing at all (a sibling key follows, or
+                // EOF): a folded scalar continuation that merely *reads* as
+                // null (`a: # c\n  null`) is a different, unhandled case
+                // where real yq places the comment after the folded value
+                // instead of right after the key, which `v`/`is_null()`
+                // alone can't tell apart from true absence - both collapse
+                // through the same semantic check `to_owned` uses - so this
+                // also checks the raw text is empty, not just null-ish.
+                if let Some(kc) = field.key_cursor.line_comment_raw() {
+                    let value_absent = field.value.is_null()
+                        && field.value.as_str().map_or(true, |s| s.is_empty());
+                    key_comment_map.insert(key, (kc, value_absent));
+                }
             }
             f = rest;
         }
         (
             OwnedValue::Object(map),
-            CommentTree::Object(own_comment, comment_map),
+            CommentTree::Object(own_comment, comment_map, key_comment_map),
         )
     } else if let Some(elements) = value.as_array() {
         let mut items = Vec::new();

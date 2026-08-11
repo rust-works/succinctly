@@ -985,9 +985,20 @@ fn emit_yaml_value(
                         if matches!(v, OwnedValue::Object(m) if !m.is_empty())
                             || matches!(v, OwnedValue::Array(a) if !a.is_empty())
                         {
+                            // A comment trailing the key's own line, when the
+                            // value is deferred to the next line, belongs to
+                            // the key, not the value (#765).
+                            let key_comment_suffix = comments
+                                .key_comment(k)
+                                .map_or_else(String::new, |c| format!(" {c}"));
                             // For nested containers, emit at depth+1 which handles its own indentation
                             let val = emit_yaml_value(v, field_comments, config, depth + 1, false);
-                            format!("{indent}{key}:\n{val}{comment_suffix}")
+                            format!("{indent}{key}:{key_comment_suffix}\n{val}{comment_suffix}")
+                        } else if let Some(kc) = comments.key_comment_if_value_absent(k) {
+                            // The deferred value materialized as nothing at
+                            // all - the key's own comment stands alone with
+                            // no value token, matching real yq (#765).
+                            format!("{indent}{key}: {kc}")
                         } else {
                             let val = emit_yaml_value(v, field_comments, config, depth + 1, false);
                             format!("{indent}{key}: {val}{comment_suffix}")
@@ -2543,6 +2554,7 @@ mod tests {
             vec![CommentTree::Object(
                 Some("# obj trailing".to_string()),
                 obj_comments,
+                IndexMap::new(),
             )],
         );
 

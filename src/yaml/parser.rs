@@ -2198,7 +2198,12 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 self.write_bp_close();
                 return Ok(());
             }
-            // Value is on next line - check what kind of value
+            // Value is on next line - check what kind of value. Capture a
+            // trailing comment on the key's own line first (issue #765) -
+            // `self.last_open_bp_pos` still holds the key node's bp_pos here
+            // since no value node has been opened yet (nothing opens a BP
+            // node between the key's own close above and this point).
+            self.maybe_capture_line_comment(self.last_open_bp_pos);
             self.skip_to_eol();
 
             // Look ahead to see what the next content line looks like

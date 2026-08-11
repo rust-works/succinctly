@@ -1419,6 +1419,10 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                             out.write_char(':')?;
                             let value = field.value_cursor();
                             if is_yaml_cursor_container(&value) && value.style() != "flow" {
+                                // A comment trailing the key's own line, when
+                                // the value is deferred to the next line,
+                                // belongs to the key, not the value (#765).
+                                write_line_comment(out, field.key_cursor().line_comment_raw())?;
                                 // The anchor (if any) belongs on the same
                                 // line as the key, before the newline that
                                 // starts the container's own contents.
@@ -1437,6 +1441,16 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                                     sort_keys,
                                 )?;
                                 write_line_comment(out, value.line_comment_raw())?;
+                            } else if let Some(kc) = field
+                                .key_cursor()
+                                .line_comment_raw()
+                                .filter(|_| is_deferred_value_absent(&value))
+                            {
+                                // The deferred value materialized as nothing
+                                // at all - the key's own comment stands
+                                // alone with no value token, matching real
+                                // yq (#765).
+                                write_line_comment(out, Some(kc))?;
                             } else {
                                 out.write_char(' ')?;
                                 if let Some(anchor) = value.anchor() {
@@ -1466,6 +1480,10 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                             // Check if value needs newline
                             let value = field.value_cursor();
                             if is_yaml_cursor_container(&value) && value.style() != "flow" {
+                                // A comment trailing the key's own line, when
+                                // the value is deferred to the next line,
+                                // belongs to the key, not the value (#765).
+                                write_line_comment(out, field.key_cursor().line_comment_raw())?;
                                 // The anchor (if any) belongs on the same
                                 // line as the key, before the newline that
                                 // starts the container's own contents.
@@ -1484,6 +1502,16 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                                     sort_keys,
                                 )?;
                                 write_line_comment(out, value.line_comment_raw())?;
+                            } else if let Some(kc) = field
+                                .key_cursor()
+                                .line_comment_raw()
+                                .filter(|_| is_deferred_value_absent(&value))
+                            {
+                                // The deferred value materialized as nothing
+                                // at all - the key's own comment stands
+                                // alone with no value token, matching real
+                                // yq (#765).
+                                write_line_comment(out, Some(kc))?;
                             } else {
                                 out.write_char(' ')?;
                                 if let Some(anchor) = value.anchor() {
@@ -5508,6 +5536,28 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentElements for YamlElements<'a, W> {
 /// literal `<<` field.
 fn is_yaml_cursor_container<W: AsRef<[u64]>>(cursor: &YamlCursor<'_, W>) -> bool {
     cursor.is_container() && cursor.first_child().is_some()
+}
+
+/// Whether a mapping field's value cursor is a deferred value that
+/// materialized as nothing at all - a sibling key follows at the same or
+/// lower indent, or EOF (issue #765).
+///
+/// Deliberately checks the resolved value's *text*, not general semantic
+/// nullness - a folded scalar continuation that merely *reads* as null
+/// (`a: # c\n  null`) is semantically null too, but real `yq` places its
+/// comment after the folded value instead of right after the key, a
+/// different, unhandled case this must not swallow. Also deliberately does
+/// not use `YamlCursor::raw_bytes()`: for exactly this deferred-and-absent
+/// shape, the value's recorded text position aliases onto whatever follows
+/// in the source (e.g. the next sibling key's own text), so `raw_bytes()`
+/// reads that unrelated text instead of reporting emptiness. `value()`'s
+/// `String`/`Null` classification does not have that problem.
+fn is_deferred_value_absent<W: AsRef<[u64]>>(value: &YamlCursor<'_, W>) -> bool {
+    match value.value() {
+        YamlValue::Null => true,
+        YamlValue::String(s) => s.is_unquoted() && s.as_str().map_or(true, |t| t.is_empty()),
+        _ => false,
+    }
 }
 
 /// Write `width` copies of `unit` as indentation (`unit` is `' '` for

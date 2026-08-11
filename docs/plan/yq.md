@@ -143,9 +143,20 @@ succinctly yq '.spec.containers[]' deployment.yaml service.yaml
 captured and preserved through output, always-on (no `--preserve-comments`
 flag needed or planned) — but only on paths that keep a live YAML cursor
 (identity, field/index navigation, filters like `select`, `-S`/sort-keys).
-Assignment (`=`, `|=`, ...) and other value-constructing expressions fall
-through a JSON-round-trip evaluator path that has no comment data to carry;
-see the `comments` row below and the tracking issue for the follow-up.
+A comment trailing a mapping *key*'s own line, when its value is deferred to
+a following line (`a: # comment\n  b: 1`), is preserved the same way (#765)
+for the two shapes the deferred value can resolve to that real `yq` itself
+preserves: a nested mapping/sequence, or nothing at all (a sibling key
+follows at the same or lower indent, or EOF — `a: # comment\nb: 2`). It's
+key-scoped, not value-scoped, so it stays invisible to `line_comment` and
+friends, matching real `yq`. A third shape — a folded plain-scalar
+continuation (`a: # comment\n  hello` → real `yq` emits `a: hello #
+comment`, comment *after* the value) — is not handled; succinctly still
+drops the comment there, since real `yq` positions it differently from the
+other two shapes. Assignment (`=`, `|=`, ...) and other value-constructing
+expressions fall through a JSON-round-trip evaluator path that has no
+comment data to carry; see the `comments` row below and the tracking issue
+for the follow-up.
 
 ---
 
