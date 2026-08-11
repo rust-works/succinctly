@@ -6170,62 +6170,120 @@ fn builtin_match<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let global = flags.is_some_and(|f| f.contains('g'));
 
     if global {
-        // Return all matches
-        let matches: Vec<OwnedValue> = re
-            .find_iter(&input)
-            .map(|m| build_match_object(&re, m.as_str(), m.start(), &input))
+        // Stream one match object per match (jq's match(re;"g") is a generator)
+        let matches: Vec<OwnedValue> = global_captures(&re, &input)
+            .iter()
+            .map(|caps| build_match_object(&re, caps))
             .collect();
-        QueryResult::Owned(OwnedValue::Array(matches))
+        if matches.is_empty() {
+            QueryResult::None
+        } else {
+            QueryResult::ManyOwned(matches)
+        }
     } else {
         // Return first match or null
-        match re.find(&input) {
-            Some(m) => QueryResult::Owned(build_match_object(&re, m.as_str(), m.start(), &input)),
+        match re.captures(&input) {
+            Some(caps) => QueryResult::Owned(build_match_object(&re, &caps)),
             None => QueryResult::Owned(OwnedValue::Null),
         }
     }
 }
 
-/// Build a jq match object
+/// Find every match of `re` in `input`, including a trailing zero-width
+/// match immediately after a non-empty one — which `Regex::captures_iter`
+/// deliberately suppresses (regex-automata treats it as overlapping the
+/// prior match's end bound). Mirrors jq's own C matching loop: advance to
+/// the match end, or one character past it when the match was empty.
 #[cfg(feature = "regex")]
-fn build_match_object(re: &regex::Regex, matched: &str, offset: usize, input: &str) -> OwnedValue {
+fn global_captures<'h>(re: &regex::Regex, input: &'h str) -> Vec<regex::Captures<'h>> {
+    let mut results = Vec::new();
+    let mut start = 0usize;
+    while start <= input.len() {
+        let Some(caps) = re.captures_at(input, start) else {
+            break;
+        };
+        let m = caps
+            .get(0)
+            .expect("capture group 0 is always present on a match");
+        let (m_start, m_end) = (m.start(), m.end());
+        results.push(caps);
+        start = if m_end > m_start {
+            m_end
+        } else {
+            match input[m_end..].chars().next() {
+                Some(c) => m_end + c.len_utf8(),
+                None => m_end + 1,
+            }
+        };
+    }
+    results
+}
+
+/// Build a jq match object from an already-obtained `Captures`.
+#[cfg(feature = "regex")]
+fn build_match_object(re: &regex::Regex, caps: &regex::Captures) -> OwnedValue {
+    let m0 = caps
+        .get(0)
+        .expect("capture group 0 is always present on a match");
     let mut obj = IndexMap::new();
 
-    obj.insert("offset".to_string(), OwnedValue::Int(offset as i64));
-    obj.insert("length".to_string(), OwnedValue::Int(matched.len() as i64));
+    obj.insert("offset".to_string(), OwnedValue::Int(m0.start() as i64));
+    obj.insert("length".to_string(), OwnedValue::Int(m0.len() as i64));
     obj.insert(
         "string".to_string(),
-        OwnedValue::String(matched.to_string()),
+        OwnedValue::String(m0.as_str().to_string()),
     );
 
     // Build captures array
     let mut captures = Vec::new();
-    if let Some(caps) = re.captures(input) {
-        for (i, name) in re.capture_names().enumerate() {
-            if i == 0 {
-                continue; // Skip the full match
-            }
-            let cap = caps.get(i);
-            let mut cap_obj = IndexMap::new();
-            cap_obj.insert(
-                "offset".to_string(),
-                cap.map_or(OwnedValue::Null, |m| OwnedValue::Int(m.start() as i64)),
-            );
-            cap_obj.insert(
-                "length".to_string(),
-                cap.map_or(OwnedValue::Int(0), |m| OwnedValue::Int(m.len() as i64)),
-            );
-            cap_obj.insert(
-                "string".to_string(),
-                cap.map_or(OwnedValue::Null, |m| {
-                    OwnedValue::String(m.as_str().to_string())
-                }),
-            );
-            cap_obj.insert(
-                "name".to_string(),
-                name.map_or(OwnedValue::Null, |n| OwnedValue::String(n.to_string())),
-            );
-            captures.push(OwnedValue::Object(cap_obj));
+    for (i, name) in re.capture_names().enumerate() {
+        if i == 0 {
+            continue; // Skip the full match
         }
+        let mut cap_obj = IndexMap::new();
+        // jq (verified against pinned jq-1.7.1) swaps "string" before
+        // "length" whenever a capture's own length is 0 — whether it
+        // matched empty or didn't participate at all. A group that never
+        // participated (e.g. a `?`/`*`-quantified group that ran zero times)
+        // reports offset -1, string null — *unless* the overall match itself
+        // is zero-length, in which case oniguruma reports every
+        // non-participating group as an empty match at the overall match's
+        // own position instead of unset. Verified with 6 independent probes,
+        // e.g. `(a)(b)*` on "a" (nonzero match) -> group 2 offset -1, but
+        // `(a)*` on "" (zero-length match) -> group 1 offset 0, string "".
+        match caps.get(i) {
+            Some(m) if !m.is_empty() => {
+                cap_obj.insert("offset".to_string(), OwnedValue::Int(m.start() as i64));
+                cap_obj.insert("length".to_string(), OwnedValue::Int(m.len() as i64));
+                cap_obj.insert(
+                    "string".to_string(),
+                    OwnedValue::String(m.as_str().to_string()),
+                );
+            }
+            Some(m) => {
+                cap_obj.insert("offset".to_string(), OwnedValue::Int(m.start() as i64));
+                cap_obj.insert(
+                    "string".to_string(),
+                    OwnedValue::String(m.as_str().to_string()),
+                );
+                cap_obj.insert("length".to_string(), OwnedValue::Int(0));
+            }
+            None if m0.is_empty() => {
+                cap_obj.insert("offset".to_string(), OwnedValue::Int(m0.start() as i64));
+                cap_obj.insert("string".to_string(), OwnedValue::String(String::new()));
+                cap_obj.insert("length".to_string(), OwnedValue::Int(0));
+            }
+            None => {
+                cap_obj.insert("offset".to_string(), OwnedValue::Int(-1));
+                cap_obj.insert("string".to_string(), OwnedValue::Null);
+                cap_obj.insert("length".to_string(), OwnedValue::Int(0));
+            }
+        }
+        cap_obj.insert(
+            "name".to_string(),
+            name.map_or(OwnedValue::Null, |n| OwnedValue::String(n.to_string())),
+        );
+        captures.push(OwnedValue::Object(cap_obj));
     }
     obj.insert("captures".to_string(), OwnedValue::Array(captures));
 
@@ -6584,21 +6642,40 @@ fn builtin_capture_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Err(e) => return QueryResult::Error(e),
     };
 
-    // Find first match and extract named captures
-    if let Some(caps) = re.captures(&input) {
-        let mut entries = IndexMap::new();
-        for name in re.capture_names().flatten() {
-            if let Some(m) = caps.name(name) {
-                entries.insert(name.to_string(), OwnedValue::String(m.as_str().to_string()));
-            }
+    // Check if global flag is set
+    let global = flags.is_some_and(|f| f.contains('g'));
+
+    if global {
+        // Stream one captures object per match (jq's capture(re;"g") is a generator)
+        let objects: Vec<OwnedValue> = global_captures(&re, &input)
+            .iter()
+            .map(|caps| capture_object(&re, caps))
+            .collect();
+        if objects.is_empty() {
+            QueryResult::None
+        } else {
+            QueryResult::ManyOwned(objects)
         }
-        QueryResult::Owned(OwnedValue::Object(entries))
+    } else if let Some(caps) = re.captures(&input) {
+        QueryResult::Owned(capture_object(&re, &caps))
     } else if optional {
         QueryResult::None
     } else {
         // jq returns empty object when no match
         QueryResult::Owned(OwnedValue::Object(IndexMap::new()))
     }
+}
+
+/// Extract named captures from an already-obtained `Captures` into a jq object.
+#[cfg(feature = "regex")]
+fn capture_object(re: &regex::Regex, caps: &regex::Captures) -> OwnedValue {
+    let mut entries = IndexMap::new();
+    for name in re.capture_names().flatten() {
+        if let Some(m) = caps.name(name) {
+            entries.insert(name.to_string(), OwnedValue::String(m.as_str().to_string()));
+        }
+    }
+    OwnedValue::Object(entries)
 }
 
 /// Builtin: sub(re; replacement; flags) - replace first match with flags
