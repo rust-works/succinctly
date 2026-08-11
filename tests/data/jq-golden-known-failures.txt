@@ -120,9 +120,6 @@
 # mere gaps. Each below is filed as its own issue with the verified
 # jq-vs-succinctly repro already in the issue body.
 regex_sub_g_global_replace     regex-flags   sub(...;...;"g") never does a global replace — #728
-regex_match_g_streams          regex-flags   match(...;"g") returns one array, not a stream — #729
-regex_match_g_zero_width       regex-flags   match(...;"g") doesn't stream and misses the trailing zero-width match — #729
-regex_capture_g_streams        regex-flags   capture(...;"g") returns only the first match, not a stream — #729
 regex_test_z_unknown_flag      regex-flags   unknown flag characters are silently accepted, not rejected — #730
 
 # Seeded by #716's date/time oracle-coverage sweep: the builtins had unit
