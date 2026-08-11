@@ -1701,6 +1701,15 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
         if args.raw_input {
             anyhow::bail!("--front-matter and --raw-input are incompatible");
         }
+        if args.front_matter == Some(FrontMatterMode::Extract) && args.inplace {
+            // `extract` never captures a body to reattach (only `process`
+            // does, see `apply_front_matter`), so `--inplace` would
+            // overwrite the file with just the transformed front matter,
+            // silently discarding everything after the closing fence.
+            anyhow::bail!(
+                "--front-matter=extract and --inplace are incompatible (would discard the file's body); use --front-matter=process instead"
+            );
+        }
         if args.front_matter == Some(FrontMatterMode::Process) {
             if args.slurp {
                 anyhow::bail!("--front-matter=process and --slurp are incompatible");

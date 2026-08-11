@@ -5860,6 +5860,33 @@ fn test_front_matter_process_inplace_rewrites_file() -> Result<()> {
     Ok(())
 }
 
+/// Regression test: `extract` mode captures no body to reattach (only
+/// `process` does), so `--front-matter=extract -i` used to overwrite the
+/// file with just the transformed front matter, silently discarding
+/// everything after the closing fence (#715 follow-up).
+#[test]
+fn test_front_matter_extract_rejects_inplace() -> Result<()> {
+    let mut input_file = NamedTempFile::new()?;
+    write!(input_file, "{FRONT_MATTER_FIXTURE}")?;
+    let original = std::fs::read_to_string(input_file.path())?;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .arg("yq")
+        .args(["--front-matter", "extract", "-i"])
+        .arg(".title = \"New\"")
+        .arg(input_file.path())
+        .stdin(Stdio::null())
+        .output()?;
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--inplace"), "stderr: {stderr}");
+
+    // The file must be left untouched, not partially overwritten.
+    let unchanged = std::fs::read_to_string(input_file.path())?;
+    assert_eq!(unchanged, original);
+    Ok(())
+}
+
 #[test]
 fn test_front_matter_no_fence_errors() -> Result<()> {
     let (_output, _stderr, code) =
