@@ -1409,6 +1409,23 @@ fn test_arithmetic_compare_cartesian_fanout_issue_768() -> Result<()> {
     assert_eq!(code, 0);
     assert_eq!(stdout.trim(), "[false,true,true]");
 
+    // A bare (non-array-wrapped) top-level comparison exercises a distinct
+    // code path from the array-wrapped assertions above: the CLI's default
+    // fast path evaluates a top-level `Expr::Compare` through
+    // `eval_generic.rs`'s own native arm (for cursor-context/perf reasons),
+    // not `eval.rs`'s `eval_compare` -- wrapping in `[...]` routes through
+    // array construction instead, which always hits the full evaluator. Both
+    // arms had the identical collapse-to-first bug and both needed fixing
+    // (#768); arithmetic has no such native arm in eval_generic.rs, so bare
+    // arithmetic worked correctly even before this fix.
+    let (stdout, _, code) = run_jq_full(&["-c", "(1,2,3) > 2"], Some("null"))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "false\nfalse\ntrue\n");
+
+    let (stdout, _, code) = run_jq_full(&["-c", ".[] > 1"], Some("[1,2,3]"))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "false\ntrue\ntrue\n");
+
     // Cartesian ordering when both sides are generators: right operand
     // outer, left operand inner (jq's actual order, verified against the
     // pinned oracle -- NOT the reverse `eval_boolean`/`and`/`or` uses).
