@@ -119,9 +119,6 @@
 # tests against the pinned jq oracle surfaced four distinct bugs rather than
 # mere gaps. Each below is filed as its own issue with the verified
 # jq-vs-succinctly repro already in the issue body.
-regex_test_s_single_line_dot   regex-flags   jq's s/m/p flags are inverted vs succinctly's — #727
-regex_test_m_multiline_dot     regex-flags   jq's s/m/p flags are inverted vs succinctly's — #727
-regex_test_p_both_modes        regex-flags   jq's s/m/p flags are inverted vs succinctly's — #727
 regex_sub_g_global_replace     regex-flags   sub(...;...;"g") never does a global replace — #728
 regex_match_g_streams          regex-flags   match(...;"g") returns one array, not a stream — #729
 regex_match_g_zero_width       regex-flags   match(...;"g") doesn't stream and misses the trailing zero-width match — #729

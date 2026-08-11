@@ -6054,17 +6054,38 @@ fn build_regex(pattern: &str, flags: Option<&str>) -> Result<regex::Regex, EvalE
 
     // Apply flags
     if let Some(flags) = flags {
-        let mut prefix = String::from("(?");
+        let mut case_insensitive = false;
+        let mut extended = false;
+        let mut dot_matches_newline = false; // jq's `m`/`p` -> Rust regex's `s`
         for c in flags.chars() {
             match c {
-                'i' => prefix.push('i'), // case insensitive
-                'x' => prefix.push('x'), // extended mode (ignore whitespace)
-                's' => prefix.push('s'), // single-line mode (. matches newline)
-                'm' => prefix.push('m'), // multi-line mode
-                'g' => {}                // global - handled at call site
-                'p' => {}                // PCRE mode - not fully supported
+                'i' => case_insensitive = true, // case insensitive
+                'x' => extended = true,         // extended mode (ignore whitespace)
+                // jq's `s` (oniguruma ONIG_OPTION_SINGLELINE) only affects
+                // ^/$ anchoring, which is already the default under jq's
+                // Perl-style syntax (and Rust regex's un-flagged default) —
+                // no native flag needed.
+                's' => {}
+                // jq's `m` (oniguruma ONIG_OPTION_MULTILINE) means dot
+                // matches newline ("dotall" in Perl/PCRE terms) — Rust
+                // regex's native `s` flag.
+                'm' => dot_matches_newline = true,
+                // `p` enables both s and m; s is a no-op here, so p reduces
+                // to the same effect as m.
+                'p' => dot_matches_newline = true,
+                'g' => {} // global - handled at call site
                 _ => {}
             }
+        }
+        let mut prefix = String::from("(?");
+        if case_insensitive {
+            prefix.push('i');
+        }
+        if extended {
+            prefix.push('x');
+        }
+        if dot_matches_newline {
+            prefix.push('s');
         }
         if prefix.len() > 2 {
             prefix.push(')');
@@ -24263,6 +24284,32 @@ mod tests {
         query!(br#""abc""#, r#"test("[0-9]+")"#,
             QueryResult::Owned(OwnedValue::Bool(b)) => {
                 assert!(!b);
+            }
+        );
+    }
+
+    #[cfg(feature = "regex")]
+    #[test]
+    fn test_regex_flags_s_m_p() {
+        // The #727 repro: jq's `s` (single-line mode) leaves dot NOT
+        // matching newline.
+        query!(br#""a\nb""#, r#"test("a.b";"s")"#,
+            QueryResult::Owned(OwnedValue::Bool(b)) => {
+                assert!(!b);
+            }
+        );
+
+        // jq's `m` (multi-line mode) makes dot match newline.
+        query!(br#""a\nb""#, r#"test("a.b";"m")"#,
+            QueryResult::Owned(OwnedValue::Bool(b)) => {
+                assert!(b);
+            }
+        );
+
+        // jq's `p` enables both s and m; dot still matches newline.
+        query!(br#""a\nb""#, r#"test("a.b";"p")"#,
+            QueryResult::Owned(OwnedValue::Bool(b)) => {
+                assert!(b);
             }
         );
     }
