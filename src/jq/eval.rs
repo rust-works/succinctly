@@ -24474,6 +24474,98 @@ mod tests {
     }
 
     #[test]
+    fn test_builtin_upper_in_propagates_source_error() {
+        query!(br"5", r#"IN(error("boom"))"#,
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "boom");
+            }
+        );
+    }
+
+    #[test]
+    fn test_builtin_upper_in_src_propagates_src_error() {
+        query!(br"5", r#"IN(error("boom"); 1)"#,
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "boom");
+            }
+        );
+    }
+
+    #[test]
+    fn test_builtin_upper_in_src_propagates_s_error() {
+        query!(br"5", r#"IN(1; error("boom"))"#,
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "boom");
+            }
+        );
+    }
+
+    #[test]
+    fn test_builtin_upper_index_propagates_non_iterable_input_error() {
+        // Single-arg `INDEX(idx_expr)` is `INDEX(.[]; idx_expr)`: on a
+        // non-iterable input, the implicit `.[]` errors before `idx_expr`
+        // is ever evaluated.
+        query!(br"5", "INDEX(.)",
+            QueryResult::Error(_) => {}
+        );
+    }
+
+    #[test]
+    fn test_builtin_upper_index_stream_propagates_stream_error() {
+        query!(br"5", r#"INDEX(error("boom"); .id)"#,
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "boom");
+            }
+        );
+    }
+
+    #[test]
+    fn test_builtin_upper_in_inside_user_defined_function() {
+        // Exercises function-call inlining (`expand_func_calls`/
+        // `substitute_func_param`) through the `IN(s)` builtin arg.
+        query!(br"5", "def apply(f): IN(f); apply(1,2,3,5)",
+            QueryResult::Owned(OwnedValue::Bool(b)) => {
+                assert!(b);
+            }
+        );
+    }
+
+    #[test]
+    fn test_builtin_upper_in_src_inside_user_defined_function() {
+        // Exercises function-call inlining through both `IN(src; s)` args.
+        query!(br"1", "def apply(a): IN(a; 1); apply(1,2,3)",
+            QueryResult::Owned(OwnedValue::Bool(b)) => {
+                assert!(b);
+            }
+        );
+    }
+
+    #[test]
+    fn test_builtin_upper_index_inside_user_defined_function() {
+        // Exercises function-call inlining through the `INDEX(idx_expr)` arg.
+        assert_eq!(
+            outputs(
+                br#"[{"id":1},{"id":2}]"#,
+                "def apply(g): INDEX(g); apply(.id)"
+            ),
+            [r#"{"1":{"id":1},"2":{"id":2}}"#]
+        );
+    }
+
+    #[test]
+    fn test_builtin_upper_index_stream_inside_user_defined_function() {
+        // Exercises function-call inlining through both `INDEX(stream;
+        // idx_expr)` args.
+        assert_eq!(
+            outputs(
+                br#"[{"id":1},{"id":2}]"#,
+                "def apply(g): INDEX(.[]; g); apply(.id)"
+            ),
+            [r#"{"1":{"id":1},"2":{"id":2}}"#]
+        );
+    }
+
+    #[test]
     fn test_builtin_getpath() {
         query!(br#"{"a": {"b": 42}}"#, r#"getpath(["a", "b"])"#,
             QueryResult::Owned(v) => {
