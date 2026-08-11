@@ -183,6 +183,12 @@ The implementation covers ~95% of jq functionality and is production-ready.
 - [x] `.a += value`, `-=`, `*=`, `/=`, `%=` - Compound assignment
 - [x] `.a //= value` - Alternative assignment
 - [x] `del(.a)` - Delete path
+- [x] `.a * .b` / `.a *= .b` - Recursive object merge (both jq and yq mode); on
+  arrays, replaces wholesale in yq mode (yq has no array-merge concept in jq
+  mode, matching real jq's error). yq mode also accepts combinable flag
+  suffixes (`*+`, `*?`, `*n`, `*d`, `*c`, e.g. `*=+d`) after `*`/`*=` that
+  control merge semantics — see [yq-language.md](yq-language.md#yq-specific-operators)
+  for the full flag table.
 
 ### User Functions
 - [x] `def name: body;`

@@ -5640,3 +5640,148 @@ fn test_key_comment_preserved_with_null_value_and_sort_keys_765() -> Result<()> 
     assert_eq!(out, "a: # comment on key\nb: 2\nz: 9\n");
     Ok(())
 }
+
+// ============================================================================
+// Merge-flag suffixes on `*`/`*=` (#713)
+// ============================================================================
+
+/// Issue #713's own repro: unflagged array `*=` used to error outright
+/// ("array (...) and array (...) cannot be multiplied") instead of doing
+/// yq's default "rhs replaces lhs wholesale".
+#[test]
+fn test_713_array_merge_assign_no_longer_errors() -> Result<()> {
+    let input = "a: [1, 2]\nb: [3, 4]\n";
+    let (output, code) = run_yq_stdin(".a *= .b", input, &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#"{"a":[3,4],"b":[3,4]}"#);
+
+    let (output, code) = run_yq_stdin(".a * .b", input, &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "[3,4]");
+
+    Ok(())
+}
+
+/// Issue #713's own repro of the *malformed* flags-before-`=` spelling
+/// (`*+=`, `*?=`). Real yq doesn't accept these either — flags belong after
+/// `=`, not before — so succinctly should still fail to parse them, just no
+/// longer with "unexpected character" (it now recognizes `*+`/`*?` as
+/// tokens, same as real yq, and fails downstream instead).
+#[test]
+fn test_713_malformed_flags_before_equals_still_rejected() -> Result<()> {
+    let (_, stderr, code) = run_yq_stdin_with_stderr(".a *+= .b", "a: [1, 2]\nb: [3, 4]\n", &[])?;
+    assert_ne!(code, 0);
+    assert!(
+        !stderr.contains("unexpected character '+'"),
+        "stderr: {stderr}"
+    );
+
+    let (_, stderr, code) =
+        run_yq_stdin_with_stderr(".a *?= .b", "a:\n  x: 1\nb:\n  x: 2\n  y: 3\n", &[])?;
+    assert_ne!(code, 0);
+    assert!(
+        !stderr.contains("unexpected character '?'"),
+        "stderr: {stderr}"
+    );
+
+    Ok(())
+}
+
+/// The correct in-place spellings put flags after `=`: `*=+`, `*=n`, `*=nd`, ...
+#[test]
+fn test_713_merge_flags_after_equals() -> Result<()> {
+    let (output, code) = run_yq_stdin(".a *=+ .b", "a: [1, 2]\nb: [3, 4]\n", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#"{"a":[1,2,3,4],"b":[3,4]}"#);
+
+    let (output, code) = run_yq_stdin(
+        ".a *=n .b",
+        "a:\n  thing: one\nb:\n  thing: two\n  missing: two\n",
+        &["-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(
+        output.trim(),
+        r#"{"a":{"thing":"one","missing":"two"},"b":{"thing":"two","missing":"two"}}"#
+    );
+
+    Ok(())
+}
+
+/// jq mode has no merge-flag syntax at all (real jq doesn't either) — this
+/// must not regress just because yq mode gained it.
+#[test]
+fn test_713_jq_mode_unaffected() -> Result<()> {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_succinctly"));
+    cmd.arg("jq")
+        .arg(".a * .b")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn()?;
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(br#"{"a":[1,2],"b":[3,4]}"#)?;
+    let output = child.wait_with_output()?;
+    assert_ne!(
+        output.status.code().unwrap_or(-1),
+        0,
+        "array * array must still error in jq mode"
+    );
+
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_succinctly"));
+    cmd.arg("jq")
+        .arg(".a *+ .b")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn()?;
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(br#"{"a":[1,2],"b":[3,4]}"#)?;
+    let output = child.wait_with_output()?;
+    assert_ne!(
+        output.status.code().unwrap_or(-1),
+        0,
+        "flag suffixes must still be unrecognized in jq mode"
+    );
+
+    Ok(())
+}
+
+/// A null (or absent, which evaluates to null) merge target is the most
+/// common way `*=n`/`*=?` get invoked in practice. `arith_mul` must route
+/// null operands through the same flag-gated merge machinery as a real
+/// container pair instead of short-circuiting to `null` before flags apply
+/// — otherwise `n`/`?` silently do nothing on a fresh/absent field, which is
+/// exactly the case #713's own examples lead with. Expected values
+/// cross-checked against real yq v4.53.3.
+#[test]
+fn test_713_merge_flags_on_null_or_absent_target() -> Result<()> {
+    // `n` on an explicit null target: writes the full rhs, same as a null
+    // nested field would.
+    let (output, code) = run_yq_stdin(
+        ".a *=n .b",
+        "a: null\nb: {x: 1, y: 2}\n",
+        &["-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#"{"a":{"x":1,"y":2},"b":{"x":1,"y":2}}"#);
+
+    // `?` on an absent target: never creates new fields, so it merges into
+    // an empty object and every field is blocked, leaving `a: {}`.
+    let (output, code) = run_yq_stdin(".a *=? .b", "b: {x: 1, y: 2}\n", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#"{"b":{"x":1,"y":2},"a":{}}"#);
+
+    // A null right operand is a no-op regardless of flags.
+    let (output, code) = run_yq_stdin(".a *=+ null", "a: [1, 2]\n", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#"{"a":[1,2]}"#);
+
+    Ok(())
+}

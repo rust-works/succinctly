@@ -216,17 +216,17 @@ echo '["a","b","c"]' | jq -r '@dsv(";")'        # Output: "a";"b";"c"
 
 The jq implementation supports assignment operators for modifying JSON in-place:
 
-| Operator   | Syntax               | Description                                          | Example                    |
-|------------|----------------------|------------------------------------------------------|----------------------------|
-| **=**      | `.path = value`      | Simple assignment                                    | `.a = 42`                  |
-| **\|=**    | `.path \|= filter`   | Update assignment (applies filter to current value)  | `.a \|= . + 1`             |
-| **+=**     | `.path += value`     | Compound add (equivalent to `.path \|= . + value`)   | `.count += 10`             |
-| **-=**     | `.path -= value`     | Compound subtract                                    | `.health -= 25`            |
-| ***=**     | `.path *= value`     | Compound multiply                                    | `.scale *= 2`              |
-| **/=**     | `.path /= value`     | Compound divide                                      | `.total /= 4`              |
-| **%=**     | `.path %= value`     | Compound modulo                                      | `.index %= 10`             |
-| **//=**    | `.path //= value`    | Alternative assignment (sets only if null/false)     | `.default //= "fallback"`  |
-| **del()**  | `del(.path)`         | Delete field or array element                        | `del(.temporary)`          |
+| Operator  | Syntax             | Description                                                    | Example                   |
+|-----------|--------------------|----------------------------------------------------------------|---------------------------|
+| **=**     | `.path = value`    | Simple assignment                                              | `.a = 42`                 |
+| **\|=**   | `.path \|= filter` | Update assignment (applies filter to current value)            | `.a \|= . + 1`            |
+| **+=**    | `.path += value`   | Compound add (equivalent to `.path \|= . + value`)             | `.count += 10`            |
+| **-=**    | `.path -= value`   | Compound subtract                                              | `.health -= 25`           |
+| ***=**    | `.path *= value`   | Compound multiply, or recursive object/array merge (see below) | `.scale *= 2`             |
+| **/=**    | `.path /= value`   | Compound divide                                                | `.total /= 4`             |
+| **%=**    | `.path %= value`   | Compound modulo                                                | `.index %= 10`            |
+| **//=**   | `.path //= value`  | Alternative assignment (sets only if null/false)               | `.default //= "fallback"` |
+| **del()** | `del(.path)`       | Delete field or array element                                  | `del(.temporary)`         |
 
 ```bash
 # Examples
@@ -237,6 +237,39 @@ echo '{"a": null}' | succinctly jq '.a //= "default"'  # {"a": "default"}
 echo '{"a": 1, "b": 2}' | succinctly jq 'del(.a)'   # {"b": 2}
 echo '[1, 2, 3]' | succinctly jq '.[] |= . * 2'     # [2, 4, 6]
 ```
+
+`*`/`*=` on two objects recursively merges them (matching values are merged if both are objects, otherwise the right side wins) — this works in both `jq` and `yq` mode, since real jq does the same. On two arrays, plain `*`/`*=` replaces the left side wholesale with the right (yq mode only; `succinctly jq` still errors on array `*`, matching real jq, which has no array-merge concept):
+
+```bash
+echo '{"a": {"x": 1}, "b": {"x": 2, "y": 3}}' | succinctly jq '.a *= .b'  # {"a":{"x":2,"y":3},...}
+printf 'a: [1, 2]\nb: [3, 4]\n' | succinctly yq '.a *= .b'               # a: [3, 4]
+```
+
+### yq Merge-Flag Suffixes on `*`/`*=` (yq mode only)
+
+Real yq extends `*`/`*=` with combinable flag suffixes that control merge semantics. They go directly after `*` for the plain (non-assign) form, or after `*=` for the in-place form — never between `*` and `=` (`.a *+= .b` is not valid; the flags belong after the `=`):
+
+| Flag | Meaning                                                                                    |
+|------|--------------------------------------------------------------------------------------------|
+| `+`  | Append arrays instead of replacing them                                                    |
+| `?`  | Only update fields/indices that already exist; never create new                            |
+| `n`  | Only write fields/indices that don't already exist (or are `null`)                         |
+| `d`  | Deep-merge arrays: treat them like objects, merging by index                               |
+| `c`  | Clobber custom tags (parsed but a no-op today — no tag data exists to preserve or clobber) |
+
+Flags combine freely, in any order (`*+d` and `*d+` are identical):
+
+```bash
+printf 'a: [1, 2]\nb: [3, 4]\n' | succinctly yq '.a *=+ .b'   # a: [1, 2, 3, 4]  (append)
+printf 'a:\n  x: 1\nb:\n  x: 2\n  y: 3\n' | succinctly yq '.a *=? .b'  # a: {x: 2}        (only-existing)
+printf 'a:\n  x: 1\nb:\n  x: 2\n  y: 3\n' | succinctly yq '.a *=n .b'  # a: {x: 1, y: 3}  (only-new)
+```
+
+`?`/`n` propagate through every nesting depth: a parent key that already exists still gets recursed into so its own new children can be added or blocked individually — the gate never blocks recursion into a matching nested object/array itself, only the leaf writes within it. Combining `?` and `n` is an AND of both gates (net effect: only touch a field that already exists and is currently `null`).
+
+`+`/`d` combined on the same array is a documented simplification: real yq has a surprising, untested-upstream double-effect here; succinctly makes `+` take clean priority (pure append, `d` ignored) instead.
+
+`null` acts as an empty container on either side of a yq-mode merge (jq mode keeps plain `null * x = null`): a null/absent *left* operand merges as if starting from `{}`/`[]` (`.a *=n .b` on `a: null` writes the full `.b` in; `.a *=? .b` on an absent `.a` leaves `a: {}`, blocked field-by-field rather than staying `null`), and a null *right* operand is always a no-op (`.a *= null` leaves `.a` untouched).
 
 ### jq Position-Based Navigation (succinctly extension)
 

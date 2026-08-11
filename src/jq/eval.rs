@@ -57,6 +57,15 @@ pub trait EvalSemantics: Copy + Default {
     /// (`LazySeq`'s buffered `Instruction`s) that can't carry `Self` as a type
     /// parameter.
     const TAG: EvalTag;
+    /// If true, unflagged array `*`/`*=` replaces/merges instead of erroring (yq).
+    /// If false, array * array is a type error (jq) — real jq has no array-merge concept.
+    const ARRAY_MULTIPLY_MERGES: bool;
+    /// If true, `null` acts as an empty container on either side of `*`/`*=`:
+    /// a null right operand is a no-op (left passes through unchanged), and a
+    /// null left operand merging with an object/array merges as if starting
+    /// from `{}`/`[]` (yq). If false, any null operand short-circuits to
+    /// `null` (jq).
+    const NULL_MERGES_AS_EMPTY: bool;
 }
 
 /// jq-compatible evaluation semantics (default).
@@ -73,6 +82,8 @@ impl EvalSemantics for JqSemantics {
     const NEGATIVE_INDEX_IN_HAS: bool = false;
     const MOD_TRUNCATES_FLOATS: bool = true;
     const TAG: EvalTag = EvalTag::Jq;
+    const ARRAY_MULTIPLY_MERGES: bool = false;
+    const NULL_MERGES_AS_EMPTY: bool = false;
 }
 
 /// yq-compatible evaluation semantics.
@@ -89,13 +100,15 @@ impl EvalSemantics for YqSemantics {
     const NEGATIVE_INDEX_IN_HAS: bool = true;
     const MOD_TRUNCATES_FLOATS: bool = false;
     const TAG: EvalTag = EvalTag::Yq;
+    const ARRAY_MULTIPLY_MERGES: bool = true;
+    const NULL_MERGES_AS_EMPTY: bool = true;
 }
 
 use crate::json::light::{JsonCursor, JsonElements, JsonFields, StandardJson};
 
 use super::expr::{
-    ArithOp, AssignOp, Builtin, CompareOp, Expr, FormatType, Literal, ObjectEntry, ObjectKey,
-    Pattern, StringPart,
+    ArithOp, AssignOp, Builtin, CompareOp, Expr, FormatType, Literal, MergeFlags, ObjectEntry,
+    ObjectKey, Pattern, StringPart,
 };
 use super::value::{
     cmp_f64, format_number_jq_compat, is_nan_sentinel, numeric_repr_cmp, NumberRepr, OwnedValue,
@@ -1358,7 +1371,7 @@ fn eval_arithmetic<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let result = match op {
         ArithOp::Add => arith_add::<S>(left_val, right_val),
         ArithOp::Sub => arith_sub::<S>(left_val, right_val),
-        ArithOp::Mul => arith_mul::<S>(left_val, right_val),
+        ArithOp::Mul(flags) => arith_mul::<S>(left_val, right_val, flags),
         ArithOp::Div => arith_div::<S>(left_val, right_val),
         ArithOp::Mod => arith_mod::<S>(left_val, right_val),
     };
@@ -1453,6 +1466,7 @@ fn arith_sub<S: EvalSemantics>(
 fn arith_mul<S: EvalSemantics>(
     left: OwnedValue,
     right: OwnedValue,
+    flags: MergeFlags,
 ) -> Result<OwnedValue, EvalError> {
     let (left, right) = (left.into_plain_number(), right.into_plain_number());
     match (left, right) {
@@ -1482,9 +1496,39 @@ fn arith_mul<S: EvalSemantics>(
                 Ok(OwnedValue::String(s.repeat(n as usize)))
             }
         }
-        // Object recursive merge
-        (OwnedValue::Object(a), OwnedValue::Object(b)) => {
-            Ok(OwnedValue::Object(merge_objects(a, b)))
+        // Object recursive merge (yq's `*`/`*=` merge operator; also jq's
+        // plain object multiply, which has always done the same thing).
+        // Uses merge_existing (not merge_values) because `a`/`b` are the
+        // direct `.path *= value` assignment target: `a` already "exists"
+        // as a concrete value, so `n`-gating must consider it (see
+        // merge_existing) — unlike the null-derived-empty-container arms
+        // below, which merge_values still handles unconditionally.
+        (a @ OwnedValue::Object(_), b @ OwnedValue::Object(_)) => Ok(merge_existing(a, b, flags)),
+        // Array merge is yq-only: real jq has no array-merge concept and
+        // errors here too (falls through to the generic error arm below).
+        // Unflagged: rhs replaces lhs wholesale. `+`/`d` flags change that
+        // (see merge_values) — flags are unreachable in jq-mode ASTs, so
+        // this arm and its flag handling only ever fire for yq.
+        (a @ OwnedValue::Array(_), b @ OwnedValue::Array(_)) if S::ARRAY_MULTIPLY_MERGES => {
+            Ok(merge_existing(a, b, flags))
+        }
+        // yq: null is an empty container for merge purposes. A null right
+        // operand is a no-op regardless of flags (real yq: `x *= null`
+        // leaves `x` untouched, whatever `x` is). A null left operand
+        // merging with an object/array merges as if it started from
+        // `{}`/`[]`, routing through the same merge_values() call as a real
+        // container pair — so `?`/`n` gating (which only takes effect once
+        // merge_values recurses into positions) behaves exactly as if the
+        // target already existed as an empty container. This is what makes
+        // the merge-flag suffixes (#713) work on a top-level target that's
+        // `null` or entirely absent (`.a` on a missing key evaluates to
+        // `null`), not just on nested fields within an existing container.
+        (left, OwnedValue::Null) if S::NULL_MERGES_AS_EMPTY => Ok(left),
+        (OwnedValue::Null, b @ OwnedValue::Object(_)) if S::NULL_MERGES_AS_EMPTY => {
+            Ok(merge_values(OwnedValue::Object(IndexMap::new()), b, flags))
+        }
+        (OwnedValue::Null, b @ OwnedValue::Array(_)) if S::NULL_MERGES_AS_EMPTY => {
+            Ok(merge_values(OwnedValue::Array(Vec::new()), b, flags))
         }
         // null * x = null
         (OwnedValue::Null, _) | (_, OwnedValue::Null) => Ok(OwnedValue::Null),
@@ -1492,19 +1536,146 @@ fn arith_mul<S: EvalSemantics>(
     }
 }
 
-/// Recursively merge two objects.
-fn merge_objects(
+/// Merge two values for `*`/`*=` where `right` merges into a position
+/// synthesized to stand in for an absent/null `left` (the
+/// `NULL_MERGES_AS_EMPTY` arms of `arith_mul`) — so unlike [`merge_existing`],
+/// there is no real prior value to gate `n` against. Matching containers
+/// (`Object`+`Object`, or `Array`+`Array` under `d` without `+`) merge
+/// structurally, recursing into positions gated individually by
+/// [`merge_position`]; anything else is a plain leaf replace.
+fn merge_values(left: OwnedValue, right: OwnedValue, flags: MergeFlags) -> OwnedValue {
+    match (left, right) {
+        (OwnedValue::Object(a), OwnedValue::Object(b)) => {
+            OwnedValue::Object(merge_object_fields(a, b, flags))
+        }
+        (OwnedValue::Array(a), OwnedValue::Array(b))
+            if flags.deep_merge_arrays && !flags.append_arrays =>
+        {
+            OwnedValue::Array(merge_arrays_by_index(a, b, flags))
+        }
+        (existing, incoming) => merge_leaf(existing, incoming, flags),
+    }
+}
+
+/// The terminal case of a merge: `existing` and `incoming` are not a
+/// matching container pair we'd recurse into, so decide the value outright.
+/// `+` makes two arrays concatenate; everything else is a plain replace
+/// (`incoming` wins) — this is also yq's default for unflagged arrays.
+fn merge_leaf(existing: OwnedValue, incoming: OwnedValue, flags: MergeFlags) -> OwnedValue {
+    match (existing, incoming) {
+        (OwnedValue::Array(mut a), OwnedValue::Array(b)) if flags.append_arrays => {
+            a.extend(b);
+            OwnedValue::Array(a)
+        }
+        (_, incoming) => incoming,
+    }
+}
+
+/// Merge `incoming` into a position known to already hold `existing` —
+/// shared by [`merge_position`] (a nested field/index reached via
+/// recursion) and `arith_mul`'s top-level `Object`/`Array` arms (the direct
+/// `.path *= value` assignment target, which already "exists" as a concrete
+/// value once the `NULL_MERGES_AS_EMPTY` absent/null case has been ruled
+/// out). A matching container pair always recurses structurally regardless
+/// of `?`/`n` — those flags only gate genuine leaf writes, not whether an
+/// existing nested container gets walked. This is what makes `n`/`?`
+/// propagate correctly through nested merges: a parent key that already
+/// exists still gets recursed into, so *its* new children can be added (or
+/// blocked) individually.
+fn merge_existing(existing: OwnedValue, incoming: OwnedValue, flags: MergeFlags) -> OwnedValue {
+    match (existing, incoming) {
+        (OwnedValue::Object(a), OwnedValue::Object(b)) => {
+            OwnedValue::Object(merge_object_fields(a, b, flags))
+        }
+        (OwnedValue::Array(a), OwnedValue::Array(b))
+            if flags.deep_merge_arrays && !flags.append_arrays =>
+        {
+            OwnedValue::Array(merge_arrays_by_index(a, b, flags))
+        }
+        (existing, incoming) => {
+            // `n`: only write if the existing value is already null. `?`
+            // never blocks here — it only blocks brand-new positions, and
+            // `existing` is already known to be present.
+            if flags.only_new && !matches!(existing, OwnedValue::Null) {
+                existing
+            } else {
+                merge_leaf(existing, incoming, flags)
+            }
+        }
+    }
+}
+
+/// Decide the merged value for one position (an object field or array
+/// index) of a `*`/`*=` merge, honoring `?`/`n` gating. `existing` is
+/// `None` when the position isn't present in `left` yet. Returns `None` to
+/// mean "leave `left` unchanged here" (blocked by `?`), `Some(v)` to mean
+/// "set it to `v`".
+///
+/// `only_existing_applies` scopes `?` to object fields: real yq's `?` never
+/// blocks creating a brand-new *array* index, only a brand-new *object*
+/// key — so callers merging array positions ([`merge_arrays_by_index`])
+/// pass `false`, while object-field callers ([`merge_object_fields`]) pass
+/// `true`.
+fn merge_position(
+    existing: Option<OwnedValue>,
+    incoming: OwnedValue,
+    flags: MergeFlags,
+    only_existing_applies: bool,
+) -> Option<OwnedValue> {
+    match existing {
+        None => {
+            if flags.only_existing && only_existing_applies {
+                None
+            } else {
+                Some(incoming)
+            }
+        }
+        Some(existing) => Some(merge_existing(existing, incoming, flags)),
+    }
+}
+
+/// Merge `right`'s fields into `left`, one position at a time via
+/// [`merge_position`]. Uses the `Entry` API rather than
+/// `left.get(&k).cloned()` + `left.insert(..)` so an existing value that's
+/// itself a large nested container moves into the merge instead of being
+/// deep-cloned first.
+fn merge_object_fields(
     mut left: IndexMap<String, OwnedValue>,
     right: IndexMap<String, OwnedValue>,
+    flags: MergeFlags,
 ) -> IndexMap<String, OwnedValue> {
     for (k, v) in right {
-        match (left.get(&k).cloned(), v) {
-            (Some(OwnedValue::Object(a)), OwnedValue::Object(b)) => {
-                left.insert(k, OwnedValue::Object(merge_objects(a, b)));
+        match left.entry(k) {
+            indexmap::map::Entry::Occupied(mut e) => {
+                let existing = e.insert(OwnedValue::Null);
+                e.insert(merge_existing(existing, v, flags));
             }
-            (_, v) => {
-                left.insert(k, v);
+            indexmap::map::Entry::Vacant(e) => {
+                if let Some(new_value) = merge_position(None, v, flags, true) {
+                    e.insert(new_value);
+                }
             }
+        }
+    }
+    left
+}
+
+/// Deep-merge two arrays by index (the `d` flag): treats the array like an
+/// object keyed by index, one position at a time via [`merge_existing`].
+/// Indices only present in `right` extend `left` — real yq's `?` never
+/// blocks this (see [`merge_position`]'s doc comment), so extension is
+/// unconditional here rather than routed through `merge_position`.
+fn merge_arrays_by_index(
+    mut left: Vec<OwnedValue>,
+    right: Vec<OwnedValue>,
+    flags: MergeFlags,
+) -> Vec<OwnedValue> {
+    for (i, v) in right.into_iter().enumerate() {
+        if i < left.len() {
+            let existing = core::mem::replace(&mut left[i], OwnedValue::Null);
+            left[i] = merge_existing(existing, v, flags);
+        } else {
+            left.push(v);
         }
     }
     left
@@ -7582,7 +7753,7 @@ fn eval_compound_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let arith_op = match op {
         AssignOp::Add => ArithOp::Add,
         AssignOp::Sub => ArithOp::Sub,
-        AssignOp::Mul => ArithOp::Mul,
+        AssignOp::Mul(flags) => ArithOp::Mul(flags),
         AssignOp::Div => ArithOp::Div,
         AssignOp::Mod => ArithOp::Mod,
     };
@@ -18496,7 +18667,7 @@ fn eval_func_call<'a, W: Clone + AsRef<[u64]>>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::jq::parse;
+    use crate::jq::{parse, parse_with_mode, ParserMode};
     use crate::json::JsonIndex;
 
     /// Helper macro to run a query and match the result.
@@ -18507,6 +18678,25 @@ mod tests {
             let cursor = index.root(json_bytes);
             let expr = parse($expr).unwrap();
             match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+                $pattern $(if $guard)? => $body,
+                other => panic!("unexpected result: {:?}", other),
+            }
+        }};
+    }
+
+    /// Like `query!`, but parses in `ParserMode::Yq` and evaluates with
+    /// `YqSemantics` — for exercising yq-only syntax/semantics such as the
+    /// `*`/`*=` merge-flag suffixes (#713). The document is still built via
+    /// `JsonIndex`: arithmetic/merge operate purely on `OwnedValue` after
+    /// document conversion, so JSON input exercises the same code path YAML
+    /// input would (see `eval_generic.rs`'s `to_owned` conversion).
+    macro_rules! yq_query {
+        ($json:expr, $expr:expr, $pattern:pat $(if $guard:expr)? => $body:expr) => {{
+            let json_bytes: &[u8] = $json;
+            let index = JsonIndex::build(json_bytes);
+            let cursor = index.root(json_bytes);
+            let expr = parse_with_mode($expr, ParserMode::Yq).unwrap();
+            match eval::<Vec<u64>, YqSemantics>(&expr, cursor) {
                 $pattern $(if $guard)? => $body,
                 other => panic!("unexpected result: {:?}", other),
             }
@@ -19179,6 +19369,239 @@ mod tests {
         // String repetition
         query!(br#"{"s": "ab", "n": 3}"#, ".s * .n",
             QueryResult::Owned(OwnedValue::String(s)) if s == "ababab" => {}
+        );
+
+        // Object recursive merge (already worked pre-#713, but was untested).
+        query!(br#"{"a": {"x": 1}, "b": {"x": 2, "y": 3}}"#, ".a * .b",
+            QueryResult::Owned(OwnedValue::Object(o)) => {
+                assert_eq!(o.get("x"), Some(&OwnedValue::Int(2)));
+                assert_eq!(o.get("y"), Some(&OwnedValue::Int(3)));
+            }
+        );
+
+        // Array * array is a type error in jq (no array-merge concept) —
+        // matches real jq (#713).
+        query!(br#"{"a": [1, 2], "b": [3, 4]}"#, ".a * .b",
+            QueryResult::Error(_) => {}
+        );
+    }
+
+    #[test]
+    fn test_yq_merge_flags() {
+        // Unflagged array `*`/`*=` is yq-only: rhs replaces lhs wholesale,
+        // instead of jq's type error (#713).
+        yq_query!(br#"{"a": [1, 2], "b": [3, 4]}"#, ".a * .b",
+            QueryResult::Owned(OwnedValue::Array(a)) => {
+                assert_eq!(a, vec![OwnedValue::Int(3), OwnedValue::Int(4)]);
+            }
+        );
+        yq_query!(br#"{"a": [1, 2], "b": [3, 4]}"#, ".a *= .b",
+            QueryResult::Owned(OwnedValue::Object(o)) => {
+                assert_eq!(o.get("a"), Some(&OwnedValue::Array(vec![OwnedValue::Int(3), OwnedValue::Int(4)])));
+            }
+        );
+
+        // `+`: append arrays instead of replacing.
+        yq_query!(br#"{"a": [1, 2], "b": [3, 4]}"#, ".a *=+ .b",
+            QueryResult::Owned(OwnedValue::Object(o)) => {
+                assert_eq!(
+                    o.get("a"),
+                    Some(&OwnedValue::Array(vec![
+                        OwnedValue::Int(1), OwnedValue::Int(2), OwnedValue::Int(3), OwnedValue::Int(4),
+                    ]))
+                );
+            }
+        );
+
+        // `n`: only write fields that don't already exist (or are null).
+        yq_query!(
+            br#"{"a": {"thing": "one", "cat": "frog"}, "b": {"missing": "two", "thing": "two"}}"#,
+            ".a *=n .b",
+            QueryResult::Owned(OwnedValue::Object(o)) => {
+                let OwnedValue::Object(a) = o.get("a").unwrap() else { panic!("expected object") };
+                assert_eq!(a.get("thing"), Some(&OwnedValue::String("one".into())));
+                assert_eq!(a.get("cat"), Some(&OwnedValue::String("frog".into())));
+                assert_eq!(a.get("missing"), Some(&OwnedValue::String("two".into())));
+            }
+        );
+
+        // `?`: only update fields that already exist.
+        yq_query!(
+            br#"{"a": {"thing": "one", "cat": "frog"}, "b": {"missing": "two", "thing": "two"}}"#,
+            ".a *=? .b",
+            QueryResult::Owned(OwnedValue::Object(o)) => {
+                let OwnedValue::Object(a) = o.get("a").unwrap() else { panic!("expected object") };
+                assert_eq!(a.get("thing"), Some(&OwnedValue::String("two".into())));
+                assert_eq!(a.get("cat"), Some(&OwnedValue::String("frog".into())));
+                assert_eq!(a.get("missing"), None);
+            }
+        );
+
+        // `?` + `n` together: independent ANDed gates — net effect is "only
+        // touch a field that already exists and is currently null".
+        yq_query!(
+            br#"{"a": {"thing": null, "cat": "frog"}, "b": {"missing": "two", "thing": "two"}}"#,
+            ".a *=?n .b",
+            QueryResult::Owned(OwnedValue::Object(o)) => {
+                let OwnedValue::Object(a) = o.get("a").unwrap() else { panic!("expected object") };
+                assert_eq!(a.get("thing"), Some(&OwnedValue::String("two".into())));
+                assert_eq!(a.get("cat"), Some(&OwnedValue::String("frog".into())));
+                assert_eq!(a.get("missing"), None);
+            }
+        );
+
+        // `n` + `+` together: `n` is checked first — if a field already
+        // exists (and is non-null), `+` never fires ("no effect").
+        yq_query!(
+            br#"{"a": {"thing": [1, 2]}, "b": {"thing": [3, 4], "another": [1]}}"#,
+            ".a *=n+ .b",
+            QueryResult::Owned(OwnedValue::Object(o)) => {
+                let OwnedValue::Object(a) = o.get("a").unwrap() else { panic!("expected object") };
+                assert_eq!(a.get("thing"), Some(&OwnedValue::Array(vec![OwnedValue::Int(1), OwnedValue::Int(2)])));
+                assert_eq!(a.get("another"), Some(&OwnedValue::Array(vec![OwnedValue::Int(1)])));
+            }
+        );
+
+        // `d`: deep-merge arrays by index, like objects keyed by index.
+        // Extra rhs indices extend lhs; extra lhs indices are untouched.
+        yq_query!(br#"{"a": [1, 2, 3], "b": [10, 20]}"#, ".a *=d .b",
+            QueryResult::Owned(OwnedValue::Object(o)) => {
+                assert_eq!(
+                    o.get("a"),
+                    Some(&OwnedValue::Array(vec![OwnedValue::Int(10), OwnedValue::Int(20), OwnedValue::Int(3)]))
+                );
+            }
+        );
+        yq_query!(br#"{"a": [1, 2], "b": [10, 20, 30]}"#, ".a *=d .b",
+            QueryResult::Owned(OwnedValue::Object(o)) => {
+                assert_eq!(
+                    o.get("a"),
+                    Some(&OwnedValue::Array(vec![OwnedValue::Int(10), OwnedValue::Int(20), OwnedValue::Int(30)]))
+                );
+            }
+        );
+
+        // `n` + `d`: field-existence gating propagates into the deep array
+        // merge at the object level within each matched index.
+        yq_query!(
+            br#"{"a": [{"thing": "one"}], "b": [{"missing": "two", "thing": "two"}]}"#,
+            ".a *=nd .b",
+            QueryResult::Owned(OwnedValue::Object(o)) => {
+                let OwnedValue::Array(a) = o.get("a").unwrap() else { panic!("expected array") };
+                assert_eq!(a.len(), 1);
+                let OwnedValue::Object(elem) = &a[0] else { panic!("expected object") };
+                assert_eq!(elem.get("thing"), Some(&OwnedValue::String("one".into())));
+                assert_eq!(elem.get("missing"), Some(&OwnedValue::String("two".into())));
+            }
+        );
+
+        // `n`/`?` propagate through every nesting depth, not just the top
+        // level: a parent key that already exists still gets recursed into
+        // so its own new children can be added (the bug this test guards
+        // against: gating that blocks recursion into a matching container
+        // entirely, rather than only gating leaf writes within it).
+        yq_query!(
+            br#"{"a": {"inner": {"thing": "one", "cat": "frog"}}, "b": {"inner": {"missing": "two", "thing": "two"}}}"#,
+            ".a *=n .b",
+            QueryResult::Owned(OwnedValue::Object(o)) => {
+                let OwnedValue::Object(a) = o.get("a").unwrap() else { panic!("expected object") };
+                let OwnedValue::Object(inner) = a.get("inner").unwrap() else { panic!("expected object") };
+                assert_eq!(inner.get("thing"), Some(&OwnedValue::String("one".into())));
+                assert_eq!(inner.get("cat"), Some(&OwnedValue::String("frog".into())));
+                assert_eq!(inner.get("missing"), Some(&OwnedValue::String("two".into())));
+            }
+        );
+
+        // `c` is parsed but currently has no observable effect (no tag data
+        // exists to clobber or preserve) — it must not error or otherwise
+        // change the merge result.
+        yq_query!(br#"{"a": {"x": 1}, "b": {"x": 2, "y": 3}}"#, ".a *=c .b",
+            QueryResult::Owned(OwnedValue::Object(o)) => {
+                let OwnedValue::Object(a) = o.get("a").unwrap() else { panic!("expected object") };
+                assert_eq!(a.get("x"), Some(&OwnedValue::Int(2)));
+                assert_eq!(a.get("y"), Some(&OwnedValue::Int(3)));
+            }
+        );
+
+        // `+` + `d` together: a deliberate, documented simplification.
+        // Real yq's own combined behavior here is an undocumented,
+        // untested-upstream quirk (both a whole-array append AND a
+        // per-index deep-merge happen). We make `+` take clean priority
+        // over `d` instead — pure append, no combined effect.
+        yq_query!(
+            br#"{"a": [{"name": "fred", "age": 12}, {"name": "bob", "age": 32}], "b": [{"name": "fred", "age": 34}]}"#,
+            ".a *=+d .b",
+            QueryResult::Owned(OwnedValue::Object(o)) => {
+                let OwnedValue::Array(a) = o.get("a").unwrap() else { panic!("expected array") };
+                assert_eq!(a.len(), 3, "expected pure append (2 + 1 elements), got {a:?}");
+            }
+        );
+    }
+
+    #[test]
+    fn test_yq_merge_flags_null_or_absent_target() {
+        // A null (or absent, which evaluates to null via `.a`) merge target
+        // is the most common way to invoke `*=n`/`*=?` in practice — e.g.
+        // "add this key only if it's not already set". `arith_mul`'s null
+        // handling must route through the same flag-gated merge machinery
+        // as a real container pair, not short-circuit to `null` before
+        // flags ever apply. All expected values here were cross-checked
+        // against real yq v4.53.3.
+
+        // `n` on a null target: null counts as "doesn't exist or is null",
+        // so the full rhs is written in (matches a null nested field).
+        yq_query!(br#"{"a": null, "b": {"x": 1, "y": 2}}"#, ".a *=n .b",
+            QueryResult::Owned(OwnedValue::Object(o)) => {
+                let OwnedValue::Object(a) = o.get("a").unwrap() else { panic!("expected object") };
+                assert_eq!(a.get("x"), Some(&OwnedValue::Int(1)));
+                assert_eq!(a.get("y"), Some(&OwnedValue::Int(2)));
+            }
+        );
+
+        // `?` on an absent target: `.a` evaluates to null (there's no `a`
+        // key at all), and `?` never creates new fields — so merging
+        // recurses into an empty object and every field is blocked,
+        // leaving `a: {}` (not `a: null`, and not the full rhs).
+        yq_query!(br#"{"b": {"x": 1, "y": 2}}"#, ".a *=? .b",
+            QueryResult::Owned(OwnedValue::Object(o)) => {
+                assert_eq!(o.get("a"), Some(&OwnedValue::Object(IndexMap::new())));
+            }
+        );
+
+        // Unflagged `*=` on a null target still merges in the full rhs
+        // (null is transparent, not a hard stop).
+        yq_query!(br#"{"a": null, "b": {"x": 1, "y": 2}}"#, ".a *= .b",
+            QueryResult::Owned(OwnedValue::Object(o)) => {
+                let OwnedValue::Object(a) = o.get("a").unwrap() else { panic!("expected object") };
+                assert_eq!(a.get("x"), Some(&OwnedValue::Int(1)));
+                assert_eq!(a.get("y"), Some(&OwnedValue::Int(2)));
+            }
+        );
+
+        // A null *right* operand is a no-op: the left is returned
+        // untouched, regardless of flags.
+        yq_query!(br#"{"a": {"x": 1}}"#, ".a *= null",
+            QueryResult::Owned(OwnedValue::Object(o)) => {
+                let OwnedValue::Object(a) = o.get("a").unwrap() else { panic!("expected object") };
+                assert_eq!(a.get("x"), Some(&OwnedValue::Int(1)));
+            }
+        );
+        yq_query!(br#"{"a": [1, 2]}"#, ".a *=+ null",
+            QueryResult::Owned(OwnedValue::Object(o)) => {
+                assert_eq!(
+                    o.get("a"),
+                    Some(&OwnedValue::Array(vec![OwnedValue::Int(1), OwnedValue::Int(2)]))
+                );
+            }
+        );
+
+        // jq mode is unaffected: null is still a hard `null` result on
+        // either side, matching jq mode's pre-existing (non-merge) behavior.
+        query!(br#"{"a": null, "b": {"x": 1}}"#, ".a * .b",
+            QueryResult::Owned(OwnedValue::Null) => {}
+        );
+        query!(br#"{"a": {"x": 1}}"#, ".a * null",
+            QueryResult::Owned(OwnedValue::Null) => {}
         );
     }
 
