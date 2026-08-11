@@ -24886,6 +24886,160 @@ mod tests {
 
     #[cfg(feature = "regex")]
     #[test]
+    fn test_regex_dollar_trailing_newline_exception() {
+        // #799 repro, verified against pinned jq-1.7.1: `$` matches at the
+        // absolute end of the string, or immediately before a single
+        // trailing `\n` — but a *second* trailing `\n` disqualifies it.
+        query!(br#""a\n""#, r#"test("a$")"#,
+            QueryResult::Owned(OwnedValue::Bool(b)) => assert!(b)
+        );
+        query!(br#""a\n\n""#, r#"test("a$")"#,
+            QueryResult::Owned(OwnedValue::Bool(b)) => assert!(!b)
+        );
+        query!(br#""a\nb\n""#, r#"test("b$")"#,
+            QueryResult::Owned(OwnedValue::Bool(b)) => assert!(b)
+        );
+
+        // `^` gets no symmetric leading-newline exception in real jq.
+        query!(br#""\na""#, r#"test("^a")"#,
+            QueryResult::Owned(OwnedValue::Bool(b)) => assert!(!b)
+        );
+
+        // The exception is genuinely zero-width — it must not consume the
+        // trailing `\n` into the match/replacement.
+        query!(br#""a\n""#, r#"sub("a$"; "X")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => assert_eq!(s, "X\n")
+        );
+        query!(br#""a\n""#, r#"gsub("$"; "X")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => assert_eq!(s, "aX\nX")
+        );
+
+        // Greedy quantifier before `$`: only the trimmed-view search can
+        // find this (the full view can never reach absolute end, since
+        // `.` doesn't match `\n`).
+        query!(br#""a\n""#, r#"match("a.*$")"#,
+            QueryResult::Owned(OwnedValue::Object(obj)) => {
+                assert_eq!(obj.get("string"), Some(&OwnedValue::String("a".to_string())));
+                assert_eq!(obj.get("offset"), Some(&OwnedValue::Int(0)));
+                assert_eq!(obj.get("length"), Some(&OwnedValue::Int(1)));
+            }
+        );
+
+        // Global iteration finds both the trailing-newline-exception
+        // position and the absolute-end position as independent matches.
+        query!(br#""aaa\n""#, r#"[match("a*$";"g")]"#,
+            QueryResult::Owned(OwnedValue::Array(matches)) => {
+                assert_eq!(matches.len(), 3);
+                let offset = |v: &OwnedValue| match v {
+                    OwnedValue::Object(o) => o.get("offset").cloned(),
+                    _ => None,
+                };
+                assert_eq!(offset(&matches[0]), Some(OwnedValue::Int(0)));
+                assert_eq!(offset(&matches[1]), Some(OwnedValue::Int(3)));
+                assert_eq!(offset(&matches[2]), Some(OwnedValue::Int(4)));
+            }
+        );
+
+        // A user-written inline `(?m)` must keep its own (already correct,
+        // native Rust) multiline semantics untouched by this fix.
+        query!(br#""a\nb\n\n""#, r#"test("(?m)b$")"#,
+            QueryResult::Owned(OwnedValue::Bool(b)) => assert!(b)
+        );
+    }
+
+    #[cfg(feature = "regex")]
+    #[test]
+    fn test_regex_zero_width_after_nonempty_match() {
+        // Bonus fix alongside #799: scan/gsub/splits previously used
+        // find_iter/replace_all/split directly, which suppress a trailing
+        // zero-width match immediately after a non-empty one — unlike real
+        // jq (and unlike this codebase's own match(;"g"), which already
+        // used global_captures to avoid the same gap). Now scan/gsub/splits
+        // route through global_captures too.
+        query!(br#""ab""#, r#"gsub("a|"; "X")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => assert_eq!(s, "XXbX")
+        );
+        query!(br#""ab""#, r#"[scan("a|")]"#,
+            QueryResult::Owned(OwnedValue::Array(matches)) => {
+                assert_eq!(matches, vec![
+                    OwnedValue::String("a".to_string()),
+                    OwnedValue::String(String::new()),
+                    OwnedValue::String(String::new()),
+                ]);
+            }
+        );
+    }
+
+    #[cfg(feature = "regex")]
+    #[test]
+    fn test_ends_with_single_trailing_newline() {
+        assert!(ends_with_single_trailing_newline("a\n"));
+        assert!(!ends_with_single_trailing_newline("a\n\n"));
+        assert!(!ends_with_single_trailing_newline("a"));
+        assert!(!ends_with_single_trailing_newline(""));
+        assert!(ends_with_single_trailing_newline("\n"));
+        assert!(!ends_with_single_trailing_newline("\n\n"));
+    }
+
+    #[cfg(feature = "regex")]
+    #[test]
+    fn test_pattern_may_enable_multiline() {
+        assert!(!pattern_may_enable_multiline("a$"));
+        assert!(!pattern_may_enable_multiline("[m]$"));
+        assert!(pattern_may_enable_multiline("(?m)a$"));
+        assert!(pattern_may_enable_multiline("(?im)a$"));
+        assert!(pattern_may_enable_multiline("(?m:a$)"));
+        // `-m` only *disables* multiline for the rest of that flag run.
+        assert!(!pattern_may_enable_multiline("(?-m)a$"));
+        // Conservative simplification: a later `(?-m)` scope doesn't
+        // un-flag an earlier `(?m)` group for this whole-pattern check.
+        assert!(pattern_may_enable_multiline("(?m)a(?-m)b$"));
+    }
+
+    #[cfg(feature = "regex")]
+    #[test]
+    fn test_pattern_may_need_trailing_newline_check() {
+        assert!(pattern_may_need_trailing_newline_check("a$"));
+        assert!(!pattern_may_need_trailing_newline_check("abc"));
+        // Naive `$`-presence check: an escaped/class `$` still triggers a
+        // (harmless, redundant) dual-view search — see the function's doc.
+        assert!(pattern_may_need_trailing_newline_check(r"a\$"));
+        assert!(pattern_may_need_trailing_newline_check("[$]"));
+        // A user-written inline multiline group backs off entirely.
+        assert!(!pattern_may_need_trailing_newline_check("(?m)a$"));
+    }
+
+    #[cfg(feature = "regex")]
+    #[test]
+    // The anchored literal `a$` is exactly what's under test here (its
+    // trailing-newline exception), not something `str::ends_with` could
+    // stand in for.
+    #[allow(clippy::trivial_regex)]
+    fn test_dv_is_match_trailing_newline_exception() {
+        let re = regex::Regex::new("a$").unwrap();
+        // Real jq: test("a$") on "a\n" -> true, on "a\n\n" -> false.
+        assert!(dv_is_match(&re, "a\n", true));
+        assert!(!dv_is_match(&re, "a\n\n", true));
+        assert!(dv_is_match(&re, "a", true));
+        // Without the check flag, falls back to plain Rust `$` semantics.
+        assert!(!dv_is_match(&re, "a\n", false));
+    }
+
+    #[cfg(feature = "regex")]
+    #[test]
+    #[allow(clippy::trivial_regex)]
+    fn test_dv_captures_at_does_not_consume_trailing_newline() {
+        // Real jq: sub("a$";"X") on "a\n" -> "X\n" (matches "a" itself,
+        // zero-width $ after it — the \n is never part of the match).
+        let re = regex::Regex::new("a$").unwrap();
+        let caps = dv_captures_at(&re, "a\n", 0, true).unwrap();
+        let m = caps.get(0).unwrap();
+        assert_eq!(m.as_str(), "a");
+        assert_eq!((m.start(), m.end()), (0, 1));
+    }
+
+    #[cfg(feature = "regex")]
+    #[test]
     fn test_regex_scan() {
         query!(br#""test abc test""#, r#"scan("test")"#,
             QueryResult::ManyOwned(matches) => {
