@@ -3716,6 +3716,21 @@ fn test_slurp_color_output_json() -> Result<()> {
     Ok(())
 }
 
+/// #809 follow-up: before this fix, `--slurp -C`'s identity query was the
+/// only thing exercising `output_value`'s YAML `config.use_color` branch.
+/// Once `can_slurp_fast_path` started accepting color (this PR), that query
+/// moved onto the new fast path and stopped covering it. `--null-input` has
+/// no cursor to stream from, so it bypasses the M2 fast path entirely
+/// regardless of query shape and keeps hitting `output_value` — pinning it
+/// here so the DOM-path YAML color branch stays covered.
+#[test]
+fn test_null_input_color_output_yaml() -> Result<()> {
+    let (output, code) = run_yq_stdin("{a: 1}", "", &["-n", "-C"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "\u{1b}[36ma\u{1b}[0m: 1\u{1b}[0m\n");
+    Ok(())
+}
+
 /// #809: `-C --inplace` fell through to the `OwnedValue`/`IndexMap` DOM
 /// path for any non-compact indent (`can_inplace_yaml_fast_path` excluded
 /// color via `can_stream_pretty`), collapsing duplicate keys — mirrors
