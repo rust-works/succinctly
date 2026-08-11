@@ -11811,7 +11811,34 @@ fn continue_rest_with_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         QueryResult::None => QueryResult::None,
         QueryResult::Error(e) => QueryResult::Error(e),
         QueryResult::Break(label) => QueryResult::Break(label),
-        QueryResult::Partial(vs, control) => partial(vs, control),
+        // `intermediate` produced `vs` before terminating in `outer_control`
+        // (#400, #494): pipe each already-produced value through `rest`
+        // first -- mirroring `pipe_owned_prefix`'s handling of the same
+        // shape -- and only attach `outer_control` once that's done, unless
+        // piping itself fails first, in which case that failure is what's
+        // actually reached and `outer_control` never surfaces. The previous
+        // `partial(vs, control)` here skipped `rest` entirely, silently
+        // dropping its transformation and swallowing any error it would
+        // have raised (e.g. `(1, error("x")) | file_index` reported the raw
+        // `1` instead of `file_index`'s resolved value, and never reported
+        // an error for a `rest` that itself fails).
+        QueryResult::Partial(vs, outer_control) => {
+            let mut results = Vec::new();
+            for v in vs {
+                let step = eval_pipe_with_path_context_internal::<W, S>(
+                    rest,
+                    &v,
+                    root,
+                    file_origin,
+                    current_path,
+                    optional,
+                );
+                if let Some(stop) = accumulate_path_context_step(&mut results, step) {
+                    return stop;
+                }
+            }
+            partial(results, outer_control)
+        }
         QueryResult::OneCursor(_) => unreachable!("materialize_cursor removes OneCursor"),
     }
 }
@@ -29557,14 +29584,18 @@ mod tests {
         // `cond` itself fans out to more than one value and then errors
         // (`(true, error("boom"))`): the branch loop finishes normally for
         // every value `cond` did produce, so the trailing control has to be
-        // reapplied *after* the loop rather than short-circuiting it.
+        // reapplied *after* the loop rather than short-circuiting it. The
+        // branch's own output (`1`) must still be piped through the rest of
+        // the pipe (`| file_index`, which ignores its input and reads only
+        // `current_path`) before landing in `vs` -- so the surviving prefix
+        // is `file_index`'s resolved `0`, not the raw branch value `1`.
         match eval_all_result(
             b"[1]",
             &[0],
             r#".[] | (if (true, error("boom")) then 1 else 2 end) | file_index"#,
         ) {
             QueryResult::Partial(vs, Control::Error(e)) => {
-                assert_eq!(vs, vec![OwnedValue::Int(1)]);
+                assert_eq!(vs, vec![OwnedValue::Int(0)]);
                 assert_eq!(e.message, "boom");
             }
             other => panic!("expected Partial, got {other:?}"),
@@ -29573,12 +29604,49 @@ mod tests {
 
     #[test]
     fn test_comma_partial_error_propagates_through_continuation_with_path_context() {
+        // The comma's own prefix output (`1`) must be piped through the
+        // rest of the pipe (`| file_index`) before landing in `vs`, exactly
+        // like `pipe_owned_prefix` does for the plain evaluator -- so the
+        // surviving prefix is `file_index`'s resolved `0`, not the raw
+        // comma value `1`.
         match eval_all_result(b"[1]", &[0], r#".[] | (1, error("boom")) | file_index"#) {
             QueryResult::Partial(vs, Control::Error(e)) => {
-                assert_eq!(vs, vec![OwnedValue::Int(1)]);
+                assert_eq!(vs, vec![OwnedValue::Int(0)]);
                 assert_eq!(e.message, "boom");
             }
             other => panic!("expected Partial, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_try_catch_partial_prefix_continues_pipe_with_path_context() {
+        // `try`/`catch` reaching `continue_rest_with_context` with a
+        // `Partial` intermediate (the `catch` branch's own generator fans
+        // out and then errors) must still pipe its prefix through the rest
+        // of the pipe rather than passing the raw pre-`rest` value through.
+        match eval_all_result(
+            b"[1]",
+            &[0],
+            r#".[] | (try (1, error("x")) catch (2, error("y"))) | file_index"#,
+        ) {
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(vs, vec![OwnedValue::Int(0), OwnedValue::Int(0)]);
+                assert_eq!(e.message, "y");
+            }
+            other => panic!("expected Partial, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_label_break_partial_prefix_continues_pipe_with_path_context() {
+        // Same shape as the `try`/`catch` case above, via `label`/`break`.
+        match eval_all_result(
+            b"[1]",
+            &[0],
+            r#".[] | (label $out | (1, break $out)) | file_index"#,
+        ) {
+            QueryResult::Owned(v) => assert_eq!(v, OwnedValue::Int(0)),
+            other => panic!("expected Owned, got {other:?}"),
         }
     }
 
