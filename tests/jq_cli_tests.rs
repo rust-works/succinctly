@@ -2551,6 +2551,25 @@ fn test_regex_capture_available_in_cli() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn test_regex_capture_bare_form_no_match_produces_no_output() -> Result<()> {
+    // #805: bare capture(re) printed `null` on no match; real jq prints nothing.
+    let (output, code) = run_jq_stdin(r#"capture("[0-9]+")"#, r#""abc""#, &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "");
+    Ok(())
+}
+
+#[test]
+fn test_regex_capture_flags_form_no_match_produces_no_output() -> Result<()> {
+    // #805: capture(re; flags)'s non-optional no-match branch printed `{}`;
+    // real jq prints nothing there either.
+    let (output, code) = run_jq_stdin(r#"capture("[0-9]+"; "")"#, r#""abc""#, &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "");
+    Ok(())
+}
+
 // =============================================================================
 // range() float support (issue #165)
 // =============================================================================
