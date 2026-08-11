@@ -2351,7 +2351,11 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // Reduction
         Builtin::Add => builtin_add::<W, S>(value, optional),
         Builtin::Any => builtin_any::<W>(value, optional),
+        Builtin::AnyF(cond) => builtin_any_f::<W, S>(cond, value, optional),
+        Builtin::AnyCond(gen, cond) => builtin_any_cond::<W, S>(gen, cond, value, optional),
         Builtin::All => builtin_all::<W>(value, optional),
+        Builtin::AllF(cond) => builtin_all_f::<W, S>(cond, value, optional),
+        Builtin::AllCond(gen, cond) => builtin_all_cond::<W, S>(gen, cond, value, optional),
         Builtin::Min => builtin_min::<W>(value, optional),
         Builtin::Max => builtin_max::<W>(value, optional),
         Builtin::MinBy(f) => builtin_min_by::<W, S>(f, value, optional),
@@ -3107,6 +3111,125 @@ fn builtin_all<W: Clone + AsRef<[u64]>>(
         _ if optional => QueryResult::None,
         _ => QueryResult::Error(EvalError::cannot_iterate(&to_owned(&value))),
     }
+}
+
+/// Probes a single element's `cond` output for a match, using the same
+/// prefix-vs-trailing-control split as `eval_limit`/`eval_first_expr`
+/// (`eval_owned_expr_fork`), so a match found before a later error in the
+/// same `cond` application still short-circuits instead of surfacing that
+/// error — jq's own `first(...)`-based definitions only pull one output at
+/// a time, so `cond` yielding `(false, error(...))` for one element must
+/// resolve on the `false` alone.
+fn any_all_probe_element<S: EvalSemantics>(
+    cond: &Expr,
+    elem: &OwnedValue,
+    target_truthy: bool,
+) -> Result<bool, Control> {
+    let (cond_outputs, cond_trailing) = eval_owned_expr_fork::<S>(cond, elem, false);
+    if cond_outputs.iter().any(|c| c.is_truthy() == target_truthy) {
+        return Ok(true);
+    }
+    match cond_trailing {
+        Some(control) => Err(control),
+        None => Ok(false),
+    }
+}
+
+fn control_to_result<'a, W: Clone + AsRef<[u64]>>(control: Control) -> QueryResult<'a, W> {
+    match control {
+        Control::Error(e) => QueryResult::Error(e),
+        Control::Break(label) => QueryResult::Break(label),
+    }
+}
+
+/// Shared engine for `any(cond)`/`all(cond)`: iterates the container's own
+/// elements (array items or object values — matching bare `any`/`all`'s
+/// #422 object support), applying `cond` per element with
+/// short-circuit-on-match semantics.
+fn any_all_f<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    cond: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+    target_truthy: bool,
+) -> QueryResult<'a, W> {
+    let elements: Vec<OwnedValue> = match value {
+        StandardJson::Array(elements) => elements.map(|e| to_owned(&e)).collect(),
+        StandardJson::Object(fields) => fields.map(|f| to_owned(&f.value())).collect(),
+        _ if optional => return QueryResult::None,
+        _ => return QueryResult::Error(EvalError::cannot_iterate(&to_owned(&value))),
+    };
+    for elem in &elements {
+        match any_all_probe_element::<S>(cond, elem, target_truthy) {
+            Ok(true) => return QueryResult::Owned(OwnedValue::Bool(target_truthy)),
+            Ok(false) => {}
+            Err(control) => return control_to_result(control),
+        }
+    }
+    QueryResult::Owned(OwnedValue::Bool(!target_truthy))
+}
+
+/// Builtin: `any(cond)` - true if cond is truthy for any element of `.[]`.
+fn builtin_any_f<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    cond: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    any_all_f::<W, S>(cond, value, optional, true)
+}
+
+/// Builtin: `all(cond)` - true if cond is truthy for every element of `.[]`.
+fn builtin_all_f<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    cond: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    any_all_f::<W, S>(cond, value, optional, false)
+}
+
+/// Shared engine for `any(gen; cond)`/`all(gen; cond)`, matching real jq's
+/// `isempty(generator|condition {and,or} empty)`-based definitions: a
+/// match found among `gen`'s outputs short-circuits and drops any later
+/// error/break from the unexamined remainder of `gen`.
+fn any_all_gen_cond<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    gen: &Expr,
+    cond: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+    target_truthy: bool,
+) -> QueryResult<'a, W> {
+    let owned = to_owned(&value);
+    let (gen_outputs, gen_trailing) = eval_owned_expr_fork::<S>(gen, &owned, optional);
+    for elem in &gen_outputs {
+        match any_all_probe_element::<S>(cond, elem, target_truthy) {
+            Ok(true) => return QueryResult::Owned(OwnedValue::Bool(target_truthy)),
+            Ok(false) => {}
+            Err(control) => return control_to_result(control),
+        }
+    }
+    match gen_trailing {
+        Some(control) => control_to_result(control),
+        None => QueryResult::Owned(OwnedValue::Bool(!target_truthy)),
+    }
+}
+
+/// Builtin: `any(gen; cond)` - true if cond is truthy for any output of gen.
+fn builtin_any_cond<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    gen: &Expr,
+    cond: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    any_all_gen_cond::<W, S>(gen, cond, value, optional, true)
+}
+
+/// Builtin: `all(gen; cond)` - true if cond is truthy for every output of gen.
+fn builtin_all_cond<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    gen: &Expr,
+    cond: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    any_all_gen_cond::<W, S>(gen, cond, value, optional, false)
 }
 
 /// Builtin: min
@@ -10023,7 +10146,17 @@ fn substitute_var_in_builtin(
         }
         Builtin::Add => Builtin::Add,
         Builtin::Any => Builtin::Any,
+        Builtin::AnyF(e) => Builtin::AnyF(Box::new(substitute_var(e, var_name, replacement))),
+        Builtin::AnyCond(gen, cond) => Builtin::AnyCond(
+            Box::new(substitute_var(gen, var_name, replacement)),
+            Box::new(substitute_var(cond, var_name, replacement)),
+        ),
         Builtin::All => Builtin::All,
+        Builtin::AllF(e) => Builtin::AllF(Box::new(substitute_var(e, var_name, replacement))),
+        Builtin::AllCond(gen, cond) => Builtin::AllCond(
+            Box::new(substitute_var(gen, var_name, replacement)),
+            Box::new(substitute_var(cond, var_name, replacement)),
+        ),
         Builtin::Min => Builtin::Min,
         Builtin::Max => Builtin::Max,
         Builtin::MinBy(e) => Builtin::MinBy(Box::new(substitute_var(e, var_name, replacement))),
@@ -16256,7 +16389,11 @@ fn builtin_builtins<'a, W: Clone + AsRef<[u64]>>() -> QueryResult<'a, W> {
         // Reduction (arity 0-1)
         "add/0",
         "any/0",
+        "any/1",
+        "any/2",
         "all/0",
+        "all/1",
+        "all/2",
         "min/0",
         "max/0",
         "min_by/1",
@@ -18824,7 +18961,17 @@ fn expand_func_calls_in_builtin(
         }
         Builtin::Add => Builtin::Add,
         Builtin::Any => Builtin::Any,
+        Builtin::AnyF(e) => Builtin::AnyF(Box::new(expand_func_calls(e, func_name, params, body))),
+        Builtin::AnyCond(gen, cond) => Builtin::AnyCond(
+            Box::new(expand_func_calls(gen, func_name, params, body)),
+            Box::new(expand_func_calls(cond, func_name, params, body)),
+        ),
         Builtin::All => Builtin::All,
+        Builtin::AllF(e) => Builtin::AllF(Box::new(expand_func_calls(e, func_name, params, body))),
+        Builtin::AllCond(gen, cond) => Builtin::AllCond(
+            Box::new(expand_func_calls(gen, func_name, params, body)),
+            Box::new(expand_func_calls(cond, func_name, params, body)),
+        ),
         Builtin::Min => Builtin::Min,
         Builtin::Max => Builtin::Max,
         Builtin::MinBy(e) => {
@@ -19178,7 +19325,17 @@ fn substitute_func_param_in_builtin(builtin: &Builtin, param: &str, arg: &Expr) 
         Builtin::MapValues(e) => Builtin::MapValues(Box::new(substitute_func_param(e, param, arg))),
         Builtin::Add => Builtin::Add,
         Builtin::Any => Builtin::Any,
+        Builtin::AnyF(e) => Builtin::AnyF(Box::new(substitute_func_param(e, param, arg))),
+        Builtin::AnyCond(gen, cond) => Builtin::AnyCond(
+            Box::new(substitute_func_param(gen, param, arg)),
+            Box::new(substitute_func_param(cond, param, arg)),
+        ),
         Builtin::All => Builtin::All,
+        Builtin::AllF(e) => Builtin::AllF(Box::new(substitute_func_param(e, param, arg))),
+        Builtin::AllCond(gen, cond) => Builtin::AllCond(
+            Box::new(substitute_func_param(gen, param, arg)),
+            Box::new(substitute_func_param(cond, param, arg)),
+        ),
         Builtin::Min => Builtin::Min,
         Builtin::Max => Builtin::Max,
         Builtin::MinBy(e) => Builtin::MinBy(Box::new(substitute_func_param(e, param, arg))),
@@ -22424,6 +22581,95 @@ mod tests {
         );
         query!(br"{}", "all",
             QueryResult::Owned(OwnedValue::Bool(true)) => {}
+        );
+    }
+
+    #[test]
+    fn test_builtin_any_f() {
+        // any(cond) is any(.[]; cond) - iterate the container, test cond.
+        query!(br"[1, 2, 3]", "any(. > 2)",
+            QueryResult::Owned(OwnedValue::Bool(true)) => {}
+        );
+        query!(br"[1, 2, 3]", "any(. > 5)",
+            QueryResult::Owned(OwnedValue::Bool(false)) => {}
+        );
+        // .[] over an object iterates its values (#422).
+        query!(br#"{"a": false, "b": true}"#, "any(.)",
+            QueryResult::Owned(OwnedValue::Bool(true)) => {}
+        );
+        // `?` on a non-iterable input swallows the "cannot iterate" error.
+        query!(br"1", "any(. > 0)?",
+            QueryResult::None => {}
+        );
+    }
+
+    #[test]
+    fn test_builtin_all_f() {
+        query!(br"[1, 2, 3]", "all(. > 0)",
+            QueryResult::Owned(OwnedValue::Bool(true)) => {}
+        );
+        query!(br"[1, 2, 3]", "all(. > 1)",
+            QueryResult::Owned(OwnedValue::Bool(false)) => {}
+        );
+        query!(br#"{"a": true, "b": false}"#, "all(.)",
+            QueryResult::Owned(OwnedValue::Bool(false)) => {}
+        );
+        query!(br"1", "all(. > 0)?",
+            QueryResult::None => {}
+        );
+    }
+
+    #[test]
+    fn test_builtin_any_cond() {
+        // The generator ignores `.` entirely, matching jq's own idiom of
+        // driving any/all off an explicit generator rather than the input.
+        query!(b"null", "any(1,2,3; . > 2)",
+            QueryResult::Owned(OwnedValue::Bool(true)) => {}
+        );
+        query!(b"null", "any(1,2,3; . > 5)",
+            QueryResult::Owned(OwnedValue::Bool(false)) => {}
+        );
+
+        // Short-circuit past a trailing error: a match at `2` means `error`
+        // (the generator's third output) is never reached (verified against
+        // jq 1.7.1).
+        query!(b"null", r#"any(1,2,error("boom"); . > 1)"#,
+            QueryResult::Owned(OwnedValue::Bool(true)) => {}
+        );
+        // No match precedes the error, so it surfaces.
+        query!(b"null", r#"any(1,2,error("boom"); . > 5)"#,
+            QueryResult::Error(e) => assert_eq!(e.message, "boom")
+        );
+
+        // Per-element short-circuit: `cond` itself yields a truthy output
+        // before erroring on the very same generator element - the match
+        // still wins over that trailing error (verified against jq 1.7.1).
+        query!(b"null", r#"any(1,2,3; (true, error("nope")))"#,
+            QueryResult::Owned(OwnedValue::Bool(true)) => {}
+        );
+    }
+
+    #[test]
+    fn test_builtin_all_cond() {
+        query!(b"null", "all(1,2,3; . > 0)",
+            QueryResult::Owned(OwnedValue::Bool(true)) => {}
+        );
+        query!(b"null", "all(1,2,3; . > 1)",
+            QueryResult::Owned(OwnedValue::Bool(false)) => {}
+        );
+
+        // No falsy element precedes the error, so `all` cannot conclude
+        // early and the error surfaces (verified against jq 1.7.1) - unlike
+        // `any` above, `all` only short-circuits on a *falsy* match.
+        query!(b"null", r#"all(1,2,error("boom"); . > 0)"#,
+            QueryResult::Error(e) => assert_eq!(e.message, "boom")
+        );
+
+        // Per-element short-circuit: `cond` yields a falsy output before
+        // erroring on the same generator element (verified against jq
+        // 1.7.1).
+        query!(b"null", r#"all(1,2,3; (false, error("nope")))"#,
+            QueryResult::Owned(OwnedValue::Bool(false)) => {}
         );
     }
 

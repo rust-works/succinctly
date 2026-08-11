@@ -555,8 +555,16 @@ pub enum Builtin {
     Add,
     /// `any` - true if any element is truthy
     Any,
+    /// `any(cond)` - true if cond is truthy for any element of `.[]`
+    AnyF(Box<Expr>),
+    /// `any(gen; cond)` - true if cond is truthy for any output of gen
+    AnyCond(Box<Expr>, Box<Expr>),
     /// `all` - true if all elements are truthy
     All,
+    /// `all(cond)` - true if cond is truthy for every element of `.[]`
+    AllF(Box<Expr>),
+    /// `all(gen; cond)` - true if cond is truthy for every output of gen
+    AllCond(Box<Expr>, Box<Expr>),
     /// `min` - minimum element
     Min,
     /// `max` - maximum element
