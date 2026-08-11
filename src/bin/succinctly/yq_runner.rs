@@ -278,6 +278,12 @@ fn resolve_input_format(format: InputFormat, path: Option<&Path>) -> InputFormat
 /// standalone YAML, so extraction must happen first. Returns
 /// `(bytes, format, body)`; `body` is `Some` only in `process` mode, where
 /// the caller must reattach it verbatim after the transformed front matter.
+///
+/// Once a mode is set, the returned format is always `InputFormat::Yaml`
+/// regardless of `resolved_format` -- front matter is YAML by definition,
+/// and the `run_yq` compat guard already rejects an explicit
+/// `--input-format json` paired with `--front-matter`, so this never
+/// actually overrides a caller's real preference.
 fn apply_front_matter(
     raw_bytes: Vec<u8>,
     resolved_format: InputFormat,
@@ -1700,6 +1706,13 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
         }
         if args.raw_input {
             anyhow::bail!("--front-matter and --raw-input are incompatible");
+        }
+        if args.input_format == InputFormat::Json {
+            // Front matter is YAML by definition (the `---`-fenced header),
+            // so `apply_front_matter` always forces `InputFormat::Yaml` once
+            // a mode is set -- reject an explicit, contradictory
+            // `--input-format json` instead of silently overriding it.
+            anyhow::bail!("--front-matter and --input-format json are incompatible");
         }
         if args.front_matter == Some(FrontMatterMode::Extract) && args.inplace {
             // `extract` never captures a body to reattach (only `process`

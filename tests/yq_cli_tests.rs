@@ -5907,6 +5907,23 @@ fn test_front_matter_unterminated_errors() -> Result<()> {
     Ok(())
 }
 
+/// Regression test: `apply_front_matter` always forces `InputFormat::Yaml`
+/// once a mode is set (front matter is YAML by definition), but it used to
+/// do so silently even when the caller explicitly asked for
+/// `--input-format json` -- reject the contradictory combination instead
+/// (#715 follow-up).
+#[test]
+fn test_front_matter_rejects_json_input_format() -> Result<()> {
+    let (_output, stderr, code) = run_yq_stdin_with_stderr(
+        ".",
+        FRONT_MATTER_FIXTURE,
+        &["--front-matter", "extract", "--input-format", "json"],
+    )?;
+    assert_ne!(code, 0);
+    assert!(stderr.contains("--input-format"), "stderr: {stderr}");
+    Ok(())
+}
+
 #[test]
 fn test_front_matter_rejects_doc_flag() -> Result<()> {
     let (_output, stderr, code) = run_yq_stdin_with_stderr(
