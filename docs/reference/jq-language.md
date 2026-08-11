@@ -209,6 +209,17 @@ The implementation covers ~95% of jq functionality and is production-ready.
   compatibility. `truncate_stream(f)` takes a single argument, not `depth; f` — the
   depth comes from `.`, matching jq's own `def truncate_stream(stream): . as $n | stream | ...`.
 - [x] `map(f)` / `map_values(f)`
+- [x] `IN(s)` / `IN(src; s)` — SQL-style membership test (#722). `IN(src; s)` is
+  a cartesian equality check between `src`'s and `s`'s outputs, both run
+  against the original current value — *not* a literal translation of
+  upstream's documented `def IN(src; s): any(src|s == .; .);`, which was
+  verified against the real jq-1.7.1 oracle to not reproduce its own
+  behavior (that def's `.` gets rebound by the `src|` pipe before `s` can
+  see the original input).
+- [x] `INDEX(stream; idx_expr)` / `INDEX(idx_expr)` — build an object keyed
+  by `idx_expr` from a stream of rows (#722); `INDEX(idx_expr)` is
+  `INDEX(.[]; idx_expr)`. Duplicate keys keep the last row, matching
+  `.[key] = row`.
 
 ### Date/Time Functions
 - [x] `now` - Current Unix timestamp as float
@@ -451,5 +462,6 @@ cargo test --features cli,regex --test jq_error_message_tests
 | 2026-01-24 | Document audit: Added `omit(keys)`, `load(file)`, `at_offset(n)`, `at_position(line; col)` to docs|
 | 2026-01-24 | Clarified YAML metadata: `alias` is cursor-level API only (not a jq builtin)|
 | 2026-01-24 | Updated coverage to 100% for most categories after comprehensive code review|
+| 2026-08-11 | Added `IN(s)` / `IN(src; s)` / `INDEX(stream; idx_expr)` / `INDEX(idx_expr)` SQL-style builtins (#722, ✅ complete)|
 | 2026-08-10 | Fixed `anchor`/`style` jq builtins to resolve real YAML metadata via cursor (previously hardcoded to always return `""`) (#709, ✅ complete)|
 | 2026-08-10 | Added `line_comment` yq builtin and trailing same-line comment preservation on cursor-preserving output paths (#710, ✅ partial - assignment paths not yet covered)|
