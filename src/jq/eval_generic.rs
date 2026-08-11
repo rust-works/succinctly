@@ -711,6 +711,67 @@ fn partial_generic<V: DocumentValue>(
     }
 }
 
+/// Normalize a `Vec<OwnedValue>` accumulator into the smallest `GenericResult`
+/// shape that represents it. Mirrors [`super::eval::owned_vec_to_result`].
+fn owned_vec_to_generic_result<V: DocumentValue>(mut vs: Vec<OwnedValue>) -> GenericResult<V> {
+    match vs.len() {
+        0 => GenericResult::None,
+        1 => GenericResult::Owned(vs.pop().unwrap()),
+        _ => GenericResult::ManyOwned(vs),
+    }
+}
+
+/// Finalize a fork's accumulated `outputs`, given an optional terminating
+/// `Control`. Mirrors [`super::eval::finish_fork`]: a trailing `Error` is
+/// silenced (keeping whatever outputs already succeeded) when `optional` is
+/// set; `Break` always propagates via [`partial_generic`], uncaught by
+/// `optional`, for the same reason `finish_fork`'s doc comment gives.
+fn finish_fork_generic<V: DocumentValue>(
+    outputs: Vec<OwnedValue>,
+    control: Option<Control>,
+    optional: bool,
+) -> GenericResult<V> {
+    match control {
+        None => owned_vec_to_generic_result(outputs),
+        Some(Control::Error(_)) if optional => owned_vec_to_generic_result(outputs),
+        Some(control) => partial_generic(outputs, control),
+    }
+}
+
+/// Append every output of a `GenericResult` stream to `out`, returning any
+/// terminating `Control` instead of collapsing to the first output the way
+/// the old `Expr::Compare` arm did. Mirrors [`super::eval::push_owned_values`]
+/// for the generic evaluator's cursor-aware result type — used to fork
+/// `Expr::Compare`'s operands into every output instead of only the first
+/// (#768), the same way [`push_generic_truthiness`] already forks `select`'s
+/// condition.
+fn push_generic_owned_values<V: DocumentValue>(
+    result: GenericResult<V>,
+    out: &mut Vec<OwnedValue>,
+) -> Option<Control> {
+    match result.materialize_lazy() {
+        GenericResult::One(v) => out.push(to_owned(&v)),
+        GenericResult::OneCursor(c) => out.push(to_owned(&c.value())),
+        GenericResult::Many(vs) => out.extend(vs.iter().map(to_owned)),
+        GenericResult::ManyCursor(cs) => out.extend(cs.iter().map(|c| to_owned(&c.value()))),
+        GenericResult::None => {}
+        GenericResult::Owned(v) => out.push(v),
+        GenericResult::ManyOwned(vs) => out.extend(vs),
+        GenericResult::Error(e) => return Some(Control::Error(e)),
+        GenericResult::Break(label) => return Some(Control::Break(label)),
+        GenericResult::Partial(vs, control) => {
+            out.extend(vs);
+            return Some(control);
+        }
+        GenericResult::LazyKeys { .. }
+        | GenericResult::LazyIndexRange(_)
+        | GenericResult::LazySeq(_) => {
+            unreachable!("materialize_lazy() already normalized every lazy variant")
+        }
+    }
+    None
+}
+
 /// Append one truthiness bit per output of a `GenericResult` stream to
 /// `out`. Mirrors [`super::eval::push_truthiness`] for the generic
 /// evaluator's cursor-aware result type — used to fan `select`'s condition
@@ -2137,124 +2198,56 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
 
         Expr::Builtin(builtin) => eval_builtin::<S, _>(builtin, value, optional, cursor),
 
-        // Comparison operations - handle locally to preserve cursor context
+        // Comparison operations - handle locally to preserve cursor context,
+        // over every pairing jq's cartesian fanout produces rather than just
+        // the first (#768): right operand outer, left operand inner, mirroring
+        // `eval::eval_binary_fanout`. `left`/`right` are evaluated at a
+        // hardcoded `optional: false` (unchanged from before this fix) --
+        // only the final comparison step below consults the ambient
+        // `optional`, same split as `Expr::IndexExpr`'s key/bounds above.
         Expr::Compare { op, left, right } => {
-            // Evaluate left and right with cursor context preserved
-            let left_result = eval_single::<S, _>(left, value.clone(), false, cursor);
-            let right_result = eval_single::<S, _>(right, value, false, cursor);
+            let mut right_vals = Vec::new();
+            let right_control = push_generic_owned_values(
+                eval_single::<S, _>(right, value.clone(), false, cursor),
+                &mut right_vals,
+            );
 
-            // Convert results to OwnedValue for comparison
-            let left_owned = match left_result.materialize_lazy() {
-                GenericResult::Owned(o) => o,
-                GenericResult::One(v) => to_owned(&v),
-                GenericResult::OneCursor(c) => to_owned(&c.value()),
-                GenericResult::LazyKeys { .. }
-                | GenericResult::LazyIndexRange(_)
-                | GenericResult::LazySeq(_) => {
-                    unreachable!("materialize_lazy() already normalized every lazy variant")
-                }
-                GenericResult::Error(e) => {
-                    return if optional {
-                        GenericResult::None
-                    } else {
-                        GenericResult::Error(e)
-                    }
-                }
-                GenericResult::None => return GenericResult::None,
-                GenericResult::Many(vs) => {
-                    if let Some(first) = vs.first() {
-                        to_owned(first)
-                    } else {
-                        return GenericResult::None;
-                    }
-                }
-                GenericResult::ManyCursor(cs) => {
-                    if let Some(first) = cs.first() {
-                        to_owned(&first.value())
-                    } else {
-                        return GenericResult::None;
-                    }
-                }
-                GenericResult::ManyOwned(vs) => {
-                    if let Some(first) = vs.first() {
-                        first.clone()
-                    } else {
-                        return GenericResult::None;
-                    }
-                }
-                GenericResult::Break(label) => return GenericResult::Break(label),
-                // Same "take the first output" policy as `Many`/`ManyOwned`
-                // above; the trailing control is dropped, consistent with
-                // how comparison already doesn't fork over a multi-output
-                // operand.
-                GenericResult::Partial(vs, _control) => vs.into_iter().next().unwrap(),
-            };
+            let mut out: Vec<OwnedValue> = Vec::new();
+            for right_val in &right_vals {
+                let mut left_vals = Vec::new();
+                let left_control = push_generic_owned_values(
+                    eval_single::<S, _>(left, value.clone(), false, cursor),
+                    &mut left_vals,
+                );
 
-            let right_owned = match right_result.materialize_lazy() {
-                GenericResult::Owned(o) => o,
-                GenericResult::One(v) => to_owned(&v),
-                GenericResult::OneCursor(c) => to_owned(&c.value()),
-                GenericResult::LazyKeys { .. }
-                | GenericResult::LazyIndexRange(_)
-                | GenericResult::LazySeq(_) => {
-                    unreachable!("materialize_lazy() already normalized every lazy variant")
+                for left_val in left_vals {
+                    let result = match op {
+                        CompareOp::Eq => left_val == *right_val,
+                        CompareOp::Ne => left_val != *right_val,
+                        CompareOp::Lt => {
+                            compare_values(&left_val, right_val) == core::cmp::Ordering::Less
+                        }
+                        CompareOp::Le => matches!(
+                            compare_values(&left_val, right_val),
+                            core::cmp::Ordering::Less | core::cmp::Ordering::Equal
+                        ),
+                        CompareOp::Gt => {
+                            compare_values(&left_val, right_val) == core::cmp::Ordering::Greater
+                        }
+                        CompareOp::Ge => matches!(
+                            compare_values(&left_val, right_val),
+                            core::cmp::Ordering::Greater | core::cmp::Ordering::Equal
+                        ),
+                    };
+                    out.push(OwnedValue::Bool(result));
                 }
-                GenericResult::Error(e) => {
-                    return if optional {
-                        GenericResult::None
-                    } else {
-                        GenericResult::Error(e)
-                    }
-                }
-                GenericResult::None => return GenericResult::None,
-                GenericResult::Many(vs) => {
-                    if let Some(first) = vs.first() {
-                        to_owned(first)
-                    } else {
-                        return GenericResult::None;
-                    }
-                }
-                GenericResult::ManyCursor(cs) => {
-                    if let Some(first) = cs.first() {
-                        to_owned(&first.value())
-                    } else {
-                        return GenericResult::None;
-                    }
-                }
-                GenericResult::ManyOwned(vs) => {
-                    if let Some(first) = vs.first() {
-                        first.clone()
-                    } else {
-                        return GenericResult::None;
-                    }
-                }
-                GenericResult::Break(label) => return GenericResult::Break(label),
-                // Same "take the first output" policy as `Many`/`ManyOwned`
-                // above; the trailing control is dropped.
-                GenericResult::Partial(vs, _control) => vs.into_iter().next().unwrap(),
-            };
 
-            // Perform the comparison
-            let result = match op {
-                CompareOp::Eq => left_owned == right_owned,
-                CompareOp::Ne => left_owned != right_owned,
-                CompareOp::Lt => {
-                    compare_values(&left_owned, &right_owned) == core::cmp::Ordering::Less
+                if let Some(control) = left_control {
+                    return finish_fork_generic(out, Some(control), optional);
                 }
-                CompareOp::Le => matches!(
-                    compare_values(&left_owned, &right_owned),
-                    core::cmp::Ordering::Less | core::cmp::Ordering::Equal
-                ),
-                CompareOp::Gt => {
-                    compare_values(&left_owned, &right_owned) == core::cmp::Ordering::Greater
-                }
-                CompareOp::Ge => matches!(
-                    compare_values(&left_owned, &right_owned),
-                    core::cmp::Ordering::Greater | core::cmp::Ordering::Equal
-                ),
-            };
+            }
 
-            GenericResult::Owned(OwnedValue::Bool(result))
+            finish_fork_generic(out, right_control, optional)
         }
 
         // Fall back to the full evaluator for complex expressions
@@ -7356,9 +7349,11 @@ mod tests {
     }
 
     #[test]
-    fn test_json_compare_left_many_cursor_uses_first_element() {
+    fn test_json_compare_left_many_cursor_forks_over_every_element_768() {
         // `Compare`'s `ManyCursor`-operand arm: `.[]` on the left side yields
-        // a `ManyCursor`, and the comparison uses its first element.
+        // a `ManyCursor`, and the comparison forks over every element rather
+        // than only the first (#768) -- verified against jq: `[1,2] | .[] ==
+        // 1` is `true`, `false`.
         let json = br"[1, 2]";
         let index = JsonIndex::build(json);
         let expr = Expr::Compare {
@@ -7368,12 +7363,17 @@ mod tests {
         };
 
         let result = eval_with_cursor(&expr, index.root(json));
-        assert_eq!(result.into_owned(), Some(OwnedValue::Bool(true)));
+        assert_eq!(
+            result.collect_owned(),
+            vec![OwnedValue::Bool(true), OwnedValue::Bool(false)]
+        );
     }
 
     #[test]
-    fn test_json_compare_right_many_cursor_uses_first_element() {
-        // Mirror of the above for the right-hand operand.
+    fn test_json_compare_right_many_cursor_forks_over_every_element_768() {
+        // Mirror of the above for the right-hand operand -- right is the
+        // outer loop (#768), but with only one left output the ordering
+        // still comes out element-order: `[1,2] | 1 == .[]` is `true`, `false`.
         let json = br"[1, 2]";
         let index = JsonIndex::build(json);
         let expr = Expr::Compare {
@@ -7383,7 +7383,10 @@ mod tests {
         };
 
         let result = eval_with_cursor(&expr, index.root(json));
-        assert_eq!(result.into_owned(), Some(OwnedValue::Bool(true)));
+        assert_eq!(
+            result.collect_owned(),
+            vec![OwnedValue::Bool(true), OwnedValue::Bool(false)]
+        );
     }
 
     #[test]
@@ -7608,16 +7611,11 @@ mod tests {
 
     #[test]
     fn generic_value_position_partial_collapses_to_its_control() {
-        // Comparison, computed indexing and `select` each consult their
-        // operand once, so a `Partial` there is reduced the same way a
-        // multi-output operand already is.
-
-        // Comparison keeps the prefix's first output on either side and drops
-        // the control. (jq 1.7.1 prints `true` and *then* fails; succinctly
-        // exits 0 — a divergence this pins rather than endorses.)
-        let truthy = Summary::Values(vec!["true".to_string()]);
-        assert_eq!(summarize(b"null", r#"(1,error("x")) == 1"#), truthy);
-        assert_eq!(summarize(b"null", r#"1 == (1,error("x"))"#), truthy);
+        // Computed indexing and `select` each consult their operand once, so
+        // a `Partial` there is reduced the same way a multi-output operand
+        // already is. Comparison used to share this reduction too, but now
+        // forks over every output instead (#768) — see
+        // `generic_compare_partial_operand_keeps_prefix_768` below.
 
         // A computed *target* that is a `Partial` surfaces the control alone.
         // (jq 1.7.1 prints 7 and 8 first; pinned here, not endorsed.)
@@ -7640,6 +7638,26 @@ mod tests {
         assert_eq!(
             summarize(b"[[7],[8]]", "(.[0],(.[1],break $out))[(0+0):2]"),
             Summary::Break("out".to_string())
+        );
+    }
+
+    #[test]
+    fn generic_compare_partial_operand_keeps_prefix_768() {
+        // A `Partial` operand on either side now keeps every pairing
+        // computed before the trailing control, instead of taking the first
+        // output and dropping the control entirely (#768) — matching real
+        // jq exactly: `null | (1,error("x")) == 1` prints `true`, then fails.
+        assert_eq!(
+            summarize(b"null", r#"(1,error("x")) == 1"#),
+            partial_err(&["true"], "x")
+        );
+        assert_eq!(
+            summarize(b"null", r#"1 == (1,error("x"))"#),
+            partial_err(&["true"], "x")
+        );
+        assert_eq!(
+            summarize(b"null", "(1,break $out) == 1"),
+            partial_break(&["true"])
         );
     }
 
