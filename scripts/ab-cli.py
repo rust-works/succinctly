@@ -103,7 +103,9 @@ def run_text(cmd):
 
 
 def command(binary, args, query, path):
-    return [binary, args.tool, "-o", args.output, "-I0", query, path]
+    if args.tool == "yq":
+        return [binary, args.tool, "-o", args.output, "-I0", query, path]
+    return [binary, args.tool, query, path]
 
 
 def digest(binary, args, query, path):
