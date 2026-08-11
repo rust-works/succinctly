@@ -367,6 +367,31 @@ pub(crate) fn needs_path_context(expr: &Expr) -> bool {
         Expr::Builtin(Builtin::Parent) => true,
         Expr::Builtin(Builtin::ParentN(_)) => true,
         Expr::Builtin(Builtin::Key) => true,
+        // `--eval-all`'s `file_index`/`fileIndex`/`fi` (#715) needs the same
+        // path-context routing as `Key` above -- it resolves via
+        // `current_path`, not a cursor.
+        Expr::Builtin(Builtin::FileIndex) => true,
+        // Neither `Compare` nor `Select` carries path context on its own,
+        // but a `key`/`document_index`/`file_index` nested in one of their
+        // operands does -- e.g. `select(file_index == 0)`, the headline
+        // `--eval-all` idiom. Recursing here is what makes
+        // `eval_pipe`/`eval_pipe_with_path_context_internal` route the whole
+        // pipe through path-context evaluation instead of losing it (#715;
+        // this closes a pre-existing gap for `key`/`document_index` too,
+        // e.g. `.[] | select(key >= 1)` previously produced no output).
+        Expr::Compare { left, right, .. } => needs_path_context(left) || needs_path_context(right),
+        // `*`-merge (`select(file_index==0) * select(file_index==1)`) is the
+        // other headline `--eval-all` idiom (#715) -- both operands need the
+        // same recursion as `Compare` above.
+        Expr::Arithmetic { left, right, .. } => {
+            needs_path_context(left) || needs_path_context(right)
+        }
+        Expr::Builtin(Builtin::Select(cond)) => needs_path_context(cond),
+        // `map(f)` needs the same recursion as `Select` above -- e.g.
+        // `map(select(file_index == 0))`, previously silently stubbed to 0
+        // for every element instead of resolving or erroring (#715
+        // follow-up).
+        Expr::Builtin(Builtin::Map(f)) => needs_path_context(f),
         Expr::Pipe(exprs) => exprs.iter().any(needs_path_context),
         Expr::Paren(inner) => needs_path_context(inner),
         Expr::Optional(inner) => needs_path_context(inner),
@@ -389,6 +414,12 @@ pub(crate) fn needs_path_context(expr: &Expr) -> bool {
         Expr::Try { expr, catch } => {
             needs_path_context(expr) || catch.as_ref().is_some_and(|c| needs_path_context(c))
         }
+        // `label $x | ...` is otherwise inert wrt path context, but a
+        // `key`/`document_index`/`file_index` inside its body still needs
+        // the same recursion as `If`/`Try` above -- without it,
+        // `label $out | file_index` silently dropped path context (#715
+        // follow-up).
+        Expr::Label { body, .. } => needs_path_context(body),
         _ => false,
     }
 }
@@ -1834,16 +1865,27 @@ fn eval_compare<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Err(e) => return QueryResult::Error(e),
     };
 
-    let result = match op {
-        CompareOp::Eq => left_val == right_val,
-        CompareOp::Ne => left_val != right_val,
-        CompareOp::Lt => compare_values(&left_val, &right_val) == core::cmp::Ordering::Less,
-        CompareOp::Le => compare_values(&left_val, &right_val) != core::cmp::Ordering::Greater,
-        CompareOp::Gt => compare_values(&left_val, &right_val) == core::cmp::Ordering::Greater,
-        CompareOp::Ge => compare_values(&left_val, &right_val) != core::cmp::Ordering::Less,
-    };
+    QueryResult::Owned(OwnedValue::Bool(apply_compare_op(
+        op, &left_val, &right_val,
+    )))
+}
 
-    QueryResult::Owned(OwnedValue::Bool(result))
+/// Apply a comparison operator to two already-evaluated values.
+///
+/// Factored out of [`eval_compare`] so the path-context evaluator's own
+/// `Expr::Compare` arm (`eval_pipe_with_path_context_internal`, #715) can
+/// reuse the exact same operator semantics rather than a second, divergence-
+/// prone copy -- see the project's own "one definition, plus a test that call
+/// sites agree" convention (already applied to `compare_values` itself).
+fn apply_compare_op(op: CompareOp, left: &OwnedValue, right: &OwnedValue) -> bool {
+    match op {
+        CompareOp::Eq => left == right,
+        CompareOp::Ne => left != right,
+        CompareOp::Lt => compare_values(left, right) == core::cmp::Ordering::Less,
+        CompareOp::Le => compare_values(left, right) != core::cmp::Ordering::Greater,
+        CompareOp::Gt => compare_values(left, right) == core::cmp::Ordering::Greater,
+        CompareOp::Ge => compare_values(left, right) != core::cmp::Ordering::Less,
+    }
 }
 
 /// Compare two values using jq ordering: null < bool < number < string < array < object.
@@ -2524,6 +2566,14 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Builtin::Column => builtin_column::<W>(),
         Builtin::DocumentIndex => builtin_document_index::<W>(),
         Builtin::LineComment => builtin_line_comment::<W>(),
+        Builtin::FileIndex => {
+            // Requires the `--eval-all` path-context evaluator to resolve to
+            // anything but 0; reached here means either outside `--eval-all`
+            // or nested in a shape that evaluator doesn't cover (#715), the
+            // same documented "0 outside supported context" contract
+            // `document_index` already has.
+            QueryResult::Owned(OwnedValue::Int(0))
+        }
         Builtin::Shuffle => builtin_shuffle::<W>(value, optional),
         Builtin::Pivot => builtin_pivot::<W>(value, optional),
         Builtin::SplitDoc => {
@@ -7522,6 +7572,42 @@ pub fn eval_lenient<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     }
 }
 
+/// Evaluate `expr` against a combined `--eval-all` array (succinctly
+/// extension, #715).
+///
+/// Makes `file_index`/`fileIndex`/`fi` resolve via `file_origin` -- a side
+/// table mapping each top-level array position to its originating file
+/// index, built by the yq CLI driver -- wherever
+/// `eval_pipe_with_path_context_internal` can reach it: plain
+/// `.`/`.[]`/`.field` navigation, comparisons, `select(...)`, `map(...)`,
+/// `if`/`then`/`else`, `try`/`catch`, comma, and `label` (the same
+/// capability level `key`/`document_index` already have; array/object
+/// literals and user-defined functions remain out of scope, matching those
+/// builtins' own existing limits).
+///
+/// Routes through the ordinary evaluator, untouched, whenever `expr`
+/// doesn't reference `file_index`/`key`/`parent`/`path` anywhere
+/// `needs_path_context` can see -- the overwhelming majority of
+/// `--eval-all` filters pay zero extra cost over a normal `evaluate_input`.
+pub fn eval_owned_with_file_index<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    expr: &Expr,
+    input: &OwnedValue,
+    file_origin: &[usize],
+) -> QueryResult<'a, W> {
+    if needs_path_context(expr) {
+        eval_pipe_with_path_context_internal::<W, S>(
+            core::slice::from_ref(expr),
+            input,
+            input,
+            Some(file_origin),
+            &[],
+            false,
+        )
+    } else {
+        eval_owned_input::<W, S>(expr, input, false)
+    }
+}
+
 // =============================================================================
 // Assignment Operators Implementation
 // =============================================================================
@@ -10144,6 +10230,7 @@ fn substitute_var_in_builtin(
         Builtin::Column => Builtin::Column,
         Builtin::DocumentIndex => Builtin::DocumentIndex,
         Builtin::LineComment => Builtin::LineComment,
+        Builtin::FileIndex => Builtin::FileIndex,
         Builtin::Shuffle => Builtin::Shuffle,
         Builtin::Pivot => Builtin::Pivot,
         Builtin::SplitDoc => Builtin::SplitDoc,
@@ -11592,15 +11679,178 @@ fn eval_pipe_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     current_path: &[OwnedValue],
     optional: bool,
 ) -> QueryResult<'a, W> {
-    // Call the internal version with root value
-    eval_pipe_with_path_context_internal::<W, S>(exprs, value, value, current_path, optional)
+    // Call the internal version with root value. `file_origin` is only ever
+    // `Some` for `--eval-all`'s combined-array evaluation, which calls
+    // `eval_pipe_with_path_context_internal` directly (see
+    // `eval_owned_with_file_index`) rather than through this wrapper.
+    eval_pipe_with_path_context_internal::<W, S>(exprs, value, value, None, current_path, optional)
 }
 
-/// Internal helper that also tracks the root value for parent navigation.
+/// Fold one fan-out step's result into `results`, matching the project's
+/// #400/#494 guarantee: an `Error`/`Break` produced partway through a
+/// fan-out must not discard outputs already produced by earlier steps. Every
+/// fan-out loop in `eval_pipe_with_path_context_internal` (`Iterate`, `If`'s
+/// multi-valued `cond`, `Comma`, `Select`'s continuation) and
+/// `continue_rest_with_context` shares this exact accumulate-or-stop shape;
+/// this is the one place it's implemented (#715 follow-up -- six near-copies
+/// of this loop each independently collapsed `Break`/`Partial` to a bare
+/// `None`, silently dropping both the escaping control signal and any output
+/// already produced).
+///
+/// Returns `Some(result)` when the loop must stop and propagate that result
+/// immediately (an error, an escaping `break`, or a nested partial result);
+/// `None` to keep iterating.
+fn accumulate_path_context_step<'a, W: Clone + AsRef<[u64]>>(
+    results: &mut Vec<OwnedValue>,
+    step: QueryResult<'a, W>,
+) -> Option<QueryResult<'a, W>> {
+    match step.materialize_cursor() {
+        QueryResult::Owned(v) => {
+            results.push(v);
+            None
+        }
+        QueryResult::ManyOwned(vs) => {
+            results.extend(vs);
+            None
+        }
+        // `eval_fanout` (used by `Select`) returns these borrowed-cursor
+        // variants even from an all-owned-value call site -- e.g. a `select`
+        // whose condition matched nothing produces `Many(vec![])`, not
+        // `None` -- so this must convert, not treat them as unreachable.
+        QueryResult::One(v) => {
+            results.push(to_owned(&v));
+            None
+        }
+        QueryResult::Many(vs) => {
+            results.extend(vs.iter().map(to_owned));
+            None
+        }
+        QueryResult::None => None,
+        QueryResult::Error(e) => Some(partial(core::mem::take(results), Control::Error(e))),
+        QueryResult::Break(label) => Some(partial(core::mem::take(results), Control::Break(label))),
+        QueryResult::Partial(vs, control) => {
+            results.extend(vs);
+            Some(partial(core::mem::take(results), control))
+        }
+        QueryResult::OneCursor(_) => unreachable!("materialize_cursor removes OneCursor"),
+    }
+}
+
+/// Continue evaluating `rest` for each output of an already-computed
+/// intermediate `QueryResult`, preserving `root`/`current_path` (the
+/// intermediate stage doesn't move navigational position -- e.g. a
+/// comparison, an `if`/`then`/`else`, or a `try`/`catch` result is still
+/// "at" the position it was computed from) and fanning a multi-valued
+/// result back out over `rest` the same way `Iterate` does above. Shared by
+/// `If`/`Comma`/`Try`/`Label` below to avoid re-deriving this fan-out loop
+/// at each call site.
+fn continue_rest_with_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    intermediate: QueryResult<'a, W>,
+    rest: &[Expr],
+    root: &OwnedValue,
+    file_origin: Option<&[usize]>,
+    current_path: &[OwnedValue],
+    optional: bool,
+) -> QueryResult<'a, W> {
+    // `eval_fanout` (reached via `Select`) can hand back its borrowed-cursor
+    // variants (`One`/`Many`) even here, not just Owned/ManyOwned -- e.g. a
+    // `select` that matched nothing produces `Many(vec![])` -- so those
+    // convert via `to_owned` instead of being treated as unreachable.
+    match intermediate.materialize_cursor() {
+        QueryResult::Owned(v) => eval_pipe_with_path_context_internal::<W, S>(
+            rest,
+            &v,
+            root,
+            file_origin,
+            current_path,
+            optional,
+        ),
+        QueryResult::One(v) => eval_pipe_with_path_context_internal::<W, S>(
+            rest,
+            &to_owned(&v),
+            root,
+            file_origin,
+            current_path,
+            optional,
+        ),
+        QueryResult::ManyOwned(vs) => {
+            let mut results = Vec::new();
+            for v in vs {
+                let step = eval_pipe_with_path_context_internal::<W, S>(
+                    rest,
+                    &v,
+                    root,
+                    file_origin,
+                    current_path,
+                    optional,
+                );
+                if let Some(stop) = accumulate_path_context_step(&mut results, step) {
+                    return stop;
+                }
+            }
+            owned_vec_to_result(results)
+        }
+        QueryResult::Many(vs) => {
+            let mut results = Vec::new();
+            for v in vs {
+                let owned_v = to_owned(&v);
+                let step = eval_pipe_with_path_context_internal::<W, S>(
+                    rest,
+                    &owned_v,
+                    root,
+                    file_origin,
+                    current_path,
+                    optional,
+                );
+                if let Some(stop) = accumulate_path_context_step(&mut results, step) {
+                    return stop;
+                }
+            }
+            owned_vec_to_result(results)
+        }
+        QueryResult::None => QueryResult::None,
+        QueryResult::Error(e) => QueryResult::Error(e),
+        QueryResult::Break(label) => QueryResult::Break(label),
+        // `intermediate` produced `vs` before terminating in `outer_control`
+        // (#400, #494): pipe each already-produced value through `rest`
+        // first -- mirroring `pipe_owned_prefix`'s handling of the same
+        // shape -- and only attach `outer_control` once that's done, unless
+        // piping itself fails first, in which case that failure is what's
+        // actually reached and `outer_control` never surfaces. The previous
+        // `partial(vs, control)` here skipped `rest` entirely, silently
+        // dropping its transformation and swallowing any error it would
+        // have raised (e.g. `(1, error("x")) | file_index` reported the raw
+        // `1` instead of `file_index`'s resolved value, and never reported
+        // an error for a `rest` that itself fails).
+        QueryResult::Partial(vs, outer_control) => {
+            let mut results = Vec::new();
+            for v in vs {
+                let step = eval_pipe_with_path_context_internal::<W, S>(
+                    rest,
+                    &v,
+                    root,
+                    file_origin,
+                    current_path,
+                    optional,
+                );
+                if let Some(stop) = accumulate_path_context_step(&mut results, step) {
+                    return stop;
+                }
+            }
+            partial(results, outer_control)
+        }
+        QueryResult::OneCursor(_) => unreachable!("materialize_cursor removes OneCursor"),
+    }
+}
+
+/// Internal helper that also tracks the root value for parent navigation,
+/// and (for `--eval-all`, #715) an optional origin-file-index side table
+/// keyed by top-level array position, resolving `file_index`/`fileIndex`/`fi`.
 fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     exprs: &[Expr],
     value: &OwnedValue,
     root: &OwnedValue,
+    file_origin: Option<&[usize]>,
     current_path: &[OwnedValue],
     optional: bool,
 ) -> QueryResult<'a, W> {
@@ -11622,6 +11872,7 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
                 rest,
                 &v,
                 root,
+                file_origin,
                 current_path,
                 optional,
             );
@@ -11646,6 +11897,38 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
                 rest,
                 &v,
                 root,
+                file_origin,
+                current_path,
+                optional,
+            );
+        }
+    }
+
+    // Handle FileIndex - return the origin file index of the top-level
+    // element `current_path` descends from (#715). Reads `current_path[0]`
+    // (the outermost index), not `.last()` like `Key` does: `file_index`
+    // answers "which file did this whole document come from", unaffected by
+    // further navigation. Falls back to 0 outside `--eval-all` (`file_origin`
+    // is `None`) or once past the top level's index (defensive; `.first()`
+    // always exists once inside an `--eval-all` array), matching
+    // `document_index`'s existing "0 outside supported context" contract.
+    if matches!(first, Expr::Builtin(Builtin::FileIndex)) {
+        let file_idx = current_path
+            .first()
+            .and_then(OwnedValue::as_i64)
+            .and_then(|i| usize::try_from(i).ok())
+            .and_then(|i| file_origin.and_then(|origins| origins.get(i).copied()))
+            .unwrap_or(0);
+        let file_index_result = QueryResult::Owned(OwnedValue::Int(file_idx as i64));
+        if rest.is_empty() {
+            return file_index_result;
+        }
+        if let QueryResult::Owned(v) = file_index_result {
+            return eval_pipe_with_path_context_internal::<W, S>(
+                rest,
+                &v,
+                root,
+                file_origin,
                 current_path,
                 optional,
             );
@@ -11680,6 +11963,7 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
                 rest,
                 &v,
                 root,
+                file_origin,
                 &parent_path,
                 optional,
             );
@@ -11725,6 +12009,7 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
                 rest,
                 &v,
                 root,
+                file_origin,
                 &parent_path,
                 optional,
             );
@@ -11735,7 +12020,14 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
     match first {
         Expr::Identity => {
             // Identity doesn't change the path
-            eval_pipe_with_path_context_internal::<W, S>(rest, value, root, current_path, optional)
+            eval_pipe_with_path_context_internal::<W, S>(
+                rest,
+                value,
+                root,
+                file_origin,
+                current_path,
+                optional,
+            )
         }
         Expr::Field(name) => {
             // Extend path with field name
@@ -11749,7 +12041,12 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
                         return QueryResult::Owned(v.clone());
                     }
                     return eval_pipe_with_path_context_internal::<W, S>(
-                        rest, v, root, &new_path, optional,
+                        rest,
+                        v,
+                        root,
+                        file_origin,
+                        &new_path,
+                        optional,
                     );
                 }
                 // jq returns null for missing fields on objects (not an error)
@@ -11784,7 +12081,12 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
                         return QueryResult::Owned(v.clone());
                     }
                     return eval_pipe_with_path_context_internal::<W, S>(
-                        rest, v, root, &new_path, optional,
+                        rest,
+                        v,
+                        root,
+                        file_origin,
+                        &new_path,
+                        optional,
                     );
                 }
             }
@@ -11812,14 +12114,16 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
                         if rest.is_empty() {
                             results.push(v.clone());
                         } else {
-                            match eval_pipe_with_path_context_internal::<W, S>(
-                                rest, v, root, &new_path, optional,
-                            ) {
-                                QueryResult::Owned(r) => results.push(r),
-                                QueryResult::ManyOwned(rs) => results.extend(rs),
-                                QueryResult::None => {}
-                                QueryResult::Error(e) => return QueryResult::Error(e),
-                                _ => {}
+                            let step = eval_pipe_with_path_context_internal::<W, S>(
+                                rest,
+                                v,
+                                root,
+                                file_origin,
+                                &new_path,
+                                optional,
+                            );
+                            if let Some(stop) = accumulate_path_context_step(&mut results, step) {
+                                return stop;
                             }
                         }
                     }
@@ -11831,14 +12135,16 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
                         if rest.is_empty() {
                             results.push(v.clone());
                         } else {
-                            match eval_pipe_with_path_context_internal::<W, S>(
-                                rest, v, root, &new_path, optional,
-                            ) {
-                                QueryResult::Owned(r) => results.push(r),
-                                QueryResult::ManyOwned(rs) => results.extend(rs),
-                                QueryResult::None => {}
-                                QueryResult::Error(e) => return QueryResult::Error(e),
-                                _ => {}
+                            let step = eval_pipe_with_path_context_internal::<W, S>(
+                                rest,
+                                v,
+                                root,
+                                file_origin,
+                                &new_path,
+                                optional,
+                            );
+                            if let Some(stop) = accumulate_path_context_step(&mut results, step) {
+                                return stop;
                             }
                         }
                     }
@@ -11846,13 +12152,7 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
                 _ if optional => return QueryResult::None,
                 _ => return QueryResult::Error(EvalError::cannot_iterate(value)),
             }
-            if results.is_empty() {
-                QueryResult::None
-            } else if results.len() == 1 {
-                QueryResult::Owned(results.pop().unwrap())
-            } else {
-                QueryResult::ManyOwned(results)
-            }
+            owned_vec_to_result(results)
         }
         Expr::Paren(inner) => {
             // Parentheses don't change path, just evaluate inner
@@ -11861,6 +12161,7 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
                     &[(**inner).clone()],
                     value,
                     root,
+                    file_origin,
                     current_path,
                     optional,
                 )
@@ -11871,6 +12172,7 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
                     &combined,
                     value,
                     root,
+                    file_origin,
                     current_path,
                     optional,
                 )
@@ -11883,6 +12185,7 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
                     &[(**inner).clone()],
                     value,
                     root,
+                    file_origin,
                     current_path,
                     true,
                 )
@@ -11893,6 +12196,7 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
                     &combined,
                     value,
                     root,
+                    file_origin,
                     current_path,
                     true,
                 )
@@ -11906,6 +12210,224 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
                 &combined,
                 value,
                 root,
+                file_origin,
+                current_path,
+                optional,
+            )
+        }
+        Expr::Arithmetic { op, left, right } => {
+            // Evaluate both sides through the path-context evaluator too --
+            // without this, `select(file_index==0) * select(file_index==1)`
+            // (the other headline `--eval-all` merge idiom, #715) silently
+            // evaluates both `select`s against the 0-stub, so the
+            // `file_index==1` side always comes back empty.
+            let left_val = match result_to_owned(eval_pipe_with_path_context_internal::<W, S>(
+                core::slice::from_ref(left),
+                value,
+                root,
+                file_origin,
+                current_path,
+                optional,
+            )) {
+                Ok(v) => v,
+                Err(e) => return QueryResult::Error(e),
+            };
+            let right_val = match result_to_owned(eval_pipe_with_path_context_internal::<W, S>(
+                core::slice::from_ref(right),
+                value,
+                root,
+                file_origin,
+                current_path,
+                optional,
+            )) {
+                Ok(v) => v,
+                Err(e) => return QueryResult::Error(e),
+            };
+            let arith_result = match op {
+                ArithOp::Add => arith_add::<S>(left_val, right_val),
+                ArithOp::Sub => arith_sub::<S>(left_val, right_val),
+                ArithOp::Mul(flags) => arith_mul::<S>(left_val, right_val, *flags),
+                ArithOp::Div => arith_div::<S>(left_val, right_val),
+                ArithOp::Mod => arith_mod::<S>(left_val, right_val),
+            };
+            let arith_result = match arith_result {
+                Ok(v) => QueryResult::Owned(v),
+                Err(_) if optional => QueryResult::None,
+                Err(e) => QueryResult::Error(e),
+            };
+            if rest.is_empty() {
+                return arith_result;
+            }
+            match arith_result {
+                QueryResult::Owned(v) => {
+                    // Preserve root/current_path, same as `Compare` above --
+                    // arithmetic is typically a mid-pipe computation, not the
+                    // pipe's final value, so later `key`/`file_index` calls
+                    // must still resolve against the pre-arithmetic position.
+                    eval_pipe_with_path_context_internal::<W, S>(
+                        rest,
+                        &v,
+                        root,
+                        file_origin,
+                        current_path,
+                        optional,
+                    )
+                }
+                QueryResult::None => QueryResult::None,
+                QueryResult::Error(e) => QueryResult::Error(e),
+                _ => unreachable!("arith_result was just constructed above as Owned/None/Error"),
+            }
+        }
+        Expr::Compare { op, left, right } => {
+            // Evaluate both sides through the path-context evaluator too, so
+            // `key`/`document_index`/`file_index` resolve correctly inside a
+            // comparison (e.g. `file_index == 0`) rather than falling back to
+            // their 0/null stubs (#715 -- this was already a latent gap for
+            // `key`/`document_index`, not something `file_index` introduces).
+            let left_val = match result_to_owned(eval_pipe_with_path_context_internal::<W, S>(
+                core::slice::from_ref(left),
+                value,
+                root,
+                file_origin,
+                current_path,
+                optional,
+            )) {
+                Ok(v) => v,
+                Err(e) => return QueryResult::Error(e),
+            };
+            let right_val = match result_to_owned(eval_pipe_with_path_context_internal::<W, S>(
+                core::slice::from_ref(right),
+                value,
+                root,
+                file_origin,
+                current_path,
+                optional,
+            )) {
+                Ok(v) => v,
+                Err(e) => return QueryResult::Error(e),
+            };
+            let compare_result = QueryResult::Owned(OwnedValue::Bool(apply_compare_op(
+                *op, &left_val, &right_val,
+            )));
+            if rest.is_empty() {
+                return compare_result;
+            }
+            if let QueryResult::Owned(v) = compare_result {
+                // Unlike `Object`/`Array`/`Literal`, a comparison is
+                // typically a mid-pipe filter/test, not the pipe's final
+                // value -- `key`/`document_index`/`file_index` later in the
+                // same pipe must still resolve against the position the
+                // comparison was evaluated at, so `root`/`current_path` are
+                // preserved (matching the generic fallback below, and
+                // `main`'s pre-#715 behavior: `.[] | (1==1) | key` must keep
+                // returning the original index, not `null`).
+                return eval_pipe_with_path_context_internal::<W, S>(
+                    rest,
+                    &v,
+                    root,
+                    file_origin,
+                    current_path,
+                    optional,
+                );
+            }
+            unreachable!("QueryResult::Owned was just constructed above")
+        }
+        Expr::Builtin(Builtin::Select(cond)) => {
+            // Evaluate the condition through the path-context evaluator too,
+            // so `select(file_index == 0)` -- the headline `--eval-all` idiom
+            // -- resolves correctly instead of falling back to the 0 stub
+            // (#715; same latent gap `Compare` above closes for `key`/
+            // `document_index`). Mirrors `builtin_select`'s `eval_fanout`
+            // structure so multi-valued conditions still fan out identically.
+            let cond_result = eval_pipe_with_path_context_internal::<W, S>(
+                core::slice::from_ref(cond),
+                value,
+                root,
+                file_origin,
+                current_path,
+                optional,
+            );
+            let select_result = eval_fanout(cond_result, |truthy| {
+                if truthy {
+                    QueryResult::Owned(value.clone())
+                } else {
+                    QueryResult::None
+                }
+            });
+            if rest.is_empty() {
+                return select_result;
+            }
+            // `select` doesn't navigate, so continue `rest` from `value`'s
+            // existing path/root for each surviving (truthy) output.
+            // `eval_fanout` above can produce `Partial`/`Break` (e.g. when
+            // `cond` itself fans out and errors partway through), not just
+            // Owned/ManyOwned/None/Error, so this delegates to
+            // `continue_rest_with_context` instead of re-deriving (and
+            // mis-deriving, #715 follow-up) the same fan-out loop here.
+            continue_rest_with_context::<W, S>(
+                select_result,
+                rest,
+                root,
+                file_origin,
+                current_path,
+                optional,
+            )
+        }
+        Expr::Builtin(Builtin::Map(f)) => {
+            // Evaluate `map(f)` through the path-context evaluator too, so
+            // `file_index`/`key`/`document_index` inside `f` resolve
+            // correctly per-element instead of falling back to the 0/null
+            // stub (#715 follow-up) -- `map(f)` is `[.[] | f]`, mirroring
+            // `builtin_map`'s element-source handling (object values too,
+            // #422) and `eval_array_construction`'s atomicity (a mid-way
+            // error/break discards the in-progress array rather than
+            // surfacing a partial one, verified: `[1,error("x"),3]`
+            // produces no output at all).
+            let elements: Vec<(OwnedValue, OwnedValue)> = match value {
+                OwnedValue::Array(arr) => arr
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| (OwnedValue::Int(i as i64), v.clone()))
+                    .collect(),
+                OwnedValue::Object(entries) => entries
+                    .iter()
+                    .map(|(k, v)| (OwnedValue::String(k.clone()), v.clone()))
+                    .collect(),
+                _ if optional => return QueryResult::None,
+                _ => return QueryResult::Error(EvalError::cannot_iterate(value)),
+            };
+            let mut results = Vec::new();
+            let mut stopped = None;
+            for (key, elem) in elements {
+                let mut new_path = current_path.to_vec();
+                new_path.push(key);
+                let step = eval_pipe_with_path_context_internal::<W, S>(
+                    core::slice::from_ref(f),
+                    &elem,
+                    root,
+                    file_origin,
+                    &new_path,
+                    optional,
+                );
+                if let Some(stop) = accumulate_path_context_step(&mut results, step) {
+                    stopped = Some(stop);
+                    break;
+                }
+            }
+            let map_result = match stopped {
+                Some(QueryResult::Partial(_, Control::Error(e))) => QueryResult::Error(e),
+                Some(QueryResult::Partial(_, Control::Break(label))) => QueryResult::Break(label),
+                Some(other) => other,
+                None => QueryResult::Owned(OwnedValue::Array(results)),
+            };
+            if rest.is_empty() {
+                return map_result;
+            }
+            continue_rest_with_context::<W, S>(
+                map_result,
+                rest,
+                root,
+                file_origin,
                 current_path,
                 optional,
             )
@@ -11921,6 +12443,7 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
                             rest,
                             &result,
                             root,
+                            file_origin,
                             current_path,
                             optional,
                         )
@@ -11943,6 +12466,7 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
                             rest,
                             &result,
                             &result,
+                            file_origin,
                             &[],
                             optional,
                         )
@@ -11952,6 +12476,255 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
                 Err(e) => QueryResult::Error(e),
             }
         }
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            // Evaluate cond/then/else through the path-context evaluator
+            // too, so `if file_index == 0 then ... end` -- a natural
+            // `--eval-all` idiom -- resolves correctly instead of falling
+            // back to the 0/null stub. `needs_path_context` already
+            // recurses into `If`; this arm is what actually honors that
+            // (#715 follow-up: previously there was no explicit `If` arm
+            // here, so it fell into the generic fallback below and lost
+            // path context for anything nested in cond/then/else).
+            let cond_result = eval_pipe_with_path_context_internal::<W, S>(
+                core::slice::from_ref(cond),
+                value,
+                root,
+                file_origin,
+                current_path,
+                optional,
+            );
+            // Unpack `cond_result` into its truthy/falsy values plus any
+            // trailing control (#400/#494) -- `cond` itself can produce more
+            // than one value (e.g. `if .[] then ... end`) and/or end in an
+            // error/break after producing some, and both must still drive a
+            // branch evaluation per value with the control propagated after.
+            let (cond_values, cond_control): (Vec<OwnedValue>, Option<Control>) = match cond_result
+            {
+                QueryResult::Owned(v) => (vec![v], None),
+                QueryResult::ManyOwned(vs) => (vs, None),
+                QueryResult::None => (Vec::new(), None),
+                QueryResult::Error(e) => (Vec::new(), Some(Control::Error(e))),
+                QueryResult::Break(label) => (Vec::new(), Some(Control::Break(label))),
+                QueryResult::Partial(vs, control) => (vs, Some(control)),
+                QueryResult::One(_) | QueryResult::OneCursor(_) | QueryResult::Many(_) => {
+                    unreachable!(
+                        "eval_pipe_with_path_context_internal only ever produces \
+                         Owned/ManyOwned/None/Error/Break/Partial"
+                    )
+                }
+            };
+            let mut results = Vec::new();
+            let mut stopped = None;
+            for v in cond_values {
+                let branch = if v.is_truthy() {
+                    then_branch
+                } else {
+                    else_branch
+                };
+                let step = eval_pipe_with_path_context_internal::<W, S>(
+                    core::slice::from_ref(branch),
+                    value,
+                    root,
+                    file_origin,
+                    current_path,
+                    optional,
+                );
+                if let Some(stop) = accumulate_path_context_step(&mut results, step) {
+                    stopped = Some(stop);
+                    break;
+                }
+            }
+            let branch_result = if let Some(stop) = stopped {
+                stop
+            } else if let Some(control) = cond_control {
+                partial(results, control)
+            } else {
+                owned_vec_to_result(results)
+            };
+            if rest.is_empty() {
+                return branch_result;
+            }
+            continue_rest_with_context::<W, S>(
+                branch_result,
+                rest,
+                root,
+                file_origin,
+                current_path,
+                optional,
+            )
+        }
+        Expr::Comma(exprs) => {
+            // Evaluate every branch through the path-context evaluator too,
+            // so `key`/`document_index`/`file_index` nested in a comma
+            // resolve correctly per-branch instead of falling back to the
+            // stub (#715 follow-up; `needs_path_context` already recurses
+            // into `Comma`, but there was no matching interpreter arm).
+            // Fans out independently and preserves output already produced
+            // before a later branch errors/breaks, matching the plain
+            // evaluator's `eval_comma` (line ~690) instead of re-deriving a
+            // different (collapse-to-array, discard-on-error) policy here.
+            let mut branch_outputs = Vec::new();
+            let mut stopped = None;
+            for sub_expr in exprs {
+                let step = eval_pipe_with_path_context_internal::<W, S>(
+                    core::slice::from_ref(sub_expr),
+                    value,
+                    root,
+                    file_origin,
+                    current_path,
+                    optional,
+                );
+                if let Some(stop) = accumulate_path_context_step(&mut branch_outputs, step) {
+                    stopped = Some(stop);
+                    break;
+                }
+            }
+            let comma_result = stopped.unwrap_or_else(|| owned_vec_to_result(branch_outputs));
+            if rest.is_empty() {
+                return comma_result;
+            }
+            continue_rest_with_context::<W, S>(
+                comma_result,
+                rest,
+                root,
+                file_origin,
+                current_path,
+                optional,
+            )
+        }
+        Expr::Try {
+            expr: try_expr,
+            catch,
+        } => {
+            // Evaluate the try body (and catch handler) through the
+            // path-context evaluator too, so `try select(file_index == 1)
+            // catch ...` -- a natural `--eval-all` idiom -- resolves
+            // correctly instead of falling back to the stub (#715
+            // follow-up). Mirrors `eval_try`'s Error/Break/Partial handling
+            // above, just routed through path context instead of
+            // `eval_single`.
+            let result = eval_pipe_with_path_context_internal::<W, S>(
+                core::slice::from_ref(try_expr),
+                value,
+                root,
+                file_origin,
+                current_path,
+                optional,
+            );
+            let try_result = match result {
+                QueryResult::Error(e) => match catch.as_deref() {
+                    Some(catch_expr) => eval_pipe_with_path_context_internal::<W, S>(
+                        core::slice::from_ref(catch_expr),
+                        &e.payload(),
+                        root,
+                        file_origin,
+                        current_path,
+                        optional,
+                    ),
+                    None => QueryResult::None,
+                },
+                QueryResult::Break(_) => match catch.as_deref() {
+                    Some(catch_expr) => eval_pipe_with_path_context_internal::<W, S>(
+                        core::slice::from_ref(catch_expr),
+                        &OwnedValue::Null,
+                        root,
+                        file_origin,
+                        current_path,
+                        optional,
+                    ),
+                    None => QueryResult::None,
+                },
+                QueryResult::Partial(prefix, Control::Error(e)) => {
+                    let handled = match catch.as_deref() {
+                        Some(catch_expr) => eval_pipe_with_path_context_internal::<W, S>(
+                            core::slice::from_ref(catch_expr),
+                            &e.payload(),
+                            root,
+                            file_origin,
+                            current_path,
+                            optional,
+                        ),
+                        None => QueryResult::None,
+                    };
+                    prepend(prefix, handled)
+                }
+                QueryResult::Partial(prefix, Control::Break(_)) => {
+                    let handled = match catch.as_deref() {
+                        Some(catch_expr) => eval_pipe_with_path_context_internal::<W, S>(
+                            core::slice::from_ref(catch_expr),
+                            &OwnedValue::Null,
+                            root,
+                            file_origin,
+                            current_path,
+                            optional,
+                        ),
+                        None => QueryResult::None,
+                    };
+                    prepend(prefix, handled)
+                }
+                other => other,
+            };
+            if rest.is_empty() {
+                return try_result;
+            }
+            continue_rest_with_context::<W, S>(
+                try_result,
+                rest,
+                root,
+                file_origin,
+                current_path,
+                optional,
+            )
+        }
+        Expr::Label { name, body } => {
+            // Evaluate the label body through the path-context evaluator
+            // too, so `label $out | ... file_index ...` -- a natural (if
+            // inert) wrapper -- resolves correctly instead of silently
+            // falling back to the 0/null stub. Paired with the
+            // `needs_path_context` fix for `Label`: one without the other
+            // still drops path context silently (#715 follow-up).
+            let result = eval_pipe_with_path_context_internal::<W, S>(
+                core::slice::from_ref(body),
+                value,
+                root,
+                file_origin,
+                current_path,
+                optional,
+            );
+            let label_result = match result {
+                QueryResult::Break(label) if &label == name => QueryResult::None,
+                QueryResult::Partial(prefix, Control::Break(label)) if &label == name => {
+                    owned_vec_to_result(prefix)
+                }
+                other => other,
+            };
+            if rest.is_empty() {
+                return label_result;
+            }
+            continue_rest_with_context::<W, S>(
+                label_result,
+                rest,
+                root,
+                file_origin,
+                current_path,
+                optional,
+            )
+        }
+        // `break` is a control signal, not a value -- `rest` (anything
+        // structurally following it once a flattened pipe is split at
+        // `exprs.split_first()`) never runs; the `Label` arm above is what
+        // catches this. Without this arm, `Expr::Break` fell into the
+        // generic fallback below, which unconditionally converts any
+        // `Control::Break` into a synthetic "break $label not in label"
+        // `EvalError` (`eval_owned_expr`, above) -- wrongly reporting a
+        // label miss even when a real enclosing `label` was present, just
+        // not visible to that fallback's single-expression evaluation
+        // (#715 follow-up).
+        Expr::Break(name) => QueryResult::Break(name.clone()),
         _ => {
             // For other expressions, evaluate normally and continue
             // Note: This loses path context for complex expressions
@@ -11964,6 +12737,7 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
                             rest,
                             &result,
                             root,
+                            file_origin,
                             current_path,
                             optional,
                         )
@@ -18290,6 +19064,7 @@ fn expand_func_calls_in_builtin(
         Builtin::Column => Builtin::Column,
         Builtin::DocumentIndex => Builtin::DocumentIndex,
         Builtin::LineComment => Builtin::LineComment,
+        Builtin::FileIndex => Builtin::FileIndex,
         Builtin::Shuffle => Builtin::Shuffle,
         Builtin::Pivot => Builtin::Pivot,
         Builtin::SplitDoc => Builtin::SplitDoc,
@@ -18591,6 +19366,7 @@ fn substitute_func_param_in_builtin(builtin: &Builtin, param: &str, arg: &Expr) 
         Builtin::Column => Builtin::Column,
         Builtin::DocumentIndex => Builtin::DocumentIndex,
         Builtin::LineComment => Builtin::LineComment,
+        Builtin::FileIndex => Builtin::FileIndex,
         Builtin::Shuffle => Builtin::Shuffle,
         Builtin::Pivot => Builtin::Pivot,
         Builtin::SplitDoc => Builtin::SplitDoc,
@@ -28394,6 +29170,827 @@ mod tests {
                 assert_eq!(s, "inner");
             }
         );
+    }
+
+    // Regression tests (#715 follow-up): `eval_pipe_with_path_context_internal`
+    // gained `Compare`/`Arithmetic`/`Select` arms for `--eval-all`'s
+    // `file_index`, but the `Compare`/`Arithmetic` arms unconditionally reset
+    // `current_path`/`root` for the rest of the pipe, breaking `key` (and
+    // `document_index`/`file_index`) in plain `jq` usage that has nothing to
+    // do with `--eval-all` -- e.g. `.[] | (1==1) | key`. Fixed by preserving
+    // path context instead, matching the pre-existing generic fallback.
+    // `If`/`Try`/`Comma`/`Label` had the same gap for a different reason: no
+    // explicit arm at all, so they fell into that same generic fallback
+    // which evaluates via the *plain* (non-path-context) evaluator, losing
+    // `key`/`file_index` for anything nested inside.
+
+    #[test]
+    fn test_key_survives_comparison_mid_pipe() {
+        assert_eq!(outputs(b"[10,20]", ".[] | (1==1) | key"), vec!["0", "1"]);
+    }
+
+    #[test]
+    fn test_key_survives_arithmetic_mid_pipe() {
+        assert_eq!(outputs(b"[10,20]", ".[] | (1+1) | key"), vec!["0", "1"]);
+    }
+
+    #[test]
+    fn test_key_survives_if_then_else_mid_pipe() {
+        assert_eq!(
+            outputs(b"[10,20]", ".[] | if true then key else null end"),
+            vec!["0", "1"]
+        );
+    }
+
+    #[test]
+    fn test_key_survives_try_catch_mid_pipe() {
+        assert_eq!(
+            outputs(b"[10,20]", ".[] | try key catch \"err\""),
+            vec!["0", "1"]
+        );
+    }
+
+    #[test]
+    fn test_key_survives_label_wrapper() {
+        assert_eq!(
+            outputs(b"[10,20]", "label $out | .[] | key"),
+            vec!["0", "1"]
+        );
+    }
+
+    #[test]
+    fn test_key_survives_comma_branches() {
+        // `(key, key)` fans out to independent top-level outputs, matching
+        // plain jq's `(a, b)` comma semantics -- not a single `[key, key]`
+        // array per element (#715 follow-up: the path-context `Comma` arm
+        // used to collapse every branch's outputs into one array and
+        // silently discard anything already produced once a later branch
+        // errored; fixed to reuse the same accumulate-independently policy
+        // `eval_comma` already has).
+        assert_eq!(
+            outputs(b"[10,20]", ".[] | (key, key)"),
+            vec!["0", "0", "1", "1"]
+        );
+    }
+
+    // Coverage-gap regression tests (PR #770 review): `--eval-all`'s
+    // path-context plumbing (`eval_pipe_with_path_context_internal`,
+    // `accumulate_path_context_step`, `continue_rest_with_context`) grew a
+    // lot of branches for `file_index`/`Compare`/`Arithmetic`/`Select`/
+    // `Map`/`If`/`Comma`/`Try`/`Label`, most reachable only through
+    // combinations the CLI-level `--eval-all` tests above don't happen to
+    // hit (e.g. a builtin followed by *more* pipe stages, an operand that
+    // itself errors, a condition that fans out to multiple values). These
+    // exercise them directly.
+
+    /// Every output of `filter` against `json`, evaluated through
+    /// `eval_owned_with_file_index` with `file_index` resolving against
+    /// `file_origin` -- the same entry point the `--eval-all` CLI driver
+    /// uses. Mirrors `outputs`, but for the path-context evaluator; panics
+    /// on `Error`/`Break`/`Partial` since those are asserted on directly via
+    /// `eval_all_result` where expected.
+    fn eval_all_outputs(json: &[u8], file_origin: &[usize], filter: &str) -> Vec<String> {
+        match eval_all_result(json, file_origin, filter) {
+            QueryResult::Owned(v) => vec![v.to_json()],
+            QueryResult::ManyOwned(vs) => vs.iter().map(OwnedValue::to_json).collect(),
+            QueryResult::None => vec![],
+            other => panic!("expected a successful result, got {other:?}"),
+        }
+    }
+
+    /// Like `eval_all_outputs`, but returns the raw `QueryResult` so a test
+    /// can assert on `Error`/`Break`/`Partial` too. `json` is fed straight
+    /// in as `eval_owned_with_file_index`'s `input` -- i.e. it plays the
+    /// role of the already-combined `--eval-all` array the yq CLI driver
+    /// builds, with `file_origin[i]` naming array element `i`'s origin file.
+    fn eval_all_result<'a>(
+        json: &[u8],
+        file_origin: &[usize],
+        filter: &str,
+    ) -> QueryResult<'a, Vec<u64>> {
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let input = to_owned(&cursor.value());
+        let expr = parse(filter).unwrap();
+        eval_owned_with_file_index::<Vec<u64>, JqSemantics>(&expr, &input, file_origin)
+    }
+
+    #[test]
+    fn test_key_continues_pipe_after_itself() {
+        assert_eq!(
+            outputs(b"[10,20]", ".[] | key | tostring"),
+            vec![r#""0""#, r#""1""#]
+        );
+    }
+
+    #[test]
+    fn test_file_index_continues_pipe_after_itself() {
+        assert_eq!(
+            eval_all_outputs(b"[10,20]", &[7, 8], ".[] | file_index | tostring"),
+            vec![r#""7""#, r#""8""#]
+        );
+    }
+
+    #[test]
+    fn test_generic_builtin_continues_pipe_with_path_context() {
+        // `tostring` (any builtin without its own dedicated path-context
+        // arm) followed by yet another stage, not just used as the pipe's
+        // final value.
+        assert_eq!(
+            eval_all_outputs(
+                b"[10,20]",
+                &[100, 8],
+                ".[] | file_index | tostring | length"
+            ),
+            vec!["3", "1"]
+        );
+    }
+
+    #[test]
+    fn test_array_construction_continues_pipe_with_path_context() {
+        // An array literal resets path/root to the newly constructed value
+        // (it's not navigation), but must still continue the rest of the
+        // pipe rather than short-circuiting.
+        assert_eq!(
+            eval_all_outputs(b"[10,20]", &[7, 8], ".[] | file_index | [., 1] | length"),
+            vec!["2", "2"]
+        );
+    }
+
+    #[test]
+    fn test_parent_continues_pipe_with_path_context() {
+        assert_eq!(
+            eval_all_outputs(
+                br#"[{"a":1},{"a":2}]"#,
+                &[7, 8],
+                ".[] | .a | parent | file_index"
+            ),
+            vec!["7", "8"]
+        );
+    }
+
+    #[test]
+    fn test_parent_n_continues_pipe_with_path_context() {
+        assert_eq!(
+            eval_all_outputs(
+                br#"[{"a":1},{"a":2}]"#,
+                &[7, 8],
+                ".[] | .a | parent(1) | file_index"
+            ),
+            vec!["7", "8"]
+        );
+    }
+
+    #[test]
+    fn test_identity_continues_pipe_with_path_context() {
+        assert_eq!(
+            eval_all_outputs(b"[10,20]", &[7, 8], ".[] | . | file_index"),
+            vec!["7", "8"]
+        );
+    }
+
+    #[test]
+    fn test_optional_as_final_pipe_stage_with_path_context() {
+        assert_eq!(
+            eval_all_outputs(b"[10,20]", &[7, 8], ".[] | (file_index)?"),
+            vec!["7", "8"]
+        );
+    }
+
+    #[test]
+    fn test_optional_continues_pipe_with_path_context() {
+        assert_eq!(
+            eval_all_outputs(b"[10,20]", &[7, 8], ".[] | (file_index)? | tostring"),
+            vec![r#""7""#, r#""8""#]
+        );
+    }
+
+    #[test]
+    fn test_object_iterate_path_context_stops_on_error() {
+        // Same "stop early, don't discard the escaping control" contract
+        // the array-`.[]` loop above already has a test for, but for the
+        // `OwnedValue::Object` iteration branch specifically.
+        let expr = parse(r#".[] | if key == "a" then error("boom") else file_index end"#).unwrap();
+        let input = OwnedValue::Object(IndexMap::from([
+            ("a".to_string(), OwnedValue::Int(1)),
+            ("b".to_string(), OwnedValue::Int(2)),
+        ]));
+        match eval_owned_with_file_index::<Vec<u64>, JqSemantics>(&expr, &input, &[]) {
+            QueryResult::Error(e) => assert_eq!(e.message, "boom"),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_arithmetic_left_operand_error_propagates() {
+        match eval_all_result(b"[1]", &[0], r#".[] | (error("boom") + 1) | file_index"#) {
+            QueryResult::Error(e) => assert_eq!(e.message, "boom"),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_arithmetic_right_operand_error_propagates() {
+        match eval_all_result(b"[1]", &[0], r#".[] | (1 + error("boom")) | file_index"#) {
+            QueryResult::Error(e) => assert_eq!(e.message, "boom"),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_arithmetic_every_op_reachable_with_path_context() {
+        assert_eq!(
+            eval_all_outputs(b"[10]", &[0], ".[] | (file_index - 1) | tostring"),
+            vec![r#""-1""#]
+        );
+        assert_eq!(
+            eval_all_outputs(b"[10]", &[6], ".[] | (file_index % 4) | tostring"),
+            vec![r#""2""#]
+        );
+    }
+
+    #[test]
+    fn test_arithmetic_division_error_propagates_with_path_context() {
+        match eval_all_result(b"[1]", &[0], ".[] | (1 / 0) | file_index") {
+            QueryResult::Error(_) => {}
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_arithmetic_optional_division_error_becomes_none_with_path_context() {
+        assert_eq!(
+            eval_all_outputs(b"[1]", &[0], ".[] | (1 / 0)? | file_index"),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn test_compare_left_operand_error_propagates() {
+        match eval_all_result(b"[1]", &[0], r#".[] | (error("boom") == 1) | file_index"#) {
+            QueryResult::Error(e) => assert_eq!(e.message, "boom"),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_compare_right_operand_error_propagates() {
+        match eval_all_result(b"[1]", &[0], r#".[] | (1 == error("boom")) | file_index"#) {
+            QueryResult::Error(e) => assert_eq!(e.message, "boom"),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_map_over_object_with_path_context() {
+        assert_eq!(
+            eval_all_outputs(br#"[{"a":1,"b":2}]"#, &[9], ".[] | map(file_index)"),
+            vec!["[9,9]"]
+        );
+    }
+
+    #[test]
+    fn test_map_over_non_container_errors_with_path_context() {
+        match eval_all_result(b"[5]", &[0], ".[] | map(file_index)") {
+            QueryResult::Error(_) => {}
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_map_over_non_container_optional_is_none_with_path_context() {
+        assert_eq!(
+            eval_all_outputs(b"[5]", &[0], ".[] | map(file_index)?"),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn test_map_element_partial_error_propagates_with_path_context() {
+        match eval_all_result(
+            b"[[1]]",
+            &[0],
+            r#".[] | map((1, error("boom"))) | file_index"#,
+        ) {
+            QueryResult::Error(e) => assert_eq!(e.message, "boom"),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_map_element_partial_break_propagates_with_path_context() {
+        match eval_all_result(b"[[1]]", &[0], ".[] | map((1, break $out)) | file_index") {
+            QueryResult::Break(label) => assert_eq!(label, "out"),
+            other => panic!("expected Break, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_map_continues_pipe_with_path_context() {
+        assert_eq!(
+            eval_all_outputs(b"[[1,2]]", &[9], ".[] | map(file_index) | length"),
+            vec!["2"]
+        );
+    }
+
+    #[test]
+    fn test_if_cond_empty_produces_none_with_path_context() {
+        // `.arr[]` on an empty array produces bare `QueryResult::None`
+        // directly, so the `If` cond -- and thus the whole `if`/`then`/
+        // `else` -- does too, feeding `continue_rest_with_context`'s
+        // top-level `None` arm (rather than the "false, take else" case a
+        // non-empty falsy cond would).
+        assert_eq!(
+            eval_all_outputs(
+                br#"[{"arr":[]}]"#,
+                &[3],
+                ".[] | (if .arr[] then 1 else 2 end) | file_index"
+            ),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn test_if_branch_error_propagates_through_continuation_with_path_context() {
+        match eval_all_result(
+            b"[1]",
+            &[0],
+            r#".[] | (if true then error("boom") else 1 end) | file_index"#,
+        ) {
+            QueryResult::Error(e) => assert_eq!(e.message, "boom"),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_if_branch_break_propagates_through_continuation_with_path_context() {
+        match eval_all_result(
+            b"[1]",
+            &[0],
+            ".[] | (if true then break $out else 1 end) | file_index",
+        ) {
+            QueryResult::Break(label) => assert_eq!(label, "out"),
+            other => panic!("expected Break, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_if_cond_many_owned_with_path_context() {
+        // `cond` itself fans out to more than one value with no error at
+        // all (`.arr[]` over two truthy elements) -- the `ManyOwned` arm of
+        // the cond-unpacking match, sibling to the `Owned`/`None`/`Error`/
+        // `Break`/`Partial` ones the other `test_if_cond_*` tests cover.
+        assert_eq!(
+            eval_all_outputs(
+                br#"[{"arr":[1,2]}]"#,
+                &[5],
+                ".[] | (if .arr[] then 1 else 2 end) | file_index"
+            ),
+            vec!["5", "5"]
+        );
+    }
+
+    #[test]
+    fn test_if_cond_bare_error_with_path_context() {
+        // `cond` itself is a bare error (not a `Comma` that produced some
+        // output first), so the cond-unpacking match's `Error` arm builds
+        // an empty-values, `Some(Control::Error(_))` pair directly, unlike
+        // `test_if_cond_partial_error_drives_partial_branch_result_with_path_context`'s
+        // `Partial` cond result.
+        match eval_all_result(
+            b"[1]",
+            &[0],
+            r#".[] | (if error("boom") then 1 else 2 end) | file_index"#,
+        ) {
+            QueryResult::Error(e) => assert_eq!(e.message, "boom"),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_if_cond_bare_break_with_path_context() {
+        match eval_all_result(
+            b"[1]",
+            &[0],
+            ".[] | (if break $out then 1 else 2 end) | file_index",
+        ) {
+            QueryResult::Break(label) => assert_eq!(label, "out"),
+            other => panic!("expected Break, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_if_cond_partial_error_drives_partial_branch_result_with_path_context() {
+        // `cond` itself fans out to more than one value and then errors
+        // (`(true, error("boom"))`): the branch loop finishes normally for
+        // every value `cond` did produce, so the trailing control has to be
+        // reapplied *after* the loop rather than short-circuiting it. The
+        // branch's own output (`1`) must still be piped through the rest of
+        // the pipe (`| file_index`, which ignores its input and reads only
+        // `current_path`) before landing in `vs` -- so the surviving prefix
+        // is `file_index`'s resolved `0`, not the raw branch value `1`.
+        match eval_all_result(
+            b"[1]",
+            &[0],
+            r#".[] | (if (true, error("boom")) then 1 else 2 end) | file_index"#,
+        ) {
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(vs, vec![OwnedValue::Int(0)]);
+                assert_eq!(e.message, "boom");
+            }
+            other => panic!("expected Partial, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_comma_partial_error_propagates_through_continuation_with_path_context() {
+        // The comma's own prefix output (`1`) must be piped through the
+        // rest of the pipe (`| file_index`) before landing in `vs`, exactly
+        // like `pipe_owned_prefix` does for the plain evaluator -- so the
+        // surviving prefix is `file_index`'s resolved `0`, not the raw
+        // comma value `1`.
+        match eval_all_result(b"[1]", &[0], r#".[] | (1, error("boom")) | file_index"#) {
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(vs, vec![OwnedValue::Int(0)]);
+                assert_eq!(e.message, "boom");
+            }
+            other => panic!("expected Partial, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_try_catch_partial_prefix_continues_pipe_with_path_context() {
+        // `try`/`catch` reaching `continue_rest_with_context` with a
+        // `Partial` intermediate (the `catch` branch's own generator fans
+        // out and then errors) must still pipe its prefix through the rest
+        // of the pipe rather than passing the raw pre-`rest` value through.
+        match eval_all_result(
+            b"[1]",
+            &[0],
+            r#".[] | (try (1, error("x")) catch (2, error("y"))) | file_index"#,
+        ) {
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(vs, vec![OwnedValue::Int(0), OwnedValue::Int(0)]);
+                assert_eq!(e.message, "y");
+            }
+            other => panic!("expected Partial, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_label_break_partial_prefix_continues_pipe_with_path_context() {
+        // Same shape as the `try`/`catch` case above, via `label`/`break`.
+        match eval_all_result(
+            b"[1]",
+            &[0],
+            r".[] | (label $out | (1, break $out)) | file_index",
+        ) {
+            QueryResult::Owned(v) => assert_eq!(v, OwnedValue::Int(0)),
+            other => panic!("expected Owned, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_select_fanout_produces_many_owned_with_path_context() {
+        // `select(.tags[])` on an element whose `.tags` has two truthy
+        // entries fans `cond` out to two truthy bits, so `select`'s own
+        // `eval_fanout` accumulates a genuine `ManyOwned` (not the
+        // single-`Owned`/empty-`Many` shapes every other `select` test in
+        // this file produces) -- routed onward through
+        // `continue_rest_with_context`'s `ManyOwned` loop since `|
+        // file_index` follows.
+        assert_eq!(
+            eval_all_outputs(
+                br#"[{"tags":["a","b"]}]"#,
+                &[9],
+                ".[] | select(.tags[]) | file_index"
+            ),
+            vec!["9", "9"]
+        );
+    }
+
+    #[test]
+    fn test_try_catches_error_with_path_context() {
+        assert_eq!(
+            eval_all_outputs(
+                b"[10,20]",
+                &[7, 8],
+                r#".[] | try error("boom") catch file_index"#
+            ),
+            vec!["7", "8"]
+        );
+    }
+
+    #[test]
+    fn test_try_without_catch_swallows_error_with_path_context() {
+        assert_eq!(
+            eval_all_outputs(
+                b"[10,20]",
+                &[7, 8],
+                r#".[] | (try error("boom")) | file_index"#
+            ),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn test_try_catches_break_with_path_context() {
+        assert_eq!(
+            eval_all_outputs(
+                b"[10,20]",
+                &[7, 8],
+                ".[] | try (break $out) catch file_index"
+            ),
+            vec!["7", "8"]
+        );
+    }
+
+    #[test]
+    fn test_try_without_catch_swallows_break_with_path_context() {
+        assert_eq!(
+            eval_all_outputs(b"[10,20]", &[7, 8], ".[] | (try (break $out)) | file_index"),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn test_try_catches_partial_error_with_path_context() {
+        assert_eq!(
+            eval_all_outputs(
+                b"[10,20]",
+                &[7, 8],
+                r#".[] | try (1, error("boom")) catch file_index"#
+            ),
+            vec!["1", "7", "1", "8"]
+        );
+    }
+
+    #[test]
+    fn test_try_without_catch_prepends_partial_error_prefix_with_path_context() {
+        assert_eq!(
+            eval_all_outputs(
+                b"[10,20]",
+                &[7, 8],
+                r#".[] | (try (1, error("boom"))) | file_index"#
+            ),
+            vec!["7", "8"]
+        );
+    }
+
+    #[test]
+    fn test_try_catches_partial_break_with_path_context() {
+        assert_eq!(
+            eval_all_outputs(
+                b"[10,20]",
+                &[7, 8],
+                ".[] | try (1, break $out) catch file_index"
+            ),
+            vec!["1", "7", "1", "8"]
+        );
+    }
+
+    #[test]
+    fn test_try_without_catch_prepends_partial_break_prefix_with_path_context() {
+        assert_eq!(
+            eval_all_outputs(
+                b"[10,20]",
+                &[7, 8],
+                ".[] | (try (1, break $out)) | file_index"
+            ),
+            vec!["7", "8"]
+        );
+    }
+
+    #[test]
+    fn test_label_catches_its_own_bare_break_with_path_context() {
+        // The break fires on the very first element, so the enclosing
+        // `.[]` loop's fan-out aborts with zero accumulated output --
+        // `result` is a bare `Break`, not a `Partial`.
+        assert_eq!(
+            eval_all_outputs(
+                b"[10,20]",
+                &[7, 8],
+                "label $out | .[] | if key == 0 then break $out else file_index end"
+            ),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn test_label_catches_partial_break_with_path_context() {
+        // The break fires on the second element, after the first already
+        // produced output -- `result` is `Partial(prefix, Break(_))`, and
+        // catching it must keep the prefix rather than discarding it.
+        assert_eq!(
+            eval_all_outputs(
+                b"[10,20]",
+                &[7, 8],
+                "label $out | .[] | if key == 1 then break $out else file_index end"
+            ),
+            vec!["7"]
+        );
+    }
+
+    #[test]
+    fn test_label_continues_pipe_with_path_context() {
+        assert_eq!(
+            eval_all_outputs(
+                b"[10,20]",
+                &[7, 8],
+                ".[] | (label $out | file_index) | tostring"
+            ),
+            vec![r#""7""#, r#""8""#]
+        );
+    }
+
+    #[test]
+    fn test_file_index_inside_user_defined_function() {
+        // `eval_owned_with_file_index`'s own doc comment: user-defined
+        // functions are out of scope for `--eval-all` path-context
+        // resolution, the same pre-existing limit `key`/`document_index`
+        // already have -- `needs_path_context` doesn't see through a
+        // `FuncCall`, so `.[] | f` never routes through path-context
+        // evaluation and `file_index` inside `f`'s body falls back to its
+        // default (0) rather than resolving per-element. This exercises
+        // `expand_func_calls`'s `FileIndex` arm (hit while inlining `f`'s
+        // body at call time), not per-element resolution --
+        // `test_file_index_continues_pipe_after_itself` covers that.
+        assert_eq!(
+            eval_all_outputs(b"[10,20]", &[3, 4], "def f: file_index; .[] | f"),
+            vec!["0", "0"]
+        );
+    }
+
+    #[test]
+    fn test_file_index_inside_parameterized_user_defined_function() {
+        // Same scope boundary as above, via `substitute_func_param`'s
+        // `FileIndex` arm instead of `expand_func_calls`'s.
+        assert_eq!(
+            eval_all_outputs(b"[10]", &[9], "def f($x): (file_index, $x); .[] | f(1)"),
+            vec!["0", "1"]
+        );
+    }
+
+    // The remaining branches in this plumbing are provably unreachable
+    // through any real filter, so they're exercised directly against the
+    // private functions instead of via a filter: `accumulate_path_context_step`'s
+    // `One` and `continue_rest_with_context`'s `One`/non-empty-`Many` exist
+    // only because `eval_fanout` (shared with plain `select`) is generic
+    // over borrowed-cursor results, but the `Select` arm's own fan-out body
+    // (`Owned`/`None` only, never `One`/`Many`) can never construct a
+    // non-empty borrowed variant.
+
+    #[test]
+    fn test_accumulate_path_context_step_handles_borrowed_one() {
+        let bytes: &[u8] = b"42";
+        let index = JsonIndex::build(bytes);
+        let cursor = index.root(bytes);
+        let sj = cursor.value();
+
+        let mut results = Vec::new();
+        let stop = accumulate_path_context_step::<Vec<u64>>(&mut results, QueryResult::One(sj));
+        assert!(stop.is_none());
+        assert_eq!(results, vec![OwnedValue::Int(42)]);
+    }
+
+    #[test]
+    fn test_continue_rest_with_context_handles_borrowed_one() {
+        let bytes: &[u8] = b"42";
+        let index = JsonIndex::build(bytes);
+        let cursor = index.root(bytes);
+        let sj = cursor.value();
+        let rest_expr = parse("tostring").unwrap();
+
+        let result = continue_rest_with_context::<Vec<u64>, JqSemantics>(
+            QueryResult::One(sj),
+            core::slice::from_ref(&rest_expr),
+            &OwnedValue::Null,
+            None,
+            &[],
+            false,
+        );
+        match result {
+            QueryResult::Owned(OwnedValue::String(s)) => assert_eq!(s, "42"),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_continue_rest_with_context_handles_borrowed_many() {
+        let bytes: &[u8] = br#"{"a": [1, false, 2]}"#;
+        let index = JsonIndex::build(bytes);
+        let cursor = index.root(bytes);
+        let many = match eval::<Vec<u64>, JqSemantics>(&parse(".a[] // 9").unwrap(), cursor) {
+            QueryResult::Many(vs) => vs,
+            other => panic!("expected Many, got {other:?}"),
+        };
+        assert_eq!(many.len(), 2);
+
+        let rest_expr = parse("tostring").unwrap();
+        let result = continue_rest_with_context::<Vec<u64>, JqSemantics>(
+            QueryResult::Many(many),
+            core::slice::from_ref(&rest_expr),
+            &OwnedValue::Null,
+            None,
+            &[],
+            false,
+        );
+        match result {
+            QueryResult::ManyOwned(vs) => {
+                assert_eq!(
+                    vs,
+                    vec![
+                        OwnedValue::String("1".to_string()),
+                        OwnedValue::String("2".to_string())
+                    ]
+                );
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_continue_rest_with_context_many_owned_loop_stops_on_error() {
+        // `(1, 2)` (a `Comma`, evaluated with no error at all) hands
+        // `continue_rest_with_context` a genuine `ManyOwned([1, 2])`
+        // intermediate; erroring on the *second* value while continuing
+        // `rest` per-element exercises the loop's early-return "stop" path
+        // rather than the case (`test_select_fanout_produces_many_owned_with_path_context`)
+        // where every element's continuation succeeds.
+        match eval_all_result(
+            b"1",
+            &[0],
+            r#"(1, 2) | if . == 2 then error("boom") else file_index end"#,
+        ) {
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(vs, vec![OwnedValue::Int(0)]);
+                assert_eq!(e.message, "boom");
+            }
+            other => panic!("expected Partial, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_continue_rest_with_context_borrowed_many_loop_stops_on_error() {
+        // Same "stop early, keep the prefix" contract as the `ManyOwned`
+        // loop above, for the borrowed-cursor `Many` loop -- reachable
+        // only via a direct call (see the borrowed-`One`/`Many` tests
+        // above for why).
+        let bytes: &[u8] = br#"{"a": [1, 2]}"#;
+        let index = JsonIndex::build(bytes);
+        let cursor = index.root(bytes);
+        let many = match eval::<Vec<u64>, JqSemantics>(&parse(".a[]").unwrap(), cursor) {
+            QueryResult::Many(vs) => vs,
+            other => panic!("expected Many, got {other:?}"),
+        };
+        assert_eq!(many.len(), 2);
+
+        let rest_expr = parse(r#"if . == 2 then error("boom") else tostring end"#).unwrap();
+        let result = continue_rest_with_context::<Vec<u64>, JqSemantics>(
+            QueryResult::Many(many),
+            core::slice::from_ref(&rest_expr),
+            &OwnedValue::Null,
+            None,
+            &[],
+            false,
+        );
+        match result {
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(vs, vec![OwnedValue::String("1".to_string())]);
+                assert_eq!(e.message, "boom");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_generic_fallback_continues_pipe_with_path_context() {
+        // `1 as $x | $x` (`Expr::As`) has no dedicated path-context arm, so
+        // it falls into the generic `_` fallback -- which must still
+        // continue the rest of the pipe (here, `file_index`) rather than
+        // treating itself as the pipe's final value.
+        assert_eq!(
+            eval_all_outputs(b"[10,20]", &[7, 8], ".[] | (1 as $x | $x) | file_index"),
+            vec!["7", "8"]
+        );
+    }
+
+    #[test]
+    fn test_key_continues_pipe_after_itself_yq_semantics() {
+        // Same shape as `test_key_continues_pipe_after_itself`, but through
+        // `YqSemantics` -- the generic path-context functions are
+        // monomorphized per `EvalSemantics` impl, and the yq CLI (the only
+        // real caller of the eval-all-adjacent parts of this file) always
+        // uses `YqSemantics`, never `JqSemantics`.
+        let index = JsonIndex::build(b"[10,20]");
+        let cursor = index.root(b"[10,20]");
+        let expr = parse(".[] | key | tostring").unwrap();
+        let out: Vec<String> = eval::<Vec<u64>, YqSemantics>(&expr, cursor)
+            .collect_owned()
+            .iter()
+            .map(OwnedValue::to_json)
+            .collect();
+        assert_eq!(out, vec![r#""0""#, r#""1""#]);
     }
 
     // Phase 12 tests: Additional builtins

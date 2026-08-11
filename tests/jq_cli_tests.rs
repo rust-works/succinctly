@@ -3077,6 +3077,66 @@ fn test_path_context_builtins_across_pipe_stages_554() -> Result<()> {
     Ok(())
 }
 
+/// Regression tests (#715 follow-up) for the path-context evaluator's
+/// fan-out loops (`Iterate`, `If`'s multi-valued `cond`, `Comma`, `Select`):
+/// each independently collapsed an escaping `break` or `error` to a bare
+/// synthetic error / `None`, discarding output already produced by earlier
+/// iterations. Fixed by routing every loop through a shared
+/// accumulate-or-stop helper that matches the plain evaluator's `eval_comma`
+/// (#400/#494) semantics instead of re-deriving (and mis-deriving) the same
+/// logic per arm.
+#[test]
+fn test_path_context_fanout_preserves_output_before_break_or_error_715() -> Result<()> {
+    // `break` inside `if`/`then`/`else` whose `cond` needs path context
+    // (`key`) used to wrongly report "break $out not in label" even though
+    // the label genuinely enclosed it -- `Expr::Break` had no arm in the
+    // path-context evaluator and fell into a fallback that unconditionally
+    // converts `Control::Break` into a synthetic error.
+    let (stdout, _stderr, code) = run_jq_full(
+        &["label $out | .[] | if key == 1 then break $out else key end"],
+        Some("[10,20,30]"),
+    )?;
+    assert_eq!(stdout, "0\n");
+    assert_eq!(code, 0);
+
+    // `Iterate` (`.[]`) used to discard output from earlier elements when a
+    // later element's path-context-dependent branch errored.
+    let (stdout, stderr, code) = run_jq_full(
+        &[".[] | if key == 2 then error(\"boom\") else key end"],
+        Some("[10,20,30]"),
+    )?;
+    assert_eq!(stdout, "0\n1\n");
+    assert!(stderr.contains("boom"), "expected the error, got: {stderr}");
+    assert_eq!(code, 5);
+
+    // `Comma` used to discard an earlier branch's output on a later
+    // branch's error (and also collapsed independent branch outputs into a
+    // single array, unlike plain jq's `(a, b)`).
+    let (stdout, stderr, code) = run_jq_full(&[".[0] | (key, error(\"boom\"))"], Some("[10,20]"))?;
+    assert_eq!(stdout, "0\n");
+    assert!(stderr.contains("boom"), "expected the error, got: {stderr}");
+    assert_eq!(code, 5);
+
+    // `(key, key)` now fans out to independent top-level outputs, matching
+    // plain jq's comma semantics instead of collapsing per-element into a
+    // `[key, key]` array.
+    let (stdout, _stderr, code) = run_jq_full(&[".[] | (key, key)"], Some("[10,20]"))?;
+    assert_eq!(stdout, "0\n0\n1\n1\n");
+    assert_eq!(code, 0);
+
+    // `Select`'s continuation used to collapse a `Partial`/`Break` result to
+    // a bare `None`; it now delegates to the same shared helper.
+    let (stdout, stderr, code) = run_jq_full(
+        &[".[] | select(key == 0, error(\"boom\"))"],
+        Some("[10,20]"),
+    )?;
+    assert_eq!(stdout, "10\n");
+    assert!(stderr.contains("boom"), "expected the error, got: {stderr}");
+    assert_eq!(code, 5);
+
+    Ok(())
+}
+
 /// `keys_unsorted` stays lazy through `length`/`.[]`/`.[n]`/`first`/`last`
 /// (#140), backed by a new `JqValue::LazyKeysArray` output writer in
 /// `print_json`. Uses `run_jq_full` (the pre-built binary) to exercise that

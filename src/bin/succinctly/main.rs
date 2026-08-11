@@ -976,6 +976,20 @@ pub enum InputFormat {
     Json,
 }
 
+/// Front matter handling mode for `--front-matter`
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum FrontMatterMode {
+    /// Evaluate the expression against only the YAML front matter, discard
+    /// the trailing body content.
+    #[value(name = "extract")]
+    Extract,
+    /// Evaluate the expression against the YAML front matter, then re-emit
+    /// the transformed front matter followed by the original trailing body,
+    /// unchanged.
+    #[value(name = "process")]
+    Process,
+}
+
 /// Command-line YAML processor (yq-compatible)
 #[derive(Debug, Parser)]
 #[command(name = "yq")]
@@ -1002,6 +1016,15 @@ pub struct YqCommand {
     #[arg(short = 's', long)]
     pub slurp: bool,
 
+    /// Combine all documents from all files into one evaluation context
+    /// (yq-compatible name: `eval-all`/`ea`), exposing `file_index`/
+    /// `fileIndex`/`fi` for cross-file merges. Unlike real yq, expressions
+    /// must use explicit `.[]` iteration (e.g. `.[] | select(file_index ==
+    /// 0)`) rather than a bare top-level `select(...)` -- see
+    /// docs/reference/yq-language.md for the full deviation (#715).
+    #[arg(long = "eval-all", alias = "ea")]
+    pub eval_all: bool,
+
     /// Validate YAML strictly (opt-in) before processing. Reports line:column
     /// errors and exits without producing output on the first violation.
     #[arg(long)]
@@ -1015,6 +1038,13 @@ pub struct YqCommand {
         default_value = "auto"
     )]
     pub input_format: InputFormat,
+
+    /// Treat input as text with a `---`-fenced YAML front matter header
+    /// (e.g. Markdown). `extract` evaluates the expression against just the
+    /// front matter and discards the body; `process` re-emits the
+    /// transformed front matter followed by the untouched body.
+    #[arg(long = "front-matter", value_name = "MODE")]
+    pub front_matter: Option<FrontMatterMode>,
 
     // === Output Options ===
     /// Output format type [yaml, json, auto] (default: yaml)
@@ -1073,6 +1103,17 @@ pub struct YqCommand {
     /// Update the file in place
     #[arg(short = 'i', long)]
     pub inplace: bool,
+
+    /// Split output into multiple files, one per result, named by evaluating
+    /// EXPR against each result (`.` is the result; `$index` is that
+    /// result's zero-based output index across the whole run; --arg/
+    /// --argjson values and $ARGS are also available, same as the main
+    /// filter). Suppresses normal stdout output.
+    ///
+    /// Deliberately long-only, unlike real yq's `-s`/`--split-exp`:
+    /// succinctly's `-s` is already `--slurp` (#715).
+    #[arg(long = "split-exp", value_name = "EXPR")]
+    pub split_exp: Option<String>,
 
     // === Program Input ===
     /// Read filter from file instead of command line
@@ -2196,6 +2237,7 @@ mod corpus_stats;
 mod dsv_bench;
 mod dsv_generators;
 mod env_config;
+mod front_matter;
 mod generators;
 mod jq_bench;
 mod jq_locate;

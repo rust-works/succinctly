@@ -818,6 +818,17 @@ pub enum Builtin {
     DocumentIndex,
     /// `line_comment` - return the trailing same-line comment text, or "" (yq, #710)
     LineComment,
+    /// `file_index` / `fileIndex` / `fi` - return the 0-indexed origin file
+    /// position within an `--eval-all` combined evaluation (yq/succinctly
+    /// extension, #715). Resolves via the same `current_path`-derived
+    /// mechanism as `key`, not `document_index`'s cursor mechanism, since
+    /// only that path reaches the combined-array evaluation `--eval-all`
+    /// requires. Outside `--eval-all` (or reachable through the same
+    /// supported shapes `key`/`document_index` already document — plain
+    /// navigation/`select`/comparisons, not `map`/`if`/literals/user
+    /// functions), returns 0 -- the same "0 outside supported context"
+    /// contract `document_index` already has today.
+    FileIndex,
     /// `shuffle` - randomly shuffle array elements (yq)
     Shuffle,
     /// `pivot` - transpose arrays/objects (yq)

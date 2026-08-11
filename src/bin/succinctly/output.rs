@@ -114,6 +114,7 @@ impl core::fmt::Display for InputLocation {
 #[derive(Debug, Default)]
 pub struct ErrorSink {
     hit: bool,
+    report_count: usize,
 }
 
 impl ErrorSink {
@@ -143,11 +144,23 @@ impl ErrorSink {
             DiagStyle::Yq => eprintln!("Error: {message}"),
         }
         self.hit = true;
+        self.report_count += 1;
     }
 
     /// Whether any uncaught error was reported during the run.
     pub fn hit(&self) -> bool {
         self.hit
+    }
+
+    /// How many uncaught errors have been reported so far. Unlike `hit()`
+    /// (sticky for the whole run, once true never false again), this lets a
+    /// caller detect whether *this specific call* reported anything, by
+    /// comparing the count before and after -- `hit()` alone can't tell
+    /// "just reported" from "reported earlier, unrelated to this call" once
+    /// any prior error has already flipped it (#715 follow-up: this is what
+    /// `write_split_result` needs to avoid double-reporting).
+    pub fn report_count(&self) -> usize {
+        self.report_count
     }
 }
 

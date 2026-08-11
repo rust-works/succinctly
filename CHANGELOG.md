@@ -62,6 +62,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`yq` gains `--front-matter`, `--split-exp`, and `--eval-all`/`file_index`**
+  (#715), closing three real `yq` CLI gaps found by a systematic gap-audit:
+  - `--front-matter=extract|process` operates on YAML embedded as front
+    matter in another file (e.g. a Markdown post's `---`-fenced header):
+    `extract` evaluates the expression against just the front matter,
+    discarding the body; `process` re-emits the transformed front matter
+    followed by the original body, byte-for-byte unchanged.
+  - `--split-exp EXPR` splits output into one file per result, named by
+    evaluating `EXPR` against it (`.` is the result, `$index` its 0-based
+    output index). Deliberately long-only, unlike real yq's `-s`/
+    `--split-exp`: succinctly's `-s` is already `--slurp`.
+  - `--eval-all`/`--ea` combines every document from every file into one
+    evaluation context, exposing a new `file_index`/`fileIndex`/`fi`
+    builtin for cross-file merges (`.[] | select(file_index == 0)`).
+    Requires explicit `.[]` iteration, unlike real yq's implicit
+    node-list broadcast (`select(fileIndex == 0)` with no `.[]`) — a
+    deliberate, documented scope boundary given succinctly's evaluator has
+    one scalar value per evaluation, not a broadcasting node list.
+    Building it surfaced and fixed a pre-existing gap: `key`/
+    `document_index` (and now `file_index`) inside a `select(...)`
+    condition or a comparison (`select(key >= 1)`, `document_index == 0`)
+    previously fell back to their 0/null stub instead of resolving via
+    path context, because `needs_path_context` never recursed into
+    `Expr::Select`/`Expr::Compare`/`Expr::Arithmetic`.
+  - See [yq Language Reference](docs/reference/yq-language.md#cross-file-operations-succinctly-extension)
+    for the full `--eval-all` deviation and supported idioms.
+
 - **jq `@csv`/`@tsv`/`@dsv`/`@sh` allocation overhead investigated: no
   measurable end-to-end effect** (#647, follow-up to #124's real win for
   `@uri`/`@html`): a byte-scanning rewrite of the four format functions was
@@ -205,6 +232,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   surface.
 
 ### Fixed
+
+- **`yq --front-matter`/`--split-exp`/`--eval-all` correctness fixes found
+  reviewing #715 before merge**:
+  - `--front-matter=extract --inplace` overwrote the target file with just
+    the transformed front matter, discarding everything after the closing
+    fence — `extract` mode captures no body to reattach (only `process`
+    does). Now rejected with a clear error; use `--front-matter=process` to
+    edit in place.
+  - The path-context evaluator's shared `Partial`-result continuation
+    (`continue_rest_with_context`, reached by `Select`/`Map`/`If`/`Comma`/
+    `Try`/`Label`) skipped piping its already-produced values through the
+    rest of the pipe: `.[] | (1, error("boom")) | file_index` returned the
+    raw `1` instead of `file_index`'s resolved value, and silently dropped
+    any error the rest of the pipe would itself have raised.
+  - `--eval-all` never routed its output through the `SplitDocState` state
+    machine every other output path uses, so `--eval-all '... | split_doc'`
+    silently merged every result with zero `---` separators.
+  - `--split-exp`'s expression never received `--arg`/`--argjson`/`$ARGS`
+    substitution (only `$index` was bound per result), so a filename
+    expression referencing an `--arg` value failed as an undefined variable
+    even though the same `--arg` works for the main filter.
+  - `--front-matter`'s fence detection scanned only for `\n`, so a file with
+    classic-Mac (`\r`-only) line endings collapsed into one "line" and its
+    front matter was misreported as unterminated — the same failure class
+    #324 already fixed for the YAML parser — and a leading UTF-8 BOM
+    defeated fence detection entirely, both now fixed by routing through
+    the shared `text::line_break` rule.
+  - `apply_front_matter` silently forced `InputFormat::Yaml` even when the
+    caller explicitly passed `--input-format json`; now rejected instead.
+
+  Also documented two pre-existing behaviors, not bugs, found along the
+  way: `--slurp`/`--eval-all` output carries no comments (both combine
+  documents through the `OwnedValue` DOM, which has none to carry), and
+  `--front-matter`'s position builtins (`at_offset`/`at_position`/`line`/
+  `column`) resolve against the extracted YAML block's own coordinates,
+  not the original file.
 
 - **`gmtime`, `mktime`, and `strptime` raised the right exit code but the
   wrong message on bad input** (#761): `gmtime`/`localtime` on a non-number

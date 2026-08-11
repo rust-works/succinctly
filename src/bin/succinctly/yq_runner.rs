@@ -15,7 +15,7 @@ use succinctly::jq::eval_generic::{
     eval_with_cursor_using, to_owned, to_owned_with_comments, CommentTree, GenericResult,
 };
 use succinctly::jq::{
-    self, sync_aliased_paths, Builtin, Expr, OwnedValue, QueryResult, YqSemantics,
+    self, sync_aliased_paths, Builtin, EvalError, Expr, OwnedValue, QueryResult, YqSemantics,
 };
 use succinctly::json::light::StandardJson;
 use succinctly::json::JsonIndex;
@@ -24,7 +24,8 @@ use succinctly::yaml::{
     ResolvedScalar, YamlCursor, YamlIndex, YamlValue,
 };
 
-use super::{InputFormat, OutputFormat, YqCommand};
+use super::{FrontMatterMode, InputFormat, OutputFormat, YqCommand};
+use crate::front_matter;
 use crate::output::{
     self, exit_codes, ColorScheme, ControlEscape, DiagStyle, ErrorSink, FloatStyle, InputLocation,
     JsonFormatOpts,
@@ -272,6 +273,82 @@ fn resolve_input_format(format: InputFormat, path: Option<&Path>) -> InputFormat
     }
 }
 
+/// Applies `--front-matter`, if set, to raw input bytes before format
+/// resolution and validation: the raw bytes (e.g. Markdown) aren't valid
+/// standalone YAML, so extraction must happen first. Returns
+/// `(bytes, format, body)`; `body` is `Some` only in `process` mode, where
+/// the caller must reattach it verbatim after the transformed front matter.
+///
+/// Once a mode is set, the returned format is always `InputFormat::Yaml`
+/// regardless of `resolved_format` -- front matter is YAML by definition,
+/// and the `run_yq` compat guard already rejects an explicit
+/// `--input-format json` paired with `--front-matter`, so this never
+/// actually overrides a caller's real preference.
+fn apply_front_matter(
+    raw_bytes: Vec<u8>,
+    resolved_format: InputFormat,
+    front_matter: Option<FrontMatterMode>,
+    name: &str,
+) -> Result<(Vec<u8>, InputFormat, Option<Vec<u8>>)> {
+    let Some(mode) = front_matter else {
+        return Ok((raw_bytes, resolved_format, None));
+    };
+    let fm =
+        front_matter::split_front_matter(&raw_bytes).map_err(|e| anyhow::anyhow!("{name}: {e}"))?;
+    let body = (mode == FrontMatterMode::Process).then(|| fm.body.to_vec());
+    Ok((fm.yaml.to_vec(), InputFormat::Yaml, body))
+}
+
+/// The result of [`gather_input_sources`]: either the gathered sources, or
+/// an exit code from a failed `--validate` check that the caller must
+/// return immediately, mirroring [`yaml_validate_guard`]'s "bail with this
+/// code" contract at each of this function's now-single call site.
+enum GatheredSources {
+    Sources(Vec<(Vec<u8>, InputFormat, Option<Vec<u8>>)>),
+    ExitCode(i32),
+}
+
+/// Reads each input source -- stdin if `input_files` is empty, else each
+/// file in listed order -- applying `--front-matter` (a no-op unless the
+/// flag is set, via [`apply_front_matter`]) and resolving its format, then
+/// running the shared `--validate` guard. Shared by `--eval-all`,
+/// `--split-exp`, `--slurp`, and the default path, which all start from
+/// this identical stdin-or-per-file gather step; each `--front-matter`
+/// body is `None` unless `front_matter` is `Some(Process)`, same contract
+/// as `apply_front_matter`.
+fn gather_input_sources(
+    input_files: &[String],
+    input_format: InputFormat,
+    front_matter: Option<FrontMatterMode>,
+    validate: bool,
+) -> Result<GatheredSources> {
+    let mut sources = Vec::new();
+    if input_files.is_empty() {
+        let raw_bytes = read_stdin()?;
+        let resolved_format = resolve_input_format(input_format, None);
+        let (input_bytes, format, body) =
+            apply_front_matter(raw_bytes, resolved_format, front_matter, "<stdin>")?;
+        if let Some(code) = yaml_validate_guard(&input_bytes, format, validate, None) {
+            return Ok(GatheredSources::ExitCode(code));
+        }
+        sources.push((input_bytes, format, body));
+    } else {
+        for file_path in input_files {
+            let path = Path::new(file_path);
+            let raw_bytes = read_file(path)?;
+            let resolved_format = resolve_input_format(input_format, Some(path));
+            let (input_bytes, format, body) =
+                apply_front_matter(raw_bytes, resolved_format, front_matter, file_path)?;
+            if let Some(code) = yaml_validate_guard(&input_bytes, format, validate, Some(file_path))
+            {
+                return Ok(GatheredSources::ExitCode(code));
+            }
+            sources.push((input_bytes, format, body));
+        }
+    }
+    Ok(GatheredSources::Sources(sources))
+}
+
 /// Parse input bytes according to the specified format.
 fn parse_input(bytes: &[u8], format: InputFormat) -> Result<Vec<OwnedValue>> {
     match format {
@@ -396,32 +473,44 @@ fn evaluate_input(
     let cursor = index.root(json_bytes);
 
     let result = jq::eval::<Vec<u64>, YqSemantics>(expr, cursor);
+    Ok(query_result_to_owned_values(result, sink))
+}
 
-    // Convert result to Vec<OwnedValue>
+/// Convert a `QueryResult` into `Vec<OwnedValue>`, reporting an uncaught
+/// error/break through `sink` (evaluation continues past one, per yq's
+/// convention -- see `ErrorSink`'s own doc comment) rather than failing the
+/// whole run. Factored out of [`evaluate_input`] so `--eval-all`'s
+/// `eval_owned_with_file_index` call site (#715) shares the exact same
+/// conversion/error-reporting policy instead of a second, divergence-prone
+/// copy.
+fn query_result_to_owned_values(
+    result: QueryResult<'_, Vec<u64>>,
+    sink: &mut ErrorSink,
+) -> Vec<OwnedValue> {
     match result {
-        QueryResult::One(v) => Ok(vec![standard_json_to_owned(&v)]),
-        QueryResult::OneCursor(c) => Ok(vec![standard_json_to_owned(&c.value())]),
-        QueryResult::Many(vs) => Ok(vs.iter().map(standard_json_to_owned).collect()),
-        QueryResult::None => Ok(vec![]),
+        QueryResult::One(v) => vec![standard_json_to_owned(&v)],
+        QueryResult::OneCursor(c) => vec![standard_json_to_owned(&c.value())],
+        QueryResult::Many(vs) => vs.iter().map(standard_json_to_owned).collect(),
+        QueryResult::None => vec![],
         QueryResult::Error(e) => {
             sink.report(DiagStyle::Yq, &e, &no_location());
-            Ok(vec![])
+            vec![]
         }
-        QueryResult::Owned(v) => Ok(vec![v]),
-        QueryResult::ManyOwned(vs) => Ok(vs),
+        QueryResult::Owned(v) => vec![v],
+        QueryResult::ManyOwned(vs) => vs,
         QueryResult::Break(label) => {
             sink.report_break(DiagStyle::Yq, &label, &no_location());
-            Ok(vec![])
+            vec![]
         }
         // The outputs already produced no longer vanish behind the failure
         // (#400, #494).
         QueryResult::Partial(vs, jq::Control::Error(e)) => {
             sink.report(DiagStyle::Yq, &e, &no_location());
-            Ok(vs)
+            vs
         }
         QueryResult::Partial(vs, jq::Control::Break(label)) => {
             sink.report_break(DiagStyle::Yq, &label, &no_location());
-            Ok(vs)
+            vs
         }
     }
 }
@@ -557,6 +646,87 @@ fn walk_alias_groups<W: AsRef<[u64]> + Clone>(
         }
         _ => {}
     }
+}
+
+/// Evaluate `split_expr` against `result` with `$index` bound to
+/// `output_index`, expect exactly one string back, and write `result`
+/// (serialized through `output_config`, color forced off, matching
+/// `--inplace`) to that path.
+///
+/// Non-string, empty, or multi-value split-expression results are reported
+/// through `sink` — the same "continue, exit 1 at the end" convention used
+/// for other uncaught evaluation errors in this file — rather than aborting
+/// the run outright.
+fn write_split_result(
+    result: &OwnedValue,
+    comments: &CommentTree,
+    split_expr: &Expr,
+    output_index: i64,
+    output_config: &OutputConfig,
+    written_files: &mut std::collections::HashSet<String>,
+    sink: &mut ErrorSink,
+) -> Result<()> {
+    let index_val = OwnedValue::Int(output_index);
+    let per_result_expr = jq::substitute_vars(split_expr, [("index", &index_val)]);
+
+    let reports_before = sink.report_count();
+    let filename_results = evaluate_input(result, &per_result_expr, sink)?;
+
+    let filename = match filename_results.as_slice() {
+        [OwnedValue::String(s)] => s.clone(),
+        // `evaluate_input` already reported the underlying error (e.g. an
+        // undefined variable, or an explicit `error(...)`) via `sink`.
+        // `report_count()` (not `hit()`, which is sticky for the whole run)
+        // is what lets this tell "this call just reported" from "some
+        // earlier result already tripped the sink" -- otherwise every
+        // result after the first real error in the run double-reports here
+        // (#715 follow-up).
+        [] if sink.report_count() > reports_before => return Ok(()),
+        [] => {
+            sink.report(
+                DiagStyle::Yq,
+                &EvalError::new(format!(
+                    "--split-exp expression produced no output for result #{output_index}"
+                )),
+                &no_location(),
+            );
+            return Ok(());
+        }
+        [other] => {
+            sink.report(
+                DiagStyle::Yq,
+                &EvalError::new(format!(
+                    "--split-exp expression must evaluate to a string, got {} for result #{output_index}",
+                    other.type_name()
+                )),
+                &no_location(),
+            );
+            return Ok(());
+        }
+        many => {
+            sink.report(
+                DiagStyle::Yq,
+                &EvalError::new(format!(
+                    "--split-exp expression must evaluate to exactly one string, got {} results for result #{output_index}",
+                    many.len()
+                )),
+                &no_location(),
+            );
+            return Ok(());
+        }
+    };
+
+    if !written_files.insert(filename.clone()) {
+        eprintln!("Warning: --split-exp path '{filename}' written more than once; overwriting");
+    }
+
+    let mut buf = Vec::new();
+    let mut no_color_config = output_config.clone();
+    no_color_config.use_color = false;
+    output_value(&mut buf, result, comments, &no_color_config)?;
+
+    std::fs::write(&filename, &buf)
+        .with_context(|| format!("failed to write --split-exp output file: {filename}"))
 }
 
 /// Evaluate a jq expression directly on a YAML cursor.
@@ -1577,6 +1747,89 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
         anyhow::bail!("--doc and --raw-input are incompatible");
     }
 
+    if args.front_matter.is_some() {
+        if args.document.is_some() {
+            anyhow::bail!("--front-matter and --doc are incompatible");
+        }
+        if args.null_input {
+            anyhow::bail!("--front-matter and --null-input are incompatible");
+        }
+        if args.raw_input {
+            anyhow::bail!("--front-matter and --raw-input are incompatible");
+        }
+        if args.input_format == InputFormat::Json {
+            // Front matter is YAML by definition (the `---`-fenced header),
+            // so `apply_front_matter` always forces `InputFormat::Yaml` once
+            // a mode is set -- reject an explicit, contradictory
+            // `--input-format json` instead of silently overriding it.
+            anyhow::bail!("--front-matter and --input-format json are incompatible");
+        }
+        if args.front_matter == Some(FrontMatterMode::Extract) && args.inplace {
+            // `extract` never captures a body to reattach (only `process`
+            // does, see `apply_front_matter`), so `--inplace` would
+            // overwrite the file with just the transformed front matter,
+            // silently discarding everything after the closing fence.
+            anyhow::bail!(
+                "--front-matter=extract and --inplace are incompatible (would discard the file's body); use --front-matter=process instead"
+            );
+        }
+        if args.front_matter == Some(FrontMatterMode::Process) {
+            if args.slurp {
+                anyhow::bail!("--front-matter=process and --slurp are incompatible");
+            }
+            // `output_value` treats anything other than `Yaml` as JSON
+            // output (including `Auto`, which has no YAML/Markdown-file
+            // detection of its own) -- so the guard must reject everything
+            // but `Yaml`, not just the explicit `Json` variant, or `-o auto`
+            // silently slips through and wraps a JSON body in `---` fences.
+            if args.output_format != OutputFormat::Yaml {
+                anyhow::bail!(
+                    "--front-matter=process requires YAML output (got -o/--output-format {})",
+                    if args.output_format == OutputFormat::Json {
+                        "json"
+                    } else {
+                        "auto"
+                    }
+                );
+            }
+        }
+    }
+
+    if args.split_exp.is_some() {
+        if args.slurp {
+            anyhow::bail!("--split-exp and --slurp are incompatible");
+        }
+        if args.inplace {
+            anyhow::bail!("--split-exp and --inplace are incompatible");
+        }
+        if args.raw_input {
+            anyhow::bail!("--split-exp with --raw-input is not yet supported");
+        }
+        if args.front_matter.is_some() {
+            anyhow::bail!("--split-exp and --front-matter are incompatible");
+        }
+    }
+
+    if args.eval_all {
+        if args.slurp {
+            anyhow::bail!(
+                "--eval-all and --slurp are incompatible: both combine inputs into a single evaluation"
+            );
+        }
+        if args.inplace {
+            anyhow::bail!("--eval-all and --inplace are incompatible");
+        }
+        if args.raw_input {
+            anyhow::bail!("--eval-all and --raw-input are incompatible");
+        }
+        if args.split_exp.is_some() {
+            anyhow::bail!("--eval-all and --split-exp are incompatible");
+        }
+        if args.front_matter.is_some() {
+            anyhow::bail!("--eval-all and --front-matter are incompatible");
+        }
+    }
+
     // Parse the jq program (use Yq mode for extended identifier syntax like kebab-case)
     let mut program = jq::parse_program_with_mode(&filter_str, jq::ParserMode::Yq)
         .map_err(|e| anyhow::anyhow!("parse error: {e}"))?;
@@ -1588,13 +1841,27 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
     // variable into the expression AST before evaluating, mirroring the jq
     // runner (see jq_runner.rs). Without this, filter references like `$g`
     // error as "undefined variable" even though the values were parsed (#284).
-    {
-        let args_value = build_args_var(&context);
-        let mut all_vars: Vec<(&str, &OwnedValue)> =
-            context.named.iter().map(|(k, v)| (k.as_str(), v)).collect();
-        all_vars.push(("ARGS", &args_value));
-        program.expr = jq::substitute_vars(&program.expr, all_vars);
-    }
+    let args_value = build_args_var(&context);
+    let mut all_vars: Vec<(&str, &OwnedValue)> =
+        context.named.iter().map(|(k, v)| (k.as_str(), v)).collect();
+    all_vars.push(("ARGS", &args_value));
+    program.expr = jq::substitute_vars(&program.expr, all_vars.iter().copied());
+
+    // Parse the --split-exp expression, if given, once up front, applying
+    // the same --arg/--argjson/$ARGS substitution as the main filter --
+    // otherwise a filename expression referencing `--arg`-provided values
+    // (e.g. an output directory prefix) fails as an undefined variable even
+    // though the same flag works for the main filter. `$index` is bound
+    // separately, per output result (see `write_split_result`).
+    let split_expr: Option<Expr> = args
+        .split_exp
+        .as_deref()
+        .map(|s| {
+            jq::parse_program_with_mode(s, jq::ParserMode::Yq)
+                .map(|p| jq::substitute_vars(&p.expr, all_vars.iter().copied()))
+                .map_err(|e| anyhow::anyhow!("parse error in --split-exp expression: {e}"))
+        })
+        .transpose()?;
 
     // Output configuration
     let output_config = OutputConfig::from_args(&args);
@@ -1651,6 +1918,9 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
         && !args.raw_input
         && !args.slurp
         && !args.inplace
+        && args.front_matter.is_none()
+        && split_expr.is_none()
+        && !args.eval_all
         && context.named.is_empty();
     let can_yaml_fast_path = is_m2_streamable
         && (output_config.compact || can_stream_pretty)
@@ -1659,6 +1929,9 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
         && !args.raw_input
         && !args.slurp
         && !args.inplace
+        && args.front_matter.is_none()
+        && split_expr.is_none()
+        && !args.eval_all
         && context.named.is_empty();
     let can_fast_path = can_json_fast_path || can_yaml_fast_path;
 
@@ -1676,6 +1949,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
         && !args.null_input
         && !args.raw_input
         && args.inplace
+        && args.front_matter.is_none()
         && context.named.is_empty();
     let can_inplace_yaml_fast_path = is_m2_streamable
         && (output_config.compact || can_stream_pretty)
@@ -1683,6 +1957,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
         && !args.null_input
         && !args.raw_input
         && args.inplace
+        && args.front_matter.is_none()
         && context.named.is_empty();
     let can_inplace_fast_path = can_inplace_json_fast_path || can_inplace_yaml_fast_path;
 
@@ -1698,6 +1973,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
         && output_config.output_format == OutputFormat::Yaml
         && !args.null_input
         && !args.raw_input
+        && args.front_matter.is_none()
         && context.named.is_empty();
 
     // Indent width/unit for the fast path's streamers. `--tab` always means
@@ -1975,6 +2251,174 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                 }
             }
         }
+    } else if args.eval_all {
+        // Handle --eval-all: combine every document from every file into one
+        // evaluation context, exposing `file_index`/`fileIndex`/`fi` (#715).
+        // Input-gathering mirrors --slurp's DOM path (all_docs collection),
+        // but tracks each document's origin file index alongside it and
+        // evaluates via `eval_owned_with_file_index` instead of plain
+        // `evaluate_input`, so `file_index` resolves against that side table.
+        // `--front-matter` is rejected in combination above, so every
+        // gathered body is `None` here.
+        let input_sources = match gather_input_sources(
+            &input_files,
+            args.input_format,
+            args.front_matter,
+            args.validate,
+        )? {
+            GatheredSources::Sources(s) => s,
+            GatheredSources::ExitCode(code) => return Ok(code),
+        };
+
+        let mut all_docs: Vec<OwnedValue> = Vec::new();
+        let mut file_origin: Vec<usize> = Vec::new();
+        let mut global_doc_index: usize = 0;
+        for (file_idx, (bytes, format, _)) in input_sources.iter().enumerate() {
+            let inputs = parse_input(bytes, *format)?;
+            for input in inputs {
+                let should_include = args
+                    .document
+                    .map_or(true, |target| target == global_doc_index);
+                if should_include {
+                    all_docs.push(input);
+                    file_origin.push(file_idx);
+                }
+                global_doc_index += 1;
+            }
+        }
+
+        let combined = OwnedValue::Array(all_docs);
+        let query_result: QueryResult<'_, Vec<u64>> = jq::eval_owned_with_file_index::<
+            Vec<u64>,
+            YqSemantics,
+        >(
+            &program.expr, &combined, &file_origin
+        );
+        let results = query_result_to_owned_values(query_result, &mut sink);
+
+        let mut split_doc_state = SplitDocState::new(has_split_doc);
+        for (i, result) in results.iter().enumerate() {
+            if has_split_doc {
+                // The filter explicitly marks its outputs as separate
+                // documents (`split_doc`); route through the same state
+                // machine every other output path uses for that, or no
+                // separator is ever written here at all.
+                split_doc_state.write_separator(&mut writer, &output_config)?;
+            } else if output_config.output_format == OutputFormat::Yaml
+                && !output_config.no_doc
+                && results.len() > 1
+                && i > 0
+            {
+                // `---` BETWEEN results (not before the first) -- deliberately
+                // different from --slurp's no-separator convention, since
+                // eval-all is explicitly a multi-document-stream feature (#715).
+                writeln!(writer, "---")?;
+            }
+            any_truthy |= !matches!(result, OwnedValue::Null | OwnedValue::Bool(false));
+            output_value(&mut writer, result, &CommentTree::empty(), &output_config)?;
+        }
+    } else if let Some(split_expr) = split_expr.as_ref() {
+        // Handle --split-exp: write each result to its own file (named by
+        // evaluating `split_expr` against it, with `$index` bound to its
+        // zero-based output index) instead of stdout. `--front-matter` is
+        // rejected in combination above, so no extraction step is needed
+        // here; the input-gathering below otherwise mirrors the standard
+        // path at the bottom of this function.
+        let mut output_index: i64 = 0;
+        let mut written_split_files: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+
+        if args.null_input {
+            let results = evaluate_input(&OwnedValue::Null, &program.expr, &mut sink)?;
+            for result in &results {
+                any_truthy |= !matches!(result, OwnedValue::Null | OwnedValue::Bool(false));
+                write_split_result(
+                    result,
+                    &CommentTree::empty(),
+                    split_expr,
+                    output_index,
+                    &output_config,
+                    &mut written_split_files,
+                    &mut sink,
+                )?;
+                output_index += 1;
+            }
+        } else {
+            // `--front-matter` is rejected in combination above, so every
+            // gathered body is `None` here.
+            let input_sources = match gather_input_sources(
+                &input_files,
+                args.input_format,
+                args.front_matter,
+                args.validate,
+            )? {
+                GatheredSources::Sources(s) => s,
+                GatheredSources::ExitCode(code) => return Ok(code),
+            };
+
+            let mut global_doc_index: usize = 0;
+            for (bytes, format, _) in &input_sources {
+                match format {
+                    InputFormat::Yaml | InputFormat::Auto => {
+                        let doc_filter = args.document.map(|target| (target, global_doc_index));
+                        // Split-exp output files carry real comments when
+                        // written as YAML, same as the main output path (#710).
+                        let need_comments = output_config.output_format == OutputFormat::Yaml;
+                        let (doc_results, num_docs) = evaluate_yaml_direct_filtered(
+                            bytes,
+                            &program.expr,
+                            doc_filter,
+                            &mut sink,
+                            need_comments,
+                        )?;
+                        global_doc_index += num_docs;
+                        for results in doc_results {
+                            for (result, comments) in &results {
+                                any_truthy |=
+                                    !matches!(result, OwnedValue::Null | OwnedValue::Bool(false));
+                                write_split_result(
+                                    result,
+                                    comments,
+                                    split_expr,
+                                    output_index,
+                                    &output_config,
+                                    &mut written_split_files,
+                                    &mut sink,
+                                )?;
+                                output_index += 1;
+                            }
+                        }
+                    }
+                    InputFormat::Json => {
+                        let inputs = parse_input(bytes, InputFormat::Json)?;
+                        for input in inputs {
+                            if let Some(target_doc) = args.document {
+                                if global_doc_index != target_doc {
+                                    global_doc_index += 1;
+                                    continue;
+                                }
+                            }
+                            let results = evaluate_input(&input, &program.expr, &mut sink)?;
+                            for result in &results {
+                                any_truthy |=
+                                    !matches!(result, OwnedValue::Null | OwnedValue::Bool(false));
+                                write_split_result(
+                                    result,
+                                    &CommentTree::empty(),
+                                    split_expr,
+                                    output_index,
+                                    &output_config,
+                                    &mut written_split_files,
+                                    &mut sink,
+                                )?;
+                                output_index += 1;
+                            }
+                            global_doc_index += 1;
+                        }
+                    }
+                }
+            }
+        }
     } else if args.null_input {
         // Handle --null-input
         let mut split_doc_state = SplitDocState::new(has_split_doc);
@@ -2025,28 +2469,18 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
     } else if args.slurp {
         // Handle --slurp: collect all documents from all inputs into an array
 
-        // Collect input sources
-        let input_sources: Vec<(Vec<u8>, InputFormat)> = if input_files.is_empty() {
-            let input_bytes = read_stdin()?;
-            let format = resolve_input_format(args.input_format, None);
-            if let Some(code) = yaml_validate_guard(&input_bytes, format, args.validate, None) {
-                return Ok(code);
-            }
-            vec![(input_bytes, format)]
-        } else {
-            let mut sources = Vec::new();
-            for file_path in &input_files {
-                let path = Path::new(file_path);
-                let input_bytes = read_file(path)?;
-                let format = resolve_input_format(args.input_format, Some(path));
-                if let Some(code) =
-                    yaml_validate_guard(&input_bytes, format, args.validate, Some(file_path))
-                {
-                    return Ok(code);
-                }
-                sources.push((input_bytes, format));
-            }
-            sources
+        // Collect input sources. `--front-matter` (extract only here; process
+        // mode is rejected above since a slurped array can't reattach a body
+        // per input file) is applied before validation, since the raw
+        // file bytes (e.g. Markdown) aren't valid standalone YAML.
+        let input_sources = match gather_input_sources(
+            &input_files,
+            args.input_format,
+            args.front_matter,
+            args.validate,
+        )? {
+            GatheredSources::Sources(s) => s,
+            GatheredSources::ExitCode(code) => return Ok(code),
         };
 
         if can_slurp_fast_path {
@@ -2064,7 +2498,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
             // `Vec` unless their backing bytes/index all outlive that `Vec`.
             let mut parsed_sources: Vec<(Vec<u8>, YamlIndex<Vec<u64>>)> =
                 Vec::with_capacity(input_sources.len());
-            for (bytes, _format) in input_sources {
+            for (bytes, _format, _) in input_sources {
                 let index = YamlIndex::build(&bytes)
                     .map_err(|e| anyhow::anyhow!("YAML parse error: {e}"))?;
                 parsed_sources.push((bytes, index));
@@ -2126,7 +2560,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
 
             // Parse all inputs and collect documents
             let mut global_doc_index: usize = 0;
-            for (bytes, format) in &input_sources {
+            for (bytes, format, _) in &input_sources {
                 let inputs = parse_input(bytes, *format)?;
                 for input in inputs {
                     // Apply --doc filter if specified
@@ -2160,8 +2594,10 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
         let mut global_doc_index: usize = 0;
         for file_path in &input_files {
             let path = Path::new(file_path);
-            let input_bytes = read_file(path)?;
-            let format = resolve_input_format(args.input_format, Some(path));
+            let raw_bytes = read_file(path)?;
+            let resolved_format = resolve_input_format(args.input_format, Some(path));
+            let (input_bytes, format, front_matter_body) =
+                apply_front_matter(raw_bytes, resolved_format, args.front_matter, file_path)?;
             if let Some(code) =
                 yaml_validate_guard(&input_bytes, format, args.validate, Some(file_path))
             {
@@ -2261,6 +2697,13 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                 };
                 let is_multi_doc = matching_docs > 1;
 
+                // `--front-matter=process` opens its own leading `---` fence
+                // here; the body's closing fence + body text are appended
+                // after `buf_writer` is dropped, below.
+                if front_matter_body.is_some() {
+                    writeln!(buf_writer, "---")?;
+                }
+
                 let mut split_doc_state = SplitDocState::new(has_split_doc);
                 for (local_idx, input) in inputs.iter().enumerate() {
                     let current_doc_index = global_doc_index + local_idx;
@@ -2276,6 +2719,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                         && output_config.output_format == OutputFormat::Yaml
                         && !output_config.no_doc
                         && is_multi_doc
+                        && front_matter_body.is_none()
                     {
                         writeln!(buf_writer, "---")?;
                     }
@@ -2299,6 +2743,12 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                 global_doc_index += inputs.len();
             }
 
+            if let Some(body) = &front_matter_body {
+                output_buffer.extend_from_slice(b"---");
+                output_buffer.extend_from_slice(front_matter::body_line_ending(body));
+                output_buffer.extend_from_slice(body);
+            }
+
             // Write the output back to the file
             std::fs::write(path, &output_buffer)
                 .with_context(|| format!("failed to write to file: {}", path.display()))?;
@@ -2308,28 +2758,19 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
         // For YAML inputs, use direct evaluation to preserve position metadata
         // For JSON inputs, use the OwnedValue path
 
-        // Collect input sources with their bytes and formats
-        let input_sources: Vec<(Vec<u8>, InputFormat)> = if input_files.is_empty() {
-            let input_bytes = read_stdin()?;
-            let format = resolve_input_format(args.input_format, None);
-            if let Some(code) = yaml_validate_guard(&input_bytes, format, args.validate, None) {
-                return Ok(code);
-            }
-            vec![(input_bytes, format)]
-        } else {
-            let mut sources = Vec::new();
-            for file_path in &input_files {
-                let path = Path::new(file_path);
-                let input_bytes = read_file(path)?;
-                let format = resolve_input_format(args.input_format, Some(path));
-                if let Some(code) =
-                    yaml_validate_guard(&input_bytes, format, args.validate, Some(file_path))
-                {
-                    return Ok(code);
-                }
-                sources.push((input_bytes, format));
-            }
-            sources
+        // Collect input sources with their bytes and formats. `--front-matter`
+        // is applied before validation, since the raw file bytes (e.g.
+        // Markdown) aren't valid standalone YAML; `process` mode's body is
+        // carried alongside each source for reattachment in the output loop
+        // below.
+        let input_sources = match gather_input_sources(
+            &input_files,
+            args.input_format,
+            args.front_matter,
+            args.validate,
+        )? {
+            GatheredSources::Sources(s) => s,
+            GatheredSources::ExitCode(code) => return Ok(code),
         };
 
         // Process all inputs first to collect results, then determine multi-doc status
@@ -2339,7 +2780,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
         // input has none, so it's paired with CommentTree::empty().
         let mut all_results: Vec<Vec<Vec<ResultWithComments>>> = Vec::new();
         let mut global_doc_index: usize = 0;
-        for (bytes, format) in &input_sources {
+        for (bytes, format, _) in &input_sources {
             match format {
                 InputFormat::Yaml | InputFormat::Auto => {
                     // Use direct YAML evaluation to preserve position metadata
@@ -2392,14 +2833,24 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
         // Output all results with proper separators
         // For split_doc: add --- BETWEEN each result (not before first)
         // For regular multi-doc: add --- before each document's results
+        // For --front-matter=process: each file's own leading/closing ---
+        // fences wrap its transformed front matter, followed by its
+        // untouched body (carried alongside `input_sources`, gathered above).
         let mut split_doc_state = SplitDocState::new(has_split_doc);
-        for doc_results in all_results {
+        for (file_idx, doc_results) in all_results.into_iter().enumerate() {
+            let front_matter_body = input_sources
+                .get(file_idx)
+                .and_then(|(_, _, body)| body.as_ref());
+            if front_matter_body.is_some() {
+                writeln!(writer, "---")?;
+            }
             for results in doc_results {
                 // Add document separator in YAML mode for multi-doc (before each doc's results)
                 if !has_split_doc
                     && output_config.output_format == OutputFormat::Yaml
                     && !output_config.no_doc
                     && is_multi_doc
+                    && front_matter_body.is_none()
                 {
                     writeln!(writer, "---")?;
                 }
@@ -2407,6 +2858,19 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                     split_doc_state.write_separator(&mut writer, &output_config)?;
                     any_truthy |= !matches!(&result, OwnedValue::Null | OwnedValue::Bool(false));
                     output_value(&mut writer, &result, &comments, &output_config)?;
+                }
+            }
+            if let Some(body) = front_matter_body {
+                let line_ending = front_matter::body_line_ending(body);
+                writer.write_all(b"---")?;
+                writer.write_all(line_ending)?;
+                writer.write_all(body)?;
+                // A body with no trailing line break would otherwise run
+                // straight into the next file's opening fence (or whatever
+                // follows), corrupting the stream -- ensure one separates
+                // them, matching this body's own line-ending convention.
+                if !body.is_empty() && !body.ends_with(b"\n") {
+                    writer.write_all(line_ending)?;
                 }
             }
         }

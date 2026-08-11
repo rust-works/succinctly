@@ -2953,6 +2953,23 @@ impl<'a> Parser<'a> {
             return Ok(Some(Builtin::DocumentIndex));
         }
 
+        // file_index / fileIndex / fi - succinctly extension (#715): return
+        // 0-indexed origin file position within an `--eval-all` combined
+        // evaluation. `fileIndex` (camelCase) is real yq's own spelling;
+        // `file_index` mirrors this codebase's `document_index` convention.
+        if self.matches_keyword("file_index") {
+            self.consume_keyword("file_index");
+            return Ok(Some(Builtin::FileIndex));
+        }
+        if self.matches_keyword("fileIndex") {
+            self.consume_keyword("fileIndex");
+            return Ok(Some(Builtin::FileIndex));
+        }
+        if self.matches_keyword("fi") {
+            self.consume_keyword("fi");
+            return Ok(Some(Builtin::FileIndex));
+        }
+
         // shuffle - yq: randomly shuffle array elements
         if self.matches_keyword("shuffle") {
             self.consume_keyword("shuffle");

@@ -13,7 +13,7 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 
 use anyhow::Result;
-use tempfile::NamedTempFile;
+use tempfile::{NamedTempFile, TempDir};
 
 /// Helper to run yq command with input from stdin
 fn run_yq_stdin(filter: &str, input: &str, extra_args: &[&str]) -> Result<(String, i32)> {
@@ -1987,6 +1987,18 @@ fn test_yaml_assign_then_map_through_anchor_still_excluded() -> Result<()> {
     let (output, exit_code) = run_yq_stdin(".a = 99 | map(.)", input, &["-o=json", "-I=0"])?;
     assert_eq!(exit_code, 0);
     assert_eq!(output.trim(), r"[99,1]");
+    Ok(())
+}
+
+#[test]
+fn test_yaml_paren_wrapped_optional_assign_through_anchor_updates_alias() -> Result<()> {
+    // `(.a = 99)?` -- `Optional` wrapping `Paren` wrapping `Assign` -- must
+    // still count as alias-sensitive: `is_alias_sensitive_assign` unwraps
+    // both `Paren` and `Optional` before checking for a write underneath.
+    let input = "a: &x 1\nb: *x\n";
+    let (output, exit_code) = run_yq_stdin("(.a = 99)?", input, &["-o=json", "-I=0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), r#"{"a":99,"b":99}"#);
     Ok(())
 }
 
@@ -5783,5 +5795,1073 @@ fn test_713_merge_flags_on_null_or_absent_target() -> Result<()> {
     assert_eq!(code, 0);
     assert_eq!(output.trim(), r#"{"a":[1,2]}"#);
 
+    Ok(())
+}
+
+// ============================================================================
+// --front-matter Tests (#715)
+// ============================================================================
+
+const FRONT_MATTER_FIXTURE: &str = "---\ntitle: My Post\ntags: [a, b]\n---\n# Body\n\nSome text.\n";
+
+#[test]
+fn test_front_matter_extract_evaluates_only_yaml() -> Result<()> {
+    let mut input_file = NamedTempFile::new()?;
+    write!(input_file, "{FRONT_MATTER_FIXTURE}")?;
+
+    let (output, code) = run_yq_file(
+        ".title",
+        input_file.path().to_str().unwrap(),
+        &["--front-matter", "extract"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "My Post");
+    assert!(!output.contains("Body"));
+    Ok(())
+}
+
+#[test]
+fn test_front_matter_process_reattaches_body_verbatim() -> Result<()> {
+    let mut input_file = NamedTempFile::new()?;
+    write!(input_file, "{FRONT_MATTER_FIXTURE}")?;
+
+    let (output, code) = run_yq_file(
+        ".title = \"New\"",
+        input_file.path().to_str().unwrap(),
+        &["--front-matter", "process"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(
+        output,
+        "---\ntitle: New\ntags:\n  - a\n  - b\n---\n# Body\n\nSome text.\n"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_front_matter_process_inplace_rewrites_file() -> Result<()> {
+    let mut input_file = NamedTempFile::new()?;
+    write!(input_file, "{FRONT_MATTER_FIXTURE}")?;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .arg("yq")
+        .args(["--front-matter", "process", "-i"])
+        .arg(".title = \"New\"")
+        .arg(input_file.path())
+        .stdin(Stdio::null())
+        .output()?;
+    assert!(output.status.success());
+
+    let rewritten = std::fs::read_to_string(input_file.path())?;
+    assert_eq!(
+        rewritten,
+        "---\ntitle: New\ntags:\n  - a\n  - b\n---\n# Body\n\nSome text.\n"
+    );
+    Ok(())
+}
+
+/// Regression test: `extract` mode captures no body to reattach (only
+/// `process` does), so `--front-matter=extract -i` used to overwrite the
+/// file with just the transformed front matter, silently discarding
+/// everything after the closing fence (#715 follow-up).
+#[test]
+fn test_front_matter_extract_rejects_inplace() -> Result<()> {
+    let mut input_file = NamedTempFile::new()?;
+    write!(input_file, "{FRONT_MATTER_FIXTURE}")?;
+    let original = std::fs::read_to_string(input_file.path())?;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .arg("yq")
+        .args(["--front-matter", "extract", "-i"])
+        .arg(".title = \"New\"")
+        .arg(input_file.path())
+        .stdin(Stdio::null())
+        .output()?;
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--inplace"), "stderr: {stderr}");
+
+    // The file must be left untouched, not partially overwritten.
+    let unchanged = std::fs::read_to_string(input_file.path())?;
+    assert_eq!(unchanged, original);
+    Ok(())
+}
+
+#[test]
+fn test_front_matter_no_fence_errors() -> Result<()> {
+    let (_output, _stderr, code) =
+        run_yq_stdin_with_stderr(".", "just: yaml\n", &["--front-matter", "extract"])?;
+    assert_ne!(code, 0);
+    Ok(())
+}
+
+#[test]
+fn test_front_matter_unterminated_errors() -> Result<()> {
+    let (_output, stderr, code) = run_yq_stdin_with_stderr(
+        ".",
+        "---\ntitle: foo\nno closing fence\n",
+        &["--front-matter", "extract"],
+    )?;
+    assert_ne!(code, 0);
+    assert!(stderr.contains("unterminated"), "stderr: {stderr}");
+    Ok(())
+}
+
+/// Regression test: `apply_front_matter` always forces `InputFormat::Yaml`
+/// once a mode is set (front matter is YAML by definition), but it used to
+/// do so silently even when the caller explicitly asked for
+/// `--input-format json` -- reject the contradictory combination instead
+/// (#715 follow-up).
+#[test]
+fn test_front_matter_rejects_json_input_format() -> Result<()> {
+    let (_output, stderr, code) = run_yq_stdin_with_stderr(
+        ".",
+        FRONT_MATTER_FIXTURE,
+        &["--front-matter", "extract", "--input-format", "json"],
+    )?;
+    assert_ne!(code, 0);
+    assert!(stderr.contains("--input-format"), "stderr: {stderr}");
+    Ok(())
+}
+
+#[test]
+fn test_front_matter_rejects_doc_flag() -> Result<()> {
+    let (_output, stderr, code) = run_yq_stdin_with_stderr(
+        ".",
+        FRONT_MATTER_FIXTURE,
+        &["--front-matter", "extract", "--doc", "0"],
+    )?;
+    assert_ne!(code, 0);
+    assert!(stderr.contains("--doc"), "stderr: {stderr}");
+    Ok(())
+}
+
+#[test]
+fn test_front_matter_rejects_null_input() -> Result<()> {
+    let (_output, stderr, code) =
+        run_yq_stdin_with_stderr(".", "", &["--front-matter", "extract", "-n"])?;
+    assert_ne!(code, 0);
+    assert!(stderr.contains("--null-input"), "stderr: {stderr}");
+    Ok(())
+}
+
+#[test]
+fn test_front_matter_rejects_raw_input() -> Result<()> {
+    let (_output, stderr, code) = run_yq_stdin_with_stderr(
+        ".",
+        FRONT_MATTER_FIXTURE,
+        &["--front-matter", "extract", "-R"],
+    )?;
+    assert_ne!(code, 0);
+    assert!(stderr.contains("--raw-input"), "stderr: {stderr}");
+    Ok(())
+}
+
+#[test]
+fn test_front_matter_process_rejects_slurp() -> Result<()> {
+    let (_output, stderr, code) = run_yq_stdin_with_stderr(
+        ".",
+        FRONT_MATTER_FIXTURE,
+        &["--front-matter", "process", "-s"],
+    )?;
+    assert_ne!(code, 0);
+    assert!(stderr.contains("--slurp"), "stderr: {stderr}");
+    Ok(())
+}
+
+#[test]
+fn test_front_matter_process_rejects_json_output() -> Result<()> {
+    let (_output, stderr, code) = run_yq_stdin_with_stderr(
+        ".",
+        FRONT_MATTER_FIXTURE,
+        &["--front-matter", "process", "-o", "json"],
+    )?;
+    assert_ne!(code, 0);
+    assert!(stderr.contains("json"), "stderr: {stderr}");
+    Ok(())
+}
+
+/// Regression test: `output_value` treats anything other than `Yaml` as
+/// JSON output (including `Auto`), but the compat guard only checked for
+/// the explicit `Json` variant -- `-o auto` slipped through and wrapped a
+/// JSON body in `---` fences (#715 follow-up).
+#[test]
+fn test_front_matter_process_rejects_auto_output() -> Result<()> {
+    let (_output, stderr, code) = run_yq_stdin_with_stderr(
+        ".",
+        FRONT_MATTER_FIXTURE,
+        &["--front-matter", "process", "-o", "auto"],
+    )?;
+    assert_ne!(code, 0);
+    assert!(stderr.contains("auto"), "stderr: {stderr}");
+    Ok(())
+}
+
+/// Regression test: reattaching a body that doesn't end in a newline used
+/// to run straight into the next file's opening fence with no separator,
+/// e.g. `Body A---` -- corrupting the stream (#715 follow-up).
+#[test]
+fn test_front_matter_process_multi_file_separates_body_from_next_fence() -> Result<()> {
+    let mut file1 = NamedTempFile::new()?;
+    write!(file1, "---\ntitle: A\n---\nBody A")?; // no trailing newline
+    let mut file2 = NamedTempFile::new()?;
+    write!(file2, "---\ntitle: B\n---\nBody B\n")?;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .arg("yq")
+        .args(["--front-matter", "process"])
+        .arg(".title = \"X\"")
+        .arg(file1.path())
+        .arg(file2.path())
+        .stdin(Stdio::null())
+        .output()?;
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout)?;
+    assert_eq!(
+        stdout,
+        "---\ntitle: X\n---\nBody A\n---\ntitle: X\n---\nBody B\n"
+    );
+    Ok(())
+}
+
+/// Regression test: the closing `---` fence injected right before a
+/// reattached body was always LF-only, even when the body itself was CRLF
+/// -- producing a file with mixed line endings (#715 follow-up).
+#[test]
+fn test_front_matter_process_preserves_crlf_line_endings() -> Result<()> {
+    let (output, stderr, code) = run_yq_stdin_with_stderr(
+        ".title = \"X\"",
+        "---\r\ntitle: A\r\n---\r\nBody\r\ntext\r\n",
+        &["--front-matter", "process"],
+    )?;
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(output, "---\ntitle: X\n---\r\nBody\r\ntext\r\n");
+    Ok(())
+}
+
+#[test]
+fn test_front_matter_extract_allows_slurp_across_files() -> Result<()> {
+    let mut file1 = NamedTempFile::new()?;
+    write!(file1, "---\ntitle: One\n---\nBody one\n")?;
+    let mut file2 = NamedTempFile::new()?;
+    write!(file2, "---\ntitle: Two\n---\nBody two\n")?;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .arg("yq")
+        .args(["--front-matter", "extract", "-s", "-o", "json", "-I0"])
+        .arg(".")
+        .arg(file1.path())
+        .arg(file2.path())
+        .stdin(Stdio::null())
+        .output()?;
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout)?;
+    assert_eq!(stdout.trim(), r#"[{"title":"One"},{"title":"Two"}]"#);
+    Ok(())
+}
+
+/// A top-level `break` with no enclosing `label` reaches
+/// `query_result_to_owned_values` as a bare `QueryResult::Break`, distinct
+/// from the `Partial(_, Control::Break(_))` case an escaping break-after-
+/// some-output takes -- exercised elsewhere via `--eval-all`'s
+/// `write_split_result`, but not through the plain evaluation path.
+#[test]
+fn test_bare_break_outside_label_reports_error() -> Result<()> {
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .arg("yq")
+        .args(["-n", "break $foo"])
+        .stdin(Stdio::null())
+        .output()?;
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(
+        stderr.contains("break $foo not in label"),
+        "stderr: {stderr}"
+    );
+    Ok(())
+}
+
+// ============================================================================
+// --split-exp Tests (#715)
+// ============================================================================
+
+fn run_yq_split(filter: &str, input: &str, extra_args: &[&str]) -> Result<(String, String, i32)> {
+    run_yq_stdin_with_stderr(filter, input, extra_args)
+}
+
+#[test]
+fn test_split_exp_writes_one_file_per_result_by_index() -> Result<()> {
+    let dir = TempDir::new()?;
+    let pattern = format!(
+        "\"{}/out_\" + ($index|tostring) + \".yml\"",
+        dir.path().display()
+    );
+    let (stdout, _stderr, code) = run_yq_split(
+        ".[]",
+        r#"[{"name":"a"},{"name":"b"},{"name":"c"}]"#,
+        &["--split-exp", &pattern, "-p", "json"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "", "stdout must be suppressed on success");
+
+    for (i, expected) in ["a", "b", "c"].into_iter().enumerate() {
+        let content = std::fs::read_to_string(dir.path().join(format!("out_{i}.yml")))?;
+        assert_eq!(content, format!("name: {expected}\n"));
+    }
+    Ok(())
+}
+
+#[test]
+fn test_split_exp_non_string_result_errors() -> Result<()> {
+    let (_stdout, stderr, code) =
+        run_yq_split(".[]", "[1, 2]", &["--split-exp", "$index", "-p", "json"])?;
+    assert_ne!(code, 0);
+    assert!(
+        stderr.contains("must evaluate to a string"),
+        "stderr: {stderr}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_split_exp_dot_is_bound_to_result() -> Result<()> {
+    let dir = TempDir::new()?;
+    let pattern = format!("\"{}/\" + .name + \".yml\"", dir.path().display());
+    let (_stdout, _stderr, code) = run_yq_split(
+        ".[]",
+        r#"[{"name":"a"},{"name":"b"}]"#,
+        &["--split-exp", &pattern, "-p", "json"],
+    )?;
+    assert_eq!(code, 0);
+
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("a.yml"))?,
+        "name: a\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("b.yml"))?,
+        "name: b\n"
+    );
+    Ok(())
+}
+
+/// Regression test: `--split-exp`'s expression was parsed independently of
+/// the main filter and never received `--arg`/`--argjson`/`$ARGS`
+/// substitution (only `$index` was bound), so a filename expression
+/// referencing an `--arg` value failed as an undefined variable even though
+/// the same `--arg` works fine for the main filter (#715 follow-up).
+#[test]
+fn test_split_exp_uses_arg_variable() -> Result<()> {
+    let dir = TempDir::new()?;
+    let pattern = format!("\"{}/\" + $prefix + .name + \".yml\"", dir.path().display());
+    let (_stdout, stderr, code) = run_yq_split(
+        ".[]",
+        r#"[{"name":"a"}]"#,
+        &[
+            "--arg",
+            "prefix",
+            "pre_",
+            "--split-exp",
+            &pattern,
+            "-p",
+            "json",
+        ],
+    )?;
+    assert_eq!(code, 0, "stderr: {stderr}");
+
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("pre_a.yml"))?,
+        "name: a\n"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_split_exp_and_slurp_incompatible() -> Result<()> {
+    let (_stdout, stderr, code) = run_yq_split(".", "{}", &["--split-exp", "\"f.yml\"", "-s"])?;
+    assert_ne!(code, 0);
+    assert!(stderr.contains("--slurp"), "stderr: {stderr}");
+    Ok(())
+}
+
+#[test]
+fn test_split_exp_and_inplace_incompatible() -> Result<()> {
+    let mut input_file = NamedTempFile::new()?;
+    writeln!(input_file, "a: 1")?;
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .arg("yq")
+        .args(["--split-exp", "\"f.yml\"", "-i"])
+        .arg(".")
+        .arg(input_file.path())
+        .stdin(Stdio::null())
+        .output()?;
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(stderr.contains("--inplace"), "stderr: {stderr}");
+    Ok(())
+}
+
+#[test]
+fn test_split_exp_and_raw_input_not_yet_supported() -> Result<()> {
+    let (_stdout, stderr, code) = run_yq_split(".", "hello", &["--split-exp", "\"f.yml\"", "-R"])?;
+    assert_ne!(code, 0);
+    assert!(stderr.contains("not yet supported"), "stderr: {stderr}");
+    Ok(())
+}
+
+#[test]
+fn test_split_exp_and_front_matter_incompatible() -> Result<()> {
+    let (_stdout, stderr, code) = run_yq_split(
+        ".",
+        "---\na: 1\n---\nbody\n",
+        &["--split-exp", "\"f.yml\"", "--front-matter", "extract"],
+    )?;
+    assert_ne!(code, 0);
+    assert!(stderr.contains("--front-matter"), "stderr: {stderr}");
+    Ok(())
+}
+
+#[test]
+fn test_split_exp_with_null_input() -> Result<()> {
+    let dir = TempDir::new()?;
+    let pattern = format!(
+        "\"{}/f\" + ($index|tostring) + \".yml\"",
+        dir.path().display()
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .arg("yq")
+        .args(["-n", "--split-exp", &pattern])
+        .arg("range(3)")
+        .stdin(Stdio::null())
+        .output()?;
+    assert!(output.status.success());
+
+    for (i, expected) in ["0", "1", "2"].into_iter().enumerate() {
+        let content = std::fs::read_to_string(dir.path().join(format!("f{i}.yml")))?;
+        assert_eq!(content.trim(), expected);
+    }
+    Ok(())
+}
+
+#[test]
+fn test_split_exp_duplicate_filename_warns_and_overwrites() -> Result<()> {
+    let dir = TempDir::new()?;
+    let pattern = format!("\"{}/const.yml\"", dir.path().display());
+    let (_stdout, stderr, code) =
+        run_yq_split(".[]", "[1, 2]", &["--split-exp", &pattern, "-p", "json"])?;
+    assert_eq!(code, 0);
+    assert!(
+        stderr.contains("written more than once"),
+        "stderr: {stderr}"
+    );
+
+    let content = std::fs::read_to_string(dir.path().join("const.yml"))?;
+    assert_eq!(content.trim(), "2");
+    Ok(())
+}
+
+/// Regression test: `ErrorSink::hit()` is sticky for the whole run, so
+/// comparing it before/after each call only correctly detects "this call
+/// just reported" for the very first error -- every later real error was
+/// double-reported with a spurious extra "produced no output" message
+/// (#715 follow-up). Fixed via `report_count()`, which can be compared
+/// per-call regardless of earlier hits.
+#[test]
+fn test_split_exp_reports_each_error_exactly_once() -> Result<()> {
+    let dir = TempDir::new()?;
+    let pattern = format!(
+        "if . == 1 then error(\"boom1\") elif . == 2 then error(\"boom2\") else \"{}/f3.yml\" end",
+        dir.path().display()
+    );
+    let (_stdout, stderr, code) =
+        run_yq_split(".[]", "[1, 2, 3]", &["--split-exp", &pattern, "-p", "json"])?;
+    assert_ne!(code, 0);
+    let error_lines: Vec<&str> = stderr.lines().filter(|l| l.starts_with("Error:")).collect();
+    assert_eq!(
+        error_lines,
+        vec!["Error: boom1", "Error: boom2"],
+        "stderr: {stderr}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("f3.yml"))?.trim(),
+        "3"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_split_exp_output_format_respected() -> Result<()> {
+    let dir = TempDir::new()?;
+    let pattern = format!(
+        "\"{}/j\" + ($index|tostring) + \".json\"",
+        dir.path().display()
+    );
+    let (_stdout, _stderr, code) = run_yq_split(
+        ".[]",
+        r#"[{"a":1},{"a":2}]"#,
+        &["--split-exp", &pattern, "-p", "json", "-o", "json", "-I0"],
+    )?;
+    assert_eq!(code, 0);
+
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("j0.json"))?.trim(),
+        r#"{"a":1}"#
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("j1.json"))?.trim(),
+        r#"{"a":2}"#
+    );
+    Ok(())
+}
+
+/// Regression test: `.` alone is `is_m2_streamable`, so without the
+/// `split_expr.is_none()` guard on the M2 fast-path gates, `--split-exp`
+/// combined with an identity filter would silently stream straight to
+/// stdout instead of writing the split file (#715).
+#[test]
+fn test_split_exp_with_identity_filter_not_bypassed_by_m2() -> Result<()> {
+    let dir = TempDir::new()?;
+    let pattern = format!("\"{}/identity_out.yml\"", dir.path().display());
+    let (stdout, _stderr, code) = run_yq_split(".", "a: 1\n", &["--split-exp", &pattern])?;
+    assert_eq!(code, 0);
+    assert_eq!(
+        stdout, "",
+        "stdout must stay empty; M2 fast path must not bypass split-exp"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("identity_out.yml"))?,
+        "a: 1\n"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_split_exp_empty_result_errors() -> Result<()> {
+    let (_stdout, stderr, code) = run_yq_split(".", "a: 1\n", &["--split-exp", "empty"])?;
+    assert_ne!(code, 0);
+    assert!(stderr.contains("produced no output"), "stderr: {stderr}");
+    Ok(())
+}
+
+#[test]
+fn test_split_exp_many_results_errors() -> Result<()> {
+    let (_stdout, stderr, code) = run_yq_split(".", "a: 1\n", &["--split-exp", "$index, $index"])?;
+    assert_ne!(code, 0);
+    assert!(
+        stderr.contains("exactly one string") && stderr.contains("2 results"),
+        "stderr: {stderr}"
+    );
+    Ok(())
+}
+
+/// Regression coverage for `write_split_result`'s own `std::fs::write`
+/// failure path (distinct from the filename-evaluation error paths above):
+/// a directory that doesn't exist makes the actual file write fail, which
+/// must surface as a normal CLI error rather than a panic, across all three
+/// input-gathering branches (`-n`/null-input, YAML, JSON).
+#[test]
+fn test_split_exp_write_failure_reports_error_null_input() -> Result<()> {
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .arg("yq")
+        .args(["-n", "--split-exp", "\"/nonexistent-dir-715/out.yml\""])
+        .arg("1")
+        .stdin(Stdio::null())
+        .output()?;
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(
+        stderr.contains("failed to write --split-exp output file"),
+        "stderr: {stderr}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_split_exp_write_failure_reports_error_yaml_input() -> Result<()> {
+    let (_stdout, stderr, code) = run_yq_split(
+        ".",
+        "a: 1\n",
+        &["--split-exp", "\"/nonexistent-dir-715/out.yml\""],
+    )?;
+    assert_ne!(code, 0);
+    assert!(
+        stderr.contains("failed to write --split-exp output file"),
+        "stderr: {stderr}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_split_exp_write_failure_reports_error_json_input() -> Result<()> {
+    let (_stdout, stderr, code) = run_yq_split(
+        ".",
+        "{\"a\":1}",
+        &[
+            "--split-exp",
+            "\"/nonexistent-dir-715/out.yml\"",
+            "-p",
+            "json",
+        ],
+    )?;
+    assert_ne!(code, 0);
+    assert!(
+        stderr.contains("failed to write --split-exp output file"),
+        "stderr: {stderr}"
+    );
+    Ok(())
+}
+
+/// `--split-exp` combined with `--doc`/`document` filtering for JSON input:
+/// with two JSON files and `--doc 1`, the first file's document must be
+/// skipped (not written) and only the second file's document processed.
+#[test]
+fn test_split_exp_document_filter_skips_earlier_json_files() -> Result<()> {
+    let dir = TempDir::new()?;
+    let mut file1 = NamedTempFile::new()?;
+    write!(file1, "{{\"which\":\"one\"}}")?;
+    let mut file2 = NamedTempFile::new()?;
+    write!(file2, "{{\"which\":\"two\"}}")?;
+    let pattern = format!("\"{}/out.json\"", dir.path().display());
+
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .arg("yq")
+        .args([
+            "--split-exp",
+            &pattern,
+            "-p",
+            "json",
+            "-o",
+            "json",
+            "-I0",
+            "--doc",
+            "1",
+        ])
+        .arg(".")
+        .arg(file1.path())
+        .arg(file2.path())
+        .stdin(Stdio::null())
+        .output()?;
+    assert!(output.status.success());
+
+    let content = std::fs::read_to_string(dir.path().join("out.json"))?;
+    assert_eq!(content.trim(), r#"{"which":"two"}"#);
+    Ok(())
+}
+
+/// `--split-exp` reading from stdin with `--validate` set must reject
+/// invalid YAML before ever reaching the split-write loop.
+#[test]
+fn test_split_exp_validate_rejects_invalid_yaml_from_stdin() -> Result<()> {
+    let (_stdout, stderr, code) = run_yq_split(
+        ".",
+        "a: b: c: d\n",
+        &["--split-exp", "\"f.yml\"", "--validate"],
+    )?;
+    assert_ne!(code, 0);
+    assert!(stderr.contains("validation error"), "stderr: {stderr}");
+    Ok(())
+}
+
+/// Same as above, but reading from a file (exercises the file-gathering
+/// branch of `--split-exp`'s input collection rather than the stdin one).
+#[test]
+fn test_split_exp_validate_rejects_invalid_yaml_from_file() -> Result<()> {
+    let mut input_file = NamedTempFile::new()?;
+    writeln!(input_file, "a: b: c: d")?;
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .arg("yq")
+        .args(["--split-exp", "\"f.yml\"", "--validate"])
+        .arg(".")
+        .arg(input_file.path())
+        .stdin(Stdio::null())
+        .output()?;
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(stderr.contains("validation error"), "stderr: {stderr}");
+    Ok(())
+}
+
+/// A hard parse failure (as opposed to `--validate`'s opt-in strict check)
+/// from the loose YAML loader itself, e.g. tab-indentation, must still
+/// surface as a normal CLI error under `--split-exp`'s YAML branch, not a
+/// panic -- exercises `evaluate_yaml_direct_filtered`'s own `Err` path
+/// rather than `write_split_result`'s.
+#[test]
+fn test_split_exp_hard_yaml_parse_error_propagates() -> Result<()> {
+    let (_stdout, stderr, code) = run_yq_split(".", "a:\n\t- 1\n", &["--split-exp", "\"f.yml\""])?;
+    assert_ne!(code, 0);
+    assert!(stderr.contains("YAML parse error"), "stderr: {stderr}");
+    Ok(())
+}
+
+// ============================================================================
+// --eval-all / file_index Tests (#715)
+// ============================================================================
+
+fn run_yq_files(
+    filter: &str,
+    files: &[&std::path::Path],
+    extra_args: &[&str],
+) -> Result<(String, String, i32)> {
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .arg("yq")
+        .args(extra_args)
+        .arg(filter)
+        .args(files)
+        .stdin(Stdio::null())
+        .output()?;
+    let stdout = String::from_utf8(output.stdout)?;
+    let stderr = String::from_utf8(output.stderr)?;
+    let code = output.status.code().unwrap_or(-1);
+    Ok((stdout, stderr, code))
+}
+
+fn two_doc_fixtures() -> Result<(NamedTempFile, NamedTempFile)> {
+    let mut f1 = NamedTempFile::new()?;
+    write!(f1, "a: 1\nname: first\n")?;
+    let mut f2 = NamedTempFile::new()?;
+    write!(f2, "b: 2\nname: second\n")?;
+    Ok((f1, f2))
+}
+
+#[test]
+fn test_eval_all_combines_documents_across_files() -> Result<()> {
+    let (f1, f2) = two_doc_fixtures()?;
+    let (stdout, _stderr, code) = run_yq_files("length", &[f1.path(), f2.path()], &["--eval-all"])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "2");
+    Ok(())
+}
+
+/// `--eval-all` reading a single document from stdin (no input files at
+/// all) is a distinct input-gathering branch from the file-list one every
+/// other `--eval-all` test above exercises.
+#[test]
+fn test_eval_all_works_from_stdin() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_yq_stdin_with_stderr(".", "a: 1\n", &["--eval-all", "-o", "json", "-I0"])?;
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout.trim(), r#"[{"a":1}]"#);
+    Ok(())
+}
+
+#[test]
+fn test_eval_all_ea_alias() -> Result<()> {
+    let (f1, f2) = two_doc_fixtures()?;
+    let (stdout, _stderr, code) = run_yq_files("length", &[f1.path(), f2.path()], &["--ea"])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "2");
+    Ok(())
+}
+
+#[test]
+fn test_eval_all_file_index_bare() -> Result<()> {
+    let (f1, f2) = two_doc_fixtures()?;
+    let (stdout, _stderr, code) = run_yq_files(
+        ".[] | file_index",
+        &[f1.path(), f2.path()],
+        &["--eval-all", "-o", "json"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "0\n1");
+    Ok(())
+}
+
+/// The headline `--eval-all` idiom -- regression test for the
+/// `needs_path_context`/`Select` runtime-arm fix (#715).
+#[test]
+fn test_eval_all_file_index_select() -> Result<()> {
+    let (f1, f2) = two_doc_fixtures()?;
+    let (stdout, _stderr, code) = run_yq_files(
+        ".[] | select(file_index == 0)",
+        &[f1.path(), f2.path()],
+        &["--eval-all"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "a: 1\nname: first\n");
+    Ok(())
+}
+
+#[test]
+fn test_eval_all_file_index_select_then_field() -> Result<()> {
+    let (f1, f2) = two_doc_fixtures()?;
+    let (stdout, _stderr, code) = run_yq_files(
+        ".[] | select(file_index == 0) | .name",
+        &[f1.path(), f2.path()],
+        &["--eval-all"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "first");
+    Ok(())
+}
+
+/// Regression test: `needs_path_context` recurses into `Expr::If`, but
+/// `eval_pipe_with_path_context_internal` had no matching arm, so it fell
+/// into the generic (non-path-context) fallback and silently lost
+/// `file_index` for anything nested in `then`/`else` (#715 follow-up).
+#[test]
+fn test_eval_all_file_index_in_if_then_else() -> Result<()> {
+    let (f1, f2) = two_doc_fixtures()?;
+    let (stdout, _stderr, code) = run_yq_files(
+        r#".[] | if file_index == 0 then "from-f1" else "from-f2" end"#,
+        &[f1.path(), f2.path()],
+        &["--eval-all"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "from-f1\n---\nfrom-f2\n");
+    Ok(())
+}
+
+/// Regression test: same gap as `test_eval_all_file_index_in_if_then_else`,
+/// for `Expr::Try` (#715 follow-up).
+#[test]
+fn test_eval_all_file_index_in_try_catch() -> Result<()> {
+    let (f1, f2) = two_doc_fixtures()?;
+    let (stdout, _stderr, code) = run_yq_files(
+        r#".[] | try select(file_index == 1) catch "err""#,
+        &[f1.path(), f2.path()],
+        &["--eval-all"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "b: 2\nname: second\n");
+    Ok(())
+}
+
+/// Regression test: `label $x | ...` is otherwise inert, but wrapping a
+/// `file_index`-using pipe in one silently dropped path context on both the
+/// `needs_path_context` predicate and the interpreter side (#715 follow-up).
+#[test]
+fn test_eval_all_file_index_survives_label_wrapper() -> Result<()> {
+    let (f1, f2) = two_doc_fixtures()?;
+    let (stdout, _stderr, code) = run_yq_files(
+        "label $out | .[] | file_index",
+        &[f1.path(), f2.path()],
+        &["--eval-all", "-o", "json"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "0\n1");
+    Ok(())
+}
+
+/// Regression test: same gap as `test_eval_all_file_index_in_if_then_else`,
+/// for `map(...)` -- `file_index` silently stubbed to 0 for every element
+/// instead of resolving, so `map(select(file_index == 0))` returned every
+/// document from every file instead of filtering to file 0's (#715
+/// follow-up).
+#[test]
+fn test_eval_all_file_index_in_map() -> Result<()> {
+    let (f1, f2) = two_doc_fixtures()?;
+    let (stdout, _stderr, code) = run_yq_files(
+        "map(select(file_index == 0))",
+        &[f1.path(), f2.path()],
+        &["--eval-all"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "-\n  a: 1\n  name: first\n");
+    Ok(())
+}
+
+/// `map(f)` is `[.[] | f]`, so it must stay atomic on error like real array
+/// construction (`[1,error("x"),3]` produces no output at all) rather than
+/// leaking an in-progress array (#715 follow-up).
+#[test]
+fn test_eval_all_file_index_in_map_is_atomic_on_error() -> Result<()> {
+    let (f1, f2) = two_doc_fixtures()?;
+    let (stdout, stderr, code) = run_yq_files(
+        r#"map(if file_index == 0 then error("boom") else . end)"#,
+        &[f1.path(), f2.path()],
+        &["--eval-all"],
+    )?;
+    assert_eq!(stdout, "");
+    assert!(stderr.contains("boom"), "expected the error, got: {stderr}");
+    assert_eq!(code, 1);
+    Ok(())
+}
+
+#[test]
+fn test_eval_all_file_index_outside_eval_all_is_zero() -> Result<()> {
+    let (f1, _f2) = two_doc_fixtures()?;
+    let (stdout, _stderr, code) = run_yq_files("file_index", &[f1.path()], &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "0");
+    Ok(())
+}
+
+#[test]
+fn test_eval_all_file_index_camelcase_and_short_alias() -> Result<()> {
+    let (f1, f2) = two_doc_fixtures()?;
+    for keyword in ["fileIndex", "fi"] {
+        let (stdout, _stderr, code) = run_yq_files(
+            &format!(".[] | {keyword}"),
+            &[f1.path(), f2.path()],
+            &["--eval-all", "-o", "json"],
+        )?;
+        assert_eq!(code, 0, "keyword: {keyword}");
+        assert_eq!(stdout.trim(), "0\n1", "keyword: {keyword}");
+    }
+    Ok(())
+}
+
+#[test]
+fn test_eval_all_reduce_merge() -> Result<()> {
+    let (f1, f2) = two_doc_fixtures()?;
+    let (stdout, _stderr, code) = run_yq_files(
+        "reduce .[] as $item ({}; . * $item)",
+        &[f1.path(), f2.path()],
+        &["--eval-all", "-o", "json", "-I0"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), r#"{"a":1,"name":"second","b":2}"#);
+    Ok(())
+}
+
+/// The approximated real-yq merge idiom -- correct only when each file
+/// contributes exactly one matching top-level document (#715). Also the
+/// regression test for the `Expr::Arithmetic` path-context runtime-arm fix:
+/// without it, both `select`s evaluate against the 0-stub and the
+/// `file_index==1` side comes back empty ("no value" error).
+#[test]
+fn test_eval_all_select_star_merge_single_doc_per_file() -> Result<()> {
+    let (f1, f2) = two_doc_fixtures()?;
+    let (stdout, _stderr, code) = run_yq_files(
+        "(.[] | select(file_index == 0)) * (.[] | select(file_index == 1))",
+        &[f1.path(), f2.path()],
+        &["--eval-all", "-o", "json", "-I0"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), r#"{"a":1,"name":"second","b":2}"#);
+    Ok(())
+}
+
+#[test]
+fn test_eval_all_doc_separator_between_results() -> Result<()> {
+    let (f1, f2) = two_doc_fixtures()?;
+    let (stdout, _stderr, code) = run_yq_files(".[]", &[f1.path(), f2.path()], &["--eval-all"])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "a: 1\nname: first\n---\nb: 2\nname: second\n");
+    Ok(())
+}
+
+/// Regression test: `--eval-all` never routed through `SplitDocState` (the
+/// state machine every other output path uses to honor an explicit
+/// `split_doc` marker), so `--eval-all '... | split_doc'` silently merged
+/// every result with zero `---` separators instead of one per result
+/// (#715 follow-up).
+#[test]
+fn test_eval_all_split_doc_emits_separators() -> Result<()> {
+    let (f1, f2) = two_doc_fixtures()?;
+    let (stdout, _stderr, code) =
+        run_yq_files(".[] | split_doc", &[f1.path(), f2.path()], &["--eval-all"])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "a: 1\nname: first\n---\nb: 2\nname: second\n");
+    Ok(())
+}
+
+#[test]
+fn test_eval_all_doc_flag_interaction() -> Result<()> {
+    let mut multi = NamedTempFile::new()?;
+    write!(multi, "x: 1\n---\nx: 2\n")?;
+    let (stdout, _stderr, code) =
+        run_yq_files(".[] | .x", &[multi.path()], &["--eval-all", "--doc", "1"])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "2");
+    Ok(())
+}
+
+#[test]
+fn test_eval_all_rejects_slurp() -> Result<()> {
+    let (f1, _f2) = two_doc_fixtures()?;
+    let (_stdout, stderr, code) = run_yq_files(".", &[f1.path()], &["--eval-all", "-s"])?;
+    assert_ne!(code, 0);
+    assert!(stderr.contains("--slurp"), "stderr: {stderr}");
+    Ok(())
+}
+
+#[test]
+fn test_eval_all_rejects_inplace() -> Result<()> {
+    let (f1, _f2) = two_doc_fixtures()?;
+    let (_stdout, stderr, code) = run_yq_files(".", &[f1.path()], &["--eval-all", "-i"])?;
+    assert_ne!(code, 0);
+    assert!(stderr.contains("--inplace"), "stderr: {stderr}");
+    Ok(())
+}
+
+#[test]
+fn test_eval_all_rejects_raw_input() -> Result<()> {
+    let (f1, _f2) = two_doc_fixtures()?;
+    let (_stdout, stderr, code) = run_yq_files(".", &[f1.path()], &["--eval-all", "-R"])?;
+    assert_ne!(code, 0);
+    assert!(stderr.contains("--raw-input"), "stderr: {stderr}");
+    Ok(())
+}
+
+#[test]
+fn test_eval_all_rejects_split_exp() -> Result<()> {
+    let (f1, _f2) = two_doc_fixtures()?;
+    let (_stdout, stderr, code) = run_yq_files(
+        ".",
+        &[f1.path()],
+        &["--eval-all", "--split-exp", "\"f.yml\""],
+    )?;
+    assert_ne!(code, 0);
+    assert!(stderr.contains("--split-exp"), "stderr: {stderr}");
+    Ok(())
+}
+
+#[test]
+fn test_eval_all_rejects_front_matter() -> Result<()> {
+    let (f1, _f2) = two_doc_fixtures()?;
+    let (_stdout, stderr, code) = run_yq_files(
+        ".",
+        &[f1.path()],
+        &["--eval-all", "--front-matter", "extract"],
+    )?;
+    assert_ne!(code, 0);
+    assert!(stderr.contains("--front-matter"), "stderr: {stderr}");
+    Ok(())
+}
+
+/// `--eval-all` reading from stdin with `--validate` set must reject invalid
+/// YAML before combining it into the evaluation array.
+#[test]
+fn test_eval_all_validate_rejects_invalid_yaml_from_stdin() -> Result<()> {
+    let (_stdout, stderr, code) =
+        run_yq_stdin_with_stderr(".", "a: b: c: d\n", &["--eval-all", "--validate"])?;
+    assert_ne!(code, 0);
+    assert!(stderr.contains("validation error"), "stderr: {stderr}");
+    Ok(())
+}
+
+/// Same as above, but reading from files (exercises the file-gathering
+/// branch of `--eval-all`'s input collection rather than the stdin one).
+#[test]
+fn test_eval_all_validate_rejects_invalid_yaml_from_file() -> Result<()> {
+    let mut bad_file = NamedTempFile::new()?;
+    writeln!(bad_file, "a: b: c: d")?;
+    let (_stdout, stderr, code) =
+        run_yq_files(".", &[bad_file.path()], &["--eval-all", "--validate"])?;
+    assert_ne!(code, 0);
+    assert!(stderr.contains("validation error"), "stderr: {stderr}");
+    Ok(())
+}
+
+/// Regression test for the `needs_path_context`/`Compare` runtime-arm fix
+/// (#715): `key` used inside `select(...)`'s condition previously produced
+/// no output at all, independent of `--eval-all`.
+#[test]
+fn test_key_inside_select_regression() -> Result<()> {
+    let (stdout, code) = run_yq_stdin(".[] | select(key >= 1)", "[10, 20, 30]", &["-o", "json"])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "20\n30");
+    Ok(())
+}
+
+/// Regression test for the same fix, via `document_index` (yq's existing
+/// builtin) inside a comparison instead of `key` inside `select`.
+#[test]
+fn test_document_index_inside_comparison_regression() -> Result<()> {
+    let (stdout, code) = run_yq_stdin("select(document_index == 1)", "a: 1\n---\nb: 2\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "b: 2\n");
     Ok(())
 }
