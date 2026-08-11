@@ -5046,6 +5046,115 @@ fn test_yq_halt_not_caught_by_try_catch_or_label() -> Result<()> {
     Ok(())
 }
 
+/// #791 follow-up: `map(f)`'s path-context evaluator (only reachable via
+/// `--eval-all` when `f` references `file_index`/`key`/`path`/`parent`, which
+/// routes through `eval_pipe_with_path_context_internal` instead of the
+/// ordinary `map_over`) discarded the partial array on a mid-map `Error`/
+/// `Break` but let a `Halt` leak the elements already mapped before it as if
+/// they were legitimate output. `map(f)` is array construction, atomic in jq
+/// (`[1,error("x"),3]` produces no output at all) -- a halt partway through
+/// must discard the whole array, same as error/break.
+#[test]
+fn test_map_with_path_context_discards_partial_array_on_halt() -> Result<()> {
+    let mut f1 = NamedTempFile::new()?;
+    writeln!(f1, "1")?;
+    let mut f2 = NamedTempFile::new()?;
+    writeln!(f2, "2")?;
+    let mut f3 = NamedTempFile::new()?;
+    writeln!(f3, "3")?;
+
+    let (stdout, stderr, code) = run_yq_files(
+        "map(if . == 2 then halt else . + 10 + file_index end)",
+        &[f1.path(), f2.path(), f3.path()],
+        &["--eval-all"],
+    )?;
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout, "", "partial map output must not leak: {stdout:?}");
+    Ok(())
+}
+
+/// #791 follow-up: `std::fs::write` in the `--inplace` write-back ran
+/// unconditionally, so a filter that produced no output for a file (a
+/// `halt`/`halt_error` before that file's first document, `empty`, ...)
+/// truncated it to zero bytes -- destroying the original content. `halt`
+/// used as an early-exit guard clause is a natural way to trigger this, more
+/// so than the pre-existing `empty`/error triggers.
+#[test]
+fn test_inplace_halt_before_any_output_does_not_truncate_file() -> Result<()> {
+    let mut input_file = NamedTempFile::new()?;
+    write!(input_file, "a: 1\nb: hello\n")?;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .arg("yq")
+        .arg("-i")
+        .arg("halt")
+        .arg(input_file.path())
+        .stdin(Stdio::null())
+        .output()?;
+
+    assert!(output.status.success());
+    let content = std::fs::read_to_string(input_file.path())?;
+    assert_eq!(content, "a: 1\nb: hello\n", "original content must survive");
+    Ok(())
+}
+
+/// The fix above is deliberately halt-specific, not "any empty output
+/// preserves the file": real yq (v4.53.3, verified live) truncates a file
+/// to reflect a filter that legitimately produces no output for it --
+/// `-i 'select(false)'` empties the file rather than leaving it untouched.
+/// Only a `halt`-caused emptiness gets the preserve-original-content
+/// protection.
+#[test]
+fn test_inplace_legitimately_empty_output_still_truncates_file() -> Result<()> {
+    for filter in ["select(false)", "empty"] {
+        let mut input_file = NamedTempFile::new()?;
+        write!(input_file, "a: 1\nb: hello\n")?;
+
+        let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+            .arg("yq")
+            .arg("-i")
+            .arg(filter)
+            .arg(input_file.path())
+            .stdin(Stdio::null())
+            .output()?;
+
+        assert!(output.status.success(), "{filter}");
+        let content = std::fs::read_to_string(input_file.path())?;
+        assert_eq!(content, "", "{filter}: must truncate, matching real yq");
+    }
+    Ok(())
+}
+
+/// A multi-file `--inplace` halt partway through must still: edit files
+/// before the halt normally, leave the halting file's original content
+/// intact (the halt fired before that file produced any output), and leave
+/// every later file completely untouched.
+#[test]
+fn test_inplace_multi_file_halt_leaves_untouched_files_alone() -> Result<()> {
+    let mut f1 = NamedTempFile::new()?;
+    writeln!(f1, "a: 1")?;
+    let mut f2 = NamedTempFile::new()?;
+    writeln!(f2, "a: 2")?;
+    let mut f3 = NamedTempFile::new()?;
+    writeln!(f3, "a: 3")?;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .arg("yq")
+        .arg("-i")
+        .arg("if .a == 2 then halt else .a += 100 end")
+        .arg(f1.path())
+        .arg(f2.path())
+        .arg(f3.path())
+        .stdin(Stdio::null())
+        .output()?;
+
+    assert!(output.status.success());
+    assert_eq!(std::fs::read_to_string(f1.path())?, "a: 101\n");
+    assert_eq!(std::fs::read_to_string(f2.path())?, "a: 2\n");
+    assert_eq!(std::fs::read_to_string(f3.path())?, "a: 3\n");
+    Ok(())
+}
+
 /// The diagnostic must never reach stdout.
 ///
 /// The YAML and JSON streaming fast paths used to `write!` it into the output

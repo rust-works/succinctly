@@ -3029,9 +3029,23 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                 output_buffer.extend_from_slice(body);
             }
 
-            // Write the output back to the file
-            std::fs::write(path, &output_buffer)
-                .with_context(|| format!("failed to write to file: {}", path.display()))?;
+            // Write the output back to the file — unless a `halt`/
+            // `halt_error` fired before this file produced any output at
+            // all. A halt aborts the whole process; this file was never
+            // fully considered, so leaving its original content in place is
+            // safer than truncating it to reflect an evaluation that never
+            // really finished (#791) — `halt` used as an early-exit guard
+            // clause is a natural way to trigger this under `-i`.
+            //
+            // Deliberately narrower than "output is empty": real yq (v4.53.3,
+            // verified live) truncates a file to reflect a filter that
+            // legitimately produces no output for it, e.g. `-i 'select(false)'`
+            // or `-i 'del(.)'` both empty the file — so only a halt gets this
+            // protection, not ordinary empty output.
+            if !(output_buffer.is_empty() && sink.halted().is_some()) {
+                std::fs::write(path, &output_buffer)
+                    .with_context(|| format!("failed to write to file: {}", path.display()))?;
+            }
 
             // halt/halt_error (#791) outranks editing any further files.
             if sink.halted().is_some() {
