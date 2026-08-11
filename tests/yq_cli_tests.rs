@@ -6128,6 +6128,37 @@ fn test_split_exp_dot_is_bound_to_result() -> Result<()> {
     Ok(())
 }
 
+/// Regression test: `--split-exp`'s expression was parsed independently of
+/// the main filter and never received `--arg`/`--argjson`/`$ARGS`
+/// substitution (only `$index` was bound), so a filename expression
+/// referencing an `--arg` value failed as an undefined variable even though
+/// the same `--arg` works fine for the main filter (#715 follow-up).
+#[test]
+fn test_split_exp_uses_arg_variable() -> Result<()> {
+    let dir = TempDir::new()?;
+    let pattern = format!("\"{}/\" + $prefix + .name + \".yml\"", dir.path().display());
+    let (_stdout, stderr, code) = run_yq_split(
+        ".[]",
+        r#"[{"name":"a"}]"#,
+        &[
+            "--arg",
+            "prefix",
+            "pre_",
+            "--split-exp",
+            &pattern,
+            "-p",
+            "json",
+        ],
+    )?;
+    assert_eq!(code, 0, "stderr: {stderr}");
+
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("pre_a.yml"))?,
+        "name: a\n"
+    );
+    Ok(())
+}
+
 #[test]
 fn test_split_exp_and_slurp_incompatible() -> Result<()> {
     let (_stdout, stderr, code) = run_yq_split(".", "{}", &["--split-exp", "\"f.yml\"", "-s"])?;

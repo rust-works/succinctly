@@ -1771,19 +1771,6 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
     let mut program = jq::parse_program_with_mode(&filter_str, jq::ParserMode::Yq)
         .map_err(|e| anyhow::anyhow!("parse error: {e}"))?;
 
-    // Parse the --split-exp expression, if given, once up front. `$index` is
-    // bound per output result (see `write_split_result`); no other variable
-    // substitution is applied to it, deliberately -- see the flag's help text.
-    let split_expr: Option<Expr> = args
-        .split_exp
-        .as_deref()
-        .map(|s| {
-            jq::parse_program_with_mode(s, jq::ParserMode::Yq)
-                .map(|p| p.expr)
-                .map_err(|e| anyhow::anyhow!("parse error in --split-exp expression: {e}"))
-        })
-        .transpose()?;
-
     // Parse variables
     let context = parse_variables(&args)?;
 
@@ -1791,13 +1778,27 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
     // variable into the expression AST before evaluating, mirroring the jq
     // runner (see jq_runner.rs). Without this, filter references like `$g`
     // error as "undefined variable" even though the values were parsed (#284).
-    {
-        let args_value = build_args_var(&context);
-        let mut all_vars: Vec<(&str, &OwnedValue)> =
-            context.named.iter().map(|(k, v)| (k.as_str(), v)).collect();
-        all_vars.push(("ARGS", &args_value));
-        program.expr = jq::substitute_vars(&program.expr, all_vars);
-    }
+    let args_value = build_args_var(&context);
+    let mut all_vars: Vec<(&str, &OwnedValue)> =
+        context.named.iter().map(|(k, v)| (k.as_str(), v)).collect();
+    all_vars.push(("ARGS", &args_value));
+    program.expr = jq::substitute_vars(&program.expr, all_vars.iter().copied());
+
+    // Parse the --split-exp expression, if given, once up front, applying
+    // the same --arg/--argjson/$ARGS substitution as the main filter --
+    // otherwise a filename expression referencing `--arg`-provided values
+    // (e.g. an output directory prefix) fails as an undefined variable even
+    // though the same flag works for the main filter. `$index` is bound
+    // separately, per output result (see `write_split_result`).
+    let split_expr: Option<Expr> = args
+        .split_exp
+        .as_deref()
+        .map(|s| {
+            jq::parse_program_with_mode(s, jq::ParserMode::Yq)
+                .map(|p| jq::substitute_vars(&p.expr, all_vars.iter().copied()))
+                .map_err(|e| anyhow::anyhow!("parse error in --split-exp expression: {e}"))
+        })
+        .transpose()?;
 
     // Output configuration
     let output_config = OutputConfig::from_args(&args);
