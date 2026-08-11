@@ -5749,6 +5749,54 @@ fn test_iterated_containers_keep_own_comments_793a() -> Result<()> {
     Ok(())
 }
 
+// #793b: on the DOM path (`OwnedValue` + `emit_yaml_value`, still reachable
+// via flags like `--arg` that can't use the M2 fast path even after #796
+// widened which queries can), a container's own trailing comment used to be
+// concatenated directly onto its last child's rendered line with no
+// separator - indistinguishable from that child's own comment. Fixed by
+// giving the container's own comment a standalone comment line instead.
+// `--arg x y` is used as the M2-blocking flag throughout (rather than the
+// original issue's `select(...)`, which #796 now routes through M2 and so
+// no longer reaches this code at all for these shapes).
+
+#[test]
+fn test_dom_path_container_comment_gets_own_line_not_glued_to_last_child_793b() -> Result<()> {
+    let (out, code) = run_yq_stdin(
+        ".a",
+        "a: [1, 2, 3] # trailing\nb: 2\n",
+        &["--arg", "x", "y"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "- 1\n- 2\n- 3\n# trailing\n");
+    Ok(())
+}
+
+#[test]
+fn test_dom_path_root_container_comment_gets_own_line_793b() -> Result<()> {
+    let (out, code) = run_yq_stdin(
+        ".",
+        "items: [1, 2, 3] # container comment\n",
+        &["--arg", "x", "y"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "items:\n  - 1\n  - 2\n  - 3\n  # container comment\n");
+    Ok(())
+}
+
+/// A child's own comment and the container's own comment must both survive,
+/// as two distinct comments - not silently concatenated onto one line.
+#[test]
+fn test_dom_path_container_and_child_comments_stay_distinct_793b() -> Result<()> {
+    let (out, code) = run_yq_stdin(
+        ".",
+        "items: [1, 2 # child\n] # container\n",
+        &["--arg", "x", "y"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "items:\n  - 1\n  - 2 # child\n  # container\n");
+    Ok(())
+}
+
 /// A comment trailing the first document's scalar root in a multi-document
 /// stream is dropped by real `yq` too (verified empirically) - not a
 /// regression to "fix" here.
