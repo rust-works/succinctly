@@ -3651,6 +3651,24 @@ fn test_color_output_survives_iteration_with_duplicate_keys() -> Result<()> {
     Ok(())
 }
 
+/// Same as [`test_color_output_survives_iteration_with_duplicate_keys`], for
+/// `-o json`: the `stream_maybe_colored` call in the non-identity JSON
+/// branch of `stream_cursor!` (`result.stream_json`, used for anything other
+/// than plain `.`) is otherwise only exercised by identity queries.
+#[test]
+fn test_color_output_survives_iteration_with_duplicate_keys_json() -> Result<()> {
+    let yaml = "- a: 1\n  a: 2\n- b: 3\n";
+
+    let (output, code) = run_yq_stdin(".[]", yaml, &["-C", "-o", "json"])?;
+    assert_eq!(code, 0);
+    assert_eq!(
+        output,
+        "\u{1b}[1;39m{\u{1b}[0m\n  \u{1b}[1;34m\"a\"\u{1b}[0m: \u{1b}[0;39m1\u{1b}[0m,\n  \u{1b}[1;34m\"a\"\u{1b}[0m: \u{1b}[0;39m2\u{1b}[0m\n\u{1b}[1;39m}\u{1b}[0m\n\u{1b}[1;39m{\u{1b}[0m\n  \u{1b}[1;34m\"b\"\u{1b}[0m: \u{1b}[0;39m3\u{1b}[0m\n\u{1b}[1;39m}\u{1b}[0m\n"
+    );
+
+    Ok(())
+}
+
 // ============================================================================
 // Special float values (NaN / Infinity)
 // ============================================================================
