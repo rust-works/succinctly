@@ -6149,9 +6149,148 @@ fn builtin_getpath<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 // Phase 7: Regex Functions (requires "regex" feature)
 // =============================================================================
 
+/// True iff `input` ends with exactly one trailing `\n` — jq's (and
+/// Perl's) end-of-string exception for `$` applies to at most one trailing
+/// newline; a second one disqualifies it (verified against jq-1.7.1:
+/// `"a\n\n"` does not satisfy `a$`, only `"a\n"` does).
+#[cfg(feature = "regex")]
+fn ends_with_single_trailing_newline(input: &str) -> bool {
+    let bytes = input.as_bytes();
+    matches!(bytes.last(), Some(b'\n'))
+        && !matches!(bytes.get(bytes.len().wrapping_sub(2)), Some(b'\n'))
+}
+
+/// Conservative (over-detecting, never under-detecting) check for whether
+/// `pattern` contains an inline modifier group that could turn on Rust
+/// regex's native multi-line mode (e.g. `(?m)`, `(?im)`, `(?m:...)`). When
+/// multiline is genuinely active, `$`/`^` already mean "end/start of line"
+/// under Rust's own (lookahead-free, already-correct) semantics, and jq's
+/// separate single-trailing-newline exception does not additionally stack
+/// on top of that (verified against jq-1.7.1: `(?m)b$` on `"a\nb\n\n"` is
+/// `true` via plain per-line anchoring, with no extra exception involved).
+/// A pattern that both enables and disables multiline in separate scopes,
+/// e.g. `(?m)a(?-m)b$`, is conservatively treated as "multiline active" for
+/// the whole pattern — full per-branch flag-scope tracking is out of scope.
+/// This is a documented simplification, not a correctness bug: at worst it
+/// skips the trailing-newline fix for that one (rare) pattern.
+#[cfg(feature = "regex")]
+fn pattern_may_enable_multiline(pattern: &str) -> bool {
+    let bytes = pattern.as_bytes();
+    let mut search_from = 0;
+    while let Some(rel) = pattern[search_from..].find("(?") {
+        let mut j = search_from + rel + 2;
+        while j < bytes.len() && bytes[j] != b')' && bytes[j] != b':' {
+            if bytes[j] == b'm' {
+                return true;
+            }
+            if bytes[j] == b'-' {
+                break; // rest of this run only *disables* flags
+            }
+            j += 1;
+        }
+        search_from += rel + 2;
+    }
+    false
+}
+
+/// Whether `pattern` needs the dual-haystack-view trailing-newline check at
+/// all (see `dv_captures_at`). Deliberately naive about escaping/character
+/// classes — a false positive (an escaped `\$` or a `$` inside `[...]`)
+/// just costs one harmless redundant search, since both haystack views
+/// agree on non-anchor content.
+#[cfg(feature = "regex")]
+fn pattern_may_need_trailing_newline_check(pattern: &str) -> bool {
+    pattern.contains('$') && !pattern_may_enable_multiline(pattern)
+}
+
+/// `re.is_match(input)`, honoring jq's Perl-style trailing-newline
+/// exception for `$` (see `dv_captures_at`'s doc comment).
+#[cfg(feature = "regex")]
+fn dv_is_match(re: &regex::Regex, input: &str, needs_check: bool) -> bool {
+    re.is_match(input)
+        || (needs_check
+            && ends_with_single_trailing_newline(input)
+            && re.is_match(&input[..input.len() - 1]))
+}
+
+/// Leftmost `Captures` in `input` at or after byte offset `start` — like
+/// `Regex::captures_at`, but also honors jq's Perl-style trailing-newline
+/// exception for `$`: real jq's `$` matches at the absolute end of the
+/// string, or immediately before a single trailing `\n`, as a genuine
+/// zero-width assertion (it never consumes that `\n` — verified against
+/// jq-1.7.1: `sub("a$";"X")` on `"a\n"` is `"aX\n"`, not `"aX"` or `"X"`).
+/// Rust's `regex` crate has no lookahead, so no pattern rewrite can express
+/// this directly. Instead, when `needs_check` and `input` ends in exactly
+/// one `\n`, the *unmodified* pattern is searched against a second
+/// haystack view with that one `\n` trimmed off; Rust's own (already
+/// correct, lookahead-free) `$`/`\z` handles each view correctly on its own
+/// terms, and whichever view produces the leftmost match wins. Byte offsets
+/// from the trimmed view are already valid offsets into `input` (only the
+/// tail was trimmed), so no translation is needed — this also gets
+/// match/capture content exactly right for free, since the trimmed view
+/// never contains the `\n` to begin with.
+#[cfg(feature = "regex")]
+fn dv_captures_at<'h>(
+    re: &regex::Regex,
+    input: &'h str,
+    start: usize,
+    needs_check: bool,
+) -> Option<regex::Captures<'h>> {
+    let full = re.captures_at(input, start);
+    if !needs_check || !ends_with_single_trailing_newline(input) {
+        return full;
+    }
+    let trimmed = &input[..input.len() - 1];
+    if start > trimmed.len() {
+        return full;
+    }
+    match (re.captures_at(trimmed, start), full) {
+        (Some(t), Some(f)) => {
+            if t.get(0).expect("group 0 always present").start()
+                <= f.get(0).expect("group 0 always present").start()
+            {
+                Some(t)
+            } else {
+                Some(f)
+            }
+        }
+        (Some(t), None) => Some(t),
+        (None, full) => full,
+    }
+}
+
+/// A compiled jq regex plus whatever extra state its builtins need to
+/// replicate jq semantics that Rust's `regex` crate doesn't natively
+/// support (currently: jq's Perl-style trailing-newline exception for `$`
+/// — see `dv_captures_at`/`dv_is_match`).
+#[cfg(feature = "regex")]
+struct JqRegex {
+    re: regex::Regex,
+    needs_trailing_nl_check: bool,
+}
+
+#[cfg(feature = "regex")]
+impl JqRegex {
+    fn is_match(&self, input: &str) -> bool {
+        dv_is_match(&self.re, input, self.needs_trailing_nl_check)
+    }
+
+    fn captures<'h>(&self, input: &'h str) -> Option<regex::Captures<'h>> {
+        dv_captures_at(&self.re, input, 0, self.needs_trailing_nl_check)
+    }
+
+    fn capture_names(&self) -> regex::CaptureNames<'_> {
+        self.re.capture_names()
+    }
+
+    fn captures_len(&self) -> usize {
+        self.re.captures_len()
+    }
+}
+
 /// Build regex flags from jq flag string
 #[cfg(feature = "regex")]
-fn build_regex(pattern: &str, flags: Option<&str>) -> Result<regex::Regex, EvalError> {
+fn build_regex(pattern: &str, flags: Option<&str>) -> Result<JqRegex, EvalError> {
     let mut pattern = pattern.to_string();
 
     // Apply flags
@@ -6195,7 +6334,20 @@ fn build_regex(pattern: &str, flags: Option<&str>) -> Result<regex::Regex, EvalE
         }
     }
 
-    regex::Regex::new(&pattern).map_err(|e| EvalError::new(format!("invalid regex: {e}")))
+    // jq's un-flagged `$` matches at the absolute end of the string, or
+    // immediately before a single trailing `\n` (Perl's `\Z` semantics) —
+    // unlike Rust regex's un-flagged `$`, which only matches the absolute
+    // end. See `dv_captures_at`/`dv_is_match` for how builtins compensate,
+    // and `pattern_may_enable_multiline` for why a user-written `(?m)`
+    // pattern is deliberately left alone.
+    let needs_trailing_nl_check = pattern_may_need_trailing_newline_check(&pattern);
+
+    let re =
+        regex::Regex::new(&pattern).map_err(|e| EvalError::new(format!("invalid regex: {e}")))?;
+    Ok(JqRegex {
+        re,
+        needs_trailing_nl_check,
+    })
 }
 
 /// Builtin: test(re) - test if string matches the regex
@@ -6295,13 +6447,15 @@ fn builtin_match<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// match immediately after a non-empty one — which `Regex::captures_iter`
 /// deliberately suppresses (regex-automata treats it as overlapping the
 /// prior match's end bound). Mirrors jq's own C matching loop: advance to
-/// the match end, or one character past it when the match was empty.
+/// the match end, or one character past it when the match was empty. Also
+/// honors jq's Perl-style trailing-newline exception for `$` via
+/// `dv_captures_at` — see its doc comment.
 #[cfg(feature = "regex")]
-fn global_captures<'h>(re: &regex::Regex, input: &'h str) -> Vec<regex::Captures<'h>> {
+fn global_captures<'h>(re: &JqRegex, input: &'h str) -> Vec<regex::Captures<'h>> {
     let mut results = Vec::new();
     let mut start = 0usize;
     while start <= input.len() {
-        let Some(caps) = re.captures_at(input, start) else {
+        let Some(caps) = dv_captures_at(&re.re, input, start, re.needs_trailing_nl_check) else {
             break;
         };
         let m = caps
@@ -6323,7 +6477,7 @@ fn global_captures<'h>(re: &regex::Regex, input: &'h str) -> Vec<regex::Captures
 
 /// Build a jq match object from an already-obtained `Captures`.
 #[cfg(feature = "regex")]
-fn build_match_object(re: &regex::Regex, caps: &regex::Captures) -> OwnedValue {
+fn build_match_object(re: &JqRegex, caps: &regex::Captures) -> OwnedValue {
     let m0 = caps
         .get(0)
         .expect("capture group 0 is always present on a match");
@@ -6392,6 +6546,48 @@ fn build_match_object(re: &regex::Regex, caps: &regex::Captures) -> OwnedValue {
     OwnedValue::Object(obj)
 }
 
+/// Split `input` around each match in `matches` (already
+/// trailing-newline-aware, e.g. from `global_captures`), mirroring
+/// `Regex::split` but driven by a match list computed ourselves instead of
+/// `Regex`'s own iteration — see `global_captures`'s doc comment for why
+/// (it also fixes the same trailing-zero-width-match gap for split/replace,
+/// not just match(;"g")).
+#[cfg(feature = "regex")]
+fn stitch_split(input: &str, matches: &[regex::Captures]) -> Vec<String> {
+    let mut parts = Vec::with_capacity(matches.len() + 1);
+    let mut last_end = 0;
+    for caps in matches {
+        let m = caps
+            .get(0)
+            .expect("capture group 0 is always present on a match");
+        parts.push(input[last_end..m.start()].to_string());
+        last_end = m.end();
+    }
+    parts.push(input[last_end..].to_string());
+    parts
+}
+
+/// Replace every match in `matches` (already trailing-newline-aware, e.g.
+/// from `global_captures`) within `input`, expanding `replacement`'s
+/// `$name`/`$1`-style references against each match's own captures via
+/// `Captures::expand`. Mirrors `Regex::replace_all`, but driven by a match
+/// list computed ourselves — see `stitch_split`'s doc comment for why.
+#[cfg(feature = "regex")]
+fn stitch_replacements(input: &str, matches: &[regex::Captures], replacement: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut last_end = 0;
+    for caps in matches {
+        let m = caps
+            .get(0)
+            .expect("capture group 0 is always present on a match");
+        out.push_str(&input[last_end..m.start()]);
+        caps.expand(replacement, &mut out);
+        last_end = m.end();
+    }
+    out.push_str(&input[last_end..]);
+    out
+}
+
 /// Builtin: scan(re) - find all matches
 #[cfg(feature = "regex")]
 fn builtin_scan<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
@@ -6426,9 +6622,14 @@ fn builtin_scan<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     };
 
     // Find all matches
-    let matches: Vec<OwnedValue> = re
-        .find_iter(&input)
-        .map(|m| OwnedValue::String(m.as_str().to_string()))
+    let matches: Vec<OwnedValue> = global_captures(&re, &input)
+        .iter()
+        .map(|caps| {
+            let m = caps
+                .get(0)
+                .expect("capture group 0 is always present on a match");
+            OwnedValue::String(m.as_str().to_string())
+        })
         .collect();
 
     QueryResult::ManyOwned(matches)
@@ -6468,9 +6669,10 @@ fn builtin_splits<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     };
 
     // Split by regex
-    let parts: Vec<OwnedValue> = re
-        .split(&input)
-        .map(|s| OwnedValue::String(s.to_string()))
+    let matches = global_captures(&re, &input);
+    let parts: Vec<OwnedValue> = stitch_split(&input, &matches)
+        .into_iter()
+        .map(OwnedValue::String)
         .collect();
 
     QueryResult::Owned(OwnedValue::Array(parts))
@@ -6523,8 +6725,20 @@ fn builtin_sub<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     };
 
     // Replace first match
-    let result = re.replace(&input, replacement.as_str());
-    QueryResult::Owned(OwnedValue::String(result.into_owned()))
+    let result = match dv_captures_at(&re.re, &input, 0, re.needs_trailing_nl_check) {
+        Some(caps) => {
+            let m = caps
+                .get(0)
+                .expect("capture group 0 is always present on a match");
+            let mut out = String::with_capacity(input.len());
+            out.push_str(&input[..m.start()]);
+            caps.expand(replacement.as_str(), &mut out);
+            out.push_str(&input[m.end()..]);
+            out
+        }
+        None => input,
+    };
+    QueryResult::Owned(OwnedValue::String(result))
 }
 
 /// Builtin: gsub(re; replacement) - replace all matches
@@ -6574,8 +6788,9 @@ fn builtin_gsub<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     };
 
     // Replace all matches
-    let result = re.replace_all(&input, replacement.as_str());
-    QueryResult::Owned(OwnedValue::String(result.into_owned()))
+    let matches = global_captures(&re, &input);
+    let result = stitch_replacements(&input, &matches, replacement.as_str());
+    QueryResult::Owned(OwnedValue::String(result))
 }
 
 /// Builtin: test(re; flags) - test with flags expression
@@ -6724,7 +6939,7 @@ fn builtin_capture_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
 /// Extract named captures from an already-obtained `Captures` into a jq object.
 #[cfg(feature = "regex")]
-fn capture_object(re: &regex::Regex, caps: &regex::Captures) -> OwnedValue {
+fn capture_object(re: &JqRegex, caps: &regex::Captures) -> OwnedValue {
     let mut entries = IndexMap::new();
     for name in re.capture_names().flatten() {
         if let Some(m) = caps.name(name) {
@@ -6806,8 +7021,20 @@ fn builtin_sub_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let replacement = convert_jq_replacement(&replacement);
 
     // Replace first match
-    let result = re.replace(&input, replacement.as_str());
-    QueryResult::Owned(OwnedValue::String(result.into_owned()))
+    let result = match dv_captures_at(&re.re, &input, 0, re.needs_trailing_nl_check) {
+        Some(caps) => {
+            let m = caps
+                .get(0)
+                .expect("capture group 0 is always present on a match");
+            let mut out = String::with_capacity(input.len());
+            out.push_str(&input[..m.start()]);
+            caps.expand(replacement.as_str(), &mut out);
+            out.push_str(&input[m.end()..]);
+            out
+        }
+        None => input,
+    };
+    QueryResult::Owned(OwnedValue::String(result))
 }
 
 /// Builtin: gsub(re; replacement; flags) - replace all matches with flags
@@ -6882,8 +7109,9 @@ fn builtin_gsub_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let replacement = convert_jq_replacement(&replacement);
 
     // Replace all matches
-    let result = re.replace_all(&input, replacement.as_str());
-    QueryResult::Owned(OwnedValue::String(result.into_owned()))
+    let matches = global_captures(&re, &input);
+    let result = stitch_replacements(&input, &matches, replacement.as_str());
+    QueryResult::Owned(OwnedValue::String(result))
 }
 
 /// Builtin: scan(re; flags) - find all matches with flags
@@ -6944,7 +7172,7 @@ fn builtin_scan_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let mut results = Vec::new();
     let capture_count = re.captures_len();
 
-    for caps in re.captures_iter(&input) {
+    for caps in global_captures(&re, &input) {
         if capture_count > 1 {
             // Has capture groups - return array of captured strings
             let mut captured = Vec::new();
@@ -7013,9 +7241,10 @@ fn builtin_split_regex<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     };
 
     // Split by regex
-    let parts: Vec<OwnedValue> = re
-        .split(&input)
-        .map(|s| OwnedValue::String(s.to_string()))
+    let matches = global_captures(&re, &input);
+    let parts: Vec<OwnedValue> = stitch_split(&input, &matches)
+        .into_iter()
+        .map(OwnedValue::String)
         .collect();
 
     QueryResult::Owned(OwnedValue::Array(parts))
@@ -7076,9 +7305,10 @@ fn builtin_splits_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     };
 
     // Split by regex and return as stream
-    let parts: Vec<OwnedValue> = re
-        .split(&input)
-        .map(|s| OwnedValue::String(s.to_string()))
+    let matches = global_captures(&re, &input);
+    let parts: Vec<OwnedValue> = stitch_split(&input, &matches)
+        .into_iter()
+        .map(OwnedValue::String)
         .collect();
 
     if parts.is_empty() {
