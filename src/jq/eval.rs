@@ -2422,7 +2422,7 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         #[cfg(feature = "regex")]
         Builtin::MatchFlags(re, flags) => builtin_match_flags::<W, S>(re, flags, value, optional),
         #[cfg(feature = "regex")]
-        Builtin::Capture(re) => builtin_capture::<W, S>(re, value, optional),
+        Builtin::Capture(re) => builtin_capture_with_flags::<W, S>(re, None, value, optional),
         #[cfg(feature = "regex")]
         Builtin::CaptureFlags(re, flags) => {
             builtin_capture_flags::<W, S>(re, flags, value, optional)
@@ -6290,54 +6290,6 @@ fn build_match_object(re: &regex::Regex, caps: &regex::Captures) -> OwnedValue {
     OwnedValue::Object(obj)
 }
 
-/// Builtin: capture(re) - return named captures as object
-#[cfg(feature = "regex")]
-fn builtin_capture<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
-    re_expr: &Expr,
-    value: StandardJson<'a, W>,
-    optional: bool,
-) -> QueryResult<'a, W> {
-    // Get the pattern
-    let pattern = match result_to_owned(eval_single::<W, S>(re_expr, value.clone(), optional)) {
-        Ok(OwnedValue::String(s)) => s,
-        Ok(_) if optional => return QueryResult::None,
-        Ok(v) => return QueryResult::Error(EvalError::not_string_or_array(v.type_name())),
-        Err(e) => return QueryResult::Error(e),
-    };
-
-    // Get the input string
-    let input = match &value {
-        StandardJson::String(s) => match s.as_str() {
-            Ok(cow) => cow.into_owned(),
-            Err(_) if optional => return QueryResult::None,
-            Err(_) => return QueryResult::Error(EvalError::new("invalid string")),
-        },
-        _ if optional => return QueryResult::None,
-        _ => return QueryResult::Error(EvalError::cannot_be_matched(&to_owned(&value))),
-    };
-
-    // Build regex
-    let re = match build_regex(&pattern, None) {
-        Ok(r) => r,
-        Err(_e) if optional => return QueryResult::None,
-        Err(e) => return QueryResult::Error(e),
-    };
-
-    // Extract named captures
-    match re.captures(&input) {
-        Some(caps) => {
-            let mut result = IndexMap::new();
-            for name in re.capture_names().flatten() {
-                if let Some(m) = caps.name(name) {
-                    result.insert(name.to_string(), OwnedValue::String(m.as_str().to_string()));
-                }
-            }
-            QueryResult::Owned(OwnedValue::Object(result))
-        }
-        None => QueryResult::Owned(OwnedValue::Null),
-    }
-}
-
 /// Builtin: scan(re) - find all matches
 #[cfg(feature = "regex")]
 fn builtin_scan<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
@@ -6661,11 +6613,10 @@ fn builtin_capture_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         }
     } else if let Some(caps) = re.captures(&input) {
         QueryResult::Owned(capture_object(&re, &caps))
-    } else if optional {
-        QueryResult::None
     } else {
-        // jq returns empty object when no match
-        QueryResult::Owned(OwnedValue::Object(IndexMap::new()))
+        // jq produces no output (not `{}`, not `null`) when there's no match,
+        // whether or not `?` was used.
+        QueryResult::None
     }
 }
 
@@ -24477,6 +24428,28 @@ mod tests {
                 assert_eq!(obj.get("first"), Some(&OwnedValue::String("foo".to_string())));
                 assert_eq!(obj.get("second"), Some(&OwnedValue::String("bar".to_string())));
             }
+        );
+    }
+
+    // #805: capture(re) produced `null` on no match, diverging from real jq's
+    // "no output" (empty stream) behavior. capture(re; flags)'s non-optional
+    // no-match branch had the same divergence, just with `{}` instead of
+    // `null` (verified against pinned jq-1.7.1: all four combinations below
+    // produce zero outputs).
+    #[cfg(feature = "regex")]
+    #[test]
+    fn test_regex_capture_no_match_produces_no_output() {
+        query!(br#""abc""#, r#"capture("[0-9]+")"#,
+            QueryResult::None => {}
+        );
+        query!(br#""abc""#, r#"capture("[0-9]+")?"#,
+            QueryResult::None => {}
+        );
+        query!(br#""abc""#, r#"capture("[0-9]+"; "")"#,
+            QueryResult::None => {}
+        );
+        query!(br#""abc""#, r#"capture("[0-9]+"; "")?"#,
+            QueryResult::None => {}
         );
     }
 
