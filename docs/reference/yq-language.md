@@ -347,11 +347,11 @@ succinctly yq --front-matter extract '.title' post.md
 succinctly yq --front-matter process --inplace '.tags += ["new"]' post.md
 ```
 
-A file without a leading `---` line errors. `--front-matter` is incompatible with `--doc`, `--null-input`, `--raw-input`, and `--eval-all`; `--front-matter=process` additionally requires YAML output and is incompatible with `--slurp` (a slurped array can't reattach a body per input file).
+A file without a leading `---` line errors. `--front-matter` is incompatible with `--doc`, `--null-input`, `--raw-input`, `--eval-all`, and an explicit `--input-format json` (front matter is YAML by definition); `--front-matter=process` additionally requires YAML output and is incompatible with `--slurp` (a slurped array can't reattach a body per input file); `--front-matter=extract` is incompatible with `--inplace` (it captures no body to reattach, so `-i` would discard everything after the closing fence). Position builtins (`at_offset`/`at_position`/`line`/`column`) resolve against the extracted YAML block's own coordinates, not the original file (see [Known Limitations](#known-limitations)).
 
 ### `--split-exp` (Succinctly Extension)
 
-Splits output into one file per result instead of printing to stdout, named by evaluating `EXPR` against that result (`.` is the result; `$index` is its zero-based output index across the whole run).
+Splits output into one file per result instead of printing to stdout, named by evaluating `EXPR` against that result (`.` is the result; `$index` is its zero-based output index across the whole run; `--arg`/`--argjson` values and `$ARGS` are also available, same as the main filter).
 
 ```bash
 # One file per array element, named by index
@@ -418,6 +418,8 @@ See [yq Remaining Work](../plan/yq-remaining.md) for incomplete features.
 2. **Anchor metadata** - Available at cursor level; may be lost after complex jq operations
 3. **`file_index`/`key`/`document_index` in complex expressions** - Resolve through `.`/`.[]`/`.field` navigation, comparisons, `select(...)`, `map(...)`, `if/then/else`, `try/catch`, comma, and `label`; return `0` inside array/object literals, `any`/`all`, or user-defined functions
 4. **`*`/`+` are not cartesian generators** - `(a, b) * (c, d)` takes only the first value of each side, unlike real jq/yq's cartesian-product combination; this bounds the `--eval-all` two-file merge idiom (`select(file_index == 0) * select(file_index == 1)`) to inputs where each file contributes exactly one matching document
+5. **`--slurp`/`--eval-all` output has no comments** - both combine documents through the `OwnedValue` DOM (which carries no comment data) before evaluating, unlike the default per-document path
+6. **`--front-matter` position builtins use the extracted block's own coordinates** - `at_offset`, `at_position`, `line`, and `column` resolve against the extracted YAML slice, not the original file; a reported `line`/`column` is offset from the file's real line/column by the front-matter header's length
 
 ---
 

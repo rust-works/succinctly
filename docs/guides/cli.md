@@ -421,7 +421,7 @@ succinctly yq '.users[]' input.yaml
 - `-P, --prettyPrint`: Pretty print, expand flow styles to block style
 - `--tab`: Use tabs for indentation
 - `-a, --ascii-output`: Output ASCII only, escaping non-ASCII as `\uXXXX`
-- `--split-exp <EXPR>`: Split output into one file per result, named by evaluating `EXPR` against it (`.` is the result, `$index` its 0-based output index); suppresses stdout. Long-only, unlike real yq's `-s`/`--split-exp` — succinctly's `-s` is already `--slurp` (#715). Incompatible with `--slurp`, `--inplace`, `--front-matter`; `--raw-input` not yet supported
+- `--split-exp <EXPR>`: Split output into one file per result, named by evaluating `EXPR` against it (`.` is the result, `$index` its 0-based output index; `--arg`/`--argjson` values and `$ARGS` are also available, same as the main filter). Suppresses stdout. Long-only, unlike real yq's `-s`/`--split-exp` — succinctly's `-s` is already `--slurp` (#715). Incompatible with `--slurp`, `--inplace`, `--front-matter`; `--raw-input` not yet supported
 
 ### Input Options
 
@@ -432,8 +432,8 @@ succinctly yq '.users[]' input.yaml
 - `--validate`: Validate YAML strictly (opt-in) before processing; reports line:column errors and bails without producing output (see [YAML Validation](#yaml-validation))
 - `-i, --inplace`: Update the file in place
 - `--doc <N>`: Select specific document by 0-based index from multi-document stream
-- `--eval-all`, `--ea`: Combine all documents from all files into one evaluation context, exposing `file_index`/`fileIndex`/`fi` for cross-file merges (e.g. `.[] | select(file_index == 0)`). Requires explicit `.[]` iteration, unlike real yq's bare `select(fileIndex == 0)` — see [yq Language Reference](../reference/yq-language.md#cross-file-operations-succinctly-extension) for the full deviation (#715). Incompatible with `--slurp`, `--inplace`, `--raw-input`, `--split-exp`, `--front-matter`
-- `--front-matter <MODE>`: Treat input as text with a `---`-fenced YAML front matter header (e.g. Markdown). `extract` evaluates only the front matter, discarding the body; `process` re-emits the transformed front matter followed by the untouched body. Incompatible with `--doc`, `--null-input`, `--raw-input`, `--eval-all`; `process` mode also requires YAML output and is incompatible with `--slurp`
+- `--eval-all`, `--ea`: Combine all documents from all files into one evaluation context, exposing `file_index`/`fileIndex`/`fi` for cross-file merges (e.g. `.[] | select(file_index == 0)`). Requires explicit `.[]` iteration, unlike real yq's bare `select(fileIndex == 0)` — see [yq Language Reference](../reference/yq-language.md#cross-file-operations-succinctly-extension) for the full deviation (#715). Combines documents through the `OwnedValue` DOM, same as `--slurp`, so output carries no comments regardless of the input. Incompatible with `--slurp`, `--inplace`, `--raw-input`, `--split-exp`, `--front-matter`
+- `--front-matter <MODE>`: Treat input as text with a `---`-fenced YAML front matter header (e.g. Markdown). `extract` evaluates only the front matter, discarding the body; `process` re-emits the transformed front matter followed by the untouched body. Incompatible with `--doc`, `--null-input`, `--raw-input`, `--eval-all`, an explicit `--input-format json` (front matter is YAML by definition); `process` mode also requires YAML output and is incompatible with `--slurp`; `extract` mode is incompatible with `--inplace` (it captures no body to reattach, so `-i` would discard everything after the closing fence). Position builtins (`at_offset`, `at_position`, `line`, `column`) resolve against the extracted YAML block's own coordinates, not the original file — a `line`/`column` reported under `--front-matter` does not match the file's line/column
 
 ### Variables
 
