@@ -1301,6 +1301,33 @@ fn bools_to_result<'a, W: Clone + AsRef<[u64]>>(mut bools: Vec<bool>) -> QueryRe
     }
 }
 
+/// The `OwnedValue`-collecting analog of [`push_truthiness`]: pushes every
+/// output `result` produced into `out`, returning any terminating `Control`
+/// instead of collapsing to the first output the way [`result_to_owned`]
+/// does. Used by [`eval_binary_fanout`] (#768) to fork an arithmetic/
+/// comparison operand into all of its outputs, mirroring how `push_truthiness`
+/// already forks `and`/`or`'s operands.
+fn push_owned_values<W: Clone + AsRef<[u64]>>(
+    result: QueryResult<'_, W>,
+    out: &mut Vec<OwnedValue>,
+) -> Option<Control> {
+    match result.materialize_cursor() {
+        QueryResult::One(v) => out.push(to_owned(&v)),
+        QueryResult::OneCursor(_) => unreachable!("materialize_cursor removes OneCursor"),
+        QueryResult::Owned(v) => out.push(v),
+        QueryResult::Many(vs) => out.extend(vs.iter().map(to_owned)),
+        QueryResult::ManyOwned(vs) => out.extend(vs),
+        QueryResult::None => {}
+        QueryResult::Error(e) => return Some(Control::Error(e)),
+        QueryResult::Break(label) => return Some(Control::Break(label)),
+        QueryResult::Partial(vs, control) => {
+            out.extend(vs);
+            return Some(control);
+        }
+    }
+    None
+}
+
 /// Evaluate `body(bit)` once per truthy-bit of a condition stream, merging
 /// the results in order. Shared by `eval_if` and `builtin_select` so a
 /// multi-output condition (`if (true,false) then "a" else "b" end` /
@@ -1382,6 +1409,68 @@ fn eval_fanout<'a, W: Clone + AsRef<[u64]>>(
     }
 }
 
+/// Evaluate `left op right` over every pairing jq's cartesian fanout
+/// produces, right operand outer / left operand inner (#768): `(1,2) + (10,20)`
+/// is `11,12,21,22` (right=10 held fixed while left runs 1,2; then right=20).
+/// Shared by [`eval_arithmetic`] and [`eval_compare`], which differ only in
+/// how they combine one pairing — the fallible `combine` closure — since
+/// both used to fork through [`result_to_owned`], which collapses a
+/// multi-output operand to its first value (correct for `result_to_owned`'s
+/// other single-value callers, wrong here).
+///
+/// This is the opposite nesting from `and`/`or` ([`eval_boolean`],
+/// left-outer/right-inner: short-circuiting needs left's value first). Its
+/// structure otherwise mirrors `eval_boolean`'s: fork one operand via a
+/// `push_*`-style helper into outputs plus a trailing `Control`, loop over
+/// it, fork the other operand per iteration.
+///
+/// A `combine` error (op-application failure, e.g. `"a" + 1`) always aborts
+/// the whole fanout rather than skipping just that pairing — jq doesn't
+/// retry a generator past a fatal error — via [`finish_fork`], which also
+/// reproduces the original single-pairing `Err(_) if optional => None`
+/// policy exactly when there is no fanout. An operand-evaluation error/break
+/// is never gated by `optional` here (matching the original's unconditional
+/// propagation, and `eval_boolean`'s own precedent) — an enclosing `?`/`try`
+/// is what catches it, one level up.
+fn eval_binary_fanout<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    left: &Expr,
+    right: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+    mut combine: impl FnMut(OwnedValue, OwnedValue) -> Result<OwnedValue, EvalError>,
+) -> QueryResult<'a, W> {
+    let mut right_vals = Vec::new();
+    let right_control = push_owned_values(
+        eval_single::<W, S>(right, value.clone(), optional),
+        &mut right_vals,
+    );
+
+    let mut out: Vec<OwnedValue> = Vec::new();
+    for right_val in &right_vals {
+        let mut left_vals = Vec::new();
+        let left_control = push_owned_values(
+            eval_single::<W, S>(left, value.clone(), optional),
+            &mut left_vals,
+        );
+
+        for left_val in left_vals {
+            match combine(left_val, right_val.clone()) {
+                Ok(v) => out.push(v),
+                Err(e) => return finish_fork(out, Some(Control::Error(e)), optional),
+            }
+        }
+
+        if let Some(control) = left_control {
+            return partial(out, control);
+        }
+    }
+
+    match right_control {
+        Some(control) => partial(out, control),
+        None => owned_vec_to_result(out),
+    }
+}
+
 /// Evaluate arithmetic operations.
 fn eval_arithmetic<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     op: ArithOp,
@@ -1390,28 +1479,19 @@ fn eval_arithmetic<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    let left_val = match result_to_owned(eval_single::<W, S>(left, value.clone(), optional)) {
-        Ok(v) => v,
-        Err(e) => return QueryResult::Error(e),
-    };
-    let right_val = match result_to_owned(eval_single::<W, S>(right, value, optional)) {
-        Ok(v) => v,
-        Err(e) => return QueryResult::Error(e),
-    };
-
-    let result = match op {
-        ArithOp::Add => arith_add::<S>(left_val, right_val),
-        ArithOp::Sub => arith_sub::<S>(left_val, right_val),
-        ArithOp::Mul(flags) => arith_mul::<S>(left_val, right_val, flags),
-        ArithOp::Div => arith_div::<S>(left_val, right_val),
-        ArithOp::Mod => arith_mod::<S>(left_val, right_val),
-    };
-
-    match result {
-        Ok(v) => QueryResult::Owned(v),
-        Err(_) if optional => QueryResult::None,
-        Err(e) => QueryResult::Error(e),
-    }
+    eval_binary_fanout::<W, S>(
+        left,
+        right,
+        value,
+        optional,
+        |left_val, right_val| match op {
+            ArithOp::Add => arith_add::<S>(left_val, right_val),
+            ArithOp::Sub => arith_sub::<S>(left_val, right_val),
+            ArithOp::Mul(flags) => arith_mul::<S>(left_val, right_val, flags),
+            ArithOp::Div => arith_div::<S>(left_val, right_val),
+            ArithOp::Mod => arith_mod::<S>(left_val, right_val),
+        },
+    )
 }
 
 /// Add two values (numbers, strings, arrays, objects).
@@ -1856,18 +1936,11 @@ fn eval_compare<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    let left_val = match result_to_owned(eval_single::<W, S>(left, value.clone(), optional)) {
-        Ok(v) => v,
-        Err(e) => return QueryResult::Error(e),
-    };
-    let right_val = match result_to_owned(eval_single::<W, S>(right, value, optional)) {
-        Ok(v) => v,
-        Err(e) => return QueryResult::Error(e),
-    };
-
-    QueryResult::Owned(OwnedValue::Bool(apply_compare_op(
-        op, &left_val, &right_val,
-    )))
+    eval_binary_fanout::<W, S>(left, right, value, optional, |left_val, right_val| {
+        Ok(OwnedValue::Bool(apply_compare_op(
+            op, &left_val, &right_val,
+        )))
+    })
 }
 
 /// Apply a comparison operator to two already-evaluated values.
