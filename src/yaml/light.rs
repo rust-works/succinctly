@@ -1468,7 +1468,26 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                                 unit,
                                 sort_keys,
                             )?;
-                            write_line_comment(out, value.line_comment_raw())?;
+                            // The value's own comment takes priority; fall
+                            // back to the key's own comment when the value
+                            // has none - covers an explicit key's trailing
+                            // comment (`? k # key comment\n: v\n`), which
+                            // the parser captures against the key's own
+                            // node but which otherwise has no write site
+                            // once key and value collapse onto one output
+                            // line (#795). A no-op for the ordinary
+                            // implicit-key case: the parser only ever
+                            // captures a same-line comment against
+                            // whichever node's text ends there last, which
+                            // for `a: v # c` is always the value, never
+                            // the key.
+                            let key_cursor = field.key_cursor();
+                            write_line_comment(
+                                out,
+                                value
+                                    .line_comment_raw()
+                                    .or_else(|| key_cursor.line_comment_raw()),
+                            )?;
                         }
                     }
                     Ok(())

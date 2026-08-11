@@ -6071,6 +6071,52 @@ fn test_key_comment_preserved_with_null_value_and_sort_keys_765() -> Result<()> 
 }
 
 // ============================================================================
+// Explicit-key (`? k ... : v`) trailing comment (#795)
+// ============================================================================
+//
+// Distinct from #765 above: #765 covers the *implicit*-key form (`a: #
+// comment\n  b: 1`, key/value on separate lines via indentation); this is
+// the *explicit*-key form (`? k ... : v`), a different grammar production.
+// The parser already captures the key's own comment generically (any
+// scalar node close, including an explicit key) via the same side-table
+// #710 added, but no write site read it back for a same-line scalar value
+// until this fix - it was captured but never re-emitted anywhere.
+
+/// The issue's own repro: an explicit key's trailing comment, with a
+/// same-line scalar value - re-serialized to implicit single-line form,
+/// same as real `yq`.
+#[test]
+fn test_explicit_key_comment_preserved_on_identity_795() -> Result<()> {
+    let (out, code) = run_yq_stdin(".", "? k # key comment\n: v\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "k: v # key comment\n");
+    Ok(())
+}
+
+/// Same fix, but through the DOM/`CommentTree` path (`--arg` forces it,
+/// since `select(...)` now routes through the M2 path after #796 and would
+/// no longer exercise this code for a query shape this simple).
+#[test]
+fn test_explicit_key_comment_preserved_via_dom_path_795() -> Result<()> {
+    let (out, code) = run_yq_stdin(".", "? k # key comment\n: v\n", &["--arg", "x", "y"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "k: v # key comment\n");
+    Ok(())
+}
+
+/// Regression guard: an ordinary implicit key with its own same-line value
+/// comment is unaffected by the new key-comment fallback (the value's own
+/// comment always takes priority; the key's own comment is only ever
+/// present at all for the explicit-key shape above).
+#[test]
+fn test_implicit_key_same_line_value_comment_unaffected_by_795_fallback() -> Result<()> {
+    let (out, code) = run_yq_stdin(".", "a: v # normal\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "a: v # normal\n");
+    Ok(())
+}
+
+// ============================================================================
 // Merge-flag suffixes on `*`/`*=` (#713)
 // ============================================================================
 

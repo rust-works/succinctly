@@ -1254,6 +1254,21 @@ fn emit_yaml_value(
                             format!("{indent}{key}: {kc}")
                         } else {
                             let val = emit_yaml_value(v, field_comments, config, depth + 1, false);
+                            // The value's own comment takes priority; fall
+                            // back to the key's own comment when the value
+                            // has none - covers an explicit key's trailing
+                            // comment (`? k # key comment\n: v\n`), which
+                            // otherwise has no write site once key and
+                            // value collapse onto one output line (#795).
+                            // A no-op for the ordinary implicit-key case
+                            // (`comment_suffix` is already non-empty then).
+                            let comment_suffix = if comment_suffix.is_empty() {
+                                comments
+                                    .key_comment(k)
+                                    .map_or_else(String::new, |c| format!(" {c}"))
+                            } else {
+                                comment_suffix
+                            };
                             format!("{indent}{key}: {val}{comment_suffix}")
                         }
                     })
