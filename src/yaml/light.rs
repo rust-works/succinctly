@@ -1372,7 +1372,6 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                 if indent_spaces == 0 || self.style() == "flow" {
                     // Flow style
                     out.write_char('{')?;
-                    let mut first = true;
                     let mut items: Vec<_> = fields.into_iter().collect();
                     if sort_keys {
                         let mut keyed: Vec<_> = items
@@ -1382,14 +1381,19 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                         keyed.sort_by(|a, b| a.0.cmp(&b.0));
                         items = keyed.into_iter().map(|(_, field)| field).collect();
                     }
-                    for field in items {
-                        if !first {
+                    let last_index = items.len() - 1;
+                    for (i, field) in items.into_iter().enumerate() {
+                        if i != 0 {
                             out.write_str(", ")?;
                         }
-                        first = false;
                         write_yaml_field_key(out, field)?;
                         out.write_str(": ")?;
                         write_yaml_child_inline(out, field.value_cursor(), unit, sort_keys)?;
+                        if i == last_index {
+                            let value_cursor = field.value_cursor();
+                            let comment = value_cursor.line_comment_raw();
+                            write_flow_last_item_comment(out, comment, current_indent, unit)?;
+                        }
                     }
                     out.write_char('}')
                 } else {
@@ -1461,7 +1465,24 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                                 unit,
                                 sort_keys,
                             )?;
-                            write_line_comment(out, value.line_comment_raw())?;
+                            // The value's own comment takes priority; fall
+                            // back to the key's own comment when the value
+                            // has none - covers an explicit key's trailing
+                            // comment (`? k # key comment\n: v\n`), which
+                            // the parser captures against the key's own
+                            // node but which otherwise has no write site
+                            // once key and value collapse onto one output
+                            // line (#795). A no-op for the ordinary
+                            // implicit-key case: the parser only ever
+                            // captures a same-line comment against
+                            // whichever node's text ends there last, which
+                            // for `a: v # c` is always the value, never
+                            // the key.
+                            let key_cursor = field.key_cursor();
+                            let comment = value
+                                .line_comment_raw()
+                                .or_else(|| key_cursor.line_comment_raw());
+                            write_line_comment(out, comment)?;
                         }
                     }
                     Ok(())
@@ -1482,6 +1503,10 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                         }
                         first = false;
                         write_yaml_child_inline(out, cursor, unit, sort_keys)?;
+                        if rest.is_empty() {
+                            let comment = cursor.line_comment_raw();
+                            write_flow_last_item_comment(out, comment, current_indent, unit)?;
+                        }
                         elems = rest;
                     }
                     out.write_char(']')
@@ -1845,19 +1870,37 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
         self.index.get_tag(self.bp_pos)
     }
 
+    /// Get the raw byte range of this node's trailing same-line comment and
+    /// decode it as UTF-8, distinguishing "no comment" (`Ok(None)`) from
+    /// "comment present but not valid UTF-8" (`Err(_)`) — the shared
+    /// decode point for [`Self::line_comment_raw`] (tolerant: invalid bytes
+    /// collapse to `None`, for output/write paths that must keep rendering
+    /// the rest of the document) and [`Self::line_comment_checked`] (strict:
+    /// invalid bytes surface as an error, issue #797).
+    #[inline]
+    fn line_comment_raw_checked(&self) -> Result<Option<&str>, core::str::Utf8Error> {
+        let Some((start, end)) = self.index.get_line_comment(self.bp_pos) else {
+            return Ok(None);
+        };
+        core::str::from_utf8(&self.text[start as usize..end as usize]).map(Some)
+    }
+
     /// Get the raw trailing same-line comment for this node, `#` and all,
     /// exactly as it appears in the source (issue #710).
     ///
-    /// Returns `None` if this node has no trailing comment. Used by the
-    /// write path, which re-emits the bytes verbatim after a single
-    /// normalized space (matching real `yq`'s output, verified empirically:
-    /// the gap before `#` is normalized to one space, but everything from
-    /// `#` onward — including internal/trailing whitespace — is preserved
+    /// Returns `None` if this node has no trailing comment *or* if the
+    /// comment bytes aren't valid UTF-8 — this tolerant getter is for
+    /// output/write paths that must keep rendering the rest of the document
+    /// either way; use [`Self::line_comment_checked`] where "absent" and
+    /// "invalid" need to be told apart (issue #797). Used by the write
+    /// path, which re-emits the bytes verbatim after a single normalized
+    /// space (matching real `yq`'s output, verified empirically: the gap
+    /// before `#` is normalized to one space, but everything from `#`
+    /// onward — including internal/trailing whitespace — is preserved
     /// as-is). See [`Self::line_comment`] for the stripped getter form.
     #[inline]
     pub fn line_comment_raw(&self) -> Option<&str> {
-        let (start, end) = self.index.get_line_comment(self.bp_pos)?;
-        core::str::from_utf8(&self.text[start as usize..end as usize]).ok()
+        self.line_comment_raw_checked().ok().flatten()
     }
 
     /// Get this node's trailing same-line comment text (the `line_comment`
@@ -1867,7 +1910,9 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
     /// unchanged, since there's nothing to strip.
     ///
     /// Returns `None` if this node has no trailing comment; the builtin
-    /// itself maps that to `""`, matching real `yq`.
+    /// itself maps that to `""`, matching real `yq`. Invalid UTF-8 also
+    /// collapses to `None` here — use [`Self::line_comment_checked`] to
+    /// tell the two apart (issue #797).
     #[inline]
     pub fn line_comment(&self) -> Option<&str> {
         let raw = self.line_comment_raw()?;
@@ -1876,6 +1921,20 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
         // of the text with nothing to strip, e.g. `#keep this` stays
         // `"#keep this"` unchanged (verified against real `yq`).
         Some(raw.strip_prefix("# ").unwrap_or(raw))
+    }
+
+    /// Get this node's trailing same-line comment, distinguishing "no
+    /// comment" (`Ok(None)`) from "comment present but not valid UTF-8"
+    /// (`Err(_)`) — unlike [`Self::line_comment`], which silently collapses
+    /// both to `None`, indistinguishable from each other (issue #797).
+    /// Mirrors `parse_alias_value`'s `YamlValue::Error` handling of the
+    /// identical situation for an invalid-UTF-8 anchor name.
+    #[inline]
+    pub fn line_comment_checked(&self) -> Result<Option<&str>, core::str::Utf8Error> {
+        match self.line_comment_raw_checked()? {
+            Some(raw) => Ok(Some(raw.strip_prefix("# ").unwrap_or(raw))),
+            None => Ok(None),
+        }
     }
 
     /// Get the anchor name that this alias references.
@@ -5121,6 +5180,11 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
     }
 
     #[inline]
+    fn line_comment_checked(&self) -> Result<Option<String>, core::str::Utf8Error> {
+        YamlCursor::line_comment_checked(self).map(|opt| opt.map(ToString::to_string))
+    }
+
+    #[inline]
     fn cursor_at_offset(&self, offset: usize) -> Option<Self> {
         YamlCursor::cursor_at_offset(self, offset)
     }
@@ -5148,6 +5212,16 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
         sort_keys: bool,
     ) -> core::fmt::Result {
         YamlCursor::stream_yaml(self, out, indent, sort_keys)
+    }
+
+    #[inline]
+    fn stream_yaml_as_document<Out: core::fmt::Write>(
+        &self,
+        out: &mut Out,
+        indent: IndentSpec,
+        sort_keys: bool,
+    ) -> core::fmt::Result {
+        YamlCursor::stream_yaml_as_document(self, out, indent, sort_keys)
     }
 
     #[inline]
@@ -5538,6 +5612,35 @@ fn write_line_comment<Out: core::fmt::Write>(
         }
         None => Ok(()),
     }
+}
+
+/// Write the last item's own trailing comment in a flow-style sequence or
+/// mapping, if present, followed by a newline and reindent to the
+/// container's own indentation (issue #794).
+///
+/// A comment can't be followed by the closing `]`/`}` on the same line -
+/// `#` would consume the bracket into the comment text, corrupting the
+/// YAML - so unlike a comment elsewhere in a flow collection, the last
+/// item's own comment forces a line break before the close, mirroring real
+/// `yq`'s own reformatting for this shape (which also adds a trailing
+/// comma; that's not replicated here, as it's cosmetic and comma-before-
+/// comment isn't required by the grammar). Only the *last* item is handled
+/// this way - a comment on a middle item would need to avoid also
+/// swallowing the following `,` onto the same line, which no filed issue
+/// currently asks for.
+fn write_flow_last_item_comment<Out: core::fmt::Write>(
+    out: &mut Out,
+    comment: Option<&str>,
+    current_indent: usize,
+    unit: char,
+) -> core::fmt::Result {
+    if let Some(c) = comment {
+        out.write_char(' ')?;
+        out.write_str(c)?;
+        out.write_char('\n')?;
+        write_yaml_indent(out, current_indent, unit)?;
+    }
+    Ok(())
 }
 
 /// Stream independent document cursors as a single YAML sequence (block or
@@ -10401,6 +10504,59 @@ mod tests {
                     .stream_yaml(&mut out, IndentSpec::COMPACT, false)
                     .expect("streams");
                 assert_eq!(out, "{!!str k: v}");
+                return;
+            }
+        }
+        panic!("Could not find value");
+    }
+
+    /// Direct coverage for `DocumentCursor::stream_yaml`'s `YamlCursor`
+    /// delegation. Its only production caller (`GenericResult::stream_yaml`'s
+    /// `OneCursor`/`ManyCursor` arms, `eval_generic.rs`) switched to
+    /// `stream_yaml_as_document` for #793a (a navigated container keeps its
+    /// own trailing comment, unlike a navigated scalar) - this pins the
+    /// bare, no-own-comment contract directly (trait-qualified, same
+    /// pattern as `test_stream_yaml_flow_mapping_preserves_tagged_key`
+    /// above for the inherent method), since nothing else reaches it
+    /// anymore.
+    #[test]
+    fn test_document_cursor_stream_yaml_trait_delegation_drops_own_comment() {
+        let yaml = b"a: [1, 2, 3] # trailing\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let root = index.root(yaml);
+        if let YamlValue::Mapping(fields) = first_doc(root) {
+            if let Some(field) = fields.into_iter().next() {
+                let cursor = field.value_cursor();
+                let mut out = String::new();
+                DocumentCursor::stream_yaml(&cursor, &mut out, IndentSpec::COMPACT, false)
+                    .expect("streams");
+                assert_eq!(out, "[1, 2, 3]");
+                return;
+            }
+        }
+        panic!("Could not find value");
+    }
+
+    /// Direct coverage for the stripped `line_comment` getter (issue #710)
+    /// and its `DocumentCursor` trait delegation. Both lost their only
+    /// caller when the `line_comment` jq builtin switched to
+    /// `line_comment_checked`, which distinguishes "absent" from "invalid
+    /// UTF-8" where this getter collapses both to `None` (issue #797) -
+    /// pinned directly here since nothing in the CLI reaches either form
+    /// anymore.
+    #[test]
+    fn test_line_comment_getter_and_trait_delegation_direct() {
+        let yaml = b"a: 1 # keep this\nb: 2\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let root = index.root(yaml);
+        if let YamlValue::Mapping(fields) = first_doc(root) {
+            if let Some(field) = fields.into_iter().next() {
+                let cursor = field.value_cursor();
+                assert_eq!(cursor.line_comment(), Some("keep this"));
+                assert_eq!(
+                    DocumentCursor::line_comment(&cursor),
+                    Some("keep this".to_string())
+                );
                 return;
             }
         }

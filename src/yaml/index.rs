@@ -860,6 +860,71 @@ mod tests {
         assert_eq!(field_line_comment_raw(yaml, "b"), None);
     }
 
+    /// Helper: like [`field_line_comment_raw`], but via the checked getter
+    /// that distinguishes "no comment" from "comment present but not valid
+    /// UTF-8" (issue #797).
+    fn field_line_comment_checked(
+        yaml: &[u8],
+        key: &str,
+    ) -> Result<Option<String>, core::str::Utf8Error> {
+        use crate::yaml::light::YamlValue;
+
+        let index = YamlIndex::build(yaml).expect("valid YAML");
+        let root = index.root(yaml);
+        let YamlValue::Sequence(docs) = root.value() else {
+            panic!("root is always the virtual document sequence");
+        };
+        let (doc_cursor, _) = docs.uncons_cursor().expect("at least one document");
+        let YamlValue::Mapping(fields) = doc_cursor.value() else {
+            panic!("expected a mapping document");
+        };
+        for field in fields {
+            if let YamlValue::String(k) = field.key() {
+                if k.raw_bytes() == key.as_bytes() {
+                    return field
+                        .value_cursor()
+                        .line_comment_checked()
+                        .map(|opt| opt.map(alloc::string::ToString::to_string));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    #[test]
+    fn test_line_comment_checked_distinguishes_absent_from_invalid_utf8_797() {
+        // Absent: no comment at all.
+        assert_eq!(field_line_comment_checked(b"a: 1\nb: 2\n", "a"), Ok(None));
+        // Present and valid - stripped form, like `line_comment` (not the
+        // raw `#`-prefixed form `line_comment_raw` returns).
+        assert_eq!(
+            field_line_comment_checked(b"a: 1 # keep this\n", "a"),
+            Ok(Some("keep this".to_string()))
+        );
+        // Present but not valid UTF-8 - must be `Err`, not silently `Ok(None)`
+        // like the tolerant `line_comment_raw` getter.
+        assert!(field_line_comment_checked(b"a: 1 # caf\xE9\n", "a").is_err());
+        // A key that isn't the first field - exercises the helper's
+        // skip-and-continue loop, not just its immediate-match return.
+        assert_eq!(
+            field_line_comment_checked(b"a: 1\nb: 2 # keep this\n", "b"),
+            Ok(Some("keep this".to_string()))
+        );
+        // A key that's absent entirely - the helper's own fallback, as
+        // opposed to a present-but-commentless value (the "Absent" case
+        // above).
+        assert_eq!(field_line_comment_checked(b"a: 1\n", "z"), Ok(None));
+        // A preceding field with a non-scalar (explicit complex) key -
+        // `field.key()` returns `YamlValue::Sequence`, not `String`, so the
+        // helper's `if let YamlValue::String(k) = field.key()` pattern
+        // match itself fails and skips the field, distinct from the
+        // scalar-key-that-just-doesn't-match case above.
+        assert_eq!(
+            field_line_comment_checked(b"? [1, 2]\n: 1\na: 2 # keep this\n", "a"),
+            Ok(Some("keep this".to_string()))
+        );
+    }
+
     #[test]
     fn test_line_comment_captured_on_quoted_scalar() {
         let yaml = b"a: \"hello\" # quoted\n";

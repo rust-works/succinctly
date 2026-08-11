@@ -857,6 +857,33 @@ fn test_duplicate_mapping_key_survives_computed_index() -> Result<()> {
     Ok(())
 }
 
+/// #796: `select(...)` had the same latent bug as #631's `first`/`last`/
+/// computed-indexing - `eval_generic.rs`'s own `Builtin::Select` arm already
+/// forwarded the incoming cursor unchanged, but `can_use_m2_streaming` never
+/// had an arm for it, so `yq` always fell through to `evaluate_yaml_cursor`'s
+/// `to_owned()` DOM path and silently collapsed duplicate keys (and, since
+/// #710, the earlier key's own comment right along with it).
+#[test]
+fn test_duplicate_mapping_key_survives_select_796() -> Result<()> {
+    let yaml = "a: 1 # first\na: 2 # second\n";
+
+    let (out, code) = run_yq_stdin("select(true)", yaml, &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "a: 1 # first\na: 2 # second\n");
+
+    // A real (non-`true`) predicate must still evaluate correctly through
+    // the new M2 path, not just pass everything through unconditionally.
+    let (filtered_out, code) = run_yq_stdin("select(.a == 2) | .a", yaml, &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(filtered_out, "2\n");
+
+    let (json_out, code) = run_yq_stdin("select(true)", yaml, &["-o", "json", "-I0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(json_out, "{\"a\":1,\"a\":2}\n");
+
+    Ok(())
+}
+
 /// #733: `-S`/`--sort-keys` excluded identity/navigation queries from the M2
 /// cursor-streaming fast path, forcing them through the `OwnedValue` DOM
 /// (`IndexMap`-backed), which silently collapsed duplicate keys — the same
@@ -5491,6 +5518,51 @@ fn test_flow_collection_trailing_comment_preserved_710() -> Result<()> {
     Ok(())
 }
 
+/// #794: unlike the comment-after-the-closing-bracket case just above, a
+/// comment between the *last element* and the closing bracket *on a
+/// following line* used to be silently dropped from identity output
+/// entirely (not merely reformatted differently). The parser already
+/// attributes it to the last element (verified via the DOM path, which
+/// showed it correctly before this fix - see #793's own repro); the bug was
+/// that flow-style rendering never emitted an item's own trailing comment
+/// at all. A newline before the closing bracket is required for validity -
+/// `#` would otherwise consume the bracket into the comment text - so exact
+/// formatting isn't expected to byte-match real `yq`'s own reformatting.
+#[test]
+fn test_flow_sequence_comment_before_closing_bracket_on_next_line_794() -> Result<()> {
+    let (out, code) = run_yq_stdin(".", "a: [1, 2, 3 # trailing\n]\n", &[])?;
+    assert_eq!(code, 0);
+    assert!(out.contains("# trailing"), "comment missing: {out:?}");
+    // Must still be valid YAML that round-trips without losing the comment.
+    let (out2, code2) = run_yq_stdin(".", &out, &[])?;
+    assert_eq!(code2, 0);
+    assert_eq!(out2, out);
+    Ok(())
+}
+
+/// Same shape, but for a flow mapping rather than a flow sequence.
+#[test]
+fn test_flow_mapping_comment_before_closing_brace_on_next_line_794() -> Result<()> {
+    let (out, code) = run_yq_stdin(".", "a: {b: 1, c: 2 # trailing\n}\n", &[])?;
+    assert_eq!(code, 0);
+    assert!(out.contains("# trailing"), "comment missing: {out:?}");
+    let (out2, code2) = run_yq_stdin(".", &out, &[])?;
+    assert_eq!(code2, 0);
+    assert_eq!(out2, out);
+    Ok(())
+}
+
+/// Regression guard: a *single*-element flow collection with the comment
+/// before the closing bracket on the next line hits the same "last item"
+/// code path as the multi-element cases above.
+#[test]
+fn test_flow_sequence_single_element_comment_before_closing_bracket_794() -> Result<()> {
+    let (out, code) = run_yq_stdin(".", "a: [1 # trailing\n]\n", &[])?;
+    assert_eq!(code, 0);
+    assert!(out.contains("# trailing"), "comment missing: {out:?}");
+    Ok(())
+}
+
 #[test]
 fn test_quoted_scalar_comment_preserved_710() -> Result<()> {
     let (out, code) = run_yq_stdin(".", "a: \"hello\" # quoted\n", &[])?;
@@ -5642,14 +5714,23 @@ fn test_root_object_comment_preserved_on_identity_710() -> Result<()> {
     Ok(())
 }
 
-/// Same fix, but through the DOM/`select` path (`output_value` in
-/// `yq_runner.rs`) rather than the M2/P9 streaming path exercised by plain
-/// identity above.
+/// Same fix, but for `select(true)` rather than plain identity above.
+///
+/// Before #796, `select(...)` always fell through to the DOM path
+/// (`output_value`'s `root_comment_suffix` in `yq_runner.rs`), which
+/// reserializes every container to block style regardless of the source's
+/// own style - so this used to assert the reformatted `"a: 1 # trailing"`.
+/// #796 routes `select(...)` through the same cursor-native M2 path plain
+/// identity already used, which preserves the source's original flow/block
+/// style instead of always reformatting to block - so the expected output
+/// here changed to match, and now agrees with real `yq` byte-for-byte
+/// (verified against the pinned v4.53.3 binary), where the old block-style
+/// expectation did not.
 #[test]
 fn test_root_array_comment_preserved_on_select_710() -> Result<()> {
     let (out, code) = run_yq_stdin("select(true)", "{a: 1} # trailing\n", &[])?;
     assert_eq!(code, 0);
-    assert_eq!(out.trim_end(), "a: 1 # trailing");
+    assert_eq!(out.trim_end(), "{a: 1} # trailing");
     Ok(())
 }
 
@@ -5685,6 +5766,79 @@ fn test_field_navigation_still_drops_comment_after_root_fix_710() -> Result<()> 
     let (out, code) = run_yq_stdin(".a", "a: 1 # keep this\nb: 2\n", &[])?;
     assert_eq!(code, 0);
     assert_eq!(out.trim(), "1");
+    Ok(())
+}
+
+/// #793a: unlike a navigated *scalar* (dropped, see above - matches real
+/// `yq`), a navigated *container* keeps its own trailing comment, the same
+/// as when that container is the whole document's root. Before the fix,
+/// `GenericResult::stream_yaml`'s `OneCursor`/`ManyCursor` arms always used
+/// the bare (comment-less) `stream_yaml`, so `.a` alone silently dropped it
+/// even though plain `.` on the same document already kept it.
+#[test]
+fn test_navigated_container_keeps_own_comment_793a() -> Result<()> {
+    let (out, code) = run_yq_stdin(".a", "a: [1, 2, 3] # trailing\nb: 2\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "[1, 2, 3] # trailing\n");
+    Ok(())
+}
+
+/// Same fix, but for a multi-result stream (`.[]`) rather than a single
+/// navigated result - each streamed container result keeps its own comment
+/// independently.
+#[test]
+fn test_iterated_containers_keep_own_comments_793a() -> Result<()> {
+    let (out, code) = run_yq_stdin(".[]", "- [1, 2] # x\n- [3, 4] # y\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "[1, 2] # x\n[3, 4] # y\n");
+    Ok(())
+}
+
+// #793b: on the DOM path (`OwnedValue` + `emit_yaml_value`, still reachable
+// via flags like `--arg` that can't use the M2 fast path even after #796
+// widened which queries can), a container's own trailing comment used to be
+// concatenated directly onto its last child's rendered line with no
+// separator - indistinguishable from that child's own comment. Fixed by
+// giving the container's own comment a standalone comment line instead.
+// `--arg x y` is used as the M2-blocking flag throughout (rather than the
+// original issue's `select(...)`, which #796 now routes through M2 and so
+// no longer reaches this code at all for these shapes).
+
+#[test]
+fn test_dom_path_container_comment_gets_own_line_not_glued_to_last_child_793b() -> Result<()> {
+    let (out, code) = run_yq_stdin(
+        ".a",
+        "a: [1, 2, 3] # trailing\nb: 2\n",
+        &["--arg", "x", "y"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "- 1\n- 2\n- 3\n# trailing\n");
+    Ok(())
+}
+
+#[test]
+fn test_dom_path_root_container_comment_gets_own_line_793b() -> Result<()> {
+    let (out, code) = run_yq_stdin(
+        ".",
+        "items: [1, 2, 3] # container comment\n",
+        &["--arg", "x", "y"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "items:\n  - 1\n  - 2\n  - 3\n  # container comment\n");
+    Ok(())
+}
+
+/// A child's own comment and the container's own comment must both survive,
+/// as two distinct comments - not silently concatenated onto one line.
+#[test]
+fn test_dom_path_container_and_child_comments_stay_distinct_793b() -> Result<()> {
+    let (out, code) = run_yq_stdin(
+        ".",
+        "items: [1, 2 # child\n] # container\n",
+        &["--arg", "x", "y"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "items:\n  - 1\n  - 2 # child\n  # container\n");
     Ok(())
 }
 
@@ -5823,12 +5977,14 @@ fn test_key_comment_not_exposed_via_line_comment_getter_765() -> Result<()> {
     Ok(())
 }
 
-/// A cursor-preserving filter (the DOM/`CommentTree` path, not bare
-/// identity's M2 streaming path) must also place the key's comment right
-/// after `key:`, not just plain `.`.
+/// The DOM/`CommentTree` path must also place the key's comment right
+/// after `key:`, not just plain `.` on the M2 streaming path (`--arg`
+/// forces the DOM path, since `select(...)` now routes through M2 after
+/// #796 and would no longer exercise this code for a query shape this
+/// simple - same reasoning as `test_explicit_key_comment_preserved_via_dom_path_795`).
 #[test]
-fn test_key_comment_preserved_via_select_dom_path_765() -> Result<()> {
-    let (out, code) = run_yq_stdin("select(true)", "a: # comment on key\n  b: 1\n", &[])?;
+fn test_key_comment_preserved_via_dom_path_765() -> Result<()> {
+    let (out, code) = run_yq_stdin(".", "a: # comment on key\n  b: 1\n", &["--arg", "x", "y"])?;
     assert_eq!(code, 0);
     assert_eq!(out, "a: # comment on key\n  b: 1\n");
     Ok(())
@@ -5895,11 +6051,12 @@ fn test_key_comment_preserved_with_null_value_at_eof_765() -> Result<()> {
     Ok(())
 }
 
-/// The DOM/`CommentTree` path (`select`, not bare identity's M2 streaming
-/// path) must also keep the comment for a null deferred value.
+/// The DOM/`CommentTree` path (`--arg` forces it, since `select(...)` now
+/// routes through M2 after #796 - see `test_key_comment_preserved_via_dom_path_765`
+/// above) must also keep the comment for a null deferred value.
 #[test]
-fn test_key_comment_preserved_with_null_value_via_select_dom_path_765() -> Result<()> {
-    let (out, code) = run_yq_stdin("select(true)", "a: # comment on key\nb: 2\n", &[])?;
+fn test_key_comment_preserved_with_null_value_via_dom_path_765() -> Result<()> {
+    let (out, code) = run_yq_stdin(".", "a: # comment on key\nb: 2\n", &["--arg", "x", "y"])?;
     assert_eq!(code, 0);
     assert_eq!(out, "a: # comment on key\nb: 2\n");
     Ok(())
@@ -5913,6 +6070,64 @@ fn test_key_comment_preserved_with_null_value_and_sort_keys_765() -> Result<()> 
     let (out, code) = run_yq_stdin(".", "z: 9\na: # comment on key\nb: 2\n", &["-S"])?;
     assert_eq!(code, 0);
     assert_eq!(out, "a: # comment on key\nb: 2\nz: 9\n");
+    Ok(())
+}
+
+// ============================================================================
+// Explicit-key (`? k ... : v`) trailing comment (#795)
+// ============================================================================
+//
+// Distinct from #765 above: #765 covers the *implicit*-key form (`a: #
+// comment\n  b: 1`, key/value on separate lines via indentation); this is
+// the *explicit*-key form (`? k ... : v`), a different grammar production.
+// The parser already captures the key's own comment generically (any
+// scalar node close, including an explicit key) via the same side-table
+// #710 added, but no write site read it back for a same-line scalar value
+// until this fix - it was captured but never re-emitted anywhere.
+
+/// The issue's own repro: an explicit key's trailing comment, with a
+/// same-line scalar value - re-serialized to implicit single-line form,
+/// same as real `yq`.
+#[test]
+fn test_explicit_key_comment_preserved_on_identity_795() -> Result<()> {
+    let (out, code) = run_yq_stdin(".", "? k # key comment\n: v\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "k: v # key comment\n");
+    Ok(())
+}
+
+/// Same fix, but through the DOM/`CommentTree` path (`--arg` forces it,
+/// since `select(...)` now routes through the M2 path after #796 and would
+/// no longer exercise this code for a query shape this simple).
+#[test]
+fn test_explicit_key_comment_preserved_via_dom_path_795() -> Result<()> {
+    let (out, code) = run_yq_stdin(".", "? k # key comment\n: v\n", &["--arg", "x", "y"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "k: v # key comment\n");
+    Ok(())
+}
+
+/// Regression guard: an ordinary implicit key with its own same-line value
+/// comment is unaffected by the new key-comment fallback (the value's own
+/// comment always takes priority; the key's own comment is only ever
+/// present at all for the explicit-key shape above).
+#[test]
+fn test_implicit_key_same_line_value_comment_unaffected_by_795_fallback() -> Result<()> {
+    let (out, code) = run_yq_stdin(".", "a: v # normal\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "a: v # normal\n");
+    Ok(())
+}
+
+/// Same regression guard, but through the DOM/`CommentTree` path (`--arg`
+/// forces it, same as the other `_765`/`_795` DOM-path variants above) -
+/// the value's own comment must win outright on this path too, rather than
+/// falling back to a (non-existent, for this shape) key comment.
+#[test]
+fn test_implicit_key_same_line_value_comment_unaffected_by_795_fallback_dom_path() -> Result<()> {
+    let (out, code) = run_yq_stdin(".", "a: v # normal\n", &["--arg", "x", "y"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "a: v # normal\n");
     Ok(())
 }
 

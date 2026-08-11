@@ -1201,8 +1201,12 @@ impl<V: DocumentValue> GenericResult<V> {
                 stats.any_truthy = !stats.last_was_falsy;
             }
             Self::OneCursor(c) => {
-                // Stream directly from cursor using DocumentCursor trait
-                c.stream_yaml(out, indent, sort_keys)?;
+                // Stream directly from cursor using DocumentCursor trait.
+                // `stream_yaml_as_document` (not the bare `stream_yaml`): a
+                // navigated container result keeps its own trailing comment
+                // just like the whole document does, unlike a navigated
+                // scalar (#793a).
+                c.stream_yaml_as_document(out, indent, sort_keys)?;
                 on_value(out)?;
                 stats.count = 1;
                 stats.last_was_falsy = c.is_falsy();
@@ -1220,7 +1224,9 @@ impl<V: DocumentValue> GenericResult<V> {
             }
             Self::ManyCursor(cs) => {
                 for c in cs {
-                    c.stream_yaml(out, indent, sort_keys)?;
+                    // See `OneCursor` above: each streamed result keeps its
+                    // own trailing comment if it's a container (#793a).
+                    c.stream_yaml_as_document(out, indent, sort_keys)?;
                     on_value(out)?;
                     stats.last_was_falsy = c.is_falsy();
                     stats.any_truthy |= !stats.last_was_falsy;
@@ -2783,10 +2789,13 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
             GenericResult::Owned(OwnedValue::String(style.to_string()))
         }
 
-        Builtin::LineComment => {
-            let comment = cursor.and_then(|c| c.line_comment()).unwrap_or_default();
-            GenericResult::Owned(OwnedValue::String(comment))
-        }
+        Builtin::LineComment => match cursor.map(|c| c.line_comment_checked()) {
+            Some(Err(_)) => GenericResult::Error(EvalError::invalid_utf8_in_comment()),
+            Some(Ok(comment)) => {
+                GenericResult::Owned(OwnedValue::String(comment.unwrap_or_default()))
+            }
+            None => GenericResult::Owned(OwnedValue::String(String::new())),
+        },
 
         Builtin::Select(cond) => {
             // Evaluate condition with cursor context preserved.
@@ -5186,6 +5195,25 @@ mod tests {
             result.into_owned().unwrap(),
             OwnedValue::String(String::new())
         );
+    }
+
+    #[test]
+    fn test_yaml_line_comment_builtin_invalid_utf8_is_error_797() {
+        use crate::yaml::YamlIndex;
+
+        // "caf\xE9" - a comment with an invalid UTF-8 byte. Must surface as
+        // an error, not silently collapse to "" as if there were no comment
+        // at all (issue #797).
+        let yaml = b"a: 1 # caf\xE9\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let doc_cursor = index
+            .root(yaml)
+            .first_child()
+            .expect("YAML document should have content");
+
+        let expr = crate::jq::parse(".a | line_comment").unwrap();
+        let result = eval_with_cursor(&expr, doc_cursor);
+        assert!(result.is_error());
     }
 
     #[test]

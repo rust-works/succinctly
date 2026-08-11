@@ -1024,13 +1024,15 @@ fn output_value<W: Write>(
         // own trailing comment from output on both identity and `select`,
         // even though `line_comment` still returns it — real `yq`'s own
         // quirk, not a succinctly gap, so replicated here rather than
-        // "fixed" into a new divergence.
-        let root_comment_suffix = if matches!(value, OwnedValue::Array(_) | OwnedValue::Object(_)) {
-            trailing_comment_suffix(comments)
+        // "fixed" into a new divergence. Appended as a standalone comment
+        // line (not glued onto `body`'s last line), so it isn't
+        // indistinguishable from the last child's own comment when `body`
+        // is multi-line block content (#793).
+        let output = if matches!(value, OwnedValue::Array(_) | OwnedValue::Object(_)) {
+            append_own_comment_line(body, comments.own(), "")
         } else {
-            String::new()
+            body
         };
-        let output = format!("{body}{root_comment_suffix}");
         if config.use_color {
             write!(writer, "{}", colorize_yaml(&output))?;
         } else {
@@ -1082,9 +1084,29 @@ fn output_value<W: Write>(
 
 /// Format a node's own trailing comment (issue #710) as `" # text"`, or
 /// `""` if it has none — the single point of change for the separator
-/// convention shared by every `emit_yaml_value` call site that appends one.
+/// convention shared by every `emit_yaml_value` call site that appends one
+/// *on the same line* as the rest of the value (safe only when that value
+/// renders as a single line — a scalar, or an empty/flow-style container).
 fn trailing_comment_suffix(comments: &CommentTree) -> String {
     comments.own().map_or_else(String::new, |c| format!(" {c}"))
+}
+
+/// Append a container's own trailing comment (#710/#793) as a standalone
+/// comment line at `indent`, rather than concatenating it onto `body`'s
+/// last line the way [`trailing_comment_suffix`] does. `body` here is
+/// always genuinely multi-line block content (a non-empty, block-rendered
+/// `Array`/`Object`) — gluing the container's *own* comment onto that last
+/// line would make it indistinguishable from the last child's own trailing
+/// comment on that same line, silently merging two distinct comments into
+/// one (#793). `OwnedValue` carries no source flow/block style, so this
+/// doesn't attempt to match real `yq`'s exact output (which keeps flow
+/// style, staying on one line); it only guarantees the two comments never
+/// collide.
+fn append_own_comment_line(body: String, own_comment: Option<&str>, indent: &str) -> String {
+    match own_comment {
+        Some(c) => format!("{body}\n{indent}{c}"),
+        None => body,
+    }
 }
 
 /// Emit a YAML value as a string, appending each node's trailing same-line
@@ -1149,15 +1171,23 @@ fn emit_yaml_value(
                     .map(|(i, v)| {
                         let elem_comments = comments.at_index(i);
                         let item = emit_yaml_value(v, elem_comments, config, depth + 1, false);
-                        let comment_suffix = trailing_comment_suffix(elem_comments);
                         // Check if it's a multi-line value (mapping or sequence)
                         if matches!(v, OwnedValue::Object(_) | OwnedValue::Array(_))
                             && !item.starts_with('[')
                             && !item.starts_with('{')
                         {
-                            // Multi-line value - emit nested content which handles its own indentation
-                            format!("{indent}-\n{item}{comment_suffix}")
+                            // Multi-line value - emit nested content which
+                            // handles its own indentation. The element's own
+                            // comment goes on its own line rather than
+                            // glued onto its last grandchild's line (#793).
+                            let item = append_own_comment_line(
+                                item,
+                                elem_comments.own(),
+                                &config.indent_str.repeat(depth + 1),
+                            );
+                            format!("{indent}-\n{item}")
                         } else {
+                            let comment_suffix = trailing_comment_suffix(elem_comments);
                             format!("{indent}- {item}{comment_suffix}")
                         }
                     })
@@ -1206,9 +1236,17 @@ fn emit_yaml_value(
                             let key_comment_suffix = comments
                                 .key_comment(k)
                                 .map_or_else(String::new, |c| format!(" {c}"));
-                            // For nested containers, emit at depth+1 which handles its own indentation
+                            // For nested containers, emit at depth+1 which
+                            // handles its own indentation. The value's own
+                            // comment goes on its own line rather than
+                            // glued onto its last grandchild's line (#793).
                             let val = emit_yaml_value(v, field_comments, config, depth + 1, false);
-                            format!("{indent}{key}:{key_comment_suffix}\n{val}{comment_suffix}")
+                            let val = append_own_comment_line(
+                                val,
+                                field_comments.own(),
+                                &config.indent_str.repeat(depth + 1),
+                            );
+                            format!("{indent}{key}:{key_comment_suffix}\n{val}")
                         } else if let Some(kc) = comments.key_comment_if_value_absent(k) {
                             // The deferred value materialized as nothing at
                             // all - the key's own comment stands alone with
@@ -1216,6 +1254,21 @@ fn emit_yaml_value(
                             format!("{indent}{key}: {kc}")
                         } else {
                             let val = emit_yaml_value(v, field_comments, config, depth + 1, false);
+                            // The value's own comment takes priority; fall
+                            // back to the key's own comment when the value
+                            // has none - covers an explicit key's trailing
+                            // comment (`? k # key comment\n: v\n`), which
+                            // otherwise has no write site once key and
+                            // value collapse onto one output line (#795).
+                            // A no-op for the ordinary implicit-key case
+                            // (`comment_suffix` is already non-empty then).
+                            let comment_suffix = if comment_suffix.is_empty() {
+                                comments
+                                    .key_comment(k)
+                                    .map_or_else(String::new, |c| format!(" {c}"))
+                            } else {
+                                comment_suffix
+                            };
                             format!("{indent}{key}: {val}{comment_suffix}")
                         }
                     })
@@ -1533,6 +1586,17 @@ fn can_use_m2_streaming(expr: &Expr) -> bool {
         Expr::FirstExpr(_) | Expr::LastExpr(_) => true,
         Expr::Builtin(Builtin::FirstStream(_) | Builtin::LastStream(_)) => true,
         Expr::IndexExpr { .. } => true,
+
+        // `select(...)` never changes position - a truthy output is always
+        // the input node unchanged - and `eval_generic.rs`'s own
+        // `Builtin::Select` arm already forwards the incoming cursor as-is
+        // (`OneCursor`/`ManyCursor`) rather than rebuilding a value. Routing
+        // it here rather than through `evaluate_yaml_cursor`'s unconditional
+        // `to_owned()` DOM path is what keeps duplicate mapping keys (and
+        // their comments) intact, matching `FirstExpr`/`LastExpr` above
+        // (#631) and `-S`/`--tab` (#733) - `select()` had the same latent
+        // gap (#796).
+        Expr::Builtin(Builtin::Select(_)) => true,
 
         // `keys_unsorted` on a mapping produces `GenericResult::LazyKeys { sorted: false, .. }`,
         // which `GenericResult::stream_json`/`stream_yaml` now stream directly
