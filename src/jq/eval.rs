@@ -24955,6 +24955,19 @@ mod tests {
         query!(br#""a\nb\n\n""#, r#"test("(?m)b$")"#,
             QueryResult::Owned(OwnedValue::Bool(b)) => assert!(b)
         );
+
+        // A named-capture group whose name happens to contain the letter
+        // `m` (e.g. `time`) must not be misread as an inline `(?m)` flag
+        // group — that previously disabled this whole fix (verified
+        // against jq-1.7.1: `capture("(?<time>a)$")` on `"a\n"` matches).
+        query!(br#""a\n""#, r#"test("(?<time>a)$")"#,
+            QueryResult::Owned(OwnedValue::Bool(b)) => assert!(b)
+        );
+        query!(br#""a\n""#, r#"capture("(?<time>a)$")"#,
+            QueryResult::Owned(OwnedValue::Object(obj)) => {
+                assert_eq!(obj.get("time"), Some(&OwnedValue::String("a".to_string())));
+            }
+        );
     }
 
     #[cfg(feature = "regex")]
@@ -25004,6 +25017,15 @@ mod tests {
         // Conservative simplification: a later `(?-m)` scope doesn't
         // un-flag an earlier `(?m)` group for this whole-pattern check.
         assert!(pattern_may_enable_multiline("(?m)a(?-m)b$"));
+
+        // Named-capture groups are not flag groups: `P`/`<` are not flag
+        // letters, so a capture name containing `m` (e.g. `time`, `name`,
+        // `amount`) must not be misread as enabling multiline.
+        assert!(!pattern_may_enable_multiline("(?P<time>a)$"));
+        assert!(!pattern_may_enable_multiline("(?<name>a)$"));
+        assert!(!pattern_may_enable_multiline("(?P<amount>a)$"));
+        // A genuine `(?m)` group elsewhere in the pattern is still found.
+        assert!(pattern_may_enable_multiline("(?P<time>a)(?m)b$"));
     }
 
     #[cfg(feature = "regex")]
