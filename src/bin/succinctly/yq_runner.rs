@@ -299,6 +299,56 @@ fn apply_front_matter(
     Ok((fm.yaml.to_vec(), InputFormat::Yaml, body))
 }
 
+/// The result of [`gather_input_sources`]: either the gathered sources, or
+/// an exit code from a failed `--validate` check that the caller must
+/// return immediately, mirroring [`yaml_validate_guard`]'s "bail with this
+/// code" contract at each of this function's now-single call site.
+enum GatheredSources {
+    Sources(Vec<(Vec<u8>, InputFormat, Option<Vec<u8>>)>),
+    ExitCode(i32),
+}
+
+/// Reads each input source -- stdin if `input_files` is empty, else each
+/// file in listed order -- applying `--front-matter` (a no-op unless the
+/// flag is set, via [`apply_front_matter`]) and resolving its format, then
+/// running the shared `--validate` guard. Shared by `--eval-all`,
+/// `--split-exp`, `--slurp`, and the default path, which all start from
+/// this identical stdin-or-per-file gather step; each `--front-matter`
+/// body is `None` unless `front_matter` is `Some(Process)`, same contract
+/// as `apply_front_matter`.
+fn gather_input_sources(
+    input_files: &[String],
+    input_format: InputFormat,
+    front_matter: Option<FrontMatterMode>,
+    validate: bool,
+) -> Result<GatheredSources> {
+    let mut sources = Vec::new();
+    if input_files.is_empty() {
+        let raw_bytes = read_stdin()?;
+        let resolved_format = resolve_input_format(input_format, None);
+        let (input_bytes, format, body) =
+            apply_front_matter(raw_bytes, resolved_format, front_matter, "<stdin>")?;
+        if let Some(code) = yaml_validate_guard(&input_bytes, format, validate, None) {
+            return Ok(GatheredSources::ExitCode(code));
+        }
+        sources.push((input_bytes, format, body));
+    } else {
+        for file_path in input_files {
+            let path = Path::new(file_path);
+            let raw_bytes = read_file(path)?;
+            let resolved_format = resolve_input_format(input_format, Some(path));
+            let (input_bytes, format, body) =
+                apply_front_matter(raw_bytes, resolved_format, front_matter, file_path)?;
+            if let Some(code) = yaml_validate_guard(&input_bytes, format, validate, Some(file_path))
+            {
+                return Ok(GatheredSources::ExitCode(code));
+            }
+            sources.push((input_bytes, format, body));
+        }
+    }
+    Ok(GatheredSources::Sources(sources))
+}
+
 /// Parse input bytes according to the specified format.
 fn parse_input(bytes: &[u8], format: InputFormat) -> Result<Vec<OwnedValue>> {
     match format {
@@ -2208,33 +2258,22 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
         // but tracks each document's origin file index alongside it and
         // evaluates via `eval_owned_with_file_index` instead of plain
         // `evaluate_input`, so `file_index` resolves against that side table.
-        let input_sources: Vec<(Vec<u8>, InputFormat)> = if input_files.is_empty() {
-            let input_bytes = read_stdin()?;
-            let format = resolve_input_format(args.input_format, None);
-            if let Some(code) = yaml_validate_guard(&input_bytes, format, args.validate, None) {
-                return Ok(code);
-            }
-            vec![(input_bytes, format)]
-        } else {
-            let mut sources = Vec::new();
-            for file_path in &input_files {
-                let path = Path::new(file_path);
-                let input_bytes = read_file(path)?;
-                let format = resolve_input_format(args.input_format, Some(path));
-                if let Some(code) =
-                    yaml_validate_guard(&input_bytes, format, args.validate, Some(file_path))
-                {
-                    return Ok(code);
-                }
-                sources.push((input_bytes, format));
-            }
-            sources
+        // `--front-matter` is rejected in combination above, so every
+        // gathered body is `None` here.
+        let input_sources = match gather_input_sources(
+            &input_files,
+            args.input_format,
+            args.front_matter,
+            args.validate,
+        )? {
+            GatheredSources::Sources(s) => s,
+            GatheredSources::ExitCode(code) => return Ok(code),
         };
 
         let mut all_docs: Vec<OwnedValue> = Vec::new();
         let mut file_origin: Vec<usize> = Vec::new();
         let mut global_doc_index: usize = 0;
-        for (file_idx, (bytes, format)) in input_sources.iter().enumerate() {
+        for (file_idx, (bytes, format, _)) in input_sources.iter().enumerate() {
             let inputs = parse_input(bytes, *format)?;
             for input in inputs {
                 let should_include = args
@@ -2305,31 +2344,20 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                 output_index += 1;
             }
         } else {
-            let input_sources: Vec<(Vec<u8>, InputFormat)> = if input_files.is_empty() {
-                let input_bytes = read_stdin()?;
-                let format = resolve_input_format(args.input_format, None);
-                if let Some(code) = yaml_validate_guard(&input_bytes, format, args.validate, None) {
-                    return Ok(code);
-                }
-                vec![(input_bytes, format)]
-            } else {
-                let mut sources = Vec::new();
-                for file_path in &input_files {
-                    let path = Path::new(file_path);
-                    let input_bytes = read_file(path)?;
-                    let format = resolve_input_format(args.input_format, Some(path));
-                    if let Some(code) =
-                        yaml_validate_guard(&input_bytes, format, args.validate, Some(file_path))
-                    {
-                        return Ok(code);
-                    }
-                    sources.push((input_bytes, format));
-                }
-                sources
+            // `--front-matter` is rejected in combination above, so every
+            // gathered body is `None` here.
+            let input_sources = match gather_input_sources(
+                &input_files,
+                args.input_format,
+                args.front_matter,
+                args.validate,
+            )? {
+                GatheredSources::Sources(s) => s,
+                GatheredSources::ExitCode(code) => return Ok(code),
             };
 
             let mut global_doc_index: usize = 0;
-            for (bytes, format) in &input_sources {
+            for (bytes, format, _) in &input_sources {
                 match format {
                     InputFormat::Yaml | InputFormat::Auto => {
                         let doc_filter = args.document.map(|target| (target, global_doc_index));
@@ -2445,31 +2473,14 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
         // mode is rejected above since a slurped array can't reattach a body
         // per input file) is applied before validation, since the raw
         // file bytes (e.g. Markdown) aren't valid standalone YAML.
-        let input_sources: Vec<(Vec<u8>, InputFormat)> = if input_files.is_empty() {
-            let raw_bytes = read_stdin()?;
-            let resolved_format = resolve_input_format(args.input_format, None);
-            let (input_bytes, format, _body) =
-                apply_front_matter(raw_bytes, resolved_format, args.front_matter, "<stdin>")?;
-            if let Some(code) = yaml_validate_guard(&input_bytes, format, args.validate, None) {
-                return Ok(code);
-            }
-            vec![(input_bytes, format)]
-        } else {
-            let mut sources = Vec::new();
-            for file_path in &input_files {
-                let path = Path::new(file_path);
-                let raw_bytes = read_file(path)?;
-                let resolved_format = resolve_input_format(args.input_format, Some(path));
-                let (input_bytes, format, _body) =
-                    apply_front_matter(raw_bytes, resolved_format, args.front_matter, file_path)?;
-                if let Some(code) =
-                    yaml_validate_guard(&input_bytes, format, args.validate, Some(file_path))
-                {
-                    return Ok(code);
-                }
-                sources.push((input_bytes, format));
-            }
-            sources
+        let input_sources = match gather_input_sources(
+            &input_files,
+            args.input_format,
+            args.front_matter,
+            args.validate,
+        )? {
+            GatheredSources::Sources(s) => s,
+            GatheredSources::ExitCode(code) => return Ok(code),
         };
 
         if can_slurp_fast_path {
@@ -2487,7 +2498,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
             // `Vec` unless their backing bytes/index all outlive that `Vec`.
             let mut parsed_sources: Vec<(Vec<u8>, YamlIndex<Vec<u64>>)> =
                 Vec::with_capacity(input_sources.len());
-            for (bytes, _format) in input_sources {
+            for (bytes, _format, _) in input_sources {
                 let index = YamlIndex::build(&bytes)
                     .map_err(|e| anyhow::anyhow!("YAML parse error: {e}"))?;
                 parsed_sources.push((bytes, index));
@@ -2549,7 +2560,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
 
             // Parse all inputs and collect documents
             let mut global_doc_index: usize = 0;
-            for (bytes, format) in &input_sources {
+            for (bytes, format, _) in &input_sources {
                 let inputs = parse_input(bytes, *format)?;
                 for input in inputs {
                     // Apply --doc filter if specified
@@ -2750,35 +2761,16 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
         // Collect input sources with their bytes and formats. `--front-matter`
         // is applied before validation, since the raw file bytes (e.g.
         // Markdown) aren't valid standalone YAML; `process` mode's body is
-        // stashed per-source for reattachment in the output loop below.
-        let mut front_matter_bodies: Vec<Option<Vec<u8>>> = Vec::new();
-        let input_sources: Vec<(Vec<u8>, InputFormat)> = if input_files.is_empty() {
-            let raw_bytes = read_stdin()?;
-            let resolved_format = resolve_input_format(args.input_format, None);
-            let (input_bytes, format, body) =
-                apply_front_matter(raw_bytes, resolved_format, args.front_matter, "<stdin>")?;
-            front_matter_bodies.push(body);
-            if let Some(code) = yaml_validate_guard(&input_bytes, format, args.validate, None) {
-                return Ok(code);
-            }
-            vec![(input_bytes, format)]
-        } else {
-            let mut sources = Vec::new();
-            for file_path in &input_files {
-                let path = Path::new(file_path);
-                let raw_bytes = read_file(path)?;
-                let resolved_format = resolve_input_format(args.input_format, Some(path));
-                let (input_bytes, format, body) =
-                    apply_front_matter(raw_bytes, resolved_format, args.front_matter, file_path)?;
-                front_matter_bodies.push(body);
-                if let Some(code) =
-                    yaml_validate_guard(&input_bytes, format, args.validate, Some(file_path))
-                {
-                    return Ok(code);
-                }
-                sources.push((input_bytes, format));
-            }
-            sources
+        // carried alongside each source for reattachment in the output loop
+        // below.
+        let input_sources = match gather_input_sources(
+            &input_files,
+            args.input_format,
+            args.front_matter,
+            args.validate,
+        )? {
+            GatheredSources::Sources(s) => s,
+            GatheredSources::ExitCode(code) => return Ok(code),
         };
 
         // Process all inputs first to collect results, then determine multi-doc status
@@ -2788,7 +2780,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
         // input has none, so it's paired with CommentTree::empty().
         let mut all_results: Vec<Vec<Vec<ResultWithComments>>> = Vec::new();
         let mut global_doc_index: usize = 0;
-        for (bytes, format) in &input_sources {
+        for (bytes, format, _) in &input_sources {
             match format {
                 InputFormat::Yaml | InputFormat::Auto => {
                     // Use direct YAML evaluation to preserve position metadata
@@ -2843,10 +2835,12 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
         // For regular multi-doc: add --- before each document's results
         // For --front-matter=process: each file's own leading/closing ---
         // fences wrap its transformed front matter, followed by its
-        // untouched body (see `front_matter_bodies`, collected above).
+        // untouched body (carried alongside `input_sources`, gathered above).
         let mut split_doc_state = SplitDocState::new(has_split_doc);
         for (file_idx, doc_results) in all_results.into_iter().enumerate() {
-            let front_matter_body = front_matter_bodies.get(file_idx).and_then(Option::as_ref);
+            let front_matter_body = input_sources
+                .get(file_idx)
+                .and_then(|(_, _, body)| body.as_ref());
             if front_matter_body.is_some() {
                 writeln!(writer, "---")?;
             }
