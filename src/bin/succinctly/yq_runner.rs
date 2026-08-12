@@ -2209,9 +2209,13 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                     } else {
                         // M2 YAML path: evaluate and stream YAML results
                         let result = eval_with_cursor_using::<YqSemantics, _>(&program.expr, $cursor);
+                        // A halt/halt_error (#791) with no prior output carries none
+                        // of it here — GenericResult::Halt is the zero-output case;
+                        // an output-bearing halt is GenericResult::Partial instead,
+                        // which is `will_output`'s default (not excluded below).
                         let will_output = !matches!(
                             &result,
-                            GenericResult::None | GenericResult::Break(_)
+                            GenericResult::None | GenericResult::Break(_) | GenericResult::Halt(_)
                         ) && !matches!(&result, GenericResult::Many(vs) if vs.is_empty())
                             && !matches!(&result, GenericResult::ManyCursor(cs) if cs.is_empty())
                             && !matches!(&result, GenericResult::ManyOwned(vs) if vs.is_empty());

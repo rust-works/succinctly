@@ -5094,6 +5094,25 @@ fn test_map_with_path_context_discards_partial_array_on_halt() -> Result<()> {
     Ok(())
 }
 
+/// #791 follow-up: in the M2 YAML streaming fast path, `will_output`'s
+/// exclusions covered `None`/`Break`/empty `Many*` but not the zero-output
+/// `GenericResult::Halt`, so a document that halts is misclassified as
+/// "about to output," and `emit_yaml_doc_separator` writes a stray `---`
+/// with nothing behind it. `select(...)` stays on the M2 fast path
+/// regardless of its predicate's shape (#796), so wrapping a per-document
+/// conditional halt in `select` reaches this exact branch.
+#[test]
+fn test_m2_select_halt_does_not_emit_stray_separator() -> Result<()> {
+    let yaml = "a: 1\n---\na: 2\n";
+    let (output, code) = run_yq_stdin("select(if .a == 2 then halt else true end)", yaml, &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(
+        output, "a: 1\n",
+        "no stray separator after the halted document"
+    );
+    Ok(())
+}
+
 /// #791 follow-up: `std::fs::write` in the `--inplace` write-back ran
 /// unconditionally, so a filter that produced no output for a file (a
 /// `halt`/`halt_error` before that file's first document, `empty`, ...)
