@@ -3057,6 +3057,24 @@ fn test_bsearch_propagates_halt_in_target_argument() -> Result<()> {
 }
 
 #[test]
+fn test_parent_propagates_halt_in_n_argument() -> Result<()> {
+    // `Builtin::ParentN`'s `n`-argument wildcard swallowed a halt smuggled
+    // back through `EvalError::halt`, treating it as an ordinary `optional`
+    // failure and answering `QueryResult::None` instead. `parent` is a
+    // succinctly extension (real jq has no such builtin), so this is
+    // checked against succinctly's own halt-propagation contract rather
+    // than jq: `parent(halt_error(9))?` must still exit 9, not 0, matching
+    // every other `?`-suppressible builtin argument in this file.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", ".a.b | parent(halt_error(9))?"],
+        Some(r#"{"a":{"b":1}}"#),
+    )?;
+    assert_eq!(code, 9, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
 fn test_halt_error_negative_exit_code_floors_to_zero() -> Result<()> {
     // Real jq clamps any negative `halt_error(n)` argument to exit code 0,
     // rather than letting the OS's usual two's-complement byte-truncation of

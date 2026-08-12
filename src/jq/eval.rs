@@ -12924,6 +12924,7 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
             }
             Ok(_) if optional => return QueryResult::None,
             Ok(_) => return QueryResult::Error(EvalError::type_error("number", "other")),
+            Err(e) if e.halt.is_some() => return query_result_from_error(e),
             Err(_) if optional => return QueryResult::None,
             Err(e) => return query_result_from_error(e),
         };
