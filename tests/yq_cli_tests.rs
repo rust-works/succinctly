@@ -4856,6 +4856,27 @@ fn test_split_doc_hides_in_computed_slice_bounds() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn test_split_doc_hides_in_halt_error_argument() -> Result<()> {
+    // #791 follow-up: `contains_split_doc` never recursed into
+    // `Builtin::HaltErrorCode`'s argument, so `has_split_doc` came back
+    // `false` for a filter with `split_doc` reachable only through a
+    // never-taken `halt_error(...)` branch. That misses more than the
+    // separators `split_doc` itself would add: `has_split_doc == false`
+    // also *re-enables* the DOM path's own regular multi-doc `---`
+    // injection (gated on `!has_split_doc`), which -- unlike
+    // `SplitDocState` -- writes a separator before the very first document
+    // too, not just between documents.
+    let yaml = "x: 1\n---\nx: 2\n";
+    let (output, code) = run_yq_stdin("if false then halt_error(split_doc) else . end", yaml, &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(
+        output, "x: 1\n---\nx: 2\n",
+        "no leading separator before doc 0"
+    );
+    Ok(())
+}
+
 // =============================================================================
 // Whole-float representation — #169
 // =============================================================================

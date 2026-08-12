@@ -1748,7 +1748,8 @@ fn contains_split_doc(expr: &Expr) -> bool {
             args.iter().any(contains_split_doc)
         }
         Expr::Builtin(b) => match b {
-            Builtin::Has(e)
+            Builtin::HaltErrorCode(e)
+            | Builtin::Has(e)
             | Builtin::In(e)
             | Builtin::Select(e)
             | Builtin::Map(e)
