@@ -3146,6 +3146,36 @@ fn test_computed_index_still_conservative_on_error_and_break() -> Result<()> {
 }
 
 #[test]
+fn test_computed_index_target_error_after_pending_halt_still_streams_prefix() -> Result<()> {
+    // #791 follow-up: unlike the key-stream's own error/break above, a later
+    // key's *index* error (not the key stream itself) had no test coverage
+    // and dropped its already-indexed prefix -- and, since the key stream
+    // here already recorded `pending_halt` before any indexing happened, it
+    // discarded that too. Verified against jq 1.7.1/1.8.2: `{"a":1} |
+    // .[("a", 5, halt)]` prints `1`, then errors "Cannot index object with
+    // number" (exit 5) -- jq's interleaved generator means the type error on
+    // key `5` fires before the key stream ever reaches `halt`. Piped stdin
+    // exercises `eval_generic.rs`; `-n` exercises `eval.rs` -- both must
+    // agree.
+    let (stdout, stderr, code) = run_jq_full(&[r#".[("a", 5, halt)]"#], Some(r#"{"a":1}"#))?;
+    assert_eq!(code, 5);
+    assert_eq!(stdout, "1\n");
+    assert!(
+        stderr.contains("Cannot index object with number"),
+        "{stderr}"
+    );
+
+    let (stdout, stderr, code) = run_jq_full(&["-n", r#"{"a":1} | .[("a", 5, halt)]"#], None)?;
+    assert_eq!(code, 5);
+    assert_eq!(stdout, "1\n");
+    assert!(
+        stderr.contains("Cannot index object with number"),
+        "{stderr}"
+    );
+    Ok(())
+}
+
+#[test]
 fn test_693_optional_around_stream_stops_at_the_first_error() -> Result<()> {
     // The `jq`/`yq` CLIs' default path evaluates through `eval_generic`'s
     // native cursor-based evaluator (`jq_runner.rs`'s `evaluate_input`/

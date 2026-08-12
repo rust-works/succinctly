@@ -2645,7 +2645,13 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
                     match index_owned_by_key(t, k, optional) {
                         Ok(Some(v)) => out.push(v),
                         Ok(None) => {}
-                        Err(e) => return GenericResult::Error(e),
+                        // A later key's index error outranks an earlier key's
+                        // still-pending halt (verified against jq 1.7.1/1.8.2:
+                        // `{"a":1} | .[("a", 5, halt)]` prints `1`, then the
+                        // "Cannot index object with number" error, and never
+                        // reaches `halt`) — the already-indexed prefix must
+                        // still survive as `Partial`, not vanish with it.
+                        Err(e) => return partial_generic(out, Control::Error(e)),
                     }
                 }
             }
@@ -2682,7 +2688,17 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
                     owned.push(v);
                 }
                 GenericResult::None => {}
-                GenericResult::Error(e) => return GenericResult::Error(e),
+                // Same reasoning as the `owned @ (...)` arm above: a later
+                // key's index error outranks an earlier key's pending halt,
+                // and the already-indexed prefix survives it as `Partial`.
+                GenericResult::Error(e) => {
+                    let out = if any_owned {
+                        owned
+                    } else {
+                        cursors.iter().map(|c| to_owned(&c.value())).collect()
+                    };
+                    return partial_generic(out, Control::Error(e));
+                }
                 _ => unreachable!("index_one_generic yields OneCursor/Owned/None/Error"),
             }
         }

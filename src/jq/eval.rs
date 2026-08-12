@@ -8015,7 +8015,18 @@ fn eval_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     match index_one::<W>(t.clone(), k, optional) {
                         QueryResult::One(v) => out.push(v),
                         QueryResult::None => {}
-                        QueryResult::Error(e) => return QueryResult::Error(e),
+                        // A later key's index error outranks an earlier key's
+                        // still-pending halt (verified against jq 1.7.1/1.8.2:
+                        // `{"a":1} | .[("a", 5, halt)]` prints `1`, then the
+                        // "Cannot index object with number" error, and never
+                        // reaches `halt` — jq's interleaved key/index
+                        // evaluation means the error fires before the
+                        // generator ever produces the `halt` key). The already
+                        // -indexed prefix must still survive as `Partial`,
+                        // matching real jq's output instead of vanishing.
+                        QueryResult::Error(e) => {
+                            return partial(out.iter().map(to_owned).collect(), Control::Error(e));
+                        }
                         _ => unreachable!("index_one yields only One/None/Error"),
                     }
                 }
@@ -8035,7 +8046,10 @@ fn eval_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     match index_one_owned(t, k, optional) {
                         Ok(Some(v)) => out.push(v),
                         Ok(None) => {}
-                        Err(e) => return query_result_from_error(e),
+                        // Same reasoning as the `Borrowed` arm above: a later
+                        // key's index error outranks an earlier key's pending
+                        // halt, and the already-indexed prefix survives it.
+                        Err(e) => return partial(out, Control::Error(e)),
                     }
                 }
             }
