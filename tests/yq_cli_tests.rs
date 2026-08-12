@@ -7045,6 +7045,38 @@ fn test_eval_all_file_index_bare() -> Result<()> {
     Ok(())
 }
 
+/// Regression test for #822: `Expr::Arithmetic` inside
+/// `eval_pipe_with_path_context_internal` used to collapse a multi-output
+/// operand to its first value whenever the pipe also needed path context
+/// (e.g. shared a comma with `file_index`) -- the same #768 bug class, in a
+/// call site #768 didn't touch.
+#[test]
+fn test_eval_all_arithmetic_fanout_survives_file_index_in_pipe_issue_822() -> Result<()> {
+    let (f1, f2) = two_doc_fixtures()?;
+    let (stdout, _stderr, code) = run_yq_files(
+        ".[] | ((1,2,3) + 1), file_index",
+        &[f1.path(), f2.path()],
+        &["--eval-all", "-o", "json"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "2\n3\n4\n0\n2\n3\n4\n1");
+    Ok(())
+}
+
+/// Same #822 gap, for `Expr::Compare`.
+#[test]
+fn test_eval_all_compare_fanout_survives_file_index_in_pipe_issue_822() -> Result<()> {
+    let (f1, f2) = two_doc_fixtures()?;
+    let (stdout, _stderr, code) = run_yq_files(
+        ".[] | ((1,2,3) > 1), file_index",
+        &[f1.path(), f2.path()],
+        &["--eval-all", "-o", "json"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "false\ntrue\ntrue\n0\nfalse\ntrue\ntrue\n1");
+    Ok(())
+}
+
 /// The headline `--eval-all` idiom -- regression test for the
 /// `needs_path_context`/`Select` runtime-arm fix (#715).
 #[test]

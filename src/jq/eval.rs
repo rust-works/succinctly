@@ -12460,6 +12460,75 @@ fn continue_rest_with_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     }
 }
 
+/// Path-context analog of `eval_binary_fanout` (#768/#822): evaluate `left op
+/// right` over every pairing jq's cartesian fanout produces (right operand
+/// outer / left operand inner), routed through
+/// `eval_pipe_with_path_context_internal` instead of `eval_single` so
+/// `key`/`parent`/`file_index` nested in either operand still resolve
+/// against `root`/`current_path`/`file_origin`. Structure is identical to
+/// `eval_binary_fanout`; kept separate because the two recurse through
+/// different evaluators with different parameter shapes.
+#[allow(clippy::too_many_arguments)] // STYLE-0004: mirrors eval_pipe_with_path_context_internal's
+                                     // own root/file_origin/current_path/optional threading,
+                                     // used unbundled at every one of its ~15 call sites in this
+                                     // file; a context struct here alone would diverge from that
+                                     // established pattern rather than simplify it.
+fn eval_binary_fanout_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    left: &Expr,
+    right: &Expr,
+    value: &OwnedValue,
+    root: &OwnedValue,
+    file_origin: Option<&[usize]>,
+    current_path: &[OwnedValue],
+    optional: bool,
+    mut combine: impl FnMut(OwnedValue, OwnedValue) -> Result<OwnedValue, EvalError>,
+) -> QueryResult<'a, W> {
+    let mut right_vals = Vec::new();
+    let right_control = push_owned_values(
+        eval_pipe_with_path_context_internal::<W, S>(
+            core::slice::from_ref(right),
+            value,
+            root,
+            file_origin,
+            current_path,
+            optional,
+        ),
+        &mut right_vals,
+    );
+
+    let mut out: Vec<OwnedValue> = Vec::new();
+    for right_val in &right_vals {
+        let mut left_vals = Vec::new();
+        let left_control = push_owned_values(
+            eval_pipe_with_path_context_internal::<W, S>(
+                core::slice::from_ref(left),
+                value,
+                root,
+                file_origin,
+                current_path,
+                optional,
+            ),
+            &mut left_vals,
+        );
+
+        for left_val in left_vals {
+            match combine(left_val, right_val.clone()) {
+                Ok(v) => out.push(v),
+                Err(e) => return finish_fork(out, Some(Control::Error(e)), optional),
+            }
+        }
+
+        if let Some(control) = left_control {
+            return partial(out, control);
+        }
+    }
+
+    match right_control {
+        Some(control) => partial(out, control),
+        None => owned_vec_to_result(out),
+    }
+}
+
 /// Internal helper that also tracks the root value for parent navigation,
 /// and (for `--eval-all`, #715) an optional origin-file-index side table
 /// keyed by top-level array position, resolving `file_index`/`fileIndex`/`fi`.
@@ -12837,63 +12906,45 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
             // without this, `select(file_index==0) * select(file_index==1)`
             // (the other headline `--eval-all` merge idiom, #715) silently
             // evaluates both `select`s against the 0-stub, so the
-            // `file_index==1` side always comes back empty.
-            let left_val = match result_to_owned(eval_pipe_with_path_context_internal::<W, S>(
-                core::slice::from_ref(left),
+            // `file_index==1` side always comes back empty. Fans out over
+            // every output of both operands (#822 -- this arm used to
+            // collapse a multi-output operand to its first value via
+            // `result_to_owned`, the same bug #768 fixed in `eval_arithmetic`
+            // but missed here).
+            let arith_result = eval_binary_fanout_with_path_context::<W, S>(
+                left,
+                right,
                 value,
                 root,
                 file_origin,
                 current_path,
                 optional,
-            )) {
-                Ok(v) => v,
-                Err(e) => return QueryResult::Error(e),
-            };
-            let right_val = match result_to_owned(eval_pipe_with_path_context_internal::<W, S>(
-                core::slice::from_ref(right),
-                value,
-                root,
-                file_origin,
-                current_path,
-                optional,
-            )) {
-                Ok(v) => v,
-                Err(e) => return QueryResult::Error(e),
-            };
-            let arith_result = match op {
-                ArithOp::Add => arith_add::<S>(left_val, right_val),
-                ArithOp::Sub => arith_sub::<S>(left_val, right_val),
-                ArithOp::Mul(flags) => arith_mul::<S>(left_val, right_val, *flags),
-                ArithOp::Div => arith_div::<S>(left_val, right_val),
-                ArithOp::Mod => arith_mod::<S>(left_val, right_val),
-            };
-            let arith_result = match arith_result {
-                Ok(v) => QueryResult::Owned(v),
-                Err(_) if optional => QueryResult::None,
-                Err(e) => QueryResult::Error(e),
-            };
+                |left_val, right_val| match op {
+                    ArithOp::Add => arith_add::<S>(left_val, right_val),
+                    ArithOp::Sub => arith_sub::<S>(left_val, right_val),
+                    ArithOp::Mul(flags) => arith_mul::<S>(left_val, right_val, *flags),
+                    ArithOp::Div => arith_div::<S>(left_val, right_val),
+                    ArithOp::Mod => arith_mod::<S>(left_val, right_val),
+                },
+            );
             if rest.is_empty() {
                 return arith_result;
             }
-            match arith_result {
-                QueryResult::Owned(v) => {
-                    // Preserve root/current_path, same as `Compare` above --
-                    // arithmetic is typically a mid-pipe computation, not the
-                    // pipe's final value, so later `key`/`file_index` calls
-                    // must still resolve against the pre-arithmetic position.
-                    eval_pipe_with_path_context_internal::<W, S>(
-                        rest,
-                        &v,
-                        root,
-                        file_origin,
-                        current_path,
-                        optional,
-                    )
-                }
-                QueryResult::None => QueryResult::None,
-                QueryResult::Error(e) => QueryResult::Error(e),
-                _ => unreachable!("arith_result was just constructed above as Owned/None/Error"),
-            }
+            // Preserve root/current_path, same as `Compare` below --
+            // arithmetic is typically a mid-pipe computation, not the pipe's
+            // final value, so later `key`/`file_index` calls must still
+            // resolve against the pre-arithmetic position. Uses the same
+            // accumulate-or-stop continuation `Comma`/`If`/`Select` already
+            // share, since the fanout above can now legitimately produce
+            // `ManyOwned`/`Partial`/`Break`, not just `Owned`/`None`/`Error`.
+            continue_rest_with_context::<W, S>(
+                arith_result,
+                rest,
+                root,
+                file_origin,
+                current_path,
+                optional,
+            )
         }
         Expr::Compare { op, left, right } => {
             // Evaluate both sides through the path-context evaluator too, so
@@ -12901,53 +12952,41 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
             // comparison (e.g. `file_index == 0`) rather than falling back to
             // their 0/null stubs (#715 -- this was already a latent gap for
             // `key`/`document_index`, not something `file_index` introduces).
-            let left_val = match result_to_owned(eval_pipe_with_path_context_internal::<W, S>(
-                core::slice::from_ref(left),
+            // Fans out over every output of both operands (#822 -- same
+            // collapse-to-first-value bug #768 fixed in `eval_compare` but
+            // missed here).
+            let compare_result = eval_binary_fanout_with_path_context::<W, S>(
+                left,
+                right,
                 value,
                 root,
                 file_origin,
                 current_path,
                 optional,
-            )) {
-                Ok(v) => v,
-                Err(e) => return QueryResult::Error(e),
-            };
-            let right_val = match result_to_owned(eval_pipe_with_path_context_internal::<W, S>(
-                core::slice::from_ref(right),
-                value,
-                root,
-                file_origin,
-                current_path,
-                optional,
-            )) {
-                Ok(v) => v,
-                Err(e) => return QueryResult::Error(e),
-            };
-            let compare_result = QueryResult::Owned(OwnedValue::Bool(apply_compare_op(
-                *op, &left_val, &right_val,
-            )));
+                |left_val, right_val| {
+                    Ok(OwnedValue::Bool(apply_compare_op(
+                        *op, &left_val, &right_val,
+                    )))
+                },
+            );
             if rest.is_empty() {
                 return compare_result;
             }
-            if let QueryResult::Owned(v) = compare_result {
-                // Unlike `Object`/`Array`/`Literal`, a comparison is
-                // typically a mid-pipe filter/test, not the pipe's final
-                // value -- `key`/`document_index`/`file_index` later in the
-                // same pipe must still resolve against the position the
-                // comparison was evaluated at, so `root`/`current_path` are
-                // preserved (matching the generic fallback below, and
-                // `main`'s pre-#715 behavior: `.[] | (1==1) | key` must keep
-                // returning the original index, not `null`).
-                return eval_pipe_with_path_context_internal::<W, S>(
-                    rest,
-                    &v,
-                    root,
-                    file_origin,
-                    current_path,
-                    optional,
-                );
-            }
-            unreachable!("QueryResult::Owned was just constructed above")
+            // Unlike `Object`/`Array`/`Literal`, a comparison is typically a
+            // mid-pipe filter/test, not the pipe's final value --
+            // `key`/`document_index`/`file_index` later in the same pipe
+            // must still resolve against the position the comparison was
+            // evaluated at, so `root`/`current_path` are preserved (matching
+            // `main`'s pre-#715 behavior: `.[] | (1==1) | key` must keep
+            // returning the original index, not `null`).
+            continue_rest_with_context::<W, S>(
+                compare_result,
+                rest,
+                root,
+                file_origin,
+                current_path,
+                optional,
+            )
         }
         Expr::Builtin(Builtin::Select(cond)) => {
             // Evaluate the condition through the path-context evaluator too,
@@ -30661,6 +30700,33 @@ mod tests {
             QueryResult::Error(e) => assert_eq!(e.message, "boom"),
             other => panic!("expected Error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_arithmetic_multi_output_operand_fans_out_with_path_context_issue_822() {
+        assert_eq!(
+            eval_all_outputs(b"[10]", &[0], ".[] | (((1,2,3) + 1), file_index)"),
+            vec!["2", "3", "4", "0"]
+        );
+    }
+
+    #[test]
+    fn test_compare_multi_output_operand_fans_out_with_path_context_issue_822() {
+        assert_eq!(
+            eval_all_outputs(b"[10]", &[0], ".[] | (((1,2,3) > 1), file_index)"),
+            vec!["false", "true", "true", "0"]
+        );
+    }
+
+    #[test]
+    fn test_arithmetic_cartesian_ordering_preserved_with_path_context_issue_822() {
+        // Right operand outer / left operand inner, same order
+        // `eval_binary_fanout` uses and #768's own test asserts for the
+        // non-path-context case.
+        assert_eq!(
+            eval_all_outputs(b"[10]", &[0], ".[] | (((1,2) + (10,20)), file_index)"),
+            vec!["11", "12", "21", "22", "0"]
+        );
     }
 
     #[test]
