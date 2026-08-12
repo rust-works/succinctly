@@ -5098,6 +5098,35 @@ fn test_inplace_halt_before_any_output_does_not_truncate_file() -> Result<()> {
     Ok(())
 }
 
+/// #791 follow-up: the multi-doc `---` separator was written into the
+/// in-place output buffer *before* evaluating the document it precedes, so
+/// a `halt` on the first document of a multi-document file left the buffer
+/// non-empty (just the separator) even though no real output was produced.
+/// The write-back guard checked `output_buffer.is_empty()`, saw a non-empty
+/// buffer, and wrote it back -- truncating the original two-document file
+/// down to a lone `---`.
+#[test]
+fn test_inplace_halt_before_any_output_in_multi_doc_file_does_not_truncate_file() -> Result<()> {
+    let mut input_file = NamedTempFile::new()?;
+    write!(input_file, "a: 1\n---\na: 2\n")?;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .arg("yq")
+        .arg("-i")
+        .arg("if .a == 1 then halt else . end")
+        .arg(input_file.path())
+        .stdin(Stdio::null())
+        .output()?;
+
+    assert!(output.status.success());
+    let content = std::fs::read_to_string(input_file.path())?;
+    assert_eq!(
+        content, "a: 1\n---\na: 2\n",
+        "original content must survive"
+    );
+    Ok(())
+}
+
 /// The fix above is deliberately halt-specific, not "any empty output
 /// preserves the file": real yq (v4.53.3, verified live) truncates a file
 /// to reflect a filter that legitimately produces no output for it --

@@ -2866,7 +2866,14 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
             let mut output_config = output_config.clone();
             output_config.use_color = false;
 
-            if can_inplace_fast_path {
+            // halt/halt_error (#791): tracks whether any *real* evaluated
+            // content (not a speculatively pre-written `---` separator or
+            // front-matter fence) made it into `output_buffer`, so the
+            // write-back guard below can tell "this file was never really
+            // considered" apart from "the buffer merely has some bytes in
+            // it" — see the guard's own comment for why that distinction
+            // matters.
+            let any_real_output = if can_inplace_fast_path {
                 // M2 streaming fast path (#478): stream cursor results
                 // directly into this file's buffer, skipping the OwnedValue
                 // DOM (and its IndexMap, which cannot represent duplicate
@@ -2956,6 +2963,12 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                     }
                     buf_writer.flush()?;
                 }
+                // This branch never pre-writes speculative separator/fence
+                // bytes (front matter forces the DOM branch below, and its
+                // own `---` separators are only emitted after a document has
+                // actually streamed real content), so the buffer's emptiness
+                // already reflects whether any real output happened.
+                !output_buffer.is_empty()
             } else {
                 let inputs = parse_input(&input_bytes, format)?;
 
@@ -2977,6 +2990,10 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                     writeln!(buf_writer, "---")?;
                 }
 
+                // halt/halt_error (#791): tracks real per-document output
+                // only, separately from the speculative `---`/fence bytes
+                // that may already be sitting in `buf_writer` above.
+                let mut any_real_output = false;
                 let mut split_doc_state = SplitDocState::new(has_split_doc);
                 for (local_idx, input) in inputs.iter().enumerate() {
                     let current_doc_index = global_doc_index + local_idx;
@@ -3010,6 +3027,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                             &CommentTree::empty(),
                             &output_config,
                         )?;
+                        any_real_output = true;
                     }
                     // halt/halt_error (#791): still write this file's buffer
                     // so far (below, matching the "prefix already output
@@ -3021,7 +3039,8 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                 }
                 buf_writer.flush()?;
                 global_doc_index += inputs.len();
-            }
+                any_real_output
+            };
 
             if let Some(body) = &front_matter_body {
                 output_buffer.extend_from_slice(b"---");
@@ -3030,19 +3049,28 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
             }
 
             // Write the output back to the file — unless a `halt`/
-            // `halt_error` fired before this file produced any output at
-            // all. A halt aborts the whole process; this file was never
+            // `halt_error` fired before this file produced any *real* output
+            // at all. A halt aborts the whole process; this file was never
             // fully considered, so leaving its original content in place is
             // safer than truncating it to reflect an evaluation that never
             // really finished (#791) — `halt` used as an early-exit guard
             // clause is a natural way to trigger this under `-i`.
+            //
+            // Gated on `any_real_output`, not `output_buffer.is_empty()`:
+            // the DOM branch above can pre-write a multi-doc `---` separator
+            // or a `--front-matter=process` fence into `output_buffer`
+            // before evaluating the document those bytes precede, so a halt
+            // with zero real output can still leave the buffer non-empty.
+            // Checking emptiness directly used to let that speculative
+            // prefix defeat this very guard and truncate the file down to
+            // just the prefix.
             //
             // Deliberately narrower than "output is empty": real yq (v4.53.3,
             // verified live) truncates a file to reflect a filter that
             // legitimately produces no output for it, e.g. `-i 'select(false)'`
             // or `-i 'del(.)'` both empty the file — so only a halt gets this
             // protection, not ordinary empty output.
-            if !(output_buffer.is_empty() && sink.halted().is_some()) {
+            if any_real_output || sink.halted().is_none() {
                 std::fs::write(path, &output_buffer)
                     .with_context(|| format!("failed to write to file: {}", path.display()))?;
             }
