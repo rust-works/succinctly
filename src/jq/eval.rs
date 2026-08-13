@@ -10190,22 +10190,18 @@ fn resolve_catch<'a, S: EvalSemantics>(
     prefix: Vec<PathBranch<'a>>,
     payload: OwnedValue,
 ) -> PathResolveResult<'a> {
-    match catch {
-        None => Ok(prefix),
-        Some(catch_expr) => {
-            let mut out = prefix;
-            match resolve_against_cow::<S>(catch_expr, Cow::Owned(payload)) {
-                Ok(handled) => {
-                    out.extend(handled);
-                    Ok(out)
-                }
-                Err((handler_prefix, escape)) => {
-                    out.extend(handler_prefix);
-                    Err((out, escape))
-                }
-            }
+    let Some(catch_expr) = catch else {
+        return Ok(prefix);
+    };
+    let mut out = prefix;
+    match resolve_against_cow::<S>(catch_expr, Cow::Owned(payload)) {
+        Ok(branches) => out.extend(branches),
+        Err((branches, e)) => {
+            out.extend(branches);
+            return Err((out, e));
         }
     }
+    Ok(out)
 }
 
 /// Fan `recurse(f)` / `recurse(f; cond)` out into one branch per visited

@@ -6531,13 +6531,15 @@ fn test_try_catch_inside_a_path_call_catches_a_break_regardless_of_label_824() -
     // label it targets -- the same rule the value-position evaluator's
     // `eval_try` already applies (#562), now mirrored in path context
     // (#824). `catch empty` here (rather than a handler that is itself not
-    // a valid path expression, e.g. `catch "x"`) sidesteps a separate,
-    // pre-existing gap in this same `Expr::Try` arm -- filed as #832 --
-    // where the resolved prefix is lost if the *handler itself* then fails
-    // as a path expression (#530); that gap already exists for the
-    // ordinary-error side of this arm too (`path(try (.a, .x[0]) catch
-    // "x")` on real jq 1.7.1, confirmed live: prefix `["a"]` on stdout,
-    // "Invalid path expression..." on stderr) and is not specific to break.
+    // a valid path expression, e.g. `catch "x"`) is deliberate regardless:
+    // it isolates *this* test's break-interception claim from the catch
+    // handler's own success/failure, which is covered separately below and
+    // by the dedicated #832 regression tests
+    // (`test_path_try_catch_handler_error_keeps_prefix_832` and
+    // `test_path_try_catch_handler_halt_keeps_prefix_832`) -- #832 fixed
+    // `resolve_catch` (shared by this arm's `Error` and `Break` cases) so
+    // the resolved prefix survives even when the handler itself then fails,
+    // for all three escape kinds (error, break, halt).
     // Verified against jq 1.7.1: `path(try (.a, break $out) catch empty)`
     // on `{"a":1}` is `["a"]`, exit 0 -- the break never reaches `$out` at
     // all, catch runs before the label ever gets a chance.
