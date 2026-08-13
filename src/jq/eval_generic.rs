@@ -986,6 +986,35 @@ pub enum GenericResult<V: DocumentValue> {
 }
 
 impl<V: DocumentValue> GenericResult<V> {
+    /// Whether streaming this result would write at least one value to
+    /// output.
+    ///
+    /// An exhaustive match, not a blocklist: callers like `stream_cursor!`'s
+    /// multi-doc `---` placement need this answer *before* actually
+    /// streaming, so the separator lands ahead of real content and never in
+    /// front of an empty result. This enum has grown new variants several
+    /// times (`LazyKeys`/`LazyIndexRange`/`LazySeq`, then `Halt` for #791),
+    /// and a hand-maintained exclusion list missed `Halt` the first time
+    /// (fixed by d259fba4, after a stray `---` was emitted for it) — an
+    /// exhaustive match turns the next such miss into a compile error
+    /// instead of a repeat of that bug.
+    pub fn produces_output(&self) -> bool {
+        match self {
+            Self::One(_)
+            | Self::OneCursor(_)
+            | Self::LazyKeys { .. }
+            | Self::LazyIndexRange(_)
+            | Self::LazySeq(_)
+            | Self::Error(_)
+            | Self::Owned(_)
+            | Self::Partial(_, _) => true,
+            Self::Many(vs) => !vs.is_empty(),
+            Self::ManyCursor(cs) => !cs.is_empty(),
+            Self::ManyOwned(vs) => !vs.is_empty(),
+            Self::None | Self::Break(_) | Self::Halt(_) => false,
+        }
+    }
+
     /// Materialize any lazy variant (`LazyKeys`/`LazyIndexRange`/`LazySeq`)
     /// into `Owned`/`Error`/`Break`, leaving every other variant unchanged.
     /// The shared collapse point for every consumer that was always going to
@@ -1085,7 +1114,7 @@ impl<V: DocumentValue> GenericResult<V> {
         sort_keys: bool,
         mut on_value: impl FnMut(&mut W) -> core::fmt::Result,
     ) -> Result<crate::jq::stream::StreamStats, core::fmt::Error> {
-        use crate::jq::stream::{StreamError, StreamStats, StreamableValue};
+        use crate::jq::stream::{StreamStats, StreamableValue};
 
         let mut stats = StreamStats::default();
 
@@ -1171,7 +1200,7 @@ impl<V: DocumentValue> GenericResult<V> {
                     stats.any_truthy = !stats.last_was_falsy;
                 }
                 Err(control) => {
-                    let (error, halt) = control_to_stream_outcome(control);
+                    let (error, halt) = control_to_stream_outcome(&control);
                     stats.error = error;
                     stats.halt = halt;
                 }
@@ -1211,13 +1240,14 @@ impl<V: DocumentValue> GenericResult<V> {
                 stats.count = os.len();
             }
             Self::Break(label) => {
-                stats.error = Some(StreamError {
-                    message: format!("break ${label} not in label"),
-                    not_a_string: false,
-                });
+                let (error, halt) = control_to_stream_outcome(&Control::Break(label.clone()));
+                stats.error = error;
+                stats.halt = halt;
             }
             Self::Halt(code) => {
-                stats.halt = Some(*code);
+                let (error, halt) = control_to_stream_outcome(&Control::Halt(*code));
+                stats.error = error;
+                stats.halt = halt;
             }
             // The prefix streams like `ManyOwned` above, then the control is
             // reported the same way `Error`/`Break` are (#400, #494) — the
@@ -1230,7 +1260,7 @@ impl<V: DocumentValue> GenericResult<V> {
                     stats.any_truthy |= !stats.last_was_falsy;
                 }
                 stats.count = os.len();
-                let (error, halt) = control_to_stream_outcome(control.clone());
+                let (error, halt) = control_to_stream_outcome(control);
                 stats.error = error;
                 stats.halt = halt;
             }
@@ -1259,7 +1289,7 @@ impl<V: DocumentValue> GenericResult<V> {
         sort_keys: bool,
         mut on_value: impl FnMut(&mut W) -> core::fmt::Result,
     ) -> Result<crate::jq::stream::StreamStats, core::fmt::Error> {
-        use crate::jq::stream::{StreamError, StreamStats, StreamableValue};
+        use crate::jq::stream::{StreamStats, StreamableValue};
 
         let mut stats = StreamStats::default();
 
@@ -1341,7 +1371,7 @@ impl<V: DocumentValue> GenericResult<V> {
                     stats.any_truthy = !stats.last_was_falsy;
                 }
                 Err(control) => {
-                    let (error, halt) = control_to_stream_outcome(control);
+                    let (error, halt) = control_to_stream_outcome(&control);
                     stats.error = error;
                     stats.halt = halt;
                 }
@@ -1370,13 +1400,14 @@ impl<V: DocumentValue> GenericResult<V> {
                 stats.count = os.len();
             }
             Self::Break(label) => {
-                stats.error = Some(StreamError {
-                    message: format!("break ${label} not in label"),
-                    not_a_string: false,
-                });
+                let (error, halt) = control_to_stream_outcome(&Control::Break(label.clone()));
+                stats.error = error;
+                stats.halt = halt;
             }
             Self::Halt(code) => {
-                stats.halt = Some(*code);
+                let (error, halt) = control_to_stream_outcome(&Control::Halt(*code));
+                stats.error = error;
+                stats.halt = halt;
             }
             // Same treatment as `stream_json` (#400, #494): the prefix
             // streams first, then the control is reported.
@@ -1388,7 +1419,7 @@ impl<V: DocumentValue> GenericResult<V> {
                     stats.any_truthy |= !stats.last_was_falsy;
                 }
                 stats.count = os.len();
-                let (error, halt) = control_to_stream_outcome(control.clone());
+                let (error, halt) = control_to_stream_outcome(control);
                 stats.error = error;
                 stats.halt = halt;
             }
@@ -1485,10 +1516,10 @@ fn stream_error(e: &EvalError) -> crate::jq::stream::StreamError {
 /// all three arms of the match in one place rather than splitting `Break`
 /// out on its own).
 fn control_to_stream_outcome(
-    control: Control,
+    control: &Control,
 ) -> (Option<crate::jq::stream::StreamError>, Option<i32>) {
     match control {
-        Control::Error(e) => (Some(stream_error(&e)), None),
+        Control::Error(e) => (Some(stream_error(e)), None),
         Control::Break(label) => (
             Some(crate::jq::stream::StreamError {
                 message: format!("break ${label} not in label"),
@@ -1496,7 +1527,7 @@ fn control_to_stream_outcome(
             }),
             None,
         ),
-        Control::Halt(code) => (None, Some(code)),
+        Control::Halt(code) => (None, Some(*code)),
     }
 }
 
@@ -2705,6 +2736,17 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
     }
 
     if let Some(code) = pending_halt {
+        // Known fidelity gap, same family as #631: `GenericResult::Partial`
+        // is `Vec<OwnedValue>`, so a cursor prefix has to go through
+        // `to_owned()` here — which collapses duplicate YAML mapping keys
+        // that streaming the cursors directly (the no-halt path below)
+        // preserves. `.[(0,1)]` on a document with a duplicate-keyed element
+        // keeps both keys; `.[(0,1,halt)]` on the same document silently
+        // loses one, because appending `halt` routes the same prefix through
+        // this arm instead. Fixing it for real needs `Partial` itself to
+        // carry cursors, not just owned values — the same rework #631 is
+        // already deferred on — so this only documents the trade-off rather
+        // than papering over it.
         let out = if any_owned {
             owned
         } else {
@@ -8498,5 +8540,89 @@ mod tests {
         .unwrap();
         let result = eval(&expr, value);
         assert!(matches!(result, GenericResult::Break(ref label) if label == "out"));
+    }
+
+    #[test]
+    fn test_generic_result_into_owned_halt_variant() {
+        // `GenericResult::into_owned`'s `Self::Halt(_) => None` arm (#791):
+        // mirrors the `Error`/`Break`/`Partial` arms around it -- a halt
+        // isn't representable as a single output value regardless of its
+        // code. Reachable only from this module's own `eval()` (cursor-less)
+        // entry point: `jq_runner.rs`/`yq_runner.rs` only ever call
+        // `eval_with_cursor`/`eval_with_cursor_using`, and `into_owned()`
+        // itself is never called from either CLI runner at all -- only from
+        // this file's own tests (`GenericResult::collect_owned()` is the
+        // method the CLI actually uses).
+        let json = br"null";
+        let index = JsonIndex::build(json);
+        let value = index.root(json).value();
+
+        let result = eval(&crate::jq::parse("halt_error(3)").unwrap(), value);
+        match &result {
+            GenericResult::Halt(code) => assert_eq!(*code, 3),
+            other => panic!("expected Halt(3), got {other:?}"),
+        }
+        assert_eq!(result.into_owned(), None);
+    }
+
+    #[test]
+    fn test_generic_lazy_seq_computed_index_never_reaches_a_later_halt() {
+        // Same LazySeq-over-a-computed-index family as
+        // `test_generic_lazy_seq_computed_index_swallows_error_724` above,
+        // but for `halt`/`halt_error` (#791) instead of `error(...)`: `[0]`
+        // only needs the map's first element ("a"), so
+        // `materialize_lazy()`/`collect_owned()` never advance the
+        // underlying `LazySeq` far enough to touch the second element's
+        // `halt_error(7)` at all -- it isn't swallowed, it's simply never
+        // evaluated. Diverges from real jq, which builds the whole array
+        // eagerly before indexing and so *does* hit the halt: `jq -c
+        // '(keys_unsorted | map(if . == "b" then halt_error(7) else . end))
+        // [0]'` on `{"a":1,"b":2}` exits 7 with `b` on stderr (verified
+        // live). Confirmed live against this binary too: `succinctly jq -c`
+        // on the same query prints `"a"` and exits 0 -- documented here as
+        // an accepted laziness-driven divergence, not fixed.
+        let json = br#"{"a":1,"b":2}"#;
+        let index = JsonIndex::build(json);
+        let value = index.root(json).value();
+
+        let expr = crate::jq::parse(
+            r#"(keys_unsorted | map(if . == "b" then halt_error(7) else . end))[0]"#,
+        )
+        .unwrap();
+        let result = eval(&expr, value);
+        assert!(
+            !matches!(result, GenericResult::Halt(_)),
+            "the halt is never reached, not swallowed after being reached: {result:?}"
+        );
+        assert_eq!(
+            result.collect_owned(),
+            vec![OwnedValue::String("a".to_string())]
+        );
+    }
+
+    #[test]
+    fn test_generic_pipe_bare_many_stage_halts_immediately() {
+        // `eval_single`'s `Expr::Pipe` handling, the `GenericResult::
+        // Many(vs)` stage arm's own `GenericResult::Halt(code) => return
+        // partial_generic(results, Control::Halt(code))` sub-case (#791) --
+        // sibling of
+        // `test_json_multi_stage_pipe_first_stage_bare_many_without_cursor`
+        // above (same `select(true,true)` source for a bare, cursor-less
+        // `Many`), but piping into `halt` instead of `length`. Reachable
+        // only from the cursor-less `eval()` entry point: `select`'s
+        // `pass_n` only ever constructs a bare `Many` when its own `cursor`
+        // parameter is `None`, which only happens once an *earlier* stage
+        // has already produced a bare `One` -- and `eval_with_cursor`/
+        // `eval_with_cursor_using` (what both CLI runners actually call)
+        // always start with `Some`.
+        let json = br"1";
+        let index = JsonIndex::build(json);
+        let value = index.root(json).value();
+
+        let result = eval(
+            &crate::jq::parse("select(true,true) | halt").unwrap(),
+            value,
+        );
+        assert!(matches!(result, GenericResult::Halt(0)));
     }
 }

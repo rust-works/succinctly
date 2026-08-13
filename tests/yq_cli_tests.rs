@@ -5167,6 +5167,39 @@ fn test_inplace_halt_before_any_output_in_multi_doc_file_does_not_truncate_file(
     Ok(())
 }
 
+/// Regression test (#791 follow-up), a distinct bug from the one above: the
+/// DOM `--inplace` branch wrote the multi-doc `---` separator into the
+/// buffer *before* evaluating the document it precedes, so a halt on a
+/// *later* document (not the first) left a dangling separator with nothing
+/// after it committed to disk -- a spurious trailing null document. Not
+/// halt-specific either: the same eager write also dangled a `---` for an
+/// ordinary empty-output document with no halt involved at all (`empty`
+/// case below), since the separator was written speculatively regardless of
+/// whether the document that followed it ever produced anything.
+#[test]
+fn test_inplace_multi_doc_no_dangling_separator_before_halting_or_empty_document() -> Result<()> {
+    for (filter, want) in [
+        ("if .a == 2 then halt else . end", "---\na: 1\n"),
+        ("if .a == 2 then empty else . end", "---\na: 1\n---\na: 3\n"),
+    ] {
+        let mut input_file = NamedTempFile::new()?;
+        write!(input_file, "a: 1\n---\na: 2\n---\na: 3\n")?;
+
+        let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+            .arg("yq")
+            .arg("-i")
+            .arg(filter)
+            .arg(input_file.path())
+            .stdin(Stdio::null())
+            .output()?;
+
+        assert!(output.status.success(), "{filter}");
+        let content = std::fs::read_to_string(input_file.path())?;
+        assert_eq!(content, want, "{filter}: no dangling separator");
+    }
+    Ok(())
+}
+
 /// The fix above is deliberately halt-specific, not "any empty output
 /// preserves the file": real yq (v4.53.3, verified live) truncates a file
 /// to reflect a filter that legitimately produces no output for it --
@@ -6972,6 +7005,34 @@ fn test_split_exp_with_null_input() -> Result<()> {
     Ok(())
 }
 
+/// Regression test (#791 follow-up): `write_split_result`'s halt guard was
+/// meant to catch a halt inside the *split-filename* expression, but
+/// `sink.halted()` is sticky for the whole run, so once the *main*
+/// expression halted with an output-bearing `Partial` prefix, every
+/// subsequent `write_split_result` call misread the already-set flag as its
+/// own and silently skipped writing a result that must still be split out.
+/// `1, halt` produces one real output (`1`) before halting, so `f0.yml` must
+/// still be written with that value -- not left missing.
+#[test]
+fn test_split_exp_writes_prefix_produced_before_main_expression_halts() -> Result<()> {
+    let dir = TempDir::new()?;
+    let pattern = format!(
+        "\"{}/f\" + ($index|tostring) + \".yml\"",
+        dir.path().display()
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .arg("yq")
+        .args(["-n", "--split-exp", &pattern])
+        .arg("1, halt")
+        .stdin(Stdio::null())
+        .output()?;
+    assert!(output.status.success());
+
+    let content = std::fs::read_to_string(dir.path().join("f0.yml"))?;
+    assert_eq!(content.trim(), "1");
+    Ok(())
+}
+
 #[test]
 fn test_split_exp_duplicate_filename_warns_and_overwrites() -> Result<()> {
     let dir = TempDir::new()?;
@@ -7624,5 +7685,448 @@ fn test_document_index_inside_comparison_regression() -> Result<()> {
     let (stdout, code) = run_yq_stdin("select(document_index == 1)", "a: 1\n---\nb: 2\n", &[])?;
     assert_eq!(code, 0);
     assert_eq!(stdout, "b: 2\n");
+    Ok(())
+}
+
+/// Targets `absorb_stream_stats`'s `else if let Some(err) = &stats.error`
+/// arm (yq_runner.rs) -- the #791 refactor that pulled the M2 YAML/JSON
+/// streaming macro's halt-vs-error precedence check out of two duplicated
+/// inline copies into this one shared helper, called from both the YAML and
+/// JSON branches of `stream_cursor!`. `.foo` is M2-streamable (`Expr::
+/// Field`), so applying it to a YAML sequence reaches the cursor streamer
+/// directly instead of the DOM path; the resulting type error must still
+/// surface through `report_stream` to stderr now that the check lives in a
+/// shared function instead of inline in the macro, not vanish or leak to
+/// stdout.
+#[test]
+fn test_m2_field_type_error_reported_via_absorb_stream_stats() -> Result<()> {
+    let (stdout, stderr, code) = run_yq_stdin_with_stderr(".foo", "- 1\n- 2\n", &[])?;
+    assert_eq!(code, 1, "stderr: {stderr}");
+    assert_eq!(stdout, "", "M2 stream error must not leak to stdout");
+    assert_eq!(
+        stderr.trim_end(),
+        "Error: Cannot index array with string \"foo\""
+    );
+    Ok(())
+}
+
+/// #791 follow-up, two adjacent sites in one scenario. `write_split_result`'s
+/// own halt guard (`if !halted_before && sink.halted().is_some() { return
+/// Ok(()) }`) is meant to catch a halt inside *this call's own*
+/// split-filename expression and return quietly (no "produced no output"
+/// complaint); the outer per-result loop's own check right after the call
+/// (`if sink.halted().is_some() { break 'files; }`, the YAML branch's copy)
+/// then stops the loop before any later result is reached. `.[]` over a
+/// 3-element array yields three results from one document, so making the
+/// split expression itself halt on `$index == 1` fires mid-loop with a real
+/// result (index 2) still pending -- proving both the early return and the
+/// break are immediate, not merely "happened to be last anyway".
+#[test]
+fn test_split_exp_own_halt_returns_early_and_stops_further_results() -> Result<()> {
+    let dir = TempDir::new()?;
+    let pattern = format!(
+        "if $index == 1 then halt else \"{}/f\" + ($index|tostring) + \".yml\" end",
+        dir.path().display()
+    );
+    let (stdout, stderr, code) = run_yq_split(".[]", "[1, 2, 3]\n", &["--split-exp", &pattern])?;
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout, "");
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("f0.yml"))?.trim(),
+        "1"
+    );
+    assert!(
+        !dir.path().join("f1.yml").exists(),
+        "index 1's own split-exp halt must return early without writing a file or complaining"
+    );
+    assert!(
+        !dir.path().join("f2.yml").exists(),
+        "index 2 must never be reached once index 1's split expression halted"
+    );
+    Ok(())
+}
+
+/// Targets `evaluate_yaml_cursor`'s `GenericResult::LazySeq` arm (#791
+/// follow-up): `seq.materialize_atomic()`'s `Err(jq::Control::Halt(code))`
+/// must reach `sink.request_halt`, not be swallowed as an ordinary error.
+/// `keys_unsorted | map(f)` takes the composability `LazySeq` fast path
+/// (#724/#725, native to `eval_single`'s `Pipe` folding) rather than falling
+/// into `evaluate_yaml_cursor`'s generic `Partial`/`Error` handling, so a
+/// halt inside `f` is the only way to reach this specific arm instead of the
+/// ordinary `Error`/`Break` ones right next to it. `map(f)` is atomic array
+/// construction, so the halt must also discard whatever partial array was
+/// being built, matching real jq's `[1,error("x"),3]` semantics.
+#[test]
+fn test_keys_unsorted_map_halt_propagates_through_lazyseq() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_yq_stdin_with_stderr("keys_unsorted | map(halt)", "a: 1\nb: 2\n", &[])?;
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(
+        stdout, "",
+        "a halt inside map must discard the whole in-progress array, not leak a partial one"
+    );
+    Ok(())
+}
+
+/// Targets `evaluate_yaml_cursor`'s `GenericResult::Partial(vs,
+/// jq::Control::Halt(code))` arm (#791 follow-up), distinct from its
+/// `Error`/`Break` siblings right above it. `,` isn't handled natively by
+/// `eval_single`, so it falls back to `full_eval`'s DOM path and comes back
+/// wrapped as a `GenericResult::Partial`, carrying whatever output was
+/// produced before the halt fired. `1, halt` produces one real output
+/// before halting, so it must still print `1` -- the outputs-already-
+/// produced-don't-vanish rule (#400, #494) applied to a halt specifically,
+/// not the ordinary-error case the neighboring arms handle.
+#[test]
+fn test_yaml_cursor_partial_result_keeps_prefix_output_before_halt() -> Result<()> {
+    let (stdout, stderr, code) = run_yq_stdin_with_stderr("1, halt", "x: 1\n", &[])?;
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(
+        stdout, "1\n",
+        "prefix output produced before the halt must survive"
+    );
+    Ok(())
+}
+
+/// #791 sibling of `test_split_doc_hides_in_halt_error_argument`:
+/// `contains_split_doc`'s `Expr::Builtin(b) => match b { ... }` fan-in
+/// gained a new `Builtin::HaltErrorCode(e)` leg spliced in ahead of the
+/// pre-existing `Builtin::Has(e)` leg, turning `Has`'s own line into a fresh
+/// OR-pattern alternative in the diff even though its recursion logic
+/// (`contains_split_doc(e)`) is unchanged. `has(split_doc)` inside a dead
+/// `if false` branch (never actually evaluated, exactly like the sibling
+/// `halt_error` test) proves the static scan still walks into `has(...)`'s
+/// own argument and correctly reports `has_split_doc == true`, which
+/// disables the DOM path's own regular multi-doc `---` injection so no
+/// leading separator appears before doc 0.
+#[test]
+fn test_split_doc_hides_in_has_argument() -> Result<()> {
+    let yaml = "x: 1\n---\nx: 2\n";
+    let (output, code) = run_yq_stdin("if false then has(split_doc) else . end", yaml, &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(
+        output, "x: 1\n---\nx: 2\n",
+        "no leading separator before doc 0"
+    );
+    Ok(())
+}
+
+/// #791 follow-up: the M2 fast path's *real-files* loop (`'m2_files: for
+/// file_path in &input_files`, a separate copy of the loop body from the
+/// stdin case right above it) needed its own halt check after
+/// `stream_cursor!` for the same reason the stdin copy does -- without it, a
+/// halt inside `select(...)`'s predicate (the only shape that reaches the M2
+/// path with a halt at all; `can_use_m2_streaming` special-cases
+/// `Builtin::Select` regardless of its predicate's shape, #796) would keep
+/// streaming the rest of this file's documents and then move on to open the
+/// next file entirely. Two real files (not stdin) exercises this loop
+/// specifically, distinct from the stdin copy.
+#[test]
+fn test_m2_multi_file_select_halt_stops_further_files() -> Result<()> {
+    let mut f1 = NamedTempFile::new()?;
+    write!(f1, "a: 1\n---\na: 2\n---\na: 3\n")?;
+    let mut f2 = NamedTempFile::new()?;
+    writeln!(f2, "a: 9")?;
+
+    let (stdout, stderr, code) = run_yq_files(
+        "select(if .a == 2 then halt else true end)",
+        &[f1.path(), f2.path()],
+        &[],
+    )?;
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(
+        stdout, "a: 1\n",
+        "halt inside f1's second document must stop streaming before f2 is ever opened"
+    );
+    Ok(())
+}
+
+/// #791 follow-up: `--split-exp`'s YAML per-file loop checks `sink.halted()`
+/// twice: once inside the per-result loop (right after each
+/// `write_split_result` call, covered by
+/// `test_split_exp_own_halt_returns_early_and_stops_further_results`), and
+/// once again after that loop, for the case where a *document's own*
+/// evaluation halts before producing any output at all -- so the per-result
+/// loop for that document runs zero times and the first check never fires.
+/// Unconditional `halt` on doc0 of a single-doc file is exactly that case:
+/// `evaluate_yaml_direct_filtered` already returns an empty `doc_results`
+/// (nothing to loop over, since it only pushes non-empty result sets), yet
+/// `sink` is already halted from evaluating that document internally -- only
+/// this second, outer check catches it.
+#[test]
+fn test_split_exp_halt_with_no_document_output_breaks_via_outer_check() -> Result<()> {
+    let dir = TempDir::new()?;
+    let pattern = format!(
+        "\"{}/f\" + ($index|tostring) + \".yml\"",
+        dir.path().display()
+    );
+    let (stdout, stderr, code) = run_yq_split("halt", "x: 1\n", &["--split-exp", &pattern])?;
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout, "");
+    assert!(
+        std::fs::read_dir(dir.path())?.next().is_none(),
+        "no split file is ever written when halt fires before doc0 produces anything"
+    );
+    Ok(())
+}
+
+/// The `InputFormat::Json` sibling of
+/// `test_split_exp_own_halt_returns_early_and_stops_further_results`: the
+/// JSON arm of `--split-exp`'s file loop (a separate `match format` branch
+/// from the YAML one) keeps its own copy of the per-result halt check
+/// (`if sink.halted().is_some() { break 'files; }` right after
+/// `write_split_result`), on its own source line since the two branches
+/// don't share code. `.[]` over a JSON array yields three results from one
+/// `evaluate_input` call, so `$index == 1`'s halt in the split expression
+/// fires mid-loop with a real result (index 2) still pending.
+#[test]
+fn test_split_exp_own_halt_breaks_json_branch_immediately() -> Result<()> {
+    let dir = TempDir::new()?;
+    let pattern = format!(
+        "if $index == 1 then halt else \"{}/f\" + ($index|tostring) + \".yml\" end",
+        dir.path().display()
+    );
+    let (stdout, stderr, code) =
+        run_yq_split(".[]", "[1, 2, 3]", &["--split-exp", &pattern, "-p", "json"])?;
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout, "");
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("f0.yml"))?.trim(),
+        "1"
+    );
+    assert!(!dir.path().join("f1.yml").exists());
+    assert!(!dir.path().join("f2.yml").exists());
+    Ok(())
+}
+
+/// The `InputFormat::Json` sibling of
+/// `test_split_exp_halt_with_no_document_output_breaks_via_outer_check`:
+/// same "halt before this input's own per-result loop ever runs" shape
+/// (unconditional `halt` on the only JSON value in this source, so
+/// `results` is empty and the per-result loop's own break check never
+/// fires), but through the JSON branch's separate
+/// `if sink.halted().is_some() { break 'files; }` after its
+/// `for input in inputs` loop -- a distinct source line from the YAML
+/// branch's equivalent outer check.
+#[test]
+fn test_split_exp_json_halt_with_no_output_breaks_via_outer_check() -> Result<()> {
+    let dir = TempDir::new()?;
+    let pattern = format!(
+        "\"{}/f\" + ($index|tostring) + \".yml\"",
+        dir.path().display()
+    );
+    let (stdout, stderr, code) =
+        run_yq_split("halt", "5", &["--split-exp", &pattern, "-p", "json"])?;
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout, "");
+    assert!(std::fs::read_dir(dir.path())?.next().is_none());
+    Ok(())
+}
+
+/// #791 follow-up: `-R` (raw-input) without `--slurp` evaluates each line as
+/// its own string input in a loop over `input_content.lines()`; that loop
+/// needed its own `if sink.halted().is_some() { break; }` check after each
+/// line's results are written, matching the pattern used by every other
+/// per-input loop in this file. Three lines, halting on the second, proves
+/// the third is never evaluated at all (not just "produces no output").
+#[test]
+fn test_raw_input_non_slurp_halt_stops_further_lines() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_yq_stdin_with_stderr(r#"if . == "b" then halt else . end"#, "a\nb\nc\n", &["-R"])?;
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(
+        stdout, "a\n",
+        "line c must never be evaluated after line b halts"
+    );
+    Ok(())
+}
+
+/// #791 follow-up: the M2 `--inplace` fast path (`can_inplace_fast_path`,
+/// reachable for M2-streamable filters like `select(...)`) needed its own
+/// halt-stops-streaming check inside its `Sequence` arm, matching the DOM
+/// `--inplace` branch's equivalent guard the comment right above this line
+/// points at. `select(if .a == 2 then halt else true end)` is M2-streamable
+/// (`can_use_m2_streaming` special-cases `Builtin::Select` regardless of its
+/// predicate's shape, #796), so a halt inside its predicate reaches this
+/// exact M2 inplace loop rather than the DOM one already covered by
+/// `test_inplace_halt_before_any_output_in_multi_doc_file_does_not_truncate_file`.
+#[test]
+fn test_inplace_m2_select_halt_stops_streaming_further_documents() -> Result<()> {
+    let mut input_file = NamedTempFile::new()?;
+    write!(input_file, "a: 1\n---\na: 2\n---\na: 3\n")?;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .arg("yq")
+        .arg("-i")
+        .arg("select(if .a == 2 then halt else true end)")
+        .arg(input_file.path())
+        .stdin(Stdio::null())
+        .output()?;
+
+    assert!(output.status.success());
+    let content = std::fs::read_to_string(input_file.path())?;
+    assert_eq!(
+        content, "a: 1\n",
+        "doc0's already-streamed output survives; doc2 is never reached"
+    );
+    Ok(())
+}
+
+/// Targets the `InputFormat::Json` arm of the default "Standard path"'s
+/// input-collection loop (the plain-stdout, non-`--eval-all`/`--split-exp`/
+/// `--slurp`/`--inplace`/`--null-input`/`--raw-input` fallback): its inner
+/// `for input in inputs` loop's `if sink.halted().is_some() { break; }`
+/// (matching the sibling YAML arm's own `break 'collect` right above it,
+/// already covered by the plain `run_yq_stdin_with_stderr("halt", ...)`
+/// test), and the outer `if sink.halted().is_some() { break 'collect; }`
+/// right after it that stops evaluating any further *files*. `., halt`
+/// produces one real output before halting, so the second file must never
+/// even be read.
+#[test]
+fn test_default_path_json_halt_stops_further_files() -> Result<()> {
+    let mut f1 = NamedTempFile::new()?;
+    write!(f1, "1")?;
+    let mut f2 = NamedTempFile::new()?;
+    write!(f2, "2")?;
+
+    let (stdout, stderr, code) = run_yq_files("., halt", &[f1.path(), f2.path()], &["-p", "json"])?;
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(
+        stdout, "1\n",
+        "second file must never be evaluated after the first file's halt"
+    );
+    Ok(())
+}
+
+/// `builtin_tz`'s zone-name argument (`Err(e) => return e.into()`) used
+/// the same pre-#791 style of error propagation as every other
+/// string-argument builtin in this file. `tz` is a real yq keyword (`.
+/// | tz("UTC")`), though succinctly's version reads a numeric Unix
+/// timestamp off `.` (via `get_float_value`, matching jq's own
+/// gmtime/mktime family) rather than mikefarah/yq's already-formatted
+/// date string -- confirmed live: `echo 'x: 1' | yq '1700000000 |
+/// tz("UTC")'` errors trying to parse `"1700000000"` as a date layout, a
+/// pre-existing, unrelated-to-#791 semantic difference. This is therefore
+/// checked against succinctly's own halt contract, not real yq's `tz`
+/// output shape: `.`'s numeric value is valid enough to reach the zone
+/// argument, which is where the halt fires.
+#[test]
+fn test_yq_tz_propagates_halt_in_zone_argument() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_yq_stdin_with_stderr("1700000000 | tz(halt_error(3))", "x: 1\n", &[])?;
+    assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+/// `builtin_load`'s filename argument (`Err(e) => return e.into()`) had
+/// the same pre-#791 gap. `load` is a real yq keyword
+/// (`load("file.yaml")`); confirmed live that a missing file is an
+/// ordinary error (`echo 'x: 1' | yq 'load("nonexistent.yaml")'` ->
+/// "Error: failed to load nonexistent.yaml: ..."), not relevant here since
+/// the halt fires while evaluating the filename argument itself, before
+/// any file is ever opened.
+#[test]
+fn test_yq_load_propagates_halt_in_filename_argument() -> Result<()> {
+    let (stdout, stderr, code) = run_yq_stdin_with_stderr("load(halt_error(3))", "x: 1\n", &[])?;
+    assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_yq_pick_propagates_halt_in_keys_argument() -> Result<()> {
+    // `builtin_pick`'s `QueryResult::Halt(code) => return
+    // QueryResult::Halt(code)` arm, reached when the `keys` argument itself
+    // halts. `pick`'s ordinary array-of-keys shape matches real yq, verified
+    // live: `printf 'a: 1\nb: 2\nc: 3\n' | yq '. | pick(["a","c"])'` prints
+    // `a: 1\nc: 3` (real jq's own `pick` instead takes path expressions like
+    // `.a,.c` -- a different, pre-existing shape divergence, not this
+    // fix). `halt_error` itself has no real-yq contract to check (mikefarah/
+    // yq has no `halt_error` at all), so this is checked against
+    // succinctly's own documented halt contract (#791), same as the other
+    // `halt`/`halt_error` tests in this file's #791 section.
+    let (stdout, stderr, code) =
+        run_yq_stdin_with_stderr("null | pick(halt_error(9))", "x: 1\n", &[])?;
+    assert_eq!(code, 9, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
+#[test]
+fn test_yq_omit_propagates_halt_in_keys_argument() -> Result<()> {
+    // `builtin_omit`'s `QueryResult::Halt(code) => return
+    // QueryResult::Halt(code)` arm -- the same shape as `pick`'s above, one
+    // builtin over. `omit`'s ordinary array-of-keys shape matches real yq,
+    // verified live: `printf 'a: 1\nb: 2\nc: 3\n' | yq '. | omit(["b"])'`
+    // prints `a: 1\nc: 3`. `omit` is not a real jq builtin at all (`jq:
+    // error: omit/1 is not defined`), and mikefarah/yq has no `halt_error`,
+    // so -- as with `pick` above -- this is checked against succinctly's own
+    // documented halt contract.
+    let (stdout, stderr, code) =
+        run_yq_stdin_with_stderr("null | omit(halt_error(9))", "x: 1\n", &[])?;
+    assert_eq!(code, 9, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
+/// `GenericResult::produces_output`'s exhaustive match (#791: this replaced
+/// a hand-maintained exclusion list that `d259fba4` had to separately patch
+/// for a missed `Halt` case) folds `One`/`OneCursor`/`LazyKeys`/
+/// `LazyIndexRange`/`LazySeq`/`Error`/`Owned`/`Partial` into one shared
+/// `true` arm. `.a` on a mapping lands in its `OneCursor` case at the M2
+/// CLI entry point (`eval_with_cursor_using`'s result, streamed by
+/// `stream_cursor!` in `yq_runner.rs`) -- pins that this arm's `true`
+/// answer still correctly triggers the `---` separator between two
+/// navigation results, the same contract `d259fba4`'s fix depends on for
+/// every non-empty variant.
+#[test]
+fn test_m2_field_access_one_cursor_triggers_doc_separator() -> Result<()> {
+    let (out, code) = run_yq_stdin(".a", "a: 1\n---\na: 2\n", &["-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "1\n---\n2");
+    Ok(())
+}
+
+/// `GenericResult::produces_output`'s `Self::ManyCursor(cs) =>
+/// !cs.is_empty()` and `Self::ManyOwned(vs) => !vs.is_empty()` arms (#791),
+/// each compiled separately from the surrounding `true`/`false` blocks.
+/// `.[("a","b")]`'s computed-key fan-out (#360) yields `ManyCursor` when
+/// every key resolves through a live cursor (first document, both `a` and
+/// `b` present) and `ManyOwned` when at least one key is missing
+/// (`eval_index_expr`'s `any_owned` fallback to `null`; second document has
+/// no `b`) -- both non-empty, so both must trigger their own `---`
+/// separator, complementing `test_i0_multidoc_separator_skips_empty_results`,
+/// which only pins the *false* (empty) side of this same match.
+#[test]
+fn test_m2_computed_index_many_cursor_and_many_owned_trigger_separator() -> Result<()> {
+    let yaml = "a: 1\nb: 2\n---\na: 3\n";
+    let (out, code) = run_yq_stdin(r#".[("a","b")]"#, yaml, &["-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "1\n2\n---\n3\nnull");
+    Ok(())
+}
+
+/// JSON-output sibling of `test_m2_select_halt_does_not_emit_stray_separator`:
+/// `GenericResult::stream_json`'s own `Self::Halt(code)` arm (#791) is a
+/// *separate* match from `stream_yaml`'s -- `stream_json`/`stream_yaml` are
+/// two independent methods -- and is reached only via `-o json` M2 output
+/// (`stream_cursor!`'s JSON branch in `yq_runner.rs`), not the default YAML
+/// output the sibling test exercises. Confirms a halting document
+/// contributes zero JSON output (`control_to_stream_outcome` routes the
+/// halt into `stats.halt`, not stdout) while the document before it still
+/// streams normally, and the process still exits with the halt's own code.
+#[test]
+fn test_m2_json_output_select_halt_writes_nothing_for_halted_doc() -> Result<()> {
+    let yaml = "a: 1\n---\na: 2\n";
+    let (out, code) = run_yq_stdin(
+        "select(if .a == 2 then halt else true end)",
+        yaml,
+        &["-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), r#"{"a":1}"#);
     Ok(())
 }

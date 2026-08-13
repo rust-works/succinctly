@@ -124,7 +124,7 @@ impl ErrorSink {
         self.emit(style, &err.message, err.payload_is_not_a_string(), at);
     }
 
-    /// Record a `halt`/`halt_error` request with its exit code (#791).
+    /// Records a `halt`/`halt_error` request with its exit code (#791).
     ///
     /// Unlike `report`/`report_break`, this is not a diagnostic: no message
     /// is printed here (`halt_error`'s stderr write already happened inside
@@ -711,6 +711,30 @@ mod tests {
         // Distinct from -e's codes, which describe a *successful* falsy result.
         assert_ne!(DiagStyle::Jq.error_exit_code(), exit_codes::NO_OUTPUT);
         assert_ne!(DiagStyle::Jq.error_exit_code(), exit_codes::FALSE_OR_NULL);
+    }
+
+    /// A bare `halt_error` (no explicit exit code) is documented to exit with
+    /// the same code as an uncaught error in the same mode (#791) — but the
+    /// two constants live in different crates (`JqSemantics`/`YqSemantics`'s
+    /// `DEFAULT_HALT_ERROR_CODE` in the library, `DiagStyle::error_exit_code`
+    /// here in the binary) linked only by a comment on each side, with
+    /// nothing that would catch one drifting from the other. Pinning the
+    /// equality directly, rather than each side only asserting against its
+    /// own hardcoded expectation, is what actually enforces the invariant.
+    #[test]
+    fn test_bare_halt_error_default_matches_uncaught_error_exit_code() {
+        use succinctly::jq::{EvalSemantics, JqSemantics, YqSemantics};
+
+        assert_eq!(
+            JqSemantics::DEFAULT_HALT_ERROR_CODE,
+            DiagStyle::Jq.error_exit_code(),
+            "bare halt_error in jq mode must exit like an uncaught error"
+        );
+        assert_eq!(
+            YqSemantics::DEFAULT_HALT_ERROR_CODE,
+            DiagStyle::Yq.error_exit_code(),
+            "bare halt_error in yq mode must exit like an uncaught error"
+        );
     }
 
     #[test]

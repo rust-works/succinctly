@@ -41,16 +41,6 @@ pub struct EvalError {
     /// the payload can decide — `message` has already lost the distinction
     /// (#355).
     pub value: Option<OwnedValue>,
-
-    /// Set when this `EvalError` is not a genuine error at all, but a
-    /// `halt`/`halt_error(n)` escape smuggled through a helper whose
-    /// signature (`Result<_, EvalError>`) has no channel for [`Control`]
-    /// (#791). Every site that turns such a helper's `Err` back into a
-    /// `QueryResult`/`Control` must check this field first and produce
-    /// `Halt(code)` instead of `Error(self)` — otherwise a `try`/`catch` or
-    /// `label`/`break` upstream would swallow the halt, which must never
-    /// happen. `None` for every ordinary error.
-    pub halt: Option<i32>,
 }
 
 /// A stream terminator: what ended a sequence of outputs when it wasn't
@@ -71,6 +61,55 @@ pub enum Control {
     /// handlers' existing `other => other` fallthrough passes it through
     /// unchanged without needing to special-case it.
     Halt(i32),
+}
+
+/// How an owned-evaluation helper's expression stopped: a genuine error that
+/// `try`/`catch` may handle and `?` may suppress, or a `halt` that nothing may
+/// catch (#791).
+///
+/// This is the error type of `result_to_owned`, `eval_owned_multi` and the
+/// other `eval.rs` helpers that evaluate a sub-expression to owned values. An
+/// earlier design smuggled a halt through [`EvalError`] behind a marker field,
+/// which made correctness opt-in at every call site: the natural
+/// `Err(e) => QueryResult::Error(e)` silently turned a halt into a catchable
+/// error, and review kept finding missed sites. Carrying the two cases as
+/// distinct variants makes that mistake unrepresentable — an `EvalError` can
+/// no longer *be* a halt, so only an explicit wildcard arm can misroute one.
+///
+/// Consumers should write `Err(EvalEscape::Error(e))` for the catchable case
+/// and let everything else flow through the `From` conversions into
+/// `QueryResult`/[`Control`], which preserve `Halt` by construction. Never
+/// write `Err(_) => …-that-discards` — that is the one remaining way to lose
+/// a halt.
+#[derive(Debug, Clone, PartialEq)]
+pub enum EvalEscape {
+    /// A genuine evaluation error — catchable by `try`/`catch`, suppressible
+    /// by `?`.
+    Error(EvalError),
+    /// `halt`/`halt_error(n)`: exit the whole process with this code. Must
+    /// reach the CLI unconditionally; never catchable, never suppressible.
+    Halt(i32),
+}
+
+impl From<EvalError> for EvalEscape {
+    fn from(e: EvalError) -> Self {
+        Self::Error(e)
+    }
+}
+
+impl From<EvalError> for Control {
+    fn from(e: EvalError) -> Self {
+        Self::Error(e)
+    }
+}
+
+impl From<EvalEscape> for Control {
+    fn from(escape: EvalEscape) -> Self {
+        match escape {
+            EvalEscape::Error(e) => Self::Error(e),
+            EvalEscape::Halt(code) => Self::Halt(code),
+        }
+    }
 }
 
 /// jq truncates values embedded in error messages to a fixed-width buffer
@@ -214,7 +253,6 @@ impl EvalError {
         Self {
             message: message.into(),
             value: None,
-            halt: None,
         }
     }
 
@@ -231,22 +269,6 @@ impl EvalError {
         Self {
             message,
             value: Some(value),
-            halt: None,
-        }
-    }
-
-    /// Build the `halt` escape marker documented on the `halt` field: a
-    /// `Control::Halt(code)` a `Result<_, EvalError>`-typed helper caught
-    /// while it had no way to carry `Control` through its own signature.
-    ///
-    /// Never construct this any other way — every reader of `halt` assumes
-    /// it is only ever `Some` via this constructor, carrying the real exit
-    /// code and nothing else.
-    pub fn halt_escape(code: i32) -> Self {
-        Self {
-            message: format!("halt({code}) not propagated"),
-            value: None,
-            halt: Some(code),
         }
     }
 
