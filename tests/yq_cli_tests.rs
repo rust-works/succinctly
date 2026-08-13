@@ -780,6 +780,79 @@ fn test_slurp_doc_filter_no_match_yields_empty_array() -> Result<()> {
     Ok(())
 }
 
+/// #835: a block-sequence item whose value is a non-empty mapping, written
+/// in the source as a totally bare `-` on its own line followed by the
+/// indented mapping (rather than the compact `- key: value` form), used to
+/// re-serialize as a lone `-` with the whole mapping silently dropped.
+///
+/// Root cause: `YamlElements::uncons_cursor` deliberately leaves a bare `-`
+/// item pointed at its sequence-item *wrapper* node rather than unwrapping
+/// it to the deferred value (`corpus_stats` needs the wrapper positionally).
+/// `is_yaml_cursor_container` and `stream_yaml_value`'s `Mapping` arm both
+/// then read `is_container()`/`first_child()` off the wrapper itself, which
+/// never carries a TY bit and has exactly one child - the mapping - so
+/// `first_child()` returned the mapping node in place of its first field,
+/// producing a mapping with a "field" whose key has no sibling and
+/// collapsing to zero rendered fields. Matches real `yq` v4.53.3, which
+/// re-serializes this into the same "compact" form #785 uses for every
+/// other non-empty container element, regardless of the source's own style.
+#[test]
+fn test_bare_dash_alone_mapping_value_not_truncated_835() -> Result<()> {
+    let (output, code) = run_yq_stdin(".", "-\n  a: 1\n  b: 2\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "- a: 1\n  b: 2\n");
+    Ok(())
+}
+
+/// #835: same bug, but for a sequence-valued (rather than mapping-valued)
+/// bare-dash item - `stream_yaml_value`'s `Sequence` arm doesn't share the
+/// `Mapping` arm's raw-field-walk optimization, so this shape wasn't
+/// actually truncated pre-fix, but it exercises the same
+/// `is_yaml_cursor_container` misclassification that picked the wrong
+/// (deferred, non-"compact") render branch. Pinned here alongside the
+/// mapping case so both container kinds stay covered together.
+#[test]
+fn test_bare_dash_alone_sequence_value_renders_compact_835() -> Result<()> {
+    let (output, code) = run_yq_stdin(".", "-\n  - x\n  - y\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "- - x\n  - y\n");
+    Ok(())
+}
+
+/// #835: the fix must not regress `-o json`, which was already correct
+/// pre-fix (`yaml_to_owned_value` resolves through `YamlCursor::value`'s own
+/// delegation rather than re-deriving `first_child()` off the wrapper).
+#[test]
+fn test_bare_dash_alone_mapping_value_json_output_835() -> Result<()> {
+    let (output, code) = run_yq_stdin(".", "-\n  a: 1\n  b: 2\n", &["-o", "json", "-I0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "[{\"a\":1,\"b\":2}]\n");
+    Ok(())
+}
+
+/// #835: a sequence mixing all three item styles - compact (`- key: value`),
+/// bare-dash-deferred, and a plain scalar - in one document, matching real
+/// `yq` v4.53.3. Guards against a fix that only special-cases a
+/// single-item sequence.
+#[test]
+fn test_bare_dash_alone_mapping_value_mixed_with_compact_and_scalar_835() -> Result<()> {
+    let (output, code) = run_yq_stdin(".", "- x: 1\n-\n  y: 2\n  z: 3\n- 5\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "- x: 1\n- y: 2\n  z: 3\n- 5\n");
+    Ok(())
+}
+
+/// #835: the `--slurp` fast path (`stream_yaml_sequence`) shares
+/// `is_yaml_cursor_container` with `stream_yaml_value`'s `Sequence` arm, so
+/// covers it independently of `stream_yaml_document`'s own entry point.
+#[test]
+fn test_bare_dash_alone_mapping_value_survives_slurp_835() -> Result<()> {
+    let (output, code) = run_yq_stdin(".", "-\n  a: 1\n  b: 2\n", &["--slurp"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "- - a: 1\n    b: 2\n");
+    Ok(())
+}
+
 /// #478: `stream_yaml_sequence`'s block-style rendering has a container vs.
 /// scalar branch per slurped item (mirroring `stream_yaml_value`'s `Sequence`
 /// arm); the tests above only slurp mapping documents, which always take the

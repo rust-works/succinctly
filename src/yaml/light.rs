@@ -333,6 +333,40 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
             .is_some_and(|end| end > text_pos)
     }
 
+    /// Resolve a totally bare `-` sequence-item wrapper cursor to the cursor
+    /// of its deferred (next-line) value.
+    ///
+    /// [`YamlElements::uncons_cursor`] deliberately leaves a bare `-` cursor
+    /// pointed at the wrapper node rather than unwrapping it — callers that
+    /// use the cursor *positionally* depend on that (`corpus_stats` counts
+    /// bare-dash items by it). But a couple of renderers need the wrapped
+    /// value's own cursor instead, the same way [`Self::value`] already
+    /// delegates to it: [`is_yaml_cursor_container`] classifies
+    /// block-vs-inline layout from the cursor it's handed, and
+    /// [`Self::stream_yaml_value`]'s `Mapping` arm walks `self.first_child()`
+    /// for its raw (merge-unaware) field list. Left unresolved, both read the
+    /// wrapper's own BP node — which never carries a TY bit and has exactly
+    /// one child, the deferred value itself — instead of the value's fields,
+    /// so `self.first_child()` there returns the mapping/sequence node, not
+    /// its first field, and the whole value silently renders as a bare `-`
+    /// (#835).
+    ///
+    /// A no-op for every other cursor shape: already a container (including
+    /// a same-line "compact" item, which `uncons_cursor` already unwraps), a
+    /// scalar, or a childless/empty item — all return `self` unchanged.
+    #[inline]
+    fn resolve_bare_seq_item(&self) -> Self {
+        if self.is_container() {
+            return *self;
+        }
+        match self.text_position() {
+            Some(text_pos) if starts_seq_entry(self.text, text_pos) => {
+                self.first_child().unwrap_or(*self)
+            }
+            _ => *self,
+        }
+    }
+
     /// Parse an alias value from text position.
     fn parse_alias_value(&self, text_pos: usize) -> YamlValue<'a, W> {
         // Extract anchor name from text (skip the `*`)
@@ -1380,16 +1414,25 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                 stream_yaml_string_value(out, &s)
             }
             YamlValue::Mapping(_) => {
+                // A bare `-` sequence-item wrapper (dash-alone-then-indented
+                // source style) reaches this arm still pointed at the
+                // wrapper node, not the mapping it defers to — `self.value()`
+                // above already delegated through it to classify as
+                // `Mapping`, but `self` itself is unchanged, so `first_child()`
+                // and `style()` below must resolve through the same wrapper
+                // themselves or they read the wrapper's own (containerless)
+                // BP node instead of the mapping's (#835).
+                let container = self.resolve_bare_seq_item();
                 // Raw (merge-unaware) walk, not `self.value()`'s merge-resolved
                 // fields: re-serializing to YAML must preserve a literal `<<`
                 // key rather than silently expanding it (issue #712) — merge
                 // resolution stays reserved for field *lookup* (`find`,
                 // `keys()`, ...), which still goes through `from_mapping_cursor`.
-                let fields = YamlFields::raw(self.first_child());
+                let fields = YamlFields::raw(container.first_child());
                 if fields.is_empty() {
                     return out.write_str("{}");
                 }
-                if indent_spaces == 0 || (!known_not_flow && self.style() == "flow") {
+                if indent_spaces == 0 || (!known_not_flow && container.style() == "flow") {
                     // Flow style
                     out.write_char('{')?;
                     let mut items: Vec<_> = fields.into_iter().collect();
@@ -1516,7 +1559,12 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                 if elements.is_empty() {
                     return out.write_str("[]");
                 }
-                if indent_spaces == 0 || (!known_not_flow && self.style() == "flow") {
+                // See the `Mapping` arm above (#835): a bare `-` wrapper's
+                // own `style()` doesn't see a flow-style deferred value
+                // (e.g. `-\n  [1, 2]\n`) — the style is recorded against the
+                // sequence node itself, not the wrapper around it.
+                let style_cursor = self.resolve_bare_seq_item();
+                if indent_spaces == 0 || (!known_not_flow && style_cursor.style() == "flow") {
                     // Flow style
                     out.write_char('[')?;
                     let mut first = true;
@@ -5586,7 +5634,15 @@ const COMPACT_DASH_WIDTH: usize = 2;
 /// unresolvable `<<` must still be treated as non-empty here, or it would
 /// wrongly take the empty-mapping `"{}"` shortcut instead of rendering its
 /// literal `<<` field.
+///
+/// Resolves through [`YamlCursor::resolve_bare_seq_item`] first: a block
+/// sequence item whose source uses the dash-alone-then-indented style (`-`
+/// on its own line, value on the lines below) reaches here still pointed at
+/// the sequence-item wrapper, not the mapping/sequence it defers to — the
+/// wrapper itself never carries a TY bit, so checking `is_container()`
+/// directly on it always says `false` regardless of what it wraps (#835).
 fn is_yaml_cursor_container<W: AsRef<[u64]>>(cursor: &YamlCursor<'_, W>) -> bool {
+    let cursor = cursor.resolve_bare_seq_item();
     cursor.is_container() && cursor.first_child().is_some()
 }
 
@@ -6894,6 +6950,118 @@ mod tests {
         let mut out = String::new();
         stream_yaml_sequence([cursor_a], &mut out, 0, 2, ' ', false).unwrap();
         assert_eq!(out, "- &x\n  a: 1\n  b: 2");
+    }
+
+    #[test]
+    fn test_stream_yaml_sequence_item_dash_alone_mapping_value_not_truncated_835() {
+        // #835: a block-sequence item whose value is a non-empty mapping,
+        // written as a totally bare `-` on its own line (no anchor/tag,
+        // nothing else on that line) followed by the indented mapping on
+        // subsequent lines, used to re-serialize as a lone `-` with the
+        // mapping silently dropped. `uncons_cursor` deliberately leaves such
+        // a cursor pointed at the sequence-item *wrapper* (not the mapping
+        // it defers to) for `corpus_stats`'s benefit; `is_yaml_cursor_container`
+        // and `stream_yaml_value`'s `Mapping` arm both need
+        // `YamlCursor::resolve_bare_seq_item` to see through it. Matches
+        // real yq v4.53.3's "compact" re-serialization (#785).
+        let yaml = b"-\n  a: 1\n  b: 2\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let mut out = String::new();
+        index
+            .root(yaml)
+            .stream_yaml_document(&mut out, IndentSpec::spaces(2), false)
+            .unwrap();
+        assert_eq!(out, "- a: 1\n  b: 2");
+    }
+
+    #[test]
+    fn test_stream_yaml_sequence_item_dash_alone_mapping_value_slurp_835() {
+        // Same underlying bug as
+        // `test_stream_yaml_sequence_item_dash_alone_mapping_value_not_truncated_835`,
+        // exercised through `stream_yaml_sequence` (the `--slurp` fast path):
+        // the single slurped "document" here is itself a one-item block
+        // sequence whose item is a bare-dash-deferred mapping, so rendering
+        // it recurses into `stream_yaml_value`'s Sequence arm - the same
+        // `is_yaml_cursor_container`/`resolve_bare_seq_item` path, reached
+        // through the other public entry point.
+        let bytes_a = b"-\n  a: 1\n  b: 2\n".to_vec();
+        let index_a = YamlIndex::build(&bytes_a).unwrap();
+        let cursor_a = index_a.root(&bytes_a).first_child().unwrap();
+
+        let mut out = String::new();
+        stream_yaml_sequence([cursor_a], &mut out, 0, 2, ' ', false).unwrap();
+        assert_eq!(out, "- - a: 1\n    b: 2");
+    }
+
+    /// Get the sole item's cursor from a single-document, single-element
+    /// top-level block sequence (`uncons_cursor` unresolved, as callers like
+    /// `is_yaml_cursor_container`/`stream_yaml_value` see it).
+    fn first_seq_item_cursor<'a, W: AsRef<[u64]> + core::fmt::Debug>(
+        index: &'a YamlIndex<W>,
+        yaml: &'a [u8],
+    ) -> YamlCursor<'a, W> {
+        let doc_cursor = index.root(yaml).first_child().unwrap();
+        let YamlValue::Sequence(seq_elements) = doc_cursor.value() else {
+            panic!("document should be a sequence");
+        };
+        seq_elements.uncons_cursor().unwrap().0
+    }
+
+    #[test]
+    fn test_is_yaml_cursor_container_resolves_bare_seq_item_wrapper_835() {
+        // Direct unit coverage of the classification bug (#835): a bare `-`
+        // sequence-item cursor (from `uncons_cursor`, still pointed at the
+        // wrapper) must classify as a container when it wraps a non-empty
+        // mapping, even though the wrapper's own `is_container()` is always
+        // `false` (wrappers never carry a TY bit).
+        let yaml = b"-\n  a: 1\n  b: 2\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let item_cursor = first_seq_item_cursor(&index, yaml);
+
+        // The wrapper itself never has a TY bit - confirms this test is
+        // actually exercising the wrapper-resolution path, not a cursor
+        // that was already unwrapped by `uncons_cursor`.
+        assert!(!item_cursor.is_container());
+        assert!(is_yaml_cursor_container(&item_cursor));
+
+        // And the resolved cursor is the mapping node's own bp_pos, whose
+        // `first_child()` is the first *key*, not the mapping node itself.
+        let resolved = item_cursor.resolve_bare_seq_item();
+        assert!(resolved.is_container());
+        assert_ne!(resolved.bp_position(), item_cursor.bp_position());
+    }
+
+    #[test]
+    fn test_resolve_bare_seq_item_is_noop_for_already_resolved_cursors_835() {
+        // `resolve_bare_seq_item` must leave every non-wrapper shape
+        // unchanged: a genuine container (compact-form item, already
+        // unwrapped by `uncons_cursor`), a plain scalar, and a childless
+        // (empty/null) bare-dash item.
+        let compact = b"- a: 1\n  b: 2\n";
+        let compact_index = YamlIndex::build(compact).unwrap();
+        let compact_item = first_seq_item_cursor(&compact_index, compact);
+        assert!(compact_item.is_container());
+        assert_eq!(
+            compact_item.resolve_bare_seq_item().bp_position(),
+            compact_item.bp_position()
+        );
+
+        let scalar = b"- hello\n";
+        let scalar_index = YamlIndex::build(scalar).unwrap();
+        let scalar_item = first_seq_item_cursor(&scalar_index, scalar);
+        assert!(!scalar_item.is_container());
+        assert_eq!(
+            scalar_item.resolve_bare_seq_item().bp_position(),
+            scalar_item.bp_position()
+        );
+
+        let empty = b"-\n";
+        let empty_index = YamlIndex::build(empty).unwrap();
+        let empty_item = first_seq_item_cursor(&empty_index, empty);
+        assert_eq!(
+            empty_item.resolve_bare_seq_item().bp_position(),
+            empty_item.bp_position()
+        );
     }
 
     #[test]
