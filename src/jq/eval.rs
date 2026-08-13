@@ -6652,25 +6652,37 @@ fn builtin_match<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // Check if global flag is set
     let global = flags.is_some_and(|f| f.contains('g'));
 
-    // Computed once per input rather than per match/offset (#806).
-    let input_is_ascii = input.is_ascii();
-
     if global {
         // Stream one match object per match (jq's match(re;"g") is a generator)
-        let matches: Vec<OwnedValue> = global_captures(&re, &input)
-            .iter()
-            .map(|caps| build_match_object(&re, caps, &input, input_is_ascii))
-            .collect();
-        if matches.is_empty() {
-            QueryResult::None
-        } else {
-            QueryResult::ManyOwned(matches)
+        let caps_vec = global_captures(&re, &input);
+        if caps_vec.is_empty() {
+            return QueryResult::None;
         }
+        // Computed once per input (and only once we know there's at least
+        // one match to build) rather than per match/offset (#806). The
+        // cursor is shared across every match in this call so the whole
+        // `match(re;"g")` invocation pays for one forward scan of `input`
+        // in total, not one scan per match -- see `CodepointCursor`.
+        let input_is_ascii = input.is_ascii();
+        let mut cursor = CodepointCursor::default();
+        let matches: Vec<OwnedValue> = caps_vec
+            .iter()
+            .map(|caps| build_match_object(&re, caps, &input, input_is_ascii, &mut cursor))
+            .collect();
+        QueryResult::ManyOwned(matches)
     } else {
         // Return first match, or no output (not `null`) when there's no match.
         match re.captures(&input) {
             Some(caps) => {
-                QueryResult::Owned(build_match_object(&re, &caps, &input, input_is_ascii))
+                let input_is_ascii = input.is_ascii();
+                let mut cursor = CodepointCursor::default();
+                QueryResult::Owned(build_match_object(
+                    &re,
+                    &caps,
+                    &input,
+                    input_is_ascii,
+                    &mut cursor,
+                ))
             }
             None => QueryResult::None,
         }
@@ -6709,44 +6721,106 @@ fn global_captures<'h>(re: &JqRegex, input: &'h str) -> Vec<regex::Captures<'h>>
     results
 }
 
+/// Count of codepoints in a `str`, computed in one pass over its bytes by
+/// counting everything that *isn't* a UTF-8 continuation byte (`0b10xxxxxx`)
+/// rather than decoding via `str::chars()`. Used both by
+/// [`CodepointCursor::advance`] and [`char_len`] so neither needs a separate
+/// `is_ascii()` pre-scan followed by a second decode pass on the non-ASCII
+/// branch (#806 follow-up).
+#[cfg(feature = "regex")]
+fn utf8_char_count(s: &str) -> usize {
+    s.len() - s.as_bytes().iter().filter(|&&b| b & 0xC0 == 0x80).count()
+}
+
+/// Amortises codepoint-offset conversion across the many *forward-order*
+/// offset queries a single `match(re)`/`match(re;"g")` call makes.
+///
+/// `global_captures` produces matches at strictly increasing byte offsets,
+/// and every capture group's own offset is always `>= ` the overall match's
+/// start (captures can't extend outside their match). A naive
+/// `input[..byte_offset].chars().count()` re-scan from byte 0 on every one
+/// of those calls made `match(".";"g")` quadratic on any document containing
+/// even a single non-ASCII byte (#806 follow-up) -- `M` matches each
+/// rescanning up to `N` bytes is `O(M*N)`, i.e. `O(N^2)` once `M` scales with
+/// `N`, which a densely-matching global pattern does trivially.
+///
+/// Mirrors the one-entry forward-walk cache `LineIndex` uses in
+/// `src/text/lines.rs`: advancing the cursor forward only counts the bytes
+/// since the last query (amortised `O(1)` per call, `O(N)` total across a
+/// monotone walk), and a backward query -- only possible among a single
+/// match's own out-of-order capture offsets, never across matches -- falls
+/// back to a direct scan from byte 0 without disturbing the cursor, so later
+/// forward queries stay correct.
+#[cfg(feature = "regex")]
+#[derive(Default)]
+struct CodepointCursor {
+    /// Byte offset the cursor is currently positioned at.
+    byte: usize,
+    /// Codepoint count of `input[..byte]`.
+    chars: usize,
+}
+
+#[cfg(feature = "regex")]
+impl CodepointCursor {
+    /// Codepoint offset of `byte_offset` into `input`.
+    fn advance(&mut self, input: &str, byte_offset: usize) -> i64 {
+        if byte_offset >= self.byte {
+            self.chars += utf8_char_count(&input[self.byte..byte_offset]);
+            self.byte = byte_offset;
+            self.chars as i64
+        } else {
+            utf8_char_count(&input[..byte_offset]) as i64
+        }
+    }
+}
+
 /// Convert a byte offset into `input` to the codepoint offset jq/oniguruma
 /// reports (`match`/`capture` positions are codepoints, not bytes -- #806).
 /// `input_is_ascii` is computed once per input string by the caller
-/// (`input.is_ascii()`), so this stays O(1) in the common all-ASCII case
-/// instead of re-scanning `input` on every offset conversion.
+/// (`input.is_ascii()`), so this stays O(1) in the common all-ASCII case;
+/// otherwise the conversion is delegated to `cursor`, which amortises the
+/// cost across every offset query in this `match(...)` call (see
+/// `CodepointCursor`).
 #[cfg(feature = "regex")]
-fn byte_to_char_offset(input: &str, input_is_ascii: bool, byte_offset: usize) -> i64 {
+fn byte_to_char_offset(
+    input: &str,
+    input_is_ascii: bool,
+    cursor: &mut CodepointCursor,
+    byte_offset: usize,
+) -> i64 {
     if input_is_ascii {
         byte_offset as i64
     } else {
-        input[..byte_offset].chars().count() as i64
+        cursor.advance(input, byte_offset)
     }
 }
 
 /// Codepoint length of a matched substring -- oniguruma's `length` is in
-/// codepoints, not bytes (#806). Checked per-substring rather than reusing
-/// `input_is_ascii`: a non-ASCII document can still have plenty of
-/// pure-ASCII matches, each cheap to fast-path on its own.
+/// codepoints, not bytes (#806). `matched` is a single match's own
+/// substring rather than the whole document, so this doesn't compound
+/// across matches the way per-call *input* scans would; it's a plain
+/// single-pass `O(len)` count regardless of ASCII-ness (`utf8_char_count`
+/// degrades to `matched.len()` on an all-ASCII substring without a separate
+/// branch).
 #[cfg(feature = "regex")]
 fn char_len(matched: &str) -> i64 {
-    if matched.is_ascii() {
-        matched.len() as i64
-    } else {
-        matched.chars().count() as i64
-    }
+    utf8_char_count(matched) as i64
 }
 
 /// Build a jq match object from an already-obtained `Captures`.
 ///
-/// `input` is the full haystack `caps` matched against, and `input_is_ascii`
-/// is `input.is_ascii()` computed once by the caller -- both needed to
-/// convert byte offsets to jq's codepoint offsets (#806).
+/// `input` is the full haystack `caps` matched against, `input_is_ascii` is
+/// `input.is_ascii()` computed once by the caller, and `cursor` is shared
+/// across every match/capture in the enclosing `match(...)` call -- all
+/// needed to convert byte offsets to jq's codepoint offsets without
+/// re-scanning `input` from byte 0 on every call (#806).
 #[cfg(feature = "regex")]
 fn build_match_object(
     re: &JqRegex,
     caps: &regex::Captures,
     input: &str,
     input_is_ascii: bool,
+    cursor: &mut CodepointCursor,
 ) -> OwnedValue {
     let m0 = caps
         .get(0)
@@ -6755,7 +6829,12 @@ fn build_match_object(
 
     obj.insert(
         "offset".to_string(),
-        OwnedValue::Int(byte_to_char_offset(input, input_is_ascii, m0.start())),
+        OwnedValue::Int(byte_to_char_offset(
+            input,
+            input_is_ascii,
+            cursor,
+            m0.start(),
+        )),
     );
     obj.insert("length".to_string(), OwnedValue::Int(char_len(m0.as_str())));
     obj.insert(
@@ -6784,7 +6863,12 @@ fn build_match_object(
             Some(m) if !m.is_empty() => {
                 cap_obj.insert(
                     "offset".to_string(),
-                    OwnedValue::Int(byte_to_char_offset(input, input_is_ascii, m.start())),
+                    OwnedValue::Int(byte_to_char_offset(
+                        input,
+                        input_is_ascii,
+                        cursor,
+                        m.start(),
+                    )),
                 );
                 cap_obj.insert("length".to_string(), OwnedValue::Int(char_len(m.as_str())));
                 cap_obj.insert(
@@ -6795,7 +6879,12 @@ fn build_match_object(
             Some(m) => {
                 cap_obj.insert(
                     "offset".to_string(),
-                    OwnedValue::Int(byte_to_char_offset(input, input_is_ascii, m.start())),
+                    OwnedValue::Int(byte_to_char_offset(
+                        input,
+                        input_is_ascii,
+                        cursor,
+                        m.start(),
+                    )),
                 );
                 cap_obj.insert(
                     "string".to_string(),
@@ -6806,7 +6895,12 @@ fn build_match_object(
             None if m0.is_empty() => {
                 cap_obj.insert(
                     "offset".to_string(),
-                    OwnedValue::Int(byte_to_char_offset(input, input_is_ascii, m0.start())),
+                    OwnedValue::Int(byte_to_char_offset(
+                        input,
+                        input_is_ascii,
+                        cursor,
+                        m0.start(),
+                    )),
                 );
                 cap_obj.insert("string".to_string(), OwnedValue::String(String::new()));
                 cap_obj.insert("length".to_string(), OwnedValue::Int(0));
