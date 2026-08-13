@@ -1083,7 +1083,7 @@ fn output_value<W: Write>(
     // For YAML output format (default)
     if config.output_format == OutputFormat::Yaml {
         // For YAML, scalars are printed without quotes by default (like -r in yq)
-        let body = emit_yaml_value(value, comments, config, 0, false);
+        let body = emit_yaml_value(value, comments, config, "", false);
         // Every non-root node's own trailing comment is appended by its
         // *parent* during `emit_yaml_value`'s recursion (see its Array/Object
         // arms), but the root has no parent call site to do that for it —
@@ -1183,11 +1183,23 @@ fn append_own_comment_line(body: String, own_comment: Option<&str>, indent: &str
 /// comment from the parallel `comments` tree (issue #710). Flow-style
 /// (`in_flow`) contexts never append one — flow items are comma-joined on
 /// one line, so there's no meaningful "trailing" position between them.
+///
+/// `indent` is the exact indent *string* to prepend to this value's own
+/// top-level line(s) — not a `depth: usize` repetition count. A block
+/// sequence item whose value is a non-empty mapping/sequence renders in
+/// real yq's "compact" form (`- ` shares its line with the value's first
+/// field/element, and the rest of the value's own content aligns under
+/// that first line's content rather than under a full `config.indent_str`
+/// step further — see the `Array` arm below), so a plain `depth *
+/// config.indent_str` formula can't express every line's indent; passing
+/// the literal string lets a compact caller hand down `indent` plus a
+/// fixed 2-character offset instead of a whole extra `config.indent_str`
+/// step (#785).
 fn emit_yaml_value(
     value: &OwnedValue,
     comments: &CommentTree,
     config: &OutputConfig,
-    depth: usize,
+    indent: &str,
     in_flow: bool,
 ) -> String {
     match value {
@@ -1229,34 +1241,59 @@ fn emit_yaml_value(
                 let items: Vec<_> = arr
                     .iter()
                     .enumerate()
-                    .map(|(i, v)| emit_yaml_value(v, comments.at_index(i), config, depth, true))
+                    .map(|(i, v)| emit_yaml_value(v, comments.at_index(i), config, indent, true))
                     .collect();
                 format!("[{}]", items.join(", "))
             } else {
                 // Block style sequence
-                let indent = config.indent_str.repeat(depth);
                 let items: Vec<_> = arr
                     .iter()
                     .enumerate()
                     .map(|(i, v)| {
                         let elem_comments = comments.at_index(i);
-                        let item = emit_yaml_value(v, elem_comments, config, depth + 1, false);
-                        // Check if it's a multi-line value (mapping or sequence)
-                        if matches!(v, OwnedValue::Object(_) | OwnedValue::Array(_))
-                            && !item.starts_with('[')
-                            && !item.starts_with('{')
+                        if matches!(v, OwnedValue::Object(o) if !o.is_empty())
+                            || matches!(v, OwnedValue::Array(a) if !a.is_empty())
                         {
-                            // Multi-line value - emit nested content which
-                            // handles its own indentation. The element's own
-                            // comment goes on its own line rather than
-                            // glued onto its last grandchild's line (#793).
-                            let item = append_own_comment_line(
-                                item,
+                            // A non-empty mapping/sequence element renders
+                            // in real yq's "compact" form: `- ` shares its
+                            // line with the value's own first field/
+                            // element, and the rest of the value's own
+                            // content aligns under that first line's
+                            // content (`indent` plus the 2-character width
+                            // of `- `), not under `indent` plus a full
+                            // `config.indent_str` step like an ordinary
+                            // nested block (#785).
+                            //
+                            // `emit_yaml_value` derives every line's own
+                            // indent purely from the `indent` string it's
+                            // handed, so rendering the element at
+                            // `compact_indent` and then stripping that
+                            // exact prefix from just the start of the
+                            // result (leaving every subsequent line's own
+                            // copy of the prefix untouched) reproduces the
+                            // "no separate indent for the first line"
+                            // effect `stream_yaml_value`'s cursor-based
+                            // sibling gets for free from its per-field/
+                            // per-element loop only indenting 2nd+ items.
+                            let compact_indent = format!("{indent}  ");
+                            let rendered =
+                                emit_yaml_value(v, elem_comments, config, &compact_indent, false);
+                            // The element's own comment goes on its own
+                            // line rather than glued onto its last
+                            // grandchild's line (#793).
+                            let rendered = append_own_comment_line(
+                                rendered,
                                 elem_comments.own(),
-                                &config.indent_str.repeat(depth + 1),
+                                &compact_indent,
                             );
-                            format!("{indent}-\n{item}")
+                            let first_line = rendered
+                                .strip_prefix(compact_indent.as_str())
+                                .unwrap_or(&rendered);
+                            format!("{indent}- {first_line}")
                         } else {
+                            let val_indent = format!("{indent}{}", config.indent_str);
+                            let item =
+                                emit_yaml_value(v, elem_comments, config, &val_indent, false);
                             let comment_suffix = trailing_comment_suffix(elem_comments);
                             format!("{indent}- {item}{comment_suffix}")
                         }
@@ -1274,14 +1311,13 @@ fn emit_yaml_value(
                     .iter()
                     .map(|(k, v)| {
                         let key = yaml_quote_key(k);
-                        let val = emit_yaml_value(v, comments.field(k), config, depth, true);
+                        let val = emit_yaml_value(v, comments.field(k), config, indent, true);
                         format!("{key}: {val}")
                     })
                     .collect();
                 format!("{{{}}}", entries.join(", "))
             } else {
                 // Block style mapping
-                let indent = config.indent_str.repeat(depth);
                 let entries: Vec<_> = if config.sort_keys {
                     let mut sorted: Vec<_> = obj.iter().collect();
                     sorted.sort_by(|a, b| a.0.cmp(b.0));
@@ -1296,6 +1332,7 @@ fn emit_yaml_value(
                         let key = yaml_quote_key(k);
                         let field_comments = comments.field(k);
                         let comment_suffix = trailing_comment_suffix(field_comments);
+                        let val_indent = format!("{indent}{}", config.indent_str);
                         // Check if value needs to be on next line
                         if matches!(v, OwnedValue::Object(m) if !m.is_empty())
                             || matches!(v, OwnedValue::Array(a) if !a.is_empty())
@@ -1306,16 +1343,15 @@ fn emit_yaml_value(
                             let key_comment_suffix = comments
                                 .key_comment(k)
                                 .map_or_else(String::new, |c| format!(" {c}"));
-                            // For nested containers, emit at depth+1 which
-                            // handles its own indentation. The value's own
-                            // comment goes on its own line rather than
-                            // glued onto its last grandchild's line (#793).
-                            let val = emit_yaml_value(v, field_comments, config, depth + 1, false);
-                            let val = append_own_comment_line(
-                                val,
-                                field_comments.own(),
-                                &config.indent_str.repeat(depth + 1),
-                            );
+                            // For nested containers, emit one `config.indent_str`
+                            // step deeper, which handles its own indentation.
+                            // The value's own comment goes on its own line
+                            // rather than glued onto its last grandchild's
+                            // line (#793).
+                            let val =
+                                emit_yaml_value(v, field_comments, config, &val_indent, false);
+                            let val =
+                                append_own_comment_line(val, field_comments.own(), &val_indent);
                             format!("{indent}{key}:{key_comment_suffix}\n{val}")
                         } else if let Some(kc) = comments.key_comment_if_value_absent(k) {
                             // The deferred value materialized as nothing at
@@ -1323,7 +1359,8 @@ fn emit_yaml_value(
                             // no value token, matching real yq (#765).
                             format!("{indent}{key}: {kc}")
                         } else {
-                            let val = emit_yaml_value(v, field_comments, config, depth + 1, false);
+                            let val =
+                                emit_yaml_value(v, field_comments, config, &val_indent, false);
                             // The value's own comment takes priority; fall
                             // back to the key's own comment when the value
                             // has none - covers an explicit key's trailing
@@ -3369,20 +3406,20 @@ mod tests {
 
         let nan = OwnedValue::NumberLiteral(NumberRepr::Float(f64::NAN), "nan".into());
         assert_eq!(
-            emit_yaml_value(&nan, &CommentTree::empty(), &config, 0, false),
+            emit_yaml_value(&nan, &CommentTree::empty(), &config, "", false),
             ".nan"
         );
 
         let pos_inf = OwnedValue::NumberLiteral(NumberRepr::Float(f64::INFINITY), "1e400".into());
         assert_eq!(
-            emit_yaml_value(&pos_inf, &CommentTree::empty(), &config, 0, false),
+            emit_yaml_value(&pos_inf, &CommentTree::empty(), &config, "", false),
             ".inf"
         );
 
         let neg_inf =
             OwnedValue::NumberLiteral(NumberRepr::Float(f64::NEG_INFINITY), "-1e400".into());
         assert_eq!(
-            emit_yaml_value(&neg_inf, &CommentTree::empty(), &config, 0, false),
+            emit_yaml_value(&neg_inf, &CommentTree::empty(), &config, "", false),
             "-.inf"
         );
     }
@@ -3432,7 +3469,7 @@ mod tests {
         // Flow style renders compactly and drops every trailing comment,
         // whether on the nested object or its field - unlike block style.
         assert_eq!(
-            emit_yaml_value(&value, &comments, &config, 0, true),
+            emit_yaml_value(&value, &comments, &config, "", true),
             "[{k: 1}]"
         );
     }
