@@ -6776,6 +6776,40 @@ mod tests {
     }
 
     #[test]
+    fn test_stream_yaml_sequence_item_anchor_stays_deferred_785() {
+        // An anchor written on the item's own line (`- &x\n  ...`) occupies
+        // the compact slot `stream_yaml_value`'s Sequence arm otherwise
+        // gives to the value's first field/element, so the mapping stays
+        // deferred to its own indented line rather than going compact -
+        // matching real yq (verified against v4.53.3). Covers the
+        // `cursor.anchor()` branch `stream_yaml_value`'s Sequence arm added
+        // for #785.
+        let yaml = b"- &x\n  a: 1\n  b: 2\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let mut out = String::new();
+        index
+            .root(yaml)
+            .stream_yaml_document(&mut out, IndentSpec::spaces(2), false)
+            .unwrap();
+        assert_eq!(out, "- &x\n  a: 1\n  b: 2");
+    }
+
+    #[test]
+    fn test_stream_yaml_sequence_item_anchor_stays_deferred_slurp_785() {
+        // Same as `test_stream_yaml_sequence_item_anchor_stays_deferred_785`,
+        // exercised through `stream_yaml_sequence` (the `--slurp` fast
+        // path) instead of `stream_yaml_value`'s Sequence arm - covers the
+        // equivalent `cursor.anchor()` branch added there for parity.
+        let bytes_a = b"&x\n  a: 1\n  b: 2\n".to_vec();
+        let index_a = YamlIndex::build(&bytes_a).unwrap();
+        let cursor_a = index_a.root(&bytes_a).first_child().unwrap();
+
+        let mut out = String::new();
+        stream_yaml_sequence([cursor_a], &mut out, 0, 2, ' ', false).unwrap();
+        assert_eq!(out, "- &x\n  a: 1\n  b: 2");
+    }
+
+    #[test]
     fn test_stream_yaml_flow_mapping_sorts_keys_with_nonstring_key() {
         // `-S` with `IndentSpec::COMPACT` (forces flow style regardless of
         // source style, since `indent.width == 0`) and a non-string key,
