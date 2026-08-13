@@ -5892,7 +5892,13 @@ fn builtin_implode<W: Clone + AsRef<[u64]>>(
                 };
                 // jq substitutes U+FFFD for any codepoint char::from_u32 rejects
                 // (surrogates, >0x10FFFF, negative), rather than erroring.
-                result.push(char::from_u32(codepoint as u32).unwrap_or('\u{FFFD}'));
+                // `u32::try_from` (not `as`) so a codepoint outside u32's range
+                // fails instead of wrapping into some other valid codepoint.
+                let c = u32::try_from(codepoint)
+                    .ok()
+                    .and_then(char::from_u32)
+                    .unwrap_or('\u{FFFD}');
+                result.push(c);
             }
             QueryResult::Owned(OwnedValue::String(result))
         }
