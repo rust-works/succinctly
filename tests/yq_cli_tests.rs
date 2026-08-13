@@ -1778,6 +1778,21 @@ fn test_yaml_merge_key_override() -> Result<()> {
     Ok(())
 }
 
+/// #835: `merge_sources`'s `<<: [...]` sequence-of-sources arm pushed the
+/// unresolved sequence-item wrapper `uncons_cursor` yields for a totally
+/// bare `-` source (rather than the mapping it defers to), so
+/// `merge_field_into`'s `source.first_child()` read the wrapper's one
+/// child - the mapping node itself - in place of its first key, silently
+/// dropping every field the bare-dash source would have contributed.
+#[test]
+fn test_yaml_merge_key_bare_dash_deferred_source_expands_712_835() -> Result<()> {
+    let input = "item:\n  <<:\n    -\n      a: 1\n      b: 2\n  c: 3\n";
+    let (output, exit_code) = run_yq_stdin(".item", input, &["-o", "json", "-I0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), r#"{"a":1,"b":2,"c":3}"#);
+    Ok(())
+}
+
 #[test]
 fn test_yaml_anchor_alias_without_merge() -> Result<()> {
     // Regular anchors/aliases (not merge keys) should work
@@ -1846,6 +1861,22 @@ fn test_yaml_assign_through_anchor_updates_multiple_aliases() -> Result<()> {
     let (output, exit_code) = run_yq_stdin(".a = 99", input, &["-o=json", "-I=0"])?;
     assert_eq!(exit_code, 0);
     assert_eq!(output.trim(), r#"{"a":99,"b":99,"c":99}"#);
+    Ok(())
+}
+
+/// #835: `walk_alias_groups` (the sync bookkeeping this whole family relies
+/// on) read `cursor.anchor()` on the unresolved sequence-item wrapper
+/// `uncons_cursor` yields for a totally bare `-` item, so an anchor written
+/// on its own deferred line was never registered - `.items[0].x = 99` wrote
+/// only the anchor's own copy and left the alias stale. Same root cause as
+/// the mapping-truncation bug this issue was originally filed for, just at
+/// a different call site.
+#[test]
+fn test_yaml_assign_through_bare_dash_deferred_anchor_updates_alias_835() -> Result<()> {
+    let input = "items:\n-\n  &base\n  x: 1\n- *base\n";
+    let (output, exit_code) = run_yq_stdin(".items[0].x = 99", input, &["-o=json", "-I=0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), r#"{"items":[{"x":99},{"x":99}]}"#);
     Ok(())
 }
 
@@ -5904,6 +5935,22 @@ fn test_anchor_builtin_empty_when_no_anchor() -> Result<()> {
     assert_eq!(code, 0);
     assert_eq!(output.trim(), "\"\"");
 
+    Ok(())
+}
+
+/// #835: the generic jq/yq evaluator navigates `.[n]`/`.[]` via
+/// `DocumentElements::uncons_cursor` (the `DocumentElements` trait impl,
+/// distinct from `YamlElements`' own inherent method of the same name,
+/// which several internal callers need to stay raw/unresolved). Before this
+/// fix that trait method hadn't been overridden to resolve a totally bare
+/// `-` sequence-item wrapper, so `anchor` on a bare-dash-deferred anchored
+/// value returned empty instead of the real name.
+#[test]
+fn test_anchor_builtin_bare_dash_deferred_anchor_835() -> Result<()> {
+    let input = "-\n  &x\n  a: 1\n";
+    let (output, code) = run_yq_stdin(".[0] | anchor", input, &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "x");
     Ok(())
 }
 

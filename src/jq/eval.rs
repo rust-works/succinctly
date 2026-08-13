@@ -17316,7 +17316,13 @@ fn yaml_value_to_owned<W: Clone + AsRef<[u64]>>(
         }
         YamlValue::Sequence(mut elements) => {
             let mut items = Vec::new();
-            while let Some((elem_cursor, rest)) = elements.uncons_cursor() {
+            // `uncons_resolved_cursor`, not `uncons_cursor`: the recursive
+            // call's own `cursor.explicit_tag()` above doesn't resolve a
+            // bare `-` sequence-item wrapper itself, so an unresolved
+            // cursor here would silently drop an explicit tag on a
+            // bare-dash-deferred scalar loaded via the `load()` builtin
+            // (#835).
+            while let Some((elem_cursor, rest)) = elements.uncons_resolved_cursor() {
                 items.push(yaml_value_to_owned(elem_cursor));
                 elements = rest;
             }
@@ -33631,6 +33637,32 @@ mod tests {
                         assert_eq!(obj.get("d"), Some(&OwnedValue::Float(12.5)));
                         assert_eq!(obj.get("e"), Some(&OwnedValue::String("1".to_string())));
                         assert_eq!(obj.get("f"), Some(&OwnedValue::String("5".to_string())));
+                    }
+                    other => panic!("unexpected result: {other:?}"),
+                }
+            });
+        }
+
+        #[test]
+        fn test_load_yaml_explicit_tag_on_bare_dash_deferred_sequence_item_835() {
+            // #835: `yaml_value_to_owned`'s `Sequence` arm used to walk
+            // elements via the raw `uncons_cursor` (rather than
+            // `uncons_resolved_cursor`), and its own `explicit_tag()` check
+            // doesn't resolve a bare `-` sequence-item wrapper itself (a
+            // deliberate hot-path perf trade-off elsewhere) - so a totally
+            // bare `-` item's own explicit tag, deferred to the next line,
+            // was silently dropped: `!!str 5` loaded as the number `5`
+            // instead of the string `"5"`.
+            let yaml = "-\n  !!str 5\n";
+            with_temp_file("load_test_bare_dash_tag_835.yaml", yaml, |path| {
+                let json_bytes: &[u8] = b"null";
+                let index = JsonIndex::build(json_bytes);
+                let cursor = index.root(json_bytes);
+                let query = format!(r#"load("{path}")"#);
+                let expr = parse(&query).unwrap();
+                match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+                    QueryResult::Owned(OwnedValue::Array(items)) => {
+                        assert_eq!(items, vec![OwnedValue::String("5".to_string())]);
                     }
                     other => panic!("unexpected result: {other:?}"),
                 }
