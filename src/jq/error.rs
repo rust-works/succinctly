@@ -64,8 +64,9 @@ pub enum Control {
 }
 
 /// How an owned-evaluation helper's expression stopped: a genuine error that
-/// `try`/`catch` may handle and `?` may suppress, or a `halt` that nothing may
-/// catch (#791).
+/// `try`/`catch` may handle and `?` may suppress, a `break $label` unwinding
+/// to some enclosing `label` (#824), or a `halt` that nothing may catch
+/// (#791).
 ///
 /// This is the error type of `result_to_owned`, `eval_owned_multi` and the
 /// other `eval.rs` helpers that evaluate a sub-expression to owned values. An
@@ -75,17 +76,40 @@ pub enum Control {
 /// error, and review kept finding missed sites. Carrying the two cases as
 /// distinct variants makes that mistake unrepresentable — an `EvalError` can
 /// no longer *be* a halt, so only an explicit wildcard arm can misroute one.
+/// `Break` was added later for the same reason: before #824, every consumer
+/// of this type had no choice but to fold a `Control::Break` it received into
+/// a synthetic `EvalError::new("break $label not in label")` — correct only
+/// when nothing outside actually catches it, and wrong (loud, wrongly-worded,
+/// wrongly-exit-coded) whenever a matching `label` sits further out, e.g.
+/// across a `path(...)` call boundary. Not every caller of this type has been
+/// audited to propagate `Break` correctly yet — `result_to_owned` and
+/// `eval_owned_expr` still collapse it into that same synthetic error by
+/// design, matching this type's `eval_owned_expr_ctrl`/`eval_owned_expr`
+/// split (#575's precedent: a `_ctrl`-suffixed twin that preserves
+/// [`Control`] losslessly exists at the few call sites that have been made to
+/// need it). Only `eval_owned_multi`/`eval_owned_multi_first` and
+/// `resolve_node`'s own arms (in `eval.rs`) have been updated to propagate a
+/// real `Break` so far, which is what `path()`, and the computed-key path
+/// this type also drives for `=`/`|=`/`del()`, needed. Auditing every
+/// `result_to_owned`/`eval_owned_expr` call site for the same fix is tracked
+/// separately (#833) — it is used far more broadly than path-context
+/// resolution, so it needs its own review rather than riding along here.
 ///
 /// Consumers should write `Err(EvalEscape::Error(e))` for the catchable case
 /// and let everything else flow through the `From` conversions into
-/// `QueryResult`/[`Control`], which preserve `Halt` by construction. Never
-/// write `Err(_) => …-that-discards` — that is the one remaining way to lose
-/// a halt.
+/// `QueryResult`/[`Control`], which preserve `Halt`/`Break` by construction.
+/// Never write `Err(_) => …-that-discards` — that is the one remaining way to
+/// lose a halt or a break addressed to an outer label.
 #[derive(Debug, Clone, PartialEq)]
 pub enum EvalEscape {
     /// A genuine evaluation error — catchable by `try`/`catch`, suppressible
     /// by `?`.
     Error(EvalError),
+    /// `break $label`, still looking for a `label $label` to catch it (#824).
+    /// Every consumer that has not been specifically updated to propagate
+    /// this should keep converting it to a synthetic "break $label not in
+    /// label" `Error` — see this type's own doc comment.
+    Break(String),
     /// `halt`/`halt_error(n)`: exit the whole process with this code. Must
     /// reach the CLI unconditionally; never catchable, never suppressible.
     Halt(i32),
@@ -103,10 +127,21 @@ impl From<EvalError> for Control {
     }
 }
 
+impl From<Control> for EvalEscape {
+    fn from(control: Control) -> Self {
+        match control {
+            Control::Error(e) => Self::Error(e),
+            Control::Break(label) => Self::Break(label),
+            Control::Halt(code) => Self::Halt(code),
+        }
+    }
+}
+
 impl From<EvalEscape> for Control {
     fn from(escape: EvalEscape) -> Self {
         match escape {
             EvalEscape::Error(e) => Self::Error(e),
+            EvalEscape::Break(label) => Self::Break(label),
             EvalEscape::Halt(code) => Self::Halt(code),
         }
     }

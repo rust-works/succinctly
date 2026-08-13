@@ -229,6 +229,7 @@ impl<W> From<EvalEscape> for QueryResult<'_, W> {
     fn from(escape: EvalEscape) -> Self {
         match escape {
             EvalEscape::Error(e) => QueryResult::Error(e),
+            EvalEscape::Break(label) => QueryResult::Break(label),
             EvalEscape::Halt(code) => QueryResult::Halt(code),
         }
     }
@@ -9518,9 +9519,16 @@ fn eval_owned_multi<S: EvalSemantics>(
 ) -> Result<Vec<OwnedValue>, EvalEscape> {
     match eval_owned_input::<Vec<u64>, S>(expr, input, false) {
         QueryResult::Error(e) => Err(e.into()),
-        QueryResult::Break(label) => {
-            Err(EvalError::new(format!("break ${label} not in label")).into())
-        }
+        // A `break $label` aborts this expression exactly like `Error`
+        // above — whatever a resolve-node caller was accumulating before
+        // this sub-expression is a separate concern it already handles via
+        // its own `PathResolveResult` prefix, not something this helper
+        // tries to preserve. Propagated as [`EvalEscape::Break`] rather than
+        // collapsed into a synthetic "break $label not in label" `Error`, so
+        // a `label` sitting outside the caller (e.g. across a `path(...)`
+        // call boundary) still catches it instead of seeing a bogus error
+        // (#824).
+        QueryResult::Break(label) => Err(EvalEscape::Break(label)),
         // A halt must abort this expression exactly like `Error`/`Break`
         // above rather than falling into `collect_owned()`'s "no outputs"
         // treatment below — that would make `del(.[(halt_error(3))])` or a
@@ -9529,9 +9537,10 @@ fn eval_owned_multi<S: EvalSemantics>(
         // can catch or suppress it as if it were an error.
         QueryResult::Halt(code) => Err(EvalEscape::Halt(code)),
         QueryResult::Partial(_, Control::Error(e)) => Err(e.into()),
-        QueryResult::Partial(_, Control::Break(label)) => {
-            Err(EvalError::new(format!("break ${label} not in label")).into())
-        }
+        // Same reasoning as the bare `Break` arm above: the prefix this
+        // particular sub-stream produced before breaking is not this
+        // helper's to keep (#824).
+        QueryResult::Partial(_, Control::Break(label)) => Err(EvalEscape::Break(label)),
         QueryResult::Partial(_, Control::Halt(code)) => Err(EvalEscape::Halt(code)),
         other => Ok(other.collect_owned()),
     }
@@ -9556,9 +9565,19 @@ fn eval_owned_multi_first<S: EvalSemantics>(
 ) -> Result<Vec<OwnedValue>, EvalEscape> {
     match eval_owned_input::<Vec<u64>, S>(expr, input, false) {
         QueryResult::Error(e) => Err(e.into()),
-        QueryResult::Break(label) => {
-            Err(EvalError::new(format!("break ${label} not in label")).into())
-        }
+        // A *bare* break — nothing produced before it — has no prefix to
+        // fall back to, so it must propagate rather than becoming a
+        // synthetic "not in label" error: `label $out | (.a |= (break
+        // $out))` with the label outside produces no output at all in real
+        // jq (the break unwinds the whole expression, including the update
+        // that never got a value to write), not a raised error (#824,
+        // mirroring the bare-`Halt` case below). A `Partial`'s
+        // trailing break, by contrast, is exactly the "just give me the
+        // prefix" case this function's doc comment already covers — the
+        // `other` arm below keeps producing the update filter's first
+        // output and silently drops the break, which is what real jq does
+        // too (confirmed live: `.a |= (2, break $out)` is `{"a":2}`).
+        QueryResult::Break(label) => Err(EvalEscape::Break(label)),
         // Unlike a `Partial`'s trailing control (kept as "just give me the
         // prefix" per this function's doc comment, since real jq's `_modify`
         // never evaluates far enough to see it), a *bare* halt has no prior
@@ -9708,6 +9727,15 @@ fn resolve_node<'a, S: EvalSemantics>(expr: &Expr, value: &'a OwnedValue) -> Pat
                 // not a path expression, not a value error raised while
                 // collecting one (confirmed live: `path(("a")?)` still
                 // raises in jq).
+                //
+                // A `break $label` is pruned the same unconditional way,
+                // regardless of which label it targets — jq's `?`/bare `try`
+                // (no `catch`) always intercepts a break passing through
+                // (confirmed live: `label $out | ((.a, break $out)?)` is `1`
+                // and exits 0, never reaching `$out`; the value-position
+                // evaluator's `eval_try` already applies the same rule, #562)
+                // — never something to re-raise like the invalid-path-
+                // expression carve-out above.
                 let branches = match resolve_node::<S>(inner, value) {
                     Ok(branches) => branches,
                     // Only a genuine collection failure prunes to the
@@ -9718,6 +9746,7 @@ fn resolve_node<'a, S: EvalSemantics>(expr: &Expr, value: &'a OwnedValue) -> Pat
                     Err((prefix, EvalEscape::Error(e))) if !e.is_invalid_path_expression() => {
                         prefix
                     }
+                    Err((prefix, EvalEscape::Break(_))) => prefix,
                     Err(escape) => return Err(escape),
                 };
                 Ok(branches
@@ -9921,47 +9950,47 @@ fn resolve_node<'a, S: EvalSemantics>(expr: &Expr, value: &'a OwnedValue) -> Pat
             Ok(branches) => Ok(branches),
             // `halt`/`halt_error(n)` is never caught by `try`/`catch`, in
             // path expressions any more than in value position (#791) —
-            // only a genuine error reaches `catch` (or the no-catch
-            // prefix-keeping fallback below); everything else propagates
-            // unchanged, as does an invalid-path-expression complaint
-            // (#530).
+            // only a genuine error or a break (below) reaches `catch`;
+            // everything else propagates unchanged, as does an
+            // invalid-path-expression complaint (#530).
             Err((prefix, EvalEscape::Error(e))) if !e.is_invalid_path_expression() => {
-                match catch {
-                    // No catch: keep whatever was already resolved before
-                    // the failure (confirmed live: `path(try (.a, .b[0]))`
-                    // prints `["a"]` and stops), same as `?`'s matching fix
-                    // above.
-                    None => Ok(prefix),
-                    // `e.payload()` is a fresh, function-local `OwnedValue`
-                    // (the error consumes itself to produce it) — it cannot
-                    // lend a reference with this function's own `'a`, so
-                    // resolution against it goes through
-                    // `resolve_against_cow`, which forces the result back to
-                    // `Cow::Owned` before it escapes. `prefix` must still be
-                    // kept ahead of the handler's own output (confirmed
-                    // live: `path(try (.a, .x[0]) catch empty)` on
-                    // `{"a":1,"x":5}` prints `["a"]`, not nothing) --
-                    // `catch`'s handler runs in addition to, not instead of,
-                    // whatever the failed `try` body already resolved.
-                    Some(catch_expr) => {
-                        let mut out = prefix;
-                        out.extend(resolve_against_cow::<S>(
-                            catch_expr,
-                            Cow::Owned(e.payload()),
-                        )?);
-                        Ok(out)
-                    }
-                }
+                resolve_catch::<S>(catch.as_deref(), prefix, e.payload())
+            }
+            // `catch` catches a `break` the same way it catches a raised
+            // error, regardless of which label it targets — jq's own rule
+            // (#562, already applied by the value-position `eval_try`),
+            // mirrored here for path context (#824): confirmed live,
+            // `label $out | path(try (.a, break $out) catch "x")` prints the
+            // prefix `["a"]` and then raises the catch handler's own
+            // `"x"` as an invalid-path-expression (#530) — the break never
+            // reaches `$out` at all. Real jq binds the handler's input to
+            // its internal break marker, which `null` stands in for here,
+            // same as `eval_try` already does.
+            Err((prefix, EvalEscape::Break(_))) => {
+                resolve_catch::<S>(catch.as_deref(), prefix, OwnedValue::Null)
             }
             Err(escape) => Err(escape),
         },
 
-        // `label $x | body`: transparent. Path-tracking has no notion of
-        // `break` to catch here — an unmatched `break` inside `body` will
-        // already surface as an ordinary `EvalError` via `eval_owned_multi`
-        // (see its doc comment), which propagates as any other resolution
-        // failure would.
-        Expr::Label { body, .. } => resolve_node::<S>(body, value),
+        // `label $x | body`: catches a `break` targeting this exact label
+        // while resolving `body`, mirroring the value-position `eval_label`'s
+        // `QueryResult::Break`/`Partial(_, Control::Break(_))` handling —
+        // keeping whatever branches already resolved before the break, same
+        // "prefix survives, only the escape is caught" rule every other arm
+        // in this resolver already follows (#824). Confirmed live:
+        // `path(label $out | (.a, break $out))` is `["a"]`, not an error, and
+        // — unlike a label sitting *outside* `path(...)`, which this same fix
+        // lets `EvalEscape::Break` reach — evaluation continues normally
+        // after `path(...)` returns rather than unwinding any further.
+        //
+        // A non-matching break (a different label, still meant for something
+        // further out) is not this arm's to catch, so it propagates
+        // unchanged along with every other escape.
+        Expr::Label { name, body } => match resolve_node::<S>(body, value) {
+            Ok(branches) => Ok(branches),
+            Err((prefix, EvalEscape::Break(label))) if label == *name => Ok(prefix),
+            Err(escape) => Err(escape),
+        },
 
         // `E as $x | body`: bind each output of `E` into `body` by
         // substitution — reusing `substitute_var`, already relied on for
@@ -9991,12 +10020,17 @@ fn resolve_node<'a, S: EvalSemantics>(expr: &Expr, value: &'a OwnedValue) -> Pat
             }
             match trailing {
                 None => Ok(out),
-                Some(Control::Error(e)) => Err((out, EvalEscape::Error(e))),
-                Some(Control::Break(label)) => Err((
-                    out,
-                    EvalEscape::Error(EvalError::new(format!("break ${label} not in label"))),
-                )),
-                Some(Control::Halt(code)) => Err((out, EvalEscape::Halt(code))),
+                // `Control::into()` (via `From<Control> for EvalEscape`)
+                // preserves every variant losslessly, `Break` included —
+                // propagated as a real `EvalEscape::Break` rather than
+                // collapsed into a synthetic "not in label" error, so a
+                // `label` outside this `as`-binding's enclosing `path(...)`
+                // call still catches it (#824) — confirmed live:
+                // `label $out | path((1, break $out) as $x | .a)` on
+                // `{"a":1}` prints `["a"]` (the `$x=1` iteration's own
+                // `body` resolution, already in `out`) and exits cleanly,
+                // never raising the bogus error this arm used to produce.
+                Some(control) => Err((out, control.into())),
             }
         }
 
@@ -10039,12 +10073,23 @@ fn resolve_node<'a, S: EvalSemantics>(expr: &Expr, value: &'a OwnedValue) -> Pat
 
 /// Resolve `n; expr`'s `n` the same way `eval_limit` does, then take that
 /// many resolved branches of `expr`.
+///
+/// Uses `eval_owned_expr_ctrl` (which preserves [`Control`] losslessly, the
+/// same #575 precedent `resolve_node`'s other arms rely on), not the
+/// `eval_owned_expr` that collapses a `break` into a synthetic "not in
+/// label" error — this call sits directly in `resolve_node`'s own domain
+/// (unlike the far more broadly-shared `eval_owned_expr` call sites #833
+/// tracks), so there is no reason to leave `limit(n; f)`'s own `n` bound
+/// carrying #824's bug after every other arm here was fixed: verified live,
+/// `label $out | path(limit(break $out; .a))` on `{"a":1}` now produces no
+/// output, exit 0, matching real jq exactly.
 fn resolve_limit<'a, S: EvalSemantics>(
     n_expr: &Expr,
     expr: &Expr,
     value: &'a OwnedValue,
 ) -> PathResolveResult<'a> {
-    let n_value = eval_owned_expr::<S>(n_expr, value, false).map_err(|e| (Vec::new(), e))?;
+    let n_value = eval_owned_expr_ctrl::<S>(n_expr, value, false)
+        .map_err(|control| (Vec::new(), control.into()))?;
     let n = match n_value {
         OwnedValue::Int(i) | OwnedValue::NumberLiteral(NumberRepr::Int(i), _) if i >= 0 => {
             i as usize
@@ -10205,6 +10250,42 @@ fn resolve_against_cow<'a, S: EvalSemantics>(
                 e,
             )),
         },
+    }
+}
+
+/// Apply `Expr::Try`'s `catch` clause (if any) after `expr` failed to
+/// resolve as a path, keeping `prefix` — whatever `expr` had already
+/// resolved before the failure — ahead of the handler's own output. Shared
+/// by `resolve_node`'s `Expr::Try` arm's `Error` and `Break` cases, which
+/// differ only in what `payload` binds to: the raised error's own value for
+/// an ordinary failure, `null` for a `break` (mirroring the value-position
+/// `eval_try`'s treatment of jq's internal break marker, since #562's rule
+/// is "catch catches break the same way it catches error").
+///
+/// A no-catch `try` (or bare `?`, sugar for one) keeps just `prefix`
+/// (confirmed live: `path(try (.a, .b[0]))` prints `["a"]` and stops).
+/// With a `catch`, `catch_expr` resolves as a path expression too, and its
+/// output is appended after `prefix` — `catch`'s handler runs in addition
+/// to, not instead of, whatever the failed body already resolved (confirmed
+/// live: `path(try (.a, .x[0]) catch empty)` on `{"a":1,"x":5}` prints
+/// `["a"]`, not nothing).
+///
+/// If `catch_expr` itself then fails, the `?` below returns its `Err`
+/// directly, losing `prefix` rather than threading it into the returned
+/// tuple — a separate, pre-existing gap in this same arm (#832), not fixed
+/// here.
+fn resolve_catch<'a, S: EvalSemantics>(
+    catch: Option<&Expr>,
+    prefix: Vec<PathBranch<'a>>,
+    payload: OwnedValue,
+) -> PathResolveResult<'a> {
+    match catch {
+        None => Ok(prefix),
+        Some(catch_expr) => {
+            let mut out = prefix;
+            out.extend(resolve_against_cow::<S>(catch_expr, Cow::Owned(payload))?);
+            Ok(out)
+        }
     }
 }
 
@@ -14479,7 +14560,50 @@ fn builtin_paths_filter<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     Err(EvalEscape::Halt(code)) => {
                         return partial(filtered_paths, Control::Halt(code));
                     }
-                    Err(EvalEscape::Error(_)) => {}
+                    // The `Break` half of this pattern is structurally dead
+                    // code today: `eval_owned_expr` (unlike `resolve_node`'s
+                    // own `eval_owned_multi`-based sites, which #824 fixed)
+                    // always collapses a `Control::Break` into a *synthetic*
+                    // `EvalEscape::Error("break $label not in label")`
+                    // internally before returning, so this call can never
+                    // actually produce `Err(EvalEscape::Break(_))`.
+                    //
+                    // That does NOT mean `paths(node_filter)` is safe from
+                    // #824's bug class, though — a `break` in `filter` still
+                    // reaches here, just disguised as that synthetic `Error`,
+                    // and the `Error(_)` half right below swallows it
+                    // silently (grouped with every other pre-existing,
+                    // already-accepted error-swallowing case here) instead of
+                    // unwinding to its label. Confirmed live: `label $out |
+                    // [paths(if .==2 then break $out else true end)]` on
+                    // `{"a":1,"b":{"c":2}}` prints `[["a"],["b"]]` here,
+                    // where real jq prints nothing at all (the break cancels
+                    // the whole `[...]` construction). `builtin_paths_filter`
+                    // does not resolve `filter` through `resolve_node` at
+                    // all, so it never got any part of #824's fix — this is
+                    // the same pre-existing gap #833 already tracks for
+                    // `eval_owned_expr`'s other call sites, not a regression
+                    // from this PR. Left as a plain comment rather than
+                    // `todo!()`/`unreachable!()`: the observable bug is
+                    // already live via `Error(_)` regardless of what happens
+                    // to the dead `Break(_)` sub-pattern, so a panic here
+                    // would not catch #833 landing — it would just crash a
+                    // call that already silently mishandles this case.
+                    //
+                    // FLAG FOR #833: once `eval_owned_expr` is changed to
+                    // propagate a real `Break` instead of synthesizing this
+                    // error, the `Break(_)` half of this pattern stops being
+                    // dead code and starts silently swallowing breaks
+                    // directly (same wrong observable result, new
+                    // mechanism) unless this arm is revisited then to decide
+                    // what `paths(node_filter)` should actually do with one
+                    // — most likely propagate it the way `resolve_node`'s
+                    // own arms do post-#824, not fold it into "just skip
+                    // this node." Re-confirmed independently by multiple
+                    // review passes during #824 (see PR #834's discussion)
+                    // as a real, easy-to-miss follow-on risk, not a
+                    // hypothetical one.
+                    Err(EvalEscape::Error(_) | EvalEscape::Break(_)) => {}
                 }
             }
         }
@@ -21061,16 +21185,16 @@ mod tests {
 
     #[test]
     fn eval_owned_multi_propagates_a_partial_break() {
-        // `1, break $foo` with no enclosing `label $foo` in scope produces
-        // `Partial([1], Control::Break("foo"))` -- same fix as the error
-        // case, folded into the same synthetic "break $label not in label"
-        // `EvalError` the bare (non-`Partial`) `Break` arm already used.
+        // `1, break $foo` produces `Partial([1], Control::Break("foo"))`.
+        // Before #824, this was folded into a synthetic "break $label not
+        // in label" `EvalError` unconditionally, which was wrong whenever a
+        // `label $foo` actually sits outside this sub-expression's caller
+        // (e.g. across a `path(...)` call boundary) -- it now surfaces as a
+        // real `EvalEscape::Break` so that caller can decide, instead of
+        // this helper deciding for it.
         let expr = parse("1, break $foo").unwrap();
         let err = eval_owned_multi::<JqSemantics>(&expr, &OwnedValue::Null).unwrap_err();
-        let EvalEscape::Error(err) = err else {
-            panic!("expected EvalEscape::Error, got {err:?}");
-        };
-        assert!(err.message.contains("break $foo not in label"));
+        assert_eq!(err, EvalEscape::Break("foo".to_string()));
     }
 
     #[test]
@@ -21088,15 +21212,30 @@ mod tests {
     fn eval_owned_multi_first_propagates_a_bare_break() {
         // `break $foo` alone (no preceding output, so no `Partial` wrapper --
         // `eval_owned_input` returns a bare `QueryResult::Break` directly)
-        // still shares its own dedicated arm with the plain
-        // `eval_owned_multi`, unlike the `Partial` case above which
-        // `eval_owned_multi_first` deliberately keeps un-fixed.
+        // has no prefix to fall back to, so — like the bare `Error`/`Halt`
+        // arms — it must propagate as a real `EvalEscape::Break` rather than
+        // a synthetic "not in label" error (#824): `label $out | (.a |=
+        // (break $out))` with the label outside produces no output at all
+        // in real jq, not a raised error. Distinct from the `Partial` case
+        // below, which `eval_owned_multi_first` deliberately keeps dropping
+        // the trailing control from (jq's `_modify` never observes it).
         let expr = parse("break $foo").unwrap();
         let err = eval_owned_multi_first::<JqSemantics>(&expr, &OwnedValue::Null).unwrap_err();
-        let EvalEscape::Error(err) = err else {
-            panic!("expected EvalEscape::Error, got {err:?}");
-        };
-        assert!(err.message.contains("break $foo not in label"));
+        assert_eq!(err, EvalEscape::Break("foo".to_string()));
+    }
+
+    #[test]
+    fn eval_owned_multi_first_drops_partial_break_keeping_prefix() {
+        // `1, break $foo` produces `Partial([1], Control::Break("foo"))`.
+        // Unlike the bare-break case above, `eval_owned_multi_first` keeps
+        // its old "just give me the prefix" policy for a `Partial` (#694):
+        // jq's `_modify` only ever observes the update filter's first
+        // output, so the trailing break must not surface here either --
+        // confirmed live, `.a |= (2, break $out)` is `{"a":2}` in real jq,
+        // not an error and not an unwind to `$out`.
+        let expr = parse("1, break $foo").unwrap();
+        let values = eval_owned_multi_first::<JqSemantics>(&expr, &OwnedValue::Null).unwrap();
+        assert_eq!(values, vec![OwnedValue::Int(1)]);
     }
 
     /// Evaluate `Identity`/`Field`/`Index` against an `OwnedValue` the way
