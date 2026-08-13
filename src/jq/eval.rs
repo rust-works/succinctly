@@ -9595,15 +9595,39 @@ type PathBranch<'a> = (Vec<Expr>, Cow<'a, OwnedValue>);
 type PathResolveResult<'a> = Result<Vec<PathBranch<'a>>, (Vec<PathBranch<'a>>, EvalEscape)>;
 
 /// Resolve one path node against one value, yielding a branch per output.
-fn resolve_node<'a, S: EvalSemantics>(expr: &Expr, value: &'a OwnedValue) -> PathResolveResult<'a> {
+///
+/// `trackable` is `false` for exactly one caller (`resolve_catch`, for the
+/// value `catch`'s handler binds to `.`) and `true` everywhere else —
+/// real jq never lets a `try`/`catch` handler treat its caught error/break
+/// payload as path-trackable, so any *genuine navigation* attempted against
+/// an untracked value (a field, an index, a slice, `.[]`, ...) must raise
+/// `#843`'s "near attempt" error immediately, before the navigation is
+/// even attempted, rather than only being caught once the handler's final
+/// output is checked. It threads unchanged through every combinator arm
+/// below that is not itself a navigation step — Comma, Paren, If,
+/// Alternative, Optional/Try, As, Select, the type filters, First/Limit,
+/// Label — because none of them touch the value; only the small set of
+/// arms that actually index into `value` (this function's own
+/// Field/Index/Slice dispatch in `resolve_leaf`, `IndexExpr`/`SliceExpr`,
+/// `Iterate`, `..`/`recurse`) consult it. `Expr::Builtin(GetPath(_))` is a
+/// deliberate exception: real jq treats a `getpath([...])` argument as the
+/// path itself, regardless of provenance (confirmed live:
+/// `path(try (.a, error([1,2,3])) catch getpath(["b"]))` raises the
+/// ordinary `Cannot index array with string "b"`, not a `#843` message),
+/// so that arm never reads `trackable` at all.
+fn resolve_node<'a, S: EvalSemantics>(
+    expr: &Expr,
+    value: &'a OwnedValue,
+    trackable: bool,
+) -> PathResolveResult<'a> {
     match expr {
-        Expr::Pipe(exprs) => resolve_seq::<S>(exprs, value),
-        Expr::Paren(inner) => resolve_node::<S>(inner, value),
+        Expr::Pipe(exprs) => resolve_seq::<S>(exprs, value, trackable),
+        Expr::Paren(inner) => resolve_node::<S>(inner, value, trackable),
 
         Expr::Comma(exprs) => {
             let mut out = Vec::new();
             for e in exprs {
-                match resolve_node::<S>(e, value) {
+                match resolve_node::<S>(e, value, trackable) {
                     Ok(branches) => out.extend(branches),
                     Err((prefix, e)) => {
                         out.extend(prefix);
@@ -9629,13 +9653,15 @@ fn resolve_node<'a, S: EvalSemantics>(expr: &Expr, value: &'a OwnedValue) -> Pat
             // reach the blanket arm below. It cannot yet — the postfix `?` takes
             // a path expression and nothing else until #367 — but when it can,
             // this arm still wants to see only the bare shape.
-            Expr::IndexExpr { target, key } => resolve_index_expr::<S>(target, key, value, true),
+            Expr::IndexExpr { target, key } => {
+                resolve_index_expr::<S>(target, key, value, true, trackable)
+            }
 
             // `E[S:T]?` is the same bare shape for slice bounds: only a
             // failure to *slice* is covered, never `E`, `S`, or `T`'s own
             // evaluation — see `resolve_slice_expr`'s doc comment.
             Expr::SliceExpr { target, start, end } => {
-                resolve_slice_expr::<S>(target, start, end, value, true)
+                resolve_slice_expr::<S>(target, start, end, value, true, trackable)
             }
 
             // Every other `?`-wrapped node (`.foo?`, `.[0]?`, ...): evaluation
@@ -9672,7 +9698,7 @@ fn resolve_node<'a, S: EvalSemantics>(expr: &Expr, value: &'a OwnedValue) -> Pat
                 // evaluator's `eval_try` already applies the same rule, #562)
                 // — never something to re-raise like the invalid-path-
                 // expression carve-out above.
-                let branches = match resolve_node::<S>(inner, value) {
+                let branches = match resolve_node::<S>(inner, value, trackable) {
                     Ok(branches) => branches,
                     // Only a genuine collection failure prunes to the
                     // already-resolved prefix: `halt`/`halt_error(n)` is
@@ -9713,30 +9739,63 @@ fn resolve_node<'a, S: EvalSemantics>(expr: &Expr, value: &'a OwnedValue) -> Pat
         // `.[]` before a computed key has to be expanded to concrete
         // components, because each element continues with its own key.
         // `[path(.xs[] | .[.k])]` is `[["xs",0,"p"],["xs",1,"q"]]` in jq.
-        Expr::Iterate => match value {
-            OwnedValue::Array(items) => Ok(items
-                .iter()
-                .enumerate()
-                .map(|(i, v)| (vec![Expr::Index(i as i64)], Cow::Borrowed(v)))
-                .collect()),
-            OwnedValue::Object(map) => Ok(map
-                .iter()
-                .map(|(k, v)| (vec![Expr::Field(k.clone())], Cow::Borrowed(v)))
-                .collect()),
-            other => Err((Vec::new(), EvalError::cannot_iterate(other).into())),
-        },
+        //
+        // An untracked `value` (#843) raises unconditionally, before even
+        // checking whether `value` is a container at all — confirmed live,
+        // `path(try (.a, error(5)) catch .[])` on a caught *scalar* `5`
+        // still reports "near attempt to iterate through 5", never the
+        // ordinary "Cannot iterate over number".
+        Expr::Iterate => {
+            if !trackable {
+                return Err((
+                    Vec::new(),
+                    EvalError::invalid_path_expression_near_iterate(value).into(),
+                ));
+            }
+            match value {
+                OwnedValue::Array(items) => Ok(items
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| (vec![Expr::Index(i as i64)], Cow::Borrowed(v)))
+                    .collect()),
+                OwnedValue::Object(map) => Ok(map
+                    .iter()
+                    .map(|(k, v)| (vec![Expr::Field(k.clone())], Cow::Borrowed(v)))
+                    .collect()),
+                other => Err((Vec::new(), EvalError::cannot_iterate(other).into())),
+            }
+        }
 
-        Expr::IndexExpr { target, key } => resolve_index_expr::<S>(target, key, value, false),
+        Expr::IndexExpr { target, key } => {
+            resolve_index_expr::<S>(target, key, value, false, trackable)
+        }
 
         Expr::SliceExpr { target, start, end } => {
-            resolve_slice_expr::<S>(target, start, end, value, false)
+            resolve_slice_expr::<S>(target, start, end, value, false, trackable)
         }
 
         // `..` fans out to every node in the tree (pre-order, self before
         // children), so each needs its own Field/Index chain rather than the
         // verbatim `RecursiveDescent` the static-leaf arm below would
         // otherwise store — the very case #412 was filed for.
-        Expr::RecursiveDescent => Ok(resolve_recursive_descent(value)),
+        //
+        // Every spelling here (`..`, bare `recurse`/`recurse(f)`/
+        // `recurse(f;cond)`) shares jq's own recursive definition
+        // `def r: ., (f | r); r;` — the *first* value it ever emits is `.`
+        // itself, zero navigation performed. Against an untracked value
+        // (#843) that first output is already the whole answer: it is
+        // exactly the no-navigation case `#530`'s classic "with result"
+        // message covers, so every arm below raises that immediately,
+        // without ever running the fan-out (or even evaluating `f`/`cond`)
+        // — confirmed live, `path(try (.a, error([1,2,3])) catch ..)` *and*
+        // `catch recurse(.[0])` both report "Invalid path expression with
+        // result [1,2,3]", not a "near attempt" message.
+        Expr::RecursiveDescent => {
+            if !trackable {
+                return Err((Vec::new(), EvalError::invalid_path_expression(value).into()));
+            }
+            Ok(resolve_recursive_descent(value))
+        }
 
         // Bare `recurse` *is* `..` — jq defines it as `recurse(.[]?)` and
         // `[recurse]` and `[..]` agree output for output. Sharing `..`'s
@@ -9746,12 +9805,26 @@ fn resolve_node<'a, S: EvalSemantics>(expr: &Expr, value: &'a OwnedValue) -> Pat
         // *write* (`get_path_mut`, `update_path`, `delete_at_path`) then have
         // to unwrap. They do, but there is no reason to make them.
         Expr::Builtin(Builtin::Recurse | Builtin::RecurseDown) => {
+            if !trackable {
+                return Err((Vec::new(), EvalError::invalid_path_expression(value).into()));
+            }
             Ok(resolve_recursive_descent(value))
         }
         // The parameterised spellings have no such shortcut: `f` is arbitrary,
-        // so the queue has to run.
-        Expr::Builtin(Builtin::RecurseF(f)) => resolve_recurse::<S>(f, None, value),
-        Expr::Builtin(Builtin::RecurseCond(f, cond)) => resolve_recurse::<S>(f, Some(cond), value),
+        // so the queue has to run — except when untracked, where (per the
+        // doc comment above) it never even starts.
+        Expr::Builtin(Builtin::RecurseF(f)) => {
+            if !trackable {
+                return Err((Vec::new(), EvalError::invalid_path_expression(value).into()));
+            }
+            resolve_recurse::<S>(f, None, value)
+        }
+        Expr::Builtin(Builtin::RecurseCond(f, cond)) => {
+            if !trackable {
+                return Err((Vec::new(), EvalError::invalid_path_expression(value).into()));
+            }
+            resolve_recurse::<S>(f, Some(cond), value)
+        }
 
         // `select(f)` and the typeof filters (`objects`, `arrays`, ...) add no
         // path component of their own — they either pass a branch through
@@ -9797,7 +9870,7 @@ fn resolve_node<'a, S: EvalSemantics>(expr: &Expr, value: &'a OwnedValue) -> Pat
         // parser path. Keeping both arms means it does not matter which one
         // a given call site produces.
         Expr::FirstExpr(inner) | Expr::Builtin(Builtin::FirstStream(inner)) => {
-            Ok(resolve_node::<S>(inner, value)?
+            Ok(resolve_node::<S>(inner, value, trackable)?
                 .into_iter()
                 .take(1)
                 .collect())
@@ -9827,7 +9900,7 @@ fn resolve_node<'a, S: EvalSemantics>(expr: &Expr, value: &'a OwnedValue) -> Pat
                 } else {
                     else_branch
                 };
-                match resolve_node::<S>(branch, value) {
+                match resolve_node::<S>(branch, value, trackable) {
                     Ok(branches) => out.extend(branches),
                     Err((prefix, e)) => {
                         out.extend(prefix);
@@ -9846,12 +9919,12 @@ fn resolve_node<'a, S: EvalSemantics>(expr: &Expr, value: &'a OwnedValue) -> Pat
         // `//` only substitutes for falsy/absent output, never for a raised
         // error, and the `?` here already gives us that for free.
         Expr::Alternative(left, right) => {
-            let branches: Vec<PathBranch<'a>> = resolve_node::<S>(left, value)?
+            let branches: Vec<PathBranch<'a>> = resolve_node::<S>(left, value, trackable)?
                 .into_iter()
                 .filter(|(_, v)| v.is_truthy())
                 .collect();
             if branches.is_empty() {
-                resolve_node::<S>(right, value)
+                resolve_node::<S>(right, value, trackable)
             } else {
                 Ok(branches)
             }
@@ -9863,8 +9936,8 @@ fn resolve_node<'a, S: EvalSemantics>(expr: &Expr, value: &'a OwnedValue) -> Pat
         // from jq (e.g. a negative `n`), which is that function's bug to
         // fix, not this resolver's. Both internal spellings reach here for
         // the same reason as `first` above.
-        Expr::Limit { n, expr } => resolve_limit::<S>(n, expr, value),
-        Expr::Builtin(Builtin::Limit(n, expr)) => resolve_limit::<S>(n, expr, value),
+        Expr::Limit { n, expr } => resolve_limit::<S>(n, expr, value, trackable),
+        Expr::Builtin(Builtin::Limit(n, expr)) => resolve_limit::<S>(n, expr, value, trackable),
 
         // `try expr catch handler` (and `expr?`, sugar for `try expr`):
         // resolve `expr`; if that fails and there is no `catch`, prune the
@@ -9877,12 +9950,12 @@ fn resolve_node<'a, S: EvalSemantics>(expr: &Expr, value: &'a OwnedValue) -> Pat
         // `path(try 1 catch "x")` still raises the same message rather than
         // running `"x"` — because it is a statement that the filter is not a
         // path expression at all, not a value `catch` can bind and inspect.
-        // (jq's own wording for the handler *also* failing as a path —
-        // `Invalid path expression near attempt to access ...` — is its own
-        // message shape this resolver does not reproduce; the ordinary
-        // `#530` message surfaces instead, which is still a loud error
-        // rather than a silent wrong answer.)
-        Expr::Try { expr, catch } => match resolve_node::<S>(expr, value) {
+        // (jq's own wording for the handler's *own* value failing as a path —
+        // `Invalid path expression near attempt to access ...` — used to be a
+        // message shape this resolver did not reproduce at all; `resolve_catch`
+        // below now raises it correctly by marking the handler's payload
+        // untracked, #843.)
+        Expr::Try { expr, catch } => match resolve_node::<S>(expr, value, trackable) {
             Ok(branches) => Ok(branches),
             // `halt`/`halt_error(n)` is never caught by `try`/`catch`, in
             // path expressions any more than in value position (#791) —
@@ -9922,7 +9995,7 @@ fn resolve_node<'a, S: EvalSemantics>(expr: &Expr, value: &'a OwnedValue) -> Pat
         // A non-matching break (a different label, still meant for something
         // further out) is not this arm's to catch, so it propagates
         // unchanged along with every other escape.
-        Expr::Label { name, body } => match resolve_node::<S>(body, value) {
+        Expr::Label { name, body } => match resolve_node::<S>(body, value, trackable) {
             Ok(branches) => Ok(branches),
             Err((prefix, EvalEscape::Break(label))) if label == *name => Ok(prefix),
             Err(escape) => Err(escape),
@@ -9946,7 +10019,7 @@ fn resolve_node<'a, S: EvalSemantics>(expr: &Expr, value: &'a OwnedValue) -> Pat
             let (bound_values, trailing) = eval_owned_expr_fork::<S>(expr, value, false);
             let mut out = Vec::new();
             for bound in bound_values {
-                match resolve_node::<S>(&substitute_var(body, var, &bound), value) {
+                match resolve_node::<S>(&substitute_var(body, var, &bound), value, trackable) {
                     Ok(branches) => out.extend(branches),
                     Err((body_prefix, escape)) => {
                         out.extend(body_prefix);
@@ -9979,9 +10052,23 @@ fn resolve_node<'a, S: EvalSemantics>(expr: &Expr, value: &'a OwnedValue) -> Pat
         // reproduces `getpath`'s own "Path must be specified as an array"
         // refusal for a single non-array argument, since that re-evaluates
         // the real `getpath` builtin).
+        //
+        // Deliberately *not* gated on `trackable` in general (#843): unlike
+        // every other arm above, real jq treats `getpath`'s argument as the
+        // path itself, provenance of `value` notwithstanding — confirmed
+        // live, `path(try (.a, error([1,2,3])) catch getpath(["b"]))` raises
+        // the ordinary `Cannot index array with string "b"`, never a
+        // "near attempt" message. The one exception is an *empty* array: a
+        // no-key `getpath([])` performs no navigation at all (it is exactly
+        // `.`), so it is checked the same way bare `Expr::Identity` is —
+        // confirmed live, `path(try (.a, error([1,2,3])) catch getpath([]))`
+        // raises `#530`'s classic "with result [1,2,3]".
         Expr::Builtin(Builtin::GetPath(arg)) => {
             let values = eval_owned_multi::<S>(arg, value).map_err(|e| (Vec::new(), e))?;
             if let [OwnedValue::Array(keys)] = values.as_slice() {
+                if !trackable && keys.is_empty() {
+                    return Err((Vec::new(), EvalError::invalid_path_expression(value).into()));
+                }
                 let mut components = Vec::new();
                 // Starts borrowed — an empty `keys` (a bare `getpath([])`)
                 // then costs nothing at all; each step after the first
@@ -10000,10 +10087,10 @@ fn resolve_node<'a, S: EvalSemantics>(expr: &Expr, value: &'a OwnedValue) -> Pat
                 }
                 return Ok(vec![(components, current)]);
             }
-            resolve_leaf::<S>(expr, value)
+            resolve_leaf::<S>(expr, value, trackable)
         }
 
-        other => resolve_leaf::<S>(other, value),
+        other => resolve_leaf::<S>(other, value, trackable),
     }
 }
 
@@ -10023,6 +10110,7 @@ fn resolve_limit<'a, S: EvalSemantics>(
     n_expr: &Expr,
     expr: &Expr,
     value: &'a OwnedValue,
+    trackable: bool,
 ) -> PathResolveResult<'a> {
     let n_value = eval_owned_expr_ctrl::<S>(n_expr, value, false)
         .map_err(|control| (Vec::new(), control.into()))?;
@@ -10040,10 +10128,28 @@ fn resolve_limit<'a, S: EvalSemantics>(
     if n == 0 {
         return Ok(Vec::new());
     }
-    Ok(resolve_node::<S>(expr, value)?
+    Ok(resolve_node::<S>(expr, value, trackable)?
         .into_iter()
         .take(n)
         .collect())
+}
+
+/// Convert a static, non-`Identity` path component into the `OwnedValue` jq
+/// embeds as the "element" half of its
+/// `Invalid path expression near attempt to access element ... of ...`
+/// message (#843) — a bare string for `Field`, a bare int for `Index`, or
+/// `{"start":s,"end":e}` for `Slice` (jq's own on-the-wire representation of
+/// a slice component, reused via `slice::literal_component` rather than
+/// hand-rolled here). `None` for `Identity` and anything else — `Identity`
+/// performs no navigation at all, so both call sites deliberately route it
+/// to the ordinary `#530` "with result" check instead.
+fn navigation_element(component: &Expr) -> Option<OwnedValue> {
+    match component {
+        Expr::Field(name) => Some(OwnedValue::String(name.clone())),
+        Expr::Index(i) => Some(OwnedValue::Int(*i)),
+        Expr::Slice { start, end } => Some(slice::literal_component(*start, *end)),
+        _ => None,
+    }
 }
 
 /// Resolve an ordinary (non-combinator) filter: keep it as one opaque path
@@ -10052,12 +10158,39 @@ fn resolve_limit<'a, S: EvalSemantics>(
 /// plain value-producing filter that is not a path expression at all —
 /// raising jq's `Invalid path expression` on its first output (#530). Zero
 /// outputs still prunes silently either way, matching `path(empty)` → `[]`.
-fn resolve_leaf<'a, S: EvalSemantics>(expr: &Expr, value: &'a OwnedValue) -> PathResolveResult<'a> {
+///
+/// `trackable == false` (#843) additionally makes `Field`/`Index`/`Slice`
+/// raise the "near attempt to access element ... of ..." error immediately,
+/// *before* `eval_owned_multi` below ever runs — so this fires even where
+/// the underlying access would merely be an ordinary type error (confirmed
+/// live: `path(try (.a, error("oops")) catch .foo)` on a caught *string*
+/// reports "near attempt to access element \"foo\" of \"oops\"", never the
+/// ordinary "Cannot index string with string \"foo\""). `Identity` is
+/// deliberately left out of that early check — it performs no navigation at
+/// all, so it falls through to the same eval-then-check path a non-primitive
+/// filter takes below (via the `trackable &&` guard just past it), which is
+/// exactly what makes a bare `catch .` raise `#530`'s classic "with result"
+/// message instead (confirmed live) rather than the "near attempt" one.
+fn resolve_leaf<'a, S: EvalSemantics>(
+    expr: &Expr,
+    value: &'a OwnedValue,
+    trackable: bool,
+) -> PathResolveResult<'a> {
+    if !trackable {
+        if let Some(element) = navigation_element(expr) {
+            return Err((
+                Vec::new(),
+                EvalError::invalid_path_expression_near_access(&element, value).into(),
+            ));
+        }
+    }
     let mut values = eval_owned_multi::<S>(expr, value).map_err(|e| (Vec::new(), e))?;
-    if matches!(
-        expr,
-        Expr::Identity | Expr::Field(_) | Expr::Index(_) | Expr::Slice { .. }
-    ) {
+    if trackable
+        && matches!(
+            expr,
+            Expr::Identity | Expr::Field(_) | Expr::Index(_) | Expr::Slice { .. }
+        )
+    {
         let mut components = Vec::new();
         push_path_components(&mut components, expr);
         return match values.len() {
@@ -10170,10 +10303,11 @@ fn push_recursive_branches<'a>(
 fn resolve_against_cow<'a, S: EvalSemantics>(
     expr: &Expr,
     current: Cow<'a, OwnedValue>,
+    trackable: bool,
 ) -> PathResolveResult<'a> {
     match current {
-        Cow::Borrowed(r) => resolve_node::<S>(expr, r),
-        Cow::Owned(v) => match resolve_node::<S>(expr, &v) {
+        Cow::Borrowed(r) => resolve_node::<S>(expr, r, trackable),
+        Cow::Owned(v) => match resolve_node::<S>(expr, &v, trackable) {
             Ok(branches) => Ok(branches
                 .into_iter()
                 .map(|(c, cv)| (c, Cow::Owned(cv.into_owned())))
@@ -10218,6 +10352,16 @@ fn resolve_against_cow<'a, S: EvalSemantics>(
 /// before raising `"x"`'s own #530 error, and
 /// `label $out | path(try (.a, break $out) catch error("y"))` on `{"a":1}`
 /// dropped `["a"]` before raising `"y"`).
+///
+/// `payload` is resolved with `trackable: false` (#843): real jq never lets
+/// `catch`'s handler treat the caught error/break value as path-trackable —
+/// any genuine navigation into it (even a single `.field`) raises jq's
+/// "near attempt to access ..." message immediately, regardless of whether
+/// the handler reached here via a caught `error(...)` or a caught `break`
+/// (confirmed live for both — see `resolve_node`'s doc comment on
+/// `trackable` for the full mechanism). A bare `catch .` (no navigation at
+/// all) still raises, just as the classic `#530` "with result" message
+/// instead, once `resolve_node`'s own leaf dispatch evaluates it.
 fn resolve_catch<'a, S: EvalSemantics>(
     catch: Option<&Expr>,
     prefix: Vec<PathBranch<'a>>,
@@ -10227,7 +10371,7 @@ fn resolve_catch<'a, S: EvalSemantics>(
         return Ok(prefix);
     };
     let mut out = prefix;
-    match resolve_against_cow::<S>(catch_expr, Cow::Owned(payload)) {
+    match resolve_against_cow::<S>(catch_expr, Cow::Owned(payload), false) {
         Ok(branches) => out.extend(branches),
         Err((branches, e)) => {
             out.extend(branches);
@@ -10367,8 +10511,13 @@ fn resolve_recurse<'a, S: EvalSemantics>(
         // like `builtin_recurse_f`/`builtin_recurse_cond`. Goes through
         // `resolve_against_cow`, not `resolve_node` directly, because
         // `current` may itself be a `Cow::Owned` value from an earlier
-        // step — see that function's doc comment (#668).
-        let (children, deferred_error) = match resolve_against_cow::<S>(f, current) {
+        // step — see that function's doc comment (#668). `trackable: true`
+        // is hardcoded rather than threaded as a parameter: every caller of
+        // this function in `resolve_node` already short-circuits before
+        // ever reaching here when the incoming value is untracked (#843's
+        // "recurse's first output is `.` itself" rule) — this loop only
+        // ever runs starting from a value that was already known-trackable.
+        let (children, deferred_error) = match resolve_against_cow::<S>(f, current, true) {
             Ok(children) => (children, None),
             Err((partial_children, e)) => (partial_children, Some(e)),
         };
@@ -10453,6 +10602,32 @@ fn type_filter_matches(builtin: &Builtin, value: &OwnedValue) -> bool {
     }
 }
 
+/// True if `target` is a pure passthrough — resolves to its input
+/// completely unchanged, with no path component of its own (`.`, `()`
+/// around it, or the empty/no-op `Expr::pipe` that a leading `.[EXPR]`/
+/// `.[S:T]` attaches as its `target`; see `push_bracket` in `parser.rs`).
+///
+/// Used only by [`resolve_index_expr`]/[`resolve_slice_expr`] to decide, for
+/// an untracked `value` (#843), whether *this* indexing/slicing step is the
+/// first real navigation attempted — raised here, using the actual computed
+/// key/bounds, rather than deferred to `target`'s own resolution. When
+/// `target` is anything else, resolving it through the general
+/// `resolve_node` recursion already raises first if it too reaches into the
+/// untracked value (e.g. `.a[.k]`'s `.a` — confirmed live, that raises
+/// "near attempt to access element \"a\" of ..." rather than naming `.k`'s
+/// resolved value at all), so this function never needs to re-check that
+/// case itself.
+///
+/// Reuses [`push_path_components`]'s own Identity/Pipe/Paren unwrapping
+/// rather than a bespoke `matches!` — `.[.k]` and `. | .[.k]` and `(.)[.k]`
+/// all name the same no-op target, and this is the one existing place in
+/// the file that already knows how to recognise that.
+fn is_passthrough_target(target: &Expr) -> bool {
+    let mut components = Vec::new();
+    push_path_components(&mut components, target);
+    components.is_empty()
+}
+
 /// Resolve `E[K]` in path context, with or without a trailing `?`.
 ///
 /// The two spellings differ in one thing only: what happens when the resolved
@@ -10475,12 +10650,22 @@ fn resolve_index_expr<'a, S: EvalSemantics>(
     key: &Expr,
     value: &'a OwnedValue,
     optional: bool,
+    trackable: bool,
 ) -> PathResolveResult<'a> {
     let keys = eval_owned_multi::<S>(key, value).map_err(|e| (Vec::new(), e))?;
     if keys.is_empty() {
         return Ok(Vec::new());
     }
-    let target_branches = resolve_node::<S>(target, value)?;
+    // #843: `target` is a no-op read of the untracked value itself, so the
+    // key computed above is the first real navigation attempted against it
+    // — see `is_passthrough_target`'s doc comment.
+    if !trackable && is_passthrough_target(target) {
+        return Err((
+            Vec::new(),
+            EvalError::invalid_path_expression_near_access(&keys[0], value).into(),
+        ));
+    }
+    let target_branches = resolve_node::<S>(target, value, trackable)?;
 
     // `out` accumulates in the exact order jq streams (key outer, target
     // inner — see the doc comment above), so a failure partway through
@@ -10565,6 +10750,7 @@ fn resolve_slice_expr<'a, S: EvalSemantics>(
     end: &Option<Box<Expr>>,
     value: &'a OwnedValue,
     optional: bool,
+    trackable: bool,
 ) -> PathResolveResult<'a> {
     let starts = resolve_slice_bound::<S>(start, value, f64::floor).map_err(|e| (Vec::new(), e))?;
     if starts.is_empty() {
@@ -10574,7 +10760,19 @@ fn resolve_slice_expr<'a, S: EvalSemantics>(
     if ends.is_empty() {
         return Ok(Vec::new());
     }
-    let target_branches = resolve_node::<S>(target, value)?;
+    // #843: same rule as `resolve_index_expr` above, for a slice's bounds
+    // instead of an index's key.
+    if !trackable && is_passthrough_target(target) {
+        return Err((
+            Vec::new(),
+            EvalError::invalid_path_expression_near_access(
+                &slice::literal_component(starts[0], ends[0]),
+                value,
+            )
+            .into(),
+        ));
+    }
+    let target_branches = resolve_node::<S>(target, value, trackable)?;
 
     let mut out = Vec::with_capacity(starts.len() * ends.len() * target_branches.len());
     for s in &starts {
@@ -10673,6 +10871,7 @@ fn value_after_components<S: EvalSemantics>(
 fn resolve_seq<'a, S: EvalSemantics>(
     exprs: &[Expr],
     value: &'a OwnedValue,
+    trackable: bool,
 ) -> PathResolveResult<'a> {
     let mut flat = Vec::new();
     for e in exprs {
@@ -10689,7 +10888,32 @@ fn resolve_seq<'a, S: EvalSemantics>(
     // *value* still has to be threaded through a purely static tail, because
     // an enclosing `IndexExpr` indexes it: in `.a[.k].b[.j]`, `.j` applies to
     // `.a[.k].b`.
+    //
+    // This fast path bypasses `resolve_node`/`resolve_leaf` entirely
+    // (`value_after_components` walks `flat` with plain `eval_owned_multi`),
+    // so an untracked `value` (#843) needs its own check here rather than
+    // inheriting `resolve_leaf`'s: `push_path_components` above already
+    // dropped every `Identity` from `flat` (see its doc comment), so an
+    // *empty* `flat` means the whole chain was a no-op (`.`, `. | .`, ...)
+    // — the ordinary `#530` "with result" case — while a *non-empty* one
+    // means `flat[0]` is the first real navigation attempted, using the
+    // untracked root `value` itself (confirmed live: `path(try (.a,
+    // error({a:{c:1}})) catch .a.b)` on the caught object reports "near
+    // attempt to access element \"a\" of {\"a\":{\"c\":1}}", not `.b`'s
+    // resolved value — jq never even computes `.a`'s result). A `flat[0]`
+    // that isn't `Field`/`Index`/`Slice` (e.g. `Expr::Optional` from a
+    // mid-chain `.a?.b`) is rare enough, and already `#498`-adjacent
+    // territory, that this falls back to the "with result" wording rather
+    // than growing a bespoke message for it — still a hard error either
+    // way, never the silent wrong-success #843 is about.
     let Some(last_dynamic) = flat.iter().rposition(needs_fanout_pass) else {
+        if !trackable {
+            let error = match flat.first().and_then(navigation_element) {
+                Some(element) => EvalError::invalid_path_expression_near_access(&element, value),
+                None => EvalError::invalid_path_expression(value),
+            };
+            return Err((Vec::new(), error.into()));
+        }
         let end = value_after_components::<S>(&flat, value).map_err(|e| (Vec::new(), e))?;
         return Ok(vec![(flat, Cow::Owned(end))]);
     };
@@ -10714,7 +10938,7 @@ fn resolve_seq<'a, S: EvalSemantics>(
         // full `'a` when it's still `Cow::Borrowed`, rather than capping it
         // at this loop iteration's own short borrow (#668).
         for (prefix, current) in branches {
-            match resolve_against_cow::<S>(element, current) {
+            match resolve_against_cow::<S>(element, current, trackable) {
                 Ok(resolved) => {
                     for (components, resulting) in resolved {
                         let mut path = prefix.clone();
@@ -10795,7 +11019,11 @@ fn resolve_dynamic_indexes<S: EvalSemantics>(
             .collect()
     }
 
-    match resolve_node::<S>(expr, input) {
+    // The document `path()`/`=`/`|=`/`del()` were actually called on is
+    // always fully trackable — the untracked marker (#843) exists only for
+    // the one value `resolve_catch` synthesizes internally for a `catch`
+    // handler, never for anything reaching this top-level entry point.
+    match resolve_node::<S>(expr, input, true) {
         Ok(branches) => Ok(assemble(branches)),
         Err((prefix, e)) => Err((assemble(prefix), e)),
     }
@@ -29524,6 +29752,222 @@ mod tests {
             QueryResult::Partial(vs, Control::Error(e)) => {
                 assert_eq!(prefix_json(&vs), [r#"["a"]"#]);
                 assert_eq!(e.message, "y");
+            }
+        );
+    }
+
+    /// #843: real jq never treats the value `catch`'s handler binds to `.`
+    /// as path-trackable — any genuine navigation into it (even a single
+    /// `.field`) raises jq's "near attempt to access ..." message
+    /// immediately, rather than succeeding the way an ordinary
+    /// freshly-navigated value would. Core repro from the issue: `.b`'s
+    /// resolution against the caught object must fail before `"z"` (a
+    /// second, unrelated `#530` case) is ever reached — confirmed against
+    /// jq 1.7.1: `path(try (.a, error({b:1,c:2})) catch (.b, "z"))` on
+    /// `{"a":10}` prints `["a"]` then raises
+    /// `Invalid path expression near attempt to access element "b" of
+    /// {"b":1,"c":2}`, never reaching `"z"`.
+    #[test]
+    fn test_path_catch_handler_field_access_raises_near_attempt_843() {
+        query!(br#"{"a":10}"#, r#"path(try (.a, error({"b":1,"c":2})) catch (.b, "z"))"#,
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(prefix_json(&vs), [r#"["a"]"#]);
+                assert!(!e.is_invalid_path_expression(), "{}", e.message);
+                assert_eq!(
+                    e.message,
+                    r#"Invalid path expression near attempt to access element "b" of {"b":1,"c":2}"#
+                );
+            }
+        );
+    }
+
+    /// #843, break variant: the same gap reaches path context through a
+    /// caught `break`, not just a caught `error` — both share
+    /// `resolve_catch`. succinctly's `null` stand-in for jq's internal break
+    /// marker (already documented on `resolve_catch`) means the container
+    /// named in the message is `null` rather than jq's own internal
+    /// representation; the issue that reported this explicitly calls that
+    /// difference out of scope (same underlying gap, not a second one).
+    #[test]
+    fn test_path_catch_handler_field_access_raises_near_attempt_on_break_843() {
+        query!(br#"{"a":1}"#, r#"label $out | path(try (.a, break $out) catch (.b, "z"))"#,
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(prefix_json(&vs), [r#"["a"]"#]);
+                assert_eq!(
+                    e.message,
+                    "Invalid path expression near attempt to access element \"b\" of null"
+                );
+            }
+        );
+    }
+
+    /// #843: a `catch` handler that performs *no* navigation at all (a bare
+    /// `.`) is still not path-trackable — it raises `#530`'s classic "with
+    /// result" message instead of the "near attempt" one, since there is no
+    /// navigation attempt to name. Confirmed against jq 1.7.1: `path(try
+    /// (.a, error({b:1})) catch .)` on `{"a":10}` prints `["a"]` then raises
+    /// `Invalid path expression with result {"b":1}`.
+    #[test]
+    fn test_path_catch_handler_bare_identity_raises_with_result_843() {
+        query!(br#"{"a":10}"#, r#"path(try (.a, error({"b":1})) catch .)"#,
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(prefix_json(&vs), [r#"["a"]"#]);
+                assert!(e.is_invalid_path_expression(), "{}", e.message);
+                assert_eq!(e.message, r#"Invalid path expression with result {"b":1}"#);
+            }
+        );
+    }
+
+    /// #843: `.[N]`/`.[S:T]`/`.[]` all raise the same family of error as
+    /// `.field` against an untracked value, each with jq's own wording —
+    /// index and slice reuse "near attempt to access element ... of ...",
+    /// but `.[]` gets its own "near attempt to iterate through ..." (no
+    /// "element" at all). Confirmed against jq 1.7.1.
+    #[test]
+    fn test_path_catch_handler_index_slice_iterate_raise_near_attempt_843() {
+        query!(br#"{"a":10}"#, r"path(try (.a, error([1,2,3])) catch .[0])",
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(prefix_json(&vs), [r#"["a"]"#]);
+                assert_eq!(
+                    e.message,
+                    "Invalid path expression near attempt to access element 0 of [1,2,3]"
+                );
+            }
+        );
+        query!(br#"{"a":10}"#, r"path(try (.a, error([1,2,3])) catch .[0:2])",
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(prefix_json(&vs), [r#"["a"]"#]);
+                assert_eq!(
+                    e.message,
+                    "Invalid path expression near attempt to access element {\"start\":0,... of [1,2,3]"
+                );
+            }
+        );
+        // The iterated-over value doesn't even need to be a container —
+        // real jq raises the same "near attempt" message rather than the
+        // ordinary "Cannot iterate over number" a value in normal (tracked)
+        // position would get.
+        query!(br#"{"a":10}"#, r"path(try (.a, error(5)) catch .[])",
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(prefix_json(&vs), [r#"["a"]"#]);
+                assert_eq!(
+                    e.message,
+                    "Invalid path expression near attempt to iterate through 5"
+                );
+            }
+        );
+    }
+
+    /// #843: `.[.k]` (a computed key applied directly to `.`) still raises
+    /// on the very first navigation attempt, naming the actual *computed*
+    /// key rather than deferring to `#530`'s generic "with result" — the
+    /// `Expr::IndexExpr` arm's own no-op-target special case
+    /// (`is_passthrough_target`). Confirmed against jq 1.7.1.
+    #[test]
+    fn test_path_catch_handler_computed_index_raises_near_attempt_843() {
+        query!(br#"{"a":10}"#, r#"path(try (.a, error({"b":1})) catch .[.k // "b"])"#,
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(prefix_json(&vs), [r#"["a"]"#]);
+                assert_eq!(
+                    e.message,
+                    r#"Invalid path expression near attempt to access element "b" of {"b":1}"#
+                );
+            }
+        );
+    }
+
+    /// #843: `..`/bare `recurse` share jq's own recursive definition
+    /// (`def r: ., (f | r); r;`) — their first-ever output is `.` itself,
+    /// zero navigation performed — so against an untracked value they raise
+    /// the same "with result" message a bare `.` does, never descending
+    /// into children (and never raising the "near attempt" wording).
+    /// Confirmed against jq 1.7.1.
+    #[test]
+    fn test_path_catch_handler_recursive_descent_raises_with_result_843() {
+        query!(br#"{"a":10}"#, r"path(try (.a, error([1,2,3])) catch ..)",
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(prefix_json(&vs), [r#"["a"]"#]);
+                assert!(e.is_invalid_path_expression(), "{}", e.message);
+                assert_eq!(e.message, "Invalid path expression with result [1,2,3]");
+            }
+        );
+    }
+
+    /// #843: `getpath([...])` is a deliberate exception — real jq treats
+    /// its argument as the path itself regardless of `.`'s provenance, so a
+    /// *non-empty* `getpath` still raises only the ordinary indexing error
+    /// (never the "near attempt" wording), while an *empty* `getpath([])`
+    /// — genuinely zero navigation, exactly like bare `.` — still raises
+    /// `#530`'s classic message. Confirmed against jq 1.7.1.
+    #[test]
+    fn test_path_catch_handler_getpath_843() {
+        query!(br#"{"a":10}"#, r#"path(try (.a, error([1,2,3])) catch getpath(["b"]))"#,
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(prefix_json(&vs), [r#"["a"]"#]);
+                assert_eq!(e.message, r#"Cannot index array with string "b""#);
+            }
+        );
+        query!(br#"{"a":10}"#, r"path(try (.a, error([1,2,3])) catch getpath([]))",
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(prefix_json(&vs), [r#"["a"]"#]);
+                assert!(e.is_invalid_path_expression(), "{}", e.message);
+                assert_eq!(e.message, "Invalid path expression with result [1,2,3]");
+            }
+        );
+    }
+
+    /// #843: unlike `#530`'s classic "with result" message (never suppressed
+    /// by `?`/`try`), the new "near attempt" error is an *ordinary*,
+    /// catchable error — confirmed live against jq 1.7.1:
+    /// `path(try (.a, error({b:1})) catch (.b)?)` prints only `["a"]`, no
+    /// error at all, and a *nested* `try .b catch "caught"` actually runs
+    /// `"caught"` rather than re-raising.
+    #[test]
+    fn test_path_catch_handler_near_attempt_is_suppressed_by_optional_843() {
+        assert_eq!(
+            outputs(
+                br#"{"a":10}"#,
+                r#"path(try (.a, error({"b":1})) catch (.b)?)"#
+            ),
+            vec![r#"["a"]"#]
+        );
+        query!(
+            br#"{"a":10}"#,
+            r#"path(try (.a, error({"b":1})) catch (try .b catch "caught"))"#,
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(prefix_json(&vs), [r#"["a"]"#]);
+                // The nested handler's own output ("caught") is itself not
+                // path-trackable -- ordinary #530, unrelated to #843 -- but
+                // reaching it at all proves the near-attempt error was
+                // actually caught rather than propagating straight through.
+                assert!(e.is_invalid_path_expression(), "{}", e.message);
+                assert_eq!(e.message, "Invalid path expression with result \"caught\"");
+            }
+        );
+    }
+
+    /// #843: unmodified `path()` against the document's own real values —
+    /// the overwhelmingly common case, and every existing `path(...)` test
+    /// in this module — must still resolve exactly as before; `trackable`
+    /// only ever turns false for the one value `resolve_catch` marks.
+    #[test]
+    fn test_path_ordinary_navigation_unaffected_by_843() {
+        query!(br#"{"a":{"b":1,"c":[2,3]}}"#, r"path(.a.b, .a.c[1])",
+            QueryResult::ManyOwned(paths) => {
+                assert_eq!(
+                    paths,
+                    vec![
+                        OwnedValue::Array(vec![
+                            OwnedValue::String("a".into()),
+                            OwnedValue::String("b".into()),
+                        ]),
+                        OwnedValue::Array(vec![
+                            OwnedValue::String("a".into()),
+                            OwnedValue::String("c".into()),
+                            OwnedValue::Int(1),
+                        ]),
+                    ]
+                );
             }
         );
     }

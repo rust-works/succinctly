@@ -523,6 +523,49 @@ impl EvalError {
 
     const INVALID_PATH_EXPRESSION_PREFIX: &'static str = "Invalid path expression with result ";
 
+    /// `Invalid path expression near attempt to access element <k> of <v>`
+    /// (#843).
+    ///
+    /// Raised by `path()` when a genuine navigation step (a field, a
+    /// literal/computed index, or a slice) is attempted against a value that
+    /// was not itself reached by real navigation from the expression's
+    /// original input — today, only the payload `catch` binds to `.` inside
+    /// its handler (`resolve_catch` in `eval.rs`). Unlike
+    /// [`Self::invalid_path_expression`] above (`?`/`try` never suppress
+    /// it), this is an *ordinary*, catchable error — confirmed live against
+    /// jq 1.7.1: `path(try (.a, error({b:1})) catch (.b)?)` prints only
+    /// `["a"]`, no error, and a *nested*
+    /// `try (.a, error({b:1})) catch (try .b catch "caught")` actually runs
+    /// `"caught"`. So this constructor deliberately does *not* participate
+    /// in [`Self::is_invalid_path_expression`].
+    pub fn invalid_path_expression_near_access(
+        element: &OwnedValue,
+        container: &OwnedValue,
+    ) -> Self {
+        Self::new(format!(
+            "Invalid path expression near attempt to access element {} of {}",
+            dump_truncated(element),
+            dump_truncated(container)
+        ))
+    }
+
+    /// `Invalid path expression near attempt to iterate through <v>` (#843).
+    ///
+    /// The `.[]`/`Expr::Iterate` sibling of
+    /// [`Self::invalid_path_expression_near_access`] — same trigger (a
+    /// genuine navigation attempt against an untracked value), same
+    /// catchable-not-`#530` status, just jq's distinct wording for
+    /// iteration rather than a keyed access (confirmed live:
+    /// `path(try (.a, error(5)) catch .[])` on a caught scalar `5` reports
+    /// "near attempt to iterate through 5", never "Cannot iterate over
+    /// number").
+    pub fn invalid_path_expression_near_iterate(container: &OwnedValue) -> Self {
+        Self::new(format!(
+            "Invalid path expression near attempt to iterate through {}",
+            dump_truncated(container)
+        ))
+    }
+
     /// Whether this is an [`Self::invalid_path_expression`] — a statement
     /// that the *filter* is not a path expression, not a runtime value
     /// error. `?` only suppresses failures raised while collecting a path
