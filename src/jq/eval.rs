@@ -14453,73 +14453,80 @@ fn builtin_paths_filter<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         if let OwnedValue::Array(path_arr) = &path {
             // Get the value at this path
             if let Some(val_at_path) = get_value_at_path(&owned, path_arr) {
-                // jq's `paths(node_filter)` is `path(recurse|select(node_filter))`:
-                // the path is kept whenever node_filter's result is truthy, not only
-                // when it's the literal boolean `true`. This matters for filters like
-                // `scalars`/`numbers`/`values` that yield the value itself rather than
-                // a boolean.
-                match eval_owned_expr::<S>(filter, &val_at_path, optional) {
-                    Ok(result) => {
-                        if result.is_truthy() {
-                            filtered_paths.push(path);
-                        }
+                // jq's `paths(node_filter)` is `path(recurse|select(node_filter))`,
+                // and `select(f)` is `if f then . else empty end` -- `if` forks
+                // over every output `f` produces, so a multi-output node_filter
+                // must be checked per-output, not collapsed into one value
+                // first. Confirmed against jq 1.7.1:
+                // `{"a":1,"b":{"c":2}} | [paths(false,false)]` is `[]`, and
+                // `[paths(true,true)]` duplicates every path, `[["a"],["a"],
+                // ["b"],["b"],["b","c"],["b","c"]]` -- not each path once
+                // (#773).
+                //
+                // `paths(node_filter)`'s own definition is `select(node_filter)`'s
+                // fan-out (`path(recurse|select(node_filter))`), and
+                // `push_truthiness` is the exact helper this codebase
+                // already uses for that fan-out shape (it backs `eval_if`/
+                // `builtin_select` via `eval_fanout`) -- collect one
+                // truthiness bit per output instead of collapsing them
+                // (matching `eval_owned_expr_fork`'s "keep every output"
+                // idiom that `reduce`/`foreach`/`while`/`until` build on,
+                // not the shared `eval_owned_multi` helper used by ~19
+                // *other* callers, whose contract collapses a `Partial`
+                // straight to `Err` and discards the outputs already
+                // produced -- correct there, #694, wrong here). A node's
+                // own truthy output(s) produced before an error/break/halt
+                // in the *same* node_filter fan-out must still be kept and
+                // counted once each. Confirmed against jq 1.7.1: `[1,"x",2]
+                // | paths(if type=="string" then (true, error("bad")) else
+                // true end)` streams `[0]`, `[1]`, then raises -- not just
+                // `[0]`.
+                //
+                // Once credited, `halt` propagates out of the whole builtin
+                // (#791, nothing may catch it); an ordinary error/break is
+                // swallowed and the loop moves to the next node instead --
+                // a pre-existing, documented divergence from real jq (which
+                // aborts the entire `paths(...)` call on an uncaught
+                // error/break, filed as a follow-up gap, #850) that this
+                // fix does not change. `break` specifically can never
+                // resolve to an outer `label` here regardless:
+                // `val_at_path` is re-indexed into an isolated synthetic
+                // document and evaluated on its own, so a `label` lexically
+                // enclosing the original `paths(...)` call is not part of
+                // the AST being evaluated. Real propagation would need
+                // `filter` resolved through `resolve_node`'s own machinery
+                // instead (as #824 did for its sites); tracked separately
+                // for every remaining `eval_owned_expr`-shaped call site,
+                // `paths(node_filter)` included, under #833.
+                //
+                // `optional` (this builtin's own parameter, not a
+                // hardcoded `false`) must reach this per-node evaluation
+                // too: `isvalid(EXPR)` forces `optional=true` all the way
+                // down (`builtin_isvalid`, not the `?`/`try` path, which
+                // never forces it here per #693) so that an internal
+                // optional-guarded operation like `.foo` on a scalar
+                // yields empty instead of erroring. Confirmed against jq
+                // 1.7.1-equivalent semantics and this codebase's own pre-
+                // #773 code: `{"a":1,"b":2} | isvalid(paths(.foo, true))`
+                // is `true` (`.foo` errors on the scalar node but is
+                // swallowed by the forced `optional`, so the trailing
+                // `true` output still fires for every node) -- hardcoding
+                // `false` here instead breaks that to `false`.
+                let mut truthiness = Vec::new();
+                let control = push_truthiness(
+                    eval_owned_input::<Vec<u64>, S>(filter, &val_at_path, optional),
+                    &mut truthiness,
+                );
+                for &truthy in &truthiness {
+                    if truthy {
+                        filtered_paths.push(path.clone());
                     }
-                    // Every other error here is pre-existing, silently
-                    // swallowed behavior this fix does not change (`if let
-                    // Ok(..)` above), but a halt must never be silently
-                    // ignored (#791): `paths(halt_error(3))` has to actually
-                    // halt, not just skip the node as if the filter were
-                    // falsy. Paths already matched before this node must
-                    // still be reported (#400/#494), matching real jq's
-                    // lazy streaming of paths(node_filter).
-                    Err(EvalEscape::Halt(code)) => {
-                        return partial(filtered_paths, Control::Halt(code));
-                    }
-                    // The `Break` half of this pattern is structurally dead
-                    // code today: `eval_owned_expr` (unlike `resolve_node`'s
-                    // own `eval_owned_multi`-based sites, which #824 fixed)
-                    // always collapses a `Control::Break` into a *synthetic*
-                    // `EvalEscape::Error("break $label not in label")`
-                    // internally before returning, so this call can never
-                    // actually produce `Err(EvalEscape::Break(_))`.
-                    //
-                    // That does NOT mean `paths(node_filter)` is safe from
-                    // #824's bug class, though — a `break` in `filter` still
-                    // reaches here, just disguised as that synthetic `Error`,
-                    // and the `Error(_)` half right below swallows it
-                    // silently (grouped with every other pre-existing,
-                    // already-accepted error-swallowing case here) instead of
-                    // unwinding to its label. Confirmed live: `label $out |
-                    // [paths(if .==2 then break $out else true end)]` on
-                    // `{"a":1,"b":{"c":2}}` prints `[["a"],["b"]]` here,
-                    // where real jq prints nothing at all (the break cancels
-                    // the whole `[...]` construction). `builtin_paths_filter`
-                    // does not resolve `filter` through `resolve_node` at
-                    // all, so it never got any part of #824's fix — this is
-                    // the same pre-existing gap #833 already tracks for
-                    // `eval_owned_expr`'s other call sites, not a regression
-                    // from this PR. Left as a plain comment rather than
-                    // `todo!()`/`unreachable!()`: the observable bug is
-                    // already live via `Error(_)` regardless of what happens
-                    // to the dead `Break(_)` sub-pattern, so a panic here
-                    // would not catch #833 landing — it would just crash a
-                    // call that already silently mishandles this case.
-                    //
-                    // FLAG FOR #833: once `eval_owned_expr` is changed to
-                    // propagate a real `Break` instead of synthesizing this
-                    // error, the `Break(_)` half of this pattern stops being
-                    // dead code and starts silently swallowing breaks
-                    // directly (same wrong observable result, new
-                    // mechanism) unless this arm is revisited then to decide
-                    // what `paths(node_filter)` should actually do with one
-                    // — most likely propagate it the way `resolve_node`'s
-                    // own arms do post-#824, not fold it into "just skip
-                    // this node." Re-confirmed independently by multiple
-                    // review passes during #824 (see PR #834's discussion)
-                    // as a real, easy-to-miss follow-on risk, not a
-                    // hypothetical one.
-                    Err(EvalEscape::Error(_) | EvalEscape::Break(_)) => {}
                 }
+                if let Some(Control::Halt(code)) = control {
+                    return partial(filtered_paths, Control::Halt(code));
+                }
+                // Error/Break: the prefix above is already credited;
+                // swallow the escape itself and move to the next node.
             }
         }
     }
@@ -27158,6 +27165,26 @@ mod tests {
                 QueryResult::Owned(OwnedValue::Bool(false)) => {}
             );
         }
+    }
+
+    /// #773 follow-up regression: `builtin_paths_filter`'s per-node
+    /// `node_filter` evaluation must receive `isvalid`'s forced
+    /// `optional = true` the same way every other builtin covered by
+    /// `test_isvalid_reaches_every_builtins_own_optional_guard` above does,
+    /// not a hardcoded `false`. `.foo` on a scalar node errors; with
+    /// `optional` correctly threaded, that error is swallowed (empty), so
+    /// `(.foo, true)` still emits `true` for every node and `paths(...)`
+    /// comes back non-empty -- `isvalid` reports `true`. A hardcoded
+    /// `false` here instead lets `.foo`'s error abort the whole per-node
+    /// comma, `paths(...)` comes back empty, and `isvalid` wrongly reports
+    /// `false`. Confirmed this matches the pre-#773 code's own behavior
+    /// (which forwarded `optional` correctly) by building that commit
+    /// directly.
+    #[test]
+    fn test_isvalid_reaches_paths_filters_own_optional_guard() {
+        query!(br#"{"a":1,"b":2}"#, r"isvalid(paths(.foo, true))",
+            QueryResult::Owned(OwnedValue::Bool(true)) => {}
+        );
     }
 
     // =========================================================================
