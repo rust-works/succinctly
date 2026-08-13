@@ -6652,11 +6652,14 @@ fn builtin_match<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // Check if global flag is set
     let global = flags.is_some_and(|f| f.contains('g'));
 
+    // Computed once per input rather than per match/offset (#806).
+    let input_is_ascii = input.is_ascii();
+
     if global {
         // Stream one match object per match (jq's match(re;"g") is a generator)
         let matches: Vec<OwnedValue> = global_captures(&re, &input)
             .iter()
-            .map(|caps| build_match_object(&re, caps))
+            .map(|caps| build_match_object(&re, caps, &input, input_is_ascii))
             .collect();
         if matches.is_empty() {
             QueryResult::None
@@ -6666,7 +6669,9 @@ fn builtin_match<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     } else {
         // Return first match, or no output (not `null`) when there's no match.
         match re.captures(&input) {
-            Some(caps) => QueryResult::Owned(build_match_object(&re, &caps)),
+            Some(caps) => {
+                QueryResult::Owned(build_match_object(&re, &caps, &input, input_is_ascii))
+            }
             None => QueryResult::None,
         }
     }
@@ -6704,16 +6709,55 @@ fn global_captures<'h>(re: &JqRegex, input: &'h str) -> Vec<regex::Captures<'h>>
     results
 }
 
-/// Build a jq match object from an already-obtained `Captures`.
+/// Convert a byte offset into `input` to the codepoint offset jq/oniguruma
+/// reports (`match`/`capture` positions are codepoints, not bytes -- #806).
+/// `input_is_ascii` is computed once per input string by the caller
+/// (`input.is_ascii()`), so this stays O(1) in the common all-ASCII case
+/// instead of re-scanning `input` on every offset conversion.
 #[cfg(feature = "regex")]
-fn build_match_object(re: &JqRegex, caps: &regex::Captures) -> OwnedValue {
+fn byte_to_char_offset(input: &str, input_is_ascii: bool, byte_offset: usize) -> i64 {
+    if input_is_ascii {
+        byte_offset as i64
+    } else {
+        input[..byte_offset].chars().count() as i64
+    }
+}
+
+/// Codepoint length of a matched substring -- oniguruma's `length` is in
+/// codepoints, not bytes (#806). Checked per-substring rather than reusing
+/// `input_is_ascii`: a non-ASCII document can still have plenty of
+/// pure-ASCII matches, each cheap to fast-path on its own.
+#[cfg(feature = "regex")]
+fn char_len(matched: &str) -> i64 {
+    if matched.is_ascii() {
+        matched.len() as i64
+    } else {
+        matched.chars().count() as i64
+    }
+}
+
+/// Build a jq match object from an already-obtained `Captures`.
+///
+/// `input` is the full haystack `caps` matched against, and `input_is_ascii`
+/// is `input.is_ascii()` computed once by the caller -- both needed to
+/// convert byte offsets to jq's codepoint offsets (#806).
+#[cfg(feature = "regex")]
+fn build_match_object(
+    re: &JqRegex,
+    caps: &regex::Captures,
+    input: &str,
+    input_is_ascii: bool,
+) -> OwnedValue {
     let m0 = caps
         .get(0)
         .expect("capture group 0 is always present on a match");
     let mut obj = IndexMap::new();
 
-    obj.insert("offset".to_string(), OwnedValue::Int(m0.start() as i64));
-    obj.insert("length".to_string(), OwnedValue::Int(m0.len() as i64));
+    obj.insert(
+        "offset".to_string(),
+        OwnedValue::Int(byte_to_char_offset(input, input_is_ascii, m0.start())),
+    );
+    obj.insert("length".to_string(), OwnedValue::Int(char_len(m0.as_str())));
     obj.insert(
         "string".to_string(),
         OwnedValue::String(m0.as_str().to_string()),
@@ -6738,15 +6782,21 @@ fn build_match_object(re: &JqRegex, caps: &regex::Captures) -> OwnedValue {
         // `(a)*` on "" (zero-length match) -> group 1 offset 0, string "".
         match caps.get(i) {
             Some(m) if !m.is_empty() => {
-                cap_obj.insert("offset".to_string(), OwnedValue::Int(m.start() as i64));
-                cap_obj.insert("length".to_string(), OwnedValue::Int(m.len() as i64));
+                cap_obj.insert(
+                    "offset".to_string(),
+                    OwnedValue::Int(byte_to_char_offset(input, input_is_ascii, m.start())),
+                );
+                cap_obj.insert("length".to_string(), OwnedValue::Int(char_len(m.as_str())));
                 cap_obj.insert(
                     "string".to_string(),
                     OwnedValue::String(m.as_str().to_string()),
                 );
             }
             Some(m) => {
-                cap_obj.insert("offset".to_string(), OwnedValue::Int(m.start() as i64));
+                cap_obj.insert(
+                    "offset".to_string(),
+                    OwnedValue::Int(byte_to_char_offset(input, input_is_ascii, m.start())),
+                );
                 cap_obj.insert(
                     "string".to_string(),
                     OwnedValue::String(m.as_str().to_string()),
@@ -6754,7 +6804,10 @@ fn build_match_object(re: &JqRegex, caps: &regex::Captures) -> OwnedValue {
                 cap_obj.insert("length".to_string(), OwnedValue::Int(0));
             }
             None if m0.is_empty() => {
-                cap_obj.insert("offset".to_string(), OwnedValue::Int(m0.start() as i64));
+                cap_obj.insert(
+                    "offset".to_string(),
+                    OwnedValue::Int(byte_to_char_offset(input, input_is_ascii, m0.start())),
+                );
                 cap_obj.insert("string".to_string(), OwnedValue::String(String::new()));
                 cap_obj.insert("length".to_string(), OwnedValue::Int(0));
             }
