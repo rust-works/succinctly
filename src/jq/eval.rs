@@ -29818,6 +29818,24 @@ mod tests {
         );
     }
 
+    /// #843, `resolve_seq`'s own leaf: `. | .` is a two-element
+    /// `Expr::Pipe` where both sides are `Identity`, so `push_path_components`
+    /// drops both and `resolve_seq`'s static-tail fast path runs with a
+    /// genuinely *empty* `flat` — a different code path than the bare `.`
+    /// case above (which never reaches `resolve_seq` at all, since a lone
+    /// `.` isn't wrapped in a `Pipe`). Same "with result" outcome either
+    /// way: zero navigation performed. Confirmed against jq 1.7.1.
+    #[test]
+    fn test_path_catch_handler_pipe_of_identities_raises_with_result_843() {
+        query!(br#"{"a":10}"#, r#"path(try (.a, error({"b":1})) catch (. | .))"#,
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(prefix_json(&vs), [r#"["a"]"#]);
+                assert!(e.is_invalid_path_expression(), "{}", e.message);
+                assert_eq!(e.message, r#"Invalid path expression with result {"b":1}"#);
+            }
+        );
+    }
+
     /// #843: `.[N]`/`.[S:T]`/`.[]` all raise the same family of error as
     /// `.field` against an untracked value, each with jq's own wording —
     /// index and slice reuse "near attempt to access element ... of ...",
@@ -29987,6 +30005,24 @@ mod tests {
                 assert_eq!(prefix_json(&vs), [r#"["a"]"#]);
                 assert!(e.is_invalid_path_expression(), "{}", e.message);
                 assert_eq!(e.message, "Invalid path expression with result [1,2,3]");
+            }
+        );
+    }
+
+    /// Not a #843 case at all (no `catch`/untracked value involved) — a
+    /// `getpath(...)` argument that doesn't evaluate to a literal array
+    /// falls through `resolve_node`'s `Builtin::GetPath` arm to the same
+    /// `resolve_leaf` a non-primitive filter gets, reproducing `getpath`'s
+    /// own "Path must be specified as an array" refusal (already documented
+    /// on that arm). Added alongside the #843 tests above only because nothing
+    /// in the pre-existing suite happened to exercise this exact fallback line.
+    /// Confirmed against jq 1.7.1: `path(getpath("not-array"))` raises this
+    /// message.
+    #[test]
+    fn test_path_getpath_non_array_argument_falls_through_to_resolve_leaf() {
+        query!(br#"{"a":10}"#, r#"path(getpath("not-array"))"#,
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "Path must be specified as an array");
             }
         );
     }
