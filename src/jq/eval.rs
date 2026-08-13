@@ -5892,7 +5892,14 @@ fn builtin_implode<W: Clone + AsRef<[u64]>>(
                 };
                 // jq substitutes U+FFFD for any codepoint char::from_u32 rejects
                 // (surrogates, >0x10FFFF, negative), rather than erroring.
-                result.push(char::from_u32(codepoint as u32).unwrap_or('\u{FFFD}'));
+                // `u32::try_from` (not `as`) so a codepoint outside u32's range
+                // fails instead of wrapping into some other valid codepoint.
+                result.push(
+                    u32::try_from(codepoint)
+                        .ok()
+                        .and_then(char::from_u32)
+                        .unwrap_or('\u{FFFD}'),
+                );
             }
             QueryResult::Owned(OwnedValue::String(result))
         }
@@ -25323,6 +25330,10 @@ mod tests {
     fn test_builtin_implode_boundary_table() {
         for (codepoint, expected) in [
             ("-1", "\u{FFFD}"), // negative -> replacement char
+            // large-magnitude negative: wraps to a spuriously "valid" low
+            // codepoint (100) under a naive `as u32` cast -- must still
+            // replace, not silently produce U+0064 ('d'). See #738.
+            ("-4294967196", "\u{FFFD}"),
             ("0", "\u{0}"),
             ("1", "\u{1}"),
             ("2", "\u{2}"),
