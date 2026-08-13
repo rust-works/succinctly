@@ -14453,25 +14453,42 @@ fn builtin_paths_filter<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         if let OwnedValue::Array(path_arr) = &path {
             // Get the value at this path
             if let Some(val_at_path) = get_value_at_path(&owned, path_arr) {
-                // jq's `paths(node_filter)` is `path(recurse|select(node_filter))`:
-                // the path is kept whenever node_filter's result is truthy, not only
-                // when it's the literal boolean `true`. This matters for filters like
-                // `scalars`/`numbers`/`values` that yield the value itself rather than
-                // a boolean.
-                match eval_owned_expr::<S>(filter, &val_at_path, optional) {
-                    Ok(result) => {
-                        if result.is_truthy() {
-                            filtered_paths.push(path);
+                // jq's `paths(node_filter)` is `path(recurse|select(node_filter))`,
+                // and `select(f)` is `if f then . else empty end` -- `if` forks
+                // over every output `f` produces, so a multi-output node_filter
+                // must be checked per-output, not collapsed into one value
+                // first. `eval_owned_multi` (not `eval_owned_expr`, which
+                // collapses 2+ outputs into one always-truthy `OwnedValue::Array`
+                // before any truthiness check ever runs) preserves that
+                // cardinality, and each truthy output re-adds this path -- once
+                // per truthy output, not once per matching node. Confirmed
+                // against jq 1.7.1: `{"a":1,"b":{"c":2}} | [paths(false,false)]`
+                // is `[]` (the bug this fixes), and `[paths(true,true)]`
+                // duplicates every path, `[["a"],["a"],["b"],["b"],["b","c"],
+                // ["b","c"]]` -- not each path once (#773).
+                match eval_owned_multi::<S>(filter, &val_at_path) {
+                    Ok(outputs) => {
+                        for out in &outputs {
+                            if out.is_truthy() {
+                                filtered_paths.push(path.clone());
+                            }
                         }
                     }
                     // Every other error here is pre-existing, silently
-                    // swallowed behavior this fix does not change (`if let
-                    // Ok(..)` above), but a halt must never be silently
-                    // ignored (#791): `paths(halt_error(3))` has to actually
-                    // halt, not just skip the node as if the filter were
-                    // falsy. Paths already matched before this node must
-                    // still be reported (#400/#494), matching real jq's
-                    // lazy streaming of paths(node_filter).
+                    // swallowed behavior this fix does not change (`Ok(..)`
+                    // above), but a halt must never be silently ignored
+                    // (#791): `paths(halt_error(3))` has to actually halt,
+                    // not just skip the node as if the filter were falsy.
+                    // Paths already matched before this node must still be
+                    // reported (#400/#494), matching real jq's lazy
+                    // streaming of paths(node_filter). `eval_owned_multi`
+                    // itself intercepts a mid-stream error/break exactly
+                    // like a bare one (see its doc comment) rather than
+                    // keeping the outputs already produced before it, so a
+                    // node_filter that fans out into a truthy output
+                    // followed by an ordinary error still drops the whole
+                    // node -- consistent with the pre-existing "swallow the
+                    // whole node on error" policy this fix does not change.
                     Err(EvalEscape::Halt(code)) => {
                         return partial(filtered_paths, Control::Halt(code));
                     }

@@ -7334,6 +7334,83 @@ fn test_paths_filter_still_swallows_ordinary_per_path_error() -> Result<()> {
     Ok(())
 }
 
+/// #773: `builtin_paths_filter` used to evaluate `node_filter` per path via
+/// `eval_owned_expr`, which collapses a multi-output result into a single
+/// `OwnedValue::Array` when it produces 2+ outputs. A non-empty array is
+/// always truthy in jq, so a `node_filter` with two falsy outputs (`false,
+/// false`) was wrapped into the truthy array `[false,false]` *before* the
+/// truthiness check ever ran, silently keeping every path. Verified against
+/// real jq 1.7.1: `{"a":1,"b":{"c":2}} | [paths(false,false)]` is `[]`.
+#[test]
+fn test_paths_filter_all_falsy_multi_output_keeps_nothing() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "[paths(false,false)]"],
+        Some(r#"{"a":1,"b":{"c":2}}"#),
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[]\n");
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
+/// Companion to the all-falsy test above, pinning the other half of #773's
+/// fix: the fan-out direction. jq's `paths(node_filter)` is
+/// `path(recurse|select(node_filter))`, and `select(f)` is literally
+/// `if f then . else empty end` in jq's own builtin.jq — `if` forks over
+/// every output its condition produces. So a multi-output `node_filter`
+/// with 2+ *truthy* outputs must duplicate the path once per truthy
+/// output, not keep it once regardless of how many outputs were truthy.
+/// Verified against real jq 1.7.1:
+/// `{"a":1,"b":{"c":2}} | [paths(true,true)]` is
+/// `[["a"],["a"],["b"],["b"],["b","c"],["b","c"]]` — every path duplicated,
+/// not deduplicated to one occurrence each.
+#[test]
+fn test_paths_filter_multi_truthy_output_duplicates_each_path() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "[paths(true,true)]"],
+        Some(r#"{"a":1,"b":{"c":2}}"#),
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(
+        stdout,
+        "[[\"a\"],[\"a\"],[\"b\"],[\"b\"],[\"b\",\"c\"],[\"b\",\"c\"]]\n"
+    );
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
+/// A single-truthy-output `node_filter` (the common case) must not
+/// duplicate — this is the control proving the fan-out fix above didn't
+/// overcorrect into always duplicating. Verified against real jq 1.7.1:
+/// `{"a":1,"b":{"c":2}} | [paths(true)]` is `[["a"],["b"],["b","c"]]`.
+#[test]
+fn test_paths_filter_single_truthy_output_does_not_duplicate() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", "[paths(true)]"], Some(r#"{"a":1,"b":{"c":2}}"#))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[[\"a\"],[\"b\"],[\"b\",\"c\"]]\n");
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
+/// Mixed truthy/falsy outputs (`true,false`) keep the path exactly once
+/// (one truthy output out of two), distinguishing this from both the
+/// all-falsy (#773's original repro) and all-truthy (duplicate) cases
+/// above. Verified against real jq 1.7.1:
+/// `{"a":1,"b":{"c":2}} | [paths(true,false)]` is
+/// `[["a"],["b"],["b","c"]]`.
+#[test]
+fn test_paths_filter_mixed_truthy_falsy_keeps_path_once() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "[paths(true,false)]"],
+        Some(r#"{"a":1,"b":{"c":2}}"#),
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[[\"a\"],[\"b\"],[\"b\",\"c\"]]\n");
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
 /// Distinct from `test_setpath_propagates_halt_in_path_argument` above,
 /// which hits `builtin_setpath`'s bare `QueryResult::Halt` arm (the path
 /// argument halts with zero prior output): this hits the
