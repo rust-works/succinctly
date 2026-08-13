@@ -33872,6 +33872,135 @@ mod tests {
         }
     }
 
+    #[test]
+    fn eval_assign_optional_swallows_ordinary_path_error_called_directly() {
+        // `eval_assign`'s own `optional` parameter governs `(PATH = VALUE)?`
+        // -- but any *reachable* top-level `?` around a whole assignment is
+        // also caught one layer up, by the ordinary `Expr::Optional`/
+        // `eval_try` machinery every `?` goes through (both here and in
+        // `eval_generic.rs`), which converts the exact same
+        // `QueryResult::Error` this function's `optional=false` fallback
+        // (`Err((_, escape)) => escape.into()`) would already produce into
+        // `None` regardless -- making the two arms behaviorally
+        // indistinguishable from any parseable `?`-wrapped query. Calling
+        // `eval_assign` directly with `optional: true` isolates its own
+        // `Err((_, EvalEscape::Error(_))) if optional => return
+        // QueryResult::None` arm instead, the same way the unreachable-from-
+        // CLI functions above are tested directly.
+        let json_bytes: &[u8] = br"null";
+        let index = JsonIndex::build(json_bytes);
+        let cursor = index.root(json_bytes);
+        let path_expr = parse(".[({})]").unwrap();
+        let value_expr = Expr::Literal(Literal::Int(1));
+        match eval_assign::<Vec<u64>, JqSemantics>(&path_expr, &value_expr, cursor.value(), true) {
+            QueryResult::None => {}
+            other => panic!("expected None, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn eval_update_optional_swallows_ordinary_path_error_called_directly() {
+        // `eval_update` sibling of the test above -- see its doc comment.
+        let json_bytes: &[u8] = br"null";
+        let index = JsonIndex::build(json_bytes);
+        let cursor = index.root(json_bytes);
+        let path_expr = parse(".[({})]").unwrap();
+        let filter_expr = Expr::Identity;
+        match eval_update::<Vec<u64>, JqSemantics>(&path_expr, &filter_expr, cursor.value(), true) {
+            QueryResult::None => {}
+            other => panic!("expected None, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn builtin_del_optional_swallows_ordinary_path_error_called_directly() {
+        // `builtin_del` sibling of the two tests above -- see
+        // `eval_assign_optional_swallows_ordinary_path_error_called_directly`'s
+        // doc comment.
+        let json_bytes: &[u8] = br"null";
+        let index = JsonIndex::build(json_bytes);
+        let cursor = index.root(json_bytes);
+        let path_expr = parse(".[({})]").unwrap();
+        match builtin_del::<Vec<u64>, JqSemantics>(&path_expr, cursor.value(), true) {
+            QueryResult::None => {}
+            other => panic!("expected None, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn builtin_limit_propagates_halt_from_expr_argument() {
+        // `Builtin::Limit` is never constructed by the parser: a CLI
+        // `limit(n; expr)` always parses through `parse_limit_expr` (matched
+        // before `try_parse_builtin` ever runs) into `Expr::Limit`, reaching
+        // `eval_limit` instead of `builtin_limit` -- the same
+        // parser-shadowing that makes `eval_nth_expr` above unreachable from
+        // any parseable query. `builtin_limit` is exercised directly here.
+        // Its main result match, bare `QueryResult::Halt(code)` arm: once
+        // `n` resolves cleanly, a bare halt from `expr` (no prior output)
+        // must come back as `Halt`, not be folded into a type error.
+        let json_bytes: &[u8] = br"[1, 2, 3]";
+        let index = JsonIndex::build(json_bytes);
+        let cursor = index.root(json_bytes);
+        let n_expr = Expr::Literal(Literal::Int(5));
+        let expr = parse("halt_error(9)").unwrap();
+        match builtin_limit::<Vec<u64>, JqSemantics>(&n_expr, &expr, cursor.value(), false) {
+            QueryResult::Halt(code) => assert_eq!(code, 9),
+            other => panic!("expected Halt(9), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn builtin_first_stream_propagates_bare_halt() {
+        // `Builtin::FirstStream` is never constructed by the parser: a CLI
+        // `first(expr)` always parses through `parse_first_expr` (matched
+        // before `try_parse_builtin` ever runs) into `Expr::FirstExpr`,
+        // reaching `eval_first_expr` instead -- same parser-shadowing as
+        // `builtin_limit` above. `builtin_first_stream`'s bare
+        // `QueryResult::Halt(code)` arm is exercised directly here.
+        let json_bytes: &[u8] = br"[1, 2, 3]";
+        let index = JsonIndex::build(json_bytes);
+        let cursor = index.root(json_bytes);
+        let expr = parse("halt_error(10)").unwrap();
+        match builtin_first_stream::<Vec<u64>, JqSemantics>(&expr, cursor.value(), false) {
+            QueryResult::Halt(code) => assert_eq!(code, 10),
+            other => panic!("expected Halt(10), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn builtin_last_stream_propagates_bare_halt() {
+        // `Builtin::LastStream` is never constructed by the parser: a CLI
+        // `last(expr)` always parses through `parse_last_expr` into
+        // `Expr::LastExpr`, reaching `eval_last_expr` instead -- same
+        // parser-shadowing as `builtin_limit`/`builtin_first_stream` above.
+        // `builtin_last_stream`'s bare `QueryResult::Halt(code)` arm is
+        // exercised directly here.
+        let json_bytes: &[u8] = br"[1, 2, 3]";
+        let index = JsonIndex::build(json_bytes);
+        let cursor = index.root(json_bytes);
+        let expr = parse("halt_error(11)").unwrap();
+        match builtin_last_stream::<Vec<u64>, JqSemantics>(&expr, cursor.value(), false) {
+            QueryResult::Halt(code) => assert_eq!(code, 11),
+            other => panic!("expected Halt(11), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn builtin_last_stream_propagates_halt_past_partial_prefix() {
+        // Same unreachable-from-CLI function as above, the
+        // `QueryResult::Partial(_, Control::Halt(code))` arm: `last` cannot
+        // short-circuit, so a prefix (`1`) produced before the halt is
+        // dropped, and only the halt surfaces.
+        let json_bytes: &[u8] = br"[1, 2, 3]";
+        let index = JsonIndex::build(json_bytes);
+        let cursor = index.root(json_bytes);
+        let expr = parse("(1, halt_error(12))").unwrap();
+        match builtin_last_stream::<Vec<u64>, JqSemantics>(&expr, cursor.value(), false) {
+            QueryResult::Halt(code) => assert_eq!(code, 12),
+            other => panic!("expected Halt(12), got {other:?}"),
+        }
+    }
+
     #[cfg(feature = "std")]
     #[test]
     fn builtin_envvar_propagates_halt_from_variable_name_expression() {
