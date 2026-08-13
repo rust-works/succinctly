@@ -14517,20 +14517,9 @@ fn builtin_paths_filter<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     eval_owned_input::<Vec<u64>, S>(filter, &val_at_path, optional),
                     &mut truthiness,
                 );
-                // Move `path` into its last truthy push instead of cloning
-                // every time -- keeps the common single-truthy-output case
-                // as allocation-free as the pre-#773 code's single `push`.
-                let mut remaining = truthiness.iter().filter(|&&t| t).count();
-                if remaining > 0 {
-                    for &truthy in &truthiness {
-                        if truthy {
-                            remaining -= 1;
-                            if remaining == 0 {
-                                filtered_paths.push(path);
-                                break;
-                            }
-                            filtered_paths.push(path.clone());
-                        }
+                for &truthy in &truthiness {
+                    if truthy {
+                        filtered_paths.push(path.clone());
                     }
                 }
                 if let Some(Control::Halt(code)) = control {
