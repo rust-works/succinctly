@@ -1240,14 +1240,13 @@ impl<V: DocumentValue> GenericResult<V> {
                 stats.count = os.len();
             }
             Self::Break(label) => {
-                let (error, halt) = control_to_stream_outcome(&Control::Break(label.clone()));
-                stats.error = error;
-                stats.halt = halt;
+                stats.error = Some(crate::jq::stream::StreamError {
+                    message: format!("break ${label} not in label"),
+                    not_a_string: false,
+                });
             }
             Self::Halt(code) => {
-                let (error, halt) = control_to_stream_outcome(&Control::Halt(*code));
-                stats.error = error;
-                stats.halt = halt;
+                stats.halt = Some(*code);
             }
             // The prefix streams like `ManyOwned` above, then the control is
             // reported the same way `Error`/`Break` are (#400, #494) — the
@@ -1400,14 +1399,13 @@ impl<V: DocumentValue> GenericResult<V> {
                 stats.count = os.len();
             }
             Self::Break(label) => {
-                let (error, halt) = control_to_stream_outcome(&Control::Break(label.clone()));
-                stats.error = error;
-                stats.halt = halt;
+                stats.error = Some(crate::jq::stream::StreamError {
+                    message: format!("break ${label} not in label"),
+                    not_a_string: false,
+                });
             }
             Self::Halt(code) => {
-                let (error, halt) = control_to_stream_outcome(&Control::Halt(*code));
-                stats.error = error;
-                stats.halt = halt;
+                stats.halt = Some(*code);
             }
             // Same treatment as `stream_json` (#400, #494): the prefix
             // streams first, then the control is reported.

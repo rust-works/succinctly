@@ -18420,11 +18420,10 @@ fn builtin_stderr<W: Clone + AsRef<[u64]>>(
     _optional: bool,
 ) -> QueryResult<'_, W> {
     let owned = to_owned(&value);
-    let text = match &owned {
-        OwnedValue::String(s) => s.clone(),
-        other => other.to_json(),
-    };
-    write_stderr(&text);
+    match &owned {
+        OwnedValue::String(s) => write_stderr(s),
+        other => write_stderr(&other.to_json()),
+    }
     QueryResult::Owned(owned)
 }
 
