@@ -3833,6 +3833,47 @@ fn test_slurp_color_output_yaml() -> Result<()> {
     Ok(())
 }
 
+/// `compact_item_opens_with_key`'s quote-aware lookahead must skip a `:`
+/// that's inside a quoted compact-form key, not treat it as the
+/// key-indicating colon - and must still resolve `at_key_start` correctly
+/// once the quote closes and the *real* key-ending `:` follows. The
+/// quoted key itself renders green either way (`colorize_yaml`'s `"`/`'`
+/// arm colors it unconditionally, independent of `at_key_start`), so this
+/// doesn't change what's visible - it pins the lookahead's own quote
+/// entry/exit and in-quote-skip behavior directly, which no other test
+/// exercises.
+#[test]
+fn test_color_compact_quoted_key_with_colon_785() -> Result<()> {
+    let yaml = "- \"x: y\": 1\n  b: 2\n";
+
+    let (output, code) = run_yq_stdin(".", yaml, &["-C"])?;
+    assert_eq!(code, 0);
+    assert_eq!(
+        output,
+        "\u{1b}[33m-\u{1b}[0m \u{1b}[32m\"x: y\"\u{1b}[0m: 1\n  \u{1b}[36mb\u{1b}[0m: 2\u{1b}[0m\n"
+    );
+
+    Ok(())
+}
+
+/// Same as [`test_slurp_color_compact_quoted_key_with_colon_785`], for an
+/// escaped quote inside the compact-form quoted key - pins the lookahead's
+/// escape-skip branch (`if c == '\\' { chars.next(); }`), which the
+/// unescaped case above doesn't reach.
+#[test]
+fn test_color_compact_quoted_key_with_escaped_quote_785() -> Result<()> {
+    let yaml = "- \"a\\\"b: c\": 1\n  d: 2\n";
+
+    let (output, code) = run_yq_stdin(".", yaml, &["-C"])?;
+    assert_eq!(code, 0);
+    assert_eq!(
+        output,
+        "\u{1b}[33m-\u{1b}[0m \u{1b}[32m\"a\\\"b: c\"\u{1b}[0m: 1\n  \u{1b}[36md\u{1b}[0m: 2\u{1b}[0m\n"
+    );
+
+    Ok(())
+}
+
 /// Unlike [`test_slurp_color_output_yaml`], `-o json --slurp` stays on the
 /// `OwnedValue`/`IndexMap` DOM path regardless of `-C` — `can_slurp_fast_path`
 /// requires YAML output, so `-o json --slurp` is unaffected by #809's fix and
