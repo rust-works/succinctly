@@ -5449,10 +5449,11 @@ fn test_sub_propagates_halt_in_pattern_argument() -> Result<()> {
 }
 
 /// `builtin_sub`'s replacement-argument arm, a distinct evaluation site from
-/// the pattern arm one match block above -- the pattern must succeed first,
-/// so this exercises the second `result_to_owned(eval_single(...))` call in
-/// the same function. Verified against jq 1.7.1: `jq 'sub("a"; halt_error(23))'`
-/// on `"abc"` exits 23 with empty stdout.
+/// the pattern arm one match block above -- the pattern must find a match
+/// first, so this exercises `eval_sub_replacement`'s per-match evaluation of
+/// the replacement expression (#826: `.` is bound to that match's captures,
+/// not the original input). Verified against jq 1.7.1: `jq 'sub("a";
+/// halt_error(23))'` on `"abc"` exits 23 with empty stdout.
 #[test]
 fn test_sub_propagates_halt_in_replacement_argument() -> Result<()> {
     let (stdout, stderr, code) =
@@ -5487,9 +5488,10 @@ fn test_gsub_propagates_halt_in_pattern_argument() -> Result<()> {
     Ok(())
 }
 
-/// `builtin_gsub`'s replacement-argument arm, the second evaluation site in
-/// the function. Verified against jq 1.7.1: `jq 'gsub("a"; halt_error(25))'`
-/// on `"abc"` exits 25 with empty stdout.
+/// `builtin_gsub`'s replacement-argument arm, evaluated per match via
+/// `stitch_replacements_evaluated`/`eval_sub_replacement` (#826). Verified
+/// against jq 1.7.1: `jq 'gsub("a"; halt_error(25))'` on `"abc"` exits 25
+/// with empty stdout.
 #[test]
 fn test_gsub_propagates_halt_in_replacement_argument() -> Result<()> {
     let (stdout, stderr, code) =
@@ -5625,9 +5627,10 @@ fn test_sub_with_flags_propagates_halt_in_pattern_argument() -> Result<()> {
     Ok(())
 }
 
-/// `builtin_sub_with_flags`'s replacement-argument arm, reached once both
-/// flags and pattern resolve cleanly -- the third distinct evaluation site
-/// in this function. Verified against jq 1.7.1:
+/// `builtin_sub_with_flags`'s replacement-argument arm, reached once flags
+/// and pattern resolve cleanly and a match is found -- the replacement is
+/// evaluated per match via `eval_sub_replacement` (#826), not once up
+/// front. Verified against jq 1.7.1:
 /// `jq 'sub("a"; halt_error(33); "i")'` on `"abc"` exits 33 with empty
 /// stdout.
 #[test]
@@ -5650,6 +5653,106 @@ fn test_sub_with_flags_reports_invalid_regex_error() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(&["-c", r#"sub("["; "b"; "i")"#], Some(r#""abc""#))?;
     assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
     assert_eq!(stdout, "");
+    Ok(())
+}
+
+/// `eval_sub_replacement`'s non-optional type-mismatch arm (#826): once a
+/// match is found, the replacement expression is evaluated per match and
+/// must produce a string. Real jq also errors here (`string ("") and number
+/// (5) cannot be added`, from its own `+=`-based definition) -- succinctly's
+/// wording differs (a direct type check) but the exit code matches. Verified
+/// against jq 1.7.1: `jq 'sub("a"; 5)'` on `"abc"` exits 5.
+#[test]
+fn test_sub_replacement_wrong_type_errors() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-c", r#"sub("a"; 5)"#], Some(r#""abc""#))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+/// Black-box counterpart to the test above: `sub("a"; 5)?` swallows the same
+/// non-string replacement instead of raising it. Note this exercises
+/// `eval_sub_replacement` with `optional: false` (`E?`'s `Expr::Optional`
+/// dispatch evaluates `E` with the *ambient* optional and lets its own
+/// `eval_try` catch the aggregate error -- see that arm's doc comment,
+/// `Expr::Optional(inner) => eval_try::<W, S>(inner, None, value,
+/// optional)`), so it hits the same non-optional error arm as the test above
+/// internally; `test_sub_replacement_wrong_type_optional_via_isvalid` below
+/// is what actually drives `eval_sub_replacement`'s own `optional: true`
+/// arm. Verified against jq 1.7.1: `jq 'sub("a"; 5)?'` on `"abc"` exits 0
+/// with empty stdout.
+#[test]
+fn test_sub_replacement_wrong_type_optional_is_silent() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-c", r#"sub("a"; 5)?"#], Some(r#""abc""#))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+/// `eval_sub_replacement`'s `optional: true` type-mismatch arm (#826),
+/// reached via `isvalid`, which -- unlike a bare `?` postfix (see the test
+/// above) -- forces `optional: true` all the way down into the expression it
+/// validates (already exploited by `test_isvalid_propagates_halt_from_error_message_expression`
+/// for the same reason). `isvalid` is a succinctly/jq-1.8+ builtin absent
+/// from the pinned jq-1.7.1 oracle, so this is a self-contained assertion
+/// rather than a golden fixture; the type mismatch makes `sub` invalid
+/// either way, so `isvalid` reports `false` regardless of which arm
+/// internally handles it -- this test's value is in exercising the
+/// `optional: true` code path itself, not in a distinguishable outward
+/// symptom.
+#[test]
+fn test_sub_replacement_wrong_type_optional_via_isvalid() -> Result<()> {
+    let (stdout, _stderr, code) =
+        run_jq_full(&["-c", r#"isvalid(sub("a"; 5))"#], Some(r#""abc""#))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "false\n");
+    Ok(())
+}
+
+/// `builtin_sub_with_flags`'s `global` arm (3-arg `sub(re; replacement;
+/// "g")`, i.e. `sub` used as `gsub` via an explicit flag) propagating a
+/// replacement error through `stitch_replacements_evaluated` (#826) -- a
+/// distinct call site from plain `gsub`'s own error propagation tested
+/// above. Verified against jq 1.7.1: `jq 'sub("a"; 5; "g")'` on `"abc"`
+/// exits 5.
+#[test]
+fn test_sub_with_flags_global_replacement_wrong_type_errors() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-c", r#"sub("a"; 5; "g")"#], Some(r#""abc""#))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+/// `eval_sub_replacement`'s multi-output stopgap (#826): a replacement
+/// filter that yields more than one value for a single match (a real jq
+/// feature -- jq 1.7.1 forks the whole `sub`/`gsub` call, producing one
+/// whole-string output per replacement value, verified live: `jq -c
+/// 'sub("a"; "x","y")'` on `"abc"` prints `"xbc"` then `"ybc"`) is not fully
+/// implemented here; `eval_sub_replacement` instead takes the first value,
+/// via `result_to_owned`'s policy, matching what the pre-#826 code already
+/// did when it pre-evaluated the whole replacement once. This is a
+/// deliberate, documented divergence (see that function's doc comment and
+/// follow-up #840), not a golden-fixture case (there is no single jq output
+/// to pin against). What this test guards against is a *regression* off
+/// that stopgap: earlier in #826's own review cycle, routing the
+/// per-match evaluation through `eval_owned_expr` (which array-collapses a
+/// multi-output filter) turned this into a hard type-mismatch error instead.
+#[test]
+fn test_sub_replacement_multi_value_takes_first_value() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-c", r#"sub("a"; "x","y")"#], Some(r#""abc""#))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "\"xbc\"\n");
+    Ok(())
+}
+
+/// `gsub` counterpart to the test above, routed through
+/// `stitch_replacements_evaluated` rather than `builtin_sub_with_flags`'s
+/// single-match arm -- a distinct call site for the same stopgap (#826).
+#[test]
+fn test_gsub_replacement_multi_value_takes_first_value() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-c", r#"gsub("a"; "x","y")"#], Some(r#""aa""#))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "\"xx\"\n");
     Ok(())
 }
 
@@ -5686,7 +5789,9 @@ fn test_gsub_with_flags_propagates_halt_in_pattern_argument() -> Result<()> {
 }
 
 /// `builtin_gsub_with_flags`'s replacement-argument arm, reached once both
-/// flags and pattern resolve cleanly. Verified against jq 1.7.1:
+/// flags and pattern resolve cleanly -- the replacement is evaluated per
+/// match via `stitch_replacements_evaluated`/`eval_sub_replacement` (#826).
+/// Verified against jq 1.7.1:
 /// `jq 'gsub("a"; halt_error(36); "i")'` on `"abc"` exits 36 with empty
 /// stdout.
 #[test]
