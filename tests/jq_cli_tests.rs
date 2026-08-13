@@ -6531,13 +6531,15 @@ fn test_try_catch_inside_a_path_call_catches_a_break_regardless_of_label_824() -
     // label it targets -- the same rule the value-position evaluator's
     // `eval_try` already applies (#562), now mirrored in path context
     // (#824). `catch empty` here (rather than a handler that is itself not
-    // a valid path expression, e.g. `catch "x"`) sidesteps a separate,
-    // pre-existing gap in this same `Expr::Try` arm -- filed as #832 --
-    // where the resolved prefix is lost if the *handler itself* then fails
-    // as a path expression (#530); that gap already exists for the
-    // ordinary-error side of this arm too (`path(try (.a, .x[0]) catch
-    // "x")` on real jq 1.7.1, confirmed live: prefix `["a"]` on stdout,
-    // "Invalid path expression..." on stderr) and is not specific to break.
+    // a valid path expression, e.g. `catch "x"`) is deliberate regardless:
+    // it isolates *this* test's break-interception claim from the catch
+    // handler's own success/failure, which is covered separately below and
+    // by the dedicated #832 regression tests
+    // (`test_path_try_catch_handler_error_keeps_prefix_832` and
+    // `test_path_try_catch_handler_halt_keeps_prefix_832`) -- #832 fixed
+    // `resolve_catch` (shared by this arm's `Error` and `Break` cases) so
+    // the resolved prefix survives even when the handler itself then fails,
+    // for all three escape kinds (error, break, halt).
     // Verified against jq 1.7.1: `path(try (.a, break $out) catch empty)`
     // on `{"a":1}` is `["a"]`, exit 0 -- the break never reaches `$out` at
     // all, catch runs before the label ever gets a chance.
@@ -6574,14 +6576,18 @@ fn test_try_catch_inside_a_path_call_catches_a_break_regardless_of_label_824() -
 
     // The catch handler itself raising a *different* error, rather than
     // failing as a path expression (#530) — the same "catch runs, and its
-    // own failure propagates" shape, through the code path shared with
-    // #832's pre-existing gap (see the doc comment above): confirmed live,
-    // real jq's `path(try (.a, break $out) catch error("y"))` on `{"a":1}`
-    // prints the prefix `["a"]` then raises "y", exit 5. succinctly instead
-    // loses the prefix here (empty stdout) while still raising "y" and
-    // exiting 5 -- the handler's own failure is reported correctly, only
-    // the earlier prefix is dropped, which is #832's gap, not a new one
-    // this fix introduces.
+    // own failure propagates" shape, through the code path #832 fixed
+    // (`resolve_catch`, shared by this arm's `Error` and `Break` cases):
+    // confirmed live, real jq's `path(try (.a, break $out) catch
+    // error("y"))` on `{"a":1}` prints the prefix `["a"]` then raises "y",
+    // exit 5. Before #832, succinctly lost the prefix here (empty stdout)
+    // while still raising "y" and exiting 5 -- the handler's own failure was
+    // reported correctly, only the earlier prefix was dropped. `resolve_catch`
+    // now threads `prefix` into the `Err` side the same way every other arm
+    // in this resolver already does, so the prefix survives regardless of
+    // which escape kind (error, break, or halt) the handler itself raises --
+    // see #832's dedicated regression tests below for the ordinary-error and
+    // halt cases.
     let (stdout, stderr, code) = run_jq_full(
         &[
             "-c",
@@ -6590,9 +6596,49 @@ fn test_try_catch_inside_a_path_call_catches_a_break_regardless_of_label_824() -
         Some(r#"{"a":1}"#),
     )?;
     assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
-    assert_eq!(stdout, "");
+    assert_eq!(stdout, "[\"a\"]\n");
     assert!(stderr.contains("error (at <stdin>:"), "{stderr}");
     assert!(stderr.trim_end().ends_with(": y"), "{stderr}");
+    Ok(())
+}
+
+#[test]
+fn test_path_try_catch_handler_error_keeps_prefix_832() -> Result<()> {
+    // #832: `resolve_catch` (the helper `resolve_node`'s `Expr::Try` arm
+    // shares between its `Error` and `Break` cases) used to return the catch
+    // handler's own failure via a bare `?`, discarding whatever `prefix` the
+    // failed `try` body had already resolved. Ordinary-error variant:
+    // `catch_expr` itself is not a valid path expression (#530). Verified
+    // against jq 1.7.1: `path(try (.a, .x[0]) catch "x")` on
+    // `{"a":1,"x":5}` prints the prefix `["a"]` (the `.a` branch, resolved
+    // before `.x[0]` failed) then raises the #530 "Invalid path expression"
+    // complaint about `"x"`, exit 5.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r#"path(try (.a, .x[0]) catch "x")"#],
+        Some(r#"{"a":1,"x":5}"#),
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[\"a\"]\n");
+    assert!(stderr.contains("Invalid path expression"), "{stderr}");
+    Ok(())
+}
+
+#[test]
+fn test_path_try_catch_handler_halt_keeps_prefix_832() -> Result<()> {
+    // #832, halt variant: the catch handler itself calls `halt_error`, which
+    // is never caught by `try`/`catch` (#791) and exits the whole process.
+    // `resolve_catch`'s fix is escape-kind-agnostic (it matches on the
+    // handler's `Err((prefix, escape))` generically), so this needs its own
+    // regression case distinct from the ordinary-error and break variants
+    // above/below -- confirmed independently rather than assumed from the
+    // other two. The prefix `["a"]` (resolved before `.x[0]` failed) must
+    // still reach stdout before the process halts.
+    let (stdout, _stderr, code) = run_jq_full(
+        &["-c", "path(try (.a, .x[0]) catch halt_error)"],
+        Some(r#"{"a":1,"x":5}"#),
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout:?}");
+    assert_eq!(stdout, "[\"a\"]\n");
     Ok(())
 }
 
