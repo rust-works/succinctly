@@ -3608,6 +3608,136 @@ fn test_block_scalar_folded() -> Result<()> {
 }
 
 // =============================================================================
+// Compatibility tests - Block scalar style preservation on re-serialization
+// (#836: the M2 streaming/cursor path used to lose `|`/`>` entirely and
+// re-emit a double-quoted string with `\n` escapes instead)
+// =============================================================================
+
+#[test]
+fn test_block_scalar_literal_style_preserved_as_sequence_item() -> Result<()> {
+    // Exact repro from #836.
+    let input = "- |\n  line1\n  line2\n- next\n";
+    let (output, exit_code) = run_yq_stdin(".", input, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "- |\n  line1\n  line2\n- next\n");
+    Ok(())
+}
+
+#[test]
+fn test_block_scalar_folded_style_preserved_as_sequence_item() -> Result<()> {
+    // Exact repro from #836. Real yq's own re-encoding always adds an extra
+    // blank line after a folded scalar with clip/keep chomping (verified
+    // against the pinned yq v4.53.3 oracle) - not a succinctly gap, so
+    // replicated rather than "fixed" into a new divergence.
+    let input = "- >\n  line1\n  line2\n- next\n";
+    let (output, exit_code) = run_yq_stdin(".", input, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "- >\n  line1 line2\n\n- next\n");
+    Ok(())
+}
+
+#[test]
+fn test_block_scalar_literal_style_preserved_as_mapping_field() -> Result<()> {
+    let input = "a: |\n  line1\n  line2\nb: next\n";
+    let (output, exit_code) = run_yq_stdin(".", input, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "a: |\n  line1\n  line2\nb: next\n");
+    Ok(())
+}
+
+#[test]
+fn test_block_scalar_folded_style_preserved_as_mapping_field() -> Result<()> {
+    let input = "a: >\n  line1\n  line2\nb: next\n";
+    let (output, exit_code) = run_yq_stdin(".", input, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "a: >\n  line1 line2\n\nb: next\n");
+    Ok(())
+}
+
+#[test]
+fn test_block_scalar_literal_strip_style_preserved() -> Result<()> {
+    let input = "a: |-\n  line1\n  line2\nb: next\n";
+    let (output, exit_code) = run_yq_stdin(".", input, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "a: |-\n  line1\n  line2\nb: next\n");
+    Ok(())
+}
+
+#[test]
+fn test_block_scalar_literal_keep_style_preserved() -> Result<()> {
+    let input = "a: |+\n  line1\n  line2\n\nb: next\n";
+    let (output, exit_code) = run_yq_stdin(".", input, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "a: |+\n  line1\n  line2\n\nb: next\n");
+    Ok(())
+}
+
+#[test]
+fn test_block_scalar_folded_keep_style_preserved() -> Result<()> {
+    let input = "a: >+\n  line1\n  line2\n\nb: next\n";
+    let (output, exit_code) = run_yq_stdin(".", input, &[])?;
+    assert_eq!(exit_code, 0);
+    // Chomping suffix (`+`) is chosen from the decoded value's own trailing
+    // newline count, not copied from the source's chomping indicator - see
+    // `chomping_indicator` in src/yaml/light.rs.
+    assert_eq!(output, "a: >+\n  line1 line2\n\n\nb: next\n");
+    Ok(())
+}
+
+#[test]
+fn test_block_scalar_folded_embedded_blank_line_widened() -> Result<()> {
+    // A single `\n` between two equally-indented lines folds back to a
+    // space on re-parse (YAML 1.2 §8.1.3) - an *embedded* blank line (not
+    // the scalar's own trailing one) has to be widened to a real blank
+    // line (two breaks) for its fold-preserving `\n` to survive, exercising
+    // `widen_folded_breaks`'s embedded-run branch specifically (its
+    // trailing-run branch is already covered by the clip/keep tests
+    // above).
+    let input = "a: >\n  line1\n\n  line2\nb: next\n";
+    let (output, exit_code) = run_yq_stdin(".", input, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "a: >\n  line1\n\n  line2\n\nb: next\n");
+    Ok(())
+}
+
+#[test]
+fn test_block_scalar_empty_falls_back_to_quoted_string() -> Result<()> {
+    // An empty block scalar has no lines to re-indent under `|`/`>` - real
+    // yq drops block style here too (verified against the pinned oracle),
+    // so falling through to normal quoting rather than emitting `|-`/`>-`
+    // with nothing after it matches, not diverges.
+    let input = "a: |\n  \nb: next\n";
+    let (output, exit_code) = run_yq_stdin(".", input, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "a: \"\"\nb: next\n");
+    Ok(())
+}
+
+#[test]
+fn test_block_scalar_style_preserved_through_slurp() -> Result<()> {
+    // The `--slurp` fast path (`stream_yaml_sequence`) delegates each
+    // element to the same `stream_yaml_value` this fix changes, rather than
+    // duplicating its own String-rendering arm - so it inherits the fix
+    // without any changes of its own.
+    let dir = TempDir::new()?;
+    let file1 = dir.path().join("a.yaml");
+    std::fs::write(&file1, "- |\n  line1\n  line2\n")?;
+    let cmd = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .arg("yq")
+        .arg("--slurp")
+        .arg(".")
+        .arg(&file1)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let output = cmd.wait_with_output()?;
+    let stdout = String::from_utf8(output.stdout)?;
+    assert_eq!(output.status.code().unwrap_or(-1), 0);
+    assert_eq!(stdout, "- - |\n    line1\n    line2\n");
+    Ok(())
+}
+
+// =============================================================================
 // Compatibility tests - Multi-document handling
 // =============================================================================
 
@@ -6218,7 +6348,10 @@ fn test_assignment_does_not_yet_preserve_comments_710() -> Result<()> {
 fn test_block_scalar_does_not_steal_following_comment_710() -> Result<()> {
     let (out, code) = run_yq_stdin(".", "a: |\n  line one\n# comment for b\nb: 2\n", &[])?;
     assert_eq!(code, 0);
-    assert_eq!(out, "a: \"line one\\n\"\nb: 2\n");
+    // `a`'s own scalar re-emits as `|` block style, not a quoted string
+    // with `\n` escapes, since #836 - unrelated to what this test itself
+    // pins (that the comment isn't misattributed to `a`'s value).
+    assert_eq!(out, "a: |\n  line one\nb: 2\n");
     Ok(())
 }
 

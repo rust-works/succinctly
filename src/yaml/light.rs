@@ -1437,6 +1437,48 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                     out.write_str(tag)?;
                     out.write_char(' ')?;
                 }
+                // A source-level block literal (`|`) or folded (`>`) scalar
+                // has no branch in `stream_yaml_string_value` at all - it
+                // only sees `s`'s *quoting-relevant* `YamlString` variant,
+                // never this cursor's own text position, so it always
+                // smart-quotes the decoded value instead (and a decoded
+                // value with raw embedded newlines always needs quoting,
+                // so it always comes out double-quoted with `\n` escapes -
+                // #836). `self.style()` (already resolved through a bare
+                // `-` sequence-item wrapper, same as the container arms
+                // above) is the only thing here that knows the source
+                // style; consult it before falling through.
+                //
+                // `indent_spaces == 0` (flow/compact context, reached via
+                // `write_yaml_child_inline`) can't represent a block
+                // scalar syntactically - YAML has no way to write `|`/`>`
+                // inside `[...]`/`{...}` - so it always falls through, same
+                // as an empty decoded value (real yq drops block style for
+                // an empty scalar too: verified against the pinned oracle,
+                // `a: |\n  \n` re-emits as `a: ""`, #836).
+                let style = self.style();
+                if indent_spaces != 0 && matches!(style, "literal" | "folded") {
+                    if let Ok(decoded) = s.as_str() {
+                        // A line ending in a literal trailing space is
+                        // invisible and fragile in block form (many editors
+                        // strip it on save) - real yq falls back to a
+                        // quoted string whenever any line has one, rather
+                        // than risk it, and this matches that rather than
+                        // diverging (verified against the pinned oracle: a
+                        // trailing *tab* is fine and stays block-styled,
+                        // only a trailing space disqualifies, #836).
+                        let has_trailing_space =
+                            decoded.split('\n').any(|line| line.ends_with(' '));
+                        if !decoded.is_empty() && !has_trailing_space {
+                            return stream_yaml_block_scalar(
+                                out,
+                                &decoded,
+                                indent,
+                                style == "folded",
+                            );
+                        }
+                    }
+                }
                 stream_yaml_string_value(out, &s)
             }
             YamlValue::Mapping(_) => {
@@ -6069,6 +6111,103 @@ fn stream_yaml_nonstring_key<W: AsRef<[u64]>, Out: core::fmt::Write>(
     }
 }
 
+/// Write a block scalar (`|` literal or `>` folded), re-emitting its
+/// original style instead of falling back to `stream_yaml_string_value`'s
+/// smart quoting (#836). `decoded` is the scalar's already-decoded value
+/// (`YamlString::as_str()`'s output) - never empty, the caller already
+/// checked. `indent` is the indentation each content line gets: the same
+/// "one level deeper" string `stream_yaml_value`'s Mapping/Sequence arms
+/// already compute for every scalar value - block content is just the
+/// first case that actually *writes* it.
+///
+/// Two things can't be read off `decoded` alone and need deriving:
+///
+/// - **Chomping indicator** ([`chomping_indicator`]). Whatever comes right
+///   after this function returns (the mapping-field/sequence-item loop's
+///   own `\n` + indent before the next sibling, or the document's own
+///   final on_value newline if this is the last value in the whole
+///   output) already writes exactly one `\n` unconditionally, the same
+///   "exactly one separator follows every value" invariant every other
+///   scalar already relies on. So this function deliberately writes its
+///   own trailing run of `\n`s *one short* of `decoded`'s, leaving that
+///   last one for whatever already-existing code writes next rather than
+///   double up on it.
+/// - **Folded-style embedded breaks** ([`widen_folded_breaks`]). A single
+///   `\n` between two equally-indented lines folds back to a space on
+///   re-parse (YAML 1.2 §8.1.3) - it takes a *blank line* (two breaks) for
+///   an embedded `\n` to survive. Literal style has no such ambiguity
+///   (every `\n` is already literal), so only `folded` needs this.
+///
+/// Both rules were derived empirically against the pinned real `yq`
+/// oracle (v4.53.3) across the full clip/strip/keep × embedded/trailing
+/// newline-run space, not from the YAML spec alone - the "one short, let
+/// the caller's own separator supply the last one" trick in particular
+/// isn't something real yq does (its own re-encoding is one write with no
+/// such external dependency), but produces byte-identical output because
+/// this codebase already unconditionally writes exactly one `\n` after
+/// every value, at every nesting depth, before starting the next thing.
+fn stream_yaml_block_scalar<Out: core::fmt::Write>(
+    out: &mut Out,
+    decoded: &str,
+    indent: &str,
+    folded: bool,
+) -> core::fmt::Result {
+    out.write_char(if folded { '>' } else { '|' })?;
+    out.write_str(chomping_indicator(decoded))?;
+
+    let widened;
+    let content: &str = if folded {
+        widened = widen_folded_breaks(decoded);
+        &widened
+    } else if let Some(stripped) = decoded.strip_suffix('\n') {
+        stripped
+    } else {
+        decoded
+    };
+
+    for line in content.split('\n') {
+        out.write_char('\n')?;
+        if !line.is_empty() {
+            out.write_str(indent)?;
+            out.write_str(line)?;
+        }
+    }
+    Ok(())
+}
+
+/// The minimal chomping indicator (`""` clip, `"-"` strip, `"+"` keep)
+/// that makes a re-emitted block scalar decode back to exactly `decoded`
+/// (#836) - clip if there's exactly one trailing `\n` (the default, no
+/// indicator needed), strip if there's none, keep if there's more than
+/// one (a plain clip/strip re-parse would collapse or drop the rest).
+fn chomping_indicator(decoded: &str) -> &'static str {
+    match decoded.strip_suffix('\n') {
+        None => "-",
+        Some(rest) if !rest.ends_with('\n') => "",
+        Some(_) => "+",
+    }
+}
+
+/// Widen every *embedded* (non-trailing) run of `\n` in a folded scalar's
+/// decoded value by one `\n`, so each survives folding back to a space on
+/// re-parse - see [`stream_yaml_block_scalar`]'s doc comment. The
+/// scalar's own trailing run is deliberately left untouched, for the same
+/// doc comment's "one short, let the caller supply the last one" reason.
+fn widen_folded_breaks(decoded: &str) -> String {
+    let mut result = String::with_capacity(decoded.len() + 1);
+    let mut chars = decoded.chars().peekable();
+    while let Some(ch) = chars.next() {
+        result.push(ch);
+        if ch == '\n' && chars.peek().is_some() && chars.peek() != Some(&'\n') {
+            // End of a run of `\n`s with more content after it (not the
+            // scalar's own trailing run, which runs to the end of
+            // `decoded` with nothing following) - widen it by one.
+            result.push('\n');
+        }
+    }
+    result
+}
+
 fn stream_yaml_string_value<Out: core::fmt::Write>(
     out: &mut Out,
     s: &YamlString<'_>,
@@ -7398,11 +7537,16 @@ mod tests {
     }
 
     #[test]
-    fn test_stream_yaml_block_scalar_smart_quoting() {
-        // Block scalars decode to plain strings and take the smart-quoting
-        // path (needs_yaml_quoting / looks_like_yaml_number): multiline
-        // content and anything that would re-parse as a keyword or number
-        // must be double-quoted to stay a string; everything else stays bare.
+    fn test_stream_yaml_block_scalar_style_preserved_regardless_of_content_shape() {
+        // Before #836, a block scalar's decoded value fell through to the
+        // same smart-quoting path (needs_yaml_quoting / looks_like_yaml_
+        // number) as any other decoded string, so a multiline value always
+        // came back double-quoted with `\n` escapes and a value that merely
+        // *looked* like a keyword/number lost its block style along with
+        // it. Now every one of these keeps its source `|`/`>` style - the
+        // shapes that used to need smart-quoting (multiline, `true`-
+        // looking, number-looking, ...) are exactly why this covers so
+        // many at once, not because they still take that path.
         let yaml = b"a: |-\n  hello\n  world\nb: |-\n  plain\nc: |-\n  true\nd: |-\n  123\ne: |-\n  1.5e+3\nf: |-\n  12x\ng: |-\n  1.5.5\nh: |-\n  +\ni: |-\n  +x\nj: |-\n  +5x\nk: >-\n  folded here\nl: |-\n  -foo\n";
         let index = YamlIndex::build(yaml).unwrap();
         let mut out = String::new();
@@ -7410,20 +7554,21 @@ mod tests {
             .root(yaml)
             .stream_yaml_document(&mut out, IndentSpec::spaces(2), false)
             .unwrap();
+        // Byte-for-byte match against the pinned real yq oracle (v4.53.3).
         assert_eq!(
             out,
-            "a: \"hello\\nworld\"\n\
-             b: plain\n\
-             c: \"true\"\n\
-             d: \"123\"\n\
-             e: \"1.5e+3\"\n\
-             f: 12x\n\
-             g: 1.5.5\n\
-             h: +\n\
-             i: +x\n\
-             j: +5x\n\
-             k: folded here\n\
-             l: \"-foo\""
+            "a: |-\n  hello\n  world\n\
+             b: |-\n  plain\n\
+             c: |-\n  true\n\
+             d: |-\n  123\n\
+             e: |-\n  1.5e+3\n\
+             f: |-\n  12x\n\
+             g: |-\n  1.5.5\n\
+             h: |-\n  +\n\
+             i: |-\n  +x\n\
+             j: |-\n  +5x\n\
+             k: >-\n  folded here\n\
+             l: |-\n  -foo"
         );
     }
 
