@@ -6660,6 +6660,51 @@ fn test_last_expr_propagates_halt_past_partial_prefix() -> Result<()> {
     Ok(())
 }
 
+/// The three tests below are `eval.rs`-specific siblings of
+/// `test_first_expr_propagates_halt`/`test_last_expr_propagates_bare_halt`/
+/// `test_last_expr_propagates_halt_past_partial_prefix` above: those three
+/// use `first`/`last` as the *top-level* CLI filter, which
+/// `eval_generic.rs`'s own native `Expr::FirstExpr`/`Expr::LastExpr` handling
+/// (`eval_first_or_last_generic`, added for #607) intercepts before
+/// `eval.rs`'s `eval_first_expr`/`eval_last_expr` are ever reached. Routing
+/// through a `group_by` key function (as with the `eval_pipe`/`eval_index_expr`
+/// tests earlier in this file) forces evaluation through `eval.rs`'s own
+/// implementations instead.
+#[test]
+fn test_eval_first_expr_bare_halt_reached_through_group_by_key_fn() -> Result<()> {
+    // `eval_first_expr`'s own `QueryResult::Halt(code)` arm. Verified against
+    // jq 1.7.1: `jq -c 'group_by(first(halt))'` on `[5]` exits 0 with no
+    // output.
+    let (stdout, stderr, code) = run_jq_full(&["-c", "group_by(first(halt))"], Some("[5]"))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_eval_last_expr_bare_halt_reached_through_group_by_key_fn() -> Result<()> {
+    // `eval_last_expr`'s own bare `QueryResult::Halt(code)` arm. Verified
+    // against jq 1.7.1: `jq -c 'group_by(last(halt))'` on `[5]` exits 0 with
+    // no output.
+    let (stdout, stderr, code) = run_jq_full(&["-c", "group_by(last(halt))"], Some("[5]"))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_eval_last_expr_partial_halt_reached_through_group_by_key_fn() -> Result<()> {
+    // `eval_last_expr`'s own `QueryResult::Partial(_, Control::Halt(code))`
+    // arm: `last` cannot short-circuit, so a prefix (`1`, `2`) produced
+    // before the halt is dropped, and only the halt surfaces. Verified
+    // against jq 1.7.1: `jq -c 'group_by(last((1, 2, halt)))'` on `[5]`
+    // exits 0 with no output.
+    let (stdout, stderr, code) = run_jq_full(&["-c", "group_by(last((1, 2, halt)))"], Some("[5]"))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
 #[test]
 fn test_range_bound_error_is_caught_by_try_catch() -> Result<()> {
     // `range_arg`'s `QueryResult::Error(e) => Err(e.into())` arm -- the
