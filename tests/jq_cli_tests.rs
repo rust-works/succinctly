@@ -4933,6 +4933,225 @@ fn test_sort_by_propagates_halt_in_key_function() -> Result<()> {
     Ok(())
 }
 
+/// The four tests below are siblings of `test_group_by_propagates_halt_in_key_function`
+/// above, but exercise `eval.rs`'s generic `eval_pipe`/`eval_index_expr` machinery
+/// itself rather than `builtin_group_by`'s own match arm: that test's key
+/// function (`halt_error(9)`, a bare builtin call) halts directly inside
+/// `eval_single`'s `Expr::Builtin` dispatch without ever entering `eval_pipe`.
+/// A key function that is itself a multi-stage `Pipe`/`IndexExpr` is needed to
+/// reach `eval_pipe`'s own internal arms -- and it must be routed through
+/// `group_by`/`sort_by`/`min_by`/`max_by`/`unique_by` (or another builtin whose
+/// argument falls through `eval_generic.rs`'s `eval_on_owned` fallback) rather
+/// than used as the top-level CLI filter, since ordinary pipes/index
+/// expressions at the top level are handled natively by `eval_generic.rs`'s own
+/// (separate) implementation and never reach `eval.rs` at all.
+#[test]
+fn test_eval_pipe_many_loop_halt_reached_through_group_by_key_fn() -> Result<()> {
+    // `eval_pipe`'s `QueryResult::Many(values)` loop, `QueryResult::Halt`
+    // arm: `group_by`'s single item is `[1,2,3]`, and the key function's
+    // first stage (`.[]`) fans it out into three *borrowed* values before
+    // the second stage halts on the second one. Verified against jq 1.7.1:
+    // `jq -c 'group_by(.[] | if . == 2 then halt else . end)'` on `[[1,2,3]]`
+    // exits 0 with no output -- array construction for the key is atomic, so
+    // the `1` already produced before the halt never reaches stdout (#400
+    // does not apply inside `[f]`).
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "group_by(.[] | if . == 2 then halt else . end)"],
+        Some("[[1,2,3]]"),
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_eval_pipe_top_level_halt_reached_through_group_by_key_fn() -> Result<()> {
+    // `eval_pipe`'s top-level `QueryResult::Halt(code) => QueryResult::Halt(code)`
+    // arm: the key function's *first* stage (bare `halt`) halts outright,
+    // reached via the `match result.materialize_cursor()` dispatch rather
+    // than the `Many` loop above (there is a second pipe stage, `.`, so
+    // `eval_pipe` cannot take its own `rest.is_empty()` early return either).
+    // Verified against jq 1.7.1: `jq -c 'group_by(halt | .)'` on `[[1,2,3]]`
+    // exits 0 with no output.
+    let (stdout, stderr, code) = run_jq_full(&["-c", "group_by(halt | .)"], Some("[[1,2,3]]"))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_pipe_owned_prefix_halt_reached_through_group_by_key_fn() -> Result<()> {
+    // `pipe_owned_prefix`'s own `QueryResult::Halt` arm: the key function's
+    // first stage (`1,2,3`, a comma of literals) fans out into *owned*
+    // values, taking `eval_pipe`'s `ManyOwned` arm into `pipe_owned_prefix`
+    // rather than the borrowed `Many` loop above. Verified against jq 1.7.1:
+    // `jq -c 'group_by((1,2,3) | halt)'` on `[1]` exits 0 with no output --
+    // the halt fires while piping the very first generated value (`1`)
+    // through the second stage.
+    let (stdout, stderr, code) = run_jq_full(&["-c", "group_by((1,2,3) | halt)"], Some("[1]"))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_eval_index_expr_direct_halt_reached_through_group_by_key_fn() -> Result<()> {
+    // `eval_index_expr`'s direct `QueryResult::Halt(code) => return
+    // QueryResult::Halt(code)` arm: the key function's computed-index key
+    // expression (`halt_error(3)`) halts outright with zero keys ever
+    // produced, distinct from the `Partial(vs, Control::Halt(code))` arm
+    // right below it (which handles a key stream that halts *after*
+    // already yielding some keys). `halt_error`'s non-string argument is the
+    // group_by item itself (`1`), printed as JSON to stderr per halt_error's
+    // own contract -- not stdout. Verified against jq 1.7.1: `jq -c
+    // 'group_by(.[(halt_error(3))])'` on `[1]` exits 3 with no stdout.
+    let (stdout, stderr, code) = run_jq_full(&["-c", "group_by(.[(halt_error(3))])"], Some("[1]"))?;
+    assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert!(stderr.contains('1'), "stderr: {stderr:?}");
+    Ok(())
+}
+
+/// The seven tests below cover `eval_index_expr`/`eval_slice_expr`/
+/// `eval_slice_bound`'s remaining halt-propagation arms, all reached the same
+/// way as the test above -- through a `group_by` key function, since a
+/// top-level `E[K]`/`E[S:T]` is handled natively by `eval_generic.rs` and
+/// never reaches `eval.rs` at all. One parser subtlety applies throughout:
+/// `parse_postfix` only builds an `Expr::IndexExpr`/`Expr::SliceExpr` (with
+/// its own explicit `target`) when the bracket contains at least one
+/// *computed* key/bound (`push_bracket`'s `Bracket::Dynamic`/
+/// `Bracket::DynamicSlice`); a bracket with only *literal* contents (`[0]`,
+/// `[0:1]`) is a flat chain element instead, folding `PRECEDING[LITERAL]`
+/// into a plain `Expr::Pipe` that never constructs either node. So every
+/// filter below keeps at least one bracket position non-literal (`.`, or a
+/// `halt`-containing sub-expression) purely to force the right AST shape --
+/// independent of which arm is under test.
+#[test]
+fn test_eval_index_expr_target_none_with_pending_key_halt_reached_through_group_by_key_fn(
+) -> Result<()> {
+    // `eval_index_expr`'s `QueryResult::None => { return match pending_halt
+    // { Some(code) => QueryResult::Halt(code), ... } }` arm: the key stream
+    // (`1, halt`) yields one key before halting (setting `pending_halt`),
+    // but the target (`empty`) produces zero outputs -- so there is no
+    // key/target pair left to index, yet the key side's pending halt must
+    // still fire rather than silently degrading to `None`. Verified against
+    // jq 1.7.1: `jq -c 'group_by(empty[(1,halt)])'` on `[1]` exits 0 with no
+    // output (`empty[...]` is legitimately empty regardless).
+    let (stdout, stderr, code) = run_jq_full(&["-c", "group_by(empty[(1,halt)])"], Some("[1]"))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_eval_index_expr_target_direct_halt_reached_through_group_by_key_fn() -> Result<()> {
+    // `eval_index_expr`'s target-materialization match has its own direct
+    // `QueryResult::Halt(code) => return QueryResult::Halt(code)` arm,
+    // distinct from the key-stream's own (already-covered) direct-halt arm:
+    // here the *key* (`.`) succeeds trivially, but the *target* (`halt`)
+    // halts outright. Verified against jq 1.7.1: `jq -c 'group_by(halt[.])'`
+    // on `[5]` exits 0 with no output.
+    let (stdout, stderr, code) = run_jq_full(&["-c", "group_by(halt[.])"], Some("[5]"))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_eval_index_expr_target_partial_halt_reached_through_group_by_key_fn() -> Result<()> {
+    // `eval_index_expr`'s target-materialization match, `Partial(_,
+    // Control::Halt(code))` arm: the target (`1,2,halt`) produces two real
+    // outputs before halting -- conservatively treated the same as a direct
+    // halt (the already-produced prefix is discarded, matching the key
+    // stream's own conservative `Error`/`Break` treatment right above it in
+    // the source). Verified against jq 1.7.1: `jq -c 'group_by((1,2,halt)[.])'`
+    // on `[5]` exits 0 with no output.
+    let (stdout, stderr, code) = run_jq_full(&["-c", "group_by((1,2,halt)[.])"], Some("[5]"))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_eval_index_expr_owned_targets_pending_key_halt_reached_through_group_by_key_fn(
+) -> Result<()> {
+    // `eval_index_expr`'s `Targets::Owned` branch, `pending_halt` arm --
+    // the *owned* twin of the already-covered `Targets::Borrowed` arm right
+    // above it. The target (`[9,8,7],[6,5,4]`, two array literals) is
+    // *computed* rather than borrowed from the input, taking the `Owned`
+    // branch; the key (`0, halt`) yields one real key (`0`) before halting.
+    // Both targets get indexed by the one produced key before the pending
+    // halt fires, so this also proves the already-indexed values (`9`, `6`)
+    // are computed before being discarded, not skipped outright. Verified
+    // against jq 1.7.1: `jq -c 'group_by(([9,8,7],[6,5,4])[(0, halt)])'` on
+    // `[5]` exits 0 with no output.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "group_by(([9,8,7],[6,5,4])[(0, halt)])"],
+        Some("[5]"),
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_eval_slice_expr_start_bound_halt_reached_through_group_by_key_fn() -> Result<()> {
+    // `eval_slice_expr`'s start-bound evaluation: `eval_slice_bound`
+    // returning `Err(Control::Halt(code))` (because the start bound itself,
+    // `halt`, halts) must abort before the end bound or target are ever
+    // touched. Verified against jq 1.7.1: `jq -c 'group_by(.[(halt):2])'`
+    // on `[5]` exits 0 with no output.
+    let (stdout, stderr, code) = run_jq_full(&["-c", "group_by(.[(halt):2])"], Some("[5]"))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_eval_slice_expr_end_bound_halt_reached_through_group_by_key_fn() -> Result<()> {
+    // Sibling of the test above for the *end* bound: the start bound (`0`)
+    // succeeds first, then the end bound (`halt`) halts. Distinct call site
+    // from the start-bound test (`eval_slice_expr` evaluates the two bounds
+    // with two separate `eval_slice_bound` calls). Verified against jq
+    // 1.7.1: `jq -c 'group_by(.[0:(halt)])'` on `[5]` exits 0 with no output.
+    let (stdout, stderr, code) = run_jq_full(&["-c", "group_by(.[0:(halt)])"], Some("[5]"))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_eval_slice_expr_target_halt_reached_through_group_by_key_fn() -> Result<()> {
+    // `eval_slice_expr`'s own target-materialization match, direct-halt arm
+    // (mirrors `eval_index_expr`'s equivalent arm, tested above, but this is
+    // a separate match in a separate function). Both bounds (`0`, `.`)
+    // succeed trivially -- the end bound is `.` rather than a literal
+    // *purely* to keep the bracket "dynamic" so the parser builds an
+    // `Expr::SliceExpr` with an explicit `target` at all (see this group's
+    // doc comment); it plays no role in the halt itself, which comes from
+    // the target (`halt`). Verified against jq 1.7.1: `jq -c
+    // 'group_by(halt[0:.])'` on `[5]` exits 0 with no output.
+    let (stdout, stderr, code) = run_jq_full(&["-c", "group_by(halt[0:.])"], Some("[5]"))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_eval_slice_expr_target_partial_halt_reached_through_group_by_key_fn() -> Result<()> {
+    // `eval_slice_expr`'s target-materialization match, `Partial(_,
+    // Control::Halt(code))` arm -- the `eval_slice_expr` sibling of
+    // `test_eval_index_expr_target_partial_halt_reached_through_group_by_key_fn`.
+    // The target (`1,2,halt`) produces two real outputs before halting;
+    // like the index-expr case, the already-produced prefix is discarded
+    // rather than sliced. Verified against jq 1.7.1: `jq -c
+    // 'group_by((1,2,halt)[0:.])'` on `[5]` exits 0 with no output.
+    let (stdout, stderr, code) = run_jq_full(&["-c", "group_by((1,2,halt)[0:.])"], Some("[5]"))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
 #[test]
 fn test_with_entries_propagates_halt_from_map_function() -> Result<()> {
     // `builtin_with_entries`'s `map(f)` loop: a bare (non-`Partial`) halt
