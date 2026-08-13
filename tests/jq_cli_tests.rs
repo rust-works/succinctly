@@ -5723,6 +5723,39 @@ fn test_sub_with_flags_global_replacement_wrong_type_errors() -> Result<()> {
     Ok(())
 }
 
+/// `eval_sub_replacement`'s multi-output stopgap (#826): a replacement
+/// filter that yields more than one value for a single match (a real jq
+/// feature -- jq 1.7.1 forks the whole `sub`/`gsub` call, producing one
+/// whole-string output per replacement value, verified live: `jq -c
+/// 'sub("a"; "x","y")'` on `"abc"` prints `"xbc"` then `"ybc"`) is not fully
+/// implemented here; `eval_sub_replacement` instead takes the first value,
+/// via `result_to_owned`'s policy, matching what the pre-#826 code already
+/// did when it pre-evaluated the whole replacement once. This is a
+/// deliberate, documented divergence (see that function's doc comment and
+/// follow-up #840), not a golden-fixture case (there is no single jq output
+/// to pin against). What this test guards against is a *regression* off
+/// that stopgap: earlier in #826's own review cycle, routing the
+/// per-match evaluation through `eval_owned_expr` (which array-collapses a
+/// multi-output filter) turned this into a hard type-mismatch error instead.
+#[test]
+fn test_sub_replacement_multi_value_takes_first_value() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-c", r#"sub("a"; "x","y")"#], Some(r#""abc""#))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "\"xbc\"\n");
+    Ok(())
+}
+
+/// `gsub` counterpart to the test above, routed through
+/// `stitch_replacements_evaluated` rather than `builtin_sub_with_flags`'s
+/// single-match arm -- a distinct call site for the same stopgap (#826).
+#[test]
+fn test_gsub_replacement_multi_value_takes_first_value() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-c", r#"gsub("a"; "x","y")"#], Some(r#""aa""#))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "\"xx\"\n");
+    Ok(())
+}
+
 /// `builtin_gsub_flags`'s flags-argument arm (`gsub(re; replacement; flags)`,
 /// the 3-arg form) -- same shape as `builtin_sub_flags`'s flags arm, but a
 /// distinct function/site in the source. Verified against jq 1.7.1:

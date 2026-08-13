@@ -6950,6 +6950,28 @@ fn stitch_split(input: &str, matches: &[regex::Captures]) -> Vec<String> {
 /// via [`capture_object`]) — not the original subject the regex matched
 /// against. This is what lets a replacement like `"[\(.x)]"` reference a
 /// named capture group it just matched (#826).
+///
+/// A replacement filter that produces more than one output for a single
+/// match (`sub("a"; "x","y")`) is a real jq feature this function does not
+/// implement: full support means forking the whole `sub`/`gsub` call across
+/// every combination the multi-valued matches produce (jq 1.7.1, verified
+/// live: `gsub("a"; "x","y")` on `"aa"` yields two whole-string outputs,
+/// `"xx"` and `"yy"`, not one string with both matches independently
+/// resolved). That is real, separable work — tracked as a follow-up rather
+/// than attempted here.
+///
+/// What this function does instead is deliberately *not* the natural
+/// consequence of routing through [`eval_owned_expr`] (array-collapsing a
+/// multi-output filter, which — unlike here, where the immediate caller can
+/// only accept a `String` — would turn this into a hard type-mismatch error,
+/// a regression from the pre-#826 code's behavior on this same input): it
+/// uses [`result_to_owned`]'s "take the first output" policy instead
+/// (`eval_owned_input`, not `eval_owned_expr`, so the stream survives long
+/// enough for `result_to_owned` to see more than one element), matching what
+/// the pre-#826 code already did when it pre-evaluated the whole replacement
+/// once via `result_to_owned(eval_single(...))`. Non-fatal, if not fully
+/// jq-correct, is the stopgap this function commits to until the follow-up
+/// lands.
 #[cfg(feature = "regex")]
 fn eval_sub_replacement<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     replacement_expr: &Expr,
@@ -6958,7 +6980,12 @@ fn eval_sub_replacement<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     optional: bool,
 ) -> Result<String, QueryResult<'a, W>> {
     let captures = capture_object(re, caps);
-    match eval_owned_expr::<S>(replacement_expr, &captures, optional) {
+    let result = result_to_owned(eval_owned_input::<W, S>(
+        replacement_expr,
+        &captures,
+        optional,
+    ));
+    match result {
         Ok(OwnedValue::String(s)) => Ok(s),
         Ok(_) if optional => Err(QueryResult::None),
         Ok(_) => Err(QueryResult::Error(EvalError::type_error(
@@ -7351,7 +7378,7 @@ fn builtin_sub_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // Replace first match. `replacement_expr` is evaluated once, only if
     // there is a match — jq never evaluates the replacement when nothing
     // matched (and there is no capture object to bind `.` to in that case).
-    match dv_captures_at(&re.re, &input, 0, re.needs_trailing_nl_check) {
+    match re.captures(&input) {
         Some(caps) => {
             let m = caps
                 .get(0)
@@ -7393,6 +7420,16 @@ fn builtin_gsub_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 }
 
 /// Builtin: gsub(re; replacement) or gsub(re; replacement; flags) - replace all matches
+///
+/// jq defines this as `sub($re; str; flags + "g")` — delegate straight into
+/// `builtin_sub_with_flags` instead of duplicating its pattern/input/
+/// regex-build boilerplate a second time. `'g'` is a no-op in
+/// `build_regex`'s own flag parser (it only ever affects
+/// `builtin_sub_with_flags`'s choice between its single-match and
+/// `stitch_replacements_evaluated` global-match arms, never the compiled
+/// pattern itself), so forcing it into `flags` here reliably selects the
+/// global arm — i.e. gsub's unconditional "replace every match" behavior —
+/// the same way an explicit `"g"` flag does for `sub`.
 #[cfg(feature = "regex")]
 fn builtin_gsub_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     re_expr: &Expr,
@@ -7401,39 +7438,14 @@ fn builtin_gsub_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    // Get the pattern
-    let pattern = match result_to_owned(eval_single::<W, S>(re_expr, value.clone(), optional)) {
-        Ok(OwnedValue::String(s)) => s,
-        Ok(_) if optional => return QueryResult::None,
-        Ok(_) => return QueryResult::Error(EvalError::type_error("string", "pattern")),
-        Err(e) => return e.into(),
-    };
-
-    // Get the input string
-    let input = match &value {
-        StandardJson::String(s) => match s.as_str() {
-            Ok(cow) => cow.into_owned(),
-            Err(_) if optional => return QueryResult::None,
-            Err(_) => return QueryResult::Error(EvalError::new("invalid string")),
-        },
-        _ if optional => return QueryResult::None,
-        _ => return QueryResult::Error(EvalError::cannot_be_matched(&to_owned(&value))),
-    };
-
-    // Build regex
-    let re = match build_regex(&pattern, flags) {
-        Ok(r) => r,
-        Err(_e) if optional => return QueryResult::None,
-        Err(e) => return e.into(),
-    };
-
-    // Replace all matches, re-evaluating `replacement_expr` against each
-    // match's own captures object (see `eval_sub_replacement`).
-    let matches = global_captures(&re, &input);
-    match stitch_replacements_evaluated::<W, S>(replacement_expr, &re, &input, &matches, optional) {
-        Ok(result) => QueryResult::Owned(OwnedValue::String(result)),
-        Err(qr) => qr,
-    }
+    let global_flags = format!("{}g", flags.unwrap_or(""));
+    builtin_sub_with_flags::<W, S>(
+        re_expr,
+        replacement_expr,
+        Some(&global_flags),
+        value,
+        optional,
+    )
 }
 
 /// Builtin: scan(re; flags) - find all matches with flags
