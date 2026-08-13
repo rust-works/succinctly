@@ -496,16 +496,21 @@ fn test_assignment_key_must_denote_a_component() {
         r#".[error("boom")] = 5"#,
         Outcome::error("boom"),
     );
-    // DIVERGENCE from jq 1.7.1: a `break` in a key is silent there, unwinding
-    // to the label and emitting nothing. The path pre-pass resolves keys with a
-    // plain `Result`, which has no way to carry a label out, so it reports the
-    // unwind rather than mapping it to "no paths" — the alternative would make
-    // `break` in a key indistinguishable from an empty key stream, which is a
-    // *successful* no-op assignment.
+    // A `break` in a key unwinds to the enclosing `label` and emits nothing,
+    // matching jq 1.7.1 exactly (#824). Before #824, the path pre-pass
+    // resolved keys through `PathResolveResult`'s `EvalEscape`, which had no
+    // way to carry a label out — every caller folded the break into a
+    // synthetic "not in label" error instead of letting `label $out` catch
+    // it. `EvalEscape::Break` now carries the label through, so this is a
+    // real, successful no-op assignment rather than an error — the same
+    // "no paths resolved" outcome an empty key stream already produces
+    // (confirmed via `label $out | .[break $out]` above, the read-side
+    // sibling of this write, which never had this gap since ordinary
+    // value-context indexing already propagated `Break` correctly).
     check(
         r#"{"a":1}"#,
         "label $out | (.[break $out] = 5)",
-        Outcome::error("break $out not in label"),
+        Outcome::values(&[]),
     );
 }
 

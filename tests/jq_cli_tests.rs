@@ -6328,30 +6328,186 @@ fn test_path_as_binding_propagates_error_from_partial_bind_stream() -> Result<()
 }
 
 #[test]
-fn test_path_as_binding_break_in_bind_stream_is_a_known_pre_existing_gap() -> Result<()> {
+fn test_path_as_binding_break_in_bind_stream_reaches_an_outer_label() -> Result<()> {
     // `Expr::As`'s `Some(Control::Break(label))` trailing-control arm,
     // reached when the bind source itself raises a labeled `break` after
-    // already producing an output. This documents a real, PRE-EXISTING
-    // divergence from real jq that predates #791 and isn't specific to
-    // `as`-bindings -- confirmed live that a bare, non-`as` comma reaches
-    // the exact same mismatch: `label $out | path((.a, break $out))` on
-    // `{"a":1}` also exits 5 with "break $out not in label" here, instead
-    // of real jq's exit 0 with `["a"]`. Path-context has no mechanism to
-    // let a `break` escape `resolve_node` and be caught by a `label`
-    // sitting *outside* the `path(...)` call (`PathResolveResult`'s error
-    // type, `EvalEscape`, has no `Break` variant to carry it), so every
-    // site that turns a path-context `Control::Break` into an ordinary
-    // "break $label not in label" `EvalError` -- this one and the
-    // pre-existing `eval_owned_multi` one alike -- shares this gap. Kept
-    // consistent with that existing behavior rather than fixed here; not a
-    // regression introduced by this arm. Filed as #824.
+    // already producing an output. Before #824, `resolve_node`'s error type
+    // (`EvalEscape`, threaded through `PathResolveResult`) had no way to
+    // carry a `Control::Break`, so every site that received one -- this arm
+    // and `eval_owned_multi` alike -- had no choice but to fold it into a
+    // synthetic "break $label not in label" `EvalError`, even when a
+    // `label` with that exact name was sitting right outside the
+    // `path(...)` call, fully able to catch it. `EvalEscape::Break` now
+    // carries the label through instead, so `label $out`, sitting outside
+    // this `path(...)` call, catches it cleanly: verified against jq 1.7.1,
+    // `label $out | path((1, break $out) as $x | .a)` on `{"a":1}` exits 0
+    // with `["a"]` (the `$x=1` iteration's own `body` resolution completing
+    // before the break), not an error.
     let (stdout, stderr, code) = run_jq_full(
         &["-c", "label $out | path((1, break $out) as $x | .a)"],
         Some(r#"{"a":1}"#),
     )?;
-    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
     assert_eq!(stdout, "[\"a\"]\n");
-    assert!(stderr.contains("break $out not in label"), "{stderr}");
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
+#[test]
+fn test_break_across_a_path_call_boundary_reaches_an_outer_label_824() -> Result<()> {
+    // Issue #824's own first repro: a `break $label` raised inside a
+    // `path(...)` call's argument couldn't reach a `label $label` sitting
+    // *outside* that call -- it degraded into a bogus "break $out not in
+    // label" error (exit 5) instead of unwinding cleanly, even though the
+    // output already resolved before the break (`["a"]`) still reached
+    // stdout first. Verified against jq 1.7.1. The issue's second repro,
+    // through an `as`-binding's bind source, is covered by
+    // `test_path_as_binding_break_in_bind_stream_reaches_an_outer_label`
+    // above rather than duplicated here.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "label $out | path((.a, break $out))"],
+        Some(r#"{"a":1}"#),
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[\"a\"]\n");
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
+#[test]
+fn test_break_inside_a_path_call_is_caught_by_a_label_inside_it_824() -> Result<()> {
+    // The mirror image of the boundary-crossing case above: a `label`
+    // sitting *inside* `path(...)` catches its own matching `break` right
+    // there -- `path(...)` still resolves normally, and (unlike a break
+    // that escapes `path(...)` entirely) evaluation continues afterward
+    // rather than unwinding any further. Verified against jq 1.7.1:
+    // `path(label $out | (.a, break $out))` is `["a"]`, and following it
+    // with another expression in the same enclosing label still reaches
+    // that expression.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "path(label $out | (.a, break $out))"],
+        Some(r#"{"a":1}"#),
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[\"a\"]\n");
+    assert_eq!(stderr, "");
+
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            r#"label $out | (path(label $out | (.a, break $out)), "after")"#,
+        ],
+        Some(r#"{"a":1}"#),
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[\"a\"]\n\"after\"\n");
+    assert_eq!(stderr, "");
+
+    // A *non-matching* break (still meant for something further out) is not
+    // this `label`'s to catch, so it propagates past it unchanged -- here as
+    // a plain error unrelated to any break at all, exercising the same
+    // catch-all fallthrough. Verified against jq 1.7.1: `path(label $out |
+    // error("boom"))` raises "boom", exit 5 (the `label` plays no role when
+    // there's no break to catch).
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r#"path(label $out | error("boom"))"#],
+        Some(r#"{"a":1}"#),
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert!(stderr.contains("boom"), "{stderr}");
+    Ok(())
+}
+
+#[test]
+fn test_try_catch_inside_a_path_call_catches_a_break_regardless_of_label_824() -> Result<()> {
+    // `try`/`catch` (and bare `?`, sugar for a catch-less `try`) intercept a
+    // `break` passing through them unconditionally, regardless of which
+    // label it targets -- the same rule the value-position evaluator's
+    // `eval_try` already applies (#562), now mirrored in path context
+    // (#824). `catch empty` here (rather than a handler that is itself not
+    // a valid path expression, e.g. `catch "x"`) sidesteps a separate,
+    // pre-existing gap in this same `Expr::Try` arm -- filed as #832 --
+    // where the resolved prefix is lost if the *handler itself* then fails
+    // as a path expression (#530); that gap already exists for the
+    // ordinary-error side of this arm too (`path(try (.a, .x[0]) catch
+    // "x")` on real jq 1.7.1, confirmed live: prefix `["a"]` on stdout,
+    // "Invalid path expression..." on stderr) and is not specific to break.
+    // Verified against jq 1.7.1: `path(try (.a, break $out) catch empty)`
+    // on `{"a":1}` is `["a"]`, exit 0 -- the break never reaches `$out` at
+    // all, catch runs before the label ever gets a chance.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "label $out | path(try (.a, break $out) catch empty)"],
+        Some(r#"{"a":1}"#),
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[\"a\"]\n");
+    assert_eq!(stderr, "");
+
+    // Bare `?` (no catch) prunes the break the same way, keeping just the
+    // prefix: `path((.a, break $out)?)` on `{"a":1}` is `["a"]`, exit 0.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "label $out | path((.a, break $out)?)"],
+        Some(r#"{"a":1}"#),
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[\"a\"]\n");
+    assert_eq!(stderr, "");
+
+    // `try EXPR` with *no* `catch` clause at all (distinct from bare `?`
+    // above at the AST level, `Expr::Try { catch: None, .. }` rather than
+    // `Expr::Optional`) catches the break the same unconditional way.
+    // Verified against jq 1.7.1: `path(try (.a, break $out))` on `{"a":1}`
+    // is `["a"]`, exit 0.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "label $out | path(try (.a, break $out))"],
+        Some(r#"{"a":1}"#),
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[\"a\"]\n");
+    assert_eq!(stderr, "");
+
+    // The catch handler itself raising a *different* error, rather than
+    // failing as a path expression (#530) — the same "catch runs, and its
+    // own failure propagates" shape, through the code path shared with
+    // #832's pre-existing gap (see the doc comment above): confirmed live,
+    // real jq's `path(try (.a, break $out) catch error("y"))` on `{"a":1}`
+    // prints the prefix `["a"]` then raises "y", exit 5. succinctly instead
+    // loses the prefix here (empty stdout) while still raising "y" and
+    // exiting 5 -- the handler's own failure is reported correctly, only
+    // the earlier prefix is dropped, which is #832's gap, not a new one
+    // this fix introduces.
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            r#"label $out | path(try (.a, break $out) catch error("y"))"#,
+        ],
+        Some(r#"{"a":1}"#),
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert!(stderr.contains("error (at <stdin>:"), "{stderr}");
+    assert!(stderr.trim_end().ends_with(": y"), "{stderr}");
+    Ok(())
+}
+
+#[test]
+fn test_limit_n_bound_break_inside_a_path_call_reaches_an_outer_label_824() -> Result<()> {
+    // `resolve_limit`'s own `n_expr` evaluation (`limit(n; f)`'s count) sits
+    // directly in `resolve_node`'s domain, adjacent to every other arm this
+    // PR fixed, so it was switched from `eval_owned_expr` (which still
+    // collapses a break into a synthetic "not in label" error, same as
+    // #833's broader, out-of-scope call sites) to `eval_owned_expr_ctrl`
+    // (which preserves `Control` losslessly), rather than leaving this one
+    // adjacent gap unfixed. Verified against jq 1.7.1: `path(limit(break
+    // $out; .a))` on `{"a":1}` produces no output, exit 0.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "label $out | path(limit(break $out; .a))"],
+        Some(r#"{"a":1}"#),
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(stderr, "");
     Ok(())
 }
 
