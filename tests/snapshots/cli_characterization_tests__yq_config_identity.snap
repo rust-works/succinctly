@@ -1,5 +1,6 @@
 ---
 source: tests/cli_characterization_tests.rs
+assertion_line: 159
 expression: "run(&[\"yq\", \".\"], YAML_CONFIG)?"
 ---
 apiVersion: v1
@@ -8,9 +9,7 @@ metadata:
   name: demo
 spec:
   containers:
-    -
-      name: web
+    - name: web
       image: nginx
-    -
-      name: sidecar
+    - name: sidecar
       image: envoy

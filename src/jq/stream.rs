@@ -127,7 +127,7 @@ impl StreamableValue for OwnedValue {
         indent: IndentSpec,
         sort_keys: bool,
     ) -> core::fmt::Result {
-        stream_owned_value_yaml(self, out, 0, indent.width, indent.unit, sort_keys)
+        stream_owned_value_yaml(self, out, "", indent.width, indent.unit, sort_keys)
     }
 
     fn is_falsy(&self) -> bool {
@@ -360,17 +360,39 @@ pub fn stream_lazy_keys_json<W: core::fmt::Write, F: DocumentFields>(
 // YAML Streaming
 // ============================================================================
 
+/// The literal character width of a block-sequence item's `- ` prefix
+/// (dash + one ASCII space) - always exactly 2 literal ASCII bytes,
+/// independent of the configured `indent_spaces`/`unit` (`-I`/`--tab`).
+/// Mirrors `crate::yaml::light`'s identically-named/valued constant (a
+/// separate local copy, not shared: the two live in different crate
+/// modules with no existing shared indent-primitives module, and the
+/// value is definitionally fixed - `"- "` - not something that could
+/// drift independently). See `stream_owned_value_yaml`'s `Array` arm
+/// (#785).
+const COMPACT_DASH_WIDTH: usize = 2;
+
 /// Stream an OwnedValue as YAML without intermediate string allocation.
 ///
-/// - `current_indent`: Current indentation level (number of `unit` characters)
-/// - `indent_spaces`: `unit` characters per indentation level (0 for flow style)
+/// - `indent`: the exact indent *string* to write at the start of this
+///   value's own subsequent block-style lines (not a `usize` repetition
+///   count) - needed because a real-yq "compact" block-sequence item's
+///   continuation offset ([`COMPACT_DASH_WIDTH`] literal ASCII spaces) and
+///   an ordinary `unit`-based nesting step have to interleave in the exact
+///   chronological order they were nested, which a
+///   `(current_indent: usize, extra_spaces: usize)` pair collapses into a
+///   fixed unit-then-extra order regardless of which happened first
+///   (#785) - mirrors `crate::yaml::light::stream_yaml_value`'s identical
+///   fix and its `deeper_yaml_indent`/`compact_yaml_indent` helpers (this
+///   module's `deeper_indent`/`compact_indent` below).
+/// - `indent_spaces`: `unit` characters per *ordinary* (non-compact)
+///   indentation level (0 for flow style)
 /// - `unit`: the character repeated `indent_spaces` times per level (`' '`
 ///   normally, `'\t'` for `--tab`)
 /// - `sort_keys`: sort object keys before writing (`-S`/`--sort-keys`)
 fn stream_owned_value_yaml<W: core::fmt::Write>(
     value: &OwnedValue,
     out: &mut W,
-    current_indent: usize,
+    indent: &str,
     indent_spaces: usize,
     unit: char,
     sort_keys: bool,
@@ -414,7 +436,7 @@ fn stream_owned_value_yaml<W: core::fmt::Write>(
                     if i > 0 {
                         out.write_str(", ")?;
                     }
-                    stream_owned_value_yaml(elem, out, 0, 0, unit, sort_keys)?;
+                    stream_owned_value_yaml(elem, out, "", 0, unit, sort_keys)?;
                 }
                 out.write_char(']')
             } else {
@@ -422,28 +444,36 @@ fn stream_owned_value_yaml<W: core::fmt::Write>(
                 for (i, elem) in arr.iter().enumerate() {
                     if i > 0 {
                         out.write_char('\n')?;
-                        write_indent(out, current_indent, unit)?;
+                        out.write_str(indent)?;
                     }
                     out.write_str("- ")?;
-                    // For nested containers, put on next line with extra indent
+                    // A non-empty container element renders in real yq's
+                    // "compact" form (#785): sharing `- `'s own line with
+                    // its first field/element rather than deferring to a
+                    // fully-indented line of its own. No leading indent is
+                    // written before recursing - this loop only writes one
+                    // for the 2nd+ *element* of `arr` above, mirroring the
+                    // same "no separate indent for the recursion's own
+                    // first line" trick `light.rs`'s cursor-based
+                    // renderers use.
                     if matches!(elem, OwnedValue::Array(_) | OwnedValue::Object(_))
                         && !is_empty_container(elem)
                     {
-                        out.write_char('\n')?;
-                        write_indent(out, current_indent + indent_spaces, unit)?;
+                        let child_indent = compact_indent(indent);
                         stream_owned_value_yaml(
                             elem,
                             out,
-                            current_indent + indent_spaces,
+                            &child_indent,
                             indent_spaces,
                             unit,
                             sort_keys,
                         )?;
                     } else {
+                        let child_indent = deeper_indent(indent, indent_spaces, unit);
                         stream_owned_value_yaml(
                             elem,
                             out,
-                            current_indent + indent_spaces,
+                            &child_indent,
                             indent_spaces,
                             unit,
                             sort_keys,
@@ -470,7 +500,7 @@ fn stream_owned_value_yaml<W: core::fmt::Write>(
                     }
                     stream_yaml_string(out, key)?;
                     out.write_str(": ")?;
-                    stream_owned_value_yaml(val, out, 0, 0, unit, sort_keys)?;
+                    stream_owned_value_yaml(val, out, "", 0, unit, sort_keys)?;
                 }
                 out.write_char('}')
             } else {
@@ -478,7 +508,7 @@ fn stream_owned_value_yaml<W: core::fmt::Write>(
                 for (i, (key, val)) in entries.into_iter().enumerate() {
                     if i > 0 {
                         out.write_char('\n')?;
-                        write_indent(out, current_indent, unit)?;
+                        out.write_str(indent)?;
                     }
                     stream_yaml_string(out, key)?;
                     out.write_str(":")?;
@@ -487,21 +517,23 @@ fn stream_owned_value_yaml<W: core::fmt::Write>(
                         && !is_empty_container(val)
                     {
                         out.write_char('\n')?;
-                        write_indent(out, current_indent + indent_spaces, unit)?;
+                        let child_indent = deeper_indent(indent, indent_spaces, unit);
+                        out.write_str(&child_indent)?;
                         stream_owned_value_yaml(
                             val,
                             out,
-                            current_indent + indent_spaces,
+                            &child_indent,
                             indent_spaces,
                             unit,
                             sort_keys,
                         )?;
                     } else {
                         out.write_char(' ')?;
+                        let child_indent = deeper_indent(indent, indent_spaces, unit);
                         stream_owned_value_yaml(
                             val,
                             out,
-                            current_indent + indent_spaces,
+                            &child_indent,
                             indent_spaces,
                             unit,
                             sort_keys,
@@ -524,12 +556,41 @@ fn is_empty_container(value: &OwnedValue) -> bool {
 }
 
 /// Write `width` copies of `unit` as indentation (`unit` is `' '` for
-/// space-indented output, `'\t'` for `--tab`).
+/// space-indented output, `'\t'` for `--tab`). JSON-only:
+/// `stream_owned_value_yaml` builds its own indent *strings* instead (see
+/// `deeper_indent`) - see its doc comment for why (#785).
 fn write_indent<W: core::fmt::Write>(out: &mut W, width: usize, unit: char) -> core::fmt::Result {
     for _ in 0..width {
         out.write_char(unit)?;
     }
     Ok(())
+}
+
+/// Build a new YAML block-style indent string one level deeper than
+/// `indent`: `indent_spaces` more copies of `unit` appended. The ordinary
+/// (non-compact) nesting step for `stream_owned_value_yaml` (#785) - see
+/// `compact_indent` for the other kind of step. Mirrors
+/// `crate::yaml::light::deeper_yaml_indent`.
+fn deeper_indent(indent: &str, indent_spaces: usize, unit: char) -> String {
+    let mut next = String::with_capacity(indent.len() + indent_spaces);
+    next.push_str(indent);
+    for _ in 0..indent_spaces {
+        next.push(unit);
+    }
+    next
+}
+
+/// Build a new YAML block-style indent string for a real-yq "compact"
+/// block-sequence item's continuation lines: [`COMPACT_DASH_WIDTH`] more
+/// literal ASCII spaces appended to `indent`, regardless of `unit` (#785).
+/// Mirrors `crate::yaml::light::compact_yaml_indent`.
+fn compact_indent(indent: &str) -> String {
+    let mut next = String::with_capacity(indent.len() + COMPACT_DASH_WIDTH);
+    next.push_str(indent);
+    for _ in 0..COMPACT_DASH_WIDTH {
+        next.push(' ');
+    }
+    next
 }
 
 /// Stream a string as YAML with smart quoting.
@@ -1024,9 +1085,9 @@ mod tests {
 
     #[test]
     fn test_stream_yaml_array_block_style_nested_container() {
-        // Covers the "nested containers get their own indented line" branch,
-        // distinct from the plain-scalar-element branch `test_stream_array`-
-        // style tests already exercise.
+        // Covers the "nested containers render in real yq's compact form"
+        // branch (#785), distinct from the plain-scalar-element branch
+        // `test_stream_array`-style tests already exercise.
         let mut buf = String::new();
         OwnedValue::Array(vec![
             OwnedValue::Array(vec![OwnedValue::Int(1)]),
@@ -1034,7 +1095,7 @@ mod tests {
         ])
         .stream_yaml(&mut buf, IndentSpec::spaces(2), false)
         .unwrap();
-        assert_eq!(buf, "- \n  - 1\n- 2");
+        assert_eq!(buf, "- - 1\n- 2");
     }
 
     #[test]

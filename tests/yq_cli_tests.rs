@@ -683,7 +683,9 @@ fn test_duplicate_mapping_key_to_entries_preserves_both() -> Result<()> {
     let (output, code) = run_yq_stdin("to_entries", yaml, &[])?;
 
     assert_eq!(code, 0);
-    assert_eq!(output, "-\n  key: a\n  value: 1\n-\n  key: a\n  value: 2\n");
+    // Each element renders in real yq's "compact" form (#785): `- ` shares
+    // its line with the mapping's own first field.
+    assert_eq!(output, "- key: a\n  value: 1\n- key: a\n  value: 2\n");
     Ok(())
 }
 
@@ -712,11 +714,13 @@ fn test_duplicate_mapping_key_survives_slurp() -> Result<()> {
 
     let (pretty, code) = run_yq_stdin(".", yaml, &["--slurp"])?;
     assert_eq!(code, 0);
-    assert_eq!(pretty, "-\n  a: 1\n  a: 2\n");
+    // Renders in real yq's "compact" form (#785): `- ` shares its line
+    // with the mapping's own first field.
+    assert_eq!(pretty, "- a: 1\n  a: 2\n");
 
     let (compact, code) = run_yq_stdin(".", yaml, &["--slurp", "-I0"])?;
     assert_eq!(code, 0);
-    assert_eq!(compact, "-\n  a: 1\n  a: 2\n");
+    assert_eq!(compact, "- a: 1\n  a: 2\n");
 
     Ok(())
 }
@@ -742,7 +746,9 @@ fn test_duplicate_mapping_key_survives_slurp_multiple_sources() -> Result<()> {
     let stdout = String::from_utf8(output.stdout)?;
 
     assert!(output.status.success());
-    assert_eq!(stdout, "-\n  a: 1\n  a: 2\n-\n  b: 3\n");
+    // Renders in real yq's "compact" form (#785): `- ` shares its line
+    // with the mapping's own first field.
+    assert_eq!(stdout, "- a: 1\n  a: 2\n- b: 3\n");
     Ok(())
 }
 
@@ -755,7 +761,9 @@ fn test_duplicate_mapping_key_survives_slurp_multiple_sources() -> Result<()> {
 fn test_slurp_exit_status_fast_path() -> Result<()> {
     let (output, code) = run_yq_stdin(".", "a: 1\n", &["--slurp", "-e"])?;
     assert_eq!(code, 0);
-    assert_eq!(output, "-\n  a: 1\n");
+    // Renders in real yq's "compact" form (#785): `- ` shares its line
+    // with the mapping's own first field.
+    assert_eq!(output, "- a: 1\n");
     Ok(())
 }
 
@@ -960,6 +968,100 @@ fn test_duplicate_mapping_key_survives_sort_keys_and_tab() -> Result<()> {
     let (json, code) = run_yq_stdin(".", yaml, &["-S", "--tab", "-o", "json"])?;
     assert_eq!(code, 0);
     assert_eq!(json, "{\n\t\"a\": 2,\n\t\"a\": 3,\n\t\"b\": 1\n}\n");
+
+    Ok(())
+}
+
+/// #785's compact-rendering fix has to align a block-sequence item's
+/// mapping/sequence value under `- `'s own literal 2-byte width, which
+/// can't be expressed as a repetition count of `unit` once `unit != ' '`
+/// (`--tab`) - real yq itself has no `--tab` flag at all to serve as an
+/// oracle here (`Error: unknown flag: --tab` against v4.53.3), so the bar
+/// this pins is self-consistency: the identity/M2 streaming path
+/// (`YamlCursor::stream_yaml_value`) and the DOM path (`emit_yaml_value`,
+/// forced via `map(.)`) must byte-match each other under `--tab`, not just
+/// each look individually plausible. A first version of this fix fed the
+/// alignment offset through the same `unit`-repetition helper as ordinary
+/// indentation, which under `--tab` wrote literal tab characters instead
+/// of the fixed-width literal-space offset `- ` itself always needs,
+/// producing two different (and differently wrong) outputs from the two
+/// paths for the same input.
+#[test]
+fn test_compact_seq_item_tab_self_consistent_785() -> Result<()> {
+    let yaml = "- a: 1\n  b: 2\n";
+
+    let (streamed, code) = run_yq_stdin(".", yaml, &["--tab"])?;
+    assert_eq!(code, 0);
+
+    let (dom, code) = run_yq_stdin("map(.)", yaml, &["--tab"])?;
+    assert_eq!(code, 0);
+
+    assert_eq!(streamed, dom);
+    // No outer indent level applies at the top level, so the only
+    // alignment in play here is the fixed 2-literal-ASCII-space compact
+    // offset itself - never tab characters, matching `- `'s own always-
+    // ASCII width.
+    assert_eq!(streamed, "- a: 1\n  b: 2\n");
+
+    Ok(())
+}
+
+/// Same self-consistency bar, but with a genuine outer `--tab` indent
+/// level *and* the compact offset both in play, and in the order that
+/// actually exposed the bug this pins: the compact transition happens
+/// *first* (the top-level array's own single element renders compactly,
+/// since it's a non-empty mapping), and only *then* does an ordinary
+/// `unit`-based nesting step follow (that mapping's `items` field defers
+/// its own array value to a new, further-indented line). A `(current_indent:
+/// usize, extra_spaces: usize)` representation collapses to a fixed
+/// unit-then-extra order regardless of which happened first, so it got
+/// this specific compact-then-normal ordering backwards even after the
+/// first `--tab` fix (`extra_spaces` always written after `current_indent`'s
+/// `unit` repeats, when here the literal-space compact offset actually
+/// came *before* the later tab step, chronologically) - only visible once
+/// a normal indent step follows a compact one under a non-space `unit`,
+/// which the top-level, no-further-nesting cases above don't exercise.
+/// The wrapper array element (rather than a bare top-level mapping) is
+/// required for the `map(.)` DOM-forcing query below to preserve
+/// structure: real jq's `map(f)` is `[.[] | f]`, and `.[]` on a bare
+/// object iterates its *values* (restructuring `{items: [...]}` into
+/// `[[...]]`), not its entries - wrapping in an array first makes `map(.)`
+/// a true per-element identity instead.
+#[test]
+fn test_compact_seq_item_tab_self_consistent_compact_then_normal_785() -> Result<()> {
+    let yaml = "- items:\n    - a: 1\n      b: 2\n";
+
+    let (streamed, code) = run_yq_stdin(".", yaml, &["--tab"])?;
+    assert_eq!(code, 0);
+
+    let (dom, code) = run_yq_stdin("map(.)", yaml, &["--tab"])?;
+    assert_eq!(code, 0);
+
+    assert_eq!(streamed, dom);
+    assert_eq!(streamed, "- items:\n  \t- a: 1\n  \t  b: 2\n");
+
+    Ok(())
+}
+
+/// Same self-consistency bar as [`test_compact_seq_item_tab_self_consistent_785`],
+/// for nested compact items (`- - 1\n  - 2\n`) - confirms the `--tab`
+/// alignment offset accumulates correctly across more than one compact
+/// transition, not just the first. No outer indent level applies at the
+/// top level, so - same as the single-level case - the only alignment in
+/// play is two lots of the fixed 2-literal-ASCII-space compact offset,
+/// never tab characters.
+#[test]
+fn test_compact_seq_item_tab_self_consistent_nested_785() -> Result<()> {
+    let yaml = "- - 1\n  - 2\n";
+
+    let (streamed, code) = run_yq_stdin(".", yaml, &["--tab"])?;
+    assert_eq!(code, 0);
+
+    let (dom, code) = run_yq_stdin("map(.)", yaml, &["--tab"])?;
+    assert_eq!(code, 0);
+
+    assert_eq!(streamed, dom);
+    assert_eq!(streamed, "- - 1\n  - 2\n");
 
     Ok(())
 }
@@ -3712,9 +3814,61 @@ fn test_slurp_color_output_yaml() -> Result<()> {
 
     let (output, code) = run_yq_stdin(".", yaml, &["--slurp", "-C"])?;
     assert_eq!(code, 0);
+    // Renders in real yq's "compact" form (#785): `- ` shares its line
+    // with the mapping's own first field. `colorize_yaml` is a simple
+    // single-pass text colorizer (its own scheme, not oracle-matched
+    // against real yq's `-C`, which uses entirely different codes/colors)
+    // whose `at_key_start` flag was never previously reachable directly
+    // after a list marker - compact form is the first shape that puts a
+    // key there instead of a value or a newline. It now peeks ahead
+    // (`compact_item_opens_with_key`) to tell a compact key from a bare
+    // scalar value in that position before deciding whether to color it,
+    // so this first "a" gets its cyan key coloring too, matching every
+    // other key in the document.
     assert_eq!(
         output,
-        "\u{1b}[33m-\u{1b}[0m\n  \u{1b}[36ma\u{1b}[0m: 1\n  \u{1b}[36ma\u{1b}[0m: 2\u{1b}[0m\n"
+        "\u{1b}[33m-\u{1b}[0m \u{1b}[36ma\u{1b}[0m: 1\n  \u{1b}[36ma\u{1b}[0m: 2\u{1b}[0m\n"
+    );
+
+    Ok(())
+}
+
+/// `compact_item_opens_with_key`'s quote-aware lookahead must skip a `:`
+/// that's inside a quoted compact-form key, not treat it as the
+/// key-indicating colon - and must still resolve `at_key_start` correctly
+/// once the quote closes and the *real* key-ending `:` follows. The
+/// quoted key itself renders green either way (`colorize_yaml`'s `"`/`'`
+/// arm colors it unconditionally, independent of `at_key_start`), so this
+/// doesn't change what's visible - it pins the lookahead's own quote
+/// entry/exit and in-quote-skip behavior directly, which no other test
+/// exercises.
+#[test]
+fn test_color_compact_quoted_key_with_colon_785() -> Result<()> {
+    let yaml = "- \"x: y\": 1\n  b: 2\n";
+
+    let (output, code) = run_yq_stdin(".", yaml, &["-C"])?;
+    assert_eq!(code, 0);
+    assert_eq!(
+        output,
+        "\u{1b}[33m-\u{1b}[0m \u{1b}[32m\"x: y\"\u{1b}[0m: 1\n  \u{1b}[36mb\u{1b}[0m: 2\u{1b}[0m\n"
+    );
+
+    Ok(())
+}
+
+/// Same as [`test_slurp_color_compact_quoted_key_with_colon_785`], for an
+/// escaped quote inside the compact-form quoted key - pins the lookahead's
+/// escape-skip branch (`if c == '\\' { chars.next(); }`), which the
+/// unescaped case above doesn't reach.
+#[test]
+fn test_color_compact_quoted_key_with_escaped_quote_785() -> Result<()> {
+    let yaml = "- \"a\\\"b: c\": 1\n  d: 2\n";
+
+    let (output, code) = run_yq_stdin(".", yaml, &["-C"])?;
+    assert_eq!(code, 0);
+    assert_eq!(
+        output,
+        "\u{1b}[33m-\u{1b}[0m \u{1b}[32m\"a\\\"b: c\"\u{1b}[0m: 1\n  \u{1b}[36md\u{1b}[0m: 2\u{1b}[0m\n"
     );
 
     Ok(())
@@ -7479,7 +7633,9 @@ fn test_eval_all_file_index_in_map() -> Result<()> {
         &["--eval-all"],
     )?;
     assert_eq!(code, 0);
-    assert_eq!(stdout, "-\n  a: 1\n  name: first\n");
+    // Renders in real yq's "compact" form (#785): `- ` shares its line
+    // with the mapping's own first field.
+    assert_eq!(stdout, "- a: 1\n  name: first\n");
     Ok(())
 }
 

@@ -1068,6 +1068,68 @@ mod tests {
         assert_eq!(field_key_line_comment_raw(yaml, "a"), None);
     }
 
+    /// Helper: like [`field_key_line_comment_raw`], but for a field of the
+    /// mapping that is itself the value of a block-sequence item's *first*
+    /// element - the only mapping entry parsed by `parse_compact_mapping_entry`
+    /// rather than `parse_mapping_entry` (issue #785).
+    fn seq_item_field_key_line_comment_raw(yaml: &[u8], key: &str) -> Option<String> {
+        use crate::yaml::light::YamlValue;
+
+        let index = YamlIndex::build(yaml).expect("valid YAML");
+        let root = index.root(yaml);
+        let YamlValue::Sequence(docs) = root.value() else {
+            panic!("root is always the virtual document sequence");
+        };
+        let (doc_cursor, _) = docs.uncons_cursor().expect("at least one document");
+        let YamlValue::Sequence(items) = doc_cursor.value() else {
+            panic!("expected a sequence document");
+        };
+        let (item_cursor, _) = items.uncons_cursor().expect("at least one item");
+        let YamlValue::Mapping(fields) = item_cursor.value() else {
+            panic!(
+                "expected item to be a mapping, got {:?}",
+                item_cursor.value()
+            );
+        };
+        for field in fields {
+            if let YamlValue::String(k) = field.key() {
+                if k.raw_bytes() == key.as_bytes() {
+                    return field
+                        .key_cursor()
+                        .line_comment_raw()
+                        .map(alloc::string::ToString::to_string);
+                }
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn test_key_line_comment_captured_for_seq_item_first_field_785() {
+        // The compact block-sequence form (`- key: value`, the item's
+        // first field sharing the dash's own line) parses that first
+        // field through a different function than an ordinary mapping
+        // entry (`parse_compact_mapping_entry` vs `parse_mapping_entry`) -
+        // a #765 regression this pins directly (issue #785).
+        let yaml = b"- a: # comment on key\n    b: 1\n";
+        assert_eq!(
+            seq_item_field_key_line_comment_raw(yaml, "a").as_deref(),
+            Some("# comment on key")
+        );
+    }
+
+    #[test]
+    fn test_key_line_comment_captured_for_seq_item_second_field_785() {
+        // A non-first field of the same mapping already went through
+        // `parse_mapping_entry` before #785 - included as a control case
+        // confirming the first-field fix doesn't disturb it.
+        let yaml = b"- x: 1\n  a: # comment on key\n    b: 2\n";
+        assert_eq!(
+            seq_item_field_key_line_comment_raw(yaml, "a").as_deref(),
+            Some("# comment on key")
+        );
+    }
+
     #[test]
     fn test_key_line_comment_not_captured_for_same_line_value_765() {
         // A comment trailing a same-line value belongs to the value (#710),

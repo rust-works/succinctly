@@ -1215,7 +1215,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
         sort_keys: bool,
     ) -> core::fmt::Result {
         self.write_leading_anchor(out)?;
-        self.stream_yaml_value(out, 0, indent.width, indent.unit, sort_keys)
+        self.stream_yaml_value(out, "", indent.width, indent.unit, sort_keys, false)
     }
 
     /// Like [`Self::stream_yaml`], but also appends this cursor's own
@@ -1251,7 +1251,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
     ) -> core::fmt::Result {
         self.write_leading_anchor(out)?;
         let value = self.value();
-        self.stream_yaml_value(out, 0, indent.width, indent.unit, sort_keys)?;
+        self.stream_yaml_value(out, "", indent.width, indent.unit, sort_keys, false)?;
         if matches!(value, YamlValue::Mapping(_) | YamlValue::Sequence(_)) {
             write_line_comment(out, self.line_comment_raw())?;
         }
@@ -1286,7 +1286,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
 
         // Multiple documents or not at root - output as-is
         self.write_leading_anchor(out)?;
-        self.stream_yaml_value(out, 0, indent.width, indent.unit, sort_keys)
+        self.stream_yaml_value(out, "", indent.width, indent.unit, sort_keys, false)
     }
 
     /// Write this cursor's own `&anchor` before streaming it as a YAML root.
@@ -1330,20 +1330,40 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
 
     /// Internal: stream this cursor's value as YAML.
     ///
-    /// - `unit`: the character repeated `indent_spaces` times per level
-    ///   (`' '` normally, `'\t'` for `--tab`).
+    /// - `indent`: the exact indent *string* to write at the start of this
+    ///   value's own subsequent block-style lines (not a `usize`
+    ///   repetition count) — needed because a real-yq "compact"
+    ///   block-sequence item's continuation offset ([`COMPACT_DASH_WIDTH`]
+    ///   literal ASCII spaces) and an ordinary `unit`-based nesting step
+    ///   have to interleave in the exact chronological order they were
+    ///   nested (#785); see [`deeper_yaml_indent`]/[`compact_yaml_indent`],
+    ///   which build the two kinds of "one level deeper" string this
+    ///   recurses with.
+    /// - `unit`: the character repeated `indent_spaces` times per
+    ///   *ordinary* (non-compact) indentation level (`' '` normally, `'\t'`
+    ///   for `--tab`).
     /// - `sort_keys`: sort each mapping's fields before writing (`-S`).
     ///   `YamlField` is `Copy`, so materializing a mapping's fields into a
     ///   `Vec` is cheap — cursor structs only, no value data — and is done
     ///   unconditionally so the sorted and unsorted cases share one loop
     ///   body; the `Vec` is only actually sorted when `-S` is requested.
+    /// - `known_not_flow`: `true` when the caller already resolved
+    ///   `self.style() != "flow"` for this exact cursor (the #785
+    ///   compact-rendering gate in the `Sequence` arm below and in
+    ///   `stream_yaml_sequence` both do), letting this call skip
+    ///   re-deriving it — `style()` walks `text_position()`
+    ///   (`bp_to_text_pos`) plus a byte scan, not free work to repeat
+    ///   twice per element on this crate's flagship streaming path.
+    ///   `false` everywhere else, which re-derives it as before.
+    #[allow(clippy::too_many_arguments)] // STYLE-0004: every param is threaded through this function's own recursion; a struct would hide the 1:1 relationship each has to a specific rendering decision
     fn stream_yaml_value<Out: core::fmt::Write>(
         &self,
         out: &mut Out,
-        current_indent: usize,
+        indent: &str,
         indent_spaces: usize,
         unit: char,
         sort_keys: bool,
+        known_not_flow: bool,
     ) -> core::fmt::Result {
         match self.value() {
             YamlValue::Null => out.write_str("null"),
@@ -1369,7 +1389,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                 if fields.is_empty() {
                     return out.write_str("{}");
                 }
-                if indent_spaces == 0 || self.style() == "flow" {
+                if indent_spaces == 0 || (!known_not_flow && self.style() == "flow") {
                     // Flow style
                     out.write_char('{')?;
                     let mut items: Vec<_> = fields.into_iter().collect();
@@ -1392,7 +1412,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                         if i == last_index {
                             let value_cursor = field.value_cursor();
                             let comment = value_cursor.line_comment_raw();
-                            write_flow_last_item_comment(out, comment, current_indent, unit)?;
+                            write_flow_last_item_comment(out, comment, indent)?;
                         }
                     }
                     out.write_char('}')
@@ -1411,7 +1431,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                     for field in items {
                         if !first {
                             out.write_char('\n')?;
-                            write_yaml_indent(out, current_indent, unit)?;
+                            out.write_str(indent)?;
                         }
                         first = false;
                         write_yaml_field_key(out, field)?;
@@ -1432,13 +1452,15 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                                 out.write_str(anchor)?;
                             }
                             out.write_char('\n')?;
-                            write_yaml_indent(out, current_indent + indent_spaces, unit)?;
+                            let child_indent = deeper_yaml_indent(indent, indent_spaces, unit);
+                            out.write_str(&child_indent)?;
                             value.stream_yaml_value(
                                 out,
-                                current_indent + indent_spaces,
+                                &child_indent,
                                 indent_spaces,
                                 unit,
                                 sort_keys,
+                                true,
                             )?;
                             write_line_comment(out, value.line_comment_raw())?;
                         } else if let Some(kc) = field
@@ -1458,12 +1480,14 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                                 out.write_str(anchor)?;
                                 out.write_char(' ')?;
                             }
+                            let child_indent = deeper_yaml_indent(indent, indent_spaces, unit);
                             value.stream_yaml_value(
                                 out,
-                                current_indent + indent_spaces,
+                                &child_indent,
                                 indent_spaces,
                                 unit,
                                 sort_keys,
+                                false,
                             )?;
                             // The value's own comment takes priority; fall
                             // back to the key's own comment when the value
@@ -1492,7 +1516,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                 if elements.is_empty() {
                     return out.write_str("[]");
                 }
-                if indent_spaces == 0 || self.style() == "flow" {
+                if indent_spaces == 0 || (!known_not_flow && self.style() == "flow") {
                     // Flow style
                     out.write_char('[')?;
                     let mut first = true;
@@ -1505,7 +1529,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                         write_yaml_child_inline(out, cursor, unit, sort_keys)?;
                         if rest.is_empty() {
                             let comment = cursor.line_comment_raw();
-                            write_flow_last_item_comment(out, comment, current_indent, unit)?;
+                            write_flow_last_item_comment(out, comment, indent)?;
                         }
                         elems = rest;
                     }
@@ -1517,30 +1541,61 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                     while let Some((cursor, rest)) = elems.uncons_cursor() {
                         if !first {
                             out.write_char('\n')?;
-                            write_yaml_indent(out, current_indent, unit)?;
+                            out.write_str(indent)?;
                         }
                         first = false;
-                        // Check if value needs newline. A container value
-                        // gets a bare `-` (no trailing space) followed by its
-                        // own indented line — matching real yq and the
-                        // DOM/pretty-printer, and avoiding a stray trailing
-                        // space before the newline.
-                        if is_yaml_cursor_container(&cursor) && cursor.style() != "flow" {
-                            out.write_char('-')?;
+                        // A non-empty, non-flow mapping/sequence value
+                        // renders in real yq's "compact" form: `- ` shares
+                        // its line with the value's own first field/element,
+                        // and the rest of the value's own content aligns
+                        // under that first line's content — i.e.
+                        // `compact_yaml_indent(indent)`, [`COMPACT_DASH_WIDTH`]
+                        // more literal ASCII spaces than the current level
+                        // already has (never `deeper_yaml_indent`'s
+                        // `unit`-based step, which can differ under
+                        // `-I`/`--tab`) (#785). `stream_yaml_value`'s own
+                        // Mapping/Sequence loops already skip the leading
+                        // indent for their first field/element (only 2nd+
+                        // write `indent` before their own content), so
+                        // simply writing `- ` here and recursing with the
+                        // new indent string is enough — no separate
+                        // "compact" rendering path needed.
+                        //
+                        // An anchor written directly on the item's own line
+                        // (`- &x\n  ...`) occupies that slot instead, so the
+                        // value stays deferred to its own line in that case,
+                        // matching real yq. (An anchor sharing the first
+                        // key's own line, e.g. `- &x a: 1`, isn't captured
+                        // by `cursor.anchor()` here at all — a separate,
+                        // pre-existing gap, out of scope for #785.)
+                        let style = cursor.style();
+                        if is_yaml_cursor_container(&cursor) && style != "flow" {
                             if let Some(anchor) = cursor.anchor() {
-                                out.write_char(' ')?;
-                                out.write_char('&')?;
+                                out.write_str("- &")?;
                                 out.write_str(anchor)?;
+                                out.write_char('\n')?;
+                                let child_indent = deeper_yaml_indent(indent, indent_spaces, unit);
+                                out.write_str(&child_indent)?;
+                                cursor.stream_yaml_value(
+                                    out,
+                                    &child_indent,
+                                    indent_spaces,
+                                    unit,
+                                    sort_keys,
+                                    true,
+                                )?;
+                            } else {
+                                out.write_str("- ")?;
+                                let child_indent = compact_yaml_indent(indent);
+                                cursor.stream_yaml_value(
+                                    out,
+                                    &child_indent,
+                                    indent_spaces,
+                                    unit,
+                                    sort_keys,
+                                    true,
+                                )?;
                             }
-                            out.write_char('\n')?;
-                            write_yaml_indent(out, current_indent + indent_spaces, unit)?;
-                            cursor.stream_yaml_value(
-                                out,
-                                current_indent + indent_spaces,
-                                indent_spaces,
-                                unit,
-                                sort_keys,
-                            )?;
                             write_line_comment(out, cursor.line_comment_raw())?;
                         } else {
                             out.write_str("- ")?;
@@ -1549,12 +1604,14 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                                 out.write_str(anchor)?;
                                 out.write_char(' ')?;
                             }
+                            let child_indent = deeper_yaml_indent(indent, indent_spaces, unit);
                             cursor.stream_yaml_value(
                                 out,
-                                current_indent + indent_spaces,
+                                &child_indent,
                                 indent_spaces,
                                 unit,
                                 sort_keys,
+                                false,
                             )?;
                             write_line_comment(out, cursor.line_comment_raw())?;
                         }
@@ -5499,6 +5556,24 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentElements for YamlElements<'a, W> {
 // YAML Streaming Helpers
 // ============================================================================
 
+/// The literal character width of a block-sequence item's `- ` prefix
+/// (dash + one ASCII space) — always exactly 2 literal ASCII bytes,
+/// independent of the configured `indent_spaces`/`unit` (`-I`/`--tab`).
+/// Real yq's "compact" form for a sequence item whose value is a
+/// non-empty mapping/sequence aligns the value's own continuation lines
+/// under this width, not under `indent_spaces` (verified against `yq`
+/// v4.53.3 with `-I1` through `-I6`: the alignment never moves, only the
+/// sequence item's *own* indent does).
+///
+/// This offset is always written as literal `' '` characters directly —
+/// never fed through [`write_yaml_indent`]'s `unit`-repetition — because
+/// `- ` itself is always literal ASCII regardless of `unit`; under
+/// `--tab` (`unit == '\t'`), multiplying this width by `unit` would
+/// literally double-tab the continuation instead of producing a 2-column
+/// visual offset. See `stream_yaml_value`'s `Sequence` block-style arm
+/// and `stream_yaml_sequence`'s `extra_spaces` parameter (#785).
+const COMPACT_DASH_WIDTH: usize = 2;
+
 /// Check if a cursor points to a non-empty container.
 ///
 /// Uses `is_container()` + `first_child()` directly rather than `cursor.value()`:
@@ -5538,7 +5613,14 @@ fn is_deferred_value_absent<W: AsRef<[u64]>>(value: &YamlCursor<'_, W>) -> bool 
 }
 
 /// Write `width` copies of `unit` as indentation (`unit` is `' '` for
-/// space-indented output, `'\t'` for `--tab`).
+/// space-indented output, `'\t'` for `--tab`). JSON-only: `stream_yaml_value`
+/// and `stream_yaml_sequence` build their own indent *strings* instead (see
+/// [`deeper_yaml_indent`]) since a real-yq "compact" block-sequence item's
+/// continuation offset can't always be expressed as a pure repetition count
+/// once a normal `unit`-based nesting step follows a compact one - the two
+/// have to interleave in the exact chronological order they were nested,
+/// which a `(width: usize, extra: usize)` pair collapses into a fixed
+/// unit-then-extra order regardless of which happened first (#785).
 fn write_yaml_indent<Out: core::fmt::Write>(
     out: &mut Out,
     width: usize,
@@ -5548,6 +5630,33 @@ fn write_yaml_indent<Out: core::fmt::Write>(
         out.write_char(unit)?;
     }
     Ok(())
+}
+
+/// Build a new YAML block-style indent string one level deeper than
+/// `indent`: `indent_spaces` more copies of `unit` appended. The ordinary
+/// (non-compact) nesting step for `stream_yaml_value`/`stream_yaml_sequence`
+/// (#785) - see [`compact_yaml_indent`] for the other kind of step.
+fn deeper_yaml_indent(indent: &str, indent_spaces: usize, unit: char) -> String {
+    let mut next = String::with_capacity(indent.len() + indent_spaces);
+    next.push_str(indent);
+    for _ in 0..indent_spaces {
+        next.push(unit);
+    }
+    next
+}
+
+/// Build a new YAML block-style indent string for a real-yq "compact"
+/// block-sequence item's continuation lines: [`COMPACT_DASH_WIDTH`] more
+/// literal ASCII spaces appended to `indent`, regardless of `unit` - `- `
+/// is always exactly that many literal bytes wide, independent of the
+/// configured indent character (#785).
+fn compact_yaml_indent(indent: &str) -> String {
+    let mut next = String::with_capacity(indent.len() + COMPACT_DASH_WIDTH);
+    next.push_str(indent);
+    for _ in 0..COMPACT_DASH_WIDTH {
+        next.push(' ');
+    }
+    next
 }
 
 /// Write a mapping field's key.
@@ -5590,7 +5699,7 @@ fn write_yaml_child_inline<W: AsRef<[u64]>, Out: core::fmt::Write>(
         out.write_str(anchor)?;
         out.write_char(' ')?;
     }
-    value.stream_yaml_value(out, 0, 0, unit, sort_keys)
+    value.stream_yaml_value(out, "", 0, unit, sort_keys, false)
 }
 
 /// Write a trailing same-line comment after a value, if present (issue
@@ -5631,14 +5740,13 @@ fn write_line_comment<Out: core::fmt::Write>(
 fn write_flow_last_item_comment<Out: core::fmt::Write>(
     out: &mut Out,
     comment: Option<&str>,
-    current_indent: usize,
-    unit: char,
+    indent: &str,
 ) -> core::fmt::Result {
     if let Some(c) = comment {
         out.write_char(' ')?;
         out.write_str(c)?;
         out.write_char('\n')?;
-        write_yaml_indent(out, current_indent, unit)?;
+        out.write_str(indent)?;
     }
     Ok(())
 }
@@ -5654,8 +5762,9 @@ fn write_flow_last_item_comment<Out: core::fmt::Write>(
 ///
 /// Mirrors the `Sequence` block/flow-style rendering in `stream_yaml_value`
 /// exactly (same container-vs-scalar branching, same empty-sequence `"[]"`
-/// shortcut) so multi-document slurped output matches single-document M2
-/// streaming byte-for-byte.
+/// shortcut, same `#785` compact-form handling and per-item trailing-
+/// comment write) so multi-document slurped output matches single-document
+/// M2 streaming byte-for-byte.
 pub fn stream_yaml_sequence<'a, W, I, Out>(
     cursors: I,
     out: &mut Out,
@@ -5694,22 +5803,45 @@ where
                 write_yaml_indent(out, current_indent, unit)?;
             }
             first = false;
-            if is_yaml_cursor_container(&cursor) {
-                out.write_char('-')?;
+            // Mirrors `stream_yaml_value`'s `Sequence` block-style arm
+            // exactly, including its `#785` compact-form handling (see the
+            // comment there). This function is never itself called
+            // recursively (it's only ever the outermost entry point - the
+            // `--slurp` array itself), so `current_indent` has no inherited
+            // compact "extra spaces" baggage of its own yet - converting it
+            // to a plain `unit`-repeated string here before handing off to
+            // `stream_yaml_value` (which *is* recursive and needs the
+            // general string form) is exact, not an approximation.
+            let style = cursor.style();
+            if is_yaml_cursor_container(&cursor) && style != "flow" {
                 if let Some(anchor) = cursor.anchor() {
-                    out.write_char(' ')?;
-                    out.write_char('&')?;
+                    out.write_str("- &")?;
                     out.write_str(anchor)?;
+                    out.write_char('\n')?;
+                    let child_indent = deeper_yaml_indent("", current_indent + indent_spaces, unit);
+                    out.write_str(&child_indent)?;
+                    cursor.stream_yaml_value(
+                        out,
+                        &child_indent,
+                        indent_spaces,
+                        unit,
+                        sort_keys,
+                        true,
+                    )?;
+                } else {
+                    out.write_str("- ")?;
+                    let own_indent = deeper_yaml_indent("", current_indent, unit);
+                    let child_indent = compact_yaml_indent(&own_indent);
+                    cursor.stream_yaml_value(
+                        out,
+                        &child_indent,
+                        indent_spaces,
+                        unit,
+                        sort_keys,
+                        true,
+                    )?;
                 }
-                out.write_char('\n')?;
-                write_yaml_indent(out, current_indent + indent_spaces, unit)?;
-                cursor.stream_yaml_value(
-                    out,
-                    current_indent + indent_spaces,
-                    indent_spaces,
-                    unit,
-                    sort_keys,
-                )?;
+                write_line_comment(out, cursor.line_comment_raw())?;
             } else {
                 out.write_str("- ")?;
                 if let Some(anchor) = cursor.anchor() {
@@ -5717,13 +5849,16 @@ where
                     out.write_str(anchor)?;
                     out.write_char(' ')?;
                 }
+                let child_indent = deeper_yaml_indent("", current_indent + indent_spaces, unit);
                 cursor.stream_yaml_value(
                     out,
-                    current_indent + indent_spaces,
+                    &child_indent,
                     indent_spaces,
                     unit,
                     sort_keys,
+                    false,
                 )?;
+                write_line_comment(out, cursor.line_comment_raw())?;
             }
         }
         Ok(())
@@ -6700,7 +6835,11 @@ mod tests {
 
         let mut out = String::new();
         stream_yaml_sequence([cursor_a, cursor_b], &mut out, 0, 2, ' ', false).unwrap();
-        assert_eq!(out, "-\n  a: 1\n- 2");
+        // The mapping element renders in real yq's "compact" form (#785):
+        // `- ` shares its line with the mapping's own first (and only)
+        // field, rather than a bare `-` deferring the whole mapping to an
+        // indented line of its own.
+        assert_eq!(out, "- a: 1\n- 2");
     }
 
     #[test]
@@ -6717,7 +6856,44 @@ mod tests {
             .root(yaml)
             .stream_yaml_document(&mut out, IndentSpec::spaces(2), false)
             .unwrap();
-        assert_eq!(out, "-\n  a: 1\n-\n  b: 2");
+        // Each mapping element renders in real yq's "compact" form (#785):
+        // `- ` shares its line with the mapping's own first field, rather
+        // than a bare `-` deferring the whole mapping to an indented line.
+        assert_eq!(out, "- a: 1\n- b: 2");
+    }
+
+    #[test]
+    fn test_stream_yaml_sequence_item_anchor_stays_deferred_785() {
+        // An anchor written on the item's own line (`- &x\n  ...`) occupies
+        // the compact slot `stream_yaml_value`'s Sequence arm otherwise
+        // gives to the value's first field/element, so the mapping stays
+        // deferred to its own indented line rather than going compact -
+        // matching real yq (verified against v4.53.3). Covers the
+        // `cursor.anchor()` branch `stream_yaml_value`'s Sequence arm added
+        // for #785.
+        let yaml = b"- &x\n  a: 1\n  b: 2\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let mut out = String::new();
+        index
+            .root(yaml)
+            .stream_yaml_document(&mut out, IndentSpec::spaces(2), false)
+            .unwrap();
+        assert_eq!(out, "- &x\n  a: 1\n  b: 2");
+    }
+
+    #[test]
+    fn test_stream_yaml_sequence_item_anchor_stays_deferred_slurp_785() {
+        // Same as `test_stream_yaml_sequence_item_anchor_stays_deferred_785`,
+        // exercised through `stream_yaml_sequence` (the `--slurp` fast
+        // path) instead of `stream_yaml_value`'s Sequence arm - covers the
+        // equivalent `cursor.anchor()` branch added there for parity.
+        let bytes_a = b"&x\n  a: 1\n  b: 2\n".to_vec();
+        let index_a = YamlIndex::build(&bytes_a).unwrap();
+        let cursor_a = index_a.root(&bytes_a).first_child().unwrap();
+
+        let mut out = String::new();
+        stream_yaml_sequence([cursor_a], &mut out, 0, 2, ' ', false).unwrap();
+        assert_eq!(out, "- &x\n  a: 1\n  b: 2");
     }
 
     #[test]
@@ -10851,11 +11027,14 @@ mod tests {
 
         let mut out = String::new();
         stream_yaml_sequence([cursor_a, cursor_b], &mut out, 0, 2, ' ', false).unwrap();
-        // `stream_yaml_sequence`'s block branch always puts a mapping item on
-        // its own line (unlike `stream_yaml_value`'s Sequence arm, it doesn't
-        // gate on `.style() != "flow"` — pre-existing, unrelated to #712);
-        // the anchor/alias preservation itself is what's under test here.
-        assert_eq!(out, "-\n  a: &x 1\n  c: *x\n-\n  b: &y 2\n  d: *y");
+        // Each mapping item renders in real yq's "compact" form (#785): `- `
+        // shares its line with the mapping's own first field, rather than a
+        // bare `-` deferring the whole mapping to an indented line - now
+        // mirroring `stream_yaml_value`'s Sequence arm exactly, including its
+        // `.style() != "flow"` gate (a pre-existing parity gap this also
+        // closed). The anchor/alias preservation itself is what's under test
+        // here.
+        assert_eq!(out, "- a: &x 1\n  c: *x\n- b: &y 2\n  d: *y");
     }
 
     // =========================================================================
