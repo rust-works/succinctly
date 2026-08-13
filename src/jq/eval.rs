@@ -9279,9 +9279,19 @@ fn owned_type_name(value: &OwnedValue) -> &'static str {
 /// impossible for the *next* combinator too.
 fn needs_path_prepass(expr: &Expr) -> bool {
     match expr {
-        Expr::Identity | Expr::Field(_) | Expr::Index(_) | Expr::Slice { .. } | Expr::Iterate => {
-            false
-        }
+        Expr::Identity | Expr::Field(_) | Expr::Index(_) | Expr::Slice { .. } => false,
+        // `Iterate` alone doesn't need `resolve_node`'s help to be *understood*
+        // -- `walk_path` and friends handle it natively, same as the other
+        // arms above. But unlike them it isn't necessarily single-valued, and
+        // `resolve_seq`'s own "nothing needs prepass" fast path assumes
+        // exactly that: it hands its whole static tail to
+        // `value_after_components`, which collapses any component producing
+        // != 1 output to `Null` -- silently discarding every branch but one
+        // whenever a trailing bare `.foo[]`/`.foo[]?` reaches a 2+-element
+        // container (#682). Treating `Iterate` as prepass-needing routes it
+        // through the same per-element fan-out loop already used for a
+        // genuine computed key, which resolves it correctly.
+        Expr::Iterate => true,
         Expr::Pipe(exprs) => exprs.iter().any(needs_path_prepass),
         Expr::Optional(inner) | Expr::Paren(inner) => needs_path_prepass(inner),
         _ => true,
