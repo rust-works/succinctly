@@ -10173,10 +10173,18 @@ fn resolve_against_cow<'a, S: EvalSemantics>(
 /// live: `path(try (.a, .x[0]) catch empty)` on `{"a":1,"x":5}` prints
 /// `["a"]`, not nothing).
 ///
-/// If `catch_expr` itself then fails, the `?` below returns its `Err`
-/// directly, losing `prefix` rather than threading it into the returned
-/// tuple — a separate, pre-existing gap in this same arm (#832), not fixed
-/// here.
+/// If `catch_expr` itself then fails — with an ordinary error (including
+/// #530's "Invalid path expression"), a `break` targeting some outer label,
+/// or a `halt`/`halt_error` — `prefix` (and whatever partial output the
+/// handler itself already resolved before its own failure) is threaded into
+/// the returned `Err` rather than dropped, matching every other arm in this
+/// resolver (`Expr::Comma`, `Expr::As`, ...) that already keeps its
+/// accumulated prefix on the error path (#832; before this fix, all three
+/// escape kinds silently discarded `prefix` here — confirmed live:
+/// `path(try (.a, .x[0]) catch "x")` on `{"a":1,"x":5}` dropped `["a"]`
+/// before raising `"x"`'s own #530 error, and
+/// `label $out | path(try (.a, break $out) catch error("y"))` on `{"a":1}`
+/// dropped `["a"]` before raising `"y"`).
 fn resolve_catch<'a, S: EvalSemantics>(
     catch: Option<&Expr>,
     prefix: Vec<PathBranch<'a>>,
@@ -10186,8 +10194,16 @@ fn resolve_catch<'a, S: EvalSemantics>(
         None => Ok(prefix),
         Some(catch_expr) => {
             let mut out = prefix;
-            out.extend(resolve_against_cow::<S>(catch_expr, Cow::Owned(payload))?);
-            Ok(out)
+            match resolve_against_cow::<S>(catch_expr, Cow::Owned(payload)) {
+                Ok(handled) => {
+                    out.extend(handled);
+                    Ok(out)
+                }
+                Err((handler_prefix, escape)) => {
+                    out.extend(handler_prefix);
+                    Err((out, escape))
+                }
+            }
         }
     }
 }
@@ -29316,6 +29332,46 @@ mod tests {
         // means nothing is written at all — no partial prefix here.
         query!(br#"{"a":1}"#, "(.a, 1) = 5",
             QueryResult::Error(e) => assert_eq!(e.message, "Invalid path expression with result 1")
+        );
+    }
+
+    /// #832: `resolve_catch` (shared by `resolve_node`'s `Expr::Try` arm's
+    /// `Error` and `Break` cases) used a bare `?` on the catch handler's own
+    /// resolution, discarding `prefix` -- whatever the failed `try` body had
+    /// already resolved -- the instant the handler itself failed, instead of
+    /// threading it into the returned `Err` the way every sibling arm here
+    /// does (e.g. `test_path_keeps_the_prefix_before_a_later_sibling_errors`
+    /// above). Ordinary-error variant: the handler's own output (`"x"`) is
+    /// not a valid path expression (#530's gate). Verified against jq 1.7.1:
+    /// `path(try (.a, .x[0]) catch "x")` on `{"a":1,"x":5}` prints `["a"]`
+    /// (the `.a` branch, resolved before `.x[0]` failed) then raises
+    /// "Invalid path expression with result \"x\"", exit 5.
+    #[test]
+    fn test_path_try_catch_handler_error_keeps_prefix_832() {
+        query!(br#"{"a":1,"x":5}"#, r#"path(try (.a, .x[0]) catch "x")"#,
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(prefix_json(&vs), [r#"["a"]"#]);
+                assert!(e.is_invalid_path_expression(), "{}", e.message);
+            }
+        );
+    }
+
+    /// #832, break variant: the same `resolve_catch` helper is reached via
+    /// the `Expr::Try` arm's `Break` case (rather than its `Error` case
+    /// above) once `catch` intercepts a `break` (#824, #562's "catch catches
+    /// break the same way it catches error" rule) -- and the handler itself
+    /// then raises an ordinary error. Verified against jq 1.7.1: `label $out
+    /// | path(try (.a, break $out) catch error("y"))` on `{"a":1}` prints
+    /// `["a"]` then raises "y", exit 5.
+    #[test]
+    fn test_path_try_catch_handler_break_keeps_prefix_832() {
+        query!(
+            br#"{"a":1}"#,
+            r#"label $out | path(try (.a, break $out) catch error("y"))"#,
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(prefix_json(&vs), [r#"["a"]"#]);
+                assert_eq!(e.message, "y");
+            }
         );
     }
 
