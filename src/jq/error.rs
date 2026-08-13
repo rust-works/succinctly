@@ -54,6 +54,62 @@ pub struct EvalError {
 pub enum Control {
     Error(EvalError),
     Break(String),
+    /// `halt`/`halt_error(n)`: exit the whole process with this code. Unlike
+    /// `Error`/`Break`, this must NOT be caught by `try`/`catch` or
+    /// `label`/`break` (confirmed against real jq: both bypass it entirely) —
+    /// carried as its own variant rather than reusing `Error` so those two
+    /// handlers' existing `other => other` fallthrough passes it through
+    /// unchanged without needing to special-case it.
+    Halt(i32),
+}
+
+/// How an owned-evaluation helper's expression stopped: a genuine error that
+/// `try`/`catch` may handle and `?` may suppress, or a `halt` that nothing may
+/// catch (#791).
+///
+/// This is the error type of `result_to_owned`, `eval_owned_multi` and the
+/// other `eval.rs` helpers that evaluate a sub-expression to owned values. An
+/// earlier design smuggled a halt through [`EvalError`] behind a marker field,
+/// which made correctness opt-in at every call site: the natural
+/// `Err(e) => QueryResult::Error(e)` silently turned a halt into a catchable
+/// error, and review kept finding missed sites. Carrying the two cases as
+/// distinct variants makes that mistake unrepresentable — an `EvalError` can
+/// no longer *be* a halt, so only an explicit wildcard arm can misroute one.
+///
+/// Consumers should write `Err(EvalEscape::Error(e))` for the catchable case
+/// and let everything else flow through the `From` conversions into
+/// `QueryResult`/[`Control`], which preserve `Halt` by construction. Never
+/// write `Err(_) => …-that-discards` — that is the one remaining way to lose
+/// a halt.
+#[derive(Debug, Clone, PartialEq)]
+pub enum EvalEscape {
+    /// A genuine evaluation error — catchable by `try`/`catch`, suppressible
+    /// by `?`.
+    Error(EvalError),
+    /// `halt`/`halt_error(n)`: exit the whole process with this code. Must
+    /// reach the CLI unconditionally; never catchable, never suppressible.
+    Halt(i32),
+}
+
+impl From<EvalError> for EvalEscape {
+    fn from(e: EvalError) -> Self {
+        Self::Error(e)
+    }
+}
+
+impl From<EvalError> for Control {
+    fn from(e: EvalError) -> Self {
+        Self::Error(e)
+    }
+}
+
+impl From<EvalEscape> for Control {
+    fn from(escape: EvalEscape) -> Self {
+        match escape {
+            EvalEscape::Error(e) => Self::Error(e),
+            EvalEscape::Halt(code) => Self::Halt(code),
+        }
+    }
 }
 
 /// jq truncates values embedded in error messages to a fixed-width buffer

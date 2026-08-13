@@ -85,6 +85,17 @@ pub struct StreamStats {
     /// diagnostic belongs on stderr and must set the process exit code, which
     /// only the caller can do. Handing it back here keeps it off stdout (#355).
     pub error: Option<StreamError>,
+
+    /// A `halt`/`halt_error(n)` exit code, if the result was one.
+    ///
+    /// Mutually exclusive with `error`: unlike an ordinary uncaught error, a
+    /// halt is not a diagnostic to render — it is a request to exit the whole
+    /// process with this code, immediately, with no further evaluation. A
+    /// caller must check this field *before* `error` and call the CLI's own
+    /// halt-request path with it, rather than reporting it through the
+    /// ordinary error-diagnostic path — otherwise the real exit code is lost
+    /// and a halt is misreported as a generic failure (#791).
+    pub halt: Option<i32>,
 }
 
 /// An uncaught evaluation error surfaced by a streaming operation.

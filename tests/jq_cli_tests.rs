@@ -2821,6 +2821,582 @@ fn test_uncaught_error_exits_5() -> Result<()> {
     Ok(())
 }
 
+// `halt`, `halt_error`/`halt_error(n)`, and `stderr` (#791). Every byte-exact
+// expectation below was captured directly from real `jq` (1.7.1 and 1.8.2,
+// via `xxd` on separately-redirected stdout/stderr -- `2>&1` interleaves the
+// two streams misleadingly, since stdout is buffered when piped but stderr
+// is not) rather than assumed from the manual page wording.
+
+#[test]
+fn test_halt_exits_0_with_no_output() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-n", "halt"], None)?;
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout, "");
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
+#[test]
+fn test_halt_prints_outputs_produced_before_it() -> Result<()> {
+    // Verified against jq 1.7.1/1.8.2: `jq -n '1,2,halt,3'` prints `1` and
+    // `2` then exits 0 -- nothing after `halt` runs.
+    let (stdout, stderr, code) = run_jq_full(&["-n", "1,2,halt,3"], None)?;
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout, "1\n2\n");
+    Ok(())
+}
+
+#[test]
+fn test_halt_error_string_prints_raw_with_no_trailing_newline() -> Result<()> {
+    // Verified against jq 1.7.1/1.8.2: stderr is exactly `foo` (no quotes,
+    // no newline); stdout is empty (halt_error never passes its value
+    // through, unlike `stderr`); exit code defaults to 5.
+    let (stdout, stderr, code) = run_jq_full(&["-n", r#""foo" | halt_error"#], None)?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(stderr, "foo");
+    Ok(())
+}
+
+#[test]
+fn test_halt_error_non_string_prints_compact_json_with_trailing_newline() -> Result<()> {
+    // Verified against jq 1.7.1/1.8.2: non-string, non-null values print as
+    // compact JSON *with* a trailing newline -- unlike the string case above.
+    for (filter, want_stderr) in [
+        (r#"[1,2,"a b"] | halt_error"#, "[1,2,\"a b\"]\n"),
+        (r#"{"a":1} | halt_error"#, "{\"a\":1}\n"),
+        ("false | halt_error", "false\n"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-n", filter], None)?;
+        assert_eq!(code, 5, "{filter}: stdout: {stdout:?} stderr: {stderr:?}");
+        assert_eq!(stdout, "", "{filter}");
+        assert_eq!(stderr, want_stderr, "{filter}");
+    }
+    Ok(())
+}
+
+#[test]
+fn test_halt_error_null_prints_nothing() -> Result<()> {
+    // Verified against jq 1.7.1/1.8.2: `null` is the one value `halt_error`
+    // special-cases to print *nothing* at all (not even "null").
+    let (stdout, stderr, code) = run_jq_full(&["-n", "null | halt_error(9)"], None)?;
+    assert_eq!(code, 9, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
+#[test]
+fn test_halt_error_custom_exit_code() -> Result<()> {
+    // Verified against jq 1.7.1/1.8.2: `halt_error(n)` exits with `n`, not
+    // the default 5.
+    let (stdout, stderr, code) = run_jq_full(&["-n", r#""foo" | halt_error(7)"#], None)?;
+    assert_eq!(code, 7, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(stderr, "foo");
+    Ok(())
+}
+
+#[test]
+fn test_stderr_passes_through_and_prints_raw_compact_with_no_newline() -> Result<()> {
+    // Verified against jq 1.7.1/1.8.2: `stderr` always writes with no
+    // trailing newline (unlike halt_error's non-string case), raw for
+    // strings and compact JSON for everything else including `null` (unlike
+    // halt_error's null-skips-entirely rule) -- and passes its input through
+    // unchanged to stdout via the normal output path.
+    for (filter, want_stdout, want_stderr) in [
+        (r#""hello" | stderr"#, "\"hello\"\n", "hello"),
+        ("[1,2] | stderr", "[1,2]\n", "[1,2]"),
+        ("null | stderr", "null\n", "null"),
+        ("false | stderr", "false\n", "false"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-n", "-c", filter], None)?;
+        assert_eq!(code, 0, "{filter}: stderr: {stderr:?}");
+        assert_eq!(stdout, want_stdout, "{filter}");
+        assert_eq!(stderr, want_stderr, "{filter}");
+    }
+    Ok(())
+}
+
+#[test]
+fn test_halt_not_caught_by_try_catch_or_label() -> Result<()> {
+    // Verified live against jq 1.7.1/1.8.2: none of these ever print
+    // "caught", and the exit code is `halt`/`halt_error`'s own, not
+    // whatever `try`/`catch`/`label` would otherwise produce.
+    for (filter, want_code) in [
+        (r#"try (halt) catch "caught""#, 0),
+        (r#"try ("x"|halt_error) catch "caught""#, 5),
+        (r"label $out | (halt, break $out)", 0),
+        (r#"("x"|halt_error)? // "fallback""#, 5),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-n", filter], None)?;
+        assert_eq!(code, want_code, "{filter}: stderr: {stderr:?}");
+        assert!(!stdout.contains("caught"), "{filter}: stdout: {stdout:?}");
+        assert!(!stdout.contains("fallback"), "{filter}: stdout: {stdout:?}");
+    }
+    Ok(())
+}
+
+// Follow-up fixes to #791's halt-propagation sweep: a code-review pass found
+// several `eval_single`-consuming sites that read `QueryResult` directly via
+// a wildcard match instead of the new `result_to_owned`/`query_result_from_error`
+// helpers, so a halt reaching them was misreported as an ordinary error, a
+// bogus boolean, or silently swallowed. Every expectation below was verified
+// live against jq 1.7.1.
+
+#[test]
+fn test_halt_not_caught_by_try_catch_in_path_expression() -> Result<()> {
+    // `resolve_node`'s `Expr::Try` arm (the separate path-expression resolver
+    // behind `path()`, `=`, `|=`, `del()`) used to treat a halt smuggled back
+    // through `EvalError::halt_escape` as an ordinary catchable error.
+    // Verified against jq 1.7.1: `jq -n '1, del(try halt_error(9) catch empty), 2'`
+    // prints `1` and exits 9 -- the halt is never caught, so `2` never runs.
+    let (stdout, stderr, code) =
+        run_jq_full(&["-n", "1, del(try halt_error(9) catch empty), 2"], None)?;
+    assert_eq!(code, 9, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "1\n");
+    Ok(())
+}
+
+#[test]
+fn test_halt_not_caught_by_bare_optional_in_path_expression() -> Result<()> {
+    // `resolve_node`'s `Expr::Optional` blanket arm used to discard the
+    // error object entirely -- including any halt marker inside it -- as if
+    // it were a suppressed `?` failure. Verified against jq 1.7.1:
+    // `jq -n 'del((halt_error(4))?)'` exits 4, not 0.
+    let (stdout, stderr, code) = run_jq_full(&["-n", "del((halt_error(4))?)"], None)?;
+    assert_eq!(code, 4, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_halt_not_caught_by_try_catch_in_update_assignment() -> Result<()> {
+    // Same root cause as the `path()`/`del()` cases above, reached via `|=`:
+    // `eval_update`'s own top-level halt check never fires because the halt
+    // is already gone by the time `resolve_node` returns. Verified against
+    // jq 1.7.1: exits 9 after printing `1`.
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-n",
+            "{\"a\":1} | 1, ((try halt_error(9) catch empty) |= .+1), 2",
+        ],
+        None,
+    )?;
+    assert_eq!(code, 9, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "1\n");
+    Ok(())
+}
+
+#[test]
+fn test_isempty_propagates_halt_instead_of_answering_false() -> Result<()> {
+    // `builtin_isempty`'s wildcard arm used to answer `false` for a halt
+    // with zero prior outputs, exiting 0. Verified against jq 1.7.1:
+    // `jq -n 'isempty(halt_error(14))'` exits 14 with no output.
+    let (stdout, stderr, code) = run_jq_full(&["-n", "isempty(halt_error(14))"], None)?;
+    assert_eq!(code, 14, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_setpath_propagates_halt_in_path_argument() -> Result<()> {
+    // `builtin_setpath`'s path-array argument used to misreport a halt as
+    // "Path must be specified as an array". Verified against jq 1.7.1:
+    // `jq -n 'setpath([(halt_error(6))]; 1)'` exits 6.
+    let (stdout, stderr, code) = run_jq_full(&["-n", "setpath([(halt_error(6))]; 1)"], None)?;
+    assert_eq!(code, 6, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_setpath_propagates_halt_in_value_argument() -> Result<()> {
+    // `builtin_setpath`'s value argument used to fall through to `null`,
+    // silently writing `null` instead of halting. Verified against jq 1.7.1:
+    // `jq -n '{} | setpath(["a"]; halt_error(13))'` exits 13 with no output.
+    let (stdout, stderr, code) =
+        run_jq_full(&["-n", r#"{} | setpath(["a"]; halt_error(13))"#], None)?;
+    assert_eq!(code, 13, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_delpaths_propagates_halt_in_paths_argument() -> Result<()> {
+    // `builtin_delpaths` had the identical gap as `builtin_setpath` above.
+    // Verified against jq 1.7.1: `jq -n '{"a":1} | delpaths([(halt_error(7))])'`
+    // exits 7.
+    let (stdout, stderr, code) =
+        run_jq_full(&["-n", "{\"a\":1} | delpaths([(halt_error(7))])"], None)?;
+    assert_eq!(code, 7, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_nth_stream_propagates_halt_in_n_argument() -> Result<()> {
+    // The two-argument `nth(n; expr)` form matched its `n` argument's result
+    // directly; the wildcard arm turned a halt into a generic type error.
+    // Verified against jq 1.7.1: `jq -n 'nth(halt_error(12); 1,2,3)'` exits 12.
+    let (stdout, stderr, code) = run_jq_full(&["-n", "nth(halt_error(12); 1,2,3)"], None)?;
+    assert_eq!(code, 12, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_bsearch_propagates_halt_in_target_argument() -> Result<()> {
+    // `builtin_bsearch`'s target-expression wildcard swallowed a halt as if
+    // the target produced no value. Verified against jq 1.7.1:
+    // `jq -n '[1,2,3] | bsearch(halt_error(15))'` exits 15.
+    let (stdout, stderr, code) = run_jq_full(&["-n", "[1,2,3] | bsearch(halt_error(15))"], None)?;
+    assert_eq!(code, 15, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_parent_propagates_halt_in_n_argument() -> Result<()> {
+    // `Builtin::ParentN`'s `n`-argument wildcard swallowed a halt smuggled
+    // back through the `EvalEscape` a `Result<_, EvalEscape>`-typed helper
+    // returns, treating it as an ordinary `optional` failure and answering
+    // `QueryResult::None` instead. `parent` is a succinctly extension (real
+    // jq has no such builtin), so this is checked against succinctly's own
+    // halt-propagation contract rather than jq: `parent(halt_error(9))?`
+    // must still exit 9, not 0, matching every other `?`-suppressible
+    // builtin argument in this file.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", ".a.b | parent(halt_error(9))?"],
+        Some(r#"{"a":{"b":1}}"#),
+    )?;
+    assert_eq!(code, 9, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_path_context_optional_does_not_swallow_halt_in_builtin_arm() -> Result<()> {
+    // `eval_pipe_with_path_context_internal`'s `Expr::Builtin` arm (reached
+    // whenever a pipe needs `key`/`parent`/`file_index`/`path` tracking) used
+    // to check `optional` before checking for a smuggled-back halt, the same
+    // shape of bug `ParentN` had one arm over. Verified live against jq
+    // 1.7.1's contract that `?` never suppresses `halt`/`halt_error`:
+    // `.a.b | (has(halt_error(9)))?, key` must exit 9 with no output --
+    // `.a.b`'s value feeds the pipe's right side as input, it is never
+    // itself printed, and the halt inside `has(...)`'s argument aborts
+    // before the comma's `key` branch ever runs.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", ".a.b | (has(halt_error(9)))?, key"],
+        Some(r#"{"a":{"b":{"c":1}}}"#),
+    )?;
+    assert_eq!(code, 9, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_path_context_optional_does_not_swallow_halt_in_object_literal_arm() -> Result<()> {
+    // Same bug shape as the `Expr::Builtin` arm above, one arm over: object
+    // construction inside a path-context pipe.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", ".a.b | ({x: halt_error(9)})?, key"],
+        Some(r#"{"a":{"b":{"c":1}}}"#),
+    )?;
+    assert_eq!(code, 9, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_compound_assign_propagates_halt_after_partial_rhs_output() -> Result<()> {
+    // `eval_rhs_once`'s `Partial(vs, _control)` arm took the RHS stream's
+    // first output and silently dropped a trailing halt, so a compound
+    // assignment whose RHS produced a value and *then* halted finished the
+    // assignment and exited 0. Verified against jq 1.7.1: `{"a":0} | .a +=
+    // (1, halt_error(3))` exits 3 with no output at all -- the halt fires
+    // while still computing the RHS, before `+=` ever produces the modified
+    // document that would otherwise be this input's one output.
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", ".a += (1, halt_error(3))"], Some(r#"{"a":0}"#))?;
+    assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_isvalid_propagates_halt_instead_of_answering_true() -> Result<()> {
+    // `builtin_isvalid`'s wildcard `_ => Bool(true)` arm swallowed
+    // `QueryResult::Halt`, answering `true` and letting evaluation continue
+    // -- the same bug class already fixed for `isempty` above.
+    let (stdout, stderr, code) = run_jq_full(&["-n", "isvalid(halt_error(3)), \"after\""], None)?;
+    assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_isvalid_propagates_halt_from_error_message_expression() -> Result<()> {
+    // A distinct site from the one above: `isvalid` forces `optional=true`
+    // down its whole subtree, and `eval_error`'s own `Err(_) if optional`
+    // arm used to swallow a halt reached while evaluating `error(msg)`'s
+    // message expression before `isvalid` ever saw the result. Fixing
+    // `isvalid`'s own wildcard alone does not fix this one.
+    let (stdout, stderr, code) =
+        run_jq_full(&["-n", "isvalid(error(halt_error(3))), \"after\""], None)?;
+    assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_range_halt_not_caught_by_try_catch() -> Result<()> {
+    // `range_arg`'s wildcard arm downgraded a halt in a range bound to a
+    // fresh "Range bounds must be numeric" `EvalError`, making it an
+    // ordinary catchable error -- the clearest possible violation of the
+    // "halt is never caught" contract, since `try`/`catch` is the mechanism
+    // that must never see it.
+    let (stdout, stderr, code) =
+        run_jq_full(&["-n", "try (range(halt_error(3))) catch \"caught\""], None)?;
+    assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_pow_propagates_halt_in_argument() -> Result<()> {
+    // `get_number_from_result`'s wildcard arm -- shared by every two-arg
+    // math builtin (`pow`, `atan2`, ...) -- consumed a halt and reported
+    // "expected number" instead.
+    let (stdout, stderr, code) = run_jq_full(&["-n", "pow(halt_error(3); 2)"], None)?;
+    assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_repeat_propagates_halt_instead_of_running_to_iteration_cap() -> Result<()> {
+    // `eval_owned_expr_ctrl`'s `Partial(vs, _control)` arm collapsed a
+    // multi-output result to first-value-or-array and dropped a trailing
+    // halt, so a `repeat` body that output a value and then halted on the
+    // *same* iteration kept looping instead of stopping -- silently
+    // discarding the halt every round until hitting the internal iteration
+    // cap. `repeat` is a succinctly extension (no upstream jq builtin), so
+    // this is checked against succinctly's own contract: the halt must win
+    // on the very first iteration, giving exit 3 and no output, not a
+    // 1000-element array and exit 0.
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-n",
+            "[repeat(if . > 2 then error(\"done\") else (. + 1, halt_error(3)) end)]?",
+        ],
+        None,
+    )?;
+    assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_halt_error_document_sourced_float_exit_code() -> Result<()> {
+    // `builtin_halt_error`'s numeric-code match covered `Float` and
+    // `NumberLiteral(Int)` but not `NumberLiteral(Float)` -- what `to_owned`
+    // produces for every non-integer number read from a document -- so a
+    // float exit code from `.` raised "requires a number exit code" instead
+    // of halting. Verified against jq 1.7.1: `echo 2.5 | jq 'halt_error(.)'`
+    // writes `2.5` to stderr and exits 2 (the float truncated toward zero).
+    let (stdout, stderr, code) = run_jq_full(&["halt_error(.)"], Some("2.5"))?;
+    assert_eq!(code, 2, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(stderr, "2.5\n");
+    Ok(())
+}
+
+#[test]
+fn test_stderr_nan_prints_json_null_not_text_format() -> Result<()> {
+    // `builtin_stderr` used `owned_to_string` -- the string-interpolation
+    // renderer, which spells non-finite floats `NaN`/`inf` -- instead of
+    // `to_json`'s compact-JSON convention. Verified against jq 1.7.1:
+    // `jq -n 'nan | stderr'` writes literal `null` to stderr, matching how
+    // JSON represents (the un-representable) NaN.
+    let (stdout, stderr, code) = run_jq_full(&["-n", "-c", "nan | stderr"], None)?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stderr, "null");
+    assert_eq!(stdout, "null\n");
+    Ok(())
+}
+
+#[test]
+fn test_debug_msg_argument_halt_propagates() -> Result<()> {
+    // `builtin_debug_msg` never evaluated its `msg` argument at all (a
+    // pre-existing library-context no-print stub), which after halt/
+    // halt_error's introduction made `debug(msg)` the one builtin argument
+    // position where a halt had zero effect -- no stderr write, no exit
+    // code. Verified against jq 1.7.1: `jq -n 'debug(halt_error(3))'` exits
+    // 3 (the pre-existing no-print policy for `msg`'s *text* is unchanged;
+    // only its control effects must reach the process).
+    let (stdout, stderr, code) = run_jq_full(&["-n", "debug(halt_error(3)), \"after\""], None)?;
+    assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_debug_msg_argument_error_propagates() -> Result<()> {
+    // Code-review follow-up (#791): the fix above only forwarded a `Halt`
+    // out of `msg`'s evaluation, matching only the `Err(EvalEscape::Halt)`
+    // arm and silently discarding a plain `Err(EvalEscape::Error(_))` the
+    // same way it discarded a successful `Ok(_)` -- so `debug(error(...))`
+    // printed the original input and exited 0 instead of erroring. Real
+    // jq's `builtin.jq` defines `debug(msg)` as a plain pipe
+    // (`(msg|debug|empty), .`, no `try`/`?`), so an error while evaluating
+    // `msg` aborts the whole expression. Verified against jq 1.7.1:
+    // `echo 1 | jq 'debug(error("boom"))'` exits 5 with the error on
+    // stderr, never reaching stdout.
+    let (stdout, stderr, code) = run_jq_full(&["debug(error(\"boom\"))"], Some("1"))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert!(stderr.contains("boom"), "stderr: {stderr:?}");
+    Ok(())
+}
+
+#[test]
+fn test_paths_filter_halt_on_scalar_root() -> Result<()> {
+    // `builtin_paths_filter` only evaluated `filter` against nodes reached
+    // by non-root paths, never the root itself, so for an input with no
+    // non-root paths (`null`, a scalar, an empty container) `filter` never
+    // ran at all -- `paths(halt_error(3))` was silently never invoked.
+    // Verified against jq 1.7.1: `jq -n 'null | [paths(halt_error(3))]'`
+    // exits 3, since real jq's `paths(node_filter)` evaluates `node_filter`
+    // against every node `recurse` visits, root included, even though the
+    // root's own path never appears in the output.
+    let (stdout, stderr, code) = run_jq_full(&["-n", "null | [paths(halt_error(3))]"], None)?;
+    assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_halt_error_negative_exit_code_floors_to_zero() -> Result<()> {
+    // Real jq clamps any negative `halt_error(n)` argument to exit code 0,
+    // rather than letting the OS's usual two's-complement byte-truncation of
+    // a negative process-exit status produce a nonzero code. Verified live
+    // against jq 1.7.1 for every value below.
+    for filter in [
+        r#""x" | halt_error(-1)"#,
+        r#""x" | halt_error(-100)"#,
+        r#""x" | halt_error(-2147483648)"#,
+        r#""x" | halt_error(-infinite)"#,
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-n", filter], None)?;
+        assert_eq!(code, 0, "{filter}: stdout: {stdout:?} stderr: {stderr:?}");
+    }
+    Ok(())
+}
+
+#[test]
+fn test_halt_error_positive_and_special_exit_codes_unaffected() -> Result<()> {
+    // Sanity check that the negative-floor fix above didn't disturb the
+    // already-correct positive/NaN/+infinity handling. Verified against jq
+    // 1.7.1. Platform-independent rows only; see the `#[cfg(unix)]` block
+    // below for the two that depend on Unix's exit-status byte truncation.
+    for (filter, want_code) in [
+        (r#""x" | halt_error(nan)"#, 0),
+        (r#""x" | halt_error(7)"#, 7),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-n", filter], None)?;
+        assert_eq!(
+            code, want_code,
+            "{filter}: stdout: {stdout:?} stderr: {stderr:?}"
+        );
+    }
+
+    // `halt_error`'s own saturating cast to i32 (see its doc comment) is
+    // platform-independent and matches real jq's untruncated i32::MAX exit
+    // code on every OS. What's Unix-specific is only the *observed* exit
+    // code here: `WEXITSTATUS` truncates `process::exit(i32::MAX)` to its
+    // low byte (255), while Windows' `ExitStatus::code()` returns the full
+    // i32 untouched. There is no Windows CI leg exercising this today, so
+    // this gate documents a latent portability difference rather than
+    // guarding an active failure.
+    #[cfg(unix)]
+    for (filter, want_code) in [
+        (r#""x" | halt_error(4294967296)"#, 255),
+        (r#""x" | halt_error(infinite)"#, 255),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-n", filter], None)?;
+        assert_eq!(
+            code, want_code,
+            "{filter}: stdout: {stdout:?} stderr: {stderr:?}"
+        );
+    }
+
+    Ok(())
+}
+
+#[test]
+fn test_computed_index_streams_keys_produced_before_halt() -> Result<()> {
+    // `eval_index_expr`'s key stream used to discard already-produced keys
+    // when the key generator itself later halted, printing nothing instead
+    // of the indexed values for the keys already yielded. Verified against
+    // jq 1.7.1: `echo '[10,20,30]' | jq '.[(1,2,halt)]'` prints `20` then
+    // `30` before halting. Piped stdin input exercises the cursor-based
+    // evaluator (`eval_generic.rs`), distinct from the `-n` literal-array
+    // path (`eval.rs`) -- both must agree.
+    let (stdout, stderr, code) = run_jq_full(&[".[(1,2,halt)]"], Some("[10,20,30]"))?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout, "20\n30\n");
+
+    let (stdout, stderr, code) = run_jq_full(&["-n", "[10,20,30] | .[(1,2,halt)]"], None)?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout, "20\n30\n");
+    Ok(())
+}
+
+#[test]
+fn test_computed_index_still_conservative_on_error_and_break() -> Result<()> {
+    // The fix above is deliberately halt-specific: `Error`/`Break` keep the
+    // pre-existing, documented conservative behavior (discard the prefix
+    // rather than stream it), matching real jq's own gap here -- see
+    // `eval_index_expr`'s doc comment. `Error` still aborts the whole
+    // process (exit 5), it just doesn't print `20`/`30` first.
+    let (stdout, stderr, code) = run_jq_full(&[r#".[(1,2,error("boom"))]"#], Some("[10,20,30]"))?;
+    assert_eq!(code, 5);
+    assert_eq!(stdout, "");
+    assert!(stderr.contains("boom"));
+    Ok(())
+}
+
+#[test]
+fn test_computed_index_target_error_after_pending_halt_still_streams_prefix() -> Result<()> {
+    // #791 follow-up: unlike the key-stream's own error/break above, a later
+    // key's *index* error (not the key stream itself) had no test coverage
+    // and dropped its already-indexed prefix -- and, since the key stream
+    // here already recorded `pending_halt` before any indexing happened, it
+    // discarded that too. Verified against jq 1.7.1/1.8.2: `{"a":1} |
+    // .[("a", 5, halt)]` prints `1`, then errors "Cannot index object with
+    // number" (exit 5) -- jq's interleaved generator means the type error on
+    // key `5` fires before the key stream ever reaches `halt`. Piped stdin
+    // exercises `eval_generic.rs`; `-n` exercises `eval.rs` -- both must
+    // agree.
+    let (stdout, stderr, code) = run_jq_full(&[r#".[("a", 5, halt)]"#], Some(r#"{"a":1}"#))?;
+    assert_eq!(code, 5);
+    assert_eq!(stdout, "1\n");
+    assert!(
+        stderr.contains("Cannot index object with number"),
+        "{stderr}"
+    );
+
+    let (stdout, stderr, code) = run_jq_full(&["-n", r#"{"a":1} | .[("a", 5, halt)]"#], None)?;
+    assert_eq!(code, 5);
+    assert_eq!(stdout, "1\n");
+    assert!(
+        stderr.contains("Cannot index object with number"),
+        "{stderr}"
+    );
+    Ok(())
+}
+
 #[test]
 fn test_693_optional_around_stream_stops_at_the_first_error() -> Result<()> {
     // The `jq`/`yq` CLIs' default path evaluates through `eval_generic`'s
@@ -3669,5 +4245,3759 @@ fn test_top_level_map_lazy_seq_sort_keys_path_725() -> Result<()> {
     assert_eq!(output, "");
     assert!(stderr.contains("break $out not in label"), "{stderr}");
 
+    Ok(())
+}
+
+#[test]
+fn test_path_halt_after_partial_resolution_converts_via_evalescape_into_control() -> Result<()> {
+    // `error.rs`'s `impl From<EvalEscape> for Control` -- specifically its
+    // `EvalEscape::Halt(code) => Self::Halt(code)` arm (line 110) -- is
+    // reached from exactly one call site: `builtin_path`'s
+    // `partial(paths, e.into())`, where `e: EvalEscape` comes from
+    // `resolve_dynamic_indexes`/`resolve_node`'s `Expr::Comma` arm.
+    // `path(.a, halt_error(3))` resolves `.a` into a path successfully
+    // first (populating `paths`), then hits the halt while resolving the
+    // second comma branch -- `paths` is non-empty at that point, so
+    // `builtin_path` takes the `partial(paths, e.into())` branch, not its
+    // `paths.is_empty()` sibling (which instead goes through `eval.rs`'s
+    // own separate `impl From<EvalEscape> for QueryResult` and never
+    // touches this line). Verified against jq 1.7.1: `jq -c 'path(.a,
+    // halt_error(3))'` on `{"a":1}` prints `["a"]` to stdout (the path
+    // resolved before the halt), `{"a":1}` to stderr (halt_error's
+    // non-string value -- `.` at the point of the halt is still the whole
+    // input, since `,` evaluates each branch against the same value), and
+    // exits 3.
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", "path(.a, halt_error(3))"], Some(r#"{"a":1}"#))?;
+    assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[\"a\"]\n");
+    assert_eq!(stderr, "{\"a\":1}\n");
+    Ok(())
+}
+
+#[test]
+fn test_input_dsv_streaming_halt_aborts_remaining_rows() -> Result<()> {
+    // The `--input-dsv` streaming loop's `if let Some(code) = sink.halted()
+    // { out.flush()?; return Ok(code); }` check (jq_runner.rs, added by
+    // #791) used to be entirely absent: a halt raised while evaluating one
+    // row was recorded in `sink` but nothing inspected it until the whole
+    // rows/files loop finished naturally, letting every later row's filter
+    // keep running (and its output print) after the halt fired.
+    // `--input-dsv` is a succinctly-only extension (real jq has no DSV
+    // input mode), so this is checked against succinctly's own contract,
+    // not jq: row 1 prints normally, row 2's filter halts, and row 3 --
+    // which would print `["c","d"]` if this check were missing -- must
+    // never be reached.
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "--input-dsv",
+            ",",
+            "-c",
+            r#"if .[0] == "HALT" then halt_error(9) else . end"#,
+        ],
+        Some("a,b\nHALT,x\nc,d\n"),
+    )?;
+    assert_eq!(code, 9, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[\"a\",\"b\"]\n");
+    assert_eq!(stderr, "[\"HALT\",\"x\"]\n");
+    Ok(())
+}
+
+#[test]
+fn test_lazyseq_map_halt_propagates_through_evaluate_input_sort_keys_path() -> Result<()> {
+    // `evaluate_input`'s `GenericResult::LazySeq(seq) => match
+    // seq.materialize_atomic() { ... Err(jq::Control::Halt(code)) =>
+    // sink.request_halt(code) ... }` arm (jq_runner.rs) is the non-lazy CLI
+    // path used whenever `-S`/`-s`/`-R`/`--color-output`/`--ascii-output`/
+    // `--input-dsv` is set -- a separate copy of this match from the
+    // default lazy-bytes path's own (see the next test). `keys_unsorted |
+    // map(...)` on an object builds a `LazySeq` (#724/#725's composability
+    // engine: `LazyKeys | map(f)` stays lazy instead of materializing
+    // eagerly), and `-S` (sort_keys) forces `can_use_lazy_path` false,
+    // routing evaluation through `evaluate_input` instead of
+    // `evaluate_bytes_lazy`. Verified against jq 1.7.1: `jq -S
+    // 'keys_unsorted | map(if . == "a" then halt_error(3) else . end)'` on
+    // `{"a":1,"b":2}` exits 3 with no stdout and stderr `a` (the halted
+    // value, a string, printed raw).
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-S",
+            r#"keys_unsorted | map(if . == "a" then halt_error(3) else . end)"#,
+        ],
+        Some(r#"{"a":1,"b":2}"#),
+    )?;
+    assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(stderr, "a");
+    Ok(())
+}
+
+#[test]
+fn test_lazyseq_map_halt_propagates_through_default_lazy_path() -> Result<()> {
+    // `generic_result_to_jq_values`'s `GenericResult::LazySeq(seq) => match
+    // seq.materialize_atomic() { ... Err(jq::Control::Halt(code)) =>
+    // sink.request_halt(code) ... }` arm (jq_runner.rs) is reached from the
+    // *default* lazy-bytes CLI path (`evaluate_bytes_lazy`, used for plain
+    // stdin/file input with none of -S/-s/-R/--color-output/--ascii-output/
+    // --input-dsv set) -- a distinct site from `evaluate_input`'s own copy
+    // of this match (tested above), since the two functions build the
+    // `JqValue`/`OwnedValue` output representations independently.
+    // Verified against jq 1.7.1: `jq 'keys_unsorted | map(if . == "a" then
+    // halt_error(3) else . end)'` on `{"a":1,"b":2}` exits 3 with no
+    // stdout and stderr `a`.
+    let (stdout, stderr, code) = run_jq_full(
+        &[r#"keys_unsorted | map(if . == "a" then halt_error(3) else . end)"#],
+        Some(r#"{"a":1,"b":2}"#),
+    )?;
+    assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(stderr, "a");
+    Ok(())
+}
+
+#[test]
+fn test_array_construction_drops_partial_prefix_on_halt() -> Result<()> {
+    // `eval_array_construction`'s `Partial(_, Control::Halt(code))` arm
+    // (#791): array construction is atomic in jq, so a halt reached partway
+    // through building `[1, halt_error(3)]` must drop the in-progress array
+    // entirely and propagate the bare halt, not surface a truncated array --
+    // the same atomicity `Error`/`Break` already get one arm above this one.
+    // Verified against jq 1.7.1: `jq -n '[1, halt_error(3)]'` exits 3 with no
+    // output on either stream (`.` at the point `halt_error` runs is still
+    // `null`, which prints nothing).
+    let (stdout, stderr, code) = run_jq_full(&["-n", "[1, halt_error(3)]"], None)?;
+    assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
+#[test]
+fn test_object_construction_keeps_partial_prefix_on_halt() -> Result<()> {
+    // `eval_object_construction`'s `Err(ObjectEscape::Halt(code))` arm when
+    // `objects` is already non-empty (#791): earlier key/value combinations
+    // already pushed to `objects` before a later combination halts must
+    // survive as `QueryResult::Partial`'s prefix, not vanish -- the same
+    // "outputs already produced don't vanish" contract #400/#494 gave
+    // `Error`/`Break` on the two arms right above this one. Verified against
+    // jq 1.7.1: `jq -c -n '{a: (1,2), b: (3, halt_error(9))}'` prints
+    // `{"a":1,"b":3}` -- the a=1,b=3 combination, completed before a=1's
+    // second b-value halts -- then exits 9; the a=2 branch is never reached.
+    let (stdout, stderr, code) =
+        run_jq_full(&["-n", "-c", "{a: (1,2), b: (3, halt_error(9))}"], None)?;
+    assert_eq!(code, 9, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "{\"a\":1,\"b\":3}\n");
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
+#[test]
+fn test_reduce_update_halt_produces_no_output() -> Result<()> {
+    // `eval_owned_expr_fork`'s `Halt` arm (#791), reached through `reduce`'s
+    // UPDATE expression: a bare halt on a fold step has no prior UPDATE
+    // output on *that* step to fall back to, unlike a `Partial`'s trailing
+    // control (the arm right below this one) -- so `eval_reduce`'s `aborted`
+    // stays set and `outputs` (the accumulator across earlier fold steps)
+    // is returned as-is via `finish_fork`, never gaining this step's value.
+    // Verified against jq 1.7.1: `jq -n 'reduce (1) as $x (0; halt_error(3))'`
+    // prints nothing to stdout, prints `0` (the accumulator, `.` at the
+    // point `halt_error` runs) to stderr, and exits 3.
+    let (stdout, stderr, code) = run_jq_full(&["-n", "reduce (1) as $x (0; halt_error(3))"], None)?;
+    assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(stderr, "0\n");
+    Ok(())
+}
+
+#[test]
+fn test_try_catch_prepend_propagates_halt_from_handler() -> Result<()> {
+    // `prepend`'s `Halt` arm (#791): `eval_try`'s `Partial(prefix,
+    // Control::Error)` arm splices the catch handler's own result in after
+    // the body's prefix via `prepend(prefix, handled)`. If the handler
+    // itself halts, `prepend` must keep the body's earlier outputs *and*
+    // still propagate the halt via `partial(prefix, Control::Halt(code))`,
+    // not just return the handler's bare `Halt` and drop the prefix.
+    // Verified against jq 1.7.1: `jq -n 'try (1, error("x")) catch
+    // halt_error(9)'` prints `1` to stdout, `x` (the caught error's payload,
+    // which `.` is bound to inside the catch handler) to stderr with no
+    // trailing newline, and exits 9.
+    let (stdout, stderr, code) =
+        run_jq_full(&["-n", r#"try (1, error("x")) catch halt_error(9)"#], None)?;
+    assert_eq!(code, 9, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "1\n");
+    assert_eq!(stderr, "x");
+    Ok(())
+}
+
+#[test]
+fn test_result_to_owned_many_empty_arm_via_ltrimstr_argument() -> Result<()> {
+    // `result_to_owned`'s `Many(vs)` arm when `vs` is empty. `(empty,empty)`
+    // is two `None`-valued comma operands, so `eval_comma` never touches its
+    // `owned` promotion path and falls out through its own `None =>
+    // QueryResult::Many(borrowed)` arm with `borrowed` still `[]` --
+    // `ltrimstr`'s argument slot then feeds that `Many(vec![])` into
+    // `result_to_owned`, hitting the "empty result" error arm. Not
+    // halt-specific (this arm predates #791; only its `.into()` wrapper is
+    // new) and a pre-existing, unrelated divergence from real jq worth
+    // flagging: jq treats `f(g)` as backtracking over every output of `g`,
+    // so a zero-output argument means zero outputs overall -- `jq -n '"abc"
+    // | ltrimstr((empty,empty))'` exits 0 with no output -- while
+    // succinctly's `ltrimstr` resolves its argument to a single value via
+    // `result_to_owned`, which treats "the argument stream produced
+    // nothing" as an error instead.
+    let (stdout, stderr, code) = run_jq_full(&["-n", r#""abc" | ltrimstr((empty,empty))"#], None)?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(stderr, "jq: error (at <unknown>): empty result\n");
+    Ok(())
+}
+
+#[test]
+fn test_result_to_owned_manyowned_empty_arm_via_ltrimstr_argument() -> Result<()> {
+    // `result_to_owned`'s `ManyOwned(vs)` arm when `vs` is empty -- the
+    // `Owned`-target sibling of the `Many`-empty case above, reached through
+    // a different producer: `eval_index_expr`'s `Targets::Owned` branch ends
+    // its match on `out.len()` with only `1 => Owned(...)`, so the `_ =>
+    // ManyOwned(out)` wildcard also covers `out.len() == 0`. `(2+3)` is
+    // computed (arithmetic is always `Owned`/`ManyOwned`, never
+    // document-borrowed, so its target is `Targets::Owned`), and both
+    // `"x"`/`"y"` keys against the number `5` -- with the trailing `?`
+    // making `optional` true -- each resolve via `index_one_owned`'s `_ if
+    // optional => Ok(None)` refusal-suppression arm, leaving `out` empty:
+    // `QueryResult::ManyOwned(vec![])`. Same pre-existing, halt-unrelated
+    // divergence from real jq as the `Many`-empty case above: `jq -n '"abc"
+    // | ltrimstr((2+3) | .[("x","y")]?)'` exits 0 with no output, while
+    // succinctly's `result_to_owned` reports it as an error.
+    let (stdout, stderr, code) =
+        run_jq_full(&["-n", r#""abc" | ltrimstr((2+3) | .[("x","y")]?)"#], None)?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(stderr, "jq: error (at <unknown>): empty result\n");
+    Ok(())
+}
+
+#[test]
+fn test_result_to_owned_partial_halt_outranks_its_prefix() -> Result<()> {
+    // `result_to_owned`'s `Partial(_, Control::Halt(code))` arm (#791): a
+    // single-value builtin argument that produced an output and *then*
+    // halted must still halt, not quietly compute with the value already
+    // produced. This dedicated arm is checked *before* the generic
+    // `Partial(vs, _control) => Ok(vs.into_iter().next().unwrap())`
+    // fallback right below it, which would otherwise silently take `1` and
+    // let `ltrimstr` continue. Note `ltrimstr`'s argument is a single-value
+    // site here, not a backtracking generator: real jq's own `ltrimstr((1,
+    // halt_error(6)))` actually calls `ltrimstr` once per argument output,
+    // so `jq -n '"abc" | ltrimstr((1, halt_error(6)))'` prints `abc` (from
+    // the `1` branch, where `ltrimstr` is a no-op on a non-string argument)
+    // *before* the second branch halts -- succinctly's `ltrimstr` instead
+    // resolves its argument to one value via `result_to_owned`, so it never
+    // gets that first output at all; this test pins succinctly's own
+    // contract, which #791 documents explicitly at this arm.
+    let (stdout, stderr, code) =
+        run_jq_full(&["-n", r#""abc" | ltrimstr((1, halt_error(6)))"#], None)?;
+    assert_eq!(code, 6, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(stderr, "abc");
+    Ok(())
+}
+
+#[test]
+fn test_result_to_owned_none_error_break_arms_via_ltrimstr_argument() -> Result<()> {
+    // `result_to_owned`'s `None`/`Error`/`Break` arms -- all three now
+    // wrapped in `.into()` to fit the `Result<OwnedValue, EvalEscape>`
+    // return type this PR introduced (previously `Result<OwnedValue,
+    // EvalError>`), exercised together since they are adjacent,
+    // mechanically-identical conversions and none of them are
+    // halt-specific. Uses `ltrimstr`'s argument slot as the call site, same
+    // as the `Many`/`ManyOwned`-empty and `Partial`-halt tests above.
+    // `None`/`Break` here are a pre-existing, halt-unrelated divergence from
+    // real jq worth flagging: jq's `empty` argument yields zero output (not
+    // an error), and a `break` whose label encloses the whole expression is
+    // caught there, not reported as "not in label" -- both verified: `jq -n
+    // '"abc" | ltrimstr(empty)'` and `jq -n 'label $out | ("abc" |
+    // ltrimstr(break $out))'` both exit 0 with no output. succinctly's
+    // `ltrimstr` resolves its argument through `result_to_owned`, which
+    // turns both into a generic catchable error instead. The `Error` arm,
+    // by contrast, matches real jq exactly.
+    let (stdout, stderr, code) = run_jq_full(&["-n", r#""abc" | ltrimstr(empty)"#], None)?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(stderr, "jq: error (at <unknown>): no value\n");
+
+    let (stdout, stderr, code) = run_jq_full(&["-n", r#""abc" | ltrimstr(error("boom"))"#], None)?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(stderr, "jq: error (at <unknown>): boom\n");
+
+    let (stdout, stderr, code) = run_jq_full(
+        &["-n", r#"label $out | ("abc" | ltrimstr(break $out))"#],
+        None,
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(
+        stderr,
+        "jq: error (at <unknown>): break $out not in label\n"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_boolean_and_propagates_halt_from_right_operand() -> Result<()> {
+    // `push_truthiness`'s `Halt` arm (#791), reached through `eval_boolean`'s
+    // right-operand fork -- `and`/`or` are generators over both operands
+    // here, not scalar short-circuit operators, so the right operand's
+    // stream is pushed through `push_truthiness` once per non-short-circuiting
+    // left output. A halt while evaluating the right operand must escape
+    // immediately rather than contribute a truthiness bit. Verified against
+    // jq 1.7.1: `jq -n 'true and halt_error(4)'` exits 4 with no output on
+    // either stream (`.` at the point `halt_error` runs is still `null`,
+    // which prints nothing).
+    let (stdout, stderr, code) = run_jq_full(&["-n", "true and halt_error(4)"], None)?;
+    assert_eq!(code, 4, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
+#[test]
+fn test_arithmetic_propagates_halt_from_right_operand() -> Result<()> {
+    // `push_owned_values`'s `Halt` arm (#791), reached through
+    // `binary_fanout_core`'s right-operand fork -- shared by every
+    // arithmetic and comparison operator (#768). A halt while evaluating
+    // the right operand must escape immediately, the `OwnedValue`-collecting
+    // analog of `push_truthiness`'s arm `and`/`or` use above. Verified
+    // against jq 1.7.1: `jq -n '1 + halt_error(6)'` exits 6 with no output
+    // on either stream.
+    let (stdout, stderr, code) = run_jq_full(&["-n", "1 + halt_error(6)"], None)?;
+    assert_eq!(code, 6, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
+#[test]
+fn test_isvalid_suppresses_genuine_error_in_error_message_expression() -> Result<()> {
+    // `eval_error`'s message-expression arm, `Err(EvalEscape::Error(_)) if
+    // optional => return QueryResult::None` (#791): this PR narrowed the
+    // match from `Err(_) if optional` to `Err(EvalEscape::Error(_)) if
+    // optional` specifically, so a halt in the message expression escapes
+    // instead of being swallowed (covered by
+    // `test_isvalid_propagates_halt_from_error_message_expression` above).
+    // This test pins the other half: the narrowing must not have also
+    // stopped swallowing a *genuine* (non-halt) error in the message
+    // expression, which `isvalid`'s forced `optional=true` still has to
+    // suppress into `false`. `isvalid` is a succinctly extension (real jq
+    // has no such builtin -- `jq -n 'isvalid(error("boom"))'` reports
+    // `isvalid/1 is not defined`), so this is checked against succinctly's
+    // own documented contract instead of jq parity.
+    let (stdout, stderr, code) = run_jq_full(&["-n", r#"isvalid(error(error("boom")))"#], None)?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "false\n");
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
+#[test]
+fn test_map_propagates_bare_halt_from_element() -> Result<()> {
+    // `map_over`'s bare `Halt` arm (#791): `map(f)` is `[.[] | f]` --
+    // array-construction atomic, so a halt applying `f` to any element
+    // drops the whole in-progress result array, mirroring
+    // `eval_array_construction`'s own bare-`Halt` arm. Verified against jq
+    // 1.7.1: `jq -n '[1] | map(halt_error(4))'` exits 4 with no stdout
+    // (stderr `1`, the element `f` ran against).
+    let (stdout, stderr, code) = run_jq_full(&["-n", "[1] | map(halt_error(4))"], None)?;
+    assert_eq!(code, 4, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(stderr, "1\n");
+    Ok(())
+}
+
+#[test]
+fn test_map_propagates_partial_halt_from_element() -> Result<()> {
+    // `map_over`'s `Partial(_, Control::Halt(code))` arm, one arm below the
+    // bare-`Halt` one above: `f` producing an output and *then* halting on
+    // the same element must still drop the whole result array, matching
+    // the `Error`/`Break` `Partial` arms right beside it. Verified against
+    // jq 1.7.1: `jq -n '[1] | map(2, halt_error(4))'` exits 4 with no
+    // output (the `2` never surfaces -- array construction is atomic, same
+    // as `test_array_construction_drops_partial_prefix_on_halt` above).
+    let (stdout, stderr, code) = run_jq_full(&["-n", "[1] | map(2, halt_error(4))"], None)?;
+    assert_eq!(code, 4, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(stderr, "1\n");
+    Ok(())
+}
+
+#[test]
+fn test_map_values_object_propagates_bare_halt_from_field() -> Result<()> {
+    // `builtin_map_values`'s object-branch bare `Halt` arm (#791): object
+    // construction is atomic (see `eval_object_construction`), so a halt
+    // applying `f` to any field's value drops the whole in-progress result
+    // object. Verified against jq 1.7.1: `jq -n '{"a":1} |
+    // map_values(halt_error(5))'` exits 5 with no stdout (stderr `1`, the
+    // field value `f` ran against).
+    let (stdout, stderr, code) =
+        run_jq_full(&["-n", r#"{"a":1} | map_values(halt_error(5))"#], None)?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(stderr, "1\n");
+    Ok(())
+}
+
+#[test]
+fn test_map_values_object_propagates_partial_halt_from_field() -> Result<()> {
+    // `builtin_map_values`'s object-branch `Partial(_, Control::Halt(code))`
+    // arm: `f` producing an output and then halting on the same field must
+    // still drop the whole result object. Real jq's `map_values` is
+    // defined as `.[] |= f` (`_modify`), which only ever observes the
+    // *first* output of `f` and never reaches a second one -- `jq -n
+    // '{"a":1} | map_values(2, halt_error(5))'` prints `{"a":2}` and exits
+    // 0, never reaching `halt_error` at all -- while succinctly's
+    // `map_values` instead evaluates `f` eagerly via `eval_single` and
+    // walks every `QueryResult` variant it can return, so it does reach the
+    // halt. This test pins succinctly's own contract for this pre-existing
+    // divergence, not jq parity.
+    let (stdout, stderr, code) =
+        run_jq_full(&["-n", r#"{"a":1} | map_values(2, halt_error(5))"#], None)?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(stderr, "1\n");
+    Ok(())
+}
+
+#[test]
+fn test_map_values_array_propagates_bare_halt_from_element() -> Result<()> {
+    // `builtin_map_values`'s array-branch bare `Halt` arm (#791): the array
+    // sibling of the object-branch test above. Verified against jq 1.7.1:
+    // `jq -n '[1] | map_values(halt_error(6))'` exits 6 with no stdout
+    // (stderr `1`).
+    let (stdout, stderr, code) = run_jq_full(&["-n", "[1] | map_values(halt_error(6))"], None)?;
+    assert_eq!(code, 6, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(stderr, "1\n");
+    Ok(())
+}
+
+#[test]
+fn test_map_values_array_propagates_partial_halt_from_element() -> Result<()> {
+    // `builtin_map_values`'s array-branch `Partial(_, Control::Halt(code))`
+    // arm. Same pre-existing multi-output-`f` divergence from real jq as
+    // the object-branch `Partial` test above: real jq's `.[] |= f` only
+    // observes `f`'s first output, so `jq -n '[1] | map_values(2,
+    // halt_error(6))'` prints `[2]` and exits 0 without ever reaching
+    // `halt_error` -- this test pins succinctly's own contract, which does
+    // reach it.
+    let (stdout, stderr, code) = run_jq_full(&["-n", "[1] | map_values(2, halt_error(6))"], None)?;
+    assert_eq!(code, 6, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(stderr, "1\n");
+    Ok(())
+}
+
+#[test]
+fn test_add_reports_type_error_via_into_conversion() -> Result<()> {
+    // `builtin_add`'s `Err(e) => e.into()` arm -- a pure `.into()` wrapper
+    // this PR's `Result<_, EvalError> -> QueryResult` conversions added
+    // (not halt-specific: `arith_add` only ever returns a plain
+    // `EvalError`, never an `EvalEscape`, so this always resolves to
+    // `QueryResult::Error`), exercised via a genuine type error since
+    // that's the only way to reach it. Verified against jq 1.7.1: `jq -n
+    // '[1, "a"] | add'` reports `number (1) and string ("a") cannot be
+    // added` and exits 5.
+    let (stdout, stderr, code) = run_jq_full(&["-n", r#"[1, "a"] | add"#], None)?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(
+        stderr,
+        "jq: error (at <unknown>): number (1) and string (\"a\") cannot be added\n"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_any_propagates_halt_from_condition() -> Result<()> {
+    // `control_to_result`'s `Halt` arm (#791), reached via `any(cond)`:
+    // `any_all_probe_element` forks `cond` through `eval_owned_expr_fork`
+    // and, when it halts with no truthy output for this element, returns
+    // `Err(Control::Halt(code))`; `any_all_f`'s `Err(control) =>
+    // control_to_result(control)` converts that back into a `QueryResult`
+    // through this arm. Verified against jq 1.7.1: `jq -n '[1,2] |
+    // any(halt_error(4))'` exits 4 with no stdout (stderr `1`, the first
+    // element `cond` ran against -- the second element is never probed).
+    let (stdout, stderr, code) = run_jq_full(&["-n", "[1,2] | any(halt_error(4))"], None)?;
+    assert_eq!(code, 4, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(stderr, "1\n");
+    Ok(())
+}
+
+#[test]
+fn test_min_by_propagates_halt_from_key_expr() -> Result<()> {
+    // `builtin_min_by`'s `QueryResult::Halt(code) => return
+    // QueryResult::Halt(code)` arm (#791): each item's key is computed via
+    // `eval_array_construction`, and a halt while computing any item's key
+    // must abort the whole `min_by` rather than being folded into the
+    // `_ => unreachable!(...)` wildcard right below (which `Owned`
+    // is not, being explicitly listed as `eval_array_construction`'s only
+    // other possible non-escaping return). Verified against jq 1.7.1: `jq
+    // -n '[1,2] | min_by(halt_error(4))'` exits 4 with no stdout (stderr
+    // `1`, the first item the key filter ran against).
+    let (stdout, stderr, code) = run_jq_full(&["-n", "[1,2] | min_by(halt_error(4))"], None)?;
+    assert_eq!(code, 4, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(stderr, "1\n");
+    Ok(())
+}
+
+#[test]
+fn test_max_by_propagates_halt_from_key_expr() -> Result<()> {
+    // `builtin_max_by`'s `QueryResult::Halt(code) => return
+    // QueryResult::Halt(code)` arm (#791) -- the `max_by` sibling of the
+    // `min_by` test above, identical shape. Verified against jq 1.7.1: `jq
+    // -n '[1,2] | max_by(halt_error(4))'` exits 4 with no stdout (stderr
+    // `1`, the first item the key filter ran against).
+    let (stdout, stderr, code) = run_jq_full(&["-n", "[1,2] | max_by(halt_error(4))"], None)?;
+    assert_eq!(code, 4, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(stderr, "1\n");
+    Ok(())
+}
+
+#[test]
+fn test_ltrimstr_propagates_halt_in_prefix_argument() -> Result<()> {
+    // `builtin_ltrimstr`'s `Err(e) => return e.into()` arm (#791): the
+    // prefix argument's `result_to_owned` failure -- here a bare halt --
+    // must escape via `.into()` (which preserves `EvalEscape::Halt` through
+    // the `From<EvalEscape> for QueryResult` impl) rather than being folded
+    // into a plain `QueryResult::Error`. Verified against jq 1.7.1: `jq -n
+    // '"abc" | ltrimstr(halt_error(7))'` exits 7 with no stdout (stderr
+    // `abc`, the string `.` halt_error printed raw with no trailing
+    // newline, per its string-payload contract).
+    let (stdout, stderr, code) = run_jq_full(&["-n", r#""abc" | ltrimstr(halt_error(7))"#], None)?;
+    assert_eq!(code, 7, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(stderr, "abc");
+    Ok(())
+}
+
+#[test]
+fn test_rtrimstr_propagates_halt_in_suffix_argument() -> Result<()> {
+    // `builtin_rtrimstr`'s `Err(e) => return e.into()` arm (#791) -- the
+    // `rtrimstr` sibling of the `ltrimstr` test above, same shape. Verified
+    // against jq 1.7.1: `jq -n '"abc" | rtrimstr(halt_error(8))'` exits 8
+    // with no stdout (stderr `abc`, no trailing newline).
+    let (stdout, stderr, code) = run_jq_full(&["-n", r#""abc" | rtrimstr(halt_error(8))"#], None)?;
+    assert_eq!(code, 8, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(stderr, "abc");
+    Ok(())
+}
+
+#[test]
+fn test_startswith_propagates_halt_in_prefix_argument() -> Result<()> {
+    // `builtin_startswith`'s `Err(e) => return e.into()` arm (#791) --
+    // same shape as `ltrimstr`/`rtrimstr` above, one call site further down
+    // the file. Verified against jq 1.7.1: `jq -n '"abc" |
+    // startswith(halt_error(9))'` exits 9 with no stdout (stderr `abc`, no
+    // trailing newline).
+    let (stdout, stderr, code) =
+        run_jq_full(&["-n", r#""abc" | startswith(halt_error(9))"#], None)?;
+    assert_eq!(code, 9, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(stderr, "abc");
+    Ok(())
+}
+
+#[test]
+fn test_endswith_propagates_halt_in_suffix_argument() -> Result<()> {
+    // `builtin_endswith`'s suffix-argument arm used `query_result_from_error`,
+    // which read a halt marker smuggled inside `EvalError`; `result_to_owned`
+    // now returns `Result<OwnedValue, EvalEscape>` directly and this arm just
+    // forwards the escape via `From<EvalEscape> for QueryResult`. Verified
+    // against jq 1.7.1: `jq -n '"abc" | endswith(halt_error(9))'` exits 9
+    // with nothing on stdout.
+    let (stdout, stderr, code) = run_jq_full(&["-n", r#""abc" | endswith(halt_error(9))"#], None)?;
+    assert_eq!(code, 9, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_split_propagates_halt_in_separator_argument() -> Result<()> {
+    // `builtin_split`'s separator-argument arm: same `query_result_from_error`
+    // -> `e.into()` refactor as `endswith` above, now exercised at this
+    // distinct call site. Verified against jq 1.7.1:
+    // `jq -n '"a,b" | split(halt_error(9))'` exits 9 with no output.
+    let (stdout, stderr, code) = run_jq_full(&["-n", r#""a,b" | split(halt_error(9))"#], None)?;
+    assert_eq!(code, 9, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_join_propagates_halt_in_separator_argument() -> Result<()> {
+    // `builtin_join`'s separator-argument arm. Verified against jq 1.7.1:
+    // `jq -n '["a","b"] | join(halt_error(9))'` exits 9 with no output.
+    let (stdout, stderr, code) = run_jq_full(&["-n", r#"["a","b"] | join(halt_error(9))"#], None)?;
+    assert_eq!(code, 9, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_contains_propagates_halt_in_argument() -> Result<()> {
+    // `builtin_contains`'s `b`-argument arm. Verified against jq 1.7.1:
+    // `jq -n '"abc" | contains(halt_error(9))'` exits 9 with no output.
+    let (stdout, stderr, code) = run_jq_full(&["-n", r#""abc" | contains(halt_error(9))"#], None)?;
+    assert_eq!(code, 9, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_inside_propagates_halt_in_argument() -> Result<()> {
+    // `builtin_inside`'s `b`-argument arm -- `inside`'s own dedicated call
+    // site, distinct from `contains`'s even though the two share
+    // `owned_contains`. Verified against jq 1.7.1:
+    // `jq -n '"abc" | inside(halt_error(9))'` exits 9 with no output.
+    let (stdout, stderr, code) = run_jq_full(&["-n", r#""abc" | inside(halt_error(9))"#], None)?;
+    assert_eq!(code, 9, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_nth_single_arg_propagates_halt_in_index_argument() -> Result<()> {
+    // `builtin_nth`'s index-argument arm -- the single-argument `nth(n)`
+    // form (`.[n]`), a distinct function from `builtin_nth_stream`, which
+    // backs the two-argument `nth(n; expr)` form already covered by
+    // `test_nth_stream_propagates_halt_in_n_argument` above. Verified
+    // against jq 1.7.1: `jq -n '[1,2,3] | nth(halt_error(9))'` exits 9 with
+    // no output.
+    let (stdout, stderr, code) = run_jq_full(&["-n", "[1,2,3] | nth(halt_error(9))"], None)?;
+    assert_eq!(code, 9, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_flatten_depth_propagates_halt_in_depth_argument() -> Result<()> {
+    // `builtin_flatten_depth`'s depth-argument arm (the `flatten(depth)`
+    // two-arg-equivalent form, not the depth-less `flatten` builtin).
+    // Verified against jq 1.7.1: `jq -n '[[1,2]] | flatten(halt_error(9))'`
+    // exits 9 with no output.
+    let (stdout, stderr, code) = run_jq_full(&["-n", "[[1,2]] | flatten(halt_error(9))"], None)?;
+    assert_eq!(code, 9, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_group_by_propagates_halt_in_key_function() -> Result<()> {
+    // `builtin_group_by`'s per-item match on `eval_array_construction`'s
+    // result now has its own `QueryResult::Halt(code) => return
+    // QueryResult::Halt(code)` arm (previously the wildcard below it would
+    // have hit `unreachable!()` on a halt, since that arm was written
+    // assuming only Owned/Error/Break could reach it pre-#791). Verified
+    // against jq 1.7.1: `jq -n '[1,2,3] | group_by(halt_error(9))'` exits 9
+    // with no output -- the halt fires while keying the very first element.
+    let (stdout, stderr, code) = run_jq_full(&["-n", "[1,2,3] | group_by(halt_error(9))"], None)?;
+    assert_eq!(code, 9, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_unique_by_propagates_halt_in_key_function() -> Result<()> {
+    // `builtin_unique_by`'s own copy of the `group_by` key-computation match,
+    // now carrying the same `QueryResult::Halt` arm. Verified against jq
+    // 1.7.1: `jq -n '[1,2,3] | unique_by(halt_error(9))'` exits 9 with no
+    // output.
+    let (stdout, stderr, code) = run_jq_full(&["-n", "[1,2,3] | unique_by(halt_error(9))"], None)?;
+    assert_eq!(code, 9, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_sort_by_propagates_halt_in_key_function() -> Result<()> {
+    // `builtin_sort_by`'s own copy of the same key-computation match, third
+    // (and last) of the three sites sharing this shape. Verified against jq
+    // 1.7.1: `jq -n '[1,2,3] | sort_by(halt_error(9))'` exits 9 with no
+    // output.
+    let (stdout, stderr, code) = run_jq_full(&["-n", "[1,2,3] | sort_by(halt_error(9))"], None)?;
+    assert_eq!(code, 9, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+/// The four tests below are siblings of `test_group_by_propagates_halt_in_key_function`
+/// above, but exercise `eval.rs`'s generic `eval_pipe`/`eval_index_expr` machinery
+/// itself rather than `builtin_group_by`'s own match arm: that test's key
+/// function (`halt_error(9)`, a bare builtin call) halts directly inside
+/// `eval_single`'s `Expr::Builtin` dispatch without ever entering `eval_pipe`.
+/// A key function that is itself a multi-stage `Pipe`/`IndexExpr` is needed to
+/// reach `eval_pipe`'s own internal arms -- and it must be routed through
+/// `group_by`/`sort_by`/`min_by`/`max_by`/`unique_by` (or another builtin whose
+/// argument falls through `eval_generic.rs`'s `eval_on_owned` fallback) rather
+/// than used as the top-level CLI filter, since ordinary pipes/index
+/// expressions at the top level are handled natively by `eval_generic.rs`'s own
+/// (separate) implementation and never reach `eval.rs` at all.
+#[test]
+fn test_eval_pipe_many_loop_halt_reached_through_group_by_key_fn() -> Result<()> {
+    // `eval_pipe`'s `QueryResult::Many(values)` loop, `QueryResult::Halt`
+    // arm: `group_by`'s single item is `[1,2,3]`, and the key function's
+    // first stage (`.[]`) fans it out into three *borrowed* values before
+    // the second stage halts on the second one. Verified against jq 1.7.1:
+    // `jq -c 'group_by(.[] | if . == 2 then halt else . end)'` on `[[1,2,3]]`
+    // exits 0 with no output -- array construction for the key is atomic, so
+    // the `1` already produced before the halt never reaches stdout (#400
+    // does not apply inside `[f]`).
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "group_by(.[] | if . == 2 then halt else . end)"],
+        Some("[[1,2,3]]"),
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_eval_pipe_top_level_halt_reached_through_group_by_key_fn() -> Result<()> {
+    // `eval_pipe`'s top-level `QueryResult::Halt(code) => QueryResult::Halt(code)`
+    // arm: the key function's *first* stage (bare `halt`) halts outright,
+    // reached via the `match result.materialize_cursor()` dispatch rather
+    // than the `Many` loop above (there is a second pipe stage, `.`, so
+    // `eval_pipe` cannot take its own `rest.is_empty()` early return either).
+    // Verified against jq 1.7.1: `jq -c 'group_by(halt | .)'` on `[[1,2,3]]`
+    // exits 0 with no output.
+    let (stdout, stderr, code) = run_jq_full(&["-c", "group_by(halt | .)"], Some("[[1,2,3]]"))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_pipe_owned_prefix_halt_reached_through_group_by_key_fn() -> Result<()> {
+    // `pipe_owned_prefix`'s own `QueryResult::Halt` arm: the key function's
+    // first stage (`1,2,3`, a comma of literals) fans out into *owned*
+    // values, taking `eval_pipe`'s `ManyOwned` arm into `pipe_owned_prefix`
+    // rather than the borrowed `Many` loop above. Verified against jq 1.7.1:
+    // `jq -c 'group_by((1,2,3) | halt)'` on `[1]` exits 0 with no output --
+    // the halt fires while piping the very first generated value (`1`)
+    // through the second stage.
+    let (stdout, stderr, code) = run_jq_full(&["-c", "group_by((1,2,3) | halt)"], Some("[1]"))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_eval_index_expr_direct_halt_reached_through_group_by_key_fn() -> Result<()> {
+    // `eval_index_expr`'s direct `QueryResult::Halt(code) => return
+    // QueryResult::Halt(code)` arm: the key function's computed-index key
+    // expression (`halt_error(3)`) halts outright with zero keys ever
+    // produced, distinct from the `Partial(vs, Control::Halt(code))` arm
+    // right below it (which handles a key stream that halts *after*
+    // already yielding some keys). `halt_error`'s non-string argument is the
+    // group_by item itself (`1`), printed as JSON to stderr per halt_error's
+    // own contract -- not stdout. Verified against jq 1.7.1: `jq -c
+    // 'group_by(.[(halt_error(3))])'` on `[1]` exits 3 with no stdout.
+    let (stdout, stderr, code) = run_jq_full(&["-c", "group_by(.[(halt_error(3))])"], Some("[1]"))?;
+    assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert!(stderr.contains('1'), "stderr: {stderr:?}");
+    Ok(())
+}
+
+/// The seven tests below cover `eval_index_expr`/`eval_slice_expr`/
+/// `eval_slice_bound`'s remaining halt-propagation arms, all reached the same
+/// way as the test above -- through a `group_by` key function, since a
+/// top-level `E[K]`/`E[S:T]` is handled natively by `eval_generic.rs` and
+/// never reaches `eval.rs` at all. One parser subtlety applies throughout:
+/// `parse_postfix` only builds an `Expr::IndexExpr`/`Expr::SliceExpr` (with
+/// its own explicit `target`) when the bracket contains at least one
+/// *computed* key/bound (`push_bracket`'s `Bracket::Dynamic`/
+/// `Bracket::DynamicSlice`); a bracket with only *literal* contents (`[0]`,
+/// `[0:1]`) is a flat chain element instead, folding `PRECEDING[LITERAL]`
+/// into a plain `Expr::Pipe` that never constructs either node. So every
+/// filter below keeps at least one bracket position non-literal (`.`, or a
+/// `halt`-containing sub-expression) purely to force the right AST shape --
+/// independent of which arm is under test.
+#[test]
+fn test_eval_index_expr_target_none_with_pending_key_halt_reached_through_group_by_key_fn(
+) -> Result<()> {
+    // `eval_index_expr`'s `QueryResult::None => { return match pending_halt
+    // { Some(code) => QueryResult::Halt(code), ... } }` arm: the key stream
+    // (`1, halt`) yields one key before halting (setting `pending_halt`),
+    // but the target (`empty`) produces zero outputs -- so there is no
+    // key/target pair left to index, yet the key side's pending halt must
+    // still fire rather than silently degrading to `None`. Verified against
+    // jq 1.7.1: `jq -c 'group_by(empty[(1,halt)])'` on `[1]` exits 0 with no
+    // output (`empty[...]` is legitimately empty regardless).
+    let (stdout, stderr, code) = run_jq_full(&["-c", "group_by(empty[(1,halt)])"], Some("[1]"))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_eval_index_expr_target_direct_halt_reached_through_group_by_key_fn() -> Result<()> {
+    // `eval_index_expr`'s target-materialization match has its own direct
+    // `QueryResult::Halt(code) => return QueryResult::Halt(code)` arm,
+    // distinct from the key-stream's own (already-covered) direct-halt arm:
+    // here the *key* (`.`) succeeds trivially, but the *target* (`halt`)
+    // halts outright. Verified against jq 1.7.1: `jq -c 'group_by(halt[.])'`
+    // on `[5]` exits 0 with no output.
+    let (stdout, stderr, code) = run_jq_full(&["-c", "group_by(halt[.])"], Some("[5]"))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_eval_index_expr_target_partial_halt_reached_through_group_by_key_fn() -> Result<()> {
+    // `eval_index_expr`'s target-materialization match, `Partial(_,
+    // Control::Halt(code))` arm: the target (`1,2,halt`) produces two real
+    // outputs before halting -- conservatively treated the same as a direct
+    // halt (the already-produced prefix is discarded, matching the key
+    // stream's own conservative `Error`/`Break` treatment right above it in
+    // the source). Verified against jq 1.7.1: `jq -c 'group_by((1,2,halt)[.])'`
+    // on `[5]` exits 0 with no output.
+    let (stdout, stderr, code) = run_jq_full(&["-c", "group_by((1,2,halt)[.])"], Some("[5]"))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_eval_index_expr_owned_targets_pending_key_halt_reached_through_group_by_key_fn(
+) -> Result<()> {
+    // `eval_index_expr`'s `Targets::Owned` branch, `pending_halt` arm --
+    // the *owned* twin of the already-covered `Targets::Borrowed` arm right
+    // above it. The target (`[9,8,7],[6,5,4]`, two array literals) is
+    // *computed* rather than borrowed from the input, taking the `Owned`
+    // branch; the key (`0, halt`) yields one real key (`0`) before halting.
+    // Both targets get indexed by the one produced key before the pending
+    // halt fires, so this also proves the already-indexed values (`9`, `6`)
+    // are computed before being discarded, not skipped outright. Verified
+    // against jq 1.7.1: `jq -c 'group_by(([9,8,7],[6,5,4])[(0, halt)])'` on
+    // `[5]` exits 0 with no output.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "group_by(([9,8,7],[6,5,4])[(0, halt)])"],
+        Some("[5]"),
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_eval_slice_expr_start_bound_halt_reached_through_group_by_key_fn() -> Result<()> {
+    // `eval_slice_expr`'s start-bound evaluation: `eval_slice_bound`
+    // returning `Err(Control::Halt(code))` (because the start bound itself,
+    // `halt`, halts) must abort before the end bound or target are ever
+    // touched. Verified against jq 1.7.1: `jq -c 'group_by(.[(halt):2])'`
+    // on `[5]` exits 0 with no output.
+    let (stdout, stderr, code) = run_jq_full(&["-c", "group_by(.[(halt):2])"], Some("[5]"))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_eval_slice_expr_end_bound_halt_reached_through_group_by_key_fn() -> Result<()> {
+    // Sibling of the test above for the *end* bound: the start bound (`0`)
+    // succeeds first, then the end bound (`halt`) halts. Distinct call site
+    // from the start-bound test (`eval_slice_expr` evaluates the two bounds
+    // with two separate `eval_slice_bound` calls). Verified against jq
+    // 1.7.1: `jq -c 'group_by(.[0:(halt)])'` on `[5]` exits 0 with no output.
+    let (stdout, stderr, code) = run_jq_full(&["-c", "group_by(.[0:(halt)])"], Some("[5]"))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_eval_slice_expr_target_halt_reached_through_group_by_key_fn() -> Result<()> {
+    // `eval_slice_expr`'s own target-materialization match, direct-halt arm
+    // (mirrors `eval_index_expr`'s equivalent arm, tested above, but this is
+    // a separate match in a separate function). Both bounds (`0`, `.`)
+    // succeed trivially -- the end bound is `.` rather than a literal
+    // *purely* to keep the bracket "dynamic" so the parser builds an
+    // `Expr::SliceExpr` with an explicit `target` at all (see this group's
+    // doc comment); it plays no role in the halt itself, which comes from
+    // the target (`halt`). Verified against jq 1.7.1: `jq -c
+    // 'group_by(halt[0:.])'` on `[5]` exits 0 with no output.
+    let (stdout, stderr, code) = run_jq_full(&["-c", "group_by(halt[0:.])"], Some("[5]"))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_eval_slice_expr_target_partial_halt_reached_through_group_by_key_fn() -> Result<()> {
+    // `eval_slice_expr`'s target-materialization match, `Partial(_,
+    // Control::Halt(code))` arm -- the `eval_slice_expr` sibling of
+    // `test_eval_index_expr_target_partial_halt_reached_through_group_by_key_fn`.
+    // The target (`1,2,halt`) produces two real outputs before halting;
+    // like the index-expr case, the already-produced prefix is discarded
+    // rather than sliced. Verified against jq 1.7.1: `jq -c
+    // 'group_by((1,2,halt)[0:.])'` on `[5]` exits 0 with no output.
+    let (stdout, stderr, code) = run_jq_full(&["-c", "group_by((1,2,halt)[0:.])"], Some("[5]"))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_with_entries_propagates_halt_from_map_function() -> Result<()> {
+    // `builtin_with_entries`'s `map(f)` loop: a bare (non-`Partial`) halt
+    // from evaluating `f` against one entry must abort the whole builtin
+    // immediately via its `QueryResult::Halt(code) => return
+    // QueryResult::Halt(code)` arm, rather than being folded into the
+    // `transformed` vector. Verified against jq 1.7.1:
+    // `jq -n '{"a":1} | with_entries(halt_error(9))'` exits 9 with no output.
+    let (stdout, stderr, code) =
+        run_jq_full(&["-n", r#"{"a":1} | with_entries(halt_error(9))"#], None)?;
+    assert_eq!(code, 9, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_with_entries_propagates_halt_after_partial_map_output() -> Result<()> {
+    // Distinct arm from the bare-halt one above: when `f` yields one or more
+    // values and *then* halts, `eval_single(...).materialize_cursor()`
+    // returns `QueryResult::Partial(_, Control::Halt(code))`, which must
+    // also abort immediately rather than silently folding the partial
+    // prefix into `transformed`. Verified against jq 1.7.1:
+    // `jq -n '{"a":1} | with_entries(., halt_error(9))'` exits 9 with no
+    // output (real jq discards the same partial output here too, since
+    // `with_entries` is `from_entries(map(f))` and array construction is
+    // atomic).
+    let (stdout, stderr, code) =
+        run_jq_full(&["-n", r#"{"a":1} | with_entries(., halt_error(9))"#], None)?;
+    assert_eq!(code, 9, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_string_interpolation_propagates_bare_halt() -> Result<()> {
+    // `eval_string_interpolation`'s `\(...)` slot: a bare (non-`Partial`)
+    // halt from the embedded expression must abort the whole interpolated
+    // string via its `QueryResult::Halt(code) => return
+    // QueryResult::Halt(code)` arm. Verified against jq 1.7.1:
+    // `jq -n '"\(halt_error(9))"'` exits 9 with no stdout and (since the
+    // filter's overall input, `null`, is what `halt_error` receives here)
+    // no stderr either.
+    let (stdout, stderr, code) = run_jq_full(&["-n", r#""\(halt_error(9))""#], None)?;
+    assert_eq!(code, 9, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_string_interpolation_propagates_halt_after_partial_output() -> Result<()> {
+    // Distinct arm from the bare-halt one above: when the `\(...)` slot's
+    // expression yields a value and *then* halts, `materialize_cursor()`
+    // returns `QueryResult::Partial(_, Control::Halt(code))`, handled here by
+    // its own two-line arm. Per this function's own doc comment ("string
+    // interpolation is atomic ... a `Partial` just surfaces its control,
+    // same as a bare one"), succinctly deliberately does NOT match real
+    // jq's behavior here: real jq forks the whole string per output of the
+    // slot's generator (`jq -n '"\(1, halt_error(9))"'` prints `"1"` to
+    // stdout *before* halting 9), but succinctly's `\(...)` embeds only the
+    // slot's single embedded value and discards the rest of a multi-output
+    // stream, so here the halt wins outright with no partial "1" on stdout.
+    let (stdout, stderr, code) = run_jq_full(&["-n", r#""\(1, halt_error(9))""#], None)?;
+    assert_eq!(code, 9, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_skip_propagates_bare_halt_in_expr_argument() -> Result<()> {
+    // `builtin_skip`'s `result` match: a bare halt from evaluating `expr`
+    // (no prior output to skip past) surfaces via its own
+    // `QueryResult::Halt(code) => QueryResult::Halt(code)` arm. `skip` is a
+    // succinctly extension (real jq has no `skip/2` builtin -- confirmed via
+    // `jq -n 'skip(1; 1,2,3)'` => "skip/2 is not defined"), so this is
+    // checked against succinctly's own halt-propagation contract: the halt
+    // must exit the process, not be swallowed as an ordinary `QueryResult`.
+    let (stdout, stderr, code) = run_jq_full(&["-n", "skip(0; halt_error(9))"], None)?;
+    assert_eq!(code, 9, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_indices_propagates_halt_in_pattern_argument() -> Result<()> {
+    // `builtin_indices`'s pattern-argument arm. Verified against jq 1.7.1:
+    // `jq -n '"abc" | indices(halt_error(9))'` exits 9 with no output.
+    let (stdout, stderr, code) = run_jq_full(&["-n", r#""abc" | indices(halt_error(9))"#], None)?;
+    assert_eq!(code, 9, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_index_propagates_halt_in_pattern_argument() -> Result<()> {
+    // `builtin_index`'s pattern-argument arm, distinct from `indices`'s own
+    // copy above. Verified against jq 1.7.1:
+    // `jq -n '"abc" | index(halt_error(9))'` exits 9 with no output.
+    let (stdout, stderr, code) = run_jq_full(&["-n", r#""abc" | index(halt_error(9))"#], None)?;
+    assert_eq!(code, 9, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_index_reports_invalid_slice_descriptor_error() -> Result<()> {
+    // `builtin_index`'s `sliced` match: when the pattern is an object (jq's
+    // slice-descriptor form, e.g. `{start:...}`) but `SliceBounds::
+    // from_descriptor` rejects it, the `Err(e) => e.into()` arm here forwards
+    // a plain (non-halt) `EvalError` -- distinct from the two `Err(e) =>
+    // e.into()` arms above that forward an `EvalEscape`. Verified against jq
+    // 1.7.1: `jq -n '"abcdef" | index({start:"x"})'` errors with "Array/
+    // string slice indices must be integers" and exits 5 (confirmed this is
+    // reached rather than the sibling `Ok(_) => cannot_index_with_type(...)`
+    // arm by first checking `jq -n '"abcdef" | index({start:1,end:3})'`,
+    // which *does* hit that other arm with "Cannot index string with
+    // number").
+    let (stdout, stderr, code) = run_jq_full(&["-n", r#""abcdef" | index({start:"x"})"#], None)?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert!(
+        stderr.contains("Array/string slice indices must be integers"),
+        "{stderr}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_rindex_propagates_halt_in_pattern_argument() -> Result<()> {
+    // `builtin_rindex`'s pattern-argument arm, `rindex`'s own copy of the
+    // `index`/`indices` shape. Verified against jq 1.7.1:
+    // `jq -n '"abc" | rindex(halt_error(9))'` exits 9 with no output.
+    let (stdout, stderr, code) = run_jq_full(&["-n", r#""abc" | rindex(halt_error(9))"#], None)?;
+    assert_eq!(code, 9, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_rindex_reports_invalid_slice_descriptor_error() -> Result<()> {
+    // `builtin_rindex`'s `sliced` match, same shape as `index`'s above but at
+    // its own call site. Verified against jq 1.7.1:
+    // `jq -n '"abcdef" | rindex({start:"x"})'` errors with "Array/string
+    // slice indices must be integers" and exits 5.
+    let (stdout, stderr, code) = run_jq_full(&["-n", r#""abcdef" | rindex({start:"x"})"#], None)?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert!(
+        stderr.contains("Array/string slice indices must be integers"),
+        "{stderr}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_getpath_propagates_halt_in_path_argument() -> Result<()> {
+    // `builtin_getpath`'s path-argument arm (distinct from `builtin_setpath`'s
+    // already-covered one). Verified against jq 1.7.1:
+    // `jq -n '{"a":1} | getpath([(halt_error(9))])'` exits 9 with no stdout
+    // (the input `{"a":1}` goes to stderr instead, from `halt_error`).
+    let (stdout, stderr, code) =
+        run_jq_full(&["-n", r#"{"a":1} | getpath([(halt_error(9))])"#], None)?;
+    assert_eq!(code, 9, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_getpath_reports_invalid_string_slice_descriptor_error() -> Result<()> {
+    // `builtin_getpath`'s `(String(s), Object(desc))` segment arm: a
+    // malformed slice descriptor against a *string* current value hits its
+    // own `Err(e) => e.into()`, a separate call site from the sibling array
+    // segment arm just above it (which is not in this cluster -- it isn't a
+    // newly-uncovered line, unlike this one). Verified against jq 1.7.1:
+    // `jq -n '"abcdef" | getpath([{"start":"x"}])'` errors with "Array/
+    // string slice indices must be integers" and exits 5.
+    let (stdout, stderr, code) =
+        run_jq_full(&["-n", r#""abcdef" | getpath([{"start":"x"}])"#], None)?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert!(
+        stderr.contains("Array/string slice indices must be integers"),
+        "{stderr}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_test_builtin_propagates_halt_in_pattern_argument() -> Result<()> {
+    // `builtin_test_regex`'s pattern-argument arm (the `test(re)` builtin,
+    // gated on the `regex` feature, which the `cli` feature enables).
+    // Verified against jq 1.7.1: `jq -n '"abc" | test(halt_error(9))'`
+    // exits 9 with no output.
+    let (stdout, stderr, code) = run_jq_full(&["-n", r#""abc" | test(halt_error(9))"#], None)?;
+    assert_eq!(code, 9, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_match_propagates_halt_in_pattern_argument() -> Result<()> {
+    // `builtin_match`'s pattern-argument arm, `match`'s own copy of the
+    // `test`-shaped pattern evaluation. Verified against jq 1.7.1:
+    // `jq -n '"abc" | match(halt_error(9))'` exits 9 with no output.
+    let (stdout, stderr, code) = run_jq_full(&["-n", r#""abc" | match(halt_error(9))"#], None)?;
+    assert_eq!(code, 9, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_match_reports_invalid_regex_error() -> Result<()> {
+    // `builtin_match`'s `build_regex` arm: `build_regex` returns a plain
+    // `Result<JqRegex, EvalError>` (it only compiles a pattern string, never
+    // evaluates a jq expression), so its `Err(e) => e.into()` here can only
+    // ever forward an ordinary `EvalError`, never a halt -- a distinct case
+    // from the pattern-argument arm above. Verified against jq 1.7.1:
+    // `jq -n '"abc" | match("(")'` errors with "Regex failure: end pattern
+    // with unmatched parenthesis" and exits 5; succinctly reports its own
+    // "invalid regex: ..." wording for the same malformed pattern (message
+    // parity is a separate concern from the exit code, per this file's other
+    // uncaught-error tests).
+    let (stdout, stderr, code) = run_jq_full(&["-n", r#""abc" | match("(")"#], None)?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert!(stderr.contains("invalid regex"), "{stderr}");
+    Ok(())
+}
+
+#[test]
+fn test_scan_propagates_halt_in_pattern_argument() -> Result<()> {
+    // `builtin_scan`'s pattern-argument arm. Verified against jq 1.7.1:
+    // `jq -n '"abc" | scan(halt_error(9))'` exits 9 with no output.
+    let (stdout, stderr, code) = run_jq_full(&["-n", r#""abc" | scan(halt_error(9))"#], None)?;
+    assert_eq!(code, 9, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_scan_reports_invalid_regex_error() -> Result<()> {
+    // `builtin_scan`'s `build_regex` arm, same shape as `match`'s above but
+    // at `scan`'s own call site. Verified against jq 1.7.1:
+    // `jq -n '"abc" | scan("(")'` errors with "Regex failure: end pattern
+    // with unmatched parenthesis" and exits 5.
+    let (stdout, stderr, code) = run_jq_full(&["-n", r#""abc" | scan("(")"#], None)?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert!(stderr.contains("invalid regex"), "{stderr}");
+    Ok(())
+}
+
+/// `builtin_splits`'s pattern-argument arm (`splits(re)`, the 1-arg stream
+/// form) now forwards `result_to_owned`'s `Err(EvalEscape)` via `.into()`
+/// instead of the old bare `QueryResult::Error(e)` wrap that could only ever
+/// hold an `EvalError` -- the conversion this PR adds so a halt smuggled back
+/// through the pattern argument's evaluation keeps being a halt instead of an
+/// ordinary catchable error. Verified against jq 1.7.1: `jq 'splits(halt_error(21))'`
+/// on `"abc"` exits 21 with empty stdout.
+#[test]
+fn test_splits_propagates_halt_in_pattern_argument() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-c", "splits(halt_error(21))"], Some(r#""abc""#))?;
+    assert_eq!(code, 21, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+/// `builtin_splits`'s `build_regex` arm, reached once the pattern argument
+/// itself evaluates cleanly to a string that fails to compile as a regex.
+/// This arm's `Err(e)` is a plain `EvalError` (not an `EvalEscape`), so
+/// `.into()` here is the same conversion as before the refactor -- this test
+/// confirms the ordinary "bad regex" path still works post-refactor.
+/// Verified against jq 1.7.1: `jq 'splits("[")'` on `"abc"` exits 5
+/// (oniguruma reports "premature end of char-class"; succinctly reports its
+/// own message via the Rust `regex` crate, so only the exit code and empty
+/// stdout are asserted here).
+#[test]
+fn test_splits_reports_invalid_regex_error() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-c", r#"splits("[")"#], Some(r#""abc""#))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+/// `builtin_sub`'s pattern-argument arm (`sub(re; replacement)`, the 2-arg
+/// no-flags form) forwards a smuggled-back halt via `.into()` instead of
+/// downgrading it to an ordinary error. Verified against jq 1.7.1:
+/// `jq 'sub(halt_error(22); "x")'` on `"abc"` exits 22 with empty stdout.
+#[test]
+fn test_sub_propagates_halt_in_pattern_argument() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", r#"sub(halt_error(22); "x")"#], Some(r#""abc""#))?;
+    assert_eq!(code, 22, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+/// `builtin_sub`'s replacement-argument arm, a distinct evaluation site from
+/// the pattern arm one match block above -- the pattern must succeed first,
+/// so this exercises the second `result_to_owned(eval_single(...))` call in
+/// the same function. Verified against jq 1.7.1: `jq 'sub("a"; halt_error(23))'`
+/// on `"abc"` exits 23 with empty stdout.
+#[test]
+fn test_sub_propagates_halt_in_replacement_argument() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", r#"sub("a"; halt_error(23))"#], Some(r#""abc""#))?;
+    assert_eq!(code, 23, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+/// `builtin_sub`'s `build_regex` arm (2-arg, no-flags form), reached once
+/// both pattern and replacement evaluate cleanly but the pattern string
+/// itself fails to compile as a regex. Verified against jq 1.7.1:
+/// `jq 'sub("["; "x")'` on `"abc"` exits 5 with empty stdout.
+#[test]
+fn test_sub_reports_invalid_regex_error() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-c", r#"sub("["; "x")"#], Some(r#""abc""#))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+/// `builtin_gsub`'s pattern-argument arm (`gsub(re; replacement)`, the 2-arg
+/// no-flags form) -- same shape as `builtin_sub`'s pattern arm, but this is
+/// a distinct function/site in the source. Verified against jq 1.7.1:
+/// `jq 'gsub(halt_error(24); "x")'` on `"abc"` exits 24 with empty stdout.
+#[test]
+fn test_gsub_propagates_halt_in_pattern_argument() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", r#"gsub(halt_error(24); "x")"#], Some(r#""abc""#))?;
+    assert_eq!(code, 24, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+/// `builtin_gsub`'s replacement-argument arm, the second evaluation site in
+/// the function. Verified against jq 1.7.1: `jq 'gsub("a"; halt_error(25))'`
+/// on `"abc"` exits 25 with empty stdout.
+#[test]
+fn test_gsub_propagates_halt_in_replacement_argument() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", r#"gsub("a"; halt_error(25))"#], Some(r#""abc""#))?;
+    assert_eq!(code, 25, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+/// `builtin_test_flags`'s flags-argument arm (`test(re; flags)`) -- flags is
+/// evaluated *before* the pattern in this function, so this is the first
+/// `result_to_owned(eval_single(...))` call site hit. Verified against jq
+/// 1.7.1: `jq 'test("a"; halt_error(26))'` on `"abc"` exits 26 with empty
+/// stdout.
+#[test]
+fn test_test_flags_propagates_halt_in_flags_argument() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", r#"test("a"; halt_error(26))"#], Some(r#""abc""#))?;
+    assert_eq!(code, 26, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+/// `builtin_test_flags`'s pattern-argument arm, reached only after the flags
+/// argument evaluates cleanly -- a distinct site from the flags arm above.
+/// Verified against jq 1.7.1: `jq 'test(halt_error(27); "i")'` on `"abc"`
+/// exits 27 with empty stdout.
+#[test]
+fn test_test_flags_propagates_halt_in_pattern_argument() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", r#"test(halt_error(27); "i")"#], Some(r#""abc""#))?;
+    assert_eq!(code, 27, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+/// `builtin_test_flags`'s `build_regex` arm, reached once both flags and
+/// pattern evaluate cleanly but the pattern fails to compile as a regex.
+/// Verified against jq 1.7.1: `jq 'test("["; "i")'` on `"abc"` exits 5 with
+/// empty stdout.
+#[test]
+fn test_test_flags_reports_invalid_regex_error() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-c", r#"test("["; "i")"#], Some(r#""abc""#))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+/// `builtin_match_flags`'s flags-argument arm (`match(re; flags)`) --
+/// evaluated before it ever delegates to `builtin_match`, so a halt here
+/// must escape without `builtin_match` getting a chance to run at all.
+/// Verified against jq 1.7.1: `jq 'match("a"; halt_error(28))'` on `"abc"`
+/// exits 28 with empty stdout.
+#[test]
+fn test_match_flags_propagates_halt_in_flags_argument() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", r#"match("a"; halt_error(28))"#], Some(r#""abc""#))?;
+    assert_eq!(code, 28, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+/// `builtin_capture_flags`'s flags-argument arm (`capture(re; flags)`) --
+/// evaluated before it ever delegates to `builtin_capture_with_flags`, so a
+/// halt here must escape before capture's own pattern/build_regex arms are
+/// ever reached. Verified against jq 1.7.1: `jq 'capture("a"; halt_error(29))'`
+/// on `"abc"` exits 29 with empty stdout.
+#[test]
+fn test_capture_flags_propagates_halt_in_flags_argument() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", r#"capture("a"; halt_error(29))"#], Some(r#""abc""#))?;
+    assert_eq!(code, 29, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+/// `builtin_capture_with_flags`'s pattern-argument arm, reached directly from
+/// the bare `capture(re)` (1-arg) form -- `Builtin::Capture` calls
+/// `builtin_capture_with_flags` with `flags: None`, skipping the flags-arm
+/// site entirely, so this is a distinct code path from `capture(re; flags)`
+/// above. Verified against jq 1.7.1: `jq 'capture(halt_error(30))'` on
+/// `"abc"` exits 30 with empty stdout.
+#[test]
+fn test_capture_bare_propagates_halt_in_pattern_argument() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-c", "capture(halt_error(30))"], Some(r#""abc""#))?;
+    assert_eq!(code, 30, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+/// `builtin_capture_with_flags`'s `build_regex` arm, reached via the bare
+/// `capture(re)` (1-arg) form once the pattern evaluates cleanly to a string
+/// that fails to compile as a regex. Verified against jq 1.7.1:
+/// `jq 'capture("[")'` on `"abc"` exits 5 with empty stdout.
+#[test]
+fn test_capture_bare_reports_invalid_regex_error() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-c", r#"capture("[")"#], Some(r#""abc""#))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+/// `builtin_sub_flags`'s flags-argument arm (`sub(re; replacement; flags)`,
+/// the 3-arg form) -- flags is evaluated before delegating to
+/// `builtin_sub_with_flags`, so a halt here must escape before that
+/// function's own pattern/replacement/build_regex arms are ever reached.
+/// Verified against jq 1.7.1: `jq 'sub("a"; "b"; halt_error(31))'` on
+/// `"abc"` exits 31 with empty stdout.
+#[test]
+fn test_sub_flags_propagates_halt_in_flags_argument() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r#"sub("a"; "b"; halt_error(31))"#],
+        Some(r#""abc""#),
+    )?;
+    assert_eq!(code, 31, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+/// `builtin_sub_with_flags`'s pattern-argument arm, reached from the 3-arg
+/// `sub(re; replacement; flags)` form once the flags argument (a literal
+/// here) has already resolved cleanly. Verified against jq 1.7.1:
+/// `jq 'sub(halt_error(32); "b"; "i")'` on `"abc"` exits 32 with empty
+/// stdout.
+#[test]
+fn test_sub_with_flags_propagates_halt_in_pattern_argument() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r#"sub(halt_error(32); "b"; "i")"#],
+        Some(r#""abc""#),
+    )?;
+    assert_eq!(code, 32, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+/// `builtin_sub_with_flags`'s replacement-argument arm, reached once both
+/// flags and pattern resolve cleanly -- the third distinct evaluation site
+/// in this function. Verified against jq 1.7.1:
+/// `jq 'sub("a"; halt_error(33); "i")'` on `"abc"` exits 33 with empty
+/// stdout.
+#[test]
+fn test_sub_with_flags_propagates_halt_in_replacement_argument() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r#"sub("a"; halt_error(33); "i")"#],
+        Some(r#""abc""#),
+    )?;
+    assert_eq!(code, 33, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+/// `builtin_sub_with_flags`'s `build_regex` arm (3-arg `sub` form), reached
+/// once flags, pattern and replacement all evaluate cleanly but the pattern
+/// fails to compile as a regex. Verified against jq 1.7.1:
+/// `jq 'sub("["; "b"; "i")'` on `"abc"` exits 5 with empty stdout.
+#[test]
+fn test_sub_with_flags_reports_invalid_regex_error() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-c", r#"sub("["; "b"; "i")"#], Some(r#""abc""#))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+/// `builtin_gsub_flags`'s flags-argument arm (`gsub(re; replacement; flags)`,
+/// the 3-arg form) -- same shape as `builtin_sub_flags`'s flags arm, but a
+/// distinct function/site in the source. Verified against jq 1.7.1:
+/// `jq 'gsub("a"; "b"; halt_error(34))'` on `"abc"` exits 34 with empty
+/// stdout.
+#[test]
+fn test_gsub_flags_propagates_halt_in_flags_argument() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r#"gsub("a"; "b"; halt_error(34))"#],
+        Some(r#""abc""#),
+    )?;
+    assert_eq!(code, 34, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+/// `builtin_gsub_with_flags`'s pattern-argument arm, reached from the 3-arg
+/// `gsub(re; replacement; flags)` form once the flags argument has already
+/// resolved cleanly. Verified against jq 1.7.1:
+/// `jq 'gsub(halt_error(35); "b"; "i")'` on `"abc"` exits 35 with empty
+/// stdout.
+#[test]
+fn test_gsub_with_flags_propagates_halt_in_pattern_argument() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r#"gsub(halt_error(35); "b"; "i")"#],
+        Some(r#""abc""#),
+    )?;
+    assert_eq!(code, 35, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+/// `builtin_gsub_with_flags`'s replacement-argument arm, reached once both
+/// flags and pattern resolve cleanly. Verified against jq 1.7.1:
+/// `jq 'gsub("a"; halt_error(36); "i")'` on `"abc"` exits 36 with empty
+/// stdout.
+#[test]
+fn test_gsub_with_flags_propagates_halt_in_replacement_argument() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r#"gsub("a"; halt_error(36); "i")"#],
+        Some(r#""abc""#),
+    )?;
+    assert_eq!(code, 36, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+/// `builtin_gsub_with_flags`'s `build_regex` arm (3-arg `gsub` form),
+/// reached once flags, pattern and replacement all evaluate cleanly but the
+/// pattern fails to compile as a regex. Verified against jq 1.7.1:
+/// `jq 'gsub("["; "b"; "i")'` on `"abc"` exits 5 with empty stdout.
+#[test]
+fn test_gsub_with_flags_reports_invalid_regex_error() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-c", r#"gsub("["; "b"; "i")"#], Some(r#""abc""#))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+/// `builtin_scan_flags`'s flags-argument arm (`scan(re; flags)`) -- evaluated
+/// before it ever delegates to `builtin_scan_with_flags`. Verified against
+/// jq 1.7.1: `jq '[scan("a"; halt_error(37))]'` on `"abc"` exits 37 with
+/// empty stdout (the enclosing array collector never gets a chance to close).
+#[test]
+fn test_scan_flags_propagates_halt_in_flags_argument() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", r#"scan("a"; halt_error(37))"#], Some(r#""abc""#))?;
+    assert_eq!(code, 37, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+/// `builtin_scan_with_flags`'s pattern-argument arm, reached from
+/// `scan(re; flags)` once the flags argument has already resolved cleanly.
+/// Verified against jq 1.7.1: `jq 'scan(halt_error(38); "i")'` on `"abc"`
+/// exits 38 with empty stdout.
+#[test]
+fn test_scan_with_flags_propagates_halt_in_pattern_argument() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", r#"scan(halt_error(38); "i")"#], Some(r#""abc""#))?;
+    assert_eq!(code, 38, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+/// `builtin_scan_with_flags`'s `build_regex` arm, reached once flags and
+/// pattern both evaluate cleanly but the pattern fails to compile as a
+/// regex. Verified against jq 1.7.1: `jq 'scan("["; "i")'` on `"abc"` exits
+/// 5 with empty stdout.
+#[test]
+fn test_scan_with_flags_reports_invalid_regex_error() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-c", r#"scan("["; "i")"#], Some(r#""abc""#))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+/// `builtin_split_regex`'s flags-argument arm (`split(re; flags)`, the
+/// regex-based 2-arg form distinct from the literal-separator `split(sep)`)
+/// -- flags is evaluated before the pattern in this function. Verified
+/// against jq 1.7.1: `jq 'split("a"; halt_error(39))'` on `"abc"` exits 39
+/// with empty stdout.
+#[test]
+fn test_split_regex_propagates_halt_in_flags_argument() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", r#"split("a"; halt_error(39))"#], Some(r#""abc""#))?;
+    assert_eq!(code, 39, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+/// `builtin_split_regex`'s pattern-argument arm, reached once the flags
+/// argument (`null`, a valid literal) has already resolved cleanly.
+/// Verified against jq 1.7.1: `jq 'split(halt_error(40); null)'` on `"abc"`
+/// exits 40 with empty stdout.
+#[test]
+fn test_split_regex_propagates_halt_in_pattern_argument() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", "split(halt_error(40); null)"], Some(r#""abc""#))?;
+    assert_eq!(code, 40, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+/// `builtin_split_regex`'s `build_regex` arm, reached once flags and pattern
+/// both evaluate cleanly but the pattern fails to compile as a regex.
+/// Verified against jq 1.7.1: `jq 'split("["; null)'` on `"abc"` exits 5
+/// with empty stdout.
+#[test]
+fn test_split_regex_reports_invalid_regex_error() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-c", r#"split("["; null)"#], Some(r#""abc""#))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+/// `builtin_splits_flags`'s flags-argument arm (`splits(re; flags)`, the
+/// 2-arg stream form) -- evaluated before it ever delegates to
+/// `builtin_splits_with_flags`. Verified against jq 1.7.1:
+/// `jq 'splits("a"; halt_error(41))'` on `"abc"` exits 41 with empty stdout.
+#[test]
+fn test_splits_flags_propagates_halt_in_flags_argument() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", r#"splits("a"; halt_error(41))"#], Some(r#""abc""#))?;
+    assert_eq!(code, 41, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+/// `builtin_splits_with_flags`'s pattern-argument arm, reached from
+/// `splits(re; flags)` once the flags argument has already resolved
+/// cleanly. Verified against jq 1.7.1: `jq 'splits(halt_error(42); "i")'`
+/// on `"abc"` exits 42 with empty stdout.
+#[test]
+fn test_splits_with_flags_propagates_halt_in_pattern_argument() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", r#"splits(halt_error(42); "i")"#], Some(r#""abc""#))?;
+    assert_eq!(code, 42, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+/// `builtin_splits_with_flags`'s `build_regex` arm, reached once flags and
+/// pattern both evaluate cleanly but the pattern fails to compile as a
+/// regex. Verified against jq 1.7.1: `jq 'splits("["; "i")'` on `"abc"`
+/// exits 5 with empty stdout.
+#[test]
+fn test_splits_with_flags_reports_invalid_regex_error() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-c", r#"splits("["; "i")"#], Some(r#""abc""#))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+/// `eval_pipe`'s `Many(values)` loop, `QueryResult::Halt(code)` arm: when the
+/// pipe's first stage yields multiple borrowed values (here, `.[]` over an
+/// array) and piping one of them through the rest of the pipe halts, any
+/// values already piped through for earlier elements must still be flushed
+/// as output before the halt takes effect -- the same "prefix survives, the
+/// terminator wins" contract `Partial` already gave `Error`/`Break` (#400,
+/// #494), extended to `Halt` by #791. Verified against jq 1.7.1:
+/// `jq -c '.[] | if . == 2 then halt_error(43) else . end'` on `[1,2,3]`
+/// prints `1` then exits 43 -- `2` and `3` never appear, and the halt is
+/// reached mid-loop rather than at the very first or last element.
+#[test]
+fn test_eval_pipe_many_branch_propagates_halt_mid_stream() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", ".[] | if . == 2 then halt_error(43) else . end"],
+        Some("[1,2,3]"),
+    )?;
+    assert_eq!(code, 43, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "1\n");
+    Ok(())
+}
+
+#[test]
+fn test_eval_pipe_many_loop_propagates_halt_from_borrowed_element() -> Result<()> {
+    // `eval_pipe`'s `QueryResult::Many(values)` loop (reached when the first
+    // stage of a pipe fans out into several *borrowed* results, e.g. `.[]`)
+    // has its own `QueryResult::Halt(code)` arm, distinct from the top-level
+    // `Halt` arm a few lines up in the same function: this one fires when
+    // piping one of those borrowed elements through the rest of the pipe
+    // halts partway through the loop, not when the very first stage halts
+    // outright. Verified against jq 1.7.1: `[1,2,3] | .[] | halt_error(3)`
+    // halts on the very first element, exit 3, no output.
+    let (stdout, stderr, code) = run_jq_full(&["-c", ".[] | halt_error(3)"], Some("[1,2,3]"))?;
+    assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_eval_pipe_top_level_propagates_direct_halt() -> Result<()> {
+    // `eval_pipe`'s top-level `match result.materialize_cursor()` has its own
+    // `QueryResult::Halt(code) => QueryResult::Halt(code)` arm for when the
+    // *first* stage of the pipe halts outright -- distinct from the sibling
+    // arm inside the `Many` loop, which only fires for one element of a
+    // fanned-out borrowed stream (see the test above). Verified against jq
+    // 1.7.1: `halt_error(3) | .` exits 3 with no output.
+    let (stdout, stderr, code) = run_jq_full(&["-n", "halt_error(3) | ."], None)?;
+    assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_pipe_owned_prefix_propagates_halt() -> Result<()> {
+    // `pipe_owned_prefix` -- the owned-value twin of `eval_pipe`'s `Many`
+    // loop, reached when the first stage of a pipe fans out into several
+    // *owned* results (here, a comma of literals) rather than values
+    // borrowed straight from the input document -- has the same
+    // per-element `Halt` arm the borrowed loop does. Verified against jq
+    // 1.7.1: `(1,2,3) | halt_error(5)` halts while piping the first
+    // generated value (`1`) through `halt_error`, exit 5, no output.
+    let (stdout, stderr, code) = run_jq_full(&["-n", "(1,2,3) | halt_error(5)"], None)?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_eval_index_expr_key_stream_propagates_direct_halt() -> Result<()> {
+    // `eval_index_expr`'s key-stream match has a direct `QueryResult::Halt`
+    // arm for when the *whole* key expression halts with zero keys already
+    // produced -- distinct from the `Partial(vs, Control::Halt(code))` arm
+    // right below it, which handles a key stream that halts *after*
+    // already yielding some keys (see the `pending_halt` tests further
+    // down). Verified against jq 1.7.1: `.[(halt_error(3))]` exits 3 with
+    // no output -- the key generator never gets past its first attempt, so
+    // the target is never even touched.
+    let (stdout, stderr, code) = run_jq_full(&["-n", ".[(halt_error(3))]"], None)?;
+    assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_eval_index_expr_pending_halt_survives_an_empty_target() -> Result<()> {
+    // `eval_index_expr`'s `QueryResult::None` target arm: a target with zero
+    // outputs (here, `empty`) indexes to zero results for every key -- it
+    // is not itself an error/break/halt that could "happen first" -- so a
+    // `pending_halt` already captured from the key stream (`(0,1,
+    // halt_error(7))`, which yields two keys before halting) must still
+    // win, rather than being discarded just because the target produced
+    // nothing (#791). Verified live against jq 1.7.1's matching contract:
+    // `empty[(0,1,halt_error(7))]` exits 7 with no output.
+    let (stdout, stderr, code) = run_jq_full(&["-n", "empty[(0,1,halt_error(7))]"], None)?;
+    assert_eq!(code, 7, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_eval_index_expr_target_propagates_direct_halt() -> Result<()> {
+    // `eval_index_expr`'s *target* stream has the same direct
+    // `QueryResult::Halt` arm the key stream does (see the key-side test
+    // above), just on the other operand: the key stream here (`(0,0)`)
+    // resolves cleanly to two ordinary keys first, and it is evaluating
+    // the target (`halt_error(5)`) that halts outright. Verified against jq
+    // 1.7.1: `(halt_error(5))[(0,0)]` exits 5 with no output.
+    let (stdout, stderr, code) = run_jq_full(&["-n", "(halt_error(5))[(0,0)]"], None)?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_eval_index_expr_target_partial_halt_discards_prefix() -> Result<()> {
+    // `eval_index_expr`'s target-side `QueryResult::Partial(_, Control::
+    // Halt(code))` arm: unlike the *key*-side `pending_halt` handling
+    // (#791, see `test_eval_index_expr_owned_target_flushes_prior_keys_
+    // before_halting`), the *target* side has no equivalent bookkeeping --
+    // it is the same conservative treatment this function's own doc
+    // comment gives the target's `Error`/`Break` arms right above it
+    // ("conservatively matching the existing Error/Break arms rather than
+    // inventing new partial-key behavior"), just extended uniformly to
+    // `Halt`. The already-produced target values (`[1,2]` and `[3,4]`, the
+    // first two comma operands, evaluated before the third one halts) are
+    // discarded rather than flushed -- a real, pre-existing divergence from
+    // jq 1.7.1, which streams `1` then `3` (`[1,2][0]` then `[3,4][0]`)
+    // before halting: `([1,2],[3,4],halt_error(6))[(0,0)]` on real jq exits
+    // 6 with stdout "1\n3\n"; succinctly exits 6 with no output at all,
+    // since it evaluates the whole target stream up front rather than
+    // interleaving it with indexing.
+    let (stdout, stderr, code) = run_jq_full(&["-n", "([1,2],[3,4],halt_error(6))[(0,0)]"], None)?;
+    assert_eq!(code, 6, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_eval_index_expr_owned_target_flushes_prior_keys_before_halting() -> Result<()> {
+    // `eval_index_expr`'s `Targets::Owned` arm (an owned/computed target --
+    // here, an inline array literal, rather than a value borrowed straight
+    // from the input document) carries its own copy of the `pending_halt`
+    // flush the `Targets::Borrowed` arm has: a key stream that yields some
+    // keys before halting (`(0,1,halt_error(9))`) must still index the
+    // target with every key already produced before the halt propagates
+    // (#791). Verified against jq 1.7.1:
+    // `[10,20,30][(0,1,halt_error(9))]` prints `10`, `20`, then exits 9
+    // with nothing on stderr (halt_error's own argument is `null`, jq's -n
+    // root). The array literal is wrapped in parens here because
+    // succinctly's parser (unlike jq's) doesn't accept an index bracket
+    // directly after an unparenthesized array-literal target.
+    let (stdout, stderr, code) = run_jq_full(&["-n", "([10,20,30])[(0,1,halt_error(9))]"], None)?;
+    assert_eq!(code, 9, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "10\n20\n");
+    Ok(())
+}
+
+#[test]
+fn test_eval_slice_expr_start_bound_propagates_halt() -> Result<()> {
+    // `eval_slice_expr`'s `starts` match converts `eval_slice_bound`'s
+    // `Err(Control::Halt(code))` -- itself reached through
+    // `eval_slice_bound`'s own `QueryResult::Halt` arm, since the start
+    // bound here is a bare `halt_error` call with nothing produced before
+    // it -- into a halt for the whole slice, before the end bound or the
+    // target are ever touched. Verified against jq 1.7.1:
+    // `.[(halt_error(3)):2]` exits 3 with no output.
+    let (stdout, stderr, code) = run_jq_full(&["-n", ".[(halt_error(3)):2]"], None)?;
+    assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_eval_slice_expr_end_bound_propagates_halt() -> Result<()> {
+    // Same arm family as the start-bound test above, but the *end* bound's
+    // own call into the shared `eval_slice_bound` function is what halts
+    // here, after the start bound (`0`) already resolved cleanly. Verified
+    // against jq 1.7.1: `.[0:(halt_error(4))]` exits 4 with no output.
+    let (stdout, stderr, code) = run_jq_full(&["-n", ".[0:(halt_error(4))]"], None)?;
+    assert_eq!(code, 4, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_eval_slice_expr_target_propagates_direct_halt() -> Result<()> {
+    // `eval_slice_expr`'s own `targets` match (mirroring `eval_index_expr`'s)
+    // has a direct `QueryResult::Halt` arm for when the *target* -- not
+    // either bound -- halts outright. Both bounds here (`1-1` and `2`) are
+    // deliberately non-literal so the whole expression compiles to
+    // `Expr::SliceExpr` (a literal `0:2` would fold to the static
+    // `Expr::Slice` fast path instead and never reach this function).
+    // Verified against jq 1.7.1: `(halt_error(5))[(1-1):2]` exits 5 with no
+    // output.
+    let (stdout, stderr, code) = run_jq_full(&["-n", "(halt_error(5))[(1-1):2]"], None)?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_eval_slice_expr_target_partial_halt_discards_prefix() -> Result<()> {
+    // `eval_slice_expr`'s target-side `QueryResult::Partial(_, Control::
+    // Halt(code))` arm: the same conservative "discard the already-
+    // produced prefix" treatment `eval_index_expr`'s analogous target-side
+    // arm has (see `test_eval_index_expr_target_partial_halt_discards_
+    // prefix`), and the same real divergence from jq 1.7.1 follows: real
+    // jq streams `[1,2]` then `[4,5]` (slicing each of the two arrays
+    // before the third comma operand halts) before exiting 6, while
+    // succinctly evaluates the whole target stream up front, sees it end
+    // in `Partial(_, Halt(6))`, and discards the buffered `[1,2,3]`/
+    // `[4,5,6]` entirely -- exit 6, no output at all.
+    let (stdout, stderr, code) =
+        run_jq_full(&["-n", "([1,2,3],[4,5,6],halt_error(6))[(1-1):2]"], None)?;
+    assert_eq!(code, 6, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_eval_rhs_once_propagates_direct_halt() -> Result<()> {
+    // `eval_rhs_once` (the RHS evaluator shared by `+=`/`-=`/`*=`/`/=`/`%=`)
+    // has a direct `QueryResult::Halt` arm for when the RHS halts outright,
+    // distinct from the `Partial(_, Control::Halt(code))` arm right below
+    // it (a RHS that outputs a value *before* halting -- see
+    // `test_compound_assign_propagates_halt_after_partial_rhs_output`).
+    // Verified against jq 1.7.1: `{"a":0} | .a += halt_error(3)` exits 3
+    // after printing the original document (`{"a":0}`, since `+=`'s RHS is
+    // evaluated against the pristine input) to stderr, no stdout.
+    let (stdout, stderr, code) = run_jq_full(&["-c", ".a += halt_error(3)"], Some(r#"{"a":0}"#))?;
+    assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_eval_assign_rhs_propagates_direct_halt() -> Result<()> {
+    // `eval_assign`'s own RHS-collecting match (distinct from
+    // `eval_rhs_once`, which `+=`/`|=`/etc. use -- plain `=` forks over
+    // every RHS output instead, #392) has its own `QueryResult::Halt` arm:
+    // a RHS that halts outright collects zero `rhs_values` with
+    // `terminal = Some(Control::Halt(code))`, so `eval_assign` returns a
+    // bare halt without ever resolving or writing to any path. Verified
+    // against jq 1.7.1: `{"a":0} | .a = halt_error(3)` exits 3 after
+    // printing the original document to stderr, no stdout.
+    let (stdout, stderr, code) = run_jq_full(&["-c", ".a = halt_error(3)"], Some(r#"{"a":0}"#))?;
+    assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_eval_assign_optional_still_swallows_ordinary_path_error() -> Result<()> {
+    // `eval_assign`'s `resolve_dynamic_indexes` match used to be a single
+    // `Err((_, _)) if optional => return QueryResult::None` guard preceded
+    // by its own `e.halt.is_some()` check; the #791 refactor splits it into
+    // `Err((_, EvalEscape::Error(_))) if optional => ...` plus a
+    // fall-through `Err((_, escape)) => escape.into()`, so an ordinary
+    // (non-halt) error inside a computed index must still be swallowed by
+    // `?` exactly as before -- this is the "still works" half of that
+    // split, proven against the same `.[(EXPR)] = 1` shape the halt-side
+    // contract (`(.[(halt_error(3))] = 1)?` still halts) documents.
+    // Verified against jq 1.7.1: `(.[(error("x"))] = 1)?` exits 0 with no
+    // output.
+    let (stdout, stderr, code) = run_jq_full(&["-n", r#"(.[(error("x"))] = 1)?"#], None)?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_eval_assign_terminal_halt_keeps_already_built_documents() -> Result<()> {
+    // `eval_assign`'s final `terminal` match: a RHS that produces at least
+    // one output before halting (`(1, halt_error(3))`) still builds and
+    // keeps the document for every output produced before the halt
+    // (#400/#494's `Partial` machinery, now extended to `Halt`) instead of
+    // discarding it the way the target-side arms in `eval_index_expr`/
+    // `eval_slice_expr` above do -- `=` forks per RHS output, and each fork
+    // is a fully independent, already-completed document, unlike those
+    // functions' single shared target stream. Verified against jq 1.7.1:
+    // `{"a":0} | .a = (1, halt_error(3))` prints `{"a":1}`, then exits 3.
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", ".a = (1, halt_error(3))"], Some(r#"{"a":0}"#))?;
+    assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "{\"a\":1}\n");
+    Ok(())
+}
+
+#[test]
+fn test_eval_update_optional_still_swallows_ordinary_path_error() -> Result<()> {
+    // Same split as `eval_assign`'s `resolve_dynamic_indexes` match (see
+    // `test_eval_assign_optional_still_swallows_ordinary_path_error`), one
+    // function over in `eval_update` (`|=`'s own path resolution): an
+    // ordinary error inside a computed index must still be swallowed by an
+    // outer `?`, even though a halt in the same position never is.
+    // Verified against jq 1.7.1: `(.[(error("x"))] |= .+1)?` exits 0 with
+    // no output.
+    let (stdout, stderr, code) = run_jq_full(&["-n", r#"(.[(error("x"))] |= .+1)?"#], None)?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+/// Sibling of `test_eval_assign_optional_still_swallows_ordinary_path_error`
+/// using a distinct error mechanism: an object used as a computed index
+/// (`{}`) is a type error raised while *applying* the resolved key, not
+/// while *evaluating* it (`error("x")`'s mechanism) -- both are ordinary,
+/// non-halt errors from `resolve_dynamic_indexes`, but the difference
+/// matters for patch-coverage: this shape reaches
+/// `eval_assign`'s own `Err((_, EvalEscape::Error(_))) if optional`
+/// guard, distinct from whatever internal path the `error("x")` shape takes.
+/// Verified against jq 1.7.1: `(.[({})] = 1)?` exits 0 with no output.
+#[test]
+fn test_eval_assign_optional_swallows_type_error_from_object_key() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-n", "(.[({})] = 1)?"], None)?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+/// `eval_update` sibling of the test above -- see its doc comment. Verified
+/// against jq 1.7.1: `(.[({})] |= .+1)?` exits 0 with no output.
+#[test]
+fn test_eval_update_optional_swallows_type_error_from_object_key() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-n", "(.[({})] |= .+1)?"], None)?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_eval_owned_multi_propagates_partial_halt_from_computed_key() -> Result<()> {
+    // `eval_owned_multi`'s `QueryResult::Partial(_, Control::Halt(code))`
+    // arm: the computed key (`1, halt`) produces one real output before
+    // halting, distinct from a *bare* halt with zero prefix (`.[(halt)]`,
+    // already covered) which takes the sibling `QueryResult::Halt(code)` arm
+    // right above this one. Verified against jq 1.7.1: `.[(1, halt)] = 1`
+    // on `null` exits 0 with no output.
+    let (stdout, stderr, code) = run_jq_full(&["-c", ".[(1, halt)] = 1"], Some("null"))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_resolve_node_try_catch_runs_handler_as_path_after_ordinary_error() -> Result<()> {
+    // `resolve_node`'s `Expr::Try` arm, `Some(catch_expr)` branch: when the
+    // `try` body fails with a genuine (non-halt, non-invalid-path-expression)
+    // error partway through producing its own path outputs, the `catch`
+    // handler runs as a path expression too, against the error's payload,
+    // and its resolved paths are appended after whatever the `try` body
+    // already resolved before failing. `.a` succeeds first (contributing
+    // `["a"]`), then `.x[0]` fails indexing the number `5` with a number;
+    // `catch empty` contributes nothing further. Verified against jq 1.7.1:
+    // `path(try (.a, .x[0]) catch empty)` on `{"a":1,"x":5}` is `["a"]`.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "path(try (.a, .x[0]) catch empty)"],
+        Some(r#"{"a":1,"x":5}"#),
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[\"a\"]\n");
+    Ok(())
+}
+
+#[test]
+fn test_update_path_index_arm_reports_type_error_on_non_array() -> Result<()> {
+    // `update_path`'s bare `Expr::Index(idx)` arm (reached when the whole
+    // resolved path is a single index component, e.g. `.[0]`): indexing a
+    // non-array, non-null root with `optional: false` reports jq's
+    // ordinary "cannot index" error. This is plain pre-existing type
+    // checking, unrelated to halt propagation -- the source line only
+    // moved because `update_path`'s return type changed from
+    // `Result<(), EvalError>` to `Result<(), EvalEscape>` for #791, so
+    // every ordinary error return needed `.into()` added. Verified against
+    // jq 1.7.1: `"abc" | .[0] |= .+1` exits 5 with "Cannot index string
+    // with number".
+    let (stdout, stderr, code) = run_jq_full(&["-c", ".[0] |= .+1"], Some(r#""abc""#))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert!(
+        stderr.contains("Cannot index string with number"),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_update_path_iterate_arm_reports_type_error_on_non_iterable() -> Result<()> {
+    // `update_path`'s bare `Expr::Iterate` arm (the whole resolved path is
+    // `.[]`): iterating a scalar root with `optional: false` reports jq's
+    // ordinary "cannot iterate" error -- same "line moved for the
+    // `.into()` conversion, not new behavior" story as the `Index` arm
+    // test above. Verified against jq 1.7.1: `5 | .[] |= .+1` exits 5 with
+    // "Cannot iterate over number (5)".
+    let (stdout, stderr, code) = run_jq_full(&["-c", ".[] |= .+1"], Some("5"))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert!(
+        stderr.contains("Cannot iterate over number"),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_update_path_pipe_field_arm_reports_type_error_on_non_object() -> Result<()> {
+    // `update_path`'s `Expr::Pipe(exprs)` branch has its own copy of the
+    // `Expr::Field` type check for a *non-last* path component (the whole
+    // resolved path here is `.a.b`, two components, so `first =
+    // Field("a")` is checked against the root *before* recursing into
+    // `rest`) -- distinct from the top-level bare `Expr::Field` arm, which
+    // only ever sees a single-component path. Verified against jq 1.7.1:
+    // `5 | .a.b |= .+1` exits 5 with `Cannot index number with string
+    // "a"`.
+    let (stdout, stderr, code) = run_jq_full(&["-c", ".a.b |= .+1"], Some("5"))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert!(
+        stderr.contains(r#"Cannot index number with string "a""#),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_update_path_pipe_index_arm_reports_type_error_on_non_array() -> Result<()> {
+    // Same shape as the `Pipe`-branch `Field` arm test above, one arm over:
+    // the whole resolved path here is `.[0][1]`, two components, so
+    // `first = Index(0)` is checked against the (non-array) root before
+    // recursing into `rest`. Verified against jq 1.7.1:
+    // `"abc" | .[0][1] |= .+1` exits 5 with "Cannot index string with
+    // number".
+    let (stdout, stderr, code) = run_jq_full(&["-c", ".[0][1] |= .+1"], Some(r#""abc""#))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert!(
+        stderr.contains("Cannot index string with number"),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_update_path_pipe_iterate_arm_reports_type_error_on_non_iterable() -> Result<()> {
+    // Same shape again, for `Expr::Iterate` inside the `Pipe` branch: the
+    // whole resolved path here is `.[][0]`, two components, so
+    // `first = Iterate` is checked against the (non-iterable) root before
+    // recursing into `rest`. Verified against jq 1.7.1:
+    // `5 | .[][0] |= .+1` exits 5 with "Cannot iterate over number (5)".
+    let (stdout, stderr, code) = run_jq_full(&["-c", ".[][0] |= .+1"], Some("5"))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert!(
+        stderr.contains("Cannot iterate over number"),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_path_as_binding_propagates_halt_from_partial_bind_stream() -> Result<()> {
+    // `resolve_node`'s `Expr::As` arm (`path()`'s own `E as $x | body`
+    // handling), its `Some(Control::Halt(code))` trailing-control arm: the
+    // bind expression produces one output and then halts. This used to be
+    // impossible to see at all -- the arm's predecessor eagerly collected
+    // the *whole* bind stream via `eval_owned_multi` before running `body`
+    // even once, so a bind source that halts partway through discarded any
+    // prefix and never bound `$x` for the earlier, successful output (#791).
+    // Verified against jq 1.7.1: `path((1, halt_error(3)) as $x | .a)` on
+    // `{"a":1}` prints `["a"]` (the $x=1 iteration's own body completing)
+    // to stdout, dumps the still-unmodified input `{"a":1}` to stderr (bare
+    // `halt_error`'s current-value dump), and exits 3 -- it never attempts a
+    // second iteration for the failed bind.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "path((1, halt_error(3)) as $x | .a)"],
+        Some(r#"{"a":1}"#),
+    )?;
+    assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[\"a\"]\n");
+    Ok(())
+}
+
+#[test]
+fn test_path_as_binding_propagates_error_from_partial_bind_stream() -> Result<()> {
+    // Sibling of the halt test above, `Expr::As`'s `Some(Control::Error(e))`
+    // trailing-control arm instead of its `Halt` arm: the bind source
+    // produces one output, `body` resolves it, and only the *second*
+    // attempt to advance the bind source raises an ordinary error --
+    // the already-resolved prefix from the first binding must still reach
+    // the caller. Verified against jq 1.7.1: `path((1, error("boom")) as $x
+    // | .a)` on `{"a":1}` prints `["a"]`, then errors "boom", exit 5.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r#"path((1, error("boom")) as $x | .a)"#],
+        Some(r#"{"a":1}"#),
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[\"a\"]\n");
+    assert!(stderr.contains("boom"), "{stderr}");
+    Ok(())
+}
+
+#[test]
+fn test_path_as_binding_break_in_bind_stream_is_a_known_pre_existing_gap() -> Result<()> {
+    // `Expr::As`'s `Some(Control::Break(label))` trailing-control arm,
+    // reached when the bind source itself raises a labeled `break` after
+    // already producing an output. This documents a real, PRE-EXISTING
+    // divergence from real jq that predates #791 and isn't specific to
+    // `as`-bindings -- confirmed live that a bare, non-`as` comma reaches
+    // the exact same mismatch: `label $out | path((.a, break $out))` on
+    // `{"a":1}` also exits 5 with "break $out not in label" here, instead
+    // of real jq's exit 0 with `["a"]`. Path-context has no mechanism to
+    // let a `break` escape `resolve_node` and be caught by a `label`
+    // sitting *outside* the `path(...)` call (`PathResolveResult`'s error
+    // type, `EvalEscape`, has no `Break` variant to carry it), so every
+    // site that turns a path-context `Control::Break` into an ordinary
+    // "break $label not in label" `EvalError` -- this one and the
+    // pre-existing `eval_owned_multi` one alike -- shares this gap. Kept
+    // consistent with that existing behavior rather than fixed here; not a
+    // regression introduced by this arm. Filed as #824.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "label $out | path((1, break $out) as $x | .a)"],
+        Some(r#"{"a":1}"#),
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[\"a\"]\n");
+    assert!(stderr.contains("break $out not in label"), "{stderr}");
+    Ok(())
+}
+
+#[test]
+fn test_path_as_binding_keeps_earlier_binding_prefix_when_a_later_body_errors() -> Result<()> {
+    // `Expr::As`'s per-binding loop body, the `Err((body_prefix, escape))`
+    // arm: the bind source itself succeeds fully (no error/break/halt), but
+    // a *later* binding's `body` resolution fails as a path expression.
+    // Whatever `out` accumulated from earlier, successful bindings must
+    // still reach the caller ahead of the failure, not just `body_prefix`
+    // from the failing iteration alone. Verified against jq 1.7.1:
+    // `path((1,2) as $x | if $x==1 then .a else ($x|.a) end)` on `{"a":1}`
+    // prints `["a"]` (the `$x=1` iteration), then raises an "invalid path
+    // expression" error for the `$x=2` iteration (indexing a number as a
+    // path) and exits 5 -- the exact wording differs from jq's own (a
+    // pre-existing, accepted divergence documented on `Expr::Try` above),
+    // but the exit code and the kept prefix both match.
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            "path((1,2) as $x | if $x==1 then .a else ($x|.a) end)",
+        ],
+        Some(r#"{"a":1}"#),
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[\"a\"]\n");
+    assert!(stderr.contains("Invalid path expression"), "{stderr}");
+    Ok(())
+}
+
+#[test]
+fn test_update_assign_propagates_halt_from_bare_filter() -> Result<()> {
+    // `eval_owned_multi_first`'s bare `QueryResult::Halt(code)` arm --
+    // `update_path`'s `Expr::Identity` arm (`|=`'s own update-filter
+    // evaluation) uses this function specifically because it must keep only
+    // the update filter's *first* output. Unlike a `Partial`'s trailing
+    // control (deliberately kept as "just the prefix" per this function's
+    // own doc comment), a *bare* halt has no prior output to fall back to --
+    // `collect_owned()` would turn it into `Ok(vec![])`, read back as an
+    // empty filter and silently assigning `null` instead of halting (#791).
+    // This exercises the direct filter path (no `try`/`catch` wrapper),
+    // distinct from the existing `try halt_error(9) catch empty` regression
+    // test. Verified against jq 1.7.1: `{"a":1} | .a |= halt_error(7)`
+    // prints nothing to stdout, dumps `1` (the pre-update `.a`) to stderr,
+    // and exits 7.
+    let (stdout, stderr, code) = run_jq_full(&["-c", ".a |= halt_error(7)"], Some(r#"{"a":1}"#))?;
+    assert_eq!(code, 7, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_resolve_node_try_without_catch_keeps_prefix_on_ordinary_error() -> Result<()> {
+    // `resolve_node`'s `Expr::Try` arm, the genuine-error (non-halt) branch
+    // guarded by `!e.is_invalid_path_expression()`: with no `catch`, the
+    // path components already resolved before the failure are kept, the
+    // same policy `?`'s matching arm uses. This is the positive-path sibling
+    // of `test_halt_not_caught_by_try_catch_in_path_expression`, which only
+    // exercises the case where the escape *is* a halt and this whole `match
+    // catch` block is never entered. Verified against jq 1.7.1:
+    // `jq -c 'path(try (.a, .x[0]))'` on `{"a":1,"x":5}` (`.x[0]` errors --
+    // 5 is a number, not indexable) prints `["a"]`, exit 0.
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", "path(try (.a, .x[0]))"], Some(r#"{"a":1,"x":5}"#))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[\"a\"]\n");
+    Ok(())
+}
+
+#[test]
+fn test_resolve_node_try_catch_handles_ordinary_error() -> Result<()> {
+    // `resolve_node`'s `Expr::Try` arm, the `Some(catch_expr)` branch: a
+    // genuine (non-halt) error resolved by `try` runs the `catch` handler as
+    // a path expression too, via `resolve_against_cow` (the error payload is
+    // a fresh, function-local `OwnedValue`, so it can't lend a reference with
+    // this function's own `'a`). Verified against jq 1.7.1:
+    // `jq -c 'path(try (.a, .x[0]) catch empty)'` on `{"a":1,"x":5}` prints
+    // `["a"]`, exit 0 -- the caught error's `catch empty` handler resolves
+    // to zero path components, contributing nothing after `.a`'s own.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "path(try (.a, .x[0]) catch empty)"],
+        Some(r#"{"a":1,"x":5}"#),
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[\"a\"]\n");
+    Ok(())
+}
+
+#[test]
+fn test_resolve_limit_path_context_rejects_non_numeric_n() -> Result<()> {
+    // `resolve_limit`'s wildcard arm (`path(limit(...))`'s own `n`-argument
+    // check, the path-tracking sibling of `eval_limit`'s equivalent check):
+    // any `n` that isn't a non-negative int reports "limit requires
+    // non-negative integer" rather than silently coercing. Real jq's
+    // `limit/2` is defined via `foreach`/arithmetic, so a non-numeric `n`
+    // fails there with its own "cannot be subtracted" wording instead --
+    // different text, but the same "reject, don't silently misbehave" shape:
+    // both exit non-zero. Verified against jq 1.7.1:
+    // `jq -c 'path(limit("x"; .a))'` on `{"a":1}` exits 5.
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", "path(limit(\"x\"; .a))"], Some(r#"{"a":1}"#))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert!(
+        stderr.contains("limit requires non-negative integer"),
+        "{stderr}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_as_binding_propagates_halt_from_bind_expression() -> Result<()> {
+    // `eval_as`'s `bound_result` match: a halt while evaluating the bind
+    // expression itself (`EXPR as $x | body`'s `EXPR`), with zero prior
+    // output, must return `QueryResult::Halt` directly rather than being
+    // read as "no bound values" and silently running `body` zero times with
+    // exit 0. Verified against jq 1.7.1: `jq -n 'halt_error(3) as $x | $x'`
+    // exits 3 with no output.
+    let (stdout, stderr, code) = run_jq_full(&["-n", "halt_error(3) as $x | $x"], None)?;
+    assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_as_binding_propagates_halt_from_body_after_partial_output() -> Result<()> {
+    // `eval_as`'s per-bound-value loop match: once bound values are being
+    // iterated, a halt raised while evaluating `body` for a later bound
+    // value must still surface, carrying forward whatever `all_results` the
+    // earlier bound values already produced (#400/#494's "outputs already
+    // produced no longer vanish" policy applied to `as`). Verified against
+    // jq 1.7.1: `jq -n '(1,2) as $x | if $x==2 then halt_error(4) else $x
+    // end'` prints `1` then exits 4 -- the `$x=2` iteration halts before
+    // producing its own output.
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-n",
+            "(1,2) as $x | if $x==2 then halt_error(4) else $x end",
+        ],
+        None,
+    )?;
+    assert_eq!(code, 4, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "1\n");
+    Ok(())
+}
+
+#[test]
+fn test_reduce_propagates_halt_from_input_stream() -> Result<()> {
+    // `eval_reduce`'s `input_result` match, bare `QueryResult::Halt` arm: a
+    // halt while evaluating `reduce EXPR as $var (...)`'s source stream,
+    // with zero prior input values, must escape as a halt rather than being
+    // read as "empty input", which would still run the accumulator's INIT
+    // and answer normally. Verified against jq 1.7.1:
+    // `jq -n 'reduce halt_error(5) as $x (0; .+$x)'` exits 5 with no output.
+    let (stdout, stderr, code) =
+        run_jq_full(&["-n", "reduce halt_error(5) as $x (0; .+$x)"], None)?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_reduce_propagates_halt_from_partial_input_stream() -> Result<()> {
+    // `eval_reduce`'s `input_result` match, `QueryResult::Partial(_,
+    // Control::Halt(code))` arm: `reduce`'s source stream produced a value
+    // and then halted. `reduce`'s own output is always single-shot (only the
+    // final accumulator, never intermediates), so the partial prefix is
+    // dropped and only the halt escapes -- verified against jq 1.7.1:
+    // `jq -n 'reduce (1, halt_error(6)) as $x (0; .+$x)'` exits 6 with no
+    // output at all, not the accumulator computed from the single `1`.
+    let (stdout, stderr, code) =
+        run_jq_full(&["-n", "reduce (1, halt_error(6)) as $x (0; .+$x)"], None)?;
+    assert_eq!(code, 6, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_reduce_propagates_halt_from_init_expression() -> Result<()> {
+    // `eval_reduce`'s `init_result` match, bare `QueryResult::Halt` arm: a
+    // halt while evaluating INIT (with zero prior INIT outputs) must escape
+    // directly -- INIT forks the whole reduce over each of its own outputs
+    // (#534), and a bare halt here means there is no fork to run at all.
+    // Verified against jq 1.7.1: `jq -n 'reduce 1 as $x (halt_error(7);
+    // .+$x)'` exits 7 with no output.
+    let (stdout, stderr, code) =
+        run_jq_full(&["-n", "reduce 1 as $x (halt_error(7); .+$x)"], None)?;
+    assert_eq!(code, 7, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_parentn_n_expr_break_reported_as_break_not_in_label() -> Result<()> {
+    // `eval_owned_expr`'s `Control::Break` arm (split out from `Error`
+    // alongside the new `Control::Halt` arm one line below it, forced by
+    // `Control` gaining the `Halt` variant): an unmatched `break` raised
+    // while evaluating an owned-value-based argument -- here `parent(n)`'s
+    // `n` argument, via `ParentN`'s call to `eval_owned_expr` -- converts
+    // into the ordinary "break $label not in label" `EvalError`, the same
+    // diagnostic every other uncaught break in this file produces. `parent`
+    // is a succinctly extension (no real-jq equivalent), so this is checked
+    // against succinctly's own established "break $out not in label" wording
+    // (see `test_uncaught_break_after_output_keeps_the_prefix`), not jq.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", ".a.b | parent(break $out)"],
+        Some(r#"{"a":{"b":1}}"#),
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert!(stderr.contains("break $out not in label"), "{stderr}");
+    Ok(())
+}
+
+#[test]
+fn test_foreach_propagates_halt_from_input_stream() -> Result<()> {
+    // `eval_foreach`'s `input_result` match, bare `QueryResult::Halt` arm:
+    // same shape as `eval_reduce`'s equivalent arm -- a halt while evaluating
+    // `foreach`'s source stream, with zero prior input values, must escape
+    // directly. Verified against jq 1.7.1:
+    // `jq -n 'foreach halt_error(8) as $x (0; .+$x)'` exits 8 with no output.
+    let (stdout, stderr, code) =
+        run_jq_full(&["-n", "foreach halt_error(8) as $x (0; .+$x)"], None)?;
+    assert_eq!(code, 8, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_foreach_propagates_halt_from_init_expression() -> Result<()> {
+    // `eval_foreach`'s `init_result` match, bare `QueryResult::Halt` arm:
+    // same shape as `eval_reduce`'s equivalent arm -- INIT forks the whole
+    // foreach over each of its own outputs (#534), and a bare halt here
+    // means there is no fork to run. Verified against jq 1.7.1:
+    // `jq -n 'foreach 1 as $x (halt_error(9); .+$x)'` exits 9 with no output.
+    let (stdout, stderr, code) =
+        run_jq_full(&["-n", "foreach 1 as $x (halt_error(9); .+$x)"], None)?;
+    assert_eq!(code, 9, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_limit_propagates_halt_in_n_argument() -> Result<()> {
+    // `eval_limit`'s `n_result` match, `Err(e) => return e.into()` arm: a
+    // halt while evaluating `limit(n; expr)`'s `n` argument must escape
+    // rather than being reported as "limit requires non-negative integer".
+    // Verified against jq 1.7.1: `jq -n 'limit(halt_error(11); 1,2,3)'`
+    // exits 11 with no output.
+    let (stdout, stderr, code) = run_jq_full(&["-n", "limit(halt_error(11); 1,2,3)"], None)?;
+    assert_eq!(code, 11, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_limit_propagates_halt_in_expr_argument() -> Result<()> {
+    // `eval_limit`'s main result match, `QueryResult::Halt(code)` arm: a
+    // halt used to be reachable only via the old wildcard alongside `Break`
+    // (fixed alongside #494's "limit drops what it shouldn't" family) --
+    // a bare halt from `expr` (no prior outputs) must escape as `Halt`, not
+    // be dropped the way excess values past `n` are. Verified against jq
+    // 1.7.1: `jq -n 'limit(3; halt_error(12))'` exits 12 with no output.
+    let (stdout, stderr, code) = run_jq_full(&["-n", "limit(3; halt_error(12))"], None)?;
+    assert_eq!(code, 12, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_first_expr_propagates_halt() -> Result<()> {
+    // `eval_first_expr`'s result match, `QueryResult::Halt(code)` arm: a
+    // bare halt from `expr` (no prior output to take as "first") must
+    // escape as `Halt`, not be read as `None`. Verified against jq 1.7.1:
+    // `jq -n 'first(halt_error(13))'` exits 13 with no output.
+    let (stdout, stderr, code) = run_jq_full(&["-n", "first(halt_error(13))"], None)?;
+    assert_eq!(code, 13, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_last_expr_propagates_bare_halt() -> Result<()> {
+    // `eval_last_expr`'s result match, bare `QueryResult::Halt(code)` arm: a
+    // halt from `expr` with zero prior outputs must escape directly.
+    // Verified against jq 1.7.1: `jq -n 'last(halt_error(14))'` exits 14
+    // with no output.
+    let (stdout, stderr, code) = run_jq_full(&["-n", "last(halt_error(14))"], None)?;
+    assert_eq!(code, 14, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_last_expr_propagates_halt_past_partial_prefix() -> Result<()> {
+    // `eval_last_expr`'s result match, `QueryResult::Partial(_,
+    // Control::Halt(code))` arm: unlike `first`, `last` cannot short-circuit
+    // -- it doesn't know a value is the last until the stream is exhausted
+    // -- so a `Partial` prefix (here `[1]`, produced before the halt) is
+    // dropped and only the halt surfaces. Verified against jq 1.7.1:
+    // `jq -n 'last(1, halt_error(15))'` exits 15 with no output -- it does
+    // not answer `1`.
+    let (stdout, stderr, code) = run_jq_full(&["-n", "last(1, halt_error(15))"], None)?;
+    assert_eq!(code, 15, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+/// The three tests below are `eval.rs`-specific siblings of
+/// `test_first_expr_propagates_halt`/`test_last_expr_propagates_bare_halt`/
+/// `test_last_expr_propagates_halt_past_partial_prefix` above: those three
+/// use `first`/`last` as the *top-level* CLI filter, which
+/// `eval_generic.rs`'s own native `Expr::FirstExpr`/`Expr::LastExpr` handling
+/// (`eval_first_or_last_generic`, added for #607) intercepts before
+/// `eval.rs`'s `eval_first_expr`/`eval_last_expr` are ever reached. Routing
+/// through a `group_by` key function (as with the `eval_pipe`/`eval_index_expr`
+/// tests earlier in this file) forces evaluation through `eval.rs`'s own
+/// implementations instead.
+#[test]
+fn test_eval_first_expr_bare_halt_reached_through_group_by_key_fn() -> Result<()> {
+    // `eval_first_expr`'s own `QueryResult::Halt(code)` arm. Verified against
+    // jq 1.7.1: `jq -c 'group_by(first(halt))'` on `[5]` exits 0 with no
+    // output.
+    let (stdout, stderr, code) = run_jq_full(&["-c", "group_by(first(halt))"], Some("[5]"))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_eval_last_expr_bare_halt_reached_through_group_by_key_fn() -> Result<()> {
+    // `eval_last_expr`'s own bare `QueryResult::Halt(code)` arm. Verified
+    // against jq 1.7.1: `jq -c 'group_by(last(halt))'` on `[5]` exits 0 with
+    // no output.
+    let (stdout, stderr, code) = run_jq_full(&["-c", "group_by(last(halt))"], Some("[5]"))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_eval_last_expr_partial_halt_reached_through_group_by_key_fn() -> Result<()> {
+    // `eval_last_expr`'s own `QueryResult::Partial(_, Control::Halt(code))`
+    // arm: `last` cannot short-circuit, so a prefix (`1`, `2`) produced
+    // before the halt is dropped, and only the halt surfaces. Verified
+    // against jq 1.7.1: `jq -c 'group_by(last((1, 2, halt)))'` on `[5]`
+    // exits 0 with no output.
+    let (stdout, stderr, code) = run_jq_full(&["-c", "group_by(last((1, 2, halt)))"], Some("[5]"))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_range_bound_error_is_caught_by_try_catch() -> Result<()> {
+    // `range_arg`'s `QueryResult::Error(e) => Err(e.into())` arm -- the
+    // ordinary-error sibling of the `Halt` arm covered by
+    // `test_range_halt_not_caught_by_try_catch`. A genuine (non-halt) error
+    // in a range bound is fully catchable, unlike a halt. Verified against
+    // jq 1.7.1: `jq -n 'try (range(error("boom"))) catch .'` is `"boom"`,
+    // exit 0.
+    let (stdout, stderr, code) =
+        run_jq_full(&["-n", "try (range(error(\"boom\"))) catch ."], None)?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "\"boom\"\n");
+    Ok(())
+}
+
+#[test]
+fn test_range_from_bound_partial_halt_aborts_immediately() -> Result<()> {
+    // `range_arg`'s `QueryResult::Partial(_, Control::Halt(code))` arm,
+    // reached via `eval_range`'s `from_val` computation (`Err(e) => return
+    // e.into()`): the `from` bound produces one output and then halts. This
+    // is a succinctly-only shape to pin: real jq's `range/2` fans out over
+    // every output of a multi-valued bound (confirmed live --
+    // `jq -n 'range((1, halt_error(4)); 10)'` prints `1` through `9` from
+    // the first `from` value's whole `range(1;10)` before halting on the
+    // second), whereas this evaluator's `from`/`to`/`step` each take exactly
+    // one resolved value and never fork. So here the halt is caught before
+    // `eval_range` ever calls `eval_range_values`: no range values are
+    // generated at all, unlike jq's partial run. Succinctly's own contract
+    // (halt is never downgraded, never partially computed around) still
+    // holds: no output, exit 4.
+    let (stdout, stderr, code) = run_jq_full(&["-n", "range((1, halt_error(4)); 10)"], None)?;
+    assert_eq!(code, 4, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_range_bound_non_numeric_value_rejected() -> Result<()> {
+    // `range_arg`'s trailing wildcard arm ("Range bounds must be numeric"):
+    // a single-argument `range(N)` whose bound evaluates to a non-numeric
+    // `OwnedValue` (here a plain string literal, which reaches this
+    // function as `QueryResult::Owned(OwnedValue::String(..))` -- none of
+    // the numeric `Owned`/`One` arms above it) is rejected outright rather
+    // than silently coerced. Verified against jq 1.7.1: `jq -n 'range("x")'`
+    // exits 5 with the identical "Range bounds must be numeric" message.
+    let (stdout, stderr, code) = run_jq_full(&["-n", "range(\"x\")"], None)?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert!(stderr.contains("Range bounds must be numeric"), "{stderr}");
+    Ok(())
+}
+
+#[test]
+fn test_range_step_bound_propagates_halt() -> Result<()> {
+    // `eval_range`'s `step_val` computation, `Err(e) => return e.into()`
+    // arm: a halt while evaluating `range(a;b;step)`'s `step` argument must
+    // escape before any range values are generated. Verified against jq
+    // 1.7.1: `jq -n 'range(1; 10; halt_error(6))'` exits 6 with no output --
+    // the step is resolved once, up front, so (unlike `from`'s fan-out
+    // divergence) this one matches jq exactly.
+    let (stdout, stderr, code) = run_jq_full(&["-n", "range(1; 10; halt_error(6))"], None)?;
+    assert_eq!(code, 6, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_recurse_cond_propagates_halt_from_f() -> Result<()> {
+    // `builtin_recurse_cond`'s `f`-evaluation match, `Err(e) => return
+    // partial(outputs, e.into())` arm: an error/halt from `f` aborts
+    // immediately rather than pruning just the current node's children
+    // (#636's "nothing catches an error from `f`" rule extended to halt).
+    // The root is still emitted first (`recurse`'s own `.,` output happens
+    // before `f` is evaluated), so this exercises the halt carrying that
+    // one-element `outputs` prefix forward as a `Partial`. Verified against
+    // jq 1.7.1: `jq -n '1 | recurse(halt_error(7); true)'` prints `1` to
+    // stdout, dumps `1` (the current value at the point of the halt) to
+    // stderr, and exits 7.
+    let (stdout, stderr, code) = run_jq_full(&["-n", "1 | recurse(halt_error(7); true)"], None)?;
+    assert_eq!(code, 7, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "1\n");
+    Ok(())
+}
+
+#[test]
+fn test_walk_propagates_halt_from_f() -> Result<()> {
+    // `builtin_walk`'s `Err(e) => e.into()` arm: `walk_impl` applies `f` to
+    // the (already child-processed) value via `eval_owned_expr`, and a halt
+    // from `f` propagates back up through every recursive `walk_impl` call's
+    // `?` (through `Vec<_>`/`IndexMap<_>`'s `collect()` for container
+    // values) to this top-level match, converting back into a `QueryResult`.
+    // Verified against jq 1.7.1: `jq -n '1 | walk(halt_error(8))'` prints
+    // nothing to stdout, dumps `1` (the value `f` was applied to) to stderr,
+    // and exits 8.
+    let (stdout, stderr, code) = run_jq_full(&["-n", "1 | walk(halt_error(8))"], None)?;
+    assert_eq!(code, 8, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+/// `builtin_isvalid`'s `QueryResult::Partial(_, Control::Halt(code))` arm
+/// (distinct from the bare `QueryResult::Halt` arm already covered by
+/// `test_isvalid_propagates_halt_instead_of_answering_true`): `isvalid`
+/// forces `optional = true` and evaluates its argument via a single
+/// `eval_single` call, so an argument that produces an output *before*
+/// halting (`1, halt_error(3)`) comes back as `QueryResult::Partial`, not a
+/// bare `Halt`. Must still halt, not report `true` just because a value was
+/// already produced before the halt.
+#[test]
+fn test_isvalid_propagates_halt_from_partial_argument_result() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_full(&["-n", "isvalid(1, halt_error(3)), \"after\""], None)?;
+    assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+/// `continue_rest_with_context`'s bare `QueryResult::Halt` arm: reached
+/// whenever an `If`/`Comma`/`Try`/`Label` branch inside a path-context pipe
+/// (here, `if`'s `then` branch) halts with zero prior output of its own and
+/// there is still more pipe left to run (`| "tail"`) after it. Distinct
+/// from `accumulate_path_context_step`'s own halt handling, which stops the
+/// `key` comma branch's accumulation one level up, and from the `If` arm's
+/// own `cond`-halts-first case (see the `test_path_context_if_arm_...`
+/// test below). Verified against jq 1.7.1 -- bare if/pipe/halt has no
+/// succinctly-specific behavior here: `jq -n '1, (if true then
+/// halt_error(3) else 1 end | "tail")'` prints `1` then exits 3.
+#[test]
+fn test_path_context_continue_rest_propagates_bare_halt_from_if_branch() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            r#".a.b | key, (if true then halt_error(3) else 1 end | "tail")"#,
+        ],
+        Some(r#"{"a":{"b":{"c":1}}}"#),
+    )?;
+    assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "\"b\"\n");
+    Ok(())
+}
+
+/// Companion to `test_parent_propagates_halt_in_n_argument`: that test
+/// proves a halt in `parent`'s `n` argument escapes even under `?`; this
+/// proves the `Err(EvalEscape::Error(_)) if optional` guard right above it
+/// still swallows a genuine error -- the split from the old catch-all
+/// `Err(_) if optional` must not have started leaking ordinary errors too.
+/// `has(error("x"))` is used rather than bare `error("x")` because
+/// `error`'s own `optional` handling would otherwise self-swallow to
+/// `Ok(Null)` before `parent`'s `n`-argument evaluator ever observes an
+/// `Err`; `has` turns that into its own unconditional "no value" error,
+/// which is what actually reaches this arm. `parent` is a succinctly
+/// extension (no real-jq equivalent), so this is checked against
+/// succinctly's own contract.
+#[test]
+fn test_parent_n_argument_still_swallows_ordinary_error_under_optional() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r#".a.b | parent(has(error("x")))?"#],
+        Some(r#"{"a":{"b":1}}"#),
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+/// Companion to `test_path_context_optional_does_not_swallow_halt_in_builtin_arm`:
+/// that test proves a halt escapes `eval_pipe_with_path_context_internal`'s
+/// `Expr::Builtin` arm even under `?`; this proves the
+/// `Err(EvalEscape::Error(_)) if optional` guard right above it still
+/// swallows a genuine error. Same `has(error(...))` trick as the `parent`
+/// test above, for the same reason (`error`'s own optional self-swallow
+/// would otherwise never let an `Err` reach this arm at all).
+#[test]
+fn test_path_context_builtin_arm_still_swallows_ordinary_error_under_optional() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r#".a.b | (has(error("boom")))?, key"#],
+        Some(r#"{"a":{"b":{"c":1}}}"#),
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "\"b\"\n");
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
+/// Companion to `test_path_context_optional_does_not_swallow_halt_in_object_literal_arm`:
+/// proves the `Err(EvalEscape::Error(_)) if optional` guard in
+/// `eval_pipe_with_path_context_internal`'s `Expr::Object | Expr::Array |
+/// Expr::Literal` arm still swallows a genuine error, the same
+/// Error-vs-Halt split as the `Expr::Builtin` arm two arms up. Same
+/// `has(error(...))` trick, for the same reason.
+#[test]
+fn test_path_context_object_literal_arm_still_swallows_ordinary_error_under_optional() -> Result<()>
+{
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r#".a.b | ({x: has(error("boom"))})?, key"#],
+        Some(r#"{"a":{"b":{"c":1}}}"#),
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "\"b\"\n");
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
+/// `eval_pipe_with_path_context_internal`'s `Expr::If` arm unpacks
+/// `cond_result` into `(cond_values, cond_control)` before running any
+/// branch; this targets its `QueryResult::Halt(code) => (Vec::new(),
+/// Some(Control::Halt(code)))` case -- `cond` itself halting with zero
+/// prior output -- distinct from `continue_rest_with_context`'s halt
+/// handling (which only runs *after* a branch has already been picked and
+/// evaluated, see the test above). Verified against jq 1.7.1: `jq -n '1,
+/// (if halt_error(3) then "t" else "f" end)'` prints `1` then exits 3.
+#[test]
+fn test_path_context_if_arm_converts_bare_halt_from_cond() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            r#".a.b | key, (if halt_error(3) then "t" else "f" end)"#,
+        ],
+        Some(r#"{"a":{"b":{"c":1}}}"#),
+    )?;
+    assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "\"b\"\n");
+    Ok(())
+}
+
+/// Companion to the `Expr::Builtin`/object-literal arms above: targets
+/// `eval_pipe_with_path_context_internal`'s final catch-all `_` arm
+/// (reached for expression kinds with no dedicated handling here, e.g. `X
+/// as $v | BODY`). Proves its `Err(EvalEscape::Error(_)) if optional`
+/// guard still swallows a genuine error reached this way. Same
+/// `has(error(...))` trick, for the same reason.
+#[test]
+fn test_path_context_generic_fallback_still_swallows_ordinary_error_under_optional() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r#".a.b | key, (1 as $x | has(error("boom")))?"#],
+        Some(r#"{"a":{"b":{"c":1}}}"#),
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "\"b\"\n");
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
+/// `builtin_fromstream`'s bare `QueryResult::Halt` arm: a filter argument
+/// that halts before producing any tostream-style event has no prior
+/// prefix to fall back to (unlike a `Partial`'s trailing control, handled
+/// separately by the `Partial` arm just below it). Falling through to
+/// `result.collect_owned()` would silently treat the halt as "zero events"
+/// instead of halting. `fromstream` is a real jq builtin; verified against
+/// jq 1.7.1: `jq -n 'fromstream(halt_error(3))'` exits 3 with no output.
+#[test]
+fn test_fromstream_propagates_bare_halt_from_argument() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-n", "fromstream(halt_error(3))"], None)?;
+    assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+/// `builtin_truncate_stream`'s bare `QueryResult::Halt` arm -- same shape
+/// as the matching arm in `builtin_fromstream` just above it (the doc
+/// comment on this arm points back at that one). `truncate_stream` is a
+/// real jq builtin, taking its depth from `.` and its stream filter as the
+/// argument; verified against jq 1.7.1: `jq -n 'null |
+/// truncate_stream(halt_error(3))'` exits 3 with no output.
+#[test]
+fn test_truncate_stream_propagates_bare_halt_from_argument() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_full(&["-n", "null | truncate_stream(halt_error(3))"], None)?;
+    assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+/// `builtin_paths_filter`'s per-path loop (distinct from its root-level
+/// halt pre-check just above, which only fires if the *root* value itself
+/// halts the filter) used the old `EvalError::halt` field
+/// (`Err(e) if e.halt.is_some() => return query_result_from_error(e)`)
+/// before this refactor to `EvalEscape`; this exercises the same halt path
+/// through its new `Err(EvalEscape::Halt(code))` arm. `paths` is a real jq
+/// builtin. The root here is an array (`type == "array"`), so the root
+/// pre-check does not fire; the filter only halts once the walk reaches
+/// the string child at index 1 -- the match already found at index 0 must
+/// still be reported (#400/#494), matching real jq's own streaming `paths`,
+/// which prints `[0]` before halting.
+#[test]
+fn test_paths_filter_propagates_halt_from_non_root_path() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            r#"paths(if type=="string" then halt_error(3) else true end)"#,
+        ],
+        Some(r#"[1,"x"]"#),
+    )?;
+    assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[0]\n");
+    Ok(())
+}
+
+/// Companion to the halt test above: proves the refactor's
+/// `Err(EvalEscape::Error(_)) => {}` arm still keeps the pre-existing (and,
+/// per its own comment, intentionally jq-divergent) policy of silently
+/// skipping a node whose filter errors ordinarily, rather than aborting
+/// the whole `paths` call -- unlike halt, this does not escape. Verified
+/// against real jq 1.7.1 that this is a genuine divergence, not something
+/// this test should expect to match: `[1,"x",2] | paths(if type=="string"
+/// then error("bad") else true end)` raises in real jq (its `paths`
+/// streams `[0]` first, then errors), while succinctly silently drops the
+/// string element's path and keeps every other match.
+#[test]
+fn test_paths_filter_still_swallows_ordinary_per_path_error() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            r#"paths(if type=="string" then error("bad") else true end)"#,
+        ],
+        Some(r#"[1,"x",2]"#),
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[0]\n[2]\n");
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
+/// Distinct from `test_setpath_propagates_halt_in_path_argument` above,
+/// which hits `builtin_setpath`'s bare `QueryResult::Halt` arm (the path
+/// argument halts with zero prior output): this hits the
+/// `QueryResult::Partial(_, Control::Halt(code))` arm just below it, where
+/// the path argument's stream produces an output *before* halting.
+/// `builtin_setpath` reads a single (not fanned-out) path result via
+/// `eval_single`, so this diverges from real jq's own generator-based
+/// `setpath`, which evaluates the path argument lazily and errors on the
+/// first (non-array) output before ever reaching the halt: `jq -n
+/// 'setpath((1, halt_error(6)); 1)'` raises "Path must be specified as an
+/// array" instead of halting. This checks succinctly's own contract
+/// instead -- the halt still wins over any partially-produced path output,
+/// matching the pre-#791 bug this arm fixes (silently writing `null`/an
+/// unrelated error) rather than propagating the halt.
+#[test]
+fn test_setpath_propagates_halt_from_partial_path_argument() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-n", "setpath((1, halt_error(6)); 1)"], None)?;
+    assert_eq!(code, 6, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+/// Distinct from `test_setpath_propagates_halt_in_value_argument` above,
+/// which hits the bare `QueryResult::Halt` arm (value argument halts with
+/// zero prior output): this hits the `QueryResult::Partial(_,
+/// Control::Halt(code))` arm just below it, where the value argument's
+/// stream produces an output *before* halting. Diverges from real jq here
+/// too -- `jq -n 'setpath(["a"]; (1, halt_error(6)))'` fans out and prints
+/// `{"a":1}` before exiting 6 -- because `builtin_setpath` takes a single
+/// (not fanned-out) value result, the same architectural simplification as
+/// the path-argument test above; this checks succinctly's own contract
+/// that the halt still wins and no output escapes.
+#[test]
+fn test_setpath_propagates_halt_from_partial_value_argument() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_full(&["-n", r#"setpath(["a"]; (1, halt_error(6)))"#], None)?;
+    assert_eq!(code, 6, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+/// `builtin_del`'s `resolve_dynamic_indexes` error handling: `?` swallows
+/// only a genuine error resolving a computed key (`Err((_,
+/// EvalEscape::Error(_))) if optional`), matching the same split
+/// `eval_assign` already applies -- this is the ordinary-error half; a
+/// halt in the same position is checked by
+/// `test_halt_not_caught_by_bare_optional_in_path_expression` (a different
+/// call site, `resolve_node`'s own `Expr::Optional` arm, not this one).
+/// `del` is a real jq builtin; verified against jq 1.7.1: `jq -n
+/// '[1,2,3]|del(.[error("x")])?'` exits 0 with no output, same as
+/// succinctly here.
+#[test]
+fn test_del_computed_index_still_swallows_ordinary_error_under_optional() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-c", r#"del(.[error("x")])?"#], Some("[1,2,3]"))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+/// `builtin_mktime`'s six `get_int(IDX)` call sites were mechanically
+/// migrated off the old `query_result_from_error(e)` helper (which read an
+/// `EvalError::halt` field that no longer exists) to `e.into()`. This is
+/// not itself a halt-propagation fix -- `get_int` only inspects an
+/// already-materialized array element and never evaluates an expression,
+/// so it can never carry a halt marker -- but exercises all six sites the
+/// mechanical migration touched, one per broken-down-time field. `mktime`
+/// is a real jq builtin; verified against jq 1.7.1 that a non-numeric
+/// element anywhere in the first six positions is a hard error (jq's own
+/// message differs -- it validates the whole array at once rather than
+/// per-field -- but the error-not-swallowed shape matches).
+#[test]
+fn test_mktime_get_int_error_sites_report_plain_type_error_per_field() -> Result<()> {
+    for (idx, input) in [
+        (0, r#"["bad",1,1,0,0,0]"#),
+        (1, r#"[2020,"bad",1,0,0,0]"#),
+        (2, r#"[2020,0,"bad",0,0,0]"#),
+        (3, r#"[2020,0,1,"bad",0,0]"#),
+        (4, r#"[2020,0,1,0,"bad",0]"#),
+        (5, r#"[2020,0,1,0,0,"bad"]"#),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", "mktime"], Some(input))?;
+        assert_eq!(
+            code, 5,
+            "index {idx}: stdout: {stdout:?} stderr: {stderr:?}"
+        );
+        assert_eq!(stdout, "", "index {idx}");
+    }
+    Ok(())
+}
+
+/// `builtin_strftime`'s format-string argument went through the same
+/// mechanical `query_result_from_error` -> `e.into()` migration as
+/// `mktime`'s fields, but unlike those, `fmt_expr` is a full expression
+/// that can legitimately halt (`result_to_owned` on its `eval_single`
+/// result). `strftime` is a real jq builtin; verified against jq 1.7.1:
+/// `jq -n 'strftime(halt_error(3))'` exits 3 with no output.
+#[test]
+fn test_strftime_propagates_halt_in_format_argument() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-n", "strftime(halt_error(3))"], None)?;
+    assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+/// Same shape as `builtin_strftime`'s format argument test above, one
+/// function over (`builtin_strptime`'s `fmt_expr`). `strptime` is a real
+/// jq builtin; verified against jq 1.7.1: `jq -n
+/// 'strptime(halt_error(3))'` exits 3 with no output.
+#[test]
+fn test_strptime_propagates_halt_in_format_argument() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-n", "strptime(halt_error(3))"], None)?;
+    assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+/// `builtin_combinations_n`'s `n`-argument wildcard swallowed a halt the
+/// same way `nth`'s `n` argument used to. `combinations(n)` is a real jq
+/// builtin, but real jq's own `n` is bound via `as $n` and interacts with
+/// a halt in a way `builtin_combinations_n`'s single `result_to_owned` +
+/// `eval_single` read does not attempt to reproduce -- confirmed live:
+/// `jq -n '[1] | combinations(halt_error(3))'` unexpectedly prints `[1]`
+/// before halting. This checks succinctly's own single-shot contract
+/// instead, the same kind of pre-existing, unrelated-to-#791 divergence
+/// already documented for `nth`/`setpath` elsewhere in this file.
+#[test]
+fn test_combinations_n_propagates_halt_in_n_argument() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-n", "[1] | combinations(halt_error(3))"], None)?;
+    assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+/// `builtin_limit`'s body-stream match gained an explicit
+/// `QueryResult::Halt` arm: a bare halt (zero prior output) from `expr`
+/// must exit, not fall into the `Partial` handling below it (which drops
+/// its trailing control once the prefix already reaches `n`). `limit` is a
+/// real jq builtin; verified against jq 1.7.1: `jq -n 'limit(1;
+/// halt_error(3))'` exits 3 with no output.
+#[test]
+fn test_limit_stream_propagates_bare_halt_from_body() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-n", "limit(1; halt_error(3))"], None)?;
+    assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+/// Same shape as `builtin_limit`'s bare-halt arm above, one function over
+/// in `builtin_first_stream`. `first(expr)` is a real jq builtin; verified
+/// against jq 1.7.1: `jq -n 'first(halt_error(3))'` exits 3 with no
+/// output.
+#[test]
+fn test_first_stream_propagates_bare_halt_from_body() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-n", "first(halt_error(3))"], None)?;
+    assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+/// `builtin_last_stream` has two distinct halt arms: a bare
+/// `QueryResult::Halt` (zero prior output) and a `QueryResult::Partial(_,
+/// Control::Halt(code))` (some output already produced) -- unlike `first`,
+/// `last` can never short-circuit, so it must consume the whole stream and
+/// both shapes are reachable. `last(expr)` is a real jq builtin; verified
+/// against jq 1.7.1: both `jq -n 'last(halt_error(3))'` and `jq -n
+/// 'last(1, halt_error(3))'` exit 3 with no output.
+#[test]
+fn test_last_stream_propagates_halt_bare_and_after_partial_output() -> Result<()> {
+    for filter in ["last(halt_error(3))", "last(1, halt_error(3))"] {
+        let (stdout, stderr, code) = run_jq_full(&["-n", filter], None)?;
+        assert_eq!(code, 3, "{filter}: stdout: {stdout:?} stderr: {stderr:?}");
+        assert_eq!(stdout, "", "{filter}");
+    }
+    Ok(())
+}
+
+/// `builtin_nth_stream` has two halt sites this batch targets: `n`'s own
+/// evaluation ending in a `QueryResult::Partial(_, Control::Halt(code))`
+/// (some `n` candidate produced before halting), and a bare
+/// `QueryResult::Halt` from `expr`'s body stream once `n` itself resolved
+/// cleanly. `nth(n; expr)` is a real jq builtin, but real jq's own `n` is
+/// bound via `as $n` and fans out -- confirmed live: `jq -n
+/// 'nth((1, halt_error(3)); 1,2,3)'` actually *prints* `2` (it fully
+/// evaluates the body for the first `n` candidate before the second one
+/// halts) -- while `builtin_nth_stream` reads `n_expr` with a single
+/// `eval_single` call, the same pre-existing, unrelated-to-#791
+/// simplification already documented for `combinations`/`setpath`
+/// elsewhere in this file; this checks succinctly's own single-shot
+/// contract for that first case. The second case (`expr` itself halting,
+/// `n` already resolved) has no such divergence: `jq -n 'nth(0;
+/// halt_error(3))'` exits 3 with no output, matching succinctly here too.
+#[test]
+fn test_nth_stream_propagates_halt_from_n_partial_and_body_bare() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-n", "nth((1, halt_error(3)); 1,2,3)"], None)?;
+    assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+
+    let (stdout, stderr, code) = run_jq_full(&["-n", "nth(0; halt_error(3))"], None)?;
+    assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_nth_stream_partial_halt_in_stream_argument() -> Result<()> {
+    // `builtin_nth_stream`'s second halt arm: unlike
+    // `test_nth_stream_propagates_halt_in_n_argument` above (bare
+    // `QueryResult::Halt` reached when the `n` argument itself halts), this
+    // exercises the `Control::Halt` arm nested inside the trailing
+    // `QueryResult::Partial` match on the *stream* argument -- reached when
+    // `n` indexes past every value the stream produced before it halted.
+    // Verified against jq 1.7.1: `jq -n 'nth(5; 1,2,3,halt_error(7))'` exits
+    // 7 with no output (the stream never reaches index 5, so the trailing
+    // halt wins over the type-error fallback).
+    let (stdout, stderr, code) = run_jq_full(&["-n", "nth(5; 1,2,3,halt_error(7))"], None)?;
+    assert_eq!(code, 7, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
+#[test]
+fn test_delpaths_propagates_halt_via_partial_prefix_in_paths_argument() -> Result<()> {
+    // `builtin_delpaths`'s `QueryResult::Partial(_, Control::Halt(code))`
+    // arm -- a second, distinct arm from the bare `Halt` case
+    // `test_delpaths_propagates_halt_in_paths_argument` above covers --
+    // fires when the `paths` argument produces at least one successful
+    // output (via a comma expression) before halting.
+    //
+    // Note: `builtin_delpaths` evaluates `paths_expr` with a single
+    // `eval_single` call, unlike real jq's per-output "run once per value
+    // the argument filter generates" semantics for builtin filter arguments
+    // (a pre-existing, separate implementation gap unrelated to this halt
+    // fix): `jq -n '{"a":1,"b":2,"c":3} | delpaths((1, halt_error(9)))'`
+    // errors out immediately on the first output `1` not being an array
+    // (exit 5), never reaching `halt_error` at all. Checked here against
+    // succinctly's own contract instead: the halt must still win, discarding
+    // the `1` prefix entirely rather than emitting a result for it first.
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-n",
+            "{\"a\":1,\"b\":2,\"c\":3} | delpaths((1, halt_error(9)))",
+        ],
+        None,
+    )?;
+    assert_eq!(code, 9, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(stderr, "{\"a\":1,\"b\":2,\"c\":3}\n");
+    Ok(())
+}
+
+#[test]
+fn test_pow_propagates_halt_via_partial_prefix_in_exponent_argument() -> Result<()> {
+    // `get_number_from_result`'s `QueryResult::Partial(_, Control::Halt(code))`
+    // arm -- reached when an argument expression produces at least one
+    // output (e.g. a comma expression) before halting, rather than halting
+    // immediately -- feeding `builtin_pow`'s own `exp`-branch
+    // `Err(NumberError::Halt(code)) => return QueryResult::Halt(code)` arm
+    // (a distinct site from the `base`-branch arm
+    // `test_pow_propagates_halt_in_argument` above already covers, one
+    // match block over).
+    //
+    // Note: `builtin_pow` evaluates each argument with a single
+    // `eval_single` call, the same pre-existing generator-vs-single-eval gap
+    // noted on `delpaths` above: `jq -n 'pow(2; (1, halt_error(3)))'` prints
+    // `2` (from the first exponent output) before halting with exit 3.
+    // Checked here against succinctly's own contract instead: the halt
+    // discards the whole call, including the already-computed
+    // `1`-exponent partial output, producing no stdout at all.
+    let (stdout, stderr, code) = run_jq_full(&["-n", "pow(2; (1, halt_error(3)))"], None)?;
+    assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
+#[test]
+fn test_atan2_propagates_halt_in_y_argument() -> Result<()> {
+    // `builtin_atan2`'s `y`-branch `Err(NumberError::Halt(code)) => return
+    // QueryResult::Halt(code)` arm -- shares `get_number_from_result` with
+    // `pow`/`atan2`'s other argument but is its own distinct return site.
+    // Verified against jq 1.7.1: `jq -n 'atan2(halt_error(4); 2)'` exits 4
+    // with no output.
+    let (stdout, stderr, code) = run_jq_full(&["-n", "atan2(halt_error(4); 2)"], None)?;
+    assert_eq!(code, 4, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
+#[test]
+fn test_atan2_propagates_halt_in_x_argument() -> Result<()> {
+    // `builtin_atan2`'s `x`-branch `Err(NumberError::Halt(code)) => return
+    // QueryResult::Halt(code)` arm -- a distinct site from the `y`-branch
+    // arm above, one match block over. Verified against jq 1.7.1:
+    // `jq -n 'atan2(2; halt_error(4))'` exits 4 with no output.
+    let (stdout, stderr, code) = run_jq_full(&["-n", "atan2(2; halt_error(4))"], None)?;
+    assert_eq!(code, 4, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
+#[test]
+fn test_halt_error_with_non_number_argument_is_ordinary_catchable_error() -> Result<()> {
+    // `builtin_halt_error`'s `Ok(_) => return QueryResult::Error(...)` arm
+    // fires when the exit-code argument evaluates to a non-number (string,
+    // bool, array, object, ...) -- distinct from every other arm in this
+    // match, which all handle a genuine halt. Unlike `halt`/`halt_error(n)`
+    // itself, a malformed exit-code argument must NOT halt at all: it's an
+    // ordinary, `try`/`catch`-catchable type error. Verified against jq
+    // 1.7.1: `jq -n 'try halt_error("x") catch "caught"'` prints `"caught"`
+    // and exits 0 (real jq's own uncaught "number required" error exits 5 --
+    // the ordinary uncaught-error code, not a halt -- confirming this is a
+    // regular error in real jq too, not a halt).
+    let (stdout, stderr, code) =
+        run_jq_full(&["-n", r#"try halt_error("x") catch "caught""#], None)?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "\"caught\"\n");
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
+#[test]
+fn test_halt_error_propagates_halt_from_exit_code_argument() -> Result<()> {
+    // `builtin_halt_error`'s `Err(e) => return e.into()` arm, reached when
+    // `result_to_owned` on the exit-code argument returns
+    // `Err(EvalEscape::Halt(code))` -- i.e. the exit-code expression itself
+    // halts. `EvalEscape`'s `From` impl for `QueryResult` preserves `Halt`
+    // by construction (#791), so the *inner* halt code wins and the outer
+    // `halt_error` call never runs at all. Verified against jq 1.7.1:
+    // `jq -n 'halt_error(halt_error(3))'` exits 3 with no stderr output
+    // (`.` is null in `-n` mode at the inner call).
+    let (stdout, stderr, code) = run_jq_full(&["-n", "halt_error(halt_error(3))"], None)?;
+    assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
+#[test]
+fn test_bsearch_propagates_halt_via_partial_prefix_in_target_argument() -> Result<()> {
+    // `builtin_bsearch`'s `QueryResult::Partial(_, Control::Halt(code))` arm
+    // -- a second, distinct arm from the bare `Halt` case
+    // `test_bsearch_propagates_halt_in_target_argument` above covers --
+    // fires when the target expression produces an output before halting.
+    //
+    // Note: `builtin_bsearch` evaluates `x_expr` with a single
+    // `eval_single` call, the same pre-existing generator-vs-single-eval gap
+    // noted on `delpaths`/`pow` above: `jq -n '[1,2,3] | bsearch((1,
+    // halt_error(15)))'` prints `0` (bsearch(1) succeeds on the first
+    // output) before halting with exit 15. Checked here against
+    // succinctly's own contract instead: the halt discards the whole call,
+    // producing no stdout. stderr still matches real jq byte-for-byte
+    // though, since `.` at the `halt_error` call is the same either way --
+    // the original `[1,2,3]` input to `bsearch`, untouched by which
+    // semantics evaluate the target.
+    let (stdout, stderr, code) =
+        run_jq_full(&["-n", "[1,2,3] | bsearch((1, halt_error(15)))"], None)?;
+    assert_eq!(code, 15, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(stderr, "[1,2,3]\n");
+    Ok(())
+}
+
+#[test]
+fn test_as_pattern_propagates_halt_in_bind_expression() -> Result<()> {
+    // `eval_as_pattern`'s `QueryResult::Halt(code) => return
+    // QueryResult::Halt(code)` arm, reached when the bind expression (`expr`
+    // in `expr as $pattern | body`) itself halts before producing any value
+    // to destructure. Verified against jq 1.7.1:
+    // `jq -n '(halt_error(4)) as {a: $x} | $x'` exits 4 with no output.
+    let (stdout, stderr, code) = run_jq_full(&["-n", "(halt_error(4)) as {a: $x} | $x"], None)?;
+    assert_eq!(code, 4, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
+#[test]
+fn test_as_pattern_propagates_halt_after_partial_body_output() -> Result<()> {
+    // `eval_as_pattern`'s `QueryResult::Halt(code) => return
+    // partial(all_results, Control::Halt(code))` arm, reached inside the
+    // per-bound-value loop when an earlier bound value's `body` already
+    // produced an output and a *later* bound value's `body` halts. The
+    // prefix accumulated from the earlier iteration must still reach the
+    // caller (as a `Partial`) instead of vanishing. Verified against jq
+    // 1.7.1: `jq -cn '(({a: 1}, {a: 2})) as {a: $x} | if $x == 1 then $x else
+    // halt_error(7) end'` prints `1` then exits 7.
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-n",
+            "-c",
+            "(({a: 1}, {a: 2})) as {a: $x} | if $x == 1 then $x else halt_error(7) end",
+        ],
+        None,
+    )?;
+    assert_eq!(code, 7, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "1\n");
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
+#[test]
+fn test_func_def_expand_recurses_through_halt_stderr_and_halt_error_builtins() -> Result<()> {
+    // `expand_func_calls_in_builtin`'s `Halt`/`Stderr`/`HaltError`/
+    // `HaltErrorCode` arms, added alongside the four new `Control`/
+    // `QueryResult` variants this PR introduces, so `eval_func_def`'s
+    // AST-rewrite pass (`expand_func_calls`, run on the entire `then` tree
+    // of every `def` regardless of whether the defined function is ever
+    // called) can walk through these builtins instead of leaving an
+    // unmatched `Builtin` variant. A single `def`'s `then` mentioning all
+    // four covers every arm in one pass, since the static tree is rewritten
+    // once regardless of which comma branch actually runs at evaluation
+    // time -- here, only the first (`halt_error(3)`) does. Verified against
+    // jq 1.7.1: `jq -n 'def noop: .; (halt_error(3), halt, ("x" | stderr),
+    // halt_error)'` exits 3 with no output.
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-n",
+            r#"def noop: .; (halt_error(3), halt, ("x" | stderr), halt_error)"#,
+        ],
+        None,
+    )?;
+    assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
+#[test]
+fn test_func_call_param_substitution_recurses_through_halt_stderr_and_halt_error_builtins(
+) -> Result<()> {
+    // `substitute_func_param`'s `Halt`/`Stderr`/`HaltError`/`HaltErrorCode`
+    // arms -- the parameter-substitution twin of the `expand_func_calls`
+    // test above, invoked once per parameter when a *parameterized*
+    // function is actually called (`expand_func_calls`'s `FuncCall` arm
+    // walks the body once per param via `substitute_func_param`). The
+    // `HaltErrorCode(x)` arm's own recursive substitution is exercised too:
+    // `x` is the function's parameter and must be replaced with the call's
+    // actual argument (`4`) before evaluation, or the code wouldn't be `4`.
+    // Verified against jq 1.7.1: `jq -n 'def f(x): (halt_error(x), halt,
+    // ("y" | stderr), halt_error); f(4)'` exits 4 with no output.
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-n",
+            r#"def f(x): (halt_error(x), halt, ("y" | stderr), halt_error); f(4)"#,
+        ],
+        None,
+    )?;
+    assert_eq!(code, 4, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
+/// `eval_generic.rs`'s `LazySeq` machinery for #791: `map(f)` on the
+/// element produced by `.[]` builds a `GenericResult::LazySeq` that stays
+/// unforced (`Builtin::Map`'s native arm) until something pulls it. Here
+/// that force happens inside `flatten_generic_results`, called once `.[]`'s
+/// `ManyCursor` loop finishes (`eval_single`'s `Expr::Pipe` handling) --
+/// `f`'s own `halt` reaches `LazySeq::fold_one`'s `into_lazy_items(...)`
+/// call (`GenericResult::Halt(code) => Err(Control::Halt(code))`), which
+/// `materialize_atomic()` propagates as `Err`, which `GenericResult::
+/// materialize_lazy()`'s own `LazySeq` arm turns into a bare `Self::Halt`,
+/// which `flatten_generic_results` re-raises as `Err(Control::Halt(code))`
+/// instead of quietly treating it as a normal value. Piped stdin input is
+/// required (not `-n` with an inline array literal): an inline literal
+/// would force the whole pipe through the owned-value/`eval.rs` bridge,
+/// bypassing this file's `Builtin::Map` arm entirely. Verified against jq
+/// 1.7.1: `echo '[[1,2,3]]' | jq '.[] | map(if . == 2 then halt else .
+/// end)'` prints nothing and exits 0.
+#[test]
+fn test_iterate_then_map_lazy_seq_halt_discards_array_no_stray_output() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &[".[] | map(if . == 2 then halt else . end)"],
+        Some("[[1,2,3]]"),
+    )?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+/// `push_generic_owned_values`'s `GenericResult::Halt(code) => return
+/// Some(Control::Halt(code))` arm (#791, #768's fork helper): `Expr::
+/// Compare`'s native handling forks its `right` operand through this
+/// function before ever looking at `left`. Bare `halt` isn't itself
+/// natively dispatched by `eval_single`, so it falls through to the `_`
+/// wildcard's `full_eval` bridge, which hands back a bare `GenericResult::
+/// Halt` -- exactly the shape this arm exists to catch instead of quietly
+/// forking zero comparisons. Verified against jq 1.7.1: `jq -n '1 ==
+/// halt'` prints nothing and exits 0 (not 5 -- bare `halt`, not
+/// `halt_error`).
+#[test]
+fn test_compare_right_operand_halt_short_circuits_fork() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-n", "1 == halt"], None)?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+/// `eval_on_many_owned`'s `GenericResult::Halt(code) => return
+/// partial_generic(results, Control::Halt(code))` arm (#791): reached when
+/// an earlier pipe stage collapses to `GenericResult::ManyOwned` (here,
+/// `(1,2,3)` -- an `Expr::Comma` bridged through the `_` wildcard since
+/// comma isn't natively dispatched by `eval_single`) and a *later* stage
+/// halts partway through piping each owned value in turn: the value
+/// already produced (`1`) survives as a `Partial` prefix instead of
+/// vanishing, matching #400/#494's contract for `Error`/`Break`. Verified
+/// against jq 1.7.1: `jq -n '(1,2,3) | if . == 2 then halt else . end'`
+/// prints `1` and exits 0 -- `3` never runs.
+#[test]
+fn test_comma_then_conditional_halt_keeps_prefix_from_many_owned_pipe() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_full(&["-n", "(1,2,3) | if . == 2 then halt else . end"], None)?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout, "1\n");
+    Ok(())
+}
+
+/// `Expr::Optional`'s `GenericResult::LazySeq(seq) => match seq.
+/// materialize_atomic() { ... Err(Control::Halt(code)) => GenericResult::
+/// Halt(code) ... }` arm (#791): `map(f)?` parses to `Expr::Optional(
+/// Builtin::Map(f))`, and plain `arr | map(f)` builds an unforced
+/// `GenericResult::LazySeq` (#724, #725). `?` has to force it to know
+/// whether to catch anything, and this arm deliberately does NOT fold a
+/// resulting `Halt` into the `Error`/`Break` arm right above it -- `?`
+/// catches those but must let a halt escape uncaught, mirroring the
+/// non-lazy case `test_halt_not_caught_by_try_catch_or_label` already pins
+/// for `("x"|halt_error)? // "fallback"`. Piped input (not an inline `-n`
+/// array literal) keeps `map` on the cursor-native `Builtin::Map` arm
+/// instead of `eval.rs`'s own eager implementation. Verified against jq
+/// 1.7.1: `echo '[1,2,3]' | jq 'map(if . == 2 then halt_error(7) else .
+/// end)?'` prints nothing to stdout, `2` to stderr, and exits 7 -- not 0,
+/// which is what a caught halt would produce.
+#[test]
+fn test_map_optional_lazy_seq_does_not_catch_halt() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["map(if . == 2 then halt_error(7) else . end)?"],
+        Some("[1,2,3]"),
+    )?;
+    assert_eq!(code, 7, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(stderr, "2\n");
+    Ok(())
+}
+
+/// The `ManyCursor` loop's `GenericResult::Error(e) => { return match
+/// flatten_generic_results(per_element) { ... Err(Control::Halt(code)) =>
+/// GenericResult::Halt(code), ... } }` arm (#791, inside `eval_single`'s
+/// `Expr::Pipe` handling): the first array element (`["a","b"]`) buffers an
+/// unforced `map(...)`-produced `LazySeq` into `per_element` without
+/// forcing it (`other => per_element.push(other)`); the second element
+/// (`"boom"`, a plain string) can't be mapped at all, so its own `rest`
+/// evaluation immediately yields a bare `GenericResult::Error`, triggering
+/// this early-return branch before the loop ever reaches a third element.
+/// Forcing `per_element` to compute the prefix then discovers the *first*
+/// element's own buffered map halts -- and since it's chronologically
+/// first, that halt outranks the second element's error entirely. Piped
+/// input keeps `.[]`/`map` on the cursor-native path. Verified against jq
+/// 1.7.1: `echo '[["a","b"], "boom"]' | jq '.[] | map(if . == "b" then
+/// halt else . end)'` prints nothing and exits 0 (not an error about
+/// `"boom"`).
+#[test]
+fn test_iterate_earlier_buffered_map_halt_outranks_later_element_error() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &[".[] | map(if . == \"b\" then halt else . end)"],
+        Some(r#"[["a","b"], "boom"]"#),
+    )?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+/// The `ManyCursor` loop's own `GenericResult::Halt(code) => { return
+/// match flatten_generic_results(per_element) { Ok(prefix) =>
+/// partial_generic(prefix, Control::Halt(code)), ... } }` arm (#791, inside
+/// `eval_single`'s `Expr::Pipe` handling): unlike the `Error`/`Break`
+/// siblings just above it (pre-existing before #791), this whole branch is
+/// new -- a halt reaching one cursor element directly (not via a buffered
+/// `LazySeq`) must stop the loop immediately rather than falling through to
+/// the `other => per_element.push(other)` wildcard, which would keep
+/// evaluating later elements. The first element (`1`) succeeds normally
+/// (buffered as `Owned(1)`, nothing to force), so `flatten_generic_results`
+/// returns `Ok([1])` and this hits the `Ok(prefix)` sub-arm specifically.
+/// Piped input keeps `.[]` on the cursor-native path. Verified against jq
+/// 1.7.1: `echo '[1,2,3]' | jq '.[] | if . == 2 then halt else . end'`
+/// prints `1` and exits 0 -- `3` is never evaluated.
+#[test]
+fn test_iterate_direct_halt_stops_loop_keeping_earlier_prefix() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_full(&[".[] | if . == 2 then halt else . end"], Some("[1,2,3]"))?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout, "1\n");
+    Ok(())
+}
+
+#[test]
+fn test_manycursor_post_loop_flatten_propagates_halt_from_buffered_lazyseq() -> Result<()> {
+    // `Expr::Pipe`'s `GenericResult::ManyCursor` arm buffers each cursor's
+    // own result into `per_element` when it isn't itself an immediate
+    // `Error`/`Break`/`Halt`/`Partial` (the `other => per_element.push(other)`
+    // wildcard) -- a bare `map(f)` stays exactly that: an unmaterialized
+    // `GenericResult::LazySeq`, since `Builtin::Map` only *builds* the lazy
+    // chain, never evaluates `f`. Once the per-cursor loop exhausts every
+    // cursor without an early return, `flatten_generic_results(per_element)`
+    // finally pulls that buffered `LazySeq` -- and if `f` halts on its
+    // first item, this is the one place a halt discovered *after* the
+    // per-cursor loop has already finished must still make it out as
+    // `GenericResult::Halt`, not get silently absorbed into `Ok`. Verified
+    // against jq 1.7.1: `[[1]] | .[] | map(halt)` halts (real jq's `map`
+    // is eagerly atomic) with no output and exit 0.
+    let (stdout, stderr, code) = run_jq_full(&[".[] | map(halt)"], Some("[[1]]"))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
+#[test]
+fn test_lazyseq_length_composability_propagates_halt_mid_fold() -> Result<()> {
+    // `Expr::Pipe`'s `GenericResult::LazySeq` composability arm dispatches
+    // `Builtin::Length` to a count-and-discard loop over the still-lazy
+    // `map(f)` chain -- every element still runs (so `length` of a `map`
+    // that halts partway isn't a partial count), and its own
+    // `Err(Control::Halt(code)) => return GenericResult::Halt(code)` arm is
+    // what turns that mid-fold halt into the pipe's overall result instead
+    // of falling through to a bogus count. Verified against jq 1.7.1:
+    // `[1,2,3] | map(halt) | length` halts while still building the mapped
+    // array (real jq's `map` is atomic), never reaching `length` -- no
+    // output, exit 0.
+    let (stdout, stderr, code) = run_jq_full(&["map(halt) | length"], Some("[1,2,3]"))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
+#[test]
+fn test_lazyseq_iterate_composability_propagates_halt_mid_fold() -> Result<()> {
+    // Same `GenericResult::LazySeq` composability dispatch as `length`
+    // above, but for `Expr::Iterate` (`.[]`): it must pull the *entire*
+    // lazy `map(f)` chain before yielding anything (real jq's array
+    // construction is atomic, so a failure discards every already-yielded
+    // element too), and its own `Err(Control::Halt(code)) => return
+    // GenericResult::Halt(code)` arm is the site under test. Verified
+    // against jq 1.7.1: `[1,2,3] | map(halt) | .[]` halts while building
+    // the array -- no output, exit 0.
+    let (stdout, stderr, code) = run_jq_full(&["map(halt) | .[]"], Some("[1,2,3]"))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
+#[test]
+fn test_lazyseq_first_index0_composability_propagates_halt_on_pulled_element() -> Result<()> {
+    // The `Builtin::First | Expr::Index(0)` composability arm is the
+    // "pull-one-and-stop" fast path -- at most one element of the lazy
+    // `map(f)` chain is ever evaluated. Its `Some(Err(Control::Halt(code)))
+    // => GenericResult::Halt(code)` arm is what happens when *that one*
+    // pulled element halts. Verified against jq 1.7.1: `[1,2,3] |
+    // map(halt) | .[0]` halts while building the array (real jq's `map`
+    // is atomic, so `.[0]` never gets to see a partial result) -- no
+    // output, exit 0.
+    let (stdout, stderr, code) = run_jq_full(&["map(halt) | .[0]"], Some("[1,2,3]"))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
+#[test]
+fn test_lazyseq_fallback_materialize_propagates_halt() -> Result<()> {
+    // Every other consumer of a `GenericResult::LazySeq` (anything besides
+    // `Map`/`Length`/`Iterate`/`First`/`Index(0)`, e.g. `last`) falls to the
+    // `_` arm: one atomic `materialize_atomic()` pass, then hand off to the
+    // full evaluator. Its `Err(Control::Halt(code)) => GenericResult::Halt(code)`
+    // arm is the site under test -- `last` never even gets a materialized
+    // value to inspect. Verified against jq 1.7.1: `[1,2,3] | map(halt) |
+    // last` halts while building the array -- no output, exit 0.
+    let (stdout, stderr, code) = run_jq_full(&["map(halt) | last"], Some("[1,2,3]"))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
+#[test]
+fn test_pipe_fold_forwards_halt_from_current_into_next_stage() -> Result<()> {
+    // `Expr::Pipe`'s per-stage fold matches `current` before running the
+    // *next* stage; when an earlier stage already resolved to
+    // `GenericResult::Halt(code)`, its own `GenericResult::Halt(code) =>
+    // return GenericResult::Halt(code)` arm is what stops the fold from
+    // ever invoking the next stage at all -- the site under test.
+    // Verified against jq 1.7.1: `halt | 1` halts on the first stage and
+    // never evaluates `1` -- no output, exit 0.
+    let (stdout, stderr, code) = run_jq_full(&["halt | 1"], Some("null"))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
+#[test]
+fn test_last_of_bare_halt_forwards_halt_directly() -> Result<()> {
+    // `eval_first_or_last_generic`'s `want_last = true` branch (reached via
+    // `Expr::LastExpr`, i.e. `last(...)`) has its own `GenericResult::Halt(code)
+    // => GenericResult::Halt(code)` forwarding arm, distinct from the
+    // `want_last = false` one exercised below -- both need independent
+    // coverage since they're separate match arms in separate branches of
+    // the same function. Verified against jq 1.7.1: `last(halt)` halts
+    // immediately (real jq's `last(g)` def still has to run `g` to find
+    // its last output) -- no output, exit 0.
+    let (stdout, stderr, code) = run_jq_full(&["last(halt)"], Some("null"))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
+#[test]
+fn test_last_of_comma_then_halt_drops_prefix_and_forwards_halt() -> Result<()> {
+    // `eval_first_or_last_generic`'s `want_last = true` branch also has a
+    // dedicated `GenericResult::Partial(_, Control::Halt(code)) =>
+    // GenericResult::Halt(code)` arm, distinct from the bare-`Halt` arm
+    // above: `last` can't short-circuit on a first output (it doesn't know
+    // a value is the last one until the stream ends), so a `Partial`'s
+    // trailing control is what determines the outcome and its prefix is
+    // dropped, matching `eval::eval_last_expr`. Verified against jq 1.7.1:
+    // `last(1, halt)` still halts with no output despite `1` having been
+    // produced first -- `last` has no "final" value to report once the
+    // stream is cut short.
+    let (stdout, stderr, code) = run_jq_full(&["last(1, halt)"], Some("null"))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
+#[test]
+fn test_first_of_bare_halt_forwards_halt_directly() -> Result<()> {
+    // The `want_last = false` mirror of the `last(halt)` test above --
+    // `Expr::FirstExpr`'s own `GenericResult::Halt(code) =>
+    // GenericResult::Halt(code)` arm. Verified against jq 1.7.1:
+    // `first(halt)` halts immediately -- no output, exit 0.
+    let (stdout, stderr, code) = run_jq_full(&["first(halt)"], Some("null"))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
+#[test]
+fn test_computed_index_key_stream_bare_halt_with_no_prior_keys() -> Result<()> {
+    // `eval_index_expr`'s key-stream match has its own bare
+    // `GenericResult::Halt(code) => return GenericResult::Halt(code)` arm,
+    // distinct from the `Partial(vs, Control::Halt(code))` arm exercised
+    // by `test_computed_index_streams_keys_produced_before_halt` -- this
+    // one fires when the key expression halts on its *very first*
+    // attempt, before any key has ever been produced (so there is no
+    // prefix to thread through `pending_halt` at all). Verified against jq
+    // 1.7.1: `.[(halt_error(4))]` on `{"a":1}` writes the input document
+    // (halt_error's current value, compact JSON with a trailing newline)
+    // to stderr and exits 4 with no stdout.
+    let (stdout, stderr, code) = run_jq_full(&[".[(halt_error(4))]"], Some(r#"{"a":1}"#))?;
+    assert_eq!(code, 4, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(stderr, "{\"a\":1}\n");
+    Ok(())
+}
+
+#[test]
+fn test_computed_index_target_bare_halt_before_any_key_applied() -> Result<()> {
+    // `eval_index_expr`'s *target* match (evaluated after the key stream
+    // has already produced at least one key) has the identical bare
+    // `GenericResult::Halt(code) => return GenericResult::Halt(code)` arm,
+    // one match over from the key-stream's own copy above -- kept out of
+    // the `owned @ (...)` group below so `collect_owned()` can't quietly
+    // turn a halted target into an empty `Vec`. Verified against jq 1.7.1:
+    // `(halt_error(4))[("a")]` writes the current value ("ignored", raw,
+    // no trailing newline since it's a string) to stderr and exits 4 with
+    // no stdout -- the target halts before any indexing ever happens.
+    let (stdout, stderr, code) = run_jq_full(&[r#"(halt_error(4))[("a")]"#], Some("\"ignored\""))?;
+    assert_eq!(code, 4, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(stderr, "ignored");
+    Ok(())
+}
+
+#[test]
+fn test_computed_index_empty_target_still_honors_pending_halt() -> Result<()> {
+    // `eval_index_expr`'s target match's `GenericResult::None` arm handles
+    // a target with zero outputs -- not itself an error/break/halt, so it
+    // has nothing that "happens first" to preempt a `pending_halt` already
+    // recorded from the key stream. Its `match pending_halt { Some(code)
+    // => GenericResult::Halt(code), None => GenericResult::None }` is the
+    // site under test: a zero-output target must still let an
+    // already-pending halt through rather than reporting `None` (#791).
+    // Verified against jq 1.7.1: `(.a[])[(1, 2, halt)]` on `{"a": []}`
+    // halts with no output -- `.a[]` produces nothing to index against for
+    // either key, and the key generator's own halt still fires.
+    let (stdout, stderr, code) = run_jq_full(&["(.a[])[(1, 2, halt)]"], Some(r#"{"a": []}"#))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
+#[test]
+fn test_computed_index_target_indexes_first_output_before_reaching_a_later_halt() -> Result<()> {
+    // Unlike the target-`Error`/`Break` precedent this was originally
+    // modeled on (`test_computed_index_still_conservative_on_error_and_break`),
+    // a computed target is NOT collected as a whole standalone stream before
+    // indexing starts: indexing the target's first output (`1`) is
+    // attempted immediately, errors ("Cannot index number with string"),
+    // and that error surfaces without ever reaching the target stream's
+    // second output (`halt_error(6)`) at all -- matching real jq exactly.
+    // Verified against jq 1.7.1: `(1, halt_error(6))[("a")]` errors the
+    // same way, exit 5.
+    let (stdout, stderr, code) = run_jq_full(&[r#"(1, halt_error(6))[("a")]"#], Some("null"))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert!(
+        stderr.contains("Cannot index number with string"),
+        "{stderr}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_computed_index_owned_target_streams_prefix_before_pending_halt() -> Result<()> {
+    // The `owned @ (...)` branch handles a *computed* (non-navigational)
+    // target -- here `({"a":1},{"a":2})`, a comma expression, which
+    // resolves to `GenericResult::ManyOwned` rather than a cursor. Its
+    // `match pending_halt { Some(code) => partial_generic(out,
+    // Control::Halt(code)), ... }` arm is the site under test: every
+    // already-indexed `out` value must still stream before the key
+    // stream's recorded halt takes over. Verified against jq 1.7.1:
+    // `({"a":1},{"a":2})[("a", halt)]` prints `1` then `2` (real jq's
+    // key-outer/target-inner generator indexes both targets for key "a"
+    // before the key generator's next attempt reaches `halt`), then halts
+    // -- exit 0.
+    let (stdout, stderr, code) = run_jq_full(&[r#"({"a":1},{"a":2})[("a", halt)]"#], Some("null"))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "1\n2\n");
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
+#[test]
+fn test_computed_index_array_key_error_streams_prefix_without_pending_halt() -> Result<()> {
+    // `eval_index_expr`'s "key outer, target inner" cursor loop's `Error`
+    // arm assembles the already-indexed prefix (`out`) before returning it
+    // as a `Partial` -- the same fix as
+    // `test_computed_index_target_error_after_pending_halt_still_streams_prefix`,
+    // but isolated from any `pending_halt` interaction: no halt is
+    // involved here at all, just a later key's ordinary type error on an
+    // array target, confirming the prefix-preservation logic itself works
+    // independently of the #791 halt-tracking it was added alongside.
+    // Verified against jq 1.7.1: `.[(0, "x")]` on `[10,20]` prints `10`,
+    // then errors "Cannot index array with string \"x\"" and exits 5.
+    let (stdout, stderr, code) = run_jq_full(&[r#".[(0, "x")]"#], Some("[10,20]"))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "10\n");
+    assert!(
+        stderr.contains("Cannot index array with string"),
+        "{stderr}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_computed_index_pending_halt_streams_owned_prefix_after_missing_key() -> Result<()> {
+    // The cursor loop's tail `if let Some(code) = pending_halt { let out =
+    // if any_owned { owned } else { cursors... }; return
+    // partial_generic(out, Control::Halt(code)); }` has two branches
+    // depending on whether the loop ever needed to fall back from cursors
+    // to owned values -- `any_owned` becomes true the moment any key maps
+    // to a *missing* field (`index_one_generic`'s `None => Owned(Null)`
+    // arm), which forces every already-collected cursor to be converted to
+    // owned too. This test drives that conversion so the `owned` branch
+    // (not the `cursors` branch, already covered by
+    // `test_computed_index_streams_keys_produced_before_halt`) is what's
+    // returned. Verified against jq 1.7.1: `.[("a", "missing", halt)]` on
+    // `{"a":1}` prints `1` then `null` (the missing key), then halts --
+    // exit 0.
+    let (stdout, stderr, code) =
+        run_jq_full(&[r#".[("a", "missing", halt)]"#], Some(r#"{"a":1}"#))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "1\nnull\n");
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
+#[test]
+fn test_slice_start_bound_halt_propagates() -> Result<()> {
+    // `eval_slice_expr` evaluates its `start` bound via `eval_slice_bound`
+    // before ever looking at `end` or the target; its own
+    // `Err(Control::Halt(code)) => return GenericResult::Halt(code)` arm
+    // converts a halted start-bound stream into the slice's overall
+    // result. This also exercises `eval_slice_bound`'s own
+    // `GenericResult::Halt(code) => return Err(Control::Halt(code))` arm,
+    // which is what makes the halt visible to `eval_slice_expr` in the
+    // first place instead of being silently swallowed by the
+    // `other => other.collect_owned()` fallback (#791). Verified against
+    // jq 1.7.1: `[1,2,3][halt_error(3):]` halts (the current value at that
+    // point is the ambient input, `null`, so nothing prints to stderr) and
+    // exits 3 with no stdout. The array literal is wrapped in parens here
+    // because succinctly's parser (unlike jq's) doesn't accept a slice
+    // bracket directly after an unparenthesized array-literal target.
+    let (stdout, stderr, code) = run_jq_full(&["([1,2,3])[halt_error(3):]"], Some("null"))?;
+    assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
+#[test]
+fn test_slice_end_bound_halt_propagates() -> Result<()> {
+    // The `end`-bound counterpart of the `start`-bound test above --
+    // `eval_slice_expr`'s second `eval_slice_bound` call has its own,
+    // separate `Err(Control::Halt(code)) => return GenericResult::Halt(code)`
+    // match arm one text block down, and reaches the same
+    // `eval_slice_bound` Halt-detection arm as a dynamic slice bound like
+    // `.[:halt_error(3)]` documents (#791). Verified against jq 1.7.1:
+    // `[1,2,3][:halt_error(3)]` halts with no stdout and exit 3. The array
+    // literal is wrapped in parens here because succinctly's parser (unlike
+    // jq's) doesn't accept a slice bracket directly after an
+    // unparenthesized array-literal target.
+    let (stdout, stderr, code) = run_jq_full(&["([1,2,3])[:halt_error(3)]"], Some("null"))?;
+    assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
+#[test]
+fn test_slice_target_bare_halt_propagates() -> Result<()> {
+    // `eval_slice_expr`'s own target match (evaluated once both bounds
+    // have resolved) has the same bare `GenericResult::Halt(code) =>
+    // return GenericResult::Halt(code)` arm `eval_index_expr`'s target
+    // match has -- kept separate from the `owned @ (...)` group so a
+    // halted target isn't silently swallowed by `collect_owned()`.
+    // Verified against jq 1.7.1: `(halt_error(7))[0:1]` halts with no
+    // stdout, and since the current value at that point (the ambient
+    // input) is `null`, nothing prints to stderr either -- exit 7.
+    let (stdout, stderr, code) = run_jq_full(&["(halt_error(7))[0:1]"], Some("null"))?;
+    assert_eq!(code, 7, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
+#[test]
+fn test_slice_target_slices_first_output_before_reaching_a_later_halt() -> Result<()> {
+    // Same shape as
+    // `test_computed_index_target_indexes_first_output_before_reaching_a_later_halt`,
+    // one construct over: a computed slice target is not collected as a
+    // whole standalone stream before slicing starts either -- slicing the
+    // target's first output (`1`) is attempted immediately, errors
+    // ("Cannot index number with object"), and that error surfaces without
+    // ever reaching the target stream's second output (`halt_error(7)`) at
+    // all, matching real jq exactly. Verified against jq 1.7.1: `(1,
+    // halt_error(7))[0:1]` errors the same way, exit 5.
+    let (stdout, stderr, code) = run_jq_full(&["(1, halt_error(7))[0:1]"], Some("null"))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert!(
+        stderr.contains("Cannot index number with object"),
+        "{stderr}"
+    );
     Ok(())
 }

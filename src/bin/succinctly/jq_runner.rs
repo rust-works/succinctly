@@ -758,6 +758,12 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
                         }
                         write_output(&mut out, &result, &output_config)?;
                     }
+                    // halt/halt_error (#791) outranks everything else,
+                    // including remaining rows/files still to process.
+                    if let Some(code) = sink.halted() {
+                        out.flush()?;
+                        return Ok(code);
+                    }
                     // row_value is dropped here, freeing memory for this row
                 }
             }
@@ -862,6 +868,12 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
                     write_output_jq_value(&mut out, &result, &output_config)?;
                     // result is dropped here, freeing its memory immediately
                 }
+                // halt/halt_error (#791) outranks everything else, including
+                // remaining values/files still to process.
+                if let Some(code) = sink.halted() {
+                    out.flush()?;
+                    return Ok(code);
+                }
             }
         }
     } else {
@@ -880,6 +892,10 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
                 had_output = true;
                 last_output = Some(result.clone());
                 write_output(&mut out, &result, &output_config)?;
+            }
+            if let Some(code) = sink.halted() {
+                out.flush()?;
+                return Ok(code);
             }
         }
     }
@@ -1626,6 +1642,10 @@ fn evaluate_input(
                 sink.report_break(DiagStyle::Jq, &label, at);
                 Ok(vec![])
             }
+            Err(jq::Control::Halt(code)) => {
+                sink.request_halt(code);
+                Ok(vec![])
+            }
         },
         GenericResult::None => Ok(vec![]),
         GenericResult::Error(e) => {
@@ -1638,6 +1658,13 @@ fn evaluate_input(
             sink.report_break(DiagStyle::Jq, &label, at);
             Ok(vec![])
         }
+        // `halt`/`halt_error` (#791): not a diagnostic, so no `sink.report*`
+        // call — `request_halt` records the exit code for the loop above to
+        // short-circuit on, without touching `hit`/`report_count`.
+        GenericResult::Halt(code) => {
+            sink.request_halt(code);
+            Ok(vec![])
+        }
         // The outputs already produced no longer vanish behind the failure
         // (#400, #494): report the diagnostic (which drives the exit code
         // via `sink`), but still return the prefix for the caller to print.
@@ -1647,6 +1674,10 @@ fn evaluate_input(
         }
         GenericResult::Partial(vs, jq::Control::Break(label)) => {
             sink.report_break(DiagStyle::Jq, &label, at);
+            Ok(vs)
+        }
+        GenericResult::Partial(vs, jq::Control::Halt(code)) => {
+            sink.request_halt(code);
             Ok(vs)
         }
     }
@@ -1729,6 +1760,10 @@ fn generic_result_to_jq_values<'a, W: Clone + AsRef<[u64]>>(
                 sink.report_break(DiagStyle::Jq, &label, at);
                 vec![]
             }
+            Err(jq::Control::Halt(code)) => {
+                sink.request_halt(code);
+                vec![]
+            }
         },
         GenericResult::None => vec![],
         GenericResult::Error(e) => {
@@ -1741,6 +1776,13 @@ fn generic_result_to_jq_values<'a, W: Clone + AsRef<[u64]>>(
             sink.report_break(DiagStyle::Jq, &label, at);
             vec![]
         }
+        // `halt`/`halt_error` (#791): not a diagnostic, so no `sink.report*`
+        // call — `request_halt` records the exit code for the loop above to
+        // short-circuit on, without touching `hit`/`report_count`.
+        GenericResult::Halt(code) => {
+            sink.request_halt(code);
+            vec![]
+        }
         // The outputs already produced no longer vanish behind the failure
         // (#400, #494).
         GenericResult::Partial(vs, jq::Control::Error(e)) => {
@@ -1749,6 +1791,10 @@ fn generic_result_to_jq_values<'a, W: Clone + AsRef<[u64]>>(
         }
         GenericResult::Partial(vs, jq::Control::Break(label)) => {
             sink.report_break(DiagStyle::Jq, &label, at);
+            vs.into_iter().map(JqValue::from_owned).collect()
+        }
+        GenericResult::Partial(vs, jq::Control::Halt(code)) => {
+            sink.request_halt(code);
             vs.into_iter().map(JqValue::from_owned).collect()
         }
     }

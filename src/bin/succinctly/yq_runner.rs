@@ -37,6 +37,22 @@ fn no_location() -> InputLocation {
     InputLocation::unknown()
 }
 
+/// Route a streamed `GenericResult`'s terminating outcome into `sink`: a halt
+/// (#791) outranks an error, since `StreamStats::halt` carries the real exit
+/// code and must reach `sink.request_halt` directly, never `report_stream` —
+/// that path would both misreport the exit code and print a spurious "not
+/// propagated" diagnostic no real jq/yq ever emits. Streaming never writes a
+/// diagnostic to stdout; an error is handed back here so it reaches stderr
+/// and fails the run (#355). Shared by `stream_cursor!`'s YAML and JSON arms,
+/// which otherwise duplicated this precedence check verbatim.
+fn absorb_stream_stats(sink: &mut ErrorSink, stats: &succinctly::jq::stream::StreamStats) {
+    if let Some(code) = stats.halt {
+        sink.request_halt(code);
+    } else if let Some(err) = &stats.error {
+        sink.report_stream(DiagStyle::Yq, err, &no_location());
+    }
+}
+
 /// Adapter to use `std::io::Write` with `core::fmt::Write` methods.
 /// This enables streaming JSON output without intermediate String allocation.
 struct FmtWriter<W>(W);
@@ -472,6 +488,13 @@ fn evaluate_yaml_direct_filtered(
 
                 local_idx += 1;
                 docs = rest;
+
+                // halt/halt_error (#791) outranks evaluating any further
+                // documents in this file — the caller checks `sink.halted()`
+                // too, to stop further *files*.
+                if sink.halted().is_some() {
+                    break;
+                }
             }
             Ok((doc_results, local_idx))
         }
@@ -547,6 +570,13 @@ fn query_result_to_owned_values(
             sink.report_break(DiagStyle::Yq, &label, &no_location());
             vec![]
         }
+        // `halt`/`halt_error` (#791): not a diagnostic, so no `sink.report*`
+        // call — `request_halt` records the exit code for the caller's loop
+        // to short-circuit on, without touching `hit`/`report_count`.
+        QueryResult::Halt(code) => {
+            sink.request_halt(code);
+            vec![]
+        }
         // The outputs already produced no longer vanish behind the failure
         // (#400, #494).
         QueryResult::Partial(vs, jq::Control::Error(e)) => {
@@ -555,6 +585,10 @@ fn query_result_to_owned_values(
         }
         QueryResult::Partial(vs, jq::Control::Break(label)) => {
             sink.report_break(DiagStyle::Yq, &label, &no_location());
+            vs
+        }
+        QueryResult::Partial(vs, jq::Control::Halt(code)) => {
+            sink.request_halt(code);
             vs
         }
     }
@@ -714,8 +748,29 @@ fn write_split_result(
     let index_val = OwnedValue::Int(output_index);
     let per_result_expr = jq::substitute_vars(split_expr, [("index", &index_val)]);
 
+    // Snapshotted before evaluating the split-filename expression, so the
+    // check below can tell "this call's own expression halted" from "the
+    // *main* expression already halted and `result` is an output-bearing
+    // `Partial` prefix that still owes its file" (#791): `sink.halted()` is
+    // sticky for the whole run (`request_halt`'s "first halt wins"), so
+    // without this snapshot every `write_split_result` call after a
+    // mid-stream halt would misread the already-set flag as its own and
+    // skip writing a result that must still be split out.
+    let halted_before = sink.halted().is_some();
+
     let reports_before = sink.report_count();
     let filename_results = evaluate_input(result, &per_result_expr, sink)?;
+
+    // halt/halt_error (#791) inside *this* split expression: not a
+    // diagnostic (no `report_count` bump), so an empty result must be
+    // checked before the `[]` arms below, or it would be misreported as
+    // "produced no output". But a halt that already produced a value (e.g.
+    // `"out\($index).yml", halt`) must still fall through to the match below
+    // so that value gets written -- only bail early when the halt left
+    // nothing behind, or a legitimately-produced filename is silently lost.
+    if !halted_before && sink.halted().is_some() && filename_results.is_empty() {
+        return Ok(());
+    }
 
     let filename = match filename_results.as_slice() {
         [OwnedValue::String(s)] => s.clone(),
@@ -867,6 +922,10 @@ fn evaluate_yaml_cursor<W: AsRef<[u64]> + Clone>(
                 sink.report_break(DiagStyle::Yq, &label, &no_location());
                 Ok(vec![])
             }
+            Err(jq::Control::Halt(code)) => {
+                sink.request_halt(code);
+                Ok(vec![])
+            }
         },
         GenericResult::None => Ok(vec![]),
         GenericResult::Error(e) => {
@@ -879,6 +938,13 @@ fn evaluate_yaml_cursor<W: AsRef<[u64]> + Clone>(
             sink.report_break(DiagStyle::Yq, &label, &no_location());
             Ok(vec![])
         }
+        // `halt`/`halt_error` (#791): not a diagnostic, so no `sink.report*`
+        // call — `request_halt` records the exit code for the caller's loop
+        // to short-circuit on, without touching `hit`/`report_count`.
+        GenericResult::Halt(code) => {
+            sink.request_halt(code);
+            Ok(vec![])
+        }
         // The outputs already produced no longer vanish behind the failure
         // (#400, #494).
         GenericResult::Partial(vs, jq::Control::Error(e)) => {
@@ -887,6 +953,10 @@ fn evaluate_yaml_cursor<W: AsRef<[u64]> + Clone>(
         }
         GenericResult::Partial(vs, jq::Control::Break(label)) => {
             sink.report_break(DiagStyle::Yq, &label, &no_location());
+            Ok(vs.into_iter().map(no_comments).collect())
+        }
+        GenericResult::Partial(vs, jq::Control::Halt(code)) => {
+            sink.request_halt(code);
             Ok(vs.into_iter().map(no_comments).collect())
         }
     };
@@ -1708,7 +1778,8 @@ fn contains_split_doc(expr: &Expr) -> bool {
             args.iter().any(contains_split_doc)
         }
         Expr::Builtin(b) => match b {
-            Builtin::Has(e)
+            Builtin::HaltErrorCode(e)
+            | Builtin::Has(e)
             | Builtin::In(e)
             | Builtin::Select(e)
             | Builtin::Map(e)
@@ -2146,81 +2217,74 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
     // parameters don't have that problem — they always evaluate in the
     // caller's own scope — hence passing color as `$use_color:expr`.
     macro_rules! stream_cursor {
-            ($cursor:expr, $writer:expr, $is_yaml:expr, $doc_streamed:expr, $use_color:expr) => {{
-                if $is_yaml {
-                    // M2 YAML path: YAML output streaming
-                    if is_identity {
-                        // P9 path: stream directly without evaluation.
-                        // `stream_yaml_as_document` (not `stream_yaml`) since
-                        // `$cursor` here is the whole document being
-                        // redisplayed as itself - its own trailing comment,
-                        // if any, must be kept (#710).
-                        emit_yaml_doc_separator($writer, $doc_streamed, true)?;
-                        stream_maybe_colored($writer, $use_color, colorize_yaml, |out| {
-                            $cursor.stream_yaml_as_document(out, yaml_indent, sort_keys)
-                        })?;
-                        writeln!($writer)?;
-                        // Streaming skips evaluation, so inspect the document
-                        // value directly to keep `-e` falsy tracking (#178).
-                        if args.exit_status {
-                            any_truthy |= !$cursor.is_falsy();
-                        }
-                    } else {
-                        // M2 YAML path: evaluate and stream YAML results
-                        let result = eval_with_cursor_using::<YqSemantics, _>(&program.expr, $cursor);
-                        let will_output = !matches!(
-                            &result,
-                            GenericResult::None | GenericResult::Break(_)
-                        ) && !matches!(&result, GenericResult::Many(vs) if vs.is_empty())
-                            && !matches!(&result, GenericResult::ManyCursor(cs) if cs.is_empty())
-                            && !matches!(&result, GenericResult::ManyOwned(vs) if vs.is_empty());
-                        emit_yaml_doc_separator($writer, $doc_streamed, will_output)?;
-                        let stats =
-                            stream_maybe_colored($writer, $use_color, colorize_yaml, |out| {
-                                result.stream_yaml(out, yaml_indent, sort_keys, |w| w.write_str("\n"))
-                            })?;
-                        any_truthy |= stats.any_truthy;
-                        // Streaming never writes a diagnostic to stdout; it hands
-                        // the error back here so it reaches stderr and fails the run (#355).
-                        if let Some(err) = &stats.error {
-                            sink.report_stream(DiagStyle::Yq, err, &no_location());
-                        }
+        ($cursor:expr, $writer:expr, $is_yaml:expr, $doc_streamed:expr, $use_color:expr) => {{
+            if $is_yaml {
+                // M2 YAML path: YAML output streaming
+                if is_identity {
+                    // P9 path: stream directly without evaluation.
+                    // `stream_yaml_as_document` (not `stream_yaml`) since
+                    // `$cursor` here is the whole document being
+                    // redisplayed as itself - its own trailing comment,
+                    // if any, must be kept (#710).
+                    emit_yaml_doc_separator($writer, $doc_streamed, true)?;
+                    stream_maybe_colored($writer, $use_color, colorize_yaml, |out| {
+                        $cursor.stream_yaml_as_document(out, yaml_indent, sort_keys)
+                    })?;
+                    writeln!($writer)?;
+                    // Streaming skips evaluation, so inspect the document
+                    // value directly to keep `-e` falsy tracking (#178).
+                    if args.exit_status {
+                        any_truthy |= !$cursor.is_falsy();
                     }
                 } else {
-                    // M2 path: JSON output streaming
-                    if is_identity {
-                        // P9 path: stream directly without evaluation
-                        stream_maybe_colored(
-                            $writer,
-                            $use_color,
-                            |s| output::colorize_json(s, &ColorScheme::default()),
-                            |out| $cursor.stream_json(out, json_indent, sort_keys),
-                        )?;
-                        writeln!($writer)?;
-                        // Streaming skips evaluation, so inspect the document
-                        // value directly to keep `-e` falsy tracking (#178).
-                        if args.exit_status {
-                            any_truthy |= !$cursor.is_falsy();
-                        }
-                    } else {
-                        // M2 path: evaluate and stream results
-                        let result = eval_with_cursor_using::<YqSemantics, _>(&program.expr, $cursor);
-                        let stats = stream_maybe_colored(
-                            $writer,
-                            $use_color,
-                            |s| output::colorize_json(s, &ColorScheme::default()),
-                            |out| result.stream_json(out, json_indent, sort_keys, |w| w.write_str("\n")),
-                        )?;
-                        any_truthy |= stats.any_truthy;
-                        // Streaming never writes a diagnostic to stdout; it hands
-                        // the error back here so it reaches stderr and fails the run (#355).
-                        if let Some(err) = &stats.error {
-                            sink.report_stream(DiagStyle::Yq, err, &no_location());
-                        }
-                    }
+                    // M2 YAML path: evaluate and stream YAML results
+                    let result = eval_with_cursor_using::<YqSemantics, _>(&program.expr, $cursor);
+                    // `produces_output` is an exhaustive match on
+                    // `GenericResult`, not a hand-maintained exclusion
+                    // list — a halt/halt_error (#791) with no prior
+                    // output (`GenericResult::Halt`) answers `false`
+                    // there; an output-bearing halt
+                    // (`GenericResult::Partial`) answers `true`.
+                    emit_yaml_doc_separator($writer, $doc_streamed, result.produces_output())?;
+                    let stats = stream_maybe_colored($writer, $use_color, colorize_yaml, |out| {
+                        result.stream_yaml(out, yaml_indent, sort_keys, |w| w.write_str("\n"))
+                    })?;
+                    any_truthy |= stats.any_truthy;
+                    absorb_stream_stats(&mut sink, &stats);
                 }
-            }};
-        }
+            } else {
+                // M2 path: JSON output streaming
+                if is_identity {
+                    // P9 path: stream directly without evaluation
+                    stream_maybe_colored(
+                        $writer,
+                        $use_color,
+                        |s| output::colorize_json(s, &ColorScheme::default()),
+                        |out| $cursor.stream_json(out, json_indent, sort_keys),
+                    )?;
+                    writeln!($writer)?;
+                    // Streaming skips evaluation, so inspect the document
+                    // value directly to keep `-e` falsy tracking (#178).
+                    if args.exit_status {
+                        any_truthy |= !$cursor.is_falsy();
+                    }
+                } else {
+                    // M2 path: evaluate and stream results
+                    let result = eval_with_cursor_using::<YqSemantics, _>(&program.expr, $cursor);
+                    let stats = stream_maybe_colored(
+                        $writer,
+                        $use_color,
+                        |s| output::colorize_json(s, &ColorScheme::default()),
+                        |out| {
+                            result.stream_json(out, json_indent, sort_keys, |w| w.write_str("\n"))
+                        },
+                    )?;
+                    any_truthy |= stats.any_truthy;
+                    absorb_stream_stats(&mut sink, &stats);
+                }
+            }
+        }};
+    }
 
     if can_fast_path {
         // M2 streaming fast path: evaluate expression and stream results directly
@@ -2256,6 +2320,10 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                                 &mut yaml_doc_streamed,
                                 output_config.use_color
                             );
+                            // See the matching check in the per-file loop below.
+                            if sink.halted().is_some() {
+                                break;
+                            }
                         }
                         global_doc_index += 1;
                         docs = rest;
@@ -2306,7 +2374,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                 }
             }
         } else {
-            for file_path in &input_files {
+            'm2_files: for file_path in &input_files {
                 let path = Path::new(file_path);
                 let yaml_bytes = read_file(path)?;
                 let fmt = resolve_input_format(args.input_format, Some(path));
@@ -2334,6 +2402,17 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                                     &mut yaml_doc_streamed,
                                     output_config.use_color
                                 );
+                                // Halt outranks every remaining document and
+                                // file (#791): without this, a `halt` nested
+                                // inside `first(...)`/`last(...)`/a computed
+                                // index — the only shapes that reach the M2
+                                // path with a halt at all, see
+                                // `can_use_m2_streaming` — would keep
+                                // streaming further documents and files
+                                // instead of stopping immediately.
+                                if sink.halted().is_some() {
+                                    break 'm2_files;
+                                }
                             }
                             global_doc_index += 1;
                             docs = rest;
@@ -2386,6 +2465,10 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                                         &mut yaml_doc_streamed,
                                         output_config.use_color
                                     );
+                                    // See the matching check in the `Sequence` arm above.
+                                    if sink.halted().is_some() {
+                                        break 'm2_files;
+                                    }
                                 }
                             }
                         }
@@ -2473,6 +2556,14 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
 
         if args.null_input {
             let results = evaluate_input(&OwnedValue::Null, &program.expr, &mut sink)?;
+            // Snapshotted before the loop: if the *main* filter already
+            // halted after producing several values (e.g. `1,2,3,halt`),
+            // `results` is the full legitimate pre-halt prefix and every
+            // element still owes its file — `sink.halted()` must not be
+            // misread as "this iteration halted" until a *new* halt (from
+            // this batch's own split-filename evaluation) actually occurs
+            // (#791, mirrors `write_split_result`'s own `halted_before`).
+            let halted_before_batch = sink.halted().is_some();
             for result in &results {
                 any_truthy |= !matches!(result, OwnedValue::Null | OwnedValue::Bool(false));
                 write_split_result(
@@ -2485,6 +2576,11 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                     &mut sink,
                 )?;
                 output_index += 1;
+                // halt/halt_error (#791) outranks writing any further split
+                // files, but only once introduced during this batch.
+                if !halted_before_batch && sink.halted().is_some() {
+                    break;
+                }
             }
         } else {
             // `--front-matter` is rejected in combination above, so every
@@ -2500,7 +2596,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
             };
 
             let mut global_doc_index: usize = 0;
-            for (bytes, format, _) in &input_sources {
+            'files: for (bytes, format, _) in &input_sources {
                 match format {
                     InputFormat::Yaml | InputFormat::Auto => {
                         let doc_filter = args.document.map(|target| (target, global_doc_index));
@@ -2516,6 +2612,14 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                         )?;
                         global_doc_index += num_docs;
                         for results in doc_results {
+                            // See the --null-input arm above: a halt already
+                            // present when this document's batch starts
+                            // means every element of `results` is a
+                            // legitimate pre-halt prefix that still owes its
+                            // file, so only a *new* halt (from this batch's
+                            // own split-filename evaluation) should stop the
+                            // loop early (#791).
+                            let halted_before_batch = sink.halted().is_some();
                             for (result, comments) in &results {
                                 any_truthy |=
                                     !matches!(result, OwnedValue::Null | OwnedValue::Bool(false));
@@ -2529,7 +2633,16 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                                     &mut sink,
                                 )?;
                                 output_index += 1;
+                                // halt/halt_error (#791) outranks writing any
+                                // further split files or evaluating any
+                                // further documents/inputs/files.
+                                if !halted_before_batch && sink.halted().is_some() {
+                                    break 'files;
+                                }
                             }
+                        }
+                        if sink.halted().is_some() {
+                            break 'files;
                         }
                     }
                     InputFormat::Json => {
@@ -2542,6 +2655,11 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                                 }
                             }
                             let results = evaluate_input(&input, &program.expr, &mut sink)?;
+                            // See the --null-input arm above: a pre-existing
+                            // halt means every element of `results` is a
+                            // legitimate pre-halt prefix still owed its file
+                            // (#791).
+                            let halted_before_batch = sink.halted().is_some();
                             for result in &results {
                                 any_truthy |=
                                     !matches!(result, OwnedValue::Null | OwnedValue::Bool(false));
@@ -2555,8 +2673,14 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                                     &mut sink,
                                 )?;
                                 output_index += 1;
+                                if !halted_before_batch && sink.halted().is_some() {
+                                    break 'files;
+                                }
                             }
                             global_doc_index += 1;
+                            if sink.halted().is_some() {
+                                break 'files;
+                            }
                         }
                     }
                 }
@@ -2606,6 +2730,10 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                     split_doc_state.write_separator(&mut writer, &output_config)?;
                     any_truthy |= !matches!(&result, OwnedValue::Null | OwnedValue::Bool(false));
                     output_value(&mut writer, &result, &CommentTree::empty(), &output_config)?;
+                }
+                // halt/halt_error (#791) outranks evaluating any further lines.
+                if sink.halted().is_some() {
+                    break;
                 }
             }
         }
@@ -2739,7 +2867,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
         }
 
         let mut global_doc_index: usize = 0;
-        for file_path in &input_files {
+        'inplace_files: for file_path in &input_files {
             let path = Path::new(file_path);
             let raw_bytes = read_file(path)?;
             let resolved_format = resolve_input_format(args.input_format, Some(path));
@@ -2770,7 +2898,14 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
             let mut output_config = output_config.clone();
             output_config.use_color = false;
 
-            if can_inplace_fast_path {
+            // halt/halt_error (#791): tracks whether any *real* evaluated
+            // content (not a speculatively pre-written `---` separator or
+            // front-matter fence) made it into `output_buffer`, so the
+            // write-back guard below can tell "this file was never really
+            // considered" apart from "the buffer merely has some bytes in
+            // it" — see the guard's own comment for why that distinction
+            // matters.
+            let any_real_output = if can_inplace_fast_path {
                 // M2 streaming fast path (#478): stream cursor results
                 // directly into this file's buffer, skipping the OwnedValue
                 // DOM (and its IndexMap, which cannot represent duplicate
@@ -2799,6 +2934,17 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                                         &mut yaml_doc_streamed,
                                         false
                                     );
+                                    // halt/halt_error (#791): matches the DOM
+                                    // `--inplace` branch below — stop
+                                    // streaming further documents into this
+                                    // file, but still let the shared
+                                    // write-back-then-break-'inplace_files
+                                    // logic after this `if`/`else` run, so
+                                    // the prefix already streamed is still
+                                    // committed to disk.
+                                    if sink.halted().is_some() {
+                                        break;
+                                    }
                                 }
                                 global_doc_index += 1;
                                 docs = rest;
@@ -2849,6 +2995,12 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                     }
                     buf_writer.flush()?;
                 }
+                // This branch never pre-writes speculative separator/fence
+                // bytes (front matter forces the DOM branch below, and its
+                // own `---` separators are only emitted after a document has
+                // actually streamed real content), so the buffer's emptiness
+                // already reflects whether any real output happened.
+                !output_buffer.is_empty()
             } else {
                 let inputs = parse_input(&input_bytes, format)?;
 
@@ -2870,6 +3022,10 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                     writeln!(buf_writer, "---")?;
                 }
 
+                // halt/halt_error (#791): tracks real per-document output
+                // only, separately from the speculative `---`/fence bytes
+                // that may already be sitting in `buf_writer` above.
+                let mut any_real_output = false;
                 let mut split_doc_state = SplitDocState::new(has_split_doc);
                 for (local_idx, input) in inputs.iter().enumerate() {
                     let current_doc_index = global_doc_index + local_idx;
@@ -2880,20 +3036,31 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                         }
                     }
 
-                    // For regular multi-doc (without split_doc), add --- before each doc
-                    if !has_split_doc
-                        && output_config.output_format == OutputFormat::Yaml
-                        && !output_config.no_doc
-                        && is_multi_doc
-                        && front_matter_body.is_none()
-                    {
-                        writeln!(buf_writer, "---")?;
-                    }
                     let results = evaluate_input(input, &program.expr, &mut sink)?;
                     // `output_config` was already shadowed to `use_color:
                     // false` above — reused here rather than building a
                     // second, parallel no-color config.
+                    let mut doc_had_output = false;
                     for result in results {
+                        // For regular multi-doc (without split_doc), add ---
+                        // before each doc's first real output — not
+                        // unconditionally before the doc is even evaluated.
+                        // A doc whose query yields no values gets no
+                        // separator either side (#175), matching the M2 fast
+                        // path's already-correct behavior above; writing it
+                        // eagerly left a dangling `---` whenever a doc
+                        // produced zero output, whether from an ordinary
+                        // empty filter or from a halt partway through (#791).
+                        if !doc_had_output
+                            && !has_split_doc
+                            && output_config.output_format == OutputFormat::Yaml
+                            && !output_config.no_doc
+                            && is_multi_doc
+                            && front_matter_body.is_none()
+                        {
+                            writeln!(buf_writer, "---")?;
+                        }
+                        doc_had_output = true;
                         split_doc_state.write_separator(&mut buf_writer, &output_config)?;
                         any_truthy |=
                             !matches!(&result, OwnedValue::Null | OwnedValue::Bool(false));
@@ -2903,11 +3070,20 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                             &CommentTree::empty(),
                             &output_config,
                         )?;
+                        any_real_output = true;
+                    }
+                    // halt/halt_error (#791): still write this file's buffer
+                    // so far (below, matching the "prefix already output
+                    // survives" rule elsewhere), but evaluate no further
+                    // documents in this file or any other.
+                    if sink.halted().is_some() {
+                        break;
                     }
                 }
                 buf_writer.flush()?;
                 global_doc_index += inputs.len();
-            }
+                any_real_output
+            };
 
             if let Some(body) = &front_matter_body {
                 output_buffer.extend_from_slice(b"---");
@@ -2915,9 +3091,51 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                 output_buffer.extend_from_slice(body);
             }
 
-            // Write the output back to the file
-            std::fs::write(path, &output_buffer)
-                .with_context(|| format!("failed to write to file: {}", path.display()))?;
+            // Write the output back to the file — unless a `halt`/
+            // `halt_error` fired before this file produced any *real* output
+            // at all. A halt aborts the whole process; this file was never
+            // fully considered, so leaving its original content in place is
+            // safer than truncating it to reflect an evaluation that never
+            // really finished (#791) — `halt` used as an early-exit guard
+            // clause is a natural way to trigger this under `-i`.
+            //
+            // Gated on `any_real_output`, not `output_buffer.is_empty()`:
+            // the DOM branch above can pre-write a `--front-matter=process`
+            // fence into `output_buffer` before evaluating the document that
+            // follows it, so a halt with zero real output can still leave
+            // the buffer non-empty. Checking emptiness directly would let
+            // that speculative prefix defeat this guard and truncate the
+            // file down to just the prefix. (The multi-doc `---` separator
+            // is no longer speculative — it's written only after a document
+            // has actually produced its first output, same as the M2 fast
+            // path above.)
+            //
+            // Deliberately narrower than "output is empty": real yq (v4.53.3,
+            // verified live) truncates a file to reflect a filter that
+            // legitimately produces no output for it, e.g. `-i 'select(false)'`
+            // or `-i 'del(.)'` both empty the file — so only a halt gets this
+            // protection, not ordinary empty output. This is a deliberate,
+            // tested product choice for `-i` specifically (see
+            // `test_inplace_halt_before_any_output_does_not_truncate_file`
+            // and its neighbors): unlike every other halt-propagation fix in
+            // this codebase, "should halt-caused emptiness in one document
+            // of a file still truncate the file because an earlier document
+            // legitimately produced nothing" is not dictated by any jq
+            // semantics `halt`/`halt_error` must uphold — mikefarah/yq (the
+            // real-yq oracle used elsewhere in this codebase) does not even
+            // parse `halt`/`if`/`then`/`end` the same way, so there is no
+            // external contract to defer to here, only this project's own
+            // considered choice to err toward preserving user data whenever
+            // a halt is involved.
+            if any_real_output || sink.halted().is_none() {
+                std::fs::write(path, &output_buffer)
+                    .with_context(|| format!("failed to write to file: {}", path.display()))?;
+            }
+
+            // halt/halt_error (#791) outranks editing any further files.
+            if sink.halted().is_some() {
+                break 'inplace_files;
+            }
         }
     } else {
         // Standard path: evaluate inputs
@@ -2946,7 +3164,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
         // input has none, so it's paired with CommentTree::empty().
         let mut all_results: Vec<Vec<Vec<ResultWithComments>>> = Vec::new();
         let mut global_doc_index: usize = 0;
-        for (bytes, format, _) in &input_sources {
+        'collect: for (bytes, format, _) in &input_sources {
             match format {
                 InputFormat::Yaml | InputFormat::Auto => {
                     // Use direct YAML evaluation to preserve position metadata
@@ -2965,6 +3183,11 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                     )?;
                     global_doc_index += num_docs;
                     all_results.push(doc_results);
+                    // halt/halt_error (#791) outranks evaluating any further
+                    // files — whatever was collected so far still prints below.
+                    if sink.halted().is_some() {
+                        break 'collect;
+                    }
                 }
                 InputFormat::Json => {
                     // Use OwnedValue path for JSON
@@ -2986,8 +3209,19 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                                 .collect::<Vec<_>>(),
                         );
                         global_doc_index += 1;
+                        // halt/halt_error (#791): stop evaluating further
+                        // inputs in this file (and, below, further files) —
+                        // whatever was collected so far still prints below.
+                        if sink.halted().is_some() {
+                            break;
+                        }
                     }
                     all_results.push(json_results);
+                    // halt/halt_error (#791) outranks evaluating any further
+                    // files — matches the sibling YAML arm above.
+                    if sink.halted().is_some() {
+                        break 'collect;
+                    }
                 }
             }
         }
@@ -3043,6 +3277,13 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
     }
 
     writer.flush()?;
+
+    // halt/halt_error (#791) outranks everything below — every branch above
+    // stops evaluating further input as soon as it's requested, but still
+    // finishes writing whatever output it already had buffered/collected.
+    if let Some(code) = sink.halted() {
+        return Ok(code);
+    }
 
     // Determine exit code. An uncaught error outranks -e: the filter failed,
     // which is not the same as it succeeding with a falsy result (#355 vs #178).
