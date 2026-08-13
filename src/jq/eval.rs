@@ -34249,4 +34249,45 @@ mod tests {
             other => panic!("unexpected result: {other:?}"),
         }
     }
+
+    #[cfg(feature = "regex")]
+    #[test]
+    fn codepoint_cursor_backward_query_falls_back_without_disturbing_cursor() {
+        // `CodepointCursor::advance`'s backward branch (`byte_offset <
+        // self.byte`) is unreachable through the public `match(...)` /
+        // `match(...;"g")` builtins with the `regex` crate specifically:
+        // capture-group offsets are always within their overall match's
+        // span, `global_captures` emits matches at strictly increasing byte
+        // offsets, and the crate supports neither lookaround nor
+        // backreferences -- the two constructs that could otherwise make a
+        // higher-numbered capture group start before a lower-numbered one.
+        // So every real `byte_to_char_offset` call built_match_object makes
+        // is forward-or-equal, and this branch has no reachable jq-level
+        // regex fixture. Tested directly on the cursor abstraction instead
+        // (#806 follow-up review).
+        let input = "héllo wörld";
+        let mut cursor = CodepointCursor::default();
+
+        // Advance forward past both non-ASCII characters first, as
+        // build_match_object would for a match/capture near the end of the
+        // string.
+        let forward_offset = cursor.advance(input, input.len());
+        assert_eq!(forward_offset, input.chars().count() as i64);
+        assert_eq!(cursor.byte, input.len());
+
+        // A backward query for an earlier byte offset (e.g. from an
+        // out-of-order capture group, if the regex engine ever produced
+        // one) must still return the correct codepoint offset...
+        let backward_offset = cursor.advance(input, 1);
+        assert_eq!(
+            backward_offset, 1,
+            "byte 1 is still inside 'h', codepoint 1"
+        );
+
+        // ...without moving the cursor backward, so a later forward query
+        // in the same call resumes from where it left off rather than
+        // re-scanning from byte 0.
+        assert_eq!(cursor.byte, input.len());
+        assert_eq!(cursor.chars, input.chars().count());
+    }
 }
