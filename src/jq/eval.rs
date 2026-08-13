@@ -7242,6 +7242,14 @@ fn builtin_sub_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // Convert jq replacement syntax (\(.name)) to regex replacement syntax ($name)
     let replacement = convert_jq_replacement(&replacement);
 
+    // jq defines gsub(re; str; flags) as sub(re; str; flags + "g") -- a "g" flag
+    // here means the same global replace gsub always performs.
+    if flags.is_some_and(|f| f.contains('g')) {
+        let matches = global_captures(&re, &input);
+        let result = stitch_replacements(&input, &matches, replacement.as_str());
+        return QueryResult::Owned(OwnedValue::String(result));
+    }
+
     // Replace first match
     let result = match dv_captures_at(&re.re, &input, 0, re.needs_trailing_nl_check) {
         Some(caps) => {
