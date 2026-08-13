@@ -2020,7 +2020,17 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
 
         // Parse value
         if self.at_line_end() {
-            // Value is on next line or implicit null
+            // Value is on next line or implicit null. Capture a trailing
+            // comment on the key's own line first (issue #765) -
+            // `self.last_open_bp_pos` still holds the key node's bp_pos here
+            // since no value node has been opened yet (nothing opens a BP
+            // node between the key's own close above and this point). This
+            // mirrors `parse_mapping_entry`'s identical capture just below
+            // - missing here left a block-sequence item's *first* field
+            // (the only mapping entry parsed by this function rather than
+            // `parse_mapping_entry`) silently dropping its own key comment
+            // (#785).
+            self.maybe_capture_line_comment(self.last_open_bp_pos);
             self.skip_to_eol();
 
             // Look ahead to determine if this is a null value or a nested structure
