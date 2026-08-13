@@ -30385,6 +30385,39 @@ mod tests {
         );
     }
 
+    /// #843 review, the true `resolve_index_expr`/`resolve_slice_expr`
+    /// `target == Builtin::GetPath(...)` shape: `.[0]`/`.[0:2]` after a
+    /// literal-key `getpath(...)` fold onto the *same* static chain as the
+    /// `getpath` call (reaching `resolve_seq`, already covered above), so
+    /// forcing the actual `IndexExpr`/`SliceExpr` variant these two
+    /// functions handle requires a genuinely *computed* key/bound —
+    /// confirmed live against jq 1.7.1: both still raise "near attempt",
+    /// naming `getpath`'s own landed value as the container, and perform
+    /// no write.
+    #[test]
+    fn test_path_catch_handler_getpath_as_true_index_slice_expr_target_843() {
+        query!(
+            br#"{"a":10,"other":[1,2,3]}"#,
+            r#"try (.a, error({"other":[7,8,9]})) catch (getpath(["other"])[.k // 0]) = "HACKED""#,
+            QueryResult::Error(e) => {
+                assert_eq!(
+                    e.message,
+                    "Invalid path expression near attempt to access element 0 of [7,8,9]"
+                );
+            }
+        );
+        query!(
+            br#"{"a":10,"other":[1,2,3]}"#,
+            r#"try (.a, error({"other":[7,8,9]})) catch (getpath(["other"])[(0+1):2]) = ["X","Y"]"#,
+            QueryResult::Error(e) => {
+                assert_eq!(
+                    e.message,
+                    "Invalid path expression near attempt to access element {\"start\":1,... of [7,8,9]"
+                );
+            }
+        );
+    }
+
     /// #843 review: a *bare* `getpath(...)` call, used as the entire catch
     /// handler with nothing further navigating its result, is exactly the
     /// no-further-navigation case `#530`'s classic "with result" message
