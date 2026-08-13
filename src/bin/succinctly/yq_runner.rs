@@ -762,9 +762,13 @@ fn write_split_result(
     let filename_results = evaluate_input(result, &per_result_expr, sink)?;
 
     // halt/halt_error (#791) inside *this* split expression: not a
-    // diagnostic (no `report_count` bump), so it must be checked before the
-    // `[]` arms below, or it would be misreported as "produced no output".
-    if !halted_before && sink.halted().is_some() {
+    // diagnostic (no `report_count` bump), so an empty result must be
+    // checked before the `[]` arms below, or it would be misreported as
+    // "produced no output". But a halt that already produced a value (e.g.
+    // `"out\($index).yml", halt`) must still fall through to the match below
+    // so that value gets written -- only bail early when the halt left
+    // nothing behind, or a legitimately-produced filename is silently lost.
+    if !halted_before && sink.halted().is_some() && filename_results.is_empty() {
         return Ok(());
     }
 

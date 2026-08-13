@@ -7746,6 +7746,35 @@ fn test_split_exp_own_halt_returns_early_and_stops_further_results() -> Result<(
     Ok(())
 }
 
+/// Sibling of the test above, covering the case its own doc comment didn't:
+/// the split-filename expression's own halt can carry a *produced* value
+/// with it (a comma expression like `filename, halt`), not just an empty
+/// one. `write_split_result`'s halt guard must only skip writing when the
+/// halt left nothing behind -- a legitimately-produced filename must still
+/// reach the match below and get written, or the result is silently lost
+/// with exit code 0 and no diagnostic at all.
+#[test]
+fn test_split_exp_own_halt_with_produced_value_still_writes_file() -> Result<()> {
+    let dir = TempDir::new()?;
+    let pattern = format!(
+        "\"{}/f\" + ($index|tostring) + \".yml\", halt",
+        dir.path().display()
+    );
+    let (stdout, stderr, code) = run_yq_split(".[]", "[1, 2, 3]\n", &["--split-exp", &pattern])?;
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout, "");
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("f0.yml"))?.trim(),
+        "1",
+        "the filename produced before the halt must still be written to"
+    );
+    assert!(
+        !dir.path().join("f1.yml").exists(),
+        "index 1 must never be reached once index 0's split expression halted"
+    );
+    Ok(())
+}
+
 /// Targets `evaluate_yaml_cursor`'s `GenericResult::LazySeq` arm (#791
 /// follow-up): `seq.materialize_atomic()`'s `Err(jq::Control::Halt(code))`
 /// must reach `sink.request_halt`, not be swallowed as an ordinary error.
