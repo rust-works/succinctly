@@ -2004,7 +2004,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
     /// // Navigate to the anchored value and call .anchor()
     /// ```
     /// Deliberately does **not** resolve a bare `-` sequence-item wrapper
-    /// itself (see [`YamlCursor::resolve_bare_seq_item`]'s doc comment):
+    /// itself (see `resolve_bare_seq_item`'s doc comment internally):
     /// this is called for essentially every node on `stream_yaml_value`'s
     /// hot per-field/per-item render path, where `self` is *already*
     /// guaranteed resolved by the caller, and paying the resolve cost again
@@ -4100,8 +4100,8 @@ impl<'a, W: AsRef<[u64]>> YamlElements<'a, W> {
     /// This is the right choice for every caller that goes on to read a
     /// *property* of the item's value — its container-ness, fields/elements,
     /// style, anchor, tag, or comment — rather than the item's own text
-    /// position: [`stream_yaml_value`]'s `Sequence` arm uses this so the
-    /// cursor it hands to [`is_yaml_cursor_container`] and recurses into is
+    /// position: `stream_yaml_value`'s `Sequence` arm uses this so the
+    /// cursor it hands to `is_yaml_cursor_container` and recurses into is
     /// already resolved, letting both stay their cheap, non-resolving form
     /// instead of re-resolving per call — `is_yaml_cursor_container` runs
     /// once per rendered node on this crate's flagship `yq` streaming path,
