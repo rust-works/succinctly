@@ -2552,6 +2552,14 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
 
         if args.null_input {
             let results = evaluate_input(&OwnedValue::Null, &program.expr, &mut sink)?;
+            // Snapshotted before the loop: if the *main* filter already
+            // halted after producing several values (e.g. `1,2,3,halt`),
+            // `results` is the full legitimate pre-halt prefix and every
+            // element still owes its file — `sink.halted()` must not be
+            // misread as "this iteration halted" until a *new* halt (from
+            // this batch's own split-filename evaluation) actually occurs
+            // (#791, mirrors `write_split_result`'s own `halted_before`).
+            let halted_before_batch = sink.halted().is_some();
             for result in &results {
                 any_truthy |= !matches!(result, OwnedValue::Null | OwnedValue::Bool(false));
                 write_split_result(
@@ -2564,8 +2572,9 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                     &mut sink,
                 )?;
                 output_index += 1;
-                // halt/halt_error (#791) outranks writing any further split files.
-                if sink.halted().is_some() {
+                // halt/halt_error (#791) outranks writing any further split
+                // files, but only once introduced during this batch.
+                if !halted_before_batch && sink.halted().is_some() {
                     break;
                 }
             }
@@ -2599,6 +2608,14 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                         )?;
                         global_doc_index += num_docs;
                         for results in doc_results {
+                            // See the --null-input arm above: a halt already
+                            // present when this document's batch starts
+                            // means every element of `results` is a
+                            // legitimate pre-halt prefix that still owes its
+                            // file, so only a *new* halt (from this batch's
+                            // own split-filename evaluation) should stop the
+                            // loop early (#791).
+                            let halted_before_batch = sink.halted().is_some();
                             for (result, comments) in &results {
                                 any_truthy |=
                                     !matches!(result, OwnedValue::Null | OwnedValue::Bool(false));
@@ -2615,7 +2632,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                                 // halt/halt_error (#791) outranks writing any
                                 // further split files or evaluating any
                                 // further documents/inputs/files.
-                                if sink.halted().is_some() {
+                                if !halted_before_batch && sink.halted().is_some() {
                                     break 'files;
                                 }
                             }
@@ -2634,6 +2651,11 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                                 }
                             }
                             let results = evaluate_input(&input, &program.expr, &mut sink)?;
+                            // See the --null-input arm above: a pre-existing
+                            // halt means every element of `results` is a
+                            // legitimate pre-halt prefix still owed its file
+                            // (#791).
+                            let halted_before_batch = sink.halted().is_some();
                             for result in &results {
                                 any_truthy |=
                                     !matches!(result, OwnedValue::Null | OwnedValue::Bool(false));
@@ -2647,7 +2669,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                                     &mut sink,
                                 )?;
                                 output_index += 1;
-                                if sink.halted().is_some() {
+                                if !halted_before_batch && sink.halted().is_some() {
                                     break 'files;
                                 }
                             }

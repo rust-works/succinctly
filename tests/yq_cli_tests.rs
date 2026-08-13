@@ -7923,6 +7923,85 @@ fn test_split_exp_json_halt_with_no_output_breaks_via_outer_check() -> Result<()
     Ok(())
 }
 
+/// Code-review follow-up (#791): distinct from
+/// `test_split_exp_writes_prefix_produced_before_main_expression_halts`,
+/// which uses a *single*-element pre-halt prefix (`1, halt`) and so cannot
+/// tell "wrote the whole batch" apart from "broke after the first element".
+/// `sink.halted()` is already set by the time `results` comes back from
+/// `evaluate_input` (the *main* filter itself halted after producing three
+/// legitimate outputs), so the per-result loop's own halt check must not
+/// mistake that pre-existing flag for something this iteration caused --
+/// every element of the prefix still owes its file, not just the first one.
+#[test]
+fn test_split_exp_writes_every_result_in_a_multi_value_halt_prefix_null_input() -> Result<()> {
+    let dir = TempDir::new()?;
+    let pattern = format!(
+        "\"{}/f\" + ($index|tostring) + \".yml\"",
+        dir.path().display()
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .arg("yq")
+        .args(["-n", "--split-exp", &pattern])
+        .arg("1, 2, 3, halt")
+        .stdin(Stdio::null())
+        .output()?;
+    assert!(output.status.success());
+
+    for (i, expected) in ["1", "2", "3"].into_iter().enumerate() {
+        let content = std::fs::read_to_string(dir.path().join(format!("f{i}.yml")))?;
+        assert_eq!(content.trim(), expected, "f{i}.yml");
+    }
+    Ok(())
+}
+
+/// YAML-branch sibling of the null-input test above: `range(3), halt`
+/// against a single document produces a `doc_results` entry with three
+/// legitimate prefix values before the halt, all from one
+/// `evaluate_yaml_direct_filtered` call -- so `sink.halted()` is already
+/// `Some` before the per-result loop even starts.
+#[test]
+fn test_split_exp_writes_every_result_in_a_multi_value_halt_prefix_yaml() -> Result<()> {
+    let dir = TempDir::new()?;
+    let pattern = format!(
+        "\"{}/f\" + ($index|tostring) + \".yml\"",
+        dir.path().display()
+    );
+    let (stdout, stderr, code) =
+        run_yq_split("range(3), halt", "x: 1\n", &["--split-exp", &pattern])?;
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout, "");
+
+    for (i, expected) in ["0", "1", "2"].into_iter().enumerate() {
+        let content = std::fs::read_to_string(dir.path().join(format!("f{i}.yml")))?;
+        assert_eq!(content.trim(), expected, "f{i}.yml");
+    }
+    Ok(())
+}
+
+/// JSON-branch sibling of the two tests above, through `--split-exp`'s
+/// separate `InputFormat::Json` per-document loop.
+#[test]
+fn test_split_exp_writes_every_result_in_a_multi_value_halt_prefix_json() -> Result<()> {
+    let dir = TempDir::new()?;
+    let pattern = format!(
+        "\"{}/f\" + ($index|tostring) + \".yml\"",
+        dir.path().display()
+    );
+    let (stdout, stderr, code) = run_yq_split(
+        "range(3), halt",
+        "5",
+        &["--split-exp", &pattern, "-p", "json"],
+    )?;
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout, "");
+
+    for (i, expected) in ["0", "1", "2"].into_iter().enumerate() {
+        let content = std::fs::read_to_string(dir.path().join(format!("f{i}.yml")))?;
+        assert_eq!(content.trim(), expected, "f{i}.yml");
+    }
+    Ok(())
+}
+
 /// #791 follow-up: `-R` (raw-input) without `--slurp` evaluates each line as
 /// its own string input in a loop over `input_content.lines()`; that loop
 /// needed its own `if sink.halted().is_some() { break; }` check after each
