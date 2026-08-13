@@ -6129,6 +6129,67 @@ fn test_eval_update_optional_still_swallows_ordinary_path_error() -> Result<()> 
     Ok(())
 }
 
+/// Sibling of `test_eval_assign_optional_still_swallows_ordinary_path_error`
+/// using a distinct error mechanism: an object used as a computed index
+/// (`{}`) is a type error raised while *applying* the resolved key, not
+/// while *evaluating* it (`error("x")`'s mechanism) -- both are ordinary,
+/// non-halt errors from `resolve_dynamic_indexes`, but the difference
+/// matters for patch-coverage: this shape reaches
+/// `eval_assign`'s own `Err((_, EvalEscape::Error(_))) if optional`
+/// guard, distinct from whatever internal path the `error("x")` shape takes.
+/// Verified against jq 1.7.1: `(.[({})] = 1)?` exits 0 with no output.
+#[test]
+fn test_eval_assign_optional_swallows_type_error_from_object_key() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-n", "(.[({})] = 1)?"], None)?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+/// `eval_update` sibling of the test above -- see its doc comment. Verified
+/// against jq 1.7.1: `(.[({})] |= .+1)?` exits 0 with no output.
+#[test]
+fn test_eval_update_optional_swallows_type_error_from_object_key() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-n", "(.[({})] |= .+1)?"], None)?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_eval_owned_multi_propagates_partial_halt_from_computed_key() -> Result<()> {
+    // `eval_owned_multi`'s `QueryResult::Partial(_, Control::Halt(code))`
+    // arm: the computed key (`1, halt`) produces one real output before
+    // halting, distinct from a *bare* halt with zero prefix (`.[(halt)]`,
+    // already covered) which takes the sibling `QueryResult::Halt(code)` arm
+    // right above this one. Verified against jq 1.7.1: `.[(1, halt)] = 1`
+    // on `null` exits 0 with no output.
+    let (stdout, stderr, code) = run_jq_full(&["-c", ".[(1, halt)] = 1"], Some("null"))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_resolve_node_try_catch_runs_handler_as_path_after_ordinary_error() -> Result<()> {
+    // `resolve_node`'s `Expr::Try` arm, `Some(catch_expr)` branch: when the
+    // `try` body fails with a genuine (non-halt, non-invalid-path-expression)
+    // error partway through producing its own path outputs, the `catch`
+    // handler runs as a path expression too, against the error's payload,
+    // and its resolved paths are appended after whatever the `try` body
+    // already resolved before failing. `.a` succeeds first (contributing
+    // `["a"]`), then `.x[0]` fails indexing the number `5` with a number;
+    // `catch empty` contributes nothing further. Verified against jq 1.7.1:
+    // `path(try (.a, .x[0]) catch empty)` on `{"a":1,"x":5}` is `["a"]`.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "path(try (.a, .x[0]) catch empty)"],
+        Some(r#"{"a":1,"x":5}"#),
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[\"a\"]\n");
+    Ok(())
+}
+
 #[test]
 fn test_update_path_index_arm_reports_type_error_on_non_array() -> Result<()> {
     // `update_path`'s bare `Expr::Index(idx)` arm (reached when the whole
