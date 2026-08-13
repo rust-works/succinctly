@@ -18355,12 +18355,17 @@ fn builtin_debug_msg<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // `builtin_debug`'s own no-op policy — but `msg` still has to be
     // evaluated for its control effects, even though its value is discarded:
     // a halt reached while producing it (`debug(halt_error(3))`) must halt
-    // the process exactly as it would anywhere else `msg` could sit (#791).
-    // This does not change the pre-existing no-print policy, only stops a
-    // halt from vanishing because the argument was never evaluated at all.
+    // the process exactly as it would anywhere else `msg` could sit (#791),
+    // and a plain error must propagate too — real jq defines `debug(msg)` as
+    // `(msg|debug|empty), .` with no `try`/`?`, so an error raised while
+    // producing `msg` aborts the whole expression (verified live:
+    // `debug(error("boom"))` errors out in real jq rather than passing `.`
+    // through). This does not change the pre-existing no-print policy, only
+    // stops a halt/error from vanishing because the argument was never
+    // evaluated at all.
     let owned = to_owned(&value);
-    if let Err(EvalEscape::Halt(code)) = eval_owned_multi::<S>(msg, &owned) {
-        return QueryResult::Halt(code);
+    if let Err(escape) = eval_owned_multi::<S>(msg, &owned) {
+        return QueryResult::from(escape);
     }
     QueryResult::Owned(owned)
 }

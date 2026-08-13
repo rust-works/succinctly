@@ -3242,6 +3242,25 @@ fn test_debug_msg_argument_halt_propagates() -> Result<()> {
 }
 
 #[test]
+fn test_debug_msg_argument_error_propagates() -> Result<()> {
+    // Code-review follow-up (#791): the fix above only forwarded a `Halt`
+    // out of `msg`'s evaluation, matching only the `Err(EvalEscape::Halt)`
+    // arm and silently discarding a plain `Err(EvalEscape::Error(_))` the
+    // same way it discarded a successful `Ok(_)` -- so `debug(error(...))`
+    // printed the original input and exited 0 instead of erroring. Real
+    // jq's `builtin.jq` defines `debug(msg)` as a plain pipe
+    // (`(msg|debug|empty), .`, no `try`/`?`), so an error while evaluating
+    // `msg` aborts the whole expression. Verified against jq 1.7.1:
+    // `echo 1 | jq 'debug(error("boom"))'` exits 5 with the error on
+    // stderr, never reaching stdout.
+    let (stdout, stderr, code) = run_jq_full(&["debug(error(\"boom\"))"], Some("1"))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert!(stderr.contains("boom"), "stderr: {stderr:?}");
+    Ok(())
+}
+
+#[test]
 fn test_paths_filter_halt_on_scalar_root() -> Result<()> {
     // `builtin_paths_filter` only evaluated `filter` against nodes reached
     // by non-root paths, never the root itself, so for an input with no
