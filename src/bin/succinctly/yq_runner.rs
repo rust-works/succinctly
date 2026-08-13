@@ -1493,6 +1493,49 @@ fn yaml_quote_key(s: &str) -> String {
     }
 }
 
+/// Whether a compact block-sequence item's remaining source (the text
+/// right after `- `, as returned by `Chars::as_str()` at that point) opens
+/// with a mapping key rather than a scalar value — i.e. whether an
+/// unquoted `:` appears before the line ends.
+///
+/// `colorize_yaml`'s state machine colors a token *as it's written*, one
+/// `char` at a time, with no ability to go back and re-color something it
+/// already emitted — so at the position right after `- `, it has to decide
+/// up front whether what follows is a key (color it) or a value (don't),
+/// and the only way to tell is to look ahead. Before #785, `- ` was always
+/// followed by either a scalar value or a newline (a container value's
+/// mapping always started on its own line), so this ambiguity never arose.
+/// A nested compact marker (`- - 1`) recurses naturally: the caller
+/// re-invokes this same lookahead for the *inner* `-` too, so a mapping
+/// arbitrarily many `- ` markers deep (`- - a: 1`) still finds its `:` and
+/// colors `a`, while a purely scalar nested sequence (`- - 1\n  - 2`) does
+/// not color the inner marker - real, but narrow and, like the rest of
+/// this colorizer, not oracle-matched against real yq's own (differently
+/// coded) `-C` output, so left as a known residual gap rather than chased
+/// further (#785).
+fn compact_item_opens_with_key(rest_of_line: &str) -> bool {
+    let mut quote: Option<char> = None;
+    let mut chars = rest_of_line.chars();
+    while let Some(c) = chars.next() {
+        match quote {
+            Some(q) => {
+                if c == '\\' {
+                    chars.next(); // Skip the escaped character.
+                } else if c == q {
+                    quote = None;
+                }
+            }
+            None => match c {
+                '\n' => return false,
+                '"' | '\'' => quote = Some(c),
+                ':' => return true,
+                _ => {}
+            },
+        }
+    }
+    false
+}
+
 /// Colorize YAML output (basic ANSI colors).
 fn colorize_yaml(yaml: &str) -> String {
     let mut result = String::with_capacity(yaml.len() * 2);
@@ -1501,7 +1544,8 @@ fn colorize_yaml(yaml: &str) -> String {
     let mut at_key_start = true;
     let mut in_key = false;
 
-    for c in yaml.chars() {
+    let mut chars = yaml.chars();
+    while let Some(c) = chars.next() {
         if escape_next {
             result.push(c);
             escape_next = false;
@@ -1528,7 +1572,15 @@ fn colorize_yaml(yaml: &str) -> String {
                 at_key_start = false;
             }
             ':' if !in_string => {
-                result.push_str("\x1b[0m");
+                // Only close a color span that's actually open (`in_key`)
+                // - otherwise this `:` belongs to a value that was never
+                // colored (e.g. a quoted-key's colon after the closing
+                // quote already reset color, or a `:` inside an uncolored
+                // token), and unconditionally emitting a reset here would
+                // write an orphaned `\x1b[0m` with no matching open.
+                if in_key {
+                    result.push_str("\x1b[0m");
+                }
                 result.push(c);
                 in_key = false;
                 at_key_start = false;
@@ -1542,7 +1594,12 @@ fn colorize_yaml(yaml: &str) -> String {
                 result.push_str("\x1b[33m"); // Yellow for list markers
                 result.push(c);
                 result.push_str("\x1b[0m");
-                at_key_start = false;
+                // A real-yq "compact" block-sequence item (`- key: value`,
+                // #785) puts its mapping's first key directly after `- `
+                // on the same line, instead of on a fresh line (which
+                // already re-triggers `at_key_start` via the `\n` arm
+                // above) - see `compact_item_opens_with_key`'s doc comment.
+                at_key_start = compact_item_opens_with_key(chars.as_str());
             }
             _ if at_key_start && !c.is_whitespace() && !in_string => {
                 result.push_str("\x1b[36m"); // Cyan for keys
