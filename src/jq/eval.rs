@@ -14457,85 +14457,79 @@ fn builtin_paths_filter<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 // and `select(f)` is `if f then . else empty end` -- `if` forks
                 // over every output `f` produces, so a multi-output node_filter
                 // must be checked per-output, not collapsed into one value
-                // first. `eval_owned_multi` (not `eval_owned_expr`, which
-                // collapses 2+ outputs into one always-truthy `OwnedValue::Array`
-                // before any truthiness check ever runs) preserves that
-                // cardinality, and each truthy output re-adds this path -- once
-                // per truthy output, not once per matching node. Confirmed
-                // against jq 1.7.1: `{"a":1,"b":{"c":2}} | [paths(false,false)]`
-                // is `[]` (the bug this fixes), and `[paths(true,true)]`
-                // duplicates every path, `[["a"],["a"],["b"],["b"],["b","c"],
-                // ["b","c"]]` -- not each path once (#773).
-                match eval_owned_multi::<S>(filter, &val_at_path) {
-                    Ok(outputs) => {
-                        for out in &outputs {
+                // first. Confirmed against jq 1.7.1:
+                // `{"a":1,"b":{"c":2}} | [paths(false,false)]` is `[]`, and
+                // `[paths(true,true)]` duplicates every path, `[["a"],["a"],
+                // ["b"],["b"],["b","c"],["b","c"]]` -- not each path once
+                // (#773).
+                //
+                // This calls `eval_owned_input` directly rather than the
+                // shared `eval_owned_multi` helper (used by ~19 other
+                // callers). `eval_owned_multi`'s contract collapses a
+                // `Partial` -- one or more outputs followed by an
+                // error/break/halt -- straight to `Err`, discarding the
+                // outputs already produced; that is the correct, deliberate
+                // behavior for those other callers (#694) and must not
+                // change. But `paths(node_filter)` needs different, local
+                // handling here: confirmed against jq 1.7.1 that a node's
+                // own truthy output(s) produced before an escape in the
+                // *same* node_filter fan-out are still kept, e.g.
+                // `[1,"x",2] | paths(if type=="string" then (true,
+                // error("bad")) else true end)` streams `[0]`, `[1]`, then
+                // raises (not just `[0]`) -- so the prefix is credited
+                // below before the escape is handled, instead of being
+                // dropped along with it. Once credited, the escape itself
+                // still follows the existing policy: `halt` propagates
+                // out of the whole builtin (#791, nothing may catch it),
+                // while an ordinary error/break is swallowed and the loop
+                // moves to the next node -- a pre-existing, documented
+                // divergence from real jq (which aborts the entire
+                // `paths(...)` call on an uncaught error/break) that this
+                // fix does not change.
+                match eval_owned_input::<Vec<u64>, S>(filter, &val_at_path, false) {
+                    QueryResult::Halt(code) => {
+                        return partial(filtered_paths, Control::Halt(code));
+                    }
+                    // Bare escape, nothing produced before it -- swallow and
+                    // move to the next node (pre-existing policy). Unlike
+                    // the old `eval_owned_expr`-based code this replaced,
+                    // `Break` is directly reachable here (matched on the
+                    // raw `QueryResult`, not funneled through `EvalEscape`),
+                    // but it is still swallowed rather than propagated to
+                    // an outer `label`: `val_at_path` is re-indexed into an
+                    // isolated synthetic document and evaluated on its own
+                    // (`eval_owned_input`/`eval_single`), so a `label`
+                    // lexically enclosing the original `paths(...)` call
+                    // site is not part of the AST being evaluated here --
+                    // a `break` naming it can never resolve no matter which
+                    // `QueryResult` variant carries it. Real propagation
+                    // would need `filter` resolved through `resolve_node`'s
+                    // own machinery instead (as #824 did for its sites);
+                    // tracked separately for every remaining
+                    // `eval_owned_expr`-shaped call site, `paths(node_filter)`
+                    // included, under #833 -- out of scope for this fix.
+                    QueryResult::Error(_) | QueryResult::Break(_) => {}
+                    QueryResult::Partial(vs, control) => {
+                        for out in &vs {
+                            if out.is_truthy() {
+                                filtered_paths.push(path.clone());
+                            }
+                        }
+                        if let Control::Halt(code) = control {
+                            return partial(filtered_paths, Control::Halt(code));
+                        }
+                        // Error/Break: the prefix above is already
+                        // credited; swallow the escape itself and move on
+                        // (same #833-tracked limitation as the bare-escape
+                        // arm above).
+                    }
+                    other => {
+                        for out in other.collect_owned() {
                             if out.is_truthy() {
                                 filtered_paths.push(path.clone());
                             }
                         }
                     }
-                    // Every other error here is pre-existing, silently
-                    // swallowed behavior this fix does not change (`Ok(..)`
-                    // above), but a halt must never be silently ignored
-                    // (#791): `paths(halt_error(3))` has to actually halt,
-                    // not just skip the node as if the filter were falsy.
-                    // Paths already matched before this node must still be
-                    // reported (#400/#494), matching real jq's lazy
-                    // streaming of paths(node_filter). `eval_owned_multi`
-                    // itself intercepts a mid-stream error/break exactly
-                    // like a bare one (see its doc comment) rather than
-                    // keeping the outputs already produced before it, so a
-                    // node_filter that fans out into a truthy output
-                    // followed by an ordinary error still drops the whole
-                    // node -- consistent with the pre-existing "swallow the
-                    // whole node on error" policy this fix does not change.
-                    Err(EvalEscape::Halt(code)) => {
-                        return partial(filtered_paths, Control::Halt(code));
-                    }
-                    // The `Break` half of this pattern is structurally dead
-                    // code today: `eval_owned_expr` (unlike `resolve_node`'s
-                    // own `eval_owned_multi`-based sites, which #824 fixed)
-                    // always collapses a `Control::Break` into a *synthetic*
-                    // `EvalEscape::Error("break $label not in label")`
-                    // internally before returning, so this call can never
-                    // actually produce `Err(EvalEscape::Break(_))`.
-                    //
-                    // That does NOT mean `paths(node_filter)` is safe from
-                    // #824's bug class, though — a `break` in `filter` still
-                    // reaches here, just disguised as that synthetic `Error`,
-                    // and the `Error(_)` half right below swallows it
-                    // silently (grouped with every other pre-existing,
-                    // already-accepted error-swallowing case here) instead of
-                    // unwinding to its label. Confirmed live: `label $out |
-                    // [paths(if .==2 then break $out else true end)]` on
-                    // `{"a":1,"b":{"c":2}}` prints `[["a"],["b"]]` here,
-                    // where real jq prints nothing at all (the break cancels
-                    // the whole `[...]` construction). `builtin_paths_filter`
-                    // does not resolve `filter` through `resolve_node` at
-                    // all, so it never got any part of #824's fix — this is
-                    // the same pre-existing gap #833 already tracks for
-                    // `eval_owned_expr`'s other call sites, not a regression
-                    // from this PR. Left as a plain comment rather than
-                    // `todo!()`/`unreachable!()`: the observable bug is
-                    // already live via `Error(_)` regardless of what happens
-                    // to the dead `Break(_)` sub-pattern, so a panic here
-                    // would not catch #833 landing — it would just crash a
-                    // call that already silently mishandles this case.
-                    //
-                    // FLAG FOR #833: once `eval_owned_expr` is changed to
-                    // propagate a real `Break` instead of synthesizing this
-                    // error, the `Break(_)` half of this pattern stops being
-                    // dead code and starts silently swallowing breaks
-                    // directly (same wrong observable result, new
-                    // mechanism) unless this arm is revisited then to decide
-                    // what `paths(node_filter)` should actually do with one
-                    // — most likely propagate it the way `resolve_node`'s
-                    // own arms do post-#824, not fold it into "just skip
-                    // this node." Re-confirmed independently by multiple
-                    // review passes during #824 (see PR #834's discussion)
-                    // as a real, easy-to-miss follow-on risk, not a
-                    // hypothetical one.
-                    Err(EvalEscape::Error(_) | EvalEscape::Break(_)) => {}
                 }
             }
         }

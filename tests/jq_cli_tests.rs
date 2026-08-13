@@ -7411,6 +7411,83 @@ fn test_paths_filter_mixed_truthy_falsy_keeps_path_once() -> Result<()> {
     Ok(())
 }
 
+/// #773 follow-up (review of the original fix, commit 047133e2): once
+/// `builtin_paths_filter` switched to `eval_owned_multi` to preserve
+/// fan-out cardinality, a *different* regression appeared -- a node whose
+/// `node_filter` fans out into a truthy output followed by an ordinary
+/// `error` had its truthy output silently dropped too, where the pre-fix
+/// code (via `eval_owned_expr`'s single-value collapse) happened to keep
+/// it. Confirmed against real jq 1.7.1: `[1,"x",2] | paths(if
+/// type=="string" then (true, error("bad")) else true end)` streams `[0]`
+/// then `[1]` before raising -- the truthy output preceding the error is
+/// not discarded. succinctly's own pre-existing (and intentionally
+/// jq-divergent, see `test_paths_filter_still_swallows_ordinary_per_path_error`
+/// above) policy is to swallow an ordinary per-node error and continue to
+/// the next node rather than aborting the whole `paths` call, so the
+/// expected succinctly output here also includes `[2]`.
+#[test]
+fn test_paths_filter_keeps_truthy_prefix_before_ordinary_error() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            r#"paths(if type=="string" then (true, error("bad")) else true end)"#,
+        ],
+        Some(r#"[1,"x",2]"#),
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[0]\n[1]\n[2]\n");
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
+/// Same regression as the ordinary-error test above, but for `halt_error`:
+/// a truthy output preceding a `halt` within one node's fan-out must still
+/// be reported before the whole builtin halts (halt itself must still
+/// propagate out unconditionally, #791 -- only the *dropped prefix* was
+/// the bug). Confirmed against real jq 1.7.1: `[1,"x",2] | paths(if
+/// type=="string" then (true, halt_error(3)) else true end)` streams
+/// `[0]` then `[1]` to stdout before exiting 3.
+#[test]
+fn test_paths_filter_keeps_truthy_prefix_before_halt() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            r#"paths(if type=="string" then (true, halt_error(3)) else true end)"#,
+        ],
+        Some(r#"[1,"x",2]"#),
+    )?;
+    assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[0]\n[1]\n");
+    Ok(())
+}
+
+/// Same regression again, but for `break`: a truthy output preceding a
+/// `break $label` within one node's fan-out must still be reported. Unlike
+/// real jq (whose closures resolve a label lexically enclosing the
+/// `paths(...)` call, so `break` there aborts the whole computation
+/// cleanly), succinctly's per-node filter evaluation re-indexes the value
+/// into an isolated synthetic document (`eval_owned_input`) that cannot
+/// resolve a label from the caller's outer scope -- the label lookup fails
+/// and is treated as an ordinary error (same swallow-and-continue policy
+/// as the plain-error test above), a pre-existing, unrelated limitation
+/// this fix does not change. What this test pins is narrower: the truthy
+/// prefix produced before that failed `break` must still be kept, not
+/// dropped along with it.
+#[test]
+fn test_paths_filter_keeps_truthy_prefix_before_break() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            r#"label $out | paths(if type=="string" then (true, break $out) else true end)"#,
+        ],
+        Some(r#"[1,"x",2]"#),
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[0]\n[1]\n[2]\n");
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
 /// Distinct from `test_setpath_propagates_halt_in_path_argument` above,
 /// which hits `builtin_setpath`'s bare `QueryResult::Halt` arm (the path
 /// argument halts with zero prior output): this hits the
