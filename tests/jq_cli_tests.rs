@@ -5449,10 +5449,11 @@ fn test_sub_propagates_halt_in_pattern_argument() -> Result<()> {
 }
 
 /// `builtin_sub`'s replacement-argument arm, a distinct evaluation site from
-/// the pattern arm one match block above -- the pattern must succeed first,
-/// so this exercises the second `result_to_owned(eval_single(...))` call in
-/// the same function. Verified against jq 1.7.1: `jq 'sub("a"; halt_error(23))'`
-/// on `"abc"` exits 23 with empty stdout.
+/// the pattern arm one match block above -- the pattern must find a match
+/// first, so this exercises `eval_sub_replacement`'s per-match evaluation of
+/// the replacement expression (#826: `.` is bound to that match's captures,
+/// not the original input). Verified against jq 1.7.1: `jq 'sub("a";
+/// halt_error(23))'` on `"abc"` exits 23 with empty stdout.
 #[test]
 fn test_sub_propagates_halt_in_replacement_argument() -> Result<()> {
     let (stdout, stderr, code) =
@@ -5487,9 +5488,10 @@ fn test_gsub_propagates_halt_in_pattern_argument() -> Result<()> {
     Ok(())
 }
 
-/// `builtin_gsub`'s replacement-argument arm, the second evaluation site in
-/// the function. Verified against jq 1.7.1: `jq 'gsub("a"; halt_error(25))'`
-/// on `"abc"` exits 25 with empty stdout.
+/// `builtin_gsub`'s replacement-argument arm, evaluated per match via
+/// `stitch_replacements_evaluated`/`eval_sub_replacement` (#826). Verified
+/// against jq 1.7.1: `jq 'gsub("a"; halt_error(25))'` on `"abc"` exits 25
+/// with empty stdout.
 #[test]
 fn test_gsub_propagates_halt_in_replacement_argument() -> Result<()> {
     let (stdout, stderr, code) =
@@ -5625,9 +5627,10 @@ fn test_sub_with_flags_propagates_halt_in_pattern_argument() -> Result<()> {
     Ok(())
 }
 
-/// `builtin_sub_with_flags`'s replacement-argument arm, reached once both
-/// flags and pattern resolve cleanly -- the third distinct evaluation site
-/// in this function. Verified against jq 1.7.1:
+/// `builtin_sub_with_flags`'s replacement-argument arm, reached once flags
+/// and pattern resolve cleanly and a match is found -- the replacement is
+/// evaluated per match via `eval_sub_replacement` (#826), not once up
+/// front. Verified against jq 1.7.1:
 /// `jq 'sub("a"; halt_error(33); "i")'` on `"abc"` exits 33 with empty
 /// stdout.
 #[test]
@@ -5686,7 +5689,9 @@ fn test_gsub_with_flags_propagates_halt_in_pattern_argument() -> Result<()> {
 }
 
 /// `builtin_gsub_with_flags`'s replacement-argument arm, reached once both
-/// flags and pattern resolve cleanly. Verified against jq 1.7.1:
+/// flags and pattern resolve cleanly -- the replacement is evaluated per
+/// match via `stitch_replacements_evaluated`/`eval_sub_replacement` (#826).
+/// Verified against jq 1.7.1:
 /// `jq 'gsub("a"; halt_error(36); "i")'` on `"abc"` exits 36 with empty
 /// stdout.
 #[test]

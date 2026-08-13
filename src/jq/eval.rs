@@ -6944,25 +6944,58 @@ fn stitch_split(input: &str, matches: &[regex::Captures]) -> Vec<String> {
     parts
 }
 
-/// Replace every match in `matches` (already trailing-newline-aware, e.g.
-/// from `global_captures`) within `input`, expanding `replacement`'s
-/// `$name`/`$1`-style references against each match's own captures via
-/// `Captures::expand`. Mirrors `Regex::replace_all`, but driven by a match
-/// list computed ourselves — see `stitch_split`'s doc comment for why.
+/// Evaluate `replacement_expr` for one regex match. jq's `sub`/`gsub`
+/// evaluate the replacement filter **once per match**, with `.` bound to
+/// that match's named-capture object (the same shape `capture(re)` builds
+/// via [`capture_object`]) — not the original subject the regex matched
+/// against. This is what lets a replacement like `"[\(.x)]"` reference a
+/// named capture group it just matched (#826).
 #[cfg(feature = "regex")]
-fn stitch_replacements(input: &str, matches: &[regex::Captures], replacement: &str) -> String {
+fn eval_sub_replacement<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    replacement_expr: &Expr,
+    re: &JqRegex,
+    caps: &regex::Captures,
+    optional: bool,
+) -> Result<String, QueryResult<'a, W>> {
+    let captures = capture_object(re, caps);
+    match eval_owned_expr::<S>(replacement_expr, &captures, optional) {
+        Ok(OwnedValue::String(s)) => Ok(s),
+        Ok(_) if optional => Err(QueryResult::None),
+        Ok(_) => Err(QueryResult::Error(EvalError::type_error(
+            "string",
+            "replacement",
+        ))),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Replace every match in `matches` (already trailing-newline-aware, e.g.
+/// from `global_captures`) within `input`, re-evaluating `replacement_expr`
+/// against each match's own captures (see [`eval_sub_replacement`]). Mirrors
+/// `Regex::replace_all`, but driven by a match list computed ourselves — see
+/// `stitch_split`'s doc comment for why — and by a real per-match jq
+/// evaluation rather than a static template string.
+#[cfg(feature = "regex")]
+fn stitch_replacements_evaluated<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    replacement_expr: &Expr,
+    re: &JqRegex,
+    input: &str,
+    matches: &[regex::Captures],
+    optional: bool,
+) -> Result<String, QueryResult<'a, W>> {
     let mut out = String::with_capacity(input.len());
     let mut last_end = 0;
     for caps in matches {
         let m = caps
             .get(0)
             .expect("capture group 0 is always present on a match");
+        let replacement = eval_sub_replacement::<W, S>(replacement_expr, re, caps, optional)?;
         out.push_str(&input[last_end..m.start()]);
-        caps.expand(replacement, &mut out);
+        out.push_str(&replacement);
         last_end = m.end();
     }
     out.push_str(&input[last_end..]);
-    out
+    Ok(out)
 }
 
 /// Builtin: scan(re) - find all matches
@@ -7056,6 +7089,10 @@ fn builtin_splits<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 }
 
 /// Builtin: sub(re; replacement) - replace first match
+///
+/// jq defines this as `sub($re; str; "")` — delegate to the flags-aware
+/// implementation directly rather than duplicating its (now per-match)
+/// replacement evaluation here.
 #[cfg(feature = "regex")]
 fn builtin_sub<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     re_expr: &Expr,
@@ -7063,62 +7100,14 @@ fn builtin_sub<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    // Get the pattern
-    let pattern = match result_to_owned(eval_single::<W, S>(re_expr, value.clone(), optional)) {
-        Ok(OwnedValue::String(s)) => s,
-        Ok(_) if optional => return QueryResult::None,
-        Ok(_) => return QueryResult::Error(EvalError::type_error("string", "pattern")),
-        Err(e) => return e.into(),
-    };
-
-    // Get the replacement
-    let replacement = match result_to_owned(eval_single::<W, S>(
-        replacement_expr,
-        value.clone(),
-        optional,
-    )) {
-        Ok(OwnedValue::String(s)) => s,
-        Ok(_) if optional => return QueryResult::None,
-        Ok(_) => return QueryResult::Error(EvalError::type_error("string", "replacement")),
-        Err(e) => return e.into(),
-    };
-
-    // Get the input string
-    let input = match &value {
-        StandardJson::String(s) => match s.as_str() {
-            Ok(cow) => cow.into_owned(),
-            Err(_) if optional => return QueryResult::None,
-            Err(_) => return QueryResult::Error(EvalError::new("invalid string")),
-        },
-        _ if optional => return QueryResult::None,
-        _ => return QueryResult::Error(EvalError::cannot_be_matched(&to_owned(&value))),
-    };
-
-    // Build regex
-    let re = match build_regex(&pattern, None) {
-        Ok(r) => r,
-        Err(_e) if optional => return QueryResult::None,
-        Err(e) => return e.into(),
-    };
-
-    // Replace first match
-    let result = match dv_captures_at(&re.re, &input, 0, re.needs_trailing_nl_check) {
-        Some(caps) => {
-            let m = caps
-                .get(0)
-                .expect("capture group 0 is always present on a match");
-            let mut out = String::with_capacity(input.len());
-            out.push_str(&input[..m.start()]);
-            caps.expand(replacement.as_str(), &mut out);
-            out.push_str(&input[m.end()..]);
-            out
-        }
-        None => input,
-    };
-    QueryResult::Owned(OwnedValue::String(result))
+    builtin_sub_with_flags::<W, S>(re_expr, replacement_expr, None, value, optional)
 }
 
 /// Builtin: gsub(re; replacement) - replace all matches
+///
+/// jq defines this as `sub($re; str; "g")` — delegate to the flags-aware
+/// implementation directly rather than duplicating its (now per-match)
+/// replacement evaluation here.
 #[cfg(feature = "regex")]
 fn builtin_gsub<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     re_expr: &Expr,
@@ -7126,48 +7115,7 @@ fn builtin_gsub<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    // Get the pattern
-    let pattern = match result_to_owned(eval_single::<W, S>(re_expr, value.clone(), optional)) {
-        Ok(OwnedValue::String(s)) => s,
-        Ok(_) if optional => return QueryResult::None,
-        Ok(_) => return QueryResult::Error(EvalError::type_error("string", "pattern")),
-        Err(e) => return e.into(),
-    };
-
-    // Get the replacement
-    let replacement = match result_to_owned(eval_single::<W, S>(
-        replacement_expr,
-        value.clone(),
-        optional,
-    )) {
-        Ok(OwnedValue::String(s)) => s,
-        Ok(_) if optional => return QueryResult::None,
-        Ok(_) => return QueryResult::Error(EvalError::type_error("string", "replacement")),
-        Err(e) => return e.into(),
-    };
-
-    // Get the input string
-    let input = match &value {
-        StandardJson::String(s) => match s.as_str() {
-            Ok(cow) => cow.into_owned(),
-            Err(_) if optional => return QueryResult::None,
-            Err(_) => return QueryResult::Error(EvalError::new("invalid string")),
-        },
-        _ if optional => return QueryResult::None,
-        _ => return QueryResult::Error(EvalError::cannot_be_matched(&to_owned(&value))),
-    };
-
-    // Build regex
-    let re = match build_regex(&pattern, None) {
-        Ok(r) => r,
-        Err(_e) if optional => return QueryResult::None,
-        Err(e) => return e.into(),
-    };
-
-    // Replace all matches
-    let matches = global_captures(&re, &input);
-    let result = stitch_replacements(&input, &matches, replacement.as_str());
-    QueryResult::Owned(OwnedValue::String(result))
+    builtin_gsub_with_flags::<W, S>(re_expr, replacement_expr, None, value, optional)
 }
 
 /// Builtin: test(re; flags) - test with flags expression
@@ -7364,18 +7312,6 @@ fn builtin_sub_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Err(e) => return e.into(),
     };
 
-    // Get the replacement
-    let replacement = match result_to_owned(eval_single::<W, S>(
-        replacement_expr,
-        value.clone(),
-        optional,
-    )) {
-        Ok(OwnedValue::String(s)) => s,
-        Ok(_) if optional => return QueryResult::None,
-        Ok(_) => return QueryResult::Error(EvalError::type_error("string", "replacement")),
-        Err(e) => return e.into(),
-    };
-
     // Get the input string
     let input = match &value {
         StandardJson::String(s) => match s.as_str() {
@@ -7394,34 +7330,45 @@ fn builtin_sub_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Err(e) => return e.into(),
     };
 
-    // Convert jq replacement syntax (\(.name)) to regex replacement syntax ($name)
-    let replacement = convert_jq_replacement(&replacement);
-
     // jq defines gsub(re; str; flags) as sub(re; str; flags + "g") -- a "g" flag
     // here means the same global replace gsub always performs.
     let global = flags.is_some_and(|f| f.contains('g'));
 
     if global {
         let matches = global_captures(&re, &input);
-        let result = stitch_replacements(&input, &matches, replacement.as_str());
-        return QueryResult::Owned(OwnedValue::String(result));
+        return match stitch_replacements_evaluated::<W, S>(
+            replacement_expr,
+            &re,
+            &input,
+            &matches,
+            optional,
+        ) {
+            Ok(result) => QueryResult::Owned(OwnedValue::String(result)),
+            Err(qr) => qr,
+        };
     }
 
-    // Replace first match
-    let result = match dv_captures_at(&re.re, &input, 0, re.needs_trailing_nl_check) {
+    // Replace first match. `replacement_expr` is evaluated once, only if
+    // there is a match — jq never evaluates the replacement when nothing
+    // matched (and there is no capture object to bind `.` to in that case).
+    match dv_captures_at(&re.re, &input, 0, re.needs_trailing_nl_check) {
         Some(caps) => {
             let m = caps
                 .get(0)
                 .expect("capture group 0 is always present on a match");
+            let replacement =
+                match eval_sub_replacement::<W, S>(replacement_expr, &re, &caps, optional) {
+                    Ok(s) => s,
+                    Err(qr) => return qr,
+                };
             let mut out = String::with_capacity(input.len());
             out.push_str(&input[..m.start()]);
-            caps.expand(replacement.as_str(), &mut out);
+            out.push_str(&replacement);
             out.push_str(&input[m.end()..]);
-            out
+            QueryResult::Owned(OwnedValue::String(out))
         }
-        None => input,
-    };
-    QueryResult::Owned(OwnedValue::String(result))
+        None => QueryResult::Owned(OwnedValue::String(input)),
+    }
 }
 
 /// Builtin: gsub(re; replacement; flags) - replace all matches with flags
@@ -7462,18 +7409,6 @@ fn builtin_gsub_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Err(e) => return e.into(),
     };
 
-    // Get the replacement
-    let replacement = match result_to_owned(eval_single::<W, S>(
-        replacement_expr,
-        value.clone(),
-        optional,
-    )) {
-        Ok(OwnedValue::String(s)) => s,
-        Ok(_) if optional => return QueryResult::None,
-        Ok(_) => return QueryResult::Error(EvalError::type_error("string", "replacement")),
-        Err(e) => return e.into(),
-    };
-
     // Get the input string
     let input = match &value {
         StandardJson::String(s) => match s.as_str() {
@@ -7492,13 +7427,13 @@ fn builtin_gsub_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Err(e) => return e.into(),
     };
 
-    // Convert jq replacement syntax (\(.name)) to regex replacement syntax ($name)
-    let replacement = convert_jq_replacement(&replacement);
-
-    // Replace all matches
+    // Replace all matches, re-evaluating `replacement_expr` against each
+    // match's own captures object (see `eval_sub_replacement`).
     let matches = global_captures(&re, &input);
-    let result = stitch_replacements(&input, &matches, replacement.as_str());
-    QueryResult::Owned(OwnedValue::String(result))
+    match stitch_replacements_evaluated::<W, S>(replacement_expr, &re, &input, &matches, optional) {
+        Ok(result) => QueryResult::Owned(OwnedValue::String(result)),
+        Err(qr) => qr,
+    }
 }
 
 /// Builtin: scan(re; flags) - find all matches with flags
@@ -7703,50 +7638,6 @@ fn builtin_splits_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     } else {
         QueryResult::ManyOwned(parts)
     }
-}
-
-/// Convert jq replacement syntax to regex replacement syntax
-/// jq uses \(.name) for backreferences, regex crate uses $name or ${name}
-#[cfg(feature = "regex")]
-fn convert_jq_replacement(replacement: &str) -> String {
-    // Simple conversion: \(.name) -> ${name}
-    // This is a simplified version; full jq supports arbitrary expressions
-    let mut result = String::new();
-    let mut chars = replacement.chars().peekable();
-
-    while let Some(c) = chars.next() {
-        if c == '\\' {
-            if chars.peek() == Some(&'(') {
-                chars.next(); // consume '('
-                let mut name = String::new();
-                while let Some(&nc) = chars.peek() {
-                    if nc == ')' {
-                        chars.next(); // consume ')'
-                        break;
-                    }
-                    name.push(nc);
-                    chars.next();
-                }
-                // Check if it's a simple variable reference like .name
-                if let Some(stripped) = name.strip_prefix('.') {
-                    result.push_str("${");
-                    result.push_str(stripped);
-                    result.push('}');
-                } else {
-                    // Not a simple reference, just output literally
-                    result.push_str("\\(");
-                    result.push_str(&name);
-                    result.push(')');
-                }
-            } else {
-                result.push(c);
-            }
-        } else {
-            result.push(c);
-        }
-    }
-
-    result
 }
 
 /// Evaluate a pipe (chain) of expressions.
