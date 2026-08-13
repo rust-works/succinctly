@@ -780,6 +780,79 @@ fn test_slurp_doc_filter_no_match_yields_empty_array() -> Result<()> {
     Ok(())
 }
 
+/// #835: a block-sequence item whose value is a non-empty mapping, written
+/// in the source as a totally bare `-` on its own line followed by the
+/// indented mapping (rather than the compact `- key: value` form), used to
+/// re-serialize as a lone `-` with the whole mapping silently dropped.
+///
+/// Root cause: `YamlElements::uncons_cursor` deliberately leaves a bare `-`
+/// item pointed at its sequence-item *wrapper* node rather than unwrapping
+/// it to the deferred value (`corpus_stats` needs the wrapper positionally).
+/// `is_yaml_cursor_container` and `stream_yaml_value`'s `Mapping` arm both
+/// then read `is_container()`/`first_child()` off the wrapper itself, which
+/// never carries a TY bit and has exactly one child - the mapping - so
+/// `first_child()` returned the mapping node in place of its first field,
+/// producing a mapping with a "field" whose key has no sibling and
+/// collapsing to zero rendered fields. Matches real `yq` v4.53.3, which
+/// re-serializes this into the same "compact" form #785 uses for every
+/// other non-empty container element, regardless of the source's own style.
+#[test]
+fn test_bare_dash_alone_mapping_value_not_truncated_835() -> Result<()> {
+    let (output, code) = run_yq_stdin(".", "-\n  a: 1\n  b: 2\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "- a: 1\n  b: 2\n");
+    Ok(())
+}
+
+/// #835: same bug, but for a sequence-valued (rather than mapping-valued)
+/// bare-dash item - `stream_yaml_value`'s `Sequence` arm doesn't share the
+/// `Mapping` arm's raw-field-walk optimization, so this shape wasn't
+/// actually truncated pre-fix, but it exercises the same
+/// `is_yaml_cursor_container` misclassification that picked the wrong
+/// (deferred, non-"compact") render branch. Pinned here alongside the
+/// mapping case so both container kinds stay covered together.
+#[test]
+fn test_bare_dash_alone_sequence_value_renders_compact_835() -> Result<()> {
+    let (output, code) = run_yq_stdin(".", "-\n  - x\n  - y\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "- - x\n  - y\n");
+    Ok(())
+}
+
+/// #835: the fix must not regress `-o json`, which was already correct
+/// pre-fix (`yaml_to_owned_value` resolves through `YamlCursor::value`'s own
+/// delegation rather than re-deriving `first_child()` off the wrapper).
+#[test]
+fn test_bare_dash_alone_mapping_value_json_output_835() -> Result<()> {
+    let (output, code) = run_yq_stdin(".", "-\n  a: 1\n  b: 2\n", &["-o", "json", "-I0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "[{\"a\":1,\"b\":2}]\n");
+    Ok(())
+}
+
+/// #835: a sequence mixing all three item styles - compact (`- key: value`),
+/// bare-dash-deferred, and a plain scalar - in one document, matching real
+/// `yq` v4.53.3. Guards against a fix that only special-cases a
+/// single-item sequence.
+#[test]
+fn test_bare_dash_alone_mapping_value_mixed_with_compact_and_scalar_835() -> Result<()> {
+    let (output, code) = run_yq_stdin(".", "- x: 1\n-\n  y: 2\n  z: 3\n- 5\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "- x: 1\n- y: 2\n  z: 3\n- 5\n");
+    Ok(())
+}
+
+/// #835: the `--slurp` fast path (`stream_yaml_sequence`) shares
+/// `is_yaml_cursor_container` with `stream_yaml_value`'s `Sequence` arm, so
+/// covers it independently of `stream_yaml_document`'s own entry point.
+#[test]
+fn test_bare_dash_alone_mapping_value_survives_slurp_835() -> Result<()> {
+    let (output, code) = run_yq_stdin(".", "-\n  a: 1\n  b: 2\n", &["--slurp"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "- - a: 1\n    b: 2\n");
+    Ok(())
+}
+
 /// #478: `stream_yaml_sequence`'s block-style rendering has a container vs.
 /// scalar branch per slurped item (mirroring `stream_yaml_value`'s `Sequence`
 /// arm); the tests above only slurp mapping documents, which always take the
@@ -1705,6 +1778,21 @@ fn test_yaml_merge_key_override() -> Result<()> {
     Ok(())
 }
 
+/// #835: `merge_sources`'s `<<: [...]` sequence-of-sources arm pushed the
+/// unresolved sequence-item wrapper `uncons_cursor` yields for a totally
+/// bare `-` source (rather than the mapping it defers to), so
+/// `merge_field_into`'s `source.first_child()` read the wrapper's one
+/// child - the mapping node itself - in place of its first key, silently
+/// dropping every field the bare-dash source would have contributed.
+#[test]
+fn test_yaml_merge_key_bare_dash_deferred_source_expands_712_835() -> Result<()> {
+    let input = "item:\n  <<:\n    -\n      a: 1\n      b: 2\n  c: 3\n";
+    let (output, exit_code) = run_yq_stdin(".item", input, &["-o", "json", "-I0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), r#"{"a":1,"b":2,"c":3}"#);
+    Ok(())
+}
+
 #[test]
 fn test_yaml_anchor_alias_without_merge() -> Result<()> {
     // Regular anchors/aliases (not merge keys) should work
@@ -1773,6 +1861,22 @@ fn test_yaml_assign_through_anchor_updates_multiple_aliases() -> Result<()> {
     let (output, exit_code) = run_yq_stdin(".a = 99", input, &["-o=json", "-I=0"])?;
     assert_eq!(exit_code, 0);
     assert_eq!(output.trim(), r#"{"a":99,"b":99,"c":99}"#);
+    Ok(())
+}
+
+/// #835: `walk_alias_groups` (the sync bookkeeping this whole family relies
+/// on) read `cursor.anchor()` on the unresolved sequence-item wrapper
+/// `uncons_cursor` yields for a totally bare `-` item, so an anchor written
+/// on its own deferred line was never registered - `.items[0].x = 99` wrote
+/// only the anchor's own copy and left the alias stale. Same root cause as
+/// the mapping-truncation bug this issue was originally filed for, just at
+/// a different call site.
+#[test]
+fn test_yaml_assign_through_bare_dash_deferred_anchor_updates_alias_835() -> Result<()> {
+    let input = "items:\n-\n  &base\n  x: 1\n- *base\n";
+    let (output, exit_code) = run_yq_stdin(".items[0].x = 99", input, &["-o=json", "-I=0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), r#"{"items":[{"x":99},{"x":99}]}"#);
     Ok(())
 }
 
@@ -5831,6 +5935,22 @@ fn test_anchor_builtin_empty_when_no_anchor() -> Result<()> {
     assert_eq!(code, 0);
     assert_eq!(output.trim(), "\"\"");
 
+    Ok(())
+}
+
+/// #835: the generic jq/yq evaluator navigates `.[n]`/`.[]` via
+/// `DocumentElements::uncons_cursor` (the `DocumentElements` trait impl,
+/// distinct from `YamlElements`' own inherent method of the same name,
+/// which several internal callers need to stay raw/unresolved). Before this
+/// fix that trait method hadn't been overridden to resolve a totally bare
+/// `-` sequence-item wrapper, so `anchor` on a bare-dash-deferred anchored
+/// value returned empty instead of the real name.
+#[test]
+fn test_anchor_builtin_bare_dash_deferred_anchor_835() -> Result<()> {
+    let input = "-\n  &x\n  a: 1\n";
+    let (output, code) = run_yq_stdin(".[0] | anchor", input, &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "x");
     Ok(())
 }
 

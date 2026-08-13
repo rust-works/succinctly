@@ -226,7 +226,13 @@ fn yaml_to_owned_value<W: AsRef<[u64]>>(cursor: YamlCursor<'_, W>) -> Result<Own
         YamlValue::Sequence(elements) => {
             let mut arr = Vec::new();
             let mut rest = elements;
-            while let Some((elem_cursor, next)) = rest.uncons_cursor() {
+            // `uncons_resolved_cursor`, not `uncons_cursor`: the recursive
+            // call's own `cursor.explicit_tag()` above doesn't resolve a
+            // bare `-` sequence-item wrapper itself (see
+            // `YamlCursor::anchor`'s doc comment for why), so an
+            // unresolved cursor here would silently drop an explicit tag
+            // on a bare-dash-deferred scalar (#835).
+            while let Some((elem_cursor, next)) = rest.uncons_resolved_cursor() {
                 arr.push(yaml_to_owned_value(elem_cursor)?);
                 rest = next;
             }
@@ -709,7 +715,14 @@ fn walk_alias_groups<W: AsRef<[u64]> + Clone>(
         YamlValue::Sequence(elements) => {
             let mut idx = 0i64;
             let mut rest = elements;
-            while let Some((elem_cursor, next_rest)) = rest.uncons_cursor() {
+            // `uncons_resolved_cursor`, not `uncons_cursor`: a bare `-`
+            // item's own anchor (if any) sits on the deferred value's line,
+            // not the wrapper's, and this function's own `cursor.anchor()`
+            // check above doesn't resolve through the wrapper itself (see
+            // `YamlCursor::anchor`'s doc comment) — an unresolved cursor
+            // here would silently miss the anchor and break alias-sync
+            // bookkeeping for a bare-dash-deferred anchored value (#835).
+            while let Some((elem_cursor, next_rest)) = rest.uncons_resolved_cursor() {
                 path.push(OwnedValue::Int(idx));
                 walk_alias_groups(elem_cursor, path, defs, aliases);
                 path.pop();
