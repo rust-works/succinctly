@@ -29876,19 +29876,94 @@ mod tests {
         );
     }
 
-    /// #843: `..`/bare `recurse` share jq's own recursive definition
-    /// (`def r: ., (f | r); r;`) — their first-ever output is `.` itself,
-    /// zero navigation performed — so against an untracked value they raise
-    /// the same "with result" message a bare `.` does, never descending
-    /// into children (and never raising the "near attempt" wording).
-    /// Confirmed against jq 1.7.1.
+    /// #843: `..`/bare `recurse`/`recurse(f)`/`recurse(f;cond)` all share
+    /// jq's own recursive definition (`def r: ., (f | r); r;`) — their
+    /// first-ever output is `.` itself, zero navigation performed — so
+    /// against an untracked value every spelling raises the same "with
+    /// result" message a bare `.` does, never descending into children
+    /// (and never raising the "near attempt" wording, nor even evaluating
+    /// `f`/`cond`). Confirmed against jq 1.7.1 for all four spellings.
     #[test]
     fn test_path_catch_handler_recursive_descent_raises_with_result_843() {
-        query!(br#"{"a":10}"#, r"path(try (.a, error([1,2,3])) catch ..)",
+        for filter in [
+            r"path(try (.a, error([1,2,3])) catch ..)",
+            r"path(try (.a, error([1,2,3])) catch recurse)",
+            r"path(try (.a, error([1,2,3])) catch recurse(.[0]))",
+            r"path(try (.a, error([1,2,3])) catch recurse(.[0]; true))",
+        ] {
+            query!(br#"{"a":10}"#, filter,
+                QueryResult::Partial(vs, Control::Error(e)) => {
+                    assert_eq!(prefix_json(&vs), [r#"["a"]"#], "{filter}");
+                    assert!(e.is_invalid_path_expression(), "{filter}: {}", e.message);
+                    assert_eq!(
+                        e.message, "Invalid path expression with result [1,2,3]",
+                        "{filter}"
+                    );
+                }
+            );
+        }
+    }
+
+    /// #843: a genuine navigation attempt against the untracked value still
+    /// raises correctly when it is reached through `resolve_seq`'s
+    /// dedicated static-chain fast path (`.a.b`, i.e. `Expr::Pipe([Field,
+    /// Field])` with no computed key anywhere) rather than through
+    /// `resolve_leaf`'s single-component dispatch — that fast path bypasses
+    /// `resolve_leaf` entirely (see its own doc comment), so it needs its
+    /// own check. Confirmed against jq 1.7.1: `path(try (.x, error({a:
+    /// {c:1}})) catch .a.b)` on `{"x":1}` reports "near attempt to access
+    /// element \"a\" of {\"a\":{\"c\":1}}" — the *first* component, using
+    /// the untracked root, never even computing what `.a` would resolve to.
+    #[test]
+    fn test_path_catch_handler_chained_field_access_raises_near_attempt_843() {
+        query!(br#"{"x":1}"#, r"path(try (.x, error({a:{c:1}})) catch .a.b)",
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(prefix_json(&vs), [r#"["x"]"#]);
+                assert_eq!(
+                    e.message,
+                    "Invalid path expression near attempt to access element \"a\" of {\"a\":{\"c\":1}}"
+                );
+            }
+        );
+    }
+
+    /// #843: a *dynamic* slice bound (one that doesn't constant-fold at
+    /// parse time, forcing `Expr::SliceExpr` rather than the static
+    /// `Expr::Slice` `resolve_leaf` handles) reaches
+    /// `resolve_slice_expr`'s own no-op-target special case, the sibling of
+    /// `resolve_index_expr`'s `.[.k]` handling tested above. Confirmed
+    /// against jq 1.7.1.
+    #[test]
+    fn test_path_catch_handler_dynamic_slice_raises_near_attempt_843() {
+        query!(br#"{"a":10}"#, r"path(try (.a, error([1,2,3])) catch .[(0+1):2])",
             QueryResult::Partial(vs, Control::Error(e)) => {
                 assert_eq!(prefix_json(&vs), [r#"["a"]"#]);
-                assert!(e.is_invalid_path_expression(), "{}", e.message);
-                assert_eq!(e.message, "Invalid path expression with result [1,2,3]");
+                assert_eq!(
+                    e.message,
+                    "Invalid path expression near attempt to access element {\"start\":1,... of [1,2,3]"
+                );
+            }
+        );
+    }
+
+    /// #843: `a // b` still threads `trackable` into its right-hand
+    /// fallback correctly — `empty` (the left side) produces zero outputs,
+    /// so `//` falls through to `.b`, which then raises on the untracked
+    /// value exactly as a bare `catch .b` would. (Left sides that instead
+    /// produce a *value* that isn't itself path-shaped, e.g. `false // .b`,
+    /// hit a separate, pre-existing `Expr::Alternative` gap unrelated to
+    /// #843 — confirmed live against jq 1.7.1 outside of any `catch` at
+    /// all: `path(false // .b)` is `["b"]` in real jq, but already raises
+    /// `#530` in succinctly today; filed as #845, not fixed here.)
+    #[test]
+    fn test_path_catch_handler_alternative_fallback_raises_near_attempt_843() {
+        query!(br#"{"a":10}"#, r#"path(try (.a, error({"b":1})) catch (empty // .b))"#,
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(prefix_json(&vs), [r#"["a"]"#]);
+                assert_eq!(
+                    e.message,
+                    r#"Invalid path expression near attempt to access element "b" of {"b":1}"#
+                );
             }
         );
     }
