@@ -6641,11 +6641,9 @@ fn test_truncate_stream_propagates_bare_halt_from_argument() -> Result<()> {
 /// through its new `Err(EvalEscape::Halt(code))` arm. `paths` is a real jq
 /// builtin. The root here is an array (`type == "array"`), so the root
 /// pre-check does not fire; the filter only halts once the walk reaches
-/// the string child at index 1, discarding the match already found at
-/// index 0 -- succinctly's `paths(filter)` collects all matches into a
-/// `Vec` before emitting any of them (unlike real jq's own streaming
-/// `paths`, which would print `[0]` before halting), a pre-existing,
-/// unrelated-to-#791 architectural difference.
+/// the string child at index 1 -- the match already found at index 0 must
+/// still be reported (#400/#494), matching real jq's own streaming `paths`,
+/// which prints `[0]` before halting.
 #[test]
 fn test_paths_filter_propagates_halt_from_non_root_path() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(
@@ -6656,7 +6654,7 @@ fn test_paths_filter_propagates_halt_from_non_root_path() -> Result<()> {
         Some(r#"[1,"x"]"#),
     )?;
     assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
-    assert_eq!(stdout, "");
+    assert_eq!(stdout, "[0]\n");
     Ok(())
 }
 

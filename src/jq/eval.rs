@@ -14249,8 +14249,12 @@ fn builtin_paths_filter<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     // Ok(..)` above), but a halt must never be silently
                     // ignored (#791): `paths(halt_error(3))` has to actually
                     // halt, not just skip the node as if the filter were
-                    // falsy.
-                    Err(EvalEscape::Halt(code)) => return QueryResult::Halt(code),
+                    // falsy. Paths already matched before this node must
+                    // still be reported (#400/#494), matching real jq's
+                    // lazy streaming of paths(node_filter).
+                    Err(EvalEscape::Halt(code)) => {
+                        return partial(filtered_paths, Control::Halt(code));
+                    }
                     Err(EvalEscape::Error(_)) => {}
                 }
             }
