@@ -119,6 +119,10 @@
 # tests against the pinned jq oracle surfaced four distinct bugs rather than
 # mere gaps. Each below is filed as its own issue with the verified
 # jq-vs-succinctly repro already in the issue body.
+#
+# regex_sub_g_global_replace (#728) has since been fixed and dropped, leaving 1:
+# sub(re; replacement; "g") now dispatches to the same global_captures/
+# stitch_replacements path gsub already used, instead of ignoring the "g" flag.
 regex_test_z_unknown_flag      regex-flags   unknown flag characters are silently accepted, not rejected — #730
 
 # Seeded by #716's date/time oracle-coverage sweep: the builtins had unit
@@ -143,3 +147,10 @@ regex_test_z_unknown_flag      regex-flags   unknown flag characters are silentl
 strftime_raw_number_input          datetime   strftime requires an array; real jq accepts a raw timestamp number too — #759
 date_roundtrip_leap_year_torture   datetime   same root cause as strftime_raw_number_input — #759
 strftime_unsupported_specifiers    datetime   %U/%V/%W/%G/%g are not implemented — #760
+
+# Found while broadening #728's golden coverage to a "g" + capture-group case:
+# sub()/gsub()'s replacement expression is evaluated once against the
+# original input, not per-match with `.` bound to that match's captures, so
+# any `\(.name)` interpolation referencing a named capture fails outright.
+# Not specific to "g" or to #728 — reproduces on plain sub/gsub too.
+regex_sub_g_capture_group   regex-flags   \(.name) capture-group interpolation in sub/gsub's replacement errors instead of binding to the match — #826
