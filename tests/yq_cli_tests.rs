@@ -7923,6 +7923,45 @@ fn test_split_exp_json_halt_with_no_output_breaks_via_outer_check() -> Result<()
     Ok(())
 }
 
+/// Null-input sibling of `test_split_exp_own_halt_returns_early_and_stops_further_results`
+/// (which drives the equivalent file/YAML branch via `.[]`): with `-n`, the
+/// *main* filter (`1, 2, 3`) never halts on its own, so `halted_before_batch`
+/// is `false` for the whole batch -- the halt introduced by index 1's own
+/// split-filename expression must still be recognized as *new* and break the
+/// per-result loop immediately, leaving index 2 unprocessed. Distinguishes
+/// this guarded `if !halted_before_batch && sink.halted().is_some() { break;
+/// }` from the unconditional form it replaced, which broke here too but for
+/// the wrong reason.
+#[test]
+fn test_split_exp_own_halt_in_null_input_stops_further_results() -> Result<()> {
+    let dir = TempDir::new()?;
+    let pattern = format!(
+        "if $index == 1 then halt else \"{}/f\" + ($index|tostring) + \".yml\" end",
+        dir.path().display()
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .arg("yq")
+        .args(["-n", "--split-exp", &pattern])
+        .arg("1, 2, 3")
+        .stdin(Stdio::null())
+        .output()?;
+    assert!(output.status.success());
+
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("f0.yml"))?.trim(),
+        "1"
+    );
+    assert!(
+        !dir.path().join("f1.yml").exists(),
+        "index 1's own split-exp halt must return early without writing a file"
+    );
+    assert!(
+        !dir.path().join("f2.yml").exists(),
+        "index 2 must never be reached once index 1's split expression halted"
+    );
+    Ok(())
+}
+
 /// Code-review follow-up (#791): distinct from
 /// `test_split_exp_writes_prefix_produced_before_main_expression_halts`,
 /// which uses a *single*-element pre-halt prefix (`1, halt`) and so cannot
