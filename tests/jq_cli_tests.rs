@@ -5670,15 +5670,42 @@ fn test_sub_replacement_wrong_type_errors() -> Result<()> {
     Ok(())
 }
 
-/// `eval_sub_replacement`'s optional (`?`) type-mismatch arm (#826) --
-/// the same non-string replacement as above, but wrapped in `try`/`?`, so it
-/// is swallowed instead of raised. Verified against jq 1.7.1:
-/// `jq 'sub("a"; 5)?'` on `"abc"` exits 0 with empty stdout.
+/// Black-box counterpart to the test above: `sub("a"; 5)?` swallows the same
+/// non-string replacement instead of raising it. Note this exercises
+/// `eval_sub_replacement` with `optional: false` (`E?`'s `Expr::Optional`
+/// dispatch evaluates `E` with the *ambient* optional and lets its own
+/// `eval_try` catch the aggregate error -- see that arm's doc comment,
+/// `Expr::Optional(inner) => eval_try::<W, S>(inner, None, value,
+/// optional)`), so it hits the same non-optional error arm as the test above
+/// internally; `test_sub_replacement_wrong_type_optional_via_isvalid` below
+/// is what actually drives `eval_sub_replacement`'s own `optional: true`
+/// arm. Verified against jq 1.7.1: `jq 'sub("a"; 5)?'` on `"abc"` exits 0
+/// with empty stdout.
 #[test]
 fn test_sub_replacement_wrong_type_optional_is_silent() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(&["-c", r#"sub("a"; 5)?"#], Some(r#""abc""#))?;
     assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
     assert_eq!(stdout, "");
+    Ok(())
+}
+
+/// `eval_sub_replacement`'s `optional: true` type-mismatch arm (#826),
+/// reached via `isvalid`, which -- unlike a bare `?` postfix (see the test
+/// above) -- forces `optional: true` all the way down into the expression it
+/// validates (already exploited by `test_isvalid_propagates_halt_from_error_message_expression`
+/// for the same reason). `isvalid` is a succinctly/jq-1.8+ builtin absent
+/// from the pinned jq-1.7.1 oracle, so this is a self-contained assertion
+/// rather than a golden fixture; the type mismatch makes `sub` invalid
+/// either way, so `isvalid` reports `false` regardless of which arm
+/// internally handles it -- this test's value is in exercising the
+/// `optional: true` code path itself, not in a distinguishable outward
+/// symptom.
+#[test]
+fn test_sub_replacement_wrong_type_optional_via_isvalid() -> Result<()> {
+    let (stdout, _stderr, code) =
+        run_jq_full(&["-c", r#"isvalid(sub("a"; 5))"#], Some(r#""abc""#))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "false\n");
     Ok(())
 }
 
