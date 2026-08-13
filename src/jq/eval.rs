@@ -9288,6 +9288,47 @@ fn needs_path_prepass(expr: &Expr) -> bool {
     }
 }
 
+/// Like [`needs_path_prepass`], but also treats a bare `Iterate` (or
+/// `Optional(Iterate)`) as needing `resolve_seq`'s per-element fan-out loop.
+///
+/// `needs_path_prepass` says `Iterate` doesn't need `resolve_node`'s help
+/// because `walk_path` and friends already understand it natively -- true,
+/// and exactly why `resolve_dynamic_indexes`'s outer guard (using
+/// `needs_path_prepass` unmodified) can skip `resolve_node` entirely for a
+/// plain `.foo[]` with no computed key anywhere, keeping `del`/`path`/`=`/
+/// `|=` on their fast native-walker path for that overwhelmingly common
+/// shape -- an earlier version of this fix flipped `needs_path_prepass`
+/// itself, which also routed *that* shared fast path through the
+/// multi-branch resolver, turning `del(.foo[])`/`path(.foo[])` on a large
+/// container into O(n^2)-or-worse (measured ~250-1500x slower in review).
+///
+/// This function instead answers a narrower question, asked only once
+/// `resolve_seq` has *already* been reached (a real computed key elsewhere
+/// in the pipe, or -- unconditionally -- `resolve_recurse` resolving `f`):
+/// can its "nothing left needs resolving" fast path assume the remaining
+/// tail is single-valued? For `Iterate` the answer is no --
+/// `value_after_components` silently collapses any component producing != 1
+/// output to `Null`, which `resolve_recurse` treats as "no children" and
+/// prunes, silently dropping every result whenever a trailing
+/// `.foo[]`/`.foo[]?` reaches a 2+-element container (#682). Fanning it out
+/// through the same loop already used for a genuine computed key fixes that,
+/// without touching `resolve_dynamic_indexes`'s much more common
+/// no-computed-key fast path.
+///
+/// No `Expr::Pipe` arm: this function's only caller (`resolve_seq`) always
+/// calls it on `flat`'s already-`push_path_components`-flattened elements,
+/// which by construction never contains a raw `Pipe` -- so unlike
+/// `needs_path_prepass`, which is also called on whole (possibly
+/// un-flattened) expressions elsewhere, adding one here would be untested
+/// dead code.
+fn needs_fanout_pass(expr: &Expr) -> bool {
+    match expr {
+        Expr::Iterate => true,
+        Expr::Optional(inner) | Expr::Paren(inner) => needs_fanout_pass(inner),
+        other => needs_path_prepass(other),
+    }
+}
+
 /// Append `expr` to a path component list, splicing nested pipes and dropping
 /// `Identity`.
 ///
@@ -10368,6 +10409,20 @@ fn value_after_components<S: EvalSemantics>(
     let mut current = value.clone();
     for component in components {
         let mut values = eval_owned_multi::<S>(component, &current)?;
+        // Every caller hands this a tail already proven single-valued by
+        // construction (`resolve_seq`, gated on `needs_fanout_pass`) -- a
+        // `> 1` output count here is a genuine invariant violation, not the
+        // ordinary "component matched nothing" case handled below (a
+        // missing key still yields exactly one output, `null`). #682 was
+        // exactly this: `Expr::Iterate` produced more than one output
+        // through this function, which silently discarded every branch but
+        // one instead of the fan-out its caller actually needed.
+        debug_assert!(
+            values.len() <= 1,
+            "value_after_components: {component:?} produced {} outputs, but every \
+             caller requires a single-valued tail (see needs_fanout_pass)",
+            values.len()
+        );
         match values.len() {
             1 => current = values.pop().expect("len checked"),
             _ => return Ok(OwnedValue::Null),
@@ -10391,12 +10446,17 @@ fn resolve_seq<'a, S: EvalSemantics>(
         push_path_components(&mut flat, e);
     }
 
-    // Everything after the last computed key or Comma keeps its components
-    // verbatim — resolving them would expand `.[]` into one path per element
-    // for no gain. The *value* still has to be threaded through them, because
+    // Everything after the last computed key, Comma, or bare iterate keeps
+    // its components verbatim for a *pure* Identity/Field/Index/Slice tail —
+    // resolving those would expand nothing (each is already single-valued),
+    // so there's no gain. A bare `.foo[]`/`.foo[]?` is different: it isn't
+    // single-valued, so `needs_fanout_pass` (unlike `needs_path_prepass`)
+    // still routes it through the fan-out loop below rather than
+    // `value_after_components`'s single-value assumption (#682). The
+    // *value* still has to be threaded through a purely static tail, because
     // an enclosing `IndexExpr` indexes it: in `.a[.k].b[.j]`, `.j` applies to
     // `.a[.k].b`.
-    let Some(last_dynamic) = flat.iter().rposition(needs_path_prepass) else {
+    let Some(last_dynamic) = flat.iter().rposition(needs_fanout_pass) else {
         let end = value_after_components::<S>(&flat, value).map_err(|e| (Vec::new(), e))?;
         return Ok(vec![(flat, Cow::Owned(end))]);
     };
