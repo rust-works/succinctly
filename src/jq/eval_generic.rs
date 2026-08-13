@@ -3690,6 +3690,62 @@ mod tests {
         );
     }
 
+    /// `GenericResult::produces_output()`'s exhaustive match (added after
+    /// #791's `Halt` variant was once missed by a hand-maintained exclusion
+    /// list, see the method's own doc comment): four of its `true` arms —
+    /// `One`, `LazyIndexRange`, `LazySeq`, `Owned` — needed direct coverage
+    /// distinct from the `OneCursor`/`LazyKeys`/`Error`/`Partial` siblings
+    /// they share a source line with, which other tests already reach.
+    #[test]
+    fn test_produces_output_covers_one_lazy_index_range_lazyseq_owned() {
+        let json = br"[1, 2, 3]";
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+
+        let one = eval(&Expr::Identity, cursor.value());
+        assert!(matches!(one, GenericResult::One(_)));
+        assert!(one.produces_output());
+
+        let lazy_index_range = eval(&Expr::Builtin(Builtin::KeysUnsorted), cursor.value());
+        assert!(matches!(lazy_index_range, GenericResult::LazyIndexRange(3)));
+        assert!(lazy_index_range.produces_output());
+
+        let map_expr = parse("map(. + 1)").unwrap();
+        let lazy_seq = eval(&map_expr, cursor.value());
+        assert!(matches!(lazy_seq, GenericResult::LazySeq(_)));
+        assert!(lazy_seq.produces_output());
+
+        let owned_expr = parse(".[0] + 1").unwrap();
+        let owned = eval(&owned_expr, cursor.value());
+        assert!(matches!(owned, GenericResult::Owned(_)));
+        assert!(owned.produces_output());
+
+        // `Self::Many(vs) => !vs.is_empty()` -- its own line, not part of the
+        // `true`-arm OR-pattern above. `select`'s `pass_n` closure
+        // constructs a bare (cursor-less) `GenericResult::Many` when its
+        // condition yields more than one truthy output and `eval()`'s
+        // top-level entry point always calls in with `cursor: None`.
+        let select_expr = parse("select(true, true)").unwrap();
+        let many = eval(&select_expr, cursor.value());
+        assert!(matches!(many, GenericResult::Many(ref vs) if vs.len() == 2));
+        assert!(many.produces_output());
+    }
+
+    /// `GenericResult::collect_owned()`'s `Self::Halt(_) => vec![]` arm: a
+    /// bare halt collects as no outputs, the same as `Break`/`Error` right
+    /// above it, rather than being folded in as a value.
+    #[test]
+    fn test_collect_owned_treats_halt_as_no_output() {
+        let json = br"[1, 2, 3]";
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+
+        let halt_expr = parse("halt_error(9)").unwrap();
+        let halted = eval(&halt_expr, cursor.value());
+        assert!(matches!(halted, GenericResult::Halt(9)));
+        assert_eq!(halted.collect_owned(), Vec::<OwnedValue>::new());
+    }
+
     /// `eval_index_expr`'s `keys` match (#694): a `Partial`'s trailing
     /// control was silently dropped there, keeping only its prefix instead
     /// of propagating the error. Confirmed against real jq 1.7.1:
