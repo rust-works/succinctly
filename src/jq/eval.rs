@@ -30418,6 +30418,30 @@ mod tests {
         );
     }
 
+    /// #843 review: `resolve_index_expr`/`resolve_slice_expr`'s post-target
+    /// `getpath`-laundering check (added above) only has something to
+    /// reject when `target` actually resolved to at least one branch —
+    /// when `target` itself legitimately produces *no* output at all
+    /// (`select(false)`, filtering everything), there is nothing to index
+    /// into and nothing to raise on either, the same as it would be for a
+    /// perfectly ordinary trackable value. Confirmed live against jq
+    /// 1.7.1: both `path(try (.a, error({y:99})) catch
+    /// (select(false)[.k]))` and the slice sibling print only `["a"]`, no
+    /// error, no extra output.
+    #[test]
+    fn test_path_catch_handler_index_slice_expr_target_produces_no_branches_843() {
+        for filter in [
+            r#"path(try (.a, error({"y":99})) catch (select(false)[.k]))"#,
+            r#"path(try (.a, error({"y":99})) catch (select(false)[(0+1):2]))"#,
+        ] {
+            assert_eq!(
+                outputs(br#"{"a":10}"#, filter),
+                vec![r#"["a"]"#],
+                "{filter}"
+            );
+        }
+    }
+
     /// #843 review: a *bare* `getpath(...)` call, used as the entire catch
     /// handler with nothing further navigating its result, is exactly the
     /// no-further-navigation case `#530`'s classic "with result" message
