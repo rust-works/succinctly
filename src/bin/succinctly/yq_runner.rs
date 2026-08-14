@@ -1295,7 +1295,21 @@ fn output_value<W: Write>(
     // For YAML output format (default)
     if config.output_format == OutputFormat::Yaml {
         // For YAML, scalars are printed without quotes by default (like -r in yq)
-        let body = emit_yaml_value(value, comments, config, "", false);
+        // A bare top-level result drops all of its own styling (#852,
+        // mirroring `YamlCursor::stream_yaml_as_document`'s and
+        // `OwnedValue::stream_yaml`'s identical root-only special case for
+        // the cursor/streaming paths) - `output_value` is the actual top
+        // level for every result that reaches it (its own recursion never
+        // calls back into `output_value`, only `emit_yaml_value`), so this
+        // covers every caller uniformly: the main eval path, `-n`,
+        // `--raw-input`, `--split-exp`, ... Redundant with (but harmless
+        // alongside) `evaluate_yaml_cursor`'s equivalent root-scalar pass
+        // for the cursor-based DOM path specifically.
+        let body = if let OwnedValue::String(s) = value {
+            s.clone()
+        } else {
+            emit_yaml_value(value, comments, config, "", false)
+        };
         // Every non-root node's own trailing comment is appended by its
         // *parent* during `emit_yaml_value`'s recursion (see its Array/Object
         // arms), but the root has no parent call site to do that for it —

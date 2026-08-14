@@ -127,6 +127,19 @@ impl StreamableValue for OwnedValue {
         indent: IndentSpec,
         sort_keys: bool,
     ) -> core::fmt::Result {
+        // A bare top-level/computed scalar result drops all of its own
+        // styling (quotes) - issue #852, mirroring
+        // `YamlCursor::stream_yaml_as_document`'s identical root-only
+        // special case for the cursor path (`src/yaml/light.rs`).
+        // `stream_owned_value_yaml` below is also the *recursive*
+        // per-node renderer this same function calls for every nested
+        // value, so this has to intercept only here, at the actual
+        // top-level entry point - bypassing it inside
+        // `stream_owned_value_yaml` itself would drop quoting from every
+        // nested string field too, not just the root.
+        if let Self::String(s) = self {
+            return out.write_str(s);
+        }
         stream_owned_value_yaml(self, out, "", indent.width, indent.unit, sort_keys)
     }
 

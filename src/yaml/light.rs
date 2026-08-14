@@ -1321,10 +1321,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
         self_.write_leading_anchor(out)?;
         let value = self_.value();
         if let YamlValue::String(s) = &value {
-            match s.as_str() {
-                Ok(decoded) => out.write_str(&decoded)?,
-                Err(_) => out.write_str("\"\"")?,
-            }
+            out.write_str(&s.as_str().unwrap_or(Cow::Borrowed("\"\"")))?;
         } else {
             self_.stream_yaml_value(out, "", indent.width, indent.unit, sort_keys, false)?;
         }
