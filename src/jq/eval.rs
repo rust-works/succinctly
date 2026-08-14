@@ -18785,6 +18785,17 @@ fn builtin_delpaths<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // array" (#791).
         QueryResult::Halt(code) => return QueryResult::Halt(code),
         QueryResult::Partial(_, Control::Halt(code)) => return QueryResult::Halt(code),
+        // Same reasoning for a bare, unresolved `break` (#867 follow-up):
+        // must keep unwinding, not be misreported as the same array-type
+        // error. Deliberately asymmetric with `Halt` above, though:
+        // `Partial(_, Control::Break(_))` (paths_expr already produced a
+        // value before breaking) stays on the wildcard arm below, since
+        // real jq only ever demands paths_expr's *first* output here and
+        // never reaches a later comma branch at all — confirmed via oracle,
+        // `delpaths(1, break $out)` in real jq 1.7.1 raises the same "Paths
+        // must be specified as an array" error this wildcard already
+        // produces, it never even reaches the break.
+        QueryResult::Break(label) => return QueryResult::Break(label),
         _ => return QueryResult::Error(EvalError::paths_must_be_array()),
     };
 
