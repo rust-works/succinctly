@@ -14985,13 +14985,22 @@ fn builtin_paths_filter<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // later filtered out of the result (`length > 0`); confirmed live:
     // `1 | [paths(error("x"))]` raises in real jq, though a scalar has no
     // non-root paths at all. The loop below only visits non-root paths, so
-    // without this, `paths(halt_error(3))` on a scalar/null/empty container
-    // never runs `filter` at all. Only the halt case is fixed here, matching
-    // the existing per-path "every other error is pre-existing, silently
-    // swallowed behavior this fix does not change" policy below, applied
-    // consistently to the root (#791).
-    if let Err(EvalEscape::Halt(code)) = eval_owned_expr::<S>(filter, &owned, optional) {
-        return QueryResult::Halt(code);
+    // without this, `paths(node_filter)` on a scalar/null/empty container
+    // never runs `filter` at all -- and (#850) even on a non-empty root, an
+    // error/break on the root itself must abort before any non-root path is
+    // produced, not just be missed. Nothing has been credited to
+    // `filtered_paths` yet at this point, so any escape here is a bare
+    // `Error`/`Break`/`Halt`, never a `Partial`. Uses `eval_owned_expr_ctrl`
+    // rather than its `eval_owned_expr` twin specifically for the `break`
+    // case: the latter collapses `Control::Break` into a synthetic "not in
+    // label" `EvalError` (see #833), which would make `label $out |
+    // [paths(break $out)]` on a scalar report a bogus error instead of
+    // unwinding to `$out`. Confirmed against jq 1.7.1: `{"a":1} |
+    // paths(if type=="object" then error("x") else true end)` raises
+    // immediately with no output (not `["a"]`), and `label $out |
+    // [paths(break $out)]` on `1` produces no output and exits 0.
+    if let Err(control) = eval_owned_expr_ctrl::<S>(filter, &owned, optional) {
+        return partial(Vec::new(), control);
     }
 
     let mut all_paths = Vec::new();
