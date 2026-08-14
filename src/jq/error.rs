@@ -523,6 +523,84 @@ impl EvalError {
 
     const INVALID_PATH_EXPRESSION_PREFIX: &'static str = "Invalid path expression with result ";
 
+    /// `Invalid path expression near attempt to access element <k> of <v>`
+    /// (#843).
+    ///
+    /// Raised by `path()` when a genuine navigation step (a field, a
+    /// literal/computed index, or a slice) is attempted against a value that
+    /// was not itself reached by real navigation from the expression's
+    /// original input — today, only the payload `catch` binds to `.` inside
+    /// its handler (`resolve_catch` in `eval.rs`). Unlike
+    /// [`Self::invalid_path_expression`] above (`?`/`try` never suppress
+    /// it), this is mostly an *ordinary*, catchable error — confirmed live
+    /// against jq 1.7.1: `path(try (.a, error({b:1})) catch (.b)?)` prints
+    /// only `["a"]`, no error, and a *nested*
+    /// `try (.a, error({b:1})) catch (try .b catch "caught")` actually runs
+    /// `"caught"`. The one exception is a *bare* postfix `?` directly on the
+    /// plain field/index/iterate/slice access that raised it (`.b?`, not
+    /// `(.b)?`) — jq does not suppress it there either (confirmed live:
+    /// `path(try (.a, error(5)) catch .b?)` still raises), which is what
+    /// [`Self::is_untracked_navigation_error`] exists for. So this
+    /// constructor deliberately does *not* participate in
+    /// [`Self::is_invalid_path_expression`] — only in that narrower,
+    /// position-sensitive check.
+    pub fn invalid_path_expression_near_access(
+        element: &OwnedValue,
+        container: &OwnedValue,
+    ) -> Self {
+        Self::new(format!(
+            "{}{} of {}",
+            Self::UNTRACKED_NAVIGATION_ACCESS_PREFIX,
+            dump_truncated(element),
+            dump_truncated(container)
+        ))
+    }
+
+    const UNTRACKED_NAVIGATION_ACCESS_PREFIX: &'static str =
+        "Invalid path expression near attempt to access element ";
+
+    /// `Invalid path expression near attempt to iterate through <v>` (#843).
+    ///
+    /// The `.[]`/`Expr::Iterate` sibling of
+    /// [`Self::invalid_path_expression_near_access`] — same trigger (a
+    /// genuine navigation attempt against an untracked value), same
+    /// mostly-catchable status (see that constructor's doc comment for the
+    /// bare-`?` exception both share), just jq's distinct wording for
+    /// iteration rather than a keyed access (confirmed live:
+    /// `path(try (.a, error(5)) catch .[])` on a caught scalar `5` reports
+    /// "near attempt to iterate through 5", never "Cannot iterate over
+    /// number").
+    pub fn invalid_path_expression_near_iterate(container: &OwnedValue) -> Self {
+        Self::new(format!(
+            "{}{}",
+            Self::UNTRACKED_NAVIGATION_ITERATE_PREFIX,
+            dump_truncated(container)
+        ))
+    }
+
+    const UNTRACKED_NAVIGATION_ITERATE_PREFIX: &'static str =
+        "Invalid path expression near attempt to iterate through ";
+
+    /// Whether this is one of [`Self::invalid_path_expression_near_access`]/
+    /// [`Self::invalid_path_expression_near_iterate`] (#843) — an untracked
+    /// navigation attempt inside a `catch` handler. Unlike
+    /// [`Self::is_invalid_path_expression`], this error *is* ordinarily
+    /// suppressed by `?`/bare `try` — except in one narrow position, a bare
+    /// postfix `?` directly wrapping the plain `Field`/`Index`/`Iterate`/
+    /// `Slice` access that raised it, which is exactly why this needs its
+    /// own predicate rather than reusing `is_invalid_path_expression`'s
+    /// blanket "never suppressed" rule: `resolve_node`'s `Expr::Optional`
+    /// arm consults this, but only for that one bare-primitive shape, to
+    /// decide *not* to prune it there — see that arm's doc comment for the
+    /// jq-1.7.1-confirmed `.b?` vs `(.b)?` distinction this exists for.
+    pub fn is_untracked_navigation_error(&self) -> bool {
+        self.message
+            .starts_with(Self::UNTRACKED_NAVIGATION_ACCESS_PREFIX)
+            || self
+                .message
+                .starts_with(Self::UNTRACKED_NAVIGATION_ITERATE_PREFIX)
+    }
+
     /// Whether this is an [`Self::invalid_path_expression`] — a statement
     /// that the *filter* is not a path expression, not a runtime value
     /// error. `?` only suppresses failures raised while collecting a path
