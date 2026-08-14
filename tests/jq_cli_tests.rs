@@ -7282,6 +7282,50 @@ fn test_resolve_recurse_cond_still_gates_null_child_emission() -> Result<()> {
     Ok(())
 }
 
+/// Review-driven regression guard for the fix above: bounding recursion
+/// *into* a null node must not also skip *evaluating* `f` on it -- real
+/// jq's `recurse` always applies `f` to every node it visits, root
+/// included, so an `f` that errors on a null node (e.g. `.[]`, "Cannot
+/// iterate over null") must still abort the whole call, exactly like an
+/// `f` error on any other node. An earlier version of this fix skipped
+/// `resolve_against_cow` entirely whenever the popped node was null,
+/// silently swallowing that error instead of propagating it -- for the
+/// DFS-seed (root) value specifically, since a null root is seeded
+/// directly onto the stack without going through the per-child collection
+/// loop at all. Verified against jq 1.7.1: `null | path(recurse(.[]))`
+/// raises "Cannot iterate over null (null)" and exits 5, printing `[]`
+/// (the root's own path) first.
+#[test]
+fn test_resolve_recurse_null_root_still_evaluates_f_and_propagates_its_error() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-n", "null | path(recurse(.[]))"], None)?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[]\n");
+    assert_eq!(
+        stderr,
+        "jq: error (at <unknown>): Cannot iterate over null (null)\n"
+    );
+    Ok(())
+}
+
+/// Same regression guard as above, but for a null *child* rather than the
+/// root: `f` must still be evaluated on a null child that was correctly
+/// queued and emitted (per the fix's primary #856 repro), not just on a
+/// null root. Verified against jq 1.7.1: `{"a":null} |
+/// path(recurse(.[]))` streams `[]` then `["a"]` before raising "Cannot
+/// iterate over null (null)" and exiting 5 -- the error surfaces only
+/// once the traversal actually reaches the null child, not before.
+#[test]
+fn test_resolve_recurse_null_child_still_evaluates_f_and_propagates_its_error() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-c", "path(recurse(.[]))"], Some(r#"{"a":null}"#))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[]\n[\"a\"]\n");
+    assert_eq!(
+        stderr,
+        "jq: error (at <stdin>:0): Cannot iterate over null (null)\n"
+    );
+    Ok(())
+}
+
 #[test]
 fn test_recurse_f_keeps_own_partial_fanout_subtree_before_error_842() -> Result<()> {
     // A deeper #842 repro: the successfully-produced child (`.child`)

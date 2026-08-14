@@ -10630,24 +10630,7 @@ fn resolve_recurse<'a, S: EvalSemantics>(
         // still `O(path length)` per node, `O(d²)` total; #701, unfixed here.
         outputs.push((prefix.clone(), current.clone()));
 
-        // A null node ends its own line of descent here, unlike the value
-        // evaluator since #490 -- but (#856) it's still emitted above like
-        // every other popped node first; only the *recursion into it* is
-        // skipped, bounding path-prefix growth against a non-terminating
-        // `f` without dropping the null child's own path the way an early
-        // `continue` before crediting it would. Gating here (once popped,
-        // in its correct DFS position) rather than at collection time keeps
-        // sibling ordering correct: a null child collected alongside a
-        // non-null sibling must still wait for its turn on `stack`, so it
-        // can't jump ahead of an earlier sibling's own subtree. Confirmed
-        // against jq 1.7.1: `{"a":null,"b":{"x":1}} | path(recurse(if
-        // (.==null) then empty elif type=="object" then .[] else empty
-        // end))` streams `[]`, `["a"]`, `["b"]`, `["b","x"]` in that order
-        // -- the null leaf between the root and `b`'s own subtree, not
-        // after it.
-        if matches!(current.as_ref(), OwnedValue::Null) {
-            continue;
-        }
+        let is_null_current = matches!(current.as_ref(), OwnedValue::Null);
 
         // An `f` error aborts the whole traversal — see the doc comment
         // above (#636) — but only after whatever candidate children
@@ -10661,6 +10644,13 @@ fn resolve_recurse<'a, S: EvalSemantics>(
         // above already guarantees it's `true` on entry, so this is just
         // avoiding a second, separately-maintained "always trackable here"
         // claim inside the loop.
+        //
+        // `f` is evaluated here unconditionally, even when `current` is
+        // null: real jq applies `f` to every node `recurse` visits (see
+        // the doc comment above), so an `f` that errors on null (e.g.
+        // `.[]`) must still abort the whole call like any other `f` error
+        // -- only the *children* `f` produces from a null node are
+        // discarded below, not the call itself (#856 review).
         let (children, deferred_error) = match resolve_against_cow::<S>(f, current, trackable) {
             Ok(children) => (children, None),
             Err((partial_children, e)) => (partial_children, Some(e)),
@@ -10671,33 +10661,44 @@ fn resolve_recurse<'a, S: EvalSemantics>(
         // one popped, and its whole subtree completes before the second
         // entry is even reached.
         let mut next: Vec<PathBranch<'a>> = Vec::new();
-        for (child_components, child_value) in children {
-            // A null child is queued onto `next`/`stack` like any other --
-            // the null-recursion bound is enforced once popped, above, not
-            // here (#856), so it still gets its own turn through `cond`
-            // (if present) and its correct place in DFS order.
-            let mut path = prefix.clone();
-            path.extend(child_components);
+        // A null node's own line of descent ends here (see the doc comment
+        // above for why): the children `f` just produced from it are
+        // discarded rather than queued for further recursion, bounding
+        // path-prefix growth instead of relying on natural termination the
+        // way the value evaluator does. Its own path was already credited
+        // by the unconditional `outputs.push` above (#856); only recursion
+        // *into* it is skipped. Gating here -- once popped, in its correct
+        // DFS position -- rather than when the *caller* collected it as a
+        // child keeps sibling order correct: a null child queued alongside
+        // a non-null sibling still waits its own turn on `stack`, so it
+        // can't jump ahead of an earlier sibling's own subtree (confirmed
+        // against jq 1.7.1 with two siblings, one null and one with its
+        // own descendants).
+        if !is_null_current {
+            for (child_components, child_value) in children {
+                let mut path = prefix.clone();
+                path.extend(child_components);
 
-            match cond {
-                None => next.push((path, child_value)),
-                Some(cond) => {
-                    // `cond` gates the child, not `current`, and forks once
-                    // per truthy output — see the doc comment above (#627).
-                    // A `cond` error aborts immediately too (#636), same as
-                    // `f`'s error above — this arm's own prefix-loss
-                    // (`next`'s already-cond-approved entries built so far
-                    // this node) is pre-existing and out of scope for #842,
-                    // which is specifically about `f`'s fan-out.
-                    match eval_owned_multi::<S>(cond, &child_value) {
-                        Ok(cond_outputs) => {
-                            for c in &cond_outputs {
-                                if c.is_truthy() {
-                                    next.push((path.clone(), child_value.clone()));
+                match cond {
+                    None => next.push((path, child_value)),
+                    Some(cond) => {
+                        // `cond` gates the child, not `current`, and forks once
+                        // per truthy output — see the doc comment above (#627).
+                        // A `cond` error aborts immediately too (#636), same as
+                        // `f`'s error above — this arm's own prefix-loss
+                        // (`next`'s already-cond-approved entries built so far
+                        // this node) is pre-existing and out of scope for #842,
+                        // which is specifically about `f`'s fan-out.
+                        match eval_owned_multi::<S>(cond, &child_value) {
+                            Ok(cond_outputs) => {
+                                for c in &cond_outputs {
+                                    if c.is_truthy() {
+                                        next.push((path.clone(), child_value.clone()));
+                                    }
                                 }
                             }
+                            Err(e) => return Err((outputs, e)),
                         }
-                        Err(e) => return Err((outputs, e)),
                     }
                 }
             }
