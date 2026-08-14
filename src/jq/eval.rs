@@ -2969,10 +2969,13 @@ fn builtin_has<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             let len = (*elements).count() as i64;
             let in_bounds = if S::NEGATIVE_INDEX_IN_HAS {
                 // yq behavior: negative indices are valid if abs(idx) <= len
+                // -- `unsigned_abs`, not `abs`, since `i64::MIN.abs()`
+                // overflows (panics in debug, silently wraps back to a
+                // still-negative i64::MIN in release, #908 review).
                 if *idx >= 0 {
                     *idx < len
                 } else {
-                    idx.abs() <= len
+                    idx.unsigned_abs() <= len as u64
                 }
             } else {
                 // jq behavior: only non-negative indices
@@ -2988,68 +2991,93 @@ fn builtin_has<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     }
 }
 
-/// Builtin: in(obj)
+/// Builtin: in(xs)
+///
+/// jq defines this as `def in(xs): . as $x | xs | has($x);` (confirmed
+/// against jq 1.7.1) — a plain pipe, so `xs`'s own generator semantics drive
+/// `in(xs)` directly: `"a" | in({a:1}, {b:2})` yields `true` *and* `false`,
+/// one output per `xs` output, not just the first (`"a" | [in({a:1},
+/// {a:9})]'` is `[true,true]`). `eval_owned_multi_keep_partial` evaluates
+/// `xs` fully (keeping every already-produced candidate if a later one
+/// errors/breaks/halts, #842's precedent), then each candidate is checked
+/// against the key in encounter order — a per-candidate type mismatch (e.g.
+/// a number where an object was needed) stops the loop exactly like `xs`
+/// itself erroring would, since real jq's `has($x)` raising mid-pipe has the
+/// same effect as `xs` raising: the rest of the generator never runs
+/// (confirmed: `"a" | in({b:1}, 5, {a:1})?` is only `false`, never reaching
+/// `{a:1}`'s `true` — `?`/`try` truncates the stream at the first error
+/// rather than skipping just that one output).
 fn builtin_in<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     obj_expr: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    // The input should be a key (string or number), and we check if it exists in obj
+    // The input is a key (string or number) to check against every output
+    // of `xs`; `xs` itself also receives this same input (`. as $x | xs`
+    // doesn't change `.`).
     let key_owned = to_owned(&value);
-    let obj_result = eval_single::<W, S>(obj_expr, value.clone(), optional);
+    let (candidates, xs_escape) = eval_owned_multi_keep_partial::<S>(obj_expr, &key_owned);
 
-    // Get the object/array to check against (need to handle Owned case for object literals)
-    let obj_owned = match obj_result {
-        QueryResult::One(o) => to_owned(&o),
-        QueryResult::Many(os) => {
-            if let Some(o) = os.into_iter().next() {
-                to_owned(&o)
-            } else if optional {
-                return QueryResult::None;
-            } else {
-                return QueryResult::Error(EvalError::new(
-                    "in() requires an object or array argument",
-                ));
+    let mut results: Vec<OwnedValue> = Vec::with_capacity(candidates.len());
+    let mut check_escape: Option<EvalEscape> = None;
+    for obj_owned in candidates {
+        match (&key_owned, &obj_owned) {
+            (OwnedValue::String(key), OwnedValue::Object(fields)) => {
+                results.push(OwnedValue::Bool(fields.keys().any(|k| k == key)));
+            }
+            // jq returns false for negative indices, yq returns true if in range
+            (
+                OwnedValue::Int(idx) | OwnedValue::NumberLiteral(NumberRepr::Int(idx), _),
+                OwnedValue::Array(elements),
+            ) => {
+                let len = elements.len() as i64;
+                let in_bounds = if S::NEGATIVE_INDEX_IN_HAS {
+                    // yq behavior: negative indices are valid if abs(idx) <= len
+                    // -- `unsigned_abs`, not `abs`, since `i64::MIN.abs()`
+                    // overflows (panics in debug, silently wraps back to a
+                    // still-negative i64::MIN in release, #908 review).
+                    if *idx >= 0 {
+                        *idx < len
+                    } else {
+                        idx.unsigned_abs() <= len as u64
+                    }
+                } else {
+                    // jq behavior: only non-negative indices
+                    *idx >= 0 && *idx < len
+                };
+                results.push(OwnedValue::Bool(in_bounds));
+            }
+            // A null candidate is never "in" anything, regardless of key
+            // type -- matches `builtin_has`'s own `(StandardJson::Null, _)`
+            // short-circuit (#908 review; confirmed against jq 1.7.1:
+            // `"a" | in(null)` is `false`, not an error).
+            (_, OwnedValue::Null) => {
+                results.push(OwnedValue::Bool(false));
+            }
+            _ => {
+                check_escape = Some(EvalEscape::Error(EvalError::cannot_check_has(
+                    obj_owned.type_name(),
+                    key_owned.type_name(),
+                )));
+                break;
             }
         }
-        QueryResult::Owned(o) => o,
-        QueryResult::Error(e) => return QueryResult::Error(e),
-        _ if optional => return QueryResult::None,
-        _ => {
-            return QueryResult::Error(EvalError::new("in() requires an object or array argument"));
-        }
-    };
-
-    match (&key_owned, &obj_owned) {
-        (OwnedValue::String(key), OwnedValue::Object(fields)) => {
-            let found = fields.keys().any(|k| k == key);
-            QueryResult::Owned(OwnedValue::Bool(found))
-        }
-        // jq returns false for negative indices, yq returns true if in range
-        (
-            OwnedValue::Int(idx) | OwnedValue::NumberLiteral(NumberRepr::Int(idx), _),
-            OwnedValue::Array(elements),
-        ) => {
-            let len = elements.len() as i64;
-            let in_bounds = if S::NEGATIVE_INDEX_IN_HAS {
-                // yq behavior: negative indices are valid if abs(idx) <= len
-                if *idx >= 0 {
-                    *idx < len
-                } else {
-                    idx.abs() <= len
-                }
-            } else {
-                // jq behavior: only non-negative indices
-                *idx >= 0 && *idx < len
-            };
-            QueryResult::Owned(OwnedValue::Bool(in_bounds))
-        }
-        _ if optional => QueryResult::None,
-        _ => QueryResult::Error(EvalError::cannot_check_has(
-            obj_owned.type_name(),
-            key_owned.type_name(),
-        )),
     }
+
+    // `check_escape` (a type mismatch on an already-produced candidate)
+    // always precedes `xs_escape` (whatever ended `xs`'s own stream after
+    // that candidate) chronologically, since it fires while still consuming
+    // `candidates` -- the same "earlier escape wins" reasoning
+    // `queue_recurse_children` documents for `recurse`. `finish_fork`
+    // (shared with 8+ other fork/fold constructs, #908 review) already
+    // implements the "keep already-produced outputs, suppress only a
+    // trailing Error under `optional`, let Break/Halt through regardless"
+    // policy this used to hand-roll here.
+    finish_fork(
+        results,
+        check_escape.or(xs_escape).map(Into::into),
+        optional,
+    )
 }
 
 /// Builtin: `IN(s)` - true if any output of `s` (run against the current
@@ -24898,6 +24926,94 @@ mod tests {
         // For now, test has() which works similarly
         query!(br#"{"a": 1, "b": 2}"#, "has(\"a\")",
             QueryResult::Owned(OwnedValue::Bool(true)) => {}
+        );
+    }
+
+    #[test]
+    // `"in({a:1}, {a:9})"` is a jq filter literal, not a formatting string;
+    // clippy cannot tell the two apart from the brace shape alone.
+    #[allow(clippy::literal_string_with_formatting_args)]
+    fn test_builtin_in_fans_out_over_every_xs_output_880() {
+        // `in(xs)` = `. as $x | xs | has($x)` (jq 1.7.1) -- a plain pipe, so
+        // it forks once per `xs` output rather than only consulting the
+        // first (#880's own review discovery, distinct from the
+        // Halt/Break-swallowing bug this issue is titled after). Confirmed
+        // against jq 1.7.1: `"a" | [in({a:1}, {a:9})]` is `[true,true]`;
+        // `"a" | [in({a:1}, {b:2})]` is `[true,false]`.
+        assert_eq!(outputs(br#""a""#, "in({a:1}, {a:9})"), ["true", "true"]);
+        assert_eq!(outputs(br#""a""#, "in({a:1}, {b:2})"), ["true", "false"]);
+    }
+
+    #[test]
+    fn test_builtin_in_empty_xs_produces_no_output_880() {
+        // `in(empty)` -- `xs` producing zero outputs means `in(xs)` produces
+        // zero outputs too (same as any pipe into a filter with nothing to
+        // feed it). Confirmed against jq 1.7.1: `"a" | in(empty)` exits 0
+        // with no output.
+        assert!(outputs(br#""a""#, "in(empty)").is_empty());
+    }
+
+    #[test]
+    // `"in([1,2,3])"` is a jq filter literal, not a formatting string;
+    // clippy cannot tell the two apart from the brace shape alone.
+    #[allow(clippy::literal_string_with_formatting_args)]
+    fn test_builtin_in_array_index_880() {
+        // The array-index arm of `in(xs)` (jq's non-negative-only index
+        // semantics, `S::NEGATIVE_INDEX_IN_HAS == false`) alongside the
+        // object-key arm exercised by the fan-out test above. Confirmed
+        // against jq 1.7.1: `2 | in([1,2,3])` is `true`; `5 | in([1,2,3])`
+        // is `false`.
+        assert_eq!(outputs(b"2", "in([1,2,3])"), ["true"]);
+        assert_eq!(outputs(b"5", "in([1,2,3])"), ["false"]);
+    }
+
+    #[test]
+    // `"in(null)"`/`"in({a:1}, null)"` are jq filter literals, not
+    // formatting strings; clippy cannot tell the two apart from the brace
+    // shape alone.
+    #[allow(clippy::literal_string_with_formatting_args)]
+    fn test_builtin_in_null_candidate_is_never_in_anything_908() {
+        // Review finding on #908: a null `xs` candidate has no arm of its
+        // own, unlike `builtin_has`'s `(StandardJson::Null, _) => false`
+        // short-circuit, so it fell into the type-mismatch catch-all and
+        // errored instead of contributing `false`. Confirmed against jq
+        // 1.7.1: `"a" | in(null)` is `false`; `"a" | in({a:1}, null)` is
+        // `true` *and* `false` (the null candidate doesn't truncate the
+        // stream); `5 | in(null)` is `false` regardless of key type.
+        assert_eq!(outputs(br#""a""#, "in(null)"), ["false"]);
+        assert_eq!(outputs(br#""a""#, "in({a:1}, null)"), ["true", "false"]);
+        assert_eq!(outputs(b"5", "in(null)"), ["false"]);
+    }
+
+    #[test]
+    // `"in(5, {a:1})?"` is a jq filter literal, not a formatting string;
+    // clippy cannot tell the two apart from the brace shape alone.
+    #[allow(clippy::literal_string_with_formatting_args)]
+    fn test_builtin_in_optional_with_zero_prior_candidates_880() {
+        // Companion to `test_builtin_in_optional_truncates_stream_at_first_type_mismatch_880`:
+        // that test suppresses an error after one candidate already
+        // succeeded (`results.len() == 1`); this one suppresses an error on
+        // the *very first* candidate, so `results` is still empty when the
+        // `optional` guard fires. Confirmed against jq 1.7.1: `"a" |
+        // in(5, {a:1})?` produces no output at all, exit 0 -- `{a:1}`'s own
+        // `true` is never reached (real jq's `try` truncates the stream,
+        // it doesn't skip just the erroring candidate).
+        assert!(outputs(br#""a""#, "in(5, {a:1})?").is_empty());
+    }
+
+    #[test]
+    // `"in({a:1}, {b:2}, 5)"` is a jq filter literal, not a formatting
+    // string; clippy cannot tell the two apart from the brace shape alone.
+    #[allow(clippy::literal_string_with_formatting_args)]
+    fn test_builtin_in_optional_with_multiple_prior_candidates_880() {
+        // Companion to the two tests above: suppresses an error after *two*
+        // candidates already succeeded (`results.len() >= 2`, the
+        // `ManyOwned` sub-arm). Confirmed against jq 1.7.1: `"a" |
+        // in({a:1}, {b:2}, 5)?` prints `true` and `false` (both already-
+        // produced candidates), then stops -- exit 0, no error surfaces.
+        assert_eq!(
+            outputs(br#""a""#, "in({a:1}, {b:2}, 5)?"),
+            ["true", "false"]
         );
     }
 

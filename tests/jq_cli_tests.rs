@@ -9017,3 +9017,120 @@ fn test_slice_target_slices_first_output_before_reaching_a_later_halt() -> Resul
     );
     Ok(())
 }
+
+/// #880: `builtin_in`'s (`in(xs)`) match on its argument's evaluation result
+/// had no arm for `Halt`, `Break`, or their `Partial` variants -- all fell
+/// into either the `optional` guard or a bogus "in() requires an object or
+/// array argument" type error, instead of propagating the escape. Verified
+/// against jq 1.7.1 (with stdout/stderr captured separately): `jq -n -c '"a"
+/// | in(halt_error(3))'` writes `a` (the raw value `halt_error` writes as
+/// its own message) to *stderr*, produces no stdout, and exits 3.
+#[test]
+fn test_builtin_in_propagates_a_bare_halt_880() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-n", "-c", r#""a" | in(halt_error(3))"#], None)?;
+    assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(stderr, "a");
+    Ok(())
+}
+
+/// Companion to the test above, for `break`: unlike `Halt`, a bare `break`
+/// with no enclosing `label` in scope produces no output and a clean exit
+/// (real jq's actual behavior once the break has nowhere left to unwind
+/// to -- confirmed live). Verified against jq 1.7.1: `jq -n -c 'label $out
+/// | ("a" | in(break $out)), "after"'` produces no output, exit 0 -- the
+/// break unwinds past the whole comma expression, including `"after"`.
+#[test]
+fn test_builtin_in_propagates_a_bare_break_880() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-n",
+            "-c",
+            r#"label $out | ("a" | in(break $out)), "after""#,
+        ],
+        None,
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
+/// A `break`/`halt` on a *later* `xs` candidate must not erase the boolean
+/// already produced by an *earlier* one (#842's "keep partial output before
+/// the escape" precedent, applied here since `in(xs)` now fans out over
+/// every `xs` output via `eval_owned_multi_keep_partial`). Verified against
+/// jq 1.7.1: `jq -n -c 'label $out | "a" | in({a:1}, break $out)'` prints
+/// `true` (from the first candidate) then exits 0 -- the break silently
+/// stops the rest of the stream without erroring.
+#[test]
+// `"in({a:1}, break $out)"` is a jq filter literal, not a formatting
+// string; clippy cannot tell the two apart from the brace shape alone.
+#[allow(clippy::literal_string_with_formatting_args)]
+fn test_builtin_in_keeps_earlier_candidates_before_a_later_break_880() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-n", "-c", r#"label $out | "a" | in({a:1}, break $out)"#],
+        None,
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "true\n");
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
+/// Same shape as the previous test, for `halt_error` instead of `break`.
+/// Verified against jq 1.7.1 (streams captured separately): `jq -n -c '"a" |
+/// in({a:1}, halt_error(3))'` prints `true` (the first candidate's result)
+/// to stdout, writes `a` (halt_error's own message) to *stderr*, exits 3.
+#[test]
+// `"in({a:1}, halt_error(3))"` is a jq filter literal, not a formatting
+// string; clippy cannot tell the two apart from the brace shape alone.
+#[allow(clippy::literal_string_with_formatting_args)]
+fn test_builtin_in_keeps_earlier_candidates_before_a_later_halt_880() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_full(&["-n", "-c", r#""a" | in({a:1}, halt_error(3))"#], None)?;
+    assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "true\n");
+    assert_eq!(stderr, "a");
+    Ok(())
+}
+
+/// A genuine type-mismatch error on a *later* `xs` candidate behaves the
+/// same way as `xs` itself erroring: the stream truncates at that point
+/// (real jq's `try`/`?` semantics never resume a generator past a caught
+/// error), so an outer `?` keeps only the already-produced candidates and
+/// silently drops the rest, rather than either erroring or somehow still
+/// reaching a later, otherwise-valid candidate. Verified against jq 1.7.1:
+/// `jq -n -c '"a" | in({b:1}, 5, {a:1})?'` prints only `false` (`{b:1}`'s
+/// result) -- `{a:1}`'s own `true` is never reached, exit 0.
+#[test]
+// `"in({b:1}, 5, {a:1})?"` is a jq filter literal, not a formatting
+// string; clippy cannot tell the two apart from the brace shape alone.
+#[allow(clippy::literal_string_with_formatting_args)]
+fn test_builtin_in_optional_truncates_stream_at_first_type_mismatch_880() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-n", "-c", r#""a" | in({b:1}, 5, {a:1})?"#], None)?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "false\n");
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
+/// Companion to the test above without `?`: the same type mismatch, but
+/// unsuppressed, keeps the already-produced `false` and then raises.
+/// Verified against jq 1.7.1: `jq -n -c '"a" | in({b:1}, 5, {a:1})'` prints
+/// `false` to stdout, then errors ("Cannot check whether number has a
+/// string key"), exit 5.
+#[test]
+// `"in({b:1}, 5, {a:1})"` is a jq filter literal, not a formatting string;
+// clippy cannot tell the two apart from the brace shape alone.
+#[allow(clippy::literal_string_with_formatting_args)]
+fn test_builtin_in_keeps_earlier_candidates_before_a_later_type_mismatch_error_880() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-n", "-c", r#""a" | in({b:1}, 5, {a:1})"#], None)?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "false\n");
+    assert!(
+        stderr.contains("Cannot check whether number has a string key"),
+        "{stderr}"
+    );
+    Ok(())
+}

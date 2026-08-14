@@ -10059,3 +10059,55 @@ fn test_m2_json_output_select_halt_writes_nothing_for_halted_doc() -> Result<()>
     assert_eq!(out.trim(), r#"{"a":1}"#);
     Ok(())
 }
+
+/// #880: `builtin_in`'s array-index arm has a yq-specific negative-index
+/// branch (`S::NEGATIVE_INDEX_IN_HAS`, unreachable via `succinctly jq`'s
+/// `JqSemantics`) -- yq treats a negative index as valid if
+/// `abs(idx) <= len`, unlike jq which only accepts non-negative indices.
+/// Also covers the same branch's non-negative sub-case under yq semantics
+/// specifically (the jq-mode non-negative case is covered separately by
+/// `test_builtin_in_array_index_880` in `src/jq/eval.rs`, which uses
+/// `JqSemantics` and so never reaches `NEGATIVE_INDEX_IN_HAS`'s branch at
+/// all). Confirmed against real yq: `-1 | in([1,2,3])` is `true` (in
+/// range), `-4 | in([1,2,3])` is `false` (out of range), `2 | in([1,2,3])`
+/// is `true`, `5 | in([1,2,3])` is `false`.
+#[test]
+fn test_builtin_in_yq_negative_index_880() -> Result<()> {
+    let (out, code) = run_yq_stdin("in([1,2,3])", "-1", &[])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "true");
+
+    let (out, code) = run_yq_stdin("in([1,2,3])", "-4", &[])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "false");
+
+    let (out, code) = run_yq_stdin("in([1,2,3])", "2", &[])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "true");
+
+    let (out, code) = run_yq_stdin("in([1,2,3])", "5", &[])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "false");
+    Ok(())
+}
+
+/// Review finding on #908: `idx.abs()` in the negative-index branch above
+/// overflows for `i64::MIN` -- a debug build panics ("attempt to negate
+/// with overflow", exit 101 via `unwrap`/no catch), a release build
+/// silently wraps back to a still-negative `i64::MIN`, making
+/// `idx.abs() <= len` spuriously true. `idx.unsigned_abs()` (a `u64`,
+/// overflow-free for every `i64` including `MIN`) fixes both. A non-zero
+/// exit code here would mean either the panic or the wrong-answer shape
+/// resurfaced. `has(...)`'s identical, independently-duplicated branch is
+/// exercised too, since it shares this exact bug.
+#[test]
+fn test_builtin_in_and_has_yq_negative_index_i64_min_no_overflow_908() -> Result<()> {
+    let (out, code) = run_yq_stdin("in([1,2,3])", "-9223372036854775808", &[])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "false");
+
+    let (out, code) = run_yq_stdin("has(-9223372036854775808)", "[1,2,3]", &[])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "false");
+    Ok(())
+}
