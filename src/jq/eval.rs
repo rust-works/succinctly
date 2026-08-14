@@ -9811,71 +9811,21 @@ fn resolve_node<'a, S: EvalSemantics>(expr: &Expr, value: &'a OwnedValue) -> Pat
         // fall back to `b` only when none survive. An error while resolving
         // `a` propagates rather than falling back, matching `eval_alternative`:
         // `//` only substitutes for falsy/absent output, never for a raised
-        // error.
-        //
-        // The one exception is `#530`'s "Invalid path expression" (#845):
-        // `a` only has to be path-shaped for whatever output of it actually
-        // survives the truthy filter below, not for output that gets
-        // filtered out — confirmed live, `path(false // .b)` is `["b"]` in
-        // jq (never raising on `false`), while `path(true // .b)` and
-        // `path(1 // .b)` still raise, because those outputs are kept.
-        // `resolve_leaf` (reached through `resolve_node` just below) raises
-        // that error the moment it finds a single, non-path-shaped output,
-        // before this arm ever gets a chance to filter it — so on exactly
-        // that error, re-run `a` in value position to see whether any
-        // output was actually truthy. That second call is cheap and
-        // side-effect-free for the overwhelming majority of real `//` left
-        // operands (literals, comparisons, plain navigation); a `left` with
-        // genuine side effects (e.g. `input`) that also happens not to be
-        // path-shaped would perform them twice — a narrow, documented
-        // trade-off rather than a claim of full jq bytecode fidelity for
-        // that specific combination.
-        Expr::Alternative(left, right) => match resolve_node::<S>(left, value) {
-            Ok(branches) => {
-                let branches: Vec<PathBranch<'a>> = branches
-                    .into_iter()
-                    .filter(|(_, v)| v.is_truthy())
-                    .collect();
-                if branches.is_empty() {
-                    resolve_node::<S>(right, value)
-                } else {
-                    Ok(branches)
-                }
+        // error. `#530`'s "Invalid path expression" is the one exception
+        // (#845): see `resolve_alternative_left`'s own doc comment for why
+        // `a` is resolved through a dedicated helper rather than a plain
+        // `resolve_node::<S>(left, value)?` here.
+        Expr::Alternative(left, right) => {
+            let branches: Vec<PathBranch<'a>> = resolve_alternative_left::<S>(left, value)?
+                .into_iter()
+                .filter(|(_, v)| v.is_truthy())
+                .collect();
+            if branches.is_empty() {
+                resolve_node::<S>(right, value)
+            } else {
+                Ok(branches)
             }
-            Err((prefix, EvalEscape::Error(e))) if e.is_invalid_path_expression() => {
-                let left_all_falsy = matches!(
-                    eval_owned_multi::<S>(left, value),
-                    Ok(values) if !values.iter().any(OwnedValue::is_truthy)
-                );
-                if left_all_falsy {
-                    resolve_node::<S>(right, value)
-                } else {
-                    // Either some output of `left` was truthy (jq itself
-                    // raises here too, so the original error stands) or the
-                    // value-position re-evaluation errored a different way
-                    // (kept conservative: still surface the original path
-                    // error rather than guessing at which one jq would
-                    // actually reach). `resolve_node`'s own `Comma` arm
-                    // aborts at the *first* element that fails to resolve,
-                    // which is only the same element jq's own left-to-right,
-                    // fail-fast-at-first-problem evaluation would stop on
-                    // when that first unresolvable element is also the
-                    // first *truthy* one. When an earlier element is
-                    // falsy-and-invalid-shaped and a later one raises a
-                    // genuine, unrelated error, this still cites the
-                    // earlier (stale) invalid-path complaint rather than
-                    // jq's real error — confirmed live, `path((false, 1/0)
-                    // // .b)` raises jq's division-by-zero message, not
-                    // "Invalid path expression with result false" — a
-                    // narrower, message-only divergence (still a raised
-                    // error either way, never a wrong value) left as a
-                    // known gap rather than threading full per-output
-                    // streaming through every combinator arm; see #845.
-                    Err((prefix, EvalEscape::Error(e)))
-                }
-            }
-            Err(escape) => Err(escape),
-        },
+        }
 
         // `limit(n; f)`: same `n`-conversion rule as `eval_limit`, so
         // `path(limit(...))` agrees with plain `limit(...)` in this
@@ -10064,6 +10014,82 @@ fn resolve_limit<'a, S: EvalSemantics>(
         .into_iter()
         .take(n)
         .collect())
+}
+
+/// Resolve `//`'s left operand for path context (#845).
+///
+/// Identical to `resolve_node` for every shape except the one narrow case
+/// where it would raise `#530`'s "Invalid path expression": `//` only needs
+/// a *kept* (truthy) output to be path-shaped, never a falsy one that the
+/// `Expr::Alternative` arm's own truthy filter discards anyway. Confirmed
+/// live against jq 1.7.1: `path(false // .b)` is `["b"]`, never raising on
+/// `false`, while `path(true // .b)`/`path(1 // .b)` still raise, because
+/// those outputs are kept.
+///
+/// `resolve_leaf` raises that error the moment it finds a single,
+/// non-path-shaped output, before any caller gets a chance to filter it —
+/// so on exactly that error, this re-runs just the offending piece in value
+/// position to see whether its output was actually truthy. If every output
+/// was falsy, it resolves to nothing (as if the piece had been path-shaped
+/// and then filtered out); otherwise the original error — or, if the
+/// recheck itself hit a different escape, *that* escape — takes over. A
+/// `Halt`/`Break` the recheck turns up is never dropped in favor of the
+/// stale `Error` above it: `EvalEscape`'s own doc comment is explicit that
+/// discarding either is the one thing no consumer may do.
+///
+/// `Expr::Comma` gets its own copy of `resolve_node`'s element loop here
+/// rather than delegating to it, because the two need different per-element
+/// behavior: an ordinary `path((.a, 1))` must still raise on `1` (`#530`
+/// applies unconditionally outside `//`), but `path((false, .a) // .b)`
+/// must not raise on `false` and must still go on to resolve `.a` —
+/// confirmed live, jq gives `["a"]` for the latter. Without this, the
+/// shared `Comma` arm aborts at `false` (the first element it cannot
+/// resolve) and never even reaches `.a`. This also keeps every recheck
+/// scoped to exactly the one element that failed rather than the whole
+/// `left`, which matters for jq's left-to-right, fail-fast-at-the-first-
+/// problem ordering: `path((1, halt_error(3)) // .b)` must raise on `1`
+/// without ever reaching the halt (confirmed live), which a whole-`left`
+/// recheck would get wrong by evaluating `halt_error(3)` regardless.
+///
+/// A mode flag threaded through the shared `resolve_node` arms instead was
+/// considered and rejected: full symmetry would need every other
+/// multi-branch arm (`If`, `Try`, `As`, `Label`, ...) to cooperate too,
+/// which is `#843`'s much larger "trackable" pattern for an unrelated
+/// problem, not a fit for this arm-local fix. A left operand built from one
+/// of *those* combinators (rather than `Comma`) still gets only the
+/// coarser, whole-subexpression recheck below — a narrower residual gap
+/// than the one this function closes for `Comma`.
+fn resolve_alternative_left<'a, S: EvalSemantics>(
+    expr: &Expr,
+    value: &'a OwnedValue,
+) -> PathResolveResult<'a> {
+    match expr {
+        Expr::Paren(inner) => resolve_alternative_left::<S>(inner, value),
+        Expr::Comma(exprs) => {
+            let mut out = Vec::new();
+            for e in exprs {
+                match resolve_alternative_left::<S>(e, value) {
+                    Ok(branches) => out.extend(branches),
+                    Err((prefix, e)) => {
+                        out.extend(prefix);
+                        return Err((out, e));
+                    }
+                }
+            }
+            Ok(out)
+        }
+        _ => match resolve_node::<S>(expr, value) {
+            Ok(branches) => Ok(branches),
+            Err((prefix, EvalEscape::Error(e))) if e.is_invalid_path_expression() => {
+                match eval_owned_multi::<S>(expr, value) {
+                    Ok(values) if !values.iter().any(OwnedValue::is_truthy) => Ok(Vec::new()),
+                    Ok(_) => Err((prefix, EvalEscape::Error(e))),
+                    Err(escape2) => Err((prefix, escape2)),
+                }
+            }
+            Err(escape) => Err(escape),
+        },
+    }
 }
 
 /// Resolve an ordinary (non-combinator) filter: keep it as one opaque path
@@ -29431,27 +29457,77 @@ mod tests {
         );
     }
 
-    /// #845's documented remaining gap, pinned rather than silently left
-    /// untested: when `//`'s left side has multiple outputs, and the
-    /// *first* one `resolve_node`'s `Comma` arm cannot resolve is
-    /// falsy-and-not-path-shaped while a *later* one raises a genuine,
-    /// unrelated error, this resolver still cites the earlier (stale)
-    /// invalid-path complaint rather than jq's real error. Real jq 1.7.1
-    /// raises the division error here (confirmed live), not "Invalid path
-    /// expression with result false" — fixing this fully would need
-    /// per-output streaming threaded through every combinator arm `left`
-    /// can take, which is out of scope for this arm-local fix. Both sides
-    /// still raise (exit 5), so this is a message-only divergence, not a
-    /// wrong-value one — pinned here so a future full fix has a clear
-    /// "was documented, not missed" marker to update instead of silently
-    /// changing behavior.
+    /// #845 (`resolve_alternative_left`'s `Comma` case): a falsy,
+    /// non-path-shaped element must not stop a multi-output left operand
+    /// from resolving a *later*, genuinely-path-shaped truthy element — the
+    /// shared `resolve_node` `Comma` arm aborts at the first element it
+    /// cannot resolve, which would otherwise raise on `false` before ever
+    /// reaching `.a`. Confirmed live against jq 1.7.1: both orderings give
+    /// `["a"]`, no error.
     #[test]
-    fn test_alternative_left_stale_error_before_a_later_unrelated_one_is_a_known_gap() {
+    fn test_alternative_left_comma_falsy_invalid_element_does_not_block_a_later_valid_one() {
+        for filter in ["path((false, .a) // .b)", "path((.a, false) // .b)"] {
+            assert_eq!(outputs(br#"{"a":10}"#, filter), [r#"["a"]"#], "{filter}");
+        }
+    }
+
+    /// #845 (`resolve_alternative_left`'s `Comma` case): a genuine,
+    /// unrelated error on a *later* element surfaces instead of the
+    /// earlier, falsy element's stale invalid-path complaint — confirmed
+    /// live, jq 1.7.1 raises the division error for
+    /// `path((false, 1/0) // .b)`, not "Invalid path expression with
+    /// result false".
+    #[test]
+    fn test_alternative_left_comma_later_genuine_error_wins_over_an_earlier_falsy_one() {
         query!(br#"{"a":10}"#, "path((false, 1/0) // .b)",
             QueryResult::Error(e) => {
-                assert!(e.is_invalid_path_expression(), "{}", e.message);
-                assert_eq!(e.message, "Invalid path expression with result false");
+                assert!(!e.is_invalid_path_expression(), "{}", e.message);
+                assert!(e.message.contains("cannot be divided"), "{}", e.message);
             }
+        );
+    }
+
+    /// #845 (`resolve_alternative_left`'s `Comma` case), the ordering-
+    /// sensitive flip side of the two tests above: when the *first*
+    /// element is truthy-and-invalid-shaped, jq raises on it immediately
+    /// and never reaches a later element at all — including one that would
+    /// otherwise halt or break. Confirmed live against jq 1.7.1:
+    /// `path((1, halt_error(3)) // .b)` raises "Invalid path expression
+    /// with result 1" (not halt, exit 5), and the `break`-under-`label`
+    /// variant raises the same message rather than reaching `$out`.
+    #[test]
+    fn test_alternative_left_comma_truthy_invalid_element_wins_even_before_a_later_escape() {
+        query!(br#"{"a":10}"#, "path((1, halt_error(3)) // .b)",
+            QueryResult::Error(e) => {
+                assert!(e.is_invalid_path_expression(), "{}", e.message);
+                assert_eq!(e.message, "Invalid path expression with result 1");
+            }
+        );
+        query!(br#"{"a":10}"#, "label $out | path((1, break $out) // .b)",
+            QueryResult::Error(e) => {
+                assert!(e.is_invalid_path_expression(), "{}", e.message);
+                assert_eq!(e.message, "Invalid path expression with result 1");
+            }
+        );
+    }
+
+    /// #845 (`resolve_alternative_left`'s `Comma` case): a `halt`/`break`
+    /// reached only *after* skipping an earlier falsy, non-path-shaped
+    /// element must still propagate as itself — never silently converted
+    /// into the earlier element's ordinary, catchable `#530` error. This is
+    /// the specific case `EvalEscape`'s own doc comment warns every
+    /// consumer never to get wrong ("Never write `Err(_) => …`-that-
+    /// discards" a `Halt`/`Break`). Confirmed live against jq 1.7.1:
+    /// `path((false, halt_error(3)) // .b)` halts with exit code 3 (no
+    /// "Invalid path expression" at all), and the `break` variant reaches
+    /// `$out` rather than raising.
+    #[test]
+    fn test_alternative_left_comma_halt_and_break_survive_a_preceding_falsy_element() {
+        query!(br#"{"a":10}"#, "path((false, halt_error(3)) // .b)",
+            QueryResult::Halt(code) => assert_eq!(code, 3)
+        );
+        query!(br#"{"a":10}"#, "label $out | (path((false, break $out) // .b), \"after\")",
+            QueryResult::None => {}
         );
     }
 
