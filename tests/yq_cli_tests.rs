@@ -578,6 +578,21 @@ fn test_identity_preserves_flow_nested_under_block_mapping() -> Result<()> {
     Ok(())
 }
 
+/// #707's second repro: writing to one element of a flow-style array must
+/// not reformat the array itself to block style. The `_739` tests above
+/// cover an untouched *sibling* keeping its style, and a directly-written
+/// *scalar* keeping its own; this is the container analog of the latter --
+/// the array's own node is what's mutated (`reconcile_presentation`'s
+/// `Array` arm), not just a value inside it. Verified against real yq:
+/// `a: [1, 2, 3]` + `.a[0] = 9` -> `a: [9, 2, 3]`.
+#[test]
+fn test_assign_to_flow_array_element_preserves_the_arrays_own_flow_style_707() -> Result<()> {
+    let (output, code) = run_yq_stdin(".a[0] = 9", "a: [1, 2, 3]\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "a: [9, 2, 3]\n");
+    Ok(())
+}
+
 /// #707: the fix applies to any pure-navigation query, not just the bare
 /// identity `.` P9 fast path — `.top` still routes through the same
 /// cursor-streaming `stream_yaml_value` and must preserve style too.
