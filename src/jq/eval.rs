@@ -2961,25 +2961,36 @@ fn builtin_has<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             });
             QueryResult::Owned(OwnedValue::Bool(found))
         }
-        // Array has index - jq returns false for negative, yq returns true if in range
+        // Array has index - jq returns false for negative, yq returns true if
+        // in range. Any numeric key type is accepted here, not just Int --
+        // `numeric_key_to_index` truncates a Float toward zero (matching
+        // jq's own `.[1.5]` coercion) and reports `None` for NaN, which is
+        // never in bounds (#909 review: this arm used to match only Int,
+        // erroring on a Float/NaN key instead of truncating/answering
+        // `false` like real jq's `has(1.5)`/`has(nan)` do).
         (
             StandardJson::Array(elements),
-            OwnedValue::Int(idx) | OwnedValue::NumberLiteral(NumberRepr::Int(idx), _),
+            OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..),
         ) => {
             let len = (*elements).count() as i64;
-            let in_bounds = if S::NEGATIVE_INDEX_IN_HAS {
-                // yq behavior: negative indices are valid if abs(idx) <= len
-                // -- `unsigned_abs`, not `abs`, since `i64::MIN.abs()`
-                // overflows (panics in debug, silently wraps back to a
-                // still-negative i64::MIN in release, #908 review).
-                if *idx >= 0 {
-                    *idx < len
-                } else {
-                    idx.unsigned_abs() <= len as u64
+            let in_bounds = match numeric_key_to_index(&key_owned) {
+                None => false,
+                Some(idx) => {
+                    if S::NEGATIVE_INDEX_IN_HAS {
+                        // yq behavior: negative indices are valid if abs(idx) <= len
+                        // -- `unsigned_abs`, not `abs`, since `i64::MIN.abs()`
+                        // overflows (panics in debug, silently wraps back to a
+                        // still-negative i64::MIN in release, #908 review).
+                        if idx >= 0 {
+                            idx < len
+                        } else {
+                            idx.unsigned_abs() <= len as u64
+                        }
+                    } else {
+                        // jq behavior: only non-negative indices
+                        idx >= 0 && idx < len
+                    }
                 }
-            } else {
-                // jq behavior: only non-negative indices
-                *idx >= 0 && *idx < len
             };
             QueryResult::Owned(OwnedValue::Bool(in_bounds))
         }
@@ -3025,25 +3036,34 @@ fn builtin_in<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             (OwnedValue::String(key), OwnedValue::Object(fields)) => {
                 results.push(OwnedValue::Bool(fields.keys().any(|k| k == key)));
             }
-            // jq returns false for negative indices, yq returns true if in range
+            // jq returns false for negative indices, yq returns true if in
+            // range. Any numeric key type is accepted here, not just Int --
+            // see `builtin_has`'s matching arm (#909 review) for the full
+            // rationale on truncating a Float toward zero and treating NaN
+            // as never-in-bounds via `numeric_key_to_index`.
             (
-                OwnedValue::Int(idx) | OwnedValue::NumberLiteral(NumberRepr::Int(idx), _),
+                OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..),
                 OwnedValue::Array(elements),
             ) => {
                 let len = elements.len() as i64;
-                let in_bounds = if S::NEGATIVE_INDEX_IN_HAS {
-                    // yq behavior: negative indices are valid if abs(idx) <= len
-                    // -- `unsigned_abs`, not `abs`, since `i64::MIN.abs()`
-                    // overflows (panics in debug, silently wraps back to a
-                    // still-negative i64::MIN in release, #908 review).
-                    if *idx >= 0 {
-                        *idx < len
-                    } else {
-                        idx.unsigned_abs() <= len as u64
+                let in_bounds = match numeric_key_to_index(&key_owned) {
+                    None => false,
+                    Some(idx) => {
+                        if S::NEGATIVE_INDEX_IN_HAS {
+                            // yq behavior: negative indices are valid if abs(idx) <= len
+                            // -- `unsigned_abs`, not `abs`, since `i64::MIN.abs()`
+                            // overflows (panics in debug, silently wraps back to a
+                            // still-negative i64::MIN in release, #908 review).
+                            if idx >= 0 {
+                                idx < len
+                            } else {
+                                idx.unsigned_abs() <= len as u64
+                            }
+                        } else {
+                            // jq behavior: only non-negative indices
+                            idx >= 0 && idx < len
+                        }
                     }
-                } else {
-                    // jq behavior: only non-negative indices
-                    *idx >= 0 && *idx < len
                 };
                 results.push(OwnedValue::Bool(in_bounds));
             }
