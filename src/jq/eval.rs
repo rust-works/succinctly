@@ -9442,10 +9442,7 @@ fn eval_owned_multi<S: EvalSemantics>(
     input: &OwnedValue,
 ) -> Result<Vec<OwnedValue>, EvalEscape> {
     let (values, escape) = eval_owned_multi_keep_partial::<S>(expr, input);
-    match escape {
-        Some(e) => Err(e),
-        None => Ok(values),
-    }
+    escape.map_or(Ok(values), Err)
 }
 
 /// Like [`eval_owned_multi`], but keeps `collect_owned`'s old "just give me
