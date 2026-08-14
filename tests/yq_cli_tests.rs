@@ -2317,6 +2317,54 @@ fn test_yaml_empty_mapping_anchor_preserved_on_whole_document_root_712() -> Resu
     Ok(())
 }
 
+/// #852: a bare top-level scalar document root drops all of its own
+/// styling (quote style here), the same way it already drops its own
+/// anchor (#712, tests above) and trailing comment (#710). Verified:
+/// `printf '"hello world"\n' | yq '.'` -> `hello world`.
+#[test]
+fn test_yaml_double_quoted_scalar_style_dropped_on_whole_document_root_852() -> Result<()> {
+    let input = "\"hello world\"\n";
+    let (output, exit_code) = run_yq_stdin(".", input, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "hello world\n");
+    Ok(())
+}
+
+#[test]
+fn test_yaml_single_quoted_scalar_style_dropped_on_query_result_852() -> Result<()> {
+    let input = "item: 'hello world'\n";
+    let (output, exit_code) = run_yq_stdin(".item", input, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "hello world\n");
+    Ok(())
+}
+
+/// A nested scalar under the same key keeps its quote style when the
+/// *whole document* (not just that field) is the result - contrasts with
+/// the two tests above, where the scalar itself is the entire output.
+#[test]
+fn test_yaml_quoted_scalar_style_kept_when_nested_under_the_document_root_852() -> Result<()> {
+    let input = "item: 'hello world'\n";
+    let (output, exit_code) = run_yq_stdin(".", input, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, input);
+    Ok(())
+}
+
+/// Real `yq` drops root-scalar styling unconditionally, even for content
+/// that would be ambiguous (parsed as a different type) if left unquoted
+/// in a normal nested position - there's no sibling content at the
+/// document root for it to be confused with. Verified:
+/// `printf '"true"\n' | yq '.'` -> bare `true`, not re-quoted for safety.
+#[test]
+fn test_yaml_ambiguous_scalar_style_dropped_unconditionally_on_document_root_852() -> Result<()> {
+    let input = "\"true\"\n";
+    let (output, exit_code) = run_yq_stdin(".", input, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "true\n");
+    Ok(())
+}
+
 // =============================================================================
 // Alias-sync survives a pass-through stage mixed into the pipe (#764) - the
 // #711 gate originally required *every* pipe stage to be assignment-family,
@@ -3963,28 +4011,36 @@ fn test_block_scalar_explicit_indent_trailing_run_not_widened() -> Result<()> {
     Ok(())
 }
 
+/// #852: `.a` navigates to a single scalar and makes it the *whole*
+/// output - a bare top-level/navigated scalar root drops ALL of its own
+/// styling (quotes, `|`/`>` block-scalar indicators), matching real `yq`
+/// exactly, verified against the pinned binary: `foo\nbar\n` prints as
+/// bare `foo` / `bar` lines, no quoting, no `|` indicator.
+///
+/// This superseded an earlier "fall back to quoting" workaround (dropped
+/// here) that avoided a then-real data-loss bug: re-emitting block-style
+/// content at the root's empty indent has no structural indentation,
+/// which isn't valid block-scalar syntax and used to silently decode back
+/// to `""` on re-parse. Bypassing `stream_yaml_value`'s styling logic
+/// entirely at the root (rather than trying to re-emit block style there)
+/// sidesteps that indentation problem by construction - there's no block
+/// scalar being written at all. The round-trip is still not lossless, but
+/// only in the way real `yq`'s own output is: two plain-scalar lines fold
+/// into one space-joined line on YAML re-parse (`foo\nbar` -> `foo bar`),
+/// which is YAML's own plain-scalar folding rule, not a succinctly bug -
+/// confirmed identical against the pinned real `yq` binary's own
+/// round-trip.
 #[test]
-fn test_block_scalar_bare_top_level_projection_falls_back_to_quoted() -> Result<()> {
-    // `.a` navigates to a single scalar and makes it the *whole* output -
-    // `stream_yaml_document` calls `stream_yaml_value(out, "", ...)` for a
-    // bare top-level result, with no parent mapping/sequence loop having
-    // computed a "one level deeper" indent first (unlike every nested call
-    // site). Re-emitting block-style content at that empty indent would
-    // have zero structural indentation, which isn't valid block-scalar
-    // content and silently decodes back to "" on re-parse - a real,
-    // confirmed data-loss bug found in review (`.a` field projection is
-    // one of the most common query shapes there is). Falling back to
-    // quoting here is lossless, matching what this exact position already
-    // did before #836 (real yq instead drops ALL styling for a bare
-    // top-level/navigated scalar, tracked separately as #852).
+fn test_block_scalar_bare_top_level_projection_drops_all_styling_852() -> Result<()> {
     let input = "a: |\n  foo\n  bar\nc: 1\n";
     let (output, exit_code) = run_yq_stdin(".a", input, &[])?;
     assert_eq!(exit_code, 0);
-    assert_eq!(output, "\"foo\\nbar\\n\"\n");
-    // The critical assertion: round-tripping must not lose the content.
+    assert_eq!(output, "foo\nbar\n\n");
+    // Not lossless, but matches real yq's own round-trip exactly (YAML's
+    // plain-scalar line-folding rule, not a succinctly-specific bug).
     let (decoded, code2) = run_yq_stdin(".", &output, &["-o", "json"])?;
     assert_eq!(code2, 0);
-    assert_eq!(decoded.trim(), "\"foo\\nbar\\n\"");
+    assert_eq!(decoded.trim(), "\"foo bar\"");
     Ok(())
 }
 
