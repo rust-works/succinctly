@@ -730,6 +730,12 @@ impl EvalError {
         Self::new("mktime requires array inputs")
     }
 
+    /// `strftime/1 requires parsed datetime inputs` — `strftime` on an input
+    /// that's neither a broken-down-time array nor a raw number.
+    pub fn strftime_requires_parsed_datetime_inputs() -> Self {
+        Self::new("strftime/1 requires parsed datetime inputs")
+    }
+
     /// `date "<input>" does not match format "<fmt>"` — any `strptime`
     /// parse failure. jq reports this one wording regardless of which
     /// format specifier the input failed to satisfy.

@@ -16723,40 +16723,98 @@ fn builtin_strftime<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Err(e) => return e.into(),
     };
 
-    // Value should be a broken-down time array
-    let arr = match to_owned(&value) {
-        OwnedValue::Array(a) => a,
-        _ if optional => return QueryResult::None,
-        _ => return QueryResult::Error(EvalError::type_error("array", "strftime")),
-    };
+    // Value should be a broken-down time array, or a raw Unix timestamp
+    // number (auto-converted the same way `gmtime` converts one).
+    let (year, month, day, hour, minute, second, weekday, yearday) = match &value {
+        StandardJson::Number(_) => {
+            let timestamp = match get_float_value_with::<W>(&value, optional, || {
+                EvalError::strftime_requires_parsed_datetime_inputs()
+            }) {
+                Ok(f) => f,
+                Err(r) => return r,
+            };
 
-    if arr.len() < 6 {
-        if optional {
-            return QueryResult::None;
+            // Convert Unix timestamp to broken-down time (UTC) — mirrors
+            // `builtin_gmtime`'s conversion.
+            let secs = timestamp.trunc() as i64;
+            let days = if secs >= 0 {
+                secs / 86400
+            } else {
+                (secs - 86399) / 86400
+            };
+            let time_of_day = ((secs % 86400) + 86400) % 86400;
+            let hour = time_of_day / 3600;
+            let minute = (time_of_day % 3600) / 60;
+            let second = time_of_day % 60;
+
+            let z = days + 719468; // days since Mar 1, 0000
+            let era = if z >= 0 { z } else { z - 146096 } / 146097;
+            let doe = (z - era * 146097) as u32; // day of era [0, 146096]
+            let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // year of era [0, 399]
+            let y = yoe as i64 + era * 400;
+            let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // day of year [0, 365]
+            let mp = (5 * doy + 2) / 153; // month [0, 11] starting from March
+            let day = (doy - (153 * mp + 2) / 5 + 1) as i64;
+            let month = if mp < 10 { mp + 3 } else { mp - 9 };
+            let year = y + i64::from(month <= 2);
+
+            let weekday = (days % 7 + 4 + 7) % 7;
+
+            let is_leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
+            let month_days: [i64; 12] = if is_leap {
+                [0, 31, 60, 91, 121, 152, 182, 213, 244, 274, 305, 335]
+            } else {
+                [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334]
+            };
+            let yearday = month_days[(month - 1) as usize] + day - 1;
+
+            (
+                year,
+                month as i64,
+                day,
+                hour,
+                minute,
+                second,
+                weekday,
+                yearday,
+            )
         }
-        return QueryResult::Error(EvalError::new(
-            "strftime requires array with at least 6 elements",
-        ));
-    }
+        _ => match to_owned(&value) {
+            OwnedValue::Array(arr) => {
+                if arr.len() < 6 {
+                    if optional {
+                        return QueryResult::None;
+                    }
+                    return QueryResult::Error(EvalError::new(
+                        "strftime requires array with at least 6 elements",
+                    ));
+                }
 
-    let get_int = |idx: usize| -> i64 {
-        match arr.get(idx) {
-            Some(OwnedValue::Int(n)) => *n,
-            Some(OwnedValue::Float(f)) => *f as i64,
-            Some(OwnedValue::NumberLiteral(NumberRepr::Int(n), _)) => *n,
-            Some(OwnedValue::NumberLiteral(NumberRepr::Float(f), _)) => *f as i64,
-            _ => 0,
-        }
+                let get_int = |idx: usize| -> i64 {
+                    match arr.get(idx) {
+                        Some(OwnedValue::Int(n)) => *n,
+                        Some(OwnedValue::Float(f)) => *f as i64,
+                        Some(OwnedValue::NumberLiteral(NumberRepr::Int(n), _)) => *n,
+                        Some(OwnedValue::NumberLiteral(NumberRepr::Float(f), _)) => *f as i64,
+                        _ => 0,
+                    }
+                };
+
+                (
+                    get_int(0),
+                    get_int(1) + 1, // jq uses 0-indexed month
+                    get_int(2),
+                    get_int(3),
+                    get_int(4),
+                    get_int(5),
+                    if arr.len() > 6 { get_int(6) } else { 0 },
+                    if arr.len() > 7 { get_int(7) } else { 0 },
+                )
+            }
+            _ if optional => return QueryResult::None,
+            _ => return QueryResult::Error(EvalError::strftime_requires_parsed_datetime_inputs()),
+        },
     };
-
-    let year = get_int(0);
-    let month = get_int(1) + 1; // jq uses 0-indexed
-    let day = get_int(2);
-    let hour = get_int(3);
-    let minute = get_int(4);
-    let second = get_int(5);
-    let weekday = if arr.len() > 6 { get_int(6) } else { 0 };
-    let yearday = if arr.len() > 7 { get_int(7) } else { 0 };
 
     let result = format_strftime(
         &fmt, year, month, day, hour, minute, second, weekday, yearday,
