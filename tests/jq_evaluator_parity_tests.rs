@@ -835,15 +835,19 @@ fn test_parity_number_literal_reaches_more_numeric_arg_builtins_387() {
     }
 
     // strftime returns a raw (unquoted) string, so it's checked separately
-    // from the `to_json`-per-output loop above.
+    // from the `to_json`-per-output loop above. Real jq requires the full
+    // 8-element array (weekday and yearday included) — a 6-element array
+    // errors in real jq too (#760), so this uses 8 elements to keep
+    // exercising the NumberLiteral-Float arm this test targets without
+    // relying on the since-fixed 6-element leniency.
     assert_eq!(
         as_strs(&full_outputs(
-            br"[2020.0,0,1,0,0,0]",
+            br"[2020.0,0,1,0,0,0,3,0]",
             r#"strftime("%Y-%m-%d")"#
         )),
         ["\"2020-01-01\""]
     );
-    assert_parity(br"[2020.0,0,1,0,0,0]", r#"strftime("%Y-%m-%d")"#);
+    assert_parity(br"[2020.0,0,1,0,0,0,3,0]", r#"strftime("%Y-%m-%d")"#);
 }
 
 /// A slice is a path component (#366), so it reaches `path()`, `getpath`,

@@ -16741,8 +16741,24 @@ fn builtin_mktime<W: Clone + AsRef<[u64]>>(
         Err(e) => return e.into(),
     };
 
-    // Convert to Unix timestamp using inverse of the gmtime algorithm
-    // Algorithm from Howard Hinnant's date library (civil_from_days inverse)
+    let timestamp = unix_secs_from_broken_down_time(year, month, day, hour, minute, second);
+
+    QueryResult::Owned(OwnedValue::Float(timestamp as f64))
+}
+
+/// Convert broken-down time (UTC) to a Unix timestamp — the inverse of
+/// [`broken_down_time_from_unix_secs`], using the inverse of the Howard
+/// Hinnant `civil_from_days` algorithm. Shared by `mktime` and `strftime`'s
+/// `%s` specifier (#760) so a future fix to this math only needs applying
+/// in one place.
+fn unix_secs_from_broken_down_time(
+    year: i64,
+    month: i64,
+    day: i64,
+    hour: i64,
+    minute: i64,
+    second: i64,
+) -> i64 {
     let y = year - i64::from(month <= 2);
     let era = if y >= 0 { y } else { y - 399 } / 400;
     let yoe = (y - era * 400) as u32; // year of era [0, 399]
@@ -16752,9 +16768,7 @@ fn builtin_mktime<W: Clone + AsRef<[u64]>>(
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // day of era [0, 146096]
     let days = era * 146097 + doe as i64 - 719468; // days since Unix epoch
 
-    let timestamp = days * 86400 + hour * 3600 + minute * 60 + second;
-
-    QueryResult::Owned(OwnedValue::Float(timestamp as f64))
+    days * 86400 + hour * 3600 + minute * 60 + second
 }
 
 /// Builtin: strftime(fmt) - format broken-down time as string
@@ -16796,13 +16810,19 @@ fn builtin_strftime<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         }
         _ => match to_owned(&value) {
             OwnedValue::Array(arr) => {
-                if arr.len() < 6 {
+                // Real jq requires the full 8-element array — weekday and
+                // yearday included — not just the 6 fields mktime needs.
+                // Confirmed empirically: `[2024,0,15,0,0,0] | strftime(...)`
+                // errors in real jq for every length 1-7, only succeeding at
+                // 8. Below 8, this codebase used to default weekday/yearday
+                // to 0 instead of erroring, which was harmless before this
+                // PR added specifiers that read those fields (#760) — now it
+                // would silently produce a wrong date instead of matching
+                // jq's error.
+                if arr.len() < 8 {
                     if optional {
                         return QueryResult::None;
                     }
-                    // Real jq reports the same generic wording for a
-                    // too-short array as for any other invalid input —
-                    // it has no distinct "at least 6 elements" message.
                     return QueryResult::Error(
                         EvalError::strftime_requires_parsed_datetime_inputs(),
                     );
@@ -16825,8 +16845,8 @@ fn builtin_strftime<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     get_int(3),
                     get_int(4),
                     get_int(5),
-                    if arr.len() > 6 { get_int(6) } else { 0 },
-                    if arr.len() > 7 { get_int(7) } else { 0 },
+                    get_int(6),
+                    get_int(7),
                 )
             }
             _ if optional => return QueryResult::None,
@@ -16934,6 +16954,34 @@ fn format_strftime(
                 Some('t') => result.push('\t'),
                 Some('z') => result.push_str("+0000"), // UTC offset (we're always UTC for gmtime)
                 Some('Z') => result.push_str("UTC"),
+                Some('s') => result.push_str(
+                    &unix_secs_from_broken_down_time(year, month, day, hour, minute, second)
+                        .to_string(),
+                ),
+                Some('U') => {
+                    // Sunday-first week number: days before the year's first
+                    // Sunday are week 00.
+                    let week = (yearday - weekday + 7).div_euclid(7);
+                    result.push_str(&format!("{week:02}"));
+                }
+                Some('W') => {
+                    // Monday-first week number.
+                    let weekday_mon = (weekday + 6).rem_euclid(7); // Sunday=0..Sat=6 -> Monday=0..Sun=6
+                    let week = (yearday - weekday_mon + 7).div_euclid(7);
+                    result.push_str(&format!("{week:02}"));
+                }
+                Some('V') => {
+                    let (_, week) = iso_week_date(year, yearday, weekday);
+                    result.push_str(&format!("{week:02}"));
+                }
+                Some('G') => {
+                    let (iso_year, _) = iso_week_date(year, yearday, weekday);
+                    result.push_str(&format!("{iso_year:04}"));
+                }
+                Some('g') => {
+                    let (iso_year, _) = iso_week_date(year, yearday, weekday);
+                    result.push_str(&format!("{:02}", iso_year.rem_euclid(100)));
+                }
                 Some(other) => {
                     result.push('%');
                     result.push(other);
@@ -16946,6 +16994,42 @@ fn format_strftime(
     }
 
     result
+}
+
+/// ISO 8601 week-based year and week number (`%G`/`%V`), per the
+/// "Thursday rule": a date belongs to the ISO year of the Thursday in its
+/// week, and ISO week 1 is the week containing that year's first Thursday.
+/// `weekday` is Sunday=0..Saturday=6 (jq's convention); `yearday` is
+/// 0-indexed day of year.
+fn iso_week_date(year: i64, yearday: i64, weekday: i64) -> (i64, i64) {
+    let iso_weekday = if weekday == 0 { 7 } else { weekday }; // Monday=1..Sunday=7
+    let ordinal = yearday + 1; // 1-indexed day of year
+    let week = (ordinal - iso_weekday + 10).div_euclid(7);
+
+    if week < 1 {
+        let iso_year = year - 1;
+        (iso_year, weeks_in_iso_year(iso_year))
+    } else if week > weeks_in_iso_year(year) {
+        (year + 1, 1)
+    } else {
+        (year, week)
+    }
+}
+
+/// Number of ISO 8601 weeks in a given year (52 or 53).
+fn weeks_in_iso_year(year: i64) -> i64 {
+    // Standard ISO week-date "long year" test (Wikipedia: ISO week date §
+    // Weeks per year): p(y) is Jan 1 of year y's day-of-week, computed via
+    // the Gregorian doomsday-style formula. A year has 53 weeks exactly
+    // when it starts on a Thursday (p(y) == 4) or is a leap year starting
+    // on a Wednesday (p(y-1) == 3, i.e. the *previous* year started on a
+    // Wednesday and was itself a leap year).
+    let p = |y: i64| (y + y.div_euclid(4) - y.div_euclid(100) + y.div_euclid(400)).rem_euclid(7);
+    if p(year) == 4 || p(year - 1) == 3 {
+        53
+    } else {
+        52
+    }
 }
 
 /// Builtin: strptime(fmt) - parse string to broken-down time
@@ -31015,6 +31099,63 @@ mod tests {
         query!(b"[2024,0,15,10,30,0,1,14]", r#"strftime("%Y-%m-%dT%H:%M:%SZ")"#,
             QueryResult::Owned(OwnedValue::String(s)) => {
                 assert_eq!(s, "2024-01-15T10:30:00Z");
+            }
+        );
+    }
+
+    #[test]
+    fn test_strftime_week_year_specifiers() {
+        // Verified against the pinned jq oracle (#760).
+        query!(b"1435677542", r#"gmtime | strftime("%s %U %V %W %G %g")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "1435677542 26 27 26 2015 15");
+            }
+        );
+
+        // ISO week/year boundary: a Monday in late December belongs to ISO
+        // week 1 of the *following* year.
+        query!(b"1577664000", r#"gmtime | strftime("%U %V %W %G %g")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "52 01 52 2020 20");
+            }
+        );
+
+        // ISO week/year boundary the other way: Jan 1 on a Friday belongs
+        // to ISO week 53 of the *previous* year.
+        query!(b"1609459200", r#"gmtime | strftime("%U %V %W %G %g")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "00 53 00 2020 20");
+            }
+        );
+
+        // %s recomputes from the broken-down fields (portable), matching
+        // mktime exactly, rather than round-tripping through a TZ-dependent
+        // reinterpretation.
+        query!(b"[2024,0,15,10,30,0,1,14]", r#"strftime("%s")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "1705314600");
+            }
+        );
+
+        // Real jq requires the full 8-element array (weekday and yearday
+        // included), not just the 6 fields mktime needs — verified against
+        // the pinned oracle for every length 1-7. Before this fix, a
+        // 6-element array silently defaulted weekday/yearday to 0 instead
+        // of erroring, which %U/%V/%W/%G/%g would then silently compute a
+        // wrong answer from.
+        query!(b"[2024,0,15,0,0,0]", r#"strftime("%Y")"#,
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "strftime/1 requires parsed datetime inputs");
+            }
+        );
+
+        // %W's weekday-to-Monday-first remap uses rem_euclid, matching
+        // %U's div_euclid discipline rather than plain `%` (which would
+        // give a different, wrong answer for a hand-constructed array with
+        // an out-of-range weekday).
+        query!(b"[2024,0,1,0,0,0,-7,0]", r#"strftime("%U %W")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "02 00");
             }
         );
     }
