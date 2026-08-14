@@ -27392,6 +27392,50 @@ mod tests {
 
     #[cfg(feature = "regex")]
     #[test]
+    fn test_regex_scan_bare_form_honors_capture_groups_915() {
+        // #915: bare `scan(re)` used to duplicate `scan(re; flags)`'s logic
+        // instead of delegating, and the duplicate never checked
+        // `capture_count` — so a pattern with capture groups returned the
+        // whole match (group 0) instead of the array of captured groups.
+        // Verified live against jq 1.7.1: `scan("(a)(b)")` on `"ab"` is
+        // `["a","b"]`, matching what `scan(re; "")` already produced here.
+        query!(br#""ab""#, r#"scan("(a)(b)")"#,
+            QueryResult::ManyOwned(matches) => {
+                assert_eq!(matches.len(), 1);
+                assert_eq!(
+                    matches[0],
+                    OwnedValue::Array(vec![
+                        OwnedValue::String("a".to_string()),
+                        OwnedValue::String("b".to_string()),
+                    ])
+                );
+            }
+        );
+
+        // Two matches of a capture-grouped pattern.
+        query!(br#""a1b2""#, r#"scan("([a-z])([0-9])")"#,
+            QueryResult::ManyOwned(matches) => {
+                assert_eq!(matches.len(), 2);
+                assert_eq!(
+                    matches[0],
+                    OwnedValue::Array(vec![
+                        OwnedValue::String("a".to_string()),
+                        OwnedValue::String("1".to_string()),
+                    ])
+                );
+                assert_eq!(
+                    matches[1],
+                    OwnedValue::Array(vec![
+                        OwnedValue::String("b".to_string()),
+                        OwnedValue::String("2".to_string()),
+                    ])
+                );
+            }
+        );
+    }
+
+    #[cfg(feature = "regex")]
+    #[test]
     fn test_regex_splits() {
         // `splits(re)` streams one output per substring — like real jq, and
         // like `splits(re; flags)` already did before #906's fix made the
