@@ -34317,6 +34317,29 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_recurse_max_items_truncation_suppresses_a_pending_error_842() {
+        // Path-position sibling of the previous test: `resolve_recurse`'s
+        // own `stack.is_empty()` check (its `else` branch, hit only when
+        // `MAX_ITEMS` truncates the drain before a `pending_error` would
+        // otherwise surface) needs the same coverage as
+        // `builtin_recurse_f`'s.
+        let large_doc = format!(
+            r#"{{"items":[{}],"bad":5}}"#,
+            (0..15000)
+                .map(|i| i.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        query!(
+            large_doc.as_bytes(),
+            r#"path(recurse(if type=="object" then (.items[], .bad[0]) else empty end))"#,
+            QueryResult::ManyOwned(vs) => {
+                assert_eq!(vs.len(), 10000);
+            }
+        );
+    }
+
+    #[test]
     fn test_update_assign_ignores_trailing_error_after_first_output_694() {
         // The one call site that must NOT be "fixed" by #694: jq's `_modify`
         // (backing `|=`) only ever observes the update filter's first
