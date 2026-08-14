@@ -2990,6 +2990,13 @@ fn builtin_has<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             QueryResult::Owned(OwnedValue::Bool(in_bounds))
         }
         _ if optional => QueryResult::None,
+        // Real yq (mikefarah/yq, confirmed live against the pinned v4.53.3,
+        // #917) never raises a type-mismatch error for `has()` at all --
+        // `.a | has("x")` on an array, `has(0)` on an object, and `has(...)`
+        // on a bare scalar are all `false`, not an error. jq keeps erroring
+        // here (`Cannot check whether <container> has a <key> key`, which
+        // is correct and unaffected).
+        _ if S::NEGATIVE_INDEX_IN_HAS => QueryResult::Owned(OwnedValue::Bool(false)),
         _ => QueryResult::Error(EvalError::cannot_check_has(
             type_name(&value),
             key_owned.type_name(),
@@ -3013,6 +3020,17 @@ fn builtin_has<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// (confirmed: `"a" | in({b:1}, 5, {a:1})?` is only `false`, never reaching
 /// `{a:1}`'s `true` — `?`/`try` truncates the stream at the first error
 /// rather than skipping just that one output).
+///
+/// **yq-mode caveat (#917):** `in(xs)` as a jq-style function-call filter is
+/// a succinctly-only convenience in yq mode, not a real-yq-compatible
+/// construct — real yq (mikefarah/yq, confirmed live against the pinned
+/// v4.53.3) has no `in(...)` syntax at all; every invocation tried
+/// (`.a | in([1,2,3])`, `yq -n 'in([1,2,3])'`) hits a lexer error
+/// (`invalid input text "in([1,2,3])"`). So "confirmed against real yq" for
+/// this builtin's yq-mode *value* semantics means checked via jq's own
+/// desugared `. as $x | xs | has($x)` form and `has()`'s independently
+/// verified real-yq behavior — never via `in(...)` call syntax itself,
+/// which has no oracle to check against.
 fn builtin_in<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     obj_expr: &Expr,
     value: StandardJson<'a, W>,
@@ -3059,6 +3077,12 @@ fn builtin_in<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // short-circuit (#908 review; confirmed against jq 1.7.1:
             // `"a" | in(null)` is `false`, not an error).
             (_, OwnedValue::Null) => {
+                results.push(OwnedValue::Bool(false));
+            }
+            // Real yq never raises a type-mismatch error here either --
+            // see `builtin_has`'s matching arm (#917) for the
+            // real-yq-verified rationale. jq keeps erroring.
+            _ if S::NEGATIVE_INDEX_IN_HAS => {
                 results.push(OwnedValue::Bool(false));
             }
             _ => {
@@ -7959,19 +7983,22 @@ fn numeric_key_to_array_index<S: EvalSemantics>(key: &OwnedValue) -> Option<i64>
 /// bounds for an array of length `len`, per `S`'s negative-index policy?
 /// Shared by `builtin_has`/`builtin_in`'s array-key arms (#909 review: their
 /// own copies of this check had already drifted once, in #908's
-/// `i64::MIN`-overflow fix, before this PR re-duplicated it a second time
+/// `i64::MIN`-overflow fix, before that PR re-duplicated it a second time
 /// widening both to accept Float/NaN keys).
+///
+/// yq's own rule (real mikefarah/yq, confirmed live against the pinned
+/// v4.53.3, #917) is simpler than it first looks: *any* negative integer is
+/// unconditionally `true`, regardless of magnitude or the array's own
+/// length -- `.a | has(-1)`, `has(-1000000)`, and `has(-9223372036854775808)`
+/// are all `true` on a 3-element array, and even `has(-1)` on an *empty*
+/// array is `true`. This repo's own earlier documentation ("negative
+/// indices are valid if abs(idx) <= len") was itself wrong, not just this
+/// function's implementation of it -- #880/#908's own tests asserting the
+/// bounded version were written without checking the real binary.
 fn index_in_array_bounds<S: EvalSemantics>(idx: i64, len: i64) -> bool {
     if S::NEGATIVE_INDEX_IN_HAS {
-        // yq behavior: negative indices are valid if abs(idx) <= len --
-        // `unsigned_abs`, not `abs`, since `i64::MIN.abs()` overflows
-        // (panics in debug, silently wraps back to a still-negative
-        // i64::MIN in release, #908 review).
-        if idx >= 0 {
-            idx < len
-        } else {
-            idx.unsigned_abs() <= len as u64
-        }
+        // yq behavior: any negative index is valid, unconditionally.
+        idx < 0 || idx < len
     } else {
         // jq behavior: only non-negative indices
         idx >= 0 && idx < len
