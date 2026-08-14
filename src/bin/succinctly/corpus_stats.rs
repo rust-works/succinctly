@@ -373,7 +373,19 @@ fn visit_yaml(
                 if block && has_bare_dash_indicator(bytes, &child) {
                     counters.bare_dash_items += 1;
                 }
-                visit_yaml(index, bytes, child, st, counters);
+                // `child` deliberately stays unresolved for the bare-dash
+                // check above (it needs the wrapper's own position), but
+                // the recursive visit must not see the wrapper: `style()`
+                // (unlike `value()`) doesn't self-resolve, so a bare-`-`
+                // deferred flow mapping/sequence would otherwise read the
+                // `-`'s own text position instead of the deferred value's,
+                // never reporting "flow" (#849). `resolve_bare_seq_item` is
+                // private to `yaml::light`, so resolve via the public
+                // `uncons_resolved_cursor` instead of re-deriving it here.
+                let resolved = es
+                    .uncons_resolved_cursor()
+                    .map_or(child, |(resolved, _)| resolved);
+                visit_yaml(index, bytes, resolved, st, counters);
                 es = rest;
             }
             st.items_per_sequence.push(n);
@@ -1028,6 +1040,33 @@ mod tests {
         // exactly one flow collection recorded, of length == "[1, 2, 3]"
         assert_eq!(st.flow_collection_bytes.values.len(), 1);
         assert_eq!(st.flow_collection_bytes.values[0], "[1, 2, 3]".len() as u64);
+    }
+
+    #[test]
+    fn yaml_bare_dash_deferred_flow_collections_are_recorded_as_flow() {
+        // #849: a totally bare `-` sequence-item wrapper (the `-` alone on
+        // its own line, value deferred to the next line) used to make
+        // `visit_yaml`'s recursive call pass the wrapper's own cursor
+        // straight into `record_flow`, which reads `cur.style()` -- a
+        // method that (unlike `value()`) doesn't self-resolve through the
+        // wrapper, so it read the `-`'s own text position instead of the
+        // deferred value's and never reported "flow". Both a bare-dash
+        // sequence and a bare-dash mapping are covered; a same-line item
+        // (`- [7, 8]`) is included as the pre-existing, already-working
+        // control.
+        let doc = b"items:\n  -\n    [1, 2, 3]\n  -\n    {a: 1, b: 2}\n  - [7, 8]\n";
+        let mut st = YamlStats::default();
+        ingest_yaml(doc, &mut st).unwrap();
+
+        let mut lens = st.flow_collection_bytes.values.clone();
+        lens.sort_unstable();
+        let mut expected = vec![
+            "[1, 2, 3]".len() as u64,
+            "{a: 1, b: 2}".len() as u64,
+            "[7, 8]".len() as u64,
+        ];
+        expected.sort_unstable();
+        assert_eq!(lens, expected);
     }
 
     #[test]
