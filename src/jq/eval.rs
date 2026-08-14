@@ -7510,8 +7510,17 @@ fn builtin_scan_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         _ => return QueryResult::Error(EvalError::cannot_be_matched(&to_owned(&value))),
     };
 
+    // `scan` always operates in jq's "global" mode (it finds every match, the
+    // way `gsub` always replaces every match) — jq's own bootstrap prepends
+    // `g` to the flags string before validation for exactly that reason.
+    // `g` is a no-op for `build_regex`'s own compiled-pattern behavior, so
+    // this only affects the wording of an invalid-flags error, matching
+    // jq's own message: confirmed live, `scan("a"; "z")` reports "gz is not
+    // a valid modifier string", not "z is not a valid modifier string".
+    let global_flags = format!("g{}", flags.unwrap_or(""));
+
     // Build regex
-    let re = match build_regex(&pattern, flags) {
+    let re = match build_regex(&pattern, Some(&global_flags)) {
         Ok(r) => r,
         Err(_e) if optional => return QueryResult::None,
         Err(e) => return e.into(),
@@ -7582,8 +7591,13 @@ fn builtin_split_regex<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         _ => return QueryResult::Error(EvalError::cannot_be_matched(&to_owned(&value))),
     };
 
+    // `split` always operates in jq's "global" mode — see `builtin_scan_with_flags`'s
+    // identical comment on why `g` is prepended before validation (confirmed
+    // live: `split("a"; "z")` reports "gz is not a valid modifier string").
+    let global_flags = format!("g{flags}");
+
     // Build regex
-    let re = match build_regex(&pattern, Some(&flags)) {
+    let re = match build_regex(&pattern, Some(&global_flags)) {
         Ok(r) => r,
         Err(_e) if optional => return QueryResult::None,
         Err(e) => return e.into(),
@@ -7646,8 +7660,14 @@ fn builtin_splits_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         _ => return QueryResult::Error(EvalError::cannot_be_matched(&to_owned(&value))),
     };
 
+    // `splits` always operates in jq's "global" mode — see
+    // `builtin_scan_with_flags`'s identical comment on why `g` is prepended
+    // before validation (confirmed live: `splits("a"; "z")` reports "gz is
+    // not a valid modifier string").
+    let global_flags = format!("g{}", flags.unwrap_or(""));
+
     // Build regex
-    let re = match build_regex(&pattern, flags) {
+    let re = match build_regex(&pattern, Some(&global_flags)) {
         Ok(r) => r,
         Err(_e) if optional => return QueryResult::None,
         Err(e) => return e.into(),
