@@ -1280,9 +1280,12 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
     /// unmodified, but drops it when the very same node is extracted alone
     /// via field/index navigation (`.a` on `a: 1 # keep this` outputs a bare
     /// `1`, no comment - verified against the pinned real `yq` binary).
-    /// `stream_yaml` is also what `GenericResult::stream_yaml`'s
-    /// `OneCursor`/`ManyCursor` arms use for exactly those navigated
-    /// results, so it must keep the bare (no-comment) behavior.
+    /// `stream_yaml_as_document` (not the bare `stream_yaml`) is what
+    /// `GenericResult::stream_yaml`'s `OneCursor`/`ManyCursor` arms actually
+    /// call for those navigated results too (#793a), so both the whole
+    /// document and a navigated field/index share the exact same root
+    /// special-casing below - a bare `stream_yaml` call is only reached by
+    /// paths that were never a query result's own top level to begin with.
     ///
     /// Scalar/null/alias document roots are excluded even here: verified
     /// against the pinned real `yq` binary, a bare scalar document
@@ -1291,6 +1294,20 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
     /// succinctly gap, so replicated rather than "fixed" into a new
     /// divergence. Only `Mapping`/`Sequence` roots (e.g. `[1, 2, 3] # c`)
     /// keep it.
+    ///
+    /// A scalar root also drops all of its own *styling* (quotes, `|`/`>`
+    /// block-scalar indicators) - issue #852, verified against the pinned
+    /// real `yq` binary: `printf '"hi"\n' | yq '.'` prints bare `hi`, and
+    /// `printf 'a: "hi"\nb: 1\n' | yq '.a'` prints bare `hi` too, even
+    /// though the very same string nested under a key keeps its quotes.
+    /// Unlike the comment case, this applies to every ambiguous case too
+    /// (a quoted `"true"`/`"- foo"` root prints bare `true`/`- foo`, not
+    /// re-quoted for safety) - there's no sibling content at the document
+    /// root for an unquoted `true`/`- foo` to be confused with, so nothing
+    /// needs protecting. `Null`/`Alias` roots have no style to drop in the
+    /// first place (`null`/`*name` render identically either way), so only
+    /// `String` needs its own branch here instead of going through
+    /// `stream_yaml_value`'s normal quoting logic at all.
     pub fn stream_yaml_as_document<Out: core::fmt::Write>(
         &self,
         out: &mut Out,
@@ -1303,7 +1320,11 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
         let self_ = self.resolve_bare_seq_item();
         self_.write_leading_anchor(out)?;
         let value = self_.value();
-        self_.stream_yaml_value(out, "", indent.width, indent.unit, sort_keys, false)?;
+        if let YamlValue::String(s) = &value {
+            out.write_str(&s.as_str().unwrap_or(Cow::Borrowed("\"\"")))?;
+        } else {
+            self_.stream_yaml_value(out, "", indent.width, indent.unit, sort_keys, false)?;
+        }
         if matches!(value, YamlValue::Mapping(_) | YamlValue::Sequence(_)) {
             write_line_comment(out, self_.line_comment_raw())?;
         }
