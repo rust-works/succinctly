@@ -10111,3 +10111,20 @@ fn test_builtin_in_and_has_yq_negative_index_i64_min_no_overflow_908() -> Result
     assert_eq!(out.trim(), "false");
     Ok(())
 }
+
+/// #909: the array-index arm's yq-mode negative-index branch also gets a
+/// Float key now (previously Int-only), truncated toward zero before the
+/// `abs(idx) <= len` check runs. Confirmed against real yq: `-1.5 |
+/// in([1,2,3])` truncates to index -1, `abs(-1) <= 3` -- `true`; `-4.5 |
+/// in([1,2,3])` truncates to -4, `abs(-4) > 3` -- `false`.
+#[test]
+fn test_builtin_in_yq_negative_float_index_909() -> Result<()> {
+    let (out, code) = run_yq_stdin("in([1,2,3])", "-1.5", &[])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "true");
+
+    let (out, code) = run_yq_stdin("in([1,2,3])", "-4.5", &[])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "false");
+    Ok(())
+}

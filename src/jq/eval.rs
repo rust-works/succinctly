@@ -25042,6 +25042,29 @@ mod tests {
     }
 
     #[test]
+    fn test_builtin_has_float_and_nan_array_key_909() {
+        // #909: the array-index arm used to match only Int, erroring on a
+        // Float/NaN key instead of truncating toward zero (matching jq's
+        // own `.[1.5]` coercion) or, for NaN, answering `false` -- both via
+        // the existing `numeric_key_to_index` helper. Confirmed against jq
+        // 1.7.1: `[1,2,3] | has(1.5)` and `has(2.9)` are both `true`
+        // (truncate to index 1/2, in bounds); `has(5.5)` is `false` (index
+        // 5, out of bounds); `has(nan)` is `false`.
+        query!(br"[1, 2, 3]", "has(1.5)",
+            QueryResult::Owned(OwnedValue::Bool(true)) => {}
+        );
+        query!(br"[1, 2, 3]", "has(2.9)",
+            QueryResult::Owned(OwnedValue::Bool(true)) => {}
+        );
+        query!(br"[1, 2, 3]", "has(5.5)",
+            QueryResult::Owned(OwnedValue::Bool(false)) => {}
+        );
+        query!(br"[1, 2, 3]", "has(nan)",
+            QueryResult::Owned(OwnedValue::Bool(false)) => {}
+        );
+    }
+
+    #[test]
     fn test_builtin_in() {
         // in() checks if a key/index exists
         // Note: in() with piped owned values requires fixing eval_pipe
@@ -25087,6 +25110,24 @@ mod tests {
         // is `false`.
         assert_eq!(outputs(b"2", "in([1,2,3])"), ["true"]);
         assert_eq!(outputs(b"5", "in([1,2,3])"), ["false"]);
+    }
+
+    #[test]
+    // `"in([1,2,3])"` is a jq filter literal, not a formatting string;
+    // clippy cannot tell the two apart from the brace shape alone.
+    #[allow(clippy::literal_string_with_formatting_args)]
+    fn test_builtin_in_float_and_nan_array_key_909() {
+        // #909: `in(xs)`'s array-index arm had the identical Float/NaN gap
+        // as `builtin_has`'s (see `test_builtin_has_float_and_nan_array_key_909`).
+        // Confirmed against jq 1.7.1: `1.5 | in([1,2,3])` and `2.9 |
+        // in([1,2,3])` are both `true`; `5.5 | in([1,2,3])` is `false`;
+        // `nan | in([1,2,3])` is `false`.
+        assert_eq!(outputs(b"1.5", "in([1,2,3])"), ["true"]);
+        assert_eq!(outputs(b"2.9", "in([1,2,3])"), ["true"]);
+        assert_eq!(outputs(b"5.5", "in([1,2,3])"), ["false"]);
+        // JSON has no NaN literal, so `nan` has to come from the filter's
+        // own jq-level constant rather than the input document.
+        assert_eq!(outputs(b"null", "nan | in([1,2,3])"), ["false"]);
     }
 
     #[test]
