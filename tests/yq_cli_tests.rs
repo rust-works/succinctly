@@ -10063,14 +10063,19 @@ fn test_m2_json_output_select_halt_writes_nothing_for_halted_doc() -> Result<()>
 /// #880/#917: `builtin_in`'s array-index arm has a yq-specific
 /// negative-index branch (`S::NEGATIVE_INDEX_IN_HAS`, unreachable via
 /// `succinctly jq`'s `JqSemantics`). #917's review corrected the rule this
-/// pins: real yq (confirmed live against the pinned v4.53.3) accepts *any*
-/// negative index unconditionally, regardless of magnitude vs. the array's
-/// own length -- #880's own version of this test asserted the bounded
-/// `abs(idx) <= len` rule this repo's docs used to (incorrectly) claim,
-/// written without checking the real binary. Confirmed: `-1 | in([1,2,3])`
-/// and `-4 | in([1,2,3])` (magnitude 4 > len 3) are both `true`;
-/// `2 | in([1,2,3])` is `true`; `5 | in([1,2,3])` is `false` (jq-shared,
-/// non-negative-only bound still applies on the positive side).
+/// pins: real yq accepts *any* negative index unconditionally, regardless
+/// of magnitude vs. the array's own length -- #880's own version of this
+/// test asserted the bounded `abs(idx) <= len` rule this repo's docs used
+/// to (incorrectly) claim, written without checking the real binary. Real
+/// yq itself has no `in(...)` call syntax at all (`builtin_in`'s own doc
+/// comment has the real-yq-verified detail), so the values below are
+/// checked via `succinctly yq`'s own binary, not real yq directly -- the
+/// oracle-verified claim is the *value* semantics (via `has($x)`'s
+/// desugared form, confirmed live against the pinned v4.53.3), not this
+/// `in(...)` invocation syntax. `-1 | in([1,2,3])` and `-4 | in([1,2,3])`
+/// (magnitude 4 > len 3) are both `true`; `2 | in([1,2,3])` is `true`;
+/// `5 | in([1,2,3])` is `false` (jq-shared, non-negative-only bound still
+/// applies on the positive side).
 #[test]
 fn test_builtin_in_yq_negative_index_880() -> Result<()> {
     let (out, code) = run_yq_stdin("in([1,2,3])", "-1", &[])?;
@@ -10095,11 +10100,12 @@ fn test_builtin_in_yq_negative_index_880() -> Result<()> {
 /// overflowed for `i64::MIN` -- a debug build panicked ("attempt to negate
 /// with overflow", exit 101), a release build silently wrapped back to a
 /// still-negative `i64::MIN`. #917 replaced the whole bounded-magnitude
-/// check with an unconditional `idx < 0` test (any negative index is
-/// simply always in range in real yq), which sidesteps the overflow
-/// concern entirely rather than needing `unsigned_abs()` to guard it --
-/// pinning that `i64::MIN` still doesn't panic and now correctly answers
-/// `true` (not `false`), matching every other negative magnitude.
+/// check with a plain `idx < len` comparison (any negative index is simply
+/// always in range in real yq, since `len` is never negative), which
+/// sidesteps the overflow concern entirely rather than needing
+/// `unsigned_abs()` to guard it -- pinning that `i64::MIN` still doesn't
+/// panic and now correctly answers `true` (not `false`), matching every
+/// other negative magnitude.
 #[test]
 fn test_builtin_in_and_has_yq_negative_index_i64_min_no_overflow_908() -> Result<()> {
     let (out, code) = run_yq_stdin("in([1,2,3])", "-9223372036854775808", &[])?;
@@ -10204,5 +10210,32 @@ fn test_builtin_in_yq_type_mismatch_never_errors_917() -> Result<()> {
     let (out, code) = run_yq_stdin("in(42)", r#""x""#, &[])?;
     assert_eq!(code, 0, "out: {out:?}");
     assert_eq!(out.trim(), "false");
+    Ok(())
+}
+
+/// Review finding on #917: `builtin_has`'s "yq never errors on a type
+/// mismatch" arm originally sat *after* the pre-existing `_ if optional`
+/// arm, so it was unreachable whenever `optional` was true --
+/// `isvalid(EXPR)` forces `optional=true` unconditionally for its inner
+/// expression (`builtin_isvalid`), so `isvalid(has("x"))` on `[1,2,3]`
+/// returned `false` (as if `has("x")` *would* error without the forced
+/// `?`) instead of `true` (yq's `has()` never errors here at all, so the
+/// expression is valid). Fixed by moving the permissive arm before the
+/// `optional` check. `in()`'s equivalent per-candidate arm never had this
+/// bug (it doesn't have a separate `optional`-gated arm in its loop), pinned
+/// here too so the two stay symmetric.
+#[test]
+fn test_isvalid_has_yq_type_mismatch_is_valid_917() -> Result<()> {
+    let (out, code) = run_yq_stdin(r#"isvalid(has("x"))"#, "[1,2,3]", &[])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "true");
+
+    let (out, code) = run_yq_stdin("isvalid(has(0))", "{a: 1}", &[])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "true");
+
+    let (out, code) = run_yq_stdin(r"isvalid(in(5))", r#""x""#, &[])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "true");
     Ok(())
 }

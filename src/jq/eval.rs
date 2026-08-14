@@ -49,7 +49,17 @@ pub trait EvalSemantics: Copy + Default {
     const OVERFLOW_WRAPS: bool;
     /// If true, division by zero returns infinity (yq). If false, returns error (jq).
     const DIV_BY_ZERO_IS_INFINITY: bool;
-    /// If true, has(-1) on arrays checks if abs(idx) <= len (yq). If false, only non-negative (jq).
+    /// If true (yq), `has()`/`in()`'s array-index arm accepts *any* negative
+    /// index unconditionally (magnitude doesn't matter, confirmed live
+    /// against real yq v4.53.3, #917 -- an earlier, narrower `abs(idx) <=
+    /// len` rule documented here was itself wrong, not just its
+    /// implementation), and their catch-all type-mismatch arm answers
+    /// `false` instead of erroring. If false (jq), only non-negative
+    /// indices are ever in bounds and a type mismatch still raises
+    /// `cannot_check_has`. These are two distinct policies bundled under
+    /// one const because real yq happens to relax both together; see
+    /// `has_type_mismatch_is_permissive` for the second policy accessed
+    /// under its own name.
     const NEGATIVE_INDEX_IN_HAS: bool;
     /// If true, `%` truncates float operands to integers (jq). If false, float modulo (yq).
     const MOD_TRUNCATES_FLOATS: bool;
@@ -78,7 +88,7 @@ pub trait EvalSemantics: Copy + Default {
 ///
 /// - Integer overflow converts to float
 /// - Division by zero returns error
-/// - has(-1) on arrays returns false
+/// - has(-1) on arrays returns false; has()/in() on a type mismatch errors
 #[derive(Debug, Clone, Copy, Default)]
 pub struct JqSemantics;
 
@@ -97,7 +107,9 @@ impl EvalSemantics for JqSemantics {
 ///
 /// - Integer overflow wraps
 /// - Division by zero returns infinity
-/// - has(-1) on arrays returns true (if abs(idx) <= len)
+/// - has(-1) on arrays returns true unconditionally (any negative index,
+///   regardless of magnitude); has()/in() on a type mismatch answers
+///   `false` instead of erroring
 #[derive(Debug, Clone, Copy, Default)]
 pub struct YqSemantics;
 
@@ -2989,14 +3001,22 @@ fn builtin_has<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             };
             QueryResult::Owned(OwnedValue::Bool(in_bounds))
         }
-        _ if optional => QueryResult::None,
         // Real yq (mikefarah/yq, confirmed live against the pinned v4.53.3,
         // #917) never raises a type-mismatch error for `has()` at all --
         // `.a | has("x")` on an array, `has(0)` on an object, and `has(...)`
-        // on a bare scalar are all `false`, not an error. jq keeps erroring
-        // here (`Cannot check whether <container> has a <key> key`, which
-        // is correct and unaffected).
-        _ if S::NEGATIVE_INDEX_IN_HAS => QueryResult::Owned(OwnedValue::Bool(false)),
+        // on a bare scalar are all `false`, not an error. This has to come
+        // *before* the `optional` arm below: yq's `has()` never errors here
+        // regardless of `?`, so `isvalid(has("x"))` on an array (which
+        // forces `optional=true` unconditionally, see `builtin_isvalid`)
+        // must still report the expression as valid, not `None`/`false` as
+        // if it *would* have errored without `?` -- an earlier version of
+        // this arm sat after the `optional` check and made `isvalid` return
+        // `false` for a `has()` call yq itself never fails on (#917 review,
+        // caught via `isvalid(has("x"))` on `[1,2,3]` returning `false`
+        // instead of `true`). jq keeps erroring here (`Cannot check whether
+        // <container> has a <key> key`, which is correct and unaffected).
+        _ if has_type_mismatch_is_permissive::<S>() => QueryResult::Owned(OwnedValue::Bool(false)),
+        _ if optional => QueryResult::None,
         _ => QueryResult::Error(EvalError::cannot_check_has(
             type_name(&value),
             key_owned.type_name(),
@@ -3013,13 +3033,18 @@ fn builtin_has<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// {a:9})]'` is `[true,true]`). `eval_owned_multi_keep_partial` evaluates
 /// `xs` fully (keeping every already-produced candidate if a later one
 /// errors/breaks/halts, #842's precedent), then each candidate is checked
-/// against the key in encounter order — a per-candidate type mismatch (e.g.
-/// a number where an object was needed) stops the loop exactly like `xs`
-/// itself erroring would, since real jq's `has($x)` raising mid-pipe has the
-/// same effect as `xs` raising: the rest of the generator never runs
-/// (confirmed: `"a" | in({b:1}, 5, {a:1})?` is only `false`, never reaching
-/// `{a:1}`'s `true` — `?`/`try` truncates the stream at the first error
-/// rather than skipping just that one output).
+/// against the key in encounter order. In jq mode, a per-candidate type
+/// mismatch (e.g. a number where an object was needed) stops the loop
+/// exactly like `xs` itself erroring would, since real jq's `has($x)`
+/// raising mid-pipe has the same effect as `xs` raising: the rest of the
+/// generator never runs (confirmed: `"a" | in({b:1}, 5, {a:1})?` is only
+/// `false`, never reaching `{a:1}`'s `true` — `?`/`try` truncates the
+/// stream at the first error rather than skipping just that one output).
+/// In yq mode this does *not* apply (#917): a type mismatch is never an
+/// error there, so the loop treats it as `false` and keeps going --
+/// `"a" | [in({b:1}, 5, {a:1})]` in yq mode is `[false, false, true]`,
+/// reaching `{a:1}`'s `true` past the mismatched `5`, unlike jq's
+/// early-truncating behavior above.
 ///
 /// **yq-mode caveat (#917):** `in(xs)` as a jq-style function-call filter is
 /// a succinctly-only convenience in yq mode, not a real-yq-compatible
@@ -3082,7 +3107,7 @@ fn builtin_in<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // Real yq never raises a type-mismatch error here either --
             // see `builtin_has`'s matching arm (#917) for the
             // real-yq-verified rationale. jq keeps erroring.
-            _ if S::NEGATIVE_INDEX_IN_HAS => {
+            _ if has_type_mismatch_is_permissive::<S>() => {
                 results.push(OwnedValue::Bool(false));
             }
             _ => {
@@ -7997,12 +8022,35 @@ fn numeric_key_to_array_index<S: EvalSemantics>(key: &OwnedValue) -> Option<i64>
 /// bounded version were written without checking the real binary.
 fn index_in_array_bounds<S: EvalSemantics>(idx: i64, len: i64) -> bool {
     if S::NEGATIVE_INDEX_IN_HAS {
-        // yq behavior: any negative index is valid, unconditionally.
-        idx < 0 || idx < len
+        // yq behavior: any negative index is valid, unconditionally; a
+        // non-negative index still obeys the ordinary bound. `len` (an
+        // element count) is always >= 0 at both call sites, so `idx < len`
+        // alone already implies "any negative index passes" without a
+        // separate `idx < 0` disjunct -- `idx < 0 || idx < len` would be
+        // logically equivalent but reads as if the two arms independently
+        // do work, when only this one comparison is actually load-bearing.
+        idx < len
     } else {
         // jq behavior: only non-negative indices
         idx >= 0 && idx < len
     }
+}
+
+/// Does a `has()`/`in()` type mismatch (a key/container shape neither
+/// preceding match arm handles, e.g. a string key on an array) answer
+/// `false` instead of raising `cannot_check_has`? Real yq (mikefarah/yq,
+/// confirmed live against the pinned v4.53.3, #917) is fully permissive
+/// here; jq keeps erroring. Named and extracted separately from
+/// `S::NEGATIVE_INDEX_IN_HAS` itself -- even though it currently tracks the
+/// same const, this is a distinct policy (type-mismatch handling, not
+/// negative-index bounds) that real yq merely happens to relax alongside
+/// the other. Shared by `builtin_has` and `builtin_in`'s catch-all arms so
+/// the two can't silently drift the way `index_in_array_bounds`'s own
+/// bounds-check logic already did twice before its own extraction (see
+/// that function's doc comment, and CLAUDE.md's "Duplicated predicates
+/// diverge silently" insight from #106).
+fn has_type_mismatch_is_permissive<S: EvalSemantics>() -> bool {
+    S::NEGATIVE_INDEX_IN_HAS
 }
 
 /// Apply one resolved key to one target value.
