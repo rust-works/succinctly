@@ -13403,15 +13403,41 @@ fn builtin_isvalid<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // A halt is never a validity verdict: it must exit the process, not
         // report `true`/`false` and let evaluation continue (#791) — same
         // shape as the `Error`/`None` cases above never being swallowed by
-        // `isempty`.
-        QueryResult::Halt(code) => QueryResult::Halt(code),
-        QueryResult::Partial(_, Control::Halt(code)) => QueryResult::Halt(code),
+        // `isempty`. Both the bare and `Partial`-prefixed shapes propagate
+        // identically, so they're one OR-pattern arm (matching this file's
+        // own precedent, e.g. `QueryResult::is_error`).
+        QueryResult::Halt(code) | QueryResult::Partial(_, Control::Halt(code)) => {
+            QueryResult::Halt(code)
+        }
         // Same reasoning applies to an unresolved `break`: it must keep
         // unwinding toward its enclosing `label`, not report `true` and let
         // evaluation continue (#867) — the `_` catch-all below previously
         // swallowed both shapes exactly like the `Halt` cases once did.
-        QueryResult::Break(label) => QueryResult::Break(label),
-        QueryResult::Partial(_, Control::Break(label)) => QueryResult::Break(label),
+        //
+        // Deliberately propagates `Partial(_, Control::Break(_))`
+        // unconditionally too, same as `Halt` above, even though a prior
+        // output *was* produced — this is not an oversight, and does not
+        // need `isempty`'s asymmetric treatment (see that function's own
+        // comment): `isempty`'s asymmetry exists because real jq's own
+        // laziness means a break *after* the first output is never even
+        // reached there. `isvalid` has no such laziness (`eval_single`
+        // evaluates the whole argument eagerly), so the real question is
+        // simply "is a trailing `break` isvalid's concern, or a foreign
+        // escape passing through it" - and unwrapped jq settles that:
+        // `label $out | (1, break $out), "after"` prints `1` then unwinds
+        // to `$out` untouched (exit 0), while the structurally identical
+        // `(1, error("x")), "after"` prints `1` then genuinely fails (exit
+        // 5) - real jq itself only ever "digests" the *error* case into a
+        // pass/fail outcome, never the break case, regardless of what
+        // already ran before it. `isvalid` mirrors that: `Error`/`None`
+        // are its actual domain (digested into `Bool`), `Break` and `Halt`
+        // are both foreign control escapes that must pass through
+        // unconverted no matter what already ran - keeping `Break`
+        // symmetric with the already-established `Halt` arm above, not
+        // with `Error`.
+        QueryResult::Break(label) | QueryResult::Partial(_, Control::Break(label)) => {
+            QueryResult::Break(label)
+        }
         _ => QueryResult::Owned(OwnedValue::Bool(true)),
     }
 }
