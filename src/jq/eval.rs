@@ -9493,11 +9493,14 @@ fn eval_owned_multi_first<S: EvalSemantics>(
 ///
 /// `eval_owned_multi`'s all-or-nothing contract is correct for its other
 /// callers (see its own doc comment), so this is a separate function rather
-/// than a change to that one's behavior. The only correct callers are
-/// `recurse`'s own children-evaluation step, value position
-/// (`builtin_recurse_f`/`builtin_recurse_cond`, both evaluate `f` through
-/// this function directly). The path-position sibling, `resolve_recurse`,
-/// needs the same fix but resolves `f` through `resolve_node`/
+/// than a change to that one's behavior. Direct callers today: `recurse`'s
+/// own children-evaluation step in value position (`builtin_recurse_f`/
+/// `builtin_recurse_cond`, both evaluate `f` through this function
+/// directly), and `resolve_leaf`'s non-primitive fallback in path position
+/// (#861 — the same all-or-nothing pitfall reaching `path(...)`-wrapped
+/// expressions whose argument isn't one of the specially-tracked navigation
+/// primitives). The other path-position sibling, `resolve_recurse`, needs
+/// the same fix but resolves `f` through `resolve_node`/
 /// `resolve_against_cow` instead — a structurally different call whose
 /// `PathResolveResult` already threads a prefix through its own `Err`, so
 /// it applies the equivalent fix without calling this function. `f`'s *own*
@@ -9509,6 +9512,14 @@ fn eval_owned_multi_first<S: EvalSemantics>(
 /// `{"a":1,"b":2}` prints the root *and* `1` (the `.a` branch, produced
 /// before `.b[0]` fails) before erroring — succinctly used to print only the
 /// root.
+///
+/// Unlike the two `recurse` callers (which always thread the trailing
+/// escape through to their own caller regardless of prefix length),
+/// `resolve_leaf` deliberately discards a trailing `Break`/`Error` once it
+/// already has a value to check path-shape against — see its own comments —
+/// while still always propagating a trailing `Halt`. Callers of this
+/// function decide that policy themselves; it isn't part of this function's
+/// own contract.
 ///
 /// Built on [`push_owned_values`] (the same "keep every value, surface the
 /// terminal escape separately" primitive [`eval_binary_fanout`] already
@@ -10282,7 +10293,40 @@ fn resolve_leaf<'a, S: EvalSemantics>(
             ));
         }
     }
-    let mut values = eval_owned_multi::<S>(expr, value).map_err(|e| (Vec::new(), e))?;
+    // `eval_owned_multi_keep_partial`, not `eval_owned_multi`: a later output
+    // of `expr` erroring or breaking must not retroactively un-produce an
+    // earlier one it already yielded (#842's precedent for `recurse`'s own
+    // fan-out, applying equally here) — see the "streams as it goes" case
+    // below (#861).
+    let (mut values, trailing) = match eval_owned_multi_keep_partial::<S>(expr, value) {
+        Ok(values) => (values, None),
+        Err((prefix, escape)) => (prefix, Some(escape)),
+    };
+    // Halt is never swallowed, however many outputs `expr` already produced:
+    // it is an unconditional process-termination signal (`EvalEscape::Halt`'s
+    // own doc comment), not an ordinary catchable failure. Break/Error below
+    // are provably safe to fold into an ordinary path error instead —
+    // confirmed live against jq 1.7.1, real jq's own `path(...)` never even
+    // reaches a later output's break/error here (see the `1 =>` arm's
+    // comment below) — but that same "real jq never gets there" argument
+    // does not rescue Halt: a script relying on `halt_error` as a hard,
+    // uncatchable abort must not have it silently downgraded into a
+    // `try`/`catch`-able "Invalid path expression" just because this
+    // resolver's own evaluation of `expr` is eager rather than jq's lazy
+    // per-output generator (unlike jq, `eval_owned_multi_keep_partial`
+    // already ran the candidate that halted, side effects included, by the
+    // time control reaches here — the only question left is whether that
+    // already-triggered halt still takes effect, and it must).
+    if let Some(EvalEscape::Halt(code)) = &trailing {
+        return Err((Vec::new(), EvalEscape::Halt(*code)));
+    }
+    // No output prunes the branch — unless there never would have been one
+    // because evaluating `expr` itself broke/errored (Halt excluded, handled
+    // above) before producing anything.
+    let empty_case = |trailing: Option<EvalEscape>| match trailing {
+        Some(escape) => Err((Vec::new(), escape)),
+        None => Ok(Vec::new()),
+    };
     if trackable
         && matches!(
             expr,
@@ -10292,8 +10336,7 @@ fn resolve_leaf<'a, S: EvalSemantics>(
         let mut components = Vec::new();
         push_path_components(&mut components, expr);
         return match values.len() {
-            // No output prunes the branch.
-            0 => Ok(Vec::new()),
+            0 => empty_case(trailing),
             1 => Ok(vec![(
                 components,
                 Cow::Owned(values.pop().expect("len checked")),
@@ -10311,7 +10354,19 @@ fn resolve_leaf<'a, S: EvalSemantics>(
         };
     }
     match values.len() {
-        0 => Ok(Vec::new()),
+        0 => empty_case(trailing),
+        // Real jq's `path(...)` checks each output as it streams: the first
+        // non-path-shaped value raises "Invalid path expression" immediately,
+        // before a later output of the same expression is ever produced —
+        // even one that would itself error or break (confirmed live:
+        // `path(range(3))` raises on `0` alone, never reaching `1`/`2`; #861's
+        // own repro, `path(paths(if type=="string" then break $out else true
+        // end))` on `[1,"x",2]`, raises on `[0]` alone, never reaching the
+        // second candidate where the `break` sits). `values[0]` is that first
+        // output regardless of whether `trailing` still carries a Break/Error
+        // from evaluating further here — real jq never reaches whatever would
+        // have caused it, so it's discarded rather than propagated (Halt is
+        // the one exception, already handled above).
         1 => Err((
             Vec::new(),
             EvalError::invalid_path_expression(&values[0]).into(),
@@ -10324,6 +10379,13 @@ fn resolve_leaf<'a, S: EvalSemantics>(
         // (`Invalid path expression near attempt to access element ... of
         // ...`) is its own message shape already deliberately not
         // reproduced here, per `test_unsupported_path_prefixes_report_rather_than_misfire`).
+        //
+        // Note this doesn't match live jq either (confirmed above,
+        // `path(range(3))` raises on the first value, not this message) —
+        // a pre-existing, separate divergence from #861's own repro, not
+        // touched here. A trailing Break/Error past this point is discarded
+        // the same way the `1 =>` arm's comment explains (Halt already
+        // handled above, before either match).
         _ => Err((
             Vec::new(),
             EvalError::new("Cannot use a computed index after a multi-output path component")
@@ -30093,6 +30155,61 @@ mod tests {
                 QueryResult::Error(e) => assert_eq!(e.message, message, "{filter}")
             );
         }
+    }
+
+    /// #861: `path(paths(node_filter))` checks each of `paths(node_filter)`'s
+    /// own outputs (plain arrays, not further path-trackable) the moment
+    /// they're produced — the same "invalid path expression" check
+    /// `test_path_of_a_non_path_expression_raises_invalid_path_expression`
+    /// above exercises for a single-output argument, but here the argument is
+    /// a generator whose *second* candidate would otherwise `break` to a
+    /// label outside `path(...)` entirely. Real jq never reaches that second
+    /// candidate: it raises on the first output before evaluating the next
+    /// one, so the break never fires. Verified against jq 1.7.1: `label $out
+    /// | path(paths(if type=="string" then break $out else true end))` on
+    /// `[1,"x",2]` raises "Invalid path expression with result [0]", exit 5
+    /// — not silence (`resolve_leaf`'s fallback used to evaluate the whole
+    /// argument via `eval_owned_multi`, which discards the already-produced
+    /// first output the moment the second candidate's break escapes, per
+    /// #842's precedent for the same all-or-nothing pitfall elsewhere).
+    #[test]
+    fn test_path_paths_filter_raises_before_reaching_a_later_break_861() {
+        query!(
+            br#"[1,"x",2]"#,
+            r#"label $out | path(paths(if type=="string" then break $out else true end))"#,
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "Invalid path expression with result [0]");
+            }
+        );
+    }
+
+    /// Halt sibling of the fix above: switching `resolve_leaf` to
+    /// `eval_owned_multi_keep_partial` means a later `Break`/`Error` no
+    /// longer erases an already-produced prefix, but `Halt` must never be
+    /// folded into that same "discard the escape, raise an ordinary path
+    /// error" treatment. `EvalEscape::Halt`'s own doc: "Must reach the CLI
+    /// unconditionally; never catchable, never suppressible." Two
+    /// legitimate outputs (`[0]`, `[1]`, from the two number candidates)
+    /// are produced before the third candidate halts — unlike `break`, real
+    /// jq's own laziness never even reaches this halt either (it would
+    /// raise on `[0]` alone, same as #861's own repro), but this resolver's
+    /// evaluation is eager, not lazy, so by the time `resolve_leaf` sees
+    /// the escape, `halt_error`'s side effect has already run and its exit
+    /// code must still take effect rather than being silently downgraded
+    /// into a catchable "Invalid path expression".
+    #[test]
+    fn test_path_paths_filter_never_swallows_a_later_halt() {
+        query!(
+            br#"[1,2,"trigger"]"#,
+            r#"path(paths(if type=="string" then (.|halt_error) else true end))"#,
+            QueryResult::Halt(_) => {}
+        );
+        // Wrapping in try/catch must not change this: halt is uncatchable.
+        query!(
+            br#"[1,2,"trigger"]"#,
+            r#"try path(paths(if type=="string" then (.|halt_error) else true end)) catch "caught""#,
+            QueryResult::Halt(_) => {}
+        );
     }
 
     /// `?` does not suppress `invalid_path_expression` — it is a statement
