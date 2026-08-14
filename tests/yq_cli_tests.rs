@@ -10112,18 +10112,50 @@ fn test_builtin_in_and_has_yq_negative_index_i64_min_no_overflow_908() -> Result
     Ok(())
 }
 
-/// #909: the array-index arm's yq-mode negative-index branch also gets a
-/// Float key now (previously Int-only), truncated toward zero before the
-/// `abs(idx) <= len` check runs. Confirmed against real yq: `-1.5 |
-/// in([1,2,3])` truncates to index -1, `abs(-1) <= 3` -- `true`; `-4.5 |
-/// in([1,2,3])` truncates to -4, `abs(-4) > 3` -- `false`.
+/// #909 review: unlike jq, real yq (mikefarah/yq, confirmed live against
+/// the pinned v4.53.3) never accepts a Float key for array indexing at
+/// all -- not even a negative one that would truncate to an in-bounds
+/// index. `printf 'a: [1,2,3]\n' | yq '.a | has(-1.5)'` and `has(-4.5)`
+/// are both `false`, unlike jq's `.[1.5]`-style truncation. An earlier
+/// version of this test asserted the opposite (that yq truncates just
+/// like jq) before this was checked against the real binary; ports
+/// `numeric_key_to_array_index`'s corrected behavior.
 #[test]
 fn test_builtin_in_yq_negative_float_index_909() -> Result<()> {
     let (out, code) = run_yq_stdin("in([1,2,3])", "-1.5", &[])?;
     assert_eq!(code, 0, "out: {out:?}");
-    assert_eq!(out.trim(), "true");
+    assert_eq!(out.trim(), "false");
 
     let (out, code) = run_yq_stdin("in([1,2,3])", "-4.5", &[])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "false");
+    Ok(())
+}
+
+/// Companion test: yq mode also rejects a *positive* Float key, even one
+/// whose truncated value would be an in-bounds index (confirmed live:
+/// `has(2.0)` and `has(1.5)` are both `false` on a 3-element array, unlike
+/// jq's truncate-then-bounds-check).
+///
+/// Uses `2.5`/`1.5`, not `2.0`, as the YAML *input* value -- an
+/// integer-valued float scalar like `2.0` gets normalized to a genuine
+/// `OwnedValue::Int` during YAML parsing itself (confirmed via direct
+/// inspection; a separate, pre-existing characteristic of this codebase's
+/// YAML-to-OwnedValue conversion, unrelated to this fix -- filed
+/// separately). `2.5`/`1.5` have a real fractional part and are preserved
+/// as `Float` all the way through, which is what this test needs to
+/// exercise the array-key arm's Float-rejection path.
+#[test]
+fn test_builtin_in_yq_positive_float_index_never_matches_909() -> Result<()> {
+    let (out, code) = run_yq_stdin("in([1,2,3])", "2.5", &[])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "false");
+
+    let (out, code) = run_yq_stdin("in([1,2,3])", "1.5", &[])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "false");
+
+    let (out, code) = run_yq_stdin("has(2.0)", "[1,2,3]", &[])?;
     assert_eq!(code, 0, "out: {out:?}");
     assert_eq!(out.trim(), "false");
     Ok(())
