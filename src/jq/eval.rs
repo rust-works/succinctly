@@ -16925,8 +16925,15 @@ fn parse_simple_tz_offset(tz: &str) -> Option<i64> {
     let hours: i64 = parts.first()?.parse().ok()?;
     let minutes: i64 = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
 
-    // TZ offset is positive for west of UTC, but we want seconds to add
-    let offset_secs = (hours * 3600 + minutes * 60) * if negative { 1 } else { -1 };
+    // TZ offset is positive for west of UTC, but we want seconds to add.
+    // `hours`/`minutes` are parsed straight out of the `TZ` env var with no
+    // bound (#894) — checked throughout so a malformed/adversarial `TZ`
+    // falls back to the existing `None` -> UTC path instead of panicking.
+    let hour_secs = hours.checked_mul(3600)?;
+    let minute_secs = minutes.checked_mul(60)?;
+    let offset_secs = hour_secs
+        .checked_add(minute_secs)?
+        .checked_mul(if negative { 1 } else { -1 })?;
     Some(offset_secs)
 }
 
@@ -16968,8 +16975,11 @@ fn builtin_mktime<W: Clone + AsRef<[u64]>>(
         Err(_) if optional => return QueryResult::None,
         Err(e) => return e.into(),
     };
-    let month = match get_int(1) {
-        Ok(m) => m + 1, // jq uses 0-indexed months
+    let month = match get_int(1).and_then(|m| {
+        m.checked_add(1)
+            .ok_or_else(EvalError::broken_down_time_out_of_range)
+    }) {
+        Ok(m) => m, // jq uses 0-indexed months
         Err(_) if optional => return QueryResult::None,
         Err(e) => return e.into(),
     };
@@ -16994,7 +17004,11 @@ fn builtin_mktime<W: Clone + AsRef<[u64]>>(
         Err(e) => return e.into(),
     };
 
-    let timestamp = unix_secs_from_broken_down_time(year, month, day, hour, minute, second);
+    let timestamp = match unix_secs_from_broken_down_time(year, month, day, hour, minute, second) {
+        Ok(t) => t,
+        Err(_) if optional => return QueryResult::None,
+        Err(e) => return QueryResult::Error(e),
+    };
 
     QueryResult::Owned(OwnedValue::Float(timestamp as f64))
 }
@@ -17004,6 +17018,17 @@ fn builtin_mktime<W: Clone + AsRef<[u64]>>(
 /// Hinnant `civil_from_days` algorithm. Shared by `mktime` and `strftime`'s
 /// `%s` specifier (#760) so a future fix to this math only needs applying
 /// in one place.
+///
+/// Returns `Err` for any `year`/`month`/`day`/`hour`/`minute`/`second`
+/// combination whose arithmetic would overflow `i64` (#893 — a
+/// user-controlled `mktime`/`strftime` broken-down-time array can set any of
+/// these to an arbitrary integer, not just `year`). Every step here now uses
+/// `checked_*` instead of the original's plain operators, mirroring
+/// [`broken_down_time_from_unix_secs`]'s own `checked_sub` guard on its one
+/// overflow-prone step, applied everywhere in this direction since every
+/// field independently risks the same panic (verified: extreme `year`,
+/// `month`, `day`, `hour`, `minute`, and `second` each panic a different
+/// line of the original unchecked version).
 fn unix_secs_from_broken_down_time(
     year: i64,
     month: i64,
@@ -17011,17 +17036,52 @@ fn unix_secs_from_broken_down_time(
     hour: i64,
     minute: i64,
     second: i64,
-) -> i64 {
-    let y = year - i64::from(month <= 2);
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = (y - era * 400) as u32; // year of era [0, 399]
-    let m = month as u32;
-    let d = day as u32;
-    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1; // day of year [0, 365]
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // day of era [0, 146096]
-    let days = era * 146097 + doe as i64 - 719468; // days since Unix epoch
+) -> Result<i64, EvalError> {
+    let overflow = EvalError::broken_down_time_out_of_range;
 
-    days * 86400 + hour * 3600 + minute * 60 + second
+    let y = year
+        .checked_sub(i64::from(month <= 2))
+        .ok_or_else(overflow)?;
+    let era = if y >= 0 {
+        y / 400
+    } else {
+        y.checked_sub(399).ok_or_else(overflow)? / 400
+    };
+    let era_400 = era.checked_mul(400).ok_or_else(overflow)?;
+    let yoe = y.checked_sub(era_400).ok_or_else(overflow)?; // year of era [0, 399]
+
+    let m = if month > 2 { month - 3 } else { month + 9 };
+    let doy = (153i64
+        .checked_mul(m)
+        .and_then(|v| v.checked_add(2))
+        .ok_or_else(overflow)?
+        / 5)
+    .checked_add(day)
+    .and_then(|v| v.checked_sub(1))
+    .ok_or_else(overflow)?; // day of year [0, 365]
+
+    let doe = yoe
+        .checked_mul(365)
+        .and_then(|v| v.checked_add(yoe / 4))
+        .and_then(|v| v.checked_sub(yoe / 100))
+        .and_then(|v| v.checked_add(doy))
+        .ok_or_else(overflow)?; // day of era [0, 146096]
+
+    let era_146097 = era.checked_mul(146097).ok_or_else(overflow)?;
+    let days = era_146097
+        .checked_add(doe)
+        .and_then(|v| v.checked_sub(719468))
+        .ok_or_else(overflow)?; // days since Unix epoch
+
+    let days_secs = days.checked_mul(86400).ok_or_else(overflow)?;
+    let hour_secs = hour.checked_mul(3600).ok_or_else(overflow)?;
+    let minute_secs = minute.checked_mul(60).ok_or_else(overflow)?;
+
+    days_secs
+        .checked_add(hour_secs)
+        .and_then(|v| v.checked_add(minute_secs))
+        .and_then(|v| v.checked_add(second))
+        .ok_or_else(overflow)
 }
 
 /// Builtin: strftime(fmt) - format broken-down time as string
@@ -17097,9 +17157,20 @@ fn builtin_strftime<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     }
                 };
 
+                // `+ 1` (jq's 0-indexed month -> this function's 1-indexed
+                // month) overflows for an adversarial `i64::MAX` array
+                // element (#893's panic class, reachable here independently
+                // of `%s`/`unix_secs_from_broken_down_time`: every format
+                // path eagerly computes `month`, not just `%s`).
+                let month = match get_int(1).checked_add(1) {
+                    Some(m) => m,
+                    None if optional => return QueryResult::None,
+                    None => return QueryResult::Error(EvalError::broken_down_time_out_of_range()),
+                };
+
                 (
                     get_int(0),
-                    get_int(1) + 1, // jq uses 0-indexed month
+                    month,
                     get_int(2),
                     get_int(3),
                     get_int(4),
@@ -17113,9 +17184,13 @@ fn builtin_strftime<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         },
     };
 
-    let result = format_strftime(
+    let result = match format_strftime(
         &fmt, year, month, day, hour, minute, second, weekday, yearday,
-    );
+    ) {
+        Ok(s) => s,
+        Err(_) if optional => return QueryResult::None,
+        Err(e) => return QueryResult::Error(e),
+    };
     QueryResult::Owned(OwnedValue::String(result))
 }
 
@@ -17131,7 +17206,8 @@ fn format_strftime(
     second: i64,
     weekday: i64,
     yearday: i64,
-) -> String {
+) -> Result<String, EvalError> {
+    let overflow = EvalError::broken_down_time_out_of_range;
     let mut result = String::new();
     let mut chars = fmt.chars().peekable();
 
@@ -17159,7 +17235,10 @@ fn format_strftime(
                 Some('S') => result.push_str(&format!("{second:02}")),
                 Some('p') => result.push_str(if hour < 12 { "AM" } else { "PM" }),
                 Some('P') => result.push_str(if hour < 12 { "am" } else { "pm" }),
-                Some('j') => result.push_str(&format!("{:03}", yearday + 1)), // 1-indexed
+                Some('j') => result.push_str(&format!(
+                    "{:03}",
+                    yearday.checked_add(1).ok_or_else(overflow)? // 1-indexed
+                )),
                 Some('w') => result.push_str(&format!("{weekday}")),
                 Some('u') => {
                     result.push_str(&format!("{}", if weekday == 0 { 7 } else { weekday }));
@@ -17214,31 +17293,39 @@ fn format_strftime(
                 Some('z') => result.push_str("+0000"), // UTC offset (we're always UTC for gmtime)
                 Some('Z') => result.push_str("UTC"),
                 Some('s') => result.push_str(
-                    &unix_secs_from_broken_down_time(year, month, day, hour, minute, second)
+                    &unix_secs_from_broken_down_time(year, month, day, hour, minute, second)?
                         .to_string(),
                 ),
                 Some('U') => {
                     // Sunday-first week number: days before the year's first
                     // Sunday are week 00.
-                    let week = (yearday - weekday + 7).div_euclid(7);
+                    let week = yearday
+                        .checked_sub(weekday)
+                        .and_then(|v| v.checked_add(7))
+                        .ok_or_else(overflow)?
+                        .div_euclid(7);
                     result.push_str(&format!("{week:02}"));
                 }
                 Some('W') => {
                     // Monday-first week number.
-                    let weekday_mon = (weekday + 6).rem_euclid(7); // Sunday=0..Sat=6 -> Monday=0..Sun=6
-                    let week = (yearday - weekday_mon + 7).div_euclid(7);
+                    let weekday_mon = weekday.checked_add(6).ok_or_else(overflow)?.rem_euclid(7); // Sunday=0..Sat=6 -> Monday=0..Sun=6
+                    let week = yearday
+                        .checked_sub(weekday_mon)
+                        .and_then(|v| v.checked_add(7))
+                        .ok_or_else(overflow)?
+                        .div_euclid(7);
                     result.push_str(&format!("{week:02}"));
                 }
                 Some('V') => {
-                    let (_, week) = iso_week_date(year, yearday, weekday);
+                    let (_, week) = iso_week_date(year, yearday, weekday)?;
                     result.push_str(&format!("{week:02}"));
                 }
                 Some('G') => {
-                    let (iso_year, _) = iso_week_date(year, yearday, weekday);
+                    let (iso_year, _) = iso_week_date(year, yearday, weekday)?;
                     result.push_str(&format!("{iso_year:04}"));
                 }
                 Some('g') => {
-                    let (iso_year, _) = iso_week_date(year, yearday, weekday);
+                    let (iso_year, _) = iso_week_date(year, yearday, weekday)?;
                     result.push_str(&format!("{:02}", iso_year.rem_euclid(100)));
                 }
                 Some(other) => {
@@ -17252,7 +17339,7 @@ fn format_strftime(
         }
     }
 
-    result
+    Ok(result)
 }
 
 /// ISO 8601 week-based year and week number (`%G`/`%V`), per the
@@ -17260,34 +17347,57 @@ fn format_strftime(
 /// week, and ISO week 1 is the week containing that year's first Thursday.
 /// `weekday` is Sunday=0..Saturday=6 (jq's convention); `yearday` is
 /// 0-indexed day of year.
-fn iso_week_date(year: i64, yearday: i64, weekday: i64) -> (i64, i64) {
+///
+/// `Err` for a `year`/`yearday`/`weekday` combination whose arithmetic
+/// would overflow `i64` — these three fields come from the same
+/// user-controlled `strftime` array as the fields
+/// [`unix_secs_from_broken_down_time`] already checks; this function
+/// reaches its own independent overflow-prone arithmetic and needs the
+/// identical treatment (#911 review round).
+fn iso_week_date(year: i64, yearday: i64, weekday: i64) -> Result<(i64, i64), EvalError> {
+    let overflow = EvalError::broken_down_time_out_of_range;
     let iso_weekday = if weekday == 0 { 7 } else { weekday }; // Monday=1..Sunday=7
-    let ordinal = yearday + 1; // 1-indexed day of year
-    let week = (ordinal - iso_weekday + 10).div_euclid(7);
+    let ordinal = yearday.checked_add(1).ok_or_else(overflow)?; // 1-indexed day of year
+    let week = ordinal
+        .checked_sub(iso_weekday)
+        .and_then(|v| v.checked_add(10))
+        .ok_or_else(overflow)?
+        .div_euclid(7);
 
     if week < 1 {
-        let iso_year = year - 1;
-        (iso_year, weeks_in_iso_year(iso_year))
-    } else if week > weeks_in_iso_year(year) {
-        (year + 1, 1)
+        let iso_year = year.checked_sub(1).ok_or_else(overflow)?;
+        Ok((iso_year, weeks_in_iso_year(iso_year)?))
+    } else if week > weeks_in_iso_year(year)? {
+        Ok((year.checked_add(1).ok_or_else(overflow)?, 1))
     } else {
-        (year, week)
+        Ok((year, week))
     }
 }
 
 /// Number of ISO 8601 weeks in a given year (52 or 53).
-fn weeks_in_iso_year(year: i64) -> i64 {
+///
+/// `Err` for a `year` whose arithmetic would overflow `i64` — see
+/// [`iso_week_date`]'s doc comment.
+fn weeks_in_iso_year(year: i64) -> Result<i64, EvalError> {
+    let overflow = EvalError::broken_down_time_out_of_range;
     // Standard ISO week-date "long year" test (Wikipedia: ISO week date §
     // Weeks per year): p(y) is Jan 1 of year y's day-of-week, computed via
     // the Gregorian doomsday-style formula. A year has 53 weeks exactly
     // when it starts on a Thursday (p(y) == 4) or is a leap year starting
     // on a Wednesday (p(y-1) == 3, i.e. the *previous* year started on a
     // Wednesday and was itself a leap year).
-    let p = |y: i64| (y + y.div_euclid(4) - y.div_euclid(100) + y.div_euclid(400)).rem_euclid(7);
-    if p(year) == 4 || p(year - 1) == 3 {
-        53
+    let p = |y: i64| -> Result<i64, EvalError> {
+        Ok(y.checked_add(y.div_euclid(4))
+            .and_then(|v| v.checked_sub(y.div_euclid(100)))
+            .and_then(|v| v.checked_add(y.div_euclid(400)))
+            .ok_or_else(overflow)?
+            .rem_euclid(7))
+    };
+    let year_minus_1 = year.checked_sub(1).ok_or_else(overflow)?;
+    if p(year)? == 4 || p(year_minus_1)? == 3 {
+        Ok(53)
     } else {
-        52
+        Ok(52)
     }
 }
 
@@ -18047,74 +18157,66 @@ fn parse_numeric_offset(s: &str) -> Option<i64> {
 
 /// Simplified DST check for US Eastern timezone
 /// DST starts 2nd Sunday of March, ends 1st Sunday of November (since 2007)
+///
+/// Derives month/day via the shared, floor-corrected
+/// [`broken_down_time_from_unix_secs`] rather than re-deriving the civil
+/// date inline (#895): the inline version this replaced truncated
+/// `secs / 86400` toward zero instead of flooring, giving the wrong
+/// month/day — and thus the wrong DST answer near a transition boundary —
+/// for any pre-1970 timestamp. `Err` (a timestamp too extreme to convert)
+/// falls back to `false`, consistent with this function's own "simplified
+/// subset" scope and the catch-all `_ => false` arm below.
 fn is_dst_us_eastern(timestamp: f64) -> bool {
-    // Convert to days since epoch and calculate approximate month/day
     let secs = timestamp.trunc() as i64;
-    let days = secs / 86400;
-
-    // Get year, month, day from days since epoch
-    let z = days + 719468;
-    let era = if z >= 0 { z } else { z - 146096 } / 146097;
-    let doe = (z - era * 146097) as u32;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = (doy - (153 * mp + 2) / 5 + 1) as i32;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 } as i32;
+    let Ok(t) = broken_down_time_from_unix_secs(secs) else {
+        return false;
+    };
 
     // Approximate DST: March 8-14 to November 1-7 (simplified)
     // More accurate would check actual Sunday dates
-    match month {
-        3 => day >= 8,  // After ~2nd week of March
-        4..=10 => true, // April through October
-        11 => day < 7,  // First week of November
-        _ => false,     // December through February
+    match t.month {
+        3 => t.day >= 8, // After ~2nd week of March
+        4..=10 => true,  // April through October
+        11 => t.day < 7, // First week of November
+        _ => false,      // December through February
     }
 }
 
 /// Simplified DST check for European timezones
 /// DST starts last Sunday of March, ends last Sunday of October
+///
+/// See [`is_dst_us_eastern`]'s doc comment for why this derives month/day
+/// via [`broken_down_time_from_unix_secs`] rather than inline (#895).
 fn is_dst_europe(timestamp: f64) -> bool {
     let secs = timestamp.trunc() as i64;
-    let days = secs / 86400;
+    let Ok(t) = broken_down_time_from_unix_secs(secs) else {
+        return false;
+    };
 
-    let z = days + 719468;
-    let era = if z >= 0 { z } else { z - 146096 } / 146097;
-    let doe = (z - era * 146097) as u32;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = (doy - (153 * mp + 2) / 5 + 1) as i32;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 } as i32;
-
-    match month {
-        3 => day >= 25, // Last week of March
-        4..=9 => true,  // April through September
-        10 => day < 25, // Before last week of October
+    match t.month {
+        3 => t.day >= 25, // Last week of March
+        4..=9 => true,    // April through September
+        10 => t.day < 25, // Before last week of October
         _ => false,
     }
 }
 
 /// Simplified DST check for Australian Eastern timezones
 /// DST starts first Sunday of October, ends first Sunday of April
+///
+/// See [`is_dst_us_eastern`]'s doc comment for why this derives month/day
+/// via [`broken_down_time_from_unix_secs`] rather than inline (#895).
 fn is_dst_australia(timestamp: f64) -> bool {
     let secs = timestamp.trunc() as i64;
-    let days = secs / 86400;
-
-    let z = days + 719468;
-    let era = if z >= 0 { z } else { z - 146096 } / 146097;
-    let doe = (z - era * 146097) as u32;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = (doy - (153 * mp + 2) / 5 + 1) as i32;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 } as i32;
+    let Ok(t) = broken_down_time_from_unix_secs(secs) else {
+        return false;
+    };
 
     // Australian DST is opposite to Northern Hemisphere
-    match month {
-        10 => day >= 7,              // After first Sunday of October
+    match t.month {
+        10 => t.day >= 7,            // After first Sunday of October
         11 | 12 | 1 | 2 | 3 => true, // November through March
-        4 => day < 7,                // Before first Sunday of April
+        4 => t.day < 7,              // Before first Sunday of April
         _ => false,
     }
 }
@@ -31696,6 +31798,183 @@ mod tests {
         query!(b"null", r#"(-0.5) | strftime("%Y-%m-%dT%H:%M:%SZ")"#,
             QueryResult::Owned(OwnedValue::String(s)) => assert_eq!(s, "1970-01-01T00:00:00Z")
         );
+    }
+
+    #[test]
+    fn test_mktime_and_strftime_s_error_instead_of_panicking_on_overflow_893() {
+        // #893: unix_secs_from_broken_down_time's era/day/hour/minute/second
+        // arithmetic panicked on overflow for a user-controlled
+        // broken-down-time array element — the mirror-image bug of #869 on
+        // the opposite (broken-down-time -> seconds) conversion direction.
+        // Every field independently reachable through this exact panic
+        // before the fix (confirmed by hand, one field at a time, against
+        // the pre-fix code): year, month, day, hour, minute, and second.
+        // Deliberately a different message than #869's own tests use
+        // (`datetime_out_of_range`, the opposite conversion direction) —
+        // real jq has no equivalent error for *this* direction at all (it
+        // silently computes a wrapped/nonsensical result instead), so
+        // there's no oracle text to match; see
+        // `EvalError::broken_down_time_out_of_range`'s doc comment.
+        const MSG: &str = "mktime/strftime: broken-down time value out of representable range";
+
+        query!(b"null", r"[9223372036854775807,0,1,0,0,0,0,0] | mktime",
+            QueryResult::Error(e) => assert_eq!(e.message, MSG));
+        query!(b"null", r#"[9223372036854775807,0,1,0,0,0,0,0] | strftime("%s")"#,
+            QueryResult::Error(e) => assert_eq!(e.message, MSG));
+        // Extreme *negative* year: takes `era`'s negative-`y` branch (the
+        // positive cases above never do), whose own `y.checked_sub(399)`
+        // overflows for a `y` this close to `i64::MIN`.
+        query!(b"null", r"[-9223372036854775808,6,1,0,0,0,0,0] | mktime",
+            QueryResult::Error(e) => assert_eq!(e.message, MSG));
+        query!(b"null", r"[2020,9223372036854775807,1,0,0,0,0,0] | mktime",
+            QueryResult::Error(e) => assert_eq!(e.message, MSG));
+        query!(b"null", r"[2020,0,9223372036854775807,0,0,0,0,0] | mktime",
+            QueryResult::Error(e) => assert_eq!(e.message, MSG));
+        query!(b"null", r"[2020,0,1,9223372036854775807,0,0,0,0] | mktime",
+            QueryResult::Error(e) => assert_eq!(e.message, MSG));
+        query!(b"null", r"[2020,0,1,0,9223372036854775807,0,0,0] | mktime",
+            QueryResult::Error(e) => assert_eq!(e.message, MSG));
+        query!(b"null", r"[2020,0,1,0,0,9223372036854775807,0,0] | mktime",
+            QueryResult::Error(e) => assert_eq!(e.message, MSG));
+
+        // `?` suppresses it, same as #869's precedent.
+        query!(b"null", r"[9223372036854775807,0,1,0,0,0,0,0] | mktime?", QueryResult::None => {});
+        query!(b"null", r#"[9223372036854775807,0,1,0,0,0,0,0] | strftime("%s")?"#, QueryResult::None => {});
+
+        // Ordinary dates still round-trip correctly (regression guard).
+        query!(b"null", r"[2024,5,15,10,30,0,0,0] | mktime",
+            QueryResult::Owned(OwnedValue::Float(f)) => assert_eq!(f, 1_718_447_400.0));
+
+        // `strftime`'s array branch computes `month` (its own `get_int(1) +
+        // 1` step) eagerly for every format string, not just `%s` — an
+        // extreme month here panicked independently of
+        // unix_secs_from_broken_down_time, before this same overflow ever
+        // reaches that function.
+        query!(b"null", r#"[2020,9223372036854775807,1,0,0,0,0,0] | strftime("%Y")"#,
+            QueryResult::Error(e) => assert_eq!(e.message, MSG));
+    }
+
+    #[test]
+    fn test_strftime_week_and_yearday_specifiers_error_instead_of_panicking_on_overflow_911() {
+        // #911 review round: the initial #893 fix hardened
+        // unix_secs_from_broken_down_time and the two `month + 1` sites,
+        // but format_strftime's %j/%U/%W/%V/%G/%g specifiers each do their
+        // own independent unchecked arithmetic on the same user-controlled
+        // `weekday`/`yearday`/`year` array fields (indices 6/7/0) and
+        // panicked just the same. `iso_week_date`/`weeks_in_iso_year`
+        // (backing %V/%G/%g) needed the identical treatment.
+        const MSG: &str = "mktime/strftime: broken-down time value out of representable range";
+
+        query!(b"null", r#"[2020,0,1,0,0,0,0,9223372036854775807] | strftime("%j")"#,
+            QueryResult::Error(e) => assert_eq!(e.message, MSG));
+        query!(b"null", r#"[2020,0,1,0,0,0,-9223372036854775808,0] | strftime("%U")"#,
+            QueryResult::Error(e) => assert_eq!(e.message, MSG));
+        query!(b"null", r#"[2020,0,1,0,0,0,9223372036854775807,0] | strftime("%W")"#,
+            QueryResult::Error(e) => assert_eq!(e.message, MSG));
+        query!(b"null", r#"[2020,0,1,0,0,0,0,-9223372036854775808] | strftime("%W")"#,
+            QueryResult::Error(e) => assert_eq!(e.message, MSG));
+        query!(b"null", r#"[9223372036854775807,0,1,0,0,0,0,0] | strftime("%V")"#,
+            QueryResult::Error(e) => assert_eq!(e.message, MSG));
+        query!(b"null", r#"[-9223372036854775808,0,1,0,0,0,0,0] | strftime("%V")"#,
+            QueryResult::Error(e) => assert_eq!(e.message, MSG));
+        query!(b"null", r#"[2020,0,1,0,0,0,0,9223372036854775807] | strftime("%V")"#,
+            QueryResult::Error(e) => assert_eq!(e.message, MSG));
+        query!(b"null", r#"[9223372036854775807,0,1,0,0,0,0,0] | strftime("%G")"#,
+            QueryResult::Error(e) => assert_eq!(e.message, MSG));
+        query!(b"null", r#"[9223372036854775807,0,1,0,0,0,0,0] | strftime("%g")"#,
+            QueryResult::Error(e) => assert_eq!(e.message, MSG));
+
+        // `?` suppresses it, same as every other overflow site in this file.
+        query!(b"null", r#"[2020,0,1,0,0,0,0,9223372036854775807] | strftime("%j")?"#, QueryResult::None => {});
+
+        // Ordinary dates still produce the exact same output as real jq
+        // (byte-for-byte verified against the pinned jq-1.7.1 oracle).
+        query!(b"null", r#"[2024,5,15,10,30,0,6,166] | strftime("%j %U %W %V %G %g")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => assert_eq!(s, "167 23 24 24 2024 24"));
+    }
+
+    #[test]
+    fn test_parse_simple_tz_offset_errors_gracefully_on_overflow_894() {
+        // #894: `hours * 3600`/`minutes * 60`/the final sign multiply were
+        // unchecked, panicking on a malformed/adversarial `TZ` env var
+        // (reachable independently of the timestamp being converted, since
+        // `TZ` parsing happens before any timestamp arithmetic runs). Tested
+        // directly against the private helper rather than through the `TZ`
+        // env var + `localtime` builtin, since mutating process-global env
+        // vars in a parallel test binary is inherently racy.
+        assert_eq!(parse_simple_tz_offset("EST9999999999999999"), None); // hours overflow
+        assert_eq!(parse_simple_tz_offset("EST-9999999999999999"), None); // hours overflow, negative
+        assert_eq!(
+            parse_simple_tz_offset("EST1:999999999999999999"),
+            None // minutes overflow (hours alone is in range)
+        );
+
+        // Normal input still resolves correctly (positive TZ = west of UTC
+        // = negative offset applied, per this function's own doc comment).
+        assert_eq!(parse_simple_tz_offset("EST5EDT"), Some(-5 * 3600));
+        assert_eq!(parse_simple_tz_offset("EST-5EDT"), Some(5 * 3600));
+    }
+
+    #[test]
+    fn test_dst_heuristics_use_floor_not_truncating_division_pre_1970_895() {
+        // #895: each of is_dst_us_eastern/is_dst_europe/is_dst_australia
+        // hand-duplicated the pre-#889 truncating `secs / 86400` instead of
+        // the shared, floor-corrected broken_down_time_from_unix_secs — so
+        // a pre-1970 timestamp not exactly on a day boundary could resolve
+        // to the *next* day's civil date, giving the wrong DST answer right
+        // at a transition boundary.
+        //
+        // -25833601.0 is one second before 1969-03-08T00:00:00Z (verified
+        // via gmtime: [1969,2,7,23,59,59,...], 0-indexed month=2 is March,
+        // day=7). The old truncating division computed day=8 here (the
+        // *next* day) instead of day=7, wrongly reporting US-Eastern DST
+        // (which starts "day >= 8" in March) a full second early.
+        assert!(!is_dst_us_eastern(-25_833_601.0)); // Mar 7 23:59:59 -> day 7, not yet DST
+        assert!(is_dst_us_eastern(-25_833_600.0)); // Mar 8 00:00:00 -> day 8, DST starts
+
+        // Same mechanism, Europe's "day >= 25" March boundary.
+        // 1969-03-25T00:00:00Z: gmtime confirms [1969,2,25,0,0,0,...].
+        query!(b"-24364800", r"gmtime",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr[1], OwnedValue::Int(2));
+                assert_eq!(arr[2], OwnedValue::Int(25));
+            }
+        );
+        assert!(!is_dst_europe(-24_364_801.0)); // Mar 24 23:59:59 -> day 24, not yet DST
+        assert!(is_dst_europe(-24_364_800.0)); // Mar 25 00:00:00 -> day 25, DST starts
+
+        // Same mechanism, Australia's "day >= 7" October boundary (1969-10-07T00:00:00Z).
+        assert!(!is_dst_australia(-7_430_401.0)); // Oct 6 23:59:59 -> day 6, not yet DST
+        assert!(is_dst_australia(-7_430_400.0)); // Oct 7 00:00:00 -> day 7, DST starts
+
+        // Every other match arm each function has, plus the `Err` (timestamp
+        // too extreme to convert) fallback all three now share — all
+        // timestamps below verified against `gmtime` first.
+        const JAN_1_1970: f64 = 0.0; // [1970,0,1,...] (0-indexed month 0)
+        const JUN_15_2024: f64 = 1_718_445_000.0; // [2024,5,15,...]
+        const OCT_15_2024: f64 = 1_728_950_400.0; // [2024,9,15,...]
+        const NOV_15_2024: f64 = 1_731_628_800.0; // [2024,10,15,...]
+        const DEC_15_2024: f64 = 1_734_220_800.0; // [2024,11,15,...]
+        const APR_15_2024: f64 = 1_713_139_200.0; // [2024,3,15,...]
+        const TOO_EXTREME: f64 = 1e300; // same magnitude #869's own test uses
+
+        assert!(is_dst_us_eastern(JUN_15_2024)); // June -> April..=October, true
+        assert!(!is_dst_us_eastern(NOV_15_2024)); // Nov 15 -> day < 7 is false
+        assert!(!is_dst_us_eastern(DEC_15_2024)); // Dec -> catch-all false
+        assert!(!is_dst_us_eastern(TOO_EXTREME)); // Err -> false fallback
+
+        assert!(is_dst_europe(JUN_15_2024)); // June -> April..=September, true
+        assert!(is_dst_europe(OCT_15_2024)); // Oct 15 -> day < 25 is true
+        assert!(!is_dst_europe(DEC_15_2024)); // Dec -> catch-all false
+        assert!(!is_dst_europe(TOO_EXTREME)); // Err -> false fallback
+
+        assert!(is_dst_australia(OCT_15_2024)); // Oct 15 -> day >= 7 is true
+        assert!(is_dst_australia(NOV_15_2024)); // Nov -> Nov..=March, true
+        assert!(is_dst_australia(DEC_15_2024)); // Dec -> Nov..=March, true
+        assert!(is_dst_australia(JAN_1_1970)); // Jan -> Nov..=March, true
+        assert!(!is_dst_australia(APR_15_2024)); // Apr 15 -> day < 7 is false
+        assert!(!is_dst_australia(JUN_15_2024)); // June -> catch-all false
+        assert!(!is_dst_australia(TOO_EXTREME)); // Err -> false fallback
     }
 
     #[test]
