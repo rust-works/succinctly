@@ -333,11 +333,12 @@ now  # → 1705766400.123456 (seconds since Unix epoch)
 .timestamp = now
 ```
 
-**`strftime(fmt)`** - Format broken-down time array as string (jq-compatible) ✅
+**`strftime(fmt)`** - Format broken-down time array, or a raw Unix timestamp number, as string (jq-compatible) ✅
 ```bash
 # Uses POSIX strftime format specifiers (%Y, %m, %d, etc.)
 now | gmtime | strftime("%Y-%m-%d")  # → "2026-01-20"
 now | gmtime | strftime("%Y-%m-%dT%H:%M:%SZ")  # → "2026-01-20T15:04:05Z"
+now | strftime("%Y-%m-%d")  # → "2026-01-20" (raw number, auto-converted like gmtime)
 ```
 
 **`strptime(fmt)`** - Parse string to broken-down time array (jq-compatible) ✅

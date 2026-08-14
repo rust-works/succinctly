@@ -226,7 +226,7 @@ The implementation covers ~95% of jq functionality and is production-ready.
 - [x] `gmtime` - Convert Unix timestamp to broken-down UTC time
 - [x] `localtime` - Convert Unix timestamp to broken-down local time
 - [x] `mktime` - Convert broken-down time to Unix timestamp
-- [x] `strftime(fmt)` - Format broken-down time as string
+- [x] `strftime(fmt)` - Format broken-down time (or a raw Unix timestamp number) as string
 - [x] `strptime(fmt)` - Parse string to broken-down time
 - [x] `todate` / `todateiso8601` - Convert Unix timestamp to ISO 8601 string
 - [x] `fromdate` / `fromdateiso8601` - Parse ISO 8601 string to Unix timestamp

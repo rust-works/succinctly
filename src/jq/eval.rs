@@ -16422,16 +16422,34 @@ fn builtin_gmtime<W: Clone + AsRef<[u64]>>(
         Err(r) => return r,
     };
 
-    // Convert Unix timestamp to broken-down time (UTC)
-    let secs = timestamp.trunc() as i64;
+    let t = broken_down_time_from_unix_secs(timestamp.trunc() as i64);
 
+    let result = vec![
+        OwnedValue::Int(t.year),
+        OwnedValue::Int(t.month - 1), // 0-indexed month
+        OwnedValue::Int(t.day),
+        OwnedValue::Int(t.hour),
+        OwnedValue::Int(t.minute),
+        OwnedValue::Int(t.second),
+        OwnedValue::Int(t.weekday),
+        OwnedValue::Int(t.yearday),
+    ];
+
+    QueryResult::Owned(OwnedValue::Array(result))
+}
+
+/// Convert a Unix timestamp (whole seconds, UTC) to broken-down time using
+/// the Howard Hinnant `civil_from_days` algorithm. Shared by `gmtime` and
+/// `strftime`'s raw-number input path (#759) so a future fix to this math
+/// only needs applying in one place — see `BrokenDownTime`.
+fn broken_down_time_from_unix_secs(secs: i64) -> BrokenDownTime {
     // Days since Unix epoch (Jan 1, 1970)
     let days = if secs >= 0 {
         secs / 86400
     } else {
         (secs - 86399) / 86400
     };
-    let time_of_day = ((secs % 86400) + 86400) % 86400;
+    let time_of_day = secs.rem_euclid(86400);
     let hour = time_of_day / 3600;
     let minute = (time_of_day % 3600) / 60;
     let second = time_of_day % 60;
@@ -16462,18 +16480,16 @@ fn builtin_gmtime<W: Clone + AsRef<[u64]>>(
     };
     let yearday = month_days[(month - 1) as usize] + day - 1;
 
-    let result = vec![
-        OwnedValue::Int(year),
-        OwnedValue::Int((month - 1) as i64), // 0-indexed month
-        OwnedValue::Int(day),
-        OwnedValue::Int(hour),
-        OwnedValue::Int(minute),
-        OwnedValue::Int(second),
-        OwnedValue::Int(weekday),
-        OwnedValue::Int(yearday),
-    ];
-
-    QueryResult::Owned(OwnedValue::Array(result))
+    BrokenDownTime {
+        year,
+        month: month as i64,
+        day,
+        hour,
+        minute,
+        second,
+        weekday,
+        yearday,
+    }
 }
 
 /// Builtin: localtime - convert Unix timestamp to broken-down local time
@@ -16723,40 +16739,68 @@ fn builtin_strftime<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Err(e) => return e.into(),
     };
 
-    // Value should be a broken-down time array
-    let arr = match to_owned(&value) {
-        OwnedValue::Array(a) => a,
-        _ if optional => return QueryResult::None,
-        _ => return QueryResult::Error(EvalError::type_error("array", "strftime")),
-    };
+    // Value should be a broken-down time array, or a raw Unix timestamp
+    // number (auto-converted the same way `gmtime` converts one).
+    let (year, month, day, hour, minute, second, weekday, yearday) = match &value {
+        StandardJson::Number(n) => {
+            // Extracted directly rather than via `get_float_value_with`:
+            // `value` is already known to be a `Number` here, so that
+            // helper's generic `not_a_number` case would be unreachable.
+            let timestamp = if is_nan_sentinel(n.raw_bytes()) {
+                f64::NAN
+            } else if let Ok(f) = n.as_f64() {
+                f
+            } else if optional {
+                return QueryResult::None;
+            } else {
+                return QueryResult::Error(EvalError::new("invalid number"));
+            };
 
-    if arr.len() < 6 {
-        if optional {
-            return QueryResult::None;
+            // Auto-converted the same way `gmtime` converts a raw number.
+            let t = broken_down_time_from_unix_secs(timestamp.trunc() as i64);
+            (
+                t.year, t.month, t.day, t.hour, t.minute, t.second, t.weekday, t.yearday,
+            )
         }
-        return QueryResult::Error(EvalError::new(
-            "strftime requires array with at least 6 elements",
-        ));
-    }
+        _ => match to_owned(&value) {
+            OwnedValue::Array(arr) => {
+                if arr.len() < 6 {
+                    if optional {
+                        return QueryResult::None;
+                    }
+                    // Real jq reports the same generic wording for a
+                    // too-short array as for any other invalid input —
+                    // it has no distinct "at least 6 elements" message.
+                    return QueryResult::Error(
+                        EvalError::strftime_requires_parsed_datetime_inputs(),
+                    );
+                }
 
-    let get_int = |idx: usize| -> i64 {
-        match arr.get(idx) {
-            Some(OwnedValue::Int(n)) => *n,
-            Some(OwnedValue::Float(f)) => *f as i64,
-            Some(OwnedValue::NumberLiteral(NumberRepr::Int(n), _)) => *n,
-            Some(OwnedValue::NumberLiteral(NumberRepr::Float(f), _)) => *f as i64,
-            _ => 0,
-        }
+                let get_int = |idx: usize| -> i64 {
+                    match arr.get(idx) {
+                        Some(OwnedValue::Int(n)) => *n,
+                        Some(OwnedValue::Float(f)) => *f as i64,
+                        Some(OwnedValue::NumberLiteral(NumberRepr::Int(n), _)) => *n,
+                        Some(OwnedValue::NumberLiteral(NumberRepr::Float(f), _)) => *f as i64,
+                        _ => 0,
+                    }
+                };
+
+                (
+                    get_int(0),
+                    get_int(1) + 1, // jq uses 0-indexed month
+                    get_int(2),
+                    get_int(3),
+                    get_int(4),
+                    get_int(5),
+                    if arr.len() > 6 { get_int(6) } else { 0 },
+                    if arr.len() > 7 { get_int(7) } else { 0 },
+                )
+            }
+            _ if optional => return QueryResult::None,
+            _ => return QueryResult::Error(EvalError::strftime_requires_parsed_datetime_inputs()),
+        },
     };
-
-    let year = get_int(0);
-    let month = get_int(1) + 1; // jq uses 0-indexed
-    let day = get_int(2);
-    let hour = get_int(3);
-    let minute = get_int(4);
-    let second = get_int(5);
-    let weekday = if arr.len() > 6 { get_int(6) } else { 0 };
-    let yearday = if arr.len() > 7 { get_int(7) } else { 0 };
 
     let result = format_strftime(
         &fmt, year, month, day, hour, minute, second, weekday, yearday,
@@ -30939,6 +30983,66 @@ mod tests {
         query!(b"[2024,0,15,10,30,0,1,14]", r#"strftime("%Y-%m-%dT%H:%M:%SZ")"#,
             QueryResult::Owned(OwnedValue::String(s)) => {
                 assert_eq!(s, "2024-01-15T10:30:00Z");
+            }
+        );
+    }
+
+    #[test]
+    fn test_strftime_raw_number_input() {
+        // A raw Unix timestamp number is auto-converted the same way
+        // `gmtime` converts one, matching real jq (#759).
+        query!(b"0", r#"strftime("%Y-%m-%dT%H:%M:%SZ")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "1970-01-01T00:00:00Z");
+            }
+        );
+
+        // Fractional timestamp, truncated to whole seconds.
+        query!(b"1435677542.822351", r#"strftime("%A, %B %e, %Y")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "Tuesday, June 30, 2015");
+            }
+        );
+
+        // Neither array nor number: real jq's own wording, not a generic
+        // type error.
+        query!(br#""not a date""#, r#"strftime("%Y")"#,
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "strftime/1 requires parsed datetime inputs");
+            }
+        );
+
+        // `?` suppresses the error for an input that's neither array nor
+        // number, same as any other builtin.
+        query!(br#""not a date""#, r#"strftime("%Y")?"#,
+            QueryResult::None => {}
+        );
+
+        // A too-short array gets the same wording real jq uses — it has no
+        // distinct "at least 6 elements" message.
+        query!(b"[2024,0,15]", r#"strftime("%Y")"#,
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "strftime/1 requires parsed datetime inputs");
+            }
+        );
+        query!(b"[2024,0,15]", r#"strftime("%Y")?"#,
+            QueryResult::None => {}
+        );
+
+        // A non-numeric array element falls back to 0, matching
+        // get_int's existing catch-all for array-input strftime.
+        query!(br#"["x",0,1,0,0,0,4,0]"#, r#"strftime("%Y")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "0000");
+            }
+        );
+
+        // Array elements built from arithmetic (OwnedValue::Int), not
+        // literal JSON numbers (OwnedValue::NumberLiteral) — exercises
+        // get_int's other numeric-variant arm.
+        query!(b"[2024,0,15,10,30,0,1,14]", r#"map(.+0) | strftime("%Y-%m-%d")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "2024-01-15");
             }
         );
     }
