@@ -27306,6 +27306,38 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "regex")]
+    #[test]
+    fn test_regex_unknown_flags_rejected_730() {
+        // #730: an unrecognized flag character must raise jq's own error
+        // rather than silently doing nothing. Verified against jq 1.7.1:
+        // the message names the *whole* flags string, not just the
+        // offending character, and is identical whether the bad character
+        // stands alone or sits next to a genuinely valid one.
+        for (flags, expected) in [
+            ("z", "z is not a valid modifier string"),
+            ("zq", "zq is not a valid modifier string"),
+            ("iz", "iz is not a valid modifier string"),
+        ] {
+            query!(br#""abc""#, &format!(r#"test("abc"; "{flags}")"#),
+                QueryResult::Error(e) => {
+                    assert_eq!(e.message, expected, "flags: {flags:?}");
+                }
+            );
+        }
+
+        // `n` (suppress empty matches) and `l` (POSIX leftmost-longest) are
+        // real jq flag characters, just not yet functionally implemented
+        // here (#730) - they must not be rejected as unknown.
+        for flags in ["n", "l", "p"] {
+            query!(br#""abc""#, &format!(r#"test("abc"; "{flags}")"#),
+                QueryResult::Owned(OwnedValue::Bool(b)) => {
+                    assert!(b, "flags: {flags:?}");
+                }
+            );
+        }
+    }
+
     // =========================================================================
     // Phase 8 Tests: Variables and Advanced Control Flow
     // =========================================================================
