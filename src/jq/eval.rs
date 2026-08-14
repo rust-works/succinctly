@@ -18827,7 +18827,19 @@ fn builtin_isempty<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         QueryResult::None => true,
         QueryResult::Many(ref v) if v.is_empty() => true,
         QueryResult::ManyOwned(ref v) if v.is_empty() => true,
-        QueryResult::Error(_) => true, // Errors count as empty
+        // A bare, uncaught error must propagate, not be answered as `true`
+        // (#882) - real jq's `isempty` has no `try`/`catch` around its
+        // argument, so `isempty(error("x"))` genuinely fails (exit 5) rather
+        // than reporting the argument as "empty". Same asymmetry as `Halt`/
+        // `Break` below, and for the same reason: a `Partial`'s error always
+        // has a non-empty prefix (`g` already produced an output before
+        // erroring), and real jq's laziness means `g`'s second output is
+        // never requested once the first already answered `isempty`'s own
+        // internal `break $out` - confirmed via oracle, `isempty(1,
+        // error("x"))` answers `false` in real jq 1.7.1, same as
+        // `isempty(1, halt_error(3))`/`isempty(1, break $out)` below - so
+        // the wildcard arm correctly still answers `false` for that shape.
+        QueryResult::Error(e) => return QueryResult::Error(e),
         // A halt with zero prior outputs must propagate rather than answer
         // `false` — but a `Partial`'s halt always has a non-empty prefix (see
         // `partial`), meaning `g` already produced an output before halting,
