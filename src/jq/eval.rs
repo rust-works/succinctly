@@ -16810,13 +16810,19 @@ fn builtin_strftime<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         }
         _ => match to_owned(&value) {
             OwnedValue::Array(arr) => {
-                if arr.len() < 6 {
+                // Real jq requires the full 8-element array — weekday and
+                // yearday included — not just the 6 fields mktime needs.
+                // Confirmed empirically: `[2024,0,15,0,0,0] | strftime(...)`
+                // errors in real jq for every length 1-7, only succeeding at
+                // 8. Below 8, this codebase used to default weekday/yearday
+                // to 0 instead of erroring, which was harmless before this
+                // PR added specifiers that read those fields (#760) — now it
+                // would silently produce a wrong date instead of matching
+                // jq's error.
+                if arr.len() < 8 {
                     if optional {
                         return QueryResult::None;
                     }
-                    // Real jq reports the same generic wording for a
-                    // too-short array as for any other invalid input —
-                    // it has no distinct "at least 6 elements" message.
                     return QueryResult::Error(
                         EvalError::strftime_requires_parsed_datetime_inputs(),
                     );
@@ -16839,8 +16845,8 @@ fn builtin_strftime<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     get_int(3),
                     get_int(4),
                     get_int(5),
-                    if arr.len() > 6 { get_int(6) } else { 0 },
-                    if arr.len() > 7 { get_int(7) } else { 0 },
+                    get_int(6),
+                    get_int(7),
                 )
             }
             _ if optional => return QueryResult::None,
@@ -16960,7 +16966,7 @@ fn format_strftime(
                 }
                 Some('W') => {
                     // Monday-first week number.
-                    let weekday_mon = (weekday + 6) % 7; // Sunday=0..Sat=6 -> Monday=0..Sun=6
+                    let weekday_mon = (weekday + 6).rem_euclid(7); // Sunday=0..Sat=6 -> Monday=0..Sun=6
                     let week = (yearday - weekday_mon + 7).div_euclid(7);
                     result.push_str(&format!("{week:02}"));
                 }
@@ -17012,6 +17018,12 @@ fn iso_week_date(year: i64, yearday: i64, weekday: i64) -> (i64, i64) {
 
 /// Number of ISO 8601 weeks in a given year (52 or 53).
 fn weeks_in_iso_year(year: i64) -> i64 {
+    // Standard ISO week-date "long year" test (Wikipedia: ISO week date §
+    // Weeks per year): p(y) is Jan 1 of year y's day-of-week, computed via
+    // the Gregorian doomsday-style formula. A year has 53 weeks exactly
+    // when it starts on a Thursday (p(y) == 4) or is a leap year starting
+    // on a Wednesday (p(y-1) == 3, i.e. the *previous* year started on a
+    // Wednesday and was itself a leap year).
     let p = |y: i64| (y + y.div_euclid(4) - y.div_euclid(100) + y.div_euclid(400)).rem_euclid(7);
     if p(year) == 4 || p(year - 1) == 3 {
         53
@@ -31122,6 +31134,28 @@ mod tests {
         query!(b"[2024,0,15,10,30,0,1,14]", r#"strftime("%s")"#,
             QueryResult::Owned(OwnedValue::String(s)) => {
                 assert_eq!(s, "1705314600");
+            }
+        );
+
+        // Real jq requires the full 8-element array (weekday and yearday
+        // included), not just the 6 fields mktime needs — verified against
+        // the pinned oracle for every length 1-7. Before this fix, a
+        // 6-element array silently defaulted weekday/yearday to 0 instead
+        // of erroring, which %U/%V/%W/%G/%g would then silently compute a
+        // wrong answer from.
+        query!(b"[2024,0,15,0,0,0]", r#"strftime("%Y")"#,
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "strftime/1 requires parsed datetime inputs");
+            }
+        );
+
+        // %W's weekday-to-Monday-first remap uses rem_euclid, matching
+        // %U's div_euclid discipline rather than plain `%` (which would
+        // give a different, wrong answer for a hand-constructed array with
+        // an out-of-range weekday).
+        query!(b"[2024,0,1,0,0,0,-7,0]", r#"strftime("%U %W")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "02 00");
             }
         );
     }
