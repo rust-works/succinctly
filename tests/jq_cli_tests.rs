@@ -7432,6 +7432,62 @@ fn test_isvalid_propagates_halt_from_partial_argument_result() -> Result<()> {
     Ok(())
 }
 
+/// `builtin_isvalid`'s `QueryResult::Break`/`Partial(_, Control::Break(_))`
+/// arms (#867): mirrors the `Halt` arms directly above -- an unresolved
+/// `break $label` in `isvalid`'s argument must keep unwinding toward its
+/// enclosing `label`, not be swallowed by the old `_ => Bool(true)`
+/// catch-all. `isvalid` is a succinctly-only extension (no real jq to diff
+/// against), but the `break`/`label` semantics it must not interfere with
+/// are real jq's own: this input would produce no output and exit 0 in real
+/// jq if `isvalid` didn't exist to swallow the break at all.
+#[test]
+fn test_isvalid_propagates_bare_break_to_outer_label() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_full(&["-n", "label $out | isvalid(break $out), \"after\""], None)?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
+/// Companion to the bare-break test above, for the `Partial(_,
+/// Control::Break(_))` arm specifically: an argument that produces an
+/// output *before* breaking (`1, break $out`) comes back as
+/// `QueryResult::Partial`, not a bare `Break` -- same distinction
+/// `test_isvalid_propagates_halt_from_partial_argument_result` draws for
+/// `Halt`.
+#[test]
+fn test_isvalid_propagates_break_from_partial_argument_result() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-n", "label $out | isvalid(1, break $out), \"after\""],
+        None,
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
+/// The issue's own repro shape: a `break` surfacing through
+/// `paths(node_filter)` (only reachable as a bare `Break` since #850 fixed
+/// `builtin_paths_filter`'s own control-signal handling) wrapped in
+/// `isvalid`. Confirms the fix is reachable through a realistic nested
+/// builtin call, not just a directly-written `break $out`.
+#[test]
+fn test_isvalid_propagates_break_through_paths_filter() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            r#"label $out | isvalid(paths(if type=="number" then break $out else true end))"#,
+        ],
+        Some(r#"{"a":1}"#),
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
 /// `continue_rest_with_context`'s bare `QueryResult::Halt` arm: reached
 /// whenever an `If`/`Comma`/`Try`/`Label` branch inside a path-context pipe
 /// (here, `if`'s `then` branch) halts with zero prior output of its own and
