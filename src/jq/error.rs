@@ -725,6 +725,17 @@ impl EvalError {
         Self::new(format!("{builtin}() requires numeric inputs"))
     }
 
+    /// `error converting number of seconds since epoch to datetime` — a
+    /// `gmtime`/`localtime`/`strftime`/`todate`/`tz` timestamp too extreme
+    /// to convert (matches real jq's own message and, approximately, its
+    /// error boundary: confirmed empirically that jq itself starts
+    /// erroring once the resulting year would overflow a 32-bit int,
+    /// e.g. `(7e16) | strftime(...)` errors while `(6e16) | strftime(...)`
+    /// succeeds).
+    pub fn datetime_out_of_range() -> Self {
+        Self::new("error converting number of seconds since epoch to datetime")
+    }
+
     /// `mktime requires array inputs`.
     pub fn mktime_requires_array() -> Self {
         Self::new("mktime requires array inputs")
