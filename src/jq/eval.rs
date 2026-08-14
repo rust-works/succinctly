@@ -10282,7 +10282,15 @@ fn resolve_leaf<'a, S: EvalSemantics>(
             ));
         }
     }
-    let mut values = eval_owned_multi::<S>(expr, value).map_err(|e| (Vec::new(), e))?;
+    // `eval_owned_multi_keep_partial`, not `eval_owned_multi`: a later output
+    // of `expr` erroring or breaking must not retroactively un-produce an
+    // earlier one it already yielded (#842's precedent for `recurse`'s own
+    // fan-out, applying equally here) — see the "streams as it goes" case
+    // below (#861).
+    let (mut values, trailing) = match eval_owned_multi_keep_partial::<S>(expr, value) {
+        Ok(values) => (values, None),
+        Err((prefix, escape)) => (prefix, Some(escape)),
+    };
     if trackable
         && matches!(
             expr,
@@ -10292,8 +10300,15 @@ fn resolve_leaf<'a, S: EvalSemantics>(
         let mut components = Vec::new();
         push_path_components(&mut components, expr);
         return match values.len() {
-            // No output prunes the branch.
-            0 => Ok(Vec::new()),
+            // No output prunes the branch — unless there never would have
+            // been one because evaluating this leaf itself escaped (these
+            // primitives don't fan out, so a non-empty prefix can't coexist
+            // with a trailing escape in practice, but propagate rather than
+            // silently prune if that ever changes).
+            0 => match trailing {
+                Some(escape) => Err((Vec::new(), escape)),
+                None => Ok(Vec::new()),
+            },
             1 => Ok(vec![(
                 components,
                 Cow::Owned(values.pop().expect("len checked")),
@@ -10311,7 +10326,21 @@ fn resolve_leaf<'a, S: EvalSemantics>(
         };
     }
     match values.len() {
-        0 => Ok(Vec::new()),
+        0 => match trailing {
+            Some(escape) => Err((Vec::new(), escape)),
+            None => Ok(Vec::new()),
+        },
+        // Real jq's `path(...)` checks each output as it streams: the first
+        // non-path-shaped value raises "Invalid path expression" immediately,
+        // before a later output of the same expression is ever produced —
+        // even one that would itself error or break (confirmed live:
+        // `path(range(3))` raises on `0` alone, never reaching `1`/`2`; #861's
+        // own repro, `path(paths(if type=="string" then break $out else true
+        // end))` on `[1,"x",2]`, raises on `[0]` alone, never reaching the
+        // second candidate where the `break` sits). `values[0]` is that first
+        // output regardless of whether `trailing` also carries an escape from
+        // evaluating further here — real jq never reaches whatever would have
+        // caused it, so the escape is discarded rather than propagated.
         1 => Err((
             Vec::new(),
             EvalError::invalid_path_expression(&values[0]).into(),
@@ -10324,6 +10353,11 @@ fn resolve_leaf<'a, S: EvalSemantics>(
         // (`Invalid path expression near attempt to access element ... of
         // ...`) is its own message shape already deliberately not
         // reproduced here, per `test_unsupported_path_prefixes_report_rather_than_misfire`).
+        //
+        // Note this doesn't match live jq either (confirmed above,
+        // `path(range(3))` raises on the first value, not this message) —
+        // a pre-existing, separate divergence from #861's own repro, not
+        // touched here.
         _ => Err((
             Vec::new(),
             EvalError::new("Cannot use a computed index after a multi-output path component")
