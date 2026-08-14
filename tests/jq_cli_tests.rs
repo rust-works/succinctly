@@ -7208,6 +7208,80 @@ fn test_resolve_recurse_keeps_f_partial_fanout_before_error_842() -> Result<()> 
     Ok(())
 }
 
+/// #856: `resolve_recurse`'s null-child guard (`if matches!(child_value...,
+/// OwnedValue::Null) { continue; }` in its main loop) stopped recursion
+/// *into* a null child, as documented -- but the bare `continue` also
+/// discarded the null child's own path entirely, rather than still
+/// emitting it as a leaf the way `builtin_recurse_f`/`builtin_recurse_cond`
+/// (value position) correctly do. Verified against jq 1.7.1:
+/// `{"a":null} | path(recurse(if . == {"a":null} then .a else empty
+/// end))` prints `[]` (root) *and* `["a"]` (the null child, emitted as a
+/// leaf since its own recursion into `f` produces nothing further).
+#[test]
+fn test_resolve_recurse_emits_null_childs_own_path() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            r#"path(recurse(if . == {"a":null} then .a else empty end))"#,
+        ],
+        Some(r#"{"a":null}"#),
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[]\n[\"a\"]\n");
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
+/// Companion to the test above: a null child emitted as a leaf must not
+/// jump ahead of an *earlier* sibling's own subtree just because it has no
+/// descendants of its own. `resolve_recurse` gates the null-recursion bound
+/// at the point a node is popped from its DFS stack (the same point every
+/// other node is emitted), not at child-collection time, specifically so a
+/// null child queued alongside a non-null sibling still waits its correct
+/// turn. Verified against jq 1.7.1: `{"a":null,"b":{"x":1,"y":2}} |
+/// path(recurse(if (.==null) then empty elif (type=="object") then .[]
+/// else empty end))` streams `[]`, `["a"]`, `["b"]`, `["b","x"]`,
+/// `["b","y"]` in that order -- the null leaf right after the root, before
+/// `b`'s own subtree, not interleaved with or after it.
+#[test]
+fn test_resolve_recurse_null_child_does_not_disturb_sibling_order() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            r#"path(recurse(if (.==null) then empty elif (type=="object") then .[] else empty end))"#,
+        ],
+        Some(r#"{"a":null,"b":{"x":1,"y":2}}"#),
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(
+        stdout,
+        "[]\n[\"a\"]\n[\"b\"]\n[\"b\",\"x\"]\n[\"b\",\"y\"]\n"
+    );
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
+/// Companion to the two tests above, for `recurse(f; cond)`: `cond` still
+/// gates whether a null child is emitted *at all* -- the null-recursion
+/// bound only decides whether a null child that already passed `cond`
+/// gets recursed into further, not whether `cond` itself applies to it.
+/// Verified against jq 1.7.1: `{"a":null} | path(recurse(.a;
+/// type=="object"))` prints only `[]` (root) and exits 0 -- the null
+/// child never appears, since `type=="object"` rejects it before it would
+/// ever be emitted (real jq's `paths(node_filter)` = `path(recurse|select(
+/// node_filter))`, and a `select`-rejected child is never even reached).
+#[test]
+fn test_resolve_recurse_cond_still_gates_null_child_emission() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r#"path(recurse(.a; type=="object"))"#],
+        Some(r#"{"a":null}"#),
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[]\n");
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
 #[test]
 fn test_recurse_f_keeps_own_partial_fanout_subtree_before_error_842() -> Result<()> {
     // A deeper #842 repro: the successfully-produced child (`.child`)

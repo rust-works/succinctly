@@ -10630,6 +10630,25 @@ fn resolve_recurse<'a, S: EvalSemantics>(
         // still `O(path length)` per node, `O(d²)` total; #701, unfixed here.
         outputs.push((prefix.clone(), current.clone()));
 
+        // A null node ends its own line of descent here, unlike the value
+        // evaluator since #490 -- but (#856) it's still emitted above like
+        // every other popped node first; only the *recursion into it* is
+        // skipped, bounding path-prefix growth against a non-terminating
+        // `f` without dropping the null child's own path the way an early
+        // `continue` before crediting it would. Gating here (once popped,
+        // in its correct DFS position) rather than at collection time keeps
+        // sibling ordering correct: a null child collected alongside a
+        // non-null sibling must still wait for its turn on `stack`, so it
+        // can't jump ahead of an earlier sibling's own subtree. Confirmed
+        // against jq 1.7.1: `{"a":null,"b":{"x":1}} | path(recurse(if
+        // (.==null) then empty elif type=="object" then .[] else empty
+        // end))` streams `[]`, `["a"]`, `["b"]`, `["b","x"]` in that order
+        // -- the null leaf between the root and `b`'s own subtree, not
+        // after it.
+        if matches!(current.as_ref(), OwnedValue::Null) {
+            continue;
+        }
+
         // An `f` error aborts the whole traversal — see the doc comment
         // above (#636) — but only after whatever candidate children
         // `resolve_node` already resolved before hitting that error get
@@ -10653,13 +10672,10 @@ fn resolve_recurse<'a, S: EvalSemantics>(
         // entry is even reached.
         let mut next: Vec<PathBranch<'a>> = Vec::new();
         for (child_components, child_value) in children {
-            // A null child ends that line of descent here, unlike the value
-            // evaluator since #490. See the note above on why this function
-            // keeps the guard: it bounds path-prefix growth, not just count.
-            if matches!(child_value.as_ref(), OwnedValue::Null) {
-                continue;
-            }
-
+            // A null child is queued onto `next`/`stack` like any other --
+            // the null-recursion bound is enforced once popped, above, not
+            // here (#856), so it still gets its own turn through `cond`
+            // (if present) and its correct place in DFS order.
             let mut path = prefix.clone();
             path.extend(child_components);
 
