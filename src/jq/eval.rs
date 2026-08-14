@@ -10416,9 +10416,19 @@ fn resolve_recurse<'a, S: EvalSemantics>(
         queue_recurse_children(&mut stack, next, deferred_error, &mut pending_error);
     }
 
-    match pending_error {
-        Some(e) => Err((outputs, e)),
-        None => Ok(outputs),
+    // A `pending_error` only surfaces once `stack` drains naturally — if
+    // `MAX_ITEMS` cut the loop short instead (`stack` still non-empty), this
+    // matches the pre-existing MAX_ITEMS convention everywhere else in this
+    // file (silent truncation, no error) rather than surfacing an error
+    // whose presence would otherwise depend on where the arbitrary cap
+    // happened to land relative to it (#842 review).
+    if stack.is_empty() {
+        match pending_error {
+            Some(e) => Err((outputs, e)),
+            None => Ok(outputs),
+        }
+    } else {
+        Ok(outputs)
     }
 }
 
@@ -12762,8 +12772,13 @@ fn builtin_recurse_f<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         queue_recurse_children(&mut stack, children, deferred_error, &mut pending_error);
     }
 
-    if let Some(e) = pending_error {
-        return partial(outputs, e.into());
+    // See `resolve_recurse`'s matching check for the full rationale (#842
+    // review): a `pending_error` only surfaces once `stack` drains
+    // naturally, not when `MAX_ITEMS` cuts the loop short instead.
+    if stack.is_empty() {
+        if let Some(e) = pending_error {
+            return partial(outputs, e.into());
+        }
     }
 
     if outputs.is_empty() {
@@ -12859,8 +12874,13 @@ fn builtin_recurse_cond<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         queue_recurse_children(&mut stack, next, deferred_error, &mut pending_error);
     }
 
-    if let Some(e) = pending_error {
-        return partial(outputs, e.into());
+    // See `resolve_recurse`'s matching check for the full rationale (#842
+    // review): a `pending_error` only surfaces once `stack` drains
+    // naturally, not when `MAX_ITEMS` cuts the loop short instead.
+    if stack.is_empty() {
+        if let Some(e) = pending_error {
+            return partial(outputs, e.into());
+        }
     }
 
     if outputs.is_empty() {
@@ -34264,6 +34284,35 @@ mod tests {
                 r#"{"child":"leaf","leafflag":true}"#,
                 r#""leaf""#,
             ]
+        );
+    }
+
+    #[test]
+    fn test_recurse_f_max_items_truncation_suppresses_a_pending_error_842() {
+        // Review of #842's fix: a `pending_error` deferred past `MAX_ITEMS`
+        // items must not surface just because of where the (internal,
+        // non-jq-semantic) 10000-item safety cap happened to land relative
+        // to it — that would make two structurally identical large fan-outs
+        // (this one, vs. the same shape with no trailing error at all)
+        // diverge on whether an error appears, purely as an accident of the
+        // cap. `builtin_recurse_f` already silently truncates at
+        // `MAX_ITEMS` with no error for a non-erroring fan-out (unrelated
+        // to #842, pre-existing convention); this pins that a *deferred*
+        // error is suppressed the same way once the cap truncates the
+        // drain, rather than resurfacing as `QueryResult::Partial`.
+        let large_doc = format!(
+            r#"{{"items":[{}],"bad":5}}"#,
+            (0..15000)
+                .map(|i| i.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        query!(
+            large_doc.as_bytes(),
+            r#"recurse(if type=="object" then (.items[], .bad[0]) else empty end)"#,
+            QueryResult::ManyOwned(vs) => {
+                assert_eq!(vs.len(), 10000);
+            }
         );
     }
 
