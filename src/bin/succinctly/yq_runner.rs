@@ -773,25 +773,27 @@ fn walk_alias_groups<W: AsRef<[u64]> + Clone>(
 /// the YAML documents this rewrites are config-file-sized, not
 /// data-file-sized.
 ///
-/// **Known gap** (untested/unfiled - narrow enough not to warrant a
-/// precursor spike, but real): a *wholesale-replaced* `Array`/`Object`'s
-/// new elements/fields should get fresh (empty) metadata regardless of
-/// position/key, since they're new nodes real `yq`'s node-mutation model
-/// never touches - `.a = [4, 5, 6]` on `a: ['x', 'y', 'z']` should drop
-/// every element's quote style, and real `yq` does. But this function has
-/// no way to tell "recursing into an untouched sibling subtree" apart from
-/// "recursing into a wholesale-replaced subtree that happens to share
+/// **Known gap, filed as #870**: this function matches a child to
+/// its pristine counterpart purely by key/index, so any write that
+/// reshuffles an `Array`'s or `Object`'s *positions* - not just a
+/// wholesale replacement like `.a = [4, 5, 6]` on `a: ['x', 'y', 'z']`,
+/// but an everyday `.arr = ["new"] + .arr` prepend or a `del()` that
+/// shifts later indices down - misattributes old elements' style/comments
+/// to whichever new element now sits at the same key/index, instead of
+/// giving every element under the write fresh (empty) metadata the way
+/// real `yq`'s node-mutation model does (confirmed against the pinned
+/// binary: prepending to `arr:\n  - "x"\n  - y` should drop the new
+/// element's style entirely and leave `"x"`'s own quotes exactly where
+/// they were; this function instead lets the new element inherit `"x"`'s
+/// old quote style and leaves `"x"` unquoted). This function has no way
+/// to tell "recursing into an untouched sibling subtree" apart from
+/// "recursing into a reshuffled subtree that happens to share
 /// positions/keys with the old one" - both look identical from a pure
-/// before/after value diff, only a path-based approach (the
-/// `resolve_dynamic_indexes` alternative above) could distinguish them. So
-/// a child at a matching key/index keeps its own metadata even under a
-/// wholesale replacement, over-preserving style/comments there instead of
-/// resetting them (confirmed against real `yq`: `.a = {"x": "p"}` on
-/// `a: {x: 'old'}` should print `a: {x: p}`, prints `a: {x: 'p'}` here).
-/// Purely cosmetic (no data loss, no incorrect values, still strictly
+/// before/after value diff; only a path-based approach (the
+/// `resolve_dynamic_indexes` alternative above) could distinguish them.
+/// Purely cosmetic (no data loss, no incorrect *values*, still strictly
 /// better than every write losing all style/comments unconditionally,
-/// which was the pre-#739 baseline) - left as a documented limitation
-/// rather than filed as a tracked issue, since it's this narrow.
+/// which was the pre-#739 baseline).
 fn reconcile_presentation(
     pristine_value: &OwnedValue,
     pristine_tree: &CommentTree,
@@ -813,10 +815,18 @@ fn reconcile_presentation(
                 // line, not its value, so it survives regardless of
                 // whether the value under it changed - only a removed key
                 // (not iterated here, since this loop is over `r_fields`)
-                // drops it.
+                // drops it. The "deferred value materialized as nothing"
+                // flag, though, is re-derived from `r_v`, not copied from
+                // pristine: a write that gives the key a real value must
+                // not carry over a stale "absent" flag, or
+                // `key_comment_if_value_absent`'s own consumer
+                // (`emit_yaml_value`'s block-mapping arm) renders only the
+                // key and comment, silently dropping the write's value
+                // entirely (found in review).
                 if let CommentTree::Object(_, _, _, pristine_key_comments) = pristine_tree {
-                    if let Some(kc) = pristine_key_comments.get(k) {
-                        key_comments.insert(k.clone(), kc.clone());
+                    if let Some((kc, _)) = pristine_key_comments.get(k) {
+                        let value_absent = matches!(r_v, OwnedValue::Null);
+                        key_comments.insert(k.clone(), (kc.clone(), value_absent));
                     }
                 }
             }
@@ -1743,9 +1753,14 @@ fn can_single_quote(s: &str) -> bool {
 /// `CommentTree`'s own doc comment) falls back to the plain heuristic
 /// unchanged.
 fn yaml_quote_string_with_style(s: &str, style: &str) -> String {
-    if s.is_empty() {
-        return "''".to_string();
-    }
+    // No empty-string special case needed here (unlike `yaml_quote_string`
+    // below): every arm already renders `""` correctly on its own -
+    // `yaml_double_quote_escaped`/`yaml_single_quote_escaped` produce
+    // `""`/`''` for an empty `s`, and the `_` fallback defers to
+    // `yaml_quote_string`, which has its own empty-string case. A
+    // short-circuit here that always returned `''` regardless of `style`
+    // used to flip an untouched double-quoted empty string to single-quote
+    // style on a sibling write (found in review).
     match style {
         "single" if can_single_quote(s) => yaml_single_quote_escaped(s),
         "double" => yaml_double_quote_escaped(s),

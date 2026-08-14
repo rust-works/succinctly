@@ -665,6 +665,35 @@ fn test_pretty_print_still_forces_block_style_on_a_write_739() -> Result<()> {
     Ok(())
 }
 
+/// #739 review finding: `reconcile_presentation` used to copy a key's
+/// stale "deferred value materialized as nothing" flag (#765) forward
+/// from the pristine document verbatim, even once a write gave that key a
+/// real value — `key_comment_if_value_absent`'s consumer in
+/// `emit_yaml_value` then rendered only the key and its comment, silently
+/// dropping the written value entirely.
+#[test]
+fn test_assign_to_a_key_with_a_deferred_value_comment_keeps_the_written_value_739() -> Result<()> {
+    let (output, code) = run_yq_stdin(
+        ".version = \"1.0.0\"",
+        "version: # TODO fill in\nauthor: me\n",
+        &[],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "version: 1.0.0 # TODO fill in\nauthor: me\n");
+    Ok(())
+}
+
+/// #739 review finding: an untouched double-quoted *empty* string sibling
+/// used to always flip to single-quote style (`yaml_quote_string_with_style`'s
+/// empty-string short-circuit ran before consulting `style` at all).
+#[test]
+fn test_assign_preserves_untouched_empty_string_double_quote_style_739() -> Result<()> {
+    let (output, code) = run_yq_stdin(".b = 2", "a: \"\"\nb: 1\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "a: \"\"\nb: 2\n");
+    Ok(())
+}
+
 #[test]
 fn test_duplicate_mapping_key_is_last_wins() -> Result<()> {
     // YAML 1.2 / yq: a mapping with a duplicate key resolves `.key` to the
