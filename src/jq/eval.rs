@@ -27771,9 +27771,10 @@ mod tests {
             );
         }
 
-        // `n` (suppress empty matches) and `l` (POSIX leftmost-longest) are
-        // real jq flag characters, just not yet functionally implemented
-        // here (#730) - they must not be rejected as unknown.
+        // `n` (suppress empty matches, implemented below in
+        // test_regex_n_flag_suppresses_empty_matches_730), `l` (POSIX
+        // leftmost-longest, not yet implemented — #920) and `p` are all
+        // real jq flag characters — they must not be rejected as unknown.
         for flags in ["n", "l", "p"] {
             query!(br#""abc""#, &format!(r#"test("abc"; "{flags}")"#),
                 QueryResult::Owned(OwnedValue::Bool(b)) => {
@@ -27781,6 +27782,99 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[cfg(feature = "regex")]
+    #[test]
+    fn test_regex_n_flag_suppresses_empty_matches_730() {
+        // #730: `n` filters zero-length matches out of the global-match
+        // iteration, and — for the first-match-only builtins — searches
+        // forward past a leading empty match to find the first non-empty
+        // one, rather than settling for offset 0. Every case here is
+        // verified live against jq 1.7.1.
+
+        // scan/gsub/split/splits (global by construction) keep only the
+        // non-empty runs.
+        query!(br#""a  b   c""#, r#"[scan(" *"; "n")]"#,
+            QueryResult::Owned(OwnedValue::Array(vs)) => {
+                assert_eq!(
+                    vs,
+                    vec![
+                        OwnedValue::String("  ".to_string()),
+                        OwnedValue::String("   ".to_string()),
+                    ]
+                );
+            }
+        );
+        query!(br#""a  b   c""#, r#"gsub(" *"; "_"; "n")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "a_b_c");
+            }
+        );
+        query!(br#""a1b2""#, r#"[splits("[0-9]*"; "n")]"#,
+            QueryResult::Owned(OwnedValue::Array(vs)) => {
+                assert_eq!(
+                    vs,
+                    vec![
+                        OwnedValue::String("a".to_string()),
+                        OwnedValue::String("b".to_string()),
+                        OwnedValue::String(String::new()),
+                    ]
+                );
+            }
+        );
+
+        // match(re;"g") / capture(re;"g") also route through the same
+        // global_captures filtering.
+        query!(br#""a  b   c""#, r#"[match(" *"; "gn")] | length"#,
+            QueryResult::Owned(OwnedValue::Int(n)) => {
+                assert_eq!(n, 2);
+            }
+        );
+
+        // match/test/capture/sub without "g" search forward past a leading
+        // empty match instead of settling for it.
+        query!(br#""aaxaa""#, r#"match("x*"; "n") | .offset"#,
+            QueryResult::Owned(OwnedValue::Int(offset)) => {
+                assert_eq!(offset, 2);
+            }
+        );
+        query!(br#""aaxaa""#, r#"test("x*"; "n")"#,
+            QueryResult::Owned(OwnedValue::Bool(b)) => {
+                assert!(b);
+            }
+        );
+        query!(br#""aaxaa""#, r#"sub("x*"; "Y"; "n")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "aaYaa");
+            }
+        );
+
+        // When no non-empty match exists anywhere, jq's generators produce
+        // no output at all (not `null`), `test` is false, and `sub` leaves
+        // the input unchanged since there is nothing to replace.
+        query!(br#""a""#, r#"[match("x*"; "n")]"#,
+            QueryResult::Owned(OwnedValue::Array(vs)) => {
+                assert!(vs.is_empty());
+            }
+        );
+        query!(br#""a""#, r#"test("x*"; "n")"#,
+            QueryResult::Owned(OwnedValue::Bool(b)) => {
+                assert!(!b);
+            }
+        );
+        query!(br#""aaa""#, r#"sub("x*"; "Y"; "n")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "aaa");
+            }
+        );
+
+        // `n` composes with other flags rather than overriding them.
+        query!(br#""AAxAA""#, r#"match("x*"; "in") | .offset"#,
+            QueryResult::Owned(OwnedValue::Int(offset)) => {
+                assert_eq!(offset, 2);
+            }
+        );
     }
 
     #[cfg(feature = "regex")]
