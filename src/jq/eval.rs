@@ -16977,7 +16977,7 @@ fn builtin_mktime<W: Clone + AsRef<[u64]>>(
     };
     let month = match get_int(1).and_then(|m| {
         m.checked_add(1)
-            .ok_or_else(EvalError::datetime_out_of_range)
+            .ok_or_else(EvalError::broken_down_time_out_of_range)
     }) {
         Ok(m) => m, // jq uses 0-indexed months
         Err(_) if optional => return QueryResult::None,
@@ -17037,7 +17037,7 @@ fn unix_secs_from_broken_down_time(
     minute: i64,
     second: i64,
 ) -> Result<i64, EvalError> {
-    let overflow = EvalError::datetime_out_of_range;
+    let overflow = EvalError::broken_down_time_out_of_range;
 
     let y = year
         .checked_sub(i64::from(month <= 2))
@@ -17165,7 +17165,7 @@ fn builtin_strftime<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 let month = match get_int(1).checked_add(1) {
                     Some(m) => m,
                     None if optional => return QueryResult::None,
-                    None => return QueryResult::Error(EvalError::datetime_out_of_range()),
+                    None => return QueryResult::Error(EvalError::broken_down_time_out_of_range()),
                 };
 
                 (
@@ -17207,6 +17207,7 @@ fn format_strftime(
     weekday: i64,
     yearday: i64,
 ) -> Result<String, EvalError> {
+    let overflow = EvalError::broken_down_time_out_of_range;
     let mut result = String::new();
     let mut chars = fmt.chars().peekable();
 
@@ -17234,7 +17235,10 @@ fn format_strftime(
                 Some('S') => result.push_str(&format!("{second:02}")),
                 Some('p') => result.push_str(if hour < 12 { "AM" } else { "PM" }),
                 Some('P') => result.push_str(if hour < 12 { "am" } else { "pm" }),
-                Some('j') => result.push_str(&format!("{:03}", yearday + 1)), // 1-indexed
+                Some('j') => result.push_str(&format!(
+                    "{:03}",
+                    yearday.checked_add(1).ok_or_else(overflow)? // 1-indexed
+                )),
                 Some('w') => result.push_str(&format!("{weekday}")),
                 Some('u') => {
                     result.push_str(&format!("{}", if weekday == 0 { 7 } else { weekday }));
@@ -17295,25 +17299,33 @@ fn format_strftime(
                 Some('U') => {
                     // Sunday-first week number: days before the year's first
                     // Sunday are week 00.
-                    let week = (yearday - weekday + 7).div_euclid(7);
+                    let week = yearday
+                        .checked_sub(weekday)
+                        .and_then(|v| v.checked_add(7))
+                        .ok_or_else(overflow)?
+                        .div_euclid(7);
                     result.push_str(&format!("{week:02}"));
                 }
                 Some('W') => {
                     // Monday-first week number.
-                    let weekday_mon = (weekday + 6).rem_euclid(7); // Sunday=0..Sat=6 -> Monday=0..Sun=6
-                    let week = (yearday - weekday_mon + 7).div_euclid(7);
+                    let weekday_mon = weekday.checked_add(6).ok_or_else(overflow)?.rem_euclid(7); // Sunday=0..Sat=6 -> Monday=0..Sun=6
+                    let week = yearday
+                        .checked_sub(weekday_mon)
+                        .and_then(|v| v.checked_add(7))
+                        .ok_or_else(overflow)?
+                        .div_euclid(7);
                     result.push_str(&format!("{week:02}"));
                 }
                 Some('V') => {
-                    let (_, week) = iso_week_date(year, yearday, weekday);
+                    let (_, week) = iso_week_date(year, yearday, weekday)?;
                     result.push_str(&format!("{week:02}"));
                 }
                 Some('G') => {
-                    let (iso_year, _) = iso_week_date(year, yearday, weekday);
+                    let (iso_year, _) = iso_week_date(year, yearday, weekday)?;
                     result.push_str(&format!("{iso_year:04}"));
                 }
                 Some('g') => {
-                    let (iso_year, _) = iso_week_date(year, yearday, weekday);
+                    let (iso_year, _) = iso_week_date(year, yearday, weekday)?;
                     result.push_str(&format!("{:02}", iso_year.rem_euclid(100)));
                 }
                 Some(other) => {
@@ -17335,34 +17347,57 @@ fn format_strftime(
 /// week, and ISO week 1 is the week containing that year's first Thursday.
 /// `weekday` is Sunday=0..Saturday=6 (jq's convention); `yearday` is
 /// 0-indexed day of year.
-fn iso_week_date(year: i64, yearday: i64, weekday: i64) -> (i64, i64) {
+///
+/// `Err` for a `year`/`yearday`/`weekday` combination whose arithmetic
+/// would overflow `i64` — these three fields come from the same
+/// user-controlled `strftime` array as the fields
+/// [`unix_secs_from_broken_down_time`] already checks; this function
+/// reaches its own independent overflow-prone arithmetic and needs the
+/// identical treatment (#911 review round).
+fn iso_week_date(year: i64, yearday: i64, weekday: i64) -> Result<(i64, i64), EvalError> {
+    let overflow = EvalError::broken_down_time_out_of_range;
     let iso_weekday = if weekday == 0 { 7 } else { weekday }; // Monday=1..Sunday=7
-    let ordinal = yearday + 1; // 1-indexed day of year
-    let week = (ordinal - iso_weekday + 10).div_euclid(7);
+    let ordinal = yearday.checked_add(1).ok_or_else(overflow)?; // 1-indexed day of year
+    let week = ordinal
+        .checked_sub(iso_weekday)
+        .and_then(|v| v.checked_add(10))
+        .ok_or_else(overflow)?
+        .div_euclid(7);
 
     if week < 1 {
-        let iso_year = year - 1;
-        (iso_year, weeks_in_iso_year(iso_year))
-    } else if week > weeks_in_iso_year(year) {
-        (year + 1, 1)
+        let iso_year = year.checked_sub(1).ok_or_else(overflow)?;
+        Ok((iso_year, weeks_in_iso_year(iso_year)?))
+    } else if week > weeks_in_iso_year(year)? {
+        Ok((year.checked_add(1).ok_or_else(overflow)?, 1))
     } else {
-        (year, week)
+        Ok((year, week))
     }
 }
 
 /// Number of ISO 8601 weeks in a given year (52 or 53).
-fn weeks_in_iso_year(year: i64) -> i64 {
+///
+/// `Err` for a `year` whose arithmetic would overflow `i64` — see
+/// [`iso_week_date`]'s doc comment.
+fn weeks_in_iso_year(year: i64) -> Result<i64, EvalError> {
+    let overflow = EvalError::broken_down_time_out_of_range;
     // Standard ISO week-date "long year" test (Wikipedia: ISO week date §
     // Weeks per year): p(y) is Jan 1 of year y's day-of-week, computed via
     // the Gregorian doomsday-style formula. A year has 53 weeks exactly
     // when it starts on a Thursday (p(y) == 4) or is a leap year starting
     // on a Wednesday (p(y-1) == 3, i.e. the *previous* year started on a
     // Wednesday and was itself a leap year).
-    let p = |y: i64| (y + y.div_euclid(4) - y.div_euclid(100) + y.div_euclid(400)).rem_euclid(7);
-    if p(year) == 4 || p(year - 1) == 3 {
-        53
+    let p = |y: i64| -> Result<i64, EvalError> {
+        Ok(y.checked_add(y.div_euclid(4))
+            .and_then(|v| v.checked_sub(y.div_euclid(100)))
+            .and_then(|v| v.checked_add(y.div_euclid(400)))
+            .ok_or_else(overflow)?
+            .rem_euclid(7))
+    };
+    let year_minus_1 = year.checked_sub(1).ok_or_else(overflow)?;
+    if p(year)? == 4 || p(year_minus_1)? == 3 {
+        Ok(53)
     } else {
-        52
+        Ok(52)
     }
 }
 
@@ -31774,7 +31809,13 @@ mod tests {
         // Every field independently reachable through this exact panic
         // before the fix (confirmed by hand, one field at a time, against
         // the pre-fix code): year, month, day, hour, minute, and second.
-        const MSG: &str = "error converting number of seconds since epoch to datetime";
+        // Deliberately a different message than #869's own tests use
+        // (`datetime_out_of_range`, the opposite conversion direction) —
+        // real jq has no equivalent error for *this* direction at all (it
+        // silently computes a wrapped/nonsensical result instead), so
+        // there's no oracle text to match; see
+        // `EvalError::broken_down_time_out_of_range`'s doc comment.
+        const MSG: &str = "mktime/strftime: broken-down time value out of representable range";
 
         query!(b"null", r"[9223372036854775807,0,1,0,0,0,0,0] | mktime",
             QueryResult::Error(e) => assert_eq!(e.message, MSG));
@@ -31811,6 +31852,45 @@ mod tests {
         // reaches that function.
         query!(b"null", r#"[2020,9223372036854775807,1,0,0,0,0,0] | strftime("%Y")"#,
             QueryResult::Error(e) => assert_eq!(e.message, MSG));
+    }
+
+    #[test]
+    fn test_strftime_week_and_yearday_specifiers_error_instead_of_panicking_on_overflow_911() {
+        // #911 review round: the initial #893 fix hardened
+        // unix_secs_from_broken_down_time and the two `month + 1` sites,
+        // but format_strftime's %j/%U/%W/%V/%G/%g specifiers each do their
+        // own independent unchecked arithmetic on the same user-controlled
+        // `weekday`/`yearday`/`year` array fields (indices 6/7/0) and
+        // panicked just the same. `iso_week_date`/`weeks_in_iso_year`
+        // (backing %V/%G/%g) needed the identical treatment.
+        const MSG: &str = "mktime/strftime: broken-down time value out of representable range";
+
+        query!(b"null", r#"[2020,0,1,0,0,0,0,9223372036854775807] | strftime("%j")"#,
+            QueryResult::Error(e) => assert_eq!(e.message, MSG));
+        query!(b"null", r#"[2020,0,1,0,0,0,-9223372036854775808,0] | strftime("%U")"#,
+            QueryResult::Error(e) => assert_eq!(e.message, MSG));
+        query!(b"null", r#"[2020,0,1,0,0,0,9223372036854775807,0] | strftime("%W")"#,
+            QueryResult::Error(e) => assert_eq!(e.message, MSG));
+        query!(b"null", r#"[2020,0,1,0,0,0,0,-9223372036854775808] | strftime("%W")"#,
+            QueryResult::Error(e) => assert_eq!(e.message, MSG));
+        query!(b"null", r#"[9223372036854775807,0,1,0,0,0,0,0] | strftime("%V")"#,
+            QueryResult::Error(e) => assert_eq!(e.message, MSG));
+        query!(b"null", r#"[-9223372036854775808,0,1,0,0,0,0,0] | strftime("%V")"#,
+            QueryResult::Error(e) => assert_eq!(e.message, MSG));
+        query!(b"null", r#"[2020,0,1,0,0,0,0,9223372036854775807] | strftime("%V")"#,
+            QueryResult::Error(e) => assert_eq!(e.message, MSG));
+        query!(b"null", r#"[9223372036854775807,0,1,0,0,0,0,0] | strftime("%G")"#,
+            QueryResult::Error(e) => assert_eq!(e.message, MSG));
+        query!(b"null", r#"[9223372036854775807,0,1,0,0,0,0,0] | strftime("%g")"#,
+            QueryResult::Error(e) => assert_eq!(e.message, MSG));
+
+        // `?` suppresses it, same as every other overflow site in this file.
+        query!(b"null", r#"[2020,0,1,0,0,0,0,9223372036854775807] | strftime("%j")?"#, QueryResult::None => {});
+
+        // Ordinary dates still produce the exact same output as real jq
+        // (byte-for-byte verified against the pinned jq-1.7.1 oracle).
+        query!(b"null", r#"[2024,5,15,10,30,0,6,166] | strftime("%j %U %W %V %G %g")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => assert_eq!(s, "167 23 24 24 2024 24"));
     }
 
     #[test]
