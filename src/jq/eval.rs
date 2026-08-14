@@ -16548,7 +16548,11 @@ fn builtin_gmtime<W: Clone + AsRef<[u64]>>(
         Err(r) => return r,
     };
 
-    let t = broken_down_time_from_unix_secs(timestamp.trunc() as i64);
+    let t = match broken_down_time_from_unix_secs(timestamp.trunc() as i64) {
+        Ok(t) => t,
+        Err(_) if optional => return QueryResult::None,
+        Err(e) => return QueryResult::Error(e),
+    };
 
     let result = vec![
         OwnedValue::Int(t.year),
@@ -16565,15 +16569,25 @@ fn builtin_gmtime<W: Clone + AsRef<[u64]>>(
 }
 
 /// Convert a Unix timestamp (whole seconds, UTC) to broken-down time using
-/// the Howard Hinnant `civil_from_days` algorithm. Shared by `gmtime` and
-/// `strftime`'s raw-number input path (#759) so a future fix to this math
-/// only needs applying in one place — see `BrokenDownTime`.
-fn broken_down_time_from_unix_secs(secs: i64) -> BrokenDownTime {
+/// the Howard Hinnant `civil_from_days` algorithm. Shared by `gmtime`,
+/// `localtime`, `todate`, `tz`, and `strftime`'s raw-number input path
+/// (#759) so a future fix to this math only needs applying in one place —
+/// see `BrokenDownTime`.
+///
+/// Returns `Err` for a `secs` too extreme to convert safely: the negative
+/// branch's `secs - 86399` is the only step in this function that can
+/// overflow `i64` (every other step stays comfortably in range for any
+/// `secs` that step doesn't already reject), and the resulting `year` is
+/// additionally checked against `i32`'s range to match real jq's own error
+/// boundary — see [`EvalError::datetime_out_of_range`].
+fn broken_down_time_from_unix_secs(secs: i64) -> Result<BrokenDownTime, EvalError> {
     // Days since Unix epoch (Jan 1, 1970)
     let days = if secs >= 0 {
         secs / 86400
     } else {
-        (secs - 86399) / 86400
+        secs.checked_sub(86399)
+            .ok_or_else(EvalError::datetime_out_of_range)?
+            / 86400
     };
     let time_of_day = secs.rem_euclid(86400);
     let hour = time_of_day / 3600;
@@ -16593,6 +16607,10 @@ fn broken_down_time_from_unix_secs(secs: i64) -> BrokenDownTime {
     let month = if mp < 10 { mp + 3 } else { mp - 9 };
     let year = y + i64::from(month <= 2);
 
+    if year < i64::from(i32::MIN) || year > i64::from(i32::MAX) {
+        return Err(EvalError::datetime_out_of_range());
+    }
+
     // Calculate weekday (0 = Sunday, 6 = Saturday)
     // Jan 1, 1970 was a Thursday (4)
     let weekday = (days % 7 + 4 + 7) % 7;
@@ -16606,7 +16624,7 @@ fn broken_down_time_from_unix_secs(secs: i64) -> BrokenDownTime {
     };
     let yearday = month_days[(month - 1) as usize] + day - 1;
 
-    BrokenDownTime {
+    Ok(BrokenDownTime {
         year,
         month: month as i64,
         day,
@@ -16615,7 +16633,7 @@ fn broken_down_time_from_unix_secs(secs: i64) -> BrokenDownTime {
         second,
         weekday,
         yearday,
-    }
+    })
 }
 
 /// Builtin: localtime - convert Unix timestamp to broken-down local time
@@ -16667,50 +16685,27 @@ fn builtin_localtime<W: Clone + AsRef<[u64]>>(
         // Try to estimate local offset by looking at current system time
         // This gives us the offset at the current moment (may differ from timestamp's offset due to DST)
         let local_offset = estimate_local_offset(now_utc);
-        let local_secs = secs + local_offset;
-
-        // Days since Unix epoch
-        let days = if local_secs >= 0 {
-            local_secs / 86400
-        } else {
-            (local_secs - 86399) / 86400
+        let local_secs = match secs.checked_add(local_offset) {
+            Some(s) => s,
+            None if optional => return QueryResult::None,
+            None => return QueryResult::Error(EvalError::datetime_out_of_range()),
         };
-        let time_of_day = ((local_secs % 86400) + 86400) % 86400;
-        let hour = time_of_day / 3600;
-        let minute = (time_of_day % 3600) / 60;
-        let second = time_of_day % 60;
 
-        // Calculate year, month, day from days since epoch
-        let z = days + 719468;
-        let era = if z >= 0 { z } else { z - 146096 } / 146097;
-        let doe = (z - era * 146097) as u32;
-        let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-        let y = yoe as i64 + era * 400;
-        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-        let mp = (5 * doy + 2) / 153;
-        let day = (doy - (153 * mp + 2) / 5 + 1) as i64;
-        let month = if mp < 10 { mp + 3 } else { mp - 9 };
-        let year = y + i64::from(month <= 2);
-
-        let weekday = (days % 7 + 4 + 7) % 7;
-
-        let is_leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
-        let month_days: [i64; 12] = if is_leap {
-            [0, 31, 60, 91, 121, 152, 182, 213, 244, 274, 305, 335]
-        } else {
-            [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334]
+        let t = match broken_down_time_from_unix_secs(local_secs) {
+            Ok(t) => t,
+            Err(_) if optional => return QueryResult::None,
+            Err(e) => return QueryResult::Error(e),
         };
-        let yearday = month_days[(month - 1) as usize] + day - 1;
 
         let result = vec![
-            OwnedValue::Int(year),
-            OwnedValue::Int((month - 1) as i64),
-            OwnedValue::Int(day),
-            OwnedValue::Int(hour),
-            OwnedValue::Int(minute),
-            OwnedValue::Int(second),
-            OwnedValue::Int(weekday),
-            OwnedValue::Int(yearday),
+            OwnedValue::Int(t.year),
+            OwnedValue::Int(t.month - 1),
+            OwnedValue::Int(t.day),
+            OwnedValue::Int(t.hour),
+            OwnedValue::Int(t.minute),
+            OwnedValue::Int(t.second),
+            OwnedValue::Int(t.weekday),
+            OwnedValue::Int(t.yearday),
         ];
 
         QueryResult::Owned(OwnedValue::Array(result))
@@ -16897,7 +16892,11 @@ fn builtin_strftime<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             };
 
             // Auto-converted the same way `gmtime` converts a raw number.
-            let t = broken_down_time_from_unix_secs(timestamp.trunc() as i64);
+            let t = match broken_down_time_from_unix_secs(timestamp.trunc() as i64) {
+                Ok(t) => t,
+                Err(_) if optional => return QueryResult::None,
+                Err(e) => return QueryResult::Error(e),
+            };
             (
                 t.year, t.month, t.day, t.hour, t.minute, t.second, t.weekday, t.yearday,
             )
@@ -17499,28 +17498,16 @@ fn builtin_todate<W: Clone + AsRef<[u64]>>(
 
     // Convert to broken-down time first
     let secs = timestamp.trunc() as i64;
-    let days = if secs >= 0 {
-        secs / 86400
-    } else {
-        (secs - 86399) / 86400
+    let t = match broken_down_time_from_unix_secs(secs) {
+        Ok(t) => t,
+        Err(_) if optional => return QueryResult::None,
+        Err(e) => return QueryResult::Error(e),
     };
-    let time_of_day = ((secs % 86400) + 86400) % 86400;
-    let hour = time_of_day / 3600;
-    let minute = (time_of_day % 3600) / 60;
-    let second = time_of_day % 60;
 
-    let z = days + 719468;
-    let era = if z >= 0 { z } else { z - 146096 } / 146097;
-    let doe = (z - era * 146097) as u32;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = y + i64::from(month <= 2);
-
-    let result = format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z");
+    let result = format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        t.year, t.month, t.day, t.hour, t.minute, t.second
+    );
 
     QueryResult::Owned(OwnedValue::String(result))
 }
@@ -17684,41 +17671,28 @@ fn builtin_to_unix<W: Clone + AsRef<[u64]>>(
 }
 
 /// Format Unix timestamp to ISO 8601 string with timezone offset
-fn format_datetime_with_offset(timestamp: f64, offset_seconds: i64) -> String {
+fn format_datetime_with_offset(timestamp: f64, offset_seconds: i64) -> Result<String, EvalError> {
     // Apply the timezone offset to the timestamp
-    let adjusted_secs = timestamp.trunc() as i64 + offset_seconds;
+    let adjusted_secs = (timestamp.trunc() as i64)
+        .checked_add(offset_seconds)
+        .ok_or_else(EvalError::datetime_out_of_range)?;
 
-    let days = if adjusted_secs >= 0 {
-        adjusted_secs / 86400
-    } else {
-        (adjusted_secs - 86399) / 86400
-    };
-    let time_of_day = ((adjusted_secs % 86400) + 86400) % 86400;
-    let hour = time_of_day / 3600;
-    let minute = (time_of_day % 3600) / 60;
-    let second = time_of_day % 60;
+    let t = broken_down_time_from_unix_secs(adjusted_secs)?;
 
-    let z = days + 719468;
-    let era = if z >= 0 { z } else { z - 146096 } / 146097;
-    let doe = (z - era * 146097) as u32;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = y + i64::from(month <= 2);
-
-    if offset_seconds == 0 {
-        format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
+    Ok(if offset_seconds == 0 {
+        format!(
+            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+            t.year, t.month, t.day, t.hour, t.minute, t.second
+        )
     } else {
         let offset_hours = offset_seconds.abs() / 3600;
         let offset_mins = (offset_seconds.abs() % 3600) / 60;
         let sign = if offset_seconds >= 0 { '+' } else { '-' };
         format!(
-            "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}{sign}{offset_hours:02}:{offset_mins:02}"
+            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}{}{:02}:{:02}",
+            t.year, t.month, t.day, t.hour, t.minute, t.second, sign, offset_hours, offset_mins
         )
-    }
+    })
 }
 
 /// Get timezone offset in seconds for a given IANA timezone name
@@ -18005,7 +17979,11 @@ fn builtin_tz<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     };
 
     // Format the datetime with the timezone offset
-    let result = format_datetime_with_offset(timestamp, offset);
+    let result = match format_datetime_with_offset(timestamp, offset) {
+        Ok(s) => s,
+        Err(_) if optional => return QueryResult::None,
+        Err(e) => return QueryResult::Error(e),
+    };
     QueryResult::Owned(OwnedValue::String(result))
 }
 
@@ -31242,6 +31220,66 @@ mod tests {
                 assert_eq!(arr[6], OwnedValue::Int(4));    // weekday (Thursday)
                 assert_eq!(arr[7], OwnedValue::Int(0));    // yearday
             }
+        );
+    }
+
+    #[test]
+    fn test_datetime_extreme_magnitude_errors_instead_of_panicking() {
+        // Before #869's fix, an extreme-magnitude timestamp made
+        // `broken_down_time_from_unix_secs`'s `secs - 86399` underflow
+        // `i64` — a debug-build panic, or (release, overflow-checks off) a
+        // silently wrong result. Verified against real jq (jq-1.7.1): jq
+        // itself cleanly errors on these inputs with this exact message.
+        const MSG: &str = "error converting number of seconds since epoch to datetime";
+
+        query!(b"-1e300", r"gmtime", QueryResult::Error(e) => assert_eq!(e.message, MSG));
+        query!(b"1e300", r"gmtime", QueryResult::Error(e) => assert_eq!(e.message, MSG));
+        query!(b"-1e300", r"localtime", QueryResult::Error(e) => assert_eq!(e.message, MSG));
+        query!(b"-1e300", r"todate", QueryResult::Error(e) => assert_eq!(e.message, MSG));
+        query!(b"-1e300", r#"tz("UTC")"#, QueryResult::Error(e) => assert_eq!(e.message, MSG));
+        query!(b"-1e300", r#"strftime("%Y-%m-%d")"#, QueryResult::Error(e) => assert_eq!(e.message, MSG));
+
+        // `?` suppresses it, same as any other builtin error.
+        query!(b"-1e300", r"gmtime?", QueryResult::None => {});
+        query!(b"-1e300", r#"strftime("%Y-%m-%d")?"#, QueryResult::None => {});
+    }
+
+    #[test]
+    fn test_datetime_year_out_of_i32_range_errors_matching_jq_boundary() {
+        // Empirically bisected against real jq (jq-1.7.1): jq starts
+        // erroring on `gmtime`/`strftime` once the resulting year would
+        // overflow a 32-bit int, not merely `i64` — `6e16`/`-6e16` succeed
+        // in jq (and produce this exact date, confirmed byte-for-byte
+        // against `jq`), `7e16`/`-7e16` error, in both directions.
+        const MSG: &str = "error converting number of seconds since epoch to datetime";
+
+        query!(b"6e16", r"gmtime",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr[0], OwnedValue::Int(1_901_326_280));
+            }
+        );
+        query!(b"-6e16", r"gmtime",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr[0], OwnedValue::Int(-1_901_322_341));
+            }
+        );
+        query!(b"7e16", r"gmtime", QueryResult::Error(e) => assert_eq!(e.message, MSG));
+        query!(b"-7e16", r"gmtime", QueryResult::Error(e) => assert_eq!(e.message, MSG));
+    }
+
+    #[test]
+    fn test_datetime_nan_and_subsecond_negative_already_match_jq() {
+        // #869 suspected these were also bugs, but checking the pinned jq
+        // oracle (jq-1.7.1) directly showed both already match real jq
+        // exactly — do not "fix" either into diverging from jq:
+        //  - NaN silently maps to the Unix epoch (not an error) in jq too.
+        //  - A sub-second-negative timestamp truncates toward zero in jq
+        //    (not floor semantics — `-0.5` maps to `secs=0`, not `-1`).
+        query!(b"null", r#"(nan) | strftime("%Y-%m-%d")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => assert_eq!(s, "1970-01-01")
+        );
+        query!(b"null", r#"(-0.5) | strftime("%Y-%m-%dT%H:%M:%SZ")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => assert_eq!(s, "1970-01-01T00:00:00Z")
         );
     }
 
