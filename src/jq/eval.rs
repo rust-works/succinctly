@@ -7077,49 +7077,21 @@ fn stitch_replacements_evaluated<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
 /// Builtin: scan(re) - find all matches
 #[cfg(feature = "regex")]
+/// jq defines this as `scan($re; null)` — delegate to the flags-aware
+/// implementation directly rather than duplicating its match-collection
+/// logic here. The former standalone body always took `caps.get(0)` (the
+/// whole match), never branching on `capture_count` the way
+/// `builtin_scan_with_flags` does, so a pattern with capture groups
+/// silently returned the wrong shape (#915): `scan("(a)(b)")` on `"ab"`
+/// read back as `"ab"` instead of `["a","b"]` — `scan("(a)(b)"; null)` and
+/// real jq both already produced the correct array. Same duplication
+/// shape #906 found and fixed for `splits`.
 fn builtin_scan<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     re_expr: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    // Get the pattern
-    let pattern = match result_to_owned(eval_single::<W, S>(re_expr, value.clone(), optional)) {
-        Ok(OwnedValue::String(s)) => s,
-        Ok(_) if optional => return QueryResult::None,
-        Ok(_) => return QueryResult::Error(EvalError::type_error("string", "pattern")),
-        Err(e) => return e.into(),
-    };
-
-    // Get the input string
-    let input = match &value {
-        StandardJson::String(s) => match s.as_str() {
-            Ok(cow) => cow.into_owned(),
-            Err(_) if optional => return QueryResult::None,
-            Err(_) => return QueryResult::Error(EvalError::new("invalid string")),
-        },
-        _ if optional => return QueryResult::None,
-        _ => return QueryResult::Error(EvalError::cannot_be_matched(&to_owned(&value))),
-    };
-
-    // Build regex
-    let re = match build_regex(&pattern, None) {
-        Ok(r) => r,
-        Err(_e) if optional => return QueryResult::None,
-        Err(e) => return e.into(),
-    };
-
-    // Find all matches
-    let matches: Vec<OwnedValue> = global_captures(&re, &input)
-        .iter()
-        .map(|caps| {
-            let m = caps
-                .get(0)
-                .expect("capture group 0 is always present on a match");
-            OwnedValue::String(m.as_str().to_string())
-        })
-        .collect();
-
-    QueryResult::ManyOwned(matches)
+    builtin_scan_with_flags::<W, S>(re_expr, None, value, optional)
 }
 
 /// Builtin: splits(re) - split by regex
