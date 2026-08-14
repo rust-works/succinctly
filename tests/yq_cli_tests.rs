@@ -5641,6 +5641,72 @@ fn test_compact_mapping_first_field_dispatch_agrees_with_ordinary_mapping_entry_
 }
 
 // ============================================================================
+// Extra spaces after a block-sequence dash (#877)
+// ============================================================================
+// `parse_sequence_item`'s compact-mapping dispatch used to hardcode
+// `compact_indent = indent + 2`, assuming exactly one space between `-` and
+// a compact item's first key. With more than one space, every field after
+// the first folded into the first field's own scalar value instead of being
+// recognized as its own entry - `-   a: hello` / `    b: 2` (three spaces
+// after the dash) read back as `{"a":"hello b"}` (`b` concatenated as text
+// onto `a`'s value, `2` lost entirely).
+
+#[test]
+fn test_compact_mapping_extra_spaces_after_dash_877() -> Result<()> {
+    let (output, exit_code) =
+        run_yq_stdin(".", "-   a: hello\n    b: 2\n", &["-o", "json", "-I0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), r#"[{"a":"hello","b":2}]"#);
+    Ok(())
+}
+
+#[test]
+fn test_compact_mapping_extra_spaces_after_dash_multi_field_877() -> Result<()> {
+    let (output, exit_code) = run_yq_stdin(
+        ".",
+        "-     a: 1\n      b: 2\n      c: 3\n",
+        &["-o", "json", "-I0"],
+    )?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), r#"[{"a":1,"b":2,"c":3}]"#);
+    Ok(())
+}
+
+#[test]
+fn test_compact_mapping_extra_spaces_after_dash_with_flow_first_field_877() -> Result<()> {
+    // Interacts with #864's fix: the compact-mapping indent this dispatches
+    // through is the same one #877 fixes, so a flow-collection first field
+    // (routed through the #864 arms) must also land at the correct column
+    // when the dash has extra spaces.
+    let (output, exit_code) =
+        run_yq_stdin(".", "-   a: {x: 1}\n    b: 2\n", &["-o", "json", "-I0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), r#"[{"a":{"x":1},"b":2}]"#);
+    Ok(())
+}
+
+#[test]
+fn test_compact_mapping_extra_spaces_after_dash_multiple_items_877() -> Result<()> {
+    let (output, exit_code) = run_yq_stdin(
+        ".",
+        "-   a: 1\n    b: 2\n-   a: 3\n    b: 4\n",
+        &["-o", "json", "-I0"],
+    )?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), r#"[{"a":1,"b":2},{"a":3,"b":4}]"#);
+    Ok(())
+}
+
+#[test]
+fn test_compact_mapping_single_space_after_dash_still_works_877() -> Result<()> {
+    // Control: the ordinary single-space case must remain unaffected.
+    let (output, exit_code) = run_yq_stdin(".", "- a: hello\n  b: 2\n", &["-o", "json", "-I0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), r#"[{"a":"hello","b":2}]"#);
+    Ok(())
+}
+
+// ============================================================================
 // Out-dented block sequence continuation (#485)
 // ============================================================================
 // A continuation `-` indented strictly between a sequence's own indent and
