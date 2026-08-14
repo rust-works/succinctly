@@ -5428,6 +5428,116 @@ fn test_inline_sequence_as_compact_mapping_value_is_not_dropped() -> Result<()> 
 }
 
 // ============================================================================
+// Flow collection as a compact mapping's *first* field (#864)
+// ============================================================================
+// The dash-dispatch fix above (#325/inline-sequence) covers one of
+// `parse_compact_mapping_entry`'s inline-value arms; `[`/`{`/`|`/`>` were
+// still missing entirely, so any of them as the value of a block-sequence
+// item's *first* field fell through to the scalar fallback
+// (`parse_inline_value`), which treats `{`/`[`/`,`/`}`/`]` as ordinary plain
+// scalar characters. A flow array lost its real content (read back as `[]`);
+// a flow mapping was worse — the scalar scanner stopped at its first inner
+// `key:`+space and stranded `self.pos` mid-line, corrupting every sibling
+// field parsed after it too. Confirmed via oracle diff against pinned `yq`
+// v4.53.3 and via before/after `git stash` bisection against this fix.
+
+#[test]
+fn test_compact_mapping_first_field_flow_mapping_value_864() -> Result<()> {
+    // Before the fix: `[{"a":{}}]` - `b` vanished entirely, not just `a`'s
+    // content, matching the issue title's "corrupting sibling parsing".
+    let (output, exit_code) = run_yq_stdin(".", "- a: {x: 1}\n  b: 2\n", &["-o", "json", "-I0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), r#"[{"a":{"x":1},"b":2}]"#);
+    Ok(())
+}
+
+#[test]
+fn test_compact_mapping_first_field_flow_mapping_value_multi_key_multi_sibling_864() -> Result<()> {
+    // The worst-case shape: a multi-key flow mapping followed by multiple
+    // sibling fields. Before the fix this read back as just `[{"a":{}}]`,
+    // silently dropping `b` and `c` along with `a`'s own contents.
+    let (output, exit_code) = run_yq_stdin(
+        ".",
+        "- a: {x: 1, y: 2}\n  b: 3\n  c: 4\n",
+        &["-o", "json", "-I0"],
+    )?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), r#"[{"a":{"x":1,"y":2},"b":3,"c":4}]"#);
+    Ok(())
+}
+
+#[test]
+fn test_compact_mapping_first_field_flow_sequence_value_864() -> Result<()> {
+    // Before the fix: `[{"a":[],"b":3}]` - `a`'s real content (`[1,2]`) was
+    // lost, though `b` happened to survive this particular shape.
+    let (output, exit_code) = run_yq_stdin(".", "- a: [1, 2]\n  b: 3\n", &["-o", "json", "-I0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), r#"[{"a":[1,2],"b":3}]"#);
+    Ok(())
+}
+
+#[test]
+fn test_compact_mapping_first_field_empty_flow_collections_864() -> Result<()> {
+    for (input, expected) in [
+        ("- a: {}\n  b: 2\n", r#"[{"a":{},"b":2}]"#),
+        ("- a: []\n  b: 2\n", r#"[{"a":[],"b":2}]"#),
+    ] {
+        let (output, exit_code) = run_yq_stdin(".", input, &["-o", "json", "-I0"])?;
+        assert_eq!(exit_code, 0, "input: {input:?}");
+        assert_eq!(output.trim(), expected, "input: {input:?}");
+    }
+    Ok(())
+}
+
+#[test]
+fn test_compact_mapping_first_field_flow_mapping_value_with_anchor_864() -> Result<()> {
+    // An anchor prefixing the flow-mapping value must still resolve through
+    // the same dispatch, not just the bare (unanchored) form.
+    let (output, exit_code) = run_yq_stdin(
+        ".",
+        "- a: &anchor {x: 1}\n  b: 2\n- a: *anchor\n",
+        &["-o", "json", "-I0"],
+    )?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), r#"[{"a":{"x":1},"b":2},{"a":{"x":1}}]"#);
+    Ok(())
+}
+
+#[test]
+fn test_compact_mapping_multiple_items_with_flow_first_field_864() -> Result<()> {
+    // Two compact-mapping sequence items in a row, each with a flow-mapping
+    // first field, guards against the fix only working for a lone item.
+    let (output, exit_code) = run_yq_stdin(
+        ".",
+        "- a: {x: 1}\n  b: 2\n- a: {x: 3}\n  b: 4\n",
+        &["-o", "json", "-I0"],
+    )?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(
+        output.trim(),
+        r#"[{"a":{"x":1},"b":2},{"a":{"x":3},"b":4}]"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_compact_mapping_first_field_block_scalar_value_864() -> Result<()> {
+    // Block scalars (`|`/`>`) as a compact mapping's first field already
+    // resolved correctly through the scalar fallback's own indent-aware
+    // parsing before this fix - this arm is a defensive dispatch added for
+    // consistency with `parse_mapping_entry`'s identical arm, not a bug fix.
+    // Kept as a direct oracle-verified regression guard regardless.
+    let (output, exit_code) = run_yq_stdin(
+        ".",
+        "- a: |\n    hello\n    world\n  b: 2\n",
+        &["-o", "json", "-I0"],
+    )?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), r#"[{"a":"hello\nworld\n","b":2}]"#);
+    Ok(())
+}
+
+// ============================================================================
 // Out-dented block sequence continuation (#485)
 // ============================================================================
 // A continuation `-` indented strictly between a sequence's own indent and
