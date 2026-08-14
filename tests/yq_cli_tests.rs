@@ -1579,11 +1579,15 @@ fn test_raw_input_json_output() -> Result<()> {
 #[test]
 fn test_raw_input_slurp() -> Result<()> {
     // yq -R -s (jq semantics): the entire input is one string, not an
-    // array of lines
+    // array of lines. A bare top-level scalar result drops all of its
+    // own styling (#852), so this prints the raw content - including its
+    // embedded newlines written literally, not quoted/escaped - matching
+    // real yq's own root-scalar behavior (verified elsewhere in this file
+    // for the analogous block-scalar-root case).
     let input = "line one\nline two\nline three";
     let (output, exit_code) = run_yq_stdin(".", input, &["-R", "-s"])?;
     assert_eq!(exit_code, 0);
-    assert_eq!(output, "\"line one\\nline two\\nline three\"\n");
+    assert_eq!(output, "line one\nline two\nline three\n");
     Ok(())
 }
 
@@ -1628,7 +1632,7 @@ fn test_raw_input_slurp_raw_output() -> Result<()> {
 fn test_raw_input_slurp_empty_input() -> Result<()> {
     let (output, exit_code) = run_yq_stdin(".", "", &["-R", "-s"])?;
     assert_eq!(exit_code, 0);
-    assert_eq!(output, "''\n");
+    assert_eq!(output, "\n");
     Ok(())
 }
 
@@ -1685,8 +1689,9 @@ fn test_raw_input_empty_lines() -> Result<()> {
     let input = "line1\n\nline2\n\n\nline3";
     let (output, exit_code) = run_yq_stdin(".", input, &["-R"])?;
     assert_eq!(exit_code, 0);
-    // Empty lines become empty strings, which are quoted in YAML output
-    assert_eq!(output, "line1\n''\nline2\n''\n''\nline3\n");
+    // Each line is its own bare top-level result; an empty line's result
+    // drops its own styling (#852) and prints as a blank line, not `''`.
+    assert_eq!(output, "line1\n\nline2\n\n\nline3\n");
     Ok(())
 }
 
@@ -2360,6 +2365,54 @@ fn test_yaml_quoted_scalar_style_kept_when_nested_under_the_document_root_852() 
 fn test_yaml_ambiguous_scalar_style_dropped_unconditionally_on_document_root_852() -> Result<()> {
     let input = "\"true\"\n";
     let (output, exit_code) = run_yq_stdin(".", input, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "true\n");
+    Ok(())
+}
+
+/// #852: an empty double-quoted string root prints as literally nothing
+/// (not `""`), matching real `yq` exactly.
+#[test]
+fn test_yaml_empty_string_style_dropped_on_document_root_852() -> Result<()> {
+    let (output, exit_code) = run_yq_stdin(".", "\"\"\n", &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "\n");
+    Ok(())
+}
+
+/// #852: content that would need quoting in a normal nested position
+/// (starts with `- `, ambiguous with a block-sequence item) still drops
+/// its quotes unconditionally at the document root - there's no sibling
+/// content there for it to be confused with.
+#[test]
+fn test_yaml_dash_prefixed_scalar_style_dropped_on_document_root_852() -> Result<()> {
+    let input = "'- foo'\n";
+    let (output, exit_code) = run_yq_stdin(".", input, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "- foo\n");
+    Ok(())
+}
+
+/// #852 (found in code review): the M2/cursor path fix alone left the
+/// *computed*-value path (`GenericResult::One`/`Many`, e.g. `-n`
+/// construction or any query whose root goes through the general
+/// evaluator rather than staying a pure cursor passthrough) still quoting
+/// an ambiguous root string - `OwnedValue::stream_yaml`
+/// (`src/jq/stream.rs`) needed the identical root-only special case.
+#[test]
+fn test_null_input_computed_scalar_style_dropped_on_document_root_852() -> Result<()> {
+    let (output, exit_code) = run_yq_stdin("\"true\"", "", &["-n"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "true\n");
+    Ok(())
+}
+
+/// Same computed-value gap as above, reached via arithmetic (`+`, not
+/// M2-streamable) on real input instead of `-n` construction.
+#[test]
+fn test_computed_string_concat_style_dropped_on_query_result_852() -> Result<()> {
+    let input = "a: \"tr\"\nb: \"ue\"\n";
+    let (output, exit_code) = run_yq_stdin(".a + .b", input, &[])?;
     assert_eq!(exit_code, 0);
     assert_eq!(output, "true\n");
     Ok(())
@@ -6754,28 +6807,29 @@ fn test_line_comment_builtin_710() -> Result<()> {
     Ok(())
 }
 
-/// No space after `#` - nothing to strip, matching real `yq`'s value. The
-/// result is quoted (`"#keep this"`) because an unquoted string starting
-/// with `#` would itself look like a comment in the re-parsed YAML.
+/// No space after `#` - nothing to strip, matching real `yq`'s value. A
+/// bare top-level scalar result drops its own styling unconditionally
+/// (#852), so this prints raw `#keep this` even though an unquoted string
+/// starting with `#` would look like a comment if re-parsed - real `yq`
+/// does the identical thing (verified against the pinned binary).
 #[test]
 fn test_line_comment_builtin_no_space_after_hash_710() -> Result<()> {
     let (out, code) = run_yq_stdin(".a | line_comment", "a: 1 #keep this\n", &[])?;
     assert_eq!(code, 0);
-    assert_eq!(out.trim(), "\"#keep this\"");
+    assert_eq!(out.trim(), "#keep this");
     Ok(())
 }
 
 /// No comment at all - the getter returns `""`, not `null` (matches real
 /// `yq`'s value, verified empirically - this is not the same default as
-/// `line`/`column`, which return `0`). Output is `''` rather than a blank
-/// line because succinctly quotes empty-string scalars by default, unlike
-/// real `yq` - a pre-existing, unrelated discrepancy (`yq '""'` shows the
-/// same gap on unmodified `main`), not something this feature introduces.
+/// `line`/`column`, which return `0`). Output is a blank line, not `''`:
+/// this was the exact gap #852 fixed (a bare top-level empty-string result
+/// used to be quoted, unlike real `yq`).
 #[test]
 fn test_line_comment_builtin_empty_when_absent_710() -> Result<()> {
     let (out, code) = run_yq_stdin(".a | line_comment", "a: 1\n", &[])?;
     assert_eq!(code, 0);
-    assert_eq!(out, "''\n");
+    assert_eq!(out, "\n");
     Ok(())
 }
 
@@ -7062,9 +7116,10 @@ fn test_keys_unsorted_lazy_index_range_via_dom_fallback_710() -> Result<()> {
 fn test_line_comment_builtin_via_json_input_dom_path_710() -> Result<()> {
     let (out, code) = run_yq_stdin(".a | line_comment", "{\"a\": 1}", &["-p", "json"])?;
     assert_eq!(code, 0);
-    // Default output stays YAML (`-p` only sets the *input* format), so an
-    // empty string renders as YAML's `''`, not JSON's `""`.
-    assert_eq!(out, "''\n");
+    // Default output stays YAML (`-p` only sets the *input* format); a
+    // bare top-level empty-string result renders as a blank line, not
+    // JSON's `""` or YAML's `''` (#852).
+    assert_eq!(out, "\n");
     Ok(())
 }
 
@@ -7078,7 +7133,7 @@ fn test_line_comment_builtin_via_json_input_dom_path_710() -> Result<()> {
 fn test_line_comment_builtin_through_def_expansion_710() -> Result<()> {
     let (out, code) = run_yq_stdin("def f: line_comment; .a | f", "{\"a\": 1}", &["-p", "json"])?;
     assert_eq!(code, 0);
-    assert_eq!(out, "''\n");
+    assert_eq!(out, "\n");
     Ok(())
 }
 
@@ -7140,11 +7195,11 @@ fn test_key_comment_not_exposed_via_line_comment_getter_765() -> Result<()> {
 
     let (out, code) = run_yq_stdin(".a | line_comment", input, &[])?;
     assert_eq!(code, 0);
-    assert_eq!(out, "''\n");
+    assert_eq!(out, "\n");
 
     let (out, code) = run_yq_stdin(".a.b | line_comment", input, &[])?;
     assert_eq!(code, 0);
-    assert_eq!(out, "''\n");
+    assert_eq!(out, "\n");
 
     Ok(())
 }
