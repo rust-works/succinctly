@@ -5790,12 +5790,34 @@ fn test_flow_collection_as_implicit_mapping_key_still_permitted_878() -> Result<
     // #878's validation must not reject a flow collection followed by `:` -
     // that's a legitimate implicit-mapping-key shape (confirmed against the
     // YAML test suite's own "Implicit Flow Mapping Key" and "6BFJ"/"Q9WF"
-    // cases), not trailing garbage after a value. Only reachable through
-    // `parse_value` (`check_trailing: false`), never through the other three
-    // dispatch sites, which are always past an unambiguous `key:` already.
-    for doc in ["[a, b]: value\n", "{a: 1}: value\n"] {
-        let (_, code) = run_yq_stdin(".", doc, &["-o", "json", "-I0"])?;
+    // cases), not trailing garbage after a value. Reachable through
+    // `parse_value` (document root / bare sequence item) and
+    // `parse_explicit_value` (`? key` / `: ...`) - both pass
+    // `check_trailing: false` for exactly this reason.
+    //
+    // Pins *actual* output, not just exit code (this project's testing
+    // conventions treat an exit-code-only assertion here as a false-
+    // confidence anti-pattern) - and deliberately documents a known,
+    // pre-existing gap rather than papering over it: succinctly doesn't
+    // actually implement flow-collection-keyed implicit mappings yet. Real
+    // `yq` folds `[a, b]: value` into a single-entry mapping `{"":
+    // "value"}`; succinctly currently only avoids hard-erroring on it,
+    // emitting the flow collection and the trailing value as two disjoint
+    // results instead (confirmed identical on `main` before this PR - not
+    // introduced or worsened here). This test's job is to confirm the
+    // document doesn't error and to catch a regression in the *current*
+    // output if one occurs; implementing the real feature is tracked as a
+    // follow-up.
+    let cases: &[(&str, &str)] = &[
+        ("[a, b]: value\n", "[\"a\",\"b\"]\n\"value\""),
+        ("{a: 1}: value\n", "{\"a\":1}\n\"value\""),
+        ("? k\n: [a, b]: value\n", r#"{"k":["a","b"]}"#),
+        ("? k\n: {a: 1}: value\n", r#"{"k":{"a":1}}"#),
+    ];
+    for (doc, expected) in cases {
+        let (out, code) = run_yq_stdin(".", doc, &["-o", "json", "-I0"])?;
         assert_eq!(code, 0, "doc: {doc:?}");
+        assert_eq!(out.trim(), *expected, "doc: {doc:?}");
     }
     Ok(())
 }
