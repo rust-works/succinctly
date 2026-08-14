@@ -24968,6 +24968,24 @@ mod tests {
     }
 
     #[test]
+    // `"in(null)"`/`"in({a:1}, null)"` are jq filter literals, not
+    // formatting strings; clippy cannot tell the two apart from the brace
+    // shape alone.
+    #[allow(clippy::literal_string_with_formatting_args)]
+    fn test_builtin_in_null_candidate_is_never_in_anything_908() {
+        // Review finding on #908: a null `xs` candidate has no arm of its
+        // own, unlike `builtin_has`'s `(StandardJson::Null, _) => false`
+        // short-circuit, so it fell into the type-mismatch catch-all and
+        // errored instead of contributing `false`. Confirmed against jq
+        // 1.7.1: `"a" | in(null)` is `false`; `"a" | in({a:1}, null)` is
+        // `true` *and* `false` (the null candidate doesn't truncate the
+        // stream); `5 | in(null)` is `false` regardless of key type.
+        assert_eq!(outputs(br#""a""#, "in(null)"), ["false"]);
+        assert_eq!(outputs(br#""a""#, "in({a:1}, null)"), ["true", "false"]);
+        assert_eq!(outputs(b"5", "in(null)"), ["false"]);
+    }
+
+    #[test]
     // `"in(5, {a:1})?"` is a jq filter literal, not a formatting string;
     // clippy cannot tell the two apart from the brace shape alone.
     #[allow(clippy::literal_string_with_formatting_args)]

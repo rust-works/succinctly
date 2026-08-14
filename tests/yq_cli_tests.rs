@@ -10090,3 +10090,24 @@ fn test_builtin_in_yq_negative_index_880() -> Result<()> {
     assert_eq!(out.trim(), "false");
     Ok(())
 }
+
+/// Review finding on #908: `idx.abs()` in the negative-index branch above
+/// overflows for `i64::MIN` -- a debug build panics ("attempt to negate
+/// with overflow", exit 101 via `unwrap`/no catch), a release build
+/// silently wraps back to a still-negative `i64::MIN`, making
+/// `idx.abs() <= len` spuriously true. `idx.unsigned_abs()` (a `u64`,
+/// overflow-free for every `i64` including `MIN`) fixes both. A non-zero
+/// exit code here would mean either the panic or the wrong-answer shape
+/// resurfaced. `has(...)`'s identical, independently-duplicated branch is
+/// exercised too, since it shares this exact bug.
+#[test]
+fn test_builtin_in_and_has_yq_negative_index_i64_min_no_overflow_908() -> Result<()> {
+    let (out, code) = run_yq_stdin("in([1,2,3])", "-9223372036854775808", &[])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "false");
+
+    let (out, code) = run_yq_stdin("has(-9223372036854775808)", "[1,2,3]", &[])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "false");
+    Ok(())
+}
