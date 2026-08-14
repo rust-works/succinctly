@@ -694,6 +694,47 @@ fn test_assign_preserves_untouched_empty_string_double_quote_style_739() -> Resu
     Ok(())
 }
 
+/// #739: a brand-new field (no pristine counterpart at that key) gets
+/// fresh, empty metadata in `reconcile_presentation`'s `Object` arm,
+/// while its untouched sibling keeps its own style.
+#[test]
+fn test_assign_adds_a_new_field_with_no_pristine_style_739() -> Result<()> {
+    let (output, code) = run_yq_stdin(".c = 3", "a: 'single'\nb: 1\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "a: 'single'\nb: 1\nc: 3\n");
+    Ok(())
+}
+
+/// #739: an untouched double-quoted sibling containing every character
+/// `yaml_double_quote_escaped` escapes must round-trip through the
+/// style-forced "double" path, not just the default heuristic path.
+#[test]
+fn test_assign_preserves_double_quote_escaping_on_untouched_sibling_739() -> Result<()> {
+    let (output, code) = run_yq_stdin(
+        ".b = 2",
+        "a: \"line1\\nline2\\ttab\\\\back\\\"quote\"\nb: 1\n",
+        &[],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(
+        output,
+        "a: \"line1\\nline2\\ttab\\\\back\\\"quote\"\nb: 2\n"
+    );
+    Ok(())
+}
+
+/// #852, exercised through a write this time: a write followed by
+/// navigating to a scalar result must still drop that scalar's own
+/// styling at the top level, even though the DOM path now tracks style
+/// data for writes (#739).
+#[test]
+fn test_write_then_navigate_to_scalar_still_drops_root_style_739() -> Result<()> {
+    let (output, code) = run_yq_stdin(".a = 5 | .a", "a: 'single'\nb: 1\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "5\n");
+    Ok(())
+}
+
 #[test]
 fn test_duplicate_mapping_key_is_last_wins() -> Result<()> {
     // YAML 1.2 / yq: a mapping with a duplicate key resolves `.key` to the
