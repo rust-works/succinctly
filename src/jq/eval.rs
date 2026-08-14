@@ -7123,46 +7123,22 @@ fn builtin_scan<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 }
 
 /// Builtin: splits(re) - split by regex
+///
+/// jq defines this as `splits($re; null)` — delegate to the flags-aware
+/// implementation directly rather than duplicating its (streaming) split
+/// logic here. The former standalone body returned a single
+/// `QueryResult::Owned(Array(parts))` instead of streaming one output per
+/// substring the way `splits(re; flags)` and real jq both do (#906):
+/// `[splits("[0-9]")]` on `"a1b2"` read back as `[["a","b",""]]` (one
+/// nested array) instead of `["a","b",""]` (three streamed strings
+/// collected).
 #[cfg(feature = "regex")]
 fn builtin_splits<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     re_expr: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    // Get the pattern
-    let pattern = match result_to_owned(eval_single::<W, S>(re_expr, value.clone(), optional)) {
-        Ok(OwnedValue::String(s)) => s,
-        Ok(_) if optional => return QueryResult::None,
-        Ok(_) => return QueryResult::Error(EvalError::type_error("string", "pattern")),
-        Err(e) => return e.into(),
-    };
-
-    // Get the input string
-    let input = match &value {
-        StandardJson::String(s) => match s.as_str() {
-            Ok(cow) => cow.into_owned(),
-            Err(_) if optional => return QueryResult::None,
-            Err(_) => return QueryResult::Error(EvalError::new("invalid string")),
-        },
-        _ if optional => return QueryResult::None,
-        _ => return QueryResult::Error(EvalError::cannot_be_matched(&to_owned(&value))),
-    };
-
-    // Build regex
-    let re = match build_regex(&pattern, None) {
-        Ok(r) => r,
-        Err(_e) if optional => return QueryResult::None,
-        Err(e) => return e.into(),
-    };
-
-    // Split by regex
-    let matches = global_captures(&re, &input);
-    let parts: Vec<OwnedValue> = stitch_split(&input, &matches)
-        .into_iter()
-        .map(OwnedValue::String)
-        .collect();
-
-    QueryResult::Owned(OwnedValue::Array(parts))
+    builtin_splits_with_flags::<W, S>(re_expr, None, value, optional)
 }
 
 /// Builtin: sub(re; replacement) - replace first match
@@ -27445,8 +27421,12 @@ mod tests {
     #[cfg(feature = "regex")]
     #[test]
     fn test_regex_splits() {
+        // `splits(re)` streams one output per substring — like real jq, and
+        // like `splits(re; flags)` already did before #906's fix made the
+        // bare form (this one) match instead of wrongly collapsing to a
+        // single array-valued output.
         query!(br#""a1b2c3d""#, r#"splits("[0-9]")"#,
-            QueryResult::Owned(OwnedValue::Array(parts)) => {
+            QueryResult::ManyOwned(parts) => {
                 assert_eq!(parts.len(), 4);
                 assert_eq!(parts[0], OwnedValue::String("a".to_string()));
                 assert_eq!(parts[1], OwnedValue::String("b".to_string()));
