@@ -7512,6 +7512,76 @@ fn test_recurse_f_keeps_own_partial_fanout_subtree_before_error_842() -> Result<
 }
 
 #[test]
+fn test_recurse_cond_keeps_already_approved_siblings_before_error_854() -> Result<()> {
+    // Issue #854's primary repro (value position). Distinct from #842
+    // (which was `f`'s own fan-out): here `f` succeeds fully and it's
+    // `cond`'s own per-child evaluation loop that errors partway through a
+    // node's children, dropping the siblings that already passed `cond`
+    // earlier in that same loop. Verified against jq 1.7.1:
+    // `echo '[1,2,3]' | jq -c 'recurse(if type=="array" then .[] else
+    // empty end; if . == 2 then error("boom") else true end)'` prints
+    // `[1,2,3]` and `1` to stdout before erroring, and exits 5.
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            r#"recurse(if type=="array" then .[] else empty end; if . == 2 then error("boom") else true end)"#,
+        ],
+        Some("[1,2,3]"),
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[1,2,3]\n1\n");
+    assert!(stderr.contains("boom"), "stderr: {stderr:?}");
+    Ok(())
+}
+
+#[test]
+fn test_resolve_recurse_cond_keeps_already_approved_siblings_before_error_854() -> Result<()> {
+    // Issue #854's secondary repro (path position, `resolve_recurse`).
+    // Same underlying bug as the value-position test above, in the
+    // path-tracking evaluator `path(...)` uses. Verified against jq 1.7.1:
+    // `echo '[1,2,3]' | jq -c 'path(recurse(if type=="array" then .[] else
+    // empty end; if . == 2 then error("boom") else true end))'` prints
+    // `[]` and `[0]` to stdout before erroring, and exits 5.
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            r#"path(recurse(if type=="array" then .[] else empty end; if . == 2 then error("boom") else true end))"#,
+        ],
+        Some("[1,2,3]"),
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[]\n[0]\n");
+    assert!(stderr.contains("boom"), "stderr: {stderr:?}");
+    Ok(())
+}
+
+#[test]
+fn test_recurse_cond_own_multi_output_fanout_kept_before_error_854() -> Result<()> {
+    // The deepest layer of #854: `cond` itself can be a multi-output
+    // generator (independent of the child), so a truthy output it already
+    // produced for a given child before erroring on a later output of that
+    // same call must still queue the child for its own full recursive
+    // descent. Real jq's lazy interleaving then recurses fully into that
+    // approved child *before* ever asking `cond` for its second output, so
+    // the error that actually surfaces is whatever that recursion itself
+    // hits — not `cond`'s own deferred one. Verified against jq 1.7.1:
+    // `echo '{"a":1,"b":2,"c":3}' | jq -c 'recurse(.[]; (true,
+    // error("cond-err")))'` prints the root and `1` to stdout, then exits
+    // 5 with "Cannot iterate over number (1)" — not "cond-err".
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r#"recurse(.[]; (true, error("cond-err")))"#],
+        Some(r#"{"a":1,"b":2,"c":3}"#),
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "{\"a\":1,\"b\":2,\"c\":3}\n1\n");
+    assert!(
+        stderr.contains("Cannot iterate over number"),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
+#[test]
 fn test_walk_propagates_halt_from_f() -> Result<()> {
     // `builtin_walk`'s `Err(e) => e.into()` arm: `walk_impl` applies `f` to
     // the (already child-processed) value via `eval_owned_expr`, and a halt
