@@ -30129,6 +30129,32 @@ mod tests {
         }
     }
 
+    /// #861: `path(paths(node_filter))` checks each of `paths(node_filter)`'s
+    /// own outputs (plain arrays, not further path-trackable) the moment
+    /// they're produced — the same "invalid path expression" check
+    /// `test_path_of_a_non_path_expression_raises_invalid_path_expression`
+    /// above exercises for a single-output argument, but here the argument is
+    /// a generator whose *second* candidate would otherwise `break` to a
+    /// label outside `path(...)` entirely. Real jq never reaches that second
+    /// candidate: it raises on the first output before evaluating the next
+    /// one, so the break never fires. Verified against jq 1.7.1: `label $out
+    /// | path(paths(if type=="string" then break $out else true end))` on
+    /// `[1,"x",2]` raises "Invalid path expression with result [0]", exit 5
+    /// — not silence (`resolve_leaf`'s fallback used to evaluate the whole
+    /// argument via `eval_owned_multi`, which discards the already-produced
+    /// first output the moment the second candidate's break escapes, per
+    /// #842's precedent for the same all-or-nothing pitfall elsewhere).
+    #[test]
+    fn test_path_paths_filter_raises_before_reaching_a_later_break_861() {
+        query!(
+            br#"[1,"x",2]"#,
+            r#"label $out | path(paths(if type=="string" then break $out else true end))"#,
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "Invalid path expression with result [0]");
+            }
+        );
+    }
+
     /// `?` does not suppress `invalid_path_expression` — it is a statement
     /// about the filter, not a value error raised while collecting a path
     /// (confirmed live against jq 1.7.1: `path(("a")?)` still raises there).
