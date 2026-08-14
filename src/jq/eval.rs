@@ -9441,7 +9441,11 @@ fn eval_owned_multi<S: EvalSemantics>(
     expr: &Expr,
     input: &OwnedValue,
 ) -> Result<Vec<OwnedValue>, EvalEscape> {
-    eval_owned_multi_keep_partial::<S>(expr, input).map_err(|(_prefix, e)| e)
+    let (values, escape) = eval_owned_multi_keep_partial::<S>(expr, input);
+    match escape {
+        Some(e) => Err(e),
+        None => Ok(values),
+    }
 }
 
 /// Like [`eval_owned_multi`], but keeps `collect_owned`'s old "just give me
@@ -9491,22 +9495,23 @@ fn eval_owned_multi_first<S: EvalSemantics>(
 /// Like [`eval_owned_multi`], but keeps whatever prefix `expr` already
 /// produced before an error/break/halt escaped, instead of discarding it.
 ///
-/// `eval_owned_multi`'s all-or-nothing contract is correct for its other
-/// callers (see its own doc comment), so this is a separate function rather
 /// than a change to that one's behavior. Direct callers today: `recurse`'s
 /// own children-evaluation step in value position (`builtin_recurse_f`/
 /// `builtin_recurse_cond`, both evaluate `f` through this function
-/// directly), and `resolve_leaf`'s non-primitive fallback in path position
-/// (#861 — the same all-or-nothing pitfall reaching `path(...)`-wrapped
-/// expressions whose argument isn't one of the specially-tracked navigation
-/// primitives). The other path-position sibling, `resolve_recurse`, needs
-/// the same fix but resolves `f` through `resolve_node`/
-/// `resolve_against_cow` instead — a structurally different call whose
-/// `PathResolveResult` already threads a prefix through its own `Err`, so
-/// it applies the equivalent fix without calling this function. `f`'s *own*
-/// fan-out is a generator like any other comma expression, and jq's
-/// backtracking generator semantics mean a later output of that same call
-/// erroring does not retroactively un-emit an earlier one it already
+/// directly), `resolve_recurse`'s own `cond`-evaluation step in path
+/// position (#854 — `cond` can itself be a multi-output generator whose own
+/// later output errors after an earlier one already fired truthy for the
+/// same child), and `resolve_leaf`'s non-primitive fallback, also path
+/// position (#861 — the same all-or-nothing pitfall reaching
+/// `path(...)`-wrapped expressions whose argument isn't one of the
+/// specially-tracked navigation primitives). `resolve_recurse`'s own
+/// `f`-evaluation step is the one exception: it resolves `f` through
+/// `resolve_node`/`resolve_against_cow` instead — a structurally different
+/// call whose `PathResolveResult` already threads a prefix through its own
+/// `Err`, so it applies the equivalent fix without calling this function.
+/// `f`'s *own* fan-out is a generator like any other comma expression, and
+/// jq's backtracking generator semantics mean a later output of that same
+/// call erroring does not retroactively un-emit an earlier one it already
 /// produced (#842). Confirmed against jq 1.7.1:
 /// `recurse(if . == {"a":1,"b":2} then (.a, .b[0]) else empty end)` on
 /// `{"a":1,"b":2}` prints the root *and* `1` (the `.a` branch, produced
@@ -9525,16 +9530,23 @@ fn eval_owned_multi_first<S: EvalSemantics>(
 /// terminal escape separately" primitive [`eval_binary_fanout`] already
 /// uses) rather than a second hand-rolled match over `QueryResult`, so
 /// there is exactly one implementation of that shape in this file.
+///
+/// Returns `(values, escape)` rather than `Result<Vec<_>, (Vec<_>, _)>`:
+/// every one of this function's own callers immediately unwraps either
+/// shape into exactly this pair anyway (there is no caller that treats
+/// "some escape" and "no escape" as genuinely different *return types* to
+/// propagate — every one wants the values either way, and separately checks
+/// whether an escape needs deferring), so returning the pair directly
+/// removes an `Ok`/`Err` unwrap at each call site rather than relocating it
+/// (#854 review).
 fn eval_owned_multi_keep_partial<S: EvalSemantics>(
     expr: &Expr,
     input: &OwnedValue,
-) -> Result<Vec<OwnedValue>, (Vec<OwnedValue>, EvalEscape)> {
+) -> (Vec<OwnedValue>, Option<EvalEscape>) {
     let result = eval_owned_input::<Vec<u64>, S>(expr, input, false);
     let mut out = Vec::new();
-    match push_owned_values(result, &mut out) {
-        Some(control) => Err((out, control.into())),
-        None => Ok(out),
-    }
+    let escape = push_owned_values(result, &mut out).map(EvalEscape::from);
+    (out, escape)
 }
 
 /// Turn a resolved key value into the static path component it denotes.
@@ -10298,10 +10310,7 @@ fn resolve_leaf<'a, S: EvalSemantics>(
     // earlier one it already yielded (#842's precedent for `recurse`'s own
     // fan-out, applying equally here) — see the "streams as it goes" case
     // below (#861).
-    let (mut values, trailing) = match eval_owned_multi_keep_partial::<S>(expr, value) {
-        Ok(values) => (values, None),
-        Err((prefix, escape)) => (prefix, Some(escape)),
-    };
+    let (mut values, trailing) = eval_owned_multi_keep_partial::<S>(expr, value);
     // Halt is never swallowed, however many outputs `expr` already produced:
     // it is an unconditional process-termination signal (`EvalEscape::Halt`'s
     // own doc comment), not an ordinary catchable failure. Break/Error below
@@ -10808,10 +10817,7 @@ fn resolve_recurse<'a, S: EvalSemantics>(
                     // `pending_error` supersede rule above reproduces this
                     // exactly once `cond`'s own prefix is kept here.
                     let (cond_outputs, cond_err) =
-                        match eval_owned_multi_keep_partial::<S>(cond, &child_value) {
-                            Ok(cond_outputs) => (cond_outputs, None),
-                            Err((prefix, e)) => (prefix, Some(e)),
-                        };
+                        eval_owned_multi_keep_partial::<S>(cond, &child_value);
                     if !is_null_current {
                         for c in &cond_outputs {
                             if c.is_truthy() {
@@ -13330,10 +13336,7 @@ fn builtin_recurse_f<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // recursive treatment (#842); `eval_owned_multi_keep_partial` keeps
         // that prefix instead of `eval_owned_multi`'s all-or-nothing
         // contract, which is right for its other callers but not this one.
-        let (children, deferred_error) = match eval_owned_multi_keep_partial::<S>(f, &current) {
-            Ok(children) => (children, None),
-            Err((prefix, e)) => (prefix, Some(e)),
-        };
+        let (children, deferred_error) = eval_owned_multi_keep_partial::<S>(f, &current);
         queue_recurse_children(&mut stack, children, deferred_error, &mut pending_error);
     }
 
@@ -13415,10 +13418,7 @@ fn builtin_recurse_cond<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // node (kept via `eval_owned_multi_keep_partial`, #842) has had its
         // own full `cond`-gated recursive treatment, deferred below exactly
         // like `builtin_recurse_f`.
-        let (children, mut deferred_error) = match eval_owned_multi_keep_partial::<S>(f, &current) {
-            Ok(children) => (children, None),
-            Err((prefix, e)) => (prefix, Some(e)),
-        };
+        let (children, mut deferred_error) = eval_owned_multi_keep_partial::<S>(f, &current);
 
         // Collected in encounter order, then pushed onto `stack` reversed —
         // see `resolve_recurse`'s doc comment (#635) — so the first entry's
@@ -13441,10 +13441,7 @@ fn builtin_recurse_cond<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // recursive descent before the deferred error surfaces. See
             // `resolve_recurse`'s matching arm for the full jq 1.7.1
             // confirmation (#854).
-            let (cond_outputs, cond_err) = match eval_owned_multi_keep_partial::<S>(cond, &child) {
-                Ok(cond_outputs) => (cond_outputs, None),
-                Err((prefix, e)) => (prefix, Some(e)),
-            };
+            let (cond_outputs, cond_err) = eval_owned_multi_keep_partial::<S>(cond, &child);
             for c in &cond_outputs {
                 if c.is_truthy() {
                     next.push(child.clone());
