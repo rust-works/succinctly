@@ -16925,8 +16925,15 @@ fn parse_simple_tz_offset(tz: &str) -> Option<i64> {
     let hours: i64 = parts.first()?.parse().ok()?;
     let minutes: i64 = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
 
-    // TZ offset is positive for west of UTC, but we want seconds to add
-    let offset_secs = (hours * 3600 + minutes * 60) * if negative { 1 } else { -1 };
+    // TZ offset is positive for west of UTC, but we want seconds to add.
+    // `hours`/`minutes` are parsed straight out of the `TZ` env var with no
+    // bound (#894) — checked throughout so a malformed/adversarial `TZ`
+    // falls back to the existing `None` -> UTC path instead of panicking.
+    let hour_secs = hours.checked_mul(3600)?;
+    let minute_secs = minutes.checked_mul(60)?;
+    let offset_secs = hour_secs
+        .checked_add(minute_secs)?
+        .checked_mul(if negative { 1 } else { -1 })?;
     Some(offset_secs)
 }
 
@@ -16968,8 +16975,11 @@ fn builtin_mktime<W: Clone + AsRef<[u64]>>(
         Err(_) if optional => return QueryResult::None,
         Err(e) => return e.into(),
     };
-    let month = match get_int(1) {
-        Ok(m) => m + 1, // jq uses 0-indexed months
+    let month = match get_int(1).and_then(|m| {
+        m.checked_add(1)
+            .ok_or_else(EvalError::datetime_out_of_range)
+    }) {
+        Ok(m) => m, // jq uses 0-indexed months
         Err(_) if optional => return QueryResult::None,
         Err(e) => return e.into(),
     };
@@ -16994,7 +17004,11 @@ fn builtin_mktime<W: Clone + AsRef<[u64]>>(
         Err(e) => return e.into(),
     };
 
-    let timestamp = unix_secs_from_broken_down_time(year, month, day, hour, minute, second);
+    let timestamp = match unix_secs_from_broken_down_time(year, month, day, hour, minute, second) {
+        Ok(t) => t,
+        Err(_) if optional => return QueryResult::None,
+        Err(e) => return QueryResult::Error(e),
+    };
 
     QueryResult::Owned(OwnedValue::Float(timestamp as f64))
 }
@@ -17004,6 +17018,17 @@ fn builtin_mktime<W: Clone + AsRef<[u64]>>(
 /// Hinnant `civil_from_days` algorithm. Shared by `mktime` and `strftime`'s
 /// `%s` specifier (#760) so a future fix to this math only needs applying
 /// in one place.
+///
+/// Returns `Err` for any `year`/`month`/`day`/`hour`/`minute`/`second`
+/// combination whose arithmetic would overflow `i64` (#893 — a
+/// user-controlled `mktime`/`strftime` broken-down-time array can set any of
+/// these to an arbitrary integer, not just `year`). Every step here now uses
+/// `checked_*` instead of the original's plain operators, mirroring
+/// [`broken_down_time_from_unix_secs`]'s own `checked_sub` guard on its one
+/// overflow-prone step, applied everywhere in this direction since every
+/// field independently risks the same panic (verified: extreme `year`,
+/// `month`, `day`, `hour`, `minute`, and `second` each panic a different
+/// line of the original unchecked version).
 fn unix_secs_from_broken_down_time(
     year: i64,
     month: i64,
@@ -17011,17 +17036,52 @@ fn unix_secs_from_broken_down_time(
     hour: i64,
     minute: i64,
     second: i64,
-) -> i64 {
-    let y = year - i64::from(month <= 2);
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = (y - era * 400) as u32; // year of era [0, 399]
-    let m = month as u32;
-    let d = day as u32;
-    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1; // day of year [0, 365]
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // day of era [0, 146096]
-    let days = era * 146097 + doe as i64 - 719468; // days since Unix epoch
+) -> Result<i64, EvalError> {
+    let overflow = EvalError::datetime_out_of_range;
 
-    days * 86400 + hour * 3600 + minute * 60 + second
+    let y = year
+        .checked_sub(i64::from(month <= 2))
+        .ok_or_else(overflow)?;
+    let era = if y >= 0 {
+        y / 400
+    } else {
+        y.checked_sub(399).ok_or_else(overflow)? / 400
+    };
+    let era_400 = era.checked_mul(400).ok_or_else(overflow)?;
+    let yoe = y.checked_sub(era_400).ok_or_else(overflow)?; // year of era [0, 399]
+
+    let m = if month > 2 { month - 3 } else { month + 9 };
+    let doy = (153i64
+        .checked_mul(m)
+        .and_then(|v| v.checked_add(2))
+        .ok_or_else(overflow)?
+        / 5)
+    .checked_add(day)
+    .and_then(|v| v.checked_sub(1))
+    .ok_or_else(overflow)?; // day of year [0, 365]
+
+    let doe = yoe
+        .checked_mul(365)
+        .and_then(|v| v.checked_add(yoe / 4))
+        .and_then(|v| v.checked_sub(yoe / 100))
+        .and_then(|v| v.checked_add(doy))
+        .ok_or_else(overflow)?; // day of era [0, 146096]
+
+    let era_146097 = era.checked_mul(146097).ok_or_else(overflow)?;
+    let days = era_146097
+        .checked_add(doe)
+        .and_then(|v| v.checked_sub(719468))
+        .ok_or_else(overflow)?; // days since Unix epoch
+
+    let days_secs = days.checked_mul(86400).ok_or_else(overflow)?;
+    let hour_secs = hour.checked_mul(3600).ok_or_else(overflow)?;
+    let minute_secs = minute.checked_mul(60).ok_or_else(overflow)?;
+
+    days_secs
+        .checked_add(hour_secs)
+        .and_then(|v| v.checked_add(minute_secs))
+        .and_then(|v| v.checked_add(second))
+        .ok_or_else(overflow)
 }
 
 /// Builtin: strftime(fmt) - format broken-down time as string
@@ -17097,9 +17157,20 @@ fn builtin_strftime<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     }
                 };
 
+                // `+ 1` (jq's 0-indexed month -> this function's 1-indexed
+                // month) overflows for an adversarial `i64::MAX` array
+                // element (#893's panic class, reachable here independently
+                // of `%s`/`unix_secs_from_broken_down_time`: every format
+                // path eagerly computes `month`, not just `%s`).
+                let month = match get_int(1).checked_add(1) {
+                    Some(m) => m,
+                    None if optional => return QueryResult::None,
+                    None => return QueryResult::Error(EvalError::datetime_out_of_range()),
+                };
+
                 (
                     get_int(0),
-                    get_int(1) + 1, // jq uses 0-indexed month
+                    month,
                     get_int(2),
                     get_int(3),
                     get_int(4),
@@ -17113,9 +17184,13 @@ fn builtin_strftime<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         },
     };
 
-    let result = format_strftime(
+    let result = match format_strftime(
         &fmt, year, month, day, hour, minute, second, weekday, yearday,
-    );
+    ) {
+        Ok(s) => s,
+        Err(_) if optional => return QueryResult::None,
+        Err(e) => return QueryResult::Error(e),
+    };
     QueryResult::Owned(OwnedValue::String(result))
 }
 
@@ -17131,7 +17206,7 @@ fn format_strftime(
     second: i64,
     weekday: i64,
     yearday: i64,
-) -> String {
+) -> Result<String, EvalError> {
     let mut result = String::new();
     let mut chars = fmt.chars().peekable();
 
@@ -17214,7 +17289,7 @@ fn format_strftime(
                 Some('z') => result.push_str("+0000"), // UTC offset (we're always UTC for gmtime)
                 Some('Z') => result.push_str("UTC"),
                 Some('s') => result.push_str(
-                    &unix_secs_from_broken_down_time(year, month, day, hour, minute, second)
+                    &unix_secs_from_broken_down_time(year, month, day, hour, minute, second)?
                         .to_string(),
                 ),
                 Some('U') => {
@@ -17252,7 +17327,7 @@ fn format_strftime(
         }
     }
 
-    result
+    Ok(result)
 }
 
 /// ISO 8601 week-based year and week number (`%G`/`%V`), per the
@@ -18047,74 +18122,66 @@ fn parse_numeric_offset(s: &str) -> Option<i64> {
 
 /// Simplified DST check for US Eastern timezone
 /// DST starts 2nd Sunday of March, ends 1st Sunday of November (since 2007)
+///
+/// Derives month/day via the shared, floor-corrected
+/// [`broken_down_time_from_unix_secs`] rather than re-deriving the civil
+/// date inline (#895): the inline version this replaced truncated
+/// `secs / 86400` toward zero instead of flooring, giving the wrong
+/// month/day — and thus the wrong DST answer near a transition boundary —
+/// for any pre-1970 timestamp. `Err` (a timestamp too extreme to convert)
+/// falls back to `false`, consistent with this function's own "simplified
+/// subset" scope and the catch-all `_ => false` arm below.
 fn is_dst_us_eastern(timestamp: f64) -> bool {
-    // Convert to days since epoch and calculate approximate month/day
     let secs = timestamp.trunc() as i64;
-    let days = secs / 86400;
-
-    // Get year, month, day from days since epoch
-    let z = days + 719468;
-    let era = if z >= 0 { z } else { z - 146096 } / 146097;
-    let doe = (z - era * 146097) as u32;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = (doy - (153 * mp + 2) / 5 + 1) as i32;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 } as i32;
+    let Ok(t) = broken_down_time_from_unix_secs(secs) else {
+        return false;
+    };
 
     // Approximate DST: March 8-14 to November 1-7 (simplified)
     // More accurate would check actual Sunday dates
-    match month {
-        3 => day >= 8,  // After ~2nd week of March
-        4..=10 => true, // April through October
-        11 => day < 7,  // First week of November
-        _ => false,     // December through February
+    match t.month {
+        3 => t.day >= 8, // After ~2nd week of March
+        4..=10 => true,  // April through October
+        11 => t.day < 7, // First week of November
+        _ => false,      // December through February
     }
 }
 
 /// Simplified DST check for European timezones
 /// DST starts last Sunday of March, ends last Sunday of October
+///
+/// See [`is_dst_us_eastern`]'s doc comment for why this derives month/day
+/// via [`broken_down_time_from_unix_secs`] rather than inline (#895).
 fn is_dst_europe(timestamp: f64) -> bool {
     let secs = timestamp.trunc() as i64;
-    let days = secs / 86400;
+    let Ok(t) = broken_down_time_from_unix_secs(secs) else {
+        return false;
+    };
 
-    let z = days + 719468;
-    let era = if z >= 0 { z } else { z - 146096 } / 146097;
-    let doe = (z - era * 146097) as u32;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = (doy - (153 * mp + 2) / 5 + 1) as i32;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 } as i32;
-
-    match month {
-        3 => day >= 25, // Last week of March
-        4..=9 => true,  // April through September
-        10 => day < 25, // Before last week of October
+    match t.month {
+        3 => t.day >= 25, // Last week of March
+        4..=9 => true,    // April through September
+        10 => t.day < 25, // Before last week of October
         _ => false,
     }
 }
 
 /// Simplified DST check for Australian Eastern timezones
 /// DST starts first Sunday of October, ends first Sunday of April
+///
+/// See [`is_dst_us_eastern`]'s doc comment for why this derives month/day
+/// via [`broken_down_time_from_unix_secs`] rather than inline (#895).
 fn is_dst_australia(timestamp: f64) -> bool {
     let secs = timestamp.trunc() as i64;
-    let days = secs / 86400;
-
-    let z = days + 719468;
-    let era = if z >= 0 { z } else { z - 146096 } / 146097;
-    let doe = (z - era * 146097) as u32;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = (doy - (153 * mp + 2) / 5 + 1) as i32;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 } as i32;
+    let Ok(t) = broken_down_time_from_unix_secs(secs) else {
+        return false;
+    };
 
     // Australian DST is opposite to Northern Hemisphere
-    match month {
-        10 => day >= 7,              // After first Sunday of October
+    match t.month {
+        10 => t.day >= 7,            // After first Sunday of October
         11 | 12 | 1 | 2 | 3 => true, // November through March
-        4 => day < 7,                // Before first Sunday of April
+        4 => t.day < 7,              // Before first Sunday of April
         _ => false,
     }
 }
