@@ -2766,6 +2766,163 @@ fn test_yaml_explicit_tag_resolves_when_nested_747() -> Result<()> {
     Ok(())
 }
 
+/// #903 review round: a YAML alias occurrence has no `bp_pos` tag of its
+/// own — a valid alias node (`*anchor`) can't carry a tag in the source —
+/// so `YamlCursor::explicit_tag()` must dereference through
+/// `YamlValue::Alias`'s `target` to the anchor definition's tag, the same
+/// way every other alias-transparent accessor on `YamlValue` already does
+/// (`as_bool`/`as_i64`/`as_f64`/`as_object`/`as_array`/`type_name`).
+/// Without that dereference, `.y`'s tag silently vanished even though the
+/// direct `.x` access (and `-o=json`'s cursor-streaming output) already
+/// resolved it correctly.
+#[test]
+fn test_yaml_explicit_tag_resolves_through_alias_903() -> Result<()> {
+    let input = "x: &a !!str 1\ny: *a\n";
+
+    let (types, code) = run_yq_stdin("[.x, .y] | map(type)", input, &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(types.trim(), r#"["string","string"]"#);
+
+    let (eq, code) = run_yq_stdin(r#".y == "1""#, input, &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(eq.trim(), "true");
+
+    let (add, code) = run_yq_stdin(".y + 1", "x: &a !!int \"5\"\ny: *a\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(add.trim(), "6");
+
+    Ok(())
+}
+
+/// #903 review round: `Expr::Field`/`Expr::Index`'s type-mismatch error
+/// messages, and `Builtin::First`/`Last`/`Reverse`/`Pivot`/`Shuffle`'s
+/// non-array-input error messages, all had `cursor` in scope but still read
+/// the raw, untagged `value.type_name()` — so the error text could name a
+/// different type than `.a | type` (fixed earlier in #747) reports for the
+/// exact same node. Now routed through `tagged_type_name` like `type`
+/// itself.
+#[test]
+fn test_yaml_explicit_tag_error_messages_agree_with_type_903() -> Result<()> {
+    let input = "a: !!str 1\n";
+
+    let (_, err, code) = run_yq_stdin_with_stderr(".a.foo", input, &[])?;
+    assert_eq!(code, 1);
+    assert!(err.contains("Cannot index string with"), "{err}");
+
+    let (_, err, code) = run_yq_stdin_with_stderr(".a | last", input, &[])?;
+    assert_eq!(code, 1);
+    assert!(err.contains("Cannot index string with"), "{err}");
+
+    let (_, err, code) = run_yq_stdin_with_stderr(".a | reverse", input, &[])?;
+    assert_eq!(code, 1);
+    assert!(err.contains("Cannot index string with"), "{err}");
+
+    let (_, err, code) = run_yq_stdin_with_stderr(".a | pivot", input, &[])?;
+    assert_eq!(code, 1);
+    assert!(err.contains("expected array, got string"), "{err}");
+
+    let (_, err, code) = run_yq_stdin_with_stderr(".a | shuffle", input, &[])?;
+    assert_eq!(code, 1);
+    assert!(err.contains("shuffle requires array, got string"), "{err}");
+
+    Ok(())
+}
+
+/// #903 review round: `to_entries`, `reverse`, `pivot`, and `shuffle` each
+/// materialize their elements via a bare `to_owned`/`collect_values` instead
+/// of the cursor-carrying `to_owned_cursor`/`collect_cursors`, silently
+/// dropping an explicit tag on any element they touch — the exact #747
+/// defect, left unfixed in these four builtins specifically. `shuffle`'s
+/// element order is random, so it's checked via `type` over every element
+/// rather than positionally.
+#[test]
+fn test_yaml_explicit_tag_resolves_in_to_entries_reverse_pivot_shuffle_903() -> Result<()> {
+    let (entries, code) =
+        run_yq_stdin(". | to_entries", "a: !!str 1\nb: 2\n", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(
+        entries.trim(),
+        r#"[{"key":"a","value":"1"},{"key":"b","value":2}]"#
+    );
+
+    let (reversed, code) = run_yq_stdin(
+        ".a | reverse",
+        "a:\n  - !!str 1\n  - 2\n",
+        &["-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(reversed.trim(), r#"[2,"1"]"#);
+
+    let (pivoted, code) = run_yq_stdin(
+        ".a | pivot",
+        "a:\n  - [!!str 1, 2]\n  - [3, 4]\n",
+        &["-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(pivoted.trim(), r#"[["1",3],[2,4]]"#);
+
+    let (shuffled_types, code) = run_yq_stdin(
+        "[.a | shuffle | .[] | type]",
+        "a:\n  - !!str 1\n  - !!str 2\n",
+        &["-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(shuffled_types.trim(), r#"["string","string"]"#);
+
+    Ok(())
+}
+
+/// #903 review round: the `is*` family (`isnull`/`isboolean`/`isnumber`/
+/// `isstring`/`isarray`/`isobject`) called `DocumentValue::is_null`/
+/// `is_bool`/etc. directly — the exact same tag-blind gap `type` had before
+/// #747 — plus a second, tag-independent bug the fix incidentally closes for
+/// these call sites: `is_number`/`is_string`'s *default* implementations can
+/// both answer `true` for the same untagged plain YAML scalar (`as_str()`
+/// always succeeds on a `YamlValue::String` node regardless of its resolved
+/// type), which `type_name()`'s single-answer match doesn't have. Routing
+/// through `tagged_type_name` fixes both at once.
+#[test]
+fn test_yaml_is_builtins_resolve_tags_and_agree_with_type_903() -> Result<()> {
+    for (query, input, expected) in [
+        ("isboolean", "a: !!bool \"yes\"\n", "true"),
+        ("isnull", "a: !!null anything\n", "true"),
+        ("isstring", "a: !!str 1\n", "true"),
+        ("isnumber", "a: !!str 1\n", "false"),
+        // Untagged plain number: isnumber true, isstring false (not both).
+        ("isnumber", "a: 1\n", "true"),
+        ("isstring", "a: 1\n", "false"),
+        ("isarray", "a: [1, 2]\n", "true"),
+        ("isobject", "a: {x: 1}\n", "true"),
+    ] {
+        let (out, code) = run_yq_stdin(&format!(".a | {query}"), input, &[])?;
+        assert_eq!(code, 0, "{query} on {input:?}: expected clean success");
+        assert_eq!(out.trim(), expected, "{query} on {input:?}");
+    }
+    Ok(())
+}
+
+/// #903 review round: `to_owned_key_shape` (backing computed-index keys and
+/// slice bounds) took a bare `&V` with no cursor, so a tagged key/bound
+/// expression resolved as its untagged plain-scalar type instead —
+/// `to_owned_key_shape_cursor` is the cursor-carrying sibling that closes
+/// this the same way `to_owned_cursor` closes it for `to_owned`.
+#[test]
+fn test_yaml_explicit_tag_resolves_in_computed_key_and_slice_bound_903() -> Result<()> {
+    let (matched, code) = run_yq_stdin(".a[.k]", "k: !!str 1\na:\n  \"1\": matched\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(matched.trim(), "matched");
+
+    let (sliced, code) = run_yq_stdin(
+        ".arr[.k:3]",
+        "k: !!int \"1\"\narr: [10, 20, 30, 40]\n",
+        &["-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(sliced.trim(), "[20,30]");
+
+    Ok(())
+}
+
 // The following `test_yaml_tag_gate_gap_*` tests were the #664 audit's output:
 // they used to pin the *wrong* behavior (`exit_code == 0`, tag text silently
 // absorbed into the surrounding scalar/key) for every block-context path

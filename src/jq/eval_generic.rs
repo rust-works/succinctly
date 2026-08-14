@@ -5220,6 +5220,40 @@ mod tests {
         );
     }
 
+    /// #903 review round: `Builtin::Shuffle`'s array branch now materializes
+    /// via `collect_cursors`/`to_owned_cursor` instead of
+    /// `collect_values`/`to_owned`, the same fix as `to_entries`/`reverse`/
+    /// `pivot`. An in-process unit test (rather than a CLI subprocess test,
+    /// like the sibling cases in `tests/yq_cli_tests.rs`) because
+    /// `cargo-llvm-cov`'s workspace report doesn't reliably attribute
+    /// coverage back through `Command::new(env!("CARGO_BIN_EXE_succinctly"))`
+    /// for this arm specifically, despite the CLI binary demonstrably taking
+    /// it when run directly. Order isn't checked (`shuffle` permutes), only
+    /// that every element still carries its own resolved type.
+    #[test]
+    fn test_yaml_shuffle_resolves_explicit_tag_903() {
+        use crate::yaml::YamlIndex;
+
+        let yaml = b"a:\n  - !!str 1\n  - !!str 2\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let cursor = index.root(yaml);
+        let mapping_cursor = cursor
+            .first_child()
+            .expect("YAML document should have content");
+        let value = mapping_cursor.value();
+
+        let result = eval(&crate::jq::parse(".a | shuffle").unwrap(), value);
+        match result.into_owned().unwrap() {
+            OwnedValue::Array(items) => {
+                assert_eq!(items.len(), 2);
+                for item in &items {
+                    assert_eq!(item.type_name(), "string", "{item:?}");
+                }
+            }
+            other => panic!("expected array, got {other:?}"),
+        }
+    }
+
     #[test]
     fn test_yaml_generic_field_access() {
         use crate::yaml::YamlIndex;
