@@ -143,5 +143,9 @@ regex_test_z_unknown_flag      regex-flags   unknown flag characters are silentl
 # Caught when this golden, captured under AEST (UTC+10), failed the jq-drift
 # check on a UTC CI runner. Dropped `%s` from the filter; %U/%V/%W/%G/%g are
 # ordinary calendar week/year specifiers with no TZ dependency and still pin
+#
+# strftime_raw_number_input and date_roundtrip_leap_year_torture (#759) have
+# since been fixed and dropped, leaving 1: strftime(fmt) now auto-converts a
+# raw Unix timestamp number the same way gmtime does, matching real jq.
 # succinctly's non-implementation of all six.
 strftime_unsupported_specifiers    datetime   %U/%V/%W/%G/%g are not implemented — #760

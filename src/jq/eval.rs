@@ -16422,16 +16422,34 @@ fn builtin_gmtime<W: Clone + AsRef<[u64]>>(
         Err(r) => return r,
     };
 
-    // Convert Unix timestamp to broken-down time (UTC)
-    let secs = timestamp.trunc() as i64;
+    let t = broken_down_time_from_unix_secs(timestamp.trunc() as i64);
 
+    let result = vec![
+        OwnedValue::Int(t.year),
+        OwnedValue::Int(t.month - 1), // 0-indexed month
+        OwnedValue::Int(t.day),
+        OwnedValue::Int(t.hour),
+        OwnedValue::Int(t.minute),
+        OwnedValue::Int(t.second),
+        OwnedValue::Int(t.weekday),
+        OwnedValue::Int(t.yearday),
+    ];
+
+    QueryResult::Owned(OwnedValue::Array(result))
+}
+
+/// Convert a Unix timestamp (whole seconds, UTC) to broken-down time using
+/// the Howard Hinnant `civil_from_days` algorithm. Shared by `gmtime` and
+/// `strftime`'s raw-number input path (#759) so a future fix to this math
+/// only needs applying in one place — see `BrokenDownTime`.
+fn broken_down_time_from_unix_secs(secs: i64) -> BrokenDownTime {
     // Days since Unix epoch (Jan 1, 1970)
     let days = if secs >= 0 {
         secs / 86400
     } else {
         (secs - 86399) / 86400
     };
-    let time_of_day = ((secs % 86400) + 86400) % 86400;
+    let time_of_day = secs.rem_euclid(86400);
     let hour = time_of_day / 3600;
     let minute = (time_of_day % 3600) / 60;
     let second = time_of_day % 60;
@@ -16462,18 +16480,16 @@ fn builtin_gmtime<W: Clone + AsRef<[u64]>>(
     };
     let yearday = month_days[(month - 1) as usize] + day - 1;
 
-    let result = vec![
-        OwnedValue::Int(year),
-        OwnedValue::Int((month - 1) as i64), // 0-indexed month
-        OwnedValue::Int(day),
-        OwnedValue::Int(hour),
-        OwnedValue::Int(minute),
-        OwnedValue::Int(second),
-        OwnedValue::Int(weekday),
-        OwnedValue::Int(yearday),
-    ];
-
-    QueryResult::Owned(OwnedValue::Array(result))
+    BrokenDownTime {
+        year,
+        month: month as i64,
+        day,
+        hour,
+        minute,
+        second,
+        weekday,
+        yearday,
+    }
 }
 
 /// Builtin: localtime - convert Unix timestamp to broken-down local time
@@ -16727,6 +16743,9 @@ fn builtin_strftime<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // number (auto-converted the same way `gmtime` converts one).
     let (year, month, day, hour, minute, second, weekday, yearday) = match &value {
         StandardJson::Number(_) => {
+            // `value` is already known to be a `Number` here, so the
+            // `not_a_number` closure below can never fire — kept only for
+            // parity with `gmtime`/`localtime`'s identical call shape.
             let timestamp = match get_float_value_with::<W>(&value, optional, || {
                 EvalError::strftime_requires_parsed_datetime_inputs()
             }) {
@@ -16734,49 +16753,10 @@ fn builtin_strftime<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 Err(r) => return r,
             };
 
-            // Convert Unix timestamp to broken-down time (UTC) — mirrors
-            // `builtin_gmtime`'s conversion.
-            let secs = timestamp.trunc() as i64;
-            let days = if secs >= 0 {
-                secs / 86400
-            } else {
-                (secs - 86399) / 86400
-            };
-            let time_of_day = ((secs % 86400) + 86400) % 86400;
-            let hour = time_of_day / 3600;
-            let minute = (time_of_day % 3600) / 60;
-            let second = time_of_day % 60;
-
-            let z = days + 719468; // days since Mar 1, 0000
-            let era = if z >= 0 { z } else { z - 146096 } / 146097;
-            let doe = (z - era * 146097) as u32; // day of era [0, 146096]
-            let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // year of era [0, 399]
-            let y = yoe as i64 + era * 400;
-            let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // day of year [0, 365]
-            let mp = (5 * doy + 2) / 153; // month [0, 11] starting from March
-            let day = (doy - (153 * mp + 2) / 5 + 1) as i64;
-            let month = if mp < 10 { mp + 3 } else { mp - 9 };
-            let year = y + i64::from(month <= 2);
-
-            let weekday = (days % 7 + 4 + 7) % 7;
-
-            let is_leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
-            let month_days: [i64; 12] = if is_leap {
-                [0, 31, 60, 91, 121, 152, 182, 213, 244, 274, 305, 335]
-            } else {
-                [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334]
-            };
-            let yearday = month_days[(month - 1) as usize] + day - 1;
-
+            // Auto-converted the same way `gmtime` converts a raw number.
+            let t = broken_down_time_from_unix_secs(timestamp.trunc() as i64);
             (
-                year,
-                month as i64,
-                day,
-                hour,
-                minute,
-                second,
-                weekday,
-                yearday,
+                t.year, t.month, t.day, t.hour, t.minute, t.second, t.weekday, t.yearday,
             )
         }
         _ => match to_owned(&value) {
@@ -30997,6 +30977,32 @@ mod tests {
         query!(b"[2024,0,15,10,30,0,1,14]", r#"strftime("%Y-%m-%dT%H:%M:%SZ")"#,
             QueryResult::Owned(OwnedValue::String(s)) => {
                 assert_eq!(s, "2024-01-15T10:30:00Z");
+            }
+        );
+    }
+
+    #[test]
+    fn test_strftime_raw_number_input() {
+        // A raw Unix timestamp number is auto-converted the same way
+        // `gmtime` converts one, matching real jq (#759).
+        query!(b"0", r#"strftime("%Y-%m-%dT%H:%M:%SZ")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "1970-01-01T00:00:00Z");
+            }
+        );
+
+        // Fractional timestamp, truncated to whole seconds.
+        query!(b"1435677542.822351", r#"strftime("%A, %B %e, %Y")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "Tuesday, June 30, 2015");
+            }
+        );
+
+        // Neither array nor number: real jq's own wording, not a generic
+        // type error.
+        query!(br#""not a date""#, r#"strftime("%Y")"#,
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "strftime/1 requires parsed datetime inputs");
             }
         );
     }
