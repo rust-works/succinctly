@@ -36264,9 +36264,10 @@ mod tests {
         // comment above, "One divergence remains, deliberately") applying
         // identically whether or not `cond` is present: `is_null_current`
         // must terminate this in exactly the same 2 outputs the no-`cond`
-        // case (`path(recurse(.a?))`, already covered by other tests)
-        // produces, not silently regress to unbounded (or `MAX_ITEMS`-only)
-        // growth just because a `cond` was added.
+        // case (`path(recurse(.a?))`, asserted directly below as this
+        // test's own baseline -- no other test happens to pin this exact
+        // shape) produces, not silently regress to unbounded (or
+        // `MAX_ITEMS`-only) growth just because a `cond` was added.
         assert_eq!(
             outputs(br#"{"a":null}"#, r"path(recurse(.a?; true))"),
             vec!["[]", r#"["a"]"#]
