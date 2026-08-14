@@ -2988,67 +2988,92 @@ fn builtin_has<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     }
 }
 
-/// Builtin: in(obj)
+/// Builtin: in(xs)
+///
+/// jq defines this as `def in(xs): . as $x | xs | has($x);` (confirmed
+/// against jq 1.7.1) — a plain pipe, so `xs`'s own generator semantics drive
+/// `in(xs)` directly: `"a" | in({a:1}, {b:2})` yields `true` *and* `false`,
+/// one output per `xs` output, not just the first (`"a" | [in({a:1},
+/// {a:9})]'` is `[true,true]`). `eval_owned_multi_keep_partial` evaluates
+/// `xs` fully (keeping every already-produced candidate if a later one
+/// errors/breaks/halts, #842's precedent), then each candidate is checked
+/// against the key in encounter order — a per-candidate type mismatch (e.g.
+/// a number where an object was needed) stops the loop exactly like `xs`
+/// itself erroring would, since real jq's `has($x)` raising mid-pipe has the
+/// same effect as `xs` raising: the rest of the generator never runs
+/// (confirmed: `"a" | in({b:1}, 5, {a:1})?` is only `false`, never reaching
+/// `{a:1}`'s `true` — `?`/`try` truncates the stream at the first error
+/// rather than skipping just that one output).
 fn builtin_in<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     obj_expr: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    // The input should be a key (string or number), and we check if it exists in obj
+    // The input is a key (string or number) to check against every output
+    // of `xs`; `xs` itself also receives this same input (`. as $x | xs`
+    // doesn't change `.`).
     let key_owned = to_owned(&value);
-    let obj_result = eval_single::<W, S>(obj_expr, value.clone(), optional);
+    let (candidates, xs_escape) = eval_owned_multi_keep_partial::<S>(obj_expr, &key_owned);
 
-    // Get the object/array to check against (need to handle Owned case for object literals)
-    let obj_owned = match obj_result {
-        QueryResult::One(o) => to_owned(&o),
-        QueryResult::Many(os) => {
-            if let Some(o) = os.into_iter().next() {
-                to_owned(&o)
-            } else if optional {
-                return QueryResult::None;
-            } else {
-                return QueryResult::Error(EvalError::new(
-                    "in() requires an object or array argument",
-                ));
+    let mut results: Vec<OwnedValue> = Vec::with_capacity(candidates.len());
+    let mut check_escape: Option<EvalEscape> = None;
+    for obj_owned in candidates {
+        match (&key_owned, &obj_owned) {
+            (OwnedValue::String(key), OwnedValue::Object(fields)) => {
+                results.push(OwnedValue::Bool(fields.keys().any(|k| k == key)));
+            }
+            // jq returns false for negative indices, yq returns true if in range
+            (
+                OwnedValue::Int(idx) | OwnedValue::NumberLiteral(NumberRepr::Int(idx), _),
+                OwnedValue::Array(elements),
+            ) => {
+                let len = elements.len() as i64;
+                let in_bounds = if S::NEGATIVE_INDEX_IN_HAS {
+                    // yq behavior: negative indices are valid if abs(idx) <= len
+                    if *idx >= 0 {
+                        *idx < len
+                    } else {
+                        idx.abs() <= len
+                    }
+                } else {
+                    // jq behavior: only non-negative indices
+                    *idx >= 0 && *idx < len
+                };
+                results.push(OwnedValue::Bool(in_bounds));
+            }
+            _ => {
+                check_escape = Some(EvalEscape::Error(EvalError::cannot_check_has(
+                    obj_owned.type_name(),
+                    key_owned.type_name(),
+                )));
+                break;
             }
         }
-        QueryResult::Owned(o) => o,
-        QueryResult::Error(e) => return QueryResult::Error(e),
-        _ if optional => return QueryResult::None,
-        _ => {
-            return QueryResult::Error(EvalError::new("in() requires an object or array argument"));
-        }
-    };
+    }
 
-    match (&key_owned, &obj_owned) {
-        (OwnedValue::String(key), OwnedValue::Object(fields)) => {
-            let found = fields.keys().any(|k| k == key);
-            QueryResult::Owned(OwnedValue::Bool(found))
-        }
-        // jq returns false for negative indices, yq returns true if in range
-        (
-            OwnedValue::Int(idx) | OwnedValue::NumberLiteral(NumberRepr::Int(idx), _),
-            OwnedValue::Array(elements),
-        ) => {
-            let len = elements.len() as i64;
-            let in_bounds = if S::NEGATIVE_INDEX_IN_HAS {
-                // yq behavior: negative indices are valid if abs(idx) <= len
-                if *idx >= 0 {
-                    *idx < len
-                } else {
-                    idx.abs() <= len
-                }
-            } else {
-                // jq behavior: only non-negative indices
-                *idx >= 0 && *idx < len
-            };
-            QueryResult::Owned(OwnedValue::Bool(in_bounds))
-        }
-        _ if optional => QueryResult::None,
-        _ => QueryResult::Error(EvalError::cannot_check_has(
-            obj_owned.type_name(),
-            key_owned.type_name(),
-        )),
+    // `check_escape` (a type mismatch on an already-produced candidate)
+    // always precedes `xs_escape` (whatever ended `xs`'s own stream after
+    // that candidate) chronologically, since it fires while still consuming
+    // `candidates` -- the same "earlier escape wins" reasoning
+    // `queue_recurse_children` documents for `recurse`.
+    match check_escape.or(xs_escape) {
+        None => match results.len() {
+            0 => QueryResult::None,
+            1 => QueryResult::Owned(results.pop().expect("len checked")),
+            _ => QueryResult::ManyOwned(results),
+        },
+        // `?` suppresses only a genuine error, matching `has($x)`'s own
+        // typical `optional` semantics elsewhere in this file -- a `Break`
+        // or `Halt` is never caught by `?`/`try` (`EvalEscape`'s own doc
+        // comment), so those always propagate below regardless of
+        // `optional`.
+        Some(EvalEscape::Error(_)) if optional => match results.len() {
+            0 => QueryResult::None,
+            1 => QueryResult::Owned(results.pop().expect("len checked")),
+            _ => QueryResult::ManyOwned(results),
+        },
+        Some(e) if results.is_empty() => e.into(),
+        Some(e) => partial(results, e.into()),
     }
 }
 
