@@ -5428,6 +5428,204 @@ fn test_inline_sequence_as_compact_mapping_value_is_not_dropped() -> Result<()> 
 }
 
 // ============================================================================
+// Flow collection as a compact mapping's *first* field (#864)
+// ============================================================================
+// The dash-dispatch fix above (#325/inline-sequence) covers one of
+// `parse_compact_mapping_entry`'s inline-value arms; `[`/`{`/`|`/`>` were
+// still missing entirely, so any of them as the value of a block-sequence
+// item's *first* field fell through to the scalar fallback
+// (`parse_inline_value`), which treats `{`/`[`/`,`/`}`/`]` as ordinary plain
+// scalar characters. A flow array lost its real content (read back as `[]`);
+// a flow mapping was worse — the scalar scanner stopped at its first inner
+// `key:`+space and stranded `self.pos` mid-line, corrupting every sibling
+// field parsed after it too. Confirmed via oracle diff against pinned `yq`
+// v4.53.3 and via before/after `git stash` bisection against this fix.
+
+#[test]
+fn test_compact_mapping_first_field_flow_mapping_value_864() -> Result<()> {
+    // Before the fix: `[{"a":{}}]` - `b` vanished entirely, not just `a`'s
+    // content, matching the issue title's "corrupting sibling parsing".
+    let (output, exit_code) = run_yq_stdin(".", "- a: {x: 1}\n  b: 2\n", &["-o", "json", "-I0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), r#"[{"a":{"x":1},"b":2}]"#);
+    Ok(())
+}
+
+#[test]
+fn test_compact_mapping_first_field_flow_mapping_value_multi_key_multi_sibling_864() -> Result<()> {
+    // The worst-case shape: a multi-key flow mapping followed by multiple
+    // sibling fields. Before the fix this read back as just `[{"a":{}}]`,
+    // silently dropping `b` and `c` along with `a`'s own contents.
+    let (output, exit_code) = run_yq_stdin(
+        ".",
+        "- a: {x: 1, y: 2}\n  b: 3\n  c: 4\n",
+        &["-o", "json", "-I0"],
+    )?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), r#"[{"a":{"x":1,"y":2},"b":3,"c":4}]"#);
+    Ok(())
+}
+
+#[test]
+fn test_compact_mapping_first_field_flow_sequence_value_864() -> Result<()> {
+    // Before the fix: `[{"a":[],"b":3}]` - `a`'s real content (`[1,2]`) was
+    // lost, though `b` happened to survive this particular shape.
+    let (output, exit_code) = run_yq_stdin(".", "- a: [1, 2]\n  b: 3\n", &["-o", "json", "-I0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), r#"[{"a":[1,2],"b":3}]"#);
+    Ok(())
+}
+
+#[test]
+fn test_compact_mapping_first_field_empty_flow_collections_864() -> Result<()> {
+    for (input, expected) in [
+        ("- a: {}\n  b: 2\n", r#"[{"a":{},"b":2}]"#),
+        ("- a: []\n  b: 2\n", r#"[{"a":[],"b":2}]"#),
+    ] {
+        let (output, exit_code) = run_yq_stdin(".", input, &["-o", "json", "-I0"])?;
+        assert_eq!(exit_code, 0, "input: {input:?}");
+        assert_eq!(output.trim(), expected, "input: {input:?}");
+    }
+    Ok(())
+}
+
+#[test]
+fn test_compact_mapping_first_field_flow_mapping_value_with_anchor_864() -> Result<()> {
+    // An anchor prefixing the flow-mapping value must still resolve through
+    // the same dispatch, not just the bare (unanchored) form.
+    let (output, exit_code) = run_yq_stdin(
+        ".",
+        "- a: &anchor {x: 1}\n  b: 2\n- a: *anchor\n",
+        &["-o", "json", "-I0"],
+    )?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), r#"[{"a":{"x":1},"b":2},{"a":{"x":1}}]"#);
+    Ok(())
+}
+
+#[test]
+fn test_compact_mapping_multiple_items_with_flow_first_field_864() -> Result<()> {
+    // Two compact-mapping sequence items in a row, each with a flow-mapping
+    // first field, guards against the fix only working for a lone item.
+    let (output, exit_code) = run_yq_stdin(
+        ".",
+        "- a: {x: 1}\n  b: 2\n- a: {x: 3}\n  b: 4\n",
+        &["-o", "json", "-I0"],
+    )?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(
+        output.trim(),
+        r#"[{"a":{"x":1},"b":2},{"a":{"x":3},"b":4}]"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_compact_mapping_first_field_block_scalar_value_864() -> Result<()> {
+    // Colon-free/hash-free body content happens to resolve correctly even
+    // through the pre-fix scalar fallback, so this shape alone doesn't
+    // prove the dispatch arm does anything - see the sibling test below for
+    // body content that actually distinguishes the two.
+    let (output, exit_code) = run_yq_stdin(
+        ".",
+        "- a: |\n    hello\n    world\n  b: 2\n",
+        &["-o", "json", "-I0"],
+    )?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), r#"[{"a":"hello\nworld\n","b":2}]"#);
+    Ok(())
+}
+
+#[test]
+fn test_compact_mapping_first_field_block_scalar_with_colon_and_hash_lines_864() -> Result<()> {
+    // Unlike the plain-content case above, this shape *does* distinguish
+    // the fix from the fallback: the pre-fix scalar scanner doesn't know
+    // it's inside literal block-scalar content, so a body line shaped like
+    // `key: value` or starting with `#` hits the same `:`/`#` terminator
+    // rules real keys/comments use. Pre-fix this silently dropped `b`
+    // entirely for the colon case, and corrupted the hash case into a
+    // spurious `"world":"b"` field - confirmed via before/after bisection
+    // during review. This is the only new-arm test in this file that
+    // actually fails without the `Some(b'|' | b'>')` dispatch arm.
+    let (output, exit_code) = run_yq_stdin(
+        ".",
+        "- a: |\n    key: value\n    world\n  b: 2\n",
+        &["-o", "json", "-I0"],
+    )?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), r#"[{"a":"key: value\nworld\n","b":2}]"#);
+
+    let (output, exit_code) = run_yq_stdin(
+        ".",
+        "- a: |\n    # not a comment\n    world\n  b: 2\n",
+        &["-o", "json", "-I0"],
+    )?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(
+        output.trim(),
+        r##"[{"a":"# not a comment\nworld\n","b":2}]"##
+    );
+    Ok(())
+}
+
+#[test]
+fn test_compact_mapping_first_field_dispatch_agrees_with_ordinary_mapping_entry_864() -> Result<()>
+{
+    // Invariant guard against this exact bug class recurring again.
+    // `parse_compact_mapping_entry` and `parse_mapping_entry` each carry
+    // their own hand-written copy of the `[`/`{`/`|`/`>` inline-value
+    // dispatch arms, and this file has fixed the same "one copy is missing
+    // an arm the other has" defect six times now (#325, #372, #406, #224,
+    // #785, #864) - each individually-correct example test above only
+    // proves *this* dispatch table currently handles *this* shape; none
+    // proves the two tables stay in agreement with each other going
+    // forward. A future edit to one dispatch table without the other -
+    // exactly how #864 happened - passes every existing example test right
+    // up until it ships. This test instead asserts the two tables produce
+    // identical parsed values for the same shape in both positions, so a
+    // future divergence fails here rather than shipping silently (the #106
+    // lesson: "duplicated predicates diverge silently - one definition,
+    // plus a test that the call sites agree").
+    let cases: &[(&str, &str, &str, &str)] = &[
+        (
+            "a: {x: 1, y: 2}\n",
+            ".a",
+            "- a: {x: 1, y: 2}\n  b: 9\n",
+            ".[0].a",
+        ),
+        ("a: [1, 2, 3]\n", ".a", "- a: [1, 2, 3]\n  b: 9\n", ".[0].a"),
+        ("a: {}\n", ".a", "- a: {}\n  b: 9\n", ".[0].a"),
+        ("a: []\n", ".a", "- a: []\n  b: 9\n", ".[0].a"),
+        (
+            "a: |\n  hello\n  world\n",
+            ".a",
+            "- a: |\n    hello\n    world\n  b: 9\n",
+            ".[0].a",
+        ),
+        (
+            "a: >\n  hello\n  world\n",
+            ".a",
+            "- a: >\n    hello\n    world\n  b: 9\n",
+            ".[0].a",
+        ),
+    ];
+    for (ordinary_doc, ordinary_filter, compact_doc, compact_filter) in cases {
+        let (ordinary_out, ordinary_code) =
+            run_yq_stdin(ordinary_filter, ordinary_doc, &["-o", "json", "-I0"])?;
+        let (compact_out, compact_code) =
+            run_yq_stdin(compact_filter, compact_doc, &["-o", "json", "-I0"])?;
+        assert_eq!(ordinary_code, 0, "ordinary doc: {ordinary_doc:?}");
+        assert_eq!(compact_code, 0, "compact doc: {compact_doc:?}");
+        assert_eq!(
+            ordinary_out.trim(),
+            compact_out.trim(),
+            "ordinary mapping entry and compact-item first field disagree for {ordinary_doc:?} vs {compact_doc:?}"
+        );
+    }
+    Ok(())
+}
+
+// ============================================================================
 // Out-dented block sequence continuation (#485)
 // ============================================================================
 // A continuation `-` indented strictly between a sequence's own indent and

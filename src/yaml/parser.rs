@@ -2077,6 +2077,40 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                     // into the plain scalar below.
                     self.parse_alias()?;
                 }
+                Some(b'[') => {
+                    // Flow sequence value (`- a: [1, 2]`). Missing this arm
+                    // (and the `{`/`|`/`>` ones below) left every flow-value
+                    // fallback through the scalar arm's `parse_inline_value`,
+                    // which treats `{`/`[`/`,`/`}`/`]` as ordinary plain-scalar
+                    // content instead of structure: a flow *array* value gets
+                    // consumed whole as one bogus scalar token (its real
+                    // content lost, `parse_flow_sequence` never runs to open
+                    // real BP structure for it — reads back as `[]`), and a
+                    // flow *mapping* value is worse, since the scalar scanner
+                    // stops at its first inner `key:`+space and strands
+                    // `self.pos` mid-line, corrupting everything parsed after
+                    // it too (#864).
+                    self.parse_flow_sequence()?;
+                }
+                Some(b'{') => {
+                    // Flow mapping value (`- a: {x: 1}`) - see the `[` arm
+                    // above for why the fallback scalar path corrupts this.
+                    self.parse_flow_mapping()?;
+                }
+                Some(b'|' | b'>') => {
+                    // Block scalar value (`- a: |`) - handles its own BP,
+                    // mirroring `parse_mapping_entry`'s identical arm. Not
+                    // purely defensive: the scalar fallback's plain-scalar
+                    // scanner doesn't know it's inside literal content, so a
+                    // body line shaped like `key: value` or starting with
+                    // `#` (legal in a block literal, meaningless as YAML
+                    // there) hit the same `:`/`#` terminator rules real keys
+                    // and comments use, stopping the scan early and losing
+                    // or corrupting sibling fields exactly like the `[`/`{`
+                    // cases above (confirmed via `git worktree` bisection
+                    // against the pre-#864 fallback during review).
+                    self.parse_block_scalar(indent)?;
+                }
                 Some(b'-') if Self::is_ws_break_or_eoi(self.peek_at(1)) => {
                     // Block sequence indicator inline with a compact mapping's own
                     // value (`- a: - x`): the same invalid-but-common shape #325
