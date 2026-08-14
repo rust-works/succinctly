@@ -6545,7 +6545,22 @@ fn build_regex(pattern: &str, flags: Option<&str>) -> Result<JqRegex, EvalError>
                 // to the same effect as m.
                 'p' => dot_matches_newline = true,
                 'g' => {} // global - handled at call site
-                _ => {}
+                // Recognized by real jq but not yet implemented here (#730):
+                // `n` (suppress empty matches) and `l` (POSIX leftmost-longest)
+                // are accepted as valid flag characters, silently without
+                // effect, rather than raising the error below.
+                'n' | 'l' => {}
+                _ => {
+                    // Real jq's own wording, and its own choice: the message
+                    // names the whole flags string, not just the offending
+                    // character — confirmed live, both `test("abc";"zq")`
+                    // and `test("abc";"iz")` (one valid flag, one invalid)
+                    // report "zq"/"iz is not a valid modifier string", never
+                    // singling out which character was the problem.
+                    return Err(EvalError::new(format!(
+                        "{flags} is not a valid modifier string"
+                    )));
+                }
             }
         }
         let mut prefix = String::from("(?");
@@ -7495,8 +7510,17 @@ fn builtin_scan_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         _ => return QueryResult::Error(EvalError::cannot_be_matched(&to_owned(&value))),
     };
 
+    // `scan` always operates in jq's "global" mode (it finds every match, the
+    // way `gsub` always replaces every match) — jq's own bootstrap prepends
+    // `g` to the flags string before validation for exactly that reason.
+    // `g` is a no-op for `build_regex`'s own compiled-pattern behavior, so
+    // this only affects the wording of an invalid-flags error, matching
+    // jq's own message: confirmed live, `scan("a"; "z")` reports "gz is not
+    // a valid modifier string", not "z is not a valid modifier string".
+    let global_flags = format!("g{}", flags.unwrap_or(""));
+
     // Build regex
-    let re = match build_regex(&pattern, flags) {
+    let re = match build_regex(&pattern, Some(&global_flags)) {
         Ok(r) => r,
         Err(_e) if optional => return QueryResult::None,
         Err(e) => return e.into(),
@@ -7567,8 +7591,13 @@ fn builtin_split_regex<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         _ => return QueryResult::Error(EvalError::cannot_be_matched(&to_owned(&value))),
     };
 
+    // `split` always operates in jq's "global" mode — see `builtin_scan_with_flags`'s
+    // identical comment on why `g` is prepended before validation (confirmed
+    // live: `split("a"; "z")` reports "gz is not a valid modifier string").
+    let global_flags = format!("g{flags}");
+
     // Build regex
-    let re = match build_regex(&pattern, Some(&flags)) {
+    let re = match build_regex(&pattern, Some(&global_flags)) {
         Ok(r) => r,
         Err(_e) if optional => return QueryResult::None,
         Err(e) => return e.into(),
@@ -7631,8 +7660,14 @@ fn builtin_splits_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         _ => return QueryResult::Error(EvalError::cannot_be_matched(&to_owned(&value))),
     };
 
+    // `splits` always operates in jq's "global" mode — see
+    // `builtin_scan_with_flags`'s identical comment on why `g` is prepended
+    // before validation (confirmed live: `splits("a"; "z")` reports "gz is
+    // not a valid modifier string").
+    let global_flags = format!("g{}", flags.unwrap_or(""));
+
     // Build regex
-    let re = match build_regex(&pattern, flags) {
+    let re = match build_regex(&pattern, Some(&global_flags)) {
         Ok(r) => r,
         Err(_e) if optional => return QueryResult::None,
         Err(e) => return e.into(),
@@ -27287,6 +27322,85 @@ mod tests {
         query!(br#""abc""#, r#"test("a"; 5)"#,
             QueryResult::Error(e) => {
                 assert!(e.to_string().contains("flags"));
+            }
+        );
+    }
+
+    #[cfg(feature = "regex")]
+    #[test]
+    fn test_regex_unknown_flags_rejected_730() {
+        // #730: an unrecognized flag character must raise jq's own error
+        // rather than silently doing nothing. Verified against jq 1.7.1:
+        // the message names the *whole* flags string, not just the
+        // offending character, and is identical whether the bad character
+        // stands alone or sits next to a genuinely valid one.
+        for (flags, expected) in [
+            ("z", "z is not a valid modifier string"),
+            ("zq", "zq is not a valid modifier string"),
+            ("iz", "iz is not a valid modifier string"),
+        ] {
+            query!(br#""abc""#, &format!(r#"test("abc"; "{flags}")"#),
+                QueryResult::Error(e) => {
+                    assert_eq!(e.message, expected, "flags: {flags:?}");
+                }
+            );
+        }
+
+        // `n` (suppress empty matches) and `l` (POSIX leftmost-longest) are
+        // real jq flag characters, just not yet functionally implemented
+        // here (#730) - they must not be rejected as unknown.
+        for flags in ["n", "l", "p"] {
+            query!(br#""abc""#, &format!(r#"test("abc"; "{flags}")"#),
+                QueryResult::Owned(OwnedValue::Bool(b)) => {
+                    assert!(b, "flags: {flags:?}");
+                }
+            );
+        }
+    }
+
+    #[cfg(feature = "regex")]
+    #[test]
+    fn test_scan_split_splits_prepend_g_before_validating_flags_730() {
+        // scan/split/splits always operate in jq's "global" mode (they find
+        // or split on every match), and jq's own bootstrap prepends `g` to
+        // the flags string before validation for exactly that reason -- `g`
+        // has no effect on `build_regex`'s compiled pattern, so this only
+        // changes the wording of an invalid-flags error. Verified live
+        // against jq 1.7.1: `scan("a"; "z")` reports "gz is not a valid
+        // modifier string", not "z is not a valid modifier string" -- and
+        // the same holds for split/splits. Found during #730's own review:
+        // the first version of this fix passed the raw flags straight to
+        // `build_regex` at these three sites, producing the wrong message.
+        for (filter, expected) in [
+            (r#"scan("a"; "z")"#, "gz is not a valid modifier string"),
+            (r#"scan("a"; "iz")"#, "giz is not a valid modifier string"),
+            (r#"split("a"; "z")"#, "gz is not a valid modifier string"),
+            (r#"split("a"; "iz")"#, "giz is not a valid modifier string"),
+            (r#"splits("a"; "z")"#, "gz is not a valid modifier string"),
+            (r#"splits("a"; "iz")"#, "giz is not a valid modifier string"),
+        ] {
+            query!(br#""abc""#, filter,
+                QueryResult::Error(e) => {
+                    assert_eq!(e.message, expected, "filter: {filter}");
+                }
+            );
+        }
+
+        // Valid flags must still work correctly at all three sites (the `g`
+        // prefix must not leak into compiled-pattern behavior or output).
+        query!(br#""ABC""#, r#"[scan("a"; "i")]"#,
+            QueryResult::Owned(OwnedValue::Array(vs)) => {
+                assert_eq!(vs, vec![OwnedValue::String("A".to_string())]);
+            }
+        );
+        query!(br#""a1b2""#, r#"split("[0-9]"; "")"#,
+            QueryResult::Owned(OwnedValue::Array(vs)) => {
+                assert_eq!(vs.len(), 3);
+            }
+        );
+        query!(br#""a1b2""#, r#"[splits("[0-9]"; "")]"#,
+            QueryResult::Owned(OwnedValue::Array(vs)) => {
+                assert_eq!(vs.len(), 3);
             }
         );
     }
