@@ -24951,6 +24951,52 @@ mod tests {
     }
 
     #[test]
+    // `"in([1,2,3])"` is a jq filter literal, not a formatting string;
+    // clippy cannot tell the two apart from the brace shape alone.
+    #[allow(clippy::literal_string_with_formatting_args)]
+    fn test_builtin_in_array_index_880() {
+        // The array-index arm of `in(xs)` (jq's non-negative-only index
+        // semantics, `S::NEGATIVE_INDEX_IN_HAS == false`) alongside the
+        // object-key arm exercised by the fan-out test above. Confirmed
+        // against jq 1.7.1: `2 | in([1,2,3])` is `true`; `5 | in([1,2,3])`
+        // is `false`.
+        assert_eq!(outputs(b"2", "in([1,2,3])"), ["true"]);
+        assert_eq!(outputs(b"5", "in([1,2,3])"), ["false"]);
+    }
+
+    #[test]
+    // `"in(5, {a:1})?"` is a jq filter literal, not a formatting string;
+    // clippy cannot tell the two apart from the brace shape alone.
+    #[allow(clippy::literal_string_with_formatting_args)]
+    fn test_builtin_in_optional_with_zero_prior_candidates_880() {
+        // Companion to `test_builtin_in_optional_truncates_stream_at_first_type_mismatch_880`:
+        // that test suppresses an error after one candidate already
+        // succeeded (`results.len() == 1`); this one suppresses an error on
+        // the *very first* candidate, so `results` is still empty when the
+        // `optional` guard fires. Confirmed against jq 1.7.1: `"a" |
+        // in(5, {a:1})?` produces no output at all, exit 0 -- `{a:1}`'s own
+        // `true` is never reached (real jq's `try` truncates the stream,
+        // it doesn't skip just the erroring candidate).
+        assert!(outputs(br#""a""#, "in(5, {a:1})?").is_empty());
+    }
+
+    #[test]
+    // `"in({a:1}, {b:2}, 5)"` is a jq filter literal, not a formatting
+    // string; clippy cannot tell the two apart from the brace shape alone.
+    #[allow(clippy::literal_string_with_formatting_args)]
+    fn test_builtin_in_optional_with_multiple_prior_candidates_880() {
+        // Companion to the two tests above: suppresses an error after *two*
+        // candidates already succeeded (`results.len() >= 2`, the
+        // `ManyOwned` sub-arm). Confirmed against jq 1.7.1: `"a" |
+        // in({a:1}, {b:2}, 5)?` prints `true` and `false` (both already-
+        // produced candidates), then stops -- exit 0, no error surfaces.
+        assert_eq!(
+            outputs(br#""a""#, "in({a:1}, {b:2}, 5)?"),
+            ["true", "false"]
+        );
+    }
+
+    #[test]
     fn test_builtin_select() {
         // select outputs input only if condition is true
         query!(br"5", "select(. > 3)",

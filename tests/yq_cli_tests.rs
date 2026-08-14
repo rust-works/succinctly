@@ -10059,3 +10059,21 @@ fn test_m2_json_output_select_halt_writes_nothing_for_halted_doc() -> Result<()>
     assert_eq!(out.trim(), r#"{"a":1}"#);
     Ok(())
 }
+
+/// #880: `builtin_in`'s array-index arm has a yq-specific negative-index
+/// branch (`S::NEGATIVE_INDEX_IN_HAS`, unreachable via `succinctly jq`'s
+/// `JqSemantics`) -- yq treats a negative index as valid if
+/// `abs(idx) <= len`, unlike jq which only accepts non-negative indices.
+/// Confirmed against real yq: `-1 | in([1,2,3])` is `true` (in range),
+/// `-4 | in([1,2,3])` is `false` (out of range).
+#[test]
+fn test_builtin_in_yq_negative_index_880() -> Result<()> {
+    let (out, code) = run_yq_stdin("in([1,2,3])", "-1", &[])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "true");
+
+    let (out, code) = run_yq_stdin("in([1,2,3])", "-4", &[])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "false");
+    Ok(())
+}
