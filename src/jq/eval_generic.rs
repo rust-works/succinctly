@@ -79,8 +79,12 @@ pub fn to_owned<V: DocumentValue>(value: &V) -> OwnedValue {
     }
 }
 
-/// A shape-parallel tree of trailing same-line comments (issue #710), built
-/// alongside an `OwnedValue` by [`to_owned_with_comments`].
+/// A shape-parallel tree of per-node presentation metadata.
+///
+/// Trailing same-line comments (issue #710) and YAML style (issue #739;
+/// `""` for block/plain, `"flow"`/`"double"`/`"single"`/`"literal"`/
+/// `"folded"` per [`DocumentCursor::style`]) — built alongside an
+/// `OwnedValue` by [`to_owned_with_comments`].
 ///
 /// `OwnedValue` itself carries no metadata — extending its enum would ripple
 /// through every match site in both the JSON and YAML evaluators for a
@@ -91,51 +95,64 @@ pub fn to_owned<V: DocumentValue>(value: &V) -> OwnedValue {
 /// `evaluate_yaml_cursor`, the only place that calls
 /// `to_owned_with_comments`). It is a distinct mechanism from
 /// `YamlCursor::stream_yaml_value`/`stream_yaml_as_document` in
-/// `light.rs`, which stream comments straight from a *live cursor* via
-/// `write_line_comment` and never go through `CommentTree` at all —
-/// `stream_owned_value_yaml` in `stream.rs` streams plain `OwnedValue`
-/// (no cursor, no comment data) and isn't part of either mechanism.
-/// A query that reshapes the tree (`map`, `del`, array construction, ...)
-/// simply has no `to_owned_with_comments` call in its chain, so comments are
-/// dropped there exactly as they are today — not a new regression, and out
-/// of scope for this issue (see the issue's own scope note).
+/// `light.rs`, which stream comments/style straight from a *live cursor*
+/// and never go through `CommentTree` at all — `stream_owned_value_yaml` in
+/// `stream.rs` streams plain `OwnedValue` (no cursor, no metadata) and
+/// isn't part of either mechanism.
+/// A query that reshapes the tree (`map`, object/array construction, ...)
+/// simply has no `to_owned_with_comments` call in its chain, so metadata is
+/// dropped there exactly as they are today — out of scope for this issue,
+/// tracked separately (see the issue's own scope note). A query that
+/// rewrites specific paths (`=`, `|=`, `del()`, ...) instead gets a
+/// reconciled tree from `evaluate_yaml_cursor`'s `reconcile_presentation`,
+/// which pairs the pristine (pre-write) tree with the post-write value and
+/// keeps metadata for every node whose value the write didn't touch.
 #[derive(Debug, Clone)]
 pub enum CommentTree {
     /// A scalar (or any node with no comment-bearing children): this node's
-    /// own trailing comment, if any.
-    Leaf(Option<String>),
+    /// own trailing comment, if any, and its style.
+    Leaf(Option<String>, &'static str),
     /// An array: this node's own trailing comment (e.g. `a: [1,2] # c`,
-    /// which trails the whole array, not an element), plus one subtree per
-    /// element in order.
-    Array(Option<String>, Vec<Self>),
-    /// An object: this node's own trailing comment, one subtree per field
-    /// (keyed the same as the parallel `OwnedValue::Object`), plus one
-    /// key-scoped comment per field for a comment trailing the *key's* own
-    /// line when its value is deferred to a following line (issue #765,
-    /// e.g. `a: # comment\n  b: 1`) - distinct from the field's value
-    /// subtree's own comment, which `.a | line_comment` etc. read instead.
-    /// The `bool` alongside each comment is whether the deferred value
-    /// materialized as nothing at all (a sibling key follows, or EOF) -
-    /// see [`Self::key_comment_if_value_absent`].
+    /// which trails the whole array, not an element) and style, plus one
+    /// subtree per element in order.
+    Array(Option<String>, &'static str, Vec<Self>),
+    /// An object: this node's own trailing comment and style, one subtree
+    /// per field (keyed the same as the parallel `OwnedValue::Object`),
+    /// plus one key-scoped comment per field for a comment trailing the
+    /// *key's* own line when its value is deferred to a following line
+    /// (issue #765, e.g. `a: # comment\n  b: 1`) - distinct from the
+    /// field's value subtree's own comment, which `.a | line_comment` etc.
+    /// read instead. The `bool` alongside each comment is whether the
+    /// deferred value materialized as nothing at all (a sibling key
+    /// follows, or EOF) - see [`Self::key_comment_if_value_absent`].
     Object(
         Option<String>,
+        &'static str,
         IndexMap<String, Self>,
         IndexMap<String, (String, bool)>,
     ),
 }
 
 impl CommentTree {
-    /// The empty tree: no comment at this node, and (for containers) no
-    /// children — used where a caller has no cursor at all (comment-less by
-    /// construction, e.g. a computed value).
+    /// The empty tree: no comment or style at this node, and (for
+    /// containers) no children — used where a caller has no cursor at all
+    /// (metadata-less by construction, e.g. a computed value).
     pub const fn empty() -> Self {
-        Self::Leaf(None)
+        Self::Leaf(None, "")
     }
 
     /// This node's own trailing comment, if any.
     pub fn own(&self) -> Option<&str> {
         match self {
-            Self::Leaf(c) | Self::Array(c, _) | Self::Object(c, _, _) => c.as_deref(),
+            Self::Leaf(c, _) | Self::Array(c, _, _) | Self::Object(c, _, _, _) => c.as_deref(),
+        }
+    }
+
+    /// This node's own YAML style (`""`, `"flow"`, `"double"`, `"single"`,
+    /// `"literal"`, or `"folded"` — see [`DocumentCursor::style`]).
+    pub fn style(&self) -> &'static str {
+        match self {
+            Self::Leaf(_, s) | Self::Array(_, s, _) | Self::Object(_, s, _, _) => s,
         }
     }
 
@@ -143,7 +160,7 @@ impl CommentTree {
     /// `Array` or the index is out of range.
     pub fn at_index(&self, i: usize) -> &Self {
         match self {
-            Self::Array(_, items) => items.get(i).unwrap_or(&EMPTY_COMMENT_TREE),
+            Self::Array(_, _, items) => items.get(i).unwrap_or(&EMPTY_COMMENT_TREE),
             _ => &EMPTY_COMMENT_TREE,
         }
     }
@@ -152,7 +169,7 @@ impl CommentTree {
     /// `Object` or has no such key.
     pub fn field(&self, key: &str) -> &Self {
         match self {
-            Self::Object(_, fields, _) => fields.get(key).unwrap_or(&EMPTY_COMMENT_TREE),
+            Self::Object(_, _, fields, _) => fields.get(key).unwrap_or(&EMPTY_COMMENT_TREE),
             _ => &EMPTY_COMMENT_TREE,
         }
     }
@@ -164,7 +181,7 @@ impl CommentTree {
     /// trailing comment (issue #710).
     pub fn key_comment(&self, key: &str) -> Option<&str> {
         match self {
-            Self::Object(_, _, key_comments) => key_comments.get(key).map(|(c, _)| c.as_str()),
+            Self::Object(_, _, _, key_comments) => key_comments.get(key).map(|(c, _)| c.as_str()),
             _ => None,
         }
     }
@@ -181,7 +198,7 @@ impl CommentTree {
     /// the key, a different, unhandled case).
     pub fn key_comment_if_value_absent(&self, key: &str) -> Option<&str> {
         match self {
-            Self::Object(_, _, key_comments) => key_comments
+            Self::Object(_, _, _, key_comments) => key_comments
                 .get(key)
                 .filter(|(_, absent)| *absent)
                 .map(|(c, _)| c.as_str()),
@@ -194,7 +211,7 @@ impl CommentTree {
 /// can't be borrowed as `'static` from inside a generic method call
 /// argument like `Option::unwrap_or`) — used by [`CommentTree::at_index`]/
 /// [`CommentTree::field`] wherever there's no comment data to return.
-static EMPTY_COMMENT_TREE: CommentTree = CommentTree::Leaf(None);
+static EMPTY_COMMENT_TREE: CommentTree = CommentTree::Leaf(None, "");
 
 /// Convert a `DocumentValue` to an `OwnedValue` alongside a parallel [`CommentTree`].
 ///
@@ -208,6 +225,7 @@ pub fn to_owned_with_comments<V: DocumentValue>(
     // The raw (`#`-prefixed) form, not the stripped `line_comment` builtin
     // getter: the write path re-emits this verbatim after one space.
     let own_comment = cursor.and_then(DocumentCursor::line_comment_raw);
+    let own_style = cursor.map_or("", DocumentCursor::style);
     if let Some(fields) = value.as_object() {
         let mut map = IndexMap::new();
         let mut comment_map = IndexMap::new();
@@ -241,7 +259,7 @@ pub fn to_owned_with_comments<V: DocumentValue>(
         }
         (
             OwnedValue::Object(map),
-            CommentTree::Object(own_comment, comment_map, key_comment_map),
+            CommentTree::Object(own_comment, own_style, comment_map, key_comment_map),
         )
     } else if let Some(elements) = value.as_array() {
         let mut items = Vec::new();
@@ -258,10 +276,10 @@ pub fn to_owned_with_comments<V: DocumentValue>(
         }
         (
             OwnedValue::Array(items),
-            CommentTree::Array(own_comment, comment_items),
+            CommentTree::Array(own_comment, own_style, comment_items),
         )
     } else {
-        (to_owned(value), CommentTree::Leaf(own_comment))
+        (to_owned(value), CommentTree::Leaf(own_comment, own_style))
     }
 }
 
