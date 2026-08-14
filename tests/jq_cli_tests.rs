@@ -7287,6 +7287,50 @@ fn test_resolve_recurse_keeps_f_partial_fanout_before_error_842() -> Result<()> 
     Ok(())
 }
 
+/// #854: `recurse(f; cond)`'s `cond`-evaluation loop dropped the
+/// already-`cond`-approved siblings of a node's children when `cond`
+/// errored on a *later* child in the same batch -- distinct from #842
+/// above (which was about `f`'s own fan-out, not `cond`'s). Verified
+/// against jq 1.7.1: `echo '[1,2,3]' | jq -c 'recurse(if type=="array"
+/// then .[] else empty end; if . == 2 then error("boom") else true
+/// end)'` prints the root `[1,2,3]` and `1` (the first child, already
+/// `cond`-approved and fully recursed before `cond` errors on the second
+/// child) to stdout, then errors and exits 5.
+#[test]
+fn test_recurse_cond_keeps_already_approved_siblings_before_cond_error_854() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            r#"recurse(if type=="array" then .[] else empty end; if . == 2 then error("boom") else true end)"#,
+        ],
+        Some("[1,2,3]"),
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[1,2,3]\n1\n");
+    assert!(stderr.contains("boom"), "stderr: {stderr:?}");
+    Ok(())
+}
+
+/// Path-position counterpart of the previous test (`resolve_recurse`'s
+/// `Some(cond)` arm). Verified against jq 1.7.1: `echo '[1,2,3]' | jq -c
+/// 'path(recurse(if type=="array" then .[] else empty end; if . == 2
+/// then error("boom") else true end))'` prints `[]` and `[0]` before
+/// erroring, exit 5.
+#[test]
+fn test_resolve_recurse_cond_keeps_already_approved_siblings_before_cond_error_854() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            r#"path(recurse(if type=="array" then .[] else empty end; if . == 2 then error("boom") else true end))"#,
+        ],
+        Some("[1,2,3]"),
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[]\n[0]\n");
+    assert!(stderr.contains("boom"), "stderr: {stderr:?}");
+    Ok(())
+}
+
 /// #856: `resolve_recurse`'s null-child guard (`if matches!(child_value...,
 /// OwnedValue::Null) { continue; }` in its main loop) stopped recursion
 /// *into* a null child, as documented -- but the bare `continue` also

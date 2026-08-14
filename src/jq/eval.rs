@@ -35663,6 +35663,65 @@ mod tests {
     }
 
     #[test]
+    fn test_recurse_cond_keeps_already_approved_siblings_before_cond_error_854() {
+        // #854's own bug shape, distinct from #842 above: here `f` never
+        // errors (it fans out cleanly over every array element); `cond`
+        // itself errors on a later child, after already approving an
+        // earlier one in the same batch. Confirmed against real jq 1.7.1:
+        // `echo '[1,2,3]' | jq -c 'recurse(if type=="array" then .[] else
+        // empty end; if . == 2 then error("boom") else true end)'` prints
+        // the root `[1,2,3]` *and* `1` (the first child, already
+        // `cond`-approved and fully recursed before `cond` errors on the
+        // second child) before erroring. Before this fix, succinctly
+        // printed only the root, dropping `1`.
+        assert_eq!(
+            outputs(
+                br"[1,2,3]",
+                r#"recurse(if type=="array" then .[] else empty end; if . == 2 then error("boom") else true end)"#
+            ),
+            vec!["[1,2,3]", "1"]
+        );
+    }
+
+    #[test]
+    fn test_resolve_recurse_cond_keeps_already_approved_siblings_before_cond_error_854() {
+        // Path-position counterpart of the previous test (`resolve_recurse`'s
+        // `Some(cond)` arm). Confirmed against real jq 1.7.1: `echo
+        // '[1,2,3]' | jq -c 'path(recurse(if type=="array" then .[] else
+        // empty end; if . == 2 then error("boom") else true end))'` prints
+        // `[]` *and* `[0]` before erroring.
+        assert_eq!(
+            outputs(
+                br"[1,2,3]",
+                r#"path(recurse(if type=="array" then .[] else empty end; if . == 2 then error("boom") else true end))"#
+            ),
+            vec!["[]", "[0]"]
+        );
+    }
+
+    #[test]
+    fn test_recurse_cond_error_supersedes_f_own_later_deferred_error_854() {
+        // When both `f` and `cond` would eventually error at the same node,
+        // `cond`'s error on an already-`f`-produced child must win over `f`'s
+        // own later deferred error (from #842) — real jq's generator
+        // semantics evaluate `select(cond)` on each child as `f` produces
+        // it, so a `cond` error on an earlier child always happens before
+        // `f` is ever asked to produce a later one. Confirmed against real
+        // jq 1.7.1: `echo '[1,2,3,4,5,6]' | jq -c 'recurse(if type=="array"
+        // then (if length>=4 then (.[0],.[1],.[2],error("f-boom")) else
+        // empty end) else empty end; if . == 2 then error("cond-boom") else
+        // true end)'` prints the root and `1`, then raises `cond-boom` —
+        // `f-boom` never surfaces.
+        assert_eq!(
+            outputs(
+                br"[1,2,3,4,5,6]",
+                r#"recurse(if type=="array" then (if length>=4 then (.[0],.[1],.[2],error("f-boom")) else empty end) else empty end; if . == 2 then error("cond-boom") else true end)"#
+            ),
+            vec!["[1,2,3,4,5,6]", "1"]
+        );
+    }
+
+    #[test]
     fn test_recurse_f_keeps_own_partial_fanout_before_break_842() {
         // The same #842 fix applies uniformly to `break`, not just `error`
         // (`eval_owned_multi_keep_partial` keeps the prefix for all three
