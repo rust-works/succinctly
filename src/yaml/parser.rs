@@ -1911,13 +1911,12 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             // The sequence item contains a mapping.
             //
             // The key's real column, not a hardcoded `indent + 2` - `- `
-            // (dash + whitespace) is already skipped by this point, same as
-            // the nested-sequence arm above uses `self.current_column()`
-            // rather than assuming a fixed offset. A fixed `indent + 2`
-            // assumed exactly one space after the dash: with more than one
-            // (`-   a: hello`), every entry after the compact mapping's
-            // first field folded into that first field's own value instead
-            // of being recognized as its own entry (#877).
+            // (dash + whitespace) is already skipped by this point, so
+            // `self.current_column()` is exact regardless of spacing. A
+            // fixed `indent + 2` assumed exactly one space after the dash:
+            // with more than one (`-   a: hello`), every entry after the
+            // compact mapping's first field folded into that first field's
+            // own value instead of being recognized as its own entry (#877).
             let compact_indent = self.current_column();
             self.parse_compact_mapping_entry(compact_indent)?;
             // Don't close anything - mapping and item will be closed by
@@ -2627,7 +2626,14 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 if !self.at_line_end() {
                     // Parse item value
                     if self.looks_like_mapping_entry() {
-                        self.parse_compact_mapping_entry(indent + 3)?;
+                        // The key's real column, not a hardcoded `indent + 3`
+                        // - `- ` is already skipped above, so `self.pos` sits
+                        // at the key. `indent + 3` was wrong even for the
+                        // ordinary single-space case (`? - a: 1`): `?` + ` `
+                        // + `-` + ` ` is 4 columns, not 3, so every field
+                        // after the compact mapping's first silently landed
+                        // at the wrong indent (#877 follow-up).
+                        self.parse_compact_mapping_entry(self.current_column())?;
                     } else {
                         self.parse_value(indent + 2)?;
                     }
