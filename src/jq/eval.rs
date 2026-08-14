@@ -2969,10 +2969,13 @@ fn builtin_has<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             let len = (*elements).count() as i64;
             let in_bounds = if S::NEGATIVE_INDEX_IN_HAS {
                 // yq behavior: negative indices are valid if abs(idx) <= len
+                // -- `unsigned_abs`, not `abs`, since `i64::MIN.abs()`
+                // overflows (panics in debug, silently wraps back to a
+                // still-negative i64::MIN in release, #908 review).
                 if *idx >= 0 {
                     *idx < len
                 } else {
-                    idx.abs() <= len
+                    idx.unsigned_abs() <= len as u64
                 }
             } else {
                 // jq behavior: only non-negative indices
@@ -3030,16 +3033,26 @@ fn builtin_in<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 let len = elements.len() as i64;
                 let in_bounds = if S::NEGATIVE_INDEX_IN_HAS {
                     // yq behavior: negative indices are valid if abs(idx) <= len
+                    // -- `unsigned_abs`, not `abs`, since `i64::MIN.abs()`
+                    // overflows (panics in debug, silently wraps back to a
+                    // still-negative i64::MIN in release, #908 review).
                     if *idx >= 0 {
                         *idx < len
                     } else {
-                        idx.abs() <= len
+                        idx.unsigned_abs() <= len as u64
                     }
                 } else {
                     // jq behavior: only non-negative indices
                     *idx >= 0 && *idx < len
                 };
                 results.push(OwnedValue::Bool(in_bounds));
+            }
+            // A null candidate is never "in" anything, regardless of key
+            // type -- matches `builtin_has`'s own `(StandardJson::Null, _)`
+            // short-circuit (#908 review; confirmed against jq 1.7.1:
+            // `"a" | in(null)` is `false`, not an error).
+            (_, OwnedValue::Null) => {
+                results.push(OwnedValue::Bool(false));
             }
             _ => {
                 check_escape = Some(EvalEscape::Error(EvalError::cannot_check_has(
@@ -3055,26 +3068,16 @@ fn builtin_in<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // always precedes `xs_escape` (whatever ended `xs`'s own stream after
     // that candidate) chronologically, since it fires while still consuming
     // `candidates` -- the same "earlier escape wins" reasoning
-    // `queue_recurse_children` documents for `recurse`.
-    match check_escape.or(xs_escape) {
-        None => match results.len() {
-            0 => QueryResult::None,
-            1 => QueryResult::Owned(results.pop().expect("len checked")),
-            _ => QueryResult::ManyOwned(results),
-        },
-        // `?` suppresses only a genuine error, matching `has($x)`'s own
-        // typical `optional` semantics elsewhere in this file -- a `Break`
-        // or `Halt` is never caught by `?`/`try` (`EvalEscape`'s own doc
-        // comment), so those always propagate below regardless of
-        // `optional`.
-        Some(EvalEscape::Error(_)) if optional => match results.len() {
-            0 => QueryResult::None,
-            1 => QueryResult::Owned(results.pop().expect("len checked")),
-            _ => QueryResult::ManyOwned(results),
-        },
-        Some(e) if results.is_empty() => e.into(),
-        Some(e) => partial(results, e.into()),
-    }
+    // `queue_recurse_children` documents for `recurse`. `finish_fork`
+    // (shared with 8+ other fork/fold constructs, #908 review) already
+    // implements the "keep already-produced outputs, suppress only a
+    // trailing Error under `optional`, let Break/Halt through regardless"
+    // policy this used to hand-roll here.
+    finish_fork(
+        results,
+        check_escape.or(xs_escape).map(Into::into),
+        optional,
+    )
 }
 
 /// Builtin: `IN(s)` - true if any output of `s` (run against the current
