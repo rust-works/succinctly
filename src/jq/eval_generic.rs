@@ -5230,6 +5230,14 @@ mod tests {
     /// for this arm specifically, despite the CLI binary demonstrably taking
     /// it when run directly. Order isn't checked (`shuffle` permutes), only
     /// that every element still carries its own resolved type.
+    ///
+    /// `#[cfg(feature = "cli")]`: `Builtin::Shuffle`'s array-materializing
+    /// arm this test exercises only exists under that feature (see its own
+    /// `#[cfg(feature = "cli")]` a few hundred lines up) — CI's plain
+    /// `cargo test --verbose` leg (no `cli`) hits the sibling
+    /// `#[cfg(not(feature = "cli"))]` error arm instead, which isn't what
+    /// this test is for.
+    #[cfg(feature = "cli")]
     #[test]
     fn test_yaml_shuffle_resolves_explicit_tag_903() {
         use crate::yaml::YamlIndex;
