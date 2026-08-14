@@ -25,6 +25,10 @@ target
 # AI scratch directory (temporary files for AI assistants)
 .ai/
 
+# Manual yq/jq CLI testing fixture — untracked so ad hoc testing (e.g. `-i`
+# inplace edits) never dirties the tree; use .ai/scratch/ for this instead.
+/.yml
+
 # Generated benchmark data
 data/bench/generated/
 

@@ -31,6 +31,10 @@ Use `.ai/scratch/` for temporary files (git-ignored):
 mkdir -p .ai/scratch
 ```
 
+When manually exercising `jq`/`yq` CLI behavior (trying flags, checking output, `-i`
+inplace edits), use a file under `.ai/scratch/`, not a tracked fixture elsewhere in the
+repo (e.g. `users.yaml`) — those are committed samples, not scratch space.
+
 ## Project Overview
 
 Succinctly is a high-performance Rust library implementing succinct data structures with fast rank and select operations, optimized for both x86_64 (POPCNT) and ARM (NEON) architectures.
