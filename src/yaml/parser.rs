@@ -2735,8 +2735,18 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             return Ok(());
         }
 
-        // Parse the value
-        if self.try_dispatch_flow_or_block_value(indent, true)? {
+        // Parse the value. `check_trailing: false` — same ambiguity as
+        // `parse_value`: the node after `: ` may itself be a compact mapping
+        // whose *key* is a flow collection (`: [a, b]: value`), mirroring
+        // the scalar-keyed case the `looks_like_mapping_entry` arm below
+        // already handles (`: b: c`) — real YAML accepts both (confirmed
+        // live against real `yq`: `? k\n: [a, b]: value\n` parses as
+        // `{"k":{"":"value"}}`). `looks_like_mapping_entry` itself can't
+        // catch the flow-collection-keyed case (it returns `false`
+        // immediately for `[`/`{`), so an unconditional trailing-content
+        // check here would reject real, non-garbage input before that arm
+        // ever gets a chance to run.
+        if self.try_dispatch_flow_or_block_value(indent, false)? {
             return Ok(());
         }
         match self.peek() {
@@ -3218,14 +3228,23 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     /// `{a: 1}: value`, where `:` legitimately follows the closing
     /// delimiter (confirmed against the YAML test suite's own "Implicit
     /// Flow Mapping Key" case, which a `true`-everywhere version of this
-    /// check broke). `parse_value` — reached for a sequence item's value
-    /// once `looks_like_mapping_entry` has already ruled out a
-    /// *scalar*-keyed compact mapping, and for document-root/deferred
-    /// content starting with `[`/`{` — is exactly that ambiguous position;
-    /// its callers pass `false`. The other three callers only ever reach
-    /// this helper *after* an unambiguous `key:` has already been parsed,
-    /// where a following `:` cannot be anything but real trailing garbage,
-    /// so they pass `true`.
+    /// check broke). Two of the four callers are that ambiguous:
+    /// `parse_value` (reached for a sequence item's value once
+    /// `looks_like_mapping_entry` has already ruled out a *scalar*-keyed
+    /// compact mapping, and for document-root/deferred content starting
+    /// with `[`/`{`) and `parse_explicit_value` (its own value position can
+    /// equally be a compact mapping keyed by a flow collection — confirmed
+    /// live against real `yq`: `? k\n: [a, b]: value\n` parses as
+    /// `{"k":{"":"value"}}` — mirroring the *scalar*-keyed case its own
+    /// `looks_like_mapping_entry` arm already handles a few lines below; an
+    /// unconditional check here used to reject that real input before that
+    /// arm ever ran). The other two callers (`parse_compact_mapping_entry`,
+    /// `parse_mapping_entry`) only ever reach this helper *after* an
+    /// unambiguous `key:` has already been parsed with no equivalent "value
+    /// could itself be a keyed mapping" arm of their own, where a following
+    /// `:` cannot be anything but real trailing garbage (confirmed live:
+    /// real `yq` rejects `key1: [a, b]: value2` outright) — so they pass
+    /// `true`.
     ///
     /// Returns `Ok(true)` if a flow collection or block scalar was found and
     /// fully consumed (the caller does nothing further for this value), or
@@ -3266,10 +3285,16 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     /// rigor for permissiveness the way CLAUDE.md's documented
     /// minimal-validation trade-off intends: it corrupts the rest of the
     /// document, dropping every sibling field that follows with no error at
-    /// all. `at_line_end()` is the same "rest of the line is only
-    /// whitespace/a comment" check `parse_block_scalar`'s own boundary
-    /// already relies on — applied here at the flow collection's boundary
-    /// too, for the same rigor.
+    /// all.
+    ///
+    /// Deliberately not `at_line_end()`: that helper only treats a plain
+    /// space as skippable inline whitespace, not a tab, unlike this file's
+    /// own `is_inline_whitespace` (space *or* tab). Every existing caller of
+    /// `at_line_end()` only uses it for soft branching, where a stray tab
+    /// merely picks a slightly different (but still correct) path — this is
+    /// the first caller turning a wrong `false` into a hard error, which
+    /// made the gap observable: confirmed live, `at_line_end()` would
+    /// false-positive-reject `a: [1, 2]\t# comment`, which real `yq` accepts.
     ///
     /// Only called for `[`/`{`, and only when the caller has ruled out an
     /// implicit-mapping-key reading (see `try_dispatch_flow_or_block_value`'s
@@ -3277,12 +3302,21 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     /// same-line trailing-content shape to reject, since its own terminator
     /// is a dedent, not a delimiter byte a stray token could follow.
     fn reject_trailing_flow_content(&self) -> Result<(), YamlError> {
-        if self.at_line_end() {
+        let mut i = self.pos;
+        while i < self.input.len() {
+            match self.input[i] {
+                b'#' => return Ok(()),
+                b if Self::is_inline_whitespace(b) => i += 1,
+                b if Self::is_break(b) => return Ok(()),
+                _ => break,
+            }
+        }
+        if i >= self.input.len() {
             return Ok(());
         }
         Err(YamlError::UnexpectedCharacter {
-            offset: self.pos,
-            char: self.peek().map_or('\0', |b| b as char),
+            offset: i,
+            char: self.input[i] as char,
             context: "after a flow collection's closing delimiter",
         })
     }
