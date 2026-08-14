@@ -1,0 +1,48 @@
+literal_seq:
+  - |
+    line1
+    line2
+  - next
+folded_seq:
+  - >
+    line1 line2
+
+  - next
+literal_field:
+  a: |
+    line1
+    line2
+  b: next
+folded_field:
+  a: >
+    line1 line2
+
+  b: next
+literal_strip: |-
+  line1
+  line2
+literal_keep: |+
+  line1
+  line2
+
+folded_keep: >+
+  line1 line2
+
+
+folded_embedded_blank: >
+  line1
+
+  line2
+
+next_after_embedded_blank: next
+literal_explicit_indent: |2
+    foo
+  bar
+folded_explicit_indent: >2
+    foo
+    bar
+folded_explicit_indent_keep: >2+
+    foo
+    bar
+
+next_after_explicit_indent: next
