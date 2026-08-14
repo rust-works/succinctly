@@ -2999,6 +2999,45 @@ fn test_isempty_propagates_halt_instead_of_answering_false() -> Result<()> {
     Ok(())
 }
 
+/// Companion to `test_isempty_propagates_halt_instead_of_answering_false`,
+/// for `break` (#867 follow-up): the same "zero prior outputs must
+/// propagate" reasoning applies to a bare `Break`, not just `Halt`.
+/// Verified against jq 1.7.1: `label $out | isempty(break $out), "after"`
+/// produces no output and exits 0.
+#[test]
+fn test_isempty_propagates_bare_break_to_outer_label() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_full(&["-n", "label $out | isempty(break $out), \"after\""], None)?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
+/// The asymmetric counterpart: unlike the bare-break case above, a `break`
+/// that only surfaces *after* `g` already produced an output must NOT
+/// propagate — real jq's `isempty` is defined as `label $out | (g|false,
+/// break $out), true`, so `g`'s second output (the `break`) is never even
+/// requested once its first output already answered `isempty`'s own
+/// internal `break $out`. Verified against jq 1.7.1: `isempty(1, break
+/// $out)` answers `false` then prints `"after"`, exiting 0 — the exact
+/// same shape as `isempty(1, halt_error(3))` staying `false` above it in
+/// this file. This must keep passing after the bare-break fix; a
+/// mechanical "propagate every Break/Partial(_, Break)" fix (mirroring
+/// `isvalid`'s) would have broken this case, which is why `isempty`'s fix
+/// only touches the bare `Break` arm, not `Partial(_, Control::Break(_))`.
+#[test]
+fn test_isempty_break_after_partial_output_does_not_propagate() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-n", "label $out | isempty(1, break $out), \"after\""],
+        None,
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "false\n\"after\"\n");
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
 #[test]
 fn test_setpath_propagates_halt_in_path_argument() -> Result<()> {
     // `builtin_setpath`'s path-array argument used to misreport a halt as
