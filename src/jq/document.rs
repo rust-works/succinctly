@@ -111,6 +111,16 @@ pub trait DocumentCursor: Sized + Copy + Clone {
         None
     }
 
+    /// Get the explicit YAML tag at this node, if any (e.g. `"!!str"`).
+    ///
+    /// Returns `None` when the node has no explicit tag, and for formats
+    /// without a tag concept (JSON). Only YAML cursors override this —
+    /// tag lookup is keyed by byte position, which only a cursor carries;
+    /// a bare [`DocumentValue`] has already lost it (#747).
+    fn explicit_tag(&self) -> Option<&str> {
+        None
+    }
+
     /// Get the YAML style indicator for this node (e.g. `"flow"`, `"double"`).
     ///
     /// Returns `""` (no explicit style) by default; only YAML cursors

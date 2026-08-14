@@ -79,6 +79,93 @@ pub fn to_owned<V: DocumentValue>(value: &V) -> OwnedValue {
     }
 }
 
+/// Convert a `DocumentCursor`'s value to an `OwnedValue`, resolving an
+/// explicit YAML tag along the way (e.g. `!!str 1` materializes as the
+/// string `"1"`, not the number `1` — issue #747).
+///
+/// A bare [`DocumentValue`] has already lost its tag by the time it reaches
+/// [`to_owned`] — tag lookup is keyed by byte position, which only a cursor
+/// carries ([`DocumentCursor::explicit_tag`]). Mirrors `to_owned`'s
+/// container-first structure, recursing via cursors
+/// (`field.value_cursor`/`elems.uncons_cursor`, as in
+/// [`to_owned_with_comments`]) so the tag check reaches every scalar, not
+/// just the top-level one. Call sites that already hold a cursor (rather
+/// than a bare value) should use this instead of `to_owned(&cursor.value())`.
+pub fn to_owned_cursor<C: DocumentCursor>(cursor: &C) -> OwnedValue {
+    let value = cursor.value();
+    if let Some(fields) = value.as_object() {
+        let mut map = IndexMap::new();
+        let mut f = fields;
+        while let Some((field, rest)) = f.uncons() {
+            if let Some(key) = field.key_str() {
+                map.insert(key.into_owned(), to_owned_cursor(&field.value_cursor));
+            }
+            f = rest;
+        }
+        OwnedValue::Object(map)
+    } else if let Some(elements) = value.as_array() {
+        let mut items = Vec::new();
+        let mut elems = elements;
+        while let Some((elem_cursor, rest)) = elems.uncons_cursor() {
+            items.push(to_owned_cursor(&elem_cursor));
+            elems = rest;
+        }
+        OwnedValue::Array(items)
+    } else {
+        cursor
+            .explicit_tag()
+            .and_then(|tag| tagged_scalar_to_owned(tag, &value))
+            .unwrap_or_else(|| to_owned(&value))
+    }
+}
+
+/// Resolve a scalar's explicit YAML tag (`!!str`, `!!int`, ...) against its
+/// raw source text, or `None` if the value isn't a scalar with text (a
+/// container, already excluded by [`to_owned_cursor`]'s caller) or the tag
+/// doesn't apply to this text (e.g. `!!int` on `"abc"` — [`resolve_tagged`]
+/// itself decides applicability).
+fn tagged_scalar_to_owned<V: DocumentValue>(tag: &str, value: &V) -> Option<OwnedValue> {
+    let text = value.as_str()?;
+    let resolved = crate::yaml::resolve_tagged(&text, tag)?;
+    Some(match resolved {
+        crate::yaml::ResolvedScalar::Null => OwnedValue::Null,
+        crate::yaml::ResolvedScalar::Bool(b) => OwnedValue::Bool(b),
+        crate::yaml::ResolvedScalar::Int(n) => OwnedValue::Int(n),
+        crate::yaml::ResolvedScalar::Float(f) => OwnedValue::Float(f),
+        crate::yaml::ResolvedScalar::Str => OwnedValue::String(text.into_owned()),
+    })
+}
+
+/// Materialize `value`, preferring the cursor-aware, tag-resolving
+/// [`to_owned_cursor`] when a cursor is available (issue #747) and falling
+/// back to the cursor-less [`to_owned`] otherwise — e.g. a computed value
+/// with no navigated position (see [`DocumentCursor::line`]'s "not
+/// available" contract, which the same computed-vs-navigated distinction
+/// applies to). Since `cursor.value()` and a separately-threaded `value`
+/// always describe the same node on every call site in this module, `value`
+/// itself is only needed for the `None` fallback.
+fn to_owned_with_cursor<V: DocumentValue>(value: &V, cursor: Option<V::Cursor>) -> OwnedValue {
+    match cursor {
+        Some(c) => to_owned_cursor(&c),
+        None => to_owned(value),
+    }
+}
+
+/// The jq `type` name for `value` at `cursor`, resolving an explicit YAML
+/// tag first (e.g. `!!str 1` is `"string"`, not `"number"` — issue #747)
+/// and falling back to [`DocumentValue::type_name`] otherwise. Mirrors
+/// [`tagged_scalar_to_owned`]'s tag lookup, but only needs
+/// [`crate::yaml::ResolvedScalar::type_name`], not the resolved value
+/// itself.
+fn tagged_type_name<V: DocumentValue>(value: &V, cursor: Option<V::Cursor>) -> &'static str {
+    cursor
+        .and_then(|c| {
+            c.explicit_tag()
+                .and_then(|tag| tagged_scalar_to_owned(tag, value))
+        })
+        .map_or_else(|| value.type_name(), |owned| owned.type_name())
+}
+
 /// A shape-parallel tree of per-node presentation metadata.
 ///
 /// Trailing same-line comments (issue #710) and YAML style (issue #739;
@@ -545,7 +632,7 @@ impl<V: DocumentValue> LazySeq<V> {
         let mut out = Vec::new();
         for item in self {
             match item {
-                Ok(LazyElem::Cursor(c)) => out.push(to_owned(&c.value())),
+                Ok(LazyElem::Cursor(c)) => out.push(to_owned_cursor(&c)),
                 Ok(LazyElem::Owned(o)) => out.push(o),
                 Err(control) => return Err(control),
             }
@@ -772,9 +859,9 @@ fn push_generic_owned_values<V: DocumentValue>(
 ) -> Option<Control> {
     match result.materialize_lazy() {
         GenericResult::One(v) => out.push(to_owned(&v)),
-        GenericResult::OneCursor(c) => out.push(to_owned(&c.value())),
+        GenericResult::OneCursor(c) => out.push(to_owned_cursor(&c)),
         GenericResult::Many(vs) => out.extend(vs.iter().map(to_owned)),
-        GenericResult::ManyCursor(cs) => out.extend(cs.iter().map(|c| to_owned(&c.value()))),
+        GenericResult::ManyCursor(cs) => out.extend(cs.iter().map(to_owned_cursor)),
         GenericResult::None => {}
         GenericResult::Owned(v) => out.push(v),
         GenericResult::ManyOwned(vs) => out.extend(vs),
@@ -804,10 +891,10 @@ fn push_generic_truthiness<V: DocumentValue>(
 ) -> Option<Control> {
     match result {
         GenericResult::One(v) => out.push(to_owned(&v).is_truthy()),
-        GenericResult::OneCursor(c) => out.push(to_owned(&c.value()).is_truthy()),
+        GenericResult::OneCursor(c) => out.push(to_owned_cursor(&c).is_truthy()),
         GenericResult::Many(vs) => out.extend(vs.iter().map(|v| to_owned(v).is_truthy())),
         GenericResult::ManyCursor(cs) => {
-            out.extend(cs.iter().map(|c| to_owned(&c.value()).is_truthy()));
+            out.extend(cs.iter().map(|c| to_owned_cursor(c).is_truthy()));
         }
         // A lazy keys array, materialized or not, sorted or not, is
         // array-shaped and therefore always truthy in jq (only `null`/
@@ -861,10 +948,10 @@ fn flatten_generic_results<V: DocumentValue>(
     for r in items {
         match r.materialize_lazy() {
             GenericResult::One(v) => results.push(to_owned(&v)),
-            GenericResult::OneCursor(c) => results.push(to_owned(&c.value())),
+            GenericResult::OneCursor(c) => results.push(to_owned_cursor(&c)),
             GenericResult::Many(rs) => results.extend(rs.iter().map(to_owned)),
             GenericResult::ManyCursor(cs) => {
-                results.extend(cs.iter().map(|c| to_owned(&c.value())));
+                results.extend(cs.iter().map(to_owned_cursor));
             }
             GenericResult::None => {}
             GenericResult::Owned(o) => results.push(o),
@@ -1059,11 +1146,11 @@ impl<V: DocumentValue> GenericResult<V> {
     pub fn into_owned(self) -> Option<OwnedValue> {
         match self.materialize_lazy() {
             Self::One(v) => Some(to_owned(&v)),
-            Self::OneCursor(c) => Some(to_owned(&c.value())),
+            Self::OneCursor(c) => Some(to_owned_cursor(&c)),
             Self::Many(vs) => Some(OwnedValue::Array(vs.iter().map(to_owned).collect())),
-            Self::ManyCursor(cs) => Some(OwnedValue::Array(
-                cs.iter().map(|c| to_owned(&c.value())).collect(),
-            )),
+            Self::ManyCursor(cs) => {
+                Some(OwnedValue::Array(cs.iter().map(to_owned_cursor).collect()))
+            }
             Self::None => None,
             Self::Error(_) => None,
             Self::Owned(o) => Some(o),
@@ -1086,9 +1173,9 @@ impl<V: DocumentValue> GenericResult<V> {
     pub fn collect_owned(self) -> Vec<OwnedValue> {
         match self.materialize_lazy() {
             Self::One(v) => vec![to_owned(&v)],
-            Self::OneCursor(c) => vec![to_owned(&c.value())],
+            Self::OneCursor(c) => vec![to_owned_cursor(&c)],
             Self::Many(vs) => vs.iter().map(to_owned).collect(),
-            Self::ManyCursor(cs) => cs.iter().map(|c| to_owned(&c.value())).collect(),
+            Self::ManyCursor(cs) => cs.iter().map(to_owned_cursor).collect(),
             Self::None => vec![],
             Self::Error(_) => vec![],
             Self::Owned(o) => vec![o],
@@ -1691,7 +1778,9 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
             } else if optional {
                 GenericResult::None
             } else {
-                GenericResult::Error(EvalError::cannot_iterate(&to_owned(&value)))
+                GenericResult::Error(EvalError::cannot_iterate(&to_owned_with_cursor(
+                    &value, cursor,
+                )))
             }
         }
 
@@ -1776,7 +1865,7 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
             // letting a later stage fall through `eval_builtin`'s per-builtin
             // fallback in isolation, which has no path to give it (#554).
             if exprs.iter().any(needs_path_context) {
-                let owned = to_owned(&value);
+                let owned = to_owned_with_cursor(&value, cursor);
                 return eval_on_owned::<S, _>(&Expr::Pipe(exprs.clone()), owned, optional);
             }
 
@@ -1817,12 +1906,12 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                         for v in vs {
                             match eval_single::<S, _>(expr, v, optional, None).materialize_lazy() {
                                 GenericResult::One(r) => results.push(to_owned(&r)),
-                                GenericResult::OneCursor(c) => results.push(to_owned(&c.value())),
+                                GenericResult::OneCursor(c) => results.push(to_owned_cursor(&c)),
                                 GenericResult::Many(rs) => {
                                     results.extend(rs.iter().map(to_owned));
                                 }
                                 GenericResult::ManyCursor(cs) => {
-                                    results.extend(cs.iter().map(|c| to_owned(&c.value())));
+                                    results.extend(cs.iter().map(to_owned_cursor));
                                 }
                                 GenericResult::None => {}
                                 // The outputs already piped through no longer
@@ -2225,7 +2314,7 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                                     items
                                         .into_iter()
                                         .map(|item| match item {
-                                            LazyElem::Cursor(c) => to_owned(&c.value()),
+                                            LazyElem::Cursor(c) => to_owned_cursor(&c),
                                             LazyElem::Owned(o) => o,
                                         })
                                         .collect(),
@@ -2314,7 +2403,9 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
         // Formats are pure functions of the value, so evaluate them here rather
         // than falling through to the catch-all, which would serialize the
         // value to JSON and rebuild a `JsonIndex` for every one (#124).
-        Expr::Format(format_type) => format_result(format_type, &to_owned(&value), optional),
+        Expr::Format(format_type) => {
+            format_result(format_type, &to_owned_with_cursor(&value, cursor), optional)
+        }
 
         Expr::Builtin(builtin) => eval_builtin::<S, _>(builtin, value, optional, cursor),
 
@@ -2373,7 +2464,7 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
         // Fall back to the full evaluator for complex expressions
         _ => {
             // Convert to OwnedValue, then to JSON, then evaluate with full evaluator
-            let owned = to_owned(&value);
+            let owned = to_owned_with_cursor(&value, cursor);
             let json_str = owned.to_json_for_reindex();
             let json_bytes = json_str.as_bytes();
             let index = JsonIndex::build(json_bytes);
@@ -2721,7 +2812,7 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
             match index_one_generic::<V>(t.clone(), k, optional) {
                 GenericResult::OneCursor(c) => {
                     if any_owned {
-                        owned.push(to_owned(&c.value()));
+                        owned.push(to_owned_cursor(&c));
                     } else {
                         cursors.push(c);
                     }
@@ -2729,7 +2820,7 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
                 GenericResult::Owned(v) => {
                     if !any_owned {
                         any_owned = true;
-                        owned = cursors.iter().map(|c| to_owned(&c.value())).collect();
+                        owned = cursors.iter().map(to_owned_cursor).collect();
                         cursors.clear();
                     }
                     owned.push(v);
@@ -2742,7 +2833,7 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
                     let out = if any_owned {
                         owned
                     } else {
-                        cursors.iter().map(|c| to_owned(&c.value())).collect()
+                        cursors.iter().map(to_owned_cursor).collect()
                     };
                     return partial_generic(out, Control::Error(e));
                 }
@@ -2766,7 +2857,7 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
         let out = if any_owned {
             owned
         } else {
-            cursors.iter().map(|c| to_owned(&c.value())).collect()
+            cursors.iter().map(to_owned_cursor).collect()
         };
         return partial_generic(out, Control::Halt(code));
     }
@@ -3055,7 +3146,7 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                 // dispatch path starts forcing `optional = true` here.
                 Some(control) => {
                     let prefix: Vec<OwnedValue> = match cursor {
-                        Some(c) => core::iter::repeat_with(|| to_owned(&c.value()))
+                        Some(c) => core::iter::repeat_with(|| to_owned_cursor(&c))
                             .take(truthy_count)
                             .collect(),
                         None => core::iter::repeat_with(|| to_owned(&value))
@@ -3085,7 +3176,9 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
             } else if optional {
                 GenericResult::None
             } else {
-                GenericResult::Error(EvalError::cannot_iterate(&to_owned(&value)))
+                GenericResult::Error(EvalError::cannot_iterate(&to_owned_with_cursor(
+                    &value, cursor,
+                )))
             }
         }
 
@@ -3208,7 +3301,7 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
         }
 
         Builtin::Type => {
-            let type_name = value.type_name();
+            let type_name = tagged_type_name(&value, cursor);
             GenericResult::Owned(OwnedValue::String(type_name.to_string()))
         }
 
@@ -3232,7 +3325,9 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
             } else if optional {
                 GenericResult::None
             } else {
-                GenericResult::Error(EvalError::has_no_length(&to_owned(&value)))
+                GenericResult::Error(EvalError::has_no_length(&to_owned_with_cursor(
+                    &value, cursor,
+                )))
             }
         }
 
@@ -3258,7 +3353,9 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
             } else if optional {
                 GenericResult::None
             } else {
-                GenericResult::Error(EvalError::has_no_keys(&to_owned(&value)))
+                GenericResult::Error(EvalError::has_no_keys(&to_owned_with_cursor(
+                    &value, cursor,
+                )))
             }
         }
 
@@ -3279,7 +3376,9 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
             } else if optional {
                 GenericResult::None
             } else {
-                GenericResult::Error(EvalError::has_no_keys(&to_owned(&value)))
+                GenericResult::Error(EvalError::has_no_keys(&to_owned_with_cursor(
+                    &value, cursor,
+                )))
             }
         }
 
@@ -3333,7 +3432,9 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                 // evaluates it at the ambient `optional` (normally `false`)
                 // and lets the outer `Expr::Optional`/`eval_try`-style catch
                 // convert the resulting `Error` to `None` once instead.
-                GenericResult::Error(EvalError::has_no_keys(&to_owned(&value)))
+                GenericResult::Error(EvalError::has_no_keys(&to_owned_with_cursor(
+                    &value, cursor,
+                )))
             }
         }
 
@@ -3439,7 +3540,7 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
         Builtin::Empty => GenericResult::None,
 
         Builtin::ToString => {
-            let owned = to_owned(&value);
+            let owned = to_owned_with_cursor(&value, cursor);
             let s = match &owned {
                 OwnedValue::Null => "null".to_string(),
                 OwnedValue::Bool(b) => b.to_string(),
@@ -3470,7 +3571,9 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
             } else if optional {
                 GenericResult::None
             } else {
-                GenericResult::Error(EvalError::cannot_parse_as_number(&to_owned(&value)))
+                GenericResult::Error(EvalError::cannot_parse_as_number(&to_owned_with_cursor(
+                    &value, cursor,
+                )))
             }
         }
 
@@ -3599,7 +3702,7 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
 
         // For other builtins, fall back to full evaluator via JSON
         _ => {
-            let owned = to_owned(&value);
+            let owned = to_owned_with_cursor(&value, cursor);
             eval_on_owned::<S, _>(&Expr::Builtin(builtin.clone()), owned, optional)
         }
     }
@@ -6175,7 +6278,7 @@ mod tests {
                     // `select(...)`), so a match here is `OneCursor`, not
                     // `One` — see the `Builtin::Select` cursor-forwarding
                     // fix in `eval_builtin`.
-                    GenericResult::OneCursor(c) => results.push(to_owned(&c.value())),
+                    GenericResult::OneCursor(c) => results.push(to_owned_cursor(&c)),
                     GenericResult::Owned(o) => results.push(o),
                     GenericResult::None => {} // Filtered out
                     _ => {}

@@ -5524,6 +5524,11 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
     }
 
     #[inline]
+    fn explicit_tag(&self) -> Option<&str> {
+        YamlCursor::explicit_tag(self)
+    }
+
+    #[inline]
     fn style(&self) -> &'static str {
         YamlCursor::style(self)
     }
@@ -5641,22 +5646,18 @@ impl<'a, W: AsRef<[u64]>> YamlValue<'a, W> {
     }
 }
 
-// KNOWN LIMITATION (#224, tracked as #747): the typed getters below
-// (`is_null`, `as_bool`, `as_i64`, `as_f64`, `type_name`) are not tag-aware,
-// unlike every JSON output path (`write_json_to`/`stream_json_value`) and the
-// CLI's `yaml_to_owned_value`. A bare `YamlValue` has no `bp_pos` to look an
-// explicit tag up with — only a `YamlCursor` does (`explicit_tag()`) — and
-// `crate::jq::eval_generic::to_owned`, the generic evaluator's lazy
-// materializer backing `select`, `==`, arithmetic, and `type` on the
-// cursor-evaluator path, calls these directly on a `DocumentValue` with no
-// cursor in scope. So `echo 'a: !!str 1' | succinctly yq '.a | type'` says
-// `"number"`, not `"string"` — while `succinctly yq '.'`'s JSON output for
-// the same input is correct. Fixing this needs either threading a cursor
-// through `to_owned`'s recursion (it can: `DocumentField::value_cursor` and
-// `DocumentElements::uncons_cursor` already exist) or embedding the tag in
-// `YamlValue::String` itself, which fans out to ~90 pattern-match sites
-// across 6 files. Scoped out of #224 as a follow-up rather than risking an
-// under-tested change to a evaluator shared with JSON this late.
+// FORMER KNOWN LIMITATION (#224, fixed by #747): the typed getters below
+// (`is_null`, `as_bool`, `as_i64`, `as_f64`, `type_name`) are still not
+// tag-aware themselves — a bare `YamlValue` has no `bp_pos` to look an
+// explicit tag up with, only a `YamlCursor` does (`explicit_tag()`) — but
+// every caller that can reach an explicit tag now checks it first via a
+// cursor before ever falling through to these getters:
+// `crate::jq::eval_generic::to_owned_cursor` (backing `select`, `==`,
+// arithmetic, and other cursor-materializing paths) and
+// `crate::jq::eval_generic::tagged_type_name` (backing `type` specifically,
+// which doesn't materialize a value at all). So
+// `echo 'a: !!str 1' | succinctly yq '.a | type'` now correctly says
+// `"string"`, matching `succinctly yq '.'`'s JSON output for the same input.
 impl<'a, W: AsRef<[u64]> + Clone> DocumentValue for YamlValue<'a, W> {
     type Cursor = YamlCursor<'a, W>;
     type Fields = YamlFields<'a, W>;
