@@ -36228,6 +36228,59 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_recurse_cond_keeps_already_approved_siblings_before_break_854() {
+        // Path-position counterpart of the previous test (`resolve_recurse`'s
+        // `Some(cond)` arm) -- the value-position case above was covered,
+        // but the path-tracking evaluator's own `break` handling through the
+        // same deferred-`cond_err` mechanism wasn't separately pinned.
+        // Confirmed against real jq 1.7.1: `echo '[1,2,3]' | jq -c 'label
+        // $out | path(recurse(if type=="array" then .[] else empty end; if
+        // . == 2 then break $out else true end))'` prints `[]` and `[0]`,
+        // then exits 0 (no error).
+        assert_eq!(
+            outputs(
+                b"[1,2,3]",
+                r#"label $out | path(recurse(if type=="array" then .[] else empty end; if . == 2 then break $out else true end))"#
+            ),
+            vec!["[]", "[0]"]
+        );
+    }
+
+    #[test]
+    fn test_resolve_recurse_cond_still_bounds_null_current_growth_854() {
+        // Review-driven regression guard on #854's own rewrite of the
+        // `Some(cond)` arm: switching `cond`'s own evaluation to
+        // `eval_owned_multi_keep_partial` must not drop the pre-existing
+        // `is_null_current` gate around queueing an approved child for
+        // *further* recursion (#856) -- `cond` still runs on a null
+        // current's candidate children (for side effects/error
+        // propagation), but a truthy `cond` must not re-open the
+        // null-recursion bound the `None` arm above already enforces.
+        //
+        // NOT a real-jq-parity case: `recurse(.a?; true)` on `{"a":null}`
+        // genuinely never terminates in real jq 1.7.1 either (confirmed
+        // live -- `null.a?` is `null` again, `true` keeps accepting it,
+        // `path()` prints ever-longer paths until killed; this is real
+        // jq's actual, unbounded semantics for this adversarial shape, not
+        // a succinctly gap). What this test pins is succinctly's own
+        // *documented, deliberate* divergence (see this function's doc
+        // comment above, "One divergence remains, deliberately") applying
+        // identically whether or not `cond` is present: `is_null_current`
+        // must terminate this in exactly the same 2 outputs the no-`cond`
+        // case (`path(recurse(.a?))`, already covered by other tests)
+        // produces, not silently regress to unbounded (or `MAX_ITEMS`-only)
+        // growth just because a `cond` was added.
+        assert_eq!(
+            outputs(br#"{"a":null}"#, r"path(recurse(.a?; true))"),
+            vec!["[]", r#"["a"]"#]
+        );
+        assert_eq!(
+            outputs(br#"{"a":null}"#, r"path(recurse(.a?))"),
+            vec!["[]", r#"["a"]"#]
+        );
+    }
+
+    #[test]
     fn test_recurse_cond_max_items_truncation_suppresses_a_pending_error_854() {
         // Review of #842's fix, now exercised via `cond`'s own deferred
         // error rather than `f`'s: a `pending_error` sourced from `cond`

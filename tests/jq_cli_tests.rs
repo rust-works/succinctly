@@ -7394,6 +7394,27 @@ fn test_resolve_recurse_cond_still_gates_null_child_emission() -> Result<()> {
     Ok(())
 }
 
+/// Review-driven regression guard on #854's own rewrite of `resolve_recurse`'s
+/// `Some(cond)` arm: switching `cond`'s own evaluation to
+/// `eval_owned_multi_keep_partial` must not drop the pre-existing
+/// `is_null_current` gate that bounds recursion *past* a null node (#856) --
+/// a truthy `cond` must not re-open that bound. NOT a real-jq-parity case:
+/// `recurse(.a?; true)` on `{"a":null}` never terminates in real jq 1.7.1
+/// either (confirmed live: `null.a?` is `null` again, `true` keeps accepting
+/// it, `path()` prints ever-longer paths until killed -- real jq's actual
+/// unbounded semantics here, not a succinctly gap). This pins succinctly's
+/// own documented, deliberate divergence instead: `cond` present must
+/// terminate in exactly the same 2 outputs the no-`cond` case does.
+#[test]
+fn test_resolve_recurse_cond_still_bounds_null_current_growth_854() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", r"path(recurse(.a?; true))"], Some(r#"{"a":null}"#))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[]\n[\"a\"]\n");
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
 /// Review-driven regression guard for the fix above: bounding recursion
 /// *into* a null node must not also skip *evaluating* `f` on it -- real
 /// jq's `recurse` always applies `f` to every node it visits, root
