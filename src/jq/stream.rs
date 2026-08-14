@@ -820,6 +820,23 @@ mod tests {
         assert_eq!(buf, "null");
     }
 
+    /// #852: `OwnedValue::stream_yaml` (the top-level `StreamableValue`
+    /// entry point, not the recursive `stream_owned_value_yaml` it calls
+    /// for nested values) drops all styling for a root `String`, printing
+    /// it raw even when `stream_yaml_string`'s own heuristic would have
+    /// quoted it. Exercised directly here since the CLI-level tests for
+    /// this fix (`-n` construction, `.a + .b` arithmetic) happen to route
+    /// through `output_value`'s identical, separately-fixed special case
+    /// instead of through this trait method specifically.
+    #[test]
+    fn test_stream_yaml_string_root_drops_ambiguous_styling_852() {
+        let mut buf = String::new();
+        OwnedValue::String("true".to_string())
+            .stream_yaml(&mut buf, IndentSpec::COMPACT, false)
+            .unwrap();
+        assert_eq!(buf, "true");
+    }
+
     #[test]
     fn test_stream_bool() {
         let mut buf = String::new();
