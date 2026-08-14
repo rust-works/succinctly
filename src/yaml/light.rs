@@ -2177,8 +2177,27 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
     /// See [`Self::anchor`]'s doc comment: deliberately does not resolve a
     /// bare `-` sequence-item wrapper itself, for the same hot-path
     /// performance reason.
+    ///
+    /// Dereferences through an alias to the anchor definition's own tag
+    /// (`x: &a !!str 1` / `y: *a` — `.y`'s cursor has no tag at its own
+    /// `bp_pos`, since a YAML alias node cannot itself carry a tag; the tag
+    /// lives on the anchor it points to). Mirrors every other alias-transparent
+    /// accessor on this type (`as_bool`/`as_i64`/`as_f64`/`as_object`/
+    /// `as_array`/`type_name` below, and `stream_json_value`'s `Alias` arm) —
+    /// `explicit_tag` was the one left out (#903 review).
     #[inline]
     pub fn explicit_tag(&self) -> Option<&str> {
+        if let YamlValue::Alias { target, .. } = self.value() {
+            // Not `target.and_then(|t| t.explicit_tag())`: `t` is a local
+            // `YamlCursor` moved into the closure, so a call through `&t`
+            // ties the returned `&str` to that closure-local borrow even
+            // though the string data itself lives for `'a`. Read through
+            // `t.index` (a `Copy` `&'a YamlIndex<W>`) directly instead, so
+            // the elided lifetime resolves to `'a`, matching every other
+            // `Alias` arm in this file that recurses via the cursor itself
+            // rather than a getter call on it.
+            return target.and_then(|t| t.index.get_tag(t.bp_pos));
+        }
         self.index.get_tag(self.bp_pos)
     }
 
@@ -5649,15 +5668,20 @@ impl<'a, W: AsRef<[u64]>> YamlValue<'a, W> {
 // FORMER KNOWN LIMITATION (#224, fixed by #747): the typed getters below
 // (`is_null`, `as_bool`, `as_i64`, `as_f64`, `type_name`) are still not
 // tag-aware themselves — a bare `YamlValue` has no `bp_pos` to look an
-// explicit tag up with, only a `YamlCursor` does (`explicit_tag()`) — but
-// every caller that can reach an explicit tag now checks it first via a
-// cursor before ever falling through to these getters:
-// `crate::jq::eval_generic::to_owned_cursor` (backing `select`, `==`,
-// arithmetic, and other cursor-materializing paths) and
-// `crate::jq::eval_generic::tagged_type_name` (backing `type` specifically,
-// which doesn't materialize a value at all). So
-// `echo 'a: !!str 1' | succinctly yq '.a | type'` now correctly says
+// explicit tag up with, only a `YamlCursor` does (`explicit_tag()`). Every
+// caller that already holds a cursor at the point it navigates to a node
+// now checks the tag first, via `crate::jq::eval_generic::to_owned_cursor`
+// (`select`, `==`, arithmetic, `is*`, `to_entries`, `reverse`/`shuffle`/
+// `pivot`, and other cursor-materializing paths) or
+// `crate::jq::eval_generic::tagged_type_name` (`type` and every
+// type-mismatch error message, none of which materialize a value at all).
+// So `echo 'a: !!str 1' | succinctly yq '.a | type'` now correctly says
 // `"string"`, matching `succinctly yq '.'`'s JSON output for the same input.
+// Two gaps remain, deliberately out of scope for #747/#903: `to_owned`
+// itself (used wherever a cursor genuinely isn't available, e.g. a computed
+// value or an already-cursor-less ambient `.`) and
+// `to_owned_with_comments`'s scalar leaf (the `#710`/`#739` comment-tree
+// write path, a separate mechanism from the read-side fix here).
 impl<'a, W: AsRef<[u64]> + Clone> DocumentValue for YamlValue<'a, W> {
     type Cursor = YamlCursor<'a, W>;
     type Fields = YamlFields<'a, W>;

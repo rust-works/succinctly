@@ -79,7 +79,7 @@ pub fn to_owned<V: DocumentValue>(value: &V) -> OwnedValue {
     }
 }
 
-/// Convert a `DocumentCursor`'s value to an `OwnedValue`, resolving an
+/// Converts a `DocumentCursor`'s value to an `OwnedValue`, resolving an
 /// explicit YAML tag along the way (e.g. `!!str 1` materializes as the
 /// string `"1"`, not the number `1` — issue #747).
 ///
@@ -119,7 +119,7 @@ pub fn to_owned_cursor<C: DocumentCursor>(cursor: &C) -> OwnedValue {
     }
 }
 
-/// Resolve a scalar's explicit YAML tag (`!!str`, `!!int`, ...) against its
+/// Resolves a scalar's explicit YAML tag (`!!str`, `!!int`, ...) against its
 /// raw source text, or `None` if the value isn't a scalar with text (a
 /// container, already excluded by [`to_owned_cursor`]'s caller) or the tag
 /// doesn't apply to this text (e.g. `!!int` on `"abc"` — [`resolve_tagged`]
@@ -136,7 +136,7 @@ fn tagged_scalar_to_owned<V: DocumentValue>(tag: &str, value: &V) -> Option<Owne
     })
 }
 
-/// Materialize `value`, preferring the cursor-aware, tag-resolving
+/// Materializes `value`, preferring the cursor-aware, tag-resolving
 /// [`to_owned_cursor`] when a cursor is available (issue #747) and falling
 /// back to the cursor-less [`to_owned`] otherwise — e.g. a computed value
 /// with no navigated position (see [`DocumentCursor::line`]'s "not
@@ -160,10 +160,17 @@ fn to_owned_with_cursor<V: DocumentValue>(value: &V, cursor: Option<V::Cursor>) 
 fn tagged_type_name<V: DocumentValue>(value: &V, cursor: Option<V::Cursor>) -> &'static str {
     cursor
         .and_then(|c| {
-            c.explicit_tag()
-                .and_then(|tag| tagged_scalar_to_owned(tag, value))
+            // Not `c.explicit_tag().and_then(...)` chained outside this
+            // closure: `c` is a local `V::Cursor` moved in by `and_then`,
+            // so a `&str` returned through `&c` (an elided-lifetime `&self`
+            // method) can't outlive this closure even though the
+            // underlying text can — resolve it to an owned `ResolvedScalar`
+            // before returning, same as `to_owned_cursor`'s scalar arm.
+            let tag = c.explicit_tag()?;
+            let text = value.as_str()?;
+            crate::yaml::resolve_tagged(&text, tag)
         })
-        .map_or_else(|| value.type_name(), |owned| owned.type_name())
+        .map_or_else(|| value.type_name(), crate::yaml::ResolvedScalar::type_name)
 }
 
 /// A shape-parallel tree of per-node presentation metadata.
@@ -384,6 +391,22 @@ fn to_owned_key_shape<V: DocumentValue>(value: &V) -> OwnedValue {
         OwnedValue::Object(IndexMap::new())
     } else {
         to_owned(value)
+    }
+}
+
+/// Cursor-carrying sibling of [`to_owned_key_shape`] (#903 review): a
+/// computed-index key or slice bound reached via `OneCursor`/`ManyCursor`
+/// still needs its scalar resolved through `to_owned_cursor` rather than the
+/// bare `to_owned`, or an explicit tag on the key/bound expression itself
+/// (`.a[.k]` where `.k` is `!!str 1`) is silently ignored.
+fn to_owned_key_shape_cursor<C: DocumentCursor>(cursor: &C) -> OwnedValue {
+    let value = cursor.value();
+    if value.is_array() {
+        OwnedValue::Array(Vec::new())
+    } else if value.is_object() {
+        OwnedValue::Object(IndexMap::new())
+    } else {
+        to_owned_cursor(cursor)
     }
 }
 
@@ -1696,7 +1719,10 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
             } else if optional {
                 GenericResult::None
             } else {
-                GenericResult::Error(EvalError::cannot_index_with_field(value.type_name(), name))
+                GenericResult::Error(EvalError::cannot_index_with_field(
+                    tagged_type_name(&value, cursor),
+                    name,
+                ))
             }
         }
 
@@ -1733,7 +1759,7 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                 // convert the resulting `Error` to `None` once, same
                 // externally-observable result via a different path.
                 GenericResult::Error(EvalError::cannot_index_with_type(
-                    value.type_name(),
+                    tagged_type_name(&value, cursor),
                     "number",
                 ))
             }
@@ -2715,11 +2741,9 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
             vs
         }
         GenericResult::One(v) => vec![to_owned_key_shape(&v)],
-        GenericResult::OneCursor(c) => vec![to_owned_key_shape(&c.value())],
+        GenericResult::OneCursor(c) => vec![to_owned_key_shape_cursor(&c)],
         GenericResult::Many(vs) => vs.iter().map(to_owned_key_shape).collect(),
-        GenericResult::ManyCursor(cs) => {
-            cs.iter().map(|c| to_owned_key_shape(&c.value())).collect()
-        }
+        GenericResult::ManyCursor(cs) => cs.iter().map(to_owned_key_shape_cursor).collect(),
         other => other.collect_owned(),
     };
     if keys.is_empty() {
@@ -3008,11 +3032,9 @@ fn eval_slice_bound<S: EvalSemantics, V: DocumentValue>(
         GenericResult::None => return Ok(Vec::new()),
         GenericResult::Partial(_, control) => return Err(control),
         GenericResult::One(v) => vec![to_owned_key_shape(&v)],
-        GenericResult::OneCursor(c) => vec![to_owned_key_shape(&c.value())],
+        GenericResult::OneCursor(c) => vec![to_owned_key_shape_cursor(&c)],
         GenericResult::Many(vs) => vs.iter().map(to_owned_key_shape).collect(),
-        GenericResult::ManyCursor(cs) => {
-            cs.iter().map(|c| to_owned_key_shape(&c.value())).collect()
-        }
+        GenericResult::ManyCursor(cs) => cs.iter().map(to_owned_key_shape_cursor).collect(),
         other => other.collect_owned(),
     };
     raw.iter()
@@ -3190,15 +3212,18 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                 use rand_chacha::ChaCha8Rng;
 
                 if let Some(elements) = value.as_array() {
-                    let mut values: Vec<OwnedValue> =
-                        elements.collect_values().iter().map(to_owned).collect();
+                    let mut values: Vec<OwnedValue> = elements
+                        .collect_cursors()
+                        .iter()
+                        .map(to_owned_cursor)
+                        .collect();
                     let mut rng = ChaCha8Rng::from_rng(&mut rand::rng());
                     values.shuffle(&mut rng);
                     GenericResult::Owned(OwnedValue::Array(values))
                 } else {
                     GenericResult::Error(EvalError::new(format!(
                         "shuffle requires array, got {}",
-                        value.type_name()
+                        tagged_type_name(&value, cursor)
                     )))
                 }
             }
@@ -3212,8 +3237,11 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
 
         Builtin::Pivot => {
             if let Some(elements) = value.as_array() {
-                let items: Vec<OwnedValue> =
-                    elements.collect_values().iter().map(to_owned).collect();
+                let items: Vec<OwnedValue> = elements
+                    .collect_cursors()
+                    .iter()
+                    .map(to_owned_cursor)
+                    .collect();
                 if items.is_empty() {
                     return GenericResult::Owned(OwnedValue::Array(vec![]));
                 }
@@ -3288,7 +3316,10 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
             } else if optional {
                 GenericResult::None
             } else {
-                GenericResult::Error(EvalError::type_error("array", value.type_name()))
+                GenericResult::Error(EvalError::type_error(
+                    "array",
+                    tagged_type_name(&value, cursor),
+                ))
             }
         }
 
@@ -3401,13 +3432,13 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
         Builtin::ToEntries => {
             if let Some(elements) = value.as_array() {
                 let entries: Vec<OwnedValue> = elements
-                    .collect_values()
+                    .collect_cursors()
                     .into_iter()
                     .enumerate()
-                    .map(|(i, elem)| {
+                    .map(|(i, elem_cursor)| {
                         let mut entry = IndexMap::new();
                         entry.insert("key".to_string(), OwnedValue::Int(i as i64));
-                        entry.insert("value".to_string(), to_owned(&elem));
+                        entry.insert("value".to_string(), to_owned_cursor(&elem_cursor));
                         OwnedValue::Object(entry)
                     })
                     .collect();
@@ -3419,7 +3450,7 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                     if let Some(key) = field.key_str() {
                         let mut entry = IndexMap::new();
                         entry.insert("key".to_string(), OwnedValue::String(key.into_owned()));
-                        entry.insert("value".to_string(), to_owned(&field.value));
+                        entry.insert("value".to_string(), to_owned_cursor(&field.value_cursor));
                         entries.push(OwnedValue::Object(entry));
                     }
                     f = rest;
@@ -3438,17 +3469,37 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
             }
         }
 
-        Builtin::IsNull => GenericResult::Owned(OwnedValue::Bool(value.is_null())),
+        // The `is*` family reads through `tagged_type_name` rather than
+        // `DocumentValue::is_null`/`is_bool`/`is_number`/`is_string`
+        // directly: those default to shape-only checks with no tag lookup
+        // (same gap `Type` had before #747), and — for YAML specifically —
+        // `is_number`/`is_string` can both independently answer `true` for
+        // an untagged plain scalar (`as_str()` always succeeds on a
+        // `YamlValue::String` node, whatever its resolved type), which
+        // `type_name()`'s single-answer match doesn't have.
+        Builtin::IsNull => {
+            GenericResult::Owned(OwnedValue::Bool(tagged_type_name(&value, cursor) == "null"))
+        }
 
-        Builtin::IsBoolean => GenericResult::Owned(OwnedValue::Bool(value.is_bool())),
+        Builtin::IsBoolean => GenericResult::Owned(OwnedValue::Bool(
+            tagged_type_name(&value, cursor) == "boolean",
+        )),
 
-        Builtin::IsNumber => GenericResult::Owned(OwnedValue::Bool(value.is_number())),
+        Builtin::IsNumber => GenericResult::Owned(OwnedValue::Bool(
+            tagged_type_name(&value, cursor) == "number",
+        )),
 
-        Builtin::IsString => GenericResult::Owned(OwnedValue::Bool(value.is_string())),
+        Builtin::IsString => GenericResult::Owned(OwnedValue::Bool(
+            tagged_type_name(&value, cursor) == "string",
+        )),
 
-        Builtin::IsArray => GenericResult::Owned(OwnedValue::Bool(value.is_array())),
+        Builtin::IsArray => GenericResult::Owned(OwnedValue::Bool(
+            tagged_type_name(&value, cursor) == "array",
+        )),
 
-        Builtin::IsObject => GenericResult::Owned(OwnedValue::Bool(value.is_object())),
+        Builtin::IsObject => GenericResult::Owned(OwnedValue::Bool(
+            tagged_type_name(&value, cursor) == "object",
+        )),
 
         Builtin::Iterables => {
             // Returns input if iterable, empty otherwise
@@ -3481,7 +3532,7 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                 GenericResult::None
             } else {
                 GenericResult::Error(EvalError::cannot_index_with_type(
-                    value.type_name(),
+                    tagged_type_name(&value, cursor),
                     "number",
                 ))
             }
@@ -3501,7 +3552,7 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                 GenericResult::None
             } else {
                 GenericResult::Error(EvalError::cannot_index_with_type(
-                    value.type_name(),
+                    tagged_type_name(&value, cursor),
                     "number",
                 ))
             }
@@ -3521,17 +3572,17 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
         Builtin::Reverse => {
             if let Some(elements) = value.as_array() {
                 let values: Vec<OwnedValue> = elements
-                    .collect_values()
+                    .collect_cursors()
                     .iter()
                     .rev()
-                    .map(to_owned)
+                    .map(to_owned_cursor)
                     .collect();
                 GenericResult::Owned(OwnedValue::Array(values))
             } else if optional {
                 GenericResult::None
             } else {
                 GenericResult::Error(EvalError::cannot_index_with_type(
-                    value.type_name(),
+                    tagged_type_name(&value, cursor),
                     "number",
                 ))
             }
