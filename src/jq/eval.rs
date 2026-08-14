@@ -15031,22 +15031,29 @@ fn builtin_paths_filter<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 // true end)` streams `[0]`, `[1]`, then raises -- not just
                 // `[0]`.
                 //
-                // Once credited, `halt` propagates out of the whole builtin
-                // (#791, nothing may catch it); an ordinary error/break is
-                // swallowed and the loop moves to the next node instead --
-                // a pre-existing, documented divergence from real jq (which
-                // aborts the entire `paths(...)` call on an uncaught
-                // error/break, filed as a follow-up gap, #850) that this
-                // fix does not change. `break` specifically can never
-                // resolve to an outer `label` here regardless:
-                // `val_at_path` is re-indexed into an isolated synthetic
-                // document and evaluated on its own, so a `label` lexically
-                // enclosing the original `paths(...)` call is not part of
-                // the AST being evaluated. Real propagation would need
-                // `filter` resolved through `resolve_node`'s own machinery
-                // instead (as #824 did for its sites); tracked separately
-                // for every remaining `eval_owned_expr`-shaped call site,
-                // `paths(node_filter)` included, under #833.
+                // Once credited, any control signal -- `halt` (#791), or an
+                // ordinary error/break -- aborts the whole builtin instead of
+                // being swallowed and moving on to the next node (#850).
+                // This matches real jq: `paths(node_filter)` is
+                // `path(recurse|select(node_filter))`, and an uncaught
+                // error/break inside `select`'s fan-out aborts the entire
+                // generator, not just the current node. Confirmed against jq
+                // 1.7.1: `[1,"x",2] | paths(if type=="string" then
+                // error("bad") else true end)` streams `[0]` then raises,
+                // never reaching index 2. `break $label` also now correctly
+                // unwinds to a `label` lexically enclosing the whole
+                // `paths(...)` call: unlike `result_to_owned`/`eval_owned_expr`
+                // (the helpers #833 is about), `eval_owned_input` never
+                // collapses `Control::Break` into a "not in label" error --
+                // `push_truthiness` already threads it through intact, so
+                // once this loop stops swallowing it, propagation just
+                // works. Confirmed: `label $out | paths(if type=="string"
+                // then break $out else true end)` on `[1,"x",2]` now matches
+                // real jq exactly (streams `[0]`, exit 0), including when
+                // the matching node is nested. This does not extend to
+                // `path(paths(node_filter))` -- wrapping this builtin's own
+                // output in `path(...)`'s trackable-path machinery is a
+                // separate, still-open divergence (filed as #861).
                 //
                 // `optional` (this builtin's own parameter, not a
                 // hardcoded `false`) must reach this per-node evaluation
@@ -15071,11 +15078,9 @@ fn builtin_paths_filter<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                         filtered_paths.push(path.clone());
                     }
                 }
-                if let Some(Control::Halt(code)) = control {
-                    return partial(filtered_paths, Control::Halt(code));
+                if let Some(control) = control {
+                    return partial(filtered_paths, control);
                 }
-                // Error/Break: the prefix above is already credited;
-                // swallow the escape itself and move to the next node.
             }
         }
     }

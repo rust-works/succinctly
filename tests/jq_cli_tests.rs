@@ -7392,18 +7392,16 @@ fn test_paths_filter_propagates_halt_from_non_root_path() -> Result<()> {
     Ok(())
 }
 
-/// Companion to the halt test above: proves the refactor's
-/// `Err(EvalEscape::Error(_)) => {}` arm still keeps the pre-existing (and,
-/// per its own comment, intentionally jq-divergent) policy of silently
-/// skipping a node whose filter errors ordinarily, rather than aborting
-/// the whole `paths` call -- unlike halt, this does not escape. Verified
-/// against real jq 1.7.1 that this is a genuine divergence, not something
-/// this test should expect to match: `[1,"x",2] | paths(if type=="string"
-/// then error("bad") else true end)` raises in real jq (its `paths`
-/// streams `[0]` first, then errors), while succinctly silently drops the
-/// string element's path and keeps every other match.
+/// Companion to the halt test above, now pinning #850's fix: an ordinary
+/// per-node error/break aborts the whole `paths` call instead of being
+/// swallowed and moving on to the next node -- matching real jq exactly,
+/// since `paths(node_filter)` is `path(recurse|select(node_filter))` and an
+/// uncaught error/break inside `select`'s fan-out aborts the entire
+/// generator. Verified against real jq 1.7.1: `[1,"x",2] | paths(if
+/// type=="string" then error("bad") else true end)` streams `[0]`, then
+/// raises without ever reaching index 2.
 #[test]
-fn test_paths_filter_still_swallows_ordinary_per_path_error() -> Result<()> {
+fn test_paths_filter_aborts_on_ordinary_per_path_error() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(
         &[
             "-c",
@@ -7411,9 +7409,9 @@ fn test_paths_filter_still_swallows_ordinary_per_path_error() -> Result<()> {
         ],
         Some(r#"[1,"x",2]"#),
     )?;
-    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
-    assert_eq!(stdout, "[0]\n[2]\n");
-    assert_eq!(stderr, "");
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[0]\n");
+    assert_eq!(stderr, "jq: error (at <stdin>:0): bad\n");
     Ok(())
 }
 
@@ -7503,11 +7501,9 @@ fn test_paths_filter_mixed_truthy_falsy_keeps_path_once() -> Result<()> {
 /// it. Confirmed against real jq 1.7.1: `[1,"x",2] | paths(if
 /// type=="string" then (true, error("bad")) else true end)` streams `[0]`
 /// then `[1]` before raising -- the truthy output preceding the error is
-/// not discarded. succinctly's own pre-existing (and intentionally
-/// jq-divergent, see `test_paths_filter_still_swallows_ordinary_per_path_error`
-/// above) policy is to swallow an ordinary per-node error and continue to
-/// the next node rather than aborting the whole `paths` call, so the
-/// expected succinctly output here also includes `[2]`.
+/// not discarded. Since #850, succinctly also aborts the whole `paths`
+/// call on that same error rather than continuing to the next node, so
+/// index 2 (`[2]`) is never reached, matching real jq exactly.
 #[test]
 fn test_paths_filter_keeps_truthy_prefix_before_ordinary_error() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(
@@ -7517,9 +7513,9 @@ fn test_paths_filter_keeps_truthy_prefix_before_ordinary_error() -> Result<()> {
         ],
         Some(r#"[1,"x",2]"#),
     )?;
-    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
-    assert_eq!(stdout, "[0]\n[1]\n[2]\n");
-    assert_eq!(stderr, "");
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[0]\n[1]\n");
+    assert_eq!(stderr, "jq: error (at <stdin>:0): bad\n");
     Ok(())
 }
 
@@ -7545,17 +7541,17 @@ fn test_paths_filter_keeps_truthy_prefix_before_halt() -> Result<()> {
 }
 
 /// Same regression again, but for `break`: a truthy output preceding a
-/// `break $label` within one node's fan-out must still be reported. Unlike
-/// real jq (whose closures resolve a label lexically enclosing the
-/// `paths(...)` call, so `break` there aborts the whole computation
-/// cleanly), succinctly's per-node filter evaluation re-indexes the value
-/// into an isolated synthetic document (`eval_owned_input`) that cannot
-/// resolve a label from the caller's outer scope -- the label lookup fails
-/// and is treated as an ordinary error (same swallow-and-continue policy
-/// as the plain-error test above), a pre-existing, unrelated limitation
-/// this fix does not change. What this test pins is narrower: the truthy
-/// prefix produced before that failed `break` must still be kept, not
-/// dropped along with it.
+/// `break $label` within one node's fan-out must still be reported, and
+/// (since #850) the `break` itself now correctly unwinds to a `label`
+/// lexically enclosing the whole `paths(...)` call instead of being
+/// swallowed and treated as an ordinary per-node error. Unlike
+/// `result_to_owned`/`eval_owned_expr` (see #833), `eval_owned_input` never
+/// collapses `Control::Break` into a "not in label" error, so once
+/// `builtin_paths_filter`'s loop stopped swallowing every non-halt control
+/// signal, propagation to the outer label just worked. Confirmed against
+/// real jq 1.7.1: `label $out | paths(if type=="string" then (true, break
+/// $out) else true end)` on `[1,"x",2]` streams `[0]` then `[1]` before the
+/// break unwinds, exiting 0 -- index 2 is never reached.
 #[test]
 fn test_paths_filter_keeps_truthy_prefix_before_break() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(
@@ -7566,7 +7562,7 @@ fn test_paths_filter_keeps_truthy_prefix_before_break() -> Result<()> {
         Some(r#"[1,"x",2]"#),
     )?;
     assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
-    assert_eq!(stdout, "[0]\n[1]\n[2]\n");
+    assert_eq!(stdout, "[0]\n[1]\n");
     assert_eq!(stderr, "");
     Ok(())
 }
