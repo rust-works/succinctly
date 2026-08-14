@@ -7077,92 +7077,40 @@ fn stitch_replacements_evaluated<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
 /// Builtin: scan(re) - find all matches
 #[cfg(feature = "regex")]
+/// jq defines this as `scan($re; null)` — delegate to the flags-aware
+/// implementation directly rather than duplicating its match-collection
+/// logic here. The former standalone body always took `caps.get(0)` (the
+/// whole match), never branching on `capture_count` the way
+/// `builtin_scan_with_flags` does, so a pattern with capture groups
+/// silently returned the wrong shape (#915): `scan("(a)(b)")` on `"ab"`
+/// read back as `"ab"` instead of `["a","b"]` — `scan("(a)(b)"; null)` and
+/// real jq both already produced the correct array. Same duplication
+/// shape #906 found and fixed for `splits`.
 fn builtin_scan<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     re_expr: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    // Get the pattern
-    let pattern = match result_to_owned(eval_single::<W, S>(re_expr, value.clone(), optional)) {
-        Ok(OwnedValue::String(s)) => s,
-        Ok(_) if optional => return QueryResult::None,
-        Ok(_) => return QueryResult::Error(EvalError::type_error("string", "pattern")),
-        Err(e) => return e.into(),
-    };
-
-    // Get the input string
-    let input = match &value {
-        StandardJson::String(s) => match s.as_str() {
-            Ok(cow) => cow.into_owned(),
-            Err(_) if optional => return QueryResult::None,
-            Err(_) => return QueryResult::Error(EvalError::new("invalid string")),
-        },
-        _ if optional => return QueryResult::None,
-        _ => return QueryResult::Error(EvalError::cannot_be_matched(&to_owned(&value))),
-    };
-
-    // Build regex
-    let re = match build_regex(&pattern, None) {
-        Ok(r) => r,
-        Err(_e) if optional => return QueryResult::None,
-        Err(e) => return e.into(),
-    };
-
-    // Find all matches
-    let matches: Vec<OwnedValue> = global_captures(&re, &input)
-        .iter()
-        .map(|caps| {
-            let m = caps
-                .get(0)
-                .expect("capture group 0 is always present on a match");
-            OwnedValue::String(m.as_str().to_string())
-        })
-        .collect();
-
-    QueryResult::ManyOwned(matches)
+    builtin_scan_with_flags::<W, S>(re_expr, None, value, optional)
 }
 
 /// Builtin: splits(re) - split by regex
+///
+/// jq defines this as `splits($re; null)` — delegate to the flags-aware
+/// implementation directly rather than duplicating its (streaming) split
+/// logic here. The former standalone body returned a single
+/// `QueryResult::Owned(Array(parts))` instead of streaming one output per
+/// substring the way `splits(re; flags)` and real jq both do (#906):
+/// `[splits("[0-9]")]` on `"a1b2"` read back as `[["a","b",""]]` (one
+/// nested array) instead of `["a","b",""]` (three streamed strings
+/// collected).
 #[cfg(feature = "regex")]
 fn builtin_splits<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     re_expr: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    // Get the pattern
-    let pattern = match result_to_owned(eval_single::<W, S>(re_expr, value.clone(), optional)) {
-        Ok(OwnedValue::String(s)) => s,
-        Ok(_) if optional => return QueryResult::None,
-        Ok(_) => return QueryResult::Error(EvalError::type_error("string", "pattern")),
-        Err(e) => return e.into(),
-    };
-
-    // Get the input string
-    let input = match &value {
-        StandardJson::String(s) => match s.as_str() {
-            Ok(cow) => cow.into_owned(),
-            Err(_) if optional => return QueryResult::None,
-            Err(_) => return QueryResult::Error(EvalError::new("invalid string")),
-        },
-        _ if optional => return QueryResult::None,
-        _ => return QueryResult::Error(EvalError::cannot_be_matched(&to_owned(&value))),
-    };
-
-    // Build regex
-    let re = match build_regex(&pattern, None) {
-        Ok(r) => r,
-        Err(_e) if optional => return QueryResult::None,
-        Err(e) => return e.into(),
-    };
-
-    // Split by regex
-    let matches = global_captures(&re, &input);
-    let parts: Vec<OwnedValue> = stitch_split(&input, &matches)
-        .into_iter()
-        .map(OwnedValue::String)
-        .collect();
-
-    QueryResult::Owned(OwnedValue::Array(parts))
+    builtin_splits_with_flags::<W, S>(re_expr, None, value, optional)
 }
 
 /// Builtin: sub(re; replacement) - replace first match
@@ -27444,9 +27392,57 @@ mod tests {
 
     #[cfg(feature = "regex")]
     #[test]
+    fn test_regex_scan_bare_form_honors_capture_groups_915() {
+        // #915: bare `scan(re)` used to duplicate `scan(re; flags)`'s logic
+        // instead of delegating, and the duplicate never checked
+        // `capture_count` — so a pattern with capture groups returned the
+        // whole match (group 0) instead of the array of captured groups.
+        // Verified live against jq 1.7.1: `scan("(a)(b)")` on `"ab"` is
+        // `["a","b"]`, matching what `scan(re; "")` already produced here.
+        query!(br#""ab""#, r#"scan("(a)(b)")"#,
+            QueryResult::ManyOwned(matches) => {
+                assert_eq!(matches.len(), 1);
+                assert_eq!(
+                    matches[0],
+                    OwnedValue::Array(vec![
+                        OwnedValue::String("a".to_string()),
+                        OwnedValue::String("b".to_string()),
+                    ])
+                );
+            }
+        );
+
+        // Two matches of a capture-grouped pattern.
+        query!(br#""a1b2""#, r#"scan("([a-z])([0-9])")"#,
+            QueryResult::ManyOwned(matches) => {
+                assert_eq!(matches.len(), 2);
+                assert_eq!(
+                    matches[0],
+                    OwnedValue::Array(vec![
+                        OwnedValue::String("a".to_string()),
+                        OwnedValue::String("1".to_string()),
+                    ])
+                );
+                assert_eq!(
+                    matches[1],
+                    OwnedValue::Array(vec![
+                        OwnedValue::String("b".to_string()),
+                        OwnedValue::String("2".to_string()),
+                    ])
+                );
+            }
+        );
+    }
+
+    #[cfg(feature = "regex")]
+    #[test]
     fn test_regex_splits() {
+        // `splits(re)` streams one output per substring — like real jq, and
+        // like `splits(re; flags)` already did before #906's fix made the
+        // bare form (this one) match instead of wrongly collapsing to a
+        // single array-valued output.
         query!(br#""a1b2c3d""#, r#"splits("[0-9]")"#,
-            QueryResult::Owned(OwnedValue::Array(parts)) => {
+            QueryResult::ManyOwned(parts) => {
                 assert_eq!(parts.len(), 4);
                 assert_eq!(parts[0], OwnedValue::String("a".to_string()));
                 assert_eq!(parts[1], OwnedValue::String("b".to_string()));
