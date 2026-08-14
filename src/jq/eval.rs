@@ -13406,6 +13406,12 @@ fn builtin_isvalid<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // `isempty`.
         QueryResult::Halt(code) => QueryResult::Halt(code),
         QueryResult::Partial(_, Control::Halt(code)) => QueryResult::Halt(code),
+        // Same reasoning applies to an unresolved `break`: it must keep
+        // unwinding toward its enclosing `label`, not report `true` and let
+        // evaluation continue (#867) — the `_` catch-all below previously
+        // swallowed both shapes exactly like the `Halt` cases once did.
+        QueryResult::Break(label) => QueryResult::Break(label),
+        QueryResult::Partial(_, Control::Break(label)) => QueryResult::Break(label),
         _ => QueryResult::Owned(OwnedValue::Bool(true)),
     }
 }
