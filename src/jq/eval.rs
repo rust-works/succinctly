@@ -27358,6 +27358,53 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "regex")]
+    #[test]
+    fn test_scan_split_splits_prepend_g_before_validating_flags_730() {
+        // scan/split/splits always operate in jq's "global" mode (they find
+        // or split on every match), and jq's own bootstrap prepends `g` to
+        // the flags string before validation for exactly that reason -- `g`
+        // has no effect on `build_regex`'s compiled pattern, so this only
+        // changes the wording of an invalid-flags error. Verified live
+        // against jq 1.7.1: `scan("a"; "z")` reports "gz is not a valid
+        // modifier string", not "z is not a valid modifier string" -- and
+        // the same holds for split/splits. Found during #730's own review:
+        // the first version of this fix passed the raw flags straight to
+        // `build_regex` at these three sites, producing the wrong message.
+        for (filter, expected) in [
+            (r#"scan("a"; "z")"#, "gz is not a valid modifier string"),
+            (r#"scan("a"; "iz")"#, "giz is not a valid modifier string"),
+            (r#"split("a"; "z")"#, "gz is not a valid modifier string"),
+            (r#"split("a"; "iz")"#, "giz is not a valid modifier string"),
+            (r#"splits("a"; "z")"#, "gz is not a valid modifier string"),
+            (r#"splits("a"; "iz")"#, "giz is not a valid modifier string"),
+        ] {
+            query!(br#""abc""#, filter,
+                QueryResult::Error(e) => {
+                    assert_eq!(e.message, expected, "filter: {filter}");
+                }
+            );
+        }
+
+        // Valid flags must still work correctly at all three sites (the `g`
+        // prefix must not leak into compiled-pattern behavior or output).
+        query!(br#""ABC""#, r#"[scan("a"; "i")]"#,
+            QueryResult::Owned(OwnedValue::Array(vs)) => {
+                assert_eq!(vs, vec![OwnedValue::String("A".to_string())]);
+            }
+        );
+        query!(br#""a1b2""#, r#"split("[0-9]"; "")"#,
+            QueryResult::Owned(OwnedValue::Array(vs)) => {
+                assert_eq!(vs.len(), 3);
+            }
+        );
+        query!(br#""a1b2""#, r#"[splits("[0-9]"; "")]"#,
+            QueryResult::Owned(OwnedValue::Array(vs)) => {
+                assert_eq!(vs.len(), 3);
+            }
+        );
+    }
+
     // =========================================================================
     // Phase 8 Tests: Variables and Advanced Control Flow
     // =========================================================================
