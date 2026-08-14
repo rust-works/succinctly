@@ -10666,6 +10666,8 @@ fn resolve_recurse<'a, S: EvalSemantics>(
         // one popped, and its whole subtree completes before the second
         // entry is even reached.
         let mut next: Vec<PathBranch<'a>> = Vec::new();
+        // Set below on a `cond` error — see the loop's `Err(e)` arm (#854).
+        let mut cond_error: Option<EvalEscape> = None;
         for (child_components, child_value) in children {
             let mut path = prefix.clone();
             path.extend(child_components);
@@ -10690,11 +10692,6 @@ fn resolve_recurse<'a, S: EvalSemantics>(
                 Some(cond) => {
                     // `cond` gates the child, not `current`, and forks once
                     // per truthy output — see the doc comment above (#627).
-                    // A `cond` error aborts immediately too (#636), same as
-                    // `f`'s error above — this arm's own prefix-loss
-                    // (`next`'s already-cond-approved entries built so far
-                    // this node) is pre-existing and out of scope for #842,
-                    // which is specifically about `f`'s fan-out.
                     //
                     // Evaluated unconditionally, even when `current` is
                     // null: like `f` above, `cond`'s own error/side effect
@@ -10713,13 +10710,36 @@ fn resolve_recurse<'a, S: EvalSemantics>(
                                 }
                             }
                         }
-                        Err(e) => return Err((outputs, e)),
+                        Err(e) => {
+                            // Same "keep what's already approved, defer the
+                            // error" treatment `f`'s own error gets above
+                            // (#842), applied to `cond`'s error too (#854):
+                            // stop considering further children at this
+                            // node, but let `next`'s already-`cond`-approved
+                            // siblings (built so far this iteration) get
+                            // their own full recursive descent before this
+                            // error is raised. `cond_error` supersedes
+                            // `deferred_error` below rather than the other
+                            // way around — real jq's generator semantics
+                            // evaluate `select(cond)` on each child as `f`
+                            // produces it, so a `cond` error on an
+                            // already-produced child always happens before
+                            // `f` would ever be asked to produce a later one
+                            // (which is what `deferred_error` represents).
+                            cond_error = Some(e);
+                            break;
+                        }
                     }
                 }
             }
         }
 
-        queue_recurse_children(&mut stack, next, deferred_error, &mut pending_error);
+        queue_recurse_children(
+            &mut stack,
+            next,
+            cond_error.or(deferred_error),
+            &mut pending_error,
+        );
     }
 
     // A `pending_error` only surfaces once `stack` drains naturally — if
@@ -13309,17 +13329,22 @@ fn builtin_recurse_cond<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // see `resolve_recurse`'s doc comment (#635) — so the first entry's
         // whole subtree completes before the next is reached.
         let mut next: Vec<OwnedValue> = Vec::new();
+        // Set below on a `cond` error — see the loop's `Err(e)` arm (#854).
+        let mut cond_error: Option<EvalEscape> = None;
         for child in children {
             // `cond` gates the child, not `current` (see doc comment above).
-            // A `cond` error aborts immediately too — same jq definition,
-            // same reasoning as `f`'s error above (#636) — rather than
-            // pruning just this child the way a falsy `cond` does. This
-            // arm's own prefix-loss (`next`'s already-cond-approved entries
-            // built so far this node) is pre-existing and out of scope for
-            // #842, which is specifically about `f`'s fan-out.
             let cond_outputs = match eval_owned_multi::<S>(cond, &child) {
                 Ok(cond_outputs) => cond_outputs,
-                Err(e) => return partial(outputs, e.into()),
+                Err(e) => {
+                    // Same "keep what's already approved, defer the error"
+                    // treatment `f`'s own error gets above (#842), applied
+                    // to `cond`'s error too (#854) — see `resolve_recurse`'s
+                    // matching arm for the full rationale, including why
+                    // `cond_error` supersedes `deferred_error` below rather
+                    // than the other way around.
+                    cond_error = Some(e);
+                    break;
+                }
             };
             for c in &cond_outputs {
                 if c.is_truthy() {
@@ -13328,7 +13353,12 @@ fn builtin_recurse_cond<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             }
         }
 
-        queue_recurse_children(&mut stack, next, deferred_error, &mut pending_error);
+        queue_recurse_children(
+            &mut stack,
+            next,
+            cond_error.or(deferred_error),
+            &mut pending_error,
+        );
     }
 
     // See `resolve_recurse`'s matching check for the full rationale (#842
