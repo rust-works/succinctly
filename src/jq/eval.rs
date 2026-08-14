@@ -16548,10 +16548,12 @@ fn builtin_gmtime<W: Clone + AsRef<[u64]>>(
         Err(r) => return r,
     };
 
-    let t = match broken_down_time_from_unix_secs(timestamp.trunc() as i64) {
+    let t = match ok_or_result::<W, _>(
+        broken_down_time_from_unix_secs(timestamp.trunc() as i64),
+        optional,
+    ) {
         Ok(t) => t,
-        Err(_) if optional => return QueryResult::None,
-        Err(e) => return QueryResult::Error(e),
+        Err(r) => return r,
     };
 
     let result = vec![
@@ -16578,8 +16580,24 @@ fn builtin_gmtime<W: Clone + AsRef<[u64]>>(
 /// branch's `secs - 86399` is the only step in this function that can
 /// overflow `i64` (every other step stays comfortably in range for any
 /// `secs` that step doesn't already reject), and the resulting `year` is
-/// additionally checked against `i32`'s range to match real jq's own error
-/// boundary — see [`EvalError::datetime_out_of_range`].
+/// additionally rejected outside `i32`'s range — see
+/// [`EvalError::datetime_out_of_range`].
+///
+/// This `i32` check is a deliberate, principled safety boundary, not an
+/// attempt to bit-for-bit replicate real jq's own cutoff: jq's actual
+/// behavior here is an asymmetric artifact of its C implementation, not a
+/// clean year-fits-in-i32 rule — confirmed directly against jq-1.7.1, jq
+/// silently *wraps* a `year` of `i32::MAX + 1` down to `i32::MIN` instead
+/// of erroring (`67767976233532800 | gmtime` succeeds in jq, returning a
+/// bogus `year: -2147483648`), while it *errors* on `-67768100536262402`
+/// despite that input's own computed year (`-2147483647`) fitting `i32`
+/// just fine. Reproducing jq's wraparound would reintroduce exactly the
+/// "silently wrong value" failure mode #869 exists to eliminate, so it's
+/// intentionally not replicated even though it means diverging from jq in
+/// both directions at this boundary (erroring where jq wraps; succeeding
+/// where jq errors) — the two sides agree closely (not exactly) in the
+/// practically-relevant range, confirmed by bisection up to ~1e16 seconds
+/// from the epoch in both directions.
 fn broken_down_time_from_unix_secs(secs: i64) -> Result<BrokenDownTime, EvalError> {
     // Days since Unix epoch (Jan 1, 1970)
     let days = if secs >= 0 {
@@ -16636,6 +16654,27 @@ fn broken_down_time_from_unix_secs(secs: i64) -> Result<BrokenDownTime, EvalErro
     })
 }
 
+/// Fold a `Result<T, EvalError>` into this file's `Result<T, QueryResult>`
+/// early-return idiom (already used by, e.g., `get_float_value_with`),
+/// respecting `optional` the same way: `Err(_) if optional` becomes
+/// `QueryResult::None`, otherwise the error propagates as-is. Used by every
+/// `gmtime`/`localtime`/`strftime`/`todate`/`tz` call site that can now fail
+/// on an extreme timestamp, so they share one `optional`-handling arm
+/// instead of each hand-copying `Ok(t) => t, Err(_) if optional => ...,
+/// Err(e) => ...`.
+fn ok_or_result<'a, W: Clone + AsRef<[u64]>, T>(
+    result: Result<T, EvalError>,
+    optional: bool,
+) -> Result<T, QueryResult<'a, W>> {
+    result.map_err(|e| {
+        if optional {
+            QueryResult::None
+        } else {
+            QueryResult::Error(e)
+        }
+    })
+}
+
 /// Builtin: localtime - convert Unix timestamp to broken-down local time
 /// Returns [year, month(0-11), day(1-31), hour, minute, second, weekday(0-6, Sunday=0), yearday(0-365)]
 fn builtin_localtime<W: Clone + AsRef<[u64]>>(
@@ -16685,16 +16724,18 @@ fn builtin_localtime<W: Clone + AsRef<[u64]>>(
         // Try to estimate local offset by looking at current system time
         // This gives us the offset at the current moment (may differ from timestamp's offset due to DST)
         let local_offset = estimate_local_offset(now_utc);
-        let local_secs = match secs.checked_add(local_offset) {
-            Some(s) => s,
-            None if optional => return QueryResult::None,
-            None => return QueryResult::Error(EvalError::datetime_out_of_range()),
+        let local_secs = match ok_or_result::<W, _>(
+            secs.checked_add(local_offset)
+                .ok_or_else(EvalError::datetime_out_of_range),
+            optional,
+        ) {
+            Ok(s) => s,
+            Err(r) => return r,
         };
 
-        let t = match broken_down_time_from_unix_secs(local_secs) {
+        let t = match ok_or_result::<W, _>(broken_down_time_from_unix_secs(local_secs), optional) {
             Ok(t) => t,
-            Err(_) if optional => return QueryResult::None,
-            Err(e) => return QueryResult::Error(e),
+            Err(r) => return r,
         };
 
         let result = vec![
@@ -16892,10 +16933,12 @@ fn builtin_strftime<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             };
 
             // Auto-converted the same way `gmtime` converts a raw number.
-            let t = match broken_down_time_from_unix_secs(timestamp.trunc() as i64) {
+            let t = match ok_or_result::<W, _>(
+                broken_down_time_from_unix_secs(timestamp.trunc() as i64),
+                optional,
+            ) {
                 Ok(t) => t,
-                Err(_) if optional => return QueryResult::None,
-                Err(e) => return QueryResult::Error(e),
+                Err(r) => return r,
             };
             (
                 t.year, t.month, t.day, t.hour, t.minute, t.second, t.weekday, t.yearday,
@@ -17498,10 +17541,9 @@ fn builtin_todate<W: Clone + AsRef<[u64]>>(
 
     // Convert to broken-down time first
     let secs = timestamp.trunc() as i64;
-    let t = match broken_down_time_from_unix_secs(secs) {
+    let t = match ok_or_result::<W, _>(broken_down_time_from_unix_secs(secs), optional) {
         Ok(t) => t,
-        Err(_) if optional => return QueryResult::None,
-        Err(e) => return QueryResult::Error(e),
+        Err(r) => return r,
     };
 
     let result = format!(
@@ -17670,7 +17712,10 @@ fn builtin_to_unix<W: Clone + AsRef<[u64]>>(
     builtin_fromdate::<W>(value, optional)
 }
 
-/// Format Unix timestamp to ISO 8601 string with timezone offset
+/// Format Unix timestamp to ISO 8601 string with timezone offset.
+///
+/// `Err` for a timestamp/offset combination too extreme to convert — see
+/// [`EvalError::datetime_out_of_range`] and [`broken_down_time_from_unix_secs`].
 fn format_datetime_with_offset(timestamp: f64, offset_seconds: i64) -> Result<String, EvalError> {
     // Apply the timezone offset to the timestamp
     let adjusted_secs = (timestamp.trunc() as i64)
@@ -17979,11 +18024,11 @@ fn builtin_tz<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     };
 
     // Format the datetime with the timezone offset
-    let result = match format_datetime_with_offset(timestamp, offset) {
-        Ok(s) => s,
-        Err(_) if optional => return QueryResult::None,
-        Err(e) => return QueryResult::Error(e),
-    };
+    let result =
+        match ok_or_result::<W, _>(format_datetime_with_offset(timestamp, offset), optional) {
+            Ok(s) => s,
+            Err(r) => return r,
+        };
     QueryResult::Owned(OwnedValue::String(result))
 }
 
@@ -31290,12 +31335,13 @@ mod tests {
     }
 
     #[test]
-    fn test_datetime_year_out_of_i32_range_errors_matching_jq_boundary() {
-        // Empirically bisected against real jq (jq-1.7.1): jq starts
-        // erroring on `gmtime`/`strftime` once the resulting year would
-        // overflow a 32-bit int, not merely `i64` — `6e16`/`-6e16` succeed
-        // in jq (and produce this exact date, confirmed byte-for-byte
-        // against `jq`), `7e16`/`-7e16` error, in both directions.
+    fn test_datetime_year_out_of_i32_range_errors_cleanly() {
+        // Empirically bisected against real jq (jq-1.7.1) in this range:
+        // `6e16`/`-6e16` succeed in jq (and produce this exact date,
+        // confirmed byte-for-byte against `jq`), `7e16`/`-7e16` error, in
+        // both directions — real jq's *exact* cutoff is not this clean
+        // (see the divergence test below and `broken_down_time_from_unix_secs`'s
+        // doc comment), but the two agree closely here.
         const MSG: &str = "error converting number of seconds since epoch to datetime";
 
         query!(b"6e16", r"gmtime",
@@ -31310,6 +31356,32 @@ mod tests {
         );
         query!(b"7e16", r"gmtime", QueryResult::Error(e) => assert_eq!(e.message, MSG));
         query!(b"-7e16", r"gmtime", QueryResult::Error(e) => assert_eq!(e.message, MSG));
+    }
+
+    #[test]
+    fn test_datetime_i32_boundary_deliberately_diverges_from_jqs_own_wraparound_quirk() {
+        // Real jq's own boundary is an asymmetric C-implementation
+        // artifact, not a clean "year fits i32" rule — confirmed directly
+        // against jq-1.7.1, in both directions:
+        //   `67767976233532800 | gmtime` (a would-be year of i32::MAX + 1)
+        //   *succeeds* in real jq, silently wrapping to `year: i32::MIN`.
+        //   Reproducing that wraparound would reintroduce exactly the
+        //   "silently wrong value" failure mode #869 exists to eliminate,
+        //   so it's intentionally not replicated — this errors instead.
+        //   `-67768100536262402 | gmtime` conversely *errors* in real jq,
+        //   despite its computed year (`-2147483647`) fitting `i32` —
+        //   jq's cutoff sits at a different, smaller magnitude than i32's
+        //   own range on the negative side. This succeeds here instead,
+        //   under-erroring relative to jq rather than over-erroring; a
+        //   documented, deliberate simplification, not a bug.
+        const MSG: &str = "error converting number of seconds since epoch to datetime";
+
+        query!(b"67767976233532800", r"gmtime", QueryResult::Error(e) => assert_eq!(e.message, MSG));
+        query!(b"-67768100536262402", r"gmtime",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr[0], OwnedValue::Int(-2_147_483_647));
+            }
+        );
     }
 
     #[test]
