@@ -7097,6 +7097,89 @@ fn test_recurse_cond_propagates_halt_from_f() -> Result<()> {
 }
 
 #[test]
+fn test_recurse_f_keeps_own_partial_fanout_before_error_842() -> Result<()> {
+    // Issue #842's primary repro (value position). `f`'s own fan-out
+    // (`.a, .b[0]`) is a generator like any other comma expression: a
+    // later output of that same call erroring must not retroactively
+    // un-emit an earlier one it already produced. Before this fix,
+    // `resolve_recurse`/`builtin_recurse_f` dropped `f`'s own partial
+    // fan-out on error, matching neither jq's semantics nor the codebase's
+    // existing "never un-emit an already-produced output" rule (#530,
+    // #636, #694, #824). Verified against jq 1.7.1:
+    // `echo '{"a":1,"b":2}' | jq -c 'recurse(if . == {"a":1,"b":2} then
+    // (.a, .b[0]) else empty end)'` prints `{"a":1,"b":2}` and `1` to
+    // stdout before erroring, and exits 5.
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            r#"recurse(if . == {"a":1,"b":2} then (.a, .b[0]) else empty end)"#,
+        ],
+        Some(r#"{"a":1,"b":2}"#),
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "{\"a\":1,\"b\":2}\n1\n");
+    assert!(
+        stderr.contains("Cannot index number with number"),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_resolve_recurse_keeps_f_partial_fanout_before_error_842() -> Result<()> {
+    // Issue #842's secondary repro (path position, `resolve_recurse`).
+    // Same underlying bug as the value-position test above, in the
+    // path-tracking evaluator `path(...)` uses. Verified against jq 1.7.1:
+    // `echo '{"a":1,"b":2}' | jq -c 'path(recurse(if . == {"a":1,"b":2}
+    // then (.a, .b[0]) else empty end))'` prints `[]` and `["a"]` to
+    // stdout before erroring, and exits 5.
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            r#"path(recurse(if . == {"a":1,"b":2} then (.a, .b[0]) else empty end))"#,
+        ],
+        Some(r#"{"a":1,"b":2}"#),
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[]\n[\"a\"]\n");
+    assert!(
+        stderr.contains("Cannot index number with number"),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_recurse_f_keeps_own_partial_fanout_subtree_before_error_842() -> Result<()> {
+    // A deeper #842 repro: the successfully-produced child (`.child`)
+    // itself has further children under recursion, so the *entire*
+    // subtree reached from `f`'s own partial fan-out must be visited
+    // before the error — not just the bare partial value. Verified
+    // against jq 1.7.1: `echo
+    // '{"child":{"child":"leaf","leafflag":true},"bad":3}' | jq -c
+    // 'recurse(if (.|type)=="object" then (.child, .bad[0]) else empty
+    // end)'` prints the root, `{"child":"leaf","leafflag":true}`,
+    // `"leaf"`, and `null` (in that order) before erroring, and exits 5.
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            r#"recurse(if (.|type)=="object" then (.child, .bad[0]) else empty end)"#,
+        ],
+        Some(r#"{"child":{"child":"leaf","leafflag":true},"bad":3}"#),
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(
+        stdout,
+        "{\"child\":{\"child\":\"leaf\",\"leafflag\":true},\"bad\":3}\n{\"child\":\"leaf\",\"leafflag\":true}\n\"leaf\"\nnull\n"
+    );
+    assert!(
+        stderr.contains("Cannot index number with number"),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
+#[test]
 fn test_walk_propagates_halt_from_f() -> Result<()> {
     // `builtin_walk`'s `Err(e) => e.into()` arm: `walk_impl` applies `f` to
     // the (already child-processed) value via `eval_owned_expr`, and a halt

@@ -9412,6 +9412,27 @@ fn push_path_components(out: &mut Vec<Expr>, expr: &Expr) {
 /// first (#694): an error/break mid-stream aborts the whole expression here,
 /// it does not silently degrade into "however many outputs came before it."
 ///
+/// A `break $label` aborts this expression exactly like `Error` — whatever a
+/// resolve-node caller was accumulating before this sub-expression is a
+/// separate concern it already handles via its own `PathResolveResult`
+/// prefix, not something this helper tries to preserve. Propagated as
+/// [`EvalEscape::Break`] rather than collapsed into a synthetic "break
+/// $label not in label" `Error`, so a `label` sitting outside the caller
+/// (e.g. across a `path(...)` call boundary) still catches it instead of
+/// seeing a bogus error (#824). A halt must abort this expression exactly
+/// like `Error`/`Break` rather than falling into `collect_owned()`'s "no
+/// outputs" treatment — that would make `del(.[(halt_error(3))])` or a
+/// computed key `.[(halt)]` a silent no-op instead of halting (#791). It
+/// travels as [`EvalEscape::Halt`], its own variant, so no caller can catch
+/// or suppress it as if it were an error. Both apply to a `Partial`'s
+/// trailing control too, same as a bare occurrence (#824).
+///
+/// A thin adapter over [`eval_owned_multi_keep_partial`] that discards
+/// whatever prefix `expr` already produced before the escape — the right
+/// contract for every caller except `recurse`'s own children evaluation
+/// (`builtin_recurse_f`/`builtin_recurse_cond`/`resolve_recurse`), which
+/// call `eval_owned_multi_keep_partial` directly instead (#842).
+///
 /// The one caller that must NOT use this — `update_path`'s `Expr::Identity`
 /// arm, i.e. `|=`'s own update-filter evaluation — uses
 /// [`eval_owned_multi_first`] instead; see that function's doc comment for
@@ -9420,33 +9441,7 @@ fn eval_owned_multi<S: EvalSemantics>(
     expr: &Expr,
     input: &OwnedValue,
 ) -> Result<Vec<OwnedValue>, EvalEscape> {
-    match eval_owned_input::<Vec<u64>, S>(expr, input, false) {
-        QueryResult::Error(e) => Err(e.into()),
-        // A `break $label` aborts this expression exactly like `Error`
-        // above — whatever a resolve-node caller was accumulating before
-        // this sub-expression is a separate concern it already handles via
-        // its own `PathResolveResult` prefix, not something this helper
-        // tries to preserve. Propagated as [`EvalEscape::Break`] rather than
-        // collapsed into a synthetic "break $label not in label" `Error`, so
-        // a `label` sitting outside the caller (e.g. across a `path(...)`
-        // call boundary) still catches it instead of seeing a bogus error
-        // (#824).
-        QueryResult::Break(label) => Err(EvalEscape::Break(label)),
-        // A halt must abort this expression exactly like `Error`/`Break`
-        // above rather than falling into `collect_owned()`'s "no outputs"
-        // treatment below — that would make `del(.[(halt_error(3))])` or a
-        // computed key `.[(halt)]` a silent no-op instead of halting (#791).
-        // It travels as [`EvalEscape::Halt`], its own variant, so no caller
-        // can catch or suppress it as if it were an error.
-        QueryResult::Halt(code) => Err(EvalEscape::Halt(code)),
-        QueryResult::Partial(_, Control::Error(e)) => Err(e.into()),
-        // Same reasoning as the bare `Break` arm above: the prefix this
-        // particular sub-stream produced before breaking is not this
-        // helper's to keep (#824).
-        QueryResult::Partial(_, Control::Break(label)) => Err(EvalEscape::Break(label)),
-        QueryResult::Partial(_, Control::Halt(code)) => Err(EvalEscape::Halt(code)),
-        other => Ok(other.collect_owned()),
-    }
+    eval_owned_multi_keep_partial::<S>(expr, input).map_err(|(_prefix, e)| e)
 }
 
 /// Like [`eval_owned_multi`], but keeps `collect_owned`'s old "just give me
@@ -9490,6 +9485,44 @@ fn eval_owned_multi_first<S: EvalSemantics>(
         // (#791).
         QueryResult::Halt(code) => Err(EvalEscape::Halt(code)),
         other => Ok(other.collect_owned()),
+    }
+}
+
+/// Like [`eval_owned_multi`], but keeps whatever prefix `expr` already
+/// produced before an error/break/halt escaped, instead of discarding it.
+///
+/// `eval_owned_multi`'s all-or-nothing contract is correct for its other
+/// callers (see its own doc comment), so this is a separate function rather
+/// than a change to that one's behavior. The only correct callers are
+/// `recurse`'s own children-evaluation step, value position
+/// (`builtin_recurse_f`/`builtin_recurse_cond`, both evaluate `f` through
+/// this function directly). The path-position sibling, `resolve_recurse`,
+/// needs the same fix but resolves `f` through `resolve_node`/
+/// `resolve_against_cow` instead — a structurally different call whose
+/// `PathResolveResult` already threads a prefix through its own `Err`, so
+/// it applies the equivalent fix without calling this function. `f`'s *own*
+/// fan-out is a generator like any other comma expression, and jq's
+/// backtracking generator semantics mean a later output of that same call
+/// erroring does not retroactively un-emit an earlier one it already
+/// produced (#842). Confirmed against jq 1.7.1:
+/// `recurse(if . == {"a":1,"b":2} then (.a, .b[0]) else empty end)` on
+/// `{"a":1,"b":2}` prints the root *and* `1` (the `.a` branch, produced
+/// before `.b[0]` fails) before erroring — succinctly used to print only the
+/// root.
+///
+/// Built on [`push_owned_values`] (the same "keep every value, surface the
+/// terminal escape separately" primitive [`eval_binary_fanout`] already
+/// uses) rather than a second hand-rolled match over `QueryResult`, so
+/// there is exactly one implementation of that shape in this file.
+fn eval_owned_multi_keep_partial<S: EvalSemantics>(
+    expr: &Expr,
+    input: &OwnedValue,
+) -> Result<Vec<OwnedValue>, (Vec<OwnedValue>, EvalEscape)> {
+    let result = eval_owned_input::<Vec<u64>, S>(expr, input, false);
+    let mut out = Vec::new();
+    match push_owned_values(result, &mut out) {
+        Some(control) => Err((out, control.into())),
+        None => Ok(out),
     }
 }
 
@@ -10204,6 +10237,35 @@ fn resolve_catch<'a, S: EvalSemantics>(
     Ok(out)
 }
 
+/// Shared "defer the escape, queue what's left" step for `recurse`'s three
+/// stack-driven implementations (`resolve_recurse`,
+/// `builtin_recurse_f`/`builtin_recurse_cond`) (#842).
+///
+/// `next` is this node's already-`cond`-gated (where applicable) children —
+/// from a fully-successful `f` call, or from whatever `f` itself produced
+/// before ending in an error/break/halt. Called every iteration regardless
+/// of which case it was: on success `deferred_error` is `None` and this is
+/// just the ordinary "push `next` reversed" step; on an escape, `stack` is
+/// cleared first (nothing already queued may run once an escape is pending
+/// — jq's error/break/halt aborts the *entire* remaining traversal, not
+/// just the current node) before `next` replaces it, and `pending_error` is
+/// set so the caller raises it once `next`'s own subtree(s) have fully
+/// drained — which may itself overwrite `pending_error` with a *later*
+/// call's own escape, correctly superseding this one (it happens first,
+/// chronologically, in jq's real generator order).
+fn queue_recurse_children<T>(
+    stack: &mut Vec<T>,
+    next: Vec<T>,
+    deferred_error: Option<EvalEscape>,
+    pending_error: &mut Option<EvalEscape>,
+) {
+    if let Some(e) = deferred_error {
+        stack.clear();
+        *pending_error = Some(e);
+    }
+    stack.extend(next.into_iter().rev());
+}
+
 /// Fan `recurse(f)` / `recurse(f; cond)` out into one branch per visited
 /// node, depth-first. Uses the same explicit stack
 /// `builtin_recurse_f`/`builtin_recurse_cond` do — including the
@@ -10240,11 +10302,20 @@ fn resolve_catch<'a, S: EvalSemantics>(
 /// output pushes its own copy of `(path, child_value)` into `next`, in the
 /// order `cond`'s outputs were produced.
 ///
-/// An error raised while evaluating `f` or `cond` aborts immediately —
-/// nothing in jq's own definition above catches one — returning whatever
-/// branches were already committed to `outputs`, mirroring `resolve_node`'s
-/// own `Comma` arm (#636; matches `builtin_recurse_f`/`builtin_recurse_cond`,
-/// fixed the same way).
+/// An error raised while evaluating `f` or `cond` aborts the whole
+/// traversal — nothing in jq's own definition above catches one — returning
+/// whatever branches were already committed to `outputs`, mirroring
+/// `resolve_node`'s own `Comma` arm (#636; matches
+/// `builtin_recurse_f`/`builtin_recurse_cond`, fixed the same way). `cond`'s
+/// error still aborts *immediately*, mid-node. `f`'s does not: `f`'s own
+/// fan-out at the current node is a generator like any other comma
+/// expression, so whatever it already produced before erroring still gets
+/// its own full `cond`-gated recursive descent — rebased onto `current`'s
+/// absolute path, the same way a fully-successful `f` call's children
+/// already are — before the deferred error is finally raised (#842;
+/// confirmed against jq 1.7.1: `path(recurse(if . == {"a":1,"b":2} then
+/// (.a, .b[0]) else empty end))` on `{"a":1,"b":2}` prints `[]` *and*
+/// `["a"]` before erroring, not just `[]`).
 ///
 /// One divergence remains, deliberately: this function still does not
 /// stack a null child, where the value evaluator does. `f` is arbitrary
@@ -10278,6 +10349,9 @@ fn resolve_recurse<'a, S: EvalSemantics>(
 ) -> PathResolveResult<'a> {
     let mut outputs: Vec<PathBranch<'a>> = Vec::new();
     let mut stack: Vec<PathBranch<'a>> = vec![(Vec::new(), Cow::Borrowed(value))];
+    // Set by `queue_recurse_children` once `f` itself ends in an
+    // error/break/halt — see that function's doc comment (#842).
+    let mut pending_error: Option<EvalEscape> = None;
     const MAX_ITEMS: usize = 10000;
 
     while !stack.is_empty() && outputs.len() < MAX_ITEMS {
@@ -10286,18 +10360,17 @@ fn resolve_recurse<'a, S: EvalSemantics>(
         // still `O(path length)` per node, `O(d²)` total; #701, unfixed here.
         outputs.push((prefix.clone(), current.clone()));
 
-        // An `f` error aborts immediately rather than pruning `current`'s
-        // children — see the doc comment above (#636). The candidate
-        // children `resolve_node` may have already resolved before hitting
-        // that error are dropped rather than stacked, matching
-        // `eval_owned_multi`'s all-or-nothing contract for
-        // `builtin_recurse_f`/`builtin_recurse_cond`. Goes through
+        // An `f` error aborts the whole traversal — see the doc comment
+        // above (#636) — but only after whatever candidate children
+        // `resolve_node` already resolved before hitting that error get
+        // their own full recursive treatment (#842), deferred below exactly
+        // like `builtin_recurse_f`/`builtin_recurse_cond`. Goes through
         // `resolve_against_cow`, not `resolve_node` directly, because
         // `current` may itself be a `Cow::Owned` value from an earlier
         // step — see that function's doc comment (#668).
-        let children = match resolve_against_cow::<S>(f, current) {
-            Ok(children) => children,
-            Err((_prefix, e)) => return Err((outputs, e)),
+        let (children, deferred_error) = match resolve_against_cow::<S>(f, current) {
+            Ok(children) => (children, None),
+            Err((partial_children, e)) => (partial_children, Some(e)),
         };
 
         // Collected in encounter order, then pushed onto `stack` reversed
@@ -10322,7 +10395,10 @@ fn resolve_recurse<'a, S: EvalSemantics>(
                     // `cond` gates the child, not `current`, and forks once
                     // per truthy output — see the doc comment above (#627).
                     // A `cond` error aborts immediately too (#636), same as
-                    // `f`'s error above.
+                    // `f`'s error above — this arm's own prefix-loss
+                    // (`next`'s already-cond-approved entries built so far
+                    // this node) is pre-existing and out of scope for #842,
+                    // which is specifically about `f`'s fan-out.
                     match eval_owned_multi::<S>(cond, &child_value) {
                         Ok(cond_outputs) => {
                             for c in &cond_outputs {
@@ -10336,10 +10412,24 @@ fn resolve_recurse<'a, S: EvalSemantics>(
                 }
             }
         }
-        stack.extend(next.into_iter().rev());
+
+        queue_recurse_children(&mut stack, next, deferred_error, &mut pending_error);
     }
 
-    Ok(outputs)
+    // A `pending_error` only surfaces once `stack` drains naturally — if
+    // `MAX_ITEMS` cut the loop short instead (`stack` still non-empty), this
+    // matches the pre-existing MAX_ITEMS convention everywhere else in this
+    // file (silent truncation, no error) rather than surfacing an error
+    // whose presence would otherwise depend on where the arbitrary cap
+    // happened to land relative to it (#842 review).
+    if stack.is_empty() {
+        match pending_error {
+            Some(e) => Err((outputs, e)),
+            None => Ok(outputs),
+        }
+    } else {
+        Ok(outputs)
+    }
 }
 
 /// Does `builtin` (one of `values`/`nulls`/`booleans`/.../`scalars`) keep
@@ -12654,6 +12744,9 @@ fn builtin_recurse_f<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 ) -> QueryResult<'a, W> {
     let mut outputs: Vec<OwnedValue> = Vec::new();
     let mut stack: Vec<OwnedValue> = vec![to_owned(&value)];
+    // Set by `queue_recurse_children` once `f`'s own evaluation at some node
+    // ends in an error/break/halt — see that function's doc comment (#842).
+    let mut pending_error: Option<EvalEscape> = None;
     const MAX_ITEMS: usize = 10000;
 
     while !stack.is_empty() && outputs.len() < MAX_ITEMS {
@@ -12666,13 +12759,25 @@ fn builtin_recurse_f<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // (#490). Pushed reversed so the first child stays on top and its
         // whole subtree completes before the next sibling is reached
         // (#635) — see `resolve_recurse`'s doc comment for the general
-        // shape this mirrors. An error aborts immediately, same as jq's
-        // `def r: ., (f | r); r;` (#636) — the values already output no
-        // longer vanish, via the same `partial()` helper #495 uses for
-        // `repeat`/`while`.
-        match eval_owned_multi::<S>(f, &current) {
-            Ok(children) => stack.extend(children.into_iter().rev()),
-            Err(e) => return partial(outputs, e.into()),
+        // shape this mirrors. An error aborts the whole traversal, same as
+        // jq's `def r: ., (f | r); r;` (#636) — but not until whatever `f`
+        // itself already produced at this node has had its own full
+        // recursive treatment (#842); `eval_owned_multi_keep_partial` keeps
+        // that prefix instead of `eval_owned_multi`'s all-or-nothing
+        // contract, which is right for its other callers but not this one.
+        let (children, deferred_error) = match eval_owned_multi_keep_partial::<S>(f, &current) {
+            Ok(children) => (children, None),
+            Err((prefix, e)) => (prefix, Some(e)),
+        };
+        queue_recurse_children(&mut stack, children, deferred_error, &mut pending_error);
+    }
+
+    // See `resolve_recurse`'s matching check for the full rationale (#842
+    // review): a `pending_error` only surfaces once `stack` drains
+    // naturally, not when `MAX_ITEMS` cuts the loop short instead.
+    if stack.is_empty() {
+        if let Some(e) = pending_error {
+            return partial(outputs, e.into());
         }
     }
 
@@ -12720,6 +12825,9 @@ fn builtin_recurse_cond<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 ) -> QueryResult<'a, W> {
     let mut outputs: Vec<OwnedValue> = Vec::new();
     let mut stack: Vec<OwnedValue> = vec![to_owned(&value)];
+    // Set by `queue_recurse_children` once `f` itself ends in an
+    // error/break/halt — see that function's doc comment (#842).
+    let mut pending_error: Option<EvalEscape> = None;
     const MAX_ITEMS: usize = 10000;
 
     while !stack.is_empty() && outputs.len() < MAX_ITEMS {
@@ -12729,12 +12837,15 @@ fn builtin_recurse_cond<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // Every output of `f` becomes exactly one candidate child, in order —
         // a null output is a real value (not "no child"), and an array output
         // is visited as one node (not spliced into its elements) (#490). An
-        // `f` error aborts immediately rather than pruning `current`'s
-        // children, matching jq's `def r: ., (f | select(cond) | r); r;`,
-        // where nothing catches an error from `f` (#636).
-        let children = match eval_owned_multi::<S>(f, &current) {
-            Ok(children) => children,
-            Err(e) => return partial(outputs, e.into()),
+        // `f` error aborts the whole traversal, matching jq's `def r: .,
+        // (f | select(cond) | r); r;`, where nothing catches an error from
+        // `f` (#636) — but only after whatever `f` already produced at this
+        // node (kept via `eval_owned_multi_keep_partial`, #842) has had its
+        // own full `cond`-gated recursive treatment, deferred below exactly
+        // like `builtin_recurse_f`.
+        let (children, deferred_error) = match eval_owned_multi_keep_partial::<S>(f, &current) {
+            Ok(children) => (children, None),
+            Err((prefix, e)) => (prefix, Some(e)),
         };
 
         // Collected in encounter order, then pushed onto `stack` reversed —
@@ -12745,7 +12856,10 @@ fn builtin_recurse_cond<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // `cond` gates the child, not `current` (see doc comment above).
             // A `cond` error aborts immediately too — same jq definition,
             // same reasoning as `f`'s error above (#636) — rather than
-            // pruning just this child the way a falsy `cond` does.
+            // pruning just this child the way a falsy `cond` does. This
+            // arm's own prefix-loss (`next`'s already-cond-approved entries
+            // built so far this node) is pre-existing and out of scope for
+            // #842, which is specifically about `f`'s fan-out.
             let cond_outputs = match eval_owned_multi::<S>(cond, &child) {
                 Ok(cond_outputs) => cond_outputs,
                 Err(e) => return partial(outputs, e.into()),
@@ -12756,7 +12870,17 @@ fn builtin_recurse_cond<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 }
             }
         }
-        stack.extend(next.into_iter().rev());
+
+        queue_recurse_children(&mut stack, next, deferred_error, &mut pending_error);
+    }
+
+    // See `resolve_recurse`'s matching check for the full rationale (#842
+    // review): a `pending_error` only surfaces once `stack` drains
+    // naturally, not when `MAX_ITEMS` cuts the loop short instead.
+    if stack.is_empty() {
+        if let Some(e) = pending_error {
+            return partial(outputs, e.into());
+        }
     }
 
     if outputs.is_empty() {
@@ -34026,12 +34150,191 @@ mod tests {
         // Issue #694's second repro. Confirmed against real jq 1.7.1: errors
         // with "boom" -- before this fix, succinctly silently continued the
         // traversal to `[null,1]`, contradicting `builtin_recurse`'s own
-        // doc comment ("An error aborts immediately", #636).
+        // doc comment ("An error aborts the whole traversal", #636 — reworded
+        // by #842, which added the nuance that `f`'s own partial fan-out is
+        // drained before the error is actually raised).
         query!(
             b"null",
             r#"[recurse(if . == null then (foreach (1,2) as $x (0; .+$x, error("boom"))) else empty end)]"#,
             QueryResult::Error(e) | QueryResult::Partial(_, Control::Error(e)) => {
                 assert_eq!(e.message, "boom");
+            }
+        );
+    }
+
+    #[test]
+    fn test_recurse_f_keeps_own_partial_fanout_before_error_842() {
+        // Issue #842's primary repro (value position, streamed — not
+        // collected into `[...]`, which is atomic in both jq and succinctly
+        // and not part of this bug). Confirmed against real jq 1.7.1:
+        // `echo '{"a":1,"b":2}' | jq -c 'recurse(if . == {"a":1,"b":2} then
+        // (.a, .b[0]) else empty end)'` prints the root *and* `1` (the `.a`
+        // branch of `f`'s fan-out, produced before `.b[0]` errors) before
+        // erroring. Before this fix, succinctly printed only the root,
+        // dropping `1`.
+        assert_eq!(
+            outputs(
+                br#"{"a":1,"b":2}"#,
+                r#"recurse(if . == {"a":1,"b":2} then (.a, .b[0]) else empty end)"#
+            ),
+            vec![r#"{"a":1,"b":2}"#, "1"]
+        );
+        query!(
+            br#"{"a":1,"b":2}"#,
+            r#"recurse(if . == {"a":1,"b":2} then (.a, .b[0]) else empty end)"#,
+            QueryResult::Partial(prefix, Control::Error(e)) => {
+                assert_eq!(
+                    prefix.iter().map(OwnedValue::to_json).collect::<Vec<_>>(),
+                    vec![r#"{"a":1,"b":2}"#.to_string(), "1".to_string()]
+                );
+                assert!(e.message.contains("Cannot index number with number"));
+            }
+        );
+    }
+
+    #[test]
+    fn test_recurse_f_keeps_own_partial_fanout_subtree_before_error_842() {
+        // A deeper repro of #842: the successfully-produced child (`.child`)
+        // itself has further children under recursion, so this checks that
+        // the *entire* subtree reached from `f`'s own partial fan-out is
+        // visited before the error, not just the bare partial value.
+        // Confirmed against real jq 1.7.1:
+        // `echo '{"child":{"child":"leaf","leafflag":true},"bad":3}' | jq -c
+        // 'recurse(if (.|type)=="object" then (.child, .bad[0]) else empty
+        // end)'` prints the root, `{"child":"leaf","leafflag":true}`,
+        // `"leaf"`, and `null` (in that order) before erroring.
+        assert_eq!(
+            outputs(
+                br#"{"child":{"child":"leaf","leafflag":true},"bad":3}"#,
+                r#"recurse(if (.|type)=="object" then (.child, .bad[0]) else empty end)"#
+            ),
+            vec![
+                r#"{"child":{"child":"leaf","leafflag":true},"bad":3}"#,
+                r#"{"child":"leaf","leafflag":true}"#,
+                r#""leaf""#,
+                "null",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_recurse_cond_keeps_f_partial_fanout_before_error_842() {
+        // `builtin_recurse_cond`'s `f`-evaluation arm has the same #842 bug
+        // as `builtin_recurse_f` — kept in parity per this function's own
+        // doc comment. `cond` here is always `true` so it never itself
+        // gates or errors; only `f`'s own fan-out is under test.
+        assert_eq!(
+            outputs(
+                br#"{"a":1,"b":2}"#,
+                r#"recurse(if . == {"a":1,"b":2} then (.a, .b[0]) else empty end; true)"#
+            ),
+            vec![r#"{"a":1,"b":2}"#, "1"]
+        );
+    }
+
+    #[test]
+    fn test_resolve_recurse_keeps_f_partial_fanout_before_error_842() {
+        // Issue #842's path-position repro (`resolve_recurse`, no `cond`).
+        // Confirmed against real jq 1.7.1:
+        // `echo '{"a":1,"b":2}' | jq -c 'path(recurse(if . ==
+        // {"a":1,"b":2} then (.a, .b[0]) else empty end))'` prints `[]`
+        // *and* `["a"]` before erroring. Before this fix, succinctly
+        // printed only `[]`, dropping `["a"]`.
+        assert_eq!(
+            outputs(
+                br#"{"a":1,"b":2}"#,
+                r#"path(recurse(if . == {"a":1,"b":2} then (.a, .b[0]) else empty end))"#
+            ),
+            vec!["[]", r#"["a"]"#]
+        );
+    }
+
+    #[test]
+    fn test_resolve_recurse_cond_keeps_f_partial_fanout_before_error_842() {
+        // Same as the previous test, but with `cond` present (always `true`,
+        // so it never itself gates or errors) — exercises `resolve_recurse`'s
+        // `Some(cond)` arm through the same deferred-error path.
+        assert_eq!(
+            outputs(
+                br#"{"a":1,"b":2}"#,
+                r#"path(recurse(if . == {"a":1,"b":2} then (.a, .b[0]) else empty end; true))"#
+            ),
+            vec!["[]", r#"["a"]"#]
+        );
+    }
+
+    #[test]
+    fn test_recurse_f_keeps_own_partial_fanout_before_break_842() {
+        // The same #842 fix applies uniformly to `break`, not just `error`
+        // (`eval_owned_multi_keep_partial` keeps the prefix for all three
+        // `Control` variants). Confirmed against real jq 1.7.1:
+        // `echo '{"child":{"child":"leaf","leafflag":true},"bad":3}' | jq -c
+        // 'label $out | recurse(if (.|type)=="object" then (.child, (if
+        // .bad then break $out else empty end)) else empty end)'` prints
+        // the root, `{"child":"leaf","leafflag":true}`, and `"leaf"`, then
+        // exits 0 (no error) — the break unwinds to the label with the
+        // prefix already emitted.
+        assert_eq!(
+            outputs(
+                br#"{"child":{"child":"leaf","leafflag":true},"bad":3}"#,
+                r#"label $out | recurse(if (.|type)=="object" then (.child, (if .bad then break $out else empty end)) else empty end)"#
+            ),
+            vec![
+                r#"{"child":{"child":"leaf","leafflag":true},"bad":3}"#,
+                r#"{"child":"leaf","leafflag":true}"#,
+                r#""leaf""#,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_recurse_f_max_items_truncation_suppresses_a_pending_error_842() {
+        // Review of #842's fix: a `pending_error` deferred past `MAX_ITEMS`
+        // items must not surface just because of where the (internal,
+        // non-jq-semantic) 10000-item safety cap happened to land relative
+        // to it — that would make two structurally identical large fan-outs
+        // (this one, vs. the same shape with no trailing error at all)
+        // diverge on whether an error appears, purely as an accident of the
+        // cap. `builtin_recurse_f` already silently truncates at
+        // `MAX_ITEMS` with no error for a non-erroring fan-out (unrelated
+        // to #842, pre-existing convention); this pins that a *deferred*
+        // error is suppressed the same way once the cap truncates the
+        // drain, rather than resurfacing as `QueryResult::Partial`.
+        let large_doc = format!(
+            r#"{{"items":[{}],"bad":5}}"#,
+            (0..15000)
+                .map(|i| i.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        query!(
+            large_doc.as_bytes(),
+            r#"recurse(if type=="object" then (.items[], .bad[0]) else empty end)"#,
+            QueryResult::ManyOwned(vs) => {
+                assert_eq!(vs.len(), 10000);
+            }
+        );
+    }
+
+    #[test]
+    fn test_resolve_recurse_max_items_truncation_suppresses_a_pending_error_842() {
+        // Path-position sibling of the previous test: `resolve_recurse`'s
+        // own `stack.is_empty()` check (its `else` branch, hit only when
+        // `MAX_ITEMS` truncates the drain before a `pending_error` would
+        // otherwise surface) needs the same coverage as
+        // `builtin_recurse_f`'s.
+        let large_doc = format!(
+            r#"{{"items":[{}],"bad":5}}"#,
+            (0..15000)
+                .map(|i| i.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        query!(
+            large_doc.as_bytes(),
+            r#"path(recurse(if type=="object" then (.items[], .bad[0]) else empty end))"#,
+            QueryResult::ManyOwned(vs) => {
+                assert_eq!(vs.len(), 10000);
             }
         );
     }
