@@ -3610,6 +3610,35 @@ fn test_yaml_explicit_non_scalar_key_headline_repro() -> Result<()> {
 }
 
 #[test]
+fn test_yaml_explicit_key_sequence_item_compact_mapping_second_field_877() -> Result<()> {
+    // A different shape from the headline repro above: the key sequence's
+    // first item is itself a compact mapping (`? - a: 1`, not `? - a`). This
+    // arm hardcoded `indent + 3` for the compact mapping's own indent - wrong
+    // even for ordinary single-space spacing (`?` + ` ` + `-` + ` ` is 4
+    // columns, not 3) - so the second field silently landed at the wrong
+    // indent and the `: value` line was swallowed into it instead of closing
+    // the entry. A single-field compact mapping here never exercised the bug
+    // (nothing to land at the wrong indent), which is why it takes a second
+    // field to distinguish this from #877's own primary repro.
+    let input = "? - a: 1\n    b: 2\n: value\n";
+    let (output, exit_code) = run_yq_stdin(".", input, &["-o=json", "-I=0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), r#"{"":"value"}"#);
+    Ok(())
+}
+
+#[test]
+fn test_yaml_explicit_key_sequence_item_compact_mapping_extra_spaces_877() -> Result<()> {
+    // Combines the two #877 shapes: extra spaces after the nested `-`, on
+    // top of the explicit-key wrapper.
+    let input = "? -   a: 1\n      b: 2\n: value\n";
+    let (output, exit_code) = run_yq_stdin(".", input, &["-o=json", "-I=0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), r#"{"":"value"}"#);
+    Ok(())
+}
+
+#[test]
 fn test_yaml_explicit_non_scalar_key_keeps_its_siblings() -> Result<()> {
     // Entries before and after the explicit entry are unaffected.
     let input = "x: 1\n? - a\n  - b\n: value\ny: 2\n";
@@ -5652,57 +5681,32 @@ fn test_compact_mapping_first_field_dispatch_agrees_with_ordinary_mapping_entry_
 // onto `a`'s value, `2` lost entirely).
 
 #[test]
-fn test_compact_mapping_extra_spaces_after_dash_877() -> Result<()> {
-    let (output, exit_code) =
-        run_yq_stdin(".", "-   a: hello\n    b: 2\n", &["-o", "json", "-I0"])?;
-    assert_eq!(exit_code, 0);
-    assert_eq!(output.trim(), r#"[{"a":"hello","b":2}]"#);
-    Ok(())
-}
-
-#[test]
-fn test_compact_mapping_extra_spaces_after_dash_multi_field_877() -> Result<()> {
-    let (output, exit_code) = run_yq_stdin(
-        ".",
-        "-     a: 1\n      b: 2\n      c: 3\n",
-        &["-o", "json", "-I0"],
-    )?;
-    assert_eq!(exit_code, 0);
-    assert_eq!(output.trim(), r#"[{"a":1,"b":2,"c":3}]"#);
-    Ok(())
-}
-
-#[test]
-fn test_compact_mapping_extra_spaces_after_dash_with_flow_first_field_877() -> Result<()> {
-    // Interacts with #864's fix: the compact-mapping indent this dispatches
-    // through is the same one #877 fixes, so a flow-collection first field
-    // (routed through the #864 arms) must also land at the correct column
-    // when the dash has extra spaces.
-    let (output, exit_code) =
-        run_yq_stdin(".", "-   a: {x: 1}\n    b: 2\n", &["-o", "json", "-I0"])?;
-    assert_eq!(exit_code, 0);
-    assert_eq!(output.trim(), r#"[{"a":{"x":1},"b":2}]"#);
-    Ok(())
-}
-
-#[test]
-fn test_compact_mapping_extra_spaces_after_dash_multiple_items_877() -> Result<()> {
-    let (output, exit_code) = run_yq_stdin(
-        ".",
-        "-   a: 1\n    b: 2\n-   a: 3\n    b: 4\n",
-        &["-o", "json", "-I0"],
-    )?;
-    assert_eq!(exit_code, 0);
-    assert_eq!(output.trim(), r#"[{"a":1,"b":2},{"a":3,"b":4}]"#);
-    Ok(())
-}
-
-#[test]
-fn test_compact_mapping_single_space_after_dash_still_works_877() -> Result<()> {
-    // Control: the ordinary single-space case must remain unaffected.
-    let (output, exit_code) = run_yq_stdin(".", "- a: hello\n  b: 2\n", &["-o", "json", "-I0"])?;
-    assert_eq!(exit_code, 0);
-    assert_eq!(output.trim(), r#"[{"a":"hello","b":2}]"#);
+fn test_compact_mapping_dash_spacing_877() -> Result<()> {
+    let cases: &[(&str, &str)] = &[
+        // Extra spaces, the headline repro.
+        ("-   a: hello\n    b: 2\n", r#"[{"a":"hello","b":2}]"#),
+        // Extra spaces, three fields.
+        (
+            "-     a: 1\n      b: 2\n      c: 3\n",
+            r#"[{"a":1,"b":2,"c":3}]"#,
+        ),
+        // Extra spaces + a flow-collection first field: interacts with
+        // #864's fix, since the compact-mapping indent this dispatches
+        // through is the same one #877 fixes.
+        ("-   a: {x: 1}\n    b: 2\n", r#"[{"a":{"x":1},"b":2}]"#),
+        // Extra spaces, multiple compact items in one sequence.
+        (
+            "-   a: 1\n    b: 2\n-   a: 3\n    b: 4\n",
+            r#"[{"a":1,"b":2},{"a":3,"b":4}]"#,
+        ),
+        // Control: the ordinary single-space case must remain unaffected.
+        ("- a: hello\n  b: 2\n", r#"[{"a":"hello","b":2}]"#),
+    ];
+    for (input, expected) in cases {
+        let (output, exit_code) = run_yq_stdin(".", input, &["-o", "json", "-I0"])?;
+        assert_eq!(exit_code, 0, "input: {input:?}");
+        assert_eq!(output.trim(), *expected, "input: {input:?}");
+    }
     Ok(())
 }
 
