@@ -18724,6 +18724,20 @@ fn builtin_isempty<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // case, same as it already does for `Partial(_, Control::Error(_))`
         // (#791).
         QueryResult::Halt(code) => return QueryResult::Halt(code),
+        // Same reasoning for `break`, and the same asymmetry: a bare `Break`
+        // (zero prior output) must propagate — `isempty(break $out)` in real
+        // jq produces no output and exits 0, matching real jq's own `def
+        // isempty(g): label $out | (g|false,break $out), true;`, which never
+        // even asks `g` for a value at all when `g`'s very first "output" is
+        // itself a break. `Partial(_, Control::Break(_))` (`g` already
+        // produced a value before the break) must NOT propagate, though:
+        // real jq's laziness means `g`'s second output is never requested
+        // once the first already answered `isempty`'s own internal `break
+        // $out` — confirmed via oracle (`isempty(1, break $out)` answers
+        // `false` in real jq 1.7.1, same as `isempty(1, halt_error(3))`
+        // above) — so the wildcard arm correctly still answers `false` for
+        // that shape too (#867 follow-up).
+        QueryResult::Break(label) => return QueryResult::Break(label),
         _ => false,
     };
     QueryResult::Owned(OwnedValue::Bool(is_empty))
