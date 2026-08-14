@@ -31224,6 +31224,51 @@ mod tests {
     }
 
     #[test]
+    fn test_datetime_builtins_optional_true_suppresses_extreme_magnitude_error() {
+        // `?` alone can't reach these builtins' own `optional`-guarded
+        // arms: `E?` (`eval_try`) catches `E`'s *result* from the outside,
+        // evaluated with whatever `optional` was already ambient — it does
+        // not force `optional = true` down into a bare builtin call (#693)
+        // — so this exercises the guards directly the same way this file
+        // already tests other builtins' `optional` arms elsewhere (see
+        // `eval_single::<Vec<u64>, JqSemantics>(&expr, cursor.value(),
+        // true)` a few tests up). `local_offset` defaults to 0 in this
+        // test environment (no `TZ` set), so `localtime`'s own
+        // `checked_add` overflow guard isn't reachable this way — that arm
+        // only matters with a non-default `TZ` and a timestamp within
+        // `local_offset` of `i64::MIN`, not practically triggerable
+        // through the public jq CLI/query surface.
+        let json: &[u8] = b"-1e300";
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+
+        assert!(matches!(
+            builtin_gmtime::<Vec<u64>>(cursor.value(), true),
+            QueryResult::None
+        ));
+        assert!(matches!(
+            builtin_localtime::<Vec<u64>>(cursor.value(), true),
+            QueryResult::None
+        ));
+        assert!(matches!(
+            builtin_todate::<Vec<u64>>(cursor.value(), true),
+            QueryResult::None
+        ));
+
+        let fmt_expr = parse(r#""%Y-%m-%d""#).unwrap();
+        assert!(matches!(
+            builtin_strftime::<Vec<u64>, JqSemantics>(&fmt_expr, cursor.value(), true),
+            QueryResult::None
+        ));
+
+        let zone_expr = parse(r#""UTC""#).unwrap();
+        assert!(matches!(
+            builtin_tz::<Vec<u64>, JqSemantics>(&zone_expr, cursor.value(), true),
+            QueryResult::None
+        ));
+    }
+
+    #[test]
     fn test_datetime_extreme_magnitude_errors_instead_of_panicking() {
         // Before #869's fix, an extreme-magnitude timestamp made
         // `broken_down_time_from_unix_secs`'s `secs - 86399` underflow
