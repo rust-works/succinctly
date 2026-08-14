@@ -9493,11 +9493,14 @@ fn eval_owned_multi_first<S: EvalSemantics>(
 ///
 /// `eval_owned_multi`'s all-or-nothing contract is correct for its other
 /// callers (see its own doc comment), so this is a separate function rather
-/// than a change to that one's behavior. The only correct callers are
-/// `recurse`'s own children-evaluation step, value position
-/// (`builtin_recurse_f`/`builtin_recurse_cond`, both evaluate `f` through
-/// this function directly). The path-position sibling, `resolve_recurse`,
-/// needs the same fix but resolves `f` through `resolve_node`/
+/// than a change to that one's behavior. Direct callers today: `recurse`'s
+/// own children-evaluation step in value position (`builtin_recurse_f`/
+/// `builtin_recurse_cond`, both evaluate `f` through this function
+/// directly), and `resolve_leaf`'s non-primitive fallback in path position
+/// (#861 — the same all-or-nothing pitfall reaching `path(...)`-wrapped
+/// expressions whose argument isn't one of the specially-tracked navigation
+/// primitives). The other path-position sibling, `resolve_recurse`, needs
+/// the same fix but resolves `f` through `resolve_node`/
 /// `resolve_against_cow` instead — a structurally different call whose
 /// `PathResolveResult` already threads a prefix through its own `Err`, so
 /// it applies the equivalent fix without calling this function. `f`'s *own*
@@ -9509,6 +9512,14 @@ fn eval_owned_multi_first<S: EvalSemantics>(
 /// `{"a":1,"b":2}` prints the root *and* `1` (the `.a` branch, produced
 /// before `.b[0]` fails) before erroring — succinctly used to print only the
 /// root.
+///
+/// Unlike the two `recurse` callers (which always thread the trailing
+/// escape through to their own caller regardless of prefix length),
+/// `resolve_leaf` deliberately discards a trailing `Break`/`Error` once it
+/// already has a value to check path-shape against — see its own comments —
+/// while still always propagating a trailing `Halt`. Callers of this
+/// function decide that policy themselves; it isn't part of this function's
+/// own contract.
 ///
 /// Built on [`push_owned_values`] (the same "keep every value, surface the
 /// terminal escape separately" primitive [`eval_binary_fanout`] already
@@ -10291,6 +10302,31 @@ fn resolve_leaf<'a, S: EvalSemantics>(
         Ok(values) => (values, None),
         Err((prefix, escape)) => (prefix, Some(escape)),
     };
+    // Halt is never swallowed, however many outputs `expr` already produced:
+    // it is an unconditional process-termination signal (`EvalEscape::Halt`'s
+    // own doc comment), not an ordinary catchable failure. Break/Error below
+    // are provably safe to fold into an ordinary path error instead —
+    // confirmed live against jq 1.7.1, real jq's own `path(...)` never even
+    // reaches a later output's break/error here (see the `1 =>` arm's
+    // comment below) — but that same "real jq never gets there" argument
+    // does not rescue Halt: a script relying on `halt_error` as a hard,
+    // uncatchable abort must not have it silently downgraded into a
+    // `try`/`catch`-able "Invalid path expression" just because this
+    // resolver's own evaluation of `expr` is eager rather than jq's lazy
+    // per-output generator (unlike jq, `eval_owned_multi_keep_partial`
+    // already ran the candidate that halted, side effects included, by the
+    // time control reaches here — the only question left is whether that
+    // already-triggered halt still takes effect, and it must).
+    if let Some(EvalEscape::Halt(code)) = &trailing {
+        return Err((Vec::new(), EvalEscape::Halt(*code)));
+    }
+    // No output prunes the branch — unless there never would have been one
+    // because evaluating `expr` itself broke/errored (Halt excluded, handled
+    // above) before producing anything.
+    let empty_case = |trailing: Option<EvalEscape>| match trailing {
+        Some(escape) => Err((Vec::new(), escape)),
+        None => Ok(Vec::new()),
+    };
     if trackable
         && matches!(
             expr,
@@ -10300,15 +10336,7 @@ fn resolve_leaf<'a, S: EvalSemantics>(
         let mut components = Vec::new();
         push_path_components(&mut components, expr);
         return match values.len() {
-            // No output prunes the branch — unless there never would have
-            // been one because evaluating this leaf itself escaped (these
-            // primitives don't fan out, so a non-empty prefix can't coexist
-            // with a trailing escape in practice, but propagate rather than
-            // silently prune if that ever changes).
-            0 => match trailing {
-                Some(escape) => Err((Vec::new(), escape)),
-                None => Ok(Vec::new()),
-            },
+            0 => empty_case(trailing),
             1 => Ok(vec![(
                 components,
                 Cow::Owned(values.pop().expect("len checked")),
@@ -10326,10 +10354,7 @@ fn resolve_leaf<'a, S: EvalSemantics>(
         };
     }
     match values.len() {
-        0 => match trailing {
-            Some(escape) => Err((Vec::new(), escape)),
-            None => Ok(Vec::new()),
-        },
+        0 => empty_case(trailing),
         // Real jq's `path(...)` checks each output as it streams: the first
         // non-path-shaped value raises "Invalid path expression" immediately,
         // before a later output of the same expression is ever produced —
@@ -10338,9 +10363,10 @@ fn resolve_leaf<'a, S: EvalSemantics>(
         // own repro, `path(paths(if type=="string" then break $out else true
         // end))` on `[1,"x",2]`, raises on `[0]` alone, never reaching the
         // second candidate where the `break` sits). `values[0]` is that first
-        // output regardless of whether `trailing` also carries an escape from
-        // evaluating further here — real jq never reaches whatever would have
-        // caused it, so the escape is discarded rather than propagated.
+        // output regardless of whether `trailing` still carries a Break/Error
+        // from evaluating further here — real jq never reaches whatever would
+        // have caused it, so it's discarded rather than propagated (Halt is
+        // the one exception, already handled above).
         1 => Err((
             Vec::new(),
             EvalError::invalid_path_expression(&values[0]).into(),
