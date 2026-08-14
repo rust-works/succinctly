@@ -9561,25 +9561,39 @@ type PathBranch<'a> = (Vec<Expr>, Cow<'a, OwnedValue>);
 /// semantics (confirmed live: `(.a, 1) = 5` produces no output at all).
 type PathResolveResult<'a> = Result<Vec<PathBranch<'a>>, (Vec<PathBranch<'a>>, EvalEscape)>;
 
+/// Shared `Expr::Comma` element loop for path-context resolvers: resolve
+/// each element via `resolve_one` in order, accumulating branches and
+/// stopping — keeping whatever prefix already resolved — at the first
+/// element that fails. `resolve_node` and `resolve_alternative_left` both
+/// need exactly this control flow and differ only in which resolver each
+/// element goes through, so it lives here once rather than as two copies
+/// that could silently drift out of sync (this exact loop has already
+/// changed shape twice, for #824 and #845).
+fn resolve_comma_with<'a>(
+    exprs: &[Expr],
+    value: &'a OwnedValue,
+    resolve_one: impl Fn(&Expr, &'a OwnedValue) -> PathResolveResult<'a>,
+) -> PathResolveResult<'a> {
+    let mut out = Vec::new();
+    for e in exprs {
+        match resolve_one(e, value) {
+            Ok(branches) => out.extend(branches),
+            Err((prefix, e)) => {
+                out.extend(prefix);
+                return Err((out, e));
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Resolve one path node against one value, yielding a branch per output.
 fn resolve_node<'a, S: EvalSemantics>(expr: &Expr, value: &'a OwnedValue) -> PathResolveResult<'a> {
     match expr {
         Expr::Pipe(exprs) => resolve_seq::<S>(exprs, value),
         Expr::Paren(inner) => resolve_node::<S>(inner, value),
 
-        Expr::Comma(exprs) => {
-            let mut out = Vec::new();
-            for e in exprs {
-                match resolve_node::<S>(e, value) {
-                    Ok(branches) => out.extend(branches),
-                    Err((prefix, e)) => {
-                        out.extend(prefix);
-                        return Err((out, e));
-                    }
-                }
-            }
-            Ok(out)
-        }
+        Expr::Comma(exprs) => resolve_comma_with(exprs, value, resolve_node::<S>),
 
         Expr::Optional(inner) => match inner.as_ref() {
             // `E[K]?` only covers a failure to *index* — evaluating `E` or `K`
@@ -10065,19 +10079,7 @@ fn resolve_alternative_left<'a, S: EvalSemantics>(
 ) -> PathResolveResult<'a> {
     match expr {
         Expr::Paren(inner) => resolve_alternative_left::<S>(inner, value),
-        Expr::Comma(exprs) => {
-            let mut out = Vec::new();
-            for e in exprs {
-                match resolve_alternative_left::<S>(e, value) {
-                    Ok(branches) => out.extend(branches),
-                    Err((prefix, e)) => {
-                        out.extend(prefix);
-                        return Err((out, e));
-                    }
-                }
-            }
-            Ok(out)
-        }
+        Expr::Comma(exprs) => resolve_comma_with(exprs, value, resolve_alternative_left::<S>),
         _ => match resolve_node::<S>(expr, value) {
             Ok(branches) => Ok(branches),
             Err((prefix, EvalEscape::Error(e))) if e.is_invalid_path_expression() => {
