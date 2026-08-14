@@ -7726,6 +7726,91 @@ fn test_recurse_cond_own_multi_output_fanout_kept_before_error_854() -> Result<(
     Ok(())
 }
 
+/// #896: the same "drops an already-produced generator prefix on a later
+/// error" bug class #842/#854 fixed for `recurse`'s own `f`/`cond` loops was
+/// independently live in `resolve_node`'s `Select` arm — `cond` runs
+/// through the all-or-nothing `eval_owned_multi`, so an already-produced
+/// truthy branch was silently dropped instead of printed before the error.
+/// Verified against jq 1.7.1: `echo '1' | jq -c
+/// 'path(select((true, error("x"))))'` prints `[]` to stdout before
+/// erroring, and exits 5.
+#[test]
+fn test_resolve_node_select_keeps_cond_partial_fanout_before_error_896() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", r#"path(select((true, error("x"))))"#], Some("1"))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[]\n");
+    assert!(stderr.contains('x'), "stderr: {stderr:?}");
+    Ok(())
+}
+
+/// #896: same bug class as the `Select` test above, in `resolve_node`'s
+/// `If` arm's `cond` evaluation. Verified against jq 1.7.1: `echo '1' | jq
+/// -c 'path(if (true, error("x")) then . else empty end)'` prints `[]` to
+/// stdout before erroring, and exits 5.
+#[test]
+fn test_resolve_node_if_keeps_cond_partial_fanout_before_error_896() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r#"path(if (true, error("x")) then . else empty end)"#],
+        Some("1"),
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[]\n");
+    assert!(stderr.contains('x'), "stderr: {stderr:?}");
+    Ok(())
+}
+
+/// #896: same bug class, in `resolve_index_expr`'s computed-key evaluation
+/// (`.[EXPR]` where `EXPR` is a multi-output generator). Verified against
+/// jq 1.7.1: `echo '{"a":1,"b":2}' | jq -c 'path(.[("a", error("x"))])'`
+/// prints `["a"]` to stdout before erroring, and exits 5.
+#[test]
+fn test_resolve_index_expr_keeps_key_partial_fanout_before_error_896() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r#"path(.[("a", error("x"))])"#],
+        Some(r#"{"a":1,"b":2}"#),
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[\"a\"]\n");
+    assert!(stderr.contains('x'), "stderr: {stderr:?}");
+    Ok(())
+}
+
+/// #896: same bug class, in `resolve_node`'s `Builtin::GetPath` arm's
+/// argument evaluation. Verified against jq 1.7.1: `echo '{"a":1}' | jq -c
+/// 'path(getpath((["a"], error("x"))))'` prints `["a"]` to stdout before
+/// erroring, and exits 5.
+#[test]
+fn test_resolve_node_getpath_keeps_arg_partial_fanout_before_error_896() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r#"path(getpath((["a"], error("x"))))"#],
+        Some(r#"{"a":1}"#),
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[\"a\"]\n");
+    assert!(stderr.contains('x'), "stderr: {stderr:?}");
+    Ok(())
+}
+
+/// #896: a bare escape (zero prior outputs of the generator) must still
+/// propagate normally at each of the 4 sites above — the partial-keeping
+/// fix must not change this case. Verified against jq 1.7.1: both queries
+/// below print nothing to stdout and exit 5.
+#[test]
+fn test_resolve_node_896_sites_bare_error_still_propagates() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-c", r#"path(select(error("x")))"#], Some("1"))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert!(stderr.contains('x'), "stderr: {stderr:?}");
+
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", r#"path(.[(error("x"))])"#], Some(r#"{"a":1}"#))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert!(stderr.contains('x'), "stderr: {stderr:?}");
+    Ok(())
+}
+
 #[test]
 fn test_walk_propagates_halt_from_f() -> Result<()> {
     // `builtin_walk`'s `Err(e) => e.into()` arm: `walk_impl` applies `f` to
