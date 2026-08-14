@@ -6578,6 +6578,18 @@ fn dv_captures_at<'h>(
 /// support (currently: jq's Perl-style trailing-newline exception for `$`
 /// — see `dv_captures_at`/`dv_is_match` — and the `n` flag's suppression of
 /// zero-length matches — see `first_captures`/`global_captures`).
+///
+/// `suppress_empty`'s skip-forward algorithm only correctly implements the
+/// `n` flag for patterns where an empty match proves no non-empty match is
+/// achievable at that position — true for greedy quantifiers and
+/// alternations whose non-empty branch is preferred first, which covers
+/// every documented jq use of `n`. Lazy quantifiers (`*?`) and alternations
+/// with an empty-matching branch listed first can have a non-empty match at
+/// the *same* position that the skip-forward search never finds, since
+/// finding it needs backtracking semantics (oniguruma's
+/// `ONIG_OPTION_FIND_NOT_EMPTY`) that Rust's non-backtracking `regex` crate
+/// has no equivalent for — the same category of gap as `l`'s missing
+/// `MatchKind::LeftmostLongest` (#920). Tracked as #922.
 #[cfg(feature = "regex")]
 struct JqRegex {
     re: regex::Regex,
@@ -6596,7 +6608,11 @@ impl JqRegex {
     }
 
     fn captures<'h>(&self, input: &'h str) -> Option<regex::Captures<'h>> {
-        first_captures(self, input)
+        if self.suppress_empty {
+            first_captures(self, input)
+        } else {
+            dv_captures_at(&self.re, input, 0, self.needs_trailing_nl_check)
+        }
     }
 
     fn capture_names(&self) -> regex::CaptureNames<'_> {
@@ -6798,31 +6814,62 @@ fn builtin_match<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     }
 }
 
-/// Leftmost match of `re` in `input`, honoring the `n` flag
-/// (`re.suppress_empty`): when set, a zero-length match is skipped in favor
-/// of the next one, the same way `global_captures` skips it when collecting
-/// every match — verified live against jq-1.7.1, e.g. `match("x*";"n")` on
-/// `"aaxaa"` finds `"x"` at offset 2 rather than the empty match at offset
-/// 0. Unlike `global_captures`, stops at the first qualifying match instead
-/// of scanning the whole input.
+/// One step of a forward regex search: the leftmost match of `re` at or
+/// after byte offset `start`, whether it satisfies the `n` flag's policy
+/// (`re.suppress_empty` implies non-empty), and the offset to resume
+/// searching from for the next match. `first_captures` and
+/// `global_captures` are both this step driven in a loop — the former
+/// stops at the first accepted match, the latter collects every accepted
+/// one — so the acceptance test and the empty-match advance-by-one-codepoint
+/// arithmetic exist in exactly one place rather than two copies that could
+/// silently drift (the exact failure mode #906/#915 hit with duplicated
+/// builtin logic elsewhere in this file).
+#[cfg(feature = "regex")]
+fn next_match_step<'h>(
+    re: &JqRegex,
+    input: &'h str,
+    start: usize,
+) -> Option<(regex::Captures<'h>, bool, usize)> {
+    if start > input.len() {
+        return None;
+    }
+    let caps = dv_captures_at(&re.re, input, start, re.needs_trailing_nl_check)?;
+    let m = caps
+        .get(0)
+        .expect("capture group 0 is always present on a match");
+    let (m_start, m_end) = (m.start(), m.end());
+    let accepted = !re.suppress_empty || m_end > m_start;
+    let next_start = if m_end > m_start {
+        m_end
+    } else {
+        match input[m_end..].chars().next() {
+            Some(c) => m_end + c.len_utf8(),
+            None => m_end + 1,
+        }
+    };
+    Some((caps, accepted, next_start))
+}
+
+/// Leftmost match of `re` in `input` satisfying the `n` flag
+/// (`re.suppress_empty`) — verified live against jq-1.7.1, e.g.
+/// `match("x*";"n")` on `"aaxaa"` finds `"x"` at offset 2 rather than the
+/// empty match at offset 0. Unlike `global_captures`, stops at the first
+/// qualifying match instead of scanning the whole input.
+///
+/// `n`'s skip-forward search only finds a non-empty match reachable by
+/// moving to a *later* position, not one reachable only by backtracking to
+/// a different alternative at the *same* position — see the gap documented
+/// on `JqRegex` (#922).
 #[cfg(feature = "regex")]
 fn first_captures<'h>(re: &JqRegex, input: &'h str) -> Option<regex::Captures<'h>> {
     let mut start = 0usize;
-    while start <= input.len() {
-        let caps = dv_captures_at(&re.re, input, start, re.needs_trailing_nl_check)?;
-        let m = caps
-            .get(0)
-            .expect("capture group 0 is always present on a match");
-        let (m_start, m_end) = (m.start(), m.end());
-        if !re.suppress_empty || m_end > m_start {
+    loop {
+        let (caps, accepted, next_start) = next_match_step(re, input, start)?;
+        if accepted {
             return Some(caps);
         }
-        start = match input[m_end..].chars().next() {
-            Some(c) => m_end + c.len_utf8(),
-            None => m_end + 1,
-        };
+        start = next_start;
     }
-    None
 }
 
 /// Find every match of `re` in `input`, including a trailing zero-width
@@ -6835,30 +6882,17 @@ fn first_captures<'h>(re: &JqRegex, input: &'h str) -> Option<regex::Captures<'h
 /// (`re.suppress_empty`), which excludes zero-length matches from the
 /// result while still using them to advance the search position, matching
 /// jq's own behavior (verified live: `[scan(" *";"n")]` on `"a  b   c"`
-/// keeps only the two non-empty runs of spaces).
+/// keeps only the two non-empty runs of spaces). Same known gap as
+/// `first_captures` (#922).
 #[cfg(feature = "regex")]
 fn global_captures<'h>(re: &JqRegex, input: &'h str) -> Vec<regex::Captures<'h>> {
     let mut results = Vec::new();
     let mut start = 0usize;
-    while start <= input.len() {
-        let Some(caps) = dv_captures_at(&re.re, input, start, re.needs_trailing_nl_check) else {
-            break;
-        };
-        let m = caps
-            .get(0)
-            .expect("capture group 0 is always present on a match");
-        let (m_start, m_end) = (m.start(), m.end());
-        if !re.suppress_empty || m_end > m_start {
+    while let Some((caps, accepted, next_start)) = next_match_step(re, input, start) {
+        if accepted {
             results.push(caps);
         }
-        start = if m_end > m_start {
-            m_end
-        } else {
-            match input[m_end..].chars().next() {
-                Some(c) => m_end + c.len_utf8(),
-                None => m_end + 1,
-            }
-        };
+        start = next_start;
     }
     results
 }
