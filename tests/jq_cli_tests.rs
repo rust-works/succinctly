@@ -7326,6 +7326,49 @@ fn test_resolve_recurse_null_child_still_evaluates_f_and_propagates_its_error() 
     Ok(())
 }
 
+/// Second review-driven regression guard: an earlier version of the fix
+/// above evaluated `f` unconditionally on a null `current` (correctly
+/// propagating its error) but left `cond`'s evaluation nested inside the
+/// same `is_null_current` gate as the "queue for further recursion"
+/// decision -- so `cond`'s own error on a candidate child produced from an
+/// already-null `current` was still silently swallowed. This is a
+/// pre-existing gap (confirmed identical on `main` before #856 for the
+/// null-root case specifically, since a non-root value could never reach
+/// `current` while null before this fix), but #856's own restructuring
+/// widened its reach from "root only" to "any null node encountered
+/// during traversal" -- so it's fixed here rather than deferred. Verified
+/// against jq 1.7.1: `null | path(recurse(.a; error("boom")))` streams
+/// `[]` (the root's own path) then raises "boom" and exits 5.
+#[test]
+fn test_resolve_recurse_null_root_still_evaluates_cond_and_propagates_its_error() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_full(&["-n", "null | path(recurse(.a; error(\"boom\")))"], None)?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[]\n");
+    assert_eq!(stderr, "jq: error (at <unknown>): boom\n");
+    Ok(())
+}
+
+/// Companion to the test above, for the *widened* reach specifically: a
+/// null value reached partway through the traversal (not the root) must
+/// also still evaluate `cond` on its own candidate children. Verified
+/// against jq 1.7.1: `{"a":null} | path(recurse(.a; error("boom")))`
+/// streams `[]` (the root's own path) then raises "boom" and exits 5 --
+/// the null child `"a"` is reached, `f`(`.a`) is evaluated on it, and
+/// `cond`'s error on that result aborts the call, all before any further
+/// descent.
+#[test]
+fn test_resolve_recurse_null_child_still_evaluates_cond_and_propagates_its_error() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "path(recurse(.a; error(\"boom\")))"],
+        Some(r#"{"a":null}"#),
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[]\n");
+    assert_eq!(stderr, "jq: error (at <stdin>:0): boom\n");
+    Ok(())
+}
+
 #[test]
 fn test_recurse_f_keeps_own_partial_fanout_subtree_before_error_842() -> Result<()> {
     // A deeper #842 repro: the successfully-produced child (`.child`)

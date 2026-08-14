@@ -10572,19 +10572,24 @@ fn queue_recurse_children<T>(
 /// `["a"]` before erroring, not just `[]`).
 ///
 /// One divergence remains, deliberately: this function still does not
-/// stack a null child, where the value evaluator does. `f` is arbitrary
-/// and nothing says it makes progress: `recurse(.a?)` over `{"a":null}`
-/// reads `null` from `null` forever (confirmed hanging in real jq too —
-/// this is jq's actual semantics, not a bug). The value evaluator's stack
+/// recurse *past* a null node, where the value evaluator does. `f` is
+/// arbitrary and nothing says it makes progress: `recurse(.a?)` over
+/// `{"a":null}` reads `null` from `null` forever (confirmed hanging in
+/// real jq too — this is jq's actual semantics, not a bug). A null node
+/// itself is still stacked and popped like any other (#856: it's emitted,
+/// and `f`/`cond` are still evaluated on it and its own candidate
+/// children, so an error/side effect either raises still propagates) —
+/// only *its children* are never queued for their own further recursion,
+/// which is what actually bounds the growth: the value evaluator's stack
 /// holds bare `OwnedValue`s, so `MAX_ITEMS` bounds it in O(`MAX_ITEMS`)
-/// total. This function's stack holds `(path, value)` pairs, so the same
-/// non-terminating `f` would run to `MAX_ITEMS` with a prefix one
+/// total, while this function's stack holds `(path, value)` pairs, so the
+/// same non-terminating `f` would run to `MAX_ITEMS` with a prefix one
 /// component longer each round — quadratic, and measured at 9 GB for an
 /// 18-byte document before this guard existed. So the two evaluators can
-/// now disagree on this one adversarial shape (path-tracking prunes the
-/// null and stops; value evaluation runs to `MAX_ITEMS`) — both already
-/// deviate from unbounded true-jq semantics via their own `MAX_ITEMS`, so
-/// this is a narrower gap, not a new class of one.
+/// now disagree on this one adversarial shape (path-tracking prunes one
+/// node past the null and stops; value evaluation runs to `MAX_ITEMS`) —
+/// both already deviate from unbounded true-jq semantics via their own
+/// `MAX_ITEMS`, so this is a narrower gap, not a new class of one.
 ///
 /// `current.clone()`/`child_value.clone()` below are `Cow::clone()`, not a
 /// deep copy: cheap (a pointer copy) whenever the value in hand is still
@@ -10661,44 +10666,54 @@ fn resolve_recurse<'a, S: EvalSemantics>(
         // one popped, and its whole subtree completes before the second
         // entry is even reached.
         let mut next: Vec<PathBranch<'a>> = Vec::new();
-        // A null node's own line of descent ends here (see the doc comment
-        // above for why): the children `f` just produced from it are
-        // discarded rather than queued for further recursion, bounding
-        // path-prefix growth instead of relying on natural termination the
-        // way the value evaluator does. Its own path was already credited
-        // by the unconditional `outputs.push` above (#856); only recursion
-        // *into* it is skipped. Gating here -- once popped, in its correct
-        // DFS position -- rather than when the *caller* collected it as a
-        // child keeps sibling order correct: a null child queued alongside
-        // a non-null sibling still waits its own turn on `stack`, so it
-        // can't jump ahead of an earlier sibling's own subtree (confirmed
-        // against jq 1.7.1 with two siblings, one null and one with its
-        // own descendants).
-        if !is_null_current {
-            for (child_components, child_value) in children {
-                let mut path = prefix.clone();
-                path.extend(child_components);
+        for (child_components, child_value) in children {
+            let mut path = prefix.clone();
+            path.extend(child_components);
 
-                match cond {
-                    None => next.push((path, child_value)),
-                    Some(cond) => {
-                        // `cond` gates the child, not `current`, and forks once
-                        // per truthy output — see the doc comment above (#627).
-                        // A `cond` error aborts immediately too (#636), same as
-                        // `f`'s error above — this arm's own prefix-loss
-                        // (`next`'s already-cond-approved entries built so far
-                        // this node) is pre-existing and out of scope for #842,
-                        // which is specifically about `f`'s fan-out.
-                        match eval_owned_multi::<S>(cond, &child_value) {
-                            Ok(cond_outputs) => {
+            match cond {
+                None => {
+                    // A null node's own line of descent ends here (see the
+                    // doc comment above for why): its own path was already
+                    // credited by the unconditional `outputs.push` above
+                    // (#856), so only queueing this child for further
+                    // recursion is skipped, not anything with a side
+                    // effect to lose. Gating here -- once popped, in its
+                    // correct DFS position -- rather than when the
+                    // *caller* collected it as a child keeps sibling order
+                    // correct: a null child queued alongside a non-null
+                    // sibling still waits its own turn on `stack`, so it
+                    // can't jump ahead of an earlier sibling's own subtree.
+                    if !is_null_current {
+                        next.push((path, child_value));
+                    }
+                }
+                Some(cond) => {
+                    // `cond` gates the child, not `current`, and forks once
+                    // per truthy output — see the doc comment above (#627).
+                    // A `cond` error aborts immediately too (#636), same as
+                    // `f`'s error above — this arm's own prefix-loss
+                    // (`next`'s already-cond-approved entries built so far
+                    // this node) is pre-existing and out of scope for #842,
+                    // which is specifically about `f`'s fan-out.
+                    //
+                    // Evaluated unconditionally, even when `current` is
+                    // null: like `f` above, `cond`'s own error/side effect
+                    // on a candidate child must still propagate, matching
+                    // real jq's `select(cond)` semantics (#856 review) --
+                    // only whether an *accepted* child gets queued for
+                    // further recursion is bounded by `is_null_current`,
+                    // not whether `cond` runs on it at all.
+                    match eval_owned_multi::<S>(cond, &child_value) {
+                        Ok(cond_outputs) => {
+                            if !is_null_current {
                                 for c in &cond_outputs {
                                     if c.is_truthy() {
                                         next.push((path.clone(), child_value.clone()));
                                     }
                                 }
                             }
-                            Err(e) => return Err((outputs, e)),
                         }
+                        Err(e) => return Err((outputs, e)),
                     }
                 }
             }
