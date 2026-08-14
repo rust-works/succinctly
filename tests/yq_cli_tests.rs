@@ -5522,11 +5522,10 @@ fn test_compact_mapping_multiple_items_with_flow_first_field_864() -> Result<()>
 
 #[test]
 fn test_compact_mapping_first_field_block_scalar_value_864() -> Result<()> {
-    // Block scalars (`|`/`>`) as a compact mapping's first field already
-    // resolved correctly through the scalar fallback's own indent-aware
-    // parsing before this fix - this arm is a defensive dispatch added for
-    // consistency with `parse_mapping_entry`'s identical arm, not a bug fix.
-    // Kept as a direct oracle-verified regression guard regardless.
+    // Colon-free/hash-free body content happens to resolve correctly even
+    // through the pre-fix scalar fallback, so this shape alone doesn't
+    // prove the dispatch arm does anything - see the sibling test below for
+    // body content that actually distinguishes the two.
     let (output, exit_code) = run_yq_stdin(
         ".",
         "- a: |\n    hello\n    world\n  b: 2\n",
@@ -5534,6 +5533,38 @@ fn test_compact_mapping_first_field_block_scalar_value_864() -> Result<()> {
     )?;
     assert_eq!(exit_code, 0);
     assert_eq!(output.trim(), r#"[{"a":"hello\nworld\n","b":2}]"#);
+    Ok(())
+}
+
+#[test]
+fn test_compact_mapping_first_field_block_scalar_with_colon_and_hash_lines_864() -> Result<()> {
+    // Unlike the plain-content case above, this shape *does* distinguish
+    // the fix from the fallback: the pre-fix scalar scanner doesn't know
+    // it's inside literal block-scalar content, so a body line shaped like
+    // `key: value` or starting with `#` hits the same `:`/`#` terminator
+    // rules real keys/comments use. Pre-fix this silently dropped `b`
+    // entirely for the colon case, and corrupted the hash case into a
+    // spurious `"world":"b"` field - confirmed via before/after bisection
+    // during review. This is the only new-arm test in this file that
+    // actually fails without the `Some(b'|' | b'>')` dispatch arm.
+    let (output, exit_code) = run_yq_stdin(
+        ".",
+        "- a: |\n    key: value\n    world\n  b: 2\n",
+        &["-o", "json", "-I0"],
+    )?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), r#"[{"a":"key: value\nworld\n","b":2}]"#);
+
+    let (output, exit_code) = run_yq_stdin(
+        ".",
+        "- a: |\n    # not a comment\n    world\n  b: 2\n",
+        &["-o", "json", "-I0"],
+    )?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(
+        output.trim(),
+        r##"[{"a":"# not a comment\nworld\n","b":2}]"##
+    );
     Ok(())
 }
 

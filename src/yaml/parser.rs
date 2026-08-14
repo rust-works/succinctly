@@ -2099,7 +2099,16 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 }
                 Some(b'|' | b'>') => {
                     // Block scalar value (`- a: |`) - handles its own BP,
-                    // mirroring `parse_mapping_entry`'s identical arm.
+                    // mirroring `parse_mapping_entry`'s identical arm. Not
+                    // purely defensive: the scalar fallback's plain-scalar
+                    // scanner doesn't know it's inside literal content, so a
+                    // body line shaped like `key: value` or starting with
+                    // `#` (legal in a block literal, meaningless as YAML
+                    // there) hit the same `:`/`#` terminator rules real keys
+                    // and comments use, stopping the scan early and losing
+                    // or corrupting sibling fields exactly like the `[`/`{`
+                    // cases above (confirmed via `git worktree` bisection
+                    // against the pre-#864 fallback during review).
                     self.parse_block_scalar(indent)?;
                 }
                 Some(b'-') if Self::is_ws_break_or_eoi(self.peek_at(1)) => {
