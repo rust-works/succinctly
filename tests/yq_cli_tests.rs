@@ -723,6 +723,27 @@ fn test_assign_preserves_double_quote_escaping_on_untouched_sibling_739() -> Res
     Ok(())
 }
 
+/// #739: `yaml_double_quote_escaped`'s carriage-return and generic
+/// ascii-control-character arms specifically (`\n`/`\t` are covered by
+/// the sibling test above).
+#[test]
+fn test_assign_preserves_double_quote_escaping_of_carriage_return_739() -> Result<()> {
+    let (output, code) = run_yq_stdin(".b = 2", "a: \"cr\\rhere\"\nb: 1\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "a: \"cr\\rhere\"\nb: 2\n");
+    Ok(())
+}
+
+/// #739: `yaml_single_quote_escaped` doubles an embedded single quote per
+/// YAML's own escaping rule.
+#[test]
+fn test_assign_preserves_single_quote_escaping_of_embedded_quote_739() -> Result<()> {
+    let (output, code) = run_yq_stdin(".b = 2", "a: 'it''s'\nb: 1\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "a: 'it''s'\nb: 2\n");
+    Ok(())
+}
+
 /// #852, exercised through a write this time: a write followed by
 /// navigating to a scalar result must still drop that scalar's own
 /// styling at the top level, even though the DOM path now tracks style
