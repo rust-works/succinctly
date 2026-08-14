@@ -3038,6 +3038,38 @@ fn test_isempty_break_after_partial_output_does_not_propagate() -> Result<()> {
     Ok(())
 }
 
+/// `builtin_isempty`'s bare `QueryResult::Error(_)` arm used to answer
+/// `true` unconditionally ("errors count as empty"), swallowing a genuine
+/// uncaught error instead of propagating it (#882). Real jq's `isempty` has
+/// no `try`/`catch` around its argument, so an uncaught error must fail the
+/// whole evaluation. Verified against jq 1.7.1: `jq -n
+/// 'isempty(error("x"))'` exits 5 with no output.
+#[test]
+fn test_isempty_propagates_bare_error_instead_of_answering_true() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-n", "isempty(error(\"x\")), \"after\""], None)?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert!(stderr.contains('x'), "{stderr}");
+    Ok(())
+}
+
+/// The asymmetric counterpart, mirroring `test_isempty_break_after_partial_output_does_not_propagate`:
+/// an error surfacing *after* `g` already produced an output must NOT
+/// propagate, for the same laziness reason - real jq's `isempty` never
+/// requests `g`'s second output once the first already answered its own
+/// internal `break $out`. Verified against jq 1.7.1: `isempty(1,
+/// error("x"))` answers `false` then prints `"after"`, exiting 0. This must
+/// keep passing after the bare-error fix; a mechanical "propagate every
+/// Error/Partial(_, Error)" fix would have broken this case.
+#[test]
+fn test_isempty_error_after_partial_output_does_not_propagate() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-n", "isempty(1, error(\"x\")), \"after\""], None)?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "false\n\"after\"\n");
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
 #[test]
 fn test_setpath_propagates_halt_in_path_argument() -> Result<()> {
     // `builtin_setpath`'s path-array argument used to misreport a halt as
