@@ -1722,6 +1722,47 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         }
     }
 
+    /// Whether `indent` falls in the "gap" between an open compact mapping's
+    /// own recorded indent and its enclosing sequence item's virtual indent
+    /// — e.g. `-   a: hello\n  b: 2\n`, where the compact mapping opened by
+    /// `a` sits at indent 4 (the real column of `a`) but `b`'s line is
+    /// indented only 2, strictly between that and the item's own virtual
+    /// indent 1.
+    ///
+    /// Real yq rejects this input outright as inconsistently indented, but
+    /// the plain indent comparison `close_deeper_indents`/`parse_mapping_entry`
+    /// would otherwise apply treats it as *closing* the compact mapping and
+    /// opening a second, untagged mapping as a sibling directly under the
+    /// same `SequenceItem` — which structurally expects only one value
+    /// child, so every field after the first inconsistent line is silently
+    /// dropped by the JSON serializer (#885). Deliberately narrow, mirroring
+    /// `close_deeper_indents_for_sequence_item`'s own caution: only a
+    /// `Mapping` frame directly on top of a `SequenceItem` frame — the exact
+    /// shape `parse_compact_mapping_entry` creates — not mapping-under-mapping
+    /// nesting, where the same out-of-range indent is genuinely ambiguous
+    /// between two different enclosing scopes.
+    fn compact_mapping_gap_reaches(&self, indent: usize) -> bool {
+        let len = self.indent_stack.len();
+        len >= 2
+            && self.type_stack[len - 1] == NodeType::Mapping
+            && self.type_stack[len - 2] == NodeType::SequenceItem
+            && self.sequence_frame_reaches(len - 1, indent)
+    }
+
+    /// Normalize `indent` to the open compact mapping's own recorded indent
+    /// when [`Self::compact_mapping_gap_reaches`] holds, so
+    /// `parse_mapping_entry` adds an entry to that mapping instead of
+    /// closing it — the same normalization `parse_sequence_item_inner`
+    /// already does for an out-dented sequence continuation (#485). A no-op
+    /// otherwise.
+    fn resolve_compact_mapping_gap_indent(&self, indent: usize) -> usize {
+        if self.compact_mapping_gap_reaches(indent) {
+            *self.indent_stack.last().unwrap()
+        } else {
+            indent
+        }
+    }
+
     /// Close a sequence that was the value of a previous mapping entry.
     ///
     /// When we're about to add a new entry to a mapping at indent N, and the top
@@ -4796,13 +4837,20 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 // parse_explicit_key, and parse_explicit_value eventually
                 // lands here, so fixing property consumption in this one arm
                 // closes most of #664's audit at once (#224).
-                self.close_deeper_indents(indent);
-
+                //
                 // Look ahead to see if this is a `key:` pattern
                 if self.node_properties_prefix_mapping_entry() {
-                    // Let parse_mapping_entry handle the property
+                    // Let parse_mapping_entry handle the property, including
+                    // its own `close_deeper_indents` — using the
+                    // gap-tolerant indent (#885) rather than closing
+                    // unconditionally up front, which would otherwise
+                    // already have closed an open compact mapping this
+                    // line's indent still belongs to before this arm ever
+                    // got to decide.
+                    let indent = self.resolve_compact_mapping_gap_indent(indent);
                     self.parse_mapping_entry(indent)?;
                 } else {
+                    self.close_deeper_indents(indent);
                     // Consume any leading `&anchor` and/or `!tag`, in either
                     // order, for non-mapping-key cases
                     self.parse_node_properties()?;
@@ -4857,6 +4905,8 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 // Check if this is `*alias : value` pattern (alias as mapping key)
                 if self.looks_like_mapping_entry() {
                     // Alias is a key - let parse_mapping_entry handle it
+                    // (gap-tolerant indent, #885 — see the `&`/`!` arm above)
+                    let indent = self.resolve_compact_mapping_gap_indent(indent);
                     self.parse_mapping_entry(indent)?;
                 } else {
                     // Standalone alias value
@@ -4868,6 +4918,8 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 // Check if this looks like a mapping entry (has `: ` on this line)
                 // This handles both quoted keys ("foo": bar) and unquoted keys (foo: bar)
                 if self.looks_like_mapping_entry() {
+                    // Gap-tolerant indent, #885 — see the `&`/`!` arm above.
+                    let indent = self.resolve_compact_mapping_gap_indent(indent);
                     self.parse_mapping_entry(indent)?;
                 } else {
                     // Scalar value - either bare document scalar or value in a container
