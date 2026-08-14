@@ -31766,6 +31766,138 @@ mod tests {
     }
 
     #[test]
+    fn test_mktime_and_strftime_s_error_instead_of_panicking_on_overflow_893() {
+        // #893: unix_secs_from_broken_down_time's era/day/hour/minute/second
+        // arithmetic panicked on overflow for a user-controlled
+        // broken-down-time array element — the mirror-image bug of #869 on
+        // the opposite (broken-down-time -> seconds) conversion direction.
+        // Every field independently reachable through this exact panic
+        // before the fix (confirmed by hand, one field at a time, against
+        // the pre-fix code): year, month, day, hour, minute, and second.
+        const MSG: &str = "error converting number of seconds since epoch to datetime";
+
+        query!(b"null", r"[9223372036854775807,0,1,0,0,0,0,0] | mktime",
+            QueryResult::Error(e) => assert_eq!(e.message, MSG));
+        query!(b"null", r#"[9223372036854775807,0,1,0,0,0,0,0] | strftime("%s")"#,
+            QueryResult::Error(e) => assert_eq!(e.message, MSG));
+        // Extreme *negative* year: takes `era`'s negative-`y` branch (the
+        // positive cases above never do), whose own `y.checked_sub(399)`
+        // overflows for a `y` this close to `i64::MIN`.
+        query!(b"null", r"[-9223372036854775808,6,1,0,0,0,0,0] | mktime",
+            QueryResult::Error(e) => assert_eq!(e.message, MSG));
+        query!(b"null", r"[2020,9223372036854775807,1,0,0,0,0,0] | mktime",
+            QueryResult::Error(e) => assert_eq!(e.message, MSG));
+        query!(b"null", r"[2020,0,9223372036854775807,0,0,0,0,0] | mktime",
+            QueryResult::Error(e) => assert_eq!(e.message, MSG));
+        query!(b"null", r"[2020,0,1,9223372036854775807,0,0,0,0] | mktime",
+            QueryResult::Error(e) => assert_eq!(e.message, MSG));
+        query!(b"null", r"[2020,0,1,0,9223372036854775807,0,0,0] | mktime",
+            QueryResult::Error(e) => assert_eq!(e.message, MSG));
+        query!(b"null", r"[2020,0,1,0,0,9223372036854775807,0,0] | mktime",
+            QueryResult::Error(e) => assert_eq!(e.message, MSG));
+
+        // `?` suppresses it, same as #869's precedent.
+        query!(b"null", r"[9223372036854775807,0,1,0,0,0,0,0] | mktime?", QueryResult::None => {});
+        query!(b"null", r#"[9223372036854775807,0,1,0,0,0,0,0] | strftime("%s")?"#, QueryResult::None => {});
+
+        // Ordinary dates still round-trip correctly (regression guard).
+        query!(b"null", r"[2024,5,15,10,30,0,0,0] | mktime",
+            QueryResult::Owned(OwnedValue::Float(f)) => assert_eq!(f, 1_718_447_400.0));
+
+        // `strftime`'s array branch computes `month` (its own `get_int(1) +
+        // 1` step) eagerly for every format string, not just `%s` — an
+        // extreme month here panicked independently of
+        // unix_secs_from_broken_down_time, before this same overflow ever
+        // reaches that function.
+        query!(b"null", r#"[2020,9223372036854775807,1,0,0,0,0,0] | strftime("%Y")"#,
+            QueryResult::Error(e) => assert_eq!(e.message, MSG));
+    }
+
+    #[test]
+    fn test_parse_simple_tz_offset_errors_gracefully_on_overflow_894() {
+        // #894: `hours * 3600`/`minutes * 60`/the final sign multiply were
+        // unchecked, panicking on a malformed/adversarial `TZ` env var
+        // (reachable independently of the timestamp being converted, since
+        // `TZ` parsing happens before any timestamp arithmetic runs). Tested
+        // directly against the private helper rather than through the `TZ`
+        // env var + `localtime` builtin, since mutating process-global env
+        // vars in a parallel test binary is inherently racy.
+        assert_eq!(parse_simple_tz_offset("EST9999999999999999"), None); // hours overflow
+        assert_eq!(parse_simple_tz_offset("EST-9999999999999999"), None); // hours overflow, negative
+        assert_eq!(
+            parse_simple_tz_offset("EST1:999999999999999999"),
+            None // minutes overflow (hours alone is in range)
+        );
+
+        // Normal input still resolves correctly (positive TZ = west of UTC
+        // = negative offset applied, per this function's own doc comment).
+        assert_eq!(parse_simple_tz_offset("EST5EDT"), Some(-5 * 3600));
+        assert_eq!(parse_simple_tz_offset("EST-5EDT"), Some(5 * 3600));
+    }
+
+    #[test]
+    fn test_dst_heuristics_use_floor_not_truncating_division_pre_1970_895() {
+        // #895: each of is_dst_us_eastern/is_dst_europe/is_dst_australia
+        // hand-duplicated the pre-#889 truncating `secs / 86400` instead of
+        // the shared, floor-corrected broken_down_time_from_unix_secs — so
+        // a pre-1970 timestamp not exactly on a day boundary could resolve
+        // to the *next* day's civil date, giving the wrong DST answer right
+        // at a transition boundary.
+        //
+        // -25833601.0 is one second before 1969-03-08T00:00:00Z (verified
+        // via gmtime: [1969,2,7,23,59,59,...], 0-indexed month=2 is March,
+        // day=7). The old truncating division computed day=8 here (the
+        // *next* day) instead of day=7, wrongly reporting US-Eastern DST
+        // (which starts "day >= 8" in March) a full second early.
+        assert!(!is_dst_us_eastern(-25_833_601.0)); // Mar 7 23:59:59 -> day 7, not yet DST
+        assert!(is_dst_us_eastern(-25_833_600.0)); // Mar 8 00:00:00 -> day 8, DST starts
+
+        // Same mechanism, Europe's "day >= 25" March boundary.
+        // 1969-03-25T00:00:00Z: gmtime confirms [1969,2,25,0,0,0,...].
+        query!(b"-24364800", r"gmtime",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr[1], OwnedValue::Int(2));
+                assert_eq!(arr[2], OwnedValue::Int(25));
+            }
+        );
+        assert!(!is_dst_europe(-24_364_801.0)); // Mar 24 23:59:59 -> day 24, not yet DST
+        assert!(is_dst_europe(-24_364_800.0)); // Mar 25 00:00:00 -> day 25, DST starts
+
+        // Same mechanism, Australia's "day >= 7" October boundary (1969-10-07T00:00:00Z).
+        assert!(!is_dst_australia(-7_430_401.0)); // Oct 6 23:59:59 -> day 6, not yet DST
+        assert!(is_dst_australia(-7_430_400.0)); // Oct 7 00:00:00 -> day 7, DST starts
+
+        // Every other match arm each function has, plus the `Err` (timestamp
+        // too extreme to convert) fallback all three now share — all
+        // timestamps below verified against `gmtime` first.
+        const JAN_1_1970: f64 = 0.0; // [1970,0,1,...] (0-indexed month 0)
+        const JUN_15_2024: f64 = 1_718_445_000.0; // [2024,5,15,...]
+        const OCT_15_2024: f64 = 1_728_950_400.0; // [2024,9,15,...]
+        const NOV_15_2024: f64 = 1_731_628_800.0; // [2024,10,15,...]
+        const DEC_15_2024: f64 = 1_734_220_800.0; // [2024,11,15,...]
+        const APR_15_2024: f64 = 1_713_139_200.0; // [2024,3,15,...]
+        const TOO_EXTREME: f64 = 1e300; // same magnitude #869's own test uses
+
+        assert!(is_dst_us_eastern(JUN_15_2024)); // June -> April..=October, true
+        assert!(!is_dst_us_eastern(NOV_15_2024)); // Nov 15 -> day < 7 is false
+        assert!(!is_dst_us_eastern(DEC_15_2024)); // Dec -> catch-all false
+        assert!(!is_dst_us_eastern(TOO_EXTREME)); // Err -> false fallback
+
+        assert!(is_dst_europe(JUN_15_2024)); // June -> April..=September, true
+        assert!(is_dst_europe(OCT_15_2024)); // Oct 15 -> day < 25 is true
+        assert!(!is_dst_europe(DEC_15_2024)); // Dec -> catch-all false
+        assert!(!is_dst_europe(TOO_EXTREME)); // Err -> false fallback
+
+        assert!(is_dst_australia(OCT_15_2024)); // Oct 15 -> day >= 7 is true
+        assert!(is_dst_australia(NOV_15_2024)); // Nov -> Nov..=March, true
+        assert!(is_dst_australia(DEC_15_2024)); // Dec -> Nov..=March, true
+        assert!(is_dst_australia(JAN_1_1970)); // Jan -> Nov..=March, true
+        assert!(!is_dst_australia(APR_15_2024)); // Apr 15 -> day < 7 is false
+        assert!(!is_dst_australia(JUN_15_2024)); // June -> catch-all false
+        assert!(!is_dst_australia(TOO_EXTREME)); // Err -> false fallback
+    }
+
+    #[test]
     fn test_mktime() {
         // Round-trip: gmtime | mktime should return original timestamp
         query!(b"[1970,0,1,0,0,0,4,0]", r"mktime",
