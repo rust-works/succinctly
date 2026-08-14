@@ -5537,6 +5537,63 @@ fn test_compact_mapping_first_field_block_scalar_value_864() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn test_compact_mapping_first_field_dispatch_agrees_with_ordinary_mapping_entry_864() -> Result<()>
+{
+    // Invariant guard against this exact bug class recurring again.
+    // `parse_compact_mapping_entry` and `parse_mapping_entry` each carry
+    // their own hand-written copy of the `[`/`{`/`|`/`>` inline-value
+    // dispatch arms, and this file has fixed the same "one copy is missing
+    // an arm the other has" defect six times now (#325, #372, #406, #224,
+    // #785, #864) - each individually-correct example test above only
+    // proves *this* dispatch table currently handles *this* shape; none
+    // proves the two tables stay in agreement with each other going
+    // forward. A future edit to one dispatch table without the other -
+    // exactly how #864 happened - passes every existing example test right
+    // up until it ships. This test instead asserts the two tables produce
+    // identical parsed values for the same shape in both positions, so a
+    // future divergence fails here rather than shipping silently (the #106
+    // lesson: "duplicated predicates diverge silently - one definition,
+    // plus a test that the call sites agree").
+    let cases: &[(&str, &str, &str, &str)] = &[
+        (
+            "a: {x: 1, y: 2}\n",
+            ".a",
+            "- a: {x: 1, y: 2}\n  b: 9\n",
+            ".[0].a",
+        ),
+        ("a: [1, 2, 3]\n", ".a", "- a: [1, 2, 3]\n  b: 9\n", ".[0].a"),
+        ("a: {}\n", ".a", "- a: {}\n  b: 9\n", ".[0].a"),
+        ("a: []\n", ".a", "- a: []\n  b: 9\n", ".[0].a"),
+        (
+            "a: |\n  hello\n  world\n",
+            ".a",
+            "- a: |\n    hello\n    world\n  b: 9\n",
+            ".[0].a",
+        ),
+        (
+            "a: >\n  hello\n  world\n",
+            ".a",
+            "- a: >\n    hello\n    world\n  b: 9\n",
+            ".[0].a",
+        ),
+    ];
+    for (ordinary_doc, ordinary_filter, compact_doc, compact_filter) in cases {
+        let (ordinary_out, ordinary_code) =
+            run_yq_stdin(ordinary_filter, ordinary_doc, &["-o", "json", "-I0"])?;
+        let (compact_out, compact_code) =
+            run_yq_stdin(compact_filter, compact_doc, &["-o", "json", "-I0"])?;
+        assert_eq!(ordinary_code, 0, "ordinary doc: {ordinary_doc:?}");
+        assert_eq!(compact_code, 0, "compact doc: {compact_doc:?}");
+        assert_eq!(
+            ordinary_out.trim(),
+            compact_out.trim(),
+            "ordinary mapping entry and compact-item first field disagree for {ordinary_doc:?} vs {compact_doc:?}"
+        );
+    }
+    Ok(())
+}
+
 // ============================================================================
 // Out-dented block sequence continuation (#485)
 // ============================================================================
