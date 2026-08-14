@@ -13403,9 +13403,41 @@ fn builtin_isvalid<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // A halt is never a validity verdict: it must exit the process, not
         // report `true`/`false` and let evaluation continue (#791) — same
         // shape as the `Error`/`None` cases above never being swallowed by
-        // `isempty`.
-        QueryResult::Halt(code) => QueryResult::Halt(code),
-        QueryResult::Partial(_, Control::Halt(code)) => QueryResult::Halt(code),
+        // `isempty`. Both the bare and `Partial`-prefixed shapes propagate
+        // identically, so they're one OR-pattern arm (matching this file's
+        // own precedent, e.g. `QueryResult::is_error`).
+        QueryResult::Halt(code) | QueryResult::Partial(_, Control::Halt(code)) => {
+            QueryResult::Halt(code)
+        }
+        // Same reasoning applies to an unresolved `break`: it must keep
+        // unwinding toward its enclosing `label`, not report `true` and let
+        // evaluation continue (#867) — the `_` catch-all below previously
+        // swallowed both shapes exactly like the `Halt` cases once did.
+        //
+        // Deliberately propagates `Partial(_, Control::Break(_))`
+        // unconditionally too, same as `Halt` above, even though a prior
+        // output *was* produced — this is not an oversight, and does not
+        // need `isempty`'s asymmetric treatment (see that function's own
+        // comment): `isempty`'s asymmetry exists because real jq's own
+        // laziness means a break *after* the first output is never even
+        // reached there. `isvalid` has no such laziness (`eval_single`
+        // evaluates the whole argument eagerly), so the real question is
+        // simply "is a trailing `break` isvalid's concern, or a foreign
+        // escape passing through it" - and unwrapped jq settles that:
+        // `label $out | (1, break $out), "after"` prints `1` then unwinds
+        // to `$out` untouched (exit 0), while the structurally identical
+        // `(1, error("x")), "after"` prints `1` then genuinely fails (exit
+        // 5) - real jq itself only ever "digests" the *error* case into a
+        // pass/fail outcome, never the break case, regardless of what
+        // already ran before it. `isvalid` mirrors that: `Error`/`None`
+        // are its actual domain (digested into `Bool`), `Break` and `Halt`
+        // are both foreign control escapes that must pass through
+        // unconverted no matter what already ran - keeping `Break`
+        // symmetric with the already-established `Halt` arm above, not
+        // with `Error`.
+        QueryResult::Break(label) | QueryResult::Partial(_, Control::Break(label)) => {
+            QueryResult::Break(label)
+        }
         _ => QueryResult::Owned(OwnedValue::Bool(true)),
     }
 }
@@ -18718,6 +18750,20 @@ fn builtin_isempty<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // case, same as it already does for `Partial(_, Control::Error(_))`
         // (#791).
         QueryResult::Halt(code) => return QueryResult::Halt(code),
+        // Same reasoning for `break`, and the same asymmetry: a bare `Break`
+        // (zero prior output) must propagate — `isempty(break $out)` in real
+        // jq produces no output and exits 0, matching real jq's own `def
+        // isempty(g): label $out | (g|false,break $out), true;`, which never
+        // even asks `g` for a value at all when `g`'s very first "output" is
+        // itself a break. `Partial(_, Control::Break(_))` (`g` already
+        // produced a value before the break) must NOT propagate, though:
+        // real jq's laziness means `g`'s second output is never requested
+        // once the first already answered `isempty`'s own internal `break
+        // $out` — confirmed via oracle (`isempty(1, break $out)` answers
+        // `false` in real jq 1.7.1, same as `isempty(1, halt_error(3))`
+        // above) — so the wildcard arm correctly still answers `false` for
+        // that shape too (#867 follow-up).
+        QueryResult::Break(label) => return QueryResult::Break(label),
         _ => false,
     };
     QueryResult::Owned(OwnedValue::Bool(is_empty))
@@ -18739,6 +18785,17 @@ fn builtin_delpaths<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // array" (#791).
         QueryResult::Halt(code) => return QueryResult::Halt(code),
         QueryResult::Partial(_, Control::Halt(code)) => return QueryResult::Halt(code),
+        // Same reasoning for a bare, unresolved `break` (#867 follow-up):
+        // must keep unwinding, not be misreported as the same array-type
+        // error. Deliberately asymmetric with `Halt` above, though:
+        // `Partial(_, Control::Break(_))` (paths_expr already produced a
+        // value before breaking) stays on the wildcard arm below, since
+        // real jq only ever demands paths_expr's *first* output here and
+        // never reaches a later comma branch at all — confirmed via oracle,
+        // `delpaths(1, break $out)` in real jq 1.7.1 raises the same "Paths
+        // must be specified as an array" error this wildcard already
+        // produces, it never even reaches the break.
+        QueryResult::Break(label) => return QueryResult::Break(label),
         _ => return QueryResult::Error(EvalError::paths_must_be_array()),
     };
 

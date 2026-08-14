@@ -2999,6 +2999,45 @@ fn test_isempty_propagates_halt_instead_of_answering_false() -> Result<()> {
     Ok(())
 }
 
+/// Companion to `test_isempty_propagates_halt_instead_of_answering_false`,
+/// for `break` (#867 follow-up): the same "zero prior outputs must
+/// propagate" reasoning applies to a bare `Break`, not just `Halt`.
+/// Verified against jq 1.7.1: `label $out | isempty(break $out), "after"`
+/// produces no output and exits 0.
+#[test]
+fn test_isempty_propagates_bare_break_to_outer_label() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_full(&["-n", "label $out | isempty(break $out), \"after\""], None)?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
+/// The asymmetric counterpart: unlike the bare-break case above, a `break`
+/// that only surfaces *after* `g` already produced an output must NOT
+/// propagate — real jq's `isempty` is defined as `label $out | (g|false,
+/// break $out), true`, so `g`'s second output (the `break`) is never even
+/// requested once its first output already answered `isempty`'s own
+/// internal `break $out`. Verified against jq 1.7.1: `isempty(1, break
+/// $out)` answers `false` then prints `"after"`, exiting 0 — the exact
+/// same shape as `isempty(1, halt_error(3))` staying `false` above it in
+/// this file. This must keep passing after the bare-break fix; a
+/// mechanical "propagate every Break/Partial(_, Break)" fix (mirroring
+/// `isvalid`'s) would have broken this case, which is why `isempty`'s fix
+/// only touches the bare `Break` arm, not `Partial(_, Control::Break(_))`.
+#[test]
+fn test_isempty_break_after_partial_output_does_not_propagate() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-n", "label $out | isempty(1, break $out), \"after\""],
+        None,
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "false\n\"after\"\n");
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
 #[test]
 fn test_setpath_propagates_halt_in_path_argument() -> Result<()> {
     // `builtin_setpath`'s path-array argument used to misreport a halt as
@@ -3031,6 +3070,46 @@ fn test_delpaths_propagates_halt_in_paths_argument() -> Result<()> {
         run_jq_full(&["-n", "{\"a\":1} | delpaths([(halt_error(7))])"], None)?;
     assert_eq!(code, 7, "stdout: {stdout:?} stderr: {stderr:?}");
     assert_eq!(stdout, "");
+    Ok(())
+}
+
+/// Companion to `test_delpaths_propagates_halt_in_paths_argument`, for a
+/// bare `break` (#867 follow-up): must keep unwinding, not be misreported
+/// as "Paths must be specified as an array". Verified against jq 1.7.1:
+/// `label $out | delpaths(break $out), "after"` produces no output and
+/// exits 0.
+#[test]
+fn test_delpaths_propagates_bare_break_to_outer_label() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-n", "label $out | delpaths(break $out), \"after\""],
+        None,
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
+/// The asymmetric counterpart, mirroring `isempty`'s equivalent pair of
+/// tests: unlike the bare-break case above, a `break` surfacing *after*
+/// `paths_expr` already produced a value must NOT propagate. Real jq's
+/// `delpaths` only ever demands `paths_expr`'s first output, so a
+/// non-array first value raises immediately without ever reaching a later
+/// comma branch. Verified against jq 1.7.1: `delpaths(1, break $out)`
+/// raises "Paths must be specified as an array", the same error the bare
+/// non-array case already produces — it never reaches the break.
+#[test]
+fn test_delpaths_break_after_partial_output_does_not_propagate() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-n", "label $out | delpaths(1, break $out), \"after\""],
+        None,
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert!(
+        stderr.contains("Paths must be specified as an array"),
+        "{stderr}"
+    );
     Ok(())
 }
 
@@ -7429,6 +7508,62 @@ fn test_isvalid_propagates_halt_from_partial_argument_result() -> Result<()> {
         run_jq_full(&["-n", "isvalid(1, halt_error(3)), \"after\""], None)?;
     assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
     assert_eq!(stdout, "");
+    Ok(())
+}
+
+/// `builtin_isvalid`'s `QueryResult::Break`/`Partial(_, Control::Break(_))`
+/// arms (#867): mirrors the `Halt` arms directly above -- an unresolved
+/// `break $label` in `isvalid`'s argument must keep unwinding toward its
+/// enclosing `label`, not be swallowed by the old `_ => Bool(true)`
+/// catch-all. `isvalid` is a succinctly-only extension (no real jq to diff
+/// against), but the `break`/`label` semantics it must not interfere with
+/// are real jq's own: this input would produce no output and exit 0 in real
+/// jq if `isvalid` didn't exist to swallow the break at all.
+#[test]
+fn test_isvalid_propagates_bare_break_to_outer_label() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_full(&["-n", "label $out | isvalid(break $out), \"after\""], None)?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
+/// Companion to the bare-break test above, for the `Partial(_,
+/// Control::Break(_))` arm specifically: an argument that produces an
+/// output *before* breaking (`1, break $out`) comes back as
+/// `QueryResult::Partial`, not a bare `Break` -- same distinction
+/// `test_isvalid_propagates_halt_from_partial_argument_result` draws for
+/// `Halt`.
+#[test]
+fn test_isvalid_propagates_break_from_partial_argument_result() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-n", "label $out | isvalid(1, break $out), \"after\""],
+        None,
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
+/// The issue's own repro shape: a `break` surfacing through
+/// `paths(node_filter)` (only reachable as a bare `Break` since #850 fixed
+/// `builtin_paths_filter`'s own control-signal handling) wrapped in
+/// `isvalid`. Confirms the fix is reachable through a realistic nested
+/// builtin call, not just a directly-written `break $out`.
+#[test]
+fn test_isvalid_propagates_break_through_paths_filter() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            r#"label $out | isvalid(paths(if type=="number" then break $out else true end))"#,
+        ],
+        Some(r#"{"a":1}"#),
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(stderr, "");
     Ok(())
 }
 
