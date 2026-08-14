@@ -6576,21 +6576,27 @@ fn dv_captures_at<'h>(
 /// A compiled jq regex plus whatever extra state its builtins need to
 /// replicate jq semantics that Rust's `regex` crate doesn't natively
 /// support (currently: jq's Perl-style trailing-newline exception for `$`
-/// — see `dv_captures_at`/`dv_is_match`).
+/// — see `dv_captures_at`/`dv_is_match` — and the `n` flag's suppression of
+/// zero-length matches — see `first_captures`/`global_captures`).
 #[cfg(feature = "regex")]
 struct JqRegex {
     re: regex::Regex,
     needs_trailing_nl_check: bool,
+    suppress_empty: bool,
 }
 
 #[cfg(feature = "regex")]
 impl JqRegex {
     fn is_match(&self, input: &str) -> bool {
-        dv_is_match(&self.re, input, self.needs_trailing_nl_check)
+        if self.suppress_empty {
+            first_captures(self, input).is_some()
+        } else {
+            dv_is_match(&self.re, input, self.needs_trailing_nl_check)
+        }
     }
 
     fn captures<'h>(&self, input: &'h str) -> Option<regex::Captures<'h>> {
-        dv_captures_at(&self.re, input, 0, self.needs_trailing_nl_check)
+        first_captures(self, input)
     }
 
     fn capture_names(&self) -> regex::CaptureNames<'_> {
@@ -6608,6 +6614,7 @@ fn build_regex(pattern: &str, flags: Option<&str>) -> Result<JqRegex, EvalError>
     let mut pattern = pattern.to_string();
 
     // Apply flags
+    let mut suppress_empty = false;
     if let Some(flags) = flags {
         let mut case_insensitive = false;
         let mut extended = false;
@@ -6628,12 +6635,13 @@ fn build_regex(pattern: &str, flags: Option<&str>) -> Result<JqRegex, EvalError>
                 // `p` enables both s and m; s is a no-op here, so p reduces
                 // to the same effect as m.
                 'p' => dot_matches_newline = true,
-                'g' => {} // global - handled at call site
+                'g' => {}                     // global - handled at call site
+                'n' => suppress_empty = true, // suppress empty matches (#730)
                 // Recognized by real jq but not yet implemented here (#730):
-                // `n` (suppress empty matches) and `l` (POSIX leftmost-longest)
-                // are accepted as valid flag characters, silently without
-                // effect, rather than raising the error below.
-                'n' | 'l' => {}
+                // `l` (POSIX leftmost-longest) is accepted as a valid flag
+                // character, silently without effect, rather than raising
+                // the error below — see #920 for why this one stays open.
+                'l' => {}
                 _ => {
                     // Real jq's own wording, and its own choice: the message
                     // names the whole flags string, not just the offending
@@ -6676,6 +6684,7 @@ fn build_regex(pattern: &str, flags: Option<&str>) -> Result<JqRegex, EvalError>
     Ok(JqRegex {
         re,
         needs_trailing_nl_check,
+        suppress_empty,
     })
 }
 
@@ -6789,13 +6798,44 @@ fn builtin_match<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     }
 }
 
+/// Leftmost match of `re` in `input`, honoring the `n` flag
+/// (`re.suppress_empty`): when set, a zero-length match is skipped in favor
+/// of the next one, the same way `global_captures` skips it when collecting
+/// every match — verified live against jq-1.7.1, e.g. `match("x*";"n")` on
+/// `"aaxaa"` finds `"x"` at offset 2 rather than the empty match at offset
+/// 0. Unlike `global_captures`, stops at the first qualifying match instead
+/// of scanning the whole input.
+#[cfg(feature = "regex")]
+fn first_captures<'h>(re: &JqRegex, input: &'h str) -> Option<regex::Captures<'h>> {
+    let mut start = 0usize;
+    while start <= input.len() {
+        let caps = dv_captures_at(&re.re, input, start, re.needs_trailing_nl_check)?;
+        let m = caps
+            .get(0)
+            .expect("capture group 0 is always present on a match");
+        let (m_start, m_end) = (m.start(), m.end());
+        if !re.suppress_empty || m_end > m_start {
+            return Some(caps);
+        }
+        start = match input[m_end..].chars().next() {
+            Some(c) => m_end + c.len_utf8(),
+            None => m_end + 1,
+        };
+    }
+    None
+}
+
 /// Find every match of `re` in `input`, including a trailing zero-width
 /// match immediately after a non-empty one — which `Regex::captures_iter`
 /// deliberately suppresses (regex-automata treats it as overlapping the
 /// prior match's end bound). Mirrors jq's own C matching loop: advance to
 /// the match end, or one character past it when the match was empty. Also
 /// honors jq's Perl-style trailing-newline exception for `$` via
-/// `dv_captures_at` — see its doc comment.
+/// `dv_captures_at` — see its doc comment — and the `n` flag
+/// (`re.suppress_empty`), which excludes zero-length matches from the
+/// result while still using them to advance the search position, matching
+/// jq's own behavior (verified live: `[scan(" *";"n")]` on `"a  b   c"`
+/// keeps only the two non-empty runs of spaces).
 #[cfg(feature = "regex")]
 fn global_captures<'h>(re: &JqRegex, input: &'h str) -> Vec<regex::Captures<'h>> {
     let mut results = Vec::new();
@@ -6808,7 +6848,9 @@ fn global_captures<'h>(re: &JqRegex, input: &'h str) -> Vec<regex::Captures<'h>>
             .get(0)
             .expect("capture group 0 is always present on a match");
         let (m_start, m_end) = (m.start(), m.end());
-        results.push(caps);
+        if !re.suppress_empty || m_end > m_start {
+            results.push(caps);
+        }
         start = if m_end > m_start {
             m_end
         } else {
