@@ -3073,6 +3073,46 @@ fn test_delpaths_propagates_halt_in_paths_argument() -> Result<()> {
     Ok(())
 }
 
+/// Companion to `test_delpaths_propagates_halt_in_paths_argument`, for a
+/// bare `break` (#867 follow-up): must keep unwinding, not be misreported
+/// as "Paths must be specified as an array". Verified against jq 1.7.1:
+/// `label $out | delpaths(break $out), "after"` produces no output and
+/// exits 0.
+#[test]
+fn test_delpaths_propagates_bare_break_to_outer_label() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-n", "label $out | delpaths(break $out), \"after\""],
+        None,
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
+/// The asymmetric counterpart, mirroring `isempty`'s equivalent pair of
+/// tests: unlike the bare-break case above, a `break` surfacing *after*
+/// `paths_expr` already produced a value must NOT propagate. Real jq's
+/// `delpaths` only ever demands `paths_expr`'s first output, so a
+/// non-array first value raises immediately without ever reaching a later
+/// comma branch. Verified against jq 1.7.1: `delpaths(1, break $out)`
+/// raises "Paths must be specified as an array", the same error the bare
+/// non-array case already produces — it never reaches the break.
+#[test]
+fn test_delpaths_break_after_partial_output_does_not_propagate() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-n", "label $out | delpaths(1, break $out), \"after\""],
+        None,
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert!(
+        stderr.contains("Paths must be specified as an array"),
+        "{stderr}"
+    );
+    Ok(())
+}
+
 #[test]
 fn test_nth_stream_propagates_halt_in_n_argument() -> Result<()> {
     // The two-argument `nth(n; expr)` form matched its `n` argument's result
