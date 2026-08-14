@@ -12246,22 +12246,45 @@ fn eval_owned_fast_path(
     }
 }
 
-/// Same evaluator as [`eval_owned_expr`], but keeps a `break` distinguishable
-/// from a real error via [`Control`] instead of collapsing it into a
-/// synthetic "break $label not in label" [`EvalError`] — needed by callers
-/// that run their operand through a loop of their own (`while`, `until`,
-/// `repeat`, `reduce`, `foreach`'s per-iteration UPDATE/EXTRACT) and must let
-/// a `break $label` inside that operand reach its enclosing `label` (#575).
-/// Same fix [`eval_slice_bound`] already applies to slice bounds.
-fn eval_owned_expr_ctrl<S: EvalSemantics>(
+/// Collapse a multi-output `Vec<OwnedValue>` into the single value
+/// [`eval_owned_expr_ctrl_inner`]'s callers represent a fan-out as: one
+/// element unwraps bare, more than one becomes a JSON array. Shared so the
+/// success path (`Many`/`ManyOwned`) and a `Partial`'s already-streamed
+/// prefix always agree on the same representation (#855).
+fn collapse_owned_values(vs: Vec<OwnedValue>) -> OwnedValue {
+    if vs.len() == 1 {
+        vs.into_iter().next().unwrap()
+    } else {
+        OwnedValue::Array(vs)
+    }
+}
+
+/// Shared evaluation core for [`eval_owned_expr_ctrl`] and
+/// [`eval_owned_expr_ctrl_keep_partial`]: runs `expr` against `input` and
+/// collapses every success shape (`One`/`Owned`/`Many`/`ManyOwned`/`None`)
+/// identically for both callers. The two wrappers below only differ in what
+/// they do with a `QueryResult::Partial`'s already-streamed prefix, so that
+/// is the only case surfaced distinctly here — as `Err((vs, control))` with
+/// a non-empty `vs` — with every other escape carrying `Err((Vec::new(),
+/// control))` since there is no prefix to represent.
+///
+/// The prefix travels as a `Vec<OwnedValue>`, not a collapsed `OwnedValue`
+/// directly (even though every caller immediately collapses it via
+/// [`collapse_owned_values`] when it wants it at all): embedding an
+/// `OwnedValue` straight in the `Err` tuple made it large enough to trip
+/// clippy's `result_large_err` (`OwnedValue` carries a `String`/`Vec`/
+/// `IndexMap` payload inline), which every other `Err`-with-prefix helper in
+/// this file (e.g. [`eval_owned_multi_keep_partial`]) already avoids by
+/// keeping the prefix as a `Vec`.
+fn eval_owned_expr_ctrl_inner<S: EvalSemantics>(
     expr: &Expr,
     input: &OwnedValue,
     optional: bool,
-) -> Result<OwnedValue, Control> {
+) -> Result<OwnedValue, (Vec<OwnedValue>, Control)> {
     if let Some(result) = eval_owned_fast_path(expr, input, optional) {
         return result
             .map(|v| v.unwrap_or(OwnedValue::Null))
-            .map_err(Control::Error);
+            .map_err(|e| (Vec::new(), Control::Error(e)));
     }
 
     // Create a synthetic JSON from the owned value
@@ -12283,39 +12306,89 @@ fn eval_owned_expr_ctrl<S: EvalSemantics>(
         QueryResult::One(v) => Ok(to_owned(&v)),
         QueryResult::OneCursor(_) => unreachable!(),
         QueryResult::Owned(v) => Ok(v),
-        QueryResult::Many(vs) => {
-            if vs.len() == 1 {
-                Ok(to_owned(&vs[0]))
-            } else {
-                Ok(OwnedValue::Array(vs.iter().map(to_owned).collect()))
-            }
-        }
-        QueryResult::ManyOwned(vs) => {
-            if vs.len() == 1 {
-                Ok(vs.into_iter().next().unwrap())
-            } else {
-                Ok(OwnedValue::Array(vs))
-            }
-        }
+        QueryResult::Many(vs) => Ok(collapse_owned_values(vs.iter().map(to_owned).collect())),
+        QueryResult::ManyOwned(vs) => Ok(collapse_owned_values(vs)),
         QueryResult::None => Ok(OwnedValue::Null),
-        QueryResult::Error(e) => Err(Control::Error(e)),
-        QueryResult::Break(label) => Err(Control::Break(label)),
-        QueryResult::Halt(code) => Err(Control::Halt(code)),
-        // A trailing halt is never droppable, unlike the `Error`/`Break`
-        // cases below: `repeat((. + 1, halt_error(3)))` must exit 3, not run
-        // to the iteration cap with the halt discarded once per round (#791).
-        QueryResult::Partial(_, Control::Halt(code)) => Err(Control::Halt(code)),
-        // Same collapse-to-single-or-array policy as `Many`/`ManyOwned`
-        // above; the trailing `Error`/`Break` is dropped, consistent with how
-        // this function already doesn't fork over a multi-output update (a
-        // separate, pre-existing limitation, not #400/#494's concern).
-        QueryResult::Partial(vs, _control) => {
-            if vs.len() == 1 {
-                Ok(vs.into_iter().next().unwrap())
-            } else {
-                Ok(OwnedValue::Array(vs))
-            }
-        }
+        QueryResult::Error(e) => Err((Vec::new(), Control::Error(e))),
+        QueryResult::Break(label) => Err((Vec::new(), Control::Break(label))),
+        QueryResult::Halt(code) => Err((Vec::new(), Control::Halt(code))),
+        QueryResult::Partial(vs, control) => Err((vs, control)),
+    }
+}
+
+/// Same evaluator as [`eval_owned_expr`], but keeps a `break` distinguishable
+/// from a real error via [`Control`] instead of collapsing it into a
+/// synthetic "break $label not in label" [`EvalError`] — needed by callers
+/// that run their operand through a loop of their own (`while`, `until`,
+/// `repeat`, `reduce`, `foreach`'s per-iteration UPDATE/EXTRACT) and must let
+/// a `break $label` inside that operand reach its enclosing `label` (#575).
+/// Same fix [`eval_slice_bound`] already applies to slice bounds.
+///
+/// A `QueryResult::Partial`'s trailing `Error`/`Break` is dropped here,
+/// consistent with how this function already doesn't fork over a
+/// multi-output update (a separate, pre-existing limitation, not #400/#494's
+/// concern) — only a trailing `Halt` is never droppable:
+/// `repeat((. + 1, halt_error(3)))` must exit 3, not run to the iteration
+/// cap with the halt discarded once per round (#791). Callers that need the
+/// `Error`/`Break` case preserved too (`walk`/`repeat`, #855) use
+/// [`eval_owned_expr_ctrl_keep_partial`] instead.
+fn eval_owned_expr_ctrl<S: EvalSemantics>(
+    expr: &Expr,
+    input: &OwnedValue,
+    optional: bool,
+) -> Result<OwnedValue, Control> {
+    match eval_owned_expr_ctrl_inner::<S>(expr, input, optional) {
+        Ok(v) => Ok(v),
+        Err((_prefix, control @ Control::Halt(_))) => Err(control),
+        Err((prefix, _control)) if !prefix.is_empty() => Ok(collapse_owned_values(prefix)),
+        Err((_, control)) => Err(control),
+    }
+}
+
+/// Same evaluator as [`eval_owned_expr_ctrl`], but a `QueryResult::Partial`
+/// propagates its trailing [`Control`] as an `Err` instead of collapsing the
+/// already-streamed prefix into an `Ok` and silently dropping the escape
+/// (#855) — the mirror image of #842/#853's `recurse` fix
+/// ([`eval_owned_multi_keep_partial`]), for `walk`/`repeat`'s own
+/// single-value-collapsing evaluator instead of `recurse`'s
+/// multi-output accumulator: `walk(1, error("bad"))` on a leaf used to
+/// return `Ok(1)` (the error vanished); `repeat((1, error("bad")))` used to
+/// treat the error as just another round's value and loop to
+/// `MAX_ITERATIONS`.
+///
+/// Deliberately scoped to `walk_impl`/`eval_repeat` rather than changing
+/// [`eval_owned_expr_ctrl`] itself: that function also backs
+/// `resolve_limit`'s/`ParentN`'s numeric bound, value-constructing
+/// `Object`/`Array`/`Literal` evaluation, and `$var` lookups, none of which
+/// were audited here for whether flipping `Partial` to always-`Err` would
+/// change their behavior — same narrow-scoping precedent #853 used when it
+/// added `eval_owned_multi_keep_partial` as a `recurse`-scoped sibling
+/// rather than changing `eval_owned_multi` itself.
+///
+/// Neither `walk` nor `repeat` fork over a multi-output `f` even on the
+/// success path today — a related but distinct limitation, out of scope
+/// here — so a `Partial`'s already-streamed prefix is dropped on this path
+/// too, exactly like a bare (non-`Partial`) `Error`/`Break`/`Halt`: only the
+/// escape survives, never the values that preceded it.
+fn eval_owned_expr_ctrl_keep_partial<S: EvalSemantics>(
+    expr: &Expr,
+    input: &OwnedValue,
+    optional: bool,
+) -> Result<OwnedValue, Control> {
+    eval_owned_expr_ctrl_inner::<S>(expr, input, optional).map_err(|(_prefix, control)| control)
+}
+
+/// Map a [`Control`] the way [`eval_owned_expr`]/[`walk_impl`] both want:
+/// `Break` collapses into a synthetic "not in label" [`EvalError`] rather
+/// than propagating as [`EvalEscape::Break`] (see [`EvalEscape`]'s own doc
+/// comment — auditing every call site for the real-`Break` fix is #833,
+/// not this one), while `Halt` keeps its own variant so `try`/`catch` never
+/// sees it.
+fn control_to_eval_escape(control: Control) -> EvalEscape {
+    match control {
+        Control::Error(e) => e.into(),
+        Control::Break(label) => EvalError::new(format!("break ${label} not in label")).into(),
+        Control::Halt(code) => EvalEscape::Halt(code),
     }
 }
 
@@ -12325,15 +12398,7 @@ fn eval_owned_expr<S: EvalSemantics>(
     input: &OwnedValue,
     optional: bool,
 ) -> Result<OwnedValue, EvalEscape> {
-    eval_owned_expr_ctrl::<S>(expr, input, optional).map_err(|control| match control {
-        Control::Error(e) => e.into(),
-        Control::Break(label) => EvalError::new(format!("break ${label} not in label")).into(),
-        // A halt reached here (e.g. inside `reduce`/`foreach`'s INIT/UPDATE
-        // via a caller that uses `eval_owned_expr` rather than
-        // `eval_owned_expr_ctrl`, which carries `Control` through losslessly)
-        // keeps its own `EvalEscape` variant, so `try`/`catch` never sees it.
-        Control::Halt(code) => EvalEscape::Halt(code),
-    })
+    eval_owned_expr_ctrl::<S>(expr, input, optional).map_err(control_to_eval_escape)
 }
 
 /// Evaluate an expression with an OwnedValue as input, preserving the full
@@ -12978,8 +13043,17 @@ fn eval_repeat<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     const MAX_ITERATIONS: usize = 1000; // Limit to prevent infinite loops
 
     for _ in 0..MAX_ITERATIONS {
-        // Evaluate expr with the original input each time
-        match eval_owned_expr_ctrl::<S>(expr, &owned, optional) {
+        // Evaluate expr with the original input each time. Uses
+        // `eval_owned_expr_ctrl_keep_partial`, not `eval_owned_expr_ctrl`:
+        // when `expr` is a comma expression that streams some values before
+        // erroring/breaking, the trailing escape must still surface instead
+        // of being silently dropped just because this round produced
+        // *something* first (#855) — same "keep values, drop the escape"
+        // bug class #842/#853 fixed for `recurse`. This round's own partial
+        // output is not preserved (neither `repeat` nor `walk` fork over a
+        // multi-output `expr` even on success today — a separate,
+        // pre-existing limitation), only the escape.
+        match eval_owned_expr_ctrl_keep_partial::<S>(expr, &owned, optional) {
             Ok(new_val) => outputs.push(new_val),
             // The values already output no longer vanish, and an error with
             // no prior output surfaces as an error rather than empty output
@@ -13355,8 +13429,20 @@ fn walk_impl<S: EvalSemantics>(
         other => other,
     };
 
-    // Then apply f to the processed value
-    eval_owned_expr::<S>(f, &processed, optional)
+    // Then apply f to the processed value. Uses
+    // `eval_owned_expr_ctrl_keep_partial`, not the plain `eval_owned_expr`:
+    // when `f` is a comma expression that streams some values before
+    // erroring/breaking, the trailing escape must still surface instead of
+    // being silently dropped just because `f` produced *something* first
+    // (#855) — `walk(1, error("bad"))` on a leaf used to return `Ok(1)`,
+    // the error vanishing entirely. Same "keep values, drop the escape" bug
+    // class #842/#853 fixed for `recurse`. `walk` does not fork over a
+    // multi-output `f` even on success today (a separate, pre-existing
+    // limitation), so the partial prefix itself is not preserved here,
+    // only the escape — mirrors `control_to_eval_escape`'s existing
+    // Break-to-synthetic-error collapse so this fix doesn't also change
+    // `walk`'s (out-of-scope, #833-tracked) `break` handling.
+    eval_owned_expr_ctrl_keep_partial::<S>(f, &processed, optional).map_err(control_to_eval_escape)
 }
 
 /// Builtin: isvalid(expr) - check if expr succeeds without errors.
@@ -34035,6 +34121,40 @@ mod tests {
                     panic!("expected items array");
                 }
             }
+        );
+    }
+
+    #[test]
+    fn test_walk_f_multi_field_comma_uses_borrowed_many_path_855() {
+        // #855's `eval_owned_expr_ctrl_inner` has two multi-output success
+        // arms: `ManyOwned` for a computed/literal fan-out (already covered
+        // by e.g. `test_walk` and friends) and `QueryResult::Many` for a
+        // *structural* fan-out -- borrowed cursor values read straight off
+        // the temp reindexed document, taken by a plain field-selecting
+        // comma like `.a, .b`. `walk`/`repeat` don't fork over a
+        // multi-output `f` on success (pre-existing, out of scope for
+        // #855), so both arms collapse to the same JSON-array
+        // representation via `collapse_owned_values`.
+        query!(br#"{"a":1,"b":2}"#, r#"walk(if type=="object" then (.a, .b) else . end)"#,
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr, vec![OwnedValue::Int(1), OwnedValue::Int(2)]);
+            }
+        );
+    }
+
+    #[test]
+    fn test_collapse_owned_values_855() {
+        // Direct unit coverage of `collapse_owned_values`'s two branches
+        // (shared by `eval_owned_expr_ctrl`'s success path and its legacy
+        // wrapper's single-item `Partial`-prefix collapse, #855): exactly
+        // one value unwraps bare; more than one becomes a JSON array.
+        assert_eq!(
+            collapse_owned_values(vec![OwnedValue::Int(1)]),
+            OwnedValue::Int(1)
+        );
+        assert_eq!(
+            collapse_owned_values(vec![OwnedValue::Int(1), OwnedValue::Int(2)]),
+            OwnedValue::Array(vec![OwnedValue::Int(1), OwnedValue::Int(2)])
         );
     }
 

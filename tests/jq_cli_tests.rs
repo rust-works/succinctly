@@ -7195,6 +7195,69 @@ fn test_walk_propagates_halt_from_f() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn test_walk_propagates_trailing_error_after_a_partial_fanout_855() -> Result<()> {
+    // Issue #855: `eval_owned_expr_ctrl`'s `Partial(vs, _control)` arm kept
+    // `f`'s already-streamed values but silently dropped the trailing
+    // `Error`/`Break`, so a `walk(f)` whose `f` was a comma expression that
+    // produced output *before* erroring looked like a clean, error-free
+    // result. `walk`/`repeat` don't fork over a multi-output `f` even on
+    // success (a separate, pre-existing limitation), so the fix
+    // (`eval_owned_expr_ctrl_keep_partial`) surfaces the escape without
+    // also surfacing that partial prefix -- exit code now matches jq, even
+    // though succinctly's non-forking `walk` cannot also print the leading
+    // `1` real jq does. Verified against jq 1.7.1: `echo 5 | jq -c
+    // 'walk(1, error("bad"))'` prints `1` then errors, exit 5 (pre-fix,
+    // succinctly printed `1` and exited 0).
+    let (stdout, stderr, code) = run_jq_full(&["-c", r#"walk(1, error("bad"))"#], Some("5"))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert!(stderr.contains("bad"), "stderr: {stderr:?}");
+    Ok(())
+}
+
+#[test]
+fn test_repeat_propagates_trailing_error_after_a_partial_fanout_855() -> Result<()> {
+    // Issue #855's `repeat` repro: same `eval_owned_expr_ctrl` bug as above,
+    // reached through `eval_repeat` instead of `walk_impl`. Before the fix,
+    // `repeat`'s per-round `Partial` collapsed to `Ok` and the error simply
+    // never surfaced, so this looped silently to `MAX_ITERATIONS` instead of
+    // raising. Verified against jq 1.7.1: `echo null | jq -c 'limit(3;
+    // repeat((1, error("bad"))))'` prints `1` then errors, exit 5 (pre-fix,
+    // succinctly printed `1` three times and exited 0).
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r#"limit(3; repeat((1, error("bad"))))"#],
+        Some("null"),
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert!(stderr.contains("bad"), "stderr: {stderr:?}");
+    Ok(())
+}
+
+#[test]
+fn test_repeat_break_after_a_partial_fanout_reaches_label_instead_of_looping_855() -> Result<()> {
+    // Same #855 bug class, but with a `break $label` (not an `error`) as
+    // the trailing control after a partial fan-out -- confirms the fix
+    // isn't `Control::Error`-specific. Pre-fix, succinctly's `outputs.push`
+    // arm treated the collapsed partial value as a normal round result and
+    // kept looping, printing `1` for all 3 rounds `limit` allowed instead
+    // of stopping on the very first one. `break`, unlike `error`, is caught
+    // by the enclosing `label` here, so this is not jq-comparable on exit
+    // code alone the way the `error` cases above are (both exit 0 either
+    // way) -- the CLI-observable regression is `stdout`, gated below.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r"label $out | limit(3; repeat((1, break $out)))"],
+        Some("null"),
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(
+        stdout, "",
+        "must stop on the first round's break, not loop to `limit`'s cap: {stdout:?}"
+    );
+    Ok(())
+}
+
 /// `builtin_isvalid`'s `QueryResult::Partial(_, Control::Halt(code))` arm
 /// (distinct from the bare `QueryResult::Halt` arm already covered by
 /// `test_isvalid_propagates_halt_instead_of_answering_true`): `isvalid`
