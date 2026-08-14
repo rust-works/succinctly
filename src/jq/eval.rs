@@ -16742,15 +16742,18 @@ fn builtin_strftime<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // Value should be a broken-down time array, or a raw Unix timestamp
     // number (auto-converted the same way `gmtime` converts one).
     let (year, month, day, hour, minute, second, weekday, yearday) = match &value {
-        StandardJson::Number(_) => {
-            // `value` is already known to be a `Number` here, so the
-            // `not_a_number` closure below can never fire — kept only for
-            // parity with `gmtime`/`localtime`'s identical call shape.
-            let timestamp = match get_float_value_with::<W>(&value, optional, || {
-                EvalError::strftime_requires_parsed_datetime_inputs()
-            }) {
-                Ok(f) => f,
-                Err(r) => return r,
+        StandardJson::Number(n) => {
+            // Extracted directly rather than via `get_float_value_with`:
+            // `value` is already known to be a `Number` here, so that
+            // helper's generic `not_a_number` case would be unreachable.
+            let timestamp = if is_nan_sentinel(n.raw_bytes()) {
+                f64::NAN
+            } else if let Ok(f) = n.as_f64() {
+                f
+            } else if optional {
+                return QueryResult::None;
+            } else {
+                return QueryResult::Error(EvalError::new("invalid number"));
             };
 
             // Auto-converted the same way `gmtime` converts a raw number.
@@ -16765,9 +16768,12 @@ fn builtin_strftime<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     if optional {
                         return QueryResult::None;
                     }
-                    return QueryResult::Error(EvalError::new(
-                        "strftime requires array with at least 6 elements",
-                    ));
+                    // Real jq reports the same generic wording for a
+                    // too-short array as for any other invalid input —
+                    // it has no distinct "at least 6 elements" message.
+                    return QueryResult::Error(
+                        EvalError::strftime_requires_parsed_datetime_inputs(),
+                    );
                 }
 
                 let get_int = |idx: usize| -> i64 {
@@ -31003,6 +31009,40 @@ mod tests {
         query!(br#""not a date""#, r#"strftime("%Y")"#,
             QueryResult::Error(e) => {
                 assert_eq!(e.message, "strftime/1 requires parsed datetime inputs");
+            }
+        );
+
+        // `?` suppresses the error for an input that's neither array nor
+        // number, same as any other builtin.
+        query!(br#""not a date""#, r#"strftime("%Y")?"#,
+            QueryResult::None => {}
+        );
+
+        // A too-short array gets the same wording real jq uses — it has no
+        // distinct "at least 6 elements" message.
+        query!(b"[2024,0,15]", r#"strftime("%Y")"#,
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "strftime/1 requires parsed datetime inputs");
+            }
+        );
+        query!(b"[2024,0,15]", r#"strftime("%Y")?"#,
+            QueryResult::None => {}
+        );
+
+        // A non-numeric array element falls back to 0, matching
+        // get_int's existing catch-all for array-input strftime.
+        query!(br#"["x",0,1,0,0,0,4,0]"#, r#"strftime("%Y")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "0000");
+            }
+        );
+
+        // Array elements built from arithmetic (OwnedValue::Int), not
+        // literal JSON numbers (OwnedValue::NumberLiteral) — exercises
+        // get_int's other numeric-variant arm.
+        query!(b"[2024,0,15,10,30,0,1,14]", r#"map(.+0) | strftime("%Y-%m-%d")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "2024-01-15");
             }
         );
     }
