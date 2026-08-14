@@ -5933,6 +5933,130 @@ fn test_correctly_aligned_sequence_is_unaffected_by_out_dent_handling() -> Resul
     Ok(())
 }
 
+// ============================================================================
+// Inconsistent compact-mapping continuation indent (#885)
+// ============================================================================
+// The mapping-shaped analog of #485 above: a continuation line indented
+// strictly between a compact mapping's own indent and its enclosing sequence
+// item's virtual indent is invalid YAML (`yq` v4.53.3 rejects it outright),
+// but before this fix, the plain indent comparison `close_deeper_indents`
+// applies closed the compact mapping and reopened a second, orphaned mapping
+// as a sibling directly under the same sequence item — which structurally
+// expects only one value child, so the JSON serializer silently dropped
+// every field after the first inconsistent line. Same "parse the obvious
+// extension" policy #485 (and #325 before it) already established for this
+// class of problem.
+
+#[test]
+fn test_inconsistent_compact_mapping_indent_headline_repro() -> Result<()> {
+    // yq v4.53.3: `Error: bad file '-': yaml: while parsing a block
+    // collection ...: did not find expected '-' indicator`.
+    let (output, exit_code) = run_yq_stdin(".", "-   a: hello\n  b: 2\n", &["-o", "json", "-I0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), r#"[{"a":"hello","b":2}]"#);
+    Ok(())
+}
+
+#[test]
+fn test_inconsistent_compact_mapping_indent_does_not_lose_later_fields() -> Result<()> {
+    // Every field after the first inconsistent line must survive, not just
+    // the first one.
+    let (output, exit_code) =
+        run_yq_stdin(".", "-   a: 1\n  b: 2\n  c: 3\n", &["-o", "json", "-I0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), r#"[{"a":1,"b":2,"c":3}]"#);
+    Ok(())
+}
+
+#[test]
+fn test_inconsistent_compact_mapping_indent_does_not_leak_into_next_item() -> Result<()> {
+    // A properly-dashed sibling item after the inconsistent one must still
+    // be recognized as its own item, not folded into the first.
+    let (output, exit_code) =
+        run_yq_stdin(".", "-   a: 1\n  b: 2\n-   x: 9\n", &["-o", "json", "-I0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), r#"[{"a":1,"b":2},{"x":9}]"#);
+    Ok(())
+}
+
+#[test]
+fn test_indent_genuinely_below_the_item_stays_a_separate_top_level_entry() -> Result<()> {
+    // Regression guard: an indent at or below the sequence item's own dash
+    // column (strictly below the compact mapping's *and* the item's own
+    // virtual indent) must not be swallowed into the mapping by
+    // `compact_mapping_gap_reaches`. Real `yq` v4.53.3 rejects this input
+    // too (`did not find expected '-' indicator`) — same as every other
+    // case in this file — succinctly's own two-item output here comes from
+    // a separate, pre-existing "parse the obvious extension" heuristic
+    // (an indent-0 mapping line becoming a new top-level sequence item),
+    // not evidence this shape is any more spec-legitimate than the others.
+    let (output, exit_code) = run_yq_stdin(".", "-   a: hello\nb: 2\n", &["-o", "json", "-I0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), r#"[{"a":"hello"},{"b":2}]"#);
+    Ok(())
+}
+
+#[test]
+fn test_inconsistent_compact_mapping_indent_single_space_continuation() -> Result<()> {
+    // The most common real-world shape: single space after the dash (not
+    // this file's extra-spaced headline repro), with the continuation
+    // indented exactly at the sequence item's own virtual indent — the
+    // inclusive lower bound `compact_mapping_gap_reaches` needs (`indent >=`,
+    // not `indent >`) for this to be recognized as still belonging to the
+    // mapping rather than silently dropped.
+    let (output, exit_code) = run_yq_stdin(".", "- a: 1\n b: 2\n", &["-o", "json", "-I0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), r#"[{"a":1,"b":2}]"#);
+    Ok(())
+}
+
+#[test]
+fn test_inconsistent_compact_mapping_indent_with_explicit_key() -> Result<()> {
+    // `parse_explicit_key`/`parse_explicit_value` (the `?`/`:` dispatch
+    // arms) carry the identical close_deeper_indents/need_new_mapping
+    // shape `parse_mapping_entry` does, and needed the same fix.
+    let (output, exit_code) =
+        run_yq_stdin(".", "-   a: hello\n  ? b\n  : 2\n", &["-o", "json", "-I0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), r#"[{"a":"hello","b":2}]"#);
+    Ok(())
+}
+
+#[test]
+fn test_inconsistent_compact_mapping_indent_with_anchor_prefixed_key() -> Result<()> {
+    // The `&`/`!` dispatch arm has its own `close_deeper_indents` call and
+    // needed the same gap-tolerant indent as the plain-key arm.
+    let (output, exit_code) = run_yq_stdin(".", "-   &anc k: v\n  b: 2\n", &["-o", "json", "-I0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), r#"[{"k":"v","b":2}]"#);
+    Ok(())
+}
+
+#[test]
+fn test_inconsistent_compact_mapping_indent_with_tag_prefixed_key() -> Result<()> {
+    let (output, exit_code) =
+        run_yq_stdin(".", "-   !!str k: v\n  b: 2\n", &["-o", "json", "-I0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), r#"[{"k":"v","b":2}]"#);
+    Ok(())
+}
+
+#[test]
+fn test_inconsistent_compact_mapping_indent_with_alias_key() -> Result<()> {
+    // The `*` (alias-as-key) dispatch arm.
+    let (output, exit_code) = run_yq_stdin(
+        ".",
+        "x: &k1 hello\nlist:\n-   *k1: v\n  b: 2\n",
+        &["-o", "json", "-I0"],
+    )?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(
+        output.trim(),
+        r#"{"x":"hello","list":[{"hello":"v","b":2}]}"#
+    );
+    Ok(())
+}
+
 #[test]
 fn test_flow_dash_without_whitespace_is_still_a_scalar() -> Result<()> {
     // A `-` not followed by whitespace is a legitimate plain scalar in flow
