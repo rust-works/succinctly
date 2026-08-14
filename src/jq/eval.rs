@@ -10383,7 +10383,9 @@ fn resolve_leaf<'a, S: EvalSemantics>(
         // Note this doesn't match live jq either (confirmed above,
         // `path(range(3))` raises on the first value, not this message) —
         // a pre-existing, separate divergence from #861's own repro, not
-        // touched here.
+        // touched here. A trailing Break/Error past this point is discarded
+        // the same way the `1 =>` arm's comment explains (Halt already
+        // handled above, before either match).
         _ => Err((
             Vec::new(),
             EvalError::new("Cannot use a computed index after a multi-output path component")
@@ -30178,6 +30180,35 @@ mod tests {
             QueryResult::Error(e) => {
                 assert_eq!(e.message, "Invalid path expression with result [0]");
             }
+        );
+    }
+
+    /// Halt sibling of the fix above: switching `resolve_leaf` to
+    /// `eval_owned_multi_keep_partial` means a later `Break`/`Error` no
+    /// longer erases an already-produced prefix, but `Halt` must never be
+    /// folded into that same "discard the escape, raise an ordinary path
+    /// error" treatment. `EvalEscape::Halt`'s own doc: "Must reach the CLI
+    /// unconditionally; never catchable, never suppressible." Two
+    /// legitimate outputs (`[0]`, `[1]`, from the two number candidates)
+    /// are produced before the third candidate halts — unlike `break`, real
+    /// jq's own laziness never even reaches this halt either (it would
+    /// raise on `[0]` alone, same as #861's own repro), but this resolver's
+    /// evaluation is eager, not lazy, so by the time `resolve_leaf` sees
+    /// the escape, `halt_error`'s side effect has already run and its exit
+    /// code must still take effect rather than being silently downgraded
+    /// into a catchable "Invalid path expression".
+    #[test]
+    fn test_path_paths_filter_never_swallows_a_later_halt() {
+        query!(
+            br#"[1,2,"trigger"]"#,
+            r#"path(paths(if type=="string" then (.|halt_error) else true end))"#,
+            QueryResult::Halt(_) => {}
+        );
+        // Wrapping in try/catch must not change this: halt is uncatchable.
+        query!(
+            br#"[1,2,"trigger"]"#,
+            r#"try path(paths(if type=="string" then (.|halt_error) else true end)) catch "caught""#,
+            QueryResult::Halt(_) => {}
         );
     }
 
