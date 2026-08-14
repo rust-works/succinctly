@@ -591,6 +591,80 @@ fn test_field_navigation_preserves_flow_style() -> Result<()> {
     Ok(())
 }
 
+/// #739 (ADR-0017): a write to one field must not reformat an unrelated,
+/// untouched sibling — the issue's own repro. Every case verified against
+/// the pinned real `yq` binary.
+#[test]
+fn test_assign_preserves_untouched_sibling_single_quote_style_739() -> Result<()> {
+    let (output, code) = run_yq_stdin(".b = 2", "a: 'single'\nb: 1\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "a: 'single'\nb: 2\n");
+    Ok(())
+}
+
+#[test]
+fn test_assign_preserves_untouched_sibling_double_quote_style_739() -> Result<()> {
+    let (output, code) = run_yq_stdin(".b = 2", "a: \"double\"\nb: 1\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "a: \"double\"\nb: 2\n");
+    Ok(())
+}
+
+#[test]
+fn test_assign_preserves_untouched_sibling_flow_style_739() -> Result<()> {
+    let (output, code) = run_yq_stdin(".b = 2", "a: {x: 1, y: 2}\nb: 1\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "a: {x: 1, y: 2}\nb: 2\n");
+    Ok(())
+}
+
+#[test]
+fn test_del_preserves_untouched_sibling_style_739() -> Result<()> {
+    let (output, code) = run_yq_stdin("del(.c)", "a: 'single'\nb: 1\nc: 2\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "a: 'single'\nb: 1\n");
+    Ok(())
+}
+
+#[test]
+fn test_compound_assign_preserves_untouched_sibling_style_739() -> Result<()> {
+    let (output, code) = run_yq_stdin(".b += 1", "a: 'single'\nb: 1\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "a: 'single'\nb: 2\n");
+    Ok(())
+}
+
+/// #739: a *written* scalar field keeps its own quote style too, as long
+/// as the new value is still a scalar (real `yq`'s in-place node-mutation
+/// model updates the value but never touches the node's own style) — not
+/// just untouched siblings. A kind change (scalar to container) does drop
+/// it, since there's no such node to keep.
+#[test]
+fn test_assign_new_string_value_keeps_written_fields_own_quote_style_739() -> Result<()> {
+    let (output, code) = run_yq_stdin(".a = \"new\"", "a: 'single'\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "a: 'new'\n");
+    Ok(())
+}
+
+#[test]
+fn test_assign_kind_change_drops_the_written_fields_style_739() -> Result<()> {
+    let (output, code) = run_yq_stdin(".a = {\"x\": 1}", "a: 'single'\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "a:\n  x: 1\n");
+    Ok(())
+}
+
+/// #739/#705: `-P` still forces block/plain style unconditionally, even
+/// though the DOM path now tracks real style data for writes too.
+#[test]
+fn test_pretty_print_still_forces_block_style_on_a_write_739() -> Result<()> {
+    let (output, code) = run_yq_stdin(".b = 2", "a: {x: 1, y: 2}\nb: 1\n", &["-P"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "a:\n  x: 1\n  y: 2\nb: 2\n");
+    Ok(())
+}
+
 #[test]
 fn test_duplicate_mapping_key_is_last_wins() -> Result<()> {
     // YAML 1.2 / yq: a mapping with a duplicate key resolves `.key` to the
@@ -1667,7 +1741,9 @@ fn test_split_doc_with_objects() -> Result<()> {
     let input = "[{name: alice}, {name: bob}]";
     let (output, exit_code) = run_yq_stdin(".[] | split_doc", input, &[])?;
     assert_eq!(exit_code, 0);
-    assert_eq!(output, "name: alice\n---\nname: bob\n");
+    // Each object keeps its flow style (#739) - verified against the
+    // pinned real `yq` binary.
+    assert_eq!(output, "{name: alice}\n---\n{name: bob}\n");
     Ok(())
 }
 
@@ -1727,8 +1803,9 @@ fn test_split_doc_nested_arrays() -> Result<()> {
     let input = "[[1, 2], [3, 4]]";
     let (output, exit_code) = run_yq_stdin(".[] | split_doc", input, &[])?;
     assert_eq!(exit_code, 0);
-    // Each sub-array is output as a YAML sequence
-    assert_eq!(output, "- 1\n- 2\n---\n- 3\n- 4\n");
+    // Each sub-array is output as a YAML sequence, keeping its flow style
+    // (#739) - verified against the pinned real `yq` binary.
+    assert_eq!(output, "[1, 2]\n---\n[3, 4]\n");
     Ok(())
 }
 
@@ -6215,12 +6292,18 @@ fn test_keys_unsorted_yaml_dom_fallback_matches_lazy_685() -> Result<()> {
 /// It's now wired into `can_stream_pretty` (`yq_runner.rs`), forcing the DOM
 /// fallback exactly like `--sort-keys` above (`test_keys_unsorted_yaml_dom_fallback_matches_lazy_685`).
 ///
-/// #707 (flow-style preservation) has since landed on the M2 cursor-streaming
-/// path only — the DOM fallback path `-P` forces was never touched by it and
-/// still renders unconditionally block-style. So for flow-style input, `-P`
-/// now diverges from the default (which preserves the input's flow style)
-/// and produces real block-style pretty-printing, matching real yq's `-P`
-/// semantics.
+/// #707 (flow-style preservation) landed on the M2 cursor-streaming path
+/// only; the DOM fallback path `-P` forces had no style tracking at all
+/// back then, so it always rendered block-style regardless of `-P`. #739
+/// later gave the DOM path real style tracking too (`CommentTree`'s style
+/// field, `evaluate_yaml_cursor`'s `reconcile_presentation`) — real `yq`'s
+/// own doc says `-P` is "shorthand for `... style = \"\"`", i.e. a genuine
+/// clear, not just "there's nothing to clear" — so `evaluate_yaml_cursor`'s
+/// `strip_style` parameter now does that explicitly
+/// (`strip_presentation_style`) whenever `args.pretty_print` is set. The
+/// observable result is unchanged (block-style output either way); only
+/// the reason changed, from "no style data exists here" to "style data
+/// exists and `-P` clears it."
 #[test]
 fn test_pretty_print_flag_forces_block_style_705() -> Result<()> {
     let input = "a: [1, 2, 3]\nb: {c: 1, d: 2}\n";
@@ -6549,23 +6632,24 @@ fn test_line_comment_builtin_empty_when_absent_710() -> Result<()> {
     Ok(())
 }
 
-/// Known gap, not a silent regression: assignment (`=`, `|=`, ...) isn't
-/// natively handled by the cursor-aware evaluator, so it falls through a
-/// JSON-round-trip fallback (`eval_generic.rs`'s catch-all) that discards
-/// cursor/comment data for the *entire* document - not just the assigned
-/// field. `.b = 5` here never touches `a`, yet `a`'s comment is still gone.
-/// Fixing this needs comment-aware assignment logic, not just write-path
-/// wiring; tracked as a follow-up rather than solved here so the gap is
-/// pinned and visible instead of an undocumented surprise.
+/// #739 (was a documented gap, #710): assignment (`=`, `|=`, ...) used to
+/// fall through a JSON-round-trip fallback (`eval_generic.rs`'s catch-all)
+/// that discarded cursor/comment data for the *entire* document - not just
+/// the assigned field. `evaluate_yaml_cursor`'s `reconcile_presentation`
+/// now recovers it: an untouched sibling keeps its comment (`.b = 5` here
+/// never touches `a`), and - verified against the pinned real `yq` binary -
+/// even the *written* field's own comment survives a same-kind value
+/// change (`.a = 5` still keeps `a`'s comment; only a kind change, e.g.
+/// scalar to object, would drop it).
 #[test]
-fn test_assignment_does_not_yet_preserve_comments_710() -> Result<()> {
+fn test_assignment_preserves_comments_739() -> Result<()> {
     let (out, code) = run_yq_stdin(".a = 5", "a: 1 # keep this\nb: 2\n", &[])?;
     assert_eq!(code, 0);
-    assert_eq!(out, "a: 5\nb: 2\n");
+    assert_eq!(out, "a: 5 # keep this\nb: 2\n");
 
     let (out, code) = run_yq_stdin(".b = 5", "a: 1 # keep this\nb: 2\n", &[])?;
     assert_eq!(code, 0);
-    assert_eq!(out, "a: 1\nb: 5\n");
+    assert_eq!(out, "a: 1 # keep this\nb: 5\n");
     Ok(())
 }
 
@@ -6725,7 +6809,14 @@ fn test_iterated_containers_keep_own_comments_793a() -> Result<()> {
 // widened which queries can), a container's own trailing comment used to be
 // concatenated directly onto its last child's rendered line with no
 // separator - indistinguishable from that child's own comment. Fixed by
-// giving the container's own comment a standalone comment line instead.
+// giving the container's own comment a standalone comment line instead,
+// for block-rendered output. #739 later taught this same DOM path to
+// preserve a container's own flow-vs-block style (previously always
+// forced to block, unconditionally, regardless of source): both of these
+// inputs use flow syntax (`[1, 2, 3]`), so the container now renders on
+// one line and its own comment glues onto that line instead - unambiguous
+// since there's no separate "last child's line" to collide with. Both
+// outputs verified against the pinned real `yq` binary.
 // `--arg x y` is used as the M2-blocking flag throughout (rather than the
 // original issue's `select(...)`, which #796 now routes through M2 and so
 // no longer reaches this code at all for these shapes).
@@ -6738,7 +6829,7 @@ fn test_dom_path_container_comment_gets_own_line_not_glued_to_last_child_793b() 
         &["--arg", "x", "y"],
     )?;
     assert_eq!(code, 0);
-    assert_eq!(out, "- 1\n- 2\n- 3\n# trailing\n");
+    assert_eq!(out, "[1, 2, 3] # trailing\n");
     Ok(())
 }
 
@@ -6750,12 +6841,20 @@ fn test_dom_path_root_container_comment_gets_own_line_793b() -> Result<()> {
         &["--arg", "x", "y"],
     )?;
     assert_eq!(code, 0);
-    assert_eq!(out, "items:\n  - 1\n  - 2\n  - 3\n  # container comment\n");
+    assert_eq!(out, "items: [1, 2, 3] # container comment\n");
     Ok(())
 }
 
 /// A child's own comment and the container's own comment must both survive,
 /// as two distinct comments - not silently concatenated onto one line.
+///
+/// The source is flow syntax (`[1, 2 ...]`), but a `#` comment runs to end
+/// of line and this one trails a non-final element, so there's nowhere for
+/// it to go on one line without breaking flow's grammar; `is_flow_safe`
+/// (#739) falls back to block rendering rather than lose the comment
+/// (real `yq` instead keeps flow with a synthetic trailing comma before
+/// the line break - a narrower fidelity gap this PR accepts, see
+/// `is_flow_safe`'s own doc comment).
 #[test]
 fn test_dom_path_container_and_child_comments_stay_distinct_793b() -> Result<()> {
     let (out, code) = run_yq_stdin(
@@ -7235,9 +7334,12 @@ fn test_front_matter_process_reattaches_body_verbatim() -> Result<()> {
         &["--front-matter", "process"],
     )?;
     assert_eq!(code, 0);
+    // `tags: [a, b]` keeps its flow style (#739) even though `.title` is
+    // the field actually written - verified against the pinned real `yq`
+    // binary.
     assert_eq!(
         output,
-        "---\ntitle: New\ntags:\n  - a\n  - b\n---\n# Body\n\nSome text.\n"
+        "---\ntitle: New\ntags: [a, b]\n---\n# Body\n\nSome text.\n"
     );
     Ok(())
 }
