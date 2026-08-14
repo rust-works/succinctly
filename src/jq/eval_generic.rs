@@ -5120,6 +5120,55 @@ mod tests {
         }
     }
 
+    /// #747: mirrors `test_json_multi_stage_pipe_first_stage_bare_many_lazy_index_range_684`'s
+    /// shape — `select(true,true)` on a cursor-less top-level `eval()` call
+    /// produces a bare `GenericResult::Many` (`Builtin::Select`'s `pass_n`
+    /// closure, `(n, None)` arm), whose per-item re-evaluation in the pipe
+    /// stage's `Many(vs)` arm goes through `to_owned_cursor` when the
+    /// per-item result comes back as `OneCursor` (`.a`, single field) or
+    /// `ManyCursor` (`.[]`, all fields) — exercising the exact two sub-arms
+    /// `to_owned_cursor` replaced `to_owned(&c.value())` in. Each duplicated
+    /// per-item cursor must still resolve its own explicit tag correctly,
+    /// not just the top-level query's own cursor.
+    #[test]
+    fn test_yaml_multi_stage_pipe_bare_many_per_item_cursor_resolves_tag_747() {
+        use crate::yaml::YamlIndex;
+
+        let yaml = b"a: !!str 1\nb: 2\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let cursor = index.root(yaml);
+        let mapping_cursor = cursor
+            .first_child()
+            .expect("YAML document should have content");
+        let value = mapping_cursor.value();
+
+        let single_field = eval(
+            &crate::jq::parse("select(true,true) | .a | type").unwrap(),
+            value.clone(),
+        );
+        assert_eq!(
+            single_field.collect_owned(),
+            vec![
+                OwnedValue::String("string".to_string()),
+                OwnedValue::String("string".to_string()),
+            ]
+        );
+
+        let iterate_fields = eval(
+            &crate::jq::parse("select(true,true) | .[] | type").unwrap(),
+            value,
+        );
+        assert_eq!(
+            iterate_fields.collect_owned(),
+            vec![
+                OwnedValue::String("string".to_string()),
+                OwnedValue::String("number".to_string()),
+                OwnedValue::String("string".to_string()),
+                OwnedValue::String("number".to_string()),
+            ]
+        );
+    }
+
     #[test]
     fn test_yaml_generic_field_access() {
         use crate::yaml::YamlIndex;
