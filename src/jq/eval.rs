@@ -6545,7 +6545,22 @@ fn build_regex(pattern: &str, flags: Option<&str>) -> Result<JqRegex, EvalError>
                 // to the same effect as m.
                 'p' => dot_matches_newline = true,
                 'g' => {} // global - handled at call site
-                _ => {}
+                // Recognized by real jq but not yet implemented here (#730):
+                // `n` (suppress empty matches) and `l` (POSIX leftmost-longest)
+                // are accepted as valid flag characters, silently without
+                // effect, rather than raising the error below.
+                'n' | 'l' => {}
+                _ => {
+                    // Real jq's own wording, and its own choice: the message
+                    // names the whole flags string, not just the offending
+                    // character — confirmed live, both `test("abc";"zq")`
+                    // and `test("abc";"iz")` (one valid flag, one invalid)
+                    // report "zq"/"iz is not a valid modifier string", never
+                    // singling out which character was the problem.
+                    return Err(EvalError::new(format!(
+                        "{flags} is not a valid modifier string"
+                    )));
+                }
             }
         }
         let mut prefix = String::from("(?");
