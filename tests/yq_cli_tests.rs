@@ -2715,6 +2715,24 @@ fn test_yaml_explicit_tag_eq_and_arithmetic_resolve_747() -> Result<()> {
     assert_eq!(code, 0);
     assert_eq!(add.trim(), "6");
 
+    // `tagged_scalar_to_owned`'s Null/Bool/Float arms: `type`'s own tests
+    // (`test_yaml_explicit_tag_type_resolves_747`) exercise these tags only
+    // through `tagged_type_name`, which resolves straight to
+    // `ResolvedScalar::type_name()` without ever materializing an
+    // `OwnedValue` — so an `==` comparison (which does materialize, via
+    // `to_owned_cursor`) is needed to reach these three arms at all.
+    let (eq_null, code) = run_yq_stdin(".a == null", "a: !!null anything\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(eq_null.trim(), "true");
+
+    let (eq_bool, code) = run_yq_stdin(".a == true", "a: !!bool \"yes\"\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(eq_bool.trim(), "true");
+
+    let (eq_float, code) = run_yq_stdin(".a == 5.0", "a: !!float \"5\"\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(eq_float.trim(), "true");
+
     Ok(())
 }
 
