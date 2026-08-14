@@ -27913,6 +27913,51 @@ mod tests {
 
     #[cfg(feature = "regex")]
     #[test]
+    fn test_regex_n_flag_known_gap_lazy_quantifier_922() {
+        // #922: `n`'s skip-forward search only finds a non-empty match
+        // reachable by moving to a *later* position, not one reachable only
+        // by backtracking to a different alternative at the *same*
+        // position — which a lazy quantifier or an empty-preferring
+        // alternation can require. Rust's non-backtracking `regex` crate
+        // has no equivalent to oniguruma's `ONIG_OPTION_FIND_NOT_EMPTY`
+        // (same root cause as #920's missing `MatchKind::LeftmostLongest`).
+        //
+        // This pins the *current, known-divergent* behavior rather than
+        // jq's — verified live against jq 1.7.1, which returns `true`/a
+        // real match/`["x","a","b","b"]` for each case below.
+        query!(br#""x\nabb""#, r#"test("a*?"; "n")"#,
+            QueryResult::Owned(OwnedValue::Bool(b)) => {
+                assert!(!b, "jq says true here (offset 2, \"a\") — known gap, #922");
+            }
+        );
+        query!(br#""x\nabb""#, r#"[match("a*?"; "n")]"#,
+            QueryResult::Owned(OwnedValue::Array(vs)) => {
+                assert!(vs.is_empty(), "jq finds a match at offset 2 — known gap, #922");
+            }
+        );
+        query!(br#""x\nabb""#, r#"[scan(".*?"; "gn")]"#,
+            QueryResult::Owned(OwnedValue::Array(vs)) => {
+                assert!(vs.is_empty(), "jq returns [\"x\",\"a\",\"b\",\"b\"] — known gap, #922");
+            }
+        );
+
+        // The equivalent alternation with branches reordered (non-empty
+        // first) is unaffected — isolates the gap to which alternative the
+        // engine's leftmost-first preference reaches, not to `n` broadly.
+        query!(br#""xa""#, r#"[match("(?:a|)"; "gn")] | length"#,
+            QueryResult::Owned(OwnedValue::Int(n)) => {
+                assert_eq!(n, 1);
+            }
+        );
+        query!(br#""xa""#, r#"[match("(?:|a)"; "gn")]"#,
+            QueryResult::Owned(OwnedValue::Array(vs)) => {
+                assert!(vs.is_empty(), "jq finds a match at offset 1 — known gap, #922");
+            }
+        );
+    }
+
+    #[cfg(feature = "regex")]
+    #[test]
     fn test_scan_split_splits_prepend_g_before_validating_flags_730() {
         // scan/split/splits always operate in jq's "global" mode (they find
         // or split on every match), and jq's own bootstrap prepends `g` to
