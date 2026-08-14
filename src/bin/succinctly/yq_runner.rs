@@ -468,6 +468,7 @@ fn evaluate_yaml_direct_filtered(
     doc_filter: Option<(usize, usize)>,
     sink: &mut ErrorSink,
     need_comments: bool,
+    strip_style: bool,
 ) -> Result<(Vec<Vec<ResultWithComments>>, usize)> {
     let index = YamlIndex::build(bytes).map_err(|e| anyhow::anyhow!("YAML parse error: {e}"))?;
     let root = index.root(bytes);
@@ -485,7 +486,8 @@ fn evaluate_yaml_direct_filtered(
                 };
 
                 if should_eval {
-                    let results = evaluate_yaml_cursor(cursor, expr, sink, need_comments)?;
+                    let results =
+                        evaluate_yaml_cursor(cursor, expr, sink, need_comments, strip_style)?;
                     // Only include documents that have results (select may filter them out)
                     if !results.is_empty() {
                         doc_results.push(results);
@@ -516,7 +518,13 @@ fn evaluate_yaml_direct_filtered(
 
             if should_eval {
                 if let Some(content_cursor) = root.first_child() {
-                    let results = evaluate_yaml_cursor(content_cursor, expr, sink, need_comments)?;
+                    let results = evaluate_yaml_cursor(
+                        content_cursor,
+                        expr,
+                        sink,
+                        need_comments,
+                        strip_style,
+                    )?;
                     Ok((vec![results], 1))
                 } else {
                     // Empty document
@@ -740,6 +748,116 @@ fn walk_alias_groups<W: AsRef<[u64]> + Clone>(
     }
 }
 
+/// Reconcile a pristine (pre-write) presentation tree against a post-write
+/// value (issue #739, ADR-0017's mechanism 1, applied to path-mutation
+/// queries: `=`, `|=`, `+=`, `del()`, ...).
+///
+/// Verified against the pinned real `yq` binary: a node keeps its own
+/// comment and style across a write as long as the write leaves it the
+/// same *kind* (`Object`/`Array`/scalar) — regardless of whether its
+/// *value* actually changed. `.b = 2` on `b: 1 # keep` still prints
+/// `b: 2 # keep`; `.a = "new"` on `a: 'old'` still prints `a: 'new'`
+/// (single-quote style survives even though the string content didn't).
+/// Real `yq`'s in-place node-mutation model (go-yaml) explains why: `Set`
+/// overwrites the existing `Node.Value` but never touches that node's own
+/// `Style`/`LineComment`. Only a kind change (scalar becomes a container or
+/// vice versa) discards them, since there's no such node to keep - matching
+/// `.a = {"x": 1}` on `a: 'old'` dropping the quote style entirely (real
+/// `yq`: `a:\n  x: 1`).
+///
+/// Walks `pristine_value`/`result_value` in lockstep rather than computing
+/// which path(s) an expression's AST touches (`resolve_dynamic_indexes` in
+/// `eval.rs`) and invalidating just those - this is exact for every
+/// mutation shape uniformly (a single assign, a chained pipe of several, a
+/// computed-key write, a `del()`) with no per-expression-shape logic, and
+/// the YAML documents this rewrites are config-file-sized, not
+/// data-file-sized.
+///
+/// **Known gap, filed as #870**: this function matches a child to
+/// its pristine counterpart purely by key/index, so any write that
+/// reshuffles an `Array`'s or `Object`'s *positions* - not just a
+/// wholesale replacement like `.a = [4, 5, 6]` on `a: ['x', 'y', 'z']`,
+/// but an everyday `.arr = ["new"] + .arr` prepend or a `del()` that
+/// shifts later indices down - misattributes old elements' style/comments
+/// to whichever new element now sits at the same key/index, instead of
+/// giving every element under the write fresh (empty) metadata the way
+/// real `yq`'s node-mutation model does (confirmed against the pinned
+/// binary: prepending to `arr:\n  - "x"\n  - y` should drop the new
+/// element's style entirely and leave `"x"`'s own quotes exactly where
+/// they were; this function instead lets the new element inherit `"x"`'s
+/// old quote style and leaves `"x"` unquoted). This function has no way
+/// to tell "recursing into an untouched sibling subtree" apart from
+/// "recursing into a reshuffled subtree that happens to share
+/// positions/keys with the old one" - both look identical from a pure
+/// before/after value diff; only a path-based approach (the
+/// `resolve_dynamic_indexes` alternative above) could distinguish them.
+/// Purely cosmetic (no data loss, no incorrect *values*, still strictly
+/// better than every write losing all style/comments unconditionally,
+/// which was the pre-#739 baseline).
+fn reconcile_presentation(
+    pristine_value: &OwnedValue,
+    pristine_tree: &CommentTree,
+    result_value: &OwnedValue,
+) -> CommentTree {
+    match (pristine_value, result_value) {
+        (OwnedValue::Object(p_fields), OwnedValue::Object(r_fields)) => {
+            let own_comment = pristine_tree.own().map(str::to_string);
+            let own_style = pristine_tree.style();
+            let mut fields = IndexMap::new();
+            let mut key_comments = IndexMap::new();
+            for (k, r_v) in r_fields {
+                let child = match p_fields.get(k) {
+                    Some(p_v) => reconcile_presentation(p_v, pristine_tree.field(k), r_v),
+                    None => CommentTree::empty(),
+                };
+                fields.insert(k.clone(), child);
+                // A key's own trailing comment (#765) belongs to the key's
+                // line, not its value, so it survives regardless of
+                // whether the value under it changed - only a removed key
+                // (not iterated here, since this loop is over `r_fields`)
+                // drops it. The "deferred value materialized as nothing"
+                // flag, though, is re-derived from `r_v`, not copied from
+                // pristine: a write that gives the key a real value must
+                // not carry over a stale "absent" flag, or
+                // `key_comment_if_value_absent`'s own consumer
+                // (`emit_yaml_value`'s block-mapping arm) renders only the
+                // key and comment, silently dropping the write's value
+                // entirely (found in review).
+                if let CommentTree::Object(_, _, _, pristine_key_comments) = pristine_tree {
+                    if let Some((kc, _)) = pristine_key_comments.get(k) {
+                        let value_absent = matches!(r_v, OwnedValue::Null);
+                        key_comments.insert(k.clone(), (kc.clone(), value_absent));
+                    }
+                }
+            }
+            CommentTree::Object(own_comment, own_style, fields, key_comments)
+        }
+        (OwnedValue::Array(p_items), OwnedValue::Array(r_items)) => {
+            let own_comment = pristine_tree.own().map(str::to_string);
+            let own_style = pristine_tree.style();
+            let items = r_items
+                .iter()
+                .enumerate()
+                .map(|(i, r_v)| match p_items.get(i) {
+                    Some(p_v) => reconcile_presentation(p_v, pristine_tree.at_index(i), r_v),
+                    None => CommentTree::empty(),
+                })
+                .collect();
+            CommentTree::Array(own_comment, own_style, items)
+        }
+        // A kind change (container <-> scalar, or Object <-> Array) is a
+        // fresh node with no presentation memory of its own.
+        (OwnedValue::Object(_) | OwnedValue::Array(_), _)
+        | (_, OwnedValue::Object(_) | OwnedValue::Array(_)) => CommentTree::empty(),
+        // Both scalars, any variant/value: same node, only its value
+        // changed - its own comment and style survive.
+        _ => CommentTree::Leaf(
+            pristine_tree.own().map(str::to_string),
+            pristine_tree.style(),
+        ),
+    }
+}
+
 /// Evaluate `split_expr` against `result` with `$index` bound to
 /// `output_index`, expect exactly one string back, and write `result`
 /// (serialized through `output_config`, color forced off, matching
@@ -845,15 +963,21 @@ fn write_split_result(
 /// Evaluate a jq expression directly on a YAML cursor.
 ///
 /// This uses the generic evaluator to preserve position metadata (line/column).
-/// Each result carries its parallel [`CommentTree`] (issue #710) — real for
-/// `OneCursor`/`ManyCursor` (still-live cursor), [`CommentTree::empty`]
-/// everywhere else (an already-materialized/computed value, comment-less by
-/// construction — see [`CommentTree`]'s own doc comment for why).
+/// Each result carries its parallel [`CommentTree`] (issue #710/#739) —
+/// real for `OneCursor`/`ManyCursor` (still-live cursor); for every other
+/// result (an already-materialized/computed value with no cursor of its
+/// own) it's [`reconcile_presentation`]'s output against the pristine
+/// document when `expr` is a shape-preserving write
+/// ([`is_alias_sensitive_assign`]) and the caller wants comments at all
+/// (`need_comments`), or [`CommentTree::empty`] otherwise — see
+/// [`CommentTree`]'s own doc comment for why a cursor-less value can't
+/// generally carry metadata.
 fn evaluate_yaml_cursor<W: AsRef<[u64]> + Clone>(
     cursor: YamlCursor<'_, W>,
     expr: &Expr,
     sink: &mut ErrorSink,
     need_comments: bool,
+    strip_style: bool,
 ) -> Result<Vec<ResultWithComments>> {
     // Snapshot alias-sync context from the pristine document *before*
     // evaluation, only when it could possibly matter (#711): an
@@ -863,8 +987,30 @@ fn evaluate_yaml_cursor<W: AsRef<[u64]> + Clone>(
     let alias_sync_ctx = (is_alias_sensitive_assign(expr) && cursor.index().has_aliases())
         .then(|| (to_owned(&cursor.value()), collect_alias_groups(cursor)));
 
+    // Snapshot the pristine presentation tree *before* evaluation too
+    // (#739, ADR-0017): same shape-preserving-write gate as `alias_sync_ctx`
+    // above (no aliases required here - a write-family expression against
+    // any YAML document can lose style/comments, not just an aliased one),
+    // and only when the caller can use the result at all (`need_comments`).
+    // `no_comments` below reconciles this against each result document once
+    // evaluation finishes.
+    let presentation_sync_ctx = (need_comments && is_alias_sensitive_assign(expr))
+        .then(|| to_owned_with_comments(&cursor.value(), Some(&cursor)));
+
     let result = eval_with_cursor_using::<YqSemantics, _>(expr, cursor);
-    let no_comments = |v| (v, CommentTree::empty());
+    // A value with no live cursor of its own (an assignment/`del()`
+    // result, a computed value, ...) has no comment/style to read directly
+    // - but if it came from a shape-preserving write, `presentation_sync_ctx`
+    // lets it recover whatever the write didn't touch instead of falling
+    // back to genuinely empty (#739).
+    let no_comments = |v: OwnedValue| {
+        let comments = presentation_sync_ctx
+            .as_ref()
+            .map_or_else(CommentTree::empty, |(pristine, tree)| {
+                reconcile_presentation(pristine, tree, &v)
+            });
+        (v, comments)
+    };
     // `to_owned_with_comments` builds a full parallel `IndexMap`/`Vec` tree
     // alongside the `OwnedValue` one, just to carry comment text - wasted
     // work when the caller can't use it (`-o json`'s output never reads
@@ -982,7 +1128,60 @@ fn evaluate_yaml_cursor<W: AsRef<[u64]> + Clone>(
         }
     }
 
+    // A bare top-level/navigated scalar result drops all its own styling,
+    // matching real `yq` (#852) - unlike a scalar nested inside a mapping/
+    // sequence, which keeps it (`a: "x"` stays quoted when output as part
+    // of the whole document; a standalone `.a` result doesn't). Both
+    // `to_owned_with_comments` and `reconcile_presentation` above capture/
+    // preserve style uniformly for every node including the root, so this
+    // needs its own always-on, top-level-only pass, independent of
+    // `need_comments`/`is_alias_sensitive_assign` — real `yq` does this
+    // unconditionally, not just for shape-preserving writes.
+    if let Ok(docs) = &mut docs {
+        for (value, comments) in docs.iter_mut() {
+            if !matches!(value, OwnedValue::Object(_) | OwnedValue::Array(_)) {
+                *comments = CommentTree::Leaf(comments.own().map(str::to_string), "");
+            }
+        }
+    }
+
+    // `-P`/`--pretty-print` (#705) forces block/plain style regardless of
+    // source — a real style-clearing step, not just "there's no style data
+    // to clear" like before #739's style tracking existed. Comments stay
+    // (`-P` only ever claimed to affect style), so this only touches the
+    // style slot of every node, not the tree shape.
+    if strip_style {
+        if let Ok(docs) = &mut docs {
+            for (_value, comments) in docs.iter_mut() {
+                *comments = strip_presentation_style(comments);
+            }
+        }
+    }
+
     docs
+}
+
+/// Recursively clear every node's style (issue #705's `-P` gate) while
+/// keeping its comments and tree shape untouched — see the `strip_style`
+/// call in [`evaluate_yaml_cursor`].
+fn strip_presentation_style(tree: &CommentTree) -> CommentTree {
+    match tree {
+        CommentTree::Leaf(c, _) => CommentTree::Leaf(c.clone(), ""),
+        CommentTree::Array(c, _, items) => CommentTree::Array(
+            c.clone(),
+            "",
+            items.iter().map(strip_presentation_style).collect(),
+        ),
+        CommentTree::Object(c, _, fields, key_comments) => CommentTree::Object(
+            c.clone(),
+            "",
+            fields
+                .iter()
+                .map(|(k, v)| (k.clone(), strip_presentation_style(v)))
+                .collect(),
+            key_comments.clone(),
+        ),
+    }
 }
 
 /// Convert a StandardJson value to an OwnedValue.
@@ -1107,12 +1306,24 @@ fn output_value<W: Write>(
         // own trailing comment from output on both identity and `select`,
         // even though `line_comment` still returns it — real `yq`'s own
         // quirk, not a succinctly gap, so replicated here rather than
-        // "fixed" into a new divergence. Appended as a standalone comment
-        // line (not glued onto `body`'s last line), so it isn't
-        // indistinguishable from the last child's own comment when `body`
-        // is multi-line block content (#793).
+        // "fixed" into a new divergence.
+        //
+        // A flow-styled root (`comments.style() == "flow"`, #739) glues the
+        // comment onto `body`'s one and only line instead
+        // (`[1, 2, 3] # trailing`, matching real `yq` exactly) - there's no
+        // nested child on that same line to collide with. A block-rendered
+        // root instead appends it as a standalone comment line, or it would
+        // be indistinguishable from the last child's own comment on
+        // `body`'s last line (#793) - `append_own_comment_line`'s own doc
+        // comment already flagged this as the reason it couldn't match real
+        // `yq`'s flow-preserving output, before `CommentTree` carried style
+        // data to tell the two cases apart.
         let output = if matches!(value, OwnedValue::Array(_) | OwnedValue::Object(_)) {
-            append_own_comment_line(body, comments.own(), "")
+            if is_flow_safe(value, comments) {
+                format!("{body}{}", trailing_comment_suffix(comments))
+            } else {
+                append_own_comment_line(body, comments.own(), "")
+            }
         } else {
             body
         };
@@ -1163,6 +1374,30 @@ fn output_value<W: Write>(
     write_terminator(writer, config)?;
 
     Ok(())
+}
+
+/// Whether `value`/`comments` should render in YAML flow style (`[...]`/
+/// `{...}`, issue #739) — `comments.style() == "flow"`, unless a child
+/// (array element or object field) has its own trailing comment.
+///
+/// A `#` comment runs to end of line, so a flow collection has nowhere to
+/// put one before its last item without breaking onto another line anyway
+/// (real `yq` does this with a synthetic trailing comma:
+/// `[1, 2, # child\n]`). Falling back to block style — already
+/// comment-safe, since every comment gets its own line there — is simpler
+/// and more general than replicating that exact placement, at the cost of
+/// not matching real `yq`'s output byte-for-byte in this one narrow case
+/// (a comment on a non-final flow element); losing the comment entirely
+/// would be worse.
+fn is_flow_safe(value: &OwnedValue, comments: &CommentTree) -> bool {
+    if comments.style() != "flow" {
+        return false;
+    }
+    match value {
+        OwnedValue::Array(items) => !(0..items.len()).any(|i| comments.at_index(i).own().is_some()),
+        OwnedValue::Object(fields) => !fields.keys().any(|k| comments.field(k).own().is_some()),
+        _ => true,
+    }
 }
 
 /// Format a node's own trailing comment (issue #710) as `" # text"`, or
@@ -1245,11 +1480,11 @@ fn emit_yaml_value(
                 value.number_str().expect("numeric variant").into_owned()
             }
         }
-        OwnedValue::String(s) => yaml_quote_string(s),
+        OwnedValue::String(s) => yaml_quote_string_with_style(s, comments.style()),
         OwnedValue::Array(arr) => {
             if arr.is_empty() {
                 "[]".to_string()
-            } else if in_flow {
+            } else if in_flow || is_flow_safe(value, comments) {
                 // Flow style for nested in flow context
                 let items: Vec<_> = arr
                     .iter()
@@ -1264,8 +1499,10 @@ fn emit_yaml_value(
                     .enumerate()
                     .map(|(i, v)| {
                         let elem_comments = comments.at_index(i);
-                        if matches!(v, OwnedValue::Object(o) if !o.is_empty())
-                            || matches!(v, OwnedValue::Array(a) if !a.is_empty())
+                        let elem_is_flow = is_flow_safe(v, elem_comments);
+                        if !elem_is_flow
+                            && (matches!(v, OwnedValue::Object(o) if !o.is_empty())
+                                || matches!(v, OwnedValue::Array(a) if !a.is_empty()))
                         {
                             // A non-empty mapping/sequence element renders
                             // in real yq's "compact" form: `- ` shares its
@@ -1318,7 +1555,7 @@ fn emit_yaml_value(
         OwnedValue::Object(obj) => {
             if obj.is_empty() {
                 "{}".to_string()
-            } else if in_flow {
+            } else if in_flow || is_flow_safe(value, comments) {
                 // Flow style for nested in flow context
                 let entries: Vec<_> = obj
                     .iter()
@@ -1346,9 +1583,13 @@ fn emit_yaml_value(
                         let field_comments = comments.field(k);
                         let comment_suffix = trailing_comment_suffix(field_comments);
                         let val_indent = format!("{indent}{}", config.indent_str);
-                        // Check if value needs to be on next line
-                        if matches!(v, OwnedValue::Object(m) if !m.is_empty())
-                            || matches!(v, OwnedValue::Array(a) if !a.is_empty())
+                        // Check if value needs to be on next line - a
+                        // flow-styled container stays on the key's own line
+                        // instead, the same as a scalar (#739).
+                        let field_is_flow = is_flow_safe(v, field_comments);
+                        if !field_is_flow
+                            && (matches!(v, OwnedValue::Object(m) if !m.is_empty())
+                                || matches!(v, OwnedValue::Array(a) if !a.is_empty()))
                         {
                             // A comment trailing the key's own line, when the
                             // value is deferred to the next line, belongs to
@@ -1441,26 +1682,89 @@ fn yaml_quote_string(s: &str) -> String {
         || s.ends_with(' ');
 
     if needs_quoting {
-        // Use double quotes with escaping
-        let mut result = String::with_capacity(s.len() + 2);
-        result.push('"');
-        for c in s.chars() {
-            match c {
-                '"' => result.push_str("\\\""),
-                '\\' => result.push_str("\\\\"),
-                '\n' => result.push_str("\\n"),
-                '\r' => result.push_str("\\r"),
-                '\t' => result.push_str("\\t"),
-                c if c.is_ascii_control() => {
-                    result.push_str(&format!("\\x{:02x}", c as u32));
-                }
-                _ => result.push(c),
-            }
-        }
-        result.push('"');
-        result
+        yaml_double_quote_escaped(s)
     } else {
         s.to_string()
+    }
+}
+
+/// Double-quote `s`, escaping as needed — the actual quoting mechanics
+/// [`yaml_quote_string`]'s heuristic falls back to whenever it decides
+/// quoting is required, factored out so [`yaml_quote_string_with_style`]
+/// can also reach it directly to *force* double-quote style regardless of
+/// whether the heuristic alone would have required it (#739).
+fn yaml_double_quote_escaped(s: &str) -> String {
+    let mut result = String::with_capacity(s.len() + 2);
+    result.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => result.push_str("\\\""),
+            '\\' => result.push_str("\\\\"),
+            '\n' => result.push_str("\\n"),
+            '\r' => result.push_str("\\r"),
+            '\t' => result.push_str("\\t"),
+            c if c.is_ascii_control() => {
+                result.push_str(&format!("\\x{:02x}", c as u32));
+            }
+            _ => result.push(c),
+        }
+    }
+    result.push('"');
+    result
+}
+
+/// Single-quote `s`, doubling embedded single quotes per YAML's escaping
+/// rule. Only meaningful when [`can_single_quote`] agrees this is safe (a
+/// single-quoted flow scalar has no escape sequence for control
+/// characters).
+fn yaml_single_quote_escaped(s: &str) -> String {
+    let mut result = String::with_capacity(s.len() + 2);
+    result.push('\'');
+    for c in s.chars() {
+        if c == '\'' {
+            result.push_str("''");
+        } else {
+            result.push(c);
+        }
+    }
+    result.push('\'');
+    result
+}
+
+/// Whether `s` can round-trip through single-quote style at all — a
+/// single-quoted YAML scalar has no escape syntax for control characters
+/// (no `\n`, `\t`, ...), unlike double-quoted.
+fn can_single_quote(s: &str) -> bool {
+    !s.chars().any(|c| c.is_ascii_control())
+}
+
+/// Quote a YAML string the way [`yaml_quote_string`] does, except honoring
+/// a known original style (`"single"`/`"double"`, from [`CommentTree`]'s
+/// per-node style — see [`CommentTree::style`]) when there is one and it's
+/// safe to reproduce, instead of always falling back to the plain-or-
+/// double-quote heuristic. This is what makes an untouched sibling of a
+/// write keep its original quote style rather than losing it entirely —
+/// `yaml_quote_string`'s heuristic alone only adds quotes where structurally
+/// *required*, which is not the same as matching what the source actually
+/// wrote (#739's `'single'` repro needs quotes at all, not just safe ones).
+///
+/// Any other style (`""`, `"flow"`, `"literal"`, `"folded"` — the last two
+/// are block-scalar styles this DOM writer doesn't reproduce; see
+/// `CommentTree`'s own doc comment) falls back to the plain heuristic
+/// unchanged.
+fn yaml_quote_string_with_style(s: &str, style: &str) -> String {
+    // No empty-string special case needed here (unlike `yaml_quote_string`
+    // below): every arm already renders `""` correctly on its own -
+    // `yaml_double_quote_escaped`/`yaml_single_quote_escaped` produce
+    // `""`/`''` for an empty `s`, and the `_` fallback defers to
+    // `yaml_quote_string`, which has its own empty-string case. A
+    // short-circuit here that always returned `''` regardless of `style`
+    // used to flip an untouched double-quoted empty string to single-quote
+    // style on a sibling write (found in review).
+    match style {
+        "single" if can_single_quote(s) => yaml_single_quote_escaped(s),
+        "double" => yaml_double_quote_escaped(s),
+        _ => yaml_quote_string(s),
     }
 }
 
@@ -2716,6 +3020,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                             doc_filter,
                             &mut sink,
                             need_comments,
+                            args.pretty_print,
                         )?;
                         global_doc_index += num_docs;
                         for results in doc_results {
@@ -3287,6 +3592,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                         doc_filter,
                         &mut sink,
                         need_comments,
+                        args.pretty_print,
                     )?;
                     global_doc_index += num_docs;
                     all_results.push(doc_results);
@@ -3525,12 +3831,14 @@ mod tests {
         let mut obj_comments = IndexMap::new();
         obj_comments.insert(
             "k".to_string(),
-            CommentTree::Leaf(Some("# k trailing".to_string())),
+            CommentTree::Leaf(Some("# k trailing".to_string()), ""),
         );
         let comments = CommentTree::Array(
             None,
+            "",
             vec![CommentTree::Object(
                 Some("# obj trailing".to_string()),
+                "",
                 obj_comments,
                 IndexMap::new(),
             )],
@@ -3733,9 +4041,15 @@ mod tests {
     /// Like [`eval_yaml`], but keeps each result's parallel `CommentTree`
     /// (issue #710) instead of discarding it.
     fn eval_yaml_with_comments(bytes: &[u8], expr: &Expr) -> Vec<ResultWithComments> {
-        let (groups, _) =
-            evaluate_yaml_direct_filtered(bytes, expr, None, &mut ErrorSink::default(), true)
-                .unwrap();
+        let (groups, _) = evaluate_yaml_direct_filtered(
+            bytes,
+            expr,
+            None,
+            &mut ErrorSink::default(),
+            true,
+            false,
+        )
+        .unwrap();
         groups.into_iter().flatten().collect()
     }
 
