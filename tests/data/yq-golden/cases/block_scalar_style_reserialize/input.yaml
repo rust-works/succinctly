@@ -34,3 +34,14 @@ folded_embedded_blank: >
 
   line2
 next_after_embedded_blank: next
+literal_explicit_indent: |2
+    foo
+  bar
+folded_explicit_indent: >2
+    foo
+    bar
+folded_explicit_indent_keep: >2+
+    foo
+    bar
+
+next_after_explicit_indent: next

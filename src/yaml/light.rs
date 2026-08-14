@@ -1444,38 +1444,117 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                 // smart-quotes the decoded value instead (and a decoded
                 // value with raw embedded newlines always needs quoting,
                 // so it always comes out double-quoted with `\n` escapes -
-                // #836). `self.style()` (already resolved through a bare
-                // `-` sequence-item wrapper, same as the container arms
-                // above) is the only thing here that knows the source
-                // style; consult it before falling through.
-                //
-                // `indent_spaces == 0` (flow/compact context, reached via
-                // `write_yaml_child_inline`) can't represent a block
-                // scalar syntactically - YAML has no way to write `|`/`>`
-                // inside `[...]`/`{...}` - so it always falls through, same
-                // as an empty decoded value (real yq drops block style for
-                // an empty scalar too: verified against the pinned oracle,
-                // `a: |\n  \n` re-emits as `a: ""`, #836).
-                let style = self.style();
-                if indent_spaces != 0 && matches!(style, "literal" | "folded") {
-                    if let Ok(decoded) = s.as_str() {
-                        // A line ending in a literal trailing space is
-                        // invisible and fragile in block form (many editors
-                        // strip it on save) - real yq falls back to a
-                        // quoted string whenever any line has one, rather
-                        // than risk it, and this matches that rather than
-                        // diverging (verified against the pinned oracle: a
-                        // trailing *tab* is fine and stays block-styled,
-                        // only a trailing space disqualifies, #836).
-                        let has_trailing_space =
-                            decoded.split('\n').any(|line| line.ends_with(' '));
-                        if !decoded.is_empty() && !has_trailing_space {
-                            return stream_yaml_block_scalar(
-                                out,
-                                &decoded,
-                                indent,
-                                style == "folded",
-                            );
+                // #836). `s`'s own enum discriminant already distinguishes
+                // block-literal/folded from every other source style - it's
+                // exactly what `stream_yaml_string_value`'s own `_`
+                // fallback arm below matches on - so there's no need for
+                // the separately-resolved-from-text `self.style()` (its own
+                // doc comment already flags it as non-free: re-derived from
+                // the cursor's text position on every call).
+                let folded = match &s {
+                    YamlString::BlockLiteral { .. } => Some(false),
+                    YamlString::BlockFolded { .. } => Some(true),
+                    _ => None,
+                };
+                if let Some(folded) = folded {
+                    // `indent_spaces == 0` (flow/compact context, reached
+                    // via `write_yaml_child_inline`) can't represent a
+                    // block scalar syntactically - YAML has no way to
+                    // write `|`/`>` inside `[...]`/`{...}`. An empty
+                    // `indent` means this is a *bare* top-level/navigated
+                    // scalar result (`stream_yaml`/`stream_yaml_document`
+                    // call `stream_yaml_value(out, "", ...)` directly, with
+                    // no parent mapping/sequence loop to have computed a
+                    // "one level deeper" indent first, unlike every nested
+                    // call site) - content re-emitted at that empty indent
+                    // would have zero structural indentation, which isn't
+                    // valid block-scalar content at all and silently
+                    // decodes back to nothing on re-parse. Both fall
+                    // through to quoting, matching what this exact
+                    // position already did pre-#836 (lossless, if not
+                    // byte-identical to real yq's own further step of
+                    // dropping styling entirely for a bare scalar root -
+                    // a separate, pre-existing gap, #852).
+                    if indent_spaces != 0 && !indent.is_empty() {
+                        if let Ok(decoded) = s.as_str() {
+                            // A line ending in a literal trailing space is
+                            // invisible and fragile in block form (many
+                            // editors strip it on save) - real yq falls
+                            // back to a quoted string whenever any line has
+                            // one, rather than risk it, and this matches
+                            // that rather than diverging (verified against
+                            // the pinned oracle: a trailing *tab* is fine
+                            // and stays block-styled, only a trailing space
+                            // disqualifies, #836).
+                            let has_trailing_space =
+                                decoded.split('\n').any(|line| line.ends_with(' '));
+                            // Real yq also always quotes a block scalar
+                            // containing a supplementary-plane character
+                            // (U+10000+, e.g. most emoji) rather than keep
+                            // it block-styled (verified against the pinned
+                            // oracle). Matched here even though our own
+                            // quoting doesn't escape it the way real yq's
+                            // `\U` form does - a separate, pre-existing gap
+                            // in `stream_yaml_double_quoted` that predates
+                            // this fix and affects *any* double-quoted
+                            // source scalar, not just block scalars - this
+                            // narrows the divergence to that one
+                            // already-existing gap instead of adding a
+                            // second, style-selection one on top of it.
+                            let has_astral = decoded.chars().any(|c| c as u32 > 0xFFFF);
+                            // A block scalar's content indentation is
+                            // either explicit (`|N`) or auto-detected from
+                            // the first non-blank content line. If that
+                            // line has literal leading whitespace of its
+                            // own (only possible when the source itself
+                            // used an explicit indent indicator, since
+                            // auto-detection always consumes all of a
+                            // first line's leading whitespace as
+                            // structural), omitting the indicator makes a
+                            // re-parse misjudge where the structural
+                            // indent ends - corrupting the content on
+                            // round-trip (#836). `indent_spaces` (this
+                            // level's own step, not `indent`'s accumulated
+                            // length) is the indicator's value - verified
+                            // against the oracle to hold regardless of
+                            // nesting depth, since every call site computes
+                            // a child's `indent` as exactly
+                            // `indent_spaces` more characters than its
+                            // parent's own.
+                            let first_content_line =
+                                decoded.split('\n').find(|line| !line.is_empty());
+                            let needs_explicit_indent =
+                                first_content_line.is_some_and(|line| line.starts_with(' '));
+                            let explicit_indent = if needs_explicit_indent {
+                                // The indicator digit is only valid as a
+                                // single ASCII digit 1-9 (YAML 1.2
+                                // §8.1.1.1) - an indent step outside that
+                                // range can't be represented at all, so
+                                // falls back to quoting rather than emit an
+                                // indicator that can't round-trip.
+                                match u8::try_from(indent_spaces) {
+                                    Ok(n) if (1..=9).contains(&n) => Some(Some(n)),
+                                    _ => None,
+                                }
+                            } else {
+                                Some(None)
+                            };
+                            if let Some(explicit_indent) = explicit_indent {
+                                if !decoded.is_empty() && !has_trailing_space && !has_astral {
+                                    return stream_yaml_block_scalar(
+                                        out,
+                                        &decoded,
+                                        indent,
+                                        explicit_indent,
+                                        folded,
+                                    );
+                                }
+                            }
+                            // Disqualified, but already decoded above -
+                            // avoid decoding `s` a second time inside
+                            // `stream_yaml_string_value` below for exactly
+                            // the same result.
+                            return stream_yaml_block_scalar_quoted(out, &decoded);
                         }
                     }
                 }
@@ -6112,13 +6191,18 @@ fn stream_yaml_nonstring_key<W: AsRef<[u64]>, Out: core::fmt::Write>(
 }
 
 /// Write a block scalar (`|` literal or `>` folded), re-emitting its
-/// original style instead of falling back to `stream_yaml_string_value`'s
+/// original style instead of falling back to [`stream_yaml_block_scalar_quoted`]'s
 /// smart quoting (#836). `decoded` is the scalar's already-decoded value
 /// (`YamlString::as_str()`'s output) - never empty, the caller already
 /// checked. `indent` is the indentation each content line gets: the same
 /// "one level deeper" string `stream_yaml_value`'s Mapping/Sequence arms
 /// already compute for every scalar value - block content is just the
-/// first case that actually *writes* it.
+/// first case that actually *writes* it. `explicit_indent` is `Some(n)`
+/// (1-9) to write an explicit indentation indicator (`|n`/`>n`) rather
+/// than rely on auto-detection - the caller already determined this is
+/// needed (`decoded`'s first content line itself starts with a space,
+/// which only auto-detection can misjudge) and that `n` fits a single
+/// digit.
 ///
 /// Two things can't be read off `decoded` alone and need deriving:
 ///
@@ -6146,23 +6230,45 @@ fn stream_yaml_nonstring_key<W: AsRef<[u64]>, Out: core::fmt::Write>(
 /// such external dependency), but produces byte-identical output because
 /// this codebase already unconditionally writes exactly one `\n` after
 /// every value, at every nesting depth, before starting the next thing.
+///
+/// The explicit-indent digit itself deliberately diverges from the pinned
+/// oracle in one confirmed-broken corner case: real yq v4.53.3 omits the
+/// indicator (and produces YAML that fails to re-parse) when the content's
+/// first line is *blank* and only a later line needs the disambiguation -
+/// verified reproducible against the pinned binary. This function always
+/// looks past leading blank lines to the first real content line instead,
+/// so it never emits that corruption - a deliberate correctness-over-
+/// byte-match call, not an oversight.
 fn stream_yaml_block_scalar<Out: core::fmt::Write>(
     out: &mut Out,
     decoded: &str,
     indent: &str,
+    explicit_indent: Option<u8>,
     folded: bool,
 ) -> core::fmt::Result {
     out.write_char(if folded { '>' } else { '|' })?;
-    out.write_str(chomping_indicator(decoded))?;
+    if let Some(n) = explicit_indent {
+        write!(out, "{n}")?;
+    }
+    out.write_str(match chomping_indicator(decoded) {
+        ChompingIndicator::Clip => "",
+        ChompingIndicator::Strip => "-",
+        ChompingIndicator::Keep => "+",
+    })?;
 
-    let widened;
-    let content: &str = if folded {
-        widened = widen_folded_breaks(decoded);
-        &widened
-    } else if let Some(stripped) = decoded.strip_suffix('\n') {
-        stripped
+    // Literal enforces the "one newline short" trailing invariant by
+    // stripping decoded's own final `\n` before the per-line loop below
+    // ever sees it; folded's trailing run only follows the same rule when
+    // an explicit indent digit was just written above - with auto-detect
+    // (`explicit_indent.is_none()`), folded's trailing run keeps its own
+    // "+1" quirk instead, matching real yq's own encoder: verified against
+    // the oracle that an explicit-indent folded scalar's trailing run
+    // behaves exactly like literal's (no extra blank line before whatever
+    // follows), while a bare `>` scalar's does not (#836 review).
+    let content: Cow<str> = if folded {
+        widen_folded_breaks(decoded, explicit_indent.is_some())
     } else {
-        decoded
+        Cow::Borrowed(decoded.strip_suffix('\n').unwrap_or(decoded))
     };
 
     for line in content.split('\n') {
@@ -6175,37 +6281,161 @@ fn stream_yaml_block_scalar<Out: core::fmt::Write>(
     Ok(())
 }
 
-/// The minimal chomping indicator (`""` clip, `"-"` strip, `"+"` keep)
-/// that makes a re-emitted block scalar decode back to exactly `decoded`
-/// (#836) - clip if there's exactly one trailing `\n` (the default, no
-/// indicator needed), strip if there's none, keep if there's more than
-/// one (a plain clip/strip re-parse would collapse or drop the rest).
-fn chomping_indicator(decoded: &str) -> &'static str {
+/// Fall back to `needs_yaml_quoting`-driven smart quoting for a block
+/// scalar's already-decoded value, exactly like
+/// [`stream_yaml_string_value`]'s own `_` (block scalar) arm - shared
+/// so a block scalar disqualified from [`stream_yaml_block_scalar`]
+/// (empty, a trailing space, an astral character, or an unrepresentable
+/// explicit-indent digit) can reuse the decode `stream_yaml_value`'s
+/// `String` arm already performed rather than pay for a second one inside
+/// `stream_yaml_string_value` (#836 review).
+fn stream_yaml_block_scalar_quoted<Out: core::fmt::Write>(
+    out: &mut Out,
+    decoded: &str,
+) -> core::fmt::Result {
+    if needs_yaml_quoting(decoded) {
+        stream_yaml_double_quoted(out, decoded)
+    } else {
+        out.write_str(decoded)
+    }
+}
+
+/// The minimal [`ChompingIndicator`] that makes a re-emitted block scalar
+/// decode back to exactly `decoded` (#836) - clip if there's exactly one
+/// trailing `\n` (the default, no indicator needed), strip if there's
+/// none, keep if there's more than one (a plain clip/strip re-parse would
+/// collapse or drop the rest).
+fn chomping_indicator(decoded: &str) -> ChompingIndicator {
     match decoded.strip_suffix('\n') {
-        None => "-",
-        Some(rest) if !rest.ends_with('\n') => "",
-        Some(_) => "+",
+        None => ChompingIndicator::Strip,
+        Some(rest) if !rest.ends_with('\n') => ChompingIndicator::Clip,
+        Some(_) => ChompingIndicator::Keep,
     }
 }
 
 /// Widen every *embedded* (non-trailing) run of `\n` in a folded scalar's
-/// decoded value by one `\n`, so each survives folding back to a space on
-/// re-parse - see [`stream_yaml_block_scalar`]'s doc comment. The
-/// scalar's own trailing run is deliberately left untouched, for the same
-/// doc comment's "one short, let the caller supply the last one" reason.
-fn widen_folded_breaks(decoded: &str) -> String {
-    let mut result = String::with_capacity(decoded.len() + 1);
-    let mut chars = decoded.chars().peekable();
-    while let Some(ch) = chars.next() {
-        result.push(ch);
-        if ch == '\n' && chars.peek().is_some() && chars.peek() != Some(&'\n') {
-            // End of a run of `\n`s with more content after it (not the
-            // scalar's own trailing run, which runs to the end of
-            // `decoded` with nothing following) - widen it by one.
-            result.push('\n');
-        }
+/// decoded value by one `\n` - but only where widening is actually needed
+/// to survive folding back to a space on re-parse; see
+/// [`stream_yaml_block_scalar`]'s doc comment. The scalar's own trailing
+/// run is otherwise left untouched (auto-detect's "+1" trailing quirk,
+/// relying on the caller's own separator to supply the last one), unless
+/// either `explicit_indent_used` (an explicit indent digit was written)
+/// or the *last* content line before the trailing run is itself
+/// more-indented - either one says to instead strip one `\n` from the
+/// trailing run, matching real yq's own encoder (verified against the
+/// pinned oracle across all four `{explicit indent, auto-detect} ×
+/// {last line plain, last line more-indented}` combinations: the "+1"
+/// trailing quirk fires only for auto-detect *with* a plain last line;
+/// every other combination behaves exactly like literal's trailing run,
+/// #836 review - the second condition wasn't obvious from the explicit-
+/// indent tests alone, since explicit-indent content commonly has every
+/// line more-indented, only one variable moving at a time revealed there
+/// were two).
+///
+/// A run between two content lines needs widening only when *neither*
+/// line is "more-indented" (starts with a space/tab of its own literal
+/// content, distinct from this function's structural `indent` - decoding
+/// already strips that off, so what's left is exactly YAML 1.2 §8.1.3's
+/// "more-indented" test). Folding only ever collapses a break between two
+/// lines at the *same* indentation; a break next to a more-indented line
+/// is never folded in the first place; widening it anyway would insert an
+/// extra blank line decoding never produced (confirmed against the pinned
+/// oracle: an explicit-indent block scalar whose content lines all carry
+/// their own extra leading space - the common case once an indicator is
+/// needed at all - must NOT have its embedded breaks widened, #836
+/// review).
+///
+/// One real divergence from the pinned oracle is deliberate here: real
+/// yq's own encoder widens a "mixed" run too (a plain line transitioning
+/// to a more-indented one, or vice versa) whenever the *earlier* line is
+/// plain - i.e. it's asymmetric, widening a plain→indented transition but
+/// not an indented→plain one, even though YAML 1.2 §8.1.3 treats both
+/// identically ("either" side more-indented suppresses folding, full
+/// stop). Confirmed non-idempotent: piping a plain→indented block scalar
+/// through real yq `.` twice adds a blank line the *first* pass's own
+/// decoded value never had - genuine data corruption, not a style choice
+/// to replicate (a wider sweep against the oracle across style × chomping
+/// × context surfaced this beyond the narrower "both sides indented"
+/// cases found first; every case in that sweep where this function's
+/// output disagreed with the oracle was independently confirmed to
+/// round-trip losslessly on this function's side and lossily on the
+/// oracle's, #836 review).
+///
+/// Borrows `decoded` unchanged (no allocation) whenever there's nothing to
+/// widen and no trailing reduction needed - true for the common case of a
+/// single auto-detected-indent paragraph with no embedded blank lines or
+/// more-indented runs, where the only `\n` is the scalar's own trailing
+/// one. A single physical line can only be more-indented under an
+/// explicit indent digit (auto-detection always consumes a lone first
+/// line's own leading whitespace as structural, leaving none behind) -
+/// so `explicit_indent_used` is the only trailing-reduction trigger this
+/// fast path needs to check; the "last line more-indented" condition can
+/// only arise with 2+ physical lines, which always means an embedded run
+/// exists too and takes the full-scan path below instead.
+fn widen_folded_breaks(decoded: &str, explicit_indent_used: bool) -> Cow<'_, str> {
+    let trailing_run_start = decoded.trim_end_matches('\n').len();
+    // `decoded[..trailing_run_start]` is everything before the scalar's own
+    // trailing run - correct even when there IS no trailing run at all
+    // (strip chomping, `trailing_run_start == decoded.len()`), in which
+    // case it's simply the whole string: an embedded `\n` still needs
+    // finding there (#836 review - an earlier version of this check added
+    // a redundant `trailing_run_start != decoded.len()` guard that
+    // short-circuited straight past this exact case, silently skipping
+    // widening for any strip-chomped folded scalar with an embedded
+    // blank line).
+    let has_embedded = decoded[..trailing_run_start].contains('\n');
+    if !has_embedded {
+        // Nothing to widen - narrowing a borrowed slice by one trailing
+        // `\n` (if needed) is still allocation-free.
+        return if explicit_indent_used && decoded.ends_with('\n') {
+            Cow::Borrowed(&decoded[..decoded.len() - 1])
+        } else {
+            Cow::Borrowed(decoded)
+        };
     }
-    result
+
+    let bytes = decoded.as_bytes();
+    let mut result = String::with_capacity(decoded.len() + 4);
+    let mut line_start = 0; // start of the line currently being scanned
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'\n' {
+            i += 1;
+            continue;
+        }
+        // Found the end of a line (`line_start..i`) - push its own text,
+        // then measure the `\n` run that follows it. `\n` is always a
+        // single UTF-8 byte and never part of a multi-byte sequence, so
+        // byte-indexed slicing here stays on char boundaries.
+        result.push_str(&decoded[line_start..i]);
+        let run_start = i;
+        while i < bytes.len() && bytes[i] == b'\n' {
+            i += 1;
+        }
+        let is_trailing_run = run_start >= trailing_run_start;
+        // The line just scanned (`line_start..run_start`) is non-empty by
+        // construction here - see this function's own doc comment on why
+        // a truly blank "line" never becomes a `prev`/`next` check target
+        // (its own boundary bytes are `\n`, which never match `b' ' |
+        // b'\t'`, so it degrades to `false` automatically either way).
+        let prev_more_indented = matches!(bytes[line_start], b' ' | b'\t');
+        if is_trailing_run && (explicit_indent_used || prev_more_indented) {
+            // The run is non-empty by construction (`trailing_run_start !=
+            // decoded.len()`, checked above) - safe to omit its last `\n`.
+            result.push_str(&decoded[run_start..i - 1]);
+        } else {
+            result.push_str(&decoded[run_start..i]);
+            if !is_trailing_run {
+                let next_more_indented = matches!(bytes.get(i), Some(b' ' | b'\t'));
+                if !prev_more_indented && !next_more_indented {
+                    result.push('\n');
+                }
+            }
+        }
+        line_start = i;
+    }
+    result.push_str(&decoded[line_start..]);
+    Cow::Owned(result)
 }
 
 fn stream_yaml_string_value<Out: core::fmt::Write>(
@@ -6239,14 +6469,13 @@ fn stream_yaml_string_value<Out: core::fmt::Write>(
                 out.write_str(&str_val)
             }
         }
-        _ => {
-            // Block scalar - use smart quoting based on content
-            if needs_yaml_quoting(&str_val) {
-                stream_yaml_double_quoted(out, &str_val)
-            } else {
-                out.write_str(&str_val)
-            }
-        }
+        // Block scalar reached here either because `stream_yaml_value`'s
+        // `String` arm already tried `stream_yaml_block_scalar`'s
+        // style-preserving path and fell through knowing this fallback is
+        // needed (#836), or via `write_yaml_field_key` for an explicit-key
+        // block scalar (`? |\n  key\n: value`), which never attempts block
+        // style for a *key* at all - both want the same smart quoting.
+        _ => stream_yaml_block_scalar_quoted(out, &str_val),
     }
 }
 
@@ -7584,6 +7813,62 @@ mod tests {
             .stream_yaml_document(&mut out, IndentSpec::spaces(2), false)
             .unwrap();
         assert_eq!(out, "t: \"x \"");
+    }
+
+    #[test]
+    fn test_needs_yaml_quoting_and_looks_like_yaml_number_malformed_shapes() {
+        // Drives `needs_yaml_quoting`/`looks_like_yaml_number` directly with
+        // the same malformed-number/keyword-looking shapes
+        // `test_stream_yaml_block_scalar_style_preserved_regardless_of_
+        // content_shape` used to exercise indirectly, before #836 made all
+        // of them keep their block style instead of falling through to
+        // smart quoting. Without this, a regression in either function
+        // (e.g. misclassifying `+5x` as a number, or `1.5.5` as not one)
+        // would ship with no test catching it - `needs_yaml_quoting`'s only
+        // other caller here is `stream_yaml_nonstring_key`
+        // (non-string/complex mapping keys), which no existing test drives
+        // with numeric-edge-case content (#836 review).
+        assert!(needs_yaml_quoting("true")); // resolves as a bool keyword
+        assert!(needs_yaml_quoting("123")); // plain integer
+        assert!(needs_yaml_quoting("1.5e+3")); // float with exponent
+        assert!(!needs_yaml_quoting("12x")); // not a number: trailing non-digit
+        assert!(!needs_yaml_quoting("1.5.5")); // not a number: two dots
+        assert!(!needs_yaml_quoting("+x")); // not a number: sign with no digits after
+        assert!(!needs_yaml_quoting("+5x")); // not a number: digits then non-digit
+        assert!(!needs_yaml_quoting("+")); // `+` alone isn't a number and isn't a leading indicator (only `-` is)
+        assert!(needs_yaml_quoting("-foo")); // leading `-` is a sequence indicator
+
+        assert!(looks_like_yaml_number("123"));
+        assert!(looks_like_yaml_number("-123"));
+        assert!(looks_like_yaml_number("+123"));
+        assert!(looks_like_yaml_number("1.5e+3"));
+        assert!(looks_like_yaml_number("1.5e-3"));
+        assert!(!looks_like_yaml_number(""));
+        assert!(!looks_like_yaml_number("12x"));
+        assert!(!looks_like_yaml_number("1.5.5"));
+        assert!(!looks_like_yaml_number("+"));
+        assert!(!looks_like_yaml_number("+x"));
+        assert!(!looks_like_yaml_number("+5x"));
+    }
+
+    #[test]
+    fn test_stream_yaml_block_scalar_explicit_indent_digit_out_of_range_falls_back_to_quoted() {
+        // The `succinctly yq` CLI's own `-I` flag caps at 7 (`0..=7`), so
+        // `indent_spaces` can never reach double digits through the CLI -
+        // but `stream_yaml_document`/`IndentSpec::spaces` are public
+        // library API with no such range restriction, and YAML 1.2
+        // §8.1.1.1 only allows a single digit (1-9) for an explicit
+        // indent indicator. A content line needing the indicator at an
+        // indent step the indicator can't represent must fall back to
+        // quoting rather than emit an indicator that can't round-trip.
+        let yaml = b"a: |2\n    foo\n  bar\nc: after\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let mut out = String::new();
+        index
+            .root(yaml)
+            .stream_yaml_document(&mut out, IndentSpec::spaces(12), false)
+            .unwrap();
+        assert_eq!(out, "a: \"  foo\\nbar\\n\"\nc: after");
     }
 
     #[test]

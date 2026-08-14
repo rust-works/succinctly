@@ -3737,6 +3737,241 @@ fn test_block_scalar_style_preserved_through_slurp() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn test_block_scalar_explicit_indent_indicator_preserved() -> Result<()> {
+    // A source explicit indent indicator (`|2`) means the content's first
+    // line has 2 literal leading spaces of its own, beyond the 2-space
+    // structural indent - decoded value is "  foo\nbar\n". Dropping the
+    // indicator on re-emission and relying on auto-detection would make a
+    // re-parse see 4 leading spaces on "foo" as the (wrongly) detected
+    // content indent, then dedent-terminate the scalar at "bar" (2 spaces
+    // < 4) - silently truncating the value and misparsing the rest of the
+    // document as a new mapping entry. This was a real, confirmed
+    // corruption bug found in review, not just a style/byte mismatch.
+    let input = "a: |2\n    foo\n  bar\nc: after\n";
+    let (output, exit_code) = run_yq_stdin(".", input, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "a: |2\n    foo\n  bar\nc: after\n");
+    // Round-trip through succinctly's own JSON decoder to confirm no
+    // corruption, not just a byte match against this one fixture.
+    let (decoded, code2) = run_yq_stdin(".", &output, &["-o", "json", "-I0"])?;
+    assert_eq!(code2, 0);
+    assert_eq!(decoded.trim(), "{\"a\":\"  foo\\nbar\\n\",\"c\":\"after\"}");
+    Ok(())
+}
+
+#[test]
+fn test_block_scalar_explicit_indent_folded_more_indented_lines_not_widened() -> Result<()> {
+    // Every content line under an explicit indent indicator commonly
+    // carries its own extra leading whitespace (that's usually *why* the
+    // source needed the indicator at all) - making every line
+    // "more-indented" per YAML 1.2 §8.1.3, which already blocks folding
+    // between them without any widening. `widen_folded_breaks` must not
+    // treat this array's embedded `\n` the same as a plain (non-indented)
+    // one - real yq keeps the single break as-is (found in review: an
+    // earlier version of this fix over-widened here, producing an extra
+    // blank line real yq does not).
+    let input = "a: >2\n    foo\n    bar\nc: after\n";
+    let (output, exit_code) = run_yq_stdin(".", input, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "a: >2\n    foo\n    bar\nc: after\n");
+    Ok(())
+}
+
+#[test]
+fn test_block_scalar_explicit_indent_trailing_run_not_widened() -> Result<()> {
+    // Auto-detected folded style writes its trailing run one `\n` wider
+    // than the decoded value's own count (see
+    // `test_block_scalar_folded_style_preserved_as_mapping_field`) -
+    // that "+1" quirk is specific to auto-detection; an explicit-indent
+    // folded scalar's trailing run must NOT get the same treatment (found
+    // in review: an earlier version of this fix always widened it,
+    // producing a spurious blank line before the next sibling that real
+    // yq does not).
+    let input = "a: >2+\n    foo\n    bar\n\nc: next\n";
+    let (output, exit_code) = run_yq_stdin(".", input, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "a: >2+\n    foo\n    bar\n\nc: next\n");
+    Ok(())
+}
+
+#[test]
+fn test_block_scalar_bare_top_level_projection_falls_back_to_quoted() -> Result<()> {
+    // `.a` navigates to a single scalar and makes it the *whole* output -
+    // `stream_yaml_document` calls `stream_yaml_value(out, "", ...)` for a
+    // bare top-level result, with no parent mapping/sequence loop having
+    // computed a "one level deeper" indent first (unlike every nested call
+    // site). Re-emitting block-style content at that empty indent would
+    // have zero structural indentation, which isn't valid block-scalar
+    // content and silently decodes back to "" on re-parse - a real,
+    // confirmed data-loss bug found in review (`.a` field projection is
+    // one of the most common query shapes there is). Falling back to
+    // quoting here is lossless, matching what this exact position already
+    // did before #836 (real yq instead drops ALL styling for a bare
+    // top-level/navigated scalar, tracked separately as #852).
+    let input = "a: |\n  foo\n  bar\nc: 1\n";
+    let (output, exit_code) = run_yq_stdin(".a", input, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "\"foo\\nbar\\n\"\n");
+    // The critical assertion: round-tripping must not lose the content.
+    let (decoded, code2) = run_yq_stdin(".", &output, &["-o", "json"])?;
+    assert_eq!(code2, 0);
+    assert_eq!(decoded.trim(), "\"foo\\nbar\\n\"");
+    Ok(())
+}
+
+#[test]
+fn test_block_scalar_astral_character_falls_back_to_quoted() -> Result<()> {
+    // Real yq always quotes a block scalar containing a supplementary-
+    // plane character (U+10000+, e.g. most emoji) rather than keep it
+    // block-styled (found in review, verified against the pinned oracle).
+    // Our own quoting doesn't escape it the way real yq's `\U` form does
+    // (a separate, pre-existing gap in `stream_yaml_double_quoted`
+    // predating this fix, unrelated to block scalars specifically) - this
+    // test only pins the *style* choice (quoted, not block), not the
+    // escape bytes.
+    let input = "a: |\n  emoji \u{1F389} here\nb: next\n";
+    let (output, exit_code) = run_yq_stdin(".", input, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "a: \"emoji \u{1F389} here\\n\"\nb: next\n");
+    Ok(())
+}
+
+#[test]
+fn test_block_scalar_bmp_character_keeps_block_style() -> Result<()> {
+    // Contrast with the astral test above: a BMP character (here CJK,
+    // U+65E5, well under U+10000) does not disqualify block style.
+    let input = "a: |\n  cjk \u{65E5}\u{672C}\u{8A9E} here\nb: next\n";
+    let (output, exit_code) = run_yq_stdin(".", input, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(
+        output,
+        "a: |\n  cjk \u{65E5}\u{672C}\u{8A9E} here\nb: next\n"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_block_scalar_explicit_indent_and_trailing_space_both_disqualify() -> Result<()> {
+    // A content line can need an explicit indent indicator (leading
+    // whitespace of its own) *and* independently be trailing-space
+    // disqualified at the same time - the two checks are independent
+    // conditions on the same decoded value, and this drives both true at
+    // once to make sure the (already-computed) explicit-indent digit
+    // doesn't leak into the quoted fallback path.
+    let input = "a: |2\n    foo \n  bar\nc: after\n";
+    let (output, exit_code) = run_yq_stdin(".", input, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "a: \"  foo \\nbar\\n\"\nc: after\n");
+    Ok(())
+}
+
+#[test]
+fn test_block_scalar_bare_top_level_projection_of_plain_safe_content_stays_unquoted() -> Result<()>
+{
+    // Contrast with `..._falls_back_to_quoted` above: a bare top-level
+    // projection whose decoded value doesn't need quoting for any other
+    // reason (single line, strip chomping, no leading/trailing
+    // whitespace, not keyword/number-looking) comes out completely bare,
+    // not "-safe-but-still-quoted" - `stream_yaml_block_scalar_quoted`
+    // makes its own independent `needs_yaml_quoting` decision once block
+    // style is ruled out, it doesn't force quoting just because block
+    // style was.
+    let input = "a: |-\n  hello\nb: 2\n";
+    let (output, exit_code) = run_yq_stdin(".a", input, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "hello\n");
+    Ok(())
+}
+
+#[test]
+fn test_block_scalar_folded_explicit_indent_single_line_no_embedded_runs() -> Result<()> {
+    // A single physical content line under an explicit indent indicator
+    // has nothing to fold against, so `widen_folded_breaks` takes its
+    // no-embedded-runs fast path (`Cow::Borrowed`, narrowing rather than
+    // reallocating) while still needing its trailing `\n` reduced by one
+    // (`reduce_trailing`, since an indicator was written) - distinct from
+    // the multi-line explicit-indent tests above, which all go through
+    // the full scanning path instead.
+    let input = "a: >2\n    foo\nc: next\n";
+    let (output, exit_code) = run_yq_stdin(".", input, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "a: >2\n    foo\nc: next\n");
+    Ok(())
+}
+
+#[test]
+fn test_block_scalar_folded_strip_chomping_embedded_blank_line_still_widened() -> Result<()> {
+    // Found by a systematic style x chomping x context sweep against the
+    // pinned oracle: an earlier version of `widen_folded_breaks` computed
+    // "is there an embedded run to widen" as `trailing_run_start !=
+    // decoded.len() && ...`, which was meant as a quick "is there a
+    // trailing run at all" shortcut but instead skipped the whole
+    // embedded-run scan whenever there was NO trailing run - exactly the
+    // strip-chomping case (`decoded` doesn't end in `\n`, so
+    // `trim_end_matches('\n')` is a no-op and `trailing_run_start ==
+    // decoded.len()`). A folded scalar with strip chomping AND an
+    // embedded blank line silently lost that blank line's widening,
+    // collapsing "foo\n\nbar" back down to "foo\nbar" - which decodes to
+    // a different value than the source ("foo\nbar" folds its break away
+    // entirely, versus the two breaks needed to preserve it, #836 review).
+    let input = "a: >-\n  foo\n\n  bar\nc: after\n";
+    let (output, exit_code) = run_yq_stdin(".", input, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "a: >-\n  foo\n\n  bar\nc: after\n");
+    Ok(())
+}
+
+#[test]
+fn test_block_scalar_folded_auto_detect_trailing_run_reduced_when_last_line_more_indented(
+) -> Result<()> {
+    // The auto-detect folded "+1" trailing quirk (see
+    // `test_block_scalar_folded_style_preserved_as_mapping_field`) turned
+    // out to have a second trigger condition, found by a sweep: it fires
+    // only when *neither* an explicit indent digit was written *nor* the
+    // last content line before the trailing run is itself more-indented.
+    // This case isolates that second condition alone (no explicit
+    // indicator at all - "foo" auto-detects the indent - but "bar" is
+    // more-indented relative to it), which an earlier version of this fix
+    // missed (it kept the trailing quirk regardless of the last line's
+    // own indentation, adding a spurious extra blank line, #836 review).
+    let input = "a: >+\n  foo\n    bar\n\nc: next\n";
+    let (output, exit_code) = run_yq_stdin(".", input, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "a: >+\n  foo\n    bar\n\nc: next\n");
+    // The critical property: round-tripping preserves the decoded value.
+    let (decoded, code2) = run_yq_stdin(".", &output, &["-o", "json", "-I0"])?;
+    assert_eq!(code2, 0);
+    assert_eq!(
+        decoded.trim(),
+        "{\"a\":\"foo\\n  bar\\n\\n\",\"c\":\"next\"}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_block_scalar_folded_mixed_indentation_transition_stays_lossless() -> Result<()> {
+    // A deliberate, documented divergence from the pinned oracle (see
+    // `widen_folded_breaks`'s own doc comment): real yq's encoder widens
+    // an embedded run between a plain line and a more-indented one when
+    // the *plain* line comes first, but not when it comes second - a
+    // genuine, confirmed-non-idempotent bug (round-tripping through real
+    // yq `.` twice injects a blank line the first pass's own decoded
+    // value never had), not a style choice worth replicating. This test
+    // pins that this crate's own output stays lossless across that exact
+    // transition shape instead of reproducing the asymmetric bug.
+    let input = "a: >+\n  qux\n    foo\n\nc: after\n";
+    let (output, exit_code) = run_yq_stdin(".", input, &[])?;
+    assert_eq!(exit_code, 0);
+    let (decoded, code2) = run_yq_stdin(".", &output, &["-o", "json", "-I0"])?;
+    assert_eq!(code2, 0);
+    assert_eq!(
+        decoded.trim(),
+        "{\"a\":\"qux\\n  foo\\n\\n\",\"c\":\"after\"}"
+    );
+    Ok(())
+}
+
 // =============================================================================
 // Compatibility tests - Multi-document handling
 // =============================================================================
