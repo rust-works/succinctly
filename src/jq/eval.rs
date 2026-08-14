@@ -2961,25 +2961,31 @@ fn builtin_has<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             });
             QueryResult::Owned(OwnedValue::Bool(found))
         }
-        // Array has index - jq returns false for negative, yq returns true if in range
+        // Array has index - jq returns false for negative, yq returns true if
+        // in range. Any numeric key type is accepted here, not just Int --
+        // `numeric_key_to_array_index` truncates a Float toward zero in jq
+        // mode (matching jq's own `.[1.5]` coercion) and reports `None` for
+        // NaN, which is never in bounds. yq mode never accepts a Float key
+        // at all (that helper's own doc comment has the real-yq-verified
+        // rationale) -- #909 review: this arm used to match only Int,
+        // erroring on a Float/NaN key in *either* mode instead of matching
+        // each mode's own real behavior.
         (
             StandardJson::Array(elements),
-            OwnedValue::Int(idx) | OwnedValue::NumberLiteral(NumberRepr::Int(idx), _),
+            OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..),
         ) => {
-            let len = (*elements).count() as i64;
-            let in_bounds = if S::NEGATIVE_INDEX_IN_HAS {
-                // yq behavior: negative indices are valid if abs(idx) <= len
-                // -- `unsigned_abs`, not `abs`, since `i64::MIN.abs()`
-                // overflows (panics in debug, silently wraps back to a
-                // still-negative i64::MIN in release, #908 review).
-                if *idx >= 0 {
-                    *idx < len
-                } else {
-                    idx.unsigned_abs() <= len as u64
+            let in_bounds = match numeric_key_to_array_index::<S>(&key_owned) {
+                // NaN: a number, so the container check above still
+                // applies, but no element -- never in bounds. `elements`
+                // is a lazy O(n) cursor walk (`StandardJson::Array`, #909
+                // review), so this short-circuits before paying for it,
+                // matching the `Some` arm's own `len` computation being
+                // needed at all.
+                None => false,
+                Some(idx) => {
+                    let len = (*elements).count() as i64;
+                    index_in_array_bounds::<S>(idx, len)
                 }
-            } else {
-                // jq behavior: only non-negative indices
-                *idx >= 0 && *idx < len
             };
             QueryResult::Owned(OwnedValue::Bool(in_bounds))
         }
@@ -3017,6 +3023,11 @@ fn builtin_in<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // doesn't change `.`).
     let key_owned = to_owned(&value);
     let (candidates, xs_escape) = eval_owned_multi_keep_partial::<S>(obj_expr, &key_owned);
+    // `key_owned` doesn't change across `candidates`, so this is computed
+    // once rather than once per candidate (#909 review). Semantics-aware --
+    // see `numeric_key_to_array_index`'s own doc comment for why yq mode
+    // doesn't just truncate a Float key the way jq does.
+    let key_idx = numeric_key_to_array_index::<S>(&key_owned);
 
     let mut results: Vec<OwnedValue> = Vec::with_capacity(candidates.len());
     let mut check_escape: Option<EvalEscape> = None;
@@ -3025,25 +3036,21 @@ fn builtin_in<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             (OwnedValue::String(key), OwnedValue::Object(fields)) => {
                 results.push(OwnedValue::Bool(fields.keys().any(|k| k == key)));
             }
-            // jq returns false for negative indices, yq returns true if in range
+            // jq returns false for negative indices, yq returns true if in
+            // range. Any numeric key type is accepted here, not just Int --
+            // see `builtin_has`'s matching arm (#909 review) for the full
+            // rationale on truncating a Float toward zero and treating NaN
+            // as never-in-bounds via `numeric_key_to_index`.
             (
-                OwnedValue::Int(idx) | OwnedValue::NumberLiteral(NumberRepr::Int(idx), _),
+                OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..),
                 OwnedValue::Array(elements),
             ) => {
-                let len = elements.len() as i64;
-                let in_bounds = if S::NEGATIVE_INDEX_IN_HAS {
-                    // yq behavior: negative indices are valid if abs(idx) <= len
-                    // -- `unsigned_abs`, not `abs`, since `i64::MIN.abs()`
-                    // overflows (panics in debug, silently wraps back to a
-                    // still-negative i64::MIN in release, #908 review).
-                    if *idx >= 0 {
-                        *idx < len
-                    } else {
-                        idx.unsigned_abs() <= len as u64
+                let in_bounds = match key_idx {
+                    None => false,
+                    Some(idx) => {
+                        let len = elements.len() as i64;
+                        index_in_array_bounds::<S>(idx, len)
                     }
-                } else {
-                    // jq behavior: only non-negative indices
-                    *idx >= 0 && *idx < len
                 };
                 results.push(OwnedValue::Bool(in_bounds));
             }
@@ -7974,6 +7981,52 @@ pub(crate) fn numeric_key_to_index(key: &OwnedValue) -> Option<i64> {
         OwnedValue::NumberLiteral(NumberRepr::Int(i), _) => Some(*i),
         OwnedValue::NumberLiteral(NumberRepr::Float(f), _) if !f.is_nan() => Some(f.trunc() as i64),
         _ => None,
+    }
+}
+
+/// Resolve a `has()`/`in()` array key to an index, per `S`'s own float-key
+/// policy -- unlike [`numeric_key_to_index`] (used for actual `.[key]`
+/// indexing, unconditionally truncating), real yq (mikefarah/yq, confirmed
+/// live against the pinned v4.53.3) never accepts a `Float` key for array
+/// *existence* checks at all, regardless of its truncated value: `.a |
+/// has(2.0)` is `false` on `a: [1,2,3]`, even though `2.0` would truncate to
+/// the in-bounds index `2`. jq, by contrast, does truncate
+/// (`numeric_key_to_index`'s own contract). #909's own review caught this:
+/// the fix that added Float/NaN support here originally routed both
+/// semantics through the same jq-style truncation uniformly.
+fn numeric_key_to_array_index<S: EvalSemantics>(key: &OwnedValue) -> Option<i64> {
+    if S::NEGATIVE_INDEX_IN_HAS {
+        // yq: only a genuine integer key resolves.
+        match key {
+            OwnedValue::Int(i) => Some(*i),
+            OwnedValue::NumberLiteral(NumberRepr::Int(i), _) => Some(*i),
+            _ => None,
+        }
+    } else {
+        numeric_key_to_index(key)
+    }
+}
+
+/// Is a resolved array index (from [`numeric_key_to_array_index`]) within
+/// bounds for an array of length `len`, per `S`'s negative-index policy?
+/// Shared by `builtin_has`/`builtin_in`'s array-key arms (#909 review: their
+/// own copies of this check had already drifted once, in #908's
+/// `i64::MIN`-overflow fix, before this PR re-duplicated it a second time
+/// widening both to accept Float/NaN keys).
+fn index_in_array_bounds<S: EvalSemantics>(idx: i64, len: i64) -> bool {
+    if S::NEGATIVE_INDEX_IN_HAS {
+        // yq behavior: negative indices are valid if abs(idx) <= len --
+        // `unsigned_abs`, not `abs`, since `i64::MIN.abs()` overflows
+        // (panics in debug, silently wraps back to a still-negative
+        // i64::MIN in release, #908 review).
+        if idx >= 0 {
+            idx < len
+        } else {
+            idx.unsigned_abs() <= len as u64
+        }
+    } else {
+        // jq behavior: only non-negative indices
+        idx >= 0 && idx < len
     }
 }
 
@@ -25022,6 +25075,29 @@ mod tests {
     }
 
     #[test]
+    fn test_builtin_has_float_and_nan_array_key_909() {
+        // #909: the array-index arm used to match only Int, erroring on a
+        // Float/NaN key instead of truncating toward zero (matching jq's
+        // own `.[1.5]` coercion) or, for NaN, answering `false` -- both via
+        // the existing `numeric_key_to_index` helper. Confirmed against jq
+        // 1.7.1: `[1,2,3] | has(1.5)` and `has(2.9)` are both `true`
+        // (truncate to index 1/2, in bounds); `has(5.5)` is `false` (index
+        // 5, out of bounds); `has(nan)` is `false`.
+        query!(br"[1, 2, 3]", "has(1.5)",
+            QueryResult::Owned(OwnedValue::Bool(true)) => {}
+        );
+        query!(br"[1, 2, 3]", "has(2.9)",
+            QueryResult::Owned(OwnedValue::Bool(true)) => {}
+        );
+        query!(br"[1, 2, 3]", "has(5.5)",
+            QueryResult::Owned(OwnedValue::Bool(false)) => {}
+        );
+        query!(br"[1, 2, 3]", "has(nan)",
+            QueryResult::Owned(OwnedValue::Bool(false)) => {}
+        );
+    }
+
+    #[test]
     fn test_builtin_in() {
         // in() checks if a key/index exists
         // Note: in() with piped owned values requires fixing eval_pipe
@@ -25067,6 +25143,24 @@ mod tests {
         // is `false`.
         assert_eq!(outputs(b"2", "in([1,2,3])"), ["true"]);
         assert_eq!(outputs(b"5", "in([1,2,3])"), ["false"]);
+    }
+
+    #[test]
+    // `"in([1,2,3])"` is a jq filter literal, not a formatting string;
+    // clippy cannot tell the two apart from the brace shape alone.
+    #[allow(clippy::literal_string_with_formatting_args)]
+    fn test_builtin_in_float_and_nan_array_key_909() {
+        // #909: `in(xs)`'s array-index arm had the identical Float/NaN gap
+        // as `builtin_has`'s (see `test_builtin_has_float_and_nan_array_key_909`).
+        // Confirmed against jq 1.7.1: `1.5 | in([1,2,3])` and `2.9 |
+        // in([1,2,3])` are both `true`; `5.5 | in([1,2,3])` is `false`;
+        // `nan | in([1,2,3])` is `false`.
+        assert_eq!(outputs(b"1.5", "in([1,2,3])"), ["true"]);
+        assert_eq!(outputs(b"2.9", "in([1,2,3])"), ["true"]);
+        assert_eq!(outputs(b"5.5", "in([1,2,3])"), ["false"]);
+        // JSON has no NaN literal, so `nan` has to come from the filter's
+        // own jq-level constant rather than the input document.
+        assert_eq!(outputs(b"null", "nan | in([1,2,3])"), ["false"]);
     }
 
     #[test]
