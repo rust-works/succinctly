@@ -5669,6 +5669,159 @@ fn test_compact_mapping_first_field_dispatch_agrees_with_ordinary_mapping_entry_
     Ok(())
 }
 
+#[test]
+fn test_flow_or_block_value_dispatch_agrees_across_all_four_sites_876() -> Result<()> {
+    // #876: `parse_compact_mapping_entry`, `parse_mapping_entry`,
+    // `parse_explicit_value`, and `parse_value` used to each hand-roll their
+    // own copy of the `[`/`{`/`|`/`>` inline-value dispatch table - the same
+    // "one copy is missing an arm the other has" bug class recurring six
+    // times (#325, #372, #406, #224, #785, #864) before being unified into
+    // one shared `try_dispatch_flow_or_block_value` helper. The test above
+    // guards two of those four sites (compact-mapping vs. ordinary mapping);
+    // this one extends the same "the tables must agree" invariant to the
+    // other two - `parse_explicit_value` (`? key` / `: value`) and
+    // `parse_value` (a sequence item that's directly a flow collection or
+    // block scalar, not wrapped in a compact mapping) - against the same
+    // ordinary-mapping-entry baseline, so a future edit to any one site
+    // without the shared helper fails here rather than shipping silently.
+    let baseline: &[(&str, &str)] = &[
+        ("a: {x: 1, y: 2}\n", ".a"),
+        ("a: [1, 2, 3]\n", ".a"),
+        ("a: {}\n", ".a"),
+        ("a: []\n", ".a"),
+        ("a: |\n  hello\n  world\n", ".a"),
+        ("a: >\n  hello\n  world\n", ".a"),
+    ];
+    let explicit_value: &[(&str, &str)] = &[
+        ("? a\n: {x: 1, y: 2}\n", ".a"),
+        ("? a\n: [1, 2, 3]\n", ".a"),
+        ("? a\n: {}\n", ".a"),
+        ("? a\n: []\n", ".a"),
+        ("? a\n: |\n  hello\n  world\n", ".a"),
+        ("? a\n: >\n  hello\n  world\n", ".a"),
+    ];
+    let bare_sequence_item: &[(&str, &str)] = &[
+        ("- {x: 1, y: 2}\n", ".[0]"),
+        ("- [1, 2, 3]\n", ".[0]"),
+        ("- {}\n", ".[0]"),
+        ("- []\n", ".[0]"),
+        ("- |\n  hello\n  world\n", ".[0]"),
+        ("- >\n  hello\n  world\n", ".[0]"),
+    ];
+    for ((baseline_doc, baseline_filter), (ev_doc, ev_filter), (bsi_doc, bsi_filter)) in baseline
+        .iter()
+        .zip(explicit_value.iter())
+        .zip(bare_sequence_item.iter())
+        .map(|((b, e), s)| (b, e, s))
+    {
+        let (baseline_out, baseline_code) =
+            run_yq_stdin(baseline_filter, baseline_doc, &["-o", "json", "-I0"])?;
+        assert_eq!(baseline_code, 0, "baseline doc: {baseline_doc:?}");
+
+        let (ev_out, ev_code) = run_yq_stdin(ev_filter, ev_doc, &["-o", "json", "-I0"])?;
+        assert_eq!(ev_code, 0, "explicit-value doc: {ev_doc:?}");
+        assert_eq!(
+            baseline_out.trim(),
+            ev_out.trim(),
+            "ordinary mapping entry and explicit key/value disagree for {baseline_doc:?} vs {ev_doc:?}"
+        );
+
+        let (bsi_out, bsi_code) = run_yq_stdin(bsi_filter, bsi_doc, &["-o", "json", "-I0"])?;
+        assert_eq!(bsi_code, 0, "bare-sequence-item doc: {bsi_doc:?}");
+        assert_eq!(
+            baseline_out.trim(),
+            bsi_out.trim(),
+            "ordinary mapping entry and bare sequence item disagree for {baseline_doc:?} vs {bsi_doc:?}"
+        );
+    }
+    Ok(())
+}
+
+// ============================================================================
+// Trailing content after a flow collection's closing delimiter (#878)
+// ============================================================================
+// Real YAML (and real `yq`) treats content after a flow collection's closing
+// `]`/`}` on the same line - other than whitespace or a comment - as a hard
+// parse error. This loader used to silently continue instead, corrupting the
+// rest of the document (dropping every sibling field that followed) with no
+// error and exit code 0.
+
+#[test]
+fn test_trailing_content_after_flow_collection_errors_878() -> Result<()> {
+    // Document root.
+    let (_, stderr, code) = run_yq_stdin_with_stderr(
+        ".",
+        "a: [note] see below\nb: 2\nc: 3\nd: 4\n",
+        &["-o", "json", "-I0"],
+    )?;
+    assert_ne!(code, 0);
+    assert!(
+        stderr.contains("after a flow collection's closing delimiter"),
+        "stderr: {stderr}"
+    );
+
+    // Ordinary block-mapping field, non-first (used to silently drop b/c/d).
+    let (_, stderr, code) = run_yq_stdin_with_stderr(
+        ".",
+        "- x: 1\n  a: [note] see below\n  b: 2\n  c: 3\n  d: 4\n",
+        &["-o", "json", "-I0"],
+    )?;
+    assert_ne!(code, 0);
+    assert!(
+        stderr.contains("after a flow collection's closing delimiter"),
+        "stderr: {stderr}"
+    );
+
+    // A trailing comment is not an error - only non-whitespace/non-comment
+    // content is.
+    let (out, code) = run_yq_stdin(
+        ".a",
+        "a: [1, 2] # trailing comment\n",
+        &["-o", "json", "-I0"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "[1,2]");
+
+    Ok(())
+}
+
+#[test]
+fn test_flow_collection_as_implicit_mapping_key_still_permitted_878() -> Result<()> {
+    // #878's validation must not reject a flow collection followed by `:` -
+    // that's a legitimate implicit-mapping-key shape (confirmed against the
+    // YAML test suite's own "Implicit Flow Mapping Key" and "6BFJ"/"Q9WF"
+    // cases), not trailing garbage after a value. Reachable through
+    // `parse_value` (document root / bare sequence item) and
+    // `parse_explicit_value` (`? key` / `: ...`) - both pass
+    // `check_trailing: false` for exactly this reason.
+    //
+    // Pins *actual* output, not just exit code (this project's testing
+    // conventions treat an exit-code-only assertion here as a false-
+    // confidence anti-pattern) - and deliberately documents a known,
+    // pre-existing gap rather than papering over it: succinctly doesn't
+    // actually implement flow-collection-keyed implicit mappings yet. Real
+    // `yq` folds `[a, b]: value` into a single-entry mapping `{"":
+    // "value"}`; succinctly currently only avoids hard-erroring on it,
+    // emitting the flow collection and the trailing value as two disjoint
+    // results instead (confirmed identical on `main` before this PR - not
+    // introduced or worsened here). This test's job is to confirm the
+    // document doesn't error and to catch a regression in the *current*
+    // output if one occurs; implementing the real feature is tracked as a
+    // follow-up.
+    let cases: &[(&str, &str)] = &[
+        ("[a, b]: value\n", "[\"a\",\"b\"]\n\"value\""),
+        ("{a: 1}: value\n", "{\"a\":1}\n\"value\""),
+        ("? k\n: [a, b]: value\n", r#"{"k":["a","b"]}"#),
+        ("? k\n: {a: 1}: value\n", r#"{"k":{"a":1}}"#),
+    ];
+    for (doc, expected) in cases {
+        let (out, code) = run_yq_stdin(".", doc, &["-o", "json", "-I0"])?;
+        assert_eq!(code, 0, "doc: {doc:?}");
+        assert_eq!(out.trim(), *expected, "doc: {doc:?}");
+    }
+    Ok(())
+}
+
 // ============================================================================
 // Extra spaces after a block-sequence dash (#877)
 // ============================================================================

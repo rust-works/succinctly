@@ -2074,6 +2074,23 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             // `parse_sequence_item_inner` and `parse_explicit_value` where the
             // placeholder is conditional. `test_every_anchor_targets_an_open_bit`
             // is the whole-corpus guard on that.
+        } else if self.try_dispatch_flow_or_block_value(indent, true)? {
+            // Flow sequence/mapping value (`- a: [1, 2]` / `- a: {x: 1}`), or
+            // block scalar value (`- a: |`) — handled. Missing this used to
+            // leave every flow-value fallback through the scalar arm's
+            // `parse_inline_value`, which treats `{`/`[`/`,`/`}`/`]` as
+            // ordinary plain-scalar content instead of structure: a flow
+            // *array* value gets consumed whole as one bogus scalar token
+            // (its real content lost — reads back as `[]`), and a flow
+            // *mapping* value is worse, since the scalar scanner stops at its
+            // first inner `key:`+space and strands `self.pos` mid-line,
+            // corrupting everything parsed after it too (#864). A block
+            // scalar hit the same class of corruption for the same reason:
+            // the plain-scalar scanner doesn't know it's inside literal
+            // content, so a body line shaped like `key: value` or starting
+            // with `#` (legal in a block literal, meaningless as YAML there)
+            // stopped the scan early (confirmed via `git worktree` bisection
+            // against the pre-#864 fallback during review).
         } else {
             // Inline value (`parse_node_properties` ran above)
             match self.peek() {
@@ -2082,40 +2099,6 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                     // became an alias node at all before #372, and was swallowed
                     // into the plain scalar below.
                     self.parse_alias()?;
-                }
-                Some(b'[') => {
-                    // Flow sequence value (`- a: [1, 2]`). Missing this arm
-                    // (and the `{`/`|`/`>` ones below) left every flow-value
-                    // fallback through the scalar arm's `parse_inline_value`,
-                    // which treats `{`/`[`/`,`/`}`/`]` as ordinary plain-scalar
-                    // content instead of structure: a flow *array* value gets
-                    // consumed whole as one bogus scalar token (its real
-                    // content lost, `parse_flow_sequence` never runs to open
-                    // real BP structure for it — reads back as `[]`), and a
-                    // flow *mapping* value is worse, since the scalar scanner
-                    // stops at its first inner `key:`+space and strands
-                    // `self.pos` mid-line, corrupting everything parsed after
-                    // it too (#864).
-                    self.parse_flow_sequence()?;
-                }
-                Some(b'{') => {
-                    // Flow mapping value (`- a: {x: 1}`) - see the `[` arm
-                    // above for why the fallback scalar path corrupts this.
-                    self.parse_flow_mapping()?;
-                }
-                Some(b'|' | b'>') => {
-                    // Block scalar value (`- a: |`) - handles its own BP,
-                    // mirroring `parse_mapping_entry`'s identical arm. Not
-                    // purely defensive: the scalar fallback's plain-scalar
-                    // scanner doesn't know it's inside literal content, so a
-                    // body line shaped like `key: value` or starting with
-                    // `#` (legal in a block literal, meaningless as YAML
-                    // there) hit the same `:`/`#` terminator rules real keys
-                    // and comments use, stopping the scan early and losing
-                    // or corrupting sibling fields exactly like the `[`/`{`
-                    // cases above (confirmed via `git worktree` bisection
-                    // against the pre-#864 fallback during review).
-                    self.parse_block_scalar(indent)?;
                 }
                 Some(b'-') if Self::is_ws_break_or_eoi(self.peek_at(1)) => {
                     // Block sequence indicator inline with a compact mapping's own
@@ -2449,17 +2432,10 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             }
 
             // Check for flow style or block scalar - these handle their own BP
+            if self.try_dispatch_flow_or_block_value(indent, true)? {
+                return Ok(());
+            }
             match self.peek() {
-                Some(b'[') => {
-                    self.parse_flow_sequence()?;
-                }
-                Some(b'{') => {
-                    self.parse_flow_mapping()?;
-                }
-                Some(b'|' | b'>') => {
-                    // Block scalar - handles its own BP
-                    self.parse_block_scalar(indent)?;
-                }
                 Some(b'-') if Self::is_ws_break_or_eoi(self.peek_at(1)) => {
                     // Block sequence indicator inline with the mapping key (`a: - x`).
                     // This is invalid YAML (test-suite case 5U3A: a block sequence may
@@ -2759,7 +2735,20 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             return Ok(());
         }
 
-        // Parse the value
+        // Parse the value. `check_trailing: false` — same ambiguity as
+        // `parse_value`: the node after `: ` may itself be a compact mapping
+        // whose *key* is a flow collection (`: [a, b]: value`), mirroring
+        // the scalar-keyed case the `looks_like_mapping_entry` arm below
+        // already handles (`: b: c`) — real YAML accepts both (confirmed
+        // live against real `yq`: `? k\n: [a, b]: value\n` parses as
+        // `{"k":{"":"value"}}`). `looks_like_mapping_entry` itself can't
+        // catch the flow-collection-keyed case (it returns `false`
+        // immediately for `[`/`{`), so an unconditional trailing-content
+        // check here would reject real, non-garbage input before that arm
+        // ever gets a chance to run.
+        if self.try_dispatch_flow_or_block_value(indent, false)? {
+            return Ok(());
+        }
         match self.peek() {
             Some(b'-') if Self::is_ws_break_or_eoi(self.peek_at(1)) => {
                 // Sequence as value. Routed through the shared sequence-item
@@ -2769,15 +2758,6 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 // parser opens the item wrapper via `write_bp_open_seq_item`, so
                 // the #332 wrapper-end invariant is enforced here too.
                 self.parse_sequence_item(self.current_column())?;
-            }
-            Some(b'[') => {
-                self.parse_flow_sequence()?;
-            }
-            Some(b'{') => {
-                self.parse_flow_mapping()?;
-            }
-            Some(b'|' | b'>') => {
-                self.parse_block_scalar(indent)?;
             }
             _ if self.looks_like_mapping_entry() => {
                 // `: b: c` — the mirror of the key-side arm above: the node after `: `
@@ -2847,6 +2827,13 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             return self.parse_alias();
         }
 
+        // `check_trailing: false` — a flow collection reached here may turn
+        // out to be an implicit mapping *key* rather than a standalone
+        // value (see `try_dispatch_flow_or_block_value`'s doc comment).
+        if self.try_dispatch_flow_or_block_value(min_indent, false)? {
+            return Ok(());
+        }
+
         match self.peek() {
             Some(b'"') => {
                 self.set_ib();
@@ -2886,18 +2873,6 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 // classified the resulting node as an item wrapper with no child.
                 let seq_indent = self.current_column();
                 self.parse_sequence_item(seq_indent)?;
-            }
-            Some(b'[') => {
-                // Flow sequence
-                self.parse_flow_sequence()?;
-            }
-            Some(b'{') => {
-                // Flow mapping
-                self.parse_flow_mapping()?;
-            }
-            Some(b'|' | b'>') => {
-                // Block scalar - handles its own BP
-                self.parse_block_scalar(min_indent)?;
             }
             _ => {
                 self.set_ib();
@@ -3232,6 +3207,118 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         self.write_bp_close();
 
         Ok(())
+    }
+
+    /// Dispatches a flow collection or block scalar starting a block-context
+    /// value, shared by every site that can find one there:
+    /// `parse_compact_mapping_entry`, `parse_mapping_entry`,
+    /// `parse_explicit_value`, `parse_value`. Each used to hand-roll an
+    /// identical copy of this 3-arm table — the same bug class recurring
+    /// (#325, #372, #406, #224, #785, #864): a hand-copied dispatch missing
+    /// an arm, or a stale ordering bug, that a sibling copy already had
+    /// (#876). Deliberately narrow: only `[`/`{`/`|`/`>` are shared here —
+    /// each site's `-`/quoted/alias/plain-scalar arms differ enough in
+    /// content and relative ordering (see each call site) that folding them
+    /// in too would trade one duplication bug class for a worse one.
+    ///
+    /// `check_trailing` gates #878's validation (see
+    /// `reject_trailing_flow_content`) and must be `false` wherever the
+    /// flow collection might turn out to be an *implicit mapping key*
+    /// rather than a standalone value — real YAML allows `[a, b]: value` /
+    /// `{a: 1}: value`, where `:` legitimately follows the closing
+    /// delimiter (confirmed against the YAML test suite's own "Implicit
+    /// Flow Mapping Key" case, which a `true`-everywhere version of this
+    /// check broke). Two of the four callers are that ambiguous:
+    /// `parse_value` (reached for a sequence item's value once
+    /// `looks_like_mapping_entry` has already ruled out a *scalar*-keyed
+    /// compact mapping, and for document-root/deferred content starting
+    /// with `[`/`{`) and `parse_explicit_value` (its own value position can
+    /// equally be a compact mapping keyed by a flow collection — confirmed
+    /// live against real `yq`: `? k\n: [a, b]: value\n` parses as
+    /// `{"k":{"":"value"}}` — mirroring the *scalar*-keyed case its own
+    /// `looks_like_mapping_entry` arm already handles a few lines below; an
+    /// unconditional check here used to reject that real input before that
+    /// arm ever ran). The other two callers (`parse_compact_mapping_entry`,
+    /// `parse_mapping_entry`) only ever reach this helper *after* an
+    /// unambiguous `key:` has already been parsed with no equivalent "value
+    /// could itself be a keyed mapping" arm of their own, where a following
+    /// `:` cannot be anything but real trailing garbage (confirmed live:
+    /// real `yq` rejects `key1: [a, b]: value2` outright) — so they pass
+    /// `true`.
+    ///
+    /// Returns `Ok(true)` if a flow collection or block scalar was found and
+    /// fully consumed (the caller does nothing further for this value), or
+    /// `Ok(false)` if the current byte isn't one of the four (the caller
+    /// falls through to its own remaining arms).
+    fn try_dispatch_flow_or_block_value(
+        &mut self,
+        indent: usize,
+        check_trailing: bool,
+    ) -> Result<bool, YamlError> {
+        match self.peek() {
+            Some(b'[') => {
+                self.parse_flow_sequence()?;
+                if check_trailing {
+                    self.reject_trailing_flow_content()?;
+                }
+                Ok(true)
+            }
+            Some(b'{') => {
+                self.parse_flow_mapping()?;
+                if check_trailing {
+                    self.reject_trailing_flow_content()?;
+                }
+                Ok(true)
+            }
+            Some(b'|' | b'>') => {
+                self.parse_block_scalar(indent)?;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    /// #878: real YAML (confirmed against real `yq`) treats content after a
+    /// flow collection's closing `]`/`}` on the same line — other than
+    /// whitespace or a comment — as a hard parse error. Silently continuing
+    /// instead (this loader's previous behavior) doesn't trade validation
+    /// rigor for permissiveness the way CLAUDE.md's documented
+    /// minimal-validation trade-off intends: it corrupts the rest of the
+    /// document, dropping every sibling field that follows with no error at
+    /// all.
+    ///
+    /// Deliberately not `at_line_end()`: that helper only treats a plain
+    /// space as skippable inline whitespace, not a tab, unlike this file's
+    /// own `is_inline_whitespace` (space *or* tab). Every existing caller of
+    /// `at_line_end()` only uses it for soft branching, where a stray tab
+    /// merely picks a slightly different (but still correct) path — this is
+    /// the first caller turning a wrong `false` into a hard error, which
+    /// made the gap observable: confirmed live, `at_line_end()` would
+    /// false-positive-reject `a: [1, 2]\t# comment`, which real `yq` accepts.
+    ///
+    /// Only called for `[`/`{`, and only when the caller has ruled out an
+    /// implicit-mapping-key reading (see `try_dispatch_flow_or_block_value`'s
+    /// `check_trailing`) — a block scalar (`|`/`>`) has no equivalent
+    /// same-line trailing-content shape to reject, since its own terminator
+    /// is a dedent, not a delimiter byte a stray token could follow.
+    fn reject_trailing_flow_content(&self) -> Result<(), YamlError> {
+        let mut i = self.pos;
+        while i < self.input.len() {
+            match self.input[i] {
+                b'#' => return Ok(()),
+                b if Self::is_inline_whitespace(b) => i += 1,
+                b if Self::is_break(b) => return Ok(()),
+                _ => break,
+            }
+        }
+        if i >= self.input.len() {
+            return Ok(());
+        }
+        Err(YamlError::UnexpectedCharacter {
+            offset: i,
+            char: self.input[i] as char,
+            context: "after a flow collection's closing delimiter",
+        })
     }
 
     /// Parse a flow sequence: `[item1, item2, ...]`
