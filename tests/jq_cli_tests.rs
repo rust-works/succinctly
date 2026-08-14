@@ -3049,6 +3049,7 @@ fn test_isempty_propagates_bare_error_instead_of_answering_true() -> Result<()> 
     let (stdout, stderr, code) = run_jq_full(&["-n", "isempty(error(\"x\")), \"after\""], None)?;
     assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
     assert_eq!(stdout, "");
+    assert!(stderr.contains("jq: error"), "{stderr}");
     assert!(stderr.contains('x'), "{stderr}");
     Ok(())
 }
