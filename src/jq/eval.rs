@@ -24927,6 +24927,30 @@ mod tests {
     }
 
     #[test]
+    // `"in({a:1}, {a:9})"` is a jq filter literal, not a formatting string;
+    // clippy cannot tell the two apart from the brace shape alone.
+    #[allow(clippy::literal_string_with_formatting_args)]
+    fn test_builtin_in_fans_out_over_every_xs_output_880() {
+        // `in(xs)` = `. as $x | xs | has($x)` (jq 1.7.1) -- a plain pipe, so
+        // it forks once per `xs` output rather than only consulting the
+        // first (#880's own review discovery, distinct from the
+        // Halt/Break-swallowing bug this issue is titled after). Confirmed
+        // against jq 1.7.1: `"a" | [in({a:1}, {a:9})]` is `[true,true]`;
+        // `"a" | [in({a:1}, {b:2})]` is `[true,false]`.
+        assert_eq!(outputs(br#""a""#, "in({a:1}, {a:9})"), ["true", "true"]);
+        assert_eq!(outputs(br#""a""#, "in({a:1}, {b:2})"), ["true", "false"]);
+    }
+
+    #[test]
+    fn test_builtin_in_empty_xs_produces_no_output_880() {
+        // `in(empty)` -- `xs` producing zero outputs means `in(xs)` produces
+        // zero outputs too (same as any pipe into a filter with nothing to
+        // feed it). Confirmed against jq 1.7.1: `"a" | in(empty)` exits 0
+        // with no output.
+        assert!(outputs(br#""a""#, "in(empty)").is_empty());
+    }
+
+    #[test]
     fn test_builtin_select() {
         // select outputs input only if condition is true
         query!(br"5", "select(. > 3)",
