@@ -11,7 +11,8 @@ use std::path::Path;
 
 use succinctly::jq::document::{DocumentCursor, DocumentFields, IndentSpec};
 use succinctly::jq::eval_generic::{
-    eval_with_cursor_using, to_owned, to_owned_with_comments, CommentTree, GenericResult,
+    eval_with_cursor_using, to_owned as generic_to_owned, to_owned_with_comments, CommentTree,
+    GenericResult,
 };
 use succinctly::jq::{
     self, sync_aliased_paths, Builtin, EvalError, Expr, OwnedValue, QueryResult, YqSemantics,
@@ -406,7 +407,7 @@ fn parse_input(bytes: &[u8], format: InputFormat) -> Result<Vec<OwnedValue>> {
             // Parse as JSON
             let index = JsonIndex::build(bytes);
             let cursor = index.root(bytes);
-            Ok(vec![to_owned(&cursor.value())])
+            Ok(vec![generic_to_owned(&cursor.value())])
         }
         InputFormat::Yaml | InputFormat::Auto => {
             // Parse as YAML (Auto defaults to YAML when no extension hint)
@@ -553,9 +554,9 @@ fn query_result_to_owned_values(
     sink: &mut ErrorSink,
 ) -> Vec<OwnedValue> {
     match result {
-        QueryResult::One(v) => vec![to_owned(&v)],
-        QueryResult::OneCursor(c) => vec![to_owned(&c.value())],
-        QueryResult::Many(vs) => vs.iter().map(to_owned).collect(),
+        QueryResult::One(v) => vec![generic_to_owned(&v)],
+        QueryResult::OneCursor(c) => vec![generic_to_owned(&c.value())],
+        QueryResult::Many(vs) => vs.iter().map(generic_to_owned).collect(),
         QueryResult::None => vec![],
         QueryResult::Error(e) => {
             sink.report(DiagStyle::Yq, &e, &no_location());
@@ -967,8 +968,13 @@ fn evaluate_yaml_cursor<W: AsRef<[u64]> + Clone>(
     // assignment-family expression against a document that actually has
     // aliases. Everything else (JSON, plain reads, alias-free YAML) pays
     // nothing beyond this one bool check.
-    let alias_sync_ctx = (is_alias_sensitive_assign(expr) && cursor.index().has_aliases())
-        .then(|| (to_owned(&cursor.value()), collect_alias_groups(cursor)));
+    let alias_sync_ctx =
+        (is_alias_sensitive_assign(expr) && cursor.index().has_aliases()).then(|| {
+            (
+                generic_to_owned(&cursor.value()),
+                collect_alias_groups(cursor),
+            )
+        });
 
     // Snapshot the pristine presentation tree *before* evaluation too
     // (#739, ADR-0017): same shape-preserving-write gate as `alias_sync_ctx`
@@ -1002,7 +1008,7 @@ fn evaluate_yaml_cursor<W: AsRef<[u64]> + Clone>(
         if need_comments {
             to_owned_with_comments(&c.value(), Some(c))
         } else {
-            no_comments(to_owned(&c.value()))
+            no_comments(generic_to_owned(&c.value()))
         }
     };
 
@@ -1016,9 +1022,9 @@ fn evaluate_yaml_cursor<W: AsRef<[u64]> + Clone>(
     // arms are defensive/unreachable here today, kept for exhaustiveness
     // over the shared `GenericResult` enum.
     let mut docs = match result {
-        GenericResult::One(v) => Ok(vec![no_comments(to_owned(&v))]),
+        GenericResult::One(v) => Ok(vec![no_comments(generic_to_owned(&v))]),
         GenericResult::OneCursor(c) => Ok(vec![owned_with_comments(&c)]),
-        GenericResult::Many(vs) => Ok(vs.iter().map(to_owned).map(no_comments).collect()),
+        GenericResult::Many(vs) => Ok(vs.iter().map(generic_to_owned).map(no_comments).collect()),
         GenericResult::ManyCursor(cs) => Ok(cs.iter().map(owned_with_comments).collect()),
         // This is the DOM/slow path (`evaluate_yaml_direct_filtered`'s
         // fallback), reached only when `can_use_m2_streaming` rejects the
