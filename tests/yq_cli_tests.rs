@@ -6807,6 +6807,58 @@ fn test_mapping_under_mapping_gap_via_standalone_alias() -> Result<()> {
 }
 
 #[test]
+fn test_mapping_under_mapping_gap_via_sequence_item() -> Result<()> {
+    // Found during code review of this fix: `parse_block_node`'s `-` arm
+    // (dispatching to `parse_sequence_item`) had no check at all, missed
+    // by the original per-arm sweep - live-confirmed to reproduce the
+    // identical silent-data-loss shape before this test was added
+    // (`{"a":{"b":1}}`, exit 0, dropping `- c` entirely). Distinct from
+    // #900's SequenceItem-under-Mapping tolerance
+    // (`sequence_item_gap_reaches`): here the frame directly under the
+    // open inner mapping is another Mapping, not a SequenceItem, so #900's
+    // "obvious extension" reasoning doesn't apply and this stays a genuine
+    // parse error like every other arm in this function.
+    let (_output, stderr, exit_code) =
+        run_yq_stdin_with_stderr(".", "a:\n    b: 1\n  - c\n", &["-o", "json", "-I0"])?;
+    assert_eq!(exit_code, 1);
+    assert!(
+        stderr.contains("inconsistent indentation"),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
+/// #959: an invariant test that every `mapping_under_mapping_gap_reaches`
+/// call site agrees, not just that each is individually correct (the
+/// testing skill's own "Invariant Tests Over Duplicated Logic" guidance) -
+/// all 8 sites now route through the single `check_mapping_under_mapping_gap`
+/// helper, so a future edit to its error/offset logic can't silently
+/// diverge between them the way 7 independent copies could have.
+#[test]
+fn test_mapping_under_mapping_gap_agrees_across_all_dispatch_shapes() -> Result<()> {
+    let shapes = [
+        "a:\n    b: 1\n  c: 2\n",         // parse_mapping_entry
+        "a:\n    b: 1\n  ? c\n  : 2\n",   // parse_explicit_key
+        "a:\n    b: 1\n    ? c\n  : 2\n", // parse_explicit_value
+        "a:\n    b: 1\n  [1,2]\n",        // flow collection
+        "a:\n    b: 1\n  &x c\n",         // anchored scalar
+        "a:\n    b: &x 1\n  *x\n",        // standalone alias
+        "a:\n    b: 1\n  c\n",            // bare scalar
+        "a:\n    b: 1\n  - c\n",          // sequence item
+    ];
+    for yaml in shapes {
+        let (_output, stderr, exit_code) =
+            run_yq_stdin_with_stderr(".", yaml, &["-o", "json", "-I0"])?;
+        assert_eq!(exit_code, 1, "yaml: {yaml:?}, stderr: {stderr:?}");
+        assert!(
+            stderr.contains("inconsistent indentation"),
+            "yaml: {yaml:?}, stderr: {stderr:?}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn test_flow_dash_without_whitespace_is_still_a_scalar() -> Result<()> {
     // A `-` not followed by whitespace is a legitimate plain scalar in flow
     // context and was never affected; pinned so #332's fix cannot regress it.
