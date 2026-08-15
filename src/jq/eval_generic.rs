@@ -35,19 +35,66 @@ use super::slice::{slice_str, SliceBounds};
 use super::value::OwnedValue;
 use crate::json::JsonIndex;
 
+/// Recursion-depth ceiling for [`to_owned`]/[`to_owned_cursor`]/
+/// [`to_owned_with_comments`] (#998). JSON's semi-index parser
+/// (`src/json/simple.rs`/`src/json/standard.rs`) is a flat, non-recursive
+/// scan with no depth limit of its own, so adversarially deep JSON
+/// parses/indexes fine -- it's specifically this tree-materialization step,
+/// recursing once per nesting level, that needs the guard.
+///
+/// A clean, catchable error (matching real jq's own parse-time depth limit —
+/// confirmed live, `jq '.'` on 500+ levels of `[[[...]]]` raises "Exceeds
+/// depth limit for parsing") is the ideal failure mode here, but these
+/// functions are called pervasively throughout the core evaluator's hot path
+/// (truthiness checks, streaming, comparisons — dozens of call sites, not
+/// just at a single "materialize the final result" boundary), so threading a
+/// `Result` through their signatures would ripple across the whole
+/// evaluator. A controlled panic closes the actual safety concern (a raw
+/// stack overflow is undefined behavior; a panic is not) without that
+/// blast radius — see #998's own text, which names a hard process abort as
+/// an acceptable outcome alongside a clean error.
+///
+/// 256, not the 128 `src/yaml/parser.rs`/`src/json/validate.rs` use for
+/// their own (unrelated) guards: `tests/jq_cli_tests.rs`'s
+/// `test_walk_deep_nesting_does_not_overflow_the_stack` already pins
+/// `walk(.)` working at depth 200 as a deliberate, previously-measured
+/// capability, and that query's *output* still passes through this same
+/// materialization step — a 128 limit broke that test outright. Measured
+/// directly on a debug build (the more fragile of the two, larger
+/// per-frame stack cost than release): the real crash boundary for this
+/// function sits between depth 2000 (safe) and 3000 (overflow), and for
+/// `print_json` in `src/bin/succinctly/jq_runner.rs` (same limit, guards
+/// the identity-query fast path this function's own guard can't reach)
+/// between 600 (safe) and 700 (overflow) — 256 clears the 200 floor with
+/// margin and sits comfortably under both boundaries, including headroom
+/// for a CI runner with a smaller default stack than the dev machine this
+/// was measured on.
+const MAX_NESTING_DEPTH: usize = 256;
+
 /// Convert a DocumentValue to an OwnedValue.
 ///
 /// This enables the evaluator to work with both JSON and YAML inputs.
 /// Note: The order of checks is important! Check containers first, then scalars,
 /// because YAML scalars may have type coercion (e.g., unquoted "true" is a bool).
+///
+/// Panics past [`MAX_NESTING_DEPTH`] levels of nesting (#998) rather than
+/// recursing unbounded and overflowing the call stack.
 pub fn to_owned<V: DocumentValue>(value: &V) -> OwnedValue {
+    to_owned_at_depth(value, 0)
+}
+
+fn to_owned_at_depth<V: DocumentValue>(value: &V, depth: usize) -> OwnedValue {
+    assert!(
+        depth < MAX_NESTING_DEPTH,
+        "nesting depth exceeds limit of {MAX_NESTING_DEPTH}"
+    );
     // Check containers first (arrays and objects have no type ambiguity)
     if let Some(fields) = value.as_object() {
         let mut map = IndexMap::new();
         let mut f = fields;
         while let Some((field, rest)) = f.uncons() {
             if let Some(key) = field.key_str() {
-                map.insert(key.into_owned(), to_owned(&field.value));
+                map.insert(key.into_owned(), to_owned_at_depth(&field.value, depth + 1));
             }
             f = rest;
         }
@@ -56,7 +103,7 @@ pub fn to_owned<V: DocumentValue>(value: &V) -> OwnedValue {
         let mut items = Vec::new();
         let mut elems = elements;
         while let Some((elem, rest)) = elems.uncons() {
-            items.push(to_owned(&elem));
+            items.push(to_owned_at_depth(&elem, depth + 1));
             elems = rest;
         }
         OwnedValue::Array(items)
@@ -91,14 +138,28 @@ pub fn to_owned<V: DocumentValue>(value: &V) -> OwnedValue {
 /// [`to_owned_with_comments`]) so the tag check reaches every scalar, not
 /// just the top-level one. Call sites that already hold a cursor (rather
 /// than a bare value) should use this instead of `to_owned(&cursor.value())`.
+///
+/// Panics past [`MAX_NESTING_DEPTH`] levels of nesting (#998), same as
+/// [`to_owned`].
 pub fn to_owned_cursor<C: DocumentCursor>(cursor: &C) -> OwnedValue {
+    to_owned_cursor_at_depth(cursor, 0)
+}
+
+fn to_owned_cursor_at_depth<C: DocumentCursor>(cursor: &C, depth: usize) -> OwnedValue {
+    assert!(
+        depth < MAX_NESTING_DEPTH,
+        "nesting depth exceeds limit of {MAX_NESTING_DEPTH}"
+    );
     let value = cursor.value();
     if let Some(fields) = value.as_object() {
         let mut map = IndexMap::new();
         let mut f = fields;
         while let Some((field, rest)) = f.uncons() {
             if let Some(key) = field.key_str() {
-                map.insert(key.into_owned(), to_owned_cursor(&field.value_cursor));
+                map.insert(
+                    key.into_owned(),
+                    to_owned_cursor_at_depth(&field.value_cursor, depth + 1),
+                );
             }
             f = rest;
         }
@@ -107,7 +168,7 @@ pub fn to_owned_cursor<C: DocumentCursor>(cursor: &C) -> OwnedValue {
         let mut items = Vec::new();
         let mut elems = elements;
         while let Some((elem_cursor, rest)) = elems.uncons_cursor() {
-            items.push(to_owned_cursor(&elem_cursor));
+            items.push(to_owned_cursor_at_depth(&elem_cursor, depth + 1));
             elems = rest;
         }
         OwnedValue::Array(items)
@@ -115,7 +176,7 @@ pub fn to_owned_cursor<C: DocumentCursor>(cursor: &C) -> OwnedValue {
         cursor
             .explicit_tag()
             .and_then(|tag| tagged_scalar_to_owned(tag, &value))
-            .unwrap_or_else(|| to_owned(&value))
+            .unwrap_or_else(|| to_owned_at_depth(&value, depth))
     }
 }
 
@@ -305,11 +366,24 @@ static EMPTY_COMMENT_TREE: CommentTree = CommentTree::Leaf(None, "");
 ///
 /// Uses a live cursor to read each node's trailing comment (issue #710).
 /// See [`to_owned`] for the value-only conversion this mirrors and
-/// delegates scalar handling to.
+/// delegates scalar handling to. Panics past [`MAX_NESTING_DEPTH`] levels of
+/// nesting (#998), same as `to_owned`.
 pub fn to_owned_with_comments<V: DocumentValue>(
     value: &V,
     cursor: Option<&V::Cursor>,
 ) -> (OwnedValue, CommentTree) {
+    to_owned_with_comments_at_depth(value, cursor, 0)
+}
+
+fn to_owned_with_comments_at_depth<V: DocumentValue>(
+    value: &V,
+    cursor: Option<&V::Cursor>,
+    depth: usize,
+) -> (OwnedValue, CommentTree) {
+    assert!(
+        depth < MAX_NESTING_DEPTH,
+        "nesting depth exceeds limit of {MAX_NESTING_DEPTH}"
+    );
     // The raw (`#`-prefixed) form, not the stripped `line_comment` builtin
     // getter: the write path re-emits this verbatim after one space.
     let own_comment = cursor.and_then(DocumentCursor::line_comment_raw);
@@ -322,7 +396,11 @@ pub fn to_owned_with_comments<V: DocumentValue>(
         while let Some((field, rest)) = f.uncons() {
             if let Some(key) = field.key_str() {
                 let key = key.into_owned();
-                let (v, c) = to_owned_with_comments(&field.value, Some(&field.value_cursor));
+                let (v, c) = to_owned_with_comments_at_depth(
+                    &field.value,
+                    Some(&field.value_cursor),
+                    depth + 1,
+                );
                 map.insert(key.clone(), v);
                 comment_map.insert(key.clone(), c);
                 // A comment trailing the key's own line, when the value is
@@ -357,7 +435,8 @@ pub fn to_owned_with_comments<V: DocumentValue>(
         let mut elems = elements;
         while let Some((elem_cursor, rest)) = elems.uncons_cursor() {
             let elem_value = elem_cursor.value();
-            let (v, c) = to_owned_with_comments(&elem_value, Some(&elem_cursor));
+            let (v, c) =
+                to_owned_with_comments_at_depth(&elem_value, Some(&elem_cursor), depth + 1);
             items.push(v);
             comment_items.push(c);
             elems = rest;
@@ -367,7 +446,10 @@ pub fn to_owned_with_comments<V: DocumentValue>(
             CommentTree::Array(own_comment, own_style, comment_items),
         )
     } else {
-        (to_owned(value), CommentTree::Leaf(own_comment, own_style))
+        (
+            to_owned_at_depth(value, depth),
+            CommentTree::Leaf(own_comment, own_style),
+        )
     }
 }
 
@@ -8926,5 +9008,39 @@ mod tests {
             value,
         );
         assert!(matches!(result, GenericResult::Halt(0)));
+    }
+
+    /// `{"k":{"k":...{}...}}`, `depth` levels of `"k"` nesting, terminating
+    /// in `{}` — mirrors `jq_recurse_depth_tests.rs`'s own `linear_nest`.
+    fn linear_nest(depth: usize) -> String {
+        format!("{}{{}}{}", "{\"k\":".repeat(depth), "}".repeat(depth))
+    }
+
+    /// #998: `to_owned`/`to_owned_cursor` must not recurse unbounded on
+    /// adversarially deep input — confirmed live, `succinctly jq '.'` on a
+    /// 200,000-level-deep document used to abort with a raw stack overflow
+    /// (SIGABRT) before this guard existed. 255 levels (just under the
+    /// limit) must still materialize normally; 256 must panic cleanly
+    /// rather than recurse further.
+    #[test]
+    fn to_owned_panics_past_nesting_depth_limit_998() {
+        let json = linear_nest(255);
+        let index = JsonIndex::build(json.as_bytes());
+        let cursor = index.root(json.as_bytes());
+        // Under the limit: succeeds.
+        let owned = to_owned(&cursor.value());
+        assert!(matches!(owned, OwnedValue::Object(_)));
+        let owned = to_owned_cursor(&cursor);
+        assert!(matches!(owned, OwnedValue::Object(_)));
+
+        let json = linear_nest(256);
+        let index = JsonIndex::build(json.as_bytes());
+        let cursor = index.root(json.as_bytes());
+        let value = cursor.value();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| to_owned(&value)));
+        assert!(result.is_err(), "to_owned should panic at depth 256");
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| to_owned_cursor(&cursor)));
+        assert!(result.is_err(), "to_owned_cursor should panic at depth 256");
     }
 }

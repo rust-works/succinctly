@@ -10429,3 +10429,37 @@ fn test_del_multi_output_error_survives_optional_891() -> Result<()> {
     assert!(stderr.contains("Invalid path expression with result 0"));
     Ok(())
 }
+
+/// `[[[...1...]]]`, `depth` levels of array nesting wrapping a single `1`.
+fn nested_arrays(depth: usize) -> String {
+    format!("{}1{}", "[".repeat(depth), "]".repeat(depth))
+}
+
+/// #998: the bare identity `.` never materializes an `OwnedValue` tree (it
+/// stays lazy, streaming straight from the cursor via `print_json`), so
+/// `eval_generic::to_owned`'s own depth guard never gets a chance to fire
+/// for it -- confirmed live before this fix, `succinctly jq '.'` on a
+/// 200,000-level-deep document aborted with a raw stack overflow (SIGABRT,
+/// exit 134), not a clean error. `print_json` needs its own guard.
+#[test]
+fn test_identity_query_rejects_adversarial_nesting_998() -> Result<()> {
+    let input = nested_arrays(500);
+    let (_stdout, stderr, code) = run_jq_full(&["-c", "."], Some(&input))?;
+    assert_eq!(code, 1, "stderr: {stderr:?}");
+    assert!(
+        stderr.contains("nesting depth exceeds limit of 256"),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
+/// Companion to the above: legitimately-nested input well under the limit
+/// must still round-trip exactly, unaffected by the new guard.
+#[test]
+fn test_identity_query_accepts_nesting_under_limit_998() -> Result<()> {
+    let input = nested_arrays(100);
+    let (stdout, stderr, code) = run_jq_full(&["-c", "."], Some(&input))?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), input);
+    Ok(())
+}

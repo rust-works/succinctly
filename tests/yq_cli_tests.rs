@@ -10747,3 +10747,44 @@ fn test_isvalid_has_yq_type_mismatch_is_valid_917() -> Result<()> {
     assert_eq!(out.trim(), "true");
     Ok(())
 }
+
+/// #998: `yq --input-format json` routes JSON input through the DOM path
+/// (`eval_generic::to_owned`/`generic_to_owned`, per #978/#994), which now
+/// carries its own recursion-depth guard -- confirmed live before this fix,
+/// `succinctly yq --input-format json '.'` on a 200,000-level-deep document
+/// aborted with a raw stack overflow (SIGABRT, exit 134). The guard panics
+/// cleanly instead (exit 101, not a controlled `anyhow` error like the jq
+/// CLI's own `print_json` guard gets -- `to_owned` sits too deep in the
+/// evaluator's hot path for a `Result`-based fix without a much larger
+/// signature change, see the PR discussion), which is still strictly better
+/// than an uncontrolled stack overflow: a raw stack overflow is undefined
+/// behavior, a panic is not.
+#[test]
+fn test_json_input_rejects_adversarial_nesting_998() -> Result<()> {
+    let depth = 500;
+    let input = format!("{}1{}", "[".repeat(depth), "]".repeat(depth));
+    let (_stdout, stderr, code) =
+        run_yq_stdin_with_stderr(".", &input, &["--input-format", "json"])?;
+    assert_eq!(code, 101, "stderr: {stderr:?}");
+    assert!(
+        stderr.contains("nesting depth exceeds limit of 256"),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
+/// Companion to the above: legitimately-nested JSON input well under the
+/// limit must still round-trip exactly, unaffected by the new guard.
+#[test]
+fn test_json_input_accepts_nesting_under_limit_998() -> Result<()> {
+    let depth = 100;
+    let input = format!("{}1{}", "[".repeat(depth), "]".repeat(depth));
+    let (stdout, code) = run_yq_stdin(
+        ".",
+        &input,
+        &["--input-format", "json", "-o", "json", "-I0"],
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?}");
+    assert_eq!(stdout.trim_end(), input);
+    Ok(())
+}

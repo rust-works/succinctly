@@ -2031,6 +2031,18 @@ impl LiteralFormatter for PreserveFormatter {
 ///
 /// This is the unified printer that handles JSON structure (arrays, objects,
 /// indentation) while delegating literal formatting to the formatter.
+/// Recursion-depth ceiling for [`print_json`] (#998) -- adversarially deep
+/// JSON input (thousands of nested arrays/objects) recurses this writer once
+/// per nesting level; unlike `eval_generic::to_owned`'s own guard (which
+/// this mirrors, same limit -- see that constant's doc comment for how 256
+/// was chosen, including this function's own measured debug-build crash
+/// boundary of depth 600-700), a query like the bare identity `.` never
+/// materializes an `OwnedValue` tree at all (it stays lazy, streaming
+/// straight from the `JsonCursor`), so `to_owned`'s guard never gets a
+/// chance to fire for it -- this is the one recursive step that shape
+/// always goes through, so it needs its own guard.
+const MAX_NESTING_DEPTH: usize = 256;
+
 fn print_json<F, Out, Wrd>(
     out: &mut Out,
     value: &JqValue<'_, Wrd>,
@@ -2043,6 +2055,10 @@ where
     Out: Write,
     Wrd: Clone + AsRef<[u64]>,
 {
+    anyhow::ensure!(
+        level < MAX_NESTING_DEPTH,
+        "nesting depth exceeds limit of {MAX_NESTING_DEPTH}"
+    );
     let compact = config.compact;
     let indent = &config.indent_string;
     let current_indent = if compact {
