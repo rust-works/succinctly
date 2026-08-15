@@ -10483,3 +10483,14 @@ fn test_exit_status_query_rejects_adversarial_nesting_998() -> Result<()> {
     );
     Ok(())
 }
+
+/// Companion to the above: `-e` on ordinary (non-adversarial) object input
+/// still round-trips correctly through `cursor_to_owned`'s `Object` arm,
+/// not just its `Array` arm.
+#[test]
+fn test_exit_status_query_materializes_object_998() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-e", "-c", "."], Some(r#"{"a":{"b":1}}"#))?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), r#"{"a":{"b":1}}"#);
+    Ok(())
+}
