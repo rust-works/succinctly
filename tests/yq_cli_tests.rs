@@ -1244,6 +1244,58 @@ fn test_json_input_never_preserves_literal_spelling_978() -> Result<()> {
     Ok(())
 }
 
+/// #978 companion: `args.input_format` is the *raw*, unresolved CLI flag
+/// -- it stays `Auto` whenever a `.json`-extension file is opened without
+/// an explicit `--input-format json`, which `resolve_input_format`
+/// nonetheless correctly resolves to `Json` for every *other* JSON-input
+/// call site. The M2 fast-path gates initially missed this (caught by
+/// code review): a bare `succinctly yq '.' file.json` -- arguably the
+/// more common way to hit this than typing the explicit flag -- still
+/// leaked. Fixed via `any_input_is_json`, which resolves every input
+/// file's format up front instead of trusting the raw flag alone.
+#[test]
+fn test_json_extension_auto_detected_file_never_preserves_literal_spelling_978() -> Result<()> {
+    let mut input_file = NamedTempFile::with_suffix(".json")?;
+    writeln!(input_file, "{{\"a\": 1.50, \"b\": 1e2}}")?;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .arg("yq")
+        .arg("-o")
+        .arg("json")
+        .arg("-I")
+        .arg("0")
+        .arg(".")
+        .arg(input_file.path())
+        .stdin(Stdio::null())
+        .output()?;
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout)?.trim(),
+        "{\"a\":1.5,\"b\":100}"
+    );
+    Ok(())
+}
+
+/// #996 (known limitation, tracked separately -- not fixed here): routing
+/// JSON input through the DOM path to canonicalize its numbers (#978)
+/// loses M2 streaming's incidental duplicate-key preservation, since
+/// `OwnedValue::Object` is `IndexMap`-backed and can only keep the last
+/// value for a repeated key. Real yq preserves `{"a":1,"a":2}` unchanged
+/// (confirmed live); this pins the current, documented gap so a future
+/// change doesn't silently make it worse without anyone noticing --
+/// flip this assertion to the correct behavior once #996 is fixed.
+#[test]
+fn test_json_input_duplicate_keys_collapse_known_limitation_996() -> Result<()> {
+    let (out, code) = run_yq_stdin(
+        ".",
+        "{\"a\":1,\"a\":2}",
+        &["--input-format", "json", "-o", "json", "-I", "0"],
+    )?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "{\"a\":2}");
+    Ok(())
+}
+
 /// #631: `first(.[])`/`last(.[])` (the `Expr::FirstExpr`/`LastExpr` one-arg
 /// stream form `first(f)`/`last(f)` compiles to) fell through
 /// `evaluate_yaml_cursor`'s unconditional `to_owned()` DOM path, unlike

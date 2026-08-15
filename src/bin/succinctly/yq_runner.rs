@@ -15,8 +15,7 @@ use succinctly::jq::eval_generic::{
     GenericResult,
 };
 use succinctly::jq::{
-    self, sync_aliased_paths, Builtin, EvalError, Expr, NumberRepr, OwnedValue, QueryResult,
-    YqSemantics,
+    self, sync_aliased_paths, Builtin, EvalError, Expr, OwnedValue, QueryResult, YqSemantics,
 };
 use succinctly::json::JsonIndex;
 use succinctly::yaml::{
@@ -416,8 +415,6 @@ fn gather_input_sources(
 /// touching that shared function.
 fn canonicalize_json_numbers(value: OwnedValue) -> OwnedValue {
     match value {
-        OwnedValue::NumberLiteral(NumberRepr::Int(n), _) => OwnedValue::Int(n),
-        OwnedValue::NumberLiteral(NumberRepr::Float(f), _) => OwnedValue::Float(f),
         OwnedValue::Array(items) => {
             OwnedValue::Array(items.into_iter().map(canonicalize_json_numbers).collect())
         }
@@ -427,7 +424,7 @@ fn canonicalize_json_numbers(value: OwnedValue) -> OwnedValue {
                 .map(|(k, v)| (k, canonicalize_json_numbers(v)))
                 .collect(),
         ),
-        other => other,
+        other => other.into_plain_number(),
     }
 }
 
@@ -2488,7 +2485,26 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
     //
     // Supports both JSON and YAML output formats.
     let is_identity = matches!(program.expr, Expr::Identity);
-    // #978: every M2 fast path below streams a scalar's *value* straight
+    // #978: `args.input_format` is the *raw*, unresolved CLI flag - it's
+    // `Auto` whenever the user relies on `.json`-extension detection
+    // instead of typing `--input-format json` explicitly, which
+    // `resolve_input_format` (used everywhere else JSON input is handled)
+    // still correctly resolves to `Json`. The M2 gates below need that
+    // same resolution, not the raw flag, or a bare `succinctly yq '.'
+    // file.json` (arguably the more common way to hit this than the
+    // explicit flag) would still leak. Conservative for a mixed-format
+    // multi-file `--inplace`/`--doc` invocation (`-i '.' a.yaml b.json`):
+    // this disables M2 for every file, not just the JSON one(s), since
+    // `is_m2_streamable`/`can_slurp_fast_path` are single, run-wide
+    // booleans with no per-file M2-vs-DOM switch to hook into instead.
+    let any_input_is_json = if input_files.is_empty() {
+        resolve_input_format(args.input_format, None) == InputFormat::Json
+    } else {
+        input_files.iter().any(|f| {
+            resolve_input_format(args.input_format, Some(Path::new(f))) == InputFormat::Json
+        })
+    };
+    // every M2 fast path below streams a scalar's *value* straight
     // from the parsed cursor rather than materializing an OwnedValue, and
     // neither streamer (JSON or YAML output) reliably discards a JSON
     // number's own decimal-point/exponent spelling the way the DOM path's
@@ -2498,10 +2514,22 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
     // JSON input: `1e2` -> `100.0`, real yq gives `100`), and
     // `can_yaml_fast_path`'s streamer echoes the raw source span outright
     // (`1.50` stays `1.50`). Real yq never preserves a JSON-sourced
-    // number's literal spelling at all, so explicit `--input-format json`
+    // number's literal spelling at all, so JSON input (explicit flag or
+    // resolved from a `.json` extension - see `any_input_is_json` above)
     // always falls back to the (already-fixed) DOM path instead.
-    let is_m2_streamable =
-        can_use_m2_streaming(&program.expr) && args.input_format != InputFormat::Json;
+    //
+    // Known trade-off (#996): the DOM path's `OwnedValue::Object` is
+    // `IndexMap`-backed and can't represent duplicate keys, unlike M2
+    // streaming, which never materializes a map at all and so happened to
+    // preserve them - `{"a":1,"a":2}` correctly stays that way through M2
+    // (matching real yq) but collapses to `{"a":2}` once routed through
+    // here. #442 already solved this for YAML input with its own
+    // `OwnedValue`-avoiding fast path; a proper fix for JSON input needs
+    // an equivalent (most likely teaching the shared streaming formatters
+    // in `src/yaml/light.rs` to canonicalize a JSON-sourced number
+    // in-stream, restoring M2 eligibility instead of disabling it) rather
+    // than the DOM-fallback trade-off made here.
+    let is_m2_streamable = can_use_m2_streaming(&program.expr) && !any_input_is_json;
     // pretty_print isn't implemented by the cursor streamers, so it still
     // falls back to the DOM path, unchanged, rather than silently ignoring
     // the flag the way compact mode already does today. `sort_keys` and
@@ -2594,7 +2622,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
         // #978: same JSON-literal-spelling leak as can_yaml_fast_path above
         // - this gate is YAML-output-only (see its own doc comment), so no
         // JSON-output sibling to worry about excluding correctly here.
-        && args.input_format != InputFormat::Json
+        && !any_input_is_json
         && !args.null_input
         && !args.raw_input
         && args.front_matter.is_none()
