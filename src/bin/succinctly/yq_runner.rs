@@ -2053,16 +2053,23 @@ fn can_use_m2_streaming(expr: &Expr) -> bool {
         Expr::Paren(inner) => can_use_m2_streaming(inner),
 
         // first(f)/last(f) (both AST spellings the parser produces, see
-        // `Expr::FirstExpr`/`LastExpr` doc comments) and computed indexing
-        // `.[(expr)]` all thread a cursor through natively in
-        // `eval_generic.rs` (#607), so their `GenericResult` streams exactly
-        // like plain navigation instead of needing OwnedValue construction.
-        // Streaming through `eval_with_cursor_using` here (rather than
-        // `evaluate_yaml_cursor`'s unconditional `to_owned()` DOM path) is
-        // also what keeps duplicate mapping keys intact for these shapes,
-        // matching `.[0]` on the same input (#631).
-        Expr::FirstExpr(_) | Expr::LastExpr(_) => true,
-        Expr::Builtin(Builtin::FirstStream(_) | Builtin::LastStream(_)) => true,
+        // `Expr::FirstExpr`/`LastExpr` doc comments) thread a cursor through
+        // natively in `eval_generic.rs` (#607) *only when `f` itself does* --
+        // `first(.[])` streams a `GenericResult` cursor exactly like plain
+        // navigation, but `first(.a * 1e100)` still has to materialize an
+        // `OwnedValue::Float` from the arithmetic, which then needs the DOM
+        // path's yq-mode scientific-notation formatting (#997) rather than
+        // the M2 fast writers in `src/jq/stream.rs`, which don't have it.
+        // Recursing here (like `Pipe`/`Optional`/`Paren` above) restricts the
+        // fast path to exactly the inner shapes it can actually stream a
+        // cursor for. Streaming through `eval_with_cursor_using` for the
+        // eligible cases (rather than `evaluate_yaml_cursor`'s unconditional
+        // `to_owned()` DOM path) is also what keeps duplicate mapping keys
+        // intact for these shapes, matching `.[0]` on the same input (#631).
+        Expr::FirstExpr(inner) | Expr::LastExpr(inner) => can_use_m2_streaming(inner),
+        Expr::Builtin(Builtin::FirstStream(inner) | Builtin::LastStream(inner)) => {
+            can_use_m2_streaming(inner)
+        }
         Expr::IndexExpr { .. } => true,
 
         // `select(...)` never changes position - a truthy output is always

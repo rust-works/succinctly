@@ -7283,6 +7283,34 @@ fn test_computed_float_scientific_notation_yaml_output_997() -> Result<()> {
     Ok(())
 }
 
+/// `first(f)`/`last(f)` are unconditionally M2-streamable in
+/// `can_use_m2_streaming` when `f` is pure navigation (`first(.[])` etc.),
+/// which correctly bypasses `OwnedValue` construction entirely. But when `f`
+/// itself computes a new value (arithmetic), the M2 fast path's own writer
+/// (`src/jq/stream.rs`) hardcodes the pre-#997 formatter and never applies
+/// the scientific-notation threshold -- confirmed by reproducing against
+/// this exact worktree before `can_use_m2_streaming` was taught to recurse
+/// into `FirstExpr`/`LastExpr`'s inner expression the same way it already
+/// does for `Pipe`/`Optional`/`Paren`.
+#[test]
+fn test_first_last_wrapping_computation_gets_scientific_notation_997() -> Result<()> {
+    for (filter, want) in [
+        ("first(.a * 1e100)", "1e+100"),
+        ("last(.a * 1e100)", "1e+100"),
+    ] {
+        let (out, code) = run_yq_stdin(filter, "a: 1\n", &["-o=json", "-I=0"])?;
+        assert_eq!(code, 0, "exit code for {filter:?}");
+        assert_eq!(out.trim(), want, "for {filter:?}");
+    }
+    // Pure-navigation first(f)/last(f) must still take the M2 fast path
+    // (preserving duplicate mapping keys, #631) -- this is a non-regression
+    // check, not new #997 behavior.
+    let (out, code) = run_yq_stdin("first(.a[])", "a: [1, 2, 3]\n", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "1");
+    Ok(())
+}
+
 /// `succinctly jq` (JSON mode) must be completely unaffected: the fix is
 /// gated on `ControlEscape::Yq`, and jq mode's own analogous formatter gap
 /// (different threshold, out of scope for #997) keeps its pre-existing

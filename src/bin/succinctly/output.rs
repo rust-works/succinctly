@@ -318,7 +318,7 @@ pub fn format_json(value: &OwnedValue, opts: &JsonFormatOpts) -> String {
     format_json_impl(value, opts, 0)
 }
 
-/// Render a computed (non-literal-preserved) `f64` the way real yq does:
+/// Renders a computed (non-literal-preserved) `f64` the way real yq does:
 /// decimal for everyday magnitudes, scientific notation once the value's
 /// decimal exponent is `>= 6` or `<= -5`.
 ///
@@ -337,11 +337,18 @@ pub fn format_json(value: &OwnedValue, opts: &JsonFormatOpts) -> String {
 /// this is yq's own threshold, distinct from `format_number_jq_compat`'s
 /// jq-mode one (which real jq only reformats when the source literal itself
 /// already used exponent notation).
+///
+/// `f` must be finite -- like [`format_float_with_fraction`], this has no
+/// JSON/YAML-specific spelling for NaN/Infinity to fall back on, so every
+/// caller must special-case those first (both current call sites already
+/// do, ahead of this function).
 #[must_use]
 pub fn format_float_yq(f: f64) -> String {
-    if f == 0.0 {
-        return format_float_with_fraction(f);
-    }
+    debug_assert!(
+        f.is_finite(),
+        "format_float_yq requires a finite value; NaN/Infinity have no \
+         JSON/YAML spelling here and must be special-cased by the caller"
+    );
     let sci = format!("{f:e}");
     let (mantissa, exp_str) = sci
         .split_once('e')
