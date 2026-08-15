@@ -10122,7 +10122,10 @@ fn eval_owned_multi_first<S: EvalSemantics>(
 /// than a change to that one's behavior. Direct callers today: `recurse`'s
 /// own children-evaluation step in value position (`builtin_recurse_f`/
 /// `builtin_recurse_cond`, both evaluate `f` through this function
-/// directly), `resolve_recurse`'s own `cond`-evaluation step in path
+/// directly), `builtin_in`'s own `xs`-evaluation step (also value
+/// position — the candidates to check `.` against can themselves be a
+/// multi-output generator with the same shape), `resolve_recurse`'s own
+/// `cond`-evaluation step in path
 /// position (#854 — `cond` can itself be a multi-output generator whose own
 /// later output errors after an earlier one already fired truthy for the
 /// same child), and `resolve_leaf`'s non-primitive fallback, also path
@@ -10251,11 +10254,18 @@ type PathResolveResult<'a> = Result<Vec<PathBranch<'a>>, (Vec<PathBranch<'a>>, E
 /// Every "keep-partial" call site below ends by matching a
 /// `(prefix, Option<EvalEscape>)` pair the exact same way — `Some(e) =>
 /// Err((prefix, e)), None => Ok(prefix)` — hand-written independently at
-/// each one. Collapsing that into a single call removes the chance of a
-/// stray unmatched arm or an escape variable going unread at a *new* call
-/// site by omission, the way two of #896's own review-round bugs did
-/// (#962).
-#[inline]
+/// each one. Collapsing that into a single call removes exactly one class
+/// of mistake: an incorrectly hand-copied `Some`/`None` arm at a site that
+/// reaches this combine step at all (#962). It is not a general guard
+/// against every prefix-loss bug in this area — #896's own review round
+/// found two related-but-distinct bugs neither of which this helper would
+/// have caught, since neither reached a `Some`/`None` match to get wrong: a
+/// bare `?` on a `PathResolveResult` discarding its prefix outright
+/// (`resolve_index_expr`'s `target_branches`, before that review's fix), and
+/// a fallthrough path that skipped checking an escape at all before
+/// delegating elsewhere (`GetPath`'s multi-output case, same review). A
+/// third instance of the bare-`?` kind, in `resolve_slice_expr`, is fixed
+/// alongside this helper's introduction — see that function's own comment.
 fn path_result(branches: Vec<PathBranch<'_>>, escape: Option<EvalEscape>) -> PathResolveResult<'_> {
     match escape {
         Some(e) => Err((branches, e)),
@@ -11054,6 +11064,11 @@ fn resolve_leaf<'a, S: EvalSemantics>(
         };
     }
     match values.len() {
+        // No output prunes the branch — unless there never would have been
+        // one because evaluating `expr` itself broke/errored (Halt excluded,
+        // handled above) before producing anything. Same rule as the
+        // `trackable`-primitive branch above, for the general non-primitive
+        // case this arm covers.
         0 => path_result(Vec::new(), trailing),
         // Real jq's `path(...)` checks each output as it streams: the first
         // non-path-shaped value raises "Invalid path expression" immediately,
@@ -11778,7 +11793,23 @@ fn resolve_slice_expr<'a, S: EvalSemantics>(
             .into(),
         ));
     }
-    let target_branches = resolve_node::<S>(target, value, trackable)?;
+    // Keeps `target`'s own partial prefix, not just discarding it via `?`,
+    // the same fix #896's review applied to `resolve_index_expr`'s sibling
+    // target-resolution step (found independently live here too — #973
+    // review): `target` can itself be one of #896's keep-partial sites
+    // (`select`, `if`, `getpath`, a computed index), so its own `Err` can
+    // carry a non-empty prefix that still needs slicing by `starts`/`ends`
+    // rather than being returned unsliced. Only reachable with a genuinely
+    // dynamic bound — a *literal* `[N:M]` desugars to a static `Pipe`
+    // (`resolve_seq`'s own fast path) at parse time and never reaches this
+    // function at all; see #977 for that separate gap. Confirmed against jq
+    // 1.7.1: `path((select(true, error("t")))[(0+1):2])` on `[10,20,30]`
+    // prints `[{"start":1,"end":2}]` (the already-produced `select` branch,
+    // sliced) before raising `t`.
+    let (target_branches, target_escape) = match resolve_node::<S>(target, value, trackable) {
+        Ok(branches) => (branches, None),
+        Err((prefix, e)) => (prefix, Some(e)),
+    };
     // #843: `resolve_index_expr`'s sibling `getpath`-laundering check —
     // `target` can also resolve successfully with `trackable: false`
     // through `Builtin::GetPath`'s deliberate exemption, which doesn't
@@ -11821,7 +11852,7 @@ fn resolve_slice_expr<'a, S: EvalSemantics>(
             }
         }
     }
-    Ok(out)
+    path_result(out, target_escape)
 }
 
 /// Evaluate one slice bound (`start` or `end`) in path context.
