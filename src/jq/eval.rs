@@ -7340,10 +7340,12 @@ fn eval_sub_replacement<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     optional: bool,
 ) -> Result<Option<String>, QueryResult<'a, W>> {
     let captures = capture_object(re, caps);
+    // `eval_owned_input` never returns a bare `QueryResult::Many` -- its own
+    // body converts every borrowed `Many` to `ManyOwned` before returning --
+    // so only `None`/`ManyOwned([])` need checking here, not `Many([])`.
     let materialized =
         eval_owned_input::<W, S>(replacement_expr, &captures, optional).materialize_cursor();
     let stream_is_empty = matches!(&materialized, QueryResult::None)
-        || matches!(&materialized, QueryResult::Many(vs) if vs.is_empty())
         || matches!(&materialized, QueryResult::ManyOwned(vs) if vs.is_empty());
     if stream_is_empty {
         return Ok(None);
