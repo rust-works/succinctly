@@ -283,10 +283,14 @@ pub trait DocumentValue: Sized + Clone {
     /// (`1e100`, `1.0`, `-0.0`) instead of re-rendering the parsed value —
     /// see issue #387.
     ///
-    /// Defaults to `None`: only JSON overrides this today. YAML numbers are
-    /// resolved plain scalars (hex/octal/underscore forms `yq` may or may not
-    /// echo back verbatim), which is a separate judgment call this default
-    /// deliberately leaves alone.
+    /// Defaults to `None`. JSON overrides this unconditionally (every
+    /// `Number` token is JSON-legal number syntax by construction). YAML
+    /// overrides it too (#918), but only for a finite float whose source
+    /// text is independently confirmed safe and worthwhile to echo — see
+    /// `YamlValue::number_literal`'s doc comment (`src/yaml/light.rs`);
+    /// YAML's own plain-scalar grammar accepts spellings (hex/octal,
+    /// leading-dot) that aren't JSON-legal, and ints never lose information
+    /// through the bare-`Int` path, so both stay on this `None` default.
     fn number_literal(&self) -> Option<Cow<'_, str>> {
         None
     }

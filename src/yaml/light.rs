@@ -25,7 +25,8 @@ use std::string::ToString;
 use super::index::YamlIndex;
 use super::line_break::{is_line_break, line_break_len, line_break_len_before};
 use super::scalar::{
-    could_be_null_or_bool, is_json_number_syntax, resolve_plain, resolve_tagged, ResolvedScalar,
+    could_be_null_or_bool, is_preservable_float_literal, resolve_plain, resolve_tagged,
+    ResolvedScalar,
 };
 use super::{starts_inline_seq_entry, starts_seq_entry};
 use crate::util::simd::escape::find_json_escape;
@@ -5760,24 +5761,24 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentValue for YamlValue<'a, W> {
     }
 
     /// Unlike JSON's own override, this only fires for a plain *float*
-    /// scalar that both resolves to a finite value and is independently
-    /// confirmed JSON-number-syntax-safe by [`is_json_number_syntax`] - a
-    /// YAML document has no separate "number token" grammar the way JSON
-    /// does (`as_i64`/`as_f64` above do the same `resolve_plain` dispatch),
-    /// so this can't unconditionally hand back raw bytes the way JSON's
-    /// does. `Int` is deliberately excluded entirely: `resolve_plain`'s own
-    /// doc comment already warns that its numeric variants' source text
-    /// "cannot be re-parsed... emitters must use the carried value" (hex
-    /// `0x2A`, octal `0o52`), and plain decimal ints never lose information
-    /// through `as_i64`'s bare-`Int` path anyway, so there's no bug here to
-    /// fix by echoing their text. A finite `Float`'s raw text can still be
-    /// YAML-legal but JSON-illegal (leading `.`/`+`, a leading zero before
-    /// more digits) - `is_json_number_syntax` is what caught this: an
-    /// earlier version of this override fired for every finite float
-    /// unconditionally, which broke `tag` on a bare `.5` (see that
-    /// function's doc comment for the full mechanism). Non-finite floats
-    /// and anything JSON-unsafe fall through to `as_f64` below instead,
-    /// unchanged from before this override existed.
+    /// scalar whose raw text [`is_preservable_float_literal`] confirms is
+    /// both safe and worthwhile to echo - a YAML document has no separate
+    /// "number token" grammar the way JSON does (`as_i64`/`as_f64` above do
+    /// the same `resolve_plain` dispatch), so this can't unconditionally
+    /// hand back raw bytes the way JSON's does. `Int` is deliberately
+    /// excluded entirely: `resolve_plain`'s own doc comment already warns
+    /// that its numeric variants' source text "cannot be re-parsed...
+    /// emitters must use the carried value" (hex `0x2A`, octal `0o52`), and
+    /// plain decimal ints never lose information through `as_i64`'s
+    /// bare-`Int` path anyway, so there's no bug here to fix by echoing
+    /// their text. See [`is_preservable_float_literal`]'s doc comment for
+    /// why a `Float` needs more than just finiteness gating: an earlier
+    /// version of this override fired for every finite float unconditionally,
+    /// which broke `tag` on a bare `.5` (invalid JSON number syntax) and
+    /// silently overstated precision on an `i64`-overflow integer that only
+    /// resolves to `Float` as a fallback. Anything that predicate rejects
+    /// falls through to `as_f64` below instead, unchanged from before this
+    /// override existed.
     ///
     /// Without this override, `to_owned`'s short-circuiting chain
     /// (`number_literal` -> `as_i64` -> `as_f64`) skips straight to
@@ -5794,9 +5795,7 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentValue for YamlValue<'a, W> {
             YamlValue::String(s) if s.is_unquoted() => {
                 let str_val = s.as_str().ok()?;
                 match resolve_plain(&str_val) {
-                    ResolvedScalar::Float(f)
-                        if f.is_finite() && is_json_number_syntax(&str_val) =>
-                    {
+                    ResolvedScalar::Float(_) if is_preservable_float_literal(&str_val) => {
                         Some(str_val)
                     }
                     _ => None,

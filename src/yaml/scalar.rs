@@ -220,8 +220,13 @@ fn parse_float(s: &str) -> ResolvedScalar {
 /// `!!null` for a scalar that plainly has a `!!float` tag) rather than
 /// erroring loudly. This predicate is how [`super::light`]'s
 /// `number_literal()` override decides which literals are safe to echo.
+///
+/// This grammar duplicates `crate::json::validate`'s `Validator::validate_number`
+/// (reachable via the public `crate::json::validate::validate`) — hand-rolled
+/// here rather than reused to avoid adding a `yaml`-to-`json` module
+/// dependency for this fix; tracked as a follow-up dedup opportunity (#957).
 #[must_use]
-pub(super) fn is_json_number_syntax(s: &str) -> bool {
+fn is_json_number_syntax(s: &str) -> bool {
     let bytes = s.as_bytes();
     let mut i = 0;
     if bytes.first() == Some(&b'-') {
@@ -261,6 +266,53 @@ pub(super) fn is_json_number_syntax(s: &str) -> bool {
         }
     }
     i == bytes.len()
+}
+
+/// The maximum count of ASCII digit characters (integer + fraction part
+/// combined) [`is_preservable_float_literal`] allows through. 17 significant
+/// decimal digits is the documented bound beyond which distinct `f64`
+/// values can round to the same printed digits (and, symmetrically, below
+/// which every `f64` round-trips uniquely) — more digits than that means
+/// the source text already carries more precision than the `f64` it parsed
+/// to actually holds, so echoing it back verbatim would silently overstate
+/// precision the parse step already discarded.
+const MAX_PRESERVABLE_FLOAT_DIGITS: usize = 17;
+
+/// True if `s` is safe *and worthwhile* to preserve verbatim as a
+/// document-sourced float's `NumberLiteral` text — used by both YAML's
+/// [`super::light`] `number_literal()` override (a plain scalar) and its
+/// `!!float`-tag resolution path (an explicitly-tagged one), so the two
+/// don't drift into re-answering this question differently.
+///
+/// Requires, beyond [`is_json_number_syntax`]:
+/// - **A literal `.`.** A bare digit run only resolves to
+///   [`Float`](ResolvedScalar::Float) when it overflows `i64`
+///   (`parse_int_or_float`'s fallback) — that's not a value someone spelled
+///   as a float, it's an integer too big for `i64`, and echoing its raw
+///   digits back verbatim would silently claim more precision than the
+///   `f64` it parsed to can actually hold (the same concern the digit-count
+///   cap below targets, just via a different trigger).
+/// - **No exponent.** `format_number_jq_compat` — the formatter this text
+///   eventually flows through — re-normalizes exponent notation into a
+///   different spelling (uppercase `E`, forced sign, no `e0` elimination)
+///   rather than preserving it, so there is nothing gained by echoing
+///   exponent text through that path; it gets overwritten anyway. This also
+///   sidesteps that formatter's separate, pre-existing loss of `-0.0`'s
+///   sign on the exponent branch, which the source-text-echo path can't
+///   reach without an exponent in play.
+/// - **At most [`MAX_PRESERVABLE_FLOAT_DIGITS`] significant digits.**
+///
+/// Deliberately conservative: legal YAML core-schema spellings that don't
+/// meet this bar (`+2.0`, a trailing-dot `1.`) fall through to the
+/// pre-existing `as_f64` path unchanged rather than being force-fit here,
+/// leaving the #918 symptom open for that narrower spelling class — see
+/// the issue tracker for the follow-up.
+#[must_use]
+pub(crate) fn is_preservable_float_literal(s: &str) -> bool {
+    s.contains('.')
+        && !s.contains(['e', 'E'])
+        && s.bytes().filter(u8::is_ascii_digit).count() <= MAX_PRESERVABLE_FLOAT_DIGITS
+        && is_json_number_syntax(s)
 }
 
 /// Force-resolves a scalar's value under an explicit YAML tag.

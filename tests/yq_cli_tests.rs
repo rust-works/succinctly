@@ -10409,9 +10409,13 @@ fn test_builtin_in_yq_positive_float_index_never_matches_909() -> Result<()> {
 /// `as_i64` and produced a bare, source-text-discarding value; the marker
 /// itself survived (`. + 1` gave `2`, not an error), but by the time it
 /// reached a whole number it silently became indistinguishable from a
-/// genuine `OwnedValue::Int`. Real yq keeps `2.0`'s Float-ness live all the
-/// way to `in([1,2,3])`'s array-key check, unlike a genuine `Int(2)`
-/// in-bounds match.
+/// genuine `OwnedValue::Int`, matching a plain `Int(2)` in-bounds index
+/// where it shouldn't. `in(...)` is a succinctly/jq-language extension --
+/// real `yq`'s own filter language has no equivalent syntax to compare
+/// against directly (`yq 'in([1,2,3])'` is a lexer error there) -- so this
+/// pins succinctly's own internal consistency (a `2.0`-valued Float must
+/// never match a positive-integer array index, same as #909's `2.5`/`1.5`
+/// cases immediately above), not a byte-for-byte oracle comparison.
 #[test]
 fn test_builtin_in_yq_integer_valued_float_yaml_input_never_matches_918() -> Result<()> {
     let (out, code) = run_yq_stdin("in([1,2,3])", "2.0", &[])?;
@@ -10438,6 +10442,35 @@ fn test_materialized_yaml_float_literal_fidelity_918() -> Result<()> {
     let (out, code) = run_yq_stdin("[.]", ".5", &["-o", "json", "-I", "0"])?;
     assert_eq!(code, 0, "out: {out:?}");
     assert_eq!(out.trim(), "[0.5]");
+    Ok(())
+}
+
+/// #918 companion: an *explicitly*-tagged `!!float 2.0` converges on the
+/// same materialization step (`to_owned_cursor`'s `tagged_scalar_to_owned`,
+/// `src/jq/eval_generic.rs`) as a plain scalar, but through a separate code
+/// path that has to gate on `is_preservable_float_literal` independently --
+/// review of the initial version of this fix found that path still bypassed
+/// `number_literal()` entirely, reproducing the original #918 symptom for
+/// `!!float 2.0` even after the plain-scalar case was fixed. Pinned here
+/// against the pinned yq oracle (both give `[2.0]`).
+#[test]
+fn test_materialized_yaml_explicit_float_tag_literal_fidelity_918() -> Result<()> {
+    let (out, code) = run_yq_stdin("[.]", "!!float 2.0", &["-o", "json", "-I", "0"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "[2.0]");
+    Ok(())
+}
+
+/// #918 companion: `number_literal()`'s `YamlValue::Alias` arm delegates to
+/// the aliased target (mirroring the pre-existing `as_str` alias arm), so an
+/// integer-valued float reached only through an anchor/alias needs the same
+/// literal-preservation fix as a direct scalar. Pinned against the pinned yq
+/// oracle.
+#[test]
+fn test_materialized_yaml_aliased_float_literal_fidelity_918() -> Result<()> {
+    let (out, code) = run_yq_stdin("[.b]", "a: &x 2.0\nb: *x\n", &["-o", "json", "-I", "0"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "[2.0]");
     Ok(())
 }
 
