@@ -6779,21 +6779,26 @@ fn builtin_match<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    // Get the pattern
+    // Get the pattern. No `Ok(_) if optional` guard: same reasoning as the
+    // flags-eval block below — `optional` is never forced `true` reaching a
+    // nested `Call` like this one (see `Expr::Optional`'s dispatch, #693).
     let pattern = match result_to_owned(eval_single::<W, S>(re_expr, value.clone(), optional)) {
         Ok(OwnedValue::String(s)) => s,
-        Ok(_) if optional => return QueryResult::None,
         Ok(v) => return QueryResult::Error(EvalError::not_string_or_array(v.type_name())),
         Err(e) => return e.into(),
     };
 
-    // Get the flags, now that the pattern is known valid
+    // Get the flags, now that the pattern is known valid. No `Ok(_) if
+    // optional` guard here: `optional` is only ever forced `true` for the
+    // *final* step of `.[EXPR]?`/`.[S:E]?` (see `Expr::Optional`'s dispatch
+    // in `eval_single`, #693) — a nested `Call` like this one never sees it,
+    // so a bare `?` suppresses this error via the ancestor `eval_try`'s
+    // catch, not locally. Confirmed dead: 0 coverage hits pre- and post-#928.
     let flags = match flags_expr {
         None => None,
         Some(fe) => match result_to_owned(eval_single::<W, S>(fe, value.clone(), optional)) {
             Ok(OwnedValue::String(s)) => Some(s),
             Ok(OwnedValue::Null) => Some(String::new()),
-            Ok(_) if optional => return QueryResult::None,
             Ok(v) => return QueryResult::Error(EvalError::is_not_a_string(&v)),
             Err(e) => return e.into(),
         },
@@ -7340,21 +7345,26 @@ fn builtin_test_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    // Get the pattern
+    // Get the pattern. No `Ok(_) if optional` guard: same reasoning as the
+    // flags-eval block below — `optional` is never forced `true` reaching a
+    // nested `Call` like this one (see `Expr::Optional`'s dispatch, #693).
     let pattern = match result_to_owned(eval_single::<W, S>(re_expr, value.clone(), optional)) {
         Ok(OwnedValue::String(s)) => s,
-        Ok(_) if optional => return QueryResult::None,
         Ok(v) => return QueryResult::Error(EvalError::not_string_or_array(v.type_name())),
         Err(e) => return e.into(),
     };
 
-    // Get the flags, now that the pattern is known valid
+    // Get the flags, now that the pattern is known valid. No `Ok(_) if
+    // optional` guard here: `optional` is only ever forced `true` for the
+    // *final* step of `.[EXPR]?`/`.[S:E]?` (see `Expr::Optional`'s dispatch
+    // in `eval_single`, #693) — a nested `Call` like this one never sees it,
+    // so a bare `?` suppresses this error via the ancestor `eval_try`'s
+    // catch, not locally. Confirmed dead: 0 coverage hits pre- and post-#928.
     let flags = match flags_expr {
         None => None,
         Some(fe) => match result_to_owned(eval_single::<W, S>(fe, value.clone(), optional)) {
             Ok(OwnedValue::String(s)) => Some(s),
             Ok(OwnedValue::Null) => Some(String::new()),
-            Ok(_) if optional => return QueryResult::None,
             Ok(v) => return QueryResult::Error(EvalError::is_not_a_string(&v)),
             Err(e) => return e.into(),
         },
@@ -7416,21 +7426,26 @@ fn builtin_capture_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    // Get the pattern
+    // Get the pattern. No `Ok(_) if optional` guard: same reasoning as the
+    // flags-eval block below — `optional` is never forced `true` reaching a
+    // nested `Call` like this one (see `Expr::Optional`'s dispatch, #693).
     let pattern = match result_to_owned(eval_single::<W, S>(re_expr, value.clone(), optional)) {
         Ok(OwnedValue::String(s)) => s,
-        Ok(_) if optional => return QueryResult::None,
         Ok(v) => return QueryResult::Error(EvalError::not_string_or_array(v.type_name())),
         Err(e) => return e.into(),
     };
 
-    // Get the flags, now that the pattern is known valid
+    // Get the flags, now that the pattern is known valid. No `Ok(_) if
+    // optional` guard here: `optional` is only ever forced `true` for the
+    // *final* step of `.[EXPR]?`/`.[S:E]?` (see `Expr::Optional`'s dispatch
+    // in `eval_single`, #693) — a nested `Call` like this one never sees it,
+    // so a bare `?` suppresses this error via the ancestor `eval_try`'s
+    // catch, not locally. Confirmed dead: 0 coverage hits pre- and post-#928.
     let flags = match flags_expr {
         None => None,
         Some(fe) => match result_to_owned(eval_single::<W, S>(fe, value.clone(), optional)) {
             Ok(OwnedValue::String(s)) => Some(s),
             Ok(OwnedValue::Null) => Some(String::new()),
-            Ok(_) if optional => return QueryResult::None,
             Ok(v) => return QueryResult::Error(EvalError::is_not_a_string(&v)),
             Err(e) => return e.into(),
         },
@@ -7514,21 +7529,26 @@ fn builtin_sub_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    // Get the pattern
+    // Get the pattern. No `Ok(_) if optional` guard: same reasoning as the
+    // flags-eval block below — `optional` is never forced `true` reaching a
+    // nested `Call` like this one (see `Expr::Optional`'s dispatch, #693).
     let pattern = match result_to_owned(eval_single::<W, S>(re_expr, value.clone(), optional)) {
         Ok(OwnedValue::String(s)) => s,
-        Ok(_) if optional => return QueryResult::None,
         Ok(v) => return QueryResult::Error(EvalError::is_not_a_string(&v)),
         Err(e) => return e.into(),
     };
 
-    // Get the flags, now that the pattern is known valid
+    // Get the flags, now that the pattern is known valid. No `Ok(_) if
+    // optional` guard here: `optional` is only ever forced `true` for the
+    // *final* step of `.[EXPR]?`/`.[S:E]?` (see `Expr::Optional`'s dispatch
+    // in `eval_single`, #693) — a nested `Call` like this one never sees it,
+    // so a bare `?` suppresses this error via the ancestor `eval_try`'s
+    // catch, not locally. Confirmed dead: 0 coverage hits pre- and post-#928.
     let flags = match flags_expr {
         None => None,
         Some(fe) => match result_to_owned(eval_single::<W, S>(fe, value.clone(), optional)) {
             Ok(OwnedValue::String(s)) => Some(s),
             Ok(OwnedValue::Null) => Some(String::new()),
-            Ok(_) if optional => return QueryResult::None,
             Ok(v) => return QueryResult::Error(EvalError::is_not_a_string(&v)),
             Err(e) => return e.into(),
         },
@@ -7678,10 +7698,11 @@ fn builtin_gsub_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 ) -> QueryResult<'a, W> {
     let global_flags = format!("{}g", flags.unwrap_or(""));
 
-    // Get the pattern
+    // Get the pattern. No `Ok(_) if optional` guard: same reasoning as the
+    // flags-eval block in `builtin_match`/`builtin_test_with_flags`/etc. —
+    // `optional` is never forced `true` reaching a nested `Call` like this.
     let pattern = match result_to_owned(eval_single::<W, S>(re_expr, value.clone(), optional)) {
         Ok(OwnedValue::String(s)) => s,
-        Ok(_) if optional => return QueryResult::None,
         Ok(v) => return QueryResult::Error(EvalError::is_not_a_string(&v)),
         Err(e) => return e.into(),
     };
@@ -28100,14 +28121,20 @@ mod tests {
         }
 
         // ? still suppresses a non-string flags value, for every builtin
-        // whose flags-eval arm this PR touched (not just gsub — each has
-        // its own `Ok(_) if optional` guard, which needs its own coverage).
+        // whose flags-eval this PR touched (not just gsub). The suppression
+        // happens one level up, in the ancestor `eval_try` that a bare `?`
+        // installs (#693) — these builtins' own flags/pattern-eval match
+        // arms have no local `optional`-guarded case to take instead (see
+        // the "No `Ok(_) if optional` guard" comments in `builtin_match`
+        // and `builtin_gsub_with_flags`), so this is pinning the
+        // end-to-end behavior, not a specific branch.
         for filter in [
             r#"[match("a"; 1)?]"#,
             r#"[capture("(?<a>a)"; 1)?]"#,
             r#"[sub("a"; "b"; 1)?]"#,
             r#"[test("a"; 1)?]"#,
             r#"[gsub("a"; "b"; 1)?]"#,
+            r#"[gsub(1; "b"; "i")?]"#,
         ] {
             query!(br#""x""#, filter,
                 QueryResult::Owned(OwnedValue::Array(vs)) => {
@@ -28120,15 +28147,6 @@ mod tests {
         query!(br#""abc""#, r#"scan("a"; null)"#,
             QueryResult::ManyOwned(matches) => {
                 assert_eq!(matches.len(), 1);
-            }
-        );
-
-        // gsub's own pattern-eval arm (added by this PR — see
-        // builtin_gsub_with_flags) also needs its `?`-suppression covered
-        // separately from the flags-eval arm above.
-        query!(br#""x""#, r#"[gsub(1; "b"; "i")?]"#,
-            QueryResult::Owned(OwnedValue::Array(vs)) => {
-                assert!(vs.is_empty());
             }
         );
     }
