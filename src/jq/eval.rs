@@ -3144,17 +3144,43 @@ fn builtin_in<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
 /// Builtin: `IN(s)` - true if any output of `s` (run against the current
 /// value) equals the current value. Matches jq's `any(s == .; .)`.
+///
+/// #910 fix: `s` used to be evaluated eagerly to completion via
+/// `eval_owned_multi` before any equality check ran, so a later output's
+/// error fired even when an earlier output already matched -- unlike real
+/// jq's `any`-based definition, which stops asking `s` for outputs the
+/// moment a match is found. Reuses `eval_owned_expr_fork` (the same "keep
+/// the already-produced prefix, thread the trailing escape separately"
+/// split `any_all_gen_cond`/`eval_reduce`/`eval_foreach` already use
+/// throughout this file) so a match already present in the prefix
+/// short-circuits before the trailing escape is ever consulted. This
+/// isn't true step-by-step generator laziness -- `s` is still evaluated to
+/// completion internally -- but it's externally indistinguishable from it
+/// for `error(...)`/ordinary values, the same trade-off `any_all_gen_cond`'s
+/// own doc comment documents. Confirmed against jq 1.7.1: `IN(2,
+/// error("boom"))` on `2` is `true` (the error is never reached), `IN(3,
+/// error("boom"))` on `2` still raises it (no earlier candidate matched, so
+/// the trailing escape is the only verdict left). Known gap (#932, shared
+/// with `any`/`all`, pre-existing there): `halt_error`/`stderr` print as an
+/// immediate side effect of being *evaluated*, not of their result being
+/// consumed, so a match found before reaching one in `s` still leaks its
+/// printed bytes even though the overall answer and process-exit behavior
+/// stay correct -- `debug`/`error` don't have this problem, since neither
+/// performs I/O at evaluation time.
 fn builtin_upper_in<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     s: &Expr,
     value: StandardJson<'a, W>,
     _optional: bool,
 ) -> QueryResult<'a, W> {
     let current = to_owned(&value);
-    let candidates = match eval_owned_multi::<S>(s, &current) {
-        Ok(c) => c,
-        Err(e) => return e.into(),
-    };
-    QueryResult::Owned(OwnedValue::Bool(candidates.contains(&current)))
+    let (candidates, trailing) = eval_owned_expr_fork::<S>(s, &current, false);
+    if candidates.contains(&current) {
+        return QueryResult::Owned(OwnedValue::Bool(true));
+    }
+    match trailing {
+        Some(control) => control_to_result(control),
+        None => QueryResult::Owned(OwnedValue::Bool(false)),
+    }
 }
 
 /// Builtin: `IN(src; s)` - true if any output of `src` equals any output of
@@ -3167,6 +3193,22 @@ fn builtin_upper_in<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// reproduce the oracle's actual output. The cartesian-equality form here
 /// (`any(src == s; .)`) was verified to match the real builtin's behavior
 /// across a battery of cases (see issue #722).
+///
+/// #910 fix: both `src` and `s` used to be evaluated eagerly to completion
+/// via `eval_owned_multi` before any equality check ran, so a trailing
+/// error on *either* side fired even when an earlier pair already matched
+/// -- confirmed against real jq 1.7.1, `IN(2, error("boom"); 2)` and
+/// `IN(2; 2, error("boom"))` are both `true` regardless of which operand
+/// carries the later error. Same `eval_owned_expr_fork` prefix/trailing
+/// split as `builtin_upper_in` above, including its same known gap (#932):
+/// both sides are still fully evaluated internally, so a match found in
+/// the already-produced prefixes short-circuits before either trailing
+/// escape is consulted, correctly for `error(...)`/ordinary values but
+/// still leaking `halt_error`/`stderr`'s own immediate print if either
+/// operand's discarded tail reaches one. When *no* pair matches and both
+/// sides carry a trailing escape, `src`'s wins -- confirmed against real
+/// jq: `IN(3, error("src-boom"); 4, error("s-boom"))` reports
+/// `"src-boom"`, not `"s-boom"`.
 fn builtin_upper_in_src<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     src: &Expr,
     s: &Expr,
@@ -3174,16 +3216,15 @@ fn builtin_upper_in_src<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     _optional: bool,
 ) -> QueryResult<'a, W> {
     let current = to_owned(&value);
-    let haystack = match eval_owned_multi::<S>(src, &current) {
-        Ok(v) => v,
-        Err(e) => return e.into(),
-    };
-    let needles = match eval_owned_multi::<S>(s, &current) {
-        Ok(v) => v,
-        Err(e) => return e.into(),
-    };
-    let found = haystack.iter().any(|h| needles.iter().any(|n| n == h));
-    QueryResult::Owned(OwnedValue::Bool(found))
+    let (haystack, haystack_trailing) = eval_owned_expr_fork::<S>(src, &current, false);
+    let (needles, needles_trailing) = eval_owned_expr_fork::<S>(s, &current, false);
+    if haystack.iter().any(|h| needles.contains(h)) {
+        return QueryResult::Owned(OwnedValue::Bool(true));
+    }
+    match haystack_trailing.or(needles_trailing) {
+        Some(control) => control_to_result(control),
+        None => QueryResult::Owned(OwnedValue::Bool(false)),
+    }
 }
 
 /// Builtin: select(condition)
@@ -27234,6 +27275,46 @@ mod tests {
         query!(br"5", r#"IN(1; error("boom"))"#,
             QueryResult::Error(e) => {
                 assert_eq!(e.message, "boom");
+            }
+        );
+    }
+
+    /// #910: an earlier match short-circuits before a *later* candidate's
+    /// error is ever consulted -- confirmed against real jq 1.7.1,
+    /// `IN(2, error("boom"))` on `2` is `true`, not an error. When no
+    /// earlier candidate matches, the trailing error still surfaces (same
+    /// as `test_builtin_upper_in_propagates_source_error` above, just with
+    /// a matching candidate first).
+    #[test]
+    fn test_builtin_upper_in_short_circuits_before_later_error_910() {
+        query!(br"2", r#"IN(2, error("boom"))"#,
+            QueryResult::Owned(OwnedValue::Bool(true)) => {}
+        );
+        query!(br"2", r#"IN(3, error("boom"))"#,
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "boom");
+            }
+        );
+    }
+
+    /// #910 companion for the two-argument form: an earlier match on
+    /// *either* operand short-circuits before the other operand's later
+    /// error is consulted -- confirmed against real jq 1.7.1,
+    /// `IN(2, error("boom"); 2)` and `IN(2; 2, error("boom"))` are both
+    /// `true`. When neither side matches and both carry a trailing error,
+    /// `src`'s wins (confirmed: `IN(3, error("src-boom"); 4,
+    /// error("s-boom"))` reports `"src-boom"`, not `"s-boom"`).
+    #[test]
+    fn test_builtin_upper_in_src_short_circuits_before_later_error_910() {
+        query!(br"2", r#"IN(2, error("boom"); 2)"#,
+            QueryResult::Owned(OwnedValue::Bool(true)) => {}
+        );
+        query!(br"2", r#"IN(2; 2, error("boom"))"#,
+            QueryResult::Owned(OwnedValue::Bool(true)) => {}
+        );
+        query!(br"2", r#"IN(3, error("src-boom"); 4, error("s-boom"))"#,
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "src-boom");
             }
         );
     }
