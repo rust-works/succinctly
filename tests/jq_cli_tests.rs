@@ -5976,6 +5976,50 @@ fn test_gsub_replacement_multi_value_takes_first_value() -> Result<()> {
     Ok(())
 }
 
+/// `eval_sub_replacement`'s zero-output shape (#840), the sibling gap to the
+/// multi-value stopgap above -- untested until now. A replacement filter
+/// that emits `empty` for the (single) match is not a type mismatch, so it
+/// does not go through the `type_error("string", "replacement")` arm at
+/// all; it hits `result_to_owned`'s own "no value" error for an empty
+/// stream instead, one layer up. Verified against jq 1.7.1: `jq -c
+/// 'sub("a"; empty)'` on `"cab"` prints `"cab"` *unchanged*, exit 0 --
+/// jq's actual rule for this shape is not a simple "delete the match" one,
+/// confirmed inconsistent with the multi-match `gsub` case documented in
+/// docs/compliance/jq/limitations.md's "Where succinctly errors and jq
+/// does not" section, which is why this stays a documented divergence
+/// rather than a guessed-at fix.
+#[test]
+fn test_sub_replacement_empty_output_errors() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-c", r#"sub("a"; empty)"#], Some(r#""cab""#))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert!(stderr.contains("no value"), "stderr: {stderr:?}");
+    Ok(())
+}
+
+/// `gsub` counterpart: one match (of several) whose replacement filter
+/// emits `empty`, the shape #840's own repro used. Verified against jq
+/// 1.7.1: `jq -c 'gsub("(?<x>[aeiou])"; if .x=="e" then empty else
+/// "["+.x+"]" end)'` on `"hello world"` prints `"ll[o] w[o]rld"` -- the
+/// gap before the empty-replaced match (`"h"`) vanishes along with the
+/// match itself, not just that match's own contribution, which is the
+/// "genuinely surprising" behavior the compliance doc's #840 entry
+/// declines to reproduce.
+#[test]
+fn test_gsub_replacement_empty_output_errors() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            r#"gsub("(?<x>[aeiou])"; if .x=="e" then empty else "["+.x+"]" end)"#,
+        ],
+        Some(r#""hello world""#),
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert!(stderr.contains("empty result"), "stderr: {stderr:?}");
+    Ok(())
+}
+
 /// `builtin_gsub_flags`'s flags-argument arm (`gsub(re; replacement; flags)`,
 /// the 3-arg form) -- same shape as `builtin_sub_flags`'s flags arm, but a
 /// distinct function/site in the source. Verified against jq 1.7.1:
