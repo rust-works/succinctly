@@ -27320,6 +27320,47 @@ mod tests {
 
     #[cfg(feature = "regex")]
     #[test]
+    fn test_regex_bare_test_delegates_to_flagged_923() {
+        // #923: bare test(re) now delegates to builtin_test_with_flags
+        // instead of duplicating pattern/input fetch and regex build.
+        // Every case verified live against jq 1.7.1.
+
+        // Ordinary match/non-match, unaffected by the delegation.
+        query!(br#""abc""#, r#"test("abc")"#,
+            QueryResult::Owned(OwnedValue::Bool(b)) => {
+                assert!(b);
+            }
+        );
+        query!(br#""ABC""#, r#"test("abc")"#,
+            QueryResult::Owned(OwnedValue::Bool(b)) => {
+                assert!(!b, "bare test() must stay case-sensitive (no flags)");
+            }
+        );
+
+        // Non-string pattern and non-string input error the same way as
+        // the flagged form (both route through the same shared checks now).
+        query!(br#""abc""#, r#"try test(5) catch "ERR""#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "ERR");
+            }
+        );
+        query!(b"5", r#"try test("abc") catch "ERR""#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "ERR");
+            }
+        );
+
+        // `?` suppresses a bad pattern with no output, matching
+        // test(re;flags)'s existing optional behavior.
+        query!(br#""abc""#, r#"[test("(")?]"#,
+            QueryResult::Owned(OwnedValue::Array(vs)) => {
+                assert!(vs.is_empty());
+            }
+        );
+    }
+
+    #[cfg(feature = "regex")]
+    #[test]
     fn test_regex_flags_s_m_p() {
         // The #727 repro: jq's `s` (single-line mode) leaves dot NOT
         // matching newline.
