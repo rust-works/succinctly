@@ -327,3 +327,19 @@ path_non_path_keys	path(keys)	{"a":1}
 path_non_path_pipe_to_builtin	path(.a | tostring)	{"a":1}
 path_non_path_object_construction	path({a:1})	{"a":1}
 path_non_path_optional_not_suppressed	path(("a")?)	{"a":1}
+
+# ── non-finite float value previews (#930) ────────────────────────────────
+# describe()/dump_truncated() rendered an overflowed/infinite float preview
+# as JSON `null` instead of jq's real text. `infinite`/`-infinite`/arithmetic
+# overflow have no source literal of their own, so jq shows DBL_MAX text;
+# nan still has no literal spelling either way, so it stays `null` on both
+# sides (unchanged, included here as a control). Uses `scan` (regex-gated,
+# see FEATURE_GATED in jq_error_message_tests.rs) rather than `keys`/`.[]`,
+# which route a document-sourced value through OwnedValue::to_json_for_reindex
+# first - fine for a finite value, but it substitutes its own `1e999` round-
+# trip sentinel for a non-finite one (#939), which is exactly what these
+# probes need to NOT go through.
+infinite_preview	scan(infinite)	"x"
+neg_infinite_preview	scan(-infinite)	"x"
+nan_preview	scan(nan)	"x"
+arithmetic_overflow_preview	scan(1e300*1e300)	"x"

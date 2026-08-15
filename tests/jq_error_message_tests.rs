@@ -65,6 +65,15 @@ const FEATURE_GATED: &[&str] = &[
     "test_arg_non_string_flagged",
     "match_arg_non_string_flagged",
     "capture_arg_non_string_flagged",
+    // #930: these use `scan(...)` purely as a vehicle to reach a non-finite
+    // value's `describe()` preview - `keys`/`.[]` would also work without
+    // `regex`, but route the value through `to_json_for_reindex` first,
+    // which substitutes its own round-trip sentinel for a non-finite value
+    // (#939) rather than reaching `scan`'s "is not a string" type check.
+    "infinite_preview",
+    "neg_infinite_preview",
+    "nan_preview",
+    "arithmetic_overflow_preview",
 ];
 
 struct Probe {

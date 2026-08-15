@@ -25,7 +25,7 @@ use alloc::vec::Vec;
 
 use super::document::{DocumentFields, IndentSpec};
 use super::escape::{write_json_body_jq, write_json_body_yq};
-use super::value::{format_number_jq_compat, NumberRepr, OwnedValue};
+use super::value::{format_number_jq_compat, infinite_float_preview_text, NumberRepr, OwnedValue};
 use crate::yaml::format_float_with_fraction;
 
 /// A value that can be streamed directly to output without intermediate allocation.
@@ -176,7 +176,27 @@ fn stream_owned_value_json<W: core::fmt::Write>(
         sort_keys,
         write_json_body_yq,
         format_float_with_fraction,
+        real_output_infinite_float,
+        real_output_infinite_literal,
     )
+}
+
+/// The `yq`/real-output convention for an infinite `Float` (NaN is handled
+/// unconditionally, ahead of this, in `stream_owned_value_json_with` itself
+/// — both conventions agree it's always `null`): RFC 8259 has no literal for
+/// Infinity either, so this always renders `null` too, regardless of sign.
+/// Pinned by `test_stream_json_number_literal_nan_and_infinite` below —
+/// never change this without updating that test's expectation too.
+fn real_output_infinite_float(_negative: bool) -> String {
+    "null".to_string()
+}
+
+/// The `yq`/real-output convention for an infinite `NumberLiteral` — same
+/// rule as [`real_output_infinite_float`], just for the sibling variant that
+/// also carries the document's raw source text (irrelevant here, since real
+/// output never echoes it for a non-finite value).
+fn real_output_infinite_literal(_raw: &[u8]) -> String {
+    "null".to_string()
 }
 
 /// Stream an OwnedValue as JSON, escaping strings the way `jq` does.
@@ -198,9 +218,40 @@ pub fn stream_owned_value_json_jq<W: core::fmt::Write>(
 ) -> core::fmt::Result {
     // Always compact: this is the jq-error-message convention, which never
     // pretty-prints.
-    stream_owned_value_json_with(value, out, 0, 0, ' ', false, write_json_body_jq, |f| {
-        f.to_string()
-    })
+    stream_owned_value_json_with(
+        value,
+        out,
+        0,
+        0,
+        ' ',
+        false,
+        write_json_body_jq,
+        |f| f.to_string(),
+        |negative| infinite_float_preview_text(negative).to_string(),
+        preview_infinite_literal,
+    )
+}
+
+/// The jq-error-message-preview convention for an infinite `Float`: unlike
+/// real output, jq's own value previews aren't constrained by RFC 8259 (they
+/// aren't JSON, just message text), so an infinite value with no source
+/// literal of its own to echo — the `infinite`/`-infinite` builtins, or any
+/// arithmetic overflow — renders as jq's actual `DBL_MAX` text instead of
+/// `null` (issue #930).
+///
+/// (NaN still renders as `null` here too, same as real output — jq's own
+/// value previews do the same, since NaN has no literal spelling to fall
+/// back to either; that case is handled unconditionally in
+/// `stream_owned_value_json_with` itself, ahead of ever reaching this.)
+fn preview_infinite_literal(raw: &[u8]) -> String {
+    // The document literal this overflowed from is right here, so unlike
+    // the plain-`Float` case this can do better than `DBL_MAX` text: reuse
+    // the same jq-canonical-formatting path finite `NumberLiteral`s already
+    // go through — `format_number_jq_compat` now handles a non-finite input
+    // via `format_overflow_literal_mantissa` instead of the finite path's
+    // `log10`/`pow` (see that function's doc comment for why the split is
+    // necessary), so this can call it unconditionally.
+    format_number_jq_compat(raw)
 }
 
 /// Stream an OwnedValue as JSON without intermediate string allocation, using
@@ -222,6 +273,8 @@ fn stream_owned_value_json_with<W: core::fmt::Write>(
     sort_keys: bool,
     escape: fn(&mut W, &str) -> core::fmt::Result,
     float_fmt: fn(f64) -> String,
+    infinite_float: fn(bool) -> String,
+    infinite_literal: fn(&[u8]) -> String,
 ) -> core::fmt::Result {
     match value {
         OwnedValue::Null => out.write_str("null"),
@@ -229,20 +282,22 @@ fn stream_owned_value_json_with<W: core::fmt::Write>(
         OwnedValue::Bool(false) => out.write_str("false"),
         OwnedValue::Int(n) => write!(out, "{n}"),
         OwnedValue::Float(f) => {
-            if f.is_nan() || f.is_infinite() {
-                // JSON doesn't support NaN or Infinity
+            if f.is_nan() {
+                // Neither convention has a literal for NaN to fall back to.
                 out.write_str("null")
+            } else if f.is_infinite() {
+                out.write_str(&infinite_float(f.is_sign_negative()))
             } else {
                 out.write_str(&float_fmt(*f))
             }
         }
-        OwnedValue::NumberLiteral(repr, literal) => {
-            if matches!(repr, NumberRepr::Float(f) if f.is_nan() || f.is_infinite()) {
-                out.write_str("null")
-            } else {
-                out.write_str(&format_number_jq_compat(literal.as_bytes()))
+        OwnedValue::NumberLiteral(repr, literal) => match repr {
+            NumberRepr::Float(f) if f.is_nan() => out.write_str("null"),
+            NumberRepr::Float(f) if f.is_infinite() => {
+                out.write_str(&infinite_literal(literal.as_bytes()))
             }
-        }
+            _ => out.write_str(&format_number_jq_compat(literal.as_bytes())),
+        },
         OwnedValue::String(s) => stream_json_string(out, s, escape),
         OwnedValue::Array(arr) => {
             if arr.is_empty() {
@@ -267,6 +322,8 @@ fn stream_owned_value_json_with<W: core::fmt::Write>(
                     sort_keys,
                     escape,
                     float_fmt,
+                    infinite_float,
+                    infinite_literal,
                 )?;
             }
             if indent_spaces > 0 {
@@ -304,6 +361,8 @@ fn stream_owned_value_json_with<W: core::fmt::Write>(
                     sort_keys,
                     escape,
                     float_fmt,
+                    infinite_float,
+                    infinite_literal,
                 )?;
             }
             if indent_spaces > 0 {
@@ -946,6 +1005,59 @@ mod tests {
         OwnedValue::NumberLiteral(NumberRepr::Float(f64::INFINITY), "1e400".into())
             .stream_json(&mut buf, IndentSpec::COMPACT, false)
             .unwrap();
+        assert_eq!(buf, "null");
+    }
+
+    /// #930: unlike real output (above), jq's error-message value previews
+    /// (`stream_owned_value_json_jq`, used by `describe()`/`dump_truncated()`
+    /// in `src/jq/error.rs`) aren't constrained by RFC 8259 - jq's own
+    /// previews show real text for a non-finite float, not `null`. A plain
+    /// `Float` carries no source literal, so an infinite one renders as
+    /// jq's `DBL_MAX` text (oracle-verified: `infinite`/`-infinite`/any
+    /// arithmetic overflow all match this exactly). NaN still has no
+    /// literal to fall back to either way, so it stays `null` - unchanged
+    /// from real output and from jq itself.
+    #[test]
+    fn test_stream_json_jq_float_non_finite() {
+        let mut buf = String::new();
+        stream_owned_value_json_jq(&OwnedValue::Float(f64::INFINITY), &mut buf).unwrap();
+        assert_eq!(buf, "1.7976931348623157e+308");
+
+        buf.clear();
+        stream_owned_value_json_jq(&OwnedValue::Float(f64::NEG_INFINITY), &mut buf).unwrap();
+        assert_eq!(buf, "-1.7976931348623157e+308");
+
+        buf.clear();
+        stream_owned_value_json_jq(&OwnedValue::Float(f64::NAN), &mut buf).unwrap();
+        assert_eq!(buf, "null");
+    }
+
+    /// #930: a `NumberLiteral` carries its document source text, so an
+    /// overflowed one gets jq's literal-preserving text instead of `DBL_MAX`
+    /// text - matching how real jq distinguishes an echoed literal from a
+    /// computed value. `format_number_jq_compat` is exercised directly
+    /// (rather than via a CLI-level `keys`/`.[]` probe) because those
+    /// operations round-trip an input document's value through
+    /// `OwnedValue::to_json_for_reindex` before an error can reach this
+    /// code, which substitutes its own `1e999` round-trip sentinel for the
+    /// original literal text (pre-existing, unrelated to this fix - see the
+    /// `#930` follow-up filed for it).
+    #[test]
+    fn test_stream_json_jq_number_literal_overflow_preserves_literal_text() {
+        let mut buf = String::new();
+        stream_owned_value_json_jq(
+            &OwnedValue::NumberLiteral(NumberRepr::Float(f64::INFINITY), "1e400".into()),
+            &mut buf,
+        )
+        .unwrap();
+        assert_eq!(buf, "1E+400");
+
+        buf.clear();
+        stream_owned_value_json_jq(
+            &OwnedValue::NumberLiteral(NumberRepr::Float(f64::NAN), "nan".into()),
+            &mut buf,
+        )
+        .unwrap();
         assert_eq!(buf, "null");
     }
 

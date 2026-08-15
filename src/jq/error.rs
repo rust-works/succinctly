@@ -295,11 +295,20 @@ impl EvalError {
     ///
     /// The message renders `value` the way jq reports it: a string payload is
     /// used as-is (`error("boom")` reports `boom`, not `"boom"`), anything else
-    /// is serialized as JSON.
+    /// is serialized via the jq-error-message convention (`stream_owned_value_json_jq`,
+    /// the same one `describe`/`dump_truncated` use — not [`OwnedValue::to_json`],
+    /// whose RFC-8259-safe `null` for a non-finite float is wrong here: `error(infinite)`
+    /// reports jq's real `DBL_MAX` text, not `null` (#930)). Unlike `dump_truncated`,
+    /// this has no length budget — `error(v)`'s message is the whole value, verbatim,
+    /// same as real jq.
     pub fn from_value(value: OwnedValue) -> Self {
         let message = match &value {
             OwnedValue::String(s) => s.clone(),
-            other => other.to_json(),
+            other => {
+                let mut message = String::new();
+                let _ = stream_owned_value_json_jq(other, &mut message);
+                message
+            }
         };
         Self {
             message,
@@ -876,6 +885,70 @@ mod tests {
         let _ = sink.write_str(&"あ".repeat(20)); // 3 bytes each: 12 < 14 < 15
         assert_eq!(sink.buf, "ああああ", "cut back to a char boundary");
         assert!(sink.buf.len() <= 14);
+    }
+
+    /// #930: an infinite `NumberLiteral` reaching `dump_truncated` now
+    /// renders its own source text (rather than the unconditional `"null"`
+    /// this whole area used to take) via `format_number_jq_compat` - which,
+    /// same spirit as `preview_sink_copies_at_most_its_cap` above, must stay
+    /// bounded even if the document's mantissa is enormous, since almost
+    /// none of it will ever be visible past `dump_truncated`'s own budget.
+    #[test]
+    fn dump_truncated_bounds_an_overflowed_literal_with_a_huge_mantissa() {
+        let mantissa = "9".repeat(2_000_000);
+        let literal: Box<str> = format!("{mantissa}.5e400").into();
+        let value = OwnedValue::NumberLiteral(
+            super::super::value::NumberRepr::Float(f64::INFINITY),
+            literal,
+        );
+        let result = dump_truncated(&value);
+        assert!(
+            result.len() < 100,
+            "must not render anywhere near the full 2,000,000-digit mantissa: got {} bytes",
+            result.len()
+        );
+        assert!(result.starts_with("9.999999999"), "got: {result}");
+        assert!(result.ends_with("..."), "must be truncated: {result}");
+    }
+
+    /// #930 review: `from_value`'s non-string branch used `OwnedValue::to_json`,
+    /// which is the *real-output* convention (RFC-8259-safe `null` for a
+    /// non-finite float) - wrong for `error(v)`'s message, which (like
+    /// `describe`/`dump_truncated` above) isn't JSON and should show jq's
+    /// real preview text instead. Oracle-verified: `error(infinite)`
+    /// uncaught reports `1.7976931348623157e+308` in real jq, not `null`.
+    #[test]
+    fn from_value_renders_infinite_float_like_jq_not_as_null() {
+        assert_eq!(
+            EvalError::from_value(OwnedValue::Float(f64::INFINITY)).message,
+            "1.7976931348623157e+308"
+        );
+        assert_eq!(
+            EvalError::from_value(OwnedValue::Float(f64::NEG_INFINITY)).message,
+            "-1.7976931348623157e+308"
+        );
+        // NaN still has no literal to fall back to either way - unchanged.
+        assert_eq!(
+            EvalError::from_value(OwnedValue::Float(f64::NAN)).message,
+            "null"
+        );
+        // A container holding a non-finite field renders it the same way,
+        // not just a bare top-level value.
+        let mut obj = indexmap::IndexMap::new();
+        obj.insert("a".to_string(), OwnedValue::Float(f64::INFINITY));
+        obj.insert("b".to_string(), OwnedValue::String("x".to_string()));
+        assert_eq!(
+            EvalError::from_value(OwnedValue::Object(obj)).message,
+            r#"{"a":1.7976931348623157e+308,"b":"x"}"#
+        );
+        // `from_value`'s message is the whole value, not a truncated
+        // preview - unlike `dump_truncated`'s budget above.
+        let long = "x".repeat(100);
+        assert_eq!(
+            EvalError::from_value(s(&long)).message,
+            long,
+            "a string payload is used as-is, unmodified and untruncated"
+        );
     }
 
     #[test]
