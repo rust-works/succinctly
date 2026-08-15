@@ -7839,6 +7839,61 @@ fn test_resolve_index_expr_indexes_targets_partial_fanout_before_its_own_error_8
     Ok(())
 }
 
+/// #977: `resolve_seq`'s fan-out loop used to return an escaping element's
+/// partial prefix without ever applying a purely-static tail after it (a
+/// literal `.foo`/`[N]`/`[N:M]`, desugared to a flat `Pipe` at parse time —
+/// distinct from #896's own 4 sites, which only cover a *dynamic*
+/// subscript). Verified against jq 1.7.1 for all three tail shapes.
+#[test]
+fn test_resolve_seq_applies_static_tail_after_fanout_element_escape_977() -> Result<()> {
+    // Literal index tail.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r#"path((select(true, error("t")))[0])"#],
+        Some("[10,20,30]"),
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[0]\n");
+    assert!(stderr.contains('t'), "stderr: {stderr:?}");
+
+    // Literal slice tail.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r#"path((select(true, error("t")))[0:1])"#],
+        Some("[10,20,30]"),
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[{\"start\":0,\"end\":1}]\n");
+    assert!(stderr.contains('t'), "stderr: {stderr:?}");
+
+    // Literal field tail.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r#"path((select(true, error("t"))).a)"#],
+        Some(r#"{"a":1}"#),
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[\"a\"]\n");
+    assert!(stderr.contains('t'), "stderr: {stderr:?}");
+    Ok(())
+}
+
+/// #977: if the static tail itself also fails while being applied to the
+/// fan-out element's partial prefix, that later failure takes priority over
+/// the earlier deferred one — the same "later step's own failure outranks
+/// an earlier deferred one" rule this codebase already applies elsewhere
+/// (`resolve_slice_expr`'s `target_escape`). Verified against jq 1.7.1:
+/// indexing a number with `[0]` raises jq's own type error, not `t`.
+#[test]
+fn test_resolve_seq_static_tail_failure_outranks_earlier_fanout_escape_977() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", r#"path((select(true, error("t")))[0])"#], Some("5"))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert!(
+        stderr.contains("Cannot index number with number"),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
 /// #896 review round: `GetPath`'s arm only builds its own partial-prefix
 /// branch for the exact single-array-output shape; any other shape (here,
 /// 2+ valid array outputs before the error) falls through to `resolve_leaf`,

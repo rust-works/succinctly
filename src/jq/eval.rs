@@ -12220,6 +12220,48 @@ fn resolve_static_tail<'a, S: EvalSemantics>(
     value_after_components::<S>(components, value).map_err(|e| (Vec::new(), e))
 }
 
+/// Apply a purely-static path tail to every branch, extending each branch's
+/// path with `tail` verbatim and threading its value through
+/// [`resolve_static_tail`]. On the first tail-application failure, returns
+/// whatever branches were already extended, paired with that failure —
+/// `resolve_seq`'s own `Err`-side "keep what already resolved" contract.
+///
+/// Shared by `resolve_seq`'s success path (every fan-out element resolved
+/// without escaping) and its escape path (#977: an earlier fan-out element
+/// itself escaped with a partial prefix) so the two can't independently
+/// drift on how a static tail gets applied — before this fix, the escape
+/// path skipped tail application entirely, silently dropping a literal
+/// `.foo`/`[N]`/`[N:M]` suffix from the partial output already produced.
+fn apply_static_tail<'a, S: EvalSemantics>(
+    branches: Vec<PathBranch<'a>>,
+    tail: &[Expr],
+    trackable: bool,
+) -> PathResolveResult<'a> {
+    let mut out = Vec::with_capacity(branches.len());
+    for (mut prefix, current) in branches {
+        // A dynamic element as the pipe's last component (e.g. `.a[.k]`) is
+        // the common, still-trackable shape here, and leaves `tail` empty —
+        // reuse `current` directly rather than paying `resolve_static_tail`/
+        // `value_after_components`'s own clone-then-return-unchanged for a
+        // no-op walk. Anything else — a non-empty `tail`, or an untracked
+        // `current` even with an empty one (#843: `current` may be
+        // `Builtin::GetPath`'s own resolved-but-still-untracked result, see
+        // `resolve_static_tail`'s doc comment) — goes through the shared,
+        // trackable-aware helper.
+        let end: Cow<'a, OwnedValue> = if tail.is_empty() && trackable {
+            current
+        } else {
+            match resolve_static_tail::<S>(tail, &current, trackable) {
+                Ok(end) => Cow::Owned(end),
+                Err((_, e)) => return Err((out, e)),
+            }
+        };
+        prefix.extend_from_slice(tail);
+        out.push((prefix, end));
+    }
+    Ok(out)
+}
+
 /// Resolve a pipe of path nodes, threading the value left to right.
 ///
 /// The threading is the whole point: a computed key sees the value reaching
@@ -12303,7 +12345,21 @@ fn resolve_seq<'a, S: EvalSemantics>(
                         path.extend(components);
                         next.push((path, resulting));
                     }
-                    return Err((next, e));
+                    // #977: apply the static tail to whatever branches
+                    // survived up to this escape, instead of dropping it —
+                    // mirroring the success path below via the shared
+                    // `apply_static_tail` helper. If tail application
+                    // itself also fails, that later failure takes priority
+                    // (the same "later step's own failure outranks an
+                    // earlier deferred one" rule `resolve_slice_expr`'s
+                    // `target_escape`/`path_result` pairing already uses);
+                    // otherwise the tail's fully-extended result carries
+                    // the original deferred escape `e`.
+                    let tail = &flat[last_dynamic + 1..];
+                    return match apply_static_tail::<S>(next, tail, trackable) {
+                        Ok(tailed) => Err((tailed, e)),
+                        tail_err => tail_err,
+                    };
                 }
             }
         }
@@ -12311,29 +12367,7 @@ fn resolve_seq<'a, S: EvalSemantics>(
     }
 
     let tail = &flat[last_dynamic + 1..];
-    let mut out = Vec::with_capacity(branches.len());
-    for (mut prefix, current) in branches {
-        // A dynamic element as the pipe's last component (e.g. `.a[.k]`) is
-        // the common, still-trackable shape here, and leaves `tail` empty —
-        // reuse `current` directly rather than paying `resolve_static_tail`/
-        // `value_after_components`'s own clone-then-return-unchanged for a
-        // no-op walk. Anything else — a non-empty `tail`, or an untracked
-        // `current` even with an empty one (#843: `current` may be
-        // `Builtin::GetPath`'s own resolved-but-still-untracked result, see
-        // `resolve_static_tail`'s doc comment) — goes through the shared,
-        // trackable-aware helper.
-        let end: Cow<'a, OwnedValue> = if tail.is_empty() && trackable {
-            current
-        } else {
-            match resolve_static_tail::<S>(tail, &current, trackable) {
-                Ok(end) => Cow::Owned(end),
-                Err((_, e)) => return Err((out, e)),
-            }
-        };
-        prefix.extend_from_slice(tail);
-        out.push((prefix, end));
-    }
-    Ok(out)
+    apply_static_tail::<S>(branches, tail, trackable)
 }
 
 /// Rewrite every computed key in a path expression into the static component it
