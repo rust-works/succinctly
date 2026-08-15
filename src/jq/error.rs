@@ -296,7 +296,7 @@ impl EvalError {
     /// The message renders `value` the way jq reports it: a string payload is
     /// used as-is (`error("boom")` reports `boom`, not `"boom"`), anything else
     /// is serialized via the jq-error-message convention (`stream_owned_value_json_jq`,
-    /// the same one [`describe`]/[`dump_truncated`] use — not [`OwnedValue::to_json`],
+    /// the same one `describe`/`dump_truncated` use — not [`OwnedValue::to_json`],
     /// whose RFC-8259-safe `null` for a non-finite float is wrong here: `error(infinite)`
     /// reports jq's real `DBL_MAX` text, not `null` (#930)). Unlike `dump_truncated`,
     /// this has no length budget — `error(v)`'s message is the whole value, verbatim,
