@@ -3384,7 +3384,11 @@ fn builtin_map_values<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             QueryResult::Owned(OwnedValue::Array(results))
         }
         _ if optional => QueryResult::None,
-        _ => QueryResult::Error(EvalError::type_error("object or array", type_name(&value))),
+        // #929: real jq defines map_values(f) via `.[] |= f`'s own `.[]`,
+        // so a non-object/array input fails the same way any other bare
+        // `.[]` does. Confirmed live: `5 | map_values(.)` raises "Cannot
+        // iterate over number (5)" in jq 1.7.1.
+        _ => QueryResult::Error(EvalError::cannot_iterate(&to_owned(&value))),
     }
 }
 
@@ -3677,7 +3681,12 @@ fn builtin_min_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             QueryResult::Owned(min)
         }
         _ if optional => QueryResult::None,
-        _ => QueryResult::Error(EvalError::type_error("array", type_name(&value))),
+        // #929: real jq defines min_by(f) via `.[0] as $x | reduce ...` --
+        // the eventual failure is the same "Cannot iterate over" a bare
+        // `.[]`/`length` on a non-array/object gets, not a bespoke
+        // "expected array" wording. Confirmed live: `5 | min_by(.)` raises
+        // "Cannot iterate over number (5)" in jq 1.7.1.
+        _ => QueryResult::Error(EvalError::cannot_iterate(&to_owned(&value))),
     }
 }
 
@@ -3718,7 +3727,9 @@ fn builtin_max_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             QueryResult::Owned(max)
         }
         _ if optional => QueryResult::None,
-        _ => QueryResult::Error(EvalError::type_error("array", type_name(&value))),
+        // #929: same wording as min_by's own arm above -- confirmed live:
+        // `5 | max_by(.)` raises "Cannot iterate over number (5)" in jq 1.7.1.
+        _ => QueryResult::Error(EvalError::cannot_iterate(&to_owned(&value))),
     }
 }
 
@@ -4117,7 +4128,12 @@ fn builtin_nth<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let n_result = eval_single::<W, S>(n_expr, value.clone(), optional);
     let n = match result_to_owned(n_result) {
         Ok(OwnedValue::Int(i) | OwnedValue::NumberLiteral(NumberRepr::Int(i), _)) => i,
-        Ok(_) => return QueryResult::Error(EvalError::type_error("number", "non-number")),
+        // #929: real jq defines nth(n) as `.[n]`, so a non-numeric n on an
+        // array input fails the same way any other computed-index does,
+        // naming the *value* jq embeds in the message. Confirmed live:
+        // `[1,2,3] | nth("x")` raises `Cannot index array with string "x"`
+        // in jq 1.7.1.
+        Ok(v) => return QueryResult::Error(EvalError::cannot_index(type_name(&value), &v)),
         Err(e) => return e.into(),
     };
 
@@ -4128,7 +4144,13 @@ fn builtin_nth<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             None => QueryResult::Owned(OwnedValue::Null),
         },
         _ if optional => QueryResult::None,
-        _ => QueryResult::Error(EvalError::type_error("array", type_name(&value))),
+        // #929: same `.[n]` definition, this time for a non-array input --
+        // confirmed live: `5 | nth(1)` raises `Cannot index number with
+        // number` in jq 1.7.1.
+        _ => QueryResult::Error(EvalError::cannot_index(
+            type_name(&value),
+            &OwnedValue::Int(n),
+        )),
     }
 }
 
@@ -4342,7 +4364,10 @@ fn builtin_unique_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             QueryResult::Owned(OwnedValue::Array(result))
         }
         _ if optional => QueryResult::None,
-        _ => QueryResult::Error(EvalError::type_error("array", type_name(&value))),
+        // #929: same "Cannot iterate over" wording min_by/max_by use --
+        // confirmed live: `5 | unique_by(.)` raises "Cannot iterate over
+        // number (5)" in jq 1.7.1.
+        _ => QueryResult::Error(EvalError::cannot_iterate(&to_owned(&value))),
     }
 }
 
@@ -4889,7 +4914,9 @@ fn format_csv(value: &OwnedValue, optional: bool) -> Result<String, EvalError> {
             Ok(parts.join(","))
         }
         _ if optional => Ok(String::new()),
-        _ => Err(EvalError::type_error("array", value.type_name())),
+        // #929: confirmed live: `5 | @csv` raises "number (5) cannot be
+        // csv-formatted, only array" in jq 1.7.1.
+        _ => Err(EvalError::cannot_be_dsv_formatted(value, "csv")),
     }
 }
 
@@ -4912,7 +4939,9 @@ fn format_tsv(value: &OwnedValue, optional: bool) -> Result<String, EvalError> {
             Ok(parts.join("\t"))
         }
         _ if optional => Ok(String::new()),
-        _ => Err(EvalError::type_error("array", value.type_name())),
+        // #929: confirmed live: `5 | @tsv` raises "number (5) cannot be
+        // tsv-formatted, only array" in jq 1.7.1.
+        _ => Err(EvalError::cannot_be_dsv_formatted(value, "tsv")),
     }
 }
 
@@ -5126,7 +5155,11 @@ fn format_sh(value: &OwnedValue, _optional: bool) -> Result<String, EvalError> {
             "false".to_string()
         }),
         OwnedValue::Null => Ok("null".to_string()),
-        _ => Err(EvalError::type_error("string", value.type_name())),
+        // #929: confirmed live: `{"a":1} | @sh` raises `object ({"a":1})
+        // can not be escaped for shell` in jq 1.7.1 -- the only remaining
+        // variant here is Object, since every other one already has its
+        // own arm above.
+        _ => Err(EvalError::cannot_be_shell_escaped(value)),
     }
 }
 
@@ -18409,7 +18442,11 @@ fn builtin_strptime<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let fmt = match result_to_owned(eval_single::<W, S>(fmt_expr, value.clone(), optional)) {
         Ok(OwnedValue::String(s)) => s,
         Ok(_) if optional => return QueryResult::None,
-        Ok(_) => return QueryResult::Error(EvalError::type_error("string", "strptime format")),
+        // #929: confirmed live: `"2020" | strptime(1)` raises "strptime/1
+        // requires string inputs and arguments" in jq 1.7.1 -- the same
+        // wording jq's combined input+format check uses regardless of
+        // which side is the offender (see the other arm below).
+        Ok(_) => return QueryResult::Error(EvalError::strptime_requires_string()),
         Err(e) => return e.into(),
     };
 
@@ -18421,7 +18458,9 @@ fn builtin_strptime<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             Err(_) => return QueryResult::Error(EvalError::new("invalid string")),
         },
         _ if optional => return QueryResult::None,
-        _ => return QueryResult::Error(EvalError::type_error("string", "strptime")),
+        // #929: confirmed live: `5 | strptime("%Y")` raises "strptime/1
+        // requires string inputs and arguments" in jq 1.7.1.
+        _ => return QueryResult::Error(EvalError::strptime_requires_string()),
     };
 
     match parse_strptime(&input, &fmt) {
@@ -18807,7 +18846,11 @@ fn builtin_fromdate<W: Clone + AsRef<[u64]>>(
             Err(_) => return QueryResult::Error(EvalError::new("invalid string")),
         },
         _ if optional => return QueryResult::None,
-        _ => return QueryResult::Error(EvalError::type_error("string", "fromdate")),
+        // #929: `fromdate` is defined in terms of `strptime` in real jq, so
+        // a non-string input hits the same combined check -- confirmed
+        // live: `5 | fromdate` raises "strptime/1 requires string inputs
+        // and arguments" in jq 1.7.1.
+        _ => return QueryResult::Error(EvalError::strptime_requires_string()),
     };
 
     // Parse ISO 8601 format: YYYY-MM-DDTHH:MM:SSZ or YYYY-MM-DDTHH:MM:SS+HH:MM
@@ -28038,6 +28081,86 @@ mod tests {
         query!(br#""abc""#, r#"test(["a", null])"#,
             QueryResult::Owned(OwnedValue::Bool(b)) => {
                 assert!(b);
+            }
+        );
+    }
+
+    /// #929: `EvalError::type_error` is documented as reserved for sites
+    /// with no jq counterpart, but several call sites had a real jq
+    /// wording they didn't match. Confirmed against jq 1.7.1 for every
+    /// case below.
+    #[test]
+    fn test_type_error_sites_match_real_jq_wording_929() {
+        // map_values/min_by/max_by/unique_by all fail like a bare `.[]`
+        // would on a non-object/array input.
+        query!(br"5", r"map_values(.)",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "Cannot iterate over number (5)");
+            }
+        );
+        query!(br"5", r"min_by(.)",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "Cannot iterate over number (5)");
+            }
+        );
+        query!(br"5", r"max_by(.)",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "Cannot iterate over number (5)");
+            }
+        );
+        query!(br"5", r"unique_by(.)",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "Cannot iterate over number (5)");
+            }
+        );
+        // nth(n) is `.[n]` in real jq: a non-numeric n names itself as the
+        // bad key, a non-array input names the successfully-parsed n.
+        query!(br"[1,2,3]", r#"nth("x")"#,
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "Cannot index array with string \"x\"");
+            }
+        );
+        query!(br"5", r"nth(1)",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "Cannot index number with number");
+            }
+        );
+        query!(br#""abc""#, r"nth(1)",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "Cannot index string with number");
+            }
+        );
+        // @csv/@tsv on a non-array, @sh on an object.
+        query!(br"5", r"@csv",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "number (5) cannot be csv-formatted, only array");
+            }
+        );
+        query!(br"5", r"@tsv",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "number (5) cannot be tsv-formatted, only array");
+            }
+        );
+        query!(br#"{"a":1}"#, r"@sh",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "object ({\"a\":1}) can not be escaped for shell");
+            }
+        );
+        // strptime/fromdate: real jq validates both the input and the
+        // format argument with one combined check, same message either way.
+        query!(br#""2020""#, r"strptime(1)",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "strptime/1 requires string inputs and arguments");
+            }
+        );
+        query!(br"5", r#"strptime("%Y")"#,
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "strptime/1 requires string inputs and arguments");
+            }
+        );
+        query!(br"5", r"fromdate",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "strptime/1 requires string inputs and arguments");
             }
         );
     }
