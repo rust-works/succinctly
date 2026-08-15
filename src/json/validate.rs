@@ -742,9 +742,109 @@ pub fn validate(input: &[u8]) -> Result<(), ValidationError> {
     Validator::new(input).validate()
 }
 
+/// True if `bytes` is *exactly* one RFC 8259 JSON number token, with
+/// nothing before or after it.
+///
+/// Grammar: optional `-`, `0`|`[1-9][0-9]*` integer part, optional
+/// `.`-fraction requiring ≥1 digit, optional exponent requiring ≥1 digit.
+/// This is the same grammar `Validator::validate_number` enforces as one
+/// step of a larger document walk (with position tracking and detailed
+/// error variants for diagnostics); this free function instead answers a
+/// narrower, allocation-free question for a caller that already has a
+/// candidate token isolated and just needs a yes/no on the whole slice —
+/// e.g. a semi-index number token whose byte span was scanned leniently and
+/// may not actually be valid JSON number syntax (see #966), or a YAML
+/// scalar already routed to numeric dispatch that needs to know whether
+/// it's safe to echo as a JSON number literal verbatim (see #957, #918).
+///
+/// # Example
+///
+/// ```
+/// use succinctly::json::validate::is_valid_number;
+///
+/// assert!(is_valid_number(b"-3.14e10"));
+/// assert!(!is_valid_number(b"007"));      // leading zero
+/// assert!(!is_valid_number(b"1.2.3"));    // two decimal points
+/// assert!(!is_valid_number(b"1."));       // no digit after '.'
+/// ```
+#[must_use]
+pub fn is_valid_number(bytes: &[u8]) -> bool {
+    let mut i = 0;
+    if bytes.first() == Some(&b'-') {
+        i += 1;
+    }
+    match bytes.get(i) {
+        Some(b'0') => i += 1,
+        Some(b'1'..=b'9') => {
+            i += 1;
+            while matches!(bytes.get(i), Some(b'0'..=b'9')) {
+                i += 1;
+            }
+        }
+        _ => return false,
+    }
+    if bytes.get(i) == Some(&b'.') {
+        i += 1;
+        let start = i;
+        while matches!(bytes.get(i), Some(b'0'..=b'9')) {
+            i += 1;
+        }
+        if i == start {
+            return false;
+        }
+    }
+    if matches!(bytes.get(i), Some(b'e' | b'E')) {
+        i += 1;
+        if matches!(bytes.get(i), Some(b'+' | b'-')) {
+            i += 1;
+        }
+        let start = i;
+        while matches!(bytes.get(i), Some(b'0'..=b'9')) {
+            i += 1;
+        }
+        if i == start {
+            return false;
+        }
+    }
+    i == bytes.len()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ========================================================================
+    // is_valid_number tests (#957/#966)
+    // ========================================================================
+
+    #[test]
+    fn is_valid_number_accepts_full_rfc_8259_grammar() {
+        for s in [
+            "0", "-0", "42", "-42", "0.0", "2.0", "-2.5", "0.50", "1e10", "1E10", "1e+10", "1e-10",
+            "-1.5e-3", "0e0",
+        ] {
+            assert!(is_valid_number(s.as_bytes()), "expected valid: {s:?}");
+        }
+    }
+
+    #[test]
+    fn is_valid_number_rejects_lenient_semi_index_spans() {
+        // These are exactly the spans #966 found the semi-index scanner
+        // over-accepting as a single number token.
+        for s in ["007", "1.2.3", "1-2", "1.", ".5", "1e", "-", "1e+", ""] {
+            assert!(!is_valid_number(s.as_bytes()), "expected invalid: {s:?}");
+        }
+    }
+
+    #[test]
+    fn is_valid_number_rejects_trailing_garbage() {
+        // The whole slice must be one number -- this differs from
+        // `Validator::validate_number`, which only needs a number to start
+        // at the current position (a sibling `,`/`}` may legitimately
+        // follow within a larger document).
+        assert!(!is_valid_number(b"42x"));
+        assert!(!is_valid_number(b"42 "));
+    }
 
     // ========================================================================
     // Valid JSON tests

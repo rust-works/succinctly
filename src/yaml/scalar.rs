@@ -261,51 +261,12 @@ fn parse_float(s: &str) -> ResolvedScalar {
 /// erroring loudly. This predicate is how [`super::light`]'s
 /// `number_literal()` override decides which literals are safe to echo.
 ///
-/// This grammar duplicates `crate::json::validate`'s `Validator::validate_number`
-/// (reachable via the public `crate::json::validate::validate`) — hand-rolled
-/// here rather than reused to avoid adding a `yaml`-to-`json` module
-/// dependency for this fix; tracked as a follow-up dedup opportunity (#957).
+/// This grammar is the same one `crate::json::validate::is_valid_number`
+/// implements (extracted from this exact function, #957/#966) — delegate
+/// rather than hand-roll a second copy.
 #[must_use]
 fn is_json_number_syntax(s: &str) -> bool {
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    if bytes.first() == Some(&b'-') {
-        i += 1;
-    }
-    match bytes.get(i) {
-        Some(b'0') => i += 1,
-        Some(b'1'..=b'9') => {
-            i += 1;
-            while matches!(bytes.get(i), Some(b'0'..=b'9')) {
-                i += 1;
-            }
-        }
-        _ => return false,
-    }
-    if bytes.get(i) == Some(&b'.') {
-        i += 1;
-        let start = i;
-        while matches!(bytes.get(i), Some(b'0'..=b'9')) {
-            i += 1;
-        }
-        if i == start {
-            return false;
-        }
-    }
-    if matches!(bytes.get(i), Some(b'e' | b'E')) {
-        i += 1;
-        if matches!(bytes.get(i), Some(b'+' | b'-')) {
-            i += 1;
-        }
-        let start = i;
-        while matches!(bytes.get(i), Some(b'0'..=b'9')) {
-            i += 1;
-        }
-        if i == start {
-            return false;
-        }
-    }
-    i == bytes.len()
+    crate::json::validate::is_valid_number(s.as_bytes())
 }
 
 /// The maximum count of ASCII digit characters (integer + fraction part

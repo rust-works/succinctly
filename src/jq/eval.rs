@@ -329,17 +329,7 @@ fn to_owned<W: Clone + AsRef<[u64]>>(value: &StandardJson<'_, W>) -> OwnedValue 
     match value {
         StandardJson::Null => OwnedValue::Null,
         StandardJson::Bool(b) => OwnedValue::Bool(*b),
-        StandardJson::Number(n) => {
-            if is_nan_sentinel(n.raw_bytes()) {
-                OwnedValue::Float(f64::NAN)
-            } else {
-                match core::str::from_utf8(n.raw_bytes()) {
-                    Ok(s) => OwnedValue::from_number_literal(s),
-                    // Fallback - shouldn't happen for valid JSON
-                    Err(_) => OwnedValue::Float(0.0),
-                }
-            }
-        }
+        StandardJson::Number(n) => OwnedValue::from_number_bytes(n.raw_bytes()),
         StandardJson::String(s) => {
             if let Ok(cow) = s.as_str() {
                 OwnedValue::String(cow.into_owned())
@@ -5378,15 +5368,9 @@ fn builtin_tonumber<W: Clone + AsRef<[u64]>>(
     match &value {
         StandardJson::Number(n) => {
             // Already a number, return as-is -- this is a passthrough, not a
-            // computation, so (like `.`) it keeps the source literal.
-            QueryResult::Owned(if is_nan_sentinel(n.raw_bytes()) {
-                OwnedValue::Float(f64::NAN)
-            } else {
-                match core::str::from_utf8(n.raw_bytes()) {
-                    Ok(s) => OwnedValue::from_number_literal(s),
-                    Err(_) => OwnedValue::Int(0),
-                }
-            })
+            // computation, so (like `.`) it keeps the source literal when
+            // that literal is valid RFC 8259 syntax (#966).
+            QueryResult::Owned(OwnedValue::from_number_bytes(n.raw_bytes()))
         }
         StandardJson::String(s) => {
             if let Ok(cow) = s.as_str() {

@@ -31,6 +31,20 @@ pub enum NumberRepr {
     Float(f64),
 }
 
+/// Try `i64` first, fall back to `f64` -- the one definition of "how does a
+/// number string decide between the two representations," shared by
+/// [`OwnedValue::from_number_literal_boxed`] and
+/// [`OwnedValue::from_number_bytes`] so they can't silently diverge.
+fn parse_i64_or_f64(s: &str) -> Option<NumberRepr> {
+    if let Ok(i) = s.parse::<i64>() {
+        Some(NumberRepr::Int(i))
+    } else if let Ok(f) = s.parse::<f64>() {
+        Some(NumberRepr::Float(f))
+    } else {
+        None
+    }
+}
+
 /// Format a raw JSON number string the way jq itself would print it.
 ///
 /// This is jq's number formatting, not a verbatim echo of `raw`: jq always
@@ -379,9 +393,10 @@ impl OwnedValue {
     ///
     /// Parses `literal` the same way every document-materializing conversion
     /// decides between the two representations: try `i64` first, fall back
-    /// to `f64`. Falls back to plain [`Float`](Self::Float) `0.0` if
-    /// `literal` parses as neither (should not happen for a valid document
-    /// number token).
+    /// to `f64`. Falls back to [`Null`](Self::Null) if `literal` parses as
+    /// neither (should not happen for a valid document number token, but
+    /// matches how every other decode-failure path in this codebase
+    /// represents "not actually a number" — #966).
     pub(crate) fn from_number_literal(literal: &str) -> Self {
         Self::from_number_literal_boxed(literal.into())
     }
@@ -390,14 +405,49 @@ impl OwnedValue {
     /// already-owned `Box<str>` (e.g. from `JqValue::NumberLiteral`) instead
     /// of allocating a fresh one.
     pub(crate) fn from_number_literal_boxed(literal: Box<str>) -> Self {
-        let repr = if let Ok(i) = literal.parse::<i64>() {
-            NumberRepr::Int(i)
-        } else if let Ok(f) = literal.parse::<f64>() {
-            NumberRepr::Float(f)
-        } else {
-            return Self::Float(0.0);
+        let Some(repr) = parse_i64_or_f64(&literal) else {
+            return Self::Null;
         };
         Self::NumberLiteral(repr, literal)
+    }
+
+    /// Materialize raw JSON number-token bytes into the correctly-gated
+    /// `OwnedValue` -- the single conversion every "raw bytes -> number"
+    /// call site in this crate (including the CLI binary, hence `pub` not
+    /// `pub(crate)`) should go through (#966 found at least 7 independent
+    /// hand-rolled copies of this decision).
+    ///
+    /// Checks `is_nan_sentinel` first, so every caller gets that
+    /// `to_json_for_reindex`-bridge convention for free instead of having
+    /// to remember its own copy of the check (an earlier draft of this
+    /// function required exactly that, and three of its call sites forgot
+    /// it -- caught by review).
+    ///
+    /// Otherwise preserves the source spelling via
+    /// [`NumberLiteral`](Self::NumberLiteral) only when `bytes` is valid
+    /// RFC 8259 number syntax
+    /// ([`is_valid_number`](crate::json::validate::is_valid_number));
+    /// otherwise degrades to a plain `Int`/`Float`, or [`Null`](Self::Null)
+    /// if neither parses. Skipping straight to `from_number_literal` for an
+    /// invalid span (`007`, `1.2.3`) would let
+    /// [`to_json`](Self::to_json)/[`number_str`](Self::number_str) echo it
+    /// back out verbatim, since both always reproduce a `NumberLiteral`'s
+    /// stored text unchanged.
+    pub fn from_number_bytes(bytes: &[u8]) -> Self {
+        if is_nan_sentinel(bytes) {
+            return Self::Float(f64::NAN);
+        }
+        if crate::json::validate::is_valid_number(bytes) {
+            return core::str::from_utf8(bytes).map_or(Self::Null, Self::from_number_literal);
+        }
+        let Ok(s) = core::str::from_utf8(bytes) else {
+            return Self::Null;
+        };
+        match parse_i64_or_f64(s) {
+            Some(NumberRepr::Int(i)) => Self::Int(i),
+            Some(NumberRepr::Float(f)) => Self::Float(f),
+            None => Self::Null,
+        }
     }
 
     /// Collapse a [`NumberLiteral`](Self::NumberLiteral) into a plain
@@ -1461,13 +1511,14 @@ mod tests {
     }
 
     #[test]
-    fn test_from_number_literal_boxed_falls_back_to_zero_for_unparseable_text() {
-        // `from_number_literal_boxed` only ever receives valid document number
-        // tokens in practice, but it's defensive: neither an i64 nor f64 parse
-        // succeeding falls back to a plain zero rather than panicking.
+    fn test_from_number_literal_boxed_falls_back_to_null_for_unparseable_text() {
+        // Callers gate on `is_valid_number` before reaching this (#966), but
+        // it's defensive: neither an i64 nor f64 parse succeeding falls back
+        // to `Null` (matching every other decode-failure path in this
+        // codebase) rather than panicking or silently producing `0`.
         assert_eq!(
             OwnedValue::from_number_literal("not-a-number"),
-            OwnedValue::Float(0.0)
+            OwnedValue::Null
         );
     }
 

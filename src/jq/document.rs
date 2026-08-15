@@ -283,14 +283,18 @@ pub trait DocumentValue: Sized + Clone {
     /// (`1e100`, `1.0`, `-0.0`) instead of re-rendering the parsed value —
     /// see issue #387.
     ///
-    /// Defaults to `None`. JSON overrides this unconditionally (every
-    /// `Number` token is JSON-legal number syntax by construction). YAML
-    /// overrides it too (#918), but only for a finite float whose source
-    /// text is independently confirmed safe and worthwhile to echo — see
-    /// `YamlValue::number_literal`'s doc comment (`src/yaml/light.rs`);
-    /// YAML's own plain-scalar grammar accepts spellings (hex/octal,
-    /// leading-dot) that aren't JSON-legal, and ints never lose information
-    /// through the bare-`Int` path, so both stay on this `None` default.
+    /// Defaults to `None`. JSON overrides this for a `Number` token whose
+    /// raw span is independently confirmed to be valid RFC 8259 number
+    /// syntax (`crate::json::validate::is_valid_number`) -- the semi-index
+    /// scanner accepts number *spans* more leniently than that grammar
+    /// (leading zeros, multiple decimal points), so not every `Number`
+    /// token qualifies (#966). YAML overrides it too (#918), but only for a
+    /// finite float whose source text is independently confirmed safe and
+    /// worthwhile to echo — see `YamlValue::number_literal`'s doc comment
+    /// (`src/yaml/light.rs`); YAML's own plain-scalar grammar accepts
+    /// spellings (hex/octal, leading-dot) that aren't JSON-legal, and ints
+    /// never lose information through the bare-`Int` path, so both stay on
+    /// this `None` default.
     fn number_literal(&self) -> Option<Cow<'_, str>> {
         None
     }
