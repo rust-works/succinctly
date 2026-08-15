@@ -8694,6 +8694,79 @@ fn test_strptime_propagates_halt_in_format_argument() -> Result<()> {
     Ok(())
 }
 
+/// #968: an out-of-range `%m` month (`00`, or `13`+) reached
+/// `month_days[(month - 1) as usize]`'s fixed 12-element array with no
+/// bounds check, panicking the process (month=0 wraps `(0 - 1) as usize`
+/// to `usize::MAX`; month=13+ is a plain out-of-bounds index) instead of
+/// reporting an ordinary parse error the way real jq does. Also covers an
+/// out-of-range `%d` day (`32`+), which can't panic (day is only used in
+/// arithmetic, never as an array index) but real jq rejects it too.
+/// Pinned against the pinned jq oracle for every case, including the
+/// (surprising, but confirmed live) fact that day `00` is accepted.
+#[test]
+fn test_strptime_out_of_range_month_or_day_errors_instead_of_panicking_968() -> Result<()> {
+    for input in ["\"2024-00-15\"", "\"2024-13-15\"", "\"2024-01-32\""] {
+        let (stdout, _, code) = run_jq_full(&["-c", r#"strptime("%Y-%m-%d")"#], Some(input))?;
+        assert_eq!(code, 5, "input: {input}, stdout: {stdout:?}");
+    }
+
+    let (stdout, _, code) =
+        run_jq_full(&["-c", r#"strptime("%Y-%m-%d")"#], Some("\"2024-01-00\""))?;
+    assert_eq!(code, 0, "stdout: {stdout:?}");
+    assert_eq!(stdout.trim(), "[2024,0,0,0,0,0,0,-1]");
+
+    let (stdout, _, code) =
+        run_jq_full(&["-c", r#"strptime("%Y-%m-%d")"#], Some("\"2024-06-15\""))?;
+    assert_eq!(code, 0, "stdout: {stdout:?}");
+    assert_eq!(stdout.trim(), "[2024,5,15,0,0,0,6,166]");
+
+    // %D (mm/dd/yy) is a separate parsing arm reaching the same panic site.
+    let (stdout, _, code) = run_jq_full(&["-c", r#"strptime("%D")"#], Some("\"13/15/24\""))?;
+    assert_eq!(code, 5, "stdout: {stdout:?}");
+    Ok(())
+}
+
+/// #968 follow-on: the first fix (validating `month`/`day` before
+/// `month_days[(month - 1) as usize]`'s array index) left a second,
+/// distinct panic reachable through the *weekday* computation two lines
+/// above that array index -- a separate Howard Hinnant `days_from_civil`
+/// formula, `u32`-typed, that assumes `day >= 1`. `day == 0` is real,
+/// jq-valid input the fix above deliberately keeps accepting (see that
+/// test), and for March specifically (the one month where the formula's
+/// leading term truncates to exactly `0`) `day == 0` made `0u32 - 1`
+/// underflow: confirmed live, `"2024-03-00"` panicked with "attempt to
+/// subtract with overflow" even after the array-index fix alone. Every
+/// other month's day-0 case was already safe (verified by sweeping all
+/// 12), which is exactly why a test that only covered January (like the
+/// one above) didn't catch it. Fixed by widening that computation's
+/// intermediate types from `u32` to `i64`, matching the pinned jq oracle
+/// for every month.
+#[test]
+fn test_strptime_day_zero_all_months_matches_march_underflow_fixed_968() -> Result<()> {
+    let expected = [
+        "[2024,0,0,0,0,0,0,-1]",
+        "[2024,1,0,0,0,0,3,30]",
+        "[2024,2,0,0,0,0,4,59]",
+        "[2024,3,0,0,0,0,0,90]",
+        "[2024,4,0,0,0,0,2,120]",
+        "[2024,5,0,0,0,0,5,151]",
+        "[2024,6,0,0,0,0,0,181]",
+        "[2024,7,0,0,0,0,3,212]",
+        "[2024,8,0,0,0,0,6,243]",
+        "[2024,9,0,0,0,0,1,273]",
+        "[2024,10,0,0,0,0,4,304]",
+        "[2024,11,0,0,0,0,6,334]",
+    ];
+    for (i, exp) in expected.iter().enumerate() {
+        let month = i + 1;
+        let input = format!("\"2024-{month:02}-00\"");
+        let (stdout, _, code) = run_jq_full(&["-c", r#"strptime("%Y-%m-%d")"#], Some(&input))?;
+        assert_eq!(code, 0, "month: {month}, stdout: {stdout:?}");
+        assert_eq!(stdout.trim(), *exp, "month: {month}");
+    }
+    Ok(())
+}
+
 /// `builtin_combinations_n`'s `n`-argument wildcard swallowed a halt the
 /// same way `nth`'s `n` argument used to. `combinations(n)` is a real jq
 /// builtin, but real jq's own `n` is bound via `as $n` and interacts with

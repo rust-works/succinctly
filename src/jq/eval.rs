@@ -18532,9 +18532,32 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<BrokenDownTime, String> {
         }
     }
 
+    // `%m`/`%d`/`%e`/`%D`/`%F` parse up to 2 digits with no range check of
+    // their own (`parse_digits` just accepts `00`-`99`), so an out-of-range
+    // month reaching `yearday_for_civil`'s `month_days[(month - 1) as
+    // usize]` below panics (month=0 wraps `(0 - 1) as usize` to
+    // `usize::MAX`; month=13+ is a plain out-of-bounds index) - matching
+    // real jq's own rejection of month 0 and 13+, and day > 31 (confirmed
+    // live against jq 1.7.1: `2024-01-32` errors). `checked_days_from_civil`
+    // (#912) doesn't validate this itself - it only guards against actual
+    // `i64` overflow, which an out-of-semantic-range month/day doesn't
+    // trigger - so this check is still required even after that refactor.
+    // `day`'s lower bound is never checked: it's only ever assigned from
+    // `parse_digits`, which builds its output from `is_ascii_digit()`
+    // characters alone, so it can never be negative (`day == 0` is real,
+    // jq-valid input - `2024-01-00` succeeds) (#968).
+    if !(1..=12).contains(&month) || day > 31 {
+        return Err(format!("month {month} or day {day} out of range"));
+    }
+
     // Calculate weekday from days-since-epoch, via the same checked
     // days-from-civil math `mktime`/`strftime`'s %s specifier use (#912)
     // instead of a hand-duplicated, unchecked copy of the same formula.
+    // Its `i64`, checked arithmetic throughout is also what fixes #968's
+    // second panic: `day == 0` needs this formula's `doy` term to go
+    // momentarily negative for March specifically, which the pre-#912
+    // hand-duplicated copy's `u32` type couldn't represent without its
+    // subtraction underflowing.
     let days = checked_days_from_civil(year, month, day).map_err(|e| e.to_string())?;
     weekday = (days % 7 + 4 + 7) % 7;
 
