@@ -27791,6 +27791,59 @@ mod tests {
 
     #[cfg(feature = "regex")]
     #[test]
+    fn test_regex_non_string_pattern_wording_matches_jq_per_family_926() {
+        // #926: jq itself uses two different sentences for a non-string
+        // *pattern* argument depending on which builtin family raises it.
+        // test/match/capture: "<type> not a string or array" (no value
+        // preview, allows arrays too). scan/gsub/sub/splits: "<v> is not a
+        // string" (with a value preview, arrays included). Every case here
+        // is verified live against jq 1.7.1.
+        for filter in ["test(1)", "match(1)", "capture(1)"] {
+            query!(br#""x""#, filter,
+                QueryResult::Error(e) => {
+                    assert_eq!(e.message, "number not a string or array", "filter: {filter}");
+                }
+            );
+        }
+
+        for filter in ["scan(1)", "gsub(1; \"y\")", "sub(1; \"y\")", "splits(1)"] {
+            query!(br#""x""#, filter,
+                QueryResult::Error(e) => {
+                    assert_eq!(e.message, "number (1) is not a string", "filter: {filter}");
+                }
+            );
+        }
+
+        // The flagged siblings share the same wording as their bare form.
+        query!(br#""x""#, r#"scan(1; "i")"#,
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "number (1) is not a string");
+            }
+        );
+
+        // Object/array previews render the same way `describe()` renders
+        // them elsewhere in this file (truncated JSON dump).
+        query!(br#""x""#, r#"scan({"a":1})"#,
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, r#"object ({"a":1}) is not a string"#);
+            }
+        );
+        query!(br#""x""#, r"scan([1,2])",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "array ([1,2]) is not a string");
+            }
+        );
+
+        // split(re) has its own distinct jq wording, untouched by this fix.
+        query!(br#""x""#, r"split(1)",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "split input and separator must be strings");
+            }
+        );
+    }
+
+    #[cfg(feature = "regex")]
+    #[test]
     fn test_regex_lookahead_unsupported() {
         // #703: jq's oniguruma backend supports lookahead (`(?=...)`), but
         // succinctly's `regex` crate does not implement lookaround at all —
