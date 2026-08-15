@@ -6778,6 +6778,10 @@ enum RegexArgFamily {
     /// (`flags_expr: None`) pattern error uses `not_string_or_array`,
     /// switching to `is_not_a_string` once a flags argument is present
     /// (#937), regardless of what the flags expression evaluates to.
+    /// Exception (#943): a bare-form call whose pattern is a non-empty
+    /// array unpacks it as `[pattern, flags, ...ignored]` instead, and
+    /// then *also* uses `is_not_a_string` for a bad unpacked element,
+    /// even though no flags argument was ever written at the call site.
     TestMatchCapture,
     /// `sub`: forces pattern before flags (the reverse — and unchanged
     /// from what this codebase already did before #942, since only the
@@ -28661,16 +28665,36 @@ mod tests {
         // unpack either -- the two ways of supplying flags don't combine.
         // Every case verified live against jq 1.7.1.
 
-        // Successful unpacking: 2-element [string, string].
-        for filter in [
-            r#"test(["a", "i"])"#,
-            r#"match(["a", "i"])"#,
-            r#"capture(["(?<x>a)", "i"])"#,
-        ] {
-            query!(br#""abc""#, filter,
-                QueryResult::Owned(_) | QueryResult::ManyOwned(_) => {}
-            );
-        }
+        // Successful unpacking: 2-element [string, string], content
+        // verified against the equivalent 2-arg form's own known output.
+        query!(br#""abc""#, r#"test(["a", "i"])"#,
+            QueryResult::Owned(OwnedValue::Bool(b)) => {
+                assert!(b);
+            }
+        );
+        query!(br#""abc""#, r#"match(["a", "i"])"#,
+            QueryResult::Owned(OwnedValue::Object(obj)) => {
+                assert_eq!(obj.get("string"), Some(&OwnedValue::String("a".to_string())));
+                assert_eq!(obj.get("offset"), Some(&OwnedValue::Int(0)));
+            }
+        );
+        query!(br#""abc""#, r#"capture(["(?<x>a)", "i"])"#,
+            QueryResult::Owned(OwnedValue::Object(obj)) => {
+                assert_eq!(obj.get("x"), Some(&OwnedValue::String("a".to_string())));
+            }
+        );
+
+        // The unpacked flags slot reaches the same "g" (global) handling a
+        // real flags argument would -- multiple matches, not just one.
+        query!(br#""aaa""#, r#"match(["a", "g"])"#,
+            QueryResult::ManyOwned(matches) => {
+                assert_eq!(matches.len(), 3);
+                for m in &matches {
+                    let OwnedValue::Object(obj) = m else { panic!("expected object, got {m:?}") };
+                    assert_eq!(obj.get("string"), Some(&OwnedValue::String("a".to_string())));
+                }
+            }
+        );
 
         // 1-element array: pattern only, missing flags slot behaves like
         // an explicit `null` flags (still succeeds).
