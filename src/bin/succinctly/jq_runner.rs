@@ -11,7 +11,9 @@ use std::path::{Path, PathBuf};
 
 use succinctly::dsv::{build_index as build_dsv_index, DsvConfig, DsvRows};
 use succinctly::jq::document::DocumentFields;
-use succinctly::jq::eval_generic::{eval_with_cursor, to_owned as generic_to_owned, GenericResult};
+use succinctly::jq::eval_generic::{
+    eval_with_cursor, to_owned as generic_to_owned, GenericResult, MAX_NESTING_DEPTH,
+};
 use succinctly::jq::{self, format_number_jq_compat, Expr, JqValue, OwnedValue, Program};
 use succinctly::json::light::{JsonCursor, StandardJson};
 use succinctly::json::validate::{self, ValidationError};
@@ -2031,6 +2033,23 @@ impl LiteralFormatter for PreserveFormatter {
 ///
 /// This is the unified printer that handles JSON structure (arrays, objects,
 /// indentation) while delegating literal formatting to the formatter.
+///
+/// Guarded against adversarially deep JSON input (thousands of nested
+/// arrays/objects, which would otherwise recurse this writer once per
+/// nesting level and overflow the stack) by the shared
+/// [`succinctly::jq::eval_generic::MAX_NESTING_DEPTH`] ceiling -- see that
+/// constant's own doc comment for how 256 was chosen, including this
+/// function's own measured debug-build crash boundary of depth 600-700.
+/// Unlike `eval_generic::to_owned`'s own guard (a panic, since that
+/// function sits too deep in the evaluator's hot path for a `Result`-based
+/// fix), this one is a clean, catchable `anyhow` error: a query like the
+/// bare identity `.` never materializes an `OwnedValue` tree at all (it
+/// stays lazy, streaming straight from the `JsonCursor`), so `to_owned`'s
+/// own guard never gets a chance to fire for it -- this is the one
+/// recursive step that shape always goes through, and it already returns
+/// `Result` and already threads a `level` parameter (previously used only
+/// for indentation, reused here as the depth counter), so there's no reason
+/// to give up the clean failure mode the way `to_owned` had to.
 fn print_json<F, Out, Wrd>(
     out: &mut Out,
     value: &JqValue<'_, Wrd>,
@@ -2043,6 +2062,10 @@ where
     Out: Write,
     Wrd: Clone + AsRef<[u64]>,
 {
+    anyhow::ensure!(
+        level < MAX_NESTING_DEPTH,
+        "nesting depth exceeds limit of {MAX_NESTING_DEPTH}"
+    );
     let compact = config.compact;
     let indent = &config.indent_string;
     let current_indent = if compact {

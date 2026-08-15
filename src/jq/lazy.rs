@@ -608,7 +608,26 @@ fn lazy_index_range_to_owned(len: usize) -> OwnedValue {
 }
 
 /// Convert a JsonCursor to an OwnedValue (full materialization).
+///
+/// Panics past [`super::eval_generic::MAX_NESTING_DEPTH`] levels of nesting
+/// (#998) rather than recursing unbounded and overflowing the call stack --
+/// a second, independent materializer with the identical unguarded shape
+/// `eval_generic::to_owned_cursor` had, missed by that fix's own review pass
+/// and only found once it: `--exit-status`/`-e` forces `JqValue::
+/// materialize()` (see `Materializable::materialize` below) on every result
+/// before `jq_runner.rs`'s own guarded `print_json` output path ever runs,
+/// reaching this function directly. Confirmed live: `succinctly jq -e
+/// '.[0]'` on a 200,000-level-deep document raw-stack-overflowed (SIGABRT)
+/// even after `to_owned_cursor`'s own guard existed.
 fn cursor_to_owned<W: Clone + AsRef<[u64]>>(cursor: &JsonCursor<'_, W>) -> OwnedValue {
+    cursor_to_owned_at_depth(cursor, 0)
+}
+
+fn cursor_to_owned_at_depth<W: Clone + AsRef<[u64]>>(
+    cursor: &JsonCursor<'_, W>,
+    depth: usize,
+) -> OwnedValue {
+    super::eval_generic::assert_nesting_depth(depth);
     match cursor.value() {
         StandardJson::Null => OwnedValue::Null,
         StandardJson::Bool(b) => OwnedValue::Bool(b),
@@ -624,7 +643,7 @@ fn cursor_to_owned<W: Clone + AsRef<[u64]>>(cursor: &JsonCursor<'_, W>) -> Owned
             // Use cursor navigation to iterate children
             let items: Vec<OwnedValue> = cursor
                 .children()
-                .map(|child| cursor_to_owned(&child))
+                .map(|child| cursor_to_owned_at_depth(&child, depth + 1))
                 .collect();
             OwnedValue::Array(items)
         }
@@ -634,7 +653,10 @@ fn cursor_to_owned<W: Clone + AsRef<[u64]>>(cursor: &JsonCursor<'_, W>) -> Owned
                 if let StandardJson::String(key_str) = field.key() {
                     if let Ok(cow) = key_str.as_str() {
                         let value_cursor = field.value_cursor();
-                        map.insert(cow.into_owned(), cursor_to_owned(&value_cursor));
+                        map.insert(
+                            cow.into_owned(),
+                            cursor_to_owned_at_depth(&value_cursor, depth + 1),
+                        );
                     }
                 }
             }

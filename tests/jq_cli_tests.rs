@@ -10429,3 +10429,68 @@ fn test_del_multi_output_error_survives_optional_891() -> Result<()> {
     assert!(stderr.contains("Invalid path expression with result 0"));
     Ok(())
 }
+
+/// `[[[...1...]]]`, `depth` levels of array nesting wrapping a single `1`.
+fn nested_arrays(depth: usize) -> String {
+    format!("{}1{}", "[".repeat(depth), "]".repeat(depth))
+}
+
+/// #998: the bare identity `.` never materializes an `OwnedValue` tree (it
+/// stays lazy, streaming straight from the cursor via `print_json`), so
+/// `eval_generic::to_owned`'s own depth guard never gets a chance to fire
+/// for it -- confirmed live before this fix, `succinctly jq '.'` on a
+/// 200,000-level-deep document aborted with a raw stack overflow (SIGABRT,
+/// exit 134), not a clean error. `print_json` needs its own guard.
+#[test]
+fn test_identity_query_rejects_adversarial_nesting_998() -> Result<()> {
+    let input = nested_arrays(500);
+    let (_stdout, stderr, code) = run_jq_full(&["-c", "."], Some(&input))?;
+    assert_eq!(code, 1, "stderr: {stderr:?}");
+    assert!(
+        stderr.contains("nesting depth exceeds limit of 256"),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
+/// Companion to the above: legitimately-nested input well under the limit
+/// must still round-trip exactly, unaffected by the new guard.
+#[test]
+fn test_identity_query_accepts_nesting_under_limit_998() -> Result<()> {
+    let input = nested_arrays(100);
+    let (stdout, stderr, code) = run_jq_full(&["-c", "."], Some(&input))?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), input);
+    Ok(())
+}
+
+/// #998 review: `--exit-status`/`-e` forces `JqValue::materialize()` on
+/// every result before `print_json`'s own guarded output path ever runs,
+/// reaching `lazy.rs`'s independent `cursor_to_owned` materializer
+/// directly -- a second, unguarded recursive tree-walker with the exact
+/// same shape as `eval_generic::to_owned_cursor`, missed by this PR's own
+/// first pass. Confirmed live before this follow-up fix: `succinctly jq -e
+/// '.[0]'` on a 200,000-level-deep document raw-stack-overflowed (SIGABRT,
+/// exit 134) even with `print_json`'s guard already in place.
+#[test]
+fn test_exit_status_query_rejects_adversarial_nesting_998() -> Result<()> {
+    let input = nested_arrays(500);
+    let (_stdout, stderr, code) = run_jq_full(&["-e", "-c", ".[0]"], Some(&input))?;
+    assert_eq!(code, 101, "stderr: {stderr:?}");
+    assert!(
+        stderr.contains("nesting depth exceeds limit of 256"),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
+/// Companion to the above: `-e` on ordinary (non-adversarial) object input
+/// still round-trips correctly through `cursor_to_owned`'s `Object` arm,
+/// not just its `Array` arm.
+#[test]
+fn test_exit_status_query_materializes_object_998() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-e", "-c", "."], Some(r#"{"a":{"b":1}}"#))?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), r#"{"a":{"b":1}}"#);
+    Ok(())
+}
