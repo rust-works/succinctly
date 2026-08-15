@@ -3645,6 +3645,35 @@ fn builtin_max<W: Clone + AsRef<[u64]>>(
 }
 
 /// Builtin: min_by(f)
+/// jq's `map([f])`, applied to an object's values in field order.
+///
+/// `min_by`/`max_by`/`unique_by` all compute this array unconditionally
+/// before checking whether the *input* is itself an array -- `.[]` (bare
+/// iterate) accepts an object just as readily as an array, so on an object
+/// input the computation below succeeds, and the resulting array becomes
+/// the *named operand* of the eventual two-value type error rather than a
+/// fixed placeholder. Confirmed live against jq 1.7.1:
+/// `{"a":3,"b":1} | min_by(. + 100)` raises `object ({"a":3,"b":1}) and
+/// array ([[103],[101]]) cannot be iterated over` -- the `[[103],[101]]` is
+/// exactly this function's output for that input and filter.
+fn map_bracketed_over_object_fields<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    f: &Expr,
+    fields: JsonFields<'a, W>,
+    optional: bool,
+) -> Result<Vec<OwnedValue>, QueryResult<'a, W>> {
+    let mut computed = Vec::new();
+    for field in fields {
+        match eval_array_construction::<W, S>(f, field.value(), optional) {
+            QueryResult::Owned(v) => computed.push(v),
+            QueryResult::Error(e) => return Err(QueryResult::Error(e)),
+            QueryResult::Break(label) => return Err(QueryResult::Break(label)),
+            QueryResult::Halt(code) => return Err(QueryResult::Halt(code)),
+            _ => unreachable!("eval_array_construction only returns Owned/Error/Break/Halt"),
+        }
+    }
+    Ok(computed)
+}
+
 fn builtin_min_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     f: &Expr,
     value: StandardJson<'a, W>,
@@ -3680,10 +3709,28 @@ fn builtin_min_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 .unwrap();
             QueryResult::Owned(min)
         }
+        // #929: see `map_bracketed_over_object_fields` -- confirmed live:
+        // `{"a":3,"b":1} | min_by(.)` raises `object ({"a":3,"b":1}) and
+        // array ([[3],[1]]) cannot be iterated over` in jq 1.7.1.
+        StandardJson::Object(fields) => {
+            let original = to_owned(&StandardJson::Object(fields));
+            let computed = match map_bracketed_over_object_fields::<W, S>(f, fields, optional) {
+                Ok(v) => v,
+                Err(result) => return result,
+            };
+            if optional {
+                QueryResult::None
+            } else {
+                QueryResult::Error(EvalError::pair_cannot_be_iterated(
+                    &original,
+                    &OwnedValue::Array(computed),
+                ))
+            }
+        }
         _ if optional => QueryResult::None,
         // #929: real jq defines min_by(f) via `.[0] as $x | reduce ...` --
         // the eventual failure is the same "Cannot iterate over" a bare
-        // `.[]`/`length` on a non-array/object gets, not a bespoke
+        // `.[]`/`length` on a non-array/non-object gets, not a bespoke
         // "expected array" wording. Confirmed live: `5 | min_by(.)` raises
         // "Cannot iterate over number (5)" in jq 1.7.1.
         _ => QueryResult::Error(EvalError::cannot_iterate(&to_owned(&value))),
@@ -3726,9 +3773,29 @@ fn builtin_max_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 .unwrap();
             QueryResult::Owned(max)
         }
+        // #929: same operand-pairing as min_by's own Object arm above --
+        // confirmed live: `{"a":3,"b":1} | max_by(.)` raises `object
+        // ({"a":3,"b":1}) and array ([[3],[1]]) cannot be iterated over` in
+        // jq 1.7.1.
+        StandardJson::Object(fields) => {
+            let original = to_owned(&StandardJson::Object(fields));
+            let computed = match map_bracketed_over_object_fields::<W, S>(f, fields, optional) {
+                Ok(v) => v,
+                Err(result) => return result,
+            };
+            if optional {
+                QueryResult::None
+            } else {
+                QueryResult::Error(EvalError::pair_cannot_be_iterated(
+                    &original,
+                    &OwnedValue::Array(computed),
+                ))
+            }
+        }
         _ if optional => QueryResult::None,
-        // #929: same wording as min_by's own arm above -- confirmed live:
-        // `5 | max_by(.)` raises "Cannot iterate over number (5)" in jq 1.7.1.
+        // #929: same wording as min_by's own scalar arm above -- confirmed
+        // live: `5 | max_by(.)` raises "Cannot iterate over number (5)" in
+        // jq 1.7.1.
         _ => QueryResult::Error(EvalError::cannot_iterate(&to_owned(&value))),
     }
 }
@@ -4119,39 +4186,22 @@ fn builtin_nth<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    // jq: null | nth(0) => null
-    if matches!(value, StandardJson::Null) {
-        return QueryResult::Owned(OwnedValue::Null);
-    }
-
-    // Get the index
+    // #929: real jq defines `nth(n)` as `n as $n | .[$n]` -- `n` is
+    // evaluated against the *original* input before indexing, so it runs
+    // even when `.` is null (confirmed live: `null | nth(error("boom"))`
+    // raises "boom" in jq 1.7.1, it does not short-circuit to null), and
+    // the indexing step needs every `.[$n]` target/key combination: an
+    // object with a string key (missing key => null, not an error), a
+    // float key truncated toward zero, and null passed through for any
+    // key type valid on null. `index_one` is the generic `.[$k]` operator
+    // itself, so delegating to it gets all of this -- including its own
+    // lazy array fast path -- for free instead of re-deriving it here.
     let n_result = eval_single::<W, S>(n_expr, value.clone(), optional);
     let n = match result_to_owned(n_result) {
-        Ok(OwnedValue::Int(i) | OwnedValue::NumberLiteral(NumberRepr::Int(i), _)) => i,
-        // #929: real jq defines nth(n) as `.[n]`, so a non-numeric n on an
-        // array input fails the same way any other computed-index does,
-        // naming the *value* jq embeds in the message. Confirmed live:
-        // `[1,2,3] | nth("x")` raises `Cannot index array with string "x"`
-        // in jq 1.7.1.
-        Ok(v) => return QueryResult::Error(EvalError::cannot_index(type_name(&value), &v)),
+        Ok(v) => v,
         Err(e) => return e.into(),
     };
-
-    match value {
-        StandardJson::Array(elements) => match get_element_at_index::<W>(elements, n) {
-            Some(v) => QueryResult::One(v),
-            // jq: [1,2] | nth(10) => null
-            None => QueryResult::Owned(OwnedValue::Null),
-        },
-        _ if optional => QueryResult::None,
-        // #929: same `.[n]` definition, this time for a non-array input --
-        // confirmed live: `5 | nth(1)` raises `Cannot index number with
-        // number` in jq 1.7.1.
-        _ => QueryResult::Error(EvalError::cannot_index(
-            type_name(&value),
-            &OwnedValue::Int(n),
-        )),
-    }
+    index_one::<W>(value, &n, optional)
 }
 
 /// Builtin: reverse - reverse array
@@ -4363,10 +4413,30 @@ fn builtin_unique_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             let result: Vec<OwnedValue> = keyed.into_iter().map(|(_, v)| v).collect();
             QueryResult::Owned(OwnedValue::Array(result))
         }
+        // #929: unique_by shares min_by/max_by's `map([f])`-pairing
+        // computation (see `map_bracketed_over_object_fields`) but a third,
+        // distinct suffix -- confirmed live: `{"a":3,"b":1} | unique_by(.)`
+        // raises `object ({"a":3,"b":1}) and array ([[3],[1]]) cannot be
+        // sorted, as they are not both arrays` in jq 1.7.1.
+        StandardJson::Object(fields) => {
+            let original = to_owned(&StandardJson::Object(fields));
+            let computed = match map_bracketed_over_object_fields::<W, S>(f, fields, optional) {
+                Ok(v) => v,
+                Err(result) => return result,
+            };
+            if optional {
+                QueryResult::None
+            } else {
+                QueryResult::Error(EvalError::pair_cannot_be_sorted(
+                    &original,
+                    &OwnedValue::Array(computed),
+                ))
+            }
+        }
         _ if optional => QueryResult::None,
-        // #929: same "Cannot iterate over" wording min_by/max_by use --
-        // confirmed live: `5 | unique_by(.)` raises "Cannot iterate over
-        // number (5)" in jq 1.7.1.
+        // #929: same "Cannot iterate over" wording min_by/max_by's own
+        // scalar arm uses -- confirmed live: `5 | unique_by(.)` raises
+        // "Cannot iterate over number (5)" in jq 1.7.1.
         _ => QueryResult::Error(EvalError::cannot_iterate(&to_owned(&value))),
     }
 }
@@ -5101,30 +5171,31 @@ fn format_html(value: &OwnedValue, _optional: bool) -> Result<String, EvalError>
 }
 
 /// Shell-quote a single value for @sh
-fn shell_quote_value(value: &OwnedValue) -> String {
+fn shell_quote_value(value: &OwnedValue) -> Result<String, EvalError> {
     match value {
         // jq always quotes strings in @sh array output
-        OwnedValue::String(s) => {
-            if s.contains('\'') {
-                let escaped = s.replace('\'', "'\\''");
-                format!("'{escaped}'")
-            } else {
-                format!("'{s}'")
-            }
-        }
+        OwnedValue::String(s) => Ok(if s.contains('\'') {
+            let escaped = s.replace('\'', "'\\''");
+            format!("'{escaped}'")
+        } else {
+            format!("'{s}'")
+        }),
         // Numbers, bools, null are NOT quoted in jq
         OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..) => {
-            numeric_display_string(value)
+            Ok(numeric_display_string(value))
         }
-        OwnedValue::Bool(b) => {
-            if *b {
-                "true".to_string()
-            } else {
-                "false".to_string()
-            }
-        }
-        OwnedValue::Null => "null".to_string(),
-        _ => String::new(),
+        OwnedValue::Bool(b) => Ok(if *b {
+            "true".to_string()
+        } else {
+            "false".to_string()
+        }),
+        OwnedValue::Null => Ok("null".to_string()),
+        // #929: a nested array/object *element* of the top-level @sh array
+        // is just as invalid as one at the top level -- confirmed live:
+        // `[{"a":1}] | @sh` raises `object ({"a":1}) can not be escaped for
+        // shell` in jq 1.7.1, `[[1,2]] | @sh` the array variant the same
+        // way.
+        _ => Err(EvalError::cannot_be_shell_escaped(value)),
     }
 }
 
@@ -5142,7 +5213,10 @@ fn format_sh(value: &OwnedValue, _optional: bool) -> Result<String, EvalError> {
         }
         // jq: [1, 2, 3] | @sh => "1 2 3"
         OwnedValue::Array(arr) => {
-            let parts: Vec<String> = arr.iter().map(shell_quote_value).collect();
+            let parts: Vec<String> = arr
+                .iter()
+                .map(shell_quote_value)
+                .collect::<Result<_, _>>()?;
             Ok(parts.join(" "))
         }
         // Numbers, bools, null are converted to strings
@@ -28163,6 +28237,98 @@ mod tests {
                 assert_eq!(e.message, "strptime/1 requires string inputs and arguments");
             }
         );
+    }
+
+    /// #929's mandatory code review found six further gaps beyond the
+    /// initial wording audit above -- two pre-existing `nth` bugs the new
+    /// wording made "more confidently wrong", a missing object-input
+    /// variant for `min_by`/`max_by`/`unique_by`, and a second `@sh` site.
+    /// Confirmed against jq 1.7.1 for every case below.
+    #[test]
+    fn test_review_response_929() {
+        // nth(n) is really `.[n]`: a string key on an object behaves like
+        // any other object field access (missing key => null, not an
+        // error), and a float key truncates toward zero instead of being
+        // rejected outright.
+        assert_eq!(outputs(br#"{"a":1}"#, r#"nth("x")"#), ["null"]);
+        assert_eq!(outputs(br#"{"a":1}"#, r#"nth("a")"#), ["1"]);
+        assert_eq!(outputs(br"[1,2,3]", r"nth(1.5)"), ["2"]);
+        assert_eq!(outputs(br"[1,2,3]", r"nth(-1.5)"), ["3"]);
+        // `n` is evaluated against the original input before indexing, so
+        // it runs even when `.` is null instead of short-circuiting to
+        // null first.
+        query!(br"null", r#"nth(error("boom"))"#,
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "boom");
+            }
+        );
+        assert_eq!(outputs(br"null", r"nth(0)"), ["null"]);
+
+        // min_by/max_by/unique_by on an object input pair the object with
+        // the array `map([f])` computes on it -- not the generic
+        // single-value "Cannot iterate over" a bare scalar gets.
+        query!(br#"{"a":3,"b":1}"#, r"min_by(.)",
+            QueryResult::Error(e) => {
+                assert_eq!(
+                    e.message,
+                    "object ({\"a\":3,\"b\":1}) and array ([[3],[1]]) cannot be iterated over"
+                );
+            }
+        );
+        query!(br#"{"a":3,"b":1}"#, r"max_by(.)",
+            QueryResult::Error(e) => {
+                assert_eq!(
+                    e.message,
+                    "object ({\"a\":3,\"b\":1}) and array ([[3],[1]]) cannot be iterated over"
+                );
+            }
+        );
+        query!(br#"{"a":3,"b":1}"#, r"unique_by(.)",
+            QueryResult::Error(e) => {
+                assert_eq!(
+                    e.message,
+                    "object ({\"a\":3,\"b\":1}) and array ([[3],[1]]) cannot be sorted, as they are not both arrays"
+                );
+            }
+        );
+
+        // A `?`-suffixed min_by/max_by/unique_by on an object input
+        // suppresses the pairing error the same way it already did for a
+        // bare scalar, and an error `f` raises on the object's own values
+        // still propagates instead of being swallowed by that suppression.
+        assert_eq!(outputs(br#"{"a":1}"#, r"min_by(.)?"), Vec::<String>::new());
+        assert_eq!(outputs(br#"{"a":1}"#, r"max_by(.)?"), Vec::<String>::new());
+        assert_eq!(
+            outputs(br#"{"a":1}"#, r"unique_by(.)?"),
+            Vec::<String>::new()
+        );
+        query!(br#"{"a":1}"#, r#"min_by(error("boom"))"#,
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "boom");
+            }
+        );
+        query!(br#"{"a":1}"#, r#"max_by(error("boom"))"#,
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "boom");
+            }
+        );
+        query!(br#"{"a":1}"#, r#"unique_by(error("boom"))"#,
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "boom");
+            }
+        );
+
+        // @sh's array arm validates each *element* the same way the
+        // top-level value is validated, not just the top level itself --
+        // including the non-string scalar arms of `shell_quote_value`
+        // itself (a bool element takes a different branch than a string
+        // or number one).
+        query!(br#"[{"a":1}]"#, r"@sh",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "object ({\"a\":1}) can not be escaped for shell");
+            }
+        );
+        assert_eq!(outputs(br"[false]", r"@sh"), ["\"false\""]);
     }
 
     #[test]

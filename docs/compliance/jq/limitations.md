@@ -299,13 +299,13 @@ A probe is only admitted to the corpus if jq errors on it, so the corpus is blin
 opposite divergence: a filter that jq answers with a value and succinctly refuses. Those
 have to be recorded here.
 
-| Filter            | Input         | jq                          | succinctly                            |
-|-------------------|---------------|-----------------------------|---------------------------------------|
-| `.[1:2] = ["x"]`  | `null`        | `["x"]`                     | `Cannot index null with object`       |
-| `.[1:2] \|= ["x"]`| `null`        | `["x"]`                     | `Cannot index null with object`       |
-| `@uri`            | `[1,2]`       | `"%5B1%2C2%5D"`             | `expected string, got array`          |
-| `@base64`         | `5`           | `"NQ=="`                    | `expected string, got number`         |
-| `flatten("x")`    | `[1,2]`       | `[1,2]` (ignores non-integer depth) | `expected number, got non-number` |
+| Filter             | Input   | jq                                  | succinctly                        |
+|--------------------|---------|-------------------------------------|-----------------------------------|
+| `.[1:2] = ["x"]`   | `null`  | `["x"]`                             | `Cannot index null with object`   |
+| `.[1:2] \|= ["x"]` | `null`  | `["x"]`                             | `Cannot index null with object`   |
+| `@uri`             | `[1,2]` | `"%5B1%2C2%5D"`                     | `expected string, got array`      |
+| `@base64`          | `5`     | `"NQ=="`                            | `expected string, got number`     |
+| `flatten("x")`     | `[1,2]` | `[1,2]` (ignores non-integer depth) | `expected number, got non-number` |
 
 [#929](https://github.com/rust-works/succinctly/issues/929) found these while auditing
 `EvalError::type_error` wording: real jq's `@uri`/`@base64` (and every other format string

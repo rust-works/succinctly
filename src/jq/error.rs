@@ -694,6 +694,12 @@ impl EvalError {
         Self::pair(left, right, "cannot be iterated over")
     }
 
+    /// `<a> and <b> cannot be sorted, as they are not both arrays` — jq's
+    /// wording for `unique_by`/`sort_by`/`group_by` on a non-array (#929).
+    pub fn pair_cannot_be_sorted(left: &OwnedValue, right: &OwnedValue) -> Self {
+        Self::pair(left, right, "cannot be sorted, as they are not both arrays")
+    }
+
     /// `<v> has no keys`.
     pub fn has_no_keys(value: &OwnedValue) -> Self {
         Self::subject(value, "has no keys")

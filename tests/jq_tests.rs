@@ -921,8 +921,13 @@ fn test_last_on_empty_returns_null() {
 #[test]
 fn test_nth_on_null_returns_null() {
     // jq: null | nth(0) => null
+    //
+    // #929: `nth` now delegates to the generic `index_one` operator (the
+    // same one `.[0]` itself uses), so this is the lazy `One(Null)` shape
+    // rather than an eagerly-materialized `Owned(Null)` -- same value,
+    // different QueryResult variant.
     query!(b"null", "nth(0)",
-        QueryResult::Owned(OwnedValue::Null) => {}
+        QueryResult::One(StandardJson::Null) => {}
     );
 }
 
