@@ -6769,10 +6769,13 @@ fn builtin_test_regex<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 }
 
 /// Builtin: match(re) or match(re; flags) - return match object
+///
+/// Evaluates `re_expr` before `flags_expr` — see `builtin_test_with_flags`'s
+/// doc comment for why this order matters (#928).
 #[cfg(feature = "regex")]
 fn builtin_match<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     re_expr: &Expr,
-    flags: Option<&str>,
+    flags_expr: Option<&Expr>,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
@@ -6783,6 +6786,19 @@ fn builtin_match<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Ok(v) => return QueryResult::Error(EvalError::not_string_or_array(v.type_name())),
         Err(e) => return e.into(),
     };
+
+    // Get the flags, now that the pattern is known valid
+    let flags = match flags_expr {
+        None => None,
+        Some(fe) => match result_to_owned(eval_single::<W, S>(fe, value.clone(), optional)) {
+            Ok(OwnedValue::String(s)) => Some(s),
+            Ok(OwnedValue::Null) => Some(String::new()),
+            Ok(_) if optional => return QueryResult::None,
+            Ok(v) => return QueryResult::Error(EvalError::is_not_a_string(&v)),
+            Err(e) => return e.into(),
+        },
+    };
+    let flags = flags.as_deref();
 
     // Get the input string
     let input = match &value {
@@ -7304,23 +7320,23 @@ fn builtin_test_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    // Evaluate the flags expression
-    let flags = match result_to_owned(eval_single::<W, S>(flags_expr, value.clone(), optional)) {
-        Ok(OwnedValue::String(s)) => s,
-        Ok(OwnedValue::Null) => String::new(),
-        Ok(_) if optional => return QueryResult::None,
-        Ok(v) => return QueryResult::Error(EvalError::is_not_a_string(&v)),
-        Err(e) => return e.into(),
-    };
-
-    builtin_test_with_flags::<W, S>(re_expr, Some(&flags), value, optional)
+    builtin_test_with_flags::<W, S>(re_expr, Some(flags_expr), value, optional)
 }
 
 /// Builtin: test(re) or test(re; flags) - test if string matches the regex
+///
+/// Evaluates `re_expr` before `flags_expr` — jq validates the pattern
+/// argument first, so when both are invalid it's the pattern's error that
+/// surfaces (confirmed live: `test(1;2)` -> `"number (1) is not a string"`,
+/// naming the pattern, not the flags). A pre-#928 version of this evaluated
+/// flags first, which — now that the flags-argument error uses real jq
+/// wording instead of a placeholder — would have silently blamed the wrong
+/// operand, or skipped a side-effecting pattern expression's `error()`
+/// entirely (`sub(error("P");"b";2)` must raise `"P"`, not the flags error).
 #[cfg(feature = "regex")]
 fn builtin_test_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     re_expr: &Expr,
-    flags: Option<&str>,
+    flags_expr: Option<&Expr>,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
@@ -7331,6 +7347,19 @@ fn builtin_test_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Ok(v) => return QueryResult::Error(EvalError::not_string_or_array(v.type_name())),
         Err(e) => return e.into(),
     };
+
+    // Get the flags, now that the pattern is known valid
+    let flags = match flags_expr {
+        None => None,
+        Some(fe) => match result_to_owned(eval_single::<W, S>(fe, value.clone(), optional)) {
+            Ok(OwnedValue::String(s)) => Some(s),
+            Ok(OwnedValue::Null) => Some(String::new()),
+            Ok(_) if optional => return QueryResult::None,
+            Ok(v) => return QueryResult::Error(EvalError::is_not_a_string(&v)),
+            Err(e) => return e.into(),
+        },
+    };
+    let flags = flags.as_deref();
 
     // Get the input string
     let input = match &value {
@@ -7362,16 +7391,7 @@ fn builtin_match_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    // Evaluate the flags expression
-    let flags = match result_to_owned(eval_single::<W, S>(flags_expr, value.clone(), optional)) {
-        Ok(OwnedValue::String(s)) => s,
-        Ok(OwnedValue::Null) => String::new(),
-        Ok(_) if optional => return QueryResult::None,
-        Ok(v) => return QueryResult::Error(EvalError::is_not_a_string(&v)),
-        Err(e) => return e.into(),
-    };
-
-    builtin_match::<W, S>(re_expr, Some(&flags), value, optional)
+    builtin_match::<W, S>(re_expr, Some(flags_expr), value, optional)
 }
 
 /// Builtin: capture(re; flags) - capture with flags expression
@@ -7382,23 +7402,17 @@ fn builtin_capture_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    // Evaluate the flags expression
-    let flags = match result_to_owned(eval_single::<W, S>(flags_expr, value.clone(), optional)) {
-        Ok(OwnedValue::String(s)) => s,
-        Ok(OwnedValue::Null) => String::new(),
-        Ok(_) if optional => return QueryResult::None,
-        Ok(v) => return QueryResult::Error(EvalError::is_not_a_string(&v)),
-        Err(e) => return e.into(),
-    };
-
-    builtin_capture_with_flags::<W, S>(re_expr, Some(&flags), value, optional)
+    builtin_capture_with_flags::<W, S>(re_expr, Some(flags_expr), value, optional)
 }
 
 /// Builtin: capture(re) or capture(re; flags) - capture named groups
+///
+/// Evaluates `re_expr` before `flags_expr` — see `builtin_test_with_flags`'s
+/// doc comment for why this order matters (#928).
 #[cfg(feature = "regex")]
 fn builtin_capture_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     re_expr: &Expr,
-    flags: Option<&str>,
+    flags_expr: Option<&Expr>,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
@@ -7409,6 +7423,19 @@ fn builtin_capture_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Ok(v) => return QueryResult::Error(EvalError::not_string_or_array(v.type_name())),
         Err(e) => return e.into(),
     };
+
+    // Get the flags, now that the pattern is known valid
+    let flags = match flags_expr {
+        None => None,
+        Some(fe) => match result_to_owned(eval_single::<W, S>(fe, value.clone(), optional)) {
+            Ok(OwnedValue::String(s)) => Some(s),
+            Ok(OwnedValue::Null) => Some(String::new()),
+            Ok(_) if optional => return QueryResult::None,
+            Ok(v) => return QueryResult::Error(EvalError::is_not_a_string(&v)),
+            Err(e) => return e.into(),
+        },
+    };
+    let flags = flags.as_deref();
 
     // Get the input string
     let input = match &value {
@@ -7472,24 +7499,18 @@ fn builtin_sub_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    // Evaluate the flags expression
-    let flags = match result_to_owned(eval_single::<W, S>(flags_expr, value.clone(), optional)) {
-        Ok(OwnedValue::String(s)) => s,
-        Ok(OwnedValue::Null) => String::new(),
-        Ok(_) if optional => return QueryResult::None,
-        Ok(v) => return QueryResult::Error(EvalError::is_not_a_string(&v)),
-        Err(e) => return e.into(),
-    };
-
-    builtin_sub_with_flags::<W, S>(re_expr, replacement_expr, Some(&flags), value, optional)
+    builtin_sub_with_flags::<W, S>(re_expr, replacement_expr, Some(flags_expr), value, optional)
 }
 
 /// Builtin: sub(re; replacement) or sub(re; replacement; flags) - replace first match
+///
+/// Evaluates `re_expr` before `flags_expr` — see `builtin_test_with_flags`'s
+/// doc comment for why this order matters (#928).
 #[cfg(feature = "regex")]
 fn builtin_sub_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     re_expr: &Expr,
     replacement_expr: &Expr,
-    flags: Option<&str>,
+    flags_expr: Option<&Expr>,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
@@ -7501,6 +7522,43 @@ fn builtin_sub_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Err(e) => return e.into(),
     };
 
+    // Get the flags, now that the pattern is known valid
+    let flags = match flags_expr {
+        None => None,
+        Some(fe) => match result_to_owned(eval_single::<W, S>(fe, value.clone(), optional)) {
+            Ok(OwnedValue::String(s)) => Some(s),
+            Ok(OwnedValue::Null) => Some(String::new()),
+            Ok(_) if optional => return QueryResult::None,
+            Ok(v) => return QueryResult::Error(EvalError::is_not_a_string(&v)),
+            Err(e) => return e.into(),
+        },
+    };
+
+    sub_with_resolved_pattern::<W, S>(
+        &pattern,
+        replacement_expr,
+        flags.as_deref(),
+        value,
+        optional,
+    )
+}
+
+/// The rest of `sub`/`gsub`'s work once the pattern string and flags string
+/// are both already resolved — input fetch, regex build, and the single-vs-
+/// global replace logic. Split out so `builtin_gsub_with_flags` (whose
+/// flags value is a synthesized `flags + "g"` string, not a user
+/// expression, and whose own flags-before-pattern evaluation order already
+/// matches jq's — see its own doc comment) can reuse this without going
+/// through `builtin_sub_with_flags`'s pattern-first evaluation, which only
+/// applies when `flags_expr` is a real, independently-evaluated argument.
+#[cfg(feature = "regex")]
+fn sub_with_resolved_pattern<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    pattern: &str,
+    replacement_expr: &Expr,
+    flags: Option<&str>,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
     // Get the input string
     let input = match &value {
         StandardJson::String(s) => match s.as_str() {
@@ -7513,7 +7571,7 @@ fn builtin_sub_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     };
 
     // Build regex
-    let re = match build_regex(&pattern, flags) {
+    let re = match build_regex(pattern, flags) {
         Ok(r) => r,
         Err(_e) if optional => return QueryResult::None,
         Err(e) => return e.into(),
@@ -7595,14 +7653,21 @@ fn builtin_gsub_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// Builtin: gsub(re; replacement) or gsub(re; replacement; flags) - replace all matches
 ///
 /// jq defines this as `sub($re; str; flags + "g")` — delegate straight into
-/// `builtin_sub_with_flags` instead of duplicating its pattern/input/
+/// `sub_with_resolved_pattern` instead of duplicating its pattern/input/
 /// regex-build boilerplate a second time. `'g'` is a no-op in
 /// `build_regex`'s own flag parser (it only ever affects
-/// `builtin_sub_with_flags`'s choice between its single-match and
+/// `sub_with_resolved_pattern`'s choice between its single-match and
 /// `stitch_replacements_evaluated` global-match arms, never the compiled
 /// pattern itself), so forcing it into `flags` here reliably selects the
 /// global arm — i.e. gsub's unconditional "replace every match" behavior —
 /// the same way an explicit `"g"` flag does for `sub`.
+///
+/// Deliberately does *not* route through `builtin_sub_with_flags`'s
+/// pattern-first evaluation order: `flags` here is a `builtin_gsub_flags`-
+/// synthesized `flags + "g"` string, not an independent user expression, and
+/// jq's own flags-before-pattern order for gsub (confirmed live:
+/// `gsub(1;"b";2)` blames the flags, not the pattern) already matches what
+/// evaluating flags in the caller and pattern here produces.
 #[cfg(feature = "regex")]
 fn builtin_gsub_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     re_expr: &Expr,
@@ -7612,8 +7677,17 @@ fn builtin_gsub_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     optional: bool,
 ) -> QueryResult<'a, W> {
     let global_flags = format!("{}g", flags.unwrap_or(""));
-    builtin_sub_with_flags::<W, S>(
-        re_expr,
+
+    // Get the pattern
+    let pattern = match result_to_owned(eval_single::<W, S>(re_expr, value.clone(), optional)) {
+        Ok(OwnedValue::String(s)) => s,
+        Ok(_) if optional => return QueryResult::None,
+        Ok(v) => return QueryResult::Error(EvalError::is_not_a_string(&v)),
+        Err(e) => return e.into(),
+    };
+
+    sub_with_resolved_pattern::<W, S>(
+        &pattern,
         replacement_expr,
         Some(&global_flags),
         value,
