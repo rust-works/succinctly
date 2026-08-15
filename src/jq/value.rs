@@ -458,7 +458,7 @@ impl OwnedValue {
     /// through untouched should normalize its operands through this first --
     /// arithmetic calls it at the top of each operator function so a
     /// literal-carrying operand degrades before the value/value match runs.
-    pub(crate) fn into_plain_number(self) -> Self {
+    pub fn into_plain_number(self) -> Self {
         match self {
             Self::NumberLiteral(NumberRepr::Int(n), _) => Self::Int(n),
             Self::NumberLiteral(NumberRepr::Float(f), _) => Self::Float(f),
