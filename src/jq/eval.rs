@@ -18655,15 +18655,26 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<BrokenDownTime, String> {
                 }
                 Some('H') => {
                     hour = parse_digits(&mut input_iter, 2)?;
+                    if !(0..=23).contains(&hour) {
+                        return Err(format!("hour {hour} out of range"));
+                    }
                 }
                 Some('I') => {
                     hour = parse_digits(&mut input_iter, 2)?;
                     // Will be adjusted by %p if present
+                    if !(1..=12).contains(&hour) {
+                        return Err(format!("hour {hour} out of range"));
+                    }
                 }
                 Some('M') => {
                     minute = parse_digits(&mut input_iter, 2)?;
+                    if !(0..=59).contains(&minute) {
+                        return Err(format!("minute {minute} out of range"));
+                    }
                 }
                 Some('S') => {
+                    // No upper-bound check: `60` is a valid leap second and
+                    // real jq accepts it (confirmed live, #971).
                     second = parse_digits(&mut input_iter, 2)?;
                 }
                 Some('p' | 'P') => {
@@ -18727,11 +18738,17 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<BrokenDownTime, String> {
                         "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct",
                         "nov", "dec",
                     ];
-                    for (i, m) in months.iter().enumerate() {
-                        if name_lower.starts_with(m) {
-                            month = (i + 1) as i64;
-                            break;
-                        }
+                    // #971: a non-matching name (e.g. "xyz") previously left
+                    // `month` at its prior/default value instead of erroring,
+                    // silently masking malformed input as a valid date -
+                    // real jq rejects it ("does not match format").
+                    let matched = months
+                        .iter()
+                        .enumerate()
+                        .find_map(|(i, m)| name_lower.starts_with(m).then_some((i + 1) as i64));
+                    match matched {
+                        Some(m) => month = m,
+                        None => return Err(format!("unrecognized month name '{name}'")),
                     }
                 }
                 Some('C') => {
