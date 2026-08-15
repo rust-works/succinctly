@@ -6398,6 +6398,164 @@ fn test_inconsistent_compact_mapping_indent_with_alias_key() -> Result<()> {
     Ok(())
 }
 
+// ============================================================================
+// A `-` continuation in a compact mapping's gap (#900)
+// ============================================================================
+// The sibling shape #885's own doc comment flagged as deliberately
+// out-of-scope: a bare `-` line (not a `key: value` line) landing in the
+// same gap. Unlike a mapping entry, a `-` can't "just be added" to the open
+// compact mapping -- the obvious extension instead closes through both the
+// mapping and its enclosing sequence item and treats this as the next item
+// of the *outer* sequence, same "parse the obvious extension" policy as
+// #325/#485/#885. Real `yq` v4.53.3 rejects every one of these inputs
+// outright (`did not find expected '-' indicator`), same as #885's own
+// cases.
+
+#[test]
+fn test_sequence_item_gap_headline_repro() -> Result<()> {
+    let (output, exit_code) = run_yq_stdin(".", "-   a: hello\n  - b\n", &["-o", "json", "-I0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), r#"[{"a":"hello"},"b"]"#);
+    Ok(())
+}
+
+#[test]
+fn test_sequence_item_gap_at_the_mappings_own_indent_with_resolved_key() -> Result<()> {
+    // Lower bound aside, the mapping's own exact indent is *not* included in
+    // this fix's trigger range (see `sequence_item_gap_reaches`'s own doc
+    // comment for why: that exact indent is ambiguous with the legitimate
+    // "block sequence value at the key's own indent" shape when the key is
+    // deferred, so this fix deliberately leaves it alone rather than risk
+    // misreading that case). This regression guard pins the current,
+    // unchanged (pre-existing, still-buggy) behavior for the one sub-case
+    // this fix does *not* reach, so a future change to the boundary doesn't
+    // silently start (or stop) altering it without a test noticing either
+    // way.
+    let (output, exit_code) = run_yq_stdin(".", "-   a: hello\n    - b\n", &["-o", "json", "-I0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), r#"[{"a":"hello"}]"#);
+    Ok(())
+}
+
+#[test]
+fn test_sequence_item_gap_does_not_regress_deferred_value_at_own_indent() -> Result<()> {
+    // The legitimate case this fix must not disturb: a compact mapping's
+    // last key with its value deferred to the next line, and that next line
+    // is a `-` at exactly the mapping's own indent -- valid YAML (a block
+    // sequence may sit at its key's own indent), already correct before
+    // #900, and exercised end-to-end here (not just at the
+    // `YamlIndex`-internal level `test_compact_entry_trailing_anchor_targets_its_collection`
+    // already covers).
+    let (output, exit_code) = run_yq_stdin(".", "- k: &a\n  - 1\n", &["-o", "json", "-I0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), r#"[{"k":[1]}]"#);
+    Ok(())
+}
+
+#[test]
+fn test_sequence_item_gap_does_not_lose_later_items() -> Result<()> {
+    // The second `-   x: 9\n` sibling (a fresh compact-mapping item, not a
+    // plain scalar) confirms the outer sequence is genuinely reused, not
+    // just tolerated for a single extra item. `- c` is deliberately at
+    // indent 0 rather than the same 2-space indent as `- b`: indent 2 is
+    // *greater* than item `b`'s own virtual indent (1), so it would fold as
+    // a continuation of `b`'s own plain-scalar text under ordinary YAML
+    // rules (verified against real yq: `- b\n  - c\n` reads as `["b - c"]`)
+    // -- an unrelated, pre-existing folding rule, not this fix's concern.
+    let (output, exit_code) = run_yq_stdin(
+        ".",
+        "-   a: 1\n  - b\n- c\n-   x: 9\n",
+        &["-o", "json", "-I0"],
+    )?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), r#"[{"a":1},"b","c",{"x":9}]"#);
+    Ok(())
+}
+
+// ============================================================================
+// A mapping-under-mapping sibling gap (#901)
+// ============================================================================
+// #885's own doc comment flagged this as needing its own correctness
+// argument before extending its tolerance: unlike a `SequenceItem` frame,
+// an ordinary `Mapping` frame doesn't guarantee it's the *only* possible
+// enclosing scope for an out-of-range sibling -- both the inner and outer
+// mapping are structurally plausible owners. Real `yq` v4.53.3 rejects
+// every one of these inputs outright too (`did not find expected key`), and
+// unlike #900, no "obvious extension" resolves the ambiguity here, so this
+// stays a genuine parse error rather than a tolerated shape.
+
+#[test]
+fn test_mapping_under_mapping_gap_headline_repro() -> Result<()> {
+    let (_output, stderr, exit_code) =
+        run_yq_stdin_with_stderr(".", "a:\n    b: 1\n  c: 2\n", &["-o", "json", "-I0"])?;
+    assert_eq!(exit_code, 1);
+    assert!(
+        stderr.contains("inconsistent indentation"),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_mapping_under_mapping_gap_does_not_reject_sibling_at_outer_indent() -> Result<()> {
+    // Regression guard: a sibling that lands exactly at the *outer*
+    // mapping's own indent is ordinary, unambiguous YAML (close the inner
+    // mapping, add a sibling key to the outer one), not this gap shape.
+    let (output, exit_code) = run_yq_stdin(".", "a:\n    b: 1\nc: 2\n", &["-o", "json", "-I0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), r#"{"a":{"b":1},"c":2}"#);
+    Ok(())
+}
+
+#[test]
+fn test_mapping_under_mapping_gap_does_not_reject_sibling_at_inner_indent() -> Result<()> {
+    // Regression guard: a sibling at exactly the *inner* mapping's own
+    // indent is just another ordinary key of that mapping.
+    let (output, exit_code) =
+        run_yq_stdin(".", "a:\n    b: 1\n    c: 2\n", &["-o", "json", "-I0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), r#"{"a":{"b":1,"c":2}}"#);
+    Ok(())
+}
+
+#[test]
+fn test_mapping_under_mapping_gap_does_not_regress_deferred_value_at_inner_indent() -> Result<()> {
+    // The mapping-under-mapping analog of #900's own deferred-value guard:
+    // a key with its value deferred to the next line, and that next line is
+    // a nested sequence item at exactly the inner mapping's own indent.
+    let (output, exit_code) =
+        run_yq_stdin(".", "a:\n    k: &x\n    - 1\n", &["-o", "json", "-I0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), r#"{"a":{"k":[1]}}"#);
+    Ok(())
+}
+
+#[test]
+fn test_mapping_under_mapping_gap_via_explicit_key() -> Result<()> {
+    // `parse_explicit_key`'s own copy of the same check.
+    let (_output, stderr, exit_code) =
+        run_yq_stdin_with_stderr(".", "a:\n    b: 1\n  ? c\n  : 2\n", &["-o", "json", "-I0"])?;
+    assert_eq!(exit_code, 1);
+    assert!(
+        stderr.contains("inconsistent indentation"),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_mapping_under_mapping_gap_via_explicit_value() -> Result<()> {
+    // `parse_explicit_value`'s own copy of the same check.
+    let (_output, stderr, exit_code) =
+        run_yq_stdin_with_stderr(".", "a:\n    b: 1\n  ? c\n  d: 3\n", &["-o", "json", "-I0"])?;
+    assert_eq!(exit_code, 1);
+    assert!(
+        stderr.contains("inconsistent indentation"),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
 #[test]
 fn test_flow_dash_without_whitespace_is_still_a_scalar() -> Result<()> {
     // A `-` not followed by whitespace is a legitimate plain scalar in flow
