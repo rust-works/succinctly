@@ -10779,11 +10779,29 @@ fn resolve_node<'a, S: EvalSemantics>(
         // Confirmed against jq 1.7.1: `path(getpath((["a"], error("x"))))`
         // on `{"a":1}` prints `["a"]` (the branch for the already-produced
         // `["a"]`) before raising `x`. Only the exact single-array-output
-        // shape needs a bespoke partial-prefix branch here: any other shape
-        // (zero outputs, 2+ outputs, or a non-array output) falls through
-        // to `resolve_leaf` exactly as before, which re-evaluates `expr` as
-        // a whole and already applies this same keep-partial treatment
-        // itself (#861's precedent).
+        // shape gets a bespoke partial-prefix branch here.
+        //
+        // Any other shape (zero outputs, 2+ outputs, or a non-array output)
+        // with *no* escape falls through to `resolve_leaf` exactly as
+        // before. But an escape alongside a non-single-array shape must NOT
+        // fall through the same way: `resolve_leaf` re-evaluates `expr` (the
+        // whole `GetPath(arg)` node) through a *different*, single-shot code
+        // path (`builtin_getpath` -> `eval_single` -> `result_to_owned`),
+        // whose `QueryResult::Partial` arm silently discards the escape it
+        // rediscovers and keeps only `arg`'s first output — for 2+ prior
+        // outputs this fabricates an unrelated "Invalid path expression"
+        // message that masks the real error entirely (found in review:
+        // `path(getpath((["a"],["b"],error("x")))) `on `{"a":1,"b":2}`
+        // reported "Invalid path expression with result 1" instead of `x`,
+        // strictly worse than discarding the fan-out prefix, the pre-existing
+        // #896 gap this arm doesn't attempt to close for this shape). Propagate
+        // the real escape directly instead, with an empty prefix — the same
+        // outcome `eval_owned_multi`'s old all-or-nothing `?` already gave
+        // for every escape in this shape, so this is not a regression versus
+        // pre-#896 `main`, just not a further improvement for it. Giving
+        // this shape its own full fan-out (like the single-array case now
+        // has) is out of scope here — `resolve_leaf`'s multi-output
+        // `result_to_owned` gap predates and is independent of #896.
         Expr::Builtin(Builtin::GetPath(arg)) => {
             let (values, escape) = eval_owned_multi_keep_partial::<S>(arg, value);
             if let [OwnedValue::Array(keys)] = values.as_slice() {
@@ -10811,6 +10829,9 @@ fn resolve_node<'a, S: EvalSemantics>(
                     Some(e) => Err((vec![branch], e)),
                     None => Ok(vec![branch]),
                 };
+            }
+            if let Some(e) = escape {
+                return Err((Vec::new(), e));
             }
             resolve_leaf::<S>(expr, value, trackable)
         }
@@ -11612,7 +11633,22 @@ fn resolve_index_expr<'a, S: EvalSemantics>(
             EvalError::invalid_path_expression_near_access(&keys[0], value).into(),
         ));
     }
-    let target_branches = resolve_node::<S>(target, value, trackable)?;
+    // Keeps `target`'s own partial prefix too, not just `key`'s (#896
+    // review): `target` can itself now be one of #896's 4 fixed sites
+    // (`select`, `if`, `getpath`, a nested computed index), so its own
+    // `Err` can carry a non-empty prefix that still needs indexing by
+    // `keys` rather than being returned unindexed. Confirmed against jq
+    // 1.7.1: `path(select((true, error("t")))[("x", error("k"))])` on
+    // `{"a":1,"x":9}` prints `["x"]` (the already-produced `select` branch,
+    // indexed by `"x"`) before raising `t` — `key`'s own deferred escape
+    // (`k`) is never reached, since jq's `K as $k | E | .[$k]` compilation
+    // (this function's own doc comment) evaluates `E`'s whole generator,
+    // escape included, before ever asking `K`'s generator for its next
+    // value — so `target_escape` takes priority over `key_escape` below.
+    let (target_branches, target_escape) = match resolve_node::<S>(target, value, trackable) {
+        Ok(branches) => (branches, None),
+        Err((prefix, e)) => (prefix, Some(e)),
+    };
     // #843: `target` can also resolve successfully with `trackable: false`
     // through `Builtin::GetPath`'s own deliberate exemption (real jq lets
     // `getpath(P)` navigate an untracked value, matching how a literal
@@ -11687,7 +11723,10 @@ fn resolve_index_expr<'a, S: EvalSemantics>(
             out.push((path, Cow::Owned(next_value)));
         }
     }
-    match key_escape {
+    // `target_escape` first: see the comment on `target_branches`'s own
+    // computation above for why jq's evaluation order surfaces it ahead of
+    // `key_escape`.
+    match target_escape.or(key_escape) {
         Some(e) => Err((out, e)),
         None => Ok(out),
     }
