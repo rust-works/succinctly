@@ -3682,8 +3682,9 @@ fn stream_yaml_scalar_as_json<Out: core::fmt::Write>(
 }
 
 /// Stream an already-resolved scalar as JSON. `str_val` is the original
-/// source text, used only for the `Str` case (and only if `resolved` didn't
-/// come from resolving it, e.g. tag-forced `!!str` on non-string content).
+/// source text, used for the `Str` case (and only if `resolved` didn't come
+/// from resolving it, e.g. tag-forced `!!str` on non-string content), and
+/// for a preservable `Float` literal (#993).
 fn stream_resolved_scalar_as_json<Out: core::fmt::Write>(
     out: &mut Out,
     resolved: ResolvedScalar,
@@ -3694,7 +3695,16 @@ fn stream_resolved_scalar_as_json<Out: core::fmt::Write>(
         ResolvedScalar::Bool(true) => out.write_str("true"),
         ResolvedScalar::Bool(false) => out.write_str("false"),
         ResolvedScalar::Int(n) => write!(out, "{n}"),
-        // Not `write!(out, "{f}")`: that drops the `.0` from a whole float.
+        // Echo the source text when it's already safe, valid JSON number
+        // syntax (`number_literal()` below uses the same predicate for the
+        // DOM path) -- this is what keeps a trailing zero (`1.50`) intact;
+        // `format_float_with_fraction` only reconstructs the value's
+        // shortest round-trip spelling, which silently drops it (#993).
+        // Not `write!(out, "{f}")` either way: that drops the `.0` from a
+        // whole float.
+        ResolvedScalar::Float(f) if f.is_finite() && is_preservable_float_literal(str_val) => {
+            out.write_str(str_val)
+        }
         ResolvedScalar::Float(f) if f.is_finite() => out.write_str(&format_float_with_fraction(f)),
         // JSON cannot represent the `.inf`/`.nan` family.
         ResolvedScalar::Float(_) => out.write_str("null"),

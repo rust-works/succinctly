@@ -11036,6 +11036,70 @@ fn test_tag_yq_leading_dot_float_is_not_confused_for_null_918() -> Result<()> {
     Ok(())
 }
 
+// =============================================================================
+// M2 JSON-output float literal fidelity — #993
+// =============================================================================
+
+/// A bare `.field` navigation query stays on the M2 fast path
+/// (`can_json_fast_path`), which streams straight from
+/// `stream_resolved_scalar_as_json` rather than materializing an
+/// `OwnedValue` -- a different code path than the `#918` tests above (which
+/// force the DOM path via `[.]` array construction). Before this fix, that
+/// streamer always reconstructed a float's text from the parsed `f64`
+/// (`format_float_with_fraction`), silently dropping a source literal's
+/// trailing zero even though default (YAML) output preserved it correctly.
+/// Both sides pinned against the real yq oracle (v4.53.3).
+#[test]
+fn test_m2_json_output_preserves_float_trailing_zero_993() -> Result<()> {
+    for (yaml, want) in [
+        ("a: 1.50\n", "1.50"),
+        ("a: 1.500\n", "1.500"),
+        ("a: 0.10\n", "0.10"),
+        ("a: 1.0\n", "1.0"),
+    ] {
+        let (out, code) = run_yq_stdin(".a", yaml, &["-o=json", "-I=0"])?;
+        assert_eq!(code, 0, "for {yaml:?}");
+        assert_eq!(out.trim(), want, "for {yaml:?}");
+
+        // Default YAML output was already correct; this fix must not change it.
+        let (yaml_out, code) = run_yq_stdin(".a", yaml, &[])?;
+        assert_eq!(code, 0);
+        assert_eq!(yaml_out.trim(), want, "yaml output regressed for {yaml:?}");
+    }
+    Ok(())
+}
+
+/// Same fix, whole-document identity query rather than field access --
+/// `stream_resolved_scalar_as_json` is reached the same way either way, but
+/// the issue's own repro used `.` and this locks in that exact shape too.
+#[test]
+fn test_m2_json_output_preserves_float_trailing_zero_whole_doc_993() -> Result<()> {
+    let (out, code) = run_yq_stdin(".", "a: 1.50\n", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), r#"{"a":1.50}"#);
+    Ok(())
+}
+
+/// Non-regression: spellings `is_preservable_float_literal` deliberately
+/// excludes (exponent notation, more than 17 significant digits) must keep
+/// falling back to `format_float_with_fraction` exactly as before -- this
+/// fix only widens which literals get echoed, never narrows it.
+#[test]
+fn test_m2_json_output_float_fallback_unaffected_by_993() -> Result<()> {
+    for (yaml, want) in [
+        // Exponent notation: excluded by `is_preservable_float_literal`
+        // itself (unrelated follow-up scope, #1008), unaffected either way.
+        ("a: 007e2\n", "700.0"),
+        // More significant digits than an f64 actually holds.
+        ("a: 1.2345678901234567890123\n", "1.2345678901234567"),
+    ] {
+        let (out, code) = run_yq_stdin(".a", yaml, &["-o=json", "-I=0"])?;
+        assert_eq!(code, 0, "for {yaml:?}");
+        assert_eq!(out.trim(), want, "for {yaml:?}");
+    }
+    Ok(())
+}
+
 /// #917: real yq (confirmed live against the pinned v4.53.3) never raises a
 /// type-mismatch error for `has()` -- a string key on an array, a numeric
 /// key on an object, and any key at all on a bare scalar are all `false`,
