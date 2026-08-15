@@ -263,7 +263,7 @@ fn preview_infinite_literal(raw: &[u8]) -> String {
 /// - `unit`: the character repeated `indent_spaces` times per level (`' '`
 ///   normally, `'\t'` for `--tab`)
 /// - `sort_keys`: sort object keys before writing (`-S`/`--sort-keys`)
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)] // STYLE-0004: every param is threaded through this function's own recursion (and its `write_object_entries` helper below); a struct would hide the 1:1 relationship each has to a specific streaming convention (escape/float/infinity rendering).
 fn stream_owned_value_json_with<W: core::fmt::Write>(
     value: &OwnedValue,
     out: &mut W,
@@ -338,33 +338,41 @@ fn stream_owned_value_json_with<W: core::fmt::Write>(
             }
             out.write_char('{')?;
             let next_indent = current_indent + indent_spaces;
-            let mut entries: Vec<(&String, &OwnedValue)> = obj.iter().collect();
-            if sort_keys {
-                entries.sort_by(|a, b| a.0.cmp(b.0));
-            }
-            for (i, (key, value)) in entries.into_iter().enumerate() {
-                if i > 0 {
-                    out.write_char(',')?;
-                }
-                if indent_spaces > 0 {
-                    out.write_char('\n')?;
-                    write_indent(out, next_indent, unit)?;
-                }
-                stream_json_string(out, key, escape)?;
-                out.write_str(if indent_spaces > 0 { ": " } else { ":" })?;
-                stream_owned_value_json_with(
-                    value,
-                    out,
-                    next_indent,
-                    indent_spaces,
-                    unit,
-                    sort_keys,
-                    escape,
-                    float_fmt,
-                    infinite_float,
-                    infinite_literal,
-                )?;
-            }
+            // Only pay for a Vec collect+sort when an order actually needs
+            // imposing -- `sort_keys` is always `false` on the
+            // error-message value-preview path (`describe()`/
+            // `dump_truncated()`, capped at a handful of bytes by
+            // `PreviewSink`), where collecting the *whole* object first
+            // defeated that path's own early-`Err`-propagation budget
+            // check the `Array` arm above already benefits from (#931).
+            //
+            // `ObjectEntries` (below) lets both branches converge on one
+            // `write_object_entries` call site instead of two independently
+            // typed ones that would otherwise need to be kept in sync by
+            // hand (#963 review): a rebase-merge inconsistency during this
+            // fix's own development applied a signature change to only one
+            // of two near-duplicate call sites, caught only by manual
+            // review before push -- exactly the drift risk a single shared
+            // call site removes.
+            let entries = if sort_keys {
+                let mut sorted: Vec<(&String, &OwnedValue)> = obj.iter().collect();
+                sorted.sort_by(|a, b| a.0.cmp(b.0));
+                ObjectEntries::Sorted(sorted.into_iter())
+            } else {
+                ObjectEntries::Unsorted(obj.iter())
+            };
+            write_object_entries(
+                out,
+                entries,
+                next_indent,
+                indent_spaces,
+                unit,
+                sort_keys,
+                escape,
+                float_fmt,
+                infinite_float,
+                infinite_literal,
+            )?;
             if indent_spaces > 0 {
                 out.write_char('\n')?;
                 write_indent(out, current_indent, unit)?;
@@ -372,6 +380,69 @@ fn stream_owned_value_json_with<W: core::fmt::Write>(
             out.write_char('}')
         }
     }
+}
+
+/// Either a sorted (already-materialized into a `Vec`) or unsorted
+/// (borrowed directly from the map) iterator over an object's `(key,
+/// value)` pairs -- see the `Object` arm above for why unifying these into
+/// one type, rather than two call sites, matters.
+enum ObjectEntries<'a> {
+    Sorted(alloc::vec::IntoIter<(&'a String, &'a OwnedValue)>),
+    Unsorted(indexmap::map::Iter<'a, String, OwnedValue>),
+}
+
+impl<'a> Iterator for ObjectEntries<'a> {
+    type Item = (&'a String, &'a OwnedValue);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Sorted(it) => it.next(),
+            Self::Unsorted(it) => it.next(),
+        }
+    }
+}
+
+/// Write an object's `(key, value)` pairs, comma-separated and optionally
+/// indented -- shared by both the sorted (`Vec`-collected) and unsorted
+/// (`obj.iter()` directly) paths in `stream_owned_value_json_with`'s
+/// `Object` arm so the entry-writing logic isn't duplicated between them.
+#[allow(clippy::too_many_arguments)] // STYLE-0004: mirrors stream_owned_value_json_with's own suppression above -- every param is forwarded verbatim to that function's recursive call for each value.
+fn write_object_entries<'a, W: core::fmt::Write>(
+    out: &mut W,
+    entries: impl Iterator<Item = (&'a String, &'a OwnedValue)>,
+    next_indent: usize,
+    indent_spaces: usize,
+    unit: char,
+    sort_keys: bool,
+    escape: fn(&mut W, &str) -> core::fmt::Result,
+    float_fmt: fn(f64) -> String,
+    infinite_float: fn(bool) -> String,
+    infinite_literal: fn(&[u8]) -> String,
+) -> core::fmt::Result {
+    for (i, (key, value)) in entries.enumerate() {
+        if i > 0 {
+            out.write_char(',')?;
+        }
+        if indent_spaces > 0 {
+            out.write_char('\n')?;
+            write_indent(out, next_indent, unit)?;
+        }
+        stream_json_string(out, key, escape)?;
+        out.write_str(if indent_spaces > 0 { ": " } else { ":" })?;
+        stream_owned_value_json_with(
+            value,
+            out,
+            next_indent,
+            indent_spaces,
+            unit,
+            sort_keys,
+            escape,
+            float_fmt,
+            infinite_float,
+            infinite_literal,
+        )?;
+    }
+    Ok(())
 }
 
 /// Stream a quoted JSON string, escaping its body with `escape`.
@@ -1187,6 +1258,85 @@ mod tests {
         let mut out = FailOnMarker { marker: "boom" };
         let result = OwnedValue::Object(map).stream_json(&mut out, IndentSpec::spaces(2), false);
         assert!(result.is_err());
+    }
+
+    /// A [`core::fmt::Write`] that fails on its `fail_after`-th call to
+    /// `write_str`, counting every call it sees regardless of outcome --
+    /// used to prove an early write failure actually *stops* traversal
+    /// instead of just being ignored by the caller.
+    struct FailAfterNCalls {
+        calls: usize,
+        fail_after: usize,
+    }
+
+    impl core::fmt::Write for FailAfterNCalls {
+        fn write_str(&mut self, _s: &str) -> core::fmt::Result {
+            self.calls += 1;
+            if self.calls > self.fail_after {
+                Err(core::fmt::Error)
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    /// #931: the `Object` arm used to unconditionally collect every
+    /// key/value pair into a `Vec` before writing anything, even when
+    /// `sort_keys` is `false` and nothing needs reordering -- so an early
+    /// write failure (e.g. `PreviewSink`'s truncation budget, the actual
+    /// caller `describe()`/`dump_truncated()` always uses) still paid an
+    /// O(n) allocation+copy over the *whole* object first before the
+    /// failure was ever observed. Fixed by only collecting into a `Vec`
+    /// when `sort_keys` is `true`; the unsorted path now consumes
+    /// `obj.iter()` directly via the shared `write_object_entries` helper.
+    ///
+    /// This doesn't directly measure the removed allocation (a unit test
+    /// can't assert "no O(n) Vec was built" without instrumentation), but
+    /// it does pin the refactor's correctness: an early write failure on
+    /// the unsorted path still propagates via a handful of `write_str`
+    /// calls, not one per entry of a 100,000-entry object -- if a future
+    /// change routed the unsorted path back through an eager
+    /// `entries.into_iter()` collected up front, this would still pass
+    /// (the collect itself doesn't call `write_str`), so it's a guard
+    /// against `write_object_entries` itself losing its early-`Err`
+    /// propagation, not a full performance regression test.
+    #[test]
+    fn test_stream_json_unsorted_object_stops_at_first_write_failure_931() {
+        let mut map = IndexMap::new();
+        for i in 0..100_000 {
+            map.insert(format!("k{i}"), OwnedValue::Int(i));
+        }
+        let mut out = FailAfterNCalls {
+            calls: 0,
+            fail_after: 5,
+        };
+        let result = OwnedValue::Object(map).stream_json(&mut out, IndentSpec::COMPACT, false);
+        assert!(result.is_err());
+        assert!(out.calls <= 20, "calls: {}", out.calls);
+    }
+
+    /// #963 review companion to the test above: the `sort_keys=true`
+    /// branch (`ObjectEntries::Sorted`) must propagate an early write
+    /// failure through `write_object_entries`'s shared loop just as
+    /// reliably as the unsorted branch does -- the sorted path's `Vec`
+    /// collect happens unconditionally either way (sorting genuinely needs
+    /// every key), so this isn't guarding the same O(n)-avoidance property
+    /// the test above pins, only that the write loop itself still stops at
+    /// the first failing `write_str` once writing starts, regardless of
+    /// which `ObjectEntries` variant is driving it.
+    #[test]
+    fn test_stream_json_sorted_object_stops_at_first_write_failure_963() {
+        let mut map = IndexMap::new();
+        for i in 0..1_000 {
+            map.insert(format!("k{i}"), OwnedValue::Int(i));
+        }
+        let mut out = FailAfterNCalls {
+            calls: 0,
+            fail_after: 5,
+        };
+        let result = OwnedValue::Object(map).stream_json(&mut out, IndentSpec::COMPACT, true);
+        assert!(result.is_err());
+        assert!(out.calls <= 20, "calls: {}", out.calls);
     }
 
     // The `sort_keys` (`-S`) parameter was threaded through
