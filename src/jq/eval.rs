@@ -28465,6 +28465,86 @@ mod tests {
 
     #[cfg(feature = "regex")]
     #[test]
+    fn test_regex_gsub_family_forces_pattern_before_flags_938() {
+        // #938: gsub/scan/split/splits force the *pattern* expression
+        // first (propagating a genuine error(), but not yet checking its
+        // type), then evaluate+type-check flags via jq's internal
+        // `flags + "g"`/`"g" + flags` concatenation, and only afterward
+        // check pattern's own type. This is the reverse of the pre-fix
+        // behavior, which evaluated (and type-checked) flags first,
+        // silently skipping a side-effecting pattern expression whenever
+        // flags itself raised. Confirmed live via `debug()`-based probes
+        // in the doc comment on `eval_regex_pattern_and_concat_flags` —
+        // "which error wins" alone can't distinguish evaluation order
+        // when only one side ever raises (both orderings predict the same
+        // winner for e.g. `gsub(1;"b";2)`).
+
+        // Ordinary type mismatch (neither side raises): flags' type error
+        // still wins, unchanged from before this fix — matches jq's own
+        // flags-then-pattern *type-check* order (independent of which
+        // argument is evaluated first).
+        for filter in [
+            r#"gsub(1; "b"; 2)"#,
+            r"scan(1; 2)",
+            r"split(1; 2)",
+            r"splits(1; 2)",
+        ] {
+            query!(br#""abc""#, filter,
+                QueryResult::Error(e) => {
+                    assert!(e.message.contains("cannot be added"), "filter: {filter}: {}", e.message);
+                }
+            );
+        }
+
+        // A side-effecting pattern expression's error() must propagate,
+        // even though flags raises too — pattern is forced first and
+        // flags is never touched once pattern itself raises.
+        for filter in [
+            r#"gsub(error("PATTERN_ERR"); "b"; error("FLAGS_ERR"))"#,
+            r#"scan(error("PATTERN_ERR"); error("FLAGS_ERR"))"#,
+            r#"split(error("PATTERN_ERR"); error("FLAGS_ERR"))"#,
+            r#"splits(error("PATTERN_ERR"); error("FLAGS_ERR"))"#,
+        ] {
+            query!(br#""abc""#, filter,
+                QueryResult::Error(e) => {
+                    assert_eq!(e.message, "PATTERN_ERR", "filter: {filter}");
+                }
+            );
+        }
+
+        // A side-effecting *flags* expression's error() still propagates
+        // when the pattern is a plain, non-erroring valid string.
+        for filter in [
+            r#"gsub("a"; "b"; error("FLAGS_ERR"))"#,
+            r#"scan("a"; error("FLAGS_ERR"))"#,
+            r#"split("a"; error("FLAGS_ERR"))"#,
+            r#"splits("a"; error("FLAGS_ERR"))"#,
+        ] {
+            query!(br#""abc""#, filter,
+                QueryResult::Error(e) => {
+                    assert_eq!(e.message, "FLAGS_ERR", "filter: {filter}");
+                }
+            );
+        }
+
+        // `?` still suppresses a non-string flags value for every member
+        // of this family (unaffected by the reorder).
+        for filter in [
+            r#"[gsub(1; "b"; 2)?]"#,
+            r"[scan(1; 2)?]",
+            r"[split(1; 2)?]",
+            r"[splits(1; 2)?]",
+        ] {
+            query!(br#""abc""#, filter,
+                QueryResult::Owned(OwnedValue::Array(vs)) => {
+                    assert!(vs.is_empty(), "filter: {filter}");
+                }
+            );
+        }
+    }
+
+    #[cfg(feature = "regex")]
+    #[test]
     fn test_regex_lookahead_unsupported() {
         // #703: jq's oniguruma backend supports lookahead (`(?=...)`), but
         // succinctly's `regex` crate does not implement lookaround at all —
