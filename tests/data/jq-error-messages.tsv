@@ -152,6 +152,7 @@ scan_arg_non_string	scan(1)	"abc"	number (1) is not a string
 gsub_arg_non_string	gsub(1; "x")	"abc"	number (1) is not a string
 sub_arg_non_string	sub(1; "x")	"abc"	number (1) is not a string
 splits_arg_non_string	splits(1)	"abc"	number (1) is not a string
+split_regex_arg_non_string	split(1; "x")	"abc"	number (1) is not a string
 has_string_on_number	has("a")	1	Cannot check whether number has a string key
 has_string_on_array	has("a")	[1]	Cannot check whether array has a string key
 has_number_on_object	has(1)	{"a":1}	Cannot check whether object has a number key

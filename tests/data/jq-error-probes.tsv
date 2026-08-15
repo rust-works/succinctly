@@ -223,6 +223,12 @@ gsub_arg_non_string	gsub(1; "x")	"abc"
 sub_arg_non_string	sub(1; "x")	"abc"
 splits_arg_non_string	splits(1)	"abc"
 
+# split(re; flags) (the two-arg regex form, `Builtin::SplitRegex`) shares the
+# same "<v> is not a string" wording as its scan/gsub/sub/splits siblings —
+# distinct from split(sep) just below (`split_arg_non_string`), which has its
+# own "split input and separator must be strings" sentence instead.
+split_regex_arg_non_string	split(1; "x")	"abc"
+
 # ── Cannot check whether <t> has a <k> key ───────────────────────────────────
 has_string_on_number	has("a")	1
 has_string_on_array	has("a")	[1]
