@@ -6782,8 +6782,16 @@ fn builtin_match<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // Get the pattern. No `Ok(_) if optional` guard: same reasoning as the
     // flags-eval block below — `optional` is never forced `true` reaching a
     // nested `Call` like this one (see `Expr::Optional`'s dispatch, #693).
+    //
+    // jq's own pattern-error wording depends on which arity was called: the
+    // bare 1-arg form says "<type> not a string or array", but the 2-arg
+    // form (even with a valid/empty/null flags value) says "<v> is not a
+    // string" instead — confirmed live (#937). `flags_expr.is_some()`
+    // tracks which arity this call actually used, independent of what the
+    // flags expression evaluates to.
     let pattern = match result_to_owned(eval_single::<W, S>(re_expr, value.clone(), optional)) {
         Ok(OwnedValue::String(s)) => s,
+        Ok(v) if flags_expr.is_some() => return QueryResult::Error(EvalError::is_not_a_string(&v)),
         Ok(v) => return QueryResult::Error(EvalError::not_string_or_array(v.type_name())),
         Err(e) => return e.into(),
     };
@@ -7348,8 +7356,16 @@ fn builtin_test_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // Get the pattern. No `Ok(_) if optional` guard: same reasoning as the
     // flags-eval block below — `optional` is never forced `true` reaching a
     // nested `Call` like this one (see `Expr::Optional`'s dispatch, #693).
+    //
+    // jq's own pattern-error wording depends on which arity was called: the
+    // bare 1-arg form says "<type> not a string or array", but the 2-arg
+    // form (even with a valid/empty/null flags value) says "<v> is not a
+    // string" instead — confirmed live (#937). `flags_expr.is_some()`
+    // tracks which arity this call actually used, independent of what the
+    // flags expression evaluates to.
     let pattern = match result_to_owned(eval_single::<W, S>(re_expr, value.clone(), optional)) {
         Ok(OwnedValue::String(s)) => s,
+        Ok(v) if flags_expr.is_some() => return QueryResult::Error(EvalError::is_not_a_string(&v)),
         Ok(v) => return QueryResult::Error(EvalError::not_string_or_array(v.type_name())),
         Err(e) => return e.into(),
     };
@@ -7429,8 +7445,16 @@ fn builtin_capture_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // Get the pattern. No `Ok(_) if optional` guard: same reasoning as the
     // flags-eval block below — `optional` is never forced `true` reaching a
     // nested `Call` like this one (see `Expr::Optional`'s dispatch, #693).
+    //
+    // jq's own pattern-error wording depends on which arity was called: the
+    // bare 1-arg form says "<type> not a string or array", but the 2-arg
+    // form (even with a valid/empty/null flags value) says "<v> is not a
+    // string" instead — confirmed live (#937). `flags_expr.is_some()`
+    // tracks which arity this call actually used, independent of what the
+    // flags expression evaluates to.
     let pattern = match result_to_owned(eval_single::<W, S>(re_expr, value.clone(), optional)) {
         Ok(OwnedValue::String(s)) => s,
+        Ok(v) if flags_expr.is_some() => return QueryResult::Error(EvalError::is_not_a_string(&v)),
         Ok(v) => return QueryResult::Error(EvalError::not_string_or_array(v.type_name())),
         Err(e) => return e.into(),
     };
@@ -28165,17 +28189,19 @@ mod tests {
         // deliberately excluded: jq's own internal order for those already
         // evaluates flags first (confirmed live), so no reordering was
         // needed or made there.
-        // test/match/capture's pattern-check has no value preview
-        // ("<type> not a string or array" — a separate, pre-existing
-        // wording gap unrelated to evaluation order, tracked in #937), so
-        // the strongest same-shape check here is simply that it's *this*
-        // sentence (the pattern-argument one) that wins, not the flags-
-        // argument "is not a string" sentence #928 just added.
+        // test/match/capture's pattern-check switches to the "<v> is not a
+        // string" wording once a flags argument is present in the call
+        // (#937, a separate, pre-existing wording gap unrelated to
+        // evaluation order) — so on the 2-arg form used here, the pattern's
+        // error message is byte-identical in shape to what the flags-
+        // argument "is not a string" sentence #928 added. What distinguishes
+        // "pattern won" from "flags won" here is the *value* previewed: `1`
+        // (the pattern), not `2` (the flags).
         for filter in ["test(1; 2)", "match(1; 2)", "capture(1; 2)"] {
             query!(br#""abc""#, filter,
                 QueryResult::Error(e) => {
                     assert_eq!(
-                        e.message, "number not a string or array",
+                        e.message, "number (1) is not a string",
                         "filter: {filter}"
                     );
                 }
