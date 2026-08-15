@@ -4715,9 +4715,11 @@ fn eval_string_interpolation<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// `@uri`, `@html`, `@sh`, and the CSV/TSV/DSV cell formatter that falls back
 /// to `owned_to_string`) want the same `"inf"`/`"-inf"`/`"NaN"` rendering a
 /// plain `Int`/`Float` already gets from `f64::to_string()` -- a
-/// `NumberLiteral` just needs that check made explicit, since its `number_str`
-/// otherwise re-renders the (possibly nonsensical for an overflowed literal)
-/// source text via `format_number_jq_compat`.
+/// `NumberLiteral` just needs that check made explicit: `format_number_jq_compat`
+/// now formats an overflowed literal's source text correctly (#930), but its
+/// jq-error-message-preview text (e.g. `1E+400`) still isn't the Rust-style
+/// `"inf"`/`"-inf"` these non-JSON text formats want, so the explicit check
+/// stays regardless.
 pub(crate) fn numeric_display_string(value: &OwnedValue) -> String {
     if let OwnedValue::NumberLiteral(NumberRepr::Float(f), _) = value {
         if f.is_nan() || f.is_infinite() {
