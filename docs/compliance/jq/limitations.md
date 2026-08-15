@@ -352,6 +352,39 @@ the one sentence left in `eval_object_construction`, because reaching jq's answe
 means generating a stream, not renaming an error. The sentence stays succinctly's until
 #354 is built.
 
+`sub`/`gsub`'s replacement filter emitting zero or 2+ outputs for one match is a third,
+unrelated group — [#840](https://github.com/rust-works/succinctly/issues/840). jq's
+`sub`/`gsub` are defined via a `reduce` over each regex match that threads the
+replacement filter's own output stream through the fold, and the exact resulting
+semantics are inconsistent enough (see the two zero-output rows below) that reproducing
+them exactly would mean re-deriving jq's `builtin.jq` `reduce` structure verbatim rather
+than patching `eval_sub_replacement`'s current one-output-per-match assumption:
+
+| Filter                                                             | Input           | jq                                    | succinctly                     |
+|--------------------------------------------------------------------|-----------------|---------------------------------------|--------------------------------|
+| `sub("a"; empty)`                                                  | `"cab"`         | `"cab"` (unchanged)                   | `error("no value")`            |
+| `gsub("(?<x>[aeiou])"; if .x=="e" then empty else "["+.x+"]" end)` | `"hello world"` | `"ll[o] w[o]rld"`                     | `error("empty result")`        |
+| `sub("(?<x>[aeiou])"; (.x, .x+"!"))`                               | `"hello world"` | `"hello world"` then `"he!llo world"` | `"hello world"` (first output) |
+
+The two zero-output rows alone show jq's actual rule isn't a simple, safely-portable one:
+a *single*-match `sub` with an empty replacement leaves the input completely untouched
+(row 1), but a *multi*-match `gsub` where only one match's replacement is empty drops
+that match's own text *and* the gap immediately before it, while other empty matches
+elsewhere in the same string behave the same way independently (row 2 — verified
+separately: swap which vowel maps to `empty` and the *other* match's own preceding gap
+disappears instead, not a fixed position). The 2+-output row (row 3) is a real, if
+partial, jq feature: full support means forking the whole `sub`/`gsub` call across every
+combination the multi-valued matches produce (confirmed empirically:
+`gsub("(?<x>[aeiou])"; (.x, .x+"!"))` — three vowel matches, not just one — still only
+forks into 2 outputs total, applying the *n*-th replacement candidate uniformly to every
+match rather than a 2³ cartesian product). Succinctly's current stopgap (`eval_owned_input`
++ "take the first output", added same-day as #826 itself, in `src/jq/eval.rs`'s
+`eval_sub_replacement`) reaches jq's *first* output for the 2+-output shape but not the
+rest, and errors outright rather than guessing at the zero-output shape's real rule.
+Real-world replacement filters are overwhelmingly single-output (the shape #826 fixed),
+so this is left as a deliberate, documented divergence rather than chased for a
+rarely-hit, non-obviously-specified shape.
+
 `setpath` is the same operation without the syntax, and after #359 it does follow jq —
 `[1,2] | setpath([5]; 9)` is `[1,2,null,null,null,9]`, and `null | setpath(["a"]; 1)` is
 `{"a":1}`. The two used to disagree with each other in-tree; [#486](https://github.com/rust-works/succinctly/issues/486)

@@ -7317,6 +7317,20 @@ fn stitch_split(input: &str, matches: &[regex::Captures]) -> Vec<String> {
 /// once via `result_to_owned(eval_single(...))`. Non-fatal, if not fully
 /// jq-correct, is the stopgap this function commits to until the follow-up
 /// lands.
+///
+/// A replacement filter that produces *zero* outputs for a match (`sub("a";
+/// empty)`) is the other unimplemented shape (#840) — `result_to_owned`
+/// raises a plain "no value"/"empty result" error for it here rather than
+/// attempting jq's own rule, because jq's actual rule turned out (verified
+/// empirically, not assumed) to be genuinely inconsistent between a
+/// single-match `sub` (leaves the input completely unchanged) and a
+/// multi-match `gsub` where only some matches are empty (drops each empty
+/// match's own preceding gap along with it) — not a simple, safely-portable
+/// "delete the match" rule. See
+/// `docs/compliance/jq/limitations.md`'s "Where succinctly errors and jq
+/// does not" section for the full empirical writeup and why this is left as
+/// a documented divergence alongside the multi-output case above rather
+/// than guessed at.
 #[cfg(feature = "regex")]
 fn eval_sub_replacement<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     replacement_expr: &Expr,
