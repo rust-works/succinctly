@@ -9768,10 +9768,9 @@ fn test_builtin_in_keeps_earlier_candidates_before_a_later_type_mismatch_error_8
 
 /// #966: a leniently-accepted-but-RFC-8259-invalid number (leading zero)
 /// no longer echoes its raw source text once materialized through
-/// `to_owned`/`OwnedValue` (array construction forces materialization,
-/// unlike bare `.` identity — see #974's follow-up for that remaining
-/// gap) -- it numerically sanitizes instead, matching what real jq would
-/// compute for the same digits.
+/// `to_owned`/`OwnedValue` (array construction forces materialization) --
+/// it numerically sanitizes instead, matching what real jq would compute
+/// for the same digits.
 #[test]
 fn test_leading_zero_number_sanitizes_on_materialization_966() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(&["-c", "[.a]"], Some(r#"{"a": 007}"#))?;
@@ -9796,18 +9795,6 @@ fn test_malformed_two_dot_number_becomes_null_not_zero_966() -> Result<()> {
     Ok(())
 }
 
-/// #966: same as above for a bare `-` inside a number-like span (`1-2`
-/// isn't a valid number, isn't a valid subtraction expression either --
-/// it's one lenient semi-index token).
-#[test]
-fn test_malformed_bare_dash_number_becomes_null_not_zero_966() -> Result<()> {
-    let (stdout, stderr, code) = run_jq_full(&["-c", "[.a]"], Some(r#"{"a": 1-2}"#))?;
-    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
-    assert_eq!(stdout, "[null]\n");
-    assert_eq!(stderr, "");
-    Ok(())
-}
-
 /// Sanity check that ordinary valid numbers (including ones that share a
 /// prefix shape with the invalid cases above -- trailing zero, exponent,
 /// bare zero) are completely unaffected by #966's new validity gate.
@@ -9823,5 +9810,98 @@ fn test_valid_numbers_unaffected_by_966_validity_gate() -> Result<()> {
         "{\"a\":42,\"b\":-3.14,\"c\":1E+10,\"d\":0,\"e\":1.50}\n"
     );
     assert_eq!(stderr, "");
+    Ok(())
+}
+
+/// #966 code review found the fix above didn't reach the CLI's actual
+/// *default* output path: `print_json`'s `JqCompatFormatter::format_raw_number`
+/// (`src/bin/succinctly/jq_runner.rs`) is what plain field access, `.[]`,
+/// and `select(...)` print through, completely bypassing `[.a]`-style
+/// materialization -- so `.a` alone was still echoing invalid JSON after
+/// the original fix. Now fixed at that call site directly (same
+/// `OwnedValue::from_number_bytes` gate, consolidated across every "raw
+/// bytes -> number" conversion in the crate).
+#[test]
+fn test_plain_field_access_sanitizes_leading_zero_966() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-c", ".a"], Some(r#"{"a": 007}"#))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "7\n");
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
+/// Same as above for `.[]` iteration over malformed and valid numbers
+/// mixed together -- confirms the fix applies per-element, not just to a
+/// whole-document shortcut.
+#[test]
+fn test_array_iteration_sanitizes_malformed_numbers_966() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-c", ".[]"], Some("[007, 1.2.3, 42]"))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "7\nnull\n42\n");
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
+/// Bare identity (`.`, no computation at all) also sanitizes now --
+/// confirms the M2 raw-copy fast path (`StandardJson::stream_json`) isn't
+/// actually reachable in default (jq-compat) mode:
+/// `OutputConfig::can_use_raw_identity` requires `!jq_compat`, and
+/// `jq_compat` defaults to `true`. What plain `.` was actually printing
+/// through was `JqCompatFormatter::format_raw_number`, the same call site
+/// `test_plain_field_access_sanitizes_leading_zero_966` covers.
+#[test]
+fn test_bare_identity_sanitizes_leading_zero_966() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-c", "."], Some(r#"{"a": 007}"#))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "{\"a\":7}\n");
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
+/// `--preserve-input` is a deliberate, documented "keep the exact source
+/// formatting" mode (`PreserveFormatter`) -- it's expected to keep echoing
+/// a leniently-scanned-but-invalid number verbatim, since that's the
+/// whole point of the flag. This isn't the #966 bug; it's confirming the
+/// fix didn't overreach into a mode where raw echo is intentional.
+#[test]
+fn test_preserve_input_still_echoes_raw_number_text() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", "--preserve-input", "."], Some(r#"{"a": 007}"#))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "{\"a\": 007}\n");
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
+/// #966 code review found that once a malformed number's cursor
+/// materializes to `Null` (`src/jq/lazy.rs::cursor_to_owned`, reached by
+/// `jq -e`'s exit-status check), `jq -e '.a'` on a document with a
+/// malformed `.a` now correctly reports failure (exit 1) instead of
+/// silently succeeding on a value that only *looked* like a number.
+#[test]
+fn test_exit_status_false_for_malformed_number_966() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-e", "-c", ".a"], Some(r#"{"a": 1.2.3}"#))?;
+    assert_eq!(code, 1, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "null\n");
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
+/// Arithmetic on a malformed number now fails loudly instead of silently
+/// computing against a wrong `0` (the original #966 bug's most dangerous
+/// shape -- a query that looks like it succeeded but used fabricated
+/// data). Matches real jq's own hard-reject of `1.2.3` as input, just
+/// surfaced at the point the value is actually used rather than at parse
+/// time (succinctly's semi-indexing architecture defers validation --
+/// see docs/architecture/semi-indexing.md).
+#[test]
+fn test_arithmetic_on_malformed_number_errors_not_silent_zero_966() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-c", ".a - 1"], Some(r#"{"a": 1.2.3}"#))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert!(
+        stderr.contains("cannot be subtracted"),
+        "unexpected stderr: {stderr}"
+    );
     Ok(())
 }

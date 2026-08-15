@@ -1951,6 +1951,18 @@ struct JqCompatFormatter;
 
 impl LiteralFormatter for JqCompatFormatter {
     fn format_raw_number<'a>(&self, raw: &'a [u8]) -> Cow<'a, str> {
+        // The semi-index scanner accepts number *spans* more leniently than
+        // RFC 8259 (leading zeros, multiple decimal points -- #966).
+        // Sanitize via the same fallback every other "raw bytes -> number"
+        // conversion in this crate uses, instead of echoing invalid text
+        // verbatim and producing invalid JSON output.
+        if !validate::is_valid_number(raw) {
+            return Cow::Owned(match OwnedValue::from_number_bytes(raw) {
+                OwnedValue::Int(i) => self.format_int(i),
+                OwnedValue::Float(f) => self.format_float(f),
+                _ => "null".to_string(),
+            });
+        }
         // A source literal that overflows to ±Infinity/NaN (e.g. `1e400`)
         // must not be fed to `format_number_jq_compat` here: this is real
         // JSON output (`--jq-compat`), which RFC 8259 forbids an Infinity/NaN

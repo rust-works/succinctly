@@ -401,6 +401,38 @@ impl OwnedValue {
         Self::NumberLiteral(repr, literal)
     }
 
+    /// Materialize raw JSON number-token bytes into the correctly-gated
+    /// `OwnedValue` -- the single conversion every "raw bytes -> number"
+    /// call site in this crate (including the CLI binary, hence `pub` not
+    /// `pub(crate)`) should go through (#966 found at least 7 independent
+    /// hand-rolled copies of this decision).
+    ///
+    /// Preserves the source spelling via
+    /// [`NumberLiteral`](Self::NumberLiteral) only when `bytes` is valid
+    /// RFC 8259 number syntax
+    /// ([`is_valid_number`](crate::json::validate::is_valid_number));
+    /// otherwise degrades to a plain `Int`/`Float`, or [`Null`](Self::Null)
+    /// if neither parses. Skipping straight to `from_number_literal` for an
+    /// invalid span (`007`, `1.2.3`) would let
+    /// [`to_json`](Self::to_json)/[`number_str`](Self::number_str) echo it
+    /// back out verbatim, since both always reproduce a `NumberLiteral`'s
+    /// stored text unchanged.
+    pub fn from_number_bytes(bytes: &[u8]) -> Self {
+        if crate::json::validate::is_valid_number(bytes) {
+            return core::str::from_utf8(bytes).map_or(Self::Null, Self::from_number_literal);
+        }
+        let Ok(s) = core::str::from_utf8(bytes) else {
+            return Self::Null;
+        };
+        if let Ok(i) = s.parse::<i64>() {
+            Self::Int(i)
+        } else if let Ok(f) = s.parse::<f64>() {
+            Self::Float(f)
+        } else {
+            Self::Null
+        }
+    }
+
     /// Collapse a [`NumberLiteral`](Self::NumberLiteral) into a plain
     /// `Int`/`Float`, dropping the source text. A no-op for every other
     /// variant.

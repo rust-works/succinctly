@@ -726,10 +726,7 @@ fn standard_json_to_owned<W: Clone + AsRef<[u64]>>(
             if is_nan_sentinel(n.raw_bytes()) {
                 OwnedValue::Float(f64::NAN)
             } else {
-                match core::str::from_utf8(n.raw_bytes()) {
-                    Ok(s) => OwnedValue::from_number_literal(s),
-                    Err(_) => OwnedValue::Null,
-                }
+                OwnedValue::from_number_bytes(n.raw_bytes())
             }
         }
         StandardJson::String(s) => {
