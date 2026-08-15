@@ -7869,17 +7869,92 @@ fn test_resolve_node_getpath_multi_output_surfaces_real_error_not_a_fabricated_o
 
 #[test]
 fn test_walk_propagates_halt_from_f() -> Result<()> {
-    // `builtin_walk`'s `Err(e) => e.into()` arm: `walk_impl` applies `f` to
-    // the (already child-processed) value via `eval_owned_expr`, and a halt
-    // from `f` propagates back up through every recursive `walk_impl` call's
-    // `?` (through `Vec<_>`/`IndexMap<_>`'s `collect()` for container
-    // values) to this top-level match, converting back into a `QueryResult`.
+    // `builtin_walk` applies `f` to the (already child-processed) root value
+    // via `eval_owned_expr_fork` + `finish_fork` (#855); for a scalar input
+    // like `1` there are no children, so this exercises the outermost
+    // application directly, and a halt from `f` propagates through
+    // `finish_fork`'s `partial`/`Control::Halt` handling into a `QueryResult`.
     // Verified against jq 1.7.1: `jq -n '1 | walk(halt_error(8))'` prints
     // nothing to stdout, dumps `1` (the value `f` was applied to) to stderr,
     // and exits 8.
     let (stdout, stderr, code) = run_jq_full(&["-n", "1 | walk(halt_error(8))"], None)?;
     assert_eq!(code, 8, "stdout: {stdout:?} stderr: {stderr:?}");
     assert_eq!(stdout, "");
+    Ok(())
+}
+
+// ============================================================================
+// walk(f)/repeat(f) drop a trailing error/break after a multi-output f (#855)
+// ============================================================================
+// eval_owned_expr_ctrl's Partial(vs, control) arm keeps the values `f`
+// already produced but silently drops the trailing Error/Break -- fixed for
+// repeat by switching its loop to eval_owned_expr_fork (which also fixes the
+// same collapse-to-array bug for a plain, non-erroring multi-output f), and
+// for walk by having builtin_walk apply the outermost f via
+// eval_owned_expr_fork directly rather than walk_impl's own (still
+// single-value-collapsing) recursive application. Real jq's own `walk`
+// forks at every recursion level, not just the outermost one -- fully
+// matching that is separable, bigger design work, tracked as a follow-up.
+
+#[test]
+fn test_walk_propagates_error_after_partial_output() -> Result<()> {
+    // Verified against jq 1.7.1: `echo 5 | jq -c 'walk(1, error("bad"))'`
+    // prints `1` then raises, exit 5.
+    let (stdout, stderr, code) = run_jq_full(&["-c", r#"walk(1, error("bad"))"#], Some("5"))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "1\n");
+    assert!(stderr.contains("bad"), "stderr: {stderr:?}");
+    Ok(())
+}
+
+#[test]
+fn test_walk_propagates_break_after_partial_output() -> Result<()> {
+    let (stdout, _stderr, code) =
+        run_jq_full(&["-c", "label $out | walk(1, break $out)"], Some("5"))?;
+    assert_eq!(code, 0, "stdout: {stdout:?}");
+    assert_eq!(stdout, "1\n");
+    Ok(())
+}
+
+#[test]
+fn test_repeat_propagates_error_after_partial_output() -> Result<()> {
+    // Verified against jq 1.7.1: `echo null | jq -c 'limit(3;
+    // repeat((1, error("bad"))))'` prints `1` once then raises, exit 5 --
+    // not looping to `MAX_ITERATIONS` with the error silently dropped every
+    // round (the pre-fix behavior).
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r#"limit(3; repeat((1, error("bad"))))"#],
+        Some("null"),
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "1\n");
+    assert!(stderr.contains("bad"), "stderr: {stderr:?}");
+    Ok(())
+}
+
+#[test]
+fn test_repeat_propagates_break_after_partial_output() -> Result<()> {
+    let (stdout, _stderr, code) = run_jq_full(
+        &["-c", "label $out | limit(3; repeat((1, break $out)))"],
+        Some("null"),
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?}");
+    assert_eq!(stdout, "1\n");
+    Ok(())
+}
+
+#[test]
+fn test_repeat_multi_output_extends_rather_than_collapses() -> Result<()> {
+    // The non-error sibling of the two tests above: `repeat`'s own loop
+    // previously collapsed each round's multi-output `expr` into one array
+    // per round instead of extending its output stream with every value.
+    // Verified against jq 1.7.1: `echo 0 | jq -c '[limit(6; repeat((.+1,
+    // .+100)))]'` is `[1,100,1,100,1,100]`, not
+    // `[[1,100],[1,100],[1,100]]`.
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", "[limit(6; repeat((.+1, .+100)))]"], Some("0"))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[1,100,1,100,1,100]\n");
     Ok(())
 }
 
