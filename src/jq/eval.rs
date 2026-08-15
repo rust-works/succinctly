@@ -10654,18 +10654,52 @@ fn resolve_node<'a, S: EvalSemantics>(
         // fall back to `b` only when none survive. An error while resolving
         // `a` propagates rather than falling back, matching `eval_alternative`:
         // `//` only substitutes for falsy/absent output, never for a raised
-        // error, and the `?` here already gives us that for free.
-        Expr::Alternative(left, right) => {
-            let branches: Vec<PathBranch<'a>> = resolve_node::<S>(left, value, trackable)?
-                .into_iter()
-                .filter(|(_, v)| v.is_truthy())
-                .collect();
-            if branches.is_empty() {
-                resolve_node::<S>(right, value, trackable)
-            } else {
-                Ok(branches)
+        // error.
+        //
+        // #845: a bare `#530` "not path-shaped" complaint from `a` is the one
+        // exception — real jq only requires path-shape for whichever of `a`'s
+        // outputs actually survive the truthy filter, so a `left` that is
+        // *itself* falsy (`false`, `null`, an empty container's field, ...)
+        // must fall through to `b` rather than raise, even though it isn't
+        // path-shaped: confirmed live, `path(false // .b)` on `{"a":10}` is
+        // `["b"]`, while `path(1 // .b)` still raises (`1` is truthy). Only
+        // handled for the narrow shape this resolver can distinguish without
+        // a second, structurally different pass: `a` resolving as a *whole*
+        // to a single non-path-shaped value, with nothing already resolved
+        // ahead of it (`prefix` empty) — re-evaluating `a`'s plain value in
+        // that one case is cheap and side-effect-safe, since there is no
+        // earlier branch whose own evaluation this could double up on. A
+        // `Comma`-fanned `a` that mixes a later falsy/non-path output behind
+        // an earlier successful one (`(.a, false) // .b`, real jq: `["a"]`,
+        // no error at all) is not handled — this resolver's `Comma` arm
+        // already commits to the first sibling's failure eagerly rather than
+        // continuing past it with `//`'s truthy filter threaded through, the
+        // same "resolve everything up front, not lazily per output" gap #820
+        // tracks more generally; filed as #980 rather than solved here.
+        Expr::Alternative(left, right) => match resolve_node::<S>(left, value, trackable) {
+            Ok(branches) => {
+                let branches: Vec<PathBranch<'a>> = branches
+                    .into_iter()
+                    .filter(|(_, v)| v.is_truthy())
+                    .collect();
+                if branches.is_empty() {
+                    resolve_node::<S>(right, value, trackable)
+                } else {
+                    Ok(branches)
+                }
             }
-        }
+            Err((prefix, EvalEscape::Error(e)))
+                if prefix.is_empty() && e.is_invalid_path_expression() =>
+            {
+                match eval_owned_multi::<S>(left, value) {
+                    Ok(values) if values.iter().all(|v| !v.is_truthy()) => {
+                        resolve_node::<S>(right, value, trackable)
+                    }
+                    _ => Err((prefix, EvalEscape::Error(e))),
+                }
+            }
+            Err(escape) => Err(escape),
+        },
 
         // `limit(n; f)`: same `n`-conversion rule as `eval_limit`, so
         // `path(limit(...))` agrees with plain `limit(...)` in this
