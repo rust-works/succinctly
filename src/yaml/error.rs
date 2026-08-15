@@ -145,6 +145,18 @@ pub enum YamlError {
         /// Actual input length in bytes
         len: usize,
     },
+
+    /// A line's indentation falls in the ambiguous gap between an open
+    /// container's own indent and its immediate parent's indent, with no
+    /// unambiguous interpretation for which container it belongs to (#900,
+    /// #901). Real yq rejects the same inputs (`did not find expected key`
+    /// / `did not find expected '-' indicator`) rather than guessing.
+    InconsistentIndentation {
+        /// Byte offset where the misindented line starts
+        offset: usize,
+        /// Line number
+        line: usize,
+    },
 }
 
 impl fmt::Display for YamlError {
@@ -242,6 +254,12 @@ impl fmt::Display for YamlError {
                 write!(
                     f,
                     "input too large: {len} bytes exceeds the u32::MAX-byte (4 GiB) indexing limit"
+                )
+            }
+            Self::InconsistentIndentation { offset, line } => {
+                write!(
+                    f,
+                    "inconsistent indentation at line {line} (offset {offset})"
                 )
             }
         }
@@ -421,6 +439,18 @@ mod tests {
             char: '[',
         };
         assert_eq!(err.to_string(), "flow style '[' not supported at offset 3");
+    }
+
+    #[test]
+    fn test_inconsistent_indentation_display() {
+        let err = YamlError::InconsistentIndentation {
+            offset: 17,
+            line: 2,
+        };
+        assert_eq!(
+            err.to_string(),
+            "inconsistent indentation at line 2 (offset 17)"
+        );
     }
 
     #[test]

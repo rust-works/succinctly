@@ -1782,6 +1782,86 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         }
     }
 
+    /// The #901 sibling of [`Self::compact_mapping_gap_reaches`]: `indent`
+    /// falls strictly between an open mapping's own indent and its
+    /// immediate parent *mapping's* indent (not a `SequenceItem`).
+    ///
+    /// Unlike the `SequenceItem`-under-`Mapping` shape, there is no
+    /// unambiguous "exactly one possible enclosing scope" guarantee here —
+    /// so this reports the gap as an error condition rather than something
+    /// to normalize and tolerate. Bounds are strict (`>`/`<`), not
+    /// inclusive: `indent` matching either the parent's or the child's own
+    /// recorded indent exactly is the ordinary, unambiguous "sibling of
+    /// this level" case and must not be flagged here (verified against real
+    /// yq v4.53.3: both `a:\n    b: 1\nc: 2\n` and `a:\n    b: 1\n    c:
+    /// 2\n` parse cleanly; only a strictly-between indent like `a:\n    b:
+    /// 1\n  c: 2\n` is rejected, `did not find expected key`).
+    fn mapping_under_mapping_gap_reaches(&self, indent: usize) -> bool {
+        let len = self.indent_stack.len();
+        len >= 2
+            && self.type_stack[len - 1] == NodeType::Mapping
+            && self.type_stack[len - 2] == NodeType::Mapping
+            && indent > self.indent_stack[len - 2]
+            && indent < self.indent_stack[len - 1]
+    }
+
+    /// Whether a `-` sequence-item line's `indent` falls in the *lower*
+    /// portion of the gap [`Self::compact_mapping_gap_reaches`] detects
+    /// (#900) -- deliberately **excluding** the upper bound (`indent`
+    /// exactly matching the open compact mapping's own indent), unlike that
+    /// function's inclusive range.
+    ///
+    /// The exact-match indent is genuinely ambiguous rather than a case with
+    /// no valid reading at all: `parse_compact_mapping_entry` leaves the
+    /// mapping's key value deferred specifically when the *next* line is a
+    /// `-` at that exact indent, so the ordinary `need_new_sequence` logic
+    /// below can open the sequence as that key's own value (`- k: &a\n  -
+    /// 1\n` -> `{k: [1]}`, `test_compact_entry_trailing_anchor_targets_its_collection`)
+    /// -- a real, already-correct, already-tested YAML shape ("a block
+    /// sequence may sit at its key's own indent"), not a bug. Whether that
+    /// key is deferred or already resolved is not visible from
+    /// `indent_stack`/`type_stack` alone, so this predicate can't
+    /// distinguish an exact-match orphaned `-` (still a bug, just not fixed
+    /// here) from the legitimate deferred-value case -- excluding the exact
+    /// match entirely is what keeps this fix from firing on the latter.
+    /// Every indent strictly below the mapping's own has no such reading
+    /// (confirmed against the real, deferred-value-priority behavior above):
+    /// `parse_compact_mapping_entry` only takes the "leave deferred" branch
+    /// for an exact indent match, so a lesser indent already resolves the
+    /// key (to `null`) before this is even reached, making it structurally
+    /// identical to the already-resolved-key case #900 reports.
+    fn sequence_item_gap_reaches(&self, indent: usize) -> bool {
+        let len = self.indent_stack.len();
+        len >= 2
+            && self.type_stack[len - 1] == NodeType::Mapping
+            && self.type_stack[len - 2] == NodeType::SequenceItem
+            && indent >= self.indent_stack[len - 2]
+            && indent < self.indent_stack[len - 1]
+    }
+
+    /// Normalize a `-` sequence-item line's `indent` when
+    /// [`Self::sequence_item_gap_reaches`] holds (#900), to the recorded
+    /// indent of the *outer* sequence -- the frame two levels below the
+    /// open compact mapping (`[.., Sequence, SequenceItem, Mapping]`,
+    /// always present: a `SequenceItem` is only ever pushed onto an
+    /// already-open `Sequence`, so indexing `len - 3` here can't panic).
+    ///
+    /// Feeding this normalized value into `close_deeper_indents_for_sequence_item`
+    /// and the `need_new_sequence`/`sequence_frame_reaches` check below closes
+    /// through both the compact mapping and its enclosing item and reuses the
+    /// outer sequence, instead of the plain indent comparison's behavior:
+    /// closing only the mapping, then opening a *second*, untagged sequence
+    /// nested inside the still-open item -- which the JSON serializer treats
+    /// as an extra, ignored child, silently dropping this item (#900). A
+    /// no-op otherwise.
+    fn resolve_sequence_item_gap_indent(&self, indent: usize) -> usize {
+        if self.sequence_item_gap_reaches(indent) {
+            self.indent_stack[self.indent_stack.len() - 3]
+        } else {
+            indent
+        }
+    }
+
     /// Close a sequence that was the value of a previous mapping entry.
     ///
     /// When we're about to add a new entry to a mapping at indent N, and the top
@@ -1826,6 +1906,20 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     }
 
     fn parse_sequence_item_inner(&mut self, indent: usize) -> Result<(), YamlError> {
+        // A `-` landing strictly below an open compact mapping's own indent
+        // (but still within its enclosing sequence item's range) has no
+        // "just add it to the open compact mapping" interpretation the way
+        // a `key: value` continuation does (#885) -- a bare sequence-item
+        // marker can't become a mapping entry. The obvious extension here
+        // instead closes through both the compact mapping and its enclosing
+        // sequence item -- unambiguous, since a `SequenceItem` always has
+        // exactly one enclosing `Sequence` -- and treats this as the next
+        // item of that *outer* sequence, the same "parse the obvious
+        // extension" policy #325/#485/#885 already use elsewhere. See
+        // `sequence_item_gap_reaches` for why the upper bound is excluded
+        // (#900).
+        let indent = self.resolve_sequence_item_gap_indent(indent);
+
         let _item_start = self.pos;
 
         // Mark the `-` position
@@ -2197,6 +2291,19 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     fn parse_mapping_entry(&mut self, indent: usize) -> Result<(), YamlError> {
         let _entry_start = self.pos;
 
+        // A sibling landing strictly between an open mapping's own indent
+        // and its parent mapping's indent has no unambiguous owner (#901) —
+        // real yq rejects it outright, so this must too rather than
+        // silently misattributing it. Checked before the #885 normalization
+        // below since the two shapes are mutually exclusive on the parent
+        // frame's type (SequenceItem vs. Mapping).
+        if self.mapping_under_mapping_gap_reaches(indent) {
+            return Err(YamlError::InconsistentIndentation {
+                offset: self.pos,
+                line: self.current_line(),
+            });
+        }
+
         // Normalize an inconsistently-indented continuation of an open
         // compact mapping to the mapping's own indent, so the
         // close/need-new-mapping decision below adds an entry to it instead
@@ -2543,6 +2650,14 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     /// Parse an explicit key (`? key`).
     /// The key can be any value: scalar, sequence, or mapping.
     fn parse_explicit_key(&mut self, indent: usize) -> Result<(), YamlError> {
+        // Same ambiguous-gap error as parse_mapping_entry (#901).
+        if self.mapping_under_mapping_gap_reaches(indent) {
+            return Err(YamlError::InconsistentIndentation {
+                offset: self.pos,
+                line: self.current_line(),
+            });
+        }
+
         // Same gap-tolerant normalization as parse_mapping_entry (#885):
         // this function has the identical close/need-new-mapping shape.
         let indent = self.resolve_compact_mapping_gap_indent(indent);
@@ -2769,6 +2884,14 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
 
     /// Parse an explicit value (`: value` after explicit key).
     fn parse_explicit_value(&mut self, indent: usize) -> Result<(), YamlError> {
+        // Same ambiguous-gap error as parse_mapping_entry (#901).
+        if self.mapping_under_mapping_gap_reaches(indent) {
+            return Err(YamlError::InconsistentIndentation {
+                offset: self.pos,
+                line: self.current_line(),
+            });
+        }
+
         // Same gap-tolerant normalization as parse_mapping_entry (#885): an
         // inconsistently-indented `:` must not close the pending key's own
         // compact mapping out from under it.
