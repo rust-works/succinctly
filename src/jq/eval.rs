@@ -6754,39 +6754,128 @@ fn build_regex(pattern: &str, flags: Option<&str>) -> Result<JqRegex, EvalError>
     })
 }
 
-/// Evaluate `match`/`test`/`capture`'s shared pattern argument, applying
-/// jq's arity-dependent error wording (#937): the bare 1-arg form says
-/// "<type> not a string or array", but the 2-arg form (even with a
-/// valid/empty/`null` flags value) switches to "<v> is not a string"
-/// instead. `flags_expr` only needs to be checked for *presence* here
-/// (`is_some()`) — its own value has no bearing on which wording applies,
-/// and is evaluated separately by each caller afterward.
+/// Which family a regex builtin belongs to — this determines *both* its
+/// argument-evaluation order (#942) and its bare-form pattern wording
+/// (#937) together, since in jq's real model the two facts aren't
+/// independent: every family that forces flags before pattern also
+/// switches its bare-form wording, and the one family that doesn't
+/// (`sub`) also evaluates in the opposite order. Modeling them as one
+/// enum instead of two separately-passed parameters makes only the two
+/// combinations jq actually has representable, instead of a `(bool,
+/// bool)`-shaped signature whose other two combinations nothing has ever
+/// verified against jq and no caller has ever needed.
+///
+/// Evaluation order confirmed live per family via `debug()`-based probes
+/// (which error *wins* is not enough to tell — both orderings predict
+/// the same winner when only one side raises): `test(debug("x");
+/// error("F"))` never prints "x" (flags forces first, short-circuiting
+/// pattern entirely once flags itself raises), while `sub(debug("x");
+/// "b"; error("F"))` always prints "x" (pattern forces first).
+/// `match`/`capture` pattern with `test`.
+#[derive(Clone, Copy)]
+enum RegexArgFamily {
+    /// `test`/`match`/`capture`: forces flags before pattern; bare-form
+    /// (`flags_expr: None`) pattern error uses `not_string_or_array`,
+    /// switching to `is_not_a_string` once a flags argument is present
+    /// (#937), regardless of what the flags expression evaluates to.
+    TestMatchCapture,
+    /// `sub`: forces pattern before flags (the reverse — and unchanged
+    /// from what this codebase already did before #942, since only the
+    /// deferred type-check was the bug there); pattern error always uses
+    /// `is_not_a_string`, regardless of arity (confirmed live:
+    /// `sub(1;"b")` and `sub(1;"b";"")` are identical wording, unlike
+    /// `test`/`match`/`capture`).
+    Sub,
+}
+
+/// Evaluate a regex builtin's pattern and (optional) flags arguments in
+/// jq's real order (#942): one argument is forced first per `family`
+/// above, propagating a genuine `error()` immediately and short-
+/// circuiting the other argument entirely (it is never evaluated, so a
+/// side-effecting expression there never runs) — only once *both* values
+/// exist without raising does either get type-checked, pattern first
+/// (so its error wins when both are merely the wrong type, matching
+/// #928), flags second. The evaluation order and the type-check order
+/// are independent: `test`/`match`/`capture` evaluate flags first but
+/// still *report* pattern's type error first; `sub` evaluates and
+/// reports in the same (pattern-first) order.
 ///
 /// Shared by `builtin_match`/`builtin_test_with_flags`/
-/// `builtin_capture_with_flags` instead of duplicated per function
-/// (following the same-file precedent `sub_with_resolved_pattern` and
-/// `next_match_step` already set for this exact "one predicate, several
-/// builtins" shape — see #106's "duplicated predicates diverge silently").
+/// `builtin_capture_with_flags`/`builtin_sub_with_flags` instead of
+/// duplicated per function (following the same-file precedent
+/// `sub_with_resolved_pattern`/`next_match_step` already set for this
+/// exact "one predicate, several builtins" shape — see #106's
+/// "duplicated predicates diverge silently"). `gsub`/`scan`/`split`/
+/// `splits` do *not* go through here — they have their own, still-open
+/// version of this same evaluate-before-type-check problem (#938), which
+/// needs a different restructuring (their flags value is a synthesized
+/// `flags + "g"`/`"g" + flags` string with its own `+`-operator type
+/// error, not `is_not_a_string`/`not_string_or_array`) rather than an
+/// extension of this function.
 ///
 /// No `Ok(_) if optional` guard: `optional` is never forced `true`
 /// reaching a nested `Call` like this one (see `Expr::Optional`'s
 /// dispatch in `eval_single`, #693) — a bare `?` suppresses this error via
 /// the ancestor `eval_try`'s catch, not locally.
 #[cfg(feature = "regex")]
-fn eval_regex_pattern_arg<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+fn eval_regex_pattern_and_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     re_expr: &Expr,
     flags_expr: Option<&Expr>,
+    family: RegexArgFamily,
     value: StandardJson<'a, W>,
     optional: bool,
-) -> Result<String, QueryResult<'a, W>> {
-    match result_to_owned(eval_single::<W, S>(re_expr, value, optional)) {
-        Ok(OwnedValue::String(s)) => Ok(s),
-        Ok(v) if flags_expr.is_some() => Err(QueryResult::Error(EvalError::is_not_a_string(&v))),
-        Ok(v) => Err(QueryResult::Error(EvalError::not_string_or_array(
-            v.type_name(),
-        ))),
-        Err(e) => Err(e.into()),
-    }
+) -> Result<(String, Option<String>), QueryResult<'a, W>> {
+    // Only clones `value` when there are two arguments actually left to
+    // evaluate — the bare (`flags_expr: None`) form does zero internal
+    // clones here (beyond whatever the caller already did to obtain this
+    // `value`), matching what a single pattern-only evaluation cost
+    // before this function existed.
+    let (raw_pattern, raw_flags) = match family {
+        RegexArgFamily::TestMatchCapture => {
+            let raw_flags = match flags_expr {
+                None => None,
+                Some(fe) => Some(result_to_owned(eval_single::<W, S>(
+                    fe,
+                    value.clone(),
+                    optional,
+                ))?),
+            };
+            let raw_pattern = result_to_owned(eval_single::<W, S>(re_expr, value, optional))?;
+            (raw_pattern, raw_flags)
+        }
+        RegexArgFamily::Sub => {
+            if let Some(fe) = flags_expr {
+                let raw_pattern =
+                    result_to_owned(eval_single::<W, S>(re_expr, value.clone(), optional))?;
+                let raw_flags = Some(result_to_owned(eval_single::<W, S>(fe, value, optional))?);
+                (raw_pattern, raw_flags)
+            } else {
+                let raw_pattern = result_to_owned(eval_single::<W, S>(re_expr, value, optional))?;
+                (raw_pattern, None)
+            }
+        }
+    };
+
+    let pattern = match raw_pattern {
+        OwnedValue::String(s) => s,
+        v if flags_expr.is_some() || matches!(family, RegexArgFamily::Sub) => {
+            return Err(QueryResult::Error(EvalError::is_not_a_string(&v)));
+        }
+        v => {
+            return Err(QueryResult::Error(EvalError::not_string_or_array(
+                v.type_name(),
+            )));
+        }
+    };
+
+    let flags = match raw_flags {
+        None => None,
+        Some(OwnedValue::String(s)) => Some(s),
+        Some(OwnedValue::Null) => Some(String::new()),
+        Some(v) => return Err(QueryResult::Error(EvalError::is_not_a_string(&v))),
+    };
+
+    Ok((pattern, flags))
 }
 
 /// Builtin: test(re) - test if string matches the regex
@@ -6813,8 +6902,9 @@ fn builtin_test_regex<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
 /// Builtin: match(re) or match(re; flags) - return match object
 ///
-/// Evaluates `re_expr` before `flags_expr` — see `builtin_test_with_flags`'s
-/// doc comment for why this order matters (#928).
+/// See `eval_regex_pattern_and_flags`'s doc comment for the evaluation
+/// order (flags forced first, #942) and pattern-first type-check order
+/// (#928) this delegates to.
 #[cfg(feature = "regex")]
 fn builtin_match<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     re_expr: &Expr,
@@ -6822,28 +6912,18 @@ fn builtin_match<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    // See `eval_regex_pattern_arg`'s doc comment for the arity-dependent
-    // wording rationale (#937) and why there's no `Ok(_) if optional` arm.
-    let pattern = match eval_regex_pattern_arg::<W, S>(re_expr, flags_expr, value.clone(), optional)
-    {
-        Ok(s) => s,
+    // See `eval_regex_pattern_and_flags`'s doc comment for the evaluation-
+    // order (#942) and arity-dependent wording (#937) rationale, and why
+    // there's no `Ok(_) if optional` arm.
+    let (pattern, flags) = match eval_regex_pattern_and_flags::<W, S>(
+        re_expr,
+        flags_expr,
+        RegexArgFamily::TestMatchCapture,
+        value.clone(),
+        optional,
+    ) {
+        Ok(pf) => pf,
         Err(qr) => return qr,
-    };
-
-    // Get the flags, now that the pattern is known valid. No `Ok(_) if
-    // optional` guard here: `optional` is only ever forced `true` for the
-    // *final* step of `.[EXPR]?`/`.[S:E]?` (see `Expr::Optional`'s dispatch
-    // in `eval_single`, #693) — a nested `Call` like this one never sees it,
-    // so a bare `?` suppresses this error via the ancestor `eval_try`'s
-    // catch, not locally. Confirmed dead: 0 coverage hits pre- and post-#928.
-    let flags = match flags_expr {
-        None => None,
-        Some(fe) => match result_to_owned(eval_single::<W, S>(fe, value.clone(), optional)) {
-            Ok(OwnedValue::String(s)) => Some(s),
-            Ok(OwnedValue::Null) => Some(String::new()),
-            Ok(v) => return QueryResult::Error(EvalError::is_not_a_string(&v)),
-            Err(e) => return e.into(),
-        },
     };
     let flags = flags.as_deref();
 
@@ -7372,14 +7452,12 @@ fn builtin_test_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
 /// Builtin: test(re) or test(re; flags) - test if string matches the regex
 ///
-/// Evaluates `re_expr` before `flags_expr` — jq validates the pattern
-/// argument first, so when both are invalid it's the pattern's error that
-/// surfaces (confirmed live: `test(1;2)` -> `"number (1) is not a string"`,
-/// naming the pattern, not the flags). A pre-#928 version of this evaluated
-/// flags first, which — now that the flags-argument error uses real jq
-/// wording instead of a placeholder — would have silently blamed the wrong
-/// operand, or skipped a side-effecting pattern expression's `error()`
-/// entirely (`sub(error("P");"b";2)` must raise `"P"`, not the flags error).
+/// See `eval_regex_pattern_and_flags`'s doc comment: jq forces the flags
+/// argument first (#942, confirmed live via `debug()` side-effect probes
+/// — a flags-side `error()` wins even over a pattern-side one), but still
+/// *reports* pattern's type error first when neither side raises
+/// (confirmed live: `test(1;2)` -> `"number (1) is not a string"`, naming
+/// the pattern, not the flags — #928).
 #[cfg(feature = "regex")]
 fn builtin_test_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     re_expr: &Expr,
@@ -7387,28 +7465,18 @@ fn builtin_test_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    // See `eval_regex_pattern_arg`'s doc comment for the arity-dependent
-    // wording rationale (#937) and why there's no `Ok(_) if optional` arm.
-    let pattern = match eval_regex_pattern_arg::<W, S>(re_expr, flags_expr, value.clone(), optional)
-    {
-        Ok(s) => s,
+    // See `eval_regex_pattern_and_flags`'s doc comment for the evaluation-
+    // order (#942) and arity-dependent wording (#937) rationale, and why
+    // there's no `Ok(_) if optional` arm.
+    let (pattern, flags) = match eval_regex_pattern_and_flags::<W, S>(
+        re_expr,
+        flags_expr,
+        RegexArgFamily::TestMatchCapture,
+        value.clone(),
+        optional,
+    ) {
+        Ok(pf) => pf,
         Err(qr) => return qr,
-    };
-
-    // Get the flags, now that the pattern is known valid. No `Ok(_) if
-    // optional` guard here: `optional` is only ever forced `true` for the
-    // *final* step of `.[EXPR]?`/`.[S:E]?` (see `Expr::Optional`'s dispatch
-    // in `eval_single`, #693) — a nested `Call` like this one never sees it,
-    // so a bare `?` suppresses this error via the ancestor `eval_try`'s
-    // catch, not locally. Confirmed dead: 0 coverage hits pre- and post-#928.
-    let flags = match flags_expr {
-        None => None,
-        Some(fe) => match result_to_owned(eval_single::<W, S>(fe, value.clone(), optional)) {
-            Ok(OwnedValue::String(s)) => Some(s),
-            Ok(OwnedValue::Null) => Some(String::new()),
-            Ok(v) => return QueryResult::Error(EvalError::is_not_a_string(&v)),
-            Err(e) => return e.into(),
-        },
     };
     let flags = flags.as_deref();
 
@@ -7458,8 +7526,9 @@ fn builtin_capture_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
 /// Builtin: capture(re) or capture(re; flags) - capture named groups
 ///
-/// Evaluates `re_expr` before `flags_expr` — see `builtin_test_with_flags`'s
-/// doc comment for why this order matters (#928).
+/// See `eval_regex_pattern_and_flags`'s doc comment for the evaluation
+/// order (flags forced first, #942) and pattern-first type-check order
+/// (#928) this delegates to.
 #[cfg(feature = "regex")]
 fn builtin_capture_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     re_expr: &Expr,
@@ -7467,28 +7536,18 @@ fn builtin_capture_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    // See `eval_regex_pattern_arg`'s doc comment for the arity-dependent
-    // wording rationale (#937) and why there's no `Ok(_) if optional` arm.
-    let pattern = match eval_regex_pattern_arg::<W, S>(re_expr, flags_expr, value.clone(), optional)
-    {
-        Ok(s) => s,
+    // See `eval_regex_pattern_and_flags`'s doc comment for the evaluation-
+    // order (#942) and arity-dependent wording (#937) rationale, and why
+    // there's no `Ok(_) if optional` arm.
+    let (pattern, flags) = match eval_regex_pattern_and_flags::<W, S>(
+        re_expr,
+        flags_expr,
+        RegexArgFamily::TestMatchCapture,
+        value.clone(),
+        optional,
+    ) {
+        Ok(pf) => pf,
         Err(qr) => return qr,
-    };
-
-    // Get the flags, now that the pattern is known valid. No `Ok(_) if
-    // optional` guard here: `optional` is only ever forced `true` for the
-    // *final* step of `.[EXPR]?`/`.[S:E]?` (see `Expr::Optional`'s dispatch
-    // in `eval_single`, #693) — a nested `Call` like this one never sees it,
-    // so a bare `?` suppresses this error via the ancestor `eval_try`'s
-    // catch, not locally. Confirmed dead: 0 coverage hits pre- and post-#928.
-    let flags = match flags_expr {
-        None => None,
-        Some(fe) => match result_to_owned(eval_single::<W, S>(fe, value.clone(), optional)) {
-            Ok(OwnedValue::String(s)) => Some(s),
-            Ok(OwnedValue::Null) => Some(String::new()),
-            Ok(v) => return QueryResult::Error(EvalError::is_not_a_string(&v)),
-            Err(e) => return e.into(),
-        },
     };
     let flags = flags.as_deref();
 
@@ -7559,8 +7618,12 @@ fn builtin_sub_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
 /// Builtin: sub(re; replacement) or sub(re; replacement; flags) - replace first match
 ///
-/// Evaluates `re_expr` before `flags_expr` — see `builtin_test_with_flags`'s
-/// doc comment for why this order matters (#928).
+/// Evaluates `re_expr` before `flags_expr` (confirmed live via `debug()`
+/// side-effect probes, #942 — `sub` forces pattern first, unlike
+/// `test`/`match`/`capture`, which force flags first). Both are forced
+/// for their side effects before either is type-checked, so a flags-side
+/// `error()` still wins over an ordinary pattern-side type mismatch —
+/// see `eval_regex_pattern_and_flags`'s doc comment.
 #[cfg(feature = "regex")]
 fn builtin_sub_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     re_expr: &Expr,
@@ -7569,29 +7632,15 @@ fn builtin_sub_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    // Get the pattern. No `Ok(_) if optional` guard: same reasoning as the
-    // flags-eval block below — `optional` is never forced `true` reaching a
-    // nested `Call` like this one (see `Expr::Optional`'s dispatch, #693).
-    let pattern = match result_to_owned(eval_single::<W, S>(re_expr, value.clone(), optional)) {
-        Ok(OwnedValue::String(s)) => s,
-        Ok(v) => return QueryResult::Error(EvalError::is_not_a_string(&v)),
-        Err(e) => return e.into(),
-    };
-
-    // Get the flags, now that the pattern is known valid. No `Ok(_) if
-    // optional` guard here: `optional` is only ever forced `true` for the
-    // *final* step of `.[EXPR]?`/`.[S:E]?` (see `Expr::Optional`'s dispatch
-    // in `eval_single`, #693) — a nested `Call` like this one never sees it,
-    // so a bare `?` suppresses this error via the ancestor `eval_try`'s
-    // catch, not locally. Confirmed dead: 0 coverage hits pre- and post-#928.
-    let flags = match flags_expr {
-        None => None,
-        Some(fe) => match result_to_owned(eval_single::<W, S>(fe, value.clone(), optional)) {
-            Ok(OwnedValue::String(s)) => Some(s),
-            Ok(OwnedValue::Null) => Some(String::new()),
-            Ok(v) => return QueryResult::Error(EvalError::is_not_a_string(&v)),
-            Err(e) => return e.into(),
-        },
+    let (pattern, flags) = match eval_regex_pattern_and_flags::<W, S>(
+        re_expr,
+        flags_expr,
+        RegexArgFamily::Sub,
+        value.clone(),
+        optional,
+    ) {
+        Ok(pf) => pf,
+        Err(qr) => return qr,
     };
 
     sub_with_resolved_pattern::<W, S>(
@@ -7728,6 +7777,13 @@ fn builtin_gsub_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// jq's own flags-before-pattern order for gsub (confirmed live:
 /// `gsub(1;"b";2)` blames the flags, not the pattern) already matches what
 /// evaluating flags in the caller and pattern here produces.
+///
+/// That's only true for an ordinary type mismatch, though — a genuinely
+/// side-effecting *pattern* expression (`gsub(error("P");"b";error("F"))`)
+/// still loses to the flags side here, where real jq's pattern-side
+/// `error()` wins (confirmed live). Tracked separately as #938, since the
+/// fix needs a different restructuring than #942's (this function's own
+/// flags-before-pattern order is otherwise correct and shouldn't change).
 #[cfg(feature = "regex")]
 fn builtin_gsub_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     re_expr: &Expr,
@@ -28231,49 +28287,49 @@ mod tests {
         }
 
         // The both-arguments-invalid case (`test(1; 2)` etc.) is already
-        // covered by `test_regex_test_match_capture_sub_evaluate_pattern_
-        // before_flags_928`, which asserts the same flagged-form wording
-        // this test pins above — not repeated here.
+        // covered by `test_regex_pattern_vs_flags_error_precedence_928_942`,
+        // which asserts the same flagged-form wording this test pins
+        // above — not repeated here.
     }
 
     #[cfg(feature = "regex")]
     #[test]
-    fn test_regex_test_match_capture_sub_evaluate_pattern_before_flags_928() {
-        // #928 (review follow-up): test/match/capture/sub must evaluate the
-        // *pattern* argument before the *flags* argument, matching jq. A
-        // pre-fix version evaluated flags first, which — once the flags
-        // error stopped being an obviously-bogus placeholder and started
-        // looking like real jq wording (see #926) — silently blamed the
-        // wrong operand when both arguments were invalid, and skipped a
-        // side-effecting pattern expression's error() entirely. gsub/
-        // scan/split/splits are deliberately excluded: jq's own internal
-        // order for those already evaluates flags first (confirmed live),
-        // so no reordering was needed or made there.
+    fn test_regex_pattern_vs_flags_error_precedence_928_942() {
+        // #928/#942: when both the pattern and flags arguments are
+        // invalid, which one's error surfaces depends on *what kind* of
+        // invalid each is, not a single fixed "pattern always wins" rule.
         //
-        // Every case below is verified live against jq 1.7.1 *except* the
-        // last one: `test(error(P); error(F))`'s asserted "PATTERN_ERR"
-        // pins succinctly's actual (current) behavior, not jq's — real jq
-        // returns "FLAGS_ERR" there, because it forces the *flags*
-        // argument before the pattern argument (propagating whichever
-        // errors first), and only afterward runs the pattern-preferred
-        // type-check this fix implements. All four builtins here
-        // (including `sub` — `sub(1; "b"; error("F"))` is "F" in jq, not
-        // this file's "number (1) is not a string") share that same
-        // deeper divergence; it just isn't exercised by the specific `sub`
-        // case below, where the pattern's own error() happens to still
-        // win because the flags value (2) doesn't raise. That's a real
-        // evaluation-order bug, not a wording gap — filed as #942, since
-        // fixing it means restructuring these builtins to evaluate both
-        // arguments before either can early-return, not just relabeling a
-        // message.
-        // test/match/capture's pattern-check switches to the "<v> is not a
-        // string" wording once a flags argument is present in the call
-        // (#937, a separate, pre-existing wording gap unrelated to
-        // evaluation order) — so on the 2-arg form used here, the pattern's
-        // error message is byte-identical in shape to what the flags-
-        // argument "is not a string" sentence #928 added. What distinguishes
-        // "pattern won" from "flags won" here is the *value* previewed: `1`
-        // (the pattern), not `2` (the flags).
+        // For ordinary type mismatches (no `error()` call, just a wrong-
+        // typed value), pattern's error always wins once both values are
+        // known — confirmed live: `test(1;2)` -> "number (1) is not a
+        // string", naming the pattern (1), not the flags (2); same for
+        // match/capture/sub.
+        //
+        // But which argument is forced *first* — and so whose `error()`
+        // call, if any, actually runs and propagates — differs by family
+        // (confirmed live via `debug()` side-effect probes, since the
+        // error-wins outcome alone can't distinguish the two orderings
+        // when only one side raises):
+        // - test/match/capture force FLAGS first: `test(debug("x");
+        //   error("F"))` never prints "x" (pattern never evaluated once
+        //   flags raises); `test(error("P"); debug("x"))` does print "x"
+        //   before "P" (flags' side effect runs, then pattern's error
+        //   propagates).
+        // - sub forces PATTERN first (the reverse): `sub(debug("x"); "b";
+        //   error("F"))` prints "x" before "F"; `sub(error("P"); "b";
+        //   debug("x"))` never prints "x".
+        // - gsub/scan/split/splits are excluded here: their own internal
+        //   evaluation order already matches jq for the ordinary type-
+        //   mismatch case #928/#942 cover. They still have their own,
+        //   narrower open divergence for a genuinely side-effecting
+        //   *pattern* expression losing to the flags side (tracked as
+        //   #938, needs a different restructuring, not fixed here).
+        //
+        // Net effect: a flags-side `error()` always wins over a pattern-
+        // side *type mismatch* (not itself an `error()` call) for all four
+        // builtins here, since the type-check phase only runs after both
+        // arguments have already been forced without raising — see
+        // `eval_regex_pattern_and_flags`'s doc comment for the full model.
         for filter in ["test(1; 2)", "match(1; 2)", "capture(1; 2)"] {
             query!(br#""abc""#, filter,
                 QueryResult::Error(e) => {
@@ -28284,10 +28340,6 @@ mod tests {
                 }
             );
         }
-
-        // sub's pattern-check already carries a value preview (#926), so
-        // this one *does* confirm the pattern's own value (1) wins over the
-        // flags' value (2).
         query!(br#""abc""#, r#"sub(1; "b"; 2)"#,
             QueryResult::Error(e) => {
                 assert_eq!(e.message, "number (1) is not a string");
@@ -28295,16 +28347,32 @@ mod tests {
         );
 
         // A side-effecting pattern expression's error() must propagate,
-        // not get silently skipped in favor of the flags check.
+        // not get silently skipped in favor of the flags check — true for
+        // all four regardless of which argument is forced first, since
+        // the *other* argument's own type is never even inspected once
+        // either one has genuinely raised.
         query!(br#""abc""#, r#"sub(error("PATTERN_ERR"); "b"; 2)"#,
             QueryResult::Error(e) => {
                 assert_eq!(e.message, "PATTERN_ERR");
             }
         );
-        // Pins current (jq-diverging) behavior, not jq parity — see the
-        // #942 discussion in this test's doc comment above. Real jq
-        // returns "FLAGS_ERR" here.
-        query!(br#""abc""#, r#"test(error("PATTERN_ERR"); error("FLAGS_ERR"))"#,
+        query!(br#""abc""#, r#"test(1; error("FLAGS_ERR"))"#,
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "FLAGS_ERR");
+            }
+        );
+
+        // Both sides raise: whichever argument is forced first wins,
+        // regardless of message content — flags for test/match/capture,
+        // pattern for sub.
+        for filter in ["test", "match", "capture"] {
+            query!(br#""abc""#, &format!(r#"{filter}(error("PATTERN_ERR"); error("FLAGS_ERR"))"#),
+                QueryResult::Error(e) => {
+                    assert_eq!(e.message, "FLAGS_ERR", "filter: {filter}");
+                }
+            );
+        }
+        query!(br#""abc""#, r#"sub(error("PATTERN_ERR"); "b"; error("FLAGS_ERR"))"#,
             QueryResult::Error(e) => {
                 assert_eq!(e.message, "PATTERN_ERR");
             }
