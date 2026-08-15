@@ -10128,7 +10128,11 @@ fn eval_owned_multi_first<S: EvalSemantics>(
 /// same child), and `resolve_leaf`'s non-primitive fallback, also path
 /// position (#861 — the same all-or-nothing pitfall reaching
 /// `path(...)`-wrapped expressions whose argument isn't one of the
-/// specially-tracked navigation primitives). `resolve_recurse`'s own
+/// specially-tracked navigation primitives). Also `resolve_node`'s own
+/// `Select`/`If` arms (their `cond`), its `GetPath` arm (its `arg`), and
+/// `resolve_index_expr` (its `key`) — the same argument-can-itself-be-a-
+/// generator shape #842/#854 fixed for `recurse`, independently live at
+/// these 4 unrelated call sites too (#896). `resolve_recurse`'s own
 /// `f`-evaluation step is the one exception: it resolves `f` through
 /// `resolve_node`/`resolve_against_cow` instead — a structurally different
 /// call whose `PathResolveResult` already threads a prefix through its own
@@ -10240,6 +10244,24 @@ type PathBranch<'a> = (Vec<Expr>, Cow<'a, OwnedValue>);
 /// treats this exactly like a plain `Err`, matching jq's atomic write-side
 /// semantics (confirmed live: `(.a, 1) = 5` produces no output at all).
 type PathResolveResult<'a> = Result<Vec<PathBranch<'a>>, (Vec<PathBranch<'a>>, EvalEscape)>;
+
+/// Combine an already-resolved branch prefix with an optional trailing
+/// escape into this resolver's `PathResolveResult` shape.
+///
+/// Every "keep-partial" call site below ends by matching a
+/// `(prefix, Option<EvalEscape>)` pair the exact same way — `Some(e) =>
+/// Err((prefix, e)), None => Ok(prefix)` — hand-written independently at
+/// each one. Collapsing that into a single call removes the chance of a
+/// stray unmatched arm or an escape variable going unread at a *new* call
+/// site by omission, the way two of #896's own review-round bugs did
+/// (#962).
+#[inline]
+fn path_result(branches: Vec<PathBranch<'_>>, escape: Option<EvalEscape>) -> PathResolveResult<'_> {
+    match escape {
+        Some(e) => Err((branches, e)),
+        None => Ok(branches),
+    }
+}
 
 /// Resolve one path node against one value, yielding a branch per output.
 ///
@@ -10541,10 +10563,7 @@ fn resolve_node<'a, S: EvalSemantics>(
                 .filter(OwnedValue::is_truthy)
                 .map(|_| (Vec::new(), Cow::Borrowed(value)))
                 .collect();
-            match escape {
-                Some(e) => Err((branches, e)),
-                None => Ok(branches),
-            }
+            path_result(branches, escape)
         }
         Expr::Builtin(
             builtin @ (Builtin::Values
@@ -10615,10 +10634,7 @@ fn resolve_node<'a, S: EvalSemantics>(
                     }
                 }
             }
-            match escape {
-                Some(e) => Err((out, e)),
-                None => Ok(out),
-            }
+            path_result(out, escape)
         }
 
         // `a // b`: resolve `a`, keep only its truthy branches — jq's `//`
@@ -10825,10 +10841,7 @@ fn resolve_node<'a, S: EvalSemantics>(
                     components.push(component);
                 }
                 let branch = (components, current);
-                return match escape {
-                    Some(e) => Err((vec![branch], e)),
-                    None => Ok(vec![branch]),
-                };
+                return path_result(vec![branch], escape);
             }
             if let Some(e) = escape {
                 return Err((Vec::new(), e));
@@ -11011,13 +11024,6 @@ fn resolve_leaf<'a, S: EvalSemantics>(
     if let Some(EvalEscape::Halt(code)) = &trailing {
         return Err((Vec::new(), EvalEscape::Halt(*code)));
     }
-    // No output prunes the branch — unless there never would have been one
-    // because evaluating `expr` itself broke/errored (Halt excluded, handled
-    // above) before producing anything.
-    let empty_case = |trailing: Option<EvalEscape>| match trailing {
-        Some(escape) => Err((Vec::new(), escape)),
-        None => Ok(Vec::new()),
-    };
     if trackable
         && matches!(
             expr,
@@ -11027,7 +11033,10 @@ fn resolve_leaf<'a, S: EvalSemantics>(
         let mut components = Vec::new();
         push_path_components(&mut components, expr);
         return match values.len() {
-            0 => empty_case(trailing),
+            // No output prunes the branch — unless there never would have
+            // been one because evaluating `expr` itself broke/errored (Halt
+            // excluded, handled above) before producing anything.
+            0 => path_result(Vec::new(), trailing),
             1 => Ok(vec![(
                 components,
                 Cow::Owned(values.pop().expect("len checked")),
@@ -11045,7 +11054,7 @@ fn resolve_leaf<'a, S: EvalSemantics>(
         };
     }
     match values.len() {
-        0 => empty_case(trailing),
+        0 => path_result(Vec::new(), trailing),
         // Real jq's `path(...)` checks each output as it streams: the first
         // non-path-shaped value raises "Invalid path expression" immediately,
         // before a later output of the same expression is ever produced —
@@ -11525,10 +11534,7 @@ fn resolve_recurse<'a, S: EvalSemantics>(
     // whose presence would otherwise depend on where the arbitrary cap
     // happened to land relative to it (#842 review).
     if stack.is_empty() {
-        match pending_error {
-            Some(e) => Err((outputs, e)),
-            None => Ok(outputs),
-        }
+        path_result(outputs, pending_error)
     } else {
         Ok(outputs)
     }
@@ -11614,10 +11620,7 @@ fn resolve_index_expr<'a, S: EvalSemantics>(
     // prefix, same as every other bare-escape site in this file.
     let (keys, key_escape) = eval_owned_multi_keep_partial::<S>(key, value);
     if keys.is_empty() {
-        return match key_escape {
-            Some(e) => Err((Vec::new(), e)),
-            None => Ok(Vec::new()),
-        };
+        return path_result(Vec::new(), key_escape);
     }
     // #843: `target` is a no-op read of the untracked value itself, so the
     // key computed above is the first real navigation attempted against it
@@ -11726,10 +11729,7 @@ fn resolve_index_expr<'a, S: EvalSemantics>(
     // `target_escape` first: see the comment on `target_branches`'s own
     // computation above for why jq's evaluation order surfaces it ahead of
     // `key_escape`.
-    match target_escape.or(key_escape) {
-        Some(e) => Err((out, e)),
-        None => Ok(out),
-    }
+    path_result(out, target_escape.or(key_escape))
 }
 
 /// Resolve `E[S:T]` in path context, with or without a trailing `?`.
