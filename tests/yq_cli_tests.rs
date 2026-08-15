@@ -7219,6 +7219,91 @@ fn test_navigation_queries_keep_whole_float_decimal_point_yaml() -> Result<()> {
     Ok(())
 }
 
+// =============================================================================
+// Computed-float scientific notation — #997
+// =============================================================================
+
+/// A *computed* (non-literal-preserved) float must switch to scientific
+/// notation past yq's magnitude threshold, matching real yq rather than
+/// expanding to a 100+ digit decimal. Threshold and spelling (lowercase `e`,
+/// explicit sign, exponent padded to at least 2 digits) measured against
+/// `yq` v4.53.3 with `yq -o json` (issue's own repro: `.a * 1e100`).
+///
+/// This is `.a * 1e100`, not identity — identity/navigation on YAML input
+/// keeps `NumberLiteral`'s own source-spelling preservation regardless of
+/// magnitude (see `test_whole_floats_keep_their_decimal_point`'s huge-decimal
+/// case) and must never be affected by this fix.
+#[test]
+fn test_computed_float_uses_scientific_notation_past_yq_threshold_997() -> Result<()> {
+    for (filter, want) in [
+        (".a * 1e100", "1e+100"),
+        (".a / 1e100", "1e-100"),
+        (".a * -1e100", "-1e+100"),
+    ] {
+        for extra_args in [&["-o=json"][..], &["-o=json", "-I=0"][..]] {
+            let (out, code) = run_yq_stdin(filter, "a: 1\n", extra_args)?;
+            assert_eq!(code, 0, "exit code for {filter:?} {extra_args:?}");
+            assert_eq!(out.trim(), want, "for {filter:?} {extra_args:?}");
+        }
+    }
+    Ok(())
+}
+
+/// The exact exponent thresholds (`>= 6` decimal digits before the point,
+/// `<= -5` after) on both sides of zero, oracle-verified against real yq.
+/// `.a` starts non-whole (`1.5`) so the result can never collapse to `Int`
+/// (which never uses scientific notation, an orthogonal, already-correct
+/// path) and stays `Float` all the way to the threshold check.
+#[test]
+fn test_computed_float_scientific_notation_thresholds_997() -> Result<()> {
+    for (filter, want) in [
+        // Positive exponent: 1e5 stays decimal, 1e6 switches.
+        (".a * 100000", "150000.0"),
+        (".a * 1000000", "1.5e+06"),
+        (".a * 10000000", "1.5e+07"),
+        // Negative exponent: 1e-4 stays decimal, 1e-5 switches.
+        (".a / 10000", "0.00015"),
+        (".a / 100000", "1.5e-05"),
+    ] {
+        let (out, code) = run_yq_stdin(filter, "a: 1.5\n", &["-o=json", "-I=0"])?;
+        assert_eq!(code, 0, "exit code for {filter:?}");
+        assert_eq!(out.trim(), want, "for {filter:?}");
+    }
+    Ok(())
+}
+
+/// The same threshold applies to YAML (non-JSON) output, which routes
+/// through `emit_yaml_value` rather than `format_json_impl` but must render
+/// a computed float identically.
+#[test]
+fn test_computed_float_scientific_notation_yaml_output_997() -> Result<()> {
+    let (out, code) = run_yq_stdin(r#"{"a": (.a * 1e100)}"#, "a: 1\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "a: 1e+100");
+    Ok(())
+}
+
+/// `succinctly jq` (JSON mode) must be completely unaffected: the fix is
+/// gated on `ControlEscape::Yq`, and jq mode's own analogous formatter gap
+/// (different threshold, out of scope for #997) keeps its pre-existing
+/// behavior either way -- a small in-range float still round-trips exactly.
+#[test]
+fn test_jq_mode_computed_float_formatting_unaffected_by_997() -> Result<()> {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .args(["jq", "-c", ".a * 1"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    if let Some(mut stdin) = cmd.stdin.take() {
+        stdin.write_all(br#"{"a": 1.5}"#)?;
+    }
+    let output = cmd.wait_with_output()?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(String::from_utf8(output.stdout)?.trim(), "1.5");
+    Ok(())
+}
+
 #[test]
 fn test_dash_not_followed_by_space_is_still_a_scalar() -> Result<()> {
     // Guard against over-matching: negative numbers and `-`-prefixed plain

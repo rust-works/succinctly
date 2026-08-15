@@ -19,15 +19,14 @@ use succinctly::jq::{
 };
 use succinctly::json::JsonIndex;
 use succinctly::yaml::{
-    format_float_with_fraction, resolve_plain, resolve_tagged, stream_yaml_sequence, YamlCursor,
-    YamlIndex, YamlValue,
+    resolve_plain, resolve_tagged, stream_yaml_sequence, YamlCursor, YamlIndex, YamlValue,
 };
 
 use super::{FrontMatterMode, InputFormat, OutputFormat, YqCommand};
 use crate::front_matter;
 use crate::output::{
-    self, exit_codes, ColorScheme, ControlEscape, DiagStyle, ErrorSink, FloatStyle, InputLocation,
-    JsonFormatOpts,
+    self, exit_codes, format_float_yq, ColorScheme, ControlEscape, DiagStyle, ErrorSink,
+    FloatStyle, InputLocation, JsonFormatOpts,
 };
 
 /// yq's diagnostics carry no `(at <file>:<line>)` marker, so the yq paths have
@@ -1462,7 +1461,7 @@ fn emit_yaml_value(
                     "-.inf".to_string()
                 }
             } else {
-                format_float_with_fraction(*f)
+                format_float_yq(*f)
             }
         }
         OwnedValue::NumberLiteral(..) => {
