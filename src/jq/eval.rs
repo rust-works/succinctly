@@ -27985,6 +27985,62 @@ mod tests {
 
     #[cfg(feature = "regex")]
     #[test]
+    fn test_regex_non_string_flags_wording_matches_jq_per_family_928() {
+        // #928: the *flags* argument (not the pattern) splits into the same
+        // two families as #926's pattern-argument fix, plus a third
+        // wording scan/gsub/split/splits share: jq builds their internal
+        // global-flag string via concatenation (flags + "g" or "g" +
+        // flags) *before* type-checking, so a non-string flags value hits
+        // jq's own `+` operator error instead of a string-type error.
+        // Every case verified live against jq 1.7.1.
+
+        // test/match/capture/sub: same "is not a string" wording as the
+        // pattern argument.
+        for filter in [r#"test("a"; 1)"#, r#"sub("a"; "b"; 1)"#] {
+            query!(br#""x""#, filter,
+                QueryResult::Error(e) => {
+                    assert_eq!(e.message, "number (1) is not a string", "filter: {filter}");
+                }
+            );
+        }
+
+        // gsub: flags + "g" (append) — flags value on the left, matching
+        // #730's append-vs-prepend split for valid flags strings.
+        query!(br#""x""#, r#"gsub("a"; "b"; 1)"#,
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "number (1) and string (\"g\") cannot be added");
+            }
+        );
+
+        // scan/split/splits: "g" + flags (prepend) — "g" on the left.
+        for filter in [r#"scan("a"; 1)"#, r#"split("a"; 1)"#, r#"splits("a"; 1)"#] {
+            query!(br#""x""#, filter,
+                QueryResult::Error(e) => {
+                    assert_eq!(
+                        e.message,
+                        "string (\"g\") and number (1) cannot be added",
+                        "filter: {filter}"
+                    );
+                }
+            );
+        }
+
+        // ? still suppresses a non-string flags value, and null is still
+        // treated as no flags (untouched by this fix).
+        query!(br#""x""#, r#"[gsub("a"; "b"; 1)?]"#,
+            QueryResult::Owned(OwnedValue::Array(vs)) => {
+                assert!(vs.is_empty());
+            }
+        );
+        query!(br#""abc""#, r#"scan("a"; null)"#,
+            QueryResult::ManyOwned(matches) => {
+                assert_eq!(matches.len(), 1);
+            }
+        );
+    }
+
+    #[cfg(feature = "regex")]
+    #[test]
     fn test_regex_lookahead_unsupported() {
         // #703: jq's oniguruma backend supports lookahead (`(?=...)`), but
         // succinctly's `regex` crate does not implement lookaround at all —
