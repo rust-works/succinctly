@@ -6705,39 +6705,19 @@ fn build_regex(pattern: &str, flags: Option<&str>) -> Result<JqRegex, EvalError>
 }
 
 /// Builtin: test(re) - test if string matches the regex
+///
+/// jq defines this as `def test($re): test($re; null);` — delegate to the
+/// flags-aware implementation directly rather than duplicating its
+/// pattern/input fetch and regex build (#923), matching the established
+/// local convention `builtin_sub`/`builtin_gsub`/`builtin_splits`/
+/// `builtin_scan` already use post-#906/#913.
 #[cfg(feature = "regex")]
 fn builtin_test_regex<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     re_expr: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    // Evaluate the pattern
-    let pattern = match result_to_owned(eval_single::<W, S>(re_expr, value.clone(), optional)) {
-        Ok(OwnedValue::String(s)) => s,
-        Ok(_) if optional => return QueryResult::None,
-        Ok(v) => return QueryResult::Error(EvalError::not_string_or_array(v.type_name())),
-        Err(e) => return e.into(),
-    };
-
-    // Get the input string
-    let input = match &value {
-        StandardJson::String(s) => match s.as_str() {
-            Ok(cow) => cow.into_owned(),
-            Err(_) if optional => return QueryResult::None,
-            Err(_) => return QueryResult::Error(EvalError::new("invalid string")),
-        },
-        _ if optional => return QueryResult::None,
-        _ => return QueryResult::Error(EvalError::cannot_be_matched(&to_owned(&value))),
-    };
-
-    // Build regex and test for a match
-    let re = match build_regex(&pattern, None) {
-        Ok(r) => r,
-        Err(_e) if optional => return QueryResult::None,
-        Err(e) => return e.into(),
-    };
-
-    QueryResult::Owned(OwnedValue::Bool(re.is_match(&input)))
+    builtin_test_with_flags::<W, S>(re_expr, None, value, optional)
 }
 
 /// Builtin: match(re) or match(re; flags) - return match object
@@ -7285,6 +7265,17 @@ fn builtin_test_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Err(e) => return e.into(),
     };
 
+    builtin_test_with_flags::<W, S>(re_expr, Some(&flags), value, optional)
+}
+
+/// Builtin: test(re) or test(re; flags) - test if string matches the regex
+#[cfg(feature = "regex")]
+fn builtin_test_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    re_expr: &Expr,
+    flags: Option<&str>,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
     // Get the pattern
     let pattern = match result_to_owned(eval_single::<W, S>(re_expr, value.clone(), optional)) {
         Ok(OwnedValue::String(s)) => s,
@@ -7305,7 +7296,7 @@ fn builtin_test_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     };
 
     // Build regex with flags
-    let re = match build_regex(&pattern, Some(&flags)) {
+    let re = match build_regex(&pattern, flags) {
         Ok(r) => r,
         Err(_e) if optional => return QueryResult::None,
         Err(e) => return e.into(),
@@ -27323,6 +27314,47 @@ mod tests {
         query!(br#""abc""#, r#"test("[0-9]+")"#,
             QueryResult::Owned(OwnedValue::Bool(b)) => {
                 assert!(!b);
+            }
+        );
+    }
+
+    #[cfg(feature = "regex")]
+    #[test]
+    fn test_regex_bare_test_delegates_to_flagged_923() {
+        // #923: bare test(re) now delegates to builtin_test_with_flags
+        // instead of duplicating pattern/input fetch and regex build.
+        // Every case verified live against jq 1.7.1.
+
+        // Ordinary match/non-match, unaffected by the delegation.
+        query!(br#""abc""#, r#"test("abc")"#,
+            QueryResult::Owned(OwnedValue::Bool(b)) => {
+                assert!(b);
+            }
+        );
+        query!(br#""ABC""#, r#"test("abc")"#,
+            QueryResult::Owned(OwnedValue::Bool(b)) => {
+                assert!(!b, "bare test() must stay case-sensitive (no flags)");
+            }
+        );
+
+        // Non-string pattern and non-string input error the same way as
+        // the flagged form (both route through the same shared checks now).
+        query!(br#""abc""#, r#"try test(5) catch "ERR""#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "ERR");
+            }
+        );
+        query!(b"5", r#"try test("abc") catch "ERR""#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "ERR");
+            }
+        );
+
+        // `?` suppresses a bad pattern with no output, matching
+        // test(re;flags)'s existing optional behavior.
+        query!(br#""abc""#, r#"[test("(")?]"#,
+            QueryResult::Owned(OwnedValue::Array(vs)) => {
+                assert!(vs.is_empty());
             }
         );
     }
