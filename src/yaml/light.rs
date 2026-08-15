@@ -24,7 +24,9 @@ use std::string::ToString;
 
 use super::index::YamlIndex;
 use super::line_break::{is_line_break, line_break_len, line_break_len_before};
-use super::scalar::{could_be_null_or_bool, resolve_plain, resolve_tagged, ResolvedScalar};
+use super::scalar::{
+    could_be_null_or_bool, is_json_number_syntax, resolve_plain, resolve_tagged, ResolvedScalar,
+};
 use super::{starts_inline_seq_entry, starts_seq_entry};
 use crate::util::simd::escape::find_json_escape;
 
@@ -5753,6 +5755,61 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentValue for YamlValue<'a, W> {
                 }
             }
             YamlValue::Alias { target, .. } => target.and_then(|t| t.value().as_f64()),
+            _ => None,
+        }
+    }
+
+    /// Unlike JSON's own override, this only fires for a plain *float*
+    /// scalar that both resolves to a finite value and is independently
+    /// confirmed JSON-number-syntax-safe by [`is_json_number_syntax`] - a
+    /// YAML document has no separate "number token" grammar the way JSON
+    /// does (`as_i64`/`as_f64` above do the same `resolve_plain` dispatch),
+    /// so this can't unconditionally hand back raw bytes the way JSON's
+    /// does. `Int` is deliberately excluded entirely: `resolve_plain`'s own
+    /// doc comment already warns that its numeric variants' source text
+    /// "cannot be re-parsed... emitters must use the carried value" (hex
+    /// `0x2A`, octal `0o52`), and plain decimal ints never lose information
+    /// through `as_i64`'s bare-`Int` path anyway, so there's no bug here to
+    /// fix by echoing their text. A finite `Float`'s raw text can still be
+    /// YAML-legal but JSON-illegal (leading `.`/`+`, a leading zero before
+    /// more digits) - `is_json_number_syntax` is what caught this: an
+    /// earlier version of this override fired for every finite float
+    /// unconditionally, which broke `tag` on a bare `.5` (see that
+    /// function's doc comment for the full mechanism). Non-finite floats
+    /// and anything JSON-unsafe fall through to `as_f64` below instead,
+    /// unchanged from before this override existed.
+    ///
+    /// Without this override, `to_owned`'s short-circuiting chain
+    /// (`number_literal` -> `as_i64` -> `as_f64`) skips straight to
+    /// `as_f64` for every YAML float, producing a bare `OwnedValue::Float`
+    /// instead of a source-text-preserving `NumberLiteral` - `OwnedValue`'s
+    /// own float-to-text formatting then re-derives text from the bare
+    /// `f64` via `Display`, which drops the decimal point on a whole
+    /// number (`2.0_f64.to_string() == "2"`), silently turning an
+    /// integer-valued float scalar like `2.0` into an indistinguishable-
+    /// from-`2` value the moment it's displayed, reindexed, or compared by
+    /// text (#918).
+    fn number_literal(&self) -> Option<Cow<'_, str>> {
+        match self {
+            YamlValue::String(s) if s.is_unquoted() => {
+                let str_val = s.as_str().ok()?;
+                match resolve_plain(&str_val) {
+                    ResolvedScalar::Float(f)
+                        if f.is_finite() && is_json_number_syntax(&str_val) =>
+                    {
+                        Some(str_val)
+                    }
+                    _ => None,
+                }
+            }
+            // `t.value()` is a temporary, so (as `as_str`'s alias arm above
+            // also has to) any borrowed `Cow` it hands back must be owned
+            // before the closure returns.
+            YamlValue::Alias { target, .. } => target.and_then(|t| {
+                t.value()
+                    .number_literal()
+                    .map(|cow| Cow::Owned(cow.into_owned()))
+            }),
             _ => None,
         }
     }

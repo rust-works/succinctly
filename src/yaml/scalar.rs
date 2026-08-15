@@ -202,6 +202,67 @@ fn parse_float(s: &str) -> ResolvedScalar {
     }
 }
 
+/// True if `s` is valid JSON number syntax (RFC 8259) end to end: optional
+/// leading `-`, then `0` or a non-zero-led digit run, optional `.`-fraction
+/// (at least one digit), optional exponent (at least one digit).
+///
+/// This module's own numeric [`ResolvedScalar`] variants "carry the parsed
+/// value... emitters must use the carried value, never echo the source
+/// text" (see the type's doc comment) precisely because YAML's core-schema
+/// number grammar is looser than JSON's: a leading-dot float (`.5`), a
+/// leading `+` (`+.5`), or a leading zero followed by more digits (`007.5`)
+/// all resolve here but are not valid JSON number text, and hex/octal ints
+/// (`0x2A`) obviously aren't either. A caller that ignores that warning and
+/// hands such text to something expecting JSON syntax — as
+/// `OwnedValue::NumberLiteral`'s downstream reindexing bridge does — gets a
+/// value silently misclassified as a parse error instead of a number
+/// (confirmed via the `tag` builtin, which maps that error node to
+/// `!!null` for a scalar that plainly has a `!!float` tag) rather than
+/// erroring loudly. This predicate is how [`super::light`]'s
+/// `number_literal()` override decides which literals are safe to echo.
+#[must_use]
+pub(super) fn is_json_number_syntax(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    if bytes.first() == Some(&b'-') {
+        i += 1;
+    }
+    match bytes.get(i) {
+        Some(b'0') => i += 1,
+        Some(b'1'..=b'9') => {
+            i += 1;
+            while matches!(bytes.get(i), Some(b'0'..=b'9')) {
+                i += 1;
+            }
+        }
+        _ => return false,
+    }
+    if bytes.get(i) == Some(&b'.') {
+        i += 1;
+        let start = i;
+        while matches!(bytes.get(i), Some(b'0'..=b'9')) {
+            i += 1;
+        }
+        if i == start {
+            return false;
+        }
+    }
+    if matches!(bytes.get(i), Some(b'e' | b'E')) {
+        i += 1;
+        if matches!(bytes.get(i), Some(b'+' | b'-')) {
+            i += 1;
+        }
+        let start = i;
+        while matches!(bytes.get(i), Some(b'0'..=b'9')) {
+            i += 1;
+        }
+        if i == start {
+            return false;
+        }
+    }
+    i == bytes.len()
+}
+
 /// Force-resolves a scalar's value under an explicit YAML tag.
 ///
 /// Handles the 5 core-schema tags (`!!str`, `!!null`, `!!bool`, `!!int`,
