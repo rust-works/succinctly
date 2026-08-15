@@ -30,6 +30,10 @@
 //! assert_eq!(resolve_plain("1_000"), ResolvedScalar::Str);
 //! ```
 
+use std::borrow::Cow;
+
+use crate::jq::OwnedValue;
+
 /// The resolved type (and parsed value) of a plain YAML scalar.
 ///
 /// Numeric variants carry the parsed value because some spellings (`0x2A`)
@@ -77,6 +81,36 @@ impl ResolvedScalar {
             Self::Bool(_) => "boolean",
             Self::Int(_) | Self::Float(_) => "number",
             Self::Str => "string",
+        }
+    }
+
+    /// Converts this resolution to jq's [`OwnedValue`], given `text` — the
+    /// scalar's original source text (used for the `Str` case, and, for a
+    /// `Float` that also passes `is_preservable_float_literal`, to
+    /// preserve a whole-number float's spelling through materialization —
+    /// issue #918: `2.0`'s decimal point otherwise vanishes via bare
+    /// `f64::Display`, since `Int`/`Float`/`Bool`/`Null` carry no source
+    /// text of their own to fall back on).
+    ///
+    /// The single source of truth this crate's three independent
+    /// `ResolvedScalar -> OwnedValue` match arms (issue #907) collapse
+    /// into: `crate::jq::eval_generic`'s tagged-scalar materialization,
+    /// the yq CLI's DOM conversion (`yq_runner.rs`), and the `load()`
+    /// builtin's YAML loader (`eval.rs`) all called this out independently
+    /// before, which is exactly how the yq-CLI and `load()` copies missed
+    /// #918's literal-preservation fix when it landed only in
+    /// `eval_generic.rs`.
+    #[must_use]
+    pub fn to_owned_value(self, text: Cow<'_, str>) -> OwnedValue {
+        match self {
+            Self::Null => OwnedValue::Null,
+            Self::Bool(b) => OwnedValue::Bool(b),
+            Self::Int(n) => OwnedValue::Int(n),
+            Self::Float(_) if is_preservable_float_literal(&text) => {
+                OwnedValue::from_number_literal(&text)
+            }
+            Self::Float(f) => OwnedValue::Float(f),
+            Self::Str => OwnedValue::String(text.into_owned()),
         }
     }
 }
@@ -308,7 +342,7 @@ const MAX_PRESERVABLE_FLOAT_DIGITS: usize = 17;
 /// leaving the #918 symptom open for that narrower spelling class — see
 /// the issue tracker for the follow-up.
 #[must_use]
-pub(crate) fn is_preservable_float_literal(s: &str) -> bool {
+pub(super) fn is_preservable_float_literal(s: &str) -> bool {
     s.contains('.')
         && !s.contains(['e', 'E'])
         && s.bytes().filter(u8::is_ascii_digit).count() <= MAX_PRESERVABLE_FLOAT_DIGITS

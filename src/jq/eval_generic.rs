@@ -127,27 +127,7 @@ pub fn to_owned_cursor<C: DocumentCursor>(cursor: &C) -> OwnedValue {
 fn tagged_scalar_to_owned<V: DocumentValue>(tag: &str, value: &V) -> Option<OwnedValue> {
     let text = value.as_str()?;
     let resolved = crate::yaml::resolve_tagged(&text, tag)?;
-    Some(match resolved {
-        crate::yaml::ResolvedScalar::Null => OwnedValue::Null,
-        crate::yaml::ResolvedScalar::Bool(b) => OwnedValue::Bool(b),
-        crate::yaml::ResolvedScalar::Int(n) => OwnedValue::Int(n),
-        // Mirrors YamlValue::number_literal (src/yaml/light.rs) for the
-        // same reason: an explicit `!!float` tag converges on this same
-        // materialization step as a plain float scalar, so it needs the
-        // same source-text preservation for a whole-number float like
-        // `!!float 2.0` (#918) - `is_preservable_float_literal` also
-        // correctly excludes `!!float`'s int-widening case (`!!float 5`,
-        // `!!float 0x2A`, neither containing a literal `.`), which have no
-        // meaningful float-spelled text to preserve.
-        crate::yaml::ResolvedScalar::Float(f) => {
-            if crate::yaml::is_preservable_float_literal(&text) {
-                OwnedValue::from_number_literal(&text)
-            } else {
-                OwnedValue::Float(f)
-            }
-        }
-        crate::yaml::ResolvedScalar::Str => OwnedValue::String(text.into_owned()),
-    })
+    Some(resolved.to_owned_value(text))
 }
 
 /// Materializes `value`, preferring the cursor-aware, tag-resolving

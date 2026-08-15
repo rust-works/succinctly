@@ -1115,6 +1115,37 @@ fn test_duplicate_mapping_key_survives_inplace() -> Result<()> {
     Ok(())
 }
 
+/// #907: `--slurp`, `--eval-all`, and the `load()` builtin each materialize
+/// through their own copy of the `ResolvedScalar -> OwnedValue` mapping
+/// (`yq_runner.rs`'s `resolved_scalar_to_owned`/`standard_json_to_owned`,
+/// `eval.rs`'s local `resolved_scalar_to_owned`) -- none of which are the
+/// `eval_generic.rs` path #918 fixed, so an integer-valued float scalar
+/// (`2.0`) lost its decimal point through all three even after #918 landed.
+/// Confirmed live before this fix: `--slurp '.'` gave `[2]`, `--eval-all
+/// '.'` gave `2`, both wrong. Fixed by hoisting one shared
+/// `ResolvedScalar::to_owned_value` (used by all three, plus the fourth
+/// copy this uncovered, `standard_json_to_owned` -- see that function's own
+/// former doc comment; replaced by the shared `to_owned` instead).
+#[test]
+fn test_integer_valued_float_survives_slurp_eval_all_load_907() -> Result<()> {
+    let (out, code) = run_yq_stdin(".", "2.0", &["--slurp", "-o", "json", "-I", "0"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "[2.0]");
+
+    let (out, code) = run_yq_stdin(".", "2.0", &["--eval-all", "-o", "json", "-I", "0"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "[2.0]");
+
+    let mut input_file = NamedTempFile::new()?;
+    writeln!(input_file, "a: 2.0")?;
+    let load_expr = format!("load({:?})", input_file.path().display().to_string());
+    let (out, code) = run_yq_stdin(&load_expr, "null", &["-o", "json", "-I", "0"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "{\"a\":2.0}");
+
+    Ok(())
+}
+
 /// #631: `first(.[])`/`last(.[])` (the `Expr::FirstExpr`/`LastExpr` one-arg
 /// stream form `first(f)`/`last(f)` compiles to) fell through
 /// `evaluate_yaml_cursor`'s unconditional `to_owned()` DOM path, unlike

@@ -279,7 +279,6 @@ pub use light::{
     YamlField, YamlFields, YamlNumber, YamlString, YamlValue,
 };
 pub use locate::{locate_offset, locate_offset_detailed, LocateResult};
-pub(crate) use scalar::is_preservable_float_literal;
 pub use scalar::{resolve_plain, resolve_tagged, ResolvedScalar};
 
 #[cfg(test)]

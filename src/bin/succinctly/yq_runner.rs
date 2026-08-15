@@ -6,7 +6,6 @@
 use anyhow::{Context, Result};
 use core::fmt::Write as FmtWrite;
 use indexmap::IndexMap;
-use std::borrow::Cow;
 use std::io::{BufWriter, IsTerminal, Read, Write};
 use std::path::Path;
 
@@ -17,11 +16,10 @@ use succinctly::jq::eval_generic::{
 use succinctly::jq::{
     self, sync_aliased_paths, Builtin, EvalError, Expr, OwnedValue, QueryResult, YqSemantics,
 };
-use succinctly::json::light::StandardJson;
 use succinctly::json::JsonIndex;
 use succinctly::yaml::{
-    format_float_with_fraction, resolve_plain, resolve_tagged, stream_yaml_sequence,
-    ResolvedScalar, YamlCursor, YamlIndex, YamlValue,
+    format_float_with_fraction, resolve_plain, resolve_tagged, stream_yaml_sequence, YamlCursor,
+    YamlIndex, YamlValue,
 };
 
 use super::{FrontMatterMode, InputFormat, OutputFormat, YqCommand};
@@ -165,18 +163,6 @@ impl OutputConfig {
     }
 }
 
-/// Convert an already-resolved scalar to `OwnedValue`. `str_value` is the
-/// original source text, used only for the `Str` case.
-fn resolved_scalar_to_owned(resolved: ResolvedScalar, str_value: Cow<'_, str>) -> OwnedValue {
-    match resolved {
-        ResolvedScalar::Null => OwnedValue::Null,
-        ResolvedScalar::Bool(b) => OwnedValue::Bool(b),
-        ResolvedScalar::Int(n) => OwnedValue::Int(n),
-        ResolvedScalar::Float(f) => OwnedValue::Float(f),
-        ResolvedScalar::Str => OwnedValue::String(str_value.into_owned()),
-    }
-}
-
 /// Convert a YAML value to an OwnedValue for jq evaluation.
 ///
 /// Takes a cursor rather than a bare `YamlValue`: an explicit tag
@@ -195,7 +181,7 @@ fn yaml_to_owned_value<W: AsRef<[u64]>>(cursor: YamlCursor<'_, W>) -> Result<Own
 
             if let Some(explicit) = cursor.explicit_tag() {
                 if let Some(resolved) = resolve_tagged(&str_value, explicit) {
-                    return Ok(resolved_scalar_to_owned(resolved, str_value));
+                    return Ok(resolved.to_owned_value(str_value));
                 }
             }
 
@@ -206,10 +192,7 @@ fn yaml_to_owned_value<W: AsRef<[u64]>>(cursor: YamlCursor<'_, W>) -> Result<Own
             }
 
             // Resolve plain scalars per the YAML 1.2 core schema
-            Ok(resolved_scalar_to_owned(
-                resolve_plain(&str_value),
-                str_value,
-            ))
+            Ok(resolve_plain(&str_value).to_owned_value(str_value))
         }
         YamlValue::Mapping(fields) => {
             let mut map = IndexMap::new();
@@ -423,7 +406,7 @@ fn parse_input(bytes: &[u8], format: InputFormat) -> Result<Vec<OwnedValue>> {
             // Parse as JSON
             let index = JsonIndex::build(bytes);
             let cursor = index.root(bytes);
-            Ok(vec![standard_json_to_owned(&cursor.value())])
+            Ok(vec![to_owned(&cursor.value())])
         }
         InputFormat::Yaml | InputFormat::Auto => {
             // Parse as YAML (Auto defaults to YAML when no extension hint)
@@ -570,9 +553,9 @@ fn query_result_to_owned_values(
     sink: &mut ErrorSink,
 ) -> Vec<OwnedValue> {
     match result {
-        QueryResult::One(v) => vec![standard_json_to_owned(&v)],
-        QueryResult::OneCursor(c) => vec![standard_json_to_owned(&c.value())],
-        QueryResult::Many(vs) => vs.iter().map(standard_json_to_owned).collect(),
+        QueryResult::One(v) => vec![to_owned(&v)],
+        QueryResult::OneCursor(c) => vec![to_owned(&c.value())],
+        QueryResult::Many(vs) => vs.iter().map(to_owned).collect(),
         QueryResult::None => vec![],
         QueryResult::Error(e) => {
             sink.report(DiagStyle::Yq, &e, &no_location());
@@ -1181,41 +1164,6 @@ fn strip_presentation_style(tree: &CommentTree) -> CommentTree {
                 .collect(),
             key_comments.clone(),
         ),
-    }
-}
-
-/// Convert a StandardJson value to an OwnedValue.
-fn standard_json_to_owned<W: Clone + AsRef<[u64]>>(value: &StandardJson<'_, W>) -> OwnedValue {
-    match value {
-        StandardJson::Null => OwnedValue::Null,
-        StandardJson::Bool(b) => OwnedValue::Bool(*b),
-        StandardJson::Number(n) => {
-            if let Ok(i) = n.as_i64() {
-                OwnedValue::Int(i)
-            } else if let Ok(f) = n.as_f64() {
-                OwnedValue::Float(f)
-            } else {
-                OwnedValue::Null
-            }
-        }
-        StandardJson::String(s) => {
-            OwnedValue::String(s.as_str().map(|c| c.to_string()).unwrap_or_default())
-        }
-        StandardJson::Array(elements) => {
-            OwnedValue::Array((*elements).map(|e| standard_json_to_owned(&e)).collect())
-        }
-        StandardJson::Object(fields) => OwnedValue::Object(
-            (*fields)
-                .filter_map(|field| {
-                    let key = match field.key() {
-                        StandardJson::String(s) => s.as_str().ok()?.to_string(),
-                        _ => return None,
-                    };
-                    Some((key, standard_json_to_owned(&field.value())))
-                })
-                .collect(),
-        ),
-        StandardJson::Error(_) => OwnedValue::Null,
     }
 }
 
