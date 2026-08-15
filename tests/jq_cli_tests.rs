@@ -10463,3 +10463,23 @@ fn test_identity_query_accepts_nesting_under_limit_998() -> Result<()> {
     assert_eq!(stdout.trim_end(), input);
     Ok(())
 }
+
+/// #998 review: `--exit-status`/`-e` forces `JqValue::materialize()` on
+/// every result before `print_json`'s own guarded output path ever runs,
+/// reaching `lazy.rs`'s independent `cursor_to_owned` materializer
+/// directly -- a second, unguarded recursive tree-walker with the exact
+/// same shape as `eval_generic::to_owned_cursor`, missed by this PR's own
+/// first pass. Confirmed live before this follow-up fix: `succinctly jq -e
+/// '.[0]'` on a 200,000-level-deep document raw-stack-overflowed (SIGABRT,
+/// exit 134) even with `print_json`'s guard already in place.
+#[test]
+fn test_exit_status_query_rejects_adversarial_nesting_998() -> Result<()> {
+    let input = nested_arrays(500);
+    let (_stdout, stderr, code) = run_jq_full(&["-e", "-c", ".[0]"], Some(&input))?;
+    assert_eq!(code, 101, "stderr: {stderr:?}");
+    assert!(
+        stderr.contains("nesting depth exceeds limit of 256"),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}

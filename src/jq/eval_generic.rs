@@ -36,11 +36,13 @@ use super::value::OwnedValue;
 use crate::json::JsonIndex;
 
 /// Recursion-depth ceiling for [`to_owned`]/[`to_owned_cursor`]/
-/// [`to_owned_with_comments`] (#998). JSON's semi-index parser
-/// (`src/json/simple.rs`/`src/json/standard.rs`) is a flat, non-recursive
-/// scan with no depth limit of its own, so adversarially deep JSON
-/// parses/indexes fine -- it's specifically this tree-materialization step,
-/// recursing once per nesting level, that needs the guard.
+/// [`to_owned_with_comments`] (#998).
+///
+/// JSON's semi-index parser (`src/json/simple.rs`/`src/json/standard.rs`)
+/// is a flat, non-recursive scan with no depth limit of its own, so
+/// adversarially deep JSON parses/indexes fine -- it's specifically this
+/// tree-materialization step, recursing once per nesting level, that needs
+/// the guard.
 ///
 /// A clean, catchable error (matching real jq's own parse-time depth limit —
 /// confirmed live, `jq '.'` on 500+ levels of `[[[...]]]` raises "Exceeds
@@ -69,7 +71,30 @@ use crate::json::JsonIndex;
 /// margin and sits comfortably under both boundaries, including headroom
 /// for a CI runner with a smaller default stack than the dev machine this
 /// was measured on.
-const MAX_NESTING_DEPTH: usize = 256;
+///
+/// `pub`, not private: every recursive tree-materialization function that
+/// isn't itself one of this module's own (`to_owned`/`to_owned_cursor`/
+/// `to_owned_with_comments`, all guarded via [`assert_nesting_depth`] below)
+/// needs the same ceiling -- `jq_runner.rs`'s `print_json` and `lazy.rs`'s
+/// `cursor_to_owned` both import this rather than hand-rolling their own
+/// copy, so the whole binary has exactly one number to retune (#998 review:
+/// two independent copies of this same constant had already drifted apart
+/// in wording, if not value, before this consolidation).
+pub const MAX_NESTING_DEPTH: usize = 256;
+
+/// Panics past [`MAX_NESTING_DEPTH`] levels of nesting (#998).
+///
+/// The one place every guarded recursive function in the binary raises, so
+/// they can't drift on wording or the comparison itself the way three
+/// independently hand-copied `assert!`s already had before this extraction
+/// (review finding: `to_owned`/`to_owned_cursor`/`to_owned_with_comments`
+/// each carried a byte-identical copy).
+pub fn assert_nesting_depth(depth: usize) {
+    assert!(
+        depth < MAX_NESTING_DEPTH,
+        "nesting depth exceeds limit of {MAX_NESTING_DEPTH}"
+    );
+}
 
 /// Convert a DocumentValue to an OwnedValue.
 ///
@@ -84,10 +109,7 @@ pub fn to_owned<V: DocumentValue>(value: &V) -> OwnedValue {
 }
 
 fn to_owned_at_depth<V: DocumentValue>(value: &V, depth: usize) -> OwnedValue {
-    assert!(
-        depth < MAX_NESTING_DEPTH,
-        "nesting depth exceeds limit of {MAX_NESTING_DEPTH}"
-    );
+    assert_nesting_depth(depth);
     // Check containers first (arrays and objects have no type ambiguity)
     if let Some(fields) = value.as_object() {
         let mut map = IndexMap::new();
@@ -146,10 +168,7 @@ pub fn to_owned_cursor<C: DocumentCursor>(cursor: &C) -> OwnedValue {
 }
 
 fn to_owned_cursor_at_depth<C: DocumentCursor>(cursor: &C, depth: usize) -> OwnedValue {
-    assert!(
-        depth < MAX_NESTING_DEPTH,
-        "nesting depth exceeds limit of {MAX_NESTING_DEPTH}"
-    );
+    assert_nesting_depth(depth);
     let value = cursor.value();
     if let Some(fields) = value.as_object() {
         let mut map = IndexMap::new();
@@ -380,10 +399,7 @@ fn to_owned_with_comments_at_depth<V: DocumentValue>(
     cursor: Option<&V::Cursor>,
     depth: usize,
 ) -> (OwnedValue, CommentTree) {
-    assert!(
-        depth < MAX_NESTING_DEPTH,
-        "nesting depth exceeds limit of {MAX_NESTING_DEPTH}"
-    );
+    assert_nesting_depth(depth);
     // The raw (`#`-prefixed) form, not the stripped `line_comment` builtin
     // getter: the write path re-emits this verbatim after one space.
     let own_comment = cursor.and_then(DocumentCursor::line_comment_raw);
