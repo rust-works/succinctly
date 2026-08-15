@@ -634,4 +634,76 @@ mod tests {
             assert_eq!(resolve_tagged("1", tag), None, "tag: {tag}");
         }
     }
+
+    #[test]
+    fn json_number_syntax_accepts_full_rfc_8259_grammar() {
+        // Its own doc comment claims full RFC 8259 support, including the
+        // exponent form - `is_preservable_float_literal` (its only current
+        // caller) never actually routes exponent text through it, since it
+        // rejects those upstream for an unrelated reason (`format_number_
+        // jq_compat` doesn't preserve YAML's exponent spelling), so this
+        // exercises the claim directly rather than through that caller.
+        for s in [
+            "0", "-0", "42", "-42", "0.0", "2.0", "-2.5", "0.50", "1e10", "1E10", "1e+10", "1e-10",
+            "-1.5e-3", "0e0",
+        ] {
+            assert!(is_json_number_syntax(s), "expected valid: {s:?}");
+        }
+    }
+
+    #[test]
+    fn json_number_syntax_rejects_yaml_legal_json_illegal_spellings() {
+        for s in [
+            "",      // empty
+            "-",     // sign with no digits
+            ".5",    // leading dot
+            "+2.0",  // leading plus
+            "007",   // leading zero, more digits
+            "007.5", // leading zero, more digits, with fraction
+            "1.",    // trailing dot, no fraction digit
+            "2.5e",  // exponent marker, no digits
+            "2.5e+", // exponent sign, no digits
+            "0x2A",  // hex
+            "1e",    // bare exponent marker
+            "1.2.3", // trailing garbage
+            "1 ",    // trailing whitespace
+        ] {
+            assert!(!is_json_number_syntax(s), "expected invalid: {s:?}");
+        }
+    }
+
+    #[test]
+    fn preservable_float_literal_requires_a_dot_and_rejects_exponents() {
+        // The core #918 case: a plain decimal float with a literal `.`.
+        for s in ["2.0", "-2.0", "0.5", "3.140", "0.0"] {
+            assert!(
+                is_preservable_float_literal(s),
+                "expected preservable: {s:?}"
+            );
+        }
+        // No dot at all - either a plain int, or (per #953) an i64-overflow
+        // integer that only resolves to Float as a fallback; echoing its
+        // digits verbatim would overstate the f64's actual precision.
+        for s in ["2", "-2", "99999999999999999999"] {
+            assert!(!is_preservable_float_literal(s), "expected rejected: {s:?}");
+        }
+        // Exponent form - format_number_jq_compat doesn't preserve this
+        // spelling, so there's nothing to gain by echoing it (see #918's
+        // eval_generic.rs comment for the -0.0 sign-loss this also avoids).
+        for s in ["2e2", "-0e10", "1.5e-3"] {
+            assert!(!is_preservable_float_literal(s), "expected rejected: {s:?}");
+        }
+        // JSON-unsafe spellings, deliberately out of scope (#954).
+        for s in [".5", "+2.0", "1."] {
+            assert!(!is_preservable_float_literal(s), "expected rejected: {s:?}");
+        }
+    }
+
+    #[test]
+    fn preservable_float_literal_rejects_beyond_the_digit_cap() {
+        let just_over = "1.".to_string() + &"1".repeat(MAX_PRESERVABLE_FLOAT_DIGITS);
+        assert!(!is_preservable_float_literal(&just_over));
+        let at_cap = "1.".to_string() + &"1".repeat(MAX_PRESERVABLE_FLOAT_DIGITS - 1);
+        assert!(is_preservable_float_literal(&at_cap));
+    }
 }
