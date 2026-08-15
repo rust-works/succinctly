@@ -417,7 +417,13 @@ impl OwnedValue {
     /// `pub(crate)`) should go through (#966 found at least 7 independent
     /// hand-rolled copies of this decision).
     ///
-    /// Preserves the source spelling via
+    /// Checks [`is_nan_sentinel`] first, so every caller gets that
+    /// `to_json_for_reindex`-bridge convention for free instead of having
+    /// to remember its own copy of the check (an earlier draft of this
+    /// function required exactly that, and three of its call sites forgot
+    /// it -- caught by review).
+    ///
+    /// Otherwise preserves the source spelling via
     /// [`NumberLiteral`](Self::NumberLiteral) only when `bytes` is valid
     /// RFC 8259 number syntax
     /// ([`is_valid_number`](crate::json::validate::is_valid_number));
@@ -428,6 +434,9 @@ impl OwnedValue {
     /// back out verbatim, since both always reproduce a `NumberLiteral`'s
     /// stored text unchanged.
     pub fn from_number_bytes(bytes: &[u8]) -> Self {
+        if is_nan_sentinel(bytes) {
+            return Self::Float(f64::NAN);
+        }
         if crate::json::validate::is_valid_number(bytes) {
             return core::str::from_utf8(bytes).map_or(Self::Null, Self::from_number_literal);
         }
