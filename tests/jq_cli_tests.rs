@@ -10079,3 +10079,198 @@ fn test_limit_positive_float_count_still_errors_983() -> Result<()> {
     );
     Ok(())
 }
+
+// ============================================================================
+// #845: path()'s Alternative (//) arm required the left operand to be
+// path-shaped even when it's simply falsy and gets filtered out by `//`
+// itself before path-shape would ever matter.
+// ============================================================================
+
+/// #845: a falsy, non-path-shaped left operand falls through to the right
+/// side instead of raising #530. Verified against jq 1.7.1: `echo
+/// '{"a":10}' | jq -c 'path(false // .b)'` prints `["b"]`, exit 0.
+#[test]
+fn test_resolve_node_alternative_falsy_non_path_left_falls_through_845() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-c", r"path(false // .b)"], Some(r#"{"a":10}"#))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[\"b\"]\n");
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
+/// #845 companion: `null` (also falsy, also not path-shaped) behaves the
+/// same way. Verified against jq 1.7.1: `path(null // .b)` on `{"a":10}`
+/// prints `["b"]`, exit 0.
+#[test]
+fn test_resolve_node_alternative_null_left_falls_through_845() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-c", r"path(null // .b)"], Some(r#"{"a":10}"#))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[\"b\"]\n");
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
+/// #845: a *truthy* non-path-shaped left operand must still raise -- the
+/// fix must not turn `//`'s left side into a blanket path-shape exemption.
+/// Verified against jq 1.7.1: `path(1 // .b)` on `{"a":10}` raises "Invalid
+/// path expression with result 1", exit 5.
+#[test]
+fn test_resolve_node_alternative_truthy_non_path_left_still_raises_845() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-c", r"path(1 // .b)"], Some(r#"{"a":10}"#))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert!(stderr.contains("Invalid path expression with result 1"));
+    Ok(())
+}
+
+/// #845: a genuine `error(...)` raised while resolving the left side must
+/// still propagate -- `//` only substitutes for falsy/absent output, never
+/// for a raised error. Verified against jq 1.7.1: `path(error("x") // .b)`
+/// raises `x`, exit 5.
+#[test]
+fn test_resolve_node_alternative_left_error_still_propagates_845() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", r#"path(error("x") // .b)"#], Some(r#"{"a":10}"#))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert!(stderr.contains('x'));
+    Ok(())
+}
+
+/// #845: a truthy, path-shaped left operand is untouched by the fix --
+/// `//`'s right side is never even resolved. Verified against jq 1.7.1:
+/// `path(.a // .b)` on `{"a":10}` prints `["a"]`, exit 0.
+#[test]
+fn test_resolve_node_alternative_truthy_path_left_unaffected_845() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-c", r"path(.a // .b)"], Some(r#"{"a":10}"#))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[\"a\"]\n");
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
+/// #845: bare `path(false)` (no `//` at all) still raises -- the fix is
+/// scoped to `//`'s own truthy-filtering context, not a general "falsy
+/// values are always path-exempt" rule. Verified against jq 1.7.1:
+/// `path(false)` on `{"a":10}` raises "Invalid path expression with result
+/// false", exit 5.
+#[test]
+fn test_resolve_node_bare_path_false_still_raises_845() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-c", r"path(false)"], Some(r#"{"a":10}"#))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert!(stderr.contains("Invalid path expression with result false"));
+    Ok(())
+}
+
+/// #845: the fix only special-cases a bare literal `left` -- a `Comma`
+/// fanning out to a truthy, non-path-shaped later sibling takes the
+/// original, untouched code path, whose pre-existing prefix-carrying
+/// behavior already matches jq exactly on its own. Verified against jq
+/// 1.7.1: `path((.a, 1) // .b)` on `{"a":10}` prints `["a"]` before raising
+/// on `1`, exit 5.
+#[test]
+fn test_resolve_node_alternative_keeps_prefix_when_later_sibling_truthy_and_non_path_845(
+) -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-c", r"path((.a, 1) // .b)"], Some(r#"{"a":10}"#))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[\"a\"]\n");
+    assert!(stderr.contains("Invalid path expression with result 1"));
+    Ok(())
+}
+
+/// #845: `try`/`catch` interaction -- `//`'s own filtering, not `try`'s
+/// error-catching, is what suppresses the would-be #530 here, so this
+/// still succeeds even without a `catch` clause. Verified against jq
+/// 1.7.1: `try (path(false // .b)) catch "caught"` on `{"a":10}` prints
+/// `["b"]`, exit 0 (the `try` never even has anything to catch).
+#[test]
+fn test_resolve_node_alternative_falsy_left_no_catch_needed_845() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r#"try (path(false // .b)) catch "caught""#],
+        Some(r#"{"a":10}"#),
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[\"b\"]\n");
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
+/// #845 review round: the fix must not evaluate a non-literal `left` a
+/// second time to check its truthiness -- an earlier draft did, via a
+/// generic re-evaluation instead of a literal-only static check, and that
+/// duplicated any observable side effect `left` had (confirmed live:
+/// `path(stderr // .b)` wrote its input to stderr twice under that draft).
+/// The shipped fix only special-cases a bare literal (whose value needs no
+/// evaluation at all), so a non-literal falsy-*valued* left like `stderr`
+/// still takes the original, single-evaluation code path -- this pins
+/// "exactly one write", not jq-matching output (that query still diverges
+/// from jq for an unrelated, pre-existing reason, tracked as #986).
+#[test]
+fn test_resolve_node_alternative_does_not_double_evaluate_non_literal_left_845() -> Result<()> {
+    let (_stdout, stderr, _code) = run_jq_full(&["-c", "path(stderr // .b)"], Some(r#"{"a":10}"#))?;
+    // Count only the portion before the error message, whose own dumped
+    // payload also happens to contain the same text -- that's not a second
+    // `stderr` write, just the error describing what it saw.
+    let before_error = stderr.split("jq: error").next().unwrap_or(&stderr);
+    let write_count = before_error.matches(r#"{"a":10}"#).count();
+    assert_eq!(
+        write_count, 1,
+        "stderr should be written exactly once: {stderr:?}"
+    );
+    Ok(())
+}
+
+/// #845 review round: the fix's benefit reaches every other top-level
+/// caller of `resolve_node`'s `Alternative` arm, not just `path()` --
+/// `del()`, `=`, and `|=` all share the same code. Verified against jq
+/// 1.7.1: all three queries below match jq exactly.
+#[test]
+fn test_alternative_falsy_left_fix_reaches_del_assign_and_update_845() -> Result<()> {
+    let (stdout, _stderr, code) =
+        run_jq_full(&["-c", "del(false // .b)"], Some(r#"{"a":10,"b":20}"#))?;
+    assert_eq!(code, 0, "stdout: {stdout:?}");
+    assert_eq!(stdout, "{\"a\":10}\n");
+
+    let (stdout, _stderr, code) =
+        run_jq_full(&["-c", "(false // .b) = 99"], Some(r#"{"a":10,"b":20}"#))?;
+    assert_eq!(code, 0, "stdout: {stdout:?}");
+    assert_eq!(stdout, "{\"a\":10,\"b\":99}\n");
+
+    let (stdout, _stderr, code) = run_jq_full(
+        &["-c", "(false // .b) |= . + 1"],
+        Some(r#"{"a":10,"b":20}"#),
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?}");
+    assert_eq!(stdout, "{\"a\":10,\"b\":21}\n");
+    Ok(())
+}
+
+/// #845 review round: interaction with `catch`'s untracked payload (#843).
+/// A falsy literal `left` falls through unconditionally, regardless of
+/// trackability (it never attempts navigation into the payload at all);
+/// the untracked check still applies normally to whatever `right` does.
+/// Verified against jq 1.7.1: `path(try error(false) catch (false // .b))`
+/// on `{"a":10}` raises "Invalid path expression near attempt to access
+/// element \"b\" of false" (from `.b`'s own untracked-navigation check, not
+/// from `false` itself), and `path(try error(false) catch (false // .))`
+/// raises the plain `#530` "with result false" (no navigation attempted at
+/// all).
+#[test]
+fn test_resolve_node_alternative_falsy_literal_interacts_correctly_with_untracked_catch_845(
+) -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "path(try error(false) catch (false // .b))"],
+        Some(r#"{"a":10}"#),
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert!(stderr.contains("near attempt to access element \"b\" of false"));
+
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "path(try error(false) catch (false // .))"],
+        Some(r#"{"a":10}"#),
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert!(stderr.contains("Invalid path expression with result false"));
+    Ok(())
+}

@@ -10274,6 +10274,16 @@ fn path_result(branches: Vec<PathBranch<'_>>, escape: Option<EvalEscape>) -> Pat
     }
 }
 
+/// Peel any wrapping `Expr::Paren` down to the inner expression — `(false)`
+/// and `false` are the same node for a caller that only cares about literal
+/// shape, not surface syntax (`Expr::Alternative`'s `#845` fix, below).
+fn unwrap_paren(expr: &Expr) -> &Expr {
+    match expr {
+        Expr::Paren(inner) => unwrap_paren(inner),
+        other => other,
+    }
+}
+
 /// Resolve one path node against one value, yielding a branch per output.
 ///
 /// `trackable` is `false` for exactly one caller (`resolve_catch`, for the
@@ -10655,7 +10665,39 @@ fn resolve_node<'a, S: EvalSemantics>(
         // `a` propagates rather than falling back, matching `eval_alternative`:
         // `//` only substitutes for falsy/absent output, never for a raised
         // error, and the `?` here already gives us that for free.
+        //
+        // #845: a *literal* `a` is the one exception — real jq only requires
+        // path-shape for whichever of `a`'s outputs actually survive the
+        // truthy filter, so `a` being itself falsy (`false`, `null`) must
+        // fall through to `b` without ever needing to resolve as a path at
+        // all: confirmed live, `path(false // .b)` on `{"a":10}` is `["b"]`,
+        // while `path(1 // .b)` still raises (`1` is truthy, and does need
+        // path-shape — the `?` below still fires for it, unchanged). A
+        // literal's own value is known statically, at zero evaluation cost
+        // and with no side effect to risk duplicating — unlike checking
+        // `a`'s general truthiness by evaluating it a *second* time
+        // (rejected in review: a `resolve_node` call already evaluates `a`
+        // once by the time any failure is visible here, so a follow-up
+        // evaluation just to inspect truthiness double-fires anything `a`
+        // does — confirmed live, `path(stderr // .b)` wrote its input to
+        // stderr twice under that approach — and a catch-all on the retry's
+        // own outcome swallowed a `halt`/`break` the retry surfaced instead
+        // of letting it escape, same review round).
+        //
+        // Every other shape — a `Comma`-fanned `a` mixing a falsy/non-path
+        // sibling with a path-shaped or truthy one, any non-literal filter
+        // that merely *evaluates* to something falsy, ... — is not handled:
+        // this resolver's `Comma`/`If`/`Select` arms already commit to the
+        // first sibling's own failure eagerly, before `//`'s truthy filter
+        // ever gets a chance to see it, the same "resolve everything up
+        // front, not lazily per output" gap #820 tracks more generally;
+        // filed as #980 rather than solved here.
         Expr::Alternative(left, right) => {
+            if let Expr::Literal(lit) = unwrap_paren(left) {
+                if !literal_to_owned(lit).is_truthy() {
+                    return resolve_node::<S>(right, value, trackable);
+                }
+            }
             let branches: Vec<PathBranch<'a>> = resolve_node::<S>(left, value, trackable)?
                 .into_iter()
                 .filter(|(_, v)| v.is_truthy())
