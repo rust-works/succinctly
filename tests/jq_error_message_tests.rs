@@ -36,7 +36,15 @@ const KNOWN_DIVERGENCES: &str = include_str!("data/jq-error-known-divergences.tx
 /// `test_arg_non_string` needs no entry here — but that fallback doesn't
 /// support a flags argument at all, so `test_flags_non_string` (and, by the
 /// same reasoning, `test`'s *flagged* pattern-error probe,
-/// `test_arg_non_string_flagged`) still does.
+/// `test_arg_non_string_flagged`) still does. Same for #943's array-pattern
+/// unpacking: the non-regex fallback doesn't implement it at all, so any
+/// probe that depends on unpacking actually happening (`test`'s own
+/// `_array_pattern_bad_element`/`_array_pattern_bad_flags`, plus all of
+/// `match`/`capture`'s array probes, which need `regex` unconditionally
+/// regardless of unpacking) needs gating — except `test_array_pattern_empty`,
+/// which coincidentally matches on both configs, since an empty array never
+/// unpacks either way and both paths fall back to the same plain
+/// non-string-pattern check on the array itself.
 #[cfg(feature = "regex")]
 const FEATURE_GATED: &[&str] = &[];
 #[cfg(not(feature = "regex"))]
@@ -65,6 +73,12 @@ const FEATURE_GATED: &[&str] = &[
     "test_arg_non_string_flagged",
     "match_arg_non_string_flagged",
     "capture_arg_non_string_flagged",
+    "test_array_pattern_bad_element",
+    "test_array_pattern_bad_flags",
+    "match_array_pattern_empty",
+    "match_array_pattern_bad_element",
+    "capture_array_pattern_empty",
+    "capture_array_pattern_bad_element",
     // #930: these use `scan(...)` purely as a vehicle to reach a non-finite
     // value's `describe()` preview - `keys`/`.[]` would also work without
     // `regex`, but route the value through `to_json_for_reindex` first,

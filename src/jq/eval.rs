@@ -6778,6 +6778,10 @@ enum RegexArgFamily {
     /// (`flags_expr: None`) pattern error uses `not_string_or_array`,
     /// switching to `is_not_a_string` once a flags argument is present
     /// (#937), regardless of what the flags expression evaluates to.
+    /// Exception (#943): a bare-form call whose pattern is a non-empty
+    /// array unpacks it as `[pattern, flags, ...ignored]` instead, and
+    /// then *also* uses `is_not_a_string` for a bad unpacked element,
+    /// even though no flags argument was ever written at the call site.
     TestMatchCapture,
     /// `sub`: forces pattern before flags (the reverse — and unchanged
     /// from what this codebase already did before #942, since only the
@@ -6855,9 +6859,37 @@ fn eval_regex_pattern_and_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         }
     };
 
+    // #943: `test`/`match`/`capture`'s *bare* form (no `flags_expr` at all)
+    // additionally unpacks a non-empty array pattern as `[pattern, flags,
+    // ...ignored]` — undocumented but real jq behavior, confirmed live:
+    // `test(["a","i"])` behaves exactly like `test("a";"i")`, extra
+    // elements past index 1 are silently ignored (`test(["a","i","x"])`
+    // still succeeds), and a 1-element array supplies `null` flags
+    // (`test(["a"])` succeeds with no flags). Only a genuinely *empty*
+    // array (no element 0 to unpack) skips this and falls through to the
+    // plain non-string-pattern check below, using the array's own type
+    // name. Does not apply to `sub` (confirmed live: `sub(["a","i"];"b")`
+    // is a plain non-string-pattern error, no unpacking) or when
+    // `flags_expr` is itself present (`test(["a","i"]; "x")` is likewise
+    // a plain error — the two ways of supplying flags don't combine).
+    let (raw_pattern, raw_flags, array_unpacked) = match (family, flags_expr, raw_pattern) {
+        (RegexArgFamily::TestMatchCapture, None, OwnedValue::Array(items)) if !items.is_empty() => {
+            let mut items = items.into_iter();
+            let pattern = items.next().expect("checked non-empty above");
+            let flags = items.next();
+            (pattern, flags, true)
+        }
+        (_, _, raw_pattern) => (raw_pattern, raw_flags, false),
+    };
+
+    // Once an array pattern has been unpacked, both the pattern and flags
+    // slots use the same wording an explicit 2-arg call would — confirmed
+    // live even for a 1-element array with no explicit flags slot at all:
+    // `test([1])` -> "number (1) is not a string", not the bare "not a
+    // string or array" `test(1)` alone would give.
     let pattern = match raw_pattern {
         OwnedValue::String(s) => s,
-        v if flags_expr.is_some() || matches!(family, RegexArgFamily::Sub) => {
+        v if array_unpacked || flags_expr.is_some() || matches!(family, RegexArgFamily::Sub) => {
             return Err(QueryResult::Error(EvalError::is_not_a_string(&v)));
         }
         v => {
@@ -28616,6 +28648,113 @@ mod tests {
             query!(br#""abc""#, filter,
                 QueryResult::Owned(OwnedValue::Array(vs)) => {
                     assert!(vs.is_empty(), "filter: {filter}");
+                }
+            );
+        }
+    }
+
+    #[cfg(feature = "regex")]
+    #[test]
+    fn test_regex_bare_array_pattern_unpacks_as_regex_flags_943() {
+        // #943: test/match/capture's *bare* form (no flags argument at
+        // all) additionally accepts a non-empty array pattern, unpacking
+        // it as [pattern, flags, ...ignored] -- undocumented but real jq
+        // behavior. sub/gsub/scan/split/splits do NOT do this (a plain
+        // non-string-pattern error, verified separately below), and an
+        // array pattern combined with an explicit flags argument doesn't
+        // unpack either -- the two ways of supplying flags don't combine.
+        // Every case verified live against jq 1.7.1.
+
+        // Successful unpacking: 2-element [string, string], content
+        // verified against the equivalent 2-arg form's own known output.
+        query!(br#""abc""#, r#"test(["a", "i"])"#,
+            QueryResult::Owned(OwnedValue::Bool(b)) => {
+                assert!(b);
+            }
+        );
+        query!(br#""abc""#, r#"match(["a", "i"])"#,
+            QueryResult::Owned(OwnedValue::Object(obj)) => {
+                assert_eq!(obj.get("string"), Some(&OwnedValue::String("a".to_string())));
+                assert_eq!(obj.get("offset"), Some(&OwnedValue::Int(0)));
+            }
+        );
+        query!(br#""abc""#, r#"capture(["(?<x>a)", "i"])"#,
+            QueryResult::Owned(OwnedValue::Object(obj)) => {
+                assert_eq!(obj.get("x"), Some(&OwnedValue::String("a".to_string())));
+            }
+        );
+
+        // The unpacked flags slot reaches the same "g" (global) handling a
+        // real flags argument would -- multiple matches, not just one.
+        query!(br#""aaa""#, r#"match(["a", "g"])"#,
+            QueryResult::ManyOwned(matches) => {
+                assert_eq!(matches.len(), 3);
+                for m in &matches {
+                    let OwnedValue::Object(obj) = m else { panic!("expected object, got {m:?}") };
+                    assert_eq!(obj.get("string"), Some(&OwnedValue::String("a".to_string())));
+                }
+            }
+        );
+
+        // 1-element array: pattern only, missing flags slot behaves like
+        // an explicit `null` flags (still succeeds).
+        query!(br#""abc""#, r#"test(["a"])"#,
+            QueryResult::Owned(OwnedValue::Bool(b)) => {
+                assert!(b);
+            }
+        );
+
+        // Extra elements past index 1 are silently ignored, not an error.
+        query!(br#""abc""#, r#"test(["a", "i", "extra", "junk"])"#,
+            QueryResult::Owned(OwnedValue::Bool(b)) => {
+                assert!(b);
+            }
+        );
+
+        // A genuinely empty array has no element 0 to unpack, so it falls
+        // through to the plain non-string-pattern check on the array
+        // itself -- the *bare*-form wording (no value preview), since
+        // unpacking never happened.
+        for filter in [r"test([])", r"match([])", r"capture([])"] {
+            query!(br#""abc""#, filter,
+                QueryResult::Error(e) => {
+                    assert_eq!(e.message, "array not a string or array", "filter: {filter}");
+                }
+            );
+        }
+
+        // Once unpacked, a bad pattern or flags value uses the *flagged*-
+        // form wording (is_not_a_string, with a value preview) even
+        // though this is syntactically the bare 1-arg call -- confirmed
+        // live even for a 1-element array with no explicit flags slot:
+        // `test([1])` -> "number (1) is not a string", not `test(1)`'s
+        // own "number not a string or array".
+        for filter in ["test([1])", "test([1, 2])", "test([\"a\", 2])"] {
+            query!(br#""abc""#, filter,
+                QueryResult::Error(e) => {
+                    assert!(e.message.ends_with("is not a string"), "filter: {filter}: {}", e.message);
+                }
+            );
+        }
+
+        // An explicit flags argument suppresses unpacking entirely --
+        // the array is just an ordinary bad pattern value then, using
+        // the (already-established, #937) flagged-form wording.
+        query!(br#""abc""#, r#"test(["a", "i"]; "x")"#,
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "array ([\"a\",\"i\"]) is not a string");
+            }
+        );
+
+        // sub/gsub/scan/split/splits do not unpack array patterns at all.
+        for filter in [
+            r#"sub(["a", "i"]; "b")"#,
+            r#"gsub(["a", "i"]; "b")"#,
+            r#"scan(["a", "i"])"#,
+        ] {
+            query!(br#""abc""#, filter,
+                QueryResult::Error(e) => {
+                    assert!(e.message.starts_with("array ("), "filter: {filter}: {}", e.message);
                 }
             );
         }

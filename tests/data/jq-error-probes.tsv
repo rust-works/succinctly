@@ -256,6 +256,20 @@ test_arg_non_string_flagged	test(1; "")	"abc"
 match_arg_non_string_flagged	match(1; "")	"abc"
 capture_arg_non_string_flagged	capture(1; "")	"abc"
 
+# test/match/capture's *bare* form additionally unpacks a non-empty array
+# pattern as [pattern, flags, ...ignored] (#943, undocumented real jq
+# behavior). A genuinely empty array has no element 0 to unpack, so it
+# falls through to the plain bare-form wording using the array's own type
+# name; once unpacking succeeds, a bad element uses the flagged-form
+# wording instead, even for a 1-element array with no explicit flags slot.
+test_array_pattern_empty	test([])	"abc"
+match_array_pattern_empty	match([])	"abc"
+capture_array_pattern_empty	capture([])	"abc"
+test_array_pattern_bad_element	test([1])	"abc"
+match_array_pattern_bad_element	match([1])	"abc"
+capture_array_pattern_bad_element	capture([1])	"abc"
+test_array_pattern_bad_flags	test(["a", 2])	"abc"
+
 # ── Cannot check whether <t> has a <k> key ───────────────────────────────────
 has_string_on_number	has("a")	1
 has_string_on_array	has("a")	[1]
