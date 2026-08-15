@@ -9765,3 +9765,63 @@ fn test_builtin_in_keeps_earlier_candidates_before_a_later_type_mismatch_error_8
     );
     Ok(())
 }
+
+/// #966: a leniently-accepted-but-RFC-8259-invalid number (leading zero)
+/// no longer echoes its raw source text once materialized through
+/// `to_owned`/`OwnedValue` (array construction forces materialization,
+/// unlike bare `.` identity — see #974's follow-up for that remaining
+/// gap) -- it numerically sanitizes instead, matching what real jq would
+/// compute for the same digits.
+#[test]
+fn test_leading_zero_number_sanitizes_on_materialization_966() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-c", "[.a]"], Some(r#"{"a": 007}"#))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[7]\n");
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
+/// #966: a number with two decimal points was silently materializing as
+/// `0`; it now correctly falls through to `null`, since neither `i64` nor
+/// `f64` parses it (matching real jq's behavior of rejecting `1.2.3`
+/// outright -- succinctly's semi-indexing architecture is deliberately
+/// lenient about accepting it as a token in the first place, but the
+/// materialized *value* should never silently be a wrong number).
+#[test]
+fn test_malformed_two_dot_number_becomes_null_not_zero_966() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-c", "[.a]"], Some(r#"{"a": 1.2.3}"#))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[null]\n");
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
+/// #966: same as above for a bare `-` inside a number-like span (`1-2`
+/// isn't a valid number, isn't a valid subtraction expression either --
+/// it's one lenient semi-index token).
+#[test]
+fn test_malformed_bare_dash_number_becomes_null_not_zero_966() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-c", "[.a]"], Some(r#"{"a": 1-2}"#))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[null]\n");
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
+/// Sanity check that ordinary valid numbers (including ones that share a
+/// prefix shape with the invalid cases above -- trailing zero, exponent,
+/// bare zero) are completely unaffected by #966's new validity gate.
+#[test]
+fn test_valid_numbers_unaffected_by_966_validity_gate() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "."],
+        Some(r#"{"a": 42, "b": -3.14, "c": 1e10, "d": 0, "e": 1.50}"#),
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(
+        stdout,
+        "{\"a\":42,\"b\":-3.14,\"c\":1E+10,\"d\":0,\"e\":1.50}\n"
+    );
+    assert_eq!(stderr, "");
+    Ok(())
+}

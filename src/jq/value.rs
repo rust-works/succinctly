@@ -379,9 +379,10 @@ impl OwnedValue {
     ///
     /// Parses `literal` the same way every document-materializing conversion
     /// decides between the two representations: try `i64` first, fall back
-    /// to `f64`. Falls back to plain [`Float`](Self::Float) `0.0` if
-    /// `literal` parses as neither (should not happen for a valid document
-    /// number token).
+    /// to `f64`. Falls back to [`Null`](Self::Null) if `literal` parses as
+    /// neither (should not happen for a valid document number token, but
+    /// matches how every other decode-failure path in this codebase
+    /// represents "not actually a number" — #966).
     pub(crate) fn from_number_literal(literal: &str) -> Self {
         Self::from_number_literal_boxed(literal.into())
     }
@@ -395,7 +396,7 @@ impl OwnedValue {
         } else if let Ok(f) = literal.parse::<f64>() {
             NumberRepr::Float(f)
         } else {
-            return Self::Float(0.0);
+            return Self::Null;
         };
         Self::NumberLiteral(repr, literal)
     }
@@ -1461,13 +1462,14 @@ mod tests {
     }
 
     #[test]
-    fn test_from_number_literal_boxed_falls_back_to_zero_for_unparseable_text() {
-        // `from_number_literal_boxed` only ever receives valid document number
-        // tokens in practice, but it's defensive: neither an i64 nor f64 parse
-        // succeeding falls back to a plain zero rather than panicking.
+    fn test_from_number_literal_boxed_falls_back_to_null_for_unparseable_text() {
+        // Callers gate on `is_valid_number` before reaching this (#966), but
+        // it's defensive: neither an i64 nor f64 parse succeeding falls back
+        // to `Null` (matching every other decode-failure path in this
+        // codebase) rather than panicking or silently producing `0`.
         assert_eq!(
             OwnedValue::from_number_literal("not-a-number"),
-            OwnedValue::Float(0.0)
+            OwnedValue::Null
         );
     }
 

@@ -1661,7 +1661,18 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentValue for StandardJson<'a, W> {
 
     fn number_literal(&self) -> Option<Cow<'_, str>> {
         match self {
-            StandardJson::Number(n) => core::str::from_utf8(n.raw_bytes()).ok().map(Cow::Borrowed),
+            StandardJson::Number(n) => {
+                let bytes = n.raw_bytes();
+                if !crate::json::validate::is_valid_number(bytes) {
+                    // The semi-index scanner accepts number *spans* more
+                    // leniently than RFC 8259 (e.g. `007`, `1.2.3` — see
+                    // #966): echoing such text verbatim would produce
+                    // invalid JSON output. Fall through to `as_i64`/`as_f64`
+                    // (still lenient, but numerically sound) or `Null`.
+                    return None;
+                }
+                core::str::from_utf8(bytes).ok().map(Cow::Borrowed)
+            }
             _ => None,
         }
     }
