@@ -1153,24 +1153,94 @@ fn test_integer_valued_float_survives_slurp_eval_all_load_907() -> Result<()> {
     Ok(())
 }
 
-/// #907 companion: `standard_json_to_owned`'s removal (see the test above)
-/// changes `--slurp`/`--eval-all --input-format json`'s number formatting,
-/// not just YAML input's -- `StandardJson::number_literal()` is
-/// unconditional (unlike YAML's gated override), so every JSON number now
-/// preserves its own source spelling through this path instead of
-/// `as_i64`/`as_f64`'s lossy round-trip. Pinned against the pinned jq
-/// oracle: `echo '{"a":1e2}' | jq '.'` also gives `1E+2`, confirming this
-/// is a correctness fix (the old behavior silently normalized to `100.0`),
-/// not a new divergence.
+/// #907 companion, corrected by #978: `standard_json_to_owned`'s removal
+/// (see the test above) changed `--slurp`/`--eval-all --input-format
+/// json`'s number formatting, not just YAML input's -- `StandardJson::
+/// number_literal()` is unconditional (unlike YAML's gated override), so
+/// every JSON number briefly preserved its own source spelling through
+/// this path instead of `as_i64`/`as_f64`'s lossy round-trip. #907's own
+/// pin here (`1e2` -> `1E+2`) was checked against the pinned *jq* oracle,
+/// which genuinely does preserve it -- but yq's own JSON-input convention
+/// is different (#978): real yq *never* preserves a JSON-sourced number's
+/// spelling, touched or not (`jq` and `yq` diverge on this, confirmed
+/// live: `jq` keeps `1.0`, `yq --input-format json` always normalizes it
+/// to `1`). #978's `canonicalize_json_numbers` fixes this back to `100`,
+/// which is what this test now pins.
 #[test]
-fn test_json_input_slurp_preserves_exponent_literal_spelling_907() -> Result<()> {
+fn test_json_input_slurp_canonicalizes_exponent_literal_spelling_978() -> Result<()> {
     let (out, code) = run_yq_stdin(
         ".",
         "{\"a\":1e2}",
         &["--input-format", "json", "--slurp", "-o", "json", "-I", "0"],
     )?;
     assert_eq!(code, 0, "out: {out:?}");
-    assert_eq!(out.trim(), "[{\"a\":1E+2}]");
+    assert_eq!(out.trim(), "[{\"a\":100}]");
+    Ok(())
+}
+
+/// #978: unlike YAML input (#918, correctly preserved), real yq never
+/// preserves a JSON-sourced number's exact source spelling -- `1.0`
+/// renders as `1` whether touched by the filter or not, in every output
+/// format. Confirmed live against the pinned yq oracle for every case
+/// here. Two independent leak sites needed fixing:
+/// - the M2 fast path (`can_json_fast_path`/`can_yaml_fast_path`/
+///   `can_slurp_fast_path`, `src/bin/succinctly/yq_runner.rs`) streams a
+///   scalar's value straight from the parsed cursor without ever
+///   materializing an `OwnedValue`, so it doesn't go through this fix's
+///   `canonicalize_json_numbers` at all -- disabled outright for explicit
+///   `--input-format json`, falling back to the (now-fixed) DOM path.
+/// - `parse_input`'s `InputFormat::Json` arm (the DOM path's single
+///   choke point for every JSON-input call site: the default path,
+///   `--slurp`, `--eval-all`, `--split-exp`, `--inplace`'s DOM fallback)
+///   now recursively strips `NumberLiteral` down to bare `Int`/`Float`.
+#[test]
+fn test_json_input_never_preserves_literal_spelling_978() -> Result<()> {
+    // M2 path, default (YAML) output, bare identity.
+    let (out, code) = run_yq_stdin(".", "1.0", &["--input-format", "json"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "1");
+
+    // M2 path, default (YAML) output, field access + exponent notation.
+    let (out, code) = run_yq_stdin(
+        ".a",
+        "{\"a\": 1.50, \"b\": 1e2}",
+        &["--input-format", "json"],
+    )?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "1.5");
+
+    // M2 path, -o json output (previously already-correct for a plain
+    // decimal, but still leaked the exponent case via
+    // format_float_with_fraction's trailing-.0 preservation).
+    let (out, code) = run_yq_stdin(
+        ".",
+        "{\"a\": 1.50, \"b\": 1e2, \"c\": 3}",
+        &["--input-format", "json", "-o", "json", "-I", "0"],
+    )?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "{\"a\":1.5,\"b\":100,\"c\":3}");
+
+    // DOM path (a non-M2-streamable filter forces this regardless of the
+    // M2-path fix above).
+    let (out, code) = run_yq_stdin(
+        "[.a]",
+        "{\"a\": 1.50}",
+        &["--input-format", "json", "-o", "json", "-I", "0"],
+    )?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "[1.5]");
+
+    // YAML input (no --input-format json) must stay unaffected -- #918's
+    // literal preservation is correct there and this fix must not touch it.
+    // Default (YAML) output, not -o json: -o json on YAML-sourced input
+    // has its own separate, pre-existing trailing-zero-loss gap
+    // (`a: 1.50` -> `{"a":1.5}` via -o json, confirmed unrelated to and
+    // unchanged by this fix -- filed as a follow-up), which isn't what
+    // this assertion is trying to pin.
+    let (out, code) = run_yq_stdin(".a", "a: 1.50", &[])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "1.50");
+
     Ok(())
 }
 

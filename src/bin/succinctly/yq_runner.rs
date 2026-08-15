@@ -15,7 +15,8 @@ use succinctly::jq::eval_generic::{
     GenericResult,
 };
 use succinctly::jq::{
-    self, sync_aliased_paths, Builtin, EvalError, Expr, OwnedValue, QueryResult, YqSemantics,
+    self, sync_aliased_paths, Builtin, EvalError, Expr, NumberRepr, OwnedValue, QueryResult,
+    YqSemantics,
 };
 use succinctly::json::JsonIndex;
 use succinctly::yaml::{
@@ -400,6 +401,36 @@ fn gather_input_sources(
     Ok(GatheredSources::Sources(sources))
 }
 
+/// Recursively collapses every `NumberLiteral` in `value` into a bare
+/// `Int`/`Float`, discarding the number's original source-text spelling.
+///
+/// Unlike YAML input (#918, correctly preserved), real `yq` never
+/// preserves a JSON-sourced number's exact spelling — `1.0` always renders
+/// as `1`, whether touched by the filter or not — most plausibly because
+/// its `--input-format json` path reads through Go's `encoding/json` into
+/// a plain `float64`, with no "untouched literal" concept at all (#978).
+/// `generic_to_owned` (this crate's shared `OwnedValue` materializer) has
+/// no such format-awareness — it's also `succinctly jq`'s own conversion,
+/// which correctly *does* preserve JSON literal spelling — so this stays
+/// local to `yq_runner.rs`'s own JSON-input call sites rather than
+/// touching that shared function.
+fn canonicalize_json_numbers(value: OwnedValue) -> OwnedValue {
+    match value {
+        OwnedValue::NumberLiteral(NumberRepr::Int(n), _) => OwnedValue::Int(n),
+        OwnedValue::NumberLiteral(NumberRepr::Float(f), _) => OwnedValue::Float(f),
+        OwnedValue::Array(items) => {
+            OwnedValue::Array(items.into_iter().map(canonicalize_json_numbers).collect())
+        }
+        OwnedValue::Object(fields) => OwnedValue::Object(
+            fields
+                .into_iter()
+                .map(|(k, v)| (k, canonicalize_json_numbers(v)))
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
 /// Parse input bytes according to the specified format.
 fn parse_input(bytes: &[u8], format: InputFormat) -> Result<Vec<OwnedValue>> {
     match format {
@@ -407,7 +438,9 @@ fn parse_input(bytes: &[u8], format: InputFormat) -> Result<Vec<OwnedValue>> {
             // Parse as JSON
             let index = JsonIndex::build(bytes);
             let cursor = index.root(bytes);
-            Ok(vec![generic_to_owned(&cursor.value())])
+            Ok(vec![canonicalize_json_numbers(generic_to_owned(
+                &cursor.value(),
+            ))])
         }
         InputFormat::Yaml | InputFormat::Auto => {
             // Parse as YAML (Auto defaults to YAML when no extension hint)
@@ -2455,7 +2488,20 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
     //
     // Supports both JSON and YAML output formats.
     let is_identity = matches!(program.expr, Expr::Identity);
-    let is_m2_streamable = can_use_m2_streaming(&program.expr);
+    // #978: every M2 fast path below streams a scalar's *value* straight
+    // from the parsed cursor rather than materializing an OwnedValue, and
+    // neither streamer (JSON or YAML output) reliably discards a JSON
+    // number's own decimal-point/exponent spelling the way the DOM path's
+    // canonicalize_json_numbers now does - `can_json_fast_path`'s
+    // stream_resolved_scalar_as_json still keeps a computed whole-number
+    // float's trailing `.0` (matching #918's YAML convention, wrong for
+    // JSON input: `1e2` -> `100.0`, real yq gives `100`), and
+    // `can_yaml_fast_path`'s streamer echoes the raw source span outright
+    // (`1.50` stays `1.50`). Real yq never preserves a JSON-sourced
+    // number's literal spelling at all, so explicit `--input-format json`
+    // always falls back to the (already-fixed) DOM path instead.
+    let is_m2_streamable =
+        can_use_m2_streaming(&program.expr) && args.input_format != InputFormat::Json;
     // pretty_print isn't implemented by the cursor streamers, so it still
     // falls back to the DOM path, unchanged, rather than silently ignoring
     // the flag the way compact mode already does today. `sort_keys` and
@@ -2545,6 +2591,10 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
     let can_slurp_fast_path = is_identity
         && can_stream_pretty_or_colored
         && output_config.output_format == OutputFormat::Yaml
+        // #978: same JSON-literal-spelling leak as can_yaml_fast_path above
+        // - this gate is YAML-output-only (see its own doc comment), so no
+        // JSON-output sibling to worry about excluding correctly here.
+        && args.input_format != InputFormat::Json
         && !args.null_input
         && !args.raw_input
         && args.front_matter.is_none()
