@@ -1330,6 +1330,53 @@ fn test_csv_numbers_not_quoted() {
     );
 }
 
+/// #991: a nested array/object element must reject the whole row instead
+/// of silently stringifying itself in -- confirmed live against jq 1.7.1:
+/// `[[1,2]] | @csv` is `"array ([1,2]) is not valid in a csv row"`.
+#[test]
+fn test_csv_rejects_nested_array_element_991() {
+    query!(b"[[1,2]]", "@csv",
+        QueryResult::Error(e) => {
+            assert_eq!(e.message, "array ([1,2]) is not valid in a csv row");
+        }
+    );
+}
+
+/// #991: same row-level rejection as the array case above, for an object
+/// element -- confirmed live: `[{"a":1}] | @csv` errors in jq 1.7.1.
+#[test]
+fn test_csv_rejects_nested_object_element_991() {
+    query!(br#"[{"a": 1}]"#, "@csv",
+        QueryResult::Error(e) => {
+            assert_eq!(e.message, r#"object ({"a":1}) is not valid in a csv row"#);
+        }
+    );
+}
+
+/// #991: @tsv shares @csv's row-level rejection for nested arrays/objects.
+/// jq's own error wording says "csv row" even for `@tsv` (confirmed live,
+/// jq 1.7.1) -- a real jq wording quirk reproduced here, not a succinctly
+/// bug.
+#[test]
+fn test_tsv_rejects_nested_array_element_991() {
+    query!(b"[[1,2]]", "@tsv",
+        QueryResult::Error(e) => {
+            assert_eq!(e.message, "array ([1,2]) is not valid in a csv row");
+        }
+    );
+}
+
+/// #991: `@dsv` is documented as CSV-compatible (`@dsv(",")` == `@csv`),
+/// so it shares the same row rejection for a nested array/object element.
+#[test]
+fn test_dsv_rejects_nested_array_element_991() {
+    query!(b"[[1,2]]", r#"@dsv("|")"#,
+        QueryResult::Error(e) => {
+            assert_eq!(e.message, "array ([1,2]) is not valid in a csv row");
+        }
+    );
+}
+
 // =============================================================================
 // Compatibility tests - @base64d edge cases
 // =============================================================================

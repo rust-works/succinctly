@@ -5003,18 +5003,40 @@ fn quote_csv_field(s: &str) -> String {
     format!("\"{}\"", s.replace('"', "\"\""))
 }
 
+/// Format one row element for `@csv`/`@tsv`/`@dsv`, sharing the
+/// null/nested-container/scalar handling all three already agreed on
+/// (only string quoting differs, via `quote_string`) so the rule has one
+/// definition instead of three copies that could silently diverge — the
+/// same reasoning `quote_csv_field` above was already extracted for
+/// (#651).
+///
+/// #991: a nested array/object element rejects the whole row instead of
+/// stringifying itself in — confirmed live: `[[1,2]] | @csv` errors in jq
+/// 1.7.1, and jq's own wording says "csv row" even for `@tsv` (a real jq
+/// wording quirk, not a succinctly bug). `@dsv` has no real jq equivalent
+/// to verify against (confirmed live: `@dsv(...)` is a syntax error in jq
+/// 1.7.1) — its use of this same rule is succinctly's own policy choice,
+/// following its documented CSV-compatibility (`@dsv(",")` == `@csv`).
+fn format_csv_row_element(
+    v: &OwnedValue,
+    quote_string: impl Fn(&str) -> String,
+) -> Result<String, EvalError> {
+    match v {
+        OwnedValue::String(s) => Ok(quote_string(s)),
+        OwnedValue::Null => Ok(String::new()),
+        OwnedValue::Array(_) | OwnedValue::Object(_) => Err(EvalError::not_valid_in_csv_row(v)),
+        other => Ok(owned_to_string(other)),
+    }
+}
+
 /// @csv - CSV format (for arrays)
 fn format_csv(value: &OwnedValue, optional: bool) -> Result<String, EvalError> {
     match value {
         OwnedValue::Array(arr) => {
-            let parts: Vec<String> = arr
+            let parts = arr
                 .iter()
-                .map(|v| match v {
-                    OwnedValue::String(s) => quote_csv_field(s),
-                    OwnedValue::Null => String::new(),
-                    other => owned_to_string(other),
-                })
-                .collect();
+                .map(|v| format_csv_row_element(v, quote_csv_field))
+                .collect::<Result<Vec<String>, EvalError>>()?;
             Ok(parts.join(","))
         }
         _ if optional => Ok(String::new()),
@@ -5028,18 +5050,17 @@ fn format_csv(value: &OwnedValue, optional: bool) -> Result<String, EvalError> {
 fn format_tsv(value: &OwnedValue, optional: bool) -> Result<String, EvalError> {
     match value {
         OwnedValue::Array(arr) => {
-            let parts: Vec<String> = arr
+            let parts = arr
                 .iter()
-                .map(|v| match v {
-                    OwnedValue::String(s) => s
-                        .replace('\\', "\\\\")
-                        .replace('\t', "\\t")
-                        .replace('\n', "\\n")
-                        .replace('\r', "\\r"),
-                    OwnedValue::Null => String::new(),
-                    other => owned_to_string(other),
+                .map(|v| {
+                    format_csv_row_element(v, |s| {
+                        s.replace('\\', "\\\\")
+                            .replace('\t', "\\t")
+                            .replace('\n', "\\n")
+                            .replace('\r', "\\r")
+                    })
                 })
-                .collect();
+                .collect::<Result<Vec<String>, EvalError>>()?;
             Ok(parts.join("\t"))
         }
         _ if optional => Ok(String::new()),
@@ -5053,14 +5074,10 @@ fn format_tsv(value: &OwnedValue, optional: bool) -> Result<String, EvalError> {
 fn format_dsv(value: &OwnedValue, delimiter: &str, optional: bool) -> Result<String, EvalError> {
     match value {
         OwnedValue::Array(arr) => {
-            let parts: Vec<String> = arr
+            let parts = arr
                 .iter()
-                .map(|v| match v {
-                    OwnedValue::String(s) => quote_csv_field(s),
-                    OwnedValue::Null => String::new(),
-                    other => owned_to_string(other),
-                })
-                .collect();
+                .map(|v| format_csv_row_element(v, quote_csv_field))
+                .collect::<Result<Vec<String>, EvalError>>()?;
             Ok(parts.join(delimiter))
         }
         _ if optional => Ok(String::new()),
