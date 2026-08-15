@@ -5761,7 +5761,7 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentValue for YamlValue<'a, W> {
     }
 
     /// Unlike JSON's own override, this only fires for a plain *float*
-    /// scalar whose raw text [`is_preservable_float_literal`] confirms is
+    /// scalar whose raw text `is_preservable_float_literal` confirms is
     /// both safe and worthwhile to echo - a YAML document has no separate
     /// "number token" grammar the way JSON does (`as_i64`/`as_f64` above do
     /// the same `resolve_plain` dispatch), so this can't unconditionally
@@ -5771,7 +5771,7 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentValue for YamlValue<'a, W> {
     /// emitters must use the carried value" (hex `0x2A`, octal `0o52`), and
     /// plain decimal ints never lose information through `as_i64`'s
     /// bare-`Int` path anyway, so there's no bug here to fix by echoing
-    /// their text. See [`is_preservable_float_literal`]'s doc comment for
+    /// their text. See `is_preservable_float_literal`'s doc comment for
     /// why a `Float` needs more than just finiteness gating: an earlier
     /// version of this override fired for every finite float unconditionally,
     /// which broke `tag` on a bare `.5` (invalid JSON number syntax) and
