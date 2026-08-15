@@ -24,14 +24,14 @@ For jq *feature* coverage rather than error wording, see
 
 ## Summary
 
-Measured against jq-1.7.1 over the 197 probes in
+Measured against jq-1.7.1 over the 205 probes in
 [`tests/data/jq-error-probes.tsv`](../../../tests/data/jq-error-probes.tsv), through
 **both** evaluators — the full one (`src/jq/eval.rs`) and the generic one
 (`src/jq/eval_generic.rs`, which the CLI uses):
 
 | Dimension                                    | Result               | Meaning                                            |
 |----------------------------------------------|----------------------|----------------------------------------------------|
-| **Message text** (both evaluators, verbatim) | **197/197 = 100.0%** | Byte-identical to jq                               |
+| **Message text** (both evaluators, verbatim) | **205/205 = 100.0%** | Byte-identical to jq                               |
 | **Wording divergences**                      | **0**                | Every probe that errors in both errors identically |
 | **Behaviour / parser gaps**                  | **0**                | succinctly does not raise the error at all         |
 

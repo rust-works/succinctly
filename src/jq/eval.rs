@@ -7309,7 +7309,7 @@ fn builtin_test_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Ok(OwnedValue::String(s)) => s,
         Ok(OwnedValue::Null) => String::new(),
         Ok(_) if optional => return QueryResult::None,
-        Ok(_) => return QueryResult::Error(EvalError::type_error("string", "flags")),
+        Ok(v) => return QueryResult::Error(EvalError::is_not_a_string(&v)),
         Err(e) => return e.into(),
     };
 
@@ -7367,7 +7367,7 @@ fn builtin_match_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Ok(OwnedValue::String(s)) => s,
         Ok(OwnedValue::Null) => String::new(),
         Ok(_) if optional => return QueryResult::None,
-        Ok(_) => return QueryResult::Error(EvalError::type_error("string", "flags")),
+        Ok(v) => return QueryResult::Error(EvalError::is_not_a_string(&v)),
         Err(e) => return e.into(),
     };
 
@@ -7387,7 +7387,7 @@ fn builtin_capture_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Ok(OwnedValue::String(s)) => s,
         Ok(OwnedValue::Null) => String::new(),
         Ok(_) if optional => return QueryResult::None,
-        Ok(_) => return QueryResult::Error(EvalError::type_error("string", "flags")),
+        Ok(v) => return QueryResult::Error(EvalError::is_not_a_string(&v)),
         Err(e) => return e.into(),
     };
 
@@ -7477,7 +7477,7 @@ fn builtin_sub_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Ok(OwnedValue::String(s)) => s,
         Ok(OwnedValue::Null) => String::new(),
         Ok(_) if optional => return QueryResult::None,
-        Ok(_) => return QueryResult::Error(EvalError::type_error("string", "flags")),
+        Ok(v) => return QueryResult::Error(EvalError::is_not_a_string(&v)),
         Err(e) => return e.into(),
     };
 
@@ -7574,7 +7574,18 @@ fn builtin_gsub_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Ok(OwnedValue::String(s)) => s,
         Ok(OwnedValue::Null) => String::new(),
         Ok(_) if optional => return QueryResult::None,
-        Ok(_) => return QueryResult::Error(EvalError::type_error("string", "flags")),
+        // jq builds this internally as `flags + "g"` (appending the global
+        // flag), so a non-string flags value hits jq's own `+` operator
+        // type check first — "<v> and \"g\" cannot be added", not a
+        // string-type error. Verified live: gsub(re;str;1) on any input ->
+        // "number (1) and string (\"g\") cannot be added".
+        Ok(v) => {
+            return QueryResult::Error(EvalError::binary_op(
+                &v,
+                &OwnedValue::String("g".to_string()),
+                BinOp::Add,
+            ))
+        }
         Err(e) => return e.into(),
     };
 
@@ -7623,7 +7634,18 @@ fn builtin_scan_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Ok(OwnedValue::String(s)) => s,
         Ok(OwnedValue::Null) => String::new(),
         Ok(_) if optional => return QueryResult::None,
-        Ok(_) => return QueryResult::Error(EvalError::type_error("string", "flags")),
+        // jq builds this internally as `"g" + flags` (prepending the
+        // global flag, unlike gsub's append) — see #730's g-prepend-vs-
+        // append finding. A non-string flags value hits jq's own `+`
+        // operator type check first, with "g" on the left. Verified live:
+        // scan(re;1) -> "string (\"g\") and number (1) cannot be added".
+        Ok(v) => {
+            return QueryResult::Error(EvalError::binary_op(
+                &OwnedValue::String("g".to_string()),
+                &v,
+                BinOp::Add,
+            ))
+        }
         Err(e) => return e.into(),
     };
 
@@ -7715,7 +7737,15 @@ fn builtin_split_regex<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Ok(OwnedValue::String(s)) => s,
         Ok(OwnedValue::Null) => String::new(),
         Ok(_) if optional => return QueryResult::None,
-        Ok(_) => return QueryResult::Error(EvalError::type_error("string", "flags")),
+        // Same "g" + flags concatenation as scan/splits — verified live:
+        // split(re;1) -> "string (\"g\") and number (1) cannot be added".
+        Ok(v) => {
+            return QueryResult::Error(EvalError::binary_op(
+                &OwnedValue::String("g".to_string()),
+                &v,
+                BinOp::Add,
+            ))
+        }
         Err(e) => return e.into(),
     };
 
@@ -7773,7 +7803,15 @@ fn builtin_splits_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Ok(OwnedValue::String(s)) => s,
         Ok(OwnedValue::Null) => String::new(),
         Ok(_) if optional => return QueryResult::None,
-        Ok(_) => return QueryResult::Error(EvalError::type_error("string", "flags")),
+        // Same "g" + flags concatenation as scan/split — verified live:
+        // splits(re;1) -> "string (\"g\") and number (1) cannot be added".
+        Ok(v) => {
+            return QueryResult::Error(EvalError::binary_op(
+                &OwnedValue::String("g".to_string()),
+                &v,
+                BinOp::Add,
+            ))
+        }
         Err(e) => return e.into(),
     };
 
@@ -28013,10 +28051,12 @@ mod tests {
             }
         );
 
-        // Non-string, non-null flags must still error.
+        // Non-string, non-null flags must still error — #928: jq's real
+        // wording here ("<v> is not a string"), not the old placeholder
+        // "expected string, got flags" this loosely matched before.
         query!(br#""abc""#, r#"test("a"; 5)"#,
             QueryResult::Error(e) => {
-                assert!(e.to_string().contains("flags"));
+                assert_eq!(e.message, "number (5) is not a string");
             }
         );
     }
