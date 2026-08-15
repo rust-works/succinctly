@@ -1035,13 +1035,13 @@ mod tests {
     /// #930: a `NumberLiteral` carries its document source text, so an
     /// overflowed one gets jq's literal-preserving text instead of `DBL_MAX`
     /// text - matching how real jq distinguishes an echoed literal from a
-    /// computed value. `format_number_jq_compat` is exercised directly
-    /// (rather than via a CLI-level `keys`/`.[]` probe) because those
-    /// operations round-trip an input document's value through
-    /// `OwnedValue::to_json_for_reindex` before an error can reach this
-    /// code, which substitutes its own `1e999` round-trip sentinel for the
-    /// original literal text (pre-existing, unrelated to this fix - see the
-    /// `#930` follow-up filed for it).
+    /// computed value. `format_number_jq_compat` is exercised directly here
+    /// rather than via a CLI-level `keys`/`.[]` probe purely to keep this a
+    /// focused unit test of the formatting logic on its own - `keys`/`.[]`
+    /// do reach this same text today (`OwnedValue::to_json_for_reindex`
+    /// reuses a document-sourced overflow literal's own text rather than
+    /// substituting its `1e999` round-trip sentinel, fixed by #939; see
+    /// `tests/jq_cli_tests.rs`'s CLI-level coverage of that bridge).
     #[test]
     fn test_stream_json_jq_number_literal_overflow_preserves_literal_text() {
         let mut buf = String::new();

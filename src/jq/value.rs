@@ -644,19 +644,30 @@ impl OwnedValue {
             Self::Float(f) if f.is_nan() => NAN_SENTINEL.to_string(),
             Self::NumberLiteral(NumberRepr::Float(f), _) if f.is_nan() => NAN_SENTINEL.to_string(),
             Self::Float(f) if f.is_infinite() => overflow_literal(*f).to_string(),
+            // A document-sourced overflow literal (`123e400`) is, by
+            // construction, already valid JSON number syntax that reparses
+            // to this exact `f64` - reusing it here (instead of the generic
+            // sentinel) lets `describe()`'s preview show the real source
+            // text (#930) instead of a disconnected "1e999"/"-1e999"
+            // placeholder (#939). `NumberLiteral` currently only ever comes
+            // from JSON parsing (`document.rs`'s `number_literal()` default
+            // returns `None`, and only `json/light.rs` overrides it - YAML
+            // has no override, so its `.inf`/`-.inf`/`.nan` always become a
+            // plain `Float`, handled by the arm above, never this one), so
+            // no further shape-checking is needed for correctness.
+            //
+            // The length cap *is* needed regardless of shape: the literal
+            // is otherwise-unbounded document text, and this function's
+            // callers (`reduce`/`foreach`/etc.'s per-iteration reindex
+            // bridge) can run it over the same unchanged value thousands of
+            // times - a bound this loose still comfortably covers any
+            // realistic overflow literal (reaching `f64::MAX` needs on the
+            // order of ~300 exponent digits at most) while keeping the
+            // *reused* case itself O(1)-ish rather than O(iterations x
+            // literal length) for a pathological one.
             Self::NumberLiteral(NumberRepr::Float(f), literal) if f.is_infinite() => {
-                // A document-sourced overflow literal (`123e400`) is, by
-                // construction, already valid JSON number syntax that
-                // reparses to this exact `f64` - reusing it here (instead of
-                // the generic sentinel) lets `describe()`'s preview show the
-                // real source text (#930) instead of a disconnected
-                // "1e999"/"-1e999" placeholder (#939). Only safe when the
-                // text is actually JSON-number-shaped: YAML's own `.inf`/
-                // `-.inf` tokens land here too (`is_infinite()` doesn't
-                // distinguish the two origins), and neither is valid JSON -
-                // `is_json_number_literal` tells them apart, falling back to
-                // the sentinel for those.
-                if is_json_number_literal(literal) {
+                const MAX_REUSED_LITERAL_LEN: usize = 256;
+                if literal.len() <= MAX_REUSED_LITERAL_LEN {
                     literal.to_string()
                 } else {
                     overflow_literal(*f).to_string()
@@ -682,22 +693,6 @@ impl OwnedValue {
             other => other.to_json(),
         }
     }
-}
-
-/// True if `s` is JSON-number-syntax-shaped: an optional leading `-`
-/// followed by an ASCII digit. Every JSON (or YAML plain-scalar) document
-/// number token satisfies this by construction, however it later
-/// overflows/underflows once parsed - JSON's own grammar has no number
-/// syntax starting with anything else. YAML's *special* float tokens
-/// (`.inf`, `-.inf`, `.nan`) do not satisfy it, which is exactly the
-/// distinction [`OwnedValue::to_json_for_reindex`] needs (#939): a real
-/// document number literal is always safe to echo back as JSON text (it
-/// already round-trips to the same value), but `.inf`-style text is not
-/// valid JSON at all and would break the reparse it's used for.
-fn is_json_number_literal(s: &str) -> bool {
-    s.strip_prefix('-')
-        .unwrap_or(s)
-        .starts_with(|c: char| c.is_ascii_digit())
 }
 
 /// A JSON number literal guaranteed to overflow to the correctly-signed
@@ -1419,14 +1414,14 @@ mod tests {
         assert_eq!(lit.to_json_for_reindex(), NAN_SENTINEL);
     }
 
-    /// #939: an infinite `NumberLiteral` backed by real JSON-number-shaped
-    /// document text (any magnitude-overflow literal, e.g. `123e400`) is
-    /// already guaranteed to reparse to this exact value - reusing it
-    /// avoids the disconnected `1e999`/`-1e999` sentinel leaking into a
-    /// downstream preview (#930's `format_overflow_literal_mantissa` can
-    /// then reformat the *real* text instead of the sentinel's).
+    /// #939: an infinite `NumberLiteral` backed by real document text (any
+    /// magnitude-overflow literal, e.g. `123e400`) is already guaranteed to
+    /// reparse to this exact value - reusing it avoids the disconnected
+    /// `1e999`/`-1e999` sentinel leaking into a downstream preview (#930's
+    /// `format_overflow_literal_mantissa` can then reformat the *real* text
+    /// instead of the sentinel's).
     #[test]
-    fn test_to_json_for_reindex_reuses_json_shaped_overflow_literal_text() {
+    fn test_to_json_for_reindex_reuses_overflow_literal_text() {
         let lit = OwnedValue::NumberLiteral(NumberRepr::Float(f64::INFINITY), "123e400".into());
         assert_eq!(lit.to_json_for_reindex(), "123e400");
 
@@ -1434,30 +1429,19 @@ mod tests {
         assert_eq!(lit.to_json_for_reindex(), "-1e400");
     }
 
-    /// #939: YAML's own special float tokens (`.inf`/`-.inf`) aren't valid
-    /// JSON number syntax - `to_json_for_reindex` must keep using the
-    /// generic sentinel for these rather than writing invalid JSON that
-    /// would fail the very reparse this function exists for.
+    /// #939 review: reusing the literal's own text is O(its length), and
+    /// this function's callers (`reduce`/`foreach`'s per-iteration reindex
+    /// bridge) can run it over the same unchanged value many times - so an
+    /// unbounded literal must fall back to the O(1) sentinel rather than
+    /// turning a loop into O(iterations x literal length). No realistic
+    /// document overflow literal is anywhere near this long (#930's own
+    /// tests only go up to a handful of digits before the exponent), so the
+    /// cap only ever trips on a pathological/adversarial one.
     #[test]
-    fn test_to_json_for_reindex_keeps_sentinel_for_non_json_shaped_literal() {
-        let lit = OwnedValue::NumberLiteral(NumberRepr::Float(f64::INFINITY), ".inf".into());
+    fn test_to_json_for_reindex_bounds_an_unrealistically_long_literal() {
+        let huge_literal = format!("{}e400", "9".repeat(300));
+        let lit = OwnedValue::NumberLiteral(NumberRepr::Float(f64::INFINITY), huge_literal.into());
         assert_eq!(lit.to_json_for_reindex(), "1e999");
-
-        let lit = OwnedValue::NumberLiteral(NumberRepr::Float(f64::NEG_INFINITY), "-.inf".into());
-        assert_eq!(lit.to_json_for_reindex(), "-1e999");
-    }
-
-    #[test]
-    fn test_is_json_number_literal() {
-        assert!(is_json_number_literal("123e400"));
-        assert!(is_json_number_literal("1e400"));
-        assert!(is_json_number_literal("-1e400"));
-        assert!(is_json_number_literal("0"));
-        assert!(!is_json_number_literal(".inf"));
-        assert!(!is_json_number_literal("-.inf"));
-        assert!(!is_json_number_literal(".nan"));
-        assert!(!is_json_number_literal(""));
-        assert!(!is_json_number_literal("-"));
     }
 
     #[test]
