@@ -6052,11 +6052,36 @@ fn builtin_test<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     optional: bool,
 ) -> QueryResult<'a, W> {
     // Evaluate the pattern
-    let pattern = match result_to_owned(eval_single::<W, S>(re_expr, value.clone(), optional)) {
-        Ok(OwnedValue::String(s)) => s,
-        Ok(_) if optional => return QueryResult::None,
-        Ok(v) => return QueryResult::Error(EvalError::not_string_or_array(v.type_name())),
+    let raw_pattern = match result_to_owned(eval_single::<W, S>(re_expr, value.clone(), optional)) {
+        Ok(v) => v,
         Err(e) => return e.into(),
+    };
+    // #956 (#943 follow-up): the bare form additionally unpacks a non-empty
+    // array pattern as `[pattern, flags, ...ignored]`, mirroring the
+    // regex-enabled `eval_regex_pattern_and_flags`'s own #943 fix -- this is
+    // real (if undocumented) jq behavior, not specific to having `regex`
+    // compiled in. `flags` (element 1, if present) is unpacked but then
+    // discarded: this fallback has no flag support at all regardless of
+    // pattern shape (it's already a documented approximation of full regex
+    // semantics), so `test(["a","i"])` behaves like `test("a")`, not like a
+    // real case-insensitive match. Confirmed against jq 1.7.1:
+    // `"abc" | test(["a","i"])` is `true` in both this fallback and the
+    // regex-enabled path (the `i` flag happens not to change the outcome
+    // for this particular pattern/input pair). Only a genuinely empty array
+    // falls through to the plain non-string-pattern check below, using the
+    // array's own type name -- same boundary #943 drew.
+    let array_unpacked = matches!(&raw_pattern, OwnedValue::Array(items) if !items.is_empty());
+    let raw_pattern = match raw_pattern {
+        OwnedValue::Array(items) if array_unpacked => {
+            items.into_iter().next().expect("checked non-empty above")
+        }
+        other => other,
+    };
+    let pattern = match raw_pattern {
+        OwnedValue::String(s) => s,
+        _ if optional => return QueryResult::None,
+        v if array_unpacked => return QueryResult::Error(EvalError::is_not_a_string(&v)),
+        v => return QueryResult::Error(EvalError::not_string_or_array(v.type_name())),
     };
 
     // Check if the input string contains the pattern (simple substring match)
@@ -27901,6 +27926,60 @@ mod tests {
             QueryResult::Owned(OwnedValue::Bool(b)) => {
                 assert!(!b);
             }
+        );
+    }
+
+    /// #956 (#943 follow-up): the non-regex `builtin_test` fallback (only
+    /// reachable with `regex` compiled out) unpacks a non-empty array
+    /// pattern the same way the regex-enabled path does, ignoring the
+    /// flags element entirely (this fallback has no flag support at all).
+    /// Confirmed against jq 1.7.1 (regex-enabled succinctly matches it
+    /// too): `"abc" | test(["a","i"])` is `true`.
+    #[test]
+    #[cfg(not(feature = "regex"))]
+    fn test_builtin_test_unpacks_bare_array_pattern_956() {
+        query!(br#""abc""#, r#"test(["a","i"])"#,
+            QueryResult::Owned(OwnedValue::Bool(b)) => {
+                assert!(b);
+            }
+        );
+        // Extra elements past index 1 are silently ignored, same as #943's
+        // regex-enabled behavior.
+        query!(br#""abc""#, r#"test(["a","i","x"])"#,
+            QueryResult::Owned(OwnedValue::Bool(b)) => {
+                assert!(b);
+            }
+        );
+        // A 1-element array (no flags slot at all) still unpacks.
+        query!(br#""abc""#, r#"test(["a"])"#,
+            QueryResult::Owned(OwnedValue::Bool(b)) => {
+                assert!(b);
+            }
+        );
+        // A non-matching pattern still returns false, not an error.
+        query!(br#""abc""#, r#"test(["z"])"#,
+            QueryResult::Owned(OwnedValue::Bool(b)) => {
+                assert!(!b);
+            }
+        );
+        // A non-string unpacked pattern reports the array-unpacked wording,
+        // matching #943's regex-enabled precedent.
+        query!(br#""abc""#, r#"test([1,"i"])"#,
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "number (1) is not a string");
+            }
+        );
+        // A genuinely empty array falls through to the plain
+        // non-string-pattern check, using the array's own type name.
+        query!(br#""abc""#, r#"test([])"#,
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "array not a string or array");
+            }
+        );
+        // `optional` (`?`) suppresses an array-unpacked pattern error too,
+        // same as it already did for a plain non-string/array pattern.
+        query!(br#""abc""#, r#"test([1,"i"])?"#,
+            QueryResult::None => {}
         );
     }
 
