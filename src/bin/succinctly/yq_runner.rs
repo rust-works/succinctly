@@ -3773,6 +3773,28 @@ mod tests {
     use super::*;
     use succinctly::jq::NumberRepr;
 
+    /// `Builtin::FirstStream`/`LastStream` (the "Phase 13" builtin-table
+    /// spelling of `first(expr)`/`last(expr)`, distinct from the
+    /// `Expr::FirstExpr`/`LastExpr` the parser actually produces --
+    /// `parse_first_expr`/`parse_last_expr` are checked earlier in the
+    /// primary-expression dispatch, so `try_parse_builtin`'s construction of
+    /// these variants is unreachable from CLI input today) still needs the
+    /// same #997 recursion as its `Expr::FirstExpr`/`LastExpr` sibling, since
+    /// both arms share the exact risk this PR closes -- exercised directly
+    /// here since no filter string can reach it through the parser.
+    #[test]
+    fn test_can_use_m2_streaming_recurses_into_builtin_first_last_stream_997() {
+        let navigation = Expr::Builtin(Builtin::FirstStream(Box::new(Expr::Iterate)));
+        assert!(can_use_m2_streaming(&navigation));
+
+        let arithmetic = Expr::Builtin(Builtin::LastStream(Box::new(Expr::Arithmetic {
+            op: succinctly::jq::ArithOp::Add,
+            left: Box::new(Expr::Identity),
+            right: Box::new(Expr::Literal(succinctly::jq::Literal::Float(1e100))),
+        })));
+        assert!(!can_use_m2_streaming(&arithmetic));
+    }
+
     #[test]
     fn test_yaml_to_owned_value_string() {
         let yaml = b"name: Alice";
