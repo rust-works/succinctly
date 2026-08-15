@@ -10015,3 +10015,67 @@ fn test_skip_positive_and_zero_count_unaffected_983() -> Result<()> {
     assert_eq!(stdout, "[1,2,3]\n");
     Ok(())
 }
+
+/// #983 review: `limit`'s path-context resolver (`resolve_limit`, reached
+/// when `limit` appears inside a path/update expression like `|=`) shares
+/// `eval_limit`'s n-conversion rule but wasn't updated by the initial fix
+/// -- confirmed live against real jq 1.7.1, which gives unlimited
+/// passthrough here too.
+#[test]
+fn test_resolve_limit_negative_count_is_unlimited_not_error_983() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "(limit(-1; .a, .b) |= 99)"],
+        Some(r#"{"a": 1, "b": 2}"#),
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "{\"a\":99,\"b\":99}\n");
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
+/// #983 review: `limit`'s fix only matched `Int`/`NumberLiteral(Int)`;
+/// a negative *float* count fell through to the same error a negative
+/// int used to hit. jq's own comparison is type-generic, so a negative
+/// float takes the identical "no limit" branch -- verified against real
+/// jq 1.7.1.
+#[test]
+fn test_limit_negative_float_count_is_unlimited_not_error_983() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-cn", "[limit(-1.5; 1,2,3)]"], None)?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[1,2,3]\n");
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
+/// #983 review: a bool count argument (`true`/`false`) orders below every
+/// number in jq's total ordering, same as `null` -- verified against real
+/// jq 1.7.1, both give unlimited passthrough.
+#[test]
+fn test_limit_bool_count_is_unlimited_not_error_983() -> Result<()> {
+    for lit in ["true", "false"] {
+        let (stdout, stderr, code) =
+            run_jq_full(&["-cn", &format!("[limit({lit}; 1,2,3)]")], None)?;
+        assert_eq!(code, 0, "{lit}: stdout: {stdout:?} stderr: {stderr:?}");
+        assert_eq!(stdout, "[1,2,3]\n", "{lit}");
+        assert_eq!(stderr, "");
+    }
+    Ok(())
+}
+
+/// A *positive* non-integer float count is a separate, pre-existing gap
+/// (real jq bounds `limit(1.9; ...)` to 2 outputs via its fractional
+/// foreach-decrement loop; succinctly errors) deliberately left untouched
+/// by #983, which is scoped to the negative/null/bool "no limit" branch
+/// specifically. Pinned here so a future change doesn't accidentally
+/// widen #983's fix to also swallow this case silently.
+#[test]
+fn test_limit_positive_float_count_still_errors_983() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-cn", "[limit(1.9; 1,2,3)]"], None)?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert!(
+        stderr.contains("limit requires non-negative integer"),
+        "unexpected stderr: {stderr}"
+    );
+    Ok(())
+}

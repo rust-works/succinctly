@@ -10888,6 +10888,16 @@ fn resolve_limit<'a, S: EvalSemantics>(
         OwnedValue::Int(i) | OwnedValue::NumberLiteral(NumberRepr::Int(i), _) if i >= 0 => {
             i as usize
         }
+        // Same jq-matched "no limit at all" branch as `eval_limit` (#983):
+        // a negative count, `null`, or a bool (jq's total ordering places
+        // all three below every positive number) means unlimited
+        // passthrough, not an error.
+        OwnedValue::Int(_)
+        | OwnedValue::NumberLiteral(NumberRepr::Int(_), _)
+        | OwnedValue::Null
+        | OwnedValue::Bool(_) => {
+            return resolve_node::<S>(expr, value, trackable);
+        }
         _ => {
             return Err((
                 Vec::new(),
@@ -13464,15 +13474,26 @@ fn eval_limit<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Ok(OwnedValue::Int(i) | OwnedValue::NumberLiteral(NumberRepr::Int(i), _)) if i >= 0 => {
             i as usize
         }
-        // A negative count (or `null`, which jq's total ordering places
-        // below every number, taking the same branch a negative count
-        // would) means "no limit at all" per jq's own `def limit`, not an
-        // error -- verified against jq 1.7.1 (#983).
+        // A negative int, `null`, or a bool -- jq's total ordering places
+        // all three below every positive number, so each takes the same
+        // "no limit at all" branch of jq's own `def limit`, not an error
+        // -- verified against jq 1.7.1 (#983).
         Ok(
             OwnedValue::Int(_)
             | OwnedValue::NumberLiteral(NumberRepr::Int(_), _)
-            | OwnedValue::Null,
+            | OwnedValue::Null
+            | OwnedValue::Bool(_),
         ) => {
+            return eval_single::<W, S>(expr, value, optional);
+        }
+        // Same for a negative float. A *positive* non-integer float (e.g.
+        // `1.9`) is a separate, pre-existing gap (jq's own fractional
+        // foreach-decrement loop bounds it to 2 outputs; succinctly errors
+        // instead) left untouched here -- out of #983's scope, which is
+        // specifically the negative/null/bool "no limit" branch.
+        Ok(OwnedValue::Float(f) | OwnedValue::NumberLiteral(NumberRepr::Float(f), _))
+            if f < 0.0 =>
+        {
             return eval_single::<W, S>(expr, value, optional);
         }
         Ok(_) => {
@@ -19701,7 +19722,11 @@ fn builtin_limit<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    // Evaluate n
+    // Evaluate n. Same "no limit at all" branch as `eval_limit` for a
+    // negative count/null/bool (#983) -- this function is parser-
+    // unreachable today (see #981's investigation), but kept consistent
+    // so a future routing change can't silently reintroduce the bug this
+    // issue fixed in the live implementation.
     let n_result = eval_single::<W, S>(n_expr, value.clone(), optional);
     let n = match n_result {
         QueryResult::One(v) => {
@@ -19711,8 +19736,11 @@ fn builtin_limit<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 return QueryResult::Error(EvalError::type_error("number", type_name(&v)));
             }
         }
-        QueryResult::Owned(OwnedValue::Int(i)) => i as usize,
-        QueryResult::Owned(OwnedValue::Float(f)) => f as usize,
+        QueryResult::Owned(OwnedValue::Int(i)) if i >= 0 => i as usize,
+        QueryResult::Owned(OwnedValue::Float(f)) if f >= 0.0 => f as usize,
+        QueryResult::Owned(
+            OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::Null | OwnedValue::Bool(_),
+        ) => return eval_single::<W, S>(expr, value, optional),
         QueryResult::Error(e) => return QueryResult::Error(e),
         _ => return QueryResult::Error(EvalError::type_error("number", "null")),
     };
