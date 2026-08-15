@@ -1818,22 +1818,95 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         }
     }
 
-    /// The #901 sibling of [`Self::compact_mapping_gap_reaches`]: `indent`
-    /// falls strictly between an open mapping's own indent and its
-    /// immediate parent *mapping's* indent (not a `SequenceItem`).
+    /// The #901 sibling of [`Self::compact_mapping_gap_reaches`]: whether
+    /// `indent` would land ambiguously if [`Self::close_deeper_indents`]
+    /// popped every frame deeper than it -- the surviving (landing) frame's
+    /// own recorded indent doesn't exactly match `indent`, so the line
+    /// belongs to neither the frame(s) that would be popped nor the one it
+    /// lands in unambiguously.
     ///
-    /// Unlike the `SequenceItem`-under-`Mapping` shape, there is no
-    /// unambiguous "exactly one possible enclosing scope" guarantee here —
-    /// so this reports the gap as an error condition rather than something
-    /// to normalize and tolerate. Bounds are strict (`>`/`<`), not
-    /// inclusive: `indent` matching either the parent's or the child's own
-    /// recorded indent exactly is the ordinary, unambiguous "sibling of
-    /// this level" case and must not be flagged here (verified against real
-    /// yq v4.53.3: both `a:\n    b: 1\nc: 2\n` and `a:\n    b: 1\n    c:
-    /// 2\n` parse cleanly; only a strictly-between indent like `a:\n    b:
-    /// 1\n  c: 2\n` is rejected, `did not find expected key`).
-    fn mapping_under_mapping_gap_reaches(&self, indent: usize) -> bool {
-        self.frame_gap_reaches(indent, NodeType::Mapping, NodeType::Mapping, false, false)
+    /// Originally scoped to only the top two stack frames (both `Mapping`)
+    /// — #958 found the identical silent-data-loss shape still reproduced,
+    /// unfixed, whenever the ambiguity wasn't between an *adjacent* pair:
+    /// a still-open intervening frame of any type (e.g. a `Sequence`
+    /// deferred as a mapping value) masked the top-two check entirely, and
+    /// a non-adjacent ancestor 3+ levels up was never examined since the
+    /// check only ever looked at `len-1`/`len-2`. Generalized here to walk
+    /// the whole stack instead, mirroring `close_deeper_indents`'s own
+    /// popping condition (`current_indent > new_indent`) exactly rather
+    /// than re-deriving a narrower approximation of it — so the two can't
+    /// silently drift apart the way #106 warns about.
+    ///
+    /// Index 0 is the permanent indent-0 root sentinel (pushed once in
+    /// `new`, never popped) — landing there is never flagged: real YAML
+    /// allows an indented top-level document (verified live: `  a: 1\n  b:
+    /// 2\n` parses cleanly), and the current root frame's own hardcoded
+    /// `0` isn't a real established indent to compare against, unlike
+    /// every other (real) frame's indent, which is always pinned by actual
+    /// prior content.
+    ///
+    /// Deliberately not restricted to a `Mapping` landing frame: verified
+    /// live that real yq rejects a mapping-entry-shaped line landing in an
+    /// *open sequence's* gap the same way (`a:\n  - x\n c: 1\n` errors,
+    /// `did not find expected key`) — succinctly had the identical
+    /// silent-data-loss bug there too before this fix, unrelated to
+    /// #901/#958's own named repros but the same root cause. An ordinary
+    /// sibling key landing exactly at a closed sequence's own indent
+    /// (`a:\n  - x\n  - y\nb: 1\n`) stays unaffected, since it matches the
+    /// landing frame's indent exactly.
+    ///
+    /// `for_sequence_item` must be `true` only for the `-` dispatch arm in
+    /// `parse_block_node`, which closes through
+    /// [`Self::close_deeper_indents_for_sequence_item`] rather than plain
+    /// `close_deeper_indents` — that closer has its own additional
+    /// tolerance (#325/#485: an out-dented `-` continuation of an *open
+    /// sequence*, checked via [`Self::sequence_frame_reaches`] at each
+    /// frame the walk would otherwise pop through), which a `key: value`
+    /// line landing in the same gap does **not** share (confirmed live:
+    /// `a:\n  - x\n c: 1\n` errors in real yq, but `a:\n  - x\n - y\n`
+    /// -- a `-` continuation at the identical out-of-range indent --
+    /// parses cleanly). Every other call site passes `false`.
+    fn mapping_under_mapping_gap_reaches(&self, indent: usize, for_sequence_item: bool) -> bool {
+        if self.indent_stack.len() < 2 {
+            return false;
+        }
+        // Defer to the top-two-frame-specific tolerances (#885's compact
+        // mapping continuation, #900's sequence-item continuation) when
+        // either applies: both are deliberate, oracle-verified "obvious
+        // extension" readings for a SequenceItem/Mapping pairing
+        // specifically (see their own doc comments), normalized by their
+        // own callers just after this check runs -- not a case with no
+        // valid reading at all, the way every other gap this function
+        // catches is. Checked before the walk below since this predicate
+        // is now general enough to otherwise also flag them (it no longer
+        // restricts itself to a Mapping-under-Mapping frame pairing).
+        if self.compact_mapping_gap_reaches(indent) || self.sequence_item_gap_reaches(indent) {
+            return false;
+        }
+        let top = self.indent_stack.len() - 1;
+        // `close_deeper_indents`/`close_deeper_indents_for_sequence_item`
+        // only ever pop (current_indent > new_indent) -- going deeper or
+        // staying flat at the current top frame never pops anything, so
+        // there's no landing-frame question to ask at all: it's either a
+        // new nested frame (handled by the caller opening one) or an
+        // ordinary sibling of the frame already open, both fine.
+        if indent >= self.indent_stack[top] {
+            return false;
+        }
+        let mut landing_idx = top;
+        while landing_idx > 0 && self.indent_stack[landing_idx] > indent {
+            // #325/#485's out-dented-sequence-continuation tolerance,
+            // mirrored from `close_deeper_indents_for_sequence_item`'s own
+            // per-frame check -- only reachable from the `-` dispatch arm.
+            if for_sequence_item
+                && self.type_stack[landing_idx] == NodeType::Sequence
+                && self.sequence_frame_reaches(landing_idx, indent)
+            {
+                return false;
+            }
+            landing_idx -= 1;
+        }
+        landing_idx > 0 && self.indent_stack[landing_idx] != indent
     }
 
     /// Check-and-error wrapper around [`Self::mapping_under_mapping_gap_reaches`]:
@@ -1842,9 +1915,15 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     /// instead of each site re-deriving it (#106's "duplicated predicates
     /// diverge silently" lesson) — the same check-and-error, `?`-friendly
     /// shape [`Self::reject_trailing_flow_content`] already uses for an
-    /// unrelated check in this file.
-    fn check_mapping_under_mapping_gap(&self, indent: usize) -> Result<(), YamlError> {
-        if self.mapping_under_mapping_gap_reaches(indent) {
+    /// unrelated check in this file. `for_sequence_item` forwards to
+    /// [`Self::mapping_under_mapping_gap_reaches`] -- see its own doc
+    /// comment for which call site must pass `true`.
+    fn check_mapping_under_mapping_gap(
+        &self,
+        indent: usize,
+        for_sequence_item: bool,
+    ) -> Result<(), YamlError> {
+        if self.mapping_under_mapping_gap_reaches(indent, for_sequence_item) {
             Err(YamlError::InconsistentIndentation {
                 offset: self.pos,
                 line: self.current_line(),
@@ -2347,7 +2426,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         // silently misattributing it. Checked before the #885 normalization
         // below since the two shapes are mutually exclusive on the parent
         // frame's type (SequenceItem vs. Mapping).
-        self.check_mapping_under_mapping_gap(indent)?;
+        self.check_mapping_under_mapping_gap(indent, false)?;
 
         // Normalize an inconsistently-indented continuation of an open
         // compact mapping to the mapping's own indent, so the
@@ -2696,7 +2775,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     /// The key can be any value: scalar, sequence, or mapping.
     fn parse_explicit_key(&mut self, indent: usize) -> Result<(), YamlError> {
         // Same ambiguous-gap error as parse_mapping_entry (#901).
-        self.check_mapping_under_mapping_gap(indent)?;
+        self.check_mapping_under_mapping_gap(indent, false)?;
 
         // Same gap-tolerant normalization as parse_mapping_entry (#885):
         // this function has the identical close/need-new-mapping shape.
@@ -2925,7 +3004,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     /// Parse an explicit value (`: value` after explicit key).
     fn parse_explicit_value(&mut self, indent: usize) -> Result<(), YamlError> {
         // Same ambiguous-gap error as parse_mapping_entry (#901).
-        self.check_mapping_under_mapping_gap(indent)?;
+        self.check_mapping_under_mapping_gap(indent, false)?;
 
         // Same gap-tolerant normalization as parse_mapping_entry (#885): an
         // inconsistently-indented `:` must not close the pending key's own
@@ -4989,8 +5068,12 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 // either, distinct from #900's SequenceItem-under-Mapping
                 // tolerance (`sequence_item_gap_reaches`), which
                 // `parse_sequence_item` still applies below this check for
-                // its own, different gap shape.
-                self.check_mapping_under_mapping_gap(indent)?;
+                // its own, different gap shape. `for_sequence_item: true`
+                // since this arm closes via
+                // `close_deeper_indents_for_sequence_item`, which has its
+                // own additional #325/#485 out-dented-continuation
+                // tolerance this check must not flag as ambiguous.
+                self.check_mapping_under_mapping_gap(indent, true)?;
                 self.parse_sequence_item(indent)?;
             }
             // Tab included in both arms below: the sibling `-` arm just above
@@ -5022,7 +5105,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             Some(b'{' | b'[') => {
                 // Flow mapping or sequence at document root
                 // Same ambiguous-gap error as parse_mapping_entry (#901, #959).
-                self.check_mapping_under_mapping_gap(indent)?;
+                self.check_mapping_under_mapping_gap(indent, false)?;
                 self.close_deeper_indents(indent);
                 self.parse_value(indent)?;
             }
@@ -5049,7 +5132,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                     self.parse_mapping_entry(indent)?;
                 } else {
                     // Same ambiguous-gap error as parse_mapping_entry (#901, #959).
-                    self.check_mapping_under_mapping_gap(indent)?;
+                    self.check_mapping_under_mapping_gap(indent, false)?;
                     self.close_deeper_indents(indent);
                     // Consume any leading `&anchor` and/or `!tag`, in either
                     // order, for non-mapping-key cases
@@ -5108,7 +5191,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                     self.parse_mapping_entry(indent)?;
                 } else {
                     // Same ambiguous-gap error as parse_mapping_entry (#901, #959).
-                    self.check_mapping_under_mapping_gap(indent)?;
+                    self.check_mapping_under_mapping_gap(indent, false)?;
                     // Standalone alias value
                     self.close_deeper_indents(indent);
                     self.parse_alias()?;
@@ -5123,7 +5206,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                     // Same ambiguous-gap error as parse_mapping_entry (#901,
                     // #959) - the original repro this issue was filed
                     // against.
-                    self.check_mapping_under_mapping_gap(indent)?;
+                    self.check_mapping_under_mapping_gap(indent, false)?;
                     // Scalar value - either bare document scalar or value in a container
                     self.close_deeper_indents(indent);
                     self.set_ib();

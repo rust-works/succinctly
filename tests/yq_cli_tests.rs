@@ -6858,6 +6858,119 @@ fn test_mapping_under_mapping_gap_agrees_across_all_dispatch_shapes() -> Result<
     Ok(())
 }
 
+// #958: #900/#901's ambiguous-gap check was only ever compared against the
+// top two stack frames, missing two related shapes a real document can hit:
+// a still-open intervening frame (of any type) masking the check entirely,
+// and a non-adjacent ancestor 3+ levels up that the top-two-only check never
+// examined. Generalized to walk the whole stack instead.
+
+#[test]
+fn test_ambiguous_gap_via_masked_intervening_frame_958() -> Result<()> {
+    // The intervening `y:` mapping's own deferred sequence value (`- a`)
+    // stays open when `x: 2` arrives, so the top frame is a Sequence, not
+    // a Mapping -- the original top-two-only check never even looked past
+    // it. Confirmed live: real yq v4.53.3 errors ("did not find expected
+    // key"); succinctly silently dropped "x: 2" before this fix.
+    let (_output, stderr, exit_code) = run_yq_stdin_with_stderr(
+        ".",
+        "z:\n    y:\n      - a\n  x: 2\n",
+        &["-o", "json", "-I0"],
+    )?;
+    assert_eq!(exit_code, 1, "stderr: {stderr:?}");
+    assert!(
+        stderr.contains("inconsistent indentation"),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_ambiguous_gap_via_non_adjacent_ancestor_958() -> Result<()> {
+    // `c: 2`'s indent (1) is ambiguous relative to the outermost `z:`
+    // mapping (indent 0), a grandparent -- not the immediately adjacent
+    // pair the original check compared. Confirmed live against yq v4.53.3.
+    let (_output, stderr, exit_code) =
+        run_yq_stdin_with_stderr(".", "z:\n  a:\n    b: 1\n c: 2\n", &["-o", "json", "-I0"])?;
+    assert_eq!(exit_code, 1, "stderr: {stderr:?}");
+    assert!(
+        stderr.contains("inconsistent indentation"),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_ambiguous_gap_via_sequence_item_non_adjacent_958() -> Result<()> {
+    // The #900 (sequence-item) side of the same generalization: `- d`
+    // lands ambiguously 3 levels up, past two intervening compact-mapping
+    // frames. Confirmed live against yq v4.53.3.
+    let (_output, stderr, exit_code) = run_yq_stdin_with_stderr(
+        ".",
+        "-   a:\n        b:\n            c: 1\n      - d\n",
+        &["-o", "json", "-I0"],
+    )?;
+    assert_eq!(exit_code, 1, "stderr: {stderr:?}");
+    assert!(
+        stderr.contains("inconsistent indentation"),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_ambiguous_gap_via_key_landing_in_sequence_958() -> Result<()> {
+    // Not one of #958's own named repros, but the same root cause: the
+    // generalized check is deliberately not restricted to a Mapping
+    // landing frame, so a mapping-entry-shaped line landing in an open
+    // *sequence's* gap is caught too. Confirmed live: real yq errors here;
+    // succinctly silently dropped "c: 1" before this fix. A `-`
+    // continuation at the identical indent stays valid (tested below),
+    // since #325/#485's tolerance is specific to that line shape.
+    let (_output, stderr, exit_code) =
+        run_yq_stdin_with_stderr(".", "a:\n  - x\n c: 1\n", &["-o", "json", "-I0"])?;
+    assert_eq!(exit_code, 1, "stderr: {stderr:?}");
+    assert!(
+        stderr.contains("inconsistent indentation"),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_ambiguous_gap_generalization_does_not_regress_existing_tolerances_958() -> Result<()> {
+    // Every pre-existing tolerance this generalization could plausibly
+    // have swallowed, pinned to stay valid.
+    for (yaml, expected) in [
+        // #901's own exact-match sibling cases.
+        ("a:\n    b: 1\nc: 2\n", r#"{"a":{"b":1},"c":2}"#),
+        ("a:\n    b: 1\n    c: 2\n", r#"{"a":{"b":1,"c":2}}"#),
+        // Indented top-level document (real YAML need not start at
+        // column 0) -- landing on the permanent root sentinel must never
+        // be flagged.
+        ("  a: 1\n  b: 2\n", r#"{"a":1,"b":2}"#),
+        // #900's compact-mapping-under-sequence-item continuation.
+        (
+            "-   a: 1\n  - b\n- c\n-   x: 9\n",
+            r#"[{"a":1},"b","c",{"x":9}]"#,
+        ),
+        // #885's exact-match deferred-value exception.
+        ("- k: &a\n  - 1\n", r#"[{"k":[1]}]"#),
+        // #325/#485's out-dented sequence-item continuation -- the
+        // exact shape that #958's generalization first broke before the
+        // `for_sequence_item` tolerance was threaded through.
+        ("b:\n    - x\n   - y\nc: 2\n", r#"{"b":["x","y"],"c":2}"#),
+        // An ordinary sibling key landing exactly at a closed sequence's
+        // own indent, distinct from the new key-in-sequence-gap error
+        // case above (this one matches the landing frame exactly).
+        ("a:\n  - x\n  - y\nb: 1\n", r#"{"a":["x","y"],"b":1}"#),
+    ] {
+        let (output, exit_code) = run_yq_stdin(".", yaml, &["-o", "json", "-I0"])?;
+        assert_eq!(exit_code, 0, "yaml: {yaml:?}, output: {output:?}");
+        assert_eq!(output.trim(), expected, "yaml: {yaml:?}");
+    }
+    Ok(())
+}
+
 #[test]
 fn test_flow_dash_without_whitespace_is_still_a_scalar() -> Result<()> {
     // A `-` not followed by whitespace is a legitimate plain scalar in flow
