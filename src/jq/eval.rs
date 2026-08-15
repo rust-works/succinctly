@@ -13107,11 +13107,18 @@ fn eval_owned_fast_path(
 
 /// Same evaluator as [`eval_owned_expr`], but keeps a `break` distinguishable
 /// from a real error via [`Control`] instead of collapsing it into a
-/// synthetic "break $label not in label" [`EvalError`] — needed by callers
-/// that run their operand through a loop of their own (`while`, `until`,
-/// `repeat`, `reduce`, `foreach`'s per-iteration UPDATE/EXTRACT) and must let
-/// a `break $label` inside that operand reach its enclosing `label` (#575).
-/// Same fix [`eval_slice_bound`] already applies to slice bounds.
+/// synthetic "break $label not in label" [`EvalError`] — needed by any
+/// caller that must let a `break $label` inside its operand reach its
+/// enclosing `label` (#575) but can't (or, for a caller needing every
+/// output rather than one collapsed value, shouldn't) use
+/// [`eval_owned_expr_fork`] directly. Direct callers today: `resolve_limit`
+/// (a single bound value, not a stream) and `builtin_paths_filter`'s
+/// root-node check (only ever cares whether the root escaped, not what it
+/// produced). `while`/`until`/`repeat`/`reduce`/`foreach`/`walk` all use
+/// `eval_owned_expr_fork` directly instead, since each needs the full
+/// `(Vec<OwnedValue>, Option<Control>)` shape to avoid silently dropping a
+/// trailing error/break behind values already produced (#855). Same fix
+/// [`eval_slice_bound`] already applies to slice bounds.
 fn eval_owned_expr_ctrl<S: EvalSemantics>(
     expr: &Expr,
     input: &OwnedValue,
@@ -13161,8 +13168,11 @@ fn eval_owned_expr_ctrl<S: EvalSemantics>(
         QueryResult::Break(label) => Err(Control::Break(label)),
         QueryResult::Halt(code) => Err(Control::Halt(code)),
         // A trailing halt is never droppable, unlike the `Error`/`Break`
-        // cases below: `repeat((. + 1, halt_error(3)))` must exit 3, not run
-        // to the iteration cap with the halt discarded once per round (#791).
+        // cases below: a caller looping on this function's own result (any
+        // of `resolve_limit`, `eval_owned_expr`'s further callers, or
+        // `builtin_paths_filter`'s root check) must see a halt that arrives
+        // after some values were already produced, not have it silently
+        // discarded (#791).
         QueryResult::Partial(_, Control::Halt(code)) => Err(Control::Halt(code)),
         // Same collapse-to-single-or-array policy as `Many`/`ManyOwned`
         // above; the trailing `Error`/`Break` is dropped, consistent with how
@@ -13834,7 +13844,19 @@ fn eval_repeat<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 ) -> QueryResult<'a, W> {
     let owned = to_owned(&value);
     let mut outputs: Vec<OwnedValue> = Vec::new();
-    const MAX_ITERATIONS: usize = 1000; // Limit to prevent infinite loops
+    // Bounds the round count for the one case a per-value budget can't
+    // reach: an `expr` that produces zero outputs every round (e.g.
+    // `repeat(empty)`) never charges `budget` below, so it would loop
+    // forever without this backstop.
+    const MAX_ITERATIONS: usize = 1000;
+    // Bounds total output size independent of `expr`'s own fan-out (#855
+    // follow-up): the per-round loop below used to push at most one
+    // (collapsed) value per round, implicitly capping output at
+    // `MAX_ITERATIONS`; extending with every value a multi-output round
+    // produces removes that implicit cap unless charged explicitly here,
+    // the same "width needs its own accounting" reasoning `foreach`'s own
+    // per-EXTRACT charge already documents.
+    let mut budget = REDUCE_FOREACH_MAX_STEPS;
 
     for _ in 0..MAX_ITERATIONS {
         // Evaluate expr with the original input each time, extending
@@ -13844,7 +13866,12 @@ fn eval_repeat<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // .+100)))]` on `0` is `[1,100,1,100,1,100]`, not
         // `[[1,100],[1,100],[1,100]]`.
         let (vals, control) = eval_owned_expr_fork::<S>(expr, &owned, optional);
-        outputs.extend(vals);
+        for val in vals {
+            if let Some(control) = charge_budget(&mut budget, "repeat") {
+                return finish_fork(outputs, Some(control), optional);
+            }
+            outputs.push(val);
+        }
         // The values already output no longer vanish, and an error with
         // no prior output surfaces as an error rather than empty output
         // (#495): `repeat(if . > 3 then error("boom") else .+1 end)` on
@@ -13856,7 +13883,7 @@ fn eval_repeat<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // then raises, matching jq exactly, instead of looping to
         // `MAX_ITERATIONS` with the error silently dropped every round.
         if let Some(control) = control {
-            return partial(outputs, control);
+            return finish_fork(outputs, Some(control), optional);
         }
     }
 
@@ -14199,83 +14226,96 @@ fn builtin_recurse_cond<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
 /// Builtin: walk(f) - recursively transform all values.
 ///
-/// The outermost application of `f` (to the fully children-processed root
-/// value) uses `eval_owned_expr_fork` directly, not `walk_impl`'s own
-/// (nested) collapsing behavior: a multi-output `f` that also errors partway
-/// through must surface the values it already produced before the error,
-/// not silently drop them (#855) — verified against jq 1.7.1: `walk(1,
-/// error("bad"))` on `5` prints `1` then raises, exit 5.
-///
-/// `f` applied at *nested* levels (inside `walk_impl`'s own recursion, for
-/// every array/object element) keeps its existing single-value-collapsing
-/// behavior unchanged — real jq's own `walk` recursively forks at every
-/// level (verified: `walk(1, 2)` on `5` prints `1` and `2` as two separate
-/// top-level outputs, not one array, with no error involved at all), so
-/// fully matching it would mean threading a value-stream through every
-/// level of tree recursion, with array/object using different combination
-/// rules (`map`'s flatten-concatenate vs `map_values`'s `|=`
-/// last-output-wins-or-delete) — real, separable design work tracked as a
-/// follow-up rather than attempted here. This fix's own scope is narrower:
-/// stop the outermost application from *silently swallowing* a trailing
-/// error/break behind values it already produced, exactly the shape #855
-/// reports.
+/// jq's own recursive definition (`def walk(f): def w: (if type == "object"
+/// then map_values(w) elif type == "array" then map(w) else . end) | f; w;`)
+/// genuinely forks at *every* recursion level, not just the outermost one
+/// (#855) — verified against jq 1.7.1: `walk(1, 2)` on the container `[5]`
+/// (not a scalar, which only exercises the outermost level) prints `[1,2]`
+/// as `.[0]`'s own two-way fork flattened into the rebuilt array, matching
+/// `map(w)`'s `[.[] | w]` semantics; `walk(1, error("bad"))` on `[5,6]`
+/// prints nothing at all before raising, matching `[...]`'s atomic
+/// construction (an interior error discards the whole array, not just the
+/// one element). `walk_impl` implements this directly: see its own doc
+/// comment for the two containers' differing combination rules and the
+/// verification behind each.
 fn builtin_walk<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     f: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
     let owned = to_owned(&value);
-    let processed = match walk_children::<S>(f, owned, optional) {
-        Ok(v) => v,
-        Err(e) => return e.into(),
-    };
-    let (vals, control) = eval_owned_expr_fork::<S>(f, &processed, optional);
+    let (vals, control) = walk_impl::<S>(f, owned, optional);
     finish_fork(vals, control, optional)
 }
 
-/// Recursively process `value`'s children (if it's an array/object), each
-/// via [`walk_impl`] -- shared by [`builtin_walk`] (for the outermost
-/// value, before its own fork-aware `f` application) and `walk_impl` itself
-/// (for a nested value, before *its* still-collapsing `f` application).
-fn walk_children<S: EvalSemantics>(
-    f: &Expr,
-    value: OwnedValue,
-    optional: bool,
-) -> Result<OwnedValue, EvalEscape> {
-    match value {
-        OwnedValue::Array(arr) => {
-            let new_arr: Result<Vec<_>, _> = arr
-                .into_iter()
-                .map(|v| walk_impl::<S>(f, v, optional))
-                .collect();
-            Ok(OwnedValue::Array(new_arr?))
-        }
-        OwnedValue::Object(obj) => {
-            let new_obj: Result<IndexMap<_, _>, _> = obj
-                .into_iter()
-                .map(|(k, v)| walk_impl::<S>(f, v, optional).map(|nv| (k, nv)))
-                .collect();
-            Ok(OwnedValue::Object(new_obj?))
-        }
-        other => Ok(other),
-    }
-}
-
-/// Implementation of walk - processes children first, then applies f.
+/// Recursively transform `value`, returning every output `f` produces for
+/// the whole (sub)tree and an optional trailing control if evaluation cut
+/// short partway through -- the same `(Vec<OwnedValue>, Option<Control>)`
+/// shape [`eval_owned_expr_fork`] returns, since this function's own final
+/// step *is* an `eval_owned_expr_fork` call (applying `f` to the
+/// already-processed value).
 ///
-/// Used for every *nested* value (array/object elements); the outermost
-/// value's own `f` application is [`builtin_walk`]'s job instead, via
-/// [`walk_children`] + `eval_owned_expr_fork` directly -- see that
-/// function's doc comment for why the two levels are treated differently.
+/// Array and object children combine their own sub-streams with two
+/// different rules, matching `map`/`map_values`'s real jq definitions
+/// exactly (each verified live against jq 1.7.1):
+/// - **Array** (`map(w) = [.[] | w]`): flatten-concatenate every child's
+///   full output stream into the rebuilt array. `walk(if type=="array"
+///   then . else (1,2) end)` on `[5,6]` is `[1,2,1,2]` (two elements, two
+///   outputs each, all four flattened) — not `[[1,2],[1,2]]`. A
+///   zero-output child drops out of the array entirely (`walk(if
+///   type=="array" then . else empty end)` on `[5,6]` is `[]`, not
+///   `[null,null]`).
+/// - **Object** (`map_values(w) = .[] |= w`): each key takes only the
+///   *first* output of its own child's stream, or is deleted if that
+///   stream is empty. `walk(if type=="object" then . else (1,2) end)` on
+///   `{"a":5}` is `{"a":1}`, not `{"a":2}` — jq's `|=` (via its
+///   `_modify`/`label`+`break` desugaring) commits the first successful
+///   update and never runs the rest of the stream. `walk(if
+///   type=="object" then . else empty end)` on `{"a":5}` is `{}`.
+///
+/// Both containers are atomic on error/break, matching how `[...]`/`{...}`
+/// construction works in jq generally: a child that returns a trailing
+/// `Control` aborts the *whole* container immediately, discarding every
+/// sibling already processed (not just that one child) — verified:
+/// `walk(if .==5 then error("x") else . end)` on `[5,6]` raises with no
+/// output at all, not a partial array.
 fn walk_impl<S: EvalSemantics>(
     f: &Expr,
     value: OwnedValue,
     optional: bool,
-) -> Result<OwnedValue, EvalEscape> {
-    let processed = walk_children::<S>(f, value, optional)?;
+) -> (Vec<OwnedValue>, Option<Control>) {
+    let processed = match value {
+        OwnedValue::Array(arr) => {
+            let mut new_arr = Vec::with_capacity(arr.len());
+            for v in arr {
+                let (vs, control) = walk_impl::<S>(f, v, optional);
+                new_arr.extend(vs);
+                if let Some(control) = control {
+                    return (Vec::new(), Some(control));
+                }
+            }
+            OwnedValue::Array(new_arr)
+        }
+        OwnedValue::Object(obj) => {
+            let mut new_obj = IndexMap::with_capacity(obj.len());
+            for (k, v) in obj {
+                let (vs, control) = walk_impl::<S>(f, v, optional);
+                if let Some(control) = control {
+                    return (Vec::new(), Some(control));
+                }
+                if let Some(new_v) = vs.into_iter().next() {
+                    new_obj.insert(k, new_v);
+                }
+            }
+            OwnedValue::Object(new_obj)
+        }
+        other => other,
+    };
 
-    // Then apply f to the processed value
-    eval_owned_expr::<S>(f, &processed, optional)
+    // Then apply f to the processed value, correctly threading Control
+    // (#855) at every level -- the same fork building block every other
+    // fork construct in this file uses.
+    eval_owned_expr_fork::<S>(f, &processed, optional)
 }
 
 /// Builtin: isvalid(expr) - check if expr succeeds without errors.
