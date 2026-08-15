@@ -6545,9 +6545,17 @@ fn test_mapping_under_mapping_gap_via_explicit_key() -> Result<()> {
 
 #[test]
 fn test_mapping_under_mapping_gap_via_explicit_value() -> Result<()> {
-    // `parse_explicit_value`'s own copy of the same check.
-    let (_output, stderr, exit_code) =
-        run_yq_stdin_with_stderr(".", "a:\n    b: 1\n  ? c\n  d: 3\n", &["-o", "json", "-I0"])?;
+    // `parse_explicit_value`'s own copy of the same check, genuinely
+    // exercised: the key (`? c`) is at the inner mapping's own valid indent
+    // (4), so it triggers no check itself -- only the *value* line (`: 2`)
+    // lands in the gap (indent 2). A key at the gap indent instead (as an
+    // earlier version of this test used) triggers `parse_explicit_key`'s
+    // copy before this one is ever reached, leaving this branch untested.
+    let (_output, stderr, exit_code) = run_yq_stdin_with_stderr(
+        ".",
+        "a:\n    b: 1\n    ? c\n  : 2\n",
+        &["-o", "json", "-I0"],
+    )?;
     assert_eq!(exit_code, 1);
     assert!(
         stderr.contains("inconsistent indentation"),
