@@ -3291,12 +3291,12 @@ fn test_pow_propagates_halt_in_argument() -> Result<()> {
 
 #[test]
 fn test_repeat_propagates_halt_instead_of_running_to_iteration_cap() -> Result<()> {
-    // `eval_owned_expr_ctrl`'s `Partial(vs, _control)` arm collapsed a
-    // multi-output result to first-value-or-array and dropped a trailing
-    // halt, so a `repeat` body that output a value and then halted on the
-    // *same* iteration kept looping instead of stopping -- silently
-    // discarding the halt every round until hitting the internal iteration
-    // cap. `repeat` is a succinctly extension (no upstream jq builtin), so
+    // A halt was already threaded correctly even before #855 (`eval_repeat`
+    // now uses `eval_owned_expr_fork`, not `eval_owned_expr_ctrl`, but both
+    // always propagated a trailing `Control::Halt` rather than silencing
+    // it) -- this pins that a `repeat` body producing a value and then
+    // halting on the *same* round stops immediately rather than looping.
+    // `repeat` is a succinctly extension (no upstream jq builtin), so
     // this is checked against succinctly's own contract: the halt must win
     // on the very first iteration, giving exit 3 and no output, not a
     // 1000-element array and exit 0.
@@ -7869,11 +7869,10 @@ fn test_resolve_node_getpath_multi_output_surfaces_real_error_not_a_fabricated_o
 
 #[test]
 fn test_walk_propagates_halt_from_f() -> Result<()> {
-    // `builtin_walk` applies `f` to the (already child-processed) root value
-    // via `eval_owned_expr_fork` + `finish_fork` (#855); for a scalar input
-    // like `1` there are no children, so this exercises the outermost
-    // application directly, and a halt from `f` propagates through
-    // `finish_fork`'s `partial`/`Control::Halt` handling into a `QueryResult`.
+    // `walk_impl` applies `f` via `eval_owned_expr_fork` at every level
+    // (#855, #960); a scalar input like `1` has no children, so this
+    // exercises that application directly, and a halt from `f` propagates
+    // through `finish_fork`'s `Control::Halt` handling into a `QueryResult`.
     // Verified against jq 1.7.1: `jq -n '1 | walk(halt_error(8))'` prints
     // nothing to stdout, dumps `1` (the value `f` was applied to) to stderr,
     // and exits 8.
@@ -7884,17 +7883,23 @@ fn test_walk_propagates_halt_from_f() -> Result<()> {
 }
 
 // ============================================================================
-// walk(f)/repeat(f) drop a trailing error/break after a multi-output f (#855)
+// walk(f)/repeat(f) drop a trailing error/break after a multi-output f
+// (#855), and don't fork on a multi-output f at all, independent of errors
+// (#960)
 // ============================================================================
 // eval_owned_expr_ctrl's Partial(vs, control) arm keeps the values `f`
-// already produced but silently drops the trailing Error/Break -- fixed for
-// repeat by switching its loop to eval_owned_expr_fork (which also fixes the
-// same collapse-to-array bug for a plain, non-erroring multi-output f), and
-// for walk by having builtin_walk apply the outermost f via
-// eval_owned_expr_fork directly rather than walk_impl's own (still
-// single-value-collapsing) recursive application. Real jq's own `walk`
-// forks at every recursion level, not just the outermost one -- fully
-// matching that is separable, bigger design work, tracked as a follow-up.
+// already produced but silently drops the trailing Error/Break. Fixed for
+// `repeat` by switching its loop to eval_owned_expr_fork (which also fixes
+// the same collapse-to-array bug for a plain, non-erroring multi-output f).
+// `walk_impl` implements jq's actual recursive fork semantics directly
+// (verified against jq 1.7.1 for every combination rule -- see its own doc
+// comment): array children flatten-concatenate their sub-streams (`map`),
+// object children take the first output or delete the key (`map_values`/
+// `|=`), and both are atomic on an interior error/break, discarding every
+// sibling already processed. This closes both #855 and #960 for walk; #960
+// remains open only in spirit for `repeat`, which cannot meaningfully
+// "recurse into children" (it's a flat loop over the unchanged original
+// input, not a tree), and already forks fully as of #855's own fix.
 
 #[test]
 fn test_walk_propagates_error_after_partial_output() -> Result<()> {
@@ -7955,6 +7960,157 @@ fn test_repeat_multi_output_extends_rather_than_collapses() -> Result<()> {
         run_jq_full(&["-c", "[limit(6; repeat((.+1, .+100)))]"], Some("0"))?;
     assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
     assert_eq!(stdout, "[1,100,1,100,1,100]\n");
+    Ok(())
+}
+
+#[test]
+fn test_repeat_empty_expr_yields_nothing_instead_of_looping_forever_on_nulls() -> Result<()> {
+    // `eval_owned_expr_ctrl` mapped a zero-output round to `Ok(Null)`, so
+    // `repeat(empty)` used to emit `MAX_ITERATIONS` `null`s; `eval_owned_expr_fork`
+    // reports zero-output rounds as genuinely zero values, so `repeat(empty)`
+    // now emits nothing at all -- jq itself has no oracle answer here (a
+    // bare `repeat(empty)` spins forever with no output either way, so this
+    // pins succinctly's own bounded behavior rather than a jq comparison).
+    let (stdout, stderr, code) = run_jq_full(&["-c", "[limit(3; repeat(empty))]"], Some("null"))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[]\n");
+    Ok(())
+}
+
+#[test]
+fn test_walk_array_multi_output_flattens_children_streams() -> Result<()> {
+    // `map(w) = [.[] | w]`: every child's own output stream flattens
+    // straight into the rebuilt array, not one sub-array per child.
+    // Verified against jq 1.7.1: `echo '[5,6]' | jq -c 'walk(if
+    // type=="array" then . else (1,2) end)'` is `[1,2,1,2]`.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r#"walk(if type=="array" then . else (1,2) end)"#],
+        Some("[5,6]"),
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[1,2,1,2]\n");
+    Ok(())
+}
+
+#[test]
+fn test_walk_array_zero_output_child_drops_out_of_the_array() -> Result<()> {
+    // Verified against jq 1.7.1: `echo '[5,6]' | jq -c 'walk(if
+    // type=="array" then . else empty end)'` is `[]`, not `[null,null]`.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r#"walk(if type=="array" then . else empty end)"#],
+        Some("[5,6]"),
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[]\n");
+    Ok(())
+}
+
+#[test]
+fn test_walk_object_multi_output_child_takes_the_first_value() -> Result<()> {
+    // `map_values(w) = .[] |= w`: jq's `|=` commits the *first* output of
+    // the update stream (via its `label`/`break` desugaring), not the
+    // last. Verified against jq 1.7.1: `echo '{"a":5}' | jq -c 'walk(if
+    // type=="object" then . else (1,2) end)'` is `{"a":1}`, not `{"a":2}`.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r#"walk(if type=="object" then . else (1,2) end)"#],
+        Some(r#"{"a":5}"#),
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "{\"a\":1}\n");
+    Ok(())
+}
+
+#[test]
+fn test_walk_object_zero_output_child_deletes_the_key() -> Result<()> {
+    // Verified against jq 1.7.1: `echo '{"a":5}' | jq -c 'walk(if
+    // type=="object" then . else empty end)'` is `{}`.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r#"walk(if type=="object" then . else empty end)"#],
+        Some(r#"{"a":5}"#),
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "{}\n");
+    Ok(())
+}
+
+#[test]
+fn test_walk_array_construction_is_atomic_on_an_interior_error() -> Result<()> {
+    // A child's error must discard the *whole* array being built, not just
+    // that one element -- matching how `[...]` construction works in jq
+    // generally. Verified against jq 1.7.1: `echo '[5,6]' | jq -c 'walk(if
+    // .==5 then error("x") else . end)'` raises with no output at all, not
+    // a partial array (e.g. `[6]` or `[null,6]`).
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r#"walk(if .==5 then error("x") else . end)"#],
+        Some("[5,6]"),
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert!(stderr.contains('x'), "stderr: {stderr:?}");
+    Ok(())
+}
+
+#[test]
+fn test_walk_nested_break_reaches_its_enclosing_label() -> Result<()> {
+    // Before this fix, a nested `f` application collapsed a `Control::Break`
+    // into a synthetic "break $label not in label" `EvalError` (the same
+    // #575 shape already fixed for `repeat`'s own single-level loop, now
+    // fixed for every level of `walk`'s tree recursion too). Verified
+    // against jq 1.7.1: `echo '[5]' | jq -c 'label $out | walk(if
+    // type=="number" then break $out else . end)'` prints nothing and
+    // exits 0 -- not a "break $out not in label" error.
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            r#"label $out | walk(if type=="number" then break $out else . end)"#,
+        ],
+        Some("[5]"),
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_walk_nested_error_reports_the_same_message_jq_does() -> Result<()> {
+    // Before this fix, a nested trailing error was silently absorbed and
+    // the *outermost* `f` was re-applied to the corrupted, partially-built
+    // tree instead -- reporting a synthetic error message and a spurious
+    // stdout value neither of which jq ever produces. Verified against jq
+    // 1.7.1: `echo '[5]' | jq -c 'walk(1, error(tostring))'` prints nothing
+    // to stdout and reports "5" (the value `f` was applied to, via
+    // `tostring`), not "[1]" (a rebuilt array `f` was never really applied
+    // to in the real evaluation).
+    let (stdout, stderr, code) = run_jq_full(&["-c", "walk(1, error(tostring))"], Some("[5]"))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert!(stderr.contains('5'), "stderr: {stderr:?}");
+    assert!(!stderr.contains('1'), "stderr: {stderr:?}");
+    Ok(())
+}
+
+#[test]
+fn test_walk_deep_nesting_does_not_overflow_the_stack() -> Result<()> {
+    // Regression guard: an earlier version of this fix split `walk_impl`
+    // into two mutually-recursive functions, adding a non-inlined stack
+    // frame per nesting level. Measured on a release build, that dropped
+    // the depth `walk(.)` could handle before overflowing from ~7000-8000
+    // down to ~6000-7000; on the debug build this test binary actually
+    // runs, frames are far larger and the safe/unsafe boundary sits
+    // between depth 500 and 700 post-fix (measured). Depth 200 here is
+    // comfortably under that boundary (leaving margin for a CI runner with
+    // a smaller default stack than the dev machine this was measured on)
+    // while still deep enough that reintroducing a meaningfully-sized
+    // per-level frame has a real chance of tripping it.
+    let depth = 200;
+    let input = format!("{}1{}", "[".repeat(depth), "]".repeat(depth));
+    // Compares stdout directly against the input text (both already
+    // whitespace-free) rather than round-tripping through jq's own `==`,
+    // whose comparison recursion could mask a `walk`-specific regression
+    // behind a stack limit of its own.
+    let (stdout, stderr, code) = run_jq_full(&["-c", "walk(.)"], Some(&input))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), input);
     Ok(())
 }
 
