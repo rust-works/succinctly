@@ -10519,19 +10519,32 @@ fn resolve_node<'a, S: EvalSemantics>(
         // unchanged or prune it, exactly like `Optional` above but driven by a
         // predicate instead of an error.
         //
-        // `cond` runs through `eval_owned_multi`, not `eval_owned_expr`, and
-        // republishes `value` once per truthy output rather than collapsing
-        // every output into one always-truthy array (#628, mirroring #627's
+        // `cond` runs through `eval_owned_multi_keep_partial`, not
+        // `eval_owned_multi`/`eval_owned_expr`, and republishes `value` once
+        // per truthy output rather than collapsing every output into one
+        // always-truthy array (#628, mirroring #627's
         // `builtin_recurse_cond`/`resolve_recurse` fix): confirmed against jq
         // 1.7.1, `path(select((false,false)))` is empty (not `[[]]`), and
         // `path(select((true,true)))` forks into two branches, `[[],[]]`.
+        // Keeping the partial prefix (rather than discarding it on a later
+        // error/break) matches jq's backtracking generator semantics: a
+        // later output of `cond` failing does not retroactively un-emit a
+        // branch an earlier truthy output already produced (#842/#854's
+        // precedent for `recurse`, independently live here too — #896).
+        // Confirmed against jq 1.7.1: `path(select((true, error("x"))))`
+        // prints `[]` (the branch for the already-produced `true`) before
+        // raising `x`.
         Expr::Builtin(Builtin::Select(cond)) => {
-            let cond_outputs = eval_owned_multi::<S>(cond, value).map_err(|e| (Vec::new(), e))?;
-            Ok(cond_outputs
+            let (cond_outputs, escape) = eval_owned_multi_keep_partial::<S>(cond, value);
+            let branches: Vec<PathBranch<'a>> = cond_outputs
                 .into_iter()
                 .filter(OwnedValue::is_truthy)
                 .map(|_| (Vec::new(), Cow::Borrowed(value)))
-                .collect())
+                .collect();
+            match escape {
+                Some(e) => Err((branches, e)),
+                None => Ok(branches),
+            }
         }
         Expr::Builtin(
             builtin @ (Builtin::Values
@@ -10569,18 +10582,24 @@ fn resolve_node<'a, S: EvalSemantics>(
         // evaluated at all, so a non-path `else` that is never reached
         // raises nothing (matches jq).
         //
-        // `cond` runs through `eval_owned_multi`, not `eval_owned_expr`, and
-        // forks once per output rather than collapsing every output into one
-        // always-truthy array (#628, mirroring #627): confirmed against jq
-        // 1.7.1, `path(if (false,false) then . else empty end)` is empty
-        // (not `[[]]`), and `path(if (true,true) then . else empty end)`
-        // resolves `then_branch` once per truthy output, `[[],[]]`.
+        // `cond` runs through `eval_owned_multi_keep_partial`, not
+        // `eval_owned_multi`/`eval_owned_expr`, and forks once per output
+        // rather than collapsing every output into one always-truthy array
+        // (#628, mirroring #627): confirmed against jq 1.7.1,
+        // `path(if (false,false) then . else empty end)` is empty (not
+        // `[[]]`), and `path(if (true,true) then . else empty end)`
+        // resolves `then_branch` once per truthy output, `[[],[]]`. Keeping
+        // the partial prefix (rather than discarding it on a later `cond`
+        // error/break) mirrors `Select` above and #842/#854's precedent for
+        // `recurse` — #896. Confirmed against jq 1.7.1:
+        // `path(if (true, error("x")) then . else empty end)` prints `[]`
+        // (the branch for the already-produced `true`) before raising `x`.
         Expr::If {
             cond,
             then_branch,
             else_branch,
         } => {
-            let cond_outputs = eval_owned_multi::<S>(cond, value).map_err(|e| (Vec::new(), e))?;
+            let (cond_outputs, escape) = eval_owned_multi_keep_partial::<S>(cond, value);
             let mut out = Vec::new();
             for c in cond_outputs {
                 let branch = if c.is_truthy() {
@@ -10596,7 +10615,10 @@ fn resolve_node<'a, S: EvalSemantics>(
                     }
                 }
             }
-            Ok(out)
+            match escape {
+                Some(e) => Err((out, e)),
+                None => Ok(out),
+            }
         }
 
         // `a // b`: resolve `a`, keep only its truthy branches — jq's `//`
@@ -10751,8 +10773,37 @@ fn resolve_node<'a, S: EvalSemantics>(
         // `.`), so it is checked the same way bare `Expr::Identity` is —
         // confirmed live, `path(try (.a, error([1,2,3])) catch getpath([]))`
         // raises `#530`'s classic "with result [1,2,3]".
+        // Keeps `arg`'s partial prefix (not `eval_owned_multi`'s
+        // all-or-nothing) for the same reason as `Select`/`If` above —
+        // #842/#854's precedent, independently live here too (#896).
+        // Confirmed against jq 1.7.1: `path(getpath((["a"], error("x"))))`
+        // on `{"a":1}` prints `["a"]` (the branch for the already-produced
+        // `["a"]`) before raising `x`. Only the exact single-array-output
+        // shape gets a bespoke partial-prefix branch here.
+        //
+        // Any other shape (zero outputs, 2+ outputs, or a non-array output)
+        // with *no* escape falls through to `resolve_leaf` exactly as
+        // before. But an escape alongside a non-single-array shape must NOT
+        // fall through the same way: `resolve_leaf` re-evaluates `expr` (the
+        // whole `GetPath(arg)` node) through a *different*, single-shot code
+        // path (`builtin_getpath` -> `eval_single` -> `result_to_owned`),
+        // whose `QueryResult::Partial` arm silently discards the escape it
+        // rediscovers and keeps only `arg`'s first output — for 2+ prior
+        // outputs this fabricates an unrelated "Invalid path expression"
+        // message that masks the real error entirely (found in review:
+        // `path(getpath((["a"],["b"],error("x")))) `on `{"a":1,"b":2}`
+        // reported "Invalid path expression with result 1" instead of `x`,
+        // strictly worse than discarding the fan-out prefix, the pre-existing
+        // #896 gap this arm doesn't attempt to close for this shape). Propagate
+        // the real escape directly instead, with an empty prefix — the same
+        // outcome `eval_owned_multi`'s old all-or-nothing `?` already gave
+        // for every escape in this shape, so this is not a regression versus
+        // pre-#896 `main`, just not a further improvement for it. Giving
+        // this shape its own full fan-out (like the single-array case now
+        // has) is out of scope here — `resolve_leaf`'s multi-output
+        // `result_to_owned` gap predates and is independent of #896.
         Expr::Builtin(Builtin::GetPath(arg)) => {
-            let values = eval_owned_multi::<S>(arg, value).map_err(|e| (Vec::new(), e))?;
+            let (values, escape) = eval_owned_multi_keep_partial::<S>(arg, value);
             if let [OwnedValue::Array(keys)] = values.as_slice() {
                 if !trackable && keys.is_empty() {
                     return Err((Vec::new(), EvalError::invalid_path_expression(value).into()));
@@ -10773,7 +10824,14 @@ fn resolve_node<'a, S: EvalSemantics>(
                     );
                     components.push(component);
                 }
-                return Ok(vec![(components, current)]);
+                let branch = (components, current);
+                return match escape {
+                    Some(e) => Err((vec![branch], e)),
+                    None => Ok(vec![branch]),
+                };
+            }
+            if let Some(e) = escape {
+                return Err((Vec::new(), e));
             }
             resolve_leaf::<S>(expr, value, trackable)
         }
@@ -11547,9 +11605,19 @@ fn resolve_index_expr<'a, S: EvalSemantics>(
     optional: bool,
     trackable: bool,
 ) -> PathResolveResult<'a> {
-    let keys = eval_owned_multi::<S>(key, value).map_err(|e| (Vec::new(), e))?;
+    // Keeps `key`'s partial prefix (not `eval_owned_multi`'s all-or-nothing)
+    // for the same reason as `Select`/`If`/`GetPath`'s argument — #842/#854's
+    // precedent, independently live here too (#896). Confirmed against jq
+    // 1.7.1: `path(.[("a", error("x"))])` on `{"a":1,"b":2}` prints `["a"]`
+    // (the branch for the already-produced `"a"`) before raising `x`. A
+    // bare escape (zero prior `key` outputs) still propagates with an empty
+    // prefix, same as every other bare-escape site in this file.
+    let (keys, key_escape) = eval_owned_multi_keep_partial::<S>(key, value);
     if keys.is_empty() {
-        return Ok(Vec::new());
+        return match key_escape {
+            Some(e) => Err((Vec::new(), e)),
+            None => Ok(Vec::new()),
+        };
     }
     // #843: `target` is a no-op read of the untracked value itself, so the
     // key computed above is the first real navigation attempted against it
@@ -11565,7 +11633,22 @@ fn resolve_index_expr<'a, S: EvalSemantics>(
             EvalError::invalid_path_expression_near_access(&keys[0], value).into(),
         ));
     }
-    let target_branches = resolve_node::<S>(target, value, trackable)?;
+    // Keeps `target`'s own partial prefix too, not just `key`'s (#896
+    // review): `target` can itself now be one of #896's 4 fixed sites
+    // (`select`, `if`, `getpath`, a nested computed index), so its own
+    // `Err` can carry a non-empty prefix that still needs indexing by
+    // `keys` rather than being returned unindexed. Confirmed against jq
+    // 1.7.1: `path(select((true, error("t")))[("x", error("k"))])` on
+    // `{"a":1,"x":9}` prints `["x"]` (the already-produced `select` branch,
+    // indexed by `"x"`) before raising `t` — `key`'s own deferred escape
+    // (`k`) is never reached, since jq's `K as $k | E | .[$k]` compilation
+    // (this function's own doc comment) evaluates `E`'s whole generator,
+    // escape included, before ever asking `K`'s generator for its next
+    // value — so `target_escape` takes priority over `key_escape` below.
+    let (target_branches, target_escape) = match resolve_node::<S>(target, value, trackable) {
+        Ok(branches) => (branches, None),
+        Err((prefix, e)) => (prefix, Some(e)),
+    };
     // #843: `target` can also resolve successfully with `trackable: false`
     // through `Builtin::GetPath`'s own deliberate exemption (real jq lets
     // `getpath(P)` navigate an untracked value, matching how a literal
@@ -11640,7 +11723,13 @@ fn resolve_index_expr<'a, S: EvalSemantics>(
             out.push((path, Cow::Owned(next_value)));
         }
     }
-    Ok(out)
+    // `target_escape` first: see the comment on `target_branches`'s own
+    // computation above for why jq's evaluation order surfaces it ahead of
+    // `key_escape`.
+    match target_escape.or(key_escape) {
+        Some(e) => Err((out, e)),
+        None => Ok(out),
+    }
 }
 
 /// Resolve `E[S:T]` in path context, with or without a trailing `?`.

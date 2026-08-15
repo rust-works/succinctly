@@ -7726,6 +7726,147 @@ fn test_recurse_cond_own_multi_output_fanout_kept_before_error_854() -> Result<(
     Ok(())
 }
 
+/// #896: the same "drops an already-produced generator prefix on a later
+/// error" bug class #842/#854 fixed for `recurse`'s own `f`/`cond` loops was
+/// independently live in `resolve_node`'s `Select` arm — `cond` runs
+/// through the all-or-nothing `eval_owned_multi`, so an already-produced
+/// truthy branch was silently dropped instead of printed before the error.
+/// Verified against jq 1.7.1: `echo '1' | jq -c
+/// 'path(select((true, error("x"))))'` prints `[]` to stdout before
+/// erroring, and exits 5.
+#[test]
+fn test_resolve_node_select_keeps_cond_partial_fanout_before_error_896() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", r#"path(select((true, error("x"))))"#], Some("1"))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[]\n");
+    assert!(stderr.contains('x'), "stderr: {stderr:?}");
+    Ok(())
+}
+
+/// #896: same bug class as the `Select` test above, in `resolve_node`'s
+/// `If` arm's `cond` evaluation. Verified against jq 1.7.1: `echo '1' | jq
+/// -c 'path(if (true, error("x")) then . else empty end)'` prints `[]` to
+/// stdout before erroring, and exits 5.
+#[test]
+fn test_resolve_node_if_keeps_cond_partial_fanout_before_error_896() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r#"path(if (true, error("x")) then . else empty end)"#],
+        Some("1"),
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[]\n");
+    assert!(stderr.contains('x'), "stderr: {stderr:?}");
+    Ok(())
+}
+
+/// #896: same bug class, in `resolve_index_expr`'s computed-key evaluation
+/// (`.[EXPR]` where `EXPR` is a multi-output generator). Verified against
+/// jq 1.7.1: `echo '{"a":1,"b":2}' | jq -c 'path(.[("a", error("x"))])'`
+/// prints `["a"]` to stdout before erroring, and exits 5.
+#[test]
+fn test_resolve_index_expr_keeps_key_partial_fanout_before_error_896() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r#"path(.[("a", error("x"))])"#],
+        Some(r#"{"a":1,"b":2}"#),
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[\"a\"]\n");
+    assert!(stderr.contains('x'), "stderr: {stderr:?}");
+    Ok(())
+}
+
+/// #896: same bug class, in `resolve_node`'s `Builtin::GetPath` arm's
+/// argument evaluation. Verified against jq 1.7.1: `echo '{"a":1}' | jq -c
+/// 'path(getpath((["a"], error("x"))))'` prints `["a"]` to stdout before
+/// erroring, and exits 5.
+#[test]
+fn test_resolve_node_getpath_keeps_arg_partial_fanout_before_error_896() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r#"path(getpath((["a"], error("x"))))"#],
+        Some(r#"{"a":1}"#),
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[\"a\"]\n");
+    assert!(stderr.contains('x'), "stderr: {stderr:?}");
+    Ok(())
+}
+
+/// #896: a bare escape (zero prior outputs of the generator) must still
+/// propagate normally at each of the 4 sites above — the partial-keeping
+/// fix must not change this case. Verified against jq 1.7.1: both queries
+/// below print nothing to stdout and exit 5.
+#[test]
+fn test_resolve_node_896_sites_bare_error_still_propagates() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-c", r#"path(select(error("x")))"#], Some("1"))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert!(stderr.contains('x'), "stderr: {stderr:?}");
+
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", r#"path(.[(error("x"))])"#], Some(r#"{"a":1}"#))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert!(stderr.contains('x'), "stderr: {stderr:?}");
+    Ok(())
+}
+
+/// #896 review round: `resolve_index_expr`'s `target_branches =
+/// resolve_node::<S>(target, value, trackable)?` used to discard the whole
+/// prefix on any `target` error via `?` — harmless before #896, since none
+/// of the 4 fixed sites could ever produce a non-empty prefix on `Err`. Now
+/// that they can, that prefix has to be indexed by `keys` like any other
+/// target branch, not returned unindexed. Verified against jq 1.7.1:
+/// `echo '{"a":1,"x":9}' | jq -c 'path(select((true, error("t")))[("x",
+/// error("k"))])'` prints `["x"]` (the already-produced `select` branch,
+/// indexed by `"x"`) then raises `t` — `key`'s own deferred escape (`k`)
+/// is never reached, since jq's `K as $k | E | .[$k]` compilation (this
+/// function's own doc comment) exhausts `E`'s whole generator, escape
+/// included, before ever asking `K` for its next value.
+#[test]
+fn test_resolve_index_expr_indexes_targets_partial_fanout_before_its_own_error_896() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            r#"path(select((true, error("t")))[("x", error("k"))])"#,
+        ],
+        Some(r#"{"a":1,"x":9}"#),
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[\"x\"]\n");
+    assert!(stderr.contains('t'), "stderr: {stderr:?}");
+    assert!(!stderr.contains('k'), "stderr: {stderr:?}");
+    Ok(())
+}
+
+/// #896 review round: `GetPath`'s arm only builds its own partial-prefix
+/// branch for the exact single-array-output shape; any other shape (here,
+/// 2+ valid array outputs before the error) falls through to `resolve_leaf`,
+/// which re-evaluates `arg` from scratch via a different, single-shot code
+/// path that discards the escape it rediscovers — before this fix, that
+/// fabricated an unrelated "Invalid path expression" message instead of the
+/// real error. Now it at least surfaces the correct error (still without the
+/// fan-out, which needs a separate, larger fix to `resolve_leaf`'s own
+/// multi-output handling — out of scope here, filed separately). Verified
+/// against jq 1.7.1: `echo '{"a":1,"b":2}' | jq -c 'path(getpath((["a"],
+/// ["b"], error("x"))))'` prints `["a"]` then `["b"]` before raising `x`;
+/// this codebase intentionally only matches the error, not the fan-out.
+#[test]
+fn test_resolve_node_getpath_multi_output_surfaces_real_error_not_a_fabricated_one_896(
+) -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r#"path(getpath((["a"], ["b"], error("x"))))"#],
+        Some(r#"{"a":1,"b":2}"#),
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert!(stderr.contains('x'), "stderr: {stderr:?}");
+    assert!(
+        !stderr.contains("Invalid path expression"),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
 #[test]
 fn test_walk_propagates_halt_from_f() -> Result<()> {
     // `builtin_walk`'s `Err(e) => e.into()` arm: `walk_impl` applies `f` to
