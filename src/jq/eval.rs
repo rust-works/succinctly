@@ -28115,6 +28115,60 @@ mod tests {
 
     #[cfg(feature = "regex")]
     #[test]
+    fn test_regex_test_match_capture_sub_evaluate_pattern_before_flags_928() {
+        // #928 (review follow-up): test/match/capture/sub must evaluate the
+        // *pattern* argument before the *flags* argument, matching jq. A
+        // pre-fix version evaluated flags first, which — once the flags
+        // error stopped being an obviously-bogus placeholder and started
+        // looking like real jq wording (see #926) — silently blamed the
+        // wrong operand when both arguments were invalid, and skipped a
+        // side-effecting pattern expression's error() entirely. Every case
+        // verified live against jq 1.7.1. gsub/scan/split/splits are
+        // deliberately excluded: jq's own internal order for those already
+        // evaluates flags first (confirmed live), so no reordering was
+        // needed or made there.
+        // test/match/capture's pattern-check has no value preview
+        // ("<type> not a string or array" — a separate, pre-existing
+        // wording gap unrelated to evaluation order, tracked in #937), so
+        // the strongest same-shape check here is simply that it's *this*
+        // sentence (the pattern-argument one) that wins, not the flags-
+        // argument "is not a string" sentence #928 just added.
+        for filter in ["test(1; 2)", "match(1; 2)", "capture(1; 2)"] {
+            query!(br#""abc""#, filter,
+                QueryResult::Error(e) => {
+                    assert_eq!(
+                        e.message, "number not a string or array",
+                        "filter: {filter}"
+                    );
+                }
+            );
+        }
+
+        // sub's pattern-check already carries a value preview (#926), so
+        // this one *does* confirm the pattern's own value (1) wins over the
+        // flags' value (2).
+        query!(br#""abc""#, r#"sub(1; "b"; 2)"#,
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "number (1) is not a string");
+            }
+        );
+
+        // A side-effecting pattern expression's error() must propagate,
+        // not get silently skipped in favor of the flags check.
+        query!(br#""abc""#, r#"sub(error("PATTERN_ERR"); "b"; 2)"#,
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "PATTERN_ERR");
+            }
+        );
+        query!(br#""abc""#, r#"test(error("PATTERN_ERR"); error("FLAGS_ERR"))"#,
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "PATTERN_ERR");
+            }
+        );
+    }
+
+    #[cfg(feature = "regex")]
+    #[test]
     fn test_regex_lookahead_unsupported() {
         // #703: jq's oniguruma backend supports lookahead (`(?=...)`), but
         // succinctly's `regex` crate does not implement lookaround at all —
