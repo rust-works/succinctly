@@ -5141,6 +5141,25 @@ fn test_yaml_special_floats_to_json_are_null() -> Result<()> {
     Ok(())
 }
 
+/// #939: fixed `keys`/`.[]`-style previews of a document-sourced overflow
+/// *number* literal (`123e400`) to reuse the literal's own JSON-safe text
+/// instead of `OwnedValue::to_json_for_reindex`'s generic `1e999` sentinel.
+/// YAML's `.inf`/`-.inf` special tokens are a different, non-JSON-safe
+/// shape that fix deliberately left alone (writing `.inf` back out as JSON
+/// text to reparse would itself be invalid) - pinning that they still take
+/// the sentinel path, unchanged.
+#[test]
+fn test_yaml_special_float_keys_preview_still_uses_sentinel_text_939() -> Result<()> {
+    let (output, exit_code) = run_yq_stdin("try keys catch .", ".inf\n", &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "number (1E+999) has no keys\n");
+
+    let (output, exit_code) = run_yq_stdin("try keys catch .", "-.inf\n", &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "number (-1E+999) has no keys\n");
+    Ok(())
+}
+
 #[test]
 fn test_build_configuration_flag() -> Result<()> {
     // --build-configuration prints diagnostics and exits successfully.

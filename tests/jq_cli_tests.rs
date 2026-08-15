@@ -3958,6 +3958,45 @@ fn test_number_literal_overflow_owned_reindex_bridges_via_cli() -> Result<()> {
     Ok(())
 }
 
+/// #939: the same reindex bridges as the test above, but previewing the
+/// overflowed value itself (via `keys`) rather than converting it with
+/// `tostring`. `to_json_for_reindex` substituted a generic `1e999`/`-1e999`
+/// sentinel for *every* infinite `NumberLiteral`, discarding a document-
+/// sourced overflow literal's own text before #930's `describe()` fix ever
+/// got a chance to reformat it - so every such literal previewed
+/// identically regardless of its actual magnitude, e.g. `123e400` and
+/// `9e400` both showed `1E+999`. Oracle-verified: `reduce`/`with_entries`
+/// now reuse the literal's own text (matching real jq exactly), since it's
+/// already valid JSON number syntax guaranteed to reparse to this value.
+#[test]
+fn test_document_overflow_literal_keys_preview_via_reindex_bridges_cli_939() -> Result<()> {
+    let (output, code) = run_jq_stdin(
+        "try (reduce (1) as $x (.; .) | keys) catch .",
+        "123e400",
+        &[],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#""number (1.23E+402) has no keys""#);
+
+    let (output, code) = run_jq_stdin(
+        "try (reduce (1) as $x (.; .) | keys) catch .",
+        "-1e400",
+        &[],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#""number (-1E+400) has no keys""#);
+
+    let (output, code) = run_jq_stdin(
+        "try with_entries(.value |= (. | keys)) catch .",
+        r#"{"a":12.34e400}"#,
+        &[],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#""number (1.234E+401) has no keys""#);
+
+    Ok(())
+}
+
 /// `path`/`parent`/`parent(n)`/`key` used to silently answer `[]`/`{}`/`null`
 /// (the root-level defaults) whenever they weren't the very first pipe stage:
 /// the CLI's streaming evaluator (`eval_generic.rs`) bridged only the bare
