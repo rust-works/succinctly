@@ -747,7 +747,7 @@ pub fn validate(input: &[u8]) -> Result<(), ValidationError> {
 ///
 /// Grammar: optional `-`, `0`|`[1-9][0-9]*` integer part, optional
 /// `.`-fraction requiring ≥1 digit, optional exponent requiring ≥1 digit.
-/// This is the same grammar [`Validator::validate_number`] enforces as one
+/// This is the same grammar `Validator::validate_number` enforces as one
 /// step of a larger document walk (with position tracking and detailed
 /// error variants for diagnostics); this free function instead answers a
 /// narrower, allocation-free question for a caller that already has a

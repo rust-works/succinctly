@@ -417,7 +417,7 @@ impl OwnedValue {
     /// `pub(crate)`) should go through (#966 found at least 7 independent
     /// hand-rolled copies of this decision).
     ///
-    /// Checks [`is_nan_sentinel`] first, so every caller gets that
+    /// Checks `is_nan_sentinel` first, so every caller gets that
     /// `to_json_for_reindex`-bridge convention for free instead of having
     /// to remember its own copy of the check (an earlier draft of this
     /// function required exactly that, and three of its call sites forgot
