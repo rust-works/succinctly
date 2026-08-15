@@ -6752,13 +6752,54 @@ fn build_regex(pattern: &str, flags: Option<&str>) -> Result<JqRegex, EvalError>
     })
 }
 
+/// Evaluate `match`/`test`/`capture`'s shared pattern argument, applying
+/// jq's arity-dependent error wording (#937): the bare 1-arg form says
+/// "<type> not a string or array", but the 2-arg form (even with a
+/// valid/empty/`null` flags value) switches to "<v> is not a string"
+/// instead. `flags_expr` only needs to be checked for *presence* here
+/// (`is_some()`) — its own value has no bearing on which wording applies,
+/// and is evaluated separately by each caller afterward.
+///
+/// Shared by `builtin_match`/`builtin_test_with_flags`/
+/// `builtin_capture_with_flags` instead of duplicated per function
+/// (following the same-file precedent `sub_with_resolved_pattern` and
+/// `next_match_step` already set for this exact "one predicate, several
+/// builtins" shape — see #106's "duplicated predicates diverge silently").
+///
+/// No `Ok(_) if optional` guard: `optional` is never forced `true`
+/// reaching a nested `Call` like this one (see `Expr::Optional`'s
+/// dispatch in `eval_single`, #693) — a bare `?` suppresses this error via
+/// the ancestor `eval_try`'s catch, not locally.
+#[cfg(feature = "regex")]
+fn eval_regex_pattern_arg<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    re_expr: &Expr,
+    flags_expr: Option<&Expr>,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> Result<String, QueryResult<'a, W>> {
+    match result_to_owned(eval_single::<W, S>(re_expr, value, optional)) {
+        Ok(OwnedValue::String(s)) => Ok(s),
+        Ok(v) if flags_expr.is_some() => Err(QueryResult::Error(EvalError::is_not_a_string(&v))),
+        Ok(v) => Err(QueryResult::Error(EvalError::not_string_or_array(
+            v.type_name(),
+        ))),
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// Builtin: test(re) - test if string matches the regex
 ///
-/// jq defines this as `def test($re): test($re; null);` — delegate to the
-/// flags-aware implementation directly rather than duplicating its
-/// pattern/input fetch and regex build (#923), matching the established
-/// local convention `builtin_sub`/`builtin_gsub`/`builtin_splits`/
-/// `builtin_scan` already use post-#906/#913.
+/// jq defines this as `def test($re): test($re; null);`, but that's jq's
+/// own *definition*, not a literal call — delegating to
+/// `builtin_test_with_flags` with `flags_expr: None` (a real 1-arg call,
+/// not a synthesized `Some(null)`) is what reproduces jq's *observable*
+/// arity-dependent behavior (#937): a hand-rolled `Some(&Expr::Literal(
+/// Literal::Null))` here would flip `flags_expr.is_some()` to `true` and
+/// silently switch this bare form to the 2-arg error wording. Delegating
+/// this way also avoids duplicating the pattern/input fetch and regex
+/// build (#923), matching the established local convention
+/// `builtin_sub`/`builtin_gsub`/`builtin_splits`/`builtin_scan` already
+/// use post-#906/#913.
 #[cfg(feature = "regex")]
 fn builtin_test_regex<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     re_expr: &Expr,
@@ -6779,13 +6820,12 @@ fn builtin_match<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    // Get the pattern. No `Ok(_) if optional` guard: same reasoning as the
-    // flags-eval block below — `optional` is never forced `true` reaching a
-    // nested `Call` like this one (see `Expr::Optional`'s dispatch, #693).
-    let pattern = match result_to_owned(eval_single::<W, S>(re_expr, value.clone(), optional)) {
-        Ok(OwnedValue::String(s)) => s,
-        Ok(v) => return QueryResult::Error(EvalError::not_string_or_array(v.type_name())),
-        Err(e) => return e.into(),
+    // See `eval_regex_pattern_arg`'s doc comment for the arity-dependent
+    // wording rationale (#937) and why there's no `Ok(_) if optional` arm.
+    let pattern = match eval_regex_pattern_arg::<W, S>(re_expr, flags_expr, value.clone(), optional)
+    {
+        Ok(s) => s,
+        Err(qr) => return qr,
     };
 
     // Get the flags, now that the pattern is known valid. No `Ok(_) if
@@ -7345,13 +7385,12 @@ fn builtin_test_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    // Get the pattern. No `Ok(_) if optional` guard: same reasoning as the
-    // flags-eval block below — `optional` is never forced `true` reaching a
-    // nested `Call` like this one (see `Expr::Optional`'s dispatch, #693).
-    let pattern = match result_to_owned(eval_single::<W, S>(re_expr, value.clone(), optional)) {
-        Ok(OwnedValue::String(s)) => s,
-        Ok(v) => return QueryResult::Error(EvalError::not_string_or_array(v.type_name())),
-        Err(e) => return e.into(),
+    // See `eval_regex_pattern_arg`'s doc comment for the arity-dependent
+    // wording rationale (#937) and why there's no `Ok(_) if optional` arm.
+    let pattern = match eval_regex_pattern_arg::<W, S>(re_expr, flags_expr, value.clone(), optional)
+    {
+        Ok(s) => s,
+        Err(qr) => return qr,
     };
 
     // Get the flags, now that the pattern is known valid. No `Ok(_) if
@@ -7426,13 +7465,12 @@ fn builtin_capture_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    // Get the pattern. No `Ok(_) if optional` guard: same reasoning as the
-    // flags-eval block below — `optional` is never forced `true` reaching a
-    // nested `Call` like this one (see `Expr::Optional`'s dispatch, #693).
-    let pattern = match result_to_owned(eval_single::<W, S>(re_expr, value.clone(), optional)) {
-        Ok(OwnedValue::String(s)) => s,
-        Ok(v) => return QueryResult::Error(EvalError::not_string_or_array(v.type_name())),
-        Err(e) => return e.into(),
+    // See `eval_regex_pattern_arg`'s doc comment for the arity-dependent
+    // wording rationale (#937) and why there's no `Ok(_) if optional` arm.
+    let pattern = match eval_regex_pattern_arg::<W, S>(re_expr, flags_expr, value.clone(), optional)
+    {
+        Ok(s) => s,
+        Err(qr) => return qr,
     };
 
     // Get the flags, now that the pattern is known valid. No `Ok(_) if
@@ -28153,6 +28191,51 @@ mod tests {
 
     #[cfg(feature = "regex")]
     #[test]
+    fn test_regex_pattern_error_wording_switches_on_flags_arity_937() {
+        // #937: test/match/capture's pattern-argument error wording depends
+        // on which arity was actually called, not just the pattern's own
+        // type — the bare 1-arg form says "<type> not a string or array"
+        // (#926), but the 2-arg form switches to "<v> is not a string" even
+        // when the flags value itself is fine (a valid, empty, or `null`
+        // flags string). `sub` has no such split — its bare-vs-flagged
+        // wording is identical in real jq, so #926 already gave it
+        // `is_not_a_string` unconditionally and this fix doesn't touch it.
+        // Every case verified live against jq 1.7.1.
+
+        // Bare form: unchanged from #926 (not_string_or_array, no preview).
+        for filter in [r"test(1)", r"match(1)", r"capture(1)"] {
+            query!(br#""x""#, filter,
+                QueryResult::Error(e) => {
+                    assert_eq!(e.message, "number not a string or array", "filter: {filter}");
+                }
+            );
+        }
+
+        // Flagged form with a *valid* flags value still switches wording —
+        // it's the arity, not the flags value's own validity, that matters.
+        for filter in [
+            r#"test(1; "")"#,
+            r#"match(1; "")"#,
+            r#"capture(1; "")"#,
+            r"test(1; null)",
+            r"match(1; null)",
+            r"capture(1; null)",
+        ] {
+            query!(br#""x""#, filter,
+                QueryResult::Error(e) => {
+                    assert_eq!(e.message, "number (1) is not a string", "filter: {filter}");
+                }
+            );
+        }
+
+        // The both-arguments-invalid case (`test(1; 2)` etc.) is already
+        // covered by `test_regex_test_match_capture_sub_evaluate_pattern_
+        // before_flags_928`, which asserts the same flagged-form wording
+        // this test pins above — not repeated here.
+    }
+
+    #[cfg(feature = "regex")]
+    #[test]
     fn test_regex_test_match_capture_sub_evaluate_pattern_before_flags_928() {
         // #928 (review follow-up): test/match/capture/sub must evaluate the
         // *pattern* argument before the *flags* argument, matching jq. A
@@ -28160,22 +28243,40 @@ mod tests {
         // error stopped being an obviously-bogus placeholder and started
         // looking like real jq wording (see #926) — silently blamed the
         // wrong operand when both arguments were invalid, and skipped a
-        // side-effecting pattern expression's error() entirely. Every case
-        // verified live against jq 1.7.1. gsub/scan/split/splits are
-        // deliberately excluded: jq's own internal order for those already
-        // evaluates flags first (confirmed live), so no reordering was
-        // needed or made there.
-        // test/match/capture's pattern-check has no value preview
-        // ("<type> not a string or array" — a separate, pre-existing
-        // wording gap unrelated to evaluation order, tracked in #937), so
-        // the strongest same-shape check here is simply that it's *this*
-        // sentence (the pattern-argument one) that wins, not the flags-
-        // argument "is not a string" sentence #928 just added.
+        // side-effecting pattern expression's error() entirely. gsub/
+        // scan/split/splits are deliberately excluded: jq's own internal
+        // order for those already evaluates flags first (confirmed live),
+        // so no reordering was needed or made there.
+        //
+        // Every case below is verified live against jq 1.7.1 *except* the
+        // last one: `test(error(P); error(F))`'s asserted "PATTERN_ERR"
+        // pins succinctly's actual (current) behavior, not jq's — real jq
+        // returns "FLAGS_ERR" there, because it forces the *flags*
+        // argument before the pattern argument (propagating whichever
+        // errors first), and only afterward runs the pattern-preferred
+        // type-check this fix implements. All four builtins here
+        // (including `sub` — `sub(1; "b"; error("F"))` is "F" in jq, not
+        // this file's "number (1) is not a string") share that same
+        // deeper divergence; it just isn't exercised by the specific `sub`
+        // case below, where the pattern's own error() happens to still
+        // win because the flags value (2) doesn't raise. That's a real
+        // evaluation-order bug, not a wording gap — filed as #942, since
+        // fixing it means restructuring these builtins to evaluate both
+        // arguments before either can early-return, not just relabeling a
+        // message.
+        // test/match/capture's pattern-check switches to the "<v> is not a
+        // string" wording once a flags argument is present in the call
+        // (#937, a separate, pre-existing wording gap unrelated to
+        // evaluation order) — so on the 2-arg form used here, the pattern's
+        // error message is byte-identical in shape to what the flags-
+        // argument "is not a string" sentence #928 added. What distinguishes
+        // "pattern won" from "flags won" here is the *value* previewed: `1`
+        // (the pattern), not `2` (the flags).
         for filter in ["test(1; 2)", "match(1; 2)", "capture(1; 2)"] {
             query!(br#""abc""#, filter,
                 QueryResult::Error(e) => {
                     assert_eq!(
-                        e.message, "number not a string or array",
+                        e.message, "number (1) is not a string",
                         "filter: {filter}"
                     );
                 }
@@ -28198,6 +28299,9 @@ mod tests {
                 assert_eq!(e.message, "PATTERN_ERR");
             }
         );
+        // Pins current (jq-diverging) behavior, not jq parity — see the
+        // #942 discussion in this test's doc comment above. Real jq
+        // returns "FLAGS_ERR" here.
         query!(br#""abc""#, r#"test(error("PATTERN_ERR"); error("FLAGS_ERR"))"#,
             QueryResult::Error(e) => {
                 assert_eq!(e.message, "PATTERN_ERR");

@@ -245,6 +245,17 @@ scan_flags_non_string	scan("a"; 1)	"abc"
 split_flags_non_string	split("a"; 1)	"abc"
 splits_flags_non_string	splits("a"; 1)	"abc"
 
+# test/match/capture's *pattern*-argument error wording switches based on
+# call arity, not the pattern's own type (#937): the bare 1-arg form uses
+# `test_arg_non_string`'s "<t> not a string or array" wording above, but
+# the 2-arg form (even with a valid/empty flags value) switches to the
+# "<v> is not a string" wording instead — the gap the existing corpus
+# missed, since it only ever probed the bare form and the flags-argument
+# error separately, never a flagged call with a bad *pattern*.
+test_arg_non_string_flagged	test(1; "")	"abc"
+match_arg_non_string_flagged	match(1; "")	"abc"
+capture_arg_non_string_flagged	capture(1; "")	"abc"
+
 # ── Cannot check whether <t> has a <k> key ───────────────────────────────────
 has_string_on_number	has("a")	1
 has_string_on_array	has("a")	[1]
