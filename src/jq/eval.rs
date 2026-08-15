@@ -17541,13 +17541,7 @@ fn broken_down_time_from_unix_secs(secs: i64) -> Result<BrokenDownTime, EvalErro
     let weekday = (days % 7 + 4 + 7) % 7;
 
     // Calculate day of year (0-365, 0 = Jan 1)
-    let is_leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
-    let month_days: [i64; 12] = if is_leap {
-        [0, 31, 60, 91, 121, 152, 182, 213, 244, 274, 305, 335]
-    } else {
-        [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334]
-    };
-    let yearday = month_days[(month - 1) as usize] + day - 1;
+    let yearday = yearday_for_civil(year, i64::from(month), day);
 
     Ok(BrokenDownTime {
         year,
@@ -17811,11 +17805,13 @@ fn builtin_mktime<W: Clone + AsRef<[u64]>>(
 /// Days since the Unix epoch for a civil `(year, month 1-12, day)` date, via
 /// the Howard Hinnant `days_from_civil` algorithm — the shared core of
 /// [`unix_secs_from_broken_down_time`] (which extends this with
-/// hour/minute/second), `parse_strptime`, and `parse_iso8601` (which use the
-/// day count alone to derive a weekday). One definition instead of the
-/// three/four hand-duplicated copies #893's fix originally left in place
-/// (#912): a change to this math previously had to be applied in every copy
-/// to stay correct.
+/// hour/minute/second) and `parse_strptime` (which uses the day count alone
+/// to derive a weekday). `parse_iso8601` reuses
+/// [`unix_secs_from_broken_down_time`] directly rather than calling this
+/// function itself, since it needs the full seconds conversion, not just
+/// the day count. One definition instead of the three/four hand-duplicated
+/// copies #893's fix originally left in place (#912): a change to this math
+/// previously had to be applied in every copy to stay correct.
 ///
 /// Returns `Err` for any `year`/`month`/`day` combination whose arithmetic
 /// would overflow `i64` (#893) — every step uses `checked_*` instead of the
@@ -17852,13 +17848,32 @@ fn checked_days_from_civil(year: i64, month: i64, day: i64) -> Result<i64, EvalE
         .ok_or_else(overflow)?; // day of year [0, 365]
 
     let yoe_365 = yoe.checked_mul(365).ok_or_else(overflow)?;
-    let doe_partial = yoe_365.checked_add(yoe / 4).ok_or_else(overflow)?;
-    let doe_partial = doe_partial.checked_sub(yoe / 100).ok_or_else(overflow)?;
-    let doe = doe_partial.checked_add(doy).ok_or_else(overflow)?; // day of era [0, 146096]
+    let yoe_365_plus_leap = yoe_365.checked_add(yoe / 4).ok_or_else(overflow)?;
+    let doe_before_doy = yoe_365_plus_leap
+        .checked_sub(yoe / 100)
+        .ok_or_else(overflow)?;
+    let doe = doe_before_doy.checked_add(doy).ok_or_else(overflow)?; // day of era [0, 146096]
 
     let era_146097 = era.checked_mul(146097).ok_or_else(overflow)?;
     let days_since_epoch = era_146097.checked_add(doe).ok_or_else(overflow)?;
     days_since_epoch.checked_sub(719468).ok_or_else(overflow) // days since Unix epoch
+}
+
+/// Day of year (0-365, Jan 1 = 0) for a civil `(year, month 1-12, day)`
+/// date, via a leap-year check and a cumulative month-length table —
+/// shared by [`broken_down_time_from_unix_secs`] and `parse_strptime`,
+/// which each duplicated this exact leap-year rule and table verbatim
+/// (#912): a future leap-year fix (there is none currently known, but the
+/// duplication itself was the risk) would otherwise have had no reason to
+/// touch both copies to stay correct.
+fn yearday_for_civil(year: i64, month: i64, day: i64) -> i64 {
+    let is_leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
+    let month_days: [i64; 12] = if is_leap {
+        [0, 31, 60, 91, 121, 152, 182, 213, 244, 274, 305, 335]
+    } else {
+        [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334]
+    };
+    month_days[(month - 1) as usize] + day - 1
 }
 
 /// Convert broken-down time (UTC) to a Unix timestamp — the inverse of
@@ -17891,9 +17906,11 @@ fn unix_secs_from_broken_down_time(
     let hour_secs = hour.checked_mul(3600).ok_or_else(overflow)?;
     let minute_secs = minute.checked_mul(60).ok_or_else(overflow)?;
 
-    let secs = days_secs.checked_add(hour_secs).ok_or_else(overflow)?;
-    let secs = secs.checked_add(minute_secs).ok_or_else(overflow)?;
-    secs.checked_add(second).ok_or_else(overflow)
+    let days_and_hour_secs = days_secs.checked_add(hour_secs).ok_or_else(overflow)?;
+    let secs_before_second = days_and_hour_secs
+        .checked_add(minute_secs)
+        .ok_or_else(overflow)?;
+    secs_before_second.checked_add(second).ok_or_else(overflow)
 }
 
 /// Builtin: strftime(fmt) - format broken-down time as string
@@ -18521,14 +18538,9 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<BrokenDownTime, String> {
     let days = checked_days_from_civil(year, month, day).map_err(|e| e.to_string())?;
     weekday = (days % 7 + 4 + 7) % 7;
 
-    // Calculate yearday
-    let is_leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
-    let month_days: [i64; 12] = if is_leap {
-        [0, 31, 60, 91, 121, 152, 182, 213, 244, 274, 305, 335]
-    } else {
-        [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334]
-    };
-    let yearday = month_days[(month - 1) as usize] + day - 1;
+    // Calculate day of year, via the same leap-year table
+    // broken_down_time_from_unix_secs uses (#912).
+    let yearday = yearday_for_civil(year, month, day);
 
     Ok(BrokenDownTime {
         year,
