@@ -28651,6 +28651,93 @@ mod tests {
 
     #[cfg(feature = "regex")]
     #[test]
+    fn test_regex_bare_array_pattern_unpacks_as_regex_flags_943() {
+        // #943: test/match/capture's *bare* form (no flags argument at
+        // all) additionally accepts a non-empty array pattern, unpacking
+        // it as [pattern, flags, ...ignored] -- undocumented but real jq
+        // behavior. sub/gsub/scan/split/splits do NOT do this (a plain
+        // non-string-pattern error, verified separately below), and an
+        // array pattern combined with an explicit flags argument doesn't
+        // unpack either -- the two ways of supplying flags don't combine.
+        // Every case verified live against jq 1.7.1.
+
+        // Successful unpacking: 2-element [string, string].
+        for filter in [
+            r#"test(["a", "i"])"#,
+            r#"match(["a", "i"])"#,
+            r#"capture(["(?<x>a)", "i"])"#,
+        ] {
+            query!(br#""abc""#, filter,
+                QueryResult::Owned(_) | QueryResult::ManyOwned(_) => {}
+            );
+        }
+
+        // 1-element array: pattern only, missing flags slot behaves like
+        // an explicit `null` flags (still succeeds).
+        query!(br#""abc""#, r#"test(["a"])"#,
+            QueryResult::Owned(OwnedValue::Bool(b)) => {
+                assert!(b);
+            }
+        );
+
+        // Extra elements past index 1 are silently ignored, not an error.
+        query!(br#""abc""#, r#"test(["a", "i", "extra", "junk"])"#,
+            QueryResult::Owned(OwnedValue::Bool(b)) => {
+                assert!(b);
+            }
+        );
+
+        // A genuinely empty array has no element 0 to unpack, so it falls
+        // through to the plain non-string-pattern check on the array
+        // itself -- the *bare*-form wording (no value preview), since
+        // unpacking never happened.
+        for filter in [r"test([])", r"match([])", r"capture([])"] {
+            query!(br#""abc""#, filter,
+                QueryResult::Error(e) => {
+                    assert_eq!(e.message, "array not a string or array", "filter: {filter}");
+                }
+            );
+        }
+
+        // Once unpacked, a bad pattern or flags value uses the *flagged*-
+        // form wording (is_not_a_string, with a value preview) even
+        // though this is syntactically the bare 1-arg call -- confirmed
+        // live even for a 1-element array with no explicit flags slot:
+        // `test([1])` -> "number (1) is not a string", not `test(1)`'s
+        // own "number not a string or array".
+        for filter in ["test([1])", "test([1, 2])", "test([\"a\", 2])"] {
+            query!(br#""abc""#, filter,
+                QueryResult::Error(e) => {
+                    assert!(e.message.ends_with("is not a string"), "filter: {filter}: {}", e.message);
+                }
+            );
+        }
+
+        // An explicit flags argument suppresses unpacking entirely --
+        // the array is just an ordinary bad pattern value then, using
+        // the (already-established, #937) flagged-form wording.
+        query!(br#""abc""#, r#"test(["a", "i"]; "x")"#,
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "array ([\"a\",\"i\"]) is not a string");
+            }
+        );
+
+        // sub/gsub/scan/split/splits do not unpack array patterns at all.
+        for filter in [
+            r#"sub(["a", "i"]; "b")"#,
+            r#"gsub(["a", "i"]; "b")"#,
+            r#"scan(["a", "i"])"#,
+        ] {
+            query!(br#""abc""#, filter,
+                QueryResult::Error(e) => {
+                    assert!(e.message.starts_with("array ("), "filter: {filter}: {}", e.message);
+                }
+            );
+        }
+    }
+
+    #[cfg(feature = "regex")]
+    #[test]
     fn test_regex_lookahead_unsupported() {
         // #703: jq's oniguruma backend supports lookahead (`(?=...)`), but
         // succinctly's `regex` crate does not implement lookaround at all —
