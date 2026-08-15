@@ -2558,7 +2558,7 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Builtin::Flatten => builtin_flatten::<W>(value, optional, 1),
         Builtin::FlattenDepth(depth) => builtin_flatten_depth::<W, S>(depth, value, optional),
         Builtin::GroupBy(f) => builtin_group_by::<W, S>(f, value, optional),
-        Builtin::Unique => builtin_unique::<W>(value, optional),
+        Builtin::Unique => builtin_unique::<W, S>(value, optional),
         Builtin::UniqueBy(f) => builtin_unique_by::<W, S>(f, value, optional),
         Builtin::Sort => builtin_sort::<W>(value, optional),
         Builtin::SortBy(f) => builtin_sort_by::<W, S>(f, value, optional),
@@ -3674,6 +3674,41 @@ fn map_bracketed_over_object_fields<'a, W: Clone + AsRef<[u64]>, S: EvalSemantic
     Ok(computed)
 }
 
+/// Shared `StandardJson::Object` arm for `min_by`/`max_by`/`unique_by`/
+/// `group_by`/`sort_by`/`unique` -- all six share the same "`map([f])`
+/// succeeds on an object input, but the object itself isn't an array"
+/// two-operand type error, differing only in which wording jq uses
+/// (`error_ctor`: `EvalError::pair_cannot_be_iterated` for `min_by`/
+/// `max_by`, `EvalError::pair_cannot_be_sorted` for the rest). Extracted
+/// after #995's review found this hand-copied five times over, with
+/// `unique` a sixth, still-unfixed instance the copy-paste history had
+/// missed entirely -- `unique` takes no `f` argument at all (it's `unique_by(.)`
+/// under the hood), so it fell outside both #929's grep-based audit and
+/// #995's own initial scope (confirmed live: `{"a":3,"b":1} | unique`
+/// raises `object ({"a":3,"b":1}) and array ([[3],[1]]) cannot be sorted,
+/// as they are not both arrays` in jq 1.7.1).
+///
+/// `original`'s clone is deferred until actually needed (the `!optional`
+/// error path) -- the `optional`-suppressed and inner-`f`-error paths never
+/// read it (#995 review).
+fn object_pair_type_error<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    f: &Expr,
+    fields: JsonFields<'a, W>,
+    optional: bool,
+    error_ctor: fn(&OwnedValue, &OwnedValue) -> EvalError,
+) -> QueryResult<'a, W> {
+    let computed = match map_bracketed_over_object_fields::<W, S>(f, fields, optional) {
+        Ok(v) => v,
+        Err(result) => return result,
+    };
+    if optional {
+        QueryResult::None
+    } else {
+        let original = to_owned(&StandardJson::Object(fields));
+        QueryResult::Error(error_ctor(&original, &OwnedValue::Array(computed)))
+    }
+}
+
 fn builtin_min_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     f: &Expr,
     value: StandardJson<'a, W>,
@@ -3709,23 +3744,11 @@ fn builtin_min_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 .unwrap();
             QueryResult::Owned(min)
         }
-        // #929: see `map_bracketed_over_object_fields` -- confirmed live:
+        // #929: see `object_pair_type_error` -- confirmed live:
         // `{"a":3,"b":1} | min_by(.)` raises `object ({"a":3,"b":1}) and
         // array ([[3],[1]]) cannot be iterated over` in jq 1.7.1.
         StandardJson::Object(fields) => {
-            let original = to_owned(&StandardJson::Object(fields));
-            let computed = match map_bracketed_over_object_fields::<W, S>(f, fields, optional) {
-                Ok(v) => v,
-                Err(result) => return result,
-            };
-            if optional {
-                QueryResult::None
-            } else {
-                QueryResult::Error(EvalError::pair_cannot_be_iterated(
-                    &original,
-                    &OwnedValue::Array(computed),
-                ))
-            }
+            object_pair_type_error::<W, S>(f, fields, optional, EvalError::pair_cannot_be_iterated)
         }
         _ if optional => QueryResult::None,
         // #929: real jq defines min_by(f) via `.[0] as $x | reduce ...` --
@@ -3778,19 +3801,7 @@ fn builtin_max_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // ({"a":3,"b":1}) and array ([[3],[1]]) cannot be iterated over` in
         // jq 1.7.1.
         StandardJson::Object(fields) => {
-            let original = to_owned(&StandardJson::Object(fields));
-            let computed = match map_bracketed_over_object_fields::<W, S>(f, fields, optional) {
-                Ok(v) => v,
-                Err(result) => return result,
-            };
-            if optional {
-                QueryResult::None
-            } else {
-                QueryResult::Error(EvalError::pair_cannot_be_iterated(
-                    &original,
-                    &OwnedValue::Array(computed),
-                ))
-            }
+            object_pair_type_error::<W, S>(f, fields, optional, EvalError::pair_cannot_be_iterated)
         }
         _ if optional => QueryResult::None,
         // #929: same wording as min_by's own scalar arm above -- confirmed
@@ -4349,13 +4360,25 @@ fn builtin_group_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
             QueryResult::Owned(OwnedValue::Array(groups))
         }
+        // #995: group_by shares min_by/max_by/unique_by's `map([f])`-pairing
+        // computation (see `map_bracketed_over_object_fields`) and
+        // unique_by's own suffix -- confirmed live: `{"a":3,"b":1} |
+        // group_by(.)` raises `object ({"a":3,"b":1}) and array
+        // ([[3],[1]]) cannot be sorted, as they are not both arrays` in jq
+        // 1.7.1.
+        StandardJson::Object(fields) => {
+            object_pair_type_error::<W, S>(f, fields, optional, EvalError::pair_cannot_be_sorted)
+        }
         _ if optional => QueryResult::None,
+        // #995: same "Cannot iterate over" wording min_by/max_by/unique_by's
+        // own scalar arm uses -- confirmed live: `5 | group_by(.)` raises
+        // "Cannot iterate over number (5)" in jq 1.7.1.
         _ => QueryResult::Error(EvalError::cannot_iterate(&to_owned(&value))),
     }
 }
 
 /// Builtin: unique - remove duplicates
-fn builtin_unique<W: Clone + AsRef<[u64]>>(
+fn builtin_unique<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'_, W>,
     optional: bool,
 ) -> QueryResult<'_, W> {
@@ -4371,6 +4394,17 @@ fn builtin_unique<W: Clone + AsRef<[u64]>>(
 
             QueryResult::Owned(OwnedValue::Array(items))
         }
+        // #995: real jq defines `unique` as `unique_by(.)`, so it shares the
+        // identical object-input pairing bug -- confirmed live:
+        // `{"a":3,"b":1} | unique` raises `object ({"a":3,"b":1}) and array
+        // ([[3],[1]]) cannot be sorted, as they are not both arrays` in jq
+        // 1.7.1.
+        StandardJson::Object(fields) => object_pair_type_error::<W, S>(
+            &Expr::Identity,
+            fields,
+            optional,
+            EvalError::pair_cannot_be_sorted,
+        ),
         _ if optional => QueryResult::None,
         _ => QueryResult::Error(EvalError::cannot_iterate(&to_owned(&value))),
     }
@@ -4419,19 +4453,7 @@ fn builtin_unique_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // raises `object ({"a":3,"b":1}) and array ([[3],[1]]) cannot be
         // sorted, as they are not both arrays` in jq 1.7.1.
         StandardJson::Object(fields) => {
-            let original = to_owned(&StandardJson::Object(fields));
-            let computed = match map_bracketed_over_object_fields::<W, S>(f, fields, optional) {
-                Ok(v) => v,
-                Err(result) => return result,
-            };
-            if optional {
-                QueryResult::None
-            } else {
-                QueryResult::Error(EvalError::pair_cannot_be_sorted(
-                    &original,
-                    &OwnedValue::Array(computed),
-                ))
-            }
+            object_pair_type_error::<W, S>(f, fields, optional, EvalError::pair_cannot_be_sorted)
         }
         _ if optional => QueryResult::None,
         // #929: same "Cannot iterate over" wording min_by/max_by's own
@@ -4491,7 +4513,19 @@ fn builtin_sort_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             let result: Vec<OwnedValue> = keyed.into_iter().map(|(_, v)| v).collect();
             QueryResult::Owned(OwnedValue::Array(result))
         }
+        // #995: sort_by shares min_by/max_by/unique_by/group_by's
+        // `map([f])`-pairing computation (see
+        // `map_bracketed_over_object_fields`) and unique_by/group_by's own
+        // suffix -- confirmed live: `{"a":3,"b":1} | sort_by(.)` raises
+        // `object ({"a":3,"b":1}) and array ([[3],[1]]) cannot be sorted, as
+        // they are not both arrays` in jq 1.7.1.
+        StandardJson::Object(fields) => {
+            object_pair_type_error::<W, S>(f, fields, optional, EvalError::pair_cannot_be_sorted)
+        }
         _ if optional => QueryResult::None,
+        // #995: same "Cannot iterate over" wording min_by/max_by/unique_by/
+        // group_by's own scalar arm uses -- confirmed live: `5 | sort_by(.)`
+        // raises "Cannot iterate over number (5)" in jq 1.7.1.
         _ => QueryResult::Error(EvalError::cannot_iterate(&to_owned(&value))),
     }
 }
@@ -28329,6 +28363,101 @@ mod tests {
             }
         );
         assert_eq!(outputs(br"[false]", r"@sh"), ["\"false\""]);
+    }
+
+    /// #995: `group_by`/`sort_by` on an object input have the identical
+    /// pairing bug #929's review found for `unique_by` -- they share the
+    /// same `map([f])` computation and "not both arrays" suffix, but
+    /// predate #929's diff (they never called `EvalError::type_error`, so
+    /// they were outside that issue's grep-based scope). Confirmed against
+    /// jq 1.7.1 for every case below.
+    #[test]
+    fn test_group_by_sort_by_object_wording_995() {
+        query!(br#"{"a":3,"b":1}"#, r"group_by(.)",
+            QueryResult::Error(e) => {
+                assert_eq!(
+                    e.message,
+                    "object ({\"a\":3,\"b\":1}) and array ([[3],[1]]) cannot be sorted, as they are not both arrays"
+                );
+            }
+        );
+        query!(br#"{"a":3,"b":1}"#, r"sort_by(.)",
+            QueryResult::Error(e) => {
+                assert_eq!(
+                    e.message,
+                    "object ({\"a\":3,\"b\":1}) and array ([[3],[1]]) cannot be sorted, as they are not both arrays"
+                );
+            }
+        );
+        // The computed array tracks the actual filter, not a fixed
+        // placeholder.
+        query!(br#"{"a":3,"b":1}"#, r"group_by(. + 100)",
+            QueryResult::Error(e) => {
+                assert_eq!(
+                    e.message,
+                    "object ({\"a\":3,\"b\":1}) and array ([[103],[101]]) cannot be sorted, as they are not both arrays"
+                );
+            }
+        );
+        query!(br#"{"a":3,"b":1}"#, r"sort_by(. + 100)",
+            QueryResult::Error(e) => {
+                assert_eq!(
+                    e.message,
+                    "object ({\"a\":3,\"b\":1}) and array ([[103],[101]]) cannot be sorted, as they are not both arrays"
+                );
+            }
+        );
+        // Scalar input keeps the pre-existing, already-correct wording.
+        query!(br"5", r"group_by(.)",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "Cannot iterate over number (5)");
+            }
+        );
+        query!(br"5", r"sort_by(.)",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "Cannot iterate over number (5)");
+            }
+        );
+        // `?` suppresses the pairing error, and an error `f` still
+        // propagates through the suppression.
+        assert_eq!(
+            outputs(br#"{"a":1}"#, r"group_by(.)?"),
+            Vec::<String>::new()
+        );
+        assert_eq!(outputs(br#"{"a":1}"#, r"sort_by(.)?"), Vec::<String>::new());
+        query!(br#"{"a":1}"#, r#"group_by(error("boom"))"#,
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "boom");
+            }
+        );
+        query!(br#"{"a":1}"#, r#"sort_by(error("boom"))"#,
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "boom");
+            }
+        );
+    }
+
+    /// #995 review: bare `unique` (real jq defines it as `unique_by(.)`) has
+    /// the identical object-input pairing bug, missed by both #929's
+    /// grep-based audit and this issue's own initial scope because `unique`
+    /// takes no `f` argument at all. Confirmed against jq 1.7.1.
+    #[test]
+    fn test_unique_object_wording_995() {
+        query!(br#"{"a":3,"b":1}"#, r"unique",
+            QueryResult::Error(e) => {
+                assert_eq!(
+                    e.message,
+                    "object ({\"a\":3,\"b\":1}) and array ([[3],[1]]) cannot be sorted, as they are not both arrays"
+                );
+            }
+        );
+        // Scalar input keeps the pre-existing, already-correct wording.
+        query!(br"5", r"unique",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "Cannot iterate over number (5)");
+            }
+        );
+        assert_eq!(outputs(br#"{"a":1}"#, r"unique?"), Vec::<String>::new());
     }
 
     #[test]
