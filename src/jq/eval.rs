@@ -28953,6 +28953,10 @@ mod tests {
     /// fork site ever sees it" mechanism, and are fixed by the same
     /// `isvalid` change with no changes of their own needed.
     #[test]
+    // `"isvalid(in({b:1}, error(\"x\")))"` is a jq filter literal, not a
+    // formatting string; clippy cannot tell the two apart from the brace
+    // shape alone.
+    #[allow(clippy::literal_string_with_formatting_args)]
     fn test_isvalid_other_fork_sites_error_not_masked_881() {
         // eval_assign: the write-value expression `(1, error("x"))` forks,
         // and `1` would otherwise be a real (if never-observed) write
