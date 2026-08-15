@@ -7455,7 +7455,7 @@ fn builtin_sub_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let pattern = match result_to_owned(eval_single::<W, S>(re_expr, value.clone(), optional)) {
         Ok(OwnedValue::String(s)) => s,
         Ok(_) if optional => return QueryResult::None,
-        Ok(_) => return QueryResult::Error(EvalError::type_error("string", "pattern")),
+        Ok(v) => return QueryResult::Error(EvalError::is_not_a_string(&v)),
         Err(e) => return e.into(),
     };
 
@@ -7600,7 +7600,7 @@ fn builtin_scan_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let pattern = match result_to_owned(eval_single::<W, S>(re_expr, value.clone(), optional)) {
         Ok(OwnedValue::String(s)) => s,
         Ok(_) if optional => return QueryResult::None,
-        Ok(_) => return QueryResult::Error(EvalError::type_error("string", "pattern")),
+        Ok(v) => return QueryResult::Error(EvalError::is_not_a_string(&v)),
         Err(e) => return e.into(),
     };
 
@@ -7681,7 +7681,7 @@ fn builtin_split_regex<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let pattern = match result_to_owned(eval_single::<W, S>(re_expr, value.clone(), optional)) {
         Ok(OwnedValue::String(s)) => s,
         Ok(_) if optional => return QueryResult::None,
-        Ok(_) => return QueryResult::Error(EvalError::type_error("string", "pattern")),
+        Ok(v) => return QueryResult::Error(EvalError::is_not_a_string(&v)),
         Err(e) => return e.into(),
     };
 
@@ -7750,7 +7750,7 @@ fn builtin_splits_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let pattern = match result_to_owned(eval_single::<W, S>(re_expr, value.clone(), optional)) {
         Ok(OwnedValue::String(s)) => s,
         Ok(_) if optional => return QueryResult::None,
-        Ok(_) => return QueryResult::Error(EvalError::type_error("string", "pattern")),
+        Ok(v) => return QueryResult::Error(EvalError::is_not_a_string(&v)),
         Err(e) => return e.into(),
     };
 

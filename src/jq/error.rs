@@ -690,6 +690,21 @@ impl EvalError {
         Self::new(format!("{type_name} not a string or array"))
     }
 
+    /// `<v> is not a string`.
+    ///
+    /// jq's wording when scan/gsub/sub/splits's *pattern* argument isn't a
+    /// string — a genuinely different sentence from `not_string_or_array`
+    /// above (test/match/capture's own pattern-type error), not just a
+    /// stylistic variant: confirmed live against jq-1.7.1, `scan(1)` and
+    /// `sub(1; "y")` both raise `number (1) is not a string` (#926), where
+    /// `test(1)` raises `number not a string or array`. jq itself uses two
+    /// different sentences for the same conceptual failure depending on
+    /// which builtin family raises it, so both constructors stay separate
+    /// rather than merging into one.
+    pub fn is_not_a_string(value: &OwnedValue) -> Self {
+        Self::subject(value, "is not a string")
+    }
+
     /// `<v> cannot be parsed as a number`.
     pub fn cannot_parse_as_number(value: &OwnedValue) -> Self {
         Self::subject(value, "cannot be parsed as a number")
