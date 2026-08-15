@@ -18555,8 +18555,8 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<BrokenDownTime, String> {
     // instead of a hand-duplicated, unchecked copy of the same formula.
     // Its `i64`, checked arithmetic throughout is also what fixes #968's
     // second panic: `day == 0` needs this formula's `doy` term to go
-    // momentarily negative for March specifically, which a `u32` (the
-    // pre-#912 hand-duplicated copy's type) couldn't represent without its
+    // momentarily negative for March specifically, which the pre-#912
+    // hand-duplicated copy's `u32` type couldn't represent without its
     // subtraction underflowing.
     let days = checked_days_from_civil(year, month, day).map_err(|e| e.to_string())?;
     weekday = (days % 7 + 4 + 7) % 7;
