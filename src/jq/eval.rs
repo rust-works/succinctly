@@ -3184,47 +3184,48 @@ fn builtin_upper_in<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 }
 
 /// Builtin: `IN(src; s)` - true if any output of `src` equals any output of
-/// `s`, both run independently against the current value.
+/// `s`. Matches jq's `any(src == s; .)` -- literally: `src == s`'s own
+/// generator semantics (via [`eval_compare`]/[`binary_fanout_core`], `s` as
+/// the outer loop and `src` as the inner loop, jq's real evaluation order
+/// for a binary operator with two multi-valued operands) become the `gen`
+/// argument to [`any_all_gen_cond`], with `Expr::Identity` as `cond` since
+/// each `src == s` output is already the boolean being checked.
 ///
 /// Note: this is *not* a literal translation of upstream's documented
 /// `def IN(src; s): any(src|s == .; .);` — that def's `.` inside `s == .`
 /// gets rebound by the `src|` pipe before `s` ever runs, so it can never see
 /// the original current value and (verified against real jq 1.7.1) does not
 /// reproduce the oracle's actual output. The cartesian-equality form here
-/// (`any(src == s; .)`) was verified to match the real builtin's behavior
-/// across a battery of cases (see issue #722).
+/// (`any(src == s; .)`, no `src|` pipe) was verified to match the real
+/// builtin's behavior across a battery of cases (see issue #722).
 ///
-/// #910 fix: both `src` and `s` used to be evaluated eagerly to completion
-/// via `eval_owned_multi` before any equality check ran, so a trailing
-/// error on *either* side fired even when an earlier pair already matched
-/// -- confirmed against real jq 1.7.1, `IN(2, error("boom"); 2)` and
-/// `IN(2; 2, error("boom"))` are both `true` regardless of which operand
-/// carries the later error. Same `eval_owned_expr_fork` prefix/trailing
-/// split as `builtin_upper_in` above, including its same known gap (#932):
-/// both sides are still fully evaluated internally, so a match found in
-/// the already-produced prefixes short-circuits before either trailing
-/// escape is consulted, correctly for `error(...)`/ordinary values but
-/// still leaking `halt_error`/`stderr`'s own immediate print if either
-/// operand's discarded tail reaches one. When *no* pair matches and both
-/// sides carry a trailing escape, `src`'s wins -- confirmed against real
-/// jq: `IN(3, error("src-boom"); 4, error("s-boom"))` reports
-/// `"src-boom"`, not `"s-boom"`.
+/// #910 review: an earlier version of this fix hand-rolled its own
+/// "fork `src` and `s` independently, then check every `(h, n)` pair"
+/// cross-product, which is unsound -- real jq's nested-loop generator order
+/// means an error partway through the *inner* operand (`src`) can abort the
+/// whole comparison before a *later* output of the *outer* operand (`s`)
+/// is ever reached, even if that later output would have paired with an
+/// already-produced value from `src`. Confirmed against jq 1.7.1:
+/// `IN(4, error("boom"); 9, 4)` raises `"boom"` (the match at `s`'s second
+/// output, `4`, is never reached -- `s`'s first output, `9`, drives a full
+/// inner pass over `src` that hits the error before advancing), not `true`
+/// as the flat cross-product check wrongly concluded. Delegating to the
+/// real `==` operator's own already-correct fanout (verified separately:
+/// it correctly leaves `src` untouched entirely when `s` produces zero
+/// outputs, `IN(error("boom"); empty)` is `false`, not an error) fixes this
+/// by construction instead of re-deriving jq's evaluation order by hand.
 fn builtin_upper_in_src<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     src: &Expr,
     s: &Expr,
     value: StandardJson<'a, W>,
     _optional: bool,
 ) -> QueryResult<'a, W> {
-    let current = to_owned(&value);
-    let (haystack, haystack_trailing) = eval_owned_expr_fork::<S>(src, &current, false);
-    let (needles, needles_trailing) = eval_owned_expr_fork::<S>(s, &current, false);
-    if haystack.iter().any(|h| needles.contains(h)) {
-        return QueryResult::Owned(OwnedValue::Bool(true));
-    }
-    match haystack_trailing.or(needles_trailing) {
-        Some(control) => control_to_result(control),
-        None => QueryResult::Owned(OwnedValue::Bool(false)),
-    }
+    let gen = Expr::Compare {
+        op: CompareOp::Eq,
+        left: Box::new(src.clone()),
+        right: Box::new(s.clone()),
+    };
+    any_all_gen_cond::<W, S>(&gen, &Expr::Identity, value, false, true)
 }
 
 /// Builtin: select(condition)
@@ -27301,9 +27302,7 @@ mod tests {
     /// *either* operand short-circuits before the other operand's later
     /// error is consulted -- confirmed against real jq 1.7.1,
     /// `IN(2, error("boom"); 2)` and `IN(2; 2, error("boom"))` are both
-    /// `true`. When neither side matches and both carry a trailing error,
-    /// `src`'s wins (confirmed: `IN(3, error("src-boom"); 4,
-    /// error("s-boom"))` reports `"src-boom"`, not `"s-boom"`).
+    /// `true`.
     #[test]
     fn test_builtin_upper_in_src_short_circuits_before_later_error_910() {
         query!(br"2", r#"IN(2, error("boom"); 2)"#,
@@ -27312,9 +27311,49 @@ mod tests {
         query!(br"2", r#"IN(2; 2, error("boom"))"#,
             QueryResult::Owned(OwnedValue::Bool(true)) => {}
         );
-        query!(br"2", r#"IN(3, error("src-boom"); 4, error("s-boom"))"#,
+    }
+
+    /// #910 review: an earlier version of this fix hand-rolled its own
+    /// "fork `src` and `s` independently, then check every `(h, n)` pair"
+    /// cross-product, which does not respect real jq's actual nested-loop
+    /// evaluation order for `src == s` (`s` is jq's outer loop, `src` is
+    /// the inner loop -- confirmed empirically: `jq -cn '(1,2)+(10,20)'`
+    /// is `11,12,21,22`, proving the right operand of a binary op drives
+    /// the outer loop). All four cases below are confirmed against real
+    /// jq 1.7.1 and were wrong under the old cross-product implementation:
+    /// - `IN(4, error("boom"); 9, 4)` raises `"boom"` -- `s`'s first
+    ///   output (`9`) drives a full inner pass over `src` (`4`, then the
+    ///   error) that hits the error before `s`'s *second* output (`4`,
+    ///   where the match actually lives) is ever reached. The old
+    ///   cross-product check wrongly saw `4` in both prefixes and
+    ///   answered `true`.
+    /// - `IN(9, error("boom"); empty)` is `false`, not an error -- `s`
+    ///   produces zero outputs, so the outer loop body never runs even
+    ///   once and `src` is never touched at all.
+    /// - `IN(error("src-boom"); error("s-boom"))` raises `"s-boom"`, not
+    ///   `"src-boom"` -- `s`'s outer loop fails on its very first
+    ///   attempted output, before `src` (inner) is ever entered.
+    /// - `IN(error("src-boom"); halt_error(7))` actually halts (exit 7),
+    ///   not a masked `"src-boom"` error -- same reasoning as the previous
+    ///   case, `src` is never reached.
+    #[test]
+    fn test_builtin_upper_in_src_respects_jq_nested_loop_order_910() {
+        query!(br"2", r#"IN(4, error("boom"); 9, 4)"#,
             QueryResult::Error(e) => {
-                assert_eq!(e.message, "src-boom");
+                assert_eq!(e.message, "boom");
+            }
+        );
+        query!(br"2", r#"IN(9, error("boom"); empty)"#,
+            QueryResult::Owned(OwnedValue::Bool(false)) => {}
+        );
+        query!(br"2", r#"IN(error("src-boom"); error("s-boom"))"#,
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "s-boom");
+            }
+        );
+        query!(br"2", r#"IN(error("src-boom"); halt_error(7))"#,
+            QueryResult::Halt(code) => {
+                assert_eq!(code, 7);
             }
         );
     }
