@@ -45,6 +45,11 @@ const FEATURE_GATED: &[&str] = &[
     "gsub_on_number",
     "match_arg_non_string",
     "capture_arg_non_string",
+    "scan_arg_non_string",
+    "gsub_arg_non_string",
+    "sub_arg_non_string",
+    "splits_arg_non_string",
+    "split_regex_arg_non_string",
 ];
 
 struct Probe {

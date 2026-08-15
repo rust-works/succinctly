@@ -7455,7 +7455,7 @@ fn builtin_sub_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let pattern = match result_to_owned(eval_single::<W, S>(re_expr, value.clone(), optional)) {
         Ok(OwnedValue::String(s)) => s,
         Ok(_) if optional => return QueryResult::None,
-        Ok(_) => return QueryResult::Error(EvalError::type_error("string", "pattern")),
+        Ok(v) => return QueryResult::Error(EvalError::is_not_a_string(&v)),
         Err(e) => return e.into(),
     };
 
@@ -7600,7 +7600,7 @@ fn builtin_scan_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let pattern = match result_to_owned(eval_single::<W, S>(re_expr, value.clone(), optional)) {
         Ok(OwnedValue::String(s)) => s,
         Ok(_) if optional => return QueryResult::None,
-        Ok(_) => return QueryResult::Error(EvalError::type_error("string", "pattern")),
+        Ok(v) => return QueryResult::Error(EvalError::is_not_a_string(&v)),
         Err(e) => return e.into(),
     };
 
@@ -7681,7 +7681,7 @@ fn builtin_split_regex<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let pattern = match result_to_owned(eval_single::<W, S>(re_expr, value.clone(), optional)) {
         Ok(OwnedValue::String(s)) => s,
         Ok(_) if optional => return QueryResult::None,
-        Ok(_) => return QueryResult::Error(EvalError::type_error("string", "pattern")),
+        Ok(v) => return QueryResult::Error(EvalError::is_not_a_string(&v)),
         Err(e) => return e.into(),
     };
 
@@ -7750,7 +7750,7 @@ fn builtin_splits_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let pattern = match result_to_owned(eval_single::<W, S>(re_expr, value.clone(), optional)) {
         Ok(OwnedValue::String(s)) => s,
         Ok(_) if optional => return QueryResult::None,
-        Ok(_) => return QueryResult::Error(EvalError::type_error("string", "pattern")),
+        Ok(v) => return QueryResult::Error(EvalError::is_not_a_string(&v)),
         Err(e) => return e.into(),
     };
 
@@ -27785,6 +27785,42 @@ mod tests {
         query!(br#""x""#, r#"test("[")"#,
             QueryResult::Error(e) => {
                 assert!(e.to_string().contains("invalid regex"));
+            }
+        );
+    }
+
+    #[cfg(feature = "regex")]
+    #[test]
+    fn test_regex_non_string_pattern_wording_matches_jq_per_family_926() {
+        // #926: jq itself uses two different sentences for a non-string
+        // *pattern* argument depending on which builtin family raises it —
+        // test/match/capture's "<type> not a string or array" (no value
+        // preview) vs. scan/gsub/sub/splits/split(re;flags)'s "<v> is not a
+        // string" (with a value preview). Both bare forms are already
+        // pinned per-builtin, against both evaluators, by the oracle-driven
+        // `jq_error_message_parity` test via `tests/data/jq-error-probes.tsv`
+        // (test_arg_non_string, scan_arg_non_string, etc.) — this test only
+        // covers what that corpus can't: a flagged sibling sharing its bare
+        // form's wording, and the object/array value-preview rendering.
+        // Verified live against jq 1.7.1.
+
+        // The flagged sibling shares its bare form's wording.
+        query!(br#""x""#, r#"scan(1; "i")"#,
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "number (1) is not a string");
+            }
+        );
+
+        // Object/array previews render the same way `describe()` renders
+        // them elsewhere in this file (truncated JSON dump).
+        query!(br#""x""#, r#"scan({"a":1})"#,
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, r#"object ({"a":1}) is not a string"#);
+            }
+        );
+        query!(br#""x""#, r"scan([1,2])",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "array ([1,2]) is not a string");
             }
         );
     }
