@@ -27230,6 +27230,45 @@ mod tests {
         );
     }
 
+    /// #939: `to_json_for_reindex` (the same bridge #561's test above
+    /// exercises) substituted a generic `1e999`/`-1e999` sentinel for *any*
+    /// infinite `NumberLiteral`, including a document-sourced overflow
+    /// literal that already had real source text of its own - so once
+    /// `keys`/`.[]`-style operations routed the value through this bridge,
+    /// #930's fix (reformatting a `NumberLiteral`'s own text) had nothing
+    /// left to work with, and every overflow literal previewed as the same
+    /// sentinel-derived text regardless of its actual digits. Oracle-
+    /// verified against real jq 1.7.1: a document literal's own text is
+    /// reused directly (matching jq exactly) whenever it's already valid
+    /// JSON number syntax, since it's guaranteed to reparse to this same
+    /// value either way.
+    #[test]
+    fn test_document_overflow_literal_preserves_own_text_through_reindex_bridges_939() {
+        query!(br"123e400", "reduce (1) as $x (.; .) | keys",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "number (1.23E+402) has no keys");
+            }
+        );
+
+        query!(br"-1e400", "reduce (1) as $x (.; .) | .[]",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "Cannot iterate over number (-1E+400)");
+            }
+        );
+
+        query!(br#"{"a":12.34e400}"#, "with_entries(.value |= (. | keys))",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "number (1.234E+401) has no keys");
+            }
+        );
+
+        query!(br"0.5e400", "foreach (1) as $x (.; .) | keys",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "number (5E+399) has no keys");
+            }
+        );
+    }
+
     #[test]
     fn test_builtin_tonumber() {
         query!(br#""42""#, "tonumber",

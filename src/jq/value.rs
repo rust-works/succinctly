@@ -644,8 +644,34 @@ impl OwnedValue {
             Self::Float(f) if f.is_nan() => NAN_SENTINEL.to_string(),
             Self::NumberLiteral(NumberRepr::Float(f), _) if f.is_nan() => NAN_SENTINEL.to_string(),
             Self::Float(f) if f.is_infinite() => overflow_literal(*f).to_string(),
-            Self::NumberLiteral(NumberRepr::Float(f), _) if f.is_infinite() => {
-                overflow_literal(*f).to_string()
+            // A document-sourced overflow literal (`123e400`) is, by
+            // construction, already valid JSON number syntax that reparses
+            // to this exact `f64` - reusing it here (instead of the generic
+            // sentinel) lets `describe()`'s preview show the real source
+            // text (#930) instead of a disconnected "1e999"/"-1e999"
+            // placeholder (#939). `NumberLiteral` currently only ever comes
+            // from JSON parsing (`document.rs`'s `number_literal()` default
+            // returns `None`, and only `json/light.rs` overrides it - YAML
+            // has no override, so its `.inf`/`-.inf`/`.nan` always become a
+            // plain `Float`, handled by the arm above, never this one), so
+            // no further shape-checking is needed for correctness.
+            //
+            // The length cap *is* needed regardless of shape: the literal
+            // is otherwise-unbounded document text, and this function's
+            // callers (`reduce`/`foreach`/etc.'s per-iteration reindex
+            // bridge) can run it over the same unchanged value thousands of
+            // times - a bound this loose still comfortably covers any
+            // realistic overflow literal (reaching `f64::MAX` needs on the
+            // order of ~300 exponent digits at most) while keeping the
+            // *reused* case itself O(1)-ish rather than O(iterations x
+            // literal length) for a pathological one.
+            Self::NumberLiteral(NumberRepr::Float(f), literal) if f.is_infinite() => {
+                const MAX_REUSED_LITERAL_LEN: usize = 256;
+                if literal.len() <= MAX_REUSED_LITERAL_LEN {
+                    literal.to_string()
+                } else {
+                    overflow_literal(*f).to_string()
+                }
             }
             Self::Array(arr) => {
                 let elements: Vec<String> = arr.iter().map(Self::to_json_for_reindex).collect();
@@ -1386,6 +1412,36 @@ mod tests {
         );
         let lit = OwnedValue::NumberLiteral(NumberRepr::Float(f64::NAN), "nan".into());
         assert_eq!(lit.to_json_for_reindex(), NAN_SENTINEL);
+    }
+
+    /// #939: an infinite `NumberLiteral` backed by real document text (any
+    /// magnitude-overflow literal, e.g. `123e400`) is already guaranteed to
+    /// reparse to this exact value - reusing it avoids the disconnected
+    /// `1e999`/`-1e999` sentinel leaking into a downstream preview (#930's
+    /// `format_overflow_literal_mantissa` can then reformat the *real* text
+    /// instead of the sentinel's).
+    #[test]
+    fn test_to_json_for_reindex_reuses_overflow_literal_text() {
+        let lit = OwnedValue::NumberLiteral(NumberRepr::Float(f64::INFINITY), "123e400".into());
+        assert_eq!(lit.to_json_for_reindex(), "123e400");
+
+        let lit = OwnedValue::NumberLiteral(NumberRepr::Float(f64::NEG_INFINITY), "-1e400".into());
+        assert_eq!(lit.to_json_for_reindex(), "-1e400");
+    }
+
+    /// #939 review: reusing the literal's own text is O(its length), and
+    /// this function's callers (`reduce`/`foreach`'s per-iteration reindex
+    /// bridge) can run it over the same unchanged value many times - so an
+    /// unbounded literal must fall back to the O(1) sentinel rather than
+    /// turning a loop into O(iterations x literal length). No realistic
+    /// document overflow literal is anywhere near this long (#930's own
+    /// tests only go up to a handful of digits before the exponent), so the
+    /// cap only ever trips on a pathological/adversarial one.
+    #[test]
+    fn test_to_json_for_reindex_bounds_an_unrealistically_long_literal() {
+        let huge_literal = format!("{}e400", "9".repeat(300));
+        let lit = OwnedValue::NumberLiteral(NumberRepr::Float(f64::INFINITY), huge_literal.into());
+        assert_eq!(lit.to_json_for_reindex(), "1e999");
     }
 
     #[test]
