@@ -28099,16 +28099,36 @@ mod tests {
             );
         }
 
-        // ? still suppresses a non-string flags value, and null is still
-        // treated as no flags (untouched by this fix).
-        query!(br#""x""#, r#"[gsub("a"; "b"; 1)?]"#,
-            QueryResult::Owned(OwnedValue::Array(vs)) => {
-                assert!(vs.is_empty());
-            }
-        );
+        // ? still suppresses a non-string flags value, for every builtin
+        // whose flags-eval arm this PR touched (not just gsub — each has
+        // its own `Ok(_) if optional` guard, which needs its own coverage).
+        for filter in [
+            r#"[match("a"; 1)?]"#,
+            r#"[capture("(?<a>a)"; 1)?]"#,
+            r#"[sub("a"; "b"; 1)?]"#,
+            r#"[test("a"; 1)?]"#,
+            r#"[gsub("a"; "b"; 1)?]"#,
+        ] {
+            query!(br#""x""#, filter,
+                QueryResult::Owned(OwnedValue::Array(vs)) => {
+                    assert!(vs.is_empty(), "filter: {filter}");
+                }
+            );
+        }
+
+        // null is still treated as no flags (untouched by this fix).
         query!(br#""abc""#, r#"scan("a"; null)"#,
             QueryResult::ManyOwned(matches) => {
                 assert_eq!(matches.len(), 1);
+            }
+        );
+
+        // gsub's own pattern-eval arm (added by this PR — see
+        // builtin_gsub_with_flags) also needs its `?`-suppression covered
+        // separately from the flags-eval arm above.
+        query!(br#""x""#, r#"[gsub(1; "b"; "i")?]"#,
+            QueryResult::Owned(OwnedValue::Array(vs)) => {
+                assert!(vs.is_empty());
             }
         );
     }
