@@ -5456,19 +5456,36 @@ fn builtin_skip<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    // Evaluate n
+    // Evaluate n. jq 1.8's own `def skip($n; expr): if $n > 0 then ...
+    // elif $n == 0 then expr else error("skip doesn't support negative
+    // count") end` -- a genuinely negative count silently became index 0
+    // (skipping nothing) here instead of erroring (#983; `null` already
+    // fell through to the catch-all below and erred, just with different
+    // message text).
     let n_result = eval_single::<W, S>(n_expr, value.clone(), optional);
     let n = match n_result {
         QueryResult::One(v) => {
             if let StandardJson::Number(num) = v {
-                num.as_i64().unwrap_or(0) as usize
+                let f = num.as_f64().unwrap_or(0.0);
+                if f < 0.0 {
+                    return QueryResult::Error(EvalError::new(
+                        "skip doesn't support negative count",
+                    ));
+                }
+                num.as_i64().map_or(f as usize, |i| i as usize)
             } else {
                 return QueryResult::Error(EvalError::type_error("number", type_name(&v)));
             }
         }
         QueryResult::Owned(
             ref owned @ (OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..)),
-        ) => owned.as_f64().unwrap_or(0.0) as usize,
+        ) => {
+            let f = owned.as_f64().unwrap_or(0.0);
+            if f < 0.0 {
+                return QueryResult::Error(EvalError::new("skip doesn't support negative count"));
+            }
+            f as usize
+        }
         QueryResult::Error(e) => return QueryResult::Error(e),
         _ => return QueryResult::Error(EvalError::type_error("number", "null")),
     };
@@ -13436,11 +13453,27 @@ fn eval_limit<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    // Evaluate n
+    // Evaluate n. Mirrors jq's own `def limit($n; exp): if $n > 0 then
+    // ... elif $n == 0 then empty else exp end` -- a negative count (or
+    // `null`, which jq's total ordering places below every number, taking
+    // the same branch a negative count would) means "no limit at all",
+    // not an error (#983; verified against jq 1.7.1: `limit(-1; 1,2,3)`
+    // and `limit(null; 1,2,3)` both pass every value through unchanged).
     let n_result = eval_single::<W, S>(n_expr, value.clone(), optional);
     let n = match result_to_owned(n_result) {
         Ok(OwnedValue::Int(i) | OwnedValue::NumberLiteral(NumberRepr::Int(i), _)) if i >= 0 => {
             i as usize
+        }
+        // A negative count (or `null`, which jq's total ordering places
+        // below every number, taking the same branch a negative count
+        // would) means "no limit at all" per jq's own `def limit`, not an
+        // error -- verified against jq 1.7.1 (#983).
+        Ok(
+            OwnedValue::Int(_)
+            | OwnedValue::NumberLiteral(NumberRepr::Int(_), _)
+            | OwnedValue::Null,
+        ) => {
+            return eval_single::<W, S>(expr, value, optional);
         }
         Ok(_) => {
             return QueryResult::Error(EvalError::new("limit requires non-negative integer"));
@@ -19813,19 +19846,36 @@ fn builtin_nth_stream<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    // Evaluate n
+    // Evaluate n. jq's own `def nth($n; g): if $n < 0 then error("nth
+    // doesn't support negative indices") else ...` -- `null` already falls
+    // into the `_` catch-all below and errors (different message text, but
+    // the same jq-required outcome); a genuinely negative number silently
+    // became index 0 here instead of erroring (#983; verified against jq
+    // 1.7.1's own two-arg `nth`).
     let n_result = eval_single::<W, S>(n_expr, value.clone(), optional);
     let n = match n_result {
         QueryResult::One(v) => {
             if let StandardJson::Number(num) = v {
-                num.as_i64().unwrap_or(0) as usize
+                let f = num.as_f64().unwrap_or(0.0);
+                if f < 0.0 {
+                    return QueryResult::Error(EvalError::new(
+                        "nth doesn't support negative indices",
+                    ));
+                }
+                num.as_i64().map_or(f as usize, |i| i as usize)
             } else {
                 return QueryResult::Error(EvalError::type_error("number", type_name(&v)));
             }
         }
         QueryResult::Owned(
             ref owned @ (OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..)),
-        ) => owned.as_f64().unwrap_or(0.0) as usize,
+        ) => {
+            let f = owned.as_f64().unwrap_or(0.0);
+            if f < 0.0 {
+                return QueryResult::Error(EvalError::new("nth doesn't support negative indices"));
+            }
+            f as usize
+        }
         QueryResult::Error(e) => return QueryResult::Error(e),
         // A halt while evaluating `n` must propagate, not be misreported as
         // a type error (#791).
@@ -30106,17 +30156,24 @@ mod tests {
             );
         }
 
-        // reduce/foreach: `limit(-1; 1)` errors unconditionally, propagating
+        // reduce/foreach: `error("x")` errors unconditionally, propagating
         // as a genuine `Error`/`Partial(_, Control::Error(_))` from
         // `eval_reduce`/`eval_foreach`'s own INIT/SOURCE/fork-loop sites —
         // caught directly by `isvalid`'s match without needing any
         // optional-forcing.
+        //
+        // (Originally used `limit(-1;1)` as the guaranteed-to-error vehicle
+        // expression here; #983 corrected `limit`'s negative-count handling
+        // to match jq's own semantics -- unlimited passthrough, not an
+        // error -- which stopped it erroring at all, so it no longer fits
+        // this fixture's purpose. Swapped for `error("x")`, which still
+        // exercises the exact same isvalid/reduce/foreach code paths.)
         for expr in [
-            "isvalid(reduce (1,2) as $x (0; limit(-1;1)))",
-            "isvalid(reduce (1,2) as $x (limit(-1;1); .+$x))",
-            "isvalid(reduce (1,2) as $x ((1,limit(-1;1)); .+$x))",
-            "isvalid(foreach limit(-1;1) as $x (0; .+$x))",
-            "isvalid(foreach (1,2) as $x (limit(-1;1); .+$x))",
+            "isvalid(reduce (1,2) as $x (0; error(\"x\")))",
+            "isvalid(reduce (1,2) as $x (error(\"x\"); .+$x))",
+            "isvalid(reduce (1,2) as $x ((1,error(\"x\")); .+$x))",
+            "isvalid(foreach error(\"x\") as $x (0; .+$x))",
+            "isvalid(foreach (1,2) as $x (error(\"x\"); .+$x))",
         ] {
             query!(br"1", expr,
                 QueryResult::Owned(OwnedValue::Bool(false)) => {}

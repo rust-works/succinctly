@@ -9905,3 +9905,113 @@ fn test_arithmetic_on_malformed_number_errors_not_silent_zero_966() -> Result<()
     );
     Ok(())
 }
+
+/// #983: `limit`'s own jq definition (`if $n > 0 then ... elif $n == 0
+/// then empty else exp end`) treats a negative count as "no limit at
+/// all", not an error -- verified against real jq 1.7.1. succinctly used
+/// to error instead.
+#[test]
+fn test_limit_negative_count_is_unlimited_not_error_983() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-cn", "[limit(-1; 1,2,3)]"], None)?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[1,2,3]\n");
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
+/// Same as above for a `null` count, which jq's total ordering places
+/// below every number -- same branch a negative count takes.
+#[test]
+fn test_limit_null_count_is_unlimited_not_error_983() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-cn", "[limit(null; 1,2,3)]"], None)?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[1,2,3]\n");
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
+/// Sanity check that ordinary positive/zero counts are unaffected by
+/// #983's fix.
+#[test]
+fn test_limit_positive_and_zero_count_unaffected_983() -> Result<()> {
+    let (stdout, _, code) = run_jq_full(&["-cn", "[limit(2; 1,2,3)]"], None)?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "[1,2]\n");
+
+    let (stdout, _, code) = run_jq_full(&["-cn", "[limit(0; 1,2,3)]"], None)?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "[]\n");
+    Ok(())
+}
+
+/// #983: two-arg `nth`'s own jq definition errors on a negative index
+/// (jq's total ordering makes `null < 0` true too, so both take the same
+/// branch) -- verified against real jq 1.7.1 (`nth/2` predates 1.8).
+/// succinctly used to silently substitute index 0 instead.
+#[test]
+fn test_nth_negative_index_errors_not_silent_zero_983() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-cn", "[1,2,3] | nth(-1; .[])"], None)?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert!(
+        stderr.contains("nth doesn't support negative indices"),
+        "unexpected stderr: {stderr}"
+    );
+    Ok(())
+}
+
+/// Same as above but with the index sourced from the input document
+/// rather than a literal, exercising `builtin_nth_stream`'s other
+/// number-extraction branch (`StandardJson::Number` vs `OwnedValue`).
+#[test]
+fn test_nth_negative_index_from_document_errors_983() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "nth(.n; .arr[])"],
+        Some(r#"{"n": -1, "arr": [1,2,3]}"#),
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert!(
+        stderr.contains("nth doesn't support negative indices"),
+        "unexpected stderr: {stderr}"
+    );
+    Ok(())
+}
+
+/// Sanity check that an ordinary non-negative index is unaffected.
+#[test]
+fn test_nth_non_negative_index_unaffected_983() -> Result<()> {
+    let (stdout, _, code) = run_jq_full(&["-cn", "[1,2,3] | nth(1; .[])"], None)?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "2\n");
+    Ok(())
+}
+
+/// #983: jq 1.8's own `skip` definition errors on a negative count
+/// (`skip` doesn't exist in the pinned 1.7.1 oracle, but its definition
+/// is unambiguous: `else error("skip doesn't support negative count")`).
+/// succinctly used to silently return the unskipped stream instead.
+#[test]
+fn test_skip_negative_count_errors_not_silent_pass_through_983() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-cn", "[skip(-1; 1,2,3)]"], None)?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert!(
+        stderr.contains("skip doesn't support negative count"),
+        "unexpected stderr: {stderr}"
+    );
+    Ok(())
+}
+
+/// Sanity check that ordinary positive/zero counts are unaffected.
+#[test]
+fn test_skip_positive_and_zero_count_unaffected_983() -> Result<()> {
+    let (stdout, _, code) = run_jq_full(&["-cn", "[skip(1; 1,2,3)]"], None)?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "[2,3]\n");
+
+    let (stdout, _, code) = run_jq_full(&["-cn", "[skip(0; 1,2,3)]"], None)?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "[1,2,3]\n");
+    Ok(())
+}
