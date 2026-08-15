@@ -6748,6 +6748,64 @@ fn test_mapping_under_mapping_gap_via_explicit_value() -> Result<()> {
     Ok(())
 }
 
+// #959: #901's check was only wired into parse_mapping_entry,
+// parse_explicit_key, and parse_explicit_value -- the same three
+// call sites #885 touched for the analogous compact-mapping-gap check.
+// parse_block_node dispatches several other line shapes through their own
+// arms that called close_deeper_indents directly, bypassing the check
+// entirely and reproducing #901's identical silent-data-loss shape for a
+// line that isn't `key: value`.
+
+#[test]
+fn test_mapping_under_mapping_gap_via_bare_scalar() -> Result<()> {
+    // The original repro this issue was filed against: a bare scalar
+    // landing in the gap silently vanished instead of erroring.
+    let (_output, stderr, exit_code) =
+        run_yq_stdin_with_stderr(".", "a:\n    b: 1\n  c\n", &["-o", "json", "-I0"])?;
+    assert_eq!(exit_code, 1);
+    assert!(
+        stderr.contains("inconsistent indentation"),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_mapping_under_mapping_gap_via_flow_collection() -> Result<()> {
+    let (_output, stderr, exit_code) =
+        run_yq_stdin_with_stderr(".", "a:\n    b: 1\n  [1,2]\n", &["-o", "json", "-I0"])?;
+    assert_eq!(exit_code, 1);
+    assert!(
+        stderr.contains("inconsistent indentation"),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_mapping_under_mapping_gap_via_anchored_scalar() -> Result<()> {
+    let (_output, stderr, exit_code) =
+        run_yq_stdin_with_stderr(".", "a:\n    b: 1\n  &x c\n", &["-o", "json", "-I0"])?;
+    assert_eq!(exit_code, 1);
+    assert!(
+        stderr.contains("inconsistent indentation"),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_mapping_under_mapping_gap_via_standalone_alias() -> Result<()> {
+    let (_output, stderr, exit_code) =
+        run_yq_stdin_with_stderr(".", "a:\n    b: &x 1\n  *x\n", &["-o", "json", "-I0"])?;
+    assert_eq!(exit_code, 1);
+    assert!(
+        stderr.contains("inconsistent indentation"),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
 #[test]
 fn test_flow_dash_without_whitespace_is_still_a_scalar() -> Result<()> {
     // A `-` not followed by whitespace is a legitimate plain scalar in flow

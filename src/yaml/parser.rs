@@ -5011,6 +5011,17 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             }
             Some(b'{' | b'[') => {
                 // Flow mapping or sequence at document root
+                //
+                // #959: a flow collection landing in a mapping-under-mapping
+                // gap has the identical no-unambiguous-owner shape #901 fixed
+                // for `key: value` lines - reject it the same way instead of
+                // silently misattributing it via a plain close.
+                if self.mapping_under_mapping_gap_reaches(indent) {
+                    return Err(YamlError::InconsistentIndentation {
+                        offset: self.pos,
+                        line: self.current_line(),
+                    });
+                }
                 self.close_deeper_indents(indent);
                 self.parse_value(indent)?;
             }
@@ -5036,6 +5047,15 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                     // preempted by an unconditional close running first.
                     self.parse_mapping_entry(indent)?;
                 } else {
+                    // #959: same mapping-under-mapping gap rejection as the
+                    // flow-collection arm above, for an anchored/tagged
+                    // scalar value landing in the gap.
+                    if self.mapping_under_mapping_gap_reaches(indent) {
+                        return Err(YamlError::InconsistentIndentation {
+                            offset: self.pos,
+                            line: self.current_line(),
+                        });
+                    }
                     self.close_deeper_indents(indent);
                     // Consume any leading `&anchor` and/or `!tag`, in either
                     // order, for non-mapping-key cases
@@ -5093,6 +5113,15 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                     // Alias is a key - let parse_mapping_entry handle it
                     self.parse_mapping_entry(indent)?;
                 } else {
+                    // #959: same mapping-under-mapping gap rejection as the
+                    // other arms in this function, for a standalone alias
+                    // value landing in the gap.
+                    if self.mapping_under_mapping_gap_reaches(indent) {
+                        return Err(YamlError::InconsistentIndentation {
+                            offset: self.pos,
+                            line: self.current_line(),
+                        });
+                    }
                     // Standalone alias value
                     self.close_deeper_indents(indent);
                     self.parse_alias()?;
@@ -5104,6 +5133,16 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 if self.looks_like_mapping_entry() {
                     self.parse_mapping_entry(indent)?;
                 } else {
+                    // #959: same mapping-under-mapping gap rejection as the
+                    // other arms in this function, for a bare scalar value
+                    // landing in the gap - the original repro this issue
+                    // was filed against.
+                    if self.mapping_under_mapping_gap_reaches(indent) {
+                        return Err(YamlError::InconsistentIndentation {
+                            offset: self.pos,
+                            line: self.current_line(),
+                        });
+                    }
                     // Scalar value - either bare document scalar or value in a container
                     self.close_deeper_indents(indent);
                     self.set_ib();
