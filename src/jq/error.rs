@@ -512,6 +512,44 @@ impl EvalError {
         Self::new(format!("Cannot iterate over {}", describe(value)))
     }
 
+    /// `strptime/1 requires string inputs and arguments` (#929).
+    ///
+    /// jq's C implementation validates `strptime`'s input *and* format
+    /// argument with a single combined check, raising this exact message
+    /// regardless of which one is the non-string offender — confirmed live
+    /// against jq 1.7.1 for all three: a non-string format on a valid
+    /// string input, a non-string input with a valid format string, and
+    /// `fromdate`/`fromdateiso8601` (defined in terms of `strptime`) on a
+    /// non-string input. (A non-string format *and* non-string input
+    /// together crashes real jq with a C assertion failure rather than
+    /// raising this message — not reproduced here; this message is
+    /// strictly better than a crash for that combination.)
+    pub fn strptime_requires_string() -> Self {
+        Self::new("strptime/1 requires string inputs and arguments")
+    }
+
+    /// `<type> (<value>) cannot be <format>-formatted, only array` (#929).
+    ///
+    /// Raised by `@csv`/`@tsv` for a non-array top-level value — confirmed
+    /// live against jq 1.7.1: `5 | @csv` is `"number (5) cannot be
+    /// csv-formatted, only array"`, `5 | @tsv` the same with `tsv`.
+    pub fn cannot_be_dsv_formatted(value: &OwnedValue, format: &str) -> Self {
+        Self::new(format!(
+            "{} cannot be {format}-formatted, only array",
+            describe(value)
+        ))
+    }
+
+    /// `<type> (<value>) can not be escaped for shell` (#929).
+    ///
+    /// Raised by `@sh` for a value that isn't a string, number, boolean,
+    /// `null`, or array of those (jq's own shell-quoting rules) — confirmed
+    /// live against jq 1.7.1: `{"a":1} | @sh` is `"object ({\"a\":1}) can
+    /// not be escaped for shell"`.
+    pub fn cannot_be_shell_escaped(value: &OwnedValue) -> Self {
+        Self::new(format!("{} can not be escaped for shell", describe(value)))
+    }
+
     /// `Invalid path expression with result <value>` (#530).
     ///
     /// Raised by `path()` when the filter it was given is not a path
@@ -654,6 +692,12 @@ impl EvalError {
     /// on a non-array, where both operands are the same value.
     pub fn pair_cannot_be_iterated(left: &OwnedValue, right: &OwnedValue) -> Self {
         Self::pair(left, right, "cannot be iterated over")
+    }
+
+    /// `<a> and <b> cannot be sorted, as they are not both arrays` — jq's
+    /// wording for `unique_by`/`sort_by`/`group_by` on a non-array (#929).
+    pub fn pair_cannot_be_sorted(left: &OwnedValue, right: &OwnedValue) -> Self {
+        Self::pair(left, right, "cannot be sorted, as they are not both arrays")
     }
 
     /// `<v> has no keys`.

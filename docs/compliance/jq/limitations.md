@@ -299,10 +299,23 @@ A probe is only admitted to the corpus if jq errors on it, so the corpus is blin
 opposite divergence: a filter that jq answers with a value and succinctly refuses. Those
 have to be recorded here.
 
-| Filter            | Input         | jq                          | succinctly                            |
-|-------------------|---------------|-----------------------------|---------------------------------------|
-| `.[1:2] = ["x"]`  | `null`        | `["x"]`                     | `Cannot index null with object`       |
-| `.[1:2] \|= ["x"]`| `null`        | `["x"]`                     | `Cannot index null with object`       |
+| Filter             | Input   | jq                                  | succinctly                        |
+|--------------------|---------|-------------------------------------|-----------------------------------|
+| `.[1:2] = ["x"]`   | `null`  | `["x"]`                             | `Cannot index null with object`   |
+| `.[1:2] \|= ["x"]` | `null`  | `["x"]`                             | `Cannot index null with object`   |
+| `@uri`             | `[1,2]` | `"%5B1%2C2%5D"`                     | `expected string, got array`      |
+| `@base64`          | `5`     | `"NQ=="`                            | `expected string, got number`     |
+| `flatten("x")`     | `[1,2]` | `[1,2]` (ignores non-integer depth) | `expected number, got non-number` |
+
+[#929](https://github.com/rust-works/succinctly/issues/929) found these while auditing
+`EvalError::type_error` wording: real jq's `@uri`/`@base64` (and every other format string
+except `@csv`/`@tsv`/`@sh`) auto-`tostring`s a non-string argument before formatting rather
+than refusing it outright, and `flatten`'s depth argument is silently ignored if it isn't a
+number rather than validated. `@base64d` is a related but distinct case — jq *does* still
+error on `5 | @base64d` (`string ("5") trailing base64 byte found`), just from attempting to
+base64-decode the auto-stringified `"5"` rather than refusing the number up front, so it
+isn't purely a "jq doesn't error" gap; matching it needs the same underlying
+auto-`tostring`-first change `@uri`/`@base64` do, not just a different error message.
 
 Both rows are a slice write walking a path *in place*, and the gap is the same
 auto-vivification jq performs everywhere else it writes through a path: `null` grows into
