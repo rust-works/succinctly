@@ -6576,21 +6576,43 @@ fn dv_captures_at<'h>(
 /// A compiled jq regex plus whatever extra state its builtins need to
 /// replicate jq semantics that Rust's `regex` crate doesn't natively
 /// support (currently: jq's Perl-style trailing-newline exception for `$`
-/// — see `dv_captures_at`/`dv_is_match`).
+/// — see `dv_captures_at`/`dv_is_match` — and the `n` flag's suppression of
+/// zero-length matches — see `first_captures`/`global_captures`).
+///
+/// `suppress_empty`'s skip-forward algorithm only correctly implements the
+/// `n` flag for patterns where an empty match proves no non-empty match is
+/// achievable at that position — true for greedy quantifiers and
+/// alternations whose non-empty branch is preferred first, which covers
+/// every documented jq use of `n`. Lazy quantifiers (`*?`) and alternations
+/// with an empty-matching branch listed first can have a non-empty match at
+/// the *same* position that the skip-forward search never finds, since
+/// finding it needs backtracking semantics (oniguruma's
+/// `ONIG_OPTION_FIND_NOT_EMPTY`) that Rust's non-backtracking `regex` crate
+/// has no equivalent for — the same category of gap as `l`'s missing
+/// `MatchKind::LeftmostLongest` (#920). Tracked as #922.
 #[cfg(feature = "regex")]
 struct JqRegex {
     re: regex::Regex,
     needs_trailing_nl_check: bool,
+    suppress_empty: bool,
 }
 
 #[cfg(feature = "regex")]
 impl JqRegex {
     fn is_match(&self, input: &str) -> bool {
-        dv_is_match(&self.re, input, self.needs_trailing_nl_check)
+        if self.suppress_empty {
+            first_captures(self, input).is_some()
+        } else {
+            dv_is_match(&self.re, input, self.needs_trailing_nl_check)
+        }
     }
 
     fn captures<'h>(&self, input: &'h str) -> Option<regex::Captures<'h>> {
-        dv_captures_at(&self.re, input, 0, self.needs_trailing_nl_check)
+        if self.suppress_empty {
+            first_captures(self, input)
+        } else {
+            dv_captures_at(&self.re, input, 0, self.needs_trailing_nl_check)
+        }
     }
 
     fn capture_names(&self) -> regex::CaptureNames<'_> {
@@ -6608,6 +6630,7 @@ fn build_regex(pattern: &str, flags: Option<&str>) -> Result<JqRegex, EvalError>
     let mut pattern = pattern.to_string();
 
     // Apply flags
+    let mut suppress_empty = false;
     if let Some(flags) = flags {
         let mut case_insensitive = false;
         let mut extended = false;
@@ -6628,12 +6651,13 @@ fn build_regex(pattern: &str, flags: Option<&str>) -> Result<JqRegex, EvalError>
                 // `p` enables both s and m; s is a no-op here, so p reduces
                 // to the same effect as m.
                 'p' => dot_matches_newline = true,
-                'g' => {} // global - handled at call site
+                'g' => {}                     // global - handled at call site
+                'n' => suppress_empty = true, // suppress empty matches (#730)
                 // Recognized by real jq but not yet implemented here (#730):
-                // `n` (suppress empty matches) and `l` (POSIX leftmost-longest)
-                // are accepted as valid flag characters, silently without
-                // effect, rather than raising the error below.
-                'n' | 'l' => {}
+                // `l` (POSIX leftmost-longest) is accepted as a valid flag
+                // character, silently without effect, rather than raising
+                // the error below — see #920 for why this one stays open.
+                'l' => {}
                 _ => {
                     // Real jq's own wording, and its own choice: the message
                     // names the whole flags string, not just the offending
@@ -6676,6 +6700,7 @@ fn build_regex(pattern: &str, flags: Option<&str>) -> Result<JqRegex, EvalError>
     Ok(JqRegex {
         re,
         needs_trailing_nl_check,
+        suppress_empty,
     })
 }
 
@@ -6789,34 +6814,85 @@ fn builtin_match<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     }
 }
 
+/// One step of a forward regex search: the leftmost match of `re` at or
+/// after byte offset `start`, whether it satisfies the `n` flag's policy
+/// (`re.suppress_empty` implies non-empty), and the offset to resume
+/// searching from for the next match. `first_captures` and
+/// `global_captures` are both this step driven in a loop — the former
+/// stops at the first accepted match, the latter collects every accepted
+/// one — so the acceptance test and the empty-match advance-by-one-codepoint
+/// arithmetic exist in exactly one place rather than two copies that could
+/// silently drift (the exact failure mode #906/#915 hit with duplicated
+/// builtin logic elsewhere in this file).
+#[cfg(feature = "regex")]
+fn next_match_step<'h>(
+    re: &JqRegex,
+    input: &'h str,
+    start: usize,
+) -> Option<(regex::Captures<'h>, bool, usize)> {
+    if start > input.len() {
+        return None;
+    }
+    let caps = dv_captures_at(&re.re, input, start, re.needs_trailing_nl_check)?;
+    let m = caps
+        .get(0)
+        .expect("capture group 0 is always present on a match");
+    let (m_start, m_end) = (m.start(), m.end());
+    let accepted = !re.suppress_empty || m_end > m_start;
+    let next_start = if m_end > m_start {
+        m_end
+    } else {
+        match input[m_end..].chars().next() {
+            Some(c) => m_end + c.len_utf8(),
+            None => m_end + 1,
+        }
+    };
+    Some((caps, accepted, next_start))
+}
+
+/// Leftmost match of `re` in `input` satisfying the `n` flag
+/// (`re.suppress_empty`) — verified live against jq-1.7.1, e.g.
+/// `match("x*";"n")` on `"aaxaa"` finds `"x"` at offset 2 rather than the
+/// empty match at offset 0. Unlike `global_captures`, stops at the first
+/// qualifying match instead of scanning the whole input.
+///
+/// `n`'s skip-forward search only finds a non-empty match reachable by
+/// moving to a *later* position, not one reachable only by backtracking to
+/// a different alternative at the *same* position — see the gap documented
+/// on `JqRegex` (#922).
+#[cfg(feature = "regex")]
+fn first_captures<'h>(re: &JqRegex, input: &'h str) -> Option<regex::Captures<'h>> {
+    let mut start = 0usize;
+    loop {
+        let (caps, accepted, next_start) = next_match_step(re, input, start)?;
+        if accepted {
+            return Some(caps);
+        }
+        start = next_start;
+    }
+}
+
 /// Find every match of `re` in `input`, including a trailing zero-width
 /// match immediately after a non-empty one — which `Regex::captures_iter`
 /// deliberately suppresses (regex-automata treats it as overlapping the
 /// prior match's end bound). Mirrors jq's own C matching loop: advance to
 /// the match end, or one character past it when the match was empty. Also
 /// honors jq's Perl-style trailing-newline exception for `$` via
-/// `dv_captures_at` — see its doc comment.
+/// `dv_captures_at` — see its doc comment — and the `n` flag
+/// (`re.suppress_empty`), which excludes zero-length matches from the
+/// result while still using them to advance the search position, matching
+/// jq's own behavior (verified live: `[scan(" *";"n")]` on `"a  b   c"`
+/// keeps only the two non-empty runs of spaces). Same known gap as
+/// `first_captures` (#922).
 #[cfg(feature = "regex")]
 fn global_captures<'h>(re: &JqRegex, input: &'h str) -> Vec<regex::Captures<'h>> {
     let mut results = Vec::new();
     let mut start = 0usize;
-    while start <= input.len() {
-        let Some(caps) = dv_captures_at(&re.re, input, start, re.needs_trailing_nl_check) else {
-            break;
-        };
-        let m = caps
-            .get(0)
-            .expect("capture group 0 is always present on a match");
-        let (m_start, m_end) = (m.start(), m.end());
-        results.push(caps);
-        start = if m_end > m_start {
-            m_end
-        } else {
-            match input[m_end..].chars().next() {
-                Some(c) => m_end + c.len_utf8(),
-                None => m_end + 1,
-            }
-        };
+    while let Some((caps, accepted, next_start)) = next_match_step(re, input, start) {
+        if accepted {
+            results.push(caps);
+        }
+        start = next_start;
     }
     results
 }
@@ -27729,9 +27805,10 @@ mod tests {
             );
         }
 
-        // `n` (suppress empty matches) and `l` (POSIX leftmost-longest) are
-        // real jq flag characters, just not yet functionally implemented
-        // here (#730) - they must not be rejected as unknown.
+        // `n` (suppress empty matches, implemented below in
+        // test_regex_n_flag_suppresses_empty_matches_730), `l` (POSIX
+        // leftmost-longest, not yet implemented — #920) and `p` are all
+        // real jq flag characters — they must not be rejected as unknown.
         for flags in ["n", "l", "p"] {
             query!(br#""abc""#, &format!(r#"test("abc"; "{flags}")"#),
                 QueryResult::Owned(OwnedValue::Bool(b)) => {
@@ -27739,6 +27816,144 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[cfg(feature = "regex")]
+    #[test]
+    fn test_regex_n_flag_suppresses_empty_matches_730() {
+        // #730: `n` filters zero-length matches out of the global-match
+        // iteration, and — for the first-match-only builtins — searches
+        // forward past a leading empty match to find the first non-empty
+        // one, rather than settling for offset 0. Every case here is
+        // verified live against jq 1.7.1.
+
+        // scan/gsub/split/splits (global by construction) keep only the
+        // non-empty runs.
+        query!(br#""a  b   c""#, r#"[scan(" *"; "n")]"#,
+            QueryResult::Owned(OwnedValue::Array(vs)) => {
+                assert_eq!(
+                    vs,
+                    vec![
+                        OwnedValue::String("  ".to_string()),
+                        OwnedValue::String("   ".to_string()),
+                    ]
+                );
+            }
+        );
+        query!(br#""a  b   c""#, r#"gsub(" *"; "_"; "n")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "a_b_c");
+            }
+        );
+        query!(br#""a1b2""#, r#"[splits("[0-9]*"; "n")]"#,
+            QueryResult::Owned(OwnedValue::Array(vs)) => {
+                assert_eq!(
+                    vs,
+                    vec![
+                        OwnedValue::String("a".to_string()),
+                        OwnedValue::String("b".to_string()),
+                        OwnedValue::String(String::new()),
+                    ]
+                );
+            }
+        );
+
+        // match(re;"g") / capture(re;"g") also route through the same
+        // global_captures filtering.
+        query!(br#""a  b   c""#, r#"[match(" *"; "gn")] | length"#,
+            QueryResult::Owned(OwnedValue::Int(n)) => {
+                assert_eq!(n, 2);
+            }
+        );
+
+        // match/test/capture/sub without "g" search forward past a leading
+        // empty match instead of settling for it.
+        query!(br#""aaxaa""#, r#"match("x*"; "n") | .offset"#,
+            QueryResult::Owned(OwnedValue::Int(offset)) => {
+                assert_eq!(offset, 2);
+            }
+        );
+        query!(br#""aaxaa""#, r#"test("x*"; "n")"#,
+            QueryResult::Owned(OwnedValue::Bool(b)) => {
+                assert!(b);
+            }
+        );
+        query!(br#""aaxaa""#, r#"sub("x*"; "Y"; "n")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "aaYaa");
+            }
+        );
+
+        // When no non-empty match exists anywhere, jq's generators produce
+        // no output at all (not `null`), `test` is false, and `sub` leaves
+        // the input unchanged since there is nothing to replace.
+        query!(br#""a""#, r#"[match("x*"; "n")]"#,
+            QueryResult::Owned(OwnedValue::Array(vs)) => {
+                assert!(vs.is_empty());
+            }
+        );
+        query!(br#""a""#, r#"test("x*"; "n")"#,
+            QueryResult::Owned(OwnedValue::Bool(b)) => {
+                assert!(!b);
+            }
+        );
+        query!(br#""aaa""#, r#"sub("x*"; "Y"; "n")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "aaa");
+            }
+        );
+
+        // `n` composes with other flags rather than overriding them.
+        query!(br#""AAxAA""#, r#"match("x*"; "in") | .offset"#,
+            QueryResult::Owned(OwnedValue::Int(offset)) => {
+                assert_eq!(offset, 2);
+            }
+        );
+    }
+
+    #[cfg(feature = "regex")]
+    #[test]
+    fn test_regex_n_flag_known_gap_lazy_quantifier_922() {
+        // #922: `n`'s skip-forward search only finds a non-empty match
+        // reachable by moving to a *later* position, not one reachable only
+        // by backtracking to a different alternative at the *same*
+        // position — which a lazy quantifier or an empty-preferring
+        // alternation can require. Rust's non-backtracking `regex` crate
+        // has no equivalent to oniguruma's `ONIG_OPTION_FIND_NOT_EMPTY`
+        // (same root cause as #920's missing `MatchKind::LeftmostLongest`).
+        //
+        // This pins the *current, known-divergent* behavior rather than
+        // jq's — verified live against jq 1.7.1, which returns `true`/a
+        // real match/`["x","a","b","b"]` for each case below.
+        query!(br#""x\nabb""#, r#"test("a*?"; "n")"#,
+            QueryResult::Owned(OwnedValue::Bool(b)) => {
+                assert!(!b, "jq says true here (offset 2, \"a\") — known gap, #922");
+            }
+        );
+        query!(br#""x\nabb""#, r#"[match("a*?"; "n")]"#,
+            QueryResult::Owned(OwnedValue::Array(vs)) => {
+                assert!(vs.is_empty(), "jq finds a match at offset 2 — known gap, #922");
+            }
+        );
+        query!(br#""x\nabb""#, r#"[scan(".*?"; "gn")]"#,
+            QueryResult::Owned(OwnedValue::Array(vs)) => {
+                assert!(vs.is_empty(), "jq returns [\"x\",\"a\",\"b\",\"b\"] — known gap, #922");
+            }
+        );
+
+        // The equivalent alternation with branches reordered (non-empty
+        // first) is unaffected — isolates the gap to which alternative the
+        // engine's leftmost-first preference reaches, not to `n` broadly.
+        query!(br#""xa""#, r#"[match("(?:a|)"; "gn")] | length"#,
+            QueryResult::Owned(OwnedValue::Int(n)) => {
+                assert_eq!(n, 1);
+            }
+        );
+        query!(br#""xa""#, r#"[match("(?:|a)"; "gn")]"#,
+            QueryResult::Owned(OwnedValue::Array(vs)) => {
+                assert!(vs.is_empty(), "jq finds a match at offset 1 — known gap, #922");
+            }
+        );
     }
 
     #[cfg(feature = "regex")]
