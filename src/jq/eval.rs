@@ -10274,6 +10274,26 @@ fn path_result(branches: Vec<PathBranch<'_>>, escape: Option<EvalEscape>) -> Pat
     }
 }
 
+/// Truncate a resolved node's branches to its first `n`, matching jq's
+/// lazy generator model: once `n` outputs are already available, a
+/// trailing error/break the source produced *after* them is never even
+/// reached, so it must not surface here either -- a bare `?` on `result`
+/// would propagate it regardless of how much output had already
+/// accumulated. Every "keep-partial" resolver (`select`/`if`/`getpath`/
+/// computed-index/`recurse`, #896/#842/#854) already threads its own
+/// partial prefix through `PathResolveResult`'s `Err` side for exactly
+/// this reason; this is where `first`/`limit` (the two callers that
+/// truncate rather than consume every output) finally make use of it
+/// instead of discarding it (#972). Shared so the two can't drift on the
+/// exact same "how much is enough" comparison.
+fn take_path_branches(result: PathResolveResult<'_>, n: usize) -> PathResolveResult<'_> {
+    match result {
+        Ok(branches) => Ok(branches.into_iter().take(n).collect()),
+        Err((partial, _)) if partial.len() >= n => Ok(partial.into_iter().take(n).collect()),
+        Err(e) => Err(e),
+    }
+}
+
 /// Resolve one path node against one value, yielding a branch per output.
 ///
 /// `trackable` is `false` for exactly one caller (`resolve_catch`, for the
@@ -10600,11 +10620,14 @@ fn resolve_node<'a, S: EvalSemantics>(
         // is a second, older representation reachable from a different
         // parser path. Keeping both arms means it does not matter which one
         // a given call site produces.
+        //
+        // `take_path_branches` (not a bare `?`) matters here: jq's own
+        // lazy generator never asks `f` for a value past the first one, so
+        // an error `f` would raise *after* that first output is never
+        // even reached -- confirmed live, `path(first(select((true,
+        // error("x")))))` is `[]`, exit 0, in real jq (#972).
         Expr::FirstExpr(inner) | Expr::Builtin(Builtin::FirstStream(inner)) => {
-            Ok(resolve_node::<S>(inner, value, trackable)?
-                .into_iter()
-                .take(1)
-                .collect())
+            take_path_branches(resolve_node::<S>(inner, value, trackable), 1)
         }
 
         // `if cond then a else b end`: only the branch the runtime actually
@@ -10908,10 +10931,11 @@ fn resolve_limit<'a, S: EvalSemantics>(
     if n == 0 {
         return Ok(Vec::new());
     }
-    Ok(resolve_node::<S>(expr, value, trackable)?
-        .into_iter()
-        .take(n)
-        .collect())
+    // `take_path_branches`, not a bare `?`: jq's lazy generator never asks
+    // `expr` for a value past the `n`th, so a later error is never even
+    // reached -- confirmed live, `path(limit(1; select((true,
+    // error("x")))))` is `[[]]`, exit 0, in real jq (#972).
+    take_path_branches(resolve_node::<S>(expr, value, trackable), n)
 }
 
 /// Convert a static, non-`Identity` path component into the `OwnedValue` jq

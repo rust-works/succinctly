@@ -10079,3 +10079,123 @@ fn test_limit_positive_float_count_still_errors_983() -> Result<()> {
     );
     Ok(())
 }
+
+/// #972: jq's lazy generator model never asks a source for a value past
+/// what `first`/`limit` need, so an error the source would raise *after*
+/// enough output was already produced is never even reached. succinctly's
+/// path-context resolver (`resolve_node`) used a bare `?` on the inner
+/// generator's result, discarding the fact that enough output had
+/// already been collected and raising the trailing error anyway.
+/// Verified against real jq 1.7.1: `[]`, exit 0.
+#[test]
+fn test_path_first_select_discards_trailing_error_972() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "path(first(select((true, error(\"x\")))))"],
+        Some("1"),
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[]\n");
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
+/// Same shape as above for `limit(1; ...)`, the other truncating resolver
+/// #972 fixed via the same shared `take_path_branches` helper.
+#[test]
+fn test_path_limit_select_discards_trailing_error_972() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "path(limit(1; select((true, error(\"x\")))))"],
+        Some("1"),
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[]\n");
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
+/// Same shape via `if`/`else`'s own keep-partial resolver (#896/#628)
+/// instead of `select`'s.
+#[test]
+fn test_path_first_if_discards_trailing_error_972() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            "path(first(if (true, error(\"x\")) then . else empty end))",
+        ],
+        Some("1"),
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[]\n");
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
+/// Same shape via a computed index's keep-partial resolver (#896).
+#[test]
+fn test_path_first_computed_index_discards_trailing_error_972() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", "path(first(.[(0,error(\"x\"))]))"], Some("[1,2,3]"))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[0]\n");
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
+/// Same shape via `getpath`'s keep-partial resolver (#896).
+#[test]
+fn test_path_first_getpath_discards_trailing_error_972() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "path(first(getpath(([\"a\"],error(\"x\")))))"],
+        Some(r#"{"a":1}"#),
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[\"a\"]\n");
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
+/// Same shape via `recurse`'s keep-partial resolver (#842/#854), the
+/// case that predates #896 entirely.
+#[test]
+fn test_path_first_recurse_discards_trailing_error_972() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            r#"path(first(recurse(if type=="object" then .[] else error("x") end)))"#,
+        ],
+        Some(r#"{"a":{"b":1}}"#),
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[]\n");
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
+/// Sanity: when the source errors *before* producing enough output for
+/// `first`/`limit` to be satisfied, the error must still surface --
+/// #972's fix only discards a trailing error that comes *after* enough
+/// output, never one that arrives instead of it.
+#[test]
+fn test_path_first_select_still_errors_when_insufficient_output_972() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", "path(first(select((error(\"x\")))))"], Some("1"))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert!(stderr.contains('x'), "unexpected stderr: {stderr}");
+    Ok(())
+}
+
+/// Same sanity check for `limit(3; ...)`: only 2 outputs were produced
+/// before the error, short of the 3 `limit` needs, so the error (and the
+/// 2-item partial prefix jq itself would also report) must still surface.
+#[test]
+fn test_path_limit_select_still_errors_when_insufficient_output_972() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "path(limit(3; select((true, true, error(\"x\")))))"],
+        Some("1"),
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[]\n[]\n");
+    assert!(stderr.contains('x'), "unexpected stderr: {stderr}");
+    Ok(())
+}
