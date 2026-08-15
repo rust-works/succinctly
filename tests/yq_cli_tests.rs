@@ -1115,17 +1115,24 @@ fn test_duplicate_mapping_key_survives_inplace() -> Result<()> {
     Ok(())
 }
 
-/// #907: `--slurp`, `--eval-all`, and the `load()` builtin each materialize
-/// through their own copy of the `ResolvedScalar -> OwnedValue` mapping
-/// (`yq_runner.rs`'s `resolved_scalar_to_owned`/`standard_json_to_owned`,
-/// `eval.rs`'s local `resolved_scalar_to_owned`) -- none of which are the
-/// `eval_generic.rs` path #918 fixed, so an integer-valued float scalar
-/// (`2.0`) lost its decimal point through all three even after #918 landed.
-/// Confirmed live before this fix: `--slurp '.'` gave `[2]`, `--eval-all
-/// '.'` gave `2`, both wrong. Fixed by hoisting one shared
-/// `ResolvedScalar::to_owned_value` (used by all three, plus the fourth
-/// copy this uncovered, `standard_json_to_owned` -- see that function's own
-/// former doc comment; replaced by the shared `to_owned` instead).
+/// #907: `--slurp` and `load()` materialized YAML input through their own
+/// copy of the `ResolvedScalar -> OwnedValue` mapping (`yq_runner.rs`'s
+/// `resolved_scalar_to_owned`, `eval.rs`'s local `resolved_scalar_to_owned`)
+/// -- neither was the `eval_generic.rs` path #918 fixed, so an
+/// integer-valued float scalar (`2.0`) lost its decimal point through both
+/// even after #918 landed. Fixed by hoisting one shared
+/// `ResolvedScalar::to_owned_value`, used by both plus the third,
+/// tag-carrying copy in `eval_generic.rs`.
+///
+/// `--slurp`/`--eval-all`'s JSON-round-trip evaluation bridge
+/// (`evaluate_input`) uncovered a *separate*, unrelated duplicate on the
+/// way: `yq_runner.rs`'s `standard_json_to_owned` converted `StandardJson`
+/// (a JSON DOM value, not a `ResolvedScalar`) via `as_i64`/`as_f64`
+/// directly, bypassing `DocumentValue::number_literal()` entirely -- unlike
+/// this crate's own `to_owned()`, which `StandardJson` already implements
+/// `DocumentValue` for. Replaced with a call to that existing `to_owned()`
+/// instead of writing a fourth copy of anything. Confirmed live before this
+/// fix: `--slurp '.'` gave `[2]`, `--eval-all '.'` gave `2`, both wrong.
 #[test]
 fn test_integer_valued_float_survives_slurp_eval_all_load_907() -> Result<()> {
     let (out, code) = run_yq_stdin(".", "2.0", &["--slurp", "-o", "json", "-I", "0"])?;
@@ -1143,6 +1150,27 @@ fn test_integer_valued_float_survives_slurp_eval_all_load_907() -> Result<()> {
     assert_eq!(code, 0, "out: {out:?}");
     assert_eq!(out.trim(), "{\"a\":2.0}");
 
+    Ok(())
+}
+
+/// #907 companion: `standard_json_to_owned`'s removal (see the test above)
+/// changes `--slurp`/`--eval-all --input-format json`'s number formatting,
+/// not just YAML input's -- `StandardJson::number_literal()` is
+/// unconditional (unlike YAML's gated override), so every JSON number now
+/// preserves its own source spelling through this path instead of
+/// `as_i64`/`as_f64`'s lossy round-trip. Pinned against the pinned jq
+/// oracle: `echo '{"a":1e2}' | jq '.'` also gives `1E+2`, confirming this
+/// is a correctness fix (the old behavior silently normalized to `100.0`),
+/// not a new divergence.
+#[test]
+fn test_json_input_slurp_preserves_exponent_literal_spelling_907() -> Result<()> {
+    let (out, code) = run_yq_stdin(
+        ".",
+        "{\"a\":1e2}",
+        &["--input-format", "json", "--slurp", "-o", "json", "-I", "0"],
+    )?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "[{\"a\":1E+2}]");
     Ok(())
 }
 

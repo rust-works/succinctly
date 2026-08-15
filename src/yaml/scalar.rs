@@ -95,14 +95,17 @@ impl ResolvedScalar {
     /// `f64::Display`, since `Int`/`Float`/`Bool`/`Null` carry no source
     /// text of their own to fall back on).
     ///
-    /// The single source of truth this crate's three independent
-    /// `ResolvedScalar -> OwnedValue` match arms (issue #907) collapse
-    /// into: `crate::jq::eval_generic`'s tagged-scalar materialization,
-    /// the yq CLI's DOM conversion (`yq_runner.rs`), and the `load()`
-    /// builtin's YAML loader (`eval.rs`) all called this out independently
-    /// before, which is exactly how the yq-CLI and `load()` copies missed
-    /// #918's literal-preservation fix when it landed only in
-    /// `eval_generic.rs`.
+    /// Three independent `ResolvedScalar -> OwnedValue` match arms (issue
+    /// #907) collapse into this one: `crate::jq::eval_generic`'s
+    /// tagged-scalar materialization, the yq CLI's DOM conversion
+    /// (`yq_runner.rs`), and the `load()` builtin's YAML loader
+    /// (`eval.rs`) all had their own copy before, which is exactly how the
+    /// yq-CLI and `load()` copies missed #918's literal-preservation fix
+    /// when it landed only in `eval_generic.rs`. Two further siblings that
+    /// produce JSON *text* directly rather than an `OwnedValue`
+    /// (`light.rs`'s `write_resolved_scalar_as_json`/
+    /// `stream_resolved_scalar_as_json`) are a different output type and
+    /// weren't folded in here — see the #907 follow-up issue.
     #[must_use]
     pub fn to_owned_value(self, text: Cow<'_, str>) -> OwnedValue {
         match self {
