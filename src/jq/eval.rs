@@ -3006,15 +3006,21 @@ fn builtin_has<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // `.a | has("x")` on an array, `has(0)` on an object, and `has(...)`
         // on a bare scalar are all `false`, not an error. This has to come
         // *before* the `optional` arm below: yq's `has()` never errors here
-        // regardless of `?`, so `isvalid(has("x"))` on an array (which
-        // forces `optional=true` unconditionally, see `builtin_isvalid`)
-        // must still report the expression as valid, not `None`/`false` as
-        // if it *would* have errored without `?` -- an earlier version of
-        // this arm sat after the `optional` check and made `isvalid` return
+        // regardless of `?`, so `isvalid(has("x"))` on an array must still
+        // report the expression as valid, not `None`/`false` as if it
+        // *would* have errored without `?` -- an earlier version of this
+        // arm sat after the `optional` check and made `isvalid` return
         // `false` for a `has()` call yq itself never fails on (#917 review,
         // caught via `isvalid(has("x"))` on `[1,2,3]` returning `false`
-        // instead of `true`). jq keeps erroring here (`Cannot check whether
-        // <container> has a <key> key`, which is correct and unaffected).
+        // instead of `true`). This ordering matters regardless of what
+        // `optional` value `isvalid` passes down -- at the time of #917's
+        // fix `isvalid` forced `optional=true` unconditionally
+        // (`builtin_isvalid`), but #881 later removed that forcing, and
+        // this arm's own condition never depended on `optional` in the
+        // first place, so the ordering fix and its rationale both still
+        // hold unchanged either way. jq keeps erroring here (`Cannot check
+        // whether <container> has a <key> key`, which is correct and
+        // unaffected).
         _ if has_type_mismatch_is_permissive::<S>() => QueryResult::Owned(OwnedValue::Bool(false)),
         _ if optional => QueryResult::None,
         _ => QueryResult::Error(EvalError::cannot_check_has(
@@ -13735,8 +13741,8 @@ fn walk_impl<S: EvalSemantics>(
 /// surface as `eval_comma`/`eval_reduce`/`eval_foreach`'s own natural
 /// `Partial(_, Control::Error(_))` shape (built by `partial(...)`, same as
 /// every other "keep the prefix, thread the escape" site in this file),
-/// which the new arm below catches directly -- no per-builtin
-/// optional-forcing needed. See
+/// which `QueryResult::is_error` (checked below) now catches directly -- no
+/// per-builtin optional-forcing needed. See
 /// `test_isvalid_comma_sibling_error_not_masked_881` and
 /// `test_isvalid_reaches_every_builtins_own_optional_guard` for the full
 /// before/after case-by-case verification, including two cases
@@ -13749,15 +13755,20 @@ fn builtin_isvalid<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     _optional: bool,
 ) -> QueryResult<'a, W> {
-    match eval_single::<W, S>(expr, value, false) {
-        QueryResult::Error(_) => QueryResult::Owned(OwnedValue::Bool(false)),
+    let result = eval_single::<W, S>(expr, value, false);
+    // Covers both a bare `Error` and a fork construct (comma/reduce/foreach)
+    // that produced some output before a later, unforced error interrupted
+    // it -- the `Partial(_, Control::Error(_))` shape `eval_comma` et al.
+    // build via `partial(...)`, now reachable here since evaluation is no
+    // longer forced-optional (see this function's own doc comment). Reuses
+    // `QueryResult::is_error` rather than re-spelling the same two-variant
+    // match by hand, so this can't drift from that helper's own definition
+    // of "ended in an error" the way a second inline copy could.
+    if result.is_error() {
+        return QueryResult::Owned(OwnedValue::Bool(false));
+    }
+    match result {
         QueryResult::None => QueryResult::Owned(OwnedValue::Bool(false)),
-        // A fork construct (comma/reduce/foreach) that produced some output
-        // before a later, unforced error interrupted it -- the shape
-        // `eval_comma` et al. build via `partial(...)`, now reachable here
-        // since evaluation is no longer forced-optional (see this
-        // function's own doc comment).
-        QueryResult::Partial(_, Control::Error(_)) => QueryResult::Owned(OwnedValue::Bool(false)),
         // A halt is never a validity verdict: it must exit the process, not
         // report `true`/`false` and let evaluation continue (#791) — same
         // shape as the `Error`/`None` cases above never being swallowed by
@@ -15488,17 +15499,24 @@ fn builtin_paths_filter<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 //
                 // `optional` (this builtin's own parameter, not a
                 // hardcoded `false`) must reach this per-node evaluation
-                // too: `isvalid(EXPR)` forces `optional=true` all the way
-                // down (`builtin_isvalid`, not the `?`/`try` path, which
-                // never forces it here per #693) so that an internal
-                // optional-guarded operation like `.foo` on a scalar
-                // yields empty instead of erroring. Confirmed against jq
-                // 1.7.1-equivalent semantics and this codebase's own pre-
-                // #773 code: `{"a":1,"b":2} | isvalid(paths(.foo, true))`
-                // is `true` (`.foo` errors on the scalar node but is
-                // swallowed by the forced `optional`, so the trailing
-                // `true` output still fires for every node) -- hardcoding
-                // `false` here instead breaks that to `false`.
+                // too, so a real `?` the caller wrote inside `node_filter`
+                // itself (e.g. `paths(.foo?, true)`) suppresses that node's
+                // own error the same way it would anywhere else, instead of
+                // a hardcoded `false` silently ignoring it.
+                //
+                // #881 update: prior to that fix, `isvalid(EXPR)` forced
+                // `optional=true` all the way down through this parameter
+                // too (not via the `?`/`try` path, which never forces it
+                // here per #693, but via `builtin_isvalid` calling
+                // `eval_single` with `true` directly) -- so
+                // `{"a":1,"b":2} | isvalid(paths(.foo, true))` used to
+                // report `true`, with `.foo`'s error on each scalar node
+                // silently swallowed by that forcing rather than by any `?`
+                // the caller actually wrote. `isvalid` no longer forces
+                // `optional`, so that swallowing no longer happens here:
+                // the same expression is `false` now, matching real jq
+                // (`{"a":1,"b":2} | [paths(.foo, true)]` itself errors
+                // there) -- see `test_isvalid_paths_filter_node_error_not_swallowed_881`.
                 let mut truthiness = Vec::new();
                 let control = push_truthiness(
                     eval_owned_input::<Vec<u64>, S>(filter, &val_at_path, optional),
@@ -28921,6 +28939,37 @@ mod tests {
         // A single-value argument (no comma sibling to mask anything) is
         // unaffected by the fix — still `false` when it genuinely errors.
         query!(br"null", "isvalid((1|explode))",
+            QueryResult::Owned(OwnedValue::Bool(false)) => {}
+        );
+    }
+
+    /// #881 review: the same masking bug class applied equally to every
+    /// other fork/multi-output site that builds a `Partial(_,
+    /// Control::Error(_))` via the shared `partial(...)`/`finish_fork`
+    /// machinery, not just `eval_comma` — `eval_assign`'s write-value fork,
+    /// object construction's per-field fork, and `builtin_in`'s
+    /// per-candidate fork (#880) all shared the identical "forced optional
+    /// makes a later output's error self-suppress to `None` before the
+    /// fork site ever sees it" mechanism, and are fixed by the same
+    /// `isvalid` change with no changes of their own needed.
+    #[test]
+    fn test_isvalid_other_fork_sites_error_not_masked_881() {
+        // eval_assign: the write-value expression `(1, error("x"))` forks,
+        // and `1` would otherwise be a real (if never-observed) write
+        // before the later sibling errors.
+        query!(br"null", r#"isvalid(.a = (1, error("x")))"#,
+            QueryResult::Owned(OwnedValue::Bool(false)) => {}
+        );
+        // Object construction: one field's value forks and a later output
+        // errors after the field's earlier value would have been used.
+        query!(br"null", r#"isvalid({a:1, b:("x", error("z"))})"#,
+            QueryResult::Owned(OwnedValue::Bool(false)) => {}
+        );
+        // `in(xs)`: `xs`'s own generator forks, and an earlier candidate
+        // already producing a real comparison result must not mask a later
+        // candidate's error (mirrors `builtin_in`'s own #880 fix, checked
+        // here specifically through `isvalid`'s lens).
+        query!(br#""a""#, r#"isvalid(in({b:1}, error("x")))"#,
             QueryResult::Owned(OwnedValue::Bool(false)) => {}
         );
     }

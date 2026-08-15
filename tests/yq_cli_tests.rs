@@ -10215,15 +10215,17 @@ fn test_builtin_in_yq_type_mismatch_never_errors_917() -> Result<()> {
 
 /// Review finding on #917: `builtin_has`'s "yq never errors on a type
 /// mismatch" arm originally sat *after* the pre-existing `_ if optional`
-/// arm, so it was unreachable whenever `optional` was true --
-/// `isvalid(EXPR)` forces `optional=true` unconditionally for its inner
+/// arm, so it was unreachable whenever `optional` was true -- at the time,
+/// `isvalid(EXPR)` forced `optional=true` unconditionally for its inner
 /// expression (`builtin_isvalid`), so `isvalid(has("x"))` on `[1,2,3]`
 /// returned `false` (as if `has("x")` *would* error without the forced
 /// `?`) instead of `true` (yq's `has()` never errors here at all, so the
 /// expression is valid). Fixed by moving the permissive arm before the
-/// `optional` check. `in()`'s equivalent per-candidate arm never had this
-/// bug (it doesn't have a separate `optional`-gated arm in its loop), pinned
-/// here too so the two stay symmetric.
+/// `optional` check -- an ordering fix, not one that depends on `optional`
+/// being forced, so it's unaffected by #881 later removing that forcing
+/// from `isvalid` entirely. `in()`'s equivalent per-candidate arm never had
+/// this bug (it doesn't have a separate `optional`-gated arm in its loop),
+/// pinned here too so the two stay symmetric.
 #[test]
 fn test_isvalid_has_yq_type_mismatch_is_valid_917() -> Result<()> {
     let (out, code) = run_yq_stdin(r#"isvalid(has("x"))"#, "[1,2,3]", &[])?;

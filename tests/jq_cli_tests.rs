@@ -3249,11 +3249,14 @@ fn test_isvalid_propagates_halt_instead_of_answering_true() -> Result<()> {
 
 #[test]
 fn test_isvalid_propagates_halt_from_error_message_expression() -> Result<()> {
-    // A distinct site from the one above: `isvalid` forces `optional=true`
-    // down its whole subtree, and `eval_error`'s own `Err(_) if optional`
-    // arm used to swallow a halt reached while evaluating `error(msg)`'s
-    // message expression before `isvalid` ever saw the result. Fixing
-    // `isvalid`'s own wildcard alone does not fix this one.
+    // A distinct site from the one above: `eval_error`'s own guard for its
+    // message expression specifically matches `Err(EvalEscape::Error(_))`,
+    // not a bare `Err(_)`, so a halt reached while evaluating `error(msg)`'s
+    // message expression always falls through to `Err(escape) =>
+    // escape.into()` and propagates -- regardless of whether `optional` is
+    // `true` (isvalid's old forced broadcast) or `false` (isvalid's current
+    // ambient evaluation, #881). Fixing `isvalid`'s own wildcard alone does
+    // not fix this one; both fixes are independent.
     let (stdout, stderr, code) =
         run_jq_full(&["-n", "isvalid(error(halt_error(3))), \"after\""], None)?;
     assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
@@ -4757,12 +4760,19 @@ fn test_isvalid_suppresses_genuine_error_in_error_message_expression() -> Result
     // instead of being swallowed (covered by
     // `test_isvalid_propagates_halt_from_error_message_expression` above).
     // This test pins the other half: the narrowing must not have also
-    // stopped swallowing a *genuine* (non-halt) error in the message
-    // expression, which `isvalid`'s forced `optional=true` still has to
-    // suppress into `false`. `isvalid` is a succinctly extension (real jq
-    // has no such builtin -- `jq -n 'isvalid(error("boom"))'` reports
-    // `isvalid/1 is not defined`), so this is checked against succinctly's
-    // own documented contract instead of jq parity.
+    // stopped correctly turning a *genuine* (non-halt) error in the
+    // message expression into `isvalid` reporting `false`. #881 changed
+    // *how* that happens: `isvalid` no longer forces `optional=true`, so
+    // this arm's `Err(EvalEscape::Error(_)) if optional` guard no longer
+    // fires here at all (ambient `optional` is `false`) -- the message
+    // expression's error instead propagates as a genuine
+    // `QueryResult::Error` all the way up through the outer `error(...)`
+    // call, caught directly by `isvalid`'s `QueryResult::is_error` check.
+    // Same observable outcome (`false`), different mechanism than when
+    // this test was first written. `isvalid` is a succinctly extension
+    // (real jq has no such builtin -- `jq -n 'isvalid(error("boom"))'`
+    // reports `isvalid/1 is not defined`), so this is checked against
+    // succinctly's own documented contract instead of jq parity.
     let (stdout, stderr, code) = run_jq_full(&["-n", r#"isvalid(error(error("boom")))"#], None)?;
     assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
     assert_eq!(stdout, "false\n");
