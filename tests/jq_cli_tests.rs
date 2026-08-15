@@ -5976,6 +5976,81 @@ fn test_gsub_replacement_multi_value_takes_first_value() -> Result<()> {
     Ok(())
 }
 
+/// `eval_sub_replacement`'s zero-output shape (#840), the sibling gap to the
+/// multi-value stopgap above -- untested until now, and (unlike that
+/// stopgap) now fully implemented rather than left as a divergence.
+/// `stitch_replacements_evaluated`/`builtin_sub_with_flags` re-derive jq's
+/// own rule for a replacement filter that produces zero outputs: if *every*
+/// match's replacement is empty, the whole input comes back unchanged; a
+/// single-match `sub` is the trivial case of that rule (one match is
+/// trivially "every match"). Verified against jq 1.7.1: `jq -c 'sub("a";
+/// empty)'` on `"cab"` prints `"cab"` unchanged, exit 0.
+#[test]
+fn test_sub_replacement_all_matches_empty_leaves_input_unchanged() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-c", r#"sub("a"; empty)"#], Some(r#""cab""#))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "\"cab\"\n");
+    Ok(())
+}
+
+/// `gsub` counterpart to the test above, with 3 matches (not 1) all empty --
+/// the case that actually distinguishes "every match is empty" from
+/// "delete every empty match", since a naive per-match deletion would give
+/// `""`, not `"banana"`. Verified against jq 1.7.1: `jq -c 'gsub("a";
+/// empty)'` on `"banana"` prints `"banana"` unchanged, exit 0.
+#[test]
+fn test_gsub_replacement_all_matches_empty_leaves_input_unchanged() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-c", r#"gsub("a"; empty)"#], Some(r#""banana""#))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "\"banana\"\n");
+    Ok(())
+}
+
+/// `gsub` with a *mix* of empty and non-empty replacements, the shape
+/// #840's own repro used -- distinct from the two "every match empty" tests
+/// above, whose all-input-unchanged rule only applies when there is no
+/// non-empty replacement anywhere in the call. Verified against jq 1.7.1:
+/// `jq -c 'gsub("(?<x>[aeiou])"; if .x=="e" then empty else "["+.x+"]"
+/// end)'` on `"hello world"` prints `"ll[o] w[o]rld"` -- the empty match's
+/// own preceding gap (`"h"`) is dropped along with the match itself, while
+/// the two non-empty matches (both `"o"`) are processed normally.
+#[test]
+fn test_gsub_replacement_mixed_empty_and_nonempty_drops_only_empty_matches_own_gap() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            r#"gsub("(?<x>[aeiou])"; if .x=="e" then empty else "["+.x+"]" end)"#,
+        ],
+        Some(r#""hello world""#),
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "\"ll[o] w[o]rld\"\n");
+    Ok(())
+}
+
+/// Regression guard for the exact gap-tracking rule: with *non-adjacent*
+/// empty matches (real text sitting between two empty matches, not just
+/// between an empty and a non-empty one), each empty match still only drops
+/// its own immediately-preceding gap -- the gap belongs to whichever match
+/// follows it, whether or not that match happens to be a survivor.
+/// Verified against jq 1.7.1: `jq -c 'gsub("(?<x>[ac])"; if .x=="c" then
+/// "["+.x+"]" else empty end)'` on `"xaYaZc"` prints `"Z[c]"` -- `"x"`
+/// (before the first empty `a`) and `"Y"` (before the second empty `a`) are
+/// both dropped, but `"Z"` (before the surviving `c`) is kept.
+#[test]
+fn test_gsub_replacement_non_adjacent_empty_matches_each_drop_only_their_own_gap() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            r#"gsub("(?<x>[ac])"; if .x=="c" then "["+.x+"]" else empty end)"#,
+        ],
+        Some(r#""xaYaZc""#),
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "\"Z[c]\"\n");
+    Ok(())
+}
+
 /// `builtin_gsub_flags`'s flags-argument arm (`gsub(re; replacement; flags)`,
 /// the 3-arg form) -- same shape as `builtin_sub_flags`'s flags arm, but a
 /// distinct function/site in the source. Verified against jq 1.7.1:

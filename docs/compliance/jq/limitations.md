@@ -352,6 +352,36 @@ the one sentence left in `eval_object_construction`, because reaching jq's answe
 means generating a stream, not renaming an error. The sentence stays succinctly's until
 #354 is built.
 
+`sub`/`gsub`'s replacement filter emitting 2+ outputs for one match remains a genuine,
+narrower divergence — [#840](https://github.com/rust-works/succinctly/issues/840). jq
+forks the whole `sub`/`gsub` call across every combination the multi-valued matches
+produce:
+
+| Filter                               | Input           | jq                                    | succinctly                     |
+|--------------------------------------|-----------------|---------------------------------------|--------------------------------|
+| `sub("(?<x>[aeiou])"; (.x, .x+"!"))` | `"hello world"` | `"hello world"` then `"he!llo world"` | `"hello world"` (first output) |
+
+This is a real, if partial, jq feature (confirmed empirically:
+`gsub("(?<x>[aeiou])"; (.x, .x+"!"))` — three vowel matches, not just one — still only
+forks into 2 outputs total, applying the *n*-th replacement candidate uniformly to every
+match rather than a 2³ cartesian product). Succinctly's current stopgap
+(`eval_owned_input` + "take the first output", added same-day as #826 itself, in
+`src/jq/eval.rs`'s `eval_sub_replacement`) reaches jq's *first* output but not the rest.
+Real-world replacement filters are overwhelmingly single-output (the shape #826 fixed),
+so this is left as a deliberate, documented divergence rather than chased for a
+rarely-hit shape whose full fix means re-deriving jq's `builtin.jq` `reduce` structure
+verbatim.
+
+#840 also covers a *zero*-output replacement filter (`sub("a"; empty)`), which turned out
+**not** to need this treatment: re-deriving jq's own `reduce`-based definition (and
+verifying empirically, jq 1.7.1) showed a simple, fully portable rule — if *every* match
+in the call has an empty replacement, the whole input is returned unchanged; otherwise
+each empty match drops its own text *and* its own immediately-preceding gap, while every
+non-empty match is processed normally. `eval_sub_replacement`,
+`stitch_replacements_evaluated`, and `builtin_sub_with_flags` implement this rule
+directly rather than erroring — see those functions' doc comments in `src/jq/eval.rs` for
+the mechanism.
+
 `setpath` is the same operation without the syntax, and after #359 it does follow jq —
 `[1,2] | setpath([5]; 9)` is `[1,2,null,null,null,9]`, and `null | setpath(["a"]; 1)` is
 `{"a":1}`. The two used to disagree with each other in-tree; [#486](https://github.com/rust-works/succinctly/issues/486)

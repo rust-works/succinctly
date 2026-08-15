@@ -7317,21 +7317,41 @@ fn stitch_split(input: &str, matches: &[regex::Captures]) -> Vec<String> {
 /// once via `result_to_owned(eval_single(...))`. Non-fatal, if not fully
 /// jq-correct, is the stopgap this function commits to until the follow-up
 /// lands.
+///
+/// A replacement filter that produces *zero* outputs for a match (`sub("a";
+/// empty)`) returns `Ok(None)` here rather than erroring (#840) — jq's own
+/// rule for this shape, re-derived from jq's embedded `builtin.jq` and
+/// verified empirically (jq 1.7.1) across single/multi-match and
+/// adjacent/non-adjacent-gap cases, is: **if every match in the call
+/// produces a zero-output replacement, the whole input is returned
+/// unchanged**; otherwise each zero-output match drops its own text *and*
+/// its own preceding gap, while every non-empty match is processed
+/// normally. The first half of that rule (single-match `sub`, or a `gsub`
+/// where every match is empty) is a trivial "all empty" case; the caller
+/// (`stitch_replacements_evaluated`, or `builtin_sub_with_flags`'s
+/// non-global arm) is what actually implements it, since only the caller
+/// sees every match in the call — this function reports a single match's
+/// outcome, not the whole call's.
 #[cfg(feature = "regex")]
 fn eval_sub_replacement<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     replacement_expr: &Expr,
     re: &JqRegex,
     caps: &regex::Captures,
     optional: bool,
-) -> Result<String, QueryResult<'a, W>> {
+) -> Result<Option<String>, QueryResult<'a, W>> {
     let captures = capture_object(re, caps);
-    let result = result_to_owned(eval_owned_input::<W, S>(
-        replacement_expr,
-        &captures,
-        optional,
-    ));
-    match result {
-        Ok(OwnedValue::String(s)) => Ok(s),
+    // `eval_owned_input` never returns a bare `QueryResult::Many` -- its own
+    // body converts every borrowed `Many` to `ManyOwned` before returning --
+    // so only `None`/`ManyOwned([])` need checking here, not `Many([])`.
+    let materialized =
+        eval_owned_input::<W, S>(replacement_expr, &captures, optional).materialize_cursor();
+    let stream_is_empty = matches!(&materialized, QueryResult::None)
+        || matches!(&materialized, QueryResult::ManyOwned(vs) if vs.is_empty());
+    if stream_is_empty {
+        return Ok(None);
+    }
+    match result_to_owned(materialized) {
+        Ok(OwnedValue::String(s)) => Ok(Some(s)),
         Ok(_) if optional => Err(QueryResult::None),
         Ok(_) => Err(QueryResult::Error(EvalError::type_error(
             "string",
@@ -7347,6 +7367,11 @@ fn eval_sub_replacement<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// `Regex::replace_all`, but driven by a match list computed ourselves — see
 /// `stitch_split`'s doc comment for why — and by a real per-match jq
 /// evaluation rather than a static template string.
+///
+/// Implements jq's all-matches-empty rule (#840, see `eval_sub_replacement`):
+/// every match's replacement is evaluated first, and if every one of them
+/// produced zero outputs, `input` is returned completely unchanged rather
+/// than with every match individually deleted.
 #[cfg(feature = "regex")]
 fn stitch_replacements_evaluated<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     replacement_expr: &Expr,
@@ -7355,15 +7380,32 @@ fn stitch_replacements_evaluated<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     matches: &[regex::Captures],
     optional: bool,
 ) -> Result<String, QueryResult<'a, W>> {
+    let mut replacements = Vec::with_capacity(matches.len());
+    for caps in matches {
+        replacements.push(eval_sub_replacement::<W, S>(
+            replacement_expr,
+            re,
+            caps,
+            optional,
+        )?);
+    }
+    if replacements.iter().all(Option::is_none) {
+        return Ok(input.to_string());
+    }
+
     let mut out = String::with_capacity(input.len());
     let mut last_end = 0;
-    for caps in matches {
+    for (caps, replacement) in matches.iter().zip(replacements) {
         let m = caps
             .get(0)
             .expect("capture group 0 is always present on a match");
-        let replacement = eval_sub_replacement::<W, S>(replacement_expr, re, caps, optional)?;
-        out.push_str(&input[last_end..m.start()]);
-        out.push_str(&replacement);
+        // A zero-output match drops both its own text and its own preceding
+        // gap (jq 1.7.1, verified) -- distinct from the all-empty case
+        // above, which is handled before this loop runs.
+        if let Some(replacement) = replacement {
+            out.push_str(&input[last_end..m.start()]);
+            out.push_str(&replacement);
+        }
         last_end = m.end();
     }
     out.push_str(&input[last_end..]);
@@ -7714,14 +7756,23 @@ fn sub_with_resolved_pattern<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 .expect("capture group 0 is always present on a match");
             let replacement =
                 match eval_sub_replacement::<W, S>(replacement_expr, &re, &caps, optional) {
-                    Ok(s) => s,
+                    Ok(r) => r,
                     Err(qr) => return qr,
                 };
-            let mut out = String::with_capacity(input.len());
-            out.push_str(&input[..m.start()]);
-            out.push_str(&replacement);
-            out.push_str(&input[m.end()..]);
-            QueryResult::Owned(OwnedValue::String(out))
+            match replacement {
+                Some(replacement) => {
+                    let mut out = String::with_capacity(input.len());
+                    out.push_str(&input[..m.start()]);
+                    out.push_str(&replacement);
+                    out.push_str(&input[m.end()..]);
+                    QueryResult::Owned(OwnedValue::String(out))
+                }
+                // The single-match specialization of the all-matches-empty
+                // rule `stitch_replacements_evaluated` implements for gsub
+                // (#840): a zero-output replacement on the one match `sub`
+                // ever considers leaves the input unchanged.
+                None => QueryResult::Owned(OwnedValue::String(input)),
+            }
         }
         None => QueryResult::Owned(OwnedValue::String(input)),
     }
