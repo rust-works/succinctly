@@ -8807,23 +8807,31 @@ fn test_strptime_hour_minute_out_of_range_errors_971() -> Result<()> {
         (r#"strptime("%H:%M:%S")"#, "\"99:99:99\""),
         (r#"strptime("%H:%M:%S")"#, "\"24:00:00\""),
         (r#"strptime("%H:%M:%S")"#, "\"00:60:00\""),
+        // %S: 61+ errors, even though 60 (leap second) is valid.
+        (r#"strptime("%H:%M:%S")"#, "\"23:59:61\""),
+        (r#"strptime("%H:%M:%S")"#, "\"23:59:99\""),
         (r#"strptime("%I")"#, "\"13\""),
-        (r#"strptime("%I")"#, "\"00\""),
+        // %R/%T duplicate %H/%M/%S's own parsing, so they need the same
+        // range check independently -- confirmed live these leaked too.
+        (r#"strptime("%R")"#, "\"99:99\""),
+        (r#"strptime("%T")"#, "\"25:00:00\""),
     ] {
         let (stdout, _, code) = run_jq_full(&["-c", fmt], Some(input))?;
         assert_eq!(code, 5, "fmt: {fmt}, input: {input}, stdout: {stdout:?}");
     }
 
-    // Leap second: %S stays permissive, matching real jq.
+    // Leap second: %S stays permissive up to (and including) 60, matching
+    // real jq.
     let (stdout, _, code) = run_jq_full(&["-c", r#"strptime("%H:%M:%S")"#], Some("\"23:59:60\""))?;
     assert_eq!(code, 0, "stdout: {stdout:?}");
     assert_eq!(stdout.trim(), "[1970,0,1,23,59,60,4,0]");
 
-    // Boundary values stay valid.
-    let (stdout, _, code) = run_jq_full(&["-c", r#"strptime("%I")"#], Some("\"12\""))?;
-    assert_eq!(code, 0, "stdout: {stdout:?}");
-    let (stdout, _, code) = run_jq_full(&["-c", r#"strptime("%I")"#], Some("\"01\""))?;
-    assert_eq!(code, 0, "stdout: {stdout:?}");
+    // Boundary values stay valid, including %I's jq-accepted "00" (a real
+    // jq oracle divergence from the naive 1-12 range a first pass assumed).
+    for input in ["\"12\"", "\"01\"", "\"00\""] {
+        let (stdout, _, code) = run_jq_full(&["-c", r#"strptime("%I")"#], Some(input))?;
+        assert_eq!(code, 0, "input: {input}, stdout: {stdout:?}");
+    }
     Ok(())
 }
 
