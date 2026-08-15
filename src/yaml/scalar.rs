@@ -202,6 +202,119 @@ fn parse_float(s: &str) -> ResolvedScalar {
     }
 }
 
+/// True if `s` is valid JSON number syntax (RFC 8259) end to end: optional
+/// leading `-`, then `0` or a non-zero-led digit run, optional `.`-fraction
+/// (at least one digit), optional exponent (at least one digit).
+///
+/// This module's own numeric [`ResolvedScalar`] variants "carry the parsed
+/// value... emitters must use the carried value, never echo the source
+/// text" (see the type's doc comment) precisely because YAML's core-schema
+/// number grammar is looser than JSON's: a leading-dot float (`.5`), a
+/// leading `+` (`+.5`), or a leading zero followed by more digits (`007.5`)
+/// all resolve here but are not valid JSON number text, and hex/octal ints
+/// (`0x2A`) obviously aren't either. A caller that ignores that warning and
+/// hands such text to something expecting JSON syntax — as
+/// `OwnedValue::NumberLiteral`'s downstream reindexing bridge does — gets a
+/// value silently misclassified as a parse error instead of a number
+/// (confirmed via the `tag` builtin, which maps that error node to
+/// `!!null` for a scalar that plainly has a `!!float` tag) rather than
+/// erroring loudly. This predicate is how [`super::light`]'s
+/// `number_literal()` override decides which literals are safe to echo.
+///
+/// This grammar duplicates `crate::json::validate`'s `Validator::validate_number`
+/// (reachable via the public `crate::json::validate::validate`) — hand-rolled
+/// here rather than reused to avoid adding a `yaml`-to-`json` module
+/// dependency for this fix; tracked as a follow-up dedup opportunity (#957).
+#[must_use]
+fn is_json_number_syntax(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    if bytes.first() == Some(&b'-') {
+        i += 1;
+    }
+    match bytes.get(i) {
+        Some(b'0') => i += 1,
+        Some(b'1'..=b'9') => {
+            i += 1;
+            while matches!(bytes.get(i), Some(b'0'..=b'9')) {
+                i += 1;
+            }
+        }
+        _ => return false,
+    }
+    if bytes.get(i) == Some(&b'.') {
+        i += 1;
+        let start = i;
+        while matches!(bytes.get(i), Some(b'0'..=b'9')) {
+            i += 1;
+        }
+        if i == start {
+            return false;
+        }
+    }
+    if matches!(bytes.get(i), Some(b'e' | b'E')) {
+        i += 1;
+        if matches!(bytes.get(i), Some(b'+' | b'-')) {
+            i += 1;
+        }
+        let start = i;
+        while matches!(bytes.get(i), Some(b'0'..=b'9')) {
+            i += 1;
+        }
+        if i == start {
+            return false;
+        }
+    }
+    i == bytes.len()
+}
+
+/// The maximum count of ASCII digit characters (integer + fraction part
+/// combined) [`is_preservable_float_literal`] allows through. 17 significant
+/// decimal digits is the documented bound beyond which distinct `f64`
+/// values can round to the same printed digits (and, symmetrically, below
+/// which every `f64` round-trips uniquely) — more digits than that means
+/// the source text already carries more precision than the `f64` it parsed
+/// to actually holds, so echoing it back verbatim would silently overstate
+/// precision the parse step already discarded.
+const MAX_PRESERVABLE_FLOAT_DIGITS: usize = 17;
+
+/// True if `s` is safe *and worthwhile* to preserve verbatim as a
+/// document-sourced float's `NumberLiteral` text — used by both YAML's
+/// [`super::light`] `number_literal()` override (a plain scalar) and its
+/// `!!float`-tag resolution path (an explicitly-tagged one), so the two
+/// don't drift into re-answering this question differently.
+///
+/// Requires, beyond [`is_json_number_syntax`]:
+/// - **A literal `.`.** A bare digit run only resolves to
+///   [`Float`](ResolvedScalar::Float) when it overflows `i64`
+///   (`parse_int_or_float`'s fallback) — that's not a value someone spelled
+///   as a float, it's an integer too big for `i64`, and echoing its raw
+///   digits back verbatim would silently claim more precision than the
+///   `f64` it parsed to can actually hold (the same concern the digit-count
+///   cap below targets, just via a different trigger).
+/// - **No exponent.** `format_number_jq_compat` — the formatter this text
+///   eventually flows through — re-normalizes exponent notation into a
+///   different spelling (uppercase `E`, forced sign, no `e0` elimination)
+///   rather than preserving it, so there is nothing gained by echoing
+///   exponent text through that path; it gets overwritten anyway. This also
+///   sidesteps that formatter's separate, pre-existing loss of `-0.0`'s
+///   sign on the exponent branch, which the source-text-echo path can't
+///   reach without an exponent in play.
+/// - **At most [`MAX_PRESERVABLE_FLOAT_DIGITS`] significant digits.**
+///
+/// Deliberately conservative: legal YAML core-schema spellings that don't
+/// meet this bar (`+2.0`, a trailing-dot `1.`) fall through to the
+/// pre-existing `as_f64` path unchanged rather than being force-fit here,
+/// leaving the #918 symptom open for that narrower spelling class — see
+/// the issue tracker for the follow-up.
+#[must_use]
+pub(crate) fn is_preservable_float_literal(s: &str) -> bool {
+    s.contains('.')
+        && !s.contains(['e', 'E'])
+        && s.bytes().filter(u8::is_ascii_digit).count() <= MAX_PRESERVABLE_FLOAT_DIGITS
+        && is_json_number_syntax(s)
+}
+
 /// Force-resolves a scalar's value under an explicit YAML tag.
 ///
 /// Handles the 5 core-schema tags (`!!str`, `!!null`, `!!bool`, `!!int`,
@@ -520,5 +633,77 @@ mod tests {
         ] {
             assert_eq!(resolve_tagged("1", tag), None, "tag: {tag}");
         }
+    }
+
+    #[test]
+    fn json_number_syntax_accepts_full_rfc_8259_grammar() {
+        // Its own doc comment claims full RFC 8259 support, including the
+        // exponent form - `is_preservable_float_literal` (its only current
+        // caller) never actually routes exponent text through it, since it
+        // rejects those upstream for an unrelated reason (`format_number_
+        // jq_compat` doesn't preserve YAML's exponent spelling), so this
+        // exercises the claim directly rather than through that caller.
+        for s in [
+            "0", "-0", "42", "-42", "0.0", "2.0", "-2.5", "0.50", "1e10", "1E10", "1e+10", "1e-10",
+            "-1.5e-3", "0e0",
+        ] {
+            assert!(is_json_number_syntax(s), "expected valid: {s:?}");
+        }
+    }
+
+    #[test]
+    fn json_number_syntax_rejects_yaml_legal_json_illegal_spellings() {
+        for s in [
+            "",      // empty
+            "-",     // sign with no digits
+            ".5",    // leading dot
+            "+2.0",  // leading plus
+            "007",   // leading zero, more digits
+            "007.5", // leading zero, more digits, with fraction
+            "1.",    // trailing dot, no fraction digit
+            "2.5e",  // exponent marker, no digits
+            "2.5e+", // exponent sign, no digits
+            "0x2A",  // hex
+            "1e",    // bare exponent marker
+            "1.2.3", // trailing garbage
+            "1 ",    // trailing whitespace
+        ] {
+            assert!(!is_json_number_syntax(s), "expected invalid: {s:?}");
+        }
+    }
+
+    #[test]
+    fn preservable_float_literal_requires_a_dot_and_rejects_exponents() {
+        // The core #918 case: a plain decimal float with a literal `.`.
+        for s in ["2.0", "-2.0", "0.5", "3.140", "0.0"] {
+            assert!(
+                is_preservable_float_literal(s),
+                "expected preservable: {s:?}"
+            );
+        }
+        // No dot at all - either a plain int, or (per #953) an i64-overflow
+        // integer that only resolves to Float as a fallback; echoing its
+        // digits verbatim would overstate the f64's actual precision.
+        for s in ["2", "-2", "99999999999999999999"] {
+            assert!(!is_preservable_float_literal(s), "expected rejected: {s:?}");
+        }
+        // Exponent form - format_number_jq_compat doesn't preserve this
+        // spelling, so there's nothing to gain by echoing it (see #918's
+        // eval_generic.rs comment for the -0.0 sign-loss this also avoids).
+        for s in ["2e2", "-0e10", "1.5e-3"] {
+            assert!(!is_preservable_float_literal(s), "expected rejected: {s:?}");
+        }
+        // JSON-unsafe spellings, deliberately out of scope (#954).
+        for s in [".5", "+2.0", "1."] {
+            assert!(!is_preservable_float_literal(s), "expected rejected: {s:?}");
+        }
+    }
+
+    #[test]
+    fn preservable_float_literal_rejects_beyond_the_digit_cap() {
+        let just_over = "1.".to_string() + &"1".repeat(MAX_PRESERVABLE_FLOAT_DIGITS);
+        assert!(!is_preservable_float_literal(&just_over));
+        let at_cap = "1.".to_string() + &"1".repeat(MAX_PRESERVABLE_FLOAT_DIGITS - 1);
+        assert!(is_preservable_float_literal(&at_cap));
     }
 }

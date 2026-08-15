@@ -649,11 +649,15 @@ impl OwnedValue {
             // to this exact `f64` - reusing it here (instead of the generic
             // sentinel) lets `describe()`'s preview show the real source
             // text (#930) instead of a disconnected "1e999"/"-1e999"
-            // placeholder (#939). `NumberLiteral` currently only ever comes
-            // from JSON parsing (`document.rs`'s `number_literal()` default
-            // returns `None`, and only `json/light.rs` overrides it - YAML
-            // has no override, so its `.inf`/`-.inf`/`.nan` always become a
-            // plain `Float`, handled by the arm above, never this one), so
+            // placeholder (#939). This arm only ever sees a JSON-sourced
+            // literal: JSON's `number_literal()` override (`json/light.rs`)
+            // is unconditional, so its overflow literals reach here
+            // directly, but YAML's own override (`yaml/light.rs`, #918)
+            // deliberately excludes non-finite values (`.inf`/`-.inf`/
+            // `.nan` never pass `is_preservable_float_literal`'s
+            // JSON-syntax check, since none of those spellings start with a
+            // digit or `-digit`) - a YAML `.inf`/`.nan` still becomes a
+            // plain `Float`, handled by the arm above, never this one - so
             // no further shape-checking is needed for correctness.
             //
             // The length cap *is* needed regardless of shape: the literal

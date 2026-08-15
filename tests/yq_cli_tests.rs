@@ -5143,12 +5143,15 @@ fn test_yaml_special_floats_to_json_are_null() -> Result<()> {
 
 /// #939: fixed `keys`/`.[]`-style previews of a document-sourced overflow
 /// *number* literal (`123e400`) to reuse the literal's own text instead of
-/// `OwnedValue::to_json_for_reindex`'s generic `1e999` sentinel. YAML's
-/// `.inf`/`-.inf` special tokens never construct `OwnedValue::NumberLiteral`
-/// at all (only JSON's own parsing path does - see `to_json_for_reindex`'s
-/// doc comment), so they take the unrelated, unmodified `OwnedValue::Float`
-/// arm regardless of this fix; pinning here that the sentinel text they've
-/// always used stays unchanged.
+/// `OwnedValue::to_json_for_reindex`'s generic `1e999` sentinel.
+///
+/// #918 later gave YAML floats their own `number_literal()` override too
+/// (previously only JSON had one), but it deliberately excludes non-finite
+/// values: `.inf`/`-.inf`'s YAML spelling isn't valid JSON number syntax,
+/// so unlike a finite YAML float (`2.0`), they still fall through to the
+/// unrelated, unmodified `OwnedValue::Float` arm and never construct an
+/// `OwnedValue::NumberLiteral`. Pinning here that the sentinel text they've
+/// always used stays unchanged by either fix.
 #[test]
 fn test_yaml_special_float_keys_preview_is_unaffected_by_939() -> Result<()> {
     let (output, exit_code) = run_yq_stdin("try keys catch .", ".inf\n", &[])?;
@@ -10376,14 +10379,12 @@ fn test_builtin_in_yq_negative_float_index_909() -> Result<()> {
 /// `has(2.0)` and `has(1.5)` are both `false` on a 3-element array, unlike
 /// jq's truncate-then-bounds-check).
 ///
-/// Uses `2.5`/`1.5`, not `2.0`, as the YAML *input* value -- an
-/// integer-valued float scalar like `2.0` gets normalized to a genuine
-/// `OwnedValue::Int` during YAML parsing itself (confirmed via direct
-/// inspection; a separate, pre-existing characteristic of this codebase's
-/// YAML-to-OwnedValue conversion, unrelated to this fix -- filed
-/// separately). `2.5`/`1.5` have a real fractional part and are preserved
-/// as `Float` all the way through, which is what this test needs to
-/// exercise the array-key arm's Float-rejection path.
+/// Uses `2.5`/`1.5` for most cases -- `has(2.0)`'s `2.0` is a literal
+/// written directly in the filter, not YAML input, so it was never in
+/// scope for #918 either way (only document-sourced numbers go through
+/// YAML's own scalar resolution). `2.5`/`1.5` have a real fractional part
+/// and were always preserved as `Float` regardless of #918, exercising the
+/// array-key arm's Float-rejection path either way.
 #[test]
 fn test_builtin_in_yq_positive_float_index_never_matches_909() -> Result<()> {
     let (out, code) = run_yq_stdin("in([1,2,3])", "2.5", &[])?;
@@ -10397,6 +10398,97 @@ fn test_builtin_in_yq_positive_float_index_never_matches_909() -> Result<()> {
     let (out, code) = run_yq_stdin("has(2.0)", "[1,2,3]", &[])?;
     assert_eq!(code, 0, "out: {out:?}");
     assert_eq!(out.trim(), "false");
+    Ok(())
+}
+
+/// #918: an integer-valued YAML *input* scalar (`2.0`, as opposed to
+/// `has(2.0)` above's filter-embedded literal) used to lose its
+/// `NumberRepr::Float` marker during YAML-to-`OwnedValue` conversion
+/// entirely -- YAML's `DocumentValue` impl had no `number_literal()`
+/// override (unlike JSON's), so it always fell through to `as_f64`/
+/// `as_i64` and produced a bare, source-text-discarding value; the marker
+/// itself survived (`. + 1` gave `2`, not an error), but by the time it
+/// reached a whole number it silently became indistinguishable from a
+/// genuine `OwnedValue::Int`, matching a plain `Int(2)` in-bounds index
+/// where it shouldn't. `in(...)` is a succinctly/jq-language extension --
+/// real `yq`'s own filter language has no equivalent syntax to compare
+/// against directly (`yq 'in([1,2,3])'` is a lexer error there) -- so this
+/// pins succinctly's own internal consistency (a `2.0`-valued Float must
+/// never match a positive-integer array index, same as #909's `2.5`/`1.5`
+/// cases immediately above), not a byte-for-byte oracle comparison.
+#[test]
+fn test_builtin_in_yq_integer_valued_float_yaml_input_never_matches_918() -> Result<()> {
+    let (out, code) = run_yq_stdin("in([1,2,3])", "2.0", &[])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "false");
+    Ok(())
+}
+
+/// #918 companion: `[.]` forces the scalar through `to_owned` (unlike a
+/// bare `.` identity query, which streams source bytes straight through
+/// without ever materializing an `OwnedValue` and so was never affected by
+/// this bug either way). Pinned against real yq live: an integer-valued
+/// float keeps its decimal point (`[2.0]`), matching the `number_literal()`
+/// fix, while a leading-dot float normalizes to a leading zero (`[0.5]`)
+/// once materialized -- real yq does the same, confirming that excluding
+/// leading-dot text from `number_literal()` (see its doc comment) isn't
+/// just a defensive JSON-safety measure but the actually-correct output.
+#[test]
+fn test_materialized_yaml_float_literal_fidelity_918() -> Result<()> {
+    let (out, code) = run_yq_stdin("[.]", "2.0", &["-o", "json", "-I", "0"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "[2.0]");
+
+    let (out, code) = run_yq_stdin("[.]", ".5", &["-o", "json", "-I", "0"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "[0.5]");
+    Ok(())
+}
+
+/// #918 companion: an *explicitly*-tagged `!!float 2.0` converges on the
+/// same materialization step (`to_owned_cursor`'s `tagged_scalar_to_owned`,
+/// `src/jq/eval_generic.rs`) as a plain scalar, but through a separate code
+/// path that has to gate on `is_preservable_float_literal` independently --
+/// review of the initial version of this fix found that path still bypassed
+/// `number_literal()` entirely, reproducing the original #918 symptom for
+/// `!!float 2.0` even after the plain-scalar case was fixed. Pinned here
+/// against the pinned yq oracle (both give `[2.0]`).
+#[test]
+fn test_materialized_yaml_explicit_float_tag_literal_fidelity_918() -> Result<()> {
+    let (out, code) = run_yq_stdin("[.]", "!!float 2.0", &["-o", "json", "-I", "0"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "[2.0]");
+    Ok(())
+}
+
+/// #918 companion: `number_literal()`'s `YamlValue::Alias` arm delegates to
+/// the aliased target (mirroring the pre-existing `as_str` alias arm), so an
+/// integer-valued float reached only through an anchor/alias needs the same
+/// literal-preservation fix as a direct scalar. Pinned against the pinned yq
+/// oracle.
+#[test]
+fn test_materialized_yaml_aliased_float_literal_fidelity_918() -> Result<()> {
+    let (out, code) = run_yq_stdin("[.b]", "a: &x 2.0\nb: *x\n", &["-o", "json", "-I", "0"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "[2.0]");
+    Ok(())
+}
+
+/// #918 follow-on fix: an earlier version of `number_literal()`'s override
+/// fired for *every* finite YAML float unconditionally, including
+/// JSON-unsafe spellings like a bare leading-dot `.5`. That broke `tag`
+/// (which has no native cursor-aware implementation and falls back to
+/// serializing the value to JSON text and re-parsing it -- see
+/// `is_json_number_syntax`'s doc comment for the full mechanism): the raw
+/// literal `.5` isn't valid JSON number syntax, so the reparse silently
+/// misclassified it as a parse error, and `tag` mapped that to `!!null`
+/// instead of the correct `!!float`. Pinned here against the pinned yq
+/// oracle (both agree).
+#[test]
+fn test_tag_yq_leading_dot_float_is_not_confused_for_null_918() -> Result<()> {
+    let (out, code) = run_yq_stdin("tag", ".5", &[])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "!!float");
     Ok(())
 }
 
