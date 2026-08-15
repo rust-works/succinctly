@@ -6855,9 +6855,37 @@ fn eval_regex_pattern_and_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         }
     };
 
+    // #943: `test`/`match`/`capture`'s *bare* form (no `flags_expr` at all)
+    // additionally unpacks a non-empty array pattern as `[pattern, flags,
+    // ...ignored]` — undocumented but real jq behavior, confirmed live:
+    // `test(["a","i"])` behaves exactly like `test("a";"i")`, extra
+    // elements past index 1 are silently ignored (`test(["a","i","x"])`
+    // still succeeds), and a 1-element array supplies `null` flags
+    // (`test(["a"])` succeeds with no flags). Only a genuinely *empty*
+    // array (no element 0 to unpack) skips this and falls through to the
+    // plain non-string-pattern check below, using the array's own type
+    // name. Does not apply to `sub` (confirmed live: `sub(["a","i"];"b")`
+    // is a plain non-string-pattern error, no unpacking) or when
+    // `flags_expr` is itself present (`test(["a","i"]; "x")` is likewise
+    // a plain error — the two ways of supplying flags don't combine).
+    let (raw_pattern, raw_flags, array_unpacked) = match (family, flags_expr, raw_pattern) {
+        (RegexArgFamily::TestMatchCapture, None, OwnedValue::Array(items)) if !items.is_empty() => {
+            let mut items = items.into_iter();
+            let pattern = items.next().expect("checked non-empty above");
+            let flags = items.next();
+            (pattern, flags, true)
+        }
+        (_, _, raw_pattern) => (raw_pattern, raw_flags, false),
+    };
+
+    // Once an array pattern has been unpacked, both the pattern and flags
+    // slots use the same wording an explicit 2-arg call would — confirmed
+    // live even for a 1-element array with no explicit flags slot at all:
+    // `test([1])` -> "number (1) is not a string", not the bare "not a
+    // string or array" `test(1)` alone would give.
     let pattern = match raw_pattern {
         OwnedValue::String(s) => s,
-        v if flags_expr.is_some() || matches!(family, RegexArgFamily::Sub) => {
+        v if array_unpacked || flags_expr.is_some() || matches!(family, RegexArgFamily::Sub) => {
             return Err(QueryResult::Error(EvalError::is_not_a_string(&v)));
         }
         v => {
