@@ -318,6 +318,52 @@ pub fn format_json(value: &OwnedValue, opts: &JsonFormatOpts) -> String {
     format_json_impl(value, opts, 0)
 }
 
+/// Renders a computed (non-literal-preserved) `f64` the way real yq does:
+/// decimal for everyday magnitudes, scientific notation once the value's
+/// decimal exponent is `>= 6` or `<= -5`.
+///
+/// Only for [`OwnedValue::Float`] -- a value with no source literal left to
+/// preserve, either because it was actually computed (arithmetic) or because
+/// it came from JSON input, which real yq always re-serializes through
+/// float64 rather than preserving spelling. [`OwnedValue::NumberLiteral`]
+/// (YAML-sourced identity/navigation output) keeps its own source spelling
+/// regardless of magnitude and must never route through this function --
+/// confirmed against real yq v4.53.3: `12345678901234567890123` (a decimal
+/// literal) stays fully expanded on identity, while the equivalent
+/// *computed* magnitude switches to scientific notation. See issue #997.
+///
+/// The threshold and the `e+NN`/`e-NN` (lowercase, signed, exponent padded
+/// to at least 2 digits) spelling are both oracle-verified against real yq;
+/// this is yq's own threshold, distinct from `format_number_jq_compat`'s
+/// jq-mode one (which real jq only reformats when the source literal itself
+/// already used exponent notation).
+///
+/// `f` must be finite -- like [`format_float_with_fraction`], this has no
+/// JSON/YAML-specific spelling for NaN/Infinity to fall back on, so every
+/// caller must special-case those first (both current call sites already
+/// do, ahead of this function).
+#[must_use]
+pub fn format_float_yq(f: f64) -> String {
+    debug_assert!(
+        f.is_finite(),
+        "format_float_yq requires a finite value; NaN/Infinity have no \
+         JSON/YAML spelling here and must be special-cased by the caller"
+    );
+    let sci = format!("{f:e}");
+    let (mantissa, exp_str) = sci
+        .split_once('e')
+        .expect("Rust's exponential formatter always includes a lowercase 'e'");
+    let exp: i32 = exp_str
+        .parse()
+        .expect("exponent from Rust's exponential formatter is always a valid i32");
+    if (-4..6).contains(&exp) {
+        format_float_with_fraction(f)
+    } else {
+        let sign = if exp < 0 { '-' } else { '+' };
+        format!("{mantissa}e{sign}{:02}", exp.abs())
+    }
+}
+
 /// Recursive JSON formatter behind [`format_json`].
 fn format_json_impl(value: &OwnedValue, opts: &JsonFormatOpts, level: usize) -> String {
     let indent = opts.indent;
@@ -342,6 +388,13 @@ fn format_json_impl(value: &OwnedValue, opts: &JsonFormatOpts, level: usize) -> 
         OwnedValue::Float(f) => {
             if f.is_nan() || f.is_infinite() {
                 "null".to_string() // JSON doesn't support NaN or Infinity
+            } else if opts.control_escape == ControlEscape::Yq {
+                // yq mode: scientific notation past yq's magnitude threshold
+                // (#997), decimal-with-fraction otherwise, regardless of
+                // compact/pretty -- real yq's Float formatting doesn't
+                // distinguish the two (`float_style` only matters for jq
+                // mode below).
+                format_float_yq(*f)
             } else {
                 match opts.float_style {
                     FloatStyle::Shortest => f.to_string(),
@@ -906,6 +959,55 @@ mod tests {
         assert_eq!(
             format_json(&frac, &opts(FloatStyle::PreserveWholeFloat)),
             "1.5"
+        );
+    }
+
+    /// Oracle-verified against real yq v4.53.3 (#997): threshold boundaries
+    /// on both sides of zero, sign handling, and the `e+NN`/`e-NN` spelling.
+    #[test]
+    fn test_format_float_yq_997() {
+        assert_eq!(format_float_yq(0.0), "0.0");
+        assert_eq!(format_float_yq(-0.0), "-0.0");
+        // In-range: decimal, always with a fractional part.
+        assert_eq!(format_float_yq(150000.0), "150000.0");
+        assert_eq!(format_float_yq(0.00015), "0.00015");
+        assert_eq!(format_float_yq(1.5), "1.5");
+        // Past the threshold: scientific, lowercase `e`, signed, exponent
+        // padded to at least 2 digits.
+        assert_eq!(format_float_yq(1_500_000.0), "1.5e+06");
+        assert_eq!(format_float_yq(0.000015), "1.5e-05");
+        assert_eq!(format_float_yq(-1_500_000.0), "-1.5e+06");
+        assert_eq!(format_float_yq(1e100), "1e+100");
+        assert_eq!(format_float_yq(1e-100), "1e-100");
+    }
+
+    /// yq mode's `OwnedValue::Float` arm must use [`format_float_yq`]
+    /// regardless of `float_style`/compact-vs-pretty, matching real yq's
+    /// own behavior (#997) -- distinct from the jq-mode matrix in
+    /// [`test_format_json_float_styles`] above, which stays on the
+    /// `float_style` path untouched.
+    #[test]
+    fn test_format_json_yq_mode_computed_float_scientific_notation_997() {
+        let opts = |float_style| JsonFormatOpts {
+            indent: "",
+            sort_keys: false,
+            ascii: false,
+            float_style,
+            control_escape: ControlEscape::Yq,
+        };
+        let huge = OwnedValue::Float(1e100);
+        assert_eq!(format_json(&huge, &opts(FloatStyle::Shortest)), "1e+100");
+        assert_eq!(
+            format_json(&huge, &opts(FloatStyle::PreserveWholeFloat)),
+            "1e+100"
+        );
+        // In-range whole float keeps its `.0` under both styles in yq mode
+        // (unlike jq mode's `Shortest`, which drops it).
+        let whole = OwnedValue::Float(150000.0);
+        assert_eq!(format_json(&whole, &opts(FloatStyle::Shortest)), "150000.0");
+        assert_eq!(
+            format_json(&whole, &opts(FloatStyle::PreserveWholeFloat)),
+            "150000.0"
         );
     }
 

@@ -19,15 +19,14 @@ use succinctly::jq::{
 };
 use succinctly::json::JsonIndex;
 use succinctly::yaml::{
-    format_float_with_fraction, resolve_plain, resolve_tagged, stream_yaml_sequence, YamlCursor,
-    YamlIndex, YamlValue,
+    resolve_plain, resolve_tagged, stream_yaml_sequence, YamlCursor, YamlIndex, YamlValue,
 };
 
 use super::{FrontMatterMode, InputFormat, OutputFormat, YqCommand};
 use crate::front_matter;
 use crate::output::{
-    self, exit_codes, ColorScheme, ControlEscape, DiagStyle, ErrorSink, FloatStyle, InputLocation,
-    JsonFormatOpts,
+    self, exit_codes, format_float_yq, ColorScheme, ControlEscape, DiagStyle, ErrorSink,
+    FloatStyle, InputLocation, JsonFormatOpts,
 };
 
 /// yq's diagnostics carry no `(at <file>:<line>)` marker, so the yq paths have
@@ -1462,7 +1461,7 @@ fn emit_yaml_value(
                     "-.inf".to_string()
                 }
             } else {
-                format_float_with_fraction(*f)
+                format_float_yq(*f)
             }
         }
         OwnedValue::NumberLiteral(..) => {
@@ -2054,16 +2053,23 @@ fn can_use_m2_streaming(expr: &Expr) -> bool {
         Expr::Paren(inner) => can_use_m2_streaming(inner),
 
         // first(f)/last(f) (both AST spellings the parser produces, see
-        // `Expr::FirstExpr`/`LastExpr` doc comments) and computed indexing
-        // `.[(expr)]` all thread a cursor through natively in
-        // `eval_generic.rs` (#607), so their `GenericResult` streams exactly
-        // like plain navigation instead of needing OwnedValue construction.
-        // Streaming through `eval_with_cursor_using` here (rather than
-        // `evaluate_yaml_cursor`'s unconditional `to_owned()` DOM path) is
-        // also what keeps duplicate mapping keys intact for these shapes,
-        // matching `.[0]` on the same input (#631).
-        Expr::FirstExpr(_) | Expr::LastExpr(_) => true,
-        Expr::Builtin(Builtin::FirstStream(_) | Builtin::LastStream(_)) => true,
+        // `Expr::FirstExpr`/`LastExpr` doc comments) thread a cursor through
+        // natively in `eval_generic.rs` (#607) *only when `f` itself does* --
+        // `first(.[])` streams a `GenericResult` cursor exactly like plain
+        // navigation, but `first(.a * 1e100)` still has to materialize an
+        // `OwnedValue::Float` from the arithmetic, which then needs the DOM
+        // path's yq-mode scientific-notation formatting (#997) rather than
+        // the M2 fast writers in `src/jq/stream.rs`, which don't have it.
+        // Recursing here (like `Pipe`/`Optional`/`Paren` above) restricts the
+        // fast path to exactly the inner shapes it can actually stream a
+        // cursor for. Streaming through `eval_with_cursor_using` for the
+        // eligible cases (rather than `evaluate_yaml_cursor`'s unconditional
+        // `to_owned()` DOM path) is also what keeps duplicate mapping keys
+        // intact for these shapes, matching `.[0]` on the same input (#631).
+        Expr::FirstExpr(inner) | Expr::LastExpr(inner) => can_use_m2_streaming(inner),
+        Expr::Builtin(Builtin::FirstStream(inner) | Builtin::LastStream(inner)) => {
+            can_use_m2_streaming(inner)
+        }
         Expr::IndexExpr { .. } => true,
 
         // `select(...)` never changes position - a truthy output is always
@@ -3766,6 +3772,28 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
 mod tests {
     use super::*;
     use succinctly::jq::NumberRepr;
+
+    /// `Builtin::FirstStream`/`LastStream` (the "Phase 13" builtin-table
+    /// spelling of `first(expr)`/`last(expr)`, distinct from the
+    /// `Expr::FirstExpr`/`LastExpr` the parser actually produces --
+    /// `parse_first_expr`/`parse_last_expr` are checked earlier in the
+    /// primary-expression dispatch, so `try_parse_builtin`'s construction of
+    /// these variants is unreachable from CLI input today) still needs the
+    /// same #997 recursion as its `Expr::FirstExpr`/`LastExpr` sibling, since
+    /// both arms share the exact risk this PR closes -- exercised directly
+    /// here since no filter string can reach it through the parser.
+    #[test]
+    fn test_can_use_m2_streaming_recurses_into_builtin_first_last_stream_997() {
+        let navigation = Expr::Builtin(Builtin::FirstStream(Box::new(Expr::Iterate)));
+        assert!(can_use_m2_streaming(&navigation));
+
+        let arithmetic = Expr::Builtin(Builtin::LastStream(Box::new(Expr::Arithmetic {
+            op: succinctly::jq::ArithOp::Add,
+            left: Box::new(Expr::Identity),
+            right: Box::new(Expr::Literal(succinctly::jq::Literal::Float(1e100))),
+        })));
+        assert!(!can_use_m2_streaming(&arithmetic));
+    }
 
     #[test]
     fn test_yaml_to_owned_value_string() {
