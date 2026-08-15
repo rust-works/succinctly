@@ -1722,6 +1722,41 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         }
     }
 
+    /// Shared shape behind [`Self::compact_mapping_gap_reaches`],
+    /// [`Self::sequence_item_gap_reaches`], and
+    /// [`Self::mapping_under_mapping_gap_reaches`]: `indent` falls between
+    /// the top two stack frames' own recorded indents, with the top frame
+    /// of type `child` directly on top of a frame of type `parent`. One
+    /// definition so the three call sites' bound-inclusivity and
+    /// frame-type choices can't silently drift apart from each other (the
+    /// #106 lesson — duplicated predicates diverge silently).
+    fn frame_gap_reaches(
+        &self,
+        indent: usize,
+        parent: NodeType,
+        child: NodeType,
+        inclusive_lower: bool,
+        inclusive_upper: bool,
+    ) -> bool {
+        let len = self.indent_stack.len();
+        if len < 2 || self.type_stack[len - 1] != child || self.type_stack[len - 2] != parent {
+            return false;
+        }
+        let lower = self.indent_stack[len - 2];
+        let upper = self.indent_stack[len - 1];
+        let lower_ok = if inclusive_lower {
+            indent >= lower
+        } else {
+            indent > lower
+        };
+        let upper_ok = if inclusive_upper {
+            indent <= upper
+        } else {
+            indent < upper
+        };
+        lower_ok && upper_ok
+    }
+
     /// Whether `indent` falls anywhere from an open compact mapping's own
     /// recorded indent down through its enclosing sequence item's virtual
     /// indent (inclusive on both ends) — e.g. `-   a: hello\n  b: 2\n`, where
@@ -1760,12 +1795,13 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     ///   line's only possible enclosing scope) before extending this check
     ///   to it.
     fn compact_mapping_gap_reaches(&self, indent: usize) -> bool {
-        let len = self.indent_stack.len();
-        len >= 2
-            && self.type_stack[len - 1] == NodeType::Mapping
-            && self.type_stack[len - 2] == NodeType::SequenceItem
-            && indent >= self.indent_stack[len - 2]
-            && indent <= self.indent_stack[len - 1]
+        self.frame_gap_reaches(
+            indent,
+            NodeType::SequenceItem,
+            NodeType::Mapping,
+            true,
+            true,
+        )
     }
 
     /// Normalize `indent` to the open compact mapping's own recorded indent
@@ -1797,12 +1833,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     /// 2\n` parse cleanly; only a strictly-between indent like `a:\n    b:
     /// 1\n  c: 2\n` is rejected, `did not find expected key`).
     fn mapping_under_mapping_gap_reaches(&self, indent: usize) -> bool {
-        let len = self.indent_stack.len();
-        len >= 2
-            && self.type_stack[len - 1] == NodeType::Mapping
-            && self.type_stack[len - 2] == NodeType::Mapping
-            && indent > self.indent_stack[len - 2]
-            && indent < self.indent_stack[len - 1]
+        self.frame_gap_reaches(indent, NodeType::Mapping, NodeType::Mapping, false, false)
     }
 
     /// Whether a `-` sequence-item line's `indent` falls in the *lower*
@@ -1831,12 +1862,13 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     /// key (to `null`) before this is even reached, making it structurally
     /// identical to the already-resolved-key case #900 reports.
     fn sequence_item_gap_reaches(&self, indent: usize) -> bool {
-        let len = self.indent_stack.len();
-        len >= 2
-            && self.type_stack[len - 1] == NodeType::Mapping
-            && self.type_stack[len - 2] == NodeType::SequenceItem
-            && indent >= self.indent_stack[len - 2]
-            && indent < self.indent_stack[len - 1]
+        self.frame_gap_reaches(
+            indent,
+            NodeType::SequenceItem,
+            NodeType::Mapping,
+            true,
+            false,
+        )
     }
 
     /// Normalize a `-` sequence-item line's `indent` when
