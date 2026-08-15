@@ -843,12 +843,16 @@ fn test_unsupported_path_prefixes_report_rather_than_misfire() {
     // covers `..`, `recurse` and the typeof filters — see
     // `test_multi_output_path_components_fan_out` — but not arbitrary
     // generators), so it is still refused rather than silently applied to one
-    // branch. jq itself refuses too, in its own words (`Invalid path
-    // expression near attempt to access element "x" of 0`).
+    // branch. #891 made this match the single-output sibling's own "#530"
+    // wording (naming the first output) instead of a bespoke message; jq
+    // itself refuses too, but in the "near attempt to access element ..."
+    // wording specific to a value used as an assignment *target* -- a
+    // pre-existing, unrelated divergence #891 didn't touch (it already
+    // affects a single-output target the same way; see that arm's comment).
     check(
         r#"{"a":1}"#,
         r#"(range(3) | .[("x","y")]) = 9"#,
-        Outcome::error("Cannot use a computed index after a multi-output path component"),
+        Outcome::error("Invalid path expression with result 0"),
     );
     // `. = 5` replaces the root, so the sibling branch then indexes a number,
     // and reports it as jq does.

@@ -10274,3 +10274,91 @@ fn test_resolve_node_alternative_falsy_literal_interacts_correctly_with_untracke
     assert!(stderr.contains("Invalid path expression with result false"));
     Ok(())
 }
+
+// ============================================================================
+// #891: resolve_leaf's non-primitive fallback used a bespoke message for a
+// multi-output result (`range(3)` used bare inside `path(...)`) instead of
+// the same "#530" wording its single-output sibling already uses, naming
+// the first output -- matching real jq's own per-output-checked laziness,
+// which raises on the first non-path-shaped value and never even reaches
+// the rest.
+// ============================================================================
+
+/// #891: `path(range(3))` now names the first output (`0`), matching real
+/// jq's own wording exactly, instead of the old bespoke "Cannot use a
+/// computed index after a multi-output path component" message. Verified
+/// against jq 1.7.1: `echo null | jq -c 'path(range(3))'` raises "Invalid
+/// path expression with result 0", exit 5.
+#[test]
+fn test_resolve_leaf_multi_output_names_first_value_891() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-c", "path(range(3))"], Some("null"))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert!(stderr.contains("Invalid path expression with result 0"));
+    Ok(())
+}
+
+/// #891 companion: the same fix for a multi-output non-primitive whose
+/// first offending value is itself a container (`paths(...)`'s array
+/// output), not a scalar -- confirms the message uses the *rendered* first
+/// value, not just a bare number. Verified against jq 1.7.1: raises
+/// "Invalid path expression with result [0]", exit 5.
+#[test]
+fn test_resolve_leaf_multi_output_names_first_container_value_891() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            r#"path(paths(if type=="string" then error("my custom message") else true end))"#,
+        ],
+        Some(r#"[1,2,"trigger"]"#),
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert!(stderr.contains("Invalid path expression with result [0]"));
+    Ok(())
+}
+
+/// #891 review round: routing the multi-output case through
+/// `EvalError::invalid_path_expression` (the same `#530` constructor the
+/// single-output arm already used) has a second, previously-untested effect
+/// beyond the message text -- `EvalError::is_invalid_path_expression()` is a
+/// string-prefix check, so `?`/`try`/`catch` now correctly stop suppressing
+/// or catching this error, matching real jq. Before this fix, the bespoke
+/// message didn't match that prefix, so `?` wrongly swallowed the error
+/// entirely and `try`/`catch` wrongly ran the catch handler. Verified
+/// against jq 1.7.1: both queries below raise "Invalid path expression with
+/// result 0", exit 5 -- `?` does not suppress it, and `catch`'s handler
+/// never runs.
+#[test]
+fn test_resolve_leaf_multi_output_error_survives_optional_and_try_catch_891() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-c", "path((range(3))?)"], Some("null"))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert!(stderr.contains("Invalid path expression with result 0"));
+
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", r#"path(try range(3) catch "x")"#], Some("null"))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert!(stderr.contains("Invalid path expression with result 0"));
+    // If `catch`'s handler wrongly ran (the pre-fix bug), the message would
+    // instead name its own output: `Invalid path expression with result "x"`.
+    assert!(
+        !stderr.contains("result \"x\""),
+        "catch handler should never run: {stderr:?}"
+    );
+    Ok(())
+}
+
+/// #891 review round companion: the same fix reached through `del(...)`,
+/// not just `path(...)`. Verified against jq 1.7.1: `del((range(3))?)` on
+/// `null` raises "Invalid path expression with result 0", exit 5 -- `?`
+/// does not turn this into a silent no-op.
+#[test]
+fn test_del_multi_output_error_survives_optional_891() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-c", "del((range(3))?)"], Some("null"))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert!(stderr.contains("Invalid path expression with result 0"));
+    Ok(())
+}
