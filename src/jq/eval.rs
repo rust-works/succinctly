@@ -28800,6 +28800,22 @@ mod tests {
         query!(br"123", r"isvalid(.foo)",
             QueryResult::Owned(OwnedValue::Bool(false)) => {}
         );
+
+        // #881 review: a genuinely empty result (zero outputs, no error --
+        // `QueryResult::None`) is a distinct case from an error, and is
+        // `isvalid`'s own domain to digest into `Bool(false)` directly, not
+        // something `QueryResult::is_error` (checked first, see
+        // `builtin_isvalid`'s own doc comment) recognizes. No existing test
+        // exercised this arm in isolation before this PR -- every other
+        // `isvalid` test that used to reach it did so only incidentally,
+        // via a builtin's own `_ if optional => None` arm nested under
+        // isvalid's old forced broadcast, and those now short-circuit
+        // through `is_error()` instead (they error under the ambient,
+        // unforced evaluation this PR introduced) before ever reaching
+        // this arm.
+        query!(br"null", r"isvalid(empty)",
+            QueryResult::Owned(OwnedValue::Bool(false)) => {}
+        );
     }
 
     #[test]
