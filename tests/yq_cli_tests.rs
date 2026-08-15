@@ -1033,6 +1033,53 @@ fn test_bare_dash_alone_mapping_value_survives_slurp_835() -> Result<()> {
     Ok(())
 }
 
+/// #847: a block-sequence item whose value is a *flow*-style sequence,
+/// written as a bare `-` on its own line followed by the indented flow
+/// value on the next line, must preserve the source's flow style rather
+/// than re-serializing in block style. Distinct from the #835 tests above,
+/// which all use block-style sources for the deferred value. Matches real
+/// `yq` v4.53.3.
+#[test]
+fn test_bare_dash_alone_flow_sequence_value_preserves_flow_style_847() -> Result<()> {
+    let (output, code) = run_yq_stdin(".", "-\n  [1, 2]\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "- [1, 2]\n");
+    Ok(())
+}
+
+/// #847: same as above, for a flow-style *mapping* value. Matches real `yq`
+/// v4.53.3.
+#[test]
+fn test_bare_dash_alone_flow_mapping_value_preserves_flow_style_847() -> Result<()> {
+    let (output, code) = run_yq_stdin(".", "-\n  {a: 1, b: 2}\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "- {a: 1, b: 2}\n");
+    Ok(())
+}
+
+/// #847: the `--slurp` fast path (`stream_yaml_sequence`) is a separate code
+/// path from `stream_yaml_document`'s `Sequence` arm exercised by the tests
+/// above - mirrors the #835 slurp test's rationale for the same reason.
+/// Matches real `yq` v4.53.3 (`eval-all '[.]' -`).
+#[test]
+fn test_bare_dash_alone_flow_sequence_value_preserves_flow_style_survives_slurp_847() -> Result<()>
+{
+    let (output, code) = run_yq_stdin(".", "-\n  [1, 2]\n", &["--slurp"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "- - [1, 2]\n");
+    Ok(())
+}
+
+/// #847: same as above, for a flow-style *mapping* value under `--slurp`.
+/// Matches real `yq` v4.53.3.
+#[test]
+fn test_bare_dash_alone_flow_mapping_value_preserves_flow_style_survives_slurp_847() -> Result<()> {
+    let (output, code) = run_yq_stdin(".", "-\n  {a: 1, b: 2}\n", &["--slurp"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "- - {a: 1, b: 2}\n");
+    Ok(())
+}
+
 /// #478: `stream_yaml_sequence`'s block-style rendering has a container vs.
 /// scalar branch per slurped item (mirroring `stream_yaml_value`'s `Sequence`
 /// arm); the tests above only slurp mapping documents, which always take the
