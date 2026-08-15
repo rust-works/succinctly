@@ -6963,10 +6963,37 @@ fn test_ambiguous_gap_generalization_does_not_regress_existing_tolerances_958() 
         // own indent, distinct from the new key-in-sequence-gap error
         // case above (this one matches the landing frame exactly).
         ("a:\n  - x\n  - y\nb: 1\n", r#"{"a":["x","y"],"b":1}"#),
+        // An indented top-level document's own ordinary sibling entries
+        // (real YAML need not start at column 0) -- the walk never
+        // legitimately reaches the virtual-root sentinel for this case,
+        // since it matches the top-level frame's own recorded indent
+        // exactly via the earlier `indent >= indent_stack[top]`
+        // short-circuit.
+        ("  a: 1\n  b: 2\n", r#"{"a":1,"b":2}"#),
     ] {
         let (output, exit_code) = run_yq_stdin(".", yaml, &["-o", "json", "-I0"])?;
         assert_eq!(exit_code, 0, "yaml: {yaml:?}, output: {output:?}");
         assert_eq!(output.trim(), expected, "yaml: {yaml:?}");
+    }
+    Ok(())
+}
+
+/// #958 (found via code review, not one of the issue's own named repros):
+/// the initial generalization's landing-walk exempted the virtual-root
+/// sentinel from the ambiguity check unconditionally, so a dedent past an
+/// indented top-level document's own established indentation was silently
+/// accepted instead of erroring. Confirmed live: real yq v4.53.3 raises
+/// "did not find expected <document start>" for both shapes below.
+#[test]
+fn test_ambiguous_gap_via_dedent_past_indented_top_level_958() -> Result<()> {
+    for yaml in ["  a: 1\n  b: 2\nc: 3\n", "  z:\n    a:\n      b: 1\nc: 2\n"] {
+        let (_output, stderr, exit_code) =
+            run_yq_stdin_with_stderr(".", yaml, &["-o", "json", "-I0"])?;
+        assert_eq!(exit_code, 1, "yaml: {yaml:?}, stderr: {stderr:?}");
+        assert!(
+            stderr.contains("inconsistent indentation"),
+            "yaml: {yaml:?}, stderr: {stderr:?}"
+        );
     }
     Ok(())
 }

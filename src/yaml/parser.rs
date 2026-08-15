@@ -1837,13 +1837,18 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     /// than re-deriving a narrower approximation of it — so the two can't
     /// silently drift apart the way #106 warns about.
     ///
-    /// Index 0 is the permanent indent-0 root sentinel (pushed once in
-    /// `new`, never popped) — landing there is never flagged: real YAML
-    /// allows an indented top-level document (verified live: `  a: 1\n  b:
-    /// 2\n` parses cleanly), and the current root frame's own hardcoded
-    /// `0` isn't a real established indent to compare against, unlike
-    /// every other (real) frame's indent, which is always pinned by actual
-    /// prior content.
+    /// Index 0 is the permanent virtual-root sentinel (`indent_stack[0]`
+    /// set to `usize::MAX` in `parse`, never popped) — landing there is
+    /// still correctly flagged whenever `indent` doesn't match it (which
+    /// no real indent ever can), not specially exempted: a dedent past an
+    /// indented top-level document's own established indentation is
+    /// itself an error in real YAML (confirmed live: `  a: 1\n  b: 2\nc:
+    /// 3\n` raises "did not find expected <document start>"), and the
+    /// walk never legitimately reaches index 0 for the ordinary "indented
+    /// top-level document, exact-match sibling" case (`  a: 1\n  b: 2\n`)
+    /// -- that stops at the earlier `indent >= indent_stack[top]`
+    /// short-circuit instead, since a sibling's indent always matches the
+    /// top-level frame's own recorded indent exactly.
     ///
     /// Deliberately not restricted to a `Mapping` landing frame: verified
     /// live that real yq rejects a mapping-entry-shaped line landing in an
@@ -1906,7 +1911,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             }
             landing_idx -= 1;
         }
-        landing_idx > 0 && self.indent_stack[landing_idx] != indent
+        self.indent_stack[landing_idx] != indent
     }
 
     /// Check-and-error wrapper around [`Self::mapping_under_mapping_gap_reaches`]:
