@@ -10274,3 +10274,46 @@ fn test_resolve_node_alternative_falsy_literal_interacts_correctly_with_untracke
     assert!(stderr.contains("Invalid path expression with result false"));
     Ok(())
 }
+
+// ============================================================================
+// #891: resolve_leaf's non-primitive fallback used a bespoke message for a
+// multi-output result (`range(3)` used bare inside `path(...)`) instead of
+// the same "#530" wording its single-output sibling already uses, naming
+// the first output -- matching real jq's own per-output-checked laziness,
+// which raises on the first non-path-shaped value and never even reaches
+// the rest.
+// ============================================================================
+
+/// #891: `path(range(3))` now names the first output (`0`), matching real
+/// jq's own wording exactly, instead of the old bespoke "Cannot use a
+/// computed index after a multi-output path component" message. Verified
+/// against jq 1.7.1: `echo null | jq -c 'path(range(3))'` raises "Invalid
+/// path expression with result 0", exit 5.
+#[test]
+fn test_resolve_leaf_multi_output_names_first_value_891() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-c", "path(range(3))"], Some("null"))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert!(stderr.contains("Invalid path expression with result 0"));
+    Ok(())
+}
+
+/// #891 companion: the same fix for a multi-output non-primitive whose
+/// first offending value is itself a container (`paths(...)`'s array
+/// output), not a scalar -- confirms the message uses the *rendered* first
+/// value, not just a bare number. Verified against jq 1.7.1: raises
+/// "Invalid path expression with result [0]", exit 5.
+#[test]
+fn test_resolve_leaf_multi_output_names_first_container_value_891() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            r#"path(paths(if type=="string" then error("my custom message") else true end))"#,
+        ],
+        Some(r#"[1,2,"trigger"]"#),
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert!(stderr.contains("Invalid path expression with result [0]"));
+    Ok(())
+}

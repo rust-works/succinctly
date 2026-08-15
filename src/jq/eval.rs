@@ -11139,25 +11139,30 @@ fn resolve_leaf<'a, S: EvalSemantics>(
             Vec::new(),
             EvalError::invalid_path_expression(&values[0]).into(),
         )),
-        // A multi-output non-primitive (`range(3)` used bare, not as an
-        // index prefix — #412's existing "arbitrary generator" refusal
-        // rather than #530's, which is specifically about a *single*
-        // resulting value that is not path-shaped; every #530 repro is
-        // single-output, and jq's own wording for the multi-output case
-        // (`Invalid path expression near attempt to access element ... of
-        // ...`) is its own message shape already deliberately not
-        // reproduced here, per `test_unsupported_path_prefixes_report_rather_than_misfire`).
+        // #891: a multi-output non-primitive (`range(3)` used bare) gets the
+        // same `#530` "with result" message the single-output arm above
+        // uses, naming `values[0]` — matching real jq's own per-output
+        // streaming check, which raises on the *first* output alone and
+        // never even reaches the second/third (confirmed live:
+        // `path(range(3))` raises `Invalid path expression with result 0`,
+        // never touching `1`/`2`). A trailing Break/Error past this point is
+        // discarded the same way the `1 =>` arm's comment explains (Halt
+        // already handled above, before either match).
         //
-        // Note this doesn't match live jq either (confirmed above,
-        // `path(range(3))` raises on the first value, not this message) —
-        // a pre-existing, separate divergence from #861's own repro, not
-        // touched here. A trailing Break/Error past this point is discarded
-        // the same way the `1 =>` arm's comment explains (Halt already
-        // handled above, before either match).
+        // Still doesn't cover every context: when this same value is being
+        // used as an assignment *target* for further indexing rather than
+        // `path(...)`'s own leaf (`(range(3) | .[("x","y")]) = 9`), real jq
+        // instead raises the "near attempt to access element ... of ..."
+        // wording (confirmed live) — a pre-existing, unrelated divergence
+        // that already affects the single-output `1 =>` arm identically
+        // (`(1 | .[("x","y")]) = 9` also shows "with result" here, not
+        // "near attempt"), so extending this arm to match it is consistent
+        // with, not a regression from, the existing convention. Fixing that
+        // properly needs resolve_leaf to know *why* it's being asked to
+        // resolve a leaf, which it doesn't today; not attempted here.
         _ => Err((
             Vec::new(),
-            EvalError::new("Cannot use a computed index after a multi-output path component")
-                .into(),
+            EvalError::invalid_path_expression(&values[0]).into(),
         )),
     }
 }
