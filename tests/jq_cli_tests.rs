@@ -8051,6 +8051,45 @@ fn test_walk_array_construction_is_atomic_on_an_interior_error() -> Result<()> {
 }
 
 #[test]
+fn test_walk_object_construction_is_atomic_on_an_interior_error() -> Result<()> {
+    // The object counterpart to the array test above -- a distinct branch
+    // in `walk_impl` (objects use `map_values`/`|=` semantics, not `map`'s),
+    // so it needs its own coverage. Verified against jq 1.7.1: `echo
+    // '{"a":5,"b":6}' | jq -c 'walk(if .==5 then error("x") else . end)'`
+    // raises with no output at all.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r#"walk(if .==5 then error("x") else . end)"#],
+        Some(r#"{"a":5,"b":6}"#),
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert!(stderr.contains('x'), "stderr: {stderr:?}");
+    Ok(())
+}
+
+#[test]
+fn test_repeat_value_budget_bounds_total_output_independent_of_fan_out() -> Result<()> {
+    // Regression guard for the memory-bound fix: without a per-value
+    // budget, a single highly-fanning-out round (`range(20001)` produces
+    // 20001 values in one round) could balloon `outputs` far past any
+    // reasonable size before the per-round `MAX_ITERATIONS` cap ever had a
+    // chance to matter. `repeat` is a succinctly extension (no upstream jq
+    // builtin to compare against), so this pins succinctly's own contract:
+    // the budget (`REDUCE_FOREACH_MAX_STEPS`, shared with `reduce`/
+    // `foreach`) cuts the stream at exactly 10000 values with a clear
+    // error, not an unbounded allocation.
+    let (stdout, stderr, code) = run_jq_full(&["-c", "repeat(range(20001))"], Some("null"))?;
+    assert_eq!(code, 5, "stderr: {stderr:?}");
+    assert_eq!(stdout.lines().count(), 10000, "stdout: {stdout:?}");
+    assert_eq!(stdout.lines().last(), Some("9999"));
+    assert!(
+        stderr.contains("maximum iterations exceeded"),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
+#[test]
 fn test_walk_nested_break_reaches_its_enclosing_label() -> Result<()> {
     // Before this fix, a nested `f` application collapsed a `Control::Break`
     // into a synthetic "break $label not in label" `EvalError` (the same
