@@ -31,6 +31,20 @@ pub enum NumberRepr {
     Float(f64),
 }
 
+/// Try `i64` first, fall back to `f64` -- the one definition of "how does a
+/// number string decide between the two representations," shared by
+/// [`OwnedValue::from_number_literal_boxed`] and
+/// [`OwnedValue::from_number_bytes`] so they can't silently diverge.
+fn parse_i64_or_f64(s: &str) -> Option<NumberRepr> {
+    if let Ok(i) = s.parse::<i64>() {
+        Some(NumberRepr::Int(i))
+    } else if let Ok(f) = s.parse::<f64>() {
+        Some(NumberRepr::Float(f))
+    } else {
+        None
+    }
+}
+
 /// Format a raw JSON number string the way jq itself would print it.
 ///
 /// This is jq's number formatting, not a verbatim echo of `raw`: jq always
@@ -391,11 +405,7 @@ impl OwnedValue {
     /// already-owned `Box<str>` (e.g. from `JqValue::NumberLiteral`) instead
     /// of allocating a fresh one.
     pub(crate) fn from_number_literal_boxed(literal: Box<str>) -> Self {
-        let repr = if let Ok(i) = literal.parse::<i64>() {
-            NumberRepr::Int(i)
-        } else if let Ok(f) = literal.parse::<f64>() {
-            NumberRepr::Float(f)
-        } else {
+        let Some(repr) = parse_i64_or_f64(&literal) else {
             return Self::Null;
         };
         Self::NumberLiteral(repr, literal)
@@ -424,12 +434,10 @@ impl OwnedValue {
         let Ok(s) = core::str::from_utf8(bytes) else {
             return Self::Null;
         };
-        if let Ok(i) = s.parse::<i64>() {
-            Self::Int(i)
-        } else if let Ok(f) = s.parse::<f64>() {
-            Self::Float(f)
-        } else {
-            Self::Null
+        match parse_i64_or_f64(s) {
+            Some(NumberRepr::Int(i)) => Self::Int(i),
+            Some(NumberRepr::Float(f)) => Self::Float(f),
+            None => Self::Null,
         }
     }
 
