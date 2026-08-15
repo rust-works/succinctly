@@ -6044,6 +6044,61 @@ fn builtin_implode<W: Clone + AsRef<[u64]>>(
     }
 }
 
+/// Unpack a `test`/`match`/`capture` bare-form (no explicit flags argument)
+/// pattern if it's a non-empty array, as `[pattern, flags, ...ignored]` —
+/// real, if undocumented, jq 1.7.1 behavior (#943): `test(["a","i"])`
+/// behaves like `test("a";"i")`, extra elements past index 1 are silently
+/// ignored, and a 1-element array supplies `None` for flags. Only a
+/// genuinely *empty* array (no element 0 to unpack) is left alone.
+///
+/// Shared by the regex-enabled `eval_regex_pattern_and_flags` and the
+/// non-regex `builtin_test` fallback (#956) — the two are mutually
+/// exclusive, `cfg`-gated on opposite sides of the `regex` feature and can
+/// never both compile into the same binary, but this helper isn't gated on
+/// either, so both reach the one definition instead of two independently
+/// hand-written copies of the same boundary drifting apart (CLAUDE.md:
+/// "duplicated predicates diverge silently").
+///
+/// Returns `(pattern, flags, was_unpacked)` — `was_unpacked` tells the
+/// caller to use the array-unpacked error wording
+/// (`EvalError::is_not_a_string`) rather than the plain
+/// `not_string_or_array` one if `pattern` still isn't a string after this.
+fn unpack_bare_array_pattern(pattern: OwnedValue) -> (OwnedValue, Option<OwnedValue>, bool) {
+    match pattern {
+        OwnedValue::Array(items) if !items.is_empty() => {
+            let mut items = items.into_iter();
+            let pattern = items.next().expect("checked non-empty above");
+            let flags = items.next();
+            (pattern, flags, true)
+        }
+        other => (other, None, false),
+    }
+}
+
+/// Validate a `test`/`match`/`capture` flags value once it's been evaluated
+/// (or unpacked from an array pattern, `unpack_bare_array_pattern`):
+/// missing is `None`, `null` is treated as "no flags" (an empty string), a
+/// string is used as-is, and anything else is the same `is_not_a_string`
+/// error every pattern-position type mismatch in this family already uses.
+///
+/// Shared by `eval_regex_pattern_and_flags` and the non-regex `builtin_test`
+/// fallback (#956) for the same "one definition, not two hand-written
+/// copies" reason `unpack_bare_array_pattern` is — found in review: the
+/// non-regex fallback originally unpacked but never validated the flags
+/// slot at all, so `test(["a", 5])` silently succeeded there while both
+/// real jq and the regex-enabled path raise `"number (5) is not a
+/// string"`. `builtin_test` still discards the validated flags' *content*
+/// (this fallback has no flag support), but must still reject the same
+/// malformed shapes real jq does.
+fn validate_regex_flags(raw_flags: Option<OwnedValue>) -> Result<Option<String>, EvalError> {
+    match raw_flags {
+        None => Ok(None),
+        Some(OwnedValue::String(s)) => Ok(Some(s)),
+        Some(OwnedValue::Null) => Ok(Some(String::new())),
+        Some(v) => Err(EvalError::is_not_a_string(&v)),
+    }
+}
+
 /// Builtin: test(re) - test if string matches (substring fallback without regex feature)
 #[cfg(not(feature = "regex"))]
 fn builtin_test<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
@@ -6057,32 +6112,29 @@ fn builtin_test<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Err(e) => return e.into(),
     };
     // #956 (#943 follow-up): the bare form additionally unpacks a non-empty
-    // array pattern as `[pattern, flags, ...ignored]`, mirroring the
-    // regex-enabled `eval_regex_pattern_and_flags`'s own #943 fix -- this is
-    // real (if undocumented) jq behavior, not specific to having `regex`
-    // compiled in. `flags` (element 1, if present) is unpacked but then
-    // discarded: this fallback has no flag support at all regardless of
-    // pattern shape (it's already a documented approximation of full regex
-    // semantics), so `test(["a","i"])` behaves like `test("a")`, not like a
-    // real case-insensitive match. Confirmed against jq 1.7.1:
-    // `"abc" | test(["a","i"])` is `true` in both this fallback and the
-    // regex-enabled path (the `i` flag happens not to change the outcome
-    // for this particular pattern/input pair). Only a genuinely empty array
-    // falls through to the plain non-string-pattern check below, using the
-    // array's own type name -- same boundary #943 drew.
-    let array_unpacked = matches!(&raw_pattern, OwnedValue::Array(items) if !items.is_empty());
-    let raw_pattern = match raw_pattern {
-        OwnedValue::Array(items) if array_unpacked => {
-            items.into_iter().next().expect("checked non-empty above")
-        }
-        other => other,
-    };
+    // array pattern via the shared `unpack_bare_array_pattern` helper -- see
+    // its own doc comment for the exact boundary. Confirmed against jq
+    // 1.7.1: `"abc" | test(["a","i"])` is `true` in both this fallback and
+    // the regex-enabled path (the `i` flag happens not to change the
+    // outcome for this particular pattern/input pair).
+    let (raw_pattern, raw_flags, array_unpacked) = unpack_bare_array_pattern(raw_pattern);
     let pattern = match raw_pattern {
         OwnedValue::String(s) => s,
         _ if optional => return QueryResult::None,
         v if array_unpacked => return QueryResult::Error(EvalError::is_not_a_string(&v)),
         v => return QueryResult::Error(EvalError::not_string_or_array(v.type_name())),
     };
+    // The unpacked flags slot (if any) is still *validated* the same way
+    // `eval_regex_pattern_and_flags` does -- confirmed against jq 1.7.1:
+    // `"abc" | test(["a", 5])` raises "number (5) is not a string" in both
+    // that path and real jq, not a silent `true`/`false` that ignores the
+    // bad element -- but its *content* is then discarded regardless: this
+    // fallback has no flag support at all (already a documented
+    // approximation of full regex semantics), so a validly-typed flags
+    // string still can't change the substring match's outcome.
+    if let Err(e) = validate_regex_flags(raw_flags) {
+        return QueryResult::Error(e);
+    }
 
     // Check if the input string contains the pattern (simple substring match)
     match &value {
@@ -6886,27 +6938,20 @@ fn eval_regex_pattern_and_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     };
 
     // #943: `test`/`match`/`capture`'s *bare* form (no `flags_expr` at all)
-    // additionally unpacks a non-empty array pattern as `[pattern, flags,
-    // ...ignored]` — undocumented but real jq behavior, confirmed live:
-    // `test(["a","i"])` behaves exactly like `test("a";"i")`, extra
-    // elements past index 1 are silently ignored (`test(["a","i","x"])`
-    // still succeeds), and a 1-element array supplies `null` flags
-    // (`test(["a"])` succeeds with no flags). Only a genuinely *empty*
-    // array (no element 0 to unpack) skips this and falls through to the
-    // plain non-string-pattern check below, using the array's own type
-    // name. Does not apply to `sub` (confirmed live: `sub(["a","i"];"b")`
-    // is a plain non-string-pattern error, no unpacking) or when
-    // `flags_expr` is itself present (`test(["a","i"]; "x")` is likewise
-    // a plain error — the two ways of supplying flags don't combine).
-    let (raw_pattern, raw_flags, array_unpacked) = match (family, flags_expr, raw_pattern) {
-        (RegexArgFamily::TestMatchCapture, None, OwnedValue::Array(items)) if !items.is_empty() => {
-            let mut items = items.into_iter();
-            let pattern = items.next().expect("checked non-empty above");
-            let flags = items.next();
-            (pattern, flags, true)
-        }
-        (_, _, raw_pattern) => (raw_pattern, raw_flags, false),
-    };
+    // additionally unpacks a non-empty array pattern via the shared
+    // `unpack_bare_array_pattern` helper (also used by the non-regex
+    // `builtin_test` fallback, #956) — see its own doc comment for the
+    // exact boundary. Does not apply to `sub` (confirmed live:
+    // `sub(["a","i"];"b")` is a plain non-string-pattern error, no
+    // unpacking) or when `flags_expr` is itself present (`test(["a","i"];
+    // "x")` is likewise a plain error — the two ways of supplying flags
+    // don't combine).
+    let (raw_pattern, raw_flags, array_unpacked) =
+        if matches!(family, RegexArgFamily::TestMatchCapture) && flags_expr.is_none() {
+            unpack_bare_array_pattern(raw_pattern)
+        } else {
+            (raw_pattern, raw_flags, false)
+        };
 
     // Once an array pattern has been unpacked, both the pattern and flags
     // slots use the same wording an explicit 2-arg call would — confirmed
@@ -6925,12 +6970,7 @@ fn eval_regex_pattern_and_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         }
     };
 
-    let flags = match raw_flags {
-        None => None,
-        Some(OwnedValue::String(s)) => Some(s),
-        Some(OwnedValue::Null) => Some(String::new()),
-        Some(v) => return Err(QueryResult::Error(EvalError::is_not_a_string(&v))),
-    };
+    let flags = validate_regex_flags(raw_flags).map_err(|e| QueryResult::Error(e))?;
 
     Ok((pattern, flags))
 }
@@ -27971,7 +28011,7 @@ mod tests {
         );
         // A genuinely empty array falls through to the plain
         // non-string-pattern check, using the array's own type name.
-        query!(br#""abc""#, r#"test([])"#,
+        query!(br#""abc""#, r"test([])",
             QueryResult::Error(e) => {
                 assert_eq!(e.message, "array not a string or array");
             }
@@ -27980,6 +28020,25 @@ mod tests {
         // same as it already did for a plain non-string/array pattern.
         query!(br#""abc""#, r#"test([1,"i"])?"#,
             QueryResult::None => {}
+        );
+        // Review round: a validly-typed pattern with a malformed *flags*
+        // slot must still error, not silently discard the bad flags value
+        // and succeed -- confirmed against jq 1.7.1 and the regex-enabled
+        // path: `"abc" | test(["a", 5])` raises "number (5) is not a
+        // string" in both. This fallback still has no flag support at all
+        // once validated (a *valid* flags string can't change the outcome
+        // -- see the first case above), but validation itself must agree.
+        query!(br#""abc""#, r#"test(["a", 5])"#,
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "number (5) is not a string");
+            }
+        );
+        // `null` flags is valid (treated as "no flags"), matching the
+        // regex-enabled path.
+        query!(br#""abc""#, r#"test(["a", null])"#,
+            QueryResult::Owned(OwnedValue::Bool(b)) => {
+                assert!(b);
+            }
         );
     }
 
