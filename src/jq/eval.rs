@@ -13720,14 +13720,44 @@ fn walk_impl<S: EvalSemantics>(
 }
 
 /// Builtin: isvalid(expr) - check if expr succeeds without errors.
+/// #881 fix: `expr` is evaluated with its own *ambient* `optional` (always
+/// `false` here, matching #693's "ambient, not broadcast" model every other
+/// builtin follows) rather than the old forced `optional=true` broadcast
+/// down the whole subtree. The old forcing existed to make a genuinely
+/// error-producing leaf convert into a `None`/`Owned` shape isvalid's match
+/// could recognize, but it had the unintended side effect of making
+/// `eval_error` (and every other builtin's own `_ if optional => ...` arm)
+/// self-suppress *every* nested error the same way -- including a comma
+/// sibling's error several levels down, which `eval_comma` then silently
+/// no-op'd, discarding the evidence that anything went wrong while an
+/// earlier sibling's real output survived (`isvalid(1, error("x"))` wrongly
+/// answered `true`). Evaluating unforced instead lets a genuine error
+/// surface as `eval_comma`/`eval_reduce`/`eval_foreach`'s own natural
+/// `Partial(_, Control::Error(_))` shape (built by `partial(...)`, same as
+/// every other "keep the prefix, thread the escape" site in this file),
+/// which the new arm below catches directly -- no per-builtin
+/// optional-forcing needed. See
+/// `test_isvalid_comma_sibling_error_not_masked_881` and
+/// `test_isvalid_reaches_every_builtins_own_optional_guard` for the full
+/// before/after case-by-case verification, including two cases
+/// (`@format`'s own `_ if optional => Ok(String::new())` arm, and
+/// `paths_filter`'s node-error swallowing) where the old forcing had
+/// produced a succinctly-only divergence from real jq's own reference
+/// `isvalid` desugaring that this fix incidentally corrects too.
 fn builtin_isvalid<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     expr: &Expr,
     value: StandardJson<'a, W>,
     _optional: bool,
 ) -> QueryResult<'a, W> {
-    match eval_single::<W, S>(expr, value, true) {
+    match eval_single::<W, S>(expr, value, false) {
         QueryResult::Error(_) => QueryResult::Owned(OwnedValue::Bool(false)),
         QueryResult::None => QueryResult::Owned(OwnedValue::Bool(false)),
+        // A fork construct (comma/reduce/foreach) that produced some output
+        // before a later, unforced error interrupted it -- the shape
+        // `eval_comma` et al. build via `partial(...)`, now reachable here
+        // since evaluation is no longer forced-optional (see this
+        // function's own doc comment).
+        QueryResult::Partial(_, Control::Error(_)) => QueryResult::Owned(OwnedValue::Bool(false)),
         // A halt is never a validity verdict: it must exit the process, not
         // report `true`/`false` and let evaluation continue (#791) — same
         // shape as the `Error`/`None` cases above never being swallowed by
@@ -28756,23 +28786,31 @@ mod tests {
 
     #[test]
     fn test_isvalid_reaches_every_builtins_own_optional_guard() {
-        // `isvalid(EXPR)` is the one surviving construct that still evaluates
-        // `EXPR` with `optional` forced `true` for the whole subtree
-        // (`builtin_isvalid` does this deliberately, not by accident: without
-        // it, a fork construct — comma/reduce/foreach — that errors partway
-        // through would come back as `Partial`, which `isvalid`'s own
-        // three-arm match doesn't special-case and would wrongly count as
-        // "valid"). Every other route to `optional = true` was removed by
-        // #693 — `E?`/`try E` now evaluate `E` with the *ambient* `optional`
-        // and catch the aggregate result once via `eval_try`, rather than
-        // broadcasting `true` down the whole subtree the way the pre-#693
-        // bug did. That leaves each of these builtins' own internal
-        // `_ if optional => ...` arm reachable only through `isvalid`, so
-        // this is regression coverage for #698 (indirect coverage lost by
-        // #693's fix, all of it real behavior — `isvalid` correctly
-        // reporting `false` — not dead code): pin one case per remaining
-        // caller so a future refactor can't silently make `isvalid` stop
-        // noticing one of these error shapes.
+        // #881: `isvalid(EXPR)` used to evaluate `EXPR` with `optional`
+        // forced `true` for the *whole* subtree, specifically so a fork
+        // construct (comma/reduce/foreach) that errors partway through would
+        // degrade to a detectable `None`/`Owned` shape instead of a
+        // `Partial(_, Control::Error(_))` isvalid's match didn't special-case.
+        // That forcing had an unintended side effect: a *later* comma
+        // sibling's genuine error got silently swallowed by an *earlier*
+        // sibling's already-produced output (`isvalid(1, error("x"))`
+        // wrongly answered `true` — see
+        // `test_isvalid_comma_sibling_error_not_masked_881` below). Fixed by
+        // evaluating `EXPR` with its own ambient (unforced) `optional`,
+        // matching every other builtin post-#693, and catching the
+        // `Partial(_, Control::Error(_))` shape a fork construct naturally
+        // produces when an unforced error interrupts it after some output —
+        // exactly the shape `eval_comma` (`src/jq/eval.rs`) already builds
+        // via `partial(...)`, just previously never reached because the
+        // forced `optional` made the erroring leaf self-suppress to `None`
+        // before `eval_comma`'s own match ever saw an `Error`.
+        //
+        // Every case below still reports `false` for a genuinely
+        // error-producing expression — unaffected by the fix, since
+        // `eval_single`'s own `QueryResult::Error`/`Partial(_,
+        // Control::Error(_))` variants are caught directly, without needing
+        // any builtin's own `_ if optional` guard to convert the error into
+        // `None` first.
         for expr in [
             "isvalid(.[])",
             "isvalid(keys)",
@@ -28780,17 +28818,32 @@ mod tests {
             r#"isvalid(contains("a"))"#,
             r#"isvalid(inside("a"))"#,
             "isvalid(bsearch(2))",
+            // `error(...)` itself.
+            r#"isvalid(error("x"))"#,
         ] {
             query!(br"1", expr,
                 QueryResult::Owned(OwnedValue::Bool(false)) => {}
             );
         }
 
-        // The `@format` builtins' own `_ if optional` arm is unlike the
-        // others above: it doesn't produce `None`, it produces `Ok(String::
-        // new())` — under `optional`, a value the format can't handle
-        // renders as `""` rather than failing at all, so `isvalid` sees a
-        // genuine success and reports `true`, not `false`.
+        // #881 review: real jq has no `isvalid` builtin to diff against
+        // directly, but its own doc comment ("check if expr succeeds
+        // without errors") matches the standard community desugaring
+        // `def isvalid(f): try (f|true) catch false;` — checked live
+        // against jq 1.8.2. Under that reference, `isvalid(@base64d)` on a
+        // non-string input is `false` (`try @base64d catch false`:
+        // `@base64d` genuinely errors on bad input in real jq, with no
+        // optional-dependent "renders as empty string" behavior at all).
+        // Before this fix, the `@format` builtins' own `_ if optional =>
+        // Ok(String::new())` arm (`format_urid`/`format_csv`/etc,
+        // `src/jq/eval.rs`) was reachable *only* through `isvalid`'s forced
+        // broadcast — a succinctly-only quirk, not modeled on any real jq
+        // behavior, that made `isvalid(@urid)` on bad input wrongly report
+        // `true`. Now that `isvalid` no longer forces `optional`, this arm
+        // is unreachable via `isvalid` (still reachable the same way every
+        // other builtin's `_ if optional` arm is: a literal `?` written
+        // directly after the format, e.g. `@urid?`) and these correctly
+        // report `false`, matching the real-jq-verified reference semantics.
         for expr in [
             "isvalid(@urid)",
             "isvalid(@csv)",
@@ -28800,21 +28853,15 @@ mod tests {
             "isvalid(@base64d)",
         ] {
             query!(br"1", expr,
-                QueryResult::Owned(OwnedValue::Bool(true)) => {}
+                QueryResult::Owned(OwnedValue::Bool(false)) => {}
             );
         }
 
-        // `error(...)` itself.
-        query!(br"1", r#"isvalid(error("x"))"#,
-            QueryResult::Owned(OwnedValue::Bool(false)) => {}
-        );
-
         // Assignment/update/del: the write-time path traversal fails one
         // level down (`.a` is `1`, not an object, so `.b` can't be written
-        // into it), and `set_path`/`update_path`/`delete_at_path` have no
-        // `optional` of their own — it's `eval_assign`/`eval_update`/
-        // `builtin_del`'s *own* ambient `optional` (forced by `isvalid`)
-        // that decides whether the failure is swallowed.
+        // into it) — a genuine `Error`, caught directly without needing
+        // `set_path`/`update_path`/`delete_at_path`'s ambient `optional`
+        // forced.
         for expr in [
             "isvalid(.a.b = 5)",
             r#"isvalid(.a |= error("x"))"#,
@@ -28825,12 +28872,11 @@ mod tests {
             );
         }
 
-        // reduce/foreach: `limit(-1; 1)` errors unconditionally (it has no
-        // `optional` arm of its own), so it's the one construct that can
-        // still leak a genuine `Error`/`Partial` control past a leaf's own
-        // self-suppression and into `eval_reduce`/`eval_foreach`/
-        // `finish_fork`'s own optional-guards, one per INIT/SOURCE/fork-loop
-        // site.
+        // reduce/foreach: `limit(-1; 1)` errors unconditionally, propagating
+        // as a genuine `Error`/`Partial(_, Control::Error(_))` from
+        // `eval_reduce`/`eval_foreach`'s own INIT/SOURCE/fork-loop sites —
+        // caught directly by `isvalid`'s match without needing any
+        // optional-forcing.
         for expr in [
             "isvalid(reduce (1,2) as $x (0; limit(-1;1)))",
             "isvalid(reduce (1,2) as $x (limit(-1;1); .+$x))",
@@ -28844,23 +28890,61 @@ mod tests {
         }
     }
 
-    /// #773 follow-up regression: `builtin_paths_filter`'s per-node
-    /// `node_filter` evaluation must receive `isvalid`'s forced
-    /// `optional = true` the same way every other builtin covered by
-    /// `test_isvalid_reaches_every_builtins_own_optional_guard` above does,
-    /// not a hardcoded `false`. `.foo` on a scalar node errors; with
-    /// `optional` correctly threaded, that error is swallowed (empty), so
-    /// `(.foo, true)` still emits `true` for every node and `paths(...)`
-    /// comes back non-empty -- `isvalid` reports `true`. A hardcoded
-    /// `false` here instead lets `.foo`'s error abort the whole per-node
-    /// comma, `paths(...)` comes back empty, and `isvalid` wrongly reports
-    /// `false`. Confirmed this matches the pre-#773 code's own behavior
-    /// (which forwarded `optional` correctly) by building that commit
-    /// directly.
+    /// #881: the actual bug this issue was filed for. `isvalid(1,
+    /// error("x"))` and its variants used to wrongly answer `true` because
+    /// `isvalid`'s forced `optional=true` made `error("x")` self-suppress to
+    /// `None` before `eval_comma` ever saw the escape, and `eval_comma`
+    /// treats a `None` sibling as a pure no-op — silently discarding the
+    /// evidence that anything went wrong, leaving only the earlier `1`
+    /// sibling's real output behind. Fixed by evaluating with ambient
+    /// (unforced) `optional`, so `error("x")` now genuinely errors and
+    /// `eval_comma` correctly threads it through as `Partial(vec![1],
+    /// Control::Error(_))`, which `isvalid`'s match now catches. `isvalid`
+    /// has no real jq to diff against, but the reference desugaring `def
+    /// isvalid(f): try (f|true) catch false;` (checked live against jq
+    /// 1.8.2) agrees: `isvalid(1, error("x"))` is `false` there too — real
+    /// jq's `try`/`catch` stops the whole generator at the first error
+    /// (confirmed separately: `(error("a"), 99)?` is empty in jq 1.8.2, `99`
+    /// is never reached), matching `eval_comma`'s own "stop at the first
+    /// escape" behavior once it isn't preempted by forced suppression.
     #[test]
-    fn test_isvalid_reaches_paths_filters_own_optional_guard() {
+    fn test_isvalid_comma_sibling_error_not_masked_881() {
+        for expr in [
+            r#"isvalid(1, error("x"))"#,
+            "isvalid(1, (1|explode))",
+            "isvalid(1, (1/0))",
+        ] {
+            query!(br"null", expr,
+                QueryResult::Owned(OwnedValue::Bool(false)) => {}
+            );
+        }
+        // A single-value argument (no comma sibling to mask anything) is
+        // unaffected by the fix — still `false` when it genuinely errors.
+        query!(br"null", "isvalid((1|explode))",
+            QueryResult::Owned(OwnedValue::Bool(false)) => {}
+        );
+    }
+
+    /// #773 established that `builtin_paths_filter`'s per-node `node_filter`
+    /// evaluation must receive whatever `optional` is ambient around
+    /// `isvalid`, not a hardcoded `false` — a real fix at the time, since
+    /// pre-#773 code silently dropped `optional` entirely on this specific
+    /// path. #881 review: with `isvalid` no longer forcing `optional=true`
+    /// broadcast (see `test_isvalid_reaches_every_builtins_own_optional_guard`
+    /// above), `.foo` on a scalar node here now genuinely errors instead of
+    /// being swallowed — matching real jq exactly:
+    /// `{"a":1,"b":2} | [paths(.foo, true)]` itself errors in real jq 1.8.2
+    /// ("Cannot index number with string (\"foo\")"), and under the
+    /// reference `def isvalid(f): try (f|true) catch false;` desugaring
+    /// (checked live against jq 1.8.2), `isvalid(paths(.foo, true))` there
+    /// is `false`, not `true`. The pre-#881 test pinned `true` — a
+    /// succinctly-only divergence from real jq that #773's own (correct)
+    /// optional-threading fix made *reachable* without being its cause;
+    /// #881's broader fix (no longer forcing `optional` at all) corrects it.
+    #[test]
+    fn test_isvalid_paths_filter_node_error_not_swallowed_881() {
         query!(br#"{"a":1,"b":2}"#, r"isvalid(paths(.foo, true))",
-            QueryResult::Owned(OwnedValue::Bool(true)) => {}
+            QueryResult::Owned(OwnedValue::Bool(false)) => {}
         );
     }
 
