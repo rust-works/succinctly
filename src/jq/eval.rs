@@ -11131,35 +11131,23 @@ fn resolve_leaf<'a, S: EvalSemantics>(
         // own repro, `path(paths(if type=="string" then break $out else true
         // end))` on `[1,"x",2]`, raises on `[0]` alone, never reaching the
         // second candidate where the `break` sits). `values[0]` is that first
-        // output regardless of whether `trailing` still carries a Break/Error
-        // from evaluating further here — real jq never reaches whatever would
-        // have caused it, so it's discarded rather than propagated (Halt is
-        // the one exception, already handled above).
-        1 => Err((
-            Vec::new(),
-            EvalError::invalid_path_expression(&values[0]).into(),
-        )),
-        // #891: a multi-output non-primitive (`range(3)` used bare) gets the
-        // same `#530` "with result" message the single-output arm above
-        // uses, naming `values[0]` — matching real jq's own per-output
-        // streaming check, which raises on the *first* output alone and
-        // never even reaches the second/third (confirmed live:
-        // `path(range(3))` raises `Invalid path expression with result 0`,
-        // never touching `1`/`2`). A trailing Break/Error past this point is
-        // discarded the same way the `1 =>` arm's comment explains (Halt
-        // already handled above, before either match).
+        // output regardless of how many outputs there actually were (#891 —
+        // one arm covers both the single- and multi-output case, since real
+        // jq's own per-output check treats them identically: it never even
+        // learns whether a second output would have existed) or of whether
+        // `trailing` still carries a Break/Error from evaluating further
+        // here — real jq never reaches whatever would have caused it, so
+        // it's discarded rather than propagated (Halt is the one exception,
+        // already handled above).
         //
         // Still doesn't cover every context: when this same value is being
         // used as an assignment *target* for further indexing rather than
-        // `path(...)`'s own leaf (`(range(3) | .[("x","y")]) = 9`), real jq
-        // instead raises the "near attempt to access element ... of ..."
-        // wording (confirmed live) — a pre-existing, unrelated divergence
-        // that already affects the single-output `1 =>` arm identically
-        // (`(1 | .[("x","y")]) = 9` also shows "with result" here, not
-        // "near attempt"), so extending this arm to match it is consistent
-        // with, not a regression from, the existing convention. Fixing that
-        // properly needs resolve_leaf to know *why* it's being asked to
-        // resolve a leaf, which it doesn't today; not attempted here.
+        // `path(...)`'s own leaf (`(range(3) | .[("x","y")]) = 9`, or the
+        // single-output `(1 | .[("x","y")]) = 9`), real jq instead raises
+        // the "near attempt to access element ... of ..." wording (confirmed
+        // live for both) — `resolve_leaf` has no way to tell that context
+        // apart from `path(...)`'s own leaf today; filed as #989 rather than
+        // attempted here.
         _ => Err((
             Vec::new(),
             EvalError::invalid_path_expression(&values[0]).into(),

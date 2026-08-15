@@ -505,13 +505,18 @@ while collecting a path), so neither does this resolver's — the one call site 
 `resolve_node`'s bare-`?` arm and `Expr::Try`'s, both checking
 `EvalError::is_invalid_path_expression`.
 
-One case stays out of scope on purpose: a *multi-output* non-path leaf used bare (`range(3)`
-with nothing consuming its outputs as a further computed index) still reports succinctly's
-existing "Cannot use a computed index after a multi-output path component" rather than
-`invalid_path_expression` or jq's own compound wording for that shape — the same
-`test_unsupported_path_prefixes_report_rather_than_misfire` boundary #412 already drew,
-which this fix does not move. Every `path_non_path_*` probe is single-output, matching
-#530's own repro list.
+A *multi-output* non-path leaf used bare (`range(3)` with nothing consuming its outputs as a
+further computed index) also raises `invalid_path_expression`, naming the first output —
+matching real jq's own per-output check, which raises on that first output alone and never
+even learns whether a second one would have existed (#891; before that fix this reported a
+bespoke "Cannot use a computed index after a multi-output path component" instead, the same
+`test_unsupported_path_prefixes_report_rather_than_misfire` boundary #412 drew). Every
+`path_non_path_*` probe is single-output, matching #530's own repro list, but the multi-output
+shape now shares the same code path and message. One case stays out of scope: the same value
+used as an assignment *target* for further indexing (`(range(3) | .[.k]) = 9`) gets this
+"with result" wording too, where jq instead uses its "near attempt to access element ... of
+..." phrasing — `resolve_leaf` has no way to tell that context apart from `path(...)`'s own
+leaf today (#989).
 
 A closely related gap surfaced while verifying this: `path()` used to discard outputs
 already streamed before a later sibling errors (`path(.a, 1)` produced nothing at all,
