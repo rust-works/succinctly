@@ -30,6 +30,9 @@
 //! assert_eq!(resolve_plain("1_000"), ResolvedScalar::Str);
 //! ```
 
+#[cfg(not(test))]
+use alloc::borrow::Cow;
+#[cfg(test)]
 use std::borrow::Cow;
 
 use crate::jq::OwnedValue;
