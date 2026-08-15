@@ -33567,6 +33567,11 @@ mod tests {
         // reaches that function.
         query!(b"null", r#"[2020,9223372036854775807,1,0,0,0,0,0] | strftime("%Y")"#,
             QueryResult::Error(e) => assert_eq!(e.message, MSG));
+        // `?` suppresses the array branch's own month-overflow error too
+        // (distinct site from the `%s`-via-unix_secs_from_broken_down_time
+        // case above — both now share `checked_month_index`, #912).
+        query!(b"null", r#"[2020,9223372036854775807,1,0,0,0,0,0] | strftime("%Y")?"#,
+            QueryResult::None => {});
     }
 
     #[test]
