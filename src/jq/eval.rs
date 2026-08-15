@@ -7386,7 +7386,7 @@ fn builtin_scan<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    builtin_scan_with_flags::<W, S>(re_expr, None, value, optional)
+    builtin_scan_with_flags::<W, S>(re_expr, value, optional)
 }
 
 /// Builtin: splits(re) - split by regex
@@ -7405,7 +7405,7 @@ fn builtin_splits<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    builtin_splits_with_flags::<W, S>(re_expr, None, value, optional)
+    builtin_splits_with_flags::<W, S>(re_expr, value, optional)
 }
 
 /// Builtin: sub(re; replacement) - replace first match
@@ -7653,12 +7653,13 @@ fn builtin_sub_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
 /// The rest of `sub`/`gsub`'s work once the pattern string and flags string
 /// are both already resolved — input fetch, regex build, and the single-vs-
-/// global replace logic. Split out so `builtin_gsub_with_flags` (whose
-/// flags value is a synthesized `flags + "g"` string, not a user
-/// expression, and whose own flags-before-pattern evaluation order already
-/// matches jq's — see its own doc comment) can reuse this without going
-/// through `builtin_sub_with_flags`'s pattern-first evaluation, which only
-/// applies when `flags_expr` is a real, independently-evaluated argument.
+/// global replace logic. Shared by three callers, each resolving pattern
+/// and flags its own way before handing off the plain strings here:
+/// `builtin_sub_with_flags` (#942's pattern-first evaluation, real
+/// user-supplied flags or none), `builtin_gsub_with_flags` (bare `gsub`,
+/// no flags argument at all — hardcodes `"g"`), and `builtin_gsub_flags`
+/// (flagged `gsub`, #938's pattern-first-then-concatenated-flags order,
+/// via `eval_regex_pattern_and_concat_flags`).
 #[cfg(feature = "regex")]
 fn sub_with_resolved_pattern<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     pattern: &str,
@@ -7773,21 +7774,29 @@ fn eval_regex_pattern_and_concat_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSeman
 ) -> Result<(String, String), QueryResult<'a, W>> {
     let raw_pattern = result_to_owned(eval_single::<W, S>(re_expr, value.clone(), optional))?;
 
-    let flags = match result_to_owned(eval_single::<W, S>(flags_expr, value, optional))? {
-        OwnedValue::String(s) => s,
-        OwnedValue::Null => String::new(),
-        v => {
-            let g = OwnedValue::String("g".to_string());
-            let (a, b) = match concat {
-                FlagsConcat::Append => (&v, &g),
-                FlagsConcat::Prepend => (&g, &v),
-            };
-            return Err(QueryResult::Error(EvalError::binary_op(a, b, BinOp::Add)));
-        }
+    // jq's own "+" operator, `arith_add`, already implements exactly what
+    // this concatenation needs: string concat, `null` as an identity
+    // element (`null + "g"` / `"g" + null` both just yield `"g"`, matching
+    // jq's real `null`-flags handling without a separate special case),
+    // and `EvalError::binary_op` for any other type pairing. Reusing it
+    // here instead of hand-rolling the same three arms keeps this in sync
+    // with jq's real `+` semantics automatically if they're ever adjusted.
+    let raw_flags = result_to_owned(eval_single::<W, S>(flags_expr, value, optional))?;
+    let g = OwnedValue::String("g".to_string());
+    let (a, b) = match concat {
+        FlagsConcat::Append => (raw_flags, g),
+        FlagsConcat::Prepend => (g, raw_flags),
     };
-    let global_flags = match concat {
-        FlagsConcat::Append => format!("{flags}g"),
-        FlagsConcat::Prepend => format!("g{flags}"),
+    let global_flags = match arith_add::<S>(a, b) {
+        // One operand is always the literal string "g", so the only ways
+        // `arith_add` can succeed are (String, String) -> concat, or the
+        // other operand being `null` -> the "g" identity wins outright;
+        // both cases produce a String.
+        Ok(OwnedValue::String(s)) => s,
+        Ok(other) => unreachable!(
+            "arith_add(_, \"g\"-or-\"g\"-paired) always yields a String, got {other:?}"
+        ),
+        Err(e) => return Err(e.into()),
     };
 
     let pattern = match raw_pattern {
@@ -7882,11 +7891,16 @@ fn builtin_scan_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     scan_with_resolved_pattern::<W>(&pattern, &global_flags, value, optional)
 }
 
-/// Builtin: scan(re) or scan(re; flags) - find all matches
+/// Builtin: scan(re) - find all matches (bare form, no flags argument)
+///
+/// The flagged 2-arg form (`scan(re;flags)`) does *not* route through
+/// here — `builtin_scan_flags` resolves pattern and flags itself, in
+/// jq's real evaluation order (#938), and calls `scan_with_resolved_pattern`
+/// directly — so this function (and its unconditional `"g"`, jq's own
+/// "always global" mode) is reached only by the bare form.
 #[cfg(feature = "regex")]
 fn builtin_scan_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     re_expr: &Expr,
-    flags: Option<&str>,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
@@ -7897,16 +7911,7 @@ fn builtin_scan_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Err(e) => return e.into(),
     };
 
-    // `scan` always operates in jq's "global" mode (it finds every match, the
-    // way `gsub` always replaces every match) — jq's own bootstrap prepends
-    // `g` to the flags string before validation for exactly that reason.
-    // `g` is a no-op for `build_regex`'s own compiled-pattern behavior, so
-    // this only affects the wording of an invalid-flags error, matching
-    // jq's own message: confirmed live, `scan("a"; "z")` reports "gz is not
-    // a valid modifier string", not "z is not a valid modifier string".
-    let global_flags = format!("g{}", flags.unwrap_or(""));
-
-    scan_with_resolved_pattern::<W>(&pattern, &global_flags, value, optional)
+    scan_with_resolved_pattern::<W>(&pattern, "g", value, optional)
 }
 
 /// The rest of `scan`'s work once the pattern string and already-
@@ -7916,6 +7921,15 @@ fn builtin_scan_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// concatenating/type-checking flags, to get jq's real evaluation order)
 /// can reuse this without re-evaluating `re_expr` a second time, mirroring
 /// `sub_with_resolved_pattern`'s split for sub/gsub.
+///
+/// `scan`/`split`/`splits` always operate in jq's "global" mode (they find
+/// or split on *every* match, the way `gsub` always replaces every match)
+/// — jq's own bootstrap prepends `g` to the flags string before
+/// validation for exactly that reason. `g` is a no-op for `build_regex`'s
+/// own compiled-pattern behavior, so this only affects the wording of an
+/// invalid-flags error, matching jq's own message: confirmed live,
+/// `scan("a"; "z")` reports "gz is not a valid modifier string", not "z is
+/// not a valid modifier string".
 #[cfg(feature = "regex")]
 fn scan_with_resolved_pattern<'a, W: Clone + AsRef<[u64]>>(
     pattern: &str,
@@ -8039,11 +8053,18 @@ fn builtin_splits_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     splits_with_resolved_pattern::<W>(&pattern, &global_flags, value, optional)
 }
 
-/// Builtin: splits(re) or splits(re; flags) - split by regex as stream
+/// Builtin: splits(re) - split by regex as stream (bare form, no flags
+/// argument)
+///
+/// The flagged 2-arg form (`splits(re;flags)`) does *not* route through
+/// here — `builtin_splits_flags` resolves pattern and flags itself, in
+/// jq's real evaluation order (#938), and calls
+/// `splits_with_resolved_pattern` directly — so this function (and its
+/// unconditional `"g"` — see `scan_with_resolved_pattern`'s doc comment
+/// for why) is reached only by the bare form.
 #[cfg(feature = "regex")]
 fn builtin_splits_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     re_expr: &Expr,
-    flags: Option<&str>,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
@@ -8054,13 +8075,7 @@ fn builtin_splits_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Err(e) => return e.into(),
     };
 
-    // `splits` always operates in jq's "global" mode — see
-    // `scan_with_resolved_pattern`'s identical comment on why `g` is
-    // prepended before validation (confirmed live: `splits("a"; "z")`
-    // reports "gz is not a valid modifier string").
-    let global_flags = format!("g{}", flags.unwrap_or(""));
-
-    splits_with_resolved_pattern::<W>(&pattern, &global_flags, value, optional)
+    splits_with_resolved_pattern::<W>(&pattern, "g", value, optional)
 }
 
 /// The rest of `splits`'s work once the pattern string and already-
@@ -28535,6 +28550,18 @@ mod tests {
             r"[split(1; 2)?]",
             r"[splits(1; 2)?]",
         ] {
+            query!(br#""abc""#, filter,
+                QueryResult::Owned(OwnedValue::Array(vs)) => {
+                    assert!(vs.is_empty(), "filter: {filter}");
+                }
+            );
+        }
+
+        // `?` also still suppresses a non-string *pattern* value on the
+        // bare (no-flags-argument) forms — `builtin_scan_with_flags`/
+        // `builtin_splits_with_flags`/`builtin_gsub_with_flags`'s own
+        // pattern-eval blocks (`split` has no bare regex form to cover).
+        for filter in [r#"[gsub(1; "b")?]"#, r"[scan(1)?]", r"[splits(1)?]"] {
             query!(br#""abc""#, filter,
                 QueryResult::Owned(OwnedValue::Array(vs)) => {
                     assert!(vs.is_empty(), "filter: {filter}");
