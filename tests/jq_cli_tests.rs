@@ -7867,6 +7867,29 @@ fn test_resolve_node_getpath_multi_output_surfaces_real_error_not_a_fabricated_o
     Ok(())
 }
 
+/// #973 review round: `resolve_slice_expr`'s `target_branches =
+/// resolve_node::<S>(target, value, trackable)?` had the same bare-`?`
+/// bug #896's review already found and fixed in `resolve_index_expr`'s
+/// sibling target-resolution step — reachable only with a *dynamic* slice
+/// bound (`(0+1)`, not a literal), since a literal bound desugars into a
+/// static `Pipe` at parse time and never reaches this function at all
+/// (that literal-bound gap is a separate, unrelated bug in `resolve_seq`,
+/// filed as #977). Verified against jq 1.7.1: `echo '[10,20,30]' | jq -c
+/// 'path((select(true, error("t")))[(0+1):2])'` prints
+/// `[{"start":1,"end":2}]` (the already-produced `select` branch, sliced)
+/// before raising `t`.
+#[test]
+fn test_resolve_slice_expr_keeps_target_partial_fanout_before_its_own_error_973() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r#"path((select(true, error("t")))[(0+1):2])"#],
+        Some("[10,20,30]"),
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[{\"start\":1,\"end\":2}]\n");
+    assert!(stderr.contains('t'), "stderr: {stderr:?}");
+    Ok(())
+}
+
 #[test]
 fn test_walk_propagates_halt_from_f() -> Result<()> {
     // `walk_impl` applies `f` via `eval_owned_expr_fork` at every level
