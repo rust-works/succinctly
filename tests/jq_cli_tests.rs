@@ -8790,6 +8790,73 @@ fn test_strptime_day_zero_all_months_matches_march_underflow_fixed_968() -> Resu
     Ok(())
 }
 
+/// #971 (found reviewing #968): `%H`/`%M`/`%I` parsed up to 2 digits with
+/// no range check, unlike the now-fixed `%m`/`%d` -- confirmed live
+/// against the pinned jq oracle, out-of-range values for each error
+/// ("does not match format", exit 5) in real jq but were silently
+/// accepted here. `%S` deliberately stays permissive: `60` is a valid
+/// leap second and real jq accepts it too. `%I`'s 1-12 range wasn't
+/// named in #971's body (only `%H`/`%M` were), but the issue's own title
+/// says "hour/minute range" and `%I` is an hour specifier with the exact
+/// same gap -- confirmed live (`jq -n '"13" | strptime("%I")'` errors)
+/// and fixed alongside `%H` rather than filing a separate near-duplicate
+/// issue for it.
+#[test]
+fn test_strptime_hour_minute_out_of_range_errors_971() -> Result<()> {
+    for (fmt, input) in [
+        (r#"strptime("%H:%M:%S")"#, "\"99:99:99\""),
+        (r#"strptime("%H:%M:%S")"#, "\"24:00:00\""),
+        (r#"strptime("%H:%M:%S")"#, "\"00:60:00\""),
+        // %S: 61+ errors, even though 60 (leap second) is valid.
+        (r#"strptime("%H:%M:%S")"#, "\"23:59:61\""),
+        (r#"strptime("%H:%M:%S")"#, "\"23:59:99\""),
+        (r#"strptime("%I")"#, "\"13\""),
+        // %R/%T duplicate %H/%M/%S's own parsing, so they need the same
+        // range check independently -- confirmed live these leaked too.
+        (r#"strptime("%R")"#, "\"99:99\""),
+        (r#"strptime("%T")"#, "\"25:00:00\""),
+    ] {
+        let (stdout, _, code) = run_jq_full(&["-c", fmt], Some(input))?;
+        assert_eq!(code, 5, "fmt: {fmt}, input: {input}, stdout: {stdout:?}");
+    }
+
+    // Leap second: %S stays permissive up to (and including) 60, matching
+    // real jq.
+    let (stdout, _, code) = run_jq_full(&["-c", r#"strptime("%H:%M:%S")"#], Some("\"23:59:60\""))?;
+    assert_eq!(code, 0, "stdout: {stdout:?}");
+    assert_eq!(stdout.trim(), "[1970,0,1,23,59,60,4,0]");
+
+    // Boundary values stay valid, including %I's jq-accepted "00" (a real
+    // jq oracle divergence from the naive 1-12 range a first pass assumed).
+    for input in ["\"12\"", "\"01\"", "\"00\""] {
+        let (stdout, _, code) = run_jq_full(&["-c", r#"strptime("%I")"#], Some(input))?;
+        assert_eq!(code, 0, "input: {input}, stdout: {stdout:?}");
+    }
+    Ok(())
+}
+
+/// #971: a non-matching `%b`/`%B`/`%h` month name (e.g. `"xyz"`) left
+/// `month` at its prior/default value instead of erroring, silently
+/// masking malformed input as a valid (defaulted) date -- confirmed live
+/// against the pinned jq oracle, which rejects it ("does not match
+/// format", exit 5).
+#[test]
+fn test_strptime_unrecognized_month_name_errors_971() -> Result<()> {
+    for fmt in [
+        r#"strptime("%b")"#,
+        r#"strptime("%B")"#,
+        r#"strptime("%h")"#,
+    ] {
+        let (stdout, _, code) = run_jq_full(&["-c", fmt], Some("\"xyz\""))?;
+        assert_eq!(code, 5, "fmt: {fmt}, stdout: {stdout:?}");
+    }
+
+    let (stdout, _, code) = run_jq_full(&["-c", r#"strptime("%b")"#], Some("\"Jan\""))?;
+    assert_eq!(code, 0, "stdout: {stdout:?}");
+    assert_eq!(stdout.trim(), "[1970,0,1,0,0,0,4,0]");
+    Ok(())
+}
+
 /// `builtin_combinations_n`'s `n`-argument wildcard swallowed a halt the
 /// same way `nth`'s `n` argument used to. `combinations(n)` is a real jq
 /// builtin, but real jq's own `n` is bound via `as $n` and interacts with

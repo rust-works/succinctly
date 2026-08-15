@@ -18654,17 +18654,22 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<BrokenDownTime, String> {
                     day = parse_digits(&mut input_iter, 2)?;
                 }
                 Some('H') => {
-                    hour = parse_digits(&mut input_iter, 2)?;
+                    hour = check_clock_field(parse_digits(&mut input_iter, 2)?, 0..=23, "hour")?;
                 }
                 Some('I') => {
-                    hour = parse_digits(&mut input_iter, 2)?;
-                    // Will be adjusted by %p if present
+                    // 0 is valid (confirmed live: real jq accepts `%I`
+                    // "00"); will be adjusted by %p if present.
+                    hour = check_clock_field(parse_digits(&mut input_iter, 2)?, 0..=12, "hour")?;
                 }
                 Some('M') => {
-                    minute = parse_digits(&mut input_iter, 2)?;
+                    minute =
+                        check_clock_field(parse_digits(&mut input_iter, 2)?, 0..=59, "minute")?;
                 }
                 Some('S') => {
-                    second = parse_digits(&mut input_iter, 2)?;
+                    // Upper bound 60, not 59: a leap second is valid and
+                    // real jq accepts it (confirmed live, #971).
+                    second =
+                        check_clock_field(parse_digits(&mut input_iter, 2)?, 0..=60, "second")?;
                 }
                 Some('p' | 'P') => {
                     let mut ampm = String::new();
@@ -18727,11 +18732,17 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<BrokenDownTime, String> {
                         "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct",
                         "nov", "dec",
                     ];
-                    for (i, m) in months.iter().enumerate() {
-                        if name_lower.starts_with(m) {
-                            month = (i + 1) as i64;
-                            break;
-                        }
+                    // #971: a non-matching name (e.g. "xyz") previously left
+                    // `month` at its prior/default value instead of erroring,
+                    // silently masking malformed input as a valid date -
+                    // real jq rejects it ("does not match format").
+                    let matched = months
+                        .iter()
+                        .enumerate()
+                        .find_map(|(i, m)| name_lower.starts_with(m).then_some((i + 1) as i64));
+                    match matched {
+                        Some(m) => month = m,
+                        None => return Err(format!("unrecognized month name '{name}'")),
                     }
                 }
                 Some('C') => {
@@ -18765,23 +18776,26 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<BrokenDownTime, String> {
                 }
                 Some('R') => {
                     // HH:MM
-                    hour = parse_digits(&mut input_iter, 2)?;
+                    hour = check_clock_field(parse_digits(&mut input_iter, 2)?, 0..=23, "hour")?;
                     if input_iter.next() != Some(':') {
                         return Err("expected ':'".to_string());
                     }
-                    minute = parse_digits(&mut input_iter, 2)?;
+                    minute =
+                        check_clock_field(parse_digits(&mut input_iter, 2)?, 0..=59, "minute")?;
                 }
                 Some('T') => {
                     // HH:MM:SS
-                    hour = parse_digits(&mut input_iter, 2)?;
+                    hour = check_clock_field(parse_digits(&mut input_iter, 2)?, 0..=23, "hour")?;
                     if input_iter.next() != Some(':') {
                         return Err("expected ':'".to_string());
                     }
-                    minute = parse_digits(&mut input_iter, 2)?;
+                    minute =
+                        check_clock_field(parse_digits(&mut input_iter, 2)?, 0..=59, "minute")?;
                     if input_iter.next() != Some(':') {
                         return Err("expected ':'".to_string());
                     }
-                    second = parse_digits(&mut input_iter, 2)?;
+                    second =
+                        check_clock_field(parse_digits(&mut input_iter, 2)?, 0..=60, "second")?;
                 }
                 Some('n' | 't') => {
                     // Skip whitespace
@@ -18891,6 +18905,24 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<BrokenDownTime, String> {
         weekday,
         yearday,
     })
+}
+
+/// Validate a just-parsed clock field (`%H`/`%I`/`%M`/`%S`, and their
+/// composite `%R`/`%T` forms) against jq's accepted range for that field,
+/// so every specifier that sets the same `BrokenDownTime` member shares one
+/// bound instead of each call site re-deriving (and risking miscopying,
+/// #971) its own `!(...).contains(...)` check. `%S`'s upper bound is `60`
+/// (leap second), not `59` - confirmed live against the pinned jq oracle.
+fn check_clock_field(
+    value: i64,
+    range: core::ops::RangeInclusive<i64>,
+    field: &str,
+) -> Result<i64, String> {
+    if range.contains(&value) {
+        Ok(value)
+    } else {
+        Err(format!("{field} {value} out of range"))
+    }
 }
 
 /// Parse up to n digits from input
