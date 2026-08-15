@@ -161,6 +161,9 @@ gsub_flags_non_string	gsub("a"; "b"; 1)	"abc"	number (1) and string ("g") cannot
 scan_flags_non_string	scan("a"; 1)	"abc"	string ("g") and number (1) cannot be added
 split_flags_non_string	split("a"; 1)	"abc"	string ("g") and number (1) cannot be added
 splits_flags_non_string	splits("a"; 1)	"abc"	string ("g") and number (1) cannot be added
+test_arg_non_string_flagged	test(1; "")	"abc"	number (1) is not a string
+match_arg_non_string_flagged	match(1; "")	"abc"	number (1) is not a string
+capture_arg_non_string_flagged	capture(1; "")	"abc"	number (1) is not a string
 has_string_on_number	has("a")	1	Cannot check whether number has a string key
 has_string_on_array	has("a")	[1]	Cannot check whether array has a string key
 has_number_on_object	has(1)	{"a":1}	Cannot check whether object has a number key

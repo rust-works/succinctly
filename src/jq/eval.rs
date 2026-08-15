@@ -28177,6 +28177,57 @@ mod tests {
 
     #[cfg(feature = "regex")]
     #[test]
+    fn test_regex_pattern_error_wording_switches_on_flags_arity_937() {
+        // #937: test/match/capture's pattern-argument error wording depends
+        // on which arity was actually called, not just the pattern's own
+        // type — the bare 1-arg form says "<type> not a string or array"
+        // (#926), but the 2-arg form switches to "<v> is not a string" even
+        // when the flags value itself is fine (a valid, empty, or `null`
+        // flags string). `sub` has no such split — its bare-vs-flagged
+        // wording is identical in real jq, so #926 already gave it
+        // `is_not_a_string` unconditionally and this fix doesn't touch it.
+        // Every case verified live against jq 1.7.1.
+
+        // Bare form: unchanged from #926 (not_string_or_array, no preview).
+        for filter in [r"test(1)", r"match(1)", r"capture(1)"] {
+            query!(br#""x""#, filter,
+                QueryResult::Error(e) => {
+                    assert_eq!(e.message, "number not a string or array", "filter: {filter}");
+                }
+            );
+        }
+
+        // Flagged form with a *valid* flags value still switches wording —
+        // it's the arity, not the flags value's own validity, that matters.
+        for filter in [
+            r#"test(1; "")"#,
+            r#"match(1; "")"#,
+            r#"capture(1; "")"#,
+            r"test(1; null)",
+            r"match(1; null)",
+            r"capture(1; null)",
+        ] {
+            query!(br#""x""#, filter,
+                QueryResult::Error(e) => {
+                    assert_eq!(e.message, "number (1) is not a string", "filter: {filter}");
+                }
+            );
+        }
+
+        // Flagged form where *both* arguments are invalid: the pattern's
+        // error still wins (matches #928's pattern-before-flags order), now
+        // with the flagged-form wording rather than the bare one.
+        for filter in [r"test(1; 2)", r"match(1; 2)", r"capture(1; 2)"] {
+            query!(br#""x""#, filter,
+                QueryResult::Error(e) => {
+                    assert_eq!(e.message, "number (1) is not a string", "filter: {filter}");
+                }
+            );
+        }
+    }
+
+    #[cfg(feature = "regex")]
+    #[test]
     fn test_regex_test_match_capture_sub_evaluate_pattern_before_flags_928() {
         // #928 (review follow-up): test/match/capture/sub must evaluate the
         // *pattern* argument before the *flags* argument, matching jq. A

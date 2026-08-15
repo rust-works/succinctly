@@ -34,7 +34,9 @@ const KNOWN_DIVERGENCES: &str = include_str!("data/jq-error-known-divergences.tx
 /// is about. `test`'s bare/pattern-argument form has a non-regex substring-
 /// match fallback that reproduces jq's wording on both build configs, so
 /// `test_arg_non_string` needs no entry here — but that fallback doesn't
-/// support a flags argument at all, so `test_flags_non_string` still does.
+/// support a flags argument at all, so `test_flags_non_string` (and, by the
+/// same reasoning, `test`'s *flagged* pattern-error probe,
+/// `test_arg_non_string_flagged`) still does.
 #[cfg(feature = "regex")]
 const FEATURE_GATED: &[&str] = &[];
 #[cfg(not(feature = "regex"))]
@@ -60,6 +62,9 @@ const FEATURE_GATED: &[&str] = &[
     "scan_flags_non_string",
     "split_flags_non_string",
     "splits_flags_non_string",
+    "test_arg_non_string_flagged",
+    "match_arg_non_string_flagged",
+    "capture_arg_non_string_flagged",
 ];
 
 struct Probe {
