@@ -85,6 +85,20 @@ pub fn format_number_jq_compat(raw: &[u8]) -> String {
     let exp_pos = s.find(['e', 'E']).expect("has_exp guarantees e/E present");
     let exp: i32 = s[exp_pos + 1..].parse().unwrap_or(0);
 
+    // A literal whose magnitude overflows f64 (e.g. `1e400`) parses to
+    // +/-infinity, not a parse error - `value` above is non-finite in that
+    // case. The normalized-scientific-notation branch below renormalizes via
+    // `log10`/`pow` on `value`, which on an infinite input produces garbage
+    // (`log10(inf).floor() as i32` saturates to `i32::MAX`, and dividing by
+    // `10^i32::MAX` yields `NaN`) rather than erroring - so it must be
+    // special-cased here, before that branch ever runs. Every existing
+    // caller already guards non-finite `NumberLiteral`s before reaching this
+    // function (see #930), so this exists purely to make the function
+    // correct for a caller that stops doing that.
+    if !value.is_finite() {
+        return format_overflow_literal_mantissa(s, exp_pos, exp);
+    }
+
     // For e0 or e-0, jq eliminates the exponent
     if exp == 0 {
         // Check if result is integer
@@ -118,6 +132,57 @@ pub fn format_number_jq_compat(raw: &[u8]) -> String {
     let mantissa_str = format_mantissa_jq(normalized_mantissa);
 
     let sign = if value < 0.0 { "-" } else { "" };
+    let exp_sign = if new_exp >= 0 { "+" } else { "" };
+    format!("{sign}{mantissa_str}E{exp_sign}{new_exp}")
+}
+
+/// Renormalize an overflowed literal's own mantissa digits into jq's
+/// one-digit-before-the-point scientific form, entirely via string
+/// manipulation on `s` rather than the finite path's `log10`/`pow` on the
+/// (here, non-finite) parsed value -- see the call site above for why. `s`
+/// is the full literal text, `exp_pos` the byte index of its `e`/`E`, and
+/// `exp` its already-parsed exponent.
+///
+/// Oracle-verified against real jq (issue #930): `1e400` -> `1E+400`,
+/// `123e400` -> `1.23E+402`, `12.34e400` -> `1.234E+401`, `0.5e400` ->
+/// `5E+399`, `100e400` -> `1.00E+402` (trailing zeros preserved, matching
+/// this module's general trailing-zero rule).
+fn format_overflow_literal_mantissa(s: &str, exp_pos: usize, exp: i32) -> String {
+    let mantissa = &s[..exp_pos];
+    let (sign, mantissa) = match mantissa.strip_prefix('-') {
+        Some(rest) => ("-", rest),
+        None => ("", mantissa),
+    };
+    let (int_part, frac_part) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+
+    let (shift, leading, rest): (i64, &str, String) = if int_part == "0" {
+        // Mantissa < 1 (e.g. `0.5e400`): shift right to the first nonzero
+        // fractional digit.
+        match frac_part.find(|c: char| c != '0') {
+            Some(k) => (
+                -(i64::try_from(k).unwrap_or(0) + 1),
+                &frac_part[k..=k],
+                frac_part[k + 1..].to_string(),
+            ),
+            // An all-zero mantissa (`0.0e400`) parses to a finite `0.0` and
+            // never reaches this function; kept as an inert fallback.
+            None => (0, "0", String::new()),
+        }
+    } else {
+        // Mantissa >= 1: shift left past every extra integer-part digit.
+        (
+            i64::try_from(int_part.len().saturating_sub(1)).unwrap_or(0),
+            &int_part[..1],
+            format!("{}{}", &int_part[1..], frac_part),
+        )
+    };
+
+    let new_exp = i64::from(exp) + shift;
+    let mantissa_str = if rest.is_empty() {
+        leading.to_string()
+    } else {
+        format!("{leading}.{rest}")
+    };
     let exp_sign = if new_exp >= 0 { "+" } else { "" };
     format!("{sign}{mantissa_str}E{exp_sign}{new_exp}")
 }
@@ -555,6 +620,28 @@ fn overflow_literal(f: f64) -> &'static str {
         "-1e999"
     } else {
         "1e999"
+    }
+}
+
+/// The exact text real jq's error-message value previews use for an
+/// infinite `f64` reached via computation (the `infinite`/`-infinite`
+/// builtins, an arithmetic overflow, or any other value with no source
+/// literal text of its own to echo) -- `DBL_MAX`'s shortest round-trip
+/// decimal representation, per jq's `jv` (issue #930). Unlike
+/// [`overflow_literal`] above, this is for display, not round-tripping, so
+/// it uses jq's real number text rather than a smuggling sentinel.
+///
+/// Hardcoded rather than derived: `DBL_MAX` is a fixed constant, so its
+/// shortest round-trip text never changes, and computing it via the
+/// `log10`/`pow`-based path the finite branch of
+/// [`format_number_jq_compat`] uses would hit the exact `NaN`-mantissa
+/// failure that path only avoids by never being called on a non-finite
+/// input in the first place.
+pub(crate) fn infinite_float_preview_text(negative: bool) -> &'static str {
+    if negative {
+        "-1.7976931348623157e+308"
+    } else {
+        "1.7976931348623157e+308"
     }
 }
 
@@ -1350,5 +1437,36 @@ mod tests {
         // format_decimal_jq's integer fast path rather than its precision loop.
         assert_eq!(format_number_jq_compat(b"100e-2"), "1");
         assert_eq!(format_number_jq_compat(b"-100e-2"), "-1");
+    }
+
+    /// #930: a literal whose magnitude overflows f64 (e.g. `1e400`) used to
+    /// route into the finite path's `log10`/`pow` renormalization, producing
+    /// garbage (`"NaNE+2147483647"`) since that path needs a finite value to
+    /// renormalize. Every case here is oracle-verified against real jq
+    /// 1.7.1's `describe()`-equivalent value preview (`try (. + "s") catch
+    /// .` on the given literal as JSON input, which reaches the value
+    /// through `keys`/`.[]`-style operations that don't lose `NumberLiteral`
+    /// status the way arithmetic does).
+    #[test]
+    fn test_format_number_jq_compat_overflow_literal_matches_jq_1_7_1() {
+        assert_eq!(format_number_jq_compat(b"1e400"), "1E+400");
+        assert_eq!(format_number_jq_compat(b"-1e400"), "-1E+400");
+        assert_eq!(format_number_jq_compat(b"123e400"), "1.23E+402");
+        assert_eq!(format_number_jq_compat(b"12.34e400"), "1.234E+401");
+        assert_eq!(format_number_jq_compat(b"0.5e400"), "5E+399");
+        assert_eq!(format_number_jq_compat(b"100e400"), "1.00E+402");
+        assert_eq!(format_number_jq_compat(b"9.999e400"), "9.999E+400");
+        assert_eq!(format_number_jq_compat(b"1E400"), "1E+400");
+    }
+
+    /// #930: a no-exponent overflow literal (e.g. a 400-digit plain integer)
+    /// takes the function's pre-existing "no exponent -> output as-is" early
+    /// return (before `value.parse()` is ever consulted), so it was already
+    /// correct - jq itself doesn't reformat these into scientific notation
+    /// either, it just echoes the digits (oracle-verified).
+    #[test]
+    fn test_format_number_jq_compat_overflow_no_exponent_is_unaffected() {
+        let digits = "9".repeat(400);
+        assert_eq!(format_number_jq_compat(digits.as_bytes()), digits);
     }
 }
