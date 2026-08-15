@@ -1836,6 +1836,24 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         self.frame_gap_reaches(indent, NodeType::Mapping, NodeType::Mapping, false, false)
     }
 
+    /// Check-and-error wrapper around [`Self::mapping_under_mapping_gap_reaches`]:
+    /// every call site raises the identical `InconsistentIndentation` error
+    /// when the gap is reached, so this gives that pairing one definition
+    /// instead of each site re-deriving it (#106's "duplicated predicates
+    /// diverge silently" lesson) — the same check-and-error, `?`-friendly
+    /// shape [`Self::reject_trailing_flow_content`] already uses for an
+    /// unrelated check in this file.
+    fn check_mapping_under_mapping_gap(&self, indent: usize) -> Result<(), YamlError> {
+        if self.mapping_under_mapping_gap_reaches(indent) {
+            Err(YamlError::InconsistentIndentation {
+                offset: self.pos,
+                line: self.current_line(),
+            })
+        } else {
+            Ok(())
+        }
+    }
+
     /// Whether a `-` sequence-item line's `indent` falls in the *lower*
     /// portion of the gap [`Self::compact_mapping_gap_reaches`] detects
     /// (#900) -- deliberately **excluding** the upper bound (`indent`
@@ -2329,12 +2347,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         // silently misattributing it. Checked before the #885 normalization
         // below since the two shapes are mutually exclusive on the parent
         // frame's type (SequenceItem vs. Mapping).
-        if self.mapping_under_mapping_gap_reaches(indent) {
-            return Err(YamlError::InconsistentIndentation {
-                offset: self.pos,
-                line: self.current_line(),
-            });
-        }
+        self.check_mapping_under_mapping_gap(indent)?;
 
         // Normalize an inconsistently-indented continuation of an open
         // compact mapping to the mapping's own indent, so the
@@ -2683,12 +2696,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     /// The key can be any value: scalar, sequence, or mapping.
     fn parse_explicit_key(&mut self, indent: usize) -> Result<(), YamlError> {
         // Same ambiguous-gap error as parse_mapping_entry (#901).
-        if self.mapping_under_mapping_gap_reaches(indent) {
-            return Err(YamlError::InconsistentIndentation {
-                offset: self.pos,
-                line: self.current_line(),
-            });
-        }
+        self.check_mapping_under_mapping_gap(indent)?;
 
         // Same gap-tolerant normalization as parse_mapping_entry (#885):
         // this function has the identical close/need-new-mapping shape.
@@ -2917,12 +2925,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     /// Parse an explicit value (`: value` after explicit key).
     fn parse_explicit_value(&mut self, indent: usize) -> Result<(), YamlError> {
         // Same ambiguous-gap error as parse_mapping_entry (#901).
-        if self.mapping_under_mapping_gap_reaches(indent) {
-            return Err(YamlError::InconsistentIndentation {
-                offset: self.pos,
-                line: self.current_line(),
-            });
-        }
+        self.check_mapping_under_mapping_gap(indent)?;
 
         // Same gap-tolerant normalization as parse_mapping_entry (#885): an
         // inconsistently-indented `:` must not close the pending key's own
@@ -4981,6 +4984,13 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         // Check what kind of content this is
         match self.peek() {
             Some(b'-') if Self::is_ws_break_or_eoi(self.peek_at(1)) => {
+                // Same ambiguous-gap error as parse_mapping_entry (#901,
+                // #959) - a sequence item has no unambiguous owner here
+                // either, distinct from #900's SequenceItem-under-Mapping
+                // tolerance (`sequence_item_gap_reaches`), which
+                // `parse_sequence_item` still applies below this check for
+                // its own, different gap shape.
+                self.check_mapping_under_mapping_gap(indent)?;
                 self.parse_sequence_item(indent)?;
             }
             // Tab included in both arms below: the sibling `-` arm just above
@@ -5011,6 +5021,8 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             }
             Some(b'{' | b'[') => {
                 // Flow mapping or sequence at document root
+                // Same ambiguous-gap error as parse_mapping_entry (#901, #959).
+                self.check_mapping_under_mapping_gap(indent)?;
                 self.close_deeper_indents(indent);
                 self.parse_value(indent)?;
             }
@@ -5036,6 +5048,8 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                     // preempted by an unconditional close running first.
                     self.parse_mapping_entry(indent)?;
                 } else {
+                    // Same ambiguous-gap error as parse_mapping_entry (#901, #959).
+                    self.check_mapping_under_mapping_gap(indent)?;
                     self.close_deeper_indents(indent);
                     // Consume any leading `&anchor` and/or `!tag`, in either
                     // order, for non-mapping-key cases
@@ -5093,6 +5107,8 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                     // Alias is a key - let parse_mapping_entry handle it
                     self.parse_mapping_entry(indent)?;
                 } else {
+                    // Same ambiguous-gap error as parse_mapping_entry (#901, #959).
+                    self.check_mapping_under_mapping_gap(indent)?;
                     // Standalone alias value
                     self.close_deeper_indents(indent);
                     self.parse_alias()?;
@@ -5104,6 +5120,10 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 if self.looks_like_mapping_entry() {
                     self.parse_mapping_entry(indent)?;
                 } else {
+                    // Same ambiguous-gap error as parse_mapping_entry (#901,
+                    // #959) - the original repro this issue was filed
+                    // against.
+                    self.check_mapping_under_mapping_gap(indent)?;
                     // Scalar value - either bare document scalar or value in a container
                     self.close_deeper_indents(indent);
                     self.set_ib();
