@@ -5007,14 +5007,20 @@ fn quote_csv_field(s: &str) -> String {
 fn format_csv(value: &OwnedValue, optional: bool) -> Result<String, EvalError> {
     match value {
         OwnedValue::Array(arr) => {
-            let parts: Vec<String> = arr
+            let parts = arr
                 .iter()
                 .map(|v| match v {
-                    OwnedValue::String(s) => quote_csv_field(s),
-                    OwnedValue::Null => String::new(),
-                    other => owned_to_string(other),
+                    OwnedValue::String(s) => Ok(quote_csv_field(s)),
+                    OwnedValue::Null => Ok(String::new()),
+                    // #991: a nested array/object element must reject the
+                    // whole row, not stringify itself in - confirmed live:
+                    // `[[1,2]] | @csv` errors in jq 1.7.1.
+                    OwnedValue::Array(_) | OwnedValue::Object(_) => {
+                        Err(EvalError::not_valid_in_csv_row(v))
+                    }
+                    other => Ok(owned_to_string(other)),
                 })
-                .collect();
+                .collect::<Result<Vec<String>, EvalError>>()?;
             Ok(parts.join(","))
         }
         _ if optional => Ok(String::new()),
@@ -5028,18 +5034,24 @@ fn format_csv(value: &OwnedValue, optional: bool) -> Result<String, EvalError> {
 fn format_tsv(value: &OwnedValue, optional: bool) -> Result<String, EvalError> {
     match value {
         OwnedValue::Array(arr) => {
-            let parts: Vec<String> = arr
+            let parts = arr
                 .iter()
                 .map(|v| match v {
-                    OwnedValue::String(s) => s
+                    OwnedValue::String(s) => Ok(s
                         .replace('\\', "\\\\")
                         .replace('\t', "\\t")
                         .replace('\n', "\\n")
-                        .replace('\r', "\\r"),
-                    OwnedValue::Null => String::new(),
-                    other => owned_to_string(other),
+                        .replace('\r', "\\r")),
+                    OwnedValue::Null => Ok(String::new()),
+                    // #991: same row-level rejection as @csv above - jq's
+                    // own error wording says "csv row" even here (confirmed
+                    // live, not a succinctly bug).
+                    OwnedValue::Array(_) | OwnedValue::Object(_) => {
+                        Err(EvalError::not_valid_in_csv_row(v))
+                    }
+                    other => Ok(owned_to_string(other)),
                 })
-                .collect();
+                .collect::<Result<Vec<String>, EvalError>>()?;
             Ok(parts.join("\t"))
         }
         _ if optional => Ok(String::new()),
@@ -5053,14 +5065,20 @@ fn format_tsv(value: &OwnedValue, optional: bool) -> Result<String, EvalError> {
 fn format_dsv(value: &OwnedValue, delimiter: &str, optional: bool) -> Result<String, EvalError> {
     match value {
         OwnedValue::Array(arr) => {
-            let parts: Vec<String> = arr
+            let parts = arr
                 .iter()
                 .map(|v| match v {
-                    OwnedValue::String(s) => quote_csv_field(s),
-                    OwnedValue::Null => String::new(),
-                    other => owned_to_string(other),
+                    OwnedValue::String(s) => Ok(quote_csv_field(s)),
+                    OwnedValue::Null => Ok(String::new()),
+                    // #991: @dsv is documented as CSV-compatible
+                    // (`@dsv(",")` == `@csv`), so it shares @csv's row
+                    // rejection for a nested array/object element too.
+                    OwnedValue::Array(_) | OwnedValue::Object(_) => {
+                        Err(EvalError::not_valid_in_csv_row(v))
+                    }
+                    other => Ok(owned_to_string(other)),
                 })
-                .collect();
+                .collect::<Result<Vec<String>, EvalError>>()?;
             Ok(parts.join(delimiter))
         }
         _ if optional => Ok(String::new()),

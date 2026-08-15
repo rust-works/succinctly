@@ -550,6 +550,18 @@ impl EvalError {
         Self::new(format!("{} can not be escaped for shell", describe(value)))
     }
 
+    /// `<type> (<value>) is not valid in a csv row` (#991).
+    ///
+    /// Raised by `@csv`/`@tsv`/`@dsv` for a row containing a nested array or
+    /// object element, instead of silently stringifying it -- confirmed live
+    /// against jq 1.7.1: `[[1,2]] | @csv` is `"array ([1,2]) is not valid in
+    /// a csv row"`. `@tsv` reports the identical "csv row" wording rather
+    /// than "tsv row" -- a real jq wording quirk (also confirmed live), not
+    /// a succinctly bug reproduced here.
+    pub fn not_valid_in_csv_row(value: &OwnedValue) -> Self {
+        Self::new(format!("{} is not valid in a csv row", describe(value)))
+    }
+
     /// `Invalid path expression with result <value>` (#530).
     ///
     /// Raised by `path()` when the filter it was given is not a path
