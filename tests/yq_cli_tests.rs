@@ -1251,8 +1251,10 @@ fn test_json_input_never_preserves_literal_spelling_978() -> Result<()> {
 /// call site. The M2 fast-path gates initially missed this (caught by
 /// code review): a bare `succinctly yq '.' file.json` -- arguably the
 /// more common way to hit this than typing the explicit flag -- still
-/// leaked. Fixed via `any_input_is_json`, which resolves every input
-/// file's format up front instead of trusting the raw flag alone.
+/// leaked. Fixed by resolving each input source's own format via
+/// `resolve_input_format` before deciding whether to call
+/// `YamlIndex::mark_json_sourced` on it (#996), rather than trusting the
+/// raw flag alone.
 #[test]
 fn test_json_extension_auto_detected_file_never_preserves_literal_spelling_978() -> Result<()> {
     let mut input_file = NamedTempFile::with_suffix(".json")?;
@@ -1276,23 +1278,86 @@ fn test_json_extension_auto_detected_file_never_preserves_literal_spelling_978()
     Ok(())
 }
 
-/// #996 (known limitation, tracked separately -- not fixed here): routing
-/// JSON input through the DOM path to canonicalize its numbers (#978)
-/// loses M2 streaming's incidental duplicate-key preservation, since
-/// `OwnedValue::Object` is `IndexMap`-backed and can only keep the last
-/// value for a repeated key. Real yq preserves `{"a":1,"a":2}` unchanged
-/// (confirmed live); this pins the current, documented gap so a future
-/// change doesn't silently make it worse without anyone noticing --
-/// flip this assertion to the correct behavior once #996 is fixed.
+/// #996: JSON input's M2 streaming eligibility was restored (`YamlIndex`
+/// parses JSON's flow-mapping syntax fine, and `stream_resolved_scalar_as_json`/
+/// `stream_yaml_string_value`/`stream_yaml_as_document` now canonicalize a
+/// JSON-sourced float the way the DOM path's `canonicalize_json_numbers`
+/// already did, restoring #978's fix without the DOM-fallback trade-off),
+/// so M2's incidental duplicate-key preservation (it never materializes an
+/// `IndexMap` at all) now applies to JSON input too. Real yq preserves
+/// `{"a":1,"a":2}` unchanged (confirmed live, yq v4.53.3); this used to
+/// pin the opposite (collapsed) behavior as a documented, known gap --
+/// flipped to the fixed behavior.
 #[test]
-fn test_json_input_duplicate_keys_collapse_known_limitation_996() -> Result<()> {
+fn test_json_input_duplicate_keys_preserved_996() -> Result<()> {
     let (out, code) = run_yq_stdin(
         ".",
         "{\"a\":1,\"a\":2}",
         &["--input-format", "json", "-o", "json", "-I", "0"],
     )?;
     assert_eq!(code, 0, "out: {out:?}");
-    assert_eq!(out.trim(), "{\"a\":2}");
+    assert_eq!(out.trim(), "{\"a\":1,\"a\":2}");
+    Ok(())
+}
+
+/// #996 regression: a genuinely quoted JSON *string* that merely looks
+/// numeric (`"1.50"`, `"1e2"`) must never be reinterpreted as a bare
+/// float -- #996's own first attempt at the root-scalar shortcut in
+/// `stream_yaml_as_document` did exactly that (missing the same
+/// `is_unquoted()` gate its sibling call sites had), silently corrupting
+/// the value's *type*, not just its spelling. Confirmed live against real
+/// yq (v4.53.3), which preserves both unchanged.
+///
+/// Exercises several distinct M2-reachable shapes per the `testing`
+/// skill's "assert call sites agree with each other" guidance -- each
+/// routes through a different function this PR touches: a bare navigated
+/// scalar result (`stream_yaml_as_document`'s shortcut, the one that was
+/// actually broken), a value nested under an object (`stream_yaml_value`
+/// -> `stream_yaml_string_value`), and JSON-target output of the same
+/// (`stream_json_value` -> `stream_yaml_scalar_as_json`, which was always
+/// correctly gated).
+#[test]
+fn test_json_input_quoted_numeric_looking_string_not_corrupted_996() -> Result<()> {
+    // Bare navigated scalar result -- YAML output (the shape that shipped
+    // broken).
+    let (out, code) = run_yq_stdin(".b", "{\"b\": \"1.50\"}", &["--input-format", "json"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "1.50");
+
+    let (out, code) = run_yq_stdin(".b", "{\"b\": \"1e2\"}", &["--input-format", "json"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "1e2");
+
+    // Nested under an object -- YAML output. Asserts the *value* survives
+    // quoted and uncorrupted, not the exact block-vs-flow structural
+    // spelling: M2 preserves JSON's own flow-mapping syntax here (a
+    // separate, pre-existing, out-of-#996's-scope divergence from real
+    // yq, which forces block style for JSON input regardless of source
+    // style -- unrelated to this regression).
+    let (out, code) = run_yq_stdin(
+        ".",
+        "{\"nested\": {\"b\": \"1.50\"}}",
+        &["--input-format", "json", "-I", "0"],
+    )?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert!(
+        out.contains("\"1.50\""),
+        "expected the quoted string preserved verbatim, got: {out:?}"
+    );
+    assert!(
+        !out.contains("1.5\n") && !out.contains(": 1.5"),
+        "value must not have been corrupted into a bare float, got: {out:?}"
+    );
+
+    // Bare navigated scalar result -- JSON output.
+    let (out, code) = run_yq_stdin(
+        ".b",
+        "{\"b\": \"1.50\"}",
+        &["--input-format", "json", "-o", "json"],
+    )?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "\"1.50\"");
+
     Ok(())
 }
 
@@ -11180,26 +11245,73 @@ fn test_isvalid_has_yq_type_mismatch_is_valid_917() -> Result<()> {
     Ok(())
 }
 
-/// #998: `yq --input-format json` routes JSON input through the DOM path
-/// (`eval_generic::to_owned`/`generic_to_owned`, per #978/#994), which now
-/// carries its own recursion-depth guard -- confirmed live before this fix,
-/// `succinctly yq --input-format json '.'` on a 200,000-level-deep document
-/// aborted with a raw stack overflow (SIGABRT, exit 134). The guard panics
-/// cleanly instead (exit 101, not a controlled `anyhow` error like the jq
-/// CLI's own `print_json` guard gets -- `to_owned` sits too deep in the
-/// evaluator's hot path for a `Result`-based fix without a much larger
-/// signature change, see the PR discussion), which is still strictly better
-/// than an uncontrolled stack overflow: a raw stack overflow is undefined
-/// behavior, a panic is not.
+/// #998: `yq --input-format json` on adversarially deep input must never
+/// raw stack-overflow (confirmed live before #998, `succinctly yq
+/// --input-format json '.'` on a 200,000-level-deep document aborted with
+/// SIGABRT, exit 134) -- some guard must reject it cleanly.
+///
+/// #996 changed *which* guard fires first for the common (M2-eligible)
+/// case: JSON input's M2 streaming eligibility was restored by parsing it
+/// through `YamlIndex::build` (JSON is a syntactic subset of YAML's flow
+/// grammar), which carries its own unconditional parse-time depth-128
+/// guard (`yaml/parser.rs`) -- tighter than, and reached before, #998's
+/// own `eval_generic::to_owned` conversion-time 256 guard, and a clean
+/// `anyhow` parse error (exit 1) rather than a panic (exit 101). This is
+/// strictly safer (caught earlier, no panic) and closer to real jq/yq's
+/// own ~128 parse-time limit than the 256 guard was. #998's own guard is
+/// unchanged and still reachable -- see the companion test below for the
+/// DOM-forced path (`-P`), which never goes through `YamlIndex` at all.
 #[test]
-fn test_json_input_rejects_adversarial_nesting_998() -> Result<()> {
+fn test_json_input_rejects_adversarial_nesting_via_m2_path_996() -> Result<()> {
     let depth = 500;
     let input = format!("{}1{}", "[".repeat(depth), "]".repeat(depth));
     let (_stdout, stderr, code) =
         run_yq_stdin_with_stderr(".", &input, &["--input-format", "json"])?;
+    assert_eq!(code, 1, "stderr: {stderr:?}");
+    assert!(
+        stderr.contains("nesting depth exceeds limit of 128"),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
+/// Companion to the above: `-P` forces the DOM path (pretty-print isn't
+/// implemented by the M2 streamers), which parses JSON input through
+/// `JsonIndex::build` (no parse-time depth guard of its own) rather than
+/// `YamlIndex::build` -- #998's own `eval_generic::to_owned`
+/// conversion-time 256 guard is the one that fires here, unchanged by
+/// #996, confirming it's still live and not dead code now that the
+/// YAML-parser guard catches the M2-eligible case earlier.
+#[test]
+fn test_json_input_rejects_adversarial_nesting_via_dom_path_998() -> Result<()> {
+    let depth = 500;
+    let input = format!("{}1{}", "[".repeat(depth), "]".repeat(depth));
+    let (_stdout, stderr, code) =
+        run_yq_stdin_with_stderr(".", &input, &["--input-format", "json", "-P"])?;
     assert_eq!(code, 101, "stderr: {stderr:?}");
     assert!(
         stderr.contains("nesting depth exceeds limit of 256"),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
+/// #996's `can_slurp_fast_path` also dropped its own `!any_input_is_json`
+/// gate, so `--slurp`'s default (YAML) output now routes adversarially
+/// deep JSON input through `YamlIndex::build`'s parse-time depth-128
+/// guard too, same as identity above -- pinned separately since
+/// `can_slurp_fast_path`/`is_m2_streamable` are independent gates with
+/// their own call sites, not a shared code path that the identity test
+/// above would also exercise.
+#[test]
+fn test_json_input_rejects_adversarial_nesting_via_slurp_996() -> Result<()> {
+    let depth = 500;
+    let input = format!("{}1{}", "[".repeat(depth), "]".repeat(depth));
+    let (_stdout, stderr, code) =
+        run_yq_stdin_with_stderr(".", &input, &["--input-format", "json", "--slurp"])?;
+    assert_eq!(code, 1, "stderr: {stderr:?}");
+    assert!(
+        stderr.contains("nesting depth exceeds limit of 128"),
         "stderr: {stderr:?}"
     );
     Ok(())
