@@ -738,7 +738,7 @@ impl OwnedValue {
     /// entirely: no adversarial document is involved, only enough loop
     /// iterations to grow the accumulator past the limit.
     pub fn to_json(&self) -> String {
-        self.to_json_at_depth(0, format_number_jq_compat)
+        self.to_json_at_depth(0, format_number_jq_compat, |f| f.to_string())
     }
 
     /// The yq-mode sibling of [`to_json`](Self::to_json) (#1030): identical
@@ -750,17 +750,38 @@ impl OwnedValue {
     /// interpolation's container arm (`owned_to_string`), both of which need
     /// this same literal-preserving JSON text, not [`to_json`](Self::to_json)'s
     /// jq-normalized one.
+    ///
+    /// Also keeps a whole-number `Float`'s decimal point (`format_float_with_fraction`,
+    /// #953) -- unlike jq, which happily prints `1.0` as `1` in JSON (matching
+    /// real jq's own `tojson`), yq must not: `1.0` and `1` are different YAML
+    /// types, and dropping the point on a round trip changes it (#169's own
+    /// reasoning, reused here for the same class of value reached from a
+    /// different path -- an i64-overflow decimal integer scalar, which
+    /// `resolve_plain` also classifies as `!!float`, confirmed live against
+    /// the pinned oracle: real yq's `-o json` gives `100...0.0`, not
+    /// `100...0`).
     pub(crate) fn to_json_yq(&self) -> String {
-        self.to_json_at_depth(0, crate::jq::stream::real_output_finite_literal)
+        self.to_json_at_depth(
+            0,
+            crate::jq::stream::real_output_finite_literal,
+            crate::yaml::format_float_with_fraction,
+        )
     }
 
-    /// `finite_literal` formats a `NumberLiteral`'s source text -- jq's
-    /// [`format_number_jq_compat`] for [`to_json`](Self::to_json), or a
-    /// verbatim echo for [`to_json_yq`](Self::to_json_yq) -- mirroring the
-    /// same fork [`stream::stream_owned_value_json_with`](crate::jq::stream)
-    /// already threads through for the M2 streaming path (#1008), so this
-    /// doesn't grow a third hand-copied "echo verbatim for yq" branch.
-    fn to_json_at_depth(&self, depth: usize, finite_literal: fn(&[u8]) -> String) -> String {
+    /// `finite_literal` formats a `NumberLiteral`'s source text, and
+    /// `float_fmt` a plain `Float`'s -- jq's [`format_number_jq_compat`]/bare
+    /// `Display` for [`to_json`](Self::to_json), or a verbatim echo/
+    /// decimal-point-preserving format for [`to_json_yq`](Self::to_json_yq)
+    /// -- mirroring the same fork
+    /// [`stream::stream_owned_value_json_with`](crate::jq::stream) already
+    /// threads through for the M2 streaming path (#1008), so this doesn't
+    /// grow a third hand-copied jq/yq-formatting branch.
+    fn to_json_at_depth(
+        &self,
+        depth: usize,
+        finite_literal: fn(&[u8]) -> String,
+        float_fmt: fn(f64) -> String,
+    ) -> String {
         assert_value_tree_depth(depth);
         match self {
             Self::Null => "null".into(),
@@ -771,7 +792,7 @@ impl OwnedValue {
                 if f.is_nan() || f.is_infinite() {
                     "null".into() // JSON doesn't support NaN or Infinity
                 } else {
-                    format!("{f}")
+                    float_fmt(*f)
                 }
             }
             Self::NumberLiteral(NumberRepr::Float(f), _) if f.is_nan() || f.is_infinite() => {
@@ -782,7 +803,7 @@ impl OwnedValue {
             Self::Array(arr) => {
                 let elements: Vec<String> = arr
                     .iter()
-                    .map(|v| v.to_json_at_depth(depth + 1, finite_literal))
+                    .map(|v| v.to_json_at_depth(depth + 1, finite_literal, float_fmt))
                     .collect();
                 format!("[{}]", elements.join(","))
             }
@@ -793,7 +814,7 @@ impl OwnedValue {
                         format!(
                             "\"{}\":{}",
                             escape_json_body(write_json_body_jq, k),
-                            v.to_json_at_depth(depth + 1, finite_literal)
+                            v.to_json_at_depth(depth + 1, finite_literal, float_fmt)
                         )
                     })
                     .collect();
@@ -901,7 +922,28 @@ impl OwnedValue {
                     .collect();
                 format!("{{{}}}", entries.join(","))
             }
-            other => other.to_json_at_depth(depth, format_number_jq_compat),
+            // `format_float_with_fraction`, not `|f| f.to_string()`: this
+            // bridge is *not* purely internal for every caller — for any
+            // `Expr` shape `eval_generic.rs` has no native cursor arm for
+            // (`[...]`, `with_entries`, ...), it's the actual conversion
+            // path from a YAML cursor's plain (non-`NumberLiteral`) `Float`
+            // through to the final JSON reparse `format_json_impl`/
+            // `to_json_yq` echo unchanged (#953: `.a` alone streams
+            // correctly, but `[.a]` round-trips an overflowed-`i64` scalar
+            // through here, and a bare `f.to_string()` silently drops the
+            // decimal point real yq always keeps on a float). Reparsing
+            // `100000000000000000000.0` yields the identical `f64` as
+            // `100000000000000000000` would, so this is a no-op for the
+            // round-trip's own correctness -- and jq mode's own final
+            // formatter (`format_number_jq_compat`, via `to_json`/
+            // `number_str`) re-normalizes away the added `.0` after
+            // reparsing regardless, so jq-mode output is unaffected (same
+            // reasoning already verified for the `NumberLiteral` arm above).
+            other => other.to_json_at_depth(
+                depth,
+                format_number_jq_compat,
+                crate::yaml::format_float_with_fraction,
+            ),
         }
     }
 }

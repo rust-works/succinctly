@@ -10692,3 +10692,25 @@ fn test_jq_tostring_and_json_and_interpolation_unaffected_by_yq_verbatim_echo_10
     }
     Ok(())
 }
+
+/// #953: `to_json_for_reindex`'s `Float` fallback now formats through
+/// `format_float_with_fraction` (adding a `.0`) instead of bare `Display`,
+/// so any `Expr` shape with no native `eval_generic.rs` cursor arm (e.g.
+/// `[...]`) round-trips a computed whole-number float through JSON text
+/// with a decimal point where it previously had none. jq mode's own final
+/// formatter (`format_number_jq_compat`, reached via `to_json`) strips that
+/// `.0` back off after reparsing regardless -- real jq matches this on both
+/// cases (`[5]`, `[1]`, confirmed live), so the reindex bridge's added `.0`
+/// must stay invisible in jq's own output.
+#[test]
+fn test_jq_array_construction_unaffected_by_yq_float_fraction_fix_953() -> Result<()> {
+    for (filter, input, want) in [
+        ("[.a * 1.0]", r#"{"a": 5}"#, "[5]"),
+        ("[.a / 5]", r#"{"a": 5}"#, "[1]"),
+    ] {
+        let (out, code) = run_jq_stdin(filter, input, &["-c"])?;
+        assert_eq!(code, 0, "for {filter:?}: {out:?}");
+        assert_eq!(out.trim(), want, "for {filter:?}");
+    }
+    Ok(())
+}
