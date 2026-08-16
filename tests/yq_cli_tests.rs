@@ -1300,6 +1300,67 @@ fn test_json_input_duplicate_keys_preserved_996() -> Result<()> {
     Ok(())
 }
 
+/// #996 regression: a genuinely quoted JSON *string* that merely looks
+/// numeric (`"1.50"`, `"1e2"`) must never be reinterpreted as a bare
+/// float -- #996's own first attempt at the root-scalar shortcut in
+/// `stream_yaml_as_document` did exactly that (missing the same
+/// `is_unquoted()` gate its sibling call sites had), silently corrupting
+/// the value's *type*, not just its spelling. Confirmed live against real
+/// yq (v4.53.3), which preserves both unchanged.
+///
+/// Exercises several distinct M2-reachable shapes per the `testing`
+/// skill's "assert call sites agree with each other" guidance -- each
+/// routes through a different function this PR touches: a bare navigated
+/// scalar result (`stream_yaml_as_document`'s shortcut, the one that was
+/// actually broken), a value nested under an object (`stream_yaml_value`
+/// -> `stream_yaml_string_value`), and JSON-target output of the same
+/// (`stream_json_value` -> `stream_yaml_scalar_as_json`, which was always
+/// correctly gated).
+#[test]
+fn test_json_input_quoted_numeric_looking_string_not_corrupted_996() -> Result<()> {
+    // Bare navigated scalar result -- YAML output (the shape that shipped
+    // broken).
+    let (out, code) = run_yq_stdin(".b", "{\"b\": \"1.50\"}", &["--input-format", "json"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "1.50");
+
+    let (out, code) = run_yq_stdin(".b", "{\"b\": \"1e2\"}", &["--input-format", "json"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "1e2");
+
+    // Nested under an object -- YAML output. Asserts the *value* survives
+    // quoted and uncorrupted, not the exact block-vs-flow structural
+    // spelling: M2 preserves JSON's own flow-mapping syntax here (a
+    // separate, pre-existing, out-of-#996's-scope divergence from real
+    // yq, which forces block style for JSON input regardless of source
+    // style -- unrelated to this regression).
+    let (out, code) = run_yq_stdin(
+        ".",
+        "{\"nested\": {\"b\": \"1.50\"}}",
+        &["--input-format", "json", "-I", "0"],
+    )?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert!(
+        out.contains("\"1.50\""),
+        "expected the quoted string preserved verbatim, got: {out:?}"
+    );
+    assert!(
+        !out.contains("1.5\n") && !out.contains(": 1.5"),
+        "value must not have been corrupted into a bare float, got: {out:?}"
+    );
+
+    // Bare navigated scalar result -- JSON output.
+    let (out, code) = run_yq_stdin(
+        ".b",
+        "{\"b\": \"1.50\"}",
+        &["--input-format", "json", "-o", "json"],
+    )?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "\"1.50\"");
+
+    Ok(())
+}
+
 /// #631: `first(.[])`/`last(.[])` (the `Expr::FirstExpr`/`LastExpr` one-arg
 /// stream form `first(f)`/`last(f)` compiles to) fell through
 /// `evaluate_yaml_cursor`'s unconditional `to_owned()` DOM path, unlike
