@@ -11782,9 +11782,14 @@ const RECURSE_MAX_ITEMS: usize = 10000;
 /// `outputs` into a `QueryResult` — the two functions' identical tail
 /// (#1023 review of #897, echoing #106): a `pending_error` only surfaces
 /// once `stack` drains naturally, not when [`RECURSE_MAX_ITEMS`] cuts the
-/// loop short instead (#842 review).
+/// loop short instead. This matches the pre-existing `MAX_ITEMS` silent-
+/// truncation convention everywhere else in this file, rather than
+/// surfacing an error whose presence would otherwise depend on where the
+/// arbitrary cap happened to land — see `resolve_recurse`'s own matching
+/// check for the fuller rationale (#842 review).
+#[inline]
 fn finish_recurse_walk<'a, W>(
-    mut outputs: Vec<OwnedValue>,
+    outputs: Vec<OwnedValue>,
     stack_is_empty: bool,
     pending_error: Option<EvalEscape>,
 ) -> QueryResult<'a, W> {
@@ -11794,13 +11799,7 @@ fn finish_recurse_walk<'a, W>(
         }
     }
 
-    if outputs.is_empty() {
-        QueryResult::None
-    } else if outputs.len() == 1 {
-        QueryResult::Owned(outputs.pop().unwrap())
-    } else {
-        QueryResult::ManyOwned(outputs)
-    }
+    owned_vec_to_result(outputs)
 }
 
 /// Fan `recurse(f)` / `recurse(f; cond)` out into one branch per visited
@@ -12012,12 +12011,9 @@ fn resolve_recurse<'a, S: EvalSemantics>(
         queue_recurse_children(&mut stack, next, deferred_error, &mut pending_error);
     }
 
-    // A `pending_error` only surfaces once `stack` drains naturally — if
-    // `MAX_ITEMS` cut the loop short instead (`stack` still non-empty), this
-    // matches the pre-existing MAX_ITEMS convention everywhere else in this
-    // file (silent truncation, no error) rather than surfacing an error
-    // whose presence would otherwise depend on where the arbitrary cap
-    // happened to land relative to it (#842 review).
+    // Same pending_error/stack-drain rule `finish_recurse_walk` documents
+    // (#842, #1023) — can't share that helper directly, since this returns
+    // `PathResolveResult`, not `QueryResult`.
     if stack.is_empty() {
         path_result(outputs, pending_error)
     } else {
@@ -39322,6 +39318,53 @@ mod tests {
             QueryResult::ManyOwned(vs) => {
                 assert_eq!(vs.len(), 10000);
             }
+        );
+    }
+
+    /// #1023: cross-check that `finish_recurse_walk`'s `stack_is_empty` gate
+    /// (now shared by `builtin_recurse_f`/`builtin_recurse_cond`) and
+    /// `resolve_recurse`'s own independent `stack.is_empty()` gate still
+    /// agree on the MAX_ITEMS-truncates-a-pending-error edge case, rather
+    /// than relying only on the two sibling tests above individually
+    /// matching their own hand-picked expectations -- an invariant test
+    /// over duplicated logic, per this repo's testing skill: a future edit
+    /// that flips one gate's polarity but not the other's fails *this* test
+    /// even if both individual sibling tests above happened to still pass
+    /// in isolation (e.g. via a compensating change to their own
+    /// expectations).
+    #[test]
+    fn test_recurse_family_max_items_gate_agrees_across_value_and_path_position_1023() {
+        let large_doc = format!(
+            r#"{{"items":[{}],"bad":5}}"#,
+            (0..15000)
+                .map(|i| i.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+
+        // `query!` panics on any variant other than the one named, so this
+        // fails loudly (not silently) if either gate started surfacing the
+        // deferred error as `Partial` instead of suppressing it -- and the
+        // two counts are compared against *each other*, not just each
+        // against its own hardcoded literal, so a compensating edit to both
+        // sibling tests' expectations above couldn't hide a real divergence
+        // here the way two independently-asserted literals could.
+        let value_count = query!(
+            large_doc.as_bytes(),
+            r#"recurse(if type=="object" then (.items[], .bad[0]) else empty end)"#,
+            QueryResult::ManyOwned(vs) => vs.len()
+        );
+        let path_count = query!(
+            large_doc.as_bytes(),
+            r#"path(recurse(if type=="object" then (.items[], .bad[0]) else empty end))"#,
+            QueryResult::ManyOwned(vs) => vs.len()
+        );
+
+        assert_eq!(value_count, 10000, "value-position gate diverged");
+        assert_eq!(
+            path_count, value_count,
+            "path-position gate ({path_count}) disagrees with value-position gate \
+             ({value_count})"
         );
     }
 
