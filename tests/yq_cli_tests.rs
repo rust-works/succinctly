@@ -1251,8 +1251,10 @@ fn test_json_input_never_preserves_literal_spelling_978() -> Result<()> {
 /// call site. The M2 fast-path gates initially missed this (caught by
 /// code review): a bare `succinctly yq '.' file.json` -- arguably the
 /// more common way to hit this than typing the explicit flag -- still
-/// leaked. Fixed via `any_input_is_json`, which resolves every input
-/// file's format up front instead of trusting the raw flag alone.
+/// leaked. Fixed by resolving each input source's own format via
+/// `resolve_input_format` before deciding whether to call
+/// `YamlIndex::mark_json_sourced` on it (#996), rather than trusting the
+/// raw flag alone.
 #[test]
 fn test_json_extension_auto_detected_file_never_preserves_literal_spelling_978() -> Result<()> {
     let mut input_file = NamedTempFile::with_suffix(".json")?;
@@ -1283,8 +1285,9 @@ fn test_json_extension_auto_detected_file_never_preserves_literal_spelling_978()
 /// already did, restoring #978's fix without the DOM-fallback trade-off),
 /// so M2's incidental duplicate-key preservation (it never materializes an
 /// `IndexMap` at all) now applies to JSON input too. Real yq preserves
-/// `{"a":1,"a":2}` unchanged; this used to pin the opposite (collapsed)
-/// behavior as a documented, known gap -- flipped to the fixed behavior.
+/// `{"a":1,"a":2}` unchanged (confirmed live, yq v4.53.3); this used to
+/// pin the opposite (collapsed) behavior as a documented, known gap --
+/// flipped to the fixed behavior.
 #[test]
 fn test_json_input_duplicate_keys_preserved_996() -> Result<()> {
     let (out, code) = run_yq_stdin(
@@ -11227,6 +11230,27 @@ fn test_json_input_rejects_adversarial_nesting_via_dom_path_998() -> Result<()> 
     assert_eq!(code, 101, "stderr: {stderr:?}");
     assert!(
         stderr.contains("nesting depth exceeds limit of 256"),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
+/// #996's `can_slurp_fast_path` also dropped its own `!any_input_is_json`
+/// gate, so `--slurp`'s default (YAML) output now routes adversarially
+/// deep JSON input through `YamlIndex::build`'s parse-time depth-128
+/// guard too, same as identity above -- pinned separately since
+/// `can_slurp_fast_path`/`is_m2_streamable` are independent gates with
+/// their own call sites, not a shared code path that the identity test
+/// above would also exercise.
+#[test]
+fn test_json_input_rejects_adversarial_nesting_via_slurp_996() -> Result<()> {
+    let depth = 500;
+    let input = format!("{}1{}", "[".repeat(depth), "]".repeat(depth));
+    let (_stdout, stderr, code) =
+        run_yq_stdin_with_stderr(".", &input, &["--input-format", "json", "--slurp"])?;
+    assert_eq!(code, 1, "stderr: {stderr:?}");
+    assert!(
+        stderr.contains("nesting depth exceeds limit of 128"),
         "stderr: {stderr:?}"
     );
     Ok(())

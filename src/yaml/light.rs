@@ -1332,7 +1332,15 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
             // canonicalize-aware check, or a JSON-sourced float navigated
             // out as a standalone result (`.b`, not nested under a parent
             // Mapping/Sequence) would echo its raw spelling unchanged.
-            if self_.index.canonicalize_numbers() {
+            //
+            // `s.is_unquoted()` gating is required, not optional: `s` here
+            // is any `YamlValue::String` regardless of quoting style, and
+            // `resolve_plain` documents itself as only meaningful for a
+            // plain (unquoted) scalar. Without this check, a genuinely
+            // quoted JSON *string* that happens to look numeric (`"1.50"`)
+            // got its quotes silently dropped and its type corrupted into
+            // a bare float (`1.5`) -- caught in review before merge.
+            if self_.index.canonicalize_numbers() && s.is_unquoted() {
                 if let ResolvedScalar::Float(f) = resolve_plain(&str_val) {
                     if f.is_finite() {
                         return write!(out, "{f}");
