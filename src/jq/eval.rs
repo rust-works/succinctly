@@ -4114,7 +4114,7 @@ fn yq_join_nonfinite_part(value: &OwnedValue) -> Option<String> {
         OwnedValue::Float(f) | OwnedValue::NumberLiteral(NumberRepr::Float(f), _)
             if f.is_nan() || f.is_infinite() =>
         {
-            Some(nonfinite_display_string::<YqSemantics>(*f))
+            Some(nonfinite_display_string::<YqSemantics>(*f).to_string())
         }
         _ => None,
     }
@@ -5143,7 +5143,7 @@ pub(crate) fn numeric_display_string<S: EvalSemantics>(value: &OwnedValue) -> St
     if let OwnedValue::NumberLiteral(repr, literal) = value {
         if let NumberRepr::Float(f) = repr {
             if f.is_nan() || f.is_infinite() {
-                return nonfinite_display_string::<S>(*f);
+                return nonfinite_display_string::<S>(*f).to_string();
             }
         }
         // yq preserves a document-sourced literal's exact source spelling
@@ -5157,7 +5157,7 @@ pub(crate) fn numeric_display_string<S: EvalSemantics>(value: &OwnedValue) -> St
         }
     } else if let OwnedValue::Float(f) = value {
         if f.is_nan() || f.is_infinite() {
-            return nonfinite_display_string::<S>(*f);
+            return nonfinite_display_string::<S>(*f).to_string();
         }
     }
     value.number_str().expect("numeric variant").into_owned()
@@ -5177,15 +5177,39 @@ pub(crate) fn numeric_display_string<S: EvalSemantics>(value: &OwnedValue) -> St
 /// `yq_runner.rs` as well as twice more in this file, none of them sharing
 /// this definition (CLAUDE.md's #106 "duplicated predicates diverge
 /// silently" lesson).
-pub fn nonfinite_display_string<S: EvalSemantics>(f: f64) -> String {
+///
+/// Returns `&'static str`, not `String`: every branch is one of a fixed
+/// 6-string set (Rust's own `f64::Display` always normalizes any NaN bit
+/// pattern to exactly `"NaN"`, and any infinity to `"inf"`/`"-inf"`,
+/// regardless of payload/magnitude -- verified directly, not assumed).
+/// Lets the two streaming call sites (`stream.rs`, `json/light.rs`) write
+/// this straight into their `Write` sink with no heap allocation, instead
+/// of allocating a `String` just to borrow and immediately drop it.
+///
+/// # Examples
+///
+/// ```
+/// use succinctly::jq::{nonfinite_display_string, YqSemantics};
+///
+/// assert_eq!(nonfinite_display_string::<YqSemantics>(f64::NAN), ".nan");
+/// assert_eq!(nonfinite_display_string::<YqSemantics>(f64::INFINITY), ".inf");
+/// assert_eq!(nonfinite_display_string::<YqSemantics>(f64::NEG_INFINITY), "-.inf");
+/// ```
+pub fn nonfinite_display_string<S: EvalSemantics>(f: f64) -> &'static str {
     if S::TAG != EvalTag::Yq {
-        f.to_string()
+        if f.is_nan() {
+            "NaN"
+        } else if f.is_sign_negative() {
+            "-inf"
+        } else {
+            "inf"
+        }
     } else if f.is_nan() {
-        ".nan".to_string()
+        ".nan"
     } else if f.is_sign_negative() {
-        "-.inf".to_string()
+        "-.inf"
     } else {
-        ".inf".to_string()
+        ".inf"
     }
 }
 
@@ -5728,11 +5752,11 @@ fn props_value_to_string(value: &OwnedValue) -> String {
         OwnedValue::Bool(false) => "false".to_string(),
         OwnedValue::Int(n) => format!("{n}"),
         OwnedValue::Float(f) if f.is_nan() || f.is_infinite() => {
-            nonfinite_display_string::<YqSemantics>(*f)
+            nonfinite_display_string::<YqSemantics>(*f).to_string()
         }
         OwnedValue::Float(f) => format!("{f}"),
         OwnedValue::NumberLiteral(NumberRepr::Float(f), _) if f.is_nan() || f.is_infinite() => {
-            nonfinite_display_string::<YqSemantics>(*f)
+            nonfinite_display_string::<YqSemantics>(*f).to_string()
         }
         // Echo verbatim (#1008): `@props` is documented as a yq-flavored
         // format function (CLAUDE.md's format table marks it `(yq)`) --
@@ -5767,11 +5791,11 @@ fn owned_to_yaml_at_depth(value: &OwnedValue, depth: usize) -> String {
         OwnedValue::Bool(false) => "false".to_string(),
         OwnedValue::Int(n) => format!("{n}"),
         OwnedValue::Float(f) if f.is_nan() || f.is_infinite() => {
-            nonfinite_display_string::<YqSemantics>(*f)
+            nonfinite_display_string::<YqSemantics>(*f).to_string()
         }
         OwnedValue::Float(f) => format!("{f}"),
         OwnedValue::NumberLiteral(NumberRepr::Float(f), _) if f.is_nan() || f.is_infinite() => {
-            nonfinite_display_string::<YqSemantics>(*f)
+            nonfinite_display_string::<YqSemantics>(*f).to_string()
         }
         // Echo verbatim (#1008): `@yaml` is documented as a yq-flavored
         // format function (CLAUDE.md's format table marks it `(yq)`) --

@@ -1559,11 +1559,11 @@ fn emit_yaml_value_at_depth(
         OwnedValue::Bool(b) => b.to_string(),
         OwnedValue::Int(n) => n.to_string(),
         OwnedValue::Float(f) if f.is_nan() || f.is_infinite() => {
-            nonfinite_display_string::<YqSemantics>(*f)
+            nonfinite_display_string::<YqSemantics>(*f).to_string()
         }
         OwnedValue::Float(f) => format_float_yq(*f),
         OwnedValue::NumberLiteral(NumberRepr::Float(f), _) if f.is_nan() || f.is_infinite() => {
-            nonfinite_display_string::<YqSemantics>(*f)
+            nonfinite_display_string::<YqSemantics>(*f).to_string()
         }
         OwnedValue::NumberLiteral(_, literal) => {
             // Echo the source spelling verbatim (#1008) rather than

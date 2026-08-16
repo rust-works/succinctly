@@ -620,7 +620,7 @@ fn stream_owned_value_yaml_at_depth<W: core::fmt::Write>(
         OwnedValue::Bool(false) => out.write_str("false"),
         OwnedValue::Int(n) => write!(out, "{n}"),
         OwnedValue::Float(f) if f.is_nan() || f.is_infinite() => {
-            out.write_str(&super::nonfinite_display_string::<super::YqSemantics>(*f))
+            out.write_str(super::nonfinite_display_string::<super::YqSemantics>(*f))
         }
         OwnedValue::Float(f) => {
             // Not `write!(out, "{f}")`: that drops the `.0` from a whole
@@ -629,7 +629,7 @@ fn stream_owned_value_yaml_at_depth<W: core::fmt::Write>(
             out.write_str(&format_float_with_fraction(*f))
         }
         OwnedValue::NumberLiteral(NumberRepr::Float(f), _) if f.is_nan() || f.is_infinite() => {
-            out.write_str(&super::nonfinite_display_string::<super::YqSemantics>(*f))
+            out.write_str(super::nonfinite_display_string::<super::YqSemantics>(*f))
         }
         OwnedValue::NumberLiteral(_, literal) => {
             // Echo verbatim (#1008), matching this function's JSON sibling
