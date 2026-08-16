@@ -4682,48 +4682,58 @@ fn test_try_catch_prepend_propagates_halt_from_handler() -> Result<()> {
 
 #[test]
 fn test_result_to_owned_many_empty_arm_via_ltrimstr_argument() -> Result<()> {
-    // `result_to_owned`'s `Many(vs)` arm when `vs` is empty. `(empty,empty)`
-    // is two `None`-valued comma operands, so `eval_comma` never touches its
-    // `owned` promotion path and falls out through its own `None =>
-    // QueryResult::Many(borrowed)` arm with `borrowed` still `[]` --
-    // `ltrimstr`'s argument slot then feeds that `Many(vec![])` into
-    // `result_to_owned`, hitting the "empty result" error arm. Not
-    // halt-specific (this arm predates #791; only its `.into()` wrapper is
-    // new) and a pre-existing, unrelated divergence from real jq worth
-    // flagging: jq treats `f(g)` as backtracking over every output of `g`,
-    // so a zero-output argument means zero outputs overall -- `jq -n '"abc"
-    // | ltrimstr((empty,empty))'` exits 0 with no output -- while
+    // #1043 fixed the bug this test originally probed: `eval_comma`'s tail
+    // match was missing a `0 => None` arm, so `(empty,empty)` (two
+    // `None`-valued comma operands, `owned` never promoted) fell out through
+    // `None => QueryResult::Many(borrowed)` with `borrowed` still `[]` --
+    // producing `Many(vec![])` instead of `None`. That's now routed through
+    // `borrowed_vec_to_result`, which correctly collapses an empty
+    // accumulator to `None`.
+    //
+    // `ltrimstr`'s argument slot now feeds that `None` into
+    // `result_to_owned`, which still errors -- just via its *separate*
+    // `QueryResult::None => Err("no value")` arm instead of the
+    // `Many`-empty arm this test originally pinned. That's a distinct,
+    // still-unfixed, out-of-scope divergence from real jq (#1045): jq
+    // treats `f(g)` as backtracking over every output of `g`, so a
+    // zero-output argument means zero outputs overall -- `jq -n '"abc" |
+    // ltrimstr((empty,empty))'` exits 0 with no output -- while
     // succinctly's `ltrimstr` resolves its argument to a single value via
     // `result_to_owned`, which treats "the argument stream produced
-    // nothing" as an error instead.
+    // nothing" as an error regardless of *which* empty shape produced it.
     let (stdout, stderr, code) = run_jq_full(&["-n", r#""abc" | ltrimstr((empty,empty))"#], None)?;
     assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
     assert_eq!(stdout, "");
-    assert_eq!(stderr, "jq: error (at <unknown>): empty result\n");
+    assert_eq!(stderr, "jq: error (at <unknown>): no value\n");
     Ok(())
 }
 
 #[test]
 fn test_result_to_owned_manyowned_empty_arm_via_ltrimstr_argument() -> Result<()> {
-    // `result_to_owned`'s `ManyOwned(vs)` arm when `vs` is empty -- the
-    // `Owned`-target sibling of the `Many`-empty case above, reached through
-    // a different producer: `eval_index_expr`'s `Targets::Owned` branch ends
-    // its match on `out.len()` with only `1 => Owned(...)`, so the `_ =>
-    // ManyOwned(out)` wildcard also covers `out.len() == 0`. `(2+3)` is
-    // computed (arithmetic is always `Owned`/`ManyOwned`, never
+    // #1043 fixed the bug this test originally probed: the `Owned`-target
+    // sibling of the `Many`-empty case above, reached through a different
+    // producer -- `eval_index_expr`'s `Targets::Owned` branch used to end
+    // its match on `out.len()` with only `1 => Owned(...)`, so the
+    // `_ => ManyOwned(out)` wildcard also covered `out.len() == 0`. `(2+3)`
+    // is computed (arithmetic is always `Owned`/`ManyOwned`, never
     // document-borrowed, so its target is `Targets::Owned`), and both
     // `"x"`/`"y"` keys against the number `5` -- with the trailing `?`
     // making `optional` true -- each resolve via `index_one_owned`'s `_ if
-    // optional => Ok(None)` refusal-suppression arm, leaving `out` empty:
-    // `QueryResult::ManyOwned(vec![])`. Same pre-existing, halt-unrelated
-    // divergence from real jq as the `Many`-empty case above: `jq -n '"abc"
-    // | ltrimstr((2+3) | .[("x","y")]?)'` exits 0 with no output, while
-    // succinctly's `result_to_owned` reports it as an error.
+    // optional => Ok(None)` refusal-suppression arm, leaving `out` empty.
+    // That's now routed through `owned_vec_to_result`, which correctly
+    // collapses an empty accumulator to `None`.
+    //
+    // Same distinct, still-unfixed, out-of-scope divergence as the
+    // `Many`-empty case above (#1045) -- `result_to_owned`'s `None` arm
+    // still errors, just with a different message than before: `jq -n
+    // '"abc" | ltrimstr((2+3) | .[("x","y")]?)'` exits 0 with no output in
+    // real jq, while succinctly's `result_to_owned` reports it as an error
+    // regardless of which empty shape produced the `None`.
     let (stdout, stderr, code) =
         run_jq_full(&["-n", r#""abc" | ltrimstr((2+3) | .[("x","y")]?)"#], None)?;
     assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
     assert_eq!(stdout, "");
-    assert_eq!(stderr, "jq: error (at <unknown>): empty result\n");
+    assert_eq!(stderr, "jq: error (at <unknown>): no value\n");
     Ok(())
 }
 

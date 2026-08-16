@@ -844,10 +844,8 @@ fn eval_comma<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     }
 
     match owned {
-        Some(mut acc) if acc.len() == 1 => QueryResult::Owned(acc.pop().unwrap()),
-        Some(acc) => QueryResult::ManyOwned(acc),
-        None if borrowed.len() == 1 => QueryResult::One(borrowed.pop().unwrap()),
-        None => QueryResult::Many(borrowed),
+        Some(acc) => owned_vec_to_result(acc),
+        None => borrowed_vec_to_result(borrowed),
     }
 }
 
@@ -1498,10 +1496,8 @@ fn eval_fanout<'a, W: Clone + AsRef<[u64]>>(
     match cond_control {
         Some(control) => partial(merge_owned(borrowed, owned.unwrap_or_default()), control),
         None => match owned {
-            Some(mut acc) if acc.len() == 1 => QueryResult::Owned(acc.pop().unwrap()),
-            Some(acc) => QueryResult::ManyOwned(acc),
-            None if borrowed.len() == 1 => QueryResult::One(borrowed.pop().unwrap()),
-            None => QueryResult::Many(borrowed),
+            Some(acc) => owned_vec_to_result(acc),
+            None => borrowed_vec_to_result(borrowed),
         },
     }
 }
@@ -9232,10 +9228,7 @@ fn eval_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             }
             match pending_halt {
                 Some(code) => partial(out.iter().map(to_owned).collect(), Control::Halt(code)),
-                None => match out.len() {
-                    1 => QueryResult::One(out.pop().expect("len checked")),
-                    _ => QueryResult::Many(out),
-                },
+                None => borrowed_vec_to_result(out),
             }
         }
         Targets::Owned(ts) => {
@@ -9254,10 +9247,7 @@ fn eval_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             }
             match pending_halt {
                 Some(code) => partial(out, Control::Halt(code)),
-                None => match out.len() {
-                    1 => QueryResult::Owned(out.pop().expect("len checked")),
-                    _ => QueryResult::ManyOwned(out),
-                },
+                None => owned_vec_to_result(out),
             }
         }
     }
@@ -9370,10 +9360,7 @@ fn eval_slice_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             }
         }
     }
-    match out.len() {
-        1 => QueryResult::Owned(out.pop().expect("len checked")),
-        _ => QueryResult::ManyOwned(out),
-    }
+    owned_vec_to_result(out)
 }
 
 /// Evaluate one slice bound (`start` or `end`) against `value`, collecting
@@ -15098,9 +15085,12 @@ fn accumulate_path_context_step<'a, W: Clone + AsRef<[u64]>>(
             None
         }
         // `eval_fanout` (used by `Select`) returns these borrowed-cursor
-        // variants even from an all-owned-value call site -- e.g. a `select`
-        // whose condition matched nothing produces `Many(vec![])`, not
-        // `None` -- so this must convert, not treat them as unreachable.
+        // variants even from an all-owned-value call site -- e.g. `select`
+        // on a truthy condition hands back the input as `One(value)`, a
+        // genuine borrowed cursor, not `Owned` -- so this must convert, not
+        // treat them as unreachable. (A `select` that matched nothing now
+        // collapses to a bare `None` instead, since #1043 gave
+        // `eval_fanout`'s tail match its missing `0 => None` arm.)
         QueryResult::One(v) => {
             results.push(to_owned(&v));
             None
@@ -15139,8 +15129,11 @@ fn continue_rest_with_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 ) -> QueryResult<'a, W> {
     // `eval_fanout` (reached via `Select`) can hand back its borrowed-cursor
     // variants (`One`/`Many`) even here, not just Owned/ManyOwned -- e.g. a
-    // `select` that matched nothing produces `Many(vec![])` -- so those
-    // convert via `to_owned` instead of being treated as unreachable.
+    // `select` on a truthy condition hands back the input as a genuine
+    // borrowed `One` -- so those convert via `to_owned` instead of being
+    // treated as unreachable. (A `select` that matched nothing now
+    // collapses to a bare `None` instead, since #1043 gave `eval_fanout`'s
+    // tail match its missing `0 => None` arm.)
     match intermediate.materialize_cursor() {
         QueryResult::Owned(v) => eval_pipe_with_path_context_internal::<W, S>(
             rest,
@@ -24147,6 +24140,55 @@ mod tests {
     }
 
     #[test]
+    fn test_comma_all_empty_operands_collapse_to_none_1043() {
+        // #1043: every operand producing zero outputs must collapse the whole
+        // comma to `None`, not `Many(vec![])` -- real jq exits 0 with no
+        // output for `(empty,empty)`, not an error.
+        query!(br"1", "(empty, empty)",
+            QueryResult::None => {}
+        );
+    }
+
+    #[test]
+    fn test_fanout_all_empty_branches_collapse_to_none_1043() {
+        // #1043: eval_fanout's tail match is byte-identical to eval_comma's
+        // (both fold a multi-branch stream into borrowed/owned accumulators)
+        // and had the same missing `0 => None` bug. A multi-output condition
+        // whose every branch is `empty` must collapse the whole `if` to
+        // `None`, not `Many(vec![])`. Confirmed live against jq 1.7.1.
+        query!(br"1", "if (true, false) then empty else empty end",
+            QueryResult::None => {}
+        );
+    }
+
+    #[test]
+    fn test_computed_index_and_slice_zero_results_collapse_to_none_1043() {
+        // #1043: eval_index_expr's Borrowed and Owned target arms, and
+        // eval_slice_expr's final collapse, all had the same missing
+        // `0 => None` bug -- a computed index/slice whose optional (`?`)
+        // form produces zero results collapsed to `Many(vec![])`/
+        // `ManyOwned(vec![])` instead of `None`. Confirmed live against jq
+        // 1.7.1 (all three exit 0 with no output there too).
+        //
+        // Borrowed target (`.` is the document itself, a number -- not
+        // indexable, so `?` suppresses to zero results per key).
+        query!(br"5", r#".[("a", "b")]?"#,
+            QueryResult::None => {}
+        );
+        // Owned target: `(1)` constructs an owned value rather than
+        // borrowing from the document, taking eval_index_expr's separate
+        // `Targets::Owned` arm.
+        query!(br"5", r#"(1)[("a", "b")]?"#,
+            QueryResult::None => {}
+        );
+        // eval_slice_expr's final collapse: slicing a non-array/string
+        // target with `?` suppresses to zero results per (start, end) pair.
+        query!(br"null", r#"({"a": 1})[0:(1, 2)]?"#,
+            QueryResult::None => {}
+        );
+    }
+
+    #[test]
     fn test_literals() {
         query!(br"{}", "null",
             QueryResult::Owned(OwnedValue::Null) => {}
@@ -26686,10 +26728,9 @@ mod tests {
             }
         );
 
-        // select outputs nothing if condition is false. `eval_fanout` shares
-        // `eval_comma`'s empty-merge shape (`Many(vec![])`, not a bare
-        // `None`) — `outputs()` is deliberately variant-agnostic about that,
-        // per its own doc comment.
+        // select outputs nothing if condition is false, collapsing to a bare
+        // `None` since #1043 — `outputs()` is deliberately variant-agnostic
+        // about the exact `QueryResult` shape, per its own doc comment.
         assert!(outputs(br"2", "select(. > 3)").is_empty());
     }
 
