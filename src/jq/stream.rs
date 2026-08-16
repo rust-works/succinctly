@@ -640,7 +640,11 @@ fn stream_owned_value_yaml_at_depth<W: core::fmt::Write>(
             out.write_str(if *f > 0.0 { ".inf" } else { "-.inf" })
         }
         OwnedValue::NumberLiteral(_, literal) => {
-            out.write_str(&format_number_jq_compat(literal.as_bytes()))
+            // Echo verbatim (#1008), matching this function's JSON sibling
+            // (`stream_owned_value_json`'s `finite_literal` hook) -- this
+            // is `StreamableValue`'s yq-only YAML streamer (no `jq_runner.rs`
+            // caller exists), so there is no jq convention to protect here.
+            out.write_str(literal)
         }
         OwnedValue::String(s) => stream_yaml_string(out, s),
         OwnedValue::Array(arr) => {

@@ -10591,3 +10591,26 @@ fn test_exit_status_query_materializes_object_998() -> Result<()> {
     assert_eq!(stdout.trim_end(), r#"{"a":{"b":1}}"#);
     Ok(())
 }
+
+/// #1008 (yq PR) code review: `format_number_jq_compat`'s `value == 0.0`/
+/// `value as i64` checks don't distinguish -0.0 from 0.0 (IEEE 754), so a
+/// negative-zero exponent literal silently lost its sign across all three
+/// of the function's branches (`e0`/`e-0`, small negative exponents, and
+/// general scientific notation). Pre-existing and reachable via plain JSON
+/// input (nothing YAML-specific about it), just newly exposed by that PR's
+/// widening of a YAML-side predicate -- fixed at the source so `jq` mode's
+/// own output is also correct, not just yq's.
+#[test]
+fn test_negative_zero_exponent_literal_preserves_sign_1008() -> Result<()> {
+    for (input, want) in [
+        (r#"{"a": -0e0}"#, "-0"),
+        (r#"{"a": -0e10}"#, "-0E+10"),
+        (r#"{"a": -0e5}"#, "-0E+5"),
+        (r#"{"a": 0e10}"#, "0E+10"),
+    ] {
+        let (out, code) = run_jq_stdin(".a", input, &[])?;
+        assert_eq!(code, 0, "for {input:?}: {out:?}");
+        assert_eq!(out.trim(), want, "for {input:?}");
+    }
+    Ok(())
+}

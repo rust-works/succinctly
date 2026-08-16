@@ -296,14 +296,18 @@ const MAX_PRESERVABLE_FLOAT_DIGITS: usize = 17;
 ///   point or an exponent is unambiguous float syntax on its own (`1e2`
 ///   has no `.` but is still a float, not an overflowed integer), so
 ///   either is sufficient here.
-/// - **At most [`MAX_PRESERVABLE_FLOAT_DIGITS`] significant digits**
-///   (counting every ASCII digit in `s`, mantissa and exponent alike —
-///   conservative but simple, and the exponent's own digits rarely
-///   approach the cap on their own).
+/// - **At most [`MAX_PRESERVABLE_FLOAT_DIGITS`] significant digits in the
+///   mantissa.** Exponent digits carry no precision (they're a magnitude,
+///   not a significand) and must not count toward this cap -- an earlier
+///   version of this predicate counted every digit in `s` including the
+///   exponent's, which rejected exactly-round-trippable literals like
+///   `1.2345678901234567e10` (17 mantissa digits, but 19 counted) and
+///   reproduced #1008's catastrophic-decimal-expansion symptom for any
+///   long-enough exponent (caught in that PR's own code review).
 ///
-/// Exponent notation used to be excluded here (issue #1008's original
-/// symptom): the reasoning was that `format_number_jq_compat` — one
-/// formatter this text can flow through — re-normalizes exponents
+/// Exponent notation used to be excluded here entirely (issue #1008's
+/// original symptom): the reasoning was that `format_number_jq_compat` —
+/// one formatter this text can flow through — re-normalizes exponents
 /// (uppercase `E`, forced sign) regardless, so "there was nothing gained"
 /// by preserving the source spelling. That premise doesn't hold for every
 /// caller: several yq output paths (`emit_yaml_value_at_depth`,
@@ -320,8 +324,12 @@ const MAX_PRESERVABLE_FLOAT_DIGITS: usize = 17;
 /// the issue tracker for the follow-up.
 #[must_use]
 pub(super) fn is_preservable_float_literal(s: &str) -> bool {
+    let mantissa = match s.find(['e', 'E']) {
+        Some(exp_pos) => &s[..exp_pos],
+        None => s,
+    };
     (s.contains('.') || s.contains(['e', 'E']))
-        && s.bytes().filter(u8::is_ascii_digit).count() <= MAX_PRESERVABLE_FLOAT_DIGITS
+        && mantissa.bytes().filter(u8::is_ascii_digit).count() <= MAX_PRESERVABLE_FLOAT_DIGITS
         && is_json_number_syntax(s)
 }
 
@@ -716,5 +724,27 @@ mod tests {
         assert!(!is_preservable_float_literal(&just_over));
         let at_cap = "1.".to_string() + &"1".repeat(MAX_PRESERVABLE_FLOAT_DIGITS - 1);
         assert!(is_preservable_float_literal(&at_cap));
+    }
+
+    /// #1008 code review: an earlier version of the digit cap counted
+    /// exponent digits along with the mantissa's, so a full-precision
+    /// (17-digit) mantissa paired with any multi-digit exponent was
+    /// wrongly rejected -- reproducing #1008's catastrophic-decimal-expansion
+    /// symptom for exactly the round-trip-exact literals the cap exists to
+    /// protect. Only the mantissa's own digit count should matter.
+    #[test]
+    fn preservable_float_literal_digit_cap_ignores_exponent_digits() {
+        let mantissa_at_cap = "1.".to_string() + &"1".repeat(MAX_PRESERVABLE_FLOAT_DIGITS - 1);
+        assert!(is_preservable_float_literal(&format!(
+            "{mantissa_at_cap}e100"
+        )));
+        assert!(is_preservable_float_literal(&format!(
+            "{mantissa_at_cap}e-300"
+        )));
+
+        let mantissa_over_cap = "1.".to_string() + &"1".repeat(MAX_PRESERVABLE_FLOAT_DIGITS);
+        assert!(!is_preservable_float_literal(&format!(
+            "{mantissa_over_cap}e1"
+        )));
     }
 }

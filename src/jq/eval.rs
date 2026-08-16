@@ -131,8 +131,7 @@ use super::expr::{
     ObjectKey, Pattern, StringPart,
 };
 use super::value::{
-    assert_value_tree_depth, cmp_f64, format_number_jq_compat, is_nan_sentinel, numeric_repr_cmp,
-    NumberRepr, OwnedValue,
+    assert_value_tree_depth, cmp_f64, is_nan_sentinel, numeric_repr_cmp, NumberRepr, OwnedValue,
 };
 
 /// Result of evaluating a jq expression.
@@ -5500,7 +5499,12 @@ fn props_value_to_string(value: &OwnedValue) -> String {
                 "-.inf".to_string()
             }
         }
-        OwnedValue::NumberLiteral(_, literal) => format_number_jq_compat(literal.as_bytes()),
+        // Echo verbatim (#1008): `@props` is documented as a yq-flavored
+        // format function (CLAUDE.md's format table marks it `(yq)`) --
+        // reachable from `succinctly jq` too, but real yq's preservation
+        // convention is the correct one regardless of which binary calls
+        // it, not jq's `format_number_jq_compat` reformatting.
+        OwnedValue::NumberLiteral(_, literal) => literal.to_string(),
         OwnedValue::String(s) => {
             // Replace newlines with spaces, as yq does
             s.replace(['\n', '\r'], " ")
@@ -5548,7 +5552,12 @@ fn owned_to_yaml_at_depth(value: &OwnedValue, depth: usize) -> String {
                 "-.inf".to_string()
             }
         }
-        OwnedValue::NumberLiteral(_, literal) => format_number_jq_compat(literal.as_bytes()),
+        // Echo verbatim (#1008): `@yaml` is documented as a yq-flavored
+        // format function (CLAUDE.md's format table marks it `(yq)`) --
+        // reachable from `succinctly jq` too, but real yq's preservation
+        // convention is the correct one regardless of which binary calls
+        // it, not jq's `format_number_jq_compat` reformatting.
+        OwnedValue::NumberLiteral(_, literal) => literal.to_string(),
         OwnedValue::String(s) => yaml_quote_string(s),
         OwnedValue::Array(arr) => {
             let items: Vec<String> = arr
