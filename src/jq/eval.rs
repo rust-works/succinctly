@@ -34683,6 +34683,48 @@ mod tests {
         );
     }
 
+    /// #970: `strptime`'s weekday (`checked_days_from_civil`, #912's shared
+    /// Howard Hinnant `days_from_civil` formula) is astronomically correct
+    /// for every century-non-leap year (1900, 2100, 2200, 2300, ...) —
+    /// verified against macOS's own `date -j` command and independently
+    /// cross-checked by hand via Zeller's congruence.
+    ///
+    /// This is a deliberate divergence from jq's own **macOS/BSD** build,
+    /// not a succinctly bug: jq's `src/builtin.c` `set_tm_wday()` (a
+    /// hand-rolled Gauss's-algorithm fallback) carries its own doc comment
+    /// admitting it "produces the wrong day-of-the-week number for dates
+    /// in the range 1900-01-01..1900-02-28, and for 2100-01-01..2100-02-28"
+    /// — and jq's macOS build *always* uses this fallback (unlike Linux,
+    /// which only falls back to it if glibc's own `strptime()` left
+    /// `tm_wday` unset, which it doesn't). So jq's own weekday output for
+    /// this date range is platform-dependent, and the macOS build is the
+    /// one jq's own maintainers call wrong — confirmed by diffing jq's
+    /// output against this test's dates: jq-on-macOS gives one day
+    /// earlier for every date below except the two `-03-01` boundary
+    /// dates, where the bug self-corrects (matching jq's own comment
+    /// exactly). Decision (John Ky, issue #970): keep succinctly's
+    /// correct behavior rather than reproduce jq's platform-specific bug.
+    #[test]
+    fn test_strptime_weekday_correct_for_century_non_leap_years_970() {
+        for (date, expected_weekday) in [
+            ("1900-01-01", 1), // Monday; jq-macOS wrongly gives 0 (Sunday)
+            ("1900-02-28", 3), // Wednesday; jq-macOS wrongly gives 2 (Tuesday)
+            ("1900-03-01", 4), // Thursday; bug self-corrects here
+            ("2100-01-01", 5), // Friday; jq-macOS wrongly gives 4 (Thursday)
+            ("2100-02-28", 0), // Sunday; jq-macOS wrongly gives 6 (Saturday)
+            ("2100-03-01", 1), // Monday; bug self-corrects here
+            ("2200-02-15", 6), // Saturday; jq-macOS wrongly gives 5 (Friday)
+            ("2300-02-15", 4), // Thursday; jq-macOS wrongly gives 3 (Wednesday)
+        ] {
+            let input = format!("\"{date}\"");
+            query!(input.as_bytes(), r#"strptime("%Y-%m-%d")[6]"#,
+                QueryResult::Owned(OwnedValue::Int(weekday)) => {
+                    assert_eq!(weekday, expected_weekday, "date: {date}");
+                }
+            );
+        }
+    }
+
     #[test]
     fn test_todate() {
         // todate converts timestamp to ISO 8601 string
