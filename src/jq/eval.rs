@@ -7890,7 +7890,7 @@ fn eval_sub_replacement<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     re: &JqRegex,
     caps: &regex::Captures,
     optional: bool,
-) -> Result<Option<String>, QueryResult<'a, W>> {
+) -> Result<Option<OwnedValue>, QueryResult<'a, W>> {
     let captures = capture_object(re, caps);
     // `eval_owned_input` never returns a bare `QueryResult::Many` -- its own
     // body converts every borrowed `Many` to `ManyOwned` before returning --
@@ -7902,15 +7902,14 @@ fn eval_sub_replacement<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     if stream_is_empty {
         return Ok(None);
     }
-    match result_to_owned(materialized) {
-        Ok(OwnedValue::String(s)) => Ok(Some(s)),
-        Ok(_) if optional => Err(QueryResult::None),
-        Ok(_) => Err(QueryResult::Error(EvalError::type_error(
-            "string",
-            "replacement",
-        ))),
-        Err(e) => Err(e.into()),
-    }
+    // #1034: no type check here -- any successfully-evaluated value is
+    // returned as-is. jq's real `sub`/`gsub` (`src/builtin.jq`) never checks
+    // the replacement's type either; it hands the raw value straight to
+    // `$gap + $inserts[$ix]`, so a non-string replacement surfaces jq's own
+    // `+`-operator wording (`"string (...) and number (...) cannot be
+    // added"`) rather than a bespoke message. The callers below (which
+    // already hold the gap text) are what perform that `+`, via `arith_add`.
+    result_to_owned(materialized).map(Some).map_err(Into::into)
 }
 
 /// Replace every match in `matches` (already trailing-newline-aware, e.g.
@@ -7921,9 +7920,11 @@ fn eval_sub_replacement<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// evaluation rather than a static template string.
 ///
 /// Implements jq's all-matches-empty rule (#840, see `eval_sub_replacement`):
-/// every match's replacement is evaluated first, and if every one of them
-/// produced zero outputs, `input` is returned completely unchanged rather
-/// than with every match individually deleted.
+/// if every match produces a zero-output replacement, `input` is returned
+/// completely unchanged rather than with every match individually deleted.
+/// Tracked with a running flag instead of a separate up-front pass, so this
+/// stays a single loop over `matches` -- see `combine_sub_gap`'s doc comment
+/// for why a single loop matters (#1034 review).
 #[cfg(feature = "regex")]
 fn stitch_replacements_evaluated<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     replacement_expr: &Expr,
@@ -7932,36 +7933,95 @@ fn stitch_replacements_evaluated<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     matches: &[regex::Captures],
     optional: bool,
 ) -> Result<String, QueryResult<'a, W>> {
-    let mut replacements = Vec::with_capacity(matches.len());
-    for caps in matches {
-        replacements.push(eval_sub_replacement::<W, S>(
-            replacement_expr,
-            re,
-            caps,
-            optional,
-        )?);
-    }
-    if replacements.iter().all(Option::is_none) {
-        return Ok(input.to_string());
-    }
-
     let mut out = String::with_capacity(input.len());
     let mut last_end = 0;
-    for (caps, replacement) in matches.iter().zip(replacements) {
+    let mut any_nonempty = false;
+    for caps in matches {
         let m = caps
             .get(0)
             .expect("capture group 0 is always present on a match");
+        let replacement = eval_sub_replacement::<W, S>(replacement_expr, re, caps, optional)?;
         // A zero-output match drops both its own text and its own preceding
-        // gap (jq 1.7.1, verified) -- distinct from the all-empty case
-        // above, which is handled before this loop runs.
+        // gap (jq 1.7.1, verified) -- distinct from the all-empty case,
+        // resolved below once every match has been considered.
         if let Some(replacement) = replacement {
-            out.push_str(&input[last_end..m.start()]);
-            out.push_str(&replacement);
+            any_nonempty = true;
+            let gap = &input[last_end..m.start()];
+            out.push_str(&combine_sub_gap::<W, S>(gap, replacement)?);
         }
         last_end = m.end();
     }
+    if !any_nonempty {
+        return Ok(input.to_string());
+    }
     out.push_str(&input[last_end..]);
     Ok(out)
+}
+
+/// Combine a `sub`/`gsub` match's preceding gap text with its (already
+/// evaluated) replacement value -- the `$gap + $inserts[$ix]` step of jq's
+/// real `sub`/`gsub` (`src/builtin.jq`, #1034).
+///
+/// A `String` replacement (the overwhelmingly common case, and the only
+/// shape a bare `+` would need at all) is concatenated directly, with no
+/// `arith_add`/`OwnedValue` detour -- avoiding the extra allocation and
+/// unreachable-arm coupling a fully generic `+` call would add to this
+/// per-match hot path (#1034 review). Anything else falls back to
+/// jq-mode's real `+`-based accumulator (`arith_add`, `null` included via
+/// its own identity rule) or yq-mode's pre-#1034 "must already be a
+/// string" check -- **not** real yq's own `sub`/`gsub` coercion (confirmed
+/// live against yq v4.53.3: a non-string replacement stringifies and
+/// concatenates instead of erroring, e.g. `sub("a";5)` on `"abc"` is
+/// `"5bc"`); #1034 only fixed jq-mode's wording, so yq keeps its prior
+/// (still not yq-accurate, but not newly regressed) behavior here rather
+/// than silently changing under jq's `+`-based rules -- real yq-compatible
+/// `sub`/`gsub` coercion is its own follow-up (#1052).
+///
+/// Deliberately called once per match, from a single loop over all matches
+/// in order (`stitch_replacements_evaluated`) rather than from a
+/// pre-collected `Vec` of already-evaluated replacements: real jq's
+/// `reduce` evaluates and combines one match at a time, so a type failure
+/// at match N must abort *before* match N+1's replacement filter is ever
+/// invoked -- an earlier two-pass version of this fix (evaluate every
+/// match's replacement first, validate types in a second pass) broke that
+/// ordering, letting a later match's own `error(...)` mask an earlier
+/// match's genuine type mismatch (caught by #1050's review, confirmed live
+/// against jq 1.7.1).
+///
+/// No `optional`-gated arm on either error path: `optional` is never forced
+/// `true` reaching a nested `Call` node like `sub`/`gsub` (see
+/// `Expr::Optional`'s dispatch in `eval_single`, #693) -- a bare
+/// `sub(...)?` suppresses these errors via the ancestor `eval_try`'s catch,
+/// and `isvalid(sub(...))` via `isvalid`'s own error-catching (it evaluates
+/// with `optional: false`, not forced-`true`, despite an older comment
+/// elsewhere claiming otherwise). Confirmed dead per #928/#1003's identical
+/// finding elsewhere in this file: dedicated `sub(...)?`/`isvalid(sub(...))`
+/// tests for both branches still showed 0 coverage hits on the guards
+/// themselves.
+#[cfg(feature = "regex")]
+fn combine_sub_gap<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    gap: &str,
+    replacement: OwnedValue,
+) -> Result<String, QueryResult<'a, W>> {
+    if let OwnedValue::String(s) = replacement {
+        let mut combined = String::with_capacity(gap.len() + s.len());
+        combined.push_str(gap);
+        combined.push_str(&s);
+        return Ok(combined);
+    }
+    if S::TAG == EvalTag::Yq {
+        return Err(QueryResult::Error(EvalError::type_error(
+            "string",
+            "replacement",
+        )));
+    }
+    match arith_add::<S>(OwnedValue::String(gap.to_string()), replacement) {
+        Ok(OwnedValue::String(combined)) => Ok(combined),
+        Ok(other) => {
+            unreachable!("gap + replacement always yields a String or errors, got {other:?}")
+        }
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// Builtin: scan(re) - find all matches
@@ -8312,12 +8372,16 @@ fn sub_with_resolved_pattern<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     Err(qr) => return qr,
                 };
             match replacement {
+                // #1034: gap + replacement via `combine_sub_gap`, same
+                // reasoning as `stitch_replacements_evaluated`.
                 Some(replacement) => {
-                    let mut out = String::with_capacity(input.len());
-                    out.push_str(&input[..m.start()]);
-                    out.push_str(&replacement);
-                    out.push_str(&input[m.end()..]);
-                    QueryResult::Owned(OwnedValue::String(out))
+                    match combine_sub_gap::<W, S>(&input[..m.start()], replacement) {
+                        Ok(mut out) => {
+                            out.push_str(&input[m.end()..]);
+                            QueryResult::Owned(OwnedValue::String(out))
+                        }
+                        Err(qr) => qr,
+                    }
                 }
                 // The single-match specialization of the all-matches-empty
                 // rule `stitch_replacements_evaluated` implements for gsub
@@ -29740,6 +29804,118 @@ mod tests {
             QueryResult::Owned(OwnedValue::String(s)) => {
                 assert_eq!(s, "aXbXcX");
             }
+        );
+    }
+
+    #[cfg(feature = "regex")]
+    #[test]
+    fn test_regex_sub_gsub_replacement_accumulator_wording_1034() {
+        // #1034: real jq's sub/gsub (`src/builtin.jq`) build each match's
+        // output via `$gap + $inserts[$ix]` -- a genuine `+` against the
+        // preceding gap text, not a bespoke "must be a string" check. A
+        // non-string replacement now surfaces jq's own binary-op wording,
+        // naming the gap (not the whole input) as the left operand.
+        // Confirmed live against jq 1.7.1.
+        query!(br#""a""#, r#"sub("a"; 5)"#,
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "string (\"\") and number (5) cannot be added");
+            }
+        );
+        query!(br#""aa""#, r#"gsub("a"; 5)"#,
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "string (\"\") and number (5) cannot be added");
+            }
+        );
+        // The gap is whatever text precedes the match, not always empty --
+        // confirms the error names the *local* gap, not the accumulated
+        // output so far.
+        query!(br#""hello""#, r#"sub("(?<x>l+)"; 5)"#,
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "string (\"he\") and number (5) cannot be added");
+            }
+        );
+        // Array/object/bool replacements surface the same wording, matching
+        // join's #1003 divergence from `tostring`-style leniency.
+        query!(br#""a""#, r#"sub("a"; [1, 2])"#,
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "string (\"\") and array ([1,2]) cannot be added");
+            }
+        );
+        query!(br#""a""#, r#"sub("a"; {"x": 1})"#,
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "string (\"\") and object ({\"x\":1}) cannot be added");
+            }
+        );
+        // A `null` replacement is jq's own `+`-identity, not an error --
+        // deletes the match, keeping only the gap. Confirmed live.
+        query!(br#""abc""#, r#"sub("a"; null)"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "bc");
+            }
+        );
+        // `sub(...)?` still suppresses the error to None, same #693/#928
+        // reasoning as #1003's join(...)? -- the ancestor eval_try's catch,
+        // not a locally forced `optional`.
+        query!(br#""a""#, r#"sub("a"; 5)?"#,
+            QueryResult::None => {}
+        );
+        // `isvalid` reports `false` here too, via its own error-catching
+        // (it evaluates with `optional: false`, not forced -- `builtin_isvalid`
+        // ignores its own `optional` parameter entirely, per its doc
+        // comment), not through any `optional`-gated arm inside
+        // `combine_sub_gap` -- there isn't one, per that function's own doc
+        // comment above.
+        query!(br#""a""#, r#"isvalid(sub("a"; 5))"#,
+            QueryResult::Owned(OwnedValue::Bool(false)) => {}
+        );
+    }
+
+    #[cfg(feature = "regex")]
+    #[test]
+    fn test_regex_gsub_replacement_type_error_aborts_before_later_match_1034() {
+        // #1050 review: an earlier, two-pass version of #1034's fix (collect
+        // every match's evaluated replacement first, validate types in a
+        // second pass) broke jq's strict left-to-right reduce semantics --
+        // a later match's replacement filter (including its own side
+        // effects / genuine error()) would run even though an earlier
+        // match's type mismatch should have aborted the whole call first.
+        // Confirmed live against jq 1.7.1: this errors on match "a"'s type
+        // mismatch, and match "b"'s error("second ran") never fires.
+        query!(br#""ab""#, r#"gsub("(?<x>[ab])"; if .x == "a" then 5 else error("second ran") end)"#,
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "string (\"\") and number (5) cannot be added");
+            }
+        );
+    }
+
+    #[cfg(feature = "regex")]
+    #[test]
+    fn test_regex_sub_yq_mode_keeps_pre_1034_replacement_type_check() {
+        // #1050 review: #1034's arith_add-based jq wording fix is jq-only --
+        // real yq's own sub/gsub coercion diverges from jq's `+`-based rules
+        // (confirmed live against yq v4.53.3: a non-string replacement
+        // stringifies and concatenates instead of erroring, e.g.
+        // `sub("a";5)` on `"abc"` is `"5bc"`, `sub("a";null)` is `"nullbc"`).
+        // Neither succinctly's pre-#1034 nor post-#1034 yq-mode behavior
+        // matches that, so #1034 deliberately keeps yq on its pre-existing
+        // "replacement must already be a string" check rather than silently
+        // adopting jq's `+`-based rules under yq mode too -- #1052 tracks
+        // real yq-compatible sub/gsub coercion as its own follow-up.
+        yq_query!(br#""abc""#, r#"sub("a"; 5)"#,
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "expected string, got replacement");
+            }
+        );
+        yq_query!(br#""abc""#, r#"sub("a"; null)"#,
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "expected string, got replacement");
+            }
+        );
+        // `isvalid` reports `false` here too, via its own error-catching --
+        // not through any `optional`-gated arm inside `combine_sub_gap`,
+        // which has none (see that function's own doc comment).
+        yq_query!(br#""abc""#, r#"isvalid(sub("a"; 5))"#,
+            QueryResult::Owned(OwnedValue::Bool(false)) => {}
         );
     }
 
