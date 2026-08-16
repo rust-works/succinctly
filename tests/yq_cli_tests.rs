@@ -11933,3 +11933,17 @@ fn test_json_input_inplace_does_not_reintroduce_decimal_point_1051() -> Result<(
     assert_eq!(rewritten.trim_end(), r#"{"a":100,"b":"100"}"#);
     Ok(())
 }
+
+/// #1052: `sub`/`gsub`'s non-string replacement coercion is only ever
+/// exercised at the library level (`yq_query!` in `src/jq/eval.rs`)
+/// elsewhere, which can't observe the CLI's own exit code -- pre-#1052 this
+/// call exited non-zero with "Error: expected string, got replacement";
+/// confirm the fix's exit-code flip is visible through the actual binary a
+/// script would invoke, not just the internal `QueryResult` shape.
+#[test]
+fn test_sub_yq_mode_non_string_replacement_exits_zero_1052() -> Result<()> {
+    let (output, code) = run_yq_stdin(r#"sub("a"; 5)"#, "\"abc\"\n", &["-o", "json"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#""5bc""#);
+    Ok(())
+}

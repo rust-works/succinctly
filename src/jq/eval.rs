@@ -30157,6 +30157,19 @@ mod tests {
                 assert_eq!(s, "bc");
             }
         );
+        yq_query!(br#""abc""#, r#"sub("a"; [])"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "bc");
+            }
+        );
+        // An *empty* object is the one exception to the container-is-empty
+        // rule: it stringifies to the literal text "{}", not "" the way an
+        // empty array or a non-empty object both do (confirmed live).
+        yq_query!(br#""abc""#, r#"sub("a"; {})"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "{}bc");
+            }
+        );
         // Never errors any more, so isvalid reports true (was false
         // pre-#1052).
         yq_query!(br#""abc""#, r#"isvalid(sub("a"; 5))"#,
