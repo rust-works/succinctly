@@ -5450,6 +5450,34 @@ fn test_yq_json_output_special_floats_still_null_after_1060() -> Result<()> {
     Ok(())
 }
 
+/// #1060 code review: `test_yq_tostring_special_floats_use_yaml_spelling_1060`
+/// above (`.a | tostring` on a *document-sourced* scalar) doesn't actually
+/// exercise `eval.rs`'s own `builtin_tostring` -- a direct field access
+/// resolves through `eval_generic.rs`'s cursor-based `Builtin::ToString` arm
+/// instead, which already called `numeric_display_string` correctly before
+/// this fix. `builtin_tostring`'s *own* `OwnedValue::Float` arm (only
+/// reached via the reindex bridge -- `nan`/`infinite`'s jq-builtin
+/// evaluation, `--slurp`, `-i` with an expression `can_use_m2_streaming`
+/// doesn't allow-list, `reduce`/`foreach`, ...) had a separate, unfixed
+/// `format!("{f}")` that this exact test caught live: `nan | tostring` gave
+/// `"NaN"` instead of `.nan`, silently inconsistent with `nan | @text`
+/// (documented in CLAUDE.md as "same as tostring") which already gave
+/// `.nan`.
+#[test]
+fn test_yq_tostring_computed_nan_uses_yaml_spelling_1060() -> Result<()> {
+    for filter in ["nan | tostring", "(0/0) | tostring"] {
+        let (stdout, code) = run_yq_stdin(filter, "a: 1\n", &["-r"])?;
+        assert_eq!(code, 0, "for {filter:?}: {stdout:?}");
+        assert_eq!(stdout.trim_end(), ".nan", "for {filter:?}");
+    }
+    // `@text` is documented as identical to `tostring` -- confirm they now
+    // agree on the same computed value.
+    let (stdout, code) = run_yq_stdin("nan | @text", "a: 1\n", &["-r"])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), ".nan");
+    Ok(())
+}
+
 #[test]
 fn test_build_configuration_flag() -> Result<()> {
     // --build-configuration prints diagnostics and exits successfully.

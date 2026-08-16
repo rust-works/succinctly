@@ -5857,8 +5857,7 @@ fn builtin_tostring<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         OwnedValue::Bool(true) => "true".to_string(),
         OwnedValue::Bool(false) => "false".to_string(),
         OwnedValue::Int(n) => format!("{n}"),
-        OwnedValue::Float(f) => format!("{f}"),
-        OwnedValue::NumberLiteral(..) => numeric_display_string::<S>(&owned),
+        OwnedValue::Float(_) | OwnedValue::NumberLiteral(..) => numeric_display_string::<S>(&owned),
         OwnedValue::Array(_) | OwnedValue::Object(_) => owned_value_to_json::<S>(&owned),
     };
     QueryResult::Owned(OwnedValue::String(s))
