@@ -3879,6 +3879,44 @@ mod tests {
     use crate::jq::parse;
     use crate::json::JsonIndex;
 
+    /// #1048: the yq/generic-document counterpart to #1043's `eval.rs` fix
+    /// had the identical missing `0 => None` bug in 3 places -- a computed
+    /// index/slice whose optional (`?`) form produces zero results
+    /// collapsed to `Many`/`ManyOwned`/`ManyCursor(vec![])` instead of
+    /// `None`.
+    #[test]
+    fn test_1048_computed_index_and_slice_zero_results_collapse_to_none() {
+        let json = br"5";
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+
+        // Key-outer/target-inner loop, borrowed target (`.` is the document
+        // itself, a number -- not indexable, so `?` suppresses to zero
+        // results per key).
+        let result = eval(&parse(r#".[("a", "b")]?"#).unwrap(), value.clone());
+        assert!(
+            matches!(result, GenericResult::None),
+            "expected None, got {result:?}"
+        );
+
+        // Owned-target arm: `(1)` constructs an owned value rather than
+        // borrowing from the document.
+        let result = eval(&parse(r#"(1)[("a", "b")]?"#).unwrap(), value.clone());
+        assert!(
+            matches!(result, GenericResult::None),
+            "expected None, got {result:?}"
+        );
+
+        // eval_slice_expr's final collapse: slicing a non-array/string
+        // target with `?` suppresses to zero results per (start, end) pair.
+        let result = eval(&parse(r".[0:1]?").unwrap(), value);
+        assert!(
+            matches!(result, GenericResult::None),
+            "expected None, got {result:?}"
+        );
+    }
+
     #[test]
     fn test_generic_identity() {
         let json = br#"{"name": "Alice", "age": 30}"#;
