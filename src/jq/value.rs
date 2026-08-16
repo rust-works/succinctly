@@ -841,8 +841,8 @@ impl OwnedValue {
 
     /// Serialize this value as JSON for `eval_generic`'s cursor-reindexing
     /// bridge, preserving ±Infinity via a self-overflowing literal
-    /// (`1e999`/`-1e999`) and NaN via [`NAN_SENTINEL`] instead of
-    /// [`to_json`](Self::to_json)'s `"null"` substitution.
+    /// (`1e999`/`-1e999`) and NaN via a reserved internal sentinel instead
+    /// of [`to_json`](Self::to_json)'s `"null"` substitution.
     ///
     /// `to_json()`'s "null" is correct for actual JSON *output* (RFC 8259
     /// forbids Infinity/NaN), but wrong for this purely-internal round-trip:
@@ -868,7 +868,7 @@ impl OwnedValue {
     /// correct `[[[5]]]` to `[[[5.0]]]` (caught in code review) since
     /// `format_number_jq_compat` does not strip an explicit `.0` back off a
     /// literal it's handed after the reparse.
-    pub(crate) fn to_json_for_reindex<S: EvalSemantics>(&self) -> String {
+    pub fn to_json_for_reindex<S: EvalSemantics>(&self) -> String {
         self.to_json_for_reindex_at_depth::<S>(0)
     }
 

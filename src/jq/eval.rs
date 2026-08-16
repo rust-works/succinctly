@@ -2795,7 +2795,7 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
         // Process control (#791)
         Builtin::Halt => builtin_halt::<W>(),
-        Builtin::Stderr => builtin_stderr::<W>(value, optional),
+        Builtin::Stderr => builtin_stderr::<W, S>(value, optional),
         Builtin::HaltError => builtin_halt_error::<W, S>(None, value, optional),
         Builtin::HaltErrorCode(code) => builtin_halt_error::<W, S>(Some(code), value, optional),
 
@@ -21396,14 +21396,14 @@ fn builtin_halt<'a, W: Clone + AsRef<[u64]>>() -> QueryResult<'a, W> {
 /// non-finite float to `null`; that gap predates this builtin and reaches
 /// every JSON-output path in the evaluator, not just `stderr`, so closing it
 /// here alone would be inconsistent — tracked as a separate concern.
-fn builtin_stderr<W: Clone + AsRef<[u64]>>(
+fn builtin_stderr<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'_, W>,
     _optional: bool,
 ) -> QueryResult<'_, W> {
     let owned = to_owned(&value);
     match &owned {
         OwnedValue::String(s) => write_stderr(s),
-        other => write_stderr(&other.to_json()),
+        other => write_stderr(&owned_value_to_json::<S>(other)),
     }
     QueryResult::Owned(owned)
 }
@@ -21461,7 +21461,7 @@ fn builtin_halt_error<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     match &owned {
         OwnedValue::Null => {}
         OwnedValue::String(s) => write_stderr(s),
-        other => write_stderr(&format!("{}\n", other.to_json())),
+        other => write_stderr(&format!("{}\n", owned_value_to_json::<S>(other))),
     }
     QueryResult::Halt(code)
 }

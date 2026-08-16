@@ -11689,3 +11689,125 @@ fn test_yq_map_values_overflow_int_keeps_decimal_point_953() -> Result<()> {
     assert_eq!(stdout.trim_end(), r#"{"a":100000000000000000000.0}"#);
     Ok(())
 }
+
+/// #1051 item 1: `stderr` had no `S: EvalSemantics` parameter at all, so its
+/// container arm always formatted via jq rules regardless of mode.
+#[test]
+fn test_yq_stderr_preserves_exponent_literal_1051() -> Result<()> {
+    let (_stdout, stderr, code) =
+        run_yq_stdin_with_stderr(".a | stderr | empty", "a: [1e2, x]\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(stderr.trim_end(), r#"[1e2,"x"]"#);
+    Ok(())
+}
+
+/// #1051 item 2: `halt_error`'s trailing container arm ignored `S::TAG` and
+/// always called `.to_json()`, even though `S` was already in scope.
+#[test]
+fn test_yq_halt_error_preserves_exponent_literal_1051() -> Result<()> {
+    let (_stdout, stderr, _code) =
+        run_yq_stdin_with_stderr(".a | halt_error", "a: [1e2, x]\n", &[])?;
+    assert_eq!(stderr.trim_end(), r#"[1e2,"x"]"#);
+    Ok(())
+}
+
+/// #1051 item 4 (most severe) — see `evaluate_input`'s own doc comment in
+/// `src/bin/succinctly/yq_runner.rs` for the mechanism. Pinned against real
+/// yq's identical operation.
+#[test]
+fn test_yq_inplace_tostring_does_not_corrupt_untouched_sibling_field_1051() -> Result<()> {
+    let mut input_file = NamedTempFile::new()?;
+    writeln!(input_file, "a: 1e2")?;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .arg("yq")
+        .arg("-i")
+        .arg(".b = (.a | tostring)")
+        .arg(input_file.path())
+        .stdin(Stdio::null())
+        .output()?;
+
+    assert!(output.status.success());
+    let rewritten = std::fs::read_to_string(input_file.path())?;
+    // Real yq (v4.53.3) gives byte-for-byte: `a: 1e2\nb: "1e2"\n` — `a` is
+    // left completely untouched, `b` echoes `.a`'s literal spelling verbatim.
+    assert_eq!(rewritten, "a: 1e2\nb: \"1e2\"\n");
+    Ok(())
+}
+
+/// #1051 code review: the first draft of the fix above switched
+/// `evaluate_input`'s round trip to `to_json_yq()`, which substitutes
+/// JSON's `null` for a non-finite `Float`/`NumberLiteral` (correct for
+/// actual JSON *output*, RFC 8259 forbids Infinity/NaN) — but this
+/// round-trip is purely internal, so a non-finite sibling field got
+/// silently corrupted to `null` the same way the decimal-point bug
+/// corrupted `1e2` above. Confirmed live: `-i '.b = (.a | tostring)'` on
+/// `a: .inf` rewrote it to `a: null`. Fixed by routing through
+/// `to_json_for_reindex::<YqSemantics>()` instead, which preserves
+/// ±Infinity/NaN through the reparse. `b`'s own spelling (`tostring` on a
+/// non-finite value) is intentionally not asserted here — a separate,
+/// pre-existing gap in `numeric_display_string`, filed as #1060.
+#[test]
+fn test_yq_inplace_tostring_does_not_corrupt_untouched_nonfinite_sibling_field_1051() -> Result<()>
+{
+    for scalar in [".inf", "-.inf", ".nan"] {
+        let mut input_file = NamedTempFile::new()?;
+        writeln!(input_file, "a: {scalar}\nc: keep")?;
+
+        let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+            .arg("yq")
+            .arg("-i")
+            .arg(".b = (.a | tostring)")
+            .arg(input_file.path())
+            .stdin(Stdio::null())
+            .output()?;
+
+        assert!(output.status.success(), "for {scalar:?}");
+        let rewritten = std::fs::read_to_string(input_file.path())?;
+        assert!(
+            rewritten.starts_with(&format!("a: {scalar}\n")),
+            "for {scalar:?}: {rewritten:?}"
+        );
+        assert!(
+            rewritten.contains("c: keep"),
+            "for {scalar:?}: {rewritten:?}"
+        );
+    }
+    Ok(())
+}
+
+/// #1051 code review, second regression: the first attempt at routing
+/// `evaluate_input`'s reindex bridge through a yq-aware float formatter
+/// (`to_json_for_reindex::<YqSemantics>()`) broke #978's own guarantee that
+/// a JSON-sourced number, already collapsed to a plain `Float` by
+/// `canonicalize_json_numbers`, must never regain a decimal point through
+/// this round trip (`--input-format json`'s `1e2` -> `100`, not `100.0`).
+/// `test_json_input_slurp_canonicalizes_exponent_literal_spelling_978` above
+/// already caught this live in CI; this test pins the same interaction via
+/// `--inplace`'s DOM fallback specifically, the other `evaluate_input` entry
+/// point #1051 touched (`--slurp` alone wasn't enough to prove both paths
+/// stayed fixed).
+#[test]
+fn test_json_input_inplace_does_not_reintroduce_decimal_point_1051() -> Result<()> {
+    let mut input_file = NamedTempFile::new()?;
+    write!(input_file, "{{\"a\":1e2}}")?;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .arg("yq")
+        .arg("--input-format")
+        .arg("json")
+        .arg("-o")
+        .arg("json")
+        .arg("-I")
+        .arg("0")
+        .arg("-i")
+        .arg(".b = (.a | tostring)")
+        .arg(input_file.path())
+        .stdin(Stdio::null())
+        .output()?;
+
+    assert!(output.status.success());
+    let rewritten = std::fs::read_to_string(input_file.path())?;
+    assert_eq!(rewritten.trim_end(), r#"{"a":100,"b":"100"}"#);
+    Ok(())
+}
