@@ -106,9 +106,9 @@ pub enum NumberRepr {
 
 /// Try `i64` first, fall back to `f64` -- the one definition of "how does a
 /// number string decide between the two representations," shared by
-/// [`OwnedValue::from_number_literal_boxed`] and
-/// [`OwnedValue::from_number_bytes`] so they can't silently diverge.
-fn parse_i64_or_f64(s: &str) -> Option<NumberRepr> {
+/// [`OwnedValue::from_number_literal_boxed`], [`OwnedValue::from_number_bytes`],
+/// and `parser.rs`'s `fold_index_key` so they can't silently diverge.
+pub(crate) fn parse_i64_or_f64(s: &str) -> Option<NumberRepr> {
     if let Ok(i) = s.parse::<i64>() {
         Some(NumberRepr::Int(i))
     } else if let Ok(f) = s.parse::<f64>() {

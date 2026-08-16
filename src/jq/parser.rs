@@ -37,6 +37,7 @@ use super::expr::{
     ArithOp, AssignOp, Builtin, CompareOp, Expr, FormatType, Import, Include, Literal, MergeFlags,
     MetaValue, ModuleMeta, ObjectEntry, ObjectKey, Pattern, PatternEntry, Program, StringPart,
 };
+use super::value::{parse_i64_or_f64, NumberRepr};
 
 /// Parser mode controls syntax differences between jq and yq.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -353,12 +354,10 @@ impl<'a> Parser<'a> {
         }
 
         // Check for decimal point
-        let mut is_float = false;
         if self.peek() == Some('.') {
             // Look ahead to ensure it's not `..` (recursive descent)
             if self.peek_str(2) != ".." {
                 self.next(); // consume the dot
-                is_float = true;
 
                 // Consume fractional digits
                 while let Some(c) = self.peek() {
@@ -374,7 +373,6 @@ impl<'a> Parser<'a> {
         // Check for exponent
         if matches!(self.peek(), Some('e' | 'E')) {
             self.next();
-            is_float = true;
 
             // Optional sign
             if matches!(self.peek(), Some('+' | '-')) {
@@ -391,25 +389,28 @@ impl<'a> Parser<'a> {
             }
         }
 
+        let num_str = &self.input[start..self.pos];
+        let Some(repr) = parse_i64_or_f64(num_str) else {
+            return Err(ParseError::new("invalid number", start));
+        };
         // #1035: keep the literal's own source spelling (e.g. `1.500`,
         // `1e2`) instead of immediately collapsing it to a freshly-formatted
         // f64/i64 -- matches how document-parsed numbers already preserve
-        // their spelling via `OwnedValue::NumberLiteral`. The parse attempts
-        // below are validity checks only (same int-with-float-overflow-
-        // fallback rule as before); `Literal::NumberLiteral` derives its
-        // actual numeric value from the stored text on demand.
-        let num_str = &self.input[start..self.pos];
-        let valid = if is_float {
-            num_str.parse::<f64>().is_ok()
-        } else {
-            // Integer literal; on i64 overflow fall back to float like jq,
-            // which represents all numbers as doubles.
-            num_str.parse::<i64>().is_ok() || num_str.parse::<f64>().is_ok()
-        };
-        if valid {
+        // their spelling via `OwnedValue::NumberLiteral`. Only for
+        // RFC-8259-valid spellings, though: jq's own filter grammar is
+        // looser than JSON's (`1.`/`007` are valid jq number tokens jq
+        // itself reformats to `1`/`7`), and echoing one of those verbatim
+        // through `NumberLiteral` would leak invalid JSON out through
+        // `@json`/string interpolation -- `from_number_bytes` gates on the
+        // identical check for document numbers, for the identical reason
+        // (see its own doc comment).
+        if crate::json::validate::is_valid_number(num_str.as_bytes()) {
             Ok(Literal::NumberLiteral(num_str.to_string()))
         } else {
-            Err(ParseError::new("invalid number", start))
+            Ok(match repr {
+                NumberRepr::Int(i) => Literal::int(i),
+                NumberRepr::Float(f) => Literal::float(f),
+            })
         }
     }
 
@@ -760,17 +761,34 @@ impl<'a> Parser<'a> {
             // #1035: a source-text-preserving numeric literal folds the same
             // way -- an index's fast-path only needs the value, not its
             // original spelling (there's no "index formatting" to preserve).
-            Expr::Literal(Literal::NumberLiteral(text)) => {
-                if let Ok(i) = text.parse::<i64>() {
-                    Some(Expr::Index(i))
-                } else if let Ok(f) = text.parse::<f64>() {
-                    if f.fract() == 0.0 && f >= i64::MIN as f64 && f <= i64::MAX as f64 {
-                        Some(Expr::Index(f as i64))
-                    } else {
-                        None
-                    }
-                } else {
-                    None
+            // Reuses `parse_i64_or_f64` (the one shared int-vs-float decision,
+            // per its own doc comment) rather than a second hand-rolled copy.
+            Expr::Literal(Literal::NumberLiteral(text)) => match parse_i64_or_f64(text)? {
+                NumberRepr::Int(i) => Some(Expr::Index(i)),
+                NumberRepr::Float(f)
+                    if f.fract() == 0.0 && f >= i64::MIN as f64 && f <= i64::MAX as f64 =>
+                {
+                    Some(Expr::Index(f as i64))
+                }
+                NumberRepr::Float(_) => None,
+            },
+            // #1035: a jq-mode negative float/exponent index/slice-bound
+            // literal (e.g. `.[-1.0]`) parses as `-1 * <positive literal>`
+            // (see `parse_primary_inner`'s negative-literal split), not a
+            // bare `Literal` -- see through that specific shape too, or
+            // every such key silently loses this fast path and downgrades
+            // to a runtime `IndexExpr`/`DynamicSlice`. The inner literal's
+            // own fold is always non-negative (the sign was already
+            // stripped when this shape was built), so negating its folded
+            // index can never overflow i64.
+            Expr::Arithmetic {
+                op: ArithOp::Mul(_),
+                left,
+                right,
+            } if matches!(**left, Expr::Literal(Literal::Int(-1))) => {
+                match Self::fold_index_key(right)? {
+                    Expr::Index(i) => Some(Expr::Index(-i)),
+                    _ => None,
                 }
             }
             _ => None,
@@ -990,19 +1008,30 @@ impl<'a> Parser<'a> {
                         // unary negation, not part of the number token --
                         // confirmed against jq 1.7.1, where `-1.500`/`-1e2`
                         // print `-1.5`/`-100` (fidelity collapses through
-                        // the implied subtraction) while `1.500`/`1e2` print
-                        // unchanged. A plain negative *integer* has no
-                        // alternate spelling to lose (no fraction, no
+                        // the implied negation) while `1.500`/`1e2` print
+                        // unchanged. yq is the opposite: real yq never
+                        // collapses a negative literal's fidelity either
+                        // (`-1.500`/`-1e2` print back unchanged), so this
+                        // rewrite is jq-only. A plain negative *integer* has
+                        // no alternate spelling to lose (no fraction, no
                         // exponent), so folding `-` into the token there
-                        // stays unobservable -- and it's what preserves
-                        // succinctly's i64::MIN-exact-literal capability
-                        // (see `test_large_integer_literal_falls_back_to_float`),
-                        // which routing through subtraction would degrade to
+                        // stays unobservable in jq mode either way -- and
+                        // it's what preserves succinctly's
+                        // i64::MIN-exact-literal capability (see
+                        // `test_large_integer_literal_falls_back_to_float`),
+                        // which routing through arithmetic would degrade to
                         // a lossy float, unlike jq's double-only model.
-                        Literal::NumberLiteral(text) if text.contains(['.', 'e', 'E']) => {
+                        Literal::NumberLiteral(text)
+                            if self.mode == ParserMode::Jq && text.contains(['.', 'e', 'E']) =>
+                        {
+                            // Multiply rather than subtract from zero:
+                            // `0.0 - 0.0` is IEEE-754 positive zero,
+                            // silently losing the sign of `-0.0`/`-0e0`
+                            // (jq itself prints `-0` for these); `-1.0 *
+                            // 0.0` correctly preserves it.
                             Ok(Expr::Arithmetic {
-                                op: ArithOp::Sub,
-                                left: Box::new(Expr::Literal(Literal::Int(0))),
+                                op: ArithOp::Mul(MergeFlags::default()),
+                                left: Box::new(Expr::Literal(Literal::Int(-1))),
                                 right: Box::new(Expr::Literal(Literal::NumberLiteral(
                                     text[1..].to_string(),
                                 ))),
