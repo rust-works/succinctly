@@ -15085,9 +15085,12 @@ fn accumulate_path_context_step<'a, W: Clone + AsRef<[u64]>>(
             None
         }
         // `eval_fanout` (used by `Select`) returns these borrowed-cursor
-        // variants even from an all-owned-value call site -- e.g. a `select`
-        // whose condition matched nothing produces `Many(vec![])`, not
-        // `None` -- so this must convert, not treat them as unreachable.
+        // variants even from an all-owned-value call site -- e.g. `select`
+        // on a truthy condition hands back the input as `One(value)`, a
+        // genuine borrowed cursor, not `Owned` -- so this must convert, not
+        // treat them as unreachable. (A `select` that matched nothing now
+        // collapses to a bare `None` instead, since #1043 gave
+        // `eval_fanout`'s tail match its missing `0 => None` arm.)
         QueryResult::One(v) => {
             results.push(to_owned(&v));
             None
@@ -15126,8 +15129,11 @@ fn continue_rest_with_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 ) -> QueryResult<'a, W> {
     // `eval_fanout` (reached via `Select`) can hand back its borrowed-cursor
     // variants (`One`/`Many`) even here, not just Owned/ManyOwned -- e.g. a
-    // `select` that matched nothing produces `Many(vec![])` -- so those
-    // convert via `to_owned` instead of being treated as unreachable.
+    // `select` on a truthy condition hands back the input as a genuine
+    // borrowed `One` -- so those convert via `to_owned` instead of being
+    // treated as unreachable. (A `select` that matched nothing now
+    // collapses to a bare `None` instead, since #1043 gave `eval_fanout`'s
+    // tail match its missing `0 => None` arm.)
     match intermediate.materialize_cursor() {
         QueryResult::Owned(v) => eval_pipe_with_path_context_internal::<W, S>(
             rest,
@@ -24162,7 +24168,7 @@ mod tests {
         // `0 => None` bug -- a computed index/slice whose optional (`?`)
         // form produces zero results collapsed to `Many(vec![])`/
         // `ManyOwned(vec![])` instead of `None`. Confirmed live against jq
-        // 1.7.1 (all four exit 0 with no output there too).
+        // 1.7.1 (all three exit 0 with no output there too).
         //
         // Borrowed target (`.` is the document itself, a number -- not
         // indexable, so `?` suppresses to zero results per key).
@@ -26722,10 +26728,9 @@ mod tests {
             }
         );
 
-        // select outputs nothing if condition is false. `eval_fanout` shares
-        // `eval_comma`'s empty-merge shape (`Many(vec![])`, not a bare
-        // `None`) — `outputs()` is deliberately variant-agnostic about that,
-        // per its own doc comment.
+        // select outputs nothing if condition is false, collapsing to a bare
+        // `None` since #1043 — `outputs()` is deliberately variant-agnostic
+        // about the exact `QueryResult` shape, per its own doc comment.
         assert!(outputs(br"2", "select(. > 3)").is_empty());
     }
 
