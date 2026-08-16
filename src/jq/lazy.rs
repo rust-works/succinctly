@@ -170,6 +170,7 @@ impl<'a, W: Clone + AsRef<[u64]>> JqValue<'a, W> {
         match lit {
             Literal::Null => JqValue::Null,
             Literal::Bool(b) => JqValue::Bool(*b),
+            Literal::NumberLiteral(text) => JqValue::NumberLiteral(text.as_str().into()),
             Literal::Int(n) => JqValue::Int(*n),
             Literal::Float(f) => JqValue::Float(*f),
             Literal::String(s) => JqValue::String(s.clone()),

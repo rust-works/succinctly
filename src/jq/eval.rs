@@ -756,6 +756,7 @@ fn literal_to_owned(lit: &Literal) -> OwnedValue {
     match lit {
         Literal::Null => OwnedValue::Null,
         Literal::Bool(b) => OwnedValue::Bool(*b),
+        Literal::NumberLiteral(text) => OwnedValue::from_number_literal(text),
         Literal::Int(n) => OwnedValue::Int(*n),
         Literal::Float(f) => OwnedValue::Float(*f),
         Literal::String(s) => OwnedValue::String(s.clone()),
@@ -13577,11 +13578,12 @@ fn owned_to_expr_at_depth(value: &OwnedValue, depth: usize) -> Expr {
         OwnedValue::Bool(b) => Expr::Literal(Literal::Bool(*b)),
         OwnedValue::Int(i) => Expr::Literal(Literal::Int(*i)),
         OwnedValue::Float(f) => Expr::Literal(Literal::Float(*f)),
-        // A filter `Literal` has no source-text slot (out of scope -- see
-        // #387's plan), so a document-sourced literal degrades to its plain
-        // parsed form here, same as it does after arithmetic.
-        OwnedValue::NumberLiteral(NumberRepr::Int(i), _) => Expr::Literal(Literal::Int(*i)),
-        OwnedValue::NumberLiteral(NumberRepr::Float(f), _) => Expr::Literal(Literal::Float(*f)),
+        // #1035: `Literal::NumberLiteral` now has a source-text slot too,
+        // so a document-sourced literal keeps its own spelling through this
+        // splice instead of degrading to a freshly-formatted f64/i64.
+        OwnedValue::NumberLiteral(_, text) => {
+            Expr::Literal(Literal::NumberLiteral(text.to_string()))
+        }
         OwnedValue::String(s) => Expr::Literal(Literal::String(s.clone())),
         OwnedValue::Array(arr) => {
             // Build array construction expression with all elements

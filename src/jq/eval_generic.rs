@@ -2524,6 +2524,9 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
         Expr::Literal(lit) => match lit {
             Literal::Null => GenericResult::Owned(OwnedValue::Null),
             Literal::Bool(b) => GenericResult::Owned(OwnedValue::Bool(*b)),
+            Literal::NumberLiteral(text) => {
+                GenericResult::Owned(OwnedValue::from_number_literal(text))
+            }
             Literal::Int(i) => GenericResult::Owned(OwnedValue::Int(*i)),
             Literal::Float(f) => GenericResult::Owned(OwnedValue::Float(*f)),
             Literal::String(s) => GenericResult::Owned(OwnedValue::String(s.clone())),

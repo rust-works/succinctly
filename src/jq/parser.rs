@@ -391,20 +391,25 @@ impl<'a> Parser<'a> {
             }
         }
 
+        // #1035: keep the literal's own source spelling (e.g. `1.500`,
+        // `1e2`) instead of immediately collapsing it to a freshly-formatted
+        // f64/i64 -- matches how document-parsed numbers already preserve
+        // their spelling via `OwnedValue::NumberLiteral`. The parse attempts
+        // below are validity checks only (same int-with-float-overflow-
+        // fallback rule as before); `Literal::NumberLiteral` derives its
+        // actual numeric value from the stored text on demand.
         let num_str = &self.input[start..self.pos];
-        if is_float {
-            num_str
-                .parse::<f64>()
-                .map(Literal::Float)
-                .map_err(|_| ParseError::new("invalid number", start))
+        let valid = if is_float {
+            num_str.parse::<f64>().is_ok()
         } else {
             // Integer literal; on i64 overflow fall back to float like jq,
             // which represents all numbers as doubles.
-            num_str
-                .parse::<i64>()
-                .map(Literal::Int)
-                .or_else(|_| num_str.parse::<f64>().map(Literal::Float))
-                .map_err(|_| ParseError::new("invalid number", start))
+            num_str.parse::<i64>().is_ok() || num_str.parse::<f64>().is_ok()
+        };
+        if valid {
+            Ok(Literal::NumberLiteral(num_str.to_string()))
+        } else {
+            Err(ParseError::new("invalid number", start))
         }
     }
 
@@ -752,6 +757,22 @@ impl<'a> Parser<'a> {
             {
                 Some(Expr::Index(*f as i64))
             }
+            // #1035: a source-text-preserving numeric literal folds the same
+            // way -- an index's fast-path only needs the value, not its
+            // original spelling (there's no "index formatting" to preserve).
+            Expr::Literal(Literal::NumberLiteral(text)) => {
+                if let Ok(i) = text.parse::<i64>() {
+                    Some(Expr::Index(i))
+                } else if let Ok(f) = text.parse::<f64>() {
+                    if f.fract() == 0.0 && f >= i64::MIN as f64 && f <= i64::MAX as f64 {
+                        Some(Expr::Index(f as i64))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
             _ => None,
         }
     }
@@ -964,7 +985,31 @@ impl<'a> Parser<'a> {
                     .is_some_and(|c| c.is_ascii_digit())
                 {
                     let lit = self.parse_number_literal()?;
-                    Ok(Expr::Literal(lit))
+                    match lit {
+                        // #1035: jq's own grammar treats a leading `-` as
+                        // unary negation, not part of the number token --
+                        // confirmed against jq 1.7.1, where `-1.500`/`-1e2`
+                        // print `-1.5`/`-100` (fidelity collapses through
+                        // the implied subtraction) while `1.500`/`1e2` print
+                        // unchanged. A plain negative *integer* has no
+                        // alternate spelling to lose (no fraction, no
+                        // exponent), so folding `-` into the token there
+                        // stays unobservable -- and it's what preserves
+                        // succinctly's i64::MIN-exact-literal capability
+                        // (see `test_large_integer_literal_falls_back_to_float`),
+                        // which routing through subtraction would degrade to
+                        // a lossy float, unlike jq's double-only model.
+                        Literal::NumberLiteral(text) if text.contains(['.', 'e', 'E']) => {
+                            Ok(Expr::Arithmetic {
+                                op: ArithOp::Sub,
+                                left: Box::new(Expr::Literal(Literal::Int(0))),
+                                right: Box::new(Expr::Literal(Literal::NumberLiteral(
+                                    text[1..].to_string(),
+                                ))),
+                            })
+                        }
+                        lit => Ok(Expr::Literal(lit)),
+                    }
                 } else {
                     // Unary minus: negate the following expression
                     // Implemented as (0 - expr)

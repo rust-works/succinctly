@@ -1104,6 +1104,15 @@ pub enum Literal {
     Null,
     /// true or false
     Bool(bool),
+    /// A number literal written directly in filter source text, keeping its
+    /// original spelling (e.g. `1.500`, `1e2`) the same way document-parsed
+    /// numbers do via `OwnedValue::NumberLiteral` (#1035) -- jq always
+    /// echoes a number literal's own source text back out rather than a
+    /// freshly-formatted `f64`/`i64` rendering, and `parse`'s tokenizer
+    /// already has that text on hand for free. `Int`/`Float` below remain
+    /// for internally-synthesized literals (e.g. desugaring) that have no
+    /// source text to preserve.
+    NumberLiteral(String),
     /// Integer number
     Int(i64),
     /// Floating-point number

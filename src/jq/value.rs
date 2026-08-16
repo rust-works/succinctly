@@ -451,12 +451,13 @@ pub enum OwnedValue {
     Int(i64),
     /// JSON floating-point number
     Float(f64),
-    /// A number materialized straight from a document token, carrying jq's
-    /// exact source spelling (e.g. `1e100`, `1.0`, `-0.0`) alongside its
-    /// parsed value.
+    /// A number materialized straight from a document token or a filter's
+    /// own literal text, carrying jq's exact source spelling (e.g. `1e100`,
+    /// `1.0`, `-0.0`) alongside its parsed value.
     ///
-    /// Produced only by `to_owned`-style conversions out of a document
-    /// cursor; every other constructor keeps using [`Int`](Self::Int)/
+    /// Produced by `to_owned`-style conversions out of a document cursor,
+    /// and (since #1035) by `Literal::NumberLiteral`'s own evaluation --
+    /// every *other* constructor keeps using [`Int`](Self::Int)/
     /// [`Float`](Self::Float) directly. Arithmetic, comparison, and math
     /// builtins treat this exactly like `Int`/`Float` for computation --
     /// only formatting (`to_json`, `tostring`, `@json`, string
@@ -1189,6 +1190,7 @@ impl From<Literal> for OwnedValue {
         match lit {
             Literal::Null => Self::Null,
             Literal::Bool(b) => Self::Bool(b),
+            Literal::NumberLiteral(text) => Self::from_number_literal_boxed(text.into()),
             Literal::Int(n) => Self::Int(n),
             Literal::Float(f) => Self::Float(f),
             Literal::String(s) => Self::String(s),
