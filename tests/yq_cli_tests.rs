@@ -11647,7 +11647,7 @@ fn test_yq_join_preserves_exponent_literal_in_separator_1030() -> Result<()> {
     // to reach the separator without the source-fidelity loss those two
     // paths have (confirmed pre-existing on unpatched `main`, out of this
     // issue's scope).
-    let (stdout, code) = run_yq_stdin(r#".arr | join(.[0])"#, "arr: [1e2, a, b]\n", &["-r"])?;
+    let (stdout, code) = run_yq_stdin(r".arr | join(.[0])", "arr: [1e2, a, b]\n", &["-r"])?;
     assert_eq!(code, 0);
     assert_eq!(stdout.trim_end(), "1e21e2a1e2b");
     Ok(())
