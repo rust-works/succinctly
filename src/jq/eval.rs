@@ -23982,25 +23982,31 @@ mod tests {
     }
 
     #[test]
-    fn test_substitute_vars_number_literal_degrades_to_plain_literal_387() {
+    fn test_substitute_vars_number_literal_preserves_source_text_387_1035() {
         // `substitute_vars` (the `--arg`/`--argjson`-style public API) inlines
-        // each variable's value into the AST via `owned_to_expr`. Unlike a
-        // document-sourced value flowing through a builtin argument,
-        // `Expr::Literal` has no source-text slot (#387's documented scope
-        // boundary -- see `owned_to_expr`'s doc comment), so a `NumberLiteral`
-        // substituted in degrades to its plain parsed value: the substituted
-        // filter's own re-evaluation loses jq's canonical spelling and falls
-        // back to Rust's `f64`/`i64` Display, same as any other computed
-        // (non-passthrough) number.
+        // each variable's value into the AST via `owned_to_expr`. #387's
+        // originally-documented scope boundary here -- `Expr::Literal` had
+        // no source-text slot, so a `NumberLiteral` substituted in degraded
+        // to its plain parsed value -- is now closed by #1035:
+        // `Literal::NumberLiteral` carries the same source text
+        // `OwnedValue::NumberLiteral` does, so the substituted filter's own
+        // re-evaluation keeps jq's canonical spelling instead of falling
+        // back to Rust's `f64`/`i64` Display.
         let expr = parse("$n").unwrap();
 
         let int_lit = OwnedValue::from_number_literal("42");
         let substituted = substitute_vars(&expr, [("n", &int_lit)]);
-        assert_eq!(substituted, Expr::Literal(Literal::Int(42)));
+        assert_eq!(
+            substituted,
+            Expr::Literal(Literal::NumberLiteral("42".to_string()))
+        );
 
         let float_lit = OwnedValue::from_number_literal("1e100");
         let substituted = substitute_vars(&expr, [("n", &float_lit)]);
-        assert_eq!(substituted, Expr::Literal(Literal::Float(1e100)));
+        assert_eq!(
+            substituted,
+            Expr::Literal(Literal::NumberLiteral("1e100".to_string()))
+        );
 
         let index = JsonIndex::build(b"null");
         let cursor = index.root(b"null");
@@ -24010,8 +24016,8 @@ mod tests {
                 .iter()
                 .map(OwnedValue::to_json)
                 .collect::<Vec<_>>(),
-            // Not jq's "1E+100" -- see the doc comment above.
-            ["1e100".parse::<f64>().unwrap().to_string()]
+            // jq's own canonical spelling, not Rust's f64 Display -- #1035.
+            ["1E+100"]
         );
     }
 
@@ -24305,12 +24311,50 @@ mod tests {
         );
 
         query!(br"{}", "42",
-            QueryResult::Owned(OwnedValue::Int(42)) => {}
+            QueryResult::Owned(
+                OwnedValue::Int(42) | OwnedValue::NumberLiteral(NumberRepr::Int(42), _)
+            ) => {}
         );
 
         query!(br"{}", "\"hello\"",
             QueryResult::Owned(OwnedValue::String(s)) if s == "hello" => {}
         );
+    }
+
+    /// #1035: a numeric literal written directly in filter text keeps its
+    /// own source spelling through evaluation, exactly like a
+    /// document-sourced number already does via `OwnedValue::NumberLiteral`
+    /// -- verified against jq 1.7.1, which prints `1.500`/`1E+2` unchanged
+    /// for these same filters (real jq only ever collapses a literal's
+    /// spelling once it passes through an operation that produces a *new*
+    /// number, e.g. arithmetic).
+    #[test]
+    fn test_1035_filter_literal_numeric_fidelity() {
+        assert_eq!(outputs(b"null", "[1.500]"), ["[1.500]"]);
+        assert_eq!(outputs(b"null", "1e2"), ["1E+2"]);
+        assert_eq!(outputs(b"null", "1.500"), ["1.500"]);
+
+        // Arithmetic still collapses fidelity to a freshly-formatted
+        // number, same as a document-sourced `NumberLiteral` already does.
+        assert_eq!(outputs(b"null", "1.500 + 0"), ["1.5"]);
+    }
+
+    /// #1035: jq's own grammar treats a leading `-` before a number literal
+    /// as unary negation (`0 - N`), not as part of the number token itself
+    /// -- confirmed against jq 1.7.1, whose `-1.500`/`-1e2` print
+    /// `-1.5`/`-100` (fidelity collapses through the implied subtraction),
+    /// unlike the positive spelling. A plain negative *integer* has no
+    /// alternate spelling to lose, so it keeps folding into one token (see
+    /// `test_large_integer_literal_falls_back_to_float` for why: that keeps
+    /// succinctly's i64::MIN-exact-literal capability, which jq's
+    /// double-only model can't represent either way).
+    #[test]
+    fn test_1035_negative_float_literal_collapses_fidelity_like_jq() {
+        assert_eq!(outputs(b"null", "-1.500"), ["-1.5"]);
+        assert_eq!(outputs(b"null", "-1e2"), ["-100"]);
+        // A negative integer literal is unaffected -- still one token, no
+        // spelling to lose.
+        assert_eq!(outputs(b"null", "-123"), ["-123"]);
     }
 
     #[test]
@@ -24948,7 +24992,9 @@ mod tests {
 
         // Falsy value (null) uses alternative
         query!(br#"{"a": null}"#, ".a // 0",
-            QueryResult::Owned(OwnedValue::Int(0)) => {}
+            QueryResult::Owned(
+                OwnedValue::Int(0) | OwnedValue::NumberLiteral(NumberRepr::Int(0), _)
+            ) => {}
         );
 
         // Missing value uses alternative
@@ -24958,7 +25004,9 @@ mod tests {
 
         // Chain alternatives
         query!(br#"{"a": null, "b": null}"#, ".a // .b // 42",
-            QueryResult::Owned(OwnedValue::Int(42)) => {}
+            QueryResult::Owned(
+                OwnedValue::Int(42) | OwnedValue::NumberLiteral(NumberRepr::Int(42), _)
+            ) => {}
         );
     }
 
@@ -24981,7 +25029,9 @@ mod tests {
         // through to the right side, since `.a?` never produces `Error` in
         // the first place.
         query!(br"1", ".a? // 3",
-            QueryResult::Owned(OwnedValue::Int(3)) => {}
+            QueryResult::Owned(
+                OwnedValue::Int(3) | OwnedValue::NumberLiteral(NumberRepr::Int(3), _)
+            ) => {}
         );
     }
 
@@ -25457,10 +25507,14 @@ mod tests {
         // (verified against jq 1.7.1); `last` never short-circuits, so it
         // always sees the error.
         query!(b"null", r#"first(1,2,error("x"))"#,
-            QueryResult::Owned(OwnedValue::Int(1)) => {}
+            QueryResult::Owned(
+                OwnedValue::Int(1) | OwnedValue::NumberLiteral(NumberRepr::Int(1), _)
+            ) => {}
         );
         query!(b"null", r#"nth(1; 1,2,error("x"))"#,
-            QueryResult::Owned(OwnedValue::Int(2)) => {}
+            QueryResult::Owned(
+                OwnedValue::Int(2) | OwnedValue::NumberLiteral(NumberRepr::Int(2), _)
+            ) => {}
         );
         query!(b"null", r#"nth(5; 1,2,error("x"))"#,
             QueryResult::Error(e) => {
@@ -25948,12 +26002,16 @@ mod tests {
         // `nth` stops at index `n`, so the break is reached only when the
         // prefix is too short.
         query!(b"null", "nth(1; 1,2,break $out)",
-            QueryResult::Owned(OwnedValue::Int(2)) => {}
+            QueryResult::Owned(
+                OwnedValue::Int(2) | OwnedValue::NumberLiteral(NumberRepr::Int(2), _)
+            ) => {}
         );
         assert_collapses_to_break(b"null", "nth(5; 1,2,break $out)");
         // Same split for `first`.
         query!(b"null", "first(1,2,break $out)",
-            QueryResult::Owned(OwnedValue::Int(1)) => {}
+            QueryResult::Owned(
+                OwnedValue::Int(1) | OwnedValue::NumberLiteral(NumberRepr::Int(1), _)
+            ) => {}
         );
         // A `limit` operand that is a *bare* break still reaches its label —
         // the arm that used to swallow it.
@@ -26098,12 +26156,16 @@ mod tests {
     fn test_if_then_else() {
         // Basic if-then-else: true condition
         query!(br#"{"a": true}"#, "if .a then 1 else 2 end",
-            QueryResult::Owned(OwnedValue::Int(1)) => {}
+            QueryResult::Owned(
+                OwnedValue::Int(1) | OwnedValue::NumberLiteral(NumberRepr::Int(1), _)
+            ) => {}
         );
 
         // Basic if-then-else: false condition
         query!(br#"{"a": false}"#, "if .a then 1 else 2 end",
-            QueryResult::Owned(OwnedValue::Int(2)) => {}
+            QueryResult::Owned(
+                OwnedValue::Int(2) | OwnedValue::NumberLiteral(NumberRepr::Int(2), _)
+            ) => {}
         );
 
         // If with comparison condition
@@ -26113,12 +26175,16 @@ mod tests {
 
         // If with null condition (falsy)
         query!(br#"{"a": null}"#, "if .a then 1 else 2 end",
-            QueryResult::Owned(OwnedValue::Int(2)) => {}
+            QueryResult::Owned(
+                OwnedValue::Int(2) | OwnedValue::NumberLiteral(NumberRepr::Int(2), _)
+            ) => {}
         );
 
         // If with number condition (truthy, even 0)
         query!(br#"{"a": 0}"#, "if .a then 1 else 2 end",
-            QueryResult::Owned(OwnedValue::Int(1)) => {}
+            QueryResult::Owned(
+                OwnedValue::Int(1) | OwnedValue::NumberLiteral(NumberRepr::Int(1), _)
+            ) => {}
         );
     }
 
@@ -26148,7 +26214,9 @@ mod tests {
         );
 
         query!(br#"{"a": true}"#, "if .a then 1 end",
-            QueryResult::Owned(OwnedValue::Int(1)) => {}
+            QueryResult::Owned(
+                OwnedValue::Int(1) | OwnedValue::NumberLiteral(NumberRepr::Int(1), _)
+            ) => {}
         );
     }
 
@@ -26504,7 +26572,9 @@ mod tests {
 
         // try inside if with actual error
         query!(br#"{"a": 123}"#, "if true then try .a.foo catch 0 else 1 end",
-            QueryResult::Owned(OwnedValue::Int(0)) => {}
+            QueryResult::Owned(
+                OwnedValue::Int(0) | OwnedValue::NumberLiteral(NumberRepr::Int(0), _)
+            ) => {}
         );
 
         // Nested if with arithmetic
@@ -30942,13 +31012,17 @@ mod tests {
     #[test]
     fn test_first_last_expr_comma_generator_argument() {
         query!(br"null", r"first(1,2,3)",
-            QueryResult::Owned(OwnedValue::Int(n)) => {
+            QueryResult::Owned(
+                OwnedValue::Int(n) | OwnedValue::NumberLiteral(NumberRepr::Int(n), _)
+            ) => {
                 assert_eq!(n, 1);
             }
         );
 
         query!(br"null", r"last(1,2,3)",
-            QueryResult::Owned(OwnedValue::Int(n)) => {
+            QueryResult::Owned(
+                OwnedValue::Int(n) | OwnedValue::NumberLiteral(NumberRepr::Int(n), _)
+            ) => {
                 assert_eq!(n, 3);
             }
         );

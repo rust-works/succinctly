@@ -4511,7 +4511,7 @@ mod tests {
         assert_eq!(
             parse("(1)?").unwrap(),
             Expr::Optional(Box::new(Expr::Paren(Box::new(Expr::Literal(
-                Literal::Int(1)
+                Literal::NumberLiteral("1".to_string())
             )))))
         );
     }
@@ -4605,7 +4605,7 @@ mod tests {
     /// with the first two untransformed.
     #[test]
     fn test_comma_binds_tighter_than_pipe() {
-        let int = |i| Expr::Literal(Literal::Int(i));
+        let int = |i: i64| Expr::Literal(Literal::NumberLiteral(i.to_string()));
 
         // (1,2) | 3 — not 1, (2 | 3)
         assert_eq!(
@@ -4650,7 +4650,7 @@ mod tests {
     /// expression, so only the *last* comma operand is bound (#462).
     #[test]
     fn test_as_binds_inside_comma_operand() {
-        let int = |i| Expr::Literal(Literal::Int(i));
+        let int = |i: i64| Expr::Literal(Literal::NumberLiteral(i.to_string()));
 
         // 1, (2 as $x | $x) — not (1,2) as $x | $x
         assert_eq!(
@@ -4685,8 +4685,14 @@ mod tests {
             other => panic!("expected an object, got {other:?}"),
         };
         assert_eq!(entries.len(), 2, "the `,` must separate two entries");
-        assert_eq!(entries[0].value, Expr::Literal(Literal::Int(1)));
-        assert_eq!(entries[1].value, Expr::Literal(Literal::Int(2)));
+        assert_eq!(
+            entries[0].value,
+            Expr::Literal(Literal::NumberLiteral("1".to_string()))
+        );
+        assert_eq!(
+            entries[1].value,
+            Expr::Literal(Literal::NumberLiteral("2".to_string()))
+        );
 
         // Parens are how a value fans out, and they still work.
         let entries = match parse("{a: (1,2)}").unwrap() {
@@ -4757,9 +4763,9 @@ mod tests {
         assert_eq!(
             parse("first(1,2,3)").unwrap(),
             Expr::FirstExpr(Box::new(Expr::Comma(vec![
-                Expr::Literal(Literal::Int(1)),
-                Expr::Literal(Literal::Int(2)),
-                Expr::Literal(Literal::Int(3)),
+                Expr::Literal(Literal::NumberLiteral("1".to_string())),
+                Expr::Literal(Literal::NumberLiteral("2".to_string())),
+                Expr::Literal(Literal::NumberLiteral("3".to_string())),
             ])))
         );
 
@@ -4767,12 +4773,12 @@ mod tests {
         assert_eq!(
             parse("[limit(2;1,2,3,4)]").unwrap(),
             Expr::Array(Box::new(Expr::Limit {
-                n: Box::new(Expr::Literal(Literal::Int(2))),
+                n: Box::new(Expr::Literal(Literal::NumberLiteral("2".to_string()))),
                 expr: Box::new(Expr::Comma(vec![
-                    Expr::Literal(Literal::Int(1)),
-                    Expr::Literal(Literal::Int(2)),
-                    Expr::Literal(Literal::Int(3)),
-                    Expr::Literal(Literal::Int(4)),
+                    Expr::Literal(Literal::NumberLiteral("1".to_string())),
+                    Expr::Literal(Literal::NumberLiteral("2".to_string())),
+                    Expr::Literal(Literal::NumberLiteral("3".to_string())),
+                    Expr::Literal(Literal::NumberLiteral("4".to_string())),
                 ])),
             }))
         );
@@ -4864,9 +4870,18 @@ mod tests {
         assert_eq!(parse("null").unwrap(), Expr::Literal(Literal::Null));
         assert_eq!(parse("true").unwrap(), Expr::Literal(Literal::Bool(true)));
         assert_eq!(parse("false").unwrap(), Expr::Literal(Literal::Bool(false)));
-        assert_eq!(parse("42").unwrap(), Expr::Literal(Literal::Int(42)));
-        assert_eq!(parse("-123").unwrap(), Expr::Literal(Literal::Int(-123)));
-        assert_eq!(parse("2.5").unwrap(), Expr::Literal(Literal::Float(2.5)));
+        assert_eq!(
+            parse("42").unwrap(),
+            Expr::Literal(Literal::NumberLiteral("42".to_string()))
+        );
+        assert_eq!(
+            parse("-123").unwrap(),
+            Expr::Literal(Literal::NumberLiteral("-123".to_string()))
+        );
+        assert_eq!(
+            parse("2.5").unwrap(),
+            Expr::Literal(Literal::NumberLiteral("2.5".to_string()))
+        );
         assert_eq!(
             parse("\"hello\"").unwrap(),
             Expr::Literal(Literal::String("hello".into()))
@@ -4879,32 +4894,36 @@ mod tests {
 
     #[test]
     fn test_large_integer_literal_falls_back_to_float() {
-        // Literals beyond i64 range degrade to floats like jq (issue #166).
+        // Literals beyond i64 range degrade to floats like jq (issue #166),
+        // but #1035 keeps the literal's own source spelling rather than
+        // immediately collapsing it to a freshly-formatted f64 -- the value
+        // still *evaluates* as a float (see the `from_number_literal`
+        // conversion), only the AST node's stored text is unaffected here.
         assert_eq!(
             parse("9999999999999999999").unwrap(),
-            Expr::Literal(Literal::Float(1e19))
+            Expr::Literal(Literal::NumberLiteral("9999999999999999999".to_string()))
         );
         assert_eq!(
             parse("-9999999999999999999").unwrap(),
-            Expr::Literal(Literal::Float(-1e19))
+            Expr::Literal(Literal::NumberLiteral("-9999999999999999999".to_string()))
         );
         // One past the boundary in each direction.
         assert_eq!(
             parse("9223372036854775808").unwrap(),
-            Expr::Literal(Literal::Float(9.223372036854776e18))
+            Expr::Literal(Literal::NumberLiteral("9223372036854775808".to_string()))
         );
         assert_eq!(
             parse("-9223372036854775809").unwrap(),
-            Expr::Literal(Literal::Float(-9.223372036854776e18))
+            Expr::Literal(Literal::NumberLiteral("-9223372036854775809".to_string()))
         );
         // Boundary values stay exact integers.
         assert_eq!(
             parse("9223372036854775807").unwrap(),
-            Expr::Literal(Literal::Int(i64::MAX))
+            Expr::Literal(Literal::NumberLiteral("9223372036854775807".to_string()))
         );
         assert_eq!(
             parse("-9223372036854775808").unwrap(),
-            Expr::Literal(Literal::Int(i64::MIN))
+            Expr::Literal(Literal::NumberLiteral("-9223372036854775808".to_string()))
         );
     }
 
@@ -5411,14 +5430,14 @@ mod tests {
             Expr::slice_by(
                 Expr::Identity,
                 Some(Expr::Var("a".into())),
-                Some(Expr::Literal(Literal::Int(1))),
+                Some(Expr::Literal(Literal::NumberLiteral("1".to_string()))),
             )
         );
         assert_eq!(
             parse(".[1:$b]").unwrap(),
             Expr::slice_by(
                 Expr::Identity,
-                Some(Expr::Literal(Literal::Int(1))),
+                Some(Expr::Literal(Literal::NumberLiteral("1".to_string()))),
                 Some(Expr::Var("b".into())),
             )
         );
@@ -5471,8 +5490,8 @@ mod tests {
             Expr::index_by(
                 Expr::Identity,
                 Expr::Comma(vec![
-                    Expr::Literal(Literal::Int(1)),
-                    Expr::Literal(Literal::Int(2)),
+                    Expr::Literal(Literal::NumberLiteral("1".to_string())),
+                    Expr::Literal(Literal::NumberLiteral("2".to_string())),
                 ])
             )
         );

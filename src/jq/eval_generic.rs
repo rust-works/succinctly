@@ -3868,6 +3868,7 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
 #[cfg(test)]
 mod tests {
     use super::super::expr::FormatType;
+    use super::super::value::NumberRepr;
     use super::*;
     use crate::jq::parse;
     use crate::json::JsonIndex;
@@ -7401,10 +7402,20 @@ mod tests {
         let value = index.root(json).value();
 
         let first = eval(&crate::jq::parse("first(1)").unwrap(), value.clone());
-        assert!(matches!(first, GenericResult::Owned(OwnedValue::Int(1))));
+        assert!(matches!(
+            first,
+            GenericResult::Owned(
+                OwnedValue::Int(1) | OwnedValue::NumberLiteral(NumberRepr::Int(1), _)
+            )
+        ));
 
         let last = eval(&crate::jq::parse("last(1)").unwrap(), value);
-        assert!(matches!(last, GenericResult::Owned(OwnedValue::Int(1))));
+        assert!(matches!(
+            last,
+            GenericResult::Owned(
+                OwnedValue::Int(1) | OwnedValue::NumberLiteral(NumberRepr::Int(1), _)
+            )
+        ));
     }
 
     #[test]
@@ -7417,10 +7428,20 @@ mod tests {
         let value = index.root(json).value();
 
         let first = eval(&crate::jq::parse("first(1,2,3)").unwrap(), value.clone());
-        assert!(matches!(first, GenericResult::Owned(OwnedValue::Int(1))));
+        assert!(matches!(
+            first,
+            GenericResult::Owned(
+                OwnedValue::Int(1) | OwnedValue::NumberLiteral(NumberRepr::Int(1), _)
+            )
+        ));
 
         let last = eval(&crate::jq::parse("last(1,2,3)").unwrap(), value);
-        assert!(matches!(last, GenericResult::Owned(OwnedValue::Int(3))));
+        assert!(matches!(
+            last,
+            GenericResult::Owned(
+                OwnedValue::Int(3) | OwnedValue::NumberLiteral(NumberRepr::Int(3), _)
+            )
+        ));
     }
 
     #[test]
@@ -7484,7 +7505,12 @@ mod tests {
             &crate::jq::parse(r#"first(1,2,error("x"))"#).unwrap(),
             value,
         );
-        assert!(matches!(result, GenericResult::Owned(OwnedValue::Int(1))));
+        assert!(matches!(
+            result,
+            GenericResult::Owned(
+                OwnedValue::Int(1) | OwnedValue::NumberLiteral(NumberRepr::Int(1), _)
+            )
+        ));
     }
 
     #[test]
