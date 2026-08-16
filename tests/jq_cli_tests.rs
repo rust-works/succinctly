@@ -5924,17 +5924,24 @@ fn test_sub_with_flags_reports_invalid_regex_error() -> Result<()> {
     Ok(())
 }
 
-/// `eval_sub_replacement`'s non-optional type-mismatch arm (#826): once a
-/// match is found, the replacement expression is evaluated per match and
-/// must produce a string. Real jq also errors here (`string ("") and number
-/// (5) cannot be added`, from its own `+=`-based definition) -- succinctly's
-/// wording differs (a direct type check) but the exit code matches. Verified
-/// against jq 1.7.1: `jq 'sub("a"; 5)'` on `"abc"` exits 5.
+/// `stitch_replacements_evaluated`'s (and `sub_with_resolved_pattern`'s
+/// single-match arm's) non-optional type-mismatch case (#826, wording fixed
+/// by #1034): once a match is found, the replacement expression is
+/// evaluated per match and combined with the preceding gap text via
+/// `arith_add` (jq's real `sub`/`gsub` builds `$gap + $inserts[$ix]`,
+/// `src/builtin.jq`), so a non-string replacement now surfaces jq's own
+/// binary-op wording byte-for-byte instead of a bespoke message. Verified
+/// against jq 1.7.1: `jq 'sub("a"; 5)'` on `"abc"` exits 5 with exactly this
+/// stderr text.
 #[test]
 fn test_sub_replacement_wrong_type_errors() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(&["-c", r#"sub("a"; 5)"#], Some(r#""abc""#))?;
     assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
     assert_eq!(stdout, "");
+    assert_eq!(
+        stderr,
+        "jq: error (at <stdin>:0): string (\"\") and number (5) cannot be added\n"
+    );
     Ok(())
 }
 
@@ -5979,15 +5986,19 @@ fn test_sub_replacement_wrong_type_optional_via_isvalid() -> Result<()> {
 
 /// `builtin_sub_with_flags`'s `global` arm (3-arg `sub(re; replacement;
 /// "g")`, i.e. `sub` used as `gsub` via an explicit flag) propagating a
-/// replacement error through `stitch_replacements_evaluated` (#826) -- a
-/// distinct call site from plain `gsub`'s own error propagation tested
-/// above. Verified against jq 1.7.1: `jq 'sub("a"; 5; "g")'` on `"abc"`
-/// exits 5.
+/// replacement error through `stitch_replacements_evaluated` (#826, wording
+/// fixed by #1034) -- a distinct call site from plain `gsub`'s own error
+/// propagation tested above. Verified against jq 1.7.1: `jq 'sub("a"; 5;
+/// "g")'` on `"abc"` exits 5 with exactly this stderr text.
 #[test]
 fn test_sub_with_flags_global_replacement_wrong_type_errors() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(&["-c", r#"sub("a"; 5; "g")"#], Some(r#""abc""#))?;
     assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
     assert_eq!(stdout, "");
+    assert_eq!(
+        stderr,
+        "jq: error (at <stdin>:0): string (\"\") and number (5) cannot be added\n"
+    );
     Ok(())
 }
 

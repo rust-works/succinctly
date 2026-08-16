@@ -29774,6 +29774,60 @@ mod tests {
 
     #[cfg(feature = "regex")]
     #[test]
+    fn test_regex_sub_gsub_replacement_accumulator_wording_1034() {
+        // #1034: real jq's sub/gsub (`src/builtin.jq`) build each match's
+        // output via `$gap + $inserts[$ix]` -- a genuine `+` against the
+        // preceding gap text, not a bespoke "must be a string" check. A
+        // non-string replacement now surfaces jq's own binary-op wording,
+        // naming the gap (not the whole input) as the left operand.
+        // Confirmed live against jq 1.7.1.
+        query!(br#""a""#, r#"sub("a"; 5)"#,
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "string (\"\") and number (5) cannot be added");
+            }
+        );
+        query!(br#""aa""#, r#"gsub("a"; 5)"#,
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "string (\"\") and number (5) cannot be added");
+            }
+        );
+        // The gap is whatever text precedes the match, not always empty --
+        // confirms the error names the *local* gap, not the accumulated
+        // output so far.
+        query!(br#""hello""#, r#"sub("(?<x>l+)"; 5)"#,
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "string (\"he\") and number (5) cannot be added");
+            }
+        );
+        // Array/object/bool replacements surface the same wording, matching
+        // join's #1003 divergence from `tostring`-style leniency.
+        query!(br#""a""#, r#"sub("a"; [1, 2])"#,
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "string (\"\") and array ([1,2]) cannot be added");
+            }
+        );
+        query!(br#""a""#, r#"sub("a"; {"x": 1})"#,
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "string (\"\") and object ({\"x\":1}) cannot be added");
+            }
+        );
+        // A `null` replacement is jq's own `+`-identity, not an error --
+        // deletes the match, keeping only the gap. Confirmed live.
+        query!(br#""abc""#, r#"sub("a"; null)"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "bc");
+            }
+        );
+        // `sub(...)?` still suppresses the error to None, same #693/#928
+        // reasoning as #1003's join(...)? -- the ancestor eval_try's catch,
+        // not a locally forced `optional`.
+        query!(br#""a""#, r#"sub("a"; 5)?"#,
+            QueryResult::None => {}
+        );
+    }
+
+    #[cfg(feature = "regex")]
+    #[test]
     fn test_regex_match() {
         query!(br#""test123test""#, r#"match("[0-9]+")"#,
             QueryResult::Owned(OwnedValue::Object(obj)) => {
