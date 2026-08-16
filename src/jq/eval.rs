@@ -12325,7 +12325,7 @@ fn resolve_seq<'a, S: EvalSemantics>(
     // the one every #530 sibling repro exercises) is exact.
     let tail = &flat[last_dynamic + 1..];
     let mut branches: Vec<PathBranch<'a>> = vec![(Vec::new(), Cow::Borrowed(value))];
-    for element in &flat[..=last_dynamic] {
+    for (i, element) in flat[..=last_dynamic].iter().enumerate() {
         let mut next = Vec::new();
         // Consumes `branches` (not `&branches`) so each `current` arrives by
         // value: only then can `resolve_against_cow` recover the branch's
@@ -12355,8 +12355,25 @@ fn resolve_seq<'a, S: EvalSemantics>(
                     // otherwise the tail's fully-extended result carries
                     // `e` forward via `path_result`, the same pairing
                     // `resolve_slice_expr`'s `target_escape` already uses.
-                    let tailed = apply_static_tail::<S>(next, tail, trackable)?;
-                    return path_result(tailed, Some(e));
+                    //
+                    // Only when `i == last_dynamic`: `tail` is everything
+                    // *after* the pipe's last dynamic element, so an escape
+                    // at an *earlier* dynamic element (i < last_dynamic)
+                    // still has one or more further dynamic stages
+                    // (`flat[i+1..=last_dynamic]`) that haven't run yet —
+                    // splicing `tail` directly onto this stage's branches
+                    // would skip those entirely and fabricate a wrong
+                    // path/value (found in code review, confirmed live
+                    // against jq: `path(.a[(0,error("t"))] | .c[(0,1)] |
+                    // .foo)` produced a bogus `["a",0,"foo"]` instead of
+                    // the pre-existing, already-documented "known
+                    // simplification" truncation this preserves for that
+                    // shape instead).
+                    if i == last_dynamic {
+                        let tailed = apply_static_tail::<S>(next, tail, trackable)?;
+                        return path_result(tailed, Some(e));
+                    }
+                    return Err((next, e));
                 }
             }
         }

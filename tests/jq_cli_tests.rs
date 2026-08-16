@@ -7894,6 +7894,48 @@ fn test_resolve_seq_static_tail_failure_outranks_earlier_fanout_escape_977() -> 
     Ok(())
 }
 
+/// #977 (found in code review of the fix itself): when a pipe has 2+
+/// dynamic (fan-out) elements and an *earlier* one escapes — not the last,
+/// i.e. `flat`'s dynamic element at some index `i < last_dynamic` — the
+/// static tail lives *after* `last_dynamic`, not after `i`. Applying it
+/// directly to `i`'s partial branches (as an early version of this fix
+/// did) skips every dynamic stage between `i` and `last_dynamic` entirely
+/// and fabricates a wrong path/value instead of the pre-existing,
+/// already-documented "known simplification" truncation `resolve_seq`'s
+/// own top comment describes for this exact shape. Verified against jq
+/// 1.7.1: `.c[(0,1)]` (the second dynamic element) must still run before
+/// `.foo` (the tail) is ever applied — the correct output threads through
+/// it (`["a",0,"c",0,"foo"]`/`["a",0,"c",1,"foo"]`); this pins the
+/// truncated-but-honest fallback succinctly's own architecture produces
+/// instead (a pre-existing, accepted limitation for multi-dynamic-element
+/// pipes, not what this test asserts jq itself does).
+#[test]
+fn test_resolve_seq_earlier_fanout_escape_does_not_skip_later_dynamic_stage_977() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r#"path(.a[(0,error("t"))] | .c[(0,1)] | .foo)"#],
+        Some(r#"{"a":[{"c":[{"foo":1},{"foo":2}]}]}"#),
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    // Must not fabricate `["a",0,"foo"]` by skipping `.c[(0,1)]` — the
+    // pre-existing "known simplification" truncates to the partial prefix
+    // through the escaping element instead.
+    assert_eq!(stdout, "[\"a\",0]\n");
+    assert!(stderr.contains('t'), "stderr: {stderr:?}");
+
+    // A second shape, where the skipped-over tail would otherwise silently
+    // resolve against unrelated data and mask the original escape (found
+    // in review): confirms the original deferred "t" still surfaces,
+    // rather than a bogus type error from misapplying `.d` to `.a[0]`.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r#"path(.a[(0,error("t"))] | .k[.c] | .d)"#],
+        Some(r#"{"a":[{"c":"k","k":{"d":99}}]}"#),
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[\"a\",0]\n");
+    assert!(stderr.contains('t'), "stderr: {stderr:?}");
+    Ok(())
+}
+
 /// #896 review round: `GetPath`'s arm only builds its own partial-prefix
 /// branch for the exact single-array-output shape; any other shape (here,
 /// 2+ valid array outputs before the error) falls through to `resolve_leaf`,
