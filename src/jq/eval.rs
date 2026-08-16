@@ -4127,10 +4127,17 @@ fn builtin_join<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Err(e) => return e.into(),
     };
 
+    // No `_ if optional` guard on the non-iterable case below, and no
+    // `optional`-gated arm on either `arith_add` failure further down:
+    // `optional` is never forced `true` reaching a nested `Call` node like
+    // this one (see `Expr::Optional`'s dispatch in `eval_single`, #693) — a
+    // bare `join(...)?` suppresses these errors via the ancestor
+    // `eval_try`'s catch, not locally. Confirmed dead per #928's identical
+    // finding in the regex builtins: a dedicated `join(...)?` test for each
+    // site still showed 0 coverage hits on the guard itself.
     let elements: Vec<OwnedValue> = match &value {
         StandardJson::Array(elements) => (*elements).map(|e| to_owned(&e)).collect(),
         StandardJson::Object(fields) => (*fields).map(|f| to_owned(&f.value())).collect(),
-        _ if optional => return QueryResult::None,
         _ => return QueryResult::Error(EvalError::cannot_iterate(&to_owned(&value))),
     };
 
@@ -4140,13 +4147,7 @@ fn builtin_join<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             None => OwnedValue::String(String::new()),
             Some(a) => match arith_add::<S>(a, sep.clone()) {
                 Ok(v) => v,
-                Err(e) => {
-                    return if optional {
-                        QueryResult::None
-                    } else {
-                        QueryResult::Error(e)
-                    }
-                }
+                Err(e) => return QueryResult::Error(e),
             },
         };
         let right = match elem {
@@ -4159,13 +4160,7 @@ fn builtin_join<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         };
         acc = Some(match arith_add::<S>(left, right) {
             Ok(v) => v,
-            Err(e) => {
-                return if optional {
-                    QueryResult::None
-                } else {
-                    QueryResult::Error(e)
-                }
-            }
+            Err(e) => return QueryResult::Error(e),
         });
     }
 
@@ -27263,10 +27258,13 @@ mod tests {
             }
         );
 
-        // #1003: the `?` suffix suppresses every error path above -- the
-        // non-iterable input, the separator-add failure, and the element-add
-        // failure -- to None instead of propagating. Confirmed live against
-        // jq 1.7.1 (all three are silently empty there too).
+        // #1003: `join(...)?` suppresses every error path above -- the
+        // non-iterable input, the separator-add failure, and the
+        // element-add failure -- to None instead of propagating. This is
+        // the ancestor `eval_try`'s catch at work (#693), not an
+        // `optional`-gated branch inside builtin_join itself -- there isn't
+        // one, per the doc comment above. Confirmed live against jq 1.7.1
+        // (all three are silently empty there too).
         query!(br"5", r#"join(",")?"#,
             QueryResult::None => {}
         );
