@@ -29874,6 +29874,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "regex")]
     #[test]
     fn test_regex_sub_yq_mode_keeps_pre_1034_replacement_type_check() {
         // #1050 review: #1034's arith_add-based jq wording fix is jq-only --
