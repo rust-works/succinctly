@@ -8047,23 +8047,23 @@ fn stitch_replacements_evaluated<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// evaluated) replacement value -- the `$gap + $inserts[$ix]` step of jq's
 /// real `sub`/`gsub` (`src/builtin.jq`, #1034).
 ///
-/// A `String` replacement (the overwhelmingly common case, and the only
-/// shape a bare `+` would need at all) is concatenated directly, with no
-/// `arith_add`/`OwnedValue` detour -- avoiding the extra allocation and
-/// unreachable-arm coupling a fully generic `+` call would add to this
-/// per-match hot path (#1034 review). Anything else falls back to
+/// A `String` replacement (the overwhelmingly common case) is used
+/// directly with no further conversion. Anything else falls back to
 /// jq-mode's real `+`-based accumulator (`arith_add`, `null` included via
 /// its own identity rule) or, in yq mode, real yq's own looser coercion
-/// (#1052): a scalar replacement stringifies and concatenates instead of
-/// erroring (`sub("a";5)` on `"abc"` is `"5bc"`, confirmed live against
-/// yq v4.53.3 for numbers/floats/bools/`null`), while an array/object
+/// (#1052): a scalar replacement stringifies instead of erroring
+/// (`sub("a";5)` on `"abc"` is `"5bc"`, confirmed live against yq v4.53.3
+/// for numbers/floats/bools/`null`), while an array or non-empty object
 /// replacement contributes an *empty* string rather than a JSON
 /// representation (`sub("a";[1,2])` on `"abc"` is `"bc"`, not
 /// `"[1, 2]bc"` -- `tostring()` itself gives the latter, so this isn't
 /// yq's general string-coercion rule; it's presumably an artifact of
 /// yq's underlying go-yaml node model, where only scalar nodes carry a
 /// raw text `Value`, and this call site clearly reads that raw value
-/// rather than reformatting the node like `tostring()` does).
+/// rather than reformatting the node like `tostring()` does). An *empty*
+/// object is the one exception to that container-is-empty rule: it
+/// stringifies to the literal text `"{}"` (confirmed live; why this one
+/// shape alone is exempted isn't yet understood).
 ///
 /// Deliberately called once per match, from a single loop over all matches
 /// in order (`stitch_replacements_evaluated`) rather than from a
@@ -8085,36 +8085,40 @@ fn stitch_replacements_evaluated<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// error-catching (it evaluates with `optional: false`, not forced-`true`,
 /// despite an older comment elsewhere claiming otherwise). Confirmed dead
 /// per #928/#1003's identical finding elsewhere in this file: dedicated
-/// `sub(...)?`/`isvalid(sub(...))` tests for both branches still showed 0
-/// coverage hits on the guards themselves.
+/// `sub(...)?`/`isvalid(sub(...))` tests for jq mode's now-sole error path
+/// still showed 0 coverage hits on the guard itself.
 #[cfg(feature = "regex")]
 fn combine_sub_gap<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     gap: &str,
     replacement: OwnedValue,
 ) -> Result<String, QueryResult<'a, W>> {
-    if let OwnedValue::String(s) = replacement {
-        let mut combined = String::with_capacity(gap.len() + s.len());
-        combined.push_str(gap);
-        combined.push_str(&s);
-        return Ok(combined);
-    }
-    if S::TAG == EvalTag::Yq {
-        let replacement_text = match &replacement {
-            OwnedValue::Array(_) | OwnedValue::Object(_) => String::new(),
-            _ => owned_to_string::<S>(&replacement),
-        };
-        let mut combined = String::with_capacity(gap.len() + replacement_text.len());
-        combined.push_str(gap);
-        combined.push_str(&replacement_text);
-        return Ok(combined);
-    }
-    match arith_add::<S>(OwnedValue::String(gap.to_string()), replacement) {
-        Ok(OwnedValue::String(combined)) => Ok(combined),
-        Ok(other) => {
-            unreachable!("gap + replacement always yields a String or errors, got {other:?}")
+    let replacement_text: Cow<'_, str> = match replacement {
+        OwnedValue::String(s) => Cow::Owned(s),
+        replacement if S::TAG == EvalTag::Yq => match &replacement {
+            OwnedValue::Array(_) => Cow::Borrowed(""),
+            OwnedValue::Object(map) if map.is_empty() => Cow::Borrowed("{}"),
+            OwnedValue::Object(_) => Cow::Borrowed(""),
+            OwnedValue::Null
+            | OwnedValue::Bool(_)
+            | OwnedValue::Int(_)
+            | OwnedValue::Float(_)
+            | OwnedValue::NumberLiteral(..) => Cow::Owned(owned_to_string::<S>(&replacement)),
+            OwnedValue::String(_) => unreachable!("String already matched above"),
+        },
+        replacement => {
+            return match arith_add::<S>(OwnedValue::String(gap.to_string()), replacement) {
+                Ok(OwnedValue::String(combined)) => Ok(combined),
+                Ok(other) => unreachable!(
+                    "gap + replacement always yields a String or errors, got {other:?}"
+                ),
+                Err(e) => Err(e.into()),
+            };
         }
-        Err(e) => Err(e.into()),
-    }
+    };
+    let mut combined = String::with_capacity(gap.len() + replacement_text.len());
+    combined.push_str(gap);
+    combined.push_str(&replacement_text);
+    Ok(combined)
 }
 
 /// Builtin: scan(re) - find all matches
