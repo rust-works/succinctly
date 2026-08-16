@@ -12323,6 +12323,7 @@ fn resolve_seq<'a, S: EvalSemantics>(
     // simplification, not a byte-for-byte reproduction of jq's stream order;
     // the single-dynamic-element case (the overwhelmingly common one, and
     // the one every #530 sibling repro exercises) is exact.
+    let tail = &flat[last_dynamic + 1..];
     let mut branches: Vec<PathBranch<'a>> = vec![(Vec::new(), Cow::Borrowed(value))];
     for element in &flat[..=last_dynamic] {
         let mut next = Vec::new();
@@ -12350,23 +12351,18 @@ fn resolve_seq<'a, S: EvalSemantics>(
                     // mirroring the success path below via the shared
                     // `apply_static_tail` helper. If tail application
                     // itself also fails, that later failure takes priority
-                    // (the same "later step's own failure outranks an
-                    // earlier deferred one" rule `resolve_slice_expr`'s
-                    // `target_escape`/`path_result` pairing already uses);
+                    // over the earlier deferred `e` (propagated via `?`);
                     // otherwise the tail's fully-extended result carries
-                    // the original deferred escape `e`.
-                    let tail = &flat[last_dynamic + 1..];
-                    return match apply_static_tail::<S>(next, tail, trackable) {
-                        Ok(tailed) => Err((tailed, e)),
-                        tail_err => tail_err,
-                    };
+                    // `e` forward via `path_result`, the same pairing
+                    // `resolve_slice_expr`'s `target_escape` already uses.
+                    let tailed = apply_static_tail::<S>(next, tail, trackable)?;
+                    return path_result(tailed, Some(e));
                 }
             }
         }
         branches = next;
     }
 
-    let tail = &flat[last_dynamic + 1..];
     apply_static_tail::<S>(branches, tail, trackable)
 }
 
