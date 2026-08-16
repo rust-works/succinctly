@@ -5476,6 +5476,29 @@ mod tests {
         );
     }
 
+    /// #1035: a negative float/exponent index or slice bound still folds to
+    /// the static `Expr::Index`/`Expr::Slice` fast path, not a runtime
+    /// `IndexExpr`/`DynamicSlice` -- the jq-mode negative-literal split
+    /// (`-1.0` -> `-1 * 1.0`) must not defeat `fold_index_key`'s constant
+    /// folding, which only sees through `Expr::Literal`/`Expr::Paren`
+    /// unless taught this specific `Arithmetic` shape too.
+    #[test]
+    fn test_1035_negative_float_index_and_slice_bound_still_fold_to_static() {
+        assert_eq!(parse(".[-1.0]").unwrap(), Expr::Index(-1));
+        assert_eq!(parse(".[-1e0]").unwrap(), Expr::Index(-1));
+        assert_eq!(
+            parse(".[-3.0:-1.0]").unwrap(),
+            Expr::Slice {
+                start: Some(-3),
+                end: Some(-1),
+            }
+        );
+        // A non-integral negative float still can't fold -- same as the
+        // positive case, it must go through the evaluator to truncate the
+        // way jq does.
+        assert!(matches!(parse(".[-1.5]").unwrap(), Expr::IndexExpr { .. }));
+    }
+
     /// The nesting shape is what encodes jq's key scoping: every key in a
     /// postfix chain is evaluated against the chain's input, which a flat
     /// `Pipe` cannot express (it is also what an explicit `|` lowers to).

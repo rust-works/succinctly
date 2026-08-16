@@ -24340,9 +24340,9 @@ mod tests {
     }
 
     /// #1035: jq's own grammar treats a leading `-` before a number literal
-    /// as unary negation (`0 - N`), not as part of the number token itself
+    /// as unary negation (`-1 * N`), not as part of the number token itself
     /// -- confirmed against jq 1.7.1, whose `-1.500`/`-1e2` print
-    /// `-1.5`/`-100` (fidelity collapses through the implied subtraction),
+    /// `-1.5`/`-100` (fidelity collapses through the implied negation),
     /// unlike the positive spelling. A plain negative *integer* has no
     /// alternate spelling to lose, so it keeps folding into one token (see
     /// `test_large_integer_literal_falls_back_to_float` for why: that keeps
@@ -24355,6 +24355,63 @@ mod tests {
         // A negative integer literal is unaffected -- still one token, no
         // spelling to lose.
         assert_eq!(outputs(b"null", "-123"), ["-123"]);
+    }
+
+    /// #1035: the negative-literal desugaring must negate, not subtract
+    /// from zero -- `0.0 - 0.0` is IEEE-754 positive zero, silently
+    /// dropping the sign jq itself preserves (`jq -- '-0.0'` prints `-0`).
+    /// Regression-tested directly: a same-build binary predating this
+    /// fix's `Mul(-1, _)` rewrite printed plain `0` for all three of these.
+    #[test]
+    fn test_1035_negative_zero_literal_keeps_its_sign() {
+        assert_eq!(outputs(b"null", "-0.0"), ["-0"]);
+        assert_eq!(outputs(b"null", "-0e0"), ["-0"]);
+        assert_eq!(outputs(b"null", "[-0.0]"), ["[-0]"]);
+    }
+
+    /// #1035: a number spelling jq's filter grammar accepts but RFC 8259
+    /// forbids (a bare trailing dot, a leading zero) must still format
+    /// canonically once it reaches `@json`/string interpolation/`tostring`,
+    /// exactly like it always did before this issue's fix -- preserving the
+    /// literal's raw text verbatim here would leak invalid JSON, unlike the
+    /// document-number path (`from_number_bytes`), which has always gated
+    /// on this same check before ever constructing a `NumberLiteral`.
+    #[test]
+    fn test_1035_json_invalid_but_jq_valid_literal_still_formats_canonically() {
+        assert_eq!(outputs(b"null", "1."), ["1"]);
+        assert_eq!(outputs(b"null", "007"), ["7"]);
+        query!(br"null", r#""\(007)""#,
+            QueryResult::Owned(OwnedValue::String(s)) if s == "7" => {}
+        );
+    }
+
+    /// #1035: real yq (unlike jq) never collapses a negative literal's
+    /// fidelity -- `-1.500`/`-1e2` print back unchanged (verified against
+    /// yq v4.53.3), where jq's own `-1.500`/`-1e2` collapse to `-1.5`/
+    /// `-100`. The negative-literal desugaring this issue adds is gated to
+    /// jq mode specifically (`self.mode == ParserMode::Jq` in
+    /// `parse_primary_inner`) so succinctly's shared jq/yq parser doesn't
+    /// wrongly collapse these for yq too.
+    #[test]
+    fn test_1035_yq_mode_never_collapses_negative_literal_fidelity() {
+        yq_query!(br"null", "-1.500",
+            QueryResult::Owned(v) => {
+                assert_eq!(v.to_json_yq(), "-1.500");
+            }
+        );
+        yq_query!(br"null", "-1e2",
+            QueryResult::Owned(v) => {
+                assert_eq!(v.to_json_yq(), "-1e2");
+            }
+        );
+        // Positive fidelity was already covered elsewhere, but the
+        // negative-zero sign specifically diverges from jq mode (yq keeps
+        // `-0.0` verbatim; jq mode's own test above expects `-0`).
+        yq_query!(br"null", "-0.0",
+            QueryResult::Owned(v) => {
+                assert_eq!(v.to_json_yq(), "-0.0");
+            }
+        );
     }
 
     #[test]
