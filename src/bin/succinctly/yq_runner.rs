@@ -3905,7 +3905,6 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use succinctly::jq::NumberRepr;
 
     /// `Builtin::FirstStream`/`LastStream` (the "Phase 13" builtin-table
     /// spelling of `first(expr)`/`last(expr)`, distinct from the
@@ -4004,6 +4003,39 @@ mod tests {
             OwnedValue::NumberLiteral(NumberRepr::Float(f64::NEG_INFINITY), "-1e400".into());
         assert_eq!(
             emit_yaml_value(&neg_inf, &CommentTree::empty(), &config, "", false),
+            "-.inf"
+        );
+
+        // #1064: the plain `Float` arm (this test's own doc comment above
+        // claims parity with it, but never actually exercised it).
+        assert_eq!(
+            emit_yaml_value(
+                &OwnedValue::Float(f64::NAN),
+                &CommentTree::empty(),
+                &config,
+                "",
+                false
+            ),
+            ".nan"
+        );
+        assert_eq!(
+            emit_yaml_value(
+                &OwnedValue::Float(f64::INFINITY),
+                &CommentTree::empty(),
+                &config,
+                "",
+                false
+            ),
+            ".inf"
+        );
+        assert_eq!(
+            emit_yaml_value(
+                &OwnedValue::Float(f64::NEG_INFINITY),
+                &CommentTree::empty(),
+                &config,
+                "",
+                false
+            ),
             "-.inf"
         );
     }

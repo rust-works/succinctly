@@ -28622,6 +28622,23 @@ mod tests {
                 assert_eq!(s, "3.14");
             }
         );
+
+        // #1064: NaN/Infinity spell YAML-native, not jq's bare NaN/inf.
+        query!(br"null", "nan | @yaml",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, ".nan");
+            }
+        );
+        query!(br"null", "infinite | @yaml",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, ".inf");
+            }
+        );
+        query!(br"null", "-infinite | @yaml",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "-.inf");
+            }
+        );
     }
 
     #[test]
@@ -28693,6 +28710,23 @@ mod tests {
         query!(br"[1, 2, 3]", "@props",
             QueryResult::Owned(OwnedValue::String(s)) => {
                 assert_eq!(s, "0 = 1\n1 = 2\n2 = 3");
+            }
+        );
+
+        // #1064: NaN/Infinity spell YAML-native, not jq's bare NaN/inf.
+        query!(br"null", "nan | @props",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, ".nan");
+            }
+        );
+        query!(br"null", "infinite | @props",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, ".inf");
+            }
+        );
+        query!(br"null", "-infinite | @props",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "-.inf");
             }
         );
     }

@@ -2171,6 +2171,24 @@ mod tests {
         assert_eq!(buf, r#"{":a": ":b"}"#);
     }
 
+    /// #1064: an exponent overflowing to `f64::INFINITY` (JSON has no
+    /// direct Infinity/NaN literal, so this is the only way to reach a
+    /// non-finite float through this parser) spells with yq's YAML-native
+    /// `.inf`/`-.inf`, not a bare `write!(out, "{f}")` -- this is the one
+    /// call site into `nonfinite_display_string` this issue's dedup can't
+    /// exercise through the CLI directly (the M2.5 streaming gate this
+    /// function backs doesn't trigger on a plain top-level `.` query), so
+    /// it's covered here at the unit level instead.
+    #[test]
+    fn test_stream_json_as_yaml_overflow_exponent_spells_infinity() {
+        let json = br#"{"a": 1e400, "b": -1e400}"#;
+        let index = JsonIndex::build(json);
+        let value = index.root(json).value();
+        let mut buf = String::new();
+        stream_json_as_yaml(&mut buf, value, 0, 0).unwrap();
+        assert_eq!(buf, "{a: .inf, b: -.inf}");
+    }
+
     #[test]
     #[should_panic(expected = "up to u32::MAX")]
     #[cfg(target_pointer_width = "64")]

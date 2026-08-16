@@ -1233,6 +1233,31 @@ mod tests {
         assert_eq!(buf, "-.inf");
     }
 
+    /// #1064: the plain `OwnedValue::Float` arm (a *computed* non-finite,
+    /// as opposed to the `NumberLiteral` test above's document-sourced
+    /// one) goes through a separate match arm and was independently
+    /// reimplementing the same `.nan`/`.inf`/`-.inf` decision.
+    #[test]
+    fn test_stream_yaml_computed_float_nan_and_infinite() {
+        let mut buf = String::new();
+        OwnedValue::Float(f64::NAN)
+            .stream_yaml(&mut buf, IndentSpec::COMPACT, false)
+            .unwrap();
+        assert_eq!(buf, ".nan");
+
+        buf.clear();
+        OwnedValue::Float(f64::INFINITY)
+            .stream_yaml(&mut buf, IndentSpec::COMPACT, false)
+            .unwrap();
+        assert_eq!(buf, ".inf");
+
+        buf.clear();
+        OwnedValue::Float(f64::NEG_INFINITY)
+            .stream_yaml(&mut buf, IndentSpec::COMPACT, false)
+            .unwrap();
+        assert_eq!(buf, "-.inf");
+    }
+
     #[test]
     fn test_stream_string() {
         let mut buf = String::new();
