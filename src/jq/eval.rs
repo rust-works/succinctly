@@ -8053,14 +8053,17 @@ fn stitch_replacements_evaluated<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// unreachable-arm coupling a fully generic `+` call would add to this
 /// per-match hot path (#1034 review). Anything else falls back to
 /// jq-mode's real `+`-based accumulator (`arith_add`, `null` included via
-/// its own identity rule) or yq-mode's pre-#1034 "must already be a
-/// string" check -- **not** real yq's own `sub`/`gsub` coercion (confirmed
-/// live against yq v4.53.3: a non-string replacement stringifies and
-/// concatenates instead of erroring, e.g. `sub("a";5)` on `"abc"` is
-/// `"5bc"`); #1034 only fixed jq-mode's wording, so yq keeps its prior
-/// (still not yq-accurate, but not newly regressed) behavior here rather
-/// than silently changing under jq's `+`-based rules -- real yq-compatible
-/// `sub`/`gsub` coercion is its own follow-up (#1052).
+/// its own identity rule) or, in yq mode, real yq's own looser coercion
+/// (#1052): a scalar replacement stringifies and concatenates instead of
+/// erroring (`sub("a";5)` on `"abc"` is `"5bc"`, confirmed live against
+/// yq v4.53.3 for numbers/floats/bools/`null`), while an array/object
+/// replacement contributes an *empty* string rather than a JSON
+/// representation (`sub("a";[1,2])` on `"abc"` is `"bc"`, not
+/// `"[1, 2]bc"` -- `tostring()` itself gives the latter, so this isn't
+/// yq's general string-coercion rule; it's presumably an artifact of
+/// yq's underlying go-yaml node model, where only scalar nodes carry a
+/// raw text `Value`, and this call site clearly reads that raw value
+/// rather than reformatting the node like `tostring()` does).
 ///
 /// Deliberately called once per match, from a single loop over all matches
 /// in order (`stitch_replacements_evaluated`) rather than from a
@@ -8073,16 +8076,17 @@ fn stitch_replacements_evaluated<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// match's genuine type mismatch (caught by #1050's review, confirmed live
 /// against jq 1.7.1).
 ///
-/// No `optional`-gated arm on either error path: `optional` is never forced
-/// `true` reaching a nested `Call` node like `sub`/`gsub` (see
-/// `Expr::Optional`'s dispatch in `eval_single`, #693) -- a bare
-/// `sub(...)?` suppresses these errors via the ancestor `eval_try`'s catch,
-/// and `isvalid(sub(...))` via `isvalid`'s own error-catching (it evaluates
-/// with `optional: false`, not forced-`true`, despite an older comment
-/// elsewhere claiming otherwise). Confirmed dead per #928/#1003's identical
-/// finding elsewhere in this file: dedicated `sub(...)?`/`isvalid(sub(...))`
-/// tests for both branches still showed 0 coverage hits on the guards
-/// themselves.
+/// No `optional`-gated arm on its (now sole, since #1052) error path --
+/// the jq-mode `arith_add` fallback below, yq mode's own coercion never
+/// errors: `optional` is never forced `true` reaching a nested `Call` node
+/// like `sub`/`gsub` (see `Expr::Optional`'s dispatch in `eval_single`,
+/// #693) -- a bare `sub(...)?` suppresses this error via the ancestor
+/// `eval_try`'s catch, and `isvalid(sub(...))` via `isvalid`'s own
+/// error-catching (it evaluates with `optional: false`, not forced-`true`,
+/// despite an older comment elsewhere claiming otherwise). Confirmed dead
+/// per #928/#1003's identical finding elsewhere in this file: dedicated
+/// `sub(...)?`/`isvalid(sub(...))` tests for both branches still showed 0
+/// coverage hits on the guards themselves.
 #[cfg(feature = "regex")]
 fn combine_sub_gap<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     gap: &str,
@@ -8095,10 +8099,14 @@ fn combine_sub_gap<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         return Ok(combined);
     }
     if S::TAG == EvalTag::Yq {
-        return Err(QueryResult::Error(EvalError::type_error(
-            "string",
-            "replacement",
-        )));
+        let replacement_text = match &replacement {
+            OwnedValue::Array(_) | OwnedValue::Object(_) => String::new(),
+            _ => owned_to_string::<S>(&replacement),
+        };
+        let mut combined = String::with_capacity(gap.len() + replacement_text.len());
+        combined.push_str(gap);
+        combined.push_str(&replacement_text);
+        return Ok(combined);
     }
     match arith_add::<S>(OwnedValue::String(gap.to_string()), replacement) {
         Ok(OwnedValue::String(combined)) => Ok(combined),
