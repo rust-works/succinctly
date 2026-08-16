@@ -11630,6 +11630,60 @@ fn test_yq_join_null_separator_renders_as_literal_text_1041() -> Result<()> {
     Ok(())
 }
 
+/// #1047: an *empty* object is its own case, unlike a non-empty object or
+/// any array (empty or not), which all become the empty string (per
+/// `test_yq_join_non_scalar_element_becomes_empty_part_1041` above) -- real
+/// yq renders it as literal `{}` text, both as an element and as a
+/// separator. Regression-guards the specific bug this issue's own fix had
+/// to route around: `to_owned_key_shape` (the element materializer `join`
+/// uses to avoid deep-copying a container it's about to discard) always
+/// produces an *empty* map for any object regardless of its real field
+/// count, so the emptiness check must happen on the live cursor before that
+/// collapse, not after it -- `{"a":1}` must NOT render as `{}`.
+#[test]
+fn test_yq_join_empty_object_renders_as_literal_text_1047() -> Result<()> {
+    let (stdout, code) = run_yq_stdin(r#"join(",")"#, "- {}\n- x\n", &["-r"])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "{},x");
+
+    let (stdout, code) = run_yq_stdin(r#"join(",")"#, "- x: 1\n- a\n", &["-r"])?;
+    assert_eq!(code, 0);
+    assert_eq!(
+        stdout.trim_end(),
+        ",a",
+        "a non-empty object must stay empty"
+    );
+
+    let (stdout, code) = run_yq_stdin("join({})", "- 1\n- 2\n", &["-r"])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "1{}2");
+    Ok(())
+}
+
+/// #1047: a document-sourced NaN/Infinity element or separator keeps its
+/// own YAML spelling (`.nan`/`.inf`/`-.inf`) instead of `to_json_yq()`'s
+/// RFC-8259 `"null"` substitution -- matching #1060's identical fix for
+/// `tostring`/`@text`/etc.
+#[test]
+fn test_yq_join_special_float_element_and_separator_use_yaml_spelling_1047() -> Result<()> {
+    let (stdout, code) = run_yq_stdin(r#"join(",")"#, "- .nan\n- 2\n", &["-r"])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), ".nan,2");
+
+    let (stdout, code) = run_yq_stdin(r#"join(",")"#, "- .inf\n- 2\n", &["-r"])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), ".inf,2");
+
+    let (stdout, code) = run_yq_stdin(
+        ". as $root | $root.a | join($root.sep)",
+        "a: [\"1\", \"2\"]\nsep: .nan\n",
+        &["-r"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "1.nan2");
+    Ok(())
+}
+
 // =============================================================================
 // yq-mode `numeric_display_string`/`to_json_yq` scientific-notation fidelity
 // (#1030, #1008 follow-up) -- all live-verified against yq v4.53.3.
