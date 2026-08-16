@@ -2472,6 +2472,44 @@ fn test_stream_operators_emit_every_output() -> Result<()> {
 }
 
 #[test]
+fn test_stream_operator_truthy_retain_collapses_borrowed_many_to_every_arity_1038() -> Result<()> {
+    // `//`'s truthy-retain over a *borrowed* multi-output stream (`.[]`, not
+    // a constructed/owned one) collapses through `borrowed_vec_to_result`
+    // (#1038) -- pin all three arities its match covers: zero truthy values
+    // left, exactly one, and more than one.
+    for (filter, input, expected) in [
+        (r#".[] // "backup""#, "[false,null]", "\"backup\"\n"),
+        (r#".[] // "backup""#, "[false,1,null]", "1\n"),
+        (r#".[] // "backup""#, "[false,1,null,2]", "1\n2\n"),
+    ] {
+        let (stdout, code) = run_jq_stdin(filter, input, &["-c"])?;
+        assert_eq!(code, 0, "`{filter}` on {input} should succeed");
+        assert_eq!(stdout, expected, "wrong output for `{filter}` on {input}");
+    }
+    Ok(())
+}
+
+#[test]
+fn test_limit_collapses_borrowed_many_to_every_arity_1038() -> Result<()> {
+    // `limit`'s `Many` arm collapses its taken prefix through
+    // `borrowed_vec_to_result` (#1038) -- pin both reachable arities (one
+    // taken, more than one) from a *borrowed* multi-output stream (`.[]`).
+    // `limit(0; ...)` takes its own dedicated early return before `expr` is
+    // even evaluated, so it never reaches the `Many` arm at all; included
+    // anyway as ordinary black-box coverage of `limit`'s zero-output case.
+    for (filter, expected) in [
+        ("[limit(0; .[])]", "[]\n"),
+        ("[limit(1; .[])]", "[1]\n"),
+        ("[limit(2; .[])]", "[1,2]\n"),
+    ] {
+        let (stdout, code) = run_jq_stdin(filter, "[1,2,3]", &["-c"])?;
+        assert_eq!(code, 0, "`{filter}` should succeed");
+        assert_eq!(stdout, expected, "wrong output for `{filter}`");
+    }
+    Ok(())
+}
+
+#[test]
 fn test_boolean_with_empty_operand_is_silent() -> Result<()> {
     // An empty operand used to reach `result_to_owned`, which reported it as
     // `Error("no value")` and printed a diagnostic. jq emits nothing at all,
