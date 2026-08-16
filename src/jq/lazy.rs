@@ -1158,10 +1158,27 @@ mod tests {
     }
 
     /// `depth` levels of single-element array nesting: `[[[...[Null]...]]]`.
+    /// Mirrors `eval.rs`/`value.rs`'s own identically-shaped `linear_array_nest`
+    /// helper -- a separate copy (rather than a shared one) because
+    /// `OwnedValue` construction has no cross-module-visible builder to
+    /// share, same as `stream.rs`'s own copy of this shape.
     fn linear_owned_nest(depth: usize) -> OwnedValue {
         let mut v = OwnedValue::Null;
         for _ in 0..depth {
             v = OwnedValue::Array(vec![v]);
+        }
+        v
+    }
+
+    /// The `Object`-arm counterpart to [`linear_owned_nest`] -- a
+    /// depth-threading bug isolated to an `Object` match arm would pass a
+    /// boundary test built only from array nesting (#1025 code review).
+    fn linear_owned_object_nest(depth: usize) -> OwnedValue {
+        let mut v = OwnedValue::Object(IndexMap::new());
+        for _ in 0..depth {
+            let mut obj = IndexMap::new();
+            obj.insert("k".to_string(), v);
+            v = OwnedValue::Object(obj);
         }
         v
     }
@@ -1186,6 +1203,32 @@ mod tests {
             result.is_err(),
             "from_owned should panic at MAX_VALUE_TREE_DEPTH"
         );
+
+        let under_obj = linear_owned_object_nest(MAX_VALUE_TREE_DEPTH - 1);
+        let value: JqValue<'_, Vec<u64>> = JqValue::from_owned(under_obj);
+        assert!(matches!(value, JqValue::Object(_)));
+
+        let over_obj = linear_owned_object_nest(MAX_VALUE_TREE_DEPTH);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            JqValue::<Vec<u64>>::from_owned(over_obj)
+        }));
+        assert!(
+            result.is_err(),
+            "from_owned should panic at MAX_VALUE_TREE_DEPTH (Object arm)"
+        );
+    }
+
+    /// The `Object`-arm counterpart to `linear_jqvalue_nest` -- see
+    /// [`linear_owned_object_nest`]'s doc comment for why this arm needs
+    /// its own boundary coverage, not just `Array`'s.
+    fn linear_jqvalue_object_nest(depth: usize) -> JqValue<'static, Vec<u64>> {
+        let mut v = JqValue::Object(IndexMap::new());
+        for _ in 0..depth {
+            let mut obj = IndexMap::new();
+            obj.insert("k".to_string(), v);
+            v = JqValue::Object(obj);
+        }
+        v
     }
 
     /// #1025: `JqValue::write_json` (and its `to_json_string` caller) had
@@ -1205,6 +1248,18 @@ mod tests {
         assert!(
             result.is_err(),
             "write_json/to_json_string should panic at MAX_VALUE_TREE_DEPTH"
+        );
+
+        let under_obj = linear_jqvalue_object_nest(MAX_VALUE_TREE_DEPTH - 1);
+        let mut buf = String::new();
+        assert!(under_obj.write_json(&mut buf).is_ok());
+
+        let over_obj = linear_jqvalue_object_nest(MAX_VALUE_TREE_DEPTH);
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| over_obj.to_json_string()));
+        assert!(
+            result.is_err(),
+            "write_json/to_json_string should panic at MAX_VALUE_TREE_DEPTH (Object arm)"
         );
     }
 }

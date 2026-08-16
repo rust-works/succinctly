@@ -40456,6 +40456,21 @@ mod tests {
         ));
     }
 
+    /// `depth` levels of single-key object nesting: `{"k":{"k":...{}...}}`
+    /// -- the `Object`-arm counterpart to [`linear_array_nest`], since a
+    /// depth-threading bug isolated to an `Object` match arm (e.g. `depth`
+    /// instead of `depth + 1` in an object-value closure) would pass every
+    /// boundary test built only from array nesting (#1025 code review).
+    fn linear_object_nest(depth: usize) -> OwnedValue {
+        let mut v = OwnedValue::Object(IndexMap::new());
+        for _ in 0..depth {
+            let mut obj = IndexMap::new();
+            obj.insert("k".to_string(), v);
+            v = OwnedValue::Object(obj);
+        }
+        v
+    }
+
     /// #1025: `owned_to_expr` had no depth guard -- splices a
     /// compound-assignment RHS or pattern-substitution value back into the
     /// AST as literals, reachable from `.a += rhs_expr`/`.a //= rhs_expr`
@@ -40474,6 +40489,19 @@ mod tests {
         assert!(
             result.is_err(),
             "owned_to_expr should panic at MAX_VALUE_TREE_DEPTH"
+        );
+
+        // The `Object` arm is a separate match arm with its own recursive
+        // closure -- exercise its own boundary too, not just `Array`'s.
+        let under_obj = linear_object_nest(MAX_VALUE_TREE_DEPTH - 1);
+        assert!(matches!(owned_to_expr(&under_obj), Expr::Object(_)));
+
+        let over_obj = linear_object_nest(MAX_VALUE_TREE_DEPTH);
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| owned_to_expr(&over_obj)));
+        assert!(
+            result.is_err(),
+            "owned_to_expr should panic at MAX_VALUE_TREE_DEPTH (Object arm)"
         );
     }
 
@@ -40498,6 +40526,23 @@ mod tests {
         assert!(
             result.is_err(),
             "collect_leaf_paths should panic at MAX_VALUE_TREE_DEPTH"
+        );
+
+        // The `Object` arm builds its own `new_path` independently of
+        // `Array`'s -- exercise its own boundary too (#1025 code review).
+        let under_obj = linear_object_nest(MAX_VALUE_TREE_DEPTH - 1);
+        let mut paths = Vec::new();
+        collect_leaf_paths(&under_obj, &[], &mut paths);
+        assert_eq!(paths.len(), 1);
+
+        let over_obj = linear_object_nest(MAX_VALUE_TREE_DEPTH);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut paths = Vec::new();
+            collect_leaf_paths(&over_obj, &[], &mut paths);
+        }));
+        assert!(
+            result.is_err(),
+            "collect_leaf_paths should panic at MAX_VALUE_TREE_DEPTH (Object arm)"
         );
     }
 }
