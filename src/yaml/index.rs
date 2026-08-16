@@ -272,8 +272,8 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
         self.bp_to_text_end.get(open_idx)
     }
 
-    /// Marks this index's text as JSON-sourced (#996) -- see
-    /// [`Self::canonicalize_numbers`]'s own doc comment for what this
+    /// Marks this index's text as JSON-sourced (#996) -- see the private
+    /// `canonicalize_numbers` field's own doc comment for what this
     /// changes. Callers building an index over JSON bytes (JSON is a
     /// syntactic subset of YAML's flow grammar, so `YamlIndex::build`
     /// parses it fine) call this once, right after `build`, before

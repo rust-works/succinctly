@@ -3274,8 +3274,9 @@ pub fn format_float_with_fraction(f: f64) -> String {
 /// actually computed (arithmetic) -- **not** for JSON-sourced input
 /// (#996): real yq's JSON-input convention is a plain re-serialize through
 /// bare `f64` `Display` with no scientific-notation threshold at all (see
-/// [`json_sourced_canonical_float`], which the M2 streaming formatters use
-/// instead of this function for that case -- confirmed against a baseline
+/// the private `json_sourced_canonical_float` helper, which the M2
+/// streaming formatters use instead of this function for that case --
+/// confirmed against a baseline
 /// build of unmodified `main`, an extreme-magnitude JSON-sourced float
 /// like `1e100` renders as a 100+-digit decimal expansion on `-o json`
 /// today, not `1e+100`; #996 matches that existing baseline rather than
