@@ -11775,3 +11775,39 @@ fn test_yq_inplace_tostring_does_not_corrupt_untouched_nonfinite_sibling_field_1
     }
     Ok(())
 }
+
+/// #1051 code review, second regression: the first attempt at routing
+/// `evaluate_input`'s reindex bridge through a yq-aware float formatter
+/// (`to_json_for_reindex::<YqSemantics>()`) broke #978's own guarantee that
+/// a JSON-sourced number, already collapsed to a plain `Float` by
+/// `canonicalize_json_numbers`, must never regain a decimal point through
+/// this round trip (`--input-format json`'s `1e2` -> `100`, not `100.0`).
+/// `test_json_input_slurp_canonicalizes_exponent_literal_spelling_978` above
+/// already caught this live in CI; this test pins the same interaction via
+/// `--inplace`'s DOM fallback specifically, the other `evaluate_input` entry
+/// point #1051 touched (`--slurp` alone wasn't enough to prove both paths
+/// stayed fixed).
+#[test]
+fn test_json_input_inplace_does_not_reintroduce_decimal_point_1051() -> Result<()> {
+    let mut input_file = NamedTempFile::new()?;
+    write!(input_file, "{{\"a\":1e2}}")?;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .arg("yq")
+        .arg("--input-format")
+        .arg("json")
+        .arg("-o")
+        .arg("json")
+        .arg("-I")
+        .arg("0")
+        .arg("-i")
+        .arg(".b = (.a | tostring)")
+        .arg(input_file.path())
+        .stdin(Stdio::null())
+        .output()?;
+
+    assert!(output.status.success());
+    let rewritten = std::fs::read_to_string(input_file.path())?;
+    assert_eq!(rewritten.trim_end(), r#"{"a":100,"b":"100"}"#);
+    Ok(())
+}

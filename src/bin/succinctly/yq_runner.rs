@@ -572,29 +572,48 @@ fn evaluate_yaml_direct_filtered(
 /// front in `run_yq`, so this function needs no evaluation context (#284).
 ///
 /// This is `yq_runner.rs`'s own function (`jq_runner.rs` has an unrelated,
-/// separate `evaluate_input` for jq mode) and always evaluates with
-/// `YqSemantics` below, so the round-trip must use a yq-mode-aware
-/// formatter, not `to_json()` (#1051): the DOM fallback taken by `--slurp`
-/// and by `--inplace` for any expression `can_use_m2_streaming` doesn't
-/// allow-list (`tostring` is not on that list) was reformatting every
-/// `NumberLiteral` in the *whole document* via jq rules before the
-/// evaluator ever ran, silently rewriting fields the query never touched on
-/// an in-place write.
+/// separate `evaluate_input` for jq mode). It always *evaluates* with
+/// `YqSemantics` below, but the round-trip's own formatter deliberately
+/// stays `to_json_for_reindex::<JqSemantics>()`, not `<YqSemantics>` or
+/// `to_json_yq()` (#1051):
 ///
-/// `to_json_for_reindex::<YqSemantics>()`, not `to_json_yq()`: this round
-/// trip is purely internal (code review on #1051's first draft caught this
-/// live — `-i '.b = (.a | tostring)'` on `a: .inf` silently rewrote it to
-/// `a: null`), so a non-finite value must keep its ±Infinity/NaN spelling
-/// through the reparse rather than being substituted with JSON's `null`,
-/// the same reasoning `eval_owned_input`'s identical reindex bridge already
-/// applies for `reduce`/`foreach` (#561, #472).
+/// - Its `NumberLiteral` echo is unconditional either way (#1051's actual
+///   fix), so a document-sourced literal like `1e2` survives this round trip
+///   with its exact spelling untouched regardless of which `S` is passed —
+///   the DOM fallback taken by `--slurp` and by `--inplace` for any
+///   expression `can_use_m2_streaming` doesn't allow-list (`tostring` is not
+///   on that list) used to reformat it via jq's `format_number_jq_compat`
+///   before the evaluator ever ran, silently rewriting fields the query
+///   never touched on an in-place write.
+/// - Its NaN/Infinity handling is also unconditional (code review on this
+///   fix's first draft caught this live — `-i '.b = (.a | tostring)'` on
+///   `a: .inf` silently rewrote it to `a: null` through `to_json_yq()`'s
+///   RFC-8259 "null" substitution, wrong for this purely-internal round
+///   trip), matching `eval_owned_input`'s identical reindex bridge for
+///   `reduce`/`foreach` (#561, #472).
+/// - Only the *fallback* arm — a plain, already-literal-less `Float` — is
+///   `S`-gated, and `YqSemantics` there is actively wrong for this call
+///   site specifically: `parse_input`'s `--input-format json` path already
+///   collapses every `NumberLiteral` to a plain `Float`/`Int` via
+///   `canonicalize_json_numbers` (#978, matching real yq's "a JSON-sourced
+///   number never keeps its own spelling" convention) *before* the value
+///   ever reaches here — forcing `YqSemantics`'s decimal point back onto
+///   that already-canonicalized value reintroduced exactly the bug #978
+///   fixed (`--slurp --input-format json '.'` on `{"a":1e2}` regressed from
+///   `[{"a":100}]` to `[{"a":100.0}]`, caught by CI). `JqSemantics`'s bare
+///   fallback (no forced point) is correct for both the JSON-canonicalized
+///   case and the untouched-overflow-scalar case (the latter is already
+///   lossy through this whole-document round trip regardless of the point —
+///   confirmed live, real yq keeps an untouched i64-overflow scalar
+///   byte-for-byte via `-i`, e.g. `99999999999999999999` verbatim, which
+///   this reindex-through-`f64` architecture cannot match either way).
 fn evaluate_input(
     input: &OwnedValue,
     expr: &jq::Expr,
     sink: &mut ErrorSink,
 ) -> Result<Vec<OwnedValue>> {
     // Convert OwnedValue to JSON bytes for indexing
-    let json_str = input.to_json_for_reindex::<YqSemantics>();
+    let json_str = input.to_json_for_reindex::<jq::JqSemantics>();
     let json_bytes = json_str.as_bytes();
 
     // Build index and evaluate
