@@ -4102,9 +4102,38 @@ fn builtin_split<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// site, not [`to_owned`]) so a container element's contents are never
 /// materialized at all -- they're discarded unread here regardless -- and a
 /// string element is moved rather than cloned a second time.
+/// yq's own `.nan`/`.inf`/`-.inf` spelling for a non-finite element or
+/// separator (#1047, matching #1060's identical fix for `tostring`/`@text`/
+/// etc.), shared by [`yq_join_element_part`] and [`yq_join_separator`]
+/// rather than hand-copied at each -- the #106 "duplicated predicates
+/// diverge silently" lesson in `CLAUDE.md`, caught in this PR's own code
+/// review. `None` for anything else, so the caller's own catch-all
+/// (`other.to_json_yq()`) handles every other variant unchanged.
+fn yq_join_nonfinite_part(value: &OwnedValue) -> Option<String> {
+    match value {
+        OwnedValue::Float(f) | OwnedValue::NumberLiteral(NumberRepr::Float(f), _)
+            if f.is_nan() || f.is_infinite() =>
+        {
+            Some(nonfinite_display_string::<YqSemantics>(*f))
+        }
+        _ => None,
+    }
+}
+
 fn yq_join_element_part(elem: OwnedValue) -> String {
+    if let Some(s) = yq_join_nonfinite_part(&elem) {
+        return s;
+    }
     match elem {
         OwnedValue::String(s) => s,
+        // NOT a `OwnedValue::Object(m) if m.is_empty()` guard here (#1047
+        // review): `elem` was already collapsed via `to_owned_key_shape` at
+        // the call site (see this function's own doc comment), which always
+        // produces an *empty* `IndexMap` regardless of the real object's
+        // actual field count -- a guard here couldn't tell "genuinely
+        // empty" apart from "collapsed, contents unread". The empty-object
+        // special case is instead handled at the call site, on the live
+        // cursor, before that collapse ever runs.
         OwnedValue::Null | OwnedValue::Array(_) | OwnedValue::Object(_) => String::new(),
         // `to_json_yq()`, not `to_json()` (#1030 code review): this function
         // is only ever reached from `builtin_join`'s `S::TAG == EvalTag::Yq`
@@ -4124,8 +4153,15 @@ fn yq_join_element_part(elem: OwnedValue) -> String {
 /// from jq mode, where `null` is a no-op only via `+`'s own left-identity
 /// rule, not something `join` special-cases).
 fn yq_join_separator(sep: OwnedValue) -> String {
+    if let Some(s) = yq_join_nonfinite_part(&sep) {
+        return s;
+    }
     match sep {
         OwnedValue::String(s) => s,
+        // Empty-object special case (#1047): see `yq_join_element_part`'s
+        // identical arm above -- confirmed live, `[1,2] | join({})` is
+        // `"1{}2"` in real yq, not `"12"`.
+        OwnedValue::Object(ref m) if m.is_empty() => "{}".to_string(),
         OwnedValue::Array(_) | OwnedValue::Object(_) => String::new(),
         // `to_json_yq()` (#1030 code review): same reasoning as
         // `yq_join_element_part` above -- this function is yq-only.
@@ -4233,8 +4269,20 @@ fn builtin_join<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 // collapses to an empty-string part regardless of its
                 // contents (see `yq_join_element_part`'s doc comment), so
                 // deep-copying it first would be pure waste (#1044 review).
+                //
+                // The empty-object special case (#1047) is checked on the
+                // live cursor *before* that collapse: `JsonFields::is_empty`
+                // is an O(1) cursor check, and `to_owned_key_shape` always
+                // produces an empty `IndexMap` for *any* object regardless
+                // of its real field count, so checking emptiness after the
+                // collapse can't distinguish "genuinely empty" from
+                // "collapsed, contents unread" (a non-empty object would
+                // wrongly render as `{}` too).
                 let parts: Vec<String> = elements
-                    .map(|e| yq_join_element_part(to_owned_key_shape(&e)))
+                    .map(|e| match &e {
+                        StandardJson::Object(fields) if fields.is_empty() => "{}".to_string(),
+                        _ => yq_join_element_part(to_owned_key_shape(&e)),
+                    })
                     .collect();
                 QueryResult::Owned(OwnedValue::String(parts.join(&sep_str)))
             }
