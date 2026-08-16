@@ -1379,12 +1379,8 @@ fn push_truthiness<W: Clone + AsRef<[u64]>>(
 }
 
 /// Turn a stream of booleans into the result of a boolean operator.
-fn bools_to_result<'a, W: Clone + AsRef<[u64]>>(mut bools: Vec<bool>) -> QueryResult<'a, W> {
-    match bools.len() {
-        0 => QueryResult::None,
-        1 => QueryResult::Owned(OwnedValue::Bool(bools.pop().unwrap())),
-        _ => QueryResult::ManyOwned(bools.into_iter().map(OwnedValue::Bool).collect()),
-    }
+fn bools_to_result<'a, W: Clone + AsRef<[u64]>>(bools: Vec<bool>) -> QueryResult<'a, W> {
+    owned_vec_to_result(bools.into_iter().map(OwnedValue::Bool).collect())
 }
 
 /// The `OwnedValue`-collecting analog of [`push_truthiness`]: pushes every
