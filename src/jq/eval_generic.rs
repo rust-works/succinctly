@@ -955,6 +955,18 @@ fn owned_vec_to_generic_result<V: DocumentValue>(mut vs: Vec<OwnedValue>) -> Gen
     }
 }
 
+/// Normalize a `Vec<V::Cursor>` accumulator into the smallest `GenericResult`
+/// shape that represents it -- the borrowed-cursor counterpart of
+/// [`owned_vec_to_generic_result`], for the same reason (#1048): a caller
+/// with zero results must collapse to `None`, not `ManyCursor(vec![])`.
+fn cursor_vec_to_generic_result<V: DocumentValue>(mut cs: Vec<V::Cursor>) -> GenericResult<V> {
+    match cs.len() {
+        0 => GenericResult::None,
+        1 => GenericResult::OneCursor(cs.pop().unwrap()),
+        _ => GenericResult::ManyCursor(cs),
+    }
+}
+
 /// Finalize a fork's accumulated `outputs`, given an optional terminating
 /// `Control`. Mirrors [`super::eval::finish_fork`]: a trailing `Error` is
 /// silenced (keeping whatever outputs already succeeded) when `optional` is
@@ -2925,10 +2937,9 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
             }
             return match pending_halt {
                 Some(code) => partial_generic(out, Control::Halt(code)),
-                None => match out.len() {
-                    1 => GenericResult::Owned(out.pop().expect("len checked")),
-                    _ => GenericResult::ManyOwned(out),
-                },
+                // #1048: a zero-result collapse here (every key/target pair
+                // optional-suppressed) must be `None`, not `ManyOwned(vec![])`.
+                None => owned_vec_to_generic_result(out),
             };
         }
     };
@@ -2992,16 +3003,12 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
         return partial_generic(out, Control::Halt(code));
     }
 
+    // #1048: a zero-result collapse here (every key/target pair
+    // optional-suppressed) must be `None`, not `ManyOwned`/`ManyCursor(vec![])`.
     if any_owned {
-        match owned.len() {
-            1 => GenericResult::Owned(owned.pop().expect("len checked")),
-            _ => GenericResult::ManyOwned(owned),
-        }
+        owned_vec_to_generic_result(owned)
     } else {
-        match cursors.len() {
-            1 => GenericResult::OneCursor(cursors.pop().expect("len checked")),
-            _ => GenericResult::ManyCursor(cursors),
-        }
+        cursor_vec_to_generic_result(cursors)
     }
 }
 
@@ -3107,10 +3114,9 @@ fn eval_slice_expr<S: EvalSemantics, V: DocumentValue>(
             }
         }
     }
-    match out.len() {
-        1 => GenericResult::Owned(out.pop().expect("len checked")),
-        _ => GenericResult::ManyOwned(out),
-    }
+    // #1048: a zero-result collapse here (every (start, end) pair
+    // optional-suppressed) must be `None`, not `ManyOwned(vec![])`.
+    owned_vec_to_generic_result(out)
 }
 
 /// Evaluate one slice bound (`start` or `end`) against `value`/`cursor`.
