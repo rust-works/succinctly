@@ -13366,6 +13366,16 @@ fn substitute_var_in_builtin(
 
 /// Convert an OwnedValue to an Expr, preserving complex types.
 fn owned_to_expr(value: &OwnedValue) -> Expr {
+    owned_to_expr_at_depth(value, 0)
+}
+
+/// Panics past [`MAX_VALUE_TREE_DEPTH`](super::value::MAX_VALUE_TREE_DEPTH)
+/// levels of nesting (#1025) -- splices a compound-assignment RHS or
+/// pattern-substitution value back into the AST as literals, reachable from
+/// `.a += rhs_expr`/`.a //= rhs_expr` and `as`-pattern variable substitution
+/// with no adversarial document involved.
+fn owned_to_expr_at_depth(value: &OwnedValue, depth: usize) -> Expr {
+    assert_value_tree_depth(depth);
     match value {
         OwnedValue::Null => Expr::Literal(Literal::Null),
         OwnedValue::Bool(b) => Expr::Literal(Literal::Bool(*b)),
@@ -13382,7 +13392,10 @@ fn owned_to_expr(value: &OwnedValue) -> Expr {
             if arr.is_empty() {
                 Expr::Array(Box::new(Expr::Builtin(Builtin::Empty)))
             } else {
-                let elements: Vec<Expr> = arr.iter().map(owned_to_expr).collect();
+                let elements: Vec<Expr> = arr
+                    .iter()
+                    .map(|v| owned_to_expr_at_depth(v, depth + 1))
+                    .collect();
                 Expr::Array(Box::new(Expr::Comma(elements)))
             }
         }
@@ -13392,7 +13405,7 @@ fn owned_to_expr(value: &OwnedValue) -> Expr {
                 .iter()
                 .map(|(k, v)| ObjectEntry {
                     key: ObjectKey::Literal(k.clone()),
-                    value: owned_to_expr(v),
+                    value: owned_to_expr_at_depth(v, depth + 1),
                 })
                 .collect();
             Expr::Object(entries)
@@ -16742,11 +16755,18 @@ fn get_value_at_path(value: &OwnedValue, path: &[OwnedValue]) -> Option<OwnedVal
 /// side effect of `select()`'s falsy handling, not a design choice) and
 /// empty containers (whose `type` isn't scalar even though they have no
 /// children either). See #771.
+/// Panics past [`MAX_VALUE_TREE_DEPTH`](super::value::MAX_VALUE_TREE_DEPTH)
+/// levels of nesting (#1025) -- reuses `current_path.len()` as the depth
+/// counter rather than threading a separate parameter, the same shape
+/// `collect_paths`/`collect_tostream_events` (#1021) already established:
+/// `current_path` grows by exactly one element per descent, so its length
+/// already tracks tree depth without duplicating a counter.
 fn collect_leaf_paths(
     value: &OwnedValue,
     current_path: &[OwnedValue],
     paths: &mut Vec<OwnedValue>,
 ) {
+    assert_value_tree_depth(current_path.len());
     match value {
         OwnedValue::Object(entries) => {
             if entries.is_empty() {
@@ -40434,5 +40454,50 @@ mod tests {
             ),
             QueryResult::Owned(OwnedValue::Int(1))
         ));
+    }
+
+    /// #1025: `owned_to_expr` had no depth guard -- splices a
+    /// compound-assignment RHS or pattern-substitution value back into the
+    /// AST as literals, reachable from `.a += rhs_expr`/`.a //= rhs_expr`
+    /// and `as`-pattern variable substitution with no adversarial document
+    /// involved.
+    #[test]
+    fn owned_to_expr_panics_past_nesting_depth_limit_1025() {
+        use crate::jq::value::MAX_VALUE_TREE_DEPTH;
+
+        let under = linear_array_nest(MAX_VALUE_TREE_DEPTH - 1);
+        assert!(matches!(owned_to_expr(&under), Expr::Array(_)));
+
+        let over = linear_array_nest(MAX_VALUE_TREE_DEPTH);
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| owned_to_expr(&over)));
+        assert!(
+            result.is_err(),
+            "owned_to_expr should panic at MAX_VALUE_TREE_DEPTH"
+        );
+    }
+
+    /// #1025: `collect_leaf_paths` (backs `leaf_paths`) had no depth guard
+    /// of its own -- previously protected only transitively (its callers
+    /// already run the guarded `to_owned` first), a fragile invariant
+    /// rather than an independent guard.
+    #[test]
+    fn collect_leaf_paths_panics_past_nesting_depth_limit_1025() {
+        use crate::jq::value::MAX_VALUE_TREE_DEPTH;
+
+        let under = linear_array_nest(MAX_VALUE_TREE_DEPTH - 1);
+        let mut paths = Vec::new();
+        collect_leaf_paths(&under, &[], &mut paths);
+        assert_eq!(paths.len(), 1);
+
+        let over = linear_array_nest(MAX_VALUE_TREE_DEPTH);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut paths = Vec::new();
+            collect_leaf_paths(&over, &[], &mut paths);
+        }));
+        assert!(
+            result.is_err(),
+            "collect_leaf_paths should panic at MAX_VALUE_TREE_DEPTH"
+        );
     }
 }
