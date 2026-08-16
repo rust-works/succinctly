@@ -9,7 +9,7 @@ use succinctly::jq::escape::{
     escape_json_body as run_escaper, write_json_body_jq, write_json_body_jq_ascii,
     write_json_body_yq, write_json_body_yq_ascii,
 };
-use succinctly::jq::{EvalError, OwnedValue, StreamError};
+use succinctly::jq::{assert_value_tree_depth, EvalError, OwnedValue, StreamError};
 use succinctly::yaml::format_float_with_fraction;
 
 /// Exit codes matching jq behavior
@@ -365,7 +365,14 @@ pub fn format_float_yq(f: f64) -> String {
 }
 
 /// Recursive JSON formatter behind [`format_json`].
+///
+/// Panics past `succinctly::jq::MAX_VALUE_TREE_DEPTH` levels of nesting
+/// (#1005) — see that constant's own doc comment for why. `value` is the
+/// filter's evaluated output, constructible via `reduce`/`foreach`/etc.
+/// with no adversarial document involved; `serde_json`'s own input-depth
+/// limit (used elsewhere on this eager-output path) never sees it.
 fn format_json_impl(value: &OwnedValue, opts: &JsonFormatOpts, level: usize) -> String {
+    assert_value_tree_depth(level);
     let indent = opts.indent;
     let compact = indent.is_empty();
     let current_indent = if compact {
@@ -1210,5 +1217,43 @@ mod tests {
         // Diagnostic output; assert it runs without panicking for both tools.
         print_build_configuration("jq");
         print_build_configuration("yq");
+    }
+
+    /// `depth` levels of single-element array nesting: `[[[...[Null]...]]]`.
+    fn linear_array_nest(depth: usize) -> OwnedValue {
+        let mut v = OwnedValue::Null;
+        for _ in 0..depth {
+            v = OwnedValue::Array(vec![v]);
+        }
+        v
+    }
+
+    /// #1005: `value` is a filter's evaluated output (e.g. a `reduce`
+    /// accumulator growing one level per iteration), which has no
+    /// adversarial *document* behind it — `format_json_impl` must
+    /// independently refuse to recurse past the same limit rather than
+    /// overflow the stack.
+    #[test]
+    fn format_json_panics_past_nesting_depth_limit_1005() {
+        use succinctly::jq::MAX_VALUE_TREE_DEPTH;
+
+        let opts = JsonFormatOpts {
+            indent: "",
+            sort_keys: false,
+            ascii: false,
+            float_style: FloatStyle::Shortest,
+            control_escape: ControlEscape::Jq,
+        };
+
+        let under = linear_array_nest(MAX_VALUE_TREE_DEPTH - 1);
+        let _ = format_json(&under, &opts);
+
+        let over = linear_array_nest(MAX_VALUE_TREE_DEPTH);
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| format_json(&over, &opts)));
+        assert!(
+            result.is_err(),
+            "format_json should panic at MAX_VALUE_TREE_DEPTH"
+        );
     }
 }

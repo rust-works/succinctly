@@ -96,4 +96,6 @@ pub use parser::{
     parse, parse_program, parse_program_with_mode, parse_with_mode, ParseError, ParserMode,
 };
 pub use stream::{StreamError, StreamStats, StreamableValue};
-pub use value::{format_number_jq_compat, NumberRepr, OwnedValue};
+pub use value::{
+    assert_value_tree_depth, format_number_jq_compat, NumberRepr, OwnedValue, MAX_VALUE_TREE_DEPTH,
+};

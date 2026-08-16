@@ -22,6 +22,51 @@ use indexmap::IndexMap;
 use super::escape::{escape_json_body, write_json_body_jq};
 use super::expr::Literal;
 
+/// Recursion-depth ceiling for tree-walkers over an already-materialized
+/// [`OwnedValue`] (#1005).
+///
+/// Guards [`OwnedValue::to_json`]/`to_json_for_reindex`/`==`/
+/// `eval::compare_values`/`eval.rs`'s own `to_owned`/
+/// `yq_runner::reconcile_presentation`/`output::format_json_impl`.
+///
+/// Deliberately a *separate* constant from
+/// [`eval_generic::MAX_NESTING_DEPTH`](super::eval_generic::MAX_NESTING_DEPTH)
+/// (256), not a reuse of it: that ceiling guards cursor-to-`OwnedValue`
+/// *conversion* functions, individually tuned against their own measured
+/// crash boundaries (600-700 for the tightest of that set, `print_json`).
+/// This constant's own guarded functions are a different shape with
+/// different measured boundaries (debug build, default 2MiB test-thread
+/// stack — the more fragile of debug/release, matching how 256 was itself
+/// measured): `reconcile_presentation` crashes between depth 580-600 (the
+/// tightest of this set), `format_json_impl` between 650-700, and
+/// `eval.rs`'s own `to_owned` between 1800-2000. Reusing 256 here would be
+/// wrong in the *other* direction: 256 does not clear
+/// `tests/jq_recurse_depth_tests.rs`'s deliberately-pinned depth-300
+/// document-navigation capability (#626's de-risk step for
+/// `push_recursive_branches`/`resolve_recurse`), which routes through
+/// `eval.rs`'s own `to_owned` during ordinary `..`/`recurse` traversal, not
+/// just query-time-constructed accumulator growth.
+///
+/// 384, not 300: needs margin above the pinned floor for the same reason
+/// `eval_generic`'s own 256 needed margin above its 200-deep `walk` floor
+/// (256 is `200 * 1.28`; 384 is `300 * 1.28`, the same proportional
+/// headroom) — while staying comfortably under 580, the tightest of this
+/// set's measured boundaries, with margin to spare for a CI runner with a
+/// smaller default stack than the dev machine this was measured on.
+pub const MAX_VALUE_TREE_DEPTH: usize = 384;
+
+/// Panics past [`MAX_VALUE_TREE_DEPTH`] levels of nesting (#1005).
+///
+/// See that constant's own doc comment for why this exists as a second,
+/// independently-tuned ceiling alongside
+/// [`eval_generic::assert_nesting_depth`](super::eval_generic::assert_nesting_depth).
+pub fn assert_value_tree_depth(depth: usize) {
+    assert!(
+        depth < MAX_VALUE_TREE_DEPTH,
+        "nesting depth exceeds limit of {MAX_VALUE_TREE_DEPTH}"
+    );
+}
+
 /// The parsed value backing a [`OwnedValue::NumberLiteral`], kept separate
 /// from the source text so arithmetic/comparison can read it without
 /// touching the `Box<str>`.
@@ -640,7 +685,19 @@ impl OwnedValue {
     }
 
     /// Format this value as JSON string.
+    ///
+    /// Panics past [`MAX_VALUE_TREE_DEPTH`] levels of nesting (#1005) — see
+    /// that constant's own doc comment for why. Needed because a value
+    /// `reduce`/`foreach`/`while`/`until`/`repeat` build up at
+    /// query-evaluation time bypasses #998's document-input guards
+    /// entirely: no adversarial document is involved, only enough loop
+    /// iterations to grow the accumulator past the limit.
     pub fn to_json(&self) -> String {
+        self.to_json_at_depth(0)
+    }
+
+    fn to_json_at_depth(&self, depth: usize) -> String {
+        assert_value_tree_depth(depth);
         match self {
             Self::Null => "null".into(),
             Self::Bool(true) => "true".into(),
@@ -659,7 +716,8 @@ impl OwnedValue {
             Self::NumberLiteral(_, literal) => format_number_jq_compat(literal.as_bytes()),
             Self::String(s) => format!("\"{}\"", escape_json_body(write_json_body_jq, s)),
             Self::Array(arr) => {
-                let elements: Vec<String> = arr.iter().map(Self::to_json).collect();
+                let elements: Vec<String> =
+                    arr.iter().map(|v| v.to_json_at_depth(depth + 1)).collect();
                 format!("[{}]", elements.join(","))
             }
             Self::Object(obj) => {
@@ -669,7 +727,7 @@ impl OwnedValue {
                         format!(
                             "\"{}\":{}",
                             escape_json_body(write_json_body_jq, k),
-                            v.to_json()
+                            v.to_json_at_depth(depth + 1)
                         )
                     })
                     .collect();
@@ -690,6 +748,18 @@ impl OwnedValue {
     /// the bridge re-parses this text and hands the cursor to the full
     /// evaluator (#561, #472).
     pub(crate) fn to_json_for_reindex(&self) -> String {
+        self.to_json_for_reindex_at_depth(0)
+    }
+
+    /// Panics past [`MAX_VALUE_TREE_DEPTH`] levels of nesting (#1005) — see
+    /// that constant's own doc comment for why, and
+    /// [`to_json_at_depth`](Self::to_json_at_depth), which this mirrors.
+    /// This function's own callers (`reduce`/`foreach`/etc.'s per-iteration
+    /// reindex bridge) are exactly the ones that grow a value one level
+    /// deeper per loop iteration with no adversarial document involved, so
+    /// it needs the same guard [`to_json`](Self::to_json) does.
+    fn to_json_for_reindex_at_depth(&self, depth: usize) -> String {
+        assert_value_tree_depth(depth);
         match self {
             Self::Float(f) if f.is_nan() => NAN_SENTINEL.to_string(),
             Self::NumberLiteral(NumberRepr::Float(f), _) if f.is_nan() => NAN_SENTINEL.to_string(),
@@ -728,7 +798,10 @@ impl OwnedValue {
                 }
             }
             Self::Array(arr) => {
-                let elements: Vec<String> = arr.iter().map(Self::to_json_for_reindex).collect();
+                let elements: Vec<String> = arr
+                    .iter()
+                    .map(|v| v.to_json_for_reindex_at_depth(depth + 1))
+                    .collect();
                 format!("[{}]", elements.join(","))
             }
             Self::Object(obj) => {
@@ -738,13 +811,13 @@ impl OwnedValue {
                         format!(
                             "\"{}\":{}",
                             escape_json_body(write_json_body_jq, k),
-                            v.to_json_for_reindex()
+                            v.to_json_for_reindex_at_depth(depth + 1)
                         )
                     })
                     .collect();
                 format!("{{{}}}", entries.join(","))
             }
-            other => other.to_json(),
+            other => other.to_json_at_depth(depth),
         }
     }
 }
@@ -909,25 +982,57 @@ pub(crate) fn numeric_repr_cmp(a: NumberRepr, b: NumberRepr) -> core::cmp::Order
 
 impl PartialEq for OwnedValue {
     fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::Null, Self::Null) => true,
-            (Self::Bool(a), Self::Bool(b)) => a == b,
-            (Self::Int(a), Self::Int(b)) => a == b,
-            (Self::Float(a), Self::Float(b)) => a == b,
-            (Self::Int(a), Self::Float(b)) => (*a as f64) == *b,
-            (Self::Float(a), Self::Int(b)) => *a == (*b as f64),
-            (Self::NumberLiteral(a, _), Self::NumberLiteral(b, _)) => numeric_repr_eq(*a, *b),
-            (Self::NumberLiteral(a, _), Self::Int(b))
-            | (Self::Int(b), Self::NumberLiteral(a, _)) => numeric_repr_eq(*a, NumberRepr::Int(*b)),
-            (Self::NumberLiteral(a, _), Self::Float(b))
-            | (Self::Float(b), Self::NumberLiteral(a, _)) => {
-                numeric_repr_eq(*a, NumberRepr::Float(*b))
-            }
-            (Self::String(a), Self::String(b)) => a == b,
-            (Self::Array(a), Self::Array(b)) => a == b,
-            (Self::Object(a), Self::Object(b)) => a == b,
-            _ => false,
+        owned_value_eq_at_depth(self, other, 0)
+    }
+}
+
+/// Panics past [`MAX_VALUE_TREE_DEPTH`] levels of nesting (#1005) — see
+/// that constant's own doc comment for why.
+///
+/// Can't thread a depth counter through [`PartialEq::eq`] itself (the trait
+/// method's signature is fixed), so `Array`/`Object` recurse into this
+/// helper directly rather than delegating to `Vec`'s/`IndexMap`'s own `==`
+/// (which would call back into [`PartialEq::eq`] and silently reset the
+/// depth count to 0 every level, defeating the guard). `Array` mirrors
+/// `Vec`'s own positional `==`; `Object` mirrors `IndexMap`'s own
+/// order-independent `==` (same length, and every key in `a` maps to an
+/// equal value in `b`) — changing either's semantics here would make `==`
+/// disagree with itself depending on nesting depth.
+fn owned_value_eq_at_depth(a: &OwnedValue, b: &OwnedValue, depth: usize) -> bool {
+    assert_value_tree_depth(depth);
+    match (a, b) {
+        (OwnedValue::Null, OwnedValue::Null) => true,
+        (OwnedValue::Bool(a), OwnedValue::Bool(b)) => a == b,
+        (OwnedValue::Int(a), OwnedValue::Int(b)) => a == b,
+        (OwnedValue::Float(a), OwnedValue::Float(b)) => a == b,
+        (OwnedValue::Int(a), OwnedValue::Float(b)) => (*a as f64) == *b,
+        (OwnedValue::Float(a), OwnedValue::Int(b)) => *a == (*b as f64),
+        (OwnedValue::NumberLiteral(a, _), OwnedValue::NumberLiteral(b, _)) => {
+            numeric_repr_eq(*a, *b)
         }
+        (OwnedValue::NumberLiteral(a, _), OwnedValue::Int(b))
+        | (OwnedValue::Int(b), OwnedValue::NumberLiteral(a, _)) => {
+            numeric_repr_eq(*a, NumberRepr::Int(*b))
+        }
+        (OwnedValue::NumberLiteral(a, _), OwnedValue::Float(b))
+        | (OwnedValue::Float(b), OwnedValue::NumberLiteral(a, _)) => {
+            numeric_repr_eq(*a, NumberRepr::Float(*b))
+        }
+        (OwnedValue::String(a), OwnedValue::String(b)) => a == b,
+        (OwnedValue::Array(a), OwnedValue::Array(b)) => {
+            a.len() == b.len()
+                && a.iter()
+                    .zip(b.iter())
+                    .all(|(x, y)| owned_value_eq_at_depth(x, y, depth + 1))
+        }
+        (OwnedValue::Object(a), OwnedValue::Object(b)) => {
+            a.len() == b.len()
+                && a.iter().all(|(k, v)| {
+                    b.get(k)
+                        .is_some_and(|bv| owned_value_eq_at_depth(v, bv, depth + 1))
+                })
+        }
+        _ => false,
     }
 }
 
@@ -1726,5 +1831,56 @@ mod tests {
             "must not render anywhere near the full 2,000,000-digit mantissa: got {} bytes",
             result.len()
         );
+    }
+
+    /// `depth` levels of single-element array nesting: `[[[...[Null]...]]]`.
+    fn linear_array_nest(depth: usize) -> OwnedValue {
+        let mut v = OwnedValue::Null;
+        for _ in 0..depth {
+            v = OwnedValue::Array(vec![v]);
+        }
+        v
+    }
+
+    /// #1005: a value built at query-evaluation time (e.g. a `reduce`
+    /// accumulator growing one array level per iteration) has no adversarial
+    /// *document* behind it, so #998's input-side guards never see it -
+    /// `to_json`/`to_json_for_reindex`/`==` must each independently refuse
+    /// to recurse past the same limit rather than overflow the stack.
+    #[test]
+    fn to_json_panics_past_nesting_depth_limit_1005() {
+        let under = linear_array_nest(MAX_VALUE_TREE_DEPTH - 1);
+        // Under the limit: succeeds (doesn't panic).
+        let _ = under.to_json();
+        let _ = under.to_json_for_reindex();
+
+        let over = linear_array_nest(MAX_VALUE_TREE_DEPTH);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| over.to_json()));
+        assert!(
+            result.is_err(),
+            "to_json should panic at MAX_VALUE_TREE_DEPTH"
+        );
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| over.to_json_for_reindex()));
+        assert!(
+            result.is_err(),
+            "to_json_for_reindex should panic at MAX_VALUE_TREE_DEPTH"
+        );
+    }
+
+    /// #1005: `==` recurses through a private depth-tracked helper instead
+    /// of delegating to `Vec`'s/`IndexMap`'s own `==` (which would silently
+    /// reset the depth count every level) - confirm the guard actually
+    /// fires through the `PartialEq` impl, not just when called directly.
+    #[test]
+    fn eq_panics_past_nesting_depth_limit_1005() {
+        let under_a = linear_array_nest(MAX_VALUE_TREE_DEPTH - 1);
+        let under_b = linear_array_nest(MAX_VALUE_TREE_DEPTH - 1);
+        assert_eq!(under_a, under_b);
+
+        let over_a = linear_array_nest(MAX_VALUE_TREE_DEPTH);
+        let over_b = linear_array_nest(MAX_VALUE_TREE_DEPTH);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| over_a == over_b));
+        assert!(result.is_err(), "== should panic at MAX_VALUE_TREE_DEPTH");
     }
 }
