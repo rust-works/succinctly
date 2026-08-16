@@ -11621,6 +11621,45 @@ fn queue_recurse_children<T>(
     stack.extend(next.into_iter().rev());
 }
 
+/// Shared `recurse(f; cond)` "gate one child through `cond`" step used by
+/// both `resolve_recurse` (path position) and `builtin_recurse_cond` (value
+/// position) — #854 added the identical "evaluate `cond` via
+/// `eval_owned_multi_keep_partial`, fork-push each truthy output, defer any
+/// `cond` error" sequence to each function by hand (#897: extracted, the
+/// same way `queue_recurse_children` above already generalized the *outer*
+/// "queue children, defer error" step for #842/#854's own fix).
+///
+/// `cond` is evaluated on `child` unconditionally — even when the caller
+/// won't end up queueing anything for it (`gate: false`) — because a
+/// `cond` error/side effect must still surface even for a node whose
+/// children are otherwise pruned from further recursion (`resolve_recurse`'s
+/// `is_null_current` rule, #856). `gate` is the one real divergence between
+/// the two call sites: `resolve_recurse` passes `!is_null_current` since a
+/// null node's own line of descent ends there; `builtin_recurse_cond` has no
+/// such rule and always passes `true` — the two evaluators don't actually
+/// share a growth-bounding policy, just this evaluation step.
+///
+/// `push` is called once per truthy `cond` output (`select`'s real
+/// multi-output forking semantics, #627) so the caller can build its own
+/// `(path, value)` or bare `value` entry — the two stacked shapes differ, so
+/// this can't just return a `Vec` of one fixed type.
+fn eval_recurse_cond<S: EvalSemantics>(
+    cond: &Expr,
+    child: &OwnedValue,
+    gate: bool,
+    mut push: impl FnMut(),
+) -> Option<EvalEscape> {
+    let (cond_outputs, cond_err) = eval_owned_multi_keep_partial::<S>(cond, child);
+    if gate {
+        for c in &cond_outputs {
+            if c.is_truthy() {
+                push();
+            }
+        }
+    }
+    cond_err
+}
+
 /// Fan `recurse(f)` / `recurse(f; cond)` out into one branch per visited
 /// node, depth-first. Uses the same explicit stack
 /// `builtin_recurse_f`/`builtin_recurse_cond` do — including the
@@ -11800,52 +11839,26 @@ fn resolve_recurse<'a, S: EvalSemantics>(
                 Some(cond) => {
                     // `cond` gates the child, not `current`, and forks once
                     // per truthy output — see the doc comment above (#627).
-                    //
-                    // Evaluated unconditionally, even when `current` is
-                    // null: like `f` above, `cond`'s own error/side effect
-                    // on a candidate child must still propagate, matching
-                    // real jq's `select(cond)` semantics (#856 review) --
-                    // only whether an *accepted* child gets queued for
-                    // further recursion is bounded by `is_null_current`,
-                    // not whether `cond` runs on it at all (see that same
-                    // gate applied below, mirroring the `None` arm above).
-                    //
                     // A `cond` error defers exactly like `f`'s own (#636,
                     // #842) rather than discarding `next`'s already-approved
-                    // siblings from earlier in this same loop (#854): stop
-                    // gating further children (real jq never even asks
-                    // `cond` about them — see the doc comment above), and
-                    // overwrite any `f`-side `deferred_error` already set,
-                    // since a `cond` failure here strictly precedes it
-                    // chronologically (`queue_recurse_children`'s doc
-                    // comment has the full reasoning). `cond` itself can
-                    // also be a multi-output generator whose own later
-                    // output errors after an earlier one already fired
-                    // truthy for *this* child (e.g. `(true, error("x"))`,
-                    // independent of the child) — `eval_owned_multi_keep_partial`
-                    // instead of `eval_owned_multi` keeps that inner prefix
-                    // too, so this one already-truthy output still queues
-                    // its child for a full recursive descent before the
-                    // deferred error surfaces, rather than losing it to
-                    // `eval_owned_multi`'s all-or-nothing contract. Confirmed
-                    // against jq 1.7.1: `recurse(.[]; (true, error("x")))` on
+                    // siblings from earlier in this same loop (#854); a
+                    // multi-output `cond` whose later output errors after an
+                    // earlier one already fired truthy for this child still
+                    // queues it before the deferred error surfaces (see
+                    // `eval_recurse_cond`'s own doc comment, #897, for the
+                    // shared mechanics, and #854's original commit for the
+                    // jq-1.7.1 confirmation this reproduces:
+                    // `recurse(.[]; (true, error("x")))` on
                     // `{"a":1,"b":2,"c":3}` prints the root, then `1`, then
-                    // errors — not with `"x"` but with `Cannot iterate over
-                    // number (1)`, because real jq recurses fully into the
-                    // approved child `1` (hitting *that* error) before ever
-                    // backtracking to ask `cond` for its second output; the
-                    // `pending_error` supersede rule above reproduces this
-                    // exactly once `cond`'s own prefix is kept here.
-                    let (cond_outputs, cond_err) =
-                        eval_owned_multi_keep_partial::<S>(cond, &child_value);
-                    if !is_null_current {
-                        for c in &cond_outputs {
-                            if c.is_truthy() {
-                                next.push((path.clone(), child_value.clone()));
-                            }
-                        }
-                    }
-                    if let Some(e) = cond_err {
+                    // errors with `Cannot iterate over number (1)`, not
+                    // `"x"`, since real jq recurses fully into the approved
+                    // child `1` before ever backtracking to ask `cond` for
+                    // its second output). `!is_null_current` mirrors the
+                    // `None` arm above (#856).
+                    let e = eval_recurse_cond::<S>(cond, &child_value, !is_null_current, || {
+                        next.push((path.clone(), child_value.clone()));
+                    });
+                    if let Some(e) = e {
                         deferred_error = Some(e);
                         break;
                     }
@@ -14597,26 +14610,16 @@ fn builtin_recurse_cond<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // `cond` gates the child, not `current` (see doc comment above).
             // A `cond` error defers exactly like `f`'s own (#636, #842)
             // rather than discarding `next`'s already-approved siblings from
-            // earlier in this same loop (#854): stop gating further
-            // children (real jq never even asks `cond` about them), and
-            // overwrite any `f`-side `deferred_error` already set, since a
-            // `cond` failure here strictly precedes it chronologically
-            // (`queue_recurse_children`'s doc comment has the full
-            // reasoning). `cond` itself can also be a multi-output generator
-            // whose own later output errors after an earlier one already
-            // fired truthy for *this* child — `eval_owned_multi_keep_partial`
-            // instead of `eval_owned_multi` keeps that inner prefix too, so
-            // this already-truthy output still queues its child for a full
-            // recursive descent before the deferred error surfaces. See
+            // earlier in this same loop (#854) — see `eval_recurse_cond`'s
+            // own doc comment (#897) for the shared mechanics, and
             // `resolve_recurse`'s matching arm for the full jq 1.7.1
-            // confirmation (#854).
-            let (cond_outputs, cond_err) = eval_owned_multi_keep_partial::<S>(cond, &child);
-            for c in &cond_outputs {
-                if c.is_truthy() {
-                    next.push(child.clone());
-                }
-            }
-            if let Some(e) = cond_err {
+            // confirmation. No `is_null_current`-style gate here: unlike
+            // `resolve_recurse`, this evaluator has no such rule, so `cond`
+            // always gates for real (`gate: true`).
+            let e = eval_recurse_cond::<S>(cond, &child, true, || {
+                next.push(child.clone());
+            });
+            if let Some(e) = e {
                 deferred_error = Some(e);
                 break;
             }
@@ -39463,6 +39466,50 @@ mod tests {
                 assert_eq!(vs.len(), 10000);
             }
         );
+    }
+
+    #[test]
+    fn test_resolve_recurse_cond_and_builtin_recurse_cond_agree_897() {
+        // #897: `resolve_recurse`'s `Some(cond)` arm and `builtin_recurse_cond`
+        // share their per-child "gate through cond, fork on truthy outputs"
+        // step via `eval_recurse_cond` (extracted here) -- this test is the
+        // "cross-implementation invariant test" the issue itself suggested as
+        // cheaper than (and complementary to) the extraction: it doesn't care
+        // *how* the two functions share code, only that they keep agreeing.
+        // For each `recurse(f; cond)` shape below, `path(recurse(f; cond))`'s
+        // paths, read back against the original input via `getpath`, must
+        // produce exactly the same value sequence `recurse(f; cond)` itself
+        // emits directly (path position and value position of the same
+        // traversal, modulo shape).
+        for (json, filter) in [
+            // Multi-output cond forks the same child once per truthy output
+            // (#627).
+            (
+                br#"{"a":1,"b":{"c":2}}"# as &[u8],
+                "recurse(.[]?; true, true)",
+            ),
+            // cond that's always false: no recursion past the root.
+            (br#"{"a":1,"b":{"c":2}}"#, "recurse(.[]?; false)"),
+            // cond gates on a property of the child, pruning some subtrees.
+            (
+                br"[1,[2,3],[4,[5,6]]]",
+                r#"recurse(.[]?; type != "array" or length > 1)"#,
+            ),
+            // A null child: value position ends its own descent there
+            // (#856); path position must agree it's still emitted once but
+            // not recursed into.
+            (br#"{"a":null,"b":1}"#, "recurse(.[]?; true)"),
+        ] {
+            let filter = filter.to_string();
+            let path_filter =
+                format!(". as $root | [path({filter})] | map(. as $p | $root | getpath($p))");
+            assert_eq!(
+                outputs(json, &path_filter),
+                outputs(json, &format!("[{filter}]")),
+                "path/value position drift for `{filter}` on `{}`",
+                String::from_utf8_lossy(json)
+            );
+        }
     }
 
     #[test]
