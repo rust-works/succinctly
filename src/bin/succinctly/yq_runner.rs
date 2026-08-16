@@ -2517,47 +2517,25 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
     // `Auto` whenever the user relies on `.json`-extension detection
     // instead of typing `--input-format json` explicitly, which
     // `resolve_input_format` (used everywhere else JSON input is handled)
-    // still correctly resolves to `Json`. The M2 gates below need that
-    // same resolution, not the raw flag, or a bare `succinctly yq '.'
-    // file.json` (arguably the more common way to hit this than the
-    // explicit flag) would still leak. Conservative for a mixed-format
-    // multi-file `--inplace`/`--doc` invocation (`-i '.' a.yaml b.json`):
-    // this disables M2 for every file, not just the JSON one(s), since
-    // `is_m2_streamable`/`can_slurp_fast_path` are single, run-wide
-    // booleans with no per-file M2-vs-DOM switch to hook into instead.
-    let any_input_is_json = if input_files.is_empty() {
-        resolve_input_format(args.input_format, None) == InputFormat::Json
-    } else {
-        input_files.iter().any(|f| {
-            resolve_input_format(args.input_format, Some(Path::new(f))) == InputFormat::Json
-        })
-    };
-    // every M2 fast path below streams a scalar's *value* straight
-    // from the parsed cursor rather than materializing an OwnedValue, and
-    // neither streamer (JSON or YAML output) reliably discards a JSON
-    // number's own decimal-point/exponent spelling the way the DOM path's
-    // canonicalize_json_numbers now does - `can_json_fast_path`'s
-    // stream_resolved_scalar_as_json still keeps a computed whole-number
-    // float's trailing `.0` (matching #918's YAML convention, wrong for
-    // JSON input: `1e2` -> `100.0`, real yq gives `100`), and
-    // `can_yaml_fast_path`'s streamer echoes the raw source span outright
-    // (`1.50` stays `1.50`). Real yq never preserves a JSON-sourced
-    // number's literal spelling at all, so JSON input (explicit flag or
-    // resolved from a `.json` extension - see `any_input_is_json` above)
-    // always falls back to the (already-fixed) DOM path instead.
+    // still correctly resolves to `Json`. `mark_json_sourced_indices`
+    // below needs that same resolution, not the raw flag, or a bare
+    // `succinctly yq '.' file.json` (arguably the more common way to hit
+    // this than the explicit flag) would still leak the #978 bug back in.
     //
-    // Known trade-off (#996): the DOM path's `OwnedValue::Object` is
-    // `IndexMap`-backed and can't represent duplicate keys, unlike M2
-    // streaming, which never materializes a map at all and so happened to
-    // preserve them - `{"a":1,"a":2}` correctly stays that way through M2
-    // (matching real yq) but collapses to `{"a":2}` once routed through
-    // here. #442 already solved this for YAML input with its own
-    // `OwnedValue`-avoiding fast path; a proper fix for JSON input needs
-    // an equivalent (most likely teaching the shared streaming formatters
-    // in `src/yaml/light.rs` to canonicalize a JSON-sourced number
-    // in-stream, restoring M2 eligibility instead of disabling it) rather
-    // than the DOM-fallback trade-off made here.
-    let is_m2_streamable = can_use_m2_streaming(&program.expr) && !any_input_is_json;
+    // #978 originally disabled M2 streaming outright for JSON input here
+    // (`is_m2_streamable` used to `&& !any_input_is_json`), trading away
+    // M2's performance *and* its incidental duplicate-key preservation
+    // (#996) to fix a real bug: neither M2 streamer discarded a JSON
+    // number's own decimal-point/exponent spelling the way the DOM path's
+    // `canonicalize_json_numbers` does (`1.50` stayed `1.50`, `1e2` became
+    // `100.0` instead of real yq's `100`). #996 fixed that at the source
+    // instead — `YamlIndex::mark_json_sourced` (set below, right after
+    // each M2-path `YamlIndex::build` call) makes `src/yaml/light.rs`'s
+    // streaming formatters canonicalize a `Float` the same way the DOM
+    // path already does, so M2 no longer needs to be disabled for JSON
+    // input at all: it now gets *both* correct numbers and duplicate-key
+    // preservation, matching real yq on both counts.
+    let is_m2_streamable = can_use_m2_streaming(&program.expr);
     // pretty_print isn't implemented by the cursor streamers, so it still
     // falls back to the DOM path, unchanged, rather than silently ignoring
     // the flag the way compact mode already does today. `sort_keys` and
@@ -2647,10 +2625,6 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
     let can_slurp_fast_path = is_identity
         && can_stream_pretty_or_colored
         && output_config.output_format == OutputFormat::Yaml
-        // #978: same JSON-literal-spelling leak as can_yaml_fast_path above
-        // - this gate is YAML-output-only (see its own doc comment), so no
-        // JSON-output sibling to worry about excluding correctly here.
-        && !any_input_is_json
         && !args.null_input
         && !args.raw_input
         && args.front_matter.is_none()
@@ -2785,8 +2759,11 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
             if let Some(code) = yaml_validate_guard(&yaml_bytes, fmt, args.validate, None) {
                 return Ok(code);
             }
-            let index = YamlIndex::build(&yaml_bytes)
+            let mut index = YamlIndex::build(&yaml_bytes)
                 .map_err(|e| anyhow::anyhow!("YAML parse error: {e}"))?;
+            if fmt == InputFormat::Json {
+                index.mark_json_sourced();
+            }
             let root = index.root(&yaml_bytes);
 
             // Output each document using M2 streaming
@@ -2868,8 +2845,11 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                 {
                     return Ok(code);
                 }
-                let index = YamlIndex::build(&yaml_bytes)
+                let mut index = YamlIndex::build(&yaml_bytes)
                     .map_err(|e| anyhow::anyhow!("YAML parse error in {file_path}: {e}"))?;
+                if fmt == InputFormat::Json {
+                    index.mark_json_sourced();
+                }
                 let root = index.root(&yaml_bytes);
 
                 match root.value() {
@@ -3255,9 +3235,12 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
             // `Vec` unless their backing bytes/index all outlive that `Vec`.
             let mut parsed_sources: Vec<(Vec<u8>, YamlIndex<Vec<u64>>)> =
                 Vec::with_capacity(input_sources.len());
-            for (bytes, _format, _) in input_sources {
-                let index = YamlIndex::build(&bytes)
+            for (bytes, format, _) in input_sources {
+                let mut index = YamlIndex::build(&bytes)
                     .map_err(|e| anyhow::anyhow!("YAML parse error: {e}"))?;
+                if format == InputFormat::Json {
+                    index.mark_json_sourced();
+                }
                 parsed_sources.push((bytes, index));
             }
 
@@ -3396,8 +3379,11 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                 // directly into this file's buffer, skipping the OwnedValue
                 // DOM (and its IndexMap, which cannot represent duplicate
                 // mapping keys) the same way the stdout M2 path above does.
-                let index = YamlIndex::build(&input_bytes)
+                let mut index = YamlIndex::build(&input_bytes)
                     .map_err(|e| anyhow::anyhow!("YAML parse error in {file_path}: {e}"))?;
+                if format == InputFormat::Json {
+                    index.mark_json_sourced();
+                }
                 let root = index.root(&input_bytes);
 
                 {

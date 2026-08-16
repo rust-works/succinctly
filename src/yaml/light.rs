@@ -1324,7 +1324,22 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
         self_.write_leading_anchor(out)?;
         let value = self_.value();
         if let YamlValue::String(s) = &value {
-            out.write_str(&s.as_str().unwrap_or(Cow::Borrowed("\"\"")))?;
+            let str_val = s.as_str().unwrap_or(Cow::Borrowed("\"\""));
+            // #996: this root-scalar shortcut bypasses `stream_yaml_value`/
+            // `stream_yaml_string_value` entirely (see this function's own
+            // doc comment on why -- #852's "a scalar root drops its own
+            // styling"), so it needs its own copy of the same
+            // canonicalize-aware check, or a JSON-sourced float navigated
+            // out as a standalone result (`.b`, not nested under a parent
+            // Mapping/Sequence) would echo its raw spelling unchanged.
+            if self_.index.canonicalize_numbers() {
+                if let ResolvedScalar::Float(f) = resolve_plain(&str_val) {
+                    if f.is_finite() {
+                        return write!(out, "{f}");
+                    }
+                }
+            }
+            out.write_str(&str_val)?;
         } else {
             self_.stream_yaml_value(out, "", indent.width, indent.unit, sort_keys, false)?;
         }
@@ -1582,7 +1597,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                         }
                     }
                 }
-                stream_yaml_string_value(out, &s)
+                stream_yaml_string_value(out, &s, self.index.canonicalize_numbers())
             }
             YamlValue::Mapping(_) => {
                 // A bare `-` sequence-item wrapper (dash-alone-then-indented
@@ -1893,7 +1908,12 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                 if let Some(explicit) = self.explicit_tag() {
                     if let Ok(str_val) = s.as_str() {
                         if let Some(resolved) = resolve_tagged(&str_val, explicit) {
-                            return stream_resolved_scalar_as_json(out, resolved, &str_val);
+                            return stream_resolved_scalar_as_json(
+                                out,
+                                resolved,
+                                &str_val,
+                                self.index.canonicalize_numbers(),
+                            );
                         }
                     }
                 }
@@ -1904,7 +1924,11 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                         if let Ok(str_val) = s.as_str() {
                             if s.is_unquoted() {
                                 // Plain scalar - resolve per the core schema
-                                stream_yaml_scalar_as_json(out, &str_val)
+                                stream_yaml_scalar_as_json(
+                                    out,
+                                    &str_val,
+                                    self.index.canonicalize_numbers(),
+                                )
                             } else {
                                 // Block scalars are always strings
                                 stream_json_string(out, &str_val)
@@ -3219,6 +3243,55 @@ pub fn format_float_with_fraction(f: f64) -> String {
     buf
 }
 
+/// Renders a computed (non-literal-preserved) `f64` the way real yq does:
+/// decimal for everyday magnitudes, scientific notation once the value's
+/// decimal exponent is `>= 6` or `<= -5`.
+///
+/// Only for a value with no source literal left to preserve, either because
+/// it was actually computed (arithmetic) or because it came from JSON
+/// input, which real yq always re-serializes through float64 rather than
+/// preserving spelling. A YAML-sourced identity/navigation output keeps its
+/// own source spelling regardless of magnitude and must never route through
+/// this function -- confirmed against real yq v4.53.3:
+/// `12345678901234567890123` (a decimal literal) stays fully expanded on
+/// identity, while the equivalent *computed* magnitude switches to
+/// scientific notation (#997).
+///
+/// The threshold and the `e+NN`/`e-NN` (lowercase, signed, exponent padded
+/// to at least 2 digits) spelling are both oracle-verified against real yq;
+/// this is yq's own threshold, distinct from jq mode's (which only
+/// reformats when the source literal itself already used exponent
+/// notation).
+///
+/// Lives here (not in the CLI binary) so [`YamlCursor`]'s M2 streaming
+/// formatters can share it with the CLI's own DOM-path printer (#996) --
+/// `src/bin/succinctly/output.rs` re-exports this under the same name.
+///
+/// `f` must be finite -- like [`format_float_with_fraction`], this has no
+/// JSON/YAML-specific spelling for NaN/Infinity to fall back on, so every
+/// caller must special-case those first.
+#[must_use]
+pub fn format_float_yq(f: f64) -> String {
+    debug_assert!(
+        f.is_finite(),
+        "format_float_yq requires a finite value; NaN/Infinity have no \
+         JSON/YAML spelling here and must be special-cased by the caller"
+    );
+    let sci = format!("{f:e}");
+    let (mantissa, exp_str) = sci
+        .split_once('e')
+        .expect("Rust's exponential formatter always includes a lowercase 'e'");
+    let exp: i32 = exp_str
+        .parse()
+        .expect("exponent from Rust's exponential formatter is always a valid i32");
+    if (-4..6).contains(&exp) {
+        format_float_with_fraction(f)
+    } else {
+        let sign = if exp < 0 { '-' } else { '+' };
+        format!("{mantissa}e{sign}{:02}", exp.abs())
+    }
+}
+
 /// Fast f64 to string formatting.
 #[inline]
 fn write_f64(output: &mut String, f: f64) {
@@ -3687,24 +3760,39 @@ fn stream_yaml_string_to_json<Out: core::fmt::Write>(
 fn stream_yaml_scalar_as_json<Out: core::fmt::Write>(
     out: &mut Out,
     str_val: &str,
+    canonicalize: bool,
 ) -> core::fmt::Result {
-    stream_resolved_scalar_as_json(out, resolve_plain(str_val), str_val)
+    stream_resolved_scalar_as_json(out, resolve_plain(str_val), str_val, canonicalize)
 }
 
 /// Stream an already-resolved scalar as JSON. `str_val` is the original
 /// source text, used for the `Str` case (and only if `resolved` didn't come
 /// from resolving it, e.g. tag-forced `!!str` on non-string content), and
 /// for a preservable `Float` literal (#993).
+///
+/// `canonicalize` (#996) is
+/// [`YamlIndex::canonicalize_numbers`](super::index::YamlIndex::canonicalize_numbers)
+/// -- when set, a `Float` always re-serializes through `f64` (real yq's
+/// JSON-input convention) instead of preserving `str_val`'s own spelling,
+/// which only makes sense for genuine YAML source text.
 fn stream_resolved_scalar_as_json<Out: core::fmt::Write>(
     out: &mut Out,
     resolved: ResolvedScalar,
     str_val: &str,
+    canonicalize: bool,
 ) -> core::fmt::Result {
     match resolved {
         ResolvedScalar::Null => out.write_str("null"),
         ResolvedScalar::Bool(true) => out.write_str("true"),
         ResolvedScalar::Bool(false) => out.write_str("false"),
         ResolvedScalar::Int(n) => write!(out, "{n}"),
+        // #996: real yq never preserves a JSON-sourced float's literal
+        // spelling -- `1.50` becomes `1.5`, `1e2` becomes `100` -- matching
+        // `OwnedValue::to_json`'s own bare `write!(out, "{f}")` for the DOM
+        // path's already-canonicalized `Float` variant (`canonicalize_json_numbers`
+        // in `yq_runner.rs`). Checked before the literal-preserving arms
+        // below, which exist only for genuine YAML source text.
+        ResolvedScalar::Float(f) if canonicalize && f.is_finite() => write!(out, "{f}"),
         // Echo the source text when it's already safe, valid JSON number
         // syntax (`number_literal()` below uses the same predicate for the
         // DOM path) -- this is what keeps a trailing zero (`1.50`) intact;
@@ -6108,7 +6196,11 @@ fn write_yaml_field_key<W: AsRef<[u64]>, Out: core::fmt::Write>(
         {
             out.write_str("!!merge ")?;
         }
-        stream_yaml_string_value(out, s)
+        // A JSON object key is always itself a JSON string (never a bare
+        // number), so #996's canonicalization never applies to a key -
+        // `false` unconditionally, not `self.index.canonicalize_numbers()`
+        // (this function has no cursor/self to read that from anyway).
+        stream_yaml_string_value(out, s, false)
     } else {
         stream_yaml_nonstring_key(out, &key)
     }
@@ -6561,9 +6653,21 @@ fn widen_folded_breaks(decoded: &str, explicit_indent_used: bool) -> Cow<'_, str
     Cow::Owned(result)
 }
 
+///
+/// `canonicalize` (#996) is
+/// [`YamlIndex::canonicalize_numbers`](super::index::YamlIndex::canonicalize_numbers)
+/// -- see [`stream_resolved_scalar_as_json`]'s doc comment for what this
+/// means. Only the `Unquoted` arm is affected: a JSON-sourced plain
+/// scalar's own source spelling is what's wrong for a `Float` (real yq
+/// re-serializes it through `f64`, e.g. `1.50` -> `1.5`), the same way it's
+/// wrong for JSON output -- this arm just didn't have any type-resolution
+/// logic to begin with (a genuine YAML plain scalar echoes verbatim by
+/// design, #918/#836), so the fix is to add it rather than bypass existing
+/// arms.
 fn stream_yaml_string_value<Out: core::fmt::Write>(
     out: &mut Out,
     s: &YamlString<'_>,
+    canonicalize: bool,
 ) -> core::fmt::Result {
     // Try to get the string value
     let str_val = match s.as_str() {
@@ -6576,6 +6680,31 @@ fn stream_yaml_string_value<Out: core::fmt::Write>(
         YamlString::DoubleQuoted { .. } => stream_yaml_double_quoted(out, &str_val),
         YamlString::SingleQuoted { .. } => stream_yaml_single_quoted(out, &str_val),
         YamlString::Unquoted { .. } => {
+            // #996: a JSON-sourced float re-serializes through `f64`
+            // (bare `Display`: no forced trailing `.0`, and -- matching
+            // `canonicalize_json_numbers`'s own DOM-path baseline, which
+            // this mirrors exactly rather than trying to independently
+            // improve on -- no scientific notation either, even for
+            // extreme magnitudes; `format_float_yq`'s threshold-switching
+            // is for computed/arithmetic results, a different, unrelated
+            // case that was already correct before this fix and is left
+            // untouched) - checked before the verbatim-echo fallback
+            // below, which is for genuine YAML source text only.
+            if canonicalize {
+                if let ResolvedScalar::Float(f) = resolve_plain(&str_val) {
+                    if f.is_finite() {
+                        return write!(out, "{f}");
+                    }
+                    // `.inf`/`-.inf`/`.nan` in JSON-sourced text is
+                    // unreachable (JSON has no such literal), but a value
+                    // computed at query-evaluation time and re-emitted
+                    // through the identity/M2 path shouldn't exist either
+                    // - falls through to the verbatim echo, matching this
+                    // arm's pre-#996 behavior, rather than fabricating a
+                    // YAML-specific non-finite spelling this function has
+                    // never needed before.
+                }
+            }
             // Source plain scalar: re-emit verbatim so both the scalar type and
             // its representation survive (`1`, `true`, `1.0`, `.5`, `yes`),
             // matching yq. Quote only when the decoded value cannot round-trip

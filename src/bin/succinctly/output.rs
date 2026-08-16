@@ -11,6 +11,7 @@ use succinctly::jq::escape::{
 };
 use succinctly::jq::{assert_value_tree_depth, EvalError, OwnedValue, StreamError};
 use succinctly::yaml::format_float_with_fraction;
+pub use succinctly::yaml::format_float_yq;
 
 /// Exit codes matching jq behavior
 pub mod exit_codes {
@@ -316,52 +317,6 @@ fn escape_json_body(s: &str, opts: &JsonFormatOpts) -> String {
 /// Format a value as JSON text (compact or pretty, per `opts`).
 pub fn format_json(value: &OwnedValue, opts: &JsonFormatOpts) -> String {
     format_json_impl(value, opts, 0)
-}
-
-/// Renders a computed (non-literal-preserved) `f64` the way real yq does:
-/// decimal for everyday magnitudes, scientific notation once the value's
-/// decimal exponent is `>= 6` or `<= -5`.
-///
-/// Only for [`OwnedValue::Float`] -- a value with no source literal left to
-/// preserve, either because it was actually computed (arithmetic) or because
-/// it came from JSON input, which real yq always re-serializes through
-/// float64 rather than preserving spelling. [`OwnedValue::NumberLiteral`]
-/// (YAML-sourced identity/navigation output) keeps its own source spelling
-/// regardless of magnitude and must never route through this function --
-/// confirmed against real yq v4.53.3: `12345678901234567890123` (a decimal
-/// literal) stays fully expanded on identity, while the equivalent
-/// *computed* magnitude switches to scientific notation. See issue #997.
-///
-/// The threshold and the `e+NN`/`e-NN` (lowercase, signed, exponent padded
-/// to at least 2 digits) spelling are both oracle-verified against real yq;
-/// this is yq's own threshold, distinct from `format_number_jq_compat`'s
-/// jq-mode one (which real jq only reformats when the source literal itself
-/// already used exponent notation).
-///
-/// `f` must be finite -- like [`format_float_with_fraction`], this has no
-/// JSON/YAML-specific spelling for NaN/Infinity to fall back on, so every
-/// caller must special-case those first (both current call sites already
-/// do, ahead of this function).
-#[must_use]
-pub fn format_float_yq(f: f64) -> String {
-    debug_assert!(
-        f.is_finite(),
-        "format_float_yq requires a finite value; NaN/Infinity have no \
-         JSON/YAML spelling here and must be special-cased by the caller"
-    );
-    let sci = format!("{f:e}");
-    let (mantissa, exp_str) = sci
-        .split_once('e')
-        .expect("Rust's exponential formatter always includes a lowercase 'e'");
-    let exp: i32 = exp_str
-        .parse()
-        .expect("exponent from Rust's exponential formatter is always a valid i32");
-    if (-4..6).contains(&exp) {
-        format_float_with_fraction(f)
-    } else {
-        let sign = if exp < 0 { '-' } else { '+' };
-        format!("{mantissa}e{sign}{:02}", exp.abs())
-    }
 }
 
 /// Recursive JSON formatter behind [`format_json`].

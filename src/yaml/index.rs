@@ -79,6 +79,25 @@ pub struct YamlIndex<W = Vec<u64>> {
     /// Only needed by `to_line_column()` and `to_offset()` (used by the
     /// `yq-locate` CLI and the `at_position` jq builtin).
     lines: OnceCell<crate::text::LineIndex>,
+    /// Set via [`Self::mark_json_sourced`] when this index's text is
+    /// JSON, not genuine YAML, run through this parser only because JSON
+    /// is a syntactic subset of YAML's flow grammar (#996).
+    ///
+    /// Read by [`YamlCursor`]'s M2 streaming formatters
+    /// (`stream_resolved_scalar_as_json`/`stream_yaml_string_value`) to
+    /// switch a float scalar's rendering from YAML's literal-spelling
+    /// preservation to real yq's JSON-input convention (always
+    /// re-serialize through `f64`, matching [`format_float_yq`] /
+    /// bare-`Display` -- never preserve `1.50`'s trailing zero or `1e2`'s
+    /// exponent notation). Carried on the index itself (read via
+    /// `YamlCursor`'s existing `&YamlIndex` reference) rather than as a
+    /// parameter threaded through every streaming call site, since the
+    /// M2 formatters recurse through the entire `Expr`-independent value
+    /// tree and back through `DocumentCursor`'s trait methods (shared
+    /// with the unrelated `JsonCursor` implementor) -- a field on the one
+    /// struct already in scope everywhere it's needed avoids a much
+    /// larger, cross-crate signature change for the same effect.
+    canonicalize_numbers: bool,
 }
 
 /// Build cumulative popcount index for IB.
@@ -141,6 +160,7 @@ impl YamlIndex<Vec<u64>> {
             tags: semi.tags,
             line_comments: semi.line_comments,
             lines: OnceCell::new(),
+            canonicalize_numbers: false,
         };
         index.validate_alias_acyclicity()?;
         Ok(index)
@@ -198,6 +218,7 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
             // given an explicit parameter then.
             line_comments: BTreeMap::new(),
             lines: OnceCell::new(),
+            canonicalize_numbers: false,
         }
     }
 
@@ -249,6 +270,22 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
     #[inline]
     pub fn text_end_pos_by_open_idx(&self, open_idx: usize) -> Option<usize> {
         self.bp_to_text_end.get(open_idx)
+    }
+
+    /// Marks this index's text as JSON-sourced (#996) -- see
+    /// [`Self::canonicalize_numbers`]'s own doc comment for what this
+    /// changes. Callers building an index over JSON bytes (JSON is a
+    /// syntactic subset of YAML's flow grammar, so `YamlIndex::build`
+    /// parses it fine) call this once, right after `build`, before
+    /// streaming through any [`YamlCursor`] derived from it.
+    pub fn mark_json_sourced(&mut self) {
+        self.canonicalize_numbers = true;
+    }
+
+    /// Whether [`Self::mark_json_sourced`] was called on this index.
+    #[inline]
+    pub(crate) fn canonicalize_numbers(&self) -> bool {
+        self.canonicalize_numbers
     }
 
     /// Get a reference to the interest bits words.
