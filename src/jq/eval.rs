@@ -5166,8 +5166,10 @@ pub(crate) fn numeric_display_string<S: EvalSemantics>(value: &OwnedValue) -> St
 /// jq's bare `f64::Display` (`NaN`/`inf`/`-inf`) vs yq's own YAML-native
 /// spelling (`.nan`/`.inf`/`-.inf`) for a non-finite float.
 ///
-/// See [`numeric_display_string`]'s own doc comment for the
-/// "document-sourced vs computed" caveat this doesn't attempt to resolve.
+/// See `numeric_display_string`'s own doc comment for the
+/// "document-sourced vs computed" caveat this doesn't attempt to resolve
+/// (not a doc link: that function is `pub(crate)`, unresolvable from this
+/// one's now-`pub` docs).
 ///
 /// `pub`, not `pub(crate)`: `src/bin/succinctly/yq_runner.rs` is a separate
 /// binary crate depending on this one as an external dependency, and is one
