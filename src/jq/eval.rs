@@ -27397,6 +27397,16 @@ mod tests {
                 assert_eq!(s, "a,b");
             }
         );
+        yq_query!(br#"{"x": "p", "y": "q"}"#, r#"join(",")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "p,q");
+            }
+        );
+        yq_query!(br"5", r#"join(",")"#,
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "Cannot iterate over number (5)");
+            }
+        );
     }
 
     #[test]
