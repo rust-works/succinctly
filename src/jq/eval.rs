@@ -1781,14 +1781,31 @@ fn arith_mul<S: EvalSemantics>(
 /// structurally, recursing into positions gated individually by
 /// [`merge_position`]; anything else is a plain leaf replace.
 fn merge_values(left: OwnedValue, right: OwnedValue, flags: MergeFlags) -> OwnedValue {
+    merge_values_at_depth(left, right, flags, 0)
+}
+
+/// Panics past [`MAX_VALUE_TREE_DEPTH`](super::value::MAX_VALUE_TREE_DEPTH)
+/// levels of nesting (#1017) -- `*`/`*=` had no guard anywhere in this
+/// mutually-recursive family (`merge_values`/`merge_existing`/
+/// `merge_position`/`merge_object_fields`/`merge_arrays_by_index`),
+/// unlike the tree-walkers #1015 already guarded. Reachable on a value
+/// constructed via `reduce`/`foreach`/etc. with no adversarial document
+/// involved on either side.
+fn merge_values_at_depth(
+    left: OwnedValue,
+    right: OwnedValue,
+    flags: MergeFlags,
+    depth: usize,
+) -> OwnedValue {
+    assert_value_tree_depth(depth);
     match (left, right) {
         (OwnedValue::Object(a), OwnedValue::Object(b)) => {
-            OwnedValue::Object(merge_object_fields(a, b, flags))
+            OwnedValue::Object(merge_object_fields(a, b, flags, depth))
         }
         (OwnedValue::Array(a), OwnedValue::Array(b))
             if flags.deep_merge_arrays && !flags.append_arrays =>
         {
-            OwnedValue::Array(merge_arrays_by_index(a, b, flags))
+            OwnedValue::Array(merge_arrays_by_index(a, b, flags, depth))
         }
         (existing, incoming) => merge_leaf(existing, incoming, flags),
     }
@@ -1820,14 +1837,27 @@ fn merge_leaf(existing: OwnedValue, incoming: OwnedValue, flags: MergeFlags) -> 
 /// exists still gets recursed into, so *its* new children can be added (or
 /// blocked) individually.
 fn merge_existing(existing: OwnedValue, incoming: OwnedValue, flags: MergeFlags) -> OwnedValue {
+    merge_existing_at_depth(existing, incoming, flags, 0)
+}
+
+/// Panics past [`MAX_VALUE_TREE_DEPTH`](super::value::MAX_VALUE_TREE_DEPTH)
+/// levels of nesting (#1017) -- see [`merge_values_at_depth`], which this
+/// mirrors.
+fn merge_existing_at_depth(
+    existing: OwnedValue,
+    incoming: OwnedValue,
+    flags: MergeFlags,
+    depth: usize,
+) -> OwnedValue {
+    assert_value_tree_depth(depth);
     match (existing, incoming) {
         (OwnedValue::Object(a), OwnedValue::Object(b)) => {
-            OwnedValue::Object(merge_object_fields(a, b, flags))
+            OwnedValue::Object(merge_object_fields(a, b, flags, depth))
         }
         (OwnedValue::Array(a), OwnedValue::Array(b))
             if flags.deep_merge_arrays && !flags.append_arrays =>
         {
-            OwnedValue::Array(merge_arrays_by_index(a, b, flags))
+            OwnedValue::Array(merge_arrays_by_index(a, b, flags, depth))
         }
         (existing, incoming) => {
             // `n`: only write if the existing value is already null. `?`
@@ -1858,6 +1888,7 @@ fn merge_position(
     incoming: OwnedValue,
     flags: MergeFlags,
     only_existing_applies: bool,
+    depth: usize,
 ) -> Option<OwnedValue> {
     match existing {
         None => {
@@ -1867,7 +1898,7 @@ fn merge_position(
                 Some(incoming)
             }
         }
-        Some(existing) => Some(merge_existing(existing, incoming, flags)),
+        Some(existing) => Some(merge_existing_at_depth(existing, incoming, flags, depth)),
     }
 }
 
@@ -1876,19 +1907,24 @@ fn merge_position(
 /// `left.get(&k).cloned()` + `left.insert(..)` so an existing value that's
 /// itself a large nested container moves into the merge instead of being
 /// deep-cloned first.
+///
+/// `depth` is the *parent* object's own depth (not yet incremented) --
+/// each field merged below is one level deeper, so every call back into
+/// [`merge_existing_at_depth`]/[`merge_position`] passes `depth + 1`.
 fn merge_object_fields(
     mut left: IndexMap<String, OwnedValue>,
     right: IndexMap<String, OwnedValue>,
     flags: MergeFlags,
+    depth: usize,
 ) -> IndexMap<String, OwnedValue> {
     for (k, v) in right {
         match left.entry(k) {
             indexmap::map::Entry::Occupied(mut e) => {
                 let existing = e.insert(OwnedValue::Null);
-                e.insert(merge_existing(existing, v, flags));
+                e.insert(merge_existing_at_depth(existing, v, flags, depth + 1));
             }
             indexmap::map::Entry::Vacant(e) => {
-                if let Some(new_value) = merge_position(None, v, flags, true) {
+                if let Some(new_value) = merge_position(None, v, flags, true, depth + 1) {
                     e.insert(new_value);
                 }
             }
@@ -1902,15 +1938,19 @@ fn merge_object_fields(
 /// Indices only present in `right` extend `left` — real yq's `?` never
 /// blocks this (see [`merge_position`]'s doc comment), so extension is
 /// unconditional here rather than routed through `merge_position`.
+///
+/// `depth` is the *parent* array's own depth, same convention as
+/// [`merge_object_fields`].
 fn merge_arrays_by_index(
     mut left: Vec<OwnedValue>,
     right: Vec<OwnedValue>,
     flags: MergeFlags,
+    depth: usize,
 ) -> Vec<OwnedValue> {
     for (i, v) in right.into_iter().enumerate() {
         if i < left.len() {
             let existing = core::mem::replace(&mut left[i], OwnedValue::Null);
-            left[i] = merge_existing(existing, v, flags);
+            left[i] = merge_existing_at_depth(existing, v, flags, depth + 1);
         } else {
             left.push(v);
         }
@@ -4309,17 +4349,39 @@ fn builtin_flatten<W: Clone + AsRef<[u64]>>(
     QueryResult::Owned(OwnedValue::Array(flattened))
 }
 
-/// Flatten owned values to a specific depth
+/// Flatten owned values to a specific depth.
 fn flatten_owned(items: Vec<OwnedValue>, depth: usize) -> Vec<OwnedValue> {
+    flatten_owned_at_depth(items, depth, 0)
+}
+
+/// `depth` (the *remaining flatten levels* the caller asked for, e.g. from
+/// `flatten(depth)`) and `tree_depth` (this recursion's own descent so
+/// far) are two independent counters: `depth` already self-terminates
+/// (`depth == 0` stops), but a user-supplied `flatten(N)` for a large `N`
+/// places no ceiling of its own on how deep the *array's own structure*
+/// (not the flatten count) can be walked before that termination kicks
+/// in. Panics past
+/// [`MAX_VALUE_TREE_DEPTH`](super::value::MAX_VALUE_TREE_DEPTH) levels of
+/// `tree_depth` (#1017) -- currently only reachable at a `tree_depth`
+/// this deep via a value already capped there by an upstream guard
+/// (#1005's `to_owned`/reindex-bridge), so this is defense-in-depth
+/// against that invariant changing, not a currently-live independent
+/// crash path.
+fn flatten_owned_at_depth(
+    items: Vec<OwnedValue>,
+    depth: usize,
+    tree_depth: usize,
+) -> Vec<OwnedValue> {
     if depth == 0 {
         return items;
     }
+    assert_value_tree_depth(tree_depth);
 
     let mut result = Vec::new();
     for item in items {
         match item {
             OwnedValue::Array(inner) => {
-                result.extend(flatten_owned(inner, depth - 1));
+                result.extend(flatten_owned_at_depth(inner, depth - 1, tree_depth + 1));
             }
             other => result.push(other),
         }
@@ -5349,12 +5411,24 @@ fn format_yaml(value: &OwnedValue) -> Result<String, EvalError> {
 /// Non-objects are converted to strings.
 fn format_props(value: &OwnedValue) -> Result<String, EvalError> {
     let mut lines = Vec::new();
-    format_props_recursive(value, String::new(), &mut lines);
+    format_props_recursive(value, String::new(), &mut lines, 0);
     Ok(lines.join("\n"))
 }
 
-/// Recursively format a value into Java properties lines
-fn format_props_recursive(value: &OwnedValue, prefix: String, lines: &mut Vec<String>) {
+/// Recursively format a value into Java properties lines.
+///
+/// Panics past [`MAX_VALUE_TREE_DEPTH`](super::value::MAX_VALUE_TREE_DEPTH)
+/// levels of nesting (#1017) -- unlike its sibling format functions
+/// (`format_json_impl`, guarded by #1015), this one had no guard at all;
+/// reachable on a value constructed via `reduce`/`foreach`/etc. with no
+/// adversarial document involved.
+fn format_props_recursive(
+    value: &OwnedValue,
+    prefix: String,
+    lines: &mut Vec<String>,
+    depth: usize,
+) {
+    assert_value_tree_depth(depth);
     match value {
         OwnedValue::Object(obj) => {
             for (key, val) in obj {
@@ -5363,7 +5437,7 @@ fn format_props_recursive(value: &OwnedValue, prefix: String, lines: &mut Vec<St
                 } else {
                     format!("{prefix}.{key}")
                 };
-                format_props_recursive(val, new_prefix, lines);
+                format_props_recursive(val, new_prefix, lines, depth + 1);
             }
         }
         OwnedValue::Array(arr) => {
@@ -5373,7 +5447,7 @@ fn format_props_recursive(value: &OwnedValue, prefix: String, lines: &mut Vec<St
                 } else {
                     format!("{prefix}.{idx}")
                 };
-                format_props_recursive(val, new_prefix, lines);
+                format_props_recursive(val, new_prefix, lines, depth + 1);
             }
         }
         _ => {
@@ -5430,6 +5504,15 @@ fn props_value_to_string(value: &OwnedValue) -> String {
 /// Convert OwnedValue to YAML flow-style (compact, single-line like JSON).
 /// This matches yq's @yaml behavior which outputs flow-style YAML.
 fn owned_to_yaml(value: &OwnedValue) -> String {
+    owned_to_yaml_at_depth(value, 0)
+}
+
+/// Panics past [`MAX_VALUE_TREE_DEPTH`](super::value::MAX_VALUE_TREE_DEPTH)
+/// levels of nesting (#1017) -- see [`format_props_recursive`], the
+/// sibling this mirrors: both were unguarded, unlike `format_json_impl`
+/// (#1015).
+fn owned_to_yaml_at_depth(value: &OwnedValue, depth: usize) -> String {
+    assert_value_tree_depth(depth);
     match value {
         OwnedValue::Null => "null".to_string(),
         OwnedValue::Bool(true) => "true".to_string(),
@@ -5459,13 +5542,22 @@ fn owned_to_yaml(value: &OwnedValue) -> String {
         OwnedValue::NumberLiteral(_, literal) => format_number_jq_compat(literal.as_bytes()),
         OwnedValue::String(s) => yaml_quote_string(s),
         OwnedValue::Array(arr) => {
-            let items: Vec<String> = arr.iter().map(owned_to_yaml).collect();
+            let items: Vec<String> = arr
+                .iter()
+                .map(|v| owned_to_yaml_at_depth(v, depth + 1))
+                .collect();
             format!("[{}]", items.join(", "))
         }
         OwnedValue::Object(obj) => {
             let pairs: Vec<String> = obj
                 .iter()
-                .map(|(k, v)| format!("{}: {}", yaml_quote_string(k), owned_to_yaml(v)))
+                .map(|(k, v)| {
+                    format!(
+                        "{}: {}",
+                        yaml_quote_string(k),
+                        owned_to_yaml_at_depth(v, depth + 1)
+                    )
+                })
                 .collect();
             format!("{{{}}}", pairs.join(", "))
         }
@@ -39988,6 +40080,97 @@ mod tests {
         assert!(
             result.is_err(),
             "to_owned should panic at MAX_VALUE_TREE_DEPTH"
+        );
+    }
+
+    /// #1017: `*`/`*=` merge had no guard anywhere in the mutually-recursive
+    /// `merge_values`/`merge_existing`/`merge_object_fields`/
+    /// `merge_arrays_by_index` family; `deep_merge_arrays` (the `d` flag)
+    /// exercises the array leg, which -- unlike the object leg -- is only
+    /// reachable when both sides are arrays at every level.
+    #[test]
+    fn merge_values_panics_past_nesting_depth_limit_1017() {
+        use crate::jq::value::MAX_VALUE_TREE_DEPTH;
+
+        let flags = MergeFlags {
+            deep_merge_arrays: true,
+            ..Default::default()
+        };
+
+        let under_a = linear_array_nest(MAX_VALUE_TREE_DEPTH - 1);
+        let under_b = linear_array_nest(MAX_VALUE_TREE_DEPTH - 1);
+        let _ = merge_values(under_a, under_b, flags);
+
+        let over_a = linear_array_nest(MAX_VALUE_TREE_DEPTH);
+        let over_b = linear_array_nest(MAX_VALUE_TREE_DEPTH);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            merge_values(over_a, over_b, flags)
+        }));
+        assert!(
+            result.is_err(),
+            "merge_values should panic at MAX_VALUE_TREE_DEPTH"
+        );
+    }
+
+    /// #1017: `flatten` had no guard on its own tree-recursion depth,
+    /// distinct from the pre-existing `depth` parameter (remaining flatten
+    /// levels) it already threads. Passes `usize::MAX` for that parameter
+    /// so it can never be the thing that stops recursion first -- with a
+    /// flatten-level count matched to the actual nesting instead, `depth`
+    /// and the tree-depth counter reach zero on the same call, and the
+    /// early `if depth == 0` return happens *before* the assert, masking
+    /// it entirely.
+    #[test]
+    fn flatten_owned_panics_past_nesting_depth_limit_1017() {
+        use crate::jq::value::MAX_VALUE_TREE_DEPTH;
+
+        let under = vec![linear_array_nest(MAX_VALUE_TREE_DEPTH - 1)];
+        let _ = flatten_owned(under, usize::MAX);
+
+        let over = vec![linear_array_nest(MAX_VALUE_TREE_DEPTH)];
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            flatten_owned(over, usize::MAX)
+        }));
+        assert!(
+            result.is_err(),
+            "flatten_owned should panic at MAX_VALUE_TREE_DEPTH"
+        );
+    }
+
+    /// #1017: `@props`'s recursive formatter had no guard, reachable on a
+    /// value constructed via `reduce`/`foreach`/etc. with no adversarial
+    /// document involved.
+    #[test]
+    fn format_props_panics_past_nesting_depth_limit_1017() {
+        use crate::jq::value::MAX_VALUE_TREE_DEPTH;
+
+        let under = linear_array_nest(MAX_VALUE_TREE_DEPTH - 1);
+        assert!(format_props(&under).is_ok());
+
+        let over = linear_array_nest(MAX_VALUE_TREE_DEPTH);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| format_props(&over)));
+        assert!(
+            result.is_err(),
+            "format_props should panic at MAX_VALUE_TREE_DEPTH"
+        );
+    }
+
+    /// #1017: `@yaml`'s flow-style formatter had no guard, reachable on a
+    /// value constructed via `reduce`/`foreach`/etc. with no adversarial
+    /// document involved.
+    #[test]
+    fn owned_to_yaml_panics_past_nesting_depth_limit_1017() {
+        use crate::jq::value::MAX_VALUE_TREE_DEPTH;
+
+        let under = linear_array_nest(MAX_VALUE_TREE_DEPTH - 1);
+        let _ = owned_to_yaml(&under);
+
+        let over = linear_array_nest(MAX_VALUE_TREE_DEPTH);
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| owned_to_yaml(&over)));
+        assert!(
+            result.is_err(),
+            "owned_to_yaml should panic at MAX_VALUE_TREE_DEPTH"
         );
     }
 }
