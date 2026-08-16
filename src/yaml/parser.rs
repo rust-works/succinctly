@@ -1818,6 +1818,45 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         }
     }
 
+    /// Whether an explicit value's (already #885-gap-resolved) `indent`
+    /// matches the mapping frame opened by its own pending `?`, if one is
+    /// pending (#1010). YAML ties both the explicit-key and explicit-value
+    /// productions to the same indentation parameter `n`
+    /// (c-l-block-map-explicit-key/value(n)), so any deviation -- not just a
+    /// dedent -- is ambiguous. This is a different shape than the dedent
+    /// ambiguity [`Self::mapping_under_mapping_gap_reaches`] detects: that
+    /// predicate's `indent >= indent_stack[top]` short-circuit is correct for
+    /// `parse_mapping_entry`'s "deeper indent opens a new nested mapping"
+    /// semantics, but would wrongly wave through an over-indented `:` here,
+    /// since a `:` value line never opens a new frame the way an ordinary
+    /// `key: value` line does. Confirmed live against real yq: `? k\n : v\n`
+    /// (`:` one column past `?`) and deeper misalignments both error ("did
+    /// not find expected key"); only exact alignment, or no pending key at
+    /// all (a bare `: value` with no `?`, a separate and pre-existing
+    /// out-of-scope shape), passes.
+    ///
+    /// `owner_depth` is `parse_explicit_key`'s own `indent_stack.len()`,
+    /// captured immediately after the owning mapping frame is opened/reused
+    /// and before any key-content parsing that could push extra frames (a
+    /// sequence or compact-mapping key) -- so `indent_stack[owner_depth - 1]`
+    /// always resolves to the owner's own recorded indent, never a deeper
+    /// frame the key's own content pushed. `close_pending_explicit_key`
+    /// clears `pending_explicit_key` before that frame can ever be popped
+    /// (it only fires when `indent_stack.len() == owner_depth` exactly), so
+    /// `owner_depth - 1` is always in bounds whenever this observes `Some`.
+    fn explicit_value_matches_key_indent(&self, indent: usize) -> bool {
+        match self.pending_explicit_key {
+            Some(owner_depth) => {
+                debug_assert!(
+                    owner_depth >= 1 && owner_depth <= self.indent_stack.len(),
+                    "pending_explicit_key must name a frame still on indent_stack"
+                );
+                self.indent_stack[owner_depth - 1] == indent
+            }
+            None => true,
+        }
+    }
+
     /// The #901 sibling of [`Self::compact_mapping_gap_reaches`]: whether
     /// `indent` would land ambiguously if [`Self::close_deeper_indents`]
     /// popped every frame deeper than it -- the surviving (landing) frame's
@@ -1914,13 +1953,25 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         self.indent_stack[landing_idx] != indent
     }
 
-    /// Check-and-error wrapper around [`Self::mapping_under_mapping_gap_reaches`]:
-    /// every call site raises the identical `InconsistentIndentation` error
-    /// when the gap is reached, so this gives that pairing one definition
-    /// instead of each site re-deriving it (#106's "duplicated predicates
-    /// diverge silently" lesson) — the same check-and-error, `?`-friendly
-    /// shape [`Self::reject_trailing_flow_content`] already uses for an
-    /// unrelated check in this file. `for_sequence_item` forwards to
+    /// Shared `Err` construction for every indentation-ambiguity predicate in
+    /// this cluster of the file (#106: one definition instead of each call
+    /// site re-deriving it) -- `ok` is the specific predicate's own verdict;
+    /// this only owns the error's shape, at the current position.
+    fn require_consistent_indentation(&self, ok: bool) -> Result<(), YamlError> {
+        if ok {
+            Ok(())
+        } else {
+            Err(YamlError::InconsistentIndentation {
+                offset: self.pos,
+                line: self.current_line(),
+            })
+        }
+    }
+
+    /// Check-and-error wrapper around [`Self::mapping_under_mapping_gap_reaches`],
+    /// via [`Self::require_consistent_indentation`] -- the same check-and-error,
+    /// `?`-friendly shape [`Self::reject_trailing_flow_content`] already uses
+    /// for an unrelated check in this file. `for_sequence_item` forwards to
     /// [`Self::mapping_under_mapping_gap_reaches`] -- see its own doc
     /// comment for which call site must pass `true`.
     fn check_mapping_under_mapping_gap(
@@ -1928,14 +1979,9 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         indent: usize,
         for_sequence_item: bool,
     ) -> Result<(), YamlError> {
-        if self.mapping_under_mapping_gap_reaches(indent, for_sequence_item) {
-            Err(YamlError::InconsistentIndentation {
-                offset: self.pos,
-                line: self.current_line(),
-            })
-        } else {
-            Ok(())
-        }
+        self.require_consistent_indentation(
+            !self.mapping_under_mapping_gap_reaches(indent, for_sequence_item),
+        )
     }
 
     /// Whether a `-` sequence-item line's `indent` falls in the *lower*
@@ -3015,6 +3061,11 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         // inconsistently-indented `:` must not close the pending key's own
         // compact mapping out from under it.
         let indent = self.resolve_compact_mapping_gap_indent(indent);
+
+        // Same ambiguous-column error for a `:` that doesn't match its own
+        // `?` (#1010) -- checked against the #885-resolved `indent` above,
+        // not the raw column, so that normalization's tolerance stays intact.
+        self.require_consistent_indentation(self.explicit_value_matches_key_indent(indent))?;
 
         // Close deeper structures, but keep the mapping at this indent open
         self.close_deeper_indents(indent + 1);
@@ -6412,15 +6463,24 @@ mod tests {
     /// corpus shape (id `35KP`, "Tags for Root Objects") that used to
     /// exercise this before this PR's tag-support change routed that corpus
     /// case through a different path (#224).
+    ///
+    /// #1010: this `:` (column 2) doesn't actually align with its own `?`
+    /// (column 0) either, which real yq rejects ("did not find expected
+    /// key") -- confirmed live. Before #1010's fix, `parse_explicit_value`
+    /// had no alignment check at all, so this silently resolved to `{"a":1}`
+    /// once the guard above stopped the scalar from swallowing `: 1`; the
+    /// guard's own job (stopping the scalar there rather than absorbing the
+    /// line as text) is unchanged and still exercised here, but the
+    /// now-separated `: 1` line is correctly rejected instead of silently
+    /// accepted.
     #[test]
     fn multiline_plain_scalar_stops_before_explicit_value_indicator() {
         let yaml: &[u8] = b"?   a\n  : 1\n";
-        let index = crate::yaml::YamlIndex::build(yaml).unwrap();
-        let cursor = index.root(yaml);
-        assert_eq!(
-            cursor.to_json(),
-            r#"[{"a":1}]"#,
-            "explicit key 'a' must map to 1, not swallow the ': 1' line into the key scalar"
+        let err = crate::yaml::YamlIndex::build(yaml).unwrap_err();
+        assert!(
+            matches!(err, YamlError::InconsistentIndentation { line: 2, .. }),
+            "explicit key 'a's scalar must stop before ': 1' (not swallow it into the key text), \
+             and the resulting misaligned ':' must then be rejected, not silently paired with 'a'; got {err:?}"
         );
     }
 

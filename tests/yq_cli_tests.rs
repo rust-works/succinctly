@@ -6813,6 +6813,68 @@ fn test_mapping_under_mapping_gap_via_explicit_value() -> Result<()> {
     Ok(())
 }
 
+// #1010: `parse_explicit_value`'s ambiguous-gap check ran on the raw `:`
+// column, which only ever detects a *dedent* landing in a gap between two
+// open frames (#901/#958's own shape) -- it structurally cannot fire for a
+// `:` indented *past* its own `?`, since `mapping_under_mapping_gap_reaches`
+// short-circuits to "no gap" whenever `indent >= indent_stack[top]`, which an
+// over-indented `:` always satisfies. YAML ties both the explicit key and
+// value productions to the same indentation parameter, so any deviation --
+// not just a dedent -- is ambiguous; real yq rejects it with "did not find
+// expected key". Confirmed live against pinned yq v4.53.3.
+
+#[test]
+fn test_explicit_value_past_its_key_errors_1010() -> Result<()> {
+    for (name, input) in [
+        // The issue's own headline repro: `:` one column deeper than its `?`.
+        ("one column past", "? k\n : v\nc: 3\n"),
+        // Not just an off-by-one: any over-indentation is ambiguous.
+        ("several columns past", "? k\n   : v\nc: 3\n"),
+    ] {
+        let (_output, stderr, exit_code) =
+            run_yq_stdin_with_stderr(".", input, &["-o", "json", "-I0"])?;
+        assert_eq!(exit_code, 1, "{name}");
+        assert!(
+            stderr.contains("inconsistent indentation"),
+            "{name}: stderr: {stderr:?}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn test_explicit_value_exact_alignment_still_works_1010() -> Result<()> {
+    // The #1010 fix must not disturb the ordinary, exactly-aligned case.
+    let (output, exit_code) = run_yq_stdin(".", "? k\n: v\nc: 3\n", &["-o", "json", "-I0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), r#"{"k":"v","c":3}"#);
+    Ok(())
+}
+
+#[test]
+fn test_explicit_value_legitimately_nested_value_still_works_1010() -> Result<()> {
+    // The `:` itself stays aligned with `?`; only its *value* (a nested
+    // mapping) sits deeper on following lines -- `close_deeper_indents`'s
+    // `indent + 1` tolerance this fix leaves untouched is what keeps this
+    // working, distinct from the `:` marker's own column checked here.
+    let (output, exit_code) = run_yq_stdin(".", "? k\n:\n  a: 1\nc: 3\n", &["-o", "json", "-I0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), r#"{"k":{"a":1},"c":3}"#);
+    Ok(())
+}
+
+#[test]
+fn test_explicit_value_complex_key_alignment_still_works_1010() -> Result<()> {
+    // A complex (sequence) key leaves extra frames open above its owning
+    // mapping; the `:` must still align with `?`'s own column, not the
+    // deeper key content's.
+    let (output, exit_code) =
+        run_yq_stdin(".", "? - a\n  - b\n: v\nc: 3\n", &["-o", "json", "-I0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), r#"{"":"v","c":3}"#);
+    Ok(())
+}
+
 // #959: #901's check was only wired into parse_mapping_entry,
 // parse_explicit_key, and parse_explicit_value -- the same three
 // call sites #885 touched for the analogous compact-mapping-gap check.
