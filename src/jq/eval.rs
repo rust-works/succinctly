@@ -27196,10 +27196,15 @@ mod tests {
             }
         );
 
-        // Join with null values (should be skipped)
+        // #1003: a null element contributes an empty-string part -- it is
+        // NOT skipped (that was a real, separate pre-existing bug this
+        // issue's fix corrected as a side effect of matching jq's own
+        // reduce-based definition exactly). Confirmed live against jq
+        // 1.7.1: `["a",null,"c"] | join("-")` is `"a--c"`, with the
+        // separator still appearing on both sides of the empty part.
         query!(br#"["a", null, "c"]"#, r#"join("-")"#,
             QueryResult::Owned(OwnedValue::String(s)) => {
-                assert_eq!(s, "a-c");
+                assert_eq!(s, "a--c");
             }
         );
 
@@ -27214,6 +27219,47 @@ mod tests {
         query!(br"{}", r#"join(",")"#,
             QueryResult::Owned(OwnedValue::String(s)) => {
                 assert_eq!(s, "");
+            }
+        );
+
+        // #1003: numbers and booleans stringify via tostring, but arrays and
+        // objects are passed raw into the accumulator's `+`, so they surface
+        // jq's own binary-op wording ("string (...) and array/object (...)
+        // cannot be added") instead of a bespoke join-specific error.
+        // Confirmed live against jq 1.7.1.
+        query!(br#"[[1, 2], "a"]"#, r#"join(",")"#,
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "string (\"\") and array ([1,2]) cannot be added");
+            }
+        );
+        query!(br#"["a", [1, 2]]"#, r#"join(",")"#,
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "string (\"a,\") and array ([1,2]) cannot be added");
+            }
+        );
+        query!(br#"["a", {"x": 1}]"#, r#"join(",")"#,
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "string (\"a,\") and object ({\"x\":1}) cannot be added");
+            }
+        );
+
+        // #1003's own repro: a non-string separator surfaces this same
+        // accumulator-derived wording too, because the separator is fed
+        // through the identical `+` accumulator step as every element --
+        // it is never type-checked up front. Confirmed live against jq 1.7.1.
+        query!(br"[1, 2]", r"join(1)",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "string (\"1\") and number (1) cannot be added");
+            }
+        );
+        query!(br"[1, 2, 3]", r#"join(",")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "1,2,3");
+            }
+        );
+        query!(br"[true, false]", r#"join(",")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "true,false");
             }
         );
     }
