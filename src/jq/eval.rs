@@ -4102,7 +4102,28 @@ fn builtin_split<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// site, not [`to_owned`]) so a container element's contents are never
 /// materialized at all -- they're discarded unread here regardless -- and a
 /// string element is moved rather than cloned a second time.
+/// yq's own `.nan`/`.inf`/`-.inf` spelling for a non-finite element or
+/// separator (#1047, matching #1060's identical fix for `tostring`/`@text`/
+/// etc.), shared by [`yq_join_element_part`] and [`yq_join_separator`]
+/// rather than hand-copied at each -- the #106 "duplicated predicates
+/// diverge silently" lesson in `CLAUDE.md`, caught in this PR's own code
+/// review. `None` for anything else, so the caller's own catch-all
+/// (`other.to_json_yq()`) handles every other variant unchanged.
+fn yq_join_nonfinite_part(value: &OwnedValue) -> Option<String> {
+    match value {
+        OwnedValue::Float(f) | OwnedValue::NumberLiteral(NumberRepr::Float(f), _)
+            if f.is_nan() || f.is_infinite() =>
+        {
+            Some(nonfinite_display_string::<YqSemantics>(*f))
+        }
+        _ => None,
+    }
+}
+
 fn yq_join_element_part(elem: OwnedValue) -> String {
+    if let Some(s) = yq_join_nonfinite_part(&elem) {
+        return s;
+    }
     match elem {
         OwnedValue::String(s) => s,
         // NOT a `OwnedValue::Object(m) if m.is_empty()` guard here (#1047
@@ -4114,17 +4135,6 @@ fn yq_join_element_part(elem: OwnedValue) -> String {
         // special case is instead handled at the call site, on the live
         // cursor, before that collapse ever runs.
         OwnedValue::Null | OwnedValue::Array(_) | OwnedValue::Object(_) => String::new(),
-        // YAML's own `.nan`/`.inf`/`-.inf` spelling (#1047, matching #1060's
-        // identical fix for `tostring`/`@text`/etc.), not `to_json_yq()`'s
-        // RFC-8259 `"null"` substitution -- confirmed live,
-        // `[.nan, 2] | join(",")` on a document-sourced `.nan` element is
-        // `".nan,2"` in real yq, not `"null,2"`.
-        OwnedValue::Float(f) if f.is_nan() || f.is_infinite() => {
-            nonfinite_display_string::<YqSemantics>(f)
-        }
-        OwnedValue::NumberLiteral(NumberRepr::Float(f), _) if f.is_nan() || f.is_infinite() => {
-            nonfinite_display_string::<YqSemantics>(f)
-        }
         // `to_json_yq()`, not `to_json()` (#1030 code review): this function
         // is only ever reached from `builtin_join`'s `S::TAG == EvalTag::Yq`
         // branch, so a scientific-notation literal here must echo verbatim
@@ -4143,6 +4153,9 @@ fn yq_join_element_part(elem: OwnedValue) -> String {
 /// from jq mode, where `null` is a no-op only via `+`'s own left-identity
 /// rule, not something `join` special-cases).
 fn yq_join_separator(sep: OwnedValue) -> String {
+    if let Some(s) = yq_join_nonfinite_part(&sep) {
+        return s;
+    }
     match sep {
         OwnedValue::String(s) => s,
         // Empty-object special case (#1047): see `yq_join_element_part`'s
@@ -4150,16 +4163,6 @@ fn yq_join_separator(sep: OwnedValue) -> String {
         // `"1{}2"` in real yq, not `"12"`.
         OwnedValue::Object(ref m) if m.is_empty() => "{}".to_string(),
         OwnedValue::Array(_) | OwnedValue::Object(_) => String::new(),
-        // YAML's own `.nan`/`.inf`/`-.inf` spelling (#1047): see
-        // `yq_join_element_part`'s identical arm above -- confirmed live,
-        // a document-sourced `.nan`/`.inf` *separator* keeps its own
-        // spelling too, not `to_json_yq()`'s `"null"`.
-        OwnedValue::Float(f) if f.is_nan() || f.is_infinite() => {
-            nonfinite_display_string::<YqSemantics>(f)
-        }
-        OwnedValue::NumberLiteral(NumberRepr::Float(f), _) if f.is_nan() || f.is_infinite() => {
-            nonfinite_display_string::<YqSemantics>(f)
-        }
         // `to_json_yq()` (#1030 code review): same reasoning as
         // `yq_join_element_part` above -- this function is yq-only.
         other => other.to_json_yq(),
