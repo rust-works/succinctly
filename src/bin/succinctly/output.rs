@@ -9,7 +9,9 @@ use succinctly::jq::escape::{
     escape_json_body as run_escaper, write_json_body_jq, write_json_body_jq_ascii,
     write_json_body_yq, write_json_body_yq_ascii,
 };
-use succinctly::jq::{assert_value_tree_depth, EvalError, OwnedValue, StreamError};
+use succinctly::jq::{
+    assert_value_tree_depth, format_number_jq_compat, EvalError, OwnedValue, StreamError,
+};
 use succinctly::yaml::format_float_with_fraction;
 pub use succinctly::yaml::format_float_yq;
 
@@ -367,14 +369,25 @@ fn format_json_impl(value: &OwnedValue, opts: &JsonFormatOpts, level: usize) -> 
                 }
             }
         }
-        OwnedValue::NumberLiteral(..) => {
+        OwnedValue::NumberLiteral(_, literal) => {
             if value
                 .as_f64()
                 .is_some_and(|f| f.is_nan() || f.is_infinite())
             {
                 "null".to_string() // JSON doesn't support NaN or Infinity
+            } else if opts.control_escape == ControlEscape::Yq {
+                // yq mode: echo the source spelling verbatim (#1008) --
+                // matches the Float arm's own yq/jq split above, and real
+                // yq's documented byte-for-byte literal preservation. jq
+                // mode keeps `format_number_jq_compat`'s reformatting
+                // unchanged. This PR fixed its `-0.0`-sign-loss bug (also
+                // #1008, since widening `is_preservable_float_literal`
+                // newly exposed it via YAML), but it has other pre-existing
+                // divergences from real jq, unrelated and left alone here,
+                // e.g. `0.1e1` -> `1E+0` here vs real jq's `1`.
+                literal.to_string()
             } else {
-                value.number_str().expect("numeric variant").into_owned()
+                format_number_jq_compat(literal.as_bytes())
             }
         }
         OwnedValue::String(s) => {

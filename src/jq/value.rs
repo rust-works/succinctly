@@ -192,7 +192,15 @@ pub fn format_number_jq_compat(raw: &[u8]) -> String {
     if exp == 0 {
         // Check if result is integer
         if value.fract() == 0.0 && value.abs() < 1e15 {
-            return format!("{}", value as i64);
+            // `value as i64` truncates -0.0's sign (`-0.0 as i64 == 0`),
+            // dropping it from the formatted text too -- `1e-0`/`-0e0`-style
+            // literals #1008 made newly reachable from YAML hit this.
+            // Real jq keeps the sign (`-0e0` -> `-0`).
+            return if value.is_sign_negative() {
+                format!("-{}", value.abs() as i64)
+            } else {
+                format!("{}", value as i64)
+            };
         }
         // Format as plain decimal
         return format!("{value}");
@@ -208,7 +216,13 @@ pub fn format_number_jq_compat(raw: &[u8]) -> String {
     // For other cases, use normalized scientific notation
     // jq normalizes mantissa to have one digit before decimal point
     if value == 0.0 {
-        return "0".to_string();
+        // `value == 0.0` is true for -0.0 too (IEEE 754), so a sign check
+        // is needed to avoid dropping it -- real jq keeps both the sign and
+        // the (leading-zero-stripped) source exponent for a zero mantissa,
+        // since log10(0) is undefined and there's no magnitude to
+        // renormalize against (`-0e5` -> `-0E+5`, `-0e05` -> `-0E+5` too).
+        let sign = if value.is_sign_negative() { "-" } else { "" };
+        return assemble_scientific(sign, "0", i64::from(exp));
     }
 
     let abs_value = value.abs();
@@ -365,12 +379,18 @@ fn format_mantissa_jq(value: f64) -> String {
 /// Format a decimal value for jq-compatible output.
 /// Uses smart rounding to avoid floating point noise.
 fn format_decimal_jq(value: f64) -> String {
-    let sign = if value < 0.0 { "-" } else { "" };
+    // `is_sign_negative()`, not `value < 0.0`: the latter is false for
+    // -0.0 (IEEE 754 equality), which would silently drop the sign a
+    // literal like `-0e-3` carries -- #1008 made that literal newly
+    // reachable from YAML.
+    let sign = if value.is_sign_negative() { "-" } else { "" };
     let abs_value = value.abs();
 
     // Check if it's essentially an integer
     if (abs_value.round() - abs_value).abs() < 1e-10 {
-        return format!("{}", value.round() as i64);
+        // `value.round() as i64` truncates -0.0's sign the same way, so
+        // this must build on the already-signed `abs_value` instead.
+        return format!("{sign}{}", abs_value.round() as i64);
     }
 
     // Try different precisions and pick the shortest that rounds back correctly
@@ -822,6 +842,24 @@ impl OwnedValue {
                     overflow_literal(*f).to_string()
                 }
             }
+            // A finite NumberLiteral's source text is already valid JSON
+            // number syntax (guaranteed by the two `is_preservable_float_literal`
+            // gates that construct one, and by JSON's own unconditional
+            // `number_literal()` override), so it needs no reformatting to
+            // survive this purely-internal round trip -- any valid JSON
+            // spelling of the same number works equally well for the
+            // reparse below, since jq mode's own final formatter
+            // (`format_number_jq_compat`, via `to_json`/`number_str`)
+            // re-normalizes it *after* reparsing regardless of what spelling
+            // fed the round trip. Echoing verbatim here instead of routing
+            // through that same formatter (`to_json_at_depth`'s fallback
+            // arm below, which the NaN/infinite arms above this one already
+            // bypass) closes the reindex-bridge gap #1008 left open for
+            // `[...]`/assignment/other Expr shapes with no native
+            // `eval_generic.rs` arm -- verified against real yq across
+            // `[.a]`, `.a,.a`, `map_values(.)`, and `with_entries(.)`, with
+            // zero jq-mode output change (21-query sweep against real jq).
+            Self::NumberLiteral(_, literal) => literal.to_string(),
             Self::Array(arr) => {
                 let elements: Vec<String> = arr
                     .iter()
@@ -1717,9 +1755,15 @@ mod tests {
         assert_eq!(format_number_jq_compat(b"5e0"), "5");
     }
 
+    /// #1008 code review: this was pinned to `"0"`, but real jq keeps the
+    /// exponent for a zero mantissa (verified against the pinned oracle:
+    /// `echo '{"a": 0e10}' | jq '.a'` -> `0E+10`) -- the old assertion
+    /// matched a bug (the scientific-notation branch's `value == 0.0` early
+    /// return dropped both sign and exponent for any zero-mantissa literal,
+    /// found while fixing that same branch's separate `-0.0` sign loss).
     #[test]
     fn test_format_number_jq_compat_zero_with_positive_exponent() {
-        assert_eq!(format_number_jq_compat(b"0e10"), "0");
+        assert_eq!(format_number_jq_compat(b"0e10"), "0E+10");
     }
 
     #[test]

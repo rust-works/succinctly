@@ -286,22 +286,36 @@ const MAX_PRESERVABLE_FLOAT_DIGITS: usize = 17;
 /// don't drift into re-answering this question differently.
 ///
 /// Requires, beyond [`is_json_number_syntax`]:
-/// - **A literal `.`.** A bare digit run only resolves to
-///   [`Float`](ResolvedScalar::Float) when it overflows `i64`
+/// - **A literal `.` or an exponent (`e`/`E`).** A bare digit run only
+///   resolves to [`Float`](ResolvedScalar::Float) when it overflows `i64`
 ///   (`parse_int_or_float`'s fallback) — that's not a value someone spelled
 ///   as a float, it's an integer too big for `i64`, and echoing its raw
 ///   digits back verbatim would silently claim more precision than the
 ///   `f64` it parsed to can actually hold (the same concern the digit-count
-///   cap below targets, just via a different trigger).
-/// - **No exponent.** `format_number_jq_compat` — the formatter this text
-///   eventually flows through — re-normalizes exponent notation into a
-///   different spelling (uppercase `E`, forced sign, no `e0` elimination)
-///   rather than preserving it, so there is nothing gained by echoing
-///   exponent text through that path; it gets overwritten anyway. This also
-///   sidesteps that formatter's separate, pre-existing loss of `-0.0`'s
-///   sign on the exponent branch, which the source-text-echo path can't
-///   reach without an exponent in play.
-/// - **At most [`MAX_PRESERVABLE_FLOAT_DIGITS`] significant digits.**
+///   cap below targets, just via a different trigger). Either a decimal
+///   point or an exponent is unambiguous float syntax on its own (`1e2`
+///   has no `.` but is still a float, not an overflowed integer), so
+///   either is sufficient here.
+/// - **At most [`MAX_PRESERVABLE_FLOAT_DIGITS`] significant digits in the
+///   mantissa.** Exponent digits carry no precision (they're a magnitude,
+///   not a significand) and must not count toward this cap -- an earlier
+///   version of this predicate counted every digit in `s` including the
+///   exponent's, which rejected exactly-round-trippable literals like
+///   `1.2345678901234567e10` (17 mantissa digits, but 19 counted) and
+///   reproduced #1008's catastrophic-decimal-expansion symptom for any
+///   long-enough exponent (caught in that PR's own code review).
+///
+/// Exponent notation used to be excluded here entirely (issue #1008's
+/// original symptom): the reasoning was that `format_number_jq_compat` —
+/// one formatter this text can flow through — re-normalizes exponents
+/// (uppercase `E`, forced sign) regardless, so "there was nothing gained"
+/// by preserving the source spelling. That premise doesn't hold for every
+/// caller: several yq output paths (`emit_yaml_value_at_depth`,
+/// `format_json_impl` in yq mode, `stream_owned_value_json`'s finite-literal
+/// hook) echo a `NumberLiteral`'s text directly rather than routing it
+/// through jq's reformatter, and real yq preserves scientific-notation
+/// literals byte-for-byte regardless of magnitude — confirmed empirically
+/// against the pinned oracle (`1e100` stays `1e100`, `1E5` stays `1E5`).
 ///
 /// Deliberately conservative: legal YAML core-schema spellings that don't
 /// meet this bar (`+2.0`, a trailing-dot `1.`) fall through to the
@@ -310,9 +324,12 @@ const MAX_PRESERVABLE_FLOAT_DIGITS: usize = 17;
 /// the issue tracker for the follow-up.
 #[must_use]
 pub(super) fn is_preservable_float_literal(s: &str) -> bool {
-    s.contains('.')
-        && !s.contains(['e', 'E'])
-        && s.bytes().filter(u8::is_ascii_digit).count() <= MAX_PRESERVABLE_FLOAT_DIGITS
+    let mantissa = match s.find(['e', 'E']) {
+        Some(exp_pos) => &s[..exp_pos],
+        None => s,
+    };
+    (s.contains('.') || s.contains(['e', 'E']))
+        && mantissa.bytes().filter(u8::is_ascii_digit).count() <= MAX_PRESERVABLE_FLOAT_DIGITS
         && is_json_number_syntax(s)
 }
 
@@ -639,11 +656,9 @@ mod tests {
     #[test]
     fn json_number_syntax_accepts_full_rfc_8259_grammar() {
         // Its own doc comment claims full RFC 8259 support, including the
-        // exponent form - `is_preservable_float_literal` (its only current
-        // caller) never actually routes exponent text through it, since it
-        // rejects those upstream for an unrelated reason (`format_number_
-        // jq_compat` doesn't preserve YAML's exponent spelling), so this
-        // exercises the claim directly rather than through that caller.
+        // exponent form -- exercised directly here rather than only through
+        // `is_preservable_float_literal` (which does route exponent text
+        // through it as of #1008; see that predicate's own test below).
         for s in [
             "0", "-0", "42", "-42", "0.0", "2.0", "-2.5", "0.50", "1e10", "1E10", "1e+10", "1e-10",
             "-1.5e-3", "0e0",
@@ -674,7 +689,7 @@ mod tests {
     }
 
     #[test]
-    fn preservable_float_literal_requires_a_dot_and_rejects_exponents() {
+    fn preservable_float_literal_requires_a_dot_or_an_exponent() {
         // The core #918 case: a plain decimal float with a literal `.`.
         for s in ["2.0", "-2.0", "0.5", "3.140", "0.0"] {
             assert!(
@@ -688,11 +703,14 @@ mod tests {
         for s in ["2", "-2", "99999999999999999999"] {
             assert!(!is_preservable_float_literal(s), "expected rejected: {s:?}");
         }
-        // Exponent form - format_number_jq_compat doesn't preserve this
-        // spelling, so there's nothing to gain by echoing it (see #918's
-        // eval_generic.rs comment for the -0.0 sign-loss this also avoids).
-        for s in ["2e2", "-0e10", "1.5e-3"] {
-            assert!(!is_preservable_float_literal(s), "expected rejected: {s:?}");
+        // Exponent form, with or without a dot (#1008): unambiguous float
+        // syntax on its own, and real yq preserves it verbatim regardless
+        // of magnitude -- confirmed empirically against the pinned oracle.
+        for s in ["2e2", "-0e10", "1.5e-3", "1e100", "1E5"] {
+            assert!(
+                is_preservable_float_literal(s),
+                "expected preservable: {s:?}"
+            );
         }
         // JSON-unsafe spellings, deliberately out of scope (#954).
         for s in [".5", "+2.0", "1."] {
@@ -706,5 +724,27 @@ mod tests {
         assert!(!is_preservable_float_literal(&just_over));
         let at_cap = "1.".to_string() + &"1".repeat(MAX_PRESERVABLE_FLOAT_DIGITS - 1);
         assert!(is_preservable_float_literal(&at_cap));
+    }
+
+    /// #1008 code review: an earlier version of the digit cap counted
+    /// exponent digits along with the mantissa's, so a full-precision
+    /// (17-digit) mantissa paired with any multi-digit exponent was
+    /// wrongly rejected -- reproducing #1008's catastrophic-decimal-expansion
+    /// symptom for exactly the round-trip-exact literals the cap exists to
+    /// protect. Only the mantissa's own digit count should matter.
+    #[test]
+    fn preservable_float_literal_digit_cap_ignores_exponent_digits() {
+        let mantissa_at_cap = "1.".to_string() + &"1".repeat(MAX_PRESERVABLE_FLOAT_DIGITS - 1);
+        assert!(is_preservable_float_literal(&format!(
+            "{mantissa_at_cap}e100"
+        )));
+        assert!(is_preservable_float_literal(&format!(
+            "{mantissa_at_cap}e-300"
+        )));
+
+        let mantissa_over_cap = "1.".to_string() + &"1".repeat(MAX_PRESERVABLE_FLOAT_DIGITS);
+        assert!(!is_preservable_float_literal(&format!(
+            "{mantissa_over_cap}e1"
+        )));
     }
 }

@@ -3405,9 +3405,13 @@ fn write_resolved_scalar_as_json(
         ResolvedScalar::Int(n) => write_i64(output, n),
         // See `stream_resolved_scalar_as_json`'s matching arm for why this
         // echoes `str_val` rather than always reconstructing from `f` (#993).
-        // No separate `is_finite()` check needed: `is_preservable_float_literal`
-        // already bounds the digit count well below where a finite `f64`
-        // could overflow, matching `number_literal()`'s identical guard.
+        // No separate `is_finite()` check needed here: `resolve_plain`/
+        // `resolve_tagged` (this function's only callers) never produce a
+        // non-finite `ResolvedScalar::Float` in the first place -- `parse_float`
+        // rejects an overflowing/underflowing literal to `Str` before this
+        // arm is ever reached. `is_preservable_float_literal`'s own digit
+        // cap does NOT bound magnitude (#1008): a 4-digit `1e400` sails
+        // through it trivially, so it must not be relied on for finiteness.
         ResolvedScalar::Float(_) if is_preservable_float_literal(str_val) => {
             output.push_str(str_val);
         }
@@ -3882,9 +3886,13 @@ fn stream_resolved_scalar_as_json<Out: core::fmt::Write>(
         // DOM path) -- this is what keeps a trailing zero (`1.50`) intact;
         // `format_float_with_fraction` only reconstructs the value's
         // shortest round-trip spelling, which silently drops it (#993). No
-        // separate `is_finite()` check needed: `is_preservable_float_literal`
-        // already bounds the digit count well below where a finite `f64`
-        // could overflow, matching `number_literal()`'s identical guard.
+        // separate `is_finite()` check needed here: `resolved` is only ever
+        // constructed by `resolve_plain`/`resolve_tagged`, which never
+        // produce a non-finite `Float` -- `parse_float` rejects an
+        // overflowing/underflowing literal to `Str` upstream, before this
+        // arm is reached. `is_preservable_float_literal`'s digit cap does
+        // NOT bound magnitude (#1008): a 4-digit `1e400` sails through it
+        // trivially, so it must not be relied on for finiteness.
         // Not `write!(out, "{f}")` either way: that drops the `.0` from a
         // whole float.
         ResolvedScalar::Float(_) if is_preservable_float_literal(str_val) => out.write_str(str_val),
