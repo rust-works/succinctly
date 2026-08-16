@@ -1088,6 +1088,16 @@ mod tests {
         let under = linear_jqvalue_nest(MAX_VALUE_TREE_DEPTH - 1);
         assert!(matches!(under.materialize(), OwnedValue::Array(_)));
 
+        // The `Object` arm is a separate match arm from `Array`'s, with its
+        // own recursive `.map()` closure -- exercise it too so both arms are
+        // covered, not just the array-nesting shape `linear_jqvalue_nest`
+        // builds.
+        let nested_object: JqValue<'_, Vec<u64>> = JqValue::Object(IndexMap::from([(
+            "a".to_string(),
+            JqValue::Array(vec![JqValue::Null]),
+        )]));
+        assert!(matches!(nested_object.materialize(), OwnedValue::Object(_)));
+
         let over = linear_jqvalue_nest(MAX_VALUE_TREE_DEPTH);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| over.materialize()));
         assert!(
@@ -1104,6 +1114,14 @@ mod tests {
 
         let under = linear_jqvalue_nest(MAX_VALUE_TREE_DEPTH - 1);
         assert!(matches!(under.into_owned(), OwnedValue::Array(_)));
+
+        // Exercise the `Object` arm too -- see `materialize`'s sibling test
+        // above for why.
+        let nested_object: JqValue<'_, Vec<u64>> = JqValue::Object(IndexMap::from([(
+            "a".to_string(),
+            JqValue::Array(vec![JqValue::Null]),
+        )]));
+        assert!(matches!(nested_object.into_owned(), OwnedValue::Object(_)));
 
         let over = linear_jqvalue_nest(MAX_VALUE_TREE_DEPTH);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| over.into_owned()));
