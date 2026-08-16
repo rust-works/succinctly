@@ -570,13 +570,22 @@ fn evaluate_yaml_direct_filtered(
 ///
 /// Variables (`--arg`/`--argjson`, `$ARGS`) are substituted into `expr` up
 /// front in `run_yq`, so this function needs no evaluation context (#284).
+///
+/// This is `yq_runner.rs`'s own function (`jq_runner.rs` has an unrelated,
+/// separate `evaluate_input` for jq mode) and always evaluates with
+/// `YqSemantics` below, so the round-trip must use `to_json_yq()`, not
+/// `to_json()` (#1051): the DOM fallback taken by `--slurp` and by
+/// `--inplace` for any expression `can_use_m2_streaming` doesn't allow-list
+/// (`tostring` is not on that list) was reformatting every `NumberLiteral`
+/// in the *whole document* via jq rules before the evaluator ever ran,
+/// silently rewriting fields the query never touched on an in-place write.
 fn evaluate_input(
     input: &OwnedValue,
     expr: &jq::Expr,
     sink: &mut ErrorSink,
 ) -> Result<Vec<OwnedValue>> {
     // Convert OwnedValue to JSON bytes for indexing
-    let json_str = input.to_json();
+    let json_str = input.to_json_yq();
     let json_bytes = json_str.as_bytes();
 
     // Build index and evaluate

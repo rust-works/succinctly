@@ -11689,3 +11689,51 @@ fn test_yq_map_values_overflow_int_keeps_decimal_point_953() -> Result<()> {
     assert_eq!(stdout.trim_end(), r#"{"a":100000000000000000000.0}"#);
     Ok(())
 }
+
+/// #1051 item 1: `stderr` had no `S: EvalSemantics` parameter at all, so its
+/// container arm always formatted via jq rules regardless of mode.
+#[test]
+fn test_yq_stderr_preserves_exponent_literal_1051() -> Result<()> {
+    let (_stdout, stderr, code) =
+        run_yq_stdin_with_stderr(".a | stderr | empty", "a: [1e2, x]\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(stderr.trim_end(), r#"[1e2,"x"]"#);
+    Ok(())
+}
+
+/// #1051 item 2: `halt_error`'s trailing container arm ignored `S::TAG` and
+/// always called `.to_json()`, even though `S` was already in scope.
+#[test]
+fn test_yq_halt_error_preserves_exponent_literal_1051() -> Result<()> {
+    let (_stdout, stderr, _code) =
+        run_yq_stdin_with_stderr(".a | halt_error", "a: [1e2, x]\n", &[])?;
+    assert_eq!(stderr.trim_end(), r#"[1e2,"x"]"#);
+    Ok(())
+}
+
+/// #1051 item 4 (most severe): `evaluate_input`'s DOM fallback — taken by
+/// `--inplace` for any expression `can_use_m2_streaming` doesn't allow-list
+/// (`tostring` isn't on that list) — round-tripped the *whole document*
+/// through jq-mode `to_json()` before the evaluator ever ran, silently
+/// rewriting every `NumberLiteral` in the document, including fields the
+/// query never touched. Pinned against real yq's identical operation.
+#[test]
+fn test_yq_inplace_tostring_does_not_corrupt_untouched_sibling_field_1051() -> Result<()> {
+    let mut input_file = NamedTempFile::new()?;
+    writeln!(input_file, "a: 1e2")?;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .arg("yq")
+        .arg("-i")
+        .arg(".b = (.a | tostring)")
+        .arg(input_file.path())
+        .stdin(Stdio::null())
+        .output()?;
+
+    assert!(output.status.success());
+    let rewritten = std::fs::read_to_string(input_file.path())?;
+    // Real yq (v4.53.3) gives byte-for-byte: `a: 1e2\nb: "1e2"\n` — `a` is
+    // left completely untouched, `b` echoes `.a`'s literal spelling verbatim.
+    assert_eq!(rewritten, "a: 1e2\nb: \"1e2\"\n");
+    Ok(())
+}

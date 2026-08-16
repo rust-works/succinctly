@@ -776,7 +776,7 @@ impl OwnedValue {
     /// `resolve_plain` also classifies as `!!float`, confirmed live against
     /// the pinned oracle: real yq's `-o json` gives `100...0.0`, not
     /// `100...0`).
-    pub(crate) fn to_json_yq(&self) -> String {
+    pub fn to_json_yq(&self) -> String {
         self.to_json_at_depth(
             0,
             crate::jq::stream::real_output_finite_literal,

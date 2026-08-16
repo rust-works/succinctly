@@ -10730,3 +10730,20 @@ fn test_jq_reduce_accumulator_unaffected_by_yq_float_fraction_fix_953() -> Resul
     assert_eq!(out.trim(), "[[[5]]]");
     Ok(())
 }
+
+/// #1051: `builtin_stderr` gained an `S: EvalSemantics` parameter so yq mode
+/// can echo a `NumberLiteral` verbatim; confirm jq mode's own container
+/// formatting (`format_number_jq_compat`'s uppercase-`E` reformatting) is
+/// unaffected, matching real jq.
+#[test]
+fn test_jq_stderr_and_halt_error_unaffected_by_yq_mode_fix_1051() -> Result<()> {
+    let (_stdout, stderr, code) =
+        run_jq_stdin_streams(".a | stderr | empty", r#"{"a": [1e2, "x"]}"#, &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(stderr.trim_end(), r#"[1E+2,"x"]"#);
+
+    let (_stdout, stderr, _code) =
+        run_jq_stdin_streams(".a | halt_error", r#"{"a": [1e2, "x"]}"#, &[])?;
+    assert_eq!(stderr.trim_end(), r#"[1E+2,"x"]"#);
+    Ok(())
+}
