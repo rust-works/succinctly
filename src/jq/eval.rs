@@ -139,7 +139,7 @@ use super::expr::{
     ObjectKey, Pattern, StringPart,
 };
 use super::value::{
-    assert_value_tree_depth, cmp_f64, is_nan_sentinel, numeric_repr_cmp, numeric_repr_eq_strict,
+    assert_value_tree_depth, cmp_f64, is_nan_sentinel, numeric_repr_cmp, owned_value_eq,
     NumberRepr, OwnedValue,
 };
 
@@ -1689,9 +1689,15 @@ fn arith_sub<S: EvalSemantics>(
         (OwnedValue::Int(a), OwnedValue::Float(b)) => Ok(OwnedValue::Float(a as f64 - b)),
         (OwnedValue::Float(a), OwnedValue::Int(b)) => Ok(OwnedValue::Float(a - b as f64)),
         (OwnedValue::Float(a), OwnedValue::Float(b)) => Ok(OwnedValue::Float(a - b)),
-        // Array subtraction (remove elements)
+        // Array subtraction (remove elements). `owned_value_eq::<S>`, not
+        // `Vec::contains` (plain `PartialEq`): yq's stricter Int/Float
+        // equality must apply here too, or `[2.0] - [2]` would (wrongly)
+        // remove the float (#950 review).
         (OwnedValue::Array(a), OwnedValue::Array(b)) => {
-            let result: Vec<_> = a.into_iter().filter(|x| !b.contains(x)).collect();
+            let result: Vec<_> = a
+                .into_iter()
+                .filter(|x| !b.iter().any(|y| owned_value_eq::<S>(x, y)))
+                .collect();
             Ok(OwnedValue::Array(result))
         }
         (a, b) => Err(EvalError::binary_op(&a, &b, BinOp::Subtract)),
@@ -2123,29 +2129,13 @@ pub(crate) fn apply_compare_op<S: EvalSemantics>(
     right: &OwnedValue,
 ) -> bool {
     match op {
-        CompareOp::Eq => numeric_aware_eq::<S>(left, right),
-        CompareOp::Ne => !numeric_aware_eq::<S>(left, right),
+        CompareOp::Eq => owned_value_eq::<S>(left, right),
+        CompareOp::Ne => !owned_value_eq::<S>(left, right),
         CompareOp::Lt => compare_values(left, right) == core::cmp::Ordering::Less,
         CompareOp::Le => compare_values(left, right) != core::cmp::Ordering::Greater,
         CompareOp::Gt => compare_values(left, right) == core::cmp::Ordering::Greater,
         CompareOp::Ge => compare_values(left, right) != core::cmp::Ordering::Less,
     }
-}
-
-/// `==`'s own numeric rule, distinct from [`OwnedValue`]'s general
-/// (always-widening) `PartialEq`: under `S::STRICT_NUMERIC_EQUALITY` (yq),
-/// an `Int` and a `Float` operand are never equal regardless of magnitude
-/// (#950) -- checked only when *both* operands are numeric, so a
-/// number-vs-non-number comparison (already `false` either way) and every
-/// jq-mode comparison fall straight through to the ordinary widening
-/// `PartialEq`.
-fn numeric_aware_eq<S: EvalSemantics>(left: &OwnedValue, right: &OwnedValue) -> bool {
-    if S::STRICT_NUMERIC_EQUALITY {
-        if let (Some(a), Some(b)) = (left.number_repr(), right.number_repr()) {
-            return numeric_repr_eq_strict(a, b);
-        }
-    }
-    left == right
 }
 
 /// Compare two values using jq ordering: null < bool < number < string < array < object.
@@ -3270,7 +3260,11 @@ fn builtin_upper_in<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 ) -> QueryResult<'a, W> {
     let current = to_owned(&value);
     let (candidates, trailing) = eval_owned_expr_fork::<S>(s, &current, false);
-    if candidates.contains(&current) {
+    // `owned_value_eq::<S>`, not `Vec::contains`/plain `==`: this builtin's
+    // own doc comment states it matches jq's `any(s == .; .)`, so it must
+    // agree with `==`'s own yq-mode strict Int/Float distinction (#950
+    // review) rather than silently falling back to widening equality.
+    if candidates.iter().any(|c| owned_value_eq::<S>(c, &current)) {
         return QueryResult::Owned(OwnedValue::Bool(true));
     }
     match trailing {
@@ -4372,7 +4366,7 @@ fn builtin_contains<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         }
         return QueryResult::Error(EvalError::containment_check(&input, &b));
     }
-    QueryResult::Owned(OwnedValue::Bool(owned_contains(&input, &b)))
+    QueryResult::Owned(OwnedValue::Bool(owned_contains::<S>(&input, &b)))
 }
 
 /// Check if `a` contains `b` (recursive containment check)
@@ -4381,13 +4375,18 @@ fn builtin_contains<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// container is plain `false`, as in jq — `[1,"a"] | contains(["a",2])` is
 /// `false`, not the error [`EvalError::containment_check`] raises. The callers
 /// screen the top level with [`jq_kind`], so this stays a total function.
-fn owned_contains(a: &OwnedValue, b: &OwnedValue) -> bool {
-    owned_contains_at_depth(a, b, 0)
+///
+/// Generic over `S` (#950 review): the scalar leaf case delegates to
+/// [`owned_value_eq`], so `contains`/`inside` agree with `==`'s own
+/// yq-mode strict Int/Float distinction instead of silently using the
+/// always-widening `PartialEq`.
+fn owned_contains<S: EvalSemantics>(a: &OwnedValue, b: &OwnedValue) -> bool {
+    owned_contains_at_depth::<S>(a, b, 0)
 }
 
 /// Panics past [`MAX_VALUE_TREE_DEPTH`](crate::jq::value::MAX_VALUE_TREE_DEPTH)
 /// levels of nesting (#1021, following #1005's precedent).
-fn owned_contains_at_depth(a: &OwnedValue, b: &OwnedValue, depth: usize) -> bool {
+fn owned_contains_at_depth<S: EvalSemantics>(a: &OwnedValue, b: &OwnedValue, depth: usize) -> bool {
     assert_value_tree_depth(depth);
     match (a, b) {
         // String contains string
@@ -4396,16 +4395,16 @@ fn owned_contains_at_depth(a: &OwnedValue, b: &OwnedValue, depth: usize) -> bool
         (OwnedValue::Array(a_arr), OwnedValue::Array(b_arr)) => b_arr.iter().all(|b_elem| {
             a_arr
                 .iter()
-                .any(|a_elem| owned_contains_at_depth(a_elem, b_elem, depth + 1))
+                .any(|a_elem| owned_contains_at_depth::<S>(a_elem, b_elem, depth + 1))
         }),
         // Object contains: all keys in b must exist in a with matching values
         (OwnedValue::Object(a_obj), OwnedValue::Object(b_obj)) => b_obj.iter().all(|(k, b_val)| {
             a_obj
                 .get(k)
-                .is_some_and(|a_val| owned_contains_at_depth(a_val, b_val, depth + 1))
+                .is_some_and(|a_val| owned_contains_at_depth::<S>(a_val, b_val, depth + 1))
         }),
         // Scalars: equality
-        _ => a == b,
+        _ => owned_value_eq::<S>(a, b),
     }
 }
 
@@ -4430,7 +4429,7 @@ fn builtin_inside<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         }
         return QueryResult::Error(EvalError::containment_check(&b, &input));
     }
-    QueryResult::Owned(OwnedValue::Bool(owned_contains(&b, &input)))
+    QueryResult::Owned(OwnedValue::Bool(owned_contains::<S>(&b, &input)))
 }
 
 // =============================================================================
@@ -4656,7 +4655,14 @@ fn builtin_group_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
             for (key, item) in keyed {
                 match &current_key {
-                    Some(k) if compare_values(k, &key) == core::cmp::Ordering::Equal => {
+                    // `owned_value_eq::<S>`, not `compare_values(..) ==
+                    // Equal`: the sort just above stays widening
+                    // (ordering, unaffected by #950), but *this* check
+                    // decides whether two keys are the "same group", which
+                    // must agree with `==`'s own yq-mode strict Int/Float
+                    // distinction (#950 review) -- `[2, 2.0]` groups as one
+                    // in jq, two in yq.
+                    Some(k) if owned_value_eq::<S>(k, &key) => {
                         current_group.push(item);
                     }
                     _ => {
@@ -4703,8 +4709,12 @@ fn builtin_unique<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // Sort first (jq's unique returns sorted unique values)
             items.sort_by(compare_values);
 
-            // Remove consecutive duplicates
-            items.dedup_by(|a, b| compare_values(a, b) == core::cmp::Ordering::Equal);
+            // Remove consecutive duplicates. `owned_value_eq::<S>`, not
+            // `compare_values(..) == Equal` (#950 review, same reasoning
+            // as `group_by`'s grouping step): the sort above stays
+            // widening, but two elements only count as "duplicates" under
+            // `==`'s own yq-mode strict Int/Float distinction.
+            items.dedup_by(|a, b| owned_value_eq::<S>(a, b));
 
             QueryResult::Owned(OwnedValue::Array(items))
         }
@@ -4755,8 +4765,10 @@ fn builtin_unique_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // Sort by key
             keyed.sort_by(|(a, _), (b, _)| compare_values(a, b));
 
-            // Remove consecutive duplicates by key
-            keyed.dedup_by(|(a, _), (b, _)| compare_values(a, b) == core::cmp::Ordering::Equal);
+            // Remove consecutive duplicates by key. `owned_value_eq::<S>`,
+            // not `compare_values(..) == Equal` (#950 review, same
+            // reasoning as `unique`/`group_by`).
+            keyed.dedup_by(|(a, _), (b, _)| owned_value_eq::<S>(a, b));
 
             let result: Vec<OwnedValue> = keyed.into_iter().map(|(_, v)| v).collect();
             QueryResult::Owned(OwnedValue::Array(result))
@@ -6866,10 +6878,13 @@ fn builtin_indices<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             }
         }
         StandardJson::Array(elements) => {
-            // For arrays, find indices where element equals the pattern (any type)
+            // For arrays, find indices where element equals the pattern
+            // (any type). `owned_value_eq::<S>`, not plain `==`, so this
+            // agrees with `==`'s own yq-mode strict Int/Float distinction
+            // (#950 review).
             let mut indices = Vec::new();
             for (i, elem) in (*elements).enumerate() {
-                if to_owned(&elem) == pattern {
+                if owned_value_eq::<S>(&to_owned(&elem), &pattern) {
                     indices.push(OwnedValue::Int(i as i64));
                 }
             }
@@ -6924,9 +6939,11 @@ fn builtin_index<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             }
         }
         StandardJson::Array(elements) => {
-            // For arrays, pattern can be any type
+            // For arrays, pattern can be any type. `owned_value_eq::<S>`,
+            // not plain `==` (#950 review, same reasoning as `indices`
+            // above).
             for (i, elem) in (*elements).enumerate() {
-                if to_owned(&elem) == pattern {
+                if owned_value_eq::<S>(&to_owned(&elem), &pattern) {
                     return QueryResult::Owned(OwnedValue::Int(i as i64));
                 }
             }
@@ -7033,10 +7050,12 @@ fn builtin_rindex<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             }
         }
         StandardJson::Array(elements) => {
-            // For arrays, pattern can be any type
+            // For arrays, pattern can be any type. `owned_value_eq::<S>`,
+            // not plain `==` (#950 review, same reasoning as `indices`
+            // above).
             let items: Vec<_> = (*elements).collect();
             for (i, elem) in items.iter().enumerate().rev() {
-                if to_owned(elem) == pattern {
+                if owned_value_eq::<S>(&to_owned(elem), &pattern) {
                     return QueryResult::Owned(OwnedValue::Int(i as i64));
                 }
             }
@@ -29508,6 +29527,49 @@ mod tests {
         );
     }
 
+    /// #950 review: `index`/`indices`/`rindex` internally use equality to
+    /// find matching array elements, and must agree with `==`'s own
+    /// yq-mode strict Int/Float distinction rather than the always-widening
+    /// `PartialEq` (verified against jq semantics for the jq-mode case;
+    /// mikefarah/yq's own grammar doesn't accept `index(2.0)` the same way
+    /// to cross-check yq mode directly, so this pins internal consistency
+    /// with the now-fixed `==`/`contains` instead).
+    #[test]
+    fn test_builtin_index_family_respects_strict_numeric_equality_950() {
+        // jq mode: widening, 2.0 matches 2 (unaffected by #950).
+        query!(br"[2,3]", "index(2.0)",
+            QueryResult::Owned(OwnedValue::Int(n)) => { assert_eq!(n, 0); }
+        );
+
+        // yq mode: strict, 2.0 does not match 2.
+        yq_query!(br"[2,3]", "index(2.0)",
+            QueryResult::Owned(OwnedValue::Null) => {}
+        );
+        yq_query!(br"[2.0,3,2.0]", "indices(2.0)",
+            QueryResult::Owned(OwnedValue::Array(v)) => {
+                assert_eq!(v, vec![OwnedValue::Int(0), OwnedValue::Int(2)]);
+            }
+        );
+        yq_query!(br"[2.0,3,2]", "rindex(2)",
+            QueryResult::Owned(OwnedValue::Int(n)) => { assert_eq!(n, 2); }
+        );
+    }
+
+    /// #950 review: `IN(s)` (single-arg) internally uses equality and must
+    /// agree with `==`'s own yq-mode strict Int/Float distinction, per its
+    /// own doc comment stating it matches jq's `any(s == .; .)`.
+    #[test]
+    fn test_builtin_upper_in_respects_strict_numeric_equality_950() {
+        // jq mode: widening, unaffected by #950.
+        query!(br"2.0", "IN(2)",
+            QueryResult::Owned(OwnedValue::Bool(b)) => { assert!(b); }
+        );
+        // yq mode: strict.
+        yq_query!(br"2.0", "IN(2)",
+            QueryResult::Owned(OwnedValue::Bool(b)) => { assert!(!b); }
+        );
+    }
+
     #[test]
     fn test_builtin_upper_in_single_arg() {
         query!(br"5", "IN(1,2,3,5)",
@@ -41174,12 +41236,12 @@ mod tests {
 
         let under_a = linear_array_nest(MAX_VALUE_TREE_DEPTH - 1);
         let under_b = linear_array_nest(MAX_VALUE_TREE_DEPTH - 1);
-        assert!(owned_contains(&under_a, &under_b));
+        assert!(owned_contains::<JqSemantics>(&under_a, &under_b));
 
         let over_a = linear_array_nest(MAX_VALUE_TREE_DEPTH);
         let over_b = linear_array_nest(MAX_VALUE_TREE_DEPTH);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            owned_contains(&over_a, &over_b)
+            owned_contains::<JqSemantics>(&over_a, &over_b)
         }));
         assert!(
             result.is_err(),

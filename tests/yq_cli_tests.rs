@@ -12005,3 +12005,51 @@ fn test_yq_equality_numeric_vs_string_unaffected_950() -> Result<()> {
     assert_eq!(out.trim(), "false");
     Ok(())
 }
+
+/// #950 review: `==`'s strict Int/Float distinction must apply at every
+/// nesting depth, not just the top -- `[2.0] == [2]` and `{"a":2.0} ==
+/// {"a":2}` are `false` in yq (verified against pinned yq v4.53.3), the
+/// same rule the scalar `2.0 == 2` case above already covers.
+#[test]
+fn test_yq_equality_strict_at_nested_depth_950() -> Result<()> {
+    let (out, code) = run_yq_stdin(". == [2]", "[2.0]", &[])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "false");
+
+    let (out, code) = run_yq_stdin(r#". == {"a": 2}"#, "a: 2.0", &[])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "false");
+    Ok(())
+}
+
+/// #950 review: `contains`/`inside`, `array - array`, `unique`/
+/// `unique_by`/`group_by` all consume equality internally and must agree
+/// with `==`'s own yq-mode strictness instead of silently falling back
+/// to the always-widening rule (verified against pinned yq v4.53.3 for
+/// `contains`, `unique`, and `group_by`; `array -` and `unique_by`
+/// confirmed by internal consistency with the now-fixed `==`/`contains`,
+/// since mikefarah/yq's own grammar doesn't accept a bare `-`/`unique_by`
+/// invocation the same way to cross-check directly).
+#[test]
+fn test_yq_equality_consuming_builtins_agree_with_strict_eq_950() -> Result<()> {
+    let (out, code) = run_yq_stdin("contains([2.0])", "[2]", &[])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "false");
+
+    let (out, code) = run_yq_stdin(". - [2]", "[2.0, 3]", &["-o", "json", "-I0"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "[2.0,3]");
+
+    let (out, code) = run_yq_stdin("unique", "[2, 2.0, 3]", &["-o", "json", "-I0"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "[2,2.0,3]");
+
+    let (out, code) = run_yq_stdin("unique_by(.)", "[2, 2.0, 3]", &["-o", "json", "-I0"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "[2,2.0,3]");
+
+    let (out, code) = run_yq_stdin("group_by(.)", "[2, 2.0, 3]", &["-o", "json", "-I0"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "[[2],[2.0],[3]]");
+    Ok(())
+}
