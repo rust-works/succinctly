@@ -181,7 +181,19 @@ fn stream_owned_value_json<W: core::fmt::Write>(
         format_float_with_fraction,
         real_output_infinite_float,
         real_output_infinite_literal,
+        real_output_finite_literal,
     )
+}
+
+/// The `yq`/real-output convention for a finite `NumberLiteral` (#1008):
+/// echo the document's source spelling verbatim rather than reformatting
+/// it per jq's own rules -- real yq preserves a literal's exact text
+/// (`1e100` stays `1e100`, `1E5` stays `1E5`) regardless of magnitude or
+/// query shape, confirmed empirically against the pinned oracle. `raw` is
+/// always valid UTF-8 (sourced from `OwnedValue::NumberLiteral`'s own
+/// `Box<str>`), so the lossy path here is unreachable in practice.
+fn real_output_finite_literal(raw: &[u8]) -> String {
+    String::from_utf8_lossy(raw).into_owned()
 }
 
 /// The `yq`/real-output convention for an infinite `Float` (NaN is handled
@@ -232,6 +244,7 @@ pub fn stream_owned_value_json_jq<W: core::fmt::Write>(
         |f| f.to_string(),
         |negative| infinite_float_preview_text(negative).to_string(),
         preview_infinite_literal,
+        format_number_jq_compat,
     )
 }
 
@@ -278,6 +291,7 @@ fn stream_owned_value_json_with<W: core::fmt::Write>(
     float_fmt: fn(f64) -> String,
     infinite_float: fn(bool) -> String,
     infinite_literal: fn(&[u8]) -> String,
+    finite_literal: fn(&[u8]) -> String,
 ) -> core::fmt::Result {
     stream_owned_value_json_with_at_depth(
         value,
@@ -290,6 +304,7 @@ fn stream_owned_value_json_with<W: core::fmt::Write>(
         float_fmt,
         infinite_float,
         infinite_literal,
+        finite_literal,
         0,
     )
 }
@@ -308,6 +323,7 @@ fn stream_owned_value_json_with_at_depth<W: core::fmt::Write>(
     float_fmt: fn(f64) -> String,
     infinite_float: fn(bool) -> String,
     infinite_literal: fn(&[u8]) -> String,
+    finite_literal: fn(&[u8]) -> String,
     depth: usize,
 ) -> core::fmt::Result {
     assert_value_tree_depth(depth);
@@ -331,7 +347,7 @@ fn stream_owned_value_json_with_at_depth<W: core::fmt::Write>(
             NumberRepr::Float(f) if f.is_infinite() => {
                 out.write_str(&infinite_literal(literal.as_bytes()))
             }
-            _ => out.write_str(&format_number_jq_compat(literal.as_bytes())),
+            _ => out.write_str(&finite_literal(literal.as_bytes())),
         },
         OwnedValue::String(s) => stream_json_string(out, s, escape),
         OwnedValue::Array(arr) => {
@@ -359,6 +375,7 @@ fn stream_owned_value_json_with_at_depth<W: core::fmt::Write>(
                     float_fmt,
                     infinite_float,
                     infinite_literal,
+                    finite_literal,
                     depth + 1,
                 )?;
             }
@@ -408,6 +425,7 @@ fn stream_owned_value_json_with_at_depth<W: core::fmt::Write>(
                 float_fmt,
                 infinite_float,
                 infinite_literal,
+                finite_literal,
                 depth + 1,
             )?;
             if indent_spaces > 0 {
@@ -455,6 +473,7 @@ fn write_object_entries<'a, W: core::fmt::Write>(
     float_fmt: fn(f64) -> String,
     infinite_float: fn(bool) -> String,
     infinite_literal: fn(&[u8]) -> String,
+    finite_literal: fn(&[u8]) -> String,
     depth: usize,
 ) -> core::fmt::Result {
     for (i, (key, value)) in entries.enumerate() {
@@ -478,6 +497,7 @@ fn write_object_entries<'a, W: core::fmt::Write>(
             float_fmt,
             infinite_float,
             infinite_literal,
+            finite_literal,
             depth,
         )?;
     }
@@ -1110,13 +1130,19 @@ mod tests {
         assert_eq!(buf, "3");
     }
 
+    /// `stream_json` is `StreamableValue`'s yq-convention entry point --
+    /// per #1008, a finite `NumberLiteral`'s source text is echoed
+    /// verbatim here (real yq preserves it byte-for-byte, regardless of
+    /// magnitude), not reformatted via `format_number_jq_compat`'s
+    /// jq-specific rules (that remains correct only for
+    /// `stream_owned_value_json_jq`, jq's own convention).
     #[test]
     fn test_stream_json_number_literal() {
         let mut buf = String::new();
         OwnedValue::NumberLiteral(NumberRepr::Float(1.2e3), "1.2e3".into())
             .stream_json(&mut buf, IndentSpec::COMPACT, false)
             .unwrap();
-        assert_eq!(buf, "1.2E+3");
+        assert_eq!(buf, "1.2e3");
     }
 
     #[test]

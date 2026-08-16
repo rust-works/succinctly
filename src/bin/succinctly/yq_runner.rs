@@ -1534,7 +1534,7 @@ fn emit_yaml_value_at_depth(
                 format_float_yq(*f)
             }
         }
-        OwnedValue::NumberLiteral(..) => {
+        OwnedValue::NumberLiteral(_, literal) => {
             if value.as_f64().is_some_and(f64::is_nan) {
                 ".nan".to_string()
             } else if value.as_f64().is_some_and(f64::is_infinite) {
@@ -1544,7 +1544,12 @@ fn emit_yaml_value_at_depth(
                     "-.inf".to_string()
                 }
             } else {
-                value.number_str().expect("numeric variant").into_owned()
+                // Echo the source spelling verbatim (#1008) rather than
+                // routing through `number_str()`/`format_number_jq_compat`,
+                // which reformats per jq's own rules (uppercase `E`, forced
+                // sign) -- this file is yq-CLI-only, no jq caller to protect,
+                // and yq preserves a document literal's exact text.
+                literal.to_string()
             }
         }
         OwnedValue::String(s) => yaml_quote_string_with_style(s, comments.style()),

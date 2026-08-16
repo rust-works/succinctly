@@ -367,12 +367,20 @@ fn format_json_impl(value: &OwnedValue, opts: &JsonFormatOpts, level: usize) -> 
                 }
             }
         }
-        OwnedValue::NumberLiteral(..) => {
+        OwnedValue::NumberLiteral(_, literal) => {
             if value
                 .as_f64()
                 .is_some_and(|f| f.is_nan() || f.is_infinite())
             {
                 "null".to_string() // JSON doesn't support NaN or Infinity
+            } else if opts.control_escape == ControlEscape::Yq {
+                // yq mode: echo the source spelling verbatim (#1008) --
+                // matches the Float arm's own yq/jq split above, and real
+                // yq's documented byte-for-byte literal preservation. jq
+                // mode keeps `number_str()`'s jq-compat reformatting
+                // (verified to match real jq's own scientific-notation
+                // rules) unchanged.
+                literal.to_string()
             } else {
                 value.number_str().expect("numeric variant").into_owned()
             }

@@ -11145,26 +11145,76 @@ fn test_m2_json_output_preserves_float_trailing_zero_whole_doc_993() -> Result<(
     Ok(())
 }
 
-/// Non-regression: spellings `is_preservable_float_literal` deliberately
-/// excludes (exponent notation, more than 17 significant digits) must keep
-/// falling back to `format_float_with_fraction` exactly as before -- this
-/// fix only widens which literals get echoed, never narrows it.
+/// Non-regression: a spelling `is_preservable_float_literal` still excludes
+/// (more than 17 significant digits) must keep falling back to
+/// `format_float_with_fraction` exactly as before -- this fix only widens
+/// which literals get echoed, never narrows it. Exponent notation used to
+/// be excluded here too and fell back the same way (`1.5e2` -> `150.0`);
+/// #1008 widened the predicate to cover it, so that case is now pinned as
+/// preserved verbatim in `test_m2_json_output_preserves_exponent_1008`
+/// instead of exercising this fallback.
 #[test]
 fn test_m2_json_output_float_fallback_unaffected_by_993() -> Result<()> {
+    // More significant digits than an f64 actually holds.
+    let (yaml, want) = ("a: 1.2345678901234567890123\n", "1.2345678901234567");
+    let (out, code) = run_yq_stdin(".a", yaml, &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0, "for {yaml:?}");
+    assert_eq!(out.trim(), want, "for {yaml:?}");
+    Ok(())
+}
+
+/// #1008: a YAML scalar written in scientific notation must keep its exact
+/// source spelling through JSON output on any navigation shape, matching
+/// real yq's byte-for-byte literal preservation (confirmed empirically
+/// against the pinned oracle: `1e100` stays `1e100`, `1E5` stays `1E5`,
+/// regardless of magnitude). Before this fix, `is_preservable_float_literal`
+/// excluded exponent notation entirely, so `stream_resolved_scalar_as_json`
+/// (M2 JSON path) fell back to `format_float_with_fraction`, which fully
+/// expands large magnitudes into a raw decimal string with no exponent.
+#[test]
+fn test_m2_json_output_preserves_exponent_1008() -> Result<()> {
     for (yaml, want) in [
-        // Exponent notation: `is_preservable_float_literal` requires a `.`
-        // with no `e`/`E` at all, so a literal with both (unlike `007e2`,
-        // which has no `.` and is rejected before the exponent check is
-        // ever reached) is the one that actually exercises that exclusion.
-        // Reformatting scientific notation here is itself a separate,
-        // already-filed gap (#1008) -- this only pins that this fix leaves
-        // that pre-existing fallback behavior unchanged.
-        ("a: 1.5e2\n", "150.0"),
-        // More significant digits than an f64 actually holds.
-        ("a: 1.2345678901234567890123\n", "1.2345678901234567"),
+        ("a: 1e2\n", "1e2"),
+        ("a: 1E5\n", "1E5"),
+        ("a: 1.5e10\n", "1.5e10"),
+        ("a: 1e-5\n", "1e-5"),
+        ("a: 1e100\n", "1e100"),
     ] {
         let (out, code) = run_yq_stdin(".a", yaml, &["-o=json", "-I=0"])?;
         assert_eq!(code, 0, "for {yaml:?}");
+        assert_eq!(out.trim(), want, "for {yaml:?}");
+
+        // Default YAML output was already correct (M2 YAML streaming never
+        // gated on this predicate); this fix must not change it.
+        let (yaml_out, code) = run_yq_stdin(".a", yaml, &[])?;
+        assert_eq!(code, 0);
+        assert_eq!(yaml_out.trim(), want, "yaml output regressed for {yaml:?}");
+    }
+    Ok(())
+}
+
+/// #1008 companion, non-regression for a KNOWN residual gap: `[.a]`-shaped
+/// queries (any `Expr` the generic evaluator has no native arm for --
+/// `eval_generic.rs`'s "reindex bridge") serialize the whole document to a
+/// JSON string via `to_json_for_reindex`, re-parse it, and re-evaluate --
+/// that round trip goes through `format_number_jq_compat` (jq's own
+/// normalization), so the *spelling* survives #1008's fix on this path
+/// (no more catastrophic decimal expansion) but not the exact source text
+/// (`1e2` -> `1E+2`, not verbatim). Real yq gives `[1e2]` here. Fixing this
+/// fully requires the round-trip itself to preserve literal text rather
+/// than reformat it -- filed as #1026 rather than folded into #1008, since
+/// it touches the shared jq/yq round-trip machinery `to_json_for_reindex`
+/// uses. This test exists so that gap doesn't silently widen or narrow
+/// unnoticed; update it (and #1026) together if this ever changes.
+#[test]
+fn test_materialized_yaml_exponent_literal_reindex_bridge_known_gap_1008() -> Result<()> {
+    for (yaml, want) in [
+        ("a: 1e2\n", "[1E+2]"),
+        ("a: 1e100\n", "[1E+100]"),
+        ("a: 1E5\n", "[1E+5]"),
+    ] {
+        let (out, code) = run_yq_stdin("[.a]", yaml, &["-o", "json", "-I", "0"])?;
+        assert_eq!(code, 0, "for {yaml:?}: {out:?}");
         assert_eq!(out.trim(), want, "for {yaml:?}");
     }
     Ok(())
