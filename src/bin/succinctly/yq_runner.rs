@@ -15,7 +15,8 @@ use succinctly::jq::eval_generic::{
     GenericResult,
 };
 use succinctly::jq::{
-    self, sync_aliased_paths, Builtin, EvalError, Expr, OwnedValue, QueryResult, YqSemantics,
+    self, assert_value_tree_depth, sync_aliased_paths, Builtin, EvalError, Expr, OwnedValue,
+    QueryResult, YqSemantics,
 };
 use succinctly::json::JsonIndex;
 use succinctly::yaml::{
@@ -812,6 +813,20 @@ fn reconcile_presentation(
     pristine_tree: &CommentTree,
     result_value: &OwnedValue,
 ) -> CommentTree {
+    reconcile_presentation_at_depth(pristine_value, pristine_tree, result_value, 0)
+}
+
+/// Panics past `succinctly::jq::MAX_VALUE_TREE_DEPTH` levels of nesting
+/// (#1005) — see that constant's own doc comment for why. `result_value` is
+/// the evaluated filter output, which can be constructed via `reduce`/
+/// `foreach`/etc. with no adversarial document involved on either side.
+fn reconcile_presentation_at_depth(
+    pristine_value: &OwnedValue,
+    pristine_tree: &CommentTree,
+    result_value: &OwnedValue,
+    depth: usize,
+) -> CommentTree {
+    assert_value_tree_depth(depth);
     match (pristine_value, result_value) {
         (OwnedValue::Object(p_fields), OwnedValue::Object(r_fields)) => {
             let own_comment = pristine_tree.own().map(str::to_string);
@@ -820,7 +835,9 @@ fn reconcile_presentation(
             let mut key_comments = IndexMap::new();
             for (k, r_v) in r_fields {
                 let child = match p_fields.get(k) {
-                    Some(p_v) => reconcile_presentation(p_v, pristine_tree.field(k), r_v),
+                    Some(p_v) => {
+                        reconcile_presentation_at_depth(p_v, pristine_tree.field(k), r_v, depth + 1)
+                    }
                     None => CommentTree::empty(),
                 };
                 fields.insert(k.clone(), child);
@@ -852,7 +869,12 @@ fn reconcile_presentation(
                 .iter()
                 .enumerate()
                 .map(|(i, r_v)| match p_items.get(i) {
-                    Some(p_v) => reconcile_presentation(p_v, pristine_tree.at_index(i), r_v),
+                    Some(p_v) => reconcile_presentation_at_depth(
+                        p_v,
+                        pristine_tree.at_index(i),
+                        r_v,
+                        depth + 1,
+                    ),
                     None => CommentTree::empty(),
                 })
                 .collect();
@@ -4281,5 +4303,40 @@ mod tests {
         } else {
             panic!("expected object, got {:?}", results[0]);
         }
+    }
+
+    /// `depth` levels of single-element array nesting: `[[[...[Null]...]]]`.
+    fn linear_array_nest(depth: usize) -> OwnedValue {
+        let mut v = OwnedValue::Null;
+        for _ in 0..depth {
+            v = OwnedValue::Array(vec![v]);
+        }
+        v
+    }
+
+    /// #1005: `result_value` is a filter's evaluated output (e.g. a
+    /// `reduce` accumulator growing one level per iteration), which has no
+    /// adversarial *document* behind it — `reconcile_presentation` must
+    /// independently refuse to recurse past the same limit rather than
+    /// overflow the stack. `pristine_tree` is `CommentTree::empty()` here
+    /// since only `pristine_value`'s/`result_value`'s own nesting drives
+    /// the recursion depth (`CommentTree::at_index` on a non-`Array` variant
+    /// falls back to the empty tree at every level, which is exactly what a
+    /// computed value with no live cursor of its own already looks like).
+    #[test]
+    fn reconcile_presentation_panics_past_nesting_depth_limit_1005() {
+        use succinctly::jq::MAX_VALUE_TREE_DEPTH;
+
+        let under = linear_array_nest(MAX_VALUE_TREE_DEPTH - 1);
+        let _ = reconcile_presentation(&under, &CommentTree::empty(), &under);
+
+        let over = linear_array_nest(MAX_VALUE_TREE_DEPTH);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            reconcile_presentation(&over, &CommentTree::empty(), &over)
+        }));
+        assert!(
+            result.is_err(),
+            "reconcile_presentation should panic at MAX_VALUE_TREE_DEPTH"
+        );
     }
 }

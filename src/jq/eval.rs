@@ -131,7 +131,8 @@ use super::expr::{
     ObjectKey, Pattern, StringPart,
 };
 use super::value::{
-    cmp_f64, format_number_jq_compat, is_nan_sentinel, numeric_repr_cmp, NumberRepr, OwnedValue,
+    assert_value_tree_depth, cmp_f64, format_number_jq_compat, is_nan_sentinel, numeric_repr_cmp,
+    NumberRepr, OwnedValue,
 };
 
 /// Result of evaluating a jq expression.
@@ -325,7 +326,29 @@ fn type_name<W>(value: &StandardJson<'_, W>) -> &'static str {
 }
 
 /// Convert a StandardJson value to an OwnedValue.
+///
+/// Panics past [`MAX_VALUE_TREE_DEPTH`](super::value::MAX_VALUE_TREE_DEPTH)
+/// levels of nesting (#1005) — see that constant's own doc comment for why
+/// this uses a different ceiling than `eval_generic::to_owned`'s own guard
+/// (#998). This is a second, independent copy of that same
+/// cursor-to-`OwnedValue` conversion; document-sourced input is protected
+/// transitively (it already passed through `eval_generic`'s guarded
+/// conversion before reaching this evaluator), but a value this module
+/// constructs internally afterward (a `reduce`/`foreach`/`while`/`until`/
+/// `repeat` accumulator, growing one level per loop iteration) reaches this
+/// copy directly and bypasses that upfront guard entirely — as does
+/// ordinary deep `..`/`recurse` document navigation, which is why this
+/// needs the higher, separately-tuned ceiling rather than
+/// `eval_generic::MAX_NESTING_DEPTH`.
 fn to_owned<W: Clone + AsRef<[u64]>>(value: &StandardJson<'_, W>) -> OwnedValue {
+    to_owned_at_depth(value, 0)
+}
+
+fn to_owned_at_depth<W: Clone + AsRef<[u64]>>(
+    value: &StandardJson<'_, W>,
+    depth: usize,
+) -> OwnedValue {
+    assert_value_tree_depth(depth);
     match value {
         StandardJson::Null => OwnedValue::Null,
         StandardJson::Bool(b) => OwnedValue::Bool(*b),
@@ -338,7 +361,9 @@ fn to_owned<W: Clone + AsRef<[u64]>>(value: &StandardJson<'_, W>) -> OwnedValue 
             }
         }
         StandardJson::Array(elements) => {
-            let items: Vec<OwnedValue> = (*elements).map(|e| to_owned(&e)).collect();
+            let items: Vec<OwnedValue> = (*elements)
+                .map(|e| to_owned_at_depth(&e, depth + 1))
+                .collect();
             OwnedValue::Array(items)
         }
         StandardJson::Object(fields) => {
@@ -347,7 +372,10 @@ fn to_owned<W: Clone + AsRef<[u64]>>(value: &StandardJson<'_, W>) -> OwnedValue 
                 // Get the key as a string
                 if let StandardJson::String(key_str_val) = field.key() {
                     if let Ok(cow) = key_str_val.as_str() {
-                        map.insert(cow.into_owned(), to_owned(&field.value()));
+                        map.insert(
+                            cow.into_owned(),
+                            to_owned_at_depth(&field.value(), depth + 1),
+                        );
                     }
                 }
             }
@@ -2085,7 +2113,24 @@ fn apply_compare_op(op: CompareOp, left: &OwnedValue, right: &OwnedValue) -> boo
 /// adjacent elements, so neither has any panic surface at all. See
 /// `test_sort_many_nans_does_not_panic_421`.
 pub(crate) fn compare_values(left: &OwnedValue, right: &OwnedValue) -> core::cmp::Ordering {
+    compare_values_at_depth(left, right, 0)
+}
+
+/// Panics past [`MAX_VALUE_TREE_DEPTH`](super::value::MAX_VALUE_TREE_DEPTH)
+/// levels of nesting (#1005) — see that constant's own doc comment for why
+/// this uses a different ceiling than `eval_generic::to_owned`'s guard
+/// (#998). Needed because a value `reduce`/`foreach`/`while`/`until`/
+/// `repeat` build up at query-evaluation time bypasses #998's
+/// document-input guards entirely: no adversarial document is involved,
+/// only enough loop iterations to grow the accumulator past the limit.
+fn compare_values_at_depth(
+    left: &OwnedValue,
+    right: &OwnedValue,
+    depth: usize,
+) -> core::cmp::Ordering {
     use core::cmp::Ordering;
+
+    assert_value_tree_depth(depth);
 
     let left_type = sort_rank(left);
     let right_type = sort_rank(right);
@@ -2115,7 +2160,7 @@ pub(crate) fn compare_values(left: &OwnedValue, right: &OwnedValue) -> core::cmp
         (OwnedValue::String(a), OwnedValue::String(b)) => a.cmp(b),
         (OwnedValue::Array(a), OwnedValue::Array(b)) => {
             for (av, bv) in a.iter().zip(b.iter()) {
-                match compare_values(av, bv) {
+                match compare_values_at_depth(av, bv, depth + 1) {
                     Ordering::Equal => continue,
                     other => return other,
                 }
@@ -2134,7 +2179,7 @@ pub(crate) fn compare_values(left: &OwnedValue, right: &OwnedValue) -> core::cmp
                 other => return other,
             }
             for k in a_keys {
-                match compare_values(&a[k], &b[k]) {
+                match compare_values_at_depth(&a[k], &b[k], depth + 1) {
                     Ordering::Equal => continue,
                     other => return other,
                 }
@@ -39826,5 +39871,72 @@ mod tests {
         // re-scanning from byte 0.
         assert_eq!(cursor.byte, input.len());
         assert_eq!(cursor.chars, input.chars().count());
+    }
+
+    /// `depth` levels of single-element array nesting: `[[[...[Null]...]]]`.
+    fn linear_array_nest(depth: usize) -> OwnedValue {
+        let mut v = OwnedValue::Null;
+        for _ in 0..depth {
+            v = OwnedValue::Array(vec![v]);
+        }
+        v
+    }
+
+    /// #1005: a value built at query-evaluation time (e.g. a `reduce`
+    /// accumulator growing one level per iteration) has no adversarial
+    /// *document* behind it, so #998's input-side guards never see it —
+    /// `compare_values` must independently refuse to recurse past the same
+    /// limit rather than overflow the stack.
+    #[test]
+    fn compare_values_panics_past_nesting_depth_limit_1005() {
+        use crate::jq::value::MAX_VALUE_TREE_DEPTH;
+
+        let under_a = linear_array_nest(MAX_VALUE_TREE_DEPTH - 1);
+        let under_b = linear_array_nest(MAX_VALUE_TREE_DEPTH - 1);
+        assert_eq!(
+            compare_values(&under_a, &under_b),
+            core::cmp::Ordering::Equal
+        );
+
+        let over_a = linear_array_nest(MAX_VALUE_TREE_DEPTH);
+        let over_b = linear_array_nest(MAX_VALUE_TREE_DEPTH);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            compare_values(&over_a, &over_b)
+        }));
+        assert!(
+            result.is_err(),
+            "compare_values should panic at MAX_VALUE_TREE_DEPTH"
+        );
+    }
+
+    /// #1005: `eval.rs`'s own private `to_owned` is a second, independent
+    /// copy of `eval_generic::to_owned`'s cursor-to-`OwnedValue` conversion
+    /// — #998 guarded that one, not this one. Document-sourced input is
+    /// protected transitively (already converted once via the guarded
+    /// copy), but this copy is reachable directly on values this module
+    /// constructs internally, so it needs its own independent guard.
+    #[test]
+    fn eval_rs_to_owned_panics_past_nesting_depth_limit_1005() {
+        use crate::jq::value::MAX_VALUE_TREE_DEPTH;
+
+        fn linear_nest(depth: usize) -> String {
+            format!("{}{{}}{}", "{\"k\":".repeat(depth), "}".repeat(depth))
+        }
+
+        let json = linear_nest(MAX_VALUE_TREE_DEPTH - 1);
+        let index = JsonIndex::build(json.as_bytes());
+        let cursor = index.root(json.as_bytes());
+        let owned = to_owned(&cursor.value());
+        assert!(matches!(owned, OwnedValue::Object(_)));
+
+        let json = linear_nest(MAX_VALUE_TREE_DEPTH);
+        let index = JsonIndex::build(json.as_bytes());
+        let cursor = index.root(json.as_bytes());
+        let value = cursor.value();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| to_owned(&value)));
+        assert!(
+            result.is_err(),
+            "to_owned should panic at MAX_VALUE_TREE_DEPTH"
+        );
     }
 }
