@@ -11617,3 +11617,38 @@ fn test_yq_at_json_preserves_exponent_literal_nested_in_array_1030() -> Result<(
     assert_eq!(stdout.trim_end(), r#"[1e2,"x"]"#);
     Ok(())
 }
+
+#[test]
+fn test_yq_tojson_preserves_exponent_literal_1030() -> Result<()> {
+    // #1030 code review: `tojson` is a separate builtin from the `@json`
+    // format operator (both fixed above) and was initially missed --
+    // confirmed live it must match `@json`'s behavior exactly.
+    let (stdout, code) = run_yq_stdin(".a | tojson", "a: 1e2\n", &["-r"])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "1e2");
+    Ok(())
+}
+
+#[test]
+fn test_yq_join_preserves_exponent_literal_in_element_1030() -> Result<()> {
+    // #1030 code review: `yq_join_element_part` (yq-only, #1041) was
+    // initially missed -- it must use the same verbatim-echo convention as
+    // every other yq-mode stringify path.
+    let (stdout, code) = run_yq_stdin(r#".a | join(",")"#, "a: [1e2, x]\n", &["-r"])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "1e2,x");
+    Ok(())
+}
+
+#[test]
+fn test_yq_join_preserves_exponent_literal_in_separator_1030() -> Result<()> {
+    // #1030 code review: `yq_join_separator`'s equivalent gap. Uses an
+    // array-index reference (`.[0]`), not `as $var`/a bare query literal,
+    // to reach the separator without the source-fidelity loss those two
+    // paths have (confirmed pre-existing on unpatched `main`, out of this
+    // issue's scope).
+    let (stdout, code) = run_yq_stdin(r#".arr | join(.[0])"#, "arr: [1e2, a, b]\n", &["-r"])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "1e21e2a1e2b");
+    Ok(())
+}

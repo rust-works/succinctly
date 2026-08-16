@@ -2645,7 +2645,7 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // Phase 6: Type Conversions
         Builtin::ToString => builtin_tostring::<W, S>(value, optional),
         Builtin::ToNumber => builtin_tonumber::<W>(value, optional),
-        Builtin::ToJson => builtin_tojson::<W>(value, optional),
+        Builtin::ToJson => builtin_tojson::<W, S>(value, optional),
         Builtin::FromJson => builtin_fromjson::<W>(value, optional),
 
         // Phase 6: Additional String Functions
@@ -4105,7 +4105,11 @@ fn yq_join_element_part(elem: OwnedValue) -> String {
     match elem {
         OwnedValue::String(s) => s,
         OwnedValue::Null | OwnedValue::Array(_) | OwnedValue::Object(_) => String::new(),
-        other => other.to_json(),
+        // `to_json_yq()`, not `to_json()` (#1030 code review): this function
+        // is only ever reached from `builtin_join`'s `S::TAG == EvalTag::Yq`
+        // branch, so a scientific-notation literal here must echo verbatim
+        // too, not get jq-reformatted.
+        other => other.to_json_yq(),
     }
 }
 
@@ -4122,7 +4126,9 @@ fn yq_join_separator(sep: OwnedValue) -> String {
     match sep {
         OwnedValue::String(s) => s,
         OwnedValue::Array(_) | OwnedValue::Object(_) => String::new(),
-        other => other.to_json(),
+        // `to_json_yq()` (#1030 code review): same reasoning as
+        // `yq_join_element_part` above -- this function is yq-only.
+        other => other.to_json_yq(),
     }
 }
 
@@ -5087,6 +5093,20 @@ pub(crate) fn numeric_display_string<S: EvalSemantics>(value: &OwnedValue) -> St
     value.number_str().expect("numeric variant").into_owned()
 }
 
+/// `to_json_yq()` in yq mode, `to_json()` in jq mode (#1030) -- the single
+/// definition every "stringify a whole value as JSON" call site routes
+/// through, instead of each one re-deriving the fork (#106's "duplicated
+/// predicates diverge silently" lesson, which this exact fork already
+/// tripped once: an earlier draft of this fix hand-copied this branch at
+/// four separate call sites before being consolidated here).
+pub(crate) fn owned_value_to_json<S: EvalSemantics>(value: &OwnedValue) -> String {
+    if S::TAG == EvalTag::Yq {
+        value.to_json_yq()
+    } else {
+        value.to_json()
+    }
+}
+
 /// Convert an owned value to a string representation (for interpolation).
 fn owned_to_string<S: EvalSemantics>(value: &OwnedValue) -> String {
     match value {
@@ -5097,18 +5117,12 @@ fn owned_to_string<S: EvalSemantics>(value: &OwnedValue) -> String {
             numeric_display_string::<S>(value)
         }
         OwnedValue::String(s) => s.clone(), // Don't quote strings in interpolation
-        // `to_json_yq()` in yq mode (#1030): a container's own nested
-        // NumberLiteral needs the same verbatim-echo treatment as the
-        // scalar arm above, not jq's `to_json()` reformatting -- confirmed
-        // live: real yq's `@csv`/`@tsv`/string interpolation on an array
-        // containing a scientific-notation element all preserve it.
-        OwnedValue::Array(_) | OwnedValue::Object(_) => {
-            if S::TAG == EvalTag::Yq {
-                value.to_json_yq()
-            } else {
-                value.to_json()
-            }
-        }
+        // A container's own nested NumberLiteral needs the same
+        // verbatim-echo treatment as the scalar arm above, not jq's
+        // `to_json()` reformatting -- confirmed live: real yq's
+        // `@csv`/`@tsv`/string interpolation on an array containing a
+        // scientific-notation element all preserve it.
+        OwnedValue::Array(_) | OwnedValue::Object(_) => owned_value_to_json::<S>(value),
     }
 }
 
@@ -5160,11 +5174,7 @@ fn format_text<S: EvalSemantics>(value: &OwnedValue) -> Result<String, EvalError
 
 /// @json - Format as JSON
 fn format_json<S: EvalSemantics>(value: &OwnedValue) -> Result<String, EvalError> {
-    Ok(if S::TAG == EvalTag::Yq {
-        value.to_json_yq()
-    } else {
-        value.to_json()
-    })
+    Ok(owned_value_to_json::<S>(value))
 }
 
 /// @uri - URI/percent encode
@@ -5811,13 +5821,7 @@ fn builtin_tostring<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         OwnedValue::Int(n) => format!("{n}"),
         OwnedValue::Float(f) => format!("{f}"),
         OwnedValue::NumberLiteral(..) => numeric_display_string::<S>(&owned),
-        OwnedValue::Array(_) | OwnedValue::Object(_) => {
-            if S::TAG == EvalTag::Yq {
-                owned.to_json_yq()
-            } else {
-                owned.to_json()
-            }
-        }
+        OwnedValue::Array(_) | OwnedValue::Object(_) => owned_value_to_json::<S>(&owned),
     };
     QueryResult::Owned(OwnedValue::String(s))
 }
@@ -6001,12 +6005,12 @@ fn builtin_skip<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 }
 
 /// Builtin: tojson - convert any value to JSON string
-fn builtin_tojson<W: Clone + AsRef<[u64]>>(
+fn builtin_tojson<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'_, W>,
     _optional: bool,
 ) -> QueryResult<'_, W> {
     let owned = to_owned(&value);
-    let json_string = owned.to_json();
+    let json_string = owned_value_to_json::<S>(&owned);
     QueryResult::Owned(OwnedValue::String(json_string))
 }
 

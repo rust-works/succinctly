@@ -27,8 +27,8 @@ use super::document::{
 use super::eval::{
     compare_values, eval as full_eval, format_owned, index_one_owned as index_owned_by_key,
     needs_path_context, numeric_display_string, numeric_key_to_index, owned_bound_to_i64,
-    slice_owned_value, tonumber_from_str, Control, EvalError, EvalSemantics, EvalTag, JqSemantics,
-    QueryResult, YqSemantics,
+    owned_value_to_json, slice_owned_value, tonumber_from_str, Control, EvalError, EvalSemantics,
+    EvalTag, JqSemantics, QueryResult, YqSemantics,
 };
 use super::expr::{Builtin, CompareOp, Expr, FormatType, Literal};
 use super::slice::{slice_str, SliceBounds};
@@ -3702,13 +3702,7 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                     numeric_display_string::<S>(&owned)
                 }
                 OwnedValue::String(s) => s.clone(),
-                OwnedValue::Array(_) | OwnedValue::Object(_) => {
-                    if S::TAG == EvalTag::Yq {
-                        owned.to_json_yq()
-                    } else {
-                        owned.to_json()
-                    }
-                }
+                OwnedValue::Array(_) | OwnedValue::Object(_) => owned_value_to_json::<S>(&owned),
             };
             GenericResult::Owned(OwnedValue::String(s))
         }
