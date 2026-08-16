@@ -3237,8 +3237,10 @@ fn write_yaml_scalar_as_json(output: &mut String, str_val: &str) {
 }
 
 /// Write an already-resolved scalar as JSON. `str_val` is the original
-/// source text, used only for the `Str` case (and only if `resolved` didn't
-/// come from resolving it, e.g. tag-forced `!!str` on non-string content).
+/// source text, used for the `Str` case (and only if `resolved` didn't come
+/// from resolving it, e.g. tag-forced `!!str` on non-string content), and
+/// for a preservable `Float` literal (#993) -- kept in lockstep with the
+/// streaming sibling [`stream_resolved_scalar_as_json`].
 #[inline]
 fn write_resolved_scalar_as_json(output: &mut String, resolved: ResolvedScalar, str_val: &str) {
     match resolved {
@@ -3246,6 +3248,14 @@ fn write_resolved_scalar_as_json(output: &mut String, resolved: ResolvedScalar, 
         ResolvedScalar::Bool(true) => output.push_str("true"),
         ResolvedScalar::Bool(false) => output.push_str("false"),
         ResolvedScalar::Int(n) => write_i64(output, n),
+        // See `stream_resolved_scalar_as_json`'s matching arm for why this
+        // echoes `str_val` rather than always reconstructing from `f` (#993).
+        // No separate `is_finite()` check needed: `is_preservable_float_literal`
+        // already bounds the digit count well below where a finite `f64`
+        // could overflow, matching `number_literal()`'s identical guard.
+        ResolvedScalar::Float(_) if is_preservable_float_literal(str_val) => {
+            output.push_str(str_val);
+        }
         ResolvedScalar::Float(f) if f.is_finite() => write_f64(output, f),
         // JSON cannot represent the `.inf`/`.nan` family.
         ResolvedScalar::Float(_) => output.push_str("null"),
@@ -3699,12 +3709,13 @@ fn stream_resolved_scalar_as_json<Out: core::fmt::Write>(
         // syntax (`number_literal()` below uses the same predicate for the
         // DOM path) -- this is what keeps a trailing zero (`1.50`) intact;
         // `format_float_with_fraction` only reconstructs the value's
-        // shortest round-trip spelling, which silently drops it (#993).
+        // shortest round-trip spelling, which silently drops it (#993). No
+        // separate `is_finite()` check needed: `is_preservable_float_literal`
+        // already bounds the digit count well below where a finite `f64`
+        // could overflow, matching `number_literal()`'s identical guard.
         // Not `write!(out, "{f}")` either way: that drops the `.0` from a
         // whole float.
-        ResolvedScalar::Float(f) if f.is_finite() && is_preservable_float_literal(str_val) => {
-            out.write_str(str_val)
-        }
+        ResolvedScalar::Float(_) if is_preservable_float_literal(str_val) => out.write_str(str_val),
         ResolvedScalar::Float(f) if f.is_finite() => out.write_str(&format_float_with_fraction(f)),
         // JSON cannot represent the `.inf`/`.nan` family.
         ResolvedScalar::Float(_) => out.write_str("null"),
@@ -10603,6 +10614,27 @@ mod tests {
             }
         }
         panic!("Could not find value");
+    }
+
+    /// #993: the buffered (`to_json`/`write_resolved_scalar_as_json`) and
+    /// streaming (`stream_json`/`stream_resolved_scalar_as_json`) JSON
+    /// emitters must agree on a float literal's trailing zero, same as the
+    /// custom-tag lockstep check above. An earlier version of this fix
+    /// updated only the streaming twin, leaving the buffered one -- reached
+    /// by the public `YamlCursor::to_json()`/`to_json_document()` API and
+    /// `tests/yaml_test_suite.rs`'s conformance harness, though not by the
+    /// `succinctly yq` CLI itself -- silently diverging on exactly this
+    /// input.
+    #[test]
+    fn test_float_trailing_zero_lockstep_between_emitters_993() {
+        let yaml = b"a: 1.50\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let root = index.root(yaml);
+        assert_eq!(root.to_json_document(), r#"{"a":1.50}"#);
+        let mut streamed = String::new();
+        root.stream_json_document(&mut streamed, IndentSpec::COMPACT, false)
+            .expect("streams");
+        assert_eq!(streamed, r#"{"a":1.50}"#);
     }
 
     #[test]

@@ -11087,9 +11087,14 @@ fn test_m2_json_output_preserves_float_trailing_zero_whole_doc_993() -> Result<(
 #[test]
 fn test_m2_json_output_float_fallback_unaffected_by_993() -> Result<()> {
     for (yaml, want) in [
-        // Exponent notation: excluded by `is_preservable_float_literal`
-        // itself (unrelated follow-up scope, #1008), unaffected either way.
-        ("a: 007e2\n", "700.0"),
+        // Exponent notation: `is_preservable_float_literal` requires a `.`
+        // with no `e`/`E` at all, so a literal with both (unlike `007e2`,
+        // which has no `.` and is rejected before the exponent check is
+        // ever reached) is the one that actually exercises that exclusion.
+        // Reformatting scientific notation here is itself a separate,
+        // already-filed gap (#1008) -- this only pins that this fix leaves
+        // that pre-existing fallback behavior unchanged.
+        ("a: 1.5e2\n", "150.0"),
         // More significant digits than an f64 actually holds.
         ("a: 1.2345678901234567890123\n", "1.2345678901234567"),
     ] {
