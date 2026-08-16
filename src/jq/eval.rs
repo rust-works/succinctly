@@ -30111,32 +30111,70 @@ mod tests {
 
     #[cfg(feature = "regex")]
     #[test]
-    fn test_regex_sub_yq_mode_keeps_pre_1034_replacement_type_check() {
-        // #1050 review: #1034's arith_add-based jq wording fix is jq-only --
-        // real yq's own sub/gsub coercion diverges from jq's `+`-based rules
-        // (confirmed live against yq v4.53.3: a non-string replacement
-        // stringifies and concatenates instead of erroring, e.g.
-        // `sub("a";5)` on `"abc"` is `"5bc"`, `sub("a";null)` is `"nullbc"`).
-        // Neither succinctly's pre-#1034 nor post-#1034 yq-mode behavior
-        // matches that, so #1034 deliberately keeps yq on its pre-existing
-        // "replacement must already be a string" check rather than silently
-        // adopting jq's `+`-based rules under yq mode too -- #1052 tracks
-        // real yq-compatible sub/gsub coercion as its own follow-up.
+    fn test_regex_sub_yq_mode_stringifies_non_string_replacement_1052() {
+        // #1052: real yq's own sub/gsub coercion diverges from jq's
+        // `+`-based rules -- confirmed live against yq v4.53.3: a scalar
+        // non-string replacement stringifies and concatenates instead of
+        // erroring, while an array/object replacement contributes an
+        // *empty* string, not a JSON representation like `tostring()`
+        // would give.
         yq_query!(br#""abc""#, r#"sub("a"; 5)"#,
-            QueryResult::Error(e) => {
-                assert_eq!(e.message, "expected string, got replacement");
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "5bc");
+            }
+        );
+        yq_query!(br#""abc""#, r#"sub("a"; 5.5)"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "5.5bc");
             }
         );
         yq_query!(br#""abc""#, r#"sub("a"; null)"#,
-            QueryResult::Error(e) => {
-                assert_eq!(e.message, "expected string, got replacement");
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "nullbc");
             }
         );
-        // `isvalid` reports `false` here too, via its own error-catching --
-        // not through any `optional`-gated arm inside `combine_sub_gap`,
-        // which has none (see that function's own doc comment).
+        yq_query!(br#""abc""#, r#"sub("a"; true)"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "truebc");
+            }
+        );
+        yq_query!(br#""abc""#, r#"sub("a"; false)"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "falsebc");
+            }
+        );
+        yq_query!(br#""abc""#, r#"sub("a"; [1,2])"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "bc");
+            }
+        );
+        yq_query!(br#""abc""#, r#"sub("a"; {"x":1})"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "bc");
+            }
+        );
+        // Never errors any more, so isvalid reports true (was false
+        // pre-#1052).
         yq_query!(br#""abc""#, r#"isvalid(sub("a"; 5))"#,
-            QueryResult::Owned(OwnedValue::Bool(false)) => {}
+            QueryResult::Owned(OwnedValue::Bool(true)) => {}
+        );
+    }
+
+    #[cfg(feature = "regex")]
+    #[test]
+    fn test_regex_gsub_yq_mode_stringifies_non_string_replacement_1052() {
+        // #1052: combine_sub_gap is shared by sub and gsub -- confirm the
+        // coercion applies per-match across gsub's multiple matches too,
+        // not just sub's single one.
+        yq_query!(br#""aaa""#, r#"gsub("a"; 5)"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "555");
+            }
+        );
+        yq_query!(br#""aaa""#, r#"gsub("a"; [1,2])"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "");
+            }
         );
     }
 
