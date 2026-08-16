@@ -84,8 +84,7 @@ pub const MAX_NESTING_DEPTH: usize = 256;
 
 /// Panics past [`MAX_NESTING_DEPTH`] levels of nesting (#998).
 ///
-/// A thin wrapper around
-/// [`value::assert_depth`](super::value::assert_depth) (#1018) -- the
+/// A thin wrapper around `value::assert_depth` (#1018) -- the
 /// underlying `assert!` used to be hand-copied here (fixing a #998 review
 /// finding that `to_owned`/`to_owned_cursor`/`to_owned_with_comments` each
 /// carried their own byte-identical copy), and again independently in
