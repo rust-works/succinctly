@@ -5068,17 +5068,34 @@ fn eval_string_interpolation<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// comment) because `to_json` needs "null" instead. Text formats (`@text`,
 /// `@uri`, `@html`, `@sh`, and the CSV/TSV/DSV cell formatter that falls back
 /// to `owned_to_string`) want the same `"inf"`/`"-inf"`/`"NaN"` rendering a
-/// plain `Int`/`Float` already gets from `f64::to_string()` -- a
+/// plain `Int`/`Float` already gets from `f64::to_string()` in jq mode -- a
 /// `NumberLiteral` just needs that check made explicit: `format_number_jq_compat`
 /// now formats an overflowed literal's source text correctly (#930), but its
 /// jq-error-message-preview text (e.g. `1E+400`) still isn't the Rust-style
 /// `"inf"`/`"-inf"` these non-JSON text formats want, so the explicit check
 /// stays regardless.
+///
+/// yq mode instead wants YAML's own `.nan`/`.inf`/`-.inf` spelling (#1060) --
+/// this was previously unconditional (`f.to_string()`, jq's own spelling in
+/// both modes), the same class of gap #1030 fixed for finite literals.
+/// Real yq's own Go-based number model actually distinguishes a
+/// document-sourced non-finite scalar (`.inf`) from a genuinely *computed*
+/// one (`1/0` -> Go's own `+Inf`, confirmed live against the pinned oracle)
+/// -- but succinctly's `OwnedValue` can't make that distinction once a
+/// document-sourced `.inf`/`.nan` degrades to a plain `Float`: YAML's
+/// `number_literal()` override never captures these spellings as a
+/// `NumberLiteral` in the first place (`is_preservable_float_literal`'s
+/// JSON-syntax gate rejects them, since neither starts with a digit or
+/// `-digit`). So this always answers with the document-sourced spelling --
+/// correct for the common case (`.a | tostring` on an untouched `.inf`/
+/// `.nan` scalar), diverging from real yq's Go-style spelling only for a
+/// genuinely computed non-finite result, a narrower, rarer case left
+/// unaddressed here.
 pub(crate) fn numeric_display_string<S: EvalSemantics>(value: &OwnedValue) -> String {
     if let OwnedValue::NumberLiteral(repr, literal) = value {
         if let NumberRepr::Float(f) = repr {
             if f.is_nan() || f.is_infinite() {
-                return f.to_string();
+                return nonfinite_display_string::<S>(*f);
             }
         }
         // yq preserves a document-sourced literal's exact source spelling
@@ -5090,8 +5107,28 @@ pub(crate) fn numeric_display_string<S: EvalSemantics>(value: &OwnedValue) -> St
         if S::TAG == EvalTag::Yq {
             return crate::jq::stream::real_output_finite_literal(literal.as_bytes());
         }
+    } else if let OwnedValue::Float(f) = value {
+        if f.is_nan() || f.is_infinite() {
+            return nonfinite_display_string::<S>(*f);
+        }
     }
     value.number_str().expect("numeric variant").into_owned()
+}
+
+/// jq's bare `f64::Display` (`NaN`/`inf`/`-inf`) vs yq's own YAML-native
+/// spelling (`.nan`/`.inf`/`-.inf`) for a non-finite float -- see
+/// [`numeric_display_string`]'s own doc comment for the "document-sourced
+/// vs computed" caveat this doesn't attempt to resolve.
+fn nonfinite_display_string<S: EvalSemantics>(f: f64) -> String {
+    if S::TAG != EvalTag::Yq {
+        f.to_string()
+    } else if f.is_nan() {
+        ".nan".to_string()
+    } else if f.is_sign_negative() {
+        "-.inf".to_string()
+    } else {
+        ".inf".to_string()
+    }
 }
 
 /// `to_json_yq()` in yq mode, `to_json()` in jq mode (#1030) -- the single

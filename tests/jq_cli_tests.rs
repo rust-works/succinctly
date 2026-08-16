@@ -10752,3 +10752,24 @@ fn test_jq_stderr_and_halt_error_unaffected_by_yq_mode_fix_1051() -> Result<()> 
     assert_eq!(stderr.trim_end(), r#"[1E+2,"x"]"#);
     Ok(())
 }
+
+/// #1060: `numeric_display_string`'s NaN/Infinity fast path gained an
+/// `S`-gated yq-only branch (`.nan`/`.inf`/`-.inf`); confirm jq mode's own
+/// bare `f64::Display` spelling (`NaN`/`inf`/`-inf`) is unaffected. (Real
+/// jq's own `infinite` builtin substitutes `DBL_MAX` rather than true IEEE
+/// infinity -- succinctly doesn't replicate that quirk, a pre-existing,
+/// unrelated divergence; this test pins succinctly's own actual jq-mode
+/// output, not real jq's.)
+#[test]
+fn test_jq_tostring_special_floats_unaffected_by_yq_mode_fix_1060() -> Result<()> {
+    for (filter, want) in [
+        ("infinite | tostring", r#""inf""#),
+        ("(-1 * infinite) | tostring", r#""-inf""#),
+        ("nan | tostring", r#""NaN""#),
+    ] {
+        let (out, code) = run_jq_stdin(filter, "null", &["-c"])?;
+        assert_eq!(code, 0, "for {filter:?}: {out:?}");
+        assert_eq!(out.trim(), want, "for {filter:?}");
+    }
+    Ok(())
+}

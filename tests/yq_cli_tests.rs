@@ -5410,6 +5410,46 @@ fn test_yaml_special_float_keys_preview_is_unaffected_by_939() -> Result<()> {
     Ok(())
 }
 
+/// #1060: `numeric_display_string`'s NaN/Infinity fast path was
+/// unconditional (`f.to_string()`, jq's own `NaN`/`inf`/`-inf` spelling in
+/// both modes) -- yq mode wants YAML's own `.nan`/`.inf`/`-.inf`, matching
+/// `tostring`/`@text`/`@sh`/CSV-TSV-DSV cell formatting on a document-sourced
+/// non-finite scalar. Verified byte-for-byte against pinned real yq v4.53.3.
+#[test]
+fn test_yq_tostring_special_floats_use_yaml_spelling_1060() -> Result<()> {
+    for (input, want) in [
+        ("a: .inf\n", ".inf"),
+        ("a: -.inf\n", "-.inf"),
+        ("a: .nan\n", ".nan"),
+    ] {
+        let (stdout, code) = run_yq_stdin(".a | tostring", input, &["-r"])?;
+        assert_eq!(code, 0, "for {input:?}: {stdout:?}");
+        assert_eq!(stdout.trim_end(), want, "for {input:?}");
+    }
+    Ok(())
+}
+
+/// #1060: the same fix applies to every other text format sharing
+/// `numeric_display_string` (not just `tostring`).
+#[test]
+fn test_yq_at_csv_special_floats_use_yaml_spelling_1060() -> Result<()> {
+    let (stdout, code) = run_yq_stdin(".a | @csv", "a: [.inf, -.inf, .nan]\n", &["-r"])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), ".inf,-.inf,.nan");
+    Ok(())
+}
+
+/// #1060 scope note: `@json`/`-o json` output is untouched by this fix (a
+/// separate code path, `to_json`/`to_json_yq`, already RFC-8259-correct) --
+/// pinning that this stays `null` after the `numeric_display_string` change.
+#[test]
+fn test_yq_json_output_special_floats_still_null_after_1060() -> Result<()> {
+    let (stdout, code) = run_yq_stdin(".", "x: .nan\ny: .inf\nz: -.inf\n", &["-o", "json", "-I0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), r#"{"x":null,"y":null,"z":null}"#);
+    Ok(())
+}
+
 #[test]
 fn test_build_configuration_flag() -> Result<()> {
     // --build-configuration prints diagnostics and exits successfully.
