@@ -265,30 +265,38 @@ fn test_parity_formats_over_iteration() {
 
 /// Non-finite floats exercise `numeric_display_string`/`owned_to_yaml`/
 /// `props_value_to_string` (eval.rs), which already rendered `"inf"`/`".nan"`/
-/// etc. correctly before #124 -- both evaluators agreed on these even when the
-/// generic evaluator had no direct `Expr::Format` arm, since its catch-all
+/// etc. consistently before #124 -- both evaluators agreed on these even when
+/// the generic evaluator had no direct `Expr::Format` arm, since its catch-all
 /// round-trip goes through `to_json_for_reindex` (preserving, #561), not plain
 /// `to_json` (nulling). #124's direct arm doesn't change that outcome, only
 /// how cheaply it's reached.
 ///
+/// jq mode's own spelling changed under #1075 (`"inf"`/`"-inf"`, Rust's bare
+/// `f64::Display`, to jq's actual `DBL_MAX`-text substitution) -- yq mode's
+/// (`.inf`/`.nan`) is unaffected.
+///
 /// The pinned full-evaluator values below are asserted explicitly so parity
 /// can't silently re-agree on a *new* wrong answer.
 ///
-/// Note neither evaluator matches real jq here: jq 1.7.1 preserves the source
-/// literal and prints `1E+400` for all of these. That literal-preservation gap
-/// is a separate pre-existing issue, out of scope for #124.
+/// Note neither evaluator fully matches real jq here even after #1075: jq
+/// 1.7.1 preserves a *positive* overflowed literal's own source text and
+/// prints `1E+400` for it (though it does substitute `DBL_MAX` text for a
+/// *negative* one, which #1075 does match). That literal-preservation gap is
+/// a separate pre-existing issue (#1083), out of scope for both #124 and
+/// #1075 -- see `numeric_display_string`'s own doc comment (`src/jq/eval.rs`)
+/// for why.
 #[test]
 fn test_formats_non_finite_parity_124() {
     for (json, filter, expected) in [
-        (b"1e400".as_slice(), "@text", r#""inf""#),
-        (b"-1e400", "@text", r#""-inf""#),
-        (b"1e400", "@uri", r#""inf""#),
-        (b"1e400", "@html", r#""inf""#),
+        (b"1e400".as_slice(), "@text", r#""1.7976931348623157e+308""#),
+        (b"-1e400", "@text", r#""-1.7976931348623157e+308""#),
+        (b"1e400", "@uri", r#""1.7976931348623157e%2B308""#),
+        (b"1e400", "@html", r#""1.7976931348623157e+308""#),
         (b"1e400", "@yaml", r#"".inf""#),
         (b"1e400", "@props", r#"".inf""#),
-        (b"[1e400]", "@csv", r#""inf""#),
-        (b"[1e400]", "@tsv", r#""inf""#),
-        (b"[1e400]", "@sh", r#""inf""#),
+        (b"[1e400]", "@csv", r#""1.7976931348623157e+308""#),
+        (b"[1e400]", "@tsv", r#""1.7976931348623157e+308""#),
+        (b"[1e400]", "@sh", r#""1.7976931348623157e+308""#),
     ] {
         assert_eq!(
             as_strs(&full_outputs(json, filter)),
