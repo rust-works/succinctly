@@ -1132,6 +1132,18 @@ fn owned_vec_to_result<'a, W>(mut vs: Vec<OwnedValue>) -> QueryResult<'a, W> {
     }
 }
 
+/// The borrowed-cursor counterpart to [`owned_vec_to_result`] (#1038):
+/// normalize a `Vec<StandardJson>` accumulator into the smallest
+/// `QueryResult` shape that represents it -- empty stays `None`, one value
+/// collapses to `One`, more than one stays `Many`.
+fn borrowed_vec_to_result<W>(mut vs: Vec<StandardJson<'_, W>>) -> QueryResult<'_, W> {
+    match vs.len() {
+        0 => QueryResult::None,
+        1 => QueryResult::One(vs.pop().unwrap()),
+        _ => QueryResult::Many(vs),
+    }
+}
+
 /// Normalize a prefix and its terminator into a `QueryResult` (#400, #494).
 ///
 /// An empty prefix collapses to the bare `Error`/`Break`/`Halt` variant, so
@@ -1318,11 +1330,7 @@ fn retain_truthy<W: Clone + AsRef<[u64]>>(result: QueryResult<'_, W>) -> QueryRe
         }
         QueryResult::Many(mut vs) => {
             vs.retain(json_is_truthy);
-            match vs.len() {
-                0 => QueryResult::None,
-                1 => QueryResult::One(vs.pop().unwrap()),
-                _ => QueryResult::Many(vs),
-            }
+            borrowed_vec_to_result(vs)
         }
         QueryResult::ManyOwned(mut vs) => {
             vs.retain(OwnedValue::is_truthy);
@@ -14010,13 +14018,7 @@ fn eval_limit<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         QueryResult::One(v) if n >= 1 => QueryResult::One(v),
         QueryResult::Many(vs) => {
             let taken: Vec<_> = vs.into_iter().take(n).collect();
-            if taken.is_empty() {
-                QueryResult::None
-            } else if taken.len() == 1 {
-                QueryResult::One(taken.into_iter().next().unwrap())
-            } else {
-                QueryResult::Many(taken)
-            }
+            borrowed_vec_to_result(taken)
         }
         QueryResult::Owned(v) if n >= 1 => QueryResult::Owned(v),
         QueryResult::ManyOwned(vs) => {
