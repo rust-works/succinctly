@@ -7947,7 +7947,7 @@ fn stitch_replacements_evaluated<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         if let Some(replacement) = replacement {
             any_nonempty = true;
             let gap = &input[last_end..m.start()];
-            out.push_str(&combine_sub_gap::<W, S>(gap, replacement, optional)?);
+            out.push_str(&combine_sub_gap::<W, S>(gap, replacement)?);
         }
         last_end = m.end();
     }
@@ -7987,11 +7987,21 @@ fn stitch_replacements_evaluated<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// ordering, letting a later match's own `error(...)` mask an earlier
 /// match's genuine type mismatch (caught by #1050's review, confirmed live
 /// against jq 1.7.1).
+///
+/// No `optional`-gated arm on either error path: `optional` is never forced
+/// `true` reaching a nested `Call` node like `sub`/`gsub` (see
+/// `Expr::Optional`'s dispatch in `eval_single`, #693) -- a bare
+/// `sub(...)?` suppresses these errors via the ancestor `eval_try`'s catch,
+/// and `isvalid(sub(...))` via `isvalid`'s own error-catching (it evaluates
+/// with `optional: false`, not forced-`true`, despite an older comment
+/// elsewhere claiming otherwise). Confirmed dead per #928/#1003's identical
+/// finding elsewhere in this file: dedicated `sub(...)?`/`isvalid(sub(...))`
+/// tests for both branches still showed 0 coverage hits on the guards
+/// themselves.
 #[cfg(feature = "regex")]
 fn combine_sub_gap<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     gap: &str,
     replacement: OwnedValue,
-    optional: bool,
 ) -> Result<String, QueryResult<'a, W>> {
     if let OwnedValue::String(s) = replacement {
         let mut combined = String::with_capacity(gap.len() + s.len());
@@ -8000,21 +8010,16 @@ fn combine_sub_gap<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         return Ok(combined);
     }
     if S::TAG == EvalTag::Yq {
-        return if optional {
-            Err(QueryResult::None)
-        } else {
-            Err(QueryResult::Error(EvalError::type_error(
-                "string",
-                "replacement",
-            )))
-        };
+        return Err(QueryResult::Error(EvalError::type_error(
+            "string",
+            "replacement",
+        )));
     }
     match arith_add::<S>(OwnedValue::String(gap.to_string()), replacement) {
         Ok(OwnedValue::String(combined)) => Ok(combined),
         Ok(other) => {
             unreachable!("gap + replacement always yields a String or errors, got {other:?}")
         }
-        Err(_e) if optional => Err(QueryResult::None),
         Err(e) => Err(e.into()),
     }
 }
@@ -8370,7 +8375,7 @@ fn sub_with_resolved_pattern<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 // #1034: gap + replacement via `combine_sub_gap`, same
                 // reasoning as `stitch_replacements_evaluated`.
                 Some(replacement) => {
-                    match combine_sub_gap::<W, S>(&input[..m.start()], replacement, optional) {
+                    match combine_sub_gap::<W, S>(&input[..m.start()], replacement) {
                         Ok(mut out) => {
                             out.push_str(&input[m.end()..]);
                             QueryResult::Owned(OwnedValue::String(out))
@@ -29854,6 +29859,15 @@ mod tests {
         query!(br#""a""#, r#"sub("a"; 5)?"#,
             QueryResult::None => {}
         );
+        // `isvalid` reports `false` here too, via its own error-catching
+        // (it evaluates with `optional: false`, not forced -- `builtin_isvalid`
+        // ignores its own `optional` parameter entirely, per its doc
+        // comment), not through any `optional`-gated arm inside
+        // `combine_sub_gap` -- there isn't one, per that function's own doc
+        // comment above.
+        query!(br#""a""#, r#"isvalid(sub("a"; 5))"#,
+            QueryResult::Owned(OwnedValue::Bool(false)) => {}
+        );
     }
 
     #[cfg(feature = "regex")]
@@ -29896,6 +29910,12 @@ mod tests {
             QueryResult::Error(e) => {
                 assert_eq!(e.message, "expected string, got replacement");
             }
+        );
+        // `isvalid` reports `false` here too, via its own error-catching --
+        // not through any `optional`-gated arm inside `combine_sub_gap`,
+        // which has none (see that function's own doc comment).
+        yq_query!(br#""abc""#, r#"isvalid(sub("a"; 5))"#,
+            QueryResult::Owned(OwnedValue::Bool(false)) => {}
         );
     }
 
