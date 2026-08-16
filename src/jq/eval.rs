@@ -82,6 +82,12 @@ pub trait EvalSemantics: Copy + Default {
     /// code) so the library and CLI agree without the library depending on
     /// the CLI binary crate.
     const DEFAULT_HALT_ERROR_CODE: i32;
+    /// If true (yq), `==`/`!=` treats an integer-valued float and the
+    /// equivalent plain integer as genuinely distinct, non-equal types
+    /// (`2.0 == 2` is `false`) rather than widening both to `f64` for the
+    /// comparison. If false (jq, which has no strict int/float distinction),
+    /// `2.0 == 2` is `true`. #950.
+    const STRICT_NUMERIC_EQUALITY: bool;
 }
 
 /// jq-compatible evaluation semantics (default).
@@ -101,6 +107,7 @@ impl EvalSemantics for JqSemantics {
     const ARRAY_MULTIPLY_MERGES: bool = false;
     const NULL_MERGES_AS_EMPTY: bool = false;
     const DEFAULT_HALT_ERROR_CODE: i32 = 5;
+    const STRICT_NUMERIC_EQUALITY: bool = false;
 }
 
 /// yq-compatible evaluation semantics.
@@ -122,6 +129,7 @@ impl EvalSemantics for YqSemantics {
     const ARRAY_MULTIPLY_MERGES: bool = true;
     const NULL_MERGES_AS_EMPTY: bool = true;
     const DEFAULT_HALT_ERROR_CODE: i32 = 1;
+    const STRICT_NUMERIC_EQUALITY: bool = true;
 }
 
 use crate::json::light::{JsonCursor, JsonElements, JsonFields, StandardJson};
@@ -131,7 +139,8 @@ use super::expr::{
     ObjectKey, Pattern, StringPart,
 };
 use super::value::{
-    assert_value_tree_depth, cmp_f64, is_nan_sentinel, numeric_repr_cmp, NumberRepr, OwnedValue,
+    assert_value_tree_depth, cmp_f64, is_nan_sentinel, numeric_repr_cmp, numeric_repr_eq_strict,
+    NumberRepr, OwnedValue,
 };
 
 /// Result of evaluating a jq expression.
@@ -2093,7 +2102,7 @@ fn eval_compare<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     optional: bool,
 ) -> QueryResult<'a, W> {
     eval_binary_fanout::<W, S>(left, right, value, optional, |left_val, right_val| {
-        Ok(OwnedValue::Bool(apply_compare_op(
+        Ok(OwnedValue::Bool(apply_compare_op::<S>(
             op, &left_val, &right_val,
         )))
     })
@@ -2102,19 +2111,41 @@ fn eval_compare<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// Apply a comparison operator to two already-evaluated values.
 ///
 /// Factored out of [`eval_compare`] so the path-context evaluator's own
-/// `Expr::Compare` arm (`eval_pipe_with_path_context_internal`, #715) can
-/// reuse the exact same operator semantics rather than a second, divergence-
-/// prone copy -- see the project's own "one definition, plus a test that call
-/// sites agree" convention (already applied to `compare_values` itself).
-fn apply_compare_op(op: CompareOp, left: &OwnedValue, right: &OwnedValue) -> bool {
+/// `Expr::Compare` arm (`eval_pipe_with_path_context_internal`, #715) and
+/// the generic (CLI) evaluator's own `Expr::Compare` arm
+/// (`eval_generic::eval_single`) can all reuse the exact same operator
+/// semantics rather than a third, divergence-prone copy -- see the
+/// project's own "one definition, plus a test that call sites agree"
+/// convention (already applied to `compare_values` itself).
+pub(crate) fn apply_compare_op<S: EvalSemantics>(
+    op: CompareOp,
+    left: &OwnedValue,
+    right: &OwnedValue,
+) -> bool {
     match op {
-        CompareOp::Eq => left == right,
-        CompareOp::Ne => left != right,
+        CompareOp::Eq => numeric_aware_eq::<S>(left, right),
+        CompareOp::Ne => !numeric_aware_eq::<S>(left, right),
         CompareOp::Lt => compare_values(left, right) == core::cmp::Ordering::Less,
         CompareOp::Le => compare_values(left, right) != core::cmp::Ordering::Greater,
         CompareOp::Gt => compare_values(left, right) == core::cmp::Ordering::Greater,
         CompareOp::Ge => compare_values(left, right) != core::cmp::Ordering::Less,
     }
+}
+
+/// `==`'s own numeric rule, distinct from [`OwnedValue`]'s general
+/// (always-widening) `PartialEq`: under `S::STRICT_NUMERIC_EQUALITY` (yq),
+/// an `Int` and a `Float` operand are never equal regardless of magnitude
+/// (#950) -- checked only when *both* operands are numeric, so a
+/// number-vs-non-number comparison (already `false` either way) and every
+/// jq-mode comparison fall straight through to the ordinary widening
+/// `PartialEq`.
+fn numeric_aware_eq<S: EvalSemantics>(left: &OwnedValue, right: &OwnedValue) -> bool {
+    if S::STRICT_NUMERIC_EQUALITY {
+        if let (Some(a), Some(b)) = (left.number_repr(), right.number_repr()) {
+            return numeric_repr_eq_strict(a, b);
+        }
+    }
+    left == right
 }
 
 /// Compare two values using jq ordering: null < bool < number < string < array < object.
@@ -15930,7 +15961,7 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
                 current_path,
                 optional,
                 |left_val, right_val| {
-                    Ok(OwnedValue::Bool(apply_compare_op(
+                    Ok(OwnedValue::Bool(apply_compare_op::<S>(
                         *op, &left_val, &right_val,
                     )))
                 },

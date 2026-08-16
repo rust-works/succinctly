@@ -1071,6 +1071,21 @@ pub(crate) fn numeric_repr_eq(a: NumberRepr, b: NumberRepr) -> bool {
     }
 }
 
+/// Like [`numeric_repr_eq`], but for `EvalSemantics::STRICT_NUMERIC_EQUALITY`
+/// (yq): an `Int` and a `Float` are never equal regardless of magnitude,
+/// even when the same pair would compare equal under [`numeric_repr_eq`]'s
+/// widening rule -- real yq treats `2` and `2.0` as genuinely distinct
+/// types, unlike jq (#950).
+pub(crate) fn numeric_repr_eq_strict(a: NumberRepr, b: NumberRepr) -> bool {
+    match (a, b) {
+        (NumberRepr::Int(a), NumberRepr::Int(b)) => a == b,
+        (NumberRepr::Float(a), NumberRepr::Float(b)) => a == b,
+        (NumberRepr::Int(_), NumberRepr::Float(_)) | (NumberRepr::Float(_), NumberRepr::Int(_)) => {
+            false
+        }
+    }
+}
+
 /// Order two `f64`s the way jq's own comparator does: NaN sorts strictly
 /// below every other float, including another NaN (#421).
 ///

@@ -25,12 +25,12 @@ use super::document::{
     DocumentCursor, DocumentElements, DocumentFields, DocumentValue, IndentSpec,
 };
 use super::eval::{
-    compare_values, eval as full_eval, format_owned, index_one_owned as index_owned_by_key,
+    apply_compare_op, eval as full_eval, format_owned, index_one_owned as index_owned_by_key,
     needs_path_context, numeric_display_string, numeric_key_to_index, owned_bound_to_i64,
     owned_value_to_json, slice_owned_value, tonumber_from_str, Control, EvalError, EvalSemantics,
     EvalTag, JqSemantics, QueryResult, YqSemantics,
 };
-use super::expr::{Builtin, CompareOp, Expr, FormatType, Literal};
+use super::expr::{Builtin, Expr, FormatType, Literal};
 use super::slice::{slice_str, SliceBounds};
 use super::value::OwnedValue;
 use crate::json::JsonIndex;
@@ -2576,24 +2576,7 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                 );
 
                 for left_val in left_vals {
-                    let result = match op {
-                        CompareOp::Eq => left_val == *right_val,
-                        CompareOp::Ne => left_val != *right_val,
-                        CompareOp::Lt => {
-                            compare_values(&left_val, right_val) == core::cmp::Ordering::Less
-                        }
-                        CompareOp::Le => matches!(
-                            compare_values(&left_val, right_val),
-                            core::cmp::Ordering::Less | core::cmp::Ordering::Equal
-                        ),
-                        CompareOp::Gt => {
-                            compare_values(&left_val, right_val) == core::cmp::Ordering::Greater
-                        }
-                        CompareOp::Ge => matches!(
-                            compare_values(&left_val, right_val),
-                            core::cmp::Ordering::Greater | core::cmp::Ordering::Equal
-                        ),
-                    };
+                    let result = apply_compare_op::<S>(*op, &left_val, right_val);
                     out.push(OwnedValue::Bool(result));
                 }
 
@@ -3873,7 +3856,7 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
 
 #[cfg(test)]
 mod tests {
-    use super::super::expr::FormatType;
+    use super::super::expr::{CompareOp, FormatType};
     use super::super::value::NumberRepr;
     use super::*;
     use crate::jq::parse;
