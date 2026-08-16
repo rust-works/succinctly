@@ -24134,6 +24134,55 @@ mod tests {
     }
 
     #[test]
+    fn test_comma_all_empty_operands_collapse_to_none_1043() {
+        // #1043: every operand producing zero outputs must collapse the whole
+        // comma to `None`, not `Many(vec![])` -- real jq exits 0 with no
+        // output for `(empty,empty)`, not an error.
+        query!(br"1", "(empty, empty)",
+            QueryResult::None => {}
+        );
+    }
+
+    #[test]
+    fn test_fanout_all_empty_branches_collapse_to_none_1043() {
+        // #1043: eval_fanout's tail match is byte-identical to eval_comma's
+        // (both fold a multi-branch stream into borrowed/owned accumulators)
+        // and had the same missing `0 => None` bug. A multi-output condition
+        // whose every branch is `empty` must collapse the whole `if` to
+        // `None`, not `Many(vec![])`. Confirmed live against jq 1.7.1.
+        query!(br"1", "if (true, false) then empty else empty end",
+            QueryResult::None => {}
+        );
+    }
+
+    #[test]
+    fn test_computed_index_and_slice_zero_results_collapse_to_none_1043() {
+        // #1043: eval_index_expr's Borrowed and Owned target arms, and
+        // eval_slice_expr's final collapse, all had the same missing
+        // `0 => None` bug -- a computed index/slice whose optional (`?`)
+        // form produces zero results collapsed to `Many(vec![])`/
+        // `ManyOwned(vec![])` instead of `None`. Confirmed live against jq
+        // 1.7.1 (all four exit 0 with no output there too).
+        //
+        // Borrowed target (`.` is the document itself, a number -- not
+        // indexable, so `?` suppresses to zero results per key).
+        query!(br"5", r#".[("a", "b")]?"#,
+            QueryResult::None => {}
+        );
+        // Owned target: `(1)` constructs an owned value rather than
+        // borrowing from the document, taking eval_index_expr's separate
+        // `Targets::Owned` arm.
+        query!(br"5", r#"(1)[("a", "b")]?"#,
+            QueryResult::None => {}
+        );
+        // eval_slice_expr's final collapse: slicing a non-array/string
+        // target with `?` suppresses to zero results per (start, end) pair.
+        query!(br"null", r#"({"a": 1})[0:(1, 2)]?"#,
+            QueryResult::None => {}
+        );
+    }
+
+    #[test]
     fn test_literals() {
         query!(br"{}", "null",
             QueryResult::Owned(OwnedValue::Null) => {}
