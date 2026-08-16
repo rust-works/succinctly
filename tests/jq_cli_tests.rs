@@ -10662,3 +10662,22 @@ fn test_negative_zero_exponent_literal_preserves_sign_1008() -> Result<()> {
     }
     Ok(())
 }
+
+/// #1030 (`#1008` follow-up): `numeric_display_string`/`to_json_yq` gained
+/// yq-mode-only verbatim echo -- confirm jq mode's own `tostring`/`@json`/
+/// string interpolation keep `format_number_jq_compat`'s reformatting
+/// unchanged (uppercase `E`, forced sign), not accidentally picking up
+/// yq's verbatim-echo branch.
+#[test]
+fn test_jq_tostring_and_json_and_interpolation_unaffected_by_yq_verbatim_echo_1030() -> Result<()> {
+    for (filter, want) in [
+        (".a | tostring", r#""1E+2""#),
+        (".a | @json", r#""1E+2""#),
+        (r#""\(.a)""#, r#""1E+2""#),
+    ] {
+        let (out, code) = run_jq_stdin(filter, r#"{"a": 1e2}"#, &[])?;
+        assert_eq!(code, 0, "for {filter:?}: {out:?}");
+        assert_eq!(out.trim(), want, "for {filter:?}");
+    }
+    Ok(())
+}

@@ -655,7 +655,7 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             eval_string_interpolation::<W, S>(parts, value, optional)
         }
 
-        Expr::Format(format_type) => eval_format::<W>(format_type, value, optional),
+        Expr::Format(format_type) => eval_format::<W, S>(format_type, value, optional),
 
         // Phase 8: Variables and Advanced Control Flow
         Expr::As { expr, var, body } => eval_as::<W, S>(expr, var, body, value, optional),
@@ -2643,9 +2643,9 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Builtin::WithEntries(f) => builtin_with_entries::<W, S>(f, value, optional),
 
         // Phase 6: Type Conversions
-        Builtin::ToString => builtin_tostring::<W>(value, optional),
+        Builtin::ToString => builtin_tostring::<W, S>(value, optional),
         Builtin::ToNumber => builtin_tonumber::<W>(value, optional),
-        Builtin::ToJson => builtin_tojson::<W>(value, optional),
+        Builtin::ToJson => builtin_tojson::<W, S>(value, optional),
         Builtin::FromJson => builtin_fromjson::<W>(value, optional),
 
         // Phase 6: Additional String Functions
@@ -4105,7 +4105,11 @@ fn yq_join_element_part(elem: OwnedValue) -> String {
     match elem {
         OwnedValue::String(s) => s,
         OwnedValue::Null | OwnedValue::Array(_) | OwnedValue::Object(_) => String::new(),
-        other => other.to_json(),
+        // `to_json_yq()`, not `to_json()` (#1030 code review): this function
+        // is only ever reached from `builtin_join`'s `S::TAG == EvalTag::Yq`
+        // branch, so a scientific-notation literal here must echo verbatim
+        // too, not get jq-reformatted.
+        other => other.to_json_yq(),
     }
 }
 
@@ -4122,7 +4126,9 @@ fn yq_join_separator(sep: OwnedValue) -> String {
     match sep {
         OwnedValue::String(s) => s,
         OwnedValue::Array(_) | OwnedValue::Object(_) => String::new(),
-        other => other.to_json(),
+        // `to_json_yq()` (#1030 code review): same reasoning as
+        // `yq_join_element_part` above -- this function is yq-only.
+        other => other.to_json_yq(),
     }
 }
 
@@ -5015,19 +5021,19 @@ fn eval_string_interpolation<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             StringPart::Expr(expr) => {
                 let val = eval_single::<W, S>(expr, value.clone(), optional).materialize_cursor();
                 let s = match val {
-                    QueryResult::One(v) => owned_to_string(&to_owned(&v)),
+                    QueryResult::One(v) => owned_to_string::<S>(&to_owned(&v)),
                     QueryResult::OneCursor(_) => unreachable!(),
-                    QueryResult::Owned(v) => owned_to_string(&v),
+                    QueryResult::Owned(v) => owned_to_string::<S>(&v),
                     QueryResult::Many(vs) => {
                         if let Some(v) = vs.first() {
-                            owned_to_string(&to_owned(v))
+                            owned_to_string::<S>(&to_owned(v))
                         } else {
                             String::new()
                         }
                     }
                     QueryResult::ManyOwned(vs) => {
                         if let Some(v) = vs.first() {
-                            owned_to_string(v)
+                            owned_to_string::<S>(v)
                         } else {
                             String::new()
                         }
@@ -5067,26 +5073,56 @@ fn eval_string_interpolation<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// jq-error-message-preview text (e.g. `1E+400`) still isn't the Rust-style
 /// `"inf"`/`"-inf"` these non-JSON text formats want, so the explicit check
 /// stays regardless.
-pub(crate) fn numeric_display_string(value: &OwnedValue) -> String {
-    if let OwnedValue::NumberLiteral(NumberRepr::Float(f), _) = value {
-        if f.is_nan() || f.is_infinite() {
-            return f.to_string();
+pub(crate) fn numeric_display_string<S: EvalSemantics>(value: &OwnedValue) -> String {
+    if let OwnedValue::NumberLiteral(repr, literal) = value {
+        if let NumberRepr::Float(f) = repr {
+            if f.is_nan() || f.is_infinite() {
+                return f.to_string();
+            }
+        }
+        // yq preserves a document-sourced literal's exact source spelling
+        // regardless of magnitude or query shape (#1008, confirmed
+        // empirically against the pinned oracle) -- `number_str()` itself
+        // stays mode-blind (jq's own `tostring`/`to_json` genuinely want
+        // `format_number_jq_compat`'s reformatting), so the fork happens
+        // here instead (#1030).
+        if S::TAG == EvalTag::Yq {
+            return crate::jq::stream::real_output_finite_literal(literal.as_bytes());
         }
     }
     value.number_str().expect("numeric variant").into_owned()
 }
 
+/// `to_json_yq()` in yq mode, `to_json()` in jq mode (#1030) -- the single
+/// definition every "stringify a whole value as JSON" call site routes
+/// through, instead of each one re-deriving the fork (#106's "duplicated
+/// predicates diverge silently" lesson, which this exact fork already
+/// tripped once: an earlier draft of this fix hand-copied this branch at
+/// four separate call sites before being consolidated here).
+pub(crate) fn owned_value_to_json<S: EvalSemantics>(value: &OwnedValue) -> String {
+    if S::TAG == EvalTag::Yq {
+        value.to_json_yq()
+    } else {
+        value.to_json()
+    }
+}
+
 /// Convert an owned value to a string representation (for interpolation).
-fn owned_to_string(value: &OwnedValue) -> String {
+fn owned_to_string<S: EvalSemantics>(value: &OwnedValue) -> String {
     match value {
         OwnedValue::Null => "null".to_string(),
         OwnedValue::Bool(true) => "true".to_string(),
         OwnedValue::Bool(false) => "false".to_string(),
         OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..) => {
-            numeric_display_string(value)
+            numeric_display_string::<S>(value)
         }
         OwnedValue::String(s) => s.clone(), // Don't quote strings in interpolation
-        OwnedValue::Array(_) | OwnedValue::Object(_) => value.to_json(),
+        // A container's own nested NumberLiteral needs the same
+        // verbatim-echo treatment as the scalar arm above, not jq's
+        // `to_json()` reformatting -- confirmed live: real yq's
+        // `@csv`/`@tsv`/string interpolation on an array containing a
+        // scientific-notation element all preserve it.
+        OwnedValue::Array(_) | OwnedValue::Object(_) => owned_value_to_json::<S>(value),
     }
 }
 
@@ -5097,22 +5133,22 @@ fn owned_to_string(value: &OwnedValue) -> String {
 /// a `JsonIndex` purely to re-enter this evaluator (#124). Formats are pure
 /// functions of the value -- they touch neither the cursor nor the index -- so
 /// this is the whole of the work `Expr::Format` needs.
-pub(crate) fn format_owned(
+pub(crate) fn format_owned<S: EvalSemantics>(
     format_type: &FormatType,
     owned: &OwnedValue,
     optional: bool,
 ) -> Result<String, EvalError> {
     match format_type {
-        FormatType::Text => format_text(owned),
-        FormatType::Json => format_json(owned),
-        FormatType::Uri => format_uri(owned, optional),
-        FormatType::Csv => format_csv(owned, optional),
-        FormatType::Tsv => format_tsv(owned, optional),
-        FormatType::Dsv(delimiter) => format_dsv(owned, delimiter, optional),
+        FormatType::Text => format_text::<S>(owned),
+        FormatType::Json => format_json::<S>(owned),
+        FormatType::Uri => format_uri::<S>(owned, optional),
+        FormatType::Csv => format_csv::<S>(owned, optional),
+        FormatType::Tsv => format_tsv::<S>(owned, optional),
+        FormatType::Dsv(delimiter) => format_dsv::<S>(owned, delimiter, optional),
         FormatType::Base64 => format_base64(owned, optional),
         FormatType::Base64d => format_base64d(owned, optional),
-        FormatType::Html => format_html(owned, optional),
-        FormatType::Sh => format_sh(owned, optional),
+        FormatType::Html => format_html::<S>(owned, optional),
+        FormatType::Sh => format_sh::<S>(owned, optional),
         FormatType::Urid => format_urid(owned, optional),
         FormatType::Yaml => format_yaml(owned),
         FormatType::Props => format_props(owned),
@@ -5120,34 +5156,34 @@ pub(crate) fn format_owned(
 }
 
 /// Evaluate a format string: `@json`, `@uri`, etc.
-fn eval_format<'a, W: Clone + AsRef<[u64]>>(
+fn eval_format<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     format_type: &FormatType,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    match format_owned(format_type, &to_owned(&value), optional) {
+    match format_owned::<S>(format_type, &to_owned(&value), optional) {
         Ok(s) => QueryResult::Owned(OwnedValue::String(s)),
         Err(e) => e.into(),
     }
 }
 
 /// @text - Convert to string (same as tostring)
-fn format_text(value: &OwnedValue) -> Result<String, EvalError> {
-    Ok(owned_to_string(value))
+fn format_text<S: EvalSemantics>(value: &OwnedValue) -> Result<String, EvalError> {
+    Ok(owned_to_string::<S>(value))
 }
 
 /// @json - Format as JSON
-fn format_json(value: &OwnedValue) -> Result<String, EvalError> {
-    Ok(value.to_json())
+fn format_json<S: EvalSemantics>(value: &OwnedValue) -> Result<String, EvalError> {
+    Ok(owned_value_to_json::<S>(value))
 }
 
 /// @uri - URI/percent encode
-fn format_uri(value: &OwnedValue, _optional: bool) -> Result<String, EvalError> {
+fn format_uri<S: EvalSemantics>(value: &OwnedValue, _optional: bool) -> Result<String, EvalError> {
     // jq converts non-strings to strings first (e.g., 42 | @uri => "42")
     let s = match value {
         OwnedValue::String(s) => s.clone(),
         OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..) => {
-            numeric_display_string(value)
+            numeric_display_string::<S>(value)
         }
         OwnedValue::Bool(b) => {
             if *b {
@@ -5245,7 +5281,7 @@ fn quote_csv_field(s: &str) -> String {
 /// to verify against (confirmed live: `@dsv(...)` is a syntax error in jq
 /// 1.7.1) — its use of this same rule is succinctly's own policy choice,
 /// following its documented CSV-compatibility (`@dsv(",")` == `@csv`).
-fn format_csv_row_element(
+fn format_csv_row_element<S: EvalSemantics>(
     v: &OwnedValue,
     quote_string: impl Fn(&str) -> String,
 ) -> Result<String, EvalError> {
@@ -5253,17 +5289,17 @@ fn format_csv_row_element(
         OwnedValue::String(s) => Ok(quote_string(s)),
         OwnedValue::Null => Ok(String::new()),
         OwnedValue::Array(_) | OwnedValue::Object(_) => Err(EvalError::not_valid_in_csv_row(v)),
-        other => Ok(owned_to_string(other)),
+        other => Ok(owned_to_string::<S>(other)),
     }
 }
 
 /// @csv - CSV format (for arrays)
-fn format_csv(value: &OwnedValue, optional: bool) -> Result<String, EvalError> {
+fn format_csv<S: EvalSemantics>(value: &OwnedValue, optional: bool) -> Result<String, EvalError> {
     match value {
         OwnedValue::Array(arr) => {
             let parts = arr
                 .iter()
-                .map(|v| format_csv_row_element(v, quote_csv_field))
+                .map(|v| format_csv_row_element::<S>(v, quote_csv_field))
                 .collect::<Result<Vec<String>, EvalError>>()?;
             Ok(parts.join(","))
         }
@@ -5275,13 +5311,13 @@ fn format_csv(value: &OwnedValue, optional: bool) -> Result<String, EvalError> {
 }
 
 /// @tsv - TSV format (for arrays)
-fn format_tsv(value: &OwnedValue, optional: bool) -> Result<String, EvalError> {
+fn format_tsv<S: EvalSemantics>(value: &OwnedValue, optional: bool) -> Result<String, EvalError> {
     match value {
         OwnedValue::Array(arr) => {
             let parts = arr
                 .iter()
                 .map(|v| {
-                    format_csv_row_element(v, |s| {
+                    format_csv_row_element::<S>(v, |s| {
                         s.replace('\\', "\\\\")
                             .replace('\t', "\\t")
                             .replace('\n', "\\n")
@@ -5299,12 +5335,16 @@ fn format_tsv(value: &OwnedValue, optional: bool) -> Result<String, EvalError> {
 }
 
 /// @dsv(delimiter) - Generic DSV format with custom delimiter (for arrays)
-fn format_dsv(value: &OwnedValue, delimiter: &str, optional: bool) -> Result<String, EvalError> {
+fn format_dsv<S: EvalSemantics>(
+    value: &OwnedValue,
+    delimiter: &str,
+    optional: bool,
+) -> Result<String, EvalError> {
     match value {
         OwnedValue::Array(arr) => {
             let parts = arr
                 .iter()
-                .map(|v| format_csv_row_element(v, quote_csv_field))
+                .map(|v| format_csv_row_element::<S>(v, quote_csv_field))
                 .collect::<Result<Vec<String>, EvalError>>()?;
             Ok(parts.join(delimiter))
         }
@@ -5405,12 +5445,12 @@ fn format_base64d(value: &OwnedValue, optional: bool) -> Result<String, EvalErro
 }
 
 /// @html - HTML entity escape
-fn format_html(value: &OwnedValue, _optional: bool) -> Result<String, EvalError> {
+fn format_html<S: EvalSemantics>(value: &OwnedValue, _optional: bool) -> Result<String, EvalError> {
     // jq converts non-strings to strings first (e.g., 42 | @html => "42")
     let s = match value {
         OwnedValue::String(s) => s.clone(),
         OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..) => {
-            numeric_display_string(value)
+            numeric_display_string::<S>(value)
         }
         OwnedValue::Bool(b) => {
             if *b {
@@ -5450,7 +5490,7 @@ fn format_html(value: &OwnedValue, _optional: bool) -> Result<String, EvalError>
 }
 
 /// Shell-quote a single value for @sh
-fn shell_quote_value(value: &OwnedValue) -> Result<String, EvalError> {
+fn shell_quote_value<S: EvalSemantics>(value: &OwnedValue) -> Result<String, EvalError> {
     match value {
         // jq always quotes strings in @sh array output
         OwnedValue::String(s) => Ok(if s.contains('\'') {
@@ -5461,7 +5501,7 @@ fn shell_quote_value(value: &OwnedValue) -> Result<String, EvalError> {
         }),
         // Numbers, bools, null are NOT quoted in jq
         OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..) => {
-            Ok(numeric_display_string(value))
+            Ok(numeric_display_string::<S>(value))
         }
         OwnedValue::Bool(b) => Ok(if *b {
             "true".to_string()
@@ -5479,7 +5519,7 @@ fn shell_quote_value(value: &OwnedValue) -> Result<String, EvalError> {
 }
 
 /// @sh - Shell quote
-fn format_sh(value: &OwnedValue, _optional: bool) -> Result<String, EvalError> {
+fn format_sh<S: EvalSemantics>(value: &OwnedValue, _optional: bool) -> Result<String, EvalError> {
     match value {
         OwnedValue::String(s) => {
             // Use single quotes and escape single quotes
@@ -5494,13 +5534,13 @@ fn format_sh(value: &OwnedValue, _optional: bool) -> Result<String, EvalError> {
         OwnedValue::Array(arr) => {
             let parts: Vec<String> = arr
                 .iter()
-                .map(shell_quote_value)
+                .map(shell_quote_value::<S>)
                 .collect::<Result<_, _>>()?;
             Ok(parts.join(" "))
         }
         // Numbers, bools, null are converted to strings
         OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..) => {
-            Ok(numeric_display_string(value))
+            Ok(numeric_display_string::<S>(value))
         }
         OwnedValue::Bool(b) => Ok(if *b {
             "true".to_string()
@@ -5768,7 +5808,7 @@ fn yaml_quote_string(s: &str) -> String {
 // =============================================================================
 
 /// Builtin: tostring - convert any value to string
-fn builtin_tostring<W: Clone + AsRef<[u64]>>(
+fn builtin_tostring<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'_, W>,
     _optional: bool,
 ) -> QueryResult<'_, W> {
@@ -5780,8 +5820,8 @@ fn builtin_tostring<W: Clone + AsRef<[u64]>>(
         OwnedValue::Bool(false) => "false".to_string(),
         OwnedValue::Int(n) => format!("{n}"),
         OwnedValue::Float(f) => format!("{f}"),
-        OwnedValue::NumberLiteral(..) => numeric_display_string(&owned),
-        OwnedValue::Array(_) | OwnedValue::Object(_) => owned.to_json(),
+        OwnedValue::NumberLiteral(..) => numeric_display_string::<S>(&owned),
+        OwnedValue::Array(_) | OwnedValue::Object(_) => owned_value_to_json::<S>(&owned),
     };
     QueryResult::Owned(OwnedValue::String(s))
 }
@@ -5965,12 +6005,12 @@ fn builtin_skip<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 }
 
 /// Builtin: tojson - convert any value to JSON string
-fn builtin_tojson<W: Clone + AsRef<[u64]>>(
+fn builtin_tojson<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'_, W>,
     _optional: bool,
 ) -> QueryResult<'_, W> {
     let owned = to_owned(&value);
-    let json_string = owned.to_json();
+    let json_string = owned_value_to_json::<S>(&owned);
     QueryResult::Owned(OwnedValue::String(json_string))
 }
 
@@ -6798,7 +6838,7 @@ fn build_upper_index<'a, W, S: EvalSemantics>(
             Err(e) => return e.into(),
         };
         for k in keys {
-            obj.insert(owned_to_string(&k), row.clone());
+            obj.insert(owned_to_string::<S>(&k), row.clone());
         }
     }
     QueryResult::Owned(OwnedValue::Object(obj))

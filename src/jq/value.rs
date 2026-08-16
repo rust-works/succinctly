@@ -738,10 +738,29 @@ impl OwnedValue {
     /// entirely: no adversarial document is involved, only enough loop
     /// iterations to grow the accumulator past the limit.
     pub fn to_json(&self) -> String {
-        self.to_json_at_depth(0)
+        self.to_json_at_depth(0, format_number_jq_compat)
     }
 
-    fn to_json_at_depth(&self, depth: usize) -> String {
+    /// The yq-mode sibling of [`to_json`](Self::to_json) (#1030): identical
+    /// except a finite `NumberLiteral` echoes its document-sourced spelling
+    /// verbatim rather than being reformatted per jq's own rules -- real yq
+    /// preserves scientific-notation literals byte-for-byte regardless of
+    /// magnitude or query shape (#1008, confirmed empirically against the
+    /// pinned oracle). Used by `@json`'s yq-mode branch and by string
+    /// interpolation's container arm (`owned_to_string`), both of which need
+    /// this same literal-preserving JSON text, not [`to_json`](Self::to_json)'s
+    /// jq-normalized one.
+    pub(crate) fn to_json_yq(&self) -> String {
+        self.to_json_at_depth(0, crate::jq::stream::real_output_finite_literal)
+    }
+
+    /// `finite_literal` formats a `NumberLiteral`'s source text -- jq's
+    /// [`format_number_jq_compat`] for [`to_json`](Self::to_json), or a
+    /// verbatim echo for [`to_json_yq`](Self::to_json_yq) -- mirroring the
+    /// same fork [`stream::stream_owned_value_json_with`](crate::jq::stream)
+    /// already threads through for the M2 streaming path (#1008), so this
+    /// doesn't grow a third hand-copied "echo verbatim for yq" branch.
+    fn to_json_at_depth(&self, depth: usize, finite_literal: fn(&[u8]) -> String) -> String {
         assert_value_tree_depth(depth);
         match self {
             Self::Null => "null".into(),
@@ -758,11 +777,13 @@ impl OwnedValue {
             Self::NumberLiteral(NumberRepr::Float(f), _) if f.is_nan() || f.is_infinite() => {
                 "null".into() // JSON doesn't support NaN or Infinity
             }
-            Self::NumberLiteral(_, literal) => format_number_jq_compat(literal.as_bytes()),
+            Self::NumberLiteral(_, literal) => finite_literal(literal.as_bytes()),
             Self::String(s) => format!("\"{}\"", escape_json_body(write_json_body_jq, s)),
             Self::Array(arr) => {
-                let elements: Vec<String> =
-                    arr.iter().map(|v| v.to_json_at_depth(depth + 1)).collect();
+                let elements: Vec<String> = arr
+                    .iter()
+                    .map(|v| v.to_json_at_depth(depth + 1, finite_literal))
+                    .collect();
                 format!("[{}]", elements.join(","))
             }
             Self::Object(obj) => {
@@ -772,7 +793,7 @@ impl OwnedValue {
                         format!(
                             "\"{}\":{}",
                             escape_json_body(write_json_body_jq, k),
-                            v.to_json_at_depth(depth + 1)
+                            v.to_json_at_depth(depth + 1, finite_literal)
                         )
                     })
                     .collect();
@@ -880,7 +901,7 @@ impl OwnedValue {
                     .collect();
                 format!("{{{}}}", entries.join(","))
             }
-            other => other.to_json_at_depth(depth),
+            other => other.to_json_at_depth(depth, format_number_jq_compat),
         }
     }
 }

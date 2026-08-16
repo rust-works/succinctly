@@ -27,8 +27,8 @@ use super::document::{
 use super::eval::{
     compare_values, eval as full_eval, format_owned, index_one_owned as index_owned_by_key,
     needs_path_context, numeric_display_string, numeric_key_to_index, owned_bound_to_i64,
-    slice_owned_value, tonumber_from_str, Control, EvalError, EvalSemantics, EvalTag, JqSemantics,
-    QueryResult, YqSemantics,
+    owned_value_to_json, slice_owned_value, tonumber_from_str, Control, EvalError, EvalSemantics,
+    EvalTag, JqSemantics, QueryResult, YqSemantics,
 };
 use super::expr::{Builtin, CompareOp, Expr, FormatType, Literal};
 use super::slice::{slice_str, SliceBounds};
@@ -864,12 +864,12 @@ fn standard_json_to_owned_at_depth<W: Clone + AsRef<[u64]>>(
 }
 
 /// Apply a format to an owned value and wrap it as a `GenericResult`.
-fn format_result<V: DocumentValue>(
+fn format_result<S: EvalSemantics, V: DocumentValue>(
     format_type: &FormatType,
     owned: &OwnedValue,
     optional: bool,
 ) -> GenericResult<V> {
-    match format_owned(format_type, owned, optional) {
+    match format_owned::<S>(format_type, owned, optional) {
         Ok(s) => GenericResult::Owned(OwnedValue::String(s)),
         Err(e) => GenericResult::Error(e),
     }
@@ -892,7 +892,7 @@ fn eval_on_owned<S: EvalSemantics, V: DocumentValue>(
     // `OwnedValue::Float` or `NumberLiteral`, with no dependence on having
     // passed through a JSON round-trip first.
     if let Expr::Format(format_type) = expr {
-        return format_result(format_type, &owned, optional);
+        return format_result::<S, _>(format_type, &owned, optional);
     }
 
     let json_str = owned.to_json_for_reindex();
@@ -2533,7 +2533,7 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
         // than falling through to the catch-all, which would serialize the
         // value to JSON and rebuild a `JsonIndex` for every one (#124).
         Expr::Format(format_type) => {
-            format_result(format_type, &to_owned_with_cursor(&value, cursor), optional)
+            format_result::<S, _>(format_type, &to_owned_with_cursor(&value, cursor), optional)
         }
 
         Expr::Builtin(builtin) => eval_builtin::<S, _>(builtin, value, optional, cursor),
@@ -3699,10 +3699,10 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                 OwnedValue::Null => "null".to_string(),
                 OwnedValue::Bool(b) => b.to_string(),
                 OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..) => {
-                    numeric_display_string(&owned)
+                    numeric_display_string::<S>(&owned)
                 }
                 OwnedValue::String(s) => s.clone(),
-                OwnedValue::Array(_) | OwnedValue::Object(_) => owned.to_json(),
+                OwnedValue::Array(_) | OwnedValue::Object(_) => owned_value_to_json::<S>(&owned),
             };
             GenericResult::Owned(OwnedValue::String(s))
         }
