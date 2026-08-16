@@ -584,7 +584,6 @@ fn stream_owned_value_yaml<W: core::fmt::Write>(
 
 /// Panics past [`MAX_VALUE_TREE_DEPTH`](super::value::MAX_VALUE_TREE_DEPTH)
 /// levels of nesting (#1021, following #1005's precedent).
-#[allow(clippy::too_many_arguments)] // STYLE-0004: mirrors stream_owned_value_json_with's own suppression above.
 fn stream_owned_value_yaml_at_depth<W: core::fmt::Write>(
     value: &OwnedValue,
     out: &mut W,
