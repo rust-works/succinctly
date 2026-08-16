@@ -414,14 +414,29 @@ fn gather_input_sources(
 /// local to `yq_runner.rs`'s own JSON-input call sites rather than
 /// touching that shared function.
 fn canonicalize_json_numbers(value: OwnedValue) -> OwnedValue {
+    canonicalize_json_numbers_at_depth(value, 0)
+}
+
+/// Panics past `succinctly::jq::MAX_VALUE_TREE_DEPTH` levels of nesting
+/// (#1017). Currently only reachable at a depth this deep via `value`
+/// already capped there by `generic_to_owned`'s own guard (#998, a
+/// tighter 256), since this function's only caller (`parse_input`'s JSON
+/// arm) feeds it that function's direct output -- defense-in-depth
+/// against that call chain changing, not a currently-live independent
+/// crash path.
+fn canonicalize_json_numbers_at_depth(value: OwnedValue, depth: usize) -> OwnedValue {
+    assert_value_tree_depth(depth);
     match value {
-        OwnedValue::Array(items) => {
-            OwnedValue::Array(items.into_iter().map(canonicalize_json_numbers).collect())
-        }
+        OwnedValue::Array(items) => OwnedValue::Array(
+            items
+                .into_iter()
+                .map(|v| canonicalize_json_numbers_at_depth(v, depth + 1))
+                .collect(),
+        ),
         OwnedValue::Object(fields) => OwnedValue::Object(
             fields
                 .into_iter()
-                .map(|(k, v)| (k, canonicalize_json_numbers(v)))
+                .map(|(k, v)| (k, canonicalize_json_numbers_at_depth(v, depth + 1)))
                 .collect(),
         ),
         other => other.into_plain_number(),
@@ -1205,19 +1220,33 @@ fn evaluate_yaml_cursor<W: AsRef<[u64]> + Clone>(
 /// keeping its comments and tree shape untouched — see the `strip_style`
 /// call in [`evaluate_yaml_cursor`].
 fn strip_presentation_style(tree: &CommentTree) -> CommentTree {
+    strip_presentation_style_at_depth(tree, 0)
+}
+
+/// Panics past `succinctly::jq::MAX_VALUE_TREE_DEPTH` levels of nesting
+/// (#1017) -- unlike its sibling [`reconcile_presentation`], which #1015
+/// already guards, this walker over the same `CommentTree` shape had no
+/// guard at all. Currently only fed an already-reconciled/bounded tree,
+/// so this is defense-in-depth against that call chain changing, not a
+/// currently-live independent crash path.
+fn strip_presentation_style_at_depth(tree: &CommentTree, depth: usize) -> CommentTree {
+    assert_value_tree_depth(depth);
     match tree {
         CommentTree::Leaf(c, _) => CommentTree::Leaf(c.clone(), ""),
         CommentTree::Array(c, _, items) => CommentTree::Array(
             c.clone(),
             "",
-            items.iter().map(strip_presentation_style).collect(),
+            items
+                .iter()
+                .map(|v| strip_presentation_style_at_depth(v, depth + 1))
+                .collect(),
         ),
         CommentTree::Object(c, _, fields, key_comments) => CommentTree::Object(
             c.clone(),
             "",
             fields
                 .iter()
-                .map(|(k, v)| (k.clone(), strip_presentation_style(v)))
+                .map(|(k, v)| (k.clone(), strip_presentation_style_at_depth(v, depth + 1)))
                 .collect(),
             key_comments.clone(),
         ),
@@ -1469,6 +1498,25 @@ fn emit_yaml_value(
     indent: &str,
     in_flow: bool,
 ) -> String {
+    emit_yaml_value_at_depth(value, comments, config, indent, in_flow, 0)
+}
+
+/// Panics past `succinctly::jq::MAX_VALUE_TREE_DEPTH` levels of nesting
+/// (#1017) -- see [`reconcile_presentation_at_depth`], the sibling this
+/// mirrors: both are the default YAML-target output emitters for a
+/// filter's evaluated result (JSON-target has `output::format_json_impl`,
+/// guarded by #1015; this is YAML-target's own copy), reachable on a
+/// value constructed via `reduce`/`foreach`/etc. with no adversarial
+/// document on either side.
+fn emit_yaml_value_at_depth(
+    value: &OwnedValue,
+    comments: &CommentTree,
+    config: &OutputConfig,
+    indent: &str,
+    in_flow: bool,
+    depth: usize,
+) -> String {
+    assert_value_tree_depth(depth);
     match value {
         OwnedValue::Null => "null".to_string(),
         OwnedValue::Bool(b) => b.to_string(),
@@ -1508,7 +1556,16 @@ fn emit_yaml_value(
                 let items: Vec<_> = arr
                     .iter()
                     .enumerate()
-                    .map(|(i, v)| emit_yaml_value(v, comments.at_index(i), config, indent, true))
+                    .map(|(i, v)| {
+                        emit_yaml_value_at_depth(
+                            v,
+                            comments.at_index(i),
+                            config,
+                            indent,
+                            true,
+                            depth + 1,
+                        )
+                    })
                     .collect();
                 format!("[{}]", items.join(", "))
             } else {
@@ -1545,8 +1602,14 @@ fn emit_yaml_value(
                             // sibling gets for free from its per-field/
                             // per-element loop only indenting 2nd+ items.
                             let compact_indent = format!("{indent}  ");
-                            let rendered =
-                                emit_yaml_value(v, elem_comments, config, &compact_indent, false);
+                            let rendered = emit_yaml_value_at_depth(
+                                v,
+                                elem_comments,
+                                config,
+                                &compact_indent,
+                                false,
+                                depth + 1,
+                            );
                             // The element's own comment goes on its own
                             // line rather than glued onto its last
                             // grandchild's line (#793).
@@ -1561,8 +1624,14 @@ fn emit_yaml_value(
                             format!("{indent}- {first_line}")
                         } else {
                             let val_indent = format!("{indent}{}", config.indent_str);
-                            let item =
-                                emit_yaml_value(v, elem_comments, config, &val_indent, false);
+                            let item = emit_yaml_value_at_depth(
+                                v,
+                                elem_comments,
+                                config,
+                                &val_indent,
+                                false,
+                                depth + 1,
+                            );
                             let comment_suffix = trailing_comment_suffix(elem_comments);
                             format!("{indent}- {item}{comment_suffix}")
                         }
@@ -1580,7 +1649,14 @@ fn emit_yaml_value(
                     .iter()
                     .map(|(k, v)| {
                         let key = yaml_quote_key(k);
-                        let val = emit_yaml_value(v, comments.field(k), config, indent, true);
+                        let val = emit_yaml_value_at_depth(
+                            v,
+                            comments.field(k),
+                            config,
+                            indent,
+                            true,
+                            depth + 1,
+                        );
                         format!("{key}: {val}")
                     })
                     .collect();
@@ -1621,8 +1697,14 @@ fn emit_yaml_value(
                             // The value's own comment goes on its own line
                             // rather than glued onto its last grandchild's
                             // line (#793).
-                            let val =
-                                emit_yaml_value(v, field_comments, config, &val_indent, false);
+                            let val = emit_yaml_value_at_depth(
+                                v,
+                                field_comments,
+                                config,
+                                &val_indent,
+                                false,
+                                depth + 1,
+                            );
                             let val =
                                 append_own_comment_line(val, field_comments.own(), &val_indent);
                             format!("{indent}{key}:{key_comment_suffix}\n{val}")
@@ -1632,8 +1714,14 @@ fn emit_yaml_value(
                             // no value token, matching real yq (#765).
                             format!("{indent}{key}: {kc}")
                         } else {
-                            let val =
-                                emit_yaml_value(v, field_comments, config, &val_indent, false);
+                            let val = emit_yaml_value_at_depth(
+                                v,
+                                field_comments,
+                                config,
+                                &val_indent,
+                                false,
+                                depth + 1,
+                            );
                             // The value's own comment takes priority; fall
                             // back to the key's own comment when the value
                             // has none - covers an explicit key's trailing
@@ -1974,6 +2062,16 @@ fn parse_json_value(s: &str) -> Result<OwnedValue> {
 /// Convert a `serde_json::Value` into an `OwnedValue`
 /// (mirrors `jq_runner::serde_to_owned`).
 fn serde_json_to_owned(value: &serde_json::Value) -> OwnedValue {
+    serde_json_to_owned_at_depth(value, 0)
+}
+
+/// Panics past `succinctly::jq::MAX_VALUE_TREE_DEPTH` levels of nesting
+/// (#1017). `serde_json::from_str`'s own `Deserializer` already enforces
+/// an independent ~128-deep parse-time limit before `value` can exist at
+/// all, so this is defense-in-depth against that upstream limit changing,
+/// not a currently-live independent crash path.
+fn serde_json_to_owned_at_depth(value: &serde_json::Value, depth: usize) -> OwnedValue {
+    assert_value_tree_depth(depth);
     match value {
         serde_json::Value::Null => OwnedValue::Null,
         serde_json::Value::Bool(b) => OwnedValue::Bool(*b),
@@ -1987,12 +2085,14 @@ fn serde_json_to_owned(value: &serde_json::Value) -> OwnedValue {
             }
         }
         serde_json::Value::String(s) => OwnedValue::String(s.clone()),
-        serde_json::Value::Array(arr) => {
-            OwnedValue::Array(arr.iter().map(serde_json_to_owned).collect())
-        }
+        serde_json::Value::Array(arr) => OwnedValue::Array(
+            arr.iter()
+                .map(|v| serde_json_to_owned_at_depth(v, depth + 1))
+                .collect(),
+        ),
         serde_json::Value::Object(obj) => OwnedValue::Object(
             obj.iter()
-                .map(|(k, v)| (k.clone(), serde_json_to_owned(v)))
+                .map(|(k, v)| (k.clone(), serde_json_to_owned_at_depth(v, depth + 1)))
                 .collect(),
         ),
     }

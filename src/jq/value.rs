@@ -59,16 +59,28 @@ use super::expr::Literal;
 /// smaller default stack than the dev machine this was measured on.
 pub const MAX_VALUE_TREE_DEPTH: usize = 384;
 
+/// Panics past `max` levels of nesting.
+///
+/// The one place every depth-guarded recursive function in the binary
+/// raises, regardless of which ceiling it's checked against (#1018) --
+/// before this, [`assert_value_tree_depth`] and
+/// [`eval_generic::assert_nesting_depth`](super::eval_generic::assert_nesting_depth)
+/// each carried their own byte-identical `assert!` body, hardcoding a
+/// different constant -- the same "duplicated predicates diverge
+/// silently" shape #998 had already fixed once for three earlier copies
+/// of this exact check. Both are now thin wrappers around this one,
+/// parameterized by `max` instead of re-deriving the assertion.
+pub fn assert_depth(depth: usize, max: usize) {
+    assert!(depth < max, "nesting depth exceeds limit of {max}");
+}
+
 /// Panics past [`MAX_VALUE_TREE_DEPTH`] levels of nesting (#1005).
 ///
 /// See that constant's own doc comment for why this exists as a second,
 /// independently-tuned ceiling alongside
 /// [`eval_generic::assert_nesting_depth`](super::eval_generic::assert_nesting_depth).
 pub fn assert_value_tree_depth(depth: usize) {
-    assert!(
-        depth < MAX_VALUE_TREE_DEPTH,
-        "nesting depth exceeds limit of {MAX_VALUE_TREE_DEPTH}"
-    );
+    assert_depth(depth, MAX_VALUE_TREE_DEPTH);
 }
 
 /// The parsed value backing a [`OwnedValue::NumberLiteral`], kept separate

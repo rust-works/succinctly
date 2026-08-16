@@ -84,16 +84,15 @@ pub const MAX_NESTING_DEPTH: usize = 256;
 
 /// Panics past [`MAX_NESTING_DEPTH`] levels of nesting (#998).
 ///
-/// The one place every guarded recursive function in the binary raises, so
-/// they can't drift on wording or the comparison itself the way three
-/// independently hand-copied `assert!`s already had before this extraction
-/// (review finding: `to_owned`/`to_owned_cursor`/`to_owned_with_comments`
-/// each carried a byte-identical copy).
+/// A thin wrapper around
+/// [`value::assert_depth`](super::value::assert_depth) (#1018) -- the
+/// underlying `assert!` used to be hand-copied here (fixing a #998 review
+/// finding that `to_owned`/`to_owned_cursor`/`to_owned_with_comments` each
+/// carried their own byte-identical copy), and again independently in
+/// `value.rs` for [`value::MAX_VALUE_TREE_DEPTH`](super::value::MAX_VALUE_TREE_DEPTH)'s
+/// own guard -- the same duplication shape recurring one level up.
 pub fn assert_nesting_depth(depth: usize) {
-    assert!(
-        depth < MAX_NESTING_DEPTH,
-        "nesting depth exceeds limit of {MAX_NESTING_DEPTH}"
-    );
+    super::value::assert_depth(depth, MAX_NESTING_DEPTH);
 }
 
 /// Convert a DocumentValue to an OwnedValue.
@@ -813,10 +812,25 @@ fn into_lazy_items<V: DocumentValue>(
 }
 
 /// Convert a StandardJson value to an OwnedValue.
+///
+/// Panics past [`MAX_NESTING_DEPTH`] levels of nesting (#1017) -- a third,
+/// independent copy of the cursor-to-`OwnedValue` conversion `to_owned`/
+/// `to_owned_cursor` already guard in this same file (#998); reached from
+/// `eval_on_owned`/`eval_single`'s fallback arm on a value this module
+/// constructs internally (e.g. a `reduce`/`foreach` accumulator), the same
+/// gap #998's own guards on the other two copies were added to close.
 fn standard_json_to_owned<W: Clone + AsRef<[u64]>>(
     value: &crate::json::light::StandardJson<'_, W>,
 ) -> OwnedValue {
+    standard_json_to_owned_at_depth(value, 0)
+}
+
+fn standard_json_to_owned_at_depth<W: Clone + AsRef<[u64]>>(
+    value: &crate::json::light::StandardJson<'_, W>,
+    depth: usize,
+) -> OwnedValue {
     use crate::json::light::StandardJson;
+    assert_nesting_depth(depth);
     match value {
         StandardJson::Null => OwnedValue::Null,
         StandardJson::Bool(b) => OwnedValue::Bool(*b),
@@ -824,9 +838,11 @@ fn standard_json_to_owned<W: Clone + AsRef<[u64]>>(
         StandardJson::String(s) => {
             OwnedValue::String(s.as_str().map(|c| c.to_string()).unwrap_or_default())
         }
-        StandardJson::Array(elements) => {
-            OwnedValue::Array((*elements).map(|e| standard_json_to_owned(&e)).collect())
-        }
+        StandardJson::Array(elements) => OwnedValue::Array(
+            (*elements)
+                .map(|e| standard_json_to_owned_at_depth(&e, depth + 1))
+                .collect(),
+        ),
         StandardJson::Object(fields) => OwnedValue::Object(
             (*fields)
                 .filter_map(|field| {
@@ -834,7 +850,7 @@ fn standard_json_to_owned<W: Clone + AsRef<[u64]>>(
                         StandardJson::String(s) => s.as_str().ok()?.to_string(),
                         _ => return None,
                     };
-                    let value = standard_json_to_owned(&field.value());
+                    let value = standard_json_to_owned_at_depth(&field.value(), depth + 1);
                     Some((key, value))
                 })
                 .collect(),
