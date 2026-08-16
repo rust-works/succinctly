@@ -4085,6 +4085,62 @@ fn builtin_split<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     }
 }
 
+/// Stringifies each element for yq's `join`: strings pass through, nulls
+/// are skipped, everything else is rendered as JSON. Pre-#1003 behavior,
+/// kept only for `YqSemantics` — see `builtin_join`'s doc comment for why.
+fn join_parts<'a, W: Clone + AsRef<[u64]> + 'a>(
+    elements: impl Iterator<Item = StandardJson<'a, W>>,
+) -> Vec<String> {
+    let mut parts: Vec<String> = Vec::new();
+    for elem in elements {
+        match &elem {
+            StandardJson::String(s) => {
+                if let Ok(cow) = s.as_str() {
+                    parts.push(cow.into_owned());
+                }
+            }
+            StandardJson::Null => {
+                // Skip nulls in join
+            }
+            _ => {
+                // For non-strings, convert to string representation
+                parts.push(to_owned(&elem).to_json());
+            }
+        }
+    }
+    parts
+}
+
+/// One step of `join`'s jq-mode fold: combine the running accumulator with
+/// the next element, interleaving the separator. See `builtin_join`'s doc
+/// comment for the algorithm this implements.
+fn join_step<S: EvalSemantics>(
+    acc: Option<OwnedValue>,
+    elem: OwnedValue,
+    sep: &OwnedValue,
+) -> Result<Option<OwnedValue>, EvalError> {
+    let left = match acc {
+        None => OwnedValue::String(String::new()),
+        Some(a) => arith_add::<S>(a, sep.clone())?,
+    };
+    let right = match elem {
+        OwnedValue::Null => OwnedValue::String(String::new()),
+        // `to_json()`, not `owned_to_string()`: jq's `tostring` renders
+        // NaN as `null` (confirmed live, jq 1.7.1: `nan | tostring` ->
+        // `"null"`), and `to_json()` already matches that -- `owned_to_string`
+        // doesn't (renders Rust's `"NaN"` literally instead), a real
+        // regression an earlier draft of this fix introduced and #1036's
+        // review caught. `to_json()` also preserves `NumberLiteral` source
+        // fidelity the same way (`1.500 | tojson` -> `"1.500"`).
+        OwnedValue::Bool(_)
+        | OwnedValue::Int(_)
+        | OwnedValue::Float(_)
+        | OwnedValue::NumberLiteral(..) => OwnedValue::String(elem.to_json()),
+        other => other, // String passes through; Array/Object stay raw so `+` fails naturally below.
+    };
+    Ok(Some(arith_add::<S>(left, right)?))
+}
+
 /// Builtin: join(s) - join array elements with separator
 ///
 /// `.[] over an object iterates its values, so jq accepts an object here as
@@ -4116,6 +4172,18 @@ fn builtin_split<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// previous implementation *skipped* `null` elements entirely instead of
 /// treating them as an empty-string part, so `[1,null,2] | join(",")` gave
 /// `"1,2"` (missing separator) instead of jq's own `"1,,2"`.
+///
+/// **yq-mode note (#1036 review):** the algorithm above is jq-specific.
+/// Real yq's `join` (v4.53.3) diverges from it in several confirmed ways:
+/// a non-scalar element silently becomes an empty-string part instead of
+/// erroring, a non-string separator is implicitly stringified instead of
+/// erroring, a `null` separator renders as the literal text `"null"`
+/// instead of being a no-op, and an object input is rejected outright
+/// (`"cannot join with !!map"`). #1003 is scoped to jq's error wording
+/// only, so `YqSemantics` keeps the pre-#1003 `join_parts`-based behavior
+/// unchanged below (itself not yq-accurate on every point, but not newly
+/// regressed either) — real yq-compatible `join` semantics are their own
+/// follow-up (#1041).
 fn builtin_join<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     sep_expr: &Expr,
     value: StandardJson<'a, W>,
@@ -4127,44 +4195,48 @@ fn builtin_join<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Err(e) => return e.into(),
     };
 
+    if S::TAG == EvalTag::Yq {
+        let sep_str = match sep {
+            OwnedValue::String(s) => s,
+            _ => return QueryResult::Error(EvalError::type_error("string", "non-string")),
+        };
+        return match value {
+            StandardJson::Array(elements) => {
+                QueryResult::Owned(OwnedValue::String(join_parts(elements).join(&sep_str)))
+            }
+            StandardJson::Object(fields) => QueryResult::Owned(OwnedValue::String(
+                join_parts(fields.map(|f| f.value())).join(&sep_str),
+            )),
+            _ => QueryResult::Error(EvalError::cannot_iterate(&to_owned(&value))),
+        };
+    }
+
     // No `_ if optional` guard on the non-iterable case below, and no
-    // `optional`-gated arm on either `arith_add` failure further down:
-    // `optional` is never forced `true` reaching a nested `Call` node like
-    // this one (see `Expr::Optional`'s dispatch in `eval_single`, #693) — a
-    // bare `join(...)?` suppresses these errors via the ancestor
-    // `eval_try`'s catch, not locally. Confirmed dead per #928's identical
-    // finding in the regex builtins: a dedicated `join(...)?` test for each
-    // site still showed 0 coverage hits on the guard itself.
-    let elements: Vec<OwnedValue> = match &value {
-        StandardJson::Array(elements) => (*elements).map(|e| to_owned(&e)).collect(),
-        StandardJson::Object(fields) => (*fields).map(|f| to_owned(&f.value())).collect(),
+    // `optional`-gated arm on `join_step`'s `arith_add` failures: `optional`
+    // is never forced `true` reaching a nested `Call` node like this one
+    // (see `Expr::Optional`'s dispatch in `eval_single`, #693) — a bare
+    // `join(...)?` suppresses these errors via the ancestor `eval_try`'s
+    // catch, not locally. Confirmed dead per #928's identical finding in
+    // the regex builtins: a dedicated `join(...)?` test for each site still
+    // showed 0 coverage hits on the guard itself.
+    //
+    // `try_fold` over the raw element iterator (not a collected `Vec`) so a
+    // type-mismatch error on an early element short-circuits immediately
+    // instead of paying to `to_owned` every later element first.
+    let result = match value {
+        StandardJson::Array(mut elements) => {
+            elements.try_fold(None, |acc, e| join_step::<S>(acc, to_owned(&e), &sep))
+        }
+        StandardJson::Object(mut fields) => fields.try_fold(None, |acc, f| {
+            join_step::<S>(acc, to_owned(&f.value()), &sep)
+        }),
         _ => return QueryResult::Error(EvalError::cannot_iterate(&to_owned(&value))),
     };
 
-    let mut acc: Option<OwnedValue> = None;
-    for elem in elements {
-        let left = match acc {
-            None => OwnedValue::String(String::new()),
-            Some(a) => match arith_add::<S>(a, sep.clone()) {
-                Ok(v) => v,
-                Err(e) => return QueryResult::Error(e),
-            },
-        };
-        let right = match elem {
-            OwnedValue::Null => OwnedValue::String(String::new()),
-            OwnedValue::Bool(_)
-            | OwnedValue::Int(_)
-            | OwnedValue::Float(_)
-            | OwnedValue::NumberLiteral(..) => OwnedValue::String(owned_to_string(&elem)),
-            other => other, // String passes through; Array/Object stay raw so `+` fails naturally below.
-        };
-        acc = Some(match arith_add::<S>(left, right) {
-            Ok(v) => v,
-            Err(e) => return QueryResult::Error(e),
-        });
+    match result {
+        Ok(acc) => QueryResult::Owned(acc.unwrap_or(OwnedValue::String(String::new()))),
+        Err(e) => QueryResult::Error(e),
     }
-
-    QueryResult::Owned(acc.unwrap_or_else(|| OwnedValue::String(String::new())))
 }
 
 /// Builtin: contains(b) - check if input contains b
@@ -27273,6 +27345,57 @@ mod tests {
         );
         query!(br#"["a", [1, 2]]"#, r#"join(",")?"#,
             QueryResult::None => {}
+        );
+
+        // #1036 review: NaN must stringify the way jq's own `tostring` does
+        // (as `null`), not Rust's `f64::to_string()` spelling (`"NaN"`) --
+        // an earlier draft of this fix used `owned_to_string` here and
+        // regressed this exact case (`join`'s own pre-#1003 code got it
+        // right by accident, via `to_json()`). Confirmed live: `nan |
+        // tostring` is `"null"` in jq 1.7.1.
+        query!(br"1", r#"[., nan] | join(",")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "1,null");
+            }
+        );
+    }
+
+    #[test]
+    fn test_builtin_join_yq_mode() {
+        // #1036 review: builtin_join<S> has no S-gated branch, so #1003's
+        // jq-accurate rewrite silently changed yq's `join` behavior too --
+        // including a new silent-wrong-output regression (a `null`
+        // separator used to error, matching pre-#1003 behavior; the
+        // rewrite made it silently succeed with jq's no-op-separator
+        // semantics instead, diverging further from real yq without any
+        // test catching it). These pin the restored pre-#1003 behavior for
+        // `YqSemantics` -- see `builtin_join`'s doc comment and #1041 for
+        // why yq keeps the old, still-yq-inaccurate-but-not-newly-regressed
+        // `join_parts` path rather than jq's new algorithm.
+        yq_query!(br#"["x", "y", "z"]"#, r"join(null)",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "expected string, got non-string");
+            }
+        );
+        yq_query!(br"[1, 2]", r"join(1)",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "expected string, got non-string");
+            }
+        );
+        yq_query!(br#"[[1, 2], "a"]"#, r#"join(",")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "[1,2],a");
+            }
+        );
+        yq_query!(br#"["a", null, "c"]"#, r#"join("-")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "a-c");
+            }
+        );
+        yq_query!(br#"["a", "b"]"#, r#"join(",")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "a,b");
+            }
         );
     }
 
