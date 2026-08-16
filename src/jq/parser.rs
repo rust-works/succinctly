@@ -4956,6 +4956,15 @@ mod tests {
         );
     }
 
+    /// A bare exponent marker with no digits after it (`1e`) is not a
+    /// number Rust's own `f64`/`i64` parsers accept either -- confirmed
+    /// against jq 1.7.1, which also rejects it with a parse error.
+    #[test]
+    fn test_bare_exponent_marker_with_no_digits_is_a_parse_error() {
+        assert!(parse("1e").is_err());
+        assert!(parse("1e+").is_err());
+    }
+
     #[test]
     fn test_recursive_descent() {
         assert_eq!(parse("..").unwrap(), Expr::RecursiveDescent);

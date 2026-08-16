@@ -1367,6 +1367,16 @@ mod tests {
             OwnedValue::from(Literal::String("hello".into())),
             OwnedValue::String("hello".into())
         );
+        // #1035: a filter-literal number keeps its own source spelling
+        // through this conversion too, same as `literal_to_owned`'s
+        // sibling in eval.rs.
+        match OwnedValue::from(Literal::NumberLiteral("1.500".to_string())) {
+            OwnedValue::NumberLiteral(NumberRepr::Float(f), text) => {
+                assert_eq!(f, 1.5);
+                assert_eq!(text.as_ref(), "1.500");
+            }
+            other => panic!("expected NumberLiteral, got {other:?}"),
+        }
     }
 
     #[test]

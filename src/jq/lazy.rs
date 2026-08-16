@@ -871,6 +871,14 @@ mod tests {
             val.as_str().map(alloc::borrow::Cow::into_owned),
             Some("hello".to_string())
         );
+
+        // #1035: a filter-literal number keeps its own source spelling
+        // through this construction path too, same as the eval.rs/
+        // eval_generic.rs sibling conversions.
+        let lit = Literal::NumberLiteral("1.500".to_string());
+        let val: JqValue<'_, Vec<u64>> = JqValue::from_literal(&lit);
+        assert!(matches!(val, JqValue::NumberLiteral(ref s) if s.as_ref() == "1.500"));
+        assert_eq!(val.as_f64(), Some(1.5));
     }
 
     #[test]
