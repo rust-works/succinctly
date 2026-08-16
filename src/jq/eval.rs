@@ -27262,6 +27262,20 @@ mod tests {
                 assert_eq!(s, "true,false");
             }
         );
+
+        // #1003: the `?` suffix suppresses every error path above -- the
+        // non-iterable input, the separator-add failure, and the element-add
+        // failure -- to None instead of propagating. Confirmed live against
+        // jq 1.7.1 (all three are silently empty there too).
+        query!(br"5", r#"join(",")?"#,
+            QueryResult::None => {}
+        );
+        query!(br"[1, 2]", r"join([1, 2])?",
+            QueryResult::None => {}
+        );
+        query!(br#"["a", [1, 2]]"#, r#"join(",")?"#,
+            QueryResult::None => {}
+        );
     }
 
     #[test]
