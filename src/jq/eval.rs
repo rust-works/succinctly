@@ -7890,7 +7890,7 @@ fn eval_sub_replacement<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     re: &JqRegex,
     caps: &regex::Captures,
     optional: bool,
-) -> Result<Option<String>, QueryResult<'a, W>> {
+) -> Result<Option<OwnedValue>, QueryResult<'a, W>> {
     let captures = capture_object(re, caps);
     // `eval_owned_input` never returns a bare `QueryResult::Many` -- its own
     // body converts every borrowed `Many` to `ManyOwned` before returning --
@@ -7902,15 +7902,14 @@ fn eval_sub_replacement<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     if stream_is_empty {
         return Ok(None);
     }
-    match result_to_owned(materialized) {
-        Ok(OwnedValue::String(s)) => Ok(Some(s)),
-        Ok(_) if optional => Err(QueryResult::None),
-        Ok(_) => Err(QueryResult::Error(EvalError::type_error(
-            "string",
-            "replacement",
-        ))),
-        Err(e) => Err(e.into()),
-    }
+    // #1034: no type check here -- any successfully-evaluated value is
+    // returned as-is. jq's real `sub`/`gsub` (`src/builtin.jq`) never checks
+    // the replacement's type either; it hands the raw value straight to
+    // `$gap + $inserts[$ix]`, so a non-string replacement surfaces jq's own
+    // `+`-operator wording (`"string (...) and number (...) cannot be
+    // added"`) rather than a bespoke message. The callers below (which
+    // already hold the gap text) are what perform that `+`, via `arith_add`.
+    result_to_owned(materialized).map(Some).map_err(Into::into)
 }
 
 /// Replace every match in `matches` (already trailing-newline-aware, e.g.
@@ -7924,6 +7923,18 @@ fn eval_sub_replacement<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// every match's replacement is evaluated first, and if every one of them
 /// produced zero outputs, `input` is returned completely unchanged rather
 /// than with every match individually deleted.
+///
+/// #1034: each match's gap is combined with its replacement via `arith_add`
+/// (jq's real `sub`/`gsub` builds `$gap + $inserts[$ix]`, `src/builtin.jq`),
+/// not plain string concatenation -- gap is always a `String`, so this
+/// always either succeeds with a `String` (replacement was a `String`, or
+/// `null` under `+`'s own null-identity rule) or fails with jq's own
+/// binary-op wording naming the mismatched type. A failing match aborts the
+/// whole call immediately (matching jq's strict left-to-right `reduce`: a
+/// later match's replacement filter never runs once an earlier one fails),
+/// respecting `optional` the same way `eval_sub_replacement` used to at the
+/// type-check step directly (e.g. `isvalid(sub("a"; 5))` still needs this to
+/// yield `QueryResult::None`, not propagate an error -- #826).
 #[cfg(feature = "regex")]
 fn stitch_replacements_evaluated<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     replacement_expr: &Expr,
@@ -7955,8 +7966,15 @@ fn stitch_replacements_evaluated<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // gap (jq 1.7.1, verified) -- distinct from the all-empty case
         // above, which is handled before this loop runs.
         if let Some(replacement) = replacement {
-            out.push_str(&input[last_end..m.start()]);
-            out.push_str(&replacement);
+            let gap = OwnedValue::String(input[last_end..m.start()].to_string());
+            match arith_add::<S>(gap, replacement) {
+                Ok(OwnedValue::String(combined)) => out.push_str(&combined),
+                Ok(other) => unreachable!(
+                    "gap + replacement always yields a String or errors, got {other:?}"
+                ),
+                Err(_e) if optional => return Err(QueryResult::None),
+                Err(e) => return Err(e.into()),
+            }
         }
         last_end = m.end();
     }
@@ -8312,12 +8330,23 @@ fn sub_with_resolved_pattern<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     Err(qr) => return qr,
                 };
             match replacement {
+                // #1034: gap + replacement via `arith_add`, same reasoning
+                // as `stitch_replacements_evaluated` -- gap is always a
+                // `String`, so this either succeeds with a `String` or
+                // surfaces jq's own binary-op wording.
                 Some(replacement) => {
-                    let mut out = String::with_capacity(input.len());
-                    out.push_str(&input[..m.start()]);
-                    out.push_str(&replacement);
-                    out.push_str(&input[m.end()..]);
-                    QueryResult::Owned(OwnedValue::String(out))
+                    let gap = OwnedValue::String(input[..m.start()].to_string());
+                    match arith_add::<S>(gap, replacement) {
+                        Ok(OwnedValue::String(mut out)) => {
+                            out.push_str(&input[m.end()..]);
+                            QueryResult::Owned(OwnedValue::String(out))
+                        }
+                        Ok(other) => unreachable!(
+                            "gap + replacement always yields a String or errors, got {other:?}"
+                        ),
+                        Err(_e) if optional => QueryResult::None,
+                        Err(e) => QueryResult::Error(e),
+                    }
                 }
                 // The single-match specialization of the all-matches-empty
                 // rule `stitch_replacements_evaluated` implements for gsub
