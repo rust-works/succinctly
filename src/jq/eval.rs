@@ -4085,58 +4085,91 @@ fn builtin_split<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     }
 }
 
-/// Stringifies each element for `join`: strings pass through, nulls are
-/// skipped, everything else is rendered as JSON.
-fn join_parts<'a, W: Clone + AsRef<[u64]> + 'a>(
-    elements: impl Iterator<Item = StandardJson<'a, W>>,
-) -> Vec<String> {
-    let mut parts: Vec<String> = Vec::new();
-    for elem in elements {
-        match &elem {
-            StandardJson::String(s) => {
-                if let Ok(cow) = s.as_str() {
-                    parts.push(cow.into_owned());
-                }
-            }
-            StandardJson::Null => {
-                // Skip nulls in join
-            }
-            _ => {
-                // For non-strings, convert to string representation
-                parts.push(to_owned(&elem).to_json());
-            }
-        }
-    }
-    parts
-}
-
 /// Builtin: join(s) - join array elements with separator
 ///
-/// join(s) is [.[] | tostring] joined by s, and .[] over an object iterates
-/// its values, so jq accepts an object here as readily as an array (#422).
+/// `.[] over an object iterates its values, so jq accepts an object here as
+/// readily as an array (#422).
+///
+/// #1003: real jq defines this as `def join($x): reduce .[] as $i (null;
+/// (if . == null then "" else . + $x end) + ($i | if . == null then ""
+/// elif (type == "number" or type == "boolean") then tostring else . end))
+/// // "";` (reverse-engineered from live probes against jq 1.7.1, not from
+/// jq's own source text — the exact `def` wasn't available to consult, but
+/// this reproduces every probed case byte-for-byte). Two consequences that
+/// make this genuinely different from "evaluate the separator, type-check
+/// it, then join stringified parts":
+/// - The separator (`$x`) is bound once but never itself type-checked
+///   up front — it only participates in `+` starting from the *second*
+///   element's accumulation step, so `[1] | join(1)` succeeds (`"1"`, the
+///   separator is bound but never used) and `[] | join(1)` is `""` (the
+///   reduce body never runs at all). Confirmed live both ways.
+/// - Only `null`/number/boolean elements are converted to a string before
+///   the `+`; an array or object element is passed through raw, so `+`
+///   fails on it naturally with jq's own array/object binary-op wording
+///   (`[[1,2]] | join(",")` -> `"string (\"\") and array ([1,2]) cannot be
+///   added"`) instead of a bespoke "non-string" message — confirmed this is
+///   *not* the same as `tostring`, which succeeds (JSON-encodes) on an
+///   array/object; join deliberately doesn't extend that leniency to
+///   containers.
+///
+/// This also happens to fix a real, separate null-handling bug: the
+/// previous implementation *skipped* `null` elements entirely instead of
+/// treating them as an empty-string part, so `[1,null,2] | join(",")` gave
+/// `"1,2"` (missing separator) instead of jq's own `"1,,2"`.
 fn builtin_join<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     sep_expr: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    // Get the separator string
     let sep_result = eval_single::<W, S>(sep_expr, value.clone(), optional);
     let sep = match result_to_owned(sep_result) {
-        Ok(OwnedValue::String(s)) => s,
-        Ok(_) => return QueryResult::Error(EvalError::type_error("string", "non-string")),
+        Ok(v) => v,
         Err(e) => return e.into(),
     };
 
-    match value {
-        StandardJson::Array(elements) => {
-            QueryResult::Owned(OwnedValue::String(join_parts(elements).join(&sep)))
-        }
-        StandardJson::Object(fields) => QueryResult::Owned(OwnedValue::String(
-            join_parts(fields.map(|f| f.value())).join(&sep),
-        )),
-        _ if optional => QueryResult::None,
-        _ => QueryResult::Error(EvalError::cannot_iterate(&to_owned(&value))),
+    let elements: Vec<OwnedValue> = match &value {
+        StandardJson::Array(elements) => (*elements).map(|e| to_owned(&e)).collect(),
+        StandardJson::Object(fields) => (*fields).map(|f| to_owned(&f.value())).collect(),
+        _ if optional => return QueryResult::None,
+        _ => return QueryResult::Error(EvalError::cannot_iterate(&to_owned(&value))),
+    };
+
+    let mut acc: Option<OwnedValue> = None;
+    for elem in elements {
+        let left = match acc {
+            None => OwnedValue::String(String::new()),
+            Some(a) => match arith_add::<S>(a, sep.clone()) {
+                Ok(v) => v,
+                Err(e) => {
+                    return if optional {
+                        QueryResult::None
+                    } else {
+                        QueryResult::Error(e)
+                    }
+                }
+            },
+        };
+        let right = match elem {
+            OwnedValue::Null => OwnedValue::String(String::new()),
+            OwnedValue::Bool(_)
+            | OwnedValue::Int(_)
+            | OwnedValue::Float(_)
+            | OwnedValue::NumberLiteral(..) => OwnedValue::String(owned_to_string(&elem)),
+            other => other, // String passes through; Array/Object stay raw so `+` fails naturally below.
+        };
+        acc = Some(match arith_add::<S>(left, right) {
+            Ok(v) => v,
+            Err(e) => {
+                return if optional {
+                    QueryResult::None
+                } else {
+                    QueryResult::Error(e)
+                }
+            }
+        });
     }
+
+    QueryResult::Owned(acc.unwrap_or_else(|| OwnedValue::String(String::new())))
 }
 
 /// Builtin: contains(b) - check if input contains b
