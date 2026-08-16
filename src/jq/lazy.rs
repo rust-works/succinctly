@@ -178,6 +178,16 @@ impl<'a, W: Clone + AsRef<[u64]>> JqValue<'a, W> {
 
     /// Create from an OwnedValue.
     pub fn from_owned(owned: OwnedValue) -> Self {
+        Self::from_owned_at_depth(owned, 0)
+    }
+
+    /// Panics past [`MAX_VALUE_TREE_DEPTH`](super::value::MAX_VALUE_TREE_DEPTH)
+    /// levels of nesting (#1025) -- `OwnedValue::Array`/`Object` are `pub`
+    /// and re-exported from `succinctly::jq`, so any library consumer can
+    /// build a deeply-nested value with a plain loop (no recursion needed
+    /// to construct it) and hand it to this constructor.
+    fn from_owned_at_depth(owned: OwnedValue, depth: usize) -> Self {
+        assert_value_tree_depth(depth);
         match owned {
             OwnedValue::Null => JqValue::Null,
             OwnedValue::Bool(b) => JqValue::Bool(b),
@@ -185,12 +195,14 @@ impl<'a, W: Clone + AsRef<[u64]>> JqValue<'a, W> {
             OwnedValue::Float(f) => JqValue::Float(f),
             OwnedValue::NumberLiteral(_, literal) => JqValue::NumberLiteral(literal),
             OwnedValue::String(s) => JqValue::String(s),
-            OwnedValue::Array(arr) => {
-                JqValue::Array(arr.into_iter().map(JqValue::from_owned).collect())
-            }
+            OwnedValue::Array(arr) => JqValue::Array(
+                arr.into_iter()
+                    .map(|v| Self::from_owned_at_depth(v, depth + 1))
+                    .collect(),
+            ),
             OwnedValue::Object(obj) => JqValue::Object(
                 obj.into_iter()
-                    .map(|(k, v)| (k, JqValue::from_owned(v)))
+                    .map(|(k, v)| (k, Self::from_owned_at_depth(v, depth + 1)))
                     .collect(),
             ),
         }
@@ -475,6 +487,20 @@ impl<'a, W: Clone + AsRef<[u64]>> JqValue<'a, W> {
     /// This is the preferred way to output JqValue because it preserves
     /// number formatting like `4e4` for cursor values.
     pub fn write_json<Out: core::fmt::Write>(&self, out: &mut Out) -> core::fmt::Result {
+        self.write_json_at_depth(out, 0)
+    }
+
+    /// Panics past [`MAX_VALUE_TREE_DEPTH`](super::value::MAX_VALUE_TREE_DEPTH)
+    /// levels of nesting (#1025) -- `OwnedValue::Array`/`Object` are `pub`
+    /// and re-exported from `succinctly::jq`, so any library consumer can
+    /// build a deeply-nested `JqValue` (via [`Self::from_owned`], itself
+    /// guarded) and hand it to this serializer.
+    fn write_json_at_depth<Out: core::fmt::Write>(
+        &self,
+        out: &mut Out,
+        depth: usize,
+    ) -> core::fmt::Result {
+        assert_value_tree_depth(depth);
         match self {
             JqValue::Cursor(c) => {
                 if let Some(bytes) = c.raw_bytes() {
@@ -515,7 +541,7 @@ impl<'a, W: Clone + AsRef<[u64]>> JqValue<'a, W> {
                     if i > 0 {
                         out.write_char(',')?;
                     }
-                    v.write_json(out)?;
+                    v.write_json_at_depth(out, depth + 1)?;
                 }
                 out.write_char(']')
             }
@@ -532,7 +558,7 @@ impl<'a, W: Clone + AsRef<[u64]>> JqValue<'a, W> {
                     out.write_char('"')?;
                     write_json_body_jq(out, k)?;
                     out.write_str("\":")?;
-                    v.write_json(out)?;
+                    v.write_json_at_depth(out, depth + 1)?;
                 }
                 out.write_char('}')
             }
@@ -1128,6 +1154,112 @@ mod tests {
         assert!(
             result.is_err(),
             "into_owned should panic at MAX_VALUE_TREE_DEPTH"
+        );
+    }
+
+    /// `depth` levels of single-element array nesting: `[[[...[Null]...]]]`.
+    /// Mirrors `eval.rs`/`value.rs`'s own identically-shaped `linear_array_nest`
+    /// helper -- a separate copy (rather than a shared one) because
+    /// `OwnedValue` construction has no cross-module-visible builder to
+    /// share, same as `stream.rs`'s own copy of this shape.
+    fn linear_owned_nest(depth: usize) -> OwnedValue {
+        let mut v = OwnedValue::Null;
+        for _ in 0..depth {
+            v = OwnedValue::Array(vec![v]);
+        }
+        v
+    }
+
+    /// The `Object`-arm counterpart to [`linear_owned_nest`] -- a
+    /// depth-threading bug isolated to an `Object` match arm would pass a
+    /// boundary test built only from array nesting (#1025 code review).
+    fn linear_owned_object_nest(depth: usize) -> OwnedValue {
+        let mut v = OwnedValue::Object(IndexMap::new());
+        for _ in 0..depth {
+            let mut obj = IndexMap::new();
+            obj.insert("k".to_string(), v);
+            v = OwnedValue::Object(obj);
+        }
+        v
+    }
+
+    /// #1025: `JqValue::from_owned` had no depth guard at all -- since
+    /// `OwnedValue::Array`/`Object` are `pub` and re-exported from
+    /// `succinctly::jq`, any library consumer can build a deeply-nested
+    /// value with a plain loop and hand it to this constructor.
+    #[test]
+    fn from_owned_panics_past_nesting_depth_limit_1025() {
+        use crate::jq::value::MAX_VALUE_TREE_DEPTH;
+
+        let under = linear_owned_nest(MAX_VALUE_TREE_DEPTH - 1);
+        let value: JqValue<'_, Vec<u64>> = JqValue::from_owned(under);
+        assert!(matches!(value, JqValue::Array(_)));
+
+        let over = linear_owned_nest(MAX_VALUE_TREE_DEPTH);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            JqValue::<Vec<u64>>::from_owned(over)
+        }));
+        assert!(
+            result.is_err(),
+            "from_owned should panic at MAX_VALUE_TREE_DEPTH"
+        );
+
+        let under_obj = linear_owned_object_nest(MAX_VALUE_TREE_DEPTH - 1);
+        let value: JqValue<'_, Vec<u64>> = JqValue::from_owned(under_obj);
+        assert!(matches!(value, JqValue::Object(_)));
+
+        let over_obj = linear_owned_object_nest(MAX_VALUE_TREE_DEPTH);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            JqValue::<Vec<u64>>::from_owned(over_obj)
+        }));
+        assert!(
+            result.is_err(),
+            "from_owned should panic at MAX_VALUE_TREE_DEPTH (Object arm)"
+        );
+    }
+
+    /// The `Object`-arm counterpart to `linear_jqvalue_nest` -- see
+    /// [`linear_owned_object_nest`]'s doc comment for why this arm needs
+    /// its own boundary coverage, not just `Array`'s.
+    fn linear_jqvalue_object_nest(depth: usize) -> JqValue<'static, Vec<u64>> {
+        let mut v = JqValue::Object(IndexMap::new());
+        for _ in 0..depth {
+            let mut obj = IndexMap::new();
+            obj.insert("k".to_string(), v);
+            v = JqValue::Object(obj);
+        }
+        v
+    }
+
+    /// #1025: `JqValue::write_json` (and its `to_json_string` caller) had
+    /// no depth guard at all -- reachable the same way as `materialize`/
+    /// `into_owned` above, just on the serialization path instead.
+    #[test]
+    fn write_json_panics_past_nesting_depth_limit_1025() {
+        use crate::jq::value::MAX_VALUE_TREE_DEPTH;
+
+        let under = linear_jqvalue_nest(MAX_VALUE_TREE_DEPTH - 1);
+        let mut buf = String::new();
+        assert!(under.write_json(&mut buf).is_ok());
+
+        let over = linear_jqvalue_nest(MAX_VALUE_TREE_DEPTH);
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| over.to_json_string()));
+        assert!(
+            result.is_err(),
+            "write_json/to_json_string should panic at MAX_VALUE_TREE_DEPTH"
+        );
+
+        let under_obj = linear_jqvalue_object_nest(MAX_VALUE_TREE_DEPTH - 1);
+        let mut buf = String::new();
+        assert!(under_obj.write_json(&mut buf).is_ok());
+
+        let over_obj = linear_jqvalue_object_nest(MAX_VALUE_TREE_DEPTH);
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| over_obj.to_json_string()));
+        assert!(
+            result.is_err(),
+            "write_json/to_json_string should panic at MAX_VALUE_TREE_DEPTH (Object arm)"
         );
     }
 }
