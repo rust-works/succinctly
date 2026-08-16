@@ -70,6 +70,14 @@ pub const MAX_VALUE_TREE_DEPTH: usize = 384;
 /// silently" shape #998 had already fixed once for three earlier copies
 /// of this exact check. Both are now thin wrappers around this one,
 /// parameterized by `max` instead of re-deriving the assertion.
+///
+/// `#[track_caller]` (and on both wrappers below) so a panic reports the
+/// call site inside the actual `_at_depth` recursive function that
+/// overflowed, not this shared body's own line -- otherwise every one of
+/// the ~15 guarded call sites collapses to the same file:line, making a
+/// crash report impossible to attribute without a full backtrace (#1020
+/// code review).
+#[track_caller]
 pub fn assert_depth(depth: usize, max: usize) {
     assert!(depth < max, "nesting depth exceeds limit of {max}");
 }
@@ -79,6 +87,7 @@ pub fn assert_depth(depth: usize, max: usize) {
 /// See that constant's own doc comment for why this exists as a second,
 /// independently-tuned ceiling alongside
 /// [`eval_generic::assert_nesting_depth`](super::eval_generic::assert_nesting_depth).
+#[track_caller]
 pub fn assert_value_tree_depth(depth: usize) {
     assert_depth(depth, MAX_VALUE_TREE_DEPTH);
 }

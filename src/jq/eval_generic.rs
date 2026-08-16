@@ -91,6 +91,11 @@ pub const MAX_NESTING_DEPTH: usize = 256;
 /// carried their own byte-identical copy), and again independently in
 /// `value.rs` for [`value::MAX_VALUE_TREE_DEPTH`](super::value::MAX_VALUE_TREE_DEPTH)'s
 /// own guard -- the same duplication shape recurring one level up.
+///
+/// `#[track_caller]` so a panic reports the guarded function's own call
+/// site rather than collapsing to `assert_depth`'s shared body (#1020
+/// code review).
+#[track_caller]
 pub fn assert_nesting_depth(depth: usize) {
     super::value::assert_depth(depth, MAX_NESTING_DEPTH);
 }
@@ -9074,5 +9079,30 @@ mod tests {
         let result =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| to_owned_cursor(&cursor)));
         assert!(result.is_err(), "to_owned_cursor should panic at depth 256");
+    }
+
+    /// #1017: `standard_json_to_owned` is a third, independent copy of the
+    /// cursor-to-`OwnedValue` conversion `to_owned`/`to_owned_cursor` are
+    /// already guarded above (#998) -- same limit, same construction, its
+    /// own guard.
+    #[test]
+    fn standard_json_to_owned_panics_past_nesting_depth_limit_1017() {
+        let json = linear_nest(255);
+        let index = JsonIndex::build(json.as_bytes());
+        let cursor = index.root(json.as_bytes());
+        let owned = standard_json_to_owned(&cursor.value());
+        assert!(matches!(owned, OwnedValue::Object(_)));
+
+        let json = linear_nest(256);
+        let index = JsonIndex::build(json.as_bytes());
+        let cursor = index.root(json.as_bytes());
+        let value = cursor.value();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            standard_json_to_owned(&value)
+        }));
+        assert!(
+            result.is_err(),
+            "standard_json_to_owned should panic at depth 256"
+        );
     }
 }

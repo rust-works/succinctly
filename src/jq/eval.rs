@@ -40082,4 +40082,95 @@ mod tests {
             "to_owned should panic at MAX_VALUE_TREE_DEPTH"
         );
     }
+
+    /// #1017: `*`/`*=` merge had no guard anywhere in the mutually-recursive
+    /// `merge_values`/`merge_existing`/`merge_object_fields`/
+    /// `merge_arrays_by_index` family; `deep_merge_arrays` (the `d` flag)
+    /// exercises the array leg, which -- unlike the object leg -- is only
+    /// reachable when both sides are arrays at every level.
+    #[test]
+    fn merge_values_panics_past_nesting_depth_limit_1017() {
+        use crate::jq::value::MAX_VALUE_TREE_DEPTH;
+
+        let flags = MergeFlags {
+            deep_merge_arrays: true,
+            ..Default::default()
+        };
+
+        let under_a = linear_array_nest(MAX_VALUE_TREE_DEPTH - 1);
+        let under_b = linear_array_nest(MAX_VALUE_TREE_DEPTH - 1);
+        let _ = merge_values(under_a, under_b, flags);
+
+        let over_a = linear_array_nest(MAX_VALUE_TREE_DEPTH);
+        let over_b = linear_array_nest(MAX_VALUE_TREE_DEPTH);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            merge_values(over_a, over_b, flags)
+        }));
+        assert!(
+            result.is_err(),
+            "merge_values should panic at MAX_VALUE_TREE_DEPTH"
+        );
+    }
+
+    /// #1017: `flatten` had no guard on its own tree-recursion depth,
+    /// distinct from the pre-existing `depth` parameter (remaining flatten
+    /// levels) it already threads. Passes `usize::MAX` for that parameter
+    /// so it can never be the thing that stops recursion first -- with a
+    /// flatten-level count matched to the actual nesting instead, `depth`
+    /// and the tree-depth counter reach zero on the same call, and the
+    /// early `if depth == 0` return happens *before* the assert, masking
+    /// it entirely.
+    #[test]
+    fn flatten_owned_panics_past_nesting_depth_limit_1017() {
+        use crate::jq::value::MAX_VALUE_TREE_DEPTH;
+
+        let under = vec![linear_array_nest(MAX_VALUE_TREE_DEPTH - 1)];
+        let _ = flatten_owned(under, usize::MAX);
+
+        let over = vec![linear_array_nest(MAX_VALUE_TREE_DEPTH)];
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            flatten_owned(over, usize::MAX)
+        }));
+        assert!(
+            result.is_err(),
+            "flatten_owned should panic at MAX_VALUE_TREE_DEPTH"
+        );
+    }
+
+    /// #1017: `@props`'s recursive formatter had no guard, reachable on a
+    /// value constructed via `reduce`/`foreach`/etc. with no adversarial
+    /// document involved.
+    #[test]
+    fn format_props_panics_past_nesting_depth_limit_1017() {
+        use crate::jq::value::MAX_VALUE_TREE_DEPTH;
+
+        let under = linear_array_nest(MAX_VALUE_TREE_DEPTH - 1);
+        assert!(format_props(&under).is_ok());
+
+        let over = linear_array_nest(MAX_VALUE_TREE_DEPTH);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| format_props(&over)));
+        assert!(
+            result.is_err(),
+            "format_props should panic at MAX_VALUE_TREE_DEPTH"
+        );
+    }
+
+    /// #1017: `@yaml`'s flow-style formatter had no guard, reachable on a
+    /// value constructed via `reduce`/`foreach`/etc. with no adversarial
+    /// document involved.
+    #[test]
+    fn owned_to_yaml_panics_past_nesting_depth_limit_1017() {
+        use crate::jq::value::MAX_VALUE_TREE_DEPTH;
+
+        let under = linear_array_nest(MAX_VALUE_TREE_DEPTH - 1);
+        let _ = owned_to_yaml(&under);
+
+        let over = linear_array_nest(MAX_VALUE_TREE_DEPTH);
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| owned_to_yaml(&over)));
+        assert!(
+            result.is_err(),
+            "owned_to_yaml should panic at MAX_VALUE_TREE_DEPTH"
+        );
+    }
 }

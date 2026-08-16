@@ -14,7 +14,9 @@ use succinctly::jq::document::DocumentFields;
 use succinctly::jq::eval_generic::{
     eval_with_cursor, to_owned as generic_to_owned, GenericResult, MAX_NESTING_DEPTH,
 };
-use succinctly::jq::{self, format_number_jq_compat, Expr, JqValue, OwnedValue, Program};
+use succinctly::jq::{
+    self, assert_value_tree_depth, format_number_jq_compat, Expr, JqValue, OwnedValue, Program,
+};
 use succinctly::json::light::{JsonCursor, StandardJson};
 use succinctly::json::validate::{self, ValidationError};
 use succinctly::json::JsonIndex;
@@ -1555,6 +1557,16 @@ fn strip_quotes_and_decode(field: &[u8]) -> String {
 
 /// Convert serde_json::Value to OwnedValue.
 fn serde_to_owned(value: &serde_json::Value) -> OwnedValue {
+    serde_to_owned_at_depth(value, 0)
+}
+
+/// Panics past `MAX_VALUE_TREE_DEPTH` levels of nesting (#1017/#1020) --
+/// mirrors `yq_runner::serde_json_to_owned_at_depth`, which this function's
+/// own doc comment names as guarded by the same PR; this twin was
+/// initially missed and is reachable the same way, via `--argjson`/`--args`
+/// and `--seq`/streamed JSON input parsing below.
+fn serde_to_owned_at_depth(value: &serde_json::Value, depth: usize) -> OwnedValue {
+    assert_value_tree_depth(depth);
     match value {
         serde_json::Value::Null => OwnedValue::Null,
         serde_json::Value::Bool(b) => OwnedValue::Bool(*b),
@@ -1568,12 +1580,14 @@ fn serde_to_owned(value: &serde_json::Value) -> OwnedValue {
             }
         }
         serde_json::Value::String(s) => OwnedValue::String(s.clone()),
-        serde_json::Value::Array(arr) => {
-            OwnedValue::Array(arr.iter().map(serde_to_owned).collect())
-        }
+        serde_json::Value::Array(arr) => OwnedValue::Array(
+            arr.iter()
+                .map(|v| serde_to_owned_at_depth(v, depth + 1))
+                .collect(),
+        ),
         serde_json::Value::Object(obj) => OwnedValue::Object(
             obj.iter()
-                .map(|(k, v)| (k.clone(), serde_to_owned(v)))
+                .map(|(k, v)| (k.clone(), serde_to_owned_at_depth(v, depth + 1)))
                 .collect(),
         ),
     }
@@ -2548,5 +2562,42 @@ mod tests {
         let stream = r#"{"a":1} {"b":2} {"c":3}"#;
         let values = parse_json_stream(stream).unwrap();
         assert_eq!(values.len(), 3);
+    }
+
+    /// `depth` levels of single-element array nesting in a `serde_json::Value`,
+    /// built directly rather than parsed from text -- `serde_json::from_str`
+    /// enforces its own independent ~128-deep recursion limit at parse time
+    /// (well under `MAX_VALUE_TREE_DEPTH`), so a JSON-text version of this
+    /// helper would hit that gate before ever reaching `serde_to_owned`'s
+    /// own guard.
+    fn linear_serde_json_nest(depth: usize) -> serde_json::Value {
+        let mut v = serde_json::Value::Null;
+        for _ in 0..depth {
+            v = serde_json::Value::Array(vec![v]);
+        }
+        v
+    }
+
+    /// #1020 code review: `yq_runner::serde_json_to_owned`'s own doc comment
+    /// names this function as its mirror, guarded by the same #1017-driven
+    /// PR -- but this twin (backing `--argjson`/`--args`-style value
+    /// parsing and `--seq`/streamed JSON input on the `jq` side) was
+    /// initially missed. Same guard, same construction as #1017's other
+    /// tests.
+    #[test]
+    fn serde_to_owned_panics_past_nesting_depth_limit_1020() {
+        use succinctly::jq::MAX_VALUE_TREE_DEPTH;
+
+        let under = linear_serde_json_nest(MAX_VALUE_TREE_DEPTH - 1);
+        let owned = serde_to_owned(&under);
+        assert!(matches!(owned, OwnedValue::Array(_)));
+
+        let over = linear_serde_json_nest(MAX_VALUE_TREE_DEPTH);
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| serde_to_owned(&over)));
+        assert!(
+            result.is_err(),
+            "serde_to_owned should panic at MAX_VALUE_TREE_DEPTH"
+        );
     }
 }

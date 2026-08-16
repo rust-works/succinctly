@@ -4425,4 +4425,118 @@ mod tests {
             "reconcile_presentation should panic at MAX_VALUE_TREE_DEPTH"
         );
     }
+
+    /// #1017: `emit_yaml_value` (the YAML-target default output emitter —
+    /// see its own doc comment) had no guard, reachable on a value
+    /// constructed via `reduce`/`foreach`/etc. with no adversarial document
+    /// involved.
+    #[test]
+    fn emit_yaml_value_panics_past_nesting_depth_limit_1017() {
+        use succinctly::jq::MAX_VALUE_TREE_DEPTH;
+
+        let config = OutputConfig {
+            output_format: OutputFormat::Yaml,
+            compact: false,
+            raw_output: false,
+            join_output: false,
+            nul_output: false,
+            ascii_output: false,
+            sort_keys: false,
+            no_doc: false,
+            indent_str: String::new(),
+            use_color: false,
+        };
+
+        let under = linear_array_nest(MAX_VALUE_TREE_DEPTH - 1);
+        let _ = emit_yaml_value(&under, &CommentTree::empty(), &config, "", false);
+
+        let over = linear_array_nest(MAX_VALUE_TREE_DEPTH);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            emit_yaml_value(&over, &CommentTree::empty(), &config, "", false)
+        }));
+        assert!(
+            result.is_err(),
+            "emit_yaml_value should panic at MAX_VALUE_TREE_DEPTH"
+        );
+    }
+
+    /// #1017: yq's JSON-input number canonicalization pass had no guard,
+    /// reachable the same way as every other value-tree walker guarded in
+    /// this PR — a value constructed with no adversarial document behind it.
+    #[test]
+    fn canonicalize_json_numbers_panics_past_nesting_depth_limit_1017() {
+        use succinctly::jq::MAX_VALUE_TREE_DEPTH;
+
+        let under = linear_array_nest(MAX_VALUE_TREE_DEPTH - 1);
+        let _ = canonicalize_json_numbers(under);
+
+        let over = linear_array_nest(MAX_VALUE_TREE_DEPTH);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            canonicalize_json_numbers(over)
+        }));
+        assert!(
+            result.is_err(),
+            "canonicalize_json_numbers should panic at MAX_VALUE_TREE_DEPTH"
+        );
+    }
+
+    /// `depth` levels of single-child `CommentTree::Array` nesting, mirroring
+    /// [`linear_array_nest`]'s `OwnedValue` shape.
+    fn linear_comment_tree_nest(depth: usize) -> CommentTree {
+        let mut t = CommentTree::empty();
+        for _ in 0..depth {
+            t = CommentTree::Array(None, "", vec![t]);
+        }
+        t
+    }
+
+    /// #1017: `strip_presentation_style` had no guard, reachable on a
+    /// `CommentTree` built up alongside a computed value with no live
+    /// document cursor behind it.
+    #[test]
+    fn strip_presentation_style_panics_past_nesting_depth_limit_1017() {
+        use succinctly::jq::MAX_VALUE_TREE_DEPTH;
+
+        let under = linear_comment_tree_nest(MAX_VALUE_TREE_DEPTH - 1);
+        let _ = strip_presentation_style(&under);
+
+        let over = linear_comment_tree_nest(MAX_VALUE_TREE_DEPTH);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            strip_presentation_style(&over)
+        }));
+        assert!(
+            result.is_err(),
+            "strip_presentation_style should panic at MAX_VALUE_TREE_DEPTH"
+        );
+    }
+
+    /// `depth` levels of single-element array nesting in a `serde_json::Value`.
+    fn linear_serde_json_nest(depth: usize) -> serde_json::Value {
+        let mut v = serde_json::Value::Null;
+        for _ in 0..depth {
+            v = serde_json::Value::Array(vec![v]);
+        }
+        v
+    }
+
+    /// #1017: `serde_json_to_owned` (used by `--argjson`/`--args`-style CLI
+    /// value parsing) had no guard of its own, unlike the `serde_json`
+    /// parse step feeding it, which enforces an independent ~128-deep
+    /// limit before this conversion ever runs.
+    #[test]
+    fn serde_json_to_owned_panics_past_nesting_depth_limit_1017() {
+        use succinctly::jq::MAX_VALUE_TREE_DEPTH;
+
+        let under = linear_serde_json_nest(MAX_VALUE_TREE_DEPTH - 1);
+        let owned = serde_json_to_owned(&under);
+        assert!(matches!(owned, OwnedValue::Array(_)));
+
+        let over = linear_serde_json_nest(MAX_VALUE_TREE_DEPTH);
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| serde_json_to_owned(&over)));
+        assert!(
+            result.is_err(),
+            "serde_json_to_owned should panic at MAX_VALUE_TREE_DEPTH"
+        );
+    }
 }
