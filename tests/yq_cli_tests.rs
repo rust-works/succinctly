@@ -6824,28 +6824,21 @@ fn test_mapping_under_mapping_gap_via_explicit_value() -> Result<()> {
 // expected key". Confirmed live against pinned yq v4.53.3.
 
 #[test]
-fn test_explicit_value_one_column_past_its_key_errors_1010() -> Result<()> {
-    // The issue's own headline repro: `:` one column deeper than its `?`.
-    let (_output, stderr, exit_code) =
-        run_yq_stdin_with_stderr(".", "? k\n : v\nc: 3\n", &["-o", "json", "-I0"])?;
-    assert_eq!(exit_code, 1);
-    assert!(
-        stderr.contains("inconsistent indentation"),
-        "stderr: {stderr:?}"
-    );
-    Ok(())
-}
-
-#[test]
-fn test_explicit_value_several_columns_past_its_key_errors_1010() -> Result<()> {
-    // Not just an off-by-one: any over-indentation is ambiguous.
-    let (_output, stderr, exit_code) =
-        run_yq_stdin_with_stderr(".", "? k\n   : v\nc: 3\n", &["-o", "json", "-I0"])?;
-    assert_eq!(exit_code, 1);
-    assert!(
-        stderr.contains("inconsistent indentation"),
-        "stderr: {stderr:?}"
-    );
+fn test_explicit_value_past_its_key_errors_1010() -> Result<()> {
+    for (name, input) in [
+        // The issue's own headline repro: `:` one column deeper than its `?`.
+        ("one column past", "? k\n : v\nc: 3\n"),
+        // Not just an off-by-one: any over-indentation is ambiguous.
+        ("several columns past", "? k\n   : v\nc: 3\n"),
+    ] {
+        let (_output, stderr, exit_code) =
+            run_yq_stdin_with_stderr(".", input, &["-o", "json", "-I0"])?;
+        assert_eq!(exit_code, 1, "{name}");
+        assert!(
+            stderr.contains("inconsistent indentation"),
+            "{name}: stderr: {stderr:?}"
+        );
+    }
     Ok(())
 }
 
