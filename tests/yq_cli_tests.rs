@@ -11711,12 +11711,9 @@ fn test_yq_halt_error_preserves_exponent_literal_1051() -> Result<()> {
     Ok(())
 }
 
-/// #1051 item 4 (most severe): `evaluate_input`'s DOM fallback — taken by
-/// `--inplace` for any expression `can_use_m2_streaming` doesn't allow-list
-/// (`tostring` isn't on that list) — round-tripped the *whole document*
-/// through jq-mode `to_json()` before the evaluator ever ran, silently
-/// rewriting every `NumberLiteral` in the document, including fields the
-/// query never touched. Pinned against real yq's identical operation.
+/// #1051 item 4 (most severe) — see `evaluate_input`'s own doc comment in
+/// `src/bin/succinctly/yq_runner.rs` for the mechanism. Pinned against real
+/// yq's identical operation.
 #[test]
 fn test_yq_inplace_tostring_does_not_corrupt_untouched_sibling_field_1051() -> Result<()> {
     let mut input_file = NamedTempFile::new()?;
@@ -11735,5 +11732,46 @@ fn test_yq_inplace_tostring_does_not_corrupt_untouched_sibling_field_1051() -> R
     // Real yq (v4.53.3) gives byte-for-byte: `a: 1e2\nb: "1e2"\n` — `a` is
     // left completely untouched, `b` echoes `.a`'s literal spelling verbatim.
     assert_eq!(rewritten, "a: 1e2\nb: \"1e2\"\n");
+    Ok(())
+}
+
+/// #1051 code review: the first draft of the fix above switched
+/// `evaluate_input`'s round trip to `to_json_yq()`, which substitutes
+/// JSON's `null` for a non-finite `Float`/`NumberLiteral` (correct for
+/// actual JSON *output*, RFC 8259 forbids Infinity/NaN) — but this
+/// round-trip is purely internal, so a non-finite sibling field got
+/// silently corrupted to `null` the same way the decimal-point bug
+/// corrupted `1e2` above. Confirmed live: `-i '.b = (.a | tostring)'` on
+/// `a: .inf` rewrote it to `a: null`. Fixed by routing through
+/// `to_json_for_reindex::<YqSemantics>()` instead, which preserves
+/// ±Infinity/NaN through the reparse. `b`'s own spelling (`tostring` on a
+/// non-finite value) is intentionally not asserted here — a separate,
+/// pre-existing gap in `numeric_display_string`, filed as #1060.
+#[test]
+fn test_yq_inplace_tostring_does_not_corrupt_untouched_nonfinite_sibling_field_1051() -> Result<()>
+{
+    for scalar in [".inf", "-.inf", ".nan"] {
+        let mut input_file = NamedTempFile::new()?;
+        writeln!(input_file, "a: {scalar}\nc: keep")?;
+
+        let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+            .arg("yq")
+            .arg("-i")
+            .arg(".b = (.a | tostring)")
+            .arg(input_file.path())
+            .stdin(Stdio::null())
+            .output()?;
+
+        assert!(output.status.success(), "for {scalar:?}");
+        let rewritten = std::fs::read_to_string(input_file.path())?;
+        assert!(
+            rewritten.starts_with(&format!("a: {scalar}\n")),
+            "for {scalar:?}: {rewritten:?}"
+        );
+        assert!(
+            rewritten.contains("c: keep"),
+            "for {scalar:?}: {rewritten:?}"
+        );
+    }
     Ok(())
 }

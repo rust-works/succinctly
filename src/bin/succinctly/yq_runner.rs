@@ -573,19 +573,28 @@ fn evaluate_yaml_direct_filtered(
 ///
 /// This is `yq_runner.rs`'s own function (`jq_runner.rs` has an unrelated,
 /// separate `evaluate_input` for jq mode) and always evaluates with
-/// `YqSemantics` below, so the round-trip must use `to_json_yq()`, not
-/// `to_json()` (#1051): the DOM fallback taken by `--slurp` and by
-/// `--inplace` for any expression `can_use_m2_streaming` doesn't allow-list
-/// (`tostring` is not on that list) was reformatting every `NumberLiteral`
-/// in the *whole document* via jq rules before the evaluator ever ran,
-/// silently rewriting fields the query never touched on an in-place write.
+/// `YqSemantics` below, so the round-trip must use a yq-mode-aware
+/// formatter, not `to_json()` (#1051): the DOM fallback taken by `--slurp`
+/// and by `--inplace` for any expression `can_use_m2_streaming` doesn't
+/// allow-list (`tostring` is not on that list) was reformatting every
+/// `NumberLiteral` in the *whole document* via jq rules before the
+/// evaluator ever ran, silently rewriting fields the query never touched on
+/// an in-place write.
+///
+/// `to_json_for_reindex::<YqSemantics>()`, not `to_json_yq()`: this round
+/// trip is purely internal (code review on #1051's first draft caught this
+/// live — `-i '.b = (.a | tostring)'` on `a: .inf` silently rewrote it to
+/// `a: null`), so a non-finite value must keep its ±Infinity/NaN spelling
+/// through the reparse rather than being substituted with JSON's `null`,
+/// the same reasoning `eval_owned_input`'s identical reindex bridge already
+/// applies for `reduce`/`foreach` (#561, #472).
 fn evaluate_input(
     input: &OwnedValue,
     expr: &jq::Expr,
     sink: &mut ErrorSink,
 ) -> Result<Vec<OwnedValue>> {
     // Convert OwnedValue to JSON bytes for indexing
-    let json_str = input.to_json_yq();
+    let json_str = input.to_json_for_reindex::<YqSemantics>();
     let json_bytes = json_str.as_bytes();
 
     // Build index and evaluate
