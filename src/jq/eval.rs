@@ -5756,6 +5756,16 @@ fn props_value_to_string(value: &OwnedValue) -> String {
         OwnedValue::Float(f) if f.is_nan() || f.is_infinite() => {
             nonfinite_display_string::<YqSemantics>(*f).to_string()
         }
+        // Required for match exhaustiveness over the `Float` variant, but
+        // not reachable through any real filter (#1064, verified via
+        // `cargo llvm-cov` and a direct entry-point probe, not assumed):
+        // `@props` only ever sees a `Float` here via `eval_format`'s
+        // `to_owned(&value)`, which always round-trips a *finite* computed
+        // number through `from_number_bytes` -- and that always
+        // reconstructs a `NumberLiteral`, never a bare `Float`, for any
+        // valid RFC-8259 number text. Only a NaN/Infinity sentinel
+        // (guarded by the arm above, not this one) skips that
+        // reconstruction and arrives here as a bare `Float`.
         OwnedValue::Float(f) => format!("{f}"),
         OwnedValue::NumberLiteral(NumberRepr::Float(f), _) if f.is_nan() || f.is_infinite() => {
             nonfinite_display_string::<YqSemantics>(*f).to_string()
@@ -5795,6 +5805,16 @@ fn owned_to_yaml_at_depth(value: &OwnedValue, depth: usize) -> String {
         OwnedValue::Float(f) if f.is_nan() || f.is_infinite() => {
             nonfinite_display_string::<YqSemantics>(*f).to_string()
         }
+        // Required for match exhaustiveness over the `Float` variant, but
+        // not reachable through any real filter (#1064, verified via
+        // `cargo llvm-cov` and a direct entry-point probe, not assumed):
+        // `@yaml` only ever sees a `Float` here via `eval_format`'s
+        // `to_owned(&value)`, which always round-trips a *finite* computed
+        // number through `from_number_bytes` -- and that always
+        // reconstructs a `NumberLiteral`, never a bare `Float`, for any
+        // valid RFC-8259 number text. Only a NaN/Infinity sentinel
+        // (guarded by the arm above, not this one) skips that
+        // reconstruction and arrives here as a bare `Float`.
         OwnedValue::Float(f) => format!("{f}"),
         OwnedValue::NumberLiteral(NumberRepr::Float(f), _) if f.is_nan() || f.is_infinite() => {
             nonfinite_display_string::<YqSemantics>(*f).to_string()
