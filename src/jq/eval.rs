@@ -4114,7 +4114,7 @@ fn yq_join_nonfinite_part(value: &OwnedValue) -> Option<String> {
         OwnedValue::Float(f) | OwnedValue::NumberLiteral(NumberRepr::Float(f), _)
             if f.is_nan() || f.is_infinite() =>
         {
-            Some(nonfinite_display_string::<YqSemantics>(*f))
+            Some(nonfinite_display_string::<YqSemantics>(*f).to_string())
         }
         _ => None,
     }
@@ -5143,7 +5143,7 @@ pub(crate) fn numeric_display_string<S: EvalSemantics>(value: &OwnedValue) -> St
     if let OwnedValue::NumberLiteral(repr, literal) = value {
         if let NumberRepr::Float(f) = repr {
             if f.is_nan() || f.is_infinite() {
-                return nonfinite_display_string::<S>(*f);
+                return nonfinite_display_string::<S>(*f).to_string();
             }
         }
         // yq preserves a document-sourced literal's exact source spelling
@@ -5157,25 +5157,61 @@ pub(crate) fn numeric_display_string<S: EvalSemantics>(value: &OwnedValue) -> St
         }
     } else if let OwnedValue::Float(f) = value {
         if f.is_nan() || f.is_infinite() {
-            return nonfinite_display_string::<S>(*f);
+            return nonfinite_display_string::<S>(*f).to_string();
         }
     }
     value.number_str().expect("numeric variant").into_owned()
 }
 
 /// jq's bare `f64::Display` (`NaN`/`inf`/`-inf`) vs yq's own YAML-native
-/// spelling (`.nan`/`.inf`/`-.inf`) for a non-finite float -- see
-/// [`numeric_display_string`]'s own doc comment for the "document-sourced
-/// vs computed" caveat this doesn't attempt to resolve.
-fn nonfinite_display_string<S: EvalSemantics>(f: f64) -> String {
+/// spelling (`.nan`/`.inf`/`-.inf`) for a non-finite float.
+///
+/// See `numeric_display_string`'s own doc comment for the
+/// "document-sourced vs computed" caveat this doesn't attempt to resolve
+/// (not a doc link: that function is `pub(crate)`, unresolvable from this
+/// one's now-`pub` docs).
+///
+/// `pub`, not `pub(crate)`: `src/bin/succinctly/yq_runner.rs` is a separate
+/// binary crate depending on this one as an external dependency, and is one
+/// of several call sites this single definition now serves (#1064) --
+/// before this, the yq-mode `.nan`/`.inf`/`-.inf` decision was
+/// independently reimplemented in `stream.rs`, `json/light.rs`, and
+/// `yq_runner.rs` as well as twice more in this file, none of them sharing
+/// this definition (CLAUDE.md's #106 "duplicated predicates diverge
+/// silently" lesson).
+///
+/// Returns `&'static str`, not `String`: every branch is one of a fixed
+/// 6-string set (Rust's own `f64::Display` always normalizes any NaN bit
+/// pattern to exactly `"NaN"`, and any infinity to `"inf"`/`"-inf"`,
+/// regardless of payload/magnitude -- verified directly, not assumed).
+/// Lets the two streaming call sites (`stream.rs`, `json/light.rs`) write
+/// this straight into their `Write` sink with no heap allocation, instead
+/// of allocating a `String` just to borrow and immediately drop it.
+///
+/// # Examples
+///
+/// ```
+/// use succinctly::jq::{nonfinite_display_string, YqSemantics};
+///
+/// assert_eq!(nonfinite_display_string::<YqSemantics>(f64::NAN), ".nan");
+/// assert_eq!(nonfinite_display_string::<YqSemantics>(f64::INFINITY), ".inf");
+/// assert_eq!(nonfinite_display_string::<YqSemantics>(f64::NEG_INFINITY), "-.inf");
+/// ```
+pub fn nonfinite_display_string<S: EvalSemantics>(f: f64) -> &'static str {
     if S::TAG != EvalTag::Yq {
-        f.to_string()
+        if f.is_nan() {
+            "NaN"
+        } else if f.is_sign_negative() {
+            "-inf"
+        } else {
+            "inf"
+        }
     } else if f.is_nan() {
-        ".nan".to_string()
+        ".nan"
     } else if f.is_sign_negative() {
-        "-.inf".to_string()
+        "-.inf"
     } else {
-        ".inf".to_string()
+        ".inf"
     }
 }
 
@@ -5717,26 +5753,22 @@ fn props_value_to_string(value: &OwnedValue) -> String {
         OwnedValue::Bool(true) => "true".to_string(),
         OwnedValue::Bool(false) => "false".to_string(),
         OwnedValue::Int(n) => format!("{n}"),
-        OwnedValue::Float(f) => {
-            if f.is_nan() {
-                ".nan".to_string()
-            } else if f.is_infinite() {
-                if *f > 0.0 {
-                    ".inf".to_string()
-                } else {
-                    "-.inf".to_string()
-                }
-            } else {
-                format!("{f}")
-            }
+        OwnedValue::Float(f) if f.is_nan() || f.is_infinite() => {
+            nonfinite_display_string::<YqSemantics>(*f).to_string()
         }
-        OwnedValue::NumberLiteral(NumberRepr::Float(f), _) if f.is_nan() => ".nan".to_string(),
-        OwnedValue::NumberLiteral(NumberRepr::Float(f), _) if f.is_infinite() => {
-            if *f > 0.0 {
-                ".inf".to_string()
-            } else {
-                "-.inf".to_string()
-            }
+        // Required for match exhaustiveness over the `Float` variant, but
+        // not reachable through any real filter (#1064, verified via
+        // `cargo llvm-cov` and a direct entry-point probe, not assumed):
+        // `@props` only ever sees a `Float` here via `eval_format`'s
+        // `to_owned(&value)`, which always round-trips a *finite* computed
+        // number through `from_number_bytes` -- and that always
+        // reconstructs a `NumberLiteral`, never a bare `Float`, for any
+        // valid RFC-8259 number text. Only a NaN/Infinity sentinel
+        // (guarded by the arm above, not this one) skips that
+        // reconstruction and arrives here as a bare `Float`.
+        OwnedValue::Float(f) => format!("{f}"),
+        OwnedValue::NumberLiteral(NumberRepr::Float(f), _) if f.is_nan() || f.is_infinite() => {
+            nonfinite_display_string::<YqSemantics>(*f).to_string()
         }
         // Echo verbatim (#1008): `@props` is documented as a yq-flavored
         // format function (CLAUDE.md's format table marks it `(yq)`) --
@@ -5770,26 +5802,22 @@ fn owned_to_yaml_at_depth(value: &OwnedValue, depth: usize) -> String {
         OwnedValue::Bool(true) => "true".to_string(),
         OwnedValue::Bool(false) => "false".to_string(),
         OwnedValue::Int(n) => format!("{n}"),
-        OwnedValue::Float(f) => {
-            if f.is_nan() {
-                ".nan".to_string()
-            } else if f.is_infinite() {
-                if *f > 0.0 {
-                    ".inf".to_string()
-                } else {
-                    "-.inf".to_string()
-                }
-            } else {
-                format!("{f}")
-            }
+        OwnedValue::Float(f) if f.is_nan() || f.is_infinite() => {
+            nonfinite_display_string::<YqSemantics>(*f).to_string()
         }
-        OwnedValue::NumberLiteral(NumberRepr::Float(f), _) if f.is_nan() => ".nan".to_string(),
-        OwnedValue::NumberLiteral(NumberRepr::Float(f), _) if f.is_infinite() => {
-            if *f > 0.0 {
-                ".inf".to_string()
-            } else {
-                "-.inf".to_string()
-            }
+        // Required for match exhaustiveness over the `Float` variant, but
+        // not reachable through any real filter (#1064, verified via
+        // `cargo llvm-cov` and a direct entry-point probe, not assumed):
+        // `@yaml` only ever sees a `Float` here via `eval_format`'s
+        // `to_owned(&value)`, which always round-trips a *finite* computed
+        // number through `from_number_bytes` -- and that always
+        // reconstructs a `NumberLiteral`, never a bare `Float`, for any
+        // valid RFC-8259 number text. Only a NaN/Infinity sentinel
+        // (guarded by the arm above, not this one) skips that
+        // reconstruction and arrives here as a bare `Float`.
+        OwnedValue::Float(f) => format!("{f}"),
+        OwnedValue::NumberLiteral(NumberRepr::Float(f), _) if f.is_nan() || f.is_infinite() => {
+            nonfinite_display_string::<YqSemantics>(*f).to_string()
         }
         // Echo verbatim (#1008): `@yaml` is documented as a yq-flavored
         // format function (CLAUDE.md's format table marks it `(yq)`) --
@@ -28640,6 +28668,37 @@ mod tests {
                 assert_eq!(s, "3.14");
             }
         );
+
+        // #1064: NaN/Infinity spell YAML-native, not jq's bare NaN/inf.
+        query!(br"null", "nan | @yaml",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, ".nan");
+            }
+        );
+        query!(br"null", "infinite | @yaml",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, ".inf");
+            }
+        );
+        query!(br"null", "-infinite | @yaml",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "-.inf");
+            }
+        );
+
+        // Same, but for a *document-sourced* NumberLiteral (an exponent
+        // overflowing to +/-infinity), not a computed Float -- a separate
+        // match arm in owned_to_yaml_at_depth.
+        query!(br"1e400", "@yaml",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, ".inf");
+            }
+        );
+        query!(br"-1e400", "@yaml",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "-.inf");
+            }
+        );
     }
 
     #[test]
@@ -28711,6 +28770,37 @@ mod tests {
         query!(br"[1, 2, 3]", "@props",
             QueryResult::Owned(OwnedValue::String(s)) => {
                 assert_eq!(s, "0 = 1\n1 = 2\n2 = 3");
+            }
+        );
+
+        // #1064: NaN/Infinity spell YAML-native, not jq's bare NaN/inf.
+        query!(br"null", "nan | @props",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, ".nan");
+            }
+        );
+        query!(br"null", "infinite | @props",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, ".inf");
+            }
+        );
+        query!(br"null", "-infinite | @props",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "-.inf");
+            }
+        );
+
+        // Same, but for a *document-sourced* NumberLiteral (an exponent
+        // overflowing to +/-infinity), not a computed Float -- a separate
+        // match arm in props_value_to_string.
+        query!(br"1e400", "@props",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, ".inf");
+            }
+        );
+        query!(br"-1e400", "@props",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "-.inf");
             }
         );
     }

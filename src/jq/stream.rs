@@ -619,25 +619,17 @@ fn stream_owned_value_yaml_at_depth<W: core::fmt::Write>(
         OwnedValue::Bool(true) => out.write_str("true"),
         OwnedValue::Bool(false) => out.write_str("false"),
         OwnedValue::Int(n) => write!(out, "{n}"),
-        OwnedValue::Float(f) => {
-            if f.is_nan() {
-                out.write_str(".nan")
-            } else if f.is_infinite() {
-                if *f > 0.0 {
-                    out.write_str(".inf")
-                } else {
-                    out.write_str("-.inf")
-                }
-            } else {
-                // Not `write!(out, "{f}")`: that drops the `.0` from a whole
-                // float, diverging from the identity streaming path and the
-                // DOM pretty-printer (issue #169).
-                out.write_str(&format_float_with_fraction(*f))
-            }
+        OwnedValue::Float(f) if f.is_nan() || f.is_infinite() => {
+            out.write_str(super::nonfinite_display_string::<super::YqSemantics>(*f))
         }
-        OwnedValue::NumberLiteral(NumberRepr::Float(f), _) if f.is_nan() => out.write_str(".nan"),
-        OwnedValue::NumberLiteral(NumberRepr::Float(f), _) if f.is_infinite() => {
-            out.write_str(if *f > 0.0 { ".inf" } else { "-.inf" })
+        OwnedValue::Float(f) => {
+            // Not `write!(out, "{f}")`: that drops the `.0` from a whole
+            // float, diverging from the identity streaming path and the
+            // DOM pretty-printer (issue #169).
+            out.write_str(&format_float_with_fraction(*f))
+        }
+        OwnedValue::NumberLiteral(NumberRepr::Float(f), _) if f.is_nan() || f.is_infinite() => {
+            out.write_str(super::nonfinite_display_string::<super::YqSemantics>(*f))
         }
         OwnedValue::NumberLiteral(_, literal) => {
             // Echo verbatim (#1008), matching this function's JSON sibling
@@ -1236,6 +1228,31 @@ mod tests {
 
         buf.clear();
         OwnedValue::NumberLiteral(NumberRepr::Float(f64::NEG_INFINITY), "-1e400".into())
+            .stream_yaml(&mut buf, IndentSpec::COMPACT, false)
+            .unwrap();
+        assert_eq!(buf, "-.inf");
+    }
+
+    /// #1064: the plain `OwnedValue::Float` arm (a *computed* non-finite,
+    /// as opposed to the `NumberLiteral` test above's document-sourced
+    /// one) goes through a separate match arm and was independently
+    /// reimplementing the same `.nan`/`.inf`/`-.inf` decision.
+    #[test]
+    fn test_stream_yaml_computed_float_nan_and_infinite() {
+        let mut buf = String::new();
+        OwnedValue::Float(f64::NAN)
+            .stream_yaml(&mut buf, IndentSpec::COMPACT, false)
+            .unwrap();
+        assert_eq!(buf, ".nan");
+
+        buf.clear();
+        OwnedValue::Float(f64::INFINITY)
+            .stream_yaml(&mut buf, IndentSpec::COMPACT, false)
+            .unwrap();
+        assert_eq!(buf, ".inf");
+
+        buf.clear();
+        OwnedValue::Float(f64::NEG_INFINITY)
             .stream_yaml(&mut buf, IndentSpec::COMPACT, false)
             .unwrap();
         assert_eq!(buf, "-.inf");

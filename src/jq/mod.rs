@@ -84,8 +84,8 @@ mod value;
 
 pub use error::{BinOp, Control, EvalError};
 pub use eval::{
-    eval, eval_lenient, eval_owned_with_file_index, substitute_vars, sync_aliased_paths,
-    EvalSemantics, JqSemantics, QueryResult, YqSemantics,
+    eval, eval_lenient, eval_owned_with_file_index, nonfinite_display_string, substitute_vars,
+    sync_aliased_paths, EvalSemantics, JqSemantics, QueryResult, YqSemantics,
 };
 pub use expr::{
     ArithOp, AssignOp, Builtin, CompareOp, Expr, FormatType, Import, Include, Literal, MetaValue,

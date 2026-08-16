@@ -1521,6 +1521,7 @@ pub type BorrowedJsonCursor<'a> = JsonCursor<'a, &'a [u64]>;
 use crate::jq::document::{
     DocumentCursor, DocumentElements, DocumentField, DocumentFields, DocumentValue, IndentSpec,
 };
+use crate::jq::{nonfinite_display_string, YqSemantics};
 
 impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for JsonCursor<'a, W> {
     type Value = StandardJson<'a, W>;
@@ -1792,14 +1793,8 @@ fn stream_json_as_yaml<W: AsRef<[u64]> + Clone, Out: core::fmt::Write>(
             if let Ok(i) = n.as_i64() {
                 write!(out, "{i}")
             } else if let Ok(f) = n.as_f64() {
-                if f.is_nan() {
-                    out.write_str(".nan")
-                } else if f.is_infinite() {
-                    if f > 0.0 {
-                        out.write_str(".inf")
-                    } else {
-                        out.write_str("-.inf")
-                    }
+                if f.is_nan() || f.is_infinite() {
+                    out.write_str(nonfinite_display_string::<YqSemantics>(f))
                 } else {
                     write!(out, "{f}")
                 }
@@ -2175,6 +2170,32 @@ mod tests {
         let mut buf = String::new();
         stream_json_as_yaml(&mut buf, value, 0, 0).unwrap();
         assert_eq!(buf, r#"{":a": ":b"}"#);
+    }
+
+    /// #1064: an exponent overflowing to `f64::INFINITY` (JSON has no
+    /// direct Infinity/NaN literal, so this is the only way to reach a
+    /// non-finite float through this parser) spells with yq's YAML-native
+    /// `.inf`/`-.inf`, not a bare `write!(out, "{f}")` -- this is the one
+    /// call site into `nonfinite_display_string` this issue's dedup can't
+    /// exercise through the CLI directly (the M2.5 streaming gate this
+    /// function backs doesn't trigger on a plain top-level `.` query), so
+    /// it's covered here at the unit level instead.
+    ///
+    /// Internal-consistency pin only, not oracle-verified: this exact
+    /// input has no comparable real-tool behavior to check against (real
+    /// yq hard-errors on a JSON `1e400` input entirely, "value out of
+    /// range"; real jq, which never emits YAML, just echoes the literal
+    /// text unchanged). The trigger condition and overall shape here
+    /// predate #1064 -- this PR only changed which function computes the
+    /// resulting string, not when it's called or what it does.
+    #[test]
+    fn test_stream_json_as_yaml_overflow_exponent_spells_infinity() {
+        let json = br#"{"a": 1e400, "b": -1e400}"#;
+        let index = JsonIndex::build(json);
+        let value = index.root(json).value();
+        let mut buf = String::new();
+        stream_json_as_yaml(&mut buf, value, 0, 0).unwrap();
+        assert_eq!(buf, "{a: .inf, b: -.inf}");
     }
 
     #[test]
