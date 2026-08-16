@@ -1074,13 +1074,7 @@ fn eval_object_construction<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         }
     }
 
-    if objects.is_empty() {
-        QueryResult::None
-    } else if objects.len() == 1 {
-        QueryResult::Owned(objects.pop().unwrap())
-    } else {
-        QueryResult::ManyOwned(objects)
-    }
+    owned_vec_to_result(objects)
 }
 
 /// Evaluate recursive descent.
@@ -1332,11 +1326,7 @@ fn retain_truthy<W: Clone + AsRef<[u64]>>(result: QueryResult<'_, W>) -> QueryRe
         }
         QueryResult::ManyOwned(mut vs) => {
             vs.retain(OwnedValue::is_truthy);
-            match vs.len() {
-                0 => QueryResult::None,
-                1 => QueryResult::Owned(vs.pop().unwrap()),
-                _ => QueryResult::ManyOwned(vs),
-            }
+            owned_vec_to_result(vs)
         }
         // The prefix is filtered exactly like `ManyOwned` above — jq's `//`
         // retains truthy outputs regardless of whether the stream that
@@ -1389,12 +1379,8 @@ fn push_truthiness<W: Clone + AsRef<[u64]>>(
 }
 
 /// Turn a stream of booleans into the result of a boolean operator.
-fn bools_to_result<'a, W: Clone + AsRef<[u64]>>(mut bools: Vec<bool>) -> QueryResult<'a, W> {
-    match bools.len() {
-        0 => QueryResult::None,
-        1 => QueryResult::Owned(OwnedValue::Bool(bools.pop().unwrap())),
-        _ => QueryResult::ManyOwned(bools.into_iter().map(OwnedValue::Bool).collect()),
-    }
+fn bools_to_result<'a, W: Clone + AsRef<[u64]>>(bools: Vec<bool>) -> QueryResult<'a, W> {
+    owned_vec_to_result(bools.into_iter().map(OwnedValue::Bool).collect())
 }
 
 /// The `OwnedValue`-collecting analog of [`push_truthiness`]: pushes every
@@ -5830,23 +5816,11 @@ fn builtin_skip<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         QueryResult::Many(results) => {
             let skipped: Vec<OwnedValue> =
                 results.into_iter().skip(n).map(|v| to_owned(&v)).collect();
-            if skipped.is_empty() {
-                QueryResult::None
-            } else if skipped.len() == 1 {
-                QueryResult::Owned(skipped.into_iter().next().unwrap())
-            } else {
-                QueryResult::ManyOwned(skipped)
-            }
+            owned_vec_to_result(skipped)
         }
         QueryResult::ManyOwned(results) => {
             let skipped: Vec<OwnedValue> = results.into_iter().skip(n).collect();
-            if skipped.is_empty() {
-                QueryResult::None
-            } else if skipped.len() == 1 {
-                QueryResult::Owned(skipped.into_iter().next().unwrap())
-            } else {
-                QueryResult::ManyOwned(skipped)
-            }
+            owned_vec_to_result(skipped)
         }
         QueryResult::None => QueryResult::None,
         QueryResult::Error(e) => QueryResult::Error(e),
@@ -14047,13 +14021,7 @@ fn eval_limit<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         QueryResult::Owned(v) if n >= 1 => QueryResult::Owned(v),
         QueryResult::ManyOwned(vs) => {
             let taken: Vec<_> = vs.into_iter().take(n).collect();
-            if taken.is_empty() {
-                QueryResult::None
-            } else if taken.len() == 1 {
-                QueryResult::Owned(taken.into_iter().next().unwrap())
-            } else {
-                QueryResult::ManyOwned(taken)
-            }
+            owned_vec_to_result(taken)
         }
         QueryResult::None => QueryResult::None,
         QueryResult::Error(e) => QueryResult::Error(e),
@@ -14572,6 +14540,12 @@ fn eval_range<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     }
 }
 
+/// Cap on the number of values `range(from; to; step)` will accumulate --
+/// shared by [`eval_range_values`] and [`eval_range_values_f64`] (#1029: was
+/// two independent `const MAX_RANGE` copies, the structural twin of the
+/// `MAX_ITEMS` triplication #1023 fixed for the recurse family).
+const MAX_RANGE: usize = 100000;
+
 /// Helper to generate range values.
 fn eval_range_values<'a, W: Clone + AsRef<[u64]>>(
     from: i64,
@@ -14579,7 +14553,6 @@ fn eval_range_values<'a, W: Clone + AsRef<[u64]>>(
     step: i64,
 ) -> QueryResult<'a, W> {
     let mut values: Vec<OwnedValue> = Vec::new();
-    const MAX_RANGE: usize = 100000;
 
     if step > 0 {
         let mut i = from;
@@ -14595,13 +14568,7 @@ fn eval_range_values<'a, W: Clone + AsRef<[u64]>>(
         }
     }
 
-    if values.is_empty() {
-        QueryResult::None
-    } else if values.len() == 1 {
-        QueryResult::Owned(values.pop().unwrap())
-    } else {
-        QueryResult::ManyOwned(values)
-    }
+    owned_vec_to_result(values)
 }
 
 /// Helper to generate range values over floats.
@@ -14615,7 +14582,6 @@ fn eval_range_values_f64<'a, W: Clone + AsRef<[u64]>>(
     step: f64,
 ) -> QueryResult<'a, W> {
     let mut values: Vec<OwnedValue> = Vec::new();
-    const MAX_RANGE: usize = 100000;
 
     if step > 0.0 {
         let mut i = from;
@@ -14631,13 +14597,7 @@ fn eval_range_values_f64<'a, W: Clone + AsRef<[u64]>>(
         }
     }
 
-    if values.is_empty() {
-        QueryResult::None
-    } else if values.len() == 1 {
-        QueryResult::Owned(values.pop().unwrap())
-    } else {
-        QueryResult::ManyOwned(values)
-    }
+    owned_vec_to_result(values)
 }
 
 /// Builtin: recurse (recurse(.[]))
@@ -16127,7 +16087,7 @@ fn builtin_path<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         }
     }
 
-    let mut paths: Vec<OwnedValue> = reached
+    let paths: Vec<OwnedValue> = reached
         .into_iter()
         .map(|(path, _)| OwnedValue::Array(path))
         .collect();
@@ -16140,15 +16100,11 @@ fn builtin_path<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         };
     }
 
-    match paths.len() {
-        // "No paths at all" is *no output*, never `Array(vec![])`. The empty
-        // path is a real answer — it is what `path(.)` returns — and the one
-        // path that always resolves, so rendering emptiness as it aims a
-        // caller's `getpath`/`setpath`/`delpaths` at the document root (#489).
-        0 => QueryResult::None,
-        1 => QueryResult::Owned(paths.pop().expect("len checked")),
-        _ => QueryResult::ManyOwned(paths),
-    }
+    // "No paths at all" is *no output*, never `Array(vec![])`. The empty
+    // path is a real answer — it is what `path(.)` returns — and the one
+    // path that always resolves, so rendering emptiness as it aims a
+    // caller's `getpath`/`setpath`/`delpaths` at the document root (#489).
+    owned_vec_to_result(paths)
 }
 
 /// Walk `expr` as a path expression, pushing `(path, value-at-path)` for every
@@ -16477,11 +16433,7 @@ fn builtin_fromstream<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
     match control {
         Some(control) => partial(outputs, control),
-        None => match outputs.len() {
-            0 => QueryResult::None,
-            1 => QueryResult::Owned(outputs.pop().unwrap()),
-            _ => QueryResult::ManyOwned(outputs),
-        },
+        None => owned_vec_to_result(outputs),
     }
 }
 
@@ -16545,11 +16497,7 @@ fn builtin_truncate_stream<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
     match control {
         Some(control) => partial(outputs, control),
-        None => match outputs.len() {
-            0 => QueryResult::None,
-            1 => QueryResult::Owned(outputs.pop().unwrap()),
-            _ => QueryResult::ManyOwned(outputs),
-        },
+        None => owned_vec_to_result(outputs),
     }
 }
 
@@ -16563,13 +16511,7 @@ fn builtin_paths<W: Clone + AsRef<[u64]>>(
     let mut paths = Vec::new();
     collect_paths(&owned, &[], &mut paths);
     // Stream individual paths instead of wrapping in array
-    if paths.is_empty() {
-        QueryResult::None
-    } else if paths.len() == 1 {
-        QueryResult::Owned(paths.pop().unwrap())
-    } else {
-        QueryResult::ManyOwned(paths)
-    }
+    owned_vec_to_result(paths)
 }
 
 /// Builtin: paths(filter) - paths to values matching filter
@@ -16703,13 +16645,7 @@ fn builtin_paths_filter<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         }
     }
     // Stream individual paths instead of wrapping in array
-    if filtered_paths.is_empty() {
-        QueryResult::None
-    } else if filtered_paths.len() == 1 {
-        QueryResult::Owned(filtered_paths.pop().unwrap())
-    } else {
-        QueryResult::ManyOwned(filtered_paths)
-    }
+    owned_vec_to_result(filtered_paths)
 }
 
 /// Helper to get value at a path (alias for convenience)
@@ -16813,13 +16749,7 @@ fn builtin_leaf_paths<W: Clone + AsRef<[u64]>>(
     let mut paths = Vec::new();
     collect_leaf_paths(&owned, &[], &mut paths);
     // Stream individual paths instead of wrapping in array
-    if paths.is_empty() {
-        QueryResult::None
-    } else if paths.len() == 1 {
-        QueryResult::Owned(paths.pop().unwrap())
-    } else {
-        QueryResult::ManyOwned(paths)
-    }
+    owned_vec_to_result(paths)
 }
 
 /// Resolve a `setpath` array index against the array's current length.
@@ -20314,23 +20244,11 @@ fn builtin_limit<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         QueryResult::Many(results) => {
             let limited: Vec<OwnedValue> =
                 results.into_iter().take(n).map(|v| to_owned(&v)).collect();
-            if limited.is_empty() {
-                QueryResult::None
-            } else if limited.len() == 1 {
-                QueryResult::Owned(limited.into_iter().next().unwrap())
-            } else {
-                QueryResult::ManyOwned(limited)
-            }
+            owned_vec_to_result(limited)
         }
         QueryResult::ManyOwned(results) => {
             let limited: Vec<OwnedValue> = results.into_iter().take(n).collect();
-            if limited.is_empty() {
-                QueryResult::None
-            } else if limited.len() == 1 {
-                QueryResult::Owned(limited.into_iter().next().unwrap())
-            } else {
-                QueryResult::ManyOwned(limited)
-            }
+            owned_vec_to_result(limited)
         }
         QueryResult::None => QueryResult::None,
         QueryResult::Error(e) => QueryResult::Error(e),
