@@ -3016,6 +3016,34 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         // compact mapping out from under it.
         let indent = self.resolve_compact_mapping_gap_indent(indent);
 
+        // The `:` must land at exactly its own `?`'s column: YAML ties both
+        // productions to the same indentation parameter `n`
+        // (c-l-block-map-explicit-key/value(n)), so any deviation -- not
+        // just a dedent -- is ambiguous (#1010). This is a different shape
+        // than the dedent ambiguity `check_mapping_under_mapping_gap` above
+        // detects: that check's `indent >= indent_stack[top]` short-circuit
+        // is correct for `parse_mapping_entry`'s "deeper indent opens a new
+        // nested mapping" semantics, but wrongly waves through an
+        // over-indented `:` here, since a `:` value line never opens a new
+        // frame the way an ordinary `key: value` line does. Checked against
+        // the #885-resolved `indent` above, not the raw column, so the
+        // sequence-item-compact-mapping gap tolerance that normalization
+        // grants stays intact (`-   a: hello\n  ? b\n  : 2\n` must still
+        // resolve `: 2` to the compact mapping's own indent, not reject it).
+        // Confirmed live against real yq: `? k\n : v\n` (`:` one column past
+        // `?`) and deeper misalignments both error ("did not find expected
+        // key"); only exact alignment, or no pending key at all (a bare
+        // `: value` with no `?`, a separate and pre-existing out-of-scope
+        // shape), is left alone here.
+        if let Some(owner_depth) = self.pending_explicit_key {
+            if self.indent_stack[owner_depth - 1] != indent {
+                return Err(YamlError::InconsistentIndentation {
+                    offset: self.pos,
+                    line: self.current_line(),
+                });
+            }
+        }
+
         // Close deeper structures, but keep the mapping at this indent open
         self.close_deeper_indents(indent + 1);
 
@@ -6412,15 +6440,24 @@ mod tests {
     /// corpus shape (id `35KP`, "Tags for Root Objects") that used to
     /// exercise this before this PR's tag-support change routed that corpus
     /// case through a different path (#224).
+    ///
+    /// #1010: this `:` (column 2) doesn't actually align with its own `?`
+    /// (column 0) either, which real yq rejects ("did not find expected
+    /// key") -- confirmed live. Before #1010's fix, `parse_explicit_value`
+    /// had no alignment check at all, so this silently resolved to `{"a":1}`
+    /// once the guard above stopped the scalar from swallowing `: 1`; the
+    /// guard's own job (stopping the scalar there rather than absorbing the
+    /// line as text) is unchanged and still exercised here, but the
+    /// now-separated `: 1` line is correctly rejected instead of silently
+    /// accepted.
     #[test]
     fn multiline_plain_scalar_stops_before_explicit_value_indicator() {
         let yaml: &[u8] = b"?   a\n  : 1\n";
-        let index = crate::yaml::YamlIndex::build(yaml).unwrap();
-        let cursor = index.root(yaml);
-        assert_eq!(
-            cursor.to_json(),
-            r#"[{"a":1}]"#,
-            "explicit key 'a' must map to 1, not swallow the ': 1' line into the key scalar"
+        let err = crate::yaml::YamlIndex::build(yaml).unwrap_err();
+        assert!(
+            matches!(err, YamlError::InconsistentIndentation { line: 2, .. }),
+            "explicit key 'a's scalar must stop before ': 1' (not swallow it into the key text), \
+             and the resulting misaligned ':' must then be rejected, not silently paired with 'a'; got {err:?}"
         );
     }
 
