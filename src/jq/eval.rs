@@ -4100,9 +4100,14 @@ fn builtin_split<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// yq never JSON-encodes a nested container into a join part the way it does
 /// for other unsupported operations). Everything else (number, boolean)
 /// renders via its JSON text, same as jq's own element rule.
-fn yq_join_element_part(elem: &OwnedValue) -> String {
+///
+/// Takes `elem` by value (moved from [`to_owned_key_shape`] at the call
+/// site, not [`to_owned`]) so a container element's contents are never
+/// materialized at all -- they're discarded unread here regardless -- and a
+/// string element is moved rather than cloned a second time.
+fn yq_join_element_part(elem: OwnedValue) -> String {
     match elem {
-        OwnedValue::String(s) => s.clone(),
+        OwnedValue::String(s) => s,
         OwnedValue::Null | OwnedValue::Array(_) | OwnedValue::Object(_) => String::new(),
         other => other.to_json(),
     }
@@ -4117,9 +4122,9 @@ fn yq_join_element_part(elem: &OwnedValue) -> String {
 /// flagged this element/separator asymmetry as a real, separate divergence
 /// from jq mode, where `null` is a no-op only via `+`'s own left-identity
 /// rule, not something `join` special-cases).
-fn yq_join_separator(sep: &OwnedValue) -> String {
+fn yq_join_separator(sep: OwnedValue) -> String {
     match sep {
-        OwnedValue::String(s) => s.clone(),
+        OwnedValue::String(s) => s,
         OwnedValue::Array(_) | OwnedValue::Object(_) => String::new(),
         other => other.to_json(),
     }
@@ -4188,7 +4193,11 @@ fn join_step<S: EvalSemantics>(
 /// `"1,2"` (missing separator) instead of jq's own `"1,,2"`.
 ///
 /// **yq-mode note (#1041, live-verified against yq v4.53.3):** the algorithm
-/// above is jq-specific. Real yq's `join` diverges in four confirmed ways:
+/// above is jq-specific. Real yq's `join` diverges in four confirmed ways
+/// (not necessarily exhaustive -- an empty-object separator and a NaN/
+/// Infinity element or separator were found to diverge too, after this
+/// fix landed; tracked as a narrower follow-up rather than expanding this
+/// PR's own scope):
 /// - Input must be an *array* -- an object (or any other non-array) is
 ///   rejected outright with `"cannot join with <tag>, can only join arrays
 ///   of scalars"`, unlike jq's own object-iterates-its-values leniency
@@ -4214,11 +4223,15 @@ fn builtin_join<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     };
 
     if S::TAG == EvalTag::Yq {
-        let sep_str = yq_join_separator(&sep);
+        let sep_str = yq_join_separator(sep);
         return match value {
             StandardJson::Array(elements) => {
+                // `to_owned_key_shape`, not `to_owned`: a container element
+                // collapses to an empty-string part regardless of its
+                // contents (see `yq_join_element_part`'s doc comment), so
+                // deep-copying it first would be pure waste (#1044 review).
                 let parts: Vec<String> = elements
-                    .map(|e| yq_join_element_part(&to_owned(&e)))
+                    .map(|e| yq_join_element_part(to_owned_key_shape(&e)))
                     .collect();
                 QueryResult::Owned(OwnedValue::String(parts.join(&sep_str)))
             }
