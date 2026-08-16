@@ -28665,6 +28665,20 @@ mod tests {
                 assert_eq!(s, "-.inf");
             }
         );
+
+        // Same, but for a *document-sourced* NumberLiteral (an exponent
+        // overflowing to +/-infinity), not a computed Float -- a separate
+        // match arm in owned_to_yaml_at_depth.
+        query!(br"1e400", "@yaml",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, ".inf");
+            }
+        );
+        query!(br"-1e400", "@yaml",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "-.inf");
+            }
+        );
     }
 
     #[test]
@@ -28751,6 +28765,20 @@ mod tests {
             }
         );
         query!(br"null", "-infinite | @props",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "-.inf");
+            }
+        );
+
+        // Same, but for a *document-sourced* NumberLiteral (an exponent
+        // overflowing to +/-infinity), not a computed Float -- a separate
+        // match arm in props_value_to_string.
+        query!(br"1e400", "@props",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, ".inf");
+            }
+        );
+        query!(br"-1e400", "@props",
             QueryResult::Owned(OwnedValue::String(s)) => {
                 assert_eq!(s, "-.inf");
             }
