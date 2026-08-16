@@ -895,7 +895,7 @@ fn eval_on_owned<S: EvalSemantics, V: DocumentValue>(
         return format_result::<S, _>(format_type, &owned, optional);
     }
 
-    let json_str = owned.to_json_for_reindex();
+    let json_str = owned.to_json_for_reindex::<S>();
     let json_bytes = json_str.as_bytes();
     let index = JsonIndex::build(json_bytes);
     let cursor = index.root(json_bytes);
@@ -2594,7 +2594,7 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
         _ => {
             // Convert to OwnedValue, then to JSON, then evaluate with full evaluator
             let owned = to_owned_with_cursor(&value, cursor);
-            let json_str = owned.to_json_for_reindex();
+            let json_str = owned.to_json_for_reindex::<S>();
             let json_bytes = json_str.as_bytes();
             let index = JsonIndex::build(json_bytes);
             let cursor = index.root(json_bytes);

@@ -20,6 +20,9 @@ use std::borrow::Cow;
 use indexmap::IndexMap;
 
 use super::escape::{escape_json_body, write_json_body_jq};
+#[cfg(test)]
+use super::eval::JqSemantics;
+use super::eval::{EvalSemantics, EvalTag};
 use super::expr::Literal;
 
 /// Recursion-depth ceiling for tree-walkers over an already-materialized
@@ -236,6 +239,19 @@ pub fn format_number_jq_compat(raw: &[u8]) -> String {
 
     let sign = if value < 0.0 { "-" } else { "" };
     assemble_scientific(sign, &mantissa_str, i64::from(new_exp))
+}
+
+/// jq mode's bare `Float` display: no forced decimal point, matching real
+/// jq's own convention that a computed value (one with no preserved
+/// `NumberLiteral` source text) loses its literal formatting entirely
+/// (`1.0 + 4.0` prints `5`, not `5.0`). Named and shared, rather than a
+/// hand-copied `|f| f.to_string()` closure at each call site, per the #106
+/// "duplicated predicates diverge silently" lesson in `CLAUDE.md` --
+/// [`to_json`](OwnedValue::to_json), [`to_json_for_reindex_at_depth`]'s
+/// jq-mode fallback, and [`stream::stream_owned_value_json_jq`](crate::jq::stream)
+/// all need this exact formatter.
+pub(crate) fn jq_bare_float_display(f: f64) -> String {
+    f.to_string()
 }
 
 /// Join a sign, an already-normalized mantissa, and an exponent into jq's
@@ -738,7 +754,7 @@ impl OwnedValue {
     /// entirely: no adversarial document is involved, only enough loop
     /// iterations to grow the accumulator past the limit.
     pub fn to_json(&self) -> String {
-        self.to_json_at_depth(0, format_number_jq_compat)
+        self.to_json_at_depth(0, format_number_jq_compat, jq_bare_float_display)
     }
 
     /// The yq-mode sibling of [`to_json`](Self::to_json) (#1030): identical
@@ -750,17 +766,38 @@ impl OwnedValue {
     /// interpolation's container arm (`owned_to_string`), both of which need
     /// this same literal-preserving JSON text, not [`to_json`](Self::to_json)'s
     /// jq-normalized one.
+    ///
+    /// Also keeps a whole-number `Float`'s decimal point (`format_float_with_fraction`,
+    /// #953) -- unlike jq, which happily prints `1.0` as `1` in JSON (matching
+    /// real jq's own `tojson`), yq must not: `1.0` and `1` are different YAML
+    /// types, and dropping the point on a round trip changes it (#169's own
+    /// reasoning, reused here for the same class of value reached from a
+    /// different path -- an i64-overflow decimal integer scalar, which
+    /// `resolve_plain` also classifies as `!!float`, confirmed live against
+    /// the pinned oracle: real yq's `-o json` gives `100...0.0`, not
+    /// `100...0`).
     pub(crate) fn to_json_yq(&self) -> String {
-        self.to_json_at_depth(0, crate::jq::stream::real_output_finite_literal)
+        self.to_json_at_depth(
+            0,
+            crate::jq::stream::real_output_finite_literal,
+            crate::yaml::format_float_with_fraction,
+        )
     }
 
-    /// `finite_literal` formats a `NumberLiteral`'s source text -- jq's
-    /// [`format_number_jq_compat`] for [`to_json`](Self::to_json), or a
-    /// verbatim echo for [`to_json_yq`](Self::to_json_yq) -- mirroring the
-    /// same fork [`stream::stream_owned_value_json_with`](crate::jq::stream)
-    /// already threads through for the M2 streaming path (#1008), so this
-    /// doesn't grow a third hand-copied "echo verbatim for yq" branch.
-    fn to_json_at_depth(&self, depth: usize, finite_literal: fn(&[u8]) -> String) -> String {
+    /// `finite_literal` formats a `NumberLiteral`'s source text, and
+    /// `float_fmt` a plain `Float`'s -- jq's [`format_number_jq_compat`]/bare
+    /// `Display` for [`to_json`](Self::to_json), or a verbatim echo/
+    /// decimal-point-preserving format for [`to_json_yq`](Self::to_json_yq)
+    /// -- mirroring the same fork
+    /// [`stream::stream_owned_value_json_with`](crate::jq::stream) already
+    /// threads through for the M2 streaming path (#1008), so this doesn't
+    /// grow a third hand-copied jq/yq-formatting branch.
+    fn to_json_at_depth(
+        &self,
+        depth: usize,
+        finite_literal: fn(&[u8]) -> String,
+        float_fmt: fn(f64) -> String,
+    ) -> String {
         assert_value_tree_depth(depth);
         match self {
             Self::Null => "null".into(),
@@ -771,7 +808,7 @@ impl OwnedValue {
                 if f.is_nan() || f.is_infinite() {
                     "null".into() // JSON doesn't support NaN or Infinity
                 } else {
-                    format!("{f}")
+                    float_fmt(*f)
                 }
             }
             Self::NumberLiteral(NumberRepr::Float(f), _) if f.is_nan() || f.is_infinite() => {
@@ -782,7 +819,7 @@ impl OwnedValue {
             Self::Array(arr) => {
                 let elements: Vec<String> = arr
                     .iter()
-                    .map(|v| v.to_json_at_depth(depth + 1, finite_literal))
+                    .map(|v| v.to_json_at_depth(depth + 1, finite_literal, float_fmt))
                     .collect();
                 format!("[{}]", elements.join(","))
             }
@@ -793,7 +830,7 @@ impl OwnedValue {
                         format!(
                             "\"{}\":{}",
                             escape_json_body(write_json_body_jq, k),
-                            v.to_json_at_depth(depth + 1, finite_literal)
+                            v.to_json_at_depth(depth + 1, finite_literal, float_fmt)
                         )
                     })
                     .collect();
@@ -813,8 +850,26 @@ impl OwnedValue {
     /// `numeric_display_string()` (in `src/jq/eval.rs`) needs downstream once
     /// the bridge re-parses this text and hands the cursor to the full
     /// evaluator (#561, #472).
-    pub(crate) fn to_json_for_reindex(&self) -> String {
-        self.to_json_for_reindex_at_depth(0)
+    ///
+    /// `S: EvalSemantics` picks the plain (non-`NumberLiteral`) `Float`
+    /// fallback's spelling (#953): yq keeps a decimal point regardless of
+    /// magnitude (`format_float_with_fraction`), matching real yq's own
+    /// `-o json '[.a]'` output for a value with no preserved literal (e.g.
+    /// an i64-overflow YAML scalar reaching this bridge via `[...]`/
+    /// `map_values`/`with_entries`, which have no native `eval_generic.rs`
+    /// cursor arm). jq keeps the pre-existing bare `Display` (no forced
+    /// point): real jq's own convention drops a computed value's literal
+    /// formatting entirely (`1.0 + 4.0` prints `5`, not `5.0`), and a bare
+    /// `Float` reaching this fallback is by construction one that already
+    /// lost its `NumberLiteral` text — confirmed live this must stay
+    /// mode-gated, not unconditional: an earlier draft hardcoded yq's
+    /// formatter here unconditionally, which silently flipped
+    /// `reduce (1,2) as $i (1.0 + 4.0; [.])` in **jq** mode from the
+    /// correct `[[[5]]]` to `[[[5.0]]]` (caught in code review) since
+    /// `format_number_jq_compat` does not strip an explicit `.0` back off a
+    /// literal it's handed after the reparse.
+    pub(crate) fn to_json_for_reindex<S: EvalSemantics>(&self) -> String {
+        self.to_json_for_reindex_at_depth::<S>(0)
     }
 
     /// Panics past [`MAX_VALUE_TREE_DEPTH`] levels of nesting (#1005) — see
@@ -824,7 +879,7 @@ impl OwnedValue {
     /// reindex bridge) are exactly the ones that grow a value one level
     /// deeper per loop iteration with no adversarial document involved, so
     /// it needs the same guard [`to_json`](Self::to_json) does.
-    fn to_json_for_reindex_at_depth(&self, depth: usize) -> String {
+    fn to_json_for_reindex_at_depth<S: EvalSemantics>(&self, depth: usize) -> String {
         assert_value_tree_depth(depth);
         match self {
             Self::Float(f) if f.is_nan() => NAN_SENTINEL.to_string(),
@@ -884,7 +939,7 @@ impl OwnedValue {
             Self::Array(arr) => {
                 let elements: Vec<String> = arr
                     .iter()
-                    .map(|v| v.to_json_for_reindex_at_depth(depth + 1))
+                    .map(|v| v.to_json_for_reindex_at_depth::<S>(depth + 1))
                     .collect();
                 format!("[{}]", elements.join(","))
             }
@@ -895,13 +950,22 @@ impl OwnedValue {
                         format!(
                             "\"{}\":{}",
                             escape_json_body(write_json_body_jq, k),
-                            v.to_json_for_reindex_at_depth(depth + 1)
+                            v.to_json_for_reindex_at_depth::<S>(depth + 1)
                         )
                     })
                     .collect();
                 format!("{{{}}}", entries.join(","))
             }
-            other => other.to_json_at_depth(depth, format_number_jq_compat),
+            // yq keeps a whole-number `Float`'s decimal point at any
+            // magnitude (#953); jq keeps the original bare `Display` (see
+            // this function's own doc comment for why the fork is required,
+            // not optional).
+            other if S::TAG == EvalTag::Yq => other.to_json_at_depth(
+                depth,
+                format_number_jq_compat,
+                crate::yaml::format_float_with_fraction,
+            ),
+            other => other.to_json_at_depth(depth, format_number_jq_compat, jq_bare_float_display),
         }
     }
 }
@@ -1650,11 +1714,11 @@ mod tests {
         // the reserved sentinel instead of falling back to `to_json`'s
         // "null" substitution (#472).
         assert_eq!(
-            OwnedValue::Float(f64::NAN).to_json_for_reindex(),
+            OwnedValue::Float(f64::NAN).to_json_for_reindex::<JqSemantics>(),
             NAN_SENTINEL
         );
         let lit = OwnedValue::NumberLiteral(NumberRepr::Float(f64::NAN), "nan".into());
-        assert_eq!(lit.to_json_for_reindex(), NAN_SENTINEL);
+        assert_eq!(lit.to_json_for_reindex::<JqSemantics>(), NAN_SENTINEL);
     }
 
     /// #939: an infinite `NumberLiteral` backed by real document text (any
@@ -1666,10 +1730,10 @@ mod tests {
     #[test]
     fn test_to_json_for_reindex_reuses_overflow_literal_text() {
         let lit = OwnedValue::NumberLiteral(NumberRepr::Float(f64::INFINITY), "123e400".into());
-        assert_eq!(lit.to_json_for_reindex(), "123e400");
+        assert_eq!(lit.to_json_for_reindex::<JqSemantics>(), "123e400");
 
         let lit = OwnedValue::NumberLiteral(NumberRepr::Float(f64::NEG_INFINITY), "-1e400".into());
-        assert_eq!(lit.to_json_for_reindex(), "-1e400");
+        assert_eq!(lit.to_json_for_reindex::<JqSemantics>(), "-1e400");
     }
 
     /// #939 review: reusing the literal's own text is O(its length), and
@@ -1684,7 +1748,7 @@ mod tests {
     fn test_to_json_for_reindex_bounds_an_unrealistically_long_literal() {
         let huge_literal = format!("{}e400", "9".repeat(300));
         let lit = OwnedValue::NumberLiteral(NumberRepr::Float(f64::INFINITY), huge_literal.into());
-        assert_eq!(lit.to_json_for_reindex(), "1e999");
+        assert_eq!(lit.to_json_for_reindex::<JqSemantics>(), "1e999");
     }
 
     #[test]
@@ -1942,7 +2006,7 @@ mod tests {
         let under = linear_array_nest(MAX_VALUE_TREE_DEPTH - 1);
         // Under the limit: succeeds (doesn't panic).
         let _ = under.to_json();
-        let _ = under.to_json_for_reindex();
+        let _ = under.to_json_for_reindex::<JqSemantics>();
 
         let over = linear_array_nest(MAX_VALUE_TREE_DEPTH);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| over.to_json()));
@@ -1950,8 +2014,9 @@ mod tests {
             result.is_err(),
             "to_json should panic at MAX_VALUE_TREE_DEPTH"
         );
-        let result =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| over.to_json_for_reindex()));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            over.to_json_for_reindex::<JqSemantics>()
+        }));
         assert!(
             result.is_err(),
             "to_json_for_reindex should panic at MAX_VALUE_TREE_DEPTH"

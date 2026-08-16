@@ -11652,3 +11652,40 @@ fn test_yq_join_preserves_exponent_literal_in_separator_1030() -> Result<()> {
     assert_eq!(stdout.trim_end(), "1e21e2a1e2b");
     Ok(())
 }
+
+#[test]
+fn test_yq_array_wrapped_overflow_int_keeps_decimal_point_953() -> Result<()> {
+    // #953's exact repro: `.a` alone streams straight from the YAML cursor
+    // and was already correct; `[.a]` forces `eval_generic.rs`'s
+    // reindex bridge (no native cursor arm for `Expr::Array`), which used
+    // to drop the decimal point on the round-tripped `Float` (real yq
+    // v4.53.3: `100000000000000000000.0`).
+    let (stdout, code) = run_yq_stdin("[.a]", "a: 99999999999999999999\n", &["-o", "json", "-I0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "[100000000000000000000.0]");
+    Ok(())
+}
+
+#[test]
+fn test_yq_bare_overflow_int_scalar_unaffected_953() -> Result<()> {
+    // The streaming path this issue compared against must stay unaffected
+    // by the reindex-bridge fix above.
+    let (stdout, code) = run_yq_stdin(".a", "a: 99999999999999999999\n", &["-o", "json"])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "100000000000000000000.0");
+    Ok(())
+}
+
+#[test]
+fn test_yq_map_values_overflow_int_keeps_decimal_point_953() -> Result<()> {
+    // Another `eval_generic.rs`-unhandled `Expr` shape that routes through
+    // the same reindex bridge as `[...]`.
+    let (stdout, code) = run_yq_stdin(
+        "map_values(.)",
+        "a: 99999999999999999999\n",
+        &["-o", "json", "-I0"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), r#"{"a":100000000000000000000.0}"#);
+    Ok(())
+}
