@@ -106,9 +106,9 @@ pub enum NumberRepr {
 
 /// Try `i64` first, fall back to `f64` -- the one definition of "how does a
 /// number string decide between the two representations," shared by
-/// [`OwnedValue::from_number_literal_boxed`] and
-/// [`OwnedValue::from_number_bytes`] so they can't silently diverge.
-fn parse_i64_or_f64(s: &str) -> Option<NumberRepr> {
+/// [`OwnedValue::from_number_literal_boxed`], [`OwnedValue::from_number_bytes`],
+/// and `parser.rs`'s `fold_index_key` so they can't silently diverge.
+pub(crate) fn parse_i64_or_f64(s: &str) -> Option<NumberRepr> {
     if let Ok(i) = s.parse::<i64>() {
         Some(NumberRepr::Int(i))
     } else if let Ok(f) = s.parse::<f64>() {
@@ -451,12 +451,13 @@ pub enum OwnedValue {
     Int(i64),
     /// JSON floating-point number
     Float(f64),
-    /// A number materialized straight from a document token, carrying jq's
-    /// exact source spelling (e.g. `1e100`, `1.0`, `-0.0`) alongside its
-    /// parsed value.
+    /// A number materialized straight from a document token or a filter's
+    /// own literal text, carrying jq's exact source spelling (e.g. `1e100`,
+    /// `1.0`, `-0.0`) alongside its parsed value.
     ///
-    /// Produced only by `to_owned`-style conversions out of a document
-    /// cursor; every other constructor keeps using [`Int`](Self::Int)/
+    /// Produced by `to_owned`-style conversions out of a document cursor,
+    /// and (since #1035) by `Literal::NumberLiteral`'s own evaluation --
+    /// every *other* constructor keeps using [`Int`](Self::Int)/
     /// [`Float`](Self::Float) directly. Arithmetic, comparison, and math
     /// builtins treat this exactly like `Int`/`Float` for computation --
     /// only formatting (`to_json`, `tostring`, `@json`, string
@@ -1189,6 +1190,7 @@ impl From<Literal> for OwnedValue {
         match lit {
             Literal::Null => Self::Null,
             Literal::Bool(b) => Self::Bool(b),
+            Literal::NumberLiteral(text) => Self::from_number_literal_boxed(text.into()),
             Literal::Int(n) => Self::Int(n),
             Literal::Float(f) => Self::Float(f),
             Literal::String(s) => Self::String(s),
@@ -1365,6 +1367,16 @@ mod tests {
             OwnedValue::from(Literal::String("hello".into())),
             OwnedValue::String("hello".into())
         );
+        // #1035: a filter-literal number keeps its own source spelling
+        // through this conversion too, same as `literal_to_owned`'s
+        // sibling in eval.rs.
+        match OwnedValue::from(Literal::NumberLiteral("1.500".to_string())) {
+            OwnedValue::NumberLiteral(NumberRepr::Float(f), text) => {
+                assert_eq!(f, 1.5);
+                assert_eq!(text.as_ref(), "1.500");
+            }
+            other => panic!("expected NumberLiteral, got {other:?}"),
+        }
     }
 
     #[test]

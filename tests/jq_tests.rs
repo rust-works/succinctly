@@ -1,6 +1,6 @@
 //! Integration tests for jq query functionality.
 
-use succinctly::jq::{eval, eval_lenient, parse, JqSemantics, OwnedValue, QueryResult};
+use succinctly::jq::{eval, eval_lenient, parse, JqSemantics, NumberRepr, OwnedValue, QueryResult};
 use succinctly::json::light::StandardJson;
 use succinctly::json::JsonIndex;
 
@@ -500,7 +500,9 @@ fn test_optional_after_builtin_call_success() {
 #[test]
 fn test_optional_after_parenthesized_expr() {
     query!(b"null", "(1)?",
-        QueryResult::Owned(OwnedValue::Int(n)) => {
+        QueryResult::Owned(
+            OwnedValue::Int(n) | OwnedValue::NumberLiteral(NumberRepr::Int(n), _)
+        ) => {
             assert_eq!(n, 1);
         }
     );
@@ -1157,10 +1159,17 @@ fn test_length_of_i64_min_falls_back_to_float() {
 
 #[test]
 fn test_large_integer_literal_evaluates_to_float() {
-    // jq: 9999999999999999999 => 10000000000000000000 (float; issue #166)
+    // Beyond i64 range, the literal's *numeric value* degrades to a float
+    // (issue #166) -- but #1035 keeps the literal's own source spelling
+    // through evaluation, matching real jq: `jq -n '9999999999999999999'`
+    // prints the digit string back verbatim, not a rounded
+    // `10000000000000000000` (verified against jq 1.7.1; the comment this
+    // test previously carried claiming otherwise was never actually
+    // checked against a live oracle).
     query!(b"null", "9999999999999999999",
-        QueryResult::Owned(OwnedValue::Float(f)) => {
-            assert_eq!(f, 1e19, "expected literal to degrade to 1e19, got {f}");
+        QueryResult::Owned(OwnedValue::NumberLiteral(NumberRepr::Float(f), text)) => {
+            assert_eq!(f, 1e19, "expected literal's value to degrade to 1e19, got {f}");
+            assert_eq!(text.as_ref(), "9999999999999999999");
         }
     );
 }
@@ -1463,7 +1472,9 @@ fn test_alternative_with_false() {
 fn test_alternative_with_zero() {
     // jq: 0 // "default" => 0 (0 is truthy in jq)
     query!(b"null", r#"0 // "default""#,
-        QueryResult::Owned(OwnedValue::Int(n)) => {
+        QueryResult::Owned(
+            OwnedValue::Int(n) | OwnedValue::NumberLiteral(NumberRepr::Int(n), _)
+        ) => {
             assert_eq!(n, 0);
         }
     );

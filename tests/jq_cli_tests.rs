@@ -1808,11 +1808,16 @@ fn test_jq_compat_default() -> Result<()> {
 
 #[test]
 fn test_large_integer_literal_prints_like_jq() -> Result<()> {
-    // Integer literals beyond i64 degrade to floats like jq (issue #166):
-    // jq -n '9999999999999999999' => 10000000000000000000
+    // Integer literals beyond i64 degrade to floats *numerically* (issue
+    // #166), but #1035 keeps the literal's own source spelling through
+    // evaluation, matching real jq: `jq -n '9999999999999999999'` prints
+    // the digit string back verbatim, not a rounded
+    // `10000000000000000000` (verified against jq 1.7.1 -- the comment
+    // this test previously carried claiming otherwise was never actually
+    // checked against a live oracle).
     let (output, code) = run_jq_stdin("9999999999999999999", "null", &["-c"])?;
     assert_eq!(code, 0);
-    assert_eq!(output.trim(), "10000000000000000000");
+    assert_eq!(output.trim(), "9999999999999999999");
     Ok(())
 }
 

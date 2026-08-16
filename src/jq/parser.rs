@@ -37,6 +37,7 @@ use super::expr::{
     ArithOp, AssignOp, Builtin, CompareOp, Expr, FormatType, Import, Include, Literal, MergeFlags,
     MetaValue, ModuleMeta, ObjectEntry, ObjectKey, Pattern, PatternEntry, Program, StringPart,
 };
+use super::value::{parse_i64_or_f64, NumberRepr};
 
 /// Parser mode controls syntax differences between jq and yq.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -353,12 +354,10 @@ impl<'a> Parser<'a> {
         }
 
         // Check for decimal point
-        let mut is_float = false;
         if self.peek() == Some('.') {
             // Look ahead to ensure it's not `..` (recursive descent)
             if self.peek_str(2) != ".." {
                 self.next(); // consume the dot
-                is_float = true;
 
                 // Consume fractional digits
                 while let Some(c) = self.peek() {
@@ -374,7 +373,6 @@ impl<'a> Parser<'a> {
         // Check for exponent
         if matches!(self.peek(), Some('e' | 'E')) {
             self.next();
-            is_float = true;
 
             // Optional sign
             if matches!(self.peek(), Some('+' | '-')) {
@@ -392,19 +390,27 @@ impl<'a> Parser<'a> {
         }
 
         let num_str = &self.input[start..self.pos];
-        if is_float {
-            num_str
-                .parse::<f64>()
-                .map(Literal::Float)
-                .map_err(|_| ParseError::new("invalid number", start))
+        let Some(repr) = parse_i64_or_f64(num_str) else {
+            return Err(ParseError::new("invalid number", start));
+        };
+        // #1035: keep the literal's own source spelling (e.g. `1.500`,
+        // `1e2`) instead of immediately collapsing it to a freshly-formatted
+        // f64/i64 -- matches how document-parsed numbers already preserve
+        // their spelling via `OwnedValue::NumberLiteral`. Only for
+        // RFC-8259-valid spellings, though: jq's own filter grammar is
+        // looser than JSON's (`1.`/`007` are valid jq number tokens jq
+        // itself reformats to `1`/`7`), and echoing one of those verbatim
+        // through `NumberLiteral` would leak invalid JSON out through
+        // `@json`/string interpolation -- `from_number_bytes` gates on the
+        // identical check for document numbers, for the identical reason
+        // (see its own doc comment).
+        if crate::json::validate::is_valid_number(num_str.as_bytes()) {
+            Ok(Literal::NumberLiteral(num_str.to_string()))
         } else {
-            // Integer literal; on i64 overflow fall back to float like jq,
-            // which represents all numbers as doubles.
-            num_str
-                .parse::<i64>()
-                .map(Literal::Int)
-                .or_else(|_| num_str.parse::<f64>().map(Literal::Float))
-                .map_err(|_| ParseError::new("invalid number", start))
+            Ok(match repr {
+                NumberRepr::Int(i) => Literal::int(i),
+                NumberRepr::Float(f) => Literal::float(f),
+            })
         }
     }
 
@@ -752,6 +758,39 @@ impl<'a> Parser<'a> {
             {
                 Some(Expr::Index(*f as i64))
             }
+            // #1035: a source-text-preserving numeric literal folds the same
+            // way -- an index's fast-path only needs the value, not its
+            // original spelling (there's no "index formatting" to preserve).
+            // Reuses `parse_i64_or_f64` (the one shared int-vs-float decision,
+            // per its own doc comment) rather than a second hand-rolled copy.
+            Expr::Literal(Literal::NumberLiteral(text)) => match parse_i64_or_f64(text)? {
+                NumberRepr::Int(i) => Some(Expr::Index(i)),
+                NumberRepr::Float(f)
+                    if f.fract() == 0.0 && f >= i64::MIN as f64 && f <= i64::MAX as f64 =>
+                {
+                    Some(Expr::Index(f as i64))
+                }
+                NumberRepr::Float(_) => None,
+            },
+            // #1035: a jq-mode negative float/exponent index/slice-bound
+            // literal (e.g. `.[-1.0]`) parses as `-1 * <positive literal>`
+            // (see `parse_primary_inner`'s negative-literal split), not a
+            // bare `Literal` -- see through that specific shape too, or
+            // every such key silently loses this fast path and downgrades
+            // to a runtime `IndexExpr`/`DynamicSlice`. The inner literal's
+            // own fold is always non-negative (the sign was already
+            // stripped when this shape was built), so negating its folded
+            // index can never overflow i64.
+            Expr::Arithmetic {
+                op: ArithOp::Mul(_),
+                left,
+                right,
+            } if matches!(**left, Expr::Literal(Literal::Int(-1))) => {
+                match Self::fold_index_key(right)? {
+                    Expr::Index(i) => Some(Expr::Index(-i)),
+                    _ => None,
+                }
+            }
             _ => None,
         }
     }
@@ -964,7 +1003,42 @@ impl<'a> Parser<'a> {
                     .is_some_and(|c| c.is_ascii_digit())
                 {
                     let lit = self.parse_number_literal()?;
-                    Ok(Expr::Literal(lit))
+                    match lit {
+                        // #1035: jq's own grammar treats a leading `-` as
+                        // unary negation, not part of the number token --
+                        // confirmed against jq 1.7.1, where `-1.500`/`-1e2`
+                        // print `-1.5`/`-100` (fidelity collapses through
+                        // the implied negation) while `1.500`/`1e2` print
+                        // unchanged. yq is the opposite: real yq never
+                        // collapses a negative literal's fidelity either
+                        // (`-1.500`/`-1e2` print back unchanged), so this
+                        // rewrite is jq-only. A plain negative *integer* has
+                        // no alternate spelling to lose (no fraction, no
+                        // exponent), so folding `-` into the token there
+                        // stays unobservable in jq mode either way -- and
+                        // it's what preserves succinctly's
+                        // i64::MIN-exact-literal capability (see
+                        // `test_large_integer_literal_falls_back_to_float`),
+                        // which routing through arithmetic would degrade to
+                        // a lossy float, unlike jq's double-only model.
+                        Literal::NumberLiteral(text)
+                            if self.mode == ParserMode::Jq && text.contains(['.', 'e', 'E']) =>
+                        {
+                            // Multiply rather than subtract from zero:
+                            // `0.0 - 0.0` is IEEE-754 positive zero,
+                            // silently losing the sign of `-0.0`/`-0e0`
+                            // (jq itself prints `-0` for these); `-1.0 *
+                            // 0.0` correctly preserves it.
+                            Ok(Expr::Arithmetic {
+                                op: ArithOp::Mul(MergeFlags::default()),
+                                left: Box::new(Expr::Literal(Literal::Int(-1))),
+                                right: Box::new(Expr::Literal(Literal::NumberLiteral(
+                                    text[1..].to_string(),
+                                ))),
+                            })
+                        }
+                        lit => Ok(Expr::Literal(lit)),
+                    }
                 } else {
                     // Unary minus: negate the following expression
                     // Implemented as (0 - expr)
@@ -4466,7 +4540,7 @@ mod tests {
         assert_eq!(
             parse("(1)?").unwrap(),
             Expr::Optional(Box::new(Expr::Paren(Box::new(Expr::Literal(
-                Literal::Int(1)
+                Literal::NumberLiteral("1".to_string())
             )))))
         );
     }
@@ -4560,7 +4634,7 @@ mod tests {
     /// with the first two untransformed.
     #[test]
     fn test_comma_binds_tighter_than_pipe() {
-        let int = |i| Expr::Literal(Literal::Int(i));
+        let int = |i: i64| Expr::Literal(Literal::NumberLiteral(i.to_string()));
 
         // (1,2) | 3 — not 1, (2 | 3)
         assert_eq!(
@@ -4605,7 +4679,7 @@ mod tests {
     /// expression, so only the *last* comma operand is bound (#462).
     #[test]
     fn test_as_binds_inside_comma_operand() {
-        let int = |i| Expr::Literal(Literal::Int(i));
+        let int = |i: i64| Expr::Literal(Literal::NumberLiteral(i.to_string()));
 
         // 1, (2 as $x | $x) — not (1,2) as $x | $x
         assert_eq!(
@@ -4640,8 +4714,14 @@ mod tests {
             other => panic!("expected an object, got {other:?}"),
         };
         assert_eq!(entries.len(), 2, "the `,` must separate two entries");
-        assert_eq!(entries[0].value, Expr::Literal(Literal::Int(1)));
-        assert_eq!(entries[1].value, Expr::Literal(Literal::Int(2)));
+        assert_eq!(
+            entries[0].value,
+            Expr::Literal(Literal::NumberLiteral("1".to_string()))
+        );
+        assert_eq!(
+            entries[1].value,
+            Expr::Literal(Literal::NumberLiteral("2".to_string()))
+        );
 
         // Parens are how a value fans out, and they still work.
         let entries = match parse("{a: (1,2)}").unwrap() {
@@ -4712,9 +4792,9 @@ mod tests {
         assert_eq!(
             parse("first(1,2,3)").unwrap(),
             Expr::FirstExpr(Box::new(Expr::Comma(vec![
-                Expr::Literal(Literal::Int(1)),
-                Expr::Literal(Literal::Int(2)),
-                Expr::Literal(Literal::Int(3)),
+                Expr::Literal(Literal::NumberLiteral("1".to_string())),
+                Expr::Literal(Literal::NumberLiteral("2".to_string())),
+                Expr::Literal(Literal::NumberLiteral("3".to_string())),
             ])))
         );
 
@@ -4722,12 +4802,12 @@ mod tests {
         assert_eq!(
             parse("[limit(2;1,2,3,4)]").unwrap(),
             Expr::Array(Box::new(Expr::Limit {
-                n: Box::new(Expr::Literal(Literal::Int(2))),
+                n: Box::new(Expr::Literal(Literal::NumberLiteral("2".to_string()))),
                 expr: Box::new(Expr::Comma(vec![
-                    Expr::Literal(Literal::Int(1)),
-                    Expr::Literal(Literal::Int(2)),
-                    Expr::Literal(Literal::Int(3)),
-                    Expr::Literal(Literal::Int(4)),
+                    Expr::Literal(Literal::NumberLiteral("1".to_string())),
+                    Expr::Literal(Literal::NumberLiteral("2".to_string())),
+                    Expr::Literal(Literal::NumberLiteral("3".to_string())),
+                    Expr::Literal(Literal::NumberLiteral("4".to_string())),
                 ])),
             }))
         );
@@ -4819,9 +4899,18 @@ mod tests {
         assert_eq!(parse("null").unwrap(), Expr::Literal(Literal::Null));
         assert_eq!(parse("true").unwrap(), Expr::Literal(Literal::Bool(true)));
         assert_eq!(parse("false").unwrap(), Expr::Literal(Literal::Bool(false)));
-        assert_eq!(parse("42").unwrap(), Expr::Literal(Literal::Int(42)));
-        assert_eq!(parse("-123").unwrap(), Expr::Literal(Literal::Int(-123)));
-        assert_eq!(parse("2.5").unwrap(), Expr::Literal(Literal::Float(2.5)));
+        assert_eq!(
+            parse("42").unwrap(),
+            Expr::Literal(Literal::NumberLiteral("42".to_string()))
+        );
+        assert_eq!(
+            parse("-123").unwrap(),
+            Expr::Literal(Literal::NumberLiteral("-123".to_string()))
+        );
+        assert_eq!(
+            parse("2.5").unwrap(),
+            Expr::Literal(Literal::NumberLiteral("2.5".to_string()))
+        );
         assert_eq!(
             parse("\"hello\"").unwrap(),
             Expr::Literal(Literal::String("hello".into()))
@@ -4834,33 +4923,46 @@ mod tests {
 
     #[test]
     fn test_large_integer_literal_falls_back_to_float() {
-        // Literals beyond i64 range degrade to floats like jq (issue #166).
+        // Literals beyond i64 range degrade to floats like jq (issue #166),
+        // but #1035 keeps the literal's own source spelling rather than
+        // immediately collapsing it to a freshly-formatted f64 -- the value
+        // still *evaluates* as a float (see the `from_number_literal`
+        // conversion), only the AST node's stored text is unaffected here.
         assert_eq!(
             parse("9999999999999999999").unwrap(),
-            Expr::Literal(Literal::Float(1e19))
+            Expr::Literal(Literal::NumberLiteral("9999999999999999999".to_string()))
         );
         assert_eq!(
             parse("-9999999999999999999").unwrap(),
-            Expr::Literal(Literal::Float(-1e19))
+            Expr::Literal(Literal::NumberLiteral("-9999999999999999999".to_string()))
         );
         // One past the boundary in each direction.
         assert_eq!(
             parse("9223372036854775808").unwrap(),
-            Expr::Literal(Literal::Float(9.223372036854776e18))
+            Expr::Literal(Literal::NumberLiteral("9223372036854775808".to_string()))
         );
         assert_eq!(
             parse("-9223372036854775809").unwrap(),
-            Expr::Literal(Literal::Float(-9.223372036854776e18))
+            Expr::Literal(Literal::NumberLiteral("-9223372036854775809".to_string()))
         );
         // Boundary values stay exact integers.
         assert_eq!(
             parse("9223372036854775807").unwrap(),
-            Expr::Literal(Literal::Int(i64::MAX))
+            Expr::Literal(Literal::NumberLiteral("9223372036854775807".to_string()))
         );
         assert_eq!(
             parse("-9223372036854775808").unwrap(),
-            Expr::Literal(Literal::Int(i64::MIN))
+            Expr::Literal(Literal::NumberLiteral("-9223372036854775808".to_string()))
         );
+    }
+
+    /// A bare exponent marker with no digits after it (`1e`) is not a
+    /// number Rust's own `f64`/`i64` parsers accept either -- confirmed
+    /// against jq 1.7.1, which also rejects it with a parse error.
+    #[test]
+    fn test_bare_exponent_marker_with_no_digits_is_a_parse_error() {
+        assert!(parse("1e").is_err());
+        assert!(parse("1e+").is_err());
     }
 
     #[test]
@@ -5366,14 +5468,14 @@ mod tests {
             Expr::slice_by(
                 Expr::Identity,
                 Some(Expr::Var("a".into())),
-                Some(Expr::Literal(Literal::Int(1))),
+                Some(Expr::Literal(Literal::NumberLiteral("1".to_string()))),
             )
         );
         assert_eq!(
             parse(".[1:$b]").unwrap(),
             Expr::slice_by(
                 Expr::Identity,
-                Some(Expr::Literal(Literal::Int(1))),
+                Some(Expr::Literal(Literal::NumberLiteral("1".to_string()))),
                 Some(Expr::Var("b".into())),
             )
         );
@@ -5381,6 +5483,29 @@ mod tests {
             parse(".[:$b]").unwrap(),
             Expr::slice_by(Expr::Identity, None, Some(Expr::Var("b".into())))
         );
+    }
+
+    /// #1035: a negative float/exponent index or slice bound still folds to
+    /// the static `Expr::Index`/`Expr::Slice` fast path, not a runtime
+    /// `IndexExpr`/`DynamicSlice` -- the jq-mode negative-literal split
+    /// (`-1.0` -> `-1 * 1.0`) must not defeat `fold_index_key`'s constant
+    /// folding, which only sees through `Expr::Literal`/`Expr::Paren`
+    /// unless taught this specific `Arithmetic` shape too.
+    #[test]
+    fn test_1035_negative_float_index_and_slice_bound_still_fold_to_static() {
+        assert_eq!(parse(".[-1.0]").unwrap(), Expr::Index(-1));
+        assert_eq!(parse(".[-1e0]").unwrap(), Expr::Index(-1));
+        assert_eq!(
+            parse(".[-3.0:-1.0]").unwrap(),
+            Expr::Slice {
+                start: Some(-3),
+                end: Some(-1),
+            }
+        );
+        // A non-integral negative float still can't fold -- same as the
+        // positive case, it must go through the evaluator to truncate the
+        // way jq does.
+        assert!(matches!(parse(".[-1.5]").unwrap(), Expr::IndexExpr { .. }));
     }
 
     /// The nesting shape is what encodes jq's key scoping: every key in a
@@ -5426,8 +5551,8 @@ mod tests {
             Expr::index_by(
                 Expr::Identity,
                 Expr::Comma(vec![
-                    Expr::Literal(Literal::Int(1)),
-                    Expr::Literal(Literal::Int(2)),
+                    Expr::Literal(Literal::NumberLiteral("1".to_string())),
+                    Expr::Literal(Literal::NumberLiteral("2".to_string())),
                 ])
             )
         );
