@@ -241,6 +241,19 @@ pub fn format_number_jq_compat(raw: &[u8]) -> String {
     assemble_scientific(sign, &mantissa_str, i64::from(new_exp))
 }
 
+/// jq mode's bare `Float` display: no forced decimal point, matching real
+/// jq's own convention that a computed value (one with no preserved
+/// `NumberLiteral` source text) loses its literal formatting entirely
+/// (`1.0 + 4.0` prints `5`, not `5.0`). Named and shared, rather than a
+/// hand-copied `|f| f.to_string()` closure at each call site, per the #106
+/// "duplicated predicates diverge silently" lesson in `CLAUDE.md` --
+/// [`to_json`](OwnedValue::to_json), [`to_json_for_reindex_at_depth`]'s
+/// jq-mode fallback, and [`stream::stream_owned_value_json_jq`](crate::jq::stream)
+/// all need this exact formatter.
+pub(crate) fn jq_bare_float_display(f: f64) -> String {
+    f.to_string()
+}
+
 /// Join a sign, an already-normalized mantissa, and an exponent into jq's
 /// scientific-notation text (`{sign}{mantissa}E{+/-}{exp}`) -- the shared
 /// final step of both the finite path above and the overflow path below, so
@@ -741,7 +754,7 @@ impl OwnedValue {
     /// entirely: no adversarial document is involved, only enough loop
     /// iterations to grow the accumulator past the limit.
     pub fn to_json(&self) -> String {
-        self.to_json_at_depth(0, format_number_jq_compat, |f| f.to_string())
+        self.to_json_at_depth(0, format_number_jq_compat, jq_bare_float_display)
     }
 
     /// The yq-mode sibling of [`to_json`](Self::to_json) (#1030): identical
@@ -952,7 +965,7 @@ impl OwnedValue {
                 format_number_jq_compat,
                 crate::yaml::format_float_with_fraction,
             ),
-            other => other.to_json_at_depth(depth, format_number_jq_compat, |f| f.to_string()),
+            other => other.to_json_at_depth(depth, format_number_jq_compat, jq_bare_float_display),
         }
     }
 }

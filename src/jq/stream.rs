@@ -26,8 +26,8 @@ use alloc::vec::Vec;
 use super::document::{DocumentFields, IndentSpec};
 use super::escape::{write_json_body_jq, write_json_body_yq};
 use super::value::{
-    assert_value_tree_depth, format_number_jq_compat, infinite_float_preview_text, NumberRepr,
-    OwnedValue,
+    assert_value_tree_depth, format_number_jq_compat, infinite_float_preview_text,
+    jq_bare_float_display, NumberRepr, OwnedValue,
 };
 use crate::yaml::format_float_with_fraction;
 
@@ -241,7 +241,7 @@ pub fn stream_owned_value_json_jq<W: core::fmt::Write>(
         ' ',
         false,
         write_json_body_jq,
-        |f| f.to_string(),
+        jq_bare_float_display,
         |negative| infinite_float_preview_text(negative).to_string(),
         preview_infinite_literal,
         format_number_jq_compat,
