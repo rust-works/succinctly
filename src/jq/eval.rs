@@ -11771,6 +11771,37 @@ fn eval_recurse_cond<S: EvalSemantics>(
     cond_err
 }
 
+/// Item cap shared by every `recurse`-family explicit-stack walker
+/// (`resolve_recurse`, `builtin_recurse_f`, `builtin_recurse_cond`) — a
+/// single definition so a future retuning can't silently miss one of the
+/// three copies it used to be (#1023 review of #1021, echoing #106's
+/// "duplicated predicates diverge silently").
+const RECURSE_MAX_ITEMS: usize = 10000;
+
+/// Finalize `builtin_recurse_f`/`builtin_recurse_cond`'s collected
+/// `outputs` into a `QueryResult` — the two functions' identical tail
+/// (#1023 review of #897, echoing #106): a `pending_error` only surfaces
+/// once `stack` drains naturally, not when [`RECURSE_MAX_ITEMS`] cuts the
+/// loop short instead. This matches the pre-existing `MAX_ITEMS` silent-
+/// truncation convention everywhere else in this file, rather than
+/// surfacing an error whose presence would otherwise depend on where the
+/// arbitrary cap happened to land — see `resolve_recurse`'s own matching
+/// check for the fuller rationale (#842 review).
+#[inline]
+fn finish_recurse_walk<'a, W>(
+    outputs: Vec<OwnedValue>,
+    stack_is_empty: bool,
+    pending_error: Option<EvalEscape>,
+) -> QueryResult<'a, W> {
+    if stack_is_empty {
+        if let Some(e) = pending_error {
+            return partial(outputs, e.into());
+        }
+    }
+
+    owned_vec_to_result(outputs)
+}
+
 /// Fan `recurse(f)` / `recurse(f; cond)` out into one branch per visited
 /// node, depth-first. Uses the same explicit stack
 /// `builtin_recurse_f`/`builtin_recurse_cond` do — including the
@@ -11887,9 +11918,8 @@ fn resolve_recurse<'a, S: EvalSemantics>(
     // Set by `queue_recurse_children` once `f` itself ends in an
     // error/break/halt — see that function's doc comment (#842).
     let mut pending_error: Option<EvalEscape> = None;
-    const MAX_ITEMS: usize = 10000;
 
-    while !stack.is_empty() && outputs.len() < MAX_ITEMS {
+    while !stack.is_empty() && outputs.len() < RECURSE_MAX_ITEMS {
         let (prefix, current) = stack.pop().unwrap();
         // `current.clone()` is cheap (`Cow`, #668). `prefix.clone()` is not —
         // still `O(path length)` per node, `O(d²)` total; #701, unfixed here.
@@ -11981,12 +12011,9 @@ fn resolve_recurse<'a, S: EvalSemantics>(
         queue_recurse_children(&mut stack, next, deferred_error, &mut pending_error);
     }
 
-    // A `pending_error` only surfaces once `stack` drains naturally — if
-    // `MAX_ITEMS` cut the loop short instead (`stack` still non-empty), this
-    // matches the pre-existing MAX_ITEMS convention everywhere else in this
-    // file (silent truncation, no error) rather than surfacing an error
-    // whose presence would otherwise depend on where the arbitrary cap
-    // happened to land relative to it (#842 review).
+    // Same pending_error/stack-drain rule `finish_recurse_walk` documents
+    // (#842, #1023) — can't share that helper directly, since this returns
+    // `PathResolveResult`, not `QueryResult`.
     if stack.is_empty() {
         path_result(outputs, pending_error)
     } else {
@@ -14612,9 +14639,8 @@ fn builtin_recurse_f<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // Set by `queue_recurse_children` once `f`'s own evaluation at some node
     // ends in an error/break/halt — see that function's doc comment (#842).
     let mut pending_error: Option<EvalEscape> = None;
-    const MAX_ITEMS: usize = 10000;
 
-    while !stack.is_empty() && outputs.len() < MAX_ITEMS {
+    while !stack.is_empty() && outputs.len() < RECURSE_MAX_ITEMS {
         let current = stack.pop().unwrap();
         outputs.push(current.clone());
 
@@ -14634,22 +14660,7 @@ fn builtin_recurse_f<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         queue_recurse_children(&mut stack, children, deferred_error, &mut pending_error);
     }
 
-    // See `resolve_recurse`'s matching check for the full rationale (#842
-    // review): a `pending_error` only surfaces once `stack` drains
-    // naturally, not when `MAX_ITEMS` cuts the loop short instead.
-    if stack.is_empty() {
-        if let Some(e) = pending_error {
-            return partial(outputs, e.into());
-        }
-    }
-
-    if outputs.is_empty() {
-        QueryResult::None
-    } else if outputs.len() == 1 {
-        QueryResult::Owned(outputs.pop().unwrap())
-    } else {
-        QueryResult::ManyOwned(outputs)
-    }
+    finish_recurse_walk(outputs, stack.is_empty(), pending_error)
 }
 
 /// Builtin: recurse(f; cond)
@@ -14697,9 +14708,8 @@ fn builtin_recurse_cond<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // Set by `queue_recurse_children` once `f` itself ends in an
     // error/break/halt — see that function's doc comment (#842).
     let mut pending_error: Option<EvalEscape> = None;
-    const MAX_ITEMS: usize = 10000;
 
-    while !stack.is_empty() && outputs.len() < MAX_ITEMS {
+    while !stack.is_empty() && outputs.len() < RECURSE_MAX_ITEMS {
         let current = stack.pop().unwrap();
         outputs.push(current.clone());
 
@@ -14739,22 +14749,7 @@ fn builtin_recurse_cond<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         queue_recurse_children(&mut stack, next, deferred_error, &mut pending_error);
     }
 
-    // See `resolve_recurse`'s matching check for the full rationale (#842
-    // review): a `pending_error` only surfaces once `stack` drains
-    // naturally, not when `MAX_ITEMS` cuts the loop short instead.
-    if stack.is_empty() {
-        if let Some(e) = pending_error {
-            return partial(outputs, e.into());
-        }
-    }
-
-    if outputs.is_empty() {
-        QueryResult::None
-    } else if outputs.len() == 1 {
-        QueryResult::Owned(outputs.pop().unwrap())
-    } else {
-        QueryResult::ManyOwned(outputs)
-    }
+    finish_recurse_walk(outputs, stack.is_empty(), pending_error)
 }
 
 /// Builtin: walk(f) - recursively transform all values.
@@ -39326,6 +39321,53 @@ mod tests {
         );
     }
 
+    /// #1023: cross-check that `finish_recurse_walk`'s `stack_is_empty` gate
+    /// (now shared by `builtin_recurse_f`/`builtin_recurse_cond`) and
+    /// `resolve_recurse`'s own independent `stack.is_empty()` gate still
+    /// agree on the MAX_ITEMS-truncates-a-pending-error edge case, rather
+    /// than relying only on the two sibling tests above individually
+    /// matching their own hand-picked expectations -- an invariant test
+    /// over duplicated logic, per this repo's testing skill: a future edit
+    /// that flips one gate's polarity but not the other's fails *this* test
+    /// even if both individual sibling tests above happened to still pass
+    /// in isolation (e.g. via a compensating change to their own
+    /// expectations).
+    #[test]
+    fn test_recurse_family_max_items_gate_agrees_across_value_and_path_position_1023() {
+        let large_doc = format!(
+            r#"{{"items":[{}],"bad":5}}"#,
+            (0..15000)
+                .map(|i| i.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+
+        // `query!` panics on any variant other than the one named, so this
+        // fails loudly (not silently) if either gate started surfacing the
+        // deferred error as `Partial` instead of suppressing it -- and the
+        // two counts are compared against *each other*, not just each
+        // against its own hardcoded literal, so a compensating edit to both
+        // sibling tests' expectations above couldn't hide a real divergence
+        // here the way two independently-asserted literals could.
+        let value_count = query!(
+            large_doc.as_bytes(),
+            r#"recurse(if type=="object" then (.items[], .bad[0]) else empty end)"#,
+            QueryResult::ManyOwned(vs) => vs.len()
+        );
+        let path_count = query!(
+            large_doc.as_bytes(),
+            r#"path(recurse(if type=="object" then (.items[], .bad[0]) else empty end))"#,
+            QueryResult::ManyOwned(vs) => vs.len()
+        );
+
+        assert_eq!(value_count, 10000, "value-position gate diverged");
+        assert_eq!(
+            path_count, value_count,
+            "path-position gate ({path_count}) disagrees with value-position gate \
+             ({value_count})"
+        );
+    }
+
     #[test]
     fn test_recurse_cond_keeps_already_approved_siblings_before_error_854() {
         // Issue #854's primary repro (value position): distinct from #842
@@ -40331,5 +40373,57 @@ mod tests {
             result.is_err(),
             "walk_impl should panic at MAX_VALUE_TREE_DEPTH"
         );
+    }
+
+    /// #1023: `finish_recurse_walk` locks in `builtin_recurse_f`/
+    /// `builtin_recurse_cond`'s shared finalization contract directly,
+    /// independent of the many end-to-end recurse tests already exercising
+    /// it indirectly -- every arm of the `None`/`Owned`/`ManyOwned`
+    /// three-way split, plus the `stack_is_empty` gate on `pending_error`
+    /// (#842: a deferred error must not surface if `MAX_ITEMS` cut the walk
+    /// short before the stack drained naturally).
+    #[test]
+    fn finish_recurse_walk_matches_builtin_recurse_tail_contract_1023() {
+        assert!(matches!(
+            finish_recurse_walk::<'_, Vec<u64>>(Vec::new(), true, None),
+            QueryResult::None
+        ));
+
+        assert!(matches!(
+            finish_recurse_walk::<'_, Vec<u64>>(vec![OwnedValue::Int(1)], true, None),
+            QueryResult::Owned(OwnedValue::Int(1))
+        ));
+
+        assert!(matches!(
+            finish_recurse_walk::<'_, Vec<u64>>(
+                vec![OwnedValue::Int(1), OwnedValue::Int(2)],
+                true,
+                None
+            ),
+            QueryResult::ManyOwned(vs) if vs == vec![OwnedValue::Int(1), OwnedValue::Int(2)]
+        ));
+
+        // A pending error surfaces once the stack has drained naturally...
+        assert!(matches!(
+            finish_recurse_walk::<'_, Vec<u64>>(
+                vec![OwnedValue::Int(1)],
+                true,
+                Some(EvalEscape::Error(EvalError::new("boom".to_string())))
+            ),
+            QueryResult::Partial(prefix, Control::Error(e))
+                if prefix == vec![OwnedValue::Int(1)] && e.message == "boom"
+        ));
+
+        // ...but not when MAX_ITEMS cut the walk short first (stack still
+        // non-empty) -- the pending error is silently dropped, matching
+        // every other MAX_ITEMS truncation in this file (#842 review).
+        assert!(matches!(
+            finish_recurse_walk::<'_, Vec<u64>>(
+                vec![OwnedValue::Int(1)],
+                false,
+                Some(EvalEscape::Error(EvalError::new("boom".to_string())))
+            ),
+            QueryResult::Owned(OwnedValue::Int(1))
+        ));
     }
 }
