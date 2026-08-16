@@ -11498,3 +11498,66 @@ fn test_json_input_accepts_nesting_under_limit_998() -> Result<()> {
     assert_eq!(stdout.trim_end(), input);
     Ok(())
 }
+
+// =============================================================================
+// yq-mode `join(s)` semantics (#1041) -- all live-verified against yq v4.53.3.
+// =============================================================================
+
+#[test]
+fn test_yq_join_rejects_non_array_input_1041() -> Result<()> {
+    for (name, input, expected_tag) in [
+        ("object", "a: x\nb: y\n", "!!map"),
+        ("string", r#""str""#, "!!str"),
+        ("null", "null", "!!null"),
+        ("number", "5", "!!int"),
+    ] {
+        let (_stdout, stderr, code) = run_yq_stdin_with_stderr("join(\",\")", input, &[])?;
+        assert_eq!(code, 1, "{name}: stderr: {stderr:?}");
+        assert!(
+            stderr.contains(&format!(
+                "cannot join with {expected_tag}, can only join arrays of scalars"
+            )),
+            "{name}: stderr: {stderr:?}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn test_yq_join_non_scalar_element_becomes_empty_part_1041() -> Result<()> {
+    for (filter, input, expected) in [
+        (r#"join(",")"#, "- [1, 2]\n- a\n", ",a"),
+        (r#"join(",")"#, "- x: 1\n- a\n", ",a"),
+        (r#"join("-")"#, "- a\n- null\n- c\n", "a--c"),
+    ] {
+        let (stdout, code) = run_yq_stdin(filter, input, &["-r"])?;
+        assert_eq!(code, 0, "`{filter}` on {input:?}");
+        assert_eq!(stdout.trim_end(), expected, "`{filter}` on {input:?}");
+    }
+    Ok(())
+}
+
+#[test]
+fn test_yq_join_stringifies_non_string_separator_1041() -> Result<()> {
+    for (filter, expected) in [
+        ("join(1)", "112"),
+        ("join(true)", "1true2"),
+        ("join([1,2])", "12"),
+    ] {
+        let (stdout, code) = run_yq_stdin(filter, "- 1\n- 2\n", &["-r"])?;
+        assert_eq!(code, 0, "`{filter}`");
+        assert_eq!(stdout.trim_end(), expected, "`{filter}`");
+    }
+    Ok(())
+}
+
+#[test]
+fn test_yq_join_null_separator_renders_as_literal_text_1041() -> Result<()> {
+    // The opposite of a `null` *element* (which becomes an empty-string
+    // part, per test_yq_join_non_scalar_element_becomes_empty_part_1041) --
+    // a `null` *separator* is a real inserted separator, spelled "null".
+    let (stdout, code) = run_yq_stdin("join(null)", "- x\n- y\n- z\n", &["-r"])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "xnullynullz");
+    Ok(())
+}

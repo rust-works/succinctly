@@ -4093,30 +4093,41 @@ fn builtin_split<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     }
 }
 
-/// Stringifies each element for yq's `join`: strings pass through, nulls
-/// are skipped, everything else is rendered as JSON. Pre-#1003 behavior,
-/// kept only for `YqSemantics` — see `builtin_join`'s doc comment for why.
-fn join_parts<'a, W: Clone + AsRef<[u64]> + 'a>(
-    elements: impl Iterator<Item = StandardJson<'a, W>>,
-) -> Vec<String> {
-    let mut parts: Vec<String> = Vec::new();
-    for elem in elements {
-        match &elem {
-            StandardJson::String(s) => {
-                if let Ok(cow) = s.as_str() {
-                    parts.push(cow.into_owned());
-                }
-            }
-            StandardJson::Null => {
-                // Skip nulls in join
-            }
-            _ => {
-                // For non-strings, convert to string representation
-                parts.push(to_owned(&elem).to_json());
-            }
-        }
+/// Stringifies one `join` element for yq mode (#1041, live-verified against
+/// yq v4.53.3): a string passes through; `null` *or any container* (array or
+/// object) becomes an empty-string part -- `[1,null,2] | join(",")` is
+/// `"1,,2"`, and `[[1,2],"a"] | join(",")` is `",a"`, not `"[1,2],a"` (real
+/// yq never JSON-encodes a nested container into a join part the way it does
+/// for other unsupported operations). Everything else (number, boolean)
+/// renders via its JSON text, same as jq's own element rule.
+///
+/// Takes `elem` by value (moved from [`to_owned_key_shape`] at the call
+/// site, not [`to_owned`]) so a container element's contents are never
+/// materialized at all -- they're discarded unread here regardless -- and a
+/// string element is moved rather than cloned a second time.
+fn yq_join_element_part(elem: OwnedValue) -> String {
+    match elem {
+        OwnedValue::String(s) => s,
+        OwnedValue::Null | OwnedValue::Array(_) | OwnedValue::Object(_) => String::new(),
+        other => other.to_json(),
     }
-    parts
+}
+
+/// Stringifies `join`'s separator for yq mode (#1041): a string passes
+/// through, a container (array or object) becomes empty (no separator
+/// inserted at all). Everything else -- including `null`, unlike an
+/// element's own `null` handling above -- renders via its JSON text:
+/// `["a","b"] | join(null)` is `"anullb"`, the literal text "null" used as a
+/// real separator, not a no-op (confirmed live; #1003's PR #1036 review
+/// flagged this element/separator asymmetry as a real, separate divergence
+/// from jq mode, where `null` is a no-op only via `+`'s own left-identity
+/// rule, not something `join` special-cases).
+fn yq_join_separator(sep: OwnedValue) -> String {
+    match sep {
+        OwnedValue::String(s) => s,
+        OwnedValue::Array(_) | OwnedValue::Object(_) => String::new(),
+        other => other.to_json(),
+    }
 }
 
 /// One step of `join`'s jq-mode fold: combine the running accumulator with
@@ -4181,17 +4192,25 @@ fn join_step<S: EvalSemantics>(
 /// treating them as an empty-string part, so `[1,null,2] | join(",")` gave
 /// `"1,2"` (missing separator) instead of jq's own `"1,,2"`.
 ///
-/// **yq-mode note (#1036 review):** the algorithm above is jq-specific.
-/// Real yq's `join` (v4.53.3) diverges from it in several confirmed ways:
-/// a non-scalar element silently becomes an empty-string part instead of
-/// erroring, a non-string separator is implicitly stringified instead of
-/// erroring, a `null` separator renders as the literal text `"null"`
-/// instead of being a no-op, and an object input is rejected outright
-/// (`"cannot join with !!map"`). #1003 is scoped to jq's error wording
-/// only, so `YqSemantics` keeps the pre-#1003 `join_parts`-based behavior
-/// unchanged below (itself not yq-accurate on every point, but not newly
-/// regressed either) — real yq-compatible `join` semantics are their own
-/// follow-up (#1041).
+/// **yq-mode note (#1041, live-verified against yq v4.53.3):** the algorithm
+/// above is jq-specific. Real yq's `join` diverges in four confirmed ways
+/// (not necessarily exhaustive -- an empty-object separator and a NaN/
+/// Infinity element or separator were found to diverge too, after this
+/// fix landed; tracked as a narrower follow-up rather than expanding this
+/// PR's own scope):
+/// - Input must be an *array* -- an object (or any other non-array) is
+///   rejected outright with `"cannot join with <tag>, can only join arrays
+///   of scalars"`, unlike jq's own object-iterates-its-values leniency
+///   above. Uses [`yaml_type_tag`] for the same tag spelling the `tag`
+///   builtin already uses elsewhere.
+/// - A non-scalar (array/object) *element* silently becomes an empty-string
+///   part instead of erroring or being JSON-encoded (see
+///   [`yq_join_element_part`]).
+/// - A non-string separator is implicitly stringified instead of erroring
+///   (see [`yq_join_separator`]) -- including `null`, which renders as the
+///   literal text `"null"`, a real inserted separator, not a no-op; this is
+///   the opposite of how a `null` *element* is handled just above, a real
+///   asymmetry in yq's own algorithm, not an inconsistency in this port.
 fn builtin_join<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     sep_expr: &Expr,
     value: StandardJson<'a, W>,
@@ -4204,18 +4223,22 @@ fn builtin_join<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     };
 
     if S::TAG == EvalTag::Yq {
-        let sep_str = match sep {
-            OwnedValue::String(s) => s,
-            _ => return QueryResult::Error(EvalError::type_error("string", "non-string")),
-        };
+        let sep_str = yq_join_separator(sep);
         return match value {
             StandardJson::Array(elements) => {
-                QueryResult::Owned(OwnedValue::String(join_parts(elements).join(&sep_str)))
+                // `to_owned_key_shape`, not `to_owned`: a container element
+                // collapses to an empty-string part regardless of its
+                // contents (see `yq_join_element_part`'s doc comment), so
+                // deep-copying it first would be pure waste (#1044 review).
+                let parts: Vec<String> = elements
+                    .map(|e| yq_join_element_part(to_owned_key_shape(&e)))
+                    .collect();
+                QueryResult::Owned(OwnedValue::String(parts.join(&sep_str)))
             }
-            StandardJson::Object(fields) => QueryResult::Owned(OwnedValue::String(
-                join_parts(fields.map(|f| f.value())).join(&sep_str),
-            )),
-            _ => QueryResult::Error(EvalError::cannot_iterate(&to_owned(&value))),
+            other => QueryResult::Error(EvalError::new(format!(
+                "cannot join with {}, can only join arrays of scalars",
+                yaml_type_tag(&other)
+            ))),
         };
     }
 
@@ -21877,10 +21900,12 @@ fn builtin_omit<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     }
 }
 
-// Builtin: tag - return YAML type tag (!!str, !!int, !!map, etc.)
-// Since we evaluate on JSON/OwnedValue (not raw YAML), we derive the tag from the JSON type.
-fn builtin_tag<W: Clone + AsRef<[u64]>>(value: StandardJson<'_, W>) -> QueryResult<'_, W> {
-    let tag = match &value {
+/// The YAML type tag (`!!str`, `!!int`, `!!map`, etc.) for a value. Since we
+/// evaluate on JSON/OwnedValue (not raw YAML), this derives the tag from the
+/// JSON type. Shared between `tag` and `join`'s yq-mode "input must be an
+/// array" error wording (#1041), rather than each re-deriving it (#106).
+fn yaml_type_tag<W: Clone + AsRef<[u64]>>(value: &StandardJson<'_, W>) -> &'static str {
+    match value {
         StandardJson::Null => "!!null",
         StandardJson::Bool(_) => "!!bool",
         StandardJson::Number(n) => {
@@ -21895,7 +21920,12 @@ fn builtin_tag<W: Clone + AsRef<[u64]>>(value: StandardJson<'_, W>) -> QueryResu
         StandardJson::Array(_) => "!!seq",
         StandardJson::Object(_) => "!!map",
         StandardJson::Error(_) => "!!null",
-    };
+    }
+}
+
+// Builtin: tag - return YAML type tag (!!str, !!int, !!map, etc.)
+fn builtin_tag<W: Clone + AsRef<[u64]>>(value: StandardJson<'_, W>) -> QueryResult<'_, W> {
+    let tag = yaml_type_tag(&value);
     QueryResult::Owned(OwnedValue::String(tag.to_string()))
 }
 
@@ -27364,49 +27394,94 @@ mod tests {
 
     #[test]
     fn test_builtin_join_yq_mode() {
-        // #1036 review: builtin_join<S> has no S-gated branch, so #1003's
-        // jq-accurate rewrite silently changed yq's `join` behavior too --
-        // including a new silent-wrong-output regression (a `null`
-        // separator used to error, matching pre-#1003 behavior; the
-        // rewrite made it silently succeed with jq's no-op-separator
-        // semantics instead, diverging further from real yq without any
-        // test catching it). These pin the restored pre-#1003 behavior for
-        // `YqSemantics` -- see `builtin_join`'s doc comment and #1041 for
-        // why yq keeps the old, still-yq-inaccurate-but-not-newly-regressed
-        // `join_parts` path rather than jq's new algorithm.
-        yq_query!(br#"["x", "y", "z"]"#, r"join(null)",
+        // #1041, all four confirmed divergences from jq's own algorithm,
+        // live-verified against yq v4.53.3.
+        //
+        // 1. Input must be an array -- an object (jq happily iterates its
+        //    values) or any other non-array is rejected outright, with the
+        //    same `!!<tag>` spelling `tag` uses.
+        yq_query!(br#"{"x": "p", "y": "q"}"#, r#"join(",")"#,
             QueryResult::Error(e) => {
-                assert_eq!(e.message, "expected string, got non-string");
+                assert_eq!(e.message, "cannot join with !!map, can only join arrays of scalars");
             }
         );
-        yq_query!(br"[1, 2]", r"join(1)",
+        yq_query!(br"5", r#"join(",")"#,
             QueryResult::Error(e) => {
-                assert_eq!(e.message, "expected string, got non-string");
+                assert_eq!(e.message, "cannot join with !!int, can only join arrays of scalars");
             }
         );
+        yq_query!(br#""str""#, r#"join(",")"#,
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "cannot join with !!str, can only join arrays of scalars");
+            }
+        );
+        yq_query!(br"null", r#"join(",")"#,
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "cannot join with !!null, can only join arrays of scalars");
+            }
+        );
+
+        // 2. A non-scalar (array/object) element becomes an empty-string
+        //    part instead of erroring or being JSON-encoded.
         yq_query!(br#"[[1, 2], "a"]"#, r#"join(",")"#,
             QueryResult::Owned(OwnedValue::String(s)) => {
-                assert_eq!(s, "[1,2],a");
+                assert_eq!(s, ",a");
             }
         );
+        yq_query!(br#"[{"x": 1}, "a"]"#, r#"join(",")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, ",a");
+            }
+        );
+
+        // A `null` *element*, unlike a `null` *separator* below, still
+        // becomes an empty-string part (same as jq's own rule) -- so the
+        // separator still appears on both sides of it ("a--c", not "a-c").
         yq_query!(br#"["a", null, "c"]"#, r#"join("-")"#,
             QueryResult::Owned(OwnedValue::String(s)) => {
-                assert_eq!(s, "a-c");
+                assert_eq!(s, "a--c");
             }
         );
+
+        // 3. A non-string separator is implicitly stringified instead of
+        //    erroring (jq errors here).
+        yq_query!(br"[1, 2]", r"join(1)",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "112");
+            }
+        );
+        yq_query!(br"[1, 2]", r"join(true)",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "1true2");
+            }
+        );
+        // A container separator stringifies to empty (no separator at all),
+        // the same "container -> empty" rule as element handling above.
+        yq_query!(br"[1, 2]", r"join([1,2])",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "12");
+            }
+        );
+
+        // 4. A `null` separator renders as the literal text "null" -- a
+        //    real inserted separator, not a no-op. The opposite of how a
+        //    `null` *element* is handled above: a genuine asymmetry in
+        //    yq's own algorithm, not an inconsistency in this port.
+        yq_query!(br#"["x", "y", "z"]"#, r"join(null)",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "xnullynullz");
+            }
+        );
+
+        // Ordinary cases, unaffected by any of the above, still work.
         yq_query!(br#"["a", "b"]"#, r#"join(",")"#,
             QueryResult::Owned(OwnedValue::String(s)) => {
                 assert_eq!(s, "a,b");
             }
         );
-        yq_query!(br#"{"x": "p", "y": "q"}"#, r#"join(",")"#,
+        yq_query!(br"[]", r#"join(",")"#,
             QueryResult::Owned(OwnedValue::String(s)) => {
-                assert_eq!(s, "p,q");
-            }
-        );
-        yq_query!(br"5", r#"join(",")"#,
-            QueryResult::Error(e) => {
-                assert_eq!(e.message, "Cannot iterate over number (5)");
+                assert_eq!(s, "");
             }
         );
     }
