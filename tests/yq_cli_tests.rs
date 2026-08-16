@@ -7667,6 +7667,82 @@ fn test_jq_mode_computed_float_formatting_unaffected_by_997() -> Result<()> {
     Ok(())
 }
 
+// =============================================================================
+// Computed whole-float YAML output — #949
+//
+// #997 (above) fixed the *scientific-notation threshold* for a computed
+// float, in both JSON and YAML output. This is a narrower, ordinary-
+// magnitude case #997 didn't touch: unlike JSON output (which keeps a
+// computed whole float's decimal point regardless of compact/pretty --
+// `test_compact_and_pretty_agree_on_whole_floats` above), YAML output of
+// the *same* computed value drops it -- `. + 1` on `1.0` prints `2` in
+// YAML output but `2.0` in JSON output. Each expectation was measured
+// directly against the pinned `yq` v4.53.3 binary.
+// =============================================================================
+
+#[test]
+fn test_computed_whole_float_yaml_output_drops_decimal_point_949() -> Result<()> {
+    let (out, code) = run_yq_stdin(". + 1", "1.0\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "2");
+    Ok(())
+}
+
+#[test]
+fn test_computed_whole_float_json_output_keeps_decimal_point_949() -> Result<()> {
+    let (compact, compact_code) = run_yq_stdin(". + 1", "1.0\n", &["-o=json", "-I=0"])?;
+    let (pretty, pretty_code) = run_yq_stdin(". + 1", "1.0\n", &["-o=json"])?;
+    assert_eq!(compact_code, 0);
+    assert_eq!(pretty_code, 0);
+    assert_eq!(compact.trim(), "2.0");
+    assert_eq!(pretty.trim(), "2.0");
+    Ok(())
+}
+
+/// JSON-sourced input never preserves the decimal point at all (#978,
+/// already fixed on `main`) -- confirmed unaffected by this fix in either
+/// output format.
+#[test]
+fn test_computed_whole_float_json_sourced_input_unaffected_by_949() -> Result<()> {
+    for extra_args in [
+        &["--input-format=json"][..],
+        &["--input-format=json", "-o=json"][..],
+    ] {
+        let (out, code) = run_yq_stdin(". + 1", "1.0\n", extra_args)?;
+        assert_eq!(code, 0, "for {extra_args:?}");
+        assert_eq!(out.trim(), "2", "for {extra_args:?}");
+    }
+    Ok(())
+}
+
+/// An untouched literal is unaffected by this fix in any output mode -- a
+/// different `OwnedValue` variant (`NumberLiteral`) with its own,
+/// unrelated rendering path.
+#[test]
+fn test_literal_whole_float_unaffected_by_949_fix() -> Result<()> {
+    for extra_args in [&[][..], &["-o=json", "-I=0"], &["-o=json"]] {
+        let (out, code) = run_yq_stdin(".", "1.0\n", extra_args)?;
+        assert_eq!(code, 0, "for {extra_args:?}");
+        assert_eq!(out.trim(), "1.0", "for {extra_args:?}");
+    }
+    Ok(())
+}
+
+/// The M2 YAML streaming path (`stream_owned_value_yaml` in
+/// `src/jq/stream.rs`) has its own, separate `Float` arm from the DOM path
+/// (`emit_yaml_value`) fixed above -- reachable via `first`/`last`
+/// wrapping a computation, the same M2-classification path #997 fixed for
+/// the scientific-notation case. Confirms both writers agree.
+#[test]
+fn test_computed_whole_float_via_first_last_yaml_output_949() -> Result<()> {
+    for (filter, want) in [("first(.a + 1)", "2"), ("last(.a + 1)", "2")] {
+        let (out, code) = run_yq_stdin(filter, "a: 1.0\n", &[])?;
+        assert_eq!(code, 0, "for {filter:?}");
+        assert_eq!(out.trim(), want, "for {filter:?}");
+    }
+    Ok(())
+}
+
 #[test]
 fn test_dash_not_followed_by_space_is_still_a_scalar() -> Result<()> {
     // Guard against over-matching: negative numbers and `-`-prefixed plain

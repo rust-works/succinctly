@@ -3306,9 +3306,41 @@ pub fn format_float_with_fraction(f: f64) -> String {
 /// caller must special-case those first.
 #[must_use]
 pub fn format_float_yq(f: f64) -> String {
+    format_float_yq_with(f, format_float_with_fraction)
+}
+
+/// The YAML-output sibling of [`format_float_yq`].
+///
+/// Same magnitude threshold and scientific-notation spelling, but everyday
+/// magnitudes render at their shortest (`2`, not `2.0`) rather than with a
+/// forced decimal point.
+///
+/// Real yq's computed-float convention genuinely differs by *output*
+/// format, not just by input source: `. + 1` on YAML-sourced `1.0` prints
+/// `2` on YAML output but `2.0` on JSON output (compact and pretty always
+/// agree with each other, just not with YAML) -- confirmed against real yq
+/// v4.53.3 (issue #949). [`format_float_yq`] is the JSON-output
+/// convention (also used by `-o json`'s DOM path in `output.rs`); this is
+/// the YAML-output one, for [`crate::jq::eval`]'s YAML streamer and the
+/// `yq` CLI's own YAML DOM printer.
+///
+/// `f` must be finite, like [`format_float_yq`].
+#[must_use]
+pub fn format_float_yq_yaml(f: f64) -> String {
+    format_float_yq_with(f, |f| f.to_string())
+}
+
+/// Shared magnitude-threshold logic behind [`format_float_yq`] and
+/// [`format_float_yq_yaml`]: scientific notation (`e+NN`/`e-NN`) once the
+/// value's decimal exponent is `>= 6` or `<= -5`, otherwise
+/// `ordinary_magnitude` -- the only place the two conventions actually
+/// differ (whole-number decimal-point handling), so this is where the
+/// threshold and exponent spelling stay oracle-verified in exactly one
+/// place rather than two.
+fn format_float_yq_with(f: f64, ordinary_magnitude: impl FnOnce(f64) -> String) -> String {
     debug_assert!(
         f.is_finite(),
-        "format_float_yq requires a finite value; NaN/Infinity have no \
+        "format_float_yq_with requires a finite value; NaN/Infinity have no \
          JSON/YAML spelling here and must be special-cased by the caller"
     );
     let sci = format!("{f:e}");
@@ -3319,7 +3351,7 @@ pub fn format_float_yq(f: f64) -> String {
         .parse()
         .expect("exponent from Rust's exponential formatter is always a valid i32");
     if (-4..6).contains(&exp) {
-        format_float_with_fraction(f)
+        ordinary_magnitude(f)
     } else {
         let sign = if exp < 0 { '-' } else { '+' };
         format!("{mantissa}e{sign}{:02}", exp.abs())
@@ -12292,5 +12324,27 @@ mod tests {
             first_doc_json(b"- b: &anc 1\n- a: *anc\n"),
             r#"[{"b":1},{"a":1}]"#
         );
+    }
+
+    /// [`format_float_yq_yaml`]'s YAML-output convention: shares
+    /// [`format_float_yq`]'s scientific-notation threshold exactly, but
+    /// drops the forced decimal point for everyday magnitudes -- issue
+    /// #949. Mirrors `test_format_float_yq_997` in `output.rs`, which pins
+    /// the JSON-output sibling's identical threshold with a forced point.
+    #[test]
+    fn test_format_float_yq_yaml_949() {
+        assert_eq!(format_float_yq_yaml(0.0), "0");
+        assert_eq!(format_float_yq_yaml(-0.0), "-0");
+        // In-range: shortest decimal, no forced fractional part.
+        assert_eq!(format_float_yq_yaml(150000.0), "150000");
+        assert_eq!(format_float_yq_yaml(0.00015), "0.00015");
+        assert_eq!(format_float_yq_yaml(1.5), "1.5");
+        // Past the threshold: scientific, matching `format_float_yq` exactly
+        // (this is the one place the two conventions agree).
+        assert_eq!(format_float_yq_yaml(1_500_000.0), "1.5e+06");
+        assert_eq!(format_float_yq_yaml(0.000015), "1.5e-05");
+        assert_eq!(format_float_yq_yaml(-1_500_000.0), "-1.5e+06");
+        assert_eq!(format_float_yq_yaml(1e100), "1e+100");
+        assert_eq!(format_float_yq_yaml(1e-100), "1e-100");
     }
 }

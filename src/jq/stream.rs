@@ -29,7 +29,7 @@ use super::value::{
     assert_value_tree_depth, format_number_jq_compat, infinite_float_preview_text,
     jq_bare_float_display, NumberRepr, OwnedValue,
 };
-use crate::yaml::format_float_with_fraction;
+use crate::yaml::{format_float_with_fraction, format_float_yq_yaml};
 
 /// A value that can be streamed directly to output without intermediate allocation.
 ///
@@ -623,10 +623,15 @@ fn stream_owned_value_yaml_at_depth<W: core::fmt::Write>(
             out.write_str(super::nonfinite_display_string::<super::YqSemantics>(*f))
         }
         OwnedValue::Float(f) => {
-            // Not `write!(out, "{f}")`: that drops the `.0` from a whole
-            // float, diverging from the identity streaming path and the
-            // DOM pretty-printer (issue #169).
-            out.write_str(&format_float_with_fraction(*f))
+            // `format_float_yq_yaml`, not `format_float_with_fraction`: a
+            // bare (computed) `Float` has no source text to preserve, and
+            // real yq's YAML output shows the shortest form -- with the
+            // same scientific-notation threshold as the DOM path's own
+            // `emit_yaml_value` -- for a computed whole number (e.g. `. + 1`
+            // on `1.0` prints `2`, not `2.0`) -- issue #949. An untouched
+            // literal keeps its own `.0` via the `NumberLiteral` arm below,
+            // unaffected by this.
+            out.write_str(&format_float_yq_yaml(*f))
         }
         OwnedValue::NumberLiteral(NumberRepr::Float(f), _) if f.is_nan() || f.is_infinite() => {
             out.write_str(super::nonfinite_display_string::<super::YqSemantics>(*f))
@@ -1104,14 +1109,42 @@ mod tests {
         assert_eq!(buf, "[1.0,2.5]");
     }
 
-    /// The `yq` YAML convention must agree with the JSON one.
+    /// Unlike the JSON M2 convention above, a bare (computed) `Float`'s YAML
+    /// rendering drops the decimal point on a whole number: real yq's YAML
+    /// output shows `2`, not `2.0`, for a genuinely computed whole float
+    /// (e.g. `. + 1` on `1.0`) — issue #949. This deliberately diverges from
+    /// `test_stream_json_whole_float_keeps_decimal_point` above: YAML output
+    /// and JSON output of the *same* computed value are not required to
+    /// agree, matching real yq. An untouched literal still keeps its own
+    /// `.0` via the sibling `NumberLiteral` variant, unaffected by this.
     #[test]
-    fn test_stream_yaml_whole_float_keeps_decimal_point() {
+    fn test_stream_yaml_computed_whole_float_drops_decimal_point_949() {
         let mut buf = String::new();
         OwnedValue::Float(1.0)
             .stream_yaml(&mut buf, IndentSpec::COMPACT, false)
             .unwrap();
-        assert_eq!(buf, "1.0");
+        assert_eq!(buf, "1");
+
+        buf.clear();
+        OwnedValue::Float(-0.0)
+            .stream_yaml(&mut buf, IndentSpec::COMPACT, false)
+            .unwrap();
+        assert_eq!(buf, "-0");
+
+        buf.clear();
+        OwnedValue::Array(vec![OwnedValue::Float(1.0), OwnedValue::Float(2.5)])
+            .stream_yaml(&mut buf, IndentSpec::COMPACT, false)
+            .unwrap();
+        assert_eq!(buf, "[1, 2.5]");
+
+        // Scientific-notation threshold agrees with the DOM path's
+        // `format_float_yq_yaml` (and `format_float_yq`'s own JSON
+        // threshold): shortest mantissa only past exponent `>= 6`/`<= -5`.
+        buf.clear();
+        OwnedValue::Float(1_500_000.0)
+            .stream_yaml(&mut buf, IndentSpec::COMPACT, false)
+            .unwrap();
+        assert_eq!(buf, "1.5e+06");
     }
 
     /// The `jq` error convention is a distinct writer (`stream_owned_value_json_jq`,

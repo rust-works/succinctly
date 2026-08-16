@@ -20,14 +20,15 @@ use succinctly::jq::{
 };
 use succinctly::json::JsonIndex;
 use succinctly::yaml::{
-    resolve_plain, resolve_tagged, stream_yaml_sequence, YamlCursor, YamlIndex, YamlValue,
+    format_float_yq_yaml, resolve_plain, resolve_tagged, stream_yaml_sequence, YamlCursor,
+    YamlIndex, YamlValue,
 };
 
 use super::{FrontMatterMode, InputFormat, OutputFormat, YqCommand};
 use crate::front_matter;
 use crate::output::{
-    self, exit_codes, format_float_yq, ColorScheme, ControlEscape, DiagStyle, ErrorSink,
-    FloatStyle, InputLocation, JsonFormatOpts,
+    self, exit_codes, ColorScheme, ControlEscape, DiagStyle, ErrorSink, FloatStyle, InputLocation,
+    JsonFormatOpts,
 };
 
 /// yq's diagnostics carry no `(at <file>:<line>)` marker, so the yq paths have
@@ -1561,7 +1562,10 @@ fn emit_yaml_value_at_depth(
         OwnedValue::Float(f) if f.is_nan() || f.is_infinite() => {
             nonfinite_display_string::<YqSemantics>(*f).to_string()
         }
-        OwnedValue::Float(f) => format_float_yq(*f),
+        // `format_float_yq_yaml`, not `format_float_yq`: this is YAML
+        // output, whose computed-whole-float convention drops the decimal
+        // point (`2`, not `2.0`) unlike JSON output -- issue #949.
+        OwnedValue::Float(f) => format_float_yq_yaml(*f),
         OwnedValue::NumberLiteral(NumberRepr::Float(f), _) if f.is_nan() || f.is_infinite() => {
             nonfinite_display_string::<YqSemantics>(*f).to_string()
         }
