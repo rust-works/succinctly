@@ -42,10 +42,14 @@ use super::expr::Literal;
 /// `eval.rs`'s own `to_owned` between 1800-2000. Reusing 256 here would be
 /// wrong in the *other* direction: 256 does not clear
 /// `tests/jq_recurse_depth_tests.rs`'s deliberately-pinned depth-300
-/// document-navigation capability (#626's de-risk step for
-/// `push_recursive_branches`/`resolve_recurse`), which routes through
-/// `eval.rs`'s own `to_owned` during ordinary `..`/`recurse` traversal, not
-/// just query-time-constructed accumulator growth.
+/// correctness capability for `path(..)`/`path(recurse)` (#626's de-risk
+/// step for `push_recursive_branches`/`resolve_recurse`), which that test
+/// exercises via the library's own `eval()` entry point and which routes
+/// through `eval.rs`'s own `to_owned` — a real, tested capability of this
+/// crate's public API, independent of whether the `succinctly` CLI binary's
+/// own document-parsing entry point happens to hit a different, earlier
+/// guard (`eval_generic::MAX_NESTING_DEPTH`, unaffected by this constant)
+/// first for the same document depth.
 ///
 /// 384, not 300: needs margin above the pinned floor for the same reason
 /// `eval_generic`'s own 256 needed margin above its 200-deep `walk` floor
