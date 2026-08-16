@@ -15,8 +15,8 @@ use succinctly::jq::eval_generic::{
     GenericResult,
 };
 use succinctly::jq::{
-    self, assert_value_tree_depth, sync_aliased_paths, Builtin, EvalError, Expr, OwnedValue,
-    QueryResult, YqSemantics,
+    self, assert_value_tree_depth, nonfinite_display_string, sync_aliased_paths, Builtin,
+    EvalError, Expr, NumberRepr, OwnedValue, QueryResult, YqSemantics,
 };
 use succinctly::json::JsonIndex;
 use succinctly::yaml::{
@@ -1558,36 +1558,20 @@ fn emit_yaml_value_at_depth(
         OwnedValue::Null => "null".to_string(),
         OwnedValue::Bool(b) => b.to_string(),
         OwnedValue::Int(n) => n.to_string(),
-        OwnedValue::Float(f) => {
-            if f.is_nan() {
-                ".nan".to_string()
-            } else if f.is_infinite() {
-                if *f > 0.0 {
-                    ".inf".to_string()
-                } else {
-                    "-.inf".to_string()
-                }
-            } else {
-                format_float_yq(*f)
-            }
+        OwnedValue::Float(f) if f.is_nan() || f.is_infinite() => {
+            nonfinite_display_string::<YqSemantics>(*f)
+        }
+        OwnedValue::Float(f) => format_float_yq(*f),
+        OwnedValue::NumberLiteral(NumberRepr::Float(f), _) if f.is_nan() || f.is_infinite() => {
+            nonfinite_display_string::<YqSemantics>(*f)
         }
         OwnedValue::NumberLiteral(_, literal) => {
-            if value.as_f64().is_some_and(f64::is_nan) {
-                ".nan".to_string()
-            } else if value.as_f64().is_some_and(f64::is_infinite) {
-                if value.as_f64() > Some(0.0) {
-                    ".inf".to_string()
-                } else {
-                    "-.inf".to_string()
-                }
-            } else {
-                // Echo the source spelling verbatim (#1008) rather than
-                // routing through `number_str()`/`format_number_jq_compat`,
-                // which reformats per jq's own rules (uppercase `E`, forced
-                // sign) -- this file is yq-CLI-only, no jq caller to protect,
-                // and yq preserves a document literal's exact text.
-                literal.to_string()
-            }
+            // Echo the source spelling verbatim (#1008) rather than
+            // routing through `number_str()`/`format_number_jq_compat`,
+            // which reformats per jq's own rules (uppercase `E`, forced
+            // sign) -- this file is yq-CLI-only, no jq caller to protect,
+            // and yq preserves a document literal's exact text.
+            literal.to_string()
         }
         OwnedValue::String(s) => yaml_quote_string_with_style(s, comments.style()),
         OwnedValue::Array(arr) => {

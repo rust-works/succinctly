@@ -5164,10 +5164,20 @@ pub(crate) fn numeric_display_string<S: EvalSemantics>(value: &OwnedValue) -> St
 }
 
 /// jq's bare `f64::Display` (`NaN`/`inf`/`-inf`) vs yq's own YAML-native
-/// spelling (`.nan`/`.inf`/`-.inf`) for a non-finite float -- see
-/// [`numeric_display_string`]'s own doc comment for the "document-sourced
-/// vs computed" caveat this doesn't attempt to resolve.
-fn nonfinite_display_string<S: EvalSemantics>(f: f64) -> String {
+/// spelling (`.nan`/`.inf`/`-.inf`) for a non-finite float.
+///
+/// See [`numeric_display_string`]'s own doc comment for the
+/// "document-sourced vs computed" caveat this doesn't attempt to resolve.
+///
+/// `pub`, not `pub(crate)`: `src/bin/succinctly/yq_runner.rs` is a separate
+/// binary crate depending on this one as an external dependency, and is one
+/// of several call sites this single definition now serves (#1064) --
+/// before this, the yq-mode `.nan`/`.inf`/`-.inf` decision was
+/// independently reimplemented in `stream.rs`, `json/light.rs`, and
+/// `yq_runner.rs` as well as twice more in this file, none of them sharing
+/// this definition (CLAUDE.md's #106 "duplicated predicates diverge
+/// silently" lesson).
+pub fn nonfinite_display_string<S: EvalSemantics>(f: f64) -> String {
     if S::TAG != EvalTag::Yq {
         f.to_string()
     } else if f.is_nan() {
@@ -5717,26 +5727,12 @@ fn props_value_to_string(value: &OwnedValue) -> String {
         OwnedValue::Bool(true) => "true".to_string(),
         OwnedValue::Bool(false) => "false".to_string(),
         OwnedValue::Int(n) => format!("{n}"),
-        OwnedValue::Float(f) => {
-            if f.is_nan() {
-                ".nan".to_string()
-            } else if f.is_infinite() {
-                if *f > 0.0 {
-                    ".inf".to_string()
-                } else {
-                    "-.inf".to_string()
-                }
-            } else {
-                format!("{f}")
-            }
+        OwnedValue::Float(f) if f.is_nan() || f.is_infinite() => {
+            nonfinite_display_string::<YqSemantics>(*f)
         }
-        OwnedValue::NumberLiteral(NumberRepr::Float(f), _) if f.is_nan() => ".nan".to_string(),
-        OwnedValue::NumberLiteral(NumberRepr::Float(f), _) if f.is_infinite() => {
-            if *f > 0.0 {
-                ".inf".to_string()
-            } else {
-                "-.inf".to_string()
-            }
+        OwnedValue::Float(f) => format!("{f}"),
+        OwnedValue::NumberLiteral(NumberRepr::Float(f), _) if f.is_nan() || f.is_infinite() => {
+            nonfinite_display_string::<YqSemantics>(*f)
         }
         // Echo verbatim (#1008): `@props` is documented as a yq-flavored
         // format function (CLAUDE.md's format table marks it `(yq)`) --
@@ -5770,26 +5766,12 @@ fn owned_to_yaml_at_depth(value: &OwnedValue, depth: usize) -> String {
         OwnedValue::Bool(true) => "true".to_string(),
         OwnedValue::Bool(false) => "false".to_string(),
         OwnedValue::Int(n) => format!("{n}"),
-        OwnedValue::Float(f) => {
-            if f.is_nan() {
-                ".nan".to_string()
-            } else if f.is_infinite() {
-                if *f > 0.0 {
-                    ".inf".to_string()
-                } else {
-                    "-.inf".to_string()
-                }
-            } else {
-                format!("{f}")
-            }
+        OwnedValue::Float(f) if f.is_nan() || f.is_infinite() => {
+            nonfinite_display_string::<YqSemantics>(*f)
         }
-        OwnedValue::NumberLiteral(NumberRepr::Float(f), _) if f.is_nan() => ".nan".to_string(),
-        OwnedValue::NumberLiteral(NumberRepr::Float(f), _) if f.is_infinite() => {
-            if *f > 0.0 {
-                ".inf".to_string()
-            } else {
-                "-.inf".to_string()
-            }
+        OwnedValue::Float(f) => format!("{f}"),
+        OwnedValue::NumberLiteral(NumberRepr::Float(f), _) if f.is_nan() || f.is_infinite() => {
+            nonfinite_display_string::<YqSemantics>(*f)
         }
         // Echo verbatim (#1008): `@yaml` is documented as a yq-flavored
         // format function (CLAUDE.md's format table marks it `(yq)`) --

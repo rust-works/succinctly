@@ -619,25 +619,17 @@ fn stream_owned_value_yaml_at_depth<W: core::fmt::Write>(
         OwnedValue::Bool(true) => out.write_str("true"),
         OwnedValue::Bool(false) => out.write_str("false"),
         OwnedValue::Int(n) => write!(out, "{n}"),
-        OwnedValue::Float(f) => {
-            if f.is_nan() {
-                out.write_str(".nan")
-            } else if f.is_infinite() {
-                if *f > 0.0 {
-                    out.write_str(".inf")
-                } else {
-                    out.write_str("-.inf")
-                }
-            } else {
-                // Not `write!(out, "{f}")`: that drops the `.0` from a whole
-                // float, diverging from the identity streaming path and the
-                // DOM pretty-printer (issue #169).
-                out.write_str(&format_float_with_fraction(*f))
-            }
+        OwnedValue::Float(f) if f.is_nan() || f.is_infinite() => {
+            out.write_str(&super::nonfinite_display_string::<super::YqSemantics>(*f))
         }
-        OwnedValue::NumberLiteral(NumberRepr::Float(f), _) if f.is_nan() => out.write_str(".nan"),
-        OwnedValue::NumberLiteral(NumberRepr::Float(f), _) if f.is_infinite() => {
-            out.write_str(if *f > 0.0 { ".inf" } else { "-.inf" })
+        OwnedValue::Float(f) => {
+            // Not `write!(out, "{f}")`: that drops the `.0` from a whole
+            // float, diverging from the identity streaming path and the
+            // DOM pretty-printer (issue #169).
+            out.write_str(&format_float_with_fraction(*f))
+        }
+        OwnedValue::NumberLiteral(NumberRepr::Float(f), _) if f.is_nan() || f.is_infinite() => {
+            out.write_str(&super::nonfinite_display_string::<super::YqSemantics>(*f))
         }
         OwnedValue::NumberLiteral(_, literal) => {
             // Echo verbatim (#1008), matching this function's JSON sibling

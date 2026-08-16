@@ -1792,14 +1792,8 @@ fn stream_json_as_yaml<W: AsRef<[u64]> + Clone, Out: core::fmt::Write>(
             if let Ok(i) = n.as_i64() {
                 write!(out, "{i}")
             } else if let Ok(f) = n.as_f64() {
-                if f.is_nan() {
-                    out.write_str(".nan")
-                } else if f.is_infinite() {
-                    if f > 0.0 {
-                        out.write_str(".inf")
-                    } else {
-                        out.write_str("-.inf")
-                    }
+                if f.is_nan() || f.is_infinite() {
+                    out.write_str(&crate::jq::nonfinite_display_string::<crate::jq::YqSemantics>(f))
                 } else {
                     write!(out, "{f}")
                 }
