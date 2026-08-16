@@ -8047,20 +8047,23 @@ fn stitch_replacements_evaluated<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// evaluated) replacement value -- the `$gap + $inserts[$ix]` step of jq's
 /// real `sub`/`gsub` (`src/builtin.jq`, #1034).
 ///
-/// A `String` replacement (the overwhelmingly common case, and the only
-/// shape a bare `+` would need at all) is concatenated directly, with no
-/// `arith_add`/`OwnedValue` detour -- avoiding the extra allocation and
-/// unreachable-arm coupling a fully generic `+` call would add to this
-/// per-match hot path (#1034 review). Anything else falls back to
+/// A `String` replacement (the overwhelmingly common case) is used
+/// directly with no further conversion. Anything else falls back to
 /// jq-mode's real `+`-based accumulator (`arith_add`, `null` included via
-/// its own identity rule) or yq-mode's pre-#1034 "must already be a
-/// string" check -- **not** real yq's own `sub`/`gsub` coercion (confirmed
-/// live against yq v4.53.3: a non-string replacement stringifies and
-/// concatenates instead of erroring, e.g. `sub("a";5)` on `"abc"` is
-/// `"5bc"`); #1034 only fixed jq-mode's wording, so yq keeps its prior
-/// (still not yq-accurate, but not newly regressed) behavior here rather
-/// than silently changing under jq's `+`-based rules -- real yq-compatible
-/// `sub`/`gsub` coercion is its own follow-up (#1052).
+/// its own identity rule) or, in yq mode, real yq's own looser coercion
+/// (#1052): a scalar replacement stringifies instead of erroring
+/// (`sub("a";5)` on `"abc"` is `"5bc"`, confirmed live against yq v4.53.3
+/// for numbers/floats/bools/`null`), while an array or non-empty object
+/// replacement contributes an *empty* string rather than a JSON
+/// representation (`sub("a";[1,2])` on `"abc"` is `"bc"`, not
+/// `"[1, 2]bc"` -- `tostring()` itself gives the latter, so this isn't
+/// yq's general string-coercion rule; it's presumably an artifact of
+/// yq's underlying go-yaml node model, where only scalar nodes carry a
+/// raw text `Value`, and this call site clearly reads that raw value
+/// rather than reformatting the node like `tostring()` does). An *empty*
+/// object is the one exception to that container-is-empty rule: it
+/// stringifies to the literal text `"{}"` (confirmed live; why this one
+/// shape alone is exempted isn't yet understood).
 ///
 /// Deliberately called once per match, from a single loop over all matches
 /// in order (`stitch_replacements_evaluated`) rather than from a
@@ -8073,40 +8076,49 @@ fn stitch_replacements_evaluated<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// match's genuine type mismatch (caught by #1050's review, confirmed live
 /// against jq 1.7.1).
 ///
-/// No `optional`-gated arm on either error path: `optional` is never forced
-/// `true` reaching a nested `Call` node like `sub`/`gsub` (see
-/// `Expr::Optional`'s dispatch in `eval_single`, #693) -- a bare
-/// `sub(...)?` suppresses these errors via the ancestor `eval_try`'s catch,
-/// and `isvalid(sub(...))` via `isvalid`'s own error-catching (it evaluates
-/// with `optional: false`, not forced-`true`, despite an older comment
-/// elsewhere claiming otherwise). Confirmed dead per #928/#1003's identical
-/// finding elsewhere in this file: dedicated `sub(...)?`/`isvalid(sub(...))`
-/// tests for both branches still showed 0 coverage hits on the guards
-/// themselves.
+/// No `optional`-gated arm on its (now sole, since #1052) error path --
+/// the jq-mode `arith_add` fallback below, yq mode's own coercion never
+/// errors: `optional` is never forced `true` reaching a nested `Call` node
+/// like `sub`/`gsub` (see `Expr::Optional`'s dispatch in `eval_single`,
+/// #693) -- a bare `sub(...)?` suppresses this error via the ancestor
+/// `eval_try`'s catch, and `isvalid(sub(...))` via `isvalid`'s own
+/// error-catching (it evaluates with `optional: false`, not forced-`true`,
+/// despite an older comment elsewhere claiming otherwise). Confirmed dead
+/// per #928/#1003's identical finding elsewhere in this file: dedicated
+/// `sub(...)?`/`isvalid(sub(...))` tests for jq mode's now-sole error path
+/// still showed 0 coverage hits on the guard itself.
 #[cfg(feature = "regex")]
 fn combine_sub_gap<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     gap: &str,
     replacement: OwnedValue,
 ) -> Result<String, QueryResult<'a, W>> {
-    if let OwnedValue::String(s) = replacement {
-        let mut combined = String::with_capacity(gap.len() + s.len());
-        combined.push_str(gap);
-        combined.push_str(&s);
-        return Ok(combined);
-    }
-    if S::TAG == EvalTag::Yq {
-        return Err(QueryResult::Error(EvalError::type_error(
-            "string",
-            "replacement",
-        )));
-    }
-    match arith_add::<S>(OwnedValue::String(gap.to_string()), replacement) {
-        Ok(OwnedValue::String(combined)) => Ok(combined),
-        Ok(other) => {
-            unreachable!("gap + replacement always yields a String or errors, got {other:?}")
+    let replacement_text: Cow<'_, str> = match replacement {
+        OwnedValue::String(s) => Cow::Owned(s),
+        replacement if S::TAG == EvalTag::Yq => match &replacement {
+            OwnedValue::Array(_) => Cow::Borrowed(""),
+            OwnedValue::Object(map) if map.is_empty() => Cow::Borrowed("{}"),
+            OwnedValue::Object(_) => Cow::Borrowed(""),
+            OwnedValue::Null
+            | OwnedValue::Bool(_)
+            | OwnedValue::Int(_)
+            | OwnedValue::Float(_)
+            | OwnedValue::NumberLiteral(..) => Cow::Owned(owned_to_string::<S>(&replacement)),
+            OwnedValue::String(_) => unreachable!("String already matched above"),
+        },
+        replacement => {
+            return match arith_add::<S>(OwnedValue::String(gap.to_string()), replacement) {
+                Ok(OwnedValue::String(combined)) => Ok(combined),
+                Ok(other) => unreachable!(
+                    "gap + replacement always yields a String or errors, got {other:?}"
+                ),
+                Err(e) => Err(e.into()),
+            };
         }
-        Err(e) => Err(e.into()),
-    }
+    };
+    let mut combined = String::with_capacity(gap.len() + replacement_text.len());
+    combined.push_str(gap);
+    combined.push_str(&replacement_text);
+    Ok(combined)
 }
 
 /// Builtin: scan(re) - find all matches
@@ -30103,32 +30115,83 @@ mod tests {
 
     #[cfg(feature = "regex")]
     #[test]
-    fn test_regex_sub_yq_mode_keeps_pre_1034_replacement_type_check() {
-        // #1050 review: #1034's arith_add-based jq wording fix is jq-only --
-        // real yq's own sub/gsub coercion diverges from jq's `+`-based rules
-        // (confirmed live against yq v4.53.3: a non-string replacement
-        // stringifies and concatenates instead of erroring, e.g.
-        // `sub("a";5)` on `"abc"` is `"5bc"`, `sub("a";null)` is `"nullbc"`).
-        // Neither succinctly's pre-#1034 nor post-#1034 yq-mode behavior
-        // matches that, so #1034 deliberately keeps yq on its pre-existing
-        // "replacement must already be a string" check rather than silently
-        // adopting jq's `+`-based rules under yq mode too -- #1052 tracks
-        // real yq-compatible sub/gsub coercion as its own follow-up.
+    fn test_regex_sub_yq_mode_stringifies_non_string_replacement_1052() {
+        // #1052: real yq's own sub/gsub coercion diverges from jq's
+        // `+`-based rules -- confirmed live against yq v4.53.3: a scalar
+        // non-string replacement stringifies and concatenates instead of
+        // erroring, while an array/object replacement contributes an
+        // *empty* string, not a JSON representation like `tostring()`
+        // would give.
         yq_query!(br#""abc""#, r#"sub("a"; 5)"#,
-            QueryResult::Error(e) => {
-                assert_eq!(e.message, "expected string, got replacement");
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "5bc");
+            }
+        );
+        yq_query!(br#""abc""#, r#"sub("a"; 5.5)"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "5.5bc");
             }
         );
         yq_query!(br#""abc""#, r#"sub("a"; null)"#,
-            QueryResult::Error(e) => {
-                assert_eq!(e.message, "expected string, got replacement");
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "nullbc");
             }
         );
-        // `isvalid` reports `false` here too, via its own error-catching --
-        // not through any `optional`-gated arm inside `combine_sub_gap`,
-        // which has none (see that function's own doc comment).
+        yq_query!(br#""abc""#, r#"sub("a"; true)"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "truebc");
+            }
+        );
+        yq_query!(br#""abc""#, r#"sub("a"; false)"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "falsebc");
+            }
+        );
+        yq_query!(br#""abc""#, r#"sub("a"; [1,2])"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "bc");
+            }
+        );
+        yq_query!(br#""abc""#, r#"sub("a"; {"x":1})"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "bc");
+            }
+        );
+        yq_query!(br#""abc""#, r#"sub("a"; [])"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "bc");
+            }
+        );
+        // An *empty* object is the one exception to the container-is-empty
+        // rule: it stringifies to the literal text "{}", not "" the way an
+        // empty array or a non-empty object both do (confirmed live).
+        yq_query!(br#""abc""#, r#"sub("a"; {})"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "{}bc");
+            }
+        );
+        // Never errors any more, so isvalid reports true (was false
+        // pre-#1052).
         yq_query!(br#""abc""#, r#"isvalid(sub("a"; 5))"#,
-            QueryResult::Owned(OwnedValue::Bool(false)) => {}
+            QueryResult::Owned(OwnedValue::Bool(true)) => {}
+        );
+    }
+
+    #[cfg(feature = "regex")]
+    #[test]
+    fn test_regex_gsub_yq_mode_stringifies_non_string_replacement_1052() {
+        // #1052: combine_sub_gap is shared by sub and gsub -- confirm the
+        // coercion applies per-match across gsub's multiple matches too,
+        // not just sub's single one.
+        yq_query!(br#""aaa""#, r#"gsub("a"; 5)"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "555");
+            }
+        );
+        yq_query!(br#""aaa""#, r#"gsub("a"; [1,2])"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "");
+            }
         );
     }
 
