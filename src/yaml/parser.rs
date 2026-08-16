@@ -183,6 +183,18 @@ struct Parser<'a, const HAS_CR: bool> {
     /// See [`SemiIndex::line_comments`].
     line_comments: BTreeMap<usize, (u32, u32)>,
 
+    /// A comment trailing a `&anchor`/`!tag` whose value is deferred to a
+    /// later line, not yet attached to any node (#784).
+    ///
+    /// Real yq attaches such a comment to whatever node the deferred value
+    /// resolves to — its first child if one follows, or (if the value turns
+    /// out null) the next sibling entirely — never to the anchor's own key
+    /// line. That target doesn't exist yet at the point the comment is
+    /// scanned, so [`Self::defer_line_comment`] stashes the byte range here
+    /// and [`Self::take_pending_head_comment`] claims it once the next
+    /// primary node (a mapping key or sequence item) actually opens.
+    pending_head_comment: Option<(u32, u32)>,
+
     // Document tracking
     /// Whether we're currently inside a document
     in_document: bool,
@@ -276,6 +288,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             aliases: BTreeMap::new(),
             tags: BTreeMap::new(),
             line_comments: BTreeMap::new(),
+            pending_head_comment: None,
             in_document: false,
             document_start_bp_pos: 0,
             pending_explicit_key: None,
@@ -475,6 +488,66 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             self.line_comments
                 .entry(owner_bp_pos)
                 .or_insert((start as u32, p as u32));
+        }
+    }
+
+    /// Like [`Self::maybe_capture_line_comment`], but the owning node doesn't
+    /// exist yet: stash the comment's byte range in
+    /// [`Self::pending_head_comment`] instead of `line_comments` directly.
+    /// [`Self::take_pending_head_comment`] attaches it once that node opens
+    /// (#784).
+    #[inline]
+    fn defer_line_comment(&mut self) {
+        let mut p = self.pos;
+        while p < self.input.len() && Self::is_inline_whitespace(self.input[p]) {
+            p += 1;
+        }
+        if p < self.input.len() && self.input[p] == b'#' {
+            let start = p;
+            while p < self.input.len() && !Self::is_break(self.input[p]) {
+                p += 1;
+            }
+            self.pending_head_comment = Some((start as u32, p as u32));
+        }
+    }
+
+    /// Claim a comment deferred by [`Self::defer_line_comment`] for
+    /// `owner_bp_pos`, if one is pending (#784).
+    ///
+    /// Called at whichever bp_pos the *renderer* actually reads a trailing
+    /// comment from for that shape of node, mirroring the bp each call
+    /// site's own ordinary (non-deferred) same-line comment already
+    /// attaches to: a mapping key (`parse_mapping_entry`,
+    /// `parse_compact_mapping_entry` — both read from the key regardless of
+    /// whether the value is inline or deferred further) or a plain-scalar
+    /// sequence item's own scalar (`parse_sequence_item_inner`, after
+    /// `parse_value` returns — a sequence item's *wrapper* bp is never
+    /// read, only its content's). Never call this for a node the deferred
+    /// value's own null-value fallback opens inline, or the comment would
+    /// misattach to the anchor's own empty value instead of floating to the
+    /// next sibling, matching real yq's own behavior.
+    #[inline]
+    fn take_pending_head_comment(&mut self, owner_bp_pos: usize) {
+        if let Some(range) = self.pending_head_comment.take() {
+            self.line_comments.entry(owner_bp_pos).or_insert(range);
+        }
+    }
+
+    /// Drop a [`Self::pending_head_comment`] that survived one full
+    /// document-line dispatch completely untouched — neither consumed by
+    /// [`Self::take_pending_head_comment`] nor replaced by a fresh
+    /// [`Self::defer_line_comment`] call chained off that same line's own
+    /// anchor (#784). `before` is the value observed prior to the dispatch;
+    /// comparing by value, not just presence, is what tells "untouched" apart
+    /// from "consumed, then a new one queued in its place" when a line
+    /// chains two deferred anchors (`a: &x # c1` immediately followed by
+    /// `b: &y # c2`) — a boolean "was something pending" flag can't
+    /// distinguish those, and would wipe out `c2` before it ever got a
+    /// chance to attach.
+    #[inline]
+    fn drop_stale_pending_head_comment(&mut self, before: Option<(u32, u32)>) {
+        if before.is_some() && self.pending_head_comment == before {
+            self.pending_head_comment = None;
         }
     }
 
@@ -1171,6 +1244,13 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     fn start_document(&mut self) {
         self.in_document = true;
         self.document_start_bp_pos = self.bp_pos;
+        // A comment deferred by an anchor in a *previous* document (#784)
+        // has no node left to attach to once a new document starts -
+        // `parse_document_line`'s own one-line grace period already covers
+        // ordinary lines, but a document boundary can be reached via
+        // `parse_inline_document_value` instead, which doesn't go through
+        // that backstop.
+        self.pending_head_comment = None;
     }
 
     /// End the current document, closing any open containers.
@@ -2146,6 +2226,14 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
 
         // Open the sequence item node
         self.write_bp_open_seq_item();
+        // Deliberately not a `take_pending_head_comment` call site (#784):
+        // this wrapper's own bp is never what the emitter reads for a
+        // trailing comment on this line — a plain-scalar item's line
+        // comment lives on the *scalar's* own bp (see the `take_pending_head_comment`
+        // call after `parse_value` below), and any other continuation
+        // (compact-mapping key, a nested `parse_mapping_entry`/
+        // `parse_sequence_item` reached via a fresh line dispatch) claims it
+        // at its own, already-instrumented key/wrapper-open site instead.
 
         // Skip `- `
         self.advance(); // -
@@ -2179,6 +2267,15 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
 
         // Check what follows
         if self.at_line_end() {
+            // A trailing comment here belongs to this item's own deferred
+            // value, not to the item's dash line (#784, same shape as
+            // `parse_mapping_entry`'s anchor case) - only when there was a
+            // property to defer it past; a bare `- # comment` has no anchor
+            // to blame the deferral on and is a separate, untouched gap.
+            if had_property {
+                self.defer_line_comment();
+            }
+
             // An anchor records the *next* BP position as its target, and a
             // tag is looked up *at* that position (`self.tags`), so a
             // property-prefixed item whose value turns out to be null needs
@@ -2259,6 +2356,14 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             // Parse the item value normally
             // Pass structure indent for block scalars (content must be > this)
             self.parse_value(indent)?;
+            // Claim a comment deferred by an earlier anchor's deferred value
+            // (#784): a plain-scalar item's own trailing comment lives on
+            // the scalar's own bp (matching the ordinary, non-deferred
+            // `- 1 # comment` case, which `set_bp_text_end` inside
+            // `parse_value` already attaches there) - `self.last_open_bp_pos`
+            // still refers to that scalar here since nothing opens a BP
+            // node between `parse_value` returning and this point.
+            self.take_pending_head_comment(self.last_open_bp_pos);
             // Close the sequence item for simple values
             self.indent_stack.pop();
             self.pop_type();
@@ -2302,6 +2407,9 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
 
         // Open key node
         self.write_bp_open();
+        // Claim a comment deferred by an earlier anchor's deferred value
+        // (#784), if this key is the first content to follow it.
+        self.take_pending_head_comment(self.last_open_bp_pos);
 
         // Check for a property on the key (`- &a k: v` / `- !!str k: v`) -
         // record it pointing to this key.
@@ -2517,6 +2625,9 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
 
         // Open key node
         self.write_bp_open();
+        // Claim a comment deferred by an earlier anchor's deferred value
+        // (#784), if this key is the first content to follow it.
+        self.take_pending_head_comment(self.last_open_bp_pos);
 
         // Check for a property on the key - record it pointing to this key BP
         self.record_key_properties()?;
@@ -2718,6 +2829,13 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
 
             // After anchor, check if value continues on next line
             if self.at_line_end() {
+                // A trailing comment here belongs to the deferred value, not
+                // to this key's own line (#784, distinct from #765's
+                // no-anchor case) - defer it rather than dropping it;
+                // `take_pending_head_comment` claims it wherever the next
+                // primary node opens.
+                self.defer_line_comment();
+
                 // Need to check if the next line has content for this value,
                 // or if the value is null (same or lower indent on next line)
                 self.skip_to_eol();
@@ -5039,6 +5157,11 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
 
     /// Parse a single line of document content.
     fn parse_document_line(&mut self) -> Result<(), YamlError> {
+        // Snapshot for `drop_stale_pending_head_comment` below (#784): a
+        // comment deferred by an anchor on an *earlier* line gets exactly
+        // one line's worth of grace to be claimed by this dispatch.
+        let pending_head_comment_before = self.pending_head_comment;
+
         // Count indentation - but handle tabs specially for flow structures
         let indent = match self.count_indent() {
             Ok(n) => n,
@@ -5055,6 +5178,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                         self.parse_value(0)?;
                         // Move to next line if we haven't already
                         self.skip_line_break();
+                        self.drop_stale_pending_head_comment(pending_head_comment_before);
                         return Ok(());
                     }
                     _ => {
@@ -5093,6 +5217,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
 
         // Move to next line if we haven't already
         self.skip_line_break();
+        self.drop_stale_pending_head_comment(pending_head_comment_before);
 
         Ok(())
     }

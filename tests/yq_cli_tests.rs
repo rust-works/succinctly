@@ -9110,6 +9110,149 @@ fn test_key_comment_preserved_with_null_value_and_sort_keys_765() -> Result<()> 
 }
 
 // ============================================================================
+// Anchor-deferred trailing comment (#784)
+// ============================================================================
+//
+// Distinct from #765 above: #765 covers a comment trailing a *key*'s own
+// line with no anchor (`a: # comment\n  b: 1`, attaches to the key). This
+// covers a comment trailing an `&anchor`/`!tag` that itself defers the
+// value (`a: &anc # comment\n  b: 1`) - real yq attaches that comment to
+// the deferred value's own first line instead (`b: 1 # comment`), never to
+// the anchor's key line. When the anchor's value turns out null, the
+// comment floats past it to whatever comes next in the document (the next
+// sibling key or item) rather than disappearing - verified against the
+// pinned real `yq` binary for every shape below, same discipline as #765.
+
+/// The issue's own repro: an anchor's trailing comment, value deferred to a
+/// nested mapping.
+#[test]
+fn test_anchor_comment_preserved_with_nested_mapping_value_784() -> Result<()> {
+    let (out, code) = run_yq_stdin(".", "a: &anc # comment\n  b: 1\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "a: &anc\n  b: 1 # comment\n");
+    Ok(())
+}
+
+/// Same shape, but the deferred value is a nested sequence rather than a
+/// nested mapping - the comment attaches to the first item.
+#[test]
+fn test_anchor_comment_preserved_with_nested_sequence_value_784() -> Result<()> {
+    let (out, code) = run_yq_stdin(".", "a: &anc # comment\n  - 1\n  - 2\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "a: &anc\n  - 1 # comment\n  - 2\n");
+    Ok(())
+}
+
+/// The deferred value's first line is itself a mapping key with no inline
+/// scalar (further deferred again) - the comment lands on that key's own
+/// line, matching #765's own key-attachment convention recursively.
+#[test]
+fn test_anchor_comment_preserved_with_doubly_nested_mapping_value_784() -> Result<()> {
+    let (out, code) = run_yq_stdin(".", "a: &anc # comment\n  b:\n    c: 1\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "a: &anc\n  b: # comment\n    c: 1\n");
+    Ok(())
+}
+
+/// The deferred value's first item is itself a compact mapping (`- key:
+/// value`) - the comment lands on that item's own key, matching a plain
+/// mapping entry's own attachment convention.
+#[test]
+fn test_anchor_comment_preserved_with_compact_mapping_sequence_value_784() -> Result<()> {
+    let (out, code) = run_yq_stdin(".", "a: &anc # comment\n  - key: 1\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "a: &anc\n  - key: 1 # comment\n");
+    Ok(())
+}
+
+/// A sequence *item's own* anchor (not a mapping key's) can defer its value
+/// the same way - the comment attaches to the nested mapping's key exactly
+/// as it does for the mapping-key-anchor case above.
+#[test]
+fn test_anchor_comment_preserved_on_sequence_item_784() -> Result<()> {
+    let (out, code) = run_yq_stdin(".", "- &anc # comment\n  b: 1\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "- &anc\n  b: 1 # comment\n");
+    Ok(())
+}
+
+/// Same shape, but the deferred value is a nested sequence (`- - 1`) -
+/// exercises the recursive sequence-item-inside-sequence-item path.
+#[test]
+fn test_anchor_comment_preserved_on_sequence_item_with_nested_sequence_784() -> Result<()> {
+    let (out, code) = run_yq_stdin(".", "a: &anc # comment\n  - - 1\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "a: &anc\n  - - 1 # comment\n");
+    Ok(())
+}
+
+/// Regression guard: a comment trailing a same-line (not deferred) anchored
+/// value keeps belonging to that value, unaffected by the new deferred-
+/// comment machinery.
+#[test]
+fn test_anchor_comment_not_deferred_for_same_line_value_784() -> Result<()> {
+    let (out, code) = run_yq_stdin(".", "a: &anc 5 # comment\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "a: &anc 5 # comment\n");
+    Ok(())
+}
+
+/// Regression guard: an anchor with no trailing comment at all is
+/// unaffected.
+#[test]
+fn test_anchor_no_comment_unaffected_784() -> Result<()> {
+    let (out, code) = run_yq_stdin(".", "a: &anc\n  b: 1\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "a: &anc\n  b: 1\n");
+    Ok(())
+}
+
+// When the anchor's deferred value turns out null, the comment floats past
+// it to the next sibling rather than disappearing (or, at true EOF with no
+// sibling to float to, is dropped - matching real yq exactly there) - the
+// three tests below pin that behavior specifically. Note: succinctly
+// renders a null anchor value's own line as `&anc ""` here, not real yq's
+// bare `&anc` - that's a separate, pre-existing divergence in null-anchor
+// rendering (unrelated to comment placement, reproduces identically with no
+// comment present at all, e.g. plain `a: &anc\n` with EOF immediately after
+// - tracked as a follow-up, not part of #784's scope). Only the *comment's*
+// position (landing on the sibling's own line, or vanishing at EOF) is what
+// these tests pin.
+
+/// A sibling key immediately follows at the same indent - the anchor's
+/// deferred value is null, and its comment floats to the sibling.
+#[test]
+fn test_anchor_comment_floats_to_sibling_same_indent_784() -> Result<()> {
+    let (out, code) = run_yq_stdin(".", "a: &anc # comment\nb: 2\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "a: &anc \"\"\nb: 2 # comment\n");
+    Ok(())
+}
+
+/// Same shape, but the sibling that ends the anchor's deferred value sits
+/// at a lower indent than the anchor itself.
+#[test]
+fn test_anchor_comment_floats_to_sibling_lower_indent_784() -> Result<()> {
+    let (out, code) = run_yq_stdin(".", "x:\n  a: &anc # comment\n  b: 2\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "x:\n  a: &anc \"\"\n  b: 2 # comment\n");
+    Ok(())
+}
+
+/// The deferred anchor is the last thing in the document - EOF ends it with
+/// no sibling to float to, so the comment is dropped entirely, matching
+/// real yq exactly (verified live: real yq also drops it here, unlike
+/// #765's own EOF case, where a *key's* deferred-null comment survives with
+/// no anchor involved).
+#[test]
+fn test_anchor_comment_dropped_at_eof_with_no_sibling_784() -> Result<()> {
+    let (out, code) = run_yq_stdin(".", "a: &anc # comment\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "a: &anc \"\"\n");
+    Ok(())
+}
+
+// ============================================================================
 // Explicit-key (`? k ... : v`) trailing comment (#795)
 // ============================================================================
 //
