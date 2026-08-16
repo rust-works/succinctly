@@ -4184,18 +4184,27 @@ fn builtin_contains<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// `false`, not the error [`EvalError::containment_check`] raises. The callers
 /// screen the top level with [`jq_kind`], so this stays a total function.
 fn owned_contains(a: &OwnedValue, b: &OwnedValue) -> bool {
+    owned_contains_at_depth(a, b, 0)
+}
+
+/// Panics past [`MAX_VALUE_TREE_DEPTH`](crate::jq::value::MAX_VALUE_TREE_DEPTH)
+/// levels of nesting (#1021, following #1005's precedent).
+fn owned_contains_at_depth(a: &OwnedValue, b: &OwnedValue, depth: usize) -> bool {
+    assert_value_tree_depth(depth);
     match (a, b) {
         // String contains string
         (OwnedValue::String(a_str), OwnedValue::String(b_str)) => a_str.contains(b_str.as_str()),
         // Array contains: all elements of b must be contained in a
-        (OwnedValue::Array(a_arr), OwnedValue::Array(b_arr)) => b_arr
-            .iter()
-            .all(|b_elem| a_arr.iter().any(|a_elem| owned_contains(a_elem, b_elem))),
+        (OwnedValue::Array(a_arr), OwnedValue::Array(b_arr)) => b_arr.iter().all(|b_elem| {
+            a_arr
+                .iter()
+                .any(|a_elem| owned_contains_at_depth(a_elem, b_elem, depth + 1))
+        }),
         // Object contains: all keys in b must exist in a with matching values
         (OwnedValue::Object(a_obj), OwnedValue::Object(b_obj)) => b_obj.iter().all(|(k, b_val)| {
             a_obj
                 .get(k)
-                .is_some_and(|a_val| owned_contains(a_val, b_val))
+                .is_some_and(|a_val| owned_contains_at_depth(a_val, b_val, depth + 1))
         }),
         // Scalars: equality
         _ => a == b,
@@ -11538,11 +11547,20 @@ fn resolve_recursive_descent(value: &OwnedValue) -> Vec<PathBranch<'_>> {
 /// `Vec<Expr>` path components rather than the value — tracked separately as
 /// #701 since it needs a different technique (structural sharing over the
 /// path list, not `Cow`) and #668 never scoped it in.
+///
+/// Panics past [`MAX_VALUE_TREE_DEPTH`](crate::jq::value::MAX_VALUE_TREE_DEPTH)
+/// levels of nesting (#1021, following #1005's precedent) — `prefix` already
+/// grows by exactly one component per descent from its sole call site
+/// (`resolve_recursive_descent`, starting at `&[]`), so its length doubles
+/// as the recursion depth with no extra parameter needed. `tests/
+/// jq_recurse_depth_tests.rs` already pins a depth-300 correctness floor
+/// through this exact function (#626/#661) — well under the 384 ceiling.
 fn push_recursive_branches<'a>(
     prefix: &[Expr],
     value: &'a OwnedValue,
     out: &mut Vec<PathBranch<'a>>,
 ) {
+    assert_value_tree_depth(prefix.len());
     out.push((prefix.to_vec(), Cow::Borrowed(value)));
     match value {
         OwnedValue::Array(items) => {
@@ -14799,11 +14817,23 @@ fn walk_impl<S: EvalSemantics>(
     value: OwnedValue,
     optional: bool,
 ) -> (Vec<OwnedValue>, Option<Control>) {
+    walk_impl_at_depth::<S>(f, value, optional, 0)
+}
+
+/// Panics past [`MAX_VALUE_TREE_DEPTH`](crate::jq::value::MAX_VALUE_TREE_DEPTH)
+/// levels of nesting (#1021, following #1005's precedent).
+fn walk_impl_at_depth<S: EvalSemantics>(
+    f: &Expr,
+    value: OwnedValue,
+    optional: bool,
+    depth: usize,
+) -> (Vec<OwnedValue>, Option<Control>) {
+    assert_value_tree_depth(depth);
     let processed = match value {
         OwnedValue::Array(arr) => {
             let mut new_arr = Vec::with_capacity(arr.len());
             for v in arr {
-                let (vs, control) = walk_impl::<S>(f, v, optional);
+                let (vs, control) = walk_impl_at_depth::<S>(f, v, optional, depth + 1);
                 new_arr.extend(vs);
                 if let Some(control) = control {
                     return (Vec::new(), Some(control));
@@ -14814,7 +14844,7 @@ fn walk_impl<S: EvalSemantics>(
         OwnedValue::Object(obj) => {
             let mut new_obj = IndexMap::with_capacity(obj.len());
             for (k, v) in obj {
-                let (vs, control) = walk_impl::<S>(f, v, optional);
+                let (vs, control) = walk_impl_at_depth::<S>(f, v, optional, depth + 1);
                 if let Some(control) = control {
                     return (Vec::new(), Some(control));
                 }
@@ -16282,8 +16312,15 @@ fn extend(current_path: &[OwnedValue], component: OwnedValue) -> Vec<OwnedValue>
     path
 }
 
-/// Helper to collect all paths recursively
+/// Helper to collect all paths recursively.
+///
+/// Panics past [`MAX_VALUE_TREE_DEPTH`](crate::jq::value::MAX_VALUE_TREE_DEPTH)
+/// levels of nesting (#1021, following #1005's precedent) — `current_path`
+/// already grows by exactly one component per descent from both call sites
+/// (`builtin_paths`/`builtin_paths_filter`, both starting at `&[]`), so its
+/// length doubles as the recursion depth with no extra parameter needed.
 fn collect_paths(value: &OwnedValue, current_path: &[OwnedValue], paths: &mut Vec<OwnedValue>) {
+    assert_value_tree_depth(current_path.len());
     match value {
         OwnedValue::Object(entries) => {
             for (key, val) in entries {
@@ -16310,7 +16347,14 @@ fn collect_paths(value: &OwnedValue, current_path: &[OwnedValue], paths: &mut Ve
 /// every *non-empty* container, whose path is the container's own path with
 /// its last key/index appended (jq's own convention — verified against
 /// jq-1.7.1, see `test_tostream_*` below).
+///
+/// Panics past [`MAX_VALUE_TREE_DEPTH`](crate::jq::value::MAX_VALUE_TREE_DEPTH)
+/// levels of nesting (#1021, following #1005's precedent) — `path` already
+/// grows by exactly one component per descent from its sole call site
+/// (`builtin_tostream`, starting at `&[]`), so its length doubles as the
+/// recursion depth with no extra parameter needed.
 fn collect_tostream_events(value: &OwnedValue, path: &[OwnedValue], events: &mut Vec<OwnedValue>) {
+    assert_value_tree_depth(path.len());
     match value {
         OwnedValue::Object(entries) if !entries.is_empty() => {
             let mut last_path = path.to_vec();
@@ -40171,6 +40215,121 @@ mod tests {
         assert!(
             result.is_err(),
             "owned_to_yaml should panic at MAX_VALUE_TREE_DEPTH"
+        );
+    }
+
+    /// #1021: `owned_contains` (backs `contains`/`inside`) had no depth
+    /// guard at all before this issue.
+    #[test]
+    fn owned_contains_panics_past_nesting_depth_limit_1021() {
+        use crate::jq::value::MAX_VALUE_TREE_DEPTH;
+
+        let under_a = linear_array_nest(MAX_VALUE_TREE_DEPTH - 1);
+        let under_b = linear_array_nest(MAX_VALUE_TREE_DEPTH - 1);
+        assert!(owned_contains(&under_a, &under_b));
+
+        let over_a = linear_array_nest(MAX_VALUE_TREE_DEPTH);
+        let over_b = linear_array_nest(MAX_VALUE_TREE_DEPTH);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            owned_contains(&over_a, &over_b)
+        }));
+        assert!(
+            result.is_err(),
+            "owned_contains should panic at MAX_VALUE_TREE_DEPTH"
+        );
+    }
+
+    /// #1021: `collect_paths` (backs `paths`/`paths(node_filter)`) had no
+    /// depth guard at all before this issue -- `current_path.len()` doubles
+    /// as the recursion depth, so no new parameter was needed, just the
+    /// assertion.
+    #[test]
+    fn collect_paths_panics_past_nesting_depth_limit_1021() {
+        use crate::jq::value::MAX_VALUE_TREE_DEPTH;
+
+        let under = linear_array_nest(MAX_VALUE_TREE_DEPTH - 1);
+        let mut paths = Vec::new();
+        collect_paths(&under, &[], &mut paths);
+        assert_eq!(paths.len(), MAX_VALUE_TREE_DEPTH - 1);
+
+        let over = linear_array_nest(MAX_VALUE_TREE_DEPTH);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut paths = Vec::new();
+            collect_paths(&over, &[], &mut paths);
+        }));
+        assert!(
+            result.is_err(),
+            "collect_paths should panic at MAX_VALUE_TREE_DEPTH"
+        );
+    }
+
+    /// #1021: `collect_tostream_events` (backs `tostream`) had no depth
+    /// guard at all before this issue -- `path.len()` doubles as the
+    /// recursion depth, so no new parameter was needed, just the assertion.
+    #[test]
+    fn collect_tostream_events_panics_past_nesting_depth_limit_1021() {
+        use crate::jq::value::MAX_VALUE_TREE_DEPTH;
+
+        let under = linear_array_nest(MAX_VALUE_TREE_DEPTH - 1);
+        let mut events = Vec::new();
+        collect_tostream_events(&under, &[], &mut events);
+        assert!(!events.is_empty());
+
+        let over = linear_array_nest(MAX_VALUE_TREE_DEPTH);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut events = Vec::new();
+            collect_tostream_events(&over, &[], &mut events);
+        }));
+        assert!(
+            result.is_err(),
+            "collect_tostream_events should panic at MAX_VALUE_TREE_DEPTH"
+        );
+    }
+
+    /// #1021: `push_recursive_branches` (backs `..`/bare `recurse`) had no
+    /// depth guard at all before this issue -- `prefix.len()` doubles as the
+    /// recursion depth, so no new parameter was needed, just the assertion.
+    /// `tests/jq_recurse_depth_tests.rs` already pins a depth-300
+    /// correctness floor through this exact function (#626/#661), well
+    /// under the 384 ceiling asserted here.
+    #[test]
+    fn push_recursive_branches_panics_past_nesting_depth_limit_1021() {
+        use crate::jq::value::MAX_VALUE_TREE_DEPTH;
+
+        let under = linear_array_nest(MAX_VALUE_TREE_DEPTH - 1);
+        let mut out = Vec::new();
+        push_recursive_branches(&[], &under, &mut out);
+        assert_eq!(out.len(), MAX_VALUE_TREE_DEPTH);
+
+        let over = linear_array_nest(MAX_VALUE_TREE_DEPTH);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut out = Vec::new();
+            push_recursive_branches(&[], &over, &mut out);
+        }));
+        assert!(
+            result.is_err(),
+            "push_recursive_branches should panic at MAX_VALUE_TREE_DEPTH"
+        );
+    }
+
+    /// #1021: `walk_impl` (backs `walk(f)`) had no depth guard at all
+    /// before this issue.
+    #[test]
+    fn walk_impl_panics_past_nesting_depth_limit_1021() {
+        use crate::jq::value::MAX_VALUE_TREE_DEPTH;
+
+        let under = linear_array_nest(MAX_VALUE_TREE_DEPTH - 1);
+        let (vals, control) = walk_impl::<JqSemantics>(&Expr::Identity, under, false);
+        assert!(control.is_none());
+        assert_eq!(vals.len(), 1);
+
+        let over = linear_array_nest(MAX_VALUE_TREE_DEPTH);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            walk_impl::<JqSemantics>(&Expr::Identity, over, false)
+        }));
+        assert!(
+            result.is_err(),
+            "walk_impl should panic at MAX_VALUE_TREE_DEPTH"
         );
     }
 }

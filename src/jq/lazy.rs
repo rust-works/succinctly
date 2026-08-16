@@ -27,7 +27,7 @@ use crate::json::light::{JsonCursor, StandardJson};
 
 use super::escape::write_json_body_jq;
 use super::expr::Literal;
-use super::value::OwnedValue;
+use super::value::{assert_value_tree_depth, OwnedValue};
 
 /// A JSON value for jq evaluation - lazy by default, materialized when needed.
 ///
@@ -385,6 +385,13 @@ impl<'a, W: Clone + AsRef<[u64]>> JqValue<'a, W> {
     /// This recursively materializes all nested values. Use sparingly -
     /// prefer keeping values as cursors when possible.
     pub fn materialize(&self) -> OwnedValue {
+        self.materialize_at_depth(0)
+    }
+
+    /// Panics past [`MAX_VALUE_TREE_DEPTH`](super::value::MAX_VALUE_TREE_DEPTH)
+    /// levels of nesting (#1021, following #1005's precedent).
+    fn materialize_at_depth(&self, depth: usize) -> OwnedValue {
+        assert_value_tree_depth(depth);
         match self {
             JqValue::Cursor(c) => cursor_to_owned(c),
             JqValue::Null => OwnedValue::Null,
@@ -394,12 +401,14 @@ impl<'a, W: Clone + AsRef<[u64]>> JqValue<'a, W> {
             JqValue::RawNumber(bytes) => OwnedValue::from_number_bytes(bytes),
             JqValue::NumberLiteral(literal) => OwnedValue::from_number_literal(literal),
             JqValue::String(s) => OwnedValue::String(s.clone()),
-            JqValue::Array(arr) => {
-                OwnedValue::Array(arr.iter().map(JqValue::materialize).collect())
-            }
+            JqValue::Array(arr) => OwnedValue::Array(
+                arr.iter()
+                    .map(|v| v.materialize_at_depth(depth + 1))
+                    .collect(),
+            ),
             JqValue::Object(obj) => OwnedValue::Object(
                 obj.iter()
-                    .map(|(k, v)| (k.clone(), v.materialize()))
+                    .map(|(k, v)| (k.clone(), v.materialize_at_depth(depth + 1)))
                     .collect(),
             ),
             JqValue::LazyKeysArray(fields) => lazy_keys_array_to_owned(fields),
@@ -411,6 +420,13 @@ impl<'a, W: Clone + AsRef<[u64]>> JqValue<'a, W> {
     ///
     /// More efficient than `materialize()` when you don't need to keep the original.
     pub fn into_owned(self) -> OwnedValue {
+        self.into_owned_at_depth(0)
+    }
+
+    /// Panics past [`MAX_VALUE_TREE_DEPTH`](super::value::MAX_VALUE_TREE_DEPTH)
+    /// levels of nesting (#1021, following #1005's precedent).
+    fn into_owned_at_depth(self, depth: usize) -> OwnedValue {
+        assert_value_tree_depth(depth);
         match self {
             JqValue::Cursor(c) => cursor_to_owned(&c),
             JqValue::Null => OwnedValue::Null,
@@ -420,12 +436,16 @@ impl<'a, W: Clone + AsRef<[u64]>> JqValue<'a, W> {
             JqValue::RawNumber(bytes) => OwnedValue::from_number_bytes(bytes),
             JqValue::NumberLiteral(literal) => OwnedValue::from_number_literal_boxed(literal),
             JqValue::String(s) => OwnedValue::String(s),
-            JqValue::Array(arr) => {
-                OwnedValue::Array(arr.into_iter().map(JqValue::into_owned).collect())
-            }
-            JqValue::Object(obj) => {
-                OwnedValue::Object(obj.into_iter().map(|(k, v)| (k, v.into_owned())).collect())
-            }
+            JqValue::Array(arr) => OwnedValue::Array(
+                arr.into_iter()
+                    .map(|v| v.into_owned_at_depth(depth + 1))
+                    .collect(),
+            ),
+            JqValue::Object(obj) => OwnedValue::Object(
+                obj.into_iter()
+                    .map(|(k, v)| (k, v.into_owned_at_depth(depth + 1)))
+                    .collect(),
+            ),
             JqValue::LazyKeysArray(fields) => lazy_keys_array_to_owned(&fields),
             JqValue::LazyIndexRange(len) => lazy_index_range_to_owned(len),
         }
@@ -1043,5 +1063,53 @@ mod tests {
         let cursor = index.root(json);
         let into_owned_val: JqValue<'_, Vec<u64>> = JqValue::from_cursor(cursor);
         assert_eq!(into_owned_val.into_owned().to_json(), "1E+100");
+    }
+
+    /// `depth` levels of single-element array nesting: `[[[...[null]...]]]`.
+    /// Mirrors `value.rs`/`eval.rs`'s own `linear_array_nest` helper (#1005),
+    /// built directly out of `JqValue` since `materialize`/`into_owned`
+    /// recurse over that type, not `OwnedValue`.
+    fn linear_jqvalue_nest(depth: usize) -> JqValue<'static, Vec<u64>> {
+        let mut v = JqValue::Null;
+        for _ in 0..depth {
+            v = JqValue::Array(vec![v]);
+        }
+        v
+    }
+
+    /// #1021: `JqValue::materialize` had no depth guard at all before this
+    /// issue -- unlike its `Cursor` arm (already guarded independently via
+    /// `cursor_to_owned_at_depth`), the `Array`/`Object` arms recursed
+    /// unbounded.
+    #[test]
+    fn materialize_panics_past_nesting_depth_limit_1021() {
+        use crate::jq::value::MAX_VALUE_TREE_DEPTH;
+
+        let under = linear_jqvalue_nest(MAX_VALUE_TREE_DEPTH - 1);
+        assert!(matches!(under.materialize(), OwnedValue::Array(_)));
+
+        let over = linear_jqvalue_nest(MAX_VALUE_TREE_DEPTH);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| over.materialize()));
+        assert!(
+            result.is_err(),
+            "materialize should panic at MAX_VALUE_TREE_DEPTH"
+        );
+    }
+
+    /// #1021: `JqValue::into_owned` had no depth guard at all before this
+    /// issue -- same gap as `materialize`, just on the consuming twin.
+    #[test]
+    fn into_owned_panics_past_nesting_depth_limit_1021() {
+        use crate::jq::value::MAX_VALUE_TREE_DEPTH;
+
+        let under = linear_jqvalue_nest(MAX_VALUE_TREE_DEPTH - 1);
+        assert!(matches!(under.into_owned(), OwnedValue::Array(_)));
+
+        let over = linear_jqvalue_nest(MAX_VALUE_TREE_DEPTH);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| over.into_owned()));
+        assert!(
+            result.is_err(),
+            "into_owned should panic at MAX_VALUE_TREE_DEPTH"
+        );
     }
 }
