@@ -10,7 +10,7 @@
 use alloc::vec;
 #[cfg(not(test))]
 use alloc::{
-    borrow::Cow, collections::BTreeMap, rc::Rc, string::String, string::ToString, vec::Vec,
+    borrow::Cow, collections::BTreeMap, format, rc::Rc, string::String, string::ToString, vec::Vec,
 };
 
 #[cfg(test)]
