@@ -3255,8 +3255,13 @@ fn write_i64(output: &mut String, mut n: i64) {
 /// whole values and never uses exponent notation, so the absence of a `.` is
 /// the only case needing repair.
 ///
-/// Shared with the streaming writer and the `yq` CLI's printers so every
-/// emitter renders a float the same way.
+/// Shared with the streaming writer and the `yq` CLI's printers as their
+/// common fallback for a *nested* (non-root) computed float, where real
+/// yq instead emits an explicit `!!float` tag to keep the value's type
+/// unambiguous -- a mechanism succinctly's YAML emitters don't have (see
+/// [`format_float_yq_yaml`]'s doc comment, issue #949). A root-position
+/// scalar routes through [`format_float_yq_yaml`] instead, matching real
+/// yq's own root-only decimal-point-dropping rule.
 #[must_use]
 pub fn format_float_with_fraction(f: f64) -> String {
     let mut buf = f.to_string();
@@ -3295,11 +3300,9 @@ pub fn format_float_with_fraction(f: f64) -> String {
 ///
 /// Lives here (not in the CLI binary) rather than only in
 /// `src/bin/succinctly/output.rs`, which now re-exports this under the
-/// same name, so a future library-side computed-float formatter (there is
-/// none yet -- `succinctly jq`'s own arithmetic results have no yq-mode
-/// concept to begin with) could share it without duplicating the
-/// threshold logic; not because the M2 streaming path calls it today (it
-/// doesn't -- see above).
+/// same name, so its YAML-output sibling ([`format_float_yq_yaml`]) and
+/// the M2 streaming writer (`src/jq/stream.rs`) can share the threshold
+/// logic without duplicating it.
 ///
 /// `f` must be finite -- like [`format_float_with_fraction`], this has no
 /// JSON/YAML-specific spelling for NaN/Infinity to fall back on, so every
@@ -3309,20 +3312,30 @@ pub fn format_float_yq(f: f64) -> String {
     format_float_yq_with(f, format_float_with_fraction)
 }
 
-/// The YAML-output sibling of [`format_float_yq`].
+/// The YAML-output sibling of [`format_float_yq`], for a computed float at
+/// **document-root scalar position only**.
 ///
 /// Same magnitude threshold and scientific-notation spelling, but everyday
 /// magnitudes render at their shortest (`2`, not `2.0`) rather than with a
 /// forced decimal point.
 ///
 /// Real yq's computed-float convention genuinely differs by *output*
-/// format, not just by input source: `. + 1` on YAML-sourced `1.0` prints
-/// `2` on YAML output but `2.0` on JSON output (compact and pretty always
-/// agree with each other, just not with YAML) -- confirmed against real yq
-/// v4.53.3 (issue #949). [`format_float_yq`] is the JSON-output
-/// convention (also used by `-o json`'s DOM path in `output.rs`); this is
-/// the YAML-output one, for [`crate::jq::eval`]'s YAML streamer and the
-/// `yq` CLI's own YAML DOM printer.
+/// format at root position specifically: `. + 1` on YAML-sourced `1.0`
+/// prints `2` on YAML output but `2.0` on JSON output (compact and pretty
+/// always agree with each other, just not with YAML) -- confirmed against
+/// real yq v4.53.3 (issue #949). Nested (any object field, array element,
+/// or `-i` in-place edit), real yq instead emits an explicit `!!float`
+/// tag to keep the value's type unambiguous on reparse (`a: !!float 2`);
+/// succinctly's YAML emitters have no tag-emission mechanism to match
+/// that, so a nested position falls back to [`format_float_yq`]'s
+/// decimal-preserving spelling instead of calling this function --
+/// imperfect versus the oracle, but it doesn't silently change the
+/// value's inferred type from float to int on round trip the way this
+/// function's bare, untagged spelling would. Callers are responsible for
+/// making that root-vs-nested choice themselves (see the `depth`-gated
+/// call sites in `src/bin/succinctly/yq_runner.rs` and
+/// `src/jq/stream.rs`); this function always drops the point
+/// unconditionally.
 ///
 /// `f` must be finite, like [`format_float_yq`].
 #[must_use]

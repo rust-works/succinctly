@@ -7675,9 +7675,18 @@ fn test_jq_mode_computed_float_formatting_unaffected_by_997() -> Result<()> {
 // magnitude case #997 didn't touch: unlike JSON output (which keeps a
 // computed whole float's decimal point regardless of compact/pretty --
 // `test_compact_and_pretty_agree_on_whole_floats` above), YAML output of
-// the *same* computed value drops it -- `. + 1` on `1.0` prints `2` in
-// YAML output but `2.0` in JSON output. Each expectation was measured
-// directly against the pinned `yq` v4.53.3 binary.
+// the *same* computed value drops it -- but **only at document-root
+// scalar position**. Real yq v4.53.3 disambiguates a nested computed
+// float with an explicit `!!float` tag instead (`a: !!float 2`);
+// succinctly has no tag-emission mechanism to match that, so a nested
+// computed float here keeps its pre-existing decimal-point-preserving
+// spelling (`a: 2.0`) rather than dropping the point *without* a tag,
+// which would silently reparse as an int and lose the value's type --
+// worse than the pre-#949 status quo, not just non-byte-identical to the
+// oracle. Each root-scalar expectation was measured directly against the
+// pinned `yq` v4.53.3 binary; the nested-position fallback is
+// succinctly's own choice among its two imperfect options, not itself an
+// oracle-matched spelling (see `test_computed_whole_float_nested_yaml_output_keeps_type_949`).
 // =============================================================================
 
 #[test]
@@ -7728,17 +7737,58 @@ fn test_literal_whole_float_unaffected_by_949_fix() -> Result<()> {
     Ok(())
 }
 
-/// The M2 YAML streaming path (`stream_owned_value_yaml` in
-/// `src/jq/stream.rs`) has its own, separate `Float` arm from the DOM path
-/// (`emit_yaml_value`) fixed above -- reachable via `first`/`last`
-/// wrapping a computation, the same M2-classification path #997 fixed for
-/// the scientific-notation case. Confirms both writers agree.
+/// The critical regression this fix's first draft shipped (caught by code
+/// review, not by real yq's own byte-for-byte spelling): applying the
+/// root-only decimal-point drop at *every* nesting depth turned a
+/// type-preserving-if-imperfect output (`a: 2.0`, reparses as `!!float`)
+/// into a type-losing one (`a: 2`, reparses as `!!int`) for the much more
+/// common real-world shape of incrementing a float field in place. Real
+/// yq itself never drops the point here -- it tags instead (`a: !!float
+/// 2`) -- so `a: 2.0` is the closer of succinctly's two available
+/// spellings; `a: 2` would be closer in byte count but wrong in type,
+/// which is the worse defect for a data-format round trip.
 #[test]
-fn test_computed_whole_float_via_first_last_yaml_output_949() -> Result<()> {
-    for (filter, want) in [("first(.a + 1)", "2"), ("last(.a + 1)", "2")] {
-        let (out, code) = run_yq_stdin(filter, "a: 1.0\n", &[])?;
+fn test_computed_whole_float_nested_yaml_output_keeps_type_949() -> Result<()> {
+    for (filter, yaml) in [
+        (".a += 1", "a: 1.0\n"),
+        (".a |= . + 1", "a: 1.0\n"),
+        (".a *= 2", "a: 1.0\n"),
+    ] {
+        let (out, code) = run_yq_stdin(filter, yaml, &[])?;
         assert_eq!(code, 0, "for {filter:?}");
-        assert_eq!(out.trim(), want, "for {filter:?}");
+        assert_eq!(out.trim(), "a: 2.0", "for {filter:?}");
+
+        // Round-trip: re-parsing the emitted YAML must still resolve to
+        // `!!float`, not `!!int` -- the actual invariant this test
+        // protects, independent of the exact decimal spelling chosen.
+        let (tag, tag_code) = run_yq_stdin(".a | tag", &out, &[])?;
+        assert_eq!(tag_code, 0, "for {filter:?}");
+        assert_eq!(tag.trim(), "!!float", "for {filter:?}");
+    }
+
+    let (out, code) = run_yq_stdin("map(. + 1)", "- 1.0\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "- 2.0");
+
+    Ok(())
+}
+
+/// `-i`/`--inplace` must stay type-idempotent: repeatedly incrementing a
+/// float field must never degrade it to an int-looking value, which would
+/// silently change downstream `tag`/`type` results after just one edit.
+#[test]
+fn test_computed_whole_float_inplace_stays_float_typed_949() -> Result<()> {
+    let mut file = NamedTempFile::new()?;
+    writeln!(file, "a: 1.0")?;
+    let path = file.path().to_path_buf();
+
+    for want in ["a: 2.0", "a: 3.0"] {
+        let status = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+            .args(["yq", "-i", ".a += 1"])
+            .arg(&path)
+            .status()?;
+        assert!(status.success());
+        assert_eq!(std::fs::read_to_string(&path)?.trim(), want);
     }
     Ok(())
 }
