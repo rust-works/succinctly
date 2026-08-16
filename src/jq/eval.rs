@@ -11643,6 +11643,7 @@ fn queue_recurse_children<T>(
 /// multi-output forking semantics, #627) so the caller can build its own
 /// `(path, value)` or bare `value` entry — the two stacked shapes differ, so
 /// this can't just return a `Vec` of one fixed type.
+#[inline]
 fn eval_recurse_cond<S: EvalSemantics>(
     cond: &Expr,
     child: &OwnedValue,
@@ -11855,10 +11856,11 @@ fn resolve_recurse<'a, S: EvalSemantics>(
                     // child `1` before ever backtracking to ask `cond` for
                     // its second output). `!is_null_current` mirrors the
                     // `None` arm above (#856).
-                    let e = eval_recurse_cond::<S>(cond, &child_value, !is_null_current, || {
-                        next.push((path.clone(), child_value.clone()));
-                    });
-                    if let Some(e) = e {
+                    if let Some(e) =
+                        eval_recurse_cond::<S>(cond, &child_value, !is_null_current, || {
+                            next.push((path.clone(), child_value.clone()));
+                        })
+                    {
                         deferred_error = Some(e);
                         break;
                     }
@@ -14616,10 +14618,9 @@ fn builtin_recurse_cond<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // confirmation. No `is_null_current`-style gate here: unlike
             // `resolve_recurse`, this evaluator has no such rule, so `cond`
             // always gates for real (`gate: true`).
-            let e = eval_recurse_cond::<S>(cond, &child, true, || {
+            if let Some(e) = eval_recurse_cond::<S>(cond, &child, true, || {
                 next.push(child.clone());
-            });
-            if let Some(e) = e {
+            }) {
                 deferred_error = Some(e);
                 break;
             }
@@ -39490,9 +39491,12 @@ mod tests {
             ),
             // cond that's always false: no recursion past the root.
             (br#"{"a":1,"b":{"c":2}}"#, "recurse(.[]?; false)"),
-            // cond gates on a property of the child, pruning some subtrees.
+            // cond gates on a property of the child, pruning some subtrees
+            // but not others -- `[4]` (length 1) is excluded, `[2,3]`
+            // (length 2) is kept, so this actually exercises the
+            // gate=false-for-this-child path the other cases don't.
             (
-                br"[1,[2,3],[4,[5,6]]]",
+                br"[1,[2,3],[4]]",
                 r#"recurse(.[]?; type != "array" or length > 1)"#,
             ),
             // A null child: value position ends its own descent there
