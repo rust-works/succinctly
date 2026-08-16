@@ -844,10 +844,8 @@ fn eval_comma<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     }
 
     match owned {
-        Some(mut acc) if acc.len() == 1 => QueryResult::Owned(acc.pop().unwrap()),
-        Some(acc) => QueryResult::ManyOwned(acc),
-        None if borrowed.len() == 1 => QueryResult::One(borrowed.pop().unwrap()),
-        None => QueryResult::Many(borrowed),
+        Some(acc) => owned_vec_to_result(acc),
+        None => borrowed_vec_to_result(borrowed),
     }
 }
 
@@ -1498,10 +1496,8 @@ fn eval_fanout<'a, W: Clone + AsRef<[u64]>>(
     match cond_control {
         Some(control) => partial(merge_owned(borrowed, owned.unwrap_or_default()), control),
         None => match owned {
-            Some(mut acc) if acc.len() == 1 => QueryResult::Owned(acc.pop().unwrap()),
-            Some(acc) => QueryResult::ManyOwned(acc),
-            None if borrowed.len() == 1 => QueryResult::One(borrowed.pop().unwrap()),
-            None => QueryResult::Many(borrowed),
+            Some(acc) => owned_vec_to_result(acc),
+            None => borrowed_vec_to_result(borrowed),
         },
     }
 }
@@ -9232,10 +9228,7 @@ fn eval_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             }
             match pending_halt {
                 Some(code) => partial(out.iter().map(to_owned).collect(), Control::Halt(code)),
-                None => match out.len() {
-                    1 => QueryResult::One(out.pop().expect("len checked")),
-                    _ => QueryResult::Many(out),
-                },
+                None => borrowed_vec_to_result(out),
             }
         }
         Targets::Owned(ts) => {
@@ -9254,10 +9247,7 @@ fn eval_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             }
             match pending_halt {
                 Some(code) => partial(out, Control::Halt(code)),
-                None => match out.len() {
-                    1 => QueryResult::Owned(out.pop().expect("len checked")),
-                    _ => QueryResult::ManyOwned(out),
-                },
+                None => owned_vec_to_result(out),
             }
         }
     }
@@ -9370,10 +9360,7 @@ fn eval_slice_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             }
         }
     }
-    match out.len() {
-        1 => QueryResult::Owned(out.pop().expect("len checked")),
-        _ => QueryResult::ManyOwned(out),
-    }
+    owned_vec_to_result(out)
 }
 
 /// Evaluate one slice bound (`start` or `end`) against `value`, collecting
