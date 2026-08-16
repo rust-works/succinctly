@@ -11561,3 +11561,59 @@ fn test_yq_join_null_separator_renders_as_literal_text_1041() -> Result<()> {
     assert_eq!(stdout.trim_end(), "xnullynullz");
     Ok(())
 }
+
+// =============================================================================
+// yq-mode `numeric_display_string`/`to_json_yq` scientific-notation fidelity
+// (#1030, #1008 follow-up) -- all live-verified against yq v4.53.3.
+// =============================================================================
+
+#[test]
+fn test_yq_tostring_preserves_exponent_literal_1030() -> Result<()> {
+    let (stdout, code) = run_yq_stdin(".a | tostring", "a: 1e2\n", &["-r"])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "1e2");
+    Ok(())
+}
+
+#[test]
+fn test_yq_at_json_preserves_exponent_literal_1030() -> Result<()> {
+    let (stdout, code) = run_yq_stdin(".a | @json", "a: 1E5\n", &["-r"])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "1E5");
+    Ok(())
+}
+
+#[test]
+fn test_yq_string_interpolation_preserves_exponent_literal_1030() -> Result<()> {
+    let (stdout, code) = run_yq_stdin(r#""\(.a)""#, "a: 1e100\n", &["-r"])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "1e100");
+    Ok(())
+}
+
+#[test]
+fn test_yq_at_sh_preserves_exponent_literal_1030() -> Result<()> {
+    let (stdout, code) = run_yq_stdin(".a | @sh", "a: 1e2\n", &["-r"])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "1e2");
+    Ok(())
+}
+
+#[test]
+fn test_yq_at_tsv_preserves_exponent_literal_in_array_element_1030() -> Result<()> {
+    // A container's own nested element needs the same treatment as a bare
+    // scalar (`numeric_display_string`/`owned_to_string`'s Array/Object
+    // arm) -- `@tsv`'s cell formatter routes through the same shared path.
+    let (stdout, code) = run_yq_stdin(".a | @tsv", "a: [1e2, x]\n", &["-r"])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "1e2\tx");
+    Ok(())
+}
+
+#[test]
+fn test_yq_at_json_preserves_exponent_literal_nested_in_array_1030() -> Result<()> {
+    let (stdout, code) = run_yq_stdin(".a | @json", "a: [1e2, x]\n", &["-r"])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), r#"[1e2,"x"]"#);
+    Ok(())
+}

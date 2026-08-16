@@ -192,7 +192,7 @@ fn stream_owned_value_json<W: core::fmt::Write>(
 /// query shape, confirmed empirically against the pinned oracle. `raw` is
 /// always valid UTF-8 (sourced from `OwnedValue::NumberLiteral`'s own
 /// `Box<str>`), so the lossy path here is unreachable in practice.
-fn real_output_finite_literal(raw: &[u8]) -> String {
+pub(crate) fn real_output_finite_literal(raw: &[u8]) -> String {
     String::from_utf8_lossy(raw).into_owned()
 }
 
