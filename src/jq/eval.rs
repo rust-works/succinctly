@@ -4958,7 +4958,7 @@ fn builtin_with_entries<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // map(f)
     let mut transformed: Vec<OwnedValue> = Vec::new();
     for entry in entries {
-        let entry_json = owned_to_json_bytes(&entry);
+        let entry_json = owned_to_json_bytes::<S>(&entry);
         let index = crate::json::JsonIndex::build(&entry_json);
         let cursor = index.root(&entry_json);
 
@@ -4999,8 +4999,8 @@ fn builtin_with_entries<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// purely internal (e.g. `with_entries`'s per-entry re-evaluation), so an
 /// overflowed `NumberLiteral`/`Float` must keep its ±Infinity rather than
 /// being silently substituted with JSON's `"null"` (#561).
-fn owned_to_json_bytes(value: &OwnedValue) -> Vec<u8> {
-    value.to_json_for_reindex().into_bytes()
+fn owned_to_json_bytes<S: EvalSemantics>(value: &OwnedValue) -> Vec<u8> {
+    value.to_json_for_reindex::<S>().into_bytes()
 }
 
 // =============================================================================
@@ -13899,7 +13899,7 @@ fn eval_owned_expr_ctrl<S: EvalSemantics>(
     // `to_json_for_reindex` (not `to_json`): this round-trip is purely
     // internal, so an overflowed `NumberLiteral`/`Float` must keep its
     // ±Infinity rather than being silently substituted with "null" (#561).
-    let json_str = input.to_json_for_reindex();
+    let json_str = input.to_json_for_reindex::<S>();
     let json_bytes = json_str.as_bytes();
 
     // We need to create a temporary index and cursor
@@ -13996,7 +13996,7 @@ fn eval_owned_input<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // `to_json_for_reindex` (not `to_json`): this round-trip is purely
     // internal, so an overflowed `NumberLiteral`/`Float` must keep its
     // ±Infinity rather than being silently substituted with "null" (#561).
-    let json_str = input.to_json_for_reindex();
+    let json_str = input.to_json_for_reindex::<S>();
     let json_bytes = json_str.as_bytes();
 
     use crate::json::JsonIndex;
@@ -23888,7 +23888,7 @@ mod tests {
         input: &OwnedValue,
         optional: bool,
     ) -> Result<Option<OwnedValue>, EvalError> {
-        let json_str = input.to_json_for_reindex();
+        let json_str = input.to_json_for_reindex::<JqSemantics>();
         let json_bytes = json_str.as_bytes();
         let index = JsonIndex::build(json_bytes);
         let cursor = index.root(json_bytes);

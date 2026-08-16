@@ -10693,15 +10693,12 @@ fn test_jq_tostring_and_json_and_interpolation_unaffected_by_yq_verbatim_echo_10
     Ok(())
 }
 
-/// #953: `to_json_for_reindex`'s `Float` fallback now formats through
-/// `format_float_with_fraction` (adding a `.0`) instead of bare `Display`,
-/// so any `Expr` shape with no native `eval_generic.rs` cursor arm (e.g.
-/// `[...]`) round-trips a computed whole-number float through JSON text
-/// with a decimal point where it previously had none. jq mode's own final
-/// formatter (`format_number_jq_compat`, reached via `to_json`) strips that
-/// `.0` back off after reparsing regardless -- real jq matches this on both
-/// cases (`[5]`, `[1]`, confirmed live), so the reindex bridge's added `.0`
-/// must stay invisible in jq's own output.
+/// #953: top-level `[...]` array construction (`eval.rs`'s native
+/// `Expr::Array` cursor arm) never reaches `to_json_for_reindex` at all, so
+/// this doesn't exercise the reindex-bridge fix directly -- kept as a
+/// baseline sanity check that jq's own array construction is unaffected.
+/// See `test_jq_reduce_accumulator_unaffected_by_yq_float_fraction_fix_953`
+/// below for a case that actually reaches the bridge.
 #[test]
 fn test_jq_array_construction_unaffected_by_yq_float_fraction_fix_953() -> Result<()> {
     for (filter, input, want) in [
@@ -10712,5 +10709,24 @@ fn test_jq_array_construction_unaffected_by_yq_float_fraction_fix_953() -> Resul
         assert_eq!(code, 0, "for {filter:?}: {out:?}");
         assert_eq!(out.trim(), want, "for {filter:?}");
     }
+    Ok(())
+}
+
+/// #953 code review: `to_json_for_reindex`'s `Float` fallback must format
+/// through the yq-only `format_float_with_fraction` behind an
+/// `S::TAG == EvalTag::Yq` gate, not unconditionally -- an earlier draft
+/// applied it unconditionally, which silently regressed this exact case in
+/// **jq** mode. `reduce`'s owned accumulator (`1.0 + 4.0` computes a plain,
+/// non-`NumberLiteral` `Float` with no fast path in
+/// `eval_owned_fast_path`) genuinely reaches `to_json_for_reindex` each
+/// iteration, unlike the top-level `[...]` case above. Real jq gives
+/// `[[[5]]]` (a computed value loses its literal formatting entirely, per
+/// jq's own normalize-computed-floats convention) -- confirmed live against
+/// the pinned oracle.
+#[test]
+fn test_jq_reduce_accumulator_unaffected_by_yq_float_fraction_fix_953() -> Result<()> {
+    let (out, code) = run_jq_stdin("[reduce (1,2) as $i (1.0 + 4.0; [.])]", "{}", &["-c"])?;
+    assert_eq!(code, 0, "{out:?}");
+    assert_eq!(out.trim(), "[[[5]]]");
     Ok(())
 }
