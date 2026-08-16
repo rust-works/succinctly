@@ -25,7 +25,10 @@ use alloc::vec::Vec;
 
 use super::document::{DocumentFields, IndentSpec};
 use super::escape::{write_json_body_jq, write_json_body_yq};
-use super::value::{format_number_jq_compat, infinite_float_preview_text, NumberRepr, OwnedValue};
+use super::value::{
+    assert_value_tree_depth, format_number_jq_compat, infinite_float_preview_text, NumberRepr,
+    OwnedValue,
+};
 use crate::yaml::format_float_with_fraction;
 
 /// A value that can be streamed directly to output without intermediate allocation.
@@ -276,6 +279,38 @@ fn stream_owned_value_json_with<W: core::fmt::Write>(
     infinite_float: fn(bool) -> String,
     infinite_literal: fn(&[u8]) -> String,
 ) -> core::fmt::Result {
+    stream_owned_value_json_with_at_depth(
+        value,
+        out,
+        current_indent,
+        indent_spaces,
+        unit,
+        sort_keys,
+        escape,
+        float_fmt,
+        infinite_float,
+        infinite_literal,
+        0,
+    )
+}
+
+/// Panics past [`MAX_VALUE_TREE_DEPTH`](super::value::MAX_VALUE_TREE_DEPTH)
+/// levels of nesting (#1021, following #1005's precedent).
+#[allow(clippy::too_many_arguments)] // STYLE-0004: mirrors stream_owned_value_json_with's own suppression above.
+fn stream_owned_value_json_with_at_depth<W: core::fmt::Write>(
+    value: &OwnedValue,
+    out: &mut W,
+    current_indent: usize,
+    indent_spaces: usize,
+    unit: char,
+    sort_keys: bool,
+    escape: fn(&mut W, &str) -> core::fmt::Result,
+    float_fmt: fn(f64) -> String,
+    infinite_float: fn(bool) -> String,
+    infinite_literal: fn(&[u8]) -> String,
+    depth: usize,
+) -> core::fmt::Result {
+    assert_value_tree_depth(depth);
     match value {
         OwnedValue::Null => out.write_str("null"),
         OwnedValue::Bool(true) => out.write_str("true"),
@@ -313,7 +348,7 @@ fn stream_owned_value_json_with<W: core::fmt::Write>(
                     out.write_char('\n')?;
                     write_indent(out, next_indent, unit)?;
                 }
-                stream_owned_value_json_with(
+                stream_owned_value_json_with_at_depth(
                     elem,
                     out,
                     next_indent,
@@ -324,6 +359,7 @@ fn stream_owned_value_json_with<W: core::fmt::Write>(
                     float_fmt,
                     infinite_float,
                     infinite_literal,
+                    depth + 1,
                 )?;
             }
             if indent_spaces > 0 {
@@ -372,6 +408,7 @@ fn stream_owned_value_json_with<W: core::fmt::Write>(
                 float_fmt,
                 infinite_float,
                 infinite_literal,
+                depth + 1,
             )?;
             if indent_spaces > 0 {
                 out.write_char('\n')?;
@@ -418,6 +455,7 @@ fn write_object_entries<'a, W: core::fmt::Write>(
     float_fmt: fn(f64) -> String,
     infinite_float: fn(bool) -> String,
     infinite_literal: fn(&[u8]) -> String,
+    depth: usize,
 ) -> core::fmt::Result {
     for (i, (key, value)) in entries.enumerate() {
         if i > 0 {
@@ -429,7 +467,7 @@ fn write_object_entries<'a, W: core::fmt::Write>(
         }
         stream_json_string(out, key, escape)?;
         out.write_str(if indent_spaces > 0 { ": " } else { ":" })?;
-        stream_owned_value_json_with(
+        stream_owned_value_json_with_at_depth(
             value,
             out,
             next_indent,
@@ -440,6 +478,7 @@ fn write_object_entries<'a, W: core::fmt::Write>(
             float_fmt,
             infinite_float,
             infinite_literal,
+            depth,
         )?;
     }
     Ok(())
@@ -540,6 +579,21 @@ fn stream_owned_value_yaml<W: core::fmt::Write>(
     unit: char,
     sort_keys: bool,
 ) -> core::fmt::Result {
+    stream_owned_value_yaml_at_depth(value, out, indent, indent_spaces, unit, sort_keys, 0)
+}
+
+/// Panics past [`MAX_VALUE_TREE_DEPTH`](super::value::MAX_VALUE_TREE_DEPTH)
+/// levels of nesting (#1021, following #1005's precedent).
+fn stream_owned_value_yaml_at_depth<W: core::fmt::Write>(
+    value: &OwnedValue,
+    out: &mut W,
+    indent: &str,
+    indent_spaces: usize,
+    unit: char,
+    sort_keys: bool,
+    depth: usize,
+) -> core::fmt::Result {
+    assert_value_tree_depth(depth);
     match value {
         OwnedValue::Null => out.write_str("null"),
         OwnedValue::Bool(true) => out.write_str("true"),
@@ -579,7 +633,7 @@ fn stream_owned_value_yaml<W: core::fmt::Write>(
                     if i > 0 {
                         out.write_str(", ")?;
                     }
-                    stream_owned_value_yaml(elem, out, "", 0, unit, sort_keys)?;
+                    stream_owned_value_yaml_at_depth(elem, out, "", 0, unit, sort_keys, depth + 1)?;
                 }
                 out.write_char(']')
             } else {
@@ -603,23 +657,25 @@ fn stream_owned_value_yaml<W: core::fmt::Write>(
                         && !is_empty_container(elem)
                     {
                         let child_indent = compact_indent(indent);
-                        stream_owned_value_yaml(
+                        stream_owned_value_yaml_at_depth(
                             elem,
                             out,
                             &child_indent,
                             indent_spaces,
                             unit,
                             sort_keys,
+                            depth + 1,
                         )?;
                     } else {
                         let child_indent = deeper_indent(indent, indent_spaces, unit);
-                        stream_owned_value_yaml(
+                        stream_owned_value_yaml_at_depth(
                             elem,
                             out,
                             &child_indent,
                             indent_spaces,
                             unit,
                             sort_keys,
+                            depth + 1,
                         )?;
                     }
                 }
@@ -643,7 +699,7 @@ fn stream_owned_value_yaml<W: core::fmt::Write>(
                     }
                     stream_yaml_string(out, key)?;
                     out.write_str(": ")?;
-                    stream_owned_value_yaml(val, out, "", 0, unit, sort_keys)?;
+                    stream_owned_value_yaml_at_depth(val, out, "", 0, unit, sort_keys, depth + 1)?;
                 }
                 out.write_char('}')
             } else {
@@ -662,24 +718,26 @@ fn stream_owned_value_yaml<W: core::fmt::Write>(
                         out.write_char('\n')?;
                         let child_indent = deeper_indent(indent, indent_spaces, unit);
                         out.write_str(&child_indent)?;
-                        stream_owned_value_yaml(
+                        stream_owned_value_yaml_at_depth(
                             val,
                             out,
                             &child_indent,
                             indent_spaces,
                             unit,
                             sort_keys,
+                            depth + 1,
                         )?;
                     } else {
                         out.write_char(' ')?;
                         let child_indent = deeper_indent(indent, indent_spaces, unit);
-                        stream_owned_value_yaml(
+                        stream_owned_value_yaml_at_depth(
                             val,
                             out,
                             &child_indent,
                             indent_spaces,
                             unit,
                             sort_keys,
+                            depth + 1,
                         )?;
                     }
                 }
@@ -1434,5 +1492,64 @@ mod tests {
         assert!(!OwnedValue::Bool(true).is_falsy());
         assert!(!OwnedValue::Int(0).is_falsy());
         assert!(!OwnedValue::String(String::new()).is_falsy());
+    }
+
+    /// `depth` levels of single-element array nesting: `[[[...[null]...]]]`.
+    /// Mirrors `value.rs`/`eval.rs`'s own `linear_array_nest` helper (#1005).
+    fn linear_array_nest(depth: usize) -> OwnedValue {
+        let mut v = OwnedValue::Null;
+        for _ in 0..depth {
+            v = OwnedValue::Array(vec![v]);
+        }
+        v
+    }
+
+    /// #1021: `stream_owned_value_json_with` (backs `stream_json`/`syq -o
+    /// json`, and `stream_owned_value_json_jq`'s error-message convention)
+    /// had no depth guard at all before this issue.
+    #[test]
+    fn stream_owned_value_json_with_panics_past_nesting_depth_limit_1021() {
+        use crate::jq::value::MAX_VALUE_TREE_DEPTH;
+
+        let under = linear_array_nest(MAX_VALUE_TREE_DEPTH - 1);
+        let mut buf = String::new();
+        under
+            .stream_json(&mut buf, IndentSpec::COMPACT, false)
+            .unwrap();
+        assert!(!buf.is_empty());
+
+        let over = linear_array_nest(MAX_VALUE_TREE_DEPTH);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut buf = String::new();
+            over.stream_json(&mut buf, IndentSpec::COMPACT, false)
+        }));
+        assert!(
+            result.is_err(),
+            "stream_owned_value_json_with should panic at MAX_VALUE_TREE_DEPTH"
+        );
+    }
+
+    /// #1021: `stream_owned_value_yaml` (backs `stream_yaml`/`yq`'s default
+    /// output) had no depth guard at all before this issue.
+    #[test]
+    fn stream_owned_value_yaml_panics_past_nesting_depth_limit_1021() {
+        use crate::jq::value::MAX_VALUE_TREE_DEPTH;
+
+        let under = linear_array_nest(MAX_VALUE_TREE_DEPTH - 1);
+        let mut buf = String::new();
+        under
+            .stream_yaml(&mut buf, IndentSpec::COMPACT, false)
+            .unwrap();
+        assert!(!buf.is_empty());
+
+        let over = linear_array_nest(MAX_VALUE_TREE_DEPTH);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut buf = String::new();
+            over.stream_yaml(&mut buf, IndentSpec::COMPACT, false)
+        }));
+        assert!(
+            result.is_err(),
+            "stream_owned_value_yaml should panic at MAX_VALUE_TREE_DEPTH"
+        );
     }
 }
