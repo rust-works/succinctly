@@ -2109,8 +2109,7 @@ fn parse_json_value(s: &str) -> Result<OwnedValue> {
     Ok(serde_json_to_owned(&value))
 }
 
-/// Convert a `serde_json::Value` into an `OwnedValue`
-/// (mirrors `jq_runner::serde_to_owned`).
+/// Convert a `serde_json::Value` into an `OwnedValue`.
 fn serde_json_to_owned(value: &serde_json::Value) -> OwnedValue {
     serde_json_to_owned_at_depth(value, 0)
 }

@@ -794,6 +794,139 @@ fn test_slurpfile() -> Result<()> {
     Ok(())
 }
 
+// =============================================================================
+// #1093: `--slurpfile`/`--seq` preserve number-literal source fidelity the
+// same way `--argjson` does (#1058), instead of round-tripping through
+// `serde_json::Value`'s own `f64`/`i64` `Display`. All cases live-verified
+// against jq 1.7.1.
+// =============================================================================
+
+#[test]
+fn test_slurpfile_preserves_number_literal_fidelity_1093() -> Result<()> {
+    let mut file = NamedTempFile::new()?;
+    writeln!(file, "1.500")?;
+
+    let (stdout, _, code) = run_jq_full(
+        &[
+            "-cn",
+            "--slurpfile",
+            "n",
+            file.path().to_str().unwrap(),
+            "$n",
+        ],
+        None,
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "[1.500]");
+    Ok(())
+}
+
+/// Multiple values in one slurped file, one of which needs fidelity
+/// preservation -- confirms each value's own byte span is computed
+/// correctly, not just the first/only one.
+#[test]
+fn test_slurpfile_multiple_values_preserve_fidelity_1093() -> Result<()> {
+    let mut file = NamedTempFile::new()?;
+    writeln!(file, r#"{{"a":1}}"#)?;
+    writeln!(file, r#"{{"b":1.500}}"#)?;
+
+    let (stdout, _, code) = run_jq_full(
+        &[
+            "-cn",
+            "--slurpfile",
+            "n",
+            file.path().to_str().unwrap(),
+            "$n",
+        ],
+        None,
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), r#"[{"a":1},{"b":1.500}]"#);
+    Ok(())
+}
+
+/// Values separated by extra whitespace/blank lines -- confirms the
+/// leading-whitespace-skip when computing each value's start offset is
+/// correct, not just the common single-newline-separated case.
+#[test]
+fn test_slurpfile_whitespace_between_values_1093() -> Result<()> {
+    let mut file = NamedTempFile::new()?;
+    writeln!(file, "  {{\"a\":1}}   ")?;
+    writeln!(file)?;
+    writeln!(file, "  {{\"b\":1.500}}  ")?;
+
+    let (stdout, _, code) = run_jq_full(
+        &[
+            "-cn",
+            "--slurpfile",
+            "n",
+            file.path().to_str().unwrap(),
+            "$n",
+        ],
+        None,
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), r#"[{"a":1},{"b":1.500}]"#);
+    Ok(())
+}
+
+/// Genuinely malformed content is still rejected -- fidelity preservation
+/// doesn't widen what `--slurpfile` accepts.
+#[test]
+fn test_slurpfile_malformed_content_still_rejected_1093() -> Result<()> {
+    let mut file = NamedTempFile::new()?;
+    writeln!(file, "not json")?;
+
+    let (_, _, code) = run_jq_full(
+        &[
+            "-cn",
+            "--slurpfile",
+            "n",
+            file.path().to_str().unwrap(),
+            "$n",
+        ],
+        None,
+    )?;
+    assert_ne!(code, 0);
+    Ok(())
+}
+
+/// `--seq`'s own output format prefixes each value with the same RS
+/// (`\x1e`) byte its input uses (RFC 7464), unrelated to this fix -- kept
+/// in the expected string, not stripped, to pin the byte-exact output.
+#[test]
+fn test_seq_preserves_number_literal_fidelity_1093() -> Result<()> {
+    let (stdout, _, code) = run_jq_full(&["--seq", "-c", "."], Some("\x1e1.500\n"))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "\x1e1.500");
+    Ok(())
+}
+
+/// Multiple RS-separated values, each independently isolated and
+/// validated -- confirms fidelity preservation applies per-segment, not
+/// just to a single value.
+#[test]
+fn test_seq_multiple_values_preserve_fidelity_1093() -> Result<()> {
+    let (stdout, _, code) = run_jq_full(&["--seq", "-c", "."], Some("\x1e1.500\n\x1e2.000\n"))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "\x1e1.500\n\x1e2.000");
+    Ok(())
+}
+
+/// A malformed segment is silently skipped (RFC 7464's own recommendation,
+/// unchanged by this fix) while the surrounding valid segments still
+/// preserve their fidelity correctly.
+#[test]
+fn test_seq_malformed_segment_silently_skipped_1093() -> Result<()> {
+    let (stdout, _, code) = run_jq_full(
+        &["--seq", "-c", "."],
+        Some("\x1e1.500\n\x1egarbage\n\x1e2.000\n"),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "\x1e1.500\n\x1e2.000");
+    Ok(())
+}
+
 #[test]
 fn test_rawfile() -> Result<()> {
     let mut file = NamedTempFile::new()?;
