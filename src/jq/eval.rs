@@ -10390,7 +10390,14 @@ pub(crate) fn is_yq_scalar_slice_assign_path(path_expr: &Expr) -> bool {
 /// in hand, which `through_slice` never has (it only ever sees the sliced
 /// value itself).
 fn yq_del_scalar_slice_parent_path(path_expr: &Expr, root: &OwnedValue) -> Option<Expr> {
-    let Expr::Pipe(exprs) = path_expr else {
+    // `unwrap_paren`, not a direct match: a parenthesized chained target
+    // (`del((.a[0:1]))`) must apply the same parent-key-delete rule as its
+    // bare form (`del(.a[0:1])`) -- previously this shape-check required
+    // `path_expr` to literally be `Expr::Pipe`, so wrapping it in `()`
+    // silently opted out of the rule and fell through to
+    // `delete_at_path`'s own per-step walk, which errors trying to slice
+    // a scalar directly (#1153).
+    let Expr::Pipe(exprs) = unwrap_paren(path_expr) else {
         return None;
     };
     let (last, _) = unwrap_path_component(exprs.last()?);
@@ -19478,6 +19485,13 @@ fn delete_at_path(
             }
         }
         Expr::Optional(inner) => delete_at_path(root, inner, true),
+        // `(EXPR)` at the top of a resolved delete target (e.g.
+        // `del((.a))`) -- mirrors `set_path`'s identical `Expr::Paren` arm
+        // (#1116), which this arm was missing entirely until now (#1153):
+        // any parenthesized `del()` target failed with "cannot use
+        // expression as delete target", whether or not a slice was
+        // involved.
+        Expr::Paren(inner) => delete_at_path(root, inner, optional),
         // Unreachable: `resolve_dynamic_indexes` rewrites every computed key
         // into a static component before this runs. Explicit rather than left
         // to the catch-all so a missed install point fails loudly here instead

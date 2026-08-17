@@ -13901,6 +13901,71 @@ fn test_1116_chained_scalar_slice_del_removes_parent_key() -> Result<()> {
     Ok(())
 }
 
+// --- #1153: a parenthesized del() target must work at all, and a
+// parenthesized chained-scalar-slice target must still apply #1116's
+// parent-key-delete rule. Verified live against real yq v4.53.3.
+
+/// Gap 1: `delete_at_path` had no `Expr::Paren` arm anywhere (unlike
+/// `set_path`/`update_path`, which #1116 gave one) -- any parenthesized
+/// `del()` target failed outright, whether or not a slice was involved.
+#[test]
+fn test_1153_parenthesized_del_target_works() -> Result<()> {
+    let (out, code) = run_yq_stdin("del((.a))", r#"{"a":5,"b":6}"#, &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), r#"{"b":6}"#);
+
+    let (out, code) = run_yq_stdin("del((.a[0]))", r#"{"a":[1,2,3]}"#, &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), r#"{"a":[2,3]}"#);
+
+    Ok(())
+}
+
+/// Gap 2: `yq_del_scalar_slice_parent_path`'s own shape check required
+/// `path_expr` to literally be `Expr::Pipe`, so wrapping a chained
+/// scalar-slice target in `()` opted out of #1116's parent-key-delete rule
+/// entirely and fell through to `delete_at_path`'s per-step walk, which
+/// errors trying to slice a scalar directly.
+#[test]
+fn test_1153_parenthesized_chained_scalar_slice_del_removes_parent_key() -> Result<()> {
+    let (out, code) = run_yq_stdin("del((.a[0:1]))", r#"{"a":5,"b":6}"#, &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), r#"{"b":6}"#);
+
+    let (out, code) = run_yq_stdin(
+        "del((.x.a[0:1]))",
+        r#"{"x":{"a":5,"b":6}}"#,
+        &["-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), r#"{"x":{"b":6}}"#);
+
+    Ok(())
+}
+
+/// Control: a parenthesized chained scalar-slice target must keep the same
+/// array-parent scoping as the unparenthesized form -- `#1116`'s rule
+/// (`yq_del_scalar_slice_parent_path`) only fires for a *scalar* parent by
+/// deliberate choice, not oracle conformance: real yq's own chained
+/// slice-delete drops the whole parent key for *any* target type
+/// (confirmed live, both with and without parens), but succinctly keeps
+/// its own working, jq-consistent array slice-delete instead of matching
+/// that (see the function's own doc comment) -- this parenthesized form
+/// must inherit the identical, already-deliberate scoping, not accidentally
+/// widen or narrow it.
+#[test]
+fn test_1153_parenthesized_chained_scalar_slice_del_array_parent_unaffected() -> Result<()> {
+    let (out, code) = run_yq_stdin(
+        "del((.a[0:1]))",
+        r#"{"a":[1,2,3],"b":6}"#,
+        &["-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), r#"{"a":[2,3],"b":6}"#);
+
+    Ok(())
+}
+
 /// del()'s parent-key rule also applies when the resolved path fans out
 /// into more than one target (a top-level comma, or a computed key with
 /// multiple values) — `delete_expr_paths_at`'s sibling-grouping walker
@@ -14017,11 +14082,14 @@ fn test_1116_chained_scalar_slice_del_navigator_out_of_bounds_unaffected() -> Re
 /// `navigate_read_only` only understands `Field`/`Index` prefix steps — a
 /// `.[]` earlier in the chain (`Expr::Iterate`) hits its catch-all and
 /// bails to `None`, so the rewrite doesn't apply and the old, erroring
-/// per-element walk runs instead. Known, filed limitation (#1153) — this
-/// pins the current (imperfect) behavior as a regression guard rather than
-/// leaving it silently untested.
+/// per-element walk runs instead. Known, filed limitation — split off from
+/// #1153 (which covered this alongside the now-fixed parenthesized-target
+/// gap) into its own issue, #1182, since it needs `del()`'s own per-element
+/// handling rather than a small, self-contained fix. This pins the current
+/// (imperfect) behavior as a regression guard rather than leaving it
+/// silently untested.
 #[test]
-fn test_1116_chained_scalar_slice_del_iterate_prefix_not_yet_covered_1153() -> Result<()> {
+fn test_1116_chained_scalar_slice_del_iterate_prefix_not_yet_covered_1182() -> Result<()> {
     let (_out, stderr, code) = run_yq_stdin_with_stderr(
         "del(.a[].b[0:1])",
         r#"{"a":[{"b":5,"c":1},{"b":6,"c":2}]}"#,
