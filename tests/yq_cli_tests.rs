@@ -13183,21 +13183,161 @@ fn test_slice_sub_and_mul_number_scalar_still_errors_1101() -> Result<()> {
     Ok(())
 }
 
-/// Regression guard: succinctly's own array/string slice-assignment is
-/// unaffected by this scalar-only scope decision.
+/// #1101 deliberately scoped its no-op to scalar targets only, preserving
+/// succinctly's own array/string slice-assignment rather than replicating
+/// what looked like a real-yq gap at the time -- succinctly's array
+/// behavior back then was "splice `v` into the range" (`.[0:1] = [9]` on
+/// `[1,2,3]` gave `[9,2,3]`), and string slice-assignment errored
+/// (`cannot update string slices`). #1142 found this splicing was itself
+/// corrupting data relative to the true oracle: real yq no-ops a bare-root
+/// array/string slice-assignment too, live-verified (`.[0:1] = [9]` on
+/// `[1,2,3]` stays `[1,2,3]` in real yq; `.[0:1] = "X"` on `"hello"` stays
+/// `"hello"`, not an error). Renamed from
+/// `test_slice_assign_string_and_array_unaffected_1101` now that this is
+/// no longer true.
 #[test]
-fn test_slice_assign_string_and_array_unaffected_1101() -> Result<()> {
-    let (_out, stderr, code) =
-        run_yq_stdin_with_stderr(r#".[0:1] = "X""#, r#""hello""#, &["-o", "json"])?;
-    assert_eq!(code, 1);
-    assert!(
-        stderr.contains("cannot update string slices") || stderr.contains("Cannot update string"),
-        "stderr: {stderr:?}"
-    );
+fn test_slice_assign_string_and_array_bare_root_noop_1142() -> Result<()> {
+    let (out, code) = run_yq_stdin(r#".[0:1] = "X""#, r#""hello""#, &["-o", "json", "-I0"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), r#""hello""#);
 
     let (out, code) = run_yq_stdin(".[0:1] = [9]", "[1,2,3]", &["-o", "json", "-I0"])?;
     assert_eq!(code, 0, "out: {out:?}");
-    assert_eq!(out.trim(), "[9,2,3]");
+    assert_eq!(out.trim(), "[1,2,3]");
+    Ok(())
+}
+
+// ============================================================================
+// yq slice-assignment no-op widened to a chained container target (#1142)
+// ============================================================================
+//
+// #1101's no-op was scoped to a scalar target only -- for a *chained* path
+// onto a real array/string (`.a[S:E] op= v`, `.a` itself the container, not
+// the whole input), succinctly instead silently spliced the write-through
+// result into the array at the slice position, corrupting it. Live-verified
+// against real yq v4.53.3: the no-op applies here identically across
+// `=`/`|=`/`+=`/`-=`/`*=` and array/string targets -- unlike the bare-root
+// scalar case, `-=`/`*=` do *not* error for a container target, they no-op
+// too.
+
+/// The issue's own repro: `+=` with an array RHS, a bare number RHS, and a
+/// zero-width slice, all on a chained array target.
+#[test]
+fn test_slice_compound_add_array_target_is_noop_1142() -> Result<()> {
+    let (out, code) = run_yq_stdin(".a[0:2] += [99]", "a: [1,2,3]", &["-o", "json", "-I0"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), r#"{"a":[1,2,3]}"#);
+
+    let (out, code) = run_yq_stdin(".a[0:2] += 99", "a: [1,2,3]", &["-o", "json", "-I0"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), r#"{"a":[1,2,3]}"#);
+
+    let (out, code) = run_yq_stdin(".a[0:0] += 99", "a: [1,2,3]", &["-o", "json", "-I0"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), r#"{"a":[1,2,3]}"#);
+    Ok(())
+}
+
+/// `=`/`|=` on a chained array target, including a same-length replacement
+/// (`[7,8]` for a 2-element slice) that might look like it should "just
+/// work" -- it doesn't, real yq no-ops unconditionally.
+#[test]
+fn test_slice_assign_and_update_array_target_is_noop_1142() -> Result<()> {
+    let (out, code) = run_yq_stdin(".a[0:2] = [7,8]", "a: [1,2,3]", &["-o", "json", "-I0"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), r#"{"a":[1,2,3]}"#);
+
+    let (out, code) = run_yq_stdin(".a[0:2] |= .", "a: [1,2,3]", &["-o", "json", "-I0"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), r#"{"a":[1,2,3]}"#);
+    Ok(())
+}
+
+/// `-=`/`*=` on a chained array target no-op too -- unlike the bare-root
+/// scalar case (`test_slice_sub_and_mul_number_scalar_still_errors_1101`),
+/// where these two error instead.
+#[test]
+fn test_slice_sub_and_mul_array_target_is_noop_1142() -> Result<()> {
+    let (out, code) = run_yq_stdin(".a[0:2] -= [1]", "a: [1,2,3]", &["-o", "json", "-I0"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), r#"{"a":[1,2,3]}"#);
+
+    let (out, code) = run_yq_stdin(".a[0:2] *= [5]", "a: [1,2,3]", &["-o", "json", "-I0"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), r#"{"a":[1,2,3]}"#);
+    Ok(())
+}
+
+/// A chained *string* target no-ops the same way an array does.
+#[test]
+fn test_slice_compound_add_string_target_is_noop_1142() -> Result<()> {
+    let (out, code) = run_yq_stdin(r#".a[0:2] += "X""#, r#"a: "hello""#, &["-o", "json", "-I0"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), r#"{"a":"hello"}"#);
+    Ok(())
+}
+
+/// Nested slices (`.a[0][0:1] += 99`, one of #1142's own cited repro
+/// shapes) resolve to the identical terminal-slice-onto-array case one
+/// level deeper.
+#[test]
+fn test_slice_compound_add_nested_array_target_is_noop_1142() -> Result<()> {
+    let (out, code) = run_yq_stdin(
+        ".a[0][0:1] += 99",
+        "a: [[1,2,3],[4,5,6]]",
+        &["-o", "json", "-I0"],
+    )?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), r#"{"a":[[1,2,3],[4,5,6]]}"#);
+    Ok(())
+}
+
+/// A slice with more path *after* it (`.a[0:2][] |= f`) no-ops too --
+/// unlike a slice followed by a *field* access (the next test), `[]`
+/// (iterate) is a valid operation on an array, so this doesn't hit a type
+/// error first the way `.foo` would.
+#[test]
+fn test_slice_update_through_iterate_array_target_is_noop_1142() -> Result<()> {
+    let (out, code) = run_yq_stdin(
+        ".a[1:3][] |= . * 10",
+        "a: [1,2,3,4]",
+        &["-o", "json", "-I0"],
+    )?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), r#"{"a":[1,2,3,4]}"#);
+    Ok(())
+}
+
+/// Regression guard: a slice followed by a *field* access still errors --
+/// `.a[0:2]` produces a plain array, and `.foo` can't index one. This must
+/// not be swallowed into a no-op by #1142's fix, which is specifically for
+/// a slice as the path's terminal component.
+#[test]
+fn test_slice_assign_through_field_after_slice_still_errors_1142() -> Result<()> {
+    let (_out, _stderr, code) = run_yq_stdin_with_stderr(
+        ".a[0:2].x = 99",
+        r#"a: [{"x":1},{"y":2},{"z":3}]"#,
+        &["-o", "json"],
+    )?;
+    assert_eq!(code, 1);
+    Ok(())
+}
+
+/// Regression guard: jq mode is unaffected by any of this -- it keeps
+/// splicing the write-through result into the array, matching real jq.
+#[test]
+fn test_slice_compound_add_array_target_jq_mode_unaffected_1142() -> Result<()> {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_succinctly"));
+    cmd.arg("jq").arg("-c").arg(".[0:2] += [99]");
+    let mut child = cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    child.stdin.take().unwrap().write_all(b"[1,2,3]")?;
+    let output = child.wait_with_output()?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(String::from_utf8(output.stdout)?.trim(), "[1,2,99,3]");
     Ok(())
 }
 
