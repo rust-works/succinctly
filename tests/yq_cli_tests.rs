@@ -6598,6 +6598,82 @@ fn test_flow_collection_as_implicit_mapping_key_still_permitted_878() -> Result<
 }
 
 // ============================================================================
+// Trailing content after a flow collection is rejected everywhere, not just
+// where #878 originally checked it (#902)
+// ============================================================================
+//
+// #878 added `reject_trailing_flow_content`, but `parse_value` and
+// `parse_explicit_value` passed `check_trailing: false` unconditionally --
+// not just for the genuinely ambiguous "this could be an implicit mapping
+// key" shape, but for every flow value reaching them, silently corrupting
+// the rest of the document instead of erroring the way real yq does.
+// `parse_explicit_key`'s own `[`/`{` dispatch (a 5th, deliberately unmerged
+// copy of the shared flow-value dispatch table) never gained the check at
+// all. #902 replaced the caller-level `bool` with an occurrence-granular
+// check inside `reject_trailing_flow_content` itself (permit only `#`,
+// whitespace, a line break, EOF, or a real `:` mapping-value indicator),
+// applied unconditionally at every site including the previously-missing
+// one -- confirmed live against real yq v4.53.3 throughout.
+
+#[test]
+fn test_sequence_item_flow_collection_trailing_content_errors_902() -> Result<()> {
+    let (_out, code) = run_yq_stdin(".", "- [1, 2] extra content\nb: 2\n", &["-o", "json"])?;
+    assert_ne!(code, 0);
+    Ok(())
+}
+
+#[test]
+fn test_mapping_value_flow_collection_trailing_content_errors_902() -> Result<()> {
+    let (_out, code) = run_yq_stdin(".", "a:\n  [1, 2] extra\nb: 2\n", &["-o", "json"])?;
+    assert_ne!(code, 0);
+    Ok(())
+}
+
+#[test]
+fn test_explicit_key_flow_collection_trailing_content_errors_902() -> Result<()> {
+    let (_out, code) = run_yq_stdin(".", "? [1, 2] extra\n: v\n", &["-o", "json"])?;
+    assert_ne!(code, 0);
+    Ok(())
+}
+
+/// Same shape as above but for a flow *mapping* key (`{...}`), not just a
+/// flow sequence -- confirms the fix isn't accidentally scoped to `[` alone.
+#[test]
+fn test_explicit_key_flow_mapping_trailing_content_errors_902() -> Result<()> {
+    let (_out, code) = run_yq_stdin(".", "? {a: 1} extra\n: v\n", &["-o", "json"])?;
+    assert_ne!(code, 0);
+    Ok(())
+}
+
+/// A genuine same-line `? [flow-key]: value` must keep working -- #902's
+/// fix must not turn the legitimate mapping-value-indicator `:` into a new
+/// false rejection at `parse_explicit_key`'s site, the same way it already
+/// didn't at `parse_value`/`parse_explicit_value` (pinned by
+/// `test_flow_collection_as_implicit_mapping_key_still_permitted_878`
+/// above). Pins the *current* (pre-existing, item-5-scoped) output exactly,
+/// not just the exit code -- confirmed unchanged from before this fix.
+#[test]
+fn test_explicit_key_flow_collection_followed_by_colon_still_permitted_902() -> Result<()> {
+    let (out, code) = run_yq_stdin(".", "? [1, 2]: value\n", &["-o", "json", "-I0"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), r#"{"":"value"}"#);
+    Ok(())
+}
+
+/// A `:` immediately followed by more content (no whitespace/break/EOF) is
+/// NOT the mapping-value-indicator exception -- still trailing garbage,
+/// still an error. Confirmed live: real yq also rejects `[1, 2]:value`
+/// (compact, no space) while accepting `[1, 2]: value` (#878's existing
+/// test above) -- the exception is `:`-followed-by-whitespace specifically,
+/// not a bare `:`.
+#[test]
+fn test_flow_collection_colon_without_whitespace_still_errors_902() -> Result<()> {
+    let (_out, code) = run_yq_stdin(".", "[1, 2]:value\n", &["-o", "json"])?;
+    assert_ne!(code, 0);
+    Ok(())
+}
+
+// ============================================================================
 // Extra spaces after a block-sequence dash (#877)
 // ============================================================================
 // `parse_sequence_item`'s compact-mapping dispatch used to hardcode
