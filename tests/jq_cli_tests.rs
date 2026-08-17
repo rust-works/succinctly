@@ -11317,3 +11317,19 @@ fn test_jq_array_plus_scalar_still_errors_1119() -> Result<()> {
     assert_eq!(code, 5);
     Ok(())
 }
+
+/// #1116's yq-only "chained scalar-slice-assign no-ops" / "del() deletes
+/// the parent key" rules must not leak into jq mode: real jq errors on
+/// both `.a[0:1] = 99` and `del(.a[0:1])` for a scalar `.a`, matching
+/// succinctly's pre-existing, unaffected behavior.
+#[test]
+fn test_jq_chained_scalar_slice_assign_and_del_still_error_1116() -> Result<()> {
+    let input = r#"{"a":5,"b":6}"#;
+
+    let (_out, code) = run_jq_stdin(".a[0:1] = 99", input, &[])?;
+    assert_eq!(code, 5);
+
+    let (_out, code) = run_jq_stdin("del(.a[0:1])", input, &[])?;
+    assert_eq!(code, 5);
+    Ok(())
+}
