@@ -1058,13 +1058,20 @@ impl<'a> Parser<'a> {
                         lit => Ok(Expr::Literal(lit)),
                     }
                 } else {
-                    // Unary minus: negate the following expression
-                    // Implemented as (0 - expr)
+                    // Unary minus: negate the following expression.
+                    //
+                    // Implemented as (-1 * expr), not (0 - expr) (#1056):
+                    // IEEE-754 `0.0 - 0.0` is positive zero, silently losing
+                    // the sign of a zero-valued operand (`-.a` on `0.0`
+                    // dropped jq's `-0` to plain `0`) -- `-1.0 * 0.0`
+                    // correctly preserves it, the same fix already applied
+                    // to the filter-literal rewrite above (#1035) for
+                    // exactly this reason.
                     self.next(); // consume '-'
                     let operand = self.parse_primary()?;
                     Ok(Expr::Arithmetic {
-                        op: ArithOp::Sub,
-                        left: Box::new(Expr::Literal(Literal::Int(0))),
+                        op: ArithOp::Mul(MergeFlags::default()),
+                        left: Box::new(Expr::Literal(Literal::Int(-1))),
                         right: Box::new(operand),
                     })
                 }
