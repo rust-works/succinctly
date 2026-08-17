@@ -10425,6 +10425,35 @@ pub(crate) fn is_yq_slice_empty_container_scalar(target: &OwnedValue) -> bool {
     )
 }
 
+/// Whether `target` is a genuine scalar for a plain field/index/iterate
+/// assignment no-op (`.a = v`, `.[0] = v`, `.[] = v` on a non-container
+/// root, #1181) -- real yq's own scalar-target no-op (already implemented
+/// for `.[S:E] = v` via [`is_yq_slice_empty_container_scalar`]) applies
+/// here too, live-verified: `5 | .a = 99` and `true | .[0] = 99` both stay
+/// unchanged.
+///
+/// Deliberately *excludes* `Null`, unlike its slice sibling: a plain
+/// field/index write's own `autovivify_object`/`autovivify_array` already
+/// turns `Null` into an empty container and writes into that
+/// successfully (`null | .a = 99` -> `{"a":99}`, confirmed live) before
+/// this predicate is ever consulted, so a call site that reaches here
+/// with `Null` would be a real bug, not the no-op case -- keeping `Null`
+/// out of this predicate (rather than reusing the slice one, which
+/// intentionally folds it in) makes that visible instead of silently
+/// masking it as another no-op.
+///
+/// Only covers the scalar-vs-scalar/absent shape: a *container* target
+/// mismatched against the wrong access kind (`[1,2,3] | .a = 5`, array
+/// field-access) still errors, matching real yq (confirmed live:
+/// `cannot index array with 'a'`) -- out of this predicate's scope, #1181
+/// left that undecided pending its own follow-up.
+fn is_yq_field_index_noop_scalar(target: &OwnedValue) -> bool {
+    !matches!(
+        target,
+        OwnedValue::Array(_) | OwnedValue::Object(_) | OwnedValue::Null
+    )
+}
+
 /// Whether a *resolved* assignment-target path (a `paths`/`delete_at_path`
 /// entry, already past `resolve_dynamic_indexes`, not the raw `path_expr`
 /// the user wrote) is a bare slice — `.[S:E]`, `.[S:E]?`, or `(.[S:E])` —
@@ -11216,6 +11245,8 @@ fn set_path(
             if let OwnedValue::Object(map) = root {
                 map.insert(name.clone(), new_value);
                 Ok(())
+            } else if scalar_noop && is_yq_field_index_noop_scalar(root) {
+                Ok(())
             } else {
                 Err(EvalError::cannot_index_with_field(
                     owned_type_name(root),
@@ -11227,6 +11258,8 @@ fn set_path(
             autovivify_array(root);
             if let OwnedValue::Array(arr) = root {
                 *write_index(arr, *idx)? = new_value;
+                Ok(())
+            } else if scalar_noop && is_yq_field_index_noop_scalar(root) {
                 Ok(())
             } else {
                 Err(EvalError::cannot_index_with_type(
@@ -11622,7 +11655,15 @@ fn update_path<S: EvalSemantics>(
             if let OwnedValue::Object(map) = root {
                 let current = map.entry(name.clone()).or_insert(OwnedValue::Null);
                 update_path::<S>(current, &Expr::Identity, filter_expr, optional, scalar_noop)
-            } else if optional {
+            } else if optional
+                // #1181: unconditional on the operator, unlike `scalar_noop`
+                // above (which is `container_noop`'s slice-only, #1101
+                // sibling, gated `false` for `-=`/`*=`) -- live-verified
+                // real yq no-ops `.a -= 1`/`.a *= 1` on a scalar root just
+                // the same as `.a |= f`, unlike the slice case where those
+                // two operators genuinely error instead.
+                || (S::TAG == EvalTag::Yq && is_yq_field_index_noop_scalar(root))
+            {
                 Ok(())
             } else {
                 Err(EvalError::cannot_index_with_field(owned_type_name(root), name).into())
@@ -11638,7 +11679,7 @@ fn update_path<S: EvalSemantics>(
                     optional,
                     scalar_noop,
                 )
-            } else if optional {
+            } else if optional || (S::TAG == EvalTag::Yq && is_yq_field_index_noop_scalar(root)) {
                 Ok(())
             } else {
                 Err(EvalError::cannot_index_with_type(owned_type_name(root), "number").into())
@@ -12094,11 +12135,33 @@ fn eval_owned_multi_keep_partial<S: EvalSemantics>(
 /// that a number cannot index is reported as an array that has no such element:
 /// `{"a":1} | .[nan] = 5` is `Cannot index object with number` in jq, the same
 /// message `.[0] = 5` gets there, and says nothing about NaN.
-fn key_to_path_component(key: &OwnedValue, container: &OwnedValue) -> Result<Expr, EvalError> {
+///
+/// `scalar_noop` (yq-mode's own scalar-target assignment no-op, #1181 --
+/// `S::TAG == EvalTag::Yq` at every call site) lets a genuine scalar
+/// container (`is_yq_field_index_noop_scalar`) through this function's own
+/// array/null gate too: a *computed* numeric index (`0 as $k | .[$k] = 99`
+/// on a scalar target) resolves through here before ever reaching
+/// `set_path`'s own already-yq-aware no-op check, so without this the
+/// computed-key case would still error even though the equivalent literal
+/// key (`.[0] = 99`) correctly no-ops. This case skips the NaN check
+/// below entirely and returns a placeholder component instead: real yq's
+/// own no-op applies unconditionally to a scalar target regardless of the
+/// key's own validity (confirmed live: `5 | .[0/0] = 99` -- a NaN-valued
+/// key -- stays `5`, not an error, unlike the same key against an array
+/// target). `set_path`'s no-op check fires before this placeholder's
+/// index value is ever read back out, so its exact value doesn't matter.
+fn key_to_path_component(
+    key: &OwnedValue,
+    container: &OwnedValue,
+    scalar_noop: bool,
+) -> Result<Expr, EvalError> {
     match key {
         OwnedValue::String(s) => Ok(Expr::Field(s.clone())),
         // Truncation toward zero, as in the value path.
         OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..) => {
+            if scalar_noop && is_yq_field_index_noop_scalar(container) {
+                return Ok(Expr::Index(0));
+            }
             // Null belongs with array: a write builds the array the index names,
             // so `null | .[nan] = 5` is the NaN complaint in jq too.
             if !matches!(container, OwnedValue::Array(_) | OwnedValue::Null) {
@@ -12781,8 +12844,14 @@ fn resolve_node<'a, S: EvalSemantics>(
                 // `index_one_owned`, so it becomes `Cow::Owned` from there.
                 let mut current: Cow<'a, OwnedValue> = Cow::Borrowed(value);
                 for key in keys {
-                    let component =
-                        key_to_path_component(key, &current).map_err(|e| (Vec::new(), e.into()))?;
+                    // `false`: real yq doesn't accept `getpath(...)` as an
+                    // assignment target at all (confirmed live: a lexer
+                    // error, not even valid syntax), so there's no yq-mode
+                    // no-op behavior to match here -- unlike the `.foo`/
+                    // `.[key]` shapes `resolve_index_expr` handles below,
+                    // which do (#1181).
+                    let component = key_to_path_component(key, &current, false)
+                        .map_err(|e| (Vec::new(), e.into()))?;
                     current = Cow::Owned(
                         index_one_owned(&current, key, false)
                             .map_err(|e| (Vec::new(), e.into()))?
@@ -13708,18 +13777,33 @@ fn resolve_index_expr<'a, S: EvalSemantics>(
                     EvalError::new("Cannot set array element at NaN index").into(),
                 ));
             }
-            let component = match key_to_path_component(k, target_value) {
+            let scalar_noop = S::TAG == EvalTag::Yq && is_yq_field_index_noop_scalar(target_value);
+            let component = match key_to_path_component(k, target_value, S::TAG == EvalTag::Yq) {
                 Ok(component) => component,
                 Err(_) if optional => continue,
                 Err(e) => return Err((out, e.into())),
             };
+            // yq's scalar-target no-op (#1181): `key_to_path_component` above
+            // already turned this into a placeholder write that no-ops at
+            // `set_path`, so the real index-and-read below must not run at
+            // all -- `index_one_owned` has no concept of the no-op and would
+            // unconditionally raise `Cannot index number with number` for
+            // exactly the target/key combination this is meant to tolerate.
+            // The chain continues with the target unchanged; whatever
+            // further components follow are, by the same rule, going to
+            // no-op too once `set_path` reaches this step.
+            //
             // `false`, not `optional`: the failure has to arrive as an error for
             // the two spellings to be told apart here, rather than as the `None`
             // that the optional form of this call reports it as.
-            let next_value = match index_one_owned(target_value, k, false) {
-                Ok(v) => v.expect("non-optional index yields a value or errors"),
-                Err(_) if optional => continue,
-                Err(e) => return Err((out, e.into())),
+            let next_value = if scalar_noop {
+                target_value.clone().into_owned()
+            } else {
+                match index_one_owned(target_value, k, false) {
+                    Ok(v) => v.expect("non-optional index yields a value or errors"),
+                    Err(_) if optional => continue,
+                    Err(e) => return Err((out, e.into())),
+                }
             };
             // `resolve_dynamic_indexes` strips the `Expr::Optional` wrapper
             // below from every component before it ever reaches
