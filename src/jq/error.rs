@@ -575,6 +575,37 @@ impl EvalError {
         Self::new(format!("{} trailing base64 byte found", describe(value)))
     }
 
+    /// `<type> (<value>) is not valid base64 data` (#1146).
+    ///
+    /// Raised by `@base64d` (jq mode) when a byte in the input isn't a
+    /// member of the base64 alphabet. Confirmed live against jq 1.7.1:
+    /// `"ab!d" | @base64d` is `"string (\"ab!d\") is not valid base64
+    /// data"`. Distinct from [`Self::base64_trailing_byte`] above, which
+    /// covers a *different* jq wording for a too-short trailing group of
+    /// otherwise-valid characters -- this one is for an outright invalid
+    /// byte anywhere in the input.
+    pub fn base64_invalid_data(value: &OwnedValue) -> Self {
+        Self::new(format!("{} is not valid base64 data", describe(value)))
+    }
+
+    /// `illegal base64 data at input byte N` (#1146).
+    ///
+    /// Raised by `@base64d` (yq mode only) for *any* decode failure --
+    /// invalid character or a too-short trailing group alike. Unlike jq's
+    /// two-message split ([`Self::base64_invalid_data`]/
+    /// [`Self::base64_trailing_byte`]), real yq (v4.53.3, live-verified)
+    /// uses one uniform, byte-position-based message for every base64
+    /// decode error, with no jq analogue -- hence [`Self::new`] directly,
+    /// following this module's own convention for jq-less wording. `pos`
+    /// is a 0-indexed byte offset into the string actually fed to the
+    /// decoder (post leading/trailing-whitespace trim, since yq trims
+    /// before decoding) -- confirmed live: an input with 2 leading spaces
+    /// reports the identical position as the same input with none, so the
+    /// position is relative to the *trimmed* string, not the original.
+    pub fn base64_illegal_data(pos: usize) -> Self {
+        Self::new(format!("illegal base64 data at input byte {pos}"))
+    }
+
     /// `Invalid path expression with result <value>` (#530).
     ///
     /// Raised by `path()` when the filter it was given is not a path
