@@ -13654,11 +13654,32 @@ fn resolve_slice_expr<'a, S: EvalSemantics>(
                 // `false`, not `optional`: the failure has to arrive as an
                 // error for the two spellings to be told apart here, same
                 // as `resolve_index_expr`'s `index_one_owned` call.
-                let next_value = match slice_owned_value(target_value, *s, *e, false) {
-                    Ok(v) => v.expect("non-optional slice yields a value or errors"),
-                    Err(_) if optional => continue,
-                    Err(e) => return Err((out, e.into())),
-                };
+                //
+                // yq mode (#1117): a scalar target still needs to resolve
+                // to a real path here, not error, the same way a *literal*
+                // bound already does -- real yq no-ops a computed-bound
+                // slice-assignment on a scalar identically to a literal one
+                // (#1101/#1116), but that no-op lives downstream in
+                // `through_slice`, which only ever runs once path
+                // resolution has actually produced an `Expr::Slice` for
+                // `set_path`/`update_path` to walk. Seeding the same empty-
+                // array placeholder `through_slice`'s own scalar-noop arm
+                // uses lets resolution succeed here; the eventual write is
+                // still discarded there, not here -- so `-=`/`*=`, which
+                // gate their no-op *after* resolution
+                // (`eval_update`'s `scalar_slice_noop`), still reach
+                // `through_slice`'s catch-all for a scalar target and raise
+                // the identical error this used to raise here instead.
+                let next_value =
+                    if S::TAG == EvalTag::Yq && is_yq_slice_empty_container_scalar(target_value) {
+                        OwnedValue::Array(Vec::new())
+                    } else {
+                        match slice_owned_value(target_value, *s, *e, false) {
+                            Ok(v) => v.expect("non-optional slice yields a value or errors"),
+                            Err(_) if optional => continue,
+                            Err(e) => return Err((out, e.into())),
+                        }
+                    };
                 let mut path = components.clone();
                 path.push(if optional {
                     Expr::Optional(Box::new(slice_expr.clone()))
