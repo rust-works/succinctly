@@ -710,15 +710,68 @@ fn test_argjson_bare_hyphen_rejected_not_fabricated_into_negative_zero_1094() ->
     Ok(())
 }
 
-/// A negative leading-zero number, reached nested inside an array so it
-/// doesn't hit the unrelated CLI arg-parsing issue a bare negative
-/// `--argjson` value has (#1150) -- exercises
-/// `normalize_leading_zero_numbers`'s own leading-`-` handling.
+/// A negative leading-zero number, nested inside an array -- exercises
+/// `normalize_leading_zero_numbers`'s own leading-`-` handling. Nesting
+/// was originally required to route around #1150's separate CLI
+/// arg-parsing bug (a bare negative `--argjson` value was rejected before
+/// `normalize_leading_zero_numbers` ever ran); #1150's own fix means the
+/// bare form is now directly testable too, see
+/// `test_argjson_bare_negative_leading_zero_1150` below.
 #[test]
 fn test_argjson_negative_leading_zero_when_nested_1094() -> Result<()> {
     let (stdout, _, code) = run_jq_full(&["-cn", "--argjson", "n", "[-007, 1]", "$n"], None)?;
     assert_eq!(code, 0);
     assert_eq!(stdout.trim_end(), "[-7,1]");
+    Ok(())
+}
+
+// --- #1150: clap rejected any negative-number (or other hyphen-prefixed)
+// --argjson/--arg/--slurpfile/--rawfile VALUE before it ever reached this
+// crate's own JSON-content validation -- fixed via `allow_hyphen_values`
+// on all six affected clap::Arg sites (JqCommand's arg/argjson/slurpfile/
+// rawfile, YqCommand's arg/argjson). Verified live against real jq 1.7.1.
+
+#[test]
+fn test_argjson_bare_negative_number_1150() -> Result<()> {
+    let (stdout, _, code) = run_jq_full(&["-n", "--argjson", "n", "-7", "$n"], None)?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "-7");
+    Ok(())
+}
+
+#[test]
+fn test_argjson_bare_negative_leading_zero_1150() -> Result<()> {
+    let (stdout, _, code) = run_jq_full(&["-n", "--argjson", "n", "-007", "$n"], None)?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "-7");
+    Ok(())
+}
+
+#[test]
+fn test_arg_hyphen_prefixed_string_value_1150() -> Result<()> {
+    let (stdout, _, code) = run_jq_full(&["-n", "--arg", "n", "-hello", "$n"], None)?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), r#""-hello""#);
+    Ok(())
+}
+
+#[test]
+fn test_multiple_argjson_one_negative_one_positive_1150() -> Result<()> {
+    let (stdout, _, code) = run_jq_full(
+        &[
+            "-cn",
+            "--argjson",
+            "a",
+            "1",
+            "--argjson",
+            "b",
+            "-2",
+            "[$a,$b]",
+        ],
+        None,
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "[1,-2]");
     Ok(())
 }
 
@@ -924,6 +977,32 @@ fn test_seq_malformed_segment_silently_skipped_1093() -> Result<()> {
     )?;
     assert_eq!(code, 0);
     assert_eq!(stdout.trim_end(), "\x1e1.500\n\x1e2.000");
+    Ok(())
+}
+
+/// A hyphen-prefixed `--slurpfile`/`--rawfile` FILE value must reach this
+/// crate's own file-open logic, not get rejected by clap as an unknown
+/// flag first (#1150, same `allow_hyphen_values` fix as `--arg`/
+/// `--argjson`). Uses a nonexistent filename -- the point is only to
+/// distinguish clap's "unexpected argument" rejection (the pre-fix
+/// failure mode) from this crate's own "no such file" error (proof the
+/// value was accepted and passed through), not to exercise real file I/O.
+#[test]
+fn test_slurpfile_rawfile_hyphen_prefixed_filename_reaches_file_open_1150() -> Result<()> {
+    let (_, stderr, code) =
+        run_jq_full(&["-n", "--slurpfile", "n", "-nonexistent.json", "$n"], None)?;
+    assert_ne!(code, 0);
+    assert!(
+        !stderr.contains("unexpected argument"),
+        "clap should not reject the hyphen-prefixed value: {stderr}"
+    );
+
+    let (_, stderr, code) = run_jq_full(&["-n", "--rawfile", "n", "-nonexistent.txt", "$n"], None)?;
+    assert_ne!(code, 0);
+    assert!(
+        !stderr.contains("unexpected argument"),
+        "clap should not reject the hyphen-prefixed value: {stderr}"
+    );
     Ok(())
 }
 
