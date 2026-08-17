@@ -1368,7 +1368,12 @@ impl From<Literal> for OwnedValue {
         match lit {
             Literal::Null => Self::Null,
             Literal::Bool(b) => Self::Bool(b),
-            Literal::NumberLiteral(text) => Self::from_number_literal_boxed(text.into()),
+            // #1062: `repr` was already parsed by `parse`'s tokenizer (the
+            // same `parse_i64_or_f64` `from_number_literal_boxed` would run
+            // again here) -- constructed directly instead of re-parsing
+            // `text` and re-deriving the identical value on every visit of
+            // this AST node.
+            Literal::NumberLiteral(repr, text) => Self::NumberLiteral(repr, text.into()),
             Literal::Int(n) => Self::Int(n),
             Literal::Float(f) => Self::Float(f),
             Literal::String(s) => Self::String(s),
@@ -1548,7 +1553,7 @@ mod tests {
         // #1035: a filter-literal number keeps its own source spelling
         // through this conversion too, same as `literal_to_owned`'s
         // sibling in eval.rs.
-        match OwnedValue::from(Literal::NumberLiteral("1.500".to_string())) {
+        match OwnedValue::from(Literal::number_literal("1.500".to_string())) {
             OwnedValue::NumberLiteral(NumberRepr::Float(f), text) => {
                 assert_eq!(f, 1.5);
                 assert_eq!(text.as_ref(), "1.500");

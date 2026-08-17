@@ -177,7 +177,12 @@ impl<'a, W: Clone + AsRef<[u64]>> JqValue<'a, W> {
     /// rather than re-listing five arms a third time.
     pub fn from_literal(lit: &Literal) -> Self {
         match lit {
-            Literal::NumberLiteral(text) => JqValue::NumberLiteral(text.as_str().into()),
+            // `repr` (#1062) is ignored here -- `JqValue`'s own laziness
+            // (this arm's whole reason for existing, see the doc comment
+            // above) means the parsed value is deliberately not read until
+            // needed, regardless of whether a `NumberRepr` happens to
+            // already be sitting on the node.
+            Literal::NumberLiteral(_repr, text) => JqValue::NumberLiteral(text.as_str().into()),
             _ => JqValue::from_owned(OwnedValue::from(lit.clone())),
         }
     }
@@ -888,7 +893,7 @@ mod tests {
         // #1035: a filter-literal number keeps its own source spelling
         // through this construction path too, same as the eval.rs/
         // eval_generic.rs sibling conversions.
-        let lit = Literal::NumberLiteral("1.500".to_string());
+        let lit = Literal::number_literal("1.500".to_string());
         let val: JqValue<'_, Vec<u64>> = JqValue::from_literal(&lit);
         assert!(matches!(val, JqValue::NumberLiteral(ref s) if s.as_ref() == "1.500"));
         assert_eq!(val.as_f64(), Some(1.5));

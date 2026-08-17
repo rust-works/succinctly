@@ -11,6 +11,8 @@ use alloc::vec::Vec;
 #[cfg(test)]
 use std::collections::BTreeMap;
 
+use super::value::NumberRepr;
+
 /// A jq expression representing a query path.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
@@ -1132,7 +1134,17 @@ pub enum Literal {
     /// already has that text on hand for free. `Int`/`Float` below remain
     /// for internally-synthesized literals (e.g. desugaring) that have no
     /// source text to preserve.
-    NumberLiteral(String),
+    ///
+    /// The `NumberRepr` is the same value `parse`'s tokenizer already
+    /// computed (via `parse_i64_or_f64`) to decide whether this spelling
+    /// even qualifies for `NumberLiteral` in the first place (#1062) --
+    /// carrying it through means every downstream evaluation of this AST
+    /// node (`literal_to_owned`, `eval_single`, `JqValue::from_literal`)
+    /// clones a pre-parsed `Copy` value instead of re-running
+    /// `i64`/`f64::from_str` and re-allocating a `Box<str>` on every visit,
+    /// same shape as `OwnedValue::NumberLiteral(NumberRepr, Box<str>)`
+    /// already uses on the read side.
+    NumberLiteral(NumberRepr, String),
     /// Integer number
     Int(i64),
     /// Floating-point number
@@ -1346,6 +1358,21 @@ impl Literal {
     pub fn string(s: impl Into<String>) -> Self {
         Self::String(s.into())
     }
+
+    /// Create a source-text-preserving number literal (#1062), parsing
+    /// `text` once here rather than leaving every call site to compute its
+    /// own `NumberRepr`. Panics if `text` isn't a valid number spelling --
+    /// every real caller (the parser, `From<OwnedValue>`-style splices)
+    /// already knows `text` parses, from having produced or validated it
+    /// itself; this constructor exists for the many call sites (mostly
+    /// tests) that only ever pass a literal they already know is valid.
+    #[track_caller]
+    pub fn number_literal(text: impl Into<String>) -> Self {
+        let text = text.into();
+        let repr = super::value::parse_i64_or_f64(&text)
+            .unwrap_or_else(|| panic!("Literal::number_literal: {text:?} is not a valid number"));
+        Self::NumberLiteral(repr, text)
+    }
 }
 
 #[cfg(test)]
@@ -1424,6 +1451,28 @@ mod tests {
     #[test]
     fn test_literal_float() {
         assert_eq!(Literal::float(2.5), Literal::Float(2.5));
+    }
+
+    #[test]
+    fn test_number_literal_carries_parsed_repr_1062() {
+        assert_eq!(
+            Literal::number_literal("1.500"),
+            Literal::NumberLiteral(NumberRepr::Float(1.5), "1.500".to_string())
+        );
+        assert_eq!(
+            Literal::number_literal("42"),
+            Literal::NumberLiteral(NumberRepr::Int(42), "42".to_string())
+        );
+        assert_eq!(
+            Literal::number_literal("1e2"),
+            Literal::NumberLiteral(NumberRepr::Float(100.0), "1e2".to_string())
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "is not a valid number")]
+    fn test_number_literal_panics_on_invalid_text_1062() {
+        Literal::number_literal("not a number");
     }
 
     #[test]

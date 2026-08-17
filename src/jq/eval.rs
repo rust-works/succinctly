@@ -14630,8 +14630,10 @@ fn owned_to_expr_at_depth(value: &OwnedValue, depth: usize) -> Expr {
         // #1035: `Literal::NumberLiteral` now has a source-text slot too,
         // so a document-sourced literal keeps its own spelling through this
         // splice instead of degrading to a freshly-formatted f64/i64.
-        OwnedValue::NumberLiteral(_, text) => {
-            Expr::Literal(Literal::NumberLiteral(text.to_string()))
+        // #1062: `repr` is already parsed on the source `OwnedValue` --
+        // carried straight through instead of discarded and re-derived.
+        OwnedValue::NumberLiteral(repr, text) => {
+            Expr::Literal(Literal::NumberLiteral(*repr, text.to_string()))
         }
         OwnedValue::String(s) => Expr::Literal(Literal::String(s.clone())),
         OwnedValue::Array(arr) => {
@@ -25382,14 +25384,14 @@ mod tests {
         let substituted = substitute_vars(&expr, [("n", &int_lit)]);
         assert_eq!(
             substituted,
-            Expr::Literal(Literal::NumberLiteral("42".to_string()))
+            Expr::Literal(Literal::number_literal("42".to_string()))
         );
 
         let float_lit = OwnedValue::from_number_literal("1e100");
         let substituted = substitute_vars(&expr, [("n", &float_lit)]);
         assert_eq!(
             substituted,
-            Expr::Literal(Literal::NumberLiteral("1e100".to_string()))
+            Expr::Literal(Literal::number_literal("1e100".to_string()))
         );
 
         let index = JsonIndex::build(b"null");
