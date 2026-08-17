@@ -27,9 +27,9 @@ use super::document::{
 use super::eval::{
     apply_compare_op, collapse_vec, eval as full_eval, format_owned,
     index_one_owned as index_owned_by_key, literal_to_owned, needs_path_context,
-    numeric_display_string, numeric_key_to_index, owned_bound_to_i64, owned_to_string,
-    owned_value_to_json, slice_owned_value_read, tonumber_from_str, Control, EvalError,
-    EvalSemantics, EvalTag, JqSemantics, QueryResult, YqSemantics,
+    numeric_key_to_index, owned_bound_to_i64, owned_to_string, slice_owned_value_read,
+    tonumber_from_str, Control, EvalError, EvalSemantics, EvalTag, JqSemantics, QueryResult,
+    YqSemantics,
 };
 use super::expr::{Builtin, Expr, FormatType};
 use super::slice::{slice_str, SliceBounds};
@@ -902,12 +902,23 @@ fn eval_on_owned<S: EvalSemantics, V: DocumentValue>(
     // value (e.g. `(1e10 * 2)`) serializes through `to_json_for_reindex`'s
     // decimal-only float spelling below first, reparses as a
     // document-sourced-*looking* number, and echoes that baked text
-    // verbatim per #1008's literal-preservation rule once the `ToString`
-    // arm at the bottom of this file's `Builtin` match finally runs --
-    // permanently losing the scientific-notation spelling real yq applies
-    // to a computed float before the round trip ever has a chance to run.
-    // `owned_to_string` is the exact same function that arm already calls,
-    // so this is unobservable except in speed for every other value shape.
+    // verbatim per #1008's literal-preservation rule once `Builtin::
+    // ToString`'s own arm (this file's `eval_builtin`, which now calls
+    // `owned_to_string` directly too) finally runs -- permanently losing
+    // the scientific-notation spelling real yq applies to a computed float
+    // before the round trip ever has a chance to run.
+    //
+    // Narrow on purpose, not exhaustive: this only matches `tostring` as
+    // the *immediately next* stage. Any intervening stage (even a no-op
+    // `.`), a parenthesized `(tostring)`, `tostring?`, or `map(...|
+    // tostring)` all still fall through to the round-trip below and
+    // reproduce the original bug, since each intervening stage re-enters
+    // this function with its own, different `expr` and bakes the float
+    // into a `NumberLiteral` before `tostring` ever sees it in its
+    // original form. Fixing that needs either threading "was this ever
+    // reindexed" through every intermediate call here, or the same
+    // origin-tracking mechanism #1128 already identifies as the real fix
+    // for `@json`'s sibling gap -- tracked as #1134, not attempted here.
     if let Expr::Builtin(Builtin::ToString) = expr {
         return GenericResult::Owned(OwnedValue::String(owned_to_string::<S>(&owned)));
     }
@@ -3729,16 +3740,7 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
 
         Builtin::ToString => {
             let owned = to_owned_with_cursor(&value, cursor);
-            let s = match &owned {
-                OwnedValue::Null => "null".to_string(),
-                OwnedValue::Bool(b) => b.to_string(),
-                OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..) => {
-                    numeric_display_string::<S>(&owned)
-                }
-                OwnedValue::String(s) => s.clone(),
-                OwnedValue::Array(_) | OwnedValue::Object(_) => owned_value_to_json::<S>(&owned),
-            };
-            GenericResult::Owned(OwnedValue::String(s))
+            GenericResult::Owned(OwnedValue::String(owned_to_string::<S>(&owned)))
         }
 
         Builtin::ToNumber => {
