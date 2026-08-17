@@ -1773,15 +1773,32 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentValue for StandardJson<'a, W> {
         match self {
             StandardJson::Number(n) => {
                 let bytes = n.raw_bytes();
-                if !crate::json::validate::is_valid_number(bytes) {
-                    // The semi-index scanner accepts number *spans* more
-                    // leniently than RFC 8259 (e.g. `007`, `1.2.3` — see
-                    // #966): echoing such text verbatim would produce
-                    // invalid JSON output. Fall through to `as_i64`/`as_f64`
-                    // (still lenient, but numerically sound) or `Null`.
-                    return None;
+                if crate::json::validate::is_valid_number(bytes) {
+                    return core::str::from_utf8(bytes).ok().map(Cow::Borrowed);
                 }
-                core::str::from_utf8(bytes).ok().map(Cow::Borrowed)
+                // Real jq's own number reader tolerates a redundant
+                // leading zero that strict RFC 8259 doesn't (`007e5` ->
+                // `7E+5`, `007.500` -> `7.500`) -- #1149, same fix as
+                // `OwnedValue::from_number_bytes`'s own leading-zero
+                // handling (shared via `strip_redundant_leading_zeros`,
+                // since this trait impl has no access to that jq-layer
+                // type). Reached by `--argjson`/`--slurpfile`/`--seq`
+                // and this crate's own `.json`-file input paths, which
+                // materialize through this generic `DocumentValue`
+                // trait rather than `from_number_bytes` directly.
+                if let Some(stripped) = crate::json::validate::strip_redundant_leading_zeros(bytes)
+                {
+                    if crate::json::validate::is_valid_number(&stripped) {
+                        return String::from_utf8(stripped).ok().map(Cow::Owned);
+                    }
+                }
+                // The semi-index scanner accepts number *spans* more
+                // leniently than RFC 8259 beyond just a leading zero
+                // (e.g. `1.2.3` — see #966): echoing such text verbatim
+                // would produce invalid JSON output. Fall through to
+                // `as_i64`/`as_f64` (still lenient, but numerically
+                // sound) or `Null`.
+                None
             }
             _ => None,
         }

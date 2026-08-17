@@ -854,6 +854,32 @@ impl OwnedValue {
                 return core::str::from_utf8(bytes).map_or(Self::Null, Self::from_number_literal);
             }
         }
+        // Real jq's own number reader also tolerates a redundant leading
+        // zero in the integer part -- but unlike the leading-dot case
+        // above (which *adds* a digit and keeps everything else from the
+        // original text), real jq's own display *drops* the redundant
+        // zero itself while preserving everything else about the
+        // spelling (`007` -> `7`, `007e5` -> `7E+5` [reformatted like any
+        // exponent literal], `007.500` -> `7.500` [trailing zeros kept]).
+        // So the literal materialized here is the *stripped* text, not
+        // the original `bytes` -- confirmed live against jq 1.7.1 (an
+        // earlier draft of this fix materialized the original,
+        // leading-zero-intact text instead, which is wrong: caught by
+        // review before merge). The *only* reason this needs handling
+        // here at all: the CLI's own `--argjson`-style "normalize, retry"
+        // fix (#1094, `normalize_leading_zero_numbers` in
+        // `src/bin/succinctly/jq_runner.rs`) doesn't reach here -- it's a
+        // CLI-arg-only helper, not wired into this shared conversion, so
+        // the plain document-input path (and `--argjson` too, since it
+        // also ends up here) still fell all the way through to the lossy
+        // `parse_i64_or_f64` below, losing the leading zero *and* any
+        // exponent notation *and* any trailing zeros in one go (#1149).
+        if let Some(stripped) = crate::json::validate::strip_redundant_leading_zeros(bytes) {
+            if crate::json::validate::is_valid_number(&stripped) {
+                return core::str::from_utf8(&stripped)
+                    .map_or(Self::Null, Self::from_number_literal);
+            }
+        }
         let Ok(s) = core::str::from_utf8(bytes) else {
             return Self::Null;
         };

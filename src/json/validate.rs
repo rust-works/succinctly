@@ -26,6 +26,8 @@
 
 #[cfg(not(test))]
 use alloc::string::String;
+#[cfg(not(test))]
+use alloc::vec::Vec;
 
 use core::fmt;
 
@@ -807,6 +809,51 @@ pub fn is_valid_number(bytes: &[u8]) -> bool {
         }
     }
     i == bytes.len()
+}
+
+/// Strip a redundant leading zero (`007` -> `7`, `-007` -> `-7`) from a
+/// single, already-isolated number token's integer part.
+///
+/// Real jq's own number reader tolerates a leading zero that strict
+/// RFC 8259 doesn't; this is the shared building block two independent
+/// "recover a lenient-but-invalid number's own literal spelling"
+/// call sites use (`OwnedValue::from_number_bytes` in `src/jq/value.rs`,
+/// and [`crate::json::light`]'s `DocumentValue::number_literal`
+/// implementation, #1149) -- strip the redundant zero(s), re-check
+/// [`is_valid_number`] on the result, and materialize *that* stripped
+/// text as the literal spelling if it passes (real jq's own display
+/// drops the redundant zero but otherwise preserves the spelling
+/// unchanged, e.g. `007e5` -> `7E+5`, `007.500` -> `7.500`).
+///
+/// Returns `None` when there's nothing to strip -- either the integer
+/// part doesn't start with a redundant `0` at all (an ordinary number,
+/// the overwhelmingly common case, kept allocation-free), or it's a bare
+/// `0`/`0.x`-style integer part RFC 8259 already accepts unchanged. An
+/// all-zero run (`00`, `-000`) strips down to a single `0`, not empty.
+///
+/// Deliberately scoped to one token, unlike
+/// `normalize_leading_zero_numbers` (`src/bin/succinctly/jq_runner.rs`,
+/// #1094) which scans a whole raw JSON *string* while tracking
+/// string-literal context to find every number token inside it -- both
+/// of this function's callers already receive one isolated span, so
+/// neither needs that machinery.
+#[must_use]
+pub fn strip_redundant_leading_zeros(bytes: &[u8]) -> Option<Vec<u8>> {
+    let (sign, rest) = match bytes.first() {
+        Some(b'-') => (&bytes[..1], &bytes[1..]),
+        _ => (&bytes[..0], bytes),
+    };
+    if rest.first() != Some(&b'0') || !rest.get(1).is_some_and(u8::is_ascii_digit) {
+        return None;
+    }
+    let mut i = 0;
+    while rest.get(i) == Some(&b'0') && rest.get(i + 1).is_some_and(u8::is_ascii_digit) {
+        i += 1;
+    }
+    let mut stripped = Vec::with_capacity(bytes.len() - i);
+    stripped.extend_from_slice(sign);
+    stripped.extend_from_slice(&rest[i..]);
+    Some(stripped)
 }
 
 #[cfg(test)]

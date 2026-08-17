@@ -604,20 +604,19 @@ fn test_argjson_tolerates_leading_zero_number_1094() -> Result<()> {
 }
 
 /// A leading-zero number combined with a *trailing* zero (`007.500`) is
-/// accepted (not rejected outright, this issue's own scope), but loses the
-/// trailing zero's spelling (`7.5`, not real jq's `7.500`) -- a pre-existing
-/// gap in this crate's own `NumberLiteral`-preservation fast path for any
-/// leading-zero literal, reproducing identically via plain document input
-/// (`echo '007.500' | succinctly jq '.'`), unrelated to `--argjson` and out
-/// of this fix's scope. Tracked as #1149 (filed for the sibling
-/// scientific-notation case; same root cause, broader than its title
-/// suggests). This test pins current, non-regressed behavior, not the
-/// (still wrong) spelling.
+/// accepted (not rejected outright, this issue's own scope) and, since
+/// #1149, also keeps the trailing zero's spelling (`7.500`, matching real
+/// jq) rather than losing it (`7.5`) the way this crate's own
+/// `NumberLiteral`-preservation fast path used to for any leading-zero
+/// literal -- same fix (`OwnedValue::from_number_bytes` /
+/// `DocumentValue::number_literal`) as the sibling scientific-notation
+/// case below, since it's one root cause, broader than #1149's own title
+/// suggested.
 #[test]
-fn test_argjson_leading_zero_accepted_but_trailing_zero_spelling_lost_1094() -> Result<()> {
+fn test_argjson_leading_zero_accepted_and_trailing_zero_spelling_preserved_1149() -> Result<()> {
     let (stdout, _, code) = run_jq_full(&["-n", "--argjson", "n", "007.500", "$n"], None)?;
     assert_eq!(code, 0);
-    assert_eq!(stdout.trim_end(), "7.5");
+    assert_eq!(stdout.trim_end(), "7.500");
     Ok(())
 }
 
@@ -827,14 +826,14 @@ fn test_argjson_escaped_string_alongside_leading_zero_1094() -> Result<()> {
 
 /// A leading-zero number combined with scientific notation is accepted
 /// (not rejected outright), exercising `normalize_leading_zero_numbers`'s
-/// exponent-handling branch -- exact spelling is a separate, pre-existing
-/// gap (#1149), so this only pins acceptance and the correct numeric
-/// value, not the display spelling.
+/// exponent-handling branch, and -- since #1149 -- keeps its scientific
+/// notation on display (`7E+5`, matching real jq) instead of being
+/// expanded to a plain decimal (`700000`).
 #[test]
-fn test_argjson_leading_zero_with_exponent_accepted_1094() -> Result<()> {
+fn test_argjson_leading_zero_with_exponent_spelling_preserved_1149() -> Result<()> {
     let (stdout, _, code) = run_jq_full(&["-n", "--argjson", "n", "007e5", "$n"], None)?;
     assert_eq!(code, 0);
-    assert_eq!(stdout.trim_end(), "700000");
+    assert_eq!(stdout.trim_end(), "7E+5");
     Ok(())
 }
 
@@ -842,10 +841,65 @@ fn test_argjson_leading_zero_with_exponent_accepted_1094() -> Result<()> {
 /// exercises `normalize_leading_zero_numbers`'s explicit-exponent-sign
 /// branch specifically.
 #[test]
-fn test_argjson_leading_zero_with_signed_exponent_accepted_1094() -> Result<()> {
+fn test_argjson_leading_zero_with_signed_exponent_spelling_preserved_1149() -> Result<()> {
     let (stdout, _, code) = run_jq_full(&["-n", "--argjson", "n", "007e+5", "$n"], None)?;
     assert_eq!(code, 0);
-    assert_eq!(stdout.trim_end(), "700000");
+    assert_eq!(stdout.trim_end(), "7E+5");
+    Ok(())
+}
+
+// --- #1149: the same leading-zero spelling loss, via the crate's primary
+// document-input path (not just --argjson) -- the issue's own repro shape.
+
+/// A leading-zero number combined with scientific notation, via plain
+/// document input, keeps its scientific notation on display (matching
+/// real jq: `007e5 | .` -> `7E+5`) instead of being expanded to a plain
+/// decimal.
+#[test]
+fn test_document_input_leading_zero_exponent_spelling_preserved_1149() -> Result<()> {
+    let (stdout, _, code) = run_jq_full(&["-c", "."], Some("007e5"))?;
+    assert_eq!(code, 0, "stdout: {stdout:?}");
+    assert_eq!(stdout.trim_end(), "7E+5");
+
+    let (stdout, _, code) = run_jq_full(&["-c", "."], Some("-007e5"))?;
+    assert_eq!(code, 0, "stdout: {stdout:?}");
+    assert_eq!(stdout.trim_end(), "-7E+5");
+    Ok(())
+}
+
+/// A leading-zero number combined with a trailing zero, via plain
+/// document input, keeps the trailing zero's spelling (matching real jq:
+/// `007.500 | .` -> `7.500`) instead of collapsing it to `7.5`.
+#[test]
+fn test_document_input_leading_zero_trailing_zero_spelling_preserved_1149() -> Result<()> {
+    let (stdout, _, code) = run_jq_full(&["-c", "."], Some("007.500"))?;
+    assert_eq!(code, 0, "stdout: {stdout:?}");
+    assert_eq!(stdout.trim_end(), "7.500");
+    Ok(())
+}
+
+/// An all-zero leading-zero run (`00`) and a plain leading-zero integer
+/// (`007`) still strip down to their correct, minimal spelling -- not
+/// regressed by the new exponent/trailing-zero handling above.
+#[test]
+fn test_document_input_leading_zero_plain_and_all_zero_unaffected_1149() -> Result<()> {
+    let (stdout, _, code) = run_jq_full(&["-c", "."], Some("007"))?;
+    assert_eq!(code, 0, "stdout: {stdout:?}");
+    assert_eq!(stdout.trim_end(), "7");
+
+    let (stdout, _, code) = run_jq_full(&["-c", "."], Some("00"))?;
+    assert_eq!(code, 0, "stdout: {stdout:?}");
+    assert_eq!(stdout.trim_end(), "0");
+    Ok(())
+}
+
+/// A leading-zero number nested inside a container, via plain document
+/// input, gets the same spelling fix as a bare top-level scalar.
+#[test]
+fn test_document_input_nested_leading_zero_exponent_spelling_preserved_1149() -> Result<()> {
+    let (stdout, _, code) = run_jq_full(&["-c", "."], Some(r#"{"a":007e5,"b":007.500}"#))?;
+    assert_eq!(code, 0, "stdout: {stdout:?}");
+    assert_eq!(stdout.trim_end(), r#"{"a":7E+5,"b":7.500}"#);
     Ok(())
 }
 
