@@ -10890,3 +10890,16 @@ fn test_urid_nonascii_passthrough_and_decode_1123() -> Result<()> {
     assert_eq!(out.trim(), "\"café\"");
     Ok(())
 }
+
+/// #1119's yq-only "array + non-array appends" rule must not leak into jq
+/// mode: real jq has no array-append concept and errors on `[] + 99`,
+/// matching succinctly's pre-existing, unaffected behavior.
+#[test]
+fn test_jq_array_plus_scalar_still_errors_1119() -> Result<()> {
+    let (_out, code) = run_jq_stdin("[] + 99", "null", &[])?;
+    assert_eq!(code, 5);
+
+    let (_out, code) = run_jq_stdin("[1,2] + 3", "null", &[])?;
+    assert_eq!(code, 5);
+    Ok(())
+}

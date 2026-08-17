@@ -1715,6 +1715,17 @@ fn arith_add<S: EvalSemantics>(
         }
         // null + x = x, x + null = x
         (OwnedValue::Null, other) | (other, OwnedValue::Null) => Ok(other),
+        // yq: `array + x` appends any non-array, non-null `x` as a single
+        // new element (`[] + 99` => `[99]`) -- unlike jq, which has no
+        // array-append concept and errors here (#1119). Asymmetric: `x +
+        // array` for a non-array/non-null `x` still falls through to the
+        // error arm below, matching real yq (verified live against yq
+        // v4.53.3: `[1,2] + 3` succeeds, `3 + [1,2]` errors). Array+array
+        // and array+null are already handled above/before this arm.
+        (OwnedValue::Array(mut a), b) if S::TAG == EvalTag::Yq => {
+            a.push(b);
+            Ok(OwnedValue::Array(a))
+        }
         (a, b) => Err(EvalError::binary_op(&a, &b, BinOp::Add)),
     }
 }

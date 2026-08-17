@@ -13202,6 +13202,103 @@ fn test_base64d_invalid_utf8_is_lossy_not_error_1109() -> Result<()> {
     Ok(())
 }
 
+// --- #1119: yq's `+` appends a non-array RHS to an array LHS ---
+//
+// Verified live against real yq v4.53.3. Asymmetric: only fires when the
+// array is on the *left*. `array + array` (concat) and `array + null` /
+// `null + array` (no-op) already worked before this fix and are re-checked
+// here only as regression guards.
+
+#[test]
+fn test_1119_array_plus_number_appends() -> Result<()> {
+    let (output, code) = run_yq_stdin("[] + 99", "null", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "[99]");
+
+    let (output, code) = run_yq_stdin("[1,2] + 3", "null", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "[1,2,3]");
+
+    Ok(())
+}
+
+#[test]
+fn test_1119_array_plus_string_bool_object_appends() -> Result<()> {
+    let (output, code) = run_yq_stdin(r#"[1,2] + "a""#, "null", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#"[1,2,"a"]"#);
+
+    let (output, code) = run_yq_stdin("[1,2] + true", "null", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "[1,2,true]");
+
+    let (output, code) = run_yq_stdin(r#"[1,2] + {"a":1}"#, "null", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#"[1,2,{"a":1}]"#);
+
+    Ok(())
+}
+
+/// Asymmetric: `non-array + array` still errors, matching real yq (`3 +
+/// [1,2]` errors there too — this is not a general merge).
+#[test]
+fn test_1119_non_array_plus_array_still_errors() -> Result<()> {
+    let (_, stderr, code) = run_yq_stdin_with_stderr("3 + [1,2]", "null", &[])?;
+    assert_ne!(code, 0);
+    assert!(stderr.contains("cannot be added"), "stderr: {stderr}");
+
+    let (_, stderr, code) = run_yq_stdin_with_stderr(r#""a" + [1,2]"#, "null", &[])?;
+    assert_ne!(code, 0);
+    assert!(stderr.contains("cannot be added"), "stderr: {stderr}");
+
+    let (_, stderr, code) = run_yq_stdin_with_stderr(r#"{"a":1} + [1,2]"#, "null", &[])?;
+    assert_ne!(code, 0);
+    assert!(stderr.contains("cannot be added"), "stderr: {stderr}");
+
+    Ok(())
+}
+
+/// Array+array (concat) and array+null / null+array (no-op) already worked
+/// pre-#1119 — regression guards, not new behavior.
+#[test]
+fn test_1119_array_plus_array_and_null_unchanged() -> Result<()> {
+    let (output, code) = run_yq_stdin("[1,2] + [3,4]", "null", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "[1,2,3,4]");
+
+    let (output, code) = run_yq_stdin("[1,2] + null", "null", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "[1,2]");
+
+    let (output, code) = run_yq_stdin("null + [1,2]", "null", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "[1,2]");
+
+    Ok(())
+}
+
+#[test]
+fn test_1119_compound_assign_plus_equals_appends() -> Result<()> {
+    let (output, code) = run_yq_stdin(".a += 5", "a: [1, 2]\n", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#"{"a":[1,2,5]}"#);
+
+    Ok(())
+}
+
+/// #1101/#1112's scalar-slice-assignment no-op still works after this fix
+/// (its throwaway clone binds `.` to the scalar itself, not `[]` — see
+/// `eval_update`'s doc comment — so this array-append change doesn't touch
+/// that path at all; regression guard).
+#[test]
+fn test_1119_scalar_slice_assign_noop_still_works() -> Result<()> {
+    let (output, code) = run_yq_stdin("5 | .[0:1] += 99", "null", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "5");
+
+    Ok(())
+}
+
 /// Reference decoder used only to compute expected lossy-UTF-8 output for
 /// the tests above, independent of the implementation under test.
 fn base64_decode_lossy(s: &str) -> String {
