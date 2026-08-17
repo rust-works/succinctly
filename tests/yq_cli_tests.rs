@@ -4452,6 +4452,29 @@ fn test_yaml_ordinary_key_same_indent_sequence_unaffected_by_1040_fix() -> Resul
     Ok(())
 }
 
+#[test]
+fn test_yaml_chained_explicit_keys_with_same_indent_sequences_1040() -> Result<()> {
+    // Code review's own follow-up finding: the first fix only wired
+    // `close_same_indent_sequence_before_mapping_entry` into
+    // `parse_mapping_entry`, so a same-indent sequence value followed by
+    // *another* explicit key (rather than an ordinary `key:` entry) hit
+    // the identical staleness bug through `parse_explicit_key` instead --
+    // `k2`'s whole entry silently nested as a second element of `k`'s
+    // array rather than becoming a sibling key.
+    let input = "? k\n- item\n? k2\n: v2\n";
+    let (output, exit_code) = run_yq_stdin(".", input, &["-o=json", "-I=0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), r#"{"k":["item"],"k2":"v2"}"#);
+
+    // Chained across three explicit keys, each with its own same-indent
+    // sequence value, confirms the fix isn't a one-shot recovery.
+    let input = "? k1\n- a\n? k2\n- b\n? k3\n: v3\n";
+    let (output, exit_code) = run_yq_stdin(".", input, &["-o=json", "-I=0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), r#"{"k1":["a"],"k2":["b"],"k3":"v3"}"#);
+    Ok(())
+}
+
 // =============================================================================
 // Alias cycle rejection (#153) - cyclic anchors must be a clean parse error,
 // not a stack-overflow abort
