@@ -2315,6 +2315,62 @@ mod tests {
         assert_eq!(format_number_jq_compat(digits.as_bytes()), digits);
     }
 
+    /// #1099: the symmetric *underflow* case (a literal whose magnitude
+    /// underflows `f64` to exactly `0.0`, e.g. `1e-400`) used to lose the
+    /// mantissa entirely (`0E-400` instead of `1E-400`) -- `value == 0.0`
+    /// can't tell a genuinely-zero-mantissa literal apart from a nonzero
+    /// one that simply underflowed. In-process counterpart to
+    /// `jq_cli_tests.rs`'s CLI-level coverage of the same cases: those
+    /// spawn a subprocess and so are invisible to `cargo llvm-cov`, which
+    /// only instruments the test binary itself.
+    #[test]
+    fn test_format_number_jq_compat_underflow_preserves_mantissa_1099() {
+        assert_eq!(format_number_jq_compat(b"1e-400"), "1E-400");
+        assert_eq!(format_number_jq_compat(b"-1e-400"), "-1E-400");
+        assert_eq!(format_number_jq_compat(b"12.34e-400"), "1.234E-399");
+        assert_eq!(format_number_jq_compat(b"0.5e-400"), "5E-401");
+        assert_eq!(format_number_jq_compat(b"100.5e-400"), "1.005E-398");
+    }
+
+    /// #1099 code review: the exponent digit string was parsed at `i32`
+    /// width for `format_number_jq_compat`'s own fast-path dispatch
+    /// (`exp == 0` / `(-5..0)` checks), and an out-of-`i32`-range exponent
+    /// silently became `0` via `.unwrap_or(0)` -- misrouting into the
+    /// "eliminate exponent" fast path before the mantissa-preserving logic
+    /// above ever ran. Widening that parse to `i64` (`parse_literal_exponent`)
+    /// fixes it for any realistic exponent.
+    #[test]
+    fn test_format_number_jq_compat_underflow_beyond_i32_exponent_range_1099() {
+        // One exponent digit past i32::MIN (-2147483648) -- used to
+        // silently dispatch through `exp == 0` and print bare `0`, losing
+        // sign, mantissa, and exponent entirely.
+        assert_eq!(format_number_jq_compat(b"1e-2147483649"), "1E-2147483649");
+        assert_eq!(format_number_jq_compat(b"-1e-2147483649"), "-1E-2147483649");
+        // Right at the (now-irrelevant) old i32 boundary -- must stay
+        // correct too, not just the one-past case.
+        assert_eq!(format_number_jq_compat(b"1e-2147483648"), "1E-2147483648");
+        // Same bug, zero-mantissa side: a genuinely-zero mantissa at an
+        // out-of-i32-range exponent also mis-dispatched through `exp == 0`,
+        // wrongly eliminating (rather than preserving) the huge exponent.
+        assert_eq!(format_number_jq_compat(b"0e-2147483649"), "0E-2147483649");
+    }
+
+    /// `parse_literal_exponent`'s own saturating fallback: an exponent
+    /// digit string that overflows even `i64` (not just `i32`) saturates to
+    /// `i64::MIN`/`MAX` by sign rather than erroring. The overflow-ceiling
+    /// test above already exercises the positive (`i64::MAX`) side via
+    /// `1e99999999999999999999`; this covers the negative (`i64::MIN`)
+    /// side, which only underflow's unlimited exponent range can reach (the
+    /// overflow path's own ceiling check fires at a much smaller magnitude,
+    /// long before an exponent could overflow `i64`).
+    #[test]
+    fn test_format_number_jq_compat_underflow_exponent_beyond_i64_range_1099() {
+        assert_eq!(
+            format_number_jq_compat(b"1e-99999999999999999999"),
+            "1E-9223372036854775808"
+        );
+    }
+
     /// #930 review: an overflowed literal's mantissa can be arbitrarily long
     /// (it's document-controlled text), but only a handful of its leading
     /// digits ever survive `dump_truncated`'s later preview truncation - so
