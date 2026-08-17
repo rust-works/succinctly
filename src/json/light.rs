@@ -656,6 +656,17 @@ impl<'a, W: AsRef<[u64]>> JsonCursor<'a, W> {
                 text: self.text,
                 start: text_pos,
             }),
+            // Real jq's own number reader is lenient beyond strict JSON: a
+            // leading `.` is accepted when at least one digit follows
+            // (`.5` -> `0.5`), matching `-.5` (already accepted above,
+            // since `-` already dispatches here) but not a bare `.`/`.e5`
+            // with no digit at all, which real jq still rejects (#1171).
+            b'.' if self.text.get(text_pos + 1).is_some_and(u8::is_ascii_digit) => {
+                StandardJson::Number(JsonNumber {
+                    text: self.text,
+                    start: text_pos,
+                })
+            }
             _ => StandardJson::Error("unexpected character"),
         }
     }
