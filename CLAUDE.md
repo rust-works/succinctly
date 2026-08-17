@@ -278,7 +278,7 @@ printf 'a:\n  x: 1\nb:\n  x: 2\n  y: 3\n' | succinctly yq '.a *=n .b'  # a: {x: 
 
 `+`/`d` combined on the same array is a documented simplification: real yq has a surprising, untested-upstream double-effect here; succinctly makes `+` take clean priority (pure append, `d` ignored) instead.
 
-`null` acts as an empty container on either side of a yq-mode merge (jq mode keeps plain `null * x = null`): a null/absent *left* operand merges as if starting from `{}`/`[]` (`.a *=n .b` on `a: null` writes the full `.b` in; `.a *=? .b` on an absent `.a` leaves `a: {}`, blocked field-by-field rather than staying `null`), and a null *right* operand is always a no-op (`.a *= null` leaves `.a` untouched).
+`null` acts as an empty container on either side of a yq-mode merge (jq mode has no such exception -- every `null`-involving `*` pairing errors there, #1175): a null/absent *left* operand merges as if starting from `{}`/`[]` (`.a *=n .b` on `a: null` writes the full `.b` in; `.a *=? .b` on an absent `.a` leaves `a: {}`, blocked field-by-field rather than staying `null`), and a null *right* operand is always a no-op (`.a *= null` leaves `.a` untouched).
 
 ### jq Position-Based Navigation (succinctly extension)
 

@@ -216,8 +216,9 @@ printf 'a: [{name: fred, age: 12}, {name: bob, age: 32}]\nb: [{name: fred, age: 
   `a: null` writes the full `.b` in, and `.a *=? .b` on an absent `.a`
   leaves it as `a: {}` (blocked by `?`, not `a: null`). A null *right*
   operand is always a no-op — `.a *= null` (with or without flags) leaves
-  `.a` untouched, whatever it is. This only applies to yq mode; jq mode
-  keeps its plain `null * x = null` behavior.
+  `.a` untouched, whatever it is. This only applies to yq mode; jq mode has
+  no such exception and errors on every `null`-involving `*` pairing
+  (#1175).
 - `?`/`n` propagate through every nesting depth: a parent key that already
   exists still gets recursed into so its own new children can be added or
   blocked individually. Combining `?` and `n` is an AND of both gates (net

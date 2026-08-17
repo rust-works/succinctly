@@ -79,8 +79,8 @@ pub trait EvalSemantics: Copy + Default {
     /// If true, `null` acts as an empty container on either side of `*`/`*=`:
     /// a null right operand is a no-op (left passes through unchanged), and a
     /// null left operand merging with an object/array merges as if starting
-    /// from `{}`/`[]` (yq). If false, any null operand short-circuits to
-    /// `null` (jq).
+    /// from `{}`/`[]` (yq). If false, every null-involving pairing errors
+    /// instead, with no exceptions (jq, #1175).
     const NULL_MERGES_AS_EMPTY: bool;
     /// Exit code for a bare `halt_error` (no explicit argument). Mirrors
     /// `DiagStyle::error_exit_code()` in the CLI's `output.rs` (5 for jq's
@@ -1993,9 +1993,8 @@ fn arith_mul<S: EvalSemantics>(
         // `NumberLiteral` operand degrades to plain `Int`/`Float` here, and
         // only here -- these are the arms that actually compute a new
         // value (a product, or a repeated string), so canonical formatting
-        // is correct; every arm above relocates an operand unchanged (or
-        // discards both entirely) and must not collapse a literal's
-        // spelling (#1167).
+        // is correct; every arm above relocates an operand unchanged and
+        // must not collapse a literal's spelling (#1167).
         (left, right) => match (left.into_plain_number(), right.into_plain_number()) {
             // jq converts to float on overflow, yq wraps
             (OwnedValue::Int(a), OwnedValue::Int(b)) => {
@@ -26577,11 +26576,15 @@ mod tests {
     /// #1056 review: an earlier draft implemented unary minus as
     /// `(-1) * expr` instead of a dedicated `ArithOp::Negate` -- silently
     /// wrong, not just imprecise: `arith_mul` has its own string-repetition
-    /// (`Int * String`) and null-passthrough (`NULL_MERGES_AS_EMPTY`/`null *
-    /// x = null`) semantics that have nothing to do with negation, so
-    /// `-"abc"`/`-null` both returned `null` with exit code 0 instead of
-    /// erroring -- caught by code review before reaching `main`, with zero
-    /// test coverage of any non-numeric unary-minus operand at the time.
+    /// (`Int * String`) and null-merge (`NULL_MERGES_AS_EMPTY`) semantics
+    /// that have nothing to do with negation, so `-"abc"`/`-null` both
+    /// returned `null` with exit code 0 instead of erroring at the time --
+    /// caught by code review before reaching `main`, with zero test
+    /// coverage of any non-numeric unary-minus operand at the time. (Since
+    /// #1175, `arith_mul`'s own jq-mode null handling errors unconditionally
+    /// too, so this exact failure mode is doubly moot today -- but the
+    /// underlying lesson, that `arith_mul` carries semantics unrelated to
+    /// negation, still holds.)
     /// Confirmed live against jq 1.7.1: every non-numeric type errors with
     /// jq's own dedicated "cannot be negated" wording (`EvalError::
     /// cannot_be_negated`), not `arith_sub`'s pre-#1056 "cannot be
