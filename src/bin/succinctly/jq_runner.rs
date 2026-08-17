@@ -1536,6 +1536,22 @@ fn normalize_leading_zero_numbers(s: &str) -> String {
             while i < bytes.len() && bytes[i].is_ascii_digit() {
                 i += 1;
             }
+            if int_start == i {
+                // A bare `-` with no digit following it at all (`-`,
+                // `[-,1]`, `{"a":-}`) isn't a number token in the first
+                // place -- only reachable when `b == '-'`, since a digit
+                // `b` always advances the scan above by at least one.
+                // Leaving it untouched (not fabricating a `0` digit) is
+                // required, not just tidier: filling one in turns a
+                // genuinely malformed token into a syntactically valid
+                // one (`-0`), which would make the retried `serde_json`
+                // validation below wrongly pass and this genuinely
+                // invalid input silently reach `json_bytes_to_owned_value`
+                // as `null` instead of erroring (found by review before
+                // merge).
+                out.push(b'-');
+                continue;
+            }
             let stripped = s[int_start..i].trim_start_matches('0');
             out.extend_from_slice(&bytes[start..int_start]);
             out.extend_from_slice(if stripped.is_empty() {
