@@ -94,10 +94,10 @@ pub trait EvalSemantics: Copy + Default {
     /// comparison. If false (jq, which has no strict int/float distinction),
     /// `2.0 == 2` is `true`. #950.
     const STRICT_NUMERIC_EQUALITY: bool;
-    /// If true (jq), a `null` *right* operand of `+` passes through
+    /// If false (jq), a `null` *right* operand of `+` passes through
     /// unconditionally for any left-operand type (`7 + null` -> `7`,
     /// `{} + null` -> `{}`) -- jq's own null-symmetric identity for `+`
-    /// applies to both sides equally. If false (yq, #1197), the same
+    /// applies to both sides equally. If true (yq, #1197), the same
     /// right-null passthrough only holds when the left operand is a
     /// `String` or `Array` (both already have their own null-passthrough
     /// arm nearby); a `Number`/`Bool`/`Object` left operand with a null
@@ -1900,10 +1900,13 @@ fn arith_sub<S: EvalSemantics>(
         // all succeed there). jq has no such exception -- every
         // null-involving subtraction errors on either side there, matching
         // succinctly's own pre-existing (unaffected) jq-mode behavior
-        // exactly, including error wording. A null *right* operand still
-        // errors in both modes -- real yq has no symmetric identity for
-        // `x - null` the way it does for `null - x` (confirmed live: `7 -
-        // null` errors in yq too). `other` is relocated unchanged, not
+        // exactly, including error wording. A null *right* operand with a
+        // non-null left still errors in both modes -- real yq has no
+        // symmetric identity for `x - null` the way it does for `null - x`
+        // (confirmed live: `7 - null` errors in yq too); `null - null`
+        // itself succeeds (returns `null`), since this arm's `left ==
+        // Null` match fires first regardless of what `right` is. `other`
+        // is relocated unchanged, not
         // computed, so a `NumberLiteral` operand must keep its own source
         // spelling here (mirroring #1143/#1167's identical concern for
         // `arith_add`/`arith_mul`'s own relocation arms) -- this arm must

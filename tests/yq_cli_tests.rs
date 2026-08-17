@@ -13825,6 +13825,39 @@ fn test_1119_add_builtin_inherits_array_append_consistently() -> Result<()> {
     Ok(())
 }
 
+/// `add` also inherits #1197's narrowed right-null rule for the same
+/// reason (folds via `+`, not a separate scope decision) -- a `null`
+/// following a `Number`/`Bool`/`Object` element mid-fold now errors in yq
+/// mode, where it silently succeeded before #1197 narrowed `arith_add`'s
+/// right-null arm. A `null` in the *first* position, or following a
+/// `String`/`Array` element, is unaffected either way (left-null stays
+/// unconditional; right-null still succeeds for concat types). Real yq has
+/// no `add`/`reduce` syntax at all, so this locks in succinctly's own
+/// consistent-with-`+` behavior rather than verifying against an oracle,
+/// mirroring `test_1119_add_builtin_inherits_array_append_consistently`
+/// above.
+#[test]
+fn test_1197_add_builtin_inherits_right_null_gating_consistently() -> Result<()> {
+    let (_out, err, code) = run_yq_stdin_with_stderr("[7, null] | add", "null", &["-o=json"])?;
+    assert_eq!(code, 1, "{err}");
+    assert!(err.contains("cannot be added"), "{err}");
+
+    let (output, code) = run_yq_stdin("[null, 7] | add", "null", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "7");
+
+    let (output, code) = run_yq_stdin(r#"["a", null] | add"#, "null", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#""a""#);
+
+    // jq mode is unaffected -- `+`'s right-null rule stays unconditional.
+    let (output, _stderr, code) = run_jq_stdin_with_stderr("[7, null] | add", "null", &["-c"])?;
+    assert_eq!(code, 0, "out: {output:?}");
+    assert_eq!(output.trim(), "7");
+
+    Ok(())
+}
+
 /// #1119 (Array+non-array in `arith_add`) must not resurrect the panic this
 /// broke in `gsub`'s flags-concatenation helper: an Array-typed `flags`
 /// argument now type-checks explicitly before ever reaching `arith_add`,
