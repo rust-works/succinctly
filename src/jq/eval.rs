@@ -1718,19 +1718,31 @@ fn arith_sub<S: EvalSemantics>(
 /// sign bit for every value including `0.0`. `Int(n)` negates via
 /// `checked_neg`/`wrapping_neg` (jq/yq's usual overflow conventions,
 /// matching `arith_sub`'s `0 - n` handling exactly: only `i64::MIN` can
-/// overflow, since `-i64::MIN` doesn't fit in `i64`) -- *except* for `n ==
-/// 0`, which promotes to `Float(-0.0)` instead of staying `Int(0)`: unlike
-/// `arith_mul`, this function has exactly one caller (unary minus itself),
-/// so special-casing zero here can't accidentally reinterpret some
-/// unrelated expression the way special-casing `-1 * 0` inside `arith_mul`
-/// would have (see this function's own history above) -- real jq has no
-/// separate integer type, so an all-integer computation that reduces to
-/// exactly zero (`-(1-1)`) is already the double `0.0` there, and negating
-/// it naturally yields `-0.0`; this promotion is the one place `Int`
-/// deliberately gives up exact-integer fidelity to match that.
+/// overflow, since `-i64::MIN` doesn't fit in `i64`) -- *except* for jq mode
+/// specifically with `n == 0`, which promotes to `Float(-0.0)` instead of
+/// staying `Int(0)`: unlike `arith_mul`, this function has exactly one
+/// caller (unary minus itself), so special-casing zero here can't
+/// accidentally reinterpret some unrelated expression the way
+/// special-casing `-1 * 0` inside `arith_mul` would have (see this
+/// function's own history above) -- real jq has no separate integer type,
+/// so an all-integer computation that reduces to exactly zero (`-(1-1)`) is
+/// already the double `0.0` there, and negating it naturally yields `-0.0`;
+/// this promotion is the one place `Int` deliberately gives up
+/// exact-integer fidelity to match that.
+///
+/// **jq-mode only**: real yq has no unary-minus operator at all (confirmed
+/// live against yq v4.53.3: `-.a` is a hard parse error, `'-' expects 2
+/// args but there is 1`) -- succinctly's own support for it in yq mode is
+/// a pre-existing, unrelated extension (#1056 doesn't touch whether it
+/// exists), so there's no oracle to say a zero-valued yq integer field
+/// negating to a float (`-.replicas` on `0` becoming `-0.0` instead of
+/// staying `0`) is the *intended* behavior rather than a surprising type
+/// change to a config value -- caught by code review before reaching
+/// `main`. Leaving yq's `Int(0)` un-promoted keeps this fix scoped to
+/// jq-mode's own verified, oracle-backed convention.
 fn arith_negate<S: EvalSemantics>(operand: OwnedValue) -> Result<OwnedValue, EvalError> {
     match operand.into_plain_number() {
-        OwnedValue::Int(0) => Ok(OwnedValue::Float(-0.0)),
+        OwnedValue::Int(0) if S::TAG != EvalTag::Yq => Ok(OwnedValue::Float(-0.0)),
         OwnedValue::Int(n) => Ok(OwnedValue::Int(if S::OVERFLOW_WRAPS {
             n.wrapping_neg()
         } else {
@@ -25236,6 +25248,37 @@ mod tests {
         query!(br"null", "-(-9223372036854775808)",
             QueryResult::Owned(OwnedValue::Float(f)) => {
                 assert_eq!(f, 9223372036854775808.0);
+            }
+        );
+    }
+
+    /// #1056 review: the `Int(0) -> Float(-0.0)` promotion above is jq-mode
+    /// only. Real yq has no unary-minus operator at all (confirmed live
+    /// against yq v4.53.3: `-.a` is a hard parse error, `'-' expects 2 args
+    /// but there is 1`), so there's no oracle backing an integer-to-float
+    /// type change for a yq config field's zero value (`-.replicas` on `0`
+    /// silently becoming `-0.0`) -- an earlier draft applied the promotion
+    /// unconditionally and was caught by code review with zero yq-mode test
+    /// coverage of this exact case. yq mode's `Float` operand still
+    /// preserves sign correctly (unaffected by the gate, since that's a
+    /// genuine `f64` value with no type-change question), and a non-numeric
+    /// operand still errors rather than silently succeeding.
+    #[test]
+    fn test_unary_minus_yq_mode_integer_zero_stays_integer_1056() {
+        yq_query!(br"null", "-(1-1)",
+            QueryResult::Owned(OwnedValue::Int(0)) => {}
+        );
+
+        yq_query!(br#"{"a":0.0}"#, "-.a",
+            QueryResult::Owned(OwnedValue::Float(f)) => {
+                assert_eq!(f, 0.0);
+                assert!(f.is_sign_negative());
+            }
+        );
+
+        yq_query!(br#"{"a":"abc"}"#, "-.a",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, r#"string ("abc") cannot be negated"#);
             }
         );
     }
