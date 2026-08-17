@@ -9463,6 +9463,28 @@ fn test_anchor_comment_dropped_at_eof_with_no_sibling_784() -> Result<()> {
     Ok(())
 }
 
+/// #1077's own base case, with no anchor and no comment at all: a mapping
+/// field deferred to a sibling at the same indent, which never supplies any
+/// content, renders with no value token (`a:`, not `a: ""`).
+#[test]
+fn test_deferred_absent_mapping_field_no_anchor_renders_bare_1077() -> Result<()> {
+    let (out, code) = run_yq_stdin(".", "a:\nb: 1\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "a:\nb: 1\n");
+    Ok(())
+}
+
+/// Same shape, but a sequence item instead of a mapping field: a deferred
+/// item with no anchor and no comment, followed by a sibling item at the
+/// same indent, renders bare (`-`, not `- ""`).
+#[test]
+fn test_deferred_absent_sequence_item_no_anchor_renders_bare_1077() -> Result<()> {
+    let (out, code) = run_yq_stdin(".", "- \n- 2\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "-\n- 2\n");
+    Ok(())
+}
+
 // The shapes below were added in a second round, after code review found the
 // first pass (a) regressed #765/#785's own key-comment capture when a
 // floated comment collides with a key's genuine same-line comment, (b)
