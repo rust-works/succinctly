@@ -523,6 +523,24 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     .collect();
                 QueryResult::Owned(OwnedValue::Array(items))
             }
+            // yq treats a null/number/boolean target as an empty container
+            // for slicing purposes (#1065, verified live against real yq
+            // across all three) rather than jq's own null-passthrough rule
+            // or "not sliceable" error -- checked before the jq-only Null
+            // arm below so this wins under yq mode. Object targets are
+            // deliberately excluded: real yq's own slicing there follows
+            // its internal AST child-node layout (`{"a":1,"b":2} | .[0:2]`
+            // -> `["a",1]`, alternating keys and values), not a clean
+            // "empty container" rule, and isn't replicated here (#1102).
+            // Assignment targets are a separate, unverified case -- real
+            // yq's own behavior there is a silent no-op, not this rule
+            // (#1101) -- see `is_yq_slice_empty_container_scalar`'s doc
+            // comment, which this arm mirrors.
+            StandardJson::Null | StandardJson::Number(_) | StandardJson::Bool(_)
+                if S::TAG == EvalTag::Yq =>
+            {
+                QueryResult::Owned(OwnedValue::Array(Vec::new()))
+            }
             // jq returns null for slice on null
             StandardJson::Null => QueryResult::One(StandardJson::Null),
             // jq supports string slicing
@@ -9735,6 +9753,16 @@ fn eval_slice_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             for s in &starts {
                 for e in &ends {
                     for t in ts {
+                        // yq's empty-container slicing rule (#1065) — kept
+                        // out of `slice_owned_value` itself, since that
+                        // function is *also* used by `resolve_slice_expr`
+                        // for assignment targets, where real yq's own
+                        // behavior is a silent no-op (`5 | .[0:1] = 99`
+                        // stays `5`), not this read-path rule.
+                        if S::TAG == EvalTag::Yq && is_yq_slice_empty_container_scalar(t) {
+                            out.push(OwnedValue::Array(Vec::new()));
+                            continue;
+                        }
                         match slice_owned_value(t, *s, *e, optional) {
                             Ok(Some(v)) => out.push(v),
                             Ok(None) => {}
@@ -9799,6 +9827,32 @@ pub(crate) fn owned_bound_to_i64(
     round: fn(f64) -> f64,
 ) -> Result<Option<i64>, EvalError> {
     Ok(SliceBounds::resolved_bound(v)?.map(|f| round(f) as i64))
+}
+
+/// Whether `target` is one of the scalar shapes real yq treats as an empty
+/// container when it's the target of a *read* slice (`.[S:E]`, #1065) —
+/// null, any number representation, or a boolean. Object is deliberately
+/// excluded: real yq's own slicing there follows its internal AST
+/// child-node layout (`{"a":1,"b":2} | .[0:2]` -> `["a",1]`, alternating
+/// keys and values), not a clean "empty container" rule, and isn't
+/// replicated here (#1102). `Array`/`String` are excluded too — those
+/// already slice meaningfully and never reach this check's call sites for
+/// that reason (see [`slice_owned_value`]'s own `Array`/`String` arms).
+///
+/// Deliberately its own free function, not folded into `slice_owned_value`:
+/// that function is *also* used by `resolve_slice_expr` for assignment
+/// targets, where real yq's own behavior is a silent no-op (`5 | .[0:1] =
+/// 99` stays `5`) rather than this read-path rule — verified live, not
+/// assumed, since the two are easy to conflate (#1101).
+pub(crate) fn is_yq_slice_empty_container_scalar(target: &OwnedValue) -> bool {
+    matches!(
+        target,
+        OwnedValue::Null
+            | OwnedValue::Int(_)
+            | OwnedValue::Float(_)
+            | OwnedValue::NumberLiteral(..)
+            | OwnedValue::Bool(_)
+    )
 }
 
 /// Apply a resolved slice directly to an owned value.

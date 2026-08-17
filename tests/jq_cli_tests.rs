@@ -10809,3 +10809,14 @@ fn test_jq_equality_still_widens_int_and_float_950() -> Result<()> {
     assert_eq!(stderr, "");
     Ok(())
 }
+
+/// #1065's yq-only "scalar slices to an empty array" rule must not leak
+/// into jq mode: real jq gives no output for `.[0:1]?` on a number (matches
+/// succinctly's pre-existing, unaffected behavior).
+#[test]
+fn test_jq_slice_number_scalar_still_gives_no_output_1065() -> Result<()> {
+    let (output, code) = run_jq_stdin(".[0:1]?", "5", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "");
+    Ok(())
+}

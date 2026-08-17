@@ -12592,3 +12592,68 @@ fn test_yq_equality_consuming_builtins_agree_with_strict_eq_950() -> Result<()> 
     assert_eq!(out.trim(), "[[2],[2.0],[3]]");
     Ok(())
 }
+
+// ============================================================================
+// yq slicing a non-array/string scalar gives `[]`, not no-output (#1065)
+// ============================================================================
+//
+// Real yq treats a null/number/boolean target as an empty container when
+// it's the target of a read slice (`.[S:E]`) rather than erroring (matching
+// jq's own behavior) or passing null through unchanged. Every case here is
+// pinned against the live real `yq` v4.53.3 binary. Object targets are
+// deliberately excluded (#1065's own follow-up, #1102) -- real yq's own
+// slicing there follows its internal AST child-node layout, not this
+// empty-container rule.
+
+#[test]
+fn test_slice_number_scalar_is_empty_array_1065() -> Result<()> {
+    let (out, code) = run_yq_stdin(".[0:1]?", "5", &["-o", "json"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "[]");
+
+    // Same result without `?` -- yq's own slicing never errors here at all,
+    // unlike jq's.
+    let (out, code) = run_yq_stdin(".[0:1]", "5", &["-o", "json"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "[]");
+    Ok(())
+}
+
+#[test]
+fn test_slice_bool_scalar_is_empty_array_1065() -> Result<()> {
+    let (out, code) = run_yq_stdin(".[0:1]?", "true", &["-o", "json"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "[]");
+    Ok(())
+}
+
+#[test]
+fn test_slice_null_scalar_is_empty_array_1065() -> Result<()> {
+    let (out, code) = run_yq_stdin(".[0:1]?", "null", &["-o", "json"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "[]");
+    Ok(())
+}
+
+/// A document-sourced number (`OwnedValue::NumberLiteral`, not a bare
+/// `Int`/`Float`) must be covered too, not just filter-computed scalars.
+#[test]
+fn test_slice_number_literal_scalar_is_empty_array_1065() -> Result<()> {
+    let (out, code) = run_yq_stdin(".[0:1]?", "1.500", &["-o", "json"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "[]");
+    Ok(())
+}
+
+/// Regression guard: string/array slicing on the read path is unaffected.
+#[test]
+fn test_slice_string_and_array_unaffected_1065() -> Result<()> {
+    let (out, code) = run_yq_stdin(".[0:1]", r#""hello""#, &["-o", "json"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "\"h\"");
+
+    let (out, code) = run_yq_stdin(".[0:1]", "[1,2,3]", &["-o", "json", "-I0"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "[1]");
+    Ok(())
+}

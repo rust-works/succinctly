@@ -26,9 +26,10 @@ use super::document::{
 };
 use super::eval::{
     apply_compare_op, eval as full_eval, format_owned, index_one_owned as index_owned_by_key,
-    literal_to_owned, needs_path_context, numeric_display_string, numeric_key_to_index,
-    owned_bound_to_i64, owned_value_to_json, slice_owned_value, tonumber_from_str, Control,
-    EvalError, EvalSemantics, EvalTag, JqSemantics, QueryResult, YqSemantics,
+    is_yq_slice_empty_container_scalar, literal_to_owned, needs_path_context,
+    numeric_display_string, numeric_key_to_index, owned_bound_to_i64, owned_value_to_json,
+    slice_owned_value, tonumber_from_str, Control, EvalError, EvalSemantics, EvalTag, JqSemantics,
+    QueryResult, YqSemantics,
 };
 use super::expr::{Builtin, Expr, FormatType};
 use super::slice::{slice_str, SliceBounds};
@@ -3069,7 +3070,7 @@ fn eval_slice_expr<S: EvalSemantics, V: DocumentValue>(
             for s in &starts {
                 for e in &ends {
                     for t in ts {
-                        match slice_one_generic::<V>(t.clone(), *s, *e, optional) {
+                        match slice_one_generic::<S, V>(t.clone(), *s, *e, optional) {
                             GenericResult::Owned(v) => out.push(v),
                             GenericResult::None => {}
                             GenericResult::Error(e) => return GenericResult::Error(e),
@@ -3083,6 +3084,14 @@ fn eval_slice_expr<S: EvalSemantics, V: DocumentValue>(
             for s in &starts {
                 for e in &ends {
                     for t in ts {
+                        // yq's empty-container slicing rule (#1065) — kept
+                        // out of `slice_owned_value` itself; see
+                        // `is_yq_slice_empty_container_scalar`'s doc
+                        // comment for why.
+                        if S::TAG == EvalTag::Yq && is_yq_slice_empty_container_scalar(t) {
+                            out.push(OwnedValue::Array(Vec::new()));
+                            continue;
+                        }
                         match slice_owned_value(t, *s, *e, optional) {
                             Ok(Some(v)) => out.push(v),
                             Ok(None) => {}
@@ -3139,7 +3148,11 @@ fn eval_slice_bound<S: EvalSemantics, V: DocumentValue>(
 /// non-generic evaluator. Always returns owned, since slicing always
 /// constructs a fresh value; parallels `index_one_generic` returning `One` or
 /// `Owned`.
-fn slice_one_generic<V: DocumentValue>(
+///
+/// Only called from `eval_slice_expr`'s *read* path, never for an
+/// assignment target — no `S`-gated equivalent of `is_yq_slice_empty_container_scalar`'s
+/// caution about `resolve_slice_expr` applies here.
+fn slice_one_generic<S: EvalSemantics, V: DocumentValue>(
     target: V,
     start: Option<i64>,
     end: Option<i64>,
@@ -3151,6 +3164,21 @@ fn slice_one_generic<V: DocumentValue>(
         return GenericResult::Owned(OwnedValue::Array(
             items[range].iter().map(to_owned).collect(),
         ));
+    }
+    // yq's empty-container slicing rule (#1065) — see
+    // `is_yq_slice_empty_container_scalar`'s doc comment for the full
+    // rationale and why Object is excluded. Checked before the jq-only
+    // `is_null` arm below so it wins under yq mode. `as_i64`/`as_f64`, not
+    // `number_literal` — the latter is `None` for plenty of legitimate
+    // numbers (ints, or floats with no safe literal spelling to preserve,
+    // #387/#966/#918), so it can't stand in for "is this a number".
+    if S::TAG == EvalTag::Yq
+        && (target.is_null()
+            || target.as_bool().is_some()
+            || target.as_i64().is_some()
+            || target.as_f64().is_some())
+    {
+        return GenericResult::Owned(OwnedValue::Array(Vec::new()));
     }
     if target.is_null() {
         return GenericResult::Owned(OwnedValue::Null);
