@@ -12753,3 +12753,114 @@ fn test_slice_owned_target_scalar_is_empty_array_1065() -> Result<()> {
     assert_eq!(out.trim(), "[]");
     Ok(())
 }
+
+// ============================================================================
+// yq assigning through a scalar slice target is a silent no-op (#1101)
+// ============================================================================
+//
+// Real yq's `.[S:E] = v` / `.[S:E] |= f` / `.[S:E] += v` / `del(.[S:E])`
+// silently leave the document untouched on a null/number/boolean target --
+// confirmed live against real yq v4.53.3, including the surprising detail
+// that the RHS/filter is never even evaluated (`5 | .[0:1] += (1/0)` stays
+// `5` with no division-by-zero error). `-=`/`*=` are NOT no-ops -- they
+// error instead, with Go-internal-looking messages this crate deliberately
+// does not replicate (not a stable compatibility target). Object, string,
+// and array targets are deliberately unaffected: succinctly's own working
+// array/string slice-assignment is preserved rather than matched to what
+// looks like a real-yq gap rather than a real-yq rule (see
+// `is_yq_scalar_slice_assign_target`'s doc comment for the full premise
+// correction -- the no-op turned out not to be scalar-specific in real yq
+// at all, but this fix stays scoped to scalars anyway).
+
+#[test]
+fn test_slice_assign_number_scalar_is_noop_1101() -> Result<()> {
+    let (out, code) = run_yq_stdin(".[0:1] = 99", "5", &["-o", "json"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "5");
+    Ok(())
+}
+
+#[test]
+fn test_slice_update_number_scalar_is_noop_1101() -> Result<()> {
+    let (out, code) = run_yq_stdin(".[0:1] |= 99", "5", &["-o", "json"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "5");
+    Ok(())
+}
+
+#[test]
+fn test_slice_compound_add_number_scalar_is_noop_1101() -> Result<()> {
+    let (out, code) = run_yq_stdin(".[0:1] += 99", "5", &["-o", "json"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "5");
+    Ok(())
+}
+
+#[test]
+fn test_slice_del_number_scalar_is_noop_1101() -> Result<()> {
+    let (out, code) = run_yq_stdin("del(.[0:1])", "5", &["-o", "json"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "5");
+    Ok(())
+}
+
+#[test]
+fn test_slice_assign_bool_and_null_scalar_is_noop_1101() -> Result<()> {
+    let (out, code) = run_yq_stdin(".[0:1] = 99", "true", &["-o", "json"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "true");
+
+    let (out, code) = run_yq_stdin(".[0:1] = 99", "null", &["-o", "json"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "null");
+    Ok(())
+}
+
+/// The RHS/filter is never evaluated for the no-op cases -- a side-effecting
+/// or erroring RHS produces no observable effect, matching real yq exactly.
+#[test]
+fn test_slice_assign_scalar_noop_never_evaluates_rhs_1101() -> Result<()> {
+    let (out, code) = run_yq_stdin(".[0:1] = (1/0)", "5", &["-o", "json"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "5");
+
+    let (out, code) = run_yq_stdin(".[0:1] |= (1/0)", "5", &["-o", "json"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "5");
+
+    let (out, code) = run_yq_stdin(".[0:1] += (1/0)", "5", &["-o", "json"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "5");
+    Ok(())
+}
+
+/// `-=`/`*=` are NOT no-ops on a scalar slice target -- real yq errors on
+/// both (with odd, unreplicated messages); succinctly's own pre-existing
+/// error is left unchanged rather than matched to that wording.
+#[test]
+fn test_slice_sub_and_mul_number_scalar_still_errors_1101() -> Result<()> {
+    let (_out, _stderr, code) = run_yq_stdin_with_stderr(".[0:1] -= 99", "5", &["-o", "json"])?;
+    assert_eq!(code, 1);
+
+    let (_out, _stderr, code) = run_yq_stdin_with_stderr(".[0:1] *= 99", "5", &["-o", "json"])?;
+    assert_eq!(code, 1);
+    Ok(())
+}
+
+/// Regression guard: succinctly's own array/string slice-assignment is
+/// unaffected by this scalar-only scope decision.
+#[test]
+fn test_slice_assign_string_and_array_unaffected_1101() -> Result<()> {
+    let (_out, stderr, code) =
+        run_yq_stdin_with_stderr(r#".[0:1] = "X""#, r#""hello""#, &["-o", "json"])?;
+    assert_eq!(code, 1);
+    assert!(
+        stderr.contains("cannot update string slices") || stderr.contains("Cannot update string"),
+        "stderr: {stderr:?}"
+    );
+
+    let (out, code) = run_yq_stdin(".[0:1] = [9]", "[1,2,3]", &["-o", "json", "-I0"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "[9,2,3]");
+    Ok(())
+}
