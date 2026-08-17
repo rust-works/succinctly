@@ -9736,6 +9736,61 @@ fn test_implicit_key_same_line_value_comment_unaffected_by_795_fallback_dom_path
 }
 
 // ============================================================================
+// Explicit key's own comment must keep an anchor/tag on a deferred-absent
+// value (#1113)
+// ============================================================================
+//
+// #765/#795's own "key comment stands alone" branch (immediately above)
+// never consulted the deferred value's anchor/tag before returning -- fine
+// for the plain case (nothing to lose), but silently dropped an anchor or
+// tag when the explicit key's comment coincided with one. Any `*alias`
+// elsewhere in the document referencing that anchor now resolves to
+// nothing. #1077 already fixed the sibling (no key-comment) branch for the
+// exact same shape; these are the explicit-key-comment counterpart.
+
+/// The issue's own repro: an explicit key's comment, paired with a deferred
+/// value that resolves absent but carries an anchor -- the anchor must
+/// survive alongside the comment.
+#[test]
+fn test_explicit_key_comment_keeps_anchor_on_deferred_absent_value_1113() -> Result<()> {
+    let (out, code) = run_yq_stdin(".", "? k # key comment\n: &anc\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "k: &anc # key comment\n");
+    Ok(())
+}
+
+/// Same shape, but with a sibling field following instead of EOF ending the
+/// document right after the deferred anchor.
+#[test]
+fn test_explicit_key_comment_keeps_anchor_on_deferred_absent_value_with_sibling_1113() -> Result<()>
+{
+    let (out, code) = run_yq_stdin(".", "? k # key comment\n: &anc\nb: 1\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "k: &anc # key comment\nb: 1\n");
+    Ok(())
+}
+
+/// Same bug class, an explicit tag instead of an anchor.
+#[test]
+fn test_explicit_key_comment_keeps_tag_on_deferred_absent_value_1113() -> Result<()> {
+    let (out, code) = run_yq_stdin(".", "? k # key comment\n: !!str\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "k: !!str # key comment\n");
+    Ok(())
+}
+
+/// Both an anchor and a tag on the deferred-absent value -- both must
+/// survive, anchor before tag, matching `write_deferred_value`'s own
+/// ordering (same as #1077's sibling-branch regression guard).
+#[test]
+fn test_explicit_key_comment_keeps_anchor_and_tag_on_deferred_absent_value_1113() -> Result<()> {
+    let (out, code) = run_yq_stdin(".", "? k # key comment\n: &anc !!str\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "k: &anc !!str # key comment\n");
+    Ok(())
+}
+
+// ============================================================================
 // Merge-flag suffixes on `*`/`*=` (#713)
 // ============================================================================
 

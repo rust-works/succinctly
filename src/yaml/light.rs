@@ -1713,16 +1713,27 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                                 true,
                             )?;
                             write_line_comment(out, value.line_comment_raw())?;
-                        } else if let Some(kc) = field
-                            .key_cursor()
-                            .line_comment_raw()
-                            .filter(|_| is_deferred_value_absent(&value))
+                        } else if is_deferred_value_absent(&value)
+                            && field.key_cursor().line_comment_raw().is_some()
                         {
                             // The deferred value materialized as nothing
                             // at all - the key's own comment stands
                             // alone with no value token, matching real
-                            // yq (#765).
-                            write_line_comment(out, Some(kc))?;
+                            // yq (#765). The value can still carry an
+                            // anchor/tag though (an explicit key's own
+                            // comment, `? k # c\n: &anc`), which must be
+                            // written before the key's comment (#1113) --
+                            // `write_deferred_value` is a no-op beyond
+                            // that since the value is absent.
+                            write_deferred_value(
+                                out,
+                                &value,
+                                indent,
+                                indent_spaces,
+                                unit,
+                                sort_keys,
+                            )?;
+                            write_line_comment(out, field.key_cursor().line_comment_raw())?;
                         } else {
                             // #1077: a deferred value that materializes as
                             // nothing at all writes no value token here
