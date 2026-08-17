@@ -4362,6 +4362,66 @@ fn test_number_literal_overflow_identity_echoes_mantissa_via_cli_1087() -> Resul
     Ok(())
 }
 
+/// #1099: the symmetric *underflow* case (a literal whose magnitude
+/// underflows `f64` to exactly `0.0`, e.g. `1e-400`) used to lose the
+/// mantissa entirely (`0E-400` instead of `1E-400`) -- `value == 0.0` can't
+/// tell a genuinely-zero-mantissa literal apart from a nonzero one that
+/// simply underflowed, so `format_number_jq_compat` used to always spell
+/// the mantissa as `"0"`. Verified live against jq 1.7.1.
+#[test]
+fn test_number_literal_underflow_preserves_mantissa_via_cli_1099() -> Result<()> {
+    let (output, code) = run_jq_stdin(".", "1e-400", &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "1E-400");
+
+    let (output, code) = run_jq_stdin(".", "-1e-400", &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "-1E-400");
+
+    let (output, code) = run_jq_stdin(".", "12.34e-400", &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "1.234E-399");
+
+    let (output, code) = run_jq_stdin(".", "0.5e-400", &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "5E-401");
+
+    let (output, code) = run_jq_stdin(".", "100.5e-400", &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "1.005E-398");
+
+    Ok(())
+}
+
+/// A genuinely-zero-mantissa literal at an extreme negative exponent is
+/// unaffected by #1099's fix -- regression guard alongside the nonzero
+/// case above.
+#[test]
+fn test_number_literal_zero_mantissa_extreme_exponent_still_zero_1099() -> Result<()> {
+    let (output, code) = run_jq_stdin(".", "0e-400", &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "0E-400");
+
+    let (output, code) = run_jq_stdin(".", "-0e-400", &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "-0E-400");
+
+    Ok(())
+}
+
+/// Unlike overflow (which falls back to `DBL_MAX` text past a documented
+/// exponent-magnitude ceiling), underflow has no such ceiling -- verified
+/// live against jq 1.7.1: `1e-1000000000` (exponent magnitude *at* the
+/// overflow ceiling) still prints the literal mantissa unchanged.
+#[test]
+fn test_number_literal_underflow_has_no_ceiling_unlike_overflow_1099() -> Result<()> {
+    let (output, code) = run_jq_stdin(".", "1e-1000000000", &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "1E-1000000000");
+
+    Ok(())
+}
+
 /// `eval_owned_expr`/`eval_owned_input` (backing `reduce`/`foreach`/`as $x`
 /// variable binding) and `with_entries`'s `owned_to_json_bytes` each have
 /// their own serialize-and-reparse bridge, separate from `eval_generic`'s

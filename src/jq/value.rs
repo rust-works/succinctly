@@ -219,6 +219,16 @@ pub fn format_number_jq_compat(raw: &[u8]) -> String {
     // For other cases, use normalized scientific notation
     // jq normalizes mantissa to have one digit before decimal point
     if value == 0.0 {
+        // `value == 0.0` is true both for a genuinely-zero-mantissa literal
+        // (`0e-400`) and for a *nonzero*-mantissa literal whose magnitude
+        // simply underflowed `f64` during parsing (`1e-400`, far below
+        // `f64::MIN_POSITIVE`) -- the two can't be told apart from `value`
+        // alone (#1099). Check the mantissa's own source digits before
+        // falling back to the zero-mantissa spelling.
+        let mantissa_text = s[..exp_pos].strip_prefix('-').unwrap_or(&s[..exp_pos]);
+        if mantissa_text.bytes().any(|b| b != b'0' && b != b'.') {
+            return format_underflow_literal_mantissa(s, exp_pos, value.is_sign_negative());
+        }
         // `value == 0.0` is true for -0.0 too (IEEE 754), so a sign check
         // is needed to avoid dropping it -- real jq keeps both the sign and
         // the (leading-zero-stripped) source exponent for a zero mantissa,
@@ -263,22 +273,29 @@ fn assemble_scientific(sign: &str, mantissa_str: &str, exp: i64) -> String {
     format!("{sign}{mantissa_str}E{exp_sign}{exp}")
 }
 
-/// Renormalize an overflowed literal's own mantissa digits into jq's
-/// one-digit-before-the-point scientific form, entirely via string
-/// manipulation on `s` rather than the finite path's `log10`/`pow` on the
-/// (here, non-finite) parsed value -- see the call site above for why. `s`
-/// is the full literal text and `exp_pos` the byte index of its `e`/`E`;
-/// `negative` is `value.is_sign_negative()` from the caller, which (unlike
-/// re-deriving a sign from `s` itself) is correct for `-0.0`-style edge
-/// cases too and matches this module's usual `if value < 0.0` idiom.
+/// Shift a literal's own mantissa digits (the text before `exp_pos`, i.e.
+/// before `e`/`E`) into jq's one-digit-before-the-point normalized form,
+/// and fold that shift into the literal's own written exponent -- returns
+/// `(mantissa_str, new_exp)`. Entirely via string manipulation on `s`
+/// rather than `log10`/`pow` on the parsed value, since the caller only
+/// reaches here when the parsed value has already lost the precision this
+/// exists to recover (`+/-infinity` on overflow, exactly `0.0` on
+/// underflow).
 ///
-/// Oracle-verified against real jq (issue #930): `1e400` -> `1E+400`,
-/// `123e400` -> `1.23E+402`, `12.34e400` -> `1.234E+401`, `0.5e400` ->
-/// `5E+399`, `100e400` -> `1.00E+402` (trailing zeros preserved, matching
-/// this module's general trailing-zero rule), and beyond jq's own
-/// literal-preservation ceiling, DBL_MAX text (`1e1000000000` ->
-/// `1.7976931348623157e+308`, matching a computed infinity).
-fn format_overflow_literal_mantissa(s: &str, exp_pos: usize, negative: bool) -> String {
+/// Shared by [`format_overflow_literal_mantissa`] and
+/// [`format_underflow_literal_mantissa`] (#1099) -- the shift math is
+/// identical whether the literal's written exponent is enormous-positive
+/// (overflow) or enormous-negative (underflow); only what each caller does
+/// with `new_exp` afterward differs (overflow caps to infinity text past a
+/// ceiling; underflow has no such ceiling, oracle-verified on its own doc
+/// comment).
+///
+/// The exponent digit string can itself be longer than `i64` can hold
+/// (e.g. `1e99999999999999999999`) -- an out-of-range parse saturates to
+/// `i64::MAX`/`MIN` by sign rather than erroring, since any such value is
+/// already certain to be past whichever ceiling (or lack thereof) the
+/// caller applies.
+fn normalize_extreme_literal_mantissa(s: &str, exp_pos: usize) -> (String, i64) {
     // `dump_truncated`'s whole design keeps preview cost independent of the
     // value's own size (see its doc comment) - a document-controlled
     // mantissa of unbounded length must not turn into unbounded work here
@@ -290,7 +307,6 @@ fn format_overflow_literal_mantissa(s: &str, exp_pos: usize, negative: bool) -> 
     // actually get rendered.
     const MAX_RENDERED_MANTISSA_DIGITS: usize = 32;
 
-    let sign = if negative { "-" } else { "" };
     let mantissa = s[..exp_pos].strip_prefix('-').unwrap_or(&s[..exp_pos]);
     let (int_part, frac_part) = mantissa.split_once('.').unwrap_or((mantissa, ""));
 
@@ -307,9 +323,10 @@ fn format_overflow_literal_mantissa(s: &str, exp_pos: usize, negative: bool) -> 
                     after[..after.len().min(MAX_RENDERED_MANTISSA_DIGITS)].to_string(),
                 )
             }
-            // An all-zero mantissa (`0.0e400`) parses to a finite `0.0` and
-            // never reaches this function.
-            None => unreachable!("overflow literal mantissa is provably nonzero"),
+            // An all-zero mantissa (`0.0e400`/`0.0e-400`) parses to a
+            // finite `0.0` and never reaches either caller -- both gate on
+            // a genuinely nonzero mantissa digit existing first.
+            None => unreachable!("caller guarantees a nonzero mantissa digit exists"),
         }
     } else {
         // Mantissa >= 1: shift left past every extra integer-part digit.
@@ -328,11 +345,6 @@ fn format_overflow_literal_mantissa(s: &str, exp_pos: usize, negative: bool) -> 
         (int_part.len() as i64 - 1, &int_part[..1], rest)
     };
 
-    // The exponent digit string can itself be longer than `i32`/`i64` can
-    // hold (e.g. `1e99999999999999999999`) -- any such value is already
-    // certain to be past jq's literal-preservation ceiling below, so an
-    // out-of-range parse can saturate to `i64::MAX`/`MIN` rather than being
-    // treated as an error.
     let exp_text = &s[exp_pos + 1..];
     let parsed_exp: i64 = exp_text.parse().unwrap_or_else(|_| {
         if exp_text.trim_start_matches('+').starts_with('-') {
@@ -343,6 +355,32 @@ fn format_overflow_literal_mantissa(s: &str, exp_pos: usize, negative: bool) -> 
     });
     let new_exp = parsed_exp.saturating_add(shift);
 
+    let mantissa_str = if rest.is_empty() {
+        leading.to_string()
+    } else {
+        format!("{leading}.{rest}")
+    };
+    (mantissa_str, new_exp)
+}
+
+/// Renormalize an overflowed literal's own mantissa digits into jq's
+/// one-digit-before-the-point scientific form -- see
+/// [`normalize_extreme_literal_mantissa`] for the shared shift math. `s` is
+/// the full literal text and `exp_pos` the byte index of its `e`/`E`;
+/// `negative` is `value.is_sign_negative()` from the caller, which (unlike
+/// re-deriving a sign from `s` itself) is correct for `-0.0`-style edge
+/// cases too and matches this module's usual `if value < 0.0` idiom.
+///
+/// Oracle-verified against real jq (issue #930): `1e400` -> `1E+400`,
+/// `123e400` -> `1.23E+402`, `12.34e400` -> `1.234E+401`, `0.5e400` ->
+/// `5E+399`, `100e400` -> `1.00E+402` (trailing zeros preserved, matching
+/// this module's general trailing-zero rule), and beyond jq's own
+/// literal-preservation ceiling, DBL_MAX text (`1e1000000000` ->
+/// `1.7976931348623157e+308`, matching a computed infinity).
+fn format_overflow_literal_mantissa(s: &str, exp_pos: usize, negative: bool) -> String {
+    let sign = if negative { "-" } else { "" };
+    let (mantissa_str, new_exp) = normalize_extreme_literal_mantissa(s, exp_pos);
+
     // jq's own literal-preserving text (as opposed to a computed value's
     // DBL_MAX text) only goes up to this exponent magnitude (decNumber's
     // limit) -- oracle-verified: `1e999999999` keeps `1E+999999999`,
@@ -351,11 +389,29 @@ fn format_overflow_literal_mantissa(s: &str, exp_pos: usize, negative: bool) -> 
         return infinite_float_preview_text(negative).to_string();
     }
 
-    let mantissa_str = if rest.is_empty() {
-        leading.to_string()
-    } else {
-        format!("{leading}.{rest}")
-    };
+    assemble_scientific(sign, &mantissa_str, new_exp)
+}
+
+/// Renormalize an underflowed literal's own mantissa digits into jq's
+/// one-digit-before-the-point scientific form (#1099) -- see
+/// [`normalize_extreme_literal_mantissa`] for the shared shift math, and
+/// [`format_overflow_literal_mantissa`] for the symmetric overflow case.
+///
+/// A literal whose magnitude underflows `f64` to exactly `0.0` (nonzero
+/// mantissa, deeply negative exponent) can't be told apart from a
+/// genuinely-zero-mantissa literal by looking at the parsed value alone --
+/// both are `0.0`. The caller (`format_number_jq_compat`'s `value == 0.0`
+/// branch) already checked the mantissa's own source digits before calling
+/// this, so `s`'s mantissa is guaranteed nonzero here.
+///
+/// Oracle-verified against real jq: `1e-400` -> `1E-400`, `12.34e-400` ->
+/// `1.234E-399`, `0.5e-400` -> `5E-401`, `100.5e-400` -> `1.005E-398`.
+/// Unlike overflow, underflow has **no** ceiling -- `1e-1000000000`
+/// (exponent magnitude *at* the overflow ceiling) still prints
+/// `1E-1000000000` unchanged, not a fallback to plain `0`.
+fn format_underflow_literal_mantissa(s: &str, exp_pos: usize, negative: bool) -> String {
+    let sign = if negative { "-" } else { "" };
+    let (mantissa_str, new_exp) = normalize_extreme_literal_mantissa(s, exp_pos);
     assemble_scientific(sign, &mantissa_str, new_exp)
 }
 
