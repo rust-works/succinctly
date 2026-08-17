@@ -5342,8 +5342,16 @@ pub(crate) fn numeric_display_string<S: EvalSemantics>(value: &OwnedValue) -> St
         // contradiction: confirmed live, `(1e10*2) | tostring` gives
         // `"2e+10"` while `[.a]`'s own array-wrapped output keeps
         // `100000000000000000000.0` for an i64-overflow scalar (#1054).
+        //
+        // `format_float_yq_yaml`, not `format_float_yq`: a stringified
+        // value is never re-parsed back into the document, so there's no
+        // type-ambiguity-on-round-trip concern to preserve a forced `.0`
+        // for -- `format_float_yq`'s ordinary-magnitude formatter
+        // (`format_float_with_fraction`) is for exactly that concern, and
+        // wrongly forces `.0` here: confirmed live, `(50.0*2) | tostring`
+        // is `"100"` in real yq, not `"100.0"` (caught by review).
         if S::TAG == EvalTag::Yq {
-            return crate::yaml::format_float_yq(*f);
+            return crate::yaml::format_float_yq_yaml(*f);
         }
     }
     value.number_str().expect("numeric variant").into_owned()
@@ -6166,16 +6174,7 @@ fn builtin_tostring<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     _optional: bool,
 ) -> QueryResult<'_, W> {
     let owned = to_owned(&value);
-    let s = match owned {
-        OwnedValue::String(s) => s,
-        OwnedValue::Null => "null".to_string(),
-        OwnedValue::Bool(true) => "true".to_string(),
-        OwnedValue::Bool(false) => "false".to_string(),
-        OwnedValue::Int(n) => format!("{n}"),
-        OwnedValue::Float(_) | OwnedValue::NumberLiteral(..) => numeric_display_string::<S>(&owned),
-        OwnedValue::Array(_) | OwnedValue::Object(_) => owned_value_to_json::<S>(&owned),
-    };
-    QueryResult::Owned(OwnedValue::String(s))
+    QueryResult::Owned(OwnedValue::String(owned_to_string::<S>(&owned)))
 }
 
 /// Builtin: tonumber - convert string to number
@@ -14371,13 +14370,34 @@ fn eval_reduce<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// nesting chain of depth *d* paid a full serialize-and-reparse of an
 /// O(*d*)-sized subtree at each of its *d* nodes — O(*d*²) work to resolve
 /// what is, for these shapes, an O(1) lookup (#491).
-fn eval_owned_fast_path(
+///
+/// `Builtin::ToString` (`tostring`) is also fast-pathed here, but for
+/// correctness, not just speed (#1054): this is the JSON-input/`-n`-mode
+/// sibling of `eval_generic.rs`'s `eval_on_owned`, which has the same
+/// bypass for the same reason -- without it, `EXPR | tostring` on a
+/// genuinely computed value (e.g. `(1e10*2)`) serializes through
+/// `to_json_for_reindex`'s decimal-only float spelling first, reparses as
+/// a document-sourced-*looking* `NumberLiteral`, and echoes that baked
+/// text verbatim per #1008's literal-preservation rule -- permanently
+/// losing the scientific-notation spelling real yq applies to a computed
+/// float before that round trip ever has a chance to run. `owned_to_string`
+/// is the same function `builtin_tostring` calls directly, so this is
+/// unobservable except in speed for every other value shape.
+///
+/// Narrow on purpose, not exhaustive -- see `eval_on_owned`'s own doc
+/// comment (`eval_generic.rs`) for the exact limitation (only the
+/// immediately-next bare `tostring` is covered) and #1134, which tracks
+/// the general fix neither sibling attempts.
+fn eval_owned_fast_path<S: EvalSemantics>(
     expr: &Expr,
     input: &OwnedValue,
     optional: bool,
 ) -> Option<Result<Option<OwnedValue>, EvalError>> {
     match expr {
         Expr::Identity => Some(Ok(Some(input.clone()))),
+        Expr::Builtin(Builtin::ToString) => {
+            Some(Ok(Some(OwnedValue::String(owned_to_string::<S>(input)))))
+        }
         Expr::Field(name) => Some(match input {
             OwnedValue::Object(map) => Ok(Some(map.get(name).cloned().unwrap_or(OwnedValue::Null))),
             OwnedValue::Null => Ok(Some(OwnedValue::Null)),
@@ -14431,7 +14451,7 @@ fn eval_owned_expr_ctrl<S: EvalSemantics>(
     input: &OwnedValue,
     optional: bool,
 ) -> Result<OwnedValue, Control> {
-    if let Some(result) = eval_owned_fast_path(expr, input, optional) {
+    if let Some(result) = eval_owned_fast_path::<S>(expr, input, optional) {
         return result
             .map(|v| v.unwrap_or(OwnedValue::Null))
             .map_err(Control::Error);
@@ -14528,7 +14548,7 @@ fn eval_owned_input<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     input: &OwnedValue,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    if let Some(result) = eval_owned_fast_path(expr, input, optional) {
+    if let Some(result) = eval_owned_fast_path::<S>(expr, input, optional) {
         return match result {
             Ok(Some(v)) => QueryResult::Owned(v),
             Ok(None) => QueryResult::None,
@@ -24588,7 +24608,7 @@ mod tests {
         ];
 
         for (expr, input, optional) in cases {
-            let fast = eval_owned_fast_path(&expr, &input, optional)
+            let fast = eval_owned_fast_path::<JqSemantics>(&expr, &input, optional)
                 .expect("via_cursor's shapes are exactly the ones eval_owned_fast_path handles");
             let reference = via_cursor(&expr, &input, optional);
             assert_eq!(
