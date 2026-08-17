@@ -5879,13 +5879,26 @@ fn format_urid<S: EvalSemantics>(value: &OwnedValue, optional: bool) -> Result<S
             // Malformed escape (#1138): real yq errors rather than
             // silently passing the `%` through, quoting `%` plus
             // whatever 0, 1, or 2 bytes actually follow it (up to end of
-            // string) -- `(i + 3).min(bytes.len())` covers all three
-            // lengths with one expression, matching the boundary
-            // `EvalError::urid_invalid_escape`'s own doc comment
-            // verifies live.
-            let end = (i + 3).min(bytes.len());
-            let escape = String::from_utf8_lossy(&bytes[i..end]);
-            return Err(EvalError::urid_invalid_escape(&escape));
+            // string). `i` is always a valid char boundary here -- `%` is
+            // ASCII (0x25), and no UTF-8 continuation byte can equal an
+            // ASCII value, so `bytes[i] == b'%'` being true is on its own
+            // sufficient proof `i` doesn't sit inside another character --
+            // so `s[i..]` is a valid `&str` to walk char-wise. Widening to
+            // the next full character (rather than a fixed 3-byte window)
+            // when the raw 2-byte cutoff would otherwise split one avoids
+            // corrupting it into a single lossy replacement character;
+            // see `EvalError::urid_invalid_escape`'s own doc comment for
+            // why this is a deliberate, documented divergence from real
+            // yq's raw-byte hex-escaping for that specific case (#1216).
+            let rest = &s[i..];
+            let mut escape_len = 0;
+            for ch in rest.chars() {
+                if escape_len >= 3 {
+                    break;
+                }
+                escape_len += ch.len_utf8();
+            }
+            return Err(EvalError::urid_invalid_escape(&rest[..escape_len]));
         }
         // Not a percent sign at all, just copy the byte
         result.push(bytes[i]);

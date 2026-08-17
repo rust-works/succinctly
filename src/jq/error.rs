@@ -613,15 +613,29 @@ impl EvalError {
 
     /// `invalid URL escape "<escape>"` (#1138).
     ///
-    /// Raised by `@urid` (yq mode only, like [`Self::base64_illegal_data`]
-    /// above -- jq has no `@urid` at all) when a `%` isn't immediately
-    /// followed by two valid hex digits. `escape` is `%` plus whatever 0,
-    /// 1, or 2 bytes actually follow it in the input (not validated --
-    /// confirmed live against yq v4.53.3 that both bytes are echoed
-    /// verbatim even when only one, or neither, is a valid hex digit, and
-    /// that a literal `%` immediately after the first one is included
-    /// unchanged rather than treated as a new escape's start: `"x%y%zz" |
-    /// @urid` -> `invalid URL escape "%y%"`, not `"%y"`).
+    /// Raised by `@urid` when a `%` isn't immediately followed by two
+    /// valid hex digits. Unlike [`Self::base64_illegal_data`] above --
+    /// genuinely yq-only, since jq's own real `@base64d` has independently
+    /// verified wording to diverge against -- `@urid` is a succinctly
+    /// extension with **no jq analogue at all**, so there's no competing
+    /// jq-mode wording to preserve: this fires identically in both jq and
+    /// yq mode (`format_urid`'s malformed-escape check has no `S::TAG`
+    /// branch).
+    ///
+    /// `escape` is `%` plus whatever 0, 1, or 2 bytes actually follow it
+    /// in the input (not validated -- confirmed live against yq v4.53.3
+    /// that both bytes are echoed verbatim even when only one, or
+    /// neither, is a valid hex digit, and that a literal `%` immediately
+    /// after the first one is included unchanged rather than treated as a
+    /// new escape's start: `"x%y%zz" | @urid` -> `invalid URL escape
+    /// "%y%"`, not `"%y"`). The `Debug`-quoted `{escape:?}` below matches
+    /// real yq's own Go-style escaping for embedded `"`/`\`/control
+    /// characters exactly (confirmed live: `%"y` -> `%\"y`, `%\y` ->
+    /// `%\\y`, a literal tab -> `%\ty`) -- but for a multi-byte UTF-8
+    /// character split by the raw 2-byte cutoff, the caller widens to the
+    /// whole character rather than corrupting it into U+FFFD, which is
+    /// *not* a byte-for-byte oracle match (real yq hex-escapes the raw,
+    /// truncated bytes instead, e.g. `\xe4\xb8`) -- filed as #1216.
     pub fn urid_invalid_escape(escape: &str) -> Self {
         Self::new(format!("invalid URL escape {escape:?}"))
     }
