@@ -13789,6 +13789,10 @@ fn test_1167_object_array_merge_and_string_repeat_unchanged() -> Result<()> {
     assert_eq!(code, 0);
     assert_eq!(output.trim(), r#""ababab""#);
 
+    let (output, code) = run_yq_stdin(r#"3 * "ab""#, "null", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#""ababab""#);
+
     let (output, code) = run_yq_stdin("null * {\"a\":1}", "null", &["-o=json", "-I=0"])?;
     assert_eq!(code, 0);
     assert_eq!(output.trim(), r#"{"a":1}"#);
