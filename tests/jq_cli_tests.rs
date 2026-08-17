@@ -4410,14 +4410,56 @@ fn test_number_literal_zero_mantissa_extreme_exponent_still_zero_1099() -> Resul
 }
 
 /// Unlike overflow (which falls back to `DBL_MAX` text past a documented
-/// exponent-magnitude ceiling), underflow has no such ceiling -- verified
-/// live against jq 1.7.1: `1e-1000000000` (exponent magnitude *at* the
-/// overflow ceiling) still prints the literal mantissa unchanged.
+/// exponent-magnitude ceiling), this crate imposes no *deliberate* ceiling
+/// on underflow -- verified live against jq 1.7.1: `1e-1000000000`
+/// (exponent magnitude *at* the overflow ceiling) still prints the literal
+/// mantissa unchanged. (Real jq itself breaks down for magnitudes beyond
+/// ~1,147,483,647 -- an apparent internal bug in its own decNumber, not
+/// replicated here; see `format_underflow_literal_mantissa`'s doc comment.)
 #[test]
 fn test_number_literal_underflow_has_no_ceiling_unlike_overflow_1099() -> Result<()> {
     let (output, code) = run_jq_stdin(".", "1e-1000000000", &["-c"])?;
     assert_eq!(code, 0);
     assert_eq!(output.trim(), "1E-1000000000");
+
+    Ok(())
+}
+
+/// Code review finding on #1099's own PR: the exponent digit string was
+/// parsed at `i32` width for dispatch (`exp == 0` / `(-5..0)` fast-path
+/// checks), and an out-of-`i32`-range exponent silently became `0` via
+/// `.unwrap_or(0)` -- misrouting into the "eliminate exponent" fast path
+/// *before* the mantissa-preserving logic above ever ran, reintroducing
+/// #1099's exact original symptom one exponent-digit past `i32::MIN`
+/// (`-2147483648`). Verified live: real jq already falls into its own
+/// ~1.147B breakdown by this magnitude (see the no-ceiling test above), so
+/// this is a succinctly-only boundary, not oracle-comparable.
+#[test]
+fn test_number_literal_underflow_beyond_i32_exponent_range_1099() -> Result<()> {
+    // One exponent digit past i32::MIN (-2147483648) -- used to silently
+    // dispatch through `exp == 0` and print bare `0`, losing sign,
+    // mantissa, and exponent entirely.
+    let (output, code) = run_jq_stdin(".", "1e-2147483649", &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "1E-2147483649");
+
+    let (output, code) = run_jq_stdin(".", "-1e-2147483649", &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "-1E-2147483649");
+
+    // Right at the (now-irrelevant) old i32 boundary -- must stay correct
+    // too, not just the one-past case.
+    let (output, code) = run_jq_stdin(".", "1e-2147483648", &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "1E-2147483648");
+
+    // Same bug, zero-mantissa side: a genuinely-zero mantissa at an
+    // out-of-i32-range exponent used to also mis-dispatch through
+    // `exp == 0`, wrongly eliminating (rather than preserving) the huge
+    // exponent.
+    let (output, code) = run_jq_stdin(".", "0e-2147483649", &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "0E-2147483649");
 
     Ok(())
 }
