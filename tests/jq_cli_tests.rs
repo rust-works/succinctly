@@ -4565,6 +4565,12 @@ fn test_number_literal_underflow_beyond_i32_exponent_range_1099() -> Result<()> 
 /// `libm::pow(10.0, log10(abs_value).floor())` itself underflows to `0.0`
 /// at the extreme low end of the subnormal range, making
 /// `abs_value / 0.0 = +inf`. Verified live against jq 1.7.1.
+///
+/// CLI-level counterpart to `value.rs`'s
+/// `test_format_number_jq_compat_subnormal_preserves_mantissa_1177` (same
+/// #1099-established pattern: `run_jq_stdin` spawns a subprocess, invisible
+/// to `cargo llvm-cov`, so both an in-process and a CLI-level test exist
+/// for the same fix rather than one being redundant with the other).
 #[test]
 fn test_number_literal_subnormal_preserves_mantissa_1177() -> Result<()> {
     let (output, code) = run_jq_stdin(".", "5e-324", &["-c"])?;

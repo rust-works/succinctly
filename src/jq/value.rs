@@ -239,26 +239,35 @@ pub fn format_number_jq_compat(raw: &[u8]) -> String {
 
     // For other cases, use normalized scientific notation
     // jq normalizes mantissa to have one digit before decimal point
-    if value == 0.0 || value.abs() < f64::MIN_POSITIVE {
-        // `value == 0.0` is true both for a genuinely-zero-mantissa literal
-        // (`0e-400`) and for a *nonzero*-mantissa literal whose magnitude
-        // simply underflowed `f64` during parsing (`1e-400`, far below
-        // `f64::MIN_POSITIVE`) -- the two can't be told apart from `value`
-        // alone (#1099). `format_underflow_literal_mantissa` (and the
-        // shared `normalize_extreme_literal_mantissa` beneath it) tells
-        // them apart from the literal's own source digits.
-        //
-        // `value.abs() < f64::MIN_POSITIVE` (nonzero but *subnormal*, #1177):
-        // the finite `log10`/`pow` renormalization below breaks down at the
-        // extreme low end of the subnormal range -- `libm::pow(10.0,
-        // log10(abs_value).floor())` can itself underflow to exactly `0.0`
-        // (its own result is smaller than the smallest representable
-        // subnormal), making `abs_value / 0.0 = +inf` and rendering the
-        // mantissa as the literal text `"inf"`, which isn't valid JSON.
-        // Routing every subnormal through the same string-based path as
-        // exact-zero underflow sidesteps this entirely: that path derives
-        // the mantissa from `s`'s own source digits, never from `f64`
-        // arithmetic that's already lost precision by this magnitude.
+    //
+    // `!value.is_normal()` -- `value` is already known finite (the
+    // `!value.is_finite()` overflow check above returned first), so this
+    // is exactly "zero or subnormal," covering two distinct situations
+    // that both need the string-based path below instead of the
+    // `log10`/`pow` renormalization that follows it:
+    //
+    // - `value == 0.0`: true both for a genuinely-zero-mantissa literal
+    //   (`0e-400`) and for a *nonzero*-mantissa literal whose magnitude
+    //   simply underflowed `f64` during parsing (`1e-400`, far below
+    //   `f64::MIN_POSITIVE`) -- the two can't be told apart from `value`
+    //   alone (#1099). `format_underflow_literal_mantissa` (and the shared
+    //   `normalize_extreme_literal_mantissa` beneath it) tells them apart
+    //   from the literal's own source digits.
+    // - nonzero but *subnormal* (#1177): the `log10`/`pow` renormalization
+    //   below is already measurably imprecise across most of the subnormal
+    //   range (e.g. `1e-315` mis-renormalizes to a mantissa of
+    //   `10.000000148219696` instead of `1.0`, oracle-verified), and at
+    //   the extreme low end `libm::pow(10.0, log10(abs_value).floor())`
+    //   can itself underflow to exactly `0.0` (its own result is smaller
+    //   than the smallest representable subnormal), making
+    //   `abs_value / 0.0 = +inf` and rendering the mantissa as the literal
+    //   text `"inf"`, which isn't valid JSON at all.
+    //
+    // Routing every subnormal through the same string-based path as
+    // exact-zero underflow sidesteps both: that path derives the mantissa
+    // from `s`'s own source digits, never from `f64` arithmetic that's
+    // already lost precision by this magnitude.
+    if !value.is_normal() {
         return format_underflow_literal_mantissa(s, exp_pos, value.is_sign_negative());
     }
 
@@ -437,9 +446,15 @@ fn format_overflow_literal_mantissa(s: &str, exp_pos: usize, negative: bool) -> 
 /// A literal whose magnitude underflows `f64` to exactly `0.0` (nonzero
 /// mantissa, deeply negative exponent) can't be told apart from a
 /// genuinely-zero-mantissa literal by looking at the parsed value alone --
-/// both are `0.0`. The caller (`format_number_jq_compat`'s `value == 0.0`
-/// branch) already checked the mantissa's own source digits before calling
-/// this, so `s`'s mantissa is guaranteed nonzero here.
+/// both are `0.0`. Unlike an earlier version of this function, the caller
+/// does *not* pre-check the mantissa's own source digits before calling
+/// this -- `normalize_extreme_literal_mantissa` (below) makes that
+/// determination itself and returns `None` for a genuinely all-zero
+/// mantissa, handled explicitly in the `match` below. The single call site
+/// in `format_number_jq_compat` reaches here for both `value == 0.0` (#1099)
+/// and nonzero-but-subnormal `value` (#1177) -- in the subnormal case the
+/// mantissa is always nonzero in practice (a subnormal `f64` can't come
+/// from an all-zero-mantissa literal), but nothing here depends on that.
 ///
 /// Oracle-verified against real jq: `1e-400` -> `1E-400`, `12.34e-400` ->
 /// `1.234E-399`, `0.5e-400` -> `5E-401`, `100.5e-400` -> `1.005E-398`.
@@ -2467,13 +2482,18 @@ mod tests {
     }
 
     /// #1177 review self-check: a normal (non-subnormal) tiny value right
-    /// at and just above the `f64::MIN_POSITIVE` boundary must still take
-    /// the finite `log10`/`pow` path unchanged -- the new subnormal check
-    /// uses `<`, not `<=`, so it doesn't over-broaden into values the
-    /// existing path already handles correctly.
+    /// at and just above the `f64::MIN_POSITIVE` boundary (2.2250738585072014e-308)
+    /// must still take the finite `log10`/`pow` path unchanged -- the new
+    /// subnormal check uses `<`, not `<=`, so it doesn't over-broaden into
+    /// values the existing path already handles correctly. All three
+    /// literals here are individually confirmed `f64::is_normal() == true`
+    /// (an earlier draft of this test used `1.5e-308`, which is actually
+    /// *subnormal* -- `1.5 < 2.2250738585072014` -- and so silently tested
+    /// the new code path instead of the old one it claimed to guard,
+    /// caught in code review).
     #[test]
     fn test_format_number_jq_compat_normal_boundary_near_min_positive_unaffected_1177() {
-        assert_eq!(format_number_jq_compat(b"1.5e-308"), "1.5E-308");
+        assert_eq!(format_number_jq_compat(b"2.3e-308"), "2.3E-308");
         assert_eq!(format_number_jq_compat(b"3e-308"), "3E-308");
         assert_eq!(format_number_jq_compat(b"1e-300"), "1E-300");
     }
