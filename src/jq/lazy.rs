@@ -700,17 +700,8 @@ fn cursor_to_owned_at_depth<W: Clone + AsRef<[u64]>>(
         StandardJson::String(s) => match s.as_str() {
             Ok(cow) => OwnedValue::String(cow.into_owned()),
             // Same gap as `eval_generic::to_owned_at_depth`'s sibling check
-            // (#1098): decoding a structurally-valid JSON string can fail
-            // (invalid `\u` escape, invalid UTF-8), and silently
-            // materializing an empty string here would be wrong in a
-            // different, still-silent way. No live input reaches this
-            // today -- the same upstream structural validation that
-            // protects `to_owned_at_depth` protects this cursor-based
-            // materializer too, since both walk the identical semi-indexed
-            // JSON representation.
-            Err(e) => panic!(
-                "string scalar failed to decode despite passing structural validation (#1098): {e}"
-            ),
+            // -- see `panic_on_string_decode_failure`'s own doc comment.
+            Err(_) => super::eval_generic::panic_on_string_decode_failure(),
         },
         StandardJson::Array(_) => {
             // Use cursor navigation to iterate children

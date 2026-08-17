@@ -100,6 +100,32 @@ pub fn assert_nesting_depth(depth: usize) {
     super::value::assert_depth(depth, MAX_NESTING_DEPTH);
 }
 
+/// Panics on a string scalar that passed structural validation (the
+/// semi-index accepted its span as a `String` token) but failed to decode
+/// -- an invariant this crate's own document-input path and `--argjson`
+/// both currently enforce upstream (`serde_json`'s strict parse, and this
+/// crate's own semi-index structural checks), so no live CLI input reaches
+/// this today (#1098). `JsonIndex::build`'s scan finds string quote/escape
+/// *boundaries* without decoding/validating what's between them, though,
+/// so a library caller feeding raw bytes to `JsonIndex::build` directly
+/// (bypassing the CLI's own UTF-8 sanitizing file-read step) can reach it
+/// -- confirmed live in this function's own regression test. Panicking
+/// rather than silently materializing `null`/`""` keeps a future drift
+/// between this crate's lenient semi-index grammar and its own stricter
+/// decode step loud instead of turning it into silent data corruption.
+///
+/// Shared by [`to_owned_at_depth`] (which only has a bool signal here --
+/// the `DocumentValue` trait's `as_str()` already discarded the specific
+/// decode error via `.ok()`) and
+/// [`lazy::cursor_to_owned_at_depth`](super::lazy) (which works with
+/// `JsonString` directly and could recover the concrete error), so the two
+/// panic sites can't independently drift on wording (#106).
+#[cold]
+#[track_caller]
+pub(crate) fn panic_on_string_decode_failure() -> ! {
+    panic!("string scalar failed to decode despite passing structural validation (#1098)");
+}
+
 /// Convert a DocumentValue to an OwnedValue.
 ///
 /// This enables the evaluator to work with both JSON and YAML inputs.
@@ -151,15 +177,9 @@ fn to_owned_at_depth<V: DocumentValue>(value: &V, depth: usize) -> OwnedValue {
         // node is a string -- it's structurally a JSON/YAML string scalar,
         // but decoding it failed (invalid `\u` escape, invalid UTF-8, ...)
         // and `as_str()`'s `Option` signature swallows the specific `Err`
-        // via `.ok()` (#1098). No live input reaches this today:
-        // `--argjson`'s `serde_json` parse and this crate's own semi-index
-        // structural checks both already reject anything that would fail
-        // here before this function is ever called -- same precondition as
-        // `assert_nesting_depth` above. Panicking rather than silently
-        // materializing `null` keeps a future drift between those two
-        // independently-maintained JSON grammars loud instead of turning
-        // it into silent data corruption.
-        panic!("string scalar failed to decode despite passing structural validation (#1098)");
+        // via `.ok()` (#1098). See `panic_on_string_decode_failure`'s own
+        // doc comment for why this is a panic rather than a silent `null`.
+        panic_on_string_decode_failure();
     } else {
         // Covers error values and any unknown types
         OwnedValue::Null
