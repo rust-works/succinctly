@@ -16961,12 +16961,16 @@ fn builtin_tostream<W: Clone + AsRef<[u64]>>(
     let mut events = Vec::new();
     collect_tostream_events(&owned, &[], &mut events);
     // Always non-empty: every value (including an empty container or a
-    // top-level scalar) produces at least one leaf event.
-    if events.len() == 1 {
-        QueryResult::Owned(events.pop().unwrap())
-    } else {
-        QueryResult::ManyOwned(events)
-    }
+    // top-level scalar) produces at least one leaf event -- routed through
+    // `collapse_vec` anyway (#1067) so a future change to
+    // `collect_tostream_events` that ever violates that invariant degrades
+    // to `QueryResult::None` instead of silently returning `ManyOwned(vec![])`.
+    collapse_vec(
+        events,
+        || QueryResult::None,
+        QueryResult::Owned,
+        QueryResult::ManyOwned,
+    )
 }
 
 /// Builtin: fromstream(f) - reconstruct values from a stream of tostream-style events
