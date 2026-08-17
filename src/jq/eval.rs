@@ -18884,9 +18884,13 @@ fn delete_expr_paths_through_absent(
 /// [`delete_expr_paths_through_absent`]'s single-path counterpart, for
 /// [`delete_at_path`]'s chain-walk. Same contract: errors propagate, the
 /// rebuilt `null` is discarded, the container is untouched.
-fn delete_at_path_through_absent(rest: &Expr, optional: bool) -> Result<(), EvalError> {
+fn delete_at_path_through_absent(
+    rest: &Expr,
+    optional: bool,
+    yq_mode: bool,
+) -> Result<(), EvalError> {
     let mut absent = OwnedValue::Null;
-    delete_at_path(&mut absent, rest, optional)
+    delete_at_path(&mut absent, rest, optional, yq_mode)
 }
 
 /// [`delete_expr_paths_at`]'s `Field` case: group by field name, delete the
@@ -19233,7 +19237,7 @@ fn builtin_del<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 .then(|| yq_del_scalar_slice_parent_path(path, &result))
                 .flatten();
             let path = rewritten.as_ref().unwrap_or(path);
-            if let Err(e) = delete_at_path(&mut result, path, false) {
+            if let Err(e) = delete_at_path(&mut result, path, false, S::TAG == EvalTag::Yq) {
                 return if optional {
                     QueryResult::None
                 } else {
@@ -19286,10 +19290,24 @@ fn builtin_del<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 }
 
 /// Delete a value at a path expression.
+///
+/// `yq_mode` (#1182): `S::TAG == EvalTag::Yq` from the caller, threaded
+/// through every recursive call rather than making this function generic
+/// over `S` (mirroring `through_slice`'s own `scalar_noop`/`container_noop`
+/// bools over a full generic, since this is the only thing here that needs
+/// mode-awareness at all). Consulted only by the `Expr::Iterate` arm below,
+/// to apply yq's chained-scalar-slice parent-key-delete rule
+/// (`yq_del_scalar_slice_parent_path`) *per element* when a `.[]` precedes
+/// the trailing slice (`del(.a[].b[0:1])`) -- the top-level caller's own
+/// upfront rewrite (see this function's caller) can't handle that shape at
+/// all, since `navigate_read_only` has no way to peek through an
+/// as-yet-unresolved `Iterate` step to find each element's own scalar
+/// target.
 fn delete_at_path(
     root: &mut OwnedValue,
     path_expr: &Expr,
     optional: bool,
+    yq_mode: bool,
 ) -> Result<(), EvalError> {
     match path_expr {
         Expr::Identity => {
@@ -19369,7 +19387,7 @@ fn delete_at_path(
         Expr::Pipe(exprs) if !exprs.is_empty() => {
             // Chain: navigate and delete at the last path
             if exprs.len() == 1 {
-                delete_at_path(root, &exprs[0], optional)
+                delete_at_path(root, &exprs[0], optional, yq_mode)
             } else {
                 // Same unwrap as `update_path`'s chain arm: a resolved
                 // component can still be wrapped in `?`, and matching the
@@ -19384,7 +19402,7 @@ fn delete_at_path(
                 match first {
                     Expr::Field(name) => match root {
                         OwnedValue::Object(map) => match map.get_mut(name) {
-                            Some(current) => delete_at_path(current, &rest, optional),
+                            Some(current) => delete_at_path(current, &rest, optional, yq_mode),
                             // Same "reads as `null`, keep walking" rule as
                             // `delete_expr_object_paths`' missing-field arm
                             // (#527): `del(.a.b.c)` is a no-op, `del(.a.b[])`
@@ -19392,7 +19410,7 @@ fn delete_at_path(
                             // `?` on the missing step does not suppress what
                             // the tail itself raises, and the walk into a
                             // throwaway `null` cannot create the key.
-                            None => delete_at_path_through_absent(&rest, optional),
+                            None => delete_at_path_through_absent(&rest, optional, yq_mode),
                         },
                         // `null` tolerates any key — `null | del(.a.b)` and
                         // `{"x":null} | del(.x.a)` are both no-ops (#476) —
@@ -19401,7 +19419,7 @@ fn delete_at_path(
                         // included, so `{"x":null} | del(.x.a[])` no-op'd
                         // where jq raises `Cannot iterate over null (null)`
                         // (#527).
-                        OwnedValue::Null => delete_at_path_through_absent(&rest, optional),
+                        OwnedValue::Null => delete_at_path_through_absent(&rest, optional, yq_mode),
                         _ if here => Ok(()),
                         _ => Err(EvalError::cannot_index_with_field(
                             owned_type_name(root),
@@ -19413,20 +19431,25 @@ fn delete_at_path(
                             let len = arr.len() as i64;
                             let actual_idx = if *idx < 0 { len + idx } else { *idx };
                             if actual_idx >= 0 && (actual_idx as usize) < arr.len() {
-                                delete_at_path(&mut arr[actual_idx as usize], &rest, optional)
+                                delete_at_path(
+                                    &mut arr[actual_idx as usize],
+                                    &rest,
+                                    optional,
+                                    yq_mode,
+                                )
                             } else {
                                 // An out-of-range index resolves to null, and
                                 // deleting further into null is a no-op for
                                 // most tails, `?` or not (#477) — but not
                                 // `[]`, which still raises `Cannot iterate
                                 // over null (null)` (#527/#529).
-                                delete_at_path_through_absent(&rest, optional)
+                                delete_at_path_through_absent(&rest, optional, yq_mode)
                             }
                         }
                         // Same per-step `null` exemption as the `Field` case
                         // above — `null | del(.[0].a)` is a no-op (#476),
                         // `null | del(.[0][])` still raises (#527).
-                        OwnedValue::Null => delete_at_path_through_absent(&rest, optional),
+                        OwnedValue::Null => delete_at_path_through_absent(&rest, optional, yq_mode),
                         _ if here => Ok(()),
                         _ => Err(EvalError::cannot_index_with_type(
                             owned_type_name(root),
@@ -19436,13 +19459,46 @@ fn delete_at_path(
                     Expr::Iterate => match root {
                         OwnedValue::Array(arr) => {
                             for elem in arr.iter_mut() {
-                                delete_at_path(elem, &rest, optional)?;
+                                // #1182: yq's chained-scalar-slice del() rule
+                                // (#1116) can't be applied upfront for this
+                                // shape -- the caller's own rewrite
+                                // (`yq_del_scalar_slice_parent_path`) only
+                                // runs once, before this walk even starts,
+                                // and its `navigate_read_only` prefix-peek
+                                // has no way to look *through* an
+                                // as-yet-unresolved `.[]` to find each
+                                // element's own scalar target. So the rule is
+                                // attempted again here, once per element,
+                                // against `rest` (the path remaining after
+                                // this `.[]`) -- `None` (rule doesn't apply
+                                // to this element, or not yq mode at all)
+                                // just walks `rest` unchanged, exactly as
+                                // before this fix.
+                                let rewritten = yq_mode
+                                    .then(|| yq_del_scalar_slice_parent_path(&rest, elem))
+                                    .flatten();
+                                delete_at_path(
+                                    elem,
+                                    rewritten.as_ref().unwrap_or(&rest),
+                                    optional,
+                                    yq_mode,
+                                )?;
                             }
                             Ok(())
                         }
                         OwnedValue::Object(map) => {
                             for value in map.values_mut() {
-                                delete_at_path(value, &rest, optional)?;
+                                // Same per-element rewrite as the array arm
+                                // above.
+                                let rewritten = yq_mode
+                                    .then(|| yq_del_scalar_slice_parent_path(&rest, value))
+                                    .flatten();
+                                delete_at_path(
+                                    value,
+                                    rewritten.as_ref().unwrap_or(&rest),
+                                    optional,
+                                    yq_mode,
+                                )?;
                             }
                             Ok(())
                         }
@@ -19454,7 +19510,7 @@ fn delete_at_path(
                     Expr::Pipe(inner) => {
                         let mut spliced = inner.clone();
                         spliced.extend_from_slice(&exprs[1..]);
-                        delete_at_path(root, &Expr::Pipe(spliced), here)
+                        delete_at_path(root, &Expr::Pipe(spliced), here, yq_mode)
                     }
                     // The chain continues *inside* the slice, so the delete
                     // happens in the sub-array and the remainder is spliced
@@ -19470,7 +19526,7 @@ fn delete_at_path(
                     // `null` instead of no-op'ing (a separate, documented
                     // divergence — see docs/compliance/jq/limitations.md).
                     Expr::Slice { .. } if matches!(root, OwnedValue::Null) => {
-                        delete_at_path_through_absent(&rest, optional)
+                        delete_at_path_through_absent(&rest, optional, yq_mode)
                     }
                     // `scalar_noop`/`container_noop: false` — del()'s own
                     // yq rules (#1116's scalar case, #1162's tracked
@@ -19492,14 +19548,14 @@ fn delete_at_path(
                     // follow-up before it's fixed.
                     Expr::Slice { start, end } => {
                         through_slice(root, *start, *end, here, false, false, |sub| {
-                            delete_at_path(sub, &rest, optional)
+                            delete_at_path(sub, &rest, optional, yq_mode)
                         })
                     }
-                    _ => delete_at_path(root, first, here),
+                    _ => delete_at_path(root, first, here, yq_mode),
                 }
             }
         }
-        Expr::Optional(inner) => delete_at_path(root, inner, true),
+        Expr::Optional(inner) => delete_at_path(root, inner, true, yq_mode),
         // `(EXPR)` at the top of a resolved delete target (e.g.
         // `del((.a))`) -- mirrors `update_path`'s identical `Expr::Paren`
         // arm (#1116; passes `optional` through unchanged, unlike the
@@ -19507,7 +19563,7 @@ fn delete_at_path(
         // `delete_at_path` was missing entirely until now (#1153): any
         // parenthesized `del()` target failed with "cannot use expression
         // as delete target", whether or not a slice was involved.
-        Expr::Paren(inner) => delete_at_path(root, inner, optional),
+        Expr::Paren(inner) => delete_at_path(root, inner, optional, yq_mode),
         // Unreachable: `resolve_dynamic_indexes` rewrites every computed key
         // into a static component before this runs. Explicit rather than left
         // to the catch-all so a missed install point fails loudly here instead
@@ -41941,7 +41997,7 @@ mod tests {
         #[test]
         fn test_delete_at_path_refuses_an_unresolved_key() {
             let mut root = OwnedValue::Null;
-            let err = delete_at_path(&mut root, &unresolved(), false).unwrap_err();
+            let err = delete_at_path(&mut root, &unresolved(), false, false).unwrap_err();
             assert_eq!(
                 err.message,
                 "internal error: unresolved computed index in delete path"
@@ -42038,7 +42094,7 @@ mod tests {
         #[test]
         fn test_delete_at_path_refuses_an_unresolved_slice() {
             let mut root = OwnedValue::Null;
-            let err = delete_at_path(&mut root, &unresolved(), false).unwrap_err();
+            let err = delete_at_path(&mut root, &unresolved(), false, false).unwrap_err();
             assert_eq!(
                 err.message,
                 "internal error: unresolved computed slice in delete path"
