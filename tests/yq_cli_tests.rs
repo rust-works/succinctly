@@ -13621,6 +13621,74 @@ fn test_1116_chained_scalar_slice_del_through_missing_still_noops() -> Result<()
     Ok(())
 }
 
+/// A genuinely nested Index-then-Field prefix (`.a[0].b[0:1]`) reaching a
+/// scalar `.b` — exercises `navigate_read_only`'s successful in-bounds
+/// `Expr::Index` branch, not just the single-`Field`-step prefix the other
+/// #1116 tests use. `.a[0].b` was 5, a scalar, so this is a genuine fix
+/// (main errors "Cannot index number with object" for the same query).
+#[test]
+fn test_1116_chained_scalar_slice_del_nested_index_and_field() -> Result<()> {
+    let (out, code) = run_yq_stdin(
+        "del(.a[0].b[0:1])",
+        r#"{"a":[{"b":5}]}"#,
+        &["-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), r#"{"a":[{}]}"#);
+    Ok(())
+}
+
+/// `navigate_read_only`'s type-mismatch fallbacks (`Field` against a
+/// non-object, `Index` against a non-array) both bail out to `None`,
+/// deferring to `delete_at_path`'s own pre-existing, unaffected error —
+/// regression guards confirming #1116's rewrite doesn't fire (or change
+/// the error) for these shapes.
+#[test]
+fn test_1116_chained_scalar_slice_del_navigator_type_mismatches_unaffected() -> Result<()> {
+    let (_out, stderr, code) = run_yq_stdin_with_stderr("del(.a.b[0:1])", r#"{"a":[1,2,3]}"#, &[])?;
+    assert_ne!(code, 0);
+    assert!(stderr.contains("Cannot index array"), "stderr: {stderr}");
+
+    let (_out, stderr, code) =
+        run_yq_stdin_with_stderr("del(.a[0].b[0:1])", r#"{"a":{"x":1}}"#, &[])?;
+    assert_ne!(code, 0);
+    assert!(stderr.contains("Cannot index object"), "stderr: {stderr}");
+
+    Ok(())
+}
+
+/// An out-of-bounds index in the prefix (`.a[99].b[0:1]`) falls through
+/// `navigate_read_only` to `None` (rule doesn't apply) rather than the
+/// rewrite firing on a bogus navigation — regression guard confirming
+/// succinctly's own pre-existing out-of-range del()-through no-op (#477)
+/// is unaffected.
+#[test]
+fn test_1116_chained_scalar_slice_del_navigator_out_of_bounds_unaffected() -> Result<()> {
+    let input = r#"{"a":[{"b":5}]}"#;
+    let (out, code) = run_yq_stdin("del(.a[99].b[0:1])", input, &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), input);
+    Ok(())
+}
+
+/// `navigate_read_only` only understands `Field`/`Index` prefix steps — a
+/// `.[]` earlier in the chain (`Expr::Iterate`) hits its catch-all and
+/// bails to `None`, so the rewrite doesn't apply and the old, erroring
+/// per-element walk runs instead. Known, filed limitation (#1153) — this
+/// pins the current (imperfect) behavior as a regression guard rather than
+/// leaving it silently untested.
+#[test]
+fn test_1116_chained_scalar_slice_del_iterate_prefix_not_yet_covered_1153() -> Result<()> {
+    let (_out, stderr, code) = run_yq_stdin_with_stderr(
+        "del(.a[].b[0:1])",
+        r#"{"a":[{"b":5,"c":1},{"b":6,"c":2}]}"#,
+        &[],
+    )?;
+    assert_ne!(code, 0);
+    assert!(stderr.contains("Cannot index"), "stderr: {stderr}");
+    Ok(())
+}
+
 /// `(.[0:1]) = 99` / `(.[0:1]) |= 99` — a parenthesized *bare* slice at the
 /// top of a resolved path. #1101 covered this only by accident (its old
 /// pre-check ran before `set_path`/`update_path` were ever reached with a

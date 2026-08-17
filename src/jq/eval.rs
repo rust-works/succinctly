@@ -10282,6 +10282,15 @@ fn yq_del_scalar_slice_parent_path(path_expr: &Expr, root: &OwnedValue) -> Optio
         return None;
     }
     Some(match prefix.len() {
+        // Unreachable in practice: `resolve_dynamic_indexes`'s own
+        // `assemble()` never wraps a single resolved component in
+        // `Expr::Pipe` (a length-1 component list returns that component
+        // directly, `strip_resolved_optional` only strips wrappers *within*
+        // an existing `Pipe`, never collapses one), so `exprs.len() >= 2`
+        // always holds here and `prefix.len()` can never be `0`. Kept
+        // explicit (rather than folded into the `_` arm) for clarity, since
+        // it's still the semantically correct value if that invariant ever
+        // changes.
         0 => Expr::Identity,
         1 => prefix[0].clone(),
         _ => Expr::Pipe(prefix.to_vec()),
@@ -37589,6 +37598,100 @@ mod tests {
                 assert_eq!(arr[0], OwnedValue::Int(2));
                 assert_eq!(arr[1], OwnedValue::Int(4));
                 assert_eq!(arr[2], OwnedValue::Int(6));
+            }
+        );
+    }
+
+    #[test]
+    fn test_update_assign_object_values() {
+        // `update_path`'s bare `Expr::Iterate` arm's Object branch (the
+        // whole resolved path is `.[]`, root is an object) -- #392's
+        // sibling test above only exercises the Array branch.
+        query!(br#"{"a": 1, "b": 2}"#, r".[] |= . * 2",
+            QueryResult::Owned(OwnedValue::Object(obj)) => {
+                assert_eq!(*obj.get("a").unwrap(), OwnedValue::Int(2));
+                assert_eq!(*obj.get("b").unwrap(), OwnedValue::Int(4));
+            }
+        );
+    }
+
+    #[test]
+    fn test_update_assign_chained_iterate_array() {
+        // `update_path`'s Pipe-chain arm's `Expr::Iterate` branch (a
+        // *chained* `.a[]`, not the bare top-level case above), Array side.
+        query!(br#"{"a": [1, 2, 3]}"#, r".a[] |= . * 2",
+            QueryResult::Owned(OwnedValue::Object(obj)) => {
+                let OwnedValue::Array(arr) = obj.get("a").unwrap() else {
+                    panic!("expected array");
+                };
+                assert_eq!(arr[0], OwnedValue::Int(2));
+                assert_eq!(arr[1], OwnedValue::Int(4));
+                assert_eq!(arr[2], OwnedValue::Int(6));
+            }
+        );
+    }
+
+    #[test]
+    fn test_update_assign_chained_iterate_object() {
+        // Same Pipe-chain `Expr::Iterate` branch, Object side.
+        query!(br#"{"a": {"x": 1, "y": 2}}"#, r".a[] |= . * 2",
+            QueryResult::Owned(OwnedValue::Object(obj)) => {
+                let OwnedValue::Object(inner) = obj.get("a").unwrap() else {
+                    panic!("expected object");
+                };
+                assert_eq!(*inner.get("x").unwrap(), OwnedValue::Int(2));
+                assert_eq!(*inner.get("y").unwrap(), OwnedValue::Int(4));
+            }
+        );
+    }
+
+    #[test]
+    fn test_update_assign_array_iterate_propagates_element_error() {
+        // Bare `Expr::Iterate` arm's Array branch: `?` on the per-element
+        // recursive `update_path` call must propagate a genuine error from
+        // a later element, not just the successful case the tests above
+        // cover.
+        query!(br#"[1, "x", 3]"#, r#".[] |= (if type == "number" then . * 2 else error("boom") end)"#,
+            QueryResult::Error(e) => assert_eq!(e.message, "boom")
+        );
+    }
+
+    #[test]
+    fn test_update_assign_object_iterate_propagates_element_error() {
+        // Same as above, Object branch.
+        query!(br#"{"a": 1, "b": "x"}"#, r#".[] |= (if type == "number" then . * 2 else error("boom") end)"#,
+            QueryResult::Error(e) => assert_eq!(e.message, "boom")
+        );
+    }
+
+    #[test]
+    fn test_update_assign_chained_iterate_propagates_element_error() {
+        // The Pipe-chain arm's own `Expr::Iterate` branch (a *chained*
+        // `.a[]`, not the bare top-level case above) needs the same
+        // propagation check.
+        query!(br#"{"a": [1, "x", 3]}"#, r#".a[] |= (if type == "number" then . * 2 else error("boom") end)"#,
+            QueryResult::Error(e) => assert_eq!(e.message, "boom")
+        );
+        query!(br#"{"a": {"x": 1, "y": "z"}}"#, r#".a[] |= (if type == "number" then . * 2 else error("boom") end)"#,
+            QueryResult::Error(e) => assert_eq!(e.message, "boom")
+        );
+    }
+
+    #[test]
+    fn test_update_assign_slice_mid_chain() {
+        // `update_path`'s Pipe-chain arm's `Expr::Slice` branch: the chain
+        // continues *inside* the slice (something after it), so the update
+        // runs against the sub-array and splices back -- distinct from the
+        // top-level `Expr::Slice` arm, which is the slice terminating the
+        // whole path (`.[1:3] |= f`, already covered elsewhere).
+        query!(br"[1, 2, 3, 4]", r".[1:3][] |= . * 10",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr, vec![
+                    OwnedValue::Int(1),
+                    OwnedValue::Int(20),
+                    OwnedValue::Int(30),
+                    OwnedValue::Int(4),
+                ]);
             }
         );
     }
