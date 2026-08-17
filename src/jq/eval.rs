@@ -10398,22 +10398,35 @@ pub(crate) fn is_yq_scalar_slice_assign_path(path_expr: &Expr) -> bool {
 }
 
 /// Whether a *resolved* `del()` path ends in a slice whose target (found by
-/// navigating everything before it) is a scalar — yq's own, *different*
-/// del()-specific rule (#1116): unlike `=`/`|=`/`+=` (which no-op just the
-/// write, see `through_slice`'s doc comment), a chained scalar-slice delete
-/// removes the *entire parent key* instead (`{"a":5,"b":6} | del(.a[0:1])`
-/// -> `{"b":6}` in real yq, verified live). Returns the truncated path
-/// (every component up to, but not including, the trailing slice) to
-/// delete instead, when this rule applies — `None` when it doesn't: a bare
-/// slice (`del(.[0:1])`, #1101's existing scope, untouched by this), no
-/// trailing slice at all, or the navigated-to value isn't a scalar. An
-/// array/object parent deliberately keeps succinctly's own working
-/// slice-delete there too, mirroring `is_yq_scalar_slice_assign_path`'s own
-/// scoping choice — real yq's chained slice-delete turns out to drop the
-/// whole parent key for *any* target type, not just scalars (verified
-/// live), but replicating that for arrays/objects would remove working,
-/// jq-consistent behavior to match what looks like a real-yq gap, not a
-/// deliberate feature.
+/// navigating everything before it) exists at all — yq's own, *different*
+/// del()-specific rule (#1116, widened from scalar-only to every target type
+/// by #1162): unlike `=`/`|=`/`+=` (which no-op just the write, see
+/// `through_slice`'s doc comment), a chained slice delete removes the
+/// *entire parent key* instead, regardless of what type the target itself
+/// is (`{"a":5,"b":6} | del(.a[0:1])` -> `{"b":6}`, and identically
+/// `{"a":[1,2,3],"b":6} | del(.a[0:2])` -> `{"b":6}` — whole `"a"` field
+/// gone either way, not a 2-element partial delete — both verified live
+/// against yq v4.53.3). Returns the truncated path (every component up to,
+/// but not including, the trailing slice) to delete instead, when this rule
+/// applies — `None` when it doesn't: a bare slice (`del(.[0:1])`, handled
+/// separately by `builtin_del`'s own bare-root no-op gate, untouched by
+/// this), no trailing slice at all, or the prefix doesn't navigate to
+/// anything (a missing field/out-of-range index — `{"b":1} | del(.a[0:2])`
+/// stays a no-op, matching real yq, since `navigate_read_only` already
+/// returns `None` for an absent step and this function defers to
+/// `delete_at_path`'s own already-correct del()-through-absent handling
+/// rather than duplicating it here).
+///
+/// #1162 removed the earlier `is_yq_slice_empty_container_scalar` type gate
+/// here entirely: live-verifying every `OwnedValue` shape (scalar, array,
+/// string, object, explicit `null`) at both the bare-root and chained
+/// positions confirmed real yq's rule is genuinely type-uniform for the
+/// *chained* case (drop the parent key, whatever the target's type)  —
+/// the type-scoped restriction this doc comment used to describe here was
+/// a deliberate, but ultimately unnecessary, scope narrowing (tracked as
+/// #1162 until this fix; #1157, a separate open sibling gap for
+/// compound-assignment's own object-target no-op, is unaffected — this
+/// change only touches `del()`'s walker, not `through_slice`).
 ///
 /// Deliberately its own walker, not reusing `through_slice`: `del()` has no
 /// "edit closure producing a replacement value" to discard the result of —
@@ -10445,10 +10458,12 @@ fn yq_del_scalar_slice_parent_path(path_expr: &Expr, root: &OwnedValue) -> Optio
         return None;
     }
     let prefix = &exprs[..exprs.len() - 1];
-    let target = navigate_read_only(root, prefix)?;
-    if !is_yq_slice_empty_container_scalar(target) {
-        return None;
-    }
+    // Existence only, not type — #1162 confirmed live that real yq's rule
+    // applies uniformly to every target type once the target actually
+    // exists; `navigate_read_only` returning `None` (missing field/index)
+    // is the only remaining reason to defer to `delete_at_path`'s own
+    // absent-path handling instead.
+    navigate_read_only(root, prefix)?;
     Some(match prefix.len() {
         // Unreachable from `builtin_del`'s own top-level call site:
         // `resolve_dynamic_indexes`'s own `assemble()` never wraps a single
@@ -11307,7 +11322,10 @@ fn through_slice<E: From<EvalError>>(
             // ever returns `Ok(None)` for a target that's neither
             // Array/Null/String -- unreachable here. A silent `Null`
             // fallback would hide that invariant breaking if this guard is
-            // ever widened (e.g. to `Object`, per #1157/#1162).
+            // ever widened (e.g. to `Object`, per #1157 — a separate,
+            // still-open gap in this assignment-side `container_noop` gate;
+            // #1162's own container-target gap was in `del()`'s entirely
+            // separate walker, fixed without touching this function).
             let mut throwaway = slice_owned_value(root, start, end, optional)?
                 .expect("Array/String target always yields Some from slice_owned_value");
             edit(&mut throwaway)?;
@@ -19235,22 +19253,30 @@ fn builtin_del<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Err((_, escape)) => return escape.into(),
     };
 
-    // yq's slice-assignment no-op (#1101) — the `paths.len() <= 1` branch
-    // below already checks this per path, but `delete_expr_paths_at` (the
-    // `paths.len() > 1` branch after it) is a completely separate
-    // sibling-grouping walker that has no equivalent check at all, so a
-    // multi-path `del()` (e.g. `del(.[0:1], .[2:3])`, or any comma that
-    // resolves to 2+ paths) skipped the no-op entirely — confirmed live
-    // against real yq (a comma of bare scalar slices still no-ops there,
-    // same as the single-path case). Checked once, up front, for the
-    // common case where every resolved path individually qualifies —
-    // rather than teaching `delete_expr_paths_at`'s own sibling-comparison
-    // logic about it, which is complex, heavily-tested machinery this fix
-    // doesn't otherwise need to touch.
-    if S::TAG == EvalTag::Yq
-        && is_yq_slice_empty_container_scalar(&result)
-        && paths.iter().all(is_yq_scalar_slice_assign_path)
-    {
+    // yq's bare-root slice `del()` no-op (#1101's scalar case; #1162 widened
+    // this to every target type, matching real yq's bare-root behavior
+    // being type-uniform the same way the *chained* case is — see
+    // `yq_del_scalar_slice_parent_path`'s doc comment) — the `paths.len()
+    // <= 1` branch below already checks this per path, but
+    // `delete_expr_paths_at` (the `paths.len() > 1` branch after it) is a
+    // completely separate sibling-grouping walker that has no equivalent
+    // check at all, so a multi-path `del()` (e.g. `del(.[0:1], .[2:3])`, or
+    // any comma that resolves to 2+ paths) skipped the no-op entirely —
+    // confirmed live against real yq (a comma of bare slices still no-ops
+    // there, same as the single-path case, for every target type). Checked
+    // once, up front, for the common case where every resolved path
+    // individually qualifies — rather than teaching
+    // `delete_expr_paths_at`'s own sibling-comparison logic about it, which
+    // is complex, heavily-tested machinery this fix doesn't otherwise need
+    // to touch.
+    //
+    // No `is_yq_slice_empty_container_scalar(&result)` type gate here
+    // (#1162 removed it) — only `is_yq_scalar_slice_assign_path`'s *shape*
+    // check (is every resolved path literally a bare top-level slice, with
+    // nothing chained before or after it) matters now; the target's own
+    // type no longer restricts this, matching real yq's uniform bare-root
+    // no-op for scalar/array/string/object/null alike (verified live).
+    if S::TAG == EvalTag::Yq && paths.iter().all(is_yq_scalar_slice_assign_path) {
         return QueryResult::Owned(result);
     }
 
@@ -19594,23 +19620,22 @@ fn delete_at_path(
                         delete_at_path_through_absent(&rest, optional, yq_mode)
                     }
                     // `scalar_noop`/`container_noop: false` — del()'s own
-                    // yq rules (#1116's scalar case, #1162's tracked
-                    // container-target follow-up) are handled by del()'s
-                    // own separate mechanisms, not `through_slice`'s
-                    // built-in no-op (see `yq_del_scalar_slice_parent_path`
-                    // for the case this fix actually covers -- the slice
-                    // is the *last* path component). This arm only fires
-                    // when there's more path *after* the slice
-                    // (`.[1:3][0]`), which isn't that shape — in jq mode it
-                    // correctly descends into the sliced sub-range and
-                    // deletes within it. In yq mode this is a known,
-                    // currently-untracked-by-#1162 divergence: real yq
-                    // no-ops the whole thing instead (live-verified,
+                    // yq rules (#1116/#1162, now type-uniform) are handled
+                    // by del()'s own separate mechanisms, not
+                    // `through_slice`'s built-in no-op (see
+                    // `yq_del_scalar_slice_parent_path` for the case this
+                    // covers -- the slice is the *last* path component).
+                    // This arm only fires when there's more path *after*
+                    // the slice (`.[1:3][0]`), which isn't that shape — in
+                    // jq mode it correctly descends into the sliced
+                    // sub-range and deletes within it. In yq mode this is a
+                    // known divergence, tracked as #1219: real yq no-ops
+                    // the whole thing instead (live-verified,
                     // `del(.a[1:3][0])` on `a: [1,2,3,4]` leaves `.a`
                     // untouched, for both a container and a scalar target
-                    // reached through the slice) — this shape is broader
-                    // than #1162's stated scope and needs its own
-                    // follow-up before it's fixed.
+                    // reached through the slice) — broader than #1162's own
+                    // scope (slice as the path's *last* component), needing
+                    // its own investigation before it's fixed.
                     Expr::Slice { start, end } => {
                         through_slice(root, *start, *end, here, false, false, |sub| {
                             delete_at_path(sub, &rest, optional, yq_mode)
@@ -22228,6 +22253,29 @@ fn builtin_delpaths<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     for path in &paths {
         if !matches!(path, OwnedValue::Array(_)) {
             return QueryResult::Error(EvalError::path_must_be_array_not(path.type_name()));
+        }
+    }
+
+    // yq-mode-only (#1162): real yq's `delpaths()` rejects a slice-descriptor
+    // path component (`{"start":s,"end":e}`, `path(.[a:b])`'s own output
+    // shape) outright, at any position, rather than splicing through the
+    // named sub-range the way `delete_paths_under`/`delete_keys`'s own
+    // `OwnedValue::Object(desc)` arms below do for jq mode — checked here,
+    // over every path's every component, before any deletion runs (same
+    // up-front-refusal shape as the array-entry check just above), so a bad
+    // component anywhere refuses the whole call rather than deleting the
+    // paths that sort ahead of it.
+    if S::TAG == EvalTag::Yq {
+        for path in &paths {
+            let OwnedValue::Array(components) = path else {
+                unreachable!("every path already validated as an array above");
+            };
+            if components
+                .iter()
+                .any(|component| matches!(component, OwnedValue::Object(_)))
+            {
+                return QueryResult::Error(EvalError::delpaths_rejects_slice_descriptor());
+            }
         }
     }
 

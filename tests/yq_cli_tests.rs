@@ -14177,25 +14177,22 @@ fn test_1153_parenthesized_chained_scalar_slice_del_removes_parent_key() -> Resu
     Ok(())
 }
 
-/// Control: a parenthesized chained scalar-slice target must keep the same
-/// array-parent scoping as the unparenthesized form -- `#1116`'s rule
-/// (`yq_del_scalar_slice_parent_path`) only fires for a *scalar* parent by
-/// deliberate choice, not oracle conformance: real yq's own chained
-/// slice-delete drops the whole parent key for *any* target type
-/// (confirmed live, both with and without parens), but succinctly keeps
-/// its own working, jq-consistent array slice-delete instead of matching
-/// that (see the function's own doc comment) -- this parenthesized form
-/// must inherit the identical, already-deliberate scoping, not accidentally
-/// widen or narrow it.
+/// Control: a parenthesized chained array-slice target keeps the same
+/// parent-key-drop scoping as the unparenthesized form -- `yq_del_scalar_
+/// slice_parent_path`'s rule was widened from scalar-only to every target
+/// type by #1162 (real yq's own chained slice-delete drops the whole parent
+/// key for *any* target type, confirmed live both with and without parens),
+/// so a parenthesized array target now inherits the same whole-parent-drop
+/// behavior the unparenthesized form already gets, not a partial delete.
 #[test]
-fn test_1153_parenthesized_chained_scalar_slice_del_array_parent_unaffected() -> Result<()> {
+fn test_1162_parenthesized_chained_array_slice_del_removes_parent_key() -> Result<()> {
     let (out, code) = run_yq_stdin(
         "del((.a[0:1]))",
         r#"{"a":[1,2,3],"b":6}"#,
         &["-o=json", "-I=0"],
     )?;
     assert_eq!(code, 0);
-    assert_eq!(out.trim(), r#"{"a":[2,3],"b":6}"#);
+    assert_eq!(out.trim(), r#"{"b":6}"#);
 
     Ok(())
 }
@@ -14267,18 +14264,203 @@ fn test_1116_chained_scalar_slice_del_with_optional() -> Result<()> {
     Ok(())
 }
 
-/// del()'s parent-key rule is scalar-only — an array target keeps
-/// succinctly's own working chained slice-delete, same rationale as the
-/// assign-side regression guard above.
+/// del()'s parent-key rule applies to an array target too (#1162 widened it
+/// from #1116's original scalar-only scope) — real yq drops the whole `a`
+/// key, not a partial 2-element range, whatever bounds are given (verified
+/// live).
 #[test]
-fn test_1116_chained_array_slice_del_still_works() -> Result<()> {
+fn test_1162_chained_array_slice_del_removes_parent_key() -> Result<()> {
     let (out, code) = run_yq_stdin(
         "del(.a[1:3])",
         r#"{"a":[1,2,3,4,5],"b":6}"#,
         &["-o=json", "-I=0"],
     )?;
     assert_eq!(code, 0);
+    assert_eq!(out.trim(), r#"{"b":6}"#);
+    Ok(())
+}
+
+/// The parent-key-drop rule applies to a string target too (verified live).
+#[test]
+fn test_1162_chained_string_slice_del_removes_parent_key() -> Result<()> {
+    let (out, code) = run_yq_stdin(
+        "del(.a[0:2])",
+        r#"{"a":"hello","b":6}"#,
+        &["-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), r#"{"b":6}"#);
+    Ok(())
+}
+
+/// The parent-key-drop rule applies to an object target too (verified
+/// live) — the rule is now genuinely type-uniform, not just widened to
+/// containers with a working slice op (array/string); an object has no
+/// working slice-delete of its own for this to preserve either way.
+#[test]
+fn test_1162_chained_object_slice_del_removes_parent_key() -> Result<()> {
+    let (out, code) = run_yq_stdin(
+        "del(.a[0:1])",
+        r#"{"a":{"x":1,"y":2},"b":6}"#,
+        &["-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), r#"{"b":6}"#);
+    Ok(())
+}
+
+/// An explicit `null` target also gets the parent-key-drop rule (verified
+/// live) — distinct from a *missing* field, which stays a no-op (see the
+/// existing `..._through_missing_still_noops` test below):
+/// `navigate_read_only`'s `Field`/`Index` arms return `Some(&Null)` for a
+/// key that exists and is null, `None` only for a key that doesn't exist at
+/// all, so the two cases already resolve differently with no extra check
+/// needed.
+#[test]
+fn test_1162_chained_null_slice_del_removes_parent_key() -> Result<()> {
+    let (out, code) = run_yq_stdin("del(.a[0:1])", r#"{"a":null,"b":6}"#, &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), r#"{"b":6}"#);
+    Ok(())
+}
+
+/// A bare-root container slice `del()` no-ops, mirroring #1101's existing
+/// bare-root-scalar no-op now that #1162 dropped the scalar-only type gate
+/// on `builtin_del`'s own bare-root check — real yq leaves an array
+/// completely untouched here (verified live), unlike the *chained* case,
+/// which deletes the parent.
+#[test]
+fn test_1162_bare_root_array_slice_del_is_noop() -> Result<()> {
+    let input = r"[1,2,3]";
+    let (out, code) = run_yq_stdin("del(.[1:3])", input, &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), input);
+    Ok(())
+}
+
+/// Same bare-root no-op for a string target (verified live).
+#[test]
+fn test_1162_bare_root_string_slice_del_is_noop() -> Result<()> {
+    let input = r#""hello""#;
+    let (out, code) = run_yq_stdin("del(.[0:2])", input, &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), input);
+    Ok(())
+}
+
+/// Same bare-root no-op for an object target (verified live).
+#[test]
+fn test_1162_bare_root_object_slice_del_is_noop() -> Result<()> {
+    let input = r#"{"x":1,"y":2}"#;
+    let (out, code) = run_yq_stdin("del(.[0:1])", input, &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), input);
+    Ok(())
+}
+
+/// A comma-grouped multi-path `del()` (`delete_expr_paths_at`'s own sibling-
+/// grouping walker, a completely separate code path from the single-path
+/// case above) gets the same widened rule for each resolved path
+/// independently — real yq drops both whole parent fields (verified live),
+/// not a partial delete on either side.
+#[test]
+fn test_1162_chained_multi_path_container_slice_del_removes_both_parent_keys() -> Result<()> {
+    let (out, code) = run_yq_stdin(
+        "del(.a[0:2], .b[1:3])",
+        r#"{"a":[1,2,3],"b":[10,20,30]}"#,
+        &["-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), r"{}");
+    Ok(())
+}
+
+/// Same widening applies to a comma-grouped *bare-root*-shaped no-op —
+/// `builtin_del`'s upfront gate is checked once, over every resolved path,
+/// so a comma of bare container slices still no-ops entirely rather than
+/// falling through to the multi-path walker's own (unrelated) sibling
+/// deletion logic.
+#[test]
+fn test_1162_bare_root_comma_container_slice_del_is_noop() -> Result<()> {
+    let input = r"[1,2,3,4]";
+    let (out, code) = run_yq_stdin("del(.[0:1], .[2:3])", input, &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), input);
+    Ok(())
+}
+
+/// jq mode is unaffected by the widening — a chained array-slice del()
+/// still does succinctly's own ordinary partial-range delete, matching real
+/// jq (no parent-key-drop concept exists there at all).
+#[test]
+fn test_1162_chained_array_slice_del_jq_mode_unaffected() -> Result<()> {
+    let (out, _stderr, code) =
+        run_jq_stdin_with_stderr("del(.a[1:3])", r#"{"a":[1,2,3,4,5],"b":6}"#, &["-c"])?;
+    assert_eq!(code, 0);
     assert_eq!(out.trim(), r#"{"a":[1,4,5],"b":6}"#);
+    Ok(())
+}
+
+/// `delpaths()` rejects a slice-descriptor path component outright in yq
+/// mode (#1162) — unlike real jq, which accepts `path(.[a:b])`'s own
+/// `{"start":s,"end":e}` output shape and splices through the named
+/// sub-range (see `delete_paths_under`'s `OwnedValue::Object(desc)` arm,
+/// untouched by this fix and still reachable in jq mode below). Exact
+/// wording verified live against yq v4.53.3.
+#[test]
+fn test_1162_delpaths_rejects_slice_descriptor() -> Result<()> {
+    let (_out, stderr, code) = run_yq_stdin_with_stderr(
+        r#"delpaths([[{"start":1,"end":3}]])"#,
+        "[1,2,3,4]",
+        &["-o=json"],
+    )?;
+    assert_ne!(code, 0);
+    assert!(
+        stderr.contains(
+            "DELPATHS: expected either a !!str or !!int in the path, found !!map instead"
+        ),
+        "stderr: {stderr}"
+    );
+    Ok(())
+}
+
+/// The slice-descriptor rejection also fires for a *nested* position, not
+/// just the top level (verified live).
+#[test]
+fn test_1162_delpaths_rejects_nested_slice_descriptor() -> Result<()> {
+    let (_out, stderr, code) = run_yq_stdin_with_stderr(
+        r#"delpaths([["a",{"start":0,"end":1}]])"#,
+        r#"{"a":[1,2,3]}"#,
+        &["-o=json"],
+    )?;
+    assert_ne!(code, 0);
+    assert!(
+        stderr.contains(
+            "DELPATHS: expected either a !!str or !!int in the path, found !!map instead"
+        ),
+        "stderr: {stderr}"
+    );
+    Ok(())
+}
+
+/// An ordinary (non-slice-descriptor) `delpaths()` call is unaffected by
+/// the new yq-mode check.
+#[test]
+fn test_1162_delpaths_ordinary_paths_unaffected() -> Result<()> {
+    let (out, code) = run_yq_stdin("delpaths([[0],[2]])", "[1,2,3]", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "[2]");
+    Ok(())
+}
+
+/// `delpaths()`'s slice-descriptor support stays intact in jq mode — the
+/// new rejection is yq-mode-only.
+#[test]
+fn test_1162_delpaths_slice_descriptor_jq_mode_unaffected() -> Result<()> {
+    let (out, _stderr, code) =
+        run_jq_stdin_with_stderr(r#"delpaths([[{"start":1,"end":3}]])"#, "[1,2,3,4]", &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "[1,4]");
     Ok(())
 }
 
@@ -14387,24 +14569,22 @@ fn test_1182_chained_scalar_slice_del_through_nested_iterate() -> Result<()> {
     Ok(())
 }
 
-/// The per-element rewrite is scoped to a genuinely scalar target the same
-/// way the pre-existing bare/chained rule already is -- an array-valued
-/// element reached through the same `.[]` keeps succinctly's own working
-/// partial-range delete instead of the parent-key-drop rule, exactly
-/// mirroring the pre-existing (unrelated to #1182, untouched by this fix)
-/// bare-chained divergence from real yq for an array target
-/// (`{"b":[1,2,3]} | del(.b[0:1])` already gives real yq `{}` vs
-/// succinctly's `{"b":[2,3]}` before and after this fix alike -- tracked
-/// separately as #1162, not fixed here).
+/// The per-element rewrite applies to an array-valued element exactly the
+/// same as a scalar one (#1162 widened `yq_del_scalar_slice_parent_path`
+/// itself, so this per-element retry — reusing that same function — picks
+/// the widening up automatically with no `.[]`-specific change needed): a
+/// mixed array of array-valued and scalar-valued `.b` fields both lose the
+/// whole `b` key per element, matching real yq exactly (verified live).
 #[test]
-fn test_1182_chained_scalar_slice_del_through_iterate_array_target_unaffected() -> Result<()> {
+fn test_1182_chained_scalar_slice_del_through_iterate_array_target_also_removes_parent_key(
+) -> Result<()> {
     let (out, code) = run_yq_stdin(
         "del(.a[].b[0:1])",
         r#"{"a":[{"b":[1,2,3]},{"b":6}]}"#,
         &["-o=json", "-I=0"],
     )?;
     assert_eq!(code, 0, "out: {out:?}");
-    assert_eq!(out.trim(), r#"{"a":[{"b":[2,3]},{}]}"#);
+    assert_eq!(out.trim(), r#"{"a":[{},{}]}"#);
     Ok(())
 }
 
