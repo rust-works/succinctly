@@ -5661,6 +5661,17 @@ fn format_base64<S: EvalSemantics>(
     // (including JSON-encoding a container in jq mode, #1096).
     let s = match stringify_for_format::<S>(value) {
         Some(s) => s,
+        // Mirrors every sibling format's own `_ if optional =>
+        // Ok(String::new())` arm (`format_urid`/`format_tsv`/`format_dsv`/
+        // `format_csv` above) for consistency, but is very likely
+        // unreachable dead code post-#693 for the same reason those are:
+        // `Expr::Optional` now forces the inner evaluation's ambient
+        // `optional` to `false` and catches the resulting `Error` itself,
+        // rather than letting a builtin's own internal `optional` flag see
+        // `true` (see `test_isvalid_reaches_every_builtins_own_optional_guard`'s
+        // doc comment). Confirmed via `cargo llvm-cov`: all four sibling
+        // arms are equally uncovered on this branch, so this one matching
+        // them isn't a new gap.
         None if optional => return Ok(String::new()),
         None => return Err(EvalError::type_error("string", value.type_name())),
     };
