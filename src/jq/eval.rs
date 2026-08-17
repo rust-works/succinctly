@@ -10369,11 +10369,12 @@ pub(crate) fn is_yq_slice_empty_container_scalar(target: &OwnedValue) -> bool {
 /// time `resolve_dynamic_indexes` is done, per its own `needs_path_prepass`
 /// gate.
 ///
-/// Combine with [`is_yq_slice_empty_container_scalar`] against the *current*
-/// value at this point in the fold (not the original input — #1101's no-op
-/// is a per-path, per-fold-step decision, same granularity as `set_path`/
+/// For assignment operators (`=`/`|=`/`+=`), combine with
+/// [`is_yq_slice_empty_container_scalar`] against the *current* value at
+/// this point in the fold (not the original input — #1101's no-op is a
+/// per-path, per-fold-step decision, same granularity as `set_path`/
 /// `update_path`'s own error checks) to get the full #1101 condition: a bare
-/// slice targeting a scalar, the shape real yq's own slice-assignment
+/// slice targeting a *scalar*, the shape real yq's own slice-assignment
 /// machinery silently no-ops the *write* portion of. The RHS/filter itself
 /// is still evaluated normally at every call site — only the final write is
 /// skipped, so `.[0:1] = error("boom")`/`halt`/`break` still propagate
@@ -10382,13 +10383,20 @@ pub(crate) fn is_yq_slice_empty_container_scalar(target: &OwnedValue) -> bool {
 /// Real yq's no-op is *not* scalar-specific the way #1065's read-path rule
 /// is (`[1,2,3] | .[0:1] = [9]` is *also* a silent no-op there — slice
 /// *writes* appear to never be wired up at all, for any target type), but
-/// this check stays deliberately scoped to scalars, preserving succinctly's
-/// own working array/string slice-assignment rather than removing it to
-/// replicate what looks like a real-yq gap. `=`/`|=`/`+=`/`del()` no-op;
-/// `-=`/`*=` *error* instead (confirmed live, with odd Go-internal-leak
-/// messages not worth replicating) — callers gate accordingly. `/=`, `%=`,
-/// `//=`, and `path(...)` aren't valid real-yq syntax at all, so there's no
-/// oracle to match for those.
+/// the *assignment*-operator check above stays deliberately scoped to
+/// scalars, preserving succinctly's own working array/string
+/// slice-assignment rather than removing it to replicate what looks like a
+/// real-yq gap. `-=`/`*=` *error* instead of no-op'ing (confirmed live, with
+/// odd Go-internal-leak messages not worth replicating) — callers gate
+/// accordingly. `/=`, `%=`, `//=`, and `path(...)` aren't valid real-yq
+/// syntax at all, so there's no oracle to match for those.
+///
+/// `del()`'s *own* bare-root no-op (`builtin_del`'s own call site) does
+/// **not** combine this with a type check the way assignment does — #1162
+/// found real yq's bare-root del() no-op is type-uniform (scalar, array,
+/// string, object, and `null` targets all no-op identically), so this
+/// function's pure path-*shape* check is del()'s entire condition on its
+/// own, unlike assignment's still-scalar-scoped rule above.
 pub(crate) fn is_yq_scalar_slice_assign_path(path_expr: &Expr) -> bool {
     match path_expr {
         Expr::Slice { .. } => true,
@@ -10421,12 +10429,22 @@ pub(crate) fn is_yq_scalar_slice_assign_path(path_expr: &Expr) -> bool {
 /// here entirely: live-verifying every `OwnedValue` shape (scalar, array,
 /// string, object, explicit `null`) at both the bare-root and chained
 /// positions confirmed real yq's rule is genuinely type-uniform for the
-/// *chained* case (drop the parent key, whatever the target's type)  —
-/// the type-scoped restriction this doc comment used to describe here was
-/// a deliberate, but ultimately unnecessary, scope narrowing (tracked as
-/// #1162 until this fix; #1157, a separate open sibling gap for
-/// compound-assignment's own object-target no-op, is unaffected — this
-/// change only touches `del()`'s walker, not `through_slice`).
+/// *chained*, *single-path* case this function itself covers (drop the
+/// parent key, whatever the target's type) — the type-scoped restriction
+/// this doc comment used to describe here was a deliberate, but ultimately
+/// unnecessary, scope narrowing (tracked as #1162 until this fix; #1157, a
+/// separate open sibling gap for compound-assignment's own object-target
+/// no-op, is unaffected — this change only touches `del()`'s walker, not
+/// `through_slice`).
+///
+/// A *comma-grouped multi-path* `del()` combining this rule with an
+/// Object-typed sibling target can still hard-error before this function is
+/// ever reached (`del(.a[0:1], .c)` where `.a` is an object) — a pre-
+/// existing crash in `resolve_dynamic_indexes`'s own generic path
+/// validation for a top-level `Comma`, upstream of and unrelated to this
+/// function's own single-path rewrite, confirmed unaffected by #1162 either
+/// way (identical failure on `origin/main` before this fix). Not this
+/// function's bug to fix; tracked separately as #1223.
 ///
 /// Deliberately its own walker, not reusing `through_slice`: `del()` has no
 /// "edit closure producing a replacement value" to discard the result of —
@@ -22256,29 +22274,6 @@ fn builtin_delpaths<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         }
     }
 
-    // yq-mode-only (#1162): real yq's `delpaths()` rejects a slice-descriptor
-    // path component (`{"start":s,"end":e}`, `path(.[a:b])`'s own output
-    // shape) outright, at any position, rather than splicing through the
-    // named sub-range the way `delete_paths_under`/`delete_keys`'s own
-    // `OwnedValue::Object(desc)` arms below do for jq mode — checked here,
-    // over every path's every component, before any deletion runs (same
-    // up-front-refusal shape as the array-entry check just above), so a bad
-    // component anywhere refuses the whole call rather than deleting the
-    // paths that sort ahead of it.
-    if S::TAG == EvalTag::Yq {
-        for path in &paths {
-            let OwnedValue::Array(components) = path else {
-                unreachable!("every path already validated as an array above");
-            };
-            if components
-                .iter()
-                .any(|component| matches!(component, OwnedValue::Object(_)))
-            {
-                return QueryResult::Error(EvalError::delpaths_rejects_slice_descriptor());
-            }
-        }
-    }
-
     // A NaN component is dropped with the path around it, because it names no
     // element at any depth — `resolve_read_index` refuses it, as jq's `jv_get`
     // does. Leaving it in would do more than waste a walk: since #421,
@@ -22290,12 +22285,39 @@ fn builtin_delpaths<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // `sort_by` call entirely NaN-free, so it never risks that regardless.
     // jq cannot arbitrate either — 1.7.1 loops forever on `delpaths([[nan]])`
     // — so this is pinned by unit test rather than by a golden.
+    //
+    // yq-mode-only (#1162): real yq's `delpaths()` also rejects a
+    // slice-descriptor path component (`{"start":s,"end":e}`, `path(.[a:b])`'s
+    // own output shape) outright, at any position, rather than splicing
+    // through the named sub-range the way `delete_paths_under`/`delete_keys`'s
+    // own `OwnedValue::Object(desc)` arms below do for jq mode. Folded into
+    // this same `retain` pass rather than a separate loop before it: both
+    // checks need to visit every path's every component before any deletion
+    // runs. Gated on `keeps` (the same per-path NaN survival this `retain`
+    // already computes), not checked unconditionally, so a path that's
+    // *also* NaN-headed doesn't surface the slice-descriptor error for a
+    // path already headed for silent removal — #1220 (not implemented here)
+    // covers matching real yq's own float/NaN rejection precisely; this
+    // fix only avoids the internally-inconsistent "a doomed path still
+    // aborts the whole call" shape.
+    let mut has_slice_descriptor = false;
     paths.retain(|path| match path {
-        OwnedValue::Array(components) => !components
-            .iter()
-            .any(|key| matches!(key, OwnedValue::Float(f) if f.is_nan())),
+        OwnedValue::Array(components) => {
+            let keeps = !components
+                .iter()
+                .any(|key| matches!(key, OwnedValue::Float(f) if f.is_nan()));
+            has_slice_descriptor |= keeps
+                && S::TAG == EvalTag::Yq
+                && components
+                    .iter()
+                    .any(|component| matches!(component, OwnedValue::Object(_)));
+            keeps
+        }
         _ => false,
     });
+    if has_slice_descriptor {
+        return QueryResult::Error(EvalError::delpaths_rejects_slice_descriptor());
+    }
 
     // jq sorts the whole path list in its total value order — arrays compare
     // lexicographically — before deleting anything, so the order the caller
