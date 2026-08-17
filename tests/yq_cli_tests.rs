@@ -12961,3 +12961,149 @@ fn test_slice_assign_string_and_array_unaffected_1101() -> Result<()> {
     assert_eq!(out.trim(), "[9,2,3]");
     Ok(())
 }
+
+// ============================================================================
+// @urid / @base64d scalar-stringification (#1109)
+// ============================================================================
+//
+// Real yq (v4.53.3, live-verified) stringifies any scalar before decoding,
+// unlike jq which errors on every non-string type. A container (array or
+// object) stringifies to the empty string, matching the established
+// "container stringifies to empty" convention already used by `@sh`/`@uri`/
+// `@html` (#1072).
+
+#[test]
+fn test_yq_urid_stringifies_scalars_1109() -> Result<()> {
+    let (out, code) = run_yq_stdin("@urid", "null", &["-o", "json"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), r#""null""#);
+
+    let (out, code) = run_yq_stdin("@urid", "true", &["-o", "json"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), r#""true""#);
+
+    let (out, code) = run_yq_stdin("@urid", "false", &["-o", "json"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), r#""false""#);
+
+    let (out, code) = run_yq_stdin("@urid", "42", &["-o", "json"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), r#""42""#);
+
+    let (out, code) = run_yq_stdin("@urid", "1.5", &["-o", "json"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), r#""1.5""#);
+    Ok(())
+}
+
+#[test]
+fn test_yq_urid_container_stringifies_to_empty_1109() -> Result<()> {
+    let (out, code) = run_yq_stdin("@urid", "[1,2,3]", &["-o", "json"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), r#""""#);
+
+    let (out, code) = run_yq_stdin("@urid", "{a: 1}", &["-o", "json"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), r#""""#);
+    Ok(())
+}
+
+#[test]
+fn test_yq_base64d_stringifies_scalars_1109() -> Result<()> {
+    // "true" and "null" are both valid (if odd) base64 payloads by length;
+    // decode them and confirm the decoded bytes, not just success/failure.
+    let (out, code) = run_yq_stdin("@base64d", "true", &["-o", "json"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    let expected = base64_decode_lossy("true");
+    assert_eq!(out.trim(), format!("{expected:?}"));
+    Ok(())
+}
+
+#[test]
+fn test_yq_base64d_container_stringifies_to_empty_1109() -> Result<()> {
+    let (out, code) = run_yq_stdin("@base64d", "[1,2,3]", &["-o", "json"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), r#""""#);
+
+    let (out, code) = run_yq_stdin("@base64d", "{a: 1}", &["-o", "json"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), r#""""#);
+    Ok(())
+}
+
+/// jq mode is unaffected by #1109's yq-only stringification: it must keep
+/// erroring on every non-string scalar, exactly as before.
+#[test]
+fn test_jq_urid_base64d_still_reject_non_string_1109() -> Result<()> {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_succinctly"));
+    cmd.arg("jq").arg("@urid");
+    let mut child = cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    child.stdin.take().unwrap().write_all(b"42")?;
+    let output = child.wait_with_output()?;
+    assert_ne!(output.status.code().unwrap_or(-1), 0);
+
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_succinctly"));
+    cmd.arg("jq").arg("@base64d");
+    let mut child = cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    child.stdin.take().unwrap().write_all(b"42")?;
+    let output = child.wait_with_output()?;
+    assert_ne!(output.status.code().unwrap_or(-1), 0);
+    Ok(())
+}
+
+/// `@base64d` never errors on invalid UTF-8 in the decoded bytes -- it
+/// substitutes the replacement character, matching real jq/yq (confirmed
+/// live: `"null" | @base64d` succeeds as `"��e"` in jq 1.7.1
+/// rather than erroring).
+#[test]
+fn test_base64d_invalid_utf8_is_lossy_not_error_1109() -> Result<()> {
+    let (out, code) = run_yq_stdin("@base64d", r#""null""#, &["-o", "json"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    let expected = base64_decode_lossy("null");
+    assert_eq!(out.trim(), format!("{expected:?}"));
+    Ok(())
+}
+
+/// Reference decoder used only to compute expected lossy-UTF-8 output for
+/// the tests above, independent of the implementation under test.
+fn base64_decode_lossy(s: &str) -> String {
+    fn decode_char(c: u8) -> Option<u8> {
+        match c {
+            b'A'..=b'Z' => Some(c - b'A'),
+            b'a'..=b'z' => Some(c - b'a' + 26),
+            b'0'..=b'9' => Some(c - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            b'=' => Some(0),
+            _ => None,
+        }
+    }
+    let bytes: Vec<u8> = s.bytes().collect();
+    let mut result = Vec::new();
+    for chunk in bytes.chunks(4) {
+        if chunk.len() < 4 {
+            break;
+        }
+        let a = decode_char(chunk[0]).unwrap();
+        let b = decode_char(chunk[1]).unwrap();
+        let c_val = decode_char(chunk[2]).unwrap();
+        let d = decode_char(chunk[3]).unwrap();
+        let triple = ((a as u32) << 18) | ((b as u32) << 12) | ((c_val as u32) << 6) | (d as u32);
+        result.push(((triple >> 16) & 0xFF) as u8);
+        if chunk[2] != b'=' {
+            result.push(((triple >> 8) & 0xFF) as u8);
+        }
+        if chunk[3] != b'=' {
+            result.push((triple & 0xFF) as u8);
+        }
+    }
+    String::from_utf8_lossy(&result).into_owned()
+}
