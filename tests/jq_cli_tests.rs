@@ -9344,9 +9344,34 @@ fn test_as_pattern_propagates_halt_after_partial_body_output() -> Result<()> {
 /// non-array input) falls through to the next alternative.
 #[test]
 fn test_as_pattern_alt_falls_through_on_pattern_mismatch_720() -> Result<()> {
-    let (stdout, code) = run_jq_stdin(". as [$a] ?// {a: $a} | $a", "[1]", &["-c"])?;
+    let (stdout, _, code) = run_jq_full(&["-c", ". as [$a] ?// {a: $a} | $a"], Some("[1]"))?;
     assert_eq!(code, 0);
     assert_eq!(stdout.trim_end(), "1");
+    Ok(())
+}
+
+/// A body that references `.` (the original, cursor-backed document) rather
+/// than only substituted variables -- exercises `try_pattern_alternatives`'s
+/// `QueryResult::One`/`Many` arms specifically, which a body built entirely
+/// from substituted-literal variable references (like the test above) never
+/// reaches.
+#[test]
+fn test_as_pattern_alt_body_references_original_document_720() -> Result<()> {
+    let (stdout, _, code) = run_jq_full(&["-c", ". as [$a] ?// {a: $a} | ."], Some("[1]"))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "[1]");
+    Ok(())
+}
+
+/// Same idea, but the body also fans out (`.[]` on the original,
+/// cursor-backed document) -- exercises the `QueryResult::Many` arm
+/// specifically, distinct from the single-value `QueryResult::One` case
+/// above.
+#[test]
+fn test_as_pattern_alt_body_fans_out_over_original_document_720() -> Result<()> {
+    let (stdout, _, code) = run_jq_full(&["-c", ". as [$a] ?// {a: $a} | .[]"], Some("[1,2]"))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "1\n2\n");
     Ok(())
 }
 
@@ -9354,7 +9379,10 @@ fn test_as_pattern_alt_falls_through_on_pattern_mismatch_720() -> Result<()> {
 /// used as a catch-all fallback.
 #[test]
 fn test_as_pattern_alt_three_way_chain_720() -> Result<()> {
-    let (stdout, code) = run_jq_stdin(". as [$a] ?// {a: $a} ?// $a | $a", r#"{"a":5}"#, &["-c"])?;
+    let (stdout, _, code) = run_jq_full(
+        &["-c", ". as [$a] ?// {a: $a} ?// $a | $a"],
+        Some(r#"{"a":5}"#),
+    )?;
     assert_eq!(code, 0);
     assert_eq!(stdout.trim_end(), "5");
     Ok(())
@@ -9414,11 +9442,14 @@ fn test_as_pattern_alt_all_mismatch_errors_720() -> Result<()> {
 /// confirmed live against jq 1.7.1.
 #[test]
 fn test_as_pattern_alt_unbound_var_from_other_alt_is_null_720() -> Result<()> {
-    let (stdout, code) = run_jq_stdin(". as [$a] ?// {b: $b} | [$a, $b]", "[1]", &["-c"])?;
+    let (stdout, _, code) = run_jq_full(&["-c", ". as [$a] ?// {b: $b} | [$a, $b]"], Some("[1]"))?;
     assert_eq!(code, 0);
     assert_eq!(stdout.trim_end(), "[1,null]");
 
-    let (stdout, code) = run_jq_stdin(". as [$a] ?// {b: $b} | [$a, $b]", r#"{"b":9}"#, &["-c"])?;
+    let (stdout, _, code) = run_jq_full(
+        &["-c", ". as [$a] ?// {b: $b} | [$a, $b]"],
+        Some(r#"{"b":9}"#),
+    )?;
     assert_eq!(code, 0);
     assert_eq!(stdout.trim_end(), "[null,9]");
     Ok(())
@@ -9442,15 +9473,15 @@ fn test_as_pattern_alt_bind_expr_generator_fans_out_720() -> Result<()> {
 /// implicit retry signal.
 #[test]
 fn test_as_pattern_alt_break_and_empty_are_not_fallthrough_720() -> Result<()> {
-    let (stdout, code) = run_jq_stdin(
-        "label $out | (. as {a: $a} ?// $a | (break $out))",
-        r#"{"a":1}"#,
-        &["-c"],
+    let (stdout, _, code) = run_jq_full(
+        &["-c", "label $out | (. as {a: $a} ?// $a | (break $out))"],
+        Some(r#"{"a":1}"#),
     )?;
     assert_eq!(code, 0);
     assert_eq!(stdout.trim_end(), "");
 
-    let (stdout, code) = run_jq_stdin("[. as {a: $a} ?// $a | empty]", r#"{"a":1}"#, &["-c"])?;
+    let (stdout, _, code) =
+        run_jq_full(&["-c", "[. as {a: $a} ?// $a | empty]"], Some(r#"{"a":1}"#))?;
     assert_eq!(code, 0);
     assert_eq!(stdout.trim_end(), "[]");
     Ok(())
@@ -9480,11 +9511,11 @@ fn test_as_pattern_alt_partial_output_survives_fallthrough_720() -> Result<()> {
 /// same behavior as before.
 #[test]
 fn test_as_pattern_no_alt_unaffected_720() -> Result<()> {
-    let (stdout, code) = run_jq_stdin(". as $a | $a", "5", &["-c"])?;
+    let (stdout, _, code) = run_jq_full(&["-c", ". as $a | $a"], Some("5"))?;
     assert_eq!(code, 0);
     assert_eq!(stdout.trim_end(), "5");
 
-    let (stdout, code) = run_jq_stdin(". as [$a,$b] | $a + $b", "[1,2]", &["-c"])?;
+    let (stdout, _, code) = run_jq_full(&["-c", ". as [$a,$b] | $a + $b"], Some("[1,2]"))?;
     assert_eq!(code, 0);
     assert_eq!(stdout.trim_end(), "3");
     Ok(())
@@ -9510,6 +9541,30 @@ fn test_as_pattern_alt_rejected_in_yq_mode_720() -> Result<()> {
         0,
         "yq mode must reject ?// as a parse error, matching real yq"
     );
+    Ok(())
+}
+
+/// `substitute_func_param`'s `Expr::AsPattern` arm: a `$`-parameter used
+/// directly as a `?//` binding's own bind expression, inside a
+/// parameterized function body.
+#[test]
+fn test_as_pattern_alt_substituted_as_func_param_bind_expr_720() -> Result<()> {
+    let (stdout, _, code) = run_jq_full(
+        &["-c", "def f($x): $x as [$a] ?// $a | $a; f(5)"],
+        Some("1"),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "5");
+    Ok(())
+}
+
+/// `expand_func_calls`'s `Expr::AsPattern` arm: a call to a zero-arg
+/// function reached only by recursing into a `?//` binding's body.
+#[test]
+fn test_as_pattern_alt_func_call_inside_body_expanded_720() -> Result<()> {
+    let (stdout, _, code) = run_jq_full(&["-c", "def f: 1; (. as [$a] ?// $a | f)"], Some("null"))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "1");
     Ok(())
 }
 
