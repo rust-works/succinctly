@@ -5558,40 +5558,53 @@ fn format_uri<S: EvalSemantics>(value: &OwnedValue, _optional: bool) -> Result<S
     Ok(result)
 }
 
+/// Stringify a scalar the way real yq (v4.53.3, live-verified) does before
+/// handing it to `@urid`/`@base64d`'s decode step: numbers via
+/// `numeric_display_string`, `true`/`false`, `"null"`, and a container
+/// (array/object) to the empty string rather than erroring (#1109) -- the
+/// same "container stringifies to empty" convention already duplicated at
+/// [`yq_join_element_part`]/[`yq_join_separator`]/`combine_sub_gap`'s own
+/// yq branch (#1072 tracks consolidating those; this is a *separate*,
+/// smaller duplicate shared only between `format_urid`/`format_base64d`
+/// themselves, factored out here rather than left as two copies). Callers
+/// gate this on `S::TAG == EvalTag::Yq` themselves and only ever reach it
+/// for a non-`String` `OwnedValue` -- jq mode never calls this at all.
+fn yq_stringify_scalar_or_empty<S: EvalSemantics>(value: &OwnedValue) -> String {
+    match value {
+        OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..) => {
+            numeric_display_string::<S>(value)
+        }
+        OwnedValue::Bool(b) => {
+            if *b {
+                "true".to_string()
+            } else {
+                "false".to_string()
+            }
+        }
+        OwnedValue::Null => "null".to_string(),
+        // String is handled by the caller before reaching here; Array/Object
+        // stringify to "" (#1109).
+        _ => String::new(),
+    }
+}
+
 /// @urid - URI/percent decode
 ///
 /// jq has no `@urid` at all, so there's no jq-mode oracle to match; real
-/// yq (v4.53.3, live-verified) accepts any scalar by stringifying it first
-/// (`numeric_display_string`/`true`/`false`/`"null"`, the same conversion
-/// [`format_uri`]'s encode direction already applies) -- decoding a plain
-/// string with no `%` escapes is a no-op, so a stringified scalar just
-/// echoes back unchanged (`1.5 | @urid` is `"1.5"`). A container
-/// stringifies to the empty string rather than erroring (#1109) -- the
-/// same "container stringifies to empty" convention already duplicated at
-/// [`yq_join_element_part`]/[`yq_join_separator`]/`combine_sub_gap`'s own
-/// yq branch (#1072 tracks consolidating those), reused here rather than
-/// grown a fifth copy of a *different* rule. jq mode is unaffected: it
-/// keeps erroring on every non-string type, unchanged from before.
+/// yq accepts any scalar by stringifying it first (see
+/// [`yq_stringify_scalar_or_empty`]) -- decoding a plain string with no `%`
+/// escapes is a no-op, so a stringified scalar just echoes back unchanged
+/// (`1.5 | @urid` is `"1.5"`). jq mode is unaffected: it keeps erroring on
+/// every non-string type, unchanged from before. Note real yq's `@uri`
+/// *encode* direction does not share this behavior -- it errors on a
+/// non-string scalar rather than stringifying it (`42 | @uri` errors in
+/// real yq); [`format_uri`]'s own unconditional stringification (in both
+/// jq and yq mode) is a separate, pre-existing divergence from real yq,
+/// not touched here.
 fn format_urid<S: EvalSemantics>(value: &OwnedValue, optional: bool) -> Result<String, EvalError> {
     let s = match value {
         OwnedValue::String(s) => s.clone(),
-        _ if S::TAG == EvalTag::Yq => match value {
-            OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..) => {
-                numeric_display_string::<S>(value)
-            }
-            OwnedValue::Bool(b) => {
-                if *b {
-                    "true".to_string()
-                } else {
-                    "false".to_string()
-                }
-            }
-            OwnedValue::Null => "null".to_string(),
-            // Array/Object: stringifies to "" (#1109) -- decoding an empty
-            // string is itself a no-op below, so this needs no further
-            // special-casing past this stringification step.
-            _ => String::new(),
-        },
+        _ if S::TAG == EvalTag::Yq => yq_stringify_scalar_or_empty::<S>(value),
         _ if optional => return Ok(String::new()),
         _ => return Err(EvalError::type_error("string", value.type_name())),
     };
@@ -5772,35 +5785,22 @@ fn format_base64<S: EvalSemantics>(
 /// @base64d - Base64 decode
 ///
 /// Real yq (v4.53.3, live-verified) accepts any scalar by stringifying it
-/// first, same as [`format_urid`] above -- most stringified scalars then
-/// fail to decode as valid base64 (`1 | @base64d` errors, since `"1"` is
-/// the wrong length), but that's this decoder's own leniency/strictness
-/// on the *string* it's given, unrelated to what type reached it; not
-/// touched here. A container stringifies to the empty string (#1109,
-/// same "container stringifies to empty" convention as `format_urid`),
-/// which trivially decodes to `""` (zero chunks) rather than needing its
-/// own early return. jq mode is unaffected: it keeps erroring on every
-/// non-string type, unchanged from before.
+/// first, same as [`format_urid`] above (see [`yq_stringify_scalar_or_empty`])
+/// -- what happens next to that string (valid decode, garbage, or an
+/// error) is this decoder's own leniency/strictness on the *string* it's
+/// given, unrelated to what type reached it; not touched here (its
+/// pre-existing non-multiple-of-4-length truncation-instead-of-erroring
+/// leniency is filed separately as #1120). A container stringifies to the
+/// empty string (#1109), which trivially decodes to `""` (zero chunks)
+/// rather than needing its own early return. jq mode is unaffected: it
+/// keeps erroring on every non-string type, unchanged from before.
 fn format_base64d<S: EvalSemantics>(
     value: &OwnedValue,
     optional: bool,
 ) -> Result<String, EvalError> {
     let s = match value {
         OwnedValue::String(s) => s.clone(),
-        _ if S::TAG == EvalTag::Yq => match value {
-            OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..) => {
-                numeric_display_string::<S>(value)
-            }
-            OwnedValue::Bool(b) => {
-                if *b {
-                    "true".to_string()
-                } else {
-                    "false".to_string()
-                }
-            }
-            OwnedValue::Null => "null".to_string(),
-            _ => String::new(),
-        },
+        _ if S::TAG == EvalTag::Yq => yq_stringify_scalar_or_empty::<S>(value),
         _ if optional => return Ok(String::new()),
         _ => return Err(EvalError::type_error("string", value.type_name())),
     };
