@@ -888,9 +888,10 @@ fn eval_on_owned<S: EvalSemantics, V: DocumentValue>(
     // pure overhead for them (#124). No non-finite-float guard is needed here
     // either: every non-JSON format bottoms out in `numeric_display_string`,
     // `owned_to_yaml`, or `props_value_to_string` (eval.rs), which already
-    // render NaN/Infinity as `"inf"`/`".nan"`/etc. directly from an
-    // `OwnedValue::Float` or `NumberLiteral`, with no dependence on having
-    // passed through a JSON round-trip first.
+    // render NaN/Infinity directly from an `OwnedValue::Float` or
+    // `NumberLiteral` -- jq mode's `"null"`/`DBL_MAX`-text substitution
+    // (#1075) or yq mode's `.nan`/`.inf`/`-.inf` -- with no dependence on
+    // having passed through a JSON round-trip first.
     if let Expr::Format(format_type) = expr {
         return format_result::<S, _>(format_type, &owned, optional);
     }
@@ -4197,9 +4198,11 @@ mod tests {
     }
 
     #[test]
-    fn test_generic_tostring_overflow_literal_renders_as_inf() {
-        // Mirrors eval.rs's test_number_literal_overflow_renders_as_inf_not_garbage
-        // (#561): the generic evaluator's ToString arm had the same bug.
+    fn test_generic_tostring_overflow_literal_renders_correctly() {
+        // Mirrors eval.rs's test_number_literal_overflow_renders_correctly_not_garbage
+        // (#561, #1075): the generic evaluator's ToString arm had the same
+        // bug, first as raw-text-reformatting garbage, then as Rust's own
+        // `f64::Display` ("inf") instead of jq's `DBL_MAX`-text substitution.
         let json = br"1e400";
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
@@ -4208,7 +4211,10 @@ mod tests {
         let result = eval(&Expr::Builtin(Builtin::ToString), value);
         let owned = result.into_owned().unwrap();
 
-        assert_eq!(owned, OwnedValue::String("inf".to_string()));
+        assert_eq!(
+            owned,
+            OwnedValue::String("1.7976931348623157e+308".to_string())
+        );
     }
 
     #[test]
@@ -4220,9 +4226,10 @@ mod tests {
         // reserialization used to call `OwnedValue::to_json()`, which
         // substitutes "null" for ±Infinity (correct for real JSON output,
         // but not for this internal round-trip) -- silently destroying the
-        // overflowed literal before `eval.rs`'s (already-fixed) `@uri`
-        // formatting ever saw it (#561). This exercises that bridge
-        // directly, independent of the CLI.
+        // overflowed literal before `eval.rs`'s `@uri` formatting ever saw it
+        // (#561), then rendering Rust's own `f64::Display` ("inf") instead of
+        // jq's `DBL_MAX`-text substitution (#1075). This exercises that
+        // bridge directly, independent of the CLI.
         let json = br"1e400";
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
@@ -4231,7 +4238,10 @@ mod tests {
         let result = eval(&Expr::Format(FormatType::Uri), value);
         let owned = result.into_owned().unwrap();
 
-        assert_eq!(owned, OwnedValue::String("inf".to_string()));
+        assert_eq!(
+            owned,
+            OwnedValue::String("1.7976931348623157e%2B308".to_string())
+        );
     }
 
     #[test]
@@ -4248,7 +4258,10 @@ mod tests {
         let result = eval(&Expr::Format(FormatType::Uri), value);
         let owned = result.into_owned().unwrap();
 
-        assert_eq!(owned, OwnedValue::String("-inf".to_string()));
+        assert_eq!(
+            owned,
+            OwnedValue::String("-1.7976931348623157e%2B308".to_string())
+        );
     }
 
     #[test]

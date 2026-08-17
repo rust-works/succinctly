@@ -3906,41 +3906,43 @@ fn regression_issue_575_break_in_loop_constructs_reaches_label() -> Result<()> {
 
 /// A `NumberLiteral` that overflows to infinity (e.g. `1e400`) used to render
 /// as garbage like `"NaNE+2147483647"` in every non-JSON text format instead
-/// of `"inf"`/`"-inf"` (#561). `tostring` reaches the fix directly, but
-/// `@uri`/`@html`/`@sh`/string interpolation/`@csv` are dispatched through
-/// `eval_generic`'s cursor-reindexing bridge, which round-trips the value
-/// through JSON text -- and used to substitute `"null"` for the overflowed
-/// value before the fix ever saw it. This test exercises the real CLI (not
-/// `eval.rs::eval()` directly) so it actually covers that bridge.
+/// of jq's own `DBL_MAX`-text substitution (#561), then as Rust's own
+/// `f64::Display` (`"inf"`/`"-inf"`, still wrong -- #1075). `tostring`
+/// reaches the fix directly, but `@uri`/`@html`/`@sh`/string
+/// interpolation/`@csv` are dispatched through `eval_generic`'s
+/// cursor-reindexing bridge, which round-trips the value through JSON text --
+/// and used to substitute `"null"` for the overflowed value before the fix
+/// ever saw it. This test exercises the real CLI (not `eval.rs::eval()`
+/// directly) so it actually covers that bridge.
 #[test]
 fn test_number_literal_overflow_text_formats_via_cli() -> Result<()> {
     let (output, code) = run_jq_stdin("tostring", "1e400", &[])?;
     assert_eq!(code, 0);
-    assert_eq!(output.trim(), r#""inf""#);
+    assert_eq!(output.trim(), r#""1.7976931348623157e+308""#);
 
     let (output, code) = run_jq_stdin("tostring", "-1e400", &[])?;
     assert_eq!(code, 0);
-    assert_eq!(output.trim(), r#""-inf""#);
+    assert_eq!(output.trim(), r#""-1.7976931348623157e+308""#);
 
     let (output, code) = run_jq_stdin("@uri", "1e400", &[])?;
     assert_eq!(code, 0);
-    assert_eq!(output.trim(), r#""inf""#);
+    assert_eq!(output.trim(), r#""1.7976931348623157e%2B308""#);
 
     let (output, code) = run_jq_stdin("@html", "1e400", &[])?;
     assert_eq!(code, 0);
-    assert_eq!(output.trim(), r#""inf""#);
+    assert_eq!(output.trim(), r#""1.7976931348623157e+308""#);
 
     let (output, code) = run_jq_stdin("@sh", "1e400", &[])?;
     assert_eq!(code, 0);
-    assert_eq!(output.trim(), r#""inf""#);
+    assert_eq!(output.trim(), r#""1.7976931348623157e+308""#);
 
     let (output, code) = run_jq_stdin(r#""\(.)""#, "1e400", &[])?;
     assert_eq!(code, 0);
-    assert_eq!(output.trim(), r#""inf""#);
+    assert_eq!(output.trim(), r#""1.7976931348623157e+308""#);
 
     let (output, code) = run_jq_stdin("@csv", "[1e400]", &["-c"])?;
     assert_eq!(code, 0);
-    assert_eq!(output.trim(), r#""inf""#);
+    assert_eq!(output.trim(), r#""1.7976931348623157e+308""#);
 
     Ok(())
 }
@@ -3970,25 +3972,26 @@ fn test_number_literal_overflow_identity_prints_null_via_cli() -> Result<()> {
 /// (already covered by `test_number_literal_overflow_text_formats_via_cli`).
 /// Before switching these to `to_json_for_reindex`, they too silently turned
 /// an overflowed `NumberLiteral` into JSON `null`, so `. as $x | $x |
-/// tostring` printed `"null"` instead of `"inf"` even though a direct
-/// `tostring` was already fixed (#561).
+/// tostring` printed `"null"` instead of jq's `DBL_MAX`-text substitution
+/// even though a direct `tostring` was already fixed (#561, then #1075 for
+/// the exact substitution text).
 #[test]
 fn test_number_literal_overflow_owned_reindex_bridges_via_cli() -> Result<()> {
     let (output, code) = run_jq_stdin(". as $x | $x | tostring", "1e400", &[])?;
     assert_eq!(code, 0);
-    assert_eq!(output.trim(), r#""inf""#);
+    assert_eq!(output.trim(), r#""1.7976931348623157e+308""#);
 
     let (output, code) = run_jq_stdin(". as $x | $x | tostring", "-1e400", &[])?;
     assert_eq!(code, 0);
-    assert_eq!(output.trim(), r#""-inf""#);
+    assert_eq!(output.trim(), r#""-1.7976931348623157e+308""#);
 
     let (output, code) = run_jq_stdin("reduce (1) as $x (.; .) | tostring", "1e400", &[])?;
     assert_eq!(code, 0);
-    assert_eq!(output.trim(), r#""inf""#);
+    assert_eq!(output.trim(), r#""1.7976931348623157e+308""#);
 
     let (output, code) = run_jq_stdin("foreach (1) as $x (.; .) | tostring", "1e400", &[])?;
     assert_eq!(code, 0);
-    assert_eq!(output.trim(), r#""inf""#);
+    assert_eq!(output.trim(), r#""1.7976931348623157e+308""#);
 
     let (output, code) = run_jq_stdin(
         "with_entries(.value |= (. | tostring))",
@@ -3996,7 +3999,7 @@ fn test_number_literal_overflow_owned_reindex_bridges_via_cli() -> Result<()> {
         &["-c"],
     )?;
     assert_eq!(code, 0);
-    assert_eq!(output.trim(), r#"{"a":"inf"}"#);
+    assert_eq!(output.trim(), r#"{"a":"1.7976931348623157e+308"}"#);
 
     Ok(())
 }
@@ -10755,17 +10758,20 @@ fn test_jq_stderr_and_halt_error_unaffected_by_yq_mode_fix_1051() -> Result<()> 
 
 /// #1060: `numeric_display_string`'s NaN/Infinity fast path gained an
 /// `S`-gated yq-only branch (`.nan`/`.inf`/`-.inf`); confirm jq mode's own
-/// bare `f64::Display` spelling (`NaN`/`inf`/`-inf`) is unaffected. (Real
-/// jq's own `infinite` builtin substitutes `DBL_MAX` rather than true IEEE
-/// infinity -- succinctly doesn't replicate that quirk, a pre-existing,
-/// unrelated divergence; this test pins succinctly's own actual jq-mode
-/// output, not real jq's.)
+/// spelling is unaffected by that yq-only addition. jq mode's own spelling
+/// was, at the time #1060 landed, still Rust's bare `f64::Display`
+/// (`NaN`/`inf`/`-inf`) -- a separate, pre-existing divergence from real
+/// jq's actual `DBL_MAX`/`null` substitution, since fixed by #1075. This test
+/// now pins that corrected, oracle-matching jq-mode output instead.
 #[test]
 fn test_jq_tostring_special_floats_unaffected_by_yq_mode_fix_1060() -> Result<()> {
     for (filter, want) in [
-        ("infinite | tostring", r#""inf""#),
-        ("(-1 * infinite) | tostring", r#""-inf""#),
-        ("nan | tostring", r#""NaN""#),
+        ("infinite | tostring", r#""1.7976931348623157e+308""#),
+        (
+            "(-1 * infinite) | tostring",
+            r#""-1.7976931348623157e+308""#,
+        ),
+        ("nan | tostring", r#""null""#),
     ] {
         let (out, code) = run_jq_stdin(filter, "null", &["-c"])?;
         assert_eq!(code, 0, "for {filter:?}: {out:?}");

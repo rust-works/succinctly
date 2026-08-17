@@ -139,8 +139,8 @@ use super::expr::{
     ObjectKey, Pattern, StringPart,
 };
 use super::value::{
-    assert_value_tree_depth, cmp_f64, is_nan_sentinel, numeric_repr_cmp, owned_value_eq,
-    NumberRepr, OwnedValue,
+    assert_value_tree_depth, cmp_f64, infinite_float_preview_text, is_nan_sentinel,
+    numeric_repr_cmp, owned_value_eq, NumberRepr, OwnedValue,
 };
 
 /// Result of evaluating a jq expression.
@@ -5156,15 +5156,40 @@ fn eval_string_interpolation<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// Render a numeric value the way the non-JSON text formats want it.
 ///
 /// `number_str()` deliberately skips NaN/Infinity handling (see its doc
-/// comment) because `to_json` needs "null" instead. Text formats (`@text`,
+/// comment) because `to_json` needs its own substitution instead (currently
+/// "null" for both NaN and Infinity in jq mode -- correct for NaN, but not
+/// for a *computed* Infinity, which real jq instead gives `DBL_MAX` text the
+/// same as this function now does; that's issue #1087, separate from and
+/// out of scope for this function's own fix). Text formats (`@text`,
 /// `@uri`, `@html`, `@sh`, and the CSV/TSV/DSV cell formatter that falls back
-/// to `owned_to_string`) want the same `"inf"`/`"-inf"`/`"NaN"` rendering a
-/// plain `Int`/`Float` already gets from `f64::to_string()` in jq mode -- a
-/// `NumberLiteral` just needs that check made explicit: `format_number_jq_compat`
-/// now formats an overflowed literal's source text correctly (#930), but its
-/// jq-error-message-preview text (e.g. `1E+400`) still isn't the Rust-style
-/// `"inf"`/`"-inf"` these non-JSON text formats want, so the explicit check
-/// stays regardless.
+/// to `owned_to_string`) instead want jq's own JSON-substitution spelling for
+/// a non-finite `Float`/`NumberLiteral` (#1075: `null` for NaN, `DBL_MAX`'s
+/// literal text for +/-infinity -- confirmed live against jq 1.7.1, e.g.
+/// `nan | tostring` -> `"null"`, `infinite | tostring` ->
+/// `"1.7976931348623157e+308"`), not Rust's own `f64::Display`
+/// (`"NaN"`/`"inf"`/`"-inf"`), which this unconditionally rendered before
+/// #1075.
+///
+/// This also applies to a jq-mode `NumberLiteral` overflowing to infinity
+/// (e.g. `1e400`), even though real jq's own decNumber-backed literal
+/// preservation would reformat *some* such literals' source text instead
+/// (`1e400 | tostring` -> `"1E+400"`, live-verified) rather than substituting
+/// `DBL_MAX` text -- deliberately not attempted here (#1075 review): the
+/// `eval_owned_expr`/`eval_owned_pipe` reindex bridge (`reduce`/`foreach`/
+/// `as $x`/multi-stage pipes) round-trips a *computed* infinity through its
+/// own smuggling literal (`to_json_for_reindex`'s `1e999`/`-1e999`, see
+/// `overflow_literal` in `value.rs`) which -- unlike its NaN-sentinel sibling
+/// -- is NOT guaranteed-unparseable as a genuine document literal, so once
+/// reparsed it is bit-for-bit indistinguishable from a real `1e999` literal a
+/// user actually typed. Letting jq mode fall through to
+/// `format_number_jq_compat` here (an earlier draft of this fix did exactly
+/// that) reformats that reindexed sentinel as `"1E+999"` instead of the
+/// correct `DBL_MAX` substitution -- a real, oracle-confirmed regression this
+/// review caught. See issue #1083 (filed alongside this fix) for the
+/// literal-preservation gap this leaves: it needs the reindex bridge's own
+/// infinity sentinel made collision-safe first (mirroring `NAN_SENTINEL`'s
+/// already-safe two-exponent-marker trick) before this function can safely
+/// stop intercepting a jq-mode `NumberLiteral` here.
 ///
 /// yq mode instead wants YAML's own `.nan`/`.inf`/`-.inf` spelling (#1060) --
 /// this was previously unconditional (`f.to_string()`, jq's own spelling in
@@ -5206,13 +5231,22 @@ pub(crate) fn numeric_display_string<S: EvalSemantics>(value: &OwnedValue) -> St
     value.number_str().expect("numeric variant").into_owned()
 }
 
-/// jq's bare `f64::Display` (`NaN`/`inf`/`-inf`) vs yq's own YAML-native
-/// spelling (`.nan`/`.inf`/`-.inf`) for a non-finite float.
+/// jq's own JSON-substitution spelling for a *computed* non-finite float
+/// (`null` for NaN, `DBL_MAX`'s literal text for +/-infinity) vs yq's own
+/// YAML-native spelling (`.nan`/`.inf`/`-.inf`).
 ///
-/// See `numeric_display_string`'s own doc comment for the
-/// "document-sourced vs computed" caveat this doesn't attempt to resolve
-/// (not a doc link: that function is `pub(crate)`, unresolvable from this
-/// one's now-`pub` docs).
+/// The jq-mode branch was Rust's bare `f64::Display` (`"NaN"`/`"inf"`/
+/// `"-inf"`) before #1075 -- that never matched real jq, which spells a
+/// computed NaN as JSON `null` (the same substitution `to_json` already uses)
+/// and a computed +/-infinity as `f64::MAX`'s decimal expansion, sign
+/// preserved (confirmed live against jq 1.7.1: `nan | tostring` -> `"null"`,
+/// `infinite | tostring` -> `"1.7976931348623157e+308"`, `-infinite |
+/// tostring` -> `"-1.7976931348623157e+308"`).
+///
+/// See `numeric_display_string`'s own doc comment (`src/jq/eval.rs`, not
+/// doc-linkable from here since it's `pub(crate)`) for the
+/// "document-sourced vs computed" caveat this doesn't attempt to resolve,
+/// and issue #1083 for the gap that leaves open.
 ///
 /// `pub`, not `pub(crate)`: `src/bin/succinctly/yq_runner.rs` is a separate
 /// binary crate depending on this one as an external dependency, and is one
@@ -5224,17 +5258,21 @@ pub(crate) fn numeric_display_string<S: EvalSemantics>(value: &OwnedValue) -> St
 /// silently" lesson).
 ///
 /// Returns `&'static str`, not `String`: every branch is one of a fixed
-/// 6-string set (Rust's own `f64::Display` always normalizes any NaN bit
-/// pattern to exactly `"NaN"`, and any infinity to `"inf"`/`"-inf"`,
-/// regardless of payload/magnitude -- verified directly, not assumed).
-/// Lets the two streaming call sites (`stream.rs`, `json/light.rs`) write
-/// this straight into their `Write` sink with no heap allocation, instead
-/// of allocating a `String` just to borrow and immediately drop it.
+/// 6-string set (each of jq/yq mode's NaN/+infinity/-infinity spelling is a
+/// fixed string regardless of the input float's exact bit pattern/payload --
+/// verified directly, not assumed). Lets the two streaming call sites
+/// (`stream.rs`, `json/light.rs`) write this straight into their `Write`
+/// sink with no heap allocation, instead of allocating a `String` just to
+/// borrow and immediately drop it.
 ///
 /// # Examples
 ///
 /// ```
-/// use succinctly::jq::{nonfinite_display_string, YqSemantics};
+/// use succinctly::jq::{nonfinite_display_string, JqSemantics, YqSemantics};
+///
+/// assert_eq!(nonfinite_display_string::<JqSemantics>(f64::NAN), "null");
+/// assert_eq!(nonfinite_display_string::<JqSemantics>(f64::INFINITY), "1.7976931348623157e+308");
+/// assert_eq!(nonfinite_display_string::<JqSemantics>(f64::NEG_INFINITY), "-1.7976931348623157e+308");
 ///
 /// assert_eq!(nonfinite_display_string::<YqSemantics>(f64::NAN), ".nan");
 /// assert_eq!(nonfinite_display_string::<YqSemantics>(f64::INFINITY), ".inf");
@@ -5243,11 +5281,9 @@ pub(crate) fn numeric_display_string<S: EvalSemantics>(value: &OwnedValue) -> St
 pub fn nonfinite_display_string<S: EvalSemantics>(f: f64) -> &'static str {
     if S::TAG != EvalTag::Yq {
         if f.is_nan() {
-            "NaN"
-        } else if f.is_sign_negative() {
-            "-inf"
+            "null"
         } else {
-            "inf"
+            infinite_float_preview_text(f.is_sign_negative())
         }
     } else if f.is_nan() {
         ".nan"
@@ -28880,44 +28916,117 @@ mod tests {
         );
     }
 
+    /// #1075: a *computed* non-finite float (the bare `nan`/`infinite`
+    /// builtins, not a document-sourced literal) must spell itself the way
+    /// real jq's own JSON-substitution convention does, not Rust's bare
+    /// `f64::Display` -- confirmed live against jq 1.7.1.
     #[test]
-    fn test_number_literal_overflow_renders_as_inf_not_garbage() {
+    fn test_builtin_tostring_computed_nonfinite_matches_jq_1075() {
+        query!(br"null", "nan | tostring",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "null");
+            }
+        );
+
+        query!(br"null", "infinite | tostring",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "1.7976931348623157e+308");
+            }
+        );
+
+        query!(br"null", "-infinite | tostring",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "-1.7976931348623157e+308");
+            }
+        );
+
+        query!(br"null", "[nan] | @sh",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "null");
+            }
+        );
+
+        query!(br"null", "nan | @uri",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "null");
+            }
+        );
+
+        query!(br"null", "infinite | @uri",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "1.7976931348623157e%2B308");
+            }
+        );
+
+        query!(br"null", "nan | @html",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "null");
+            }
+        );
+
+        query!(br"null", r#"nan | "\(.)""#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "null");
+            }
+        );
+    }
+
+    #[test]
+    fn test_number_literal_overflow_renders_correctly_not_garbage() {
         // A `NumberLiteral` whose parsed f64 overflows to infinity used to
         // re-render its raw source text through `format_number_jq_compat`,
-        // producing garbage like "NaNE+2147483647" instead of "inf" (#561).
+        // producing garbage like "NaNE+2147483647" (#561), then later
+        // "inf"/"-inf" (Rust's own `f64::Display`, still wrong -- #1075).
+        //
+        // Both signs now take jq mode's `DBL_MAX`-text substitution
+        // (`nonfinite_display_string`, #1075) -- this still isn't a full
+        // match for real jq, which reformats *both* an overflowed literal's
+        // own source text (`1e400 | tostring` -> `"1E+400"`, `-1e400 |
+        // tostring` -> `"-1E+400"`, live-verified against jq 1.7.1 for this
+        // exact input-document shape -- i.e. the literal typed directly as
+        // the JSON document, which is what `query!`'s first argument always
+        // is) rather than substituting `DBL_MAX` for either sign; see
+        // `numeric_display_string`'s own doc comment and issue #1083 for why
+        // that gap is deliberately left open here. (A leading `-` typed
+        // *inside a filter expression* instead, e.g. `-1e400 | tostring` as
+        // the filter text rather than the input, is a different story --
+        // jq's own filter grammar treats that as unary negation on the
+        // positive literal, degrading fidelity the same way #1035 already
+        // documents for smaller literals -- but that's not the shape any
+        // test here exercises.)
         query!(br"1e400", "tostring",
             QueryResult::Owned(OwnedValue::String(s)) => {
-                assert_eq!(s, "inf");
+                assert_eq!(s, "1.7976931348623157e+308");
             }
         );
 
         query!(br"-1e400", "tostring",
             QueryResult::Owned(OwnedValue::String(s)) => {
-                assert_eq!(s, "-inf");
+                assert_eq!(s, "-1.7976931348623157e+308");
             }
         );
 
         query!(br"1e400", "@uri",
             QueryResult::Owned(OwnedValue::String(s)) => {
-                assert_eq!(s, "inf");
+                assert_eq!(s, "1.7976931348623157e%2B308");
             }
         );
 
         query!(br"1e400", "@html",
             QueryResult::Owned(OwnedValue::String(s)) => {
-                assert_eq!(s, "inf");
+                assert_eq!(s, "1.7976931348623157e+308");
             }
         );
 
         query!(br"1e400", "@sh",
             QueryResult::Owned(OwnedValue::String(s)) => {
-                assert_eq!(s, "inf");
+                assert_eq!(s, "1.7976931348623157e+308");
             }
         );
 
         query!(br"1e400", r#""\(.)""#,
             QueryResult::Owned(OwnedValue::String(s)) => {
-                assert_eq!(s, "inf");
+                assert_eq!(s, "1.7976931348623157e+308");
             }
         );
     }
@@ -28930,36 +29039,45 @@ mod tests {
         // `OwnedValue` back to JSON text and reparse it to keep evaluating --
         // the same bridge pattern `eval_generic.rs` had. Before switching
         // these to `to_json_for_reindex`, an overflowed `NumberLiteral` was
-        // silently turned into JSON `null` by that round-trip, so `. as $x |
-        // $x | tostring` produced "null" instead of "inf" even though a
-        // direct `tostring` (tested above) was already fixed (#561).
+        // silently turned into JSON `null` by that round-trip (#561); now it
+        // survives as the same `DBL_MAX`-text substitution the bare-literal
+        // test above uses (#1075) -- these bridges are exactly the reason
+        // `numeric_display_string` cannot safely stop substituting here for
+        // *any* jq-mode overflowed `NumberLiteral` yet (see its own doc
+        // comment and issue #1083): `to_json_for_reindex`'s own `1e999`
+        // smuggling literal reparses into a `NumberLiteral` indistinguishable
+        // from a real one, so a literal-preserving reformat here would wrongly
+        // reformat that internal sentinel too.
         query!(br"1e400", ". as $x | $x | tostring",
             QueryResult::Owned(OwnedValue::String(s)) => {
-                assert_eq!(s, "inf");
+                assert_eq!(s, "1.7976931348623157e+308");
             }
         );
 
         query!(br"-1e400", ". as $x | $x | tostring",
             QueryResult::Owned(OwnedValue::String(s)) => {
-                assert_eq!(s, "-inf");
+                assert_eq!(s, "-1.7976931348623157e+308");
             }
         );
 
         query!(br"1e400", "reduce (1) as $x (.; .) | tostring",
             QueryResult::Owned(OwnedValue::String(s)) => {
-                assert_eq!(s, "inf");
+                assert_eq!(s, "1.7976931348623157e+308");
             }
         );
 
         query!(br"1e400", "foreach (1) as $x (.; .) | tostring",
             QueryResult::Owned(OwnedValue::String(s)) => {
-                assert_eq!(s, "inf");
+                assert_eq!(s, "1.7976931348623157e+308");
             }
         );
 
         query!(br#"{"a":1e400}"#, "with_entries(.value |= (. | tostring))",
             QueryResult::Owned(OwnedValue::Object(obj)) => {
-                assert_eq!(obj.get("a"), Some(&OwnedValue::String("inf".to_string())));
+                assert_eq!(
+                    obj.get("a"),
+                    Some(&OwnedValue::String("1.7976931348623157e+308".to_string()))
+                );
             }
         );
     }
