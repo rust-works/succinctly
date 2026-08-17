@@ -1138,10 +1138,12 @@ pub enum Literal {
     /// The `NumberRepr` is the same value `parse`'s tokenizer already
     /// computed (via `parse_i64_or_f64`) to decide whether this spelling
     /// even qualifies for `NumberLiteral` in the first place (#1062) --
-    /// carrying it through means every downstream evaluation of this AST
-    /// node (`literal_to_owned`, `eval_single`, `JqValue::from_literal`)
-    /// clones a pre-parsed `Copy` value instead of re-running
-    /// `i64`/`f64::from_str` and re-allocating a `Box<str>` on every visit,
+    /// carrying it through means `literal_to_owned`/`eval_single` (via
+    /// `From<Literal> for OwnedValue`) clone a pre-parsed `Copy` value on
+    /// every evaluation of this AST node instead of re-running
+    /// `i64`/`f64::from_str`. `JqValue::from_literal` (`lazy.rs`)
+    /// deliberately does *not* benefit -- see its own doc comment for why
+    /// its laziness means reading `repr` here at all would be premature,
     /// same shape as `OwnedValue::NumberLiteral(NumberRepr, Box<str>)`
     /// already uses on the read side.
     NumberLiteral(NumberRepr, String),
@@ -1361,16 +1363,33 @@ impl Literal {
 
     /// Create a source-text-preserving number literal (#1062), parsing
     /// `text` once here rather than leaving every call site to compute its
-    /// own `NumberRepr`. Panics if `text` isn't a valid number spelling --
-    /// every real caller (the parser, `From<OwnedValue>`-style splices)
-    /// already knows `text` parses, from having produced or validated it
-    /// itself; this constructor exists for the many call sites (mostly
-    /// tests) that only ever pass a literal they already know is valid.
+    /// own `NumberRepr`. Panics if `text` isn't RFC-8259-valid number
+    /// syntax -- every real caller (the parser, `From<OwnedValue>`-style
+    /// splices) already knows `text` parses, from having produced or
+    /// validated it itself; this constructor exists for the many call
+    /// sites (mostly tests) that only ever pass a literal they already
+    /// know is valid.
+    ///
+    /// Gated on `is_valid_number`, not just `parse_i64_or_f64`: Rust's own
+    /// `f64::from_str` accepts spellings like `"nan"`/`"inf"`/`"infinity"`
+    /// that aren't valid JSON/jq number syntax at all -- without this
+    /// check, this constructor would silently succeed on those instead of
+    /// panicking as documented, unlike the real parser (which gates on the
+    /// identical check before ever reaching `Literal::NumberLiteral`).
     #[track_caller]
     pub fn number_literal(text: impl Into<String>) -> Self {
         let text = text.into();
+        // A direct `panic!` (not inside a closure) so `#[track_caller]`
+        // actually blames the caller, not this function's own line --
+        // `.unwrap_or_else(|| panic!(...))` would defeat it.
+        if !crate::json::validate::is_valid_number(text.as_bytes()) {
+            panic!("Literal::number_literal: {text:?} is not a valid number spelling");
+        }
+        // `is_valid_number` guarantees `parse_i64_or_f64` succeeds --
+        // RFC-8259 number syntax always parses as `f64` at worst (extreme
+        // magnitudes just become +/-infinity, never a parse failure).
         let repr = super::value::parse_i64_or_f64(&text)
-            .unwrap_or_else(|| panic!("Literal::number_literal: {text:?} is not a valid number"));
+            .expect("is_valid_number guarantees parse_i64_or_f64 succeeds");
         Self::NumberLiteral(repr, text)
     }
 }
@@ -1473,6 +1492,21 @@ mod tests {
     #[should_panic(expected = "is not a valid number")]
     fn test_number_literal_panics_on_invalid_text_1062() {
         Literal::number_literal("not a number");
+    }
+
+    /// Rust's own `f64::from_str` accepts `"nan"`/`"inf"`/`"infinity"`, but
+    /// none of those are valid JSON/jq number syntax -- `number_literal`
+    /// must reject them too, not just gate on `parse_i64_or_f64` succeeding.
+    #[test]
+    #[should_panic(expected = "is not a valid number spelling")]
+    fn test_number_literal_rejects_rust_only_float_spellings_1062() {
+        Literal::number_literal("nan");
+    }
+
+    #[test]
+    #[should_panic(expected = "is not a valid number spelling")]
+    fn test_number_literal_rejects_infinity_spelling_1062() {
+        Literal::number_literal("infinity");
     }
 
     #[test]
