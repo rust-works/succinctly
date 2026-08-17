@@ -2181,6 +2181,22 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 self.indent_stack.pop();
                 self.pop_type();
                 self.write_bp_close();
+
+                // The sequence just closed may itself have been the
+                // pending explicit key's own implicit value (`? k\n-
+                // item\n`, at the same indent as the key). Clear the
+                // stale flag now that the key's real value is fully
+                // closed -- unlike every other pop site's
+                // `close_pending_explicit_key()` call, no null is
+                // synthesized here: the key already received a real
+                // value, so this isn't the "encountered without an
+                // explicit value" case that helper handles. Left stale,
+                // a later mapping entry at this same indent would be
+                // silently misattributed to the closed key instead of
+                // starting fresh (#1040).
+                if self.pending_explicit_key == Some(self.indent_stack.len()) {
+                    self.pending_explicit_key = None;
+                }
             }
         }
     }
