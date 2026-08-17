@@ -10450,15 +10450,26 @@ fn yq_del_scalar_slice_parent_path(path_expr: &Expr, root: &OwnedValue) -> Optio
         return None;
     }
     Some(match prefix.len() {
-        // Unreachable in practice: `resolve_dynamic_indexes`'s own
-        // `assemble()` never wraps a single resolved component in
-        // `Expr::Pipe` (a length-1 component list returns that component
-        // directly, `strip_resolved_optional` only strips wrappers *within*
-        // an existing `Pipe`, never collapses one), so `exprs.len() >= 2`
-        // always holds here and `prefix.len()` can never be `0`. Kept
-        // explicit (rather than folded into the `_` arm) for clarity, since
-        // it's still the semantically correct value if that invariant ever
-        // changes.
+        // Unreachable from `builtin_del`'s own top-level call site:
+        // `resolve_dynamic_indexes`'s own `assemble()` never wraps a single
+        // resolved component in `Expr::Pipe` (a length-1 component list
+        // returns that component directly, `strip_resolved_optional` only
+        // strips wrappers *within* an existing `Pipe`, never collapses
+        // one), so `exprs.len() >= 2` always holds there and `prefix.len()`
+        // can never be `0` for that caller.
+        //
+        // *Is* reached from `delete_at_path`'s `Expr::Iterate` arm (#1182),
+        // which always wraps its `rest` in `Expr::Pipe` regardless of
+        // length -- a bare `.[]` directly followed by the trailing slice
+        // (`del(.a[][0:1])`, no `Field`/`Index` between) resolves `prefix`
+        // to the empty slice, so `target` (from `navigate_read_only` with
+        // zero steps) is the element itself. `Expr::Identity` signals that
+        // case back to the caller: there is no parent *key* to drop here,
+        // the element itself is the thing to remove from its container --
+        // that caller special-cases this return value rather than
+        // recursing `delete_at_path` on it (which would just null the
+        // element in place via its own `Expr::Identity` arm, not remove
+        // it).
         0 => Expr::Identity,
         1 => prefix[0].clone(),
         _ => Expr::Pipe(prefix.to_vec()),
@@ -19483,47 +19494,76 @@ fn delete_at_path(
                     },
                     Expr::Iterate => match root {
                         OwnedValue::Array(arr) => {
-                            for elem in arr.iter_mut() {
-                                // #1182: yq's chained-scalar-slice del() rule
-                                // (#1116) can't be applied upfront for this
-                                // shape -- the caller's own rewrite
-                                // (`yq_del_scalar_slice_parent_path`) only
-                                // runs once, before this walk even starts,
-                                // and its `navigate_read_only` prefix-peek
-                                // has no way to look *through* an
-                                // as-yet-unresolved `.[]` to find each
-                                // element's own scalar target. So the rule is
-                                // attempted again here, once per element,
-                                // against `rest` (the path remaining after
-                                // this `.[]`) -- `None` (rule doesn't apply
-                                // to this element, or not yq mode at all)
-                                // just walks `rest` unchanged, exactly as
-                                // before this fix.
+                            // #1182: yq's chained-scalar-slice del() rule
+                            // (#1116) can't be applied upfront for this
+                            // shape -- the caller's own rewrite
+                            // (`yq_del_scalar_slice_parent_path`) only
+                            // runs once, before this walk even starts,
+                            // and its `navigate_read_only` prefix-peek
+                            // has no way to look *through* an
+                            // as-yet-unresolved `.[]` to find each
+                            // element's own scalar target. So the rule is
+                            // attempted again here, once per element,
+                            // against `rest` (the path remaining after
+                            // this `.[]`) -- `None` (rule doesn't apply
+                            // to this element, or not yq mode at all)
+                            // just walks `rest` unchanged, exactly as
+                            // before this fix.
+                            //
+                            // `Some(Expr::Identity)` is a distinct signal
+                            // from any other rewrite: it means the *element
+                            // itself* is the scalar the trailing slice would
+                            // have targeted (`.[]` directly followed by the
+                            // slice, no `Field`/`Index` between). There is
+                            // no parent key to drop one level down from an
+                            // `&mut` reference into this array slot --
+                            // `delete_at_path`'s own `Expr::Identity` arm
+                            // would just null the element in place, not
+                            // remove it, so this element's index is queued
+                            // for removal from `arr` itself after the loop
+                            // instead of being recursed into.
+                            let mut remove_indices = Vec::new();
+                            for (i, elem) in arr.iter_mut().enumerate() {
                                 let rewritten = yq_mode
                                     .then(|| yq_del_scalar_slice_parent_path(&rest, elem))
                                     .flatten();
-                                delete_at_path(
-                                    elem,
-                                    rewritten.as_ref().unwrap_or(&rest),
-                                    optional,
-                                    yq_mode,
-                                )?;
+                                if matches!(rewritten, Some(Expr::Identity)) {
+                                    remove_indices.push(i);
+                                } else {
+                                    delete_at_path(
+                                        elem,
+                                        rewritten.as_ref().unwrap_or(&rest),
+                                        optional,
+                                        yq_mode,
+                                    )?;
+                                }
+                            }
+                            for i in remove_indices.into_iter().rev() {
+                                arr.remove(i);
                             }
                             Ok(())
                         }
                         OwnedValue::Object(map) => {
-                            for value in map.values_mut() {
-                                // Same per-element rewrite as the array arm
-                                // above.
+                            // Same per-element rewrite and elem-is-target
+                            // removal as the array arm above.
+                            let mut remove_keys = Vec::new();
+                            for (key, value) in map.iter_mut() {
                                 let rewritten = yq_mode
                                     .then(|| yq_del_scalar_slice_parent_path(&rest, value))
                                     .flatten();
-                                delete_at_path(
-                                    value,
-                                    rewritten.as_ref().unwrap_or(&rest),
-                                    optional,
-                                    yq_mode,
-                                )?;
+                                if matches!(rewritten, Some(Expr::Identity)) {
+                                    remove_keys.push(key.clone());
+                                } else {
+                                    delete_at_path(
+                                        value,
+                                        rewritten.as_ref().unwrap_or(&rest),
+                                        optional,
+                                        yq_mode,
+                                    )?;
+                                }
+                            }
+                            for key in remove_keys {
+                                map.shift_remove(&key);
                             }
                             Ok(())
                         }

@@ -14414,23 +14414,64 @@ fn test_1182_chained_scalar_slice_del_through_iterate_array_target_unaffected() 
 /// a scalar target, same as real jq) instead of yq's parent-key-drop rule.
 #[test]
 fn test_1182_chained_scalar_slice_del_through_iterate_jq_mode_unaffected() -> Result<()> {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_succinctly"));
-    cmd.arg("jq")
-        .arg("-c")
-        .arg("del(.a[].b[0:1])")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = cmd.spawn()?;
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(br#"{"a":[{"b":5,"c":1}]}"#)?;
-    let output = child.wait_with_output()?;
-    assert_ne!(output.status.code(), Some(0));
-    let stderr = String::from_utf8(output.stderr)?;
+    let (_out, stderr, code) =
+        run_jq_stdin_with_stderr("del(.a[].b[0:1])", r#"{"a":[{"b":5,"c":1}]}"#, &["-c"])?;
+    assert_ne!(code, 0);
     assert!(stderr.contains("Cannot index"), "stderr: {stderr}");
+    Ok(())
+}
+
+/// `.[]` directly followed by the trailing slice, with no `Field`/`Index`
+/// between -- the element itself (not a field reached through it) is the
+/// scalar the rule applies to. `yq_del_scalar_slice_parent_path`'s
+/// `prefix.len() == 0` case signals this back as `Expr::Identity`; the
+/// `Expr::Iterate` arm must special-case that as "remove this element from
+/// its container" rather than recursing `delete_at_path` on it (which would
+/// just null the element in place via its own `Expr::Identity` arm). Caught
+/// during review of the initial #1182 fix, which recursed unconditionally
+/// and silently corrupted this shape (`{"a":[null,null,null]}` instead of
+/// removing the elements) where the pre-fix code had at least errored
+/// loudly. Real yq drops every element (verified live).
+#[test]
+fn test_1182_bare_iterate_directly_followed_by_slice_removes_elements() -> Result<()> {
+    let (out, code) = run_yq_stdin("del(.a[][0:1])", r#"{"a":[5,6,7]}"#, &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), r#"{"a":[]}"#);
+    Ok(())
+}
+
+/// Same as above but iterating an object's values instead of an array --
+/// the `OwnedValue::Object` arm of the same `Expr::Iterate` match needs the
+/// identical elem-is-target removal, via `map.shift_remove` instead of
+/// `arr.remove`. Real yq drops every value, leaving `.a` an empty mapping
+/// (verified live).
+#[test]
+fn test_1182_bare_iterate_directly_followed_by_slice_removes_object_values() -> Result<()> {
+    let (out, code) = run_yq_stdin(
+        "del(.a[][0:1])",
+        r#"{"a":{"x":5,"y":6}}"#,
+        &["-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), r#"{"a":{}}"#);
+    Ok(())
+}
+
+/// The `OwnedValue::Object` branch of `delete_at_path`'s `Expr::Iterate` arm
+/// (`.[]` iterating an object's *values*, as opposed to an array) is a
+/// separate, hand-duplicated match arm from the array case exercised by
+/// every other `_1182` test above -- give it its own direct coverage so a
+/// future edit to one arm without the other (e.g. dropping the `yq_mode`
+/// gate, swapping which variable gets rewritten) doesn't go unnoticed.
+#[test]
+fn test_1182_chained_scalar_slice_del_through_object_iterate() -> Result<()> {
+    let (out, code) = run_yq_stdin(
+        "del(.a[].b[0:1])",
+        r#"{"a":{"x":{"b":5,"c":1},"y":{"b":6,"c":2}}}"#,
+        &["-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), r#"{"a":{"x":{"c":1},"y":{"c":2}}}"#);
     Ok(())
 }
 
