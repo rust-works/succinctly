@@ -746,9 +746,9 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // Phase 9: Variables & Definitions
         Expr::AsPattern {
             expr,
-            pattern,
+            patterns,
             body,
-        } => eval_as_pattern::<W, S>(expr, pattern, body, value, optional),
+        } => eval_as_pattern::<W, S>(expr, patterns, body, value, optional),
         Expr::FuncDef {
             name,
             params,
@@ -13850,14 +13850,16 @@ fn substitute_var(expr: &Expr, var_name: &str, replacement: &OwnedValue) -> Expr
         // Phase 9: Variables & Definitions
         Expr::AsPattern {
             expr,
-            pattern,
+            patterns,
             body,
         } => {
-            // Check if any pattern variable shadows the var_name
-            let shadowed = pattern_binds_var(pattern, var_name);
+            // Shadowed if *any* alternative binds var_name -- the body's
+            // scope has to treat the name consistently across every
+            // alternative it might actually run under (#720).
+            let shadowed = patterns.iter().any(|p| pattern_binds_var(p, var_name));
             Expr::AsPattern {
                 expr: Box::new(substitute_var(expr, var_name, replacement)),
-                pattern: pattern.clone(),
+                patterns: patterns.clone(),
                 body: if shadowed {
                     body.clone()
                 } else {
@@ -23076,10 +23078,11 @@ fn pivot_objects<'a, W: Clone + AsRef<[u64]>>(items: &[OwnedValue]) -> QueryResu
 // Phase 9: Variables & Definitions
 // ============================================================================
 
-/// Evaluate destructuring pattern binding: `expr as {key: $var, ...} | body`.
+/// Evaluate destructuring pattern binding: `expr as {key: $var, ...} | body`,
+/// including `?//`-separated alternatives (#720).
 fn eval_as_pattern<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     expr: &Expr,
-    pattern: &Pattern,
+    patterns: &[Pattern],
     body: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
@@ -23104,42 +23107,158 @@ fn eval_as_pattern<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             QueryResult::Partial(vs, control) => (vs, Some(control)),
         };
 
+    // Every variable name any alternative might bind -- a var referenced in
+    // the body but bound only by an alternative that didn't end up matching
+    // still resolves to `null`, not "undefined variable" (confirmed live
+    // against jq 1.7.1: `. as [$a] ?// {$b} | [$a,$b]` on `[1]` gives
+    // `[1,null]`). A no-op allocation when `patterns` has one element (the
+    // common, non-`?//` case).
+    let mut all_var_names: Vec<String> = Vec::new();
+    for pattern in patterns {
+        collect_pattern_var_names(pattern, &mut all_var_names);
+    }
+
     let mut all_results: Vec<OwnedValue> = Vec::new();
 
     for bound_val in bound_values {
-        // Extract bindings from the pattern
-        let bindings = match extract_pattern_bindings(pattern, &bound_val) {
-            Ok(b) => b,
-            Err(e) => return e.into(),
-        };
-
-        // Substitute all bindings in the body
-        let mut substituted_body = body.clone();
-        for (var_name, var_value) in &bindings {
-            substituted_body = substitute_var(&substituted_body, var_name, var_value);
-        }
-
-        match eval_single::<W, S>(&substituted_body, value.clone(), optional).materialize_cursor() {
-            QueryResult::One(v) => all_results.push(to_owned(&v)),
-            QueryResult::OneCursor(_) => unreachable!(),
-            QueryResult::Many(vs) => all_results.extend(vs.iter().map(to_owned)),
-            QueryResult::Owned(v) => all_results.push(v),
-            QueryResult::ManyOwned(vs) => all_results.extend(vs),
-            QueryResult::None => {}
-            // The outputs already produced no longer vanish (#400, #494).
-            QueryResult::Error(e) => return partial(all_results, Control::Error(e)),
-            QueryResult::Break(label) => return partial(all_results, Control::Break(label)),
-            QueryResult::Halt(code) => return partial(all_results, Control::Halt(code)),
-            QueryResult::Partial(vs, control) => {
+        match try_pattern_alternatives::<W, S>(
+            patterns,
+            &all_var_names,
+            body,
+            &bound_val,
+            &value,
+            optional,
+        ) {
+            Ok((vs, None)) => all_results.extend(vs),
+            Ok((vs, Some(control))) => {
                 all_results.extend(vs);
                 return partial(all_results, control);
             }
+            Err(e) => return e.into(),
         }
     }
 
     match bound_control {
         Some(control) => partial(all_results, control),
         None => owned_vec_to_result(all_results),
+    }
+}
+
+/// Try each `?//`-separated pattern alternative against `bound_val`, in
+/// order. The first alternative whose pattern matches *and* whose
+/// substituted body doesn't error wins. A pattern-match failure or a body
+/// `error(...)`/type error falls through to the next alternative; `break`,
+/// `halt`, and empty output do not (confirmed live: both propagate
+/// immediately, never retried). On the *last* alternative, either failure
+/// is the final outcome -- this degrades to exactly the pre-`?//` single-
+/// pattern behavior when `patterns` has one element.
+///
+/// A body error's own partial output (if the body is itself a generator,
+/// e.g. `(1, error("x"))`) is *not* discarded on fallthrough -- confirmed
+/// live: each tried alternative's own partial output before its error is
+/// kept, not just the winning alternative's (or the last one's, if none
+/// win) -- so the returned `Vec<OwnedValue>` accumulates across every
+/// alternative actually attempted, not just the final one.
+fn try_pattern_alternatives<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    patterns: &[Pattern],
+    all_var_names: &[String],
+    body: &Expr,
+    bound_val: &OwnedValue,
+    value: &StandardJson<'_, W>,
+    optional: bool,
+) -> Result<(Vec<OwnedValue>, Option<Control>), EvalError> {
+    let last_idx = patterns.len() - 1;
+    let mut carried: Vec<OwnedValue> = Vec::new();
+
+    for (i, pattern) in patterns.iter().enumerate() {
+        let is_last = i == last_idx;
+
+        let bindings = match extract_pattern_bindings(pattern, bound_val) {
+            Ok(b) => b,
+            Err(e) => {
+                if is_last {
+                    return Err(e);
+                }
+                continue;
+            }
+        };
+
+        let mut substituted_body = body.clone();
+        let mut bound_names: Vec<&str> = Vec::with_capacity(bindings.len());
+        for (var_name, var_value) in &bindings {
+            substituted_body = substitute_var(&substituted_body, var_name, var_value);
+            bound_names.push(var_name.as_str());
+        }
+        for var_name in all_var_names {
+            if !bound_names.contains(&var_name.as_str()) {
+                substituted_body = substitute_var(&substituted_body, var_name, &OwnedValue::Null);
+            }
+        }
+
+        match eval_single::<W, S>(&substituted_body, value.clone(), optional).materialize_cursor() {
+            QueryResult::One(v) => {
+                carried.push(to_owned(&v));
+                return Ok((carried, None));
+            }
+            QueryResult::OneCursor(_) => unreachable!(),
+            QueryResult::Many(vs) => {
+                carried.extend(vs.iter().map(to_owned));
+                return Ok((carried, None));
+            }
+            QueryResult::Owned(v) => {
+                carried.push(v);
+                return Ok((carried, None));
+            }
+            QueryResult::ManyOwned(vs) => {
+                carried.extend(vs);
+                return Ok((carried, None));
+            }
+            QueryResult::None => return Ok((carried, None)),
+            QueryResult::Error(e) => {
+                if is_last {
+                    return Ok((carried, Some(Control::Error(e))));
+                }
+                continue;
+            }
+            QueryResult::Break(label) => return Ok((carried, Some(Control::Break(label)))),
+            QueryResult::Halt(code) => return Ok((carried, Some(Control::Halt(code)))),
+            QueryResult::Partial(vs, control) => match control {
+                Control::Error(e) => {
+                    carried.extend(vs);
+                    if is_last {
+                        return Ok((carried, Some(Control::Error(e))));
+                    }
+                    continue;
+                }
+                Control::Break(_) | Control::Halt(_) => {
+                    carried.extend(vs);
+                    return Ok((carried, Some(control)));
+                }
+            },
+        }
+    }
+
+    unreachable!(
+        "patterns is always non-empty by construction (the parser never \
+         builds an empty AsPattern), and every loop iteration above \
+         returns on its `is_last` pass"
+    )
+}
+
+/// Collect every variable name a pattern would bind, recursively.
+fn collect_pattern_var_names(pattern: &Pattern, names: &mut Vec<String>) {
+    match pattern {
+        Pattern::Var(name) => names.push(name.clone()),
+        Pattern::Object(entries) => {
+            for entry in entries {
+                collect_pattern_var_names(&entry.pattern, names);
+            }
+        }
+        Pattern::Array(patterns) => {
+            for p in patterns {
+                collect_pattern_var_names(p, names);
+            }
+        }
     }
 }
 
@@ -23422,11 +23541,11 @@ fn expand_func_calls(expr: &Expr, func_name: &str, params: &[String], body: &Exp
         },
         Expr::AsPattern {
             expr,
-            pattern,
+            patterns,
             body: pattern_body,
         } => Expr::AsPattern {
             expr: Box::new(expand_func_calls(expr, func_name, params, body)),
-            pattern: pattern.clone(),
+            patterns: patterns.clone(),
             body: Box::new(expand_func_calls(pattern_body, func_name, params, body)),
         },
         Expr::FuncDef {
@@ -23707,13 +23826,13 @@ fn substitute_func_param(expr: &Expr, param: &str, arg: &Expr) -> Expr {
         },
         Expr::AsPattern {
             expr,
-            pattern,
+            patterns,
             body,
         } => {
-            let shadowed = pattern_binds_var(pattern, param);
+            let shadowed = patterns.iter().any(|p| pattern_binds_var(p, param));
             Expr::AsPattern {
                 expr: Box::new(substitute_func_param(expr, param, arg)),
-                pattern: pattern.clone(),
+                patterns: patterns.clone(),
                 body: if shadowed {
                     body.clone()
                 } else {

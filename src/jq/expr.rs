@@ -266,12 +266,19 @@ pub enum Expr {
 
     // Phase 9: Variables & Definitions
     /// Destructuring variable binding: `. as {name: $n, age: $a} | ...`
-    /// or `. as [$first, $second] | ...`
+    /// or `. as [$first, $second] | ...`, optionally with `?//`-separated
+    /// alternatives (`. as [$a] ?// {$a} | ...`): the first alternative
+    /// whose pattern matches *and* whose body doesn't error is used: a
+    /// pattern-match failure or a body-evaluation error (not `break`/
+    /// `halt`/empty output) falls through to the next alternative, except
+    /// on the last one, where either failure propagates normally. A single
+    /// pattern (the common case) is just a one-element `patterns`.
     AsPattern {
         /// Expression to evaluate and destructure
         expr: Box<Self>,
-        /// Pattern to match against
-        pattern: Pattern,
+        /// Pattern alternatives to try in order (`?//`-separated); usually
+        /// just one
+        patterns: Vec<Pattern>,
         /// Body expression where the variables are in scope
         body: Box<Self>,
     },
