@@ -13464,6 +13464,77 @@ fn test_1119_gsub_array_flags_still_errors_cleanly_not_panics() -> Result<()> {
     Ok(())
 }
 
+// --- #1143: `arith_add`'s array-append and null-passthrough arms must not
+// collapse a `NumberLiteral` operand's own source spelling -- only the arms
+// that genuinely *compute* a new number (Int+Int, Float+Float, ...) should.
+// Verified live against real yq v4.53.3.
+
+#[test]
+fn test_1143_array_plus_number_literal_appends_preserving_spelling() -> Result<()> {
+    let (output, code) = run_yq_stdin("[] + 1e10", "null", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(
+        output.trim(),
+        "[1e10]",
+        "exponent spelling must survive append"
+    );
+
+    let (output, code) = run_yq_stdin("[] + 3.00", "null", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(
+        output.trim(),
+        "[3.00]",
+        "trailing-zero spelling must survive append"
+    );
+
+    let (output, code) = run_yq_stdin("[1,2] + 1e10", "null", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "[1,2,1e10]");
+
+    Ok(())
+}
+
+#[test]
+fn test_1143_null_plus_number_literal_preserves_spelling() -> Result<()> {
+    let (output, code) = run_yq_stdin("null + 1e10", "null", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "1e10");
+
+    let (output, code) = run_yq_stdin("1e10 + null", "null", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "1e10");
+
+    let (output, code) = run_yq_stdin("null + 3.00", "null", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "3.00");
+
+    Ok(())
+}
+
+/// Control: an operand that's genuinely *computed* (not relocated
+/// unchanged) must still get canonical formatting -- #1143's fix must not
+/// accidentally suppress this for the arm that actually adds two numbers.
+#[test]
+fn test_1143_genuine_arithmetic_still_reformats() -> Result<()> {
+    let (output, code) = run_yq_stdin("3.00 + 1", "null", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(
+        output.trim(),
+        "4.0",
+        "a genuinely computed sum must reformat"
+    );
+
+    let (output, code) = run_yq_stdin("[] + (3.00 + 1)", "null", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(
+        output.trim(),
+        "[4.0]",
+        "appending a computed (not literal) number must still reformat"
+    );
+
+    Ok(())
+}
+
 // --- #1116: chained scalar-slice-assignment no-ops too; del() differs ---
 //
 // #1101 covered only a *bare* scalar-slice path (`.[S:E]`). #1116 extends

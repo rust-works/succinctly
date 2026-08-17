@@ -11571,6 +11571,44 @@ fn test_jq_array_plus_scalar_still_errors_1119() -> Result<()> {
     Ok(())
 }
 
+/// `arith_add`'s `null + x` / `x + null` passthrough arm must not collapse
+/// a `NumberLiteral` operand's own source spelling before the arm even
+/// runs (#1143). Not directly observable as the raw literal text in jq
+/// mode -- jq's own number formatting (`format_number_jq_compat`) always
+/// normalizes a `NumberLiteral`'s exponent/trailing-zero spelling on
+/// output -- but that normalization only fires for a value that actually
+/// stayed a `NumberLiteral`; a `Float`/`Int` that lost its literal
+/// upstream renders via plain `f64`/`i64::to_string()` instead, which
+/// diverges on exactly these inputs (confirmed against the pre-fix
+/// binary: `null + 1e10` printed `10000000000`, `null + 3.00` printed
+/// `3` -- both silently losing the literal).
+#[test]
+fn test_jq_null_plus_number_literal_preserves_literal_path_1143() -> Result<()> {
+    let (out, _, code) = run_jq_full(&["-cn", "null + 1e10"], None)?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "1E+10");
+
+    let (out, _, code) = run_jq_full(&["-cn", "1e10 + null"], None)?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "1E+10");
+
+    let (out, _, code) = run_jq_full(&["-cn", "null + 3.00"], None)?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "3.00");
+    Ok(())
+}
+
+/// Control: a genuinely *computed* sum must still get canonical formatting
+/// -- #1143's fix only defers `into_plain_number()` for the passthrough/
+/// append arms, not for the arm that actually adds two numbers.
+#[test]
+fn test_jq_genuine_arithmetic_still_reformats_1143() -> Result<()> {
+    let (out, _, code) = run_jq_full(&["-cn", "3.00 + 1"], None)?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "4");
+    Ok(())
+}
+
 /// #1116's yq-only "chained scalar-slice-assign no-ops" / "del() deletes
 /// the parent key" rules must not leak into jq mode: real jq errors on
 /// both `.a[0:1] = 99` and `del(.a[0:1])` for a scalar `.a`, matching
