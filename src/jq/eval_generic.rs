@@ -25,10 +25,11 @@ use super::document::{
     DocumentCursor, DocumentElements, DocumentFields, DocumentValue, IndentSpec,
 };
 use super::eval::{
-    apply_compare_op, eval as full_eval, format_owned, index_one_owned as index_owned_by_key,
-    literal_to_owned, needs_path_context, numeric_display_string, numeric_key_to_index,
-    owned_bound_to_i64, owned_value_to_json, slice_owned_value_read, tonumber_from_str, Control,
-    EvalError, EvalSemantics, EvalTag, JqSemantics, QueryResult, YqSemantics,
+    apply_compare_op, collapse_vec, eval as full_eval, format_owned,
+    index_one_owned as index_owned_by_key, literal_to_owned, needs_path_context,
+    numeric_display_string, numeric_key_to_index, owned_bound_to_i64, owned_value_to_json,
+    slice_owned_value_read, tonumber_from_str, Control, EvalError, EvalSemantics, EvalTag,
+    JqSemantics, QueryResult, YqSemantics,
 };
 use super::expr::{Builtin, Expr, FormatType};
 use super::slice::{slice_str, SliceBounds};
@@ -947,25 +948,28 @@ fn partial_generic<V: DocumentValue>(
 }
 
 /// Normalize a `Vec<OwnedValue>` accumulator into the smallest `GenericResult`
-/// shape that represents it. Mirrors [`super::eval::owned_vec_to_result`].
-fn owned_vec_to_generic_result<V: DocumentValue>(mut vs: Vec<OwnedValue>) -> GenericResult<V> {
-    match vs.len() {
-        0 => GenericResult::None,
-        1 => GenericResult::Owned(vs.pop().unwrap()),
-        _ => GenericResult::ManyOwned(vs),
-    }
+/// shape that represents it. Mirrors [`super::eval::owned_vec_to_result`];
+/// both share [`collapse_vec`]'s one definition of the actual collapse (#1067).
+fn owned_vec_to_generic_result<V: DocumentValue>(vs: Vec<OwnedValue>) -> GenericResult<V> {
+    collapse_vec(
+        vs,
+        || GenericResult::None,
+        GenericResult::Owned,
+        GenericResult::ManyOwned,
+    )
 }
 
 /// Normalize a `Vec<V::Cursor>` accumulator into the smallest `GenericResult`
 /// shape that represents it -- the borrowed-cursor counterpart of
 /// [`owned_vec_to_generic_result`], for the same reason (#1048): a caller
 /// with zero results must collapse to `None`, not `ManyCursor(vec![])`.
-fn cursor_vec_to_generic_result<V: DocumentValue>(mut cs: Vec<V::Cursor>) -> GenericResult<V> {
-    match cs.len() {
-        0 => GenericResult::None,
-        1 => GenericResult::OneCursor(cs.pop().unwrap()),
-        _ => GenericResult::ManyCursor(cs),
-    }
+fn cursor_vec_to_generic_result<V: DocumentValue>(cs: Vec<V::Cursor>) -> GenericResult<V> {
+    collapse_vec(
+        cs,
+        || GenericResult::None,
+        GenericResult::OneCursor,
+        GenericResult::ManyCursor,
+    )
 }
 
 /// Finalize a fork's accumulated `outputs`, given an optional terminating
