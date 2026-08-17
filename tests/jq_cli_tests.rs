@@ -11770,6 +11770,69 @@ fn test_jq_null_times_anything_errors_1175() -> Result<()> {
     Ok(())
 }
 
+// --- #1171: document-input parsing must not silently produce wrong
+// output for content real jq either accepts leniently (a leading-dot
+// number) or rejects outright (truncated/malformed JSON) -- both
+// previously exited 0 with silently wrong output on the default (lazy)
+// input path.
+
+/// A leading-dot number literal (`.5`), top-level and nested, must parse
+/// as the number it spells -- real jq's own reader is lenient beyond
+/// strict JSON here (confirmed live: `jq -c '.'` on `.5` outputs `0.5`).
+#[test]
+fn test_jq_leading_dot_number_parses_correctly_1171() -> Result<()> {
+    let (out, _, code) = run_jq_full(&["-c", "."], Some(".5"))?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "0.5");
+
+    let (out, _, code) = run_jq_full(&["-c", "."], Some("[.5]"))?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "[0.5]");
+
+    let (out, _, code) = run_jq_full(&["-c", "."], Some(r#"{"a":.5}"#))?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), r#"{"a":0.5}"#);
+
+    Ok(())
+}
+
+/// Truncated/malformed JSON must error (exit 5), not silently produce
+/// empty output with exit 0 -- `find_json_values` previously skipped
+/// unparseable content and kept going with no error recorded at all.
+#[test]
+fn test_jq_truncated_json_errors_not_silent_empty_output_1171() -> Result<()> {
+    let (out, stderr, code) = run_jq_full(&["-c", "."], Some("[1,2,"))?;
+    assert_eq!(code, 5, "out: {out:?}, stderr: {stderr:?}");
+    assert!(out.trim().is_empty(), "out: {out:?}");
+    assert!(!stderr.trim().is_empty(), "expected a diagnostic on stderr");
+
+    Ok(())
+}
+
+/// A bare `.` (no digit at all) must still be rejected -- the leading-dot
+/// widening above requires at least one digit to follow, matching real
+/// jq's own boundary (confirmed live: `jq -c '.'` on a bare `.` errors
+/// with "Invalid numeric literal", not accepted as some default number).
+#[test]
+fn test_jq_bare_dot_still_errors_1171() -> Result<()> {
+    let (out, _, code) = run_jq_full(&["-c", "."], Some("."))?;
+    assert_eq!(code, 5, "out: {out:?}");
+    assert!(out.trim().is_empty(), "out: {out:?}");
+
+    Ok(())
+}
+
+/// Regression guard: ordinary, well-formed multi-value document input is
+/// unaffected by the stricter error handling above.
+#[test]
+fn test_jq_valid_multi_value_stream_unaffected_1171() -> Result<()> {
+    let (out, _, code) = run_jq_full(&["-c", "."], Some("1\n2\n3\n"))?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "1\n2\n3");
+
+    Ok(())
+}
+
 /// #1116's yq-only "chained scalar-slice-assign no-ops" / "del() deletes
 /// the parent key" rules must not leak into jq mode: real jq errors on
 /// both `.a[0:1] = 99` and `del(.a[0:1])` for a scalar `.a`, matching

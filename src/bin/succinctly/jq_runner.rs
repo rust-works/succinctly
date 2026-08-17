@@ -15,7 +15,7 @@ use succinctly::jq::eval_generic::{
     eval_with_cursor, to_owned as generic_to_owned, GenericResult, MAX_NESTING_DEPTH,
 };
 use succinctly::jq::{
-    self, format_number_jq_compat, nonfinite_display_string, Expr, JqSemantics, JqValue,
+    self, format_number_jq_compat, nonfinite_display_string, EvalError, Expr, JqSemantics, JqValue,
     OwnedValue, Program,
 };
 use succinctly::json::light::{JsonCursor, StandardJson};
@@ -837,7 +837,14 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
                 }
             }
             // Process as JSON stream (handle multiple JSON values in one input)
-            let values = find_json_values(raw);
+            let values = match find_json_values(raw) {
+                Ok(values) => values,
+                Err(offset) => {
+                    let at = InputLocation::at(filename.as_deref(), line_at(raw, offset));
+                    sink.report(DiagStyle::Jq, &EvalError::new("Invalid JSON text"), &at);
+                    continue;
+                }
+            };
             for (start, end) in values {
                 let json_bytes = &raw[start..end];
 
@@ -1130,10 +1137,20 @@ fn get_inputs(
                 Ok(p) => p,
                 Err(e) => return Ok(Err(e)),
             };
-            let ends: Vec<usize> = find_json_values(raw.as_bytes())
-                .into_iter()
-                .map(|(_, end)| end)
-                .collect();
+            // `parse_json_stream` (above) already validated this exact
+            // input successfully, so `find_json_values` should never
+            // disagree with it -- surfaced as an internal error rather
+            // than silently reusing a stale/wrong offset list if the two
+            // validators ever do diverge.
+            let ends: Vec<usize> = match find_json_values(raw.as_bytes()) {
+                Ok(values) => values.into_iter().map(|(_, end)| end).collect(),
+                Err(offset) => {
+                    return Ok(Err(anyhow::anyhow!(
+                        "internal error: find_json_values failed at byte {offset} \
+                         after parse_json_stream already validated this input"
+                    )));
+                }
+            };
             locations.extend_from_ends(src, &raw, &ends, parsed.len());
             values.extend(parsed);
         }
@@ -1320,7 +1337,15 @@ fn line_at(bytes: &[u8], end: usize) -> usize {
 ///
 /// This is a simple heuristic that finds the boundaries of top-level JSON values
 /// by tracking brace/bracket nesting and handling strings.
-fn find_json_values(bytes: &[u8]) -> Vec<(usize, usize)> {
+///
+/// Returns `Err(offset)` -- the byte offset the unparseable value started at
+/// -- for content it can't recognize as any JSON value shape (a truncated
+/// container/string, or a byte that starts none of the recognized shapes),
+/// rather than silently skipping it. An earlier version of this function
+/// skipped to the next whitespace and kept going, so `{invalid}`/`[1,2,`
+/// produced `{}`/no output at all instead of an error (#1171) -- real jq
+/// itself stops at the first parse failure, not skip-and-continue.
+fn find_json_values(bytes: &[u8]) -> core::result::Result<Vec<(usize, usize)>, usize> {
     let mut values = Vec::new();
     let mut pos = 0;
 
@@ -1354,21 +1379,28 @@ fn find_json_values(bytes: &[u8]) -> Vec<(usize, usize)> {
                 // Number
                 find_number_end(bytes, pos)
             }
+            // Real jq's own number reader is lenient beyond strict JSON: a
+            // leading `.` is accepted when at least one digit follows
+            // (`.5` -> `0.5`), matching `light.rs`'s identical widening
+            // for the materialization side (#1171). A bare `.`/`.e5` with
+            // no digit at all still falls through to the `None` catch-all
+            // below, matching real jq's own rejection of that shape.
+            b'.' if bytes.get(pos + 1).is_some_and(u8::is_ascii_digit) => {
+                find_number_end(bytes, pos)
+            }
             _ => None,
         };
 
-        if let Some(end) = end {
-            values.push((start, end));
-            pos = end;
-        } else {
-            // Invalid JSON - skip to next whitespace
-            while pos < bytes.len() && !bytes[pos].is_ascii_whitespace() {
-                pos += 1;
+        match end {
+            Some(end) => {
+                values.push((start, end));
+                pos = end;
             }
+            None => return Err(start),
         }
     }
 
-    values
+    Ok(values)
 }
 
 /// Find the end of an object or array starting at `pos`.
@@ -2634,7 +2666,7 @@ mod tests {
         // Multi-value, no trailing newline after the last value: both values
         // report the same line jq does, not "line of value + 1" (#524).
         let bytes = b"1\n2";
-        let ends = find_json_values(bytes);
+        let ends = find_json_values(bytes).unwrap();
         assert_eq!(ends, vec![(0, 1), (2, 3)]);
         assert_eq!(line_at(bytes, 1), 1); // "1" ends before the '\n' lookahead
         assert_eq!(line_at(bytes, 3), 1); // "2" ends at EOF, no lookahead byte
