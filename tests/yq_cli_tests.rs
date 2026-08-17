@@ -6156,8 +6156,12 @@ fn test_args_named_object() -> Result<()> {
 /// clap rejected any negative-number (or other hyphen-prefixed) `--arg`/
 /// `--argjson` value before it ever reached this crate's own JSON-content
 /// validation -- fixed via `allow_hyphen_values` on `YqCommand`'s `arg`/
-/// `argjson` clap::Arg definitions (#1150). Verified live against real
-/// yq v4.53.3.
+/// `argjson` clap::Arg definitions (#1150). `--arg`/`--argjson` are
+/// succinctly's own jq-inspired extension to yq mode (#284) -- real yq
+/// v4.53.3 has no such flags at all (`Error: unknown flag: --argjson`),
+/// so there's no oracle to verify this specific behavior against; the
+/// jq-side tests in `tests/jq_cli_tests.rs` are what's checked live
+/// against real jq 1.7.1.
 #[test]
 fn test_argjson_bare_negative_number_1150() -> Result<()> {
     let (output, code) = run_yq_stdin(

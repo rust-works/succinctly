@@ -732,18 +732,12 @@ fn test_argjson_negative_leading_zero_when_nested_1094() -> Result<()> {
 // rawfile, YqCommand's arg/argjson). Verified live against real jq 1.7.1.
 
 #[test]
-fn test_argjson_bare_negative_number_1150() -> Result<()> {
-    let (stdout, _, code) = run_jq_full(&["-n", "--argjson", "n", "-7", "$n"], None)?;
-    assert_eq!(code, 0);
-    assert_eq!(stdout.trim_end(), "-7");
-    Ok(())
-}
-
-#[test]
-fn test_argjson_bare_negative_leading_zero_1150() -> Result<()> {
-    let (stdout, _, code) = run_jq_full(&["-n", "--argjson", "n", "-007", "$n"], None)?;
-    assert_eq!(code, 0);
-    assert_eq!(stdout.trim_end(), "-7");
+fn test_argjson_bare_hyphen_prefixed_value_1150() -> Result<()> {
+    for (value, expected) in [("-7", "-7"), ("-007", "-7")] {
+        let (stdout, _, code) = run_jq_full(&["-n", "--argjson", "n", value, "$n"], None)?;
+        assert_eq!(code, 0, "value {value:?}");
+        assert_eq!(stdout.trim_end(), expected, "value {value:?}");
+    }
     Ok(())
 }
 
@@ -772,6 +766,28 @@ fn test_multiple_argjson_one_negative_one_positive_1150() -> Result<()> {
     )?;
     assert_eq!(code, 0);
     assert_eq!(stdout.trim_end(), "[1,-2]");
+    Ok(())
+}
+
+/// `--args`/`--jsonargs` (`num_args = 0..`) consume the *remaining*
+/// command line as positional values -- the same clap hyphen-rejection
+/// defect as the two-value `--arg`/`--argjson`/etc. flags above, on a
+/// different clap shape (found during this issue's own code review, not
+/// in the original repro). Verified live against real jq 1.7.1.
+#[test]
+fn test_args_positional_hyphen_prefixed_values_1150() -> Result<()> {
+    let (stdout, _, code) = run_jq_full(&["-n", "$ARGS.positional", "--args", "-7", "abc"], None)?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "[\n  \"-7\",\n  \"abc\"\n]");
+    Ok(())
+}
+
+#[test]
+fn test_jsonargs_positional_hyphen_prefixed_values_1150() -> Result<()> {
+    let (stdout, _, code) =
+        run_jq_full(&["-n", "$ARGS.positional", "--jsonargs", "-7", "-8"], None)?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "[\n  -7,\n  -8\n]");
     Ok(())
 }
 
