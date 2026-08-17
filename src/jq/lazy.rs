@@ -697,12 +697,16 @@ fn cursor_to_owned_at_depth<W: Clone + AsRef<[u64]>>(
         StandardJson::Null => OwnedValue::Null,
         StandardJson::Bool(b) => OwnedValue::Bool(b),
         StandardJson::Number(n) => OwnedValue::from_number_bytes(n.raw_bytes()),
-        StandardJson::String(s) => match s.as_str() {
-            Ok(cow) => OwnedValue::String(cow.into_owned()),
-            // Same gap as `eval_generic::to_owned_at_depth`'s sibling check
-            // -- see `panic_on_string_decode_failure`'s own doc comment.
-            Err(_) => super::eval_generic::panic_on_string_decode_failure(),
-        },
+        StandardJson::String(s) => {
+            // `.ok()`, not a `panic!` on `Err`: see `to_owned_at_depth`'s
+            // sibling `else` arm doc comment in eval_generic.rs (#1098) for
+            // why a stricter fix here was attempted and reverted.
+            if let Ok(cow) = s.as_str() {
+                OwnedValue::String(cow.into_owned())
+            } else {
+                OwnedValue::String(String::new())
+            }
+        }
         StandardJson::Array(_) => {
             // Use cursor navigation to iterate children
             let items: Vec<OwnedValue> = cursor
@@ -901,22 +905,26 @@ mod tests {
     /// #1098: sibling of `eval_generic::to_owned`'s own regression test --
     /// `JsonIndex::build`'s semi-index scan finds string quote/escape
     /// boundaries without decoding/validating what's between them, so
-    /// invalid UTF-8 inside a string span indexes fine and only fails once
-    /// `materialize`/`into_owned` reaches `JsonString::as_str()`. This
-    /// cursor-based materializer used to silently substitute an empty
-    /// string here instead.
+    /// invalid UTF-8 inside a string span indexes fine and only degrades,
+    /// here to an empty string, once `materialize`/`into_owned` reaches
+    /// `JsonString::as_str()`. Pins the known, deliberate gap -- see
+    /// `cursor_to_owned_at_depth`'s own `String` arm doc comment for why a
+    /// stricter (panic) fix was attempted and reverted.
     #[test]
-    #[should_panic(
-        expected = "string scalar failed to decode despite passing structural validation (#1098)"
-    )]
-    fn test_materialize_panics_on_string_decode_failure_1098() {
+    fn test_materialize_degrades_to_empty_string_on_decode_failure_1098() {
         use crate::json::JsonIndex;
 
         let json: &[u8] = b"{\"a\": \"\xff\xfe\"}";
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let val = JqValue::from_cursor(cursor);
-        val.materialize();
+        assert_eq!(
+            val.materialize(),
+            OwnedValue::Object(IndexMap::from([(
+                "a".to_string(),
+                OwnedValue::String(String::new())
+            )]))
+        );
     }
 
     #[test]
@@ -1140,7 +1148,7 @@ mod tests {
 
     /// Sibling of the number test above, for `cursor_to_owned_at_depth`'s
     /// `StandardJson::String` arm -- the ordinary successfully-decoding
-    /// path, alongside `test_materialize_panics_on_string_decode_failure_1098`'s
+    /// path, alongside `test_materialize_degrades_to_empty_string_on_decode_failure_1098`'s
     /// coverage of the same arm's `Err` side.
     #[test]
     fn test_jqvalue_cursor_string_materialize_and_into_owned() {
