@@ -1459,6 +1459,29 @@ fn find_literal_end(bytes: &[u8], pos: usize) -> Option<usize> {
     Some(i)
 }
 
+/// Validate `s` as a single, complete JSON value via `serde_json::from_str`
+/// -- not for its resulting `Value` (discarded by every caller), but for
+/// its error message and its rejection of trailing garbage (`42 garbage`)
+/// that `JsonIndex`'s own semi-indexing wouldn't catch on its own. Shared
+/// by `parse_json_value` (`--argjson`/`--jsonargs`, #1058) and
+/// `parse_json_seq` (`--seq`, #1093) -- see #1163.
+///
+/// Deliberately parses to `serde_json::Value` here rather than the cheaper
+/// `serde::de::IgnoredAny` (which drives the identical grammar/trailing-
+/// content check without allocating a parse tree every caller then
+/// discards): `IgnoredAny` doesn't range-check numbers at all, so a
+/// magnitude-overflowing literal (`1e400`) that `Value` correctly rejects
+/// ("number out of range") would instead silently reach
+/// `json_bytes_to_owned_value` and materialize as `null` -- trading a
+/// clear error for silent data loss, a worse outcome than the allocation
+/// this would save (#1095 review). `parse_json_stream` (`--slurpfile`,
+/// below) doesn't call this: it validates a whole multi-value stream via
+/// `serde_json::Deserializer` instead of one value via `from_str`, a
+/// structurally different mechanism this helper can't drive.
+fn validate_json_str(s: &str) -> serde_json::Result<()> {
+    serde_json::from_str::<serde_json::Value>(s).map(|_| ())
+}
+
 /// Parse a JSON value from a string (`--argjson`/`--jsonargs`), preserving
 /// the original number-literal spelling the way document-sourced numbers
 /// already do (#1058) -- unlike `serde_json::Value::Number`, which
@@ -1468,30 +1491,17 @@ fn find_literal_end(bytes: &[u8], pos: usize) -> Option<usize> {
 /// (`Literal::NumberLiteral`, #1035) or a document-sourced one
 /// (`OwnedValue::from_number_bytes`) does not.
 ///
-/// Validates strictly via `serde_json::from_str` first -- not for its
-/// resulting `Value` (discarded), but for its error message and its
-/// rejection of trailing garbage (`42 garbage`) that `JsonIndex`'s own
-/// semi-indexing wouldn't catch on its own. Deliberately parses to
-/// `serde_json::Value` here rather than the cheaper `serde::de::IgnoredAny`
-/// (which drives the identical grammar/trailing-content check without
-/// allocating a parse tree this function then discards): `IgnoredAny`
-/// doesn't range-check numbers at all, so a magnitude-overflowing literal
-/// (`1e400`) that `Value` correctly rejects ("number out of range") would
-/// instead silently reach `json_bytes_to_owned_value` and materialize as
-/// `null` -- trading a clear error for silent data loss, a worse outcome
-/// than the allocation this would save (#1095 review).
-///
-/// Then reparses the same, now-known-valid text through this crate's own
-/// fidelity-preserving JSON semi-indexer (the same one the primary input
-/// path already uses, see `evaluate_input` above) via the shared
-/// `json_bytes_to_owned_value`.
+/// Validates strictly via `validate_json_str` first, then reparses the
+/// same, now-known-valid text through this crate's own fidelity-preserving
+/// JSON semi-indexer (the same one the primary input path already uses,
+/// see `evaluate_input` above) via the shared `json_bytes_to_owned_value`.
 fn parse_json_value(s: &str) -> Result<OwnedValue> {
     let s = s.trim();
     if s.is_empty() {
         return Ok(OwnedValue::Null);
     }
 
-    if let Err(e) = serde_json::from_str::<serde_json::Value>(s) {
+    if let Err(e) = validate_json_str(s) {
         // Real jq's own number parser tolerates a leading zero (`007`,
         // `00`, `007.5`) that strict JSON doesn't (#1094) -- retry once
         // with every number token's leading zero stripped (string
@@ -1503,7 +1513,7 @@ fn parse_json_value(s: &str) -> Result<OwnedValue> {
         // on its own (confirmed live), so there's nothing left to repair
         // for it.
         let normalized = normalize_leading_zero_numbers(s);
-        if normalized == s || serde_json::from_str::<serde_json::Value>(&normalized).is_err() {
+        if normalized == s || validate_json_str(&normalized).is_err() {
             return Err(e).with_context(|| format!("Invalid JSON: {s}"));
         }
     }
@@ -1614,9 +1624,19 @@ fn normalize_leading_zero_numbers(s: &str) -> String {
 /// Preserves number-literal source fidelity the same way `parse_json_value`
 /// does for `--argjson` (#1058, extended here to `--slurpfile`, #1093):
 /// `serde_json::Deserializer::byte_offset()` delimits each value's own
-/// span within the stream, the same way `find_json_values` (below) does
-/// for the main lazy-input path, and `json_bytes_to_owned_value`
-/// materializes the real result from that span.
+/// span within the stream, and `json_bytes_to_owned_value` materializes
+/// the real result from that span.
+///
+/// Deliberately doesn't share span-finding with `find_json_values` (below),
+/// despite both walking a byte string to delimit consecutive JSON values
+/// (#1163 follow-up question): `find_json_values` is a permissive,
+/// jq-compatible scanner for the main document-input path (accepts a
+/// leading `.` as a number start, doesn't reject trailing garbage) with no
+/// `serde_json` dependency at all, while this function needs `--slurpfile`
+/// CLI-arg validation to stay strict -- reusing `find_json_values` here
+/// would either silently accept input `--slurpfile` currently rejects, or
+/// need a second validation pass layered on top, for no real gain over the
+/// `Deserializer` this already uses.
 fn parse_json_stream(s: &str) -> Result<Vec<OwnedValue>> {
     let s = s.trim();
     if s.is_empty() {
@@ -1662,11 +1682,10 @@ fn parse_json_stream(s: &str) -> Result<Vec<OwnedValue>> {
 ///
 /// Preserves number-literal source fidelity the same way `parse_json_value`
 /// does for `--argjson` (#1058, extended here to `--seq`, #1093): each
-/// segment is already isolated by the RS split, so `serde_json::from_str`
-/// only needs to validate it (discarding the parsed `Value`) before
-/// `json_bytes_to_owned_value` materializes the real result from the same
-/// segment text -- no boundary-tracking needed, unlike `parse_json_stream`
-/// above.
+/// segment is already isolated by the RS split, so `validate_json_str`
+/// only needs to validate it before `json_bytes_to_owned_value`
+/// materializes the real result from the same segment text -- no
+/// boundary-tracking needed, unlike `parse_json_stream` above.
 fn parse_json_seq(s: &str) -> Vec<OwnedValue> {
     let mut values = Vec::new();
 
@@ -1678,7 +1697,7 @@ fn parse_json_seq(s: &str) -> Vec<OwnedValue> {
         }
 
         // Try to parse as JSON, silently ignore failures
-        if serde_json::from_str::<serde_json::Value>(segment).is_ok() {
+        if validate_json_str(segment).is_ok() {
             values.push(crate::output::json_bytes_to_owned_value(segment.as_bytes()));
         }
         // Parse failures are silently ignored per RFC 7464
