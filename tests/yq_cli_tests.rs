@@ -13464,6 +13464,156 @@ fn test_1119_gsub_array_flags_still_errors_cleanly_not_panics() -> Result<()> {
     Ok(())
 }
 
+// --- #1116: chained scalar-slice-assignment no-ops too; del() differs ---
+//
+// #1101 covered only a *bare* scalar-slice path (`.[S:E]`). #1116 extends
+// the same no-op to a *chained* one (`.foo[S:E]` where `.foo` is itself a
+// scalar) for `=`/`|=`/`+=`, but `del()` has a genuinely different rule for
+// the chained shape: it deletes the whole parent key, not a no-op. Verified
+// live against real yq v4.53.3 for every case below.
+
+#[test]
+fn test_1116_chained_scalar_slice_assign_noops() -> Result<()> {
+    let input = r#"{"a":5,"b":6}"#;
+
+    let (out, code) = run_yq_stdin(".a[0:1] = 99", input, &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), input);
+
+    let (out, code) = run_yq_stdin(".a[0:1] |= 99", input, &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), input);
+
+    let (out, code) = run_yq_stdin(".a[0:1] += 99", input, &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), input);
+
+    Ok(())
+}
+
+#[test]
+fn test_1116_chained_scalar_slice_assign_noops_at_deeper_nesting() -> Result<()> {
+    let input = r#"{"x":{"a":5,"b":6}}"#;
+    let (out, code) = run_yq_stdin(".x.a[0:1] = 99", input, &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), input);
+    Ok(())
+}
+
+/// `-=`/`*=` still error on the chained shape too, matching #1101's
+/// existing bare-root precedent (real yq errors on both, not a no-op).
+#[test]
+fn test_1116_chained_scalar_slice_sub_and_mul_still_error() -> Result<()> {
+    let input = r#"{"a":5,"b":6}"#;
+    let (_out, code) = run_yq_stdin(".a[0:1] -= 99", input, &["-o=json", "-I=0"])?;
+    assert_ne!(code, 0);
+
+    let (_out, code) = run_yq_stdin(".a[0:1] *= 99", input, &["-o=json", "-I=0"])?;
+    assert_ne!(code, 0);
+    Ok(())
+}
+
+/// A chained slice-assign through an *array* or *object* target is
+/// unaffected — succinctly deliberately keeps its own working slice-write
+/// there rather than replicating real yq's own broken behavior for those
+/// target types too (verified live: real yq no-ops `.a[1:3] = [...]` even
+/// for an array `.a`, unlike jq; succinctly intentionally diverges,
+/// matching `is_yq_scalar_slice_assign_path`'s existing precedent).
+#[test]
+fn test_1116_chained_array_slice_assign_still_works() -> Result<()> {
+    let (out, code) = run_yq_stdin(
+        r#".a[1:3] = ["x","y"]"#,
+        r#"{"a":[1,2,3,4,5],"b":6}"#,
+        &["-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), r#"{"a":[1,"x","y",4,5],"b":6}"#);
+    Ok(())
+}
+
+/// del()'s genuinely different rule: a chained scalar-slice delete removes
+/// the whole parent key, not a no-op.
+#[test]
+fn test_1116_chained_scalar_slice_del_removes_parent_key() -> Result<()> {
+    let (out, code) = run_yq_stdin("del(.a[0:1])", r#"{"a":5,"b":6}"#, &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), r#"{"b":6}"#);
+
+    let (out, code) = run_yq_stdin(
+        "del(.x.a[0:1])",
+        r#"{"x":{"a":5,"b":6}}"#,
+        &["-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), r#"{"x":{"b":6}}"#);
+
+    let (out, code) = run_yq_stdin(
+        "del(.x.y.a[0:1])",
+        r#"{"x":{"y":{"a":5,"b":6}}}"#,
+        &["-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), r#"{"x":{"y":{"b":6}}}"#);
+
+    Ok(())
+}
+
+/// del()'s parent-key rule survives a `?` on the slice component itself.
+#[test]
+fn test_1116_chained_scalar_slice_del_with_optional() -> Result<()> {
+    let (out, code) = run_yq_stdin("del(.a[0:1]?)", r#"{"a":5,"b":6}"#, &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), r#"{"b":6}"#);
+    Ok(())
+}
+
+/// del()'s parent-key rule is scalar-only — an array target keeps
+/// succinctly's own working chained slice-delete, same rationale as the
+/// assign-side regression guard above.
+#[test]
+fn test_1116_chained_array_slice_del_still_works() -> Result<()> {
+    let (out, code) = run_yq_stdin(
+        "del(.a[1:3])",
+        r#"{"a":[1,2,3,4,5],"b":6}"#,
+        &["-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), r#"{"a":[1,4,5],"b":6}"#);
+    Ok(())
+}
+
+/// Deleting through a missing/absent intermediate step stays a no-op —
+/// untouched by #1116, regression guard against the new path-rewrite logic
+/// accidentally firing where the prefix doesn't even resolve.
+#[test]
+fn test_1116_chained_scalar_slice_del_through_missing_still_noops() -> Result<()> {
+    let input = r#"{"a":{"b":1}}"#;
+    let (out, code) = run_yq_stdin("del(.a.c[0:1])", input, &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), input);
+    Ok(())
+}
+
+/// `(.[0:1]) = 99` / `(.[0:1]) |= 99` — a parenthesized *bare* slice at the
+/// top of a resolved path. #1101 covered this only by accident (its old
+/// pre-check ran before `set_path`/`update_path` were ever reached with a
+/// `Paren`-wrapped path); #1116 removed that pre-check in favor of pushing
+/// the whole check into `through_slice`'s own recursion, which exposed that
+/// neither function had ever had its own `Expr::Paren` arm. Regression
+/// guard for the fix.
+#[test]
+fn test_1116_paren_wrapped_bare_slice_assign_still_noops() -> Result<()> {
+    let (out, code) = run_yq_stdin("(.[0:1]) = 99", "5", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "5");
+
+    let (out, code) = run_yq_stdin("(.[0:1]) |= 99", "5", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "5");
+
+    Ok(())
+}
+
 /// Reference decoder used only to compute expected lossy-UTF-8 output for
 /// the tests above, independent of the implementation under test.
 fn base64_decode_lossy(s: &str) -> String {

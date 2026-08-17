@@ -10322,6 +10322,86 @@ pub(crate) fn is_yq_scalar_slice_assign_path(path_expr: &Expr) -> bool {
     }
 }
 
+/// Whether a *resolved* `del()` path ends in a slice whose target (found by
+/// navigating everything before it) is a scalar — yq's own, *different*
+/// del()-specific rule (#1116): unlike `=`/`|=`/`+=` (which no-op just the
+/// write, see `through_slice`'s doc comment), a chained scalar-slice delete
+/// removes the *entire parent key* instead (`{"a":5,"b":6} | del(.a[0:1])`
+/// -> `{"b":6}` in real yq, verified live). Returns the truncated path
+/// (every component up to, but not including, the trailing slice) to
+/// delete instead, when this rule applies — `None` when it doesn't: a bare
+/// slice (`del(.[0:1])`, #1101's existing scope, untouched by this), no
+/// trailing slice at all, or the navigated-to value isn't a scalar. An
+/// array/object parent deliberately keeps succinctly's own working
+/// slice-delete there too, mirroring `is_yq_scalar_slice_assign_path`'s own
+/// scoping choice — real yq's chained slice-delete turns out to drop the
+/// whole parent key for *any* target type, not just scalars (verified
+/// live), but replicating that for arrays/objects would remove working,
+/// jq-consistent behavior to match what looks like a real-yq gap, not a
+/// deliberate feature.
+///
+/// Deliberately its own walker, not reusing `through_slice`: `del()` has no
+/// "edit closure producing a replacement value" to discard the result of —
+/// it removes content outright, and the rule for *what* to remove (the
+/// parent key, not the slice's own contents) needs the parent *container*
+/// in hand, which `through_slice` never has (it only ever sees the sliced
+/// value itself).
+fn yq_del_scalar_slice_parent_path(path_expr: &Expr, root: &OwnedValue) -> Option<Expr> {
+    let Expr::Pipe(exprs) = path_expr else {
+        return None;
+    };
+    let (last, _) = unwrap_path_component(exprs.last()?);
+    if !matches!(last, Expr::Slice { .. }) {
+        return None;
+    }
+    let prefix = &exprs[..exprs.len() - 1];
+    let target = navigate_read_only(root, prefix)?;
+    if !is_yq_slice_empty_container_scalar(target) {
+        return None;
+    }
+    Some(match prefix.len() {
+        0 => Expr::Identity,
+        1 => prefix[0].clone(),
+        _ => Expr::Pipe(prefix.to_vec()),
+    })
+}
+
+/// Read-only navigation for [`yq_del_scalar_slice_parent_path`]'s prefix
+/// peek. Unlike `get_path_mut`, never autovivifies (a peek must not create
+/// structure the delete itself would otherwise leave untouched) and simply
+/// returns `None` for anything it can't resolve — a missing field, an
+/// out-of-bounds index, a wrong container type (including `Null`), or a
+/// step shape that can't appear in a resolved path's prefix before its own
+/// trailing slice. The caller treats `None` as "this rule doesn't apply,"
+/// deferring to `delete_at_path`'s own already-correct del()-through-absent
+/// handling rather than duplicating it here.
+fn navigate_read_only<'a>(root: &'a OwnedValue, steps: &[Expr]) -> Option<&'a OwnedValue> {
+    let mut current = root;
+    for step in steps {
+        let (step, _optional) = unwrap_path_component(step);
+        current = match step {
+            Expr::Field(name) => match current {
+                OwnedValue::Object(map) => map.get(name)?,
+                _ => return None,
+            },
+            Expr::Index(idx) => match current {
+                OwnedValue::Array(arr) => {
+                    let len = arr.len() as i64;
+                    let actual = if *idx < 0 { len + idx } else { *idx };
+                    if actual >= 0 && (actual as usize) < arr.len() {
+                        &arr[actual as usize]
+                    } else {
+                        return None;
+                    }
+                }
+                _ => return None,
+            },
+            _ => return None,
+        };
+    }
+    Some(current)
+}
+
 /// Apply a resolved slice directly to an owned value.
 ///
 /// Slicing is a plain `Vec`/`&str` operation once the bounds are known, so
@@ -10657,26 +10737,20 @@ fn eval_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             } else {
                 new_value.clone()
             };
-            // yq's slice-assignment no-op (#1101) — checked here, per
-            // resolved path, rather than before RHS evaluation: the RHS
-            // (`value`, already fully computed above) still needs to have
-            // been evaluated normally so its own errors/halt/break
-            // propagate (`.[0:1] = error("boom")` genuinely errors in real
-            // yq; only `.[0:1] = 99`-shaped *successful* RHS values are
-            // silently discarded). Checking the *resolved* `path` (not the
-            // raw `path_expr`) means a computed-bound `.[$a:$b]` and a
-            // `.[0:1]?` both reach this the same way a literal `.[0:1]`
-            // does, since `resolve_dynamic_indexes` has already folded
-            // them into the same shape by this point. See
-            // `is_yq_scalar_slice_assign_path`'s doc comment for the full
-            // rationale.
-            if S::TAG == EvalTag::Yq
-                && is_yq_scalar_slice_assign_path(path)
-                && is_yq_slice_empty_container_scalar(&result)
-            {
-                continue;
-            }
-            if let Err(e) = set_path(&mut result, path, value) {
+            // yq's slice-assignment no-op (#1101, generalized to any chain
+            // depth by #1116) — `set_path` itself now no-ops the *write*
+            // whenever it reaches a slice step targeting a scalar (see
+            // `through_slice`'s doc comment), whether that's the whole path
+            // (`5 | .[0:1] = 99`) or reached through a chain (`.a[0:1] = 99`
+            // on a scalar `.a`). The RHS (`value`, already fully computed
+            // above) is always evaluated normally either way, so its own
+            // errors/halt/break still propagate (`.[0:1] = error("boom")`
+            // genuinely errors in real yq; only `.[0:1] = 99`-shaped
+            // *successful* RHS values are silently discarded) — `=` has no
+            // filter of its own left to protect from a discarded write, so
+            // unlike `eval_update` there's no throwaway-execution step
+            // needed here at all, just passing the yq-mode flag through.
+            if let Err(e) = set_path(&mut result, path, value, S::TAG == EvalTag::Yq) {
                 // Atomic per RHS output, like `reduce`: this value's own
                 // path list contributes nothing, and the whole fan-out
                 // terminates here -- `docs` (only the strictly earlier,
@@ -10743,50 +10817,25 @@ fn eval_update<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Err((_, escape)) => return escape.into(),
     };
 
+    // yq's slice-assignment no-op (#1101, generalized to any chain depth by
+    // #1116) — `update_path` itself now no-ops the *write* whenever it
+    // reaches a slice step targeting a scalar, binding the filter's `.` to
+    // `[]` there instead (matching real yq's actual discarded-write model,
+    // #1119's follow-up), while still running the filter normally so its
+    // own errors/`halt`/`break` propagate exactly as they would for any
+    // other `|=` — see `through_slice`'s doc comment for the full
+    // rationale, including why this can't be a blanket check before the
+    // filter runs at all. No `optional`-gating here beyond what
+    // `update_path` already threads: per #693, `Expr::Optional`/
+    // `Expr::Try`'s dispatch never forces `optional = true` into the
+    // expression it wraps, so an outer `(.a |= f)?` still swallows the
+    // discarded filter's error correctly via its own catch, not through
+    // this flag.
+    let scalar_noop = scalar_slice_noop && S::TAG == EvalTag::Yq;
+
     // Get current value at path, apply filter, and set back
     for path in &paths {
-        // yq's slice-assignment no-op (#1101) — the filter still has to run
-        // normally (against a throwaway clone) so its own errors/`halt`/
-        // `break` propagate exactly as they would for any other `|=`; only
-        // the *write* back into `result` is skipped. See
-        // `is_yq_scalar_slice_assign_path`'s doc comment for the full
-        // rationale, including why this can't be a blanket check before
-        // the filter runs at all.
-        //
-        // The throwaway binds `.` to `[]`, not a clone of `result` (the
-        // scalar itself) — matching real yq's own discarded-write model
-        // exactly (`5 | .[0:1] += [1]` and `5 | .[0:1] |= keys` both no-op
-        // to `5` in real yq, since the write target reads as an empty
-        // array). This was previously scalar-cloning instead, since
-        // `arith_add` had no array-append semantic yet (`[] + 99` errored)
-        // — #1119 added it, so `[] + 99` now succeeds too, and this switch
-        // closes the exact gap #1119 was filed to unblock (verified live
-        // against yq v4.53.3 for `+= <number>`, `+= <string>`, `+= [x]`,
-        // `|= keys`, `|= length`, `|= tostring`, `|= (. + 1)`).
-        if scalar_slice_noop
-            && S::TAG == EvalTag::Yq
-            && is_yq_scalar_slice_assign_path(path)
-            && is_yq_slice_empty_container_scalar(&result)
-        {
-            let mut throwaway = OwnedValue::Array(Vec::new());
-            // No `if optional`-gated arm here, unlike the sibling call
-            // below: `optional` at this point is `eval_update`'s *own*
-            // outer `?` (`(.a |= f)?`), and per #693, `Expr::Optional`/
-            // `Expr::Try`'s dispatch (`eval_try`, called for both) never
-            // forces `optional = true` into the expression it wraps — it
-            // evaluates with the ambient value (`false` at the top level)
-            // and catches the resulting `Error` itself instead. A `?`
-            // wrapping this whole `|=`/`+=` therefore still swallows the
-            // discarded filter's error correctly (verified live), just via
-            // that outer catch, never through this branch reaching `true`.
-            if let Err(escape) =
-                update_path::<S>(&mut throwaway, &Expr::Identity, filter_expr, false)
-            {
-                return escape.into();
-            }
-            continue;
-        }
-        if let Err(escape) = update_path::<S>(&mut result, path, filter_expr, false) {
+        if let Err(escape) = update_path::<S>(&mut result, path, filter_expr, false, scalar_noop) {
             return match escape {
                 EvalEscape::Error(_) if optional => QueryResult::None,
                 other => other.into(),
@@ -10925,6 +10974,7 @@ fn set_path(
     root: &mut OwnedValue,
     path_expr: &Expr,
     new_value: OwnedValue,
+    scalar_noop: bool,
 ) -> Result<(), EvalError> {
     match path_expr {
         Expr::Identity => {
@@ -10958,13 +11008,15 @@ fn set_path(
         Expr::Pipe(exprs) if !exprs.is_empty() => {
             // For chained paths like .a.b.c, navigate to parent and set at last element
             if exprs.len() == 1 {
-                set_path(root, &exprs[0], new_value)
+                set_path(root, &exprs[0], new_value, scalar_noop)
             } else if let Some(split) = split_at_slice(exprs) {
                 match get_path_mut(root, split.before)? {
                     None => Ok(()),
-                    Some(parent) => through_slice(parent, split.start, split.end, false, |sub| {
-                        set_path(sub, &split.tail, new_value)
-                    }),
+                    Some(parent) => {
+                        through_slice(parent, split.start, split.end, false, scalar_noop, |sub| {
+                            set_path(sub, &split.tail, new_value, scalar_noop)
+                        })
+                    }
                 }
             } else {
                 // Navigate to parent
@@ -10973,11 +11025,11 @@ fn set_path(
 
                 match get_path_mut(root, parent_path)? {
                     None => Ok(()),
-                    Some(parent) => set_path(parent, last_path, new_value),
+                    Some(parent) => set_path(parent, last_path, new_value, scalar_noop),
                 }
             }
         }
-        Expr::Optional(inner) => match set_path(root, inner, new_value) {
+        Expr::Optional(inner) => match set_path(root, inner, new_value, scalar_noop) {
             Ok(()) => Ok(()),
             // jq's `?` suppresses errors raised while *collecting* a path,
             // but not the write-time bounds check on a still-negative array
@@ -10987,6 +11039,15 @@ fn set_path(
             Err(e) if e.is_negative_index_out_of_bounds() => Err(e),
             Err(_) => Ok(()), // Silently succeed for optional
         },
+        // `(EXPR)` at the top of a resolved path (e.g. `(.[0:1]) = 99`) —
+        // previously always intercepted by #1101's pre-check before ever
+        // reaching `set_path`, so this arm was never needed; #1116
+        // generalized that check into `through_slice`'s own recursion,
+        // which only sees this shape via a top-level entry point like this
+        // one, exposing the gap. Mirrors the `Optional` arm just above,
+        // minus the swallow-on-error behavior `?` gets and bare parens
+        // don't.
+        Expr::Paren(inner) => set_path(root, inner, new_value, scalar_noop),
         Expr::Iterate => match root {
             OwnedValue::Array(arr) => {
                 for elem in arr.iter_mut() {
@@ -11006,10 +11067,12 @@ fn set_path(
         // an array — that is the whole reason jq has a separate sentence for
         // it. An out-of-range range clamps rather than erroring, unlike the
         // `Expr::Index` arm above: `[1,2,3] | .[5:9] = ["x"]` appends.
-        Expr::Slice { start, end } => through_slice(root, *start, *end, false, |sub| {
-            *sub = new_value;
-            Ok(())
-        }),
+        Expr::Slice { start, end } => {
+            through_slice(root, *start, *end, false, scalar_noop, |sub| {
+                *sub = new_value;
+                Ok(())
+            })
+        }
         // Unreachable: `resolve_dynamic_indexes` rewrites every computed key
         // into a static component before this runs. Explicit rather than left
         // to the catch-all so a missed install point fails loudly here instead
@@ -11072,6 +11135,7 @@ fn through_slice<E: From<EvalError>>(
     start: Option<i64>,
     end: Option<i64>,
     optional: bool,
+    scalar_noop: bool,
     edit: impl FnOnce(&mut OwnedValue) -> Result<(), E>,
 ) -> Result<(), E> {
     match root {
@@ -11088,6 +11152,24 @@ fn through_slice<E: From<EvalError>>(
         // jq reads a string slice but will not write one back, whatever the
         // replacement — the refusal beats the non-array one above.
         OwnedValue::String(_) => Err(EvalError::cannot_update_string_slices().into()),
+        // yq's slice-assignment no-op (#1101, generalized to any nesting
+        // depth by #1116): `through_slice` is the single choke point every
+        // slice write passes through, in both `set_path` (`=`) and
+        // `update_path` (`|=`/`+=`) — whether the slice is the whole path
+        // (`5 | .[0:1] = 99`) or reached through a chain (`.a[0:1] = 99`
+        // where `.a` is itself a scalar), `root` here is exactly the value
+        // the slice would act on either way, so this one check covers both
+        // shapes with no separate chained-path detection needed. `edit`
+        // still runs, against a throwaway `[]` (matching real yq's actual
+        // internal model, #1119's `eval_update` follow-up) so its own
+        // errors/halt/break still propagate; only the write to `root` is
+        // skipped. Callers gate `scalar_noop` to `false` for `-=`/`*=`,
+        // which real yq errors on instead (confirmed live).
+        _ if scalar_noop && is_yq_slice_empty_container_scalar(root) => {
+            let mut throwaway = OwnedValue::Array(Vec::new());
+            edit(&mut throwaway)?;
+            Ok(())
+        }
         _ if optional => Ok(()),
         other => Err(EvalError::cannot_index_with_type(owned_type_name(other), "object").into()),
     }
@@ -11215,6 +11297,7 @@ fn update_path<S: EvalSemantics>(
     path_expr: &Expr,
     filter_expr: &Expr,
     optional: bool,
+    scalar_noop: bool,
 ) -> Result<(), EvalEscape> {
     match path_expr {
         Expr::Identity => {
@@ -11255,7 +11338,7 @@ fn update_path<S: EvalSemantics>(
             autovivify_object(root);
             if let OwnedValue::Object(map) = root {
                 let current = map.entry(name.clone()).or_insert(OwnedValue::Null);
-                update_path::<S>(current, &Expr::Identity, filter_expr, optional)
+                update_path::<S>(current, &Expr::Identity, filter_expr, optional, scalar_noop)
             } else if optional {
                 Ok(())
             } else {
@@ -11270,6 +11353,7 @@ fn update_path<S: EvalSemantics>(
                     &Expr::Identity,
                     filter_expr,
                     optional,
+                    scalar_noop,
                 )
             } else if optional {
                 Ok(())
@@ -11282,13 +11366,25 @@ fn update_path<S: EvalSemantics>(
             match root {
                 OwnedValue::Array(arr) => {
                     for elem in arr.iter_mut() {
-                        update_path::<S>(elem, &Expr::Identity, filter_expr, optional)?;
+                        update_path::<S>(
+                            elem,
+                            &Expr::Identity,
+                            filter_expr,
+                            optional,
+                            scalar_noop,
+                        )?;
                     }
                     Ok(())
                 }
                 OwnedValue::Object(map) => {
                     for value in map.values_mut() {
-                        update_path::<S>(value, &Expr::Identity, filter_expr, optional)?;
+                        update_path::<S>(
+                            value,
+                            &Expr::Identity,
+                            filter_expr,
+                            optional,
+                            scalar_noop,
+                        )?;
                     }
                     Ok(())
                 }
@@ -11299,7 +11395,7 @@ fn update_path<S: EvalSemantics>(
         Expr::Pipe(exprs) if !exprs.is_empty() => {
             // Chain: navigate and update
             if exprs.len() == 1 {
-                update_path::<S>(root, &exprs[0], filter_expr, optional)
+                update_path::<S>(root, &exprs[0], filter_expr, optional, scalar_noop)
             } else {
                 // Navigate to the penultimate path, then update the last.
                 // `here` is whether *this step* may fail quietly; `optional`
@@ -11313,7 +11409,7 @@ fn update_path<S: EvalSemantics>(
                         autovivify_object(root);
                         if let OwnedValue::Object(map) = root {
                             let current = map.entry(name.clone()).or_insert(OwnedValue::Null);
-                            update_path::<S>(current, &rest, filter_expr, optional)
+                            update_path::<S>(current, &rest, filter_expr, optional, scalar_noop)
                         } else if here {
                             Ok(())
                         } else {
@@ -11326,7 +11422,13 @@ fn update_path<S: EvalSemantics>(
                     Expr::Index(idx) => {
                         autovivify_array(root);
                         if let OwnedValue::Array(arr) = root {
-                            update_path::<S>(write_index(arr, *idx)?, &rest, filter_expr, optional)
+                            update_path::<S>(
+                                write_index(arr, *idx)?,
+                                &rest,
+                                filter_expr,
+                                optional,
+                                scalar_noop,
+                            )
                         } else if here {
                             Ok(())
                         } else {
@@ -11339,13 +11441,13 @@ fn update_path<S: EvalSemantics>(
                     Expr::Iterate => match root {
                         OwnedValue::Array(arr) => {
                             for elem in arr.iter_mut() {
-                                update_path::<S>(elem, &rest, filter_expr, optional)?;
+                                update_path::<S>(elem, &rest, filter_expr, optional, scalar_noop)?;
                             }
                             Ok(())
                         }
                         OwnedValue::Object(map) => {
                             for value in map.values_mut() {
-                                update_path::<S>(value, &rest, filter_expr, optional)?;
+                                update_path::<S>(value, &rest, filter_expr, optional, scalar_noop)?;
                             }
                             Ok(())
                         }
@@ -11359,26 +11461,34 @@ fn update_path<S: EvalSemantics>(
                     Expr::Pipe(inner) => {
                         let mut spliced = inner.clone();
                         spliced.extend_from_slice(&exprs[1..]);
-                        update_path::<S>(root, &Expr::Pipe(spliced), filter_expr, here)
+                        update_path::<S>(root, &Expr::Pipe(spliced), filter_expr, here, scalar_noop)
                     }
                     // The chain continues *inside* the slice, so the update
                     // runs against the sub-array and is spliced back:
                     // `[1,2,3,4] | .[1:3][] |= .*10` is `[1,20,30,4]`.
-                    Expr::Slice { start, end } => through_slice(root, *start, *end, here, |sub| {
-                        update_path::<S>(sub, &rest, filter_expr, optional)
-                    }),
-                    _ => update_path::<S>(root, first, filter_expr, here),
+                    Expr::Slice { start, end } => {
+                        through_slice(root, *start, *end, here, scalar_noop, |sub| {
+                            update_path::<S>(sub, &rest, filter_expr, optional, scalar_noop)
+                        })
+                    }
+                    _ => update_path::<S>(root, first, filter_expr, here, scalar_noop),
                 }
             }
         }
-        Expr::Optional(inner) => update_path::<S>(root, inner, filter_expr, true),
+        Expr::Optional(inner) => update_path::<S>(root, inner, filter_expr, true, scalar_noop),
+        // `(EXPR)` at the top of a resolved path (e.g. `(.[0:1]) |= 99`) —
+        // see `set_path`'s matching `Expr::Paren` arm for why this was
+        // never needed before #1116.
+        Expr::Paren(inner) => update_path::<S>(root, inner, filter_expr, optional, scalar_noop),
         // `.[a:b] |= f` runs `f` on the sub-array — not on each element — and
         // splices the answer back, so `[1,2,3] | .[1:2] |= . + ["q"]` is
         // `[1,2,"q",3]`. `f` may return an array of any length, but it has to
         // be an array.
-        Expr::Slice { start, end } => through_slice(root, *start, *end, optional, |sub| {
-            update_path::<S>(sub, &Expr::Identity, filter_expr, optional)
-        }),
+        Expr::Slice { start, end } => {
+            through_slice(root, *start, *end, optional, scalar_noop, |sub| {
+                update_path::<S>(sub, &Expr::Identity, filter_expr, optional, scalar_noop)
+            })
+        }
         // Unreachable: `resolve_dynamic_indexes` rewrites every computed key
         // into a static component before this runs. Explicit rather than left
         // to the catch-all so a missed install point fails loudly here instead
@@ -18902,6 +19012,15 @@ fn builtin_del<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     if paths.len() <= 1 {
         let mut result = result;
         for path in &paths {
+            // yq's chained-scalar-slice del() rule (#1116) — a *different*
+            // rule from #1101's no-op above: rewrite the path to delete the
+            // parent key outright, rather than walking the original path
+            // at all, when it applies. See
+            // `yq_del_scalar_slice_parent_path`'s doc comment.
+            let rewritten = (S::TAG == EvalTag::Yq)
+                .then(|| yq_del_scalar_slice_parent_path(path, &result))
+                .flatten();
+            let path = rewritten.as_ref().unwrap_or(path);
             if let Err(e) = delete_at_path(&mut result, path, false) {
                 return if optional {
                     QueryResult::None
@@ -19124,9 +19243,19 @@ fn delete_at_path(
                     Expr::Slice { .. } if matches!(root, OwnedValue::Null) => {
                         delete_at_path_through_absent(&rest, optional)
                     }
-                    Expr::Slice { start, end } => through_slice(root, *start, *end, here, |sub| {
-                        delete_at_path(sub, &rest, optional)
-                    }),
+                    // `scalar_noop: false` — del()'s own yq-scalar rule
+                    // (#1116) is intercepted earlier, via path truncation
+                    // (see `yq_del_scalar_slice_parent_path`), for the case
+                    // this fix actually covers (the slice is the *last*
+                    // path component). This arm only fires when there's
+                    // more path *after* the slice (`.[1:3][0]`), which
+                    // isn't that shape — it descends into the sliced
+                    // sub-range and deletes within it, same as jq.
+                    Expr::Slice { start, end } => {
+                        through_slice(root, *start, *end, here, false, |sub| {
+                            delete_at_path(sub, &rest, optional)
+                        })
+                    }
                     _ => delete_at_path(root, first, here),
                 }
             }
@@ -38297,18 +38426,24 @@ mod tests {
         // Direct-function coverage for the three walkers `autovivify_object`/
         // `autovivify_array`/`write_index` touch (#486), bypassing the parser.
         let mut root = OwnedValue::Null;
-        set_path(&mut root, &Expr::Field("a".to_string()), OwnedValue::Int(1)).unwrap();
+        set_path(
+            &mut root,
+            &Expr::Field("a".to_string()),
+            OwnedValue::Int(1),
+            false,
+        )
+        .unwrap();
         assert_eq!(
             root,
             OwnedValue::Object(IndexMap::from([("a".to_string(), OwnedValue::Int(1),)]))
         );
 
         let mut root = OwnedValue::Null;
-        set_path(&mut root, &Expr::Index(0), OwnedValue::Int(1)).unwrap();
+        set_path(&mut root, &Expr::Index(0), OwnedValue::Int(1), false).unwrap();
         assert_eq!(root, OwnedValue::Array(vec![OwnedValue::Int(1)]));
 
         let mut root = OwnedValue::Array(vec![OwnedValue::Int(1), OwnedValue::Int(2)]);
-        set_path(&mut root, &Expr::Index(4), OwnedValue::Int(9)).unwrap();
+        set_path(&mut root, &Expr::Index(4), OwnedValue::Int(9), false).unwrap();
         assert_eq!(
             root,
             OwnedValue::Array(vec![
@@ -41376,7 +41511,7 @@ mod tests {
         #[test]
         fn test_set_path_refuses_an_unresolved_key() {
             let mut root = OwnedValue::Null;
-            let err = set_path(&mut root, &unresolved(), OwnedValue::Int(1)).unwrap_err();
+            let err = set_path(&mut root, &unresolved(), OwnedValue::Int(1), false).unwrap_err();
             assert_eq!(
                 err.message,
                 "internal error: unresolved computed index in assignment path"
@@ -41396,8 +41531,9 @@ mod tests {
         #[test]
         fn test_update_path_refuses_an_unresolved_key() {
             let mut root = OwnedValue::Null;
-            let err = update_path::<JqSemantics>(&mut root, &unresolved(), &Expr::Identity, false)
-                .unwrap_err();
+            let err =
+                update_path::<JqSemantics>(&mut root, &unresolved(), &Expr::Identity, false, false)
+                    .unwrap_err();
             let EvalEscape::Error(err) = err else {
                 panic!("expected EvalEscape::Error, got {err:?}");
             };
@@ -41471,7 +41607,7 @@ mod tests {
         #[test]
         fn test_set_path_refuses_an_unresolved_slice() {
             let mut root = OwnedValue::Null;
-            let err = set_path(&mut root, &unresolved(), OwnedValue::Int(1)).unwrap_err();
+            let err = set_path(&mut root, &unresolved(), OwnedValue::Int(1), false).unwrap_err();
             assert_eq!(
                 err.message,
                 "internal error: unresolved computed slice in assignment path"
@@ -41491,8 +41627,9 @@ mod tests {
         #[test]
         fn test_update_path_refuses_an_unresolved_slice() {
             let mut root = OwnedValue::Null;
-            let err = update_path::<JqSemantics>(&mut root, &unresolved(), &Expr::Identity, false)
-                .unwrap_err();
+            let err =
+                update_path::<JqSemantics>(&mut root, &unresolved(), &Expr::Identity, false, false)
+                    .unwrap_err();
             let EvalEscape::Error(err) = err else {
                 panic!("expected EvalEscape::Error, got {err:?}");
             };
@@ -42280,8 +42417,13 @@ mod tests {
         // produces -- to prove the fallback still reports a real error instead
         // of silently succeeding or panicking.
         let mut root = OwnedValue::Int(1);
-        let result =
-            update_path::<JqSemantics>(&mut root, &Expr::RecursiveDescent, &Expr::Identity, false);
+        let result = update_path::<JqSemantics>(
+            &mut root,
+            &Expr::RecursiveDescent,
+            &Expr::Identity,
+            false,
+            false,
+        );
         assert!(matches!(result, Err(EvalEscape::Error(_))));
     }
 
