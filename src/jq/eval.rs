@@ -5608,6 +5608,27 @@ fn yq_stringify_scalar_or_empty<S: EvalSemantics>(value: &OwnedValue) -> String 
     }
 }
 
+/// Convert a decode loop's raw byte buffer into a `String`, using
+/// `String::from_utf8` directly (no copy: it reuses `bytes`'s own
+/// allocation) when the buffer is already valid UTF-8, and falling back to
+/// a lossy replacement-character substitution only for the genuinely
+/// invalid case -- avoiding the second full-buffer copy
+/// `String::from_utf8_lossy(&bytes).into_owned()` always pays even when
+/// `bytes` was valid all along (the common case for both callers below).
+/// Shared by `format_urid`/`format_base64d` (#1123) so the "always lossy,
+/// never error on bad UTF-8" decode policy has one definition instead of
+/// two independently-copy-pasted tails.
+///
+/// Note this is necessarily an approximation of real yq's own behavior for
+/// input that decodes to *invalid* UTF-8 (e.g. `"%FF" | @urid`): real yq
+/// (backed by Go, whose strings are arbitrary byte sequences) passes such
+/// bytes through unchanged, but Rust's `String` cannot hold invalid UTF-8
+/// at all, so lossy substitution is the closest correct representation
+/// available here, not a verified oracle match for that specific case.
+fn owned_string_from_decoded_bytes(bytes: Vec<u8>) -> String {
+    String::from_utf8(bytes).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
+}
+
 /// @urid - URI/percent decode
 ///
 /// jq has no `@urid` at all, so there's no jq-mode oracle to match; real
@@ -5634,8 +5655,7 @@ fn format_urid<S: EvalSemantics>(value: &OwnedValue, optional: bool) -> Result<S
     // instead of surviving as part of the original multi-byte UTF-8
     // sequence -- corrupting both literal pass-through bytes and genuinely
     // percent-decoded ones. Collecting into a byte buffer and converting
-    // once at the end (lossy, matching `format_base64d`'s established
-    // precedent) round-trips non-ASCII input correctly.
+    // once at the end round-trips non-ASCII input correctly.
     let mut result = Vec::with_capacity(s.len());
     let bytes = s.as_bytes();
     let mut i = 0;
@@ -5656,7 +5676,7 @@ fn format_urid<S: EvalSemantics>(value: &OwnedValue, optional: bool) -> Result<S
         result.push(bytes[i]);
         i += 1;
     }
-    Ok(String::from_utf8_lossy(&result).into_owned())
+    Ok(owned_string_from_decoded_bytes(result))
 }
 
 /// Quote a CSV/DSV string field: wrap in `"..."`, doubling inner `"`.
@@ -5821,10 +5841,15 @@ fn format_base64<S: EvalSemantics>(
 /// keeps erroring on every non-string type, unchanged from before.
 ///
 /// The decode algorithm matches real jq's exactly (see the
-/// truncate-at-first-`=` comment inside). Real yq is *stricter* than real
-/// jq for malformed/excess padding (e.g. `"===="` errors in yq, decodes to
-/// `""` in jq) — a separate, narrower divergence not addressed here, filed
-/// as #1135.
+/// truncate-at-first-`=` comment inside), and validates every character of
+/// every trailing group (2, 3, or 4 bytes long) the same way, so embedded
+/// whitespace anywhere before the first `=` is caught regardless of
+/// position (#1123 no longer has the "only a complete 4-byte group is
+/// checked" gap an earlier version of this fix had, now that #1120's
+/// truncate-then-decode-every-length rewrite validates the whole prefix
+/// uniformly). Real yq is *stricter* than real jq for malformed/excess
+/// padding (e.g. `"===="` errors in yq, decodes to `""` in jq) — a
+/// separate, narrower divergence not addressed here, filed as #1135.
 fn format_base64d<S: EvalSemantics>(
     value: &OwnedValue,
     optional: bool,
@@ -5849,9 +5874,9 @@ fn format_base64d<S: EvalSemantics>(
     }
 
     // Trim, don't strip (#1123): real yq (v4.53.3, live-verified) trims
-    // leading/trailing Unicode whitespace but rejects *embedded*
-    // whitespace as invalid base64 data (`" aGVsbG8="` decodes to
-    // `"hello"`; `"aGVs bG8="` errors) -- the previous unconditional
+    // leading/trailing Unicode whitespace but rejects embedded whitespace
+    // as invalid base64 data (`" aGVsbG8="` decodes to `"hello"`;
+    // `"aGVs bG8="` errors) -- the previous unconditional
     // `.replace(is_whitespace, "")` incorrectly stripped whitespace from
     // any position, silently accepting malformed input real yq rejects.
     // Real jq is stricter still: it trims *nothing* at all, erroring even
@@ -5950,7 +5975,7 @@ fn format_base64d<S: EvalSemantics>(
     // (`null`/`true`/... above) reaches this exact case for the first
     // time, and the strict conversion previously here would have produced
     // a different wrong error instead of matching the oracle.
-    Ok(String::from_utf8_lossy(&result).into_owned())
+    Ok(owned_string_from_decoded_bytes(result))
 }
 
 /// @html - HTML entity escape

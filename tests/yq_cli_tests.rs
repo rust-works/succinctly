@@ -13284,3 +13284,18 @@ fn test_jq_base64d_does_not_trim_whitespace_1123() -> Result<()> {
     assert_ne!(output.status.code().unwrap_or(-1), 0);
     Ok(())
 }
+
+/// `format_urid`'s non-ASCII UTF-8 fix isn't gated by `S::TAG`, but it
+/// needs a yq-mode regression pin of its own too, not just jq mode's
+/// `test_urid_nonascii_passthrough_and_decode_1123` (`tests/jq_cli_tests.rs`).
+#[test]
+fn test_yq_urid_nonascii_passthrough_and_decode_1123() -> Result<()> {
+    let (out, code) = run_yq_stdin("@urid", r#""café""#, &["-o", "json"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "\"café\"");
+
+    let (out, code) = run_yq_stdin("@urid", r#""caf%C3%A9""#, &["-o", "json"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "\"café\"");
+    Ok(())
+}
