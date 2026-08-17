@@ -12136,11 +12136,47 @@ fn test_yq_string_interpolation_preserves_exponent_literal_1030() -> Result<()> 
     Ok(())
 }
 
+/// #1030's own premise for this case was never checked against real yq
+/// specifically: real yq's `@sh` errors on *any* non-string input, a bare
+/// number included (confirmed live against v4.53.3 -- `#1073` widened that
+/// discovery from array/object to every non-string type), so `.a | @sh` on
+/// a numeric `1e2` was never a case where fidelity-preservation could be
+/// observed through `@sh` at all. Superseded by
+/// `test_yq_at_sh_errors_on_non_string_1073` below; kept as a named
+/// regression pin for the corrected behavior on this exact input.
 #[test]
-fn test_yq_at_sh_preserves_exponent_literal_1030() -> Result<()> {
-    let (stdout, code) = run_yq_stdin(".a | @sh", "a: 1e2\n", &["-r"])?;
+fn test_yq_at_sh_errors_on_number_input_1030() -> Result<()> {
+    let (_, stderr, code) = run_yq_stdin_with_stderr(".a | @sh", "a: 1e2\n", &["-r"])?;
+    assert_ne!(code, 0);
+    assert!(
+        stderr.contains("can not be escaped for shell"),
+        "stderr: {stderr}"
+    );
+    Ok(())
+}
+
+/// #1073: real yq's `@sh` only ever accepts a string -- confirmed live
+/// against v4.53.3 for an array, a bare number, and a boolean.
+#[test]
+fn test_yq_at_sh_errors_on_non_string_1073() -> Result<()> {
+    let (_, stderr, code) = run_yq_stdin_with_stderr(".a | @sh", "a: [1, 2]\n", &["-r"])?;
+    assert_ne!(code, 0);
+    assert!(
+        stderr.contains("can not be escaped for shell"),
+        "stderr: {stderr}"
+    );
+
+    let (_, stderr, code) = run_yq_stdin_with_stderr(".a | @sh", "a: true\n", &["-r"])?;
+    assert_ne!(code, 0);
+    assert!(
+        stderr.contains("can not be escaped for shell"),
+        "stderr: {stderr}"
+    );
+
+    // A string is still accepted.
+    let (stdout, code) = run_yq_stdin(".a | @sh", "a: hello\n", &["-r"])?;
     assert_eq!(code, 0);
-    assert_eq!(stdout.trim_end(), "1e2");
+    assert_eq!(stdout.trim_end(), "'hello'");
     Ok(())
 }
 
