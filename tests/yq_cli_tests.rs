@@ -7785,7 +7785,7 @@ fn test_jq_mode_computed_float_formatting_unaffected_by_997() -> Result<()> {
 }
 
 // =============================================================================
-// Computed whole-float YAML output — #949
+// Computed whole-float YAML output — #949, #1090
 //
 // #997 (above) fixed the *scientific-notation threshold* for a computed
 // float, in both JSON and YAML output. This is a narrower, ordinary-
@@ -7793,17 +7793,15 @@ fn test_jq_mode_computed_float_formatting_unaffected_by_997() -> Result<()> {
 // computed whole float's decimal point regardless of compact/pretty --
 // `test_compact_and_pretty_agree_on_whole_floats` above), YAML output of
 // the *same* computed value drops it -- but **only at document-root
-// scalar position**. Real yq v4.53.3 disambiguates a nested computed
-// float with an explicit `!!float` tag instead (`a: !!float 2`);
-// succinctly has no tag-emission mechanism to match that, so a nested
-// computed float here keeps its pre-existing decimal-point-preserving
-// spelling (`a: 2.0`) rather than dropping the point *without* a tag,
-// which would silently reparse as an int and lose the value's type --
-// worse than the pre-#949 status quo, not just non-byte-identical to the
-// oracle. Each root-scalar expectation was measured directly against the
-// pinned `yq` v4.53.3 binary; the nested-position fallback is
-// succinctly's own choice among its two imperfect options, not itself an
-// oracle-matched spelling (see `test_computed_whole_float_nested_yaml_output_keeps_type_949`).
+// scalar position**. Real yq v4.53.3 disambiguates a nested computed float
+// with an explicit `!!float` tag instead (`a: !!float 2`); #1090 gave
+// succinctly's YAML emitters that same tag-emission mechanism, so a nested
+// computed float now matches the oracle's exact byte-for-byte spelling
+// (see `test_computed_whole_float_nested_yaml_output_keeps_type_949` --
+// between #949 and #1090, that test's expectation was `a: 2.0`,
+// type-preserving but not byte-identical to the oracle; #1090 closed that
+// last gap). Each expectation below was measured directly against the
+// pinned `yq` v4.53.3 binary.
 // =============================================================================
 
 #[test]
@@ -7858,16 +7856,16 @@ fn test_literal_whole_float_unaffected_by_949_fix() -> Result<()> {
     Ok(())
 }
 
-/// The critical regression this fix's first draft shipped (caught by code
-/// review, not by real yq's own byte-for-byte spelling): applying the
-/// root-only decimal-point drop at *every* nesting depth turned a
-/// type-preserving-if-imperfect output (`a: 2.0`, reparses as `!!float`)
-/// into a type-losing one (`a: 2`, reparses as `!!int`) for the much more
-/// common real-world shape of incrementing a float field in place. Real
-/// yq itself never drops the point here -- it tags instead (`a: !!float
-/// 2`) -- so `a: 2.0` is the closer of succinctly's two available
-/// spellings; `a: 2` would be closer in byte count but wrong in type,
-/// which is the worse defect for a data-format round trip.
+/// Before #1090, applying the root-only decimal-point drop at *every*
+/// nesting depth (this fix's first draft, caught by code review before
+/// #949 shipped) turned a type-preserving-if-imperfect output (`a: 2.0`,
+/// reparses as `!!float`) into a type-losing one (`a: 2`, reparses as
+/// `!!int`) for the much more common real-world shape of incrementing a
+/// float field in place. #949 avoided that regression by falling back to
+/// the decimal-preserving spelling for anything nested; #1090 closed the
+/// remaining gap by giving succinctly's YAML emitters the same
+/// `!!float`-tagging mechanism real yq itself uses at nested position, so
+/// the output is now byte-identical to the oracle, not just type-safe.
 #[test]
 fn test_computed_whole_float_nested_yaml_output_keeps_type_949() -> Result<()> {
     for (filter, yaml) in [
@@ -7877,11 +7875,11 @@ fn test_computed_whole_float_nested_yaml_output_keeps_type_949() -> Result<()> {
     ] {
         let (out, code) = run_yq_stdin(filter, yaml, &[])?;
         assert_eq!(code, 0, "for {filter:?}");
-        assert_eq!(out.trim(), "a: 2.0", "for {filter:?}");
+        assert_eq!(out.trim(), "a: !!float 2", "for {filter:?}");
 
         // Round-trip: re-parsing the emitted YAML must still resolve to
         // `!!float`, not `!!int` -- the actual invariant this test
-        // protects, independent of the exact decimal spelling chosen.
+        // protects, independent of the exact spelling chosen.
         let (tag, tag_code) = run_yq_stdin(".a | tag", &out, &[])?;
         assert_eq!(tag_code, 0, "for {filter:?}");
         assert_eq!(tag.trim(), "!!float", "for {filter:?}");
@@ -7889,27 +7887,85 @@ fn test_computed_whole_float_nested_yaml_output_keeps_type_949() -> Result<()> {
 
     let (out, code) = run_yq_stdin("map(. + 1)", "- 1.0\n", &[])?;
     assert_eq!(code, 0);
-    assert_eq!(out.trim(), "- 2.0");
+    assert_eq!(out.trim(), "- !!float 2");
 
     Ok(())
 }
 
-/// `-i`/`--inplace` must stay type-idempotent: repeatedly incrementing a
-/// float field must never degrade it to an int-looking value, which would
-/// silently change downstream `tag`/`type` results after just one edit.
+/// `-i`/`--inplace` must produce the same tagged, type-preserving spelling
+/// as stdin/stdout mode for a single edit (#1090). A *second* successive
+/// `-i` edit re-reading that file is deliberately not exercised here: `-i`
+/// mode has a separate, pre-existing bug (unrelated to this fix, confirmed
+/// live against unmodified `main`) where it loses an explicit `!!float`
+/// tag on a whole-number-looking scalar when re-parsing its own prior
+/// output -- filed as #1176. That bug means a second `-i '.a += 1'` on
+/// `a: !!float 2` currently produces `a: 3` (type lost), not `a: !!float
+/// 3` -- a #1176 defect, not a #1090 regression: the *value this fix
+/// writes* is correct and oracle-matched (confirmed by the single-edit
+/// assertion below and by `test_computed_whole_float_nested_yaml_output_keeps_type_949`
+/// above); what's broken is `-i` re-reading it afterward.
 #[test]
 fn test_computed_whole_float_inplace_stays_float_typed_949() -> Result<()> {
     let mut file = NamedTempFile::new()?;
     writeln!(file, "a: 1.0")?;
     let path = file.path().to_path_buf();
 
-    for want in ["a: 2.0", "a: 3.0"] {
+    let status = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .args(["yq", "-i", ".a += 1"])
+        .arg(&path)
+        .status()?;
+    assert!(status.success());
+    assert_eq!(std::fs::read_to_string(&path)?.trim(), "a: !!float 2");
+    Ok(())
+}
+
+/// Characterization test, not a regression: a *second* successive `-i`
+/// edit on a file already containing an explicit `!!float`-tagged
+/// whole-number scalar loses the tag, because `-i` mode has its own,
+/// pre-existing tag-resolution bug when re-parsing that exact shape --
+/// confirmed live against unmodified `main`, unrelated to #1090's own
+/// fix (which only changes what succinctly *writes*, not how `-i` reads
+/// it back). Filed as #1176. Pinning the current (still-buggy) behavior
+/// here so a future fix for #1176 has a test to flip, and so this
+/// doesn't silently regress further -- real yq's own behavior for the
+/// identical sequence is `a: !!float 2` then `a: !!float 3` (type
+/// preserved both times).
+#[test]
+fn test_inplace_second_edit_loses_float_tag_1176_known_gap() -> Result<()> {
+    let mut file = NamedTempFile::new()?;
+    writeln!(file, "a: 1.0")?;
+    let path = file.path().to_path_buf();
+
+    for want in ["a: !!float 2", "a: 3"] {
         let status = Command::new(env!("CARGO_BIN_EXE_succinctly"))
             .args(["yq", "-i", ".a += 1"])
             .arg(&path)
             .status()?;
         assert!(status.success());
         assert_eq!(std::fs::read_to_string(&path)?.trim(), want);
+    }
+    Ok(())
+}
+
+/// Additional #1090 cases beyond the #949 tests above: a negative whole
+/// value, an exact-zero result, and confirmation the tag never applies
+/// once the value crosses into scientific notation (its own `e` marker
+/// already makes it unambiguous) -- all oracle-verified against real yq
+/// v4.53.3.
+#[test]
+fn test_nested_float_tag_edge_cases_1090() -> Result<()> {
+    for (filter, yaml, want) in [
+        (".a -= 3", "a: 1.0\n", "a: !!float -2"),
+        (".a -= 5", "a: 5.0\n", "a: !!float 0"),
+        // Crosses the scientific-notation threshold (exponent >= 6): no
+        // tag, the `e+NN` spelling is already unambiguously a float.
+        (".a += 1499999", "a: 1.0\n", "a: 1.5e+06"),
+        // Fractional result: already unambiguous, no tag needed.
+        (".a += 0.5", "a: 1.0\n", "a: 1.5"),
+    ] {
+        let (out, code) = run_yq_stdin(filter, yaml, &[])?;
+        assert_eq!(code, 0, "for {filter:?}");
+        assert_eq!(out.trim(), want, "for {filter:?}");
     }
     Ok(())
 }

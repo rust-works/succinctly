@@ -3338,6 +3338,39 @@ pub fn format_float_yq_yaml(f: f64) -> String {
     format_float_yq_with(f, |f| f.to_string())
 }
 
+/// The nested-position sibling of [`format_float_yq_yaml`] (issue #1090).
+///
+/// For a computed float anywhere except document-root scalar position
+/// (an object field, an array element, or an `-i` in-place edit), real yq
+/// emits an explicit `!!float` tag ahead of a decimal-notation whole value
+/// to keep its type unambiguous on reparse (`a: !!float 2`, never `a: 2`
+/// or `a: 2.0`) -- but never tags a value that already has a fractional
+/// part (`1.5`, already unambiguously a float) or one that crossed
+/// `format_float_yq_with`'s scientific-notation threshold (`1.5e+06`,
+/// whose own `e` marker already makes it unambiguous; confirmed live that
+/// real yq does not tag this case even when the mantissa is a whole
+/// number). Confirmed against real yq v4.53.3 across block, flow, array,
+/// and object position -- all four share the exact same rule, matching
+/// this issue's own "not style-sensitive" observation.
+///
+/// This is YAML-output-only, unlike [`format_float_yq`]: that function is
+/// also yq's `-o json` float formatter (`src/bin/succinctly/output.rs`),
+/// where injecting YAML tag syntax would corrupt the output, so this is a
+/// dedicated sibling rather than a shared-function change.
+///
+/// `f` must be finite, like [`format_float_yq`].
+#[must_use]
+pub fn format_float_yq_yaml_nested(f: f64) -> String {
+    format_float_yq_with(f, |f| {
+        let plain = f.to_string();
+        if plain.contains('.') {
+            plain
+        } else {
+            format!("!!float {plain}")
+        }
+    })
+}
+
 /// Shared magnitude-threshold logic behind [`format_float_yq`] and
 /// [`format_float_yq_yaml`]: scientific notation (`e+NN`/`e-NN`) once the
 /// value's decimal exponent is `>= 6` or `<= -5`, otherwise
