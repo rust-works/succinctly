@@ -13966,6 +13966,37 @@ fn test_1153_parenthesized_chained_scalar_slice_del_array_parent_unaffected() ->
     Ok(())
 }
 
+/// `?` applied *outside* the closing paren must apply #1116's rule the
+/// same as every other placement -- an earlier draft of this fix used the
+/// narrower `unwrap_paren` (peels only `Expr::Paren`) instead of
+/// `unwrap_path_component` (peels `Expr::Paren` *and* `Expr::Optional`,
+/// in either order), which let `del((.a[0:1])?)` alone silently no-op
+/// instead of deleting the parent key -- every sibling placement
+/// (`del((.a[0:1]))`, `del((.a[0:1]?))`, `del(.a[0:1]?)`) already worked
+/// (found by review before merge; no real-yq oracle for this exact
+/// syntax exists -- its own lexer rejects `(...)?` outright -- so this
+/// locks in succinctly's own internal consistency across the four
+/// placements, not oracle conformance).
+#[test]
+fn test_1153_optional_outside_paren_still_applies_parent_key_rule() -> Result<()> {
+    let input = r#"{"a":5,"b":6}"#;
+    let expected = r#"{"b":6}"#;
+
+    let (out, code) = run_yq_stdin("del((.a[0:1])?)", input, &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), expected, "optional outside parens");
+
+    let (out, code) = run_yq_stdin("del((.a[0:1]?))", input, &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), expected, "optional inside parens");
+
+    let (out, code) = run_yq_stdin("del(.a[0:1]?)", input, &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), expected, "no parens at all");
+
+    Ok(())
+}
+
 /// del()'s parent-key rule also applies when the resolved path fans out
 /// into more than one target (a top-level comma, or a computed key with
 /// multiple values) — `delete_expr_paths_at`'s sibling-grouping walker
