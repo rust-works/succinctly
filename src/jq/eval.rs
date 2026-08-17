@@ -5333,6 +5333,18 @@ pub(crate) fn numeric_display_string<S: EvalSemantics>(value: &OwnedValue) -> St
         if f.is_nan() || f.is_infinite() {
             return nonfinite_display_string::<S>(*f).to_string();
         }
+        // A genuinely computed float (never captured as a `NumberLiteral`
+        // above -- e.g. `(1e10 * 2)`) applies real yq's scientific-notation
+        // magnitude threshold when stringified, unlike `-o json`/structured
+        // YAML output's `to_json_yq`/reindex-bridge formatting, which must
+        // keep a decimal spelling at any magnitude instead (#953) -- these
+        // are different formatting rules for different call sites, not a
+        // contradiction: confirmed live, `(1e10*2) | tostring` gives
+        // `"2e+10"` while `[.a]`'s own array-wrapped output keeps
+        // `100000000000000000000.0` for an i64-overflow scalar (#1054).
+        if S::TAG == EvalTag::Yq {
+            return crate::yaml::format_float_yq(*f);
+        }
     }
     value.number_str().expect("numeric variant").into_owned()
 }
@@ -5415,7 +5427,7 @@ pub(crate) fn owned_value_to_json<S: EvalSemantics>(value: &OwnedValue) -> Strin
 }
 
 /// Convert an owned value to a string representation (for interpolation).
-fn owned_to_string<S: EvalSemantics>(value: &OwnedValue) -> String {
+pub(crate) fn owned_to_string<S: EvalSemantics>(value: &OwnedValue) -> String {
     match value {
         OwnedValue::Null => "null".to_string(),
         OwnedValue::Bool(true) => "true".to_string(),

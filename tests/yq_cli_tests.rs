@@ -12281,6 +12281,78 @@ fn test_yq_string_interpolation_preserves_exponent_literal_1030() -> Result<()> 
     Ok(())
 }
 
+// =============================================================================
+// #1054: `tostring`/string interpolation on a *computed* whole-number float
+// applies real yq's scientific-notation magnitude threshold, instead of
+// always spelling it out as a plain decimal. All live-verified against yq
+// v4.53.3. Distinct from #1030 above: #1030 is about a *document-sourced*
+// literal's exponent spelling surviving unchanged; this is about a value
+// with no literal at all (a genuine arithmetic result).
+// =============================================================================
+
+/// #1054's own repro: `EXPR | tostring` on a computed float. Before the fix,
+/// this serialized through the internal reindex bridge's decimal-only float
+/// formatter first, reparsed as a document-sourced-*looking* number, and
+/// echoed that baked text verbatim -- permanently losing the
+/// scientific-notation spelling real yq applies to a computed float.
+#[test]
+fn test_yq_tostring_computed_float_uses_scientific_notation_1054() -> Result<()> {
+    let (stdout, code) = run_yq_stdin("(1e10 * 2) | tostring", "a: 1\n", &["-r"])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "2e+10");
+    Ok(())
+}
+
+/// Same computation, reached via string interpolation instead of a
+/// separate `| tostring` pipe stage -- a different code path (the computed
+/// value never leaves `OwnedValue::Float`, so it was already correct via
+/// `numeric_display_string` alone, without needing the reindex-bridge
+/// bypass `tostring`'s own fix above needed).
+#[test]
+fn test_yq_interpolation_computed_float_uses_scientific_notation_1054() -> Result<()> {
+    let (stdout, code) = run_yq_stdin(r#""\((1e10 * 2))""#, "a: 1\n", &["-r"])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "2e+10");
+    Ok(())
+}
+
+/// Regression guard: a computed float whose magnitude falls *inside* real
+/// yq's non-scientific threshold (roughly exponent -4..6) keeps its plain
+/// decimal spelling via `tostring` -- and, unlike #953's `-o json`/
+/// structured-output rule, without a forced trailing `.0`: `tostring`
+/// produces a readable string, not a type-preserving round-trippable
+/// value, so `200` (not `200.0`) is real yq's own output here.
+#[test]
+fn test_yq_tostring_computed_float_within_threshold_stays_decimal_1054() -> Result<()> {
+    let (stdout, code) = run_yq_stdin("(100 * 2) | tostring", "a: 1\n", &["-r"])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "200");
+    Ok(())
+}
+
+/// jq mode has no such threshold -- `tostring` on a computed float always
+/// uses jq's own plain-decimal spelling regardless of magnitude, matching
+/// real jq exactly. This is the fix's own mode gate: confirms nothing
+/// leaked from the yq-only branch into jq mode.
+#[test]
+fn test_jq_tostring_computed_float_unaffected_1054() -> Result<()> {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_succinctly"));
+    cmd.arg("jq")
+        .args(["-r", "(1e10 * 2) | tostring"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn()?;
+    child.stdin.take().unwrap().write_all(b"1")?;
+    let output = child.wait_with_output()?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim_end(),
+        "20000000000"
+    );
+    Ok(())
+}
+
 /// #1030's own premise for this case was never checked against real yq
 /// specifically: real yq's `@sh` errors on *any* non-string input, a bare
 /// number included (confirmed live against v4.53.3 -- `#1073` widened that
