@@ -6004,14 +6004,28 @@ fn format_base64d<S: EvalSemantics>(
     // construction (it's already been truncated above), so none of
     // these arms need to special-case it the way the very first
     // version of this fix's 4-char arm alone used to.
-    for chunk in prefix.chunks(4) {
+    // Mode-specific error wording (#1146): jq splits invalid-character vs
+    // too-short-trailing-group into two distinct messages
+    // (`base64_invalid_data`/`base64_trailing_byte`); yq uses one uniform,
+    // byte-position-based message (`base64_illegal_data`) for both. `pos`
+    // is this byte's own index within `trimmed` (`chunk_start + offset`),
+    // confirmed live to be the exact failing byte, not the chunk start.
+    let char_error = |pos: usize| -> EvalError {
+        if S::TAG == EvalTag::Yq {
+            EvalError::base64_illegal_data(pos)
+        } else {
+            EvalError::base64_invalid_data(value)
+        }
+    };
+
+    for (chunk_index, chunk) in prefix.chunks(4).enumerate() {
+        let chunk_start = chunk_index * 4;
         match chunk.len() {
             4 => {
-                let a = decode_char(chunk[0]).ok_or_else(|| EvalError::new("invalid base64"))?;
-                let b = decode_char(chunk[1]).ok_or_else(|| EvalError::new("invalid base64"))?;
-                let c_val =
-                    decode_char(chunk[2]).ok_or_else(|| EvalError::new("invalid base64"))?;
-                let d = decode_char(chunk[3]).ok_or_else(|| EvalError::new("invalid base64"))?;
+                let a = decode_char(chunk[0]).ok_or_else(|| char_error(chunk_start))?;
+                let b = decode_char(chunk[1]).ok_or_else(|| char_error(chunk_start + 1))?;
+                let c_val = decode_char(chunk[2]).ok_or_else(|| char_error(chunk_start + 2))?;
+                let d = decode_char(chunk[3]).ok_or_else(|| char_error(chunk_start + 3))?;
 
                 let triple =
                     ((a as u32) << 18) | ((b as u32) << 12) | ((c_val as u32) << 6) | (d as u32);
@@ -6021,22 +6035,25 @@ fn format_base64d<S: EvalSemantics>(
                 result.push((triple & 0xFF) as u8);
             }
             3 => {
-                let a = decode_char(chunk[0]).ok_or_else(|| EvalError::new("invalid base64"))?;
-                let b = decode_char(chunk[1]).ok_or_else(|| EvalError::new("invalid base64"))?;
-                let c_val =
-                    decode_char(chunk[2]).ok_or_else(|| EvalError::new("invalid base64"))?;
+                let a = decode_char(chunk[0]).ok_or_else(|| char_error(chunk_start))?;
+                let b = decode_char(chunk[1]).ok_or_else(|| char_error(chunk_start + 1))?;
+                let c_val = decode_char(chunk[2]).ok_or_else(|| char_error(chunk_start + 2))?;
                 let value = ((a as u32) << 12) | ((b as u32) << 6) | (c_val as u32);
                 result.push(((value >> 10) & 0xFF) as u8);
                 result.push(((value >> 2) & 0xFF) as u8);
             }
             2 => {
-                let a = decode_char(chunk[0]).ok_or_else(|| EvalError::new("invalid base64"))?;
-                let b = decode_char(chunk[1]).ok_or_else(|| EvalError::new("invalid base64"))?;
+                let a = decode_char(chunk[0]).ok_or_else(|| char_error(chunk_start))?;
+                let b = decode_char(chunk[1]).ok_or_else(|| char_error(chunk_start + 1))?;
                 let value = ((a as u32) << 6) | (b as u32);
                 result.push(((value >> 4) & 0xFF) as u8);
             }
             _ => {
-                return Err(EvalError::base64_trailing_byte(value));
+                return Err(if S::TAG == EvalTag::Yq {
+                    EvalError::base64_illegal_data(prefix.len())
+                } else {
+                    EvalError::base64_trailing_byte(value)
+                });
             }
         }
     }
