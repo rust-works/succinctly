@@ -562,6 +562,19 @@ impl EvalError {
         Self::new(format!("{} is not valid in a csv row", describe(value)))
     }
 
+    /// `<type> (<value>) trailing base64 byte found` (#1120).
+    ///
+    /// Raised by `@base64d` when, after truncating at the first `=`
+    /// (real jq discards it and everything after, not just within its own
+    /// 4-character group), the remaining data's length has exactly a
+    /// 1-character remainder past a multiple of 4 -- one base64 character
+    /// (6 bits) can't carry even a single byte (8 bits). Confirmed live
+    /// against jq 1.7.1: `"false" | @base64d` is `"string (\"false\")
+    /// trailing base64 byte found"`.
+    pub fn base64_trailing_byte(value: &OwnedValue) -> Self {
+        Self::new(format!("{} trailing base64 byte found", describe(value)))
+    }
+
     /// `Invalid path expression with result <value>` (#530).
     ///
     /// Raised by `path()` when the filter it was given is not a path

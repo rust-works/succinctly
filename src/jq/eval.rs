@@ -5808,12 +5808,16 @@ fn format_base64<S: EvalSemantics>(
 /// first, same as [`format_urid`] above (see [`yq_stringify_scalar_or_empty`])
 /// -- what happens next to that string (valid decode, garbage, or an
 /// error) is this decoder's own leniency/strictness on the *string* it's
-/// given, unrelated to what type reached it; not touched here (its
-/// pre-existing non-multiple-of-4-length truncation-instead-of-erroring
-/// leniency is filed separately as #1120). A container stringifies to the
+/// given, unrelated to what type reached it. A container stringifies to the
 /// empty string (#1109), which trivially decodes to `""` (zero chunks)
 /// rather than needing its own early return. jq mode is unaffected: it
 /// keeps erroring on every non-string type, unchanged from before.
+///
+/// The decode algorithm matches real jq's exactly (see the
+/// truncate-at-first-`=` comment inside). Real yq is *stricter* than real
+/// jq for malformed/excess padding (e.g. `"===="` errors in yq, decodes to
+/// `""` in jq) — a separate, narrower divergence not addressed here, filed
+/// as #1135.
 fn format_base64d<S: EvalSemantics>(
     value: &OwnedValue,
     optional: bool,
@@ -5825,7 +5829,7 @@ fn format_base64d<S: EvalSemantics>(
         _ => return Err(EvalError::type_error("string", value.type_name())),
     };
 
-    // Simple base64 decoding
+    // Simple base64 decoding of a single non-padding character.
     fn decode_char(c: u8) -> Option<u8> {
         match c {
             b'A'..=b'Z' => Some(c - b'A'),
@@ -5833,33 +5837,83 @@ fn format_base64d<S: EvalSemantics>(
             b'0'..=b'9' => Some(c - b'0' + 52),
             b'+' => Some(62),
             b'/' => Some(63),
-            b'=' => Some(0), // Padding
             _ => None,
         }
     }
 
-    let s = s.replace(|c: char| c.is_whitespace(), "");
-    let bytes: Vec<u8> = s.bytes().collect();
+    let stripped = s.replace(|c: char| c.is_whitespace(), "");
+
+    // Real jq truncates at the *first* `=` in the (whitespace-
+    // stripped) input, discarding it and everything after it --
+    // not just within its own 4-character group, as an earlier
+    // version of this fix assumed. Confirmed live against jq 1.7.1
+    // across a wide matrix: `"AB=C"` -> `"AB"`'s decode (the `C` is
+    // discarded, not an error); `"A=B=C"` -> `"A"`'s decode (which
+    // then errors, since a lone 1-char remainder is invalid);
+    // `"YWI=="`/`"YWI="`/`"YWI"` all decode identically to `"YWI"`
+    // alone (excess or missing padding beyond the first `=` simply
+    // doesn't matter); `"===="`/`"="` both decode to `""` (an
+    // empty prefix). This is also what fixes a regression an
+    // earlier version of this same fix introduced: `"YWI=="` used
+    // to (accidentally) work pre-#1120 because the old code just
+    // `break`s on any short trailing chunk, silently ignoring the
+    // leftover `['=']`; a naive per-chunk fix without this
+    // truncation step made it a hard error instead.
+    let prefix = match stripped.as_bytes().iter().position(|&b| b == b'=') {
+        Some(i) => &stripped.as_bytes()[..i],
+        None => stripped.as_bytes(),
+    };
+
     let mut result = Vec::new();
 
-    for chunk in bytes.chunks(4) {
-        if chunk.len() < 4 {
-            break;
-        }
+    // Real jq/yq accept an unpadded final group of 2 or 3 characters
+    // (1 or 2 decoded bytes) as well as a full 4-character group —
+    // only a *1*-character trailing remainder is invalid, since one
+    // base64 character alone (6 bits) can't carry even a single byte
+    // (8 bits). Confirmed live against both oracles: `"ab"`/`"abc"`
+    // decode successfully (jq 1.7.1, yq v4.53.3), `"a"`/`"false"`
+    // (a 4-char group plus a 1-char remainder) both error. This
+    // codebase's earlier version silently `break`s out of the loop
+    // for *any* trailing chunk shorter than 4, discarding the
+    // partial data instead of decoding it (2/3-length) or erroring
+    // (1-length) — #1120. `prefix` never contains `=` by
+    // construction (it's already been truncated above), so none of
+    // these arms need to special-case it the way the very first
+    // version of this fix's 4-char arm alone used to.
+    for chunk in prefix.chunks(4) {
+        match chunk.len() {
+            4 => {
+                let a = decode_char(chunk[0]).ok_or_else(|| EvalError::new("invalid base64"))?;
+                let b = decode_char(chunk[1]).ok_or_else(|| EvalError::new("invalid base64"))?;
+                let c_val =
+                    decode_char(chunk[2]).ok_or_else(|| EvalError::new("invalid base64"))?;
+                let d = decode_char(chunk[3]).ok_or_else(|| EvalError::new("invalid base64"))?;
 
-        let a = decode_char(chunk[0]).ok_or_else(|| EvalError::new("invalid base64"))?;
-        let b = decode_char(chunk[1]).ok_or_else(|| EvalError::new("invalid base64"))?;
-        let c_val = decode_char(chunk[2]).ok_or_else(|| EvalError::new("invalid base64"))?;
-        let d = decode_char(chunk[3]).ok_or_else(|| EvalError::new("invalid base64"))?;
+                let triple =
+                    ((a as u32) << 18) | ((b as u32) << 12) | ((c_val as u32) << 6) | (d as u32);
 
-        let triple = ((a as u32) << 18) | ((b as u32) << 12) | ((c_val as u32) << 6) | (d as u32);
-
-        result.push(((triple >> 16) & 0xFF) as u8);
-        if chunk[2] != b'=' {
-            result.push(((triple >> 8) & 0xFF) as u8);
-        }
-        if chunk[3] != b'=' {
-            result.push((triple & 0xFF) as u8);
+                result.push(((triple >> 16) & 0xFF) as u8);
+                result.push(((triple >> 8) & 0xFF) as u8);
+                result.push((triple & 0xFF) as u8);
+            }
+            3 => {
+                let a = decode_char(chunk[0]).ok_or_else(|| EvalError::new("invalid base64"))?;
+                let b = decode_char(chunk[1]).ok_or_else(|| EvalError::new("invalid base64"))?;
+                let c_val =
+                    decode_char(chunk[2]).ok_or_else(|| EvalError::new("invalid base64"))?;
+                let value = ((a as u32) << 12) | ((b as u32) << 6) | (c_val as u32);
+                result.push(((value >> 10) & 0xFF) as u8);
+                result.push(((value >> 2) & 0xFF) as u8);
+            }
+            2 => {
+                let a = decode_char(chunk[0]).ok_or_else(|| EvalError::new("invalid base64"))?;
+                let b = decode_char(chunk[1]).ok_or_else(|| EvalError::new("invalid base64"))?;
+                let value = ((a as u32) << 6) | (b as u32);
+                result.push(((value >> 4) & 0xFF) as u8);
+            }
+            _ => {
+                return Err(EvalError::base64_trailing_byte(value));
+            }
         }
     }
 
