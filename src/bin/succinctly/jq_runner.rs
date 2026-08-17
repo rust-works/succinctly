@@ -15,7 +15,8 @@ use succinctly::jq::eval_generic::{
     eval_with_cursor, to_owned as generic_to_owned, GenericResult, MAX_NESTING_DEPTH,
 };
 use succinctly::jq::{
-    self, assert_value_tree_depth, format_number_jq_compat, Expr, JqValue, OwnedValue, Program,
+    self, assert_value_tree_depth, format_number_jq_compat, nonfinite_display_string, Expr,
+    JqSemantics, JqValue, OwnedValue, Program,
 };
 use succinctly::json::light::{JsonCursor, StandardJson};
 use succinctly::json::validate::{self, ValidationError};
@@ -2017,32 +2018,33 @@ impl LiteralFormatter for JqCompatFormatter {
                 _ => "null".to_string(),
             });
         }
-        // A source literal that overflows to ±Infinity/NaN (e.g. `1e400`)
-        // must not be fed to `format_number_jq_compat` here: this is real
-        // JSON output (`--jq-compat`), which RFC 8259 forbids an Infinity/NaN
-        // literal from, so it must substitute "null" regardless of what text
-        // the function would produce - match `format_float`'s guard below.
-        // (`format_number_jq_compat` itself now handles a non-finite input
-        // correctly rather than the "NaNE+2147483647"-style garbage #561
-        // fixed for the plain-overflow case - #930 closed the same gap for
-        // the *literal*-with-exponent case - but that's jq's real-text
-        // convention for error-message previews, the wrong one for this
-        // RFC-8259-constrained call site.)
-        let overflows = core::str::from_utf8(raw)
-            .ok()
-            .and_then(|s| s.parse::<f64>().ok())
-            .is_some_and(|f| f.is_nan() || f.is_infinite());
-        if overflows {
-            return Cow::Borrowed("null");
-        }
+        // A source literal that overflows to +/-Infinity (e.g. `1e400`) goes
+        // through `format_number_jq_compat` like any other literal (#1087):
+        // it already special-cases a non-finite input via
+        // `format_overflow_literal_mantissa`, giving jq's own mantissa-
+        // preserving renormalized text (`1e400` -> `1E+400`) -- confirmed
+        // live against jq 1.7.1, where `1e400 | .` (identity, no
+        // computation) echoes `1E+400`, not `null` or `DBL_MAX` text; only
+        // an actual *computed* Infinity (`format_float` below) gets the
+        // `DBL_MAX` substitution. JSON's number grammar has no NaN spelling,
+        // so a NaN literal can't reach this function at all -- only via
+        // `format_float`.
         Cow::Owned(format_number_jq_compat(raw))
     }
 
     fn format_float(&self, f: f64) -> String {
-        if f.is_nan() || f.is_infinite() {
-            "null".to_string()
-        } else {
+        // A computed Infinity (`infinite`, an arithmetic overflow) has no
+        // source literal to echo, so it renders jq's own `DBL_MAX` text
+        // instead of `null` (#1087, confirmed live against jq 1.7.1: `null |
+        // infinite` is `1.7976931348623157e+308`, not `null`). NaN has no
+        // such fallback text in real jq either and stays `null`. Reuses
+        // #1075's `nonfinite_display_string` (the same NaN-vs-Infinity split
+        // already pinned for jq's *text*-format path) rather than a fourth
+        // hand-rolled copy of the same two branches.
+        if f.is_finite() {
             format!("{f}")
+        } else {
+            nonfinite_display_string::<JqSemantics>(f).to_string()
         }
     }
 
@@ -2065,10 +2067,14 @@ impl LiteralFormatter for PreserveFormatter {
     }
 
     fn format_float(&self, f: f64) -> String {
-        if f.is_nan() || f.is_infinite() {
-            "null".to_string()
-        } else {
+        // Same split as `JqCompatFormatter::format_float` above (#1087): a
+        // computed Infinity has no source literal for preserve mode to keep
+        // either, so both formatters need the identical jq-real-output rule
+        // here, not just the jq_compat one.
+        if f.is_finite() {
             format!("{f}")
+        } else {
+            nonfinite_display_string::<JqSemantics>(f).to_string()
         }
     }
 
@@ -2507,15 +2513,18 @@ mod tests {
     fn test_jq_compat_formatter_format_raw_number() {
         // Finite numbers fall through the NaN/Infinity guard unchanged.
         assert_eq!(JqCompatFormatter.format_raw_number(b"42").as_ref(), "42");
-        // Overflowed literals substitute "null" instead of reaching
-        // `format_number_jq_compat`, which assumes a finite value (#561).
+        // Overflowed literals echo `format_number_jq_compat`'s own
+        // mantissa-preserving reformat, not "null" (#1087 -- #561's original
+        // premise, that this function "assumes a finite value," stopped
+        // holding once #930 gave it a non-finite special case;
+        // confirmed live against jq 1.7.1, `1e400 | .` echoes `1E+400`).
         assert_eq!(
             JqCompatFormatter.format_raw_number(b"1e400").as_ref(),
-            "null"
+            "1E+400"
         );
         assert_eq!(
             JqCompatFormatter.format_raw_number(b"-1e400").as_ref(),
-            "null"
+            "-1E+400"
         );
     }
 
