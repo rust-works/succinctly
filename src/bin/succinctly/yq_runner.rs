@@ -20,7 +20,8 @@ use succinctly::jq::{
 };
 use succinctly::json::JsonIndex;
 use succinctly::yaml::{
-    resolve_plain, resolve_tagged, stream_yaml_sequence, YamlCursor, YamlIndex, YamlValue,
+    format_float_yq_yaml, resolve_plain, resolve_tagged, stream_yaml_sequence, YamlCursor,
+    YamlIndex, YamlValue,
 };
 
 use super::{FrontMatterMode, InputFormat, OutputFormat, YqCommand};
@@ -1561,6 +1562,19 @@ fn emit_yaml_value_at_depth(
         OwnedValue::Float(f) if f.is_nan() || f.is_infinite() => {
             nonfinite_display_string::<YqSemantics>(*f).to_string()
         }
+        // Real yq drops a computed whole float's decimal point (`2`, not
+        // `2.0`) only at document-root scalar position -- issue #949.
+        // Anywhere nested (an object field, an array element, an `-i`
+        // in-place edit) it instead emits an explicit `!!float` tag to
+        // keep the value's type unambiguous on reparse (`a: !!float 2`);
+        // succinctly has no tag-emission mechanism to match that, so
+        // falling back to `format_float_yq`'s decimal-preserving spelling
+        // here is the safer of the two available choices -- it's not
+        // byte-identical to real yq, but unlike the bare, untagged `2`
+        // this fix originally used at every depth, it doesn't silently
+        // change the value's inferred type from float to int on
+        // reparse/round-trip through `-i`.
+        OwnedValue::Float(f) if depth == 0 => format_float_yq_yaml(*f),
         OwnedValue::Float(f) => format_float_yq(*f),
         OwnedValue::NumberLiteral(NumberRepr::Float(f), _) if f.is_nan() || f.is_infinite() => {
             nonfinite_display_string::<YqSemantics>(*f).to_string()
