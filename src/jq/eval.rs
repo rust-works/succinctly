@@ -1619,6 +1619,9 @@ fn eval_arithmetic<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             ArithOp::Mul(flags) => arith_mul::<S>(left_val, right_val, flags),
             ArithOp::Div => arith_div::<S>(left_val, right_val),
             ArithOp::Mod => arith_mod::<S>(left_val, right_val),
+            // `left_val` is always the unused dummy (see `ArithOp::Negate`'s
+            // own doc comment).
+            ArithOp::Negate => arith_negate::<S>(right_val),
         },
     )
 }
@@ -1705,6 +1708,43 @@ fn arith_sub<S: EvalSemantics>(
             Ok(OwnedValue::Array(result))
         }
         (a, b) => Err(EvalError::binary_op(&a, &b, BinOp::Subtract)),
+    }
+}
+
+/// Unary minus (`-expr`, #1056): true IEEE-754 negation, not `0 - expr`
+/// (loses the sign of a zero-valued operand) and not `-1 * expr` (silently
+/// inherits `*`'s string-repetition and null-passthrough semantics instead
+/// of erroring on a non-numeric operand -- an earlier draft of this fix did
+/// exactly that and was caught by code review before reaching `main`, since
+/// `-"abc"`/`-null` both silently returned `null` instead of erroring).
+///
+/// `Float(f)` negates via Rust's own unary `-`, which correctly flips the
+/// sign bit for every value including `0.0`. `Int(n)` negates via
+/// `checked_neg`/`wrapping_neg` (jq/yq's usual overflow conventions,
+/// matching `arith_sub`'s `0 - n` handling exactly: only `i64::MIN` can
+/// overflow, since `-i64::MIN` doesn't fit in `i64`) -- *except* for `n ==
+/// 0`, which promotes to `Float(-0.0)` instead of staying `Int(0)`: unlike
+/// `arith_mul`, this function has exactly one caller (unary minus itself),
+/// so special-casing zero here can't accidentally reinterpret some
+/// unrelated expression the way special-casing `-1 * 0` inside `arith_mul`
+/// would have (see this function's own history above) -- real jq has no
+/// separate integer type, so an all-integer computation that reduces to
+/// exactly zero (`-(1-1)`) is already the double `0.0` there, and negating
+/// it naturally yields `-0.0`; this promotion is the one place `Int`
+/// deliberately gives up exact-integer fidelity to match that.
+fn arith_negate<S: EvalSemantics>(operand: OwnedValue) -> Result<OwnedValue, EvalError> {
+    match operand.into_plain_number() {
+        OwnedValue::Int(0) => Ok(OwnedValue::Float(-0.0)),
+        OwnedValue::Int(n) => Ok(OwnedValue::Int(if S::OVERFLOW_WRAPS {
+            n.wrapping_neg()
+        } else {
+            match n.checked_neg() {
+                Some(result) => result,
+                None => return Ok(OwnedValue::Float(-(n as f64))),
+            }
+        })),
+        OwnedValue::Float(f) => Ok(OwnedValue::Float(-f)),
+        other => Err(EvalError::cannot_be_negated(&other)),
     }
 }
 
@@ -15995,6 +16035,9 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
                     ArithOp::Mul(flags) => arith_mul::<S>(left_val, right_val, *flags),
                     ArithOp::Div => arith_div::<S>(left_val, right_val),
                     ArithOp::Mod => arith_mod::<S>(left_val, right_val),
+                    // `left_val` is always the unused dummy (see
+                    // `ArithOp::Negate`'s own doc comment).
+                    ArithOp::Negate => arith_negate::<S>(right_val),
                 },
             );
             if rest.is_empty() {
@@ -25130,11 +25173,19 @@ mod tests {
 
     /// #1056: unary minus on a non-literal operand used to lower to `(0 -
     /// expr)`, whose IEEE-754 `0.0 - 0.0` silently loses the sign of a
-    /// zero-valued operand -- `(-1) * expr` preserves it instead, matching
-    /// the fix #1035 already applied to the filter-literal rewrite just
-    /// above this test. Confirmed live against jq 1.7.1.
+    /// zero-valued operand -- a dedicated `ArithOp::Negate` (`arith_negate`)
+    /// preserves it instead, matching the fix #1035 already applied to the
+    /// filter-literal rewrite just above this test. Also covers an
+    /// all-integer computation that reduces to exactly zero (`-(1-1)`):
+    /// unlike real jq (no separate integer type, so `1 - 1` is already the
+    /// double `0.0` there), `OwnedValue::Int(0)` has no negative-zero
+    /// representation of its own, so `arith_negate` promotes exactly this
+    /// one case to `Float(-0.0)` -- safe *only* because this function has
+    /// exactly one caller (unary minus), unlike the `(-1) * expr` rewrite an
+    /// earlier draft tried (see `test_unary_minus_non_numeric_errors_1056`
+    /// below for why that was reverted). Confirmed live against jq 1.7.1.
     #[test]
-    fn test_unary_minus_float_zero_preserves_sign_1056() {
+    fn test_unary_minus_zero_preserves_sign_1056() {
         query!(br#"{"a":0.0}"#, "-.a",
             QueryResult::Owned(OwnedValue::Float(f)) => {
                 assert_eq!(f, 0.0);
@@ -25158,8 +25209,15 @@ mod tests {
             }
         );
 
-        // Sanity: ordinary (non-zero) negation is unaffected by the
-        // Sub-to-Mul rewrite.
+        // The all-integer case: -(1-1) promotes Int(0) to Float(-0.0).
+        query!(br"null", "-(1-1)",
+            QueryResult::Owned(OwnedValue::Float(f)) => {
+                assert_eq!(f, 0.0);
+                assert!(f.is_sign_negative());
+            }
+        );
+
+        // Sanity: ordinary (non-zero) negation is unaffected.
         query!(br#"{"a":5.5}"#, "-.a",
             QueryResult::Owned(OwnedValue::Float(f)) => {
                 assert_eq!(f, -5.5);
@@ -25170,26 +25228,61 @@ mod tests {
                 assert_eq!(n, -5);
             }
         );
+
+        // Sanity: a generator operand still fans out to one negated result
+        // per output (the dummy `left` in `ArithOp::Negate`'s rewrite must
+        // not collapse this to a single value).
+        assert_eq!(outputs(b"null", "-(1,2,3)"), ["-1", "-2", "-3"]);
+
+        // i64::MIN overflows i64 negation (matching arith_sub's own
+        // 0 - i64::MIN overflow handling): falls back to Float, same
+        // (including precision loss) as real jq's own uniform-double model.
+        query!(br"null", "-(-9223372036854775808)",
+            QueryResult::Owned(OwnedValue::Float(f)) => {
+                assert_eq!(f, 9223372036854775808.0);
+            }
+        );
     }
 
-    /// #1056 follow-up (filed as #1091, not fixed here): unlike real jq --
-    /// which has no separate integer type, so `1 - 1` is already the double
-    /// `0.0` internally -- succinctly's `Int`/`Float` split means an
-    /// all-integer computation that reduces to exactly zero stays
-    /// `OwnedValue::Int(0)`, which has no negative-zero representation to
-    /// preserve at all. `(-1) * 0` (this issue's own fix) can't help here:
-    /// `Int * Int` correctly stays `Int` for genuine multiplication, so
-    /// special-casing it would incorrectly reinterpret a literal `(-1) * 0`
-    /// a user actually wrote. A full fix needs a representation that's
-    /// unambiguously "this is a negation" (e.g. a dedicated unary AST
-    /// variant), not an arithmetic rewrite -- pinned here so a future
-    /// evaluator change can't silently "fix" this by accident without
-    /// updating the test (which would then need `is_sign_negative()`
-    /// added, matching the float cases above).
+    /// #1056 review: an earlier draft implemented unary minus as
+    /// `(-1) * expr` instead of a dedicated `ArithOp::Negate` -- silently
+    /// wrong, not just imprecise: `arith_mul` has its own string-repetition
+    /// (`Int * String`) and null-passthrough (`NULL_MERGES_AS_EMPTY`/`null *
+    /// x = null`) semantics that have nothing to do with negation, so
+    /// `-"abc"`/`-null` both returned `null` with exit code 0 instead of
+    /// erroring -- caught by code review before reaching `main`, with zero
+    /// test coverage of any non-numeric unary-minus operand at the time.
+    /// Confirmed live against jq 1.7.1: every non-numeric type errors with
+    /// jq's own dedicated "cannot be negated" wording (`EvalError::
+    /// cannot_be_negated`), not `arith_sub`'s pre-#1056 "cannot be
+    /// subtracted" or a hypothetical `arith_mul`-derived "cannot be
+    /// multiplied".
     #[test]
-    fn test_unary_minus_integer_zero_still_loses_sign_1056_followup() {
-        query!(br"null", "-(1-1)",
-            QueryResult::Owned(OwnedValue::Int(0)) => {}
+    fn test_unary_minus_non_numeric_errors_1056() {
+        query!(br#""abc""#, "-.",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, r#"string ("abc") cannot be negated"#);
+            }
+        );
+        query!(br"null", "-.",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "null (null) cannot be negated");
+            }
+        );
+        query!(br"true", "-.",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "boolean (true) cannot be negated");
+            }
+        );
+        query!(br"[1,2]", "-.",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "array ([1,2]) cannot be negated");
+            }
+        );
+        query!(br"{}", "-.",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "object ({}) cannot be negated");
+            }
         );
     }
 
