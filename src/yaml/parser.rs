@@ -591,19 +591,36 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         self.bp_pos += 1;
     }
 
+    /// Whether the mapping on top of `indent_stack` right now is the owner
+    /// of `pending_explicit_key` — i.e. the frame that would receive the
+    /// key's value if one were written this instant. A complex key can
+    /// itself be an open container (`? k: v` leaves the key mapping above
+    /// its owner), so this is only true once the stack has unwound back to
+    /// exactly the owner's own recorded depth.
+    ///
+    /// Shared by every pending-key-aware pop site (#106: one definition,
+    /// not a copy of this same equality test re-derived at each call site).
+    fn pending_explicit_key_owns_current_frame(&self) -> bool {
+        self.pending_explicit_key == Some(self.indent_stack.len())
+    }
+
     /// Close a pending explicit key by adding a null value node.
     /// Call this when a new key or end of mapping is encountered without an explicit value.
     ///
     /// The null goes to the mapping that *owns* the key, which is only the mapping on
-    /// top of the stack when the depths match. A complex key can itself be an open
-    /// container — `? k: v` leaves the key mapping above its owner — and writing the
-    /// owner's null into that key would give the key a stray third child and consume
+    /// top of the stack when the depths match (see
+    /// [`Self::pending_explicit_key_owns_current_frame`]) — writing the owner's null
+    /// into a still-open complex key would give the key a stray third child and consume
     /// the pending state before the real `: value` line arrives.
     ///
-    /// Every caller funnels through here rather than repeating the ownership test at
-    /// the call site: three copies of one predicate is how #106 happened.
+    /// Every caller that wants a null synthesized funnels through here rather than
+    /// repeating the ownership test at the call site: three copies of one predicate is
+    /// how #106 happened. [`Self::close_same_indent_sequence_before_mapping_entry`]
+    /// checks the same predicate directly instead, since it must clear the flag
+    /// *without* synthesizing a null — the key there already has a real value (the
+    /// sequence just closed), not a missing one.
     fn close_pending_explicit_key(&mut self) {
-        if self.pending_explicit_key == Some(self.indent_stack.len()) {
+        if self.pending_explicit_key_owns_current_frame() {
             // Add a null value node (empty open/close pair)
             // Use input.len() as the text position to indicate "no text" / null value
             self.write_bp_open_at(self.input.len());
@@ -2193,8 +2210,11 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 // explicit value" case that helper handles. Left stale,
                 // a later mapping entry at this same indent would be
                 // silently misattributed to the closed key instead of
-                // starting fresh (#1040).
-                if self.pending_explicit_key == Some(self.indent_stack.len()) {
+                // starting fresh (#1040). Shares
+                // `pending_explicit_key_owns_current_frame`'s predicate
+                // with `close_pending_explicit_key` rather than
+                // re-deriving it here (#106).
+                if self.pending_explicit_key_owns_current_frame() {
                     self.pending_explicit_key = None;
                 }
             }
@@ -3055,6 +3075,16 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
 
         // If there's a pending explicit key without value, close it with null
         self.close_pending_explicit_key();
+
+        // Close a sequence that was a *previous* explicit key's same-indent
+        // implicit value, exactly as `parse_mapping_entry` does for an
+        // ordinary `key:` entry (#1040) -- `? k\n- item\n? k2\n: v2\n`
+        // reaches this function for `? k2`, not `parse_mapping_entry`, so
+        // without this call the still-open sequence stays the top frame,
+        // `need_new_mapping` below sees `current_type == Sequence` and
+        // wrongly nests `k2` as a second element of `k`'s array instead of
+        // opening a sibling mapping entry.
+        self.close_same_indent_sequence_before_mapping_entry(indent);
 
         // Check if we need to open a new mapping
         let need_new_mapping = self.current_type != Some(NodeType::Mapping)
