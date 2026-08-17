@@ -13558,6 +13558,33 @@ fn test_1116_chained_scalar_slice_del_removes_parent_key() -> Result<()> {
     Ok(())
 }
 
+/// del()'s parent-key rule also applies when the resolved path fans out
+/// into more than one target (a top-level comma, or a computed key with
+/// multiple values) — `delete_expr_paths_at`'s sibling-grouping walker
+/// never sees the original chained-scalar-slice path at all, since each
+/// resolved path is rewritten *before* flattening, the same way #1101's
+/// own no-op rule already had to be special-cased for this branch.
+#[test]
+fn test_1116_chained_scalar_slice_del_multi_path() -> Result<()> {
+    let (out, code) = run_yq_stdin(
+        "del(.a[0:1], .b[0:1])",
+        r#"{"a":5,"b":6,"c":7}"#,
+        &["-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), r#"{"c":7}"#);
+
+    let (out, code) = run_yq_stdin(
+        "del(.a[0:1], .c)",
+        r#"{"a":5,"b":6,"c":7}"#,
+        &["-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), r#"{"b":6}"#);
+
+    Ok(())
+}
+
 /// del()'s parent-key rule survives a `?` on the slice component itself.
 #[test]
 fn test_1116_chained_scalar_slice_del_with_optional() -> Result<()> {
