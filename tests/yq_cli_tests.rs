@@ -9385,6 +9385,23 @@ fn test_anchor_floated_comment_does_not_corrupt_flow_mapping_784() -> Result<()>
     Ok(())
 }
 
+/// Two sequence items in a row, each with its own anchor and comment, the
+/// outer deferring into the inner before the outer's comment is ever
+/// claimed - exercises `defer_line_comment`'s guard against overwriting an
+/// already-pending comment. Real yq's own rendering for this exact shape is
+/// unusual (a standalone comment line, per #1080) and out of scope here;
+/// this only pins that the *outer* comment is never silently clobbered by
+/// the inner one, which is the concrete failure this guard exists to
+/// prevent (dropping both safely, rather than losing the outer one and
+/// keeping the wrong one, was the pre-guard behavior).
+#[test]
+fn test_defer_line_comment_does_not_overwrite_already_pending_784() -> Result<()> {
+    let (out, code) = run_yq_stdin(".", "- &x # c1\n  - &y # c2\n    b: 1\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "- &x\n  - &y\n    b: 1\n");
+    Ok(())
+}
+
 // ============================================================================
 // Explicit-key (`? k ... : v`) trailing comment (#795)
 // ============================================================================
