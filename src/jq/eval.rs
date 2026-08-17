@@ -6049,10 +6049,26 @@ fn format_base64d<S: EvalSemantics>(
                 result.push(((value >> 4) & 0xFF) as u8);
             }
             _ => {
-                return Err(if S::TAG == EvalTag::Yq {
-                    EvalError::base64_illegal_data(prefix.len())
+                // A lone trailing byte is either genuinely too short (a
+                // valid base64 character with nothing left to pair it
+                // with) or itself an invalid character -- these are
+                // different failures in both oracles, live-verified:
+                // `"abcd!" | @base64d` is jq's "is not valid base64
+                // data" (not "trailing base64 byte found") and yq's
+                // "byte 4" (the '!' itself, not `prefix.len()` == 5).
+                // Checking the byte's own validity first, rather than
+                // assuming every 1-length remainder is the "too short"
+                // case, keeps this arm's error selection consistent with
+                // the 2/3/4-length arms above, which already validate
+                // every byte before deciding anything.
+                return Err(if decode_char(chunk[0]).is_some() {
+                    if S::TAG == EvalTag::Yq {
+                        EvalError::base64_illegal_data(prefix.len())
+                    } else {
+                        EvalError::base64_trailing_byte(value)
+                    }
                 } else {
-                    EvalError::base64_trailing_byte(value)
+                    char_error(chunk_start)
                 });
             }
         }
