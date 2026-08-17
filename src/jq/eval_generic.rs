@@ -26,11 +26,11 @@ use super::document::{
 };
 use super::eval::{
     apply_compare_op, eval as full_eval, format_owned, index_one_owned as index_owned_by_key,
-    needs_path_context, numeric_display_string, numeric_key_to_index, owned_bound_to_i64,
-    owned_value_to_json, slice_owned_value, tonumber_from_str, Control, EvalError, EvalSemantics,
-    EvalTag, JqSemantics, QueryResult, YqSemantics,
+    literal_to_owned, needs_path_context, numeric_display_string, numeric_key_to_index,
+    owned_bound_to_i64, owned_value_to_json, slice_owned_value, tonumber_from_str, Control,
+    EvalError, EvalSemantics, EvalTag, JqSemantics, QueryResult, YqSemantics,
 };
-use super::expr::{Builtin, Expr, FormatType, Literal};
+use super::expr::{Builtin, Expr, FormatType};
 use super::slice::{slice_str, SliceBounds};
 use super::value::OwnedValue;
 use crate::json::JsonIndex;
@@ -2534,16 +2534,9 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
             eval_first_or_last_generic::<S, _>(inner, value, optional, cursor, true)
         }
 
-        Expr::Literal(lit) => match lit {
-            Literal::Null => GenericResult::Owned(OwnedValue::Null),
-            Literal::Bool(b) => GenericResult::Owned(OwnedValue::Bool(*b)),
-            Literal::NumberLiteral(text) => {
-                GenericResult::Owned(OwnedValue::from_number_literal(text))
-            }
-            Literal::Int(i) => GenericResult::Owned(OwnedValue::Int(*i)),
-            Literal::Float(f) => GenericResult::Owned(OwnedValue::Float(*f)),
-            Literal::String(s) => GenericResult::Owned(OwnedValue::String(s.clone())),
-        },
+        // #1062: was a fourth hand-rolled arm-for-arm copy of the same six
+        // `Literal` variants; delegates to the one canonical conversion now.
+        Expr::Literal(lit) => GenericResult::Owned(literal_to_owned(lit)),
 
         // Formats are pure functions of the value, so evaluate them here rather
         // than falling through to the catch-all, which would serialize the
@@ -3857,7 +3850,7 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
 
 #[cfg(test)]
 mod tests {
-    use super::super::expr::{CompareOp, FormatType};
+    use super::super::expr::{CompareOp, FormatType, Literal};
     use super::super::value::NumberRepr;
     use super::*;
     use crate::jq::parse;

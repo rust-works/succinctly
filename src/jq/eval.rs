@@ -761,15 +761,14 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 }
 
 /// Convert a literal to an owned value.
-fn literal_to_owned(lit: &Literal) -> OwnedValue {
-    match lit {
-        Literal::Null => OwnedValue::Null,
-        Literal::Bool(b) => OwnedValue::Bool(*b),
-        Literal::NumberLiteral(text) => OwnedValue::from_number_literal(text),
-        Literal::Int(n) => OwnedValue::Int(*n),
-        Literal::Float(f) => OwnedValue::Float(*f),
-        Literal::String(s) => OwnedValue::String(s.clone()),
-    }
+/// Delegates to `OwnedValue`'s own `From<Literal>` impl (#1062) rather than
+/// re-listing the same six arms a third time -- `Literal: Clone` makes the
+/// borrow-to-owned crossing a single clone of the `Literal` itself (its
+/// `String`/`NumberLiteral` payload, same as this function's own arms used
+/// to clone directly), not an extra allocation on top of what was here
+/// before.
+pub(crate) fn literal_to_owned(lit: &Literal) -> OwnedValue {
+    OwnedValue::from(lit.clone())
 }
 
 /// Evaluate a comma expression (multiple outputs).
