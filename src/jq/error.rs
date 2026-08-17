@@ -717,6 +717,14 @@ impl EvalError {
         Self::subject(value, "has no keys")
     }
 
+    /// `<v> cannot be negated` — unary minus (`-expr`) on a non-numeric
+    /// operand (#1056). Matches real jq's own dedicated wording, confirmed
+    /// live against jq 1.7.1 (`-"abc"` -> `string ("abc") cannot be
+    /// negated`).
+    pub fn cannot_be_negated(value: &OwnedValue) -> Self {
+        Self::subject(value, "cannot be negated")
+    }
+
     /// `<v> has no length`.
     pub fn has_no_length(value: &OwnedValue) -> Self {
         Self::subject(value, "has no length")

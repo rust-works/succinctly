@@ -1024,6 +1024,16 @@ pub enum ArithOp {
     Div,
     /// Modulo: `%`
     Mod,
+    /// Unary minus: `-expr` (#1056). A true IEEE-754 negation, not `0 -
+    /// expr` (loses the sign of a zero-valued operand) or `-1 * expr`
+    /// (silently inherits `*`'s unrelated string-repetition and
+    /// null-passthrough semantics instead of erroring on a non-numeric
+    /// operand -- caught by code review before this reached `main`). Reuses
+    /// `Expr::Arithmetic`'s binary shape purely for its existing fan-out
+    /// machinery (a generator operand like `-(1,2,3)` still needs to
+    /// produce one negated result per output); `left` is always a dummy
+    /// `Expr::Literal(Literal::Null)` that the evaluator ignores.
+    Negate,
 }
 
 /// yq merge-flag suffixes on the `*`/`*=` merge operator (e.g. `*+d`, `*=nd`).

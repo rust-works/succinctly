@@ -1060,18 +1060,22 @@ impl<'a> Parser<'a> {
                 } else {
                     // Unary minus: negate the following expression.
                     //
-                    // Implemented as (-1 * expr), not (0 - expr) (#1056):
-                    // IEEE-754 `0.0 - 0.0` is positive zero, silently losing
-                    // the sign of a zero-valued operand (`-.a` on `0.0`
-                    // dropped jq's `-0` to plain `0`) -- `-1.0 * 0.0`
-                    // correctly preserves it, the same fix already applied
-                    // to the filter-literal rewrite above (#1035) for
-                    // exactly this reason.
+                    // `ArithOp::Negate`, not `(0 - expr)` (#1056): IEEE-754
+                    // `0.0 - 0.0` is positive zero, silently losing the sign
+                    // of a zero-valued operand (`-.a` on `0.0` dropped jq's
+                    // `-0` to plain `0`). Also not `(-1 * expr)` (an earlier
+                    // draft of this fix, reverted after code review): `*`
+                    // has its own string-repetition and null-passthrough
+                    // semantics that have nothing to do with negation, so
+                    // `-"abc"`/`-null` silently returned `null` instead of
+                    // erroring. `left` here is an unused dummy -- see
+                    // `ArithOp::Negate`'s own doc comment for why this still
+                    // reuses `Expr::Arithmetic`'s binary shape.
                     self.next(); // consume '-'
                     let operand = self.parse_primary()?;
                     Ok(Expr::Arithmetic {
-                        op: ArithOp::Mul(MergeFlags::default()),
-                        left: Box::new(Expr::Literal(Literal::Int(-1))),
+                        op: ArithOp::Negate,
+                        left: Box::new(Expr::Literal(Literal::Null)),
                         right: Box::new(operand),
                     })
                 }
