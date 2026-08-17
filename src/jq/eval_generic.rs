@@ -818,21 +818,25 @@ fn into_lazy_items<V: DocumentValue>(
 
 /// Convert a StandardJson value to an OwnedValue.
 ///
-/// Named distinctly from the crate-wide, `DocumentValue`-generic [`to_owned`]
-/// above (#965): this one is JSON-cursor-specific, used only by this
-/// module's own `eval_on_owned`/`eval_single` fallback arm on a value it
-/// constructs internally (e.g. a `reduce`/`foreach` accumulator) -- not a
-/// general-purpose converter other modules should reach for. Before this
-/// rename it happened to share a name with an unrelated, now-deleted
-/// `yq_runner.rs` helper (#907), which was a real naming-confusion risk for
-/// anyone grepping the codebase, even though the two were never the same
-/// function and never collided at compile time (module-private on both
-/// sides).
-///
 /// Panics past [`MAX_NESTING_DEPTH`] levels of nesting (#1017) -- a third,
 /// independent copy of the cursor-to-`OwnedValue` conversion `to_owned`/
 /// `to_owned_cursor` already guard in this same file (#998), the same gap
 /// #998's own guards on the other two copies were added to close.
+///
+/// Named distinctly from the crate-wide, `DocumentValue`-generic [`to_owned`]
+/// above (#965) rather than merged into it: this one is used only by this
+/// module's own `eval_on_owned`/`eval_single` fallback arm on a value it
+/// constructs internally (e.g. a `reduce`/`foreach` accumulator), and its
+/// Number/String arms carry two real behavioral differences from `to_owned`
+/// that a naive merge would lose -- NaN/Infinity-sentinel decoding (its
+/// callers round-trip through `to_json_for_reindex`, which bakes those as a
+/// sentinel number literal `to_owned`'s plain `number_literal()`/`as_f64()`
+/// path doesn't decode) and a different malformed-UTF-8-string fallback
+/// (`OwnedValue::String("")` here vs. `OwnedValue::Null` there). Before this
+/// rename it also happened to share a name with an unrelated, now-deleted
+/// `yq_runner.rs` helper (#907) -- a real naming-confusion risk for anyone
+/// grepping the codebase, even though the two never collided at compile
+/// time (module-private on both sides).
 fn owned_from_standard_json<W: Clone + AsRef<[u64]>>(
     value: &crate::json::light::StandardJson<'_, W>,
 ) -> OwnedValue {
