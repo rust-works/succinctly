@@ -893,6 +893,17 @@ struct JqCommand {
     from_file: Option<PathBuf>,
 
     // === Variables ===
+    // `allow_hyphen_values = true` below (#1150) lets a VALUE/FILE that
+    // legitimately starts with `-` (a negative number, a hyphen-prefixed
+    // filename) through clap, matching real jq. The tradeoff -- clap can
+    // no longer tell "the user forgot VALUE" from "VALUE legitimately
+    // starts with -" -- is real (a forgotten VALUE now silently swallows
+    // the next real flag as its value instead of erroring), but it's not
+    // a regression versus the oracle: confirmed live that real jq has the
+    // identical footgun (`jq --arg n -c '.'` silently sets $n="-c" and
+    // drops -c/compact-output there too). yq mode's `arg`/`argjson` below
+    // have no such oracle precedent (real yq has no equivalent flags at
+    // all, #284) but carry the same tradeoff for consistency with jq mode.
     /// Set $name to the string value
     #[arg(long, value_names = ["NAME", "VALUE"], num_args = 2, action = clap::ArgAction::Append, allow_hyphen_values = true)]
     arg: Vec<String>,
@@ -910,11 +921,11 @@ struct JqCommand {
     rawfile: Vec<String>,
 
     /// Consume remaining arguments as positional string values
-    #[arg(long, num_args = 0.., value_name = "STRINGS")]
+    #[arg(long, num_args = 0.., value_name = "STRINGS", allow_hyphen_values = true)]
     args: Vec<String>,
 
     /// Consume remaining arguments as positional JSON values
-    #[arg(long, num_args = 0.., value_name = "JSON_VALUES")]
+    #[arg(long, num_args = 0.., value_name = "JSON_VALUES", allow_hyphen_values = true)]
     jsonargs: Vec<String>,
 
     // === Modules ===
@@ -2259,6 +2270,42 @@ use generators::generate_json;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Guardrail for #1150: every `JqCommand`/`YqCommand` flag that can
+    /// take more than one value per occurrence (`--arg NAME VALUE`-style
+    /// pairs, or `--args`/`--jsonargs`' greedy remainder) must also allow
+    /// hyphen-prefixed values, or clap rejects a legitimately negative
+    /// number/hyphen-prefixed string/filename before it ever reaches this
+    /// crate's own validation -- the exact bug #1150 fixed for the six
+    /// (now eight) sites that existed at the time. Introspects the live
+    /// clap `Command` definitions rather than re-listing the field names,
+    /// so a future multi-value arg that forgets `allow_hyphen_values`
+    /// fails this test immediately instead of silently reintroducing the
+    /// bug for just that one flag.
+    #[test]
+    fn test_multi_value_variable_args_allow_hyphen_values_1150() {
+        use clap::CommandFactory;
+
+        for cmd in [JqCommand::command(), YqCommand::command()] {
+            for arg in cmd.get_arguments() {
+                if arg.is_positional() {
+                    continue;
+                }
+                let takes_multiple_per_occurrence = arg
+                    .get_num_args()
+                    .is_some_and(|range| range.max_values() > 1);
+                if takes_multiple_per_occurrence {
+                    assert!(
+                        arg.is_allow_hyphen_values_set(),
+                        "--{} in `{}` accepts multiple values per occurrence but doesn't set \
+                         allow_hyphen_values -- see #1150",
+                        arg.get_id(),
+                        cmd.get_name()
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn test_parse_size() {
