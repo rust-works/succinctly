@@ -13006,19 +13006,18 @@ fn test_slice_owned_target_scalar_is_empty_array_1065() -> Result<()> {
 // based on a misread of `.[0:1] = (1/0)` appearing not to error (`1/0`
 // isn't a catchable error in real yq at all; it's `+Inf`, which only fails
 // at JSON-output time for a value that, being part of a no-op write, is
-// never actually written or serialized). `-=`/`*=` are NOT no-ops -- they
-// error instead, with Go-internal-looking messages this crate deliberately
-// does not replicate (not a stable compatibility target). Object, string,
-// and array targets are deliberately unaffected: succinctly's own working
-// array/string slice-assignment is preserved rather than matched to what
-// looks like a real-yq gap rather than a real-yq rule. This fix is also
-// deliberately scoped to a *bare* root slice with *literal* bounds only --
-// see `is_yq_scalar_slice_assign_path`'s doc comment, and the follow-up
-// issues filed for chained paths (`.foo[S:E]`, where `del()` in particular
-// has a materially different real-yq behavior: it deletes the whole parent
-// key, not a no-op) and computed bounds (`.[$a:$b]`, which fails earlier
-// inside `resolve_slice_expr`'s own eager path-resolution slice, a
-// separate and more delicate piece of machinery than this fix touches).
+// never actually written or serialized). `-=`/`*=` are NOT no-ops for a
+// *scalar* target -- they error instead, with Go-internal-looking messages
+// this crate deliberately does not replicate (not a stable compatibility
+// target). Object is still deliberately unaffected -- see #1157/#1102 for
+// why replicating it needs real yq's own AST-child-layout read rule first
+// -- but array/string targets are *not* unaffected any more: #1142 widened
+// this same no-op to them too (any operator, including `-=`/`*=`, unlike
+// the scalar case), and #1116 (PR #1151) separately widened the *scalar*
+// case here to any chain depth, not just the bare-root shape this section
+// was originally scoped to. `.[$a:$b]` (computed bounds) still fails
+// earlier, inside `resolve_slice_expr`'s own eager path-resolution slice --
+// a separate and more delicate piece of machinery neither fix touches.
 
 #[test]
 fn test_slice_assign_number_scalar_is_noop_1101() -> Result<()> {
@@ -13674,21 +13673,23 @@ fn test_1116_chained_scalar_slice_sub_and_mul_still_error() -> Result<()> {
     Ok(())
 }
 
-/// A chained slice-assign through an *array* or *object* target is
-/// unaffected — succinctly deliberately keeps its own working slice-write
-/// there rather than replicating real yq's own broken behavior for those
-/// target types too (verified live: real yq no-ops `.a[1:3] = [...]` even
-/// for an array `.a`, unlike jq; succinctly intentionally diverges,
-/// matching `is_yq_scalar_slice_assign_path`'s existing precedent).
+/// A chained slice-assign through an *array* target no-ops too, same as
+/// the scalar case above — #1142 (live-verified against real yq v4.53.3:
+/// `.a[1:3] = [...]` no-ops even for an array `.a`, matching every other
+/// slice-assignment target type). An earlier version of this test asserted
+/// the opposite (succinctly's own pre-#1142 splice-write behavior,
+/// deliberately preserved by #1116's own narrower scope at the time) — the
+/// live-verified oracle output is unchanged from `{"a":[1,2,3,4,5],"b":6}`,
+/// not `{"a":[1,"x","y",4,5],"b":6}`.
 #[test]
-fn test_1116_chained_array_slice_assign_still_works() -> Result<()> {
+fn test_1142_chained_array_slice_assign_is_noop() -> Result<()> {
     let (out, code) = run_yq_stdin(
         r#".a[1:3] = ["x","y"]"#,
         r#"{"a":[1,2,3,4,5],"b":6}"#,
         &["-o=json", "-I=0"],
     )?;
     assert_eq!(code, 0);
-    assert_eq!(out.trim(), r#"{"a":[1,"x","y",4,5],"b":6}"#);
+    assert_eq!(out.trim(), r#"{"a":[1,2,3,4,5],"b":6}"#);
     Ok(())
 }
 
