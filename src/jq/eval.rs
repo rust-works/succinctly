@@ -37949,6 +37949,15 @@ mod tests {
         assert_eq!(outputs(b"[10,20]", ".[] | (1+1) | key"), vec!["0", "1"]);
     }
 
+    /// #1056: `eval_pipe_with_path_context_internal`'s own `Expr::Arithmetic`
+    /// arm (separate from `eval_arithmetic`'s) needs the same
+    /// `ArithOp::Negate` handling `key`/`file_index` mid-pipe after a unary
+    /// minus.
+    #[test]
+    fn test_key_survives_unary_minus_mid_pipe_1056() {
+        assert_eq!(outputs(b"[10,20]", ".[] | -(1) | key"), vec!["0", "1"]);
+    }
+
     #[test]
     fn test_key_survives_if_then_else_mid_pipe() {
         assert_eq!(
