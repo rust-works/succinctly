@@ -11947,3 +11947,109 @@ fn test_sub_yq_mode_non_string_replacement_exits_zero_1052() -> Result<()> {
     assert_eq!(output.trim(), r#""5bc""#);
     Ok(())
 }
+
+/// #950: real yq treats an integer-valued float and the equivalent plain
+/// integer as genuinely distinct, non-equal types -- `2.0 == 2` is `false`
+/// (verified against pinned yq v4.53.3), unlike jq's looser convention
+/// where `2.0 == 2` is `true` (jq has no strict int/float distinction).
+/// succinctly's `==`/`!=` used to always widen both operands to `f64`,
+/// matching jq's convention even in yq mode.
+#[test]
+fn test_yq_equality_distinguishes_int_from_equal_valued_float_950() -> Result<()> {
+    let (out, code) = run_yq_stdin(". == 2", "2.0", &[])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "false");
+
+    let (out, code) = run_yq_stdin(". != 2", "2.0", &[])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "true");
+    Ok(())
+}
+
+/// Sanity: same-type numeric equality (Int==Int, Float==Float) is
+/// unaffected by #950's fix.
+#[test]
+fn test_yq_equality_same_type_numbers_unaffected_950() -> Result<()> {
+    let (out, code) = run_yq_stdin(". == 2", "2", &[])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "true");
+
+    let (out, code) = run_yq_stdin(". == 2.5", "2.5", &[])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "true");
+    Ok(())
+}
+
+/// Sanity: ordering (`<`/`<=`/`>`/`>=`) still widens Int/Float for
+/// comparison in yq mode -- #950 only changes `==`/`!=`'s strictness,
+/// matching real yq (`2.0 < 3` and `2.0 <= 2` are both `true`).
+#[test]
+fn test_yq_ordering_still_widens_int_and_float_950() -> Result<()> {
+    let (out, code) = run_yq_stdin(". < 3", "2.0", &[])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "true");
+
+    let (out, code) = run_yq_stdin(". <= 2", "2.0", &[])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "true");
+    Ok(())
+}
+
+/// Sanity: a strict numeric-vs-non-numeric comparison is unaffected --
+/// `2 == "2"` is `false` in both jq and yq, and #950's gate only fires
+/// when *both* operands are already numeric.
+#[test]
+fn test_yq_equality_numeric_vs_string_unaffected_950() -> Result<()> {
+    let (out, code) = run_yq_stdin(r#". == "2""#, "2", &[])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "false");
+    Ok(())
+}
+
+/// #950 review: `==`'s strict Int/Float distinction must apply at every
+/// nesting depth, not just the top -- `[2.0] == [2]` and `{"a":2.0} ==
+/// {"a":2}` are `false` in yq (verified against pinned yq v4.53.3), the
+/// same rule the scalar `2.0 == 2` case above already covers.
+#[test]
+fn test_yq_equality_strict_at_nested_depth_950() -> Result<()> {
+    let (out, code) = run_yq_stdin(". == [2]", "[2.0]", &[])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "false");
+
+    let (out, code) = run_yq_stdin(r#". == {"a": 2}"#, "a: 2.0", &[])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "false");
+    Ok(())
+}
+
+/// #950 review: `contains`/`inside`, `array - array`, `unique`/
+/// `unique_by`/`group_by` all consume equality internally and must agree
+/// with `==`'s own yq-mode strictness instead of silently falling back
+/// to the always-widening rule (verified against pinned yq v4.53.3 for
+/// `contains`, `unique`, and `group_by`; `array -` and `unique_by`
+/// confirmed by internal consistency with the now-fixed `==`/`contains`,
+/// since mikefarah/yq's own grammar doesn't accept a bare `-`/`unique_by`
+/// invocation the same way to cross-check directly).
+#[test]
+fn test_yq_equality_consuming_builtins_agree_with_strict_eq_950() -> Result<()> {
+    let (out, code) = run_yq_stdin("contains([2.0])", "[2]", &[])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "false");
+
+    let (out, code) = run_yq_stdin(". - [2]", "[2.0, 3]", &["-o", "json", "-I0"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "[2.0,3]");
+
+    let (out, code) = run_yq_stdin("unique", "[2, 2.0, 3]", &["-o", "json", "-I0"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "[2,2.0,3]");
+
+    let (out, code) = run_yq_stdin("unique_by(.)", "[2, 2.0, 3]", &["-o", "json", "-I0"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "[2,2.0,3]");
+
+    let (out, code) = run_yq_stdin("group_by(.)", "[2, 2.0, 3]", &["-o", "json", "-I0"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "[[2],[2.0],[3]]");
+    Ok(())
+}

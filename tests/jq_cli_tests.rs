@@ -10773,3 +10773,16 @@ fn test_jq_tostring_special_floats_unaffected_by_yq_mode_fix_1060() -> Result<()
     }
     Ok(())
 }
+
+/// #950's yq-only strict numeric equality must not leak into jq mode: jq
+/// has no strict int/float distinction, so `2.0 == 2` stays `true` (real
+/// jq 1.7.1, verified). Pins that `apply_compare_op`'s `S::
+/// STRICT_NUMERIC_EQUALITY` gate is correctly `false` under `JqSemantics`.
+#[test]
+fn test_jq_equality_still_widens_int_and_float_950() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-c", ". == 2"], Some("2.0"))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "true\n");
+    assert_eq!(stderr, "");
+    Ok(())
+}

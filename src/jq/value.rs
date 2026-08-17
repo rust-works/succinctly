@@ -1029,14 +1029,18 @@ pub(crate) fn is_nan_sentinel(bytes: &[u8]) -> bool {
     bytes == NAN_SENTINEL.as_bytes()
 }
 
-/// jq value equality.
+/// jq (widening, non-strict) value equality -- [`OwnedValue`]'s `PartialEq`
+/// impl, and the numeric rule [`owned_value_eq`] falls back to whenever
+/// `EvalSemantics::STRICT_NUMERIC_EQUALITY` is unset (jq mode) or an
+/// operand isn't numeric. Under yq's stricter rule, equality-consuming
+/// builtins route through [`owned_value_eq`] instead of this impl
+/// directly (#950) -- see that function's doc comment for the full list
+/// and for why a single shared entry point matters here.
 ///
 /// This is deliberately **not** `#[derive]`d. Deriving would compare the
 /// representation, so `Int(1)` and `Float(1.0)` -- two spellings of the same
 /// JSON number -- would be unequal, and `1 == 1.0` would evaluate to `false`
-/// (jq says `true`). Since `Vec`/`IndexMap` inherit their `PartialEq` from the
-/// element type, every builtin routed through equality (`==`, `!=`, array `-`,
-/// `contains`, `inside`, `index`, `indices`, `rindex`) picks up this impl.
+/// (jq says `true`).
 ///
 /// Semantics, pinned against jq-1.7.1:
 ///
@@ -1068,6 +1072,75 @@ pub(crate) fn numeric_repr_eq(a: NumberRepr, b: NumberRepr) -> bool {
         (NumberRepr::Float(a), NumberRepr::Float(b)) => a == b,
         (NumberRepr::Int(a), NumberRepr::Float(b)) => (a as f64) == b,
         (NumberRepr::Float(a), NumberRepr::Int(b)) => a == (b as f64),
+    }
+}
+
+/// Like [`numeric_repr_eq`], but for `EvalSemantics::STRICT_NUMERIC_EQUALITY`
+/// (yq): an `Int` and a `Float` are never equal regardless of magnitude,
+/// even when the same pair would compare equal under [`numeric_repr_eq`]'s
+/// widening rule -- real yq treats `2` and `2.0` as genuinely distinct
+/// types, unlike jq (#950). This is exactly [`NumberRepr`]'s own derived
+/// `PartialEq` (same variant and value, never equal across variants) --
+/// spelled out as its own named function so every strict-mode call site
+/// reads as "yq's equality rule" rather than an easy-to-miss bare `==`.
+pub(crate) fn numeric_repr_eq_strict(a: NumberRepr, b: NumberRepr) -> bool {
+    a == b
+}
+
+/// jq/yq value equality, generic over `EvalSemantics::STRICT_NUMERIC_EQUALITY`
+/// (#950) -- the single definition every equality-consuming builtin should
+/// route through (`==`, `!=`, array `-`, `contains`, `inside`, `index`,
+/// `indices`, `rindex`, `IN`, `unique`, `unique_by`, `group_by`), so none
+/// of them can individually diverge from `==`'s own answer about the same
+/// pair of values (a real gap #950's own review round found: several of
+/// these builtins still used the plain, always-widening `PartialEq` after
+/// the first pass only fixed `==`/`!=` themselves).
+///
+/// Structural rules (`Null`/`Bool`/`String`/`Array`/`Object`) are
+/// identical in both modes -- only how two *numbers* compare differs, so
+/// this mirrors [`OwnedValue`]'s own `PartialEq`
+/// (`owned_value_eq_at_depth`) exactly, just threading `S` into the
+/// recursion so strictness applies at every nesting depth, not only the
+/// top: `[2.0] == [2]` and `{"a":2.0} == {"a":2}` are `false` in yq,
+/// matching jq's `true` when `S` isn't strict.
+pub(crate) fn owned_value_eq<S: EvalSemantics>(a: &OwnedValue, b: &OwnedValue) -> bool {
+    owned_value_eq_at_depth_generic::<S>(a, b, 0)
+}
+
+fn owned_value_eq_at_depth_generic<S: EvalSemantics>(
+    a: &OwnedValue,
+    b: &OwnedValue,
+    depth: usize,
+) -> bool {
+    assert_value_tree_depth(depth);
+    match (a, b) {
+        (OwnedValue::Array(a), OwnedValue::Array(b)) => {
+            a.len() == b.len()
+                && a.iter()
+                    .zip(b.iter())
+                    .all(|(x, y)| owned_value_eq_at_depth_generic::<S>(x, y, depth + 1))
+        }
+        (OwnedValue::Object(a), OwnedValue::Object(b)) => {
+            a.len() == b.len()
+                && a.iter().all(|(k, v)| {
+                    b.get(k)
+                        .is_some_and(|bv| owned_value_eq_at_depth_generic::<S>(v, bv, depth + 1))
+                })
+        }
+        // Every other pairing (Null/Bool/String, Int/Float/NumberLiteral,
+        // and any type mismatch) has no further nesting to thread through.
+        // Only checked only when *both* operands are numeric under strict
+        // mode; a number-vs-non-number comparison (already `false` either
+        // way) and every jq-mode comparison fall straight through to the
+        // ordinary widening `PartialEq`.
+        _ => {
+            if S::STRICT_NUMERIC_EQUALITY {
+                if let (Some(x), Some(y)) = (a.number_repr(), b.number_repr()) {
+                    return numeric_repr_eq_strict(x, y);
+                }
+            }
+            a == b
+        }
     }
 }
 
