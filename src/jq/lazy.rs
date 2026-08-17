@@ -1138,6 +1138,33 @@ mod tests {
         assert_eq!(into_owned_val.into_owned().to_json(), "1E+100");
     }
 
+    /// Sibling of the number test above, for `cursor_to_owned_at_depth`'s
+    /// `StandardJson::String` arm -- the ordinary successfully-decoding
+    /// path, alongside `test_materialize_panics_on_string_decode_failure_1098`'s
+    /// coverage of the same arm's `Err` side.
+    #[test]
+    fn test_jqvalue_cursor_string_materialize_and_into_owned() {
+        use crate::json::JsonIndex;
+
+        let json = br#""hello""#;
+
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let materialize_val: JqValue<'_, Vec<u64>> = JqValue::from_cursor(cursor);
+        assert_eq!(
+            materialize_val.materialize(),
+            OwnedValue::String("hello".to_string())
+        );
+
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let into_owned_val: JqValue<'_, Vec<u64>> = JqValue::from_cursor(cursor);
+        assert_eq!(
+            into_owned_val.into_owned(),
+            OwnedValue::String("hello".to_string())
+        );
+    }
+
     /// `depth` levels of single-element array nesting: `[[[...[null]...]]]`.
     /// Mirrors `value.rs`/`eval.rs`'s own `linear_array_nest` helper (#1005),
     /// built directly out of `JqValue` since `materialize`/`into_owned`
