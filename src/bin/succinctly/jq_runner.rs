@@ -1441,18 +1441,34 @@ fn find_number_end(bytes: &[u8], pos: usize) -> Option<usize> {
     }
 }
 
-/// Parse a JSON value from a string.
+/// Parse a JSON value from a string (`--argjson`/`--jsonargs`), preserving
+/// the original number-literal spelling the way document-sourced numbers
+/// already do (#1058) -- unlike `serde_json::Value::Number`, which
+/// round-trips only through Rust's own `f64`/`i64` `Display` and loses e.g.
+/// trailing zeros (`1.500` -> `1.5`) or exponent notation (`1e100` -> the
+/// fully-expanded digit string), the way a filter-literal number
+/// (`Literal::NumberLiteral`, #1035) or a document-sourced one
+/// (`OwnedValue::from_number_bytes`) does not.
+///
+/// Validates strictly via `serde_json::from_str` first -- not for its
+/// resulting `Value` (discarded), but for its error message and its
+/// rejection of trailing garbage (`42 garbage`) that `JsonIndex`'s own
+/// semi-indexing wouldn't catch on its own -- then reparses the same,
+/// now-known-valid text through this crate's own fidelity-preserving JSON
+/// semi-indexer (the same one the primary input path already uses, see
+/// `evaluate_input` above).
 fn parse_json_value(s: &str) -> Result<OwnedValue> {
     let s = s.trim();
     if s.is_empty() {
         return Ok(OwnedValue::Null);
     }
 
-    // Use serde_json for parsing, then convert to OwnedValue
-    let value: serde_json::Value =
-        serde_json::from_str(s).with_context(|| format!("Invalid JSON: {s}"))?;
+    serde_json::from_str::<serde_json::Value>(s).with_context(|| format!("Invalid JSON: {s}"))?;
 
-    Ok(serde_to_owned(&value))
+    let bytes = s.as_bytes();
+    let index = JsonIndex::build(bytes);
+    let cursor = index.root(bytes);
+    Ok(generic_to_owned(&cursor.value()))
 }
 
 /// Parse a JSON stream (multiple JSON values) from a string.
@@ -2547,14 +2563,42 @@ mod tests {
             parse_json_value("true").unwrap(),
             OwnedValue::Bool(true)
         ));
-        assert!(matches!(
-            parse_json_value("42").unwrap(),
-            OwnedValue::Int(42)
-        ));
+        // A whole number still round-trips its value (#1058: no longer a
+        // bare `OwnedValue::Int` -- `parse_json_value` now goes through the
+        // same fidelity-preserving semi-indexer as document input, which
+        // always reconstructs `NumberLiteral` for valid number text).
+        assert_eq!(parse_json_value("42").unwrap().to_json(), "42");
         assert!(matches!(
             parse_json_value("\"hello\"").unwrap(),
             OwnedValue::String(_)
         ));
+    }
+
+    /// #1058: `--argjson`/`--jsonargs`' number literals preserve their exact
+    /// source spelling, matching a filter-embedded literal (#1035) and a
+    /// document-sourced one -- previously lost via a `serde_json::Value`
+    /// round-trip through Rust's own `f64`/`i64` `Display`. Verified against
+    /// the pinned real `jq` binary, which also preserves these exactly.
+    #[test]
+    fn test_parse_json_value_preserves_number_literal_fidelity_1058() {
+        assert_eq!(parse_json_value("1.500").unwrap().to_json(), "1.500");
+        assert_eq!(parse_json_value("1e100").unwrap().to_json(), "1E+100");
+        assert_eq!(
+            parse_json_value(r#"{"a": 1.500, "b": [1e100, 2.0]}"#)
+                .unwrap()
+                .to_json(),
+            r#"{"a":1.500,"b":[1E+100,2.0]}"#
+        );
+    }
+
+    /// #1058 regression guard: preserving fidelity must not weaken the
+    /// existing strict-validation behavior (#284) -- trailing garbage after
+    /// a complete JSON value is still rejected, not silently truncated to
+    /// just the leading value the way `JsonIndex`'s own lenient semi-index
+    /// would accept on its own.
+    #[test]
+    fn test_parse_json_value_still_rejects_trailing_garbage_1058() {
+        assert!(parse_json_value("42 garbage").is_err());
     }
 
     #[test]
