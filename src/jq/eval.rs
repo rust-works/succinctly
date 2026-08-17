@@ -5452,7 +5452,7 @@ pub(crate) fn format_owned<S: EvalSemantics>(
         FormatType::Csv => format_csv::<S>(owned, optional),
         FormatType::Tsv => format_tsv::<S>(owned, optional),
         FormatType::Dsv(delimiter) => format_dsv::<S>(owned, delimiter, optional),
-        FormatType::Base64 => format_base64(owned, optional),
+        FormatType::Base64 => format_base64::<S>(owned, optional),
         FormatType::Base64d => format_base64d(owned, optional),
         FormatType::Html => format_html::<S>(owned, optional),
         FormatType::Sh => format_sh::<S>(owned, optional),
@@ -5500,6 +5500,15 @@ fn format_uri<S: EvalSemantics>(value: &OwnedValue, _optional: bool) -> Result<S
             }
         }
         OwnedValue::Null => "null".to_string(),
+        // jq JSON-encodes a container before percent-encoding it (`[1,2] |
+        // @uri` => `"%5B1%2C2%5D"`) rather than erroring -- confirmed
+        // against real jq 1.7.1 (#1096). yq diverges here and keeps
+        // rejecting a container outright ("cannot encode !!seq as URI...",
+        // confirmed against real yq v4.53.3 -- not reproduced here, out of
+        // this issue's scope), matching the existing error below.
+        OwnedValue::Array(_) | OwnedValue::Object(_) if S::TAG == EvalTag::Jq => {
+            owned_value_to_json::<S>(value)
+        }
         _ => return Err(EvalError::type_error("string", value.type_name())),
     };
 
@@ -5661,7 +5670,24 @@ fn format_dsv<S: EvalSemantics>(
 }
 
 /// @base64 - Base64 encode (simple implementation without external crate)
-fn format_base64(value: &OwnedValue, optional: bool) -> Result<String, EvalError> {
+fn format_base64<S: EvalSemantics>(
+    value: &OwnedValue,
+    optional: bool,
+) -> Result<String, EvalError> {
+    // jq JSON-encodes a container before base64-encoding it (`[1,2] |
+    // @base64` => `"eyJhIjoxfQ=="`-style) rather than erroring -- confirmed
+    // against real jq 1.7.1 (#1096). yq diverges here and keeps rejecting a
+    // container outright ("cannot encode !!seq as base64", confirmed
+    // against real yq v4.53.3 -- not reproduced here, out of this issue's
+    // scope), matching the fallthrough in the match below.
+    let owned_string;
+    let value = match value {
+        OwnedValue::Array(_) | OwnedValue::Object(_) if S::TAG == EvalTag::Jq => {
+            owned_string = OwnedValue::String(owned_value_to_json::<S>(value));
+            &owned_string
+        }
+        other => other,
+    };
     match value {
         OwnedValue::String(s) => {
             // Simple base64 encoding
@@ -28869,6 +28895,35 @@ mod tests {
         );
     }
 
+    /// jq JSON-encodes a container before percent-encoding it, rather than
+    /// erroring \u2014 confirmed against real jq 1.7.1 (#1096).
+    #[test]
+    fn test_format_uri_container_jq_mode_1096() {
+        query!(br"[1,2]", "@uri",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "%5B1%2C2%5D");
+            }
+        );
+        query!(br#"{"a":1}"#, "@uri",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "%7B%22a%22%3A1%7D");
+            }
+        );
+    }
+
+    /// yq diverges from jq here and keeps rejecting a container outright \u2014
+    /// confirmed against real yq v4.53.3 ("cannot encode !!seq as URI...").
+    /// This fix must not touch yq mode's existing behavior.
+    #[test]
+    fn test_format_uri_container_yq_mode_unaffected_1096() {
+        yq_query!(br"[1,2]", "@uri",
+            QueryResult::Error(_) => {}
+        );
+        yq_query!(br#"{"a":1}"#, "@uri",
+            QueryResult::Error(_) => {}
+        );
+    }
+
     #[test]
     fn test_format_csv() {
         // jq always double-quotes every string field (#306).
@@ -28990,6 +29045,35 @@ mod tests {
             QueryResult::Owned(OwnedValue::String(s)) => {
                 assert_eq!(s, "aGVsbG8=");
             }
+        );
+    }
+
+    /// jq JSON-encodes a container before base64-encoding it, rather than
+    /// erroring — confirmed against real jq 1.7.1 (#1096).
+    #[test]
+    fn test_format_base64_container_jq_mode_1096() {
+        query!(br"[1,2]", "@base64",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "WzEsMl0=");
+            }
+        );
+        query!(br#"{"a":1}"#, "@base64",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "eyJhIjoxfQ==");
+            }
+        );
+    }
+
+    /// yq diverges from jq here and keeps rejecting a container outright —
+    /// confirmed against real yq v4.53.3 ("cannot encode !!seq as
+    /// base64"). This fix must not touch yq mode's existing behavior.
+    #[test]
+    fn test_format_base64_container_yq_mode_unaffected_1096() {
+        yq_query!(br"[1,2]", "@base64",
+            QueryResult::Error(_) => {}
+        );
+        yq_query!(br#"{"a":1}"#, "@base64",
+            QueryResult::Error(_) => {}
         );
     }
 
