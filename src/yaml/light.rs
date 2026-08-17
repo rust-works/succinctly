@@ -1728,35 +1728,18 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                             // nothing at all writes no value token here
                             // (matching the sibling branch above, #765) --
                             // but unlike that branch, this one can still
-                            // have an anchor to write, so it can't just
-                            // skip straight to the comment. A trailing
-                            // space is only owed to something that actually
-                            // follows it: the colon alone (`a:`, no anchor,
-                            // absent value) takes none at all, matching
-                            // real yq's own bare rendering byte-for-byte.
-                            let absent = is_deferred_value_absent(&value);
-                            let anchor = value.anchor();
-                            if anchor.is_some() || !absent {
-                                out.write_char(' ')?;
-                            }
-                            if let Some(anchor) = anchor {
-                                out.write_char('&')?;
-                                out.write_str(anchor)?;
-                                if !absent {
-                                    out.write_char(' ')?;
-                                }
-                            }
-                            if !absent {
-                                let child_indent = deeper_yaml_indent(indent, indent_spaces, unit);
-                                value.stream_yaml_value(
-                                    out,
-                                    &child_indent,
-                                    indent_spaces,
-                                    unit,
-                                    sort_keys,
-                                    false,
-                                )?;
-                            }
+                            // have an anchor/tag to write, so it can't just
+                            // skip straight to the comment. See
+                            // `write_deferred_value`'s own doc comment for
+                            // the byte-for-byte spacing rule.
+                            write_deferred_value(
+                                out,
+                                &value,
+                                indent,
+                                indent_spaces,
+                                unit,
+                                sort_keys,
+                            )?;
                             // The value's own comment takes priority; fall
                             // back to the key's own comment when the value
                             // has none - covers an explicit key's trailing
@@ -1876,35 +1859,17 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                             write_line_comment(out, cursor.line_comment_raw())?;
                         } else {
                             // #1077: mirrors the mapping-field branch above
-                            // -- a deferred item that materializes as
-                            // nothing at all writes no value token, and the
-                            // dash takes no trailing space unless something
-                            // (an anchor or a real value) actually follows
-                            // it, matching real yq's bare `-` byte-for-byte.
-                            let absent = is_deferred_value_absent(&cursor);
-                            let anchor = cursor.anchor();
+                            // -- see `write_deferred_value`'s own doc
+                            // comment for the byte-for-byte spacing rule.
                             out.write_char('-')?;
-                            if anchor.is_some() || !absent {
-                                out.write_char(' ')?;
-                            }
-                            if let Some(anchor) = anchor {
-                                out.write_char('&')?;
-                                out.write_str(anchor)?;
-                                if !absent {
-                                    out.write_char(' ')?;
-                                }
-                            }
-                            if !absent {
-                                let child_indent = deeper_yaml_indent(indent, indent_spaces, unit);
-                                cursor.stream_yaml_value(
-                                    out,
-                                    &child_indent,
-                                    indent_spaces,
-                                    unit,
-                                    sort_keys,
-                                    false,
-                                )?;
-                            }
+                            write_deferred_value(
+                                out,
+                                &cursor,
+                                indent,
+                                indent_spaces,
+                                unit,
+                                sort_keys,
+                            )?;
                             write_line_comment(out, cursor.line_comment_raw())?;
                         }
                         elems = rest;
@@ -6296,6 +6261,52 @@ fn is_deferred_value_absent<W: AsRef<[u64]>>(value: &YamlCursor<'_, W>) -> bool 
         YamlValue::String(s) => s.is_unquoted() && s.as_str().map_or(true, |t| t.is_empty()),
         _ => false,
     }
+}
+
+/// Writes a possibly-absent value's anchor, explicit tag, and (if not
+/// absent) its own rendering -- shared by the mapping-field and
+/// sequence-item branches of `stream_yaml_value`'s block-style loops,
+/// which differ only in what precedes this (a `:` vs a `-`, already
+/// written by the caller).
+///
+/// A leading separator space is only written when something actually
+/// follows -- an anchor, a tag, or a real value -- matching real yq's own
+/// bare rendering byte-for-byte (`a:`/`-`, not `a: `/`- `, when nothing
+/// does) (#1077). A tag is written directly here only in the absent case;
+/// when the value isn't absent, `stream_yaml_value`'s own scalar dispatch
+/// below writes it as usual, so writing it here too would duplicate it --
+/// this is what an earlier draft of #1077's fix got wrong, silently
+/// dropping a no-anchor explicit tag on an absent value instead (found by
+/// review before merge).
+fn write_deferred_value<Out: core::fmt::Write, W: AsRef<[u64]>>(
+    out: &mut Out,
+    value: &YamlCursor<'_, W>,
+    indent: &str,
+    indent_spaces: usize,
+    unit: char,
+    sort_keys: bool,
+) -> core::fmt::Result {
+    let absent = is_deferred_value_absent(value);
+    let anchor = value.anchor();
+    let tag = if absent { value.explicit_tag() } else { None };
+    if anchor.is_some() || tag.is_some() || !absent {
+        out.write_char(' ')?;
+    }
+    if let Some(anchor) = anchor {
+        out.write_char('&')?;
+        out.write_str(anchor)?;
+        if tag.is_some() || !absent {
+            out.write_char(' ')?;
+        }
+    }
+    if let Some(tag) = tag {
+        out.write_str(tag)?;
+    }
+    if !absent {
+        let child_indent = deeper_yaml_indent(indent, indent_spaces, unit);
+        value.stream_yaml_value(out, &child_indent, indent_spaces, unit, sort_keys, false)?;
+    }
+    Ok(())
 }
 
 /// Write `width` copies of `unit` as indentation (`unit` is `' '` for

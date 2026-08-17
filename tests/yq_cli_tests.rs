@@ -9485,6 +9485,48 @@ fn test_deferred_absent_sequence_item_no_anchor_renders_bare_1077() -> Result<()
     Ok(())
 }
 
+/// Regression guard (found by review before merge): a deferred-absent
+/// mapping field with an explicit tag but no anchor must keep the tag --
+/// an earlier draft of this fix silently dropped it, since only `anchor`
+/// was checked to decide whether anything survives the absent value.
+#[test]
+fn test_deferred_absent_mapping_field_keeps_explicit_tag_1077() -> Result<()> {
+    let (out, code) = run_yq_stdin(".", "a: !!str\nb: 1\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "a: !!str\nb: 1\n");
+    Ok(())
+}
+
+/// Same regression, with both an anchor and a tag present on the absent
+/// value -- both must survive, anchor before tag, matching real yq's own
+/// ordering.
+#[test]
+fn test_deferred_absent_mapping_field_keeps_anchor_and_tag_1077() -> Result<()> {
+    let (out, code) = run_yq_stdin(".", "a: &anc !!str\nb: 1\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "a: &anc !!str\nb: 1\n");
+    Ok(())
+}
+
+/// Same regression class, the sequence-item variant: an explicit tag with
+/// no anchor on a deferred-absent item.
+#[test]
+fn test_deferred_absent_sequence_item_keeps_explicit_tag_1077() -> Result<()> {
+    let (out, code) = run_yq_stdin(".", "- !!str\n- 2\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "- !!str\n- 2\n");
+    Ok(())
+}
+
+/// Sequence-item variant with both an anchor and a tag.
+#[test]
+fn test_deferred_absent_sequence_item_keeps_anchor_and_tag_1077() -> Result<()> {
+    let (out, code) = run_yq_stdin(".", "- &anc !!str\n- 2\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "- &anc !!str\n- 2\n");
+    Ok(())
+}
+
 // The shapes below were added in a second round, after code review found the
 // first pass (a) regressed #765/#785's own key-comment capture when a
 // floated comment collides with a key's genuine same-line comment, (b)
