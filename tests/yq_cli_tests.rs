@@ -12862,6 +12862,21 @@ fn test_slice_assign_scalar_noop_still_propagates_halt_1101() -> Result<()> {
     Ok(())
 }
 
+/// A `?` wrapping the *whole* `|=`/`+=` expression (not an inline path
+/// `?`) still swallows the discarded filter's error, same as it would for
+/// any other `|=` -- `is not real yq syntax to verify this exact form
+/// against (`(EXPR)?` after a slice-assign errors at yq's own lexer), so
+/// this is checked against succinctly's own internal invariant instead:
+/// the throwaway-filter error path must still honor the ordinary `optional`
+/// catch, not just propagate unconditionally.
+#[test]
+fn test_slice_update_scalar_noop_optional_swallows_filter_error_1101() -> Result<()> {
+    let (out, code) = run_yq_stdin(r#"(.[0:1] |= error("boom"))?"#, "5", &["-o", "json"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "");
+    Ok(())
+}
+
 /// `.[0:1]?` (the postfix-optional form) still no-ops -- confirmed live
 /// against real yq, and confirmed to reach the same code path as the
 /// un-suffixed form via `resolve_dynamic_indexes`'s own `Expr::Optional`

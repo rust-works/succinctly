@@ -10392,13 +10392,20 @@ fn eval_update<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             && is_yq_slice_empty_container_scalar(&result)
         {
             let mut throwaway = result.clone();
+            // No `if optional`-gated arm here, unlike the sibling call
+            // below: `optional` at this point is `eval_update`'s *own*
+            // outer `?` (`(.a |= f)?`), and per #693, `Expr::Optional`/
+            // `Expr::Try`'s dispatch (`eval_try`, called for both) never
+            // forces `optional = true` into the expression it wraps — it
+            // evaluates with the ambient value (`false` at the top level)
+            // and catches the resulting `Error` itself instead. A `?`
+            // wrapping this whole `|=`/`+=` therefore still swallows the
+            // discarded filter's error correctly (verified live), just via
+            // that outer catch, never through this branch reaching `true`.
             if let Err(escape) =
                 update_path::<S>(&mut throwaway, &Expr::Identity, filter_expr, false)
             {
-                return match escape {
-                    EvalEscape::Error(_) if optional => QueryResult::None,
-                    other => other.into(),
-                };
+                return escape.into();
             }
             continue;
         }
@@ -18462,24 +18469,14 @@ fn builtin_del<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
     // The overwhelmingly common case — no computed key at all, or one that
     // resolved to a single value — has no sibling that could shift under it,
-    // so it keeps the simple per-path walk.
+    // so it keeps the simple per-path walk. (#1101's no-op is already fully
+    // handled by the upfront `paths.iter().all(...)` check above — for
+    // `paths.len() <= 1` specifically, "all paths qualify" and "the one
+    // path qualifies" are the same condition, so a second per-path check
+    // here would be unreachable dead code, not a real fallback.)
     if paths.len() <= 1 {
         let mut result = result;
         for path in &paths {
-            // yq's slice-assignment no-op (#1101) — `del(.[S:E])` on a bare
-            // scalar target is confirmed live to be a no-op in real yq too,
-            // same as `=`/`|=`/`+=`. Checked per resolved path (not the raw
-            // `path_expr`) so a computed-bound `.[$a:$b]` and `.[0:1]?`
-            // reach this the same way a literal `.[0:1]` does. See
-            // `is_yq_scalar_slice_assign_path`'s doc comment for the full
-            // rationale. `del()` has no RHS/filter, so there's nothing to
-            // evaluate before skipping — unlike `=`/`|=`/`+=`.
-            if S::TAG == EvalTag::Yq
-                && is_yq_scalar_slice_assign_path(path)
-                && is_yq_slice_empty_container_scalar(&result)
-            {
-                continue;
-            }
             if let Err(e) = delete_at_path(&mut result, path, false) {
                 return if optional {
                     QueryResult::None
