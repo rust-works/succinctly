@@ -11738,29 +11738,20 @@ fn test_jq_compound_assign_plus_preserves_number_literal_on_null_1143() -> Resul
     Ok(())
 }
 
-/// #1167's `arith_mul` reordering (moving relocation arms before the
-/// numeric collapse) must not change jq mode's own `null * x` / `x * null`
-/// behavior -- `NULL_MERGES_AS_EMPTY` is yq-only, so both directions still
-/// fall through to the same unconditional "null * x = null" arm as before
-/// this PR, unaffected by the reordering.
-///
-/// This locks in succinctly's *current* behavior only, not oracle
-/// conformance: real jq 1.7.1 actually *errors* on every `null`-involving
-/// multiplication (`5 * null` -> `number (5) and null (null) cannot be
-/// multiplied`, confirmed live), which succinctly's own catch-all arm
-/// (`(OwnedValue::Null, _) | (_, OwnedValue::Null) => Ok(OwnedValue::Null)`,
-/// untouched by this PR) does not replicate. Pre-existing divergence, not
-/// introduced or worsened here (identical on `main` before this PR) --
-/// filed separately as #1175.
+/// Real jq 1.7.1 errors on every `null`-involving multiplication, both
+/// directions, with no exceptions (`NULL_MERGES_AS_EMPTY` is yq-only, so
+/// jq mode never takes any of `arith_mul`'s no-op/merge arms) -- #1175.
+/// Supersedes a prior version of this test that locked in succinctly's
+/// then-current (wrong) `null`-returning behavior for both directions.
 #[test]
-fn test_jq_null_times_number_literal_still_discards_both_ways_1167() -> Result<()> {
-    let (out, _, code) = run_jq_full(&["-cn", "1e10 * null"], None)?;
-    assert_eq!(code, 0, "out: {out:?}");
-    assert_eq!(out.trim(), "null");
+fn test_jq_null_times_number_literal_errors_both_ways_1175() -> Result<()> {
+    let (_, err, code) = run_jq_full(&["-cn", "1e10 * null"], None)?;
+    assert_eq!(code, 5);
+    assert!(err.contains("cannot be multiplied"), "{err}");
 
-    let (out, _, code) = run_jq_full(&["-cn", "null * 1e10"], None)?;
-    assert_eq!(code, 0, "out: {out:?}");
-    assert_eq!(out.trim(), "null");
+    let (_, err, code) = run_jq_full(&["-cn", "null * 1e10"], None)?;
+    assert_eq!(code, 5);
+    assert!(err.contains("cannot be multiplied"), "{err}");
     Ok(())
 }
 
@@ -11796,5 +11787,39 @@ fn test_jq_parenthesized_del_target_works_but_chained_slice_still_errors_1153() 
 
     let (_out, _, code) = run_jq_full(&["-c", "del((.a[0:1]))"], Some(r#"{"a":5,"b":6}"#))?;
     assert_eq!(code, 5);
+    Ok(())
+}
+
+// --- #1175: every `null`-involving `*` multiplication must error in jq
+// mode, with zero exceptions -- confirmed live against real jq 1.7.1 for
+// every pairing below, including the two (`null * {}`, `null * []`) that
+// yq mode treats as an empty-container merge but jq does not
+// (`NULL_MERGES_AS_EMPTY` is yq-only).
+
+#[test]
+fn test_jq_null_times_scalar_errors_1175() -> Result<()> {
+    for expr in ["5 * null", "null * 5", r#"null * "ab""#, "null * true"] {
+        let (out, err, code) = run_jq_full(&["-cn", expr], None)?;
+        assert_eq!(code, 5, "expr {expr:?}: out={out:?} err={err:?}");
+        assert!(err.contains("cannot be multiplied"), "expr {expr:?}: {err}");
+    }
+    Ok(())
+}
+
+#[test]
+fn test_jq_null_times_null_errors_1175() -> Result<()> {
+    let (_, err, code) = run_jq_full(&["-cn", "null * null"], None)?;
+    assert_eq!(code, 5);
+    assert!(err.contains("cannot be multiplied"), "{err}");
+    Ok(())
+}
+
+#[test]
+fn test_jq_null_times_container_errors_1175() -> Result<()> {
+    for expr in ["null * {}", "null * []", "{} * null", "[] * null"] {
+        let (out, err, code) = run_jq_full(&["-cn", expr], None)?;
+        assert_eq!(code, 5, "expr {expr:?}: out={out:?} err={err:?}");
+        assert!(err.contains("cannot be multiplied"), "expr {expr:?}: {err}");
+    }
     Ok(())
 }

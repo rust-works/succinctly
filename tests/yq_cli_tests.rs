@@ -13745,19 +13745,16 @@ fn test_1167_mul_null_noop_preserves_number_literal_spelling() -> Result<()> {
     Ok(())
 }
 
-/// Control: `null * x` (left operand `null`) discards the right operand
-/// entirely -- it must stay `null`, not "preserve" the right operand's
-/// spelling, since nothing is relocated here (unlike the `x *= null` arm
-/// above). Locks in succinctly's *current* behavior, not oracle
-/// conformance -- real yq v4.53.3 actually errors on `null * 1e10`
-/// ("cannot multiply !!null with !!float", confirmed live), a
-/// pre-existing divergence untouched by this PR (identical on `main`
-/// before it) and filed separately as #1175.
+/// Control: `null * x` (left operand `null`, non-container right operand)
+/// must error, matching real yq v4.53.3 ("cannot multiply !!null with
+/// !!float", confirmed live) -- #1175. Superseded a prior version of this
+/// test that locked in succinctly's then-current (wrong) `null`-returning
+/// behavior.
 #[test]
-fn test_1167_null_times_number_literal_stays_null() -> Result<()> {
-    let (output, code) = run_yq_stdin("null * 1e10", "null", &["-o=json", "-I=0"])?;
-    assert_eq!(code, 0);
-    assert_eq!(output.trim(), "null");
+fn test_1175_null_times_number_literal_errors() -> Result<()> {
+    let (_, err, code) = run_yq_stdin_with_stderr("null * 1e10", "null", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 1);
+    assert!(err.contains("cannot be multiplied"), "{err}");
 
     Ok(())
 }
@@ -13802,6 +13799,58 @@ fn test_1167_object_array_merge_and_string_repeat_unchanged() -> Result<()> {
     assert_eq!(code, 0);
     assert_eq!(output.trim(), r#"{"a":1}"#);
 
+    Ok(())
+}
+
+// --- #1175: yq's asymmetric null-multiply rule -- `x * null` is a no-op,
+// `null * {}`/`null * []` merge as an empty container, `null * null` stays
+// `null`, and every other `null`-left/non-container-right pairing errors.
+// Verified live against real yq v4.53.3 for every case below.
+
+#[test]
+fn test_yq_right_null_is_always_a_noop_1175() -> Result<()> {
+    for (expr, expected) in [
+        ("5 * null", "5"),
+        (r#""a" * null"#, r#""a""#),
+        ("true * null", "true"),
+        ("{} * null", "{}"),
+        ("[] * null", "[]"),
+    ] {
+        let (output, code) = run_yq_stdin(expr, "null", &["-o=json", "-I=0"])?;
+        assert_eq!(code, 0, "expr {expr:?}");
+        assert_eq!(output.trim(), expected, "expr {expr:?}");
+    }
+    Ok(())
+}
+
+#[test]
+fn test_yq_left_null_container_still_merges_as_empty_1175() -> Result<()> {
+    let (output, code) = run_yq_stdin("null * {}", "null", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "{}");
+
+    let (output, code) = run_yq_stdin("null * []", "null", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "[]");
+
+    Ok(())
+}
+
+#[test]
+fn test_yq_null_times_null_stays_null_1175() -> Result<()> {
+    let (output, code) = run_yq_stdin("null * null", "null", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "null");
+    Ok(())
+}
+
+#[test]
+fn test_yq_left_null_scalar_errors_1175() -> Result<()> {
+    for expr in ["null * 5", r#"null * "a""#, "null * true"] {
+        let (_, err, code) = run_yq_stdin_with_stderr(expr, "null", &["-o=json", "-I=0"])?;
+        assert_eq!(code, 1, "expr {expr:?}: {err}");
+        assert!(err.contains("cannot be multiplied"), "expr {expr:?}: {err}");
+    }
     Ok(())
 }
 

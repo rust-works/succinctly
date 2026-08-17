@@ -1977,10 +1977,18 @@ fn arith_mul<S: EvalSemantics>(
         (OwnedValue::Null, b @ OwnedValue::Array(_)) if S::NULL_MERGES_AS_EMPTY => {
             Ok(merge_values(OwnedValue::Array(Vec::new()), b, flags))
         }
-        // null * x = null -- both operands are discarded outright (the
-        // result is always `Null`, never either operand), so there's
-        // nothing to relocate and no spelling to lose here.
-        (OwnedValue::Null, _) | (_, OwnedValue::Null) => Ok(OwnedValue::Null),
+        // Every other `Null`-involving pairing falls through to the
+        // generic numeric/string match below, where `Null` matches none
+        // of its patterns and lands on the final `EvalError::binary_op`
+        // arm (#1175). Both oracles error here: jq unconditionally (its
+        // `NULL_MERGES_AS_EMPTY = false` means the three arms above never
+        // fire, so every jq null pairing reaches this point), and yq for
+        // every case its own arms above don't already special-case --
+        // `x * null` (no-op) and `null * {}`/`null * []` (empty-container
+        // merge). `null * null` is *not* an exception needing its own arm:
+        // it's already handled by the `(left, Null)` no-op arm above,
+        // since `left` binds to `Null` there too (live-verified against
+        // yq v4.53.3: `null * null` -> `null`, exit 0, not an error).
         // Everything else: numeric multiplication or string repetition. A
         // `NumberLiteral` operand degrades to plain `Int`/`Float` here, and
         // only here -- these are the arms that actually compute a new
@@ -26370,13 +26378,19 @@ mod tests {
             }
         );
 
-        // jq mode is unaffected: null is still a hard `null` result on
-        // either side, matching jq mode's pre-existing (non-merge) behavior.
+        // jq mode is unaffected by the merge-flag machinery above (it has
+        // no merge concept for a null operand at all) -- both directions
+        // error, matching real jq's own unconditional null-multiply error
+        // (#1175).
         query!(br#"{"a": null, "b": {"x": 1}}"#, ".a * .b",
-            QueryResult::Owned(OwnedValue::Null) => {}
+            QueryResult::Error(e) => {
+                assert!(e.message.contains("cannot be multiplied"), "{}", e.message);
+            }
         );
         query!(br#"{"a": {"x": 1}}"#, ".a * null",
-            QueryResult::Owned(OwnedValue::Null) => {}
+            QueryResult::Error(e) => {
+                assert!(e.message.contains("cannot be multiplied"), "{}", e.message);
+            }
         );
     }
 
