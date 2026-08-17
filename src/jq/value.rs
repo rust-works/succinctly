@@ -239,7 +239,7 @@ pub fn format_number_jq_compat(raw: &[u8]) -> String {
 
     // For other cases, use normalized scientific notation
     // jq normalizes mantissa to have one digit before decimal point
-    if value == 0.0 {
+    if value == 0.0 || value.abs() < f64::MIN_POSITIVE {
         // `value == 0.0` is true both for a genuinely-zero-mantissa literal
         // (`0e-400`) and for a *nonzero*-mantissa literal whose magnitude
         // simply underflowed `f64` during parsing (`1e-400`, far below
@@ -247,6 +247,18 @@ pub fn format_number_jq_compat(raw: &[u8]) -> String {
         // alone (#1099). `format_underflow_literal_mantissa` (and the
         // shared `normalize_extreme_literal_mantissa` beneath it) tells
         // them apart from the literal's own source digits.
+        //
+        // `value.abs() < f64::MIN_POSITIVE` (nonzero but *subnormal*, #1177):
+        // the finite `log10`/`pow` renormalization below breaks down at the
+        // extreme low end of the subnormal range -- `libm::pow(10.0,
+        // log10(abs_value).floor())` can itself underflow to exactly `0.0`
+        // (its own result is smaller than the smallest representable
+        // subnormal), making `abs_value / 0.0 = +inf` and rendering the
+        // mantissa as the literal text `"inf"`, which isn't valid JSON.
+        // Routing every subnormal through the same string-based path as
+        // exact-zero underflow sidesteps this entirely: that path derives
+        // the mantissa from `s`'s own source digits, never from `f64`
+        // arithmetic that's already lost precision by this magnitude.
         return format_underflow_literal_mantissa(s, exp_pos, value.is_sign_negative());
     }
 
@@ -2434,6 +2446,36 @@ mod tests {
             format_number_jq_compat(b"1e-99999999999999999999"),
             "1E-9223372036854775808"
         );
+    }
+
+    /// #1177: a literal that parses to a nonzero but *subnormal* `f64`
+    /// (below `f64::MIN_POSITIVE`, but still representable) used to render
+    /// its mantissa as the literal text `"inf"` -- not valid JSON.
+    /// `libm::pow(10.0, log10(abs_value).floor())` itself underflows to
+    /// `0.0` at the extreme low end of the subnormal range, making
+    /// `abs_value / 0.0 = +inf`. Verified live against jq 1.7.1.
+    #[test]
+    fn test_format_number_jq_compat_subnormal_preserves_mantissa_1177() {
+        assert_eq!(format_number_jq_compat(b"5e-324"), "5E-324");
+        assert_eq!(format_number_jq_compat(b"-5e-324"), "-5E-324");
+        assert_eq!(format_number_jq_compat(b"1e-323"), "1E-323");
+        assert_eq!(format_number_jq_compat(b"4.9e-324"), "4.9E-324");
+        assert_eq!(format_number_jq_compat(b"9.9e-324"), "9.9E-324");
+        assert_eq!(format_number_jq_compat(b"2.5e-320"), "2.5E-320");
+        assert_eq!(format_number_jq_compat(b"1e-315"), "1E-315");
+        assert_eq!(format_number_jq_compat(b"1e-310"), "1E-310");
+    }
+
+    /// #1177 review self-check: a normal (non-subnormal) tiny value right
+    /// at and just above the `f64::MIN_POSITIVE` boundary must still take
+    /// the finite `log10`/`pow` path unchanged -- the new subnormal check
+    /// uses `<`, not `<=`, so it doesn't over-broaden into values the
+    /// existing path already handles correctly.
+    #[test]
+    fn test_format_number_jq_compat_normal_boundary_near_min_positive_unaffected_1177() {
+        assert_eq!(format_number_jq_compat(b"1.5e-308"), "1.5E-308");
+        assert_eq!(format_number_jq_compat(b"3e-308"), "3E-308");
+        assert_eq!(format_number_jq_compat(b"1e-300"), "1E-300");
     }
 
     /// #930 review: an overflowed literal's mantissa can be arbitrarily long

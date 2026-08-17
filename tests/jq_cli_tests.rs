@@ -4559,6 +4559,33 @@ fn test_number_literal_underflow_beyond_i32_exponent_range_1099() -> Result<()> 
     Ok(())
 }
 
+/// #1177: a literal that parses to a nonzero but *subnormal* `f64` (below
+/// `f64::MIN_POSITIVE`, but still representable) used to render its
+/// mantissa as the literal text `"inf"` -- not valid JSON.
+/// `libm::pow(10.0, log10(abs_value).floor())` itself underflows to `0.0`
+/// at the extreme low end of the subnormal range, making
+/// `abs_value / 0.0 = +inf`. Verified live against jq 1.7.1.
+#[test]
+fn test_number_literal_subnormal_preserves_mantissa_1177() -> Result<()> {
+    let (output, code) = run_jq_stdin(".", "5e-324", &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "5E-324");
+
+    let (output, code) = run_jq_stdin(".", "-5e-324", &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "-5E-324");
+
+    let (output, code) = run_jq_stdin(".", "4.9e-324", &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "4.9E-324");
+
+    let (output, code) = run_jq_stdin(".", "1e-315", &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "1E-315");
+
+    Ok(())
+}
+
 /// `eval_owned_expr`/`eval_owned_input` (backing `reduce`/`foreach`/`as $x`
 /// variable binding) and `with_entries`'s `owned_to_json_bytes` each have
 /// their own serialize-and-reparse bridge, separate from `eval_generic`'s
