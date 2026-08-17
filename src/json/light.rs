@@ -1458,7 +1458,7 @@ fn parse_hex4(hex: &[u8]) -> Result<u16, JsonError> {
 /// own behavior. Do **not** reuse this for a number reached while
 /// materializing an already-recognized container's *nested* value: that
 /// path has its own, deliberately more permissive established
-/// precedent ([`nested_number_span`], #966) of absorbing a malformed
+/// precedent (`nested_number_span`, #966) of absorbing a malformed
 /// trailing shape into one span and letting it fail to `Null` downstream
 /// rather than erroring the whole document -- this stricter function
 /// would instead truncate a span like `1.2.3` after `1.2`, silently
