@@ -29,7 +29,7 @@ use super::value::{
     assert_value_tree_depth, format_number_jq_compat, infinite_float_preview_text,
     jq_bare_float_display, NumberRepr, OwnedValue,
 };
-use crate::yaml::{format_float_with_fraction, format_float_yq_yaml};
+use crate::yaml::{format_float_with_fraction, format_float_yq, format_float_yq_yaml};
 
 /// A value that can be streamed directly to output without intermediate allocation.
 ///
@@ -627,19 +627,24 @@ fn stream_owned_value_yaml_at_depth<W: core::fmt::Write>(
         // float's decimal point only at document-root scalar position,
         // and tags it (`!!float`) everywhere else to keep its type
         // unambiguous on reparse -- a mechanism succinctly has no way to
-        // emit, so `format_float_with_fraction`'s decimal-preserving
-        // fallback is the safer of the two available choices below root.
-        // `can_use_m2_streaming` (yq_runner.rs) has no arithmetic arm, so
-        // this function is likely unreachable with a genuinely *computed*
-        // bare `Float` through any current CLI path -- kept in sync with
-        // the DOM path anyway for `StreamableValue::stream_yaml`'s other,
-        // non-CLI callers and to avoid a silent behavioral split if a
-        // future M2-eligible construct ever does carry one through (#1064
-        // documents this same "unreachable but exhaustive" shape
-        // elsewhere in this codebase). An untouched literal keeps its own
-        // `.0` via the `NumberLiteral` arm below, unaffected by this.
+        // emit, so `format_float_yq`'s decimal-preserving fallback is the
+        // safer of the two available choices below root (also matching
+        // `emit_yaml_value_at_depth`'s nested-position fallback exactly,
+        // including its scientific-notation threshold for an
+        // extreme-magnitude nested value -- `format_float_with_fraction`
+        // alone has no such threshold and would diverge from the DOM path
+        // on that case). `can_use_m2_streaming` (yq_runner.rs) has no
+        // arithmetic arm, so this function is likely unreachable with a
+        // genuinely *computed* bare `Float` through any current CLI path
+        // -- kept in sync with the DOM path anyway for
+        // `StreamableValue::stream_yaml`'s other, non-CLI callers and to
+        // avoid a silent behavioral split if a future M2-eligible
+        // construct ever does carry one through (#1064 documents this
+        // same "unreachable but exhaustive" shape elsewhere in this
+        // codebase). An untouched literal keeps its own `.0` via the
+        // `NumberLiteral` arm below, unaffected by this.
         OwnedValue::Float(f) if depth == 0 => out.write_str(&format_float_yq_yaml(*f)),
-        OwnedValue::Float(f) => out.write_str(&format_float_with_fraction(*f)),
+        OwnedValue::Float(f) => out.write_str(&format_float_yq(*f)),
         OwnedValue::NumberLiteral(NumberRepr::Float(f), _) if f.is_nan() || f.is_infinite() => {
             out.write_str(super::nonfinite_display_string::<super::YqSemantics>(*f))
         }

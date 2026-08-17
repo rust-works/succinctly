@@ -7724,9 +7724,13 @@ fn test_computed_whole_float_json_sourced_input_unaffected_by_949() -> Result<()
     Ok(())
 }
 
-/// An untouched literal is unaffected by this fix in any output mode -- a
-/// different `OwnedValue` variant (`NumberLiteral`) with its own,
-/// unrelated rendering path.
+/// An untouched literal is unaffected by this fix in any output mode.
+/// Bare `.` (identity) here takes the cursor-based P9/M2 streaming path,
+/// echoing the source text straight from `YamlCursor` without ever
+/// constructing an `OwnedValue` at all; a *navigated* literal (e.g. `.a`)
+/// would instead reach `OwnedValue::NumberLiteral`, a different variant
+/// with its own, equally unrelated rendering path -- either way, neither
+/// goes through the bare-`Float` arms this fix changes.
 #[test]
 fn test_literal_whole_float_unaffected_by_949_fix() -> Result<()> {
     for extra_args in [&[][..], &["-o=json", "-I=0"], &["-o=json"]] {
