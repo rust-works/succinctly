@@ -437,6 +437,22 @@ impl EvalError {
         Self::new(format!("Path must be specified as array, not {type_name}"))
     }
 
+    /// `DELPATHS: expected either a !!str or !!int in the path, found !!map instead`.
+    ///
+    /// yq-mode-only (#1162): unlike real jq, which accepts a slice-descriptor
+    /// path component (`{"start":s,"end":e}`, `path(.[a:b])`'s own output
+    /// shape) at any position in a `delpaths()` path and splices through the
+    /// named sub-range, real yq rejects one outright — verified live against
+    /// yq v4.53.3 with this exact wording, at both a top-level and a nested
+    /// position. Real yq's `delpaths()` is actually stricter still (also
+    /// rejects a float/bool/array component with the same message, substituting
+    /// its own type's tag), but this constructor covers only the slice-
+    /// descriptor shape #1162 itself scoped — the broader rejection is
+    /// tracked separately as #1220.
+    pub fn delpaths_rejects_slice_descriptor() -> Self {
+        Self::new("DELPATHS: expected either a !!str or !!int in the path, found !!map instead")
+    }
+
     /// `Cannot delete fields from <type>`.
     ///
     /// `delpaths`/`del` reached a scalar (other than `null`) as the container
