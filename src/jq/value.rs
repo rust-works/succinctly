@@ -544,6 +544,13 @@ impl OwnedValue {
         if is_nan_sentinel(bytes) {
             return Self::Float(f64::NAN);
         }
+        if let Some(negative) = is_infinity_sentinel(bytes) {
+            return Self::Float(if negative {
+                f64::NEG_INFINITY
+            } else {
+                f64::INFINITY
+            });
+        }
         if crate::json::validate::is_valid_number(bytes) {
             return core::str::from_utf8(bytes).map_or(Self::Null, Self::from_number_literal);
         }
@@ -759,7 +766,7 @@ impl OwnedValue {
             0,
             format_number_jq_compat,
             jq_bare_float_display,
-            jq_infinite_float_json_text,
+            infinite_float_preview_text,
         )
     }
 
@@ -815,7 +822,7 @@ impl OwnedValue {
         depth: usize,
         finite_literal: fn(&[u8]) -> String,
         float_fmt: fn(f64) -> String,
-        infinite_fmt: fn(bool) -> String,
+        infinite_fmt: fn(bool) -> &'static str,
     ) -> String {
         assert_value_tree_depth(depth);
         match self {
@@ -827,34 +834,28 @@ impl OwnedValue {
                 if f.is_nan() {
                     "null".into() // JSON doesn't support NaN
                 } else if f.is_infinite() {
-                    infinite_fmt(f.is_sign_negative())
+                    infinite_fmt(f.is_sign_negative()).into()
                 } else {
                     float_fmt(*f)
                 }
             }
             Self::NumberLiteral(NumberRepr::Float(f), _) if f.is_nan() => "null".into(),
-            // The reindex-bridge's self-overflowing sentinel (#1087, see
-            // `is_overflow_literal_sentinel`'s own doc comment): a computed
-            // Infinity that passed through `to_json_for_reindex` and got
-            // reparsed is structurally a `NumberLiteral` now, but it stood
-            // in for a value with no real source text, so it needs
-            // `infinite_fmt`'s `DBL_MAX` text (what a bare computed `Float`
-            // above gets), not a mantissa-preserving echo of "1e999" itself.
-            Self::NumberLiteral(NumberRepr::Float(f), literal)
-                if is_overflow_literal_sentinel(literal) =>
-            {
-                infinite_fmt(f.is_sign_negative())
-            }
-            // Any other infinite `NumberLiteral` is a genuine document
-            // literal, which still has its own source text to fall back
-            // to -- `1e400 | .` (identity, no computation) echoes jq's
-            // mantissa-preserving `1E+400`, not `DBL_MAX` text, confirmed
-            // live against jq 1.7.1 (#1087). `finite_literal` already
-            // handles this correctly in both modes despite its name: jq's
-            // `format_number_jq_compat` special-cases a non-finite input via
-            // `format_overflow_literal_mantissa` rather than assuming
-            // finiteness, and yq's `real_output_finite_literal` echoes raw
-            // text verbatim regardless of the parsed value.
+            // An infinite `NumberLiteral` reaching here is always a genuine
+            // document literal, which still has its own source text to
+            // fall back to -- `1e400 | .` (identity, no computation) echoes
+            // jq's mantissa-preserving `1E+400`, not `DBL_MAX` text,
+            // confirmed live against jq 1.7.1 (#1087). The reindex bridge's
+            // own computed-Infinity sentinel can never reach this arm: it's
+            // intercepted during reparse by `from_number_bytes`'s
+            // `is_infinity_sentinel` check (#1083/#1087, mirroring
+            // `is_nan_sentinel`'s sibling interception) and becomes a plain
+            // `Self::Float` above instead, before it can ever masquerade as
+            // a `NumberLiteral`. `finite_literal` already handles a genuine
+            // overflow literal correctly in both modes despite its name:
+            // jq's `format_number_jq_compat` special-cases a non-finite
+            // input via `format_overflow_literal_mantissa` rather than
+            // assuming finiteness, and yq's `real_output_finite_literal`
+            // echoes raw text verbatim regardless of the parsed value.
             Self::NumberLiteral(_, literal) => finite_literal(literal.as_bytes()),
             Self::String(s) => format!("\"{}\"", escape_json_body(write_json_body_jq, s)),
             Self::Array(arr) => {
@@ -1015,40 +1016,59 @@ impl OwnedValue {
                 depth,
                 format_number_jq_compat,
                 jq_bare_float_display,
-                jq_infinite_float_json_text,
+                infinite_float_preview_text,
             ),
         }
     }
 }
 
-/// A JSON number literal guaranteed to overflow to the correctly-signed
-/// infinity when parsed as `f64`, used only by
-/// [`OwnedValue::to_json_for_reindex`] to smuggle ±Infinity through a
-/// JSON-text round-trip.
-fn overflow_literal(f: f64) -> &'static str {
-    if f.is_sign_negative() {
-        "-1e999"
+/// The reserved JSON number literal [`OwnedValue::to_json_for_reindex`]
+/// writes in place of a computed +Infinity (see [`NEG_INFINITY_SENTINEL`]
+/// for -Infinity's spelling) -- #1083/#1087: originally `"1e999"`
+/// (naturally overflowing, valid JSON syntax), but that let a reindexed
+/// computed Infinity reparse into a `NumberLiteral(Float(inf), "1e999")`
+/// bit-for-bit indistinguishable from a genuine document literal that
+/// happened to be spelled the same way, misclassifying either direction
+/// depending which one a given call site assumed. Redesigned to mirror
+/// [`NAN_SENTINEL`]'s already-safe two-exponent-marker trick: guaranteed
+/// unparseable as an ordinary number (so it can never collide with real
+/// document text), intercepted early by [`is_infinity_sentinel`] the same
+/// way `is_nan_sentinel` intercepts its sibling, and still built entirely
+/// from `[0-9-+.eE]` so `JsonNumber::find_end()`'s span scan captures it
+/// whole. Distinguished from `NAN_SENTINEL` (`"9e999e999"`) by leading
+/// digit rather than a sign prefix, so the sign survives as plain text for
+/// [`is_infinity_sentinel`] to read back off, uniformly for both spellings.
+pub(crate) const INFINITY_SENTINEL: &str = "8e999e999";
+
+/// The negative-Infinity sibling of [`INFINITY_SENTINEL`].
+pub(crate) const NEG_INFINITY_SENTINEL: &str = "-8e999e999";
+
+/// `true`/`false` for [`NEG_INFINITY_SENTINEL`]/[`INFINITY_SENTINEL`],
+/// `None` for anything else -- the one definition every call site that
+/// reads a `to_json_for_reindex`-bridge number token must check before
+/// falling back to ordinary parsing, mirroring [`is_nan_sentinel`]'s own
+/// doc comment and existing call-site list exactly (#1083/#1087).
+pub(crate) fn is_infinity_sentinel(bytes: &[u8]) -> Option<bool> {
+    if bytes == NEG_INFINITY_SENTINEL.as_bytes() {
+        Some(true)
+    } else if bytes == INFINITY_SENTINEL.as_bytes() {
+        Some(false)
     } else {
-        "1e999"
+        None
     }
 }
 
-/// True if `literal` is exactly one of [`overflow_literal`]'s two spellings
-/// (#1087). Unlike [`NAN_SENTINEL`], which is syntactically invalid JSON
-/// (two exponent markers) and so gets intercepted during reparse before it
-/// can ever become a `NumberLiteral` at all (`from_number_bytes`'s
-/// `is_nan_sentinel` check), `"1e999"`/`"-1e999"` are deliberately *valid*
-/// JSON number syntax -- the whole point is that they reparse cleanly to
-/// the right-signed infinity -- so a reindexed computed Infinity does
-/// become a genuine `NumberLiteral(Float(inf), "1e999")`, structurally
-/// identical to a document literal that happened to be spelled the same
-/// way. `to_json_at_depth` needs to tell them apart: the sentinel should
-/// render as a computed value's `DBL_MAX` text (what it actually stood in
-/// for), not get `format_number_jq_compat`'s mantissa-preserving echo (the
-/// correct treatment for a genuine, if coincidentally-identical, document
-/// literal).
-fn is_overflow_literal_sentinel(literal: &str) -> bool {
-    literal == overflow_literal(f64::INFINITY) || literal == overflow_literal(f64::NEG_INFINITY)
+/// The correctly-signed sentinel text, used only by
+/// [`OwnedValue::to_json_for_reindex`] to smuggle ±Infinity through a
+/// JSON-text round-trip -- see [`INFINITY_SENTINEL`]'s own doc comment for
+/// why a guaranteed-unparseable (rather than naturally-overflowing)
+/// spelling is what makes this safe.
+fn overflow_literal(f: f64) -> &'static str {
+    if f.is_sign_negative() {
+        NEG_INFINITY_SENTINEL
+    } else {
+        INFINITY_SENTINEL
+    }
 }
 
 /// The exact text real jq's error-message value previews use for an
@@ -1073,24 +1093,14 @@ pub(crate) fn infinite_float_preview_text(negative: bool) -> &'static str {
     }
 }
 
-/// `to_json`'s `infinite_fmt` for jq mode (#1087): a computed Infinity
-/// serializes as [`infinite_float_preview_text`]'s `DBL_MAX` text, matching
-/// real jq (`echo null | jq -c infinite` is `1.7976931348623157e+308`, not
-/// `null`) -- `to_json_at_depth` already substitutes `null` for `NaN`
-/// unconditionally, so this fn only ever runs for the non-`NaN` infinite
-/// case.
-fn jq_infinite_float_json_text(negative: bool) -> String {
-    infinite_float_preview_text(negative).to_string()
-}
-
 /// `to_json_yq`'s `infinite_fmt` for yq mode (#1087): keeps the
 /// pre-existing `null` substitution. Real yq's own Go `encoding/json`
 /// refuses to marshal Infinity at all and errors instead, so replicating
 /// jq's `DBL_MAX`-text behavior here would not actually match either
 /// oracle -- an open design question this fn deliberately doesn't resolve,
 /// see #1087's own text.
-fn yq_infinite_float_json_text(_negative: bool) -> String {
-    "null".into()
+fn yq_infinite_float_json_text(_negative: bool) -> &'static str {
+    "null"
 }
 
 /// The reserved JSON number literal [`OwnedValue::to_json_for_reindex`]
@@ -1911,16 +1921,59 @@ mod tests {
 
     #[test]
     fn test_to_json_for_reindex_preserves_nan() {
-        // Unlike ±Infinity (which self-overflows via `1e999`), NaN has no
-        // natural JSON-number spelling, so `to_json_for_reindex` must emit
-        // the reserved sentinel instead of falling back to `to_json`'s
-        // "null" substitution (#472).
+        // NaN has no natural JSON-number spelling, so `to_json_for_reindex`
+        // must emit the reserved sentinel instead of falling back to
+        // `to_json`'s "null" substitution (#472).
         assert_eq!(
             OwnedValue::Float(f64::NAN).to_json_for_reindex::<JqSemantics>(),
             NAN_SENTINEL
         );
         let lit = OwnedValue::NumberLiteral(NumberRepr::Float(f64::NAN), "nan".into());
         assert_eq!(lit.to_json_for_reindex::<JqSemantics>(), NAN_SENTINEL);
+    }
+
+    /// #1083/#1087: the infinity sentinel must be as collision-safe as
+    /// `NAN_SENTINEL` already is -- guaranteed unparseable as an ordinary
+    /// number (so `from_number_bytes` can reliably recognize it as *the*
+    /// sentinel rather than a genuine document literal that happens to
+    /// share its spelling), yet still recoverable via
+    /// [`is_infinity_sentinel`] once reparsed.
+    #[test]
+    fn test_infinity_sentinel_is_unparseable_but_recoverable_1087() {
+        assert!(INFINITY_SENTINEL.parse::<f64>().is_err());
+        assert!(INFINITY_SENTINEL.parse::<i64>().is_err());
+        assert!(NEG_INFINITY_SENTINEL.parse::<f64>().is_err());
+        assert!(NEG_INFINITY_SENTINEL.parse::<i64>().is_err());
+
+        assert_eq!(
+            is_infinity_sentinel(INFINITY_SENTINEL.as_bytes()),
+            Some(false)
+        );
+        assert_eq!(
+            is_infinity_sentinel(NEG_INFINITY_SENTINEL.as_bytes()),
+            Some(true)
+        );
+        assert_eq!(is_infinity_sentinel(b"1e400"), None);
+        assert_eq!(is_infinity_sentinel(NAN_SENTINEL.as_bytes()), None);
+
+        // Round-trips correctly through the same public entry point real
+        // document numbers go through.
+        assert_eq!(
+            OwnedValue::from_number_bytes(INFINITY_SENTINEL.as_bytes()),
+            OwnedValue::Float(f64::INFINITY)
+        );
+        assert_eq!(
+            OwnedValue::from_number_bytes(NEG_INFINITY_SENTINEL.as_bytes()),
+            OwnedValue::Float(f64::NEG_INFINITY)
+        );
+
+        // A genuine document literal spelled coincidentally like the *old*
+        // (pre-#1083/#1087) sentinel no longer collides with anything --
+        // it round-trips as an ordinary overflow literal now.
+        assert_eq!(
+            OwnedValue::from_number_bytes(b"1e999"),
+            OwnedValue::NumberLiteral(NumberRepr::Float(f64::INFINITY), "1e999".into())
+        );
     }
 
     /// #939: an infinite `NumberLiteral` backed by real document text (any
@@ -1950,7 +2003,7 @@ mod tests {
     fn test_to_json_for_reindex_bounds_an_unrealistically_long_literal() {
         let huge_literal = format!("{}e400", "9".repeat(300));
         let lit = OwnedValue::NumberLiteral(NumberRepr::Float(f64::INFINITY), huge_literal.into());
-        assert_eq!(lit.to_json_for_reindex::<JqSemantics>(), "1e999");
+        assert_eq!(lit.to_json_for_reindex::<JqSemantics>(), INFINITY_SENTINEL);
     }
 
     #[test]

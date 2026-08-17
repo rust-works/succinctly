@@ -27,7 +27,7 @@ use crate::json::light::{JsonCursor, StandardJson};
 
 use super::escape::write_json_body_jq;
 use super::expr::Literal;
-use super::value::{assert_value_tree_depth, OwnedValue};
+use super::value::{assert_value_tree_depth, infinite_float_preview_text, OwnedValue};
 
 /// A JSON value for jq evaluation - lazy by default, materialized when needed.
 ///
@@ -524,8 +524,16 @@ impl<'a, W: Clone + AsRef<[u64]>> JqValue<'a, W> {
             JqValue::Bool(false) => out.write_str("false"),
             JqValue::Int(n) => write!(out, "{n}"),
             JqValue::Float(f) => {
-                if f.is_nan() || f.is_infinite() {
-                    out.write_str("null")
+                if f.is_nan() {
+                    out.write_str("null") // JSON doesn't support NaN
+                } else if f.is_infinite() {
+                    // A computed Infinity has no source literal to echo, so
+                    // it renders jq's own DBL_MAX text instead of "null"
+                    // (#1087) -- `JqValue` is jq-mode-only (no
+                    // `yq_runner.rs` caller exists), so there's no yq
+                    // convention to preserve here, unlike `OwnedValue::to_json`'s
+                    // mode-generic sibling.
+                    out.write_str(infinite_float_preview_text(f.is_sign_negative()))
                 } else {
                     write!(out, "{f}")
                 }

@@ -5469,24 +5469,31 @@ fn test_yaml_special_floats_to_json_are_null() -> Result<()> {
 
 /// #939: fixed `keys`/`.[]`-style previews of a document-sourced overflow
 /// *number* literal (`123e400`) to reuse the literal's own text instead of
-/// `OwnedValue::to_json_for_reindex`'s generic `1e999` sentinel.
+/// `OwnedValue::to_json_for_reindex`'s generic sentinel.
 ///
 /// #918 later gave YAML floats their own `number_literal()` override too
 /// (previously only JSON had one), but it deliberately excludes non-finite
 /// values: `.inf`/`-.inf`'s YAML spelling isn't valid JSON number syntax,
 /// so unlike a finite YAML float (`2.0`), they still fall through to the
 /// unrelated, unmodified `OwnedValue::Float` arm and never construct an
-/// `OwnedValue::NumberLiteral`. Pinning here that the sentinel text they've
-/// always used stays unchanged by either fix.
+/// `OwnedValue::NumberLiteral`. `.inf`/`-.inf` have no overflow literal of
+/// their own to preserve either way (unlike `123e400`), so they always go
+/// through the reindex bridge's sentinel -- pinning here that #1083/#1087's
+/// sentinel redesign changed *what that preview looks like* (`DBL_MAX`
+/// text, not a mantissa-echo of the old sentinel's own now-collision-prone
+/// spelling), while #939's actual fix (reusing a genuine literal's text)
+/// still doesn't apply to these two, unaffected by either change.
 #[test]
-fn test_yaml_special_float_keys_preview_is_unaffected_by_939() -> Result<()> {
+fn test_yaml_special_float_keys_preview_1087() -> Result<()> {
+    // `describe()`'s own value-preview truncation (unrelated to #1083/#1087)
+    // shortens the `DBL_MAX` text before it ever reaches this message.
     let (output, exit_code) = run_yq_stdin("try keys catch .", ".inf\n", &[])?;
     assert_eq!(exit_code, 0);
-    assert_eq!(output, "number (1E+999) has no keys\n");
+    assert_eq!(output, "number (1.797693134...) has no keys\n");
 
     let (output, exit_code) = run_yq_stdin("try keys catch .", "-.inf\n", &[])?;
     assert_eq!(exit_code, 0);
-    assert_eq!(output, "number (-1E+999) has no keys\n");
+    assert_eq!(output, "number (-1.79769313...) has no keys\n");
     Ok(())
 }
 

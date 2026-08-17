@@ -11,7 +11,8 @@ use succinctly::jq::escape::{
 };
 use succinctly::jq::eval_generic::to_owned as generic_to_owned;
 use succinctly::jq::{
-    assert_value_tree_depth, format_number_jq_compat, EvalError, OwnedValue, StreamError,
+    assert_value_tree_depth, format_number_jq_compat, nonfinite_display_string, EvalError,
+    JqSemantics, OwnedValue, StreamError,
 };
 use succinctly::json::JsonIndex;
 use succinctly::yaml::format_float_with_fraction;
@@ -377,8 +378,26 @@ fn format_json_impl(value: &OwnedValue, opts: &JsonFormatOpts, level: usize) -> 
         OwnedValue::Bool(b) => b.to_string(),
         OwnedValue::Int(i) => i.to_string(),
         OwnedValue::Float(f) => {
-            if f.is_nan() || f.is_infinite() {
-                "null".to_string() // JSON doesn't support NaN or Infinity
+            if f.is_nan() {
+                "null".to_string() // JSON doesn't support NaN
+            } else if f.is_infinite() {
+                if opts.control_escape == ControlEscape::Yq {
+                    // yq mode: still "null" -- real yq's own Go
+                    // encoding/json refuses to marshal Infinity at all and
+                    // errors instead, so this is a deliberate, open design
+                    // question left unresolved here, not a parity bug
+                    // (#1087's own scope note).
+                    "null".to_string()
+                } else {
+                    // jq mode: a computed Infinity has no source literal to
+                    // echo, so it renders jq's own DBL_MAX text instead of
+                    // "null" (#1087, confirmed live against jq 1.7.1: `null
+                    // | infinite` is `1.7976931348623157e+308`). Reuses
+                    // #1075's `nonfinite_display_string` rather than a
+                    // fourth hand-rolled copy of the same split (`value.rs`,
+                    // `jq_runner.rs`'s two `LiteralFormatter` impls).
+                    nonfinite_display_string::<JqSemantics>(*f).to_string()
+                }
             } else if opts.control_escape == ControlEscape::Yq {
                 // yq mode: scientific notation past yq's magnitude threshold
                 // (#997), decimal-with-fraction otherwise, regardless of
@@ -397,21 +416,23 @@ fn format_json_impl(value: &OwnedValue, opts: &JsonFormatOpts, level: usize) -> 
             }
         }
         OwnedValue::NumberLiteral(_, literal) => {
-            if value
-                .as_f64()
-                .is_some_and(|f| f.is_nan() || f.is_infinite())
-            {
-                "null".to_string() // JSON doesn't support NaN or Infinity
+            if value.as_f64().is_some_and(f64::is_nan) {
+                "null".to_string() // JSON doesn't support NaN
             } else if opts.control_escape == ControlEscape::Yq {
                 // yq mode: echo the source spelling verbatim (#1008) --
                 // matches the Float arm's own yq/jq split above, and real
-                // yq's documented byte-for-byte literal preservation. jq
-                // mode keeps `format_number_jq_compat`'s reformatting
-                // unchanged. This PR fixed its `-0.0`-sign-loss bug (also
-                // #1008, since widening `is_preservable_float_literal`
-                // newly exposed it via YAML), but it has other pre-existing
-                // divergences from real jq, unrelated and left alone here,
-                // e.g. `0.1e1` -> `1E+0` here vs real jq's `1`.
+                // yq's documented byte-for-byte literal preservation,
+                // regardless of finiteness (confirmed live: a genuine
+                // document `1e999` literal echoes verbatim in real yq too).
+                // jq mode keeps `format_number_jq_compat`'s reformatting
+                // unchanged, which itself already reformats a non-finite
+                // literal's mantissa correctly (#1083/#1087) rather than
+                // assuming finiteness. This PR fixed its `-0.0`-sign-loss
+                // bug (also #1008, since widening
+                // `is_preservable_float_literal` newly exposed it via
+                // YAML), but it has other pre-existing divergences from
+                // real jq, unrelated and left alone here, e.g. `0.1e1` ->
+                // `1E+0` here vs real jq's `1`.
                 literal.to_string()
             } else {
                 format_number_jq_compat(literal.as_bytes())
@@ -1109,7 +1130,12 @@ mod tests {
     }
 
     #[test]
-    fn test_format_json_non_finite_floats_are_null() {
+    fn test_format_json_non_finite_floats_1087() {
+        // NaN has no fallback text and stays "null" in jq mode; a computed
+        // Infinity (no source literal) renders jq's own DBL_MAX text
+        // instead, matching #1087's fix to `value.rs`'s `to_json` and
+        // `jq_runner.rs`'s CLI formatters -- this is the third formatter
+        // that needed the identical split.
         let opts = JsonFormatOpts {
             indent: "",
             sort_keys: false,
@@ -1120,14 +1146,33 @@ mod tests {
         assert_eq!(format_json(&OwnedValue::Float(f64::NAN), &opts), "null");
         assert_eq!(
             format_json(&OwnedValue::Float(f64::INFINITY), &opts),
+            "1.7976931348623157e+308"
+        );
+        assert_eq!(
+            format_json(&OwnedValue::Float(f64::NEG_INFINITY), &opts),
+            "-1.7976931348623157e+308"
+        );
+
+        // yq mode is deliberately left unchanged (#1087's own open design
+        // question -- real yq's Go encoding/json errors on Infinity rather
+        // than substituting anything).
+        let yq_opts = JsonFormatOpts {
+            control_escape: ControlEscape::Yq,
+            ..opts
+        };
+        assert_eq!(
+            format_json(&OwnedValue::Float(f64::INFINITY), &yq_opts),
             "null"
         );
     }
 
     #[test]
-    fn test_format_json_non_finite_number_literal_is_null() {
+    fn test_format_json_non_finite_number_literal_1087() {
         // A `NumberLiteral` whose source text overflows f64 to infinity
-        // (`1e400`) must be treated the same as a plain non-finite Float.
+        // (`1e400`) still has its own text to fall back to -- jq mode
+        // echoes the mantissa-preserving reformat (`format_number_jq_compat`
+        // already handles this correctly), not `DBL_MAX` text or "null" --
+        // confirmed live against jq 1.7.1, `1e400 | .` echoes `1E+400`.
         let opts = JsonFormatOpts {
             indent: "",
             sort_keys: false,
@@ -1139,7 +1184,21 @@ mod tests {
             succinctly::jq::NumberRepr::Float(f64::INFINITY),
             "1e400".into(),
         );
-        assert_eq!(format_json(&overflowed, &opts), "null");
+        assert_eq!(format_json(&overflowed, &opts), "1E+400");
+
+        // yq mode echoes the literal verbatim regardless of finiteness
+        // (#1008's byte-for-byte preservation convention) -- confirmed live
+        // against real yq.
+        let yq_opts = JsonFormatOpts {
+            control_escape: ControlEscape::Yq,
+            ..opts
+        };
+        assert_eq!(format_json(&overflowed, &yq_opts), "1e400");
+
+        // NaN still has no fallback text in either mode.
+        let nan_lit =
+            OwnedValue::NumberLiteral(succinctly::jq::NumberRepr::Float(f64::NAN), "nan".into());
+        assert_eq!(format_json(&nan_lit, &opts), "null");
     }
 
     #[test]
