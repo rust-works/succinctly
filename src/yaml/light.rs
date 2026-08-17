@@ -1713,36 +1713,22 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                                 true,
                             )?;
                             write_line_comment(out, value.line_comment_raw())?;
-                        } else if is_deferred_value_absent(&value)
-                            && field.key_cursor().line_comment_raw().is_some()
-                        {
-                            // The deferred value materialized as nothing
-                            // at all - the key's own comment stands
-                            // alone with no value token, matching real
-                            // yq (#765). The value can still carry an
-                            // anchor/tag though (an explicit key's own
-                            // comment, `? k # c\n: &anc`), which must be
-                            // written before the key's comment (#1113) --
-                            // `write_deferred_value` is a no-op beyond
-                            // that since the value is absent.
-                            write_deferred_value(
-                                out,
-                                &value,
-                                indent,
-                                indent_spaces,
-                                unit,
-                                sort_keys,
-                            )?;
-                            write_line_comment(out, field.key_cursor().line_comment_raw())?;
                         } else {
                             // #1077: a deferred value that materializes as
-                            // nothing at all writes no value token here
-                            // (matching the sibling branch above, #765) --
-                            // but unlike that branch, this one can still
-                            // have an anchor/tag to write, so it can't just
-                            // skip straight to the comment. See
-                            // `write_deferred_value`'s own doc comment for
-                            // the byte-for-byte spacing rule.
+                            // nothing at all writes no value token here,
+                            // but can still have an anchor/tag to write, so
+                            // it can't just skip straight to the comment.
+                            // See `write_deferred_value`'s own doc comment
+                            // for the byte-for-byte spacing rule. This
+                            // covers the explicit-key-comment-with-absent-
+                            // value shape too (`? k # c\n: &anc`, #1113) --
+                            // an earlier, narrower special case for that
+                            // shape (added by #765) wrote the key's comment
+                            // without ever consulting the value's own
+                            // anchor/tag; once #1077 taught this general
+                            // path about anchors/tags, the special case
+                            // became redundant with it (verified: deleting
+                            // it changes no test outcome) and was removed.
                             write_deferred_value(
                                 out,
                                 &value,

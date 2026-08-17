@@ -9740,13 +9740,16 @@ fn test_implicit_key_same_line_value_comment_unaffected_by_795_fallback_dom_path
 // value (#1113)
 // ============================================================================
 //
-// #765/#795's own "key comment stands alone" branch (immediately above)
-// never consulted the deferred value's anchor/tag before returning -- fine
-// for the plain case (nothing to lose), but silently dropped an anchor or
-// tag when the explicit key's comment coincided with one. Any `*alias`
-// elsewhere in the document referencing that anchor now resolves to
-// nothing. #1077 already fixed the sibling (no key-comment) branch for the
-// exact same shape; these are the explicit-key-comment counterpart.
+// #765/#795 added a narrow "key comment stands alone" branch for this
+// shape that never consulted the deferred value's anchor/tag before
+// returning -- fine for the plain case (nothing to lose), but silently
+// dropped an anchor or tag when the explicit key's comment coincided with
+// one. Any `*alias` elsewhere in the document referencing that anchor now
+// resolves to nothing. #1077 already taught the general (no-key-comment)
+// deferred-value branch about anchors/tags for the identical shape; once
+// it had, the narrower #765 branch was redundant with it and was deleted
+// rather than patched -- these tests exercise the general branch handling
+// the explicit-key-comment case on its own.
 
 /// The issue's own repro: an explicit key's comment, paired with a deferred
 /// value that resolves absent but carries an anchor -- the anchor must
