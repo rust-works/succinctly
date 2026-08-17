@@ -3531,6 +3531,61 @@ fn test_pow_propagates_halt_in_argument() -> Result<()> {
 }
 
 #[test]
+fn test_range_bare_break_reaches_outer_label_833() -> Result<()> {
+    // Sibling fix to #833: `range_arg` had the same missing-`Break`-arm
+    // shape as `result_to_owned`/`eval_owned_expr` (found auditing for
+    // #833's own sibling helpers), falling into the generic "Range bounds
+    // must be numeric" wildcard instead of propagating. Matches real jq
+    // 1.7.1: `jq -n 'label $out | [range(break $out; 5)]'` exits 0 with no
+    // output.
+    let (stdout, stderr, code) = run_jq_full(&["-n", "label $out | [range(break $out; 5)]"], None)?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
+#[test]
+fn test_pow_base_bare_break_reaches_outer_label_833() -> Result<()> {
+    // Sibling fix to #833: `get_number_from_result`/`NumberError` had the
+    // same missing-`Break`-variant shape, shared by `pow`'s base and
+    // exponent arguments and `atan2`'s y/x arguments. Matches real jq
+    // 1.7.1: `jq -n 'label $out | pow(break $out; 2)'` exits 0, no output.
+    let (stdout, stderr, code) = run_jq_full(&["-n", "label $out | pow(break $out; 2)"], None)?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
+#[test]
+fn test_pow_exp_bare_break_reaches_outer_label_833() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-n", "label $out | pow(2; break $out)"], None)?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
+#[test]
+fn test_atan2_y_bare_break_reaches_outer_label_833() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-n", "label $out | atan2(break $out; 1)"], None)?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
+#[test]
+fn test_atan2_x_bare_break_reaches_outer_label_833() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-n", "label $out | atan2(1; break $out)"], None)?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
+#[test]
 fn test_repeat_propagates_halt_instead_of_running_to_iteration_cap() -> Result<()> {
     // A halt was already threaded correctly even before #855 (`eval_repeat`
     // now uses `eval_owned_expr_fork`, not `eval_owned_expr_ctrl`, but both

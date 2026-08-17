@@ -1362,15 +1362,28 @@ fn result_to_owned<W: Clone + AsRef<[u64]>>(
         // an argument stream that produced values and *then* halted must
         // halt, not quietly compute with the first value (#791).
         QueryResult::Partial(_, Control::Halt(code)) => Err(EvalEscape::Halt(code)),
+        // A trailing `Break`/`Error` here is a separate, harder gap #833
+        // does NOT fix: real jq would still abort after this point (e.g.
+        // `ltrimstr(("a", break $out))` prints one result then unwinds to
+        // `$out`, never running whatever follows), but this function's
+        // whole contract is collapsing a generator argument to one scalar
+        // `Result` -- it cannot represent "here is a value, AND ALSO an
+        // escape for afterward" the way `QueryResult::Partial` itself can.
+        // Fixing this properly means making every caller `Partial`-aware
+        // (so it can emit its own transformed value *and* propagate the
+        // trailing escape), not something `result_to_owned` can do alone;
+        // tracked as #1164 rather than folded into this fix.
         QueryResult::Partial(vs, _control) => Ok(vs.into_iter().next().unwrap()),
         QueryResult::None => Err(EvalError::new("no value").into()),
         QueryResult::Error(e) => Err(e.into()),
-        // `break $label` escaping a builtin's argument expression now
-        // propagates losslessly instead of collapsing into a synthetic
-        // "not in label" error (#833) -- every caller either forwards the
-        // `EvalEscape` verbatim via `?`/`Err(e) => return e.into()`, or
-        // (a handful of sites) has its own dedicated arm, so the real
-        // label can unwind past the builtin call to an outer `label`.
+        // A *bare* (no prior output) `break $label` escaping a builtin's
+        // argument expression now propagates instead of collapsing into a
+        // synthetic "not in label" error (#833) -- every caller either
+        // forwards the `EvalEscape` verbatim via `?`/`Err(e) =>
+        // return e.into()`, or (a handful of sites) has its own dedicated
+        // arm, so the real label can unwind past the builtin call to an
+        // outer `label`. Doesn't cover the `Partial` case above, whose own
+        // comment explains why that's a separate, harder fix.
         QueryResult::Break(label) => Err(EvalEscape::Break(label)),
         // An operand-context halt (`1 + halt`) travels as its own
         // `EvalEscape` variant, so no consumer can mistake it for a
@@ -14998,7 +15011,10 @@ fn eval_owned_expr_ctrl<S: EvalSemantics>(
         // Same collapse-to-single-or-array policy as `Many`/`ManyOwned`
         // above; the trailing `Error`/`Break` is dropped, consistent with how
         // this function already doesn't fork over a multi-output update (a
-        // separate, pre-existing limitation, not #400/#494's concern).
+        // separate, pre-existing limitation, not #400/#494's concern) -- and,
+        // as of #833, still not this function's concern either: see
+        // `result_to_owned`'s identical arm for why a trailing escape after
+        // already-produced output needs its own, separate fix.
         QueryResult::Partial(vs, _control) => {
             if vs.len() == 1 {
                 Ok(vs.into_iter().next().unwrap())
@@ -15017,11 +15033,14 @@ fn eval_owned_expr<S: EvalSemantics>(
 ) -> Result<OwnedValue, EvalEscape> {
     eval_owned_expr_ctrl::<S>(expr, input, optional).map_err(|control| match control {
         Control::Error(e) => e.into(),
-        // Propagated losslessly rather than collapsed into a synthetic
-        // "not in label" error (#833) -- see `result_to_owned`'s identical
-        // fix just above for the full rationale; every caller here forwards
-        // the `EvalEscape` verbatim except `builtin_envvar`, which has its
-        // own dedicated arm mirroring the `Halt` one below.
+        // A *bare* break (no prior output from the argument) now propagates
+        // instead of being collapsed into a synthetic "not in label" error
+        // (#833) -- see `result_to_owned`'s identical fix just above for
+        // the full rationale, including why the `Partial` case in
+        // `eval_owned_expr_ctrl` above is a separate, still-open gap; every
+        // caller here forwards the `EvalEscape` verbatim except
+        // `builtin_envvar`, which has its own dedicated arm mirroring the
+        // `Halt` one below.
         Control::Break(label) => EvalEscape::Break(label),
         // A halt reached here (e.g. inside `reduce`/`foreach`'s INIT/UPDATE
         // via a caller that uses `eval_owned_expr` rather than
@@ -15773,6 +15792,14 @@ fn range_arg<W: Clone + AsRef<[u64]>>(result: QueryResult<'_, W>) -> Result<Rang
         // "caught"` swallow the halt entirely (#791).
         QueryResult::Halt(code) => Err(EvalEscape::Halt(code)),
         QueryResult::Partial(_, Control::Halt(code)) => Err(EvalEscape::Halt(code)),
+        // Same reasoning as `result_to_owned`'s identical arm (#833): a bare
+        // unmatched `break` in a range bound must keep unwinding toward its
+        // label, not be misreported as "Range bounds must be numeric".
+        // Doesn't extend to `Partial(_, Control::Break(_))` (a bound
+        // expression that produced a value before breaking) -- see
+        // `result_to_owned`'s own comment for why that shape needs its own,
+        // separate fix (#1164).
+        QueryResult::Break(label) => Err(EvalEscape::Break(label)),
         _ => Err(EvalError::new("Range bounds must be numeric").into()),
     }
 }
@@ -17316,13 +17343,17 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
         // `break` is a control signal, not a value -- `rest` (anything
         // structurally following it once a flattened pipe is split at
         // `exprs.split_first()`) never runs; the `Label` arm above is what
-        // catches this. Without this arm, `Expr::Break` fell into the
-        // generic fallback below, which unconditionally converts any
-        // `Control::Break` into a synthetic "break $label not in label"
+        // catches this. Before #833, without this arm `Expr::Break` fell
+        // into the generic fallback below, which unconditionally converted
+        // any `Control::Break` into a synthetic "break $label not in label"
         // `EvalError` (`eval_owned_expr`, above) -- wrongly reporting a
         // label miss even when a real enclosing `label` was present, just
         // not visible to that fallback's single-expression evaluation
-        // (#715 follow-up).
+        // (#715 follow-up). `eval_owned_expr` now propagates a bare break
+        // correctly too, but this dedicated arm is kept rather than
+        // re-verified as redundant -- a direct `QueryResult::Break` here is
+        // clearer than routing through the generic fallback's `Ok`/`Err`
+        // dance regardless.
         Expr::Break(name) => QueryResult::Break(name.clone()),
         _ => {
             // For other expressions, evaluate normally and continue
@@ -17850,11 +17881,10 @@ fn builtin_paths_filter<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // produced, not just be missed. Nothing has been credited to
     // `filtered_paths` yet at this point, so any escape here is a bare
     // `Error`/`Break`/`Halt`, never a `Partial`. Uses `eval_owned_expr_ctrl`
-    // rather than its `eval_owned_expr` twin specifically for the `break`
-    // case: the latter collapses `Control::Break` into a synthetic "not in
-    // label" `EvalError` (see #833), which would make `label $out |
-    // [paths(break $out)]` on a scalar report a bogus error instead of
-    // unwinding to `$out`. Confirmed against jq 1.7.1: `{"a":1} |
+    // rather than its `eval_owned_expr` twin because this call site needs a
+    // `Control`-typed error to pass straight to `partial(...)` below --
+    // `eval_owned_expr` now propagates a bare `break` correctly too (#833),
+    // but still returns `EvalEscape`, not `Control`. Confirmed against jq 1.7.1: `{"a":1} |
     // paths(if type=="object" then error("x") else true end)` raises
     // immediately with no output (not `["a"]`), and `label $out |
     // [paths(break $out)]` on `1` produces no output and exits 0.
@@ -17910,12 +17940,15 @@ fn builtin_paths_filter<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 // error("bad") else true end)` streams `[0]` then raises,
                 // never reaching index 2. `break $label` also now correctly
                 // unwinds to a `label` lexically enclosing the whole
-                // `paths(...)` call: unlike `result_to_owned`/`eval_owned_expr`
-                // (the helpers #833 is about), `eval_owned_input` never
-                // collapses `Control::Break` into a "not in label" error --
-                // `push_truthiness` already threads it through intact, so
-                // once this loop stops swallowing it, propagation just
-                // works. Confirmed: `label $out | paths(if type=="string"
+                // `paths(...)` call: `eval_owned_input` never collapses
+                // `Control::Break` into a "not in label" error -- unlike
+                // `result_to_owned`/`eval_owned_expr` for their own
+                // still-open `Partial` case (#833's follow-up), this path
+                // has no such gap, since `push_truthiness` already threads
+                // a trailing `Break` through intact regardless of how many
+                // truthy outputs preceded it, so once this loop stops
+                // swallowing it, propagation just works. Confirmed: `label
+                // $out | paths(if type=="string"
                 // then break $out else true end)` on `[1,"x",2]` now matches
                 // real jq exactly (streams `[0]`, exit 0), including when
                 // the matching node is nested. This does not extend to
@@ -22191,6 +22224,13 @@ enum NumberError {
     /// — that would make `pow(halt_error(3); 2)` a catchable type error
     /// instead of a halt.
     Halt(i32),
+    /// A bare unmatched `break` reached while evaluating the argument
+    /// (#833): must keep unwinding toward its label, never be downgraded
+    /// to `Error`'s "expected number" — same reasoning as `Halt` above.
+    /// Doesn't cover `Partial(_, Control::Break(_))` (an argument that
+    /// produced a value before breaking); see `result_to_owned`'s own
+    /// comment for why that shape is a separate, harder fix.
+    Break(String),
 }
 
 /// Helper to get number from eval result
@@ -22221,6 +22261,7 @@ fn get_number_from_result<W: Clone + AsRef<[u64]>>(
         QueryResult::Error(e) => Err(NumberError::Error(e)),
         QueryResult::Halt(code) => Err(NumberError::Halt(code)),
         QueryResult::Partial(_, Control::Halt(code)) => Err(NumberError::Halt(code)),
+        QueryResult::Break(label) => Err(NumberError::Break(label)),
         _ if optional => Err(NumberError::None),
         _ => Err(NumberError::Error(EvalError::new("expected number"))),
     }
@@ -22241,6 +22282,7 @@ fn builtin_pow<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Err(NumberError::None) => return QueryResult::None,
         Err(NumberError::Halt(code)) => return QueryResult::Halt(code),
         Err(NumberError::Error(e)) => return QueryResult::Error(e),
+        Err(NumberError::Break(label)) => return QueryResult::Break(label),
     };
 
     let exp = match get_number_from_result(eval_single::<W, S>(exp_expr, value, optional), optional)
@@ -22249,6 +22291,7 @@ fn builtin_pow<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Err(NumberError::None) => return QueryResult::None,
         Err(NumberError::Halt(code)) => return QueryResult::Halt(code),
         Err(NumberError::Error(e)) => return QueryResult::Error(e),
+        Err(NumberError::Break(label)) => return QueryResult::Break(label),
     };
 
     QueryResult::Owned(OwnedValue::Float(libm::pow(base, exp)))
@@ -22337,6 +22380,7 @@ fn builtin_atan2<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Err(NumberError::None) => return QueryResult::None,
         Err(NumberError::Halt(code)) => return QueryResult::Halt(code),
         Err(NumberError::Error(e)) => return QueryResult::Error(e),
+        Err(NumberError::Break(label)) => return QueryResult::Break(label),
     };
 
     let x = match get_number_from_result(eval_single::<W, S>(x_expr, value, optional), optional) {
@@ -22344,6 +22388,7 @@ fn builtin_atan2<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Err(NumberError::None) => return QueryResult::None,
         Err(NumberError::Halt(code)) => return QueryResult::Halt(code),
         Err(NumberError::Error(e)) => return QueryResult::Error(e),
+        Err(NumberError::Break(label)) => return QueryResult::Break(label),
     };
 
     QueryResult::Owned(OwnedValue::Float(libm::atan2(y, x)))
@@ -22689,13 +22734,15 @@ fn builtin_envvar<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let var_name = match var_result {
         Ok(OwnedValue::String(s)) => s,
         // Checked ahead of the generic fallback below (which would
-        // otherwise flatten it into a misleading "must be a string"
+        // otherwise flatten either into a misleading "must be a string"
         // message and, when `optional`, silently swallow it): a halt must
         // never be silently downgraded (#791), and likewise a break must
         // reach its label rather than being downgraded into a bogus type
-        // error or swallowed by `optional` (#833).
-        Err(EvalEscape::Halt(code)) => return QueryResult::Halt(code),
-        Err(EvalEscape::Break(label)) => return QueryResult::Break(label),
+        // error or swallowed by `optional` (#833). One OR-pattern arm
+        // (matching this file's own precedent, e.g. `QueryResult::is_error`
+        // and `builtin_isvalid`'s `Halt`/`Break` arms) rather than two,
+        // since both escapes get identical treatment here.
+        Err(escape @ (EvalEscape::Halt(_) | EvalEscape::Break(_))) => return escape.into(),
         _ if optional => return QueryResult::None,
         _ => return QueryResult::Error(EvalError::new("env variable name must be a string")),
     };

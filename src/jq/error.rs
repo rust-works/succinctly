@@ -81,19 +81,23 @@ pub enum Control {
 /// a synthetic `EvalError::new("break $label not in label")` — correct only
 /// when nothing outside actually catches it, and wrong (loud, wrongly-worded,
 /// wrongly-exit-coded) whenever a matching `label` sits further out, e.g.
-/// across a `path(...)` call boundary. Not every caller of this type has been
-/// audited to propagate `Break` correctly yet — `result_to_owned` and
-/// `eval_owned_expr` still collapse it into that same synthetic error by
-/// design, matching this type's `eval_owned_expr_ctrl`/`eval_owned_expr`
-/// split (#575's precedent: a `_ctrl`-suffixed twin that preserves
-/// [`Control`] losslessly exists at the few call sites that have been made to
-/// need it). Only `eval_owned_multi`/`eval_owned_multi_first` and
-/// `resolve_node`'s own arms (in `eval.rs`) have been updated to propagate a
-/// real `Break` so far, which is what `path()`, and the computed-key path
-/// this type also drives for `=`/`|=`/`del()`, needed. Auditing every
-/// `result_to_owned`/`eval_owned_expr` call site for the same fix is tracked
-/// separately (#833) — it is used far more broadly than path-context
-/// resolution, so it needs its own review rather than riding along here.
+/// across a `path(...)` call boundary. `eval_owned_multi`/
+/// `eval_owned_multi_first` and `resolve_node`'s own arms (in `eval.rs`)
+/// were the first to propagate a real `Break`, for `path()` and the
+/// computed-key path this type also drives for `=`/`|=`/`del()`. `#833`
+/// closed the far broader remaining gap: `result_to_owned` and
+/// `eval_owned_expr` (used by dozens of builtins' argument evaluation, not
+/// just path context) now propagate a *bare* unmatched `Break` too, matching
+/// this type's `eval_owned_expr_ctrl`/`eval_owned_expr` split (#575's
+/// precedent: a `_ctrl`-suffixed twin that preserves [`Control`] losslessly
+/// exists at the few call sites that need it). One shape is still open,
+/// though: when the argument generator produces one or more values *before*
+/// breaking/erroring (`QueryResult::Partial`), `result_to_owned` and
+/// `eval_owned_expr_ctrl` both still silently take the first value and drop
+/// the trailing escape — tracked as #1164, since fixing it means every
+/// caller becoming `Partial`-aware itself, not something these two
+/// functions can solve alone; see their own `Partial(vs, _control)` arms in
+/// `eval.rs` for the full rationale.
 ///
 /// Consumers should write `Err(EvalEscape::Error(e))` for the catchable case
 /// and let everything else flow through the `From` conversions into
@@ -105,10 +109,11 @@ pub enum EvalEscape {
     /// A genuine evaluation error — catchable by `try`/`catch`, suppressible
     /// by `?`.
     Error(EvalError),
-    /// `break $label`, still looking for a `label $label` to catch it (#824).
-    /// Every consumer that has not been specifically updated to propagate
-    /// this should keep converting it to a synthetic "break $label not in
-    /// label" `Error` — see this type's own doc comment.
+    /// `break $label`, still looking for a `label $label` to catch it (#824,
+    /// #833). A consumer that has not been specifically updated to
+    /// propagate this converts it to a synthetic "break $label not in
+    /// label" `Error` instead — see this type's own doc comment for which
+    /// consumers still do that.
     Break(String),
     /// `halt`/`halt_error(n)`: exit the whole process with this code. Must
     /// reach the CLI unconditionally; never catchable, never suppressible.
