@@ -5629,8 +5629,16 @@ fn format_urid<S: EvalSemantics>(value: &OwnedValue, optional: bool) -> Result<S
         _ => return Err(EvalError::type_error("string", value.type_name())),
     };
 
-    let mut result = String::new();
     let bytes = s.as_bytes();
+    // Byte buffer, not `String` -- a decoded/pass-through byte is a UTF-8
+    // *sequence* member, not its own standalone codepoint; pushing each
+    // byte individually via `as char` (the pre-#1123 approach) mis-encoded
+    // any byte >= 0x80 as its own Latin-1 codepoint, corrupting every
+    // multi-byte character it touched (`"café" | @urid` produced
+    // `"cafÃ©"` even with zero `%` escapes present). Converting once at
+    // the end lets multi-byte sequences -- whether copied through
+    // verbatim or reassembled from `%XX` escapes -- round-trip intact.
+    let mut result = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'%' && i + 2 < bytes.len() {
@@ -5640,16 +5648,16 @@ fn format_urid<S: EvalSemantics>(value: &OwnedValue, optional: bool) -> Result<S
                 (bytes[i + 2] as char).to_digit(16),
             ) {
                 let decoded = (h1 * 16 + h2) as u8;
-                result.push(decoded as char);
+                result.push(decoded);
                 i += 3;
                 continue;
             }
         }
-        // Not a valid percent-encoded sequence, just copy the character
-        result.push(bytes[i] as char);
+        // Not a valid percent-encoded sequence, just copy the byte
+        result.push(bytes[i]);
         i += 1;
     }
-    Ok(result)
+    Ok(String::from_utf8_lossy(&result).into_owned())
 }
 
 /// Quote a CSV/DSV string field: wrap in `"..."`, doubling inner `"`.
@@ -5841,7 +5849,11 @@ fn format_base64d<S: EvalSemantics>(
         }
     }
 
-    let stripped = s.replace(|c: char| c.is_whitespace(), "");
+    // ASCII whitespace only -- `char::is_whitespace()` also strips
+    // non-ASCII Unicode whitespace (U+00A0, U+2028, U+3000, ...), which
+    // real yq treats as invalid base64 input ("illegal base64 data at
+    // input byte N") rather than silently discarding (#1123).
+    let stripped = s.replace(|c: char| c.is_ascii_whitespace(), "");
 
     // Real jq truncates at the *first* `=` in the (whitespace-
     // stripped) input, discarding it and everything after it --

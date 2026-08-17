@@ -13237,3 +13237,69 @@ fn base64_decode_lossy(s: &str) -> String {
     }
     String::from_utf8_lossy(&result).into_owned()
 }
+
+// ============================================================================
+// @urid / @base64d Unicode correctness (#1123)
+// ============================================================================
+//
+// Two decode-loop bugs found reviewing #1109: `format_urid` pushed each
+// output byte via `bytes[i] as char`, mis-encoding any byte >= 0x80 as its
+// own Latin-1 codepoint instead of a UTF-8 sequence member; `format_base64d`
+// stripped input whitespace via `char::is_whitespace()`, which also strips
+// non-ASCII Unicode whitespace real yq treats as invalid base64 input.
+
+/// The issue's own repro: a non-ASCII string with zero `%` escapes must
+/// round-trip unchanged, not get mangled into mojibake.
+#[test]
+fn test_urid_passthrough_preserves_multibyte_utf8_1123() -> Result<()> {
+    let (out, code) = run_yq_stdin("@urid", "\"café\"\n", &["-o", "json"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "\"café\"");
+    Ok(())
+}
+
+/// A percent-decoded multi-byte UTF-8 sequence must reassemble correctly,
+/// not just pass through correctly.
+#[test]
+fn test_urid_percent_decode_reassembles_multibyte_utf8_1123() -> Result<()> {
+    let (out, code) = run_yq_stdin("@urid", "\"caf%C3%A9\"\n", &["-o", "json"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "\"café\"");
+    Ok(())
+}
+
+/// Mixed ASCII percent-escapes and pass-through bytes around a multi-byte
+/// sequence, to guard against a fix that only handles the all-non-ASCII or
+/// all-escaped case.
+#[test]
+fn test_urid_mixed_ascii_escape_and_multibyte_passthrough_1123() -> Result<()> {
+    let (out, code) = run_yq_stdin("@urid", "\"h%C3%A9llo world\"\n", &["-o", "json"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "\"héllo world\"");
+    Ok(())
+}
+
+/// A base64 payload with an injected non-ASCII Unicode whitespace character
+/// (U+00A0, non-breaking space) must be rejected as invalid, not silently
+/// stripped and decoded.
+#[test]
+fn test_base64d_rejects_non_ascii_whitespace_1123() -> Result<()> {
+    let input = "\"aGVs\u{a0}bG8=\"\n";
+    let (out, code) = run_yq_stdin("@base64d", input, &["-o", "json"])?;
+    assert_ne!(code, 0, "out: {out:?}");
+    Ok(())
+}
+
+/// Regression guard: ordinary ASCII whitespace (space, newline) embedded in
+/// a base64 payload must still be stripped, matching pre-#1123 behavior.
+#[test]
+fn test_base64d_still_strips_ascii_whitespace_1123() -> Result<()> {
+    let (out, code) = run_yq_stdin("@base64d", "\"aGVs bG8=\"\n", &["-o", "json"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "\"hello\"");
+
+    let (out, code) = run_yq_stdin("@base64d", "\"aGVs\nbG8=\"\n", &["-o", "json"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "\"hello\"");
+    Ok(())
+}
