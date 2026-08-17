@@ -12887,6 +12887,35 @@ fn test_slice_alternative_assign_scalar_is_noop_1101() -> Result<()> {
     Ok(())
 }
 
+/// `del()` with 2+ resolved paths (a comma of bare slices) must also
+/// no-op -- confirmed live against real yq. `builtin_del` forks into a
+/// separate multi-path deletion walker that has no per-path equivalent of
+/// the single-path check, so this needs its own upfront guard (see the
+/// comment above the `paths.len() <= 1` branch in `builtin_del`).
+#[test]
+fn test_slice_del_multi_path_number_scalar_is_noop_1101() -> Result<()> {
+    let (out, code) = run_yq_stdin("del(.[0:1], .[2:3])", "5", &["-o", "json"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "5");
+    Ok(())
+}
+
+/// A parenthesized bare slice (`(.[0:1])`) must reach the same no-op as
+/// the un-parenthesized form -- `Expr::Paren` does survive parsing (unlike
+/// an earlier version of `is_yq_scalar_slice_assign_path`'s doc comment
+/// incorrectly claimed) and needs its own unwrap arm.
+#[test]
+fn test_slice_assign_scalar_noop_with_parens_1101() -> Result<()> {
+    let (out, code) = run_yq_stdin("(.[0:1]) = 99", "5", &["-o", "json"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "5");
+
+    let (out, code) = run_yq_stdin("del((.[0:1]))", "5", &["-o", "json"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "5");
+    Ok(())
+}
+
 /// `-=`/`*=` are NOT no-ops on a scalar slice target -- real yq errors on
 /// both (with odd, unreplicated messages); succinctly's own pre-existing
 /// error is left unchanged rather than matched to that wording.

@@ -9903,65 +9903,39 @@ pub(crate) fn is_yq_slice_empty_container_scalar(target: &OwnedValue) -> bool {
 
 /// Whether a *resolved* assignment-target path (a `paths`/`delete_at_path`
 /// entry, already past `resolve_dynamic_indexes`, not the raw `path_expr`
-/// the user wrote) is a bare slice — `.[S:E]`, or `.[S:E]?` (`resolve_
-/// dynamic_indexes` doesn't always strip an outer `Expr::Optional`, unlike
-/// `Expr::Paren`, which never survives parsing at all) — as opposed to
-/// `.foo[S:E]`, `.[S:E][]`, or any other chaining. Checking the *resolved*
-/// path rather than the original `path_expr` is what makes a computed-bound
-/// `.[$a:$b]` (`Expr::SliceExpr` pre-resolution) reach this the same way a
-/// literal `.[0:1]` (`Expr::Slice` from the start) does — both fold to the
-/// identical `Expr::Slice{start,end}` shape by the time `resolve_dynamic_
-/// indexes` is done, per its own `needs_path_prepass` gate.
+/// the user wrote) is a bare slice — `.[S:E]`, `.[S:E]?`, or `(.[S:E])` —
+/// as opposed to `.foo[S:E]`, `.[S:E][]`, or any other chaining. Checking
+/// the *resolved* path rather than the original `path_expr` is what makes
+/// a computed-bound `.[$a:$b]` (`Expr::SliceExpr` pre-resolution) reach
+/// this the same way a literal `.[0:1]` (`Expr::Slice` from the start)
+/// does — both fold to the identical `Expr::Slice{start,end}` shape by the
+/// time `resolve_dynamic_indexes` is done, per its own `needs_path_prepass`
+/// gate.
 ///
 /// Combine with [`is_yq_slice_empty_container_scalar`] against the *current*
 /// value at this point in the fold (not the original input — #1101's no-op
 /// is a per-path, per-fold-step decision, same granularity as `set_path`/
 /// `update_path`'s own error checks) to get the full #1101 condition: a bare
 /// slice targeting a scalar, the shape real yq's own slice-assignment
-/// machinery silently no-ops the *write* portion of (#1101).
+/// machinery silently no-ops the *write* portion of. The RHS/filter itself
+/// is still evaluated normally at every call site — only the final write is
+/// skipped, so `.[0:1] = error("boom")`/`halt`/`break` still propagate
+/// exactly as they would for any other assignment.
 ///
-/// **Premise correction, found while live-probing #1101 against real yq
-/// v4.53.3**: the no-op is *not* scalar-specific the way #1065's read-path
-/// rule is. `[1,2,3] | .[0:1] = [9]` and `"hi" | .[0:1] = "X"` are *also*
-/// silent no-ops in real yq — `.[S:E] = v` / `.[S:E] |= f` / `.[S:E] += v`
-/// never actually *writes* anywhere, for *any* target type. This looks like
-/// real yq's slice-assignment path resolution never being wired up at all,
-/// not a deliberate design choice. succinctly's own array/string
-/// slice-assignment already works correctly and is a genuinely useful
-/// feature beyond what real yq offers — matching the universal no-op
-/// exactly would mean *removing* that working feature to replicate what
-/// looks like a real-yq gap, not a real-yq rule worth porting. So this
-/// check is deliberately narrowed to the scalar case only (matching #1065's
-/// own scope), preserving succinctly's array/string slice-assignment
-/// untouched — a deliberate scope decision, not an oversight.
-///
-/// **Second correction, found via code review**: only the *write* is a
-/// no-op — the RHS/filter is still evaluated normally, with its own
-/// errors/`halt`/`break` propagating exactly as they would for any other
-/// assignment (`.[0:1] = error("boom")` genuinely errors in real yq; only
-/// a *successful* RHS value is silently discarded rather than written). An
-/// earlier version of this fix short-circuited *before* evaluating the RHS
-/// at all, based on a since-corrected misreading of `.[0:1] = (1/0)`
-/// appearing not to error — `1/0` doesn't actually raise a catchable error
-/// in real yq (it evaluates to `+Inf`, which only fails at JSON-output time
-/// for a value that was never written and thus never serialized), so that
-/// probe never actually tested whether RHS evaluation happens. Every call
-/// site now evaluates the RHS/filter through the ordinary machinery and
-/// only skips the final write.
-///
-/// Also confirmed asymmetric by operator: `=`/`|=`/`+=`/`del()` no-op, but
-/// `-=`/`*=` *error* instead (with odd, clearly Go-internal-leak messages
-/// like `strconv.ParseInt: parsing "": invalid syntax` — not a stable
-/// compatibility target, so not replicated). Callers gate this check to
-/// only `=`, `|=`, `+=` (`AssignOp::Add` specifically), and `del()`;
-/// `-=`/`*=` are deliberately left calling the unmodified, still-erroring
-/// path. `/=`, `%=`, `//=`, and `path(...)` aren't valid real-yq syntax at
-/// all (confirmed live — e.g. `'/' expects 2 args but there is 1`), so
-/// there is no oracle to match for those and no scope decision to make.
+/// Real yq's no-op is *not* scalar-specific the way #1065's read-path rule
+/// is (`[1,2,3] | .[0:1] = [9]` is *also* a silent no-op there — slice
+/// *writes* appear to never be wired up at all, for any target type), but
+/// this check stays deliberately scoped to scalars, preserving succinctly's
+/// own working array/string slice-assignment rather than removing it to
+/// replicate what looks like a real-yq gap. `=`/`|=`/`+=`/`del()` no-op;
+/// `-=`/`*=` *error* instead (confirmed live, with odd Go-internal-leak
+/// messages not worth replicating) — callers gate accordingly. `/=`, `%=`,
+/// `//=`, and `path(...)` aren't valid real-yq syntax at all, so there's no
+/// oracle to match for those.
 pub(crate) fn is_yq_scalar_slice_assign_path(path_expr: &Expr) -> bool {
     match path_expr {
         Expr::Slice { .. } => true,
-        Expr::Optional(inner) => is_yq_scalar_slice_assign_path(inner),
+        Expr::Optional(inner) | Expr::Paren(inner) => is_yq_scalar_slice_assign_path(inner),
         _ => false,
     }
 }
@@ -10396,6 +10370,22 @@ fn eval_update<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // `is_yq_scalar_slice_assign_path`'s doc comment for the full
         // rationale, including why this can't be a blanket check before
         // the filter runs at all.
+        //
+        // The throwaway clones `result` (the scalar itself), not `[]` —
+        // real yq's own discarded-write `.` binding is actually `[]` (`5 |
+        // .[0:1] += [1]` no-ops in real yq, consistent with `[] + [1]`
+        // succeeding there), but real yq's `+` *also* has an array-append
+        // semantic succinctly's `+` doesn't implement at all (`[] + 99`
+        // gives `[99]` in real yq, errors in succinctly — a real,
+        // pre-existing, unrelated gap, filed as #1119). Binding `.` to `[]`
+        // here without that append semantic would turn the common `5 |
+        // .[0:1] += 99` case from a working no-op into a fresh regression
+        // (`array ([]) and number (99) cannot be added`) to fix an
+        // obscure array-filter edge case (`|= keys`) instead — the wrong
+        // trade. Scalar cloning keeps `+= <number>`/`|= <number filter>`
+        // correct; `|=`/`+=` with a filter whose behavior differs between
+        // an array and the raw scalar (`keys`, `+= [1]`) remain wrong,
+        // tracked alongside #1119.
         if scalar_slice_noop
             && S::TAG == EvalTag::Yq
             && is_yq_scalar_slice_assign_path(path)
@@ -18450,6 +18440,25 @@ fn builtin_del<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Err((_, EvalEscape::Error(_))) if optional => return QueryResult::None,
         Err((_, escape)) => return escape.into(),
     };
+
+    // yq's slice-assignment no-op (#1101) — the `paths.len() <= 1` branch
+    // below already checks this per path, but `delete_expr_paths_at` (the
+    // `paths.len() > 1` branch after it) is a completely separate
+    // sibling-grouping walker that has no equivalent check at all, so a
+    // multi-path `del()` (e.g. `del(.[0:1], .[2:3])`, or any comma that
+    // resolves to 2+ paths) skipped the no-op entirely — confirmed live
+    // against real yq (a comma of bare scalar slices still no-ops there,
+    // same as the single-path case). Checked once, up front, for the
+    // common case where every resolved path individually qualifies —
+    // rather than teaching `delete_expr_paths_at`'s own sibling-comparison
+    // logic about it, which is complex, heavily-tested machinery this fix
+    // doesn't otherwise need to touch.
+    if S::TAG == EvalTag::Yq
+        && is_yq_slice_empty_container_scalar(&result)
+        && paths.iter().all(is_yq_scalar_slice_assign_path)
+    {
+        return QueryResult::Owned(result);
+    }
 
     // The overwhelmingly common case — no computed key at all, or one that
     // resolved to a single value — has no sibling that could shift under it,
