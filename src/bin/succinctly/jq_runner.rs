@@ -1138,10 +1138,18 @@ fn get_inputs(
                 Err(e) => return Ok(Err(e)),
             };
             // `parse_json_stream` (above) already validated this exact
-            // input successfully, so `find_json_values` should never
-            // disagree with it -- surfaced as an internal error rather
-            // than silently reusing a stale/wrong offset list if the two
-            // validators ever do diverge.
+            // input successfully via `serde_json`, which is strictly
+            // pickier than `find_json_values`'s own lenient heuristic
+            // scan (RFC 8259 plus #1094's leading-zero tolerance, vs.
+            // `find_json_values`'s RFC 8259 plus leading-zero *and*
+            // leading-dot tolerance, #1171) -- so `find_json_values`
+            // should never fail here in practice; unreachable through
+            // this crate's own public CLI surface, not exercised by a
+            // test for that reason (matching this codebase's established
+            // convention for exhaustive-but-dead defensive arms, e.g.
+            // #1064). Surfaced as an internal error rather than silently
+            // reusing a stale/wrong offset list if the two validators
+            // ever do diverge.
             let ends: Vec<usize> = match find_json_values(raw.as_bytes()) {
                 Ok(values) => values.into_iter().map(|(_, end)| end).collect(),
                 Err(offset) => {
