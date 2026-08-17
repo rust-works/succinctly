@@ -1595,12 +1595,12 @@ fn normalize_leading_zero_numbers(s: &str) -> String {
 
 /// Parse a JSON stream (multiple JSON values) from a string (`--slurpfile`).
 ///
-/// Still loses number-literal source fidelity the way `parse_json_value`
-/// did before #1058 -- `find_json_values` (below) already splits a
-/// multi-value buffer into byte spans for the main lazy-input path and
-/// `serde_json::Deserializer::byte_offset()` could delimit each value here
-/// the same way, but wiring that up is deliberately deferred to #1093 to
-/// keep #1058/#1095 scoped to `--argjson`/`--jsonargs`.
+/// Preserves number-literal source fidelity the same way `parse_json_value`
+/// does for `--argjson` (#1058, extended here to `--slurpfile`, #1093):
+/// `serde_json::Deserializer::byte_offset()` delimits each value's own
+/// span within the stream, the same way `find_json_values` (below) does
+/// for the main lazy-input path, and `json_bytes_to_owned_value`
+/// materializes the real result from that span.
 fn parse_json_stream(s: &str) -> Result<Vec<OwnedValue>> {
     let s = s.trim();
     if s.is_empty() {
@@ -1615,20 +1615,25 @@ fn parse_json_stream(s: &str) -> Result<Vec<OwnedValue>> {
     // fidelity-preserving semi-indexer (#1058's fix for `--argjson`,
     // extended here to `--slurpfile`, #1093). `byte_offset()` gives each
     // value's own end position after a successful `.next()`; its start is
-    // the first non-whitespace byte after the previous value's end.
+    // the first non-whitespace byte after the previous value's end -- JSON
+    // ASCII whitespace specifically (`is_ascii_whitespace`, matching
+    // `find_json_values`'s own convention below, not Rust's broader
+    // Unicode `char::is_whitespace`), since that's the same set
+    // `serde_json`'s own separator-skipping recognizes between stream
+    // values.
     let mut values = Vec::new();
     let mut deserializer = serde_json::Deserializer::from_str(s).into_iter::<serde_json::Value>();
     let mut prev_end = 0;
+    let bytes = s.as_bytes();
 
     while let Some(result) = deserializer.next() {
         result.context("Invalid JSON in stream")?;
         let end = deserializer.byte_offset();
-        let start = s[prev_end..end]
-            .find(|c: char| !c.is_whitespace())
+        let start = bytes[prev_end..end]
+            .iter()
+            .position(|b| !b.is_ascii_whitespace())
             .map_or(prev_end, |offset| prev_end + offset);
-        values.push(crate::output::json_bytes_to_owned_value(
-            &s.as_bytes()[start..end],
-        ));
+        values.push(crate::output::json_bytes_to_owned_value(&bytes[start..end]));
         prev_end = end;
     }
 
