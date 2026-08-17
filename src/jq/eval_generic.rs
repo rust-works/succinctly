@@ -818,19 +818,28 @@ fn into_lazy_items<V: DocumentValue>(
 
 /// Convert a StandardJson value to an OwnedValue.
 ///
+/// Named distinctly from the crate-wide, `DocumentValue`-generic [`to_owned`]
+/// above (#965): this one is JSON-cursor-specific, used only by this
+/// module's own `eval_on_owned`/`eval_single` fallback arm on a value it
+/// constructs internally (e.g. a `reduce`/`foreach` accumulator) -- not a
+/// general-purpose converter other modules should reach for. Before this
+/// rename it happened to share a name with an unrelated, now-deleted
+/// `yq_runner.rs` helper (#907), which was a real naming-confusion risk for
+/// anyone grepping the codebase, even though the two were never the same
+/// function and never collided at compile time (module-private on both
+/// sides).
+///
 /// Panics past [`MAX_NESTING_DEPTH`] levels of nesting (#1017) -- a third,
 /// independent copy of the cursor-to-`OwnedValue` conversion `to_owned`/
-/// `to_owned_cursor` already guard in this same file (#998); reached from
-/// `eval_on_owned`/`eval_single`'s fallback arm on a value this module
-/// constructs internally (e.g. a `reduce`/`foreach` accumulator), the same
-/// gap #998's own guards on the other two copies were added to close.
-fn standard_json_to_owned<W: Clone + AsRef<[u64]>>(
+/// `to_owned_cursor` already guard in this same file (#998), the same gap
+/// #998's own guards on the other two copies were added to close.
+fn owned_from_standard_json<W: Clone + AsRef<[u64]>>(
     value: &crate::json::light::StandardJson<'_, W>,
 ) -> OwnedValue {
-    standard_json_to_owned_at_depth(value, 0)
+    owned_from_standard_json_at_depth(value, 0)
 }
 
-fn standard_json_to_owned_at_depth<W: Clone + AsRef<[u64]>>(
+fn owned_from_standard_json_at_depth<W: Clone + AsRef<[u64]>>(
     value: &crate::json::light::StandardJson<'_, W>,
     depth: usize,
 ) -> OwnedValue {
@@ -845,7 +854,7 @@ fn standard_json_to_owned_at_depth<W: Clone + AsRef<[u64]>>(
         }
         StandardJson::Array(elements) => OwnedValue::Array(
             (*elements)
-                .map(|e| standard_json_to_owned_at_depth(&e, depth + 1))
+                .map(|e| owned_from_standard_json_at_depth(&e, depth + 1))
                 .collect(),
         ),
         StandardJson::Object(fields) => OwnedValue::Object(
@@ -855,7 +864,7 @@ fn standard_json_to_owned_at_depth<W: Clone + AsRef<[u64]>>(
                         StandardJson::String(s) => s.as_str().ok()?.to_string(),
                         _ => return None,
                     };
-                    let value = standard_json_to_owned_at_depth(&field.value(), depth + 1);
+                    let value = owned_from_standard_json_at_depth(&field.value(), depth + 1);
                     Some((key, value))
                 })
                 .collect(),
@@ -940,10 +949,10 @@ fn eval_on_owned<S: EvalSemantics, V: DocumentValue>(
     // own `Expr::Optional`/`eval_try`-style boundary, not by wrapping it a
     // second time here.
     match full_eval::<Vec<u64>, S>(expr, cursor) {
-        QueryResult::One(v) => GenericResult::Owned(standard_json_to_owned(&v)),
-        QueryResult::OneCursor(c) => GenericResult::Owned(standard_json_to_owned(&c.value())),
+        QueryResult::One(v) => GenericResult::Owned(owned_from_standard_json(&v)),
+        QueryResult::OneCursor(c) => GenericResult::Owned(owned_from_standard_json(&c.value())),
         QueryResult::Many(vs) => {
-            GenericResult::ManyOwned(vs.iter().map(standard_json_to_owned).collect())
+            GenericResult::ManyOwned(vs.iter().map(owned_from_standard_json).collect())
         }
         QueryResult::None => GenericResult::None,
         QueryResult::Error(e) => GenericResult::Error(e),
@@ -2646,13 +2655,13 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
             match full_eval::<Vec<u64>, S>(expr, cursor) {
                 QueryResult::One(v) => {
                     // Convert StandardJson back to OwnedValue
-                    GenericResult::Owned(standard_json_to_owned(&v))
+                    GenericResult::Owned(owned_from_standard_json(&v))
                 }
                 QueryResult::OneCursor(c) => {
-                    GenericResult::Owned(standard_json_to_owned(&c.value()))
+                    GenericResult::Owned(owned_from_standard_json(&c.value()))
                 }
                 QueryResult::Many(vs) => {
-                    GenericResult::ManyOwned(vs.iter().map(standard_json_to_owned).collect())
+                    GenericResult::ManyOwned(vs.iter().map(owned_from_standard_json).collect())
                 }
                 QueryResult::None => GenericResult::None,
                 QueryResult::Error(e) => GenericResult::Error(e),
@@ -9216,16 +9225,16 @@ mod tests {
         assert!(result.is_err(), "to_owned_cursor should panic at depth 256");
     }
 
-    /// #1017: `standard_json_to_owned` is a third, independent copy of the
+    /// #1017: `owned_from_standard_json` is a third, independent copy of the
     /// cursor-to-`OwnedValue` conversion `to_owned`/`to_owned_cursor` are
     /// already guarded above (#998) -- same limit, same construction, its
     /// own guard.
     #[test]
-    fn standard_json_to_owned_panics_past_nesting_depth_limit_1017() {
+    fn owned_from_standard_json_panics_past_nesting_depth_limit_1017() {
         let json = linear_nest(255);
         let index = JsonIndex::build(json.as_bytes());
         let cursor = index.root(json.as_bytes());
-        let owned = standard_json_to_owned(&cursor.value());
+        let owned = owned_from_standard_json(&cursor.value());
         assert!(matches!(owned, OwnedValue::Object(_)));
 
         let json = linear_nest(256);
@@ -9233,11 +9242,11 @@ mod tests {
         let cursor = index.root(json.as_bytes());
         let value = cursor.value();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            standard_json_to_owned(&value)
+            owned_from_standard_json(&value)
         }));
         assert!(
             result.is_err(),
-            "standard_json_to_owned should panic at depth 256"
+            "owned_from_standard_json should panic at depth 256"
         );
     }
 }
