@@ -25128,6 +25128,71 @@ mod tests {
         );
     }
 
+    /// #1056: unary minus on a non-literal operand used to lower to `(0 -
+    /// expr)`, whose IEEE-754 `0.0 - 0.0` silently loses the sign of a
+    /// zero-valued operand -- `(-1) * expr` preserves it instead, matching
+    /// the fix #1035 already applied to the filter-literal rewrite just
+    /// above this test. Confirmed live against jq 1.7.1.
+    #[test]
+    fn test_unary_minus_float_zero_preserves_sign_1056() {
+        query!(br#"{"a":0.0}"#, "-.a",
+            QueryResult::Owned(OwnedValue::Float(f)) => {
+                assert_eq!(f, 0.0);
+                assert!(f.is_sign_negative());
+            }
+        );
+
+        query!(br"null", "-(1.0-1.0)",
+            QueryResult::Owned(OwnedValue::Float(f)) => {
+                assert_eq!(f, 0.0);
+                assert!(f.is_sign_negative());
+            }
+        );
+
+        // Negating a positive-signed float zero still gives negative zero
+        // (not a no-op) -- same as real jq.
+        query!(br"null", "-(0.0)",
+            QueryResult::Owned(OwnedValue::Float(f)) => {
+                assert_eq!(f, 0.0);
+                assert!(f.is_sign_negative());
+            }
+        );
+
+        // Sanity: ordinary (non-zero) negation is unaffected by the
+        // Sub-to-Mul rewrite.
+        query!(br#"{"a":5.5}"#, "-.a",
+            QueryResult::Owned(OwnedValue::Float(f)) => {
+                assert_eq!(f, -5.5);
+            }
+        );
+        query!(br#"{"a":5}"#, "-.a",
+            QueryResult::Owned(OwnedValue::Int(n)) => {
+                assert_eq!(n, -5);
+            }
+        );
+    }
+
+    /// #1056 follow-up (filed as #1091, not fixed here): unlike real jq --
+    /// which has no separate integer type, so `1 - 1` is already the double
+    /// `0.0` internally -- succinctly's `Int`/`Float` split means an
+    /// all-integer computation that reduces to exactly zero stays
+    /// `OwnedValue::Int(0)`, which has no negative-zero representation to
+    /// preserve at all. `(-1) * 0` (this issue's own fix) can't help here:
+    /// `Int * Int` correctly stays `Int` for genuine multiplication, so
+    /// special-casing it would incorrectly reinterpret a literal `(-1) * 0`
+    /// a user actually wrote. A full fix needs a representation that's
+    /// unambiguously "this is a negation" (e.g. a dedicated unary AST
+    /// variant), not an arithmetic rewrite -- pinned here so a future
+    /// evaluator change can't silently "fix" this by accident without
+    /// updating the test (which would then need `is_sign_negative()`
+    /// added, matching the float cases above).
+    #[test]
+    fn test_unary_minus_integer_zero_still_loses_sign_1056_followup() {
+        query!(br"null", "-(1-1)",
+            QueryResult::Owned(OwnedValue::Int(0)) => {}
+        );
+    }
+
     #[test]
     fn test_comparison_eq() {
         query!(br#"{"a": 1, "b": 1}"#, ".a == .b",
