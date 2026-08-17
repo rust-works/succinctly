@@ -13286,15 +13286,71 @@ fn test_1119_compound_assign_plus_equals_appends() -> Result<()> {
     Ok(())
 }
 
-/// #1101/#1112's scalar-slice-assignment no-op still works after this fix
-/// (its throwaway clone binds `.` to the scalar itself, not `[]` — see
-/// `eval_update`'s doc comment — so this array-append change doesn't touch
-/// that path at all; regression guard).
+/// #1101/#1112's scalar-slice-assignment no-op still works after this fix.
+/// Regression guard for the common numeric case.
 #[test]
 fn test_1119_scalar_slice_assign_noop_still_works() -> Result<()> {
     let (output, code) = run_yq_stdin("5 | .[0:1] += 99", "null", &["-o=json", "-I=0"])?;
     assert_eq!(code, 0);
     assert_eq!(output.trim(), "5");
+
+    Ok(())
+}
+
+/// This fix's own motivating trigger (#1119's "Why this surfaced now"
+/// section): `eval_update`'s scalar-slice no-op throwaway now binds `.` to
+/// `[]` (matching real yq's actual internal model), which this array-append
+/// arm is what makes safe -- previously switching to `[]` would have
+/// regressed the common `+= <number>` case (`[] + 99` errored pre-#1119).
+/// Verified live against yq v4.53.3: all of these no-op to the original
+/// scalar in real yq.
+#[test]
+fn test_1119_scalar_slice_assign_noop_covers_array_and_filter_rhs() -> Result<()> {
+    let (output, code) = run_yq_stdin("5 | .[0:1] += [1]", "null", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "5");
+
+    let (output, code) = run_yq_stdin("5 | .[0:1] += \"x\"", "null", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "5");
+
+    let (output, code) = run_yq_stdin("5 | .[0:1] |= keys", "null", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "5");
+
+    let (output, code) = run_yq_stdin("5 | .[0:1] |= length", "null", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "5");
+
+    Ok(())
+}
+
+/// `add` is documented (`builtin_add`'s own comment) as `[.[] | .]` folded
+/// with `+`, so it intentionally inherits `+`'s exact semantics, including
+/// this array-append arm -- not a separate scope decision. Real yq has no
+/// `add`/`reduce` syntax at all, so this locks in succinctly's own
+/// consistent-with-`+` behavior rather than verifying against an oracle.
+#[test]
+fn test_1119_add_builtin_inherits_array_append_consistently() -> Result<()> {
+    let (output, code) = run_yq_stdin("[[1,2],3,4] | add", "null", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "[1,2,3,4]");
+
+    Ok(())
+}
+
+/// #1119 (Array+non-array in `arith_add`) must not resurrect the panic this
+/// broke in `gsub`'s flags-concatenation helper: an Array-typed `flags`
+/// argument now type-checks explicitly before ever reaching `arith_add`,
+/// rather than relying on `arith_add` to keep always producing a String.
+#[test]
+fn test_1119_gsub_array_flags_still_errors_cleanly_not_panics() -> Result<()> {
+    let (_out, stderr, code) = run_yq_stdin_with_stderr(r#"gsub("t"; "x"; [])"#, "\"test\"", &[])?;
+    assert_ne!(code, 0);
+    assert!(
+        stderr.contains("cannot be added"),
+        "expected a clean type error, got: {stderr}"
+    );
 
     Ok(())
 }
