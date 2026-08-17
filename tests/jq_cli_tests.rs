@@ -4504,6 +4504,42 @@ fn test_number_literal_zero_mantissa_extreme_exponent_still_zero_1099() -> Resul
     Ok(())
 }
 
+/// #1178: a genuinely-zero-mantissa literal's printed exponent must still
+/// shift by the fractional-zero-digit count, the same normalization real
+/// jq applies to a nonzero mantissa -- #1099's own zero-mantissa test above
+/// only covers a no-fraction spelling (`0e-400`, shift 0), which is why
+/// this gap wasn't caught by that PR's suite. Live-verified against jq
+/// 1.7.1.
+#[test]
+fn test_number_literal_zero_mantissa_exponent_shifts_by_fraction_length_1178() -> Result<()> {
+    let (output, code) = run_jq_stdin(".", "0.000e-400", &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "0E-403");
+
+    let (output, code) = run_jq_stdin(".", "0.0e400", &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "0E+399");
+
+    let (output, code) = run_jq_stdin(".", "0.00e-400", &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "0E-402");
+
+    Ok(())
+}
+
+/// The sign is preserved through the shift, and `-0.00e-400` shifts
+/// identically to the unsigned case above -- confirmed live against jq
+/// 1.7.1 (`-0e5` also still unaffected: shift is 0 when there's no
+/// fraction, matching #1099's existing `-0e-400` test above).
+#[test]
+fn test_number_literal_negative_zero_mantissa_exponent_shifts_1178() -> Result<()> {
+    let (output, code) = run_jq_stdin(".", "-0.00e-400", &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "-0E-402");
+
+    Ok(())
+}
+
 /// Unlike overflow (which falls back to `DBL_MAX` text past a documented
 /// exponent-magnitude ceiling), this crate imposes no *deliberate* ceiling
 /// on underflow -- verified live against jq 1.7.1: `1e-1000000000`
