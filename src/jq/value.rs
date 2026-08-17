@@ -1565,6 +1565,27 @@ impl<T: Into<Self>> From<Vec<T>> for OwnedValue {
 mod tests {
     use super::*;
 
+    /// #1171: a leading-dot number literal (with or without a `-` sign)
+    /// must preserve its own source spelling as a `NumberLiteral`, not
+    /// degrade to a plain lossy `Float` -- direct unit coverage of both
+    /// `dot_prefix_len` branches in `from_number_bytes` (0 for `.5`, 1
+    /// for `-.5`), complementing the CLI-level regression tests.
+    #[test]
+    fn test_from_number_bytes_preserves_leading_dot_spelling() {
+        assert_eq!(
+            OwnedValue::from_number_bytes(b".500"),
+            OwnedValue::NumberLiteral(NumberRepr::Float(0.5), ".500".into())
+        );
+        assert_eq!(
+            OwnedValue::from_number_bytes(b"-.500"),
+            OwnedValue::NumberLiteral(NumberRepr::Float(-0.5), "-.500".into())
+        );
+        // A bare `.` (no digit at all) still degrades to Null: `dot_prefix_len`
+        // is set, but prefixing `0` doesn't make it strictly valid either.
+        assert_eq!(OwnedValue::from_number_bytes(b"."), OwnedValue::Null);
+        assert_eq!(OwnedValue::from_number_bytes(b"-."), OwnedValue::Null);
+    }
+
     #[test]
     fn test_constructors() {
         assert_eq!(OwnedValue::null(), OwnedValue::Null);
