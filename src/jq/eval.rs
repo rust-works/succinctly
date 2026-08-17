@@ -9835,13 +9835,9 @@ pub(crate) fn owned_bound_to_i64(
 /// 99` stays `5`) rather than this read-path rule — verified live, not
 /// assumed, since the two are easy to conflate (#1101).
 pub(crate) fn is_yq_slice_empty_container_scalar(target: &OwnedValue) -> bool {
-    matches!(
+    !matches!(
         target,
-        OwnedValue::Null
-            | OwnedValue::Int(_)
-            | OwnedValue::Float(_)
-            | OwnedValue::NumberLiteral(..)
-            | OwnedValue::Bool(_)
+        OwnedValue::Array(_) | OwnedValue::String(_) | OwnedValue::Object(_)
     )
 }
 

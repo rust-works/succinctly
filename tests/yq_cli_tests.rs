@@ -12657,3 +12657,34 @@ fn test_slice_string_and_array_unaffected_1065() -> Result<()> {
     assert_eq!(out.trim(), "[1]");
     Ok(())
 }
+
+/// The tests above all slice `.` directly against a *borrowed* document
+/// cursor, which exercises `eval.rs`'s `Expr::Slice` match arm (or
+/// `eval_generic.rs`'s `slice_one_generic`) but never `eval_slice_expr`'s
+/// `Targets::Owned` branch. That branch requires two things at once: an
+/// `Expr::SliceExpr` node (only built when a bound doesn't fold to a
+/// literal, #499 -- plain `[0:1]` folds into `Expr::Slice` instead, which
+/// never has an `Owned` target case) *and* a target sub-expression that
+/// evaluates straight to `QueryResult::Owned` with no intervening pipe
+/// boundary -- `5 | .[($a):1]` still doesn't qualify, since piping through
+/// `.` re-enters via `eval_owned_pipe`'s serialize/reparse round-trip
+/// (`eval_owned_input`), handing `eval_slice_expr` a fresh *borrowed*
+/// `StandardJson` cursor instead. `(5)[(1-1):(1+0)]` -- a bare literal in
+/// postfix-slice position, with arithmetic (non-folding) bounds -- is
+/// confirmed live (via a temporary trace) to be the one shape that reaches
+/// `slice_owned_value_read`/`is_yq_slice_empty_container_scalar` directly.
+#[test]
+fn test_slice_owned_target_scalar_is_empty_array_1065() -> Result<()> {
+    let (out, code) = run_yq_stdin("(5)[(1-1):(1+0)]", "", &["-n", "-o", "json"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "[]");
+
+    let (out, code) = run_yq_stdin("(true)[(1-1):(1+0)]", "", &["-n", "-o", "json"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "[]");
+
+    let (out, code) = run_yq_stdin("(null)[(1-1):(1+0)]", "", &["-n", "-o", "json"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "[]");
+    Ok(())
+}
