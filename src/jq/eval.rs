@@ -5721,6 +5721,19 @@ fn shell_quote_value<S: EvalSemantics>(value: &OwnedValue) -> Result<String, Eva
 
 /// @sh - Shell quote
 fn format_sh<S: EvalSemantics>(value: &OwnedValue, _optional: bool) -> Result<String, EvalError> {
+    // #1073: real yq (confirmed live against v4.53.3) only ever accepts a
+    // string for `@sh` -- every other type errors, not just array/object:
+    // `5 | @sh`, `1.5 | @sh`, `true | @sh`, and `null | @sh` all error the
+    // same way arrays and objects do. jq's own rules (below) are far more
+    // permissive (numbers/bools/null convert to strings, arrays quote each
+    // element), so this is a single early yq-only gate rather than a
+    // per-arm one -- threading `S::TAG != EvalTag::Yq` onto every arm below
+    // individually is exactly the shape that let the array-only version of
+    // this fix miss the scalar cases in the first place.
+    if S::TAG == EvalTag::Yq && !matches!(value, OwnedValue::String(_)) {
+        return Err(EvalError::cannot_be_shell_escaped(value));
+    }
+
     match value {
         OwnedValue::String(s) => {
             // Use single quotes and escape single quotes
@@ -5731,11 +5744,9 @@ fn format_sh<S: EvalSemantics>(value: &OwnedValue, _optional: bool) -> Result<St
                 Ok(format!("'{s}'"))
             }
         }
-        // jq: [1, 2, 3] | @sh => "1 2 3" -- but real yq (confirmed live
-        // against v4.53.3) errors on *any* array input to `@sh`, regardless
-        // of content (`[[1,2],3]` and `[1,null,true]` both error the same
-        // way), unlike jq's own per-element quoting above (#1073).
-        OwnedValue::Array(arr) if S::TAG != EvalTag::Yq => {
+        // jq: [1, 2, 3] | @sh => "1 2 3" (yq mode never reaches here -- the
+        // gate above already returned).
+        OwnedValue::Array(arr) => {
             let parts: Vec<String> = arr
                 .iter()
                 .map(shell_quote_value::<S>)
@@ -28701,14 +28712,16 @@ mod tests {
         );
     }
 
-    /// #1073: real yq (confirmed live against v4.53.3) errors on *any*
-    /// array input to `@sh`, regardless of content -- unlike jq's own
-    /// per-element quoting (`test_format_sh_multibyte_boundary_647`'s array
-    /// case above, which stays jq-only after this fix). The pre-existing
-    /// object error (#929) already applied under both modes; this only adds
-    /// the array-under-yq case, so it isn't re-tested here.
+    /// #1073: real yq (confirmed live against v4.53.3) only ever accepts a
+    /// *string* for `@sh` -- every other type errors, not just array/object
+    /// (`5 | @sh`, `1.5 | @sh`, `true | @sh`, and `null | @sh` all error the
+    /// same way in real yq). jq's own, far more permissive rules (numbers/
+    /// bools/null convert to strings, arrays quote each element --
+    /// `test_format_sh_multibyte_boundary_647`'s array case above) stay
+    /// jq-only after this fix. The pre-existing object error (#929) already
+    /// applied under both modes.
     #[test]
-    fn test_format_sh_yq_mode_errors_on_array_1073() {
+    fn test_format_sh_yq_mode_only_accepts_strings() {
         yq_query!(br"[1, 2, 3]", "@sh",
             QueryResult::Error(e) => {
                 assert_eq!(e.message, "array ([1,2,3]) can not be escaped for shell");
@@ -28718,13 +28731,38 @@ mod tests {
         // Nested/mixed-content arrays error the same way -- yq's own rule
         // doesn't inspect elements, unlike jq's per-element quoting.
         yq_query!(br#"[[1, 2], "x", null]"#, "@sh",
-            QueryResult::Error(_) => {}
+            QueryResult::Error(e) => {
+                assert!(e.message.starts_with("array ("), "{}", e.message);
+                assert!(e.message.ends_with("can not be escaped for shell"), "{}", e.message);
+            }
         );
 
-        // Scalars are unaffected by the yq-mode gate.
+        // Every scalar type errors too -- not just containers.
         yq_query!(br"5", "@sh",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "number (5) can not be escaped for shell");
+            }
+        );
+        yq_query!(br"1.5", "@sh",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "number (1.5) can not be escaped for shell");
+            }
+        );
+        yq_query!(br"true", "@sh",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "boolean (true) can not be escaped for shell");
+            }
+        );
+        yq_query!(br"null", "@sh",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "null (null) can not be escaped for shell");
+            }
+        );
+
+        // A string is still the one accepted type.
+        yq_query!(br#""hello""#, "@sh",
             QueryResult::Owned(OwnedValue::String(s)) => {
-                assert_eq!(s, "5");
+                assert_eq!(s, "'hello'");
             }
         );
     }
