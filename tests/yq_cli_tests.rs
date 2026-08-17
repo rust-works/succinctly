@@ -13206,6 +13206,37 @@ fn test_slice_assign_string_and_array_bare_root_noop_1142() -> Result<()> {
     Ok(())
 }
 
+/// Same as the `=` case above but for `|=`/`+=`/`-=`/`*=`, exercising
+/// `update_path`'s own bare-root terminal `Expr::Slice` arm -- a distinct
+/// code path from every other `_1142` compound-assign test in this file,
+/// which all go through a leading `.a` and hit the `Pipe`-chain `Expr::Slice`
+/// arm instead. Without this, a regression isolated to the bare-root arm
+/// (e.g. a transposed `container_noop` argument) would pass every other test
+/// here.
+#[test]
+fn test_slice_compound_bare_root_array_and_string_target_is_noop_1142() -> Result<()> {
+    let (out, code) = run_yq_stdin(".[0:2] |= .", "[1,2,3]", &["-o", "json", "-I0"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "[1,2,3]");
+
+    let (out, code) = run_yq_stdin(".[0:2] += [9]", "[1,2,3]", &["-o", "json", "-I0"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "[1,2,3]");
+
+    let (out, code) = run_yq_stdin(".[0:2] -= [1]", "[1,2,3]", &["-o", "json", "-I0"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "[1,2,3]");
+
+    let (out, code) = run_yq_stdin(".[0:2] *= [5]", "[1,2,3]", &["-o", "json", "-I0"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "[1,2,3]");
+
+    let (out, code) = run_yq_stdin(r#".[0:1] += "X""#, r#""hello""#, &["-o", "json", "-I0"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), r#""hello""#);
+    Ok(())
+}
+
 // ============================================================================
 // yq slice-assignment no-op widened to a chained container target (#1142)
 // ============================================================================
