@@ -10862,3 +10862,13 @@ fn test_jq_slice_number_scalar_still_gives_no_output_1065() -> Result<()> {
     assert_eq!(output.trim(), "");
     Ok(())
 }
+
+/// #1101's yq-only "assigning through a scalar slice target is a no-op"
+/// rule must not leak into jq mode: real jq errors on `.[0:1] = 99` for a
+/// number target, matching succinctly's pre-existing, unaffected behavior.
+#[test]
+fn test_jq_slice_assign_scalar_still_errors_1101() -> Result<()> {
+    let (_out, code) = run_jq_stdin(".[0:1] = 99", "5", &[])?;
+    assert_eq!(code, 5);
+    Ok(())
+}
