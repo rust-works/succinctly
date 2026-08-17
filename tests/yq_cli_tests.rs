@@ -12509,6 +12509,39 @@ fn test_yq_join_preserves_exponent_literal_in_separator_1030() -> Result<()> {
     Ok(())
 }
 
+/// #1124: `yq_join_separator`'s catch-all used `to_json_yq()`, whose `Float`
+/// formatting deliberately forces a decimal point for JSON/YAML *structural*
+/// output round-trip fidelity (#953) -- wrong for a join separator, which
+/// isn't structural output. Confirmed live: real yq v4.53.3 gives `"112"`
+/// (separator `"1"`) for this exact filter, not `"11.02"`.
+#[test]
+fn test_yq_join_separator_computed_float_matches_tostring_1124() -> Result<()> {
+    let (stdout, code) = run_yq_stdin(r"join(2.0 / 2)", "[1, 2]\n", &["-r"])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "112");
+    Ok(())
+}
+
+/// #1124 (partial fix, tracked further as #1144): `yq_join_element_part`'s
+/// equivalent catch-all was fixed the same way as `yq_join_separator`'s
+/// above, but a *constructed* array's computed-float element still doesn't
+/// reach real yq's `"1"` answer -- `builtin_join`'s array branch only ever
+/// receives a cursor-backed element, and reaching that cursor for a
+/// constructed array requires a `to_json_for_reindex` round-trip that bakes
+/// the decimal point into synthesized `NumberLiteral` source text
+/// indistinguishable from a genuine document literal, so this fix's
+/// `numeric_display_string` call never actually sees a bare `Float` here.
+/// Pinned as a known, separately-tracked gap rather than silently
+/// unasserted -- if #1144 closes this, this assertion should change to
+/// `"1"` and the doc comment above should be updated to match.
+#[test]
+fn test_yq_join_element_computed_float_known_gap_1124() -> Result<()> {
+    let (stdout, code) = run_yq_stdin(r#"(2.0 / 2) | [.] | join(",")"#, "null\n", &["-r"])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "1.0");
+    Ok(())
+}
+
 #[test]
 fn test_yq_array_wrapped_overflow_int_keeps_decimal_point_953() -> Result<()> {
     // #953's exact repro: `.a` alone streams straight from the YAML cursor
