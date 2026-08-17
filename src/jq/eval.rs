@@ -23081,11 +23081,16 @@ fn eval_as_pattern<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // still resolves to `null`, not "undefined variable" (confirmed live
     // against jq 1.7.1: `. as [$a] ?// {$b} | [$a,$b]` on `[1]` gives
     // `[1,null]`). A no-op allocation when `patterns` has one element (the
-    // common, non-`?//` case).
+    // common, non-`?//` case). Deduped (found by review): two alternatives
+    // commonly share a name (`. as [$a] ?// {a: $a}`), and each duplicate
+    // would otherwise cost `try_pattern_alternatives` a wasted
+    // `substitute_var` body clone-and-walk per matched alternative.
     let mut all_var_names: Vec<String> = Vec::new();
     for pattern in patterns {
         collect_pattern_var_names(pattern, &mut all_var_names);
     }
+    all_var_names.sort_unstable();
+    all_var_names.dedup();
 
     let mut all_results: Vec<OwnedValue> = Vec::new();
 
