@@ -337,7 +337,15 @@ fn parse_literal_exponent(exp_text: &str) -> i64 {
 /// kept in sync by convention (#106) -- the same duplicated-predicate shape
 /// this codebase has already been bitten by once.
 fn split_mantissa(s: &str, exp_pos: usize) -> (&str, &str) {
-    let mantissa = s[..exp_pos].strip_prefix('-').unwrap_or(&s[..exp_pos]);
+    let raw = &s[..exp_pos];
+    // Strip either sign: `+` is as insignificant to the mantissa's own
+    // magnitude as `-` already was here, and (unlike `-`) wasn't stripped at
+    // all before #1180 -- a leading `+` in `int_part` was misread as its
+    // significant leading digit.
+    let mantissa = raw
+        .strip_prefix('-')
+        .or_else(|| raw.strip_prefix('+'))
+        .unwrap_or(raw);
     mantissa.split_once('.').unwrap_or((mantissa, ""))
 }
 
@@ -375,9 +383,15 @@ fn normalize_extreme_literal_mantissa(s: &str, exp_pos: usize) -> Option<(String
 
     let (int_part, frac_part) = split_mantissa(s, exp_pos);
 
-    // A leading-dot literal (`.5e400`) has an empty `int_part`, not `"0"` --
-    // treat both the same way (mantissa magnitude < 1).
-    let (shift, leading, rest): (i64, &str, String) = if int_part.is_empty() || int_part == "0" {
+    // Insignificant leading zeros (`007`) don't change which digit is the
+    // mantissa's significant leading one, or the magnitude class it falls
+    // into (#1180) -- strip them before classifying `int_part` at all. A
+    // leading-dot literal (`.5e400`) already has an empty `int_part`, and an
+    // int_part of nothing-but-zeros (`0`, `000`) trims to empty the same
+    // way -- both fall into the magnitude-< 1 branch below.
+    let sig_int_part = int_part.trim_start_matches('0');
+
+    let (shift, leading, rest): (i64, &str, String) = if sig_int_part.is_empty() {
         // Shift right to the first nonzero fractional digit. Genuinely
         // all-zero mantissa (`0.0e400`/`0.0e-400`) has no nonzero digit to
         // shift to -- `?` propagates that as `None`.
@@ -389,10 +403,10 @@ fn normalize_extreme_literal_mantissa(s: &str, exp_pos: usize) -> Option<(String
             after[..after.len().min(MAX_RENDERED_MANTISSA_DIGITS)].to_string(),
         )
     } else {
-        // Mantissa >= 1: shift left past every extra integer-part digit.
-        // `int_part[1..]` is a slice (no copy); only what actually gets
-        // concatenated into `rest` is capped.
-        let after_leading = &int_part[1..];
+        // Mantissa >= 1: shift left past every extra significant
+        // integer-part digit. `sig_int_part[1..]` is a slice (no copy);
+        // only what actually gets concatenated into `rest` is capped.
+        let after_leading = &sig_int_part[1..];
         let rest = if after_leading.len() >= MAX_RENDERED_MANTISSA_DIGITS {
             after_leading[..MAX_RENDERED_MANTISSA_DIGITS].to_string()
         } else {
@@ -402,7 +416,7 @@ fn normalize_extreme_literal_mantissa(s: &str, exp_pos: usize) -> Option<(String
                 &frac_part[..frac_part.len().min(budget)]
             )
         };
-        (int_part.len() as i64 - 1, &int_part[..1], rest)
+        (sig_int_part.len() as i64 - 1, &sig_int_part[..1], rest)
     };
 
     let parsed_exp = parse_literal_exponent(&s[exp_pos + 1..]);
@@ -2574,6 +2588,33 @@ mod tests {
             "must not render anywhere near the full 2,000,000-digit mantissa: got {} bytes",
             result.len()
         );
+    }
+
+    /// #1180: an insignificant leading zero or `+` in the mantissa's integer
+    /// part used to be misread as its own significant leading digit,
+    /// splicing the decimal point in one position too early (`007e-400` ->
+    /// `0.07E-398` instead of `7E-400`) and leaking an un-normalized `+`
+    /// straight into the output (`+0e-400` -> `+.0E-399` instead of
+    /// `0E-400`). Only reachable by calling this `pub` function directly
+    /// with a non-canonical mantissa spelling -- succinctly's own JSON/YAML
+    /// literal-construction grammars already reject a leading zero or `+`
+    /// before ever building a `NumberLiteral`, so no CLI input reaches this
+    /// path with either spelling today.
+    #[test]
+    fn test_format_number_jq_compat_leading_zero_or_plus_mantissa_1180() {
+        // Leading zero, both underflow and overflow directions.
+        assert_eq!(format_number_jq_compat(b"007e-400"), "7E-400");
+        assert_eq!(format_number_jq_compat(b"007e400"), "7E+400");
+        // A leading zero ahead of more than one significant digit still
+        // shifts by the significant digits' own count, not the raw
+        // int-part length.
+        assert_eq!(format_number_jq_compat(b"0070e-400"), "7.0E-399");
+        // Leading zero(s) with no significant digit at all: same as a bare
+        // `0`, falls into the genuinely-all-zero-mantissa case (#1178).
+        assert_eq!(format_number_jq_compat(b"000e-400"), "0E-400");
+        // Leading `+`, both alone and ahead of a genuine digit.
+        assert_eq!(format_number_jq_compat(b"+0e-400"), "0E-400");
+        assert_eq!(format_number_jq_compat(b"+1e400"), "1E+400");
     }
 
     /// `depth` levels of single-element array nesting: `[[[...[Null]...]]]`.
