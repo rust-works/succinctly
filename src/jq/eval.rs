@@ -5485,9 +5485,24 @@ fn format_json<S: EvalSemantics>(value: &OwnedValue) -> Result<String, EvalError
 }
 
 /// @uri - URI/percent encode
-fn format_uri<S: EvalSemantics>(value: &OwnedValue, _optional: bool) -> Result<String, EvalError> {
-    // jq converts non-strings to strings first (e.g., 42 | @uri => "42")
-    let s = match value {
+/// Shared non-string-to-string conversion for `@uri`/`@html`/`@base64`
+/// (`None` means "no conversion -- caller should raise its own type
+/// error"). A scalar becomes its jq-convention display string; a
+/// container only converts in jq mode, by JSON-encoding it the same way
+/// `tostring`/`@json` do (`[1,2] | @uri` => `"%5B1%2C2%5D"`, confirmed
+/// against real jq 1.7.1, #1096).
+///
+/// yq diverges here and keeps rejecting a container outright for all
+/// three of these formats ("cannot encode !!seq as URI/base64...",
+/// confirmed against real yq v4.53.3) -- `None` on that branch lets each
+/// caller's own existing type-error fallback fire unchanged, matching
+/// yq's pre-#1096 behavior exactly.
+///
+/// One definition instead of a hand-copy per caller, per this file's own
+/// #106 lesson (see [`owned_value_to_json`]'s doc comment, which this
+/// helper's own container arm calls through to for the same reason).
+fn stringify_for_format<S: EvalSemantics>(value: &OwnedValue) -> Option<String> {
+    Some(match value {
         OwnedValue::String(s) => s.clone(),
         OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..) => {
             numeric_display_string::<S>(value)
@@ -5500,17 +5515,17 @@ fn format_uri<S: EvalSemantics>(value: &OwnedValue, _optional: bool) -> Result<S
             }
         }
         OwnedValue::Null => "null".to_string(),
-        // jq JSON-encodes a container before percent-encoding it (`[1,2] |
-        // @uri` => `"%5B1%2C2%5D"`) rather than erroring -- confirmed
-        // against real jq 1.7.1 (#1096). yq diverges here and keeps
-        // rejecting a container outright ("cannot encode !!seq as URI...",
-        // confirmed against real yq v4.53.3 -- not reproduced here, out of
-        // this issue's scope), matching the existing error below.
-        OwnedValue::Array(_) | OwnedValue::Object(_) if S::TAG == EvalTag::Jq => {
+        OwnedValue::Array(_) | OwnedValue::Object(_) if S::TAG != EvalTag::Yq => {
             owned_value_to_json::<S>(value)
         }
-        _ => return Err(EvalError::type_error("string", value.type_name())),
-    };
+        OwnedValue::Array(_) | OwnedValue::Object(_) => return None,
+    })
+}
+
+fn format_uri<S: EvalSemantics>(value: &OwnedValue, _optional: bool) -> Result<String, EvalError> {
+    // jq converts non-strings to strings first (e.g., 42 | @uri => "42")
+    let s = stringify_for_format::<S>(value)
+        .ok_or_else(|| EvalError::type_error("string", value.type_name()))?;
 
     // Byte-oriented rather than char-oriented: percent-encoding acts on raw
     // bytes anyway, and every safe byte is ASCII, so a multi-byte character's
@@ -5674,56 +5689,43 @@ fn format_base64<S: EvalSemantics>(
     value: &OwnedValue,
     optional: bool,
 ) -> Result<String, EvalError> {
-    // jq JSON-encodes a container before base64-encoding it (`[1,2] |
-    // @base64` => `"eyJhIjoxfQ=="`-style) rather than erroring -- confirmed
-    // against real jq 1.7.1 (#1096). yq diverges here and keeps rejecting a
-    // container outright ("cannot encode !!seq as base64", confirmed
-    // against real yq v4.53.3 -- not reproduced here, out of this issue's
-    // scope), matching the fallthrough in the match below.
-    let owned_string;
-    let value = match value {
-        OwnedValue::Array(_) | OwnedValue::Object(_) if S::TAG == EvalTag::Jq => {
-            owned_string = OwnedValue::String(owned_value_to_json::<S>(value));
-            &owned_string
-        }
-        other => other,
+    // jq converts non-strings to strings first, same as `@uri`/`@html`
+    // (including JSON-encoding a container in jq mode, #1096).
+    let s = match stringify_for_format::<S>(value) {
+        Some(s) => s,
+        None if optional => return Ok(String::new()),
+        None => return Err(EvalError::type_error("string", value.type_name())),
     };
-    match value {
-        OwnedValue::String(s) => {
-            // Simple base64 encoding
-            const ALPHABET: &[u8] =
-                b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-            let bytes = s.as_bytes();
-            let mut result = String::new();
 
-            for chunk in bytes.chunks(3) {
-                let b0 = chunk[0] as u32;
-                let b1 = chunk.get(1).map_or(0, |&b| b as u32);
-                let b2 = chunk.get(2).map_or(0, |&b| b as u32);
+    // Simple base64 encoding
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let bytes = s.as_bytes();
+    let mut result = String::new();
 
-                let triple = (b0 << 16) | (b1 << 8) | b2;
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = chunk.get(1).map_or(0, |&b| b as u32);
+        let b2 = chunk.get(2).map_or(0, |&b| b as u32);
 
-                result.push(ALPHABET[((triple >> 18) & 0x3F) as usize] as char);
-                result.push(ALPHABET[((triple >> 12) & 0x3F) as usize] as char);
+        let triple = (b0 << 16) | (b1 << 8) | b2;
 
-                if chunk.len() > 1 {
-                    result.push(ALPHABET[((triple >> 6) & 0x3F) as usize] as char);
-                } else {
-                    result.push('=');
-                }
+        result.push(ALPHABET[((triple >> 18) & 0x3F) as usize] as char);
+        result.push(ALPHABET[((triple >> 12) & 0x3F) as usize] as char);
 
-                if chunk.len() > 2 {
-                    result.push(ALPHABET[(triple & 0x3F) as usize] as char);
-                } else {
-                    result.push('=');
-                }
-            }
-
-            Ok(result)
+        if chunk.len() > 1 {
+            result.push(ALPHABET[((triple >> 6) & 0x3F) as usize] as char);
+        } else {
+            result.push('=');
         }
-        _ if optional => Ok(String::new()),
-        _ => Err(EvalError::type_error("string", value.type_name())),
+
+        if chunk.len() > 2 {
+            result.push(ALPHABET[(triple & 0x3F) as usize] as char);
+        } else {
+            result.push('=');
+        }
     }
+
+    Ok(result)
 }
 
 /// @base64d - Base64 decode
@@ -5779,22 +5781,11 @@ fn format_base64d(value: &OwnedValue, optional: bool) -> Result<String, EvalErro
 
 /// @html - HTML entity escape
 fn format_html<S: EvalSemantics>(value: &OwnedValue, _optional: bool) -> Result<String, EvalError> {
-    // jq converts non-strings to strings first (e.g., 42 | @html => "42")
-    let s = match value {
-        OwnedValue::String(s) => s.clone(),
-        OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..) => {
-            numeric_display_string::<S>(value)
-        }
-        OwnedValue::Bool(b) => {
-            if *b {
-                "true".to_string()
-            } else {
-                "false".to_string()
-            }
-        }
-        OwnedValue::Null => "null".to_string(),
-        _ => return Err(EvalError::type_error("string", value.type_name())),
-    };
+    // jq converts non-strings to strings first (e.g., 42 | @html => "42"),
+    // including JSON-encoding a container in jq mode, same as `@uri`/`@base64`
+    // (#1096: `{"a":1} | @html` => `"{&quot;a&quot;:1}"` in real jq 1.7.1).
+    let s = stringify_for_format::<S>(value)
+        .ok_or_else(|| EvalError::type_error("string", value.type_name()))?;
 
     // Byte-oriented rather than char-oriented, same reasoning as `format_uri`:
     // all five entities are single ASCII bytes, so a multi-byte character's
@@ -29077,6 +29068,37 @@ mod tests {
         );
     }
 
+    /// Before #1096, `@base64` only accepted a string and errored on every
+    /// other scalar type -- unlike `@uri`/`@html`, which always converted
+    /// scalars to their display string first. Routing `@base64` through the
+    /// same `stringify_for_format` helper incidentally fixes this too;
+    /// confirmed these exact values against real jq 1.7.1 (`42 | @base64`
+    /// => `"NDI="`, etc.) rather than assuming the shared helper is correct
+    /// by construction.
+    #[test]
+    fn test_format_base64_scalar_conversion_1096() {
+        query!(br"42", "@base64",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "NDI=");
+            }
+        );
+        query!(br"true", "@base64",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "dHJ1ZQ==");
+            }
+        );
+        query!(br"null", "@base64",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "bnVsbA==");
+            }
+        );
+        query!(br"3.14", "@base64",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "My4xNA==");
+            }
+        );
+    }
+
     #[test]
     fn test_format_base64d() {
         query!(br#""aGVsbG8=""#, "@base64d",
@@ -29110,6 +29132,37 @@ mod tests {
             QueryResult::Owned(OwnedValue::String(s)) => {
                 assert_eq!(s, "&lt;é&gt;");
             }
+        );
+    }
+
+    /// jq JSON-encodes a container before HTML-escaping it, rather than
+    /// erroring — confirmed against real jq 1.7.1 (#1096), the same gap
+    /// found for `@uri`/`@base64`.
+    #[test]
+    fn test_format_html_container_jq_mode_1096() {
+        query!(br"[1,2]", "@html",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "[1,2]");
+            }
+        );
+        query!(br#"{"a":1}"#, "@html",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "{&quot;a&quot;:1}");
+            }
+        );
+    }
+
+    /// yq's lexer rejects `@html` syntax entirely, so there's no oracle to
+    /// compare against directly — this pins succinctly's own extension
+    /// behavior to match `@uri`/`@base64`'s confirmed yq-mode container
+    /// rejection, keeping all three formats consistent with each other.
+    #[test]
+    fn test_format_html_container_yq_mode_unaffected_1096() {
+        yq_query!(br"[1,2]", "@html",
+            QueryResult::Error(_) => {}
+        );
+        yq_query!(br#"{"a":1}"#, "@html",
+            QueryResult::Error(_) => {}
         );
     }
 
@@ -32625,13 +32678,21 @@ mod tests {
             "isvalid(@csv)",
             "isvalid(@tsv)",
             r#"isvalid(@dsv("|"))"#,
-            "isvalid(@base64)",
             "isvalid(@base64d)",
         ] {
             query!(br"1", expr,
                 QueryResult::Owned(OwnedValue::Bool(false)) => {}
             );
         }
+
+        // `@base64` (encode) is the odd one out here: #1096 fixed it to
+        // convert a scalar to its display string first, same as `@uri`/
+        // `@html` already did (`1 | @base64` => `"MQ=="`, confirmed against
+        // real jq 1.7.1) -- so encoding `1` no longer errors at all, and
+        // `isvalid(@base64)` on it is genuinely `true`, not `false`.
+        query!(br"1", "isvalid(@base64)",
+            QueryResult::Owned(OwnedValue::Bool(true)) => {}
+        );
 
         // Assignment/update/del: the write-time path traversal fails one
         // level down (`.a` is `1`, not an object, so `.b` can't be written

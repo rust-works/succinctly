@@ -209,15 +209,23 @@ fn test_parity_formats_string_only() {
 }
 
 /// A format that rejects its input must reject it identically in both.
+///
+/// `({"a":1}, "@uri")`, `({"a":1}, "@html")`, and `(b"42", "@base64")` used
+/// to live in this list; #1096 fixed `@uri`/`@html`/`@base64` to
+/// JSON-stringify a container, and `@base64` to convert any other scalar to
+/// its display string too, before formatting (matching real jq: `42 |
+/// jq -c '@base64'` => `"NDI="`), so none of the three error on these
+/// inputs anymore. See `test_format_uri_container_jq_mode_1096`,
+/// `test_format_html_container_jq_mode_1096`, and
+/// `test_format_base64_scalar_conversion_1096` (`src/jq/eval.rs`) for their
+/// corrected coverage instead. `{"a":1} | @sh` stays: `@sh` was never in
+/// #1096's scope and still rejects a container.
 #[test]
 fn test_parity_formats_type_errors() {
     for (json, filter) in [
-        (br#"{"a":1}"#.as_slice(), "@uri"),
-        (br#"{"a":1}"#, "@html"),
-        (br#"{"a":1}"#, "@sh"),
+        (br#"{"a":1}"#.as_slice(), "@sh"),
         (b"42", "@csv"),
         (b"42", "@tsv"),
-        (b"42", "@base64"),
         (b"42", "@urid"),
         (br#""notanarray""#, "@csv"),
     ] {
@@ -336,12 +344,21 @@ fn test_formats_non_finite_owned_pipe_parity() {
 /// `?` on a format applied to a *constructed* value (arithmetic, array/object
 /// construction, ...) must still suppress a type-mismatch error, producing no
 /// output at all -- verified against jq 1.7.1 (`jq -n '(1+1 | @csv)?'` and
-/// the `@tsv`/`@base64`/`@base64d`/`@urid` siblings all produce nothing, exit
-/// 0; `@dsv` has no jq equivalent to check directly, since it's this crate's
+/// the `@tsv`/`@base64d`/`@urid` siblings all produce nothing, exit 0;
+/// `@dsv` has no jq equivalent to check directly, since it's this crate's
 /// own extension, but shares `format_csv`'s exact suppression code path).
 ///
-/// Before #693, `format_csv`/`format_tsv`/`format_dsv`/`format_base64`/
-/// `format_base64d`/`format_urid`'s own `_ if optional => Ok(String::new())`
+/// `@base64` is deliberately *not* in this list (unlike before #1096): real
+/// jq converts a scalar to its display string before base64-encoding it, so
+/// `jq -n '(1+1 | @base64)?'` genuinely produces `"Mg=="`, not nothing --
+/// re-verified live rather than trusted from the pre-#1096 version of this
+/// comment, which had never actually checked `@base64` against real jq and
+/// merely inherited succinctly's own (then-incorrect) error-on-scalar
+/// behavior. See `test_format_base64_constructed_scalar_no_longer_suppressed_1096`
+/// below for that corrected case.
+///
+/// Before #693, `format_csv`/`format_tsv`/`format_dsv`/`format_base64d`/
+/// `format_urid`'s own `_ if optional => Ok(String::new())`
 /// arm was the *only* thing that made `?` work here -- there was no separate
 /// `Expr::Optional`-catches-`Error` fallback for this path, so a suppressed
 /// format fell back to the empty *string* `""` (a real output) rather than
@@ -361,7 +378,6 @@ fn test_formats_optional_owned_type_error_parity_124() {
         (b"null".as_slice(), "(1+1 | @csv)?"),
         (b"null", "(1+1 | @tsv)?"),
         (b"null", r#"(1+1 | @dsv("|"))?"#),
-        (b"null", "(1+1 | @base64)?"),
         (b"null", "(1+1 | @base64d)?"),
         (b"null", "(1+1 | @urid)?"),
     ] {
@@ -372,6 +388,20 @@ fn test_formats_optional_owned_type_error_parity_124() {
         );
         assert_parity(json, filter);
     }
+}
+
+/// Counterpart to `test_formats_optional_owned_type_error_parity_124` above:
+/// `@base64` on a *constructed* scalar no longer errors at all (#1096), so
+/// `?` has nothing to suppress and the pipe produces its real output --
+/// verified against real jq 1.7.1 (`jq -n '(1+1 | @base64)?'` => `"Mg=="`,
+/// exit 0), not just the two evaluators agreeing with each other.
+#[test]
+fn test_format_base64_constructed_scalar_no_longer_suppressed_1096() {
+    assert_eq!(
+        as_strs(&full_outputs(b"null", "(1+1 | @base64)?")),
+        ["\"Mg==\""]
+    );
+    assert_parity(b"null", "(1+1 | @base64)?");
 }
 
 #[test]

@@ -203,6 +203,11 @@ The jq implementation supports format functions for converting values to strings
 | **@yaml**    | `@yaml`             | YAML flow-style encoding (yq)                     | `{a: 1, b: 2}`      |
 | **@props**   | `@props`            | Java properties format (yq)                       | `key = value`       |
 
+**@uri/@base64/@html on arrays/objects (jq mode only):** a container is JSON-encoded
+first, then formatted, matching real jq (`[1,2] | @uri` => `"%5B1%2C2%5D"`) — `succinctly
+yq` still rejects a container outright for all three, matching real yq's own
+`cannot encode !!seq as URI/base64...` error (#1096).
+
 **@dsv(delimiter) specifics:**
 - Custom delimiters: Any single or multi-character string
 - Always-quoted strings: every string field is double-quoted (matching jq's `@csv`), regardless of content; non-strings are bare and null is empty
