@@ -139,8 +139,8 @@ use super::expr::{
     ObjectKey, Pattern, StringPart,
 };
 use super::value::{
-    assert_value_tree_depth, cmp_f64, infinite_float_preview_text, is_nan_sentinel,
-    numeric_repr_cmp, owned_value_eq, NumberRepr, OwnedValue,
+    assert_value_tree_depth, cmp_f64, infinite_float_preview_text, is_infinity_sentinel,
+    is_nan_sentinel, numeric_repr_cmp, owned_value_eq, NumberRepr, OwnedValue,
 };
 
 /// Result of evaluating a jq expression.
@@ -3038,6 +3038,10 @@ fn builtin_length<W: Clone + AsRef<[u64]>>(
             // checked_abs: i64::MIN has no i64 absolute value; use f64
             if is_nan_sentinel(n.raw_bytes()) {
                 QueryResult::Owned(OwnedValue::Float(f64::NAN))
+            } else if is_infinity_sentinel(n.raw_bytes()).is_some() {
+                // Sign doesn't matter: `.abs()` of either infinity is the
+                // same positive infinity (#1083/#1087).
+                QueryResult::Owned(OwnedValue::Float(f64::INFINITY))
             } else if let Ok(i) = n.as_i64() {
                 QueryResult::Owned(match i.checked_abs() {
                     Some(a) => OwnedValue::Int(a),
@@ -19015,6 +19019,12 @@ fn builtin_strftime<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // helper's generic `not_a_number` case would be unreachable.
             let timestamp = if is_nan_sentinel(n.raw_bytes()) {
                 f64::NAN
+            } else if let Some(negative) = is_infinity_sentinel(n.raw_bytes()) {
+                if negative {
+                    f64::NEG_INFINITY
+                } else {
+                    f64::INFINITY
+                }
             } else if let Ok(f) = n.as_f64() {
                 f
             } else if optional {
@@ -21165,6 +21175,12 @@ fn get_float_value_with<'a, W: Clone + AsRef<[u64]>>(
         StandardJson::Number(n) => {
             if is_nan_sentinel(n.raw_bytes()) {
                 Ok(f64::NAN)
+            } else if let Some(negative) = is_infinity_sentinel(n.raw_bytes()) {
+                Ok(if negative {
+                    f64::NEG_INFINITY
+                } else {
+                    f64::INFINITY
+                })
             } else if let Ok(f) = n.as_f64() {
                 Ok(f)
             } else if optional {
@@ -21387,6 +21403,12 @@ fn get_number_from_result<W: Clone + AsRef<[u64]>>(
         QueryResult::One(StandardJson::Number(n)) => {
             if is_nan_sentinel(n.raw_bytes()) {
                 Ok(f64::NAN)
+            } else if let Some(negative) = is_infinity_sentinel(n.raw_bytes()) {
+                Ok(if negative {
+                    f64::NEG_INFINITY
+                } else {
+                    f64::INFINITY
+                })
             } else {
                 n.as_f64()
                     .map_err(|_| NumberError::Error(EvalError::new("invalid number")))
