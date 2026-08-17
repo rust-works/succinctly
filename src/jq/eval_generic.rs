@@ -26,10 +26,9 @@ use super::document::{
 };
 use super::eval::{
     apply_compare_op, eval as full_eval, format_owned, index_one_owned as index_owned_by_key,
-    is_yq_slice_empty_container_scalar, literal_to_owned, needs_path_context,
-    numeric_display_string, numeric_key_to_index, owned_bound_to_i64, owned_value_to_json,
-    slice_owned_value, tonumber_from_str, Control, EvalError, EvalSemantics, EvalTag, JqSemantics,
-    QueryResult, YqSemantics,
+    literal_to_owned, needs_path_context, numeric_display_string, numeric_key_to_index,
+    owned_bound_to_i64, owned_value_to_json, slice_owned_value_read, tonumber_from_str, Control,
+    EvalError, EvalSemantics, EvalTag, JqSemantics, QueryResult, YqSemantics,
 };
 use super::expr::{Builtin, Expr, FormatType};
 use super::slice::{slice_str, SliceBounds};
@@ -3084,15 +3083,7 @@ fn eval_slice_expr<S: EvalSemantics, V: DocumentValue>(
             for s in &starts {
                 for e in &ends {
                     for t in ts {
-                        // yq's empty-container slicing rule (#1065) — kept
-                        // out of `slice_owned_value` itself; see
-                        // `is_yq_slice_empty_container_scalar`'s doc
-                        // comment for why.
-                        if S::TAG == EvalTag::Yq && is_yq_slice_empty_container_scalar(t) {
-                            out.push(OwnedValue::Array(Vec::new()));
-                            continue;
-                        }
-                        match slice_owned_value(t, *s, *e, optional) {
+                        match slice_owned_value_read::<S>(t, *s, *e, optional) {
                             Ok(Some(v)) => out.push(v),
                             Ok(None) => {}
                             Err(e) => return GenericResult::Error(e),
@@ -3168,16 +3159,17 @@ fn slice_one_generic<S: EvalSemantics, V: DocumentValue>(
     // yq's empty-container slicing rule (#1065) — see
     // `is_yq_slice_empty_container_scalar`'s doc comment for the full
     // rationale and why Object is excluded. Checked before the jq-only
-    // `is_null` arm below so it wins under yq mode. `as_i64`/`as_f64`, not
-    // `number_literal` — the latter is `None` for plenty of legitimate
-    // numbers (ints, or floats with no safe literal spelling to preserve,
-    // #387/#966/#918), so it can't stand in for "is this a number".
-    if S::TAG == EvalTag::Yq
-        && (target.is_null()
-            || target.as_bool().is_some()
-            || target.as_i64().is_some()
-            || target.as_f64().is_some())
-    {
+    // `is_null` arm below so it wins under yq mode. Classified via
+    // `type_name()`, a variant-based check, not by chaining
+    // `as_bool()`/`as_i64()`/`as_f64()` — those are parseability checks,
+    // and a JSON number whose scanner-accepted span isn't valid number
+    // syntax (e.g. `1.2.3`, #966) fails all three despite `type_name()`
+    // correctly still reporting `"number"`, which would silently disagree
+    // with `is_yq_slice_empty_container_scalar`'s type-based `OwnedValue`
+    // match. For YAML this also collapses what was up to two separate
+    // `resolve_plain` re-derivations of the same scalar into the one
+    // `type_name()` already performs.
+    if S::TAG == EvalTag::Yq && matches!(target.type_name(), "null" | "boolean" | "number") {
         return GenericResult::Owned(OwnedValue::Array(Vec::new()));
     }
     if target.is_null() {
@@ -7151,6 +7143,30 @@ mod tests {
 
         let yq_result = eval_using::<YqSemantics, _>(&expr, index.root(json).value());
         assert_eq!(yq_result.into_owned(), Some(OwnedValue::Float(1.5)));
+    }
+
+    #[test]
+    fn test_yq_slice_scalar_empty_array_classifies_by_type_not_parseability_1065() {
+        // `slice_one_generic`'s yq empty-container check (#1065) must
+        // classify "is this a number" the same way `eval.rs`'s own
+        // `StandardJson::Number(_)` match and `is_yq_slice_empty_container_scalar`
+        // do: by variant, not by whether the raw text happens to parse as
+        // i64/f64. `1.2.3` is a JSON number span the semi-index scanner
+        // accepts leniently (#966) but that fails `as_i64`/`as_f64` parsing
+        // — an earlier version of this check used exactly that parseability
+        // test and returned an error here instead of `[]`, disagreeing with
+        // the concrete evaluator on the identical input. Uses a computed
+        // (non-literal-folding) slice so evaluation stays inside
+        // `eval_generic.rs`'s own `slice_one_generic` rather than bridging
+        // out to `eval.rs`, which is what let the divergence hide.
+        use crate::jq::YqSemantics;
+
+        let json = b"1.2.3";
+        let index = JsonIndex::build(json);
+        let expr = crate::jq::parse(".[(1-1):(1+0)]").unwrap();
+
+        let result = eval_using::<YqSemantics, _>(&expr, index.root(json).value());
+        assert_eq!(result.into_owned(), Some(OwnedValue::Array(Vec::new())));
     }
 
     // Coverage follow-ups for #532: the tests above exercise the common
