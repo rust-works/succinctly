@@ -447,12 +447,12 @@ fn canonicalize_json_numbers_at_depth(value: OwnedValue, depth: usize) -> OwnedV
 fn parse_input(bytes: &[u8], format: InputFormat) -> Result<Vec<OwnedValue>> {
     match format {
         InputFormat::Json => {
-            // Parse as JSON
-            let index = JsonIndex::build(bytes);
-            let cursor = index.root(bytes);
-            Ok(vec![canonicalize_json_numbers(generic_to_owned(
-                &cursor.value(),
-            ))])
+            // Parse as JSON, then immediately drop the number-literal
+            // fidelity `json_bytes_to_owned_value` preserves -- real yq's
+            // own `--input-format json` path never keeps it either (#978).
+            Ok(vec![canonicalize_json_numbers(
+                crate::output::json_bytes_to_owned_value(bytes),
+            )])
         }
         InputFormat::Yaml | InputFormat::Auto => {
             // Parse as YAML (Auto defaults to YAML when no extension hint)
@@ -2071,10 +2071,20 @@ fn colorize_yaml(yaml: &str) -> String {
 
 /// Parse a `--argjson` value into an `OwnedValue`.
 ///
-/// Validates strictly (RFC 8259) via `serde_json`, matching jq's `--argjson`
-/// (see `jq_runner::parse_json_value`). The lenient JSON semi-index would
-/// otherwise silently coerce malformed input (e.g. `42 garbage` → `42`)
-/// instead of surfacing an error (#284).
+/// Validates strictly (RFC 8259) via `serde_json`, matching jq's own
+/// `--argjson` validation *strategy* (see `jq_runner::parse_json_value`).
+/// The lenient JSON semi-index would otherwise silently coerce malformed
+/// input (e.g. `42 garbage` → `42`) instead of surfacing an error (#284).
+///
+/// Unlike `jq_runner::parse_json_value`, this does *not* preserve a number
+/// literal's exact source spelling (#1058 fixed that for `succinctly jq`,
+/// deliberately not for `succinctly yq`) -- real mikefarah/yq has no
+/// `--argjson` flag at all, so there's no oracle to match on fidelity
+/// specifically, and yq's own `--input-format json` path already discards
+/// JSON-sourced number fidelity on purpose (#978,
+/// `canonicalize_json_numbers`). Adding fidelity only here would make
+/// `--argjson` *inconsistent* with that established convention rather than
+/// fix a real divergence.
 fn parse_json_value(s: &str) -> Result<OwnedValue> {
     let s = s.trim();
     if s.is_empty() {
