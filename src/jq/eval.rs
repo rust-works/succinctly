@@ -1780,27 +1780,7 @@ fn arith_add<S: EvalSemantics>(
     left: OwnedValue,
     right: OwnedValue,
 ) -> Result<OwnedValue, EvalError> {
-    // A `NumberLiteral` operand degrades to plain `Int`/`Float` the moment it
-    // computes with something -- jq gives computed numbers canonical
-    // formatting, only values that reach output untouched keep their literal.
-    let (left, right) = (left.into_plain_number(), right.into_plain_number());
     match (left, right) {
-        // Number addition - jq converts to float on overflow, yq wraps
-        (OwnedValue::Int(a), OwnedValue::Int(b)) => {
-            if S::OVERFLOW_WRAPS {
-                // yq behavior: wrapping add
-                Ok(OwnedValue::Int(a.wrapping_add(b)))
-            } else {
-                // jq behavior: convert to float on overflow
-                match a.checked_add(b) {
-                    Some(result) => Ok(OwnedValue::Int(result)),
-                    None => Ok(OwnedValue::Float(a as f64 + b as f64)),
-                }
-            }
-        }
-        (OwnedValue::Int(a), OwnedValue::Float(b)) => Ok(OwnedValue::Float(a as f64 + b)),
-        (OwnedValue::Float(a), OwnedValue::Int(b)) => Ok(OwnedValue::Float(a + b as f64)),
-        (OwnedValue::Float(a), OwnedValue::Float(b)) => Ok(OwnedValue::Float(a + b)),
         // String concatenation
         (OwnedValue::String(mut a), OwnedValue::String(b)) => {
             a.push_str(&b);
@@ -1816,7 +1796,10 @@ fn arith_add<S: EvalSemantics>(
             a.extend(b);
             Ok(OwnedValue::Object(a))
         }
-        // null + x = x, x + null = x
+        // null + x = x, x + null = x -- `other` is relocated unchanged, not
+        // computed, so a `NumberLiteral` operand must keep its own source
+        // spelling here (#1143: this arm must run before the numeric arm
+        // below collapses it).
         (OwnedValue::Null, other) | (other, OwnedValue::Null) => Ok(other),
         // yq: `array + x` appends any non-array, non-null `x` as a single
         // new element (`[] + 99` => `[99]`) -- unlike jq, which has no
@@ -1824,12 +1807,39 @@ fn arith_add<S: EvalSemantics>(
         // array` for a non-array/non-null `x` still falls through to the
         // error arm below, matching real yq (verified live against yq
         // v4.53.3: `[1,2] + 3` succeeds, `3 + [1,2]` errors). Array+array
-        // and array+null are already handled above/before this arm.
+        // and array+null are already handled above/before this arm. `b` is
+        // relocated unchanged into the array, not computed, so (like the
+        // `null` arm above) a `NumberLiteral` operand must keep its own
+        // source spelling here too (#1143).
         (OwnedValue::Array(mut a), b) if S::ARRAY_PLUS_APPENDS => {
             a.push(b);
             Ok(OwnedValue::Array(a))
         }
-        (a, b) => Err(EvalError::binary_op(&a, &b, BinOp::Add)),
+        // Everything else: numeric addition. A `NumberLiteral` operand
+        // degrades to plain `Int`/`Float` here, and only here -- this is
+        // the one arm that actually computes a new number, so jq/yq's
+        // canonical formatting is correct; every arm above relocates an
+        // operand unchanged and must not collapse its literal spelling
+        // (#1143).
+        (left, right) => match (left.into_plain_number(), right.into_plain_number()) {
+            // Number addition - jq converts to float on overflow, yq wraps
+            (OwnedValue::Int(a), OwnedValue::Int(b)) => {
+                if S::OVERFLOW_WRAPS {
+                    // yq behavior: wrapping add
+                    Ok(OwnedValue::Int(a.wrapping_add(b)))
+                } else {
+                    // jq behavior: convert to float on overflow
+                    match a.checked_add(b) {
+                        Some(result) => Ok(OwnedValue::Int(result)),
+                        None => Ok(OwnedValue::Float(a as f64 + b as f64)),
+                    }
+                }
+            }
+            (OwnedValue::Int(a), OwnedValue::Float(b)) => Ok(OwnedValue::Float(a as f64 + b)),
+            (OwnedValue::Float(a), OwnedValue::Int(b)) => Ok(OwnedValue::Float(a + b as f64)),
+            (OwnedValue::Float(a), OwnedValue::Float(b)) => Ok(OwnedValue::Float(a + b)),
+            (a, b) => Err(EvalError::binary_op(&a, &b, BinOp::Add)),
+        },
     }
 }
 
