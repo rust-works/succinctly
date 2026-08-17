@@ -146,6 +146,20 @@ fn to_owned_at_depth<V: DocumentValue>(value: &V, depth: usize) -> OwnedValue {
         OwnedValue::Float(f)
     } else if let Some(s) = value.as_str() {
         OwnedValue::String(s.into_owned())
+    } else if value.type_name() == "string" {
+        // `as_str()` returned `None` despite `type_name()` reporting this
+        // node is a string -- it's structurally a JSON/YAML string scalar,
+        // but decoding it failed (invalid `\u` escape, invalid UTF-8, ...)
+        // and `as_str()`'s `Option` signature swallows the specific `Err`
+        // via `.ok()` (#1098). No live input reaches this today:
+        // `--argjson`'s `serde_json` parse and this crate's own semi-index
+        // structural checks both already reject anything that would fail
+        // here before this function is ever called -- same precondition as
+        // `assert_nesting_depth` above. Panicking rather than silently
+        // materializing `null` keeps a future drift between those two
+        // independently-maintained JSON grammars loud instead of turning
+        // it into silent data corruption.
+        panic!("string scalar failed to decode despite passing structural validation (#1098)");
     } else {
         // Covers error values and any unknown types
         OwnedValue::Null
@@ -3916,6 +3930,30 @@ mod tests {
     use super::super::expr::{CompareOp, FormatType, Literal};
     use super::super::value::NumberRepr;
     use super::*;
+
+    /// #1098: `JsonIndex::build`'s semi-index scan finds string quote/escape
+    /// *boundaries* but never decodes/validates the bytes between them --
+    /// that's deferred to `JsonString::as_str()`, called lazily by
+    /// `to_owned_at_depth`. So invalid UTF-8 inside a string span parses
+    /// and indexes fine (`JsonIndex::build` never errors), and only fails
+    /// once materialization reaches it. The CLI itself never reaches this
+    /// (its own file-reading step lossy-converts the whole input to UTF-8
+    /// before the JSON parser ever sees it -- confirmed live: a file with
+    /// `\xff\xfe` inside a string prints as replacement characters, not an
+    /// error), but any library caller feeding `JsonIndex::build` raw bytes
+    /// directly (skipping that CLI-specific safety net) can reach this.
+    #[test]
+    #[should_panic(
+        expected = "string scalar failed to decode despite passing structural validation (#1098)"
+    )]
+    fn test_to_owned_panics_on_string_decode_failure_1098() {
+        use crate::json::JsonIndex;
+        let json: &[u8] = b"{\"a\": \"\xff\xfe\"}";
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+        to_owned(&value);
+    }
     use crate::jq::parse;
     use crate::json::JsonIndex;
 
