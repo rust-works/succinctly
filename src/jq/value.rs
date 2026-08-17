@@ -307,6 +307,19 @@ fn parse_literal_exponent(exp_text: &str) -> i64 {
     })
 }
 
+/// Split a literal's mantissa text (`s[..exp_pos]`, sign stripped) into its
+/// integer and fractional parts -- shared by
+/// [`normalize_extreme_literal_mantissa`] and
+/// [`format_underflow_literal_mantissa`]'s own genuinely-all-zero-mantissa
+/// fallback (#1178), so "how do we split the mantissa out of `s`" has
+/// exactly one implementation instead of two hand-copied ones that must be
+/// kept in sync by convention (#106) -- the same duplicated-predicate shape
+/// this codebase has already been bitten by once.
+fn split_mantissa(s: &str, exp_pos: usize) -> (&str, &str) {
+    let mantissa = s[..exp_pos].strip_prefix('-').unwrap_or(&s[..exp_pos]);
+    mantissa.split_once('.').unwrap_or((mantissa, ""))
+}
+
 /// Shift a literal's own mantissa digits (the text before `exp_pos`, i.e.
 /// before `e`/`E`) into jq's one-digit-before-the-point normalized form,
 /// and fold that shift into the literal's own written exponent -- returns
@@ -339,8 +352,7 @@ fn normalize_extreme_literal_mantissa(s: &str, exp_pos: usize) -> Option<(String
     // actually get rendered.
     const MAX_RENDERED_MANTISSA_DIGITS: usize = 32;
 
-    let mantissa = s[..exp_pos].strip_prefix('-').unwrap_or(&s[..exp_pos]);
-    let (int_part, frac_part) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    let (int_part, frac_part) = split_mantissa(s, exp_pos);
 
     // A leading-dot literal (`.5e400`) has an empty `int_part`, not `"0"` --
     // treat both the same way (mantissa magnitude < 1).
@@ -455,10 +467,14 @@ fn format_underflow_literal_mantissa(s: &str, exp_pos: usize, negative: bool) ->
         // jq keeps both the sign and this shifted exponent for a zero
         // mantissa, since log10(0) is undefined (`-0e5` -> `-0E+5`).
         None => {
-            let mantissa = s[..exp_pos].strip_prefix('-').unwrap_or(&s[..exp_pos]);
-            let frac_len = mantissa.split_once('.').map_or(0, |(_, frac)| frac.len());
-            let shifted_exp =
-                parse_literal_exponent(&s[exp_pos + 1..]).saturating_sub(frac_len as i64);
+            let (_, frac_part) = split_mantissa(s, exp_pos);
+            // `try_from`, not a bare `as` cast: `frac_part.len()` is
+            // document-controlled and unbounded, same as the exponent digit
+            // string `parse_literal_exponent` already saturates rather than
+            // wraps for a couple lines up -- matching that same discipline
+            // here instead of silently flipping sign past `i64::MAX` bytes.
+            let frac_len = i64::try_from(frac_part.len()).unwrap_or(i64::MAX);
+            let shifted_exp = parse_literal_exponent(&s[exp_pos + 1..]).saturating_sub(frac_len);
             assemble_scientific(sign, "0", shifted_exp)
         }
     }
@@ -2405,6 +2421,26 @@ mod tests {
         assert_eq!(format_number_jq_compat(b"12.34e-400"), "1.234E-399");
         assert_eq!(format_number_jq_compat(b"0.5e-400"), "5E-401");
         assert_eq!(format_number_jq_compat(b"100.5e-400"), "1.005E-398");
+    }
+
+    /// #1178: a genuinely-all-zero mantissa still shifts its printed
+    /// exponent by the fractional-zero-digit count, the same normalization
+    /// #1099's nonzero-mantissa case above already gets -- #1099's own
+    /// `test_format_number_jq_compat_underflow_beyond_i32_exponent_range_1099`
+    /// zero-mantissa case (`0e-2147483649`) only covers a no-fraction
+    /// spelling (shift 0), which is why this gap wasn't caught there.
+    /// In-process counterpart to `jq_cli_tests.rs`'s CLI-level `_1178`
+    /// tests, for the same `cargo llvm-cov` visibility reason as #1099's
+    /// own in-process test above.
+    #[test]
+    fn test_format_number_jq_compat_zero_mantissa_shifts_by_fraction_length_1178() {
+        assert_eq!(format_number_jq_compat(b"0.000e-400"), "0E-403");
+        assert_eq!(format_number_jq_compat(b"0.0e400"), "0E+399");
+        assert_eq!(format_number_jq_compat(b"0.00e-400"), "0E-402");
+        assert_eq!(format_number_jq_compat(b"-0.00e-400"), "-0E-402");
+        // No-fraction spelling still has shift 0 -- unaffected regression
+        // guard alongside #1099's existing one.
+        assert_eq!(format_number_jq_compat(b"0e-400"), "0E-400");
     }
 
     /// #1099 code review: the exponent digit string was parsed at `i32`
