@@ -10260,6 +10260,22 @@ fn test_object_pattern_var_shorthand_nested_1139() -> Result<()> {
     Ok(())
 }
 
+/// The shorthand works as either side of a `?//` alternative (#720):
+/// falls through to a shorthand-using second alternative when the first
+/// genuinely fails (an array pattern against a non-array input), and is
+/// also reachable directly when the first alternative succeeds.
+#[test]
+fn test_object_pattern_var_shorthand_with_alt_patterns_720_1139() -> Result<()> {
+    let (stdout, _, code) = run_jq_full(&["-c", ". as [$x] ?// {$a} | $a"], Some(r#"{"a":9}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "9");
+
+    let (stdout, _, code) = run_jq_full(&["-c", ". as [$x] ?// {$a} | $x"], Some("[9]"))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "9");
+    Ok(())
+}
+
 #[test]
 fn test_func_def_expand_recurses_through_halt_stderr_and_halt_error_builtins() -> Result<()> {
     // `expand_func_calls_in_builtin`'s `Halt`/`Stderr`/`HaltError`/
