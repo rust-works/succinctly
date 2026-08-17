@@ -562,6 +562,23 @@ fn test_argjson_variable() -> Result<()> {
     Ok(())
 }
 
+/// `--argjson`'s number literal preserves its exact source spelling when
+/// echoed back untouched, matching a filter-embedded literal (#1035) and a
+/// document-sourced one, rather than round-tripping through
+/// `serde_json::Value`'s own `f64`/`i64` `Display` (#1058). Verified
+/// against the pinned real `jq` binary, which also preserves these exactly.
+#[test]
+fn test_argjson_preserves_number_literal_fidelity_1058() -> Result<()> {
+    let (output, code) = run_jq_null("$n", &["--argjson", "n", "1.500"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "1.500");
+
+    let (output, code) = run_jq_null("$n", &["--argjson", "n", "1e100"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "1E+100");
+    Ok(())
+}
+
 #[test]
 fn test_multiple_variables() -> Result<()> {
     let (output, code) = run_jq_null("$a + $b", &["--argjson", "a", "10", "--argjson", "b", "20"])?;
