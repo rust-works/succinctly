@@ -5453,10 +5453,10 @@ pub(crate) fn format_owned<S: EvalSemantics>(
         FormatType::Tsv => format_tsv::<S>(owned, optional),
         FormatType::Dsv(delimiter) => format_dsv::<S>(owned, delimiter, optional),
         FormatType::Base64 => format_base64::<S>(owned, optional),
-        FormatType::Base64d => format_base64d(owned, optional),
+        FormatType::Base64d => format_base64d::<S>(owned, optional),
         FormatType::Html => format_html::<S>(owned, optional),
         FormatType::Sh => format_sh::<S>(owned, optional),
-        FormatType::Urid => format_urid(owned, optional),
+        FormatType::Urid => format_urid::<S>(owned, optional),
         FormatType::Yaml => format_yaml(owned),
         FormatType::Props => format_props(owned),
     }
@@ -5559,34 +5559,64 @@ fn format_uri<S: EvalSemantics>(value: &OwnedValue, _optional: bool) -> Result<S
 }
 
 /// @urid - URI/percent decode
-fn format_urid(value: &OwnedValue, optional: bool) -> Result<String, EvalError> {
-    match value {
-        OwnedValue::String(s) => {
-            let mut result = String::new();
-            let bytes = s.as_bytes();
-            let mut i = 0;
-            while i < bytes.len() {
-                if bytes[i] == b'%' && i + 2 < bytes.len() {
-                    // Try to parse the next two characters as hex
-                    if let (Some(h1), Some(h2)) = (
-                        (bytes[i + 1] as char).to_digit(16),
-                        (bytes[i + 2] as char).to_digit(16),
-                    ) {
-                        let decoded = (h1 * 16 + h2) as u8;
-                        result.push(decoded as char);
-                        i += 3;
-                        continue;
-                    }
-                }
-                // Not a valid percent-encoded sequence, just copy the character
-                result.push(bytes[i] as char);
-                i += 1;
+///
+/// jq has no `@urid` at all, so there's no jq-mode oracle to match; real
+/// yq (v4.53.3, live-verified) accepts any scalar by stringifying it first
+/// (`numeric_display_string`/`true`/`false`/`"null"`, the same conversion
+/// [`format_uri`]'s encode direction already applies) -- decoding a plain
+/// string with no `%` escapes is a no-op, so a stringified scalar just
+/// echoes back unchanged (`1.5 | @urid` is `"1.5"`). A container
+/// stringifies to the empty string rather than erroring (#1109) -- the
+/// same "container stringifies to empty" convention already duplicated at
+/// [`yq_join_element_part`]/[`yq_join_separator`]/`combine_sub_gap`'s own
+/// yq branch (#1072 tracks consolidating those), reused here rather than
+/// grown a fifth copy of a *different* rule. jq mode is unaffected: it
+/// keeps erroring on every non-string type, unchanged from before.
+fn format_urid<S: EvalSemantics>(value: &OwnedValue, optional: bool) -> Result<String, EvalError> {
+    let s = match value {
+        OwnedValue::String(s) => s.clone(),
+        _ if S::TAG == EvalTag::Yq => match value {
+            OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..) => {
+                numeric_display_string::<S>(value)
             }
-            Ok(result)
+            OwnedValue::Bool(b) => {
+                if *b {
+                    "true".to_string()
+                } else {
+                    "false".to_string()
+                }
+            }
+            OwnedValue::Null => "null".to_string(),
+            // Array/Object: stringifies to "" (#1109) -- decoding an empty
+            // string is itself a no-op below, so this needs no further
+            // special-casing past this stringification step.
+            _ => String::new(),
+        },
+        _ if optional => return Ok(String::new()),
+        _ => return Err(EvalError::type_error("string", value.type_name())),
+    };
+
+    let mut result = String::new();
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            // Try to parse the next two characters as hex
+            if let (Some(h1), Some(h2)) = (
+                (bytes[i + 1] as char).to_digit(16),
+                (bytes[i + 2] as char).to_digit(16),
+            ) {
+                let decoded = (h1 * 16 + h2) as u8;
+                result.push(decoded as char);
+                i += 3;
+                continue;
+            }
         }
-        _ if optional => Ok(String::new()),
-        _ => Err(EvalError::type_error("string", value.type_name())),
+        // Not a valid percent-encoded sequence, just copy the character
+        result.push(bytes[i] as char);
+        i += 1;
     }
+    Ok(result)
 }
 
 /// Quote a CSV/DSV string field: wrap in `"..."`, doubling inner `"`.
@@ -5740,54 +5770,89 @@ fn format_base64<S: EvalSemantics>(
 }
 
 /// @base64d - Base64 decode
-fn format_base64d(value: &OwnedValue, optional: bool) -> Result<String, EvalError> {
-    match value {
-        OwnedValue::String(s) => {
-            // Simple base64 decoding
-            fn decode_char(c: u8) -> Option<u8> {
-                match c {
-                    b'A'..=b'Z' => Some(c - b'A'),
-                    b'a'..=b'z' => Some(c - b'a' + 26),
-                    b'0'..=b'9' => Some(c - b'0' + 52),
-                    b'+' => Some(62),
-                    b'/' => Some(63),
-                    b'=' => Some(0), // Padding
-                    _ => None,
+///
+/// Real yq (v4.53.3, live-verified) accepts any scalar by stringifying it
+/// first, same as [`format_urid`] above -- most stringified scalars then
+/// fail to decode as valid base64 (`1 | @base64d` errors, since `"1"` is
+/// the wrong length), but that's this decoder's own leniency/strictness
+/// on the *string* it's given, unrelated to what type reached it; not
+/// touched here. A container stringifies to the empty string (#1109,
+/// same "container stringifies to empty" convention as `format_urid`),
+/// which trivially decodes to `""` (zero chunks) rather than needing its
+/// own early return. jq mode is unaffected: it keeps erroring on every
+/// non-string type, unchanged from before.
+fn format_base64d<S: EvalSemantics>(
+    value: &OwnedValue,
+    optional: bool,
+) -> Result<String, EvalError> {
+    let s = match value {
+        OwnedValue::String(s) => s.clone(),
+        _ if S::TAG == EvalTag::Yq => match value {
+            OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..) => {
+                numeric_display_string::<S>(value)
+            }
+            OwnedValue::Bool(b) => {
+                if *b {
+                    "true".to_string()
+                } else {
+                    "false".to_string()
                 }
             }
+            OwnedValue::Null => "null".to_string(),
+            _ => String::new(),
+        },
+        _ if optional => return Ok(String::new()),
+        _ => return Err(EvalError::type_error("string", value.type_name())),
+    };
 
-            let s = s.replace(|c: char| c.is_whitespace(), "");
-            let bytes: Vec<u8> = s.bytes().collect();
-            let mut result = Vec::new();
-
-            for chunk in bytes.chunks(4) {
-                if chunk.len() < 4 {
-                    break;
-                }
-
-                let a = decode_char(chunk[0]).ok_or_else(|| EvalError::new("invalid base64"))?;
-                let b = decode_char(chunk[1]).ok_or_else(|| EvalError::new("invalid base64"))?;
-                let c_val =
-                    decode_char(chunk[2]).ok_or_else(|| EvalError::new("invalid base64"))?;
-                let d = decode_char(chunk[3]).ok_or_else(|| EvalError::new("invalid base64"))?;
-
-                let triple =
-                    ((a as u32) << 18) | ((b as u32) << 12) | ((c_val as u32) << 6) | (d as u32);
-
-                result.push(((triple >> 16) & 0xFF) as u8);
-                if chunk[2] != b'=' {
-                    result.push(((triple >> 8) & 0xFF) as u8);
-                }
-                if chunk[3] != b'=' {
-                    result.push((triple & 0xFF) as u8);
-                }
-            }
-
-            String::from_utf8(result).map_err(|_| EvalError::new("invalid UTF-8 in decoded base64"))
+    // Simple base64 decoding
+    fn decode_char(c: u8) -> Option<u8> {
+        match c {
+            b'A'..=b'Z' => Some(c - b'A'),
+            b'a'..=b'z' => Some(c - b'a' + 26),
+            b'0'..=b'9' => Some(c - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            b'=' => Some(0), // Padding
+            _ => None,
         }
-        _ if optional => Ok(String::new()),
-        _ => Err(EvalError::type_error("string", value.type_name())),
     }
+
+    let s = s.replace(|c: char| c.is_whitespace(), "");
+    let bytes: Vec<u8> = s.bytes().collect();
+    let mut result = Vec::new();
+
+    for chunk in bytes.chunks(4) {
+        if chunk.len() < 4 {
+            break;
+        }
+
+        let a = decode_char(chunk[0]).ok_or_else(|| EvalError::new("invalid base64"))?;
+        let b = decode_char(chunk[1]).ok_or_else(|| EvalError::new("invalid base64"))?;
+        let c_val = decode_char(chunk[2]).ok_or_else(|| EvalError::new("invalid base64"))?;
+        let d = decode_char(chunk[3]).ok_or_else(|| EvalError::new("invalid base64"))?;
+
+        let triple = ((a as u32) << 18) | ((b as u32) << 12) | ((c_val as u32) << 6) | (d as u32);
+
+        result.push(((triple >> 16) & 0xFF) as u8);
+        if chunk[2] != b'=' {
+            result.push(((triple >> 8) & 0xFF) as u8);
+        }
+        if chunk[3] != b'=' {
+            result.push((triple & 0xFF) as u8);
+        }
+    }
+
+    // Lossy, not strict: real jq/yq's own `@base64d` never errors on
+    // invalid UTF-8 in the decoded bytes -- it substitutes the standard
+    // replacement character, confirmed live against both oracles
+    // (`"null" | @base64d` succeeds as `"\u{fffd}\u{fffd}e"` in jq 1.7.1,
+    // not an error). This surfaced while adding this function's `S`
+    // parameter (#1109): yq mode's new scalar-stringification path
+    // (`null`/`true`/... above) reaches this exact case for the first
+    // time, and the strict conversion previously here would have produced
+    // a different wrong error instead of matching the oracle.
+    Ok(String::from_utf8_lossy(&result).into_owned())
 }
 
 /// @html - HTML entity escape
