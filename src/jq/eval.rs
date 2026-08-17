@@ -37646,6 +37646,31 @@ mod tests {
     }
 
     #[test]
+    fn test_update_assign_iterate_then_field() {
+        // Unlike `.a[] |= f` above (a single trailing `Iterate` collapses
+        // to the simpler top-level bare-`Expr::Iterate` arm once past
+        // `.a`), `.a[].b |= f` keeps something *after* the iterate, so it's
+        // the shape that actually dispatches through the Pipe-chain arm's
+        // *own* `first == Expr::Iterate` branch, not the bare one.
+        query!(br#"{"a": [{"b": 1}, {"b": 2}]}"#, r".a[].b |= . * 10",
+            QueryResult::Owned(OwnedValue::Object(obj)) => {
+                let OwnedValue::Array(arr) = obj.get("a").unwrap() else {
+                    panic!("expected array");
+                };
+                assert_eq!(arr[0].as_object().unwrap().get("b").unwrap(), &OwnedValue::Int(10));
+                assert_eq!(arr[1].as_object().unwrap().get("b").unwrap(), &OwnedValue::Int(20));
+            }
+        );
+    }
+
+    #[test]
+    fn test_update_assign_iterate_then_field_propagates_element_error() {
+        query!(br#"{"a": [{"b": 1}, {"b": "x"}]}"#, r#".a[].b |= (if type == "number" then . * 10 else error("boom") end)"#,
+            QueryResult::Error(e) => assert_eq!(e.message, "boom")
+        );
+    }
+
+    #[test]
     fn test_update_assign_array_iterate_propagates_element_error() {
         // Bare `Expr::Iterate` arm's Array branch: `?` on the per-element
         // recursive `update_path` call must propagate a genuine error from
