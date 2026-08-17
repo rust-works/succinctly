@@ -261,6 +261,7 @@ fn rewrite_namespaced_calls(expr: Expr) -> Expr {
             left: Box::new(rewrite_namespaced_calls(*left)),
             right: Box::new(rewrite_namespaced_calls(*right)),
         },
+        Expr::Negate(inner) => Expr::Negate(Box::new(rewrite_namespaced_calls(*inner))),
         Expr::Compare { op, left, right } => Expr::Compare {
             op,
             left: Box::new(rewrite_namespaced_calls(*left)),

@@ -2279,6 +2279,7 @@ fn contains_split_doc(expr: &Expr) -> bool {
         | Expr::FirstExpr(inner)
         | Expr::LastExpr(inner)
         | Expr::Repeat(inner)
+        | Expr::Negate(inner)
         | Expr::Error(Some(inner)) => contains_split_doc(inner),
         Expr::Arithmetic { left, right, .. }
         | Expr::Compare { left, right, .. }

@@ -461,6 +461,13 @@ pub(crate) fn needs_path_context(expr: &Expr) -> bool {
         Expr::Arithmetic { left, right, .. } => {
             needs_path_context(left) || needs_path_context(right)
         }
+        // Same reasoning as `Arithmetic` above: a `key`/`file_index` can
+        // hide inside unary minus's single operand too, e.g.
+        // `-(file_index)` (#1100). Without this arm the whole pipe reports
+        // `needs_path_context == false` and silently falls back to
+        // `eval_single`'s 0-stub `file_index` instead of erroring or
+        // resolving correctly.
+        Expr::Negate(inner) => needs_path_context(inner),
         Expr::Builtin(Builtin::Select(cond)) => needs_path_context(cond),
         // `map(f)` needs the same recursion as `Select` above -- e.g.
         // `map(select(file_index == 0))`, previously silently stubbed to 0
@@ -661,6 +668,8 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Expr::Arithmetic { op, left, right } => {
             eval_arithmetic::<W, S>(*op, left, right, value, optional)
         }
+
+        Expr::Negate(operand) => eval_negate::<W, S>(operand, value, optional),
 
         Expr::Compare { op, left, right } => {
             eval_compare::<W, S>(*op, left, right, value, optional)
@@ -1638,6 +1647,78 @@ fn binary_fanout_core<'a, W: Clone + AsRef<[u64]>>(
     }
 }
 
+/// Shared unary fork/negate/finish core behind [`eval_negate`] and its
+/// path-context sibling -- the same operand-evaluation-strategy split
+/// [`binary_fanout_core`] established for the binary case (#768), applied
+/// here to unary minus's single operand (#1100): fork `operand_result` into
+/// every output it produces, negating each one via `arith_negate`.
+/// `-(1,2,3)` still yields one negated result per generator output. The
+/// operand's own trailing escape goes through `partial` unconditionally;
+/// `arith_negate`'s own error is what `finish_fork` gates on `optional` --
+/// deliberately a dedicated function rather than reusing
+/// [`eval_binary_fanout`] with a dummy left operand the way
+/// `ArithOp::Negate` used to, since that dummy was evaluated once per real
+/// output instead of once overall.
+fn negate_fanout_core<W, S: EvalSemantics>(
+    operand_result: QueryResult<'_, W>,
+    optional: bool,
+) -> QueryResult<'_, W>
+where
+    W: Clone + AsRef<[u64]>,
+{
+    let mut vals = Vec::new();
+    let control = push_owned_values(operand_result, &mut vals);
+
+    let mut out: Vec<OwnedValue> = Vec::new();
+    for val in vals {
+        match arith_negate::<S>(val) {
+            Ok(v) => out.push(v),
+            Err(e) => return finish_fork(out, Some(e.into()), optional),
+        }
+    }
+
+    match control {
+        Some(c) => partial(out, c),
+        None => owned_vec_to_result(out),
+    }
+}
+
+fn eval_negate<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    operand: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    negate_fanout_core::<W, S>(eval_single::<W, S>(operand, value, optional), optional)
+}
+
+/// Path-context analog of [`eval_negate`] (mirroring
+/// [`eval_binary_fanout_with_path_context`]'s relationship to
+/// [`eval_binary_fanout`]): routes the operand through
+/// [`eval_pipe_with_path_context_internal`] instead of [`eval_single`] so
+/// `key`/`parent`/`file_index` nested inside `-expr` still resolve against
+/// `root`/`current_path`/`file_origin`, matching `Expr::Arithmetic`'s own
+/// dedicated path-context arm just above (#715/#822).
+fn eval_negate_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    operand: &Expr,
+    value: &OwnedValue,
+    root: &OwnedValue,
+    file_origin: Option<&[usize]>,
+    current_path: &[OwnedValue],
+    optional: bool,
+) -> QueryResult<'a, W> {
+    negate_fanout_core::<W, S>(
+        eval_pipe_with_path_context_internal::<W, S>(
+            core::slice::from_ref(operand),
+            value,
+            root,
+            file_origin,
+            current_path,
+            optional,
+        ),
+        optional,
+    )
+}
+
 fn eval_binary_fanout<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     left: &Expr,
     right: &Expr,
@@ -1673,9 +1754,6 @@ fn eval_arithmetic<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             ArithOp::Mul(flags) => arith_mul::<S>(left_val, right_val, flags),
             ArithOp::Div => arith_div::<S>(left_val, right_val),
             ArithOp::Mod => arith_mod::<S>(left_val, right_val),
-            // `left_val` is always the unused dummy (see `ArithOp::Negate`'s
-            // own doc comment).
-            ArithOp::Negate => arith_negate::<S>(right_val),
         },
     )
 }
@@ -13795,6 +13873,9 @@ fn substitute_var(expr: &Expr, var_name: &str, replacement: &OwnedValue) -> Expr
             left: Box::new(substitute_var(left, var_name, replacement)),
             right: Box::new(substitute_var(right, var_name, replacement)),
         },
+        Expr::Negate(operand) => {
+            Expr::Negate(Box::new(substitute_var(operand, var_name, replacement)))
+        }
         Expr::Compare { op, left, right } => Expr::Compare {
             op: *op,
             left: Box::new(substitute_var(left, var_name, replacement)),
@@ -16620,9 +16701,6 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
                     ArithOp::Mul(flags) => arith_mul::<S>(left_val, right_val, *flags),
                     ArithOp::Div => arith_div::<S>(left_val, right_val),
                     ArithOp::Mod => arith_mod::<S>(left_val, right_val),
-                    // `left_val` is always the unused dummy (see
-                    // `ArithOp::Negate`'s own doc comment).
-                    ArithOp::Negate => arith_negate::<S>(right_val),
                 },
             );
             if rest.is_empty() {
@@ -16637,6 +16715,31 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
             // `ManyOwned`/`Partial`/`Break`, not just `Owned`/`None`/`Error`.
             continue_rest_with_context::<W, S>(
                 arith_result,
+                rest,
+                root,
+                file_origin,
+                current_path,
+                optional,
+            )
+        }
+        Expr::Negate(operand) => {
+            // Same `key`/`file_index`-inside-the-operand reasoning as
+            // `Arithmetic` above -- `-select(file_index==0)` needs the
+            // path-context evaluator too, not the 0-stub `eval_single`
+            // would otherwise use for the operand (#1100).
+            let negate_result = eval_negate_with_path_context::<W, S>(
+                operand,
+                value,
+                root,
+                file_origin,
+                current_path,
+                optional,
+            );
+            if rest.is_empty() {
+                return negate_result;
+            }
+            continue_rest_with_context::<W, S>(
+                negate_result,
                 rest,
                 root,
                 file_origin,
@@ -23516,6 +23619,9 @@ fn expand_func_calls(expr: &Expr, func_name: &str, params: &[String], body: &Exp
             left: Box::new(expand_func_calls(left, func_name, params, body)),
             right: Box::new(expand_func_calls(right, func_name, params, body)),
         },
+        Expr::Negate(operand) => Expr::Negate(Box::new(expand_func_calls(
+            operand, func_name, params, body,
+        ))),
         Expr::Compare { op, left, right } => Expr::Compare {
             op: *op,
             left: Box::new(expand_func_calls(left, func_name, params, body)),
@@ -23778,6 +23884,7 @@ fn substitute_func_param(expr: &Expr, param: &str, arg: &Expr) -> Expr {
             left: Box::new(substitute_func_param(left, param, arg)),
             right: Box::new(substitute_func_param(right, param, arg)),
         },
+        Expr::Negate(operand) => Expr::Negate(Box::new(substitute_func_param(operand, param, arg))),
         Expr::Compare { op, left, right } => Expr::Compare {
             op: *op,
             left: Box::new(substitute_func_param(left, param, arg)),
@@ -39138,6 +39245,57 @@ mod tests {
             eval_all_outputs(b"[10]", &[0], ".[] | (((1,2) + (10,20)), file_index)"),
             vec!["11", "12", "21", "22", "0"]
         );
+    }
+
+    #[test]
+    fn test_negate_continues_pipe_with_path_context_1100() {
+        assert_eq!(
+            eval_all_outputs(b"[10,20]", &[7, 8], ".[] | -(file_index) | tostring"),
+            vec![r#""-7""#, r#""-8""#]
+        );
+    }
+
+    #[test]
+    fn test_negate_operand_error_propagates_with_path_context_1100() {
+        match eval_all_result(b"[1]", &[0], r#".[] | (-error("boom")) | file_index"#) {
+            QueryResult::Error(e) => assert_eq!(e.message, "boom"),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_negate_multi_output_operand_fans_out_with_path_context_1100() {
+        // Same "one negated result per generator output" contract
+        // `test_unary_minus_zero_preserves_sign_1056` already asserts for
+        // `eval_single`'s non-path-context `eval_negate`, but for
+        // `eval_negate_with_path_context` (#1100).
+        assert_eq!(
+            eval_all_outputs(b"[10]", &[0], ".[] | (-(1,2,3), file_index)"),
+            vec!["-1", "-2", "-3", "0"]
+        );
+    }
+
+    #[test]
+    fn test_negate_inside_select_condition_with_path_context_1100() {
+        // `needs_path_context`'s own `Compare`/`Select` arms recurse into
+        // their operands to catch a nested `key`/`file_index` (#715) --
+        // `-file_index` is a `Negate` wrapping the same `FileIndex` builtin,
+        // so it needs the identical recursion (#1100). This regressed to
+        // silently comparing against the 0-stub `file_index` (always false
+        // for file 1) before `needs_path_context` grew a `Negate` arm.
+        assert_eq!(
+            eval_all_outputs(b"[10,20]", &[0, 1], ".[] | select(-file_index == -1)"),
+            vec!["20"]
+        );
+    }
+
+    #[test]
+    fn test_map_negate_preserves_all_elements() {
+        // Regression for #1100: `Expr::Negate` maps `arith_negate` over each
+        // generator output directly rather than routing through
+        // `eval_binary_fanout`'s dummy-`left`-operand rewrite -- confirm
+        // `map(-.)` still negates every element, not just the first.
+        assert_eq!(outputs(b"[1,2,3]", "map(-.)"), vec!["[-1,-2,-3]"]);
     }
 
     #[test]

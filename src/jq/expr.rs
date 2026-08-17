@@ -117,6 +117,19 @@ pub enum Expr {
         right: Box<Self>,
     },
 
+    /// Unary minus: `-expr` (#1100). A dedicated single-child variant,
+    /// matching this AST's own convention for unary operations (`Paren`,
+    /// `Optional`, `Select`, etc. above) -- unlike the `ArithOp::Negate`
+    /// approach it replaces, which reused `Expr::Arithmetic`'s binary shape
+    /// with an always-unused dummy `left` operand purely to borrow its
+    /// existing fan-out (cartesian-product) machinery. That reuse worked
+    /// correctly but re-evaluated the dummy operand once per output the
+    /// real operand produced (`map(-.)` over N elements: N wasted dummy
+    /// evaluations); this variant evaluates its one real operand directly,
+    /// mapping `arith_negate` over each output instead of routing through
+    /// the binary fan-out path at all.
+    Negate(Box<Self>),
+
     /// Comparison operation: `.a == .b`, `.a != .b`, `.a < .b`, etc.
     Compare {
         op: CompareOp,
@@ -1031,16 +1044,6 @@ pub enum ArithOp {
     Div,
     /// Modulo: `%`
     Mod,
-    /// Unary minus: `-expr` (#1056). A true IEEE-754 negation, not `0 -
-    /// expr` (loses the sign of a zero-valued operand) or `-1 * expr`
-    /// (silently inherits `*`'s unrelated string-repetition and
-    /// null-passthrough semantics instead of erroring on a non-numeric
-    /// operand -- caught by code review before this reached `main`). Reuses
-    /// `Expr::Arithmetic`'s binary shape purely for its existing fan-out
-    /// machinery (a generator operand like `-(1,2,3)` still needs to
-    /// produce one negated result per output); `left` is always a dummy
-    /// `Expr::Literal(Literal::Null)` that the evaluator ignores.
-    Negate,
 }
 
 /// yq merge-flag suffixes on the `*`/`*=` merge operator (e.g. `*+d`, `*=nd`).
