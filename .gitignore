@@ -25,10 +25,15 @@ target
 # AI scratch directory (temporary files for AI assistants)
 .ai/
 
-# Manual yq/jq CLI testing fixture — untracked so ad hoc testing (e.g. `-i`
+# Manual yq/jq CLI testing fixtures — untracked so ad hoc testing (e.g. `-i`
 # inplace edits) never dirties the tree; use .ai/scratch/ for this instead.
-/.yml
-/1.yml
+# Root-anchored only (doesn't touch tests/data/, .github/workflows/, etc.).
+# Started as two specific filenames (/.yml, /1.yml) after each was hit by
+# this exact failure mode in turn (0da3b8997, #1086) -- generalized after
+# the second incident, since `git ls-files` confirms zero tracked root-level
+# .yml/.yaml files exist, so this costs nothing today.
+/*.yml
+/*.yaml
 
 # Generated benchmark data
 data/bench/generated/
