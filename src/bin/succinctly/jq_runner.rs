@@ -1474,9 +1474,106 @@ fn parse_json_value(s: &str) -> Result<OwnedValue> {
         return Ok(OwnedValue::Null);
     }
 
-    serde_json::from_str::<serde_json::Value>(s).with_context(|| format!("Invalid JSON: {s}"))?;
+    if let Err(e) = serde_json::from_str::<serde_json::Value>(s) {
+        // Real jq's own number parser tolerates a leading zero (`007`,
+        // `00`, `007.5`) that strict JSON doesn't (#1094) -- retry once
+        // with every number token's leading zero stripped (string
+        // contents/keys left untouched) before surfacing the original
+        // error. Only paid on this (rare) failure path, so the common
+        // case's validation cost is unaffected. `json_bytes_to_owned_value`
+        // below still runs on the *original* text, not the normalized one:
+        // this crate's own semi-indexer already tolerates a leading zero
+        // on its own (confirmed live), so there's nothing left to repair
+        // for it.
+        let normalized = normalize_leading_zero_numbers(s);
+        if normalized == s || serde_json::from_str::<serde_json::Value>(&normalized).is_err() {
+            return Err(e).with_context(|| format!("Invalid JSON: {s}"));
+        }
+    }
 
     Ok(crate::output::json_bytes_to_owned_value(s.as_bytes()))
+}
+
+/// Strip a leading zero from every JSON number token in `s` (`007` ->
+/// `7`, `-00` -> `-0`, `007.5` -> `7.5`), leaving string contents/keys and
+/// all other structure untouched. Real jq's own number parser tolerates a
+/// leading zero (unlike strict RFC 8259 JSON); this repairs just that one
+/// divergence before re-validating with `serde_json` (#1094) -- the
+/// trailing-garbage/number-range checks that validation exists for still
+/// apply to the normalized text exactly as before.
+fn normalize_leading_zero_numbers(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(s.len());
+    let mut i = 0;
+    let mut in_string = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_string {
+            out.push(b);
+            if b == b'\\' && i + 1 < bytes.len() {
+                out.push(bytes[i + 1]);
+                i += 2;
+                continue;
+            }
+            if b == b'"' {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+        if b == b'"' {
+            in_string = true;
+            out.push(b);
+            i += 1;
+            continue;
+        }
+        if b == b'-' || b.is_ascii_digit() {
+            let start = i;
+            if b == b'-' {
+                i += 1;
+            }
+            let int_start = i;
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                i += 1;
+            }
+            let stripped = s[int_start..i].trim_start_matches('0');
+            out.extend_from_slice(&bytes[start..int_start]);
+            out.extend_from_slice(if stripped.is_empty() {
+                b"0"
+            } else {
+                stripped.as_bytes()
+            });
+            if i < bytes.len() && bytes[i] == b'.' {
+                let frac_start = i;
+                i += 1;
+                while i < bytes.len() && bytes[i].is_ascii_digit() {
+                    i += 1;
+                }
+                out.extend_from_slice(&bytes[frac_start..i]);
+            }
+            if i < bytes.len() && (bytes[i] == b'e' || bytes[i] == b'E') {
+                let exp_start = i;
+                i += 1;
+                if i < bytes.len() && (bytes[i] == b'+' || bytes[i] == b'-') {
+                    i += 1;
+                }
+                while i < bytes.len() && bytes[i].is_ascii_digit() {
+                    i += 1;
+                }
+                out.extend_from_slice(&bytes[exp_start..i]);
+            }
+            continue;
+        }
+        // Every byte reaching here is copied verbatim, one at a time,
+        // whether ASCII structural syntax or (only possible inside a
+        // string, already handled above) a multi-byte UTF-8 continuation
+        // byte -- `out` ends up byte-identical to `s` except for the
+        // leading-zero digits actually stripped above, so `from_utf8`
+        // below can never fail.
+        out.push(b);
+        i += 1;
+    }
+    String::from_utf8(out).expect("only ever copies s's own bytes verbatim or drops leading ASCII '0' digits, never splits a multi-byte sequence")
 }
 
 /// Parse a JSON stream (multiple JSON values) from a string (`--slurpfile`).
