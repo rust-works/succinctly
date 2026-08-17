@@ -4245,8 +4245,10 @@ fn builtin_split<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// object) becomes an empty-string part -- `[1,null,2] | join(",")` is
 /// `"1,,2"`, and `[[1,2],"a"] | join(",")` is `",a"`, not `"[1,2],a"` (real
 /// yq never JSON-encodes a nested container into a join part the way it does
-/// for other unsupported operations). Everything else (number, boolean)
-/// renders via its JSON text, same as jq's own element rule.
+/// for other unsupported operations). A number renders via
+/// `numeric_display_string` (`tostring`'s own convention, #1124), not
+/// `to_json_yq()`'s structural-output rules; boolean still renders via its
+/// JSON text.
 ///
 /// Takes `elem` by value (moved from [`to_owned_key_shape`] at the call
 /// site, not [`to_owned`]) so a container element's contents are never
@@ -4270,8 +4272,58 @@ fn yq_join_nonfinite_part(value: &OwnedValue) -> Option<String> {
     }
 }
 
+/// Stringifies a finite Int/Float/NumberLiteral `join` element or separator
+/// for yq mode, shared by [`yq_join_element_part`]/[`yq_join_separator`] the
+/// same way [`yq_join_nonfinite_part`] above already shares the NaN/Infinity
+/// case (#1124 review: this arm was initially hand-copied at both call
+/// sites, exactly the #106 "duplicated predicates diverge silently" pattern
+/// `yq_join_nonfinite_part`'s own doc comment already names).
+///
+/// `numeric_display_string`, not `to_json_yq()`: a joined string isn't
+/// structural output, so it shouldn't follow `to_json_yq()`'s structural
+/// rules, which `numeric_display_string`'s `Float` case diverges from in two
+/// confirmed ways (live-verified against yq v4.53.3): it never forces a
+/// trailing `.0` (`format_float_with_fraction`, #953, exists specifically
+/// for round-trip type fidelity, which a join part doesn't need -- `2.0/2`
+/// is `"1"`, not `"1.0"`), and it applies yq's own scientific-notation
+/// magnitude threshold instead of always staying decimal (`1e10*2` is
+/// `"2e+10"`, not `"20000000000.0"`). `NumberLiteral`'s verbatim source-text
+/// echo is unaffected by either change, since `numeric_display_string`
+/// reaches the same `real_output_finite_literal` call `to_json_yq()` used
+/// for that case, and `Int` formatting (`n.to_string()`, matching
+/// `to_json_yq()`'s `format!("{n}")` byte-for-byte) is likewise unaffected.
+///
+/// This still doesn't fully close #1124's own repro (`(2.0/2) | [.] |
+/// join(",")` still gives `"1.0"`, not real yq's `"1"`): `builtin_join`'s
+/// array branch only ever sees a cursor-backed element, and a *constructed*
+/// array reaches that cursor by round-tripping through `to_json_for_reindex`
+/// first, which bakes the decimal point into synthesized `NumberLiteral`
+/// source text indistinguishable from a genuine document literal -- this
+/// function never actually receives a bare `OwnedValue::Float` for that
+/// case. Tracked separately as #1144 (broadened to cover `@csv`/`@tsv`/
+/// string interpolation too, which share the identical root cause), since
+/// fixing it needs either tagging a reindexed `NumberLiteral` as
+/// non-document-sourced or a cursor-free path for constructed arrays, not a
+/// change here. This function still has real, confirmed effect on
+/// [`yq_join_separator`]'s case (`sep_expr` evaluates directly to an owned
+/// value, with no cursor round-trip in between) and on any element that
+/// genuinely reaches `join` as a bare computed `Float` some other way (e.g.
+/// a document-sourced `.nan`/`.inf` scalar, which `from_number_bytes`
+/// likewise degrades to a bare `Float`, not a `NumberLiteral`).
+fn yq_join_numeric_part(value: &OwnedValue) -> Option<String> {
+    match value {
+        OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..) => {
+            Some(numeric_display_string::<YqSemantics>(value))
+        }
+        _ => None,
+    }
+}
+
 fn yq_join_element_part(elem: OwnedValue) -> String {
     if let Some(s) = yq_join_nonfinite_part(&elem) {
+        return s;
+    }
+    if let Some(s) = yq_join_numeric_part(&elem) {
         return s;
     }
     match elem {
@@ -4285,33 +4337,6 @@ fn yq_join_element_part(elem: OwnedValue) -> String {
         // special case is instead handled at the call site, on the live
         // cursor, before that collapse ever runs.
         OwnedValue::Null | OwnedValue::Array(_) | OwnedValue::Object(_) => String::new(),
-        // Int/Float/NumberLiteral: `numeric_display_string`, not
-        // `to_json_yq()` (#1124) -- `to_json_yq()`'s `Float` formatting
-        // deliberately forces a decimal point (`format_float_with_fraction`,
-        // #953) for JSON/YAML *structural* output round-trip fidelity, but a
-        // joined string isn't structural output. `NumberLiteral`'s verbatim
-        // source-text echo is unaffected either way, since
-        // `numeric_display_string` reaches the same `real_output_finite_literal`
-        // call `to_json_yq()` used for that case.
-        //
-        // This still doesn't fully close #1124's own repro
-        // (`(2.0/2) | [.] | join(",")` still gives `"1.0"`, not real yq's
-        // `"1"`): `builtin_join`'s array branch only ever sees a cursor-backed
-        // element, and a *constructed* array reaches that cursor by
-        // round-tripping through `to_json_for_reindex` first, which bakes the
-        // decimal point into synthesized `NumberLiteral` source text
-        // indistinguishable from a genuine document literal -- this arm never
-        // actually receives a bare `OwnedValue::Float` for that case. Tracked
-        // separately as #1144, since fixing it needs either tagging a
-        // reindexed `NumberLiteral` as non-document-sourced or a cursor-free
-        // path for constructed arrays, not a change here. This arm still has
-        // real, confirmed effect on [`yq_join_separator`]'s sibling case below
-        // (`sep_expr` evaluates directly to an owned value, with no cursor
-        // round-trip in between) and on any element that genuinely reaches
-        // `join` as a bare computed `Float` some other way.
-        other @ (OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..)) => {
-            numeric_display_string::<YqSemantics>(&other)
-        }
         // Bool is unaffected either way (`to_json_yq()` and
         // `numeric_display_string` agree on `"true"`/`"false"`); kept on
         // `to_json_yq()` since it's not itself numeric-formatting-related.
@@ -4321,15 +4346,20 @@ fn yq_join_element_part(elem: OwnedValue) -> String {
 
 /// Stringifies `join`'s separator for yq mode (#1041): a string passes
 /// through, a container (array or object) becomes empty (no separator
-/// inserted at all). Everything else -- including `null`, unlike an
-/// element's own `null` handling above -- renders via its JSON text:
-/// `["a","b"] | join(null)` is `"anullb"`, the literal text "null" used as a
-/// real separator, not a no-op (confirmed live; #1003's PR #1036 review
-/// flagged this element/separator asymmetry as a real, separate divergence
-/// from jq mode, where `null` is a no-op only via `+`'s own left-identity
-/// rule, not something `join` special-cases).
+/// inserted at all). A number renders via `numeric_display_string`
+/// (`tostring`'s own convention, #1124; see [`yq_join_numeric_part`]).
+/// Everything else -- including `null`, unlike an element's own `null`
+/// handling above -- renders via its JSON text: `["a","b"] | join(null)` is
+/// `"anullb"`, the literal text "null" used as a real separator, not a no-op
+/// (confirmed live; #1003's PR #1036 review flagged this element/separator
+/// asymmetry as a real, separate divergence from jq mode, where `null` is a
+/// no-op only via `+`'s own left-identity rule, not something `join`
+/// special-cases).
 fn yq_join_separator(sep: OwnedValue) -> String {
     if let Some(s) = yq_join_nonfinite_part(&sep) {
+        return s;
+    }
+    if let Some(s) = yq_join_numeric_part(&sep) {
         return s;
     }
     match sep {
@@ -4339,13 +4369,6 @@ fn yq_join_separator(sep: OwnedValue) -> String {
         // `"1{}2"` in real yq, not `"12"`.
         OwnedValue::Object(ref m) if m.is_empty() => "{}".to_string(),
         OwnedValue::Array(_) | OwnedValue::Object(_) => String::new(),
-        // `numeric_display_string`, not `to_json_yq()` (#1124): same
-        // reasoning as `yq_join_element_part` above -- confirmed live,
-        // `[1,2] | join(2.0/2)` is `"112"` (separator `"1"`) in real yq, not
-        // `"11.02"`.
-        other @ (OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..)) => {
-            numeric_display_string::<YqSemantics>(&other)
-        }
         // `to_json_yq()` (#1030 code review): same reasoning as
         // `yq_join_element_part` above -- this function is yq-only.
         other => other.to_json_yq(),
