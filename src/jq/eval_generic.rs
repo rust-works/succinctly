@@ -100,32 +100,6 @@ pub fn assert_nesting_depth(depth: usize) {
     super::value::assert_depth(depth, MAX_NESTING_DEPTH);
 }
 
-/// Panics on a string scalar that passed structural validation (the
-/// semi-index accepted its span as a `String` token) but failed to decode
-/// -- an invariant this crate's own document-input path and `--argjson`
-/// both currently enforce upstream (`serde_json`'s strict parse, and this
-/// crate's own semi-index structural checks), so no live CLI input reaches
-/// this today (#1098). `JsonIndex::build`'s scan finds string quote/escape
-/// *boundaries* without decoding/validating what's between them, though,
-/// so a library caller feeding raw bytes to `JsonIndex::build` directly
-/// (bypassing the CLI's own UTF-8 sanitizing file-read step) can reach it
-/// -- confirmed live in this function's own regression test. Panicking
-/// rather than silently materializing `null`/`""` keeps a future drift
-/// between this crate's lenient semi-index grammar and its own stricter
-/// decode step loud instead of turning it into silent data corruption.
-///
-/// Shared by [`to_owned_at_depth`] (which only has a bool signal here --
-/// the `DocumentValue` trait's `as_str()` already discarded the specific
-/// decode error via `.ok()`) and
-/// [`lazy::cursor_to_owned_at_depth`](super::lazy) (which works with
-/// `JsonString` directly and could recover the concrete error), so the two
-/// panic sites can't independently drift on wording (#106).
-#[cold]
-#[track_caller]
-pub(crate) fn panic_on_string_decode_failure() -> ! {
-    panic!("string scalar failed to decode despite passing structural validation (#1098)");
-}
-
 /// Convert a DocumentValue to an OwnedValue.
 ///
 /// This enables the evaluator to work with both JSON and YAML inputs.
@@ -172,16 +146,23 @@ fn to_owned_at_depth<V: DocumentValue>(value: &V, depth: usize) -> OwnedValue {
         OwnedValue::Float(f)
     } else if let Some(s) = value.as_str() {
         OwnedValue::String(s.into_owned())
-    } else if value.type_name() == "string" {
-        // `as_str()` returned `None` despite `type_name()` reporting this
-        // node is a string -- it's structurally a JSON/YAML string scalar,
-        // but decoding it failed (invalid `\u` escape, invalid UTF-8, ...)
-        // and `as_str()`'s `Option` signature swallows the specific `Err`
-        // via `.ok()` (#1098). See `panic_on_string_decode_failure`'s own
-        // doc comment for why this is a panic rather than a silent `null`.
-        panic_on_string_decode_failure();
     } else {
-        // Covers error values and any unknown types
+        // Covers error values, any unknown types, and -- deliberately, see
+        // #1098 -- a string scalar that passed structural validation (the
+        // semi-index accepted its span as a `String` token) but failed to
+        // decode (invalid `\u` escape, invalid UTF-8, ...). A `PR #1190`
+        // attempt to make that last case panic instead was reverted: code
+        // review found it's reachable through completely ordinary CLI
+        // usage (any non-identity query over a document containing such a
+        // string), not just a theoretical library-only edge case, which
+        // turns a low-severity silent-`null` bug into a live crash --
+        // including mid-batch, defeating this crate's own documented
+        // "evaluation continues past one error" convention (`ErrorSink`,
+        // #355). A correct fix needs to route through `EvalError`/
+        // `ErrorSink` instead, applied consistently across every sibling
+        // copy of this conversion and to object/mapping keys too (see
+        // #1098's own follow-up discussion) -- deferred as a properly
+        // scoped design item rather than shipped as a panic.
         OwnedValue::Null
     }
 }
@@ -3955,24 +3936,26 @@ mod tests {
     /// *boundaries* but never decodes/validates the bytes between them --
     /// that's deferred to `JsonString::as_str()`, called lazily by
     /// `to_owned_at_depth`. So invalid UTF-8 inside a string span parses
-    /// and indexes fine (`JsonIndex::build` never errors), and only fails
-    /// once materialization reaches it. The CLI itself never reaches this
-    /// (its own file-reading step lossy-converts the whole input to UTF-8
-    /// before the JSON parser ever sees it -- confirmed live: a file with
-    /// `\xff\xfe` inside a string prints as replacement characters, not an
-    /// error), but any library caller feeding `JsonIndex::build` raw bytes
-    /// directly (skipping that CLI-specific safety net) can reach this.
+    /// and indexes fine (`JsonIndex::build` never errors), and only
+    /// degrades once materialization reaches it, here to `Null` for that
+    /// field -- pins the known, deliberate, low-severity gap this issue
+    /// describes (see `to_owned_at_depth`'s own `else` arm doc comment for
+    /// why a stricter fix was attempted and reverted; a panic here is
+    /// reachable via completely ordinary CLI usage, not just a library
+    /// caller feeding raw bytes directly, and defeats this crate's
+    /// "evaluation continues past one error" convention).
     #[test]
-    #[should_panic(
-        expected = "string scalar failed to decode despite passing structural validation (#1098)"
-    )]
-    fn test_to_owned_panics_on_string_decode_failure_1098() {
+    fn test_to_owned_degrades_to_null_on_string_decode_failure_1098() {
         use crate::json::JsonIndex;
         let json: &[u8] = b"{\"a\": \"\xff\xfe\"}";
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let value = cursor.value();
-        to_owned(&value);
+        let owned = to_owned(&value);
+        let OwnedValue::Object(map) = owned else {
+            panic!("expected an object");
+        };
+        assert_eq!(map.get("a"), Some(&OwnedValue::Null));
     }
     use crate::jq::parse;
     use crate::json::JsonIndex;
