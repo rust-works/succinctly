@@ -166,14 +166,19 @@ impl<'a, W: Clone + AsRef<[u64]>> JqValue<'a, W> {
     }
 
     /// Create from a literal.
+    ///
+    /// Only `NumberLiteral` needs its own arm (#1062): `JqValue` defers
+    /// parsing a number literal's text until it's actually read, unlike
+    /// `OwnedValue::from_number_literal_boxed` (via `super::value::OwnedValue:
+    /// From<Literal>`), which parses eagerly -- the two target types
+    /// genuinely disagree on when that work happens, so this one arm can't
+    /// delegate. Every other variant carries no such difference, so those
+    /// route through the same canonical conversion `literal_to_owned` uses,
+    /// rather than re-listing five arms a third time.
     pub fn from_literal(lit: &Literal) -> Self {
         match lit {
-            Literal::Null => JqValue::Null,
-            Literal::Bool(b) => JqValue::Bool(*b),
             Literal::NumberLiteral(text) => JqValue::NumberLiteral(text.as_str().into()),
-            Literal::Int(n) => JqValue::Int(*n),
-            Literal::Float(f) => JqValue::Float(*f),
-            Literal::String(s) => JqValue::String(s.clone()),
+            _ => JqValue::from_owned(OwnedValue::from(lit.clone())),
         }
     }
 

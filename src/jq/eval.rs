@@ -761,12 +761,17 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 }
 
 /// Convert a literal to an owned value.
-/// Delegates to `OwnedValue`'s own `From<Literal>` impl (#1062) rather than
-/// re-listing the same six arms a third time -- `Literal: Clone` makes the
-/// borrow-to-owned crossing a single clone of the `Literal` itself (its
-/// `String`/`NumberLiteral` payload, same as this function's own arms used
-/// to clone directly), not an extra allocation on top of what was here
-/// before.
+///
+/// Delegates to `OwnedValue`'s own `From<Literal>` impl (#1062, see its doc
+/// comment for the two other conversions this crate carries: `eval_generic.rs`'s
+/// call site here, and `lazy.rs`'s partial one for `JqValue`) rather than
+/// re-listing the same six arms a third time. For the `String`/
+/// `NumberLiteral` variants this is the same single text-payload clone the
+/// old per-arm body paid directly; for the trivially-`Copy` variants
+/// (`Null`/`Bool`/`Int`/`Float`) it clones the whole (small, stack-only)
+/// `Literal` enum rather than reading the matched field alone -- no heap
+/// allocation either way, just a few extra bytes copied on the stack, not
+/// worth a second hand-matched arm to avoid.
 pub(crate) fn literal_to_owned(lit: &Literal) -> OwnedValue {
     OwnedValue::from(lit.clone())
 }

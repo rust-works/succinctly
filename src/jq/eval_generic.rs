@@ -2534,8 +2534,10 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
             eval_first_or_last_generic::<S, _>(inner, value, optional, cursor, true)
         }
 
-        // #1062: was a fourth hand-rolled arm-for-arm copy of the same six
-        // `Literal` variants; delegates to the one canonical conversion now.
+        // #1062: was a hand-rolled arm-for-arm copy of the same six
+        // `Literal` variants (one of three targeting `OwnedValue` -- see
+        // `literal_to_owned`'s own doc comment for the other two); delegates
+        // to the shared conversion now instead.
         Expr::Literal(lit) => GenericResult::Owned(literal_to_owned(lit)),
 
         // Formats are pure functions of the value, so evaluate them here rather
