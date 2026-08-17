@@ -4396,6 +4396,63 @@ fn test_yaml_explicit_key_colon_without_space_stays_key_text() -> Result<()> {
 }
 
 // =============================================================================
+// Explicit key followed by a same-indent sequence (#1040) --
+// `close_same_indent_sequence_before_mapping_entry` popped the sequence
+// without clearing `pending_explicit_key`, so a later mapping entry at the
+// same indent was silently misattributed to the already-closed key instead
+// of starting fresh.
+//
+// Note: real yq v4.53.3 actually *rejects* `? k\n- item\n...` outright
+// ("did not find expected key") -- an explicit key's value must always be
+// introduced by `:`, unlike an ordinary `key:` entry, which does accept a
+// same-indent sequence as an implicit value. succinctly doesn't reproduce
+// that rejection (a deeper, separate gap -- see the issue's follow-up); the
+// fix here is scoped to what #1040 actually named: eliminating the silent
+// data loss and phantom key once the parser has (incorrectly, but
+// harmlessly by this point) accepted the sequence as the key's value.
+// =============================================================================
+
+#[test]
+fn test_yaml_explicit_key_same_indent_sequence_then_new_entry_1040() -> Result<()> {
+    // The issue's second (worse) repro: a field after the sequence used to
+    // vanish entirely, replaced by a phantom "" key stealing the next
+    // field's value.
+    let input = "? k\n- item\nnewkey: v\nthirdkey: w\n";
+    let (output, exit_code) = run_yq_stdin(".", input, &["-o=json", "-I=0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(
+        output.trim(),
+        r#"{"k":["item"],"newkey":"v","thirdkey":"w"}"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_yaml_explicit_key_same_indent_sequence_then_new_entry_agrees_across_positions_1040(
+) -> Result<()> {
+    // Two new entries after the sequence, and a third to confirm the
+    // mapping keeps accepting ordinary entries afterward rather than only
+    // recovering for one.
+    let input = "? k\n- item\na: 1\nb: 2\nc: 3\n";
+    let (output, exit_code) = run_yq_stdin(".", input, &["-o=json", "-I=0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), r#"{"k":["item"],"a":1,"b":2,"c":3}"#);
+    Ok(())
+}
+
+#[test]
+fn test_yaml_ordinary_key_same_indent_sequence_unaffected_by_1040_fix() -> Result<()> {
+    // The fix must not touch the pre-existing, always-legal ordinary-key
+    // shape `close_same_indent_sequence_before_mapping_entry` documents
+    // (no `?`/`pending_explicit_key` involved at all).
+    let input = "foo:\n- item\nbar: v\n";
+    let (output, exit_code) = run_yq_stdin(".", input, &["-o=json", "-I=0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), r#"{"foo":["item"],"bar":"v"}"#);
+    Ok(())
+}
+
+// =============================================================================
 // Alias cycle rejection (#153) - cyclic anchors must be a clean parse error,
 // not a stack-overflow abort
 // =============================================================================
