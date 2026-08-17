@@ -14475,6 +14475,21 @@ fn test_1182_chained_scalar_slice_del_through_object_iterate() -> Result<()> {
     Ok(())
 }
 
+/// jq-mode counterpart of the Object-iterate test above -- in jq mode
+/// `yq_mode` is false, so the per-element rewrite always short-circuits to
+/// `None` and the ordinary (non-yq) recursive `delete_at_path` call runs
+/// instead, which errors trying to slice the scalar `.b` directly. Confirms
+/// the Object arm's `Expr::Iterate` else-branch propagates that error
+/// through its own `?` the same way the Array arm already does.
+#[test]
+fn test_1182_chained_scalar_slice_del_through_object_iterate_jq_mode_errors() -> Result<()> {
+    let (_out, stderr, code) =
+        run_jq_stdin_with_stderr("del(.a[].b[0:1])", r#"{"a":{"x":{"b":5,"c":1}}}"#, &["-c"])?;
+    assert_ne!(code, 0);
+    assert!(stderr.contains("Cannot index"), "stderr: {stderr}");
+    Ok(())
+}
+
 /// `(.[0:1]) = 99` / `(.[0:1]) |= 99` — a parenthesized *bare* slice at the
 /// top of a resolved path. #1101 covered this only by accident (its old
 /// pre-check ran before `set_path`/`update_path` were ever reached with a
