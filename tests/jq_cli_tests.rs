@@ -11833,6 +11833,61 @@ fn test_jq_valid_multi_value_stream_unaffected_1171() -> Result<()> {
     Ok(())
 }
 
+/// A top-level token that only *looks* number-shaped but has no digit
+/// anywhere in its mantissa (`-e5`: `-` then `e5`, no digit before the
+/// exponent marker) must error, not silently materialize as `null` --
+/// `number_literal_end`'s digit-position validation, not just "does it
+/// contain a digit somewhere" (confirmed live: real jq errors with
+/// "Invalid numeric literal", exit 5). Found by code review before merge.
+#[test]
+fn test_jq_dash_e_digit_top_level_errors_not_silent_null_1171() -> Result<()> {
+    let (out, _, code) = run_jq_full(&["-c", "."], Some("-e5"))?;
+    assert_eq!(code, 5, "out: {out:?}");
+    assert!(out.trim().is_empty(), "out: {out:?}");
+
+    Ok(())
+}
+
+/// Trailing zeros on a leading-dot literal's fractional part must be
+/// preserved, not collapsed -- `.500` -> `0.500`, not `0.5` (confirmed
+/// live: real jq's own reader adds the leading `0` but keeps trailing
+/// zeros verbatim, same as it does for a strictly-valid decimal). Covers
+/// both the positive and negative-sign spellings. Found by code review
+/// before merge (`OwnedValue::from_number_bytes` was collapsing to a
+/// plain lossy `Float` instead of a spelling-preserving `NumberLiteral`).
+#[test]
+fn test_jq_leading_dot_number_preserves_trailing_zeros_1171() -> Result<()> {
+    let (out, _, code) = run_jq_full(&["-c", "."], Some(".500"))?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "0.500");
+
+    let (out, _, code) = run_jq_full(&["-c", "."], Some("-.500"))?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "-0.500");
+
+    Ok(())
+}
+
+/// A malformed number *nested* inside an otherwise well-formed container
+/// keeps this crate's own established #966 precedent (materialize as
+/// `null`, don't error the whole document) even after #1171's stricter
+/// top-level handling -- the two code paths (`find_json_values`'s
+/// top-level document splitter vs. `light.rs`'s per-value materializer)
+/// deliberately have different error-vs-null conventions. Regression
+/// guard: an earlier draft of #1171's fix used one shared, strict
+/// number-span function for both paths, which truncated `1.2.3` after
+/// `1.2` and silently fabricated the wrong value `1.2` instead of `null`
+/// (caught by review before merge -- see `nested_number_span`'s own doc
+/// comment in `src/json/light.rs`).
+#[test]
+fn test_jq_nested_malformed_number_still_becomes_null_not_fabricated_1171() -> Result<()> {
+    let (out, _, code) = run_jq_full(&["-c", "[.a]"], Some(r#"{"a": 1.2.3}"#))?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "[null]");
+
+    Ok(())
+}
+
 /// #1116's yq-only "chained scalar-slice-assign no-ops" / "del() deletes
 /// the parent key" rules must not leak into jq mode: real jq errors on
 /// both `.a[0:1] = 99` and `del(.a[0:1])` for a scalar `.a`, matching

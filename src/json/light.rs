@@ -652,21 +652,18 @@ impl<'a, W: AsRef<[u64]>> JsonCursor<'a, W> {
                     StandardJson::Error("invalid null")
                 }
             }
-            c if c == b'-' || c.is_ascii_digit() => StandardJson::Number(JsonNumber {
+            // A leading `.` is accepted here too (in addition to `-`/an
+            // ASCII digit) -- real jq's own number reader is lenient
+            // beyond strict JSON (`.5` -> `0.5`, #1171). No grammar
+            // validation here beyond the leading byte: this is a nested
+            // container's own field/element, and `nested_number_span`'s
+            // own doc comment explains why a malformed trailing shape
+            // must still resolve to one `Number` span rather than
+            // `Error`, matching this crate's established #966 precedent.
+            c if c == b'-' || c == b'.' || c.is_ascii_digit() => StandardJson::Number(JsonNumber {
                 text: self.text,
                 start: text_pos,
             }),
-            // Real jq's own number reader is lenient beyond strict JSON: a
-            // leading `.` is accepted when at least one digit follows
-            // (`.5` -> `0.5`), matching `-.5` (already accepted above,
-            // since `-` already dispatches here) but not a bare `.`/`.e5`
-            // with no digit at all, which real jq still rejects (#1171).
-            b'.' if self.text.get(text_pos + 1).is_some_and(u8::is_ascii_digit) => {
-                StandardJson::Number(JsonNumber {
-                    text: self.text,
-                    start: text_pos,
-                })
-            }
             _ => StandardJson::Error("unexpected character"),
         }
     }
@@ -775,16 +772,13 @@ impl<'a, W: AsRef<[u64]>> JsonCursor<'a, W> {
                     return None;
                 }
             }
-            // Number: scan for end of number
-            c if c == b'-' || c.is_ascii_digit() => {
-                let mut i = start;
-                while i < self.text.len() {
-                    match self.text[i] {
-                        b'0'..=b'9' | b'-' | b'+' | b'.' | b'e' | b'E' => i += 1,
-                        _ => break,
-                    }
-                }
-                i
+            // Number: scan for end of number, matching `value()`'s own
+            // dispatch (shared `nested_number_span`, #1171 review) --
+            // this arm previously had no leading-dot case at all, so a
+            // cursor at a leading-dot number returned `None` here even
+            // though `value()` correctly classified it as `Number`.
+            c if c == b'-' || c == b'.' || c.is_ascii_digit() => {
+                nested_number_span(self.text, start)
             }
             _ => return None,
         };
@@ -1439,6 +1433,117 @@ fn parse_hex4(hex: &[u8]) -> Result<u16, JsonError> {
 // JsonNumber: Lazy number parsing
 // ============================================================================
 
+/// Find the end of a JSON number literal starting at `start` in `text`.
+///
+/// `start` must point at a byte that begins a candidate number: `-`, an
+/// ASCII digit, or -- real jq's own number reader is lenient beyond
+/// strict JSON here -- a `.` immediately followed by a digit. Returns
+/// `None` if the bytes at `start` don't actually form a valid number
+/// token (`-e5`, `1e`, a bare `.`, ...).
+///
+/// Grammar: optional `-`; an integer part (0+ digits) and/or a
+/// `.`-prefixed fractional part (`.` + 1+ digits) -- at least one of
+/// the two must supply a digit, so a bare `.` alone is rejected, but a
+/// leading-dot number (`.5`) is accepted; an optional `.`-fraction with
+/// *zero* digits after it is also accepted when the integer part
+/// already supplied one (`1.` -> `1`, matching real jq); an optional
+/// exponent (`e`/`E`, optional sign, then 1+ digits) -- if the marker
+/// is present but has no digit, the *whole* token is rejected, not
+/// truncated before it, matching real jq rejecting `1e` outright rather
+/// than accepting `1`. All confirmed live against jq 1.7.1.
+///
+/// **Only used for top-level document splitting** (the CLI's own
+/// `find_json_values`, `src/bin/succinctly/jq_runner.rs`) -- a
+/// malformed *top-level* input must error (#1171), matching real jq's
+/// own behavior. Do **not** reuse this for a number reached while
+/// materializing an already-recognized container's *nested* value: that
+/// path has its own, deliberately more permissive established
+/// precedent ([`nested_number_span`], #966) of absorbing a malformed
+/// trailing shape into one span and letting it fail to `Null` downstream
+/// rather than erroring the whole document -- this stricter function
+/// would instead truncate a span like `1.2.3` after `1.2`, silently
+/// materializing the wrong, fabricated value `1.2` instead of `null`
+/// (caught by review of #1171 before merge, 4 `#966` regression tests
+/// failed).
+pub fn number_literal_end(text: &[u8], start: usize) -> Option<usize> {
+    let mut i = start;
+    if i < text.len() && text[i] == b'-' {
+        i += 1;
+    }
+    let int_start = i;
+    while i < text.len() && text[i].is_ascii_digit() {
+        i += 1;
+    }
+    let has_int_digit = i > int_start;
+    let mut has_frac_digit = false;
+    if i < text.len() && text[i] == b'.' {
+        let frac_start = i + 1;
+        let mut j = frac_start;
+        while j < text.len() && text[j].is_ascii_digit() {
+            j += 1;
+        }
+        has_frac_digit = j > frac_start;
+        i = if has_frac_digit { j } else { i + 1 };
+    }
+    if !has_int_digit && !has_frac_digit {
+        return None;
+    }
+    if i < text.len() && (text[i] == b'e' || text[i] == b'E') {
+        let mut j = i + 1;
+        if j < text.len() && (text[j] == b'+' || text[j] == b'-') {
+            j += 1;
+        }
+        let exp_digit_start = j;
+        while j < text.len() && text[j].is_ascii_digit() {
+            j += 1;
+        }
+        if j > exp_digit_start {
+            i = j;
+        } else {
+            return None;
+        }
+    }
+    Some(i)
+}
+
+/// Find the end of a number-*shaped* span starting at `start` in `text`
+/// (a byte that begins a candidate number: `-`, an ASCII digit, or a
+/// leading `.`), for a value reached while materializing an
+/// already-recognized container's nested field/element (`value()`,
+/// `text_range()`, [`JsonNumber::find_end`] below).
+///
+/// Deliberately permissive, unlike [`number_literal_end`]: greedily
+/// consumes every subsequent `[0-9.eE+-]` byte with no grammar
+/// validation at all, so a malformed trailing shape (`1.2.3`, an
+/// exponent marker with no digit, ...) still resolves to *one*
+/// recognized span instead of either fabricating a shorter,
+/// wrong-but-valid-looking number or splitting into two adjacent
+/// tokens with no separator between them. `is_valid_number`/
+/// `OwnedValue::from_number_bytes` are what decide, from that whole
+/// span, whether it's safe to treat as a real number (falling back to
+/// `Null` if not) -- matching this crate's own established, tested
+/// precedent for a malformed *nested* number (#966: `{"a": 1.2.3}` ->
+/// `{"a": null}`, not a document-wide error). Also what makes
+/// [`OwnedValue::to_json_for_reindex`](crate::jq::OwnedValue::to_json_for_reindex)'s
+/// `NAN_SENTINEL`/`INFINITY_SENTINEL` round-trip tokens (`9e999e999`,
+/// deliberately unparseable via a repeated exponent marker, #472/#1083)
+/// round-trip correctly: their whole span must survive intact for
+/// `is_nan_sentinel`/`is_infinity_sentinel`'s exact-text comparison to
+/// recognize them.
+fn nested_number_span(text: &[u8], start: usize) -> usize {
+    let mut i = start;
+    if i < text.len() && text[i] == b'-' {
+        i += 1;
+    }
+    while i < text.len() {
+        match text[i] {
+            b'0'..=b'9' | b'.' | b'e' | b'E' | b'+' | b'-' => i += 1,
+            _ => break,
+        }
+    }
+    i
+}
+
 /// A JSON number that hasn't been parsed yet.
 ///
 /// Call `as_i64()` or `as_f64()` to parse the number.
@@ -1470,14 +1575,7 @@ impl<'a> JsonNumber<'a> {
     }
 
     fn find_end(&self) -> usize {
-        let mut i = self.start;
-        while i < self.text.len() {
-            match self.text[i] {
-                b'0'..=b'9' | b'-' | b'+' | b'.' | b'e' | b'E' => i += 1,
-                _ => break,
-            }
-        }
-        i
+        nested_number_span(self.text, self.start)
     }
 }
 
