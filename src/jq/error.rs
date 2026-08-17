@@ -611,6 +611,21 @@ impl EvalError {
         Self::new(format!("illegal base64 data at input byte {pos}"))
     }
 
+    /// `invalid URL escape "<escape>"` (#1138).
+    ///
+    /// Raised by `@urid` (yq mode only, like [`Self::base64_illegal_data`]
+    /// above -- jq has no `@urid` at all) when a `%` isn't immediately
+    /// followed by two valid hex digits. `escape` is `%` plus whatever 0,
+    /// 1, or 2 bytes actually follow it in the input (not validated --
+    /// confirmed live against yq v4.53.3 that both bytes are echoed
+    /// verbatim even when only one, or neither, is a valid hex digit, and
+    /// that a literal `%` immediately after the first one is included
+    /// unchanged rather than treated as a new escape's start: `"x%y%zz" |
+    /// @urid` -> `invalid URL escape "%y%"`, not `"%y"`).
+    pub fn urid_invalid_escape(escape: &str) -> Self {
+        Self::new(format!("invalid URL escape {escape:?}"))
+    }
+
     /// `Invalid path expression with result <value>` (#530).
     ///
     /// Raised by `path()` when the filter it was given is not a path

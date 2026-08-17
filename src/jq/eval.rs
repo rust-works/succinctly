@@ -5863,19 +5863,31 @@ fn format_urid<S: EvalSemantics>(value: &OwnedValue, optional: bool) -> Result<S
     let bytes = s.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            // Try to parse the next two characters as hex
-            if let (Some(h1), Some(h2)) = (
-                (bytes[i + 1] as char).to_digit(16),
-                (bytes[i + 2] as char).to_digit(16),
-            ) {
-                let decoded = (h1 * 16 + h2) as u8;
-                result.push(decoded);
-                i += 3;
-                continue;
+        if bytes[i] == b'%' {
+            if i + 2 < bytes.len() {
+                // Try to parse the next two characters as hex
+                if let (Some(h1), Some(h2)) = (
+                    (bytes[i + 1] as char).to_digit(16),
+                    (bytes[i + 2] as char).to_digit(16),
+                ) {
+                    let decoded = (h1 * 16 + h2) as u8;
+                    result.push(decoded);
+                    i += 3;
+                    continue;
+                }
             }
+            // Malformed escape (#1138): real yq errors rather than
+            // silently passing the `%` through, quoting `%` plus
+            // whatever 0, 1, or 2 bytes actually follow it (up to end of
+            // string) -- `(i + 3).min(bytes.len())` covers all three
+            // lengths with one expression, matching the boundary
+            // `EvalError::urid_invalid_escape`'s own doc comment
+            // verifies live.
+            let end = (i + 3).min(bytes.len());
+            let escape = String::from_utf8_lossy(&bytes[i..end]);
+            return Err(EvalError::urid_invalid_escape(&escape));
         }
-        // Not a valid percent-encoded sequence, just copy the byte
+        // Not a percent sign at all, just copy the byte
         result.push(bytes[i]);
         i += 1;
     }
@@ -40464,10 +40476,23 @@ mod tests {
                 assert_eq!(s, "hello world");
             }
         );
-        // Invalid percent encoding should pass through
+    }
+
+    /// #1138: a malformed `%` escape (not immediately followed by two
+    /// valid hex digits) errors rather than silently passing the `%`
+    /// through -- matching real yq's `invalid URL escape "..."` wording
+    /// (yq is the only oracle here; real jq has no `@urid` at all). An
+    /// earlier version of `test_format_urid` above pinned the old
+    /// passthrough behavior for exactly this input
+    /// (`"hello%GGworld"` -> `"hello%GGworld"`); this replaces it.
+    #[test]
+    fn test_format_urid_malformed_escape_errors_1138() {
         query!(br#""hello%GGworld""#, "@urid",
-            QueryResult::Owned(OwnedValue::String(s)) => {
-                assert_eq!(s, "hello%GGworld");
+            QueryResult::Error(e) => {
+                assert!(
+                    e.to_string().contains(r#"invalid URL escape "%GG""#),
+                    "error: {e}"
+                );
             }
         );
     }

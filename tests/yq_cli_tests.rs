@@ -14703,6 +14703,50 @@ fn test_yq_urid_nonascii_passthrough_and_decode_1123() -> Result<()> {
     Ok(())
 }
 
+/// #1138: a `%` not immediately followed by two valid hex digits used to
+/// silently pass the `%` itself through unchanged instead of erroring the
+/// way real yq does. The quoted escape in the error is `%` plus whatever
+/// 0, 1, or 2 bytes actually follow it -- not validated, and not stopped
+/// early by a second `%` (`"x%y%zz"` quotes `"%y%"`, treating the second
+/// `%` as ordinary data for the *first* escape's error, not the start of
+/// a new one). All cases live-verified against yq v4.53.3.
+#[test]
+fn test_yq_urid_malformed_escape_errors_1138() -> Result<()> {
+    let cases: &[(&str, &str)] = &[
+        (r#""abc%""#, r#"invalid URL escape "%""#),
+        (r#""abc%A""#, r#"invalid URL escape "%A""#),
+        (r#""abc%ZZ""#, r#"invalid URL escape "%ZZ""#),
+        (r#""%""#, r#"invalid URL escape "%""#),
+        (r#""%A""#, r#"invalid URL escape "%A""#),
+        (r#""%AZ""#, r#"invalid URL escape "%AZ""#),
+        (r#""%Z5""#, r#"invalid URL escape "%Z5""#),
+        (r#""%5Z""#, r#"invalid URL escape "%5Z""#),
+        (r#""x%y%zz""#, r#"invalid URL escape "%y%""#),
+        (r#""%%""#, r#"invalid URL escape "%%""#),
+        (r#""%4""#, r#"invalid URL escape "%4""#),
+    ];
+    for (input, expected) in cases {
+        let (_out, stderr, code) = run_yq_stdin_with_stderr("@urid", input, &[])?;
+        assert_ne!(code, 0, "input {input:?}, stderr: {stderr:?}");
+        assert!(
+            stderr.contains(expected),
+            "input {input:?}: expected stderr to contain {expected:?}, got {stderr:?}"
+        );
+    }
+    Ok(())
+}
+
+/// #1138 review self-check: a genuinely valid escape (both hex digits
+/// present and valid) must still decode successfully, not just malformed
+/// ones now erroring correctly.
+#[test]
+fn test_yq_urid_valid_escape_still_decodes_1138() -> Result<()> {
+    let (out, code) = run_yq_stdin("@urid", r#""hello%20world""#, &["-o", "json"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "\"hello world\"");
+    Ok(())
+}
+
 // ============================================================================
 // @base64d error message wording (#1146)
 // ============================================================================
@@ -14870,5 +14914,22 @@ fn test_jq_urid_invalid_utf8_after_percent_decode_is_lossy_1146() -> Result<()> 
     let (out, _stderr, code) = run_jq_stdin_with_stderr("@urid", "\"%FF\"", &[])?;
     assert_eq!(code, 0, "out: {out:?}");
     assert_eq!(out.trim(), "\"\u{fffd}\"");
+    Ok(())
+}
+
+/// #1138: real jq has no `@urid` at all (it's a succinctly extension
+/// reachable in both modes, per `format_urid`'s own doc comment), so
+/// there's no jq oracle to preserve the old silent-passthrough behavior
+/// against -- the malformed-escape decode loop has no mode-specific
+/// branch, so jq mode gets the same error yq mode does (#1138's own
+/// primary fix, verified against real yq above).
+#[test]
+fn test_jq_urid_malformed_escape_errors_1138() -> Result<()> {
+    let (_out, stderr, code) = run_jq_stdin_with_stderr("@urid", "\"abc%\"", &[])?;
+    assert_ne!(code, 0, "stderr: {stderr:?}");
+    assert!(
+        stderr.contains(r#"invalid URL escape "%""#),
+        "stderr: {stderr:?}"
+    );
     Ok(())
 }
