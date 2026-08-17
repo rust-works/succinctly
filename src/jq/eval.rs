@@ -18936,7 +18936,24 @@ fn builtin_del<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // `flatten_delete_path` reduces each resolved `Expr` to the same
     // atomic-steps shape so `delete_expr_paths_at` can delete every resolved
     // path together.
-    let flattened: Vec<Vec<DeleteStep>> = paths
+    //
+    // Each path is rewritten by #1116's chained-scalar-slice del() rule
+    // first, same as the `paths.len() <= 1` branch above — `flatten_delete_path`/
+    // `delete_expr_paths_at` are complex, heavily-tested sibling-grouping
+    // machinery this fix doesn't otherwise need to touch, so the rewrite
+    // happens once, per path, before either ever sees it, rather than
+    // teaching them the rule directly.
+    let rewritten: Vec<Expr> = paths
+        .iter()
+        .map(|path| {
+            if S::TAG == EvalTag::Yq {
+                yq_del_scalar_slice_parent_path(path, &result).unwrap_or_else(|| path.clone())
+            } else {
+                path.clone()
+            }
+        })
+        .collect();
+    let flattened: Vec<Vec<DeleteStep>> = rewritten
         .iter()
         .map(|path| {
             let mut steps = Vec::new();
