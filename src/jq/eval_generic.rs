@@ -888,9 +888,10 @@ fn eval_on_owned<S: EvalSemantics, V: DocumentValue>(
     // pure overhead for them (#124). No non-finite-float guard is needed here
     // either: every non-JSON format bottoms out in `numeric_display_string`,
     // `owned_to_yaml`, or `props_value_to_string` (eval.rs), which already
-    // render NaN/Infinity as `"inf"`/`".nan"`/etc. directly from an
-    // `OwnedValue::Float` or `NumberLiteral`, with no dependence on having
-    // passed through a JSON round-trip first.
+    // render NaN/Infinity directly from an `OwnedValue::Float` or
+    // `NumberLiteral` -- jq mode's `"null"`/`DBL_MAX`-text substitution
+    // (#1075) or yq mode's `.nan`/`.inf`/`-.inf` -- with no dependence on
+    // having passed through a JSON round-trip first.
     if let Expr::Format(format_type) = expr {
         return format_result::<S, _>(format_type, &owned, optional);
     }

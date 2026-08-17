@@ -279,12 +279,16 @@ fn test_parity_formats_over_iteration() {
 /// can't silently re-agree on a *new* wrong answer.
 ///
 /// Note neither evaluator fully matches real jq here even after #1075: jq
-/// 1.7.1 preserves a *positive* overflowed literal's own source text and
-/// prints `1E+400` for it (though it does substitute `DBL_MAX` text for a
-/// *negative* one, which #1075 does match). That literal-preservation gap is
-/// a separate pre-existing issue (#1083), out of scope for both #124 and
-/// #1075 -- see `numeric_display_string`'s own doc comment (`src/jq/eval.rs`)
-/// for why.
+/// 1.7.1 preserves an overflowed literal's own source text for *either*
+/// sign when it's the input document itself (as every case below is) --
+/// `1e400 | tostring` -> `"1E+400"`, `-1e400 | tostring` -> `"-1E+400"` --
+/// rather than substituting `DBL_MAX` text for either. (A leading `-`
+/// typed inside the *filter* text instead, rather than the document, is a
+/// different, unrelated case: jq's own grammar treats that as unary
+/// negation on the positive literal, degrading fidelity -- not what any
+/// case here exercises.) That literal-preservation gap is a separate
+/// pre-existing issue (#1083), out of scope for both #124 and #1075 -- see
+/// `numeric_display_string`'s own doc comment (`src/jq/eval.rs`) for why.
 #[test]
 fn test_formats_non_finite_parity_124() {
     for (json, filter, expected) in [

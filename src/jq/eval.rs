@@ -5156,7 +5156,11 @@ fn eval_string_interpolation<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// Render a numeric value the way the non-JSON text formats want it.
 ///
 /// `number_str()` deliberately skips NaN/Infinity handling (see its doc
-/// comment) because `to_json` needs "null" instead. Text formats (`@text`,
+/// comment) because `to_json` needs its own substitution instead (currently
+/// "null" for both NaN and Infinity in jq mode -- correct for NaN, but not
+/// for a *computed* Infinity, which real jq instead gives `DBL_MAX` text the
+/// same as this function now does; that's issue #1087, separate from and
+/// out of scope for this function's own fix). Text formats (`@text`,
 /// `@uri`, `@html`, `@sh`, and the CSV/TSV/DSV cell formatter that falls back
 /// to `owned_to_string`) instead want jq's own JSON-substitution spelling for
 /// a non-finite `Float`/`NumberLiteral` (#1075: `null` for NaN, `DBL_MAX`'s
@@ -5239,13 +5243,10 @@ pub(crate) fn numeric_display_string<S: EvalSemantics>(value: &OwnedValue) -> St
 /// `infinite | tostring` -> `"1.7976931348623157e+308"`, `-infinite |
 /// tostring` -> `"-1.7976931348623157e+308"`).
 ///
-/// See `numeric_display_string`'s own doc comment for the
-/// "document-sourced vs computed" caveat this doesn't attempt to resolve
-/// (not a doc link: that function is `pub(crate)`, unresolvable from this
-/// one's now-`pub` docs) -- this includes jq mode's own version of that gap
-/// (a jq-mode `NumberLiteral` overflowing to infinity, e.g. `1e400`, is
-/// still routed through here rather than real jq's own literal-preserving
-/// reformat; see that function's doc comment for why, and issue #1083).
+/// See `numeric_display_string`'s own doc comment (`src/jq/eval.rs`, not
+/// doc-linkable from here since it's `pub(crate)`) for the
+/// "document-sourced vs computed" caveat this doesn't attempt to resolve,
+/// and issue #1083 for the gap that leaves open.
 ///
 /// `pub`, not `pub(crate)`: `src/bin/succinctly/yq_runner.rs` is a separate
 /// binary crate depending on this one as an external dependency, and is one
@@ -28979,14 +28980,20 @@ mod tests {
         //
         // Both signs now take jq mode's `DBL_MAX`-text substitution
         // (`nonfinite_display_string`, #1075) -- this still isn't a full
-        // match for real jq, which reformats a *positive* overflowed
-        // literal's own source text instead (`1e400 | tostring` ->
-        // `"1E+400"`, live-verified) rather than substituting; see
+        // match for real jq, which reformats *both* an overflowed literal's
+        // own source text (`1e400 | tostring` -> `"1E+400"`, `-1e400 |
+        // tostring` -> `"-1E+400"`, live-verified against jq 1.7.1 for this
+        // exact input-document shape -- i.e. the literal typed directly as
+        // the JSON document, which is what `query!`'s first argument always
+        // is) rather than substituting `DBL_MAX` for either sign; see
         // `numeric_display_string`'s own doc comment and issue #1083 for why
-        // that gap is deliberately left open here. The negative case,
-        // though, genuinely does match real jq's own `DBL_MAX` substitution
-        // (confirmed live: `-1e400 | tostring` -> the negative `DBL_MAX`
-        // text, not `"-1E+400"`).
+        // that gap is deliberately left open here. (A leading `-` typed
+        // *inside a filter expression* instead, e.g. `-1e400 | tostring` as
+        // the filter text rather than the input, is a different story --
+        // jq's own filter grammar treats that as unary negation on the
+        // positive literal, degrading fidelity the same way #1035 already
+        // documents for smaller literals -- but that's not the shape any
+        // test here exercises.)
         query!(br"1e400", "tostring",
             QueryResult::Owned(OwnedValue::String(s)) => {
                 assert_eq!(s, "1.7976931348623157e+308");
