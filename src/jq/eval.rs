@@ -1955,11 +1955,7 @@ fn arith_mul<S: EvalSemantics>(
         }
         // yq: null is an empty container for merge purposes. A null right
         // operand is a no-op regardless of flags (real yq: `x *= null`
-        // leaves `x` untouched, whatever `x` is) -- `left` is relocated
-        // unchanged here, not computed, so a `NumberLiteral` operand must
-        // keep its own source spelling (#1167, mirroring #1143's identical
-        // fix for `arith_add`'s `null`-passthrough arm: this arm must run
-        // before the numeric arm below collapses it). A null left operand
+        // leaves `x` untouched, whatever `x` is). A null left operand
         // merging with an object/array merges as if it started from
         // `{}`/`[]`, routing through the same merge_values() call as a real
         // container pair — so `?`/`n` gating (which only takes effect once
@@ -1968,6 +1964,12 @@ fn arith_mul<S: EvalSemantics>(
         // the merge-flag suffixes (#713) work on a top-level target that's
         // `null` or entirely absent (`.a` on a missing key evaluates to
         // `null`), not just on nested fields within an existing container.
+        //
+        // `left` is relocated unchanged in the no-op arm below, not
+        // computed, so a `NumberLiteral` operand must keep its own source
+        // spelling there (#1167, mirroring #1143's identical fix for
+        // `arith_add`'s `null`-passthrough arm) -- this arm must run
+        // before the numeric arm further down collapses it.
         (left, OwnedValue::Null) if S::NULL_MERGES_AS_EMPTY => Ok(left),
         (OwnedValue::Null, b @ OwnedValue::Object(_)) if S::NULL_MERGES_AS_EMPTY => {
             Ok(merge_values(OwnedValue::Object(IndexMap::new()), b, flags))

@@ -13747,7 +13747,11 @@ fn test_1167_mul_null_noop_preserves_number_literal_spelling() -> Result<()> {
 /// Control: `null * x` (left operand `null`) discards the right operand
 /// entirely -- it must stay `null`, not "preserve" the right operand's
 /// spelling, since nothing is relocated here (unlike the `x *= null` arm
-/// above).
+/// above). Locks in succinctly's *current* behavior, not oracle
+/// conformance -- real yq v4.53.3 actually errors on `null * 1e10`
+/// ("cannot multiply !!null with !!float", confirmed live), a
+/// pre-existing divergence untouched by this PR (identical on `main`
+/// before it) and filed separately as #1175.
 #[test]
 fn test_1167_null_times_number_literal_stays_null() -> Result<()> {
     let (output, code) = run_yq_stdin("null * 1e10", "null", &["-o=json", "-I=0"])?;
