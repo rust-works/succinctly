@@ -6609,30 +6609,55 @@ fn test_flow_collection_as_implicit_mapping_key_still_permitted_878() -> Result<
 // the rest of the document instead of erroring the way real yq does.
 // `parse_explicit_key`'s own `[`/`{` dispatch (a 5th, deliberately unmerged
 // copy of the shared flow-value dispatch table) never gained the check at
-// all. #902 replaced the caller-level `bool` with an occurrence-granular
-// check inside `reject_trailing_flow_content` itself (permit only `#`,
-// whitespace, a line break, EOF, or a real `:` mapping-value indicator),
-// applied unconditionally at every site including the previously-missing
-// one -- confirmed live against real yq v4.53.3 throughout.
+// all.
+//
+// #902 widened `reject_trailing_flow_content` itself to recognize a real
+// mapping-value indicator (`:` followed by whitespace/break/EOF) as a
+// permitted terminator too, alongside `#`/whitespace/break/EOF -- but kept
+// the check caller-parameterized (`permit_colon_terminator: bool`), not
+// unconditional: an earlier version of this fix made the `:` exception
+// apply everywhere, which silently re-opened #878's own corruption bug at
+// `parse_mapping_entry`/`parse_compact_mapping_entry` (a trailing `:`
+// *there* can never be legitimate, since those callers only ever reach
+// this helper after an unambiguous `key:` has already been parsed) --
+// caught in review, confirmed live against both real yq and this repo's
+// own pre-#902 baseline, and fixed by keeping the two truly ambiguous call
+// sites (`parse_value`, `parse_explicit_value`, plus `parse_explicit_key`'s
+// new 5th site) as the only ones permitting the `:` exception.
 
 #[test]
 fn test_sequence_item_flow_collection_trailing_content_errors_902() -> Result<()> {
-    let (_out, code) = run_yq_stdin(".", "- [1, 2] extra content\nb: 2\n", &["-o", "json"])?;
+    let (_out, stderr, code) =
+        run_yq_stdin_with_stderr(".", "- [1, 2] extra content\nb: 2\n", &["-o", "json"])?;
     assert_ne!(code, 0);
+    assert!(
+        stderr.contains("after a flow collection's closing delimiter"),
+        "stderr: {stderr}"
+    );
     Ok(())
 }
 
 #[test]
 fn test_mapping_value_flow_collection_trailing_content_errors_902() -> Result<()> {
-    let (_out, code) = run_yq_stdin(".", "a:\n  [1, 2] extra\nb: 2\n", &["-o", "json"])?;
+    let (_out, stderr, code) =
+        run_yq_stdin_with_stderr(".", "a:\n  [1, 2] extra\nb: 2\n", &["-o", "json"])?;
     assert_ne!(code, 0);
+    assert!(
+        stderr.contains("after a flow collection's closing delimiter"),
+        "stderr: {stderr}"
+    );
     Ok(())
 }
 
 #[test]
 fn test_explicit_key_flow_collection_trailing_content_errors_902() -> Result<()> {
-    let (_out, code) = run_yq_stdin(".", "? [1, 2] extra\n: v\n", &["-o", "json"])?;
+    let (_out, stderr, code) =
+        run_yq_stdin_with_stderr(".", "? [1, 2] extra\n: v\n", &["-o", "json"])?;
     assert_ne!(code, 0);
+    assert!(
+        stderr.contains("after a flow collection's closing delimiter"),
+        "stderr: {stderr}"
+    );
     Ok(())
 }
 
@@ -6640,8 +6665,54 @@ fn test_explicit_key_flow_collection_trailing_content_errors_902() -> Result<()>
 /// flow sequence -- confirms the fix isn't accidentally scoped to `[` alone.
 #[test]
 fn test_explicit_key_flow_mapping_trailing_content_errors_902() -> Result<()> {
-    let (_out, code) = run_yq_stdin(".", "? {a: 1} extra\n: v\n", &["-o", "json"])?;
+    let (_out, stderr, code) =
+        run_yq_stdin_with_stderr(".", "? {a: 1} extra\n: v\n", &["-o", "json"])?;
     assert_ne!(code, 0);
+    assert!(
+        stderr.contains("after a flow collection's closing delimiter"),
+        "stderr: {stderr}"
+    );
+    Ok(())
+}
+
+/// The two *unambiguous* call sites (`parse_mapping_entry`,
+/// `parse_compact_mapping_entry`) reach a flow collection only after an
+/// ordinary `key:` has already committed -- a following `:` there can
+/// never be a legitimate implicit-mapping-key reading, so
+/// `permit_colon_terminator` must stay `false` for both, unlike the three
+/// genuinely ambiguous sites above. This is exactly the shape an earlier,
+/// over-broad version of this fix regressed: confirmed live that real yq
+/// hard-errors here (`mapping values are not allowed in this context`),
+/// and that this repo's own pre-#902 baseline already correctly did too --
+/// #902 must not lose that.
+#[test]
+fn test_unambiguous_mapping_value_flow_collection_followed_by_colon_still_errors_902() -> Result<()>
+{
+    let (_out, stderr, code) =
+        run_yq_stdin_with_stderr(".", "key1: [a, b]: value2\nkey3: c\n", &["-o", "json"])?;
+    assert_ne!(code, 0);
+    assert!(
+        stderr.contains("after a flow collection's closing delimiter"),
+        "stderr: {stderr}"
+    );
+
+    // Flow mapping variant, and the compact-mapping (sequence-item) form of
+    // the same unambiguous site.
+    let (_out, stderr, code) =
+        run_yq_stdin_with_stderr(".", "key1: {a: 1}: value2\nkey3: c\n", &["-o", "json"])?;
+    assert_ne!(code, 0);
+    assert!(
+        stderr.contains("after a flow collection's closing delimiter"),
+        "stderr: {stderr}"
+    );
+
+    let (_out, stderr, code) =
+        run_yq_stdin_with_stderr(".", "- key1: [a, b]: value2\n  key3: c\n", &["-o", "json"])?;
+    assert_ne!(code, 0);
+    assert!(
+        stderr.contains("after a flow collection's closing delimiter"),
+        "stderr: {stderr}"
+    );
     Ok(())
 }
 
@@ -6651,7 +6722,12 @@ fn test_explicit_key_flow_mapping_trailing_content_errors_902() -> Result<()> {
 /// didn't at `parse_value`/`parse_explicit_value` (pinned by
 /// `test_flow_collection_as_implicit_mapping_key_still_permitted_878`
 /// above). Pins the *current* (pre-existing, item-5-scoped) output exactly,
-/// not just the exit code -- confirmed unchanged from before this fix.
+/// not just the exit code -- confirmed unchanged from before this fix. Real
+/// yq's own answer for this exact one-line form is actually `{"":null}`,
+/// not `{"":"value"}` (it reads the whole `[1, 2]: value` as the *key's*
+/// own compact-mapping content, not this entry's value -- confirmed live)
+/// -- this test only asserts "doesn't error, output unchanged from before
+/// #902," not real-yq equivalence, which is #1188's separate scope.
 #[test]
 fn test_explicit_key_flow_collection_followed_by_colon_still_permitted_902() -> Result<()> {
     let (out, code) = run_yq_stdin(".", "? [1, 2]: value\n", &["-o", "json", "-I0"])?;
@@ -6668,8 +6744,12 @@ fn test_explicit_key_flow_collection_followed_by_colon_still_permitted_902() -> 
 /// not a bare `:`.
 #[test]
 fn test_flow_collection_colon_without_whitespace_still_errors_902() -> Result<()> {
-    let (_out, code) = run_yq_stdin(".", "[1, 2]:value\n", &["-o", "json"])?;
+    let (_out, stderr, code) = run_yq_stdin_with_stderr(".", "[1, 2]:value\n", &["-o", "json"])?;
     assert_ne!(code, 0);
+    assert!(
+        stderr.contains("after a flow collection's closing delimiter"),
+        "stderr: {stderr}"
+    );
     Ok(())
 }
 
