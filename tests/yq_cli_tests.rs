@@ -13308,10 +13308,31 @@ fn test_slice_update_through_iterate_array_target_is_noop_1142() -> Result<()> {
     Ok(())
 }
 
+/// `=` with an index or iterate *after* a slice no-ops too, not just the
+/// terminal-slice shape -- live-verified against real yq v4.53.3
+/// (`.a[0:2][0] = 99` and `.a[1:3][] = 99` both no-op). `set_path`'s
+/// `split_at_slice` arm handles this by attempting the write against a
+/// throwaway seeded with the slice's *real* content and discarding the
+/// result on success, rather than special-casing "only when the slice is
+/// terminal" -- see the next test for why a plain "always no-op past a
+/// slice" rule would be wrong.
+#[test]
+fn test_slice_assign_through_index_and_iterate_after_slice_is_noop_1142() -> Result<()> {
+    let (out, code) = run_yq_stdin(".a[0:2][0] = 99", "a: [1,2,3]", &["-o", "json", "-I0"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), r#"{"a":[1,2,3]}"#);
+
+    let (out, code) = run_yq_stdin(".a[1:3][] = 99", "a: [1,2,3,4]", &["-o", "json", "-I0"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), r#"{"a":[1,2,3,4]}"#);
+    Ok(())
+}
+
 /// Regression guard: a slice followed by a *field* access still errors --
 /// `.a[0:2]` produces a plain array, and `.foo` can't index one. This must
-/// not be swallowed into a no-op by #1142's fix, which is specifically for
-/// a slice as the path's terminal component.
+/// not be swallowed into a no-op by #1142's fix: the throwaway-write
+/// attempt genuinely fails here (the same way it would against the real
+/// array), so the error propagates instead of being discarded.
 #[test]
 fn test_slice_assign_through_field_after_slice_still_errors_1142() -> Result<()> {
     let (_out, _stderr, code) = run_yq_stdin_with_stderr(
