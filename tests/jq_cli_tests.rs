@@ -4979,23 +4979,19 @@ fn test_result_to_owned_partial_halt_outranks_its_prefix() -> Result<()> {
 }
 
 #[test]
-fn test_result_to_owned_none_error_break_arms_via_ltrimstr_argument() -> Result<()> {
-    // `result_to_owned`'s `None`/`Error`/`Break` arms -- all three now
-    // wrapped in `.into()` to fit the `Result<OwnedValue, EvalEscape>`
-    // return type this PR introduced (previously `Result<OwnedValue,
-    // EvalError>`), exercised together since they are adjacent,
-    // mechanically-identical conversions and none of them are
-    // halt-specific. Uses `ltrimstr`'s argument slot as the call site, same
-    // as the `Many`/`ManyOwned`-empty and `Partial`-halt tests above.
-    // `None`/`Break` here are a pre-existing, halt-unrelated divergence from
-    // real jq worth flagging: jq's `empty` argument yields zero output (not
-    // an error), and a `break` whose label encloses the whole expression is
-    // caught there, not reported as "not in label" -- both verified: `jq -n
-    // '"abc" | ltrimstr(empty)'` and `jq -n 'label $out | ("abc" |
-    // ltrimstr(break $out))'` both exit 0 with no output. succinctly's
+fn test_result_to_owned_none_error_arms_via_ltrimstr_argument() -> Result<()> {
+    // `result_to_owned`'s `None`/`Error` arms, both wrapped in `.into()` to
+    // fit the `Result<OwnedValue, EvalEscape>` return type. Uses `ltrimstr`'s
+    // argument slot as the call site, same as the `Many`/`ManyOwned`-empty
+    // and `Partial`-halt tests above. `None` here is a pre-existing,
+    // separately-tracked divergence from real jq (#1045): jq's `empty`
+    // argument yields zero output (not an error) -- verified: `jq -n '"abc"
+    // | ltrimstr(empty)'` exits 0 with no output, while succinctly's
     // `ltrimstr` resolves its argument through `result_to_owned`, which
-    // turns both into a generic catchable error instead. The `Error` arm,
-    // by contrast, matches real jq exactly.
+    // turns it into a generic catchable error instead. The `Error` arm, by
+    // contrast, matches real jq exactly. (The `Break` arm this test used to
+    // cover alongside these two is now fixed -- see
+    // `test_break_via_ltrimstr_argument_reaches_outer_label_833` below.)
     let (stdout, stderr, code) = run_jq_full(&["-n", r#""abc" | ltrimstr(empty)"#], None)?;
     assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
     assert_eq!(stdout, "");
@@ -5006,16 +5002,25 @@ fn test_result_to_owned_none_error_break_arms_via_ltrimstr_argument() -> Result<
     assert_eq!(stdout, "");
     assert_eq!(stderr, "jq: error (at <unknown>): boom\n");
 
+    Ok(())
+}
+
+#[test]
+fn test_break_via_ltrimstr_argument_reaches_outer_label_833() -> Result<()> {
+    // #833: `result_to_owned`'s `Break` arm now propagates a real
+    // `EvalEscape::Break` instead of collapsing it into a synthetic "not in
+    // label" error, so a `break` in a builtin's argument expression can
+    // reach a `label` enclosing the whole call. Matches real jq exactly:
+    // `jq -n 'label $out | ("abc" | ltrimstr(break $out))'` exits 0 with no
+    // output (this test previously pinned the pre-fix "not in label" error
+    // as expected/current behavior).
     let (stdout, stderr, code) = run_jq_full(
         &["-n", r#"label $out | ("abc" | ltrimstr(break $out))"#],
         None,
     )?;
-    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
     assert_eq!(stdout, "");
-    assert_eq!(
-        stderr,
-        "jq: error (at <unknown>): break $out not in label\n"
-    );
+    assert_eq!(stderr, "");
 
     Ok(())
 }
@@ -7422,17 +7427,20 @@ fn test_reduce_propagates_halt_from_init_expression() -> Result<()> {
 }
 
 #[test]
-fn test_parentn_n_expr_break_reported_as_break_not_in_label() -> Result<()> {
-    // `eval_owned_expr`'s `Control::Break` arm (split out from `Error`
-    // alongside the new `Control::Halt` arm one line below it, forced by
-    // `Control` gaining the `Halt` variant): an unmatched `break` raised
-    // while evaluating an owned-value-based argument -- here `parent(n)`'s
-    // `n` argument, via `ParentN`'s call to `eval_owned_expr` -- converts
-    // into the ordinary "break $label not in label" `EvalError`, the same
-    // diagnostic every other uncaught break in this file produces. `parent`
+fn test_parentn_n_expr_genuinely_uncaught_break_still_errors() -> Result<()> {
+    // No `label $out` anywhere in this filter, so `break $out` raised while
+    // evaluating `parent(n)`'s `n` argument (via `ParentN`'s call to
+    // `eval_owned_expr`) has nowhere to land regardless of #833's fix to
+    // that function -- `eval_owned_expr` now propagates a real
+    // `EvalEscape::Break` instead of collapsing it at this arm, but with no
+    // enclosing label to catch it, it still surfaces as the ordinary
+    // "break $label not in label" top-level diagnostic once fully unwound,
+    // the same as any other genuinely-uncaught break in this file. `parent`
     // is a succinctly extension (no real-jq equivalent), so this is checked
     // against succinctly's own established "break $out not in label" wording
-    // (see `test_uncaught_break_after_output_keeps_the_prefix`), not jq.
+    // (see `test_uncaught_break_after_output_keeps_the_prefix`), not jq. See
+    // `test_break_via_parentn_argument_reaches_outer_label_833` below for
+    // the case where a `label $out` genuinely encloses the call.
     let (stdout, stderr, code) = run_jq_full(
         &["-c", ".a.b | parent(break $out)"],
         Some(r#"{"a":{"b":1}}"#),
@@ -7440,6 +7448,26 @@ fn test_parentn_n_expr_break_reported_as_break_not_in_label() -> Result<()> {
     assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
     assert_eq!(stdout, "");
     assert!(stderr.contains("break $out not in label"), "{stderr}");
+    Ok(())
+}
+
+#[test]
+fn test_break_via_parentn_argument_reaches_outer_label_833() -> Result<()> {
+    // #833: same fix as `test_break_via_ltrimstr_argument_reaches_outer_label_833`,
+    // but through `eval_owned_expr` (ParentN's call path) rather than
+    // `result_to_owned`. With a `label $out` genuinely enclosing the call,
+    // the break now unwinds cleanly instead of misreporting "not in label".
+    // `parent` is a succinctly extension; there's no real-jq oracle for this
+    // exact shape, but the underlying "an unmatched builtin-argument break
+    // reaches its enclosing label" contract is the same one #833 fixes
+    // uniformly for both `result_to_owned` and `eval_owned_expr` callers.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", ".a.b | label $out | parent(break $out)"],
+        Some(r#"{"a":{"b":1}}"#),
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(stderr, "");
     Ok(())
 }
 
@@ -8614,6 +8642,43 @@ fn test_isvalid_propagates_break_through_paths_filter() -> Result<()> {
             r#"label $out | isvalid(paths(if type=="number" then break $out else true end))"#,
         ],
         Some(r#"{"a":1}"#),
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
+/// #833: a `key`/`parent`/`path` (or any other path-context-triggering)
+/// pipe stage ahead of `isvalid`/`isempty` routes their argument through
+/// `eval_pipe_with_path_context_internal`'s generic `Expr::Builtin`
+/// fallback -> `eval_builtin_owned` -> `eval_owned_expr`, not through
+/// `eval_single`'s ordinary dispatch -- a genuinely different call path
+/// from every other test in this file, which all evaluate `isvalid`/
+/// `isempty` directly. Before #833 this still misreported "not in label"
+/// even after #867/#879 fixed the direct-evaluation path, since the bug
+/// lived in `eval_owned_expr` itself, not in `isvalid`/`isempty`'s own
+/// match arms. Confirmed live against jq 1.7.1 (both real jq's own `key`
+/// only exists in `--eval-all`/path-context contexts here via succinctly's
+/// own routing, but the surrounding break/label semantics are jq's own):
+/// both exit 0 with no output once `break $out` reaches its label.
+#[test]
+fn test_isvalid_propagates_break_through_path_context_routing_833() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-n", "label $out | key | isvalid(break $out), \"after\""],
+        None,
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
+#[test]
+fn test_isempty_propagates_break_through_path_context_routing_833() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-n", "label $out | key | isempty(break $out), \"after\""],
+        None,
     )?;
     assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
     assert_eq!(stdout, "");
