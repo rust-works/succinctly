@@ -1644,19 +1644,32 @@ impl<'a> Parser<'a> {
 
                 loop {
                     self.skip_ws();
-                    // Parse key (must be identifier or string)
-                    let key = if self.peek() == Some('"') {
-                        self.parse_string_literal()?
+                    // `{$a}` shorthand: real jq desugars a bare `$var` entry
+                    // to `a: $var` -- the variable's own name doubles as
+                    // both the key to match and the binding pattern, with
+                    // no `:` at all. Checked before the identifier/string-
+                    // key branch below since `$` can't start either of
+                    // those.
+                    let (key, pattern) = if self.peek() == Some('$') {
+                        self.next();
+                        let name = self.parse_ident()?;
+                        (name.clone(), Pattern::Var(name))
                     } else {
-                        self.parse_ident()?
+                        // Parse key (must be identifier or string)
+                        let key = if self.peek() == Some('"') {
+                            self.parse_string_literal()?
+                        } else {
+                            self.parse_ident()?
+                        };
+
+                        self.skip_ws();
+                        self.expect(':')?;
+                        self.skip_ws();
+
+                        // Parse the pattern for this key
+                        let pattern = self.parse_pattern()?;
+                        (key, pattern)
                     };
-
-                    self.skip_ws();
-                    self.expect(':')?;
-                    self.skip_ws();
-
-                    // Parse the pattern for this key
-                    let pattern = self.parse_pattern()?;
                     entries.push(PatternEntry { key, pattern });
 
                     self.skip_ws();

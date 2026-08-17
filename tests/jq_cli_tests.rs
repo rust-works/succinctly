@@ -10199,6 +10199,67 @@ fn test_as_pattern_alt_func_call_inside_body_expanded_720() -> Result<()> {
     Ok(())
 }
 
+// =============================================================================
+// #1139: object destructuring pattern shorthand `{$a}` (implicit key from
+// var name). Real jq desugars a bare `$var` entry inside an object pattern
+// to `key: $var`, where `key` is the variable's own name -- e.g. `{$a}` is
+// sugar for `{a: $a}`. All cases live-verified against jq 1.7.1.
+// =============================================================================
+
+#[test]
+fn test_object_pattern_var_shorthand_bare_1139() -> Result<()> {
+    let (stdout, _, code) = run_jq_full(&["-c", ". as {$a} | $a"], Some(r#"{"a":1,"b":2}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "1");
+    Ok(())
+}
+
+/// Mixed with an ordinary explicit `key: $var` entry in the same pattern.
+#[test]
+fn test_object_pattern_var_shorthand_mixed_with_explicit_1139() -> Result<()> {
+    let (stdout, _, code) = run_jq_full(
+        &["-c", ". as {$a, b: $c} | [$a,$c]"],
+        Some(r#"{"a":1,"b":2}"#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "[1,2]");
+    Ok(())
+}
+
+/// Two shorthand entries in the same pattern.
+#[test]
+fn test_object_pattern_var_shorthand_multiple_1139() -> Result<()> {
+    let (stdout, _, code) =
+        run_jq_full(&["-c", ". as {$a, $b} | [$a,$b]"], Some(r#"{"a":1,"b":2}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "[1,2]");
+    Ok(())
+}
+
+/// A missing field binds `null`, same as an explicit `key: $var` would.
+#[test]
+fn test_object_pattern_var_shorthand_missing_key_is_null_1139() -> Result<()> {
+    let (stdout, _, code) = run_jq_full(&["-c", ". as {$a} | $a"], Some(r#"{"b":2}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "null");
+    Ok(())
+}
+
+/// Nested inside an array pattern, and nested inside another object
+/// pattern -- confirms the shorthand works at any recursion depth for
+/// free, since it's handled by the same recursive `parse_pattern` call.
+#[test]
+fn test_object_pattern_var_shorthand_nested_1139() -> Result<()> {
+    let (stdout, _, code) = run_jq_full(&["-c", ". as [{$a}] | $a"], Some(r#"[{"a":1}]"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "1");
+
+    let (stdout, _, code) = run_jq_full(&["-c", ". as {a: {$b}} | $b"], Some(r#"{"a":{"b":2}}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "2");
+    Ok(())
+}
+
 #[test]
 fn test_func_def_expand_recurses_through_halt_stderr_and_halt_error_builtins() -> Result<()> {
     // `expand_func_calls_in_builtin`'s `Halt`/`Stderr`/`HaltError`/
