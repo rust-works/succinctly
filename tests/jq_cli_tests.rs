@@ -11848,6 +11848,22 @@ fn test_jq_dash_e_digit_top_level_errors_not_silent_null_1171() -> Result<()> {
     Ok(())
 }
 
+/// A top-level token with a valid mantissa but an exponent marker with
+/// no digit after it (`1e`) must error too -- rejected outright, not
+/// truncated to just the valid `1` prefix, matching real jq (confirmed
+/// live: `jq -c '.'` on `1e` errors with "Invalid numeric literal", not
+/// `1`). Distinct code path from `-e5` above (that one has no mantissa
+/// digit at all; this one's mantissa is fine, only the exponent is
+/// incomplete).
+#[test]
+fn test_jq_incomplete_exponent_top_level_errors_1171() -> Result<()> {
+    let (out, _, code) = run_jq_full(&["-c", "."], Some("1e"))?;
+    assert_eq!(code, 5, "out: {out:?}");
+    assert!(out.trim().is_empty(), "out: {out:?}");
+
+    Ok(())
+}
+
 /// Trailing zeros on a leading-dot literal's fractional part must be
 /// preserved, not collapsed -- `.500` -> `0.500`, not `0.5` (confirmed
 /// live: real jq's own reader adds the leading `0` but keeps trailing
