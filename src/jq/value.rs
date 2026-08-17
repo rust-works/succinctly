@@ -570,8 +570,12 @@ impl OwnedValue {
     ///
     /// Every operation that *computes* with a number rather than passing it
     /// through untouched should normalize its operands through this first --
-    /// arithmetic calls it at the top of each operator function so a
-    /// literal-carrying operand degrades before the value/value match runs.
+    /// but only immediately before the arm that actually computes, not
+    /// eagerly for every arm an operator function might take. An operand
+    /// that a relocation-shaped arm (`null`-passthrough, array-append, a
+    /// merge no-op, ...) hands back unchanged must keep its own spelling
+    /// (`arith_add`, #1143); calling this at the top of the whole function,
+    /// before the match even runs, silently strips it there too.
     pub fn into_plain_number(self) -> Self {
         match self {
             Self::NumberLiteral(NumberRepr::Int(n), _) => Self::Int(n),

@@ -11613,6 +11613,29 @@ fn test_jq_genuine_arithmetic_still_reformats_1143() -> Result<()> {
     Ok(())
 }
 
+/// `add` is documented as `[.[] | .]` folded with `+` (see `builtin_add`'s
+/// own doc comment), so it inherits `arith_add`'s fix automatically -- a
+/// `null` element folded against a `NumberLiteral` must preserve the
+/// literal's spelling the same way a bare `null + <literal>` does (#1143).
+#[test]
+fn test_jq_add_builtin_preserves_number_literal_through_null_fold_1143() -> Result<()> {
+    let (out, _, code) = run_jq_full(&["-cn", "[null, 1.500] | add"], None)?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "1.500");
+    Ok(())
+}
+
+/// `.a += x` desugars to `.a |= . + x`, so a `null` field's compound-assign
+/// also goes through `arith_add`'s null-passthrough arm and must preserve
+/// the RHS literal's spelling (#1143).
+#[test]
+fn test_jq_compound_assign_plus_preserves_number_literal_on_null_1143() -> Result<()> {
+    let (out, _, code) = run_jq_full(&["-c", ".a += 1.500"], Some(r#"{"a":null}"#))?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), r#"{"a":1.500}"#);
+    Ok(())
+}
+
 /// #1116's yq-only "chained scalar-slice-assign no-ops" / "del() deletes
 /// the parent key" rules must not leak into jq mode: real jq errors on
 /// both `.a[0:1] = 99` and `del(.a[0:1])` for a scalar `.a`, matching
