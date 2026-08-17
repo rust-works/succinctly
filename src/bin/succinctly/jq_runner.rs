@@ -347,11 +347,11 @@ fn rewrite_namespaced_calls(expr: Expr) -> Expr {
         },
         Expr::AsPattern {
             expr,
-            pattern,
+            patterns,
             body,
         } => Expr::AsPattern {
             expr: Box::new(rewrite_namespaced_calls(*expr)),
-            pattern,
+            patterns,
             body: Box::new(rewrite_namespaced_calls(*body)),
         },
         Expr::StringInterpolation(parts) => {

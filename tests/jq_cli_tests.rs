@@ -9335,6 +9335,184 @@ fn test_as_pattern_propagates_halt_after_partial_body_output() -> Result<()> {
     Ok(())
 }
 
+// =============================================================================
+// #720: `?//` alternative destructuring patterns. All cases live-verified
+// against jq 1.7.1.
+// =============================================================================
+
+/// The issue's own repro: a pattern-match failure (array pattern against a
+/// non-array input) falls through to the next alternative.
+#[test]
+fn test_as_pattern_alt_falls_through_on_pattern_mismatch_720() -> Result<()> {
+    let (stdout, code) = run_jq_stdin(". as [$a] ?// {a: $a} | $a", "[1]", &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "1");
+    Ok(())
+}
+
+/// A 3-way alternation, the last (bare-var, always-matches) alternative
+/// used as a catch-all fallback.
+#[test]
+fn test_as_pattern_alt_three_way_chain_720() -> Result<()> {
+    let (stdout, code) = run_jq_stdin(". as [$a] ?// {a: $a} ?// $a | $a", r#"{"a":5}"#, &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "5");
+    Ok(())
+}
+
+/// An error raised in the matched branch's *body* (not the pattern match
+/// itself) also falls through, retrying under the next alternative's
+/// bindings -- confirmed live: `jq -c '. as {a:$a} ?// $a | $a + "x"'` on
+/// `{"a":1}` gives `object ({"a":1}) and string ("x") cannot be added`,
+/// meaning the second alternative (bare `$a`, binding the whole input) is
+/// what actually produced the surfaced error, not the first.
+#[test]
+fn test_as_pattern_alt_falls_through_on_body_error_720() -> Result<()> {
+    let (_, stderr, code) = run_jq_full(
+        &["-c", r#". as {a: $a} ?// $a | $a + "x""#],
+        Some(r#"{"a":1}"#),
+    )?;
+    assert_ne!(code, 0);
+    assert!(
+        stderr.contains(r#"object ({"a":1}) and string ("x") cannot be added"#),
+        "stderr: {stderr}"
+    );
+    Ok(())
+}
+
+/// The *last* alternative's own error propagates normally once matched --
+/// no further fallback exists.
+#[test]
+fn test_as_pattern_alt_last_alternative_error_propagates_720() -> Result<()> {
+    let (_, stderr, code) = run_jq_full(
+        &["-c", r#". as $a ?// {a: $a} | $a + "x""#],
+        Some(r#"{"a":1}"#),
+    )?;
+    assert_ne!(code, 0);
+    assert!(
+        stderr.contains(r#"number (1) and string ("x") cannot be added"#),
+        "stderr: {stderr}"
+    );
+    Ok(())
+}
+
+/// Every alternative's pattern fails to match -> the last alternative's
+/// own error is the final one.
+#[test]
+fn test_as_pattern_alt_all_mismatch_errors_720() -> Result<()> {
+    let (_, stderr, code) = run_jq_full(&["-c", ". as [$a] ?// {a: $a} | $a"], Some("5"))?;
+    assert_ne!(code, 0);
+    assert!(
+        stderr.contains(r#"Cannot index number with string "a""#),
+        "stderr: {stderr}"
+    );
+    Ok(())
+}
+
+/// A variable bound only by a *non-matching* alternative still resolves to
+/// `null` in the body, rather than an "undefined variable" error --
+/// confirmed live against jq 1.7.1.
+#[test]
+fn test_as_pattern_alt_unbound_var_from_other_alt_is_null_720() -> Result<()> {
+    let (stdout, code) = run_jq_stdin(". as [$a] ?// {b: $b} | [$a, $b]", "[1]", &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "[1,null]");
+
+    let (stdout, code) = run_jq_stdin(". as [$a] ?// {b: $b} | [$a, $b]", r#"{"b":9}"#, &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "[null,9]");
+    Ok(())
+}
+
+/// `?//`'s bind expression can still be a generator -- each output is
+/// independently destructured and fanned out, matching `as`'s existing
+/// (non-`?//`) generator behavior.
+#[test]
+fn test_as_pattern_alt_bind_expr_generator_fans_out_720() -> Result<()> {
+    let (stdout, _, code) = run_jq_full(&["-cn", "(1,2) as [$a] ?// $a | $a"], None)?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "1\n2\n");
+    Ok(())
+}
+
+/// `break`/`halt`/empty output inside the body do *not* trigger
+/// fallthrough -- only a genuine `error(...)`/type error does. Confirmed
+/// live: `break` propagates cleanly with no output (not caught as a
+/// pattern/body failure), and `empty` is genuinely empty output, not an
+/// implicit retry signal.
+#[test]
+fn test_as_pattern_alt_break_and_empty_are_not_fallthrough_720() -> Result<()> {
+    let (stdout, code) = run_jq_stdin(
+        "label $out | (. as {a: $a} ?// $a | (break $out))",
+        r#"{"a":1}"#,
+        &["-c"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "");
+
+    let (stdout, code) = run_jq_stdin("[. as {a: $a} ?// $a | empty]", r#"{"a":1}"#, &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "[]");
+    Ok(())
+}
+
+/// A body error's own partial output before it errors is *not* discarded
+/// on fallthrough -- each alternative actually tried contributes whatever
+/// it managed to produce before failing, not just the last one. Confirmed
+/// live: two failing alternatives (a generator body producing `1` then
+/// erroring, tried under two different bindings) each contribute their own
+/// `1` to the final output stream before the last alternative's error
+/// terminates it.
+#[test]
+fn test_as_pattern_alt_partial_output_survives_fallthrough_720() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r#". as {a: $a} ?// $a | (1, error("boom"))"#],
+        Some(r#"{"a":1}"#),
+    )?;
+    assert_ne!(code, 0);
+    assert_eq!(stdout, "1\n1\n");
+    assert!(stderr.contains("boom"), "stderr: {stderr}");
+    Ok(())
+}
+
+/// Without `?//`, a bare `$var`/single-pattern `as` binding is completely
+/// unaffected by this feature's addition -- same AST shape (`Expr::As`),
+/// same behavior as before.
+#[test]
+fn test_as_pattern_no_alt_unaffected_720() -> Result<()> {
+    let (stdout, code) = run_jq_stdin(". as $a | $a", "5", &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "5");
+
+    let (stdout, code) = run_jq_stdin(". as [$a,$b] | $a + $b", "[1,2]", &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "3");
+    Ok(())
+}
+
+/// yq mode does not support `?//` at all -- real yq's own parser rejects
+/// it ("lexer: invalid input text", confirmed live against yq v4.53.3) --
+/// so succinctly's shared jq/yq parser must keep erroring on it in yq mode
+/// too, rather than silently accepting broader syntax than the oracle.
+#[test]
+fn test_as_pattern_alt_rejected_in_yq_mode_720() -> Result<()> {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_succinctly"));
+    cmd.arg("yq")
+        .arg(". as [$a] ?// {a: $a} | $a")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn()?;
+    child.stdin.take().unwrap().write_all(b"a: 5\n")?;
+    let output = child.wait_with_output()?;
+    assert_ne!(
+        output.status.code().unwrap_or(-1),
+        0,
+        "yq mode must reject ?// as a parse error, matching real yq"
+    );
+    Ok(())
+}
+
 #[test]
 fn test_func_def_expand_recurses_through_halt_stderr_and_halt_error_builtins() -> Result<()> {
     // `expand_func_calls_in_builtin`'s `Halt`/`Stderr`/`HaltError`/

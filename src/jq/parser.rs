@@ -3924,41 +3924,58 @@ impl<'a> Parser<'a> {
         Ok(expr)
     }
 
-    /// Parse the pattern part of an `as` binding.
+    /// Parse the pattern part of an `as` binding, including any
+    /// `?//`-separated alternatives (`. as [$a] ?// {$a} | ...`).
     /// Called after "as" has been consumed.
     fn parse_as_pattern(&mut self, expr: Expr) -> Result<Expr, ParseError> {
-        match self.peek() {
-            Some('$') => {
-                // Simple variable binding: `$var`
+        let first_pattern = self.parse_pattern()?;
+        self.skip_ws();
+
+        // `?//` is real jq syntax (since jq 1.6) but real yq's own parser
+        // rejects it outright ("lexer: invalid input text", confirmed live
+        // against yq v4.53.3) -- gated to jq mode only so yq mode keeps
+        // erroring on it the same way, rather than silently accepting
+        // broader syntax than the oracle it's meant to match.
+        if self.mode == ParserMode::Jq && self.peek_str(3) == "?//" {
+            let mut patterns = vec![first_pattern];
+            while self.peek_str(3) == "?//" {
                 self.next();
-                let var = self.parse_ident()?;
+                self.next();
+                self.next();
                 self.skip_ws();
-                self.expect('|')?;
+                patterns.push(self.parse_pattern()?);
                 self.skip_ws();
-                let body = self.parse_expr()?;
-                Ok(Expr::As {
-                    expr: Box::new(expr),
-                    var,
-                    body: Box::new(body),
-                })
             }
-            Some('{' | '[') => {
-                // Pattern destructuring: `{key: $var}` or `[$first, $second]`
-                let pattern = self.parse_pattern()?;
-                self.skip_ws();
-                self.expect('|')?;
-                self.skip_ws();
-                let body = self.parse_expr()?;
-                Ok(Expr::AsPattern {
-                    expr: Box::new(expr),
-                    pattern,
-                    body: Box::new(body),
-                })
-            }
-            _ => Err(ParseError::new(
-                "expected '$var' or pattern after 'as'",
-                self.pos,
-            )),
+            self.expect('|')?;
+            self.skip_ws();
+            let body = self.parse_expr()?;
+            return Ok(Expr::AsPattern {
+                expr: Box::new(expr),
+                patterns,
+                body: Box::new(body),
+            });
+        }
+
+        self.expect('|')?;
+        self.skip_ws();
+        let body = self.parse_expr()?;
+
+        // No `?//` alternatives: keep the simpler, pre-existing `Expr::As`
+        // shape for a bare `$var` pattern (every other `Expr::As` call site
+        // in this file is unaffected by `?//`'s addition), and
+        // `Expr::AsPattern` with a single-element `patterns` for `{...}`/
+        // `[...]`, exactly as before this feature existed.
+        match first_pattern {
+            Pattern::Var(var) => Ok(Expr::As {
+                expr: Box::new(expr),
+                var,
+                body: Box::new(body),
+            }),
+            other => Ok(Expr::AsPattern {
+                expr: Box::new(expr),
+                patterns: vec![other],
+                body: Box::new(body),
+            }),
         }
     }
 
