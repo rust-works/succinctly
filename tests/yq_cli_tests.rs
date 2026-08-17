@@ -13579,6 +13579,179 @@ fn test_slice_compound_add_array_target_jq_mode_unaffected_1142() -> Result<()> 
 }
 
 // ============================================================================
+// yq field/index assignment no-op on a scalar root (#1181)
+// ============================================================================
+//
+// The sibling of #1101's slice no-op, for plain field/index writes onto a
+// scalar root: `.a = v`, `.[0] = v`, and a *computed* key (`$k as $k |
+// .[$k] = v`) all no-op in real yq the same way a bare-root slice does. This
+// was never generalized from the slice case -- `key_to_path_component` (the
+// computed-key path) and `set_path`'s own `Field`/`Index` arms both errored
+// unconditionally, in both jq and yq mode.
+//
+// Scoped narrowly to a scalar *root* (the whole input, not a chained
+// sub-target reached via `.a.b`/`.a[0]`) -- mirroring #1101's own original
+// scope before #1116 later generalized it to any chain depth. Chain depth
+// is left to a follow-up issue for the same reason #1116 was its own issue:
+// `get_path_mut` (the parent-navigation walker a multi-component path
+// resolves through) has no `S`/yq-mode awareness at all, unlike `set_path`'s
+// own terminal-component arms.
+//
+// One more divergence, *not* replicated here: real yq silently discards the
+// RHS/filter entirely for this no-op, including a genuinely erroring one
+// (`.a = error("boom")` on `5` is `5`, not an error) -- unlike the slice
+// no-op, which does still propagate a genuinely erroring RHS
+// (`test_slice_assign_scalar_noop_still_propagates_rhs_errors_1101`).
+// succinctly's `eval_assign`/`eval_update` evaluate the RHS before path
+// resolution ever runs, so matching that exactly needs its own design
+// (peeking at whether every resolved path is a no-op before ever evaluating
+// the RHS) -- filed separately, live-verified against yq v4.53.3.
+
+/// The issue's own repro, `=` on a bare number: `.a`, `.[0]`, and a computed
+/// key via `as`, all no-op.
+#[test]
+fn test_yq_field_index_assign_number_scalar_is_noop_1181() -> Result<()> {
+    let (out, code) = run_yq_stdin(".a = 99", "5", &["-o", "json"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "5");
+
+    let (out, code) = run_yq_stdin(".[0] = 99", "5", &["-o", "json"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "5");
+
+    let (out, code) = run_yq_stdin("0 as $k | .[$k] = 99", "5", &["-o", "json"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "5");
+    Ok(())
+}
+
+/// A computed *string* key behaves the same as a computed numeric one.
+#[test]
+fn test_yq_field_index_assign_computed_string_key_scalar_is_noop_1181() -> Result<()> {
+    let (out, code) = run_yq_stdin(r#""a" as $k | .[$k] = 99"#, "5", &["-o", "json"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "5");
+    Ok(())
+}
+
+/// Every other scalar kind (string, bool) no-ops the same way a number
+/// does -- this is about the *root's* type, not the key's.
+#[test]
+fn test_yq_field_index_assign_string_and_bool_scalar_is_noop_1181() -> Result<()> {
+    let (out, code) = run_yq_stdin(".a = 99", r#""hello""#, &["-o", "json"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), r#""hello""#);
+
+    let (out, code) = run_yq_stdin(".[0] = 99", "true", &["-o", "json"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "true");
+    Ok(())
+}
+
+/// `|=`/`+=` no-op the same as `=` -- `update_path`'s own `Field`/`Index`
+/// arms, a separate walker from `set_path`.
+#[test]
+fn test_yq_field_index_update_and_add_scalar_is_noop_1181() -> Result<()> {
+    let (out, code) = run_yq_stdin(".a |= . + 1", "5", &["-o", "json"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "5");
+
+    let (out, code) = run_yq_stdin(".[0] += 1", "5", &["-o", "json"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "5");
+
+    let (out, code) = run_yq_stdin("0 as $k | .[$k] |= . + 1", "5", &["-o", "json"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "5");
+    Ok(())
+}
+
+/// `-=`/`*=` no-op here too -- live-verified as a genuine divergence from
+/// the *slice* no-op, where these two operators error instead
+/// (`test_slice_sub_and_mul_number_scalar_still_errors_1101`). The
+/// field/index no-op has no such operator exception: it is unconditional,
+/// like #1142's container case, not gated the way #1101's scalar case is.
+#[test]
+fn test_yq_field_index_sub_and_mul_scalar_is_noop_1181() -> Result<()> {
+    let (out, code) = run_yq_stdin(".a -= 1", "5", &["-o", "json"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "5");
+
+    let (out, code) = run_yq_stdin("0 as $k | .[$k] *= 1", "5", &["-o", "json"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "5");
+    Ok(())
+}
+
+/// A NaN-valued computed key still no-ops rather than raising "cannot set
+/// array element at NaN index" -- the write no-ops before the key's own
+/// validity is ever inspected, live-verified against real yq.
+#[test]
+fn test_yq_field_index_assign_nan_computed_key_scalar_is_noop_1181() -> Result<()> {
+    let (out, code) = run_yq_stdin("(0/0) as $k | .[$k] = 99", "5", &["-o", "json"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "5");
+    Ok(())
+}
+
+/// Regression guard: a `null` root still autovivifies normally -- #1181 is
+/// specifically about a *scalar* root, and `null` is not one (it's the
+/// standard "build whatever the path names" case in both jq and yq).
+#[test]
+fn test_yq_field_index_assign_null_root_still_autovivifies_1181() -> Result<()> {
+    let (out, code) = run_yq_stdin(".a = 99", "null", &["-o", "json", "-I0"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), r#"{"a":99}"#);
+
+    let (out, code) = run_yq_stdin(".[0] = 99", "null", &["-o", "json", "-I0"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "[99]");
+    Ok(())
+}
+
+/// Regression guard: array/object roots still write normally -- the no-op
+/// is specific to a genuinely scalar root.
+#[test]
+fn test_yq_field_index_assign_container_root_unaffected_1181() -> Result<()> {
+    let (out, code) = run_yq_stdin(".[0] |= . + 100", "[1,2,3]", &["-o", "json", "-I0"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "[101,2,3]");
+
+    let (out, code) = run_yq_stdin(".a += 10", r#"{"a":1}"#, &["-o", "json", "-I0"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), r#"{"a":11}"#);
+    Ok(())
+}
+
+/// Regression guard: jq mode is unaffected -- it keeps raising `Cannot
+/// index number with ...` for every one of these shapes, matching real jq.
+#[test]
+fn test_field_index_assign_scalar_jq_mode_unaffected_1181() -> Result<()> {
+    for filter in [".a = 99", ".[0] = 99", "0 as $k | .[$k] = 99", ".a -= 1"] {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_succinctly"));
+        cmd.arg("jq").arg(filter);
+        let mut child = cmd
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        child.stdin.take().unwrap().write_all(b"5")?;
+        let output = child.wait_with_output()?;
+        assert_ne!(
+            output.status.code(),
+            Some(0),
+            "filter {filter:?} unexpectedly succeeded in jq mode"
+        );
+        let stderr = String::from_utf8(output.stderr)?;
+        assert!(
+            stderr.contains("Cannot index number"),
+            "filter {filter:?} stderr: {stderr:?}"
+        );
+    }
+    Ok(())
+}
+
+// ============================================================================
 // @urid / @base64d scalar-stringification (#1109)
 // ============================================================================
 //
