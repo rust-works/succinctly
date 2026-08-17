@@ -9701,17 +9701,7 @@ fn eval_slice_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             for s in &starts {
                 for e in &ends {
                     for t in ts {
-                        // yq's empty-container slicing rule (#1065) — kept
-                        // out of `slice_owned_value` itself, since that
-                        // function is *also* used by `resolve_slice_expr`
-                        // for assignment targets, where real yq's own
-                        // behavior is a silent no-op (`5 | .[0:1] = 99`
-                        // stays `5`), not this read-path rule.
-                        if S::TAG == EvalTag::Yq && is_yq_slice_empty_container_scalar(t) {
-                            out.push(OwnedValue::Array(Vec::new()));
-                            continue;
-                        }
-                        match slice_owned_value(t, *s, *e, optional) {
+                        match slice_owned_value_read::<S>(t, *s, *e, optional) {
                             Ok(Some(v)) => out.push(v),
                             Ok(None) => {}
                             Err(e) => return e.into(),
@@ -9834,6 +9824,25 @@ pub(crate) fn slice_owned_value(
             "object",
         )),
     }
+}
+
+/// Slice one `OwnedValue` target on the *read* path (`.[S:E]`), applying
+/// yq's empty-container-scalar rule (#1065) before falling back to
+/// `slice_owned_value`. Shared by `eval_slice_expr`'s `Targets::Owned` loop
+/// here and `eval_generic::eval_slice_expr`'s equivalent loop, so the rule
+/// has exactly one call site to keep in sync instead of two hand-copied
+/// ones — the same duplicated-predicate shape this codebase has already
+/// been bitten by once (see the crate's own optimization-lessons doc).
+pub(crate) fn slice_owned_value_read<S: EvalSemantics>(
+    target: &OwnedValue,
+    start: Option<i64>,
+    end: Option<i64>,
+    optional: bool,
+) -> Result<Option<OwnedValue>, EvalError> {
+    if S::TAG == EvalTag::Yq && is_yq_slice_empty_container_scalar(target) {
+        return Ok(Some(OwnedValue::Array(Vec::new())));
+    }
+    slice_owned_value(target, start, end, optional)
 }
 
 /// Get element at index (supports negative indexing).
