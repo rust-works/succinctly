@@ -27,9 +27,9 @@ use super::document::{
 use super::eval::{
     apply_compare_op, collapse_vec, eval as full_eval, format_owned,
     index_one_owned as index_owned_by_key, literal_to_owned, needs_path_context,
-    numeric_display_string, numeric_key_to_index, owned_bound_to_i64, owned_value_to_json,
-    slice_owned_value_read, tonumber_from_str, Control, EvalError, EvalSemantics, EvalTag,
-    JqSemantics, QueryResult, YqSemantics,
+    numeric_display_string, numeric_key_to_index, owned_bound_to_i64, owned_to_string,
+    owned_value_to_json, slice_owned_value_read, tonumber_from_str, Control, EvalError,
+    EvalSemantics, EvalTag, JqSemantics, QueryResult, YqSemantics,
 };
 use super::expr::{Builtin, Expr, FormatType};
 use super::slice::{slice_str, SliceBounds};
@@ -895,6 +895,21 @@ fn eval_on_owned<S: EvalSemantics, V: DocumentValue>(
     // having passed through a JSON round-trip first.
     if let Expr::Format(format_type) = expr {
         return format_result::<S, _>(format_type, &owned, optional);
+    }
+
+    // `tostring` needs the same bypass, for correctness here, not just
+    // speed (#1054): without it, `EXPR | tostring` on a genuinely computed
+    // value (e.g. `(1e10 * 2)`) serializes through `to_json_for_reindex`'s
+    // decimal-only float spelling below first, reparses as a
+    // document-sourced-*looking* number, and echoes that baked text
+    // verbatim per #1008's literal-preservation rule once the `ToString`
+    // arm at the bottom of this file's `Builtin` match finally runs --
+    // permanently losing the scientific-notation spelling real yq applies
+    // to a computed float before the round trip ever has a chance to run.
+    // `owned_to_string` is the exact same function that arm already calls,
+    // so this is unobservable except in speed for every other value shape.
+    if let Expr::Builtin(Builtin::ToString) = expr {
+        return GenericResult::Owned(OwnedValue::String(owned_to_string::<S>(&owned)));
     }
 
     let json_str = owned.to_json_for_reindex::<S>();
