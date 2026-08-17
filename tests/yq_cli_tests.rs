@@ -6153,6 +6153,31 @@ fn test_args_named_object() -> Result<()> {
     Ok(())
 }
 
+/// clap rejected any negative-number (or other hyphen-prefixed) `--arg`/
+/// `--argjson` value before it ever reached this crate's own JSON-content
+/// validation -- fixed via `allow_hyphen_values` on `YqCommand`'s `arg`/
+/// `argjson` clap::Arg definitions (#1150). Verified live against real
+/// yq v4.53.3.
+#[test]
+fn test_argjson_bare_negative_number_1150() -> Result<()> {
+    let (output, code) = run_yq_stdin(
+        ".n = $n",
+        "{}",
+        &["--argjson", "n", "-7", "-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#"{"n":-7}"#);
+    Ok(())
+}
+
+#[test]
+fn test_arg_hyphen_prefixed_string_value_1150() -> Result<()> {
+    let (output, code) = run_yq_stdin("$n", "a: 1", &["--arg", "n", "-hello"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "-hello");
+    Ok(())
+}
+
 #[test]
 fn test_argjson_invalid_value_errors() -> Result<()> {
     // Malformed --argjson is rejected (RFC 8259 strict), matching jq, with the

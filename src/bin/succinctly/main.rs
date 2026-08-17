@@ -894,19 +894,19 @@ struct JqCommand {
 
     // === Variables ===
     /// Set $name to the string value
-    #[arg(long, value_names = ["NAME", "VALUE"], num_args = 2, action = clap::ArgAction::Append)]
+    #[arg(long, value_names = ["NAME", "VALUE"], num_args = 2, action = clap::ArgAction::Append, allow_hyphen_values = true)]
     arg: Vec<String>,
 
     /// Set $name to the JSON value
-    #[arg(long, value_names = ["NAME", "VALUE"], num_args = 2, action = clap::ArgAction::Append)]
+    #[arg(long, value_names = ["NAME", "VALUE"], num_args = 2, action = clap::ArgAction::Append, allow_hyphen_values = true)]
     argjson: Vec<String>,
 
     /// Set $name to an array of JSON values read from file
-    #[arg(long, value_names = ["NAME", "FILE"], num_args = 2, action = clap::ArgAction::Append)]
+    #[arg(long, value_names = ["NAME", "FILE"], num_args = 2, action = clap::ArgAction::Append, allow_hyphen_values = true)]
     slurpfile: Vec<String>,
 
     /// Set $name to the string contents of file
-    #[arg(long, value_names = ["NAME", "FILE"], num_args = 2, action = clap::ArgAction::Append)]
+    #[arg(long, value_names = ["NAME", "FILE"], num_args = 2, action = clap::ArgAction::Append, allow_hyphen_values = true)]
     rawfile: Vec<String>,
 
     /// Consume remaining arguments as positional string values
@@ -1122,11 +1122,11 @@ pub struct YqCommand {
 
     // === Variables ===
     /// Set $name to the string value
-    #[arg(long, value_names = ["NAME", "VALUE"], num_args = 2, action = clap::ArgAction::Append)]
+    #[arg(long, value_names = ["NAME", "VALUE"], num_args = 2, action = clap::ArgAction::Append, allow_hyphen_values = true)]
     pub arg: Vec<String>,
 
     /// Set $name to the JSON value
-    #[arg(long, value_names = ["NAME", "VALUE"], num_args = 2, action = clap::ArgAction::Append)]
+    #[arg(long, value_names = ["NAME", "VALUE"], num_args = 2, action = clap::ArgAction::Append, allow_hyphen_values = true)]
     pub argjson: Vec<String>,
 
     // === Exit Status ===
