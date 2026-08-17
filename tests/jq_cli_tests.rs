@@ -690,6 +690,26 @@ fn test_argjson_malformed_json_still_rejected_1094() -> Result<()> {
     Ok(())
 }
 
+/// Regression guard (found by review before merge): a bare `-` with no
+/// digit following it isn't a number token at all, but an earlier draft
+/// of `normalize_leading_zero_numbers` fabricated a `0` digit for it
+/// (turning the genuinely invalid `-` into the valid number `-0`), which
+/// made the retried validation wrongly pass and let this malformed input
+/// silently reach materialization as `null` instead of erroring. Real jq
+/// rejects all three of these outright.
+#[test]
+fn test_argjson_bare_hyphen_rejected_not_fabricated_into_negative_zero_1094() -> Result<()> {
+    let (_, _, code) = run_jq_full(&["-n", "--argjson", "n", "-", "$n"], None)?;
+    assert_ne!(code, 0);
+
+    let (_, _, code) = run_jq_full(&["-cn", "--argjson", "n", "[-,1]", "$n"], None)?;
+    assert_ne!(code, 0);
+
+    let (_, _, code) = run_jq_full(&["-cn", "--argjson", "n", r#"{"a":-}"#, "$n"], None)?;
+    assert_ne!(code, 0);
+    Ok(())
+}
+
 /// A negative leading-zero number, reached nested inside an array so it
 /// doesn't hit the unrelated CLI arg-parsing issue a bare negative
 /// `--argjson` value has (#1150) -- exercises
