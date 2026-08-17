@@ -5657,7 +5657,21 @@ fn format_urid<S: EvalSemantics>(value: &OwnedValue, optional: bool) -> Result<S
         result.push(bytes[i]);
         i += 1;
     }
-    Ok(String::from_utf8_lossy(&result).into_owned())
+    Ok(bytes_to_string_lossy(result))
+}
+
+/// Converts a decoded byte buffer to a `String`, reusing the buffer's own
+/// allocation on the common valid-UTF-8 path instead of the extra
+/// malloc+copy `String::from_utf8_lossy(&buf).into_owned()` always pays
+/// (it returns a borrowed `Cow` even when valid, so `.into_owned()` copies
+/// regardless). Only genuinely invalid UTF-8 needs a fresh allocation, for
+/// the lossy replacement-character substitution. Shared by
+/// [`format_urid`] and [`format_base64d`], the two decoders that produce
+/// arbitrary bytes and must never error on invalid UTF-8 in the result
+/// (confirmed live against both oracles -- see `format_base64d`'s own
+/// doc comment on this exact point).
+fn bytes_to_string_lossy(bytes: Vec<u8>) -> String {
+    String::from_utf8(bytes).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
 }
 
 /// Quote a CSV/DSV string field: wrap in `"..."`, doubling inner `"`.
@@ -5849,11 +5863,30 @@ fn format_base64d<S: EvalSemantics>(
         }
     }
 
-    // ASCII whitespace only -- `char::is_whitespace()` also strips
-    // non-ASCII Unicode whitespace (U+00A0, U+2028, U+3000, ...), which
-    // real yq treats as invalid base64 input ("illegal base64 data at
-    // input byte N") rather than silently discarding (#1123).
-    let stripped = s.replace(|c: char| c.is_ascii_whitespace(), "");
+    // Trim leading/trailing whitespace only (any Unicode whitespace, e.g.
+    // U+00A0) in yq mode -- live-verified against real yq v4.53.3: it
+    // trims both ASCII and non-ASCII whitespace at the *edges* before
+    // decoding, but embedded whitespace anywhere in the middle is left in
+    // place and correctly errors below via `decode_char` (not a valid
+    // base64-alphabet byte), matching "illegal base64 data at input byte
+    // N". The pre-#1123 code (and #1120's own rewrite, which
+    // reintroduced it while fixing a separate truncation bug) stripped
+    // whitespace *anywhere* in the string via `.replace()`, which wrongly
+    // accepted embedded whitespace real yq rejects (`"aGVs bG8=" |
+    // @base64d` decoded as `"hello"` instead of erroring).
+    //
+    // jq mode does no trimming at all here: real jq 1.7.1 does not treat
+    // whitespace specially -- it errors on leading/embedded whitespace
+    // the same as any other non-base64-alphabet byte, live-verified.
+    // (Trailing whitespace *after* the first `=` is separately handled
+    // for free by the truncate-at-first-`=` step below, which discards
+    // everything after padding regardless of content -- that's jq's own
+    // stop-at-padding behavior, not a whitespace-specific rule.)
+    let stripped = if S::TAG == EvalTag::Yq {
+        s.trim()
+    } else {
+        s.as_str()
+    };
 
     // Real jq truncates at the *first* `=` in the (whitespace-
     // stripped) input, discarding it and everything after it --
@@ -5938,7 +5971,7 @@ fn format_base64d<S: EvalSemantics>(
     // (`null`/`true`/... above) reaches this exact case for the first
     // time, and the strict conversion previously here would have produced
     // a different wrong error instead of matching the oracle.
-    Ok(String::from_utf8_lossy(&result).into_owned())
+    Ok(bytes_to_string_lossy(result))
 }
 
 /// @html - HTML entity escape

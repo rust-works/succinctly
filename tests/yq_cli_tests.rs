@@ -13245,8 +13245,12 @@ fn base64_decode_lossy(s: &str) -> String {
 // Two decode-loop bugs found reviewing #1109: `format_urid` pushed each
 // output byte via `bytes[i] as char`, mis-encoding any byte >= 0x80 as its
 // own Latin-1 codepoint instead of a UTF-8 sequence member; `format_base64d`
-// stripped input whitespace via `char::is_whitespace()`, which also strips
-// non-ASCII Unicode whitespace real yq treats as invalid base64 input.
+// stripped input whitespace via `char::is_whitespace()` *anywhere* in the
+// string, which both stripped non-ASCII Unicode whitespace real yq treats
+// as invalid base64 input, and (found by code review, live-verified against
+// yq v4.53.3 and jq 1.7.1) stripped *embedded* whitespace real yq rejects
+// too -- yq only trims whitespace at the string's edges before decoding.
+// jq is stricter still: it does no whitespace trimming at all.
 
 /// The issue's own repro: a non-ASCII string with zero `%` escapes must
 /// round-trip unchanged, not get mangled into mojibake.
@@ -13279,27 +13283,99 @@ fn test_urid_mixed_ascii_escape_and_multibyte_passthrough_1123() -> Result<()> {
     Ok(())
 }
 
-/// A base64 payload with an injected non-ASCII Unicode whitespace character
-/// (U+00A0, non-breaking space) must be rejected as invalid, not silently
-/// stripped and decoded.
+/// A percent-decode that produces invalid UTF-8 (`%FF` is not a valid
+/// standalone UTF-8 byte) must substitute the replacement character rather
+/// than erroring or silently corrupting -- the same lossy convention
+/// `@base64d` already documents and tests for its own decode output.
 #[test]
-fn test_base64d_rejects_non_ascii_whitespace_1123() -> Result<()> {
+fn test_urid_invalid_utf8_after_percent_decode_is_lossy_1123() -> Result<()> {
+    let (out, code) = run_yq_stdin("@urid", "\"%FF\"\n", &["-o", "json"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "\"\u{fffd}\"");
+    Ok(())
+}
+
+/// `@urid`'s multi-byte fix applies identically in jq mode -- the function
+/// is shared (`S: EvalSemantics`-generic), and the original corruption bug
+/// was reachable via `succinctly jq` just as much as via yq mode.
+#[test]
+fn test_jq_urid_preserves_multibyte_utf8_1123() -> Result<()> {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_succinctly"));
+    cmd.arg("jq").arg("@urid");
+    let mut child = cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all("\"café\"".as_bytes())?;
+    let output = child.wait_with_output()?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(String::from_utf8(output.stdout)?.trim(), "\"café\"");
+    Ok(())
+}
+
+/// A base64 payload with an injected non-ASCII Unicode whitespace character
+/// (U+00A0, non-breaking space) *embedded* in the middle must be rejected
+/// as invalid, matching real yq exactly (`illegal base64 data at input
+/// byte N`) -- not silently stripped and decoded.
+#[test]
+fn test_base64d_rejects_embedded_non_ascii_whitespace_1123() -> Result<()> {
     let input = "\"aGVs\u{a0}bG8=\"\n";
     let (out, code) = run_yq_stdin("@base64d", input, &["-o", "json"])?;
     assert_ne!(code, 0, "out: {out:?}");
     Ok(())
 }
 
-/// Regression guard: ordinary ASCII whitespace (space, newline) embedded in
-/// a base64 payload must still be stripped, matching pre-#1123 behavior.
+/// yq mode trims whitespace at the string's *edges* only (both ASCII and
+/// non-ASCII, e.g. U+00A0) before decoding, live-verified against real yq
+/// v4.53.3 -- this is the one case pre-#1123's over-broad
+/// `char::is_whitespace()` strip *happened* to get right, so the fix must
+/// not regress it while narrowing to edges-only.
 #[test]
-fn test_base64d_still_strips_ascii_whitespace_1123() -> Result<()> {
-    let (out, code) = run_yq_stdin("@base64d", "\"aGVs bG8=\"\n", &["-o", "json"])?;
+fn test_base64d_yq_trims_leading_and_trailing_whitespace_1123() -> Result<()> {
+    let (out, code) = run_yq_stdin("@base64d", "\"  aGVsbG8=  \"\n", &["-o", "json"])?;
     assert_eq!(code, 0, "out: {out:?}");
     assert_eq!(out.trim(), "\"hello\"");
 
-    let (out, code) = run_yq_stdin("@base64d", "\"aGVs\nbG8=\"\n", &["-o", "json"])?;
+    let input = "\"\u{a0}aGVsbG8=\u{a0}\"\n";
+    let (out, code) = run_yq_stdin("@base64d", input, &["-o", "json"])?;
     assert_eq!(code, 0, "out: {out:?}");
     assert_eq!(out.trim(), "\"hello\"");
+    Ok(())
+}
+
+/// yq mode must reject whitespace *embedded* in the middle of the payload,
+/// even ordinary ASCII space/newline -- live-verified against real yq
+/// v4.53.3 (`"aGVs bG8=" | @base64d` errors there, it does not decode to
+/// "hello"). Pre-#1123's `.replace()`-based strip wrongly accepted this.
+#[test]
+fn test_base64d_yq_rejects_embedded_ascii_whitespace_1123() -> Result<()> {
+    let (out, code) = run_yq_stdin("@base64d", "\"aGVs bG8=\"\n", &["-o", "json"])?;
+    assert_ne!(code, 0, "out: {out:?}");
+
+    let (out, code) = run_yq_stdin("@base64d", "\"aGVs\nbG8=\"\n", &["-o", "json"])?;
+    assert_ne!(code, 0, "out: {out:?}");
+    Ok(())
+}
+
+/// jq mode does no whitespace trimming at all, live-verified against real
+/// jq 1.7.1 -- unlike yq, leading whitespace is never stripped before
+/// decoding, so it reaches `decode_char` and errors immediately.
+#[test]
+fn test_jq_base64d_rejects_leading_whitespace_1123() -> Result<()> {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_succinctly"));
+    cmd.arg("jq").arg("@base64d");
+    let mut child = cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    child.stdin.take().unwrap().write_all(b"\"  aGVsbG8=\"")?;
+    let output = child.wait_with_output()?;
+    assert_ne!(output.status.code().unwrap_or(-1), 0);
     Ok(())
 }
