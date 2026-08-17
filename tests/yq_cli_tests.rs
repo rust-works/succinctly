@@ -13871,13 +13871,23 @@ fn test_1143_array_plus_number_literal_appends_preserving_spelling() -> Result<(
     Ok(())
 }
 
+/// `null + x` (left-null) preserves a `NumberLiteral` right operand's own
+/// spelling -- unaffected by #1197, which only narrowed the *right*-null
+/// arm's type coverage, not this one.
+///
+/// The original version of this test also asserted `1e10 + null` (a
+/// right-null pairing) succeeded with spelling preserved -- that assumption
+/// was never actually checked against the real yq oracle for the
+/// right-null case specifically, and turned out to be wrong: real yq
+/// v4.53.3 errors on `1e10 + null`/`3.00 + null` exactly like `7 + null`
+/// (confirmed live, `!!float cannot be added to !!null`), since a plain
+/// number is not a `String`/`Array` on that side. #1197 fixed this, so
+/// there is no longer a right-null-with-Number relocation to preserve
+/// spelling for at all -- see `test_1197_right_null_add_errors_for_number_
+/// bool_object` for the now-correct error-path coverage of that shape.
 #[test]
 fn test_1143_null_plus_number_literal_preserves_spelling() -> Result<()> {
     let (output, code) = run_yq_stdin("null + 1e10", "null", &["-o=json", "-I=0"])?;
-    assert_eq!(code, 0);
-    assert_eq!(output.trim(), "1e10");
-
-    let (output, code) = run_yq_stdin("1e10 + null", "null", &["-o=json", "-I=0"])?;
     assert_eq!(code, 0);
     assert_eq!(output.trim(), "1e10");
 
@@ -14036,6 +14046,124 @@ fn test_yq_left_null_scalar_errors_1175() -> Result<()> {
         assert_eq!(code, 1, "expr {expr:?}: {err}");
         assert!(err.contains("cannot be multiplied"), "expr {expr:?}: {err}");
     }
+    Ok(())
+}
+
+// --- #1197/#1198: yq's `+`/`-` null-operand rules, mirroring #1175's own
+// `*` investigation. `null + x`/`null - x` succeed for every type in yq
+// (matching real yq v4.53.3, live-verified); `x + null` only succeeds when
+// `x` is a String/Array (narrower than `null + x`'s own side); `x - null`
+// errors unconditionally, on every type, in both jq and yq -- real yq has
+// no symmetric identity for `-` the way it does for `null - x`.
+
+#[test]
+fn test_1197_left_null_add_succeeds_every_type() -> Result<()> {
+    for (expr, expected) in [
+        ("null + 7", "7"),
+        (r#"null + "a""#, r#""a""#),
+        ("null + true", "true"),
+        ("null + [1,2]", "[1,2]"),
+        (r#"null + {"x":1}"#, r#"{"x":1}"#),
+    ] {
+        let (out, code) = run_yq_stdin(expr, "null", &["-o=json", "-I=0"])?;
+        assert_eq!(code, 0, "expr {expr:?}: out {out:?}");
+        assert_eq!(out.trim(), expected, "expr {expr:?}");
+    }
+    Ok(())
+}
+
+#[test]
+fn test_1197_right_null_add_succeeds_only_for_string_and_array() -> Result<()> {
+    for (expr, expected) in [(r#""a" + null"#, r#""a""#), ("[1,2] + null", "[1,2]")] {
+        let (out, code) = run_yq_stdin(expr, "null", &["-o=json", "-I=0"])?;
+        assert_eq!(code, 0, "expr {expr:?}: out {out:?}");
+        assert_eq!(out.trim(), expected, "expr {expr:?}");
+    }
+    Ok(())
+}
+
+#[test]
+fn test_1197_right_null_add_errors_for_number_bool_object() -> Result<()> {
+    for expr in ["7 + null", "true + null", r#"{"x":1} + null"#] {
+        let (_out, err, code) = run_yq_stdin_with_stderr(expr, "null", &["-o=json", "-I=0"])?;
+        assert_eq!(code, 1, "expr {expr:?}: {err}");
+        assert!(err.contains("cannot be added"), "expr {expr:?}: {err}");
+    }
+    Ok(())
+}
+
+/// jq mode is unaffected -- real jq's own `+` accepts a null right operand
+/// unconditionally for every type (unlike yq's narrower rule above).
+#[test]
+fn test_1197_right_null_add_unaffected_in_jq_mode() -> Result<()> {
+    for (expr, expected) in [("7 + null", "7"), (r#"{"x":1} + null"#, r#"{"x":1}"#)] {
+        let (out, _stderr, code) = run_jq_stdin_with_stderr(expr, "null", &["-c"])?;
+        assert_eq!(code, 0, "expr {expr:?}: out {out:?}");
+        assert_eq!(out.trim(), expected, "expr {expr:?}");
+    }
+    Ok(())
+}
+
+#[test]
+fn test_1198_left_null_sub_is_identity_every_type() -> Result<()> {
+    for (expr, expected) in [
+        ("null - 7", "7"),
+        (r#"null - "a""#, r#""a""#),
+        ("null - true", "true"),
+        ("null - [1,2]", "[1,2]"),
+        (r#"null - {"x":1}"#, r#"{"x":1}"#),
+    ] {
+        let (out, code) = run_yq_stdin(expr, "null", &["-o=json", "-I=0"])?;
+        assert_eq!(code, 0, "expr {expr:?}: out {out:?}");
+        assert_eq!(out.trim(), expected, "expr {expr:?}");
+    }
+    Ok(())
+}
+
+/// A right-null operand for `-` still errors unconditionally, on every
+/// type, unlike `null - x` above -- real yq has no symmetric identity here.
+#[test]
+fn test_1198_right_null_sub_still_errors_every_type() -> Result<()> {
+    for expr in [
+        "7 - null",
+        r#""a" - null"#,
+        "true - null",
+        "[1,2] - null",
+        r#"{"x":1} - null"#,
+    ] {
+        let (_out, err, code) = run_yq_stdin_with_stderr(expr, "null", &["-o=json", "-I=0"])?;
+        assert_eq!(code, 1, "expr {expr:?}: {err}");
+        assert!(err.contains("cannot be subtracted"), "expr {expr:?}: {err}");
+    }
+    Ok(())
+}
+
+/// jq mode is unaffected -- every null-involving subtraction still errors
+/// on both sides, matching real jq exactly (#1198's identity rule is
+/// yq-only).
+#[test]
+fn test_1198_null_sub_unaffected_in_jq_mode() -> Result<()> {
+    for expr in ["null - 7", "7 - null"] {
+        let (_out, err, code) = run_jq_stdin_with_stderr(expr, "null", &["-c"])?;
+        assert_ne!(code, 0, "expr {expr:?}");
+        assert!(err.contains("cannot be subtracted"), "expr {expr:?}: {err}");
+    }
+    Ok(())
+}
+
+/// `null - x` relocates `x` unchanged, not computed -- a `NumberLiteral`
+/// operand sourced from input data must keep its own source spelling
+/// (mirroring #1143/#1167's identical concern for `+`/`*`'s own relocation
+/// arms), not collapse to its canonical `Int`/`Float` form.
+#[test]
+fn test_1198_left_null_sub_preserves_number_literal_spelling() -> Result<()> {
+    let (out, code) = run_yq_stdin(
+        ".a as $x | null - $x",
+        r#"{"a": 2.50}"#,
+        &["-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "2.50");
     Ok(())
 }
 

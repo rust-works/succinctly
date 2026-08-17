@@ -94,6 +94,29 @@ pub trait EvalSemantics: Copy + Default {
     /// comparison. If false (jq, which has no strict int/float distinction),
     /// `2.0 == 2` is `true`. #950.
     const STRICT_NUMERIC_EQUALITY: bool;
+    /// If true (jq), a `null` *right* operand of `+` passes through
+    /// unconditionally for any left-operand type (`7 + null` -> `7`,
+    /// `{} + null` -> `{}`) -- jq's own null-symmetric identity for `+`
+    /// applies to both sides equally. If false (yq, #1197), the same
+    /// right-null passthrough only holds when the left operand is a
+    /// `String` or `Array` (both already have their own null-passthrough
+    /// arm nearby); a `Number`/`Bool`/`Object` left operand with a null
+    /// right operand *errors* instead, matching real yq's own narrower
+    /// rule (live-verified: `7 + null`/`true + null`/`{} + null` all error
+    /// in yq v4.53.3, while `"a" + null`/`[1] + null` still succeed). A
+    /// `null` *left* operand is unaffected either way -- real yq accepts
+    /// it for every type, same as jq.
+    const ADD_RIGHT_NULL_REQUIRES_CONCAT_TYPE: bool;
+    /// If true (yq, #1198), a `null` *left* operand of `-` is an identity
+    /// element for any right-operand type (`null - 7` -> `7`, `null - "a"`
+    /// -> `"a"`, `null - []` -> `[]`, `null - {}` -> `{}`) -- live-verified
+    /// against yq v4.53.3. If false (jq), every null-involving subtraction
+    /// errors, on either side, with no exceptions -- matching real jq
+    /// exactly (confirmed live: identical error wording to succinctly's
+    /// own generic `binary_op` error for every case). A `null` *right*
+    /// operand still errors in both modes either way -- real yq has no
+    /// symmetric identity for `-` the way it does for `null - x`.
+    const SUB_LEFT_NULL_IS_IDENTITY: bool;
 }
 
 /// jq-compatible evaluation semantics (default).
@@ -115,6 +138,8 @@ impl EvalSemantics for JqSemantics {
     const NULL_MERGES_AS_EMPTY: bool = false;
     const DEFAULT_HALT_ERROR_CODE: i32 = 5;
     const STRICT_NUMERIC_EQUALITY: bool = false;
+    const ADD_RIGHT_NULL_REQUIRES_CONCAT_TYPE: bool = false;
+    const SUB_LEFT_NULL_IS_IDENTITY: bool = false;
 }
 
 /// yq-compatible evaluation semantics.
@@ -138,6 +163,8 @@ impl EvalSemantics for YqSemantics {
     const NULL_MERGES_AS_EMPTY: bool = true;
     const DEFAULT_HALT_ERROR_CODE: i32 = 1;
     const STRICT_NUMERIC_EQUALITY: bool = true;
+    const ADD_RIGHT_NULL_REQUIRES_CONCAT_TYPE: bool = true;
+    const SUB_LEFT_NULL_IS_IDENTITY: bool = true;
 }
 
 use crate::json::light::{JsonCursor, JsonElements, JsonFields, StandardJson};
@@ -1796,11 +1823,30 @@ fn arith_add<S: EvalSemantics>(
             a.extend(b);
             Ok(OwnedValue::Object(a))
         }
-        // null + x = x, x + null = x -- `other` is relocated unchanged, not
-        // computed, so a `NumberLiteral` operand must keep its own source
-        // spelling here (#1143: this arm must run before the numeric arm
-        // below collapses it).
-        (OwnedValue::Null, other) | (other, OwnedValue::Null) => Ok(other),
+        // null + x = x -- unconditional, every type, both jq and yq (#1197
+        // confirmed live this side is unaffected: `null + 7`, `null + {}`,
+        // etc. all succeed in yq v4.53.3 too). `other` is relocated
+        // unchanged, not computed, so a `NumberLiteral` operand must keep
+        // its own source spelling here (#1143: this arm must run before
+        // the numeric arm below collapses it).
+        (OwnedValue::Null, other) => Ok(other),
+        // x + null = x -- real jq accepts this unconditionally for every
+        // type (`ADD_RIGHT_NULL_REQUIRES_CONCAT_TYPE = false`), but real
+        // yq only extends it to `other` being a `String`/`Array` (#1197,
+        // live-verified: `"a" + null`/`[1] + null` succeed, `7 + null`/
+        // `true + null`/`{} + null` all error) -- narrower than the
+        // left-null arm above, and narrower than `*`'s own
+        // `NULL_MERGES_AS_EMPTY` rule (which extends to every type on
+        // *its* null-right arm). `other` is relocated unchanged here too,
+        // so the same `NumberLiteral`-spelling concern applies -- but
+        // `String`/`Array` are never `NumberLiteral`, so this only matters
+        // for the jq-mode (type-unrestricted) side of the condition.
+        (other, OwnedValue::Null)
+            if !S::ADD_RIGHT_NULL_REQUIRES_CONCAT_TYPE
+                || matches!(other, OwnedValue::String(_) | OwnedValue::Array(_)) =>
+        {
+            Ok(other)
+        }
         // yq: `array + x` appends any non-array, non-null `x` as a single
         // new element (`[] + 99` => `[99]`) -- unlike jq, which has no
         // array-append concept and errors here (#1119). Asymmetric: `x +
@@ -1848,36 +1894,54 @@ fn arith_sub<S: EvalSemantics>(
     left: OwnedValue,
     right: OwnedValue,
 ) -> Result<OwnedValue, EvalError> {
-    let (left, right) = (left.into_plain_number(), right.into_plain_number());
     match (left, right) {
-        // jq converts to float on overflow, yq wraps
-        (OwnedValue::Int(a), OwnedValue::Int(b)) => {
-            if S::OVERFLOW_WRAPS {
-                // yq behavior: wrapping sub
-                Ok(OwnedValue::Int(a.wrapping_sub(b)))
-            } else {
-                // jq behavior: convert to float on overflow
-                match a.checked_sub(b) {
-                    Some(result) => Ok(OwnedValue::Int(result)),
-                    None => Ok(OwnedValue::Float(a as f64 - b as f64)),
+        // null - x = x -- yq only (#1198, live-verified against yq v4.53.3
+        // for every type: `null - 7`/`null - "a"`/`null - []`/`null - {}`
+        // all succeed there). jq has no such exception -- every
+        // null-involving subtraction errors on either side there, matching
+        // succinctly's own pre-existing (unaffected) jq-mode behavior
+        // exactly, including error wording. A null *right* operand still
+        // errors in both modes -- real yq has no symmetric identity for
+        // `x - null` the way it does for `null - x` (confirmed live: `7 -
+        // null` errors in yq too). `other` is relocated unchanged, not
+        // computed, so a `NumberLiteral` operand must keep its own source
+        // spelling here (mirroring #1143/#1167's identical concern for
+        // `arith_add`/`arith_mul`'s own relocation arms) -- this arm must
+        // run before the numeric arm below collapses it, which is why this
+        // function's own `.into_plain_number()` call, previously eager at
+        // the top since every prior arm here actually computed a value, is
+        // now deferred into the numeric sub-match instead.
+        (OwnedValue::Null, other) if S::SUB_LEFT_NULL_IS_IDENTITY => Ok(other),
+        (left, right) => match (left.into_plain_number(), right.into_plain_number()) {
+            // jq converts to float on overflow, yq wraps
+            (OwnedValue::Int(a), OwnedValue::Int(b)) => {
+                if S::OVERFLOW_WRAPS {
+                    // yq behavior: wrapping sub
+                    Ok(OwnedValue::Int(a.wrapping_sub(b)))
+                } else {
+                    // jq behavior: convert to float on overflow
+                    match a.checked_sub(b) {
+                        Some(result) => Ok(OwnedValue::Int(result)),
+                        None => Ok(OwnedValue::Float(a as f64 - b as f64)),
+                    }
                 }
             }
-        }
-        (OwnedValue::Int(a), OwnedValue::Float(b)) => Ok(OwnedValue::Float(a as f64 - b)),
-        (OwnedValue::Float(a), OwnedValue::Int(b)) => Ok(OwnedValue::Float(a - b as f64)),
-        (OwnedValue::Float(a), OwnedValue::Float(b)) => Ok(OwnedValue::Float(a - b)),
-        // Array subtraction (remove elements). `owned_value_eq::<S>`, not
-        // `Vec::contains` (plain `PartialEq`): yq's stricter Int/Float
-        // equality must apply here too, or `[2.0] - [2]` would (wrongly)
-        // remove the float (#950 review).
-        (OwnedValue::Array(a), OwnedValue::Array(b)) => {
-            let result: Vec<_> = a
-                .into_iter()
-                .filter(|x| !b.iter().any(|y| owned_value_eq::<S>(x, y)))
-                .collect();
-            Ok(OwnedValue::Array(result))
-        }
-        (a, b) => Err(EvalError::binary_op(&a, &b, BinOp::Subtract)),
+            (OwnedValue::Int(a), OwnedValue::Float(b)) => Ok(OwnedValue::Float(a as f64 - b)),
+            (OwnedValue::Float(a), OwnedValue::Int(b)) => Ok(OwnedValue::Float(a - b as f64)),
+            (OwnedValue::Float(a), OwnedValue::Float(b)) => Ok(OwnedValue::Float(a - b)),
+            // Array subtraction (remove elements). `owned_value_eq::<S>`, not
+            // `Vec::contains` (plain `PartialEq`): yq's stricter Int/Float
+            // equality must apply here too, or `[2.0] - [2]` would (wrongly)
+            // remove the float (#950 review).
+            (OwnedValue::Array(a), OwnedValue::Array(b)) => {
+                let result: Vec<_> = a
+                    .into_iter()
+                    .filter(|x| !b.iter().any(|y| owned_value_eq::<S>(x, y)))
+                    .collect();
+                Ok(OwnedValue::Array(result))
+            }
+            (a, b) => Err(EvalError::binary_op(&a, &b, BinOp::Subtract)),
+        },
     }
 }
 
