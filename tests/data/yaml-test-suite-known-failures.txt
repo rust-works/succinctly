@@ -22,11 +22,16 @@
 #               must-fail case as handled if the loader OR that validator rejects
 #               it, so the `lax:*` entries that remain here are the cases the
 #               validator does not yet reject (deeper structural analysis). -> #223
-#               `lax:tags` (LHL4, U99R) is the tag-specific slice of this: a
+#               `lax:tags` (U99R) is the tag-specific slice of this: a
 #               malformed tag (disallowed characters, a `%TAG`-mid-stream
 #               placement) is absorbed rather than rejected, the same as every
 #               other `lax:*` construct — #224 implemented tag *resolution*,
 #               not tag *validation*, matching the rest of this loader.
+#               (LHL4, the `{}`-flow-indicator variant of this, was moved off
+#               this list by #902's trailing-flow-content validation, which
+#               now incidentally rejects `!invalid{}tag scalar` as "extra
+#               content after the flow mapping's `}`" — not itself a tag
+#               validator, but strict enough to catch this specific shape.)
 #   scalars     Scalar content or block-scalar folding differs from the spec.
 #               Not yet individually triaged.
 #   structure   Document or block structure differs from the spec. Not yet
@@ -55,7 +60,6 @@ HU3P      lax:mapping       mapping/key rules not validated — #223
 JEF9/02   scalars           blank final line with no break — follows yq, which gives "" — #344
 KS4U      lax:flow          flow syntax not validated — #223
 L24T/00   scalars           scalar content/folding differs from spec
-LHL4      lax:tags          tag containing a disallowed flow indicator (`!invalid{}tag`) absorbed as text/flow-mapping rather than rejected — #224
 M5C3      scalars           scalar content/folding differs from spec
 M7A3      structure         bare document / `...` end-marker mis-parsed (both paths agree)
 MUS6/01   lax:documents     directive/document rules not validated — #223

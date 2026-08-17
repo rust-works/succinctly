@@ -2612,7 +2612,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             // `parse_sequence_item_inner` and `parse_explicit_value` where the
             // placeholder is conditional. `test_every_anchor_targets_an_open_bit`
             // is the whole-corpus guard on that.
-        } else if self.try_dispatch_flow_or_block_value(indent, true)? {
+        } else if self.try_dispatch_flow_or_block_value(indent)? {
             // Flow sequence/mapping value (`- a: [1, 2]` / `- a: {x: 1}`), or
             // block scalar value (`- a: |`) — handled. Missing this used to
             // leave every flow-value fallback through the scalar arm's
@@ -3009,7 +3009,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             }
 
             // Check for flow style or block scalar - these handle their own BP
-            if self.try_dispatch_flow_or_block_value(indent, true)? {
+            if self.try_dispatch_flow_or_block_value(indent)? {
                 return Ok(());
             }
             match self.peek() {
@@ -3220,15 +3220,31 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 self.write_bp_close(); // close item
             }
             Some(b'[') => {
-                // Flow sequence as key
+                // Flow sequence as key. #902: this dispatch is a 5th,
+                // deliberately-unmerged copy of `try_dispatch_flow_or_block_
+                // value`'s `[`/`{` arms (it wraps the key in its own
+                // `write_bp_open`/`write_bp_close` pair, which that shared
+                // helper can't represent without double-wrapping the BP
+                // tree) -- it never gained #878's trailing-content
+                // validation either, so `? [1, 2] extra\n: v\n` silently
+                // dropped the real `: v` line instead of erroring the way
+                // real yq does. `reject_trailing_flow_content` still
+                // correctly permits a genuine same-line `? [1, 2]: value`
+                // (confirmed live: real yq reads that as the compact-
+                // mapping-keyed-by-flow-collection shape, not trailing
+                // garbage -- same ambiguity `try_dispatch_flow_or_block_
+                // value`'s doc comment already covers for the value
+                // position, just mirrored here at the key position).
                 self.write_bp_open();
                 self.parse_flow_sequence()?;
+                self.reject_trailing_flow_content()?;
                 self.write_bp_close();
             }
             Some(b'{') => {
-                // Flow mapping as key
+                // Flow mapping as key -- see the `[` arm above (#902).
                 self.write_bp_open();
                 self.parse_flow_mapping()?;
+                self.reject_trailing_flow_content()?;
                 self.write_bp_close();
             }
             Some(b'|' | b'>') => {
@@ -3364,18 +3380,16 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             return Ok(());
         }
 
-        // Parse the value. `check_trailing: false` — same ambiguity as
-        // `parse_value`: the node after `: ` may itself be a compact mapping
-        // whose *key* is a flow collection (`: [a, b]: value`), mirroring
-        // the scalar-keyed case the `looks_like_mapping_entry` arm below
-        // already handles (`: b: c`) — real YAML accepts both (confirmed
-        // live against real `yq`: `? k\n: [a, b]: value\n` parses as
-        // `{"k":{"":"value"}}`). `looks_like_mapping_entry` itself can't
-        // catch the flow-collection-keyed case (it returns `false`
-        // immediately for `[`/`{`), so an unconditional trailing-content
-        // check here would reject real, non-garbage input before that arm
-        // ever gets a chance to run.
-        if self.try_dispatch_flow_or_block_value(indent, false)? {
+        // Parse the value. The node after `: ` may itself be a compact
+        // mapping whose *key* is a flow collection (`: [a, b]: value`),
+        // mirroring the scalar-keyed case the `looks_like_mapping_entry` arm
+        // below already handles (`: b: c`) — real YAML accepts both
+        // (confirmed live against real `yq`: `? k\n: [a, b]: value\n` parses
+        // as `{"k":{"":"value"}}`). `try_dispatch_flow_or_block_value`'s own
+        // trailing-content check (#902) permits exactly this `:`-following
+        // shape, so it doesn't reject real, non-garbage input before
+        // `looks_like_mapping_entry` below gets a chance to run on it.
+        if self.try_dispatch_flow_or_block_value(indent)? {
             return Ok(());
         }
         match self.peek() {
@@ -3456,10 +3470,11 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             return self.parse_alias();
         }
 
-        // `check_trailing: false` — a flow collection reached here may turn
-        // out to be an implicit mapping *key* rather than a standalone
-        // value (see `try_dispatch_flow_or_block_value`'s doc comment).
-        if self.try_dispatch_flow_or_block_value(min_indent, false)? {
+        // A flow collection reached here may turn out to be an implicit
+        // mapping *key* rather than a standalone value — see
+        // `try_dispatch_flow_or_block_value`'s doc comment for why its own
+        // trailing-content check permits that shape rather than rejecting it.
+        if self.try_dispatch_flow_or_block_value(min_indent)? {
             return Ok(());
         }
 
@@ -3850,53 +3865,37 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     /// content and relative ordering (see each call site) that folding them
     /// in too would trade one duplication bug class for a worse one.
     ///
-    /// `check_trailing` gates #878's validation (see
-    /// `reject_trailing_flow_content`) and must be `false` wherever the
-    /// flow collection might turn out to be an *implicit mapping key*
-    /// rather than a standalone value — real YAML allows `[a, b]: value` /
+    /// #878's validation (`reject_trailing_flow_content`) now runs
+    /// unconditionally at every call site (#902) — it used to be gated by a
+    /// caller-supplied `check_trailing: bool`, `false` wherever the flow
+    /// collection might turn out to be an *implicit mapping key* rather
+    /// than a standalone value (real YAML allows `[a, b]: value` /
     /// `{a: 1}: value`, where `:` legitimately follows the closing
-    /// delimiter (confirmed against the YAML test suite's own "Implicit
-    /// Flow Mapping Key" case, which a `true`-everywhere version of this
-    /// check broke). Two of the four callers are that ambiguous:
-    /// `parse_value` (reached for a sequence item's value once
-    /// `looks_like_mapping_entry` has already ruled out a *scalar*-keyed
-    /// compact mapping, and for document-root/deferred content starting
-    /// with `[`/`{`) and `parse_explicit_value` (its own value position can
-    /// equally be a compact mapping keyed by a flow collection — confirmed
-    /// live against real `yq`: `? k\n: [a, b]: value\n` parses as
-    /// `{"k":{"":"value"}}` — mirroring the *scalar*-keyed case its own
-    /// `looks_like_mapping_entry` arm already handles a few lines below; an
-    /// unconditional check here used to reject that real input before that
-    /// arm ever ran). The other two callers (`parse_compact_mapping_entry`,
-    /// `parse_mapping_entry`) only ever reach this helper *after* an
-    /// unambiguous `key:` has already been parsed with no equivalent "value
-    /// could itself be a keyed mapping" arm of their own, where a following
-    /// `:` cannot be anything but real trailing garbage (confirmed live:
-    /// real `yq` rejects `key1: [a, b]: value2` outright) — so they pass
-    /// `true`.
+    /// delimiter — confirmed against the YAML test suite's own "Implicit
+    /// Flow Mapping Key" case, which an unconditional check broke before
+    /// #902). That caller-granularity split is no longer needed:
+    /// `reject_trailing_flow_content` itself now recognizes a real
+    /// mapping-value indicator (`:` followed by whitespace/break/EOF, the
+    /// same rule `looks_like_mapping_entry` already uses for a scalar key)
+    /// as a permitted terminator, not just `#`/whitespace/break/EOF — so
+    /// every caller can run the same occurrence-granular check regardless
+    /// of whether its own position happens to be ambiguous with an
+    /// implicit-mapping-key reading.
     ///
     /// Returns `Ok(true)` if a flow collection or block scalar was found and
     /// fully consumed (the caller does nothing further for this value), or
     /// `Ok(false)` if the current byte isn't one of the four (the caller
     /// falls through to its own remaining arms).
-    fn try_dispatch_flow_or_block_value(
-        &mut self,
-        indent: usize,
-        check_trailing: bool,
-    ) -> Result<bool, YamlError> {
+    fn try_dispatch_flow_or_block_value(&mut self, indent: usize) -> Result<bool, YamlError> {
         match self.peek() {
             Some(b'[') => {
                 self.parse_flow_sequence()?;
-                if check_trailing {
-                    self.reject_trailing_flow_content()?;
-                }
+                self.reject_trailing_flow_content()?;
                 Ok(true)
             }
             Some(b'{') => {
                 self.parse_flow_mapping()?;
-                if check_trailing {
-                    self.reject_trailing_flow_content()?;
-                }
+                self.reject_trailing_flow_content()?;
                 Ok(true)
             }
             Some(b'|' | b'>') => {
@@ -3937,6 +3936,22 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 b'#' => return Ok(()),
                 b if Self::is_inline_whitespace(b) => i += 1,
                 b if Self::is_break(b) => return Ok(()),
+                // A real mapping-value indicator (#902) -- the same
+                // disambiguation `looks_like_mapping_entry` uses for a
+                // scalar key (`: ` or `:<EOL>`/`:<EOF>`, never a bare `:`
+                // immediately followed by more content). This is what makes
+                // the check occurrence-granular instead of a blanket
+                // per-caller `check_trailing: bool`: every call site can now
+                // run it unconditionally, since a flow collection that
+                // genuinely turns out to be an implicit mapping key (`[a,
+                // b]: value`) still passes, while everything else that isn't
+                // whitespace/comment/break/EOF still doesn't -- confirmed
+                // live against real yq that a colon with no following
+                // whitespace (`[1, 2]:value`) is NOT this exception and
+                // still errors the same as any other trailing garbage.
+                b':' if Self::is_ws_break_or_eoi(self.input.get(i + 1).copied()) => {
+                    return Ok(());
+                }
                 _ => break,
             }
         }
