@@ -13015,9 +13015,10 @@ fn test_slice_owned_target_scalar_is_empty_array_1065() -> Result<()> {
 // this same no-op to them too (any operator, including `-=`/`*=`, unlike
 // the scalar case), and #1116 (PR #1151) separately widened the *scalar*
 // case here to any chain depth, not just the bare-root shape this section
-// was originally scoped to. `.[$a:$b]` (computed bounds) still fails
-// earlier, inside `resolve_slice_expr`'s own eager path-resolution slice --
-// a separate and more delicate piece of machinery neither fix touches.
+// was originally scoped to. `.[$a:$b]` (computed bounds) used to fail
+// earlier still, inside `resolve_slice_expr`'s own eager path-resolution
+// slice -- a separate piece of machinery none of the above touched --
+// fixed by #1117 (see that section further down).
 
 #[test]
 fn test_slice_assign_number_scalar_is_noop_1101() -> Result<()> {
@@ -14048,6 +14049,188 @@ fn test_1116_paren_wrapped_bare_slice_assign_still_noops() -> Result<()> {
     assert_eq!(code, 0);
     assert_eq!(out.trim(), "5");
 
+    Ok(())
+}
+
+// ============================================================================
+// yq scalar-slice-assignment no-op extends to computed bounds too (#1117)
+// ============================================================================
+//
+// #1101/#1116's no-op only ever covered a *literal*-bound slice (`.[0:1]`),
+// which parses straight to `Expr::Slice` -- a *computed*-bound slice
+// (`.[$a:$b]`) instead parses to `Expr::SliceExpr` and has to be folded
+// down to a literal `Expr::Slice` by `resolve_slice_expr` before any of
+// that write-time no-op logic ever runs. `resolve_slice_expr` called
+// `slice_owned_value` eagerly as part of path *resolution* itself, on the
+// real scalar target, erroring before `through_slice`'s no-op ever got a
+// chance to fire. Live-verified against real yq v4.53.3 that the no-op
+// applies identically regardless of whether the bounds are literal or
+// computed.
+
+#[test]
+fn test_slice_assign_number_scalar_computed_bound_is_noop_1117() -> Result<()> {
+    let (out, code) = run_yq_stdin(
+        "0 as $a | 1 as $b | .[$a:$b] = 99",
+        "5",
+        &["-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "5");
+    Ok(())
+}
+
+#[test]
+fn test_slice_update_and_compound_add_scalar_computed_bound_is_noop_1117() -> Result<()> {
+    let (out, code) = run_yq_stdin(
+        "0 as $a | 1 as $b | .[$a:$b] |= .",
+        "5",
+        &["-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "5");
+
+    let (out, code) = run_yq_stdin(
+        "0 as $a | 1 as $b | .[$a:$b] += 1",
+        "5",
+        &["-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "5");
+    Ok(())
+}
+
+#[test]
+fn test_slice_del_scalar_computed_bound_is_noop_1117() -> Result<()> {
+    let (out, code) = run_yq_stdin(
+        "0 as $a | 1 as $b | del(.[$a:$b])",
+        "5",
+        &["-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "5");
+    Ok(())
+}
+
+#[test]
+fn test_slice_assign_bool_computed_bound_is_noop_1117() -> Result<()> {
+    let (out, code) = run_yq_stdin(
+        "0 as $a | 1 as $b | .[$a:$b] = 99",
+        "true",
+        &["-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "true");
+    Ok(())
+}
+
+/// `-=`/`*=` on a scalar target still error for a computed bound, exactly
+/// as they already do for a literal one (#1101) -- the no-op is gated
+/// per-operator downstream in `through_slice`, not by resolution, so this
+/// fix doesn't touch that posture.
+#[test]
+fn test_slice_sub_and_mul_scalar_computed_bound_still_errors_1117() -> Result<()> {
+    let (out, code) = run_yq_stdin(
+        "0 as $a | 1 as $b | .[$a:$b] -= 99",
+        "5",
+        &["-o=json", "-I=0"],
+    )?;
+    assert_ne!(code, 0, "out: {out:?}");
+
+    let (out, code) = run_yq_stdin(
+        "0 as $a | 1 as $b | .[$a:$b] *= 99",
+        "5",
+        &["-o=json", "-I=0"],
+    )?;
+    assert_ne!(code, 0, "out: {out:?}");
+    Ok(())
+}
+
+/// A computed bound reached through a chained field, and a computed-bound
+/// slice with more path *after* it (an index) -- both no-op on a scalar
+/// target too, matching #1116's chain-depth widening for the literal case.
+#[test]
+fn test_slice_assign_scalar_computed_bound_chained_and_nested_is_noop_1117() -> Result<()> {
+    let (out, code) = run_yq_stdin(
+        "0 as $a | 1 as $b | .foo[$a:$b] = 99",
+        r#"{"foo":5}"#,
+        &["-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), r#"{"foo":5}"#);
+
+    let (out, code) = run_yq_stdin(
+        "0 as $a | 1 as $b | .[$a:$b][0] = 99",
+        "5",
+        &["-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "5");
+    Ok(())
+}
+
+/// A computed bound genuinely incompatible with the sliced type (field
+/// access on what a scalar's no-op placeholder resolves as) still errors,
+/// the same way `.[0:2].foo = v` does for a literal bound (#1142) -- the
+/// fix must not swallow a real type error along with the no-op.
+#[test]
+fn test_slice_assign_scalar_computed_bound_through_field_after_slice_still_errors_1117(
+) -> Result<()> {
+    let (out, code) = run_yq_stdin(
+        "0 as $a | 1 as $b | .[$a:$b].foo = 1",
+        "5",
+        &["-o=json", "-I=0"],
+    )?;
+    assert_ne!(code, 0, "out: {out:?}");
+    Ok(())
+}
+
+/// A computed bound on an already-working target (array/string container,
+/// #1142; null; a genuinely optional `?`-suffixed slice) is unaffected by
+/// this fix -- confirms the change is scoped to the scalar case only.
+#[test]
+fn test_slice_assign_computed_bound_unaffected_targets_1117() -> Result<()> {
+    let (out, code) = run_yq_stdin(
+        "0 as $a | 1 as $b | .[$a:$b] = [99]",
+        "[1,2,3]",
+        &["-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "[1,2,3]");
+
+    let (out, code) = run_yq_stdin(
+        "0 as $a | 1 as $b | .[$a:$b] = 99",
+        "null",
+        &["-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "null");
+
+    let (out, code) = run_yq_stdin(
+        "0 as $a | 1 as $b | .[$a:$b]? = 99",
+        "5",
+        &["-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "5");
+    Ok(())
+}
+
+/// jq mode has no yq-style no-op at all -- a computed-bound scalar slice
+/// still errors there, matching real jq exactly.
+#[test]
+fn test_slice_assign_scalar_computed_bound_jq_mode_unaffected_1117() -> Result<()> {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_succinctly"));
+    cmd.arg("jq")
+        .arg("-c")
+        .arg("0 as $a | 1 as $b | .[$a:$b] = 99");
+    let mut child = cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    child.stdin.take().unwrap().write_all(b"5")?;
+    let output = child.wait_with_output()?;
+    assert_ne!(output.status.code(), Some(0));
     Ok(())
 }
 
