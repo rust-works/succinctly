@@ -5629,7 +5629,14 @@ fn format_urid<S: EvalSemantics>(value: &OwnedValue, optional: bool) -> Result<S
         _ => return Err(EvalError::type_error("string", value.type_name())),
     };
 
-    let mut result = String::new();
+    // Byte-oriented, not char-oriented (#1123): a non-ASCII byte pushed
+    // individually via `as char` mis-encodes as its own Latin-1 codepoint
+    // instead of surviving as part of the original multi-byte UTF-8
+    // sequence -- corrupting both literal pass-through bytes and genuinely
+    // percent-decoded ones. Collecting into a byte buffer and converting
+    // once at the end (lossy, matching `format_base64d`'s established
+    // precedent) round-trips non-ASCII input correctly.
+    let mut result = Vec::with_capacity(s.len());
     let bytes = s.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
@@ -5640,16 +5647,16 @@ fn format_urid<S: EvalSemantics>(value: &OwnedValue, optional: bool) -> Result<S
                 (bytes[i + 2] as char).to_digit(16),
             ) {
                 let decoded = (h1 * 16 + h2) as u8;
-                result.push(decoded as char);
+                result.push(decoded);
                 i += 3;
                 continue;
             }
         }
-        // Not a valid percent-encoded sequence, just copy the character
-        result.push(bytes[i] as char);
+        // Not a valid percent-encoded sequence, just copy the byte
+        result.push(bytes[i]);
         i += 1;
     }
-    Ok(result)
+    Ok(String::from_utf8_lossy(&result).into_owned())
 }
 
 /// Quote a CSV/DSV string field: wrap in `"..."`, doubling inner `"`.
@@ -5841,10 +5848,27 @@ fn format_base64d<S: EvalSemantics>(
         }
     }
 
-    let stripped = s.replace(|c: char| c.is_whitespace(), "");
+    // Trim, don't strip (#1123): real yq (v4.53.3, live-verified) trims
+    // leading/trailing Unicode whitespace but rejects *embedded*
+    // whitespace as invalid base64 data (`" aGVsbG8="` decodes to
+    // `"hello"`; `"aGVs bG8="` errors) -- the previous unconditional
+    // `.replace(is_whitespace, "")` incorrectly stripped whitespace from
+    // any position, silently accepting malformed input real yq rejects.
+    // Real jq is stricter still: it trims *nothing* at all, erroring even
+    // on leading/trailing whitespace (`" aGVsbG8="` errors in jq 1.7.1) --
+    // `decode_char` below already rejects any leftover whitespace
+    // (embedded, or untrimmed-in-jq-mode) as an invalid character, so no
+    // further gating is needed past this one trim-or-not step. Just a
+    // narrowed `&str` slice, no allocation: the byte-position search right
+    // below borrows from whichever of `s`/`s.trim()` this picks.
+    let trimmed = if S::TAG == EvalTag::Yq {
+        s.trim()
+    } else {
+        s.as_str()
+    };
 
     // Real jq truncates at the *first* `=` in the (whitespace-
-    // stripped) input, discarding it and everything after it --
+    // trimmed) input, discarding it and everything after it --
     // not just within its own 4-character group, as an earlier
     // version of this fix assumed. Confirmed live against jq 1.7.1
     // across a wide matrix: `"AB=C"` -> `"AB"`'s decode (the `C` is
@@ -5859,9 +5883,9 @@ fn format_base64d<S: EvalSemantics>(
     // `break`s on any short trailing chunk, silently ignoring the
     // leftover `['=']`; a naive per-chunk fix without this
     // truncation step made it a hard error instead.
-    let prefix = match stripped.as_bytes().iter().position(|&b| b == b'=') {
-        Some(i) => &stripped.as_bytes()[..i],
-        None => stripped.as_bytes(),
+    let prefix = match trimmed.as_bytes().iter().position(|&b| b == b'=') {
+        Some(i) => &trimmed.as_bytes()[..i],
+        None => trimmed.as_bytes(),
     };
 
     let mut result = Vec::new();

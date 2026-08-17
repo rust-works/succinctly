@@ -10872,3 +10872,21 @@ fn test_jq_slice_assign_scalar_still_errors_1101() -> Result<()> {
     assert_eq!(code, 5);
     Ok(())
 }
+
+/// `@urid`'s percent-decode loop must round-trip non-ASCII UTF-8 correctly
+/// -- both literal pass-through bytes (no `%` escapes present at all) and
+/// genuinely percent-decoded multi-byte sequences. Before #1123, pushing
+/// each raw byte individually via `bytes[i] as char` mis-encoded any byte
+/// at or above 0x80 as its own Latin-1 codepoint, corrupting the string
+/// even though decoding a plain string with no escapes should be a no-op.
+#[test]
+fn test_urid_nonascii_passthrough_and_decode_1123() -> Result<()> {
+    let (out, code) = run_jq_stdin("@urid", r#""café""#, &[])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "\"café\"");
+
+    let (out, code) = run_jq_stdin("@urid", r#""caf%C3%A9""#, &[])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "\"café\"");
+    Ok(())
+}

@@ -13237,3 +13237,50 @@ fn base64_decode_lossy(s: &str) -> String {
     }
     String::from_utf8_lossy(&result).into_owned()
 }
+
+// ============================================================================
+// @base64d trims leading/trailing whitespace but rejects embedded (#1123)
+// ============================================================================
+//
+// Real yq (v4.53.3, live-verified) trims leading/trailing Unicode
+// whitespace before decoding, but treats any *embedded* whitespace as
+// invalid base64 data. Before #1123, an unconditional
+// `.replace(is_whitespace, "")` stripped whitespace from every position,
+// silently accepting malformed input real yq rejects.
+
+#[test]
+fn test_yq_base64d_trims_leading_and_trailing_whitespace_1123() -> Result<()> {
+    let (out, code) = run_yq_stdin("@base64d", r#"" aGVsbG8=""#, &["-o", "json"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), r#""hello""#);
+
+    let (out, code) = run_yq_stdin("@base64d", r#""aGVsbG8= ""#, &["-o", "json"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), r#""hello""#);
+    Ok(())
+}
+
+#[test]
+fn test_yq_base64d_rejects_embedded_whitespace_1123() -> Result<()> {
+    let (_out, code) = run_yq_stdin("@base64d", r#""aGVs bG8=""#, &["-o", "json"])?;
+    assert_ne!(code, 0);
+    Ok(())
+}
+
+/// jq is stricter than yq here: it trims nothing at all, erroring even on
+/// leading/trailing whitespace (confirmed live: `" aGVsbG8=" | @base64d`
+/// errors in jq 1.7.1).
+#[test]
+fn test_jq_base64d_does_not_trim_whitespace_1123() -> Result<()> {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_succinctly"));
+    cmd.arg("jq").arg("@base64d");
+    let mut child = cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    child.stdin.take().unwrap().write_all(br#"" aGVsbG8=""#)?;
+    let output = child.wait_with_output()?;
+    assert_ne!(output.status.code().unwrap_or(-1), 0);
+    Ok(())
+}
