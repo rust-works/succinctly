@@ -15,8 +15,8 @@ use succinctly::jq::eval_generic::{
     eval_with_cursor, to_owned as generic_to_owned, GenericResult, MAX_NESTING_DEPTH,
 };
 use succinctly::jq::{
-    self, assert_value_tree_depth, format_number_jq_compat, nonfinite_display_string, Expr,
-    JqSemantics, JqValue, OwnedValue, Program,
+    self, format_number_jq_compat, nonfinite_display_string, Expr, JqSemantics, JqValue,
+    OwnedValue, Program,
 };
 use succinctly::json::light::{JsonCursor, StandardJson};
 use succinctly::json::validate::{self, ValidationError};
@@ -1607,13 +1607,29 @@ fn parse_json_stream(s: &str) -> Result<Vec<OwnedValue>> {
         return Ok(vec![]);
     }
 
-    // Try to parse as a stream of JSON values
+    // Validate the whole stream via `serde_json::Deserializer` as before
+    // (for its own error message and its rejection of anything that isn't
+    // valid, whitespace-or-self-delineated-separated JSON) -- but discard
+    // each parsed `Value` rather than converting it, and materialize the
+    // real result from the same byte span instead, via this crate's own
+    // fidelity-preserving semi-indexer (#1058's fix for `--argjson`,
+    // extended here to `--slurpfile`, #1093). `byte_offset()` gives each
+    // value's own end position after a successful `.next()`; its start is
+    // the first non-whitespace byte after the previous value's end.
     let mut values = Vec::new();
-    let deserializer = serde_json::Deserializer::from_str(s).into_iter::<serde_json::Value>();
+    let mut deserializer = serde_json::Deserializer::from_str(s).into_iter::<serde_json::Value>();
+    let mut prev_end = 0;
 
-    for result in deserializer {
-        let value = result.context("Invalid JSON in stream")?;
-        values.push(serde_to_owned(&value));
+    while let Some(result) = deserializer.next() {
+        result.context("Invalid JSON in stream")?;
+        let end = deserializer.byte_offset();
+        let start = s[prev_end..end]
+            .find(|c: char| !c.is_whitespace())
+            .map_or(prev_end, |offset| prev_end + offset);
+        values.push(crate::output::json_bytes_to_owned_value(
+            &s.as_bytes()[start..end],
+        ));
+        prev_end = end;
     }
 
     Ok(values)
@@ -1623,13 +1639,13 @@ fn parse_json_stream(s: &str) -> Result<Vec<OwnedValue>> {
 /// Input is split on RS (0x1E) characters, each segment parsed as JSON.
 /// Parse failures are silently ignored (per RFC 7464 recommendation).
 ///
-/// Still loses number-literal source fidelity the way `parse_json_value`
-/// did before #1058 -- unlike `parse_json_stream` above, this already
-/// isolates each value as its own segment, so #1058's exact fix
-/// (`json_bytes_to_owned_value` after a `serde_json::from_str` validation
-/// pass) would apply per segment with no boundary-tracking needed. Deferred
-/// to #1093 alongside `parse_json_stream` to keep #1058/#1095 scoped to
-/// `--argjson`/`--jsonargs`.
+/// Preserves number-literal source fidelity the same way `parse_json_value`
+/// does for `--argjson` (#1058, extended here to `--seq`, #1093): each
+/// segment is already isolated by the RS split, so `serde_json::from_str`
+/// only needs to validate it (discarding the parsed `Value`) before
+/// `json_bytes_to_owned_value` materializes the real result from the same
+/// segment text -- no boundary-tracking needed, unlike `parse_json_stream`
+/// above.
 fn parse_json_seq(s: &str) -> Vec<OwnedValue> {
     let mut values = Vec::new();
 
@@ -1641,8 +1657,8 @@ fn parse_json_seq(s: &str) -> Vec<OwnedValue> {
         }
 
         // Try to parse as JSON, silently ignore failures
-        if let Ok(value) = serde_json::from_str::<serde_json::Value>(segment) {
-            values.push(serde_to_owned(&value));
+        if serde_json::from_str::<serde_json::Value>(segment).is_ok() {
+            values.push(crate::output::json_bytes_to_owned_value(segment.as_bytes()));
         }
         // Parse failures are silently ignored per RFC 7464
     }
@@ -1705,44 +1721,6 @@ fn strip_quotes_and_decode(field: &[u8]) -> String {
         inner.replace("\"\"", "\"")
     } else {
         s.into_owned()
-    }
-}
-
-/// Convert serde_json::Value to OwnedValue.
-fn serde_to_owned(value: &serde_json::Value) -> OwnedValue {
-    serde_to_owned_at_depth(value, 0)
-}
-
-/// Panics past `MAX_VALUE_TREE_DEPTH` levels of nesting (#1017/#1020) --
-/// mirrors `yq_runner::serde_json_to_owned_at_depth`, which this function's
-/// own doc comment names as guarded by the same PR; this twin was
-/// initially missed and is reachable the same way, via `--argjson`/`--args`
-/// and `--seq`/streamed JSON input parsing below.
-fn serde_to_owned_at_depth(value: &serde_json::Value, depth: usize) -> OwnedValue {
-    assert_value_tree_depth(depth);
-    match value {
-        serde_json::Value::Null => OwnedValue::Null,
-        serde_json::Value::Bool(b) => OwnedValue::Bool(*b),
-        serde_json::Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                OwnedValue::Int(i)
-            } else if let Some(f) = n.as_f64() {
-                OwnedValue::Float(f)
-            } else {
-                OwnedValue::Null
-            }
-        }
-        serde_json::Value::String(s) => OwnedValue::String(s.clone()),
-        serde_json::Value::Array(arr) => OwnedValue::Array(
-            arr.iter()
-                .map(|v| serde_to_owned_at_depth(v, depth + 1))
-                .collect(),
-        ),
-        serde_json::Value::Object(obj) => OwnedValue::Object(
-            obj.iter()
-                .map(|(k, v)| (k.clone(), serde_to_owned_at_depth(v, depth + 1)))
-                .collect(),
-        ),
     }
 }
 
@@ -2751,42 +2729,5 @@ mod tests {
         let stream = r#"{"a":1} {"b":2} {"c":3}"#;
         let values = parse_json_stream(stream).unwrap();
         assert_eq!(values.len(), 3);
-    }
-
-    /// `depth` levels of single-element array nesting in a `serde_json::Value`,
-    /// built directly rather than parsed from text -- `serde_json::from_str`
-    /// enforces its own independent ~128-deep recursion limit at parse time
-    /// (well under `MAX_VALUE_TREE_DEPTH`), so a JSON-text version of this
-    /// helper would hit that gate before ever reaching `serde_to_owned`'s
-    /// own guard.
-    fn linear_serde_json_nest(depth: usize) -> serde_json::Value {
-        let mut v = serde_json::Value::Null;
-        for _ in 0..depth {
-            v = serde_json::Value::Array(vec![v]);
-        }
-        v
-    }
-
-    /// #1020 code review: `yq_runner::serde_json_to_owned`'s own doc comment
-    /// names this function as its mirror, guarded by the same #1017-driven
-    /// PR -- but this twin (backing `--argjson`/`--args`-style value
-    /// parsing and `--seq`/streamed JSON input on the `jq` side) was
-    /// initially missed. Same guard, same construction as #1017's other
-    /// tests.
-    #[test]
-    fn serde_to_owned_panics_past_nesting_depth_limit_1020() {
-        use succinctly::jq::MAX_VALUE_TREE_DEPTH;
-
-        let under = linear_serde_json_nest(MAX_VALUE_TREE_DEPTH - 1);
-        let owned = serde_to_owned(&under);
-        assert!(matches!(owned, OwnedValue::Array(_)));
-
-        let over = linear_serde_json_nest(MAX_VALUE_TREE_DEPTH);
-        let result =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| serde_to_owned(&over)));
-        assert!(
-            result.is_err(),
-            "serde_to_owned should panic at MAX_VALUE_TREE_DEPTH"
-        );
     }
 }
