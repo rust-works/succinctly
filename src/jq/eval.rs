@@ -1151,27 +1151,55 @@ fn merge_owned<W: Clone + AsRef<[u64]>>(
     merged
 }
 
+/// Collapse a `Vec<T>` accumulator into the smallest shape representing it:
+/// empty calls `none`, exactly one calls `one` with that value, more than one
+/// calls `many` with the whole vec. The one definition every
+/// `Vec<T>`-to-`{None,One(T)/Owned(T),Many(Vec<T>)}` collapse in this module
+/// (and [`eval_generic`](super::eval_generic)) routes through, instead of
+/// hand-rolling the same 3-arm length match at each call site -- that
+/// pattern independently drifted the same way three times before
+/// consolidation (#1038, #1043, #1048): a hand-rolled match missing the
+/// `0 => None` arm silently collapses an optional (`?`)-suppressed
+/// zero-result computed index/slice into an empty `Many`/`ManyOwned`/
+/// `ManyCursor` instead of `None`. A shared definition can't drift per call
+/// site; a fresh call site gets the right shape for free instead of risking
+/// a fourth rediscovery of the same bug.
+pub(crate) fn collapse_vec<T, R>(
+    mut items: Vec<T>,
+    none: impl FnOnce() -> R,
+    one: impl FnOnce(T) -> R,
+    many: impl FnOnce(Vec<T>) -> R,
+) -> R {
+    match items.len() {
+        0 => none(),
+        1 => one(items.pop().expect("len() == 1 guarantees a first element")),
+        _ => many(items),
+    }
+}
+
 /// Normalize a `Vec<OwnedValue>` accumulator into the smallest `QueryResult`
 /// shape that represents it: empty stays `None`, one value collapses to
 /// `Owned`, more than one stays `ManyOwned`.
-fn owned_vec_to_result<'a, W>(mut vs: Vec<OwnedValue>) -> QueryResult<'a, W> {
-    match vs.len() {
-        0 => QueryResult::None,
-        1 => QueryResult::Owned(vs.pop().unwrap()),
-        _ => QueryResult::ManyOwned(vs),
-    }
+fn owned_vec_to_result<'a, W>(vs: Vec<OwnedValue>) -> QueryResult<'a, W> {
+    collapse_vec(
+        vs,
+        || QueryResult::None,
+        QueryResult::Owned,
+        QueryResult::ManyOwned,
+    )
 }
 
 /// The borrowed-cursor counterpart to [`owned_vec_to_result`] (#1038):
 /// normalize a `Vec<StandardJson>` accumulator into the smallest
 /// `QueryResult` shape that represents it -- empty stays `None`, one value
 /// collapses to `One`, more than one stays `Many`.
-fn borrowed_vec_to_result<W>(mut vs: Vec<StandardJson<'_, W>>) -> QueryResult<'_, W> {
-    match vs.len() {
-        0 => QueryResult::None,
-        1 => QueryResult::One(vs.pop().unwrap()),
-        _ => QueryResult::Many(vs),
-    }
+fn borrowed_vec_to_result<W>(vs: Vec<StandardJson<'_, W>>) -> QueryResult<'_, W> {
+    collapse_vec(
+        vs,
+        || QueryResult::None,
+        QueryResult::One,
+        QueryResult::Many,
+    )
 }
 
 /// Normalize a prefix and its terminator into a `QueryResult` (#400, #494).
@@ -24088,6 +24116,46 @@ mod tests {
                 other => panic!("unexpected result: {:?}", other),
             }
         }};
+    }
+
+    /// #1067: pins `collapse_vec`'s own 0/1/2+ shape, independent of any
+    /// particular caller's enum -- every `Vec<T>`-to-`{None,One,Many}`
+    /// collapse in `eval.rs`/`eval_generic.rs` now shares this one
+    /// definition (`owned_vec_to_result`, `borrowed_vec_to_result`,
+    /// `eval_generic::owned_vec_to_generic_result`,
+    /// `eval_generic::cursor_vec_to_generic_result`), so a regression here
+    /// would silently reintroduce the exact "missing `0 => None` arm" bug
+    /// class already independently rediscovered three times (#1038, #1043,
+    /// #1048).
+    #[test]
+    fn test_collapse_vec_1067() {
+        assert_eq!(
+            collapse_vec(Vec::<i32>::new(), || "none", |_| "one", |_| "many"),
+            "none"
+        );
+        assert_eq!(
+            collapse_vec(vec![1], || "none", |_| "one", |_| "many"),
+            "one"
+        );
+        assert_eq!(
+            collapse_vec(vec![1, 2], || "none", |_| "one", |_| "many"),
+            "many"
+        );
+        assert_eq!(
+            collapse_vec(vec![1, 2, 3], || "none", |_| "one", |_| "many"),
+            "many"
+        );
+        // The `one` closure receives the single element itself, not a
+        // one-element `Vec` -- confirmed by using it, not just a constant arm.
+        assert_eq!(
+            collapse_vec(vec![42], || 0, |v| v, |vs| vs.len() as i32),
+            42
+        );
+        // The `many` closure receives the whole `Vec` back, unmodified.
+        assert_eq!(
+            collapse_vec(vec![1, 2, 3], Vec::new, |v| vec![v], |vs| vs),
+            vec![1, 2, 3]
+        );
     }
 
     /// Every output of `filter` on `json`, rendered as compact JSON.
