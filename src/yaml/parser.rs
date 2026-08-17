@@ -2612,7 +2612,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             // `parse_sequence_item_inner` and `parse_explicit_value` where the
             // placeholder is conditional. `test_every_anchor_targets_an_open_bit`
             // is the whole-corpus guard on that.
-        } else if self.try_dispatch_flow_or_block_value(indent)? {
+        } else if self.try_dispatch_flow_or_block_value(indent, false)? {
             // Flow sequence/mapping value (`- a: [1, 2]` / `- a: {x: 1}`), or
             // block scalar value (`- a: |`) — handled. Missing this used to
             // leave every flow-value fallback through the scalar arm's
@@ -3009,7 +3009,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             }
 
             // Check for flow style or block scalar - these handle their own BP
-            if self.try_dispatch_flow_or_block_value(indent)? {
+            if self.try_dispatch_flow_or_block_value(indent, false)? {
                 return Ok(());
             }
             match self.peek() {
@@ -3237,14 +3237,14 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 // position, just mirrored here at the key position).
                 self.write_bp_open();
                 self.parse_flow_sequence()?;
-                self.reject_trailing_flow_content()?;
+                self.reject_trailing_flow_content(true)?;
                 self.write_bp_close();
             }
             Some(b'{') => {
                 // Flow mapping as key -- see the `[` arm above (#902).
                 self.write_bp_open();
                 self.parse_flow_mapping()?;
-                self.reject_trailing_flow_content()?;
+                self.reject_trailing_flow_content(true)?;
                 self.write_bp_close();
             }
             Some(b'|' | b'>') => {
@@ -3389,7 +3389,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         // trailing-content check (#902) permits exactly this `:`-following
         // shape, so it doesn't reject real, non-garbage input before
         // `looks_like_mapping_entry` below gets a chance to run on it.
-        if self.try_dispatch_flow_or_block_value(indent)? {
+        if self.try_dispatch_flow_or_block_value(indent, true)? {
             return Ok(());
         }
         match self.peek() {
@@ -3474,7 +3474,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         // mapping *key* rather than a standalone value — see
         // `try_dispatch_flow_or_block_value`'s doc comment for why its own
         // trailing-content check permits that shape rather than rejecting it.
-        if self.try_dispatch_flow_or_block_value(min_indent)? {
+        if self.try_dispatch_flow_or_block_value(min_indent, true)? {
             return Ok(());
         }
 
@@ -3865,37 +3865,46 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     /// content and relative ordering (see each call site) that folding them
     /// in too would trade one duplication bug class for a worse one.
     ///
-    /// #878's validation (`reject_trailing_flow_content`) now runs
-    /// unconditionally at every call site (#902) — it used to be gated by a
-    /// caller-supplied `check_trailing: bool`, `false` wherever the flow
+    /// `permit_colon_terminator` gates #902's widening of #878's validation
+    /// (see `reject_trailing_flow_content`): `true` wherever the flow
     /// collection might turn out to be an *implicit mapping key* rather
-    /// than a standalone value (real YAML allows `[a, b]: value` /
+    /// than a standalone value — real YAML allows `[a, b]: value` /
     /// `{a: 1}: value`, where `:` legitimately follows the closing
-    /// delimiter — confirmed against the YAML test suite's own "Implicit
-    /// Flow Mapping Key" case, which an unconditional check broke before
-    /// #902). That caller-granularity split is no longer needed:
-    /// `reject_trailing_flow_content` itself now recognizes a real
-    /// mapping-value indicator (`:` followed by whitespace/break/EOF, the
-    /// same rule `looks_like_mapping_entry` already uses for a scalar key)
-    /// as a permitted terminator, not just `#`/whitespace/break/EOF — so
-    /// every caller can run the same occurrence-granular check regardless
-    /// of whether its own position happens to be ambiguous with an
-    /// implicit-mapping-key reading.
+    /// delimiter (confirmed against the YAML test suite's own "Implicit
+    /// Flow Mapping Key" case). Two of the four callers are that ambiguous:
+    /// `parse_value` (reached for a sequence item's value once
+    /// `looks_like_mapping_entry` has already ruled out a *scalar*-keyed
+    /// compact mapping, and for document-root/deferred content starting
+    /// with `[`/`{`) and `parse_explicit_value` (its own value position can
+    /// equally be a compact mapping keyed by a flow collection — confirmed
+    /// live against real `yq`: `? k\n: [a, b]: value\n` parses as
+    /// `{"k":{"":"value"}}`). The other two callers
+    /// (`parse_compact_mapping_entry`, `parse_mapping_entry`) only ever
+    /// reach this helper *after* an unambiguous `key:` has already been
+    /// parsed, where a following `:` cannot be anything but real trailing
+    /// garbage — confirmed live: real `yq` rejects `key1: [a, b]: value2`
+    /// outright, which an earlier version of this fix (before review
+    /// caught it) wrongly stopped rejecting by making the `:` exception
+    /// unconditional at every call site instead of gating it here.
     ///
     /// Returns `Ok(true)` if a flow collection or block scalar was found and
     /// fully consumed (the caller does nothing further for this value), or
     /// `Ok(false)` if the current byte isn't one of the four (the caller
     /// falls through to its own remaining arms).
-    fn try_dispatch_flow_or_block_value(&mut self, indent: usize) -> Result<bool, YamlError> {
+    fn try_dispatch_flow_or_block_value(
+        &mut self,
+        indent: usize,
+        permit_colon_terminator: bool,
+    ) -> Result<bool, YamlError> {
         match self.peek() {
             Some(b'[') => {
                 self.parse_flow_sequence()?;
-                self.reject_trailing_flow_content()?;
+                self.reject_trailing_flow_content(permit_colon_terminator)?;
                 Ok(true)
             }
             Some(b'{') => {
                 self.parse_flow_mapping()?;
-                self.reject_trailing_flow_content()?;
+                self.reject_trailing_flow_content(permit_colon_terminator)?;
                 Ok(true)
             }
             Some(b'|' | b'>') => {
@@ -3924,32 +3933,38 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     /// made the gap observable: confirmed live, `at_line_end()` would
     /// false-positive-reject `a: [1, 2]\t# comment`, which real `yq` accepts.
     ///
-    /// Only called for `[`/`{`, and only when the caller has ruled out an
-    /// implicit-mapping-key reading (see `try_dispatch_flow_or_block_value`'s
-    /// `check_trailing`) — a block scalar (`|`/`>`) has no equivalent
+    /// `permit_colon_terminator` (#902): when `true`, a real mapping-value
+    /// indicator (`:` followed by whitespace/break/EOF — the same
+    /// disambiguation `looks_like_mapping_entry` uses for a scalar key) is
+    /// ALSO a permitted terminator, alongside `#`/whitespace/break/EOF.
+    /// When `false`, a `:` here is ordinary trailing garbage like any other
+    /// byte, matching #878's original unconditional rejection. This has to
+    /// stay a caller-supplied flag, not something this function can infer
+    /// from the bytes alone: `[a, b]: value` and `key1: [a, b]: value2` are
+    /// byte-identical *after* the closing delimiter, and only the caller
+    /// knows whether its own position could legitimately be an implicit
+    /// mapping key (see `try_dispatch_flow_or_block_value`'s doc comment
+    /// for exactly which callers pass which value, and why an earlier
+    /// version of this fix that made the exception unconditional
+    /// everywhere silently reopened #878's own corruption bug at the two
+    /// callers that need `false`). Confirmed live that a colon with no
+    /// following whitespace (`[1, 2]:value`) is never this exception,
+    /// regardless of the flag — it still errors the same as any other
+    /// trailing garbage either way.
+    ///
+    /// Only called for `[`/`{` — a block scalar (`|`/`>`) has no equivalent
     /// same-line trailing-content shape to reject, since its own terminator
     /// is a dedent, not a delimiter byte a stray token could follow.
-    fn reject_trailing_flow_content(&self) -> Result<(), YamlError> {
+    fn reject_trailing_flow_content(&self, permit_colon_terminator: bool) -> Result<(), YamlError> {
         let mut i = self.pos;
         while i < self.input.len() {
             match self.input[i] {
                 b'#' => return Ok(()),
                 b if Self::is_inline_whitespace(b) => i += 1,
                 b if Self::is_break(b) => return Ok(()),
-                // A real mapping-value indicator (#902) -- the same
-                // disambiguation `looks_like_mapping_entry` uses for a
-                // scalar key (`: ` or `:<EOL>`/`:<EOF>`, never a bare `:`
-                // immediately followed by more content). This is what makes
-                // the check occurrence-granular instead of a blanket
-                // per-caller `check_trailing: bool`: every call site can now
-                // run it unconditionally, since a flow collection that
-                // genuinely turns out to be an implicit mapping key (`[a,
-                // b]: value`) still passes, while everything else that isn't
-                // whitespace/comment/break/EOF still doesn't -- confirmed
-                // live against real yq that a colon with no following
-                // whitespace (`[1, 2]:value`) is NOT this exception and
-                // still errors the same as any other trailing garbage.
-                b':' if Self::is_ws_break_or_eoi(self.input.get(i + 1).copied()) => {
+                b':' if permit_colon_terminator
+                    && Self::is_ws_break_or_eoi(self.input.get(i + 1).copied()) =>
+                {
                     return Ok(());
                 }
                 _ => break,
