@@ -1464,22 +1464,36 @@ fn find_literal_end(bytes: &[u8], pos: usize) -> Option<usize> {
 /// its error message and its rejection of trailing garbage (`42 garbage`)
 /// that `JsonIndex`'s own semi-indexing wouldn't catch on its own. Shared
 /// by `parse_json_value` (`--argjson`/`--jsonargs`, #1058) and
-/// `parse_json_seq` (`--seq`, #1093) -- see #1163.
+/// `parse_json_seq` (`--seq`, #1093) -- see #1163. Not the same function as
+/// `validate_json_input` above (RFC 8259 strict-mode `--validate`/`json
+/// validate`, a separate hand-rolled zero-allocation validator with its
+/// own grammar) -- similar names, different jobs.
 ///
 /// Deliberately parses to `serde_json::Value` here rather than the cheaper
-/// `serde::de::IgnoredAny` (which drives the identical grammar/trailing-
-/// content check without allocating a parse tree every caller then
-/// discards): `IgnoredAny` doesn't range-check numbers at all, so a
-/// magnitude-overflowing literal (`1e400`) that `Value` correctly rejects
-/// ("number out of range") would instead silently reach
+/// `serde::de::IgnoredAny`: `IgnoredAny` doesn't range-check numbers at
+/// all, so a magnitude-overflowing literal (`1e400`) that `Value`
+/// correctly rejects ("number out of range") would instead silently reach
 /// `json_bytes_to_owned_value` and materialize as `null` -- trading a
-/// clear error for silent data loss, a worse outcome than the allocation
-/// this would save (#1095 review). `parse_json_stream` (`--slurpfile`,
-/// below) doesn't call this: it validates a whole multi-value stream via
+/// clear error for silent data loss (#1095 review). `parse_json_stream`
+/// below doesn't call this: it validates a whole multi-value stream via
 /// `serde_json::Deserializer` instead of one value via `from_str`, a
 /// structurally different mechanism this helper can't drive.
 fn validate_json_str(s: &str) -> serde_json::Result<()> {
     serde_json::from_str::<serde_json::Value>(s).map(|_| ())
+}
+
+/// Validate `s` via `validate_json_str`, then materialize the real
+/// `OwnedValue` from those same bytes via `json_bytes_to_owned_value` --
+/// the full "validate, then reparse the same span" pattern #1163 asked to
+/// share, for the call sites where the validated string and the
+/// materialized string are the same one. `parse_json_value`'s own
+/// leading-zero retry can't use this for its retry branch (it validates a
+/// *normalized* copy but must still materialize the *original* text, see
+/// its own comment), so that one branch calls `validate_json_str`
+/// directly instead.
+fn validate_and_materialize_json(s: &str) -> serde_json::Result<OwnedValue> {
+    validate_json_str(s)?;
+    Ok(crate::output::json_bytes_to_owned_value(s.as_bytes()))
 }
 
 /// Parse a JSON value from a string (`--argjson`/`--jsonargs`), preserving
@@ -1491,34 +1505,40 @@ fn validate_json_str(s: &str) -> serde_json::Result<()> {
 /// (`Literal::NumberLiteral`, #1035) or a document-sourced one
 /// (`OwnedValue::from_number_bytes`) does not.
 ///
-/// Validates strictly via `validate_json_str` first, then reparses the
-/// same, now-known-valid text through this crate's own fidelity-preserving
-/// JSON semi-indexer (the same one the primary input path already uses,
-/// see `evaluate_input` above) via the shared `json_bytes_to_owned_value`.
+/// Validates strictly via `validate_and_materialize_json` first (see its
+/// own doc for why `serde_json::Value`, not the cheaper `IgnoredAny`),
+/// which reparses the same, now-known-valid text through this crate's own
+/// fidelity-preserving JSON semi-indexer (the same one the primary input
+/// path already uses, see `evaluate_input` above).
 fn parse_json_value(s: &str) -> Result<OwnedValue> {
     let s = s.trim();
     if s.is_empty() {
         return Ok(OwnedValue::Null);
     }
 
-    if let Err(e) = validate_json_str(s) {
-        // Real jq's own number parser tolerates a leading zero (`007`,
-        // `00`, `007.5`) that strict JSON doesn't (#1094) -- retry once
-        // with every number token's leading zero stripped (string
-        // contents/keys left untouched) before surfacing the original
-        // error. Only paid on this (rare) failure path, so the common
-        // case's validation cost is unaffected. `json_bytes_to_owned_value`
-        // below still runs on the *original* text, not the normalized one:
-        // this crate's own semi-indexer already tolerates a leading zero
-        // on its own (confirmed live), so there's nothing left to repair
-        // for it.
-        let normalized = normalize_leading_zero_numbers(s);
-        if normalized == s || validate_json_str(&normalized).is_err() {
-            return Err(e).with_context(|| format!("Invalid JSON: {s}"));
+    match validate_and_materialize_json(s) {
+        Ok(v) => Ok(v),
+        Err(e) => {
+            // Real jq's own number parser tolerates a leading zero
+            // (`007`, `00`, `007.5`) that strict JSON doesn't (#1094) --
+            // retry once with every number token's leading zero stripped
+            // (string contents/keys left untouched) before surfacing the
+            // original error. Only paid on this (rare) failure path, so
+            // the common case's validation cost is unaffected. Can't use
+            // `validate_and_materialize_json` here: it must validate the
+            // *normalized* copy but still materialize the *original*
+            // text below -- this crate's own semi-indexer already
+            // tolerates a leading zero on its own (confirmed live), so
+            // there's nothing left to repair for it, and normalizing the
+            // materialized text too would silently rewrite the value's
+            // source spelling.
+            let normalized = normalize_leading_zero_numbers(s);
+            if normalized == s || validate_json_str(&normalized).is_err() {
+                return Err(e).with_context(|| format!("Invalid JSON: {s}"));
+            }
+            Ok(crate::output::json_bytes_to_owned_value(s.as_bytes()))
         }
     }
-
-    Ok(crate::output::json_bytes_to_owned_value(s.as_bytes()))
 }
 
 /// Strip a leading zero from every JSON number token in `s` (`007` ->
@@ -1619,7 +1639,11 @@ fn normalize_leading_zero_numbers(s: &str) -> String {
     String::from_utf8(out).expect("only ever copies s's own bytes verbatim or drops leading ASCII '0' digits, never splits a multi-byte sequence")
 }
 
-/// Parse a JSON stream (multiple JSON values) from a string (`--slurpfile`).
+/// Parse a JSON stream (multiple JSON values) from a string. Backs both
+/// `--slurpfile` and, more heavily, the crate's own default/primary JSON
+/// document-input path (see the `evaluate_input` call site above, reached
+/// on every ordinary `sjq`/`succinctly jq` invocation that isn't
+/// `--seq`/`--raw-input`/`--input-dsv`).
 ///
 /// Preserves number-literal source fidelity the same way `parse_json_value`
 /// does for `--argjson` (#1058, extended here to `--slurpfile`, #1093):
@@ -1627,16 +1651,20 @@ fn normalize_leading_zero_numbers(s: &str) -> String {
 /// span within the stream, and `json_bytes_to_owned_value` materializes
 /// the real result from that span.
 ///
-/// Deliberately doesn't share span-finding with `find_json_values` (below),
-/// despite both walking a byte string to delimit consecutive JSON values
-/// (#1163 follow-up question): `find_json_values` is a permissive,
-/// jq-compatible scanner for the main document-input path (accepts a
-/// leading `.` as a number start, doesn't reject trailing garbage) with no
-/// `serde_json` dependency at all, while this function needs `--slurpfile`
-/// CLI-arg validation to stay strict -- reusing `find_json_values` here
-/// would either silently accept input `--slurpfile` currently rejects, or
-/// need a second validation pass layered on top, for no real gain over the
-/// `Deserializer` this already uses.
+/// Deliberately doesn't share span-finding with `find_json_values` (above,
+/// #1163 follow-up question), despite both walking a byte string to
+/// delimit consecutive JSON values: `find_json_values` is a permissive,
+/// jq-compatible scanner (accepts a leading `.` as a number start, doesn't
+/// reject trailing garbage) with no `serde_json` dependency at all, while
+/// this function's own validation strictness is load-bearing for more than
+/// just `--slurpfile`'s CLI-arg error message -- the main input path's own
+/// call site (below `evaluate_input`) depends on this function rejecting
+/// everything `find_json_values` would reject, so its own internal
+/// `find_json_values` cross-check never diverges. Reusing
+/// `find_json_values` here for span-finding would either silently accept
+/// input this function currently rejects (weakening that invariant for
+/// both callers), or need a second, strict validation pass layered on top
+/// for no real gain over the `Deserializer` this already uses.
 fn parse_json_stream(s: &str) -> Result<Vec<OwnedValue>> {
     let s = s.trim();
     if s.is_empty() {
@@ -1682,10 +1710,10 @@ fn parse_json_stream(s: &str) -> Result<Vec<OwnedValue>> {
 ///
 /// Preserves number-literal source fidelity the same way `parse_json_value`
 /// does for `--argjson` (#1058, extended here to `--seq`, #1093): each
-/// segment is already isolated by the RS split, so `validate_json_str`
-/// only needs to validate it before `json_bytes_to_owned_value`
-/// materializes the real result from the same segment text -- no
-/// boundary-tracking needed, unlike `parse_json_stream` above.
+/// segment is already isolated by the RS split, so
+/// `validate_and_materialize_json` can validate and materialize the same
+/// segment text directly -- no boundary-tracking needed, unlike
+/// `parse_json_stream` above.
 fn parse_json_seq(s: &str) -> Vec<OwnedValue> {
     let mut values = Vec::new();
 
@@ -1697,8 +1725,8 @@ fn parse_json_seq(s: &str) -> Vec<OwnedValue> {
         }
 
         // Try to parse as JSON, silently ignore failures
-        if validate_json_str(segment).is_ok() {
-            values.push(crate::output::json_bytes_to_owned_value(segment.as_bytes()));
+        if let Ok(v) = validate_and_materialize_json(segment) {
+            values.push(v);
         }
         // Parse failures are silently ignored per RFC 7464
     }
