@@ -405,7 +405,7 @@ impl<'a> Parser<'a> {
         // identical check for document numbers, for the identical reason
         // (see its own doc comment).
         if crate::json::validate::is_valid_number(num_str.as_bytes()) {
-            Ok(Literal::NumberLiteral(num_str.to_string()))
+            Ok(Literal::NumberLiteral(repr, num_str.to_string()))
         } else {
             Ok(match repr {
                 NumberRepr::Int(i) => Literal::int(i),
@@ -767,9 +767,10 @@ impl<'a> Parser<'a> {
             // #1035: a source-text-preserving numeric literal folds the same
             // way -- an index's fast-path only needs the value, not its
             // original spelling (there's no "index formatting" to preserve).
-            // Reuses `parse_i64_or_f64` (the one shared int-vs-float decision,
-            // per its own doc comment) rather than a second hand-rolled copy.
-            Expr::Literal(Literal::NumberLiteral(text)) => match parse_i64_or_f64(text)? {
+            // #1062: the literal's `NumberRepr` is already parsed and
+            // carried on the node itself, so this reads it directly instead
+            // of re-running `parse_i64_or_f64` on the source text.
+            Expr::Literal(Literal::NumberLiteral(repr, _)) => match *repr {
                 NumberRepr::Int(i) => Some(Expr::Index(i)),
                 NumberRepr::Float(f)
                     if f.fract() == 0.0 && f >= i64::MIN as f64 && f < i64::MAX as f64 =>
@@ -1039,7 +1040,7 @@ impl<'a> Parser<'a> {
                         // `test_large_integer_literal_falls_back_to_float`),
                         // which routing through arithmetic would degrade to
                         // a lossy float, unlike jq's double-only model.
-                        Literal::NumberLiteral(text)
+                        Literal::NumberLiteral(repr, text)
                             if self.mode == ParserMode::Jq && text.contains(['.', 'e', 'E']) =>
                         {
                             // Multiply rather than subtract from zero:
@@ -1047,10 +1048,26 @@ impl<'a> Parser<'a> {
                             // silently losing the sign of `-0.0`/`-0e0`
                             // (jq itself prints `-0` for these); `-1.0 *
                             // 0.0` correctly preserves it.
+                            //
+                            // #1062: `repr` is `text`'s (negative) parsed
+                            // value; the split-off literal's own text has
+                            // the sign stripped, so its repr is `-repr`
+                            // (the positive magnitude), not a re-parse.
+                            // `Int` is unreachable here in practice (the
+                            // guard above requires `.`/`e`/`E` in `text`,
+                            // which `parse_i64_or_f64` never resolves to an
+                            // `Int`), but `wrapping_neg` keeps this branch
+                            // panic-free even so, rather than relying on
+                            // that invariant never breaking.
+                            let stripped_repr = match repr {
+                                NumberRepr::Int(i) => NumberRepr::Int(i.wrapping_neg()),
+                                NumberRepr::Float(f) => NumberRepr::Float(-f),
+                            };
                             Ok(Expr::Arithmetic {
                                 op: ArithOp::Mul(MergeFlags::default()),
                                 left: Box::new(Expr::Literal(Literal::Int(-1))),
                                 right: Box::new(Expr::Literal(Literal::NumberLiteral(
+                                    stripped_repr,
                                     text[1..].to_string(),
                                 ))),
                             })
@@ -4580,7 +4597,7 @@ mod tests {
         assert_eq!(
             parse("(1)?").unwrap(),
             Expr::Optional(Box::new(Expr::Paren(Box::new(Expr::Literal(
-                Literal::NumberLiteral("1".to_string())
+                Literal::number_literal("1".to_string())
             )))))
         );
     }
@@ -4674,7 +4691,7 @@ mod tests {
     /// with the first two untransformed.
     #[test]
     fn test_comma_binds_tighter_than_pipe() {
-        let int = |i: i64| Expr::Literal(Literal::NumberLiteral(i.to_string()));
+        let int = |i: i64| Expr::Literal(Literal::number_literal(i.to_string()));
 
         // (1,2) | 3 — not 1, (2 | 3)
         assert_eq!(
@@ -4719,7 +4736,7 @@ mod tests {
     /// expression, so only the *last* comma operand is bound (#462).
     #[test]
     fn test_as_binds_inside_comma_operand() {
-        let int = |i: i64| Expr::Literal(Literal::NumberLiteral(i.to_string()));
+        let int = |i: i64| Expr::Literal(Literal::number_literal(i.to_string()));
 
         // 1, (2 as $x | $x) — not (1,2) as $x | $x
         assert_eq!(
@@ -4756,11 +4773,11 @@ mod tests {
         assert_eq!(entries.len(), 2, "the `,` must separate two entries");
         assert_eq!(
             entries[0].value,
-            Expr::Literal(Literal::NumberLiteral("1".to_string()))
+            Expr::Literal(Literal::number_literal("1".to_string()))
         );
         assert_eq!(
             entries[1].value,
-            Expr::Literal(Literal::NumberLiteral("2".to_string()))
+            Expr::Literal(Literal::number_literal("2".to_string()))
         );
 
         // Parens are how a value fans out, and they still work.
@@ -4832,9 +4849,9 @@ mod tests {
         assert_eq!(
             parse("first(1,2,3)").unwrap(),
             Expr::FirstExpr(Box::new(Expr::Comma(vec![
-                Expr::Literal(Literal::NumberLiteral("1".to_string())),
-                Expr::Literal(Literal::NumberLiteral("2".to_string())),
-                Expr::Literal(Literal::NumberLiteral("3".to_string())),
+                Expr::Literal(Literal::number_literal("1".to_string())),
+                Expr::Literal(Literal::number_literal("2".to_string())),
+                Expr::Literal(Literal::number_literal("3".to_string())),
             ])))
         );
 
@@ -4842,12 +4859,12 @@ mod tests {
         assert_eq!(
             parse("[limit(2;1,2,3,4)]").unwrap(),
             Expr::Array(Box::new(Expr::Limit {
-                n: Box::new(Expr::Literal(Literal::NumberLiteral("2".to_string()))),
+                n: Box::new(Expr::Literal(Literal::number_literal("2".to_string()))),
                 expr: Box::new(Expr::Comma(vec![
-                    Expr::Literal(Literal::NumberLiteral("1".to_string())),
-                    Expr::Literal(Literal::NumberLiteral("2".to_string())),
-                    Expr::Literal(Literal::NumberLiteral("3".to_string())),
-                    Expr::Literal(Literal::NumberLiteral("4".to_string())),
+                    Expr::Literal(Literal::number_literal("1".to_string())),
+                    Expr::Literal(Literal::number_literal("2".to_string())),
+                    Expr::Literal(Literal::number_literal("3".to_string())),
+                    Expr::Literal(Literal::number_literal("4".to_string())),
                 ])),
             }))
         );
@@ -4941,15 +4958,15 @@ mod tests {
         assert_eq!(parse("false").unwrap(), Expr::Literal(Literal::Bool(false)));
         assert_eq!(
             parse("42").unwrap(),
-            Expr::Literal(Literal::NumberLiteral("42".to_string()))
+            Expr::Literal(Literal::number_literal("42".to_string()))
         );
         assert_eq!(
             parse("-123").unwrap(),
-            Expr::Literal(Literal::NumberLiteral("-123".to_string()))
+            Expr::Literal(Literal::number_literal("-123".to_string()))
         );
         assert_eq!(
             parse("2.5").unwrap(),
-            Expr::Literal(Literal::NumberLiteral("2.5".to_string()))
+            Expr::Literal(Literal::number_literal("2.5".to_string()))
         );
         assert_eq!(
             parse("\"hello\"").unwrap(),
@@ -4962,6 +4979,38 @@ mod tests {
     }
 
     #[test]
+    fn test_negative_float_literal_splits_into_positive_repr_1062() {
+        // A negative float/exponent literal parses as `-1 * <positive
+        // literal>` in jq mode (the sign is folded into unary negation, not
+        // kept as part of the number token -- see the parser's own comment
+        // above this rewrite). #1062 computes the split-off literal's
+        // `NumberRepr` by negating the *original* (negative) repr rather
+        // than re-parsing the sign-stripped text; this pins that both the
+        // repr and the text agree on the positive magnitude.
+        let Expr::Arithmetic { right, .. } = parse("-1.500").unwrap() else {
+            panic!("expected an Arithmetic node");
+        };
+        assert_eq!(
+            *right,
+            Expr::Literal(Literal::NumberLiteral(
+                NumberRepr::Float(1.5),
+                "1.500".to_string()
+            ))
+        );
+
+        let Expr::Arithmetic { right, .. } = parse("-1e2").unwrap() else {
+            panic!("expected an Arithmetic node");
+        };
+        assert_eq!(
+            *right,
+            Expr::Literal(Literal::NumberLiteral(
+                NumberRepr::Float(100.0),
+                "1e2".to_string()
+            ))
+        );
+    }
+
+    #[test]
     fn test_large_integer_literal_falls_back_to_float() {
         // Literals beyond i64 range degrade to floats like jq (issue #166),
         // but #1035 keeps the literal's own source spelling rather than
@@ -4970,29 +5019,29 @@ mod tests {
         // conversion), only the AST node's stored text is unaffected here.
         assert_eq!(
             parse("9999999999999999999").unwrap(),
-            Expr::Literal(Literal::NumberLiteral("9999999999999999999".to_string()))
+            Expr::Literal(Literal::number_literal("9999999999999999999".to_string()))
         );
         assert_eq!(
             parse("-9999999999999999999").unwrap(),
-            Expr::Literal(Literal::NumberLiteral("-9999999999999999999".to_string()))
+            Expr::Literal(Literal::number_literal("-9999999999999999999".to_string()))
         );
         // One past the boundary in each direction.
         assert_eq!(
             parse("9223372036854775808").unwrap(),
-            Expr::Literal(Literal::NumberLiteral("9223372036854775808".to_string()))
+            Expr::Literal(Literal::number_literal("9223372036854775808".to_string()))
         );
         assert_eq!(
             parse("-9223372036854775809").unwrap(),
-            Expr::Literal(Literal::NumberLiteral("-9223372036854775809".to_string()))
+            Expr::Literal(Literal::number_literal("-9223372036854775809".to_string()))
         );
         // Boundary values stay exact integers.
         assert_eq!(
             parse("9223372036854775807").unwrap(),
-            Expr::Literal(Literal::NumberLiteral("9223372036854775807".to_string()))
+            Expr::Literal(Literal::number_literal("9223372036854775807".to_string()))
         );
         assert_eq!(
             parse("-9223372036854775808").unwrap(),
-            Expr::Literal(Literal::NumberLiteral("-9223372036854775808".to_string()))
+            Expr::Literal(Literal::number_literal("-9223372036854775808".to_string()))
         );
     }
 
@@ -5508,14 +5557,14 @@ mod tests {
             Expr::slice_by(
                 Expr::Identity,
                 Some(Expr::Var("a".into())),
-                Some(Expr::Literal(Literal::NumberLiteral("1".to_string()))),
+                Some(Expr::Literal(Literal::number_literal("1".to_string()))),
             )
         );
         assert_eq!(
             parse(".[1:$b]").unwrap(),
             Expr::slice_by(
                 Expr::Identity,
-                Some(Expr::Literal(Literal::NumberLiteral("1".to_string()))),
+                Some(Expr::Literal(Literal::number_literal("1".to_string()))),
                 Some(Expr::Var("b".into())),
             )
         );
@@ -5694,8 +5743,8 @@ mod tests {
             Expr::index_by(
                 Expr::Identity,
                 Expr::Comma(vec![
-                    Expr::Literal(Literal::NumberLiteral("1".to_string())),
-                    Expr::Literal(Literal::NumberLiteral("2".to_string())),
+                    Expr::Literal(Literal::number_literal("1".to_string())),
+                    Expr::Literal(Literal::number_literal("2".to_string())),
                 ])
             )
         );
