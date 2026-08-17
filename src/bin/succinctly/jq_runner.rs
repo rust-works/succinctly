@@ -1541,8 +1541,22 @@ fn parse_json_value(s: &str) -> Result<OwnedValue> {
     }
 }
 
-/// Find the end (exclusive) of a lenient, JSON-*ish* number token starting
-/// at `pos`, which must point at `-` or an ASCII digit. Unlike
+/// Where a lenient, JSON-*ish* number token's integer-digit run and its
+/// overall span end, both exclusive, relative to the same `bytes` slice
+/// [`find_number_end`] scanned. `int_end` marks the end of the digit run
+/// that follows an optional leading `-` (i.e. where a leading-zero strip
+/// would need to stop); `end` marks the end of the whole token, including
+/// any fraction/exponent. `int_end..end`, if non-empty, is always exactly
+/// the token's fraction-plus-exponent suffix, contiguous by construction
+/// since the scan that produces both is strictly sequential.
+#[derive(Debug, PartialEq, Eq)]
+struct NumberTokenEnd {
+    int_end: usize,
+    end: usize,
+}
+
+/// Find a lenient, JSON-*ish* number token's boundaries, starting at
+/// `pos`, which must point at `-` or an ASCII digit. Unlike
 /// [`crate::json::validate::is_valid_number`] (a strict RFC 8259
 /// whole-slice checker, not a token-boundary finder, and not reusable here
 /// for that reason), this tolerates a leading zero in the integer part
@@ -1551,6 +1565,21 @@ fn parse_json_value(s: &str) -> Result<OwnedValue> {
 /// `-` with no digit following it at all (`-`, `[-,1]`, `{"a":-}`) --
 /// not a number token in the first place.
 ///
+/// Also deliberately **not** [`succinctly::json::light::number_literal_end`]
+/// (#1154 review) despite that function already living in this same file's
+/// import list two functions above, for a `find_json_values` caller with
+/// a similar-sounding job: its own doc comment explicitly scopes it to
+/// *top-level* document splitting and warns against reuse elsewhere, and
+/// its grammar genuinely diverges from what this repair pass needs --
+/// it rejects a dangling exponent marker outright (`"5e"` -> `None`,
+/// whereas real jq's own parser, and this function, consume it leniently
+/// and let the later `serde_json` re-validation reject the whole string
+/// instead), and it accepts a leading-dot fraction with zero integer
+/// digits (`".5"`/`"-.5"`) that this function's caller has no leading-zero
+/// stripping to do for in the first place (a bare `-.5` isn't reachable
+/// here: `normalize_leading_zero_numbers` only calls this when `b == '-'`
+/// or `b` is itself a digit, never `.`).
+///
 /// Mirrors [`find_string_end`]/[`find_matching_close`]'s "find the end of
 /// this token" shape (#1154) rather than interleaving grammar-walking
 /// with a transformation, the way an earlier version of
@@ -1558,7 +1587,19 @@ fn parse_json_value(s: &str) -> Result<OwnedValue> {
 /// let a real bug (fabricating a bare `-` into `-0`, turning genuinely
 /// invalid input into something that would silently validate) hide until
 /// review caught it before #1152 merged.
-fn find_number_end(bytes: &[u8], pos: usize) -> Option<usize> {
+///
+/// Returns [`NumberTokenEnd`] rather than just the overall end (#1154
+/// review) so the caller's own leading-zero strip doesn't need a second,
+/// independent scan to re-derive `int_end` -- an earlier version of this
+/// function discarded that boundary internally, forcing
+/// `normalize_leading_zero_numbers` to re-walk the same digit run with its
+/// own `take_while(is_ascii_digit)`, provably redundant work and, worse, a
+/// second definition of "where the integer part ends" that could silently
+/// drift from this one if either were ever edited without the other (a
+/// future digit-separator or different-digit-set change to just this
+/// function's loop, for instance, wouldn't be caught by any test that
+/// only exercises this function in isolation).
+fn find_number_end(bytes: &[u8], pos: usize) -> Option<NumberTokenEnd> {
     let mut i = pos;
     if bytes[i] == b'-' {
         i += 1;
@@ -1570,6 +1611,7 @@ fn find_number_end(bytes: &[u8], pos: usize) -> Option<usize> {
     if i == int_start {
         return None;
     }
+    let int_end = i;
     if i < bytes.len() && bytes[i] == b'.' {
         i += 1;
         while i < bytes.len() && bytes[i].is_ascii_digit() {
@@ -1585,7 +1627,7 @@ fn find_number_end(bytes: &[u8], pos: usize) -> Option<usize> {
             i += 1;
         }
     }
-    Some(i)
+    Some(NumberTokenEnd { int_end, end: i })
 }
 
 /// Strip a leading zero from every JSON number token in `s` (`007` ->
@@ -1620,7 +1662,7 @@ fn normalize_leading_zero_numbers(s: &str) -> String {
         }
         if b == b'-' || b.is_ascii_digit() {
             let start = i;
-            let Some(end) = find_number_end(bytes, start) else {
+            let Some(NumberTokenEnd { int_end, end }) = find_number_end(bytes, start) else {
                 // Bare `-`, not a number token -- see `find_number_end`'s
                 // own doc comment for why this must stay untouched rather
                 // than fabricating a digit.
@@ -1628,12 +1670,13 @@ fn normalize_leading_zero_numbers(s: &str) -> String {
                 i += 1;
                 continue;
             };
+            // `int_start` is one byte past `start` for a signed token,
+            // `start` itself otherwise -- not re-derived from `int_end`
+            // via a second scan (#1154 review): `find_number_end` already
+            // computed and returned `int_end` directly, so this is the
+            // only "where does the integer part start/end" logic in the
+            // whole function.
             let int_start = if b == b'-' { start + 1 } else { start };
-            let int_end = int_start
-                + bytes[int_start..end]
-                    .iter()
-                    .take_while(|c| c.is_ascii_digit())
-                    .count();
             let stripped = s[int_start..int_end].trim_start_matches('0');
             out.extend_from_slice(&bytes[start..int_start]);
             out.extend_from_slice(if stripped.is_empty() {
@@ -2707,32 +2750,41 @@ mod tests {
     /// finder, independent of the CLI-level `--argjson` tests (which
     /// already cover `normalize_leading_zero_numbers`'s end-to-end
     /// behavior via subprocess spawns invisible to `cargo llvm-cov`).
+    /// Checks both `int_end` and `end` (#1154 review) -- `int_end` is
+    /// what the caller actually needs to strip a leading zero without a
+    /// second scan, so a regression there wouldn't be caught by only
+    /// checking the overall token length.
     #[test]
     fn test_find_number_end_1154() {
-        // Plain and negative integers.
-        assert_eq!(find_number_end(b"42", 0), Some(2));
-        assert_eq!(find_number_end(b"-42", 0), Some(3));
+        fn ends(bytes: &[u8], pos: usize) -> Option<(usize, usize)> {
+            find_number_end(bytes, pos).map(|e| (e.int_end, e.end))
+        }
+
+        // Plain and negative integers: int_end == end, no frac/exp.
+        assert_eq!(ends(b"42", 0), Some((2, 2)));
+        assert_eq!(ends(b"-42", 0), Some((3, 3)));
         // Leading zeros tolerated (that's the whole point of this scan).
-        assert_eq!(find_number_end(b"007", 0), Some(3));
-        // Fraction and exponent, each optionally signed.
-        assert_eq!(find_number_end(b"1.5", 0), Some(3));
-        assert_eq!(find_number_end(b"1e10", 0), Some(4));
-        assert_eq!(find_number_end(b"1E+10", 0), Some(5));
-        assert_eq!(find_number_end(b"1.5e-10", 0), Some(7));
+        assert_eq!(ends(b"007", 0), Some((3, 3)));
+        // Fraction and exponent, each optionally signed: int_end stops at
+        // the integer digit run, end includes the rest.
+        assert_eq!(ends(b"1.5", 0), Some((1, 3)));
+        assert_eq!(ends(b"1e10", 0), Some((1, 4)));
+        assert_eq!(ends(b"1E+10", 0), Some((1, 5)));
+        assert_eq!(ends(b"1.5e-10", 0), Some((1, 7)));
         // A dangling '.' or 'e' with no digits after it still consumes
         // the marker itself, matching the lenient original behavior --
         // the retried `serde_json` validation rejects the result either
         // way, so this scan doesn't need to.
-        assert_eq!(find_number_end(b"5.", 0), Some(2));
-        assert_eq!(find_number_end(b"5e", 0), Some(2));
+        assert_eq!(ends(b"5.", 0), Some((1, 2)));
+        assert_eq!(ends(b"5e", 0), Some((1, 2)));
         // Stops at the token's own end, not the end of a larger buffer.
-        assert_eq!(find_number_end(b"42,43", 0), Some(2));
+        assert_eq!(ends(b"42,43", 0), Some((2, 2)));
         // A bare '-' with nothing (or nothing digit-shaped) after it is
         // not a number token at all.
-        assert_eq!(find_number_end(b"-", 0), None);
-        assert_eq!(find_number_end(b"-,", 0), None);
-        // Starting position other than 0.
-        assert_eq!(find_number_end(b"[1,007]", 3), Some(6));
+        assert_eq!(ends(b"-", 0), None);
+        assert_eq!(ends(b"-,", 0), None);
+        // Starting position other than 0, with a multi-digit int_end.
+        assert_eq!(ends(b"[1,007]", 3), Some((6, 6)));
     }
 
     #[test]
