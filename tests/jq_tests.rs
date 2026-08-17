@@ -1410,6 +1410,151 @@ fn test_base64_encode() {
     );
 }
 
+// jq/yq accept an unpadded final base64 group of 2 or 3 characters (1 or 2
+// decoded bytes), and only error when the trailing remainder is exactly 1
+// character -- one base64 char (6 bits) can't carry even a single byte (8
+// bits). Confirmed live against real jq 1.7.1 and real yq v4.53.3. #1120's
+// bug was silently `break`ing out of the decode loop for *any* trailing
+// chunk shorter than 4 characters, discarding partial data (2/3-length)
+// instead of decoding it, and producing a truncated-but-successful result
+// instead of erroring for a 1-length remainder.
+//
+// Real jq's actual algorithm (fully characterized live, across a wide
+// matrix, after code review found the first version of this fix wrong):
+// truncate the input at the *first* `=` character -- discarding it and
+// everything after it, not just suppressing output within its own
+// 4-character group -- then apply the length-based rule above to
+// whatever's left. `decode_char('=')` treating `=` as an ordinary
+// zero-valued data character (as an earlier version of this fix did for
+// the new 2/3-char arms) produces silently wrong bytes, spurious errors on
+// inputs that should succeed, and silent successes on inputs that should
+// error -- see the tests below for the specific oracle-verified cases.
+
+#[test]
+fn test_base64d_two_char_trailing_group_decodes_1120() {
+    // jq: "ab" | @base64d => "i" (verified live)
+    query!(br#""ab""#, "@base64d",
+        QueryResult::Owned(OwnedValue::String(s)) => {
+            assert_eq!(s, "i");
+        }
+    );
+}
+
+#[test]
+fn test_base64d_three_char_trailing_group_decodes_1120() {
+    // jq: "YWJj" (4-char, full group) | @base64d => "abc" -- avoids the
+    // separate, pre-existing invalid-UTF-8-output bug (#1126) that a raw
+    // 3-char remainder like "abc" would hit instead (it decodes to a byte
+    // pair that isn't valid UTF-8, unrelated to this fix).
+    query!(br#""YWJj""#, "@base64d",
+        QueryResult::Owned(OwnedValue::String(s)) => {
+            assert_eq!(s, "abc");
+        }
+    );
+}
+
+#[test]
+fn test_base64d_one_char_trailing_group_errors_1120() {
+    // jq: "a" | @base64d errors, exact wording confirmed live -- previously
+    // silently produced "" (the 1-char remainder was dropped by the old
+    // `break`).
+    query!(br#""a""#, "@base64d",
+        QueryResult::Error(e) => {
+            assert_eq!(e.message, r#"string ("a") trailing base64 byte found"#);
+        }
+    );
+}
+
+#[test]
+fn test_base64d_issue_repro_five_char_total_errors_1120() {
+    // The issue's own repro: "false" (5 chars = one full 4-char group plus
+    // a 1-char remainder) errors in both real jq and real yq, but
+    // previously decoded to a truncated, garbled string in succinctly.
+    // Exact wording confirmed live against jq 1.7.1.
+    query!(br#""false""#, "@base64d",
+        QueryResult::Error(e) => {
+            assert_eq!(e.message, r#"string ("false") trailing base64 byte found"#);
+        }
+    );
+}
+
+#[test]
+fn test_base64d_empty_string_still_decodes_to_empty_1120() {
+    query!(br#""""#, "@base64d",
+        QueryResult::Owned(OwnedValue::String(s)) => {
+            assert_eq!(s, "");
+        }
+    );
+}
+
+// A code-review round on this fix's first version found it introduced new
+// bugs around `=` handling, all confirmed live against real jq 1.7.1: `=`
+// was treated as an ordinary zero-valued data character in the new 2/3-char
+// arms (unlike the pre-existing 4-char arm's `chunk[2]!=b'='`/`chunk[3]!=
+// b'='` suppression), producing spurious extra bytes, silent wrong output
+// on inputs that should error, and even a genuine regression versus the
+// pre-#1120 code on a case that used to work. The tests below lock in the
+// corrected "truncate at first `=`" algorithm.
+
+#[test]
+fn test_base64d_pure_padding_decodes_to_empty_1120() {
+    // jq: "=" / "==" / "===" / "====" all decode to "" -- an empty prefix
+    // before the first `=`, verified live.
+    for input in ["=", "==", "===", "===="] {
+        let json = format!(r#""{input}""#);
+        query!(json.as_bytes(), "@base64d",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "", "input: {input:?}");
+            }
+        );
+    }
+}
+
+#[test]
+fn test_base64d_truncates_at_first_equals_not_error_1120() {
+    // jq: "AB=C" -> " " (same as "AB" alone; the "C" *after* the "="
+    // is discarded entirely, not decoded and not an error) -- verified
+    // live. An earlier version of this fix instead fed "=" through the
+    // 2-char arm as data, producing a spurious extra byte.
+    query!(br#""AB=C""#, "@base64d",
+        QueryResult::Owned(OwnedValue::String(s)) => {
+            assert_eq!(s, "\u{0000}");
+        }
+    );
+}
+
+#[test]
+fn test_base64d_one_real_char_before_equals_still_errors_1120() {
+    // jq: "a=" -> errors (1 real char before the "=", same rule as "a"
+    // alone) -- verified live. An earlier version of this fix instead
+    // silently succeeded (the "=" was decoded as if it were the real
+    // character 'A', giving a wrong 1-byte result).
+    query!(br#""a=""#, "@base64d",
+        QueryResult::Error(e) => {
+            assert_eq!(e.message, r#"string ("a=") trailing base64 byte found"#);
+        }
+    );
+}
+
+#[test]
+fn test_base64d_standard_padding_matches_unpadded_1120() {
+    // jq: "YWI==" (over-padded), "YWI=" (correctly padded), and "YWI"
+    // (unpadded) all decode identically to "ab" -- verified live. This is
+    // also the specific regression an earlier version of this fix
+    // introduced: pre-#1120 code happened to get "YWI==" right by accident
+    // (its `break` silently dropped the leftover `['=']`), but a naive
+    // per-chunk-length fix without first truncating at the `=` turned it
+    // into a hard error instead.
+    for input in ["YWI==", "YWI=", "YWI"] {
+        let json = format!(r#""{input}""#);
+        query!(json.as_bytes(), "@base64d",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "ab", "input: {input:?}");
+            }
+        );
+    }
+}
+
 // =============================================================================
 // Compatibility tests - Comparison edge cases
 // =============================================================================
