@@ -287,14 +287,33 @@ pub fn format_number_jq_compat(raw: &[u8]) -> String {
         return format_overflow_literal_mantissa(s, exp_pos, value.is_sign_negative());
     }
 
+    // A zero-valued literal (`0.0e-400` or a genuinely-underflowed nonzero
+    // mantissa like `1e-400`) picks its notation on a *different* threshold
+    // than every other case below -- both `exp == 0` and the `-5..0` window
+    // just below use the literal's own *written* exponent, which #1207
+    // found is simply the wrong axis once a written exponent and a fraction
+    // are both present (`0.0e-400`'s written exponent is `-400`, but its
+    // *shifted* exponent -- what actually determines notation, matching
+    // #1178's own shift math -- is `-401`). Intercepting here, before either
+    // raw-exponent check, keeps this one shifted-exponent rule as the only
+    // path a zero-valued literal can take (`value == 0.0` is true for
+    // `-0.0` too, so this also subsumes the old `exp == 0` branch's
+    // negative-zero special case below -- that branch's own sign-handling
+    // stays necessary for a *nonzero* integer-valued literal like `-5e0`,
+    // just no longer for `-0e0` specifically).
+    if value == 0.0 {
+        return format_zero_value_literal(s, exp_pos, value.is_sign_negative());
+    }
+
     // For e0 or e-0, jq eliminates the exponent
     if exp == 0 {
         // Check if result is integer
         if value.fract() == 0.0 && value.abs() < 1e15 {
             // `value as i64` truncates -0.0's sign (`-0.0 as i64 == 0`),
-            // dropping it from the formatted text too -- `1e-0`/`-0e0`-style
-            // literals #1008 made newly reachable from YAML hit this.
-            // Real jq keeps the sign (`-0e0` -> `-0`).
+            // dropping it from the formatted text too -- but `value == 0.0`
+            // above already returned for that case, so this is reachable
+            // only via a *nonzero* negative integer-valued literal here
+            // (`-5e0` -> `-5`), where `value as i64` is exact regardless.
             return if value.is_sign_negative() {
                 format!("-{}", value.abs() as i64)
             } else {
@@ -316,32 +335,25 @@ pub fn format_number_jq_compat(raw: &[u8]) -> String {
     // jq normalizes mantissa to have one digit before decimal point
     //
     // `!value.is_normal()` -- `value` is already known finite (the
-    // `!value.is_finite()` overflow check above returned first), so this
-    // is exactly "zero or subnormal," covering two distinct situations
-    // that both need the string-based path below instead of the
-    // `log10`/`pow` renormalization that follows it:
-    //
-    // - `value == 0.0`: true both for a genuinely-zero-mantissa literal
-    //   (`0e-400`) and for a *nonzero*-mantissa literal whose magnitude
-    //   simply underflowed `f64` during parsing (`1e-400`, far below
-    //   `f64::MIN_POSITIVE`) -- the two can't be told apart from `value`
-    //   alone (#1099). `format_underflow_literal_mantissa` (and the shared
-    //   `normalize_extreme_literal_mantissa` beneath it) tells them apart
-    //   from the literal's own source digits.
-    // - nonzero but *subnormal* (#1177): the `log10`/`pow` renormalization
-    //   below is already measurably imprecise across most of the subnormal
-    //   range (e.g. `1e-315` mis-renormalizes to a mantissa of
-    //   `10.000000148219696` instead of `1.0`, oracle-verified), and at
-    //   the extreme low end `libm::pow(10.0, log10(abs_value).floor())`
-    //   can itself underflow to exactly `0.0` (its own result is smaller
-    //   than the smallest representable subnormal), making
-    //   `abs_value / 0.0 = +inf` and rendering the mantissa as the literal
-    //   text `"inf"`, which isn't valid JSON at all.
-    //
-    // Routing every subnormal through the same string-based path as
-    // exact-zero underflow sidesteps both: that path derives the mantissa
-    // from `s`'s own source digits, never from `f64` arithmetic that's
-    // already lost precision by this magnitude.
+    // `!value.is_finite()` overflow check above returned first) and known
+    // nonzero (the `value == 0.0` check above returned first too), so this
+    // is exactly "nonzero but subnormal" (#1177): the `log10`/`pow`
+    // renormalization below is already measurably imprecise across most of
+    // the subnormal range (e.g. `1e-315` mis-renormalizes to a mantissa of
+    // `10.000000148219696` instead of `1.0`, oracle-verified), and at the
+    // extreme low end `libm::pow(10.0, log10(abs_value).floor())` can
+    // itself underflow to exactly `0.0` (its own result is smaller than the
+    // smallest representable subnormal), making `abs_value / 0.0 = +inf`
+    // and rendering the mantissa as the literal text `"inf"`, which isn't
+    // valid JSON at all. Routing every subnormal through the same
+    // string-based path `format_zero_value_literal` uses for exact-zero
+    // underflow sidesteps both: that path derives the mantissa from `s`'s
+    // own source digits, never from `f64` arithmetic that's already lost
+    // precision by this magnitude. Always scientific here (the #1207
+    // small-magnitude decimal window applies only to a *genuinely*
+    // zero-mantissa literal, never to one merely underflowed to zero) --
+    // a subnormal `value` can only come from a nonzero mantissa in the
+    // first place.
     if !value.is_normal() {
         return format_underflow_literal_mantissa(s, exp_pos, value.is_sign_negative());
     }
@@ -540,23 +552,15 @@ fn format_overflow_literal_mantissa(s: &str, exp_pos: usize, negative: bool) -> 
     assemble_scientific(sign, &mantissa_str, new_exp)
 }
 
-/// Renormalize an underflowed literal's own mantissa digits into jq's
-/// one-digit-before-the-point scientific form (#1099) -- see
-/// [`normalize_extreme_literal_mantissa`] for the shared shift math, and
+/// Renormalize an underflowed-but-*nonzero*-mantissa literal's own mantissa
+/// digits into jq's one-digit-before-the-point scientific form (#1099) --
+/// see [`normalize_extreme_literal_mantissa`] for the shared shift math, and
 /// [`format_overflow_literal_mantissa`] for the symmetric overflow case.
-///
-/// A literal whose magnitude underflows `f64` to exactly `0.0` (nonzero
-/// mantissa, deeply negative exponent) can't be told apart from a
-/// genuinely-zero-mantissa literal by looking at the parsed value alone --
-/// both are `0.0`. Unlike an earlier version of this function, the caller
-/// does *not* pre-check the mantissa's own source digits before calling
-/// this -- `normalize_extreme_literal_mantissa` (below) makes that
-/// determination itself and returns `None` for a genuinely all-zero
-/// mantissa, handled explicitly in the `match` below. The single call site
-/// in `format_number_jq_compat` reaches here for both `value == 0.0` (#1099)
-/// and nonzero-but-subnormal `value` (#1177) -- in the subnormal case the
-/// mantissa is always nonzero in practice (a subnormal `f64` can't come
-/// from an all-zero-mantissa literal), but nothing here depends on that.
+/// Callers only reach this for a *subnormal* `value` (`format_number_jq_compat`
+/// handles `value == 0.0` separately via [`format_zero_value_literal`]
+/// before this function is ever called), which can only come from a nonzero
+/// mantissa in the first place -- `normalize_extreme_literal_mantissa` is
+/// therefore guaranteed `Some` here.
 ///
 /// Oracle-verified against real jq: `1e-400` -> `1E-400`, `12.34e-400` ->
 /// `1.234E-399`, `0.5e-400` -> `5E-401`, `100.5e-400` -> `1.005E-398`.
@@ -572,27 +576,65 @@ fn format_overflow_literal_mantissa(s: &str, exp_pos: usize, negative: bool) -> 
 /// jq's behavior there is itself a bug, not a rule worth matching.
 fn format_underflow_literal_mantissa(s: &str, exp_pos: usize, negative: bool) -> String {
     let sign = if negative { "-" } else { "" };
+    let Some((mantissa_str, new_exp)) = normalize_extreme_literal_mantissa(s, exp_pos) else {
+        unreachable!("a subnormal value implies a nonzero mantissa")
+    };
+    assemble_scientific(sign, &mantissa_str, new_exp)
+}
+
+/// Format a literal whose *parsed value* is exactly `0.0` (`-0.0` included)
+/// -- the single call site in `format_number_jq_compat` reaches here before
+/// any of that function's other notation checks run, since #1207 found this
+/// case picks notation on a different axis than every other literal (see
+/// the call site's own comment).
+///
+/// [`normalize_extreme_literal_mantissa`] itself distinguishes the two ways
+/// a literal can parse to exactly `0.0`:
+///
+/// - A genuinely all-zero mantissa (`0.0e-400`, `None` here) has no nonzero
+///   digit to renormalize around at all -- real jq still shifts the printed
+///   exponent by the fractional-zero-digit count the same way it does for a
+///   nonzero mantissa (#1178: `0.000e-400` -> `0E-403`, not `0E-400`; a
+///   no-fraction spelling like `0e-400` has shift `0` and needs none). That
+///   *shifted* exponent, not the literal's raw written one, is what
+///   actually determines notation (#1207, oracle-verified for shifted
+///   exponents `-8..=2`): `0` picks a bare integer (`0e1` shifts to `0`,
+///   prints `0`); `-6..=-1` picks an expanded decimal with `-shifted` zeros
+///   after the point (`0e-1` -> `0.0`, ..., `0e-6` -> `0.000000`); anything
+///   else keeps the scientific form this function used unconditionally
+///   before #1207 (`0e-7` -> `0E-7`, `0e2` -> `0E+2`).
+/// - A nonzero mantissa that simply underflowed `f64` during parsing
+///   (`1e-400`, far below `f64::MIN_POSITIVE`) can't be told apart from the
+///   above by the parsed value alone (#1099) -- but real jq's small-window
+///   decimal/bare notation never applies to it regardless of its shifted
+///   exponent's own magnitude (a mantissa with real precision to preserve
+///   always stays scientific); only `assemble_scientific` on the `Some`
+///   arm's own shift math is needed, unaffected by #1207.
+///
+/// `value == 0.0` is true for `-0.0` too (IEEE 754), so `negative` (from the
+/// caller's `value.is_sign_negative()`) still needs applying in every arm --
+/// real jq keeps the sign throughout, since `log10(0)` is undefined
+/// (`-0e5` -> `-0E+5`, `-0e0` -> `-0`, `-0.0e-1` -> `-0.00`).
+fn format_zero_value_literal(s: &str, exp_pos: usize, negative: bool) -> String {
+    let sign = if negative { "-" } else { "" };
     match normalize_extreme_literal_mantissa(s, exp_pos) {
         Some((mantissa_str, new_exp)) => assemble_scientific(sign, &mantissa_str, new_exp),
-        // Genuinely all-zero mantissa (`0.0e-400`) -- no nonzero digit to
-        // shift *to*, but real jq still shifts the printed exponent by the
-        // fractional-zero-digit count, the same normalization it applies to
-        // a nonzero mantissa (#1178) -- `0.000e-400` -> `0E-403`, not
-        // `0E-400`. A no-fraction spelling (`0e-400`, empty `frac_part`) has
-        // shift `0` and was already correct. `value == 0.0` is true for
-        // `-0.0` too (IEEE 754), so the sign still needs preserving -- real
-        // jq keeps both the sign and this shifted exponent for a zero
-        // mantissa, since log10(0) is undefined (`-0e5` -> `-0E+5`).
         None => {
             let (_, frac_part) = split_mantissa(s, exp_pos);
             // `try_from`, not a bare `as` cast: `frac_part.len()` is
             // document-controlled and unbounded, same as the exponent digit
             // string `parse_literal_exponent` already saturates rather than
-            // wraps for a couple lines up -- matching that same discipline
+            // wraps a couple lines down -- matching that same discipline
             // here instead of silently flipping sign past `i64::MAX` bytes.
             let frac_len = i64::try_from(frac_part.len()).unwrap_or(i64::MAX);
             let shifted_exp = parse_literal_exponent(&s[exp_pos + 1..]).saturating_sub(frac_len);
-            assemble_scientific(sign, "0", shifted_exp)
+            if shifted_exp == 0 {
+                format!("{sign}0")
+            } else if (-6..0).contains(&shifted_exp) {
+                format!("{sign}0.{}", "0".repeat((-shifted_exp) as usize))
+            } else {
+                assemble_scientific(sign, "0", shifted_exp)
+            }
         }
     }
 }
@@ -2776,6 +2818,63 @@ mod tests {
         let mantissa = format!("{}9", "0".repeat(2_000_000));
         let literal = format!("{mantissa}e400");
         assert_eq!(format_number_jq_compat(literal.as_bytes()), "9E+400");
+    }
+
+    /// #1207: a genuinely-zero-mantissa literal (`value == 0.0`) picks
+    /// notation on its own *shifted* exponent (written exponent minus the
+    /// mantissa's fractional-zero-digit count, #1178's shift math), not the
+    /// literal's raw written exponent the way `format_number_jq_compat`'s
+    /// `exp == 0`/`(-5..0)` fast paths do for everything else -- before this
+    /// fix, every zero-mantissa literal with a nonzero written exponent went
+    /// straight to `format_underflow_literal_mantissa`'s unconditional
+    /// scientific output, regardless of how small the resulting exponent
+    /// magnitude actually was. Oracle-verified against jq 1.7.1 for the
+    /// full boundary, shifted exponents -8..=2 (`0e{shifted}` has no
+    /// fraction digits, so its shift is 0 and its shifted exponent equals
+    /// its written one).
+    #[test]
+    fn test_format_number_jq_compat_zero_mantissa_notation_threshold_1207() {
+        // Deep in scientific territory on the underflow side, and the one
+        // step just past the decimal window's own boundary.
+        assert_eq!(format_number_jq_compat(b"0e-8"), "0E-8");
+        assert_eq!(format_number_jq_compat(b"0e-7"), "0E-7");
+        // The decimal-expansion window: shifted exponent -6..=-1, i.e.
+        // 6 down to 1 zeros after the point.
+        assert_eq!(format_number_jq_compat(b"0e-6"), "0.000000");
+        assert_eq!(format_number_jq_compat(b"0e-5"), "0.00000");
+        assert_eq!(format_number_jq_compat(b"0e-4"), "0.0000");
+        assert_eq!(format_number_jq_compat(b"0e-3"), "0.000");
+        assert_eq!(format_number_jq_compat(b"0e-2"), "0.00");
+        assert_eq!(format_number_jq_compat(b"0e-1"), "0.0");
+        // Shifted exponent exactly 0: bare integer, no decimal point at all.
+        assert_eq!(format_number_jq_compat(b"0e0"), "0");
+        // Positive shifted exponent: scientific again.
+        assert_eq!(format_number_jq_compat(b"0e1"), "0E+1");
+        assert_eq!(format_number_jq_compat(b"0e2"), "0E+2");
+        // Sign is preserved through every branch (`-0.0` is `value == 0.0`
+        // too, and `log10(0)` is undefined so jq keeps the written sign
+        // rather than trying to derive one).
+        assert_eq!(format_number_jq_compat(b"-0e-8"), "-0E-8");
+        assert_eq!(format_number_jq_compat(b"-0e-1"), "-0.0");
+        assert_eq!(format_number_jq_compat(b"-0e0"), "-0");
+        assert_eq!(format_number_jq_compat(b"-0e1"), "-0E+1");
+        // A written fractional zero digit shifts the exponent exactly like
+        // #1178's already-scientific case does, so the same classification
+        // above is reachable via a *different* written exponent than the
+        // no-fraction cases -- e.g. `0.0e-5`'s shift is -6 (written -5,
+        // minus 1 fractional digit), landing in the same decimal window as
+        // `0e-6` above despite a different written exponent.
+        assert_eq!(format_number_jq_compat(b"0.0e-5"), "0.000000"); // shift -6
+        assert_eq!(format_number_jq_compat(b"0.0e0"), "0.0"); // shift -1
+        assert_eq!(format_number_jq_compat(b"0.0e1"), "0"); // shift 0
+        assert_eq!(format_number_jq_compat(b"0.00e-1"), "0.000"); // shift -3
+        assert_eq!(format_number_jq_compat(b"0.0000e-1"), "0.00000"); // shift -5
+                                                                      // A genuinely-underflowed *nonzero* mantissa (`value == 0.0` from
+                                                                      // parsing, but the literal's own digits are not all zero) never
+                                                                      // enters this small-window notation regardless of its own shifted
+                                                                      // exponent's magnitude -- unaffected by #1207, still always
+                                                                      // scientific, matching #1099/#1178's existing coverage.
+        assert_eq!(format_number_jq_compat(b"1e-400"), "1E-400");
     }
 
     /// `depth` levels of single-element array nesting: `[[[...[Null]...]]]`.
