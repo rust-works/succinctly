@@ -1259,8 +1259,8 @@ fn owned_value_eq_at_depth(a: &OwnedValue, b: &OwnedValue, depth: usize) -> bool
 }
 
 /// The single `Literal -> OwnedValue` conversion every call site should go
-/// through (#1062, same pattern as [`from_number_literal_boxed`](Self::from_number_literal_boxed)'s
-/// own #966 fix): `eval.rs`'s `literal_to_owned` delegates here rather than
+/// through (#1062, same pattern as `from_number_literal_boxed`'s own #966
+/// fix): `eval.rs`'s `literal_to_owned` delegates here rather than
 /// re-matching the same six variants itself. `lazy.rs`'s `JqValue::from_literal`
 /// also delegates here for every variant except `NumberLiteral` -- `JqValue`
 /// defers that one's parsing until read, a genuine target-type difference
