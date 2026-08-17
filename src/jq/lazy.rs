@@ -697,13 +697,21 @@ fn cursor_to_owned_at_depth<W: Clone + AsRef<[u64]>>(
         StandardJson::Null => OwnedValue::Null,
         StandardJson::Bool(b) => OwnedValue::Bool(b),
         StandardJson::Number(n) => OwnedValue::from_number_bytes(n.raw_bytes()),
-        StandardJson::String(s) => {
-            if let Ok(cow) = s.as_str() {
-                OwnedValue::String(cow.into_owned())
-            } else {
-                OwnedValue::String(String::new())
-            }
-        }
+        StandardJson::String(s) => match s.as_str() {
+            Ok(cow) => OwnedValue::String(cow.into_owned()),
+            // Same gap as `eval_generic::to_owned_at_depth`'s sibling check
+            // (#1098): decoding a structurally-valid JSON string can fail
+            // (invalid `\u` escape, invalid UTF-8), and silently
+            // materializing an empty string here would be wrong in a
+            // different, still-silent way. No live input reaches this
+            // today -- the same upstream structural validation that
+            // protects `to_owned_at_depth` protects this cursor-based
+            // materializer too, since both walk the identical semi-indexed
+            // JSON representation.
+            Err(e) => panic!(
+                "string scalar failed to decode despite passing structural validation (#1098): {e}"
+            ),
+        },
         StandardJson::Array(_) => {
             // Use cursor navigation to iterate children
             let items: Vec<OwnedValue> = cursor
@@ -897,6 +905,27 @@ mod tests {
         let val: JqValue<'_, Vec<u64>> = JqValue::from_literal(&lit);
         assert!(matches!(val, JqValue::NumberLiteral(ref s) if s.as_ref() == "1.500"));
         assert_eq!(val.as_f64(), Some(1.5));
+    }
+
+    /// #1098: sibling of `eval_generic::to_owned`'s own regression test --
+    /// `JsonIndex::build`'s semi-index scan finds string quote/escape
+    /// boundaries without decoding/validating what's between them, so
+    /// invalid UTF-8 inside a string span indexes fine and only fails once
+    /// `materialize`/`into_owned` reaches `JsonString::as_str()`. This
+    /// cursor-based materializer used to silently substitute an empty
+    /// string here instead.
+    #[test]
+    #[should_panic(
+        expected = "string scalar failed to decode despite passing structural validation (#1098)"
+    )]
+    fn test_materialize_panics_on_string_decode_failure_1098() {
+        use crate::json::JsonIndex;
+
+        let json: &[u8] = b"{\"a\": \"\xff\xfe\"}";
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let val = JqValue::from_cursor(cursor);
+        val.materialize();
     }
 
     #[test]
