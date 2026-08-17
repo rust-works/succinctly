@@ -70,6 +70,12 @@ pub trait EvalSemantics: Copy + Default {
     /// If true, unflagged array `*`/`*=` replaces/merges instead of erroring (yq).
     /// If false, array * array is a type error (jq) — real jq has no array-merge concept.
     const ARRAY_MULTIPLY_MERGES: bool;
+    /// If true, `array + x` appends any non-array, non-null `x` as a single
+    /// new element (yq, #1119) — asymmetric: `x + array` for a non-array/
+    /// non-null `x` still errors regardless of this flag, matching real
+    /// yq. If false, array + non-array is a type error on either side (jq)
+    /// — real jq has no array-append concept.
+    const ARRAY_PLUS_APPENDS: bool;
     /// If true, `null` acts as an empty container on either side of `*`/`*=`:
     /// a null right operand is a no-op (left passes through unchanged), and a
     /// null left operand merging with an object/array merges as if starting
@@ -105,6 +111,7 @@ impl EvalSemantics for JqSemantics {
     const MOD_TRUNCATES_FLOATS: bool = true;
     const TAG: EvalTag = EvalTag::Jq;
     const ARRAY_MULTIPLY_MERGES: bool = false;
+    const ARRAY_PLUS_APPENDS: bool = false;
     const NULL_MERGES_AS_EMPTY: bool = false;
     const DEFAULT_HALT_ERROR_CODE: i32 = 5;
     const STRICT_NUMERIC_EQUALITY: bool = false;
@@ -127,6 +134,7 @@ impl EvalSemantics for YqSemantics {
     const MOD_TRUNCATES_FLOATS: bool = false;
     const TAG: EvalTag = EvalTag::Yq;
     const ARRAY_MULTIPLY_MERGES: bool = true;
+    const ARRAY_PLUS_APPENDS: bool = true;
     const NULL_MERGES_AS_EMPTY: bool = true;
     const DEFAULT_HALT_ERROR_CODE: i32 = 1;
     const STRICT_NUMERIC_EQUALITY: bool = true;
@@ -1722,7 +1730,7 @@ fn arith_add<S: EvalSemantics>(
         // error arm below, matching real yq (verified live against yq
         // v4.53.3: `[1,2] + 3` succeeds, `3 + [1,2]` errors). Array+array
         // and array+null are already handled above/before this arm.
-        (OwnedValue::Array(mut a), b) if S::TAG == EvalTag::Yq => {
+        (OwnedValue::Array(mut a), b) if S::ARRAY_PLUS_APPENDS => {
             a.push(b);
             Ok(OwnedValue::Array(a))
         }
@@ -8997,17 +9005,34 @@ fn eval_regex_pattern_and_concat_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSeman
     // and `EvalError::binary_op` for any other type pairing. Reusing it
     // here instead of hand-rolling the same three arms keeps this in sync
     // with jq's real `+` semantics automatically if they're ever adjusted.
+    //
+    // #1119 added a yq-only Array+non-array append arm to `arith_add`
+    // *for user-facing `+`*, which breaks that invariant here: an Array
+    // `flags` value in yq mode would now hit `Ok(Array(...))` instead of
+    // erroring. This is purely an internal flags-string-concat helper, not
+    // the user's own `+`, so it explicitly rejects a non-String/non-null
+    // `raw_flags` up front rather than trusting whatever `arith_add`
+    // happens to accept -- restoring the original (String, String) / (Null,
+    // String) invariant regardless of `+`'s own evolving semantics.
     let raw_flags = result_to_owned(eval_single::<W, S>(flags_expr, value, optional))?;
+    if !matches!(raw_flags, OwnedValue::String(_) | OwnedValue::Null) {
+        let g = OwnedValue::String("g".to_string());
+        let (a, b) = match concat {
+            FlagsConcat::Append => (&raw_flags, &g),
+            FlagsConcat::Prepend => (&g, &raw_flags),
+        };
+        return Err(EvalError::binary_op(a, b, BinOp::Add).into());
+    }
     let g = OwnedValue::String("g".to_string());
     let (a, b) = match concat {
         FlagsConcat::Append => (raw_flags, g),
         FlagsConcat::Prepend => (g, raw_flags),
     };
     let global_flags = match arith_add::<S>(a, b) {
-        // One operand is always the literal string "g", so the only ways
+        // `raw_flags` is now known to be String or Null, so the only ways
         // `arith_add` can succeed are (String, String) -> concat, or the
-        // other operand being `null` -> the "g" identity wins outright;
-        // both cases produce a String.
+        // Null side -> the "g" identity wins outright; both cases produce
+        // a String.
         Ok(OwnedValue::String(s)) => s,
         Ok(other) => unreachable!(
             "arith_add(_, \"g\"-or-\"g\"-paired) always yields a String, got {other:?}"
@@ -10561,27 +10586,22 @@ fn eval_update<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // rationale, including why this can't be a blanket check before
         // the filter runs at all.
         //
-        // The throwaway clones `result` (the scalar itself), not `[]` —
-        // real yq's own discarded-write `.` binding is actually `[]` (`5 |
-        // .[0:1] += [1]` no-ops in real yq, consistent with `[] + [1]`
-        // succeeding there), but real yq's `+` *also* has an array-append
-        // semantic succinctly's `+` doesn't implement at all (`[] + 99`
-        // gives `[99]` in real yq, errors in succinctly — a real,
-        // pre-existing, unrelated gap, filed as #1119). Binding `.` to `[]`
-        // here without that append semantic would turn the common `5 |
-        // .[0:1] += 99` case from a working no-op into a fresh regression
-        // (`array ([]) and number (99) cannot be added`) to fix an
-        // obscure array-filter edge case (`|= keys`) instead — the wrong
-        // trade. Scalar cloning keeps `+= <number>`/`|= <number filter>`
-        // correct; `|=`/`+=` with a filter whose behavior differs between
-        // an array and the raw scalar (`keys`, `+= [1]`) remain wrong,
-        // tracked alongside #1119.
+        // The throwaway binds `.` to `[]`, not a clone of `result` (the
+        // scalar itself) — matching real yq's own discarded-write model
+        // exactly (`5 | .[0:1] += [1]` and `5 | .[0:1] |= keys` both no-op
+        // to `5` in real yq, since the write target reads as an empty
+        // array). This was previously scalar-cloning instead, since
+        // `arith_add` had no array-append semantic yet (`[] + 99` errored)
+        // — #1119 added it, so `[] + 99` now succeeds too, and this switch
+        // closes the exact gap #1119 was filed to unblock (verified live
+        // against yq v4.53.3 for `+= <number>`, `+= <string>`, `+= [x]`,
+        // `|= keys`, `|= length`, `|= tostring`, `|= (. + 1)`).
         if scalar_slice_noop
             && S::TAG == EvalTag::Yq
             && is_yq_scalar_slice_assign_path(path)
             && is_yq_slice_empty_container_scalar(&result)
         {
-            let mut throwaway = result.clone();
+            let mut throwaway = OwnedValue::Array(Vec::new());
             // No `if optional`-gated arm here, unlike the sibling call
             // below: `optional` at this point is `eval_update`'s *own*
             // outer `?` (`(.a |= f)?`), and per #693, `Expr::Optional`/
