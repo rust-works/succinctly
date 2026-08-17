@@ -1365,9 +1365,13 @@ fn result_to_owned<W: Clone + AsRef<[u64]>>(
         QueryResult::Partial(vs, _control) => Ok(vs.into_iter().next().unwrap()),
         QueryResult::None => Err(EvalError::new("no value").into()),
         QueryResult::Error(e) => Err(e.into()),
-        QueryResult::Break(label) => {
-            Err(EvalError::new(format!("break ${label} not in label")).into())
-        }
+        // `break $label` escaping a builtin's argument expression now
+        // propagates losslessly instead of collapsing into a synthetic
+        // "not in label" error (#833) -- every caller either forwards the
+        // `EvalEscape` verbatim via `?`/`Err(e) => return e.into()`, or
+        // (a handful of sites) has its own dedicated arm, so the real
+        // label can unwind past the builtin call to an outer `label`.
+        QueryResult::Break(label) => Err(EvalEscape::Break(label)),
         // An operand-context halt (`1 + halt`) travels as its own
         // `EvalEscape` variant, so no consumer can mistake it for a
         // catchable error (#791): `try`/`catch` and `?` handle only
@@ -15013,7 +15017,12 @@ fn eval_owned_expr<S: EvalSemantics>(
 ) -> Result<OwnedValue, EvalEscape> {
     eval_owned_expr_ctrl::<S>(expr, input, optional).map_err(|control| match control {
         Control::Error(e) => e.into(),
-        Control::Break(label) => EvalError::new(format!("break ${label} not in label")).into(),
+        // Propagated losslessly rather than collapsed into a synthetic
+        // "not in label" error (#833) -- see `result_to_owned`'s identical
+        // fix just above for the full rationale; every caller here forwards
+        // the `EvalEscape` verbatim except `builtin_envvar`, which has its
+        // own dedicated arm mirroring the `Halt` one below.
+        Control::Break(label) => EvalEscape::Break(label),
         // A halt reached here (e.g. inside `reduce`/`foreach`'s INIT/UPDATE
         // via a caller that uses `eval_owned_expr` rather than
         // `eval_owned_expr_ctrl`, which carries `Control` through losslessly)
@@ -22682,8 +22691,11 @@ fn builtin_envvar<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // Checked ahead of the generic fallback below (which would
         // otherwise flatten it into a misleading "must be a string"
         // message and, when `optional`, silently swallow it): a halt must
-        // never be silently downgraded (#791).
+        // never be silently downgraded (#791), and likewise a break must
+        // reach its label rather than being downgraded into a bogus type
+        // error or swallowed by `optional` (#833).
         Err(EvalEscape::Halt(code)) => return QueryResult::Halt(code),
+        Err(EvalEscape::Break(label)) => return QueryResult::Break(label),
         _ if optional => return QueryResult::None,
         _ => return QueryResult::Error(EvalError::new("env variable name must be a string")),
     };
@@ -42785,6 +42797,31 @@ mod tests {
         let var = parse("halt_error(9)").unwrap();
         match builtin_envvar::<Vec<u64>, JqSemantics>(&var, StandardJson::Null, false) {
             QueryResult::Halt(9) => {}
+            other => panic!("unexpected result: {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn builtin_envvar_propagates_break_from_variable_name_expression_833() {
+        // Sibling of the `Halt` test above: the audit for #833 found
+        // `builtin_envvar`'s match had a dedicated `Halt` arm (from #791)
+        // but no `Break` arm, so once `eval_owned_expr` stopped collapsing
+        // `Control::Break` into a synthetic error, a break here would have
+        // fallen into the generic `_ if optional`/`_ =>` arms instead --
+        // silently swallowed under `optional`, or misreported as "env
+        // variable name must be a string" otherwise. Exercised directly
+        // (like the `Halt` test above) since `Builtin::EnvVar` has no parser
+        // construction site.
+        let var = parse("break $out").unwrap();
+        match builtin_envvar::<Vec<u64>, JqSemantics>(&var, StandardJson::Null, false) {
+            QueryResult::Break(label) => assert_eq!(label, "out"),
+            other => panic!("unexpected result: {other:?}"),
+        }
+        // Under `optional`, a break must still propagate -- not be
+        // downgraded to `None` the way an ordinary type error would be.
+        match builtin_envvar::<Vec<u64>, JqSemantics>(&var, StandardJson::Null, true) {
+            QueryResult::Break(label) => assert_eq!(label, "out"),
             other => panic!("unexpected result: {other:?}"),
         }
     }
