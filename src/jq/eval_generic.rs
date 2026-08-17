@@ -1963,12 +1963,19 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
             // ever gets constructed (#400, #494) — the same invariant the
             // unconditional `.next().unwrap()` elsewhere in this file (e.g.
             // `eval_first_or_last_generic`) relies on.
-            GenericResult::Partial(prefix, Control::Error(_) | Control::Break(_)) => {
-                match prefix.len() {
-                    1 => GenericResult::Owned(prefix.into_iter().next().unwrap()),
-                    _ => GenericResult::ManyOwned(prefix),
-                }
-            }
+            // Routed through `collapse_vec` anyway (#1067), so a future
+            // change that ever violates the "never empty here" invariant
+            // above degrades to `None` instead of silently returning
+            // `ManyOwned(vec![])` -- mirrors `eval::prepend`, which
+            // `eval::eval_try`'s identical jq-mode arm calls into and which
+            // already routes its own prefix-collapse through
+            // `owned_vec_to_result`/`collapse_vec`.
+            GenericResult::Partial(prefix, Control::Error(_) | Control::Break(_)) => collapse_vec(
+                prefix,
+                || GenericResult::None,
+                GenericResult::Owned,
+                GenericResult::ManyOwned,
+            ),
             // A `LazySeq` hasn't necessarily failed *yet* -- it's lazy, so
             // it never matches the `Error`/`Break`/`Partial` arms above even
             // when pulling it would fail (#724, #725). `E?` needs to know
