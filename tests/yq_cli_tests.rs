@@ -14344,23 +14344,92 @@ fn test_1116_chained_scalar_slice_del_navigator_out_of_bounds_unaffected() -> Re
     Ok(())
 }
 
-/// `navigate_read_only` only understands `Field`/`Index` prefix steps — a
-/// `.[]` earlier in the chain (`Expr::Iterate`) hits its catch-all and
-/// bails to `None`, so the rewrite doesn't apply and the old, erroring
-/// per-element walk runs instead. Known, filed limitation — split off from
-/// #1153 (which covered this alongside the now-fixed parenthesized-target
-/// gap) into its own issue, #1182, since it needs `del()`'s own per-element
-/// handling rather than a small, self-contained fix. This pins the current
-/// (imperfect) behavior as a regression guard rather than leaving it
-/// silently untested.
+/// #1182: `navigate_read_only`'s own prefix-peek still can't look through
+/// an unresolved `.[]` (there's no single element to peek at until the walk
+/// actually reaches one), so the *upfront*, once-per-call rewrite this
+/// helper backs still can't apply to `.a[].b[0:1]` -- but `delete_at_path`'s
+/// own `Expr::Iterate` arm now retries the same rule per element, against
+/// each element's own remaining path, once the walk actually reaches it.
+/// Real yq drops the whole `b` key from every element (verified live),
+/// matching #1116's existing bare/chained parent-key-delete rule, just
+/// applied per element instead of once upfront.
 #[test]
-fn test_1116_chained_scalar_slice_del_iterate_prefix_not_yet_covered_1182() -> Result<()> {
-    let (_out, stderr, code) = run_yq_stdin_with_stderr(
+fn test_1182_chained_scalar_slice_del_through_iterate_removes_parent_key_per_element() -> Result<()>
+{
+    let (out, code) = run_yq_stdin(
         "del(.a[].b[0:1])",
         r#"{"a":[{"b":5,"c":1},{"b":6,"c":2}]}"#,
-        &[],
+        &["-o=json", "-I=0"],
     )?;
-    assert_ne!(code, 0);
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), r#"{"a":[{"c":1},{"c":2}]}"#);
+    Ok(())
+}
+
+/// Two `.[]` steps before the trailing slice -- the per-element retry in
+/// `delete_at_path`'s `Expr::Iterate` arm fires independently at each
+/// nesting level (the first iterate's own `rest` still contains the second
+/// iterate, so `yq_del_scalar_slice_parent_path` correctly returns `None`
+/// there and only fires once the walk reaches the second, innermost
+/// iterate). Live-verified against real yq.
+#[test]
+fn test_1182_chained_scalar_slice_del_through_nested_iterate() -> Result<()> {
+    let (out, code) = run_yq_stdin(
+        "del(.a[].b[].c[0:1])",
+        r#"{"a":[{"b":[{"c":5,"d":1},{"c":6,"d":2}]},{"b":[{"c":7,"d":3}]}]}"#,
+        &["-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(
+        out.trim(),
+        r#"{"a":[{"b":[{"d":1},{"d":2}]},{"b":[{"d":3}]}]}"#
+    );
+    Ok(())
+}
+
+/// The per-element rewrite is scoped to a genuinely scalar target the same
+/// way the pre-existing bare/chained rule already is -- an array-valued
+/// element reached through the same `.[]` keeps succinctly's own working
+/// partial-range delete instead of the parent-key-drop rule, exactly
+/// mirroring the pre-existing (unrelated to #1182, untouched by this fix)
+/// bare-chained divergence from real yq for an array target
+/// (`{"b":[1,2,3]} | del(.b[0:1])` already gives real yq `{}` vs
+/// succinctly's `{"b":[2,3]}` before and after this fix alike -- tracked
+/// separately as #1162, not fixed here).
+#[test]
+fn test_1182_chained_scalar_slice_del_through_iterate_array_target_unaffected() -> Result<()> {
+    let (out, code) = run_yq_stdin(
+        "del(.a[].b[0:1])",
+        r#"{"a":[{"b":[1,2,3]},{"b":6}]}"#,
+        &["-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), r#"{"a":[{"b":[2,3]},{}]}"#);
+    Ok(())
+}
+
+/// jq mode is unaffected -- `yq_mode` gates the per-element retry the same
+/// way it already gates the upfront rewrite, so a chained scalar slice
+/// through `.[]` keeps jq's own ordinary per-element behavior (erroring on
+/// a scalar target, same as real jq) instead of yq's parent-key-drop rule.
+#[test]
+fn test_1182_chained_scalar_slice_del_through_iterate_jq_mode_unaffected() -> Result<()> {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_succinctly"));
+    cmd.arg("jq")
+        .arg("-c")
+        .arg("del(.a[].b[0:1])")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn()?;
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(br#"{"a":[{"b":5,"c":1}]}"#)?;
+    let output = child.wait_with_output()?;
+    assert_ne!(output.status.code(), Some(0));
+    let stderr = String::from_utf8(output.stderr)?;
     assert!(stderr.contains("Cannot index"), "stderr: {stderr}");
     Ok(())
 }
