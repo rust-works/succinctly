@@ -12522,6 +12522,52 @@ fn test_yq_join_separator_computed_float_matches_tostring_1124() -> Result<()> {
     Ok(())
 }
 
+/// #1124: `numeric_display_string`'s `Float` case also drops `to_json_yq()`'s
+/// "never use scientific notation" rule, applying yq's own magnitude
+/// threshold instead -- confirmed live, real yq v4.53.3 gives `"12e+102"`
+/// (separator `"2e+10"`), not `"120000000000.02"`.
+#[test]
+fn test_yq_join_separator_scientific_notation_threshold_1124() -> Result<()> {
+    let (stdout, code) = run_yq_stdin(r"join(1e10 * 2)", "[1, 2]\n", &["-r"])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "12e+102");
+    Ok(())
+}
+
+/// #1124: negative zero must lose its forced `.0` too, not just positive
+/// whole numbers -- confirmed live, real yq v4.53.3 gives `"1-02"`
+/// (separator `"-0"`), not `"1-0.02"`.
+#[test]
+fn test_yq_join_separator_negative_zero_1124() -> Result<()> {
+    let (stdout, code) = run_yq_stdin(r"join(-0.0 * 1)", "[1, 2]\n", &["-r"])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "1-02");
+    Ok(())
+}
+
+/// #1124: a fractional (non-whole-number) computed float was already
+/// correct before this fix (no decimal point to force either way) --
+/// pinned so a future regression in the `numeric_display_string` swap would
+/// still be caught. Confirmed live against real yq v4.53.3.
+#[test]
+fn test_yq_join_separator_fractional_float_unaffected_1124() -> Result<()> {
+    let (stdout, code) = run_yq_stdin(r"join(2.0 / 3)", "[1, 2]\n", &["-r"])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "10.66666666666666662");
+    Ok(())
+}
+
+/// #1124: a genuinely computed `OwnedValue::Int` (not the `NumberLiteral`
+/// shape a bare query literal like `join(1)` takes) separator was already
+/// correct -- pinned for the same reason as the fractional-float case above.
+#[test]
+fn test_yq_join_separator_computed_int_unaffected_1124() -> Result<()> {
+    let (stdout, code) = run_yq_stdin(r"join(1 + 1)", "[1, 2]\n", &["-r"])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "122");
+    Ok(())
+}
+
 /// #1124 (partial fix, tracked further as #1144): `yq_join_element_part`'s
 /// equivalent catch-all was fixed the same way as `yq_join_separator`'s
 /// above, but a *constructed* array's computed-float element still doesn't
