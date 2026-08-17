@@ -10667,7 +10667,14 @@ fn eval_rhs_once<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// attempted either. Earlier, already-completed documents are kept as a
 /// `Partial` prefix (#400, #494): `[1,2,3,4] | .[0:2] = ([8,8],1,[9,9])`
 /// streams `[8,8,3,4]`, then raises on `1` (not an array), and `[9,9]` never
-/// appears.
+/// appears. That specific example is jq-mode behavior (or any target
+/// `through_slice` doesn't no-op): in yq mode, #1142's container no-op
+/// discards every RHS output's write to an array/string slice target
+/// unconditionally, so the same expression never reaches the failing
+/// `setpath`, and instead streams three unchanged copies of the input. The
+/// partial-prefix-on-failure model above still governs whatever `edit`
+/// closure `through_slice` actually runs; yq's array/string target just
+/// never fails there to demonstrate it.
 ///
 /// `optional` is `=`'s own `?` (`(.a = 1)?`) -- see `eval_update`'s matching
 /// comment for why it is caught here at the call boundary rather than
@@ -11211,8 +11218,14 @@ fn through_slice<E: From<EvalError>>(
         // against the throwaway fails the same way it would against the
         // real array, it just never gets spliced back on success.
         OwnedValue::Array(_) | OwnedValue::String(_) if container_noop => {
-            let mut throwaway =
-                slice_owned_value(root, start, end, optional)?.unwrap_or(OwnedValue::Null);
+            // `expect`, not `unwrap_or(Null)`: the guard above has already
+            // narrowed `root` to Array/String, and `slice_owned_value` only
+            // ever returns `Ok(None)` for a target that's neither
+            // Array/Null/String -- unreachable here. A silent `Null`
+            // fallback would hide that invariant breaking if this guard is
+            // ever widened (e.g. to `Object`, per #1157/#1162).
+            let mut throwaway = slice_owned_value(root, start, end, optional)?
+                .expect("Array/String target always yields Some from slice_owned_value");
             edit(&mut throwaway)?;
             Ok(())
         }
@@ -11376,6 +11389,12 @@ fn update_path<S: EvalSemantics>(
     optional: bool,
     scalar_noop: bool,
 ) -> Result<(), EvalEscape> {
+    // yq's slice-write container no-op (#1142) is unconditional on the
+    // operator, unlike `scalar_noop` (a caller-gated parameter, `false` for
+    // `-=`/`*=`) -- so it only needs `S::TAG`, not threading through every
+    // recursive call. Bound once here rather than recomputed inline at each
+    // `Expr::Slice` arm below, so the two can't drift out of sync.
+    let container_noop = S::TAG == EvalTag::Yq;
     match path_expr {
         Expr::Identity => {
             // The filter runs as an ordinary sub-expression, not one
@@ -11558,7 +11577,7 @@ fn update_path<S: EvalSemantics>(
                         *end,
                         here,
                         scalar_noop,
-                        S::TAG == EvalTag::Yq,
+                        container_noop,
                         |sub| update_path::<S>(sub, &rest, filter_expr, optional, scalar_noop),
                     ),
                     _ => update_path::<S>(root, first, filter_expr, here, scalar_noop),
@@ -11584,7 +11603,7 @@ fn update_path<S: EvalSemantics>(
             *end,
             optional,
             scalar_noop,
-            S::TAG == EvalTag::Yq,
+            container_noop,
             |sub| update_path::<S>(sub, &Expr::Identity, filter_expr, optional, scalar_noop),
         ),
         // Unreachable: `resolve_dynamic_indexes` rewrites every computed key
@@ -19391,9 +19410,16 @@ fn delete_at_path(
                     // for the case this fix actually covers -- the slice
                     // is the *last* path component). This arm only fires
                     // when there's more path *after* the slice
-                    // (`.[1:3][0]`), which isn't that shape — it descends
-                    // into the sliced sub-range and deletes within it,
-                    // same as jq.
+                    // (`.[1:3][0]`), which isn't that shape — in jq mode it
+                    // correctly descends into the sliced sub-range and
+                    // deletes within it. In yq mode this is a known,
+                    // currently-untracked-by-#1162 divergence: real yq
+                    // no-ops the whole thing instead (live-verified,
+                    // `del(.a[1:3][0])` on `a: [1,2,3,4]` leaves `.a`
+                    // untouched, for both a container and a scalar target
+                    // reached through the slice) — this shape is broader
+                    // than #1162's stated scope and needs its own
+                    // follow-up before it's fixed.
                     Expr::Slice { start, end } => {
                         through_slice(root, *start, *end, here, false, false, |sub| {
                             delete_at_path(sub, &rest, optional)
