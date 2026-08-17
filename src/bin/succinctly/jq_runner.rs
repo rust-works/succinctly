@@ -1541,6 +1541,53 @@ fn parse_json_value(s: &str) -> Result<OwnedValue> {
     }
 }
 
+/// Find the end (exclusive) of a lenient, JSON-*ish* number token starting
+/// at `pos`, which must point at `-` or an ASCII digit. Unlike
+/// [`crate::json::validate::is_valid_number`] (a strict RFC 8259
+/// whole-slice checker, not a token-boundary finder, and not reusable here
+/// for that reason), this tolerates a leading zero in the integer part
+/// (`007`) the way real jq's own number parser does (#1094) -- the whole
+/// point of the caller this exists for. Returns `None` only for a bare
+/// `-` with no digit following it at all (`-`, `[-,1]`, `{"a":-}`) --
+/// not a number token in the first place.
+///
+/// Mirrors [`find_string_end`]/[`find_matching_close`]'s "find the end of
+/// this token" shape (#1154) rather than interleaving grammar-walking
+/// with a transformation, the way an earlier version of
+/// [`normalize_leading_zero_numbers`] did -- that shape is exactly what
+/// let a real bug (fabricating a bare `-` into `-0`, turning genuinely
+/// invalid input into something that would silently validate) hide until
+/// review caught it before #1152 merged.
+fn find_number_end(bytes: &[u8], pos: usize) -> Option<usize> {
+    let mut i = pos;
+    if bytes[i] == b'-' {
+        i += 1;
+    }
+    let int_start = i;
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        i += 1;
+    }
+    if i == int_start {
+        return None;
+    }
+    if i < bytes.len() && bytes[i] == b'.' {
+        i += 1;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+    }
+    if i < bytes.len() && (bytes[i] == b'e' || bytes[i] == b'E') {
+        i += 1;
+        if i < bytes.len() && (bytes[i] == b'+' || bytes[i] == b'-') {
+            i += 1;
+        }
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+    }
+    Some(i)
+}
+
 /// Strip a leading zero from every JSON number token in `s` (`007` ->
 /// `7`, `-00` -> `-0`, `007.5` -> `7.5`), leaving string contents/keys and
 /// all other structure untouched. Real jq's own number parser tolerates a
@@ -1548,83 +1595,58 @@ fn parse_json_value(s: &str) -> Result<OwnedValue> {
 /// divergence before re-validating with `serde_json` (#1094) -- the
 /// trailing-garbage/number-range checks that validation exists for still
 /// apply to the normalized text exactly as before.
+///
+/// Delegates string-skipping to [`find_string_end`] and number-token
+/// boundaries to [`find_number_end`] (#1154) rather than hand-rolling
+/// both scans again -- see the latter's own doc comment for why this
+/// matters beyond tidiness.
 fn normalize_leading_zero_numbers(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out: Vec<u8> = Vec::with_capacity(s.len());
     let mut i = 0;
-    let mut in_string = false;
     while i < bytes.len() {
         let b = bytes[i];
-        if in_string {
-            out.push(b);
-            if b == b'\\' && i + 1 < bytes.len() {
-                out.push(bytes[i + 1]);
-                i += 2;
-                continue;
-            }
-            if b == b'"' {
-                in_string = false;
-            }
-            i += 1;
-            continue;
-        }
         if b == b'"' {
-            in_string = true;
-            out.push(b);
-            i += 1;
+            // `s` has already failed `validate_and_materialize_json`'s
+            // stricter check by the time this repair function runs (see
+            // `parse_json_value`), so an unterminated string here is a
+            // real, reachable case, not just hypothetical -- copy to
+            // end-of-input verbatim rather than panicking; the retried
+            // validation below will reject the result either way.
+            let end = find_string_end(bytes, i).unwrap_or(bytes.len());
+            out.extend_from_slice(&bytes[i..end]);
+            i = end;
             continue;
         }
         if b == b'-' || b.is_ascii_digit() {
             let start = i;
-            if b == b'-' {
-                i += 1;
-            }
-            let int_start = i;
-            while i < bytes.len() && bytes[i].is_ascii_digit() {
-                i += 1;
-            }
-            if int_start == i {
-                // A bare `-` with no digit following it at all (`-`,
-                // `[-,1]`, `{"a":-}`) isn't a number token in the first
-                // place -- only reachable when `b == '-'`, since a digit
-                // `b` always advances the scan above by at least one.
-                // Leaving it untouched (not fabricating a `0` digit) is
-                // required, not just tidier: filling one in turns a
-                // genuinely malformed token into a syntactically valid
-                // one (`-0`), which would make the retried `serde_json`
-                // validation below wrongly pass and this genuinely
-                // invalid input silently reach `json_bytes_to_owned_value`
-                // as `null` instead of erroring (found by review before
-                // merge).
+            let Some(end) = find_number_end(bytes, start) else {
+                // Bare `-`, not a number token -- see `find_number_end`'s
+                // own doc comment for why this must stay untouched rather
+                // than fabricating a digit.
                 out.push(b'-');
+                i += 1;
                 continue;
-            }
-            let stripped = s[int_start..i].trim_start_matches('0');
+            };
+            let int_start = if b == b'-' { start + 1 } else { start };
+            let int_end = int_start
+                + bytes[int_start..end]
+                    .iter()
+                    .take_while(|c| c.is_ascii_digit())
+                    .count();
+            let stripped = s[int_start..int_end].trim_start_matches('0');
             out.extend_from_slice(&bytes[start..int_start]);
             out.extend_from_slice(if stripped.is_empty() {
                 b"0"
             } else {
                 stripped.as_bytes()
             });
-            if i < bytes.len() && bytes[i] == b'.' {
-                let frac_start = i;
-                i += 1;
-                while i < bytes.len() && bytes[i].is_ascii_digit() {
-                    i += 1;
-                }
-                out.extend_from_slice(&bytes[frac_start..i]);
-            }
-            if i < bytes.len() && (bytes[i] == b'e' || bytes[i] == b'E') {
-                let exp_start = i;
-                i += 1;
-                if i < bytes.len() && (bytes[i] == b'+' || bytes[i] == b'-') {
-                    i += 1;
-                }
-                while i < bytes.len() && bytes[i].is_ascii_digit() {
-                    i += 1;
-                }
-                out.extend_from_slice(&bytes[exp_start..i]);
-            }
+            // Fraction and exponent, if any, are contiguous from
+            // `int_end` to `end` by construction of `find_number_end` --
+            // copied verbatim in one slice, unlike the two separate
+            // frac/exp copies an earlier version of this function did.
+            out.extend_from_slice(&bytes[int_end..end]);
+            i = end;
             continue;
         }
         // Every byte reaching here is copied verbatim, one at a time,
@@ -2680,6 +2702,65 @@ fn format_json(value: &OwnedValue, config: &OutputConfig) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1154: direct unit coverage for the extracted token-boundary
+    /// finder, independent of the CLI-level `--argjson` tests (which
+    /// already cover `normalize_leading_zero_numbers`'s end-to-end
+    /// behavior via subprocess spawns invisible to `cargo llvm-cov`).
+    #[test]
+    fn test_find_number_end_1154() {
+        // Plain and negative integers.
+        assert_eq!(find_number_end(b"42", 0), Some(2));
+        assert_eq!(find_number_end(b"-42", 0), Some(3));
+        // Leading zeros tolerated (that's the whole point of this scan).
+        assert_eq!(find_number_end(b"007", 0), Some(3));
+        // Fraction and exponent, each optionally signed.
+        assert_eq!(find_number_end(b"1.5", 0), Some(3));
+        assert_eq!(find_number_end(b"1e10", 0), Some(4));
+        assert_eq!(find_number_end(b"1E+10", 0), Some(5));
+        assert_eq!(find_number_end(b"1.5e-10", 0), Some(7));
+        // A dangling '.' or 'e' with no digits after it still consumes
+        // the marker itself, matching the lenient original behavior --
+        // the retried `serde_json` validation rejects the result either
+        // way, so this scan doesn't need to.
+        assert_eq!(find_number_end(b"5.", 0), Some(2));
+        assert_eq!(find_number_end(b"5e", 0), Some(2));
+        // Stops at the token's own end, not the end of a larger buffer.
+        assert_eq!(find_number_end(b"42,43", 0), Some(2));
+        // A bare '-' with nothing (or nothing digit-shaped) after it is
+        // not a number token at all.
+        assert_eq!(find_number_end(b"-", 0), None);
+        assert_eq!(find_number_end(b"-,", 0), None);
+        // Starting position other than 0.
+        assert_eq!(find_number_end(b"[1,007]", 3), Some(6));
+    }
+
+    #[test]
+    fn test_normalize_leading_zero_numbers_1154() {
+        assert_eq!(normalize_leading_zero_numbers("007"), "7");
+        assert_eq!(normalize_leading_zero_numbers("-00"), "-0");
+        assert_eq!(normalize_leading_zero_numbers("007.5"), "7.5");
+        assert_eq!(normalize_leading_zero_numbers("007e10"), "7e10");
+        assert_eq!(normalize_leading_zero_numbers("-007.5e-10"), "-7.5e-10");
+        // String contents and object keys are never touched, even when
+        // they look like a leading-zero number themselves.
+        assert_eq!(
+            normalize_leading_zero_numbers(r#"{"007":"007"}"#),
+            r#"{"007":"007"}"#
+        );
+        // An escaped quote inside a string doesn't end the string early.
+        assert_eq!(
+            normalize_leading_zero_numbers(r#"["a\"b",007]"#),
+            r#"["a\"b",7]"#
+        );
+        // A bare '-' is left untouched, not fabricated into "-0" (#1094
+        // review finding, the bug this whole delegation exists to avoid
+        // reintroducing).
+        assert_eq!(normalize_leading_zero_numbers("-"), "-");
+        assert_eq!(normalize_leading_zero_numbers("[-,1]"), "[-,1]");
+        // A normal, already-valid number is unaffected.
+        assert_eq!(normalize_leading_zero_numbers("42"), "42");
+    }
 
     #[test]
     fn test_jq_compat_formatter_format_raw_number() {
