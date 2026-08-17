@@ -1053,14 +1053,18 @@ impl<'a> Parser<'a> {
                             // value; the split-off literal's own text has
                             // the sign stripped, so its repr is `-repr`
                             // (the positive magnitude), not a re-parse.
-                            // `Int` is unreachable here in practice (the
-                            // guard above requires `.`/`e`/`E` in `text`,
-                            // which `parse_i64_or_f64` never resolves to an
-                            // `Int`), but `wrapping_neg` keeps this branch
-                            // panic-free even so, rather than relying on
-                            // that invariant never breaking.
+                            // `Int` is unreachable here: the guard above
+                            // requires `.`/`e`/`E` in `text`, which
+                            // `parse_i64_or_f64` never resolves to an
+                            // `Int` -- `unreachable!()` rather than a
+                            // silently-wrapping fallback, so a future
+                            // change to that dispatch rule that breaks the
+                            // invariant fails loudly here instead of
+                            // producing a wrong-signed value.
                             let stripped_repr = match repr {
-                                NumberRepr::Int(i) => NumberRepr::Int(i.wrapping_neg()),
+                                NumberRepr::Int(_) => unreachable!(
+                                    "a '.'/'e'/'E'-containing literal never parses as NumberRepr::Int"
+                                ),
                                 NumberRepr::Float(f) => NumberRepr::Float(-f),
                             };
                             Ok(Expr::Arithmetic {

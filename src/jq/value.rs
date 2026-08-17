@@ -1373,7 +1373,23 @@ impl From<Literal> for OwnedValue {
             // again here) -- constructed directly instead of re-parsing
             // `text` and re-deriving the identical value on every visit of
             // this AST node.
-            Literal::NumberLiteral(repr, text) => Self::NumberLiteral(repr, text.into()),
+            //
+            // Every real construction site keeps `repr`/`text` in sync
+            // (`Literal`'s tuple fields have no runtime enforcement of
+            // that, since neither `Literal` nor `NumberRepr` can carry
+            // private fields as a public enum) -- this debug-only check
+            // catches a hand-built mismatch in tests/debug builds rather
+            // than silently trusting `repr` the way release builds still
+            // do, restoring some of what `from_number_literal_boxed`'s
+            // unconditional re-parse used to guarantee for free.
+            Literal::NumberLiteral(repr, text) => {
+                debug_assert_eq!(
+                    Some(repr),
+                    parse_i64_or_f64(&text),
+                    "Literal::NumberLiteral's repr {repr:?} doesn't match a fresh parse of its own text {text:?}"
+                );
+                Self::NumberLiteral(repr, text.into())
+            }
             Literal::Int(n) => Self::Int(n),
             Literal::Float(f) => Self::Float(f),
             Literal::String(s) => Self::String(s),
