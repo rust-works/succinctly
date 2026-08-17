@@ -92,3 +92,25 @@ fn yq_locate_rejects_out_of_range_position() {
         "expected an invalid-position error, got: {stderr}"
     );
 }
+
+/// A leading-dot number's own `byte_range` must span just the literal
+/// itself, not run off to the next structural byte -- `text_range()`
+/// (`src/json/light.rs`) previously had no leading-dot case at all
+/// (unlike `value()`, which classified the cursor as `Number` correctly),
+/// so this returned `None` and `locate_offset_detailed`'s own fallback
+/// substituted a byte range spanning to end-of-file. Found by code
+/// review of #1171 before merge.
+#[test]
+fn jq_locate_leading_dot_number_byte_range_is_exact() {
+    let mut fixture = tempfile::NamedTempFile::new().expect("create temp fixture");
+    std::io::Write::write_all(&mut fixture, b"[.5, 6, 7]").expect("write fixture");
+    let path = fixture.path().to_str().expect("utf8 path");
+
+    let (stdout, stderr, code) = run(&["jq-locate", path, "--offset", "1", "--format", "json"]);
+
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(
+        stdout.contains("\"byte_range\": [\n    1,\n    3\n  ]"),
+        "expected byte_range [1, 3], got: {stdout}"
+    );
+}

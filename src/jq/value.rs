@@ -156,8 +156,23 @@ pub fn format_number_jq_compat(raw: &[u8]) -> String {
     }
 
     if !has_exp {
-        // Plain decimal without exponent - preserve as-is (keeps trailing zeros)
-        return s.to_string();
+        // Plain decimal without exponent - preserve as-is (keeps trailing
+        // zeros), except real jq's own reader adds a leading `0` to a
+        // leading-dot spelling even under plain identity -- confirmed
+        // live: `.500 | .` -> `0.500` (trailing zeros still kept
+        // verbatim), not `.500` (#1171). `is_valid_number`-gated callers
+        // never reach this function with a leading-dot `s` in the first
+        // place (strict RFC 8259 has no such spelling); this only fires
+        // for `s` sourced from a `NumberLiteral` this crate's own
+        // document-input scanners now recognize as jq-lenient (see
+        // `number_literal_end`, `src/json/light.rs`).
+        return if let Some(rest) = s.strip_prefix('.') {
+            format!("0.{rest}")
+        } else if let Some(rest) = s.strip_prefix("-.") {
+            format!("-0.{rest}")
+        } else {
+            s.to_string()
+        };
     }
 
     // Has exponent - need to reformat according to jq rules
@@ -633,6 +648,35 @@ impl OwnedValue {
         }
         if crate::json::validate::is_valid_number(bytes) {
             return core::str::from_utf8(bytes).map_or(Self::Null, Self::from_number_literal);
+        }
+        // Real jq's own number reader also accepts a leading `.` (with or
+        // without a preceding `-`) when at least one digit follows (`.5`
+        // -> `0.5`, `-.5` -> `-0.5`) -- not valid per strict RFC 8259
+        // (`is_valid_number` stays strict on purpose, shared by callers
+        // this leniency shouldn't reach), but a real jq-accepted spelling
+        // this crate's own document-input scanners now recognize as a
+        // number span (`number_literal_end`, #1171). Preserve it the same
+        // way #1094 preserves a leading zero: check whether inserting `0`
+        // right after any `-` makes the token strictly valid, and if so,
+        // still materialize the *original* (un-inserted) text as the
+        // literal spelling -- `bytes` was already gated by
+        // `number_literal_end` at the scan site, and
+        // `Self::from_number_literal` (via `parse_i64_or_f64`) parses a
+        // leading-dot float natively, so no separate reparse of the
+        // original text is needed here.
+        let dot_prefix_len = match bytes.first() {
+            Some(b'.') => Some(0),
+            Some(b'-') if bytes.get(1) == Some(&b'.') => Some(1),
+            _ => None,
+        };
+        if let Some(prefix_len) = dot_prefix_len {
+            let mut prefixed = Vec::with_capacity(bytes.len() + 1);
+            prefixed.extend_from_slice(&bytes[..prefix_len]);
+            prefixed.push(b'0');
+            prefixed.extend_from_slice(&bytes[prefix_len..]);
+            if crate::json::validate::is_valid_number(&prefixed) {
+                return core::str::from_utf8(bytes).map_or(Self::Null, Self::from_number_literal);
+            }
         }
         let Ok(s) = core::str::from_utf8(bytes) else {
             return Self::Null;

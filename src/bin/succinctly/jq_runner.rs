@@ -1383,19 +1383,16 @@ fn find_json_values(bytes: &[u8]) -> core::result::Result<Vec<(usize, usize)>, u
                 // true, false, null
                 find_literal_end(bytes, pos)
             }
-            b'-' | b'0'..=b'9' => {
-                // Number
-                find_number_end(bytes, pos)
-            }
-            // Real jq's own number reader is lenient beyond strict JSON: a
-            // leading `.` is accepted when at least one digit follows
-            // (`.5` -> `0.5`), matching `light.rs`'s identical widening
-            // for the materialization side (#1171). A bare `.`/`.e5` with
-            // no digit at all still falls through to the `None` catch-all
-            // below, matching real jq's own rejection of that shape.
-            b'.' if bytes.get(pos + 1).is_some_and(u8::is_ascii_digit) => {
-                find_number_end(bytes, pos)
-            }
+            // Number. `number_literal_end` (shared with `light.rs`'s own
+            // materializer, #1171 review -- one validated implementation
+            // instead of independently-maintained copies) both finds the
+            // end of and validates the token: a `.` is accepted as a
+            // leading byte when at least one digit follows (`.5` -> `0.5`,
+            // matching real jq's own leniency beyond strict JSON), and a
+            // byte sequence that only *looks* number-shaped (`-e5`, `1e`,
+            // a bare `.`) is rejected outright rather than silently
+            // accepted as a truncated or zero-length span.
+            b'-' | b'.' | b'0'..=b'9' => succinctly::json::light::number_literal_end(bytes, pos),
             _ => None,
         };
 
@@ -1460,27 +1457,6 @@ fn find_literal_end(bytes: &[u8], pos: usize) -> Option<usize> {
         i += 1;
     }
     Some(i)
-}
-
-/// Find the end of a number starting at `pos`.
-fn find_number_end(bytes: &[u8], pos: usize) -> Option<usize> {
-    let mut i = pos;
-    // Allow leading minus
-    if i < bytes.len() && bytes[i] == b'-' {
-        i += 1;
-    }
-    // Digits, dots, exponents
-    while i < bytes.len() {
-        match bytes[i] {
-            b'0'..=b'9' | b'.' | b'e' | b'E' | b'+' | b'-' => i += 1,
-            _ => break,
-        }
-    }
-    if i > pos {
-        Some(i)
-    } else {
-        None
-    }
 }
 
 /// Parse a JSON value from a string (`--argjson`/`--jsonargs`), preserving
@@ -2152,6 +2128,18 @@ impl LiteralFormatter for JqCompatFormatter {
             return Cow::Owned(match OwnedValue::from_number_bytes(raw) {
                 OwnedValue::Int(i) => self.format_int(i),
                 OwnedValue::Float(f) => self.format_float(f),
+                // A leading-dot span (`.5`, `-.5`) is jq-lenient-but-not-
+                // RFC-8259 (#1171): `from_number_bytes` preserves its
+                // spelling as a `NumberLiteral` here instead of degrading
+                // to a plain `Float` (needed so trailing zeros survive,
+                // `.500` -> `0.500` not `0.5`), so route it through the
+                // same jq-compat reformatting a strictly-valid span gets
+                // below via the literal's own text (identical to `raw`
+                // for this shape) rather than falling into the `_` catch
+                // -all and printing `null`.
+                OwnedValue::NumberLiteral(_, literal) => {
+                    format_number_jq_compat(literal.as_bytes())
+                }
                 _ => "null".to_string(),
             });
         }
