@@ -11639,8 +11639,17 @@ fn test_jq_compound_assign_plus_preserves_number_literal_on_null_1143() -> Resul
 /// #1167's `arith_mul` reordering (moving relocation arms before the
 /// numeric collapse) must not change jq mode's own `null * x` / `x * null`
 /// behavior -- `NULL_MERGES_AS_EMPTY` is yq-only, so both directions still
-/// fall through to the unconditional "null * x = null" arm and discard the
-/// non-null operand entirely, matching real jq (`5 * null` -> `null`).
+/// fall through to the same unconditional "null * x = null" arm as before
+/// this PR, unaffected by the reordering.
+///
+/// This locks in succinctly's *current* behavior only, not oracle
+/// conformance: real jq 1.7.1 actually *errors* on every `null`-involving
+/// multiplication (`5 * null` -> `number (5) and null (null) cannot be
+/// multiplied`, confirmed live), which succinctly's own catch-all arm
+/// (`(OwnedValue::Null, _) | (_, OwnedValue::Null) => Ok(OwnedValue::Null)`,
+/// untouched by this PR) does not replicate. Pre-existing divergence, not
+/// introduced or worsened here (identical on `main` before this PR) --
+/// filed separately as #1175.
 #[test]
 fn test_jq_null_times_number_literal_still_discards_both_ways_1167() -> Result<()> {
     let (out, _, code) = run_jq_full(&["-cn", "1e10 * null"], None)?;
