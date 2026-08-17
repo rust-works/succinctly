@@ -14145,6 +14145,44 @@ fn test_slice_sub_and_mul_scalar_computed_bound_still_errors_1117() -> Result<()
     Ok(())
 }
 
+/// Unlike a *literal* bound (`.[0:1]?`, `resolve_dynamic_indexes`'s own
+/// `Expr::Optional` path, untouched by this fix), a *computed* bound's `?`
+/// wrapper gets stripped by `assemble()`'s `strip_resolved_optional` once
+/// resolution succeeds via this fix's placeholder -- so it no longer
+/// protects `-=`/`*=`'s downstream type error, or an erroring `|=` filter,
+/// the way the un-suffixed form never did either. Confirmed live against
+/// real yq v4.53.3: `?` here does *not* suppress either error there
+/// (it only ever swallows a genuine slice-navigation failure, not the
+/// compound operator's own error) -- so this is the fix's own placeholder
+/// making the computed-bound case match real yq's actual behavior more
+/// closely than the pre-existing literal-bound sibling still does (a
+/// separate, unaffected, pre-existing gap, not fixed here).
+#[test]
+fn test_slice_optional_suffix_does_not_swallow_sub_mul_or_filter_errors_computed_bound_1117(
+) -> Result<()> {
+    let (out, code) = run_yq_stdin(
+        "0 as $a | 1 as $b | .[$a:$b]? -= 99",
+        "5",
+        &["-o=json", "-I=0"],
+    )?;
+    assert_ne!(code, 0, "out: {out:?}");
+
+    let (out, code) = run_yq_stdin(
+        "0 as $a | 1 as $b | .[$a:$b]? *= 99",
+        "5",
+        &["-o=json", "-I=0"],
+    )?;
+    assert_ne!(code, 0, "out: {out:?}");
+
+    let (out, code) = run_yq_stdin(
+        r#"0 as $a | 1 as $b | .[$a:$b]? |= error("boom")"#,
+        "5",
+        &["-o=json", "-I=0"],
+    )?;
+    assert_ne!(code, 0, "out: {out:?}");
+    Ok(())
+}
+
 /// A computed bound reached through a chained field, and a computed-bound
 /// slice with more path *after* it (an index) -- both no-op on a scalar
 /// target too, matching #1116's chain-depth widening for the literal case.
