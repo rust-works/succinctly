@@ -690,6 +690,56 @@ fn test_argjson_malformed_json_still_rejected_1094() -> Result<()> {
     Ok(())
 }
 
+/// A negative leading-zero number, reached nested inside an array so it
+/// doesn't hit the unrelated CLI arg-parsing issue a bare negative
+/// `--argjson` value has (#1150) -- exercises
+/// `normalize_leading_zero_numbers`'s own leading-`-` handling.
+#[test]
+fn test_argjson_negative_leading_zero_when_nested_1094() -> Result<()> {
+    let (stdout, _, code) = run_jq_full(&["-cn", "--argjson", "n", "[-007, 1]", "$n"], None)?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "[-7,1]");
+    Ok(())
+}
+
+/// A string containing a backslash escape sequence, alongside a
+/// leading-zero number that triggers normalization -- confirms the escape
+/// handling inside `normalize_leading_zero_numbers`'s string-tracking
+/// correctly copies the escaped character without misreading it as ending
+/// the string early.
+#[test]
+fn test_argjson_escaped_string_alongside_leading_zero_1094() -> Result<()> {
+    let (stdout, _, code) =
+        run_jq_full(&["-cn", "--argjson", "n", r#"["a\nb", 007]"#, "$n"], None)?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), r#"["a\nb",7]"#);
+    Ok(())
+}
+
+/// A leading-zero number combined with scientific notation is accepted
+/// (not rejected outright), exercising `normalize_leading_zero_numbers`'s
+/// exponent-handling branch -- exact spelling is a separate, pre-existing
+/// gap (#1149), so this only pins acceptance and the correct numeric
+/// value, not the display spelling.
+#[test]
+fn test_argjson_leading_zero_with_exponent_accepted_1094() -> Result<()> {
+    let (stdout, _, code) = run_jq_full(&["-n", "--argjson", "n", "007e5", "$n"], None)?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "700000");
+    Ok(())
+}
+
+/// Same as above, but with an explicit `+` sign on the exponent --
+/// exercises `normalize_leading_zero_numbers`'s explicit-exponent-sign
+/// branch specifically.
+#[test]
+fn test_argjson_leading_zero_with_signed_exponent_accepted_1094() -> Result<()> {
+    let (stdout, _, code) = run_jq_full(&["-n", "--argjson", "n", "007e+5", "$n"], None)?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "700000");
+    Ok(())
+}
+
 #[test]
 fn test_multiple_variables() -> Result<()> {
     let (output, code) = run_jq_null("$a + $b", &["--argjson", "a", "10", "--argjson", "b", "20"])?;
