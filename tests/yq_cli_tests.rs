@@ -12759,18 +12759,27 @@ fn test_slice_owned_target_scalar_is_empty_array_1065() -> Result<()> {
 // ============================================================================
 //
 // Real yq's `.[S:E] = v` / `.[S:E] |= f` / `.[S:E] += v` / `del(.[S:E])`
-// silently leave the document untouched on a null/number/boolean target --
-// confirmed live against real yq v4.53.3, including the surprising detail
-// that the RHS/filter is never even evaluated (`5 | .[0:1] += (1/0)` stays
-// `5` with no division-by-zero error). `-=`/`*=` are NOT no-ops -- they
+// silently leave the document's *write* untouched on a null/number/boolean
+// target -- confirmed live against real yq v4.53.3. The RHS/filter is
+// still evaluated normally, though, and its own errors/halt/break still
+// propagate (`.[0:1] = error("boom")` genuinely errors in real yq) -- an
+// earlier version of this fix incorrectly skipped RHS evaluation entirely,
+// based on a misread of `.[0:1] = (1/0)` appearing not to error (`1/0`
+// isn't a catchable error in real yq at all; it's `+Inf`, which only fails
+// at JSON-output time for a value that, being part of a no-op write, is
+// never actually written or serialized). `-=`/`*=` are NOT no-ops -- they
 // error instead, with Go-internal-looking messages this crate deliberately
 // does not replicate (not a stable compatibility target). Object, string,
 // and array targets are deliberately unaffected: succinctly's own working
 // array/string slice-assignment is preserved rather than matched to what
-// looks like a real-yq gap rather than a real-yq rule (see
-// `is_yq_scalar_slice_assign_target`'s doc comment for the full premise
-// correction -- the no-op turned out not to be scalar-specific in real yq
-// at all, but this fix stays scoped to scalars anyway).
+// looks like a real-yq gap rather than a real-yq rule. This fix is also
+// deliberately scoped to a *bare* root slice with *literal* bounds only --
+// see `is_yq_scalar_slice_assign_path`'s doc comment, and the follow-up
+// issues filed for chained paths (`.foo[S:E]`, where `del()` in particular
+// has a materially different real-yq behavior: it deletes the whole parent
+// key, not a no-op) and computed bounds (`.[$a:$b]`, which fails earlier
+// inside `resolve_slice_expr`'s own eager path-resolution slice, a
+// separate and more delicate piece of machinery than this fix touches).
 
 #[test]
 fn test_slice_assign_number_scalar_is_noop_1101() -> Result<()> {
@@ -12816,19 +12825,63 @@ fn test_slice_assign_bool_and_null_scalar_is_noop_1101() -> Result<()> {
     Ok(())
 }
 
-/// The RHS/filter is never evaluated for the no-op cases -- a side-effecting
-/// or erroring RHS produces no observable effect, matching real yq exactly.
+/// The RHS/filter is still evaluated normally for the no-op cases -- only
+/// the *write* is skipped, so an erroring RHS/filter still raises exactly
+/// as it would for any other `=`/`|=`/`+=` (confirmed live against real
+/// yq: `.[0:1] = error("boom")` raises `boom`, not a silent no-op).
 #[test]
-fn test_slice_assign_scalar_noop_never_evaluates_rhs_1101() -> Result<()> {
-    let (out, code) = run_yq_stdin(".[0:1] = (1/0)", "5", &["-o", "json"])?;
+fn test_slice_assign_scalar_noop_still_propagates_rhs_errors_1101() -> Result<()> {
+    let (_out, stderr, code) =
+        run_yq_stdin_with_stderr(r#".[0:1] = error("boom")"#, "5", &["-o", "json"])?;
+    assert_eq!(code, 1);
+    assert!(stderr.contains("boom"), "stderr: {stderr:?}");
+
+    let (_out, stderr, code) =
+        run_yq_stdin_with_stderr(r#".[0:1] |= error("boom")"#, "5", &["-o", "json"])?;
+    assert_eq!(code, 1);
+    assert!(stderr.contains("boom"), "stderr: {stderr:?}");
+
+    let (_out, stderr, code) =
+        run_yq_stdin_with_stderr(r#".[0:1] += error("boom")"#, "5", &["-o", "json"])?;
+    assert_eq!(code, 1);
+    assert!(stderr.contains("boom"), "stderr: {stderr:?}");
+    Ok(())
+}
+
+/// `halt_error`/`break` in the RHS/filter must also still escape, not just
+/// plain errors -- succinctly's own extension (real yq has no `halt_error`
+/// at all), so this is checked against the codebase's own documented
+/// invariant (`EvalEscape`'s doc comment: a halt or break addressed to an
+/// outer label must never be silently discarded) rather than an external
+/// oracle.
+#[test]
+fn test_slice_assign_scalar_noop_still_propagates_halt_1101() -> Result<()> {
+    let (_out, _stderr, code) =
+        run_yq_stdin_with_stderr(".[0:1] = halt_error(3)", "5", &["-o", "json"])?;
+    assert_eq!(code, 3);
+    Ok(())
+}
+
+/// `.[0:1]?` (the postfix-optional form) still no-ops -- confirmed live
+/// against real yq, and confirmed to reach the same code path as the
+/// un-suffixed form via `resolve_dynamic_indexes`'s own `Expr::Optional`
+/// handling (it isn't stripped for the non-computed-bound case the way a
+/// resolved computed bound's wrapper is).
+#[test]
+fn test_slice_assign_scalar_noop_with_optional_suffix_1101() -> Result<()> {
+    let (out, code) = run_yq_stdin(".[0:1]? = 99", "5", &["-o", "json"])?;
     assert_eq!(code, 0, "out: {out:?}");
     assert_eq!(out.trim(), "5");
+    Ok(())
+}
 
-    let (out, code) = run_yq_stdin(".[0:1] |= (1/0)", "5", &["-o", "json"])?;
-    assert_eq!(code, 0, "out: {out:?}");
-    assert_eq!(out.trim(), "5");
-
-    let (out, code) = run_yq_stdin(".[0:1] += (1/0)", "5", &["-o", "json"])?;
+/// `//=` desugars to exactly the `.path |= (. // value)` shape a genuine
+/// `|=` call already no-ops on for this target, through the same
+/// `eval_update` function -- kept consistent with `|=` even though real
+/// yq has no `//=` syntax at all to verify against directly.
+#[test]
+fn test_slice_alternative_assign_scalar_is_noop_1101() -> Result<()> {
+    let (out, code) = run_yq_stdin(".[0:1] //= 99", "5", &["-o", "json"])?;
     assert_eq!(code, 0, "out: {out:?}");
     assert_eq!(out.trim(), "5");
     Ok(())

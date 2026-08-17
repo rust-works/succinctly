@@ -9901,27 +9901,53 @@ pub(crate) fn is_yq_slice_empty_container_scalar(target: &OwnedValue) -> bool {
     )
 }
 
-/// Whether `path_expr` (assignment-target position) is a bare slice
-/// (`.[S:E]`, not `.foo[S:E]`, `.[S:E][]`, or any other chaining) applied
-/// directly to a scalar `value` — the shape real yq's own slice-assignment
-/// machinery silently no-ops on (#1101).
+/// Whether a *resolved* assignment-target path (a `paths`/`delete_at_path`
+/// entry, already past `resolve_dynamic_indexes`, not the raw `path_expr`
+/// the user wrote) is a bare slice — `.[S:E]`, or `.[S:E]?` (`resolve_
+/// dynamic_indexes` doesn't always strip an outer `Expr::Optional`, unlike
+/// `Expr::Paren`, which never survives parsing at all) — as opposed to
+/// `.foo[S:E]`, `.[S:E][]`, or any other chaining. Checking the *resolved*
+/// path rather than the original `path_expr` is what makes a computed-bound
+/// `.[$a:$b]` (`Expr::SliceExpr` pre-resolution) reach this the same way a
+/// literal `.[0:1]` (`Expr::Slice` from the start) does — both fold to the
+/// identical `Expr::Slice{start,end}` shape by the time `resolve_dynamic_
+/// indexes` is done, per its own `needs_path_prepass` gate.
+///
+/// Combine with [`is_yq_slice_empty_container_scalar`] against the *current*
+/// value at this point in the fold (not the original input — #1101's no-op
+/// is a per-path, per-fold-step decision, same granularity as `set_path`/
+/// `update_path`'s own error checks) to get the full #1101 condition: a bare
+/// slice targeting a scalar, the shape real yq's own slice-assignment
+/// machinery silently no-ops the *write* portion of (#1101).
 ///
 /// **Premise correction, found while live-probing #1101 against real yq
 /// v4.53.3**: the no-op is *not* scalar-specific the way #1065's read-path
 /// rule is. `[1,2,3] | .[0:1] = [9]` and `"hi" | .[0:1] = "X"` are *also*
 /// silent no-ops in real yq — `.[S:E] = v` / `.[S:E] |= f` / `.[S:E] += v`
-/// never actually writes anywhere, for *any* target type, and does so
-/// without even evaluating the RHS/filter (`5 | .[0:1] = (1/0)` stays `5`
-/// with no error). This looks like real yq's slice-assignment path
-/// resolution never being wired up at all, not a deliberate design choice.
-/// succinctly's own array/string slice-assignment already works correctly
-/// and is a genuinely useful feature beyond what real yq offers — matching
-/// the universal no-op exactly would mean *removing* that working feature
-/// to replicate what looks like a real-yq gap, not a real-yq rule worth
-/// porting. So this check is deliberately narrowed to the scalar case only
-/// (matching #1065's own scope), preserving succinctly's array/string
-/// slice-assignment untouched — a deliberate scope decision, not an
-/// oversight.
+/// never actually *writes* anywhere, for *any* target type. This looks like
+/// real yq's slice-assignment path resolution never being wired up at all,
+/// not a deliberate design choice. succinctly's own array/string
+/// slice-assignment already works correctly and is a genuinely useful
+/// feature beyond what real yq offers — matching the universal no-op
+/// exactly would mean *removing* that working feature to replicate what
+/// looks like a real-yq gap, not a real-yq rule worth porting. So this
+/// check is deliberately narrowed to the scalar case only (matching #1065's
+/// own scope), preserving succinctly's array/string slice-assignment
+/// untouched — a deliberate scope decision, not an oversight.
+///
+/// **Second correction, found via code review**: only the *write* is a
+/// no-op — the RHS/filter is still evaluated normally, with its own
+/// errors/`halt`/`break` propagating exactly as they would for any other
+/// assignment (`.[0:1] = error("boom")` genuinely errors in real yq; only
+/// a *successful* RHS value is silently discarded rather than written). An
+/// earlier version of this fix short-circuited *before* evaluating the RHS
+/// at all, based on a since-corrected misreading of `.[0:1] = (1/0)`
+/// appearing not to error — `1/0` doesn't actually raise a catchable error
+/// in real yq (it evaluates to `+Inf`, which only fails at JSON-output time
+/// for a value that was never written and thus never serialized), so that
+/// probe never actually tested whether RHS evaluation happens. Every call
+/// site now evaluates the RHS/filter through the ordinary machinery and
+/// only skips the final write.
 ///
 /// Also confirmed asymmetric by operator: `=`/`|=`/`+=`/`del()` no-op, but
 /// `-=`/`*=` *error* instead (with odd, clearly Go-internal-leak messages
@@ -9932,15 +9958,12 @@ pub(crate) fn is_yq_slice_empty_container_scalar(target: &OwnedValue) -> bool {
 /// path. `/=`, `%=`, `//=`, and `path(...)` aren't valid real-yq syntax at
 /// all (confirmed live — e.g. `'/' expects 2 args but there is 1`), so
 /// there is no oracle to match for those and no scope decision to make.
-pub(crate) fn is_yq_scalar_slice_assign_target<W: Clone + AsRef<[u64]>>(
-    path_expr: &Expr,
-    value: &StandardJson<'_, W>,
-) -> bool {
-    matches!(path_expr, Expr::Slice { .. })
-        && matches!(
-            value,
-            StandardJson::Null | StandardJson::Number(_) | StandardJson::Bool(_)
-        )
+pub(crate) fn is_yq_scalar_slice_assign_path(path_expr: &Expr) -> bool {
+    match path_expr {
+        Expr::Slice { .. } => true,
+        Expr::Optional(inner) => is_yq_scalar_slice_assign_path(inner),
+        _ => false,
+    }
 }
 
 /// Apply a resolved slice directly to an owned value.
@@ -10195,18 +10218,6 @@ fn eval_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     input: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    // yq's slice-assignment no-op (#1101) — checked before RHS evaluation,
-    // matching real yq's own behavior of never evaluating the RHS at all
-    // for this shape (`5 | .[0:1] = (1/0)` stays `5` with no error, verified
-    // live). See `is_yq_scalar_slice_assign_target`'s doc comment for the
-    // full rationale, including the premise correction (real yq's no-op
-    // isn't scalar-specific, but this fix deliberately stays scoped to
-    // scalars to preserve succinctly's own working array/string
-    // slice-assignment).
-    if S::TAG == EvalTag::Yq && is_yq_scalar_slice_assign_target(path_expr, &input) {
-        return QueryResult::One(input);
-    }
-
     // Evaluate the RHS once, keeping every output instead of collapsing to
     // the first (#392). `terminal` carries a trailing `Error`/`Break` when
     // the stream didn't simply run out -- the same `Partial` shape every
@@ -10290,6 +10301,25 @@ fn eval_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             } else {
                 new_value.clone()
             };
+            // yq's slice-assignment no-op (#1101) — checked here, per
+            // resolved path, rather than before RHS evaluation: the RHS
+            // (`value`, already fully computed above) still needs to have
+            // been evaluated normally so its own errors/halt/break
+            // propagate (`.[0:1] = error("boom")` genuinely errors in real
+            // yq; only `.[0:1] = 99`-shaped *successful* RHS values are
+            // silently discarded). Checking the *resolved* `path` (not the
+            // raw `path_expr`) means a computed-bound `.[$a:$b]` and a
+            // `.[0:1]?` both reach this the same way a literal `.[0:1]`
+            // does, since `resolve_dynamic_indexes` has already folded
+            // them into the same shape by this point. See
+            // `is_yq_scalar_slice_assign_path`'s doc comment for the full
+            // rationale.
+            if S::TAG == EvalTag::Yq
+                && is_yq_scalar_slice_assign_path(path)
+                && is_yq_slice_empty_container_scalar(&result)
+            {
+                continue;
+            }
             if let Err(e) = set_path(&mut result, path, value) {
                 // Atomic per RHS output, like `reduce`: this value's own
                 // path list contributes nothing, and the whole fan-out
@@ -10323,7 +10353,7 @@ fn eval_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// Applies filter to the value at path and updates it.
 ///
 /// `scalar_slice_noop` gates #1101's yq no-op check (see
-/// `is_yq_scalar_slice_assign_target`'s doc comment): `true` for a genuine
+/// `is_yq_scalar_slice_assign_path`'s doc comment): `true` for a genuine
 /// `|=` and for `+=` (`AssignOp::Add`), `false` for `-=`/`*=`, which
 /// real yq errors on instead of no-op'ing for this same shape — verified
 /// live, not assumed, since both routes reduce to this same function via
@@ -10336,13 +10366,6 @@ fn eval_update<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     optional: bool,
     scalar_slice_noop: bool,
 ) -> QueryResult<'a, W> {
-    if scalar_slice_noop
-        && S::TAG == EvalTag::Yq
-        && is_yq_scalar_slice_assign_target(path_expr, &input)
-    {
-        return QueryResult::One(input);
-    }
-
     // Convert input to owned for modification
     let mut result = to_owned(&input);
 
@@ -10366,6 +10389,29 @@ fn eval_update<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
     // Get current value at path, apply filter, and set back
     for path in &paths {
+        // yq's slice-assignment no-op (#1101) — the filter still has to run
+        // normally (against a throwaway clone) so its own errors/`halt`/
+        // `break` propagate exactly as they would for any other `|=`; only
+        // the *write* back into `result` is skipped. See
+        // `is_yq_scalar_slice_assign_path`'s doc comment for the full
+        // rationale, including why this can't be a blanket check before
+        // the filter runs at all.
+        if scalar_slice_noop
+            && S::TAG == EvalTag::Yq
+            && is_yq_scalar_slice_assign_path(path)
+            && is_yq_slice_empty_container_scalar(&result)
+        {
+            let mut throwaway = result.clone();
+            if let Err(escape) =
+                update_path::<S>(&mut throwaway, &Expr::Identity, filter_expr, false)
+            {
+                return match escape {
+                    EvalEscape::Error(_) if optional => QueryResult::None,
+                    other => other.into(),
+                };
+            }
+            continue;
+        }
         if let Err(escape) = update_path::<S>(&mut result, path, filter_expr, false) {
             return match escape {
                 EvalEscape::Error(_) if optional => QueryResult::None,
@@ -10385,21 +10431,6 @@ fn eval_compound_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     input: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    // yq's slice-assignment no-op (#1101) — `+=` only (verified live against
-    // real yq that `-=`/`*=` error instead for this same shape). Checked
-    // here, before the RHS is evaluated at all: real yq's `+=` doesn't
-    // evaluate its RHS for this shape either (`5 | .[0:1] += (1/0)` stays
-    // `5` with no error, verified live), so this must run before
-    // `eval_rhs_once` below, not inside `eval_update` after the RHS is
-    // already computed. See `is_yq_scalar_slice_assign_target`'s doc
-    // comment for the full rationale.
-    if matches!(op, AssignOp::Add)
-        && S::TAG == EvalTag::Yq
-        && is_yq_scalar_slice_assign_target(path_expr, &input)
-    {
-        return QueryResult::One(input);
-    }
-
     // Convert to update: .path op= value  becomes  .path |= . op value
     let arith_op = match op {
         AssignOp::Add => ArithOp::Add,
@@ -10427,11 +10458,17 @@ fn eval_compound_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         right: Box::new(owned_to_expr(&rhs_value)),
     };
 
-    // `false`: the one case that wants #1101's no-op (`AssignOp::Add` on a
-    // scalar slice target) was already intercepted above, before the RHS
-    // was evaluated. `Sub`/`Mul`/`Div`/`Mod` reaching this point should
-    // keep the unmodified, still-erroring behavior.
-    eval_update::<W, S>(path_expr, &filter, input, optional, false)
+    // #1101's no-op applies to `Add` only (verified live that `-=`/`*=`
+    // error instead for this same shape) — `eval_update` runs the filter
+    // normally either way, only skipping the final write when this is
+    // `true` and the resolved target qualifies.
+    eval_update::<W, S>(
+        path_expr,
+        &filter,
+        input,
+        optional,
+        matches!(op, AssignOp::Add),
+    )
 }
 
 /// Evaluate alternative assignment: `.path //= value`
@@ -10455,10 +10492,16 @@ fn eval_alternative_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Box::new(owned_to_expr(&rhs_value)),
     );
 
-    // `false`: real yq has no `//=` syntax at all (`'//' expects 2 args but
-    // there is 1`, confirmed live), so there's no oracle to verify a no-op
-    // against here — left at the pre-#1101 (unmodified, erroring) behavior.
-    eval_update::<W, S>(path_expr, &filter, input, optional, false)
+    // `true`: real yq has no `//=` syntax at all (`'//' expects 2 args but
+    // there is 1`, confirmed live), so there's no external oracle for this
+    // operator specifically — but `//=` desugars to exactly the same `.path
+    // |= (. // value)` shape a genuine `|=` call already no-ops on for this
+    // target (confirmed live: `.[0:1] |= (. // 99)` no-ops), through this
+    // same `eval_update` function. Leaving this `false` would make two
+    // spellings of the identical operation disagree purely because of which
+    // AST shape reached `eval_update` — internal consistency, not an
+    // external-compat claim, is the justification here.
+    eval_update::<W, S>(path_expr, &filter, input, optional, true)
 }
 
 /// Turn `root` into a fresh empty object if it is `Null`, otherwise leave it
@@ -18382,14 +18425,6 @@ fn builtin_del<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    // yq's slice-assignment no-op (#1101) — `del(.[S:E])` on a scalar target
-    // is confirmed live to be a no-op in real yq too, same as `=`/`|=`/`+=`.
-    // See `is_yq_scalar_slice_assign_target`'s doc comment for the full
-    // rationale.
-    if S::TAG == EvalTag::Yq && is_yq_scalar_slice_assign_target(path_expr, &value) {
-        return QueryResult::One(value);
-    }
-
     // Convert to owned and delete the path
     let result = to_owned(&value);
 
@@ -18422,6 +18457,20 @@ fn builtin_del<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     if paths.len() <= 1 {
         let mut result = result;
         for path in &paths {
+            // yq's slice-assignment no-op (#1101) — `del(.[S:E])` on a bare
+            // scalar target is confirmed live to be a no-op in real yq too,
+            // same as `=`/`|=`/`+=`. Checked per resolved path (not the raw
+            // `path_expr`) so a computed-bound `.[$a:$b]` and `.[0:1]?`
+            // reach this the same way a literal `.[0:1]` does. See
+            // `is_yq_scalar_slice_assign_path`'s doc comment for the full
+            // rationale. `del()` has no RHS/filter, so there's nothing to
+            // evaluate before skipping — unlike `=`/`|=`/`+=`.
+            if S::TAG == EvalTag::Yq
+                && is_yq_scalar_slice_assign_path(path)
+                && is_yq_slice_empty_container_scalar(&result)
+            {
+                continue;
+            }
             if let Err(e) = delete_at_path(&mut result, path, false) {
                 return if optional {
                     QueryResult::None
