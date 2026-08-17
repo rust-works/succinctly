@@ -119,7 +119,7 @@ pub enum Expr {
 
     /// Unary minus: `-expr` (#1100). A dedicated single-child variant,
     /// matching this AST's own convention for unary operations (`Paren`,
-    /// `Optional`, `Select`, etc. above) -- unlike the `ArithOp::Negate`
+    /// `Optional`, etc. above) -- unlike the `ArithOp::Negate`
     /// approach it replaces, which reused `Expr::Arithmetic`'s binary shape
     /// with an always-unused dummy `left` operand purely to borrow its
     /// existing fan-out (cartesian-product) machinery. That reuse worked
