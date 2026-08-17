@@ -11606,6 +11606,10 @@ fn test_jq_genuine_arithmetic_still_reformats_1143() -> Result<()> {
     let (out, _, code) = run_jq_full(&["-cn", "3.00 + 1"], None)?;
     assert_eq!(code, 0, "out: {out:?}");
     assert_eq!(out.trim(), "4");
+
+    let (out, _, code) = run_jq_full(&["-cn", "1 + 1.500"], None)?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "2.5");
     Ok(())
 }
 
