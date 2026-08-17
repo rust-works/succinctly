@@ -14464,6 +14464,84 @@ fn test_1162_delpaths_slice_descriptor_jq_mode_unaffected() -> Result<()> {
     Ok(())
 }
 
+/// #1219 characterization: a chained slice with more path *after* it
+/// (`.[1:3][0]`) is a structurally different shape than #1162 covers —
+/// `yq_del_scalar_slice_parent_path` only rewrites when the slice is the
+/// path's *last* component, so this never reaches that rewrite at all, and
+/// falls through to `delete_at_path`'s ordinary `Expr::Slice` walker arm
+/// instead. Real yq no-ops the whole thing here (verified live); succinctly
+/// still descends into the sliced sub-range and deletes within it. Confirmed
+/// unaffected by #1162's diff either way (identical on `main` before this
+/// fix). If this is ever fixed (tracked as #1219), update this expectation.
+#[test]
+fn test_1219_chained_slice_with_trailing_path_characterize_preexisting_bug() -> Result<()> {
+    let (out, code) = run_yq_stdin(
+        "del(.a[1:3][0])",
+        r#"{"a":[1,2,3,4]}"#,
+        &["-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(
+        out.trim(),
+        r#"{"a":[1,3,4]}"#,
+        "if this now matches real yq's no-op ({{\"a\":[1,2,3,4]}}), update this test and close #1219"
+    );
+    Ok(())
+}
+
+/// #1220 characterization: real yq's `delpaths()` is stricter than the
+/// slice-descriptor-only rejection #1162 implements — it also rejects a
+/// float path component (`found !!float instead`, verified live), where
+/// jq's own model treats a float as a valid array index (truncated toward
+/// zero by `resolve_read_index`) and succinctly currently follows that
+/// jq-consistent behavior in yq mode too, silently succeeding instead of
+/// erroring. (A bool or array component, unlike a float, already errors in
+/// succinctly today too — just with jq's own wrong-key-type wording instead
+/// of real yq's `DELPATHS:` message — so the float case is the cleanest
+/// "silently accepted where real yq errors" example; #1220's own issue text
+/// covers the full scope.) Unaffected by #1162's diff (the new check only
+/// matches `OwnedValue::Object`). If this is ever widened (tracked as
+/// #1220), update this expectation.
+#[test]
+fn test_1220_delpaths_accepts_float_component_characterize_preexisting_bug() -> Result<()> {
+    let (out, code) = run_yq_stdin("delpaths([[1.0]])", "[1,2,3]", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(
+        out.trim(),
+        "[1,3]",
+        "if this now errors like real yq (found !!float instead), update this test and close #1220"
+    );
+    Ok(())
+}
+
+/// #1223 characterization: a comma-grouped multi-path `del()` crashes when
+/// a sibling's chained-slice target is an `Object`, instead of applying
+/// #1162's own parent-key-drop rule (which the *single-path* form of this
+/// exact query already gets correctly — see `test_1162_chained_object_
+/// slice_del_removes_parent_key`). Root cause is upstream of
+/// `yq_del_scalar_slice_parent_path`, in `resolve_dynamic_indexes`'s
+/// generic multi-path validation for a top-level `Comma` — confirmed
+/// unaffected by #1162's diff either way (identical crash on `main` before
+/// this fix). If this is ever fixed (tracked as #1223), update this
+/// expectation.
+#[test]
+fn test_1223_multi_path_del_object_target_characterize_preexisting_bug() -> Result<()> {
+    let (_out, stderr, code) = run_yq_stdin_with_stderr(
+        "del(.a[0:1], .c)",
+        r#"{"a":{"x":1,"y":2},"b":6,"c":9}"#,
+        &[],
+    )?;
+    assert_ne!(
+        code, 0,
+        "if this now succeeds like real yq ({{\"b\":6}}), update this test and close #1223"
+    );
+    assert!(
+        stderr.contains("Cannot index object with object"),
+        "stderr: {stderr}"
+    );
+    Ok(())
+}
+
 /// Deleting through a missing/absent intermediate step stays a no-op —
 /// untouched by #1116, regression guard against the new path-rewrite logic
 /// accidentally firing where the prefix doesn't even resolve.
