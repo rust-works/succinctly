@@ -11636,6 +11636,23 @@ fn test_jq_compound_assign_plus_preserves_number_literal_on_null_1143() -> Resul
     Ok(())
 }
 
+/// #1167's `arith_mul` reordering (moving relocation arms before the
+/// numeric collapse) must not change jq mode's own `null * x` / `x * null`
+/// behavior -- `NULL_MERGES_AS_EMPTY` is yq-only, so both directions still
+/// fall through to the unconditional "null * x = null" arm and discard the
+/// non-null operand entirely, matching real jq (`5 * null` -> `null`).
+#[test]
+fn test_jq_null_times_number_literal_still_discards_both_ways_1167() -> Result<()> {
+    let (out, _, code) = run_jq_full(&["-cn", "1e10 * null"], None)?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "null");
+
+    let (out, _, code) = run_jq_full(&["-cn", "null * 1e10"], None)?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "null");
+    Ok(())
+}
+
 /// #1116's yq-only "chained scalar-slice-assign no-ops" / "del() deletes
 /// the parent key" rules must not leak into jq mode: real jq errors on
 /// both `.a[0:1] = 99` and `del(.a[0:1])` for a scalar `.a`, matching

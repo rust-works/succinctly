@@ -1936,34 +1936,7 @@ fn arith_mul<S: EvalSemantics>(
     right: OwnedValue,
     flags: MergeFlags,
 ) -> Result<OwnedValue, EvalError> {
-    let (left, right) = (left.into_plain_number(), right.into_plain_number());
     match (left, right) {
-        // jq converts to float on overflow, yq wraps
-        (OwnedValue::Int(a), OwnedValue::Int(b)) => {
-            if S::OVERFLOW_WRAPS {
-                // yq behavior: wrapping mul
-                Ok(OwnedValue::Int(a.wrapping_mul(b)))
-            } else {
-                // jq behavior: convert to float on overflow
-                match a.checked_mul(b) {
-                    Some(result) => Ok(OwnedValue::Int(result)),
-                    None => Ok(OwnedValue::Float(a as f64 * b as f64)),
-                }
-            }
-        }
-        (OwnedValue::Int(a), OwnedValue::Float(b)) => Ok(OwnedValue::Float(a as f64 * b)),
-        (OwnedValue::Float(a), OwnedValue::Int(b)) => Ok(OwnedValue::Float(a * b as f64)),
-        (OwnedValue::Float(a), OwnedValue::Float(b)) => Ok(OwnedValue::Float(a * b)),
-        // String repetition: "ab" * 3 = "ababab". jq >= 1.7 yields "" for
-        // n == 0 and null only for n < 0 (jqlang/jq#1593)
-        (OwnedValue::String(s), OwnedValue::Int(n))
-        | (OwnedValue::Int(n), OwnedValue::String(s)) => {
-            if n < 0 {
-                Ok(OwnedValue::Null)
-            } else {
-                Ok(OwnedValue::String(s.repeat(n as usize)))
-            }
-        }
         // Object recursive merge (yq's `*`/`*=` merge operator; also jq's
         // plain object multiply, which has always done the same thing).
         // Uses merge_existing (not merge_values) because `a`/`b` are the
@@ -1982,7 +1955,11 @@ fn arith_mul<S: EvalSemantics>(
         }
         // yq: null is an empty container for merge purposes. A null right
         // operand is a no-op regardless of flags (real yq: `x *= null`
-        // leaves `x` untouched, whatever `x` is). A null left operand
+        // leaves `x` untouched, whatever `x` is) -- `left` is relocated
+        // unchanged here, not computed, so a `NumberLiteral` operand must
+        // keep its own source spelling (#1167, mirroring #1143's identical
+        // fix for `arith_add`'s `null`-passthrough arm: this arm must run
+        // before the numeric arm below collapses it). A null left operand
         // merging with an object/array merges as if it started from
         // `{}`/`[]`, routing through the same merge_values() call as a real
         // container pair — so `?`/`n` gating (which only takes effect once
@@ -1998,9 +1975,46 @@ fn arith_mul<S: EvalSemantics>(
         (OwnedValue::Null, b @ OwnedValue::Array(_)) if S::NULL_MERGES_AS_EMPTY => {
             Ok(merge_values(OwnedValue::Array(Vec::new()), b, flags))
         }
-        // null * x = null
+        // null * x = null -- both operands are discarded outright (the
+        // result is always `Null`, never either operand), so there's
+        // nothing to relocate and no spelling to lose here.
         (OwnedValue::Null, _) | (_, OwnedValue::Null) => Ok(OwnedValue::Null),
-        (a, b) => Err(EvalError::binary_op(&a, &b, BinOp::Multiply)),
+        // Everything else: numeric multiplication or string repetition. A
+        // `NumberLiteral` operand degrades to plain `Int`/`Float` here, and
+        // only here -- these are the arms that actually compute a new
+        // value (a product, or a repeated string), so canonical formatting
+        // is correct; every arm above relocates an operand unchanged (or
+        // discards both entirely) and must not collapse a literal's
+        // spelling (#1167).
+        (left, right) => match (left.into_plain_number(), right.into_plain_number()) {
+            // jq converts to float on overflow, yq wraps
+            (OwnedValue::Int(a), OwnedValue::Int(b)) => {
+                if S::OVERFLOW_WRAPS {
+                    // yq behavior: wrapping mul
+                    Ok(OwnedValue::Int(a.wrapping_mul(b)))
+                } else {
+                    // jq behavior: convert to float on overflow
+                    match a.checked_mul(b) {
+                        Some(result) => Ok(OwnedValue::Int(result)),
+                        None => Ok(OwnedValue::Float(a as f64 * b as f64)),
+                    }
+                }
+            }
+            (OwnedValue::Int(a), OwnedValue::Float(b)) => Ok(OwnedValue::Float(a as f64 * b)),
+            (OwnedValue::Float(a), OwnedValue::Int(b)) => Ok(OwnedValue::Float(a * b as f64)),
+            (OwnedValue::Float(a), OwnedValue::Float(b)) => Ok(OwnedValue::Float(a * b)),
+            // String repetition: "ab" * 3 = "ababab". jq >= 1.7 yields ""
+            // for n == 0 and null only for n < 0 (jqlang/jq#1593)
+            (OwnedValue::String(s), OwnedValue::Int(n))
+            | (OwnedValue::Int(n), OwnedValue::String(s)) => {
+                if n < 0 {
+                    Ok(OwnedValue::Null)
+                } else {
+                    Ok(OwnedValue::String(s.repeat(n as usize)))
+                }
+            }
+            (a, b) => Err(EvalError::binary_op(&a, &b, BinOp::Multiply)),
+        },
     }
 }
 

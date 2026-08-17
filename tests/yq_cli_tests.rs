@@ -13726,6 +13726,76 @@ fn test_1143_genuine_arithmetic_still_reformats() -> Result<()> {
     Ok(())
 }
 
+// --- #1167: `arith_mul`'s null-merge no-op arm (`x *= null`) must not
+// collapse a `NumberLiteral` operand's own source spelling either --
+// identical bug class to #1143, just in `arith_mul` instead of `arith_add`.
+// Verified live against real yq v4.53.3 (`x *= null` is a documented no-op).
+
+#[test]
+fn test_1167_mul_null_noop_preserves_number_literal_spelling() -> Result<()> {
+    let (output, code) = run_yq_stdin(".a *= null", r#"{"a":3.00}"#, &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#"{"a":3.00}"#);
+
+    let (output, code) = run_yq_stdin("1e10 * null", "null", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "1e10");
+
+    Ok(())
+}
+
+/// Control: `null * x` (left operand `null`) discards the right operand
+/// entirely -- it must stay `null`, not "preserve" the right operand's
+/// spelling, since nothing is relocated here (unlike the `x *= null` arm
+/// above).
+#[test]
+fn test_1167_null_times_number_literal_stays_null() -> Result<()> {
+    let (output, code) = run_yq_stdin("null * 1e10", "null", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "null");
+
+    Ok(())
+}
+
+/// Control: a genuinely *computed* product must still get canonical
+/// formatting -- #1167's fix only defers `into_plain_number()` for the
+/// relocation/discard arms, not for the arm that actually multiplies.
+#[test]
+fn test_1167_genuine_multiplication_still_reformats() -> Result<()> {
+    let (output, code) = run_yq_stdin("3.00 * 2", "null", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "6.0");
+
+    Ok(())
+}
+
+/// Regression guards: object/array merge and string repetition are
+/// unaffected by #1167's reordering.
+#[test]
+fn test_1167_object_array_merge_and_string_repeat_unchanged() -> Result<()> {
+    let (output, code) = run_yq_stdin(
+        r#"{"a":{"x":1}} * {"a":{"y":2}}"#,
+        "null",
+        &["-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#"{"a":{"x":1,"y":2}}"#);
+
+    let (output, code) = run_yq_stdin("[1,2] * [3,4]", "null", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "[3,4]");
+
+    let (output, code) = run_yq_stdin(r#""ab" * 3"#, "null", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#""ababab""#);
+
+    let (output, code) = run_yq_stdin("null * {\"a\":1}", "null", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#"{"a":1}"#);
+
+    Ok(())
+}
+
 // --- #1116: chained scalar-slice-assignment no-ops too; del() differs ---
 //
 // #1101 covered only a *bare* scalar-slice path (`.[S:E]`). #1116 extends
