@@ -755,7 +755,12 @@ impl OwnedValue {
     /// entirely: no adversarial document is involved, only enough loop
     /// iterations to grow the accumulator past the limit.
     pub fn to_json(&self) -> String {
-        self.to_json_at_depth(0, format_number_jq_compat, jq_bare_float_display)
+        self.to_json_at_depth(
+            0,
+            format_number_jq_compat,
+            jq_bare_float_display,
+            jq_infinite_float_json_text,
+        )
     }
 
     /// The yq-mode sibling of [`to_json`](Self::to_json) (#1030): identical
@@ -782,6 +787,7 @@ impl OwnedValue {
             0,
             crate::jq::stream::real_output_finite_literal,
             crate::yaml::format_float_with_fraction,
+            yq_infinite_float_json_text,
         )
     }
 
@@ -793,11 +799,23 @@ impl OwnedValue {
     /// [`stream::stream_owned_value_json_with`](crate::jq::stream) already
     /// threads through for the M2 streaming path (#1008), so this doesn't
     /// grow a third hand-copied jq/yq-formatting branch.
+    ///
+    /// `infinite_fmt` is the analogous fork for a computed (non-`NaN`)
+    /// Infinity (#1087): jq mode renders `DBL_MAX` text
+    /// ([`infinite_float_preview_text`]), matching real jq's own `1.7976...e+308`
+    /// rather than substituting `null` (RFC 8259 forbids the literal
+    /// `Infinity`, but a finite-magnitude stand-in is representable). `NaN`
+    /// has no such stand-in and stays `null` unconditionally in both modes.
+    /// yq mode's own correct behavior is still an open design question (real
+    /// yq's Go `encoding/json` refuses to marshal Infinity at all and
+    /// errors) -- `to_json_yq` keeps the pre-existing `null` substitution
+    /// rather than guessing at that answer here.
     fn to_json_at_depth(
         &self,
         depth: usize,
         finite_literal: fn(&[u8]) -> String,
         float_fmt: fn(f64) -> String,
+        infinite_fmt: fn(bool) -> String,
     ) -> String {
         assert_value_tree_depth(depth);
         match self {
@@ -806,21 +824,43 @@ impl OwnedValue {
             Self::Bool(false) => "false".into(),
             Self::Int(n) => format!("{n}"),
             Self::Float(f) => {
-                if f.is_nan() || f.is_infinite() {
-                    "null".into() // JSON doesn't support NaN or Infinity
+                if f.is_nan() {
+                    "null".into() // JSON doesn't support NaN
+                } else if f.is_infinite() {
+                    infinite_fmt(f.is_sign_negative())
                 } else {
                     float_fmt(*f)
                 }
             }
-            Self::NumberLiteral(NumberRepr::Float(f), _) if f.is_nan() || f.is_infinite() => {
-                "null".into() // JSON doesn't support NaN or Infinity
+            Self::NumberLiteral(NumberRepr::Float(f), _) if f.is_nan() => "null".into(),
+            // The reindex-bridge's self-overflowing sentinel (#1087, see
+            // `is_overflow_literal_sentinel`'s own doc comment): a computed
+            // Infinity that passed through `to_json_for_reindex` and got
+            // reparsed is structurally a `NumberLiteral` now, but it stood
+            // in for a value with no real source text, so it needs
+            // `infinite_fmt`'s `DBL_MAX` text (what a bare computed `Float`
+            // above gets), not a mantissa-preserving echo of "1e999" itself.
+            Self::NumberLiteral(NumberRepr::Float(f), literal)
+                if is_overflow_literal_sentinel(literal) =>
+            {
+                infinite_fmt(f.is_sign_negative())
             }
+            // Any other infinite `NumberLiteral` is a genuine document
+            // literal, which still has its own source text to fall back
+            // to -- `1e400 | .` (identity, no computation) echoes jq's
+            // mantissa-preserving `1E+400`, not `DBL_MAX` text, confirmed
+            // live against jq 1.7.1 (#1087). `finite_literal` already
+            // handles this correctly in both modes despite its name: jq's
+            // `format_number_jq_compat` special-cases a non-finite input via
+            // `format_overflow_literal_mantissa` rather than assuming
+            // finiteness, and yq's `real_output_finite_literal` echoes raw
+            // text verbatim regardless of the parsed value.
             Self::NumberLiteral(_, literal) => finite_literal(literal.as_bytes()),
             Self::String(s) => format!("\"{}\"", escape_json_body(write_json_body_jq, s)),
             Self::Array(arr) => {
                 let elements: Vec<String> = arr
                     .iter()
-                    .map(|v| v.to_json_at_depth(depth + 1, finite_literal, float_fmt))
+                    .map(|v| v.to_json_at_depth(depth + 1, finite_literal, float_fmt, infinite_fmt))
                     .collect();
                 format!("[{}]", elements.join(","))
             }
@@ -831,7 +871,7 @@ impl OwnedValue {
                         format!(
                             "\"{}\":{}",
                             escape_json_body(write_json_body_jq, k),
-                            v.to_json_at_depth(depth + 1, finite_literal, float_fmt)
+                            v.to_json_at_depth(depth + 1, finite_literal, float_fmt, infinite_fmt)
                         )
                     })
                     .collect();
@@ -961,12 +1001,22 @@ impl OwnedValue {
             // magnitude (#953); jq keeps the original bare `Display` (see
             // this function's own doc comment for why the fork is required,
             // not optional).
+            // `infinite_fmt` is unreachable from here either way -- every
+            // NaN/infinite case is already handled by the arms above, before
+            // this fallback -- so which one is passed only matters for
+            // reading, not behavior; picked per-mode for consistency.
             other if S::TAG == EvalTag::Yq => other.to_json_at_depth(
                 depth,
                 format_number_jq_compat,
                 crate::yaml::format_float_with_fraction,
+                yq_infinite_float_json_text,
             ),
-            other => other.to_json_at_depth(depth, format_number_jq_compat, jq_bare_float_display),
+            other => other.to_json_at_depth(
+                depth,
+                format_number_jq_compat,
+                jq_bare_float_display,
+                jq_infinite_float_json_text,
+            ),
         }
     }
 }
@@ -981,6 +1031,24 @@ fn overflow_literal(f: f64) -> &'static str {
     } else {
         "1e999"
     }
+}
+
+/// True if `literal` is exactly one of [`overflow_literal`]'s two spellings
+/// (#1087). Unlike [`NAN_SENTINEL`], which is syntactically invalid JSON
+/// (two exponent markers) and so gets intercepted during reparse before it
+/// can ever become a `NumberLiteral` at all (`from_number_bytes`'s
+/// `is_nan_sentinel` check), `"1e999"`/`"-1e999"` are deliberately *valid*
+/// JSON number syntax -- the whole point is that they reparse cleanly to
+/// the right-signed infinity -- so a reindexed computed Infinity does
+/// become a genuine `NumberLiteral(Float(inf), "1e999")`, structurally
+/// identical to a document literal that happened to be spelled the same
+/// way. `to_json_at_depth` needs to tell them apart: the sentinel should
+/// render as a computed value's `DBL_MAX` text (what it actually stood in
+/// for), not get `format_number_jq_compat`'s mantissa-preserving echo (the
+/// correct treatment for a genuine, if coincidentally-identical, document
+/// literal).
+fn is_overflow_literal_sentinel(literal: &str) -> bool {
+    literal == overflow_literal(f64::INFINITY) || literal == overflow_literal(f64::NEG_INFINITY)
 }
 
 /// The exact text real jq's error-message value previews use for an
@@ -1003,6 +1071,26 @@ pub(crate) fn infinite_float_preview_text(negative: bool) -> &'static str {
     } else {
         "1.7976931348623157e+308"
     }
+}
+
+/// `to_json`'s `infinite_fmt` for jq mode (#1087): a computed Infinity
+/// serializes as [`infinite_float_preview_text`]'s `DBL_MAX` text, matching
+/// real jq (`echo null | jq -c infinite` is `1.7976931348623157e+308`, not
+/// `null`) -- `to_json_at_depth` already substitutes `null` for `NaN`
+/// unconditionally, so this fn only ever runs for the non-`NaN` infinite
+/// case.
+fn jq_infinite_float_json_text(negative: bool) -> String {
+    infinite_float_preview_text(negative).to_string()
+}
+
+/// `to_json_yq`'s `infinite_fmt` for yq mode (#1087): keeps the
+/// pre-existing `null` substitution. Real yq's own Go `encoding/json`
+/// refuses to marshal Infinity at all and errors instead, so replicating
+/// jq's `DBL_MAX`-text behavior here would not actually match either
+/// oracle -- an open design question this fn deliberately doesn't resolve,
+/// see #1087's own text.
+fn yq_infinite_float_json_text(_negative: bool) -> String {
+    "null".into()
 }
 
 /// The reserved JSON number literal [`OwnedValue::to_json_for_reindex`]
@@ -1778,16 +1866,38 @@ mod tests {
     }
 
     #[test]
-    fn test_number_literal_to_json_overflow_to_infinity_is_null() {
+    fn test_number_literal_to_json_overflow_to_infinity_echoes_mantissa_1087() {
         // "1e400" overflows f64 to infinity during parsing even though the
         // source text is a normal-looking (if extreme) JSON number token.
-        // JSON has no Infinity, so, like plain Float, this renders as null.
+        // Unlike a bare computed `Float` (which has no source text and
+        // renders `DBL_MAX` text), a `NumberLiteral` still has one to fall
+        // back to -- confirmed live against jq 1.7.1, `1e400 | .` (identity)
+        // echoes `1E+400`, not `null` (#1087; this test's own name/premise
+        // predates that finding).
         let lit = OwnedValue::from_number_literal("1e400");
         assert!(matches!(
             lit,
             OwnedValue::NumberLiteral(NumberRepr::Float(f), _) if f.is_infinite()
         ));
-        assert_eq!(lit.to_json(), "null");
+        assert_eq!(lit.to_json(), "1E+400");
+    }
+
+    #[test]
+    fn test_computed_float_to_json_infinity_is_dbl_max_text_1087() {
+        // A genuinely *computed* Infinity (no source literal to echo, e.g.
+        // the `infinite` builtin or an arithmetic overflow) renders jq's own
+        // `DBL_MAX` text instead -- confirmed live against jq 1.7.1, `null |
+        // infinite` is `1.7976931348623157e+308`.
+        assert_eq!(
+            OwnedValue::Float(f64::INFINITY).to_json(),
+            "1.7976931348623157e+308"
+        );
+        assert_eq!(
+            OwnedValue::Float(f64::NEG_INFINITY).to_json(),
+            "-1.7976931348623157e+308"
+        );
+        // NaN still has no fallback text in either case and stays `null`.
+        assert_eq!(OwnedValue::Float(f64::NAN).to_json(), "null");
     }
 
     #[test]

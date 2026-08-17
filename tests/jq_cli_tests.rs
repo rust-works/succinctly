@@ -3969,16 +3969,26 @@ fn test_number_literal_overflow_text_formats_via_cli() -> Result<()> {
 /// `format_number_jq_compat`), and had the same overflow-renders-as-garbage
 /// bug (#561): unlike JSON output's established "NaN/Infinity -> null"
 /// convention (`OwnedValue::to_json`), it printed
-/// `"NaNE+2147483647"` for `1e400 | .` instead of `null`.
+/// `"NaNE+2147483647"` for `1e400 | .` instead of `null`. #561's "null"
+/// fallback was itself superseded by #1087: `format_number_jq_compat`
+/// already reformats a non-finite input's mantissa correctly
+/// (`format_overflow_literal_mantissa`, added by #930, after #561 landed),
+/// so a *literal* overflow now echoes it (`1E+400`) rather than "null" --
+/// confirmed live against jq 1.7.1, `1e400 | .` (identity, no computation)
+/// echoes `1E+400` too. "null" remains correct only for a genuinely
+/// *computed* Infinity with no source text of its own (see
+/// `test_jq_infinite_direct_json_output_matches_real_jq_1087`, where it's
+/// `DBL_MAX` text instead), and for NaN in both cases (no fallback text
+/// exists for NaN in real jq either).
 #[test]
-fn test_number_literal_overflow_identity_prints_null_via_cli() -> Result<()> {
+fn test_number_literal_overflow_identity_echoes_mantissa_via_cli_1087() -> Result<()> {
     let (output, code) = run_jq_stdin(".", "1e400", &["-c"])?;
     assert_eq!(code, 0);
-    assert_eq!(output.trim(), "null");
+    assert_eq!(output.trim(), "1E+400");
 
     let (output, code) = run_jq_stdin(".", "-1e400", &["-c"])?;
     assert_eq!(code, 0);
-    assert_eq!(output.trim(), "null");
+    assert_eq!(output.trim(), "-1E+400");
 
     Ok(())
 }
@@ -10793,6 +10803,38 @@ fn test_jq_tostring_special_floats_unaffected_by_yq_mode_fix_1060() -> Result<()
         let (out, code) = run_jq_stdin(filter, "null", &["-c"])?;
         assert_eq!(code, 0, "for {filter:?}: {out:?}");
         assert_eq!(out.trim(), want, "for {filter:?}");
+    }
+    Ok(())
+}
+
+/// #1087: a computed Infinity's direct `-c`/pretty JSON output (not just
+/// `tostring`'s *text*-format path, already correct since #1075) was
+/// `null` regardless of sign -- `JqCompatFormatter` (the default) and
+/// `PreserveFormatter` (`--preserve-input`) in `jq_runner.rs` both
+/// hand-rolled the same `is_nan() || is_infinite() => "null"` collapse.
+/// Confirmed live against jq 1.7.1: `null | infinite` is
+/// `1.7976931348623157e+308`, not `null`; only NaN has no such
+/// fallback text. Covers both formatters, since #1087 found the identical
+/// bug independently duplicated in each.
+#[test]
+fn test_jq_infinite_direct_json_output_matches_real_jq_1087() -> Result<()> {
+    for extra_args in [vec!["-c"], vec!["-c", "--preserve-input"]] {
+        for (filter, want) in [
+            ("infinite", "1.7976931348623157e+308"),
+            ("(-1) * infinite", "-1.7976931348623157e+308"),
+            ("[infinite]", "[1.7976931348623157e+308]"),
+            (r#"{"a":infinite}"#, r#"{"a":1.7976931348623157e+308}"#),
+            (
+                "[1, infinite] | join(\",\")",
+                "\"1,1.7976931348623157e+308\"",
+            ),
+            ("nan", "null"),
+            ("[nan]", "[null]"),
+        ] {
+            let (out, code) = run_jq_stdin(filter, "null", &extra_args)?;
+            assert_eq!(code, 0, "for {filter:?} {extra_args:?}: {out:?}");
+            assert_eq!(out.trim(), want, "for {filter:?} {extra_args:?}");
+        }
     }
     Ok(())
 }
