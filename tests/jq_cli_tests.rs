@@ -10214,6 +10214,18 @@ fn test_object_pattern_var_shorthand_bare_1139() -> Result<()> {
     Ok(())
 }
 
+/// A quoted string key (needed for a key that isn't a valid bare
+/// identifier, e.g. one containing a space) still works in the non-
+/// shorthand branch, unaffected by threading it through the new
+/// `(key, pattern)`-tuple restructuring.
+#[test]
+fn test_object_pattern_string_literal_key_unaffected_1139() -> Result<()> {
+    let (stdout, _, code) = run_jq_full(&["-c", r#". as {"a b": $x} | $x"#], Some(r#"{"a b":5}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "5");
+    Ok(())
+}
+
 /// Mixed with an ordinary explicit `key: $var` entry in the same pattern.
 #[test]
 fn test_object_pattern_var_shorthand_mixed_with_explicit_1139() -> Result<()> {
