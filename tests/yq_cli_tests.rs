@@ -9427,14 +9427,8 @@ fn test_anchor_no_comment_unaffected_784() -> Result<()> {
 // When the anchor's deferred value turns out null, the comment floats past
 // it to the next sibling rather than disappearing (or, at true EOF with no
 // sibling to float to, is dropped - matching real yq exactly there) - the
-// three tests below pin that behavior specifically. Note: succinctly
-// renders a null anchor value's own line as `&anc ""` here, not real yq's
-// bare `&anc` - that's a separate, pre-existing divergence in null-anchor
-// rendering (unrelated to comment placement, reproduces identically with no
-// comment present at all, e.g. plain `a: &anc\n` with EOF immediately after
-// - tracked as a follow-up, not part of #784's scope). Only the *comment's*
-// position (landing on the sibling's own line, or vanishing at EOF) is what
-// these tests pin.
+// three tests below pin that behavior specifically. The anchor's own line
+// renders bare (`&anc`, no value token), matching real yq - see #1077.
 
 /// A sibling key immediately follows at the same indent - the anchor's
 /// deferred value is null, and its comment floats to the sibling.
@@ -9442,7 +9436,7 @@ fn test_anchor_no_comment_unaffected_784() -> Result<()> {
 fn test_anchor_comment_floats_to_sibling_same_indent_784() -> Result<()> {
     let (out, code) = run_yq_stdin(".", "a: &anc # comment\nb: 2\n", &[])?;
     assert_eq!(code, 0);
-    assert_eq!(out, "a: &anc \"\"\nb: 2 # comment\n");
+    assert_eq!(out, "a: &anc\nb: 2 # comment\n");
     Ok(())
 }
 
@@ -9452,7 +9446,7 @@ fn test_anchor_comment_floats_to_sibling_same_indent_784() -> Result<()> {
 fn test_anchor_comment_floats_to_sibling_lower_indent_784() -> Result<()> {
     let (out, code) = run_yq_stdin(".", "x:\n  a: &anc # comment\n  b: 2\n", &[])?;
     assert_eq!(code, 0);
-    assert_eq!(out, "x:\n  a: &anc \"\"\n  b: 2 # comment\n");
+    assert_eq!(out, "x:\n  a: &anc\n  b: 2 # comment\n");
     Ok(())
 }
 
@@ -9465,7 +9459,7 @@ fn test_anchor_comment_floats_to_sibling_lower_indent_784() -> Result<()> {
 fn test_anchor_comment_dropped_at_eof_with_no_sibling_784() -> Result<()> {
     let (out, code) = run_yq_stdin(".", "a: &anc # comment\n", &[])?;
     assert_eq!(code, 0);
-    assert_eq!(out, "a: &anc \"\"\n");
+    assert_eq!(out, "a: &anc\n");
     Ok(())
 }
 
@@ -9589,7 +9583,7 @@ fn test_anchor_floated_comment_does_not_clobber_compact_key_own_comment_784() ->
 fn test_anchor_floated_comment_does_not_corrupt_flow_sequence_784() -> Result<()> {
     let (out, code) = run_yq_stdin(".", "- &anc # comment\n- [1, 2]\n", &[])?;
     assert_eq!(code, 0);
-    assert_eq!(out, "- &anc \"\"\n- [1, 2]\n");
+    assert_eq!(out, "- &anc\n- [1, 2]\n");
     Ok(())
 }
 
@@ -9598,7 +9592,7 @@ fn test_anchor_floated_comment_does_not_corrupt_flow_sequence_784() -> Result<()
 fn test_anchor_floated_comment_does_not_corrupt_flow_mapping_784() -> Result<()> {
     let (out, code) = run_yq_stdin(".", "- &anc # comment\n- {a: 1, b: 2}\n", &[])?;
     assert_eq!(code, 0);
-    assert_eq!(out, "- &anc \"\"\n- {a: 1, b: 2}\n");
+    assert_eq!(out, "- &anc\n- {a: 1, b: 2}\n");
     Ok(())
 }
 

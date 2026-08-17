@@ -1724,21 +1724,39 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                             // yq (#765).
                             write_line_comment(out, Some(kc))?;
                         } else {
-                            out.write_char(' ')?;
-                            if let Some(anchor) = value.anchor() {
-                                out.write_char('&')?;
-                                out.write_str(anchor)?;
+                            // #1077: a deferred value that materializes as
+                            // nothing at all writes no value token here
+                            // (matching the sibling branch above, #765) --
+                            // but unlike that branch, this one can still
+                            // have an anchor to write, so it can't just
+                            // skip straight to the comment. A trailing
+                            // space is only owed to something that actually
+                            // follows it: the colon alone (`a:`, no anchor,
+                            // absent value) takes none at all, matching
+                            // real yq's own bare rendering byte-for-byte.
+                            let absent = is_deferred_value_absent(&value);
+                            let anchor = value.anchor();
+                            if anchor.is_some() || !absent {
                                 out.write_char(' ')?;
                             }
-                            let child_indent = deeper_yaml_indent(indent, indent_spaces, unit);
-                            value.stream_yaml_value(
-                                out,
-                                &child_indent,
-                                indent_spaces,
-                                unit,
-                                sort_keys,
-                                false,
-                            )?;
+                            if let Some(anchor) = anchor {
+                                out.write_char('&')?;
+                                out.write_str(anchor)?;
+                                if !absent {
+                                    out.write_char(' ')?;
+                                }
+                            }
+                            if !absent {
+                                let child_indent = deeper_yaml_indent(indent, indent_spaces, unit);
+                                value.stream_yaml_value(
+                                    out,
+                                    &child_indent,
+                                    indent_spaces,
+                                    unit,
+                                    sort_keys,
+                                    false,
+                                )?;
+                            }
                             // The value's own comment takes priority; fall
                             // back to the key's own comment when the value
                             // has none - covers an explicit key's trailing
@@ -1857,21 +1875,36 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                             }
                             write_line_comment(out, cursor.line_comment_raw())?;
                         } else {
-                            out.write_str("- ")?;
-                            if let Some(anchor) = cursor.anchor() {
-                                out.write_char('&')?;
-                                out.write_str(anchor)?;
+                            // #1077: mirrors the mapping-field branch above
+                            // -- a deferred item that materializes as
+                            // nothing at all writes no value token, and the
+                            // dash takes no trailing space unless something
+                            // (an anchor or a real value) actually follows
+                            // it, matching real yq's bare `-` byte-for-byte.
+                            let absent = is_deferred_value_absent(&cursor);
+                            let anchor = cursor.anchor();
+                            out.write_char('-')?;
+                            if anchor.is_some() || !absent {
                                 out.write_char(' ')?;
                             }
-                            let child_indent = deeper_yaml_indent(indent, indent_spaces, unit);
-                            cursor.stream_yaml_value(
-                                out,
-                                &child_indent,
-                                indent_spaces,
-                                unit,
-                                sort_keys,
-                                false,
-                            )?;
+                            if let Some(anchor) = anchor {
+                                out.write_char('&')?;
+                                out.write_str(anchor)?;
+                                if !absent {
+                                    out.write_char(' ')?;
+                                }
+                            }
+                            if !absent {
+                                let child_indent = deeper_yaml_indent(indent, indent_spaces, unit);
+                                cursor.stream_yaml_value(
+                                    out,
+                                    &child_indent,
+                                    indent_spaces,
+                                    unit,
+                                    sort_keys,
+                                    false,
+                                )?;
+                            }
                             write_line_comment(out, cursor.line_comment_raw())?;
                         }
                         elems = rest;
