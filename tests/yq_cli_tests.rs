@@ -14747,6 +14747,32 @@ fn test_yq_urid_valid_escape_still_decodes_1138() -> Result<()> {
     Ok(())
 }
 
+/// #1138 review self-check: a malformed escape immediately followed by a
+/// multi-byte UTF-8 character (so the raw 2-byte error-message cutoff
+/// would otherwise land mid-character) must widen to include the whole
+/// character rather than corrupt it into a lossy replacement character --
+/// not a byte-for-byte match for real yq's own raw-byte hex-escaping in
+/// this specific case (`\xe4\xb8`), a documented, deliberate divergence
+/// (see `EvalError::urid_invalid_escape`'s doc comment and #1216).
+#[test]
+fn test_yq_urid_malformed_escape_multibyte_boundary_1138() -> Result<()> {
+    let (_out, stderr, code) = run_yq_stdin_with_stderr("@urid", "\"%\u{4e2d}\"", &[])?;
+    assert_ne!(code, 0, "stderr: {stderr:?}");
+    assert!(
+        stderr.contains("invalid URL escape \"%\u{4e2d}\""),
+        "stderr: {stderr:?}"
+    );
+
+    // A 4-byte character (outside the BMP) too, not just 3-byte.
+    let (_out, stderr, code) = run_yq_stdin_with_stderr("@urid", "\"%\u{1f600}\"", &[])?;
+    assert_ne!(code, 0, "stderr: {stderr:?}");
+    assert!(
+        stderr.contains("invalid URL escape \"%\u{1f600}\""),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
 // ============================================================================
 // @base64d error message wording (#1146)
 // ============================================================================
