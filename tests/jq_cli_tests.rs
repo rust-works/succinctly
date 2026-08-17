@@ -579,6 +579,117 @@ fn test_argjson_preserves_number_literal_fidelity_1058() -> Result<()> {
     Ok(())
 }
 
+// =============================================================================
+// #1094: `--argjson` tolerates a leading-zero number the way real jq's own
+// number parser does, instead of rejecting it outright via strict RFC 8259
+// validation. All cases live-verified against jq 1.7.1.
+// =============================================================================
+
+/// The issue's own repro: a leading-zero integer/float, accepted and
+/// normalized exactly like real jq.
+#[test]
+fn test_argjson_tolerates_leading_zero_number_1094() -> Result<()> {
+    let (stdout, _, code) = run_jq_full(&["-n", "--argjson", "n", "007", "$n"], None)?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "7");
+
+    let (stdout, _, code) = run_jq_full(&["-n", "--argjson", "n", "00", "$n"], None)?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "0");
+
+    let (stdout, _, code) = run_jq_full(&["-n", "--argjson", "n", "007.5", "$n"], None)?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "7.5");
+    Ok(())
+}
+
+/// A leading-zero number combined with a *trailing* zero (`007.500`) is
+/// accepted (not rejected outright, this issue's own scope), but loses the
+/// trailing zero's spelling (`7.5`, not real jq's `7.500`) -- a pre-existing
+/// gap in this crate's own `NumberLiteral`-preservation fast path for any
+/// leading-zero literal, reproducing identically via plain document input
+/// (`echo '007.500' | succinctly jq '.'`), unrelated to `--argjson` and out
+/// of this fix's scope. Tracked as #1149 (filed for the sibling
+/// scientific-notation case; same root cause, broader than its title
+/// suggests). This test pins current, non-regressed behavior, not the
+/// (still wrong) spelling.
+#[test]
+fn test_argjson_leading_zero_accepted_but_trailing_zero_spelling_lost_1094() -> Result<()> {
+    let (stdout, _, code) = run_jq_full(&["-n", "--argjson", "n", "007.500", "$n"], None)?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "7.5");
+    Ok(())
+}
+
+/// Trailing garbage after a leading-zero number is still rejected --
+/// leading-zero tolerance must not accidentally widen the #284 guard it
+/// sits next to.
+#[test]
+fn test_argjson_leading_zero_still_rejects_trailing_garbage_1094() -> Result<()> {
+    let (_, _, code) = run_jq_full(&["-n", "--argjson", "n", "007 garbage", "$n"], None)?;
+    assert_ne!(code, 0);
+    Ok(())
+}
+
+/// Plain trailing garbage (no leading zero involved at all) is still
+/// rejected -- confirms the fast, common-case path (no normalization
+/// needed) is unaffected by this fix.
+#[test]
+fn test_argjson_plain_trailing_garbage_still_rejected_1094() -> Result<()> {
+    let (_, _, code) = run_jq_full(&["-n", "--argjson", "n", "42 garbage", "$n"], None)?;
+    assert_ne!(code, 0);
+    Ok(())
+}
+
+/// A leading-zero number nested inside an array or object is tolerated
+/// too, not just a bare top-level scalar.
+#[test]
+fn test_argjson_leading_zero_tolerated_when_nested_1094() -> Result<()> {
+    let (stdout, _, code) = run_jq_full(&["-cn", "--argjson", "n", "[007, 1]", "$n"], None)?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "[7,1]");
+
+    let (stdout, _, code) = run_jq_full(&["-cn", "--argjson", "n", r#"{"a": 007}"#, "$n"], None)?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), r#"{"a":7}"#);
+    Ok(())
+}
+
+/// Digits that merely *look* like a leading-zero number, but are actually
+/// inside a string (a value or an object key), are left completely
+/// untouched by the normalization pass.
+#[test]
+fn test_argjson_leading_zero_inside_string_or_key_untouched_1094() -> Result<()> {
+    let (stdout, _, code) = run_jq_full(&["-n", "--argjson", "n", r#""007""#, "$n"], None)?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), r#""007""#);
+
+    let (stdout, _, code) = run_jq_full(&["-cn", "--argjson", "n", r#"{"007": 1}"#, "$n"], None)?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), r#"{"007":1}"#);
+    Ok(())
+}
+
+/// A normal number with no leading zero is completely unaffected --
+/// confirms the fast path (strict validation succeeds on the first try,
+/// no normalization attempted) isn't disturbed by this fix.
+#[test]
+fn test_argjson_normal_number_unaffected_1094() -> Result<()> {
+    let (stdout, _, code) = run_jq_full(&["-n", "--argjson", "n", "42", "$n"], None)?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "42");
+    Ok(())
+}
+
+/// Genuinely malformed JSON (not just a leading zero) is still rejected --
+/// normalization doesn't accidentally make garbage input parse.
+#[test]
+fn test_argjson_malformed_json_still_rejected_1094() -> Result<()> {
+    let (_, _, code) = run_jq_full(&["-n", "--argjson", "n", "not json", "$n"], None)?;
+    assert_ne!(code, 0);
+    Ok(())
+}
+
 #[test]
 fn test_multiple_variables() -> Result<()> {
     let (output, code) = run_jq_null("$a + $b", &["--argjson", "a", "10", "--argjson", "b", "20"])?;
