@@ -913,6 +913,42 @@ fn test_duplicate_mapping_key_to_entries_json_compact() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn test_duplicate_mapping_key_paths_preserves_both_868() -> Result<()> {
+    // Same #443 pattern as `to_entries` above, applied to bare `paths`
+    // (#868): `collect_paths_cursor` walks the field cons-list directly
+    // instead of requiring a `to_owned()`'d `OwnedValue` first, so a
+    // duplicate key's second occurrence gets its own path instead of being
+    // silently merged away.
+    let yaml = "a: 1\na: 2\nb: 3\n";
+    let (output, code) = run_yq_stdin("paths", yaml, &["-o=json", "-I=0"])?;
+
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "[\"a\"]\n[\"a\"]\n[\"b\"]");
+    Ok(())
+}
+
+#[test]
+fn test_duplicate_mapping_key_array_wrapped_paths_still_collapses_868_known_gap() -> Result<()> {
+    // Characterization test, not a regression: `[paths]` -- the exact form
+    // issue #868's own repro used -- still collapses the duplicate, because
+    // `Expr::Array` has no cursor-native arm in `eval_generic.rs::eval_single`
+    // at all (unlike `Builtin::Paths` itself, which #868 fixed). Wrapping
+    // *anything* in `[...]` re-materializes the whole document via
+    // `to_owned()` before evaluating the inner expression, discarding
+    // whatever cursor-native fix that inner expression has -- confirmed this
+    // isn't `paths`-specific: `[to_entries]` has the identical gap despite
+    // `to_entries`'s own already-shipped #443 fix. Filed as #1168; pinning
+    // the current (still-buggy) behavior here so a future fix for #1168
+    // has a test to flip, and so this doesn't silently regress further.
+    let yaml = "a: 1\na: 2\nb: 3\n";
+    let (output, code) = run_yq_stdin("[paths]", yaml, &["-o=json", "-I=0"])?;
+
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#"[["a"],["b"]]"#);
+    Ok(())
+}
+
 /// #478: `--slurp '.'` shares the same `IndexMap`-backed conversion
 /// (`yaml_to_owned_value`) #442 didn't touch, so it kept collapsing
 /// duplicate keys within each slurped element even after plain `yq '.'`

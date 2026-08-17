@@ -3227,6 +3227,46 @@ fn slice_one_generic<S: EvalSemantics, V: DocumentValue>(
     }
 }
 
+/// Cursor-aware counterpart to `eval.rs`'s `collect_paths` (#868): walks
+/// `value` directly via `DocumentFields`/`DocumentElements::uncons()`
+/// instead of requiring a `to_owned()`'d `OwnedValue` first, so duplicate
+/// YAML mapping keys are never collapsed by `OwnedValue::Object`'s
+/// `IndexMap` before path collection runs — the same #443 pattern
+/// `Builtin::ToEntries` above already established for this file. `uncons()`
+/// walks a cons-list (or, for YAML's merge-resolved mappings, an `Rc`-shared
+/// entry list), never a shared map, so no key is ever put somewhere a
+/// duplicate could overwrite it.
+fn collect_paths_cursor<V: DocumentValue>(
+    value: &V,
+    current_path: &mut Vec<OwnedValue>,
+    paths: &mut Vec<OwnedValue>,
+) {
+    assert_nesting_depth(current_path.len());
+    if let Some(fields) = value.as_object() {
+        let mut f = fields;
+        while let Some((field, rest)) = f.uncons() {
+            if let Some(key) = field.key_str() {
+                current_path.push(OwnedValue::String(key.into_owned()));
+                paths.push(OwnedValue::Array(current_path.clone()));
+                collect_paths_cursor(&field.value, current_path, paths);
+                current_path.pop();
+            }
+            f = rest;
+        }
+    } else if let Some(elements) = value.as_array() {
+        let mut i: i64 = 0;
+        let mut e = elements;
+        while let Some((elem, rest)) = e.uncons() {
+            current_path.push(OwnedValue::Int(i));
+            paths.push(OwnedValue::Array(current_path.clone()));
+            collect_paths_cursor(&elem, current_path, paths);
+            current_path.pop();
+            i += 1;
+            e = rest;
+        }
+    }
+}
+
 /// Evaluate a builtin function.
 fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
     builtin: &Builtin,
@@ -3615,6 +3655,44 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                     &value, cursor,
                 )))
             }
+        }
+
+        // Handled natively rather than through the `_` fallback below, for
+        // the same reason as `Builtin::ToEntries` just above: the fallback
+        // materializes the whole value via `to_owned()` first, which merges
+        // duplicate YAML mapping keys into one `IndexMap` entry before
+        // `collect_paths` ever runs, so a duplicate key's second path is
+        // silently lost (#868). `collect_paths_cursor` walks `as_object()`/
+        // `as_array()` directly instead, mirroring `eval.rs`'s own
+        // `collect_paths` shape but off `uncons()` rather than an
+        // already-materialized `IndexMap`/`Vec`.
+        //
+        // Doesn't cover `Builtin::PathsFilter`/`LeafPaths`/`Recurse*`/
+        // `Walk` -- those share the same wildcard fallback and likely the
+        // same bug, but fixing them needs fusing path-collection with
+        // per-node filter evaluation into one walk, which is real,
+        // separate work (#868 itself only scoped plain `paths`).
+        //
+        // Also doesn't help `[paths]` -- the array-constructor form #868's
+        // own issue text used as its repro. `Expr::Array` (like `Comma`)
+        // has no native arm in `eval_single` at all, so wrapping *any*
+        // expression in `[...]` re-materializes the whole document from
+        // scratch via the `_` fallback below and hands it to `eval.rs`'s
+        // full evaluator, discarding this arm's fix entirely -- confirmed
+        // this isn't specific to `paths`: `to_entries` has its own,
+        // already-shipped cursor-native fix (#443) and exhibits the
+        // identical silent regression once wrapped (`[to_entries]` still
+        // collapses duplicates even though bare `to_entries` doesn't).
+        // That's a separate, broader architectural gap, filed as #1168.
+        Builtin::Paths => {
+            let mut paths = Vec::new();
+            collect_paths_cursor(&value, &mut Vec::new(), &mut paths);
+            collapse_vec(
+                paths,
+                || GenericResult::None,
+                GenericResult::Owned,
+                GenericResult::ManyOwned,
+            )
         }
 
         // The `is*` family reads through `tagged_type_name` rather than
