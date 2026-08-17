@@ -752,9 +752,15 @@ impl<'a> Parser<'a> {
             Expr::Literal(Literal::String(s)) => Some(Expr::Field(s.clone())),
             Expr::Literal(Literal::Int(i)) => Some(Expr::Index(*i)),
             // `.[1.0]` is an integer index; `.[1.7]` is not, and must go through
-            // the evaluator to truncate the way jq does.
+            // the evaluator to truncate the way jq does. The upper bound is a
+            // strict `<`, not `<=`: `i64::MAX as f64` rounds *up* to `2^63`
+            // (`i64::MAX` isn't exactly representable as `f64`), so a `<=`
+            // check let `.[2^63]` through and `as i64` silently saturated it
+            // to `i64::MAX` -- one past what was actually written (#1061).
+            // `i64::MIN as f64` has no such rounding (`-2^63` is an exact
+            // power of two), so the lower bound stays `>=`.
             Expr::Literal(Literal::Float(f))
-                if f.fract() == 0.0 && *f >= i64::MIN as f64 && *f <= i64::MAX as f64 =>
+                if f.fract() == 0.0 && *f >= i64::MIN as f64 && *f < i64::MAX as f64 =>
             {
                 Some(Expr::Index(*f as i64))
             }
@@ -766,7 +772,7 @@ impl<'a> Parser<'a> {
             Expr::Literal(Literal::NumberLiteral(text)) => match parse_i64_or_f64(text)? {
                 NumberRepr::Int(i) => Some(Expr::Index(i)),
                 NumberRepr::Float(f)
-                    if f.fract() == 0.0 && f >= i64::MIN as f64 && f <= i64::MAX as f64 =>
+                    if f.fract() == 0.0 && f >= i64::MIN as f64 && f < i64::MAX as f64 =>
                 {
                     Some(Expr::Index(f as i64))
                 }
@@ -777,17 +783,29 @@ impl<'a> Parser<'a> {
             // (see `parse_primary_inner`'s negative-literal split), not a
             // bare `Literal` -- see through that specific shape too, or
             // every such key silently loses this fast path and downgrades
-            // to a runtime `IndexExpr`/`DynamicSlice`. The inner literal's
-            // own fold is always non-negative (the sign was already
-            // stripped when this shape was built), so negating its folded
-            // index can never overflow i64.
+            // to a runtime `IndexExpr`/`DynamicSlice`.
+            //
+            // #1061: negating `fold_index_key(right)`'s own result can
+            // overflow `i64` -- not just for the float/exponent spelling of
+            // `i64::MIN`'s magnitude (`2^63`, one past `i64::MAX`, so it
+            // reaches here rather than folding directly), but for *any*
+            // producer of `Expr::Index(i64::MIN)`, including a bare
+            // `Literal::Int(i64::MIN)` on `right` (reachable from ordinary
+            // jq source: `left` need not come from the negative-literal
+            // split at all, just any `-1 * <literal>` spelling, and a
+            // leading-zero integer like `-01` parses to `Literal::Int(-1)`
+            // directly rather than jq's number grammar rejecting it).
+            // `checked_neg` covers every such producer uniformly: it falls
+            // through to `None` (a runtime `IndexExpr`, which computes the
+            // same value correctly via ordinary float arithmetic) instead
+            // of panicking in a debug build or silently wrapping in release.
             Expr::Arithmetic {
                 op: ArithOp::Mul(_),
                 left,
                 right,
             } if matches!(**left, Expr::Literal(Literal::Int(-1))) => {
                 match Self::fold_index_key(right)? {
-                    Expr::Index(i) => Some(Expr::Index(-i)),
+                    Expr::Index(i) => i.checked_neg().map(Expr::Index),
                     _ => None,
                 }
             }
@@ -5506,6 +5524,109 @@ mod tests {
         // positive case, it must go through the evaluator to truncate the
         // way jq does.
         assert!(matches!(parse(".[-1.5]").unwrap(), Expr::IndexExpr { .. }));
+    }
+
+    /// #1061: `i64::MAX as f64` rounds *up* to `2^63` (`i64::MAX` itself isn't
+    /// exactly representable as `f64`), so a `<=` bound let `.[2^63]` fold to
+    /// `Expr::Index(i64::MAX)` -- silently one lower than what was written,
+    /// with no error or truncation notice. The fix must reject the whole
+    /// `[2^63, +inf)` range (both the nearest-representable spellings, since
+    /// `9223372036854775807.0` and `9223372036854775808.0` round to the same
+    /// `f64`) while still folding every value strictly below it, through both
+    /// the plain-float and the source-text-preserving `NumberLiteral` arms.
+    #[test]
+    fn test_1061_i64_max_boundary_no_longer_off_by_one() {
+        assert!(matches!(
+            parse(".[9223372036854775808.0]").unwrap(),
+            Expr::IndexExpr { .. }
+        ));
+        // Same `f64` bit pattern as the value above (`i64::MAX` rounds up to
+        // `2^63`), so it must be rejected too, not just the round-numbered
+        // spelling.
+        assert!(matches!(
+            parse(".[9223372036854775807.0]").unwrap(),
+            Expr::IndexExpr { .. }
+        ));
+        // Exponent-notation spelling goes through the `NumberLiteral` arm,
+        // not the plain-`Float` arm -- both need the same fix.
+        assert!(matches!(
+            parse(".[9223372036854775808e0]").unwrap(),
+            Expr::IndexExpr { .. }
+        ));
+
+        // A value strictly below the boundary still takes the fast path.
+        assert_eq!(
+            parse(".[9223372036854774784.0]").unwrap(),
+            Expr::Index(9223372036854774784)
+        );
+        assert_eq!(
+            parse(".[9223372036854774784e0]").unwrap(),
+            Expr::Index(9223372036854774784)
+        );
+    }
+
+    /// #1061 (review follow-up): negating `fold_index_key(right)`'s result in
+    /// the `-1 * <literal>` desugar arm has no `i64::MIN` guard on its own --
+    /// `i64::MIN`'s magnitude (`2^63`) is one larger than `i64::MAX`'s, so
+    /// `-i64::MIN` overflows `i64`. That's reachable two ways: the intended
+    /// negative-float-literal spelling (`.[-9223372036854775808.0]`, whose
+    /// magnitude is a `NumberLiteral` that parses to exactly `i64::MAX as
+    /// f64`), and separately, unrelated to any float spelling at all, a bare
+    /// `Literal::Int(i64::MIN)` reaching this arm as `right` (ordinary jq
+    /// multiplication with a `Literal::Int(-1)` on the left -- reachable from
+    /// real source via a leading-zero integer like `-01`, since that spelling
+    /// fails JSON's number grammar and falls back to a bare `Literal::Int`
+    /// rather than the source-text-preserving `NumberLiteral`). Both must
+    /// fall through to a runtime `IndexExpr` instead of folding to a wrong
+    /// value (previously a silent two's-complement wrap in release builds,
+    /// or a debug-build panic).
+    #[test]
+    fn test_1061_negating_i64_min_does_not_overflow() {
+        assert!(matches!(
+            parse(".[-9223372036854775808.0]").unwrap(),
+            Expr::IndexExpr { .. }
+        ));
+        assert!(matches!(
+            parse(".[-9223372036854775808e0]").unwrap(),
+            Expr::IndexExpr { .. }
+        ));
+        // The `right` operand need not come from the negative-literal split
+        // at all -- any `-1 * <literal>` shape matches the same arm.
+        assert!(matches!(
+            parse(".[-01 * -9223372036854775808]").unwrap(),
+            Expr::IndexExpr { .. }
+        ));
+
+        // Every other magnitude on this path still negates correctly --
+        // one `f64` ULP below the boundary above, so distinct from it
+        // (`9223372036854775807.0` isn't usable here: it rounds to the same
+        // `f64` as `2^63` and collapses onto the boundary case rather than
+        // testing a separate value). `test_1035_...` above already covers
+        // the ordinary case through the intended desugar path (`.[-1.0]`
+        // etc.), so this only needs the one large-but-safe magnitude.
+        assert_eq!(
+            parse(".[-9223372036854774784.0]").unwrap(),
+            Expr::Index(-9223372036854774784)
+        );
+    }
+
+    /// #1061: `finish_slice`'s bounds fold through `fold_int_literal`, which
+    /// itself delegates to `fold_index_key` -- so a slice bound at either
+    /// boundary must inherit the same fix as a bare index, not just be
+    /// exercised at the index call site.
+    #[test]
+    fn test_1061_boundary_fix_applies_to_slice_bounds_too() {
+        // A slice's upper bound at `2^63` can't fold, same as an index.
+        assert!(matches!(
+            parse(".[1:9223372036854775808.0]").unwrap(),
+            Expr::SliceExpr { .. }
+        ));
+        // A slice's lower bound at `i64::MIN`'s magnitude no longer
+        // overflows on negation, same as an index.
+        assert!(matches!(
+            parse(".[-9223372036854775808.0:]").unwrap(),
+            Expr::SliceExpr { .. }
+        ));
     }
 
     /// The nesting shape is what encodes jq's key scoping: every key in a
