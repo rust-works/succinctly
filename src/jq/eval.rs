@@ -5731,8 +5731,11 @@ fn format_sh<S: EvalSemantics>(value: &OwnedValue, _optional: bool) -> Result<St
                 Ok(format!("'{s}'"))
             }
         }
-        // jq: [1, 2, 3] | @sh => "1 2 3"
-        OwnedValue::Array(arr) => {
+        // jq: [1, 2, 3] | @sh => "1 2 3" -- but real yq (confirmed live
+        // against v4.53.3) errors on *any* array input to `@sh`, regardless
+        // of content (`[[1,2],3]` and `[1,null,true]` both error the same
+        // way), unlike jq's own per-element quoting above (#1073).
+        OwnedValue::Array(arr) if S::TAG != EvalTag::Yq => {
             let parts: Vec<String> = arr
                 .iter()
                 .map(shell_quote_value::<S>)
@@ -28694,6 +28697,34 @@ mod tests {
         query!(br#"["it's", "caf\u00e9", 1, true, null]"#, "@sh",
             QueryResult::Owned(OwnedValue::String(s)) => {
                 assert_eq!(s, "'it'\\''s' 'café' 1 true null");
+            }
+        );
+    }
+
+    /// #1073: real yq (confirmed live against v4.53.3) errors on *any*
+    /// array input to `@sh`, regardless of content -- unlike jq's own
+    /// per-element quoting (`test_format_sh_multibyte_boundary_647`'s array
+    /// case above, which stays jq-only after this fix). The pre-existing
+    /// object error (#929) already applied under both modes; this only adds
+    /// the array-under-yq case, so it isn't re-tested here.
+    #[test]
+    fn test_format_sh_yq_mode_errors_on_array_1073() {
+        yq_query!(br"[1, 2, 3]", "@sh",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "array ([1,2,3]) can not be escaped for shell");
+            }
+        );
+
+        // Nested/mixed-content arrays error the same way -- yq's own rule
+        // doesn't inspect elements, unlike jq's per-element quoting.
+        yq_query!(br#"[[1, 2], "x", null]"#, "@sh",
+            QueryResult::Error(_) => {}
+        );
+
+        // Scalars are unaffected by the yq-mode gate.
+        yq_query!(br"5", "@sh",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "5");
             }
         );
     }
