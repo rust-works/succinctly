@@ -445,12 +445,22 @@ fn format_underflow_literal_mantissa(s: &str, exp_pos: usize, negative: bool) ->
     let sign = if negative { "-" } else { "" };
     match normalize_extreme_literal_mantissa(s, exp_pos) {
         Some((mantissa_str, new_exp)) => assemble_scientific(sign, &mantissa_str, new_exp),
-        // Genuinely all-zero mantissa (`0.0e-400`) -- no magnitude to
-        // renormalize against. `value == 0.0` is true for `-0.0` too (IEEE
-        // 754), so the sign still needs preserving -- real jq keeps both
-        // the sign and the source exponent for a zero mantissa, since
-        // log10(0) is undefined (`-0e5` -> `-0E+5`, `-0e05` -> `-0E+5`).
-        None => assemble_scientific(sign, "0", parse_literal_exponent(&s[exp_pos + 1..])),
+        // Genuinely all-zero mantissa (`0.0e-400`) -- no nonzero digit to
+        // shift *to*, but real jq still shifts the printed exponent by the
+        // fractional-zero-digit count, the same normalization it applies to
+        // a nonzero mantissa (#1178) -- `0.000e-400` -> `0E-403`, not
+        // `0E-400`. A no-fraction spelling (`0e-400`, empty `frac_part`) has
+        // shift `0` and was already correct. `value == 0.0` is true for
+        // `-0.0` too (IEEE 754), so the sign still needs preserving -- real
+        // jq keeps both the sign and this shifted exponent for a zero
+        // mantissa, since log10(0) is undefined (`-0e5` -> `-0E+5`).
+        None => {
+            let mantissa = s[..exp_pos].strip_prefix('-').unwrap_or(&s[..exp_pos]);
+            let frac_len = mantissa.split_once('.').map_or(0, |(_, frac)| frac.len());
+            let shifted_exp =
+                parse_literal_exponent(&s[exp_pos + 1..]).saturating_sub(frac_len as i64);
+            assemble_scientific(sign, "0", shifted_exp)
+        }
     }
 }
 
