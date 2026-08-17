@@ -64,6 +64,36 @@ fn run_yq_stdin_with_stderr(
     Ok((stdout, stderr, exit_code))
 }
 
+/// jq-mode counterpart of `run_yq_stdin_with_stderr` -- this file otherwise
+/// hand-rolls `Command::new(...).arg("jq")` boilerplate per jq-mode test
+/// (#1146: introduced to avoid compounding that duplication for its own
+/// new jq-mode tests, not a full sweep of the pre-existing copies).
+fn run_jq_stdin_with_stderr(
+    filter: &str,
+    input: &str,
+    extra_args: &[&str],
+) -> Result<(String, String, i32)> {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .arg("jq")
+        .args(extra_args)
+        .arg(filter)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+
+    if let Some(mut stdin) = cmd.stdin.take() {
+        stdin.write_all(input.as_bytes())?;
+    }
+
+    let output = cmd.wait_with_output()?;
+    let stdout = String::from_utf8(output.stdout)?;
+    let stderr = String::from_utf8(output.stderr)?;
+    let exit_code = output.status.code().unwrap_or(-1);
+
+    Ok((stdout, stderr, exit_code))
+}
+
 /// Helper to run yq command with file input
 fn run_yq_file(filter: &str, file_path: &str, extra_args: &[&str]) -> Result<(String, i32)> {
     let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
@@ -13573,6 +13603,15 @@ fn test_yq_base64d_illegal_data_reports_exact_byte_position_1146() -> Result<()>
         stderr.contains("illegal base64 data at input byte 6"),
         "stderr: {stderr:?}"
     );
+
+    // A leftover 2-character trailing group (not a full 4-char group),
+    // to cover the `2 =>` arm specifically -- not just 4-char groups.
+    let (_out, stderr, code) = run_yq_stdin_with_stderr("@base64d", "\"aGVsb!\"\n", &[])?;
+    assert_ne!(code, 0);
+    assert!(
+        stderr.contains("illegal base64 data at input byte 5"),
+        "stderr: {stderr:?}"
+    );
     Ok(())
 }
 
@@ -13611,21 +13650,30 @@ fn test_yq_base64d_illegal_data_on_trailing_remainder_1146() -> Result<()> {
     Ok(())
 }
 
+/// Code review round 2 found the trailing-remainder arm didn't check
+/// whether the lone leftover byte was itself valid before assuming
+/// "too short": an *invalid* trailing byte must report the byte's own
+/// exact position (its own error category, not the too-short one),
+/// distinct from a *valid* trailing byte (the case above, positioned at
+/// the end of all significant data). Live-verified against real yq
+/// v4.53.3.
+#[test]
+fn test_yq_base64d_invalid_trailing_byte_reports_its_own_position_1146() -> Result<()> {
+    let (_out, stderr, code) = run_yq_stdin_with_stderr("@base64d", "\"abcd!\"\n", &[])?;
+    assert_ne!(code, 0);
+    assert!(
+        stderr.contains("illegal base64 data at input byte 4"),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
 /// jq mode's invalid-character message, distinct from yq's -- confirmed
 /// live against jq 1.7.1.
 #[test]
 fn test_jq_base64d_invalid_data_message_1146() -> Result<()> {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_succinctly"));
-    cmd.arg("jq").arg("@base64d");
-    let mut child = cmd
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    child.stdin.take().unwrap().write_all(b"\"ab!d\"")?;
-    let output = child.wait_with_output()?;
-    assert_ne!(output.status.code().unwrap_or(-1), 0);
-    let stderr = String::from_utf8(output.stderr)?;
+    let (_out, stderr, code) = run_jq_stdin_with_stderr("@base64d", "\"ab!d\"", &[])?;
+    assert_ne!(code, 0);
     assert!(
         stderr.contains("string (\"ab!d\") is not valid base64 data"),
         "stderr: {stderr:?}"
@@ -13638,19 +13686,25 @@ fn test_jq_base64d_invalid_data_message_1146() -> Result<()> {
 /// correct.
 #[test]
 fn test_jq_base64d_trailing_byte_message_unaffected_1146() -> Result<()> {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_succinctly"));
-    cmd.arg("jq").arg("@base64d");
-    let mut child = cmd
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    child.stdin.take().unwrap().write_all(b"\"false\"")?;
-    let output = child.wait_with_output()?;
-    assert_ne!(output.status.code().unwrap_or(-1), 0);
-    let stderr = String::from_utf8(output.stderr)?;
+    let (_out, stderr, code) = run_jq_stdin_with_stderr("@base64d", "\"false\"", &[])?;
+    assert_ne!(code, 0);
     assert!(
         stderr.contains("string (\"false\") trailing base64 byte found"),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
+/// jq-mode counterpart of
+/// `test_yq_base64d_invalid_trailing_byte_reports_its_own_position_1146`:
+/// an *invalid* lone trailing byte must get jq's invalid-data message, not
+/// its trailing-byte message.
+#[test]
+fn test_jq_base64d_invalid_trailing_byte_uses_invalid_data_message_1146() -> Result<()> {
+    let (_out, stderr, code) = run_jq_stdin_with_stderr("@base64d", "\"abcd!\"", &[])?;
+    assert_ne!(code, 0);
+    assert!(
+        stderr.contains("string (\"abcd!\") is not valid base64 data"),
         "stderr: {stderr:?}"
     );
     Ok(())
@@ -13661,21 +13715,10 @@ fn test_jq_base64d_trailing_byte_message_unaffected_1146() -> Result<()> {
 /// regression test -- only the yq-mode variant was covered.
 #[test]
 fn test_jq_base64d_invalid_utf8_is_lossy_not_error_1146() -> Result<()> {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_succinctly"));
-    cmd.arg("jq").arg("@base64d");
-    let mut child = cmd
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    child.stdin.take().unwrap().write_all(b"\"null\"")?;
-    let output = child.wait_with_output()?;
-    assert_eq!(output.status.code(), Some(0));
+    let (out, _stderr, code) = run_jq_stdin_with_stderr("@base64d", "\"null\"", &[])?;
+    assert_eq!(code, 0, "out: {out:?}");
     let expected = base64_decode_lossy("null");
-    assert_eq!(
-        String::from_utf8(output.stdout)?.trim(),
-        format!("{expected:?}")
-    );
+    assert_eq!(out.trim(), format!("{expected:?}"));
     Ok(())
 }
 
@@ -13683,16 +13726,8 @@ fn test_jq_base64d_invalid_utf8_is_lossy_not_error_1146() -> Result<()> {
 /// like `%FF`) previously had no regression test either.
 #[test]
 fn test_jq_urid_invalid_utf8_after_percent_decode_is_lossy_1146() -> Result<()> {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_succinctly"));
-    cmd.arg("jq").arg("@urid");
-    let mut child = cmd
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    child.stdin.take().unwrap().write_all(b"\"%FF\"")?;
-    let output = child.wait_with_output()?;
-    assert_eq!(output.status.code(), Some(0));
-    assert_eq!(String::from_utf8(output.stdout)?.trim(), "\"\u{fffd}\"");
+    let (out, _stderr, code) = run_jq_stdin_with_stderr("@urid", "\"%FF\"", &[])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "\"\u{fffd}\"");
     Ok(())
 }
