@@ -342,10 +342,7 @@ fn split_mantissa(s: &str, exp_pos: usize) -> (&str, &str) {
     // magnitude as `-` already was here, and (unlike `-`) wasn't stripped at
     // all before #1180 -- a leading `+` in `int_part` was misread as its
     // significant leading digit.
-    let mantissa = raw
-        .strip_prefix('-')
-        .or_else(|| raw.strip_prefix('+'))
-        .unwrap_or(raw);
+    let mantissa = raw.strip_prefix(['-', '+']).unwrap_or(raw);
     mantissa.split_once('.').unwrap_or((mantissa, ""))
 }
 
@@ -375,10 +372,14 @@ fn normalize_extreme_literal_mantissa(s: &str, exp_pos: usize) -> Option<(String
     // mantissa of unbounded length must not turn into unbounded work here
     // just because only a handful of its leading digits will ever survive
     // that later truncation anyway. Bounding the *copy* is enough: `shift`
-    // below only ever needs `int_part.len()` (an O(1) property read, not a
-    // scan), so truncating what gets copied into `rest` doesn't touch the
-    // exponent math's correctness, only how many digits past the first one
-    // actually get rendered.
+    // below only ever needs `int_part.len()` (an O(1) property read once
+    // leading zeros are trimmed -- the `trim_start_matches('0')` just below
+    // is itself an O(k) scan over any leading-zero run, #1180), so
+    // truncating what gets copied into `rest` doesn't touch the exponent
+    // math's correctness, only how many digits past the first one actually
+    // get rendered. The trim doesn't change the function's overall cost
+    // class either way: `format_number_jq_compat`'s own `s.parse::<f64>()`
+    // ahead of this call already scans every byte of `s` once.
     const MAX_RENDERED_MANTISSA_DIGITS: usize = 32;
 
     let (int_part, frac_part) = split_mantissa(s, exp_pos);
@@ -389,9 +390,9 @@ fn normalize_extreme_literal_mantissa(s: &str, exp_pos: usize) -> Option<(String
     // leading-dot literal (`.5e400`) already has an empty `int_part`, and an
     // int_part of nothing-but-zeros (`0`, `000`) trims to empty the same
     // way -- both fall into the magnitude-< 1 branch below.
-    let sig_int_part = int_part.trim_start_matches('0');
+    let int_part = int_part.trim_start_matches('0');
 
-    let (shift, leading, rest): (i64, &str, String) = if sig_int_part.is_empty() {
+    let (shift, leading, rest): (i64, &str, String) = if int_part.is_empty() {
         // Shift right to the first nonzero fractional digit. Genuinely
         // all-zero mantissa (`0.0e400`/`0.0e-400`) has no nonzero digit to
         // shift to -- `?` propagates that as `None`.
@@ -404,9 +405,9 @@ fn normalize_extreme_literal_mantissa(s: &str, exp_pos: usize) -> Option<(String
         )
     } else {
         // Mantissa >= 1: shift left past every extra significant
-        // integer-part digit. `sig_int_part[1..]` is a slice (no copy);
-        // only what actually gets concatenated into `rest` is capped.
-        let after_leading = &sig_int_part[1..];
+        // integer-part digit. `int_part[1..]` is a slice (no copy); only
+        // what actually gets concatenated into `rest` is capped.
+        let after_leading = &int_part[1..];
         let rest = if after_leading.len() >= MAX_RENDERED_MANTISSA_DIGITS {
             after_leading[..MAX_RENDERED_MANTISSA_DIGITS].to_string()
         } else {
@@ -416,7 +417,7 @@ fn normalize_extreme_literal_mantissa(s: &str, exp_pos: usize) -> Option<(String
                 &frac_part[..frac_part.len().min(budget)]
             )
         };
-        (sig_int_part.len() as i64 - 1, &sig_int_part[..1], rest)
+        (int_part.len() as i64 - 1, &int_part[..1], rest)
     };
 
     let parsed_exp = parse_literal_exponent(&s[exp_pos + 1..]);
@@ -2615,6 +2616,22 @@ mod tests {
         // Leading `+`, both alone and ahead of a genuine digit.
         assert_eq!(format_number_jq_compat(b"+0e-400"), "0E-400");
         assert_eq!(format_number_jq_compat(b"+1e400"), "1E+400");
+    }
+
+    /// #1180 review (Efficiency angle): stripping leading zeros is an O(k)
+    /// scan over the leading-zero run, unlike the O(1) length check it
+    /// replaced (see the updated comment above `MAX_RENDERED_MANTISSA_DIGITS`).
+    /// A document-controlled mantissa with a huge leading-zero run must
+    /// still produce the correct, bounded output rather than hanging or
+    /// blowing up -- the counterpart to
+    /// `test_format_number_jq_compat_overflow_huge_mantissa_is_bounded`
+    /// above, which uses a huge mantissa with *no* leading zeros and so
+    /// never exercises this scan at all.
+    #[test]
+    fn test_format_number_jq_compat_huge_leading_zero_run_is_bounded_1180() {
+        let mantissa = format!("{}9", "0".repeat(2_000_000));
+        let literal = format!("{mantissa}e400");
+        assert_eq!(format_number_jq_compat(literal.as_bytes()), "9E+400");
     }
 
     /// `depth` levels of single-element array nesting: `[[[...[Null]...]]]`.
