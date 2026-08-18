@@ -259,6 +259,87 @@ fn describe(value: &OwnedValue) -> String {
     format!("{} ({})", value.type_name(), dump_truncated(value))
 }
 
+/// Go-`%q`-style raw-byte quoting for [`EvalError::urid_invalid_escape`]
+/// (#1216) -- unlike [`dump_truncated`]/[`describe`] above, this quotes
+/// arbitrary bytes that may not even be valid UTF-8, so it can't reuse
+/// `Debug` on a `&str` directly the way those do.
+///
+/// Walks `raw` left to right: a maximal run of complete, valid UTF-8
+/// characters is quoted via Rust's own `Debug` escaping (stripping the
+/// `Debug`-added surrounding quotes, since the caller wraps the whole
+/// result once) -- already confirmed to match real yq's Go-style quoting
+/// for embedded `"`/`\`/control characters exactly. Any byte that isn't
+/// part of a complete valid character (a genuinely invalid byte, or a
+/// multi-byte sequence truncated by running out of input) renders as
+/// `\xHH`, one escape per raw byte -- matching real yq's own behavior for
+/// a `%`-escape this close to the end of the input to leave a multi-byte
+/// character split mid-sequence (verified live: a 3-byte character
+/// truncated to its first two bytes by `@urid`'s 2-trailing-byte error
+/// window renders as `\xe4\xb8`, not the whole character and not a lossy
+/// replacement).
+fn quote_bytes_go_style(raw: &[u8]) -> String {
+    let mut out = String::with_capacity(raw.len() + 2);
+    out.push('"');
+    let mut i = 0;
+    while i < raw.len() {
+        match core::str::from_utf8(&raw[i..]) {
+            // The rest of `raw` is entirely valid UTF-8 -- quote it all at
+            // once and stop.
+            Ok(s) => {
+                push_debug_escaped(&mut out, s);
+                break;
+            }
+            Err(e) => {
+                let valid_len = e.valid_up_to();
+                if valid_len > 0 {
+                    // `valid_up_to()` always lands on a char boundary, so
+                    // this slice is guaranteed valid UTF-8.
+                    let s = core::str::from_utf8(&raw[i..i + valid_len])
+                        .expect("valid_up_to() guarantees this prefix is valid UTF-8");
+                    push_debug_escaped(&mut out, s);
+                    i += valid_len;
+                }
+                // `error_len()` is `Some(n)` for n genuinely invalid bytes
+                // at this position (escape exactly those and keep
+                // scanning), or `None` when the remaining bytes are a
+                // valid *prefix* of some multi-byte character that simply
+                // ran out of input -- the truncated-character case this
+                // function exists for -- in which case every remaining
+                // byte is escaped and there's nothing left to scan.
+                match e.error_len() {
+                    Some(n) => {
+                        for b in &raw[i..i + n] {
+                            out.push_str(&format!("\\x{b:02x}"));
+                        }
+                        i += n;
+                    }
+                    None => {
+                        for b in &raw[i..] {
+                            out.push_str(&format!("\\x{b:02x}"));
+                        }
+                        i = raw.len();
+                    }
+                }
+            }
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Append `s`'s `Debug`-escaped contents to `out`, without the surrounding
+/// quotes `Debug` adds (the caller supplies its own, once, around the
+/// whole message) -- shared by [`quote_bytes_go_style`]'s two call sites
+/// (the all-valid fast path and the valid-prefix-before-a-truncation
+/// case) so they can't independently drift on how the strip is done.
+fn push_debug_escaped(out: &mut String, s: &str) {
+    let debug = format!("{s:?}");
+    // `Debug` on `&str` always wraps in a literal, single-byte `"` at each
+    // end, so trimming exactly one byte off each side can't split a
+    // multi-byte escape sequence it emitted in between.
+    out.push_str(&debug[1..debug.len() - 1]);
+}
+
 /// The binary operators jq names in arithmetic error messages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BinOp {
@@ -638,22 +719,25 @@ impl EvalError {
     /// yq mode (`format_urid`'s malformed-escape check has no `S::TAG`
     /// branch).
     ///
-    /// `escape` is `%` plus whatever 0, 1, or 2 bytes actually follow it
-    /// in the input (not validated -- confirmed live against yq v4.53.3
-    /// that both bytes are echoed verbatim even when only one, or
-    /// neither, is a valid hex digit, and that a literal `%` immediately
-    /// after the first one is included unchanged rather than treated as a
-    /// new escape's start: `"x%y%zz" | @urid` -> `invalid URL escape
-    /// "%y%"`, not `"%y"`). The `Debug`-quoted `{escape:?}` below matches
-    /// real yq's own Go-style escaping for embedded `"`/`\`/control
-    /// characters exactly (confirmed live: `%"y` -> `%\"y`, `%\y` ->
-    /// `%\\y`, a literal tab -> `%\ty`) -- but for a multi-byte UTF-8
-    /// character split by the raw 2-byte cutoff, the caller widens to the
-    /// whole character rather than corrupting it into U+FFFD, which is
-    /// *not* a byte-for-byte oracle match (real yq hex-escapes the raw,
-    /// truncated bytes instead, e.g. `\xe4\xb8`) -- filed as #1216.
-    pub fn urid_invalid_escape(escape: &str) -> Self {
-        Self::new(format!("invalid URL escape {escape:?}"))
+    /// `raw` is `%` plus whatever 0, 1, or 2 bytes actually follow it in
+    /// the input (not validated -- confirmed live against yq v4.53.3 that
+    /// both bytes are echoed verbatim even when only one, or neither, is
+    /// a valid hex digit, and that a literal `%` immediately after the
+    /// first one is included unchanged rather than treated as a new
+    /// escape's start: `"x%y%zz" | @urid` -> `invalid URL escape "%y%"`,
+    /// not `"%y"`). Takes raw bytes, not a `&str` (#1216): a `%` this
+    /// close to the end of the input can truncate a multi-byte UTF-8
+    /// character mid-sequence, which no `&str` can represent at all.
+    /// `quote_bytes_go_style` (this module's own private helper) handles
+    /// both a complete, valid character
+    /// (Rust's own `Debug` escaping, confirmed live to match real yq's
+    /// Go-style quoting for embedded `"`/`\`/control characters exactly:
+    /// `%"y` -> `%\"y`, `%\y` -> `%\\y`, a literal tab -> `%\ty`) and a
+    /// truncated one (raw `\xHH` per byte, matching real yq's own
+    /// Go-`%q`-style escaping there too -- previously a documented,
+    /// deliberate divergence, this is what #1216 closes).
+    pub fn urid_invalid_escape(raw: &[u8]) -> Self {
+        Self::new(format!("invalid URL escape {}", quote_bytes_go_style(raw)))
     }
 
     /// `Invalid path expression with result <value>` (#530).
@@ -1212,6 +1296,58 @@ mod tests {
         assert_eq!(
             err.payload(),
             OwnedValue::String("Cannot iterate over number (1)".to_string())
+        );
+    }
+
+    /// #1216: a truncated multi-byte character hex-escapes each raw byte,
+    /// matching real yq's own Go-`%q`-style escaping (live-verified,
+    /// tests/yq_cli_tests.rs's own `_1216`-suffixed CLI tests carry the
+    /// oracle comparison) -- this is the unit-level equivalent, pinning
+    /// `quote_bytes_go_style` directly rather than only through `@urid`.
+    #[test]
+    fn quote_bytes_go_style_hex_escapes_a_truncated_multibyte_character() {
+        // 中 = E4 B8 AD, truncated to its first two bytes.
+        assert_eq!(quote_bytes_go_style(b"%\xe4\xb8"), r#""%\xe4\xb8""#);
+        // 4-byte character (outside the BMP), truncated the same way.
+        assert_eq!(quote_bytes_go_style(b"%\xf0\x9f"), r#""%\xf0\x9f""#);
+    }
+
+    #[test]
+    fn quote_bytes_go_style_leaves_a_complete_character_unescaped() {
+        // é = C3 A9, not truncated at all.
+        assert_eq!(quote_bytes_go_style("%é".as_bytes()), "\"%é\"");
+    }
+
+    #[test]
+    fn quote_bytes_go_style_escapes_special_ascii_like_rust_debug() {
+        assert_eq!(quote_bytes_go_style(br#"%"y"#), r#""%\"y""#);
+        assert_eq!(quote_bytes_go_style(br"%\y"), r#""%\\y""#);
+        assert_eq!(quote_bytes_go_style(b"%\ty"), r#""%\ty""#);
+    }
+
+    #[test]
+    fn quote_bytes_go_style_handles_empty_and_ascii_only() {
+        assert_eq!(quote_bytes_go_style(b""), "\"\"");
+        assert_eq!(quote_bytes_go_style(b"%"), "\"%\"");
+        assert_eq!(quote_bytes_go_style(b"%y"), "\"%y\"");
+    }
+
+    /// A run of genuinely invalid bytes (not just an incomplete valid
+    /// prefix) also hex-escapes, one `\xHH` per byte -- `error_len()`'s
+    /// `Some(n)` branch, not just its `None` (ran-out-of-input) branch
+    /// `quote_bytes_go_style`'s other tests exercise.
+    #[test]
+    fn quote_bytes_go_style_escapes_genuinely_invalid_bytes() {
+        // 0xFF is never a valid UTF-8 lead byte at all.
+        assert_eq!(quote_bytes_go_style(b"%\xff"), r#""%\xff""#);
+        assert_eq!(quote_bytes_go_style(b"%\xff\xfe"), r#""%\xff\xfe""#);
+    }
+
+    #[test]
+    fn urid_invalid_escape_message_matches_1216_wording() {
+        assert_eq!(
+            EvalError::urid_invalid_escape(b"%\xe4\xb8").message,
+            r#"invalid URL escape "%\xe4\xb8""#
         );
     }
 }

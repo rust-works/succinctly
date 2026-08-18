@@ -15650,19 +15650,22 @@ fn test_yq_urid_valid_escape_still_decodes_1138() -> Result<()> {
     Ok(())
 }
 
-/// #1138 review self-check: a malformed escape immediately followed by a
-/// multi-byte UTF-8 character (so the raw 2-byte error-message cutoff
-/// would otherwise land mid-character) must widen to include the whole
-/// character rather than corrupt it into a lossy replacement character --
-/// not a byte-for-byte match for real yq's own raw-byte hex-escaping in
-/// this specific case (`\xe4\xb8`), a documented, deliberate divergence
-/// (see `EvalError::urid_invalid_escape`'s doc comment and #1216).
+/// #1216: a malformed escape immediately followed by a multi-byte UTF-8
+/// character (so the raw 2-byte error-message cutoff lands mid-character)
+/// now byte-for-byte matches real yq's own raw-byte hex-escaping -- `%`
+/// plus the truncated character's first 2 raw bytes, each rendered as
+/// `\xHH`, not the whole character and not a lossy replacement. Verified
+/// live against yq v4.53.3: `%<3-byte char 中 = E4 B8 AD>` truncates to
+/// `%\xe4\xb8`; `%<4-byte char 😀 = F0 9F 98 80>` truncates to `%\xf0\x9f`.
+/// Superseded a prior version of this test that pinned succinctly's
+/// then-current (documented, deliberate) divergence -- widening to the
+/// whole character instead of hex-escaping the truncated raw bytes.
 #[test]
-fn test_yq_urid_malformed_escape_multibyte_boundary_1138() -> Result<()> {
+fn test_yq_urid_malformed_escape_multibyte_boundary_1216() -> Result<()> {
     let (_out, stderr, code) = run_yq_stdin_with_stderr("@urid", "\"%\u{4e2d}\"", &[])?;
     assert_ne!(code, 0, "stderr: {stderr:?}");
     assert!(
-        stderr.contains("invalid URL escape \"%\u{4e2d}\""),
+        stderr.contains(r#"invalid URL escape "%\xe4\xb8""#),
         "stderr: {stderr:?}"
     );
 
@@ -15670,7 +15673,75 @@ fn test_yq_urid_malformed_escape_multibyte_boundary_1138() -> Result<()> {
     let (_out, stderr, code) = run_yq_stdin_with_stderr("@urid", "\"%\u{1f600}\"", &[])?;
     assert_ne!(code, 0, "stderr: {stderr:?}");
     assert!(
-        stderr.contains("invalid URL escape \"%\u{1f600}\""),
+        stderr.contains(r#"invalid URL escape "%\xf0\x9f""#),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
+/// #1216: complementary shapes not covered by the multi-byte-boundary
+/// test above -- a fully valid multi-byte character with no truncation at
+/// all (the raw 2-byte window comfortably contains the whole 2-byte
+/// character, so it renders as itself, not hex-escaped), and embedded
+/// `"`/`\`/tab characters, which must still match real yq's own Go-style
+/// `Debug`-equivalent escaping exactly (unaffected by #1216's raw-byte
+/// change, since these are all complete, valid characters). Verified live
+/// against yq v4.53.3.
+#[test]
+fn test_yq_urid_malformed_escape_valid_and_special_chars_1216() -> Result<()> {
+    // A complete 2-byte character (é), not truncated at all.
+    let (_out, stderr, code) = run_yq_stdin_with_stderr("@urid", "\"%\u{e9}\"", &[])?;
+    assert_ne!(code, 0, "stderr: {stderr:?}");
+    assert!(
+        stderr.contains("invalid URL escape \"%\u{e9}\""),
+        "stderr: {stderr:?}"
+    );
+
+    // Embedded double quote.
+    let (_out, stderr, code) = run_yq_stdin_with_stderr("@urid", r#""%\"y""#, &[])?;
+    assert_ne!(code, 0, "stderr: {stderr:?}");
+    assert!(
+        stderr.contains(r#"invalid URL escape "%\"y""#),
+        "stderr: {stderr:?}"
+    );
+
+    // Embedded backslash.
+    let (_out, stderr, code) = run_yq_stdin_with_stderr("@urid", r#""%\\y""#, &[])?;
+    assert_ne!(code, 0, "stderr: {stderr:?}");
+    assert!(
+        stderr.contains(r#"invalid URL escape "%\\y""#),
+        "stderr: {stderr:?}"
+    );
+
+    // Embedded literal tab.
+    let (_out, stderr, code) = run_yq_stdin_with_stderr("@urid", "\"%\ty\"", &[])?;
+    assert_ne!(code, 0, "stderr: {stderr:?}");
+    assert!(
+        stderr.contains(r#"invalid URL escape "%\ty""#),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
+/// #1216: `%` at the very end of the input (0 trailing bytes at all) and
+/// only 1 trailing byte still work correctly -- both shapes reach the
+/// all-valid-UTF-8 fast path in `quote_bytes_go_style` (there's nothing
+/// incomplete to hex-escape when there's nothing there, or only one plain
+/// ASCII byte), unaffected by the raw-byte-escaping change. Verified live
+/// against yq v4.53.3.
+#[test]
+fn test_yq_urid_malformed_escape_short_trailing_1216() -> Result<()> {
+    let (_out, stderr, code) = run_yq_stdin_with_stderr("@urid", r#""abc%""#, &[])?;
+    assert_ne!(code, 0, "stderr: {stderr:?}");
+    assert!(
+        stderr.contains(r#"invalid URL escape "%""#),
+        "stderr: {stderr:?}"
+    );
+
+    let (_out, stderr, code) = run_yq_stdin_with_stderr("@urid", r#""abc%y""#, &[])?;
+    assert_ne!(code, 0, "stderr: {stderr:?}");
+    assert!(
+        stderr.contains(r#"invalid URL escape "%y""#),
         "stderr: {stderr:?}"
     );
     Ok(())
