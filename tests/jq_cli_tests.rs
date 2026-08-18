@@ -8781,7 +8781,10 @@ fn test_resolve_seq_earlier_fanout_escape_does_not_skip_later_dynamic_stage_977(
     // #1013 fixed: now processes remaining dynamic elements instead of truncating
     assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
     // Now produces full paths through all remaining stages, not just truncated prefix
-    assert_eq!(stdout, "[\"a\",0,\"c\",0,\"foo\"]\n[\"a\",0,\"c\",1,\"foo\"]\n");
+    assert_eq!(
+        stdout,
+        "[\"a\",0,\"c\",0,\"foo\"]\n[\"a\",0,\"c\",1,\"foo\"]\n"
+    );
     assert!(stderr.contains('t'), "stderr: {stderr:?}");
 
     // A second shape, where the skipped-over tail would otherwise silently

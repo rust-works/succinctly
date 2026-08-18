@@ -14317,7 +14317,7 @@ fn resolve_seq<'a, S: EvalSemantics>(
                     // Store the error and continue processing.
                     let deferred_error = Some(e);
                     // Continue processing remaining stages with the partial results
-                    for remaining_element in flat[i+1..=last_dynamic].iter() {
+                    for remaining_element in &flat[i + 1..=last_dynamic] {
                         let mut next_next = Vec::new();
                         for (prefix, current) in next {
                             match resolve_against_cow::<S>(remaining_element, current, trackable) {
