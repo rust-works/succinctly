@@ -9245,7 +9245,21 @@ fn sub_with_resolved_pattern<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
     // jq defines gsub(re; str; flags) as sub(re; str; flags + "g") -- a "g" flag
     // here means the same global replace gsub always performs.
-    let global = flags.is_some_and(|f| f.contains('g'));
+    //
+    // yq diverges here for the *bare* 2-arg form specifically (#1069,
+    // confirmed live against real yq v4.53.3): `sub("a";"X")` on `"aaa"`
+    // replaces every match (`"XXX"`), unlike jq's `sub`, which replaces
+    // only the first (`"Xaa"`) -- yq's `sub` behaves like jq's `gsub`
+    // unconditionally when no flags argument is given at all. `flags ==
+    // None` uniquely identifies that shape here: `gsub` (with or without
+    // its own flags) always arrives with `flags = Some("g"/"g"+concat)`,
+    // and the 3-arg `sub(re;s;flags)` form always arrives with `flags =
+    // Some(_)` too, even for an empty flags string -- so this can't
+    // accidentally widen either of those. The 3-arg form's own real-yq
+    // semantics are a separate, still-unresolved mystery (#1069's own
+    // scope note) and are deliberately left matching jq's model here.
+    let global =
+        flags.is_some_and(|f| f.contains('g')) || (S::TAG == EvalTag::Yq && flags.is_none());
 
     if global {
         let matches = global_captures(&re, &input);
@@ -32430,6 +32444,74 @@ mod tests {
         query!(br#""a1b2c3""#, r#"gsub("[0-9]"; "X")"#,
             QueryResult::Owned(OwnedValue::String(s)) => {
                 assert_eq!(s, "aXbXcX");
+            }
+        );
+    }
+
+    /// #1069: real yq's bare, 2-arg `sub(re; s)` replaces *every* match, not
+    /// just the first the way jq's `sub` does -- confirmed live against
+    /// real yq v4.53.3 (`"aaa" | sub("a";"X")` => `"XXX"`; jq 1.7.1's
+    /// equivalent stays `"Xaa"`, unaffected by this yq-only fix).
+    #[cfg(feature = "regex")]
+    #[test]
+    fn test_regex_sub_yq_mode_replaces_every_match_1069() {
+        yq_query!(br#""aaa""#, r#"sub("a"; "X")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "XXX");
+            }
+        );
+        yq_query!(br#""hello world world""#, r#"sub("world"; "there")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "hello there there");
+            }
+        );
+
+        // jq mode is unaffected -- still first-match-only.
+        query!(br#""aaa""#, r#"sub("a"; "X")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "Xaa");
+            }
+        );
+    }
+
+    /// #1069's fix must not widen past the bare 2-arg shape: `gsub` (with
+    /// or without its own flags argument) always arrives at
+    /// `sub_with_resolved_pattern` with `flags = Some("g"/...)`, never
+    /// `None`, so it was already global before this fix and stays that way
+    /// unchanged. Confirmed both bare-`gsub` and flagged-`gsub` still
+    /// replace every match in yq mode.
+    #[cfg(feature = "regex")]
+    #[test]
+    fn test_regex_gsub_yq_mode_unaffected_by_1069() {
+        yq_query!(br#""aaa""#, r#"gsub("a"; "X")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "XXX");
+            }
+        );
+        yq_query!(br#""AAA""#, r#"gsub("a"; "X"; "i")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "XXX");
+            }
+        );
+    }
+
+    /// #1069's own scope note: the 3-arg `sub(re; s; flags)` form's real-yq
+    /// semantics are a separate, still-unresolved mystery (filed as a
+    /// follow-up rather than guessed at here) -- this fix deliberately
+    /// leaves it matching jq's existing model (global only when the flags
+    /// string itself contains `"g"`), unaffected by the bare-2-arg-only
+    /// `flags.is_none()` gate above.
+    #[cfg(feature = "regex")]
+    #[test]
+    fn test_regex_sub_flags_yq_mode_unaffected_by_1069() {
+        yq_query!(br#""aaa""#, r#"sub("a"; "X"; "g")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "XXX");
+            }
+        );
+        yq_query!(br#""aaa""#, r#"sub("a"; "X"; "")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "Xaa");
             }
         );
     }
