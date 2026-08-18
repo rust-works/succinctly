@@ -12169,6 +12169,22 @@ fn test_tag_yq_normalized_float_spellings_stay_float_954() -> Result<()> {
     Ok(())
 }
 
+/// `--slurp`/`--eval-all`/`load()` all materialize a plain scalar through
+/// `ResolvedScalar::to_owned_value` (`resolve_plain(&str_value).
+/// to_owned_value(str_value)`, `eval.rs`/`yq_runner.rs`) rather than through
+/// `DocumentValue::number_literal()` or the streaming JSON writers the other
+/// #954 tests above exercise -- a fourth, independent call site gating on
+/// `is_preservable_float_literal` (see #907's own doc comment on the
+/// sibling `2.0` test just above this one). Confirms this normalization
+/// fix reaches that path too, not just the other three.
+#[test]
+fn test_slurp_normalizes_json_unsafe_float_spelling_954() -> Result<()> {
+    let (out, code) = run_yq_stdin(".", "+1.0", &["--slurp", "-o", "json", "-I", "0"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "[1.0]");
+    Ok(())
+}
+
 // =============================================================================
 // M2 JSON-output float literal fidelity — #993
 // =============================================================================
