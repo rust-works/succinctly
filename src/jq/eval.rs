@@ -2077,23 +2077,29 @@ fn arith_mul<S: EvalSemantics>(
         // it's already handled by the `(left, Null)` no-op arm above,
         // since `left` binds to `Null` there too (live-verified against
         // yq v4.53.3: `null * null` -> `null`, exit 0, not an error).
-        // Numeric multiplication or string repetition -- only once the pair
-        // is confirmed to be one of the shapes this arm actually computes
-        // (both numeric, or one `String` paired with a numeric repeat
-        // count) does it move the operands into `into_plain_number()`. A
-        // `NumberLiteral` operand degrades to plain `Int`/`Float` here, and
-        // only here -- these are the arms that actually compute a new
-        // value (a product, or a repeated string), so canonical formatting
-        // is correct; every arm above relocates an operand unchanged and
-        // must not collapse a literal's spelling (#1167).
-        (left, right)
-            if (left.is_number() && right.is_number())
-                || (matches!(left, OwnedValue::String(_)) && right.is_number())
-                || (left.is_number() && matches!(right, OwnedValue::String(_))) =>
-        {
-            match (left.into_plain_number(), right.into_plain_number()) {
+        // Numeric multiplication or string repetition. `number_repr()`
+        // (#1199) peeks each operand's computable value through a
+        // reference -- `left`/`right` themselves stay owned and
+        // un-collapsed the whole time, so `left`/`right` are still there,
+        // with a `NumberLiteral` operand's own source spelling intact, for
+        // whichever arm ends up needing them (the `String` arms move the
+        // string content out; the final catch-all cites the originals in
+        // its error). Matching on `(left, right, l_num, r_num)` together
+        // (rather than gating a single `into_plain_number()`-based match
+        // behind a hand-written guard, #1167's original shape) makes this
+        // exhaustive without an `unreachable!()` fallback anywhere: every
+        // arm's own pattern is what proves it applies, not a separately
+        // maintained boolean condition that has to stay in sync with the
+        // arms by hand -- the bool-guard version of this let a `String`
+        // paired with a `Float` operand slip past its own guard into a
+        // fallback with no real match for that shape, which panicked in
+        // production instead of erroring (caught by code review before
+        // merge).
+        (left, right) => {
+            let (l_num, r_num) = (left.number_repr(), right.number_repr());
+            match (left, right, l_num, r_num) {
                 // jq converts to float on overflow, yq wraps
-                (OwnedValue::Int(a), OwnedValue::Int(b)) => {
+                (_, _, Some(NumberRepr::Int(a)), Some(NumberRepr::Int(b))) => {
                     if S::OVERFLOW_WRAPS {
                         // yq behavior: wrapping mul
                         Ok(OwnedValue::Int(a.wrapping_mul(b)))
@@ -2105,26 +2111,37 @@ fn arith_mul<S: EvalSemantics>(
                         }
                     }
                 }
-                (OwnedValue::Int(a), OwnedValue::Float(b)) => Ok(OwnedValue::Float(a as f64 * b)),
-                (OwnedValue::Float(a), OwnedValue::Int(b)) => Ok(OwnedValue::Float(a * b as f64)),
-                (OwnedValue::Float(a), OwnedValue::Float(b)) => Ok(OwnedValue::Float(a * b)),
+                (_, _, Some(NumberRepr::Int(a)), Some(NumberRepr::Float(b))) => {
+                    Ok(OwnedValue::Float(a as f64 * b))
+                }
+                (_, _, Some(NumberRepr::Float(a)), Some(NumberRepr::Int(b))) => {
+                    Ok(OwnedValue::Float(a * b as f64))
+                }
+                (_, _, Some(NumberRepr::Float(a)), Some(NumberRepr::Float(b))) => {
+                    Ok(OwnedValue::Float(a * b))
+                }
                 // String repetition: "ab" * 3 = "ababab". jq >= 1.7 yields ""
-                // for n == 0 and null only for n < 0 (jqlang/jq#1593)
-                (OwnedValue::String(s), OwnedValue::Int(n))
-                | (OwnedValue::Int(n), OwnedValue::String(s)) => {
+                // for n == 0 and null only for n < 0 (jqlang/jq#1593). The
+                // repeat count must specifically be `Int`-repr -- a `Float`
+                // (or a `NumberLiteral` carrying a float repr) paired with
+                // a `String` falls through to the type-mismatch arm below,
+                // matching real jq (`"ab" * 2.5` errors there too).
+                (OwnedValue::String(s), _, _, Some(NumberRepr::Int(n)))
+                | (_, OwnedValue::String(s), Some(NumberRepr::Int(n)), _) => {
                     if n < 0 {
                         Ok(OwnedValue::Null)
                     } else {
                         Ok(OwnedValue::String(s.repeat(n as usize)))
                     }
                 }
-                _ => unreachable!("guard above only admits number/number or String/number pairs"),
+                // Type mismatch -- `left`/`right` were never consumed by
+                // any arm above (the numeric arms only read `l_num`/
+                // `r_num`, and the `String` arms above bind a *different*
+                // shape), so they're still the original, uncollapsed
+                // operands here.
+                (left, right, _, _) => Err(EvalError::binary_op(&left, &right, BinOp::Multiply)),
             }
         }
-        // Type mismatch -- `left`/`right` are still the *original*,
-        // uncollapsed operands here, so a `NumberLiteral` operand's source
-        // spelling survives into the error message too (#1199).
-        (left, right) => Err(EvalError::binary_op(&left, &right, BinOp::Multiply)),
     }
 }
 
@@ -2318,7 +2335,7 @@ fn arith_div<S: EvalSemantics>(
     left: OwnedValue,
     right: OwnedValue,
 ) -> Result<OwnedValue, EvalError> {
-    // `as_number_repr()` (#1199) peeks the computable value through a
+    // `number_repr()` (#1199) peeks the computable value through a
     // reference, leaving `left`/`right` themselves owned and un-collapsed
     // for the rest of the function -- both `divisor_is_zero` (reached from
     // *inside* an otherwise-successful numeric arm, not just a trailing
@@ -2326,7 +2343,7 @@ fn arith_div<S: EvalSemantics>(
     // still cite a `NumberLiteral` operand's own source spelling, not the
     // canonically-reformatted value `into_plain_number()` would have left
     // behind.
-    match (left.as_number_repr(), right.as_number_repr()) {
+    match (left.number_repr(), right.number_repr()) {
         (Some(NumberRepr::Int(a)), Some(NumberRepr::Int(b))) => {
             if b == 0 {
                 if S::DIV_BY_ZERO_IS_INFINITY {
@@ -2362,7 +2379,7 @@ fn arith_div<S: EvalSemantics>(
             }
         }
         // Neither operand's repr matched above -- fall through to the
-        // shapes `as_number_repr()` can't express (String split, or a
+        // shapes `number_repr()` can't express (String split, or a
         // genuine type mismatch), now safe to actually consume `left`/
         // `right` since no arm past this point needs the original spelling
         // anymore.
@@ -2385,12 +2402,12 @@ fn arith_mod<S: EvalSemantics>(
     left: OwnedValue,
     right: OwnedValue,
 ) -> Result<OwnedValue, EvalError> {
-    // Same `as_number_repr()` peek as `arith_div` (#1199): `left`/`right`
+    // Same `number_repr()` peek as `arith_div` (#1199): `left`/`right`
     // stay owned and un-collapsed for both `divisor_is_zero`/`mod_floats`
     // (reached from inside an otherwise-successful numeric arm) and the
     // final type-mismatch `binary_op`, so a `NumberLiteral` operand's
     // source spelling survives into whichever error actually fires.
-    match (left.as_number_repr(), right.as_number_repr()) {
+    match (left.number_repr(), right.number_repr()) {
         (Some(NumberRepr::Int(a)), Some(NumberRepr::Int(b))) => {
             if b == 0 {
                 if S::DIV_BY_ZERO_IS_INFINITY {

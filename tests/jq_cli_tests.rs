@@ -12054,12 +12054,28 @@ fn test_jq_binary_op_error_preserves_number_literal_spelling_1199() -> Result<()
     Ok(())
 }
 
-/// The right operand's spelling is preserved too, not just the left's.
+/// The right operand's spelling is preserved too, not just the left's --
+/// checked for every operator, not just `+`, since each `arith_*`
+/// function's catch-all arm was restructured independently and a mistake
+/// in any one of them (e.g. a `&right`/`&left` swap) wouldn't be caught by
+/// checking only one operator.
 #[test]
 fn test_jq_binary_op_error_preserves_right_operand_spelling_1199() -> Result<()> {
-    let (out, err, code) = run_jq_full(&["-cn", "{} + 1e10"], None)?;
-    assert_eq!(code, 5, "out: {out:?}");
-    assert!(err.contains("number (1E+10)"), "{err}");
+    for (expr, op_wording) in [
+        ("{} + 1e10", "cannot be added"),
+        ("{} - 1e10", "cannot be subtracted"),
+        ("{} * 1e10", "cannot be multiplied"),
+        ("{} / 1e10", "cannot be divided"),
+        ("{} % 1e10", "cannot be divided (remainder)"),
+    ] {
+        let (out, err, code) = run_jq_full(&["-cn", expr], None)?;
+        assert_eq!(code, 5, "expr {expr:?}: out={out:?} err={err:?}");
+        assert!(
+            err.contains("number (1E+10)"),
+            "expr {expr:?}: expected spelling preserved, got: {err}"
+        );
+        assert!(err.contains(op_wording), "expr {expr:?}: {err}");
+    }
     Ok(())
 }
 
@@ -12067,17 +12083,29 @@ fn test_jq_binary_op_error_preserves_right_operand_spelling_1199() -> Result<()>
 /// the generic type-mismatch `binary_op`) has the identical bug, reached
 /// from *inside* an otherwise-successful numeric arm rather than a
 /// trailing catch-all -- confirms the fix threads through that path too,
-/// not just the type-mismatch one.
+/// not just the type-mismatch one. Both `/` and `%` check for their own
+/// distinguishing wording, not just the shared "number (X)" spelling
+/// preservation both `binary_op` and `divisor_is_zero` would show
+/// identically -- a regression that misrouted either operator's
+/// zero-divisor case to the generic type-mismatch arm instead (losing the
+/// "divisor is zero" phrasing) would otherwise still pass.
 #[test]
 fn test_jq_divisor_is_zero_error_preserves_number_literal_spelling_1199() -> Result<()> {
     let (out, err, code) = run_jq_full(&["-cn", "1e10 / 0"], None)?;
     assert_eq!(code, 5, "out: {out:?}");
     assert!(err.contains("number (1E+10)"), "{err}");
-    assert!(err.contains("divisor is zero"), "{err}");
+    assert!(
+        err.contains("cannot be divided because the divisor is zero"),
+        "{err}"
+    );
 
     let (out, err, code) = run_jq_full(&["-cn", "1e10 % 0"], None)?;
     assert_eq!(code, 5, "out: {out:?}");
     assert!(err.contains("number (1E+10)"), "{err}");
+    assert!(
+        err.contains("cannot be divided (remainder) because the divisor is zero"),
+        "{err}"
+    );
     Ok(())
 }
 
@@ -12099,6 +12127,34 @@ fn test_jq_binary_op_success_paths_unaffected_1199() -> Result<()> {
         let (out, err, code) = run_jq_full(&["-cn", expr], None)?;
         assert_eq!(code, 0, "expr {expr:?}: {err}");
         assert_eq!(out.trim(), expected, "expr {expr:?}");
+    }
+    Ok(())
+}
+
+/// A `Float` (or a `NumberLiteral` carrying a float repr) paired with a
+/// `String` for `*` must return a clean type-mismatch error, not panic --
+/// regression guard for a bug an earlier draft of this fix introduced and
+/// code review caught before merge. `arith_mul`'s restructuring initially
+/// gated its numeric/string-repetition arm behind `is_number()` (true for
+/// `Float` too, not just `Int`), but the inner match's string-repetition
+/// pattern only ever handled `Int`, so a `Float`+`String` pair fell through
+/// every named arm into an `unreachable!()` that was, in fact, reachable --
+/// `"ab" * 2.5` crashed the process (exit 101) instead of erroring (exit
+/// 5). succinctly has never supported a float repeat count at all (a
+/// separate, pre-existing, narrower-than-real-jq gap tracked as #1230,
+/// unaffected by this fix either way) -- the requirement here is only that
+/// the unsupported shape errors cleanly, not that it succeeds.
+#[test]
+fn test_jq_string_times_float_errors_cleanly_not_panics_1199() -> Result<()> {
+    for expr in [
+        "2.5 * \"ab\"",
+        "\"ab\" * 2.5",
+        "1e10 * \"ab\"",
+        "\"ab\" * 1e10",
+    ] {
+        let (out, err, code) = run_jq_full(&["-cn", expr], None)?;
+        assert_eq!(code, 5, "expr {expr:?}: out={out:?} err={err:?}");
+        assert!(err.contains("cannot be multiplied"), "expr {expr:?}: {err}");
     }
     Ok(())
 }
