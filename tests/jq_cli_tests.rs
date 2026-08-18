@@ -4702,6 +4702,38 @@ fn test_number_literal_subnormal_preserves_mantissa_1177() -> Result<()> {
     Ok(())
 }
 
+/// CLI-level counterpart to
+/// `test_format_number_jq_compat_scientific_notation_preserves_trailing_zeros_1206`
+/// (`run_jq_stdin` spawns `cargo run`, invisible to `cargo llvm-cov`, so both
+/// an in-process and a CLI-level test exist for the same fix).
+#[test]
+fn test_number_literal_scientific_notation_preserves_trailing_zeros_via_cli_1206() -> Result<()> {
+    let (output, code) = run_jq_stdin(".", "1.50e10", &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "1.50E+10");
+
+    let (output, code) = run_jq_stdin(".", "3.000e100", &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "3.000E+100");
+
+    Ok(())
+}
+
+/// CLI-level counterpart to
+/// `test_format_number_jq_compat_scientific_notation_mantissa_stays_below_ten_1206`.
+#[test]
+fn test_number_literal_scientific_notation_mantissa_stays_below_ten_via_cli_1206() -> Result<()> {
+    let (output, code) = run_jq_stdin(".", "9.9999999999999e-64", &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "9.9999999999999E-64");
+
+    let (output, code) = run_jq_stdin(".", "9.999999999999999e300", &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "9.999999999999999E+300");
+
+    Ok(())
+}
+
 /// `eval_owned_expr`/`eval_owned_input` (backing `reduce`/`foreach`/`as $x`
 /// variable binding) and `with_entries`'s `owned_to_json_bytes` each have
 /// their own serialize-and-reparse bridge, separate from `eval_generic`'s
