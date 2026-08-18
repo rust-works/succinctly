@@ -12642,10 +12642,16 @@ fn test_jq_string_repetition_accepts_float_count_1230() -> Result<()> {
 /// A destructuring pattern nested past the parser's depth limit exits
 /// cleanly with a compile error instead of overflowing the process stack --
 /// regression test for #1240, reachable from query text alone (no large
-/// input document needed). Mirrors the issue's own live repro.
+/// input document needed). Mirrors the issue's own live repro, which used a
+/// 100k-deep pattern -- reproduced directly against the CLI binary and
+/// confirmed there, but scaled down to just past the 256-deep limit here:
+/// passing a 100k-deep string as a literal argv entry exceeds Linux's
+/// ARG_MAX in CI ("Argument list too long", os error 7) well before the
+/// query is ever parsed, which is an unrelated process-spawn limit, not
+/// this fix's own behavior.
 #[test]
 fn test_as_pattern_deep_nesting_exits_cleanly_not_stack_overflow_1240() -> Result<()> {
-    let n = 100_000;
+    let n = 300;
     let pattern = format!("{}$x{}", "{a: ".repeat(n), "}".repeat(n));
     let query = format!(". as {pattern} | $x");
     let (out, err, code) = run_jq_full(&["-cn", &query], None)?;
