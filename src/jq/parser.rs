@@ -122,11 +122,24 @@ fn push_bracket(chain: &mut Vec<Expr>, bracket: Bracket) {
     }
 }
 
+/// Maximum recursion depth for a single `Pattern` AST (`as $pattern`
+/// destructuring, including `?//` alternative patterns). Exceeding it
+/// returns a clean [`ParseError`] instead of recursing further -- deeply
+/// nested pattern syntax (`{a: {a: {a: ...}}}`) is reachable from query
+/// text alone, with no input document needed, so an unguarded recursion is
+/// a process-abort hazard fully within a client's control (#1240). `Pattern`
+/// is exclusively constructed by [`Parser::parse_pattern`] (see that type's
+/// own doc comment), so this bound transitively covers every downstream
+/// `Pattern` tree-walker too.
+const MAX_PATTERN_DEPTH: usize = 256;
+
 /// Parser state.
 struct Parser<'a> {
     input: &'a str,
     pos: usize,
     mode: ParserMode,
+    /// Current `Pattern` recursion depth; see [`MAX_PATTERN_DEPTH`].
+    pattern_depth: usize,
 }
 
 impl<'a> Parser<'a> {
@@ -136,6 +149,7 @@ impl<'a> Parser<'a> {
             input,
             pos: 0,
             mode: ParserMode::Jq,
+            pattern_depth: 0,
         }
     }
 
@@ -144,6 +158,7 @@ impl<'a> Parser<'a> {
             input,
             pos: 0,
             mode,
+            pattern_depth: 0,
         }
     }
 
@@ -1621,6 +1636,24 @@ impl<'a> Parser<'a> {
     /// - `{key: $var, ...}` - object destructuring
     /// - `[$first, $second, ...]` - array destructuring
     fn parse_pattern(&mut self) -> Result<Pattern, ParseError> {
+        self.pattern_depth += 1;
+        let result = if self.pattern_depth > MAX_PATTERN_DEPTH {
+            Err(ParseError::new(
+                format!("pattern nesting exceeds depth limit of {MAX_PATTERN_DEPTH}"),
+                self.pos,
+            ))
+        } else {
+            self.parse_pattern_inner()
+        };
+        self.pattern_depth -= 1;
+        result
+    }
+
+    /// The real `parse_pattern` body, entered only through the depth-checked
+    /// wrapper above -- every recursive call goes back through
+    /// `self.parse_pattern()`, not this function, so the depth counter sees
+    /// every nesting level.
+    fn parse_pattern_inner(&mut self) -> Result<Pattern, ParseError> {
         self.skip_ws();
         match self.peek() {
             Some('$') => {
@@ -6280,5 +6313,40 @@ mod tests {
         // Exercises the optional +/- sign branch in exponent parsing.
         assert!(parse("1e+5").is_ok());
         assert!(parse("1e-5").is_ok());
+    }
+
+    /// A `Pattern` nested past `MAX_PATTERN_DEPTH` returns a clean
+    /// `ParseError` instead of overflowing the stack -- regression test for
+    /// #1240 (`. as {a: {a: {a: ...}}} | ...` reachable from query text
+    /// alone, no input document needed).
+    #[test]
+    fn test_pattern_depth_limit_returns_parse_error_not_overflow_1240() {
+        let n = MAX_PATTERN_DEPTH + 10;
+        let object_pattern = format!("{}$x{}", "{a: ".repeat(n), "}".repeat(n));
+        let err = parse(&format!(". as {object_pattern} | $x"))
+            .expect_err("over-depth object pattern must be a clean parse error");
+        assert!(
+            err.message.contains("depth limit"),
+            "unexpected error: {}",
+            err.message
+        );
+
+        let array_pattern = format!("{}$x{}", "[".repeat(n), "]".repeat(n));
+        let err = parse(&format!(". as {array_pattern} | $x"))
+            .expect_err("over-depth array pattern must be a clean parse error");
+        assert!(
+            err.message.contains("depth limit"),
+            "unexpected error: {}",
+            err.message
+        );
+    }
+
+    /// Control: a pattern nested just under the limit still parses fine --
+    /// the guard doesn't clip ordinary (if unusually deep) real-world usage.
+    #[test]
+    fn test_pattern_depth_just_under_limit_still_parses_1240() {
+        let n = MAX_PATTERN_DEPTH - 1;
+        let object_pattern = format!("{}$x{}", "{a: ".repeat(n), "}".repeat(n));
+        assert!(parse(&format!(". as {object_pattern} | $x")).is_ok());
     }
 }
