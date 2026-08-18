@@ -930,7 +930,7 @@ struct JqCommand {
 
     // === Modules ===
     /// Prepend directory to module search path
-    #[arg(short = 'L', value_name = "DIR", action = clap::ArgAction::Append)]
+    #[arg(short = 'L', value_name = "DIR", action = clap::ArgAction::Append, allow_hyphen_values = true)]
     library_path: Vec<PathBuf>,
 
     // === Formats ===
@@ -2299,6 +2299,37 @@ mod tests {
                         arg.is_allow_hyphen_values_set(),
                         "--{} in `{}` accepts multiple values per occurrence but doesn't set \
                          allow_hyphen_values -- see #1150",
+                        arg.get_id(),
+                        cmd.get_name()
+                    );
+                }
+            }
+        }
+    }
+
+    /// Sibling guardrail for #1203: `-L`/`--library-path` takes exactly one
+    /// value *per occurrence* (so #1150's `max_values() > 1` check above
+    /// doesn't cover it) but is repeatable across occurrences via
+    /// `ArgAction::Append`, and had the identical hyphen-value bug on that
+    /// different clap shape -- a value starting with `-` (a legitimately
+    /// hyphen-prefixed directory name) was rejected before reaching this
+    /// crate's own logic. Introspects live `Command` definitions the same
+    /// way #1150's guardrail does, so any future `Append`-action,
+    /// single-value-per-occurrence arg is caught immediately.
+    #[test]
+    fn test_append_action_args_allow_hyphen_values_1203() {
+        use clap::CommandFactory;
+
+        for cmd in [JqCommand::command(), YqCommand::command()] {
+            for arg in cmd.get_arguments() {
+                if arg.is_positional() {
+                    continue;
+                }
+                if matches!(arg.get_action(), clap::ArgAction::Append) {
+                    assert!(
+                        arg.is_allow_hyphen_values_set(),
+                        "--{} in `{}` is repeatable (ArgAction::Append) but doesn't set \
+                         allow_hyphen_values -- see #1203",
                         arg.get_id(),
                         cmd.get_name()
                     );
