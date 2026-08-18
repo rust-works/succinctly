@@ -1777,19 +1777,37 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentValue for StandardJson<'a, W> {
                     return core::str::from_utf8(bytes).ok().map(Cow::Borrowed);
                 }
                 // Real jq's own number reader tolerates a redundant
-                // leading zero that strict RFC 8259 doesn't (`007e5` ->
-                // `7E+5`, `007.500` -> `7.500`) -- #1149, same fix as
-                // `OwnedValue::from_number_bytes`'s own leading-zero
-                // handling (shared via `strip_redundant_leading_zeros`,
-                // since this trait impl has no access to that jq-layer
-                // type). Reached by `--argjson`/`--slurpfile`/`--seq`
-                // and this crate's own `.json`-file input paths, which
-                // materialize through this generic `DocumentValue`
-                // trait rather than `from_number_bytes` directly.
+                // leading zero that strict RFC 8259 doesn't (`007` ->
+                // `7`, `007e5` -> `7E+5`, `007.500` -> `7.500`) -- #1149,
+                // same leniency as `OwnedValue::from_number_bytes`'s own
+                // leading-zero handling (shared gate via
+                // `strip_redundant_leading_zeros`, since this trait impl
+                // has no access to that jq-layer type). Reached by
+                // `--argjson`/`--jsonargs` (`parse_json_value`'s own
+                // normalize-and-retry validation lets a leading-zero
+                // literal survive to materialize here) and this crate's
+                // own `.json`-file input path, which both materialize
+                // through this generic `DocumentValue` trait rather than
+                // `from_number_bytes` directly. `--slurpfile`/`--seq`
+                // don't reach this arm at all -- both validate via a
+                // stricter path with no leading-zero retry
+                // (`parse_json_stream`'s `serde_json::Deserializer`,
+                // `parse_json_seq`'s `validate_and_materialize_json`), so
+                // a leading-zero literal there still errors/is dropped
+                // before ever reaching `number_literal()` (confirmed
+                // live; pre-existing, out-of-scope gap, unchanged by this
+                // fix). Returns the *original*
+                // `bytes` here, not the stripped copy the gate check
+                // builds -- dropping the redundant zero is purely a
+                // display-time concern (`format_number_jq_compat`), not
+                // something the stored spelling itself needs to already
+                // reflect (matches `from_number_bytes`'s own leading-dot
+                // and leading-zero handling, both of which store the
+                // original text for the same reason).
                 if let Some(stripped) = crate::json::validate::strip_redundant_leading_zeros(bytes)
                 {
                     if crate::json::validate::is_valid_number(&stripped) {
-                        return String::from_utf8(stripped).ok().map(Cow::Owned);
+                        return core::str::from_utf8(bytes).ok().map(Cow::Borrowed);
                     }
                 }
                 // The semi-index scanner accepts number *spans* more

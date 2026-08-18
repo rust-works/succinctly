@@ -225,11 +225,16 @@ pub fn format_number_jq_compat(raw: &[u8]) -> String {
         // Plain integer - canonicalize away an insignificant leading
         // zero/`+` (#1224, mirroring #1180's identical fix for the
         // exponent-notation mantissa path -- `split_mantissa`/
-        // `normalize_extreme_literal_mantissa` below). `is_valid_number`-
-        // gated callers never reach this function with such a spelling in
-        // the first place (strict RFC 8259 has no leading zero or `+`);
-        // this only matters for a caller that constructs a `NumberLiteral`
-        // directly, bypassing that gate.
+        // `normalize_extreme_literal_mantissa` below). Originally
+        // reachable only via a directly-constructed `NumberLiteral`
+        // bypassing `is_valid_number`'s gate (#1224's own note) -- #1149's
+        // leading-zero materialization fix (`from_number_bytes`,
+        // `DocumentValue::number_literal`) now makes this a real,
+        // exercised path too: both store the *original* un-stripped bytes
+        // as the literal spelling (matching the leading-dot case just
+        // below) and rely entirely on this canonicalization to fix
+        // display, rather than each independently stripping the zero
+        // themselves.
         return strip_insignificant_leading_zero_and_plus(s);
     }
 
@@ -241,12 +246,9 @@ pub fn format_number_jq_compat(raw: &[u8]) -> String {
         // leading-dot spelling even under plain identity -- confirmed
         // live: `.500 | .` -> `0.500` (#1171) -- for free: an *absent*
         // integer part strips to the same canonical `0` a `007`-style one
-        // does. `is_valid_number`-gated callers never reach this function
-        // with a leading-dot `s` in the first place (strict RFC 8259 has
-        // no such spelling); this only fires for `s` sourced from a
-        // `NumberLiteral` this crate's own document-input scanners now
-        // recognize as jq-lenient (see `number_literal_end`,
-        // `src/json/light.rs`).
+        // does. Also now the real display fix for #1149's leading-zero
+        // leniency (`007.500` -> `7.500`), for the same reason as the
+        // plain-integer branch above.
         return strip_insignificant_leading_zero_and_plus(s);
     }
 
@@ -855,19 +857,28 @@ impl OwnedValue {
             }
         }
         // Real jq's own number reader also tolerates a redundant leading
-        // zero in the integer part -- but unlike the leading-dot case
-        // above (which *adds* a digit and keeps everything else from the
-        // original text), real jq's own display *drops* the redundant
-        // zero itself while preserving everything else about the
-        // spelling (`007` -> `7`, `007e5` -> `7E+5` [reformatted like any
-        // exponent literal], `007.500` -> `7.500` [trailing zeros kept]).
-        // So the literal materialized here is the *stripped* text, not
-        // the original `bytes` -- confirmed live against jq 1.7.1 (an
-        // earlier draft of this fix materialized the original,
-        // leading-zero-intact text instead, which is wrong: caught by
-        // review before merge). The *only* reason this needs handling
-        // here at all: the CLI's own `--argjson`-style "normalize, retry"
-        // fix (#1094, `normalize_leading_zero_numbers` in
+        // zero in the integer part (`007` -> `7`, `007e5` -> `7E+5`,
+        // `007.500` -> `7.500`, trailing zeros and exponent notation
+        // otherwise kept) -- confirmed live against jq 1.7.1. As with the
+        // leading-dot case just above, materialize the *original* `bytes`
+        // as the literal spelling, not a stripped copy: dropping the
+        // redundant zero is purely a display-time concern
+        // (`format_number_jq_compat` strips it in its plain-integer and
+        // plain-decimal-without-exponent branches, the only branches that
+        // echo `NumberLiteral` text verbatim -- every exponent-bearing
+        // branch already reformats from the *parsed* value/exponent
+        // digits, leading zeros and all, so it needs no separate
+        // handling), not something the stored spelling itself needs to
+        // already reflect. `bytes` was already gated by
+        // `strip_redundant_leading_zeros` + `is_valid_number` below, so no
+        // separate reparse of the original text is needed here (an
+        // earlier draft of this fix stored the *stripped* text directly
+        // here instead, duplicating the display-time fix at both
+        // materializer call sites; review found it simpler to store the
+        // original everywhere, matching the leading-dot case, and fix
+        // display once). The *only* reason this needs handling here at
+        // all: the CLI's own `--argjson`-style "normalize, retry" fix
+        // (#1094, `normalize_leading_zero_numbers` in
         // `src/bin/succinctly/jq_runner.rs`) doesn't reach here -- it's a
         // CLI-arg-only helper, not wired into this shared conversion, so
         // the plain document-input path (and `--argjson` too, since it
@@ -876,8 +887,7 @@ impl OwnedValue {
         // exponent notation *and* any trailing zeros in one go (#1149).
         if let Some(stripped) = crate::json::validate::strip_redundant_leading_zeros(bytes) {
             if crate::json::validate::is_valid_number(&stripped) {
-                return core::str::from_utf8(&stripped)
-                    .map_or(Self::Null, Self::from_number_literal);
+                return core::str::from_utf8(bytes).map_or(Self::Null, Self::from_number_literal);
             }
         }
         let Ok(s) = core::str::from_utf8(bytes) else {
