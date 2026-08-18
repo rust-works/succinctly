@@ -2392,6 +2392,12 @@ mod tests {
         // e0 eliminates the exponent; when the result is a whole number it
         // takes the integer-formatting branch rather than float Display.
         assert_eq!(format_number_jq_compat(b"5e0"), "5");
+        // #1207 review: this branch's own `is_sign_negative()` arm is only
+        // reachable via a genuinely negative *nonzero* integer literal now
+        // that `value == 0.0` (including `-0.0`) is intercepted earlier by
+        // `format_near_zero_literal` -- no existing test exercised that arm
+        // through its real case rather than incidentally through `-0e0`.
+        assert_eq!(format_number_jq_compat(b"-5e0"), "-5");
     }
 
     /// #1008 code review: this was pinned to `"0"`, but real jq keeps the
