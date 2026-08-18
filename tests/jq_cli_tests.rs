@@ -12638,3 +12638,18 @@ fn test_jq_string_repetition_accepts_float_count_1230() -> Result<()> {
     assert_eq!(out.trim(), "null");
     Ok(())
 }
+
+/// A destructuring pattern nested past the parser's depth limit exits
+/// cleanly with a compile error instead of overflowing the process stack --
+/// regression test for #1240, reachable from query text alone (no large
+/// input document needed). Mirrors the issue's own live repro.
+#[test]
+fn test_as_pattern_deep_nesting_exits_cleanly_not_stack_overflow_1240() -> Result<()> {
+    let n = 100_000;
+    let pattern = format!("{}$x{}", "{a: ".repeat(n), "}".repeat(n));
+    let query = format!(". as {pattern} | $x");
+    let (out, err, code) = run_jq_full(&["-cn", &query], None)?;
+    assert_ne!(code, 0, "out={out:?} err={err:?}");
+    assert!(err.contains("depth limit"), "err={err}");
+    Ok(())
+}
