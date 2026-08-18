@@ -14200,6 +14200,23 @@ fn test_1198_left_null_sub_preserves_number_literal_spelling() -> Result<()> {
     Ok(())
 }
 
+/// Mixed Int/Float subtraction -- unchanged logic, merely re-indented one
+/// level by #1198's restructuring of `arith_sub`'s outer match. Direct
+/// coverage for the two arms `omni-dev coverage diff` flagged as new lines
+/// (their surrounding indentation changed even though the arms themselves
+/// didn't).
+#[test]
+fn test_1198_mixed_int_float_subtraction_unaffected() -> Result<()> {
+    let (out, code) = run_yq_stdin("5 - 2.5", "null", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "2.5");
+
+    let (out, code) = run_yq_stdin("5.5 - 2", "null", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "3.5");
+    Ok(())
+}
+
 // --- #1116: chained scalar-slice-assignment no-ops too; del() differs ---
 //
 // #1101 covered only a *bare* scalar-slice path (`.[S:E]`). #1116 extends
