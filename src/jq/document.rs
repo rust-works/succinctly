@@ -395,9 +395,14 @@ pub trait DocumentFields: Sized + Clone {
     /// Find a field by name and return a cursor to its value.
     ///
     /// Must agree with [`find`](Self::find) on which field wins when a name
-    /// is repeated (YAML keeps the last duplicate key; JSON keeps the
-    /// first), so callers can switch between the two without a behavior
-    /// change — see the per-format `find`/`find_cursor` implementations.
+    /// is repeated -- both formats keep the *last* duplicate key here
+    /// (YAML: #174; JSON: #1251, matching real jq/RFC 8259), so callers can
+    /// switch between the two without a behavior change. This is the
+    /// opposite of YAML's own genuine-duplicates *preservation* elsewhere
+    /// (`to_entries`'s cursor-native walk, #443) -- `find`/`find_cursor`
+    /// answer "what does this key resolve to", `to_entries` answers "what
+    /// are all the entries", and only YAML keeps every entry distinct for
+    /// the latter question.
     fn find_cursor(&self, name: &str) -> Option<Self::Cursor>;
 
     /// Check if there are no fields.

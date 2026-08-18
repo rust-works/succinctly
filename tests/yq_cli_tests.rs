@@ -936,6 +936,21 @@ fn test_duplicate_json_key_to_entries_deduplicates_1170() -> Result<()> {
     Ok(())
 }
 
+/// #1251: `.a` field access on `--input-format json` input with a
+/// duplicate key must resolve to the *last* value, matching real jq /
+/// RFC 8259 convention -- the JSON-side sibling of #174's YAML fix, and
+/// the opposite of YAML's own genuine-duplicates preservation for
+/// `to_entries` (#443, above).
+#[test]
+fn test_duplicate_json_key_field_access_last_wins_1251() -> Result<()> {
+    let json = r#"{"a":1,"b":2,"a":3}"#;
+    let (output, code) = run_yq_stdin(".a", json, &["--input-format", "json"])?;
+
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "3");
+    Ok(())
+}
+
 /// #478: `--slurp '.'` shares the same `IndexMap`-backed conversion
 /// (`yaml_to_owned_value`) #442 didn't touch, so it kept collapsing
 /// duplicate keys within each slurped element even after plain `yq '.'`
