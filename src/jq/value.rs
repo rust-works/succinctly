@@ -118,6 +118,45 @@ pub(crate) fn parse_i64_or_f64(s: &str) -> Option<NumberRepr> {
     }
 }
 
+/// Canonicalize a non-exponent literal's insignificant leading zero/`+`
+/// (#1224, mirroring #1180's identical fix for the exponent-notation
+/// mantissa path -- `split_mantissa`/`normalize_extreme_literal_mantissa`
+/// below), for `format_number_jq_compat`'s own two non-exponent branches --
+/// one shared definition rather than two hand-copied ones, per the #106
+/// "duplicated predicates diverge silently" lesson in `CLAUDE.md`.
+///
+/// A leading `-` is always kept, including when every remaining digit is
+/// zero (`-000` -> `-0`), matching real jq's own negative-zero
+/// preservation (oracle-verified: `echo -000 | jq .` -> `-0`); a leading
+/// `+` is always dropped entirely, matching jq's own canonical output
+/// never emitting one (oracle-verified: `echo +007 | jq .` -> `7`). Only
+/// the *integer* part (before any `.`) ever loses a digit -- the
+/// fractional part, trailing zeros included, is untouched, matching this
+/// module's own trailing-zero-preservation rule. A leading-dot spelling
+/// (`.5`) has an empty integer part to begin with, which strips to the
+/// same canonical `"0"` a `007`-style one does (oracle-verified: `echo
+/// 007.5 | jq .` -> `7.5`, `echo .5 | jq .` -> `0.5`) -- so this also
+/// subsumes #1171's separate leading-dot-gets-a-`0`-prefix rule, rather
+/// than needing its own case.
+fn strip_insignificant_leading_zero_and_plus(s: &str) -> String {
+    let (sign, rest) = match s.strip_prefix('-') {
+        Some(rest) => ("-", rest),
+        None => ("", s.strip_prefix('+').unwrap_or(s)),
+    };
+    let (int_part, frac_part) = match rest.split_once('.') {
+        Some((i, f)) => (i, Some(f)),
+        None => (rest, None),
+    };
+    let canonical_int = match int_part.trim_start_matches('0') {
+        "" => "0",
+        trimmed => trimmed,
+    };
+    match frac_part {
+        Some(f) => format!("{sign}{canonical_int}.{f}"),
+        None => format!("{sign}{canonical_int}"),
+    }
+}
+
 /// Format a raw JSON number string the way jq itself would print it.
 ///
 /// This is jq's number formatting, not a verbatim echo of `raw`: jq always
@@ -127,19 +166,51 @@ pub(crate) fn parse_i64_or_f64(s: &str) -> Option<NumberRepr> {
 /// on demand (Rust's own `f64`/`i64` `Display` can't reproduce it -- that
 /// mismatch is issue #387).
 ///
-/// - Integers: output as-is
-/// - Floats with trailing zeros: preserve them (`0.10` -> `0.10`)
+/// - Integers: output as-is, except an insignificant leading zero/`+` is
+///   stripped (`007` -> `7`, `+7` -> `7`; #1224, only reachable via a
+///   directly-constructed `NumberLiteral` -- see `is_valid_number`'s own
+///   gate, which never lets this spelling through the document/query
+///   input paths)
+/// - Floats with trailing zeros: preserve them (`0.10` -> `0.10`); an
+///   insignificant leading zero/`+` in the integer part is stripped the
+///   same way integers are (`007.10` -> `7.10`)
 /// - Scientific notation: normalize mantissa (`12e2` -> `1.2E+3`), uppercase E, explicit +
 /// - `e0`/`e-0`: eliminate the exponent entirely (`5.5e0` -> `5.5`)
 /// - Negative exponents >= -5: convert to decimal (`1e-3` -> `0.001`)
 /// - Negative exponents < -5: keep scientific (`1e-10` -> `1E-10`)
-/// - Negative zero: preserved as `-0`
+/// - Negative zero: preserved as `-0` (`-000` also collapses to `-0`, not
+///   `0` -- the sign survives stripping an all-zero digit string, matching
+///   real jq's own `-0` preservation, oracle-verified)
 ///
 /// Shared by the CLI's `--jq-compat` output formatter
 /// (`src/bin/succinctly/jq_runner.rs`) and every library-level path that
 /// renders a `NumberLiteral` (`to_json`, `tostring`, `@json`, string
 /// interpolation, error-message previews) -- a single definition so the two
 /// cannot drift, per the #106 lesson in `CLAUDE.md`.
+///
+/// # Design note (#1224)
+///
+/// This function is deliberately permissive, not precondition-gated:
+/// every internal construction site for a `NumberLiteral`
+/// (`from_number_bytes`, the jq-filter lexer, JSON's `number_literal()`,
+/// YAML's `is_preservable_float_literal`) already only ever produces
+/// RFC-8259-canonical number syntax or this crate's one deliberately
+/// lenient exception, a leading-dot spelling (`.5`/`-.5`, #1171) -- but
+/// `OwnedValue::NumberLiteral`/`Literal::NumberLiteral` are both public
+/// enum variants with public fields, so nothing at the *type* level stops
+/// an external caller from constructing one with arbitrary text and
+/// reaching this function through 100% safe code. Rather than assert that
+/// precondition (tried, and reverted: it fired on this module's own
+/// existing tests for genuinely malformed input -- invalid UTF-8,
+/// unparseable exponents, #1180's own leading-zero-mantissa repros --
+/// which this function has always been expected to degrade gracefully on,
+/// not reject), every code path here already falls back to a reasonable
+/// best-effort result instead of panicking: invalid UTF-8 renders lossily,
+/// an unparseable exponent echoes the raw text unchanged, and (since this
+/// same fix) an insignificant leading zero/`+` on the plain-integer/
+/// decimal paths canonicalizes rather than echoing verbatim. A future
+/// caller passing genuinely unexpected text gets a defined, non-panicking
+/// answer either way.
 pub fn format_number_jq_compat(raw: &[u8]) -> String {
     let s = match core::str::from_utf8(raw) {
         Ok(s) => s,
@@ -151,28 +222,32 @@ pub fn format_number_jq_compat(raw: &[u8]) -> String {
     let has_dot = s.contains('.');
 
     if !has_exp && !has_dot {
-        // Plain integer - output as-is
-        return s.to_string();
+        // Plain integer - canonicalize away an insignificant leading
+        // zero/`+` (#1224, mirroring #1180's identical fix for the
+        // exponent-notation mantissa path -- `split_mantissa`/
+        // `normalize_extreme_literal_mantissa` below). `is_valid_number`-
+        // gated callers never reach this function with such a spelling in
+        // the first place (strict RFC 8259 has no leading zero or `+`);
+        // this only matters for a caller that constructs a `NumberLiteral`
+        // directly, bypassing that gate.
+        return strip_insignificant_leading_zero_and_plus(s);
     }
 
     if !has_exp {
-        // Plain decimal without exponent - preserve as-is (keeps trailing
-        // zeros), except real jq's own reader adds a leading `0` to a
+        // Plain decimal without exponent - preserve trailing zeros
+        // (`0.10` stays `0.10`), but canonicalize an insignificant leading
+        // zero/`+` in the integer part the same way (#1224). This also
+        // folds in real jq's own reader adding a leading `0` to a
         // leading-dot spelling even under plain identity -- confirmed
-        // live: `.500 | .` -> `0.500` (trailing zeros still kept
-        // verbatim), not `.500` (#1171). `is_valid_number`-gated callers
-        // never reach this function with a leading-dot `s` in the first
-        // place (strict RFC 8259 has no such spelling); this only fires
-        // for `s` sourced from a `NumberLiteral` this crate's own
-        // document-input scanners now recognize as jq-lenient (see
-        // `number_literal_end`, `src/json/light.rs`).
-        return if let Some(rest) = s.strip_prefix('.') {
-            format!("0.{rest}")
-        } else if let Some(rest) = s.strip_prefix("-.") {
-            format!("-0.{rest}")
-        } else {
-            s.to_string()
-        };
+        // live: `.500 | .` -> `0.500` (#1171) -- for free: an *absent*
+        // integer part strips to the same canonical `0` a `007`-style one
+        // does. `is_valid_number`-gated callers never reach this function
+        // with a leading-dot `s` in the first place (strict RFC 8259 has
+        // no such spelling); this only fires for `s` sourced from a
+        // `NumberLiteral` this crate's own document-input scanners now
+        // recognize as jq-lenient (see `number_literal_end`,
+        // `src/json/light.rs`).
+        return strip_insignificant_leading_zero_and_plus(s);
     }
 
     // Has exponent - need to reformat according to jq rules
@@ -2333,6 +2408,47 @@ mod tests {
         assert_eq!(format_number_jq_compat(b"5.5e0"), "5.5");
         // Negative exponents within [-5, -1] expand to decimal.
         assert_eq!(format_number_jq_compat(b"1e-3"), "0.001");
+    }
+
+    /// #1224: only reachable via a directly-constructed `NumberLiteral`
+    /// (see the function's own doc comment) -- `is_valid_number`'s gate
+    /// never lets this spelling through document/query input, so there's
+    /// no CLI repro, only this unit-level one. Oracle-verified via jq's
+    /// own lenient reader (`echo 007 | jq .` -> `7`, `echo +007 | jq .` ->
+    /// `7`, `echo 007.5 | jq .` -> `7.5`, `echo -007 | jq .` -> `-7`,
+    /// `echo -000 | jq .` -> `-0`) -- confirms the *target* canonical
+    /// spelling, not just that the old verbatim-echo was wrong.
+    #[test]
+    fn test_format_number_jq_compat_plain_integer_strips_leading_zero_and_plus() {
+        assert_eq!(format_number_jq_compat(b"007"), "7");
+        assert_eq!(format_number_jq_compat(b"+007"), "7");
+        assert_eq!(format_number_jq_compat(b"+7"), "7");
+        assert_eq!(format_number_jq_compat(b"-007"), "-7");
+        // All-zero digits collapse to a single canonical "0" -- but the
+        // sign survives even then (real jq's own negative-zero rule).
+        assert_eq!(format_number_jq_compat(b"000"), "0");
+        assert_eq!(format_number_jq_compat(b"-000"), "-0");
+        // Already-canonical spellings are unaffected.
+        assert_eq!(format_number_jq_compat(b"0"), "0");
+        assert_eq!(format_number_jq_compat(b"-0"), "-0");
+        assert_eq!(format_number_jq_compat(b"7"), "7");
+    }
+
+    /// Same rule, plain-decimal branch -- only the integer part loses a
+    /// digit; trailing zeros in the fractional part are untouched.
+    /// Oracle-verified (`echo -007.500 | jq .` -> `-7.500`).
+    #[test]
+    fn test_format_number_jq_compat_plain_decimal_strips_leading_zero_and_plus() {
+        assert_eq!(format_number_jq_compat(b"007.5"), "7.5");
+        assert_eq!(format_number_jq_compat(b"+1.5"), "1.5");
+        assert_eq!(format_number_jq_compat(b"-007.500"), "-7.500");
+        assert_eq!(format_number_jq_compat(b"000.000"), "0.000");
+        assert_eq!(format_number_jq_compat(b"-000.0"), "-0.0");
+        // Already-canonical spellings, including #1171's own leading-dot
+        // case, are unaffected -- the same helper now covers both.
+        assert_eq!(format_number_jq_compat(b"0.10"), "0.10");
+        assert_eq!(format_number_jq_compat(b".500"), "0.500");
+        assert_eq!(format_number_jq_compat(b"-.500"), "-0.500");
     }
 
     #[test]
