@@ -456,15 +456,6 @@ pub enum Pattern {
     Object(Vec<PatternEntry>),
     /// Array pattern: `[$first, $second]`
     Array(Vec<Self>),
-    /// Object-pattern entry `{$x: Pattern}` (#1204): binds the matched
-    /// value to `$x` *and* separately destructures the same value against
-    /// the nested `Pattern` -- distinct from the `{$x}` shorthand
-    /// ([`Pattern::Var`], no further destructuring) and from `key: Pattern`
-    /// ([`PatternEntry`], where the key is a literal rather than a
-    /// binding). Only ever constructed as a `PatternEntry`'s own
-    /// `pattern`, never as a bare/array-element pattern -- real jq's
-    /// grammar has no `$x: Pattern` outside an object-pattern entry.
-    VarAndPattern(String, Box<Self>),
 }
 
 /// An entry in an object destructuring pattern.

@@ -1656,12 +1656,18 @@ impl<'a> Parser<'a> {
                     // destructure the matched value -- `$a` still binds the
                     // whole value under its own name (same as the bare
                     // shorthand), *and* `Pattern` binds again, independently,
-                    // against that same value. Distinct from both the bare
-                    // `$a` shorthand above (no further destructuring) and
-                    // the `key: Pattern` form below (key is a literal, never
-                    // a binding). Peeking past the identifier for `:` is
-                    // required to tell the two `$`-led shapes apart.
-                    let (key, pattern) = if self.peek() == Some('$') {
+                    // against that same value. Desugared here into *two*
+                    // ordinary entries sharing one key, rather than a new
+                    // `Pattern` variant: `Pattern::Object`'s own evaluation
+                    // already re-fetches the value once per entry regardless
+                    // of key uniqueness (real jq's own object patterns
+                    // already tolerate a repeated key the same way --
+                    // confirmed live), so two same-key entries reproduce
+                    // `{$a: Pattern}`'s exact semantics with no new
+                    // AST shape or evaluator match arm needed. Peeking past
+                    // the identifier for `:` is required to tell the two
+                    // `$`-led shapes apart.
+                    if self.peek() == Some('$') {
                         self.next();
                         let name = self.parse_ident()?;
                         self.skip_ws();
@@ -1669,9 +1675,19 @@ impl<'a> Parser<'a> {
                             self.next();
                             self.skip_ws();
                             let nested = self.parse_pattern()?;
-                            (name.clone(), Pattern::VarAndPattern(name, Box::new(nested)))
+                            entries.push(PatternEntry {
+                                key: name.clone(),
+                                pattern: Pattern::Var(name.clone()),
+                            });
+                            entries.push(PatternEntry {
+                                key: name,
+                                pattern: nested,
+                            });
                         } else {
-                            (name.clone(), Pattern::Var(name))
+                            entries.push(PatternEntry {
+                                key: name.clone(),
+                                pattern: Pattern::Var(name),
+                            });
                         }
                     } else {
                         // Parse key (must be identifier or string)
@@ -1687,9 +1703,8 @@ impl<'a> Parser<'a> {
 
                         // Parse the pattern for this key
                         let pattern = self.parse_pattern()?;
-                        (key, pattern)
-                    };
-                    entries.push(PatternEntry { key, pattern });
+                        entries.push(PatternEntry { key, pattern });
+                    }
 
                     self.skip_ws();
                     match self.peek() {
