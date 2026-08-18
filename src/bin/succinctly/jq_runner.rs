@@ -3023,4 +3023,107 @@ mod tests {
             "{err:?}"
         );
     }
+
+    /// #1192: the `Ok` side of `standard_json_to_jq_value`'s string arm and
+    /// its object-key handling -- the decode-*failure* tests above only
+    /// exercise the `Err` side of each.
+    #[test]
+    fn test_standard_json_to_jq_value_succeeds_on_valid_input_1192() {
+        let json: &[u8] = b"\"hello\"";
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+        let jq_value = standard_json_to_jq_value(value, &cursor).unwrap();
+        assert!(matches!(jq_value, JqValue::String(s) if s == "hello"));
+
+        let json: &[u8] = b"{\"a\": 1, \"b\": 2}";
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+        let jq_value = standard_json_to_jq_value(value, &cursor).unwrap();
+        let JqValue::Object(map) = jq_value else {
+            panic!("expected an object");
+        };
+        assert_eq!(map.keys().collect::<Vec<_>>(), vec!["a", "b"]);
+    }
+
+    /// #1192: a key that isn't `StandardJson::String` at all (structurally
+    /// malformed, not a decode failure) still silently drops the field --
+    /// unchanged from before this fix, and deliberately so (#1194's
+    /// territory). A bare numeric key with a valid sibling field reaches
+    /// the per-field drop (`{invalid}` alone does not -- see the matching
+    /// test in `eval_generic.rs` for why).
+    #[test]
+    fn test_standard_json_to_jq_value_drops_structurally_malformed_key_1194() {
+        let json: &[u8] = b"{123: 1, \"b\": 2}";
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+        let jq_value = standard_json_to_jq_value(value, &cursor).unwrap();
+        let JqValue::Object(map) = jq_value else {
+            panic!("expected an object");
+        };
+        assert_eq!(map.keys().collect::<Vec<_>>(), vec!["b"]);
+    }
+
+    /// #1192: `generic_result_to_jq_values`'s own `One`/`Many` arms --
+    /// direct construction, since no ordinary top-level jq/yq expression
+    /// found during this fix's development routes a *document-sourced*
+    /// decode failure through this wrapper (see the sibling note on
+    /// `standard_json_to_jq_value`'s doc comment).
+    #[test]
+    fn test_generic_result_to_jq_values_one_ok_and_err_1192() {
+        let json: &[u8] = b"\"hello\"";
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+        let mut sink = ErrorSink::default();
+        let out = generic_result_to_jq_values(
+            GenericResult::One(value),
+            cursor,
+            &InputLocation::at(None, 1),
+            &mut sink,
+        );
+        assert_eq!(out.len(), 1);
+        assert!(!sink.hit());
+
+        let json: &[u8] = b"\"\xff\xfe\"";
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+        let mut sink = ErrorSink::default();
+        let out = generic_result_to_jq_values(
+            GenericResult::One(value),
+            cursor,
+            &InputLocation::at(None, 1),
+            &mut sink,
+        );
+        assert!(out.is_empty());
+        assert!(sink.hit());
+    }
+
+    /// #1192: `generic_result_to_jq_values`'s `Many` arm stops at the first
+    /// decode failure, keeping the already-converted prefix and reporting
+    /// exactly once -- matching how an ordinary `error`/`break` mid-
+    /// generator stops the rest of a stream elsewhere in this evaluator
+    /// (#1164), not a "skip the bad one and keep going" semantic.
+    #[test]
+    fn test_generic_result_to_jq_values_many_stops_at_first_failure_1192() {
+        let json: &[u8] = b"[1, \"\xff\xfe\", 3]";
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let StandardJson::Array(elements) = cursor.value() else {
+            panic!("expected an array");
+        };
+        let vs: Vec<StandardJson<_>> = elements.collect();
+        let mut sink = ErrorSink::default();
+        let out = generic_result_to_jq_values(
+            GenericResult::Many(vs),
+            cursor,
+            &InputLocation::at(None, 1),
+            &mut sink,
+        );
+        assert!(matches!(out.as_slice(), [JqValue::RawNumber(_)]));
+        assert!(sink.hit());
+    }
 }

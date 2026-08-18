@@ -990,6 +990,20 @@ fn eval_on_owned<S: EvalSemantics, V: DocumentValue>(
     // `Error` this bridge returns is caught, if at all, by the *caller's*
     // own `Expr::Optional`/`eval_try`-style boundary, not by wrapping it a
     // second time here.
+    // Every `Err(e)` arm below (#1192) is defense-in-depth rather than a
+    // reachable path: `cursor` is always rooted at `owned.to_json_for_reindex
+    // ::<S>()`, a fresh serialization of an already-decoded `OwnedValue`
+    // (a Rust `String`, which by construction can't hold invalid UTF-8, and
+    // whose escapes this crate's own serializer writes). `owned_from_
+    // standard_json` can only fail on genuinely malformed source bytes, which
+    // this function never sees -- confirmed empirically (~25 jq expressions
+    // over documents with real malformed UTF-8, none reached these `Err`
+    // arms) as well as structurally (same "can this document ever be
+    // malformed" argument `eval.rs`'s own textually-similar `to_owned`
+    // copy relies on to stay out of #1192's scope entirely). Kept as `Err`
+    // arms rather than `.unwrap()`/`.expect()` because the *type* (`Result`)
+    // is what lets a real failure, if this invariant is ever violated by a
+    // future change, surface as a normal `EvalError` instead of a panic.
     match full_eval::<Vec<u64>, S>(expr, cursor) {
         QueryResult::One(v) => match owned_from_standard_json(&v) {
             Ok(o) => GenericResult::Owned(o),
@@ -2719,6 +2733,16 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
             // *caller's* own `Expr::Optional`/`eval_try`-style boundary.
 
             // Evaluate using the full evaluator
+            //
+            // Every `Err(e)` arm below (#1192) is defense-in-depth, same as
+            // `eval_on_owned`'s matching comment: `cursor` is rooted at a
+            // fresh serialization (`to_json_for_reindex`) of `owned`, and
+            // `owned` itself already went through `to_owned_with_cursor`
+            // above -- any malformed string in the *original* document was
+            // already silently degraded there (that gap is #1192's
+            // remaining, out-of-scope half, tracked as #1247), not carried
+            // through as malformed bytes for `owned_from_standard_json` to
+            // ever encounter here.
             match full_eval::<Vec<u64>, S>(expr, cursor) {
                 QueryResult::One(v) => {
                     // Convert StandardJson back to OwnedValue
@@ -9424,6 +9448,136 @@ mod tests {
         assert!(
             err.message.contains("invalid UTF-8") && err.message.contains("object key"),
             "{err:?}"
+        );
+    }
+
+    /// #1192: a key that isn't `StandardJson::String` at all (structurally
+    /// malformed, not a decode failure) still silently drops the field --
+    /// unchanged from before this fix, and deliberately so (#1194's
+    /// territory). `{invalid}` (#1194's own repro) doesn't reach the
+    /// dropping arm this test targets: its lone malformed field never gets
+    /// paired into a `JsonField` at all (a *different* #1194 swallow point,
+    /// `JsonFields::uncons()`'s own collapse of "no sibling to pair as a
+    /// value" into "no more fields"), so `{123: 1, "b": 2}` is used instead
+    /// -- a bare numeric key with a valid sibling field, which does reach
+    /// the per-field drop this fix's object handling deliberately leaves
+    /// alone.
+    #[test]
+    fn test_owned_from_standard_json_drops_structurally_malformed_key_1194() {
+        let json: &[u8] = b"{123: 1, \"b\": 2}";
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+        let owned = owned_from_standard_json(&value).unwrap();
+        let OwnedValue::Object(map) = owned else {
+            panic!("expected an object");
+        };
+        assert_eq!(map.len(), 1);
+        assert_eq!(map.get("b"), Some(&OwnedValue::from_number_literal("2")));
+    }
+
+    /// #1192: the `Ok` side of `eval_on_owned`'s `QueryResult::One` arm --
+    /// the decode-failure tests above only exercise its `Err` side.
+    /// `keys_unsorted | sort` isn't one of `LazyKeys`'s dedicated fast-path
+    /// arms (only `.[]`/computed-index/`first`/`last`/a leading `map` are),
+    /// so it materializes and routes through `eval_on_owned`'s "reindex
+    /// bridge" -- confirmed by direct instrumentation while developing this
+    /// test, not just inferred from the doc comments.
+    #[test]
+    fn test_eval_on_owned_one_ok_via_keys_sort_1192() {
+        let json = br#"{"b": 1, "a": 2, "c": 3}"#;
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+        let expr = crate::jq::parse("keys_unsorted | sort").unwrap();
+        let result = eval(&expr, value);
+        assert_eq!(
+            result.into_owned().unwrap(),
+            OwnedValue::Array(vec![
+                OwnedValue::String("a".to_string()),
+                OwnedValue::String("b".to_string()),
+                OwnedValue::String("c".to_string()),
+            ])
+        );
+    }
+
+    /// #1192: the `Ok` (all-succeed) side of `eval_on_owned`'s `QueryResult::
+    /// Many` loop -- same reasoning as the `One` test above, but for a query
+    /// that produces multiple outputs through the same bridge.
+    #[test]
+    fn test_eval_on_owned_many_ok_via_keys_comma_index_1192() {
+        let json = br#"{"b": 1, "a": 2, "c": 3}"#;
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+        let expr = crate::jq::parse("keys_unsorted | (.[0], .[1])").unwrap();
+        let result = eval(&expr, value);
+        assert_eq!(
+            result.collect_owned(),
+            vec![
+                OwnedValue::String("b".to_string()),
+                OwnedValue::String("a".to_string()),
+            ]
+        );
+    }
+
+    /// #1192: the `Ok` side of `eval_single`'s *own* full-evaluator fallback
+    /// arm (a duplicate of `eval_on_owned`'s bridge, see the comment on that
+    /// arm) -- `reduce`'s own accumulator handling routes here directly,
+    /// without going through `eval_on_owned` at all (confirmed by direct
+    /// instrumentation), so it needs its own dedicated coverage.
+    #[test]
+    fn test_eval_single_fallback_one_ok_via_reduce_1192() {
+        let json = br"[1, 2, 3]";
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+        let expr = crate::jq::parse("reduce .[] as $x (0; $x)").unwrap();
+        let result = eval(&expr, value);
+        assert_eq!(result.into_owned().unwrap(), OwnedValue::Int(3));
+    }
+
+    /// #1192: the `Ok` (all-succeed) side of `eval_single`'s fallback
+    /// `QueryResult::Many` loop -- `foreach`'s per-step output list routes
+    /// here directly, same as the `reduce` case above.
+    #[test]
+    fn test_eval_single_fallback_many_ok_via_foreach_1192() {
+        let json = br"null";
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+        let expr = crate::jq::parse(r#"foreach range(3) as $i (""; . + "x"; .)"#).unwrap();
+        let result = eval(&expr, value);
+        assert_eq!(
+            result.collect_owned(),
+            vec![
+                OwnedValue::String("x".to_string()),
+                OwnedValue::String("xx".to_string()),
+                OwnedValue::String("xxx".to_string()),
+            ]
+        );
+    }
+
+    /// #1192: the `Ok` side of `eval_on_owned`'s `QueryResult::OneCursor`
+    /// arm -- `keys_unsorted | .` re-evaluates the identity against the
+    /// freshly-reindexed materialized-keys JSON inside the bridge, which
+    /// `full_eval` resolves as a cursor rather than a decoded value
+    /// (confirmed by direct instrumentation while developing this test).
+    #[test]
+    fn test_eval_on_owned_onecursor_ok_via_keys_identity_1192() {
+        let json = br#"{"b": 1, "a": 2, "c": 3}"#;
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+        let expr = crate::jq::parse("keys_unsorted | .").unwrap();
+        let result = eval(&expr, value);
+        assert_eq!(
+            result.into_owned().unwrap(),
+            OwnedValue::Array(vec![
+                OwnedValue::String("b".to_string()),
+                OwnedValue::String("a".to_string()),
+                OwnedValue::String("c".to_string()),
+            ])
         );
     }
 }
