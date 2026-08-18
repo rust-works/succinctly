@@ -791,10 +791,12 @@ fn test_jsonargs_positional_hyphen_prefixed_values_1150() -> Result<()> {
     Ok(())
 }
 
-/// `-L`/`--library-path` (`ArgAction::Append`, exactly one value per
-/// occurrence -- a different clap shape from every arg above, which is why
-/// #1150's `allow_hyphen_values` fix didn't cover it) had the identical
-/// bug: a hyphen-prefixed module directory was rejected by clap's
+/// `-L` (`ArgAction::Append`, exactly one value per occurrence -- a
+/// different clap shape from every arg above, which is why #1150's
+/// `allow_hyphen_values` fix didn't cover it -- and short-only, unlike
+/// every other flag in this file: `succinctly jq --help` confirms there is
+/// no `--library-path` long form to invoke) had the identical bug: a
+/// hyphen-prefixed module directory was rejected by clap's
 /// negative-number/unknown-flag heuristic before ever reaching this
 /// crate's module-search-path logic. Filed as #1203 during #1150's own
 /// review; fixed separately since it needed its own `allow_hyphen_values`
@@ -804,16 +806,6 @@ fn test_jsonargs_positional_hyphen_prefixed_values_1150() -> Result<()> {
 #[test]
 fn test_library_path_hyphen_prefixed_directory_1203() -> Result<()> {
     let (stdout, _, code) = run_jq_full(&["-L", "-mymodules", "-n", "null"], None)?;
-    assert_eq!(code, 0);
-    assert_eq!(stdout.trim_end(), "null");
-    Ok(())
-}
-
-/// `-L` is repeatable (`ArgAction::Append`), so a second, later occurrence
-/// must accept a hyphen-prefixed value too, not just the first.
-#[test]
-fn test_library_path_repeated_with_hyphen_prefixed_values_1203() -> Result<()> {
-    let (stdout, _, code) = run_jq_full(&["-L", "/tmp", "-L", "-mymodules", "-n", "null"], None)?;
     assert_eq!(code, 0);
     assert_eq!(stdout.trim_end(), "null");
     Ok(())

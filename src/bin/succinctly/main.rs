@@ -2307,15 +2307,21 @@ mod tests {
         }
     }
 
-    /// Sibling guardrail for #1203: `-L`/`--library-path` takes exactly one
-    /// value *per occurrence* (so #1150's `max_values() > 1` check above
-    /// doesn't cover it) but is repeatable across occurrences via
-    /// `ArgAction::Append`, and had the identical hyphen-value bug on that
-    /// different clap shape -- a value starting with `-` (a legitimately
-    /// hyphen-prefixed directory name) was rejected before reaching this
-    /// crate's own logic. Introspects live `Command` definitions the same
-    /// way #1150's guardrail does, so any future `Append`-action,
+    /// Sibling guardrail for #1203: `-L` takes exactly one value *per
+    /// occurrence* (so #1150's `max_values() > 1` check above doesn't cover
+    /// it) but is repeatable across occurrences via `ArgAction::Append`, and
+    /// had the identical hyphen-value bug on that different clap shape -- a
+    /// value starting with `-` (a legitimately hyphen-prefixed directory
+    /// name) was rejected before reaching this crate's own logic.
+    /// Introspects live `Command` definitions the same way #1150's
+    /// guardrail does, so any future `Append`-action,
     /// single-value-per-occurrence arg is caught immediately.
+    ///
+    /// Deliberately excludes anything #1150's guardrail above already
+    /// covers (`max_values() > 1`), even though every current multi-value
+    /// arg happens to also be `Append`-action -- kept the two predicates
+    /// non-overlapping so each flag is checked, and reported, by exactly
+    /// one of them.
     #[test]
     fn test_append_action_args_allow_hyphen_values_1203() {
         use clap::CommandFactory;
@@ -2325,16 +2331,34 @@ mod tests {
                 if arg.is_positional() {
                     continue;
                 }
-                if matches!(arg.get_action(), clap::ArgAction::Append) {
+                let takes_multiple_per_occurrence = arg
+                    .get_num_args()
+                    .is_some_and(|range| range.max_values() > 1);
+                if matches!(arg.get_action(), clap::ArgAction::Append)
+                    && !takes_multiple_per_occurrence
+                {
                     assert!(
                         arg.is_allow_hyphen_values_set(),
-                        "--{} in `{}` is repeatable (ArgAction::Append) but doesn't set \
+                        "{} in `{}` is repeatable (ArgAction::Append) but doesn't set \
                          allow_hyphen_values -- see #1203",
-                        arg.get_id(),
+                        invocable_flag(arg),
                         cmd.get_name()
                     );
                 }
             }
+        }
+    }
+
+    /// The flag spelling a user would actually type, for a test-failure
+    /// message -- `arg.get_id()` is the Rust field name (e.g. `library_path`
+    /// for `-L`, which has no `long` at all), not necessarily anything
+    /// invocable on the command line.
+    fn invocable_flag(arg: &clap::Arg) -> String {
+        match (arg.get_short(), arg.get_long()) {
+            (Some(s), Some(l)) => format!("-{s}/--{l}"),
+            (Some(s), None) => format!("-{s}"),
+            (None, Some(l)) => format!("--{l}"),
+            (None, None) => format!("(positional?) {}", arg.get_id()),
         }
     }
 
