@@ -13582,20 +13582,28 @@ fn test_slice_compound_add_array_target_jq_mode_unaffected_1142() -> Result<()> 
 // yq field/index assignment no-op on a scalar root (#1181)
 // ============================================================================
 //
-// The sibling of #1101's slice no-op, for plain field/index writes onto a
-// scalar root: `.a = v`, `.[0] = v`, and a *computed* key (`$k as $k |
-// .[$k] = v`) all no-op in real yq the same way a bare-root slice does. This
-// was never generalized from the slice case -- `key_to_path_component` (the
-// computed-key path) and `set_path`'s own `Field`/`Index` arms both errored
-// unconditionally, in both jq and yq mode.
+// The sibling of #1101's slice no-op, for plain field/index/iterate writes
+// onto a scalar target: `.a = v`, `.[0] = v`, `.[] = v`, and a *computed*
+// key (`$k as $k | .[$k] = v`) all no-op in real yq the same way a
+// bare-root slice does. This was never generalized from the slice case --
+// `key_to_path_component` (the computed-key path) and `set_path`'s own
+// `Field`/`Index`/`Iterate` arms all errored unconditionally, in both jq
+// and yq mode.
 //
-// Scoped narrowly to a scalar *root* (the whole input, not a chained
-// sub-target reached via `.a.b`/`.a[0]`) -- mirroring #1101's own original
-// scope before #1116 later generalized it to any chain depth. Chain depth
-// is left to a follow-up issue for the same reason #1116 was its own issue:
-// `get_path_mut` (the parent-navigation walker a multi-component path
-// resolves through) has no `S`/yq-mode awareness at all, unlike `set_path`'s
-// own terminal-component arms.
+// This covers a scalar target reached at the *last* path component,
+// however it's reached -- including through a preceding real container, so
+// `{"a":5} | .a.b = 99` (root is an object, `.a` navigates it fine, `.b`
+// then hits the scalar `5` as the terminal step) already no-ops correctly.
+// What's still out of scope, deferred to a follow-up issue for the same
+// reason #1116 (generalizing #1101's slice no-op to any chain depth) was
+// its own issue: a scalar hit *before* the last component, i.e. the whole
+// remaining path is still to be resolved once a scalar is reached --
+// `5 | .a.b = 99` (the *root itself* is the scalar, `.a` is the failing
+// step, `.b` is never reached) still errors, because `get_path_mut` (the
+// parent-navigation walker `set_path`'s `Pipe` arm delegates every
+// non-terminal component to) and `update_path`'s own structurally-parallel
+// `Pipe`-arm `Field`/`Index` sub-arms have no `S`/yq-mode awareness at all,
+// unlike `set_path`/`update_path`'s terminal-component arms.
 //
 // One more divergence, *not* replicated here: real yq silently discards the
 // RHS/filter entirely for this no-op, including a genuinely erroring one
@@ -13746,6 +13754,138 @@ fn test_field_index_assign_scalar_jq_mode_unaffected_1181() -> Result<()> {
         assert!(
             stderr.contains("Cannot index number"),
             "filter {filter:?} stderr: {stderr:?}"
+        );
+    }
+    Ok(())
+}
+
+/// A chained scalar target reached at the *terminal* step, not the root
+/// itself, already no-ops -- `{"a":5} | .a.b = 99` navigates a real object
+/// for `.a`, then hits the scalar `5` only at the last component `.b`.
+/// Exercises `get_path_mut`'s ordinary (non-scalar) `Field` arm for the
+/// `.a` hop, landing back in `set_path`'s/`update_path`'s already-fixed
+/// terminal arm for `.b` -- see the module doc comment above for why this
+/// is in scope while the scalar-*root* chain case is not.
+#[test]
+fn test_yq_field_index_assign_scalar_reached_via_container_prefix_is_noop_1181() -> Result<()> {
+    let (out, code) = run_yq_stdin(".a.b = 99", r#"{"a":5}"#, &["-o", "json", "-I0"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), r#"{"a":5}"#);
+
+    let (out, code) = run_yq_stdin(".a.b |= . + 1", r#"{"a":5}"#, &["-o", "json", "-I0"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), r#"{"a":5}"#);
+    Ok(())
+}
+
+// ============================================================================
+// yq `.[] = v` (Expr::Iterate) assignment no-op on a scalar target (#1181)
+// ============================================================================
+//
+// The `Iterate` sibling of the Field/Index no-op above: `.[] = v` on a
+// non-container, non-null target no-ops the same way `.a = v`/`.[0] = v`
+// do. `null` is a distinct third case, neither a no-op nor an error: real
+// yq autovivifies it to `[]` (an empty set of elements to write over), so
+// `null | .[] = 99` is `[]`, matching jq's own null-to-array autovivify for
+// `Field`/`Index` but *not* jq's own `Iterate`, which has no such rule at
+// all (`null | .[] = 99` genuinely errors in real jq -- confirmed live).
+
+/// The bare-root shape, across every operator this diff touches.
+#[test]
+fn test_yq_iterate_assign_scalar_is_noop_1181() -> Result<()> {
+    for filter in [
+        ".[] = 99",
+        ".[] |= . + 1",
+        ".[] += 1",
+        ".[] -= 1",
+        ".[] *= 1",
+    ] {
+        let (out, code) = run_yq_stdin(filter, "5", &["-o", "json"])?;
+        assert_eq!(code, 0, "filter {filter:?} out: {out:?}");
+        assert_eq!(out.trim(), "5", "filter {filter:?}");
+    }
+    Ok(())
+}
+
+/// String and bool roots no-op the same way a number does.
+#[test]
+fn test_yq_iterate_assign_string_and_bool_scalar_is_noop_1181() -> Result<()> {
+    let (out, code) = run_yq_stdin(".[] = 99", r#""hello""#, &["-o", "json"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), r#""hello""#);
+
+    let (out, code) = run_yq_stdin(".[] = 99", "true", &["-o", "json"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "true");
+    Ok(())
+}
+
+/// `null` is neither a no-op nor an error for `Iterate` -- it autovivifies
+/// to `[]`, unlike `Field`/`Index`'s autovivify-then-write.
+#[test]
+fn test_yq_iterate_assign_null_root_becomes_empty_array_1181() -> Result<()> {
+    for filter in [".[] = 99", ".[] |= . + 1", ".[] -= 1"] {
+        let (out, code) = run_yq_stdin(filter, "null", &["-o", "json"])?;
+        assert_eq!(code, 0, "filter {filter:?} out: {out:?}");
+        assert_eq!(out.trim(), "[]", "filter {filter:?}");
+    }
+    Ok(())
+}
+
+/// The same no-op/autovivify rule applies when the scalar/null is reached
+/// through a preceding container, not just at the root -- `.a[] = 99` on
+/// `{"a":5}` navigates `.a` (a real object field) before `Iterate` ever
+/// runs, landing on the scalar `5`/`null` exactly like the bare-root case.
+#[test]
+fn test_yq_iterate_assign_chained_scalar_and_null_is_noop_1181() -> Result<()> {
+    let (out, code) = run_yq_stdin(".a[] = 99", r#"{"a":5}"#, &["-o", "json", "-I0"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), r#"{"a":5}"#);
+
+    let (out, code) = run_yq_stdin(".a[] |= . + 1", r#"{"a":5}"#, &["-o", "json", "-I0"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), r#"{"a":5}"#);
+
+    let (out, code) = run_yq_stdin(".a[] = 99", r#"{"a":null}"#, &["-o", "json", "-I0"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), r#"{"a":[]}"#);
+    Ok(())
+}
+
+/// Regression guard: a real array/object target still iterates and writes
+/// normally -- the no-op is specific to a genuinely scalar/null target.
+#[test]
+fn test_yq_iterate_assign_container_target_unaffected_1181() -> Result<()> {
+    let (out, code) = run_yq_stdin(".[] = 99", "[1,2,3]", &["-o", "json", "-I0"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "[99,99,99]");
+    Ok(())
+}
+
+/// Regression guard: jq mode is unaffected -- `.[] = v` on a scalar or
+/// `null` both keep raising `Cannot iterate over ...`, matching real jq
+/// (which, unlike yq, has no null-autovivify rule for `Iterate` at all).
+#[test]
+fn test_yq_iterate_assign_scalar_jq_mode_unaffected_1181() -> Result<()> {
+    for input in ["5", "null"] {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_succinctly"));
+        cmd.arg("jq").arg(".[] = 99");
+        let mut child = cmd
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        child.stdin.take().unwrap().write_all(input.as_bytes())?;
+        let output = child.wait_with_output()?;
+        assert_ne!(
+            output.status.code(),
+            Some(0),
+            "input {input:?} unexpectedly succeeded in jq mode"
+        );
+        let stderr = String::from_utf8(output.stderr)?;
+        assert!(
+            stderr.contains("Cannot iterate"),
+            "input {input:?} stderr: {stderr:?}"
         );
     }
     Ok(())
