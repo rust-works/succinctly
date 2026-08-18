@@ -9257,7 +9257,19 @@ fn sub_with_resolved_pattern<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // Some(_)` too, even for an empty flags string -- so this can't
     // accidentally widen either of those. The 3-arg form's own real-yq
     // semantics are a separate, still-unresolved mystery (#1069's own
-    // scope note) and are deliberately left matching jq's model here.
+    // scope note, split into its own follow-up as #1122) and are
+    // deliberately left matching jq's model here.
+    //
+    // Known gap this widens the reachable surface of, not one it
+    // introduces: `global_captures` below iterates zero-width matches
+    // (patterns that can match an empty string, e.g. `a*`) the way jq's
+    // Oniguruma engine does, which already diverged from real yq's Go
+    // `regexp` engine for `gsub` before this fix -- confirmed still
+    // present on `main` pre-#1069 (`"bab" | gsub("a*";"X")` gave
+    // `"XbXXbX"` there too, vs real yq's `"XbXbX"`). This fix makes bare
+    // `sub` reach the same already-imperfect iteration `gsub` always
+    // used, rather than introducing new zero-width-handling logic. See
+    // #1255.
     let global =
         flags.is_some_and(|f| f.contains('g')) || (S::TAG == EvalTag::Yq && flags.is_none());
 
@@ -32495,12 +32507,19 @@ mod tests {
         );
     }
 
-    /// #1069's own scope note: the 3-arg `sub(re; s; flags)` form's real-yq
-    /// semantics are a separate, still-unresolved mystery (filed as a
-    /// follow-up rather than guessed at here) -- this fix deliberately
-    /// leaves it matching jq's existing model (global only when the flags
-    /// string itself contains `"g"`), unaffected by the bare-2-arg-only
-    /// `flags.is_none()` gate above.
+    /// Pins that the 3-arg `sub(re; s; flags)` form's *own* code path is
+    /// untouched by #1069's `flags.is_none()` gate -- **not** a claim that
+    /// these values match real yq. They don't: real yq's actual 3-arg
+    /// behavior is itself a separate, still-unresolved mystery (filed as
+    /// #1122 rather than guessed at here) -- live-probing found real yq
+    /// gives an *empty string* for both `sub("a";"X";"g")` and
+    /// `sub("a";"X";"")` on `"aaa"` whenever the pattern matches, not
+    /// `"XXX"`/`"Xaa"`. This test exists only to catch a *future* change
+    /// accidentally routing the 3-arg form through the new bare-2-arg
+    /// global-replace gate (it shouldn't, per the doc comment on `global`
+    /// above) -- it is a regression pin on succinctly's own current (and
+    /// separately tracked as incorrect) output, not an oracle-verified
+    /// baseline.
     #[cfg(feature = "regex")]
     #[test]
     fn test_regex_sub_flags_yq_mode_unaffected_by_1069() {
@@ -32510,6 +32529,18 @@ mod tests {
             }
         );
         yq_query!(br#""aaa""#, r#"sub("a"; "X"; "")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "Xaa");
+            }
+        );
+
+        // `sub(re; s; null)` specifically: `validate_regex_flags` maps a
+        // `null` flags expression to `Some(String::new())`, not `None`
+        // (confirmed at its call site above `sub_with_resolved_pattern`),
+        // so this shape also stays off the new global-replace gate --
+        // exercising the exact case the doc comment on `global` reasons
+        // through but that nothing previously asserted directly.
+        yq_query!(br#""aaa""#, r#"sub("a"; "X"; null)"#,
             QueryResult::Owned(OwnedValue::String(s)) => {
                 assert_eq!(s, "Xaa");
             }

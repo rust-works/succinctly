@@ -231,6 +231,27 @@ printf 'a: [{name: fred, age: 12}, {name: bob, age: 32}]\nb: [{name: fred, age: 
   support anywhere yet (the parser rejects custom tags outright) — it's
   parsed for forward compatibility but has no observable effect.
 
+### `sub`/`gsub` in yq mode
+
+Real yq's bare, 2-arg `sub(re; s)` diverges from jq's: it replaces **every**
+match, not just the first — jq's `sub` = first match only, `gsub` = all
+matches; yq's bare `sub` behaves like jq's `gsub` unconditionally (#1069,
+confirmed against yq v4.53.3):
+
+```bash
+echo '"aaa"' | succinctly yq 'sub("a"; "X")'
+# "XXX" — every match replaced (unlike succinctly jq's identical-syntax "Xaa")
+
+echo '"aaa"' | succinctly yq 'gsub("a"; "X")'
+# "XXX" — same result; gsub is effectively a synonym for bare sub in yq mode
+```
+
+**Known gap:** the 3-arg `sub(re; s; flags)` form's real-yq semantics don't
+fit jq's model, yq's own bare-`sub` model, or a couple of other hypotheses
+tried so far — see #1122. succinctly's 3-arg form currently matches jq's
+model (global only when the flags string contains `"g"`), which is not
+confirmed to match real yq.
+
 ### Date/Time Extensions
 
 Beyond jq's standard date functions (`now`, `gmtime`, `strftime`, `strptime`), yq adds:

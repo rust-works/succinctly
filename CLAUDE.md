@@ -280,6 +280,10 @@ printf 'a:\n  x: 1\nb:\n  x: 2\n  y: 3\n' | succinctly yq '.a *=n .b'  # a: {x: 
 
 `null` acts as an empty container on either side of a yq-mode merge (jq mode has no such exception -- every `null`-involving `*` pairing errors there, #1175): a null/absent *left* operand merges as if starting from `{}`/`[]` (`.a *=n .b` on `a: null` writes the full `.b` in; `.a *=? .b` on an absent `.a` leaves `a: {}`, blocked field-by-field rather than staying `null`), and a null *right* operand is always a no-op (`.a *= null` leaves `.a` untouched).
 
+### `sub`/`gsub` divergence (yq mode only)
+
+Real yq's bare, 2-arg `sub(re; s)` replaces *every* match, not just the first — jq's `sub` = first match only, `gsub` = all matches; yq's bare `sub` behaves like jq's `gsub` unconditionally (`"aaa" | sub("a";"X")` => `"XXX"` in yq, `"Xaa"` in jq, confirmed against yq v4.53.3). `gsub` itself, and the 3-arg `sub(re;s;flags)` form, are unaffected by this and keep matching jq's model — the 3-arg form's real-yq semantics don't fit any hypothesis tried so far (#1122).
+
 ### jq Position-Based Navigation (succinctly extension)
 
 Succinctly extends jq with position-based navigation builtins that allow jumping directly to a node at a specific byte offset or line/column position. This is unique to succinctly and not available in standard jq or yq.
