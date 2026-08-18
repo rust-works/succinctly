@@ -368,45 +368,43 @@ pub fn format_number_jq_compat(raw: &[u8]) -> String {
     // plain decimal `50000.0`; `99999999999999e1`, shifted exponent 14,
     // goes scientific) -- tracked separately as #1244, not attempted here.
     //
-    // For other cases, use normalized scientific notation
-    // jq normalizes mantissa to have one digit before decimal point
-    //
     // `!value.is_normal()` -- `value` is already known finite (the
     // `!value.is_finite()` overflow check above returned first) and known
     // nonzero (the `value == 0.0` check above returned first too), so this
-    // is exactly "nonzero but subnormal" (#1177): the `log10`/`pow`
-    // renormalization below is already measurably imprecise across most of
-    // the subnormal range (e.g. `1e-315` mis-renormalizes to a mantissa of
-    // `10.000000148219696` instead of `1.0`, oracle-verified), and at the
-    // extreme low end `libm::pow(10.0, log10(abs_value).floor())` can
-    // itself underflow to exactly `0.0` (its own result is smaller than the
-    // smallest representable subnormal), making `abs_value / 0.0 = +inf`
-    // and rendering the mantissa as the literal text `"inf"`, which isn't
-    // valid JSON at all. Routing every subnormal through the same
-    // string-based path `format_near_zero_literal` uses for exact-zero
-    // underflow sidesteps both: that path derives the mantissa from `s`'s
-    // own source digits, never from `f64` arithmetic that's already lost
-    // precision by this magnitude. Always scientific here (the #1207
-    // small-magnitude decimal window applies only to a *genuinely*
-    // zero-mantissa literal, never to one merely underflowed to zero) --
-    // a subnormal `value` can only come from a nonzero mantissa in the
-    // first place, so `format_near_zero_literal` always takes its `Ok`
-    // arm for this caller.
+    // is exactly "nonzero but subnormal" (#1177): `format_near_zero_literal`
+    // has its own #1207-established exponent-window logic for that regime,
+    // distinct from the shifted-exponent window already handled above, so
+    // it stays a separate call rather than falling through to the plain
+    // scientific case below.
     if !value.is_normal() {
         return format_near_zero_literal(s, exp_pos, value.is_sign_negative());
     }
 
-    let abs_value = value.abs();
-    let log10 = libm::log10(abs_value).floor() as i32;
-    let normalized_mantissa = abs_value / libm::pow(10.0, log10 as f64);
-    let new_exp = log10;
-
-    // Format mantissa with appropriate precision
-    // Round to avoid floating point noise (e.g., 9.199999999999999 → 9.2)
-    let mantissa_str = format_mantissa_jq(normalized_mantissa);
-
-    let sign = if value < 0.0 { "-" } else { "" };
-    assemble_scientific(sign, &mantissa_str, i64::from(new_exp))
+    // For every other case (a shifted exponent outside `-6..=0`), use
+    // normalized scientific notation -- jq normalizes the mantissa to have
+    // exactly one digit before the decimal point, which `mantissa_str`
+    // computed above already is.
+    //
+    // #1206: reuses that same string-based `mantissa_str`/`shifted_exp`
+    // rather than re-deriving a mantissa from `value` via
+    // `libm::log10`/`libm::pow` arithmetic (removed here, along with its
+    // sole caller `format_mantissa_jq`) -- the same string-based source-
+    // digit derivation `format_overflow_literal_mantissa` and
+    // `format_near_zero_literal` already use for their own scientific
+    // output. That f64-based recomputation had two independent,
+    // oracle-confirmed bugs across the normal-magnitude domain it covered:
+    // it silently trimmed trailing zeros the mantissa's own source
+    // spelling had (`1.50e10` -> `1.5E+10` instead of real jq's `1.50E+10`),
+    // and its "snap to nearest integer if very close" heuristic could round
+    // a mantissa up to exactly `10`, violating the `[1, 10)` single-
+    // leading-digit invariant scientific notation requires
+    // (`9.9999999999999e-64` -> `10E-64` instead of real jq's
+    // `9.9999999999999E-64`) -- both confirmed live against jq 1.7.1.
+    assemble_scientific(
+        if value.is_sign_negative() { "-" } else { "" },
+        &mantissa_str,
+        shifted_exp,
+    )
 }
 
 /// jq mode's bare `Float` display: no forced decimal point, matching real
@@ -664,39 +662,6 @@ fn format_near_zero_literal(s: &str, exp_pos: usize, negative: bool) -> String {
                 assemble_scientific(sign, "0", shifted_exp)
             }
         }
-    }
-}
-
-/// Format a mantissa value for jq-compatible output.
-/// Handles floating point precision issues by rounding appropriately.
-fn format_mantissa_jq(value: f64) -> String {
-    // Check if it's essentially an integer
-    if (value.round() - value).abs() < 1e-10 {
-        return format!("{}", value.round() as i64);
-    }
-
-    // Try different precisions and pick the shortest that rounds back correctly
-    for precision in 1..=15 {
-        let formatted = format!("{value:.precision$}");
-        if let Ok(parsed) = formatted.parse::<f64>() {
-            if (parsed - value).abs() < 1e-14 {
-                // Trim trailing zeros
-                let trimmed = formatted.trim_end_matches('0');
-                if trimmed.ends_with('.') {
-                    return format!("{trimmed}0");
-                }
-                return trimmed.to_string();
-            }
-        }
-    }
-
-    // Fallback: full precision
-    let formatted = format!("{value:.15}");
-    let trimmed = formatted.trim_end_matches('0');
-    if trimmed.ends_with('.') {
-        format!("{trimmed}0")
-    } else {
-        trimmed.to_string()
     }
 }
 
@@ -3026,18 +2991,79 @@ mod tests {
         assert_eq!(format_number_jq_compat(b"1e-400"), "1E-400");
     }
 
+    /// #1206 bug 1: the scientific-notation path's mantissa rendering used
+    /// to re-derive the mantissa from the parsed `f64` via
+    /// `libm::log10`/`libm::pow`, then unconditionally trim trailing zeros
+    /// -- losing a source spelling's own trailing zeros the way #993
+    /// already established `NumberLiteral` rendering must not. Fixed by
+    /// reusing the `normalize_extreme_literal_mantissa`-derived,
+    /// source-digit-preserving mantissa/shifted-exponent pair every other
+    /// scientific-notation-producing path here already uses. Every case
+    /// below oracle-verified against jq 1.7.1.
+    #[test]
+    fn test_format_number_jq_compat_scientific_notation_preserves_trailing_zeros_1206() {
+        assert_eq!(format_number_jq_compat(b"1.50e10"), "1.50E+10");
+        assert_eq!(format_number_jq_compat(b"2.500e-20"), "2.500E-20");
+        assert_eq!(format_number_jq_compat(b"1.20e6"), "1.20E+6");
+        assert_eq!(format_number_jq_compat(b"3.000e100"), "3.000E+100");
+        assert_eq!(format_number_jq_compat(b"5.0e-7"), "5.0E-7");
+        assert_eq!(format_number_jq_compat(b"-5.0e-7"), "-5.0E-7");
+    }
+
+    /// #1206 bug 2: the same `f64`-arithmetic mantissa rendering's "snap to
+    /// nearest integer if very close" heuristic
+    /// (`(value.round() - value).abs() < 1e-10`) didn't re-validate the
+    /// snapped result was still `< 10`, so a mantissa arbitrarily close to
+    /// (but strictly less than) the next power of ten could round up to
+    /// exactly `10` -- violating scientific notation's own `[1, 10)`
+    /// single-leading-digit invariant and silently producing a
+    /// *numerically wrong* value/exponent pair, not just an imprecise
+    /// spelling. The string-based mantissa this now reuses has no such
+    /// snapping step at all, so the invariant can't be violated regardless
+    /// of how close the source digits sit to a power-of-ten boundary.
+    /// Oracle-verified against jq 1.7.1.
+    #[test]
+    fn test_format_number_jq_compat_scientific_notation_mantissa_stays_below_ten_1206() {
+        assert_eq!(
+            format_number_jq_compat(b"9.9999999999999e-64"),
+            "9.9999999999999E-64"
+        );
+        assert_eq!(
+            format_number_jq_compat(b"9.9999999999999e-307"),
+            "9.9999999999999E-307"
+        );
+        assert_eq!(
+            format_number_jq_compat(b"9.999999999999999e300"),
+            "9.999999999999999E+300"
+        );
+        assert_eq!(
+            format_number_jq_compat(b"-9.9999999999999e-64"),
+            "-9.9999999999999E-64"
+        );
+    }
+
     /// #1244 characterization: a large positive-magnitude literal's
     /// notation choice depends on real jq's own significant-digit count,
     /// not a simple exponent window the way the negative side (#1226) does
     /// -- confirmed out of #1226's own scope, tracked separately. Pins the
-    /// current (still-wrong, but unaffected either way by #1226) output
-    /// rather than leaving it undocumented. Oracle: real jq gives
+    /// current (still-wrong *notation*, unaffected either way by #1226)
+    /// output rather than leaving it undocumented. Oracle: real jq gives
     /// `50000.0`. If this is ever fixed, update this expectation and close
     /// #1244.
+    ///
+    /// The expected *mantissa digits* changed under #1206 (was `5E+4`, now
+    /// `5.00000E+4`): #1206 fixed the unrelated, previously-buggy
+    /// f64-arithmetic mantissa rendering this scientific-notation path used
+    /// (silently trimming trailing zeros) in favor of the source-digit-
+    /// preserving one `format_overflow_literal_mantissa`/
+    /// `format_near_zero_literal` already used -- this literal's own
+    /// mantissa (`500000`) has 5 trailing zeros that now correctly survive,
+    /// even though the notation choice itself (scientific vs. #1244's
+    /// expected plain decimal) is untouched by that fix.
     #[test]
     fn test_format_number_jq_compat_large_positive_shifted_exponent_characterize_preexisting_bug_1244(
     ) {
-        assert_eq!(format_number_jq_compat(b"500000e-1"), "5E+4");
+        assert_eq!(format_number_jq_compat(b"500000e-1"), "5.00000E+4");
     }
 
     /// `depth` levels of single-element array nesting: `[[[...[Null]...]]]`.
