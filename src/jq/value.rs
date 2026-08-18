@@ -368,18 +368,6 @@ pub fn format_number_jq_compat(raw: &[u8]) -> String {
     // plain decimal `50000.0`; `99999999999999e1`, shifted exponent 14,
     // goes scientific) -- tracked separately as #1244, not attempted here.
     //
-    // `!value.is_normal()` -- `value` is already known finite (the
-    // `!value.is_finite()` overflow check above returned first) and known
-    // nonzero (the `value == 0.0` check above returned first too), so this
-    // is exactly "nonzero but subnormal" (#1177): `format_near_zero_literal`
-    // has its own #1207-established exponent-window logic for that regime,
-    // distinct from the shifted-exponent window already handled above, so
-    // it stays a separate call rather than falling through to the plain
-    // scientific case below.
-    if !value.is_normal() {
-        return format_near_zero_literal(s, exp_pos, value.is_sign_negative());
-    }
-
     // For every other case (a shifted exponent outside `-6..=0`), use
     // normalized scientific notation -- jq normalizes the mantissa to have
     // exactly one digit before the decimal point, which `mantissa_str`
@@ -400,6 +388,20 @@ pub fn format_number_jq_compat(raw: &[u8]) -> String {
     // leading-digit invariant scientific notation requires
     // (`9.9999999999999e-64` -> `10E-64` instead of real jq's
     // `9.9999999999999E-64`) -- both confirmed live against jq 1.7.1.
+    //
+    // This also makes the standalone `!value.is_normal()` (#1177, subnormal)
+    // check this function used to have here dead weight, since removed:
+    // `format_near_zero_literal`'s own `Ok` arm (the only arm a nonzero
+    // mantissa -- guaranteed by the `value == 0.0` check above -- ever
+    // takes) was already exactly `assemble_scientific(sign, mantissa_str,
+    // new_exp)` from a *second* `normalize_extreme_literal_mantissa(s,
+    // exp_pos)` call on the same `s`/`exp_pos` this function normalizes
+    // once, above. That redundancy only existed because the code being
+    // replaced here was f64-arithmetic-based and genuinely unsafe on a
+    // subnormal `value` (imprecise renormalization, or division by a
+    // pow()-underflowed zero -- see git history); now that this path is
+    // string-based too, subnormal and normal magnitudes take the identical
+    // call with no separate handling needed (code review, #1206).
     assemble_scientific(
         if value.is_sign_negative() { "-" } else { "" },
         &mantissa_str,
