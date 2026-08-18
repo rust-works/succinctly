@@ -14711,9 +14711,6 @@ fn pattern_binds_var(pattern: &Pattern, var_name: &str) -> bool {
             .iter()
             .any(|e| pattern_binds_var(&e.pattern, var_name)),
         Pattern::Array(patterns) => patterns.iter().any(|p| pattern_binds_var(p, var_name)),
-        Pattern::VarAndPattern(name, nested) => {
-            name == var_name || pattern_binds_var(nested, var_name)
-        }
     }
 }
 
@@ -24269,10 +24266,6 @@ fn collect_pattern_var_names(pattern: &Pattern, names: &mut Vec<String>) {
                 collect_pattern_var_names(p, names);
             }
         }
-        Pattern::VarAndPattern(name, nested) => {
-            names.push(name.clone());
-            collect_pattern_var_names(nested, names);
-        }
     }
 }
 
@@ -24322,16 +24315,6 @@ fn extract_pattern_bindings(
                 let sub_bindings = extract_pattern_bindings(pat, &elem_value)?;
                 bindings.extend(sub_bindings);
             }
-            Ok(bindings)
-        }
-        // `{$x: Pattern}` (#1204): `$x` binds the whole matched value,
-        // exactly like the `{$x}` shorthand -- *and*, independently,
-        // `Pattern` binds again against that same, unindexed value (not a
-        // sub-value of it), same as `. as {$x: $y} | ...` binding both `$x`
-        // and `$y` to the same field's value.
-        Pattern::VarAndPattern(name, nested) => {
-            let mut bindings = vec![(name.clone(), value.clone())];
-            bindings.extend(extract_pattern_bindings(nested, value)?);
             Ok(bindings)
         }
     }
