@@ -8778,11 +8778,10 @@ fn test_resolve_seq_earlier_fanout_escape_does_not_skip_later_dynamic_stage_977(
         &["-c", r#"path(.a[(0,error("t"))] | .c[(0,1)] | .foo)"#],
         Some(r#"{"a":[{"c":[{"foo":1},{"foo":2}]}]}"#),
     )?;
+    // #1013 fixed: now processes remaining dynamic elements instead of truncating
     assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
-    // Must not fabricate `["a",0,"foo"]` by skipping `.c[(0,1)]` — the
-    // pre-existing "known simplification" truncates to the partial prefix
-    // through the escaping element instead.
-    assert_eq!(stdout, "[\"a\",0]\n");
+    // Now produces full paths through all remaining stages, not just truncated prefix
+    assert_eq!(stdout, "[\"a\",0,\"c\",0,\"foo\"]\n[\"a\",0,\"c\",1,\"foo\"]\n");
     assert!(stderr.contains('t'), "stderr: {stderr:?}");
 
     // A second shape, where the skipped-over tail would otherwise silently
@@ -8794,7 +8793,8 @@ fn test_resolve_seq_earlier_fanout_escape_does_not_skip_later_dynamic_stage_977(
         Some(r#"{"a":[{"c":"k","k":{"d":99}}]}"#),
     )?;
     assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
-    assert_eq!(stdout, "[\"a\",0]\n");
+    // Now processes through .k[.c] instead of truncating
+    assert_eq!(stdout, "[\"a\",0,\"k\",\"k\",\"d\"]\n");
     assert!(stderr.contains('t'), "stderr: {stderr:?}");
     Ok(())
 }
