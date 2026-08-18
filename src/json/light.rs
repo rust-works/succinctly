@@ -1010,35 +1010,42 @@ impl<'a, W: AsRef<[u64]>> JsonFields<'a, W> {
 
     /// Find a field by name.
     ///
-    /// Returns the value of the first field with the given name,
-    /// or `None` if not found.
+    /// A duplicate JSON key collapses to its *last* occurrence, matching
+    /// real jq / RFC 8259 convention (see issue #1251) -- the same rule
+    /// `YamlFields::find` already applies for YAML's own last-duplicate-
+    /// key-wins semantics (#174), just the opposite of YAML's genuine-
+    /// duplicates preservation elsewhere (`to_entries`, #443).
     pub fn find(&self, name: &str) -> Option<StandardJson<'a, W>> {
         let mut fields = *self;
+        let mut result = None;
         while let Some((field, rest)) = fields.uncons() {
             if let StandardJson::String(key) = field.key() {
                 if key.as_str().ok()? == name {
-                    return Some(field.value());
+                    result = Some(field.value());
                 }
             }
             fields = rest;
         }
-        None
+        result
     }
 
     /// Find a field by name and return a cursor to its value.
     ///
-    /// Same first-match semantics as [`find`](Self::find).
+    /// Same last-duplicate-key-wins semantics as [`find`](Self::find) — kept
+    /// as a separate loop rather than reusing `find` so the returned cursor
+    /// (needed for `line`/`column`) doesn't require re-navigating.
     pub fn find_cursor(&self, name: &str) -> Option<JsonCursor<'a, W>> {
         let mut fields = *self;
+        let mut result = None;
         while let Some((field, rest)) = fields.uncons() {
             if let StandardJson::String(key) = field.key() {
                 if key.as_str().ok()? == name {
-                    return Some(field.value_cursor());
+                    result = Some(field.value_cursor());
                 }
             }
             fields = rest;
         }
-        None
+        result
     }
 }
 
@@ -2605,6 +2612,32 @@ mod tests {
 
                 // Non-existent field
                 assert!(fields.find("missing").is_none());
+            }
+            _ => panic!("expected object"),
+        }
+    }
+
+    /// #1251: a duplicate JSON key must resolve to its *last* value,
+    /// matching real jq / RFC 8259 -- this used to return the first,
+    /// diverging from `.a` field access in real jq (`{"a":1,"a":3}|.a`
+    /// is `3`, not `1`).
+    #[test]
+    fn test_object_find_field_duplicate_key_last_wins_1251() {
+        let json = br#"{"a": 1, "b": 2, "a": 3}"#;
+        let index = JsonIndex::build(json);
+        let root = index.root(json);
+
+        match root.value() {
+            StandardJson::Object(fields) => {
+                match fields.find("a") {
+                    Some(StandardJson::Number(n)) => assert_eq!(n.as_i64().unwrap(), 3),
+                    other => panic!("expected number 3, got {other:?}"),
+                }
+                let value_cursor = fields.find_cursor("a").expect("should find a cursor");
+                match value_cursor.value() {
+                    StandardJson::Number(n) => assert_eq!(n.as_i64().unwrap(), 3),
+                    other => panic!("expected number 3, got {other:?}"),
+                }
             }
             _ => panic!("expected object"),
         }

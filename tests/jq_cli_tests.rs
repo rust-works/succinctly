@@ -12581,3 +12581,15 @@ fn test_jq_to_entries_no_duplicate_keys_unaffected_1170() -> Result<()> {
     );
     Ok(())
 }
+
+/// #1251: `.foo` field access on a duplicate JSON key must resolve to the
+/// *last* value, matching real jq / RFC 8259 convention -- this used to
+/// return the first (oracle-verified against jq 1.7.1:
+/// `{"a":1,"b":2,"a":3}|.a` is `3`).
+#[test]
+fn test_jq_field_access_duplicate_key_last_wins_1251() -> Result<()> {
+    let (out, _, code) = run_jq_full(&["-c", ".a"], Some(r#"{"a":1,"b":2,"a":3}"#))?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "3");
+    Ok(())
+}
