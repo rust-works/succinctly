@@ -10463,6 +10463,101 @@ fn test_object_pattern_var_shorthand_with_alt_patterns_720_1139() -> Result<()> 
     Ok(())
 }
 
+// =============================================================================
+// #1204: object destructuring pattern entry `{$x: Pattern}` (bind and
+// further destructure). Real jq's `$IDENT: Pattern` entry binds the
+// matched value to `$IDENT` -- same as the `{$x}` shorthand (#1139) --
+// *and*, independently, destructures that same (unindexed) value again
+// against `Pattern`. Distinct from both `{$x}` (no further destructuring)
+// and `key: Pattern` (key is a literal, never a binding). All cases
+// live-verified against jq 1.7.1.
+// =============================================================================
+
+/// The issue's own repro: `$y` binds by re-destructuring the same value
+/// `$x` already bound whole.
+#[test]
+fn test_object_pattern_var_and_pattern_bare_1204() -> Result<()> {
+    let (stdout, _, code) =
+        run_jq_full(&["-c", ". as {$x: $y} | [$x,$y]"], Some(r#"{"x":5,"a":1}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "[5,5]");
+    Ok(())
+}
+
+/// The nested pattern can itself be an object pattern, reaching into the
+/// same value `$x` was bound to whole.
+#[test]
+fn test_object_pattern_var_and_pattern_nested_object_1204() -> Result<()> {
+    let (stdout, _, code) = run_jq_full(
+        &["-c", ". as {$x: {a: $y}} | [$x,$y]"],
+        Some(r#"{"x":{"a":10}}"#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), r#"[{"a":10},10]"#);
+    Ok(())
+}
+
+/// The nested pattern can also be an array pattern.
+#[test]
+fn test_object_pattern_var_and_pattern_nested_array_1204() -> Result<()> {
+    let (stdout, _, code) = run_jq_full(
+        &["-c", ". as {$x: [$a,$b]} | [$x,$a,$b]"],
+        Some(r#"{"x":[1,2]}"#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "[[1,2],1,2]");
+    Ok(())
+}
+
+/// A missing field binds `null` to both `$x` and whatever the nested
+/// pattern names, same as the plain shorthand does.
+#[test]
+fn test_object_pattern_var_and_pattern_missing_key_is_null_1204() -> Result<()> {
+    let (stdout, _, code) = run_jq_full(&["-c", ". as {$x: $y} | [$x,$y]"], Some(r#"{"a":1}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "[null,null]");
+    Ok(())
+}
+
+/// A nested pattern that can't match the value's shape still raises the
+/// ordinary indexing error, same as any other failing nested pattern.
+#[test]
+fn test_object_pattern_var_and_pattern_nested_mismatch_errors_1204() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", ". as {$x: {a: $y}} | [$x,$y]"], Some(r#"{"x":5}"#))?;
+    assert_ne!(code, 0, "stdout: {stdout:?}");
+    assert!(
+        stderr.contains("Cannot index number with string"),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
+/// The `{$x}` bare shorthand (#1139) and `key: $var` forms remain
+/// unaffected in the same pattern as a `{$x: Pattern}` entry.
+#[test]
+fn test_object_pattern_var_and_pattern_mixed_with_other_forms_1204() -> Result<()> {
+    let (stdout, _, code) = run_jq_full(
+        &["-c", ". as {$a, $x: $y, b: $c} | [$a,$x,$y,$c]"],
+        Some(r#"{"a":1,"x":5,"b":2}"#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "[1,5,5,2]");
+    Ok(())
+}
+
+/// Works nested inside an array pattern, and at any recursion depth, the
+/// same as the plain shorthand does (#1139's own nested test) -- both
+/// handled by the same recursive `parse_pattern` call.
+#[test]
+fn test_object_pattern_var_and_pattern_nested_inside_array_1204() -> Result<()> {
+    let (stdout, _, code) =
+        run_jq_full(&["-c", ". as [{$x: $y}] | [$x,$y]"], Some(r#"[{"x":7}]"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "[7,7]");
+    Ok(())
+}
+
 #[test]
 fn test_func_def_expand_recurses_through_halt_stderr_and_halt_error_builtins() -> Result<()> {
     // `expand_func_calls_in_builtin`'s `Halt`/`Stderr`/`HaltError`/

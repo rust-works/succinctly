@@ -1650,10 +1650,29 @@ impl<'a> Parser<'a> {
                     // no `:` at all. Checked before the identifier/string-
                     // key branch below since `$` can't start either of
                     // those.
+                    //
+                    // `{$a: Pattern}` (#1204): the same key, but with an
+                    // explicit `:` and its own pattern to further
+                    // destructure the matched value -- `$a` still binds the
+                    // whole value under its own name (same as the bare
+                    // shorthand), *and* `Pattern` binds again, independently,
+                    // against that same value. Distinct from both the bare
+                    // `$a` shorthand above (no further destructuring) and
+                    // the `key: Pattern` form below (key is a literal, never
+                    // a binding). Peeking past the identifier for `:` is
+                    // required to tell the two `$`-led shapes apart.
                     let (key, pattern) = if self.peek() == Some('$') {
                         self.next();
                         let name = self.parse_ident()?;
-                        (name.clone(), Pattern::Var(name))
+                        self.skip_ws();
+                        if self.peek() == Some(':') {
+                            self.next();
+                            self.skip_ws();
+                            let nested = self.parse_pattern()?;
+                            (name.clone(), Pattern::VarAndPattern(name, Box::new(nested)))
+                        } else {
+                            (name.clone(), Pattern::Var(name))
+                        }
                     } else {
                         // Parse key (must be identifier or string)
                         let key = if self.peek() == Some('"') {
