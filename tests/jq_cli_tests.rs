@@ -12355,30 +12355,52 @@ fn test_jq_binary_op_success_paths_unaffected_1199() -> Result<()> {
 }
 
 /// A `Float` (or a `NumberLiteral` carrying a float repr) paired with a
-/// `String` for `*` must return a clean type-mismatch error, not panic --
-/// regression guard for a bug an earlier draft of this fix introduced and
-/// code review caught before merge. `arith_mul`'s restructuring initially
-/// gated its numeric/string-repetition arm behind `is_number()` (true for
-/// `Float` too, not just `Int`), but the inner match's string-repetition
-/// pattern only ever handled `Int`, so a `Float`+`String` pair fell through
-/// every named arm into an `unreachable!()` that was, in fact, reachable --
-/// `"ab" * 2.5` crashed the process (exit 101) instead of erroring (exit
-/// 5). succinctly has never supported a float repeat count at all (a
-/// separate, pre-existing, narrower-than-real-jq gap tracked as #1230,
-/// unaffected by this fix either way) -- the requirement here is only that
-/// the unsupported shape errors cleanly, not that it succeeds.
+/// `String` for `*` must never panic -- regression guard for a bug an
+/// earlier draft of this fix introduced and code review caught before
+/// merge. `arith_mul`'s restructuring initially gated its numeric/
+/// string-repetition arm behind `is_number()` (true for `Float` too, not
+/// just `Int`), but the inner match's string-repetition pattern only ever
+/// handled `Int`, so a `Float`+`String` pair fell through every named arm
+/// into an `unreachable!()` that was, in fact, reachable -- `"ab" * 2.5`
+/// crashed the process (exit 101) instead of erroring (exit 5).
+///
+/// At the time this test was written, succinctly had no float-repeat-count
+/// support at all, so "doesn't panic" meant "errors cleanly" (exit 5,
+/// "cannot be multiplied"). #1230 added that support (truncating toward
+/// zero, matching real jq's own `intmax_t` cast), so a moderate float count
+/// now succeeds instead -- that success path is covered by
+/// `test_jq_string_repetition_accepts_float_count_1230` above. This test
+/// keeps only the still-relevant "doesn't panic" cases: `nan` and negative
+/// `infinite` repeat counts, both of which now succeed cleanly (Rust's `as
+/// i64` cast saturates `NaN` to `0` and `-inf` to `i64::MIN`, so neither
+/// reaches `String::repeat` with an unreasonable count -- `i64::MIN` is
+/// negative, so it takes the existing negative-count-returns-null branch
+/// instead).
+///
+/// Positive `infinite` (and a very large finite magnitude like `1e10`) are
+/// deliberately not covered here: truncating either yields a huge repeat
+/// count fed to `String::repeat`, an unbounded-allocation hang/OOM hazard,
+/// not a panic -- and that exact hazard already exists, unguarded, for a
+/// same-magnitude `Int` operand (`"ab" * 10000000000`) on `main` today, so
+/// it's a pre-existing characteristic of this arm rather than something
+/// #1230 introduced. Live-verified against real jq: `timeout 3 jq -cn
+/// '(infinite) * "ab"'` hangs (no output, no error) rather than rejecting
+/// the input, so there's no clean "must error" behavior to pin here either.
+///
+/// Note real jq's own `nan * "ab"` returns `null` (verified: jq-1.7.1),
+/// not `""` -- but that's `(int)NaN` C-cast undefined behavior (platform-
+/// dependent; jq has no explicit NaN check here), not a deliberate
+/// contract, so succinctly's well-defined saturating-cast result (`""`) is
+/// intentionally not matched to it.
 #[test]
 fn test_jq_string_times_float_errors_cleanly_not_panics_1199() -> Result<()> {
-    for expr in [
-        "2.5 * \"ab\"",
-        "\"ab\" * 2.5",
-        "1e10 * \"ab\"",
-        "\"ab\" * 1e10",
-    ] {
-        let (out, err, code) = run_jq_full(&["-cn", expr], None)?;
-        assert_eq!(code, 5, "expr {expr:?}: out={out:?} err={err:?}");
-        assert!(err.contains("cannot be multiplied"), "expr {expr:?}: {err}");
-    }
+    let (out, _, code) = run_jq_full(&["-cn", "(nan) * \"ab\""], None)?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "\"\"");
+
+    let (out, _, code) = run_jq_full(&["-cn", "\"ab\" * (0 - infinite)"], None)?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "null");
     Ok(())
 }
 
@@ -12591,5 +12613,28 @@ fn test_jq_field_access_duplicate_key_last_wins_1251() -> Result<()> {
     let (out, _, code) = run_jq_full(&["-c", ".a"], Some(r#"{"a":1,"b":2,"a":3}"#))?;
     assert_eq!(code, 0, "out: {out:?}");
     assert_eq!(out.trim(), "3");
+    Ok(())
+}
+
+/// #1230: `"x" * n` accepts a float repeat count, truncating toward zero
+/// like real jq's own `intmax_t` cast, instead of erroring as a type
+/// mismatch.
+#[test]
+fn test_jq_string_repetition_accepts_float_count_1230() -> Result<()> {
+    let (out, _, code) = run_jq_full(&["-cn", "2.5 * \"ab\""], None)?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "\"abab\"");
+
+    let (out, _, code) = run_jq_full(&["-cn", "2.9 * \"ab\""], None)?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "\"abab\"");
+
+    let (out, _, code) = run_jq_full(&["-cn", "\"ab\" * 0.5"], None)?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "\"\"");
+
+    let (out, _, code) = run_jq_full(&["-cn", "\"ab\" * (0.0 - 1.5)"], None)?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "null");
     Ok(())
 }

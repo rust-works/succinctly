@@ -2121,13 +2121,21 @@ fn arith_mul<S: EvalSemantics>(
                     Ok(OwnedValue::Float(a * b))
                 }
                 // String repetition: "ab" * 3 = "ababab". jq >= 1.7 yields ""
-                // for n == 0 and null only for n < 0 (jqlang/jq#1593). The
-                // repeat count must specifically be `Int`-repr -- a `Float`
-                // (or a `NumberLiteral` carrying a float repr) paired with
-                // a `String` falls through to the type-mismatch arm below,
-                // matching real jq (`"ab" * 2.5` errors there too).
-                (OwnedValue::String(s), _, _, Some(NumberRepr::Int(n)))
-                | (_, OwnedValue::String(s), Some(NumberRepr::Int(n)), _) => {
+                // for n == 0 and null only for n < 0 (jqlang/jq#1593). A
+                // `Float`-repr count (or a `NumberLiteral` carrying one)
+                // truncates toward zero first, matching real jq's own
+                // `intmax_t` cast (confirmed live: `2.5 * "ab"` -> `"abab"`,
+                // `2.9 * "ab"` -> `"abab"`, not rounded; `"ab" * 0.5` -> `""`,
+                // not an error) -- the same truncation `mod_floats` already
+                // performs for `%` (#1230).
+                (OwnedValue::String(s), _, _, Some(n_repr))
+                | (_, OwnedValue::String(s), Some(n_repr), _) => {
+                    let n = match n_repr {
+                        NumberRepr::Int(n) => n,
+                        // `as` truncates toward zero and saturates, matching
+                        // jq's intmax_t cast (mirrors `mod_floats` above).
+                        NumberRepr::Float(n) => n as i64,
+                    };
                     if n < 0 {
                         Ok(OwnedValue::Null)
                     } else {
@@ -26608,6 +26616,32 @@ mod tests {
         // matches real jq (#713).
         query!(br#"{"a": [1, 2], "b": [3, 4]}"#, ".a * .b",
             QueryResult::Error(_) => {}
+        );
+    }
+
+    /// #1230: a `Float`-repr repeat count truncates toward zero, matching
+    /// real jq's own `intmax_t` cast, instead of falling through to the
+    /// generic type-mismatch error.
+    #[test]
+    fn test_arithmetic_mul_string_repetition_float_count_1230() {
+        // Truncates down (not rounds), oracle-verified against jq 1.7.1
+        // (`2.5 * "ab"` -> `"abab"`, `2.9 * "ab"` -> `"abab"`).
+        query!(br#"{"s": "ab", "n": 2.5}"#, ".n * .s",
+            QueryResult::Owned(OwnedValue::String(s)) if s == "abab" => {}
+        );
+        query!(br#"{"s": "ab", "n": 2.9}"#, ".n * .s",
+            QueryResult::Owned(OwnedValue::String(s)) if s == "abab" => {}
+        );
+
+        // Truncates to 0 -> empty string, not an error (`"ab" * 0.5` -> `""`).
+        query!(br#"{"s": "ab", "n": 0.5}"#, ".s * .n",
+            QueryResult::Owned(OwnedValue::String(s)) if s.is_empty() => {}
+        );
+
+        // A negative float still yields null, same as a negative int
+        // (jqlang/jq#1593).
+        query!(br#"{"s": "ab", "n": -1.5}"#, ".s * .n",
+            QueryResult::Owned(OwnedValue::Null) => {}
         );
     }
 
