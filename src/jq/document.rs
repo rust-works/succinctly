@@ -6,6 +6,8 @@
 
 #[cfg(not(test))]
 use alloc::{borrow::Cow, string::String, vec::Vec};
+
+use indexmap::IndexMap;
 #[cfg(test)]
 use std::borrow::Cow;
 
@@ -400,6 +402,50 @@ pub trait DocumentFields: Sized + Clone {
 
     /// Check if there are no fields.
     fn is_empty(&self) -> bool;
+
+    /// Whether a repeated key collapses to one field (`true`) or every
+    /// occurrence is kept, distinct (`false`).
+    ///
+    /// Must agree with [`find`](Self::find)/[`find_cursor`](Self::find_cursor)'s
+    /// own per-format contract: JSON dedupes (`true`), YAML doesn't
+    /// (`false`) -- duplicate mapping keys are semantically distinct there.
+    /// Backs [`effective_fields`](Self::effective_fields) (#1170).
+    fn keys_dedup(&self) -> bool;
+
+    /// Walk every field, applying this format's own duplicate-key rule (see
+    /// [`keys_dedup`](Self::keys_dedup)): a deduping format collapses a
+    /// repeated key to its first position but *last*-seen value (#1170,
+    /// matching real jq's own `.foo`/`to_entries` behavior on duplicate
+    /// JSON keys); a non-deduping format keeps every occurrence, in
+    /// document order.
+    ///
+    /// The default implementation is the shared, format-agnostic algorithm;
+    /// individual formats only need to answer `keys_dedup`, not reimplement
+    /// the walk.
+    fn effective_fields(&self) -> Vec<DocumentField<Self::Value, Self::Cursor>> {
+        let mut fields = self.clone();
+        if !self.keys_dedup() {
+            let mut out = Vec::new();
+            while let Some((field, rest)) = fields.uncons() {
+                out.push(field);
+                fields = rest;
+            }
+            return out;
+        }
+        // `IndexMap::insert` on an existing key retains its original
+        // position but replaces the stored value -- exactly "first
+        // position, last value", so a plain walk-and-insert already
+        // implements the whole rule.
+        let mut by_key: IndexMap<String, DocumentField<Self::Value, Self::Cursor>> =
+            IndexMap::new();
+        while let Some((field, rest)) = fields.uncons() {
+            if let Some(key) = field.key_str() {
+                by_key.insert(key.into_owned(), field);
+            }
+            fields = rest;
+        }
+        by_key.into_values().collect()
+    }
 
     /// Count the number of fields.
     fn len(&self) -> usize {

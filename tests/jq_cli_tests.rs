@@ -12423,3 +12423,34 @@ fn test_jq_parenthesized_del_target_works_but_chained_slice_still_errors_1153() 
     assert_eq!(code, 5);
     Ok(())
 }
+
+/// #1170: `to_entries` on a JSON object with a repeated key must collapse
+/// it to one entry -- keeping the first occurrence's position but the
+/// last occurrence's value -- matching real jq (oracle-verified against
+/// jq 1.7.1: `{"a":1,"b":2,"a":3}|to_entries` is
+/// `[{"key":"a","value":3},{"key":"b","value":2}]`), not the raw,
+/// undeduplicated per-token walk this crate previously used (which showed
+/// three entries, one per JSON token occurrence).
+#[test]
+fn test_jq_to_entries_deduplicates_repeated_json_key_1170() -> Result<()> {
+    let (out, _, code) = run_jq_full(&["-c", "to_entries"], Some(r#"{"a":1,"b":2,"a":3}"#))?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(
+        out.trim(),
+        r#"[{"key":"a","value":3},{"key":"b","value":2}]"#
+    );
+    Ok(())
+}
+
+/// #1170 regression guard: a plain object with no repeated keys is
+/// unaffected by the dedup logic.
+#[test]
+fn test_jq_to_entries_no_duplicate_keys_unaffected_1170() -> Result<()> {
+    let (out, _, code) = run_jq_full(&["-c", "to_entries"], Some(r#"{"x":1,"y":2}"#))?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(
+        out.trim(),
+        r#"[{"key":"x","value":1},{"key":"y","value":2}]"#
+    );
+    Ok(())
+}
