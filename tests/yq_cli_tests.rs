@@ -12073,6 +12073,103 @@ fn test_tag_yq_leading_dot_float_is_not_confused_for_null_918() -> Result<()> {
 }
 
 // =============================================================================
+// #918's residual scope: YAML-legal-but-JSON-unsafe float spellings — #954
+// =============================================================================
+
+/// The issue's own repro shapes: a leading `+`, a bare trailing `.`, and a
+/// redundant leading zero all normalize to a valid JSON number instead of
+/// losing their decimal point entirely (the pre-#954 symptom, `[2]` instead
+/// of `[2.0]`). Both the M2 streaming path (`.a`) and the DOM/array path
+/// (`[.a]`) are exercised, matching #918/#993's own dual coverage of these
+/// two independent materialization routes. Pinned against the pinned yq
+/// oracle v4.53.3 for the *value* (yq itself echoes the spelling verbatim
+/// instead of normalizing -- see the divergence test below).
+#[test]
+fn test_yaml_legal_json_unsafe_float_spellings_normalize_954() -> Result<()> {
+    for (yaml, want) in [
+        ("a: +2.0\n", "2.0"),
+        ("a: 1.\n", "1.0"),
+        ("a: 007e2\n", "7e2"),
+        ("a: -1.\n", "-1.0"),
+        ("a: -007e2\n", "-7e2"),
+        ("a: +.5\n", "0.5"),
+    ] {
+        let (out, code) = run_yq_stdin(".a", yaml, &["-o=json", "-I=0"])?;
+        assert_eq!(code, 0, "for {yaml:?}");
+        assert_eq!(out.trim(), want, "M2 streaming path, for {yaml:?}");
+
+        let (out, code) = run_yq_stdin("[.a]", yaml, &["-o=json", "-I=0"])?;
+        assert_eq!(code, 0, "for {yaml:?}");
+        assert_eq!(out.trim(), format!("[{want}]"), "DOM path, for {yaml:?}");
+    }
+    Ok(())
+}
+
+/// Every `-o json` output produced above must actually BE valid JSON, not
+/// merely byte-equal to an expected string -- this is the specific defect a
+/// draft of this fix introduced and code review self-check caught: widening
+/// literal preservation via this crate's own lenient semi-index scanner
+/// (safe for *finding* a span, not for *emitting* one) made `-o json` on
+/// `a: 1.`/`a: 007e2` literally emit the invalid JSON number text `1.`/
+/// `007e2`. Parses each output through `serde_json` to catch any repeat of
+/// that class of regression directly, independent of the exact expected text.
+#[test]
+fn test_yaml_legal_json_unsafe_float_spellings_produce_valid_json_954() -> Result<()> {
+    for yaml in ["a: +2.0\n", "a: 1.\n", "a: 007e2\n", "a: -1.\n"] {
+        let (out, code) = run_yq_stdin(".", yaml, &["-o=json", "-I=0"])?;
+        assert_eq!(code, 0, "for {yaml:?}");
+        serde_json::from_str::<serde_json::Value>(out.trim())
+            .unwrap_or_else(|e| panic!("invalid JSON for {yaml:?}: {out:?}: {e}"));
+    }
+    Ok(())
+}
+
+/// Before #954, a `+`-prefixed float that failed literal preservation
+/// degraded to a bare `Float` with no source text -- and #1124 had, by that
+/// point, already split `tostring`/`join`'s float-formatting rule from the
+/// structural-output one, so the two disagreed *with each other* on the
+/// same bare value (`tostring` gave `"1"`, `join` gave `"1.0"`) even though
+/// neither matched real yq's own `+1.0`. #954's fix (materializing a
+/// preserved -- if normalized -- `NumberLiteral` instead of a bare `Float`)
+/// makes every consumer read the same stored text, so they can no longer
+/// diverge from each other, even though they still don't match real yq's
+/// own `+`-preserving spelling (a real, documented, permanent divergence --
+/// see `preservable_float_literal_text`'s own doc comment for why).
+#[test]
+fn test_yaml_legal_json_unsafe_float_self_consistent_across_consumers_954() -> Result<()> {
+    for (yaml, want) in [
+        ("a: +1.0\n", "1.0"),
+        ("a: 1.\n", "1.0"),
+        ("a: 007e2\n", "7e2"),
+    ] {
+        let (out, code) = run_yq_stdin(".a | tostring", yaml, &["-r"])?;
+        assert_eq!(code, 0, "for {yaml:?}");
+        assert_eq!(out.trim(), want, "tostring, for {yaml:?}");
+
+        let (out, code) = run_yq_stdin("[.a] | join(\",\")", yaml, &["-r"])?;
+        assert_eq!(code, 0, "for {yaml:?}");
+        assert_eq!(out.trim(), want, "join, for {yaml:?}");
+    }
+    Ok(())
+}
+
+/// The `tag` builtin's own JSON-reindex-bridge round trip (see
+/// `test_tag_yq_leading_dot_float_is_not_confused_for_null_918` above) must
+/// keep working once these wider spellings can reach `NumberLiteral` too --
+/// a genuinely non-JSON-safe stored literal would silently misclassify as a
+/// parse error and report `!!null` instead of `!!float` here, the same
+/// failure mode #918 originally fixed for a leading dot.
+#[test]
+fn test_tag_yq_normalized_float_spellings_stay_float_954() -> Result<()> {
+    for yaml in ["+1.0", "1.", "007e2", "+.5"] {
+        let (out, code) = run_yq_stdin("tag", yaml, &[])?;
+        assert_eq!(code, 0, "for {yaml:?}");
+        assert_eq!(out.trim(), "!!float", "for {yaml:?}");
+    }
+    Ok(())
+}
+
+// =============================================================================
 // M2 JSON-output float literal fidelity — #993
 // =============================================================================
 

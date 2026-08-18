@@ -31,7 +31,7 @@
 //! ```
 
 #[cfg(not(test))]
-use alloc::borrow::Cow;
+use alloc::{borrow::Cow, format, string::String, string::ToString};
 #[cfg(test)]
 use std::borrow::Cow;
 
@@ -115,7 +115,10 @@ impl ResolvedScalar {
             Self::Float(_) if is_preservable_float_literal(&text) => {
                 OwnedValue::from_number_literal(&text)
             }
-            Self::Float(f) => OwnedValue::Float(f),
+            Self::Float(f) => match preservable_float_literal_text(&text) {
+                Some(normalized) => OwnedValue::from_number_literal(&normalized),
+                None => OwnedValue::Float(f),
+            },
             Self::Str => OwnedValue::String(text.into_owned()),
         }
     }
@@ -250,16 +253,18 @@ fn parse_float(s: &str) -> ResolvedScalar {
 /// value... emitters must use the carried value, never echo the source
 /// text" (see the type's doc comment) precisely because YAML's core-schema
 /// number grammar is looser than JSON's: a leading-dot float (`.5`), a
-/// leading `+` (`+.5`), or a leading zero followed by more digits (`007.5`)
-/// all resolve here but are not valid JSON number text, and hex/octal ints
-/// (`0x2A`) obviously aren't either. A caller that ignores that warning and
-/// hands such text to something expecting JSON syntax — as
-/// `OwnedValue::NumberLiteral`'s downstream reindexing bridge does — gets a
-/// value silently misclassified as a parse error instead of a number
-/// (confirmed via the `tag` builtin, which maps that error node to
-/// `!!null` for a scalar that plainly has a `!!float` tag) rather than
-/// erroring loudly. This predicate is how [`super::light`]'s
-/// `number_literal()` override decides which literals are safe to echo.
+/// leading `+` (`+.5`), a leading zero followed by more digits (`007.5`),
+/// or a bare trailing dot (`1.`) all resolve here but are not valid JSON
+/// number text, and hex/octal ints (`0x2A`) obviously aren't either. A
+/// caller that ignores that warning and hands such text to something
+/// expecting JSON syntax — as `OwnedValue::NumberLiteral`'s downstream
+/// reindexing bridge does — gets a value silently misclassified as a parse
+/// error instead of a number (confirmed via the `tag` builtin, which maps
+/// that error node to `!!null` for a scalar that plainly has a `!!float`
+/// tag) rather than erroring loudly. This predicate is how
+/// [`super::light`]'s `number_literal()` override decides which literals
+/// are safe to echo *verbatim*; [`preservable_float_literal_text`] widens
+/// beyond it by normalizing first, for text this rejects outright.
 ///
 /// This grammar is the same one `crate::json::validate::is_valid_number`
 /// implements (extracted from this exact function, #957/#966) — delegate
@@ -317,11 +322,10 @@ const MAX_PRESERVABLE_FLOAT_DIGITS: usize = 17;
 /// literals byte-for-byte regardless of magnitude — confirmed empirically
 /// against the pinned oracle (`1e100` stays `1e100`, `1E5` stays `1E5`).
 ///
-/// Deliberately conservative: legal YAML core-schema spellings that don't
-/// meet this bar (`+2.0`, a trailing-dot `1.`) fall through to the
-/// pre-existing `as_f64` path unchanged rather than being force-fit here,
-/// leaving the #918 symptom open for that narrower spelling class — see
-/// the issue tracker for the follow-up.
+/// A YAML-legal-but-JSON-unsafe spelling (`+2.0`, `1.`, `007e2`) still
+/// fails this directly, even after #954 -- see
+/// [`preservable_float_literal_text`], which normalizes to an equivalent
+/// JSON-safe spelling before falling back to this same check.
 #[must_use]
 pub(super) fn is_preservable_float_literal(s: &str) -> bool {
     let mantissa = match s.find(['e', 'E']) {
@@ -331,6 +335,67 @@ pub(super) fn is_preservable_float_literal(s: &str) -> bool {
     (s.contains('.') || s.contains(['e', 'E']))
         && mantissa.bytes().filter(u8::is_ascii_digit).count() <= MAX_PRESERVABLE_FLOAT_DIGITS
         && is_json_number_syntax(s)
+}
+
+/// A normalized, JSON-safe equivalent spelling for `s`, for a `Float`
+/// scalar whose text is YAML-legal but rejected outright by
+/// [`is_preservable_float_literal`] (#954, the residual scope #918
+/// deliberately left open) -- a companion fallback to that predicate, not
+/// a replacement for it: callers check `is_preservable_float_literal(s)`
+/// first and only reach for this on that check's `false` (this function
+/// itself returns `None`, not `Some(s)`, when `s` was already
+/// preservable, so it can't be mistaken for the primary check). Handles a
+/// leading `+` stripped (`+1.0` -> `1.0`), a trailing bare `.` completed
+/// with a `0` (`1.` -> `1.0`), and/or a redundant leading zero stripped
+/// (`007e2` -> `7e2`, reusing
+/// [`crate::json::validate::strip_redundant_leading_zeros`], #1149's own
+/// JSON-side helper for the identical problem).
+///
+/// Normalizing (rather than preserving verbatim, the way
+/// `is_preservable_float_literal` does) is required, not a style choice:
+/// `OwnedValue::NumberLiteral`'s downstream JSON-reindexing bridge parses
+/// its stored text as if it *were* JSON, so a genuinely non-JSON-safe
+/// spelling passed through unchanged corrupts that round trip. This was
+/// caught live during this fix's own development (code review self-check):
+/// an earlier draft widened `is_preservable_float_literal` itself to
+/// accept anything this crate's own lenient semi-index scanner
+/// (`number_literal_end`) could find the boundaries of, on the theory that
+/// scanner-safety implied output-safety -- it doesn't. The scanner finding
+/// a clean span only means it won't mis-parse *already-embedded* text; it
+/// says nothing about whether that same text is valid to *emit* as new
+/// JSON output. That draft made `-o json` on `a: 1.`/`a: 007e2` literally
+/// emit `1.`/`007e2` as JSON number text -- invalid per RFC 8259 (confirmed
+/// via a real JSON parser rejecting it) -- for the same query shapes that
+/// happened to route through this text before any other validation caught
+/// it. Every consumer needs the stored spelling to be actual valid JSON,
+/// which normalizing up front guarantees uniformly.
+///
+/// This is a real, permanent divergence from real yq's own verbatim-echo
+/// `tostring`/`join`/`-o yaml` output for these spellings (`+1.0`, `1.`,
+/// `007e2` all echo completely unchanged in real yq, oracle-confirmed) --
+/// accepted, not fixed by this function, matching #954's own root-cause
+/// framing (real yq's Go-based number model has no equivalent internal
+/// JSON-reindexing constraint forcing it to normalize).
+///
+/// `None` when nothing here helps (not `.`-or-exponent-shaped at all, the
+/// digit cap is exceeded, or the normalized text is still invalid, e.g.
+/// `+1.2.3`) -- callers fall back to their own pre-existing bare-`Float`
+/// handling unchanged.
+#[must_use]
+pub(super) fn preservable_float_literal_text(s: &str) -> Option<String> {
+    if is_preservable_float_literal(s) {
+        return None;
+    }
+    let stripped_plus = s.strip_prefix('+').unwrap_or(s);
+    let with_trailing_zero = match stripped_plus.strip_suffix('.') {
+        Some(_) => format!("{stripped_plus}0"),
+        None => stripped_plus.to_string(),
+    };
+    let normalized =
+        crate::json::validate::strip_redundant_leading_zeros(with_trailing_zero.as_bytes())
+            .and_then(|stripped| String::from_utf8(stripped).ok())
+            .unwrap_or(with_trailing_zero);
+    is_preservable_float_literal(&normalized).then_some(normalized)
 }
 
 /// Force-resolves a scalar's value under an explicit YAML tag.
@@ -746,5 +811,88 @@ mod tests {
         assert!(!is_preservable_float_literal(&format!(
             "{mantissa_over_cap}e1"
         )));
+    }
+
+    // ========================================================================
+    // preservable_float_literal_text tests (#954)
+    // ========================================================================
+
+    #[test]
+    fn preservable_float_literal_text_returns_none_when_already_preservable() {
+        // Callers check `is_preservable_float_literal` first; this function
+        // is only the fallback, so it must not also claim the already-ok case.
+        for s in ["2.0", "-2.0", "1e100", "0.5"] {
+            assert_eq!(preservable_float_literal_text(s), None, "input: {s:?}");
+        }
+    }
+
+    #[test]
+    fn preservable_float_literal_text_strips_leading_plus() {
+        assert_eq!(
+            preservable_float_literal_text("+1.0"),
+            Some("1.0".to_string())
+        );
+        assert_eq!(
+            preservable_float_literal_text("+2.5e10"),
+            Some("2.5e10".to_string())
+        );
+    }
+
+    #[test]
+    fn preservable_float_literal_text_completes_a_bare_trailing_dot() {
+        assert_eq!(
+            preservable_float_literal_text("1."),
+            Some("1.0".to_string())
+        );
+        assert_eq!(
+            preservable_float_literal_text("-1."),
+            Some("-1.0".to_string())
+        );
+    }
+
+    #[test]
+    fn preservable_float_literal_text_strips_redundant_leading_zero() {
+        assert_eq!(
+            preservable_float_literal_text("007e2"),
+            Some("7e2".to_string())
+        );
+        assert_eq!(
+            preservable_float_literal_text("-007e2"),
+            Some("-7e2".to_string())
+        );
+        assert_eq!(
+            preservable_float_literal_text("007.500"),
+            Some("7.500".to_string())
+        );
+    }
+
+    #[test]
+    fn preservable_float_literal_text_composes_multiple_transforms() {
+        // Leading `+` AND a redundant leading zero, in one literal.
+        assert_eq!(
+            preservable_float_literal_text("+007e2"),
+            Some("7e2".to_string())
+        );
+        // Leading `+` AND a bare trailing dot.
+        assert_eq!(
+            preservable_float_literal_text("+1."),
+            Some("1.0".to_string())
+        );
+    }
+
+    #[test]
+    fn preservable_float_literal_text_none_when_normalized_form_still_invalid() {
+        // `+1.2.3` normalizes (strip `+`) to `1.2.3`, which is still not a
+        // single valid number -- #966's own multi-dot precedent, not
+        // something this function should paper over.
+        assert_eq!(preservable_float_literal_text("+1.2.3"), None);
+        // No dot or exponent at all after stripping -- not float-shaped.
+        assert_eq!(preservable_float_literal_text("+5"), None);
+    }
+
+    #[test]
+    fn preservable_float_literal_text_respects_the_digit_cap() {
+        let over_cap = "+1.".to_string() + &"1".repeat(MAX_PRESERVABLE_FLOAT_DIGITS);
+        assert_eq!(preservable_float_literal_text(&over_cap), None);
     }
 }
