@@ -6165,6 +6165,10 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentFields for YamlFields<'a, W> {
     fn is_empty(&self) -> bool {
         YamlFields::is_empty(self)
     }
+
+    fn keys_dedup(&self) -> bool {
+        false
+    }
 }
 
 impl<'a, W: AsRef<[u64]> + Clone> DocumentElements for YamlElements<'a, W> {

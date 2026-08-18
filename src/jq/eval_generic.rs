@@ -3696,7 +3696,13 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
         // entry before this builtin ever runs (#443). Building one entry
         // object per field directly off the field cursor -- like `Keys`/
         // `Iterate` above -- means no user key is ever put into a shared
-        // map, so duplicates can't collapse.
+        // map, so YAML duplicates can't collapse. `effective_fields` (#1170)
+        // applies each format's own duplicate-key rule during this same
+        // direct walk: YAML keeps every occurrence (`#443`'s point, above);
+        // JSON collapses a repeated key to its first position but
+        // last-seen value, matching real jq (`{"a":1,"a":2}|to_entries` is
+        // one entry, value `2`) -- previously this arm showed JSON's raw,
+        // undeduplicated token occurrences instead.
         Builtin::ToEntries => {
             if let Some(elements) = value.as_array() {
                 let entries: Vec<OwnedValue> = elements
@@ -3712,17 +3718,17 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                     .collect();
                 GenericResult::Owned(OwnedValue::Array(entries))
             } else if let Some(fields) = value.as_object() {
-                let mut entries: Vec<OwnedValue> = Vec::new();
-                let mut f = fields;
-                while let Some((field, rest)) = f.uncons() {
-                    if let Some(key) = field.key_str() {
+                let entries: Vec<OwnedValue> = fields
+                    .effective_fields()
+                    .into_iter()
+                    .filter_map(|field| {
+                        let key = field.key_str()?;
                         let mut entry = IndexMap::new();
                         entry.insert("key".to_string(), OwnedValue::String(key.into_owned()));
                         entry.insert("value".to_string(), to_owned_cursor(&field.value_cursor));
-                        entries.push(OwnedValue::Object(entry));
-                    }
-                    f = rest;
-                }
+                        Some(OwnedValue::Object(entry))
+                    })
+                    .collect();
                 GenericResult::Owned(OwnedValue::Array(entries))
             } else {
                 // No `optional`-guarded arm here: `Builtin::ToEntries` isn't
@@ -5647,6 +5653,30 @@ mod tests {
             owned,
             OwnedValue::Array(vec![expected_entry(1), expected_entry(2)])
         );
+    }
+
+    /// #1170: unlike YAML's genuine duplicates (above), a duplicate JSON
+    /// key must collapse to one entry -- keeping the *first* occurrence's
+    /// position but the *last* occurrence's value, matching real jq
+    /// (`{"a":1,"b":2,"a":3}|to_entries` is `[{"key":"a","value":3},
+    /// {"key":"b","value":2}]`, oracle-verified against jq 1.7.1).
+    #[test]
+    fn test_json_generic_to_entries_deduplicates_repeated_key_1170() {
+        let json: &[u8] = br#"{"a":1,"b":2,"a":3}"#;
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+
+        let result = eval(&Expr::Builtin(Builtin::ToEntries), value);
+        let owned = result.into_owned().unwrap();
+
+        let entry = |k: &str, v: i64| {
+            let mut entry = IndexMap::new();
+            entry.insert("key".to_string(), OwnedValue::String(k.to_string()));
+            entry.insert("value".to_string(), OwnedValue::Int(v));
+            OwnedValue::Object(entry)
+        };
+        assert_eq!(owned, OwnedValue::Array(vec![entry("a", 3), entry("b", 2)]));
     }
 
     #[test]

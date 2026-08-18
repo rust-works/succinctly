@@ -913,6 +913,29 @@ fn test_duplicate_mapping_key_to_entries_json_compact() -> Result<()> {
     Ok(())
 }
 
+/// #1170: unlike YAML's genuine duplicates (preserved unmerged above, per
+/// #443), a duplicate key on `--input-format json` input must collapse to
+/// one entry -- keeping the first occurrence's position but the last
+/// occurrence's value, matching real jq's own `to_entries` behavior on
+/// duplicate JSON keys (the two formats have opposite correct behavior
+/// here, and `to_entries`'s cursor-native walk is shared between them).
+#[test]
+fn test_duplicate_json_key_to_entries_deduplicates_1170() -> Result<()> {
+    let json = r#"{"a":1,"b":2,"a":3}"#;
+    let (output, code) = run_yq_stdin(
+        "to_entries",
+        json,
+        &["--input-format", "json", "-o=json", "-I=0"],
+    )?;
+
+    assert_eq!(code, 0);
+    assert_eq!(
+        output.trim(),
+        r#"[{"key":"a","value":3},{"key":"b","value":2}]"#
+    );
+    Ok(())
+}
+
 /// #478: `--slurp '.'` shares the same `IndexMap`-backed conversion
 /// (`yaml_to_owned_value`) #442 didn't touch, so it kept collapsing
 /// duplicate keys within each slurped element even after plain `yq '.'`
