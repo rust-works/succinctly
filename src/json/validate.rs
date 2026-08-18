@@ -1722,4 +1722,64 @@ mod tests {
             ValidationErrorKind::UnexpectedCharacter { .. }
         ));
     }
+
+    // ========================================================================
+    // strip_redundant_leading_zeros tests (#1149)
+    // ========================================================================
+
+    #[test]
+    fn test_strip_redundant_leading_zeros_basic() {
+        assert_eq!(strip_redundant_leading_zeros(b"007"), Some(b"7".to_vec()));
+        assert_eq!(strip_redundant_leading_zeros(b"-007"), Some(b"-7".to_vec()));
+        assert_eq!(
+            strip_redundant_leading_zeros(b"007e5"),
+            Some(b"7e5".to_vec())
+        );
+        assert_eq!(
+            strip_redundant_leading_zeros(b"007.500"),
+            Some(b"7.500".to_vec())
+        );
+    }
+
+    #[test]
+    fn test_strip_redundant_leading_zeros_all_zero_run_collapses_to_one_zero() {
+        // An all-zero digit run strips down to a single `0`, not empty.
+        assert_eq!(strip_redundant_leading_zeros(b"00"), Some(b"0".to_vec()));
+        assert_eq!(strip_redundant_leading_zeros(b"000"), Some(b"0".to_vec()));
+        assert_eq!(strip_redundant_leading_zeros(b"-000"), Some(b"-0".to_vec()));
+    }
+
+    #[test]
+    fn test_strip_redundant_leading_zeros_nothing_to_strip_returns_none() {
+        // Bare `0`/`0.x` is already RFC-8259-valid; no allocation, no strip.
+        assert_eq!(strip_redundant_leading_zeros(b"0"), None);
+        assert_eq!(strip_redundant_leading_zeros(b"-0"), None);
+        assert_eq!(strip_redundant_leading_zeros(b"0.5"), None);
+        // Ordinary numbers with no leading zero at all.
+        assert_eq!(strip_redundant_leading_zeros(b"42"), None);
+        assert_eq!(strip_redundant_leading_zeros(b"-42"), None);
+        assert_eq!(strip_redundant_leading_zeros(b"7e5"), None);
+    }
+
+    #[test]
+    fn test_strip_redundant_leading_zeros_non_number_input_returns_none() {
+        // No leading digit at all -- not this function's job to validate,
+        // just to decline stripping when there's nothing zero-prefixed.
+        assert_eq!(strip_redundant_leading_zeros(b""), None);
+        assert_eq!(strip_redundant_leading_zeros(b"-"), None);
+        assert_eq!(strip_redundant_leading_zeros(b"abc"), None);
+        assert_eq!(strip_redundant_leading_zeros(b".5"), None);
+    }
+
+    #[test]
+    fn test_strip_redundant_leading_zeros_result_may_still_be_invalid() {
+        // The stripped result can itself be invalid -- this function only
+        // strips, it doesn't validate; callers re-check `is_valid_number`
+        // on the result before trusting it (#966's `1.2.3`-style leniency).
+        assert_eq!(
+            strip_redundant_leading_zeros(b"007.5.3"),
+            Some(b"7.5.3".to_vec())
+        );
+        assert!(!is_valid_number(b"7.5.3"));
+    }
 }
