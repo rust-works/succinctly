@@ -1861,31 +1861,42 @@ fn arith_add<S: EvalSemantics>(
             a.push(b);
             Ok(OwnedValue::Array(a))
         }
-        // Everything else: numeric addition. A `NumberLiteral` operand
+        // Numeric addition -- only once both operands are confirmed numeric
+        // (via the non-consuming `is_number()` peek) does this arm actually
+        // move them into `into_plain_number()`. A `NumberLiteral` operand
         // degrades to plain `Int`/`Float` here, and only here -- this is
         // the one arm that actually computes a new number, so jq/yq's
         // canonical formatting is correct; every arm above relocates an
         // operand unchanged and must not collapse its literal spelling
         // (#1143).
-        (left, right) => match (left.into_plain_number(), right.into_plain_number()) {
-            // Number addition - jq converts to float on overflow, yq wraps
-            (OwnedValue::Int(a), OwnedValue::Int(b)) => {
-                if S::OVERFLOW_WRAPS {
-                    // yq behavior: wrapping add
-                    Ok(OwnedValue::Int(a.wrapping_add(b)))
-                } else {
-                    // jq behavior: convert to float on overflow
-                    match a.checked_add(b) {
-                        Some(result) => Ok(OwnedValue::Int(result)),
-                        None => Ok(OwnedValue::Float(a as f64 + b as f64)),
+        (left, right) if left.is_number() && right.is_number() => {
+            match (left.into_plain_number(), right.into_plain_number()) {
+                // Number addition - jq converts to float on overflow, yq wraps
+                (OwnedValue::Int(a), OwnedValue::Int(b)) => {
+                    if S::OVERFLOW_WRAPS {
+                        // yq behavior: wrapping add
+                        Ok(OwnedValue::Int(a.wrapping_add(b)))
+                    } else {
+                        // jq behavior: convert to float on overflow
+                        match a.checked_add(b) {
+                            Some(result) => Ok(OwnedValue::Int(result)),
+                            None => Ok(OwnedValue::Float(a as f64 + b as f64)),
+                        }
                     }
                 }
+                (OwnedValue::Int(a), OwnedValue::Float(b)) => Ok(OwnedValue::Float(a as f64 + b)),
+                (OwnedValue::Float(a), OwnedValue::Int(b)) => Ok(OwnedValue::Float(a + b as f64)),
+                (OwnedValue::Float(a), OwnedValue::Float(b)) => Ok(OwnedValue::Float(a + b)),
+                _ => unreachable!("both operands already confirmed numeric by the guard above"),
             }
-            (OwnedValue::Int(a), OwnedValue::Float(b)) => Ok(OwnedValue::Float(a as f64 + b)),
-            (OwnedValue::Float(a), OwnedValue::Int(b)) => Ok(OwnedValue::Float(a + b as f64)),
-            (OwnedValue::Float(a), OwnedValue::Float(b)) => Ok(OwnedValue::Float(a + b)),
-            (a, b) => Err(EvalError::binary_op(&a, &b, BinOp::Add)),
-        },
+        }
+        // Type mismatch -- `left`/`right` are still the *original*,
+        // uncollapsed operands here (the guard above never fires, so
+        // `into_plain_number()` never runs), so a `NumberLiteral` operand's
+        // source spelling survives into the error message too (#1199: it
+        // previously didn't, since the old single catch-all arm collapsed
+        // both operands before ever building the error).
+        (left, right) => Err(EvalError::binary_op(&left, &right, BinOp::Add)),
     }
 }
 
@@ -1915,36 +1926,46 @@ fn arith_sub<S: EvalSemantics>(
         // the top since every prior arm here actually computed a value, is
         // now deferred into the numeric sub-match instead.
         (OwnedValue::Null, other) if S::SUB_LEFT_NULL_IS_IDENTITY => Ok(other),
-        (left, right) => match (left.into_plain_number(), right.into_plain_number()) {
-            // jq converts to float on overflow, yq wraps
-            (OwnedValue::Int(a), OwnedValue::Int(b)) => {
-                if S::OVERFLOW_WRAPS {
-                    // yq behavior: wrapping sub
-                    Ok(OwnedValue::Int(a.wrapping_sub(b)))
-                } else {
-                    // jq behavior: convert to float on overflow
-                    match a.checked_sub(b) {
-                        Some(result) => Ok(OwnedValue::Int(result)),
-                        None => Ok(OwnedValue::Float(a as f64 - b as f64)),
+        // Array subtraction (remove elements). `owned_value_eq::<S>`, not
+        // `Vec::contains` (plain `PartialEq`): yq's stricter Int/Float
+        // equality must apply here too, or `[2.0] - [2]` would (wrongly)
+        // remove the float (#950 review). Split out of the numeric match
+        // below (#1199) since an array is never `is_number()`.
+        (OwnedValue::Array(a), OwnedValue::Array(b)) => {
+            let result: Vec<_> = a
+                .into_iter()
+                .filter(|x| !b.iter().any(|y| owned_value_eq::<S>(x, y)))
+                .collect();
+            Ok(OwnedValue::Array(result))
+        }
+        // Numeric subtraction -- only once both operands are confirmed
+        // numeric (via the non-consuming `is_number()` peek) does this arm
+        // actually move them into `into_plain_number()`.
+        (left, right) if left.is_number() && right.is_number() => {
+            match (left.into_plain_number(), right.into_plain_number()) {
+                // jq converts to float on overflow, yq wraps
+                (OwnedValue::Int(a), OwnedValue::Int(b)) => {
+                    if S::OVERFLOW_WRAPS {
+                        // yq behavior: wrapping sub
+                        Ok(OwnedValue::Int(a.wrapping_sub(b)))
+                    } else {
+                        // jq behavior: convert to float on overflow
+                        match a.checked_sub(b) {
+                            Some(result) => Ok(OwnedValue::Int(result)),
+                            None => Ok(OwnedValue::Float(a as f64 - b as f64)),
+                        }
                     }
                 }
+                (OwnedValue::Int(a), OwnedValue::Float(b)) => Ok(OwnedValue::Float(a as f64 - b)),
+                (OwnedValue::Float(a), OwnedValue::Int(b)) => Ok(OwnedValue::Float(a - b as f64)),
+                (OwnedValue::Float(a), OwnedValue::Float(b)) => Ok(OwnedValue::Float(a - b)),
+                _ => unreachable!("both operands already confirmed numeric by the guard above"),
             }
-            (OwnedValue::Int(a), OwnedValue::Float(b)) => Ok(OwnedValue::Float(a as f64 - b)),
-            (OwnedValue::Float(a), OwnedValue::Int(b)) => Ok(OwnedValue::Float(a - b as f64)),
-            (OwnedValue::Float(a), OwnedValue::Float(b)) => Ok(OwnedValue::Float(a - b)),
-            // Array subtraction (remove elements). `owned_value_eq::<S>`, not
-            // `Vec::contains` (plain `PartialEq`): yq's stricter Int/Float
-            // equality must apply here too, or `[2.0] - [2]` would (wrongly)
-            // remove the float (#950 review).
-            (OwnedValue::Array(a), OwnedValue::Array(b)) => {
-                let result: Vec<_> = a
-                    .into_iter()
-                    .filter(|x| !b.iter().any(|y| owned_value_eq::<S>(x, y)))
-                    .collect();
-                Ok(OwnedValue::Array(result))
-            }
-            (a, b) => Err(EvalError::binary_op(&a, &b, BinOp::Subtract)),
-        },
+        }
+        // Type mismatch -- `left`/`right` are still the *original*,
+        // uncollapsed operands here, so a `NumberLiteral` operand's source
+        // spelling survives into the error message too (#1199).
+        (left, right) => Err(EvalError::binary_op(&left, &right, BinOp::Subtract)),
     }
 }
 
@@ -2056,41 +2077,54 @@ fn arith_mul<S: EvalSemantics>(
         // it's already handled by the `(left, Null)` no-op arm above,
         // since `left` binds to `Null` there too (live-verified against
         // yq v4.53.3: `null * null` -> `null`, exit 0, not an error).
-        // Everything else: numeric multiplication or string repetition. A
+        // Numeric multiplication or string repetition -- only once the pair
+        // is confirmed to be one of the shapes this arm actually computes
+        // (both numeric, or one `String` paired with a numeric repeat
+        // count) does it move the operands into `into_plain_number()`. A
         // `NumberLiteral` operand degrades to plain `Int`/`Float` here, and
         // only here -- these are the arms that actually compute a new
         // value (a product, or a repeated string), so canonical formatting
         // is correct; every arm above relocates an operand unchanged and
         // must not collapse a literal's spelling (#1167).
-        (left, right) => match (left.into_plain_number(), right.into_plain_number()) {
-            // jq converts to float on overflow, yq wraps
-            (OwnedValue::Int(a), OwnedValue::Int(b)) => {
-                if S::OVERFLOW_WRAPS {
-                    // yq behavior: wrapping mul
-                    Ok(OwnedValue::Int(a.wrapping_mul(b)))
-                } else {
-                    // jq behavior: convert to float on overflow
-                    match a.checked_mul(b) {
-                        Some(result) => Ok(OwnedValue::Int(result)),
-                        None => Ok(OwnedValue::Float(a as f64 * b as f64)),
+        (left, right)
+            if (left.is_number() && right.is_number())
+                || (matches!(left, OwnedValue::String(_)) && right.is_number())
+                || (left.is_number() && matches!(right, OwnedValue::String(_))) =>
+        {
+            match (left.into_plain_number(), right.into_plain_number()) {
+                // jq converts to float on overflow, yq wraps
+                (OwnedValue::Int(a), OwnedValue::Int(b)) => {
+                    if S::OVERFLOW_WRAPS {
+                        // yq behavior: wrapping mul
+                        Ok(OwnedValue::Int(a.wrapping_mul(b)))
+                    } else {
+                        // jq behavior: convert to float on overflow
+                        match a.checked_mul(b) {
+                            Some(result) => Ok(OwnedValue::Int(result)),
+                            None => Ok(OwnedValue::Float(a as f64 * b as f64)),
+                        }
                     }
                 }
-            }
-            (OwnedValue::Int(a), OwnedValue::Float(b)) => Ok(OwnedValue::Float(a as f64 * b)),
-            (OwnedValue::Float(a), OwnedValue::Int(b)) => Ok(OwnedValue::Float(a * b as f64)),
-            (OwnedValue::Float(a), OwnedValue::Float(b)) => Ok(OwnedValue::Float(a * b)),
-            // String repetition: "ab" * 3 = "ababab". jq >= 1.7 yields ""
-            // for n == 0 and null only for n < 0 (jqlang/jq#1593)
-            (OwnedValue::String(s), OwnedValue::Int(n))
-            | (OwnedValue::Int(n), OwnedValue::String(s)) => {
-                if n < 0 {
-                    Ok(OwnedValue::Null)
-                } else {
-                    Ok(OwnedValue::String(s.repeat(n as usize)))
+                (OwnedValue::Int(a), OwnedValue::Float(b)) => Ok(OwnedValue::Float(a as f64 * b)),
+                (OwnedValue::Float(a), OwnedValue::Int(b)) => Ok(OwnedValue::Float(a * b as f64)),
+                (OwnedValue::Float(a), OwnedValue::Float(b)) => Ok(OwnedValue::Float(a * b)),
+                // String repetition: "ab" * 3 = "ababab". jq >= 1.7 yields ""
+                // for n == 0 and null only for n < 0 (jqlang/jq#1593)
+                (OwnedValue::String(s), OwnedValue::Int(n))
+                | (OwnedValue::Int(n), OwnedValue::String(s)) => {
+                    if n < 0 {
+                        Ok(OwnedValue::Null)
+                    } else {
+                        Ok(OwnedValue::String(s.repeat(n as usize)))
+                    }
                 }
+                _ => unreachable!("guard above only admits number/number or String/number pairs"),
             }
-            (a, b) => Err(EvalError::binary_op(&a, &b, BinOp::Multiply)),
-        },
+        }
+        // Type mismatch -- `left`/`right` are still the *original*,
+        // uncollapsed operands here, so a `NumberLiteral` operand's source
+        // spelling survives into the error message too (#1199).
+        (left, right) => Err(EvalError::binary_op(&left, &right, BinOp::Multiply)),
     }
 }
 
@@ -2284,67 +2318,65 @@ fn arith_div<S: EvalSemantics>(
     left: OwnedValue,
     right: OwnedValue,
 ) -> Result<OwnedValue, EvalError> {
-    let (left, right) = (left.into_plain_number(), right.into_plain_number());
-    match (left, right) {
-        (OwnedValue::Int(a), OwnedValue::Int(b)) => {
+    // `as_number_repr()` (#1199) peeks the computable value through a
+    // reference, leaving `left`/`right` themselves owned and un-collapsed
+    // for the rest of the function -- both `divisor_is_zero` (reached from
+    // *inside* an otherwise-successful numeric arm, not just a trailing
+    // catch-all) and the final type-mismatch `binary_op` can therefore
+    // still cite a `NumberLiteral` operand's own source spelling, not the
+    // canonically-reformatted value `into_plain_number()` would have left
+    // behind.
+    match (left.as_number_repr(), right.as_number_repr()) {
+        (Some(NumberRepr::Int(a)), Some(NumberRepr::Int(b))) => {
             if b == 0 {
                 if S::DIV_BY_ZERO_IS_INFINITY {
                     // yq behavior: return infinity
                     Ok(OwnedValue::Float(a as f64 / b as f64))
                 } else {
                     // jq behavior: error
-                    Err(EvalError::divisor_is_zero(
-                        &OwnedValue::Int(a),
-                        &OwnedValue::Int(b),
-                        BinOp::Divide,
-                    ))
+                    Err(EvalError::divisor_is_zero(&left, &right, BinOp::Divide))
                 }
             } else {
                 Ok(OwnedValue::Float(a as f64 / b as f64))
             }
         }
-        (OwnedValue::Int(a), OwnedValue::Float(b)) => {
+        (Some(NumberRepr::Int(a)), Some(NumberRepr::Float(b))) => {
             if b == 0.0 && !S::DIV_BY_ZERO_IS_INFINITY {
-                Err(EvalError::divisor_is_zero(
-                    &OwnedValue::Int(a),
-                    &OwnedValue::Float(b),
-                    BinOp::Divide,
-                ))
+                Err(EvalError::divisor_is_zero(&left, &right, BinOp::Divide))
             } else {
                 Ok(OwnedValue::Float(a as f64 / b))
             }
         }
-        (OwnedValue::Float(a), OwnedValue::Int(b)) => {
+        (Some(NumberRepr::Float(a)), Some(NumberRepr::Int(b))) => {
             if b == 0 && !S::DIV_BY_ZERO_IS_INFINITY {
-                Err(EvalError::divisor_is_zero(
-                    &OwnedValue::Float(a),
-                    &OwnedValue::Int(b),
-                    BinOp::Divide,
-                ))
+                Err(EvalError::divisor_is_zero(&left, &right, BinOp::Divide))
             } else {
                 Ok(OwnedValue::Float(a / b as f64))
             }
         }
-        (OwnedValue::Float(a), OwnedValue::Float(b)) => {
+        (Some(NumberRepr::Float(a)), Some(NumberRepr::Float(b))) => {
             if b == 0.0 && !S::DIV_BY_ZERO_IS_INFINITY {
-                Err(EvalError::divisor_is_zero(
-                    &OwnedValue::Float(a),
-                    &OwnedValue::Float(b),
-                    BinOp::Divide,
-                ))
+                Err(EvalError::divisor_is_zero(&left, &right, BinOp::Divide))
             } else {
                 Ok(OwnedValue::Float(a / b))
             }
         }
-        // String split: "a,b,c" / "," = ["a", "b", "c"]
-        (OwnedValue::String(s), OwnedValue::String(sep)) => {
-            let parts: Vec<OwnedValue> = s
-                .split(&sep)
-                .map(|p| OwnedValue::String(p.to_string()))
-                .collect();
-            Ok(OwnedValue::Array(parts))
-        }
-        (a, b) => Err(EvalError::binary_op(&a, &b, BinOp::Divide)),
+        // Neither operand's repr matched above -- fall through to the
+        // shapes `as_number_repr()` can't express (String split, or a
+        // genuine type mismatch), now safe to actually consume `left`/
+        // `right` since no arm past this point needs the original spelling
+        // anymore.
+        _ => match (left, right) {
+            // String split: "a,b,c" / "," = ["a", "b", "c"]
+            (OwnedValue::String(s), OwnedValue::String(sep)) => {
+                let parts: Vec<OwnedValue> = s
+                    .split(&sep)
+                    .map(|p| OwnedValue::String(p.to_string()))
+                    .collect();
+                Ok(OwnedValue::Array(parts))
+            }
+            (left, right) => Err(EvalError::binary_op(&left, &right, BinOp::Divide)),
+        },
     }
 }
 
@@ -2353,35 +2385,35 @@ fn arith_mod<S: EvalSemantics>(
     left: OwnedValue,
     right: OwnedValue,
 ) -> Result<OwnedValue, EvalError> {
-    let (left, right) = (left.into_plain_number(), right.into_plain_number());
-    match (left, right) {
-        (OwnedValue::Int(a), OwnedValue::Int(b)) => {
+    // Same `as_number_repr()` peek as `arith_div` (#1199): `left`/`right`
+    // stay owned and un-collapsed for both `divisor_is_zero`/`mod_floats`
+    // (reached from inside an otherwise-successful numeric arm) and the
+    // final type-mismatch `binary_op`, so a `NumberLiteral` operand's
+    // source spelling survives into whichever error actually fires.
+    match (left.as_number_repr(), right.as_number_repr()) {
+        (Some(NumberRepr::Int(a)), Some(NumberRepr::Int(b))) => {
             if b == 0 {
                 if S::DIV_BY_ZERO_IS_INFINITY {
                     // yq behavior: return NaN (will be serialized as null)
                     Ok(OwnedValue::Float(f64::NAN))
                 } else {
                     // jq behavior: error
-                    Err(EvalError::divisor_is_zero(
-                        &OwnedValue::Int(a),
-                        &OwnedValue::Int(b),
-                        BinOp::Modulo,
-                    ))
+                    Err(EvalError::divisor_is_zero(&left, &right, BinOp::Modulo))
                 }
             } else {
                 Ok(OwnedValue::Int(a.wrapping_rem(b)))
             }
         }
-        (OwnedValue::Float(a), OwnedValue::Float(b)) => {
-            mod_floats::<S>(a, b, &OwnedValue::Float(a), &OwnedValue::Float(b))
+        (Some(NumberRepr::Float(a)), Some(NumberRepr::Float(b))) => {
+            mod_floats::<S>(a, b, &left, &right)
         }
-        (OwnedValue::Int(a), OwnedValue::Float(b)) => {
-            mod_floats::<S>(a as f64, b, &OwnedValue::Int(a), &OwnedValue::Float(b))
+        (Some(NumberRepr::Int(a)), Some(NumberRepr::Float(b))) => {
+            mod_floats::<S>(a as f64, b, &left, &right)
         }
-        (OwnedValue::Float(a), OwnedValue::Int(b)) => {
-            mod_floats::<S>(a, b as f64, &OwnedValue::Float(a), &OwnedValue::Int(b))
+        (Some(NumberRepr::Float(a)), Some(NumberRepr::Int(b))) => {
+            mod_floats::<S>(a, b as f64, &left, &right)
         }
-        (a, b) => Err(EvalError::binary_op(&a, &b, BinOp::Modulo)),
+        _ => Err(EvalError::binary_op(&left, &right, BinOp::Modulo)),
     }
 }
 

@@ -830,6 +830,45 @@ impl OwnedValue {
         !matches!(self, Self::Null | Self::Bool(false))
     }
 
+    /// Whether this value is a number in any of its three representations
+    /// (`Int`, `Float`, or `NumberLiteral`) -- i.e. whether
+    /// `into_plain_number()` would collapse it to `Int`/`Float` rather than
+    /// hand it back unchanged. A cheap, non-consuming peek (#1199): lets a
+    /// caller decide *before* moving an operand into `into_plain_number()`
+    /// whether doing so is actually safe -- consuming a genuinely
+    /// non-numeric operand (`String`/`Array`/`Object`/`Bool`/`Null`) that
+    /// way is a no-op for the value itself, but discards the caller's own
+    /// binding to the original, so an error message built from the
+    /// post-collapse value loses a `NumberLiteral`'s source spelling for
+    /// nothing -- see the arith_* functions' own catch-all arms.
+    pub fn is_number(&self) -> bool {
+        matches!(
+            self,
+            Self::Int(_) | Self::Float(_) | Self::NumberLiteral(..)
+        )
+    }
+
+    /// The parsed numeric value, without consuming or collapsing `self`.
+    /// `None` for a non-number. Unlike `into_plain_number()` (which
+    /// consumes `self` to hand back an owned `Int`/`Float`, dropping a
+    /// `NumberLiteral`'s spelling in the process), this reads through a
+    /// `NumberLiteral`'s already-parsed `NumberRepr` without touching its
+    /// `Box<str>` at all -- `NumberRepr` is `Copy`, so this never allocates.
+    /// Lets a caller (`arith_div`/`arith_mod`, #1199) get the computable
+    /// value *and* keep its own binding to the original `OwnedValue` alive,
+    /// for an error message (`divisor_is_zero`) that needs to preserve a
+    /// `NumberLiteral` operand's source spelling even when the divide-by-
+    /// zero check happens deep inside an otherwise-successful numeric arm,
+    /// not just in a top-level type-mismatch catch-all.
+    pub fn as_number_repr(&self) -> Option<NumberRepr> {
+        match self {
+            Self::Int(n) => Some(NumberRepr::Int(*n)),
+            Self::Float(f) => Some(NumberRepr::Float(*f)),
+            Self::NumberLiteral(repr, _) => Some(*repr),
+            _ => None,
+        }
+    }
+
     /// Get the type name of this value.
     pub fn type_name(&self) -> &'static str {
         match self {
@@ -1812,6 +1851,40 @@ mod tests {
         assert!(OwnedValue::Null.is_null());
         assert!(!OwnedValue::Bool(false).is_null());
         assert!(!OwnedValue::Int(0).is_null());
+    }
+
+    #[test]
+    fn test_is_number() {
+        assert!(OwnedValue::Int(1).is_number());
+        assert!(OwnedValue::Float(1.5).is_number());
+        assert!(OwnedValue::NumberLiteral(NumberRepr::Int(1), "1".into()).is_number());
+        assert!(!OwnedValue::String("1".into()).is_number());
+        assert!(!OwnedValue::Bool(true).is_number());
+        assert!(!OwnedValue::Null.is_number());
+        assert!(!OwnedValue::Array(vec![]).is_number());
+    }
+
+    #[test]
+    fn test_as_number_repr() {
+        assert_eq!(
+            OwnedValue::Int(7).as_number_repr(),
+            Some(NumberRepr::Int(7))
+        );
+        assert_eq!(
+            OwnedValue::Float(2.5).as_number_repr(),
+            Some(NumberRepr::Float(2.5))
+        );
+        // Reads through a NumberLiteral without touching (or requiring)
+        // its spelling -- `self` stays borrowed, so the original value is
+        // still usable afterward.
+        let literal = OwnedValue::NumberLiteral(NumberRepr::Float(1e10), "1e10".into());
+        assert_eq!(literal.as_number_repr(), Some(NumberRepr::Float(1e10)));
+        assert_eq!(
+            literal,
+            OwnedValue::NumberLiteral(NumberRepr::Float(1e10), "1e10".into())
+        );
+        assert_eq!(OwnedValue::String("1".into()).as_number_repr(), None);
+        assert_eq!(OwnedValue::Null.as_number_repr(), None);
     }
 
     #[test]

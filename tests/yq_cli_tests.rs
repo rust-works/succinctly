@@ -14530,6 +14530,25 @@ fn test_1198_mixed_int_float_subtraction_unaffected() -> Result<()> {
     Ok(())
 }
 
+// --- #1199: a `NumberLiteral` operand's source spelling must survive into
+// a binary-op type-mismatch error message in yq mode too, not just jq
+// mode -- verified live that yq mode's arithmetic error wording uses the
+// identical "number (X) and ..." format, so the same bug and the same fix
+// apply unchanged. See tests/jq_cli_tests.rs's own `_1199` tests for the
+// full jq-mode coverage of every operator, including `divisor_is_zero`
+// (jq-only-reachable: yq's `DIV_BY_ZERO_IS_INFINITY = true` means `/`/`%`
+// never take that error arm at all in yq mode -- `1e10 / 0` and `1e10 % 0`
+// both succeed there, confirmed live -- so there is no yq-mode
+// `divisor_is_zero` case to test).
+
+#[test]
+fn test_1199_binary_op_error_preserves_number_literal_spelling_yq_mode() -> Result<()> {
+    let (_out, err, code) = run_yq_stdin_with_stderr("1e10 * {}", "null", &["-o=json"])?;
+    assert_eq!(code, 1, "{err}");
+    assert!(err.contains("number (1E+10)"), "{err}");
+    Ok(())
+}
+
 // --- #1116: chained scalar-slice-assignment no-ops too; del() differs ---
 //
 // #1101 covered only a *bare* scalar-slice path (`.[S:E]`). #1116 extends
