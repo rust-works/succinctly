@@ -6612,6 +6612,51 @@ fn test_trailing_content_after_flow_collection_errors_878() -> Result<()> {
     Ok(())
 }
 
+/// #1186: a *tab* before a trailing comment after a flow collection's
+/// closing delimiter must be accepted exactly like the space case above,
+/// not misread as leading indentation on a re-entered "next line" that's
+/// actually still the same line. `reject_trailing_flow_content` (#878,
+/// above) already *validated* a tab as ordinary inline whitespace here, but
+/// left `self.pos` sitting on it instead of consuming it -- the line-
+/// oriented loop that runs next only recognizes a leading *space* as
+/// "possibly a blank/comment line", not a tab, so it left the tab
+/// unconsumed and re-entered `parse_document_line` mid-line, where
+/// `count_indent` (which assumes it's only ever called at a genuine line
+/// start) misclassified it, erroring "tab character used for indentation".
+#[test]
+fn test_tab_before_trailing_comment_after_flow_collection_accepted_1186() -> Result<()> {
+    let (out, code) = run_yq_stdin(
+        ".a",
+        "a: [1, 2]\t# trailing comment\n",
+        &["-o", "json", "-I0"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "[1,2]");
+
+    // Flow mapping variant of the same shape.
+    let (out, code) = run_yq_stdin(
+        ".a",
+        "a: {b: 1}\t# trailing comment\n",
+        &["-o", "json", "-I0"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), r#"{"b":1}"#);
+
+    // A tab followed by real content (not just a comment) must still error,
+    // same as the space case in #878 above -- the fix only widens what
+    // counts as "just trailing whitespace/comment", not what counts as
+    // trailing garbage.
+    let (_, stderr, code) =
+        run_yq_stdin_with_stderr(".", "a: [1, 2]\tb: 3\n", &["-o", "json", "-I0"])?;
+    assert_ne!(code, 0);
+    assert!(
+        stderr.contains("after a flow collection's closing delimiter"),
+        "stderr: {stderr}"
+    );
+
+    Ok(())
+}
+
 #[test]
 fn test_flow_collection_as_implicit_mapping_key_still_permitted_878() -> Result<()> {
     // #878's validation must not reject a flow collection followed by `:` -

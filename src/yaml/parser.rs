@@ -3955,13 +3955,38 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     /// Only called for `[`/`{` — a block scalar (`|`/`>`) has no equivalent
     /// same-line trailing-content shape to reject, since its own terminator
     /// is a dedent, not a delimiter byte a stray token could follow.
-    fn reject_trailing_flow_content(&self, permit_colon_terminator: bool) -> Result<(), YamlError> {
+    ///
+    /// Consumes the inline whitespace it validates (advancing `self.pos` to
+    /// the comment/break/EOI it finds) rather than only checking it (#1186):
+    /// this function previously left `self.pos` sitting on the flow
+    /// collection's own closing delimiter even after confirming a run of
+    /// inline whitespace (space *or* tab) followed. A tab specifically was
+    /// then left unconsumed for the caller's line-oriented loop
+    /// (`skip_newlines`, which only recognizes a leading *space* as
+    /// "possibly a blank/comment line", not a tab) to re-enter
+    /// `parse_document_line` mid-line, where `count_indent` -- which
+    /// assumes it's only ever called at a genuine line start -- misread the
+    /// tab as indentation. Consuming it here instead means the caller's
+    /// `self.pos` already sits at the line break (or EOI) by the time
+    /// control returns, so that mid-line reentry never happens. The `:`
+    /// terminator arm deliberately does *not* advance `self.pos` -- #902's
+    /// own compact-mapping-key parsing still needs to see the `:` itself.
+    fn reject_trailing_flow_content(
+        &mut self,
+        permit_colon_terminator: bool,
+    ) -> Result<(), YamlError> {
         let mut i = self.pos;
         while i < self.input.len() {
             match self.input[i] {
-                b'#' => return Ok(()),
+                b'#' => {
+                    self.pos = i;
+                    return Ok(());
+                }
                 b if Self::is_inline_whitespace(b) => i += 1,
-                b if Self::is_break(b) => return Ok(()),
+                b if Self::is_break(b) => {
+                    self.pos = i;
+                    return Ok(());
+                }
                 b':' if permit_colon_terminator
                     && Self::is_ws_break_or_eoi(self.input.get(i + 1).copied()) =>
                 {
@@ -3971,6 +3996,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             }
         }
         if i >= self.input.len() {
+            self.pos = i;
             return Ok(());
         }
         Err(YamlError::UnexpectedCharacter {
@@ -5770,6 +5796,36 @@ mod tests {
         let yaml = b"name:\n\tvalue";
         let result = build_semi_index(yaml);
         assert!(matches!(result, Err(YamlError::TabIndentation { .. })));
+    }
+
+    /// #1186: unlike the genuine-indentation tab above, a tab that sits
+    /// between a flow collection's closing delimiter and a trailing
+    /// comment on the *same* line must not be misread as indentation on a
+    /// (nonexistent) next line.
+    #[test]
+    fn test_tab_before_trailing_comment_after_flow_collection_accepted_1186() {
+        let yaml = b"a: [1, 2]\t# trailing comment\n";
+        let result = build_semi_index(yaml);
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    /// #1186 regression guard: a naive fix (widening the general
+    /// blank/comment-line skip loop, `skip_newlines`, to treat a leading
+    /// tab like a space unconditionally) broke this unrelated, official
+    /// YAML Test Suite case (`Y79Y/000`, "Tabs in various contexts") --
+    /// a block scalar's own content line containing *only* a tab must
+    /// still be rejected, since a tab is never valid indentation there
+    /// either. The real fix is scoped to `reject_trailing_flow_content`
+    /// alone (only reachable after a flow collection's own closing
+    /// delimiter), which never touches block-scalar content at all.
+    #[test]
+    fn test_tab_only_block_scalar_content_line_still_rejected_1186() {
+        let yaml = b"foo: |\n\t\nbar: 1\n";
+        let result = build_semi_index(yaml);
+        assert!(
+            matches!(result, Err(YamlError::TabIndentation { .. })),
+            "{result:?}"
+        );
     }
 
     /// #173: a tab following the leading spaces was treated as start-of-content, so
