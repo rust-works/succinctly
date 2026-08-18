@@ -842,54 +842,77 @@ fn into_lazy_items<V: DocumentValue>(
 /// above (#965) rather than merged into it: this one is used only by this
 /// module's own `eval_on_owned`/`eval_single` fallback arm on a value it
 /// constructs internally (e.g. a `reduce`/`foreach` accumulator), and its
-/// Number/String arms carry two real behavioral differences from `to_owned`
-/// that a naive merge would lose -- NaN/Infinity-sentinel decoding (its
-/// callers round-trip through `to_json_for_reindex`, which bakes those as a
-/// sentinel number literal `to_owned`'s plain `number_literal()`/`as_f64()`
-/// path doesn't decode) and a different malformed-UTF-8-string fallback
-/// (`OwnedValue::String("")` here vs. `OwnedValue::Null` there). Before this
-/// rename it also happened to share a name with an unrelated, now-deleted
-/// `yq_runner.rs` helper (#907) -- a real naming-confusion risk for anyone
-/// grepping the codebase, even though the two never collided at compile
-/// time (module-private on both sides).
+/// Number arm carries a real behavioral difference from `to_owned` that a
+/// naive merge would lose -- NaN/Infinity-sentinel decoding (its callers
+/// round-trip through `to_json_for_reindex`, which bakes those as a sentinel
+/// number literal `to_owned`'s plain `number_literal()`/`as_f64()` path
+/// doesn't decode). Before this rename it also happened to share a name with
+/// an unrelated, now-deleted `yq_runner.rs` helper (#907) -- a real
+/// naming-confusion risk for anyone grepping the codebase, even though the
+/// two never collided at compile time (module-private on both sides).
+///
+/// Errors (#1192) rather than silently degrading when a string scalar (or an
+/// object key) passes structural validation but fails to *decode* (invalid
+/// UTF-8, an invalid escape, an invalid `\u` codepoint) -- this used to
+/// return `OwnedValue::String("")` for such a value and silently drop the
+/// whole field for such a key. `to_owned`/`to_owned_cursor` (this file) and
+/// `cursor_to_owned` (`lazy.rs`) still have the older silent-degrade
+/// behavior for this same failure; making those three fallible too needs a
+/// much larger signature change (each is called from 100+ sites, many mid-
+/// evaluation, not just at an output boundary -- the same blast-radius
+/// tradeoff `MAX_NESTING_DEPTH`'s panic-not-`Result` design already made) --
+/// tracked separately, not attempted here.
 fn owned_from_standard_json<W: Clone + AsRef<[u64]>>(
     value: &crate::json::light::StandardJson<'_, W>,
-) -> OwnedValue {
+) -> Result<OwnedValue, EvalError> {
     owned_from_standard_json_at_depth(value, 0)
 }
 
 fn owned_from_standard_json_at_depth<W: Clone + AsRef<[u64]>>(
     value: &crate::json::light::StandardJson<'_, W>,
     depth: usize,
-) -> OwnedValue {
+) -> Result<OwnedValue, EvalError> {
     use crate::json::light::StandardJson;
     assert_nesting_depth(depth);
-    match value {
+    Ok(match value {
         StandardJson::Null => OwnedValue::Null,
         StandardJson::Bool(b) => OwnedValue::Bool(*b),
         StandardJson::Number(n) => OwnedValue::from_number_bytes(n.raw_bytes()),
-        StandardJson::String(s) => {
-            OwnedValue::String(s.as_str().map(|c| c.to_string()).unwrap_or_default())
+        StandardJson::String(s) => OwnedValue::String(
+            s.as_str()
+                .map_err(|e| EvalError::new(format!("{e}")))?
+                .to_string(),
+        ),
+        StandardJson::Array(elements) => {
+            let mut items = Vec::new();
+            for e in *elements {
+                items.push(owned_from_standard_json_at_depth(&e, depth + 1)?);
+            }
+            OwnedValue::Array(items)
         }
-        StandardJson::Array(elements) => OwnedValue::Array(
-            (*elements)
-                .map(|e| owned_from_standard_json_at_depth(&e, depth + 1))
-                .collect(),
-        ),
-        StandardJson::Object(fields) => OwnedValue::Object(
-            (*fields)
-                .filter_map(|field| {
-                    let key = match field.key() {
-                        StandardJson::String(s) => s.as_str().ok()?.to_string(),
-                        _ => return None,
-                    };
-                    let value = owned_from_standard_json_at_depth(&field.value(), depth + 1);
-                    Some((key, value))
-                })
-                .collect(),
-        ),
+        StandardJson::Object(fields) => {
+            let mut map = IndexMap::new();
+            for field in *fields {
+                // A key that isn't `StandardJson::String` at all (e.g.
+                // `StandardJson::Error`, a *structurally* malformed key like
+                // a bare non-string token) silently drops the field, same as
+                // before this fix -- that's #1194's territory, not #1192's:
+                // this fix only covers a key that passed structural
+                // validation but failed to *decode*.
+                let key = match field.key() {
+                    StandardJson::String(s) => match s.as_str() {
+                        Ok(cow) => cow.to_string(),
+                        Err(e) => return Err(EvalError::new(format!("{e} in object key"))),
+                    },
+                    _ => continue,
+                };
+                let value = owned_from_standard_json_at_depth(&field.value(), depth + 1)?;
+                map.insert(key, value);
+            }
+            OwnedValue::Object(map)
+        }
         StandardJson::Error(_) => OwnedValue::Null,
-    }
+    })
 }
 
 /// Apply a format to an owned value and wrap it as a `GenericResult`.
@@ -968,10 +991,35 @@ fn eval_on_owned<S: EvalSemantics, V: DocumentValue>(
     // own `Expr::Optional`/`eval_try`-style boundary, not by wrapping it a
     // second time here.
     match full_eval::<Vec<u64>, S>(expr, cursor) {
-        QueryResult::One(v) => GenericResult::Owned(owned_from_standard_json(&v)),
-        QueryResult::OneCursor(c) => GenericResult::Owned(owned_from_standard_json(&c.value())),
+        QueryResult::One(v) => match owned_from_standard_json(&v) {
+            Ok(o) => GenericResult::Owned(o),
+            Err(e) => GenericResult::Error(e),
+        },
+        QueryResult::OneCursor(c) => match owned_from_standard_json(&c.value()) {
+            Ok(o) => GenericResult::Owned(o),
+            Err(e) => GenericResult::Error(e),
+        },
+        // Stops at the first element that fails to decode, keeping the
+        // already-converted prefix (`partial_generic`) -- matching how an
+        // ordinary `error`/`break` mid-generator stops the rest of a stream
+        // elsewhere in this evaluator (#1164), not a "skip the bad one and
+        // keep going" semantic (no precedent for that at this granularity).
         QueryResult::Many(vs) => {
-            GenericResult::ManyOwned(vs.iter().map(owned_from_standard_json).collect())
+            let mut out = Vec::new();
+            let mut failure = None;
+            for v in &vs {
+                match owned_from_standard_json(v) {
+                    Ok(o) => out.push(o),
+                    Err(e) => {
+                        failure = Some(e);
+                        break;
+                    }
+                }
+            }
+            match failure {
+                Some(e) => partial_generic(out, Control::Error(e)),
+                None => GenericResult::ManyOwned(out),
+            }
         }
         QueryResult::None => GenericResult::None,
         QueryResult::Error(e) => GenericResult::Error(e),
@@ -2674,13 +2722,33 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
             match full_eval::<Vec<u64>, S>(expr, cursor) {
                 QueryResult::One(v) => {
                     // Convert StandardJson back to OwnedValue
-                    GenericResult::Owned(owned_from_standard_json(&v))
+                    match owned_from_standard_json(&v) {
+                        Ok(o) => GenericResult::Owned(o),
+                        Err(e) => GenericResult::Error(e),
+                    }
                 }
-                QueryResult::OneCursor(c) => {
-                    GenericResult::Owned(owned_from_standard_json(&c.value()))
-                }
+                QueryResult::OneCursor(c) => match owned_from_standard_json(&c.value()) {
+                    Ok(o) => GenericResult::Owned(o),
+                    Err(e) => GenericResult::Error(e),
+                },
+                // See the matching arm in `eval_on_owned` above for why this
+                // stops at the first decode failure instead of skipping it.
                 QueryResult::Many(vs) => {
-                    GenericResult::ManyOwned(vs.iter().map(owned_from_standard_json).collect())
+                    let mut out = Vec::new();
+                    let mut failure = None;
+                    for v in &vs {
+                        match owned_from_standard_json(v) {
+                            Ok(o) => out.push(o),
+                            Err(e) => {
+                                failure = Some(e);
+                                break;
+                            }
+                        }
+                    }
+                    match failure {
+                        Some(e) => partial_generic(out, Control::Error(e)),
+                        None => GenericResult::ManyOwned(out),
+                    }
                 }
                 QueryResult::None => GenericResult::None,
                 QueryResult::Error(e) => GenericResult::Error(e),
@@ -9279,7 +9347,7 @@ mod tests {
         let json = linear_nest(255);
         let index = JsonIndex::build(json.as_bytes());
         let cursor = index.root(json.as_bytes());
-        let owned = owned_from_standard_json(&cursor.value());
+        let owned = owned_from_standard_json(&cursor.value()).unwrap();
         assert!(matches!(owned, OwnedValue::Object(_)));
 
         let json = linear_nest(256);
@@ -9292,6 +9360,70 @@ mod tests {
         assert!(
             result.is_err(),
             "owned_from_standard_json should panic at depth 256"
+        );
+    }
+
+    /// #1192: unlike `to_owned`/`to_owned_cursor` (this file, still silently
+    /// degrading to `OwnedValue::Null` -- see
+    /// `test_to_owned_degrades_to_null_on_string_decode_failure_1098` above)
+    /// and `cursor_to_owned` (`lazy.rs`, still degrading to an empty
+    /// string), `owned_from_standard_json` now surfaces a genuinely
+    /// undecodable string as an `EvalError` instead of silently
+    /// materializing `""`. A nested occurrence (inside an array) propagates
+    /// the same way, since the whole containing value can't be represented
+    /// once any of its scalars can't be.
+    ///
+    /// No CLI-level regression test accompanies this: extensive live probing
+    /// (~25 distinct jq expressions over a document containing exactly this
+    /// malformed byte sequence, covering navigation, construction,
+    /// `reduce`/`foreach`, assignment, and every builtin category this
+    /// crate implements) found no ordinary top-level jq syntax that reaches
+    /// `owned_from_standard_json` for a *document-sourced* value --
+    /// `eval_generic.rs`'s own native dispatch (which uses `to_owned`,
+    /// unaffected by this fix) already handles every case tried. This
+    /// function is reached only via the "reindex bridge" (`eval_on_owned`/
+    /// `eval_single`'s full-evaluator fallback) on a value *constructed*
+    /// mid-evaluation (e.g. a `reduce`/`foreach` accumulator) that itself
+    /// then needs an expression `eval_generic` can't handle natively --
+    /// unlike `to_owned`'s doc comment (#1098), which explicitly confirms
+    /// live-CLI reachability "through completely ordinary CLI usage (any
+    /// non-identity query over a document containing such a string)", this
+    /// function's own doc comment makes no such claim.
+    #[test]
+    fn test_owned_from_standard_json_errors_on_string_decode_failure_1192() {
+        let json: &[u8] = b"{\"a\": \"\xff\xfe\"}";
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+        let err = owned_from_standard_json(&value).unwrap_err();
+        assert!(err.message.contains("invalid UTF-8"), "{err:?}");
+
+        let json: &[u8] = b"[1, \"\xff\xfe\", 3]";
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+        let err = owned_from_standard_json(&value).unwrap_err();
+        assert!(err.message.contains("invalid UTF-8"), "{err:?}");
+    }
+
+    /// #1192: an object key that passes structural validation but fails to
+    /// *decode* now errors too, instead of silently dropping the whole
+    /// field (the pre-#1192 behavior, still true of `to_owned`/
+    /// `to_owned_cursor`/`cursor_to_owned` -- see the sibling test above). A
+    /// key that is *not* a string at all (structurally malformed, e.g. a
+    /// bare non-string token) is a separate, still-open gap (#1194) and is
+    /// deliberately left alone -- this fix only covers a string-shaped key
+    /// that failed to decode.
+    #[test]
+    fn test_owned_from_standard_json_errors_on_object_key_decode_failure_1192() {
+        let json: &[u8] = b"{\"\xff\xfe\": 1, \"b\": 2}";
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+        let err = owned_from_standard_json(&value).unwrap_err();
+        assert!(
+            err.message.contains("invalid UTF-8") && err.message.contains("object key"),
+            "{err:?}"
         );
     }
 }

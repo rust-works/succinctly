@@ -1991,13 +1991,33 @@ fn generic_result_to_jq_values<'a, W: Clone + AsRef<[u64]>>(
     sink: &mut ErrorSink,
 ) -> Vec<JqValue<'a, W>> {
     match result {
-        GenericResult::One(v) => vec![standard_json_to_jq_value(v, &cursor)],
+        GenericResult::One(v) => match standard_json_to_jq_value(v, &cursor) {
+            Ok(jq_value) => vec![jq_value],
+            Err(e) => {
+                sink.report(DiagStyle::Jq, &e, at);
+                vec![]
+            }
+        },
         // OneCursor: directly use the cursor - most memory efficient for unchanged values
         GenericResult::OneCursor(c) => vec![JqValue::Cursor(c)],
-        GenericResult::Many(vs) => vs
-            .into_iter()
-            .map(|v| standard_json_to_jq_value(v, &cursor))
-            .collect(),
+        // Stops at the first element that fails to decode, keeping the
+        // already-converted prefix -- matching how an ordinary `error`/
+        // `break` mid-generator stops the rest of a stream elsewhere in this
+        // evaluator (#1164), not a "skip the bad one and keep going"
+        // semantic (no precedent for that at this granularity).
+        GenericResult::Many(vs) => {
+            let mut out = Vec::new();
+            for v in vs {
+                match standard_json_to_jq_value(v, &cursor) {
+                    Ok(jq_value) => out.push(jq_value),
+                    Err(e) => {
+                        sink.report(DiagStyle::Jq, &e, at);
+                        break;
+                    }
+                }
+            }
+            out
+        }
         // ManyCursor: same lazy-cursor efficiency as OneCursor, per element.
         GenericResult::ManyCursor(cs) => cs.into_iter().map(JqValue::Cursor).collect(),
         // Stays lazy all the way to output: a bare `keys_unsorted` never
@@ -2085,11 +2105,21 @@ fn generic_result_to_jq_values<'a, W: Clone + AsRef<[u64]>>(
 /// **Phase 1 Lazy Optimization**: Arrays and objects store `JqValue::Cursor` for
 /// each child instead of recursively materializing. This defers allocation until
 /// the value is actually needed (e.g., for computation or output formatting).
+///
+/// Errors (#1192) rather than silently degrading when a top-level result
+/// string (or an immediate key of a top-level result object) passes
+/// structural validation but fails to *decode* -- this used to substitute an
+/// empty string for such a value, and an empty-string *key* (colliding
+/// multiple decode-failing keys together) for such a key, instead of
+/// surfacing a real error. Only the immediate level is checked here because
+/// array/object children stay lazy (`JqValue::Cursor`) rather than
+/// recursively converting -- a decode failure nested deeper is caught later,
+/// if and when that child cursor is itself materialized.
 fn standard_json_to_jq_value<'a, W: Clone + AsRef<[u64]>>(
     value: StandardJson<'a, W>,
     _parent_cursor: &JsonCursor<'a, W>,
-) -> JqValue<'a, W> {
-    match value {
+) -> Result<JqValue<'a, W>, EvalError> {
+    Ok(match value {
         StandardJson::Null => JqValue::Null,
         StandardJson::Bool(b) => JqValue::Bool(b),
         StandardJson::Number(n) => {
@@ -2098,7 +2128,11 @@ fn standard_json_to_jq_value<'a, W: Clone + AsRef<[u64]>>(
         }
         StandardJson::String(s) => {
             // Keep string lazy - use raw bytes reference instead of decoding
-            JqValue::String(s.as_str().map(|c| c.to_string()).unwrap_or_default())
+            JqValue::String(
+                s.as_str()
+                    .map_err(|e| EvalError::new(format!("{e}")))?
+                    .to_string(),
+            )
         }
         StandardJson::Array(elements) => {
             // LAZY: Store cursor references instead of materializing children
@@ -2107,20 +2141,25 @@ fn standard_json_to_jq_value<'a, W: Clone + AsRef<[u64]>>(
         }
         StandardJson::Object(fields) => {
             // LAZY: Store cursor references instead of materializing values
-            let map: IndexMap<String, JqValue<'a, W>> = fields
-                .map(|f| {
-                    let key = match f.key() {
-                        StandardJson::String(s) => s.as_str().unwrap_or_default().to_string(),
-                        _ => String::new(),
-                    };
-                    // Use cursor for value instead of materializing
-                    (key, JqValue::Cursor(f.value_cursor()))
-                })
-                .collect();
+            let mut map: IndexMap<String, JqValue<'a, W>> = IndexMap::new();
+            for f in fields {
+                // A key that isn't `StandardJson::String` at all is a
+                // structurally malformed key, not a decode failure -- out of
+                // scope here (#1194's territory), same as before this fix.
+                let key = match f.key() {
+                    StandardJson::String(s) => match s.as_str() {
+                        Ok(cow) => cow.to_string(),
+                        Err(e) => return Err(EvalError::new(format!("{e} in object key"))),
+                    },
+                    _ => continue,
+                };
+                // Use cursor for value instead of materializing
+                map.insert(key, JqValue::Cursor(f.value_cursor()));
+            }
             JqValue::Object(map)
         }
         StandardJson::Error(_) => JqValue::Null,
-    }
+    })
 }
 
 /// Write a single output JqValue (preserves number formatting when possible).
@@ -2942,5 +2981,46 @@ mod tests {
         let stream = r#"{"a":1} {"b":2} {"c":3}"#;
         let values = parse_json_stream(stream).unwrap();
         assert_eq!(values.len(), 3);
+    }
+
+    /// #1192: `standard_json_to_jq_value` now surfaces a genuinely
+    /// undecodable top-level string as an `EvalError` instead of silently
+    /// substituting an empty string. Array/object children stay lazy
+    /// (`JqValue::Cursor`) here, so only a decode failure at the immediate
+    /// top level is caught by this function itself -- a nested one surfaces
+    /// later, if and when that child cursor is materialized.
+    ///
+    /// No CLI-level regression test accompanies this: this function
+    /// converts a query *result*, not the input document, and every
+    /// ordinary top-level jq/yq expression tried against a document
+    /// containing this malformed byte sequence resolves its result through
+    /// `to_owned`/`cursor_to_owned` (`eval_generic.rs`/`lazy.rs`, unaffected
+    /// by this fix) before ever reaching here -- see
+    /// `test_owned_from_standard_json_errors_on_string_decode_failure_1192`
+    /// in `eval_generic.rs` for the full account of what was tried.
+    #[test]
+    fn test_standard_json_to_jq_value_errors_on_string_decode_failure_1192() {
+        let json: &[u8] = b"\"\xff\xfe\"";
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+        let err = standard_json_to_jq_value(value, &cursor).unwrap_err();
+        assert!(err.message.contains("invalid UTF-8"), "{err:?}");
+    }
+
+    /// #1192: an immediate object key that fails to decode now errors too,
+    /// instead of silently substituting an empty-string key -- which used
+    /// to collide multiple decode-failing keys together into one field.
+    #[test]
+    fn test_standard_json_to_jq_value_errors_on_object_key_decode_failure_1192() {
+        let json: &[u8] = b"{\"\xff\xfe\": 1, \"b\": 2}";
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+        let err = standard_json_to_jq_value(value, &cursor).unwrap_err();
+        assert!(
+            err.message.contains("invalid UTF-8") && err.message.contains("object key"),
+            "{err:?}"
+        );
     }
 }
