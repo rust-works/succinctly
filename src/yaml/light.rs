@@ -25,8 +25,8 @@ use std::string::ToString;
 use super::index::YamlIndex;
 use super::line_break::{is_line_break, line_break_len, line_break_len_before};
 use super::scalar::{
-    could_be_null_or_bool, is_preservable_float_literal, resolve_plain, resolve_tagged,
-    ResolvedScalar,
+    could_be_null_or_bool, is_preservable_float_literal, preservable_float_literal_text,
+    resolve_plain, resolve_tagged, ResolvedScalar,
 };
 use super::{starts_inline_seq_entry, starts_seq_entry};
 use crate::util::simd::escape::find_json_escape;
@@ -3444,20 +3444,25 @@ fn write_resolved_scalar_as_json(
         ResolvedScalar::Bool(false) => output.push_str("false"),
         ResolvedScalar::Int(n) => write_i64(output, n),
         // See `stream_resolved_scalar_as_json`'s matching arm for why this
-        // echoes `str_val` rather than always reconstructing from `f` (#993).
-        // No separate `is_finite()` check needed here: `resolve_plain`/
+        // echoes `str_val` (or a normalized, JSON-safe variant of it,
+        // #954) rather than always reconstructing from `f` (#993). No
+        // separate `is_finite()` check needed here: `resolve_plain`/
         // `resolve_tagged` (this function's only callers) never produce a
-        // non-finite `ResolvedScalar::Float` in the first place -- `parse_float`
-        // rejects an overflowing/underflowing literal to `Str` before this
-        // arm is ever reached. `is_preservable_float_literal`'s own digit
-        // cap does NOT bound magnitude (#1008): a 4-digit `1e400` sails
-        // through it trivially, so it must not be relied on for finiteness.
+        // non-finite `ResolvedScalar::Float` in the first place --
+        // `parse_float` rejects an overflowing/underflowing literal to
+        // `Str` before this arm is ever reached. `is_preservable_float_literal`'s
+        // own digit cap does NOT bound magnitude (#1008): a 4-digit
+        // `1e400` sails through it trivially, so it must not be relied on
+        // for finiteness.
         ResolvedScalar::Float(_) if is_preservable_float_literal(str_val) => {
             output.push_str(str_val);
         }
-        ResolvedScalar::Float(f) if f.is_finite() => write_f64(output, f),
-        // JSON cannot represent the `.inf`/`.nan` family.
-        ResolvedScalar::Float(_) => output.push_str("null"),
+        ResolvedScalar::Float(f) => match preservable_float_literal_text(str_val) {
+            Some(normalized) => output.push_str(&normalized),
+            None if f.is_finite() => write_f64(output, f),
+            // JSON cannot represent the `.inf`/`.nan` family.
+            None => output.push_str("null"),
+        },
         ResolvedScalar::Str => write_json_string(output, str_val),
     }
 }
@@ -3921,24 +3926,28 @@ fn stream_resolved_scalar_as_json<Out: core::fmt::Write>(
         ResolvedScalar::Bool(true) => out.write_str("true"),
         ResolvedScalar::Bool(false) => out.write_str("false"),
         ResolvedScalar::Int(n) => write!(out, "{n}"),
-        // Echo the source text when it's already safe, valid JSON number
-        // syntax (`number_literal()` below uses the same predicate for the
-        // DOM path) -- this is what keeps a trailing zero (`1.50`) intact;
-        // `format_float_with_fraction` only reconstructs the value's
-        // shortest round-trip spelling, which silently drops it (#993). No
-        // separate `is_finite()` check needed here: `resolved` is only ever
-        // constructed by `resolve_plain`/`resolve_tagged`, which never
-        // produce a non-finite `Float` -- `parse_float` rejects an
+        // Echo the source text (or a normalized, JSON-safe variant of it,
+        // #954) when it's already safe to preserve (`number_literal()`
+        // below uses the same predicate for the DOM path) -- this is what
+        // keeps a trailing zero (`1.50`) intact; `format_float_with_fraction`
+        // only reconstructs the value's shortest round-trip spelling,
+        // which silently drops it (#993). No separate `is_finite()` check
+        // needed here: `resolved` is only ever constructed by
+        // `resolve_plain`/`resolve_tagged`, which never produce a
+        // non-finite `Float` -- `parse_float` rejects an
         // overflowing/underflowing literal to `Str` upstream, before this
         // arm is reached. `is_preservable_float_literal`'s digit cap does
         // NOT bound magnitude (#1008): a 4-digit `1e400` sails through it
-        // trivially, so it must not be relied on for finiteness.
-        // Not `write!(out, "{f}")` either way: that drops the `.0` from a
+        // trivially, so it must not be relied on for finiteness. Not
+        // `write!(out, "{f}")` either way: that drops the `.0` from a
         // whole float.
         ResolvedScalar::Float(_) if is_preservable_float_literal(str_val) => out.write_str(str_val),
-        ResolvedScalar::Float(f) if f.is_finite() => out.write_str(&format_float_with_fraction(f)),
-        // JSON cannot represent the `.inf`/`.nan` family.
-        ResolvedScalar::Float(_) => out.write_str("null"),
+        ResolvedScalar::Float(f) => match preservable_float_literal_text(str_val) {
+            Some(normalized) => out.write_str(&normalized),
+            None if f.is_finite() => out.write_str(&format_float_with_fraction(f)),
+            // JSON cannot represent the `.inf`/`.nan` family.
+            None => out.write_str("null"),
+        },
         ResolvedScalar::Str => stream_json_string(out, str_val),
     }
 }
@@ -6038,6 +6047,9 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentValue for YamlValue<'a, W> {
                 match resolve_plain(&str_val) {
                     ResolvedScalar::Float(_) if is_preservable_float_literal(&str_val) => {
                         Some(str_val)
+                    }
+                    ResolvedScalar::Float(_) => {
+                        preservable_float_literal_text(&str_val).map(Cow::Owned)
                     }
                     _ => None,
                 }
