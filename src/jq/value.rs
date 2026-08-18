@@ -326,13 +326,48 @@ pub fn format_number_jq_compat(raw: &[u8]) -> String {
         return format!("{value}");
     }
 
-    // For negative exponents >= -5, jq converts to decimal
-    if (-5..0).contains(&exp) {
-        // Convert to decimal: 1e-3 → 0.001
-        // Use smart rounding to avoid floating point noise
-        return format_decimal_jq(value);
+    // #1226: real jq's bare-integer/decimal-window choice for the *rest* of
+    // this function (every nonzero, non-subnormal mantissa the `exp == 0`
+    // branch above didn't already claim) is also decided by the mantissa's
+    // *shifted* exponent, not its raw written one -- the exact same axis
+    // #1207 established for the zero-mantissa case, extended here to
+    // nonzero mantissas. `5e-6`'s raw exponent (`-6`) falls outside the old
+    // `-5..0` window and used to fall through to scientific notation, but
+    // its shift is `0` (a single-digit mantissa), so its *shifted*
+    // exponent is also `-6` -- inside real jq's actual `-6..=-1` decimal
+    // window (oracle-verified, matching #1207's own zero-mantissa
+    // boundary). `50e-1` is the inverse mismatch: raw exponent `-1` (which
+    // *was* inside the old window, so it never reached scientific
+    // notation) but shift `1` (mantissa `"50"` is two digits), giving
+    // shifted exponent `0` -- real jq renders this as `5.0`, keeping the
+    // mantissa's own trailing zero, not the bare `5` a *value*-based
+    // renderer would produce (`50e-1` and `5e0` parse to the identical
+    // `f64`, so only the literal's own text can tell them apart) -- this
+    // is why `format_shifted_mantissa` below is string-based, not the
+    // value-based rounding-and-trimming the old `(-5..0)` window's
+    // `format_decimal_jq` used (removed -- this replaced its one call
+    // site).
+    //
+    // A nonzero `value` (checked above) guarantees at least one
+    // significant mantissa digit, so this always succeeds -- the same
+    // invariant `format_overflow_literal_mantissa` relies on for its own
+    // `unreachable!()`.
+    let Ok((mantissa_str, shifted_exp)) = normalize_extreme_literal_mantissa(s, exp_pos) else {
+        unreachable!("nonzero value implies normalize_extreme_literal_mantissa succeeds")
+    };
+    if shifted_exp == 0 || (-6..=-1).contains(&shifted_exp) {
+        let sign = if value.is_sign_negative() { "-" } else { "" };
+        return format_shifted_mantissa(sign, &mantissa_str, shifted_exp);
     }
 
+    // Positive shifted exponents deliberately fall straight through to the
+    // scientific path below unconditionally (#1226 only widened the
+    // *negative*-side window above) -- live testing while implementing
+    // #1226 found the positive side does *not* follow a comparably simple
+    // exponent-window rule (`500000e-1`, shifted exponent 4, real jq keeps
+    // plain decimal `50000.0`; `99999999999999e1`, shifted exponent 14,
+    // goes scientific) -- tracked separately as #1244, not attempted here.
+    //
     // For other cases, use normalized scientific notation
     // jq normalizes mantissa to have one digit before decimal point
     //
@@ -665,46 +700,45 @@ fn format_mantissa_jq(value: f64) -> String {
     }
 }
 
-/// Format a decimal value for jq-compatible output.
-/// Uses smart rounding to avoid floating point noise.
-fn format_decimal_jq(value: f64) -> String {
-    // `is_sign_negative()`, not `value < 0.0`: the latter is false for
-    // -0.0 (IEEE 754 equality), which would silently drop the sign a
-    // literal like `-0e-3` carries -- #1008 made that literal newly
-    // reachable from YAML.
-    let sign = if value.is_sign_negative() { "-" } else { "" };
-    let abs_value = value.abs();
-
-    // Check if it's essentially an integer
-    if (abs_value.round() - abs_value).abs() < 1e-10 {
-        // `value.round() as i64` truncates -0.0's sign the same way, so
-        // this must build on the already-signed `abs_value` instead.
-        return format!("{sign}{}", abs_value.round() as i64);
+/// Render a nonzero literal's normalized mantissa (`leading[.rest]`, from
+/// [`normalize_extreme_literal_mantissa`]) as jq's bare-integer or expanded-
+/// decimal form, once the caller has confirmed `shifted_exp` is `0` or in
+/// `-6..=-1` (#1226) -- the same window #1207 established for the
+/// zero-mantissa case, extended here to any nonzero mantissa.
+///
+/// String-based, not value-based: `50e-1` and `5e0` parse to the identical
+/// `f64` (`5.0`), but real jq renders them differently (`5.0` vs `5`) --
+/// only the literal's own mantissa digits, not the parsed value, can tell
+/// them apart. This replaced the previous value-only `format_decimal_jq`
+/// (rounding to the shortest round-tripping precision, then trimming
+/// trailing zeros), which could never have reconstructed `50e-1`'s own
+/// trailing zero for exactly this reason.
+///
+/// - `shifted_exp == 0`: no decimal-point shift needed -- `rest` empty
+///   renders as the bare `leading` digit (`0.5e1`'s mantissa `"5"` -> `5`);
+///   `rest` non-empty keeps the mantissa's own decimal point in place
+///   (`50e-1`'s mantissa `"5.0"` -> `5.0`, `15e-1`'s mantissa `"1.5"` ->
+///   `1.5`).
+/// - `shifted_exp` in `-6..=-1`: expand to `0.` followed by
+///   `-shifted_exp - 1` zeros and then the mantissa's own digits
+///   (`100e-7`'s mantissa `"1.00"` at shifted exponent `-5` -> `0.` + 4
+///   zeros + `"1"` + `"00"` = `0.0000100`, preserving both the leading-zero
+///   padding *and* the mantissa's own trailing zeros -- oracle-verified).
+fn format_shifted_mantissa(sign: &str, mantissa_str: &str, shifted_exp: i64) -> String {
+    let (leading, rest) = mantissa_str.split_once('.').unwrap_or((mantissa_str, ""));
+    if shifted_exp == 0 {
+        return if rest.is_empty() {
+            format!("{sign}{leading}")
+        } else {
+            format!("{sign}{leading}.{rest}")
+        };
     }
-
-    // Try different precisions and pick the shortest that rounds back correctly
-    for precision in 1..=15 {
-        let formatted = format!("{abs_value:.precision$}");
-        if let Ok(parsed) = formatted.parse::<f64>() {
-            if (parsed - abs_value).abs() < 1e-14 {
-                // Trim trailing zeros
-                let trimmed = formatted.trim_end_matches('0');
-                if trimmed.ends_with('.') {
-                    return format!("{sign}{trimmed}0");
-                }
-                return format!("{sign}{trimmed}");
-            }
-        }
-    }
-
-    // Fallback: full precision
-    let formatted = format!("{abs_value:.15}");
-    let trimmed = formatted.trim_end_matches('0');
-    if trimmed.ends_with('.') {
-        format!("{sign}{trimmed}0")
-    } else {
-        format!("{sign}{trimmed}")
-    }
+    debug_assert!(
+        (-6..=-1).contains(&shifted_exp),
+        "caller only reaches here for shifted_exp == 0 or -6..=-1, got {shifted_exp}"
+    );
+    let zero_pad = usize::try_from(-shifted_exp - 1).unwrap_or(0);
+    format!("{sign}0.{}{leading}{rest}", "0".repeat(zero_pad))
 }
 
 /// An owned JSON value.
@@ -2571,12 +2605,16 @@ mod tests {
         assert_eq!(format_number_jq_compat(b"12e2"), "1.2E+3");
     }
 
+    /// #1226: this test previously asserted `"1"`/`"-1"`, pinning the old
+    /// value-based `format_decimal_jq`'s output -- but real jq actually
+    /// keeps the mantissa's own trailing zeros here (`100e-2` -> `1.00`,
+    /// oracle-verified), since `100e-2` and `1e0` parse to the identical
+    /// `f64` and only the literal's own text distinguishes them. The old
+    /// assertion was itself wrong, not just superseded.
     #[test]
-    fn test_format_number_jq_compat_negative_exponent_integer_decimal() {
-        // Negative exponent that still resolves to a whole number takes
-        // format_decimal_jq's integer fast path rather than its precision loop.
-        assert_eq!(format_number_jq_compat(b"100e-2"), "1");
-        assert_eq!(format_number_jq_compat(b"-100e-2"), "-1");
+    fn test_format_number_jq_compat_negative_exponent_preserves_mantissa_trailing_zeros_1226() {
+        assert_eq!(format_number_jq_compat(b"100e-2"), "1.00");
+        assert_eq!(format_number_jq_compat(b"-100e-2"), "-1.00");
     }
 
     /// #930: a literal whose magnitude overflows f64 (e.g. `1e400`) used to
@@ -2908,6 +2946,98 @@ mod tests {
                                                                       // exponent's magnitude -- unaffected by #1207, still always
                                                                       // scientific, matching #1099/#1178's existing coverage.
         assert_eq!(format_number_jq_compat(b"1e-400"), "1E-400");
+    }
+
+    /// #1226: extends #1207's shifted-exponent notation rule from zero
+    /// mantissas to *nonzero* ones -- `format_number_jq_compat`'s `exp ==
+    /// 0`/`(-5..0)` fast paths used the literal's raw written exponent for
+    /// every nonzero mantissa too, so a mantissa with 2+ significant
+    /// digits (shifting the true magnitude away from what's written) could
+    /// land in the wrong notation. Oracle-verified against jq 1.7.1 for
+    /// every case below.
+    #[test]
+    fn test_format_number_jq_compat_nonzero_mantissa_notation_threshold_1226() {
+        // The issue's own repro set: written exponent -6 sits just outside
+        // the *old*, too-narrow `-5..0` window, but shift 0 (single-digit
+        // mantissa) means shifted exponent is also -6 -- inside the real
+        // `-6..=-1` window, so this must be decimal, not scientific.
+        assert_eq!(format_number_jq_compat(b"5e-6"), "0.000005");
+        // One step further out: shifted exponent -7, still scientific.
+        assert_eq!(format_number_jq_compat(b"1e-7"), "1E-7");
+        // A multi-digit mantissa shifts the exponent further still: `123`
+        // is 3 digits, shift 2, so `123e-6`'s shifted exponent is -4.
+        assert_eq!(format_number_jq_compat(b"123e-6"), "0.000123");
+        assert_eq!(format_number_jq_compat(b"999e-6"), "0.000999");
+        // Trailing zeros in the mantissa survive the decimal expansion --
+        // `100e-7`'s shifted exponent is -5 (shift 2), and its own
+        // trailing "00" must appear after the leading "1", not be lost the
+        // way a value-only renderer (`0.00001` from the parsed f64 alone)
+        // would lose them.
+        assert_eq!(format_number_jq_compat(b"100e-7"), "0.0000100");
+        // Already-correct cases before this fix (written exponent already
+        // sat inside the old window and happened to agree with the
+        // shifted one) stay correct.
+        assert_eq!(format_number_jq_compat(b"123e-5"), "0.00123");
+        assert_eq!(format_number_jq_compat(b"1e-3"), "0.001");
+
+        // Shifted exponent exactly 0 -- a case the old `exp == 0` fast
+        // path only caught when the *written* exponent was also 0. A
+        // multi-digit mantissa can reach shifted exponent 0 via a
+        // *nonzero* written exponent instead: `50e-1` (shift 1, written
+        // -1) keeps its own trailing zero as `5.0`, not the bare `5` a
+        // value-based renderer would give (`50e-1` and `5e0` parse to the
+        // identical `f64`). `15e-1` (shift 1, written -1) similarly keeps
+        // its own fractional digit as `1.5`. `0.5e1` (shift -1, written 1)
+        // has no fractional remainder after normalizing, so it *does*
+        // collapse to the bare integer `5`.
+        assert_eq!(format_number_jq_compat(b"50e-1"), "5.0");
+        assert_eq!(format_number_jq_compat(b"15e-1"), "1.5");
+        assert_eq!(format_number_jq_compat(b"0.5e1"), "5");
+        assert_eq!(format_number_jq_compat(b"5e-1"), "0.5");
+
+        // Many-significant-digit mantissas at shifted exponent 0 stay
+        // plain decimal regardless of digit count (unlike the *positive*
+        // shifted-exponent side, tracked separately as #1244).
+        assert_eq!(
+            format_number_jq_compat(b"99999999999999e-13"),
+            "9.9999999999999"
+        );
+        assert_eq!(
+            format_number_jq_compat(b"12345678901234e-13"),
+            "1.2345678901234"
+        );
+
+        // Sign is preserved through every branch.
+        assert_eq!(format_number_jq_compat(b"-5e-6"), "-0.000005");
+        assert_eq!(format_number_jq_compat(b"-50e-1"), "-5.0");
+        assert_eq!(format_number_jq_compat(b"-0.5e1"), "-5");
+
+        // Already-correct positive-exponent cases (untouched by #1226,
+        // which only widens the negative-side window) stay correct.
+        assert_eq!(format_number_jq_compat(b"5e0"), "5");
+        assert_eq!(format_number_jq_compat(b"1e1"), "1E+1");
+        assert_eq!(format_number_jq_compat(b"5e1"), "5E+1");
+
+        // A genuinely-underflowed *nonzero* mantissa (`!value.is_normal()`,
+        // #1099/#1177) never enters this notation window regardless of its
+        // own shifted exponent's magnitude -- unaffected by #1226, routed
+        // through `format_near_zero_literal`'s subnormal path instead,
+        // still always scientific.
+        assert_eq!(format_number_jq_compat(b"1e-400"), "1E-400");
+    }
+
+    /// #1244 characterization: a large positive-magnitude literal's
+    /// notation choice depends on real jq's own significant-digit count,
+    /// not a simple exponent window the way the negative side (#1226) does
+    /// -- confirmed out of #1226's own scope, tracked separately. Pins the
+    /// current (still-wrong, but unaffected either way by #1226) output
+    /// rather than leaving it undocumented. Oracle: real jq gives
+    /// `50000.0`. If this is ever fixed, update this expectation and close
+    /// #1244.
+    #[test]
+    fn test_format_number_jq_compat_large_positive_shifted_exponent_characterize_preexisting_bug_1244(
+    ) {
+        assert_eq!(format_number_jq_compat(b"500000e-1"), "5E+4");
     }
 
     /// `depth` levels of single-element array nesting: `[[[...[Null]...]]]`.
