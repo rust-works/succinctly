@@ -12023,6 +12023,86 @@ fn test_jq_null_times_anything_errors_1175() -> Result<()> {
     Ok(())
 }
 
+// --- #1199: a `NumberLiteral` operand's source spelling must survive into
+// a binary-op type-mismatch error message, not just the *value* returned
+// on success -- found broader than #1175's own repro (which only exposed
+// this on a `null`-involving `*` pairing): every arith_* function's
+// catch-all error arm previously called `into_plain_number()` on both
+// operands before ever building the error, discarding a `NumberLiteral`'s
+// own text (e.g. `1E+10`) in favor of its canonically-reformatted value
+// (`10000000000`). Verified live against real jq 1.7.1 for every operator.
+
+/// Every operator's type-mismatch error preserves a `NumberLiteral`
+/// operand's own spelling, not the reformatted value.
+#[test]
+fn test_jq_binary_op_error_preserves_number_literal_spelling_1199() -> Result<()> {
+    for (expr, op_wording) in [
+        ("1e10 + {}", "cannot be added"),
+        ("1e10 - {}", "cannot be subtracted"),
+        ("1e10 * {}", "cannot be multiplied"),
+        ("1e10 / {}", "cannot be divided"),
+        ("1e10 % {}", "cannot be divided (remainder)"),
+    ] {
+        let (out, err, code) = run_jq_full(&["-cn", expr], None)?;
+        assert_eq!(code, 5, "expr {expr:?}: out={out:?} err={err:?}");
+        assert!(
+            err.contains("number (1E+10)"),
+            "expr {expr:?}: expected spelling preserved, got: {err}"
+        );
+        assert!(err.contains(op_wording), "expr {expr:?}: {err}");
+    }
+    Ok(())
+}
+
+/// The right operand's spelling is preserved too, not just the left's.
+#[test]
+fn test_jq_binary_op_error_preserves_right_operand_spelling_1199() -> Result<()> {
+    let (out, err, code) = run_jq_full(&["-cn", "{} + 1e10"], None)?;
+    assert_eq!(code, 5, "out: {out:?}");
+    assert!(err.contains("number (1E+10)"), "{err}");
+    Ok(())
+}
+
+/// `divisor_is_zero` (`/`'s and `%`'s own dedicated error, distinct from
+/// the generic type-mismatch `binary_op`) has the identical bug, reached
+/// from *inside* an otherwise-successful numeric arm rather than a
+/// trailing catch-all -- confirms the fix threads through that path too,
+/// not just the type-mismatch one.
+#[test]
+fn test_jq_divisor_is_zero_error_preserves_number_literal_spelling_1199() -> Result<()> {
+    let (out, err, code) = run_jq_full(&["-cn", "1e10 / 0"], None)?;
+    assert_eq!(code, 5, "out: {out:?}");
+    assert!(err.contains("number (1E+10)"), "{err}");
+    assert!(err.contains("divisor is zero"), "{err}");
+
+    let (out, err, code) = run_jq_full(&["-cn", "1e10 % 0"], None)?;
+    assert_eq!(code, 5, "out: {out:?}");
+    assert!(err.contains("number (1E+10)"), "{err}");
+    Ok(())
+}
+
+/// Control: genuine successful computation (every operator) is unaffected
+/// by the restructuring -- the numeric fast path still reaches the same
+/// arms it always did, just guarded on a non-consuming peek first.
+#[test]
+fn test_jq_binary_op_success_paths_unaffected_1199() -> Result<()> {
+    for (expr, expected) in [
+        ("5 + 3", "8"),
+        ("5 - 3", "2"),
+        ("5 * 3", "15"),
+        ("10 / 4", "2.5"),
+        ("10 % 3", "1"),
+        (r#""ab" * 3"#, r#""ababab""#),
+        (r#""a,b,c" / ",""#, r#"["a","b","c"]"#),
+        ("[1,2,3] - [2]", "[1,3]"),
+    ] {
+        let (out, err, code) = run_jq_full(&["-cn", expr], None)?;
+        assert_eq!(code, 0, "expr {expr:?}: {err}");
+        assert_eq!(out.trim(), expected, "expr {expr:?}");
+    }
+    Ok(())
+}
+
 // --- #1171: document-input parsing must not silently produce wrong
 // output for content real jq either accepts leniently (a leading-dot
 // number) or rejects outright (truncated/malformed JSON) -- both
