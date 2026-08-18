@@ -12092,6 +12092,14 @@ fn test_yaml_legal_json_unsafe_float_spellings_normalize_954() -> Result<()> {
         ("a: 007e2\n", "7e2"),
         ("a: -1.\n", "-1.0"),
         ("a: -007e2\n", "-7e2"),
+        // Passes via the pre-existing bare-`f64` fallback, not this fix's
+        // new normalization: `preservable_float_literal_text` doesn't
+        // widen a bare leading dot (`.5`, no digit before the point) at
+        // all, only a leading `+`/trailing `.`/redundant leading zero --
+        // but `0.5_f64.to_string()` already includes the leading zero
+        // naturally, so there's no #954-style symptom here to begin with.
+        // Kept in this sweep as a non-regression check, not new-path coverage
+        // (code review flagged the distinction).
         ("a: +.5\n", "0.5"),
     ] {
         let (out, code) = run_yq_stdin(".a", yaml, &["-o=json", "-I=0"])?;
@@ -12141,6 +12149,13 @@ fn test_yaml_legal_json_unsafe_float_self_consistent_across_consumers_954() -> R
         ("a: +1.0\n", "1.0"),
         ("a: 1.\n", "1.0"),
         ("a: 007e2\n", "7e2"),
+        // A bare trailing dot immediately before an exponent marker --
+        // code review found the first draft's whole-string
+        // `strip_suffix('.')` missed this shape entirely (the exponent
+        // digits are the string's actual suffix, not the dot), silently
+        // reproducing this test's exact symptom for just this one spelling.
+        ("a: 1.e5\n", "1.0e5"),
+        ("a: 007.e2\n", "7.0e2"),
     ] {
         let (out, code) = run_yq_stdin(".a | tostring", yaml, &["-r"])?;
         assert_eq!(code, 0, "for {yaml:?}");
@@ -12161,6 +12176,11 @@ fn test_yaml_legal_json_unsafe_float_self_consistent_across_consumers_954() -> R
 /// failure mode #918 originally fixed for a leading dot.
 #[test]
 fn test_tag_yq_normalized_float_spellings_stay_float_954() -> Result<()> {
+    // `+.5` isn't actually widened by `preservable_float_literal_text` (a
+    // bare leading dot is out of this fix's scope, see the sibling test
+    // above) -- kept here as a non-regression check on a value `tag`
+    // never needed a reindex-bridge round trip for in the first place
+    // (falls to a bare `Float`, which serializes trivially to JSON).
     for yaml in ["+1.0", "1.", "007e2", "+.5"] {
         let (out, code) = run_yq_stdin("tag", yaml, &[])?;
         assert_eq!(code, 0, "for {yaml:?}");

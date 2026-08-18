@@ -381,20 +381,43 @@ pub(super) fn is_preservable_float_literal(s: &str) -> bool {
 /// digit cap is exceeded, or the normalized text is still invalid, e.g.
 /// `+1.2.3`) -- callers fall back to their own pre-existing bare-`Float`
 /// handling unchanged.
+///
+/// Splits on the exponent marker first, mirroring
+/// [`is_preservable_float_literal`]'s own mantissa/exponent split just
+/// above, so the trailing-dot completion applies to the *mantissa*, not
+/// the whole string -- an earlier draft completed a trailing `.` only at
+/// the very end of `s`, missing a bare dot immediately before an exponent
+/// (`1.e5`; code review caught this live, since it silently reproduced
+/// #954's own self-inconsistency symptom for that one shape: falling
+/// through to the bare-`Float` path left `tostring`/`join` disagreeing
+/// with each other again, exactly what this function exists to prevent).
+///
+/// A mantissa whose own digit count is right at
+/// [`MAX_PRESERVABLE_FLOAT_DIGITS`] can still lose preservation here if it
+/// also needs the trailing-dot completion (the appended `0` pushes it one
+/// digit over) -- accepted as a narrow, safe edge case: the digit cap's
+/// own re-check after normalizing means this never emits a wrong value,
+/// only occasionally declines to preserve an already-rare spelling
+/// (17-significant-digit mantissa *and* a bare trailing dot), falling
+/// back to the always-value-correct bare-`Float` reconstruction instead.
 #[must_use]
 pub(super) fn preservable_float_literal_text(s: &str) -> Option<String> {
     if is_preservable_float_literal(s) {
         return None;
     }
     let stripped_plus = s.strip_prefix('+').unwrap_or(s);
-    let with_trailing_zero = match stripped_plus.strip_suffix('.') {
-        Some(_) => format!("{stripped_plus}0"),
-        None => stripped_plus.to_string(),
+    let (mantissa, exponent) = match stripped_plus.find(['e', 'E']) {
+        Some(exp_pos) => stripped_plus.split_at(exp_pos),
+        None => (stripped_plus, ""),
     };
-    let normalized =
-        crate::json::validate::strip_redundant_leading_zeros(with_trailing_zero.as_bytes())
-            .and_then(|stripped| String::from_utf8(stripped).ok())
-            .unwrap_or(with_trailing_zero);
+    let mantissa = match mantissa.strip_suffix('.') {
+        Some(_) => format!("{mantissa}0"),
+        None => mantissa.to_string(),
+    };
+    let mantissa = crate::json::validate::strip_redundant_leading_zeros(mantissa.as_bytes())
+        .and_then(|stripped| String::from_utf8(stripped).ok())
+        .unwrap_or(mantissa);
+    let normalized = format!("{mantissa}{exponent}");
     is_preservable_float_literal(&normalized).then_some(normalized)
 }
 
@@ -880,6 +903,31 @@ mod tests {
         );
     }
 
+    /// Code review: a naive whole-string trailing-dot check (`s.strip_suffix('.')`)
+    /// misses a bare dot immediately before an exponent marker, since the
+    /// exponent digits are the actual string suffix, not the dot. Confirms
+    /// the mantissa/exponent split fixes this for every combination of
+    /// leading `+` and redundant leading zero too.
+    #[test]
+    fn preservable_float_literal_text_completes_a_trailing_dot_before_an_exponent() {
+        assert_eq!(
+            preservable_float_literal_text("1.e5"),
+            Some("1.0e5".to_string())
+        );
+        assert_eq!(
+            preservable_float_literal_text("+1.e5"),
+            Some("1.0e5".to_string())
+        );
+        assert_eq!(
+            preservable_float_literal_text("007.e2"),
+            Some("7.0e2".to_string())
+        );
+        assert_eq!(
+            preservable_float_literal_text("-1.e5"),
+            Some("-1.0e5".to_string())
+        );
+    }
+
     #[test]
     fn preservable_float_literal_text_none_when_normalized_form_still_invalid() {
         // `+1.2.3` normalizes (strip `+`) to `1.2.3`, which is still not a
@@ -894,5 +942,29 @@ mod tests {
     fn preservable_float_literal_text_respects_the_digit_cap() {
         let over_cap = "+1.".to_string() + &"1".repeat(MAX_PRESERVABLE_FLOAT_DIGITS);
         assert_eq!(preservable_float_literal_text(&over_cap), None);
+    }
+
+    /// Code review: a mantissa with exactly [`MAX_PRESERVABLE_FLOAT_DIGITS`]
+    /// digits *and* a bare trailing dot (so its digit count is under the
+    /// cap *before* normalization) still gets rejected, because completing
+    /// the dot appends a `0` that pushes the count one over. Documented as
+    /// an accepted, narrow edge case in this function's own doc comment --
+    /// this test exists to pin the *safety* property (falls back to the
+    /// value-correct bare-`Float` path, never a wrong number or invalid
+    /// JSON), not to claim the spelling gets preserved.
+    #[test]
+    fn preservable_float_literal_text_digit_cap_boundary_with_trailing_dot_is_a_safe_miss() {
+        let digits_at_cap = "1".repeat(MAX_PRESERVABLE_FLOAT_DIGITS);
+        // One digit short of the cap plus the completed dot's `0` lands
+        // exactly at the cap -- still preserved.
+        let one_under = "1".repeat(MAX_PRESERVABLE_FLOAT_DIGITS - 1) + ".";
+        assert_eq!(
+            preservable_float_literal_text(&one_under),
+            Some(one_under.clone() + "0")
+        );
+        // At the cap already, so completing the dot pushes one over --
+        // declines to preserve, rather than silently exceeding the cap.
+        let at_cap = digits_at_cap.clone() + ".";
+        assert_eq!(preservable_float_literal_text(&at_cap), None);
     }
 }
