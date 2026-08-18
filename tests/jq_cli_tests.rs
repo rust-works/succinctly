@@ -12109,6 +12109,28 @@ fn test_jq_divisor_is_zero_error_preserves_number_literal_spelling_1199() -> Res
     Ok(())
 }
 
+/// `divisor_is_zero`'s `(Int, Float)` and `(Float, Float)` arms specifically
+/// -- the sibling test above only exercises `(Int, Int)`/`1e10 % 0`
+/// (`NumberLiteral`-repr `Int`). Direct coverage for the two other
+/// zero-divisor shapes `arith_div`'s `number_repr()`-based match handles.
+#[test]
+fn test_jq_divisor_is_zero_mixed_int_float_shapes_1199() -> Result<()> {
+    let (out, err, code) = run_jq_full(&["-cn", "5 / 0.0"], None)?;
+    assert_eq!(code, 5, "out: {out:?}");
+    assert!(
+        err.contains("cannot be divided because the divisor is zero"),
+        "{err}"
+    );
+
+    let (out, err, code) = run_jq_full(&["-cn", "5.5 / 0.0"], None)?;
+    assert_eq!(code, 5, "out: {out:?}");
+    assert!(
+        err.contains("cannot be divided because the divisor is zero"),
+        "{err}"
+    );
+    Ok(())
+}
+
 /// Control: genuine successful computation (every operator) is unaffected
 /// by the restructuring -- the numeric fast path still reaches the same
 /// arms it always did, just guarded on a non-consuming peek first.
