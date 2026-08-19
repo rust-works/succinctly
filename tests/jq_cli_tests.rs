@@ -13275,3 +13275,104 @@ fn test_contains_type_mismatch_still_errors_1045() -> Result<()> {
     let _ = out;
     Ok(())
 }
+
+/// #1045 coverage: `result_to_owned_full`'s widened `Ok(Some(_))` wrapping
+/// (vs. the old bare `Ok(_)`) means each of these builtins' pre-existing
+/// "wrong-typed argument, but `optional`" guard is now a distinct pattern
+/// (`Ok(Some(_)) if optional`) the diff attributes as a new line.
+///
+/// A *bare* top-level `builtin(bad_arg)?` does NOT exercise this guard: `?`
+/// desugars to `try E` (`Expr::Optional(inner) => eval_try(inner, None,
+/// value, optional)` in `eval_single`'s dispatch), which evaluates `inner`
+/// with the *ambient* (ordinarily `false`) optional and only catches the
+/// resulting error afterward -- #693's fix, deliberately not forcing
+/// `optional = true` down the whole subtree (that used to let a masked
+/// error inside a combinator look like ordinary `empty`). So each builtin's
+/// OWN `optional` parameter is `false` here, and the swallow happens in
+/// `eval_try`'s catch instead of this guard. This still confirms the
+/// end-to-end swallow-to-empty behavior (worth having), it just doesn't
+/// reach this specific line.
+#[test]
+fn test_getpath_strftime_strptime_tz_load_optional_type_mismatch_suppresses_1045() -> Result<()> {
+    let (out, err, code) = run_jq_full(&["-cn", "{\"a\":1} | getpath(1)?"], None)?;
+    assert_eq!(code, 0, "err={err}");
+    assert_eq!(out, "");
+
+    let (out, err, code) = run_jq_full(&["-cn", "0 | strftime(1)?"], None)?;
+    assert_eq!(code, 0, "err={err}");
+    assert_eq!(out, "");
+
+    let (out, err, code) = run_jq_full(&["-cn", "\"x\" | strptime(1)?"], None)?;
+    assert_eq!(code, 0, "err={err}");
+    assert_eq!(out, "");
+
+    let (out, err, code) = run_jq_full(&["-cn", "0 | tz(1)?"], None)?;
+    assert_eq!(code, 0, "err={err}");
+    assert_eq!(out, "");
+
+    let (out, err, code) = run_jq_full(&["-cn", "1 | load(1)?"], None)?;
+    assert_eq!(code, 0, "err={err}");
+    assert_eq!(out, "");
+    Ok(())
+}
+
+/// Companion to the test above: actually reaches each builtin's own
+/// `Ok(Some(_)) if optional` guard directly, via `eval_pipe_with_path_context_internal`'s
+/// `Expr::Optional` arm, which -- unlike `eval_single`'s (see the test
+/// above) -- forces `optional = true` directly onto the wrapped node
+/// instead of going through `eval_try`'s catch-afterward semantics. `key`
+/// (a succinctly-only path-tracking extension) is what forces path-context
+/// evaluation to engage at all here.
+///
+/// Each case prints `null` before `"b"` rather than just `"b"` -- that's
+/// the pre-existing, out-of-scope path-context bug filed as #1280
+/// (`eval_owned_expr_ctrl_full`'s `QueryResult::None => Ok(Null)` collapse,
+/// confirmed to predate #1045), not something this test is trying to
+/// assert is correct; it's pinned here only to keep this coverage-closing
+/// test from silently drifting if that collapse's behavior changes.
+#[test]
+fn test_getpath_strftime_strptime_tz_load_optional_guard_via_path_context_1045() -> Result<()> {
+    let (out, err, code) = run_jq_full(
+        &["-c", ".a.b | (getpath(1))?, key"],
+        Some(r#"{"a":{"b":{"c":1}}}"#),
+    )?;
+    assert_eq!(code, 0, "err={err}");
+    assert_eq!(out.trim(), "null\n\"b\"");
+
+    let (out, err, code) = run_jq_full(
+        &["-c", ".a.b | (strftime(1))?, key"],
+        Some(r#"{"a":{"b":0}}"#),
+    )?;
+    assert_eq!(code, 0, "err={err}");
+    assert_eq!(out.trim(), "null\n\"b\"");
+
+    let (out, err, code) = run_jq_full(
+        &["-c", ".a.b | (strptime(1))?, key"],
+        Some(r#"{"a":{"b":"x"}}"#),
+    )?;
+    assert_eq!(code, 0, "err={err}");
+    assert_eq!(out.trim(), "null\n\"b\"");
+
+    let (out, err, code) = run_jq_full(&["-c", ".a.b | (tz(1))?, key"], Some(r#"{"a":{"b":0}}"#))?;
+    assert_eq!(code, 0, "err={err}");
+    assert_eq!(out.trim(), "null\n\"b\"");
+
+    let (out, err, code) =
+        run_jq_full(&["-c", ".a.b | (load(1))?, key"], Some(r#"{"a":{"b":1}}"#))?;
+    assert_eq!(code, 0, "err={err}");
+    assert_eq!(out.trim(), "null\n\"b\"");
+    Ok(())
+}
+
+/// #1045 coverage: `flatten(depth)`'s `Ok(Some(_)) => ...type_error("number",
+/// "non-number")` arm -- a non-number depth argument, unconditional (no
+/// `optional` gate), unlike the negative-depth arm covered by
+/// `test_flatten_negative_depth_errors_even_with_trailing_break_1164` above.
+#[test]
+fn test_flatten_depth_non_number_argument_errors_1045() -> Result<()> {
+    let (out, err, code) = run_jq_full(&["-cn", r#"[[1]] | flatten("x")"#], None)?;
+    assert_ne!(code, 0);
+    assert!(err.contains("non-number"), "err={err}");
+    let _ = out;
+    Ok(())
+}

@@ -5151,17 +5151,19 @@ fn builtin_flatten_depth<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 ) -> QueryResult<'a, W> {
     // Get the depth
     let depth_result = eval_single::<W, S>(depth_expr, value.clone(), optional);
-    let (depth, trailing) = match result_to_owned_full(depth_result) {
+    let (depth_value, trailing) = match result_to_owned_full(depth_result) {
         Ok(None) => return QueryResult::None,
-        Ok(Some((
-            OwnedValue::Int(d) | OwnedValue::NumberLiteral(NumberRepr::Int(d), _),
-            trailing,
-        ))) if d >= 0 => (d as usize, trailing),
-        Ok(Some((OwnedValue::Int(_) | OwnedValue::NumberLiteral(NumberRepr::Int(_), _), _))) => {
+        Ok(Some(v)) => v,
+        Err(e) => return e.into(),
+    };
+    let depth = match depth_value {
+        OwnedValue::Int(d) | OwnedValue::NumberLiteral(NumberRepr::Int(d), _) if d >= 0 => {
+            d as usize
+        }
+        OwnedValue::Int(_) | OwnedValue::NumberLiteral(NumberRepr::Int(_), _) => {
             return QueryResult::Error(EvalError::new("depth must be non-negative"));
         }
-        Ok(Some(_)) => return QueryResult::Error(EvalError::type_error("number", "non-number")),
-        Err(e) => return e.into(),
+        _ => return QueryResult::Error(EvalError::type_error("number", "non-number")),
     };
 
     finish_result(builtin_flatten::<W>(value, optional, depth), trailing)
