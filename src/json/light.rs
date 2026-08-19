@@ -1472,6 +1472,18 @@ fn parse_hex4(hex: &[u8]) -> Result<u16, JsonError> {
 /// materializing the wrong, fabricated value `1.2` instead of `null`
 /// (caught by review of #1171 before merge, 4 `#966` regression tests
 /// failed).
+///
+/// One of (at least) four independent "find a JSON-ish number token's
+/// boundaries" functions in the crate, each with a genuinely different
+/// strictness grammar for its own caller (#1218) -- besides
+/// `nested_number_span` above, see
+/// [`crate::json::simple_light`]'s private `find_number_end` (backs the
+/// separate `SimpleJsonIndex`, fully greedy) and
+/// `src/bin/succinctly/jq_runner.rs`'s private `find_number_end` (a
+/// `--argjson` leading-zero repair pass, lenient on a dangling exponent
+/// marker unlike this function). None delegate to any other; see #1218
+/// for the full survey and why a blanket consolidation needs its own
+/// design pass.
 pub fn number_literal_end(text: &[u8], start: usize) -> Option<usize> {
     let mut i = start;
     if i < text.len() && text[i] == b'-' {
@@ -1537,6 +1549,12 @@ pub fn number_literal_end(text: &[u8], start: usize) -> Option<usize> {
 /// round-trip correctly: their whole span must survive intact for
 /// `is_nan_sentinel`/`is_infinity_sentinel`'s exact-text comparison to
 /// recognize them.
+///
+/// See [`number_literal_end`]'s own doc comment for the full four-way
+/// survey of this crate's independent number-token scanners (#1218) --
+/// this one's greedy character class (`[0-9.eE+-]`, no grammar
+/// validation) is closest in spirit to `simple_light`'s own scanner, but
+/// they still don't share an implementation.
 fn nested_number_span(text: &[u8], start: usize) -> usize {
     let mut i = start;
     if i < text.len() && text[i] == b'-' {
@@ -3598,5 +3616,29 @@ mod tests {
         let range = root.text_range().unwrap();
         assert_eq!(range, (0, 9));
         assert_eq!(&json[range.0..range.1], b"[1, 2, 3]");
+    }
+
+    /// Pins `number_literal_end`'s deliberate rejection of a dangling
+    /// exponent marker (#1218's documented example of the crate's 4-way
+    /// number-scanner divergence) -- a future edit that accidentally makes
+    /// this function lenient here, matching `nested_number_span`'s own
+    /// permissive contract, would defeat the whole reason it's the
+    /// stricter of the two (see the type's own doc comment).
+    #[test]
+    fn test_number_literal_end_rejects_dangling_exponent_marker_1218() {
+        assert_eq!(number_literal_end(b"5e", 0), None);
+        assert_eq!(number_literal_end(b"1E", 0), None);
+        // A well-formed exponent still parses, so this isn't blanket
+        // exponent-hostility.
+        assert_eq!(number_literal_end(b"5e1", 0), Some(3));
+    }
+
+    /// Companion to the test above: `nested_number_span` -- unlike
+    /// `number_literal_end` -- absorbs the same dangling exponent marker
+    /// into one span rather than rejecting it, by design (#966, #1218).
+    #[test]
+    fn test_nested_number_span_absorbs_dangling_exponent_marker_1218() {
+        assert_eq!(nested_number_span(b"5e", 0), 2);
+        assert_eq!(nested_number_span(b"1E", 0), 2);
     }
 }

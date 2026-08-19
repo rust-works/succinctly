@@ -1642,6 +1642,15 @@ struct NumberTokenEnd {
 /// here: `normalize_leading_zero_numbers` only calls this when `b == '-'`
 /// or `b` is itself a digit, never `.`).
 ///
+/// This is the fourth of (at least) four independent number-token
+/// scanners in the crate, none delegating to any other (#1218) -- besides
+/// `number_literal_end` above, see `succinctly::json::light`'s private
+/// `nested_number_span` (greedy, backs `StandardJson`'s nested-value
+/// materialization) and `succinctly::json::simple_light`'s private
+/// `find_number_end` (also greedy, backs the separate `SimpleJsonIndex`).
+/// See #1218 for the full survey and why a blanket consolidation needs
+/// its own design pass.
+///
 /// Mirrors [`find_string_end`]/[`find_matching_close`]'s "find the end of
 /// this token" shape (#1154) rather than interleaving grammar-walking
 /// with a transformation, the way an earlier version of
@@ -2952,7 +2961,10 @@ mod tests {
         // A dangling '.' or 'e' with no digits after it still consumes
         // the marker itself, matching the lenient original behavior --
         // the retried `serde_json` validation rejects the result either
-        // way, so this scan doesn't need to.
+        // way, so this scan doesn't need to. This is the concrete example
+        // #1218 uses to illustrate the crate's 4-way number-scanner
+        // divergence -- `succinctly::json::light::number_literal_end`
+        // deliberately rejects the same `5e`/`1E` shape outright instead.
         assert_eq!(ends(b"5.", 0), Some((1, 2)));
         assert_eq!(ends(b"5e", 0), Some((1, 2)));
         // Stops at the token's own end, not the end of a larger buffer.
