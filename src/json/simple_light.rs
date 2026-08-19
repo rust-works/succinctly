@@ -367,7 +367,35 @@ fn find_string_end(json: &[u8], start: usize) -> usize {
     json.len()
 }
 
-// Find the end of a number (position of first non-number char)
+/// Find the end of a number-*shaped* span starting at `start` in `json` --
+/// this module's own copy of the "scan a JSON-ish number token" job, one
+/// of (at least) four independent implementations in the crate with
+/// genuinely different strictness grammars (#1218); none delegate to any
+/// other, each backing a different, already-load-bearing contract:
+///
+/// - [`crate::json::light::number_literal_end`] -- strict, `Option`-returning,
+///   used only for top-level document splitting (a malformed number there
+///   must error).
+/// - [`crate::json::light`]'s private `nested_number_span` -- greedy but still
+///   character-class-limited to `[0-9.eE+-]`, backing `StandardJson`'s
+///   nested-value materialization (a malformed nested number degrades to
+///   `null` downstream instead of erroring the whole document).
+/// - `src/bin/succinctly/jq_runner.rs`'s private `find_number_end` --
+///   structured optional frac/exp, but lenient on a dangling exponent
+///   marker, purpose-built for `--argjson`'s leading-zero repair.
+///
+/// This one is the *most* permissive of the four: same greedy character
+/// class as `nested_number_span` (any `[0-9.eE+-]` byte, no grammar
+/// validation at all -- a malformed shape like `1.2.3` or a dangling `5e`
+/// still consumes as one span), backing the separate, simpler
+/// `SimpleJsonIndex`'s own value-length detection, which has no downstream
+/// re-validation step of its own to catch a malformed span the way
+/// `StandardJson`'s number materialization does. Deliberately *not* shared
+/// with any of the above: each function's grammar is tuned to its own
+/// caller's error-handling contract, and collapsing them without an
+/// audited leniency-level parameter risks silently changing which
+/// malformed inputs each caller accepts (see #1218 for the full survey and
+/// why a blanket consolidation needs its own design pass).
 fn find_number_end(json: &[u8], start: usize) -> usize {
     let mut i = start;
     while i < json.len() {
@@ -703,5 +731,17 @@ mod tests {
         assert_eq!(index.find_close(json, 2), Some(6));
         // Innermost [ at 3 closes at 5
         assert_eq!(index.find_close(json, 3), Some(5));
+    }
+
+    /// Pins this module's `find_number_end`'s own contract on the
+    /// dangling-exponent-marker example #1218 uses to illustrate the
+    /// crate's 4-way number-scanner divergence: fully greedy, absorbing
+    /// `5e`/`1E` into one span with no grammar validation at all, unlike
+    /// `json::light::number_literal_end`'s deliberate rejection of the
+    /// same shape.
+    #[test]
+    fn test_find_number_end_absorbs_dangling_exponent_marker_1218() {
+        assert_eq!(find_number_end(b"5e", 0), 2);
+        assert_eq!(find_number_end(b"1E", 0), 2);
     }
 }
