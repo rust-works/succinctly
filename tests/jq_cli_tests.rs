@@ -12638,3 +12638,36 @@ fn test_jq_string_repetition_accepts_float_count_1230() -> Result<()> {
     assert_eq!(out.trim(), "null");
     Ok(())
 }
+
+/// #1156: a deeply nested single-expression query (repeated unary minus,
+/// nested parens) must produce a clean compile error with the parser's
+/// depth-limit message -- not a stack-overflow abort (SIGABRT / exit 134),
+/// which was the pre-fix behavior at ~600 levels in a debug build.
+#[test]
+fn test_deeply_nested_expr_clean_error_not_stack_overflow_1156() -> Result<()> {
+    // Nested parens can go in as a direct filter argument.
+    let deep_parens = format!("{}5{}", "(".repeat(600), ")".repeat(600));
+    let (stdout, stderr, code) = run_jq_full(&["-c", &deep_parens], Some("null"))?;
+    assert_eq!(stdout, "", "no output expected: {stdout:?}");
+    assert!(
+        stderr.contains("depth limit"),
+        "expected depth-limit error, stderr: {stderr:?}"
+    );
+    assert_eq!(code, 1, "clean compile-error exit, not an abort (134)");
+
+    // A leading `-` would be eaten as a CLI flag, so the unary chain goes
+    // through a filter file.
+    let mut filter_file = NamedTempFile::new()?;
+    write!(filter_file, "{}5", "-".repeat(600))?;
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "-f", filter_file.path().to_str().unwrap()],
+        Some("null"),
+    )?;
+    assert_eq!(stdout, "", "no output expected: {stdout:?}");
+    assert!(
+        stderr.contains("depth limit"),
+        "expected depth-limit error, stderr: {stderr:?}"
+    );
+    assert_eq!(code, 1, "clean compile-error exit, not an abort (134)");
+    Ok(())
+}

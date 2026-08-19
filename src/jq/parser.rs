@@ -122,11 +122,46 @@ fn push_bracket(chain: &mut Vec<Expr>, bracket: Bracket) {
     }
 }
 
+/// Maximum nesting depth for a single query expression's AST. Every nesting
+/// construct — parenthesized subexpressions, unary minus, bracket/index
+/// contents, keyword-form bodies (`if`/`reduce`/`foreach`/...) — re-enters
+/// the parser's expression recursion through [`Parser::parse_primary`], which
+/// counts this depth. Exceeding it returns a clean [`ParseError`] instead of
+/// recursing further: deeply nested filter text (`-----...-5`, `((((...))))`)
+/// is reachable from a query alone, with no input document involved, so an
+/// unguarded recursive-descent parse is a process-abort hazard fully within a
+/// client's control (#1156). Binary operators, pipes, and commas parse
+/// iteratively (accumulating into a `Vec`), so only genuine nesting consumes
+/// depth — a long `a | b | c | ...` chain or `1 + 2 + 3 + ...` stays at
+/// constant depth.
+///
+/// 64, measured: the parser's unguarded crash boundary on the tightest
+/// environment this crate documents (debug build, default 2MiB test-thread
+/// stack — same discipline as [`MAX_VALUE_TREE_DEPTH`]'s own rationale in
+/// `value.rs`) is ~88-96 nesting levels for the heaviest per-level shapes
+/// (array construction ~88-96, parenthesized subexpressions ~96-104, each
+/// level costing ~13-15 recursive-descent frames through the precedence
+/// ladder). 64 keeps ≥1.35x margin under the tightest boundary, mirroring
+/// the 384-vs-580 and 256-vs-200 ratios the existing depth limits use.
+/// Real jq tolerates ~5000 levels (its bison parser is table-driven with a
+/// heap-grown stack, not recursive descent), so queries nested 65..5000 deep
+/// now error cleanly here where jq would still run — a documented trade-off;
+/// real-world queries essentially never exceed ~30 levels.
+///
+/// This bounds the *parser's* recursion on query text; the evaluator walking
+/// a parser-produced `Expr` is transitively bounded too, since it cannot see
+/// a deeper tree than the parser built. `Expr`s reconstructed from input
+/// documents (`owned_to_expr`, see #945) are a separate construction path
+/// this limit does not cover.
+const MAX_EXPR_DEPTH: usize = 64;
+
 /// Parser state.
 struct Parser<'a> {
     input: &'a str,
     pos: usize,
     mode: ParserMode,
+    /// Current expression-nesting depth; see [`MAX_EXPR_DEPTH`].
+    expr_depth: usize,
 }
 
 impl<'a> Parser<'a> {
@@ -136,6 +171,7 @@ impl<'a> Parser<'a> {
             input,
             pos: 0,
             mode: ParserMode::Jq,
+            expr_depth: 0,
         }
     }
 
@@ -144,6 +180,7 @@ impl<'a> Parser<'a> {
             input,
             pos: 0,
             mode,
+            expr_depth: 0,
         }
     }
 
@@ -970,16 +1007,32 @@ impl<'a> Parser<'a> {
     /// so by the time control reaches here any such `?` is already gone;
     /// this only wraps a `?` still left over the whole term.
     fn parse_primary(&mut self) -> Result<Expr, ParseError> {
-        let expr = self.parse_primary_inner()?;
-        self.skip_ws();
-        if self.peek() == Some('?') {
-            self.next();
-            Ok(Expr::Optional(Box::new(expr)))
+        self.expr_depth += 1;
+        let result = if self.expr_depth > MAX_EXPR_DEPTH {
+            Err(ParseError::new(
+                format!("expression nesting exceeds depth limit of {MAX_EXPR_DEPTH}"),
+                self.pos,
+            ))
         } else {
-            Ok(expr)
-        }
+            let expr = self.parse_primary_inner()?;
+            self.skip_ws();
+            if self.peek() == Some('?') {
+                self.next();
+                Ok(Expr::Optional(Box::new(expr)))
+            } else {
+                Ok(expr)
+            }
+        };
+        self.expr_depth -= 1;
+        result
     }
 
+    /// The real `parse_primary` body, entered only through the depth-checked
+    /// wrapper above. Every recursive descent into a subexpression — the
+    /// paren arm's `parse_expr`, unary minus's operand, bracket contents,
+    /// keyword-form bodies — comes back through `self.parse_primary()`, not
+    /// this function, so the depth counter sees every nesting level
+    /// (#1156; same shape as the pattern guard in #1240).
     fn parse_primary_inner(&mut self) -> Result<Expr, ParseError> {
         self.skip_ws();
 
@@ -6280,5 +6333,51 @@ mod tests {
         // Exercises the optional +/- sign branch in exponent parsing.
         assert!(parse("1e+5").is_ok());
         assert!(parse("1e-5").is_ok());
+    }
+
+    /// A query expression nested past `MAX_EXPR_DEPTH` returns a clean
+    /// `ParseError` instead of overflowing the stack -- regression test for
+    /// #1156 (`-----...-5`, `((((...5...))))` reachable from query text
+    /// alone, no input document needed; pre-fix boundary was ~596 unary
+    /// levels in a debug build, crashing with SIGABRT).
+    #[test]
+    fn test_expr_depth_limit_returns_parse_error_not_overflow_1156() {
+        let n = MAX_EXPR_DEPTH + 10;
+        let unary = format!("{}5", "-".repeat(n));
+        let err = parse(&unary).expect_err("over-depth unary chain must be a clean parse error");
+        assert!(
+            err.message.contains("depth limit"),
+            "unexpected error: {}",
+            err.message
+        );
+
+        let parens = format!("{}5{}", "(".repeat(n), ")".repeat(n));
+        let err = parse(&parens).expect_err("over-depth paren nesting must be a clean parse error");
+        assert!(
+            err.message.contains("depth limit"),
+            "unexpected error: {}",
+            err.message
+        );
+    }
+
+    /// At-limit nesting still parses -- the guard must reject only genuinely
+    /// over-deep queries, not ones sitting exactly at the boundary (#1156).
+    /// Each `(` costs one depth unit, so `MAX_EXPR_DEPTH - 1` parens put the
+    /// innermost literal at exactly `MAX_EXPR_DEPTH`; a `-` chain folds its
+    /// innermost `-5` into one negative literal, so a full
+    /// `MAX_EXPR_DEPTH`-long chain is also at-limit. Both must parse on the
+    /// 2MiB default test-thread stack, the environment the limit itself was
+    /// measured against.
+    #[test]
+    fn test_expr_at_depth_limit_still_parses_1156() {
+        let parens = format!(
+            "{}5{}",
+            "(".repeat(MAX_EXPR_DEPTH - 1),
+            ")".repeat(MAX_EXPR_DEPTH - 1)
+        );
+        parse(&parens).expect("at-limit paren nesting must still parse");
+
+        let unary = format!("{}5", "-".repeat(MAX_EXPR_DEPTH));
+        parse(&unary).expect("at-limit unary chain must still parse");
     }
 }
