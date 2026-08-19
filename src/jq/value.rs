@@ -310,15 +310,20 @@ pub fn format_number_jq_compat(raw: &[u8]) -> String {
     // the literal's exact source digits the way every other case in this
     // function does (`-824118596092576.85097746e0` -> `-...576.9`,
     // `99999999999999999e0` -> `100000000000000000`, both wrong -- oracle-
-    // confirmed against jq 1.7.1). No special-casing needed at all: an
-    // `exp == 0` literal is just the `shifted_exp == 0` case of the
-    // string-based logic below (`normalize_extreme_literal_mantissa`'s
-    // `shift` is folded into `parsed_exp`, which is already `0` here), so
-    // removing this block entirely and falling straight through gives the
-    // identical, already-verified-correct answer for every case that used
-    // to take the `value as i64` fast path too -- confirmed via a broad
-    // randomized differential sweep against jq 1.7.1, not just the cases
-    // this comment names.
+    // confirmed against jq 1.7.1). No special-casing needed at all: with
+    // `parsed_exp == 0` folded into `normalize_extreme_literal_mantissa`'s
+    // shift math below, `shifted_exp` reduces to exactly `shift` -- *not*
+    // always `0` (a multi-digit integer mantissa like `500e0` shifts to a
+    // positive `shifted_exp`, correctly routing through the
+    // `format_positive_shifted_plain`/#1244 plain-decimal path below rather
+    // than `format_shifted_mantissa`'s own `shifted_exp == 0` arm; a
+    // magnitude-<1 mantissa past `-6` shifts to scientific instead, e.g.
+    // `0.0000005e0` -> `5E-7`, matching real jq -- code review, #1264).
+    // Falling straight through to that general logic instead of keeping a
+    // dedicated fast path here gives the identical, already-verified-
+    // correct answer for every case that used to take the `value as i64`
+    // fast path too -- confirmed via a broad randomized differential sweep
+    // against jq 1.7.1, not just the cases this comment names.
 
     // #1226: real jq's bare-integer/decimal-window choice for the *rest* of
     // this function (every nonzero, non-subnormal mantissa the `exp == 0`
@@ -2854,12 +2859,16 @@ mod tests {
     }
 
     /// #1099 code review: the exponent digit string was parsed at `i32`
-    /// width for `format_number_jq_compat`'s own fast-path dispatch
-    /// (`exp == 0` / `(-5..0)` checks), and an out-of-`i32`-range exponent
-    /// silently became `0` via `.unwrap_or(0)` -- misrouting into the
-    /// "eliminate exponent" fast path before the mantissa-preserving logic
-    /// above ever ran. Widening that parse to `i64` (`parse_literal_exponent`)
-    /// fixes it for any realistic exponent.
+    /// width for `format_number_jq_compat`'s own notation dispatch (at the
+    /// time, an `exp == 0` / `(-5..0)` fast path, since removed by #1264 --
+    /// today's equivalent is `parse_literal_exponent`'s use inside
+    /// `normalize_extreme_literal_mantissa`'s shift math), and an
+    /// out-of-`i32`-range exponent silently became `0` via `.unwrap_or(0)`
+    /// -- misrouting into whichever "written exponent is exactly zero" path
+    /// existed at the time, before the mantissa-preserving logic above ever
+    /// ran. Widening that parse to `i64` (`parse_literal_exponent`) fixes it
+    /// for any realistic exponent, a fix this test still guards regardless
+    /// of which branch structure carries it.
     #[test]
     fn test_format_number_jq_compat_underflow_beyond_i32_exponent_range_1099() {
         // One exponent digit past i32::MIN (-2147483648) -- used to
