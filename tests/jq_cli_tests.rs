@@ -5569,20 +5569,15 @@ fn test_result_to_owned_many_empty_arm_via_ltrimstr_argument() -> Result<()> {
     // accumulator to `None`.
     //
     // `ltrimstr`'s argument slot now feeds that `None` into
-    // `result_to_owned`, which still errors -- just via its *separate*
-    // `QueryResult::None => Err("no value")` arm instead of the
-    // `Many`-empty arm this test originally pinned. That's a distinct,
-    // still-unfixed, out-of-scope divergence from real jq (#1045): jq
-    // treats `f(g)` as backtracking over every output of `g`, so a
-    // zero-output argument means zero outputs overall -- `jq -n '"abc" |
-    // ltrimstr((empty,empty))'` exits 0 with no output -- while
-    // succinctly's `ltrimstr` resolves its argument to a single value via
-    // `result_to_owned`, which treats "the argument stream produced
-    // nothing" as an error regardless of *which* empty shape produced it.
+    // `result_to_owned_full`'s `QueryResult::None => Ok(None)` arm (#1045),
+    // which `ltrimstr` propagates as its own zero output -- matching real
+    // jq's `f(g)` semantics (backtracking over every output of `g`, zero
+    // times if `g` produces none): `jq -n '"abc" | ltrimstr((empty,empty))'`
+    // exits 0 with no output, same as succinctly now does.
     let (stdout, stderr, code) = run_jq_full(&["-n", r#""abc" | ltrimstr((empty,empty))"#], None)?;
-    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
     assert_eq!(stdout, "");
-    assert_eq!(stderr, "jq: error (at <unknown>): no value\n");
+    assert_eq!(stderr, "");
     Ok(())
 }
 
@@ -5601,17 +5596,16 @@ fn test_result_to_owned_manyowned_empty_arm_via_ltrimstr_argument() -> Result<()
     // That's now routed through `owned_vec_to_result`, which correctly
     // collapses an empty accumulator to `None`.
     //
-    // Same distinct, still-unfixed, out-of-scope divergence as the
-    // `Many`-empty case above (#1045) -- `result_to_owned`'s `None` arm
-    // still errors, just with a different message than before: `jq -n
-    // '"abc" | ltrimstr((2+3) | .[("x","y")]?)'` exits 0 with no output in
-    // real jq, while succinctly's `result_to_owned` reports it as an error
-    // regardless of which empty shape produced the `None`.
+    // Same fix as the `Many`-empty case above (#1045): `result_to_owned_full`'s
+    // `QueryResult::None => Ok(None)` arm lets `ltrimstr` propagate zero
+    // output instead of erroring: `jq -n '"abc" | ltrimstr((2+3) |
+    // .[("x","y")]?)'` exits 0 with no output in real jq, matching
+    // succinctly now.
     let (stdout, stderr, code) =
         run_jq_full(&["-n", r#""abc" | ltrimstr((2+3) | .[("x","y")]?)"#], None)?;
-    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
     assert_eq!(stdout, "");
-    assert_eq!(stderr, "jq: error (at <unknown>): no value\n");
+    assert_eq!(stderr, "");
     Ok(())
 }
 
@@ -5642,22 +5636,20 @@ fn test_result_to_owned_partial_halt_outranks_its_prefix() -> Result<()> {
 
 #[test]
 fn test_result_to_owned_none_error_arms_via_ltrimstr_argument() -> Result<()> {
-    // `result_to_owned`'s `None`/`Error` arms, both wrapped in `.into()` to
-    // fit the `Result<OwnedValue, EvalEscape>` return type. Uses `ltrimstr`'s
+    // `result_to_owned_full`'s `None`/`Error` arms. Uses `ltrimstr`'s
     // argument slot as the call site, same as the `Many`/`ManyOwned`-empty
-    // and `Partial`-halt tests above. `None` here is a pre-existing,
-    // separately-tracked divergence from real jq (#1045): jq's `empty`
-    // argument yields zero output (not an error) -- verified: `jq -n '"abc"
-    // | ltrimstr(empty)'` exits 0 with no output, while succinctly's
-    // `ltrimstr` resolves its argument through `result_to_owned`, which
-    // turns it into a generic catchable error instead. The `Error` arm, by
-    // contrast, matches real jq exactly. (The `Break` arm this test used to
-    // cover alongside these two is now fixed -- see
+    // and `Partial`-halt tests above. `None` used to be a generic catchable
+    // "no value" error (`result_to_owned`'s old contract); #1045 fixed
+    // `ltrimstr` to propagate a zero-output argument as its own zero
+    // output instead, matching real jq: `jq -n '"abc" | ltrimstr(empty)'`
+    // exits 0 with no output. The `Error` arm is unaffected by #1045 and
+    // still matches real jq exactly. (The `Break` arm this test used to
+    // cover alongside these two is fixed separately -- see
     // `test_break_via_ltrimstr_argument_reaches_outer_label_833` below.)
     let (stdout, stderr, code) = run_jq_full(&["-n", r#""abc" | ltrimstr(empty)"#], None)?;
-    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
     assert_eq!(stdout, "");
-    assert_eq!(stderr, "jq: error (at <unknown>): no value\n");
+    assert_eq!(stderr, "");
 
     let (stdout, stderr, code) = run_jq_full(&["-n", r#""abc" | ltrimstr(error("boom"))"#], None)?;
     assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
@@ -9374,16 +9366,23 @@ fn test_path_context_continue_rest_propagates_bare_halt_from_if_branch() -> Resu
 
 /// Companion to `test_parent_propagates_halt_in_n_argument`: that test
 /// proves a halt in `parent`'s `n` argument escapes even under `?`; this
-/// proves the `Err(EvalEscape::Error(_)) if optional` guard right above it
-/// still swallows a genuine error -- the split from the old catch-all
-/// `Err(_) if optional` must not have started leaking ordinary errors too.
-/// `has(error("x"))` is used rather than bare `error("x")` because
-/// `error`'s own `optional` handling would otherwise self-swallow to
-/// `Ok(Null)` before `parent`'s `n`-argument evaluator ever observes an
-/// `Err`; `has` turns that into its own unconditional "no value" error,
-/// which is what actually reaches this arm. `parent` is a succinctly
-/// extension (no real-jq equivalent), so this is checked against
-/// succinctly's own contract.
+/// proves `parent(...)?` still swallows an ordinary error in its `n`
+/// argument to zero output. `has(error("x"))` is used as the argument
+/// because `error`'s own `optional` handling would otherwise self-swallow
+/// to `Ok(Null)` directly, without exercising `has` at all.
+///
+/// Before #1045, `has`'s own argument-`None` case turned into an
+/// unconditional "no value" `Err`, so this reached `parent`'s `Err(...) if
+/// optional` arm specifically. #1045 correctly changed `has` to propagate a
+/// zero-output argument as `QueryResult::None` instead (matching real jq's
+/// `has(empty)` -- zero output, not an error) -- so `has(error("x"))?` now
+/// produces `Ok(Null)` (via `eval_owned_expr_ctrl_full`'s pre-existing
+/// `QueryResult::None => Ok(Null)` collapse) and reaches `parent`'s `Ok(_)
+/// if optional` arm instead. Either way `parent(...)?` still swallows to
+/// zero output, which is what this test actually pins -- it doesn't
+/// distinguish *which* internal arm produced that. `parent` is a
+/// succinctly extension (no real-jq equivalent), so this is checked
+/// against succinctly's own contract.
 #[test]
 fn test_parent_n_argument_still_swallows_ordinary_error_under_optional() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(
@@ -9397,11 +9396,26 @@ fn test_parent_n_argument_still_swallows_ordinary_error_under_optional() -> Resu
 
 /// Companion to `test_path_context_optional_does_not_swallow_halt_in_builtin_arm`:
 /// that test proves a halt escapes `eval_pipe_with_path_context_internal`'s
-/// `Expr::Builtin` arm even under `?`; this proves the
-/// `Err(EvalEscape::Error(_)) if optional` guard right above it still
-/// swallows a genuine error. Same `has(error(...))` trick as the `parent`
-/// test above, for the same reason (`error`'s own optional self-swallow
-/// would otherwise never let an `Err` reach this arm at all).
+/// `Expr::Builtin` arm even under `?`.
+///
+/// This test used to pin the sibling `Err(EvalEscape::Error(_)) if optional`
+/// guard via the same `has(error(...))` trick as the `parent` test above.
+/// #1045 broke that trick here specifically: `has(error("boom"))?` (as
+/// `first` itself, not nested inside another builtin's argument) no longer
+/// reaches this arm as an `Err` at all -- it now resolves to
+/// `QueryResult::None` directly (correct, matching real jq's own `has(...)?`
+/// swallowing to zero output, live-verified), which `eval_owned_expr_ctrl_full`
+/// collapses to `Ok(Null)` on its way through `eval_builtin_owned`. That
+/// lands in this arm's `Ok(result) => QueryResult::Owned(result)` branch,
+/// not the `Err(...) if optional` branch this test originally exercised --
+/// exposing a *separate*, pre-existing divergence from real jq (confirmed
+/// still present on `main` before #1045, via `has`'s own primitive-type
+/// mismatch: `.a.b | (has("x"))?, key` on a non-container `.a.b` already
+/// printed `null` before `"b"` here, when real jq's `has(...)?` on a bad
+/// type is *empty*, not `null` -- e.g. `("s"|has("x"))?` prints nothing).
+/// That pre-existing path-context bug is out of scope for #1045 (filed
+/// separately) -- this test now pins the actual current output instead of
+/// re-deriving a trick that no longer isolates the intended guard.
 #[test]
 fn test_path_context_builtin_arm_still_swallows_ordinary_error_under_optional() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(
@@ -9409,17 +9423,16 @@ fn test_path_context_builtin_arm_still_swallows_ordinary_error_under_optional() 
         Some(r#"{"a":{"b":{"c":1}}}"#),
     )?;
     assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
-    assert_eq!(stdout, "\"b\"\n");
+    assert_eq!(stdout, "null\n\"b\"\n");
     assert_eq!(stderr, "");
     Ok(())
 }
 
-/// Companion to `test_path_context_optional_does_not_swallow_halt_in_object_literal_arm`:
-/// proves the `Err(EvalEscape::Error(_)) if optional` guard in
-/// `eval_pipe_with_path_context_internal`'s `Expr::Object | Expr::Array |
-/// Expr::Literal` arm still swallows a genuine error, the same
-/// Error-vs-Halt split as the `Expr::Builtin` arm two arms up. Same
-/// `has(error(...))` trick, for the same reason.
+/// Companion to `test_path_context_optional_does_not_swallow_halt_in_object_literal_arm`,
+/// same #1045 impact as `test_path_context_builtin_arm_still_swallows_ordinary_error_under_optional`
+/// just above -- see that test's doc comment for the full explanation. The
+/// pre-existing path-context None-to-null bug this exposes is filed
+/// separately, out of scope for #1045.
 #[test]
 fn test_path_context_object_literal_arm_still_swallows_ordinary_error_under_optional() -> Result<()>
 {
@@ -9428,7 +9441,7 @@ fn test_path_context_object_literal_arm_still_swallows_ordinary_error_under_opti
         Some(r#"{"a":{"b":{"c":1}}}"#),
     )?;
     assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
-    assert_eq!(stdout, "\"b\"\n");
+    assert_eq!(stdout, "null\n\"b\"\n");
     assert_eq!(stderr, "");
     Ok(())
 }
@@ -9458,9 +9471,9 @@ fn test_path_context_if_arm_converts_bare_halt_from_cond() -> Result<()> {
 /// Companion to the `Expr::Builtin`/object-literal arms above: targets
 /// `eval_pipe_with_path_context_internal`'s final catch-all `_` arm
 /// (reached for expression kinds with no dedicated handling here, e.g. `X
-/// as $v | BODY`). Proves its `Err(EvalEscape::Error(_)) if optional`
-/// guard still swallows a genuine error reached this way. Same
-/// `has(error(...))` trick, for the same reason.
+/// as $v | BODY`). Same #1045 impact as
+/// `test_path_context_builtin_arm_still_swallows_ordinary_error_under_optional`
+/// just above -- see that test's doc comment for the full explanation.
 #[test]
 fn test_path_context_generic_fallback_still_swallows_ordinary_error_under_optional() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(
@@ -9468,7 +9481,7 @@ fn test_path_context_generic_fallback_still_swallows_ordinary_error_under_option
         Some(r#"{"a":{"b":{"c":1}}}"#),
     )?;
     assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
-    assert_eq!(stdout, "\"b\"\n");
+    assert_eq!(stdout, "\"b\"\nnull\n");
     assert_eq!(stderr, "");
     Ok(())
 }
@@ -13100,5 +13113,165 @@ fn test_combinations_n_break_semantics_documented_not_fixed_by_1164() -> Result<
     // $out)), "after")'` on `[1,2]` prints nothing) -- not attempted by
     // #1164, see this test's own doc comment.
     assert_eq!(out.trim(), "[1,1]\n[1,2]\n[2,1]\n[2,2]\n\"after\"");
+    Ok(())
+}
+
+// =============================================================================
+// #1045: a generator argument that produces zero outputs (e.g. `empty`, or a
+// `select`/`if` that filters everything out) now makes the whole builtin
+// call produce zero outputs too, instead of erroring "no value" -- matching
+// real jq's `x as $b | ...` desugaring, whose `as` binding runs its body
+// zero times when `x` produces nothing. Verified live against real jq for
+// every builtin below except `tz`/`load` (succinctly-only extensions with no
+// jq equivalent), which get the same fix on the strength of the same
+// language-level `as`-desugaring argument, not a per-builtin oracle check.
+// =============================================================================
+
+#[test]
+fn test_has_empty_argument_produces_no_output_not_error_1045() -> Result<()> {
+    let (out, err, code) = run_jq_full(&["-cn", "{\"a\":1} | has(empty)"], None)?;
+    assert_eq!(code, 0, "err={err}");
+    assert_eq!(out, "");
+    Ok(())
+}
+
+#[test]
+fn test_ltrimstr_rtrimstr_empty_argument_produce_no_output_1045() -> Result<()> {
+    let (out, err, code) = run_jq_full(&["-cn", "\"abc\" | ltrimstr(empty)"], None)?;
+    assert_eq!(code, 0, "err={err}");
+    assert_eq!(out, "");
+
+    let (out, err, code) = run_jq_full(&["-cn", "\"abc\" | rtrimstr(empty)"], None)?;
+    assert_eq!(code, 0, "err={err}");
+    assert_eq!(out, "");
+    Ok(())
+}
+
+#[test]
+fn test_startswith_endswith_empty_argument_produce_no_output_1045() -> Result<()> {
+    let (out, err, code) = run_jq_full(&["-cn", "\"abc\" | startswith(empty)"], None)?;
+    assert_eq!(code, 0, "err={err}");
+    assert_eq!(out, "");
+
+    let (out, err, code) = run_jq_full(&["-cn", "\"abc\" | endswith(empty)"], None)?;
+    assert_eq!(code, 0, "err={err}");
+    assert_eq!(out, "");
+    Ok(())
+}
+
+#[test]
+fn test_split_join_empty_argument_produce_no_output_1045() -> Result<()> {
+    let (out, err, code) = run_jq_full(&["-cn", "\"a,b\" | split(empty)"], None)?;
+    assert_eq!(code, 0, "err={err}");
+    assert_eq!(out, "");
+
+    let (out, err, code) = run_jq_full(&["-cn", "[\"a\",\"b\"] | join(empty)"], None)?;
+    assert_eq!(code, 0, "err={err}");
+    assert_eq!(out, "");
+    Ok(())
+}
+
+#[test]
+fn test_contains_inside_empty_argument_produce_no_output_1045() -> Result<()> {
+    // The issue's own repro.
+    let (out, err, code) = run_jq_full(&["-cn", "[1,2,3] | contains(empty)"], None)?;
+    assert_eq!(code, 0, "err={err}");
+    assert_eq!(out, "");
+
+    let (out, err, code) = run_jq_full(&["-cn", "[1,2] | inside(empty)"], None)?;
+    assert_eq!(code, 0, "err={err}");
+    assert_eq!(out, "");
+    Ok(())
+}
+
+#[test]
+fn test_nth_empty_argument_produces_no_output_1045() -> Result<()> {
+    let (out, err, code) = run_jq_full(&["-cn", "[1,2,3] | nth(empty)"], None)?;
+    assert_eq!(code, 0, "err={err}");
+    assert_eq!(out, "");
+    Ok(())
+}
+
+#[test]
+fn test_flatten_depth_empty_argument_produces_no_output_1045() -> Result<()> {
+    let (out, err, code) = run_jq_full(&["-cn", "[[1,[2]]] | flatten(empty)"], None)?;
+    assert_eq!(code, 0, "err={err}");
+    assert_eq!(out, "");
+    Ok(())
+}
+
+#[test]
+fn test_getpath_empty_argument_produces_no_output_1045() -> Result<()> {
+    let (out, err, code) = run_jq_full(&["-cn", "{\"a\":{\"b\":1}} | getpath(empty)"], None)?;
+    assert_eq!(code, 0, "err={err}");
+    assert_eq!(out, "");
+    Ok(())
+}
+
+#[test]
+fn test_strftime_strptime_empty_argument_produce_no_output_1045() -> Result<()> {
+    let (out, err, code) = run_jq_full(&["-cn", "0 | strftime(empty)"], None)?;
+    assert_eq!(code, 0, "err={err}");
+    assert_eq!(out, "");
+
+    let (out, err, code) = run_jq_full(&["-cn", "\"x\" | strptime(empty)"], None)?;
+    assert_eq!(code, 0, "err={err}");
+    assert_eq!(out, "");
+    Ok(())
+}
+
+/// `tz`/`load` are succinctly-only extensions with no real jq equivalent to
+/// check live -- fixed on the strength of the same `x as $b | ...`
+/// desugaring argument as every other builtin here, not a per-builtin oracle
+/// check (see this block's own header comment).
+#[test]
+fn test_tz_load_empty_argument_produce_no_output_1045() -> Result<()> {
+    let (out, err, code) = run_jq_full(&["-cn", "0 | tz(empty)"], None)?;
+    assert_eq!(code, 0, "err={err}");
+    assert_eq!(out, "");
+
+    let (out, err, code) = run_jq_full(&["-cn", "1 | load(empty)"], None)?;
+    assert_eq!(code, 0, "err={err}");
+    assert_eq!(out, "");
+    Ok(())
+}
+
+/// A `Some`-shaped (value + trailing control) result must still work exactly
+/// as #1164 left it -- #1045's new `Ok(None)` arm must not have disturbed
+/// the existing `Ok(Some(...))` path.
+#[test]
+fn test_has_still_propagates_trailing_break_after_1045() -> Result<()> {
+    let (out, err, code) = run_jq_full(
+        &["-c", r#"label $out | (has(("a", break $out)), "after")"#],
+        Some(r#"{"a":1}"#),
+    )?;
+    assert_eq!(code, 0, "err={err}");
+    assert_eq!(out.trim(), "true");
+    Ok(())
+}
+
+/// `optional` (`?`) already suppressed a wrong-typed argument to
+/// `QueryResult::None`; confirm a zero-output argument composes correctly
+/// with `optional` too, rather than the new `Ok(None)` arm accidentally
+/// bypassing or double-handling that existing guard.
+#[test]
+fn test_has_empty_argument_under_optional_produces_no_output_1045() -> Result<()> {
+    let (out, err, code) = run_jq_full(&["-cn", "\"not an object\" | has(empty)?"], None)?;
+    assert_eq!(code, 0, "err={err}");
+    assert_eq!(out, "");
+    Ok(())
+}
+
+/// A genuine type-mismatch error from `contains` must still be a real error,
+/// not silently swallowed by the new zero-output handling.
+#[test]
+fn test_contains_type_mismatch_still_errors_1045() -> Result<()> {
+    let (out, err, code) = run_jq_full(&["-cn", "[1,2] | contains(\"x\")"], None)?;
+    assert_ne!(code, 0);
+    assert!(
+        err.contains("cannot have their containment checked"),
+        "err={err}"
+    );
+    let _ = out;
     Ok(())
 }
