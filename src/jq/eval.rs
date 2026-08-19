@@ -14311,7 +14311,37 @@ fn resolve_seq<'a, S: EvalSemantics>(
                         let tailed = apply_static_tail::<S>(next, tail, trackable)?;
                         return path_result(tailed, Some(e));
                     }
-                    return Err((next, e));
+                    // #1013: when an earlier dynamic element escapes (i < last_dynamic),
+                    // continue the fan-out loop to process remaining dynamic elements against
+                    // the partial branches that succeeded, but preserve the error to return at the end.
+                    // Store the error and continue processing.
+                    let deferred_error = Some(e);
+                    // Continue processing remaining stages with the partial results
+                    for remaining_element in &flat[i + 1..=last_dynamic] {
+                        let mut next_next = Vec::new();
+                        for (prefix, current) in next {
+                            match resolve_against_cow::<S>(remaining_element, current, trackable) {
+                                Ok(resolved) => {
+                                    for (components, resulting) in resolved {
+                                        let mut path = prefix.clone();
+                                        path.extend(components);
+                                        next_next.push((path, resulting));
+                                    }
+                                }
+                                Err((partial, _)) => {
+                                    // Ignore further errors - we already have our deferred_error
+                                    for (components, resulting) in partial {
+                                        let mut path = prefix.clone();
+                                        path.extend(components);
+                                        next_next.push((path, resulting));
+                                    }
+                                }
+                            }
+                        }
+                        next = next_next;
+                    }
+                    let tailed = apply_static_tail::<S>(next, tail, trackable)?;
+                    return path_result(tailed, deferred_error);
                 }
             }
         }
