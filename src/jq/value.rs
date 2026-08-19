@@ -638,13 +638,15 @@ fn format_overflow_literal_mantissa(s: &str, exp_pos: usize, negative: bool) -> 
     // (400 nines vastly exceeds `f64::MAX`), yet real jq still renders it
     // as a plain 400-digit integer, not scientific notation, because all
     // 400 significant digits were given (`shifted_exp` 399 `<` `digit_count`
-    // 400) -- oracle-verified, code review on #1253.
-    if new_exp > 0 {
-        if let Some(plain) =
-            format_positive_shifted_plain(sign, &mantissa_str, new_exp, digit_count)
-        {
-            return plain;
-        }
+    // 400) -- oracle-verified, code review on #1253. No `new_exp > 0` guard
+    // needed here (unlike `format_number_jq_compat`'s own call site, which
+    // also sees small/negative shifted exponents): overflow requires
+    // `|value| > f64::MAX` (~1.8e308), so `new_exp` is always well past
+    // `300` by the time this function is ever reached -- `format_positive_shifted_plain`'s
+    // own `debug_assert!` on a positive shift is what would catch a
+    // violation of that invariant, not a redundant check here.
+    if let Some(plain) = format_positive_shifted_plain(sign, &mantissa_str, new_exp, digit_count) {
+        return plain;
     }
 
     assemble_scientific(sign, &mantissa_str, new_exp)
