@@ -259,16 +259,15 @@ pub fn format_number_jq_compat(raw: &[u8]) -> String {
         Err(_) => return s.to_string(),
     };
 
-    // Parse exponent to check for e0/e-0. `has_exp` above guarantees `e`/`E`
-    // is present, so the position is always found.
+    // `has_exp` above guarantees `e`/`E` is present, so the position is
+    // always found. The exponent digit string itself is parsed lazily, on
+    // demand, by whichever of the branches below actually needs it
+    // (`parse_literal_exponent`/`normalize_extreme_literal_mantissa`) --
+    // #1264 removed the one call site that used to parse it eagerly here
+    // just to fast-path an `exp == 0` literal, since that fast path had its
+    // own precision-loss bug and turned out to be exactly equivalent to
+    // (not a genuine shortcut ahead of) the shared string-based logic below.
     let exp_pos = s.find(['e', 'E']).expect("has_exp guarantees e/E present");
-    // `i64`, not `i32`: an exponent digit string beyond `i32` range (e.g.
-    // `1e-2147483649`) used to silently become 0 via `.unwrap_or(0)`,
-    // misrouting into the `exp == 0` "eliminate exponent" fast path below
-    // and reintroducing #1099's exact symptom one exponent-digit past this
-    // PR's own tested boundary (found in code review). `i64` comfortably
-    // covers any exponent that can appear here.
-    let exp: i64 = parse_literal_exponent(&s[exp_pos + 1..]);
 
     // A literal whose magnitude overflows f64 (e.g. `1e400`) parses to
     // +/-infinity, not a parse error - `value` above is non-finite in that
@@ -280,11 +279,6 @@ pub fn format_number_jq_compat(raw: &[u8]) -> String {
     // caller already guards non-finite `NumberLiteral`s before reaching this
     // function (see #930), so this exists purely to make the function
     // correct for a caller that stops doing that.
-    //
-    // `exp_pos` (not the already-parsed `exp: i32` above) is passed through:
-    // an overflowed literal's own exponent digit string can itself exceed
-    // `i32::MAX` (`exp`'s `unwrap_or(0)` would silently zero it), so the
-    // overflow path re-parses it independently, at wider precision.
     if !value.is_finite() {
         return format_overflow_literal_mantissa(s, exp_pos, value.is_sign_negative());
     }
@@ -307,24 +301,24 @@ pub fn format_number_jq_compat(raw: &[u8]) -> String {
         return format_near_zero_literal(s, exp_pos, value.is_sign_negative());
     }
 
-    // For e0 or e-0, jq eliminates the exponent
-    if exp == 0 {
-        // Check if result is integer
-        if value.fract() == 0.0 && value.abs() < 1e15 {
-            // `value as i64` truncates -0.0's sign (`-0.0 as i64 == 0`),
-            // dropping it from the formatted text too -- but `value == 0.0`
-            // above already returned for that case, so this is reachable
-            // only via a *nonzero* negative integer-valued literal here
-            // (`-5e0` -> `-5`), where `value as i64` is exact regardless.
-            return if value.is_sign_negative() {
-                format!("-{}", value.abs() as i64)
-            } else {
-                format!("{}", value as i64)
-            };
-        }
-        // Format as plain decimal
-        return format!("{value}");
-    }
+    // #1264: `exp == 0` (an explicit `e0`/`e-0`/`E0` spelling) used to have
+    // its own fast path here -- an exact `value as i64` cast for a small
+    // integer-valued literal, else `format!("{value}")` (plain `f64`
+    // `Display`) for everything else. That `Display` fallback silently lost
+    // precision beyond `f64`'s own round-trip guarantee (~17 significant
+    // digits) for a fractional or `>= 1e15` literal instead of preserving
+    // the literal's exact source digits the way every other case in this
+    // function does (`-824118596092576.85097746e0` -> `-...576.9`,
+    // `99999999999999999e0` -> `100000000000000000`, both wrong -- oracle-
+    // confirmed against jq 1.7.1). No special-casing needed at all: an
+    // `exp == 0` literal is just the `shifted_exp == 0` case of the
+    // string-based logic below (`normalize_extreme_literal_mantissa`'s
+    // `shift` is folded into `parsed_exp`, which is already `0` here), so
+    // removing this block entirely and falling straight through gives the
+    // identical, already-verified-correct answer for every case that used
+    // to take the `value as i64` fast path too -- confirmed via a broad
+    // randomized differential sweep against jq 1.7.1, not just the cases
+    // this comment names.
 
     // #1226: real jq's bare-integer/decimal-window choice for the *rest* of
     // this function (every nonzero, non-subnormal mantissa the `exp == 0`
@@ -2664,6 +2658,43 @@ mod tests {
         // `format_near_zero_literal` -- no existing test exercised that arm
         // through its real case rather than incidentally through `-0e0`.
         assert_eq!(format_number_jq_compat(b"-5e0"), "-5");
+    }
+
+    /// #1264: an `exp == 0` literal outside the small-integer fast path
+    /// above (a fractional mantissa, or an integer whose magnitude is `>=
+    /// 1e15`) used to fall back to `format!("{value}")` -- plain `f64`
+    /// `Display` -- silently losing precision beyond `f64`'s own
+    /// round-trip guarantee instead of preserving the literal's exact
+    /// source digits the way every other case in this function does.
+    /// Oracle-verified against jq 1.7.1.
+    #[test]
+    fn test_format_number_jq_compat_e0_fractional_and_large_integer_preserve_precision_1264() {
+        // Fractional mantissa: a trailing zero used to get silently dropped
+        // (f64 Display trims it).
+        assert_eq!(format_number_jq_compat(b"-807.77317590e0"), "-807.77317590");
+        // Fractional mantissa past f64's ~17-significant-digit round-trip
+        // guarantee: used to round to the nearest representable f64 instead
+        // of echoing the literal's own digits.
+        assert_eq!(
+            format_number_jq_compat(b"-824118596092576.85097746e0"),
+            "-824118596092576.85097746"
+        );
+        // Integer magnitude >= 1e15 (the small-integer fast path's own
+        // cutoff): used to fall to the same lossy f64 Display, rounding to
+        // the nearest representable value instead of the literal's exact
+        // digits.
+        assert_eq!(
+            format_number_jq_compat(b"99999999999999999e0"),
+            "99999999999999999"
+        );
+        assert_eq!(
+            format_number_jq_compat(b"12345678901234567e0"),
+            "12345678901234567"
+        );
+        // `e-0`/`E0`/`E-0` spellings all parse to the identical `exp == 0`,
+        // exercised through the same removed fast path.
+        assert_eq!(format_number_jq_compat(b"999.99e-0"), "999.99");
+        assert_eq!(format_number_jq_compat(b"1.5E0"), "1.5");
     }
 
     /// #1008 code review: this was pinned to `"0"`, but real jq keeps the
