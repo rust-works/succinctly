@@ -1118,6 +1118,36 @@ fn test_seq_tolerates_leading_zero_number_1243() -> Result<()> {
     Ok(())
 }
 
+/// #1267: swapping `--seq`'s per-record validation to the crate's own
+/// zero-allocation grammar validator (performance-motivated) also fixed a
+/// real correctness divergence discovered while verifying the swap's
+/// grammar equivalence against `serde_json`: a magnitude-overflowing float
+/// literal (`1e400`) real jq itself accepts on ordinary document input
+/// (`1E+400`, live-verified) used to silently drop as an "unparseable"
+/// record here instead, because the old `serde_json::Value`-based
+/// validator rejects anything that doesn't fit in a finite `f64`. The new
+/// validator is a pure grammar check with no such range rejection, so this
+/// now materializes correctly, matching real jq.
+#[test]
+fn test_seq_accepts_magnitude_overflowing_number_1267() -> Result<()> {
+    let (stdout, _, code) = run_jq_full(&["--seq", "-c", "."], Some("\x1e1e400\n"))?;
+    assert_eq!(code, 0, "stdout: {stdout:?}");
+    assert_eq!(stdout.trim_end(), "\x1e1E+400");
+    Ok(())
+}
+
+/// Control: a genuinely malformed record is still silently dropped after
+/// the validator swap -- the new validator isn't accidentally more lenient
+/// on syntax, only on numeric magnitude.
+#[test]
+fn test_seq_still_drops_genuinely_malformed_record_1267() -> Result<()> {
+    let (stdout, _, code) =
+        run_jq_full(&["--seq", "-c", "."], Some("\x1enot valid json\n\x1e5\n"))?;
+    assert_eq!(code, 0, "stdout: {stdout:?}");
+    assert_eq!(stdout.trim_end(), "\x1e5");
+    Ok(())
+}
+
 /// A hyphen-prefixed `--slurpfile`/`--rawfile` FILE value must reach this
 /// crate's own file-open logic, not get rejected by clap as an unknown
 /// flag first (#1150, same `allow_hyphen_values` fix as `--arg`/

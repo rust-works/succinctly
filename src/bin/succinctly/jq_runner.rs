@@ -1872,10 +1872,38 @@ fn parse_json_stream_strict(s: &str) -> Result<Vec<OwnedValue>> {
 ///
 /// Preserves number-literal source fidelity the same way `parse_json_value`
 /// does for `--argjson` (#1058, extended here to `--seq`, #1093): each
-/// segment is already isolated by the RS split, so
-/// `validate_and_materialize_json` can validate and materialize the same
-/// segment text directly -- no boundary-tracking needed, unlike
-/// `parse_json_stream` above.
+/// segment is already isolated by the RS split, so a validate-then-
+/// materialize step can validate and materialize the same segment text
+/// directly -- no boundary-tracking needed, unlike `parse_json_stream`
+/// above.
+///
+/// Validates via the crate's own zero-allocation RFC 8259 grammar
+/// validator (`json::validate::validate`, already used by `--validate`/
+/// `json validate`) rather than `validate_and_materialize_json`'s
+/// `serde_json::Value`-tree-based check (#1267) -- `--seq` is a streaming,
+/// record-oriented format, so a discarded parse tree's allocation cost is
+/// paid once per record rather than a bounded number of times per run the
+/// way `--argjson`/`--jsonargs` pay it. Measured (500k-record stream,
+/// interleaved A/B, 5 reps -- real jq's own baseline is ~0.47s either way):
+/// a real but modest ~10-20% improvement (median ~1.30s -> ~1.15s), not the
+/// dramatic win a first, non-interleaved measurement suggested (1.38s ->
+/// 1.56s, i.e. apparently *worse* -- sequential-halves noise, the exact
+/// trap this repo's own benchmarking guide warns about). The remaining gap
+/// to real jq is dominated by something else entirely, out of this issue's
+/// own scope.
+///
+/// This also fixes a real, jq-observable divergence, not just a speed one:
+/// `json::validate::validate` is a pure grammar check with no `f64`-range
+/// rejection, unlike `serde_json::Value` -- so a magnitude-overflowing
+/// literal (`1e400`) that used to silently drop as an "unparseable" record
+/// now materializes correctly (`1E+400`, matching real jq's own primary-
+/// document-input behavior, live-verified) instead. `validate_json_str`
+/// (used by `--argjson` and this function's own leading-zero retry below)
+/// keeps its `serde_json::Value`-based magnitude rejection unchanged --
+/// this fix is scoped to `parse_json_seq`'s own hot path only; see #1267's
+/// own text for why extending it to the shared `--argjson` helper too
+/// isn't attempted here (that path's error-message text is user-visible
+/// and untouched by this issue).
 ///
 /// Also retries a failed segment with its leading zeros stripped before
 /// giving up on it, mirroring `parse_json_value`'s own `--argjson` retry
@@ -1896,8 +1924,8 @@ fn parse_json_seq(s: &str) -> Vec<OwnedValue> {
         }
 
         // Try to parse as JSON, silently ignore failures
-        if let Ok(v) = validate_and_materialize_json(segment) {
-            values.push(v);
+        if validate::validate(segment.as_bytes()).is_ok() {
+            values.push(crate::output::json_bytes_to_owned_value(segment.as_bytes()));
         } else {
             let normalized = normalize_leading_zero_numbers(segment);
             if normalized != segment && validate_json_str(&normalized).is_ok() {
@@ -3179,6 +3207,19 @@ mod tests {
         let values = parse_json_seq("\x1E{invalid\n\x1E5\n");
         assert_eq!(values.len(), 1);
         assert_eq!(values[0].to_json(), "5");
+    }
+
+    /// #1267: the crate's own zero-allocation grammar validator has no
+    /// `f64`-range rejection, unlike `serde_json::Value` -- so swapping to
+    /// it for `--seq`'s per-record validation also fixed a real divergence
+    /// from real jq, not just a speed one. `1e400` no longer silently
+    /// drops as "unparseable"; it materializes with the same spelling
+    /// primary document input already produces for it.
+    #[test]
+    fn test_parse_json_seq_accepts_magnitude_overflowing_number_1267() {
+        let values = parse_json_seq("\x1E1e400\n");
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0].to_json(), "1E+400");
     }
 
     /// #1192: `standard_json_to_jq_value` now surfaces a genuinely
