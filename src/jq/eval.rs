@@ -1246,6 +1246,73 @@ fn borrowed_vec_to_result<W>(vs: Vec<StandardJson<'_, W>>) -> QueryResult<'_, W>
     )
 }
 
+/// Finish a builtin whose own computation succeeded with `value`, given the
+/// optional trailing [`Control`] [`result_to_owned_ctrl`] returned alongside
+/// the argument value that computation used (#1164). `None` is the ordinary
+/// case (`QueryResult::Owned(value)`); `Some(control)` means the argument
+/// generator produced that value and *then* broke/errored, which real jq
+/// still lets this builtin finish and use before unwinding -- see
+/// `result_to_owned_ctrl`'s own doc comment for the live-verified semantics
+/// this preserves.
+fn finish_owned<'a, W>(value: OwnedValue, trailing: Option<Control>) -> QueryResult<'a, W> {
+    match trailing {
+        None => QueryResult::Owned(value),
+        Some(control) => partial(vec![value], control),
+    }
+}
+
+/// Like [`finish_owned`], but for a builtin that delegates its own
+/// post-argument computation to another function returning a full
+/// `QueryResult<'a, W>` directly (e.g. `nth(n)` delegating to `index_one`,
+/// `flatten(depth)` delegating to `builtin_flatten`) instead of a single
+/// already-`OwnedValue` (#1164). `None` passes `result` through completely
+/// unchanged, preserving any zero-copy/cursor fast path it took; `Some`
+/// only forces materializing it, to splice the trailing control on.
+///
+/// If `result` itself escapes (its own `Error`/`Break`/`Halt`, not the
+/// argument's), that escape wins outright and `trailing` is discarded --
+/// same "the computation that actually ran and escaped supersedes an
+/// earlier, never-revisited argument escape" rule `result_to_owned_ctrl`'s
+/// own doc comment describes and `has()`/`contains()`'s error paths above
+/// already follow. `result` becoming its own `Partial` here is not
+/// currently reachable by any caller of this function (each delegates to a
+/// function with no generator-argument evaluation of its own), so that
+/// combination -- two independent trailing escapes -- is left for whichever
+/// caller first needs it to actually decide, rather than guessed at here.
+fn finish_result<W: Clone + AsRef<[u64]>>(
+    result: QueryResult<'_, W>,
+    trailing: Option<Control>,
+) -> QueryResult<'_, W> {
+    let Some(control) = trailing else {
+        return result;
+    };
+    match result.materialize_cursor() {
+        QueryResult::One(v) => partial(vec![to_owned(&v)], control),
+        QueryResult::OneCursor(_) => unreachable!("materialize_cursor removes OneCursor"),
+        QueryResult::Owned(v) => partial(vec![v], control),
+        QueryResult::Many(vs) => partial(vs.iter().map(to_owned).collect(), control),
+        QueryResult::ManyOwned(vs) => partial(vs, control),
+        // No output from `result` itself (e.g. an `optional` filter matched
+        // nothing) -- nothing to splice the trailing control onto but the
+        // control itself, same as an empty `partial()` prefix.
+        QueryResult::None => match control {
+            Control::Error(e) => QueryResult::Error(e),
+            Control::Break(label) => QueryResult::Break(label),
+            Control::Halt(code) => QueryResult::Halt(code),
+        },
+        already_escaped
+        @ (QueryResult::Error(_) | QueryResult::Break(_) | QueryResult::Halt(_)) => already_escaped,
+        QueryResult::Partial(vs, inner_control) => {
+            debug_assert!(
+                false,
+                "finish_result: delegated computation itself produced a Partial -- \
+                 no current caller can reach this; needs its own semantics decision (#1164)"
+            );
+            partial(vs, inner_control)
+        }
+    }
+}
+
 /// Normalize a prefix and its terminator into a `QueryResult` (#400, #494).
 ///
 /// An empty prefix collapses to the bare `Error`/`Break`/`Halt` variant, so
@@ -1360,47 +1427,66 @@ fn prepend<W: Clone + AsRef<[u64]>>(
 }
 
 /// Convert a QueryResult to an OwnedValue for use in computations.
+///
+/// Drops a `Partial`'s trailing `Break`/`Error` (see [`result_to_owned_ctrl`]
+/// for why, and for the variant that exposes it) -- callers that can re-wrap
+/// their own final result via [`partial`] when that trailing control exists
+/// should use `result_to_owned_ctrl` instead (#1164).
 fn result_to_owned<W: Clone + AsRef<[u64]>>(
     result: QueryResult<'_, W>,
 ) -> Result<OwnedValue, EvalEscape> {
+    result_to_owned_ctrl(result).map(|(v, _trailing)| v)
+}
+
+/// Like [`result_to_owned`], but also returns whether the result carried a
+/// trailing [`Control`] after its first value -- a `Partial`'s own
+/// `control`, which `result_to_owned` silently drops (#1164).
+///
+/// Real jq's own generator-argument semantics (`f(x)` desugars roughly to
+/// `x as $b | ...body using $b...`) use the *first* output of `x` to run
+/// the caller's own computation to completion -- including surfacing that
+/// computation's own, unrelated error if it has one (confirmed live:
+/// `has(("a", break $out))` on a non-iterable input reports `has`'s own
+/// "cannot check ... key" error, the trailing `break` is never even
+/// observed) -- and only *after* a successful computation does the escape
+/// from `x`'s second (never fully consumed) output actually fire. So a
+/// caller using this function should wrap its own **successful** final
+/// result via `partial(vec![result], trailing)` when `trailing` is
+/// `Some`, and leave any of its own error paths alone (#833's `ltrimstr(("a",
+/// break $out))` repro: `ltrimstr` computes and returns `"bcabc"`, *then*
+/// unwinds to `$out` -- `"after"` never prints).
+fn result_to_owned_ctrl<W: Clone + AsRef<[u64]>>(
+    result: QueryResult<'_, W>,
+) -> Result<(OwnedValue, Option<Control>), EvalEscape> {
     match result.materialize_cursor() {
-        QueryResult::One(v) => Ok(to_owned(&v)),
+        QueryResult::One(v) => Ok((to_owned(&v), None)),
         QueryResult::OneCursor(_) => unreachable!(),
-        QueryResult::Owned(v) => Ok(v),
+        QueryResult::Owned(v) => Ok((v, None)),
         QueryResult::Many(vs) => {
             if let Some(v) = vs.first() {
-                Ok(to_owned(v))
+                Ok((to_owned(v), None))
             } else {
                 Err(EvalError::new("empty result").into())
             }
         }
         QueryResult::ManyOwned(vs) => {
             if let Some(v) = vs.into_iter().next() {
-                Ok(v)
+                Ok((v, None))
             } else {
                 Err(EvalError::new("empty result").into())
             }
         }
-        // Same "take the first output, ignore the rest" policy already
-        // applied to `Many`/`ManyOwned` above — a `Partial` prefix is never
-        // empty (see `partial`), so there is always a first value to take.
+        // Same "take the first output" policy already applied to
+        // `Many`/`ManyOwned` above — a `Partial` prefix is never empty (see
+        // `partial`), so there is always a first value to take.
         //
         // A `Partial`'s trailing `Halt` still wins over the prefix, though:
         // an argument stream that produced values and *then* halted must
-        // halt, not quietly compute with the first value (#791).
+        // halt, not quietly compute with the first value (#791) -- unlike
+        // `Break`/`Error`, a `Halt` has no "run to completion first" jq
+        // semantics to preserve.
         QueryResult::Partial(_, Control::Halt(code)) => Err(EvalEscape::Halt(code)),
-        // A trailing `Break`/`Error` here is a separate, harder gap #833
-        // does NOT fix: real jq would still abort after this point (e.g.
-        // `ltrimstr(("a", break $out))` prints one result then unwinds to
-        // `$out`, never running whatever follows), but this function's
-        // whole contract is collapsing a generator argument to one scalar
-        // `Result` -- it cannot represent "here is a value, AND ALSO an
-        // escape for afterward" the way `QueryResult::Partial` itself can.
-        // Fixing this properly means making every caller `Partial`-aware
-        // (so it can emit its own transformed value *and* propagate the
-        // trailing escape), not something `result_to_owned` can do alone;
-        // tracked as #1164 rather than folded into this fix.
-        QueryResult::Partial(vs, _control) => Ok(vs.into_iter().next().unwrap()),
+        QueryResult::Partial(vs, control) => Ok((vs.into_iter().next().unwrap(), Some(control))),
         QueryResult::None => Err(EvalError::new("no value").into()),
         QueryResult::Error(e) => Err(e.into()),
         // A *bare* (no prior output) `break $label` escaping a builtin's
@@ -3416,12 +3502,12 @@ fn builtin_has<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 ) -> QueryResult<'a, W> {
     // Evaluate the key expression
     let key_result = eval_single::<W, S>(key_expr, value.clone(), optional);
-    let key_owned = match result_to_owned(key_result) {
+    let (key_owned, trailing) = match result_to_owned_ctrl(key_result) {
         Ok(v) => v,
         Err(e) => return e.into(),
     };
 
-    match (&value, &key_owned) {
+    let result = match (&value, &key_owned) {
         // jq: null | has("key") => false
         (StandardJson::Null, _) => QueryResult::Owned(OwnedValue::Bool(false)),
         // Object has string key
@@ -3490,7 +3576,8 @@ fn builtin_has<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             type_name(&value),
             key_owned.type_name(),
         )),
-    }
+    };
+    finish_result(result, trailing)
 }
 
 /// Builtin: in(xs)
@@ -4340,29 +4427,29 @@ fn builtin_ltrimstr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 ) -> QueryResult<'a, W> {
     // Get the prefix string
     let prefix_result = eval_single::<W, S>(prefix_expr, value.clone(), optional);
-    let prefix = match result_to_owned(prefix_result) {
-        Ok(OwnedValue::String(s)) => s,
+    let (prefix, trailing) = match result_to_owned_ctrl(prefix_result) {
+        Ok((OwnedValue::String(s), trailing)) => (s, trailing),
         // jq's ltrimstr is total: a non-string argument leaves input unchanged.
-        Ok(_) => return QueryResult::Owned(to_owned(&value)),
+        Ok((_, trailing)) => return finish_owned(to_owned(&value), trailing),
         Err(e) => return e.into(),
     };
 
-    match &value {
+    let result = match &value {
         StandardJson::String(s) => {
             if let Ok(cow) = s.as_str() {
-                let result = if cow.starts_with(&prefix) {
-                    cow[prefix.len()..].to_string()
+                if cow.starts_with(&prefix) {
+                    OwnedValue::String(cow[prefix.len()..].to_string())
                 } else {
-                    cow.into_owned()
-                };
-                QueryResult::Owned(OwnedValue::String(result))
+                    OwnedValue::String(cow.into_owned())
+                }
             } else {
-                QueryResult::Owned(OwnedValue::String(String::new()))
+                OwnedValue::String(String::new())
             }
         }
         // jq's ltrimstr is total: a non-string input passes through unchanged.
-        _ => QueryResult::Owned(to_owned(&value)),
-    }
+        _ => to_owned(&value),
+    };
+    finish_owned(result, trailing)
 }
 
 /// Builtin: rtrimstr(s) - remove suffix s
@@ -4373,29 +4460,29 @@ fn builtin_rtrimstr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 ) -> QueryResult<'a, W> {
     // Get the suffix string
     let suffix_result = eval_single::<W, S>(suffix_expr, value.clone(), optional);
-    let suffix = match result_to_owned(suffix_result) {
-        Ok(OwnedValue::String(s)) => s,
+    let (suffix, trailing) = match result_to_owned_ctrl(suffix_result) {
+        Ok((OwnedValue::String(s), trailing)) => (s, trailing),
         // jq's rtrimstr is total: a non-string argument leaves input unchanged.
-        Ok(_) => return QueryResult::Owned(to_owned(&value)),
+        Ok((_, trailing)) => return finish_owned(to_owned(&value), trailing),
         Err(e) => return e.into(),
     };
 
-    match &value {
+    let result = match &value {
         StandardJson::String(s) => {
             if let Ok(cow) = s.as_str() {
-                let result = if cow.ends_with(&suffix) {
-                    cow[..cow.len() - suffix.len()].to_string()
+                if cow.ends_with(&suffix) {
+                    OwnedValue::String(cow[..cow.len() - suffix.len()].to_string())
                 } else {
-                    cow.into_owned()
-                };
-                QueryResult::Owned(OwnedValue::String(result))
+                    OwnedValue::String(cow.into_owned())
+                }
             } else {
-                QueryResult::Owned(OwnedValue::String(String::new()))
+                OwnedValue::String(String::new())
             }
         }
         // jq's rtrimstr is total: a non-string input passes through unchanged.
-        _ => QueryResult::Owned(to_owned(&value)),
-    }
+        _ => to_owned(&value),
+    };
+    finish_owned(result, trailing)
 }
 
 /// Builtin: startswith(s) - check if string starts with s
@@ -4406,8 +4493,8 @@ fn builtin_startswith<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 ) -> QueryResult<'a, W> {
     // Get the prefix string
     let prefix_result = eval_single::<W, S>(prefix_expr, value.clone(), optional);
-    let prefix = match result_to_owned(prefix_result) {
-        Ok(OwnedValue::String(s)) => s,
+    let (prefix, trailing) = match result_to_owned_ctrl(prefix_result) {
+        Ok((OwnedValue::String(s), trailing)) => (s, trailing),
         Ok(_) => return QueryResult::Error(EvalError::new("startswith() requires string inputs")),
         Err(e) => return e.into(),
     };
@@ -4415,9 +4502,9 @@ fn builtin_startswith<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     match &value {
         StandardJson::String(s) => {
             if let Ok(cow) = s.as_str() {
-                QueryResult::Owned(OwnedValue::Bool(cow.starts_with(&prefix)))
+                finish_owned(OwnedValue::Bool(cow.starts_with(&prefix)), trailing)
             } else {
-                QueryResult::Owned(OwnedValue::Bool(false))
+                finish_owned(OwnedValue::Bool(false), trailing)
             }
         }
         _ if optional => QueryResult::None,
@@ -4433,8 +4520,8 @@ fn builtin_endswith<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 ) -> QueryResult<'a, W> {
     // Get the suffix string
     let suffix_result = eval_single::<W, S>(suffix_expr, value.clone(), optional);
-    let suffix = match result_to_owned(suffix_result) {
-        Ok(OwnedValue::String(s)) => s,
+    let (suffix, trailing) = match result_to_owned_ctrl(suffix_result) {
+        Ok((OwnedValue::String(s), trailing)) => (s, trailing),
         Ok(_) => return QueryResult::Error(EvalError::new("endswith() requires string inputs")),
         Err(e) => return e.into(),
     };
@@ -4442,9 +4529,9 @@ fn builtin_endswith<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     match &value {
         StandardJson::String(s) => {
             if let Ok(cow) = s.as_str() {
-                QueryResult::Owned(OwnedValue::Bool(cow.ends_with(&suffix)))
+                finish_owned(OwnedValue::Bool(cow.ends_with(&suffix)), trailing)
             } else {
-                QueryResult::Owned(OwnedValue::Bool(false))
+                finish_owned(OwnedValue::Bool(false), trailing)
             }
         }
         _ if optional => QueryResult::None,
@@ -4460,8 +4547,8 @@ fn builtin_split<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 ) -> QueryResult<'a, W> {
     // Get the separator string
     let sep_result = eval_single::<W, S>(sep_expr, value.clone(), optional);
-    let sep = match result_to_owned(sep_result) {
-        Ok(OwnedValue::String(s)) => s,
+    let (sep, trailing) = match result_to_owned_ctrl(sep_result) {
+        Ok((OwnedValue::String(s), trailing)) => (s, trailing),
         Ok(_) => {
             return QueryResult::Error(EvalError::new("split input and separator must be strings"))
         }
@@ -4482,9 +4569,9 @@ fn builtin_split<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                         .map(|p| OwnedValue::String(p.to_string()))
                         .collect()
                 };
-                QueryResult::Owned(OwnedValue::Array(parts))
+                finish_owned(OwnedValue::Array(parts), trailing)
             } else {
-                QueryResult::Owned(OwnedValue::Array(vec![]))
+                finish_owned(OwnedValue::Array(vec![]), trailing)
             }
         }
         _ if optional => QueryResult::None,
@@ -4714,7 +4801,7 @@ fn builtin_join<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     optional: bool,
 ) -> QueryResult<'a, W> {
     let sep_result = eval_single::<W, S>(sep_expr, value.clone(), optional);
-    let sep = match result_to_owned(sep_result) {
+    let (sep, trailing) = match result_to_owned_ctrl(sep_result) {
         Ok(v) => v,
         Err(e) => return e.into(),
     };
@@ -4742,7 +4829,7 @@ fn builtin_join<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                         _ => yq_join_element_part(to_owned_key_shape(&e)),
                     })
                     .collect();
-                QueryResult::Owned(OwnedValue::String(parts.join(&sep_str)))
+                finish_owned(OwnedValue::String(parts.join(&sep_str)), trailing)
             }
             other => QueryResult::Error(EvalError::new(format!(
                 "cannot join with {}, can only join arrays of scalars",
@@ -4774,7 +4861,7 @@ fn builtin_join<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     };
 
     match result {
-        Ok(acc) => QueryResult::Owned(acc.unwrap_or(OwnedValue::String(String::new()))),
+        Ok(acc) => finish_owned(acc.unwrap_or(OwnedValue::String(String::new())), trailing),
         Err(e) => QueryResult::Error(e),
     }
 }
@@ -4787,7 +4874,7 @@ fn builtin_contains<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 ) -> QueryResult<'a, W> {
     // Get the value to check
     let b_result = eval_single::<W, S>(b_expr, value.clone(), optional);
-    let b = match result_to_owned(b_result) {
+    let (b, trailing) = match result_to_owned_ctrl(b_result) {
         Ok(v) => v,
         Err(e) => return e.into(),
     };
@@ -4799,7 +4886,7 @@ fn builtin_contains<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         }
         return QueryResult::Error(EvalError::containment_check(&input, &b));
     }
-    QueryResult::Owned(OwnedValue::Bool(owned_contains::<S>(&input, &b)))
+    finish_owned(OwnedValue::Bool(owned_contains::<S>(&input, &b)), trailing)
 }
 
 /// Check if `a` contains `b` (recursive containment check)
@@ -4849,7 +4936,7 @@ fn builtin_inside<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 ) -> QueryResult<'a, W> {
     // Get the container value
     let b_result = eval_single::<W, S>(b_expr, value.clone(), optional);
-    let b = match result_to_owned(b_result) {
+    let (b, trailing) = match result_to_owned_ctrl(b_result) {
         Ok(v) => v,
         Err(e) => return e.into(),
     };
@@ -4862,7 +4949,7 @@ fn builtin_inside<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         }
         return QueryResult::Error(EvalError::containment_check(&b, &input));
     }
-    QueryResult::Owned(OwnedValue::Bool(owned_contains::<S>(&b, &input)))
+    finish_owned(OwnedValue::Bool(owned_contains::<S>(&b, &input)), trailing)
 }
 
 // =============================================================================
@@ -4932,11 +5019,11 @@ fn builtin_nth<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // itself, so delegating to it gets all of this -- including its own
     // lazy array fast path -- for free instead of re-deriving it here.
     let n_result = eval_single::<W, S>(n_expr, value.clone(), optional);
-    let n = match result_to_owned(n_result) {
+    let (n, trailing) = match result_to_owned_ctrl(n_result) {
         Ok(v) => v,
         Err(e) => return e.into(),
     };
-    index_one::<W>(value, &n, optional)
+    finish_result(index_one::<W>(value, &n, optional), trailing)
 }
 
 /// Builtin: reverse - reverse array
@@ -5036,18 +5123,20 @@ fn builtin_flatten_depth<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 ) -> QueryResult<'a, W> {
     // Get the depth
     let depth_result = eval_single::<W, S>(depth_expr, value.clone(), optional);
-    let depth = match result_to_owned(depth_result) {
-        Ok(OwnedValue::Int(d) | OwnedValue::NumberLiteral(NumberRepr::Int(d), _)) if d >= 0 => {
-            d as usize
+    let (depth, trailing) = match result_to_owned_ctrl(depth_result) {
+        Ok((OwnedValue::Int(d) | OwnedValue::NumberLiteral(NumberRepr::Int(d), _), trailing))
+            if d >= 0 =>
+        {
+            (d as usize, trailing)
         }
-        Ok(OwnedValue::Int(_) | OwnedValue::NumberLiteral(NumberRepr::Int(_), _)) => {
+        Ok((OwnedValue::Int(_) | OwnedValue::NumberLiteral(NumberRepr::Int(_), _), _)) => {
             return QueryResult::Error(EvalError::new("depth must be non-negative"));
         }
         Ok(_) => return QueryResult::Error(EvalError::type_error("number", "non-number")),
         Err(e) => return e.into(),
     };
 
-    builtin_flatten::<W>(value, optional, depth)
+    finish_result(builtin_flatten::<W>(value, optional, depth), trailing)
 }
 
 /// Builtin: group_by(f) - group by key function
@@ -7875,12 +7964,13 @@ fn builtin_getpath<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     optional: bool,
 ) -> QueryResult<'a, W> {
     // Evaluate the path expression
-    let path = match result_to_owned(eval_single::<W, S>(path_expr, value.clone(), optional)) {
-        Ok(OwnedValue::Array(arr)) => arr,
-        Ok(_) if optional => return QueryResult::None,
-        Ok(_) => return QueryResult::Error(EvalError::path_must_be_array()),
-        Err(e) => return e.into(),
-    };
+    let (path, trailing) =
+        match result_to_owned_ctrl(eval_single::<W, S>(path_expr, value.clone(), optional)) {
+            Ok((OwnedValue::Array(arr), trailing)) => (arr, trailing),
+            Ok(_) if optional => return QueryResult::None,
+            Ok(_) => return QueryResult::Error(EvalError::path_must_be_array()),
+            Err(e) => return e.into(),
+        };
 
     let mut current = to_owned(&value);
 
@@ -7888,7 +7978,7 @@ fn builtin_getpath<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         match (&current, &segment) {
             // jq: null | getpath(["a"]) => null
             (OwnedValue::Null, _) => {
-                return QueryResult::Owned(OwnedValue::Null);
+                return finish_owned(OwnedValue::Null, trailing);
             }
             (OwnedValue::Object(obj), OwnedValue::String(key)) => {
                 current = obj.get(key).cloned().unwrap_or(OwnedValue::Null);
@@ -7927,7 +8017,7 @@ fn builtin_getpath<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         }
     }
 
-    QueryResult::Owned(current)
+    finish_owned(current, trailing)
 }
 
 // =============================================================================
@@ -15451,9 +15541,24 @@ fn eval_owned_expr_ctrl<S: EvalSemantics>(
     input: &OwnedValue,
     optional: bool,
 ) -> Result<OwnedValue, Control> {
+    eval_owned_expr_ctrl_full::<S>(expr, input, optional).map(|(v, _trailing)| v)
+}
+
+/// Like [`eval_owned_expr_ctrl`], but also returns whether the result
+/// carried a trailing [`Control`] after its first/only value -- a
+/// `QueryResult::Partial`'s own control, which the plain version silently
+/// drops (#1164). See [`result_to_owned_ctrl`]'s doc comment for the
+/// live-verified jq semantics this preserves for a caller that can re-wrap
+/// its own successful final result via [`partial`]/[`finish_owned`]/
+/// [`finish_result`] when this is `Some`.
+fn eval_owned_expr_ctrl_full<S: EvalSemantics>(
+    expr: &Expr,
+    input: &OwnedValue,
+    optional: bool,
+) -> Result<(OwnedValue, Option<Control>), Control> {
     if let Some(result) = eval_owned_fast_path::<S>(expr, input, optional) {
         return result
-            .map(|v| v.unwrap_or(OwnedValue::Null))
+            .map(|v| (v.unwrap_or(OwnedValue::Null), None))
             .map_err(Control::Error);
     }
 
@@ -15473,24 +15578,24 @@ fn eval_owned_expr_ctrl<S: EvalSemantics>(
     let cursor = index.root(json_bytes);
 
     match eval_single::<Vec<u64>, S>(expr, cursor.value(), optional).materialize_cursor() {
-        QueryResult::One(v) => Ok(to_owned(&v)),
+        QueryResult::One(v) => Ok((to_owned(&v), None)),
         QueryResult::OneCursor(_) => unreachable!(),
-        QueryResult::Owned(v) => Ok(v),
+        QueryResult::Owned(v) => Ok((v, None)),
         QueryResult::Many(vs) => {
             if vs.len() == 1 {
-                Ok(to_owned(&vs[0]))
+                Ok((to_owned(&vs[0]), None))
             } else {
-                Ok(OwnedValue::Array(vs.iter().map(to_owned).collect()))
+                Ok((OwnedValue::Array(vs.iter().map(to_owned).collect()), None))
             }
         }
         QueryResult::ManyOwned(vs) => {
             if vs.len() == 1 {
-                Ok(vs.into_iter().next().unwrap())
+                Ok((vs.into_iter().next().unwrap(), None))
             } else {
-                Ok(OwnedValue::Array(vs))
+                Ok((OwnedValue::Array(vs), None))
             }
         }
-        QueryResult::None => Ok(OwnedValue::Null),
+        QueryResult::None => Ok((OwnedValue::Null, None)),
         QueryResult::Error(e) => Err(Control::Error(e)),
         QueryResult::Break(label) => Err(Control::Break(label)),
         QueryResult::Halt(code) => Err(Control::Halt(code)),
@@ -15502,17 +15607,15 @@ fn eval_owned_expr_ctrl<S: EvalSemantics>(
         // discarded (#791).
         QueryResult::Partial(_, Control::Halt(code)) => Err(Control::Halt(code)),
         // Same collapse-to-single-or-array policy as `Many`/`ManyOwned`
-        // above; the trailing `Error`/`Break` is dropped, consistent with how
-        // this function already doesn't fork over a multi-output update (a
-        // separate, pre-existing limitation, not #400/#494's concern) -- and,
-        // as of #833, still not this function's concern either: see
-        // `result_to_owned`'s identical arm for why a trailing escape after
-        // already-produced output needs its own, separate fix.
-        QueryResult::Partial(vs, _control) => {
+        // above; the trailing `Error`/`Break` is now exposed via the second
+        // tuple element instead of silently dropped (#1164) -- a caller
+        // using this function (rather than the plain `eval_owned_expr_ctrl`
+        // above) is expected to apply it to its own final result.
+        QueryResult::Partial(vs, control) => {
             if vs.len() == 1 {
-                Ok(vs.into_iter().next().unwrap())
+                Ok((vs.into_iter().next().unwrap(), Some(control)))
             } else {
-                Ok(OwnedValue::Array(vs))
+                Ok((OwnedValue::Array(vs), Some(control)))
             }
         }
     }
@@ -20443,12 +20546,13 @@ fn builtin_strftime<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     optional: bool,
 ) -> QueryResult<'a, W> {
     // First get the format string
-    let fmt = match result_to_owned(eval_single::<W, S>(fmt_expr, value.clone(), optional)) {
-        Ok(OwnedValue::String(s)) => s,
-        Ok(_) if optional => return QueryResult::None,
-        Ok(_) => return QueryResult::Error(EvalError::type_error("string", "strftime format")),
-        Err(e) => return e.into(),
-    };
+    let (fmt, trailing) =
+        match result_to_owned_ctrl(eval_single::<W, S>(fmt_expr, value.clone(), optional)) {
+            Ok((OwnedValue::String(s), trailing)) => (s, trailing),
+            Ok(_) if optional => return QueryResult::None,
+            Ok(_) => return QueryResult::Error(EvalError::type_error("string", "strftime format")),
+            Err(e) => return e.into(),
+        };
 
     // Value should be a broken-down time array, or a raw Unix timestamp
     // number (auto-converted the same way `gmtime` converts one).
@@ -20549,7 +20653,7 @@ fn builtin_strftime<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Err(_) if optional => return QueryResult::None,
         Err(e) => return QueryResult::Error(e),
     };
-    QueryResult::Owned(OwnedValue::String(result))
+    finish_owned(OwnedValue::String(result), trailing)
 }
 
 /// Format a time according to strftime format specifiers
@@ -20766,16 +20870,17 @@ fn builtin_strptime<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     optional: bool,
 ) -> QueryResult<'a, W> {
     // First get the format string
-    let fmt = match result_to_owned(eval_single::<W, S>(fmt_expr, value.clone(), optional)) {
-        Ok(OwnedValue::String(s)) => s,
-        Ok(_) if optional => return QueryResult::None,
-        // #929: confirmed live: `"2020" | strptime(1)` raises "strptime/1
-        // requires string inputs and arguments" in jq 1.7.1 -- the same
-        // wording jq's combined input+format check uses regardless of
-        // which side is the offender (see the other arm below).
-        Ok(_) => return QueryResult::Error(EvalError::strptime_requires_string()),
-        Err(e) => return e.into(),
-    };
+    let (fmt, trailing) =
+        match result_to_owned_ctrl(eval_single::<W, S>(fmt_expr, value.clone(), optional)) {
+            Ok((OwnedValue::String(s), trailing)) => (s, trailing),
+            Ok(_) if optional => return QueryResult::None,
+            // #929: confirmed live: `"2020" | strptime(1)` raises "strptime/1
+            // requires string inputs and arguments" in jq 1.7.1 -- the same
+            // wording jq's combined input+format check uses regardless of
+            // which side is the offender (see the other arm below).
+            Ok(_) => return QueryResult::Error(EvalError::strptime_requires_string()),
+            Err(e) => return e.into(),
+        };
 
     // Value should be a string
     let input = match &value {
@@ -20802,7 +20907,7 @@ fn builtin_strptime<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 OwnedValue::Int(t.weekday),
                 OwnedValue::Int(t.yearday),
             ];
-            QueryResult::Owned(OwnedValue::Array(result))
+            finish_owned(OwnedValue::Array(result), trailing)
         }
         Err(_) if optional => QueryResult::None,
         Err(_) => QueryResult::Error(EvalError::strptime_no_match(&input, &fmt)),
@@ -21637,12 +21742,15 @@ fn builtin_tz<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     };
 
     // Evaluate the timezone expression to get the zone name
-    let zone_str = match result_to_owned(eval_single::<W, S>(zone_expr, value.clone(), optional)) {
-        Ok(OwnedValue::String(s)) => s,
-        Ok(_) if optional => return QueryResult::None,
-        Ok(_) => return QueryResult::Error(EvalError::type_error("string", "tz zone argument")),
-        Err(e) => return e.into(),
-    };
+    let (zone_str, trailing) =
+        match result_to_owned_ctrl(eval_single::<W, S>(zone_expr, value.clone(), optional)) {
+            Ok((OwnedValue::String(s), trailing)) => (s, trailing),
+            Ok(_) if optional => return QueryResult::None,
+            Ok(_) => {
+                return QueryResult::Error(EvalError::type_error("string", "tz zone argument"))
+            }
+            Err(e) => return e.into(),
+        };
 
     // Get the timezone offset
     let offset = match get_timezone_offset(&zone_str, timestamp) {
@@ -21657,7 +21765,7 @@ fn builtin_tz<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             Ok(s) => s,
             Err(r) => return r,
         };
-    QueryResult::Owned(OwnedValue::String(result))
+    finish_owned(OwnedValue::String(result), trailing)
 }
 
 // Phase 22: File operations (yq)
@@ -21673,12 +21781,13 @@ fn builtin_load<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     use std::path::Path;
 
     // Evaluate the file expression to get the filename
-    let filename = match result_to_owned(eval_single::<W, S>(file_expr, value, optional)) {
-        Ok(OwnedValue::String(s)) => s,
-        Ok(_) if optional => return QueryResult::None,
-        Ok(_) => return QueryResult::Error(EvalError::type_error("string", "load filename")),
-        Err(e) => return e.into(),
-    };
+    let (filename, trailing) =
+        match result_to_owned_ctrl(eval_single::<W, S>(file_expr, value, optional)) {
+            Ok((OwnedValue::String(s), trailing)) => (s, trailing),
+            Ok(_) if optional => return QueryResult::None,
+            Ok(_) => return QueryResult::Error(EvalError::type_error("string", "load filename")),
+            Err(e) => return e.into(),
+        };
 
     // Read the file contents
     let file_bytes = match std::fs::read(&filename) {
@@ -21701,7 +21810,7 @@ fn builtin_load<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         .and_then(|e| e.to_str())
         .is_some_and(|ext| ext.eq_ignore_ascii_case("json"));
 
-    if is_json {
+    let result = if is_json {
         // Parse as JSON
         let index = crate::json::JsonIndex::build(&file_bytes);
         let cursor = index.root(&file_bytes);
@@ -21737,7 +21846,8 @@ fn builtin_load<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 "load: failed to parse YAML file '{filename}': {e}"
             ))),
         }
-    }
+    };
+    finish_result(result, trailing)
 }
 
 /// Convert a YAML value to OwnedValue (helper for `load`).
@@ -23360,9 +23470,9 @@ fn builtin_envvar<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 ) -> QueryResult<'a, W> {
     // Evaluate the expression to get the variable name
     let owned_value = to_owned(&value);
-    let var_result = eval_owned_expr::<S>(var, &owned_value, optional);
-    let var_name = match var_result {
-        Ok(OwnedValue::String(s)) => s,
+    let var_result = eval_owned_expr_ctrl_full::<S>(var, &owned_value, optional);
+    let (var_name, trailing) = match var_result {
+        Ok((OwnedValue::String(s), trailing)) => (s, trailing),
         // Checked ahead of the generic fallback below (which would
         // otherwise flatten either into a misleading "must be a string"
         // message and, when `optional`, silently swallow it): a halt must
@@ -23372,16 +23482,21 @@ fn builtin_envvar<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // (matching this file's own precedent, e.g. `QueryResult::is_error`
         // and `builtin_isvalid`'s `Halt`/`Break` arms) rather than two,
         // since both escapes get identical treatment here.
-        Err(escape @ (EvalEscape::Halt(_) | EvalEscape::Break(_))) => return escape.into(),
+        Err(control @ (Control::Halt(_) | Control::Break(_))) => {
+            return partial(Vec::new(), control)
+        }
         _ if optional => return QueryResult::None,
         _ => return QueryResult::Error(EvalError::new("env variable name must be a string")),
     };
 
-    match std::env::var(&var_name) {
-        Ok(val) => QueryResult::Owned(OwnedValue::String(val)),
-        Err(_) if optional => QueryResult::None,
-        Err(_) => QueryResult::Owned(OwnedValue::Null),
-    }
+    finish_result(
+        match std::env::var(&var_name) {
+            Ok(val) => QueryResult::Owned(OwnedValue::String(val)),
+            Err(_) if optional => QueryResult::None,
+            Err(_) => QueryResult::Owned(OwnedValue::Null),
+        },
+        trailing,
+    )
 }
 
 #[cfg(not(feature = "std"))]
@@ -43703,6 +43818,32 @@ mod tests {
         // downgraded to `None` the way an ordinary type error would be.
         match builtin_envvar::<Vec<u64>, JqSemantics>(&var, StandardJson::Null, true) {
             QueryResult::Break(label) => assert_eq!(label, "out"),
+            other => panic!("unexpected result: {other:?}"),
+        }
+    }
+
+    /// #1164: a variable-name generator that produces a name and *then*
+    /// breaks -- e.g. `("PATH", break $out)` -- must still look that name
+    /// up and use it (matching every other #1164 fix's "compute
+    /// successfully with the first value, then propagate the escape"
+    /// semantics, live-verified against real jq for the CLI-reachable
+    /// builtins) rather than silently dropping the trailing `Break` the
+    /// way `builtin_envvar` did before this fix. No CLI-level equivalent
+    /// exists (`Builtin::EnvVar` has no parser construction site, per the
+    /// tests above), so this is exercised directly like they are.
+    /// `PATH` is used only because it is virtually guaranteed to be set in
+    /// any process running this test suite -- its actual value is
+    /// irrelevant, only that a real lookup happened before the escape did.
+    #[cfg(feature = "std")]
+    #[test]
+    fn builtin_envvar_propagates_trailing_break_after_successful_lookup_1164() {
+        let var = parse(r#"("PATH", break $out)"#).unwrap();
+        match builtin_envvar::<Vec<u64>, JqSemantics>(&var, StandardJson::Null, false) {
+            QueryResult::Partial(vs, Control::Break(label)) => {
+                assert_eq!(label, "out");
+                assert_eq!(vs.len(), 1);
+                assert!(matches!(vs[0], OwnedValue::String(_)), "vs[0]={:?}", vs[0]);
+            }
             other => panic!("unexpected result: {other:?}"),
         }
     }

@@ -12780,3 +12780,285 @@ fn test_destructuring_pattern_null_propagates_through_nested_array_1239() -> Res
     assert_eq!(out.trim(), "null");
     Ok(())
 }
+
+// =============================================================================
+// #1164: a builtin argument generator that produces a value and *then*
+// breaks/errors no longer silently continues past that escape once the
+// builtin has finished using the value -- `result_to_owned`/
+// `eval_owned_expr_ctrl`'s own `Partial` arm used to drop the trailing
+// control entirely. All cases below live-verified against real jq (or, for
+// `tz` -- a succinctly-only extension with no jq equivalent -- checked for
+// internal consistency against the same builtin without the trailing
+// escape).
+//
+// The pattern throughout: `label $out | (builtin((v, break $out)), "after")`
+// -- real jq computes the builtin's result using `v`, produces it, and only
+// then unwinds to `$out`, so `"after"` never prints. Before this fix,
+// succinctly silently dropped the escape and printed both the builtin's
+// result *and* `"after"`.
+// =============================================================================
+
+#[test]
+fn test_ltrimstr_uses_first_arg_value_then_propagates_trailing_break_1164() -> Result<()> {
+    let (out, err, code) = run_jq_full(
+        &[
+            "-c",
+            r#"label $out | (ltrimstr(("a", break $out)), "after")"#,
+        ],
+        Some(r#""abcabc""#),
+    )?;
+    assert_eq!(code, 0, "err={err}");
+    assert_eq!(out.trim(), r#""bcabc""#);
+    Ok(())
+}
+
+#[test]
+fn test_rtrimstr_uses_first_arg_value_then_propagates_trailing_break_1164() -> Result<()> {
+    let (out, err, code) = run_jq_full(
+        &[
+            "-c",
+            r#"label $out | (rtrimstr(("c", break $out)), "after")"#,
+        ],
+        Some(r#""abcabc""#),
+    )?;
+    assert_eq!(code, 0, "err={err}");
+    assert_eq!(out.trim(), r#""abcab""#);
+    Ok(())
+}
+
+#[test]
+fn test_startswith_endswith_split_propagate_trailing_break_1164() -> Result<()> {
+    let (out, err, code) = run_jq_full(
+        &[
+            "-c",
+            r#"label $out | (startswith(("a", break $out)), "after")"#,
+        ],
+        Some(r#""abcabc""#),
+    )?;
+    assert_eq!(code, 0, "err={err}");
+    assert_eq!(out.trim(), "true");
+
+    let (out, err, code) = run_jq_full(
+        &[
+            "-c",
+            r#"label $out | (endswith(("c", break $out)), "after")"#,
+        ],
+        Some(r#""abcabc""#),
+    )?;
+    assert_eq!(code, 0, "err={err}");
+    assert_eq!(out.trim(), "true");
+
+    let (out, err, code) = run_jq_full(
+        &["-c", r#"label $out | (split((",", break $out)), "after")"#],
+        Some(r#""abcabc""#),
+    )?;
+    assert_eq!(code, 0, "err={err}");
+    assert_eq!(out.trim(), r#"["abcabc"]"#);
+    Ok(())
+}
+
+#[test]
+fn test_join_uses_first_separator_value_then_propagates_trailing_break_1164() -> Result<()> {
+    let (out, err, code) = run_jq_full(
+        &["-c", r#"label $out | (join((",", break $out)), "after")"#],
+        Some(r#"["a","b"]"#),
+    )?;
+    assert_eq!(code, 0, "err={err}");
+    assert_eq!(out.trim(), r#""a,b""#);
+    Ok(())
+}
+
+#[test]
+fn test_contains_inside_propagate_trailing_break_1164() -> Result<()> {
+    let (out, err, code) = run_jq_full(
+        &[
+            "-c",
+            r#"label $out | (contains(("a", break $out)), "after")"#,
+        ],
+        Some(r#""abc""#),
+    )?;
+    assert_eq!(code, 0, "err={err}");
+    assert_eq!(out.trim(), "true");
+
+    let (out, err, code) = run_jq_full(
+        &[
+            "-c",
+            r#"label $out | (inside(("abc", break $out)), "after")"#,
+        ],
+        Some(r#""a""#),
+    )?;
+    assert_eq!(code, 0, "err={err}");
+    assert_eq!(out.trim(), "true");
+    Ok(())
+}
+
+/// The issue's own repro for the deeper (not just bare-Break) case: real
+/// jq's own downstream error still wins over a trailing break the argument
+/// generator's second output would have raised -- `has`'s own type-mismatch
+/// error fires first, since the break's own generator output is never
+/// reached (control test, unaffected by this fix but confirming the "own
+/// error wins" rule this fix relies on).
+#[test]
+fn test_has_propagates_trailing_break_after_success_but_not_after_own_error_1164() -> Result<()> {
+    let (out, err, code) = run_jq_full(
+        &["-c", r#"label $out | (has(("a", break $out)), "after")"#],
+        Some(r#"{"a":1}"#),
+    )?;
+    assert_eq!(code, 0, "err={err}");
+    assert_eq!(out.trim(), "true");
+
+    let (_out, err, code) = run_jq_full(
+        &["-c", r#"label $out | (has(("a", break $out)), "after")"#],
+        Some("5"),
+    )?;
+    assert_ne!(code, 0);
+    assert!(err.contains("Cannot check"), "err={err}");
+    Ok(())
+}
+
+#[test]
+fn test_nth_uses_first_arg_value_then_propagates_trailing_break_1164() -> Result<()> {
+    let (out, err, code) = run_jq_full(
+        &["-c", r#"label $out | (nth((1, break $out)), "after")"#],
+        Some("[1,2,3]"),
+    )?;
+    assert_eq!(code, 0, "err={err}");
+    assert_eq!(out.trim(), "2");
+    Ok(())
+}
+
+#[test]
+fn test_flatten_depth_uses_first_arg_value_then_propagates_trailing_break_1164() -> Result<()> {
+    let (out, err, code) = run_jq_full(
+        &["-c", r#"label $out | (flatten((1, break $out)), "after")"#],
+        Some("[[1,[2]]]"),
+    )?;
+    assert_eq!(code, 0, "err={err}");
+    assert_eq!(out.trim(), "[1,[2]]");
+    Ok(())
+}
+
+#[test]
+fn test_getpath_uses_first_arg_value_then_propagates_trailing_break_1164() -> Result<()> {
+    let (out, err, code) = run_jq_full(
+        &[
+            "-c",
+            r#"label $out | (getpath((["a"], break $out)), "after")"#,
+        ],
+        Some(r#"{"a":1}"#),
+    )?;
+    assert_eq!(code, 0, "err={err}");
+    assert_eq!(out.trim(), "1");
+    Ok(())
+}
+
+#[test]
+fn test_strftime_strptime_propagate_trailing_break_1164() -> Result<()> {
+    let (out, err, code) = run_jq_full(
+        &[
+            "-c",
+            r#"label $out | (gmtime | strftime(("%Y", break $out)), "after")"#,
+        ],
+        Some("0"),
+    )?;
+    assert_eq!(code, 0, "err={err}");
+    assert_eq!(out.trim(), r#""1970""#);
+
+    let (out, err, code) = run_jq_full(
+        &[
+            "-c",
+            r#"label $out | (strptime(("%Y-%m-%d", break $out)), "after")"#,
+        ],
+        Some(r#""2020-01-01""#),
+    )?;
+    assert_eq!(code, 0, "err={err}");
+    assert_eq!(out.trim(), "[2020,0,1,0,0,0,3,0]");
+    Ok(())
+}
+
+/// `tz` is a succinctly-only extension (no real jq equivalent to verify
+/// against) -- checked instead for internal consistency: the same query
+/// without the trailing break prints `"after"` normally, confirming the
+/// break (not some unrelated bug) is what suppresses it below.
+#[test]
+fn test_tz_uses_first_arg_value_then_propagates_trailing_break_1164() -> Result<()> {
+    let (out, err, code) = run_jq_full(&["-cn", r#"label $out | (0 | tz("UTC")), "after""#], None)?;
+    assert_eq!(code, 0, "err={err}");
+    assert_eq!(out.trim(), "\"1970-01-01T00:00:00Z\"\n\"after\"");
+
+    let (out, err, code) = run_jq_full(
+        &[
+            "-cn",
+            r#"label $out | (0 | tz(("UTC", break $out))), "after""#,
+        ],
+        None,
+    )?;
+    assert_eq!(code, 0, "err={err}");
+    assert_eq!(out.trim(), "\"1970-01-01T00:00:00Z\"");
+    Ok(())
+}
+
+#[test]
+fn test_load_uses_first_arg_value_then_propagates_trailing_break_1164() -> Result<()> {
+    let mut file = NamedTempFile::new()?;
+    writeln!(file, r#"{{"x":1}}"#)?;
+    let path = file.path().to_str().unwrap();
+
+    let query = format!(r#"label $out | (load(("{path}", break $out))), "after""#);
+    let (out, err, code) = run_jq_full(&["-cn", &query], None)?;
+    assert_eq!(code, 0, "err={err}");
+    assert_eq!(out.trim(), r#"{"x":1}"#);
+    Ok(())
+}
+
+// `builtin_envvar`'s own fix (below) has no CLI-level test: `Builtin::EnvVar`
+// has no parser construction site anywhere in this codebase (confirmed by
+// that function's own pre-existing Halt/Break regression tests in
+// src/jq/eval.rs) -- `env.VAR`/`$ENV.VAR`/`$ENV["VAR"]` all resolve through
+// ordinary field/index access on a materialized object instead, never
+// through this function. Its #1164 fix is covered by a direct unit test in
+// src/jq/eval.rs instead, mirroring those same pre-existing tests' own
+// "exercise it directly, since the CLI can't reach it" convention.
+
+/// Control: `error(msg)`'s own "success" path already collapses into
+/// producing an error, matching what the trailing break would have done
+/// anyway -- deliberately left unfixed by #1164 (verified live: real jq's
+/// `try error(("a", break $out)) catch (.)` still prints `"after"` too, the
+/// break is never re-observed once the error is caught, so there is no
+/// separate escape to propagate here). Confirms this fix didn't
+/// accidentally change `error`'s own behavior.
+#[test]
+fn test_error_message_arg_break_semantics_unaffected_by_1164() -> Result<()> {
+    let (_out, err, code) =
+        run_jq_full(&["-cn", r#"label $out | error(("a", break $out))"#], None)?;
+    assert_ne!(code, 0);
+    assert!(err.contains('a'), "err={err}");
+    Ok(())
+}
+
+/// Control: `combinations(n)` uses `n` inside a nested `range(n)`
+/// generator (not as a simple scalar), so real jq's own escape semantics
+/// there are different from every other case above -- a trailing break in
+/// `n`'s own generator aborts the whole array-construction context real
+/// jq's `def combinations(n): ...` body uses internally, producing *no*
+/// output at all, not "the first n's worth of combinations, then stop".
+/// Deliberately left unfixed by #1164; this pins the current (pre-existing,
+/// still-divergent-from-jq) behavior so a future attempt doesn't assume
+/// the same simple wrap other builtins got would be correct here too.
+#[test]
+fn test_combinations_n_break_semantics_documented_not_fixed_by_1164() -> Result<()> {
+    let (out, err, code) = run_jq_full(
+        &[
+            "-c",
+            r#"label $out | (combinations((2, break $out)), "after")"#,
+        ],
+        Some("[1,2]"),
+    )?;
+    assert_eq!(code, 0, "err={err}");
+    // Pre-existing divergence from real jq (which produces no output at all
+    // here, verified live: `jq -c 'label $out | (combinations((2, break
+    // $out)), "after")'` on `[1,2]` prints nothing) -- not attempted by
+    // #1164, see this test's own doc comment.
+    assert_eq!(out.trim(), "[1,1]\n[1,2]\n[2,1]\n[2,2]\n\"after\"");
+    Ok(())
+}
