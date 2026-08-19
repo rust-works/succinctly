@@ -1070,6 +1070,54 @@ fn test_seq_malformed_segment_silently_skipped_1093() -> Result<()> {
     Ok(())
 }
 
+// =============================================================================
+// #1243: `--slurpfile`/`--slurp`/`--seq` tolerate a leading-zero number the
+// same way document input and `--argjson` already do (#1094/#1149), instead
+// of erroring outright (`--slurpfile`/`--slurp`) or silently dropping the
+// record (`--seq`). All cases live-verified against jq 1.7.1.
+// =============================================================================
+
+#[test]
+fn test_slurpfile_tolerates_leading_zero_number_1243() -> Result<()> {
+    let mut file = NamedTempFile::new()?;
+    writeln!(file, "007e5")?;
+
+    let (stdout, _, code) = run_jq_full(
+        &[
+            "-cn",
+            "--slurpfile",
+            "n",
+            file.path().to_str().unwrap(),
+            "$n",
+        ],
+        None,
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?}");
+    assert_eq!(stdout.trim_end(), "[7E+5]");
+    Ok(())
+}
+
+/// A leading-zero number document with plain `--slurp` (not `--slurpfile`)
+/// hit the same over-strict `serde_json::Deserializer` validation, found
+/// while scoping this fix -- the primary document-input path falls onto
+/// this function's slower fallback whenever `--slurp` is set (bypassing the
+/// fast lazy path), not just for `--slurpfile`'s own argument file.
+#[test]
+fn test_slurp_flag_tolerates_leading_zero_number_1243() -> Result<()> {
+    let (stdout, _, code) = run_jq_full(&["-c", "--slurp", "."], Some("007e5"))?;
+    assert_eq!(code, 0, "stdout: {stdout:?}");
+    assert_eq!(stdout.trim_end(), "[7E+5]");
+    Ok(())
+}
+
+#[test]
+fn test_seq_tolerates_leading_zero_number_1243() -> Result<()> {
+    let (stdout, _, code) = run_jq_full(&["--seq", "-c", "."], Some("\x1e007e5\n"))?;
+    assert_eq!(code, 0, "stdout: {stdout:?}");
+    assert_eq!(stdout.trim_end(), "\x1e7E+5");
+    Ok(())
+}
+
 /// A hyphen-prefixed `--slurpfile`/`--rawfile` FILE value must reach this
 /// crate's own file-open logic, not get rejected by clap as an unknown
 /// flag first (#1150, same `allow_hyphen_values` fix as `--arg`/
