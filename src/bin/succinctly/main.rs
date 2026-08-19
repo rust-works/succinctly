@@ -1293,14 +1293,20 @@ fn main() -> Result<()> {
                     args.escape_density,
                 );
 
-                if args.verify {
-                    serde_json::from_str::<serde_json::Value>(&json)
+                let verified_parse = if args.verify {
+                    let parsed = validate_generated_json(&json, args.pretty)
                         .context("Generated invalid JSON")?;
                     eprintln!("✓ JSON validated successfully");
-                }
+                    parsed
+                } else {
+                    None
+                };
 
                 let output = if args.pretty {
-                    let value: serde_json::Value = serde_json::from_str(&json)?;
+                    let value = match verified_parse {
+                        Some(v) => v,
+                        None => serde_json::from_str(&json)?,
+                    };
                     serde_json::to_string_pretty(&value)?
                 } else {
                     json
@@ -1834,6 +1840,19 @@ const SUITE_SIZES: &[(&str, usize)] = &[
     ("1gb", 1024 * 1024 * 1024),
 ];
 
+/// Validates that self-generated `json` is well-formed, via `serde_json::Value` --
+/// shared by `json generate --verify` and `json generate-suite --verify`'s own
+/// generator-self-check (#1212, following #1163's identical consolidation for
+/// `jq_runner.rs`'s CLI-arg validation). Neither caller wants the parsed tree for its
+/// own sake (both are checking "did the generator itself produce valid JSON", not
+/// materializing a value) -- but `generate --verify --pretty` needs to immediately
+/// re-parse the same string to pretty-print it, so `keep_parsed` lets that one caller
+/// reuse this validation pass's own parse instead of paying for a second one.
+fn validate_generated_json(json: &str, keep_parsed: bool) -> Result<Option<serde_json::Value>> {
+    let value: serde_json::Value = serde_json::from_str(json)?;
+    Ok(keep_parsed.then_some(value))
+}
+
 fn generate_json_suite(args: GenerateSuite) -> Result<()> {
     let output_dir = &args.output_dir;
 
@@ -1881,7 +1900,7 @@ fn generate_json_suite(args: GenerateSuite) -> Result<()> {
             let json = generate_json(*size, *pattern, Some(seed), 5, 0.1);
 
             if args.verify {
-                serde_json::from_str::<serde_json::Value>(&json)
+                validate_generated_json(&json, false)
                     .with_context(|| format!("Generated invalid JSON for {}", path.display()))?;
             }
 
