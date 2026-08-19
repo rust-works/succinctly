@@ -13036,6 +13036,46 @@ fn test_error_message_arg_break_semantics_unaffected_by_1164() -> Result<()> {
     Ok(())
 }
 
+/// #1164 coverage: the `optional` (`?`) arm of a wrong-typed argument is a
+/// separate branch from the non-optional error arm every other test above
+/// already exercises -- `?` suppresses the type mismatch to no output
+/// (`QueryResult::None`) for each of these builtins' argument-evaluation
+/// gate, independent of whether the trailing-control fix applies at all.
+#[test]
+fn test_argument_type_mismatch_optional_arms_produce_no_output_1164() -> Result<()> {
+    for (expr, input) in [
+        ("getpath(\"notarray\")?", r#"{"a":1}"#),
+        ("gmtime | strftime(5)?", "0"),
+        ("strptime(5)?", r#""x""#),
+        ("tz(5)?", "0"),
+    ] {
+        let (out, err, code) = run_jq_full(&["-c", expr], Some(input))?;
+        assert_eq!(code, 0, "expr={expr}: err={err}");
+        assert_eq!(out, "", "expr={expr}: out={out:?}");
+    }
+
+    let (out, err, code) = run_jq_full(&["-cn", "load(5)?"], None)?;
+    assert_eq!(code, 0, "err={err}");
+    assert_eq!(out, "");
+    Ok(())
+}
+
+/// #1164 coverage: a negative `flatten` depth still errors even when the
+/// argument generator that produced it also has a trailing break -- the
+/// error arm wins outright (own-error-supersedes-argument's-escape, same
+/// rule as `has`'s control test above), independent of the guard on the
+/// success arm every other `flatten` test above already exercises.
+#[test]
+fn test_flatten_negative_depth_errors_even_with_trailing_break_1164() -> Result<()> {
+    let (_out, err, code) = run_jq_full(
+        &["-c", r"label $out | flatten((-1, break $out))"],
+        Some("[[1]]"),
+    )?;
+    assert_ne!(code, 0);
+    assert!(err.contains("non-negative"), "err={err}");
+    Ok(())
+}
+
 /// Control: `combinations(n)` uses `n` inside a nested `range(n)`
 /// generator (not as a simple scalar), so real jq's own escape semantics
 /// there are different from every other case above -- a trailing break in

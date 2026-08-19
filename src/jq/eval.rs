@@ -1269,16 +1269,18 @@ fn finish_owned<'a, W>(value: OwnedValue, trailing: Option<Control>) -> QueryRes
 /// unchanged, preserving any zero-copy/cursor fast path it took; `Some`
 /// only forces materializing it, to splice the trailing control on.
 ///
-/// If `result` itself escapes (its own `Error`/`Break`/`Halt`, not the
-/// argument's), that escape wins outright and `trailing` is discarded --
+/// If `result` itself escapes (its own `Error`/`Break`/`Halt`/`Partial`, not
+/// the argument's), that escape wins outright and `trailing` is discarded --
 /// same "the computation that actually ran and escaped supersedes an
 /// earlier, never-revisited argument escape" rule `result_to_owned_ctrl`'s
 /// own doc comment describes and `has()`/`contains()`'s error paths above
-/// already follow. `result` becoming its own `Partial` here is not
-/// currently reachable by any caller of this function (each delegates to a
-/// function with no generator-argument evaluation of its own), so that
-/// combination -- two independent trailing escapes -- is left for whichever
-/// caller first needs it to actually decide, rather than guessed at here.
+/// already follow. No current caller can make `result` its own `Partial`
+/// (each delegates to a function with no generator-argument evaluation of
+/// its own) -- but unlike the true structural impossibility right above
+/// (`OneCursor`, ruled out by `materialize_cursor`'s own contract), this is
+/// just "not exercised by today's callers," not "cannot happen," so it gets
+/// the same defensible fallback as the plain `Error`/`Break`/`Halt` case
+/// instead of an assertion a future caller could legitimately trip.
 fn finish_result<W: Clone + AsRef<[u64]>>(
     result: QueryResult<'_, W>,
     trailing: Option<Control>,
@@ -1300,16 +1302,10 @@ fn finish_result<W: Clone + AsRef<[u64]>>(
             Control::Break(label) => QueryResult::Break(label),
             Control::Halt(code) => QueryResult::Halt(code),
         },
-        already_escaped
-        @ (QueryResult::Error(_) | QueryResult::Break(_) | QueryResult::Halt(_)) => already_escaped,
-        QueryResult::Partial(vs, inner_control) => {
-            debug_assert!(
-                false,
-                "finish_result: delegated computation itself produced a Partial -- \
-                 no current caller can reach this; needs its own semantics decision (#1164)"
-            );
-            partial(vs, inner_control)
-        }
+        already_escaped @ (QueryResult::Error(_)
+        | QueryResult::Break(_)
+        | QueryResult::Halt(_)
+        | QueryResult::Partial(..)) => already_escaped,
     }
 }
 
@@ -43844,6 +43840,184 @@ mod tests {
                 assert_eq!(vs.len(), 1);
                 assert!(matches!(vs[0], OwnedValue::String(_)), "vs[0]={:?}", vs[0]);
             }
+            other => panic!("unexpected result: {other:?}"),
+        }
+    }
+
+    /// #1164: `builtin_envvar`'s trailing-control fix must apply equally to
+    /// the "variable not set, `?` suppresses the miss" branch, not just the
+    /// "found" branch verified above -- `finish_result`'s own
+    /// `QueryResult::None` handling is what makes this shape work: no
+    /// output from the lookup itself, so the trailing control alone
+    /// determines the result. (A non-optional miss returns `Owned(Null)`
+    /// instead -- an unrelated, pre-existing choice this fix doesn't touch
+    /// -- covered directly for `finish_result` itself in the `None` test
+    /// above rather than needing its own env-lookup-shaped test here.)
+    #[cfg(feature = "std")]
+    #[test]
+    fn builtin_envvar_propagates_trailing_break_when_variable_not_set_optional_1164() {
+        let var = parse(r#"("SUCCINCTLY_TEST_VAR_1164_DOES_NOT_EXIST", break $out)"#).unwrap();
+        match builtin_envvar::<Vec<u64>, JqSemantics>(&var, StandardJson::Null, true) {
+            QueryResult::Break(label) => assert_eq!(label, "out"),
+            other => panic!("unexpected result: {other:?}"),
+        }
+    }
+
+    /// #1164 coverage: a non-optional lookup of an unset variable takes the
+    /// `Owned(Null)` arm (pre-existing, unrelated choice this fix doesn't
+    /// touch -- see the `optional` sibling test above for the `None` arm),
+    /// combined with a trailing break to confirm `finish_owned`/
+    /// `finish_result`'s ordinary success-wrap path still applies to it.
+    #[cfg(feature = "std")]
+    #[test]
+    fn builtin_envvar_not_set_non_optional_returns_null_with_trailing_break_1164() {
+        let var = parse(r#"("SUCCINCTLY_TEST_VAR_1164_DOES_NOT_EXIST", break $out)"#).unwrap();
+        match builtin_envvar::<Vec<u64>, JqSemantics>(&var, StandardJson::Null, false) {
+            QueryResult::Partial(vs, Control::Break(label)) => {
+                assert_eq!(label, "out");
+                assert_eq!(vs, vec![OwnedValue::Null]);
+            }
+            other => panic!("unexpected result: {other:?}"),
+        }
+    }
+
+    /// #1164 coverage: a non-string variable-name expression is a type
+    /// error, independent of any trailing control -- the generic fallback
+    /// arm every other envvar test above happens to skip past via a string
+    /// or `Halt`/`Break` match first.
+    #[cfg(feature = "std")]
+    #[test]
+    fn builtin_envvar_non_string_name_errors_1164() {
+        let var = parse("5").unwrap();
+        match builtin_envvar::<Vec<u64>, JqSemantics>(&var, StandardJson::Null, false) {
+            QueryResult::Error(e) => assert!(e.message.contains("must be a string"), "{e:?}"),
+            other => panic!("unexpected result: {other:?}"),
+        }
+    }
+
+    /// #1164: `finish_result` is a small shared helper (backs `nth`,
+    /// `flatten(depth)`, `has`, `load`, `env.VAR`), general enough to accept
+    /// every `QueryResult` shape a delegated computation could produce --
+    /// but only `Owned`/`One` are reachable through those five callers
+    /// today. Exercised directly here for the remaining shapes, so the
+    /// helper's own correctness doesn't depend on some future caller being
+    /// the first to notice a bug in an untested branch.
+    #[test]
+    fn finish_result_many_and_many_owned_splice_trailing_control_1164() {
+        let many: QueryResult<'_, Vec<u64>> =
+            QueryResult::Many(vec![StandardJson::Bool(true), StandardJson::Bool(false)]);
+        match finish_result(many, Some(Control::Break("out".to_string()))) {
+            QueryResult::Partial(vs, Control::Break(label)) => {
+                assert_eq!(label, "out");
+                assert_eq!(vs, vec![OwnedValue::Bool(true), OwnedValue::Bool(false)]);
+            }
+            other => panic!("unexpected result: {other:?}"),
+        }
+
+        let many_owned: QueryResult<'_, Vec<u64>> =
+            QueryResult::ManyOwned(vec![OwnedValue::Int(1), OwnedValue::Int(2)]);
+        match finish_result(many_owned, Some(Control::Break("out".to_string()))) {
+            QueryResult::Partial(vs, Control::Break(label)) => {
+                assert_eq!(label, "out");
+                assert_eq!(vs, vec![OwnedValue::Int(1), OwnedValue::Int(2)]);
+            }
+            other => panic!("unexpected result: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn finish_result_none_collapses_to_each_bare_control_variant_1164() {
+        let none_result = || QueryResult::<'_, Vec<u64>>::None;
+
+        match finish_result(none_result(), Some(Control::Error(EvalError::new("boom")))) {
+            QueryResult::Error(e) => assert_eq!(e.message, "boom"),
+            other => panic!("unexpected result: {other:?}"),
+        }
+        match finish_result(none_result(), Some(Control::Break("out".to_string()))) {
+            QueryResult::Break(label) => assert_eq!(label, "out"),
+            other => panic!("unexpected result: {other:?}"),
+        }
+        match finish_result(none_result(), Some(Control::Halt(3))) {
+            QueryResult::Halt(3) => {}
+            other => panic!("unexpected result: {other:?}"),
+        }
+    }
+
+    /// The delegated computation's own escape wins outright over an
+    /// argument's earlier trailing control, even when that computation's
+    /// own escape is itself a `Partial` (has its own prior output) -- same
+    /// "already escaped, argument's control is moot" rule as the plain
+    /// `Error`/`Break`/`Halt` case, extended to this shape too (#1164).
+    #[test]
+    fn finish_result_delegated_partial_wins_over_argument_trailing_control_1164() {
+        let delegated: QueryResult<'_, Vec<u64>> = QueryResult::Partial(
+            vec![OwnedValue::Int(1)],
+            Control::Error(EvalError::new("x")),
+        );
+        match finish_result(delegated, Some(Control::Break("out".to_string()))) {
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(vs, vec![OwnedValue::Int(1)]);
+                assert_eq!(e.message, "x");
+            }
+            other => panic!("unexpected result: {other:?}"),
+        }
+    }
+
+    /// #1164: `eval_owned_expr_ctrl_full` (backs `builtin_envvar`'s fix
+    /// above) is exercised there only via a shape that lands in its
+    /// `Partial`, single-value arm. Its sibling arms -- an argument
+    /// generator with 2+ *borrowed* outputs and no escape at all (`Many`),
+    /// the owned equivalent (`ManyOwned`), and a `Partial` with 2+ prior
+    /// values -- are covered directly here instead of hunting for CLI
+    /// syntax that happens to produce each borrowed/owned distinction.
+    #[test]
+    fn eval_owned_expr_ctrl_full_many_shapes_and_multi_value_partial_1164() {
+        // Many (borrowed, 2+ outputs, no escape): `eval_owned_expr_ctrl_full`
+        // reindexes `input` into its own internal JsonIndex/cursor before
+        // evaluating, so a comma of two field accesses against an object
+        // input reaches `eval_single`'s `Many` arm (borrowed cursor values),
+        // not already-owned ones.
+        let expr = parse(".a, .b").unwrap();
+        match eval_owned_expr_ctrl_full::<JqSemantics>(
+            &expr,
+            &OwnedValue::Object(IndexMap::from([
+                ("a".to_string(), OwnedValue::Int(1)),
+                ("b".to_string(), OwnedValue::Int(2)),
+            ])),
+            false,
+        ) {
+            Ok((OwnedValue::Array(vs), None)) => {
+                assert_eq!(vs, vec![OwnedValue::Int(1), OwnedValue::Int(2)]);
+            }
+            other => panic!("unexpected result: {other:?}"),
+        }
+
+        // Multi-value Partial (2+ values, then a break): the `else` branch
+        // of the `vs.len() == 1` check inside the `Partial` arm.
+        let expr = parse("(1, 2, break $out)").unwrap();
+        match eval_owned_expr_ctrl_full::<JqSemantics>(&expr, &OwnedValue::Null, false) {
+            Ok((OwnedValue::Array(vs), Some(Control::Break(label)))) => {
+                assert_eq!(label, "out");
+                assert_eq!(vs, vec![OwnedValue::Int(1), OwnedValue::Int(2)]);
+            }
+            other => panic!("unexpected result: {other:?}"),
+        }
+    }
+
+    /// #1164: `result_to_owned_ctrl` (backs 16 of this fix's builtins) is
+    /// exercised by every CLI-level `..._1164` test above only via shapes
+    /// that land in its `Owned`/`One`/`Partial` arms -- a builtin argument
+    /// with 2+ *borrowed* outputs and no escape (`Many`) never happened to
+    /// come up. Covered directly here instead.
+    #[test]
+    fn result_to_owned_ctrl_many_arm_takes_first_borrowed_value_1164() {
+        let json: &[u8] = br#"{"a":"x","b":"y"}"#;
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let expr = parse(".a, .b").unwrap();
+        let result = eval_single::<Vec<u64>, JqSemantics>(&expr, cursor.value(), false);
+        match result_to_owned_ctrl(result) {
+            Ok((OwnedValue::String(s), None)) => assert_eq!(s, "x"),
             other => panic!("unexpected result: {other:?}"),
         }
     }
