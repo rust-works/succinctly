@@ -567,15 +567,19 @@ fn normalize_extreme_literal_mantissa(
         // shift to -- return `Err(frac_len)` instead, `frac_part.len()` is
         // exactly what the `Err` caller's own shift math needs (#1207).
         let Some(k) = frac_part.find(|c: char| c != '0') else {
-            // `try_from`, not a bare `as` cast: `frac_part.len()` is
-            // document-controlled and unbounded, same as the exponent digit
-            // string `parse_literal_exponent` below saturates rather than
-            // wraps -- matching that same discipline here instead of
-            // silently flipping sign past `i128::MAX` bytes.
-            return Err(i128::try_from(frac_part.len()).unwrap_or(i128::MAX));
+            // A bare `as` cast, not `try_from`/`unwrap_or` (#1270 review):
+            // `frac_part.len()` is a `usize`, and no realistic (or
+            // foreseeable) target has a `usize` wider than `i128` --
+            // unlike the *signed*, genuinely document-controlled-and-
+            // unbounded exponent digit string `parse_literal_exponent`
+            // below saturates against, this widening can't lose precision,
+            // so the extra `try_from`/`unwrap_or(i128::MAX)` fallback was
+            // dead code carried over from this function's pre-#1270 `i64`
+            // width (where a `usize` truly could exceed the target range).
+            return Err(frac_part.len() as i128);
         };
         let after = &frac_part[k + 1..];
-        let digit_count = i128::try_from(after.len() + 1).unwrap_or(i128::MAX);
+        let digit_count = (after.len() + 1) as i128;
         (
             -(k as i128 + 1),
             &frac_part[k..=k],
@@ -587,7 +591,7 @@ fn normalize_extreme_literal_mantissa(
         // integer-part digit. `int_part[1..]` is a slice (no copy); only
         // what actually gets concatenated into `rest` is capped.
         let after_leading = &int_part[1..];
-        let digit_count = i128::try_from(int_part.len() + frac_part.len()).unwrap_or(i128::MAX);
+        let digit_count = (int_part.len() + frac_part.len()) as i128;
         let rest = if after_leading.len() >= MAX_RENDERED_MANTISSA_DIGITS {
             after_leading[..MAX_RENDERED_MANTISSA_DIGITS].to_string()
         } else {
@@ -2820,7 +2824,8 @@ mod tests {
     /// `i32::MAX` (~10 digits) - producing `"1E+0"` for a value that's
     /// actually astronomically large, well before the real ceiling above
     /// even comes into play. `format_overflow_literal_mantissa` now
-    /// re-parses the exponent text itself at `i64` precision instead.
+    /// re-parses the exponent text itself at wide (`i128` as of #1270,
+    /// originally `i64`) precision instead.
     #[test]
     fn test_format_number_jq_compat_overflow_exponent_past_i32_matches_jq_1_7_1() {
         assert_eq!(
@@ -2934,9 +2939,17 @@ mod tests {
     /// remove this residual case, only pushes it out by ~19 orders of
     /// magnitude, past any realistic or plausibly-fuzzed literal -- this
     /// pins that the *widened* boundary still degrades to a saturated
-    /// sentinel rather than hanging or panicking, the same documented,
-    /// accepted trade-off `MAX_RENDERED_MANTISSA_DIGITS` makes for mantissa
-    /// digit count.
+    /// sentinel rather than hanging or panicking.
+    ///
+    /// Unlike `MAX_RENDERED_MANTISSA_DIGITS`'s own cap (which truncates to
+    /// a truthful, monotonically-accurate *prefix* of the real digits),
+    /// this sentinel is a fixed, input-independent value with no
+    /// relationship to the literal's actual magnitude -- code review
+    /// correctly called out the two as different severity classes, not the
+    /// same trade-off; closing this gap properly (distinguishing "exactly
+    /// parsed" from "saturated" at the type level, so the caller could fall
+    /// back to echoing the exponent's own source text instead) is filed
+    /// separately rather than attempted here.
     #[test]
     fn test_format_number_jq_compat_underflow_exponent_beyond_i128_range_1270() {
         let huge_exponent = "9".repeat(45); // comfortably past i128::MIN's ~38 digits
@@ -2956,23 +2969,25 @@ mod tests {
     #[test]
     fn test_format_number_jq_compat_astronomically_negative_exponent_preserves_digits_1270() {
         let exp24 = "9".repeat(24);
+        let raw_exp: i128 = -exp24.parse::<i128>().unwrap();
         assert_eq!(
             format_number_jq_compat(format!("1e-{exp24}").as_bytes()),
-            format!("1E-{exp24}")
+            format!("1E{raw_exp}")
         );
         // Mantissa "12" shifts left by 1 digit, so the exponent increases
-        // by exactly 1 relative to the raw written one.
-        let mut shifted = exp24.clone();
-        shifted.replace_range(23..24, "8"); // ...999 -> ...998 (subtract 1 from -exp24)
+        // by exactly 1 relative to the raw written one -- computed via the
+        // same `i128` arithmetic the production shift math uses (#1270
+        // review), not hand-derived string surgery on the digit text.
         assert_eq!(
             format_number_jq_compat(format!("12.5e-{exp24}").as_bytes()),
-            format!("1.25E-{shifted}")
+            format!("1.25E{}", raw_exp + 1)
         );
         // All-zero mantissa (the `Err(frac_len)` branch) shares the same
-        // widened arithmetic.
+        // widened arithmetic; `frac_len` is 1 (the mantissa's own single
+        // fractional `0`).
         assert_eq!(
             format_number_jq_compat(format!("0.0e-{exp24}").as_bytes()),
-            format!("0E-1{}", "0".repeat(24))
+            format!("0E{}", raw_exp - 1)
         );
     }
 
