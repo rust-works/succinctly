@@ -6349,4 +6349,16 @@ mod tests {
         let object_pattern = format!("{}$x{}", "{a: ".repeat(n), "}".repeat(n));
         assert!(parse(&format!(". as {object_pattern} | $x")).is_ok());
     }
+
+    /// `Parser::new` (kept for tests and future use, per its own
+    /// `#[allow(dead_code)]`; `parse`/`parse_with_mode` both go through
+    /// `Parser::with_mode` instead) initializes `pattern_depth` to `0` the
+    /// same as `with_mode`, and a parser built through it can still parse a
+    /// pattern -- #1240's new field didn't leave this alternate constructor
+    /// broken.
+    #[test]
+    fn test_parser_new_initializes_pattern_depth_1240() {
+        let mut parser = Parser::new(". as {$a} | $a");
+        parser.parse_expr().expect("Parser::new must still parse");
+    }
 }
