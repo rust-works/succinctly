@@ -523,15 +523,20 @@ fn normalize_extreme_literal_mantissa(s: &str, exp_pos: usize) -> Result<(String
     // already scans every byte of `s` once.
     //
     // Real jq preserves a literal's full given precision unconditionally --
-    // oracle-verified exact round-trips up to 100,000 significant digits
-    // (#1253) -- so this is a defensive bound against a pathological
-    // document-controlled literal (a multi-megabyte mantissa), not a
-    // correctness ceiling: raised from an earlier `32` (chosen for the
+    // oracle-verified exact round-trips up to exactly this many significant
+    // digits (#1253; raised from an earlier `32`, which was chosen for the
     // overflow/near-zero paths specifically, then silently inherited by
     // every other caller once #1206 routed the ordinary scientific-notation
-    // case through this same function -- #1253) to comfortably exceed any
-    // realistic literal's own precision.
-    const MAX_RENDERED_MANTISSA_DIGITS: usize = 1000;
+    // case through this same function). This *is* still a cap, not a proven
+    // ceiling: a literal with more true significant digits than this still
+    // renders truncated rather than erroring, exactly as it did at the old
+    // `32` -- code review on #1253 confirmed the truncation is silent, not
+    // that raising the number removes it. Set to what this session actually
+    // verified against pinned jq 1.7.1, not a round number chosen past it,
+    // so the constant and the oracle claim it rests on can't drift apart
+    // again the way `32` (tuned for a different use case entirely) drifted
+    // from the fidelity the ordinary case actually needs.
+    const MAX_RENDERED_MANTISSA_DIGITS: usize = 100_000;
 
     let (int_part, frac_part) = split_mantissa(s, exp_pos);
 
@@ -569,8 +574,7 @@ fn normalize_extreme_literal_mantissa(s: &str, exp_pos: usize) -> Result<(String
         // integer-part digit. `int_part[1..]` is a slice (no copy); only
         // what actually gets concatenated into `rest` is capped.
         let after_leading = &int_part[1..];
-        let digit_count =
-            i64::try_from(after_leading.len() + 1 + frac_part.len()).unwrap_or(i64::MAX);
+        let digit_count = i64::try_from(int_part.len() + frac_part.len()).unwrap_or(i64::MAX);
         let rest = if after_leading.len() >= MAX_RENDERED_MANTISSA_DIGITS {
             after_leading[..MAX_RENDERED_MANTISSA_DIGITS].to_string()
         } else {
@@ -613,7 +617,8 @@ fn format_overflow_literal_mantissa(s: &str, exp_pos: usize, negative: bool) -> 
     // A mantissa of exactly `0` times any exponent is still exactly `0.0`,
     // never `+/-infinity` -- callers only reach this function when `value`
     // has already overflowed, which guarantees a nonzero mantissa.
-    let Ok((mantissa_str, new_exp, _)) = normalize_extreme_literal_mantissa(s, exp_pos) else {
+    let Ok((mantissa_str, new_exp, digit_count)) = normalize_extreme_literal_mantissa(s, exp_pos)
+    else {
         unreachable!("overflow implies a nonzero mantissa")
     };
 
@@ -623,6 +628,23 @@ fn format_overflow_literal_mantissa(s: &str, exp_pos: usize, negative: bool) -> 
     // `1e1000000000` switches to DBL_MAX text instead.
     if new_exp.unsigned_abs() >= 1_000_000_000 {
         return infinite_float_preview_text(negative).to_string();
+    }
+
+    // #1244's plain-vs-scientific digit-count rule (see
+    // `format_number_jq_compat`'s own use of it) applies here too, not just
+    // to the non-overflow path -- an overflowed *value* (this function's
+    // whole reason for existing) doesn't mean the *literal* lacks enough
+    // given digits to stay plain: `"9".repeat(400) + "e0"` overflows `f64`
+    // (400 nines vastly exceeds `f64::MAX`), yet real jq still renders it
+    // as a plain 400-digit integer, not scientific notation, because all
+    // 400 significant digits were given (`shifted_exp` 399 `<` `digit_count`
+    // 400) -- oracle-verified, code review on #1253.
+    if new_exp > 0 {
+        if let Some(plain) =
+            format_positive_shifted_plain(sign, &mantissa_str, new_exp, digit_count)
+        {
+            return plain;
+        }
     }
 
     assemble_scientific(sign, &mantissa_str, new_exp)
@@ -723,11 +745,7 @@ fn format_near_zero_literal(s: &str, exp_pos: usize, negative: bool) -> String {
 fn format_shifted_mantissa(sign: &str, mantissa_str: &str, shifted_exp: i64) -> String {
     let (leading, rest) = mantissa_str.split_once('.').unwrap_or((mantissa_str, ""));
     if shifted_exp == 0 {
-        return if rest.is_empty() {
-            format!("{sign}{leading}")
-        } else {
-            format!("{sign}{leading}.{rest}")
-        };
+        return join_sign_digits_with_optional_point(sign, leading, rest);
     }
     debug_assert!(
         (-6..=-1).contains(&shifted_exp),
@@ -737,6 +755,21 @@ fn format_shifted_mantissa(sign: &str, mantissa_str: &str, shifted_exp: i64) -> 
     format!("{sign}0.{}{leading}{rest}", "0".repeat(zero_pad))
 }
 
+/// Join a sign and a digit string split at the decimal point, omitting the
+/// point entirely when nothing follows it -- shared by
+/// [`format_shifted_mantissa`]'s `shifted_exp == 0` arm and
+/// [`format_positive_shifted_plain`] below, which both need to decide
+/// between a bare integer (`123`) and a decimal (`123.45`) from the same
+/// `(before, after)` split, so the two can't independently drift on how an
+/// empty fractional remainder is spelled (#106, code review).
+fn join_sign_digits_with_optional_point(sign: &str, before: &str, after: &str) -> String {
+    if after.is_empty() {
+        format!("{sign}{before}")
+    } else {
+        format!("{sign}{before}.{after}")
+    }
+}
+
 /// Render a nonzero literal's normalized mantissa in plain (non-scientific)
 /// decimal form for a *positive* shifted exponent (#1244), when the
 /// literal's own given significant digits (`digit_count`) are enough to
@@ -744,19 +777,25 @@ fn format_shifted_mantissa(sign: &str, mantissa_str: &str, shifted_exp: i64) -> 
 /// trailing digit -- i.e. `shifted_exp < digit_count`, oracle-verified
 /// against jq 1.7.1 as the exact condition real jq itself uses. Returns
 /// `None` when that condition doesn't hold (caller falls back to
-/// scientific notation), and also -- rarely -- when `mantissa_str` was
-/// itself already truncated by `normalize_extreme_literal_mantissa`'s
-/// render cap short of the digit `shifted_exp` needs to place the decimal
-/// point: a bounded-cost divergence from real jq for a literal whose true
-/// digit count so vastly exceeds the cap that even a truncated plain
-/// rendering isn't recoverable; no realistic literal hits this second case.
+/// scientific notation).
 ///
-/// `mantissa_str` is `"d"` or `"d.ddd"` (one leading digit, `normalize_extreme_literal_mantissa`'s
-/// normalized form) -- concatenating its digits and re-inserting the
-/// decimal point `shifted_exp + 1` places in gives the value's natural,
-/// un-normalized digit layout (`"1.20000000000"` at shifted exponent `9`
-/// re-splits to `"1200000000.00"`, matching real jq's own
-/// `120000000000e-2` -> `1200000000.00`).
+/// The `split_pos > digits.len()` check below is a second, independent
+/// guard against `mantissa_str` having been truncated by
+/// `normalize_extreme_literal_mantissa`'s own render cap short of the digit
+/// `shifted_exp` needs to place the decimal point at -- provably
+/// unreachable *today* (a `shifted_exp` this function ever sees is bounded
+/// by a finite `f64`'s own representable magnitude, ~308, far below the
+/// render cap), so no live literal takes this branch; it exists as a safety
+/// net against a future, much smaller render cap rather than a case this
+/// code currently handles (code review, #1253).
+///
+/// `mantissa_str` is `"d"` or `"d.ddd"` (one leading digit,
+/// `normalize_extreme_literal_mantissa`'s normalized form) -- concatenating
+/// its digits and re-inserting the decimal point `shifted_exp + 1` places
+/// in gives the value's natural, un-normalized digit layout
+/// (`"1.20000000000"` at shifted exponent `9` re-splits to
+/// `"1200000000.00"`, matching real jq's own `120000000000e-2` ->
+/// `1200000000.00`).
 fn format_positive_shifted_plain(
     sign: &str,
     mantissa_str: &str,
@@ -770,17 +809,14 @@ fn format_positive_shifted_plain(
     if shifted_exp >= digit_count {
         return None;
     }
-    let digits: String = mantissa_str.chars().filter(|&c| c != '.').collect();
+    let (leading, rest) = mantissa_str.split_once('.').unwrap_or((mantissa_str, ""));
+    let digits = format!("{leading}{rest}");
     let split_pos = usize::try_from(shifted_exp + 1).ok()?;
     if split_pos > digits.len() {
         return None;
     }
     let (before, after) = digits.split_at(split_pos);
-    Some(if after.is_empty() {
-        format!("{sign}{before}")
-    } else {
-        format!("{sign}{before}.{after}")
-    })
+    Some(join_sign_digits_with_optional_point(sign, before, after))
 }
 
 /// An owned JSON value.
@@ -2861,11 +2897,17 @@ mod tests {
     /// #930 review: an overflowed literal's mantissa can be arbitrarily long
     /// (it's document-controlled text) - rendering the *whole* thing would
     /// be unbounded work for a pathological input, so
-    /// `MAX_RENDERED_MANTISSA_DIGITS` (#1253: raised from `32` to `1000`,
-    /// since real jq itself preserves full literal precision unconditionally
-    /// -- oracle-verified up to 100,000 significant digits, so `32` was
-    /// never a correctness boundary, only ever a defensive one) still caps
-    /// the copy. Pins that the leading digits (and thus the exponent, which
+    /// `MAX_RENDERED_MANTISSA_DIGITS` (#1253: raised from `32` to
+    /// `100_000` -- matching exactly what this session verified against
+    /// pinned jq 1.7.1, not a round number chosen past it; still a cap, not
+    /// a proven ceiling) caps the copy. This literal's own digit count
+    /// (2,000,001) still exceeds even the raised cap, and its shifted
+    /// exponent (2,000,399) still exceeds its own digit count either way,
+    /// so it stays on the scientific path (`format_positive_shifted_plain`,
+    /// #1244's own fix, correctly declines and falls through here -- see
+    /// `test_format_number_jq_compat_overflow_huge_mantissa_stays_plain_when_digits_cover_it_1244`
+    /// for the sibling case where the *same* overflow path picks plain
+    /// instead). Pins that the leading digits (and thus the exponent, which
     /// is unaffected either way) stay correct, and that the rendered text
     /// itself is bounded rather than millions of bytes long.
     #[test]
@@ -2873,20 +2915,23 @@ mod tests {
         let mantissa = "9".repeat(2_000_000);
         let literal = format!("{mantissa}.5e400");
         let result = format_number_jq_compat(literal.as_bytes());
-        let expected_prefix = format!("9.{}", "9".repeat(1000));
+        let expected_prefix = format!("9.{}", "9".repeat(100_000));
         assert!(
             result.starts_with(&expected_prefix),
-            "leading digits must still be correct: {result}"
+            "leading digits must still be correct (first/last 40 shown): {}...{}",
+            &result[..40.min(result.len())],
+            &result[result.len().saturating_sub(40)..]
         );
         // The exponent shift (mantissa.len() - 1) is unaffected by the
         // rendering cap - only how many digits after the leading one get
         // copied into the output text.
         assert!(
             result.ends_with("E+2000399"),
-            "exponent must reflect the mantissa's true (uncapped) length: {result}"
+            "exponent must reflect the mantissa's true (uncapped) length, last 20 chars: {}",
+            &result[result.len().saturating_sub(20)..]
         );
         assert!(
-            result.len() < 2000,
+            result.len() < 200_000,
             "must not render anywhere near the full 2,000,000-digit mantissa: got {} bytes",
             result.len()
         );
@@ -3167,6 +3212,31 @@ mod tests {
         assert_eq!(
             format_number_jq_compat(b"1.234567890123456789012345678901234567890123e50"),
             "1.234567890123456789012345678901234567890123E+50"
+        );
+    }
+
+    /// #1253 review: `format_positive_shifted_plain`'s `shifted_exp <
+    /// digit_count` rule was originally wired into `format_number_jq_compat`
+    /// only, leaving `format_overflow_literal_mantissa` -- reached once the
+    /// literal's own magnitude already overflows `f64` -- unconditionally
+    /// scientific regardless of digit count. An overflowed *value* doesn't
+    /// mean the *literal* lacks enough given digits to stay plain: 400
+    /// given nines is itself an `f64` overflow (`9e399` alone already
+    /// exceeds `f64::MAX`), yet real jq still renders every one of those
+    /// 400 given digits plainly, since `shifted_exp` (399) is still less
+    /// than `digit_count` (400) -- oracle-verified against jq 1.7.1.
+    #[test]
+    fn test_format_number_jq_compat_overflow_huge_mantissa_stays_plain_when_digits_cover_it_1244() {
+        let mantissa = "9".repeat(400);
+        assert_eq!(
+            format_number_jq_compat(format!("{mantissa}e0").as_bytes()),
+            mantissa
+        );
+        // One digit short of covering the shift: falls back to scientific,
+        // same as the non-overflow path's own boundary (#1244).
+        assert_eq!(
+            format_number_jq_compat(format!("{mantissa}e1").as_bytes()),
+            format!("9.{}E+400", "9".repeat(399))
         );
     }
 
