@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`reduce`/`foreach`'s own `as` clause accepts a full destructuring pattern**
+  (#1201), not just a bare `$var`: `reduce .[] as {a: $a} (0; . + $a)` and
+  `foreach .[] as [$a,$b] (0; . + $a + $b; .)` now evaluate instead of failing
+  to parse. The clause previously hardcoded `$` + an identifier, even though
+  `. as PATTERN | …` and function-argument patterns already went through the
+  shared `parse_pattern` — routing these two sites through it as well also
+  brings them under #1240's `MAX_PATTERN_DEPTH` guard for free.
+
+  `Expr::Reduce`/`Expr::Foreach` carry a `Pattern` in place of the old
+  `String`; a bare `$var` is `Pattern::Var`, so existing queries are
+  unaffected. The evaluator destructures each input element with
+  `extract_pattern_bindings` — the same primitive `. as PATTERN` uses — and
+  folds `substitute_var` over the resulting bindings, extending the
+  AST-rewrite binding mechanism these constructs already had from one
+  variable to N.
+
+  Unlike a bare `$var`, a pattern can fail to match a given element. Because
+  `foreach` emits one output per step, that failure has to surface only when
+  the fold actually reaches the offending element, leaving every earlier
+  step's output in place — the same contract #494 established for an ordinary
+  per-step UPDATE error. Verified against jq 1.7.1 across 19 differential
+  cases including exit codes and stderr text, and pinned by nine new
+  `jq-golden` cases.
+
+  **Known divergence:** `?//` alternatives are still rejected here, though
+  real jq accepts them. Retrying an alternative after the body errors means
+  rolling the accumulator back to the element's pre-UPDATE value, which the
+  fold has no way to express — tracked separately as #1365.
+
 ### Changed
 
 - **YAML parsing specializes on whether the document contains a carriage return**

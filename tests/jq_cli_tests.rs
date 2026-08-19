@@ -13005,6 +13005,94 @@ fn test_destructuring_pattern_null_propagates_through_nested_array_1239() -> Res
     Ok(())
 }
 
+/// #1201's own two repros, end-to-end through the CLI: `reduce`/`foreach`'s
+/// `as` clause takes a full destructuring pattern, not just a bare `$var`.
+/// The happy paths are pinned byte-for-byte against real jq by the
+/// `reduce_as_*`/`foreach_as_*` golden cases; these exist so the issue's
+/// literal reproduction commands stay covered from the binary's own entry
+/// point, and so a bare `$var` binding is shown not to have regressed.
+#[test]
+fn test_reduce_as_full_pattern_1201() -> Result<()> {
+    let (out, err, code) = run_jq_full(
+        &["-c", "reduce .[] as {a: $a} (0; . + $a)"],
+        Some(r#"[{"a":1},{"a":2}]"#),
+    )?;
+    assert_eq!(code, 0, "err={err}");
+    assert_eq!(out.trim(), "3");
+
+    let (out, err, code) = run_jq_full(
+        &["-c", "reduce .[] as [$a,$b] (0; . + $a + $b)"],
+        Some("[[1,2],[3,4]]"),
+    )?;
+    assert_eq!(code, 0, "err={err}");
+    assert_eq!(out.trim(), "10");
+
+    // A bare `$var` is just `Pattern::Var` now -- unaffected.
+    let (out, err, code) = run_jq_full(&["-c", "reduce .[] as $x (0; . + $x)"], Some("[1,2,3]"))?;
+    assert_eq!(code, 0, "err={err}");
+    assert_eq!(out.trim(), "6");
+    Ok(())
+}
+
+/// #1201: `foreach` emits one output per step, so a pattern that fails to
+/// match partway through the input must still leave every earlier step's
+/// output in place -- the same "keep the prefix" contract #494 pinned for an
+/// ordinary per-step UPDATE error, now holding for this *new* per-element
+/// error source. Checked here at the CLI boundary (not just as an in-process
+/// `QueryResult::Partial`) because what matters is that the bytes are
+/// actually written to stdout before the process exits non-zero.
+#[test]
+fn test_foreach_as_pattern_error_keeps_prefix_on_stdout_1201() -> Result<()> {
+    let (out, err, code) = run_jq_full(
+        &["-c", "foreach .[] as {a:$a} (0; . + $a; .)"],
+        Some(r#"[{"a":1},{"a":2},"bad",{"a":4}]"#),
+    )?;
+    assert_eq!(code, 5, "out={out:?} err={err:?}");
+    assert_eq!(out.lines().collect::<Vec<_>>(), ["1", "3"]);
+    assert!(err.contains("Cannot index string with string"), "err={err}");
+    Ok(())
+}
+
+/// #1201 routes `reduce`/`foreach`'s binding clause through the *same*
+/// `parse_pattern` that `. as PATTERN` uses, so #1240's `MAX_PATTERN_DEPTH`
+/// guard covers the two new construction sites for free. This pins that:
+/// without the shared entry point, a deeply nested pattern here would
+/// recurse to a stack overflow instead of a clean compile error. Cannot be a
+/// golden case -- real jq has no equivalent limit, so its output would
+/// legitimately differ. Scaled to just past the 256-deep limit for the same
+/// ARG_MAX reason as `..._1240` above.
+#[test]
+fn test_reduce_as_pattern_respects_pattern_depth_limit_1201() -> Result<()> {
+    let n = 300;
+    let pattern = format!("{}$x{}", "{a: ".repeat(n), "}".repeat(n));
+    let query = format!("reduce .[] as {pattern} (0; $x)");
+    let (out, err, code) = run_jq_full(&["-cn", &query], None)?;
+    assert_ne!(code, 0, "out={out:?} err={err:?}");
+    assert!(err.contains("depth limit"), "err={err}");
+    Ok(())
+}
+
+/// #1201 deliberately scoped out `?//` alternatives in the `reduce`/`foreach`
+/// clause: real jq accepts them, but retrying an alternative after the body
+/// errors requires rolling the accumulator back to the element's pre-UPDATE
+/// value, which the fold can't express. Tracked by #1365.
+///
+/// This pins the *current* divergence so it can't drift silently -- it is
+/// expected to fail, and should be replaced by a behaviour test, when #1365
+/// lands.
+#[test]
+fn test_reduce_foreach_reject_pattern_alternatives_1201() -> Result<()> {
+    for query in [
+        "reduce .[] as [$a] ?// {a:$a} (0; . + $a)",
+        "foreach .[] as [$a] ?// {a:$a} (0; . + $a; .)",
+    ] {
+        let (out, err, code) = run_jq_full(&["-c", query], Some(r#"[[1],{"a":2}]"#))?;
+        assert_ne!(code, 0, "`{query}` should not compile\nout={out:?}");
+        assert!(err.contains("compile error"), "`{query}`\nerr={err}");
+    }
+    Ok(())
+}
+
 // =============================================================================
 // #1164: a builtin argument generator that produces a value and *then*
 // breaks/errors no longer silently continues past that escape once the

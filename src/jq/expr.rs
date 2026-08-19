@@ -236,24 +236,28 @@ pub enum Expr {
     /// Returns an object containing all environment variables.
     Env,
 
-    /// Reduce: `reduce .[] as $x (0; . + $x)`
+    /// Reduce: `reduce .[] as $x (0; . + $x)`, or `reduce .[] as {a: $a} (0; . + $a)`
+    /// with a full destructuring pattern (#1201) -- `?//` alternatives are not
+    /// supported here, though real jq does accept them; see #1365.
     Reduce {
         /// Input expression (what to iterate over)
         input: Box<Self>,
-        /// Variable name for each element
-        var: String,
+        /// Binding pattern for each element (a bare `$var` is `Pattern::Var`)
+        pattern: Pattern,
         /// Initial accumulator value
         init: Box<Self>,
-        /// Update expression (has access to accumulator via . and element via $var)
+        /// Update expression (has access to accumulator via . and the pattern's bound variables)
         update: Box<Self>,
     },
 
-    /// Foreach: `foreach .[] as $x (0; . + 1)` or `foreach .[] as $x (0; . + 1; .)`
+    /// Foreach: `foreach .[] as $x (0; . + 1)` or `foreach .[] as $x (0; . + 1; .)`,
+    /// or with a full destructuring pattern in place of `$x` (#1201) -- same
+    /// `?//`-alternatives caveat as `Reduce` above.
     Foreach {
         /// Input expression
         input: Box<Self>,
-        /// Variable name for each element
-        var: String,
+        /// Binding pattern for each element (a bare `$var` is `Pattern::Var`)
+        pattern: Pattern,
         /// Initial accumulator value
         init: Box<Self>,
         /// Update expression

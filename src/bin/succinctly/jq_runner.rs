@@ -300,24 +300,24 @@ fn rewrite_namespaced_calls(expr: Expr) -> Expr {
         },
         Expr::Reduce {
             input,
-            var,
+            pattern,
             init,
             update,
         } => Expr::Reduce {
             input: Box::new(rewrite_namespaced_calls(*input)),
-            var,
+            pattern,
             init: Box::new(rewrite_namespaced_calls(*init)),
             update: Box::new(rewrite_namespaced_calls(*update)),
         },
         Expr::Foreach {
             input,
-            var,
+            pattern,
             init,
             update,
             extract,
         } => Expr::Foreach {
             input: Box::new(rewrite_namespaced_calls(*input)),
-            var,
+            pattern,
             init: Box::new(rewrite_namespaced_calls(*init)),
             update: Box::new(rewrite_namespaced_calls(*update)),
             extract: extract.map(|e| Box::new(rewrite_namespaced_calls(*e))),

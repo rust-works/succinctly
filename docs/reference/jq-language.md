@@ -139,6 +139,9 @@ The implementation covers ~95% of jq functionality and is production-ready.
 - [x] Object/array destructuring patterns
 - [x] `reduce expr as $x (init; update)`
 - [x] `foreach expr as $x (init; update)` / `foreach ... (init; update; extract)`
+- [x] A full destructuring pattern in `reduce`/`foreach`'s own `as` clause —
+      `reduce .[] as {a: $a} (0; . + $a)` (#1201). `?//` alternatives are
+      accepted only by `. as PATTERN`, not here; see #1365.
 
 ### Advanced Control Flow
 - [x] `limit(n; expr)`
