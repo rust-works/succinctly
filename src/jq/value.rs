@@ -2959,6 +2959,24 @@ mod tests {
         );
     }
 
+    /// `parse_literal_exponent`'s positive-sign saturation arm
+    /// (`i128::MAX`), the counterpart to the `i128::MIN` case pinned above
+    /// -- reached via `format_overflow_literal_mantissa` (a written
+    /// exponent with no `-`, so `f64` parsing overflows to `+infinity`
+    /// long before the exponent digit string itself overflows `i128`).
+    /// `new_exp` saturating to `i128::MAX` is still far past the
+    /// `1_000_000_000` overflow ceiling, so this correctly falls to the
+    /// same DBL_MAX preview text as any other overflowed literal --
+    /// oracle-verified against jq 1.7.1.
+    #[test]
+    fn test_format_number_jq_compat_overflow_exponent_beyond_i128_range_1270() {
+        let huge_exponent = "9".repeat(45);
+        assert_eq!(
+            format_number_jq_compat(format!("1e{huge_exponent}").as_bytes()),
+            "1.7976931348623157e+308"
+        );
+    }
+
     /// #1270's own repro, plus the shift-adjusted variant (#1270 review):
     /// a mantissa with more than one significant digit still correctly
     /// folds its own shift into the widened `i128` exponent rather than
