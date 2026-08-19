@@ -3198,6 +3198,30 @@ fn test_seq_ignores_parse_errors() -> Result<()> {
     Ok(())
 }
 
+/// #1213: `--seq`'s error-location reporting stays correct once its
+/// per-value line lookup is incremental (`LineCounter`) instead of a
+/// from-scratch rescan per value -- the erroring record here is deep enough
+/// into the stream (record 50 of 100) that an off-by-one in the incremental
+/// bookkeeping would show up as a wrong line number, not just a wrong
+/// answer.
+#[test]
+fn test_seq_error_location_correct_with_many_preceding_records_1213() -> Result<()> {
+    let mut input = String::new();
+    for i in 0..100 {
+        input.push('\u{1e}');
+        input.push_str(&format!("{{\"n\":{i}}}\n"));
+    }
+    let (_, stderr, code) = run_jq_full(
+        &["--seq", r#"if .n==50 then error("boom") else . end"#],
+        Some(&input),
+    )?;
+    assert_eq!(code, 5, "stderr: {stderr}");
+    // Record 50 (0-indexed) is the 51st RS-delimited record, ending on the
+    // 51st line of the input.
+    assert!(stderr.contains("(at <stdin>:51): boom"), "stderr: {stderr}");
+    Ok(())
+}
+
 #[test]
 fn test_seq_multiple_outputs() -> Result<()> {
     // Each output from iterator should get RS prefix
