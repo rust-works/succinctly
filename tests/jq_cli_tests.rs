@@ -12659,3 +12659,22 @@ fn test_as_pattern_deep_nesting_exits_cleanly_not_stack_overflow_1240() -> Resul
     assert!(err.contains("depth limit"), "err={err}");
     Ok(())
 }
+
+/// A destructuring pattern nested under an absent/null field resolves every
+/// bound variable to `null`, matching real jq, instead of hard-erroring --
+/// regression test for #1239. Mirrors the issue's own live repro exactly.
+#[test]
+fn test_destructuring_pattern_null_propagates_through_nested_object_1239() -> Result<()> {
+    let (out, err, code) = run_jq_full(&["-c", ". as {x: {y: $y}} | $y"], Some(r#"{"a":1}"#))?;
+    assert_eq!(code, 0, "err={err}");
+    assert_eq!(out.trim(), "null");
+    Ok(())
+}
+
+#[test]
+fn test_destructuring_pattern_null_propagates_through_nested_array_1239() -> Result<()> {
+    let (out, err, code) = run_jq_full(&["-c", ". as {x: [$y]} | $y"], Some(r#"{"a":1}"#))?;
+    assert_eq!(code, 0, "err={err}");
+    assert_eq!(out.trim(), "null");
+    Ok(())
+}

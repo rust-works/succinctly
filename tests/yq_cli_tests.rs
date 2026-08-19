@@ -16149,3 +16149,14 @@ fn test_jq_urid_malformed_escape_errors_1138() -> Result<()> {
     );
     Ok(())
 }
+
+/// #1239: destructuring under yq shares `extract_pattern_bindings` with jq
+/// mode, so the same null-propagation fix applies here too -- a nested
+/// pattern under an absent field resolves to `null` instead of erroring.
+#[test]
+fn test_destructuring_pattern_null_propagates_through_nested_object_1239() -> Result<()> {
+    let (out, code) = run_yq_stdin(". as {x: {y: $y}} | $y", "a: 1\n", &["-o", "json"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "null");
+    Ok(())
+}

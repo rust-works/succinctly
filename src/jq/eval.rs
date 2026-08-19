@@ -24311,6 +24311,15 @@ fn extract_pattern_bindings(
     match pattern {
         Pattern::Var(name) => Ok(vec![(name.clone(), value.clone())]),
         Pattern::Object(entries) => {
+            // Real jq lets `null` absorb any further field access the same
+            // way plain `.foo` on `null` does (`null | .foo` is `null`) --
+            // every variable this pattern (and anything nested inside it)
+            // would bind resolves to `null` instead of hard-erroring (#1239).
+            if matches!(value, OwnedValue::Null) {
+                let mut names = Vec::new();
+                collect_pattern_var_names(pattern, &mut names);
+                return Ok(names.into_iter().map(|n| (n, OwnedValue::Null)).collect());
+            }
             let mut bindings = Vec::new();
             for entry in entries {
                 // jq destructures by indexing once per key, so a non-object
@@ -24332,6 +24341,13 @@ fn extract_pattern_bindings(
             Ok(bindings)
         }
         Pattern::Array(patterns) => {
+            // Same `null`-absorbs-further-access tolerance as the Object arm
+            // above, for array-shaped destructuring (#1239).
+            if matches!(value, OwnedValue::Null) {
+                let mut names = Vec::new();
+                collect_pattern_var_names(pattern, &mut names);
+                return Ok(names.into_iter().map(|n| (n, OwnedValue::Null)).collect());
+            }
             let mut bindings = Vec::new();
             for (i, pat) in patterns.iter().enumerate() {
                 // As above: one index per element position, so the error is
@@ -34551,6 +34567,44 @@ mod tests {
             QueryResult::Owned(OwnedValue::Array(vs)) => {
                 assert_eq!(vs, vec![OwnedValue::Int(5), OwnedValue::Int(5)]);
             }
+        );
+    }
+
+    #[test]
+    fn test_destructuring_object_pattern_null_propagates_through_nested_object_1239() {
+        // `.x` is absent (-> null); real jq lets that null absorb the
+        // nested `{y: $y}` destructuring instead of erroring (#1239).
+        query!(br#"{"a":1}"#, r". as {x: {y: $y}} | $y",
+            QueryResult::Owned(OwnedValue::Null) => {}
+        );
+    }
+
+    #[test]
+    fn test_destructuring_object_pattern_null_propagates_through_nested_array_1239() {
+        query!(br#"{"a":1}"#, r". as {x: [$y]} | $y",
+            QueryResult::Owned(OwnedValue::Null) => {}
+        );
+    }
+
+    #[test]
+    fn test_destructuring_object_pattern_null_binds_every_nested_var_1239() {
+        // A multi-level, multi-var nested pattern under an absent field --
+        // every variable it would have bound resolves to null, not just the
+        // first one reached.
+        query!(br#"{"a":1}"#, r". as {x: {y: $y, z: [$p, $q]}} | [$y, $p, $q]",
+            QueryResult::Owned(OwnedValue::Array(vs)) => {
+                assert_eq!(vs, vec![OwnedValue::Null, OwnedValue::Null, OwnedValue::Null]);
+            }
+        );
+    }
+
+    #[test]
+    fn test_destructuring_object_pattern_non_null_non_object_still_errors_1239() {
+        // Control: null-tolerance doesn't widen into general leniency -- a
+        // genuinely wrong-typed value (not null, not an object) still hard-
+        // errors, same as before this fix.
+        query!(br#"{"x":"notobj"}"#, r". as {x: {y: $y}} | $y",
+            QueryResult::Error(_) => {}
         );
     }
 
