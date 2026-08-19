@@ -760,19 +760,19 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         }
         Expr::Reduce {
             input,
-            var,
+            pattern,
             init,
             update,
-        } => eval_reduce::<W, S>(input, var, init, update, value, optional),
+        } => eval_reduce::<W, S>(input, pattern, init, update, value, optional),
         Expr::Foreach {
             input,
-            var,
+            pattern,
             init,
             update,
             extract,
         } => eval_foreach::<W, S>(
             input,
-            var,
+            pattern,
             init,
             update,
             extract.as_deref(),
@@ -15596,21 +15596,25 @@ fn substitute_var(expr: &Expr, var_name: &str, replacement: &OwnedValue) -> Expr
         }
         Expr::Reduce {
             input,
-            var,
+            pattern,
             init,
             update,
         } => {
-            if var == var_name {
+            // Shadowed if the pattern binds var_name anywhere (#1201; mirrors
+            // `Expr::AsPattern`'s own `pattern_binds_var` shadow check just
+            // above, since a bare `$var` binding is just the single-variable
+            // case of this same question).
+            if pattern_binds_var(pattern, var_name) {
                 Expr::Reduce {
                     input: Box::new(substitute_var(input, var_name, replacement)),
-                    var: var.clone(),
+                    pattern: pattern.clone(),
                     init: Box::new(substitute_var(init, var_name, replacement)),
                     update: update.clone(), // shadowed
                 }
             } else {
                 Expr::Reduce {
                     input: Box::new(substitute_var(input, var_name, replacement)),
-                    var: var.clone(),
+                    pattern: pattern.clone(),
                     init: Box::new(substitute_var(init, var_name, replacement)),
                     update: Box::new(substitute_var(update, var_name, replacement)),
                 }
@@ -15618,15 +15622,15 @@ fn substitute_var(expr: &Expr, var_name: &str, replacement: &OwnedValue) -> Expr
         }
         Expr::Foreach {
             input,
-            var,
+            pattern,
             init,
             update,
             extract,
         } => {
-            if var == var_name {
+            if pattern_binds_var(pattern, var_name) {
                 Expr::Foreach {
                     input: Box::new(substitute_var(input, var_name, replacement)),
-                    var: var.clone(),
+                    pattern: pattern.clone(),
                     init: Box::new(substitute_var(init, var_name, replacement)),
                     update: update.clone(),
                     extract: extract.clone(),
@@ -15634,7 +15638,7 @@ fn substitute_var(expr: &Expr, var_name: &str, replacement: &OwnedValue) -> Expr
             } else {
                 Expr::Foreach {
                     input: Box::new(substitute_var(input, var_name, replacement)),
-                    var: var.clone(),
+                    pattern: pattern.clone(),
                     init: Box::new(substitute_var(init, var_name, replacement)),
                     update: Box::new(substitute_var(update, var_name, replacement)),
                     extract: extract
@@ -16273,7 +16277,7 @@ fn charge_budget(budget: &mut usize, what: &str) -> Option<Control> {
 /// Evaluate `reduce`: `reduce EXPR as $var (INIT; UPDATE)`.
 fn eval_reduce<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     input: &Expr,
-    var: &str,
+    pattern: &Pattern,
     init: &Expr,
     update: &Expr,
     value: StandardJson<'a, W>,
@@ -16325,17 +16329,25 @@ fn eval_reduce<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             QueryResult::Partial(vs, control) => (vs, Some(control)),
         };
 
-    // Substituting `$var` into UPDATE only depends on `input_val`, not on
-    // which INIT fork is running — hoist it out of the INIT-fork loop so a
-    // query with N INIT outputs pays for `substitute_var`'s AST rebuild
-    // once per input element, not N times (#695). Skipped entirely when
-    // there are no INIT forks to consume it.
+    // Destructuring `pattern` (and substituting its bindings) into UPDATE
+    // only depends on `input_val`, not on which INIT fork is running --
+    // hoist it out of the INIT-fork loop so a query with N INIT outputs
+    // pays for the AST rebuild once per input element, not N times (#695).
+    // Skipped entirely when there are no INIT forks to consume it.
     if init_values.is_empty() {
         return finish_fork(Vec::new(), init_control, optional);
     }
-    let substituted_updates: Vec<Expr> = input_values
+    // `Result`, not `Expr` -- a full destructuring pattern (#1201) can fail
+    // to match a given input element (`reduce .[] as {a:$a} (...)` on a
+    // non-object element), unlike the bare-`$var` case this replaces, which
+    // never fails. Computed eagerly per element (matching the existing
+    // per-element hoist above), but the failure itself is only surfaced
+    // when the loop below actually reaches that element -- see
+    // `substitute_pattern`'s own doc comment for why eager-computation-but-
+    // lazy-surfacing matters here.
+    let substituted_updates: Vec<Result<Expr, EvalError>> = input_values
         .iter()
-        .map(|v| substitute_var(update, var, v))
+        .map(|v| substitute_pattern(update, pattern, v))
         .collect();
 
     let mut outputs: Vec<OwnedValue> = Vec::new();
@@ -16356,6 +16368,13 @@ fn eval_reduce<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 aborted = Some(control);
                 break;
             }
+            let substituted = match substituted {
+                Ok(expr) => expr,
+                Err(e) => {
+                    aborted = Some(Control::Error(e.clone()));
+                    break;
+                }
+            };
             // `acc` is unconditionally overwritten below, so moving it out
             // (rather than cloning) is sound — nothing reads the old value
             // again (#695).
@@ -16672,7 +16691,7 @@ fn eval_owned_input<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// Evaluate `foreach`: `foreach EXPR as $var (INIT; UPDATE)` or `foreach EXPR as $var (INIT; UPDATE; EXTRACT)`.
 fn eval_foreach<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     input: &Expr,
-    var: &str,
+    pattern: &Pattern,
     init: &Expr,
     update: &Expr,
     extract: Option<&Expr>,
@@ -16734,14 +16753,31 @@ fn eval_foreach<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     if init_values.is_empty() {
         return finish_fork(Vec::new(), init_control, optional);
     }
-    let substituted_updates: Vec<Expr> = input_values
+    // `extract_pattern_bindings` runs once per input element and its
+    // (possible) failure is shared by both UPDATE's and EXTRACT's own
+    // substitution below -- see `substitute_pattern`'s doc comment for why
+    // this needs to stay a `Result` per element rather than failing eagerly
+    // for the whole input stream, same as `eval_reduce`.
+    let bindings_per_element: Vec<Result<Vec<(String, OwnedValue)>, EvalError>> = input_values
         .iter()
-        .map(|v| substitute_var(update, var, v))
+        .map(|v| extract_pattern_bindings(pattern, v))
         .collect();
-    let substituted_extracts: Option<Vec<Expr>> = extract.map(|ext| {
-        input_values
+    let substituted_updates: Vec<Result<Expr, EvalError>> = bindings_per_element
+        .iter()
+        .map(|b| {
+            b.as_ref()
+                .map(|b| substitute_bindings(update, b))
+                .map_err(Clone::clone)
+        })
+        .collect();
+    let substituted_extracts: Option<Vec<Result<Expr, EvalError>>> = extract.map(|ext| {
+        bindings_per_element
             .iter()
-            .map(|v| substitute_var(ext, var, v))
+            .map(|b| {
+                b.as_ref()
+                    .map(|b| substitute_bindings(ext, b))
+                    .map_err(Clone::clone)
+            })
             .collect()
     });
 
@@ -16761,6 +16797,13 @@ fn eval_foreach<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 aborted = Some(control);
                 break;
             }
+            let substituted_update = match substituted_update {
+                Ok(expr) => expr,
+                Err(e) => {
+                    aborted = Some(Control::Error(e.clone()));
+                    break;
+                }
+            };
             // `state` is unconditionally overwritten below, so moving it
             // out (rather than cloning) is sound — nothing reads the old
             // value again (#695).
@@ -16783,8 +16826,25 @@ fn eval_foreach<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                         aborted = Some(control);
                         break 'input;
                     }
+                    // Unreachable in practice: `extracts[idx]` shares its
+                    // per-element pattern bindings with `substituted_update`
+                    // at this same `idx` (both derived from the same
+                    // `bindings_per_element[idx]`, #1201), so if that
+                    // binding had failed, the `Err` match above would
+                    // already have aborted the loop before this element was
+                    // reached. Handled rather than `expect`-ed anyway: the
+                    // invariant is three parallel `Vec`s plus a `break`,
+                    // enforced by nothing the compiler checks, and this is
+                    // on a path an ordinary CLI query reaches.
+                    let ext_expr = match &extracts[idx] {
+                        Ok(expr) => expr,
+                        Err(e) => {
+                            aborted = Some(Control::Error(e.clone()));
+                            break 'input;
+                        }
+                    };
                     let (ext_vals, ext_control) =
-                        eval_owned_expr_fork::<S>(&extracts[idx], update_val, optional);
+                        eval_owned_expr_fork::<S>(ext_expr, update_val, optional);
                     // The steps already produced no longer vanish (#494).
                     outputs.extend(ext_vals);
                     if let Some(control) = ext_control {
@@ -25965,6 +26025,64 @@ fn collect_pattern_var_names(pattern: &Pattern, names: &mut Vec<String>) {
     }
 }
 
+/// Destructure `pattern` against `input_val`, then substitute the resulting
+/// bindings into `expr` -- `reduce`/`foreach`'s own pattern-binding
+/// counterpart to `try_pattern_alternatives`, but for exactly one pattern
+/// (no `?//` alternatives; real jq's grammar accepts them here too, but
+/// retrying an alternative after the body errors means rolling the
+/// accumulator back to this element's pre-UPDATE value -- something `. as
+/// PATTERN`'s independent-per-bound-value body never has to do, so
+/// `try_pattern_alternatives` has no analogue for it and #1201 doesn't
+/// attempt it; tracked by #1365) and no shared "unbound names default to
+/// null across alternatives" handling either, for the same reason.
+///
+/// The null-fill's absence is safe precisely *because* there's one pattern:
+/// on an `Ok` return `extract_pattern_bindings` binds every name the
+/// pattern mentions (absent object keys and past-the-end array indices come
+/// back as `OwnedValue::Null`, and a `null` input short-circuits to
+/// all-names-null), so the set `try_pattern_alternatives` would null-fill
+/// from is already exactly the set that came back bound.
+///
+/// Deliberately returns `Result` rather than eagerly `.unwrap()`-ing or
+/// propagating a `QueryResult` directly: both callers (`eval_reduce`,
+/// `eval_foreach`) build one of these per input element up front (mirroring
+/// the pre-#1201 `substitute_var(update, var, v)` map they replace), but
+/// must only surface a destructuring failure at the point their own
+/// per-element loop actually reaches that element -- not before, and not
+/// for elements after it that a `break`/`error` never lets the loop reach.
+/// `foreach`'s own per-step output (unlike `reduce`, which only ever emits
+/// the final accumulator) makes this eager-computation-but-lazy-surfacing
+/// split observable: `foreach (1,2,"bad",4) as {a:$a} (0; .+$a; .)` must
+/// still print `foreach`'s first two steps' outputs before erroring on the
+/// third, exactly like a real per-step `update`/`extract` error already
+/// does (confirmed live against jq 1.7.1).
+///
+/// `eval_foreach` needs the same bindings applied to *two* independent
+/// expressions (UPDATE and EXTRACT) per input element -- see
+/// `substitute_bindings` below, which this delegates to, so that caller can
+/// call `extract_pattern_bindings` once per element and reuse the result
+/// for both, rather than destructuring the same pattern against the same
+/// value twice.
+fn substitute_pattern(
+    expr: &Expr,
+    pattern: &Pattern,
+    input_val: &OwnedValue,
+) -> Result<Expr, EvalError> {
+    let bindings = extract_pattern_bindings(pattern, input_val)?;
+    Ok(substitute_bindings(expr, &bindings))
+}
+
+/// Apply an already-extracted set of pattern bindings to `expr`, one
+/// `substitute_var` call per binding. See `substitute_pattern` (which
+/// wraps this for the single-expression case) for why this is split out.
+fn substitute_bindings(expr: &Expr, bindings: &[(String, OwnedValue)]) -> Expr {
+    let mut result = expr.clone();
+    for (name, val) in bindings {
+        result = substitute_var(&result, name, val);
+    }
+    result
+}
+
 /// Extract variable bindings from a pattern matching an OwnedValue.
 fn extract_pattern_bindings(
     pattern: &Pattern,
@@ -26209,24 +26327,24 @@ fn expand_func_calls(expr: &Expr, func_name: &str, params: &[String], body: &Exp
         },
         Expr::Reduce {
             input,
-            var,
+            pattern,
             init,
             update,
         } => Expr::Reduce {
             input: Box::new(expand_func_calls(input, func_name, params, body)),
-            var: var.clone(),
+            pattern: pattern.clone(),
             init: Box::new(expand_func_calls(init, func_name, params, body)),
             update: Box::new(expand_func_calls(update, func_name, params, body)),
         },
         Expr::Foreach {
             input,
-            var,
+            pattern,
             init,
             update,
             extract,
         } => Expr::Foreach {
             input: Box::new(expand_func_calls(input, func_name, params, body)),
-            var: var.clone(),
+            pattern: pattern.clone(),
             init: Box::new(expand_func_calls(init, func_name, params, body)),
             update: Box::new(expand_func_calls(update, func_name, params, body)),
             extract: extract
@@ -26480,21 +26598,21 @@ fn substitute_func_param(expr: &Expr, param: &str, arg: &Expr) -> Expr {
         }
         Expr::Reduce {
             input,
-            var,
+            pattern,
             init,
             update,
         } => {
-            if var == param {
+            if pattern_binds_var(pattern, param) {
                 Expr::Reduce {
                     input: Box::new(substitute_func_param(input, param, arg)),
-                    var: var.clone(),
+                    pattern: pattern.clone(),
                     init: Box::new(substitute_func_param(init, param, arg)),
                     update: update.clone(),
                 }
             } else {
                 Expr::Reduce {
                     input: Box::new(substitute_func_param(input, param, arg)),
-                    var: var.clone(),
+                    pattern: pattern.clone(),
                     init: Box::new(substitute_func_param(init, param, arg)),
                     update: Box::new(substitute_func_param(update, param, arg)),
                 }
@@ -26502,15 +26620,15 @@ fn substitute_func_param(expr: &Expr, param: &str, arg: &Expr) -> Expr {
         }
         Expr::Foreach {
             input,
-            var,
+            pattern,
             init,
             update,
             extract,
         } => {
-            if var == param {
+            if pattern_binds_var(pattern, param) {
                 Expr::Foreach {
                     input: Box::new(substitute_func_param(input, param, arg)),
-                    var: var.clone(),
+                    pattern: pattern.clone(),
                     init: Box::new(substitute_func_param(init, param, arg)),
                     update: update.clone(),
                     extract: extract.clone(),
@@ -26518,7 +26636,7 @@ fn substitute_func_param(expr: &Expr, param: &str, arg: &Expr) -> Expr {
             } else {
                 Expr::Foreach {
                     input: Box::new(substitute_func_param(input, param, arg)),
-                    var: var.clone(),
+                    pattern: pattern.clone(),
                     init: Box::new(substitute_func_param(init, param, arg)),
                     update: Box::new(substitute_func_param(update, param, arg)),
                     extract: extract
@@ -35373,6 +35491,150 @@ mod tests {
                 assert_eq!(arr[1], OwnedValue::Int(3));
                 assert_eq!(arr[2], OwnedValue::Int(6));
             }
+        );
+    }
+
+    /// #1201: `reduce`/`foreach`'s own `as` clause now accepts a full
+    /// destructuring pattern (object or array), not just a bare `$var` --
+    /// the parser now calls the same `parse_pattern` `. as PATTERN` uses,
+    /// and the evaluator destructures each input element via
+    /// `extract_pattern_bindings`, the same primitive `. as PATTERN` uses
+    /// internally. Oracle-verified against jq 1.7.1.
+    #[test]
+    fn test_reduce_foreach_accept_a_full_pattern_1201() {
+        query!(br#"[{"a":1},{"a":2}]"#, r"reduce .[] as {a: $a} (0; . + $a)",
+            QueryResult::Owned(OwnedValue::Int(3)) => {}
+        );
+        query!(br"[[1,2],[3,4]]", r"reduce .[] as [$a,$b] (0; . + $a + $b)",
+            QueryResult::Owned(OwnedValue::Int(10)) => {}
+        );
+        assert_eq!(
+            outputs(
+                br#"[{"a":1},{"a":2}]"#,
+                r"foreach .[] as {a: $a} (0; . + $a; .)"
+            ),
+            ["1", "3"]
+        );
+        assert_eq!(
+            outputs(
+                br"[[1,2],[3,4]]",
+                r"foreach .[] as [$a,$b] (0; . + $a + $b; .)"
+            ),
+            ["3", "10"]
+        );
+    }
+
+    /// #1201: a pattern-match failure on one input element is a real,
+    /// per-element error -- confirmed distinct from `reduce`/`foreach`'s
+    /// other, already-tested error sources (INIT error, budget exceeded).
+    /// `reduce` never streams partial output (only ever the final
+    /// accumulator or nothing), so this is observably just an `Error`.
+    #[test]
+    fn test_reduce_pattern_match_failure_errors_1201() {
+        query!(br#"[{"a":1},"not an object",{"a":4}]"#, r"reduce .[] as {a: $a} (0; . + $a)",
+            QueryResult::Error(e) => {
+                assert!(e.message.contains("Cannot index"), "{}", e.message);
+            }
+        );
+    }
+
+    /// #1201: unlike `reduce`, `foreach` streams one output per step -- a
+    /// pattern-match failure partway through the input must still leave
+    /// every earlier step's already-produced output in place (the same
+    /// "keep the prefix" contract `regression_issue_494_foreach_keeps_the_prefix_before_an_error`
+    /// already pins for an ordinary per-step `UPDATE` error; #1201 needed
+    /// the same guarantee to hold for this *new* per-element error source
+    /// specifically, not just the pre-existing ones). Oracle-verified: real
+    /// jq 1.7.1 also prints `1`, `3` before erroring on the third element.
+    #[test]
+    fn test_foreach_pattern_match_failure_keeps_prefix_1201() {
+        query!(
+            br#"[{"a":1},{"a":2},"bad",{"a":4}]"#,
+            r"foreach .[] as {a: $a} (0; . + $a; .)",
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                let strs: Vec<String> = vs.iter().map(OwnedValue::to_json).collect();
+                assert_eq!(strs, ["1", "3"]);
+                assert!(e.message.contains("Cannot index"), "{}", e.message);
+            }
+        );
+    }
+
+    /// #1201: a pattern-bound variable shadows an outer variable of the
+    /// same name inside UPDATE/EXTRACT, mirroring `. as PATTERN`'s own
+    /// shadowing rule (and the pre-#1201 bare-`$var` case, which already
+    /// had this property via `substitute_var`'s `Expr::Reduce`/`Foreach`
+    /// shadow check).
+    #[test]
+    fn test_reduce_pattern_shadows_outer_var_1201() {
+        // If the pattern's own `$a` didn't shadow the outer `1 as $a`, this
+        // would fold `0 + 1 + 1` (using the outer value both times) instead
+        // of `0 + 10 + 20` (using each element's own destructured `.b`).
+        query!(
+            br#"[{"b":10},{"b":20}]"#,
+            r"1 as $a | reduce .[] as {b: $a} (0; . + $a)",
+            QueryResult::Owned(OwnedValue::Int(30)) => {}
+        );
+
+        // `substitute_var`'s `Expr::Foreach` shadow branch is a separate arm
+        // from `Expr::Reduce`'s, so it needs its own case: EXTRACT must see
+        // the element's own `$a` too, not the outer `1`.
+        assert_eq!(
+            outputs(
+                br#"[{"b":10},{"b":20}]"#,
+                r"1 as $a | foreach .[] as {b: $a} (0; . + $a; $a)"
+            ),
+            ["10", "20"]
+        );
+    }
+
+    /// #1201: the two AST passes that rewrite *function* bodies --
+    /// `expand_func_calls` (inlining a `def` whose body contains a
+    /// `reduce`/`foreach`) and `substitute_func_param` (threading a
+    /// parameter into one) -- both carry the binding `Pattern` through, and
+    /// `substitute_func_param` has to make the same shadow decision
+    /// `substitute_var` does. Four distinct arms, none reachable from the
+    /// plain `reduce .[] as PATTERN (…)` cases above. All oracle-verified
+    /// against jq 1.7.1.
+    #[test]
+    fn test_reduce_foreach_pattern_through_function_passes_1201() {
+        // expand_func_calls: the construct is inside the inlined body.
+        query!(br#"[{"a":1},{"a":2}]"#, r"def s: reduce .[] as {a:$a} (0; .+$a); s",
+            QueryResult::Owned(OwnedValue::Int(3)) => {}
+        );
+        assert_eq!(
+            outputs(
+                br#"[{"a":1},{"a":2}]"#,
+                r"def s: foreach .[] as {a:$a} (0; .+$a; .); s"
+            ),
+            ["1", "3"]
+        );
+
+        // substitute_func_param, non-shadowing: a filter parameter is
+        // substituted *into* UPDATE, which the pattern's own vars don't
+        // shadow (`g` is not a name the pattern binds).
+        query!(br#"[{"a":1},{"a":2}]"#, r"def f(g): reduce .[] as {a:$a} (0; . + ($a|g)); f(.*2)",
+            QueryResult::Owned(OwnedValue::Int(6)) => {}
+        );
+        assert_eq!(
+            outputs(
+                br#"[{"a":1},{"a":2}]"#,
+                r"def f(g): foreach .[] as {a:$a} (0; . + ($a|g); .); f(.*2)"
+            ),
+            ["2", "6"]
+        );
+
+        // substitute_func_param, shadowing: `def f($a)` also declares the
+        // filter parameter `a`, which the pattern rebinds -- so UPDATE keeps
+        // the element's `$a` (9), never the argument's (100).
+        query!(br#"[{"a":9}]"#, r"def f($a): reduce .[] as {a:$a} (0; .+$a); f(100)",
+            QueryResult::Owned(OwnedValue::Int(9)) => {}
+        );
+        assert_eq!(
+            outputs(
+                br#"[{"a":9}]"#,
+                r"def f($a): foreach .[] as {a:$a} (0; .+$a; [.,$a]); f(100)"
+            ),
+            ["[9,9]"]
         );
     }
 

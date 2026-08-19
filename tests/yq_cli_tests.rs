@@ -17894,3 +17894,30 @@ fn test_yaml_nested_alias_mark_is_dropped_at_its_own_path_763() -> Result<()> {
     assert_eq!(output, "l:\n  - &x {p: 1}\n  - p: 9\n");
     Ok(())
 }
+
+/// #1201: `reduce`/`foreach`'s binding clause is parsed by the shared
+/// `parse_pattern`, which both `ParserMode`s reach, so full destructuring
+/// patterns land in yq mode too. There is no oracle to match here -- real yq
+/// has no `reduce`/`foreach` at all (`lexer: invalid input text "reduce ..."`,
+/// confirmed against yq v4.53.3) -- so this pins succinctly's own extension
+/// rather than a divergence, and guards against the jq-mode fix silently
+/// failing to reach the other parser mode.
+#[test]
+fn test_yq_reduce_foreach_accept_full_pattern_1201() -> Result<()> {
+    let (output, exit_code) = run_yq_stdin(
+        ".a | reduce .[] as {x: $x} (0; . + $x)",
+        "a:\n  - x: 1\n  - x: 2\n",
+        &["-o", "json"],
+    )?;
+    assert_eq!(exit_code, 0, "output: {output:?}");
+    assert_eq!(output.trim(), "3");
+
+    let (output, exit_code) = run_yq_stdin(
+        ".a | foreach .[] as [$p, $q] (0; . + $p + $q; .)",
+        "a:\n  - [1, 2]\n  - [3, 4]\n",
+        &["-o", "json"],
+    )?;
+    assert_eq!(exit_code, 0, "output: {output:?}");
+    assert_eq!(output.lines().collect::<Vec<_>>(), ["3", "10"]);
+    Ok(())
+}

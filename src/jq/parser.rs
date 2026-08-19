@@ -1511,9 +1511,15 @@ impl<'a> Parser<'a> {
         self.consume_keyword("as");
         self.skip_ws();
 
-        // Parse variable name (with $)
-        self.expect('$')?;
-        let var = self.parse_ident()?;
+        // Parse binding pattern -- a bare `$var`, or a full destructuring
+        // pattern (#1201). Deliberately `parse_pattern`, not the
+        // `?//`-alternative-collecting `parse_as_pattern` that `. as
+        // PATTERN` uses: real jq *does* accept `?//` here too, but retrying
+        // an alternative after the body errors means rolling the
+        // accumulator back to this element's pre-UPDATE value, which the
+        // fold in `eval_reduce`/`eval_foreach` has no way to express.
+        // Deferred rather than overlooked -- tracked by #1365.
+        let pattern = self.parse_pattern()?;
         self.skip_ws();
 
         // Parse (init; update)
@@ -1529,7 +1535,7 @@ impl<'a> Parser<'a> {
 
         Ok(Expr::Reduce {
             input: Box::new(input),
-            var,
+            pattern,
             init: Box::new(init),
             update: Box::new(update),
         })
@@ -1552,9 +1558,15 @@ impl<'a> Parser<'a> {
         self.consume_keyword("as");
         self.skip_ws();
 
-        // Parse variable name (with $)
-        self.expect('$')?;
-        let var = self.parse_ident()?;
+        // Parse binding pattern -- a bare `$var`, or a full destructuring
+        // pattern (#1201). Deliberately `parse_pattern`, not the
+        // `?//`-alternative-collecting `parse_as_pattern` that `. as
+        // PATTERN` uses: real jq *does* accept `?//` here too, but retrying
+        // an alternative after the body errors means rolling the
+        // accumulator back to this element's pre-UPDATE value, which the
+        // fold in `eval_reduce`/`eval_foreach` has no way to express.
+        // Deferred rather than overlooked -- tracked by #1365.
+        let pattern = self.parse_pattern()?;
         self.skip_ws();
 
         // Parse (init; update[; extract])
@@ -1580,7 +1592,7 @@ impl<'a> Parser<'a> {
 
         Ok(Expr::Foreach {
             input: Box::new(input),
-            var,
+            pattern,
             init: Box::new(init),
             update: Box::new(update),
             extract,
@@ -5078,6 +5090,48 @@ mod tests {
         assert!(parse("until(.>1,.>2; .+1)").is_ok());
         assert!(parse("while(.<3; .+1,.)").is_ok());
         assert!(parse("while(.<3,.<5; .+1)").is_ok());
+    }
+
+    /// #1201: `reduce`/`foreach`'s `as` clause parses a full destructuring
+    /// pattern (object or array), not just a bare `$var` -- confirms the
+    /// resulting AST actually carries a non-`Pattern::Var` pattern (a bare
+    /// `is_ok()` check alone wouldn't distinguish "parsed the pattern
+    /// correctly" from "silently produced some other, wrong AST shape").
+    #[test]
+    fn test_reduce_foreach_accept_full_pattern_1201() {
+        let reduce_obj = parse("reduce .[] as {a: $a} (0; . + $a)").unwrap();
+        assert!(matches!(
+            reduce_obj,
+            Expr::Reduce {
+                pattern: Pattern::Object(_),
+                ..
+            }
+        ));
+
+        let reduce_arr = parse("reduce .[] as [$a, $b] (0; . + $a + $b)").unwrap();
+        assert!(matches!(
+            reduce_arr,
+            Expr::Reduce {
+                pattern: Pattern::Array(_),
+                ..
+            }
+        ));
+
+        let foreach_obj = parse("foreach .[] as {a: $a} (0; . + $a; .)").unwrap();
+        assert!(matches!(
+            foreach_obj,
+            Expr::Foreach {
+                pattern: Pattern::Object(_),
+                ..
+            }
+        ));
+
+        // A bare `$var` still parses to `Pattern::Var`, not a regression.
+        let reduce_var = parse("reduce .[] as $x (0; . + $x)").unwrap();
+        assert!(matches!(
+            reduce_var,
+            Expr::Reduce { pattern: Pattern::Var(ref v), .. } if v == "x"
+        ));
     }
 
     #[test]
