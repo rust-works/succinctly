@@ -14285,12 +14285,11 @@ fn resolve_static_tail<'a, S: EvalSemantics>(
 /// whatever branches were already extended, paired with that failure —
 /// `resolve_seq`'s own `Err`-side "keep what already resolved" contract.
 ///
-/// Shared by `resolve_seq`'s success path (every fan-out element resolved
-/// without escaping) and its escape path (#977: an earlier fan-out element
-/// itself escaped with a partial prefix) so the two can't independently
-/// drift on how a static tail gets applied — before this fix, the escape
-/// path skipped tail application entirely, silently dropping a literal
-/// `.foo`/`[N]`/`[N:M]` suffix from the partial output already produced.
+/// `resolve_seq` calls this exactly once, after its fan-out loop finishes —
+/// whether every element resolved cleanly or some element escaped along the
+/// way (#977, #1013). Funneling both outcomes through one call site is what
+/// keeps a purely-static tail (a literal `.foo`/`[N]`/`[N:M]`) from silently
+/// getting dropped off a partial, escaped prefix.
 fn apply_static_tail<'a, S: EvalSemantics>(
     branches: Vec<PathBranch<'a>>,
     tail: &[Expr],
@@ -14375,16 +14374,32 @@ fn resolve_seq<'a, S: EvalSemantics>(
     // those through element N+1, ...) rather than threading each branch
     // depth-first through the *entire* remaining pipe the way jq's own
     // generator composition does — so for a pipe with more than one dynamic
-    // element, a failure partway through preserves everything already
-    // completed in the *current* stage (this element, for the branches
-    // already processed) but not a later stage's contribution from an
-    // earlier-stage branch that had not yet reached it. That is a known
-    // simplification, not a byte-for-byte reproduction of jq's stream order;
-    // the single-dynamic-element case (the overwhelmingly common one, and
-    // the one every #530 sibling repro exercises) is exact.
+    // element, an escape partway through a stage still drops every
+    // not-yet-reached sibling branch *at that same stage* (branches from an
+    // earlier stage's own fan-out that hadn't reached this stage yet). That
+    // is a known simplification, not a byte-for-byte reproduction of jq's
+    // stream order; the single-dynamic-element case (the overwhelmingly
+    // common one, and the one every #530 sibling repro exercises) is exact.
+    // What *does* survive an escape (#1013): the escaping branch's own
+    // partial output (everything it produced before hitting its escape) is
+    // still threaded through every remaining dynamic stage and the tail,
+    // exactly like a branch that never escaped at all — see below.
     let tail = &flat[last_dynamic + 1..];
     let mut branches: Vec<PathBranch<'a>> = vec![(Vec::new(), Cow::Borrowed(value))];
-    for (i, element) in flat[..=last_dynamic].iter().enumerate() {
+    // Set the first time any stage's branch escapes, and overwritten by any
+    // later stage's own escape (#1013) — mirroring the pre-existing "a later
+    // step's own failure outranks an earlier deferred one" rule this
+    // function already applies between the fan-out loop and
+    // `apply_static_tail` below (also used by `resolve_slice_expr`'s
+    // `target_escape`). This matches jq's real generator order: jq threads
+    // an already-yielded value all the way through the rest of the pipe
+    // (potentially hitting a *later* escape) before it ever backtracks to
+    // try a fan-out's next alternative, so a downstream escape is the one
+    // jq actually raises, not an earlier one it never got back to. Verified
+    // live against jq 1.7.1: `path(.a[(0,error("t1"))] | .c[(0,error("t2"))]
+    // | .foo)` on `{"a":[{"c":[{"foo":1}]}]}` raises `t2`, not `t1`.
+    let mut deferred_escape: Option<EvalEscape> = None;
+    for element in &flat[..=last_dynamic] {
         let mut next = Vec::new();
         // Consumes `branches` (not `&branches`) so each `current` arrives by
         // value: only then can `resolve_against_cow` recover the branch's
@@ -14405,41 +14420,28 @@ fn resolve_seq<'a, S: EvalSemantics>(
                         path.extend(components);
                         next.push((path, resulting));
                     }
-                    // #977: apply the static tail to whatever branches
-                    // survived up to this escape, instead of dropping it —
-                    // mirroring the success path below via the shared
-                    // `apply_static_tail` helper. If tail application
-                    // itself also fails, that later failure takes priority
-                    // over the earlier deferred `e` (propagated via `?`);
-                    // otherwise the tail's fully-extended result carries
-                    // `e` forward via `path_result`, the same pairing
-                    // `resolve_slice_expr`'s `target_escape` already uses.
-                    //
-                    // Only when `i == last_dynamic`: `tail` is everything
-                    // *after* the pipe's last dynamic element, so an escape
-                    // at an *earlier* dynamic element (i < last_dynamic)
-                    // still has one or more further dynamic stages
-                    // (`flat[i+1..=last_dynamic]`) that haven't run yet —
-                    // splicing `tail` directly onto this stage's branches
-                    // would skip those entirely and fabricate a wrong
-                    // path/value (found in code review, confirmed live
-                    // against jq: `path(.a[(0,error("t"))] | .c[(0,1)] |
-                    // .foo)` produced a bogus `["a",0,"foo"]` instead of
-                    // the pre-existing, already-documented "known
-                    // simplification" truncation this preserves for that
-                    // shape instead).
-                    if i == last_dynamic {
-                        let tailed = apply_static_tail::<S>(next, tail, trackable)?;
-                        return path_result(tailed, Some(e));
-                    }
-                    return Err((next, e));
+                    // Keep whatever this branch produced before its escape,
+                    // record the escape, and stop attempting any
+                    // not-yet-reached sibling at this stage (the "known
+                    // simplification" above) — but do *not* return early:
+                    // `next` still feeds the remaining dynamic stages
+                    // (#1013) exactly like a branch that never escaped,
+                    // since e.g. `.a[(0,error("t"))]`'s successful `0`
+                    // alternative still has to run through everything after
+                    // it (`.c[(0,1)] | .foo`) before jq would ever raise
+                    // `t`.
+                    deferred_escape = Some(e);
+                    break;
                 }
             }
         }
         branches = next;
     }
 
-    apply_static_tail::<S>(branches, tail, trackable)
+    match apply_static_tail::<S>(branches, tail, trackable) {
+        Ok(tailed) => path_result(tailed, deferred_escape),
+        Err(tail_err) => Err(tail_err),
+    }
 }
 
 /// Rewrite every computed key in a path expression into the static component it
