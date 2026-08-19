@@ -805,13 +805,31 @@ fn join_sign_digits_with_optional_point(sign: &str, before: &str, after: &str) -
 ///
 /// The `split_pos > digits.len()` check below is a second, independent
 /// guard against `mantissa_str` having been truncated by
-/// `normalize_extreme_literal_mantissa`'s own render cap short of the digit
-/// `shifted_exp` needs to place the decimal point at -- provably
-/// unreachable *today* (a `shifted_exp` this function ever sees is bounded
-/// by a finite `f64`'s own representable magnitude, ~308, far below the
-/// render cap), so no live literal takes this branch; it exists as a safety
-/// net against a future, much smaller render cap rather than a case this
-/// code currently handles (code review, #1253).
+/// `normalize_extreme_literal_mantissa`'s own render cap
+/// (`MAX_RENDERED_MANTISSA_DIGITS`) short of the digit `shifted_exp` needs
+/// to place the decimal point at. Unreachable from
+/// `format_number_jq_compat`'s own call site (a `shifted_exp` reaching this
+/// function only from there is bounded by a finite `f64`'s representable
+/// magnitude, ~308, far below the render cap) -- but *is* live-reachable
+/// from `format_overflow_literal_mantissa`'s call site, whose `shifted_exp`
+/// has no comparable bound (only the unrelated `1_000_000_000` exponent
+/// ceiling). A literal with more than `MAX_RENDERED_MANTISSA_DIGITS + 1`
+/// significant digits *and* an `f64`-overflowing value (e.g.
+/// `"9".repeat(100_002) + "e0"`) hits exactly this: real jq stays plain at
+/// that scale (oracle-verified past 500,000 digits, no ceiling found), but
+/// this function's own decision already used the *true* `digit_count` to
+/// commit to "should be plain," then discovers mid-render that the
+/// (already-truncated) `mantissa_str` doesn't have enough surviving digits
+/// to actually place the decimal point -- so it falls to scientific
+/// notation instead, itself also mantissa-truncated by the same cap. This
+/// is an accepted, documented divergence from real jq at that scale (#1274
+/// code review), the same class of trade-off `MAX_RENDERED_MANTISSA_DIGITS`
+/// already makes elsewhere in this module -- fixing it exactly would need
+/// `normalize_extreme_literal_mantissa` to defer its own truncation
+/// decision until the caller's notation choice is known (currently the
+/// reverse order), which is a larger restructuring than this fallback
+/// alone; not attempted here given how rare the trigger combination is
+/// (`f64` overflow *and* a >100,000-significant-digit literal).
 ///
 /// `mantissa_str` is `"d"` or `"d.ddd"` (one leading digit,
 /// `normalize_extreme_literal_mantissa`'s normalized form) -- concatenating
@@ -3387,6 +3405,50 @@ mod tests {
         assert_eq!(
             format_number_jq_compat(format!("{mantissa}e1").as_bytes()),
             format!("9.{}E+400", "9".repeat(399))
+        );
+    }
+
+    /// #1274 characterization test (not a regression test -- this pins
+    /// known, accepted-divergent-from-jq behavior, not desired behavior;
+    /// see the testing skill's characterization-test convention). Before
+    /// this PR the mechanism was undocumented and the doc comment claiming
+    /// it "provably unreachable" was simply wrong; after this PR the
+    /// behavior itself is unchanged, only correctly documented and pinned.
+    /// If a future fix defers `normalize_extreme_literal_mantissa`'s
+    /// truncation until the caller's notation choice is known (the
+    /// restructuring `format_positive_shifted_plain`'s own doc comment
+    /// describes as the real fix), update or delete this test rather than
+    /// treating a failure here as a regression.
+    ///
+    /// `format_positive_shifted_plain`'s truncation-vs-decision mismatch is
+    /// live-reachable only via the overflow path
+    /// (`format_overflow_literal_mantissa`) since the ordinary path's own
+    /// `shifted_exp` can never exceed `MAX_RENDERED_MANTISSA_DIGITS`
+    /// (bounded by `f64`'s own finite range). One digit past
+    /// `MAX_RENDERED_MANTISSA_DIGITS` given digits (exactly filling the
+    /// render cap, no truncation yet): still plain, matching real jq
+    /// (oracle-verified past 500,000 digits). Two digits past it (one digit
+    /// truncated away): falls to scientific instead -- see
+    /// `format_positive_shifted_plain`'s own doc comment for why. Pins the
+    /// exact, intentional boundary so a future change to the render cap or
+    /// the truncation/decision ordering can't silently move it without a
+    /// test noticing.
+    #[test]
+    fn test_format_number_jq_compat_overflow_plain_scientific_flip_boundary_characterize_preexisting_bug_1274(
+    ) {
+        let at_cap = "9".repeat(100_001); // MAX_RENDERED_MANTISSA_DIGITS + 1 given digits
+        assert_eq!(
+            format_number_jq_compat(format!("{at_cap}e0").as_bytes()),
+            at_cap,
+            "at MAX_RENDERED_MANTISSA_DIGITS + 1 given digits: still plain, matching real jq"
+        );
+        let past_cap = "9".repeat(100_002); // MAX_RENDERED_MANTISSA_DIGITS + 2 given digits
+        assert_eq!(
+            format_number_jq_compat(format!("{past_cap}e0").as_bytes()),
+            format!("9.{}E+100001", "9".repeat(100_000)),
+            "at MAX_RENDERED_MANTISSA_DIGITS + 2 given digits: falls to \
+             (also-truncated) scientific, diverging from real jq's own \
+             plain output at this scale"
         );
     }
 
