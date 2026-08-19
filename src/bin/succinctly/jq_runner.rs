@@ -1716,7 +1716,7 @@ fn normalize_leading_zero_numbers(s: &str) -> String {
 /// span within the stream, and `json_bytes_to_owned_value` materializes
 /// the real result from that span.
 ///
-/// Deliberately doesn't share span-finding with `find_json_values` (above,
+/// Doesn't *primarily* share span-finding with `find_json_values` (above,
 /// #1163 follow-up question), despite both walking a byte string to
 /// delimit consecutive JSON values: `find_json_values` is a permissive,
 /// jq-compatible scanner (accepts a leading `.` as a number start, doesn't
@@ -1725,17 +1725,52 @@ fn normalize_leading_zero_numbers(s: &str) -> String {
 /// just `--slurpfile`'s CLI-arg error message -- the main input path's own
 /// call site (below `evaluate_input`) depends on this function rejecting
 /// everything `find_json_values` would reject, so its own internal
-/// `find_json_values` cross-check never diverges. Reusing
-/// `find_json_values` here for span-finding would either silently accept
-/// input this function currently rejects (weakening that invariant for
-/// both callers), or need a second, strict validation pass layered on top
-/// for no real gain over the `Deserializer` this already uses.
+/// `find_json_values` cross-check never diverges.
+///
+/// It *does* fall back to `find_json_values` on a `serde_json` failure,
+/// though (#1243): real jq's own number parser tolerates a leading zero
+/// (`007`) that strict JSON doesn't (#1094), and unlike `parse_json_value`'s
+/// own `--argjson` retry, there's no cheap single-string
+/// `normalize_leading_zero_numbers` fix here -- this function also backs
+/// plain `--slurp` on the crate's own *primary* document-input path, where
+/// stripping leading zeros from a re-validated copy but still needing to
+/// materialize spans from the *original* text hits the same
+/// offset-doesn't-shrink-in-lockstep problem `find_json_values` was built
+/// to solve for a single document already. `find_json_values` already
+/// tolerates a leading zero on its own (`number_literal_end` has no
+/// leading-zero rejection), so retrying through it instead, only on
+/// failure, fixes the divergence without weakening the happy path's
+/// validation: this function's accepted-input set only ever *grows* to
+/// match `find_json_values`'s own (never shrinks below `serde_json`'s), so
+/// the main input path's cross-check invariant above still holds -- it
+/// still never diverges, just via equality now instead of strict subset.
 fn parse_json_stream(s: &str) -> Result<Vec<OwnedValue>> {
     let s = s.trim();
     if s.is_empty() {
         return Ok(vec![]);
     }
 
+    match parse_json_stream_strict(s) {
+        Ok(values) => Ok(values),
+        Err(e) => {
+            let bytes = s.as_bytes();
+            match find_json_values(bytes) {
+                Ok(spans) => Ok(spans
+                    .into_iter()
+                    .map(|(start, end)| {
+                        crate::output::json_bytes_to_owned_value(&bytes[start..end])
+                    })
+                    .collect()),
+                Err(_) => Err(e),
+            }
+        }
+    }
+}
+
+/// The `serde_json`-validated core of [`parse_json_stream`], split out so
+/// its own doc comment can describe the fallback wrapping it without also
+/// re-explaining this half's mechanics inline.
+fn parse_json_stream_strict(s: &str) -> Result<Vec<OwnedValue>> {
     // Validate the whole stream via `serde_json::Deserializer` as before
     // (for its own error message and its rejection of anything that isn't
     // valid, whitespace-or-self-delineated-separated JSON) -- but discard
@@ -1779,6 +1814,15 @@ fn parse_json_stream(s: &str) -> Result<Vec<OwnedValue>> {
 /// `validate_and_materialize_json` can validate and materialize the same
 /// segment text directly -- no boundary-tracking needed, unlike
 /// `parse_json_stream` above.
+///
+/// Also retries a failed segment with its leading zeros stripped before
+/// giving up on it, mirroring `parse_json_value`'s own `--argjson` retry
+/// (#1094, extended here to `--seq`, #1243) -- real jq's own number parser
+/// tolerates a leading zero (`007`) that strict JSON doesn't, so `007e5`
+/// silently dropping as an unparseable record (RFC 7464's own recommended
+/// failure mode -- but only for content that's actually malformed, not for
+/// a shape jq itself accepts) was a real, jq-observable divergence, not a
+/// spelling nit.
 fn parse_json_seq(s: &str) -> Vec<OwnedValue> {
     let mut values = Vec::new();
 
@@ -1792,8 +1836,13 @@ fn parse_json_seq(s: &str) -> Vec<OwnedValue> {
         // Try to parse as JSON, silently ignore failures
         if let Ok(v) = validate_and_materialize_json(segment) {
             values.push(v);
+        } else {
+            let normalized = normalize_leading_zero_numbers(segment);
+            if normalized != segment && validate_json_str(&normalized).is_ok() {
+                values.push(crate::output::json_bytes_to_owned_value(segment.as_bytes()));
+            }
+            // Genuine parse failures are silently ignored per RFC 7464
         }
-        // Parse failures are silently ignored per RFC 7464
     }
 
     values
@@ -2981,6 +3030,59 @@ mod tests {
         let stream = r#"{"a":1} {"b":2} {"c":3}"#;
         let values = parse_json_stream(stream).unwrap();
         assert_eq!(values.len(), 3);
+    }
+
+    /// #1243: a leading-zero number token in a `--slurpfile`/`--slurp`
+    /// stream no longer errors outright -- `serde_json::Deserializer`
+    /// rejects it, but the fallback through `find_json_values` (which
+    /// already tolerates a leading zero, same as `#1094` established for
+    /// the primary document-input path) accepts it and materializes with
+    /// full source-spelling fidelity, matching real jq's own `7E+5`.
+    #[test]
+    fn test_parse_json_stream_tolerates_leading_zero_1243() {
+        let values = parse_json_stream("007e5").unwrap();
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0].to_json(), "7E+5");
+    }
+
+    /// A leading zero anywhere in a multi-value stream is tolerated, not
+    /// just when it's the only value -- and every other value keeps its
+    /// own exact spelling untouched.
+    #[test]
+    fn test_parse_json_stream_tolerates_leading_zero_among_other_values_1243() {
+        let values = parse_json_stream("42 007e5 \"hi\"").unwrap();
+        assert_eq!(values.len(), 3);
+        assert_eq!(values[0].to_json(), "42");
+        assert_eq!(values[1].to_json(), "7E+5");
+        assert_eq!(values[2].to_json(), "\"hi\"");
+    }
+
+    /// Control: genuinely malformed input (not just a leading zero) still
+    /// errors -- the fallback doesn't silently widen into general leniency.
+    #[test]
+    fn test_parse_json_stream_still_rejects_genuine_malformed_input_1243() {
+        assert!(parse_json_stream("{invalid").is_err());
+    }
+
+    /// #1243: same leading-zero tolerance as `--slurpfile`/`--slurp` above,
+    /// for `--seq` (RFC 7464) -- previously silently dropped the whole
+    /// record (its own documented "ignore parse failures" fallback) instead
+    /// of accepting it the way real jq does.
+    #[test]
+    fn test_parse_json_seq_tolerates_leading_zero_1243() {
+        let values = parse_json_seq("\x1E007e5\n");
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0].to_json(), "7E+5");
+    }
+
+    /// Control: a genuinely malformed `--seq` record is still silently
+    /// dropped (RFC 7464's own documented behavior), not resurrected by the
+    /// leading-zero retry.
+    #[test]
+    fn test_parse_json_seq_still_drops_genuine_malformed_record_1243() {
+        let values = parse_json_seq("\x1E{invalid\n\x1E5\n");
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0].to_json(), "5");
     }
 
     /// #1192: `standard_json_to_jq_value` now surfaces a genuinely
