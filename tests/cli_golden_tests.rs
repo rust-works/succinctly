@@ -4,7 +4,7 @@
 //! Run with: cargo test --features cli --test cli_golden_tests
 
 use anyhow::Result;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
 /// Maximum retries for cargo run commands that fail with exit code 101.
@@ -345,5 +345,90 @@ fn test_json_generate_reproducible() -> Result<()> {
         "Different seed should produce different output"
     );
 
+    Ok(())
+}
+
+/// Runs the pre-built `succinctly` binary directly (unlike `run_cli` above, which
+/// spawns a second, uninstrumented binary via `cargo run` and so is invisible to
+/// `cargo llvm-cov`) -- needed for #1212's own coverage, since its
+/// `validate_generated_json` consolidation and both call sites are otherwise
+/// unexercised by any existing test in this file.
+fn run_cli_bin(args: &[&str]) -> Result<(String, String, i32)> {
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()?;
+
+    let exit_code = output.status.code().unwrap_or(-1);
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    Ok((stdout, stderr, exit_code))
+}
+
+/// #1212: `--verify` alone validates and discards the parsed tree (the
+/// `keep_parsed = false` path through `validate_generated_json`).
+#[test]
+fn test_json_generate_verify_only_1212() -> Result<()> {
+    let (stdout, stderr, code) = run_cli_bin(&["json", "generate", "1kb", "--verify"])?;
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(stderr.contains("JSON validated successfully"), "{stderr}");
+    // No --pretty, no -o: output goes to stdout unmodified.
+    serde_json::from_str::<serde_json::Value>(stdout.trim())?;
+    Ok(())
+}
+
+/// #1212: `--pretty` alone (no `--verify`) takes the `None` arm of
+/// `validate_generated_json`'s reuse match -- its own independent parse, not the
+/// validation pass's (there is none).
+#[test]
+fn test_json_generate_pretty_only_1212() -> Result<()> {
+    let (stdout, stderr, code) = run_cli_bin(&["json", "generate", "1kb", "--pretty"])?;
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(!stderr.contains("validated"), "{stderr}");
+    assert!(
+        stdout.starts_with("{\n"),
+        "expected pretty-printed JSON, got: {stdout:?}"
+    );
+    serde_json::from_str::<serde_json::Value>(&stdout)?;
+    Ok(())
+}
+
+/// #1212: `--verify --pretty` together is the one combination that reuses
+/// `validate_generated_json`'s own parsed tree (`keep_parsed = true`, the `Some`
+/// arm) instead of parsing the generated JSON a second time.
+#[test]
+fn test_json_generate_verify_and_pretty_1212() -> Result<()> {
+    let (stdout, stderr, code) = run_cli_bin(&["json", "generate", "1kb", "--verify", "--pretty"])?;
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(stderr.contains("JSON validated successfully"), "{stderr}");
+    assert!(
+        stdout.starts_with("{\n"),
+        "expected pretty-printed JSON, got: {stdout:?}"
+    );
+    serde_json::from_str::<serde_json::Value>(&stdout)?;
+    Ok(())
+}
+
+/// #1212: `generate-suite --verify`'s own, separately-worded call site
+/// (`validate_generated_json(&json, false)` with a per-file error context) --
+/// keeps everything within `--max-size` tiny so the suite finishes quickly.
+#[test]
+fn test_json_generate_suite_verify_1212() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (_, stderr, code) = run_cli_bin(&[
+        "json",
+        "generate-suite",
+        "--verify",
+        "--max-size",
+        "2kb",
+        "--output-dir",
+        dir.path().to_str().expect("tempdir path is valid UTF-8"),
+    ])?;
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(
+        stderr.contains("All files validated successfully"),
+        "{stderr}"
+    );
     Ok(())
 }
