@@ -8757,21 +8757,23 @@ fn test_resolve_seq_static_tail_failure_outranks_earlier_fanout_escape_977() -> 
     Ok(())
 }
 
-/// #977 (found in code review of the fix itself): when a pipe has 2+
-/// dynamic (fan-out) elements and an *earlier* one escapes — not the last,
-/// i.e. `flat`'s dynamic element at some index `i < last_dynamic` — the
-/// static tail lives *after* `last_dynamic`, not after `i`. Applying it
-/// directly to `i`'s partial branches (as an early version of this fix
-/// did) skips every dynamic stage between `i` and `last_dynamic` entirely
-/// and fabricates a wrong path/value instead of the pre-existing,
-/// already-documented "known simplification" truncation `resolve_seq`'s
-/// own top comment describes for this exact shape. Verified against jq
-/// 1.7.1: `.c[(0,1)]` (the second dynamic element) must still run before
-/// `.foo` (the tail) is ever applied — the correct output threads through
-/// it (`["a",0,"c",0,"foo"]`/`["a",0,"c",1,"foo"]`); this pins the
-/// truncated-but-honest fallback succinctly's own architecture produces
-/// instead (a pre-existing, accepted limitation for multi-dynamic-element
-/// pipes, not what this test asserts jq itself does).
+/// #977 (found in code review of the fix itself) → threading completed by
+/// #1013: when a pipe has 2+ dynamic (fan-out) elements and an *earlier*
+/// one escapes — not the last, i.e. `flat`'s dynamic element at some index
+/// `i < last_dynamic` — the static tail lives *after* `last_dynamic`, not
+/// after `i`. An early #977 review draft applied the tail directly to
+/// `i`'s partial branches, skipping every dynamic stage between `i` and
+/// `last_dynamic` entirely and fabricating a wrong path/value
+/// (`["a",0,"foo"]`); that was rejected in review, and merged #977
+/// returned the truncated partial prefix (`["a",0]`) as a documented,
+/// accepted limitation instead. #1013 lifted it: the escape is deferred
+/// and the surviving branches thread through the remaining dynamic stages
+/// and the tail. Verified against jq 1.7.1 for both shapes: `.c[(0,1)]`
+/// (the second dynamic element) runs before `.foo` (the tail) is applied,
+/// and the second shape's `.k[.c]` resolves `.c` = "k" against `.a[0]`,
+/// then indexes `.k`'s value by "k" (null) so `.d` threads on — the
+/// original deferred "t" still surfaces in both, never a bogus type error
+/// from misapplying the tail to `.a[0]`.
 #[test]
 fn test_resolve_seq_earlier_fanout_escape_does_not_skip_later_dynamic_stage_977() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(
@@ -8779,23 +8781,93 @@ fn test_resolve_seq_earlier_fanout_escape_does_not_skip_later_dynamic_stage_977(
         Some(r#"{"a":[{"c":[{"foo":1},{"foo":2}]}]}"#),
     )?;
     assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
-    // Must not fabricate `["a",0,"foo"]` by skipping `.c[(0,1)]` — the
-    // pre-existing "known simplification" truncates to the partial prefix
-    // through the escaping element instead.
-    assert_eq!(stdout, "[\"a\",0]\n");
+    // Must not fabricate `["a",0,"foo"]` by skipping `.c[(0,1)]`, nor
+    // truncate to the old `["a",0]` fallback: the surviving branch threads
+    // the second dynamic element and the `.foo` tail before "t" surfaces.
+    assert_eq!(stdout, "[\"a\",0,\"c\",0,\"foo\"]\n[\"a\",0,\"c\",1,\"foo\"]\n");
     assert!(stderr.contains('t'), "stderr: {stderr:?}");
 
-    // A second shape, where the skipped-over tail would otherwise silently
+    // A second shape, where a skipped-over tail would otherwise silently
     // resolve against unrelated data and mask the original escape (found
-    // in review): confirms the original deferred "t" still surfaces,
-    // rather than a bogus type error from misapplying `.d` to `.a[0]`.
+    // in review).
     let (stdout, stderr, code) = run_jq_full(
         &["-c", r#"path(.a[(0,error("t"))] | .k[.c] | .d)"#],
         Some(r#"{"a":[{"c":"k","k":{"d":99}}]}"#),
     )?;
     assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
-    assert_eq!(stdout, "[\"a\",0]\n");
+    assert_eq!(stdout, "[\"a\",0,\"k\",\"k\",\"d\"]\n");
     assert!(stderr.contains('t'), "stderr: {stderr:?}");
+    Ok(())
+}
+
+/// #1013: `resolve_seq`'s fan-out loop used to truncate at the first
+/// escaping dynamic element — for a pipe with 2+ dynamic elements, an
+/// earlier element's escape returned its partial prefix (`["a",0]`)
+/// without running the remaining dynamic stages or the static tail, where
+/// jq 1.7.1's depth-first generators thread every branch produced before
+/// the error fires all the way through. The fix defers the escape and
+/// keeps threading the surviving branches stage by stage. All four shapes
+/// verified against jq 1.7.1; the last two are the two bugs the #1258
+/// review found in the first fix attempt's copied-inner-loop approach.
+#[test]
+fn test_resolve_seq_threads_remaining_dynamic_stages_after_earlier_escape_1013() -> Result<()> {
+    // Three dynamic stages, escape in the first: the surviving ["a",0]
+    // branch threads both later dynamic stages and the `.d` tail before
+    // the deferred "t" surfaces.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r#"path(.a[(0,error("t"))] | .b[(0,1)] | .c[(0,1)] | .d)"#],
+        Some(r#"{"a":[{"b":[{"c":[{"d":1},{"d":2}]},{"c":[{"d":3},{"d":4}]}]}]}"#),
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(
+        stdout,
+        "[\"a\",0,\"b\",0,\"c\",0,\"d\"]\n[\"a\",0,\"b\",0,\"c\",1,\"d\"]\n[\"a\",0,\"b\",1,\"c\",0,\"d\"]\n[\"a\",0,\"b\",1,\"c\",1,\"d\"]\n"
+    );
+    assert!(stderr.contains('t'), "stderr: {stderr:?}");
+
+    // Escape in a *middle* dynamic stage: `.b[(0,error("t"))]`'s surviving
+    // ["a",0,"b",0] branch still threads `.c[(0,1)]` and `.d`, while the
+    // stage's unprocessed sibling branch (["a",1]) is dropped — jq's
+    // depth-first generators die at the error before ever reaching it, so
+    // nothing under ["a",1] may appear.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r#"path(.a[(0,1)] | .b[(0,error("t"))] | .c[(0,1)] | .d)"#],
+        Some(r#"{"a":[{"b":[{"c":[{"d":1},{"d":2}]}]},{"b":[{"c":[{"d":3},{"d":4}]}]}]}"#),
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[\"a\",0,\"b\",0,\"c\",0,\"d\"]\n[\"a\",0,\"b\",0,\"c\",1,\"d\"]\n");
+    assert!(stderr.contains('t'), "stderr: {stderr:?}");
+
+    // A later stage's escape overwrites the deferred earlier one (verified
+    // against jq 1.7.1 in the #1258 review): depth-first, the surviving
+    // ["a",0] branch hits `.b[(0,error("late"))]`'s error before the pipe
+    // ever revisits `.a`'s generator to raise "early", so "late" is the
+    // error that surfaces — and the ["a",1] sibling is again dropped
+    // rather than threaded.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r#"path(.a[(0,1,error("early"))] | .b[(0,error("late"))])"#],
+        Some(r#"{"a":[{"b":[10]},{"b":[20]}]}"#),
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[\"a\",0,\"b\",0]\n");
+    assert!(stderr.contains("late"), "stderr: {stderr:?}");
+    assert!(!stderr.contains("early"), "stderr: {stderr:?}");
+
+    // The escaping stage's unprocessed siblings must not fabricate paths
+    // (verified against jq 1.7.1 in the #1258 review): `.a`'s generator
+    // yields 0 and 1 before "t", but the first branch's `.b[.c]` fails
+    // indexing an array with "bad", which overwrites the deferred "t" and
+    // leaves no surviving branch — jq emits no paths at all.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r#"path(.a[(0,1,error("t"))] | .b[.c])"#],
+        Some(r#"{"a":[{"b":[10,20],"c":"bad"},{"b":[10,20],"c":1}]}"#),
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert!(
+        stderr.contains("Cannot index array with string \"bad\""),
+        "stderr: {stderr:?}"
+    );
     Ok(())
 }
 
