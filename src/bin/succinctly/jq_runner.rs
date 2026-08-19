@@ -845,6 +845,10 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
                     continue;
                 }
             };
+            // `values`' end offsets are non-decreasing (find_json_values is
+            // a single left-to-right scan), so one LineCounter shared across
+            // every value in this file keeps the whole loop O(n) (#1213).
+            let mut line_counter = LineCounter::new(raw);
             for (start, end) in values {
                 let json_bytes = &raw[start..end];
 
@@ -868,7 +872,7 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
                 let index = JsonIndex::build(json_bytes);
                 // jq names the line the input value ends on, counted in the
                 // whole file rather than in this value's slice.
-                let at = InputLocation::at(filename.as_deref(), line_at(raw, end));
+                let at = InputLocation::at(filename.as_deref(), line_counter.advance_to(end));
                 let results = evaluate_bytes_lazy(json_bytes, &expr, &index, &at, &mut sink);
 
                 // Consume results to free memory after each value is written
@@ -1262,10 +1266,16 @@ impl InputLocations {
     /// Falls back to the last content line for every value when the counts
     /// disagree — modes that skip unparsable records can produce fewer values
     /// than the scan found offsets, and a wrong line is worse than a vague one.
+    ///
+    /// `ends` is already non-decreasing (both of this crate's own callers --
+    /// `find_json_values`/`json_seq_ends` -- are single left-to-right scans),
+    /// so one shared `LineCounter` keeps this whole loop O(n) rather than the
+    /// O(n^2) a per-value `line_at` rescan from byte 0 produced (#1213).
     fn extend_from_ends(&mut self, src: usize, raw: &str, ends: &[usize], values: usize) {
         if ends.len() == values {
+            let mut line_counter = LineCounter::new(raw.as_bytes());
             for &end in ends {
-                self.push(src, line_at(raw.as_bytes(), end));
+                self.push(src, line_counter.advance_to(end));
             }
         } else {
             let line = content_lines(raw);
@@ -1321,6 +1331,55 @@ fn read_file_bytes(path: &Path) -> Result<Vec<u8>> {
     std::fs::read(path).with_context(|| format!("Failed to read file: {}", path.display()))
 }
 
+/// Incremental version of [`line_at`] for a caller visiting a monotonically
+/// increasing sequence of `end` offsets into the same `bytes` (#1213) --
+/// every per-value location in a multi-value document or `--seq`/`--slurp`
+/// stream, not just a single error report. `line_at` itself scans from byte
+/// 0 on every call; calling it once per value in an N-value input makes the
+/// whole loop O(N^2) (confirmed: 80k JSON-lines records took ~27s wall time
+/// against a real-jq baseline under half a second). This type instead scans
+/// each byte of `bytes` at most once across the whole sequence of calls, by
+/// remembering how far the previous call already counted.
+///
+/// `advance_to` must be called with non-decreasing `end` values -- the same
+/// order [`find_json_values`]/`json_seq_ends` already produce their offsets
+/// in, since both are themselves single left-to-right scans.
+struct LineCounter<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+    newlines_before_pos: usize,
+}
+
+impl<'a> LineCounter<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self {
+            bytes,
+            pos: 0,
+            newlines_before_pos: 0,
+        }
+    }
+
+    /// Same result [`line_at`] would return for this `end`, given every
+    /// prior call passed a `end` no greater than this one.
+    fn advance_to(&mut self, end: usize) -> usize {
+        let end = end.min(self.bytes.len());
+        debug_assert!(
+            end >= self.pos,
+            "LineCounter::advance_to called with a smaller end than a previous call"
+        );
+        self.newlines_before_pos += self.bytes[self.pos..end]
+            .iter()
+            .filter(|&&b| b == b'\n')
+            .count();
+        self.pos = end;
+        let mut count = self.newlines_before_pos;
+        if self.bytes.get(end) == Some(&b'\n') {
+            count += 1;
+        }
+        count
+    }
+}
+
 /// jq's line number for the value whose exclusive end offset is `end` within
 /// `bytes`.
 ///
@@ -1330,8 +1389,11 @@ fn read_file_bytes(path: &Path) -> Result<Vec<u8>> {
 /// time the value's boundary is confirmed: every newline strictly before
 /// `end`, plus exactly one byte of trailing lookahead if it exists and is a
 /// newline. It is zero-based, not one-based — a value ending before any `\n`
-/// reports line 0. Only reached on the error path, so a plain scan is cheap
-/// enough.
+/// reports line 0. Only for a single, one-off lookup (a parse-error report,
+/// reached at most once per input) -- a caller visiting many `end` values
+/// for the same `bytes` in increasing order (one location per value in a
+/// multi-value document) must use [`LineCounter`] instead, or an O(n) scan
+/// per call becomes an O(n^2) loop (#1213).
 fn line_at(bytes: &[u8], end: usize) -> usize {
     let end = end.min(bytes.len());
     let mut count = bytes[..end].iter().filter(|&&b| b == b'\n').count();
@@ -2947,6 +3009,40 @@ mod tests {
         let bytes = b"1\n2\n";
         assert_eq!(line_at(bytes, 1), 1);
         assert_eq!(line_at(bytes, 3), 2);
+    }
+
+    /// #1213: `LineCounter::advance_to` must return exactly what `line_at`
+    /// would for the same offset, for every offset in a monotonic sequence
+    /// -- the whole point of introducing it is replacing a hot loop's
+    /// repeated `line_at` calls without changing what line number any value
+    /// gets reported at.
+    #[test]
+    fn test_line_counter_matches_line_at_for_monotonic_sequence_1213() {
+        let bytes = b"1\n2\n{\n\"a\":1\n}\n3";
+        let ends: Vec<usize> = find_json_values(bytes)
+            .unwrap()
+            .into_iter()
+            .map(|(_, end)| end)
+            .collect();
+
+        let mut counter = LineCounter::new(bytes);
+        for &end in &ends {
+            assert_eq!(counter.advance_to(end), line_at(bytes, end), "end={end}");
+        }
+    }
+
+    /// A value with no `\n` bytes between it and the previous one (adjacent
+    /// values with no separator between them, e.g. `12` split into `1` then
+    /// `2` isn't valid, but two values on the same line with only a space
+    /// between them is) still gets the correct, un-advanced line number --
+    /// `advance_to`'s internal scan window can be empty.
+    #[test]
+    fn test_line_counter_same_line_consecutive_values_1213() {
+        let bytes = b"1 2\n3";
+        let mut counter = LineCounter::new(bytes);
+        assert_eq!(counter.advance_to(1), 0); // "1" ends before any '\n'
+        assert_eq!(counter.advance_to(3), 1); // "2" ends right before the '\n'
+        assert_eq!(counter.advance_to(5), 1); // "3" ends at EOF, no lookahead
     }
 
     #[test]
