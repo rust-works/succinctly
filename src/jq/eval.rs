@@ -12511,6 +12511,21 @@ fn push_path_components(out: &mut Vec<Expr>, expr: &Expr) {
             }
         }
         Expr::Paren(inner) => push_path_components(out, inner),
+        // A `?` on a whole multi-component group ((.a[0:1])? | .[0]) needs
+        // each of the group's own components individually scoped with
+        // that `?` -- the same reasoning `splice_optional_group` already
+        // applies for `update_path`/`delete_at_path` (#1294) -- rather
+        // than being pushed as one opaque `Optional(Pipe(...))` element.
+        // Without this, neither `split_at_slice`'s slice scan (which
+        // unwraps `Optional`/`Paren` but not into a `Pipe` inside them)
+        // nor `get_path_mut`'s own per-step `Identity | Field | Index`
+        // match can see through it, and the whole thing falls to
+        // "invalid path component" (#1311).
+        Expr::Optional(inner) => {
+            let mut group = Vec::new();
+            push_path_components(&mut group, inner);
+            out.extend(group.into_iter().map(|e| Expr::Optional(Box::new(e))));
+        }
         other => out.push(other.clone()),
     }
 }
@@ -40832,6 +40847,37 @@ mod tests {
             // A genuinely non-sliceable target under this same nested shape
             // is a navigation failure too, and stays suppressed.
             (br#"{"a":true}"#, ".a[0:1]?[0] = 9", Ok(r#"{"a":true}"#)),
+        ]);
+    }
+
+    #[test]
+    fn test_assign_optional_group_with_more_path_1311() {
+        // #1311: `?` on a *whole multi-component group* ((.a[0:1])? | .[0]),
+        // not directly on the slice itself the way #1303's Gap 2 covered --
+        // `push_path_components` pushed the group as one opaque
+        // `Optional(Paren(Pipe(...)))` element, which neither
+        // `split_at_slice`'s slice scan nor `get_path_mut`'s own per-step
+        // match could see through. All confirmed against real jq 1.7.1.
+        assert_outcomes(&[
+            (
+                br#"{"a":[1,2,3]}"#,
+                "((.a[0:1])? | .[0]) = 9",
+                Ok(r#"{"a":[9,2,3]}"#),
+            ),
+            // A genuinely non-sliceable target under this same grouped
+            // shape is a navigation failure, and stays suppressed.
+            (
+                br#"{"a":true}"#,
+                "((.a[0:1])? | .[0]) = 9",
+                Ok(r#"{"a":true}"#),
+            ),
+            // Multiple components inside the group, each individually
+            // suppressible -- not just a bare slice.
+            (
+                br#"{"a":{"b":[1,2,3]}}"#,
+                "((.a.b[0:1])? | .[0]) = 9",
+                Ok(r#"{"a":{"b":[9,2,3]}}"#),
+            ),
         ]);
     }
 
