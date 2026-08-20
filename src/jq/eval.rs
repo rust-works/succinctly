@@ -12077,10 +12077,38 @@ fn update_path<S: EvalSemantics>(
                     // when a branch resolved to more than one component, so
                     // unwrapping can expose a nested pipe. Splice it in rather
                     // than recursing on it alone, which would strand `rest`.
+                    //
+                    // Wrap the group's own components in `Optional` when
+                    // `here` is set, rather than threading `here` through as
+                    // this call's blanket `optional` -- that kept suppressing
+                    // whatever follows the group too, past its own scope
+                    // (#1294): `(.a|.c)? | .y` must suppress a failure in
+                    // `.a`/`.c` (the `try (.a|.c)` the `?` desugars to) but
+                    // not `.y` failing afterward, outside that scope. Each
+                    // spliced-in component now self-reports its own
+                    // optionality via the wrapper, which `unwrap_path_component`
+                    // already peels at every step -- `rest` (`exprs[1..]`),
+                    // left unwrapped, keeps whatever optionality it already
+                    // had on its own once `optional` (not `here`) is passed
+                    // as this call's baseline again.
                     Expr::Pipe(inner) => {
-                        let mut spliced = inner.clone();
+                        let mut spliced: Vec<Expr> = if here {
+                            inner
+                                .iter()
+                                .cloned()
+                                .map(|e| Expr::Optional(Box::new(e)))
+                                .collect()
+                        } else {
+                            inner.clone()
+                        };
                         spliced.extend_from_slice(&exprs[1..]);
-                        update_path::<S>(root, &Expr::Pipe(spliced), filter_expr, here, scalar_noop)
+                        update_path::<S>(
+                            root,
+                            &Expr::Pipe(spliced),
+                            filter_expr,
+                            optional,
+                            scalar_noop,
+                        )
                     }
                     // The chain continues *inside* the slice, so the update
                     // runs against the sub-array and is spliced back:
@@ -20516,10 +20544,25 @@ fn delete_at_path(
                     },
                     // A nested pipe from `Optional(Pipe([…]))` — splice, do
                     // not recurse on it alone, or `rest` is stranded.
+                    //
+                    // Same per-slot scoping as `update_path`'s matching arm
+                    // (#1294): wrap the group's own components in `Optional`
+                    // when `here` is set, instead of threading `here` through
+                    // as this call's blanket `optional` — that let a `?` on
+                    // the group (`del((.a|.c)? | .y)`) keep suppressing `.y`
+                    // failing afterward too, outside the group's own scope.
                     Expr::Pipe(inner) => {
-                        let mut spliced = inner.clone();
+                        let mut spliced: Vec<Expr> = if here {
+                            inner
+                                .iter()
+                                .cloned()
+                                .map(|e| Expr::Optional(Box::new(e)))
+                                .collect()
+                        } else {
+                            inner.clone()
+                        };
                         spliced.extend_from_slice(&exprs[1..]);
-                        delete_at_path(root, &Expr::Pipe(spliced), here, yq_mode)
+                        delete_at_path(root, &Expr::Pipe(spliced), optional, yq_mode)
                     }
                     // The chain continues *inside* the slice, so the delete
                     // happens in the sub-array and the remainder is spliced
@@ -39707,6 +39750,39 @@ mod tests {
                 Err(r#"Cannot index number with string "y""#),
             ),
         ]);
+    }
+
+    #[test]
+    fn test_update_and_del_optional_group_scopes_suppression_to_the_group_only_1294() {
+        // #1294: `update_path`'s (`|=`) and `delete_at_path`'s (`del()`)
+        // sibling `Expr::Pipe(inner)` splice arms threaded `here` (which
+        // folds in the group's own `?`) as the blanket `optional` for the
+        // *entire* spliced continuation, over-suppressing whatever follows
+        // the group too -- the same bug #1287's review round found and
+        // fixed for `=`'s `get_path_mut`, independently present here. All
+        // confirmed against real jq 1.7.1.
+        query!(br#"{"a":{"c":5}}"#, "((.a|.c)? | .y) |= 9",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "Cannot index number with string \"y\"");
+            }
+        );
+        query!(br#"{"a":{"c":5}}"#, "del((.a|.c)? | .y)",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "Cannot index number with string \"y\"");
+            }
+        );
+        // Boundary: the group's own failure is still correctly suppressed
+        // -- only what comes *after* it must stop being covered.
+        query!(br#"{"a":"notobj"}"#, "((.a|.c)? | .y) |= 9",
+            QueryResult::Owned(v) => {
+                assert_eq!(v.to_json(), r#"{"a":"notobj"}"#);
+            }
+        );
+        query!(br#"{"a":"notobj"}"#, "del((.a|.c)? | .y)",
+            QueryResult::Owned(v) => {
+                assert_eq!(v.to_json(), r#"{"a":"notobj"}"#);
+            }
+        );
     }
 
     #[test]
