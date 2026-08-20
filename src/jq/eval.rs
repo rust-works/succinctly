@@ -12401,6 +12401,15 @@ fn key_to_path_component(
 /// One resolved branch: the static path components reaching it, and the value
 /// found there (needed to resolve any computed key further along the chain).
 ///
+/// A named struct rather than a `(Vec<Expr>, Cow<OwnedValue>)` tuple alias
+/// (#986): the deferred-trackability rework in
+/// `docs/plan/jq-path-trackability-deferral.md` adds a third, `bool` field
+/// here, and a bare tuple gives a reader no way to tell which positional
+/// element is which at the ~36 construction and destructure sites this type
+/// has. This commit is the mechanical half of that migration and changes no
+/// behaviour; the field itself lands separately so its per-site values are
+/// reviewable on their own.
+///
 /// The value half is `Cow<'a, OwnedValue>`, not an owned `OwnedValue`: the
 /// overwhelming majority of branch producers (`..`/`recurse`, `.[]`, static
 /// field/index chains, `select`/type-filter builtins, ...) are pure
@@ -12413,7 +12422,32 @@ fn key_to_path_component(
 /// something new) can only lend references for as long as it lives, so
 /// branches built from it are forced back to `Cow::Owned` before they escape
 /// that scope (#668).
-type PathBranch<'a> = (Vec<Expr>, Cow<'a, OwnedValue>);
+struct PathBranch<'a> {
+    /// The static path components reaching this branch.
+    path: Vec<Expr>,
+    /// The value found at `path`.
+    value: Cow<'a, OwnedValue>,
+}
+
+impl<'a> PathBranch<'a> {
+    /// Build a branch from its two halves.
+    ///
+    /// Named rather than a bare struct literal because the overwhelming
+    /// majority of construction sites are one-liners inside a `map`/`push`
+    /// that read better as a call than as a braced literal.
+    fn new(path: Vec<Expr>, value: Cow<'a, OwnedValue>) -> Self {
+        Self { path, value }
+    }
+
+    /// Force this branch's value to `Cow::Owned`, so it can outlive whatever
+    /// it was borrowing from — see `resolve_against_cow` (#668).
+    fn into_owned_value(self) -> PathBranch<'static> {
+        PathBranch {
+            path: self.path,
+            value: Cow::Owned(self.value.into_owned()),
+        }
+    }
+}
 
 /// The result of resolving one path node: either every branch it fans out
 /// to, or — if resolution failed partway through several siblings (a
@@ -12626,25 +12660,30 @@ fn resolve_node<'a, S: EvalSemantics>(
                 };
                 Ok(branches
                     .into_iter()
-                    .map(|(components, v)| {
-                        let inner_path = if components.len() == 1 {
-                            components.into_iter().next().expect("len checked")
-                        } else {
-                            // Unreached *today*, and deliberately not a panic: the
-                            // postfix `?` attaches to a single path element until
-                            // #367, so `(.a.b)?`, `(..)?` and `recurse?` are parse
-                            // errors, and `E[K]?` — which used to arrive here with
-                            // its target's components attached — now goes to
-                            // `resolve_index_expr`. #367 reopens it on purpose:
-                            // `(.a[.k])?` resolves through the `Paren` arm to
-                            // `["a","b"]`, two components, and jq writes
-                            // `{"a":{"b":5},"k":"b"}` for it. `eval_generic` can
-                            // synthesize `Expr::Optional` around any expression
-                            // too, so this was never an invariant of the type.
-                            Expr::Pipe(components)
-                        };
-                        (vec![Expr::Optional(Box::new(inner_path))], v)
-                    })
+                    .map(
+                        |PathBranch {
+                             path: components,
+                             value: v,
+                         }| {
+                            let inner_path = if components.len() == 1 {
+                                components.into_iter().next().expect("len checked")
+                            } else {
+                                // Unreached *today*, and deliberately not a panic: the
+                                // postfix `?` attaches to a single path element until
+                                // #367, so `(.a.b)?`, `(..)?` and `recurse?` are parse
+                                // errors, and `E[K]?` — which used to arrive here with
+                                // its target's components attached — now goes to
+                                // `resolve_index_expr`. #367 reopens it on purpose:
+                                // `(.a[.k])?` resolves through the `Paren` arm to
+                                // `["a","b"]`, two components, and jq writes
+                                // `{"a":{"b":5},"k":"b"}` for it. `eval_generic` can
+                                // synthesize `Expr::Optional` around any expression
+                                // too, so this was never an invariant of the type.
+                                Expr::Pipe(components)
+                            };
+                            PathBranch::new(vec![Expr::Optional(Box::new(inner_path))], v)
+                        },
+                    )
                     .collect())
             }
         },
@@ -12669,11 +12708,11 @@ fn resolve_node<'a, S: EvalSemantics>(
                 OwnedValue::Array(items) => Ok(items
                     .iter()
                     .enumerate()
-                    .map(|(i, v)| (vec![Expr::Index(i as i64)], Cow::Borrowed(v)))
+                    .map(|(i, v)| PathBranch::new(vec![Expr::Index(i as i64)], Cow::Borrowed(v)))
                     .collect()),
                 OwnedValue::Object(map) => Ok(map
                     .iter()
-                    .map(|(k, v)| (vec![Expr::Field(k.clone())], Cow::Borrowed(v)))
+                    .map(|(k, v)| PathBranch::new(vec![Expr::Field(k.clone())], Cow::Borrowed(v)))
                     .collect()),
                 other => Err((Vec::new(), EvalError::cannot_iterate(other).into())),
             }
@@ -12765,7 +12804,7 @@ fn resolve_node<'a, S: EvalSemantics>(
             let branches: Vec<PathBranch<'a>> = cond_outputs
                 .into_iter()
                 .filter(OwnedValue::is_truthy)
-                .map(|_| (Vec::new(), Cow::Borrowed(value)))
+                .map(|_| PathBranch::new(Vec::new(), Cow::Borrowed(value)))
                 .collect();
             path_result(branches, escape)
         }
@@ -12781,7 +12820,7 @@ fn resolve_node<'a, S: EvalSemantics>(
             | Builtin::Scalars),
         ) => {
             if type_filter_matches(builtin, value) {
-                Ok(vec![(Vec::new(), Cow::Borrowed(value))])
+                Ok(vec![PathBranch::new(Vec::new(), Cow::Borrowed(value))])
             } else {
                 Ok(Vec::new())
             }
@@ -12883,7 +12922,7 @@ fn resolve_node<'a, S: EvalSemantics>(
             }
             let branches: Vec<PathBranch<'a>> = resolve_node::<S>(left, value, trackable)?
                 .into_iter()
-                .filter(|(_, v)| v.is_truthy())
+                .filter(|b| b.value.is_truthy())
                 .collect();
             if branches.is_empty() {
                 resolve_node::<S>(right, value, trackable)
@@ -13082,7 +13121,7 @@ fn resolve_node<'a, S: EvalSemantics>(
                     );
                     components.push(component);
                 }
-                let branch = (components, current);
+                let branch = PathBranch::new(components, current);
                 return path_result(vec![branch], escape);
             }
             if let Some(e) = escape {
@@ -13210,7 +13249,10 @@ fn recurse_untracked_error<'a>(value: &OwnedValue) -> (Vec<PathBranch<'a>>, Eval
 /// the entire document with `"X"` instead of raising and writing nothing.
 fn reject_if_untracked(branches: Vec<PathBranch<'_>>, trackable: bool) -> PathResolveResult<'_> {
     if !trackable {
-        if let Some((_, first_value)) = branches.first() {
+        if let Some(PathBranch {
+            value: first_value, ..
+        }) = branches.first()
+        {
             return Err((
                 Vec::new(),
                 EvalError::invalid_path_expression(first_value).into(),
@@ -13289,7 +13331,7 @@ fn resolve_leaf<'a, S: EvalSemantics>(
             // been one because evaluating `expr` itself broke/errored (Halt
             // excluded, handled above) before producing anything.
             0 => path_result(Vec::new(), trailing),
-            1 => Ok(vec![(
+            1 => Ok(vec![PathBranch::new(
                 components,
                 Cow::Owned(values.pop().expect("len checked")),
             )]),
@@ -13381,7 +13423,7 @@ fn push_recursive_branches<'a>(
     out: &mut Vec<PathBranch<'a>>,
 ) {
     assert_value_tree_depth(prefix.len());
-    out.push((prefix.to_vec(), Cow::Borrowed(value)));
+    out.push(PathBranch::new(prefix.to_vec(), Cow::Borrowed(value)));
     match value {
         OwnedValue::Array(items) => {
             for (i, item) in items.iter().enumerate() {
@@ -13429,12 +13471,12 @@ fn resolve_against_cow<'a, S: EvalSemantics>(
         Cow::Owned(v) => match resolve_node::<S>(expr, &v, trackable) {
             Ok(branches) => Ok(branches
                 .into_iter()
-                .map(|(c, cv)| (c, Cow::Owned(cv.into_owned())))
+                .map(PathBranch::into_owned_value)
                 .collect()),
             Err((partial, e)) => Err((
                 partial
                     .into_iter()
-                    .map(|(c, cv)| (c, Cow::Owned(cv.into_owned())))
+                    .map(PathBranch::into_owned_value)
                     .collect(),
                 e,
             )),
@@ -13734,16 +13776,19 @@ fn resolve_recurse<'a, S: EvalSemantics>(
          recurse-family guard in resolve_node should have caught this first"
     );
     let mut outputs: Vec<PathBranch<'a>> = Vec::new();
-    let mut stack: Vec<PathBranch<'a>> = vec![(Vec::new(), Cow::Borrowed(value))];
+    let mut stack: Vec<PathBranch<'a>> = vec![PathBranch::new(Vec::new(), Cow::Borrowed(value))];
     // Set by `queue_recurse_children` once `f` itself ends in an
     // error/break/halt — see that function's doc comment (#842).
     let mut pending_error: Option<EvalEscape> = None;
 
     while !stack.is_empty() && outputs.len() < RECURSE_MAX_ITEMS {
-        let (prefix, current) = stack.pop().unwrap();
+        let PathBranch {
+            path: prefix,
+            value: current,
+        } = stack.pop().unwrap();
         // `current.clone()` is cheap (`Cow`, #668). `prefix.clone()` is not —
         // still `O(path length)` per node, `O(d²)` total; #701, unfixed here.
-        outputs.push((prefix.clone(), current.clone()));
+        outputs.push(PathBranch::new(prefix.clone(), current.clone()));
 
         let is_null_current = matches!(current.as_ref(), OwnedValue::Null);
 
@@ -13776,7 +13821,11 @@ fn resolve_recurse<'a, S: EvalSemantics>(
         // one popped, and its whole subtree completes before the second
         // entry is even reached.
         let mut next: Vec<PathBranch<'a>> = Vec::new();
-        for (child_components, child_value) in children {
+        for PathBranch {
+            path: child_components,
+            value: child_value,
+        } in children
+        {
             let mut path = prefix.clone();
             path.extend(child_components);
 
@@ -13794,7 +13843,7 @@ fn resolve_recurse<'a, S: EvalSemantics>(
                     // sibling still waits its own turn on `stack`, so it
                     // can't jump ahead of an earlier sibling's own subtree.
                     if !is_null_current {
-                        next.push((path, child_value));
+                        next.push(PathBranch::new(path, child_value));
                     }
                 }
                 Some(cond) => {
@@ -13818,7 +13867,7 @@ fn resolve_recurse<'a, S: EvalSemantics>(
                     // `None` arm above (#856).
                     if let Some(e) =
                         eval_recurse_cond::<S>(cond, &child_value, !is_null_current, || {
-                            next.push((path.clone(), child_value.clone()));
+                            next.push(PathBranch::new(path.clone(), child_value.clone()));
                         })
                     {
                         deferred_error = Some(e);
@@ -13963,7 +14012,10 @@ fn resolve_index_expr<'a, S: EvalSemantics>(
     // wrote into the real document instead of raising "near attempt to
     // access element 0 of [...]" the way jq does — found in review.
     if !trackable {
-        if let Some((_, first_value)) = target_branches.first() {
+        if let Some(PathBranch {
+            value: first_value, ..
+        }) = target_branches.first()
+        {
             return Err((
                 Vec::new(),
                 EvalError::invalid_path_expression_near_access(&keys[0], first_value).into(),
@@ -13978,7 +14030,11 @@ fn resolve_index_expr<'a, S: EvalSemantics>(
     // (#530's sibling fix).
     let mut out = Vec::with_capacity(keys.len() * target_branches.len());
     for k in &keys {
-        for (components, target_value) in &target_branches {
+        for PathBranch {
+            path: components,
+            value: target_value,
+        } in &target_branches
+        {
             // A NaN key names no element for a write to land on, so `?` does not
             // save it — but only where a number addresses an element at all. On
             // an object the failure is the ordinary `Cannot index object with
@@ -14046,7 +14102,7 @@ fn resolve_index_expr<'a, S: EvalSemantics>(
             } else {
                 component
             });
-            out.push((path, next_value));
+            out.push(PathBranch::new(path, next_value));
         }
     }
     // `target_escape` first: see the comment on `target_branches`'s own
@@ -14125,7 +14181,10 @@ fn resolve_slice_expr<'a, S: EvalSemantics>(
     // `catch (getpath(["other"])[0:2]) = [...]` silently wrote into the
     // real document instead of raising — found in review.
     if !trackable {
-        if let Some((_, first_value)) = target_branches.first() {
+        if let Some(PathBranch {
+            value: first_value, ..
+        }) = target_branches.first()
+        {
             return Err((
                 Vec::new(),
                 EvalError::invalid_path_expression_near_access(
@@ -14141,7 +14200,11 @@ fn resolve_slice_expr<'a, S: EvalSemantics>(
     for s in &starts {
         for e in &ends {
             let slice_expr = Expr::Slice { start: *s, end: *e };
-            for (components, target_value) in &target_branches {
+            for PathBranch {
+                path: components,
+                value: target_value,
+            } in &target_branches
+            {
                 // `false`, not `optional`: the failure has to arrive as an
                 // error for the two spellings to be told apart here, same
                 // as `resolve_index_expr`'s `index_one_owned` call.
@@ -14176,7 +14239,7 @@ fn resolve_slice_expr<'a, S: EvalSemantics>(
                 } else {
                     slice_expr.clone()
                 });
-                out.push((path, Cow::Owned(next_value)));
+                out.push(PathBranch::new(path, Cow::Owned(next_value)));
             }
         }
     }
@@ -14296,7 +14359,11 @@ fn apply_static_tail<'a, S: EvalSemantics>(
     trackable: bool,
 ) -> PathResolveResult<'a> {
     let mut out = Vec::with_capacity(branches.len());
-    for (mut prefix, current) in branches {
+    for PathBranch {
+        path: mut prefix,
+        value: current,
+    } in branches
+    {
         // A dynamic element as the pipe's last component (e.g. `.a[.k]`) is
         // the common, still-trackable shape here, and leaves `tail` empty —
         // reuse `current` directly rather than paying `resolve_static_tail`/
@@ -14315,7 +14382,7 @@ fn apply_static_tail<'a, S: EvalSemantics>(
             }
         };
         prefix.extend_from_slice(tail);
-        out.push((prefix, end));
+        out.push(PathBranch::new(prefix, end));
     }
     Ok(out)
 }
@@ -14366,7 +14433,7 @@ fn resolve_seq<'a, S: EvalSemantics>(
     // way, never the silent wrong-success #843 is about.
     let Some(last_dynamic) = flat.iter().rposition(needs_fanout_pass) else {
         let end = resolve_static_tail::<S>(&flat, value, trackable)?;
-        return Ok(vec![(flat, Cow::Owned(end))]);
+        return Ok(vec![PathBranch::new(flat, Cow::Owned(end))]);
     };
 
     // Fan out one pipe element at a time. Note this rebuilds `branches` stage
@@ -14385,7 +14452,7 @@ fn resolve_seq<'a, S: EvalSemantics>(
     // still threaded through every remaining dynamic stage and the tail,
     // exactly like a branch that never escaped at all — see below.
     let tail = &flat[last_dynamic + 1..];
-    let mut branches: Vec<PathBranch<'a>> = vec![(Vec::new(), Cow::Borrowed(value))];
+    let mut branches: Vec<PathBranch<'a>> = vec![PathBranch::new(Vec::new(), Cow::Borrowed(value))];
     // Set the first time any stage's branch escapes, and overwritten by any
     // later stage's own escape (#1013) — mirroring the pre-existing "a later
     // step's own failure outranks an earlier deferred one" rule this
@@ -14405,20 +14472,32 @@ fn resolve_seq<'a, S: EvalSemantics>(
         // value: only then can `resolve_against_cow` recover the branch's
         // full `'a` when it's still `Cow::Borrowed`, rather than capping it
         // at this loop iteration's own short borrow (#668).
-        for (prefix, current) in branches {
+        for PathBranch {
+            path: prefix,
+            value: current,
+        } in branches
+        {
             match resolve_against_cow::<S>(element, current, trackable) {
                 Ok(resolved) => {
-                    for (components, resulting) in resolved {
+                    for PathBranch {
+                        path: components,
+                        value: resulting,
+                    } in resolved
+                    {
                         let mut path = prefix.clone();
                         path.extend(components);
-                        next.push((path, resulting));
+                        next.push(PathBranch::new(path, resulting));
                     }
                 }
                 Err((partial, e)) => {
-                    for (components, resulting) in partial {
+                    for PathBranch {
+                        path: components,
+                        value: resulting,
+                    } in partial
+                    {
                         let mut path = prefix.clone();
                         path.extend(components);
-                        next.push((path, resulting));
+                        next.push(PathBranch::new(path, resulting));
                     }
                     // Keep whatever this branch produced before its escape,
                     // record the escape, and stop attempting any
@@ -14469,17 +14548,21 @@ fn resolve_dynamic_indexes<S: EvalSemantics>(
     fn assemble(branches: Vec<PathBranch<'_>>) -> Vec<Expr> {
         branches
             .into_iter()
-            .map(|(components, _)| {
-                let components: Vec<Expr> = components
-                    .into_iter()
-                    .map(strip_resolved_optional)
-                    .collect();
-                match components.len() {
-                    0 => Expr::Identity,
-                    1 => components.into_iter().next().expect("len checked"),
-                    _ => Expr::Pipe(components),
-                }
-            })
+            .map(
+                |PathBranch {
+                     path: components, ..
+                 }| {
+                    let components: Vec<Expr> = components
+                        .into_iter()
+                        .map(strip_resolved_optional)
+                        .collect();
+                    match components.len() {
+                        0 => Expr::Identity,
+                        1 => components.into_iter().next().expect("len checked"),
+                        _ => Expr::Pipe(components),
+                    }
+                },
+            )
             .collect()
     }
 
