@@ -505,6 +505,15 @@ pub(crate) fn needs_path_context(expr: &Expr) -> bool {
         Expr::Paren(inner) => needs_path_context(inner),
         Expr::Optional(inner) => needs_path_context(inner),
         Expr::Comma(exprs) => exprs.iter().any(needs_path_context),
+        // `[key]`/`[parent]`/`[file_index]` (#1302): an array literal is
+        // still just "collect this inner expression's outputs", the same
+        // reasoning as `Comma` above -- whatever the wrapped expression
+        // needs, the `[...]` wrapper needs too. `Expr::Object` isn't
+        // included here yet: it has the identical gap (`{"x": key}` also
+        // stubs to `null`, confirmed live), but its multi-entry/generator-key
+        // shape needs more design work than a single recursive call, so it's
+        // tracked separately rather than folded into this fix.
+        Expr::Array(inner) => needs_path_context(inner),
         Expr::IndexExpr { target, key } => needs_path_context(target) || needs_path_context(key),
         Expr::SliceExpr { target, start, end } => {
             needs_path_context(target)
@@ -18342,6 +18351,60 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
                 // (#791).
                 Err(EvalEscape::Error(_)) if optional => QueryResult::None,
                 Err(escape) => escape.into(),
+            }
+        }
+        // `[key]`/`[parent]`/`[file_index]` (#1302): the generic
+        // `Expr::Array` arm below builds the array via `eval_owned_expr_opt`
+        // -- the plain, context-less evaluator -- so a `key`/`parent`/
+        // `file_index` nested inside the literal would still stub to
+        // `null`/`0` even once `needs_path_context` correctly routes the
+        // enclosing pipe here. Route the array's *own* inner expression
+        // through this same path-context evaluator instead, collecting its
+        // outputs the same way `eval_array_construction` collects the plain
+        // evaluator's outputs elsewhere, then continue exactly as the
+        // generic arm below does (reset path/root for `rest`).
+        Expr::Array(inner) if needs_path_context(inner) => {
+            let inner_result = eval_pipe_with_path_context_internal::<W, S>(
+                core::slice::from_ref(inner),
+                value,
+                root,
+                file_origin,
+                current_path,
+                optional,
+            );
+            let items: Vec<OwnedValue> = match inner_result {
+                QueryResult::Owned(v) => vec![v],
+                QueryResult::ManyOwned(vs) => vs,
+                QueryResult::None => vec![],
+                QueryResult::Error(e) => return QueryResult::Error(e),
+                QueryResult::Break(label) => return QueryResult::Break(label),
+                QueryResult::Halt(code) => return QueryResult::Halt(code),
+                // Array construction is atomic (`eval_array_construction`'s
+                // identical reasoning): a control signal after some output
+                // still abandons the whole array rather than keeping a
+                // partial one.
+                QueryResult::Partial(_, Control::Error(e)) => return QueryResult::Error(e),
+                QueryResult::Partial(_, Control::Break(label)) => return QueryResult::Break(label),
+                QueryResult::Partial(_, Control::Halt(code)) => return QueryResult::Halt(code),
+                QueryResult::One(_) | QueryResult::OneCursor(_) | QueryResult::Many(_) => {
+                    unreachable!(
+                        "eval_pipe_with_path_context_internal only ever produces \
+                         Owned/ManyOwned/None/Error/Break/Partial"
+                    )
+                }
+            };
+            let result = OwnedValue::Array(items);
+            if rest.is_empty() {
+                QueryResult::Owned(result)
+            } else {
+                eval_pipe_with_path_context_internal::<W, S>(
+                    rest,
+                    &result,
+                    &result,
+                    file_origin,
+                    &[],
+                    optional,
+                )
             }
         }
         Expr::Object(_) | Expr::Array(_) | Expr::Literal(_) => {
