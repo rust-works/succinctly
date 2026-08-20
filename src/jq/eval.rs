@@ -12574,15 +12574,24 @@ fn resolve_node<'a, S: EvalSemantics>(
         Expr::Comma(exprs) => {
             let mut out = Vec::new();
             for e in exprs {
-                // `reject_if_untracked` (#843): each sibling's own output is
-                // final the moment it's produced — jq streams it before ever
-                // touching the next one — so this is one of the two places
-                // in the whole resolver that has to apply that check itself
-                // rather than leaving it to a caller. See that function's
-                // doc comment for why.
-                match resolve_node::<S>(e, value, trackable)
-                    .and_then(|b| reject_if_untracked(b, trackable))
-                {
+                // No `reject_if_untracked` here (#986 Stage 2). It used to
+                // run per sibling, on the premise that a sibling's output is
+                // "final the moment it's produced". That premise is false
+                // whenever the `Comma` is a non-terminal element of a pipe:
+                // in `(.a, 1) | .c` there is very much something left to
+                // navigate into `1`, and checking here reported
+                // `path()`'s own "with result 1" instead of letting `.c`
+                // raise jq's "near attempt to access element \"c\" of 1".
+                //
+                // Each sibling already resolves independently, so its
+                // branches now simply carry their own `trackable` outward
+                // and whoever turns out to be terminal decides — the
+                // enclosing pipe's static tail, `resolve_catch`, or
+                // `resolve_dynamic_indexes`. Streaming order is unaffected:
+                // siblings are still appended to `out` in source order, and
+                // an untracked one still stops everything after it, just at
+                // the point that knows enough to say so.
+                match resolve_node::<S>(e, value, trackable) {
                     Ok(branches) => out.extend(branches),
                     Err((prefix, e)) => {
                         out.extend(prefix);
@@ -13298,17 +13307,19 @@ fn recurse_untracked_error<'a>(value: &OwnedValue) -> (Vec<PathBranch<'a>>, Eval
 /// `resolve_index_expr`/`resolve_slice_expr`'s own post-target check and
 /// `resolve_static_tail` already handle that) or whether they are the
 /// final answer (in which case *this* function is what has to catch it) —
-/// only their caller knows which. The two callers that call this are
-/// exactly the two places in the whole resolver where a value becomes
-/// final without anything else in the same expression left to navigate
-/// into it: each `Expr::Comma` sibling's own output (jq streams one
-/// sibling's result before ever touching the next — confirmed live,
-/// `path(try (.a, error({y:99})) catch (select(true), "z"))` raises on
-/// `select(true)`'s own branch and never reaches `"z"`) and
-/// `resolve_catch`'s own top-level result (the bare, non-`Comma` case,
-/// e.g. `catch select(true)` alone). Found in review: before this existed,
+/// only their caller knows which. `resolve_catch` is now the sole caller:
+/// a `catch` handler's result genuinely is final, because nothing in
+/// `Expr::Try`'s own shape can follow the handler within the same node.
+/// Found in review: before this existed,
 /// `try (.a, error({y:99})) catch select(true) = "X"` silently replaced
 /// the entire document with `"X"` instead of raising and writing nothing.
+///
+/// `Expr::Comma`'s arm used to call this too, per sibling. #986 Stage 2
+/// removed that: a `Comma` mid-pipe (`(.a, 1) | .c`) does have something
+/// left to navigate into, so the check was firing a position too early.
+/// Its siblings now carry their own `trackable` outward instead — see
+/// that arm's own comment, and
+/// `docs/plan/jq-path-trackability-deferral.md`.
 fn reject_if_untracked(branches: Vec<PathBranch<'_>>, trackable: bool) -> PathResolveResult<'_> {
     // Two ways to be untracked now (#986): the whole call was made against
     // an untracked value (`trackable == false`, #843's caught-payload case),
