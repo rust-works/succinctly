@@ -408,6 +408,7 @@ fn rewrite_namespaced_calls(expr: Expr) -> Expr {
         Expr::Identity
         | Expr::Field(_)
         | Expr::Index(_)
+        | Expr::IndexNumber { .. }
         | Expr::Slice { .. }
         | Expr::Iterate
         | Expr::RecursiveDescent

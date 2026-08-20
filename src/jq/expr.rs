@@ -25,6 +25,33 @@ pub enum Expr {
     /// Array index access: `.[0]` or `.[-1]`
     Index(i64),
 
+    /// Array index access whose *original number* has to survive into
+    /// `path()` output: `.[2.0]`, `.[1.7]`, `.[1e10]`, `.[2.00]`.
+    ///
+    /// jq appends the resolved key **verbatim** as the path component, so a
+    /// number that still carries its own spelling keeps it —
+    /// `path(.[2.0])` is `[2.0]` and `path(.[1e10])` is `[1E+10]`, not
+    /// `[2]`/`[10000000000]` (#1088). [`Expr::Index`]'s bare `i64` has
+    /// nowhere to put that, so a float-spelled key folds to this instead.
+    ///
+    /// `idx` is exactly the `i64` [`Expr::Index`] would have carried (the
+    /// same truncation-toward-zero `numeric_key_to_index` applies), and
+    /// every step that *navigates* — reading, `setpath`, `del` — uses it
+    /// and behaves identically. Only the rendering of the component
+    /// differs, which is why nearly every match site pairs the two arms:
+    /// `Expr::Index(idx) | Expr::IndexNumber { idx, .. }`.
+    ///
+    /// An integer-*spelled* key never reaches here: `2` renders the same
+    /// whether it goes out as `OwnedValue::Int` or as its own literal, so
+    /// it keeps folding to [`Expr::Index`] and the hot `.foo.bar[0]` path
+    /// is untouched. Nor does a negated one — see [`NumberKey`].
+    IndexNumber {
+        /// The index every navigation step actually uses.
+        idx: i64,
+        /// The number the component is reported as.
+        key: NumberKey,
+    },
+
     /// Array slice: `.[2:5]` or `.[2:]` or `.[:5]`
     Slice {
         start: Option<i64>,
@@ -47,13 +74,15 @@ pub enum Expr {
     /// [`Expr::Field`] and `.[0]` to [`Expr::Index`], so the hot `.foo.bar[0]`
     /// path and every existing `Field`/`Index` match site are untouched.
     ///
-    /// Three deliberate divergences from jq. An array-valued key errors with
+    /// Two deliberate divergences from jq. An array-valued key errors with
     /// `Cannot index array with array` rather than performing jq's
-    /// indices-of-subarray search (`[10,20,30] | .[[20]]` → `[1]`).
-    /// `path(.[1.7])` yields `[1]` where jq keeps the unfloored `[1.7]`. And a
+    /// indices-of-subarray search (`[10,20,30] | .[[20]]` → `[1]`). And a
     /// NaN key, which reads as null in both, has no path component here — jq's
     /// `path(.[nan])` is `[null]`, a path its own `setpath` then rejects, so
     /// this errors at the source instead.
+    ///
+    /// A float key is *not* on that list any more: it keeps its own
+    /// spelling in `path()` output, via [`Expr::IndexNumber`] (#1088).
     IndexExpr {
         /// The value being indexed — the postfix chain so far.
         target: Box<Self>,
@@ -1140,6 +1169,54 @@ pub enum ObjectKey {
     Expr(Box<Expr>),
 }
 
+/// The number an [`Expr::IndexNumber`] component is reported as by `path()`.
+///
+/// jq's rule for a numeric path component is that there is no rule: the
+/// resolved key value is appended unchanged, so whatever spelling it still
+/// carries is what comes back out (#1088). These are the two shapes a
+/// *non-integer-spelled* key can be in by the time it reaches a component.
+///
+/// There is deliberately no `Int` arm. A plain integer renders identically
+/// whether it goes out as `OwnedValue::Int` or as its own literal text, so
+/// an integer key keeps folding to [`Expr::Index`] and nothing on the hot
+/// navigation path changes shape.
+///
+/// The apparent "negative float indices collapse to integers" asymmetry
+/// jq shows (`path(.[-1.0])` is `[-1]`, not `[-1.0]`) is *not* modelled
+/// here, because it is not a rule about indices at all: jq's unary minus
+/// destroys number-literal preservation, so `-1.0` in filter source is
+/// already the computed double `-1` before any indexing happens — and jq
+/// prints a whole double without a decimal point. A negative float that
+/// arrives from *data* keeps its spelling in both
+/// (`{"i":-1.00} | .i as $x | path(.a[$x])` is `["a",-1.00]`). The parser's
+/// own negative-literal fold reproduces that by dropping to
+/// [`Float`](Self::Float) whenever it negates.
+#[derive(Debug, Clone, PartialEq)]
+pub enum NumberKey {
+    /// A computed float, with no source spelling left to preserve — the
+    /// jq-compatible rendering of the `f64` is the component. Covers both
+    /// a runtime `OwnedValue::Float` key and any literal the parser had to
+    /// negate.
+    Float(f64),
+    /// A float-spelled literal that still carries its own source text,
+    /// mirroring `OwnedValue::NumberLiteral`: `2.0`, `2.00`, `1e10`.
+    Literal(NumberRepr, Box<str>),
+}
+
+impl NumberKey {
+    /// The `f64` this key denotes, spelling discarded.
+    ///
+    /// Used by the parser's negation fold, which is precisely the operation
+    /// that discards the spelling — see this type's own doc comment.
+    pub fn value(&self) -> f64 {
+        match self {
+            Self::Float(f) => *f,
+            Self::Literal(NumberRepr::Int(i), _) => *i as f64,
+            Self::Literal(NumberRepr::Float(f), _) => *f,
+        }
+    }
+}
+
 /// Literal values that can appear in jq expressions.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Literal {
@@ -1177,6 +1254,21 @@ pub enum Literal {
 }
 
 impl Expr {
+    /// The number this static array-index component reports itself as in
+    /// `path()` output, if it is anything other than its own `i64`.
+    ///
+    /// Exists so the `Expr::Index(idx) | Expr::IndexNumber { idx, .. }`
+    /// or-pattern stays a *single* arm at the three sites that render a
+    /// path component: they bind `idx` from the pattern and ask for the
+    /// spelling separately, instead of duplicating the body once per
+    /// variant (#1088).
+    pub(crate) fn index_number_key(&self) -> Option<&NumberKey> {
+        match self {
+            Self::IndexNumber { key, .. } => Some(key),
+            _ => None,
+        }
+    }
+
     /// Create an identity expression.
     pub fn identity() -> Self {
         Self::Identity

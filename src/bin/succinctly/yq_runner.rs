@@ -2211,7 +2211,7 @@ fn can_use_m2_streaming(expr: &Expr) -> bool {
         // Core M2 expressions
         Expr::Identity => true,
         Expr::Field(_) => true,
-        Expr::Index(_) => true,
+        Expr::Index(_) | Expr::IndexNumber { .. } => true,
         Expr::Iterate => true,
 
         // Chained navigation
@@ -2451,6 +2451,7 @@ fn contains_split_doc(expr: &Expr) -> bool {
         Expr::Identity
         | Expr::Field(_)
         | Expr::Index(_)
+        | Expr::IndexNumber { .. }
         | Expr::Slice { .. }
         | Expr::Iterate
         | Expr::Literal(_)
