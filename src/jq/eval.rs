@@ -11765,18 +11765,35 @@ fn get_path_mut<'a>(
     // all (`(.a|.c)[0] = 9`) hands this walker an un-flattened `Pipe`
     // directly, since `needs_path_prepass` never routes it through a
     // flattening pass first. Splicing the nested `Pipe`'s components in
-    // place and reprocessing from the same position mirrors `update_path`'s
-    // own `Expr::Pipe(inner)` arm, one step at a time, so arbitrarily nested
-    // `Pipe`s resolve the same way a single recursive call there would.
+    // place and reprocessing from the same position, rather than recursing,
+    // keeps this function's loop-based shape.
     let mut parts = path_parts.to_vec();
+    // Parallel to `parts`: whether that slot's own failure should be
+    // suppressed because it came from splicing an `Optional(Pipe(inner))`
+    // group. `(.a|.c)?` is `try (.a|.c)` — real jq catches a failure from
+    // *either* `.a` or `.c`, confirmed live (`{"a":"notobj"} |
+    // ((.a|.c)? | .y) = 9` no-ops), but NOT from a pipe stage after the
+    // closing paren (confirmed live too: `{"a":{"c":5}} | ((.a|.c)? | .y) =
+    // 9` still raises `Cannot index number with string "y"` — `.y` is
+    // outside the `try`'s scope). A single carried-forward `optional` flag,
+    // the way `update_path`'s own `Expr::Pipe(inner)` arm handles this
+    // (line ~12045), does not draw that boundary: live-verified that arm's
+    // `|=` equivalent incorrectly no-ops the second case instead of
+    // erroring, over-suppressing everything after the group. Marking only
+    // the spliced-in slots keeps the suppression scoped to the group that
+    // was actually wrapped in `?`, leaving whatever follows unaffected.
+    let mut inherited_optional = vec![false; parts.len()];
     let mut i = 0;
 
     while i < parts.len() {
-        let (part, optional) = unwrap_path_component(&parts[i]);
+        let (part, own_optional) = unwrap_path_component(&parts[i]);
+        let optional = own_optional || inherited_optional[i];
 
         if let Expr::Pipe(inner) = part {
             let inner = inner.clone();
+            let len = inner.len();
             parts.splice(i..=i, inner);
+            inherited_optional.splice(i..=i, vec![optional; len]);
             continue;
         }
 
@@ -39481,6 +39498,47 @@ mod tests {
                 br#"{"a":{"b":{"c":1}}}"#,
                 "((.a|.b|.c)[0]) = 9",
                 Err("Cannot index number with number"),
+            ),
+        ]);
+    }
+
+    #[test]
+    fn test_assign_optional_group_scopes_suppression_to_the_group_only() {
+        // #1287 review round: the first fix's splice loop computed each
+        // spliced-in component's own `?` via `unwrap_path_component` but
+        // never consulted it, so `(.a|.c)?` -- `try (.a|.c)` in jq terms --
+        // stopped suppressing navigation failures inside the group it
+        // wraps. All four cases confirmed against real jq 1.7.1.
+        assert_outcomes(&[
+            // The group's own navigation fails on its first component --
+            // `?` suppresses it, so the whole assignment no-ops.
+            (
+                br#"{"a":"notobj"}"#,
+                "((.a|.c)? | .y) = 9",
+                Ok(r#"{"a":"notobj"}"#),
+            ),
+            // Same, but the group fails on its *second* component --
+            // `try (.a|.c)` catches a failure from either half, not just
+            // the first.
+            (br#"{"a":5}"#, "((.a|.c)? | .y) = 9", Ok(r#"{"a":5}"#)),
+            // Dot-chain spelling of the same group, no explicit `|`.
+            (
+                br#"{"a":"notobj"}"#,
+                "((.a.b)? | .y) = 9",
+                Ok(r#"{"a":"notobj"}"#),
+            ),
+            // Boundary the naive fix over-suppressed: once `.a|.c` itself
+            // *succeeds*, `?` no longer covers what comes after the closing
+            // paren -- `.y` failing here must still raise, not no-op. This
+            // is the one real jq draws that a single carried-forward
+            // `optional` flag (mirroring `update_path`'s own `Expr::Pipe`
+            // arm) does not: that arm's own `|=` equivalent incorrectly
+            // no-ops this exact shape (a pre-existing, separate bug, filed
+            // rather than fixed here).
+            (
+                br#"{"a":{"c":5}}"#,
+                "((.a|.c)? | .y) = 9",
+                Err(r#"Cannot index number with string "y""#),
             ),
         ]);
     }
