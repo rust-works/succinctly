@@ -1045,6 +1045,99 @@ fn test_duplicate_json_key_to_entries_deduplicates_1170() -> Result<()> {
     Ok(())
 }
 
+/// #868: `paths` (a succinctly extension in yq mode -- real yq has no
+/// `paths` builtin at all, confirmed live: `printf 'a: 1\n' | yq '[paths]'`
+/// raises a lexer error) used to materialize the whole document via
+/// `to_owned(&value)` before walking it, collapsing duplicate YAML mapping
+/// keys into one `IndexMap` entry the same way #443 found for `to_entries`
+/// -- so a repeated key only ever contributed one path. Since there's no
+/// oracle for a succinctly-only builtin, the acceptance criterion is
+/// internal consistency: `paths` must report a path for every mapping key
+/// occurrence that `to_entries` (already correct per #443) and identity
+/// output both preserve.
+#[test]
+fn test_yq_paths_preserves_duplicate_mapping_keys_868() -> Result<()> {
+    let yaml = "a: 1\na: 2\nb: 3\n";
+    let (output, code) = run_yq_stdin("[paths]", yaml, &["-o=json", "-I=0"])?;
+
+    assert_eq!(code, 0, "out: {output:?}");
+    assert_eq!(output.trim(), r#"[["a"],["a"],["b"]]"#);
+    Ok(())
+}
+
+/// #868: the same duplicate-key fix, one level of nesting deeper -- confirms
+/// `collect_paths_generic`'s `effective_fields` call applies at every
+/// recursion level, not just the root object.
+#[test]
+fn test_yq_paths_preserves_nested_duplicate_mapping_keys_868() -> Result<()> {
+    let yaml = "x:\n  a: 1\n  a: 2\n  b: 3\n";
+    let (output, code) = run_yq_stdin("[paths]", yaml, &["-o=json", "-I=0"])?;
+
+    assert_eq!(code, 0, "out: {output:?}");
+    assert_eq!(output.trim(), r#"[["x"],["x","a"],["x","a"],["x","b"]]"#);
+    Ok(())
+}
+
+/// #868: `paths` on `--input-format json` input must still apply *JSON's*
+/// own duplicate-key rule (first position, last value -- #1170) rather than
+/// YAML's preserve-every-occurrence rule, the same format-aware split
+/// `to_entries` already established. Confirms the fix's `effective_fields`
+/// call is genuinely format-aware, not a blanket switch to "always keep
+/// duplicates."
+#[test]
+fn test_yq_paths_json_input_format_still_dedupes_868() -> Result<()> {
+    let json = r#"{"a":1,"a":2,"b":3}"#;
+    let (output, code) = run_yq_stdin(
+        "[paths]",
+        json,
+        &["--input-format", "json", "-o=json", "-I=0"],
+    )?;
+
+    assert_eq!(code, 0, "out: {output:?}");
+    assert_eq!(output.trim(), r#"[["a"],["b"]]"#);
+    Ok(())
+}
+
+/// #868: `leaf_paths` (also a succinctly extension, see CLAUDE.md) shares
+/// `paths`'s same duplicate-key bug via its own `to_owned`-based walk --
+/// same fix, same internal-consistency criterion.
+#[test]
+fn test_yq_leaf_paths_preserves_duplicate_mapping_keys_868() -> Result<()> {
+    let yaml = "a: 1\na: 2\nb: 3\n";
+    let (output, code) = run_yq_stdin("[leaf_paths]", yaml, &["-o=json", "-I=0"])?;
+
+    assert_eq!(code, 0, "out: {output:?}");
+    assert_eq!(output.trim(), r#"[["a"],["a"],["b"]]"#);
+    Ok(())
+}
+
+/// #868: `leaf_paths`'s own tree-structural leaf definition (null and empty
+/// containers count as leaves, #771) is unaffected by the duplicate-key
+/// fix -- confirms `collect_leaf_paths_generic` didn't accidentally change
+/// what counts as a leaf while switching to `effective_fields`.
+#[test]
+fn test_yq_leaf_paths_leaf_definition_unaffected_by_868() -> Result<()> {
+    let yaml = "a: {}\nb: []\nc: null\nd: 5\n";
+    let (output, code) = run_yq_stdin("[leaf_paths]", yaml, &["-o=json", "-I=0"])?;
+
+    assert_eq!(code, 0, "out: {output:?}");
+    assert_eq!(output.trim(), r#"[["a"],["b"],["c"],["d"]]"#);
+    Ok(())
+}
+
+/// #868: jq mode is unaffected -- real JSON parsing dedupes a repeated key
+/// to its first position/last value already (#1170's own rule, shared via
+/// `effective_fields`), matching real jq exactly.
+#[test]
+fn test_jq_mode_paths_duplicate_key_still_dedupes_868() -> Result<()> {
+    let (output, _stderr, code) =
+        run_jq_stdin_with_stderr("[paths]", r#"{"a":1,"a":2,"b":3}"#, &["-c"])?;
+
+    assert_eq!(code, 0, "out: {output:?}");
+    assert_eq!(output.trim(), r#"[["a"],["b"]]"#);
+    Ok(())
+}
+
 /// #1251: `.a` field access on `--input-format json` input with a
 /// duplicate key must resolve to the *last* value, matching real jq /
 /// RFC 8259 convention -- the JSON-side sibling of #174's YAML fix, and
