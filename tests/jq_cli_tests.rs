@@ -5008,6 +5008,128 @@ fn test_path_context_fanout_preserves_output_before_break_or_error_715() -> Resu
     Ok(())
 }
 
+/// `needs_path_context` had no `Expr::Array` arm (#1302), so `[key]` --
+/// semantically equivalent to `(key,key)`'s single-branch case, just
+/// array-wrapped instead of comma-joined -- silently lost path context and
+/// stubbed to `null`, even though `needs_path_context` already recursed
+/// into the structurally-identical `Comma` wrapper. Fixing just the
+/// recursion wasn't enough on its own: `eval_pipe_with_path_context_internal`'s
+/// array-construction arm built the array via the plain, context-less
+/// evaluator, so `key`/`parent`/`file_index` nested inside `[...]` needed a
+/// second, dedicated fix to route through the path-context evaluator during
+/// construction itself. Verified live against real yq v4.53.3 for `[key]`
+/// and `[parent]` (`key`/`parent` have no real-jq equivalent -- succinctly
+/// extensions -- so jq mode here pins internal consistency, not an oracle).
+#[test]
+fn test_array_wrapped_path_context_builtins_1302() -> Result<()> {
+    let (stdout, _, code) = run_jq_full(&["-c", ".a | [key]"], Some(r#"{"a":1}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), r#"["a"]"#);
+
+    let (stdout, _, code) = run_jq_full(&["-c", ".a | [parent]"], Some(r#"{"a":1}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), r#"[{"a":1}]"#);
+
+    // Multiple path-context builtins in the same array literal, plus a
+    // plain value alongside them -- all outputs collected into one array,
+    // matching `[...]`'s ordinary multi-output-collection semantics.
+    let (stdout, _, code) = run_jq_full(&["-c", ".a | [key, key, parent]"], Some(r#"{"a":1}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), r#"["a","a",{"a":1}]"#);
+
+    // Nested inside a longer pipe: `rest` after the array must still see
+    // the newly constructed array as its fresh root (path reset), matching
+    // the plain `Expr::Array`/`Expr::Object`/`Expr::Literal` arm's own
+    // "reset path and root to the new value" behavior.
+    let (stdout, _, code) = run_jq_full(&["-c", ".a | [key] | .[0]"], Some(r#"{"a":1}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), r#""a""#);
+
+    // A plain array (no path-context builtin inside) takes the original,
+    // unmodified code path and must be entirely unaffected.
+    let (stdout, _, code) = run_jq_full(&["-c", ".a | [1,2,3]"], Some(r#"{"a":1}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "[1,2,3]");
+
+    Ok(())
+}
+
+/// Exercises the non-`Owned`/`ManyOwned` arms of #1302's new inner-result
+/// match (`None`/`Error`/`Break`/`Halt`/`Partial`) -- array construction is
+/// atomic, so each of these must abandon the whole array rather than
+/// producing a partial one, mirroring `eval_array_construction`'s identical
+/// reasoning for the plain (non-path-context) case.
+#[test]
+fn test_array_wrapped_path_context_builtin_control_flow_1302() -> Result<()> {
+    // Zero output from the inner expression (`select` with a false
+    // condition on `key`) -> an empty array, not an error.
+    let (stdout, _, code) =
+        run_jq_full(&["-c", ".a | [select(key == \"z\")]"], Some(r#"{"a":1}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "[]");
+
+    // An error from the inner expression, as the pipe's very first output
+    // (no successful output preceding it), aborts the whole array
+    // construction as a bare error.
+    let (_stdout, stderr, code) =
+        run_jq_full(&["-c", ".a | [key | error(\"boom\")]"], Some(r#"{"a":1}"#))?;
+    assert_eq!(code, 5);
+    assert!(stderr.contains("boom"), "stderr: {stderr}");
+
+    // Same, but with real output already produced by an earlier comma
+    // branch (`key` succeeds with "a" before `error` fires) -- exercises
+    // the `Partial(_, Control::Error(_))` arm rather than the bare one
+    // above. Still discards the whole array, matching jq's atomic array
+    // construction.
+    let (stdout, _, code) =
+        run_jq_full(&["-c", ".a | [key, error(\"boom\")]"], Some(r#"{"a":1}"#))?;
+    assert_eq!(code, 5);
+    assert_eq!(stdout, "");
+
+    // A bare `break` out of the inner expression (pipe form, no prior
+    // output) aborts the whole array construction and unwinds past it to
+    // the enclosing label -- the comma's second branch ("reached") must
+    // never run.
+    let (stdout, _, code) = run_jq_full(
+        &[
+            "-c",
+            "label $out | ((.a | [key | break $out]), \"reached\")",
+        ],
+        Some(r#"{"a":1}"#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(
+        stdout, "",
+        "break must discard the whole array, not emit it"
+    );
+
+    // Same, but as a comma branch with real output already produced first
+    // (`key` succeeds with "a" before `break` fires) -- exercises the
+    // `Partial(_, Control::Break(_))` arm rather than the bare one above.
+    let (stdout, _, code) = run_jq_full(
+        &["-c", "label $out | ((.a | [key, break $out]), \"reached\")"],
+        Some(r#"{"a":1}"#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "");
+
+    // `halt_error(n)` from the inner expression, as the pipe's very first
+    // output (no successful output preceding it), propagates its own exit
+    // code as a bare halt.
+    let (stdout, _, code) = run_jq_full(&["-c", ".a | [key | halt_error(9)]"], Some(r#"{"a":1}"#))?;
+    assert_eq!(code, 9);
+    assert_eq!(stdout, "");
+
+    // Same, but with real output already produced by an earlier comma
+    // branch -- exercises the `Partial(_, Control::Halt(_))` arm rather
+    // than the bare one above.
+    let (stdout, _, code) = run_jq_full(&["-c", ".a | [key, halt_error(9)]"], Some(r#"{"a":1}"#))?;
+    assert_eq!(code, 9);
+    assert_eq!(stdout, "");
+
+    Ok(())
+}
+
 /// `keys_unsorted` stays lazy through `length`/`.[]`/`.[n]`/`first`/`last`
 /// (#140), backed by a new `JqValue::LazyKeysArray` output writer in
 /// `print_json`. Uses `run_jq_full` (the pre-built binary) to exercise that
