@@ -8881,7 +8881,7 @@ fn stitch_split(input: &str, matches: &[regex::Captures]) -> Vec<String> {
 /// than attempted here.
 ///
 /// What this function does instead is deliberately *not* the natural
-/// consequence of routing through [`eval_owned_expr`] (array-collapsing a
+/// consequence of routing through `eval_owned_expr` (array-collapsing a
 /// multi-output filter, which — unlike here, where the immediate caller can
 /// only accept a `String` — would turn this into a hard type-mismatch error,
 /// a regression from the pre-#826 code's behavior on this same input): it
@@ -12336,7 +12336,7 @@ fn push_path_components(out: &mut Vec<Expr>, expr: &Expr) {
 /// Evaluate an expression against an owned value, preserving the whole output
 /// stream.
 ///
-/// [`eval_owned_expr`] cannot be used for keys: it collapses a multi-output
+/// `eval_owned_expr` cannot be used for keys: it collapses a multi-output
 /// result into a single `OwnedValue::Array`, which would turn `.[("a","b")]`
 /// into one array-valued key. `QueryResult::collect_owned` is likewise unsafe
 /// on its own because it silently maps `Error`/`Break` — including a
@@ -16053,7 +16053,7 @@ fn eval_reduce<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 }
 
 /// Fast path for the handful of expr shapes that dominate the cost of
-/// [`eval_owned_expr`]/[`eval_owned_input`]: bare `.`, `.foo`, `.[n]`. These
+/// `eval_owned_expr`/[`eval_owned_input`]: bare `.`, `.foo`, `.[n]`. These
 /// never fan out and never touch anything but `input`'s own top-level shape,
 /// so they can be answered directly against the `OwnedValue` tree — no
 /// `to_json_for_reindex` + `JsonIndex::build` round trip needed. `None`
@@ -16134,7 +16134,7 @@ fn eval_owned_fast_path<S: EvalSemantics>(
     }
 }
 
-/// Same evaluator as [`eval_owned_expr`], but keeps a `break` distinguishable
+/// Same evaluator as `eval_owned_expr`, but keeps a `break` distinguishable
 /// from a real error via [`Control`] instead of collapsing it into a
 /// synthetic "break $label not in label" [`EvalError`] — needed by any
 /// caller that must let a `break $label` inside its operand reach its
@@ -16259,37 +16259,10 @@ fn eval_owned_expr_full<S: EvalSemantics>(
     }
 }
 
-/// Evaluate an expression with an OwnedValue as input.
-fn eval_owned_expr<S: EvalSemantics>(
-    expr: &Expr,
-    input: &OwnedValue,
-    optional: bool,
-) -> Result<OwnedValue, EvalEscape> {
-    eval_owned_expr_ctrl::<S>(expr, input, optional).map_err(|control| match control {
-        Control::Error(e) => e.into(),
-        // A *bare* break (no prior output from the argument) now propagates
-        // instead of being collapsed into a synthetic "not in label" error
-        // (#833) -- see `result_to_owned`'s identical fix just above for
-        // the full rationale, including why the `Partial` case in
-        // `eval_owned_expr_ctrl` above is a separate, still-open gap; every
-        // caller here forwards the `EvalEscape` verbatim except
-        // `builtin_envvar`, which has its own dedicated arm mirroring the
-        // `Halt` one below.
-        Control::Break(label) => EvalEscape::Break(label),
-        // A halt reached here (e.g. inside `reduce`/`foreach`'s INIT/UPDATE
-        // via a caller that uses `eval_owned_expr` rather than
-        // `eval_owned_expr_ctrl`, which carries `Control` through losslessly)
-        // keeps its own `EvalEscape` variant, so `try`/`catch` never sees it.
-        Control::Halt(code) => EvalEscape::Halt(code),
-    })
-}
-
-/// Like [`eval_owned_expr`], but keeps a genuinely empty result -- a
-/// `?`-swallowed type mismatch, or a builtin's own zero-output result --
-/// distinguishable from a real `null` value (#1280), via
-/// [`eval_owned_expr_full`]. `eval_owned_expr` itself cannot express this:
-/// its `Result<OwnedValue, EvalEscape>` contract always carries exactly one
-/// value on the `Ok` side. Used by
+/// Evaluate an expression with an OwnedValue as input, keeping a genuinely
+/// empty result -- a `?`-swallowed type mismatch, or a builtin's own
+/// zero-output result -- distinguishable from a real `null` value (#1280),
+/// via [`eval_owned_expr_full`]. Used by
 /// [`eval_pipe_with_path_context_internal`]'s `Builtin`/`Object`/`Array`/
 /// `Literal`/generic-fallback arms, so a comma/pipe branch that legitimately
 /// produces nothing (`(has("x"))?` on the wrong type, matching real jq's own
@@ -16303,6 +16276,11 @@ fn eval_owned_expr_opt<S: EvalSemantics>(
         .map(|opt| opt.map(|(v, _trailing)| v))
         .map_err(|control| match control {
             Control::Error(e) => e.into(),
+            // A *bare* break (no prior output from the argument) propagates
+            // instead of being collapsed into a synthetic "not in label"
+            // error (#833) -- see `result_to_owned`'s identical fix for the
+            // full rationale, including why the `Partial` case in
+            // `eval_owned_expr_ctrl` is a separate, still-open gap.
             Control::Break(label) => EvalEscape::Break(label),
             Control::Halt(code) => EvalEscape::Halt(code),
         })
@@ -16311,7 +16289,7 @@ fn eval_owned_expr_opt<S: EvalSemantics>(
 /// Evaluate an expression with an OwnedValue as input, preserving the full
 /// output stream.
 ///
-/// [`eval_owned_expr`] collapses a multi-output result into a single array,
+/// `eval_owned_expr` collapses a multi-output result into a single array,
 /// which is what `reduce`/`foreach` want but wrong for a filter that is allowed
 /// to fan out: `try error("x") catch (., .)` must emit two values, not one
 /// two-element array. This variant keeps `Many`/`ManyOwned` intact.
@@ -17845,14 +17823,24 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
 
     // Handle ParentN - return the nth parent value
     if let Expr::Builtin(Builtin::ParentN(n_expr)) = first {
-        // Evaluate n
-        let n = match eval_owned_expr::<S>(n_expr, value, optional) {
-            Ok(OwnedValue::Int(i) | OwnedValue::NumberLiteral(NumberRepr::Int(i), _)) => i as usize,
-            Ok(OwnedValue::Float(f) | OwnedValue::NumberLiteral(NumberRepr::Float(f), _)) => {
+        // Evaluate n. `eval_owned_expr_opt`, not `eval_owned_expr` (#1280
+        // review): `n_expr` producing zero outputs (e.g. `parent(empty)`)
+        // must contribute zero outputs itself, not fall through to the
+        // type-error arm below via a fabricated `Null` -- the exact
+        // collapse this PR's own three sibling arms fix, live-verified to
+        // have still been reachable here (`.a.b | parent(empty), key`
+        // errored `expected number, got other` instead of printing just
+        // `key`'s own value).
+        let n = match eval_owned_expr_opt::<S>(n_expr, value, optional) {
+            Ok(None) => return QueryResult::None,
+            Ok(Some(OwnedValue::Int(i) | OwnedValue::NumberLiteral(NumberRepr::Int(i), _))) => {
+                i as usize
+            }
+            Ok(Some(OwnedValue::Float(f) | OwnedValue::NumberLiteral(NumberRepr::Float(f), _))) => {
                 f as usize
             }
-            Ok(_) if optional => return QueryResult::None,
-            Ok(_) => return QueryResult::Error(EvalError::type_error("number", "other")),
+            Ok(Some(_)) if optional => return QueryResult::None,
+            Ok(Some(_)) => return QueryResult::Error(EvalError::type_error("number", "other")),
             // `?` swallows only a genuine error; a halt always escapes
             // (#791).
             Err(EvalEscape::Error(_)) if optional => return QueryResult::None,
@@ -18657,7 +18645,7 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
 }
 
 /// Helper to evaluate a builtin with an OwnedValue. `Option`-returning
-/// (#1280), not [`eval_owned_expr`]'s always-one-value contract: a builtin
+/// (#1280), not `eval_owned_expr`'s always-one-value contract: a builtin
 /// that legitimately produces nothing under `?` (e.g. `(has("x"))?` on the
 /// wrong type) must stay distinguishable from one that produces `null`,
 /// since this function's only caller is a path-context arm that needs to
