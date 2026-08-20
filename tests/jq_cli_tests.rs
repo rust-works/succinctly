@@ -13479,6 +13479,46 @@ fn test_path_context_parent_n_argument_empty_swallows_to_empty_1280() -> Result<
     Ok(())
 }
 
+/// `ParentN`'s float-`n` arm (`f as usize`), reached only when the `n`
+/// argument evaluates to a float rather than an int -- unchanged logic from
+/// before this PR, just newly wrapped in `Ok(Some(_))`; otherwise dead for
+/// coverage purposes since #1280 rewrote every arm's own pattern.
+#[test]
+fn test_path_context_parent_n_argument_float_1280() -> Result<()> {
+    let (out, err, code) = run_jq_full(
+        &["-c", ".a.b.c | parent(1.0), key"],
+        Some(r#"{"a":{"b":{"c":1}}}"#),
+    )?;
+    assert_eq!(code, 0, "err={err}");
+    assert_eq!(out, "{\"c\":1}\n\"c\"\n");
+    Ok(())
+}
+
+/// `ParentN`'s `Ok(Some(_)) if optional` arm: a non-number `n` argument
+/// under `?` swallows to zero output, same as any other type mismatch.
+#[test]
+fn test_path_context_parent_n_argument_wrong_type_optional_1280() -> Result<()> {
+    let (out, err, code) = run_jq_full(
+        &["-c", r#".a.b | (parent("x"))?, key"#],
+        Some(r#"{"a":{"b":1}}"#),
+    )?;
+    assert_eq!(code, 0, "err={err}");
+    assert_eq!(out.trim(), "\"b\"");
+    Ok(())
+}
+
+/// `ParentN`'s `Ok(Some(_))` unconditional arm: a non-number `n` argument
+/// without `?` is a hard type error, matching every other numeric-argument
+/// builtin's own unconditional type-check.
+#[test]
+fn test_path_context_parent_n_argument_wrong_type_errors_1280() -> Result<()> {
+    let (_out, err, code) =
+        run_jq_full(&["-c", r#".a.b | parent("x")"#], Some(r#"{"a":{"b":1}}"#))?;
+    assert_ne!(code, 0);
+    assert!(err.contains("expected number"), "err={err}");
+    Ok(())
+}
+
 /// #1045 coverage: `flatten(depth)`'s `Ok(Some(_)) => ...type_error("number",
 /// "non-number")` arm -- a non-number depth argument, unconditional (no
 /// `optional` gate), unlike the negative-depth arm covered by
