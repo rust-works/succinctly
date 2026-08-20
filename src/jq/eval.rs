@@ -11759,9 +11759,27 @@ fn get_path_mut<'a>(
     path_parts: &[Expr],
 ) -> Result<Option<&'a mut OwnedValue>, EvalError> {
     let mut current = root;
+    // A working copy, not a plain slice iteration: `resolve_node`'s `?` arm
+    // can emit `Optional(Pipe([…]))` when a branch resolves to more than one
+    // component, and a parenthesized static chain with no computed key at
+    // all (`(.a|.c)[0] = 9`) hands this walker an un-flattened `Pipe`
+    // directly, since `needs_path_prepass` never routes it through a
+    // flattening pass first. Splicing the nested `Pipe`'s components in
+    // place and reprocessing from the same position mirrors `update_path`'s
+    // own `Expr::Pipe(inner)` arm, one step at a time, so arbitrarily nested
+    // `Pipe`s resolve the same way a single recursive call there would.
+    let mut parts = path_parts.to_vec();
+    let mut i = 0;
 
-    for part in path_parts {
-        let (part, optional) = unwrap_path_component(part);
+    while i < parts.len() {
+        let (part, optional) = unwrap_path_component(&parts[i]);
+
+        if let Expr::Pipe(inner) = part {
+            let inner = inner.clone();
+            parts.splice(i..=i, inner);
+            continue;
+        }
+
         current = match part {
             Expr::Identity => current,
             Expr::Field(name) => {
@@ -11808,6 +11826,7 @@ fn get_path_mut<'a>(
             }
             _ => return Err(EvalError::new("invalid path component")),
         };
+        i += 1;
     }
 
     Ok(Some(current))
@@ -39427,6 +39446,69 @@ mod tests {
             (b"[1,2]", ".[5] = 9", Ok("[1,2,null,null,null,9]")),
             (br#"{"a":[]}"#, ".a[0] = 9", Ok(r#"{"a":[9]}"#)),
         ]);
+    }
+
+    #[test]
+    fn test_assign_through_parenthesized_pipe_target_names_the_type_mismatch() {
+        // #1287: a static (no computed key) parenthesized pipe target, like
+        // `(.a|.c)`, never goes through `resolve_dynamic_indexes`'s
+        // flattening pass (`needs_path_prepass` says no -- nothing here is
+        // computed), so `set_path`'s `Expr::Pipe` arm handed `get_path_mut`
+        // an un-flattened `Expr::Pipe([Field("a"), Field("c")])` as a single
+        // path component. `get_path_mut` didn't know how to walk a `Pipe`,
+        // so it fell to its catch-all's generic "invalid path component"
+        // instead of the type-naming message its `Field`/`Index` arms
+        // already produce once actually reached. All three confirmed
+        // against real jq 1.7.1.
+        assert_outcomes(&[
+            (
+                br#"{"a":{"c":1}}"#,
+                "((.a|.c)[0]) = 9",
+                Err("Cannot index number with number"),
+            ),
+            (
+                br#"{"a":{"c":1}}"#,
+                r#"((.a|.c)["c"]) = 9"#,
+                Err(r#"Cannot index number with string "c""#),
+            ),
+            (
+                br#"{"a":{"c":1}}"#,
+                "((.a|.c)[0:1]) = 9",
+                Err("Cannot index number with object"),
+            ),
+            // Nesting depth beyond two levels still flattens correctly.
+            (
+                br#"{"a":{"b":{"c":1}}}"#,
+                "((.a|.b|.c)[0]) = 9",
+                Err("Cannot index number with number"),
+            ),
+        ]);
+    }
+
+    #[test]
+    fn test_yq_assign_through_parenthesized_pipe_target_noops_on_non_container_1287() {
+        // `get_path_mut`'s `Expr::Pipe` splice is shared by both evaluators
+        // -- before it, yq mode hit the exact same "invalid path component"
+        // internal error jq mode did, in place of the no-op real yq gives
+        // for writing through a scalar (`scalar_noop`/`container_noop`,
+        // #1101/#1142). Live-verified against real yq v4.53.3: all three
+        // shapes leave the document unchanged, exit 0.
+        for filter in [
+            "((.a|.c)[0]) = 9",
+            r#"((.a|.c)["c"]) = 9"#,
+            "((.a|.c)[0:1]) = 9",
+        ] {
+            let json: &[u8] = br#"{"a":{"c":1}}"#;
+            let index = JsonIndex::build(json);
+            let cursor = index.root(json);
+            let expr = parse(filter).unwrap();
+            let out: Vec<String> = eval::<Vec<u64>, YqSemantics>(&expr, cursor)
+                .collect_owned()
+                .iter()
+                .map(OwnedValue::to_json)
+                .collect();
+            assert_eq!(out, vec![r#"{"a":{"c":1}}"#], "filter: {filter}");
+        }
     }
 
     #[test]
