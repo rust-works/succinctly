@@ -233,12 +233,14 @@ fn yaml_to_owned_value<W: AsRef<[u64]>>(cursor: YamlCursor<'_, W>) -> Result<Own
             Ok(OwnedValue::Array(arr))
         }
         YamlValue::Alias { target, .. } => {
-            // Resolve alias by following the target cursor
-            if let Some(target_cursor) = target {
-                yaml_to_owned_value(target_cursor)
-            } else {
-                // Unresolved alias - treat as null
-                Ok(OwnedValue::Null)
+            // Resolve the *entire* alias chain first (#1193), not just this
+            // one hop: the resolved cursor's own `.value()` is guaranteed
+            // non-`Alias`, so this recursive call terminates in exactly one
+            // more step regardless of chain length.
+            match target.and_then(|t| t.resolve_alias_target_cursor()) {
+                Some(resolved) => yaml_to_owned_value(resolved),
+                // Unresolved (dangling) target - treat as null
+                None => Ok(OwnedValue::Null),
             }
         }
         YamlValue::Error(msg) => Err(anyhow::anyhow!("YAML error: {msg}")),
