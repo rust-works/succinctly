@@ -3352,6 +3352,9 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
         // Phase 12: Additional builtins
         Builtin::Now => builtin_now::<W>(),
+        Builtin::Input => builtin_input::<W>(),
+        Builtin::Inputs => builtin_inputs::<W>(),
+        Builtin::InputLineNumber => builtin_input_line_number::<W>(),
         Builtin::Abs => builtin_fabs::<W>(value, optional), // abs is an alias for fabs
         Builtin::Builtins => builtin_builtins::<W>(),
         Builtin::Normals => builtin_normals::<W>(value),
@@ -15692,6 +15695,9 @@ fn substitute_var_in_builtin(
         Builtin::Del(e) => Builtin::Del(Box::new(substitute_var(e, var_name, replacement))),
         // Phase 12 builtins (no args to substitute)
         Builtin::Now => Builtin::Now,
+        Builtin::Input => Builtin::Input,
+        Builtin::Inputs => Builtin::Inputs,
+        Builtin::InputLineNumber => Builtin::InputLineNumber,
         Builtin::Abs => Builtin::Abs,
         Builtin::Builtins => Builtin::Builtins,
         Builtin::Normals => Builtin::Normals,
@@ -20641,6 +20647,154 @@ fn builtin_now<'a, W: Clone + AsRef<[u64]>>() -> QueryResult<'a, W> {
     {
         // no_std environment - return 0.0 as a fallback
         QueryResult::Owned(OwnedValue::Float(0.0))
+    }
+}
+
+/// Backing store for `input`/`inputs`/`input_line_number` (#723): a
+/// per-thread queue of not-yet-consumed input documents, seeded by the CLI
+/// driver (`jq_runner.rs`) before it starts evaluating any filter, and drained
+/// from here rather than threaded through `eval`/`eval_generic::eval`'s own
+/// signatures -- the same "reach outside the pure per-document evaluation
+/// model via ambient state" shape `builtin_now`/`builtin_env` already use for
+/// the OS clock/environment, chosen over a new parameter because the CLI's
+/// per-document loop itself needs to share this exact queue (see
+/// `pop_remaining_input`'s own doc comment) to keep a filter's own `input`
+/// calls and the loop's "next top-level document" in sync without a second,
+/// separately-maintained cursor.
+///
+/// `#[cfg(feature = "std")]` only: `thread_local!` needs `std`, and there is
+/// no meaningful "remaining input stream" concept in a `no_std` embedding
+/// with no CLI driver to seed it anyway.
+#[cfg(feature = "std")]
+mod remaining_inputs {
+    use super::OwnedValue;
+    use std::cell::{Cell, RefCell};
+    use std::collections::VecDeque;
+
+    thread_local! {
+        static QUEUE: RefCell<VecDeque<(OwnedValue, u32)>> = const { RefCell::new(VecDeque::new()) };
+        // jq reports the *last successfully read* document's line, not the
+        // next one still queued -- starts at 0 (matching real jq's own
+        // `input_line_number` before anything has been read yet).
+        static LAST_LINE: Cell<u32> = const { Cell::new(0) };
+    }
+
+    /// Replaces the queue's contents wholesale. Called once by the CLI driver
+    /// before evaluating any filter against any document -- never mid-run,
+    /// so this doesn't need to merge with whatever a prior call left behind.
+    pub fn seed(documents: Vec<(OwnedValue, u32)>) {
+        QUEUE.with(|q| *q.borrow_mut() = documents.into());
+        LAST_LINE.with(|l| l.set(0));
+    }
+
+    /// Pops the next queued document, recording its line for
+    /// `input_line_number`. Shared by `builtin_input`/`builtin_inputs` *and*
+    /// the CLI driver's own per-document loop (for a document the filter
+    /// itself never explicitly reads via `input`) -- one shared queue, not
+    /// two cursors kept in sync by hand.
+    pub fn pop() -> Option<(OwnedValue, u32)> {
+        let popped = QUEUE.with(|q| q.borrow_mut().pop_front());
+        if let Some((_, line)) = &popped {
+            LAST_LINE.with(|l| l.set(*line));
+        }
+        popped
+    }
+
+    /// Drains every remaining document at once, for `inputs`'s eager
+    /// generator collection (matching `range`'s own eager-with-a-cap
+    /// convention elsewhere in this file -- this codebase has no lazy
+    /// generator machinery at the `Builtin` dispatch level, so `inputs`
+    /// doesn't invent one; `first(inputs)`/`limit(1; inputs)` draining more
+    /// than needed is the same accepted trade-off `range`'s own callers
+    /// already have).
+    pub fn drain_all() -> Vec<(OwnedValue, u32)> {
+        let all: alloc::vec::Vec<_> = QUEUE.with(|q| q.borrow_mut().drain(..).collect());
+        if let Some((_, line)) = all.last() {
+            LAST_LINE.with(|l| l.set(*line));
+        }
+        all
+    }
+
+    pub fn last_line() -> u32 {
+        LAST_LINE.with(Cell::get)
+    }
+}
+
+/// Seeds the `input`/`inputs`/`input_line_number` queue (#723).
+///
+/// The CLI driver's own entry point into [`remaining_inputs`], called once
+/// before evaluating any filter. A no-op under `no_std` (nothing to seed
+/// there).
+#[cfg(feature = "std")]
+pub fn seed_remaining_inputs(documents: Vec<(OwnedValue, u32)>) {
+    remaining_inputs::seed(documents);
+}
+
+/// Pops the next queued input document (#723).
+///
+/// Exposed so the CLI driver's own per-document loop can share the exact
+/// same queue `input`/`inputs` draw from (see [`remaining_inputs::pop`]'s
+/// doc comment for why this must be one shared queue, not two cursors). A
+/// no-op under `no_std`.
+#[cfg(feature = "std")]
+pub fn pop_remaining_input() -> Option<(OwnedValue, u32)> {
+    remaining_inputs::pop()
+}
+
+/// Builtin: input - read and return the next input document (#723), erroring
+/// with real jq's own exact text (`break`, confirmed live against jq 1.7.1 --
+/// not a more descriptive message) once the input stream is exhausted. A
+/// normal, `?`/`try`-catchable `EvalError`, not this codebase's `Control::
+/// Break` (`label`/`break $label`) mechanism -- confirmed live that `input?`
+/// on exhaustion is silent (exit 0, no output) exactly like any other
+/// caught error, unlike an actual uncaught `label`/`break` mismatch.
+fn builtin_input<'a, W: Clone + AsRef<[u64]>>() -> QueryResult<'a, W> {
+    #[cfg(feature = "std")]
+    {
+        match remaining_inputs::pop() {
+            Some((doc, _line)) => owned_vec_to_result(vec![doc]),
+            None => QueryResult::Error(EvalError::new("break")),
+        }
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        QueryResult::Error(EvalError::new(
+            "input is not supported in a no_std embedding",
+        ))
+    }
+}
+
+/// Builtin: inputs - every remaining input document, one output each (#723).
+/// Stops cleanly (no output, no error) once exhausted -- unlike bare `input`,
+/// this never raises; real jq's own `inputs` is `try repeat(input) catch
+/// if .=="break" then empty else error end`, and this collects the
+/// equivalent eagerly (see [`remaining_inputs::drain_all`]'s doc comment for
+/// why eager, not lazy, matches this codebase's own convention).
+fn builtin_inputs<'a, W: Clone + AsRef<[u64]>>() -> QueryResult<'a, W> {
+    #[cfg(feature = "std")]
+    {
+        let docs: Vec<OwnedValue> = remaining_inputs::drain_all()
+            .into_iter()
+            .map(|(doc, _line)| doc)
+            .collect();
+        owned_vec_to_result(docs)
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        owned_vec_to_result(Vec::new())
+    }
+}
+
+/// Builtin: input_line_number - the line number of the most recently read
+/// input document (#723), `0` before anything has been read.
+fn builtin_input_line_number<'a, W: Clone + AsRef<[u64]>>() -> QueryResult<'a, W> {
+    #[cfg(feature = "std")]
+    {
+        QueryResult::Owned(OwnedValue::Int(remaining_inputs::last_line() as i64))
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        QueryResult::Owned(OwnedValue::Int(0))
     }
 }
 
@@ -25989,6 +26143,9 @@ fn expand_func_calls_in_builtin(
         Builtin::Del(e) => Builtin::Del(Box::new(expand_func_calls(e, func_name, params, body))),
         // Phase 12 builtins (no args to expand)
         Builtin::Now => Builtin::Now,
+        Builtin::Input => Builtin::Input,
+        Builtin::Inputs => Builtin::Inputs,
+        Builtin::InputLineNumber => Builtin::InputLineNumber,
         Builtin::Abs => Builtin::Abs,
         Builtin::Builtins => Builtin::Builtins,
         Builtin::Normals => Builtin::Normals,
@@ -26319,6 +26476,9 @@ fn substitute_func_param_in_builtin(builtin: &Builtin, param: &str, arg: &Expr) 
         Builtin::Del(e) => Builtin::Del(Box::new(substitute_func_param(e, param, arg))),
         // Phase 12 builtins (no args to substitute)
         Builtin::Now => Builtin::Now,
+        Builtin::Input => Builtin::Input,
+        Builtin::Inputs => Builtin::Inputs,
+        Builtin::InputLineNumber => Builtin::InputLineNumber,
         Builtin::Abs => Builtin::Abs,
         Builtin::Builtins => Builtin::Builtins,
         Builtin::Normals => Builtin::Normals,

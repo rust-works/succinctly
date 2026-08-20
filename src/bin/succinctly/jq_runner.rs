@@ -669,6 +669,20 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
     // Get the filter expression
     let filter_str = get_filter(&args)?;
 
+    // Whether the filter could reference `input`/`inputs`/`input_line_number`
+    // (#723) -- a conservative text-level check on the raw source rather than
+    // an AST walk: every real use of any of the three necessarily contains
+    // "input" as a contiguous substring (jq identifiers can't be split
+    // across an escape/continuation), so this never under-detects. A false
+    // positive (`.input` field access, an `"input"` string literal, a
+    // comment) only costs a missed fast-path optimization below, never a
+    // wrong result -- the opposite of an AST walk that missed a `Builtin`
+    // variant deep in some argument position, which would silently produce
+    // wrong output instead. Doesn't see inside an imported/included module's
+    // own definitions (`-L`) -- out of scope for this pass, filed as a
+    // follow-up.
+    let uses_input_builtins = filter_str.contains("input");
+
     // Parse the filter as a full program (with module directives)
     let program = jq::parse_program(&filter_str).map_err(|e| {
         eprintln!("jq: compile error: {e}");
@@ -716,7 +730,7 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
     // This uses the DSV cursor to iterate rows and writes JSON arrays directly to output.
     // Memory usage: file bytes + DSV index (~3-4% overhead) + small output buffer.
     if let Some(delimiter) = args.input_dsv {
-        if !args.slurp && !args.null_input {
+        if !args.slurp && !args.null_input && !uses_input_builtins {
             // Streaming mode: process each row independently
             let files = get_input_files(&args);
             let raw_inputs: Vec<Vec<u8>> = if files.is_empty() {
@@ -802,6 +816,9 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
     // It's available when:
     // - Not using features that require serde_json parsing (slurp, raw_input, seq input, dsv)
     // - Not using output transformations that need full access to values (sort_keys, color, ascii)
+    // - Not using input/inputs/input_line_number (#723): those need the
+    //   "original" path's own already-materialized Vec<OwnedValue> to share
+    //   with the shared input queue below; the lazy path never builds one.
     // Both jq_compat (reformatting numbers) and preserve mode (keeping original formatting)
     // use the lazy path for correctness.
     let can_use_lazy_path = !args.slurp
@@ -810,7 +827,8 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
         && !args.seq // seq input mode parses differently
         && !output_config.sort_keys
         && !output_config.color_output
-        && !output_config.ascii_output; // ASCII output requires escaping
+        && !output_config.ascii_output // ASCII output requires escaping
+        && !uses_input_builtins;
 
     if can_use_lazy_path && !args.null_input {
         // Lazy path: read files as raw bytes and process directly
@@ -895,24 +913,108 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
         }
     } else {
         // Original path: parse through serde_json (loses number formatting)
-        let (inputs, locations) = match get_inputs(&args) {
+        //
+        // `force_read_under_null_input` narrows `uses_input_builtins` by one
+        // safety check: never force a real read under `-n` when stdin is an
+        // interactive terminal with no files given. `uses_input_builtins` is
+        // a conservative text-level heuristic (see its own doc comment) that
+        // can false-positive on a filter that merely *contains* the
+        // substring "input" (a `.input` field, an `"input"` string literal)
+        // without actually calling the builtin -- harmless everywhere else
+        // (just a missed fast-path optimization), except specifically here:
+        // forcing a read under `-n` on a false positive, with no piped input
+        // and no files, would otherwise hang waiting on a TTY that was never
+        // going to send anything. Narrowing it this way means a false
+        // positive just makes `input`/`inputs` report exhausted immediately
+        // (the queue never gets seeded) instead of hanging -- never a wrong
+        // *answer*, only conceivably a real `input`/`inputs` call losing its
+        // data if someone runs `-n 'inputs'` at a bare interactive prompt
+        // with data they intend to type in live rather than pipe/redirect --
+        // an already-unusual way to invoke `-n` in the first place.
+        let force_read_under_null_input = should_force_read_under_null_input(
+            uses_input_builtins,
+            args.null_input,
+            get_input_files(&args).is_empty(),
+            std::io::stdin().is_terminal(),
+        );
+        let (inputs, locations) = match get_inputs(&args, force_read_under_null_input) {
             Ok(Ok(inputs)) => inputs,
             Ok(Err(e)) => return Err(e),
             Err(exit_code) => return Ok(exit_code), // Validation error
         };
 
-        for (idx, input) in inputs.iter().enumerate() {
-            let at = locations.get(idx);
-            let results = evaluate_input(input, &expr, &context, &at, &mut sink)?;
+        if uses_input_builtins {
+            // Seed `input`/`inputs`/`input_line_number`'s shared queue
+            // (#723) with every document `get_inputs` just read -- under
+            // `-n`, `force_read_under_null_input` (passed above) made it
+            // read the real documents instead of faking `[null]`, precisely
+            // so they're available here.
+            let queue: Vec<(OwnedValue, u32)> = inputs
+                .iter()
+                .enumerate()
+                .map(|(idx, v)| (v.clone(), locations.get(idx).line.unwrap_or(0) as u32))
+                .collect();
+            jq::seed_remaining_inputs(queue);
 
-            for result in results {
-                had_output = true;
-                last_output = Some(result.clone());
-                write_output(&mut out, &result, &output_config)?;
+            if args.null_input {
+                // `.` is null exactly once, matching `-n`'s own existing
+                // contract -- `input`/`inputs` inside the filter draw from
+                // the queue just seeded above, not from this invocation.
+                let results = evaluate_input(
+                    &OwnedValue::Null,
+                    &expr,
+                    &context,
+                    &InputLocation::unknown(),
+                    &mut sink,
+                )?;
+                for result in results {
+                    had_output = true;
+                    last_output = Some(result.clone());
+                    write_output(&mut out, &result, &output_config)?;
+                }
+                if let Some(code) = sink.halted() {
+                    out.flush()?;
+                    return Ok(code);
+                }
+            } else {
+                // The outer loop and `input`/`inputs` draw from the exact
+                // same queue (#723): a document a filter's own `input` call
+                // consumes mid-evaluation is never also re-processed here as
+                // a fresh top-level invocation, and vice versa -- one shared
+                // cursor, not two kept in sync by hand. Loses the per-value
+                // filename `locations.get(idx)` would have carried (the
+                // queue only tracks line numbers, matching real jq's own
+                // `input_line_number`); accepted for this pass since
+                // `input`/`inputs` combined with multiple named input files
+                // is a narrow case, not the common single-stream one.
+                while let Some((input, line)) = jq::pop_remaining_input() {
+                    let at = InputLocation::at(None, line as usize);
+                    let results = evaluate_input(&input, &expr, &context, &at, &mut sink)?;
+                    for result in results {
+                        had_output = true;
+                        last_output = Some(result.clone());
+                        write_output(&mut out, &result, &output_config)?;
+                    }
+                    if let Some(code) = sink.halted() {
+                        out.flush()?;
+                        return Ok(code);
+                    }
+                }
             }
-            if let Some(code) = sink.halted() {
-                out.flush()?;
-                return Ok(code);
+        } else {
+            for (idx, input) in inputs.iter().enumerate() {
+                let at = locations.get(idx);
+                let results = evaluate_input(input, &expr, &context, &at, &mut sink)?;
+
+                for result in results {
+                    had_output = true;
+                    last_output = Some(result.clone());
+                    write_output(&mut out, &result, &output_config)?;
+                }
+                if let Some(code) = sink.halted() {
+                    out.flush()?;
+                    return Ok(code);
+                }
             }
         }
     }
@@ -1054,13 +1156,47 @@ fn get_input_files(args: &JqCommand) -> Vec<std::path::PathBuf> {
     files
 }
 
+/// Whether to force a real read under `-n` for `input`/`inputs`/
+/// `input_line_number` (#723), given `uses_input_builtins`' own text-level
+/// heuristic (see its doc comment at the call site for why it can
+/// false-positive). Narrowed by one safety check, pulled out as a pure
+/// function so it's unit-testable without a real terminal: never force the
+/// read when `-n` is set, no files were given, and stdin is an interactive
+/// terminal -- a false positive there would otherwise hang waiting on a TTY
+/// that was never going to send anything, instead of just costing a missed
+/// fast-path optimization the way every other false positive does.
+///
+/// Four bools, each independently meaningful and named at every call site
+/// (no adjacent pair is ever confusable) -- a two-variant-enum refactor
+/// would add ceremony without adding clarity for this single-call-site,
+/// private helper.
+#[allow(clippy::fn_params_excessive_bools)]
+fn should_force_read_under_null_input(
+    uses_input_builtins: bool,
+    null_input: bool,
+    no_files_given: bool,
+    stdin_is_terminal: bool,
+) -> bool {
+    uses_input_builtins && !(null_input && no_files_given && stdin_is_terminal)
+}
+
 /// Get input values based on arguments.
 /// Returns Err(i32) for validation failures (exit code), Ok(Err) for other errors.
 fn get_inputs(
     args: &JqCommand,
+    force_read_under_null_input: bool,
 ) -> std::result::Result<Result<(Vec<OwnedValue>, InputLocations)>, i32> {
-    // Null input mode: use null as the single input
-    if args.null_input {
+    // Null input mode: use null as the single input -- unless the filter
+    // itself uses `input`/`inputs`/`input_line_number` (#723), in which case
+    // the caller passes `force_read_under_null_input: true` to fall through
+    // to the real read below instead: `-n` makes the top-level `.` null, but
+    // `input`/`inputs` must still see the real stdin/files (`jq -n 'reduce
+    // inputs as $x (0;.+$x)'` is jq's own idiomatic streaming-aggregation
+    // pattern, oracle-confirmed). The caller is responsible for still
+    // presenting `.` as `null` to the filter itself in that case -- this
+    // function only controls what gets *read*, not what the top-level
+    // invocation's input value is.
+    if args.null_input && !force_read_under_null_input {
         // jq prints `(at <unknown>)` under -n: there is no input to point at.
         return Ok(Ok((vec![OwnedValue::Null], InputLocations::unknown())));
     }
@@ -2932,6 +3068,41 @@ fn format_json(value: &OwnedValue, config: &OutputConfig) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #723: direct unit coverage for the TTY-safety narrowing, independent
+    /// of a real terminal (which `cargo test` never has one of anyway).
+    /// Only the exact combination -- `-n`, no files, an interactive stdin --
+    /// should suppress the forced real read; every other combination (any
+    /// one of the three false) must force it whenever `uses_input_builtins`
+    /// says the filter might need it.
+    #[test]
+    fn test_should_force_read_under_null_input_723() {
+        // Never forces anything when the filter doesn't reference these
+        // builtins at all, regardless of the other three inputs.
+        assert!(!should_force_read_under_null_input(false, true, true, true));
+        assert!(!should_force_read_under_null_input(
+            false, false, false, false
+        ));
+
+        // Not under -n at all: always forces (there's no hang risk --
+        // non-null-input mode already reads stdin/files unconditionally).
+        assert!(should_force_read_under_null_input(true, false, true, true));
+        assert!(should_force_read_under_null_input(
+            true, false, false, false
+        ));
+
+        // Under -n with files given: forces (files can't block like a bare
+        // TTY read can).
+        assert!(should_force_read_under_null_input(true, true, false, true));
+
+        // Under -n with no files but stdin isn't a terminal (piped/redirected):
+        // forces -- this is the canonical `jq -n 'reduce inputs as $x (...)'`
+        // streaming-aggregation case.
+        assert!(should_force_read_under_null_input(true, true, true, false));
+
+        // The one suppressed combination: -n, no files, interactive stdin.
+        assert!(!should_force_read_under_null_input(true, true, true, true));
+    }
 
     /// #1154: direct unit coverage for the extracted token-boundary
     /// finder, independent of the CLI-level `--argjson` tests (which

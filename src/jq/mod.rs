@@ -87,6 +87,12 @@ pub use eval::{
     eval, eval_lenient, eval_owned_with_file_index, nonfinite_display_string, substitute_vars,
     sync_aliased_paths, EvalSemantics, JqSemantics, QueryResult, YqSemantics,
 };
+// `input`/`inputs`/`input_line_number`'s CLI-facing seam (#723) -- only
+// exists under `eval.rs`'s own `#[cfg(feature = "std")]` gate (a `thread_local!`
+// backing store needs `std`, and there is no meaningful "remaining input
+// stream" to seed under a `no_std` embedding with no CLI driver anyway).
+#[cfg(feature = "std")]
+pub use eval::{pop_remaining_input, seed_remaining_inputs};
 pub use expr::{
     ArithOp, AssignOp, Builtin, CompareOp, Expr, FormatType, Import, Include, Literal, MetaValue,
     ModuleMeta, ObjectEntry, ObjectKey, Pattern, PatternEntry, Program, StringPart,
