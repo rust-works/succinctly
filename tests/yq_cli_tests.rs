@@ -15558,7 +15558,7 @@ fn test_1223_multi_path_del_object_target_fixed_nested_comma() -> Result<()> {
 #[test]
 fn test_1223_multi_path_del_object_target_with_computed_key_sibling() -> Result<()> {
     let (out, code) = run_yq_stdin(
-        r#"del(.a[0:1], .[.d])"#,
+        r"del(.a[0:1], .[.d])",
         r#"{"a":{"x":1,"y":2},"b":6,"c":9,"d":"c"}"#,
         &["-o=json", "-I=0"],
     )?;
@@ -15663,7 +15663,7 @@ fn test_1223_iterate_prefix_slice_sibling_characterize_preexisting_bug() -> Resu
 #[test]
 fn test_1223_computed_key_with_trailing_slice_characterize_preexisting_bug() -> Result<()> {
     let (_out, stderr, code) = run_yq_stdin_with_stderr(
-        r#"del(.[($k)][0:1], .c)"#,
+        r"del(.[($k)][0:1], .c)",
         r#"{"a":{"x":1,"y":2},"c":9}"#,
         &["--arg", "k", "a"],
     )?;
