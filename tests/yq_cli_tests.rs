@@ -992,26 +992,20 @@ fn test_yq_array_comma_wrapped_iterate_many_cursor_1168() -> Result<()> {
     Ok(())
 }
 
-/// #1168 coverage: `Expr::Array`'s atomicity arms (`Break`/`Halt`, and their
-/// `Partial` siblings once something already output before the break/halt
-/// fired) -- mirrors `eval::eval_array_construction`'s identical control-flow
+/// #1168 coverage: `Expr::Array`'s `Halt`/`Partial`-`Halt` atomicity arms --
+/// mirrors `eval::eval_array_construction`'s identical control-flow
 /// handling, which this native arm replaces the wildcard-fallback route to.
-#[test]
-fn test_yq_array_wrapped_break_produces_no_output_1168() -> Result<()> {
-    let (stdout, code) = run_yq_stdin("label $out | [break $out]", "null\n", &["-o=json"])?;
-    assert_eq!(code, 0);
-    assert_eq!(stdout, "");
-    Ok(())
-}
-
-#[test]
-fn test_yq_array_wrapped_partial_break_discards_prefix_1168() -> Result<()> {
-    let (stdout, code) = run_yq_stdin("label $out | [(1, break $out)]", "null\n", &["-o=json"])?;
-    assert_eq!(code, 0);
-    assert_eq!(stdout, "");
-    Ok(())
-}
-
+/// No `Break` sibling test: unlike `halt`, `break $out` needs an enclosing
+/// `label $out` to even parse, and `Expr::Label` itself has no native
+/// `eval_single` arm (see the scope-widening comment on #1168 itself) -- any
+/// query shaped so a `break` could reach *past* this arm's own boundary
+/// necessarily puts `Label` above `Array` in the tree, which routes the
+/// *whole* expression through the wildcard fallback before this arm ever
+/// runs. Its `Break`/`Partial`-`Break` arms are kept for exhaustiveness over
+/// the shared `GenericResult` enum (mirroring `eval::eval_array_construction`'s
+/// own arms), not because a reachable CLI query hits them today -- same
+/// "unreachable but exhaustive" shape #1064 documents elsewhere in this
+/// codebase; see `eval_generic.rs`'s own comment on those two arms.
 #[test]
 fn test_yq_array_wrapped_halt_exits_with_no_output_1168() -> Result<()> {
     let (stdout, code) = run_yq_stdin("[halt]", "null\n", &["-o=json"])?;
