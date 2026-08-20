@@ -11502,9 +11502,18 @@ fn set_path(
                         parent,
                         split.start,
                         split.end,
-                        split.optional,
-                        scalar_noop,
-                        container_noop,
+                        SliceEditFlags {
+                            optional: split.optional,
+                            scalar_noop,
+                            container_noop,
+                            // `split_at_slice` gives an `Identity` tail
+                            // when the slice is genuinely the *last* path
+                            // component (`.a[0:1] = v`, nothing after
+                            // it) — that's a terminal write in disguise,
+                            // not a mid-chain read-through, however this
+                            // arm reached it (#1321).
+                            terminal_write: matches!(split.tail, Expr::Identity),
+                        },
                         |sub| set_path(sub, &split.tail, new_value, scalar_noop, container_noop),
                     ),
                 }
@@ -11580,9 +11589,12 @@ fn set_path(
             root,
             *start,
             *end,
-            false,
-            scalar_noop,
-            container_noop,
+            SliceEditFlags {
+                optional: false,
+                scalar_noop,
+                container_noop,
+                terminal_write: true,
+            },
             |sub| {
                 *sub = new_value;
                 Ok(())
@@ -11676,15 +11688,52 @@ fn splice_optional_group(inner: &[Expr], rest: &[Expr], here: bool) -> Vec<Expr>
 /// and whatever it leaves has to still be an array — splicing back is element
 /// by element, which is exactly what jq's `A slice of an array can only be
 /// assigned another array` is about.
+/// Bundles `through_slice`'s per-call flags — clippy's `too_many_arguments`/
+/// `fn_params_excessive_bools` correctly flag four independent `bool`s
+/// (#1321 added `terminal_write` to the pre-existing three) as too many to
+/// track positionally at each call site.
+struct SliceEditFlags {
+    /// Whether the slice itself carried a `?` (`.a[0:1]?[0] = 9`) — threaded
+    /// into `slice_owned_value`'s own bounds check so a genuinely
+    /// out-of-range slice there is suppressed the same way a bare
+    /// `.a[0:1]? = 9` already is. Write-time application errors
+    /// (`slice_assign_non_array`/`cannot_update_string_slices`) are
+    /// unaffected either way — never gated on this, matching real jq never
+    /// suppressing them via an inline `?`.
+    optional: bool,
+    /// yq's slice-assignment no-op (#1101/#1116) for a *scalar* target —
+    /// gated by the caller to exclude `-=`/`*=`, which real yq errors on
+    /// instead.
+    scalar_noop: bool,
+    /// yq's slice-assignment no-op (#1101/#1116/#1142) for a *container*
+    /// (array/string) target — unconditional on the operator, unlike
+    /// `scalar_noop` above.
+    container_noop: bool,
+    /// Whether this call's own `edit` closure *is* the write (`*sub =
+    /// new_value`, or a filter applied directly to the slice, always
+    /// trivially `Ok`) versus a read-through step with more path *inside*
+    /// `edit` that can itself fail or no-op (#1321). Only the former ever
+    /// needs the `OwnedValue::String` arm's terminal "cannot update string
+    /// slices" refusal below -- for the latter, `edit`'s own result (a
+    /// genuine navigation failure, or a silent `?`-suppressed no-op) is
+    /// the answer, and forcing that same refusal on top would report the
+    /// wrong thing (or a spurious error where jq no-ops) either way.
+    terminal_write: bool,
+}
+
 fn through_slice<E: From<EvalError>>(
     root: &mut OwnedValue,
     start: Option<i64>,
     end: Option<i64>,
-    optional: bool,
-    scalar_noop: bool,
-    container_noop: bool,
+    flags: SliceEditFlags,
     edit: impl FnOnce(&mut OwnedValue) -> Result<(), E>,
 ) -> Result<(), E> {
+    let SliceEditFlags {
+        optional,
+        scalar_noop,
+        container_noop,
+        terminal_write,
+    } = flags;
     match root {
         // yq's slice-write no-op (#1101/#1116's scalar case, widened to a
         // real array/string target by #1142) — live-verified against yq
@@ -11729,7 +11778,21 @@ fn through_slice<E: From<EvalError>>(
             Ok(())
         }
         // jq reads a string slice but will not write one back, whatever the
-        // replacement — the refusal beats the non-array one above.
+        // replacement — the refusal beats the non-array one above. But
+        // that refusal is only correct once the slice itself *is* the
+        // write; a chained path with more path after the slice
+        // (`terminal_write: false`) needs the read-through substring
+        // handed to `edit` instead, so *that* navigation's own outcome —
+        // a genuine failure (`del(.a[0:1].b)` -> "Cannot index string
+        // with string \"b\"", matching `.a[0:1].b = 5`'s identical real-jq
+        // message) or a `?`-suppressed no-op (`del(.a[0:1][0]?)`,
+        // `.a[0:1].b? = 5`) — is the answer, not this refusal (#1321,
+        // confirmed live both ways against real jq for `del()` and `=`).
+        OwnedValue::String(_) if !terminal_write => {
+            let mut throwaway = slice_owned_value(root, start, end, optional)?
+                .expect("Array/String target always yields Some from slice_owned_value");
+            edit(&mut throwaway)
+        }
         OwnedValue::String(_) => Err(EvalError::cannot_update_string_slices().into()),
         // yq's slice-assignment no-op (#1101, generalized to any nesting
         // depth by #1116): `through_slice` is the single choke point every
@@ -12191,9 +12254,12 @@ fn update_path<S: EvalSemantics>(
                         root,
                         *start,
                         *end,
-                        here,
-                        scalar_noop,
-                        container_noop,
+                        SliceEditFlags {
+                            optional: here,
+                            scalar_noop,
+                            container_noop,
+                            terminal_write: false,
+                        },
                         |sub| update_path::<S>(sub, &rest, filter_expr, optional, scalar_noop),
                     ),
                     _ => update_path::<S>(root, first, filter_expr, here, scalar_noop),
@@ -12217,9 +12283,12 @@ fn update_path<S: EvalSemantics>(
             root,
             *start,
             *end,
-            optional,
-            scalar_noop,
-            container_noop,
+            SliceEditFlags {
+                optional,
+                scalar_noop,
+                container_noop,
+                terminal_write: true,
+            },
             |sub| update_path::<S>(sub, &Expr::Identity, filter_expr, optional, scalar_noop),
         ),
         // Unreachable: `resolve_dynamic_indexes` rewrites every computed key
@@ -20879,11 +20948,18 @@ fn delete_at_path(
                     // reached through the slice) — broader than #1162's own
                     // scope (slice as the path's *last* component), needing
                     // its own investigation before it's fixed.
-                    Expr::Slice { start, end } => {
-                        through_slice(root, *start, *end, here, false, false, |sub| {
-                            delete_at_path(sub, &rest, optional, yq_mode)
-                        })
-                    }
+                    Expr::Slice { start, end } => through_slice(
+                        root,
+                        *start,
+                        *end,
+                        SliceEditFlags {
+                            optional: here,
+                            scalar_noop: false,
+                            container_noop: false,
+                            terminal_write: false,
+                        },
+                        |sub| delete_at_path(sub, &rest, optional, yq_mode),
+                    ),
                     _ => delete_at_path(root, first, here, yq_mode),
                 }
             }
@@ -41346,6 +41422,107 @@ mod tests {
         // suppressed -- this is a navigation failure, not a write-time one.
         query!(br"true", r"del(.[0:1]?)",
             QueryResult::Owned(OwnedValue::Bool(true)) => {}
+        );
+    }
+
+    #[test]
+    fn test_del_string_slice_mid_chain_reports_the_tail_own_error_1321() {
+        // #1321: found verifying #1312, which only fixed the *standalone*
+        // (terminal) `Expr::Slice` arm above. This is the different,
+        // mid-chain case (more path *after* the slice) -- `through_slice`
+        // itself unconditionally refused any `OwnedValue::String` root
+        // before this fix, masking whatever the *tail*'s own navigation
+        // would have raised. All confirmed live against real jq 1.7.1.
+        query!(br#"{"a":"hello"}"#, r"del(.a[0:1].b)",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, r#"Cannot index string with string "b""#);
+            }
+        );
+        query!(br#"{"a":"hello"}"#, r"del(.a[0:1][0])",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "Cannot index string with number");
+            }
+        );
+        query!(br#"{"a":"hello"}"#, r"del(.a[0:1][])",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, r#"Cannot iterate over string ("h")"#);
+            }
+        );
+        // Bare-root mid-chain (no `.a` prefix) -- the same fix, reached via
+        // `delete_at_path`'s Pipe arm directly rather than through a
+        // preceding `Expr::Field` step.
+        query!(br#""hello""#, r"del(.[0:1].b)",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, r#"Cannot index string with string "b""#);
+            }
+        );
+        // `?` on the tail component suppresses *that* component's own
+        // failure, no-op'ing the whole thing -- distinct from `?` on the
+        // slice itself (`test_del_slice_on_string_target_ignores_optional_
+        // 1312` above), which never suppresses the write-time refusal.
+        query!(br#"{"a":"hello"}"#, r"del(.a[0:1].b?)",
+            QueryResult::Owned(v) => {
+                assert_eq!(v.to_json(), r#"{"a":"hello"}"#);
+            }
+        );
+        query!(br#"{"a":"hello"}"#, r"del(.a[0:1][0]?)",
+            QueryResult::Owned(v) => {
+                assert_eq!(v.to_json(), r#"{"a":"hello"}"#);
+            }
+        );
+        // Array/object mid-chain targets are unaffected -- still splice the
+        // sub-range's own deletion back, matching pre-existing behavior.
+        query!(br"[1,[2],[3]]", r"del(.[1:3][0])",
+            QueryResult::Owned(v) => {
+                assert_eq!(v.to_json(), "[1,[3]]");
+            }
+        );
+    }
+
+    #[test]
+    fn test_assign_string_slice_mid_chain_reports_the_tail_own_error_1321() {
+        // #1321 also affects `=`/`|=`: `through_slice` is the single choke
+        // point both share with `del()`. `.a[0:1].b = 5` reports the
+        // tail's own field-access error rather than masking it behind the
+        // slice's own "cannot update string slices" refusal -- confirmed
+        // live against real jq 1.7.1.
+        query!(br#"{"a":"hello"}"#, r".a[0:1].b = 5",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, r#"Cannot index string with string "b""#);
+            }
+        );
+        query!(br#"{"a":"hello"}"#, r".a[0:1].b? = 5",
+            QueryResult::Owned(v) => {
+                assert_eq!(v.to_json(), r#"{"a":"hello"}"#);
+            }
+        );
+        // The slice itself as the terminal write target (nothing after
+        // it) must still refuse, whether reached bare-root or through a
+        // preceding field -- this is `split_at_slice`'s `Identity`-tail
+        // case, which looks structurally identical to the mid-chain case
+        // above but must NOT get the same treatment (code review, #1321:
+        // an earlier version of this fix mis-classified it and silently
+        // no-op'd `.a[0:1] = v` instead of erroring).
+        query!(br#"{"a":"hello"}"#, r#".a[0:1] = ["x"]"#,
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "Cannot update string slices");
+            }
+        );
+        query!(br#""hello""#, r#".[0:1] = ["x"]"#,
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "Cannot update string slices");
+            }
+        );
+        query!(br#"{"a":"hello"}"#, r#".a[0:1] |= (. + "X")"#,
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "Cannot update string slices");
+            }
+        );
+        // Array/object mid-chain assignment targets are unaffected.
+        query!(br"[1,2,3,4]", r".[1:3][] |= .*10",
+            QueryResult::Owned(v) => {
+                assert_eq!(v.to_json(), "[1,20,30,4]");
+            }
         );
     }
 
