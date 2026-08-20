@@ -1851,6 +1851,31 @@ fn test_del_static_comma_type_error_reports_the_first_sibling() {
     );
 }
 
+/// #1322: `delete_expr_array_paths`'s multi-path type-mismatch check used to
+/// be gated behind `paths.iter().all(|p| p[start].optional)`, but every
+/// sibling here reaching this function already had its own `Expr::Optional`
+/// wrapper stripped by `resolve_dynamic_indexes` before `flatten_delete_path`
+/// ever saw it, so that gate's `Ok(value)` (silently no-op) arm was dead --
+/// unreachable regardless of how many `?`s are written.
+///
+/// A string root is the shape that actually reaches this function with `?`
+/// present: slicing a string is a legal *read* (unlike indexing/slicing a
+/// number, which fails during `resolve_dynamic_indexes`'s own navigation
+/// and, under `?`, swallows to a no-op before ever reaching here -- verified
+/// live, `del(.[0]?, .[1:2]?)` on `5` is an unchanged `5`, not an error).
+/// This still errors on a string, matching `test_del_static_comma_type_
+/// error_reports_the_first_sibling` above with every sibling's own `?`
+/// added, confirming removing the dead branch didn't change any
+/// live-reachable output.
+#[test]
+fn test_del_static_comma_type_error_still_errors_with_every_sibling_optional_1322() {
+    check(
+        r#""hi""#,
+        "del(.[0:1]?, .[1:2]?)",
+        Outcome::error("Cannot delete fields from string"),
+    );
+}
+
 #[test]
 fn test_path_of_a_computed_key_emits_one_path_per_key() {
     check(

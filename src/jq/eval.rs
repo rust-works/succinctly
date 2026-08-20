@@ -20141,27 +20141,40 @@ fn delete_expr_array_paths(
     // dd2df4d1 removed it as believed-unreachable and #504's CI caught the
     // regression via `test_del_static_comma_type_error_reports_the_first_sibling`.
     if !matches!(value, OwnedValue::Array(_)) {
-        // A non-array container fails every path here identically, so a
-        // single non-optional path among the siblings has to raise even when
-        // others are optional.
+        // A non-array container fails every path here identically. This
+        // used to be gated behind `paths.iter().all(|p| p[start].optional)`
+        // -- unconditionally always errors now, because that gate was dead
+        // (#1322): `resolve_dynamic_indexes`'s `assemble` strips every
+        // `Expr::Optional` wrapper via `strip_resolved_optional` before any
+        // comma-grouped `del()` path reaches `flatten_delete_path`, and
+        // `builtin_del`'s own call passes `optional: false` as
+        // `flatten_delete_path`'s starting value — so no `DeleteStep` this
+        // function ever sees can have `optional == true`, at any recursion
+        // depth, making that gate's `Ok(value)` arm permanently
+        // unreachable. Matches this repo's own "optional never forced true
+        // in nested calls" bug family (#928, #1003, #1034) -- confirmed live
+        // that removing the dead branch doesn't change any reachable output:
+        // a string root (where indexing/slicing is a legal *read*, so
+        // resolution actually reaches this function even under `?`) still
+        // errors identically with every sibling's own `?` added
+        // (`del(.[0:1]?, .[1:2]?)` on `"hi"`); a number/boolean/object root
+        // under `?` never reaches here at all -- `resolve_dynamic_indexes`'s
+        // own navigation fails first and, under `?`, swallows to a no-op
+        // before `flatten_delete_path` ever runs.
         //
         // *Which* sentence comes from the first sibling, because jq walks the
         // paths in source order and dies on the first: `5 | del(.[0], .[1:2])`
         // is `Cannot index number with number`, and the same two written the
         // other way round is `… with object`.
-        return if paths.iter().all(|p| p[start].optional) {
-            Ok(value)
-        } else {
-            Err(match &paths[0][start].component {
-                Expr::Slice { .. } if matches!(value, OwnedValue::String(_)) => {
-                    EvalError::cannot_delete_fields_from("string")
-                }
-                Expr::Slice { .. } => {
-                    EvalError::cannot_index_with_type(owned_type_name(&value), "object")
-                }
-                _ => EvalError::cannot_index_with_type(owned_type_name(&value), "number"),
-            })
-        };
+        return Err(match &paths[0][start].component {
+            Expr::Slice { .. } if matches!(value, OwnedValue::String(_)) => {
+                EvalError::cannot_delete_fields_from("string")
+            }
+            Expr::Slice { .. } => {
+                EvalError::cannot_index_with_type(owned_type_name(&value), "object")
+            }
+            _ => EvalError::cannot_index_with_type(owned_type_name(&value), "number"),
+        });
     }
 
     if let OwnedValue::Array(arr) = &mut value {
