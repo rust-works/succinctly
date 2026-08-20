@@ -14938,25 +14938,43 @@ fn test_1198_mixed_int_float_subtraction_unaffected() -> Result<()> {
 // apply unchanged. See tests/jq_cli_tests.rs's own `_1199` tests for the
 // full jq-mode coverage of every operator, including `divisor_is_zero`.
 //
-// succinctly's own yq mode never reaches `divisor_is_zero` for `/`/`%` at
-// all (`YqSemantics::DIV_BY_ZERO_IS_INFINITY = true` routes both to a
-// success value -- `1e10 / 0` and `1e10 % 0` both exit 0 against this
-// binary), so there is no yq-mode `divisor_is_zero` case to test here.
-// This is *not* the same as saying real yq itself succeeds on these --
-// checked directly against the oracle and it doesn't: `10 % 0` errors
-// there too ("cannot modulo by 0", tracked separately as #1231, since
-// `DIV_BY_ZERO_IS_INFINITY` conflates div and mod where real yq treats
-// them differently), and `10 / 0` also errors there, but for an unrelated
-// reason -- real yq's JSON output layer refuses to serialize the
-// resulting `+Inf` at all ("json: unsupported value: +Inf"), a pre-
-// existing output-formatting gap, not an arithmetic-evaluation one, and
-// out of scope for both #1199 and #1231.
+// succinctly's own yq mode never reaches `divisor_is_zero` for `/` (still
+// routes to a success value -- `YqSemantics::DIV_BY_ZERO_IS_INFINITY =
+// true`, `1e10 / 0` exits 0 against this binary), so there is no yq-mode
+// `divisor_is_zero` case to test for division. `%` is different: #1231
+// found real yq treats div and mod differently at zero (`10 % 0` errors
+// there, `10 / 0` succeeds as `+Inf`) where `DIV_BY_ZERO_IS_INFINITY`
+// conflated the two -- fixed by #1231, which routes an integer
+// modulo-by-zero to `EvalError::yq_modulo_by_zero()` ("cannot modulo by
+// 0") unconditionally, matching the oracle; see
+// `test_yq_modulo_by_zero_errors_but_division_does_not_1231` in
+// `src/jq/eval.rs` for that coverage. `10 / 0` still errors against the
+// real oracle too, but for an unrelated reason -- real yq's JSON output
+// layer refuses to serialize the resulting `+Inf` at all ("json:
+// unsupported value: +Inf"), a pre-existing output-formatting gap, not an
+// arithmetic-evaluation one, and out of scope for both #1199 and #1231.
 
 #[test]
 fn test_1199_binary_op_error_preserves_number_literal_spelling_yq_mode() -> Result<()> {
     let (_out, err, code) = run_yq_stdin_with_stderr("1e10 * {}", "null", &["-o=json"])?;
     assert_eq!(code, 1, "{err}");
     assert!(err.contains("number (1E+10)"), "{err}");
+    Ok(())
+}
+
+#[test]
+fn test_1231_yq_integer_modulo_by_zero_errors_but_division_does_not() -> Result<()> {
+    let (_out, err, code) = run_yq_stdin_with_stderr("10 % 0", "null", &["-o=json"])?;
+    assert_eq!(code, 1, "{err}");
+    assert!(err.contains("cannot modulo by 0"), "{err}");
+
+    // Division by zero is unaffected -- still succeeds (as Infinity, which
+    // `-o=json` serializes as `null`, JSON having no numeric representation
+    // for it -- a pre-existing, unrelated serialization choice, not part of
+    // #1231's own scope).
+    let (out, code) = run_yq_stdin("10 / 0", "null", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "null");
     Ok(())
 }
 
