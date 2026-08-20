@@ -15722,6 +15722,139 @@ fn test_1219_jq_mode_unaffected() -> Result<()> {
     Ok(())
 }
 
+/// #1219: a chained-slice-then-non-slice sibling inside a comma-grouped
+/// `del()` gets the no-op rule too, not just a single-path `del()` — real
+/// yq leaves `.a` completely untouched while still deleting the unrelated
+/// `.c` sibling, live-verified. `builtin_del`'s multi-path branch
+/// (`paths.len() > 1`) used to apply only the "drop parent" half of
+/// #1219's rule per sibling, never the "no-op" half, so this exact shape
+/// still fell through to the old buggy in-range delete for `.a` even after
+/// the single-path case above was fixed.
+#[test]
+fn test_1219_comma_grouped_noop_sibling_leaves_other_siblings_untouched() -> Result<()> {
+    let (out, code) = run_yq_stdin(
+        "del(.a[1:3][0], .c)",
+        r#"{"a":[1,2,3,4],"c":9}"#,
+        &["-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), r#"{"a":[1,2,3,4]}"#);
+    Ok(())
+}
+
+/// #1219: a chained slice hidden inside a parenthesized sub-path, combined
+/// with more path *outside* the parens (`(.a[0:1])[0:2]`), must get the
+/// same drop-parent-key treatment as the unparenthesized `del(.a[0:2])`.
+/// The original #1219 fix only inspected one flat `Expr::Pipe` level after
+/// unwrapping `Optional`/`Paren` around the *whole* path, so a slice
+/// nested inside a `Paren`-wrapped sub-`Pipe` was invisible to it and fell
+/// through to the pre-#1219 buggy walk — `yq_del_slice_outcome` now uses
+/// `flatten_delete_path` (the same recursive flattener the comma-grouped
+/// multi-path walker already relies on) to see through this nesting.
+/// Live-verified against yq v4.53.3.
+#[test]
+fn test_1219_paren_wrapped_nested_slice_drops_parent_key() -> Result<()> {
+    let (out, code) = run_yq_stdin(
+        "del((.a[0:1])[0:2])",
+        r#"{"a":[1,2,3,4],"b":6}"#,
+        &["-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), r#"{"b":6}"#);
+    Ok(())
+}
+
+/// #1219: the same `Paren`-nesting gap, but for a shape that used to hard
+/// *error* instead of silently misbehaving — `(.a[0])[0:1]` is
+/// index-then-slice (the already-#1162-correct "drop this element" shape),
+/// but nested inside a `Paren` it used to reach `delete_at_path`'s ordinary
+/// walk with a raw `Expr::Paren` in an unexpected position and fail with
+/// "Cannot index number with object." Real yq succeeds silently, dropping
+/// the trailing `[0:1)` range from the sub-array at `.a[0]`.
+#[test]
+fn test_1219_paren_wrapped_index_then_slice_no_longer_errors() -> Result<()> {
+    let (out, code) = run_yq_stdin(
+        "del((.a[0])[0:1])",
+        r#"{"a":[1,2,3,4],"b":6}"#,
+        &["-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), r#"{"a":[2,3,4],"b":6}"#);
+    Ok(())
+}
+
+/// #1219: the identical nested-`Pipe` gap reachable with *no* parentheses
+/// at all — `.a | .[0:1][0]` parses to a genuinely nested `Expr::Pipe`
+/// (each pipe-stage with more than one postfix component becomes its own
+/// `Pipe`, and `Expr::pipe` doesn't flatten nested pipes when combining
+/// stages), so this was just as invisible to the original single-level
+/// check as the `Paren`-wrapped case above. Real yq no-ops here (slice
+/// then a non-slice tail, same rule as the unparenthesized
+/// `del(.a[0:1][0])`).
+#[test]
+fn test_1219_plain_pipe_nested_chained_slice_is_noop() -> Result<()> {
+    let (out, code) = run_yq_stdin(
+        "del(.a | .[0:1][0])",
+        r#"{"a":[1,2,3,4]}"#,
+        &["-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), r#"{"a":[1,2,3,4]}"#);
+    Ok(())
+}
+
+/// #1219: the plain-pipe nesting gap combined with a trailing slice-*run*
+/// (rather than a single trailing slice) — drops the parent key, same
+/// target the unparenthesized `del(.a[0:1][0:2])` already resolves to.
+#[test]
+fn test_1219_plain_pipe_nested_chained_slice_run_drops_parent_key() -> Result<()> {
+    let (out, code) = run_yq_stdin(
+        "del(.a | .[0:1][0:2])",
+        r#"{"a":[1,2,3,4],"b":6}"#,
+        &["-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), r#"{"b":6}"#);
+    Ok(())
+}
+
+/// #1219: the plain-pipe nesting gap reached through `delete_at_path`'s own
+/// `Expr::Iterate` per-element re-classification, confirming the fix there
+/// also sees through a nested `Pipe` per element, not just at the
+/// top-level caller.
+#[test]
+fn test_1219_iterate_plain_pipe_nested_chained_slice_is_noop_per_element() -> Result<()> {
+    let (out, code) = run_yq_stdin(
+        "del(.a[] | .[0:1][0])",
+        r#"{"a":[[1,2,3,4],[10,20,30,40]],"b":6}"#,
+        &["-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), r#"{"a":[[1,2,3,4],[10,20,30,40]],"b":6}"#);
+    Ok(())
+}
+
+/// #1219: an interior slice separated from the trailing slice-run by an
+/// `Expr::Iterate` (rather than by a `Field`/`Index`, already covered
+/// above) still no-ops the whole call — `yq_del_slice_outcome`'s "residual
+/// prefix contains another slice" check doesn't special-case an `Iterate`
+/// in that prefix, and real yq agrees: every element stays completely
+/// untouched. Live-verified.
+#[test]
+fn test_1219_interior_slice_separated_by_iterate_is_noop() -> Result<()> {
+    let (out, code) = run_yq_stdin(
+        "del(.a[0:2][].b[0:1])",
+        r#"{"a":[{"b":[1,2,3,4]},{"b":[10,20,30,40]},{"b":[100,200]}]}"#,
+        &["-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(
+        out.trim(),
+        r#"{"a":[{"b":[1,2,3,4]},{"b":[10,20,30,40]},{"b":[100,200]}]}"#
+    );
+    Ok(())
+}
+
 /// #1223: a comma-grouped multi-path `del()` used to crash when a sibling's
 /// chained-slice target was an `Object`, instead of applying #1162's own
 /// parent-key-drop rule (which the *single-path* form of this exact query
@@ -15946,35 +16079,48 @@ fn test_1223_computed_key_with_trailing_slice_characterize_preexisting_bug() -> 
 
 /// #1223's own issue text names a second, unrelated finding: succinctly's
 /// multi-path `del()` combining a chained-slice branch with a bare-slice
-/// sibling is order-*insensitive* (both orderings agree, deleting both
+/// sibling was order-*insensitive* (both orderings agreed, deleting both
 /// index 0 and the `.[2:3]` range) — real yq is itself order-*sensitive*
 /// for this exact shape (confirmed live against yq v4.53.3: the two
 /// orderings give two different answers, neither of which is the
-/// composition of the two single-path results, and neither matches
-/// succinctly's own consistent-but-different answer). There is no coherent
-/// rule to replicate here (`delete_expr_paths_at`'s sibling-index-shifting
-/// logic, not #1223's own fix, drives this) — pinned as a known,
-/// separately-tracked gap rather than silently unasserted. If this is ever
-/// reconciled, update this test's expectations and the doc comment above.
+/// composition of the two single-path results). There is no coherent rule
+/// to replicate here (`delete_expr_paths_at`'s sibling-index-shifting
+/// logic, not #1223's/#1219's own fixes, drives this) — pinned as a known,
+/// separately-tracked gap rather than silently unasserted.
+///
+/// #1219 changed *what* succinctly gets wrong here, as a side effect of
+/// wiring `yq_del_chained_slice_is_noop` into the multi-path branch (a bare
+/// `.[2:3]` sibling, with nothing else in its own path, is itself a no-op
+/// shape and now correctly drops out of the delete set on its own) —
+/// live-verified this happens to make the *second* ordering (`out_b`) match
+/// real yq exactly now, while the first ordering (`out_a`) remains a
+/// mismatch, just a different one than before. Still no coherent single
+/// rule underlies real yq's own order-sensitivity, so this stays pinned as
+/// a known gap rather than chased further. If this is ever reconciled,
+/// update this test's expectations and the doc comment above.
 #[test]
 fn test_yq_mixed_bare_root_and_chained_slice_del_known_gap_1223() -> Result<()> {
     let input = r"[[1,2,3],[4,5,6],[7,8,9],[10,11,12]]";
-    let expected_succinctly = r"[[4,5,6],[10,11,12]]";
 
     let (out_a, code_a) = run_yq_stdin("del(.[0][0:1], .[2:3])", input, &["-o=json", "-I=0"])?;
     assert_eq!(code_a, 0, "out: {out_a:?}");
     assert_eq!(
         out_a.trim(),
-        expected_succinctly,
+        r"[[4,5,6],[7,8,9],[10,11,12]]",
         "real yq gives [[1,2,3],[4,5,6],[7,8,9],[10,11,12]] (unchanged) for this ordering"
     );
 
+    // This ordering now matches real yq exactly (#1219 side effect) — kept
+    // in this "known gap" test rather than promoted to its own passing
+    // test, since it's one half of an order-sensitive pair whose *other*
+    // half (`out_a` above) still diverges; splitting them would obscure
+    // that they're the same underlying gap.
     let (out_b, code_b) = run_yq_stdin("del(.[2:3], .[0][0:1])", input, &["-o=json", "-I=0"])?;
     assert_eq!(code_b, 0, "out: {out_b:?}");
     assert_eq!(
         out_b.trim(),
-        expected_succinctly,
-        "real yq gives [[4,5,6],[7,8,9],[10,11,12]] (only index 0 dropped) for this ordering"
+        r"[[4,5,6],[7,8,9],[10,11,12]]",
+        "real yq gives [[4,5,6],[7,8,9],[10,11,12]] (only index 0 dropped) for this ordering -- now matches"
     );
 
     Ok(())
