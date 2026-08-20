@@ -20432,8 +20432,15 @@ fn delete_at_path(
             }
             // `null` has no elements to drop, so jq leaves it alone.
             OwnedValue::Null => Ok(()),
-            _ if optional => Ok(()),
+            // Checked *before* the `optional` catch-all below, mirroring
+            // `through_slice`'s own ordering (#1312): a string slice target
+            // is a write-time application refusal jq's inline `?` does not
+            // suppress, not a navigation failure -- `del(.[0:1]?)` on a
+            // string still raises "Cannot delete fields from string" in
+            // real jq, confirmed live. The old order let `optional` shadow
+            // this arm entirely whenever a `?` was present.
             OwnedValue::String(_) => Err(EvalError::cannot_delete_fields_from("string")),
+            _ if optional => Ok(()),
             other => Err(EvalError::cannot_index_with_type(
                 owned_type_name(other),
                 "object",
@@ -40963,6 +40970,47 @@ mod tests {
             QueryResult::Error(e) => {
                 assert_eq!(e.message, "Cannot index number with number");
             }
+        );
+    }
+
+    #[test]
+    fn test_del_slice_on_string_target_ignores_optional_1312() {
+        // #1312: `delete_at_path`'s standalone (terminal) `Expr::Slice` arm
+        // checked its `_ if optional => Ok(())` catch-all *before* the
+        // `OwnedValue::String(_)` arm, so a `?`-marked slice targeting a
+        // string was shadowed into a silent no-op instead of raising. Real
+        // jq's inline `?` only suppresses a failure to *reach* a target, not
+        // a write-time application refusal like this one -- the same
+        // distinction #1303 fixed for `=`'s equivalent gap. A genuinely
+        // non-sliceable target (a `?`-marked slice on a boolean) is a
+        // navigation failure and stays correctly suppressed either way. All
+        // confirmed against real jq 1.7.1.
+        query!(br#""hello""#, r"del(.[0:1]?)",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "Cannot delete fields from string");
+            }
+        );
+        query!(br#"{"a":"hello"}"#, r"del(.a[0:1]?)",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "Cannot delete fields from string");
+            }
+        );
+        // Unaffected: no `?` at all still errors the same way.
+        query!(br#""hello""#, r"del(.[0:1])",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "Cannot delete fields from string");
+            }
+        );
+        // Unaffected: an array slice target still deletes normally.
+        query!(br"[1,2,3]", r"del(.[0:1]?)",
+            QueryResult::Owned(v) => {
+                assert_eq!(v.to_json(), "[2,3]");
+            }
+        );
+        // Unaffected: a genuinely non-sliceable target under `?` stays
+        // suppressed -- this is a navigation failure, not a write-time one.
+        query!(br"true", r"del(.[0:1]?)",
+            QueryResult::Owned(OwnedValue::Bool(true)) => {}
         );
     }
 
