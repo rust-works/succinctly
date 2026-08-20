@@ -39783,6 +39783,21 @@ mod tests {
                 assert_eq!(v.to_json(), r#"{"a":"notobj"}"#);
             }
         );
+        // The splice arm's non-optional path (no `?` anywhere, `here` is
+        // `false`): `(.a|.c)[0]` reaches `update_path`/`delete_at_path`'s
+        // `Expr::Pipe` arm the same un-flattened way `set_path` used to
+        // before #1287, and was already handled correctly pre-#1294 -- this
+        // pins that pre-existing behavior rather than a new fix.
+        query!(br#"{"a":{"c":1}}"#, "(.a|.c)[0] |= 9",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "Cannot index number with number");
+            }
+        );
+        query!(br#"{"a":{"c":1}}"#, "del((.a|.c)[0])",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "Cannot index number with number");
+            }
+        );
     }
 
     #[test]
