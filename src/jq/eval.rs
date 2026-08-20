@@ -23568,6 +23568,30 @@ fn builtin_isempty<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     QueryResult::Owned(OwnedValue::Bool(is_empty))
 }
 
+/// The YAML type tag (`!!str`, `!!int`, `!!float`, ...) `builtin_delpaths`'s
+/// own yq-mode type check reports for a rejected path component (#1220).
+/// Distinguishes `Int`/`Float` where `OwnedValue::type_name()` collapses
+/// both to `"number"` — real yq's own check cares about the difference (a
+/// plain `!!int` is accepted, a `!!float` never is, even a whole-number-
+/// valued one like `1.0` — confirmed live against yq v4.53.3).
+///
+/// The `!!int`/`!!str` arms are unreachable in practice: the sole call
+/// site below only invokes this on a component its own `find` already
+/// filtered to exclude `String`/`Int`/`NumberLiteral(Int)`. Both arms stay
+/// for match exhaustiveness (no catch-all) rather than being coverage-dead
+/// weight to chase.
+fn delpaths_component_type_tag(value: &OwnedValue) -> &'static str {
+    match value {
+        OwnedValue::Null => "!!null",
+        OwnedValue::Bool(_) => "!!bool",
+        OwnedValue::Int(_) | OwnedValue::NumberLiteral(NumberRepr::Int(_), _) => "!!int",
+        OwnedValue::Float(_) | OwnedValue::NumberLiteral(NumberRepr::Float(_), _) => "!!float",
+        OwnedValue::String(_) => "!!str",
+        OwnedValue::Array(_) => "!!seq",
+        OwnedValue::Object(_) => "!!map",
+    }
+}
+
 /// Builtin: delpaths(paths) - delete multiple paths
 fn builtin_delpaths<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     paths_expr: &Expr,
@@ -23626,37 +23650,49 @@ fn builtin_delpaths<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // jq cannot arbitrate either — 1.7.1 loops forever on `delpaths([[nan]])`
     // — so this is pinned by unit test rather than by a golden.
     //
-    // yq-mode-only (#1162): real yq's `delpaths()` also rejects a
-    // slice-descriptor path component (`{"start":s,"end":e}`, `path(.[a:b])`'s
-    // own output shape) outright, at any position, rather than splicing
-    // through the named sub-range the way `delete_paths_under`/`delete_keys`'s
-    // own `OwnedValue::Object(desc)` arms below do for jq mode. Folded into
-    // this same `retain` pass rather than a separate loop before it: both
-    // checks need to visit every path's every component before any deletion
-    // runs. Gated on `keeps` (the same per-path NaN survival this `retain`
-    // already computes), not checked unconditionally, so a path that's
-    // *also* NaN-headed doesn't surface the slice-descriptor error for a
-    // path already headed for silent removal — #1220 (not implemented here)
-    // covers matching real yq's own float/NaN rejection precisely; this
-    // fix only avoids the internally-inconsistent "a doomed path still
-    // aborts the whole call" shape.
-    let mut has_slice_descriptor = false;
+    // yq-mode-only (#1162, widened by #1220): real yq's `delpaths()` accepts
+    // only a `!!str`/`!!int` path component -- every other YAML type errors,
+    // including a slice-descriptor (`{"start":s,"end":e}`, `path(.[a:b])`'s
+    // own output shape, #1162's own narrower repro) that jq mode instead
+    // splices through via `delete_paths_under`/`delete_keys`'s own
+    // `OwnedValue::Object(desc)` arms below. A whole-number-valued float
+    // (`1.0`) is rejected too -- real yq's check is on the YAML type, not
+    // the numeric value, confirmed live. Folded into this same `retain`
+    // pass rather than a separate loop before it: both checks need to
+    // visit every path's every component before any deletion runs. Gated
+    // on `keeps` (the same per-path NaN survival this `retain` already
+    // computes), not checked unconditionally, so a path that's *also*
+    // NaN-headed doesn't surface the type error for a path already headed
+    // for silent removal. `rejected_component_tag` keeps only the first
+    // offender found (path order, then component order within a path) --
+    // confirmed live that real yq reports whichever type-mismatched
+    // component it reaches first when several paths/components each
+    // qualify.
+    let mut rejected_component_tag: Option<&'static str> = None;
     paths.retain(|path| match path {
         OwnedValue::Array(components) => {
             let keeps = !components
                 .iter()
                 .any(|key| matches!(key, OwnedValue::Float(f) if f.is_nan()));
-            has_slice_descriptor |= keeps
-                && S::TAG == EvalTag::Yq
-                && components
+            if keeps && S::TAG == EvalTag::Yq && rejected_component_tag.is_none() {
+                rejected_component_tag = components
                     .iter()
-                    .any(|component| matches!(component, OwnedValue::Object(_)));
+                    .find(|component| {
+                        !matches!(
+                            component,
+                            OwnedValue::String(_)
+                                | OwnedValue::Int(_)
+                                | OwnedValue::NumberLiteral(NumberRepr::Int(_), _)
+                        )
+                    })
+                    .map(delpaths_component_type_tag);
+            }
             keeps
         }
         _ => false,
     });
-    if has_slice_descriptor {
-        return QueryResult::Error(EvalError::delpaths_rejects_slice_descriptor());
+    if let Some(tag) = rejected_component_tag {
+        return QueryResult::Error(EvalError::delpaths_rejects_type(tag));
     }
 
     // jq sorts the whole path list in its total value order — arrays compare

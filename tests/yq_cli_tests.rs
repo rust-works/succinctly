@@ -15403,6 +15403,85 @@ fn test_1162_delpaths_slice_descriptor_jq_mode_unaffected() -> Result<()> {
     Ok(())
 }
 
+/// #1220: real yq's `delpaths()` rejects essentially any path component
+/// that isn't literally a `!!str` or `!!int` — not just the slice-
+/// descriptor (`!!map`) shape #1162 scoped. `!!bool`/`!!seq`/`!!float`/
+/// `!!null` all hit the identical message, substituting their own tag.
+/// Exact wording, and each type, verified live against yq v4.53.3.
+#[test]
+fn test_1220_delpaths_rejects_bool_seq_float_null_components() -> Result<()> {
+    for (filter, expected_tag) in [
+        ("delpaths([[true]])", "!!bool"),
+        ("delpaths([[[1,2]]])", "!!seq"),
+        ("delpaths([[1.5]])", "!!float"),
+        ("delpaths([[1.0]])", "!!float"), // whole-number float still rejected
+        ("delpaths([[null]])", "!!null"),
+    ] {
+        let (_out, stderr, code) = run_yq_stdin_with_stderr(filter, "[1,2,3]", &["-o=json"])?;
+        assert_ne!(code, 0, "filter: {filter}");
+        let expected = format!(
+            "DELPATHS: expected either a !!str or !!int in the path, found {expected_tag} instead"
+        );
+        assert!(
+            stderr.contains(&expected),
+            "filter: {filter}, stderr: {stderr}"
+        );
+    }
+    Ok(())
+}
+
+/// A plain `!!int` (including negative) and `!!str` are still accepted —
+/// #1220 only widens the *rejection*, not the acceptance rule #1162 already
+/// established.
+#[test]
+fn test_1220_delpaths_still_accepts_str_and_int() -> Result<()> {
+    let (out, code) = run_yq_stdin(
+        r#"delpaths([["a"],["b",-1]])"#,
+        r#"{"a":1,"b":[1,2,3]}"#,
+        &["-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 0, "out: {out:?}");
+    // "a" removed entirely; index -1 (last element) removed from "b".
+    assert_eq!(out.trim(), r#"{"b":[1,2]}"#);
+    Ok(())
+}
+
+/// When multiple paths/components each qualify, real yq reports whichever
+/// type-mismatched component it reaches first — path order, then component
+/// order within a path. Verified live both ways.
+#[test]
+fn test_1220_delpaths_reports_first_offending_component() -> Result<()> {
+    let (_out, stderr, code) =
+        run_yq_stdin_with_stderr("delpaths([[true],[1.5]])", "[1,2,3]", &["-o=json"])?;
+    assert_ne!(code, 0);
+    assert!(stderr.contains("found !!bool instead"), "stderr: {stderr}");
+
+    let (_out, stderr, code) = run_yq_stdin_with_stderr(
+        r#"delpaths([["a",true,1.5]])"#,
+        r#"{"a":{"b":1}}"#,
+        &["-o=json"],
+    )?;
+    assert_ne!(code, 0);
+    assert!(stderr.contains("found !!bool instead"), "stderr: {stderr}");
+    Ok(())
+}
+
+/// `delpaths()`'s float/bool/array/null acceptance stays intact in jq
+/// mode — #1220's new rejection is yq-mode-only, same as #1162's.
+#[test]
+fn test_1220_delpaths_jq_mode_unaffected() -> Result<()> {
+    // jq mode's own error for a boolean path component is a different,
+    // pre-existing one -- not this yq-mode-only DELPATHS wording.
+    let (_out, stderr, code) =
+        run_jq_stdin_with_stderr("delpaths([[true]])", r#"{"a":1}"#, &["-c"])?;
+    assert_ne!(code, 0);
+    assert!(
+        !stderr.contains("DELPATHS: expected either a !!str or !!int"),
+        "stderr: {stderr}"
+    );
+    Ok(())
+}
+
 /// #1219 characterization: a chained slice with more path *after* it
 /// (`.[1:3][0]`) is a structurally different shape than #1162 covers —
 /// `yq_del_scalar_slice_parent_path` only rewrites when the slice is the
@@ -15424,31 +15503,6 @@ fn test_1219_chained_slice_with_trailing_path_characterize_preexisting_bug() -> 
         out.trim(),
         r#"{"a":[1,3,4]}"#,
         "if this now matches real yq's no-op ({{\"a\":[1,2,3,4]}}), update this test and close #1219"
-    );
-    Ok(())
-}
-
-/// #1220 characterization: real yq's `delpaths()` is stricter than the
-/// slice-descriptor-only rejection #1162 implements — it also rejects a
-/// float path component (`found !!float instead`, verified live), where
-/// jq's own model treats a float as a valid array index (truncated toward
-/// zero by `resolve_read_index`) and succinctly currently follows that
-/// jq-consistent behavior in yq mode too, silently succeeding instead of
-/// erroring. (A bool or array component, unlike a float, already errors in
-/// succinctly today too — just with jq's own wrong-key-type wording instead
-/// of real yq's `DELPATHS:` message — so the float case is the cleanest
-/// "silently accepted where real yq errors" example; #1220's own issue text
-/// covers the full scope.) Unaffected by #1162's diff (the new check only
-/// matches `OwnedValue::Object`). If this is ever widened (tracked as
-/// #1220), update this expectation.
-#[test]
-fn test_1220_delpaths_accepts_float_component_characterize_preexisting_bug() -> Result<()> {
-    let (out, code) = run_yq_stdin("delpaths([[1.0]])", "[1,2,3]", &["-o=json", "-I=0"])?;
-    assert_eq!(code, 0, "out: {out:?}");
-    assert_eq!(
-        out.trim(),
-        "[1,3]",
-        "if this now errors like real yq (found !!float instead), update this test and close #1220"
     );
     Ok(())
 }
