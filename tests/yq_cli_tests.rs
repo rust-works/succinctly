@@ -913,6 +913,66 @@ fn test_duplicate_mapping_key_to_entries_json_compact() -> Result<()> {
     Ok(())
 }
 
+/// #1168: `to_entries` has its own cursor-native, duplicate-key-preserving
+/// fix (#443, above), but before this fix `eval_generic::eval_single` had no
+/// native arm for `Expr::Array`, so wrapping it in `[...]` fell to the
+/// wildcard fallback -- which materializes the *whole document* into an
+/// `OwnedValue` (last-value-wins `IndexMap`) before evaluating the wrapped
+/// expression, silently losing the fix's benefit. Must match bare
+/// `to_entries` (both duplicate `a` entries), just nested one level deeper.
+#[test]
+fn test_duplicate_mapping_key_survives_array_wrapped_to_entries_1168() -> Result<()> {
+    let yaml = "a: 1\na: 2\n";
+    let (output, code) = run_yq_stdin("[to_entries]", yaml, &["-o=json", "-I=0"])?;
+
+    assert_eq!(code, 0);
+    assert_eq!(
+        output.trim(),
+        r#"[[{"key":"a","value":1},{"key":"a","value":2}]]"#
+    );
+    Ok(())
+}
+
+/// #1168, comma sibling of the `Array` case above: `Expr::Comma` had no
+/// native arm either, so `to_entries, to_entries` hit the same
+/// whole-document-materializing fallback for both operands.
+#[test]
+fn test_duplicate_mapping_key_survives_comma_wrapped_to_entries_1168() -> Result<()> {
+    let yaml = "a: 1\na: 2\n";
+    let (output, code) = run_yq_stdin("to_entries, to_entries", yaml, &["-o=json", "-I=0"])?;
+
+    assert_eq!(code, 0);
+    assert_eq!(
+        output.trim(),
+        "[{\"key\":\"a\",\"value\":1},{\"key\":\"a\",\"value\":2}]\n[{\"key\":\"a\",\"value\":1},{\"key\":\"a\",\"value\":2}]"
+    );
+    Ok(())
+}
+
+/// #1168: `Expr::Array`/`Expr::Comma`'s new native arms must still dedupe a
+/// duplicate *JSON* key exactly like bare `to_entries` does (#1170) -- the
+/// wrapping fix must not disturb the format-aware dedup rule itself.
+#[test]
+fn test_json_duplicate_key_array_comma_wrapped_to_entries_still_dedupes_1168() -> Result<()> {
+    let json = r#"{"a":1,"b":2,"a":3}"#;
+    let extra_args = ["--input-format", "json", "-o=json", "-I=0"];
+
+    let (array_output, code) = run_yq_stdin("[to_entries]", json, &extra_args)?;
+    assert_eq!(code, 0);
+    assert_eq!(
+        array_output.trim(),
+        r#"[[{"key":"a","value":3},{"key":"b","value":2}]]"#
+    );
+
+    let (comma_output, code) = run_yq_stdin("to_entries, to_entries", json, &extra_args)?;
+    assert_eq!(code, 0);
+    assert_eq!(
+        comma_output.trim(),
+        "[{\"key\":\"a\",\"value\":3},{\"key\":\"b\",\"value\":2}]\n[{\"key\":\"a\",\"value\":3},{\"key\":\"b\",\"value\":2}]"
+    );
+    Ok(())
+}
+
 /// #1170: unlike YAML's genuine duplicates (preserved unmerged above, per
 /// #443), a duplicate key on `--input-format json` input must collapse to
 /// one entry -- keeping the first occurrence's position but the last
@@ -13029,6 +13089,24 @@ fn test_yq_array_wrapped_overflow_int_keeps_decimal_point_953() -> Result<()> {
     let (stdout, code) = run_yq_stdin("[.a]", "a: 99999999999999999999\n", &["-o", "json", "-I0"])?;
     assert_eq!(code, 0);
     assert_eq!(stdout.trim_end(), "[100000000000000000000.0]");
+    Ok(())
+}
+
+/// #1168 review: fixing #953's regression above (`Expr::Array`'s new native
+/// arm bypasses the old wildcard fallback's own `to_json_for_reindex`
+/// round-trip, which is where #953's decimal-point forcing actually lives)
+/// must not force it onto a *genuinely computed* float too -- only a direct
+/// cursor result (a value read from the input document, e.g. `.a` above)
+/// gets `yq_float_fidelity_fixup`'s round-trip; an arithmetic result never
+/// touches the input document at all, and must keep real yq's ordinary
+/// scientific-notation threshold instead (matching `1e20*1 | tostring`, and
+/// the same distinction `test_yq_join_element_computed_float_known_gap_1124`
+/// already documents for `join`).
+#[test]
+fn test_yq_array_wrapped_computed_float_keeps_scientific_notation_1168() -> Result<()> {
+    let (stdout, code) = run_yq_stdin("[1e20 * 1]", "null\n", &["-o", "json", "-I0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "[1e+20]");
     Ok(())
 }
 
