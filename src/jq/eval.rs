@@ -11796,6 +11796,23 @@ fn get_path_mut<'a>(
                     ));
                 }
             }
+            // A parenthesized multi-component sub-path (`(.a|.c)[0] = 9`) or
+            // `resolve_node`'s `?` arm (which emits `Optional(Pipe([...]))`
+            // when a branch resolves to more than one component) can hand
+            // back a single path slot that is itself a `Pipe` — recurse into
+            // it rather than falling to the catch-all below. Mirrors
+            // `update_path`'s matching `Expr::Pipe` splice arm, which
+            // already had to solve the same problem (#1287): without this,
+            // `(.a|.c)[0] = 9` on `{"a":{"c":1}}` reported the generic
+            // "invalid path component" here instead of jq's own "Cannot
+            // index number with number", even though `path()`/`del()`/`|=`
+            // already resolved the identical shape correctly.
+            Expr::Pipe(inner) => match get_path_mut(current, inner) {
+                Ok(Some(next)) => next,
+                Ok(None) => return Ok(None),
+                Err(_) if optional => return Ok(None),
+                Err(e) => return Err(e),
+            },
             Expr::IndexExpr { .. } => {
                 return Err(EvalError::new(
                     "internal error: unresolved computed index in path component",
@@ -39952,6 +39969,33 @@ mod tests {
                 "a".to_string(),
                 OwnedValue::Object(IndexMap::from([("b".to_string(), OwnedValue::Null)])),
             )]))
+        );
+    }
+
+    #[test]
+    fn test_assign_computed_index_on_parenthesized_multi_component_target_reports_type_mismatch() {
+        // #1287: `get_path_mut` (only `=`'s own walker -- `path()`/`del()`/
+        // `|=` already resolved this shape correctly) fell to its generic
+        // "invalid path component" catch-all whenever a parenthesized
+        // multi-component sub-path preceded the final index/key/slice --
+        // `(.a|.c)` never flattens into two matched `Field` arms here, it
+        // arrives as one opaque `Expr::Pipe` slot. Confirmed against real jq
+        // 1.7.1: all three report jq's own `Cannot index number with
+        // <type>`, not a generic parse-shaped complaint.
+        query!(br#"{"a":{"c":1}}"#, r"((.a|.c)[0]) = 9",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "Cannot index number with number");
+            }
+        );
+        query!(br#"{"a":{"c":1}}"#, r#"((.a|.c)["c"]) = 9"#,
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "Cannot index number with string \"c\"");
+            }
+        );
+        query!(br#"{"a":{"c":1}}"#, r"((.a|.c)[0:1]) = 9",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "Cannot index number with object");
+            }
         );
     }
 
