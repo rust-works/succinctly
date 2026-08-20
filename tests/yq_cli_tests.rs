@@ -4918,6 +4918,44 @@ fn test_yaml_alias_chain_past_depth_cap_panics_cleanly_not_via_stack_overflow_11
     Ok(())
 }
 
+#[test]
+fn test_yaml_deep_alias_chain_json_stream_output_does_not_stack_overflow_1193() -> Result<()> {
+    // `[.z]` (used by the tests above) forces materialization through
+    // `to_owned_at_depth`'s typed accessors. Bare `.z` with `-o json`
+    // instead forces `YamlCursor::stream_json_value`/`write_json_to` -- a
+    // completely separate alias-following code path with its own
+    // independent self-recursion, found live during this PR's own review:
+    // `succinctly yq -o json '.'` (this repo's own CLAUDE.md-documented
+    // standard invocation) SIGABRTed on a long chain even after the
+    // typed-accessor fix above, since neither `stream_json_value` nor
+    // `write_json_to` called into `resolve_alias_chain` at all yet.
+    let input = deep_alias_chain(50_000, "42");
+    let (stdout, stderr, exit_code) =
+        run_yq_stdin_with_stderr(".z", &input, &["-o", "json", "--indent", "0"])?;
+    assert_eq!(exit_code, 0, "expected a clean exit, stderr: {stderr}");
+    assert_eq!(stdout.trim(), "42");
+    Ok(())
+}
+
+#[test]
+fn test_yaml_alias_chain_through_owned_evaluator_bridge_does_not_stack_overflow_1193() -> Result<()>
+{
+    // Arithmetic (`+`) isn't cursor-native in the lazy evaluator, so it
+    // bridges to the full/owned evaluator, which materializes the input
+    // document via `yaml_value_to_owned` (src/jq/eval.rs) -- a third
+    // independent alias-following recursion found live during this PR's
+    // own review, distinct from both the typed accessors and the JSON
+    // streaming writer above. Kept small (500 hops, not 50,000): this
+    // whole-document conversion path has a separate, pre-existing O(n^2)
+    // total-work cost for a document shaped like this one (#1317) that
+    // isn't this test's concern -- only crash-safety and correctness are.
+    let input = deep_alias_chain(500, "42");
+    let (stdout, stderr, exit_code) = run_yq_stdin_with_stderr(".z + 1", &input, &[])?;
+    assert_eq!(exit_code, 0, "expected a clean exit, stderr: {stderr}");
+    assert_eq!(stdout.trim(), "43");
+    Ok(())
+}
+
 // =============================================================================
 // Compatibility tests - Block scalar edge cases
 // =============================================================================

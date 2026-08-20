@@ -23468,11 +23468,14 @@ fn yaml_value_to_owned<W: Clone + AsRef<[u64]>>(
             OwnedValue::Object(map)
         }
         YamlValue::Alias { target, .. } => {
-            // Resolve alias by following the target cursor
-            if let Some(target_cursor) = target {
-                yaml_value_to_owned(target_cursor)
-            } else {
-                OwnedValue::Null
+            // Resolve the *entire* alias chain first (#1193), not just this
+            // one hop: the resolved cursor's own `.value()` is guaranteed
+            // non-`Alias`, so this recursive call terminates in exactly one
+            // more step regardless of chain length.
+            match target.and_then(|t| t.resolve_alias_target_cursor()) {
+                Some(resolved) => yaml_value_to_owned(resolved),
+                // Unresolved (dangling) target - treat as null
+                None => OwnedValue::Null,
             }
         }
         YamlValue::Error(_) => OwnedValue::Null,

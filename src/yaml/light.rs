@@ -442,6 +442,45 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
         }
     }
 
+    /// Follows a chain of `Alias` nodes to the *cursor* of its final
+    /// non-alias target, iteratively rather than recursively (#1193, PR
+    /// #1314) -- the cursor-returning sibling of `resolve_alias_chain`
+    /// above (a private method, not linkable from this public one), for
+    /// callers that need to re-invoke a cursor method on the
+    /// resolved target (`stream_json_value`, `write_json_to`, `tag`, and
+    /// the CLI/evaluator's `yaml_to_owned_value`/`yaml_value_to_owned`)
+    /// rather than just the resolved value. `self` need not itself be an
+    /// alias -- returns `self` unchanged (zero hops) if it isn't.
+    ///
+    /// Kept as its own loop rather than
+    /// `self.resolve_alias_chain().map(|_| some_cursor)`: there is no
+    /// cursor to hand back from that method's own result (its loop
+    /// deliberately discards `current` once it has `current`'s `.value()`
+    /// -- see its own doc comment's efficiency finding, #1191 code
+    /// review), so reusing it here would mean re-deriving the target
+    /// cursor by some other means anyway. A `pub`, not `pub(crate)`,
+    /// visibility (unlike its sibling): `yaml_to_owned_value`
+    /// (`src/bin/succinctly/yq_runner.rs`) is a separate binary crate and
+    /// needs to call this directly.
+    ///
+    /// Returns `None` only for a dangling (unresolvable) target. Panics
+    /// past `MAX_ALIAS_CHAIN_DEPTH` (both private, not linkable from this
+    /// public method), mirroring every other depth ceiling in this crate
+    /// via the shared `assert_depth` -- the loop itself costs O(1) stack
+    /// regardless of chain length, so this bound exists purely to cap the
+    /// CPU time one call can be forced to spend on a pathologically long,
+    /// adversarially crafted chain.
+    pub fn resolve_alias_target_cursor(&self) -> Option<Self> {
+        let mut current = *self;
+        let mut depth = 0usize;
+        while let YamlValue::Alias { target, .. } = current.value() {
+            assert_depth(depth, MAX_ALIAS_CHAIN_DEPTH);
+            depth += 1;
+            current = target?;
+        }
+        Some(current)
+    }
+
     /// Skip past a leading `&anchor` and/or `!tag` (either order, each at
     /// most once) and any following whitespace.
     ///
@@ -2074,16 +2113,19 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                 out.write_char(']')
             }
             YamlValue::Alias { target, .. } => {
-                if let Some(target_cursor) = target {
-                    target_cursor.stream_json_value(
+                // Resolve the *entire* chain first (#1193), not just this
+                // one hop: the resolved cursor's own `.value()` is
+                // guaranteed non-`Alias`, so this recursive call terminates
+                // in exactly one more step regardless of chain length.
+                match target.and_then(|t| t.resolve_alias_target_cursor()) {
+                    Some(resolved) => resolved.stream_json_value(
                         out,
                         current_indent,
                         indent_spaces,
                         unit,
                         sort_keys,
-                    )
-                } else {
-                    out.write_str("null")
+                    ),
+                    None => out.write_str("null"),
                 }
             }
             YamlValue::Error(_) => out.write_str("null"),
@@ -2192,10 +2234,12 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                 output.push(']');
             }
             YamlValue::Alias { target, .. } => {
-                if let Some(target_cursor) = target {
-                    target_cursor.write_json_to(output);
-                } else {
-                    output.push_str("null");
+                // See `stream_json_value`'s matching `Alias` arm (#1193):
+                // resolve the whole chain first so this call terminates in
+                // exactly one more step regardless of chain length.
+                match target.and_then(|t| t.resolve_alias_target_cursor()) {
+                    Some(resolved) => resolved.write_json_to(output),
+                    None => output.push_str("null"),
                 }
             }
             YamlValue::Error(_) => output.push_str("null"),
@@ -2579,11 +2623,11 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
             YamlValue::Mapping(_) => "!!map",
             YamlValue::Sequence(_) => "!!seq",
             YamlValue::Alias { target, .. } => {
-                // Return tag of target
-                if let Some(t) = target {
-                    t.tag()
-                } else {
-                    "!!null"
+                // Return the tag of the fully-resolved target (#1193): see
+                // `stream_json_value`'s matching `Alias` arm.
+                match target.and_then(|t| t.resolve_alias_target_cursor()) {
+                    Some(resolved) => resolved.tag(),
+                    None => "!!null",
                 }
             }
             YamlValue::Error(_) => "!!null",
