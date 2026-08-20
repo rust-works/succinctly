@@ -1045,6 +1045,55 @@ fn eval_on_owned<S: EvalSemantics, V: DocumentValue>(
     }
 }
 
+/// Re-derives every `Float`'s spelling in `values` through
+/// [`eval_on_owned`]'s reindex bridge (`to_json_for_reindex`'s `S`-gated
+/// formatter, #953), without touching anything else in the input document.
+///
+/// `Expr::Array`/`Expr::Comma`'s own native `eval_single` arms (#1168) build
+/// `values` straight from `to_owned`/`to_owned_cursor`, which have no notion
+/// of "this bare `Float` came from a document-sourced literal that
+/// overflowed `i64`, keep its decimal point regardless of magnitude" — only
+/// `to_json_for_reindex`'s own `S`-gated fallback applies that rule (see its
+/// doc comment, `src/jq/value.rs`), and *only* because, before those two
+/// arms existed, `[...]`/`,` had no choice but to fall through to this same
+/// bridge for lack of a native cursor arm. Adding one without also keeping
+/// this fix regressed #953 (caught by its own regression test).
+///
+/// Round-tripping just `values` (not the whole input document, unlike the
+/// old wildcard fallback these two arms replace) keeps `Expr::Array`'s and
+/// `Expr::Comma`'s actual fix — duplicate mapping keys survive a builtin's
+/// own cursor-native conversion (`to_entries`, etc.) intact. Safe with
+/// respect to that fix: nothing in `values` still has a duplicate *mapping
+/// key* left to lose by round-tripping again — any genuine YAML duplicate
+/// was already collapsed the moment `to_owned`/`to_owned_cursor` first
+/// converted its mapping to an `IndexMap`-backed `Object`, before this ever
+/// runs; a builtin with its own dedup-preserving fix has already turned its
+/// duplicates into distinct array elements by this point instead, which
+/// round-trip through JSON text with no collision to lose.
+///
+/// A no-op in jq mode (`to_json_for_reindex`'s own `S`-gate already makes
+/// the round trip itself a no-op there — jq drops a computed float's
+/// literal formatting unconditionally) — skipped outright rather than paying
+/// for a round trip jq mode never needs. `Ok` carries the fixed-up values
+/// back for the caller to package (`Expr::Array` always wraps them in one
+/// `OwnedValue::Array`; `Expr::Comma` collapses via
+/// [`owned_vec_to_generic_result`]); `Err` carries an already-terminal
+/// `GenericResult` (an `Error`, in practice — see [`eval_on_owned`]'s own
+/// doc comment for why this is defense-in-depth rather than a reachable
+/// path for internally-constructed input) for the caller to return as-is.
+fn yq_float_fidelity_fixup<S: EvalSemantics, V: DocumentValue>(
+    values: Vec<OwnedValue>,
+) -> Result<Vec<OwnedValue>, GenericResult<V>> {
+    if S::TAG != EvalTag::Yq || values.is_empty() {
+        return Ok(values);
+    }
+    match eval_on_owned::<S, V>(&Expr::Identity, OwnedValue::Array(values), false) {
+        GenericResult::Owned(OwnedValue::Array(fixed)) => Ok(fixed),
+        GenericResult::Error(e) => Err(GenericResult::Error(e)),
+        other => Err(other),
+    }
+}
+
 /// Normalize a prefix and its terminator into a `GenericResult` (#400, #494).
 /// Mirrors [`super::eval::partial`] (the `QueryResult` equivalent) — an empty
 /// prefix collapses to the bare `Error`/`Break` variant.
@@ -1138,6 +1187,40 @@ fn push_generic_owned_values<V: DocumentValue>(
         }
     }
     None
+}
+
+/// [`push_generic_owned_values`]'s `Expr::Comma` sibling (#1168): identical
+/// except a direct cursor result (`OneCursor`/`ManyCursor`) is routed
+/// through [`yq_float_fidelity_fixup`] first. Scoped to exactly those two
+/// variants for the same reason as `Expr::Array`'s own arm in `eval_single`
+/// -- an already-constructed value reaching here (`Owned`/`ManyOwned`, e.g.
+/// a computed arithmetic result or a builtin's own object construction)
+/// can't be distinguished from a document-sourced one anymore, and forcing
+/// a decimal point onto it would introduce the same over-eager-forcing gap
+/// `test_yq_join_element_computed_float_known_gap_1124` (#1124/#1144)
+/// already documents as out of scope here.
+///
+/// Returns `Ok(Some(control))`/`Ok(None)` mirroring
+/// [`push_generic_owned_values`]'s `Option<Control>`, or `Err` with an
+/// already-terminal `GenericResult` if the fixup's own round trip failed
+/// (see [`yq_float_fidelity_fixup`]'s doc comment for why that's
+/// defense-in-depth rather than reachable in practice).
+fn push_generic_owned_values_yq_fixed<S: EvalSemantics, V: DocumentValue>(
+    result: GenericResult<V>,
+    out: &mut Vec<OwnedValue>,
+) -> Result<Option<Control>, GenericResult<V>> {
+    match result.materialize_lazy() {
+        GenericResult::OneCursor(c) => {
+            out.extend(yq_float_fidelity_fixup::<S, V>(vec![to_owned_cursor(&c)])?);
+            Ok(None)
+        }
+        GenericResult::ManyCursor(cs) => {
+            let values: Vec<OwnedValue> = cs.iter().map(to_owned_cursor).collect();
+            out.extend(yq_float_fidelity_fixup::<S, V>(values)?);
+            Ok(None)
+        }
+        other => Ok(push_generic_owned_values(other, out)),
+    }
 }
 
 /// Append one truthiness bit per output of a `GenericResult` stream to
@@ -2709,6 +2792,106 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
             }
 
             finish_fork_generic(out, right_control, optional)
+        }
+
+        // Array construction: collect every output of the inner expression
+        // into one array. Handled natively (mirrors `eval::eval_array_construction`)
+        // so a builtin with its own cursor-native, duplicate-key-preserving fix
+        // (e.g. #443's `to_entries`) keeps that fix when wrapped in `[...]`,
+        // instead of losing it to the wildcard fallback's whole-document
+        // `to_owned()`, which collapses duplicate mapping keys before the
+        // wrapped expression ever runs (#1168).
+        Expr::Array(inner) => {
+            let items: Vec<OwnedValue> = match eval_single::<S, _>(inner, value, optional, cursor)
+                .materialize_lazy()
+            {
+                GenericResult::One(v) => vec![to_owned(&v)],
+                // Fixed up (#953/#1168, `yq_float_fidelity_fixup`'s own doc
+                // comment): a direct cursor result reflects the input
+                // document itself, which needs the same round-trip decimal-
+                // point forcing the old wildcard fallback applied to the
+                // *whole* document before this arm existed.
+                GenericResult::OneCursor(c) => {
+                    match yq_float_fidelity_fixup::<S, _>(vec![to_owned_cursor(&c)]) {
+                        Ok(fixed) => fixed,
+                        Err(result) => return result,
+                    }
+                }
+                GenericResult::Many(vs) => vs.iter().map(to_owned).collect(),
+                GenericResult::ManyCursor(cs) => {
+                    let values: Vec<OwnedValue> = cs.iter().map(to_owned_cursor).collect();
+                    match yq_float_fidelity_fixup::<S, _>(values) {
+                        Ok(fixed) => fixed,
+                        Err(result) => return result,
+                    }
+                }
+                GenericResult::None => Vec::new(),
+                // NOT fixed up, deliberately: an already-constructed value
+                // (a builtin's own object/array, a genuinely computed
+                // arithmetic result, ...) can't be distinguished here from a
+                // document-sourced one once it's inside this shape --
+                // running the same round trip on it would force a decimal
+                // point onto a *computed* float too, which this codebase
+                // already treats as a separate, out-of-scope gap rather
+                // than "fixed" (`test_yq_join_element_computed_float_known_gap_1124`,
+                // #1124/#1144). Scoping the fixup to `OneCursor`/`ManyCursor`
+                // above avoids introducing that same over-eager-decimal-
+                // forcing for a case (bare computed arithmetic wrapped in
+                // `[...]`) that doesn't have it today.
+                GenericResult::Owned(v) => vec![v],
+                GenericResult::ManyOwned(vs) => vs,
+                GenericResult::Error(e) => return GenericResult::Error(e),
+                GenericResult::Break(label) => return GenericResult::Break(label),
+                GenericResult::Halt(code) => return GenericResult::Halt(code),
+                // Array construction is atomic in jq (verified: `[1,error("x"),3]`
+                // produces no output at all, not a partial array) -- a `Partial`
+                // inner stream surfaces only its terminating control, discarding
+                // whatever prefix it already produced. Mirrors
+                // `eval::eval_array_construction`'s identical arm.
+                GenericResult::Partial(_, Control::Error(e)) => return GenericResult::Error(e),
+                GenericResult::Partial(_, Control::Break(label)) => {
+                    return GenericResult::Break(label)
+                }
+                GenericResult::Partial(_, Control::Halt(code)) => return GenericResult::Halt(code),
+                GenericResult::LazyKeys { .. }
+                | GenericResult::LazyIndexRange(_)
+                | GenericResult::LazySeq(_) => {
+                    unreachable!("materialize_lazy() already normalized every lazy variant")
+                }
+            };
+            GenericResult::Owned(OwnedValue::Array(items))
+        }
+
+        // Comma: evaluate each operand in source order against the ambient
+        // `optional` (mirrors `eval::eval_comma`, minus its borrowed/owned
+        // fast path -- `Expr::Compare` above already establishes the
+        // "collect into an owned Vec" shape for a multi-operand native arm
+        // in this file). A sibling's own `Error`/`Break`/`Halt`/`Partial`
+        // always propagates as a `Partial` carrying whatever prefix already
+        // ran (#400) -- unlike `Expr::Array` above, comma is not atomic, and
+        // unlike `Expr::Compare`'s `finish_fork_generic` calls, this never
+        // consults `optional` itself: an ambient `?` catches the aggregate
+        // result exactly once at `Expr::Optional`'s own arm, same as
+        // `eval::eval_comma` defers to `eval::eval_try`. Handled natively so
+        // a cursor-native builtin's fix doesn't lose it to the wildcard
+        // fallback just for being joined with `,` either (#1168).
+        //
+        // Each sibling's own `push_generic_owned_values_yq_fixed` call fixes
+        // up only a direct cursor result (`OneCursor`/`ManyCursor`), same
+        // scoping and reasoning as `Expr::Array`'s own arm above -- an
+        // already-constructed value (an already-computed arithmetic result,
+        // a builtin's own object construction) is passed through untouched.
+        Expr::Comma(exprs) => {
+            let mut out: Vec<OwnedValue> = Vec::new();
+            for expr in exprs {
+                let result = eval_single::<S, _>(expr, value.clone(), optional, cursor);
+                match push_generic_owned_values_yq_fixed::<S, _>(result, &mut out) {
+                    Ok(Some(control)) => return partial_generic(out, control),
+                    Ok(None) => {}
+                    Err(result) => return result,
+                }
+            }
+            owned_vec_to_generic_result(out)
         }
 
         // Fall back to the full evaluator for complex expressions
@@ -5653,6 +5836,82 @@ mod tests {
             owned,
             OwnedValue::Array(vec![expected_entry(1), expected_entry(2)])
         );
+    }
+
+    /// #1168: `Expr::Array` had no native `eval_single` arm, so wrapping a
+    /// cursor-native, duplicate-key-preserving builtin (`to_entries`, #443
+    /// above) in `[...]` fell to the wildcard fallback, which materializes
+    /// the *whole document* into an `OwnedValue` first -- silently
+    /// re-collapsing the very duplicates `to_entries` had just preserved.
+    /// In-process (not just the CLI test in `tests/yq_cli_tests.rs`) for the
+    /// same coverage-attribution reason as [`test_yaml_shuffle_resolves_explicit_tag_903`].
+    #[test]
+    fn test_yaml_generic_array_wrapped_to_entries_preserves_duplicate_keys_1168() {
+        use crate::yaml::YamlIndex;
+
+        let yaml = b"a: 1\na: 2\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let cursor = index.root(yaml);
+
+        let mapping_cursor = cursor
+            .first_child()
+            .expect("YAML document should have content");
+        let value = mapping_cursor.value();
+
+        let result = eval(
+            &Expr::Array(Box::new(Expr::Builtin(Builtin::ToEntries))),
+            value,
+        );
+        let owned = result.into_owned().unwrap();
+
+        let expected_entry = |v: i64| {
+            let mut entry = IndexMap::new();
+            entry.insert("key".to_string(), OwnedValue::String("a".to_string()));
+            entry.insert("value".to_string(), OwnedValue::Int(v));
+            OwnedValue::Object(entry)
+        };
+        assert_eq!(
+            owned,
+            OwnedValue::Array(vec![OwnedValue::Array(vec![
+                expected_entry(1),
+                expected_entry(2)
+            ])])
+        );
+    }
+
+    /// #1168, comma sibling of the `Array` case above: `Expr::Comma` had no
+    /// native arm either, so `to_entries, to_entries` hit the same
+    /// whole-document-materializing fallback for both operands.
+    #[test]
+    fn test_yaml_generic_comma_wrapped_to_entries_preserves_duplicate_keys_1168() {
+        use crate::yaml::YamlIndex;
+
+        let yaml = b"a: 1\na: 2\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let cursor = index.root(yaml);
+
+        let mapping_cursor = cursor
+            .first_child()
+            .expect("YAML document should have content");
+        let value = mapping_cursor.value();
+
+        let result = eval(
+            &Expr::Comma(vec![
+                Expr::Builtin(Builtin::ToEntries),
+                Expr::Builtin(Builtin::ToEntries),
+            ]),
+            value,
+        );
+        let owned = result.collect_owned();
+
+        let expected_entry = |v: i64| {
+            let mut entry = IndexMap::new();
+            entry.insert("key".to_string(), OwnedValue::String("a".to_string()));
+            entry.insert("value".to_string(), OwnedValue::Int(v));
+            OwnedValue::Object(entry)
+        };
+        let expected_array = OwnedValue::Array(vec![expected_entry(1), expected_entry(2)]);
+        assert_eq!(owned, vec![expected_array.clone(), expected_array]);
     }
 
     /// #1170: unlike YAML's genuine duplicates (above), a duplicate JSON
