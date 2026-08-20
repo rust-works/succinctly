@@ -901,13 +901,13 @@ impl<'a> Parser<'a> {
 
     /// Fold a slice bound to an integer literal, seeing through parens.
     ///
-    /// [`Expr::IndexNumber`] counts (#1088): a slice bound has no spelling
-    /// to preserve -- `path(.[1.0:3.0])` still reports `{"start":1,"end":3}`
-    /// here -- so it contributes the same `i64` a plain [`Expr::Index`]
-    /// would, keeping every slice exactly as it was. That `path()` diverges
-    /// from jq for a *float* slice bound is a separate, pre-existing gap
-    /// with its own issue; folding both variants identically here is what
-    /// keeps this change from touching slices at all.
+    /// [`Expr::IndexNumber`] counts (#1088): it contributes the same `i64` a
+    /// plain [`Expr::Index`] would, so every slice keeps exactly the shape
+    /// it had -- `path(.[1.0:3.0])` still reports `{"start":1,"end":3}`
+    /// here. That this diverges from jq, which keeps a float bound as
+    /// written (`{"start":1.0,"end":3.0}`), is the same gap #1088 closed for
+    /// indices and is tracked separately as #1326; folding both variants
+    /// identically here is what keeps #1088 from touching slices at all.
     fn fold_int_literal(key: &Expr) -> Option<i64> {
         match Self::fold_index_key(key) {
             Some(Expr::Index(i) | Expr::IndexNumber { idx: i, .. }) => Some(i),
