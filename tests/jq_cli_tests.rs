@@ -13484,3 +13484,89 @@ fn test_non_pipe_path_expressions_still_raise_986() -> Result<()> {
     }
     Ok(())
 }
+
+/// Pins the shapes #986/#989's deferred-trackability rework fixed, so a later
+/// change to `resolve_leaf`/`resolve_seq`/`Expr::Comma` cannot quietly undo
+/// them.
+///
+/// Companion to `test_non_pipe_path_expressions_still_raise_986`, which pins
+/// the shapes that had to *keep* working. This pins the ones that had to
+/// start. All expectations captured live from pinned jq 1.7.1.
+///
+/// The grouping matters: Stage 1 moved the trackability decision to the
+/// genuinely terminal position, which is what lets a non-path-shaped value
+/// reach `resolve_index_expr`'s pre-existing #843 checks and pick up jq's
+/// "near attempt to access element K of V" wording. Stage 2 then stopped
+/// `Expr::Comma` from answering the same question a position too early.
+#[test]
+fn test_deferred_trackability_matches_jq_986_989() {
+    // (query, expected stderr fragment) -- all exit 5, no stdout.
+    let raising = [
+        // Stage 1: the error names the *navigation* that failed, not the
+        // value that merely wasn't a path.
+        (
+            r"path(1|.foo)",
+            r#"near attempt to access element "foo" of 1"#,
+        ),
+        (
+            r#"(1 | .[("x","y")]) = 9"#,
+            r#"near attempt to access element "x" of 1"#,
+        ),
+        (
+            r#"(range(3) | .[("x","y")]) = 9"#,
+            r#"near attempt to access element "x" of 0"#,
+        ),
+        (
+            r#"(1 | .a)[("x","y")] = 9"#,
+            r#"near attempt to access element "a" of 1"#,
+        ),
+        (
+            r#"path((1|.)[("x","y")])"#,
+            r#"near attempt to access element "x" of 1"#,
+        ),
+        // A pipe's *last* output is the one named, not its first.
+        (r"path(1|2)", "Invalid path expression with result 2"),
+        // The downstream error is reported, not masked by #530's wording.
+        (r#"path(1|error("boom"))"#, "boom"),
+    ];
+    for (query, fragment) in raising {
+        let (stdout, stderr, code) = run_jq_full(&["-c", query], Some(r#"{"a":1,"foo":10}"#))
+            .unwrap_or_else(|e| panic!("`{query}` failed to run: {e}"));
+        assert_eq!(code, 5, "`{query}`\nstdout: {stdout}\nstderr: {stderr}");
+        assert!(
+            stderr.contains(fragment),
+            "`{query}` should mention `{fragment}`, got: {stderr}"
+        );
+    }
+
+    // Stage 2: a `Comma` mid-pipe is not the terminal position. The `.a`
+    // branch resolves and is emitted first; only then does `.c` raise
+    // against the literal `1` -- naming `.c`, not the literal.
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", r"path((.a, 1)|.c)"], Some(r#"{"a":{"c":1},"x":2}"#))
+            .expect("comma-mid-pipe repro runs");
+    assert_eq!(code, 5, "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(stdout, "[\"a\",\"c\"]\n", "stderr: {stderr}");
+    assert!(
+        stderr.contains(r#"near attempt to access element "c" of 1"#),
+        "{stderr}"
+    );
+
+    // `halt_error` must still halt rather than being downgraded into a
+    // catchable "Invalid path expression" -- the one repro here that is a
+    // genuine correctness violation rather than a wording fix. Exit code is
+    // part of the contract.
+    let (stdout, _stderr, code) =
+        run_jq_full(&["-c", r"path(1|halt_error(3))"], Some("{}")).expect("halt_error repro runs");
+    assert_eq!(code, 3, "halt_error must halt with its own code");
+    assert!(stdout.is_empty(), "stdout: {stdout}");
+
+    // `break` must still unwind to its label rather than raising.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r"label $out | path(1|break $out)"],
+        Some(r#"{"a":10}"#),
+    )
+    .expect("break repro runs");
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(stdout.is_empty(), "stdout: {stdout}");
+}
