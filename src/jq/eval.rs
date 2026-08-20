@@ -20948,6 +20948,22 @@ fn delete_at_path(
                     // reached through the slice) — broader than #1162's own
                     // scope (slice as the path's *last* component), needing
                     // its own investigation before it's fixed.
+                    //
+                    // `terminal_write: yq_mode` (#1321 code review): a
+                    // string target here is the *same* #1219 divergence,
+                    // just for a scalar rather than a container -- yq
+                    // silently no-ops it (confirmed live, `del(.a[0:1].b)`
+                    // on `a: hello` leaves `a: hello` untouched), which
+                    // this PR doesn't attempt to fix. Forcing
+                    // `terminal_write: true` in yq mode keeps
+                    // `through_slice`'s String arm on its old, unconditional
+                    // refusal there -- the exact same wrong-but-unchanged
+                    // "Cannot update string slices" message yq mode already
+                    // raised before this PR -- instead of trading it for a
+                    // *different* wrong message ("Cannot index string with
+                    // string \"b\"") that would make this string case look
+                    // fixed relative to #1219's own array/object case when
+                    // it isn't. jq mode is unaffected either way.
                     Expr::Slice { start, end } => through_slice(
                         root,
                         *start,
@@ -20956,7 +20972,7 @@ fn delete_at_path(
                             optional: here,
                             scalar_noop: false,
                             container_noop: false,
-                            terminal_write: false,
+                            terminal_write: yq_mode,
                         },
                         |sub| delete_at_path(sub, &rest, optional, yq_mode),
                     ),
@@ -41475,6 +41491,34 @@ mod tests {
         query!(br"[1,[2],[3]]", r"del(.[1:3][0])",
             QueryResult::Owned(v) => {
                 assert_eq!(v.to_json(), "[1,[3]]");
+            }
+        );
+    }
+
+    #[test]
+    fn test_del_string_slice_mid_chain_yq_mode_unaffected_1321() {
+        // #1321 code review: yq mode's own del() call site into
+        // `through_slice` deliberately forces `terminal_write: true` for a
+        // string target, keeping the OLD, unconditional "Cannot update
+        // string slices" refusal there byte-for-byte unchanged -- NOT the
+        // new jq-mode fix above. This case is the same real-yq-diverges
+        // gap #1219 already tracks for a container target
+        // (`del(.a[1:3][0])` on an array): real yq silently no-ops it
+        // (confirmed live, `del(.a[0:1].b)` on `a: hello` leaves `a:
+        // hello` untouched), which is #1219's own scope to fix, not this
+        // issue's. Pinning the *unchanged* wrong message here so a future
+        // edit doesn't silently swap it for a different-but-still-wrong
+        // one and make this string case look fixed relative to #1219's
+        // still-open array/object case.
+        yq_query!(br#"{"a":"hello"}"#, r"del(.a[0:1].b)",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "Cannot update string slices");
+            }
+        );
+        // jq mode is unaffected by this yq-only gating.
+        query!(br#"{"a":"hello"}"#, r"del(.a[0:1].b)",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, r#"Cannot index string with string "b""#);
             }
         );
     }
