@@ -12663,9 +12663,9 @@ fn numeric_path_component(idx: i64, key: &OwnedValue) -> Expr {
             idx,
             key: NumberKey::Float(*f),
         },
-        OwnedValue::NumberLiteral(repr @ NumberRepr::Float(_), text) => Expr::IndexNumber {
+        OwnedValue::NumberLiteral(NumberRepr::Float(f), text) => Expr::IndexNumber {
             idx,
-            key: NumberKey::Literal(*repr, text.clone()),
+            key: NumberKey::Literal(*f, text.clone()),
         },
         // `Int` and `NumberLiteral(Int, _)`: nothing to preserve.
         _ => Expr::Index(idx),
@@ -12686,7 +12686,9 @@ fn index_component_value(idx: i64, key: Option<&NumberKey>) -> OwnedValue {
     match key {
         None => OwnedValue::Int(idx),
         Some(NumberKey::Float(f)) => OwnedValue::Float(*f),
-        Some(NumberKey::Literal(repr, text)) => OwnedValue::NumberLiteral(*repr, text.clone()),
+        Some(NumberKey::Literal(f, text)) => {
+            OwnedValue::NumberLiteral(NumberRepr::Float(*f), text.clone())
+        }
     }
 }
 

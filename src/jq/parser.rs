@@ -809,41 +809,34 @@ impl<'a> Parser<'a> {
             Expr::Paren(inner) => Self::fold_index_key(inner),
             Expr::Literal(Literal::String(s)) => Some(Expr::Field(s.clone())),
             Expr::Literal(Literal::Int(i)) => Some(Expr::Index(*i)),
-            // `.[1.0]` is an integer index; `.[1.7]` is not, and must go through
-            // the evaluator to truncate the way jq does. The upper bound is a
-            // strict `<`, not `<=`: `i64::MAX as f64` rounds *up* to `2^63`
-            // (`i64::MAX` isn't exactly representable as `f64`), so a `<=`
-            // check let `.[2^63]` through and `as i64` silently saturated it
-            // to `i64::MAX` -- one past what was actually written (#1061).
-            // `i64::MIN as f64` has no such rounding (`-2^63` is an exact
-            // power of two), so the lower bound stays `>=`.
+            // Every number written in filter source arrives as
+            // `Literal::NumberLiteral` (#1035), so this one arm covers the
+            // whole grammar; `Literal::Float`/`Literal::Int` are for
+            // internally-synthesized literals, which are spliced into an
+            // already-parsed AST and so never reach the parser's own fold.
             //
-            // #1088: the *set* of keys that fold here is unchanged -- only
-            // the variant is. A float-spelled key folds to
-            // [`Expr::IndexNumber`] rather than [`Expr::Index`] so that
-            // `path(.[2.0])` can report `[2.0]` the way jq does; `idx` is
-            // the identical `i64`, so nothing about navigation moves.
-            // `Literal::Float` is the synthesized-literal spelling (no
-            // source text to preserve), hence `NumberKey::Float`.
-            Expr::Literal(Literal::Float(f))
-                if f.fract() == 0.0 && *f >= i64::MIN as f64 && *f < i64::MAX as f64 =>
-            {
-                Some(Expr::IndexNumber {
-                    idx: *f as i64,
-                    key: NumberKey::Float(*f),
-                })
-            }
-            // #1035: a source-text-preserving numeric literal folds the same
-            // way. #1062: the literal's `NumberRepr` is already parsed and
+            // `.[1.0]` is an integer index; `.[1.7]` is not, and must go
+            // through the evaluator to truncate the way jq does. The upper
+            // bound is a strict `<`, not `<=`: `i64::MAX as f64` rounds *up*
+            // to `2^63` (`i64::MAX` isn't exactly representable as `f64`),
+            // so a `<=` check let `.[2^63]` through and `as i64` silently
+            // saturated it to `i64::MAX` -- one past what was actually
+            // written (#1061). `i64::MIN as f64` has no such rounding
+            // (`-2^63` is an exact power of two), so the lower bound stays
+            // `>=`.
+            //
+            // #1062: the literal's `NumberRepr` is already parsed and
             // carried on the node itself, so this reads it directly instead
             // of re-running `parse_i64_or_f64` on the source text.
             //
-            // #1088: an `Int` repr still folds to a plain [`Expr::Index`] --
-            // its own source text renders identically to the `i64`, so
-            // there is nothing for [`Expr::IndexNumber`] to preserve. A
-            // `Float` repr carries its spelling through instead, because
-            // jq echoes it back verbatim: `path(.[2.00])` is `[2.00]` and
-            // `path(.[1e10])` is `[1E+10]`.
+            // #1088: the *set* of keys that fold here is unchanged -- only
+            // the variant is. An `Int` repr still folds to a plain
+            // [`Expr::Index`], since its own source text renders identically
+            // to the `i64` and the hot `.foo.bar[0]` path must not move. A
+            // `Float` repr carries its spelling through
+            // [`Expr::IndexNumber`] instead, because jq echoes it back
+            // verbatim: `path(.[2.00])` is `[2.00]` and `path(.[1e10])` is
+            // `[1E+10]`. `idx` is the identical `i64` either way.
             Expr::Literal(Literal::NumberLiteral(repr, text)) => match *repr {
                 NumberRepr::Int(i) => Some(Expr::Index(i)),
                 NumberRepr::Float(f)
@@ -851,7 +844,7 @@ impl<'a> Parser<'a> {
                 {
                     Some(Expr::IndexNumber {
                         idx: f as i64,
-                        key: NumberKey::Literal(*repr, text.as_str().into()),
+                        key: NumberKey::Literal(f, text.as_str().into()),
                     })
                 }
                 NumberRepr::Float(_) => None,
@@ -5767,7 +5760,7 @@ mod tests {
             parse(".[1.0]").unwrap(),
             Expr::IndexNumber {
                 idx: 1,
-                key: NumberKey::Literal(NumberRepr::Float(1.0), "1.0".into()),
+                key: NumberKey::Literal(1.0, "1.0".into()),
             }
         );
         // `1e0` is the same value spelled differently, and jq echoes the
@@ -5776,7 +5769,7 @@ mod tests {
             parse(".[1e0]").unwrap(),
             Expr::IndexNumber {
                 idx: 1,
-                key: NumberKey::Literal(NumberRepr::Float(1.0), "1e0".into()),
+                key: NumberKey::Literal(1.0, "1e0".into()),
             }
         );
         assert_eq!(parse(".[\"a\"]").unwrap(), Expr::Field("a".into()));
@@ -5921,20 +5914,14 @@ mod tests {
             parse(".[9223372036854774784.0]").unwrap(),
             Expr::IndexNumber {
                 idx: 9223372036854774784,
-                key: NumberKey::Literal(
-                    NumberRepr::Float(9223372036854774784.0),
-                    "9223372036854774784.0".into()
-                ),
+                key: NumberKey::Literal(9223372036854774784.0, "9223372036854774784.0".into()),
             }
         );
         assert_eq!(
             parse(".[9223372036854774784e0]").unwrap(),
             Expr::IndexNumber {
                 idx: 9223372036854774784,
-                key: NumberKey::Literal(
-                    NumberRepr::Float(9223372036854774784.0),
-                    "9223372036854774784e0".into()
-                ),
+                key: NumberKey::Literal(9223372036854774784.0, "9223372036854774784e0".into()),
             }
         );
     }

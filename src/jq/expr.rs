@@ -1200,7 +1200,14 @@ pub enum NumberKey {
     Float(f64),
     /// A float-spelled literal that still carries its own source text,
     /// mirroring `OwnedValue::NumberLiteral`: `2.0`, `2.00`, `1e10`.
-    Literal(NumberRepr, Box<str>),
+    ///
+    /// The value is a bare `f64` rather than a [`NumberRepr`] because an
+    /// `Int` repr cannot occur here by construction: an integer-spelled
+    /// literal renders identically to its own `i64`, so it folds to
+    /// [`Expr::Index`] and never reaches this type. Spelling that
+    /// invariant into the field is what keeps [`Self::value`] total
+    /// instead of carrying an arm nothing can reach.
+    Literal(f64, Box<str>),
 }
 
 impl NumberKey {
@@ -1210,9 +1217,7 @@ impl NumberKey {
     /// that discards the spelling — see this type's own doc comment.
     pub fn value(&self) -> f64 {
         match self {
-            Self::Float(f) => *f,
-            Self::Literal(NumberRepr::Int(i), _) => *i as f64,
-            Self::Literal(NumberRepr::Float(f), _) => *f,
+            Self::Float(f) | Self::Literal(f, _) => *f,
         }
     }
 }
