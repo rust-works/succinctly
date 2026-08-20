@@ -351,7 +351,13 @@ pub fn format_number_jq_compat(raw: &[u8]) -> String {
     // significant mantissa digit, so this always succeeds -- the same
     // invariant `format_overflow_literal_mantissa` relies on for its own
     // `unreachable!()`.
-    let Ok((mantissa_str, shifted_exp, digit_count)) =
+    //
+    // `exp_saturated` (`_`, ignored): `s` already parsed successfully to a
+    // finite, nonzero, normal `f64` to reach this path at all, so its
+    // written exponent digit string was in `i128`'s range long before it
+    // was in `f64`'s -- unlike `format_near_zero_literal` (#1273), this
+    // path can't actually observe a saturated exponent in practice.
+    let Ok((mantissa_str, shifted_exp, digit_count, _exp_saturated)) =
         normalize_extreme_literal_mantissa(s, exp_pos)
     else {
         unreachable!("nonzero value implies normalize_extreme_literal_mantissa succeeds")
@@ -440,6 +446,34 @@ fn assemble_scientific(sign: &str, mantissa_str: &str, exp: i128) -> String {
     format!("{sign}{mantissa_str}E{exp_sign}{exp}")
 }
 
+/// Sibling of [`assemble_scientific`] for a saturated exponent (#1273): once
+/// the source digit string didn't fit in `i128`, [`parse_literal_exponent`]'s
+/// numeric return is a fixed, input-independent sentinel, not the literal's
+/// real exponent -- displaying it (as [`assemble_scientific`] would) prints
+/// the same wrong number for every overlong exponent regardless of what the
+/// document actually wrote. This instead echoes the raw exponent digit text
+/// itself, which is correct for any digit-string length and, unlike the
+/// sentinel, is at least *derived from* the real input.
+///
+/// Not shift-adjusted: [`normalize_extreme_literal_mantissa`]'s `shift`
+/// (folded into the exact case's `new_exp`) is small and bounded by the
+/// mantissa's own digit count, but adding it to an arbitrary-precision raw
+/// exponent string would need real big-integer arithmetic to stay exact --
+/// out of scope for what this issue asks for (see its own "acceptance
+/// criterion is a new caller can't silently inherit a fake exponent, not
+/// output X changes to Y"). A perfectly shift-adjusted answer isn't
+/// reachable here without that machinery, but an honestly-unshifted one
+/// beats a fabricated one.
+fn assemble_scientific_from_raw_exponent(
+    sign: &str,
+    mantissa_str: &str,
+    raw_exp_text: &str,
+) -> String {
+    let trimmed = raw_exp_text.strip_prefix('+').unwrap_or(raw_exp_text);
+    let exp_sign = if trimmed.starts_with('-') { "" } else { "+" };
+    format!("{sign}{mantissa_str}E{exp_sign}{trimmed}")
+}
+
 /// Parse a literal's exponent digit string at wide (`i128`) precision,
 /// saturating to `i128::MIN`/`MAX` by sign on overflow rather than erroring
 /// -- the exponent digit string can itself be longer than even `i128` can
@@ -447,15 +481,22 @@ fn assemble_scientific(sign: &str, mantissa_str: &str, exp: i128) -> String {
 /// value is already certain to be past whichever ceiling (or lack thereof)
 /// the caller applies. `i128`, not `i64` (#1270): the near-zero/underflow
 /// path (`format_near_zero_literal`) has no deliberate ceiling of its own
-/// (see that function's doc comment) and simply displays whatever this
-/// returns, so an `i64`-width saturation point was reachable by an ordinary
-/// (if pathological) document exponent -- `1e-999999999999999999999999`
-/// (24 nines) saturated to exactly `i64::MIN` and printed that raw sentinel
-/// as if it were a real, computed exponent (`1E-9223372036854775808`
-/// instead of anything resembling the source text). `i128`'s far larger
-/// range (~38 digits) pushes that same saturation point out by roughly 19
-/// more orders of magnitude, past what any realistic or plausibly-fuzzed
-/// literal would reach, without the complexity of true arbitrary precision.
+/// (see that function's doc comment), so an `i64`-width saturation point
+/// was reachable by an ordinary (if pathological) document exponent --
+/// `1e-999999999999999999999999` (24 nines) saturated to exactly
+/// `i64::MIN`. `i128`'s far larger range (~38 digits) pushes that same
+/// saturation point out by roughly 19 more orders of magnitude, past what
+/// any realistic or plausibly-fuzzed literal would reach, without the
+/// complexity of true arbitrary precision -- but a saturation point,
+/// wherever it sits, is still reachable by a long enough digit string
+/// (#1273), which is why the second element of the returned tuple exists:
+/// callers with their own ceiling far below `i128`'s range (`format_overflow_literal_mantissa`'s
+/// `>= 1_000_000_000` check, or the ordinary path's implicit bound via
+/// `f64::parse` already having succeeded) can ignore it and use the
+/// sentinel as "definitely past the ceiling"; [`format_near_zero_literal`],
+/// which has no such ceiling to fall back on, uses it to avoid displaying
+/// the sentinel as if it were the literal's real exponent (#1273 -- see
+/// that function's own doc comment).
 /// Shared so `format_number_jq_compat`'s own exponent dispatch and
 /// [`normalize_extreme_literal_mantissa`]'s shift math can't independently
 /// drift on how an out-of-range exponent is handled (#1099 code review:
@@ -463,14 +504,18 @@ fn assemble_scientific(sign: &str, mantissa_str: &str, exp: i128) -> String {
 /// `format_number_jq_compat` call site silently treated an out-of-range
 /// exponent as exactly `0`, misrouting extreme-underflow literals into the
 /// "eliminate exponent" fast path before ever reaching this module).
-fn parse_literal_exponent(exp_text: &str) -> i128 {
-    exp_text.parse().unwrap_or_else(|_| {
-        if exp_text.trim_start_matches('+').starts_with('-') {
-            i128::MIN
-        } else {
-            i128::MAX
+fn parse_literal_exponent(exp_text: &str) -> (i128, bool) {
+    match exp_text.parse() {
+        Ok(v) => (v, false),
+        Err(_) => {
+            let sentinel = if exp_text.trim_start_matches('+').starts_with('-') {
+                i128::MIN
+            } else {
+                i128::MAX
+            };
+            (sentinel, true)
         }
-    })
+    }
 }
 
 /// Split a literal's mantissa text (`s[..exp_pos]`, sign stripped) into its
@@ -491,17 +536,22 @@ fn split_mantissa(s: &str, exp_pos: usize) -> (&str, &str) {
 /// Shift a literal's own mantissa digits (the text before `exp_pos`, i.e.
 /// before `e`/`E`) into jq's one-digit-before-the-point normalized form,
 /// and fold that shift into the literal's own written exponent -- returns
-/// `Ok((mantissa_str, new_exp, digit_count))`, or `Err(frac_len)` if the
-/// mantissa is genuinely all-zero (`0.0e400`, `0.00e-400`), which has no
-/// magnitude to normalize against (`frac_len` is the fractional-digit count
-/// the `Err` caller needs for its own shift math, #1207 -- surfaced here
-/// rather than re-derived by every `Err` caller via a second
-/// `split_mantissa` call). `digit_count` is the mantissa's *true* (never
-/// truncated -- see `MAX_RENDERED_MANTISSA_DIGITS` below) significant-digit
-/// count, needed by `format_number_jq_compat`'s own plain-vs-scientific
-/// notation choice for a positive shifted exponent (#1244); it costs
-/// nothing extra to compute (`str::len()` is O(1)), so it's returned
-/// unconditionally rather than only on request.
+/// `Ok((mantissa_str, new_exp, digit_count, exp_saturated))`, or
+/// `Err(frac_len)` if the mantissa is genuinely all-zero (`0.0e400`,
+/// `0.00e-400`), which has no magnitude to normalize against (`frac_len` is
+/// the fractional-digit count the `Err` caller needs for its own shift
+/// math, #1207 -- surfaced here rather than re-derived by every `Err`
+/// caller via a second `split_mantissa` call). `digit_count` is the
+/// mantissa's *true* (never truncated -- see `MAX_RENDERED_MANTISSA_DIGITS`
+/// below) significant-digit count, needed by `format_number_jq_compat`'s
+/// own plain-vs-scientific notation choice for a positive shifted exponent
+/// (#1244); it costs nothing extra to compute (`str::len()` is O(1)), so
+/// it's returned unconditionally rather than only on request. `exp_saturated`
+/// is [`parse_literal_exponent`]'s own saturation bit, passed through
+/// unconditionally for the same reason (#1273) -- only
+/// [`format_near_zero_literal`] actually inspects it (its other two callers
+/// both have a ceiling `new_exp` clears regardless of whether it's exact or
+/// a saturation sentinel).
 /// Entirely via string manipulation on `s` rather than `log10`/`pow` on the
 /// parsed value, since the caller only reaches here when the parsed value
 /// has already lost the precision this exists to recover (`+/-infinity` on
@@ -521,7 +571,7 @@ fn split_mantissa(s: &str, exp_pos: usize) -> (&str, &str) {
 fn normalize_extreme_literal_mantissa(
     s: &str,
     exp_pos: usize,
-) -> Result<(String, i128, i128), i128> {
+) -> Result<(String, i128, i128, bool), i128> {
     // `dump_truncated`'s whole design keeps preview cost independent of the
     // value's own size (see its doc comment) - a document-controlled
     // mantissa of unbounded length must not turn into unbounded work here.
@@ -609,7 +659,7 @@ fn normalize_extreme_literal_mantissa(
         )
     };
 
-    let parsed_exp = parse_literal_exponent(&s[exp_pos + 1..]);
+    let (parsed_exp, exp_saturated) = parse_literal_exponent(&s[exp_pos + 1..]);
     let new_exp = parsed_exp.saturating_add(shift);
 
     let mantissa_str = if rest.is_empty() {
@@ -617,7 +667,7 @@ fn normalize_extreme_literal_mantissa(
     } else {
         format!("{leading}.{rest}")
     };
-    Ok((mantissa_str, new_exp, digit_count))
+    Ok((mantissa_str, new_exp, digit_count, exp_saturated))
 }
 
 /// Renormalize an overflowed literal's own mantissa digits into jq's
@@ -639,7 +689,14 @@ fn format_overflow_literal_mantissa(s: &str, exp_pos: usize, negative: bool) -> 
     // A mantissa of exactly `0` times any exponent is still exactly `0.0`,
     // never `+/-infinity` -- callers only reach this function when `value`
     // has already overflowed, which guarantees a nonzero mantissa.
-    let Ok((mantissa_str, new_exp, digit_count)) = normalize_extreme_literal_mantissa(s, exp_pos)
+    //
+    // `exp_saturated` (`_`, ignored): this function's own ceiling check
+    // just below fires regardless of whether `new_exp` is exact or a
+    // saturation sentinel -- either way it's past `1_000_000_000` -- so
+    // unlike `format_near_zero_literal` (#1273), there is no case here
+    // where the distinction changes what gets rendered.
+    let Ok((mantissa_str, new_exp, digit_count, _exp_saturated)) =
+        normalize_extreme_literal_mantissa(s, exp_pos)
     else {
         unreachable!("overflow implies a nonzero mantissa")
     };
@@ -728,9 +785,26 @@ fn format_overflow_literal_mantissa(s: &str, exp_pos: usize, negative: bool) -> 
 fn format_near_zero_literal(s: &str, exp_pos: usize, negative: bool) -> String {
     let sign = if negative { "-" } else { "" };
     match normalize_extreme_literal_mantissa(s, exp_pos) {
-        Ok((mantissa_str, new_exp, _)) => assemble_scientific(sign, &mantissa_str, new_exp),
+        // #1273: this is the one caller with no ceiling of its own (see the
+        // doc comment above), so it's the one place a saturated exponent
+        // must not reach `assemble_scientific` -- that would display
+        // `parse_literal_exponent`'s fixed sentinel as if it were the
+        // literal's real exponent.
+        Ok((mantissa_str, _, _, true)) => {
+            assemble_scientific_from_raw_exponent(sign, &mantissa_str, &s[exp_pos + 1..])
+        }
+        Ok((mantissa_str, new_exp, _, false)) => assemble_scientific(sign, &mantissa_str, new_exp),
         Err(frac_len) => {
-            let shifted_exp = parse_literal_exponent(&s[exp_pos + 1..]).saturating_sub(frac_len);
+            let (parsed_exp, exp_saturated) = parse_literal_exponent(&s[exp_pos + 1..]);
+            if exp_saturated {
+                // Same reasoning as the `Ok` arm above; the all-zero-mantissa
+                // shift (`frac_len`) is dropped along with the exact-value
+                // path rather than folded into the raw text (see
+                // `assemble_scientific_from_raw_exponent`'s own doc comment
+                // on why the shift isn't attempted here).
+                return assemble_scientific_from_raw_exponent(sign, "0", &s[exp_pos + 1..]);
+            }
+            let shifted_exp = parsed_exp.saturating_sub(frac_len);
             if shifted_exp == 0 {
                 format!("{sign}0")
             } else if (-6..0).contains(&shifted_exp) {
@@ -2945,35 +3019,69 @@ mod tests {
         );
     }
 
-    /// #1270: `parse_literal_exponent`'s own saturating fallback -- an
+    /// #1270/#1273: `parse_literal_exponent`'s own saturating fallback -- an
     /// exponent digit string that overflows even `i128` (not just `i64`)
-    /// saturates to `i128::MIN`/`MAX` by sign rather than erroring. Before
-    /// this issue's fix, the same saturation happened at `i64`'s much
-    /// smaller ~19-digit boundary and the raw sentinel value leaked
-    /// straight into the output as if it were the literal's real exponent
-    /// (`1e-999999999999999999999999`, 24 nines, used to print
-    /// `1E-9223372036854775808` -- nonsense unrelated to either the source
-    /// text or jq's own behavior). Widening to `i128` (~38 digits) doesn't
-    /// remove this residual case, only pushes it out by ~19 orders of
-    /// magnitude, past any realistic or plausibly-fuzzed literal -- this
-    /// pins that the *widened* boundary still degrades to a saturated
-    /// sentinel rather than hanging or panicking.
+    /// saturates internally rather than erroring, but #1273 fixed the one
+    /// unceilinged caller (`format_near_zero_literal`) to detect that and
+    /// echo the exponent's own raw source text instead of displaying the
+    /// fixed, input-independent sentinel as if it were the literal's real
+    /// exponent. Before #1273, this printed `1E-{i128::MIN.unsigned_abs()}`
+    /// (nonsense unrelated to either the source text or jq's own behavior)
+    /// regardless of how many nines the literal actually wrote; now it
+    /// echoes the 45 nines verbatim.
     ///
     /// Unlike `MAX_RENDERED_MANTISSA_DIGITS`'s own cap (which truncates to
-    /// a truthful, monotonically-accurate *prefix* of the real digits),
-    /// this sentinel is a fixed, input-independent value with no
-    /// relationship to the literal's actual magnitude -- code review
-    /// correctly called out the two as different severity classes, not the
-    /// same trade-off; closing this gap properly (distinguishing "exactly
-    /// parsed" from "saturated" at the type level, so the caller could fall
-    /// back to echoing the exponent's own source text instead) is filed
-    /// separately rather than attempted here.
+    /// a truthful, monotonically-accurate *prefix* of the real digits), the
+    /// echoed text here isn't shift-adjusted (see
+    /// `assemble_scientific_from_raw_exponent`'s doc comment) -- correct for
+    /// this specific case only because a single-digit mantissa (`"1"`) has
+    /// shift `0`, so the unshifted and shift-adjusted answers coincide.
     #[test]
     fn test_format_number_jq_compat_underflow_exponent_beyond_i128_range_1270() {
         let huge_exponent = "9".repeat(45); // comfortably past i128::MIN's ~38 digits
         assert_eq!(
             format_number_jq_compat(format!("1e-{huge_exponent}").as_bytes()),
-            format!("1E-{}", i128::MIN.unsigned_abs())
+            format!("1E-{huge_exponent}")
+        );
+    }
+
+    /// #1273: the all-zero-mantissa sibling of the test above --
+    /// `normalize_extreme_literal_mantissa`'s `Err(frac_len)` arm has its
+    /// own direct `parse_literal_exponent` call (`format_near_zero_literal`
+    /// line ~790), a separate saturation site from the `Ok` arm the test
+    /// above exercises. Before #1273 this also leaked the `i128::MIN`
+    /// sentinel; now it echoes the raw exponent text with mantissa `"0"`.
+    #[test]
+    fn test_format_number_jq_compat_all_zero_mantissa_exponent_beyond_i128_range_1273() {
+        let huge_exponent = "9".repeat(45);
+        assert_eq!(
+            format_number_jq_compat(format!("0.0e-{huge_exponent}").as_bytes()),
+            format!("0E-{huge_exponent}")
+        );
+    }
+
+    /// #1273: a multi-digit mantissa's own `shift` is real but not applied
+    /// to a saturated exponent (`assemble_scientific_from_raw_exponent`'s
+    /// doc comment explains why) -- pinning that this is a stable, sane
+    /// (if not shift-exact) answer rather than a panic or the old sentinel.
+    /// `"123"`'s shift is `2` (not `0`), so this deliberately does NOT
+    /// assert exact equality with jq at this magnitude (no live oracle
+    /// exists that reliably handles ~45-digit exponents either, per
+    /// `format_near_zero_literal`'s own doc comment on jq's own breakdown
+    /// past `i32::MAX`) -- only that the real digit string appears
+    /// verbatim, not a fabricated `i128::MIN`/`MAX`-derived number.
+    #[test]
+    fn test_format_number_jq_compat_multidigit_mantissa_exponent_beyond_i128_range_1273() {
+        let huge_exponent = "9".repeat(45);
+        let out = format_number_jq_compat(format!("123e-{huge_exponent}").as_bytes());
+        assert!(
+            out.contains(&huge_exponent),
+            "expected the real 45-nines exponent verbatim in {out:?}"
+        );
+        assert!(
+            !out.contains(&i128::MIN.unsigned_abs().to_string())
+                && !out.contains(&i128::MAX.to_string()),
+            "must not fall back to the old saturation sentinel: {out:?}"
         );
     }
 
