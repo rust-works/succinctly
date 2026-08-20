@@ -14180,6 +14180,22 @@ fn test_1088_path_reports_float_index_as_written() {
         assert_eq!(stdout, expected, "`{query}`\nstderr: {stderr}");
     }
 
+    // A float index inside a user-defined function body goes through
+    // `expand_func_calls`/`substitute_func_param`, which rebuild the AST
+    // node by node — a variant they forgot would be dropped there rather
+    // than at the point of use.
+    for (query, expected) in [
+        ("def f: path(.[2.0]); f", "[2.0]\n"),
+        ("def g($n): path(.[2.0]); g(1)", "[2.0]\n"),
+        ("def h($n): path(.[$n]); h(2.0)", "[2.0]\n"),
+        ("def k: .[2.0]; k", "3\n"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", query], arr)
+            .unwrap_or_else(|e| panic!("`{query}` failed to run: {e}"));
+        assert_eq!(code, 0, "`{query}`\nstdout: {stdout}\nstderr: {stderr}");
+        assert_eq!(stdout, expected, "`{query}`\nstderr: {stderr}");
+    }
+
     // The float component also reaches the `Invalid path expression` message,
     // which names the element that failed to navigate.
     let (stdout, stderr, code) =
