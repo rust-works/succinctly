@@ -39973,6 +39973,78 @@ mod tests {
     }
 
     #[test]
+    fn test_get_path_mut_flattens_a_nested_pipe_path_component() {
+        // #1287's fix, exercised directly (bypassing the parser, like the
+        // autovivify test above): a resolved `path_parts` slot can itself
+        // be a `Pipe` -- from a parenthesized multi-component sub-path
+        // reaching `resolve_dynamic_indexes`'s no-computed-key fast path
+        // verbatim, or from `resolve_node`'s `?` arm handing back
+        // `Optional(Pipe([...]))`. `get_path_mut` has to recurse into it
+        // rather than fall to the "invalid path component" catch-all. The
+        // last two cases here (a `?` swallowing the nested walk's error,
+        // one wrapping the whole slot and one sitting mid-chain inside it)
+        // have no standalone query-syntax repro today -- `(.a.b)?[0]` does
+        // not parse, since postfix `?` cannot be followed by `[...]` -- so
+        // they are only reachable by constructing the `Expr` directly.
+
+        // The nested pipe resolves fine: `Ok(Some(_))`.
+        let mut root = OwnedValue::Object(IndexMap::from([(
+            "a".to_string(),
+            OwnedValue::Object(IndexMap::from([("b".to_string(), OwnedValue::Int(1))])),
+        )]));
+        let slot = get_path_mut(
+            &mut root,
+            &[Expr::Pipe(vec![
+                Expr::Field("a".to_string()),
+                Expr::Field("b".to_string()),
+            ])],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(*slot, OwnedValue::Int(1));
+
+        // The nested pipe fails, and nothing marks it optional: the error
+        // propagates.
+        let mut root = OwnedValue::Object(IndexMap::from([("a".to_string(), OwnedValue::Int(5))]));
+        let err = get_path_mut(
+            &mut root,
+            &[Expr::Pipe(vec![
+                Expr::Field("a".to_string()),
+                Expr::Field("b".to_string()),
+            ])],
+        )
+        .unwrap_err();
+        assert_eq!(err.message, "Cannot index number with string \"b\"");
+
+        // A `?` wrapping the *whole* nested-pipe slot swallows that same
+        // error.
+        let mut root = OwnedValue::Object(IndexMap::from([("a".to_string(), OwnedValue::Int(5))]));
+        let slot = get_path_mut(
+            &mut root,
+            &[Expr::Optional(Box::new(Expr::Pipe(vec![
+                Expr::Field("a".to_string()),
+                Expr::Field("b".to_string()),
+            ])))],
+        )
+        .unwrap();
+        assert!(slot.is_none());
+
+        // A `?` *inside* the nested pipe (mid-chain, not wrapping the whole
+        // slot) makes the recursive call itself return `Ok(None)`, which
+        // propagates the same way.
+        let mut root = OwnedValue::Object(IndexMap::from([("a".to_string(), OwnedValue::Int(5))]));
+        let slot = get_path_mut(
+            &mut root,
+            &[Expr::Pipe(vec![
+                Expr::Field("a".to_string()),
+                Expr::Optional(Box::new(Expr::Field("b".to_string()))),
+            ])],
+        )
+        .unwrap();
+        assert!(slot.is_none());
+    }
+
+    #[test]
     fn test_assign_computed_index_on_parenthesized_multi_component_target_reports_type_mismatch() {
         // #1287: `get_path_mut` (only `=`'s own walker -- `path()`/`del()`/
         // `|=` already resolved this shape correctly) fell to its generic
