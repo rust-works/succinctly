@@ -16134,6 +16134,46 @@ fn test_1223_bare_slice_sibling_object_target_no_longer_crashes_but_still_diverg
     Ok(())
 }
 
+/// #1219 follow-up (found by `/code-review`'s third pass): the same
+/// bare-slice-sibling gap above, but with a trailing slice-*run*
+/// (`.a[0:2][0:1]`, #1219's own generalization) instead of a single
+/// trailing slice. On `main` (pre-#1219), this exact input hard-errored
+/// (`Cannot index object with object`) the same way the single-slice case
+/// used to; post-#1219 it no longer crashes, but -- like the single-slice
+/// case above -- still diverges from real yq for this specific ordering
+/// (real yq leaves the whole document unchanged here; the reversed
+/// ordering, `del(.[2:3], .a[0:2][0:1])`, happens to match real yq
+/// exactly, live-verified). Same "no coherent rule, order-sensitive"
+/// territory as the test above, extended to the run-generalized shape --
+/// not a new gap, just this one now reachable for a run as well as a
+/// single slice. If this is ever reconciled, update this expectation.
+#[test]
+fn test_1219_bare_slice_sibling_trailing_run_no_longer_crashes_but_still_diverges() -> Result<()> {
+    let (out, code) = run_yq_stdin(
+        "del(.a[0:2][0:1], .[2:3])",
+        r#"{"a":[1,2,3,4,5,6],"b":6,"c":9}"#,
+        &["-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(
+        out.trim(),
+        r#"{"b":6,"c":9}"#,
+        "real yq gives {{\"a\":[1,2,3,4,5,6],\"b\":6,\"c\":9}} (fully unchanged) for this ordering"
+    );
+
+    // The reversed ordering, unlike the one above, happens to match real
+    // yq exactly (same coincidental-agreement pattern the #1223 test above
+    // documents for the single-slice shape).
+    let (out_reversed, code_reversed) = run_yq_stdin(
+        "del(.[2:3], .a[0:2][0:1])",
+        r#"{"a":[1,2,3,4,5,6],"b":6,"c":9}"#,
+        &["-o=json", "-I=0"],
+    )?;
+    assert_eq!(code_reversed, 0, "out: {out_reversed:?}");
+    assert_eq!(out_reversed.trim(), r#"{"b":6,"c":9}"#);
+    Ok(())
+}
+
 /// #1223 follow-up (found by `/code-review`, filed separately): a comma
 /// branch reaching its trailing slice through an `Expr::Iterate` prefix
 /// (`.arr[][0:1]`) still crashes, because `navigate_read_only` (the prefix
