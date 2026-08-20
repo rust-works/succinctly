@@ -170,8 +170,8 @@ impl EvalSemantics for YqSemantics {
 use crate::json::light::{JsonCursor, JsonElements, JsonFields, StandardJson};
 
 use super::expr::{
-    ArithOp, AssignOp, Builtin, CompareOp, Expr, FormatType, Literal, MergeFlags, ObjectEntry,
-    ObjectKey, Pattern, StringPart,
+    ArithOp, AssignOp, Builtin, CompareOp, Expr, FormatType, Literal, MergeFlags, NumberKey,
+    ObjectEntry, ObjectKey, Pattern, StringPart,
 };
 use super::value::{
     assert_value_tree_depth, cmp_f64, infinite_float_preview_text, is_infinity_sentinel,
@@ -553,7 +553,9 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
         Expr::Field(name) => index_object_by_name::<W>(value, name, optional),
 
-        Expr::Index(idx) => index_array_by_position::<W>(value, *idx, optional),
+        Expr::Index(idx) | Expr::IndexNumber { idx, .. } => {
+            index_array_by_position::<W>(value, *idx, optional)
+        }
 
         Expr::IndexExpr { target, key } => eval_index_expr::<W, S>(target, key, value, optional),
 
@@ -10845,7 +10847,7 @@ fn navigate_read_only<'a>(root: &'a OwnedValue, steps: &[Expr]) -> Option<&'a Ow
                 OwnedValue::Object(map) => map.get(name)?,
                 _ => return None,
             },
-            Expr::Index(idx) => match current {
+            Expr::Index(idx) | Expr::IndexNumber { idx, .. } => match current {
                 OwnedValue::Array(arr) => {
                     let len = arr.len() as i64;
                     let actual = if *idx < 0 { len + idx } else { *idx };
@@ -11477,7 +11479,7 @@ fn set_path(
                 ))
             }
         }
-        Expr::Index(idx) => {
+        Expr::Index(idx) | Expr::IndexNumber { idx, .. } => {
             autovivify_array(root);
             if let OwnedValue::Array(arr) = root {
                 *write_index(arr, *idx)? = new_value;
@@ -11998,7 +12000,7 @@ fn get_path_mut<'a>(
                     ));
                 }
             }
-            Expr::Index(idx) => {
+            Expr::Index(idx) | Expr::IndexNumber { idx, .. } => {
                 autovivify_array(current);
                 if let OwnedValue::Array(arr) = current {
                     // A still-negative index is the write-time bounds check,
@@ -12103,7 +12105,7 @@ fn update_path<S: EvalSemantics>(
                 Err(EvalError::cannot_index_with_field(owned_type_name(root), name).into())
             }
         }
-        Expr::Index(idx) => {
+        Expr::Index(idx) | Expr::IndexNumber { idx, .. } => {
             autovivify_array(root);
             if let OwnedValue::Array(arr) = root {
                 update_path::<S>(
@@ -12187,7 +12189,7 @@ fn update_path<S: EvalSemantics>(
                             )
                         }
                     }
-                    Expr::Index(idx) => {
+                    Expr::Index(idx) | Expr::IndexNumber { idx, .. } => {
                         autovivify_array(root);
                         if let OwnedValue::Array(arr) = root {
                             update_path::<S>(
@@ -12353,9 +12355,12 @@ fn owned_type_name(value: &OwnedValue) -> &'static str {
 /// impossible for the *next* combinator too.
 fn needs_path_prepass(expr: &Expr) -> bool {
     match expr {
-        Expr::Identity | Expr::Field(_) | Expr::Index(_) | Expr::Slice { .. } | Expr::Iterate => {
-            false
-        }
+        Expr::Identity
+        | Expr::Field(_)
+        | Expr::Index(_)
+        | Expr::IndexNumber { .. }
+        | Expr::Slice { .. }
+        | Expr::Iterate => false,
         Expr::Pipe(exprs) => exprs.iter().any(needs_path_prepass),
         Expr::Optional(inner) | Expr::Paren(inner) => needs_path_prepass(inner),
         _ => true,
@@ -12626,10 +12631,62 @@ fn key_to_path_component(
                 return Err(EvalError::cannot_index(owned_type_name(container), key));
             }
             numeric_key_to_index(key)
-                .map(Expr::Index)
+                .map(|idx| numeric_path_component(idx, key))
                 .ok_or_else(|| EvalError::new("Cannot set array element at NaN index"))
         }
         _ => Err(EvalError::cannot_index(owned_type_name(container), key)),
+    }
+}
+
+/// The static path component a numeric key already resolved to `idx` denotes.
+///
+/// jq appends the resolved key **verbatim** as a path component -- there is
+/// no conversion step at all -- so a key that still carries a float spelling
+/// keeps it: `path(.[2.0])` is `[2.0]`, `path(.[1e10])` is `[1E+10]`,
+/// `path(.[2.00])` is `[2.00]` (#1088). Only an integer-spelled key can be
+/// collapsed to a bare [`Expr::Index`], because that renders identically
+/// either way.
+///
+/// `idx` comes from [`numeric_key_to_index`] rather than being recomputed
+/// here, so the "truncate toward zero" rule stays single-sourced and a
+/// component can never disagree with the read it accompanies.
+///
+/// This looks asymmetric with jq only for a *negated* literal
+/// (`path(.[-1.0])` is `[-1]`, not `[-1.0]`), and that asymmetry lives
+/// entirely in jq's unary minus, not here: negation destroys jq's literal
+/// preservation, and succinctly's arithmetic already collapses
+/// `NumberLiteral` to plain `Float` for exactly the same reason. A negative
+/// float arriving from *data* keeps its spelling in both.
+fn numeric_path_component(idx: i64, key: &OwnedValue) -> Expr {
+    match key {
+        OwnedValue::Float(f) => Expr::IndexNumber {
+            idx,
+            key: NumberKey::Float(*f),
+        },
+        OwnedValue::NumberLiteral(repr @ NumberRepr::Float(_), text) => Expr::IndexNumber {
+            idx,
+            key: NumberKey::Literal(*repr, text.clone()),
+        },
+        // `Int` and `NumberLiteral(Int, _)`: nothing to preserve.
+        _ => Expr::Index(idx),
+    }
+}
+
+/// The `OwnedValue` a static array-index component is reported as in a path.
+///
+/// The single definition of #1088's rendering rule, shared by all three
+/// sites that materialize a path component from an index ([`walk_path`],
+/// [`navigation_element`], and `eval_pipe_with_path_context_internal`) --
+/// per CLAUDE.md's "duplicated predicates diverge silently".
+///
+/// `key` is [`Expr::index_number_key`]'s answer for the component being
+/// rendered: `None` is a plain [`Expr::Index`], whose own `idx` is the
+/// component.
+fn index_component_value(idx: i64, key: Option<&NumberKey>) -> OwnedValue {
+    match key {
+        None => OwnedValue::Int(idx),
+        Some(NumberKey::Float(f)) => OwnedValue::Float(*f),
+        Some(NumberKey::Literal(repr, text)) => OwnedValue::NumberLiteral(*repr, text.clone()),
     }
 }
 
@@ -12921,7 +12978,11 @@ fn resolve_node<'a, S: EvalSemantics>(
                 // expression carve-out above.
                 let bare_navigation_primitive = matches!(
                     inner.as_ref(),
-                    Expr::Field(_) | Expr::Index(_) | Expr::Iterate | Expr::Slice { .. }
+                    Expr::Field(_)
+                        | Expr::Index(_)
+                        | Expr::IndexNumber { .. }
+                        | Expr::Iterate
+                        | Expr::Slice { .. }
                 );
                 let branches = match resolve_node::<S>(inner, value, trackable) {
                     Ok(branches) => branches,
@@ -13502,7 +13563,9 @@ fn resolve_limit<'a, S: EvalSemantics>(
 fn navigation_element(component: &Expr) -> Option<OwnedValue> {
     match component {
         Expr::Field(name) => Some(OwnedValue::String(name.clone())),
-        Expr::Index(i) => Some(OwnedValue::Int(*i)),
+        Expr::Index(idx) | Expr::IndexNumber { idx, .. } => {
+            Some(index_component_value(*idx, component.index_number_key()))
+        }
         Expr::Slice { start, end } => Some(slice::literal_component(*start, *end)),
         _ => None,
     }
@@ -13630,7 +13693,11 @@ fn resolve_leaf<'a, S: EvalSemantics>(
     if trackable
         && matches!(
             expr,
-            Expr::Identity | Expr::Field(_) | Expr::Index(_) | Expr::Slice { .. }
+            Expr::Identity
+                | Expr::Field(_)
+                | Expr::Index(_)
+                | Expr::IndexNumber { .. }
+                | Expr::Slice { .. }
         )
     {
         let mut components = Vec::new();
@@ -15229,6 +15296,10 @@ fn substitute_var(expr: &Expr, var_name: &str, replacement: &OwnedValue) -> Expr
         Expr::Identity => Expr::Identity,
         Expr::Field(name) => Expr::Field(name.clone()),
         Expr::Index(i) => Expr::Index(*i),
+        Expr::IndexNumber { idx, key } => Expr::IndexNumber {
+            idx: *idx,
+            key: key.clone(),
+        },
         Expr::Slice { start, end } => Expr::Slice {
             start: *start,
             end: *end,
@@ -16199,7 +16270,7 @@ fn eval_owned_fast_path<S: EvalSemantics>(
                 name,
             )),
         }),
-        Expr::Index(idx) => Some(match input {
+        Expr::Index(idx) | Expr::IndexNumber { idx, .. } => Some(match input {
             OwnedValue::Array(items) => {
                 let resolved = if *idx < 0 {
                     items.len() as i64 + idx
@@ -18022,10 +18093,11 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
                 ))
             }
         }
-        Expr::Index(idx) => {
-            // Extend path with index
+        Expr::Index(idx) | Expr::IndexNumber { idx, .. } => {
+            // Extend path with index, as written rather than as resolved
+            // (#1088) -- see `index_component_value`.
             let mut new_path = current_path.to_vec();
-            new_path.push(OwnedValue::Int(*idx));
+            new_path.push(index_component_value(*idx, first.index_number_key()));
 
             // Get the element value
             if let OwnedValue::Array(arr) = value {
@@ -18920,10 +18992,10 @@ fn walk_path<S: EvalSemantics>(
                 optional,
             )?;
         }
-        Expr::Index(idx) => {
+        Expr::Index(idx) | Expr::IndexNumber { idx, .. } => {
             step_into::<S>(
                 expr,
-                OwnedValue::Int(*idx),
+                index_component_value(*idx, expr.index_number_key()),
                 value,
                 current_path,
                 out,
@@ -20084,7 +20156,7 @@ fn delete_expr_paths_at(
             // two calls, `del(.[0:2], .[1:3])` on `[1,2,3,4]` would resolve
             // the second range against the already-shortened array and give
             // `[3]` where jq gives `[4]`.
-            Expr::Index(_) | Expr::Slice { .. } => indices.push(path),
+            Expr::Index(_) | Expr::IndexNumber { .. } | Expr::Slice { .. } => indices.push(path),
             Expr::Iterate => iterates.push(path),
             // `flatten_delete_path` only ever leaves Field/Index/Slice/Iterate
             // components behind; anything else is a path shape `del` has
@@ -20262,7 +20334,7 @@ fn delete_expr_array_paths(
     let mut groups: Vec<(ArrayStep, Vec<&[DeleteStep]>)> = Vec::new();
     for path in paths {
         let step = match &path[start].component {
-            Expr::Index(idx) => ArrayStep::Index(*idx),
+            Expr::Index(idx) | Expr::IndexNumber { idx, .. } => ArrayStep::Index(*idx),
             Expr::Slice { start, end } => ArrayStep::Slice(*start, *end),
             _ => unreachable!("delete_expr_paths_at only dispatches Index/Slice paths here"),
         };
@@ -20696,7 +20768,7 @@ fn delete_at_path(
                 name,
             )),
         },
-        Expr::Index(idx) => match root {
+        Expr::Index(idx) | Expr::IndexNumber { idx, .. } => match root {
             OwnedValue::Array(arr) => {
                 let len = arr.len() as i64;
                 let actual_idx = if *idx < 0 { len + idx } else { *idx };
@@ -20799,7 +20871,7 @@ fn delete_at_path(
                             name,
                         )),
                     },
-                    Expr::Index(idx) => match root {
+                    Expr::Index(idx) | Expr::IndexNumber { idx, .. } => match root {
                         OwnedValue::Array(arr) => {
                             let len = arr.len() as i64;
                             let actual_idx = if *idx < 0 { len + idx } else { *idx };
@@ -25755,6 +25827,10 @@ fn expand_func_calls(expr: &Expr, func_name: &str, params: &[String], body: &Exp
         Expr::Identity => Expr::Identity,
         Expr::Field(s) => Expr::Field(s.clone()),
         Expr::Index(i) => Expr::Index(*i),
+        Expr::IndexNumber { idx, key } => Expr::IndexNumber {
+            idx: *idx,
+            key: key.clone(),
+        },
         Expr::Slice { start, end } => Expr::Slice {
             start: *start,
             end: *end,
@@ -26022,6 +26098,10 @@ fn substitute_func_param(expr: &Expr, param: &str, arg: &Expr) -> Expr {
         Expr::Identity => Expr::Identity,
         Expr::Field(name) => Expr::Field(name.clone()),
         Expr::Index(i) => Expr::Index(*i),
+        Expr::IndexNumber { idx, key } => Expr::IndexNumber {
+            idx: *idx,
+            key: key.clone(),
+        },
         Expr::Slice { start, end } => Expr::Slice {
             start: *start,
             end: *end,

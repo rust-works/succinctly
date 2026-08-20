@@ -2057,7 +2057,7 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
             }
         }
 
-        Expr::Index(idx) => {
+        Expr::Index(idx) | Expr::IndexNumber { idx, .. } => {
             if let Some(elements) = value.as_array() {
                 let len = elements.len();
                 let actual_idx = if *idx < 0 {
@@ -2462,7 +2462,7 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                                 GenericResult::ManyCursor(cursors)
                             }
                         }
-                        Expr::Index(idx) if !sorted => {
+                        Expr::Index(idx) | Expr::IndexNumber { idx, .. } if !sorted => {
                             // Negative indices need the length to normalize
                             // against, same as `Expr::Index`'s array arm
                             // above; positive indices skip straight to the
@@ -2552,7 +2552,7 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                                 )
                             }
                         }
-                        Expr::Index(idx) => {
+                        Expr::Index(idx) | Expr::IndexNumber { idx, .. } => {
                             // Same normalization/OOB-is-null semantics as
                             // `LazyKeys`'s `Expr::Index` arm above.
                             let target = if *idx < 0 {

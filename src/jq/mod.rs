@@ -95,7 +95,7 @@ pub use eval::{
 pub use eval::{pop_remaining_input, seed_remaining_inputs};
 pub use expr::{
     ArithOp, AssignOp, Builtin, CompareOp, Expr, FormatType, Import, Include, Literal, MetaValue,
-    ModuleMeta, ObjectEntry, ObjectKey, Pattern, PatternEntry, Program, StringPart,
+    ModuleMeta, NumberKey, ObjectEntry, ObjectKey, Pattern, PatternEntry, Program, StringPart,
 };
 pub use lazy::JqValue;
 pub use parser::{

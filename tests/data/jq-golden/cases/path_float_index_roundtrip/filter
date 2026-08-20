@@ -1,0 +1,1 @@
+[setpath(path(.[2.5]); 99), getpath(path(.[2.0])), delpaths([path(.[-1.0])])]

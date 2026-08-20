@@ -14093,3 +14093,100 @@ fn test_jq_inputs_and_input_line_number_inside_user_defined_function_723() -> Re
     assert_eq!(stdout, "1\n2\n3\n1\n");
     Ok(())
 }
+
+/// #1088: `path()` reports a numeric component as the key *was*, not as the
+/// index it resolves to.
+///
+/// jq appends the resolved key verbatim, so a key still carrying a float
+/// spelling keeps it — succinctly used to route every numeric key through
+/// `numeric_key_to_index` and emit a bare integer. Every expectation here is
+/// pinned jq 1.7.1's own output.
+///
+/// The `path(.[-1.0])` → `[-1]` case is not an index-specific asymmetry, and
+/// is here to keep anyone from "fixing" it into `[-1.0]`: jq's unary minus
+/// destroys number-literal preservation (`jq -n '-1.0'` is already `-1`), so
+/// the negated key is a plain double before indexing happens at all. The
+/// `from-data` case is the control that proves it — a negative float that
+/// never passes through unary minus *does* keep its spelling.
+#[test]
+fn test_1088_path_reports_float_index_as_written() {
+    let arr = Some("[1,2,3,4,5]");
+    for (query, expected) in [
+        // Literal keys keep their own spelling.
+        ("path(.[2.0])", "[2.0]\n"),
+        ("path(.[2.00])", "[2.00]\n"),
+        ("path(.[1.7])", "[1.7]\n"),
+        ("path(.[0.0])", "[0.0]\n"),
+        ("path(.[1e10])", "[1E+10]\n"),
+        // An integer-spelled key is unchanged — nothing to preserve.
+        ("path(.[2])", "[2]\n"),
+        ("path(.[-1])", "[-1]\n"),
+        // Negated literals: jq's own unary minus already collapsed them.
+        ("path(.[-1.0])", "[-1]\n"),
+        ("path(.[-2.5])", "[-2.5]\n"),
+        ("path(.[-1e10])", "[-10000000000]\n"),
+        ("path(.[-0.0])", "[-0]\n"),
+        // A dynamic key resolves through `key_to_path_component`, not the
+        // parser's constant fold — both had to be fixed.
+        ("(2.0) as $x | path(.[$x])", "[2.0]\n"),
+        ("(-2.5) as $x | path(.[$x])", "[-2.5]\n"),
+        // Arithmetic produces a *new* number, which drops the spelling in
+        // succinctly and jq alike.
+        ("(1.0+1.0) as $x | path(.[$x])", "[2]\n"),
+        // Beyond `i64`, where the old code saturated the component to
+        // `i64::MAX` and reported a value that was never written.
+        ("path(.[9223372036854775808])", "[9223372036854775808]\n"),
+        ("path(.[infinite])", "[1.7976931348623157e+308]\n"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", query], arr)
+            .unwrap_or_else(|e| panic!("`{query}` failed to run: {e}"));
+        assert_eq!(code, 0, "`{query}`\nstdout: {stdout}\nstderr: {stderr}");
+        assert_eq!(stdout, expected, "`{query}`\nstderr: {stderr}");
+    }
+
+    // The control for the negation rule above: from data, no unary minus is
+    // involved, and jq keeps every spelling — including the negative ones.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "[.i[] as $x | path(.a[$x])]"],
+        Some(r#"{"i":[2.0,2.50,-1.0,-1.00,-1e10],"a":[1,2,3,4,5]}"#),
+    )
+    .expect("from-data repro runs");
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(
+        stdout,
+        "[[\"a\",2.0],[\"a\",2.50],[\"a\",-1.0],[\"a\",-1.00],[\"a\",-1E+10]]\n",
+        "stderr: {stderr}"
+    );
+
+    // Reading, writing and deleting through a float key are all unchanged —
+    // only the *reported* component moved. A component fed back into
+    // `setpath`/`getpath`/`delpaths` still lands on the truncated index.
+    for (query, expected) in [
+        (".[2.5]", "3\n"),
+        (".[-1.5]", "5\n"),
+        (".[2.5] = 99", "[1,2,99,4,5]\n"),
+        (".[1.5] |= .+100", "[1,102,3,4,5]\n"),
+        ("del(.[1.5])", "[1,3,4,5]\n"),
+        ("setpath(path(.[2.5]); 99)", "[1,2,99,4,5]\n"),
+        ("getpath(path(.[2.0]))", "3\n"),
+        ("delpaths([path(.[-1.0])])", "[1,2,3,4]\n"),
+        // Slices are deliberately untouched by #1088 and must not drift.
+        ("path(.[1:3])", "[{\"start\":1,\"end\":3}]\n"),
+        (".[1.5:3.5]", "[2,3,4]\n"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", query], arr)
+            .unwrap_or_else(|e| panic!("`{query}` failed to run: {e}"));
+        assert_eq!(code, 0, "`{query}`\nstdout: {stdout}\nstderr: {stderr}");
+        assert_eq!(stdout, expected, "`{query}`\nstderr: {stderr}");
+    }
+
+    // The float component also reaches the `Invalid path expression` message,
+    // which names the element that failed to navigate.
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", "path(reverse | .[1.5])"], arr).expect("untracked repro runs");
+    assert_eq!(code, 5, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        stderr.contains("near attempt to access element 1.5 of"),
+        "{stderr}"
+    );
+}

@@ -35,7 +35,8 @@ use std::collections::BTreeMap;
 
 use super::expr::{
     ArithOp, AssignOp, Builtin, CompareOp, Expr, FormatType, Import, Include, Literal, MergeFlags,
-    MetaValue, ModuleMeta, ObjectEntry, ObjectKey, Pattern, PatternEntry, Program, StringPart,
+    MetaValue, ModuleMeta, NumberKey, ObjectEntry, ObjectKey, Pattern, PatternEntry, Program,
+    StringPart,
 };
 use super::value::{parse_i64_or_f64, NumberRepr};
 
@@ -816,23 +817,42 @@ impl<'a> Parser<'a> {
             // to `i64::MAX` -- one past what was actually written (#1061).
             // `i64::MIN as f64` has no such rounding (`-2^63` is an exact
             // power of two), so the lower bound stays `>=`.
+            //
+            // #1088: the *set* of keys that fold here is unchanged -- only
+            // the variant is. A float-spelled key folds to
+            // [`Expr::IndexNumber`] rather than [`Expr::Index`] so that
+            // `path(.[2.0])` can report `[2.0]` the way jq does; `idx` is
+            // the identical `i64`, so nothing about navigation moves.
+            // `Literal::Float` is the synthesized-literal spelling (no
+            // source text to preserve), hence `NumberKey::Float`.
             Expr::Literal(Literal::Float(f))
                 if f.fract() == 0.0 && *f >= i64::MIN as f64 && *f < i64::MAX as f64 =>
             {
-                Some(Expr::Index(*f as i64))
+                Some(Expr::IndexNumber {
+                    idx: *f as i64,
+                    key: NumberKey::Float(*f),
+                })
             }
             // #1035: a source-text-preserving numeric literal folds the same
-            // way -- an index's fast-path only needs the value, not its
-            // original spelling (there's no "index formatting" to preserve).
-            // #1062: the literal's `NumberRepr` is already parsed and
+            // way. #1062: the literal's `NumberRepr` is already parsed and
             // carried on the node itself, so this reads it directly instead
             // of re-running `parse_i64_or_f64` on the source text.
-            Expr::Literal(Literal::NumberLiteral(repr, _)) => match *repr {
+            //
+            // #1088: an `Int` repr still folds to a plain [`Expr::Index`] --
+            // its own source text renders identically to the `i64`, so
+            // there is nothing for [`Expr::IndexNumber`] to preserve. A
+            // `Float` repr carries its spelling through instead, because
+            // jq echoes it back verbatim: `path(.[2.00])` is `[2.00]` and
+            // `path(.[1e10])` is `[1E+10]`.
+            Expr::Literal(Literal::NumberLiteral(repr, text)) => match *repr {
                 NumberRepr::Int(i) => Some(Expr::Index(i)),
                 NumberRepr::Float(f)
                     if f.fract() == 0.0 && f >= i64::MIN as f64 && f < i64::MAX as f64 =>
                 {
-                    Some(Expr::Index(f as i64))
+                    Some(Expr::IndexNumber {
+                        idx: f as i64,
+                        key: NumberKey::Literal(*repr, text.as_str().into()),
+                    })
                 }
                 NumberRepr::Float(_) => None,
             },
@@ -864,6 +884,21 @@ impl<'a> Parser<'a> {
             } if matches!(**left, Expr::Literal(Literal::Int(-1))) => {
                 match Self::fold_index_key(right)? {
                     Expr::Index(i) => i.checked_neg().map(Expr::Index),
+                    // #1088: negation is exactly the operation that destroys
+                    // jq's number-literal preservation, so the negated key
+                    // drops to a bare `f64` -- which is *why* `path(.[-1.0])`
+                    // is `[-1]` while `path(.[1.0])` is `[1.0]`. Nothing
+                    // index-specific is happening; `jq -n '-1.0'` already
+                    // prints `-1`. See [`NumberKey`]'s own doc comment.
+                    //
+                    // Negating the truncated `idx` and truncating the negated
+                    // value agree, because the truncation is toward zero.
+                    Expr::IndexNumber { idx, key } => {
+                        idx.checked_neg().map(|idx| Expr::IndexNumber {
+                            idx,
+                            key: NumberKey::Float(-key.value()),
+                        })
+                    }
                     _ => None,
                 }
             }
@@ -872,9 +907,17 @@ impl<'a> Parser<'a> {
     }
 
     /// Fold a slice bound to an integer literal, seeing through parens.
+    ///
+    /// [`Expr::IndexNumber`] counts (#1088): a slice bound has no spelling
+    /// to preserve -- `path(.[1.0:3.0])` still reports `{"start":1,"end":3}`
+    /// here -- so it contributes the same `i64` a plain [`Expr::Index`]
+    /// would, keeping every slice exactly as it was. That `path()` diverges
+    /// from jq for a *float* slice bound is a separate, pre-existing gap
+    /// with its own issue; folding both variants identically here is what
+    /// keeps this change from touching slices at all.
     fn fold_int_literal(key: &Expr) -> Option<i64> {
         match Self::fold_index_key(key) {
-            Some(Expr::Index(i)) => Some(i),
+            Some(Expr::Index(i) | Expr::IndexNumber { idx: i, .. }) => Some(i),
             _ => None,
         }
     }
@@ -5710,11 +5753,32 @@ mod tests {
     /// A constant key must still fold to the static chain element it always
     /// produced, so the hot `.foo.bar[0]` path and every `Field`/`Index` match
     /// site are untouched by #360.
+    ///
+    /// #1088 changed which *variant* a float-spelled key folds to, never
+    /// whether it folds: `.[1.0]` is still a static component, now carrying
+    /// the spelling `path()` has to report. An integer-spelled key is
+    /// untouched -- there is nothing for `IndexNumber` to preserve, and
+    /// `.[0]` staying `Expr::Index(0)` is what keeps the hot path hot.
     #[test]
     fn test_index_key_constant_folding() {
         assert_eq!(parse(".[0]").unwrap(), Expr::Index(0));
         assert_eq!(parse(".[-1]").unwrap(), Expr::Index(-1));
-        assert_eq!(parse(".[1.0]").unwrap(), Expr::Index(1));
+        assert_eq!(
+            parse(".[1.0]").unwrap(),
+            Expr::IndexNumber {
+                idx: 1,
+                key: NumberKey::Literal(NumberRepr::Float(1.0), "1.0".into()),
+            }
+        );
+        // `1e0` is the same value spelled differently, and jq echoes the
+        // spelling, so the two must not collapse onto one component.
+        assert_eq!(
+            parse(".[1e0]").unwrap(),
+            Expr::IndexNumber {
+                idx: 1,
+                key: NumberKey::Literal(NumberRepr::Float(1.0), "1e0".into()),
+            }
+        );
         assert_eq!(parse(".[\"a\"]").unwrap(), Expr::Field("a".into()));
         // Parenthesised constants fold too — `.[("a")]` is `.a`.
         assert_eq!(parse(".[(\"a\")]").unwrap(), Expr::Field("a".into()));
@@ -5792,8 +5856,23 @@ mod tests {
     /// unless taught this specific `Arithmetic` shape too.
     #[test]
     fn test_1035_negative_float_index_and_slice_bound_still_fold_to_static() {
-        assert_eq!(parse(".[-1.0]").unwrap(), Expr::Index(-1));
-        assert_eq!(parse(".[-1e0]").unwrap(), Expr::Index(-1));
+        // #1088: negation is what destroys jq's literal preservation, so a
+        // negated key folds to a bare `NumberKey::Float` -- which is exactly
+        // why `path(.[-1.0])` is `[-1]` while `path(.[1.0])` is `[1.0]`.
+        assert_eq!(
+            parse(".[-1.0]").unwrap(),
+            Expr::IndexNumber {
+                idx: -1,
+                key: NumberKey::Float(-1.0),
+            }
+        );
+        assert_eq!(
+            parse(".[-1e0]").unwrap(),
+            Expr::IndexNumber {
+                idx: -1,
+                key: NumberKey::Float(-1.0),
+            }
+        );
         assert_eq!(
             parse(".[-3.0:-1.0]").unwrap(),
             Expr::Slice {
@@ -5835,14 +5914,28 @@ mod tests {
             Expr::IndexExpr { .. }
         ));
 
-        // A value strictly below the boundary still takes the fast path.
+        // A value strictly below the boundary still takes the fast path
+        // (as `Expr::IndexNumber` since #1088 -- same `idx`, plus the
+        // spelling `path()` reports).
         assert_eq!(
             parse(".[9223372036854774784.0]").unwrap(),
-            Expr::Index(9223372036854774784)
+            Expr::IndexNumber {
+                idx: 9223372036854774784,
+                key: NumberKey::Literal(
+                    NumberRepr::Float(9223372036854774784.0),
+                    "9223372036854774784.0".into()
+                ),
+            }
         );
         assert_eq!(
             parse(".[9223372036854774784e0]").unwrap(),
-            Expr::Index(9223372036854774784)
+            Expr::IndexNumber {
+                idx: 9223372036854774784,
+                key: NumberKey::Literal(
+                    NumberRepr::Float(9223372036854774784.0),
+                    "9223372036854774784e0".into()
+                ),
+            }
         );
     }
 
@@ -5887,7 +5980,10 @@ mod tests {
         // etc.), so this only needs the one large-but-safe magnitude.
         assert_eq!(
             parse(".[-9223372036854774784.0]").unwrap(),
-            Expr::Index(-9223372036854774784)
+            Expr::IndexNumber {
+                idx: -9223372036854774784,
+                key: NumberKey::Float(-9223372036854774784.0),
+            }
         );
     }
 
