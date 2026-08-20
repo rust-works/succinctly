@@ -20274,6 +20274,57 @@ fn delete_expr_iterate_paths(
     }
 }
 
+/// Recursively rewrite every already-static branch of `expr` with
+/// [`yq_del_scalar_slice_parent_path`]'s chained-slice-parent-key rule
+/// (#1223), unwrapping and rewrapping any `Expr::Paren`/`Expr::Optional`
+/// around a `Comma` (or a nested `Comma` branch, however wrapped) so the
+/// rewrite reaches every syntactic route to the same comma-grouped shape --
+/// not just a bare top-level `Comma`. Recursing into a branch first (rather
+/// than checking `needs_path_prepass` on it directly) is what lets a nested
+/// comma group (`del((.a[0:1], .z), .c)`) get the same treatment as a
+/// top-level one.
+///
+/// Returns `None` when `expr` isn't (after unwrapping) a `Comma` at all --
+/// including a bare single static path with no comma anywhere, which
+/// already goes through [`builtin_del`]'s own `paths.len() <= 1` rewrite
+/// instead and has no need of this one.
+///
+/// Deliberately narrower than the full space of shapes that can still reach
+/// `resolve_dynamic_indexes`'s crash (a bare-slice sibling, a branch behind
+/// an `Iterate`, or a branch that itself needs a computed-key prepass) --
+/// each of those is either a separate, deeper gap in `navigate_read_only`'s
+/// own step support, or (for a bare-slice sibling) a shape where real yq's
+/// own answer is itself inconsistent/order-sensitive with no coherent rule
+/// to replicate, the same territory `builtin_del`'s own known-gap test
+/// already documents. See #1223's follow-up discussion.
+fn rewrite_yq_del_comma_branches(expr: &Expr, root: &OwnedValue) -> Option<Expr> {
+    match expr {
+        Expr::Paren(inner) => {
+            rewrite_yq_del_comma_branches(inner, root).map(|r| Expr::Paren(Box::new(r)))
+        }
+        Expr::Optional(inner) => {
+            rewrite_yq_del_comma_branches(inner, root).map(|r| Expr::Optional(Box::new(r)))
+        }
+        Expr::Comma(branches) => {
+            let new_branches: Vec<Expr> = branches
+                .iter()
+                .map(|branch| {
+                    if let Some(nested) = rewrite_yq_del_comma_branches(branch, root) {
+                        nested
+                    } else if !needs_path_prepass(branch) {
+                        yq_del_scalar_slice_parent_path(branch, root)
+                            .unwrap_or_else(|| branch.clone())
+                    } else {
+                        branch.clone()
+                    }
+                })
+                .collect();
+            Some(Expr::Comma(new_branches))
+        }
+        _ => None,
+    }
+}
+
 /// Builtin: del(path) - delete a single path
 fn builtin_del<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     path_expr: &Expr,
@@ -20301,27 +20352,19 @@ fn builtin_del<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // `Object` -- *before* `builtin_del` ever gets a resolved `paths` vector
     // to apply the `yq_del_scalar_slice_parent_path` rewrite below (that
     // rewrite runs on the navigation's *output*, too late to prevent the
-    // navigation's own crash). Apply the same rewrite to every branch that
-    // is already fully static (`!needs_path_prepass`) up front, so
-    // `.a[0:1]` becomes `.a` before navigation ever sees it. A branch that
-    // itself needs a prepass (a computed key) is left untouched -- it goes
-    // through the normal walk below, and the existing per-path rewrite
+    // navigation's own crash). `rewrite_yq_del_comma_branches` applies the
+    // same rewrite to every already-static branch up front, so `.a[0:1]`
+    // becomes `.a` before navigation ever sees it -- including through any
+    // `Expr::Paren`/`Expr::Optional` wrapping and any nested `Comma` branch
+    // (`del((.a[0:1], .c))`, `del((.a[0:1], .c)?)`, `del((.a[0:1], .z), .c)`
+    // all reach the same rewrite a bare `del(.a[0:1], .c)` does). A branch
+    // that itself needs a prepass (a computed key) is left untouched -- it
+    // goes through the normal walk below, and the existing per-path rewrite
     // still applies to its resolved output.
     let rewritten_comma_path_expr: Expr;
     let path_expr: &Expr = if S::TAG == EvalTag::Yq {
-        if let Expr::Comma(branches) = path_expr {
-            let new_branches: Vec<Expr> = branches
-                .iter()
-                .map(|branch| {
-                    if !needs_path_prepass(branch) {
-                        yq_del_scalar_slice_parent_path(branch, &result)
-                            .unwrap_or_else(|| branch.clone())
-                    } else {
-                        branch.clone()
-                    }
-                })
-                .collect();
-            rewritten_comma_path_expr = Expr::Comma(new_branches);
+        if let Some(rewritten) = rewrite_yq_del_comma_branches(path_expr, &result) {
+            rewritten_comma_path_expr = rewritten;
             &rewritten_comma_path_expr
         } else {
             path_expr
