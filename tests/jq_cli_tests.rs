@@ -13376,3 +13376,66 @@ fn test_flatten_depth_non_number_argument_errors_1045() -> Result<()> {
     let _ = out;
     Ok(())
 }
+
+/// Pins the seven **non-`Pipe`** path-expression shapes that already match jq
+/// 1.7.1 today, so that #986/#989's deferred-trackability rework cannot break
+/// them without a test failing first.
+///
+/// These exist because of a specific, concretely-identified hazard found while
+/// reviewing that rework's design doc
+/// (`docs/plan/jq-path-trackability-deferral.md`, "Where the terminal check
+/// belongs"). An earlier draft placed the deferred trackability check inside
+/// `resolve_seq`. Every shape below is non-`Pipe`, so `resolve_seq` never runs
+/// for any of them — the check would simply never fire, the `trackable: false`
+/// branch would flow into `resolve_dynamic_indexes`' `assemble()`, and that
+/// helper maps a zero-component branch to `Expr::Identity`. `path(1)` would
+/// silently become `[]`, and **`del(1)` would become `del(.)` -> `null`,
+/// destroying the whole document with no error at all** — the same write-path
+/// corruption class that got PR #985 reverted on #972.
+///
+/// The design's own verification sweep could not have caught this: it
+/// generated only `E1 | E2` and `(E1, E2) | E3` shapes, so every case it
+/// produced had a pipe in it and a bare `del(1)` never appeared. Hence pinning
+/// the non-pipe set explicitly, ahead of the implementation rather than after.
+///
+/// All seven were captured live against pinned jq 1.7.1: each writes nothing
+/// to stdout, exits 5, and reports `Invalid path expression with result <v>`
+/// naming the offending value.
+#[test]
+fn test_non_pipe_path_expressions_still_raise_986() -> Result<()> {
+    // (query, the value jq names in "with result <v>")
+    let cases = [
+        ("path(1)", "1"),
+        (r#"path("x")"#, r#""x""#),
+        ("path([1])", "[1]"),
+        // Folds to `2` before the resolver sees it -- jq names the folded
+        // value, not the source text.
+        ("path(1+1)", "2"),
+        ("del(1)", "1"),
+        // Multi-output: jq names the *first* output, `0`, not the last.
+        ("del(range(2))", "0"),
+        ("(1) = 9", "1"),
+    ];
+
+    for (query, named_value) in cases {
+        let (stdout, stderr, code) = run_jq_full(&["-c", query], Some(r#"{"a":1}"#))?;
+        assert_eq!(
+            code, 5,
+            "`{query}` should exit 5, got {code}\nstdout: {stdout}\nstderr: {stderr}"
+        );
+        assert!(
+            stdout.is_empty(),
+            "`{query}` should write nothing to stdout, got: {stdout}"
+        );
+        // The whole point: it must still *raise*, naming the offending value.
+        // A regression here shows up as an empty stdout with exit 0 (for
+        // `path`), or as a silently rewritten document (for `del`/`=`).
+        assert!(
+            stderr.contains(&format!(
+                "Invalid path expression with result {named_value}"
+            )),
+            "`{query}` should name `{named_value}`, got: {stderr}"
+        );
+    }
+    Ok(())
+}
