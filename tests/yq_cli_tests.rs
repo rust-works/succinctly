@@ -15463,6 +15463,39 @@ fn test_1220_delpaths_reports_first_offending_component() -> Result<()> {
     )?;
     assert_ne!(code, 0);
     assert!(stderr.contains("found !!bool instead"), "stderr: {stderr}");
+
+    // `compare_values` ranks Bool below Number, so `[[true],[1.5]]` above
+    // can't distinguish "first in argument order" from "first in
+    // compare_values sort order" -- both rules pick the bool. Swap the
+    // order so the two rules disagree: if sort order won, this would still
+    // report !!bool; real yq (and this check, which runs before any
+    // sorting) reports the argument-order-first component, !!float.
+    let (_out, stderr, code) =
+        run_yq_stdin_with_stderr("delpaths([[1.5],[true]])", "[1,2,3]", &["-o=json"])?;
+    assert_ne!(code, 0);
+    assert!(stderr.contains("found !!float instead"), "stderr: {stderr}");
+    Ok(())
+}
+
+/// #1220 code-review fix: a NaN component only suppresses the type check
+/// for *itself* (preserving the pre-existing "NaN path silently drops"
+/// behavior, unrelated to #1220's own scope), not for other, genuinely
+/// bad-typed components sharing the same path. Unreachable via real yq
+/// (its lexer rejects a bare `nan` token outright), so this pins
+/// succinctly's own internal consistency rather than an oracle behavior.
+#[test]
+fn test_1220_delpaths_nan_does_not_suppress_sibling_type_check() -> Result<()> {
+    // A NaN alongside a bad-typed sibling still reports the sibling.
+    let (_out, stderr, code) =
+        run_yq_stdin_with_stderr("delpaths([[nan,true]])", "[1,2,3]", &["-o=json"])?;
+    assert_ne!(code, 0, "stderr: {stderr}");
+    assert!(stderr.contains("found !!bool instead"), "stderr: {stderr}");
+
+    // A NaN alone still silently drops rather than erroring (NaN itself is
+    // never reported as the offending type, matching pre-#1220 behavior).
+    let (out, code) = run_yq_stdin("delpaths([[nan]])", "[1,2,3]", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "[1,2,3]");
     Ok(())
 }
 

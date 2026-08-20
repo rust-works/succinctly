@@ -23659,31 +23659,49 @@ fn builtin_delpaths<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // (`1.0`) is rejected too -- real yq's check is on the YAML type, not
     // the numeric value, confirmed live. Folded into this same `retain`
     // pass rather than a separate loop before it: both checks need to
-    // visit every path's every component before any deletion runs. Gated
-    // on `keeps` (the same per-path NaN survival this `retain` already
-    // computes), not checked unconditionally, so a path that's *also*
-    // NaN-headed doesn't surface the type error for a path already headed
-    // for silent removal. `rejected_component_tag` keeps only the first
-    // offender found (path order, then component order within a path) --
-    // confirmed live that real yq reports whichever type-mismatched
-    // component it reaches first when several paths/components each
-    // qualify.
+    // visit every path's every component before any deletion runs.
+    //
+    // No exemption for a `path()`-sourced float index (#1220 issue thread):
+    // yq-mode `path()` is itself a succinctly extension with no upstream
+    // behavior (real yq has no `path`/`getpath`/`setpath` at all), so a
+    // float index it emits isn't oracle-constrained either way. This check
+    // stays strict rather than special-casing that producer, because its
+    // own job -- matching real yq's `delpaths()` -- is oracle-backed and
+    // takes priority; a `path()` round-trip through `delpaths()` was never
+    // a real-yq guarantee to preserve.
+    //
+    // Deliberately run *unconditionally*, not gated on `keeps` (the NaN
+    // survival this `retain` also computes): a NaN-headed path can still
+    // carry a genuinely bad-typed component alongside its NaN (e.g.
+    // `delpaths([[nan, true]])`), and that component must still be caught
+    // even though the NaN itself heads the path for silent removal. The
+    // `find` predicate below explicitly exempts a NaN `Float` from being
+    // *itself* reported as the offender -- `delpaths([[nan]])` alone still
+    // silently drops rather than erroring, preserving the NaN-drop behavior
+    // above unchanged. (Gating this on `keeps` would let a co-located
+    // non-NaN bad component through unnoticed whenever any NaN shared its
+    // path -- confirmed live before this exemption was added.)
+    // `rejected_component_tag` keeps only the first offender found (path
+    // order, then component order within a path) -- confirmed live that
+    // real yq reports whichever type-mismatched component it reaches first
+    // when several paths/components each qualify.
     let mut rejected_component_tag: Option<&'static str> = None;
     paths.retain(|path| match path {
         OwnedValue::Array(components) => {
             let keeps = !components
                 .iter()
                 .any(|key| matches!(key, OwnedValue::Float(f) if f.is_nan()));
-            if keeps && S::TAG == EvalTag::Yq && rejected_component_tag.is_none() {
+            if S::TAG == EvalTag::Yq && rejected_component_tag.is_none() {
                 rejected_component_tag = components
                     .iter()
                     .find(|component| {
-                        !matches!(
-                            component,
-                            OwnedValue::String(_)
-                                | OwnedValue::Int(_)
-                                | OwnedValue::NumberLiteral(NumberRepr::Int(_), _)
-                        )
+                        !matches!(component, OwnedValue::Float(f) if f.is_nan())
+                            && !matches!(
+                                component,
+                                OwnedValue::String(_)
+                                    | OwnedValue::Int(_)
+                                    | OwnedValue::NumberLiteral(NumberRepr::Int(_), _)
+                            )
                     })
                     .map(delpaths_component_type_tag);
             }
@@ -45864,5 +45882,34 @@ mod tests {
             result.is_err(),
             "collect_leaf_paths should panic at MAX_VALUE_TREE_DEPTH (Object arm)"
         );
+    }
+
+    /// #1220 code review: `delpaths_component_type_tag` (`OwnedValue` ->
+    /// tag) and `yaml_type_tag` (`StandardJson` -> tag, backs the `tag`
+    /// builtin and `join`'s yq-mode error) independently implement the same
+    /// seven-category YAML tag mapping ~1400 lines apart, with nothing
+    /// enforcing they agree -- the exact "duplicated predicates diverge
+    /// silently" shape this codebase's own optimization notes warn about
+    /// (issue #106). Pins them to the same answer for one representative
+    /// value per category so a future edit to either one's tag spelling
+    /// (or int/float boundary) that isn't mirrored in the other fails here
+    /// instead of silently producing inconsistent error wording between
+    /// `tag`/`join` and `delpaths`.
+    #[test]
+    fn test_1220_delpaths_and_tag_type_tags_agree() {
+        macro_rules! assert_tag_agrees {
+            ($json:expr, $owned:expr) => {{
+                let via_tag_builtin =
+                    yq_query!($json, "tag", QueryResult::Owned(OwnedValue::String(s)) => s);
+                assert_eq!(via_tag_builtin, delpaths_component_type_tag(&$owned));
+            }};
+        }
+        assert_tag_agrees!(b"null", OwnedValue::Null);
+        assert_tag_agrees!(b"true", OwnedValue::Bool(true));
+        assert_tag_agrees!(b"1", OwnedValue::Int(1));
+        assert_tag_agrees!(b"1.5", OwnedValue::Float(1.5));
+        assert_tag_agrees!(b"\"a\"", OwnedValue::String("a".to_string()));
+        assert_tag_agrees!(b"[1]", OwnedValue::Array(vec![OwnedValue::Int(1)]));
+        assert_tag_agrees!(b"{}", OwnedValue::Object(IndexMap::new()));
     }
 }
