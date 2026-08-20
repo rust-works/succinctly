@@ -15515,28 +15515,210 @@ fn test_1220_delpaths_jq_mode_unaffected() -> Result<()> {
     Ok(())
 }
 
-/// #1219 characterization: a chained slice with more path *after* it
-/// (`.[1:3][0]`) is a structurally different shape than #1162 covers —
-/// `yq_del_scalar_slice_parent_path` only rewrites when the slice is the
-/// path's *last* component, so this never reaches that rewrite at all, and
-/// falls through to `delete_at_path`'s ordinary `Expr::Slice` walker arm
-/// instead. Real yq no-ops the whole thing here (verified live); succinctly
-/// still descends into the sliced sub-range and deletes within it. Confirmed
-/// unaffected by #1162's diff either way (identical on `main` before this
-/// fix). If this is ever fixed (tracked as #1219), update this expectation.
+/// #1219: a chained slice with more path *after* it (`.a[1:3][0]`) is a
+/// structurally different shape than #1162 covers — `yq_del_scalar_slice_
+/// parent_path` only rewrote when the slice was the path's *last*
+/// component, so this fell through to `delete_at_path`'s ordinary
+/// `Expr::Slice` walker arm and wrongly descended into the sliced
+/// sub-range, deleting an unrelated element. Real yq no-ops the whole
+/// `del()` call here — live-verified against yq v4.53.3, not assumed.
+/// `.a[1:3][0]`: slice then `Index` — one of several trailing-tail shapes
+/// (`Index`/`Field`/`Iterate`/a different `Index`) that all no-op
+/// identically, see the sibling tests below.
 #[test]
-fn test_1219_chained_slice_with_trailing_path_characterize_preexisting_bug() -> Result<()> {
+fn test_1219_chained_slice_then_index_is_noop() -> Result<()> {
     let (out, code) = run_yq_stdin(
         "del(.a[1:3][0])",
         r#"{"a":[1,2,3,4]}"#,
         &["-o=json", "-I=0"],
     )?;
     assert_eq!(code, 0);
-    assert_eq!(
-        out.trim(),
-        r#"{"a":[1,3,4]}"#,
-        "if this now matches real yq's no-op ({{\"a\":[1,2,3,4]}}), update this test and close #1219"
-    );
+    assert_eq!(out.trim(), r#"{"a":[1,2,3,4]}"#);
+    Ok(())
+}
+
+/// #1219: same no-op rule, but the tail after the chained slice is a
+/// `Field`, not an `Index` — confirms the rule doesn't depend on the
+/// specific step type following the slice, only on it not being another
+/// slice.
+#[test]
+fn test_1219_chained_slice_then_field_is_noop() -> Result<()> {
+    let (out, code) = run_yq_stdin(
+        "del(.a[1:3][0].x)",
+        r#"{"a":[1,2,3,4]}"#,
+        &["-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), r#"{"a":[1,2,3,4]}"#);
+    Ok(())
+}
+
+/// #1219: chained slice then `.[]` (`Expr::Iterate`) also no-ops the whole
+/// call, same as the `Index`/`Field` tails above.
+#[test]
+fn test_1219_chained_slice_then_iterate_is_noop() -> Result<()> {
+    let (out, code) = run_yq_stdin("del(.a[1:3][])", r#"{"a":[1,2,3,4]}"#, &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), r#"{"a":[1,2,3,4]}"#);
+    Ok(())
+}
+
+/// #1219: a chained slice immediately followed by *another* slice is the
+/// exception to the no-op rule above — real yq drops the parent key
+/// entirely instead, the same target #1162 already computes for a single
+/// trailing slice (`del(.a[0:2])` also gives `{"b":6}` on this input) —
+/// live-verified that a run of exactly two trailing slices collapses to
+/// the same "drop what's before the run" target, regardless of either
+/// slice's own bounds.
+#[test]
+fn test_1219_chained_slice_then_slice_drops_parent_key() -> Result<()> {
+    let (out, code) = run_yq_stdin(
+        "del(.a[1:3][0:1])",
+        r#"{"a":[1,2,3,4],"b":6}"#,
+        &["-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), r#"{"b":6}"#);
+    Ok(())
+}
+
+/// #1219: three consecutive trailing slices behave identically to two —
+/// the "drop the parent key" rule fires for a trailing run of *any* length
+/// ≥ 2, not just exactly two — live-verified.
+#[test]
+fn test_1219_triple_chained_slice_drops_parent_key() -> Result<()> {
+    let (out, code) = run_yq_stdin(
+        "del(.a[1:3][0:2][0:1])",
+        r#"{"a":[1,2,3,4,5,6],"b":6}"#,
+        &["-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), r#"{"b":6}"#);
+    Ok(())
+}
+
+/// #1219: a *third* trailing component after a two-slice run flips the
+/// result back to a no-op — the "drop parent" rule only fires when the
+/// slice-run is the path's true tail, not merely "contains two adjacent
+/// slices somewhere." This is what falsifies the simpler "any adjacent
+/// slice pair drops the parent" hypothesis and pins the real rule to a
+/// maximal *trailing* run specifically — live-verified.
+#[test]
+fn test_1219_chained_slice_slice_then_index_is_noop() -> Result<()> {
+    let (out, code) = run_yq_stdin(
+        "del(.a[1:3][0:2][0])",
+        r#"{"a":[1,2,3,4],"b":6}"#,
+        &["-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), r#"{"a":[1,2,3,4],"b":6}"#);
+    Ok(())
+}
+
+/// #1219: an `Index` prefix before the chained slice run drops the
+/// *indexed element* wholesale, not just the parent field — the same
+/// target `Expr::Index`-prefixed chains already resolved to before this
+/// fix (an `Index`, unlike a bare `Field`-only prefix, is itself
+/// unaffected by #1219; this pins that a *run* of trailing slices behaves
+/// the same as a single one for this prefix shape too).
+#[test]
+fn test_1219_index_prefix_chained_slice_run_drops_element() -> Result<()> {
+    let (out, code) = run_yq_stdin(
+        "del(.a[0][1:3][0:1])",
+        r#"{"a":[[10,20,30,40,50],[1,2,3,4,5,6]],"b":6}"#,
+        &["-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), r#"{"a":[[1,2,3,4,5,6]],"b":6}"#);
+    Ok(())
+}
+
+/// #1219: a slice that is *not* part of the trailing run (an interior
+/// slice, with a non-slice step between it and the trailing slice) still
+/// no-ops the whole call, even though the path's *last* component is
+/// itself a slice — `yq_del_scalar_slice_parent_path`'s residual prefix
+/// (`.a[0:2][1]`) still contains a slice, so the rewrite correctly
+/// declines and `yq_del_chained_slice_is_noop` catches it instead.
+/// Live-verified this is a no-op, not a partial delete or a parent-key
+/// drop.
+#[test]
+fn test_1219_interior_slice_before_trailing_slice_is_noop() -> Result<()> {
+    let (out, code) = run_yq_stdin(
+        "del(.a[0:2][1][3:5])",
+        r#"{"a":[[10,20,30],[1,2,3,4,5,6]],"b":6}"#,
+        &["-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), r#"{"a":[[10,20,30],[1,2,3,4,5,6]],"b":6}"#);
+    Ok(())
+}
+
+/// #1219: a bare chained slice-run with *no* leading `Field`/`Index` at
+/// all (`del(.[1:3][0:1])` on the root value itself) is a no-op, not
+/// "delete the root" — unlike #1101's already-established single-slice
+/// bare-root no-op, this shape (`Pipe` of two-or-more slices) wasn't
+/// covered by `is_yq_scalar_slice_assign_path`'s single-`Expr::Slice`
+/// check, so it fell through to `yq_del_scalar_slice_parent_path`'s
+/// generalized trailing-run stripping — which must decline (empty prefix,
+/// `empty_prefix_is_identity: false` at this top-level call site) rather
+/// than answering `Expr::Identity`, or this would wrongly null/replace the
+/// root. Live-verified against yq v4.53.3.
+#[test]
+fn test_1219_bare_root_chained_slice_run_is_noop() -> Result<()> {
+    let (out, code) = run_yq_stdin("del(.[1:3][0:1])", "[1,2,3,4]", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "[1,2,3,4]");
+    Ok(())
+}
+
+/// #1219: the `Expr::Iterate` per-element path (`.a[][1:3][0:1]`) hits the
+/// *opposite* empty-prefix reading from the bare-root case above — here an
+/// empty residual prefix legitimately means "drop this element entirely"
+/// (`empty_prefix_is_identity: true`), the same #1182 rule already applies
+/// for a single trailing slice, now confirmed to generalize to a run of
+/// two. Live-verified both elements are removed, matching the identical
+/// single-slice control case.
+#[test]
+fn test_1219_iterate_chained_slice_run_drops_each_element() -> Result<()> {
+    let (out, code) = run_yq_stdin(
+        "del(.a[][1:3][0:1])",
+        r#"{"a":[[1,2,3,4],[10,20,30,40]],"b":6}"#,
+        &["-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), r#"{"a":[],"b":6}"#);
+    Ok(())
+}
+
+/// #1219: the `Expr::Iterate` per-element path also picks up the plain
+/// no-op half of the rule — `.a[][1:3][0]` (slice then `Index`, no
+/// trailing slice) leaves every element completely untouched, matching
+/// the top-level no-op tests above but exercised through the separate
+/// per-element walker in `delete_at_path`'s own `Expr::Iterate` arm.
+#[test]
+fn test_1219_iterate_chained_slice_then_index_is_noop_per_element() -> Result<()> {
+    let (out, code) = run_yq_stdin(
+        "del(.a[][1:3][0])",
+        r#"{"a":[[1,2,3,4],[10,20,30,40]],"b":6}"#,
+        &["-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), r#"{"a":[[1,2,3,4],[10,20,30,40]],"b":6}"#);
+    Ok(())
+}
+
+/// #1219 jq-mode control: jq has no #1116/#1162/#1219 "chained slice"
+/// rule at all — `del(.a[1:3][0])` is an ordinary path delete there,
+/// removing the element at the sliced sub-range's index 0
+/// (`[2,3][0]` == `2`), confirmed against real jq 1.7.1. This pins that
+/// #1219's fix is entirely yq-mode-gated and doesn't touch jq's own
+/// `delete_at_path` walk.
+#[test]
+fn test_1219_jq_mode_unaffected() -> Result<()> {
+    let (out, _stderr, code) =
+        run_jq_stdin_with_stderr("del(.a[1:3][0])", r#"{"a":[1,2,3,4]}"#, &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), r#"{"a":[1,3,4]}"#);
     Ok(())
 }
 
