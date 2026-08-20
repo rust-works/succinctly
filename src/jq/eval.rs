@@ -2518,11 +2518,21 @@ fn arith_mod<S: EvalSemantics>(
     match (left.number_repr(), right.number_repr()) {
         (Some(NumberRepr::Int(a)), Some(NumberRepr::Int(b))) => {
             if b == 0 {
-                if S::DIV_BY_ZERO_IS_INFINITY {
-                    // yq behavior: return NaN (will be serialized as null)
-                    Ok(OwnedValue::Float(f64::NAN))
+                // Integer modulo by zero errors in both jq and yq --
+                // unlike division, yq's Infinity-on-zero-divisor rule
+                // (`DIV_BY_ZERO_IS_INFINITY`) does not extend to this
+                // case (#1231, confirmed live against yq v4.53.3: `5 %
+                // 0` errors "cannot modulo by 0", where `5 / 0` succeeds
+                // as `+Inf`). Only a *float*-involving modulo by zero
+                // returns NaN in yq (`mod_floats` below, gated by
+                // `MOD_TRUNCATES_FLOATS`) -- so this arm is unconditional
+                // on `S::DIV_BY_ZERO_IS_INFINITY`, unlike every other
+                // zero-divisor check in this file. yq's own wording is a
+                // fixed, terser sentence with no embedded operand values,
+                // unlike jq's `divisor_is_zero`.
+                if S::TAG == EvalTag::Yq {
+                    Err(EvalError::yq_modulo_by_zero())
                 } else {
-                    // jq behavior: error
                     Err(EvalError::divisor_is_zero(&left, &right, BinOp::Modulo))
                 }
             } else {
@@ -27948,6 +27958,45 @@ mod tests {
         // jq: infinite saturates to i64::MAX, so infinite % 3 == 1
         query!(b"null", "infinite % 3",
             QueryResult::Owned(OwnedValue::Int(1)) => {}
+        );
+    }
+
+    #[test]
+    fn test_yq_modulo_by_zero_errors_but_division_does_not_1231() {
+        // #1231: real yq's DIV_BY_ZERO_IS_INFINITY rule (5 / 0 -> +Inf)
+        // does not extend to an *integer* modulo -- 5 % 0 errors there,
+        // unlike jq's own `divisor_is_zero` wording, yq's own message has
+        // no embedded operand values. Confirmed live against yq v4.53.3.
+        yq_query!(b"null", "5 % 0",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "cannot modulo by 0");
+            }
+        );
+        // Division by zero is unaffected -- still succeeds as Infinity.
+        yq_query!(b"null", "5 / 0",
+            QueryResult::Owned(OwnedValue::Float(f)) if f.is_infinite() && f > 0.0 => {}
+        );
+        // A *float*-involving modulo by zero is also unaffected -- yq
+        // performs real float modulo and returns NaN, not an error, for
+        // any of the three float/int-zero combinations.
+        yq_query!(b"null", "5.5 % 0",
+            QueryResult::Owned(OwnedValue::Float(f)) if f.is_nan() => {}
+        );
+        yq_query!(b"null", "5 % 0.0",
+            QueryResult::Owned(OwnedValue::Float(f)) if f.is_nan() => {}
+        );
+        yq_query!(b"null", "5.5 % 0.0",
+            QueryResult::Owned(OwnedValue::Float(f)) if f.is_nan() => {}
+        );
+        // jq mode is unaffected either way -- both already errored, and
+        // still do, with jq's own wording.
+        query!(b"null", "5 % 0",
+            QueryResult::Error(e) => {
+                assert_eq!(
+                    e.message,
+                    "number (5) and number (0) cannot be divided (remainder) because the divisor is zero"
+                );
+            }
         );
     }
 
