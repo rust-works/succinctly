@@ -518,20 +518,24 @@ impl EvalError {
         Self::new(format!("Path must be specified as array, not {type_name}"))
     }
 
-    /// `DELPATHS: expected either a !!str or !!int in the path, found !!map instead`.
+    /// `DELPATHS: expected either a !!str or !!int in the path, found <tag> instead`.
     ///
-    /// yq-mode-only (#1162): unlike real jq, which accepts a slice-descriptor
-    /// path component (`{"start":s,"end":e}`, `path(.[a:b])`'s own output
-    /// shape) at any position in a `delpaths()` path and splices through the
-    /// named sub-range, real yq rejects one outright — verified live against
-    /// yq v4.53.3 with this exact wording, at both a top-level and a nested
-    /// position. Real yq's `delpaths()` is actually stricter still (also
-    /// rejects a float/bool/array component with the same message, substituting
-    /// its own type's tag), but this constructor covers only the slice-
-    /// descriptor shape #1162 itself scoped — the broader rejection is
-    /// tracked separately as #1220.
-    pub fn delpaths_rejects_slice_descriptor() -> Self {
-        Self::new("DELPATHS: expected either a !!str or !!int in the path, found !!map instead")
+    /// yq-mode-only. Real yq's `delpaths()` accepts only `!!str`/`!!int`
+    /// path components — every other YAML type errors here, `tag` naming
+    /// whichever one was actually found. Originally #1162 (a slice-
+    /// descriptor path component, `{"start":s,"end":e}`, `path(.[a:b])`'s
+    /// own output shape — unlike real jq, which accepts one at any position
+    /// and splices through the named sub-range) scoped this to just
+    /// `!!map`; #1220 found the real rule is this much broader one —
+    /// `!!null`/`!!bool`/`!!float`/`!!seq` all hit the identical message,
+    /// substituting their own tag. Verified live against yq v4.53.3 for
+    /// every variant, at both a top-level and a nested position, including
+    /// that a plain `!!int` is accepted but a whole-number-valued `!!float`
+    /// (`1.0`) is not.
+    pub fn delpaths_rejects_type(tag: &str) -> Self {
+        Self::new(format!(
+            "DELPATHS: expected either a !!str or !!int in the path, found {tag} instead"
+        ))
     }
 
     /// `Cannot delete fields from <type>`.
