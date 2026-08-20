@@ -11610,6 +11610,37 @@ fn unwrap_path_component(expr: &Expr) -> (&Expr, bool) {
     }
 }
 
+/// Splice a nested `Pipe`'s components in front of whatever follows it in
+/// the enclosing path, scoping any `?` on the group to just the group's own
+/// components rather than letting it leak onto what comes after.
+///
+/// Shared by `update_path`'s and `delete_at_path`'s matching `Expr::Pipe(inner)`
+/// arms (#1294) — both are recursive-descent walkers that splice a resolved
+/// `Optional(Pipe([…]))` component and continue with one recursive call over
+/// the combined list, so the same fix applies identically to each: when
+/// `here` (the group's own `?`, folded with whatever optionality was already
+/// ambient before it) is set, wrap each of `inner`'s own components in
+/// `Expr::Optional` — [`unwrap_path_component`] already peels this at every
+/// step — instead of threading `here` as the recursive call's blanket
+/// `optional` parameter, which previously kept suppressing `rest` too, past
+/// the group's own scope (`(.a|.c)? | .y` must suppress a failure in
+/// `.a`/`.c`, not `.y` failing afterward). The caller passes the *original*
+/// `optional` — not `here` — as that call's baseline, so `rest` keeps
+/// whatever optionality it already had on its own.
+fn splice_optional_group(inner: &[Expr], rest: &[Expr], here: bool) -> Vec<Expr> {
+    let mut spliced: Vec<Expr> = if here {
+        inner
+            .iter()
+            .cloned()
+            .map(|e| Expr::Optional(Box::new(e)))
+            .collect()
+    } else {
+        inner.to_vec()
+    };
+    spliced.extend_from_slice(rest);
+    spliced
+}
+
 /// Run `edit` over the sub-array a slice names, splicing the answer back over
 /// the original range.
 ///
@@ -12077,31 +12108,10 @@ fn update_path<S: EvalSemantics>(
                     // when a branch resolved to more than one component, so
                     // unwrapping can expose a nested pipe. Splice it in rather
                     // than recursing on it alone, which would strand `rest`.
-                    //
-                    // Wrap the group's own components in `Optional` when
-                    // `here` is set, rather than threading `here` through as
-                    // this call's blanket `optional` -- that kept suppressing
-                    // whatever follows the group too, past its own scope
-                    // (#1294): `(.a|.c)? | .y` must suppress a failure in
-                    // `.a`/`.c` (the `try (.a|.c)` the `?` desugars to) but
-                    // not `.y` failing afterward, outside that scope. Each
-                    // spliced-in component now self-reports its own
-                    // optionality via the wrapper, which `unwrap_path_component`
-                    // already peels at every step -- `rest` (`exprs[1..]`),
-                    // left unwrapped, keeps whatever optionality it already
-                    // had on its own once `optional` (not `here`) is passed
-                    // as this call's baseline again.
+                    // See `splice_optional_group`'s doc comment for why this
+                    // passes `optional`, not `here`, as the baseline (#1294).
                     Expr::Pipe(inner) => {
-                        let mut spliced: Vec<Expr> = if here {
-                            inner
-                                .iter()
-                                .cloned()
-                                .map(|e| Expr::Optional(Box::new(e)))
-                                .collect()
-                        } else {
-                            inner.clone()
-                        };
-                        spliced.extend_from_slice(&exprs[1..]);
+                        let spliced = splice_optional_group(inner, &exprs[1..], here);
                         update_path::<S>(
                             root,
                             &Expr::Pipe(spliced),
@@ -20543,25 +20553,11 @@ fn delete_at_path(
                         _ => Err(EvalError::cannot_iterate(root)),
                     },
                     // A nested pipe from `Optional(Pipe([…]))` — splice, do
-                    // not recurse on it alone, or `rest` is stranded.
-                    //
-                    // Same per-slot scoping as `update_path`'s matching arm
-                    // (#1294): wrap the group's own components in `Optional`
-                    // when `here` is set, instead of threading `here` through
-                    // as this call's blanket `optional` — that let a `?` on
-                    // the group (`del((.a|.c)? | .y)`) keep suppressing `.y`
-                    // failing afterward too, outside the group's own scope.
+                    // not recurse on it alone, or `rest` is stranded. See
+                    // `splice_optional_group`'s doc comment for why this
+                    // passes `optional`, not `here`, as the baseline (#1294).
                     Expr::Pipe(inner) => {
-                        let mut spliced: Vec<Expr> = if here {
-                            inner
-                                .iter()
-                                .cloned()
-                                .map(|e| Expr::Optional(Box::new(e)))
-                                .collect()
-                        } else {
-                            inner.clone()
-                        };
-                        spliced.extend_from_slice(&exprs[1..]);
+                        let spliced = splice_optional_group(inner, &exprs[1..], here);
                         delete_at_path(root, &Expr::Pipe(spliced), optional, yq_mode)
                     }
                     // The chain continues *inside* the slice, so the delete
@@ -39796,6 +39792,26 @@ mod tests {
         query!(br#"{"a":{"c":1}}"#, "del((.a|.c)[0])",
             QueryResult::Error(e) => {
                 assert_eq!(e.message, "Cannot index number with number");
+            }
+        );
+        // yq mode shares this exact arm (`S`-generic, no `S::TAG` branch in
+        // it) -- confirmed with a live yq v4.53.3 comparison. A *scalar*
+        // intermediate (`.c: 5`, mirroring the jq cases above) would not
+        // actually exercise the fix here: `is_yq_field_index_noop_scalar`
+        // makes `|=`'s own `Field`/`Index` arms no-op unconditionally on a
+        // scalar target, before this arm's `?`-scoping ever matters, and
+        // would pass identically whether this fix existed or not. An array
+        // intermediate keeps the failure genuine (`Cannot index array with
+        // string "y"`, matching real yq's own container-vs-container
+        // mismatch, which is not covered by the scalar no-op).
+        yq_query!(br#"{"a":{"c":[1,2,3]}}"#, "((.a|.c)? | .y) |= 9",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "Cannot index array with string \"y\"");
+            }
+        );
+        yq_query!(br#"{"a":"notobj"}"#, "((.a|.c)? | .y) |= 9",
+            QueryResult::Owned(v) => {
+                assert_eq!(v.to_json(), r#"{"a":"notobj"}"#);
             }
         );
     }
