@@ -11943,23 +11943,17 @@ struct SliceSplit {
 /// Each flattened element is matched via [`unwrap_path_component`] (not a
 /// bare `matches!`), so a `?`-marked slice — `.a[0:1]?[0] = 9`, or
 /// `(.a[0:1]?)[0] = 9` once `push_path_components` has flattened the
-/// enclosing parens away — is still found (#1303): `push_path_components`
-/// itself leaves `Expr::Optional` opaque (its other callers need that), so
-/// without this the wrapped `Slice` reaches this scan unrecognized.
+/// enclosing parens away — is still found (#1303).
 ///
-/// Still does *not* reach through a `Pipe`/`Paren` left nested *inside* an
-/// `Optional` wrapper — e.g. a `?` on a whole multi-component group ahead of
-/// a further step, `((.a[0:1])? | .[0]) = 9`. `unwrap_path_component`'s peel
-/// stops at that `Pipe`, which isn't itself a `Slice`, so the scan still
-/// misses it. Unlike the glued-postfix form (`(.a|.c)?[0] = 9`, confirmed a
-/// jq parse error), the `|`-separated spelling above genuinely parses in
-/// both real jq and here (`path((.a[0:1])? | .[0])` resolves fine) and does
-/// still reproduce the "invalid path component" fallback this whole function
-/// exists to close — found during this fix's own review, tracked separately
-/// rather than folded in here since closing it properly likely means
-/// reworking this function to unwrap one path element at a time (mirroring
-/// `update_path`'s already-correct `Expr::Pipe` arm) instead of a single
-/// flatten-then-scan pass, not another incremental patch to this one.
+/// Also reaches through a `Pipe`/`Paren` nested *inside* an `Optional`
+/// wrapper — e.g. a `?` on a whole multi-component group ahead of a further
+/// step, `((.a[0:1])? | .[0]) = 9` — since `push_path_components` (#1311)
+/// recursively flattens an `Expr::Optional`'s own contents and re-wraps each
+/// resulting component individually, rather than leaving the wrapper
+/// opaque. Unlike the glued-postfix form (`(.a|.c)?[0] = 9`, confirmed a jq
+/// parse error), the `|`-separated spelling above genuinely parses in both
+/// real jq and here (`path((.a[0:1])? | .[0])` resolves fine), and now
+/// resolves through `=` too, matching jq.
 fn split_at_slice(exprs: &[Expr]) -> Option<SliceSplit> {
     // Cheap common-case guard: the overwhelming majority of assignment
     // targets (`.a.b.c[2] = 9`) contain neither a slice nor a nested
@@ -14448,7 +14442,12 @@ fn type_filter_matches(builtin: &Builtin, value: &OwnedValue) -> bool {
 /// Reuses [`push_path_components`]'s own Identity/Pipe/Paren unwrapping
 /// rather than a bespoke `matches!` — `.[.k]` and `. | .[.k]` and `(.)[.k]`
 /// all name the same no-op target, and this is the one existing place in
-/// the file that already knows how to recognise that.
+/// the file that already knows how to recognise that. `push_path_components`
+/// also unwraps a bare `Optional(Identity)` (`.?`) to empty since #1311, but
+/// that shape can never actually reach `target` here: `parse_postfix` only
+/// lets `?` precede continued `[...]` when it's attached to a `Field`/prior
+/// bracket, never to a passthrough node, so `.?[0]`/`(.)?[0]` are parse
+/// errors in both real jq and here.
 fn is_passthrough_target(target: &Expr) -> bool {
     let mut components = Vec::new();
     push_path_components(&mut components, target);
@@ -14975,18 +14974,23 @@ fn resolve_seq<'a, S: EvalSemantics>(
     // so an untracked `value` (#843) needs its own check here rather than
     // inheriting `resolve_leaf`'s: `push_path_components` above already
     // dropped every `Identity` from `flat` (see its doc comment), so an
-    // *empty* `flat` means the whole chain was a no-op (`.`, `. | .`, ...)
-    // — the ordinary `#530` "with result" case — while a *non-empty* one
-    // means `flat[0]` is the first real navigation attempted, using the
+    // *empty* `flat` means the whole chain was a no-op (`.`, `. | .`, `.?`,
+    // ...) — the ordinary `#530` "with result" case — while a *non-empty*
+    // one means `flat[0]` is the first real navigation attempted, using the
     // untracked root `value` itself (confirmed live: `path(try (.a,
     // error({a:{c:1}})) catch .a.b)` on the caught object reports "near
     // attempt to access element \"a\" of {\"a\":{\"c\":1}}", not `.b`'s
-    // resolved value — jq never even computes `.a`'s result). A `flat[0]`
-    // that isn't `Field`/`Index`/`Slice` (e.g. `Expr::Optional` from a
-    // mid-chain `.a?.b`) is rare enough, and already `#498`-adjacent
-    // territory, that this falls back to the "with result" wording rather
-    // than growing a bespoke message for it — still a hard error either
-    // way, never the silent wrong-success #843 is about.
+    // resolved value — jq never even computes `.a`'s result). Since #1311,
+    // `push_path_components` recurses into an `Expr::Optional`'s own
+    // contents (re-wrapping each resulting component individually) rather
+    // than leaving it opaque, so `.?` alone now correctly contributes zero
+    // components here too, same as `.`. A `flat[0]` that isn't a bare
+    // `Field`/`Index`/`Slice` (e.g. the `Optional`-wrapped one from a
+    // mid-chain `.a?.b`, or from a flattened group like `(.a[0:1])? | .b`)
+    // is rare enough, and already `#498`-adjacent territory, that this
+    // falls back to the "with result" wording rather than growing a
+    // bespoke message for it — still a hard error either way, never the
+    // silent wrong-success #843 is about.
     let Some(last_dynamic) = flat.iter().rposition(needs_fanout_pass) else {
         let end = resolve_static_tail::<S>(&flat, value, trackable)?;
         // `resolve_static_tail` above already raised for an untracked
