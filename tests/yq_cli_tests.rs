@@ -15819,6 +15819,26 @@ fn test_1219_computed_key_all_noop_siblings() -> Result<()> {
     Ok(())
 }
 
+/// #1219: a computed-key multi-path `del()` where *every* resolved sibling
+/// is `DropParent`-classified (a bare trailing slice on each) -- the
+/// mirror image of the all-`Noop` case above. Unlike a syntactic comma
+/// (whose `DropParent` branches are already rewritten pre-navigation by
+/// `rewrite_yq_del_comma_branches`), a computed-key fan-out reaches
+/// `builtin_del`'s own `paths.len() > 1` `filter_map` still carrying the
+/// raw slice, so this is the only route that exercises that filter_map's
+/// own `DropParent(rewritten) => Some(rewritten)` arm directly.
+#[test]
+fn test_1219_computed_key_all_drop_parent_siblings() -> Result<()> {
+    let (out, code) = run_yq_stdin(
+        r#"del(.[("a","z")][0:1])"#,
+        r#"{"a":[1,2,3,4],"z":[5,6,7,8]}"#,
+        &["-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), r"{}");
+    Ok(())
+}
+
 /// #1219: a `DropParent`-classified chained slice whose *residual prefix*
 /// contains a multi-step `Expr::Optional` group (`.a?.b?[0:2]`) reconstructs
 /// correctly via `yq_del_slice_outcome`'s `wrap` closure -- each prefix
