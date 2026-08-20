@@ -11721,7 +11721,29 @@ struct SliceSplit {
 /// arms already unwrap that case before calling this function, so the slice
 /// would already be at the top level of a *fresh* call. This function only
 /// has to handle a compound sub-path sitting *alongside* other components.
+///
+/// Does **not** see through `Expr::Optional` — `push_path_components` leaves
+/// it opaque (its other callers need that), so `.a[0:1]?[0] = 9` still misses
+/// its slice here. Pre-existing, unrelated to #1292's own repro shape (which
+/// has no `?` anywhere): confirmed identical, unaffected behavior before and
+/// after this function's flattening was added.
 fn split_at_slice(exprs: &[Expr]) -> Option<SliceSplit> {
+    // Cheap common-case guard: the overwhelming majority of assignment
+    // targets (`.a.b.c[2] = 9`) contain neither a slice nor a nested
+    // `Pipe`/`Paren` component that could hide one, so skip the
+    // allocate-and-clone flatten below entirely when nothing here could
+    // possibly need it. Exactly equivalent to running the flatten and
+    // finding nothing: `push_path_components` only ever transforms a
+    // `Pipe`/`Paren` element, so a top-level element that is none of
+    // `Slice`/`Pipe`/`Paren` reaches the flattened list completely
+    // unchanged, and a literal `Slice` already at the top level is caught
+    // directly either way.
+    if exprs
+        .iter()
+        .all(|e| !matches!(e, Expr::Slice { .. } | Expr::Pipe(_) | Expr::Paren(_)))
+    {
+        return None;
+    }
     let mut flat = Vec::with_capacity(exprs.len());
     for e in exprs {
         push_path_components(&mut flat, e);
