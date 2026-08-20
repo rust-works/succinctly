@@ -2841,6 +2841,19 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                 GenericResult::Owned(v) => vec![v],
                 GenericResult::ManyOwned(vs) => vs,
                 GenericResult::Error(e) => return GenericResult::Error(e),
+                // `Break`/`Partial`-`Break` (bare and below): kept for
+                // exhaustiveness over `GenericResult`, mirroring
+                // `eval::eval_array_construction`'s own arms, but not
+                // reachable via any query this CLI can currently parse --
+                // `break $out` needs an enclosing `label $out`, and
+                // `Expr::Label` has no native `eval_single` arm of its own
+                // (see #1168's scope-widening comment), so any query where a
+                // `break` could reach *past* this arm's own boundary
+                // necessarily puts `Label` above `Array` in the tree, which
+                // routes the *whole* expression through the wildcard
+                // fallback below before this arm ever runs. Same
+                // "unreachable but exhaustive" shape #1064 documents
+                // elsewhere in this codebase.
                 GenericResult::Break(label) => return GenericResult::Break(label),
                 GenericResult::Halt(code) => return GenericResult::Halt(code),
                 // Array construction is atomic in jq (verified: `[1,error("x"),3]`
