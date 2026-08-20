@@ -15491,6 +15491,64 @@ fn test_1223_multi_path_del_object_target_fixed_reversed_order() -> Result<()> {
     Ok(())
 }
 
+/// #1223 (found by `/code-review`): an explicit outer paren around the
+/// whole comma group (`del((.a[0:1], .c))`, syntactically the same query,
+/// valid jq/yq syntax) parses to `Expr::Paren(Expr::Comma(...))`, which the
+/// fix's own `if let Expr::Comma(branches) = path_expr` guard doesn't match
+/// directly -- `rewrite_yq_del_comma_branches` recurses through
+/// `Expr::Paren`/`Expr::Optional` first, specifically to still catch this.
+#[test]
+fn test_1223_multi_path_del_object_target_fixed_paren_wrapped() -> Result<()> {
+    let (out, code) = run_yq_stdin(
+        "del((.a[0:1], .c))",
+        r#"{"a":{"x":1,"y":2},"b":6,"c":9}"#,
+        &["-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), r#"{"b":6}"#);
+    Ok(())
+}
+
+/// #1223 (found by `/code-review`): a `?` on the whole parenthesized comma
+/// group (`Expr::Optional(Expr::Paren(Expr::Comma(...)))`) used to reach
+/// `resolve_dynamic_indexes`'s crashing navigation unrewritten -- the `?`
+/// then silently swallowed the resulting error, giving back the *unchanged*
+/// document instead of correctly deleting anything (a worse failure mode
+/// than an honest crash: wrong output with exit 0, not caught by a
+/// crash-only regression test). `rewrite_yq_del_comma_branches` recursing
+/// through `Expr::Optional` fixes this the same way as the bare paren case
+/// above, not just by avoiding the crash.
+#[test]
+fn test_1223_multi_path_del_object_target_fixed_paren_wrapped_with_optional() -> Result<()> {
+    let (out, code) = run_yq_stdin(
+        "del((.a[0:1], .c)?)",
+        r#"{"a":{"x":1,"y":2},"b":6,"c":9}"#,
+        &["-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), r#"{"b":6}"#);
+    Ok(())
+}
+
+/// #1223 (found by `/code-review`): a comma branch that is itself a
+/// parenthesized comma group (`del(.a[0:1], (.e[0:1], .c))`) used to reach
+/// the crashing navigation unrewritten, since `needs_path_prepass` treats
+/// any `Comma`/`Paren(Comma)` as needing a prepass -- `rewrite_yq_del_
+/// comma_branches` recurses into each branch *before* falling back to that
+/// check, so a nested comma group gets the same per-branch rewrite as the
+/// top-level one.
+#[test]
+fn test_1223_multi_path_del_object_target_fixed_nested_comma() -> Result<()> {
+    let (out, code) = run_yq_stdin(
+        "del(.a[0:1], (.e[0:1], .c))",
+        r#"{"a":{"x":1,"y":2},"b":6,"c":9,"e":{"p":1,"q":2}}"#,
+        &["-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), r#"{"b":6}"#);
+    Ok(())
+}
+
 /// #1223: `resolve_dynamic_indexes`'s generic `Comma` walk also raises the
 /// same class of error when a sibling has a *computed* key ahead of the
 /// crashing branch (`.[.b]` forces the full multi-branch resolver rather
@@ -15521,6 +15579,95 @@ fn test_1223_multi_path_del_object_target_jq_mode_unaffected() -> Result<()> {
         &[],
     )?;
     assert_ne!(code, 0);
+    assert!(
+        stderr.contains("Cannot index object with object"),
+        "stderr: {stderr}"
+    );
+    Ok(())
+}
+
+/// #1223 follow-up (found by `/code-review`, filed separately): a comma
+/// branch that is itself a bare root slice (`.[2:3]`, not chained under a
+/// `Field`/`Index`) still reaches `resolve_dynamic_indexes`'s crashing
+/// navigation, because `yq_del_scalar_slice_parent_path` only rewrites a
+/// *chained* slice (`unwrap_path_component`'s result must be `Expr::Pipe`)
+/// -- a bare `Expr::Slice` isn't one, so it's correctly left unrewritten by
+/// `rewrite_yq_del_comma_branches`, same as it always was. Distinct from,
+/// and deliberately not chased by, this PR's own fix: real yq's actual
+/// answer for this exact combination is the *unchanged* document (verified
+/// live against yq v4.53.3), not the composition of the chained-slice's
+/// parent-key-drop with the bare-slice's own no-op rule -- squarely the
+/// same "no coherent rule to replicate" territory as the order-sensitivity
+/// gap below. If this is ever addressed, update this expectation.
+#[test]
+fn test_1223_bare_slice_sibling_object_target_characterize_preexisting_bug() -> Result<()> {
+    let (_out, stderr, code) = run_yq_stdin_with_stderr(
+        "del(.a[0:1], .[2:3])",
+        r#"{"a":{"x":1,"y":2},"b":6,"c":9}"#,
+        &[],
+    )?;
+    assert_ne!(
+        code, 0,
+        "if this now succeeds, update this test (real yq leaves the document unchanged here)"
+    );
+    assert!(
+        stderr.contains("Cannot index object with object"),
+        "stderr: {stderr}"
+    );
+    Ok(())
+}
+
+/// #1223 follow-up (found by `/code-review`, filed separately): a comma
+/// branch reaching its trailing slice through an `Expr::Iterate` prefix
+/// (`.arr[][0:1]`) still crashes, because `navigate_read_only` (the prefix
+/// walker `yq_del_scalar_slice_parent_path` uses to confirm the prefix
+/// actually exists) only understands `Field`/`Index` steps -- an
+/// `Iterate` step returns `None` immediately, so the rewrite silently
+/// declines and the branch reaches `resolve_dynamic_indexes` unrewritten.
+/// Deliberately not attempted here: real yq's rule for *which* parent key
+/// to drop when the prefix fans out over multiple array elements (rather
+/// than naming one) isn't obviously "drop every element," and extending
+/// `navigate_read_only` to `Iterate` needs its own live verification before
+/// committing to an answer -- a separate, more involved fix than this PR's
+/// scope. If this is ever addressed, update this expectation.
+#[test]
+fn test_1223_iterate_prefix_slice_sibling_characterize_preexisting_bug() -> Result<()> {
+    let (_out, stderr, code) = run_yq_stdin_with_stderr(
+        "del(.arr[][0:1], .c)",
+        r#"{"arr":[{"x":1,"y":2},{"x":3,"y":4}],"c":9}"#,
+        &[],
+    )?;
+    assert_ne!(code, 0, "if this now succeeds, update this test");
+    assert!(
+        stderr.contains("Cannot index object with object"),
+        "stderr: {stderr}"
+    );
+    Ok(())
+}
+
+/// #1223 follow-up (found by `/code-review`, filed separately): a branch
+/// that itself needs a computed-key prepass (`.[($k)][0:1]`) and *also*
+/// ends in a trailing slice still crashes -- `rewrite_yq_del_comma_
+/// branches` deliberately skips any branch where `needs_path_prepass` is
+/// `true` (the existing, pre-#1223 contract: such a branch resolves through
+/// the normal dynamic-index machinery, and the post-resolution rewrite at
+/// `builtin_del`'s own `paths.len() > 1` branch was expected to catch a
+/// trailing slice in its *resolved* output) -- but here the crash happens
+/// *during* that branch's own resolution, before any resolved output
+/// exists for the post-resolution rewrite to run on. A real fix needs
+/// `resolve_dynamic_indexes`'s own per-branch navigation to defer a
+/// trailing slice the same way the top-level fast path already does for a
+/// non-comma expression, which is `resolve_node`'s `Expr::Comma` arm, not
+/// `builtin_del`'s -- out of scope for this PR. If this is ever addressed,
+/// update this expectation.
+#[test]
+fn test_1223_computed_key_with_trailing_slice_characterize_preexisting_bug() -> Result<()> {
+    let (_out, stderr, code) = run_yq_stdin_with_stderr(
+        r#"del(.[($k)][0:1], .c)"#,
+        r#"{"a":{"x":1,"y":2},"c":9}"#,
+        &["--arg", "k", "a"],
+    )?;
+    assert_ne!(code, 0, "if this now succeeds, update this test");
     assert!(
         stderr.contains("Cannot index object with object"),
         "stderr: {stderr}"
