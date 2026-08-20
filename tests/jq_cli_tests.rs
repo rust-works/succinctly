@@ -13783,9 +13783,29 @@ fn test_jq_inputs_and_input_line_number_inside_user_defined_function_723() -> Re
     assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
     assert_eq!(stdout, "1\n1\n2\n2\n3\n3\n");
 
-    let (stdout, stderr, code) = run_jq_full(&["-c", ".,(def f(x): x; f(inputs))"], Some("1 2 3"))
-        .expect("inputs-as-function-argument repro runs");
+    // `substitute_func_param_in_builtin`'s own Inputs/InputLineNumber arms
+    // (as opposed to `expand_func_calls_in_builtin`'s, exercised above) only
+    // run when a filter-style (non-`$`) function *parameter* is substituted
+    // through a body that itself contains these builtins -- unlike passing
+    // `inputs` as an *argument*, which just swaps the whole argument
+    // expression in wholesale without walking its own contents.
+    //
+    // Input ends with a trailing newline deliberately: without one, the
+    // last document's own reported line number is one lower than with it, a
+    // separate pre-existing `LineCounter`/`extend_from_ends` quirk
+    // unrelated to #723 (confirmed reproducing identically for `input`'s
+    // own document-location tracking, not just `input_line_number`) --
+    // sidestepped here rather than chased, since this test's only job is
+    // patch-coverage for the AST-rewriting pass, not pinning that quirk.
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            "(def f(x): x, input, inputs, input_line_number; f(1))",
+        ],
+        Some("1 2 3\n"),
+    )
+    .expect("function-parameter-substitution repro runs");
     assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
-    assert_eq!(stdout, "1\n2\n3\n");
+    assert_eq!(stdout, "1\n2\n3\n1\n");
     Ok(())
 }
