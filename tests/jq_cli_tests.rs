@@ -13768,3 +13768,24 @@ fn test_jq_input_inside_user_defined_function_723() -> Result<()> {
     assert!(stderr.contains("break"), "{stderr}");
     Ok(())
 }
+
+/// `inputs`/`input_line_number` (the other two of #723's three new
+/// builtins) called from inside a user-defined function -- same
+/// AST-rewriting-pass coverage reasoning as the `input`-specific test
+/// above, for the two builtins it didn't happen to exercise.
+#[test]
+fn test_jq_inputs_and_input_line_number_inside_user_defined_function_723() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", ".,(def f: input_line_number; f)"],
+        Some("1\n2\n3\n"),
+    )
+    .expect("input_line_number-inside-function repro runs");
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(stdout, "1\n1\n2\n2\n3\n3\n");
+
+    let (stdout, stderr, code) = run_jq_full(&["-c", ".,(def f(x): x; f(inputs))"], Some("1 2 3"))
+        .expect("inputs-as-function-argument repro runs");
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(stdout, "1\n2\n3\n");
+    Ok(())
+}
