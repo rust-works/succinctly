@@ -11772,12 +11772,21 @@ struct SliceSplit {
 /// `(.a[0:1]?)[0] = 9` once `push_path_components` has flattened the
 /// enclosing parens away — is still found (#1303): `push_path_components`
 /// itself leaves `Expr::Optional` opaque (its other callers need that), so
-/// without this the wrapped `Slice` reaches this scan unrecognized. Does
-/// *not* reach through a `Pipe`/`Paren` still nested *inside* an `Optional`
-/// wrapper (e.g. a `?` on a whole multi-component group ahead of a further
-/// index, `(.a|.c)?[0] = 9`) — real jq syntax cannot produce that shape here
-/// in the first place (postfix `?` cannot be followed by `[...]`, confirmed
-/// live), so there is nothing to be found either way.
+/// without this the wrapped `Slice` reaches this scan unrecognized.
+///
+/// Still does *not* reach through a `Pipe`/`Paren` left nested *inside* an
+/// `Optional` wrapper — e.g. a `?` on a whole multi-component group ahead of
+/// a further step, `((.a[0:1])? | .[0]) = 9`. `unwrap_path_component`'s peel
+/// stops at that `Pipe`, which isn't itself a `Slice`, so the scan still
+/// misses it. Unlike the glued-postfix form (`(.a|.c)?[0] = 9`, confirmed a
+/// jq parse error), the `|`-separated spelling above genuinely parses in
+/// both real jq and here (`path((.a[0:1])? | .[0])` resolves fine) and does
+/// still reproduce the "invalid path component" fallback this whole function
+/// exists to close — found during this fix's own review, tracked separately
+/// rather than folded in here since closing it properly likely means
+/// reworking this function to unwrap one path element at a time (mirroring
+/// `update_path`'s already-correct `Expr::Pipe` arm) instead of a single
+/// flatten-then-scan pass, not another incremental patch to this one.
 fn split_at_slice(exprs: &[Expr]) -> Option<SliceSplit> {
     // Cheap common-case guard: the overwhelming majority of assignment
     // targets (`.a.b.c[2] = 9`) contain neither a slice nor a nested
@@ -40094,7 +40103,7 @@ mod tests {
             // `set_path`'s `Expr::Optional` arm -- real jq's inline `?`
             // suppresses a failure to *reach* a target, not a mismatch in
             // what gets written once one is found (the same class
-            // `is_negative_index_out_of_bounds` already carved out for
+            // `is_write_time_application_error` already carved out for
             // `Expr::Index`, #498).
             (
                 br#"{"a":[1,2,3]}"#,
