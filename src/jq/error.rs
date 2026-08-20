@@ -568,14 +568,34 @@ impl EvalError {
     }
 
     const OUT_OF_BOUNDS_NEGATIVE_INDEX: &'static str = "Out of bounds negative array index";
+    const SLICE_ASSIGN_NON_ARRAY: &'static str =
+        "A slice of an array can only be assigned another array";
+    const CANNOT_UPDATE_STRING_SLICES: &'static str = "Cannot update string slices";
 
-    /// Whether this is exactly [`Self::out_of_bounds_negative_index`] — the one
-    /// write-time bounds check jq's `?` does not suppress, unlike every other
-    /// indexing error it raises (`?` only suppresses errors raised while
-    /// *collecting* a path, not this one). The lone call site that needs to tell
-    /// the two apart is `set_path`'s `Expr::Optional` arm in `eval.rs` (#498).
-    pub fn is_negative_index_out_of_bounds(&self) -> bool {
+    /// Whether this is one of the write-time *application* checks jq's `?`
+    /// does not suppress, unlike every other indexing error it raises (`?`
+    /// only suppresses a failure to *reach* a target while collecting a
+    /// path; once a write is confirmed to land somewhere, a mismatch in what
+    /// gets written there survives even an inline `?`). Three messages
+    /// qualify, each confirmed live against jq 1.7.1: [`Self::out_of_bounds_negative_index`]
+    /// (`.a[-5]? = 9` still raises), [`Self::slice_assign_non_array`]
+    /// (`.a[0:1]? = 9`, a non-array RHS, still raises), and
+    /// [`Self::cannot_update_string_slices`] (`"str"[0:1]? = "x"` still
+    /// raises) — #498, #1303.
+    ///
+    /// Contrast a genuinely *non-sliceable* target (`true[0:1]? = 9`) — that
+    /// one **is** suppressed, since it's a navigation failure (the slice
+    /// never applies to a boolean at all), not a write-time application one;
+    /// `through_slice`'s own `_ if optional => Ok(())` arm already handles
+    /// that case correctly and is unaffected by this predicate.
+    ///
+    /// The lone call site that needs to tell these apart from an ordinary
+    /// (suppressible) navigation failure is `set_path`'s `Expr::Optional`
+    /// arm in `eval.rs`.
+    pub fn is_write_time_application_error(&self) -> bool {
         self.message == Self::OUT_OF_BOUNDS_NEGATIVE_INDEX
+            || self.message == Self::SLICE_ASSIGN_NON_ARRAY
+            || self.message == Self::CANNOT_UPDATE_STRING_SLICES
     }
 
     /// `Array/string slice indices must be integers`.
@@ -597,7 +617,7 @@ impl EvalError {
     /// of the walk — `null | setpath([{"start":0,"end":1},"a"]; 9)` builds
     /// `{"a":9}` and refuses it here.
     pub fn slice_assign_non_array() -> Self {
-        Self::new("A slice of an array can only be assigned another array")
+        Self::new(Self::SLICE_ASSIGN_NON_ARRAY)
     }
 
     /// `Cannot update string slices`.
@@ -606,7 +626,7 @@ impl EvalError {
     /// replacement: `"abcdef" | .[1:2] = "x"`, `|= "x"`, and the `setpath`
     /// spelling all report this.
     pub fn cannot_update_string_slices() -> Self {
-        Self::new("Cannot update string slices")
+        Self::new(Self::CANNOT_UPDATE_STRING_SLICES)
     }
 
     /// `Cannot iterate over <type> (<value>)`.
