@@ -33,7 +33,7 @@ use super::eval::{
 };
 use super::expr::{Builtin, Expr, FormatType};
 use super::slice::{slice_str, SliceBounds};
-use super::value::OwnedValue;
+use super::value::{NumberRepr, OwnedValue};
 use crate::json::JsonIndex;
 
 /// Recursion-depth ceiling for [`to_owned`]/[`to_owned_cursor`]/
@@ -1050,14 +1050,37 @@ fn eval_on_owned<S: EvalSemantics, V: DocumentValue>(
 /// formatter, #953), without touching anything else in the input document.
 ///
 /// `Expr::Array`/`Expr::Comma`'s own native `eval_single` arms (#1168) build
-/// `values` straight from `to_owned`/`to_owned_cursor`, which have no notion
-/// of "this bare `Float` came from a document-sourced literal that
-/// overflowed `i64`, keep its decimal point regardless of magnitude" — only
-/// `to_json_for_reindex`'s own `S`-gated fallback applies that rule (see its
-/// doc comment, `src/jq/value.rs`), and *only* because, before those two
-/// arms existed, `[...]`/`,` had no choice but to fall through to this same
-/// bridge for lack of a native cursor arm. Adding one without also keeping
-/// this fix regressed #953 (caught by its own regression test).
+/// `values` straight from `to_owned`/`to_owned_cursor` -- or, for a builtin
+/// with its own native construction (`to_entries`, ...), from whatever *that*
+/// builtin's arm produced, which uses the identical `to_owned`/`to_owned_cursor`
+/// conversion internally. Neither has any notion of "this bare `Float` came
+/// from a document-sourced literal that overflowed `i64`, keep its decimal
+/// point regardless of magnitude" -- only `to_json_for_reindex`'s own
+/// `S`-gated fallback applies that rule (see its doc comment,
+/// `src/jq/value.rs`), and *only* because, before `Expr::Array`/`Expr::Comma`
+/// had native arms, `[...]`/`,` had no choice but to fall through to this
+/// same bridge for lack of one. Adding native arms without also keeping this
+/// fix regressed #953 for a direct cursor result (`[.a]`, caught by its own
+/// regression test) *and*, less obviously, for a value one layer removed
+/// through a builtin's own construction (`[to_entries]` on an overflow
+/// field, caught in code review -- `Builtin::ToEntries` also reads the field
+/// via `to_owned_cursor`, just wrapped in an entry object before `Expr::Array`
+/// ever sees it, so scoping the fixup to only direct `GenericResult::
+/// OneCursor`/`ManyCursor` results missed this case entirely).
+///
+/// This is why the fixup applies unconditionally to the *whole* constructed
+/// result rather than trying to track, per value, whether it's document-
+/// sourced or genuinely computed (e.g. `1e10 * 2`) -- that distinction isn't
+/// recoverable from a `GenericResult` variant once a value has passed through
+/// even one further construction step (`to_entries`'s object wrapping looks
+/// identical, from here, to freshly computed arithmetic). The trade-off this
+/// accepts, matching an already-documented precedent
+/// (`test_yq_array_wrapped_computed_float_keeps_scientific_notation_known_gap_1168`,
+/// same shape as #1124/#1144's `join` gap): a genuinely computed float
+/// wrapped directly in `[...]`/`,` (`[1e10 * 2]`) also gets its decimal point
+/// forced, when real yq would keep scientific notation there. Getting both
+/// right needs provenance tagged at `OwnedValue::Float`'s own construction
+/// site, not reconstructed after the fact here -- out of scope for this fix.
 ///
 /// Round-tripping just `values` (not the whole input document, unlike the
 /// old wildcard fallback these two arms replace) keeps `Expr::Array`'s and
@@ -1073,24 +1096,47 @@ fn eval_on_owned<S: EvalSemantics, V: DocumentValue>(
 ///
 /// A no-op in jq mode (`to_json_for_reindex`'s own `S`-gate already makes
 /// the round trip itself a no-op there — jq drops a computed float's
-/// literal formatting unconditionally) — skipped outright rather than paying
-/// for a round trip jq mode never needs. `Ok` carries the fixed-up values
-/// back for the caller to package (`Expr::Array` always wraps them in one
-/// `OwnedValue::Array`; `Expr::Comma` collapses via
-/// [`owned_vec_to_generic_result`]); `Err` carries an already-terminal
-/// `GenericResult` (an `Error`, in practice — see [`eval_on_owned`]'s own
-/// doc comment for why this is defense-in-depth rather than a reachable
-/// path for internally-constructed input) for the caller to return as-is.
+/// literal formatting unconditionally), and a no-op whenever `values` has no
+/// `Float`/`NumberLiteral(Float, _)` anywhere in its tree (`contains_float`)
+/// — skipped outright rather than paying for a round trip that has nothing
+/// to fix, which is the common case (`[.a, .b, .c]` over strings/objects/
+/// plain ints). `Ok` carries the fixed-up values back for the caller to
+/// package (`Expr::Array` always wraps them in one `OwnedValue::Array`;
+/// `Expr::Comma` collapses via [`owned_vec_to_generic_result`]); `Err`
+/// carries an already-terminal `GenericResult` (an `Error`, in practice —
+/// see [`eval_on_owned`]'s own doc comment for why this is defense-in-depth
+/// rather than a reachable path for internally-constructed input) for the
+/// caller to return as-is.
 fn yq_float_fidelity_fixup<S: EvalSemantics, V: DocumentValue>(
     values: Vec<OwnedValue>,
 ) -> Result<Vec<OwnedValue>, GenericResult<V>> {
-    if S::TAG != EvalTag::Yq || values.is_empty() {
+    if S::TAG != EvalTag::Yq || values.is_empty() || !values.iter().any(contains_float) {
         return Ok(values);
     }
     match eval_on_owned::<S, V>(&Expr::Identity, OwnedValue::Array(values), false) {
         GenericResult::Owned(OwnedValue::Array(fixed)) => Ok(fixed),
         GenericResult::Error(e) => Err(GenericResult::Error(e)),
         other => Err(other),
+    }
+}
+
+/// Whether `value`'s tree contains a `Float`/`NumberLiteral(Float, _)`
+/// anywhere -- the only shapes [`yq_float_fidelity_fixup`]'s round trip can
+/// possibly change (see `to_json_for_reindex`'s own `S`-gated fallback,
+/// which is scoped identically). A cheap pre-check so a document with no
+/// float anywhere in the wrapped result skips the round trip entirely,
+/// rather than paying for one that has nothing to do.
+fn contains_float(value: &OwnedValue) -> bool {
+    match value {
+        OwnedValue::Float(_) => true,
+        OwnedValue::NumberLiteral(NumberRepr::Float(_), _) => true,
+        OwnedValue::Array(items) => items.iter().any(contains_float),
+        OwnedValue::Object(fields) => fields.values().any(contains_float),
+        OwnedValue::Null
+        | OwnedValue::Bool(_)
+        | OwnedValue::Int(_)
+        | OwnedValue::NumberLiteral(NumberRepr::Int(_), _)
+        | OwnedValue::String(_) => false,
     }
 }
 
@@ -1187,40 +1233,6 @@ fn push_generic_owned_values<V: DocumentValue>(
         }
     }
     None
-}
-
-/// [`push_generic_owned_values`]'s `Expr::Comma` sibling (#1168): identical
-/// except a direct cursor result (`OneCursor`/`ManyCursor`) is routed
-/// through [`yq_float_fidelity_fixup`] first. Scoped to exactly those two
-/// variants for the same reason as `Expr::Array`'s own arm in `eval_single`
-/// -- an already-constructed value reaching here (`Owned`/`ManyOwned`, e.g.
-/// a computed arithmetic result or a builtin's own object construction)
-/// can't be distinguished from a document-sourced one anymore, and forcing
-/// a decimal point onto it would introduce the same over-eager-forcing gap
-/// `test_yq_join_element_computed_float_known_gap_1124` (#1124/#1144)
-/// already documents as out of scope here.
-///
-/// Returns `Ok(Some(control))`/`Ok(None)` mirroring
-/// [`push_generic_owned_values`]'s `Option<Control>`, or `Err` with an
-/// already-terminal `GenericResult` if the fixup's own round trip failed
-/// (see [`yq_float_fidelity_fixup`]'s doc comment for why that's
-/// defense-in-depth rather than reachable in practice).
-fn push_generic_owned_values_yq_fixed<S: EvalSemantics, V: DocumentValue>(
-    result: GenericResult<V>,
-    out: &mut Vec<OwnedValue>,
-) -> Result<Option<Control>, GenericResult<V>> {
-    match result.materialize_lazy() {
-        GenericResult::OneCursor(c) => {
-            out.extend(yq_float_fidelity_fixup::<S, V>(vec![to_owned_cursor(&c)])?);
-            Ok(None)
-        }
-        GenericResult::ManyCursor(cs) => {
-            let values: Vec<OwnedValue> = cs.iter().map(to_owned_cursor).collect();
-            out.extend(yq_float_fidelity_fixup::<S, V>(values)?);
-            Ok(None)
-        }
-        other => Ok(push_generic_owned_values(other, out)),
-    }
 }
 
 /// Append one truthiness bit per output of a `GenericResult` stream to
@@ -2806,73 +2818,57 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                 .materialize_lazy()
             {
                 GenericResult::One(v) => vec![to_owned(&v)],
-                // Fixed up (#953/#1168, `yq_float_fidelity_fixup`'s own doc
-                // comment): a direct cursor result reflects the input
-                // document itself, which needs the same round-trip decimal-
-                // point forcing the old wildcard fallback applied to the
-                // *whole* document before this arm existed.
-                GenericResult::OneCursor(c) => {
-                    match yq_float_fidelity_fixup::<S, _>(vec![to_owned_cursor(&c)]) {
-                        Ok(fixed) => fixed,
-                        Err(result) => return result,
-                    }
-                }
+                GenericResult::OneCursor(c) => vec![to_owned_cursor(&c)],
                 GenericResult::Many(vs) => vs.iter().map(to_owned).collect(),
-                GenericResult::ManyCursor(cs) => {
-                    let values: Vec<OwnedValue> = cs.iter().map(to_owned_cursor).collect();
-                    match yq_float_fidelity_fixup::<S, _>(values) {
-                        Ok(fixed) => fixed,
-                        Err(result) => return result,
-                    }
-                }
+                GenericResult::ManyCursor(cs) => cs.iter().map(to_owned_cursor).collect(),
                 GenericResult::None => Vec::new(),
-                // NOT fixed up, deliberately: an already-constructed value
-                // (a builtin's own object/array, a genuinely computed
-                // arithmetic result, ...) can't be distinguished here from a
-                // document-sourced one once it's inside this shape --
-                // running the same round trip on it would force a decimal
-                // point onto a *computed* float too, which this codebase
-                // already treats as a separate, out-of-scope gap rather
-                // than "fixed" (`test_yq_join_element_computed_float_known_gap_1124`,
-                // #1124/#1144). Scoping the fixup to `OneCursor`/`ManyCursor`
-                // above avoids introducing that same over-eager-decimal-
-                // forcing for a case (bare computed arithmetic wrapped in
-                // `[...]`) that doesn't have it today.
                 GenericResult::Owned(v) => vec![v],
                 GenericResult::ManyOwned(vs) => vs,
-                GenericResult::Error(e) => return GenericResult::Error(e),
-                // `Break`/`Partial`-`Break` (bare and below): kept for
-                // exhaustiveness over `GenericResult`, mirroring
-                // `eval::eval_array_construction`'s own arms, but not
-                // reachable via any query this CLI can currently parse --
-                // `break $out` needs an enclosing `label $out`, and
-                // `Expr::Label` has no native `eval_single` arm of its own
-                // (see #1168's scope-widening comment), so any query where a
-                // `break` could reach *past* this arm's own boundary
-                // necessarily puts `Label` above `Array` in the tree, which
-                // routes the *whole* expression through the wildcard
-                // fallback below before this arm ever runs. Same
+                // `Break`/`Partial`-`Break` (below): kept for exhaustiveness
+                // over `GenericResult`, mirroring `eval::eval_array_construction`'s
+                // own arms, but not reachable via any query this CLI can
+                // currently parse -- `break $out` needs an enclosing
+                // `label $out`, and `Expr::Label` has no native `eval_single`
+                // arm of its own (see #1168's scope-widening comment), so any
+                // query where a `break` could reach *past* this arm's own
+                // boundary necessarily puts `Label` above `Array` in the
+                // tree, which routes the *whole* expression through the
+                // wildcard fallback below before this arm ever runs. Same
                 // "unreachable but exhaustive" shape #1064 documents
                 // elsewhere in this codebase.
-                GenericResult::Break(label) => return GenericResult::Break(label),
-                GenericResult::Halt(code) => return GenericResult::Halt(code),
-                // Array construction is atomic in jq (verified: `[1,error("x"),3]`
-                // produces no output at all, not a partial array) -- a `Partial`
-                // inner stream surfaces only its terminating control, discarding
-                // whatever prefix it already produced. Mirrors
-                // `eval::eval_array_construction`'s identical arm.
-                GenericResult::Partial(_, Control::Error(e)) => return GenericResult::Error(e),
-                GenericResult::Partial(_, Control::Break(label)) => {
+                //
+                // Array construction is atomic in jq (verified:
+                // `[1,error("x"),3]` produces no output at all, not a
+                // partial array) -- a bare `Error`/`Break`/`Halt` and its
+                // `Partial` sibling return the identical result (the
+                // `Partial` prefix is unconditionally discarded), so they
+                // merge via or-patterns. Mirrors `eval::eval_array_construction`'s
+                // identical arms.
+                GenericResult::Error(e) | GenericResult::Partial(_, Control::Error(e)) => {
+                    return GenericResult::Error(e)
+                }
+                GenericResult::Break(label) | GenericResult::Partial(_, Control::Break(label)) => {
                     return GenericResult::Break(label)
                 }
-                GenericResult::Partial(_, Control::Halt(code)) => return GenericResult::Halt(code),
+                GenericResult::Halt(code) | GenericResult::Partial(_, Control::Halt(code)) => {
+                    return GenericResult::Halt(code)
+                }
                 GenericResult::LazyKeys { .. }
                 | GenericResult::LazyIndexRange(_)
                 | GenericResult::LazySeq(_) => {
                     unreachable!("materialize_lazy() already normalized every lazy variant")
                 }
             };
-            GenericResult::Owned(OwnedValue::Array(items))
+            // Fixed up as one whole unit, not per-source (#953/#1168, see
+            // `yq_float_fidelity_fixup`'s own doc comment for why -- in
+            // short, a builtin's own construction around a document value
+            // (`to_entries`, ...) is indistinguishable here from a genuinely
+            // computed one, so the fixup can't be scoped any narrower than
+            // this without missing that case).
+            match yq_float_fidelity_fixup::<S, _>(items) {
+                Ok(fixed) => GenericResult::Owned(OwnedValue::Array(fixed)),
+                Err(result) => result,
+            }
         }
 
         // Comma: evaluate each operand in source order against the ambient
@@ -2889,22 +2885,25 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
         // a cursor-native builtin's fix doesn't lose it to the wildcard
         // fallback just for being joined with `,` either (#1168).
         //
-        // Each sibling's own `push_generic_owned_values_yq_fixed` call fixes
-        // up only a direct cursor result (`OneCursor`/`ManyCursor`), same
-        // scoping and reasoning as `Expr::Array`'s own arm above -- an
-        // already-constructed value (an already-computed arithmetic result,
-        // a builtin's own object construction) is passed through untouched.
+        // `yq_float_fidelity_fixup` runs once over the whole collected `out`
+        // after the loop, not per-sibling -- same reasoning as `Expr::Array`
+        // above, and cheaper (one round trip for `.a, .b, .c` instead of up
+        // to three).
         Expr::Comma(exprs) => {
             let mut out: Vec<OwnedValue> = Vec::new();
             for expr in exprs {
                 let result = eval_single::<S, _>(expr, value.clone(), optional, cursor);
-                match push_generic_owned_values_yq_fixed::<S, _>(result, &mut out) {
-                    Ok(Some(control)) => return partial_generic(out, control),
-                    Ok(None) => {}
-                    Err(result) => return result,
+                if let Some(control) = push_generic_owned_values(result, &mut out) {
+                    return match yq_float_fidelity_fixup::<S, _>(out) {
+                        Ok(fixed) => partial_generic(fixed, control),
+                        Err(result) => result,
+                    };
                 }
             }
-            owned_vec_to_generic_result(out)
+            match yq_float_fidelity_fixup::<S, _>(out) {
+                Ok(fixed) => owned_vec_to_generic_result(fixed),
+                Err(result) => result,
+            }
         }
 
         // Fall back to the full evaluator for complex expressions

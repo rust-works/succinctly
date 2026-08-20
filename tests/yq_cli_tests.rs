@@ -13141,21 +13141,79 @@ fn test_yq_array_wrapped_overflow_int_keeps_decimal_point_953() -> Result<()> {
     Ok(())
 }
 
-/// #1168 review: fixing #953's regression above (`Expr::Array`'s new native
-/// arm bypasses the old wildcard fallback's own `to_json_for_reindex`
-/// round-trip, which is where #953's decimal-point forcing actually lives)
-/// must not force it onto a *genuinely computed* float too -- only a direct
-/// cursor result (a value read from the input document, e.g. `.a` above)
-/// gets `yq_float_fidelity_fixup`'s round-trip; an arithmetic result never
-/// touches the input document at all, and must keep real yq's ordinary
-/// scientific-notation threshold instead (matching `1e20*1 | tostring`, and
-/// the same distinction `test_yq_join_element_computed_float_known_gap_1124`
-/// already documents for `join`).
+/// #1168 review round: `[to_entries]`/`to_entries, to_entries` regressed
+/// #953 the same way `[.a]` above does, but less obviously -- `to_entries`
+/// (`Builtin::ToEntries`) reads the overflow field via `to_owned_cursor`
+/// exactly like `.a` does, just wrapped in its own `{key, value}` object
+/// construction before `Expr::Array`/`Expr::Comma` ever sees the result,
+/// so it reaches them as `GenericResult::Owned`, not `OneCursor`. An
+/// earlier version of `yq_float_fidelity_fixup` scoped itself to only
+/// `OneCursor`/`ManyCursor` on the theory that `Owned` always means
+/// "already computed" -- wrong, and this test pins the case that proved it
+/// (found live against a rebuilt pre-#1168 baseline during code review).
 #[test]
-fn test_yq_array_wrapped_computed_float_keeps_scientific_notation_1168() -> Result<()> {
+fn test_yq_array_comma_wrapped_to_entries_overflow_int_keeps_decimal_point_1168() -> Result<()> {
+    let yaml = "a: 99999999999999999999\n";
+    let extra_args = ["-o", "json", "-I0"];
+
+    let (array_output, code) = run_yq_stdin("[to_entries]", yaml, &extra_args)?;
+    assert_eq!(code, 0);
+    assert_eq!(
+        array_output.trim_end(),
+        r#"[[{"key":"a","value":100000000000000000000.0}]]"#
+    );
+
+    let (comma_output, code) = run_yq_stdin("to_entries, to_entries", yaml, &extra_args)?;
+    assert_eq!(code, 0);
+    assert_eq!(
+        comma_output.trim_end(),
+        "[{\"key\":\"a\",\"value\":100000000000000000000.0}]\n[{\"key\":\"a\",\"value\":100000000000000000000.0}]"
+    );
+    Ok(())
+}
+
+/// #1168 review round: `Expr::Comma`'s fixup used to round-trip once per
+/// cursor-backed sibling instead of once for the whole comma expression --
+/// this doesn't assert on the round-trip count directly (no test hook for
+/// that), but pins the observable correctness the batched version must
+/// still deliver: every sibling's own overflow field independently forced
+/// to a decimal spelling, plain values untouched.
+#[test]
+fn test_yq_comma_multiple_overflow_fields_all_fixed_1168() -> Result<()> {
+    let yaml = "a: 99999999999999999999\nb: 1\nc: 88888888888888888888\n";
+    let (stdout, code) = run_yq_stdin(".a, .b, .c", yaml, &["-o", "json"])?;
+    assert_eq!(code, 0);
+    assert_eq!(
+        stdout,
+        "100000000000000000000.0\n1\n88888888888888890000.0\n"
+    );
+    Ok(())
+}
+
+/// #1168 review round: `yq_float_fidelity_fixup` first tried scoping itself
+/// to only a direct cursor result (`OneCursor`/`ManyCursor`), leaving an
+/// already-constructed value (`Owned`/`ManyOwned`) untouched on the theory
+/// that it can't be a document literal. That theory was wrong -- code review
+/// found `Builtin::ToEntries` (and any other builtin with its own native
+/// construction around a document value) *also* reaches `Expr::Array` as
+/// `Owned`, so the narrower scoping silently regressed #953 for exactly
+/// that shape (`[to_entries]` on an overflow field, see
+/// `test_yq_array_wrapped_to_entries_overflow_int_keeps_decimal_point_1168`
+/// below) while it was trying to avoid over-forcing a genuinely computed
+/// float like this one. Since a `GenericResult` variant can't distinguish
+/// "builtin construction around a document value" from "genuinely computed"
+/// once a value has passed through even one further construction step, the
+/// fixup now applies uniformly to the whole constructed result -- accepting
+/// this known, pre-existing-class gap (same shape as #1124/#1144's `join`
+/// gap) as the trade-off: a bare computed float wrapped directly in
+/// `[...]`/`,` also gets its decimal point forced, when real yq would keep
+/// scientific notation. Pinned here so a future attempt to "fix" this case
+/// re-checks it doesn't reintroduce the `to_entries` regression instead.
+#[test]
+fn test_yq_array_wrapped_computed_float_forces_decimal_known_gap_1168() -> Result<()> {
     let (stdout, code) = run_yq_stdin("[1e20 * 1]", "null\n", &["-o", "json", "-I0"])?;
     assert_eq!(code, 0);
-    assert_eq!(stdout.trim_end(), "[1e+20]");
+    assert_eq!(stdout.trim_end(), "[100000000000000000000.0]");
     Ok(())
 }
 
