@@ -12883,7 +12883,7 @@ fn test_jq_chained_scalar_slice_assign_and_del_still_error_1116() -> Result<()> 
 /// #1153's `delete_at_path` `Expr::Paren` arm is general (not gated by
 /// `EvalSemantics`), so a plain parenthesized delete target now works in
 /// jq mode too, matching real jq (`del((.a))` succeeds there). But the
-/// *other* half of #1153 -- `yq_del_scalar_slice_parent_path`'s
+/// *other* half of #1153 -- `yq_del_slice_outcome`'s
 /// `unwrap_paren` fix -- is itself gated to yq mode by its caller
 /// (`S::TAG == EvalTag::Yq`), so a parenthesized chained scalar-slice
 /// target must still error in jq mode exactly like its unparenthesized
