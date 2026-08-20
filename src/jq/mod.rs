@@ -105,8 +105,9 @@ pub use stream::{StreamError, StreamStats, StreamableValue};
 pub use value::{
     assert_value_tree_depth, format_number_jq_compat, NumberRepr, OwnedValue, MAX_VALUE_TREE_DEPTH,
 };
-// `pub(crate)`, not `pub`: only `yaml::light`'s `resolve_alias_chain` (#1191
-// code review) needs this from outside `jq::value` -- re-exporting it as a
-// real public API item would put a crate-internal depth-guard helper on
-// docs.rs with no external caller to justify the exposure.
+// `pub(crate)`, not `pub`: only `yaml::light`'s alias-chain resolvers (#1191
+// code review, #1193/PR #1314) need this from outside `jq::value` --
+// re-exporting it as a real public API item would put a crate-internal
+// depth-guard helper on docs.rs with no external caller to justify the
+// exposure.
 pub(crate) use value::assert_depth;

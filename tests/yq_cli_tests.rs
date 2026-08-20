@@ -4841,6 +4841,84 @@ fn test_yaml_direct_self_alias_cycle() -> Result<()> {
 }
 
 // =============================================================================
+// Deep (non-cyclic) alias-chain recursion guard (#1193) -- a syntactically
+// valid chain of anchored aliases, each referencing the previous, that never
+// revisits its own anchor (so #153's cycle check above doesn't reject it),
+// used to drive real, uncatchable stack overflow through
+// `YamlValue::Alias`'s recursive scalar accessors.
+// =============================================================================
+
+/// Builds `k0: &a0 <leaf>`, `k1: &a1 *a0`, ..., `z: *a{depth - 1}` -- a
+/// chain of `depth` anchored aliases, each hopping to the previous, with a
+/// top-level `z` referencing the tail.
+fn deep_alias_chain(depth: usize, leaf: &str) -> String {
+    let mut doc = String::new();
+    for i in 0..depth {
+        if i == 0 {
+            doc.push_str(&format!("k{i}: &a{i} {leaf}\n"));
+        } else {
+            doc.push_str(&format!("k{i}: &a{i} *a{}\n", i - 1));
+        }
+    }
+    doc.push_str(&format!("z: *a{}\n", depth - 1));
+    doc
+}
+
+#[test]
+fn test_yaml_deep_alias_chain_does_not_stack_overflow_1193() -> Result<()> {
+    // 50,000 hops crashed with SIGABRT (exit 134, "stack overflow, aborting")
+    // before the fix; the issue's own measurement found 20,000 hops still
+    // safe under the old recursive accessors. `[.z]` array-wraps the tail so
+    // the query is forced through `to_owned_at_depth`'s typed accessors
+    // (`as_bool`/`as_i64`/.../`type_name`) rather than the identity-output
+    // streaming path, which resolves aliases differently (and is untouched
+    // by this fix). An integer leaf exercises `as_i64`, confirming the fix
+    // doesn't just avoid the crash but resolves the full chain correctly.
+    let input = deep_alias_chain(50_000, "42");
+    let (stdout, stderr, exit_code) =
+        run_yq_stdin_with_stderr("[.z]", &input, &["-o", "json", "--indent", "0"])?;
+    assert_eq!(exit_code, 0, "expected a clean exit, stderr: {stderr}");
+    assert_eq!(stdout.trim(), "[42]");
+    Ok(())
+}
+
+#[test]
+fn test_yaml_moderate_alias_chain_resolves_through_every_hop_1193() -> Result<()> {
+    // A chain well short of any depth guard, confirming the iterative
+    // `resolve_alias_chain` walk is correct at ordinary depths, not just
+    // crash-safe at extreme ones. `as_bool` is one of the accessors that
+    // used to recurse via `target.and_then(|t| t.value().as_bool())`.
+    let input = deep_alias_chain(25, "true");
+    let (stdout, exit_code) = run_yq_stdin("[.z, (.z and true)]", &input, &["-o", "json"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(stdout.trim(), "[\n  true,\n  true\n]");
+    Ok(())
+}
+
+#[test]
+fn test_yaml_alias_chain_past_depth_cap_panics_cleanly_not_via_stack_overflow_1193() -> Result<()> {
+    // Past `MAX_ALIAS_CHAIN_DEPTH` (65,536), `resolve_alias_chain` panics
+    // (via `assert_depth`, mirroring this crate's other `MAX_*` depth
+    // ceilings) rather than looping forever. A `Result::unwrap`-style Rust
+    // panic unwinds cleanly to exit 101 with a message -- a world apart from
+    // the uncatchable exit-134 SIGABRT this issue reports, even though
+    // neither is catchable by a jq `try`/`catch` inside the query itself.
+    let input = deep_alias_chain(70_000, "42");
+    let (stdout, stderr, exit_code) =
+        run_yq_stdin_with_stderr("[.z]", &input, &["-o", "json", "--indent", "0"])?;
+    assert_eq!(
+        exit_code, 101,
+        "expected a clean panic exit, stderr: {stderr}"
+    );
+    assert_eq!(stdout, "");
+    assert!(
+        stderr.contains("nesting depth exceeds limit"),
+        "stderr should name the depth guard: {stderr}"
+    );
+    Ok(())
+}
+
+// =============================================================================
 // Compatibility tests - Block scalar edge cases
 // =============================================================================
 

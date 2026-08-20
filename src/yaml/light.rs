@@ -5817,21 +5817,28 @@ use crate::jq::document::{
 /// On `main` prior to this constant, `as_str()`'s `Alias` arm checked only a
 /// single hop (`if let YamlValue::String(s) = t.value() {...} else { None }`)
 /// -- correctness-buggy (a 2+-hop alias-to-string silently returned `None`)
-/// but not itself a stack-overflow risk, since it never recursed. Every
-/// *other* typed accessor on [`YamlValue`] -- `as_bool`, `as_i64`, `as_f64`,
-/// `number_literal`, `as_object`, `as_array`, `type_name`, `is_null` --
-/// already resolves an alias chain via genuine self-recursion
+/// but not itself a stack-overflow risk, since it never recursed (#1191).
+/// Every *other* typed accessor on [`YamlValue`] -- `as_bool`, `as_i64`,
+/// `as_f64`, `number_literal`, `as_object`, `as_array`, `type_name`,
+/// `is_null` -- resolved an alias chain via genuine self-recursion
 /// (`target.and_then(|t| t.value().<accessor>())`, re-entering itself once
-/// per hop) and so already carries a real, uncatchable stack-overflow DoS
+/// per hop) and so already carried a real, uncatchable stack-overflow DoS
 /// on a syntactically valid, non-cyclic chain of tens of thousands of
 /// anchored aliases -- separate from #153's build-time acyclicity check,
 /// which only rejects a chain that revisits its own anchor, not one that is
-/// merely very long. #1193 tracks fixing those 8; out of scope here. This
-/// PR's own first attempt at fixing `as_str()`'s correctness bug copied
-/// that same self-recursive shape, which introduced the identical
-/// stack-overflow regression into `as_str()` too before review caught it --
-/// `resolve_alias_chain`'s iterative loop is the fix for that regression,
-/// not for anything that was ever live on `main`.
+/// merely very long. #1193/PR #1314 fixes all 8 of those, routing each
+/// through this same `resolve_alias_chain`, alongside the YAML->JSON
+/// streaming writers (`stream_json_value`/`write_json_to`), `tag()`, and
+/// the CLI/evaluator's `yaml_to_owned_value`/`yaml_value_to_owned` -- five
+/// more independently-self-recursive sites #1191's own review didn't
+/// cover, each needing the resolved *cursor* rather than just the value
+/// (see `YamlCursor::resolve_alias_target_cursor`, this method's
+/// cursor-returning sibling). #1191's own first attempt at fixing
+/// `as_str()`'s correctness bug copied that same self-recursive shape,
+/// which introduced the identical stack-overflow regression into
+/// `as_str()` too before review caught it -- `resolve_alias_chain`'s
+/// iterative loop is the fix for that regression, not for anything that
+/// was ever live on `main` before #1191.
 ///
 /// Unlike this crate's other `MAX_*` depth ceilings
 /// ([`eval_generic::MAX_NESTING_DEPTH`](crate::jq::eval_generic::MAX_NESTING_DEPTH),
@@ -6060,11 +6067,18 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentValue for YamlValue<'a, W> {
                 }
             }
             YamlValue::Alias { target, .. } => {
-                // An alias is null exactly when its target is. The `None` arm is
-                // unreachable for an index from `YamlIndex::build`, which since
-                // #372 refuses an alias it cannot resolve; it is kept, rather
-                // than unwrapped, so a hand-built index cannot panic here.
-                target.map_or(true, |t| t.value().is_null())
+                // Resolve the *entire* alias chain first via the target
+                // cursor's own `resolve_alias_chain` (#1193/PR #1314; see
+                // `MAX_ALIAS_CHAIN_DEPTH`'s doc comment, and `as_str`'s own
+                // `Alias` arm above, fixed the same way for #1191), not a
+                // single-hop `t.value()` match. The `None` arm is
+                // unreachable for an index from `YamlIndex::build`, which
+                // since #372 refuses an alias it cannot resolve; it is
+                // kept, rather than unwrapped, so a hand-built index
+                // cannot panic here.
+                target.map_or(true, |t| {
+                    t.resolve_alias_chain().map_or(true, |v| v.is_null())
+                })
             }
             _ => false,
         }
@@ -6082,7 +6096,10 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentValue for YamlValue<'a, W> {
                     _ => None,
                 }
             }
-            YamlValue::Alias { target, .. } => target.and_then(|t| t.value().as_bool()),
+            // See `is_null`'s `Alias` arm above (#1193/PR #1314).
+            YamlValue::Alias { target, .. } => {
+                target.and_then(|t| t.resolve_alias_chain()?.as_bool())
+            }
             _ => None,
         }
     }
@@ -6096,7 +6113,10 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentValue for YamlValue<'a, W> {
                     _ => None,
                 }
             }
-            YamlValue::Alias { target, .. } => target.and_then(|t| t.value().as_i64()),
+            // See `is_null`'s `Alias` arm above (#1193/PR #1314).
+            YamlValue::Alias { target, .. } => {
+                target.and_then(|t| t.resolve_alias_chain()?.as_i64())
+            }
             _ => None,
         }
     }
@@ -6112,7 +6132,10 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentValue for YamlValue<'a, W> {
                     _ => None,
                 }
             }
-            YamlValue::Alias { target, .. } => target.and_then(|t| t.value().as_f64()),
+            // See `is_null`'s `Alias` arm above (#1193/PR #1314).
+            YamlValue::Alias { target, .. } => {
+                target.and_then(|t| t.resolve_alias_chain()?.as_f64())
+            }
             _ => None,
         }
     }
@@ -6161,11 +6184,11 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentValue for YamlValue<'a, W> {
                     _ => None,
                 }
             }
-            // `t.value()` is a temporary, so (as `as_str`'s alias arm above
-            // also has to) any borrowed `Cow` it hands back must be owned
-            // before the closure returns.
+            // See `as_str`'s `Alias` arm below (#1191/#1193, PR #1314): the
+            // resolved value is a temporary, so any borrowed `Cow` it hands
+            // back must be owned before the closure returns.
             YamlValue::Alias { target, .. } => target.and_then(|t| {
-                t.value()
+                t.resolve_alias_chain()?
                     .number_literal()
                     .map(|cow| Cow::Owned(cow.into_owned()))
             }),
@@ -6205,7 +6228,10 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentValue for YamlValue<'a, W> {
     fn as_object(&self) -> Option<Self::Fields> {
         match self {
             YamlValue::Mapping(fields) => Some(fields.clone()),
-            YamlValue::Alias { target, .. } => target.and_then(|t| t.value().as_object()),
+            // See `as_str`'s `Alias` arm above (#1191/#1193, PR #1314).
+            YamlValue::Alias { target, .. } => {
+                target.and_then(|t| t.resolve_alias_chain()?.as_object())
+            }
             _ => None,
         }
     }
@@ -6213,7 +6239,10 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentValue for YamlValue<'a, W> {
     fn as_array(&self) -> Option<Self::Elements> {
         match self {
             YamlValue::Sequence(elements) => Some(*elements),
-            YamlValue::Alias { target, .. } => target.and_then(|t| t.value().as_array()),
+            // See `as_str`'s `Alias` arm above (#1191/#1193, PR #1314).
+            YamlValue::Alias { target, .. } => {
+                target.and_then(|t| t.resolve_alias_chain()?.as_array())
+            }
             _ => None,
         }
     }
@@ -6232,7 +6261,10 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentValue for YamlValue<'a, W> {
             }
             YamlValue::Mapping(_) => "object",
             YamlValue::Sequence(_) => "array",
-            YamlValue::Alias { target, .. } => target.map_or("null", |t| t.value().type_name()),
+            // See `as_str`'s `Alias` arm above (#1191/#1193, PR #1314).
+            YamlValue::Alias { target, .. } => target.map_or("null", |t| {
+                t.resolve_alias_chain().map_or("null", |v| v.type_name())
+            }),
             YamlValue::Error(_) => "error",
         }
     }
