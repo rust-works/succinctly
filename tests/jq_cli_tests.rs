@@ -5130,6 +5130,58 @@ fn test_array_wrapped_path_context_builtin_control_flow_1302() -> Result<()> {
     Ok(())
 }
 
+/// Code review on #1302's own PR (#1333): the new array arm originally
+/// passed the ambient `optional` straight into evaluating the array's
+/// inner expression, letting a leaf error deep inside self-swallow via its
+/// own local `if optional` check before ever reaching the array's own
+/// atomicity match -- corrupting `[key, error("boom")]?` into a partial
+/// array (`["a"]`) instead of the whole construction being caught, unlike
+/// real jq's structurally identical `[1, error("x")]?` (empty output).
+/// Verified live against real jq for the baseline comparison.
+#[test]
+fn test_array_wrapped_path_context_builtin_optional_is_atomic_1302() -> Result<()> {
+    // A comma branch that succeeds (`key`) before a later branch errors:
+    // `?` must discard the whole array, not just the erroring branch.
+    let (stdout, _, code) =
+        run_jq_full(&["-c", ".a | [key, error(\"boom\")]?"], Some(r#"{"a":1}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "");
+
+    // Same shape via a genuine type error instead of an explicit `error()`.
+    let (stdout, _, code) = run_jq_full(&["-c", ".a | [key, 1 + \"x\"]?"], Some(r#"{"a":1}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "");
+
+    // An error as the array's *only* content: must produce no output at
+    // all, not a spurious `[]` (which would conflate a caught error with
+    // #1280's genuine-zero-output-generator case).
+    let (stdout, _, code) = run_jq_full(
+        &["-c", ".a | [(key | error(\"boom\"))]?"],
+        Some(r#"{"a":1}"#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "");
+
+    // Without `?`, the same query still hard-errors -- the fix must not
+    // accidentally make every error inside such an array silently vanish.
+    let (_stdout, stderr, code) =
+        run_jq_full(&["-c", ".a | [key, error(\"boom\")]"], Some(r#"{"a":1}"#))?;
+    assert_eq!(code, 5);
+    assert!(stderr.contains("boom"), "stderr: {stderr}");
+
+    // A genuinely nested `?` *inside* the array (not on the array itself)
+    // must still work on its own terms, independent of the array's own
+    // (here absent) `?`.
+    let (stdout, _, code) = run_jq_full(
+        &["-c", ".a | [key, (error(\"boom\"))?]"],
+        Some(r#"{"a":1}"#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), r#"["a"]"#);
+
+    Ok(())
+}
+
 /// `keys_unsorted` stays lazy through `length`/`.[]`/`.[n]`/`first`/`last`
 /// (#140), backed by a new `JqValue::LazyKeysArray` output writer in
 /// `print_json`. Uses `run_jq_full` (the pre-built binary) to exercise that

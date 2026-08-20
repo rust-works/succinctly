@@ -11012,9 +11012,10 @@ pub fn eval_lenient<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// `eval_pipe_with_path_context_internal` can reach it: plain
 /// `.`/`.[]`/`.field` navigation, comparisons, `select(...)`, `map(...)`,
 /// `if`/`then`/`else`, `try`/`catch`, comma, and `label` (the same
-/// capability level `key`/`document_index` already have; array/object
-/// literals and user-defined functions remain out of scope, matching those
-/// builtins' own existing limits).
+/// capability level `key`/`document_index` already have; an array literal
+/// gained this capability too, #1302 -- object literals, string
+/// interpolation, and user-defined functions remain out of scope, matching
+/// those builtins' own existing limits).
 ///
 /// Routes through the ordinary evaluator, untouched, whenever `expr`
 /// doesn't reference `file_index`/`key`/`parent`/`path` anywhere
@@ -18363,6 +18364,28 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
         // outputs the same way `eval_array_construction` collects the plain
         // evaluator's outputs elsewhere, then continue exactly as the
         // generic arm below does (reset path/root for `rest`).
+        //
+        // The inner evaluation is deliberately run with `optional` forced
+        // to `false`, not the ambient value this arm itself received (code
+        // review, #1302): `Expr::Optional`'s own dispatch a few arms above
+        // just broadcasts `optional=true` into whatever it wraps, with no
+        // catch of its own -- unlike the plain evaluator's `Expr::Optional`
+        // arm, which delegates to `eval_try` (evaluate, then explicitly
+        // convert an escaping `Error`/`Partial(_, Error)` to `None` at the
+        // top). Passing the ambient value straight through here let a
+        // genuine error deep inside the array (e.g. `error(...)`) get
+        // self-swallowed by its own leaf-level `if optional` check before
+        // ever reaching this match, corrupting `[key, error("boom")]?`
+        // into a partial array (`["a"]`) instead of catching the whole
+        // construction atomically the way real jq's `[1, error("x")]?`
+        // does. Forcing `false` here lets a genuine error surface as a
+        // real `Error`/`Partial(_, Error)`, which this arm then catches
+        // itself using *its own* `optional` -- the same
+        // evaluate-then-catch shape as `eval_try`, and the same catch
+        // condition the sibling `Object`/`Array`/`Literal` arm below
+        // already applies (`Err(EvalEscape::Error(_)) if optional`). Only
+        // `Error` is caught, not `Break`/`Halt` -- `?` never catches those
+        // (matches the sibling arm and `eval_try` above).
         Expr::Array(inner) if needs_path_context(inner) => {
             let inner_result = eval_pipe_with_path_context_internal::<W, S>(
                 core::slice::from_ref(inner),
@@ -18370,12 +18393,15 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
                 root,
                 file_origin,
                 current_path,
-                optional,
+                false,
             );
             let items: Vec<OwnedValue> = match inner_result {
                 QueryResult::Owned(v) => vec![v],
                 QueryResult::ManyOwned(vs) => vs,
                 QueryResult::None => vec![],
+                QueryResult::Error(_) | QueryResult::Partial(_, Control::Error(_)) if optional => {
+                    return QueryResult::None;
+                }
                 QueryResult::Error(e) => return QueryResult::Error(e),
                 QueryResult::Break(label) => return QueryResult::Break(label),
                 QueryResult::Halt(code) => return QueryResult::Halt(code),
