@@ -9449,18 +9449,11 @@ fn test_parent_n_argument_still_swallows_ordinary_error_under_optional() -> Resu
 /// `first` itself, not nested inside another builtin's argument) no longer
 /// reaches this arm as an `Err` at all -- it now resolves to
 /// `QueryResult::None` directly (correct, matching real jq's own `has(...)?`
-/// swallowing to zero output, live-verified), which `eval_owned_expr_ctrl_full`
-/// collapses to `Ok(Null)` on its way through `eval_builtin_owned`. That
-/// lands in this arm's `Ok(result) => QueryResult::Owned(result)` branch,
-/// not the `Err(...) if optional` branch this test originally exercised --
-/// exposing a *separate*, pre-existing divergence from real jq (confirmed
-/// still present on `main` before #1045, via `has`'s own primitive-type
-/// mismatch: `.a.b | (has("x"))?, key` on a non-container `.a.b` already
-/// printed `null` before `"b"` here, when real jq's `has(...)?` on a bad
-/// type is *empty*, not `null` -- e.g. `("s"|has("x"))?` prints nothing).
-/// That pre-existing path-context bug is out of scope for #1045 (filed
-/// separately) -- this test now pins the actual current output instead of
-/// re-deriving a trick that no longer isolates the intended guard.
+/// swallowing to zero output, live-verified). #1280 fixed the arm's own
+/// `Ok`-side handling to preserve that `None` as zero output instead of
+/// collapsing it to `Ok(Null)` via `eval_builtin_owned` -- this test now
+/// pins the corrected output (matching real jq's own `has(...)?` empty-not-
+/// null contract) instead of the characterized bug it originally caught.
 #[test]
 fn test_path_context_builtin_arm_still_swallows_ordinary_error_under_optional() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(
@@ -9468,16 +9461,15 @@ fn test_path_context_builtin_arm_still_swallows_ordinary_error_under_optional() 
         Some(r#"{"a":{"b":{"c":1}}}"#),
     )?;
     assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
-    assert_eq!(stdout, "null\n\"b\"\n");
+    assert_eq!(stdout, "\"b\"\n");
     assert_eq!(stderr, "");
     Ok(())
 }
 
 /// Companion to `test_path_context_optional_does_not_swallow_halt_in_object_literal_arm`,
-/// same #1045 impact as `test_path_context_builtin_arm_still_swallows_ordinary_error_under_optional`
-/// just above -- see that test's doc comment for the full explanation. The
-/// pre-existing path-context None-to-null bug this exposes is filed
-/// separately, out of scope for #1045.
+/// same #1045/#1280 history as
+/// `test_path_context_builtin_arm_still_swallows_ordinary_error_under_optional`
+/// just above -- see that test's doc comment for the full explanation.
 #[test]
 fn test_path_context_object_literal_arm_still_swallows_ordinary_error_under_optional() -> Result<()>
 {
@@ -9486,7 +9478,7 @@ fn test_path_context_object_literal_arm_still_swallows_ordinary_error_under_opti
         Some(r#"{"a":{"b":{"c":1}}}"#),
     )?;
     assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
-    assert_eq!(stdout, "null\n\"b\"\n");
+    assert_eq!(stdout, "\"b\"\n");
     assert_eq!(stderr, "");
     Ok(())
 }
@@ -9516,7 +9508,7 @@ fn test_path_context_if_arm_converts_bare_halt_from_cond() -> Result<()> {
 /// Companion to the `Expr::Builtin`/object-literal arms above: targets
 /// `eval_pipe_with_path_context_internal`'s final catch-all `_` arm
 /// (reached for expression kinds with no dedicated handling here, e.g. `X
-/// as $v | BODY`). Same #1045 impact as
+/// as $v | BODY`). Same #1045/#1280 history as
 /// `test_path_context_builtin_arm_still_swallows_ordinary_error_under_optional`
 /// just above -- see that test's doc comment for the full explanation.
 #[test]
@@ -9526,7 +9518,7 @@ fn test_path_context_generic_fallback_still_swallows_ordinary_error_under_option
         Some(r#"{"a":{"b":{"c":1}}}"#),
     )?;
     assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
-    assert_eq!(stdout, "\"b\"\nnull\n");
+    assert_eq!(stdout, "\"b\"\n");
     assert_eq!(stderr, "");
     Ok(())
 }
@@ -13369,12 +13361,10 @@ fn test_getpath_strftime_strptime_tz_load_optional_type_mismatch_suppresses_1045
 /// (a succinctly-only path-tracking extension) is what forces path-context
 /// evaluation to engage at all here.
 ///
-/// Each case prints `null` before `"b"` rather than just `"b"` -- that's
-/// the pre-existing, out-of-scope path-context bug filed as #1280
-/// (`eval_owned_expr_ctrl_full`'s `QueryResult::None => Ok(Null)` collapse,
-/// confirmed to predate #1045), not something this test is trying to
-/// assert is correct; it's pinned here only to keep this coverage-closing
-/// test from silently drifting if that collapse's behavior changes.
+/// Each case used to print `null` before `"b"` rather than just `"b"` --
+/// `eval_owned_expr_ctrl_full`'s `QueryResult::None => Ok(Null)` collapse
+/// (confirmed to predate #1045), fixed by #1280. Now pins the correct
+/// empty-not-null output.
 #[test]
 fn test_getpath_strftime_strptime_tz_load_optional_guard_via_path_context_1045() -> Result<()> {
     let (out, err, code) = run_jq_full(
@@ -13382,30 +13372,89 @@ fn test_getpath_strftime_strptime_tz_load_optional_guard_via_path_context_1045()
         Some(r#"{"a":{"b":{"c":1}}}"#),
     )?;
     assert_eq!(code, 0, "err={err}");
-    assert_eq!(out.trim(), "null\n\"b\"");
+    assert_eq!(out.trim(), "\"b\"");
 
     let (out, err, code) = run_jq_full(
         &["-c", ".a.b | (strftime(1))?, key"],
         Some(r#"{"a":{"b":0}}"#),
     )?;
     assert_eq!(code, 0, "err={err}");
-    assert_eq!(out.trim(), "null\n\"b\"");
+    assert_eq!(out.trim(), "\"b\"");
 
     let (out, err, code) = run_jq_full(
         &["-c", ".a.b | (strptime(1))?, key"],
         Some(r#"{"a":{"b":"x"}}"#),
     )?;
     assert_eq!(code, 0, "err={err}");
-    assert_eq!(out.trim(), "null\n\"b\"");
+    assert_eq!(out.trim(), "\"b\"");
 
     let (out, err, code) = run_jq_full(&["-c", ".a.b | (tz(1))?, key"], Some(r#"{"a":{"b":0}}"#))?;
     assert_eq!(code, 0, "err={err}");
-    assert_eq!(out.trim(), "null\n\"b\"");
+    assert_eq!(out.trim(), "\"b\"");
 
     let (out, err, code) =
         run_jq_full(&["-c", ".a.b | (load(1))?, key"], Some(r#"{"a":{"b":1}}"#))?;
     assert_eq!(code, 0, "err={err}");
-    assert_eq!(out.trim(), "null\n\"b\"");
+    assert_eq!(out.trim(), "\"b\"");
+    Ok(())
+}
+
+/// #1280's own issue repro: `has(...)` on a non-object/array primitive under
+/// `?` (not an error -- `eval_owned_fast_path`'s type-mismatch branch), the
+/// simplest live-reachable trigger for `eval_owned_expr_ctrl_full`'s
+/// `QueryResult::None => Ok(Null)` collapse. `key` forces path-context mode.
+#[test]
+fn test_path_context_builtin_arm_type_mismatch_swallows_to_empty_1280() -> Result<()> {
+    let (out, err, code) = run_jq_full(
+        &["-c", r#".a.b | (has("x"))?, key"#],
+        Some(r#"{"a":{"b":"str"}}"#),
+    )?;
+    assert_eq!(code, 0, "err={err}");
+    assert_eq!(out.trim(), "\"b\"");
+    Ok(())
+}
+
+/// A non-swallowed builtin result alongside `key` still shows its own real
+/// value (`false`, not empty) -- confirms #1280's fix only changed the
+/// `None`-collapse case, not the ordinary success path. Verified against
+/// real jq 1.7.1 (`"b"`, the succinctly-only `key` swapped for a literal, is
+/// unaffected by which builtin runs first).
+#[test]
+fn test_path_context_builtin_arm_non_swallowed_result_unaffected_1280() -> Result<()> {
+    let (out, err, code) = run_jq_full(
+        &["-c", r#".a.b | has("x"), key"#],
+        Some(r#"{"a":{"b":{"c":1}}}"#),
+    )?;
+    assert_eq!(code, 0, "err={err}");
+    assert_eq!(out, "false\n\"b\"\n");
+    Ok(())
+}
+
+/// #1280's `Expr::Object`/`Array`/`Literal` arm: an object-construction key
+/// generator that produces zero outputs (`{(empty): 1}`) means the whole
+/// construction contributes zero outputs, matching real jq
+/// (`{(empty): 1}` -> no output at all) -- confirmed live to have printed a
+/// spurious `null` before this fix, via `eval_owned_expr::<S>(first, ...)`'s
+/// same collapse (a distinct call site from the builtin arm above, since
+/// `Expr::Object` never reaches `eval_owned_fast_path`).
+#[test]
+fn test_path_context_object_arm_empty_key_generator_swallows_to_empty_1280() -> Result<()> {
+    let (out, err, code) = run_jq_full(&["-c", ".a | {(empty):1}, key"], Some(r#"{"a":1}"#))?;
+    assert_eq!(code, 0, "err={err}");
+    assert_eq!(out.trim(), "\"a\"");
+    Ok(())
+}
+
+/// #1280's generic-fallback `_` arm: `X as $v | BODY` where the source `X`
+/// produces zero outputs (`empty as $x | $x`) means the whole binding
+/// contributes zero outputs -- confirmed live to have printed a spurious
+/// `null` before this fix.
+#[test]
+fn test_path_context_generic_fallback_empty_source_swallows_to_empty_1280() -> Result<()> {
+    let (out, err, code) =
+        run_jq_full(&["-c", ".a | (empty as $x | $x), key"], Some(r#"{"a":1}"#))?;
+    assert_eq!(code, 0, "err={err}");
+    assert_eq!(out.trim(), "\"a\"");
     Ok(())
 }
 
