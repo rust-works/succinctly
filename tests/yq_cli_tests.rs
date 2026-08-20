@@ -15453,31 +15453,114 @@ fn test_1220_delpaths_accepts_float_component_characterize_preexisting_bug() -> 
     Ok(())
 }
 
-/// #1223 characterization: a comma-grouped multi-path `del()` crashes when
-/// a sibling's chained-slice target is an `Object`, instead of applying
-/// #1162's own parent-key-drop rule (which the *single-path* form of this
-/// exact query already gets correctly — see `test_1162_chained_object_
-/// slice_del_removes_parent_key`). Root cause is upstream of
-/// `yq_del_scalar_slice_parent_path`, in `resolve_dynamic_indexes`'s
-/// generic multi-path validation for a top-level `Comma` — confirmed
-/// unaffected by #1162's diff either way (identical crash on `main` before
-/// this fix). If this is ever fixed (tracked as #1223), update this
-/// expectation.
+/// #1223: a comma-grouped multi-path `del()` used to crash when a sibling's
+/// chained-slice target was an `Object`, instead of applying #1162's own
+/// parent-key-drop rule (which the *single-path* form of this exact query
+/// already got correctly — see `test_1162_chained_object_slice_del_removes_
+/// parent_key`). Root cause was upstream of `yq_del_scalar_slice_parent_path`,
+/// in `resolve_dynamic_indexes`'s generic multi-path navigation for a
+/// top-level `Comma`: it navigated `.a[0:1]` against the real document
+/// before `builtin_del` ever got a resolved `paths` vector to apply its own
+/// rewrite to, and `Object` has no slice-navigation arm. Fixed by rewriting
+/// every already-static `Comma` branch with `yq_del_scalar_slice_parent_path`
+/// *before* handing the path to `resolve_dynamic_indexes`, so navigation
+/// only ever sees `.a` (the rewritten form), never the crashing `.a[0:1]`.
 #[test]
-fn test_1223_multi_path_del_object_target_characterize_preexisting_bug() -> Result<()> {
-    let (_out, stderr, code) = run_yq_stdin_with_stderr(
+fn test_1223_multi_path_del_object_target_fixed() -> Result<()> {
+    let (out, code) = run_yq_stdin(
+        "del(.a[0:1], .c)",
+        r#"{"a":{"x":1,"y":2},"b":6,"c":9}"#,
+        &["-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), r#"{"b":6}"#);
+    Ok(())
+}
+
+/// #1223: the fix must not care which order the crashing branch appears in
+/// the comma list.
+#[test]
+fn test_1223_multi_path_del_object_target_fixed_reversed_order() -> Result<()> {
+    let (out, code) = run_yq_stdin(
+        "del(.c, .a[0:1])",
+        r#"{"a":{"x":1,"y":2},"b":6,"c":9}"#,
+        &["-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), r#"{"b":6}"#);
+    Ok(())
+}
+
+/// #1223: `resolve_dynamic_indexes`'s generic `Comma` walk also raises the
+/// same class of error when a sibling has a *computed* key ahead of the
+/// crashing branch (`.[.b]` forces the full multi-branch resolver rather
+/// than the `!needs_path_prepass` early-out `del(.a[0:1], .c)` alone takes) —
+/// the computed-key sibling still resolves normally since only the
+/// already-static `.a[0:1]` branch gets rewritten up front.
+#[test]
+fn test_1223_multi_path_del_object_target_with_computed_key_sibling() -> Result<()> {
+    let (out, code) = run_yq_stdin(
+        r#"del(.a[0:1], .[.d])"#,
+        r#"{"a":{"x":1,"y":2},"b":6,"c":9,"d":"c"}"#,
+        &["-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), r#"{"b":6,"d":"c"}"#);
+    Ok(())
+}
+
+/// #1223: jq mode is unaffected by the fix — the rewrite is yq-gated only,
+/// so real jq's own lack of a parent-key-drop concept means this still
+/// errors identically to before (real jq 1.7.1 errors the same way, verified
+/// live).
+#[test]
+fn test_1223_multi_path_del_object_target_jq_mode_unaffected() -> Result<()> {
+    let (_out, stderr, code) = run_jq_stdin_with_stderr(
         "del(.a[0:1], .c)",
         r#"{"a":{"x":1,"y":2},"b":6,"c":9}"#,
         &[],
     )?;
-    assert_ne!(
-        code, 0,
-        "if this now succeeds like real yq ({{\"b\":6}}), update this test and close #1223"
-    );
+    assert_ne!(code, 0);
     assert!(
         stderr.contains("Cannot index object with object"),
         "stderr: {stderr}"
     );
+    Ok(())
+}
+
+/// #1223's own issue text names a second, unrelated finding: succinctly's
+/// multi-path `del()` combining a chained-slice branch with a bare-slice
+/// sibling is order-*insensitive* (both orderings agree, deleting both
+/// index 0 and the `.[2:3]` range) — real yq is itself order-*sensitive*
+/// for this exact shape (confirmed live against yq v4.53.3: the two
+/// orderings give two different answers, neither of which is the
+/// composition of the two single-path results, and neither matches
+/// succinctly's own consistent-but-different answer). There is no coherent
+/// rule to replicate here (`delete_expr_paths_at`'s sibling-index-shifting
+/// logic, not #1223's own fix, drives this) — pinned as a known,
+/// separately-tracked gap rather than silently unasserted. If this is ever
+/// reconciled, update this test's expectations and the doc comment above.
+#[test]
+fn test_yq_mixed_bare_root_and_chained_slice_del_known_gap_1223() -> Result<()> {
+    let input = r"[[1,2,3],[4,5,6],[7,8,9],[10,11,12]]";
+    let expected_succinctly = r"[[4,5,6],[10,11,12]]";
+
+    let (out_a, code_a) = run_yq_stdin("del(.[0][0:1], .[2:3])", input, &["-o=json", "-I=0"])?;
+    assert_eq!(code_a, 0, "out: {out_a:?}");
+    assert_eq!(
+        out_a.trim(),
+        expected_succinctly,
+        "real yq gives [[1,2,3],[4,5,6],[7,8,9],[10,11,12]] (unchanged) for this ordering"
+    );
+
+    let (out_b, code_b) = run_yq_stdin("del(.[2:3], .[0][0:1])", input, &["-o=json", "-I=0"])?;
+    assert_eq!(code_b, 0, "out: {out_b:?}");
+    assert_eq!(
+        out_b.trim(),
+        expected_succinctly,
+        "real yq gives [[4,5,6],[7,8,9],[10,11,12]] (only index 0 dropped) for this ordering"
+    );
+
     Ok(())
 }
 
