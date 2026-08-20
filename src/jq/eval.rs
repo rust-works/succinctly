@@ -11416,11 +11416,11 @@ fn autovivify_array(root: &mut OwnedValue) {
 /// `resolve_setpath_index` (already shared with `setpath()`) for the index
 /// math, so there is exactly one place that decides what a numeric write
 /// index resolves to. A still-negative index (after counting back from the
-/// end) is jq's `Out of bounds negative array index` — the one write-time
-/// check `?` does not suppress — so this is never gated by an
+/// end) is jq's `Out of bounds negative array index` — one of the write-time
+/// checks `?` does not suppress — so this is never gated by an
 /// `optional`/`here` flag at any call site; only `set_path`'s
 /// `Expr::Optional` arm ever needs to tell it apart from a suppressible
-/// error, via [`EvalError::is_negative_index_out_of_bounds`] (#498).
+/// error, via [`EvalError::is_write_time_application_error`] (#498, #1303).
 fn write_index(arr: &mut Vec<OwnedValue>, idx: i64) -> Result<&mut OwnedValue, EvalError> {
     let actual_idx = resolve_setpath_index(&OwnedValue::Int(idx), arr.len())?;
     if actual_idx >= arr.len() {
@@ -11481,7 +11481,7 @@ fn set_path(
                         parent,
                         split.start,
                         split.end,
-                        false,
+                        split.optional,
                         scalar_noop,
                         container_noop,
                         |sub| set_path(sub, &split.tail, new_value, scalar_noop, container_noop),
@@ -11503,12 +11503,14 @@ fn set_path(
         Expr::Optional(inner) => {
             match set_path(root, inner, new_value, scalar_noop, container_noop) {
                 Ok(()) => Ok(()),
-                // jq's `?` suppresses errors raised while *collecting* a path,
-                // but not the write-time bounds check on a still-negative array
-                // index — the one error left that `Index`'s arm above can still
-                // raise now that a positive overrun pads instead of erroring
-                // (#498).
-                Err(e) if e.is_negative_index_out_of_bounds() => Err(e),
+                // jq's `?` suppresses errors raised while *collecting* a
+                // path, but not a write-time application check: a
+                // still-negative array index after the positive-overrun pad
+                // (#498), a non-array RHS for a slice write, or any write to
+                // a string slice at all (#1303) — `.a[0:1]? = 9` on
+                // `{"a":[1,2,3]}` still raises "A slice of an array can only
+                // be assigned another array" in real jq, confirmed live.
+                Err(e) if e.is_write_time_application_error() => Err(e),
                 Err(_) => Ok(()), // Silently succeed for optional
             }
         }
@@ -11737,6 +11739,15 @@ struct SliceSplit {
     before: Vec<Expr>,
     start: Option<i64>,
     end: Option<i64>,
+    /// Whether the slice itself carried a `?` (`.a[0:1]?[0] = 9`) — threaded
+    /// into `through_slice`'s own `optional` parameter so a genuinely
+    /// non-sliceable target there is suppressed the same way a bare
+    /// `.a[0:1]? = 9` already is (#1303). Write-time application errors
+    /// (`slice_assign_non_array`/`cannot_update_string_slices`) are
+    /// unaffected either way — `through_slice` never gates those on
+    /// `optional` at all, matching real jq never suppressing them via an
+    /// inline `?`.
+    optional: bool,
     /// Everything left to apply *inside* the slice, as one expression.
     tail: Expr,
 }
@@ -11756,35 +11767,45 @@ struct SliceSplit {
 /// would already be at the top level of a *fresh* call. This function only
 /// has to handle a compound sub-path sitting *alongside* other components.
 ///
-/// Does **not** see through `Expr::Optional` — `push_path_components` leaves
-/// it opaque (its other callers need that), so `.a[0:1]?[0] = 9` still misses
-/// its slice here. Pre-existing, unrelated to #1292's own repro shape (which
-/// has no `?` anywhere): confirmed identical, unaffected behavior before and
-/// after this function's flattening was added.
+/// Each flattened element is matched via [`unwrap_path_component`] (not a
+/// bare `matches!`), so a `?`-marked slice — `.a[0:1]?[0] = 9`, or
+/// `(.a[0:1]?)[0] = 9` once `push_path_components` has flattened the
+/// enclosing parens away — is still found (#1303): `push_path_components`
+/// itself leaves `Expr::Optional` opaque (its other callers need that), so
+/// without this the wrapped `Slice` reaches this scan unrecognized. Does
+/// *not* reach through a `Pipe`/`Paren` still nested *inside* an `Optional`
+/// wrapper (e.g. a `?` on a whole multi-component group ahead of a further
+/// index, `(.a|.c)?[0] = 9`) — real jq syntax cannot produce that shape here
+/// in the first place (postfix `?` cannot be followed by `[...]`, confirmed
+/// live), so there is nothing to be found either way.
 fn split_at_slice(exprs: &[Expr]) -> Option<SliceSplit> {
     // Cheap common-case guard: the overwhelming majority of assignment
     // targets (`.a.b.c[2] = 9`) contain neither a slice nor a nested
-    // `Pipe`/`Paren` component that could hide one, so skip the
+    // `Pipe`/`Paren`/`Optional` component that could hide one, so skip the
     // allocate-and-clone flatten below entirely when nothing here could
     // possibly need it. Exactly equivalent to running the flatten and
     // finding nothing: `push_path_components` only ever transforms a
-    // `Pipe`/`Paren` element, so a top-level element that is none of
-    // `Slice`/`Pipe`/`Paren` reaches the flattened list completely
-    // unchanged, and a literal `Slice` already at the top level is caught
-    // directly either way.
-    if exprs
-        .iter()
-        .all(|e| !matches!(e, Expr::Slice { .. } | Expr::Pipe(_) | Expr::Paren(_)))
-    {
+    // `Pipe`/`Paren` element, and the scan below only ever looks *through*
+    // `Optional`/`Paren` wrappers via `unwrap_path_component` — so a
+    // top-level element whose own unwrapped core is none of `Slice`/`Pipe`
+    // reaches the flattened list (and this scan) completely unchanged.
+    if exprs.iter().all(|e| {
+        !matches!(
+            unwrap_path_component(e).0,
+            Expr::Slice { .. } | Expr::Pipe(_)
+        )
+    }) {
         return None;
     }
     let mut flat = Vec::with_capacity(exprs.len());
     for e in exprs {
         push_path_components(&mut flat, e);
     }
-    let at = flat.iter().position(|e| matches!(e, Expr::Slice { .. }))?;
-    let (start, end) = match &flat[at] {
-        Expr::Slice { start, end } => (*start, *end),
+    let at = flat
+        .iter()
+        .position(|e| matches!(unwrap_path_component(e).0, Expr::Slice { .. }))?;
+    let (optional, start, end) = match unwrap_path_component(&flat[at]) {
+        (Expr::Slice { start, end }, optional) => (optional, *start, *end),
         _ => unreachable!("position matched a Slice"),
     };
     let rest = flat.split_off(at + 1);
@@ -11793,6 +11814,7 @@ fn split_at_slice(exprs: &[Expr]) -> Option<SliceSplit> {
         before: flat,
         start,
         end,
+        optional,
         // An empty tail means the slice itself is the target, which `Identity`
         // against the extracted sub-array says exactly.
         tail: if rest.is_empty() {
@@ -40059,6 +40081,57 @@ mod tests {
                 "(((.a.b)[0:1]))[0] = 9",
                 Ok(r#"{"a":{"b":[9,2,3]}}"#),
             ),
+        ]);
+    }
+
+    #[test]
+    fn test_assign_optional_slice_1303() {
+        // #1303: two independent gaps around a `?`-marked slice in an
+        // assignment path, both confirmed against real jq 1.7.1.
+        assert_outcomes(&[
+            // Gap 1: a write-time *application* error (the RHS isn't an
+            // array, or the target is a string) was wrongly swallowed by
+            // `set_path`'s `Expr::Optional` arm -- real jq's inline `?`
+            // suppresses a failure to *reach* a target, not a mismatch in
+            // what gets written once one is found (the same class
+            // `is_negative_index_out_of_bounds` already carved out for
+            // `Expr::Index`, #498).
+            (
+                br#"{"a":[1,2,3]}"#,
+                ".a[0:1]? = 9",
+                Err("A slice of an array can only be assigned another array"),
+            ),
+            (
+                br#"{"a":"hello"}"#,
+                r#".a[0:1]? = "x""#,
+                Err("Cannot update string slices"),
+            ),
+            // Contrast: a genuinely non-sliceable target *is* a navigation
+            // failure, and stays suppressed.
+            (br#"{"a":true}"#, ".a[0:1]? = 9", Ok(r#"{"a":true}"#)),
+            // The pre-existing carve-out is unaffected.
+            (
+                br#"{"a":[1,2,3]}"#,
+                ".a[-5]? = 9",
+                Err("Out of bounds negative array index"),
+            ),
+            // Gap 2: `split_at_slice`'s scan didn't see through `Expr::Optional`
+            // at all, so a `?`-marked slice followed by more path -- nested
+            // in parens or not -- fell to "invalid path component" instead
+            // of reaching `through_slice`.
+            (
+                br#"{"a":[1,2,3]}"#,
+                "(.a[0:1]?)[0] = 9",
+                Ok(r#"{"a":[9,2,3]}"#),
+            ),
+            (
+                br#"{"a":[1,2,3]}"#,
+                ".a[0:1]?[0] = 9",
+                Ok(r#"{"a":[9,2,3]}"#),
+            ),
+            // A genuinely non-sliceable target under this same nested shape
+            // is a navigation failure too, and stays suppressed.
+            (br#"{"a":true}"#, ".a[0:1]?[0] = 9", Ok(r#"{"a":true}"#)),
         ]);
     }
 
