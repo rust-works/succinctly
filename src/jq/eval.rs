@@ -12427,16 +12427,55 @@ struct PathBranch<'a> {
     path: Vec<Expr>,
     /// The value found at `path`.
     value: Cow<'a, OwnedValue>,
+    /// Whether this branch's value was actually *reached* by path
+    /// navigation, or merely computed (#986).
+    ///
+    /// `false` means `resolve_leaf`'s catch-all produced it from an
+    /// expression with no path shape of its own — a literal, arithmetic, an
+    /// arbitrary builtin call. Such a branch is not automatically an error:
+    /// whether it is depends on whether anything *after* it still has to
+    /// navigate into it, which only its consumer knows. See
+    /// `docs/plan/jq-path-trackability-deferral.md`.
+    trackable: bool,
 }
 
 impl<'a> PathBranch<'a> {
-    /// Build a branch from its two halves.
+    /// Build a branch reached by genuine path navigation.
     ///
     /// Named rather than a bare struct literal because the overwhelming
     /// majority of construction sites are one-liners inside a `map`/`push`
     /// that read better as a call than as a braced literal.
-    fn new(path: Vec<Expr>, value: Cow<'a, OwnedValue>) -> Self {
-        Self { path, value }
+    ///
+    /// `trackable` is a required argument rather than a default because
+    /// getting it wrong is silent: a site that wrongly says `true` turns a
+    /// computed value into an accepted path, which on the write side means
+    /// `del`/`=` hitting a path that was never really there. Review found
+    /// four sites that a `true` default got wrong — `Select`, the type
+    /// filters, `Builtin::GetPath` and `resolve_seq`'s own root branch, all
+    /// of which pass a value *through* without navigating and so must
+    /// inherit their caller's answer rather than assert one.
+    ///
+    /// Pass `true` only where the site is a genuine navigation step whose
+    /// untracked case is already rejected upstream.
+    fn new(path: Vec<Expr>, value: Cow<'a, OwnedValue>, trackable: bool) -> Self {
+        Self {
+            path,
+            value,
+            trackable,
+        }
+    }
+
+    /// Build a branch for a value that was *computed*, not navigated to.
+    ///
+    /// Only `resolve_leaf`'s catch-all builds these (#986). The path is
+    /// always empty: an expression with no path shape contributes no
+    /// components.
+    fn untracked(value: Cow<'a, OwnedValue>) -> Self {
+        Self {
+            path: Vec::new(),
+            value,
+            trackable: false,
+        }
     }
 
     /// Force this branch's value to `Cow::Owned`, so it can outlive whatever
@@ -12445,6 +12484,7 @@ impl<'a> PathBranch<'a> {
         PathBranch {
             path: self.path,
             value: Cow::Owned(self.value.into_owned()),
+            trackable: self.trackable,
         }
     }
 }
@@ -12664,6 +12704,7 @@ fn resolve_node<'a, S: EvalSemantics>(
                         |PathBranch {
                              path: components,
                              value: v,
+                             trackable,
                          }| {
                             let inner_path = if components.len() == 1 {
                                 components.into_iter().next().expect("len checked")
@@ -12681,7 +12722,13 @@ fn resolve_node<'a, S: EvalSemantics>(
                                 // too, so this was never an invariant of the type.
                                 Expr::Pipe(components)
                             };
-                            PathBranch::new(vec![Expr::Optional(Box::new(inner_path))], v)
+                            PathBranch {
+                                // Wrapping in `?` navigates nothing, so it
+                                // neither grants nor removes trackability.
+                                path: vec![Expr::Optional(Box::new(inner_path))],
+                                value: v,
+                                trackable,
+                            }
                         },
                     )
                     .collect())
@@ -12708,11 +12755,15 @@ fn resolve_node<'a, S: EvalSemantics>(
                 OwnedValue::Array(items) => Ok(items
                     .iter()
                     .enumerate()
-                    .map(|(i, v)| PathBranch::new(vec![Expr::Index(i as i64)], Cow::Borrowed(v)))
+                    .map(|(i, v)| {
+                        PathBranch::new(vec![Expr::Index(i as i64)], Cow::Borrowed(v), true)
+                    })
                     .collect()),
                 OwnedValue::Object(map) => Ok(map
                     .iter()
-                    .map(|(k, v)| PathBranch::new(vec![Expr::Field(k.clone())], Cow::Borrowed(v)))
+                    .map(|(k, v)| {
+                        PathBranch::new(vec![Expr::Field(k.clone())], Cow::Borrowed(v), true)
+                    })
                     .collect()),
                 other => Err((Vec::new(), EvalError::cannot_iterate(other).into())),
             }
@@ -12804,7 +12855,9 @@ fn resolve_node<'a, S: EvalSemantics>(
             let branches: Vec<PathBranch<'a>> = cond_outputs
                 .into_iter()
                 .filter(OwnedValue::is_truthy)
-                .map(|_| PathBranch::new(Vec::new(), Cow::Borrowed(value)))
+                // `select` filters; it never navigates. The value handed
+                // back is the caller's own, so its trackability is too.
+                .map(|_| PathBranch::new(Vec::new(), Cow::Borrowed(value), trackable))
                 .collect();
             path_result(branches, escape)
         }
@@ -12820,7 +12873,12 @@ fn resolve_node<'a, S: EvalSemantics>(
             | Builtin::Scalars),
         ) => {
             if type_filter_matches(builtin, value) {
-                Ok(vec![PathBranch::new(Vec::new(), Cow::Borrowed(value))])
+                // A type filter navigates nothing either.
+                Ok(vec![PathBranch::new(
+                    Vec::new(),
+                    Cow::Borrowed(value),
+                    trackable,
+                )])
             } else {
                 Ok(Vec::new())
             }
@@ -13121,7 +13179,11 @@ fn resolve_node<'a, S: EvalSemantics>(
                     );
                     components.push(component);
                 }
-                let branch = PathBranch::new(components, current);
+                // #843: `getpath` may navigate an untracked value, but that
+                // exemption is for its own indexing only — it does not
+                // launder the result into a trackable one, or
+                // `catch (getpath(["other"]) | .qqq)` would stop raising.
+                let branch = PathBranch::new(components, current, trackable);
                 return path_result(vec![branch], escape);
             }
             if let Some(e) = escape {
@@ -13248,16 +13310,17 @@ fn recurse_untracked_error<'a>(value: &OwnedValue) -> (Vec<PathBranch<'a>>, Eval
 /// `try (.a, error({y:99})) catch select(true) = "X"` silently replaced
 /// the entire document with `"X"` instead of raising and writing nothing.
 fn reject_if_untracked(branches: Vec<PathBranch<'_>>, trackable: bool) -> PathResolveResult<'_> {
-    if !trackable {
-        if let Some(PathBranch {
-            value: first_value, ..
-        }) = branches.first()
-        {
-            return Err((
-                Vec::new(),
-                EvalError::invalid_path_expression(first_value).into(),
-            ));
-        }
+    // Two ways to be untracked now (#986): the whole call was made against
+    // an untracked value (`trackable == false`, #843's caught-payload case),
+    // or an individual branch carries its own `false` because
+    // `resolve_leaf`'s catch-all deferred it here. When `trackable` is false
+    // the first branch is the offender, which is exactly what this reported
+    // before — so that case is unchanged.
+    if let Some(offending) = branches.iter().find(|b| !trackable || !b.trackable) {
+        return Err((
+            Vec::new(),
+            EvalError::invalid_path_expression(&offending.value).into(),
+        ));
     }
     Ok(branches)
 }
@@ -13331,9 +13394,11 @@ fn resolve_leaf<'a, S: EvalSemantics>(
             // been one because evaluating `expr` itself broke/errored (Halt
             // excluded, handled above) before producing anything.
             0 => path_result(Vec::new(), trailing),
+            // Guarded by the `trackable &&` on this whole arm.
             1 => Ok(vec![PathBranch::new(
                 components,
                 Cow::Owned(values.pop().expect("len checked")),
+                true,
             )]),
             // A multi-output primitive is not actually reachable today —
             // indexing/slicing a value always yields zero or one result —
@@ -13379,10 +13444,22 @@ fn resolve_leaf<'a, S: EvalSemantics>(
         // live for both) — `resolve_leaf` has no way to tell that context
         // apart from `path(...)`'s own leaf today; filed as #989 rather than
         // attempted here.
-        _ => Err((
-            Vec::new(),
-            EvalError::invalid_path_expression(&values[0]).into(),
-        )),
+        // #986: *defer*, don't raise. Whether a non-path-shaped value is an
+        // error depends on whether anything after it still has to navigate
+        // into it, and only this branch's consumer knows that: `path(1)` is
+        // an error, `path(1|.foo)` blames `.foo`, and `1|halt_error(3)` is
+        // not an error at all — it halts. Handing the value back marked
+        // untracked lets each of those be decided where the answer is
+        // actually known (`resolve_dynamic_indexes`'s terminal check,
+        // `resolve_static_tail`, `resolve_index_expr`'s post-target check),
+        // instead of guessing here.
+        //
+        // Only `values[0]` survives, for the streaming reason spelled out
+        // above: real jq checks each output as it is produced and never
+        // learns whether a second one existed.
+        _ => Ok(vec![PathBranch::untracked(Cow::Owned(
+            values.swap_remove(0),
+        ))]),
     }
 }
 
@@ -13423,7 +13500,9 @@ fn push_recursive_branches<'a>(
     out: &mut Vec<PathBranch<'a>>,
 ) {
     assert_value_tree_depth(prefix.len());
-    out.push(PathBranch::new(prefix.to_vec(), Cow::Borrowed(value)));
+    // Structural descent only, reached under the recurse-family
+    // untracked guard.
+    out.push(PathBranch::new(prefix.to_vec(), Cow::Borrowed(value), true));
     match value {
         OwnedValue::Array(items) => {
             for (i, item) in items.iter().enumerate() {
@@ -13776,7 +13855,8 @@ fn resolve_recurse<'a, S: EvalSemantics>(
          recurse-family guard in resolve_node should have caught this first"
     );
     let mut outputs: Vec<PathBranch<'a>> = Vec::new();
-    let mut stack: Vec<PathBranch<'a>> = vec![PathBranch::new(Vec::new(), Cow::Borrowed(value))];
+    let mut stack: Vec<PathBranch<'a>> =
+        vec![PathBranch::new(Vec::new(), Cow::Borrowed(value), trackable)];
     // Set by `queue_recurse_children` once `f` itself ends in an
     // error/break/halt — see that function's doc comment (#842).
     let mut pending_error: Option<EvalEscape> = None;
@@ -13785,10 +13865,22 @@ fn resolve_recurse<'a, S: EvalSemantics>(
         let PathBranch {
             path: prefix,
             value: current,
+            trackable: node_trackable,
         } = stack.pop().unwrap();
         // `current.clone()` is cheap (`Cow`, #668). `prefix.clone()` is not —
         // still `O(path length)` per node, `O(d²)` total; #701, unfixed here.
-        outputs.push(PathBranch::new(prefix.clone(), current.clone()));
+        outputs.push(PathBranch {
+            path: prefix.clone(),
+            value: current.clone(),
+            // Propagated rather than assumed `true`. The shared
+            // recurse-family guard means only a trackable value can enter
+            // this loop today, so this is `true` in practice — but carrying
+            // it keeps that a fact about the guard rather than a second
+            // place the invariant has to be independently maintained
+            // (#1023's `MAX_ITEMS` triplication is what the other way looks
+            // like). See #986's Stage 3 open risk.
+            trackable: node_trackable,
+        });
 
         let is_null_current = matches!(current.as_ref(), OwnedValue::Null);
 
@@ -13824,6 +13916,7 @@ fn resolve_recurse<'a, S: EvalSemantics>(
         for PathBranch {
             path: child_components,
             value: child_value,
+            trackable: child_trackable,
         } in children
         {
             let mut path = prefix.clone();
@@ -13843,7 +13936,11 @@ fn resolve_recurse<'a, S: EvalSemantics>(
                     // sibling still waits its own turn on `stack`, so it
                     // can't jump ahead of an earlier sibling's own subtree.
                     if !is_null_current {
-                        next.push(PathBranch::new(path, child_value));
+                        next.push(PathBranch {
+                            path,
+                            value: child_value,
+                            trackable: node_trackable && child_trackable,
+                        });
                     }
                 }
                 Some(cond) => {
@@ -13867,7 +13964,11 @@ fn resolve_recurse<'a, S: EvalSemantics>(
                     // `None` arm above (#856).
                     if let Some(e) =
                         eval_recurse_cond::<S>(cond, &child_value, !is_null_current, || {
-                            next.push(PathBranch::new(path.clone(), child_value.clone()));
+                            next.push(PathBranch {
+                                path: path.clone(),
+                                value: child_value.clone(),
+                                trackable: node_trackable && child_trackable,
+                            });
                         })
                     {
                         deferred_error = Some(e);
@@ -14022,6 +14123,20 @@ fn resolve_index_expr<'a, S: EvalSemantics>(
             ));
         }
     }
+    // #986: the same check, for a `target` that resolved fine but is itself
+    // untracked — `(1 | .) [K]`, where the pipe's own literal deferred here
+    // rather than raising. `trackable` above is the *caller's* context; this
+    // is the target's own. Both produce jq's "near attempt" wording, naming
+    // the first key as the navigation that failed.
+    if let Some(PathBranch {
+        value: first_value, ..
+    }) = target_branches.iter().find(|b| !b.trackable)
+    {
+        return Err((
+            Vec::new(),
+            EvalError::invalid_path_expression_near_access(&keys[0], first_value).into(),
+        ));
+    }
 
     // `out` accumulates in the exact order jq streams (key outer, target
     // inner — see the doc comment above), so a failure partway through
@@ -14033,6 +14148,9 @@ fn resolve_index_expr<'a, S: EvalSemantics>(
         for PathBranch {
             path: components,
             value: target_value,
+            // Every untracked target branch was already rejected by the
+            // check above, so anything reaching here is tracked.
+            ..
         } in &target_branches
         {
             // A NaN key names no element for a write to land on, so `?` does not
@@ -14102,7 +14220,8 @@ fn resolve_index_expr<'a, S: EvalSemantics>(
             } else {
                 component
             });
-            out.push(PathBranch::new(path, next_value));
+            // Untracked targets were rejected above.
+            out.push(PathBranch::new(path, next_value, true));
         }
     }
     // `target_escape` first: see the comment on `target_branches`'s own
@@ -14180,20 +14299,23 @@ fn resolve_slice_expr<'a, S: EvalSemantics>(
     // certify what comes after it as trackable. Without this,
     // `catch (getpath(["other"])[0:2]) = [...]` silently wrote into the
     // real document instead of raising — found in review.
-    if !trackable {
-        if let Some(PathBranch {
-            value: first_value, ..
-        }) = target_branches.first()
-        {
-            return Err((
-                Vec::new(),
-                EvalError::invalid_path_expression_near_access(
-                    &slice::literal_component(starts[0], ends[0]),
-                    first_value,
-                )
-                .into(),
-            ));
-        }
+    // #986: `!b.trackable` is the same question asked of the target's own
+    // branches rather than the caller's context — `(1 | .)[0:2]`, where the
+    // pipe's literal deferred here instead of raising. Kept as one condition
+    // with `!trackable` so the two can't drift: this file's own "duplicated
+    // predicates diverge silently" lesson (#106).
+    if let Some(PathBranch {
+        value: first_value, ..
+    }) = target_branches.iter().find(|b| !trackable || !b.trackable)
+    {
+        return Err((
+            Vec::new(),
+            EvalError::invalid_path_expression_near_access(
+                &slice::literal_component(starts[0], ends[0]),
+                first_value,
+            )
+            .into(),
+        ));
     }
 
     let mut out = Vec::with_capacity(starts.len() * ends.len() * target_branches.len());
@@ -14203,6 +14325,9 @@ fn resolve_slice_expr<'a, S: EvalSemantics>(
             for PathBranch {
                 path: components,
                 value: target_value,
+                // As in `resolve_index_expr`: the check above already
+                // rejected every untracked target branch.
+                ..
             } in &target_branches
             {
                 // `false`, not `optional`: the failure has to arrive as an
@@ -14239,7 +14364,8 @@ fn resolve_slice_expr<'a, S: EvalSemantics>(
                 } else {
                     slice_expr.clone()
                 });
-                out.push(PathBranch::new(path, Cow::Owned(next_value)));
+                // Untracked targets were rejected above.
+                out.push(PathBranch::new(path, Cow::Owned(next_value), true));
             }
         }
     }
@@ -14356,12 +14482,12 @@ fn resolve_static_tail<'a, S: EvalSemantics>(
 fn apply_static_tail<'a, S: EvalSemantics>(
     branches: Vec<PathBranch<'a>>,
     tail: &[Expr],
-    trackable: bool,
 ) -> PathResolveResult<'a> {
     let mut out = Vec::with_capacity(branches.len());
     for PathBranch {
         path: mut prefix,
         value: current,
+        trackable,
     } in branches
     {
         // A dynamic element as the pipe's last component (e.g. `.a[.k]`) is
@@ -14373,7 +14499,14 @@ fn apply_static_tail<'a, S: EvalSemantics>(
         // `Builtin::GetPath`'s own resolved-but-still-untracked result, see
         // `resolve_static_tail`'s doc comment) — goes through the shared,
         // trackable-aware helper.
-        let end: Cow<'a, OwnedValue> = if tail.is_empty() && trackable {
+        let end: Cow<'a, OwnedValue> = if tail.is_empty() {
+            // #986: with no tail there is nothing to navigate *into*, so an
+            // untracked `current` is not this function's problem to raise —
+            // it passes through carrying its own flag, and whoever turns out
+            // to be the genuinely terminal consumer decides. That is what
+            // lets `path((1|.)[K])` blame `K` (via `resolve_index_expr`'s
+            // post-target check) rather than the literal, while `path(1|2)`
+            // still raises at `resolve_dynamic_indexes`.
             current
         } else {
             match resolve_static_tail::<S>(tail, &current, trackable) {
@@ -14382,7 +14515,13 @@ fn apply_static_tail<'a, S: EvalSemantics>(
             }
         };
         prefix.extend_from_slice(tail);
-        out.push(PathBranch::new(prefix, end));
+        out.push(PathBranch {
+            path: prefix,
+            value: end,
+            // A non-empty tail navigated successfully, which is only
+            // reachable when `trackable` held; an empty one changes nothing.
+            trackable,
+        });
     }
     Ok(out)
 }
@@ -14433,7 +14572,10 @@ fn resolve_seq<'a, S: EvalSemantics>(
     // way, never the silent wrong-success #843 is about.
     let Some(last_dynamic) = flat.iter().rposition(needs_fanout_pass) else {
         let end = resolve_static_tail::<S>(&flat, value, trackable)?;
-        return Ok(vec![PathBranch::new(flat, Cow::Owned(end))]);
+        // `resolve_static_tail` above already raised for an untracked
+        // value, so this is `true` in practice — carried rather than
+        // asserted so the two can't drift.
+        return Ok(vec![PathBranch::new(flat, Cow::Owned(end), trackable)]);
     };
 
     // Fan out one pipe element at a time. Note this rebuilds `branches` stage
@@ -14452,7 +14594,12 @@ fn resolve_seq<'a, S: EvalSemantics>(
     // still threaded through every remaining dynamic stage and the tail,
     // exactly like a branch that never escaped at all — see below.
     let tail = &flat[last_dynamic + 1..];
-    let mut branches: Vec<PathBranch<'a>> = vec![PathBranch::new(Vec::new(), Cow::Borrowed(value))];
+    // The root branch inherits this call's own trackability: seeding it
+    // `true` regardless is what made `catch (getpath(["other"]) | .qqq)`
+    // and `catch (select(true) | .y)` stop raising, since every later
+    // branch derives its flag from this one.
+    let mut branches: Vec<PathBranch<'a>> =
+        vec![PathBranch::new(Vec::new(), Cow::Borrowed(value), trackable)];
     // Set the first time any stage's branch escapes, and overwritten by any
     // later stage's own escape (#1013) — mirroring the pre-existing "a later
     // step's own failure outranks an earlier deferred one" rule this
@@ -14475,29 +14622,53 @@ fn resolve_seq<'a, S: EvalSemantics>(
         for PathBranch {
             path: prefix,
             value: current,
+            trackable: branch_trackable,
         } in branches
         {
-            match resolve_against_cow::<S>(element, current, trackable) {
+            // #986: each branch carries its own trackability now, so this
+            // passes *that* rather than the single outer parameter. It is
+            // what makes `1 | .[K]` reach `resolve_index_expr` already
+            // knowing its target is untracked, which is how jq's "near
+            // attempt to access element K of 1" wording gets produced
+            // without any new context parameter (see #989).
+            match resolve_against_cow::<S>(element, current, branch_trackable) {
                 Ok(resolved) => {
                     for PathBranch {
                         path: components,
                         value: resulting,
+                        trackable: step_trackable,
                     } in resolved
                     {
                         let mut path = prefix.clone();
                         path.extend(components);
-                        next.push(PathBranch::new(path, resulting));
+                        next.push(PathBranch {
+                            path,
+                            value: resulting,
+                            // Untracked is absorbing: nothing downstream can
+                            // re-certify a value that was computed rather
+                            // than navigated to. Erring toward `false` is
+                            // also the safe direction — it can only turn a
+                            // silent acceptance into a loud error, never the
+                            // reverse (#985's revert is what the reverse
+                            // looks like).
+                            trackable: branch_trackable && step_trackable,
+                        });
                     }
                 }
                 Err((partial, e)) => {
                     for PathBranch {
                         path: components,
                         value: resulting,
+                        trackable: step_trackable,
                     } in partial
                     {
                         let mut path = prefix.clone();
                         path.extend(components);
-                        next.push(PathBranch::new(path, resulting));
+                        next.push(PathBranch {
+                            path,
+                            value: resulting,
+                            trackable: branch_trackable && step_trackable,
+                        });
                     }
                     // Keep whatever this branch produced before its escape,
                     // record the escape, and stop attempting any
@@ -14517,7 +14688,7 @@ fn resolve_seq<'a, S: EvalSemantics>(
         branches = next;
     }
 
-    match apply_static_tail::<S>(branches, tail, trackable) {
+    match apply_static_tail::<S>(branches, tail) {
         Ok(tailed) => path_result(tailed, deferred_escape),
         Err(tail_err) => Err(tail_err),
     }
@@ -14566,11 +14737,48 @@ fn resolve_dynamic_indexes<S: EvalSemantics>(
             .collect()
     }
 
+    /// Raise on the first branch that was computed rather than navigated to.
+    ///
+    /// This is the genuinely terminal position (#986): `resolve_dynamic_indexes`
+    /// is the top-level entry for all four of `path()`, `del()`, `=` and `|=`,
+    /// so by definition nothing follows a branch that reaches here — which
+    /// makes it the one place that can answer "is this untracked value
+    /// actually an error?" with a plain yes.
+    ///
+    /// It has to live here rather than in `resolve_seq`, for two reasons that
+    /// each break the alternative on their own. `resolve_seq` never runs at
+    /// all for a non-`Pipe` expression, so `path(1)` and — far worse —
+    /// `del(1)` would sail past every check and be assembled into
+    /// `Expr::Identity` below, silently deleting the whole document (the
+    /// shapes pinned in #1284). And `resolve_seq` cannot know whether it is
+    /// terminal even when it does run, because it is also reached as an
+    /// `IndexExpr`/`SliceExpr` target, where its own tail is empty but the
+    /// enclosing key still has to be navigated.
+    ///
+    /// Branches already produced ahead of the offending one are kept and
+    /// returned as the `Err` prefix, matching jq's never-un-emit streaming.
+    fn reject_untracked_at_terminal(
+        branches: Vec<PathBranch<'_>>,
+    ) -> Result<Vec<PathBranch<'_>>, (Vec<PathBranch<'_>>, EvalEscape)> {
+        let mut kept = Vec::with_capacity(branches.len());
+        for branch in branches {
+            if !branch.trackable {
+                let error = EvalError::invalid_path_expression(&branch.value).into();
+                return Err((kept, error));
+            }
+            kept.push(branch);
+        }
+        Ok(kept)
+    }
+
     // The document `path()`/`=`/`|=`/`del()` were actually called on is
     // always fully trackable — the untracked marker (#843) exists only for
     // the one value `resolve_catch` synthesizes internally for a `catch`
-    // handler, never for anything reaching this top-level entry point.
-    match resolve_node::<S>(expr, input, true) {
+    // handler, never for anything reaching this top-level entry point. That
+    // is about the *input*; individual branches can still come back
+    // untracked from `resolve_leaf`'s deferred catch-all (#986), which is
+    // what `reject_untracked_at_terminal` above answers for.
+    match resolve_node::<S>(expr, input, true).and_then(reject_untracked_at_terminal) {
         Ok(branches) => Ok(assemble(branches)),
         Err((prefix, e)) => Err((assemble(prefix), e)),
     }

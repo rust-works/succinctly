@@ -843,16 +843,21 @@ fn test_unsupported_path_prefixes_report_rather_than_misfire() {
     // covers `..`, `recurse` and the typeof filters — see
     // `test_multi_output_path_components_fan_out` — but not arbitrary
     // generators), so it is still refused rather than silently applied to one
-    // branch. #891 made this match the single-output sibling's own "#530"
-    // wording (naming the first output) instead of a bespoke message; jq
-    // itself refuses too, but in the "near attempt to access element ..."
-    // wording specific to a value used as an assignment *target* -- a
-    // pre-existing, unrelated divergence #891 didn't touch (it already
-    // affects a single-output target the same way; see that arm's comment).
+    // branch.
+    //
+    // The wording is now jq's own. #891 had made this match the single-output
+    // sibling's "#530" wording ("Invalid path expression with result 0"),
+    // noting that jq instead uses the "near attempt to access element ..."
+    // form for a value used as an assignment *target*, and leaving that
+    // divergence for #989. #986's deferred-trackability rework closes it:
+    // `range(3)` now hands its first output back marked untracked instead of
+    // raising on the spot, so `resolve_index_expr`'s own post-target check —
+    // which already had jq's wording — is what reports it, naming the key
+    // that failed rather than the value that was not a path.
     check(
         r#"{"a":1}"#,
         r#"(range(3) | .[("x","y")]) = 9"#,
-        Outcome::error("Invalid path expression with result 0"),
+        Outcome::error(r#"Invalid path expression near attempt to access element "x" of 0"#),
     );
     // `. = 5` replaces the root, so the sibling branch then indexes a number,
     // and reports it as jq does.
