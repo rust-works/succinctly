@@ -973,6 +973,61 @@ fn test_json_duplicate_key_array_comma_wrapped_to_entries_still_dedupes_1168() -
     Ok(())
 }
 
+/// #1168 coverage: `yq_float_fidelity_fixup`'s `ManyCursor` call sites
+/// (`Expr::Array`'s own arm, and `push_generic_owned_values_yq_fixed`'s
+/// `Expr::Comma` sibling) are only reached when the wrapped expression's
+/// *own* result is multi-valued and still cursor-backed -- `.[]`'s own
+/// native `Expr::Iterate` arm is exactly that shape, unlike the single-
+/// cursor `.a` case `test_yq_array_wrapped_overflow_int_keeps_decimal_point_953`
+/// already covers.
+#[test]
+fn test_yq_array_comma_wrapped_iterate_many_cursor_1168() -> Result<()> {
+    let (array_output, code) = run_yq_stdin("[.[]]", "[1, 2, 3]\n", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(array_output.trim(), "[1,2,3]");
+
+    let (comma_output, code) = run_yq_stdin(".[], .[]", "[1, 2]\n", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(comma_output.trim(), "1\n2\n1\n2");
+    Ok(())
+}
+
+/// #1168 coverage: `Expr::Array`'s atomicity arms (`Break`/`Halt`, and their
+/// `Partial` siblings once something already output before the break/halt
+/// fired) -- mirrors `eval::eval_array_construction`'s identical control-flow
+/// handling, which this native arm replaces the wildcard-fallback route to.
+#[test]
+fn test_yq_array_wrapped_break_produces_no_output_1168() -> Result<()> {
+    let (stdout, code) = run_yq_stdin("label $out | [break $out]", "null\n", &["-o=json"])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_yq_array_wrapped_partial_break_discards_prefix_1168() -> Result<()> {
+    let (stdout, code) = run_yq_stdin("label $out | [(1, break $out)]", "null\n", &["-o=json"])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_yq_array_wrapped_halt_exits_with_no_output_1168() -> Result<()> {
+    let (stdout, code) = run_yq_stdin("[halt]", "null\n", &["-o=json"])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_yq_array_wrapped_partial_halt_discards_prefix_1168() -> Result<()> {
+    let (stdout, code) = run_yq_stdin("[(1, halt)]", "null\n", &["-o=json"])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
 /// #1170: unlike YAML's genuine duplicates (preserved unmerged above, per
 /// #443), a duplicate key on `--input-format json` input must collapse to
 /// one entry -- keeping the first occurrence's position but the last
