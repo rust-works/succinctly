@@ -16262,11 +16262,15 @@ fn eval_owned_expr_full<S: EvalSemantics>(
 /// Evaluate an expression with an OwnedValue as input, keeping a genuinely
 /// empty result -- a `?`-swallowed type mismatch, or a builtin's own
 /// zero-output result -- distinguishable from a real `null` value (#1280),
-/// via [`eval_owned_expr_full`]. Used by
-/// [`eval_pipe_with_path_context_internal`]'s `Builtin`/`Object`/`Array`/
-/// `Literal`/generic-fallback arms, so a comma/pipe branch that legitimately
-/// produces nothing (`(has("x"))?` on the wrong type, matching real jq's own
-/// `.a?` semantics) contributes zero outputs rather than a spurious `null`.
+/// via [`eval_owned_expr_full`]. Used by [`eval_pipe_with_path_context_internal`]'s
+/// `Builtin`/`Object`/`Array`/`Literal`/generic-fallback arms and `ParentN`'s
+/// own `n` argument, so a comma/pipe branch that legitimately produces
+/// nothing (`(has("x"))?` on the wrong type, matching real jq's own `.a?`
+/// semantics) contributes zero outputs rather than a spurious `null`.
+///
+/// Like `eval_owned_expr_ctrl`, this also drops a `QueryResult::Partial`'s
+/// own trailing `Control` (via the `_trailing` below) -- a still-open gap
+/// shared by both, not unique to `eval_owned_expr_ctrl`.
 fn eval_owned_expr_opt<S: EvalSemantics>(
     expr: &Expr,
     input: &OwnedValue,
@@ -16279,8 +16283,7 @@ fn eval_owned_expr_opt<S: EvalSemantics>(
             // A *bare* break (no prior output from the argument) propagates
             // instead of being collapsed into a synthetic "not in label"
             // error (#833) -- see `result_to_owned`'s identical fix for the
-            // full rationale, including why the `Partial` case in
-            // `eval_owned_expr_ctrl` is a separate, still-open gap.
+            // full rationale.
             Control::Break(label) => EvalEscape::Break(label),
             Control::Halt(code) => EvalEscape::Halt(code),
         })
@@ -18299,9 +18302,11 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
                 optional,
             )
         }
-        Expr::Builtin(builtin) => {
-            // Handle other builtins that don't need special path handling
-            match eval_builtin_owned::<S>(builtin, value, optional) {
+        Expr::Builtin(_) => {
+            // Handle other builtins that don't need special path handling.
+            // `first` already *is* this `Expr::Builtin`, so evaluate it
+            // directly rather than reconstructing an equivalent one.
+            match eval_owned_expr_opt::<S>(first, value, optional) {
                 // #1280: a builtin that legitimately produced nothing (a
                 // `?`-swallowed type mismatch, or its own zero-output
                 // result) contributes zero outputs to this comma/pipe
@@ -18642,21 +18647,6 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
             }
         }
     }
-}
-
-/// Helper to evaluate a builtin with an OwnedValue. `Option`-returning
-/// (#1280), not `eval_owned_expr`'s always-one-value contract: a builtin
-/// that legitimately produces nothing under `?` (e.g. `(has("x"))?` on the
-/// wrong type) must stay distinguishable from one that produces `null`,
-/// since this function's only caller is a path-context arm that needs to
-/// treat the two differently.
-fn eval_builtin_owned<S: EvalSemantics>(
-    builtin: &Builtin,
-    value: &OwnedValue,
-    optional: bool,
-) -> Result<Option<OwnedValue>, EvalEscape> {
-    // For most builtins, we can just delegate to eval_owned_expr_opt
-    eval_owned_expr_opt::<S>(&Expr::Builtin(builtin.clone()), value, optional)
 }
 
 /// Builtin: path(expr) - return the path to values selected by expr
