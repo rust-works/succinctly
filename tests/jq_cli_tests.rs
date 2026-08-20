@@ -13614,16 +13614,18 @@ fn test_jq_input_exhausted_errors_with_break_723() {
 
 #[test]
 fn test_jq_input_optional_catches_exhaustion_silently_723() -> Result<()> {
-    let (stdout, code) = run_jq_stdin("input?", "1", &["-c"])?;
-    assert_eq!(code, 0);
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", "input?"], Some("1")).expect("input? repro runs");
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
     assert_eq!(stdout, "");
     Ok(())
 }
 
 #[test]
 fn test_jq_try_input_catch_catches_exhaustion_723() -> Result<()> {
-    let (stdout, code) = run_jq_stdin(r#"try input catch "caught""#, "1", &["-c"])?;
-    assert_eq!(code, 0);
+    let (stdout, stderr, code) = run_jq_full(&["-c", r#"try input catch "caught""#], Some("1"))
+        .expect("try/catch input repro runs");
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
     assert_eq!(stdout, "\"caught\"\n");
     Ok(())
 }
@@ -13632,8 +13634,10 @@ fn test_jq_try_input_catch_catches_exhaustion_723() -> Result<()> {
 /// real-world use case for `inputs`.
 #[test]
 fn test_jq_null_input_reduce_over_inputs_723() -> Result<()> {
-    let (stdout, code) = run_jq_stdin("reduce inputs as $x (0; .+$x)", "1 2 3", &["-cn"])?;
-    assert_eq!(code, 0);
+    let (stdout, stderr, code) =
+        run_jq_full(&["-cn", "reduce inputs as $x (0; .+$x)"], Some("1 2 3"))
+            .expect("-n reduce inputs repro runs");
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
     assert_eq!(stdout, "6\n");
     Ok(())
 }
@@ -13642,8 +13646,9 @@ fn test_jq_null_input_reduce_over_inputs_723() -> Result<()> {
 /// generator that just stops.
 #[test]
 fn test_jq_inputs_stream_remaining_without_error_723() -> Result<()> {
-    let (stdout, code) = run_jq_stdin("inputs", "1 2 3", &["-c"])?;
-    assert_eq!(code, 0);
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", "inputs"], Some("1 2 3")).expect("inputs repro runs");
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
     // The bare top-level loop already consumed document 1 as `.`'s own
     // input before `inputs` ever ran, so only 2 and 3 remain.
     assert_eq!(stdout, "2\n3\n");
@@ -13652,24 +13657,27 @@ fn test_jq_inputs_stream_remaining_without_error_723() -> Result<()> {
 
 #[test]
 fn test_jq_null_input_inputs_sees_every_document_723() -> Result<()> {
-    let (stdout, code) = run_jq_stdin("inputs", "1 2 3", &["-cn"])?;
-    assert_eq!(code, 0);
+    let (stdout, stderr, code) =
+        run_jq_full(&["-cn", "inputs"], Some("1 2 3")).expect("-n inputs repro runs");
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
     assert_eq!(stdout, "1\n2\n3\n");
     Ok(())
 }
 
 #[test]
 fn test_jq_input_line_number_tracks_reads_723() -> Result<()> {
-    let (stdout, code) = run_jq_stdin("., input_line_number", "1\n2\n3\n", &["-c"])?;
-    assert_eq!(code, 0);
+    let (stdout, stderr, code) = run_jq_full(&["-c", "., input_line_number"], Some("1\n2\n3\n"))
+        .expect("input_line_number repro runs");
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
     assert_eq!(stdout, "1\n1\n2\n2\n3\n3\n");
     Ok(())
 }
 
 #[test]
 fn test_jq_input_line_number_zero_before_any_read_723() -> Result<()> {
-    let (stdout, code) = run_jq_stdin("input_line_number", "1", &["-cn"])?;
-    assert_eq!(code, 0);
+    let (stdout, stderr, code) = run_jq_full(&["-cn", "input_line_number"], Some("1"))
+        .expect("-n input_line_number repro runs");
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
     assert_eq!(stdout, "0\n");
     Ok(())
 }
@@ -13679,8 +13687,9 @@ fn test_jq_input_line_number_zero_before_any_read_723() -> Result<()> {
 /// be re-processed by the loop as a fresh top-level invocation.
 #[test]
 fn test_jq_input_and_outer_loop_share_one_queue_723() -> Result<()> {
-    let (stdout, code) = run_jq_stdin("(., input)", "1 2 3 4", &["-c"])?;
-    assert_eq!(code, 0);
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", "(., input)"], Some("1 2 3 4")).expect("shared-queue repro runs");
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
     // Doc 1 -> `.` = 1, `input` reads doc 2. Doc 3 -> `.` = 3, `input`
     // reads doc 4. All four documents seen exactly once, in order.
     assert_eq!(stdout, "1\n2\n3\n4\n");
@@ -13710,8 +13719,9 @@ fn test_jq_null_input_reduce_inputs_over_multiple_files_723() -> Result<()> {
 
 #[test]
 fn test_jq_halt_after_input_still_halts_723() -> Result<()> {
-    let (stdout, code) = run_jq_stdin("(input, halt)", "1 2 3", &["-c"])?;
-    assert_eq!(code, 0);
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", "(input, halt)"], Some("1 2 3")).expect("input+halt repro runs");
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
     // `input` reads doc 2 and outputs it; `halt` then exits immediately,
     // before the outer loop would otherwise move on to doc 3.
     assert_eq!(stdout, "2\n");
@@ -13724,8 +13734,37 @@ fn test_jq_halt_after_input_still_halts_723() -> Result<()> {
 /// mentions them).
 #[test]
 fn test_jq_null_input_unaffected_when_not_using_input_builtins_723() -> Result<()> {
-    let (stdout, code) = run_jq_stdin("1 + 1", "", &["-cn"])?;
-    assert_eq!(code, 0);
+    let (stdout, stderr, code) =
+        run_jq_full(&["-cn", "1 + 1"], Some("")).expect("-n unaffected repro runs");
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
     assert_eq!(stdout, "2\n");
+    Ok(())
+}
+
+/// `halt` reached inside `-n`'s own single-invocation branch (as opposed to
+/// the non-`-n` per-document loop `test_jq_halt_after_input_still_halts_723`
+/// already covers) must still exit cleanly.
+#[test]
+fn test_jq_null_input_halt_after_inputs_723() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_full(&["-cn", "(inputs, halt)"], Some("1 2 3")).expect("-n halt repro runs");
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(stdout, "1\n2\n3\n");
+    Ok(())
+}
+
+/// `input` called from inside a user-defined function: forces
+/// `Builtin::Input`/`Inputs`/`InputLineNumber` through the AST-rewriting
+/// passes (`expand_func_calls_in_builtin`/`substitute_func_param_in_builtin`)
+/// that inline a function's own body at its call site -- exercising their
+/// mechanical pass-through arms for these three new builtins, not just the
+/// dispatch arm a bare top-level call already covers.
+#[test]
+fn test_jq_input_inside_user_defined_function_723() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-c", ".,(def f: input; f)"], Some("1 2 3"))
+        .expect("input-inside-function repro runs");
+    assert_eq!(code, 5, "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(stdout, "1\n2\n3\n");
+    assert!(stderr.contains("break"), "{stderr}");
     Ok(())
 }
