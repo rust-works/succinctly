@@ -15094,7 +15094,7 @@ fn test_1153_parenthesized_del_target_works() -> Result<()> {
     Ok(())
 }
 
-/// Gap 2: `yq_del_scalar_slice_parent_path`'s own shape check required
+/// Gap 2: `yq_del_slice_outcome`'s own shape check required
 /// `path_expr` to literally be `Expr::Pipe`, so wrapping a chained
 /// scalar-slice target in `()` opted out of #1116's parent-key-delete rule
 /// entirely and fell through to `delete_at_path`'s per-step walk, which
@@ -15636,11 +15636,10 @@ fn test_1219_index_prefix_chained_slice_run_drops_element() -> Result<()> {
 /// #1219: a slice that is *not* part of the trailing run (an interior
 /// slice, with a non-slice step between it and the trailing slice) still
 /// no-ops the whole call, even though the path's *last* component is
-/// itself a slice — `yq_del_scalar_slice_parent_path`'s residual prefix
-/// (`.a[0:2][1]`) still contains a slice, so the rewrite correctly
-/// declines and `yq_del_chained_slice_is_noop` catches it instead.
-/// Live-verified this is a no-op, not a partial delete or a parent-key
-/// drop.
+/// itself a slice — `yq_del_slice_outcome`'s residual prefix
+/// (`.a[0:2][1]`) still contains a slice, so it returns `Noop` rather than
+/// `DropParent`. Live-verified this is a no-op, not a partial delete or a
+/// parent-key drop.
 #[test]
 fn test_1219_interior_slice_before_trailing_slice_is_noop() -> Result<()> {
     let (out, code) = run_yq_stdin(
@@ -15658,11 +15657,11 @@ fn test_1219_interior_slice_before_trailing_slice_is_noop() -> Result<()> {
 /// "delete the root" — unlike #1101's already-established single-slice
 /// bare-root no-op, this shape (`Pipe` of two-or-more slices) wasn't
 /// covered by `is_yq_scalar_slice_assign_path`'s single-`Expr::Slice`
-/// check, so it fell through to `yq_del_scalar_slice_parent_path`'s
-/// generalized trailing-run stripping — which must decline (empty prefix,
+/// check, so it falls to `yq_del_slice_outcome`'s generalized
+/// trailing-run stripping — which must answer `Noop` (empty prefix,
 /// `empty_prefix_is_identity: false` at this top-level call site) rather
-/// than answering `Expr::Identity`, or this would wrongly null/replace the
-/// root. Live-verified against yq v4.53.3.
+/// than `DropParent(Expr::Identity)`, or this would wrongly null/replace
+/// the root. Live-verified against yq v4.53.3.
 #[test]
 fn test_1219_bare_root_chained_slice_run_is_noop() -> Result<()> {
     let (out, code) = run_yq_stdin("del(.[1:3][0:1])", "[1,2,3,4]", &["-o=json", "-I=0"])?;
@@ -15739,6 +15738,65 @@ fn test_1219_comma_grouped_noop_sibling_leaves_other_siblings_untouched() -> Res
     )?;
     assert_eq!(code, 0);
     assert_eq!(out.trim(), r#"{"a":[1,2,3,4]}"#);
+    Ok(())
+}
+
+/// #1219: the same comma-grouped no-op rule, but with `.a` an `Object`
+/// rather than an `Array` — this used to crash instead of no-op'ing.
+/// `rewrite_yq_del_comma_branches` (the pre-navigation crash-avoidance pass
+/// #1223 introduced) only rewrote a `DropParent`-classified branch away
+/// from its raw slice before `resolve_dynamic_indexes` navigated it; a
+/// `Noop`-classified branch was left completely unrewritten, so
+/// `resolve_dynamic_indexes` still tried to navigate `.a[1:3]` against the
+/// `Object` `.a` and hard-errored ("Cannot index object with object")
+/// instead of leaving `.a` untouched and deleting only `.c`. Every `Noop`
+/// classification is decided purely from the path's own shape (never
+/// touches the document), so it's always safe to drop a `Noop` branch from
+/// the comma group before navigation ever sees it — fixed by doing exactly
+/// that. Live-verified against yq v4.53.3.
+#[test]
+fn test_1219_comma_grouped_noop_sibling_object_target_no_longer_crashes() -> Result<()> {
+    let (out, code) = run_yq_stdin(
+        "del(.a[1:3][0], .c)",
+        r#"{"a":{"x":1,"y":2},"c":9}"#,
+        &["-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), r#"{"a":{"x":1,"y":2}}"#);
+    Ok(())
+}
+
+/// #1219: the same `Object`-target no-op-sibling fix, reached through a
+/// *nested* comma group (`del((.a[1:3][0], .z), .c)`) — confirms
+/// `rewrite_yq_del_comma_branches`'s recursive branch-dropping applies at
+/// every nesting depth, not just the top level.
+#[test]
+fn test_1219_comma_grouped_noop_sibling_object_target_nested_comma() -> Result<()> {
+    let (out, code) = run_yq_stdin(
+        "del((.a[1:3][0], .z), .c)",
+        r#"{"a":{"x":1,"y":2},"z":3,"c":9}"#,
+        &["-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), r#"{"a":{"x":1,"y":2}}"#);
+    Ok(())
+}
+
+/// #1219: every comma sibling classifying as `Noop` (all `Object`-typed
+/// targets, all no-op-shaped) collapses `rewrite_yq_del_comma_branches`'s
+/// output to an empty `Expr::Comma`, which `resolve_dynamic_indexes`
+/// resolves to zero paths — `builtin_del`'s `paths.len() <= 1` branch then
+/// correctly treats that as a full no-op (its `for path in &paths` loop
+/// simply never executes), not a crash or an empty-`Comma` panic.
+#[test]
+fn test_1219_comma_grouped_all_noop_siblings_object_targets() -> Result<()> {
+    let (out, code) = run_yq_stdin(
+        "del(.a[1:3][0], .b[1:3][0])",
+        r#"{"a":{"x":1},"b":{"y":2}}"#,
+        &["-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), r#"{"a":{"x":1},"b":{"y":2}}"#);
     Ok(())
 }
 
@@ -15859,12 +15917,12 @@ fn test_1219_interior_slice_separated_by_iterate_is_noop() -> Result<()> {
 /// chained-slice target was an `Object`, instead of applying #1162's own
 /// parent-key-drop rule (which the *single-path* form of this exact query
 /// already got correctly — see `test_1162_chained_object_slice_del_removes_
-/// parent_key`). Root cause was upstream of `yq_del_scalar_slice_parent_path`,
+/// parent_key`). Root cause was upstream of `yq_del_slice_outcome`,
 /// in `resolve_dynamic_indexes`'s generic multi-path navigation for a
 /// top-level `Comma`: it navigated `.a[0:1]` against the real document
 /// before `builtin_del` ever got a resolved `paths` vector to apply its own
 /// rewrite to, and `Object` has no slice-navigation arm. Fixed by rewriting
-/// every already-static `Comma` branch with `yq_del_scalar_slice_parent_path`
+/// every already-static `Comma` branch with `yq_del_slice_outcome`
 /// *before* handing the path to `resolve_dynamic_indexes`, so navigation
 /// only ever sees `.a` (the rewritten form), never the crashing `.a[0:1]`.
 #[test]
@@ -15990,31 +16048,37 @@ fn test_1223_multi_path_del_object_target_jq_mode_unaffected() -> Result<()> {
 
 /// #1223 follow-up (found by `/code-review`, filed separately): a comma
 /// branch that is itself a bare root slice (`.[2:3]`, not chained under a
-/// `Field`/`Index`) still reaches `resolve_dynamic_indexes`'s crashing
-/// navigation, because `yq_del_scalar_slice_parent_path` only rewrites a
-/// *chained* slice (`unwrap_path_component`'s result must be `Expr::Pipe`)
-/// -- a bare `Expr::Slice` isn't one, so it's correctly left unrewritten by
-/// `rewrite_yq_del_comma_branches`, same as it always was. Distinct from,
-/// and deliberately not chased by, this PR's own fix: real yq's actual
-/// answer for this exact combination is the *unchanged* document (verified
-/// live against yq v4.53.3), not the composition of the chained-slice's
-/// parent-key-drop with the bare-slice's own no-op rule -- squarely the
-/// same "no coherent rule to replicate" territory as the order-sensitivity
-/// gap below. If this is ever addressed, update this expectation.
+/// `Field`/`Index`) used to still reach `resolve_dynamic_indexes`'s
+/// crashing navigation, because `rewrite_yq_del_comma_branches` only
+/// rewrote a `DropParent`-classified branch away from its raw slice and
+/// left a `Noop`-classified one (which a bare root slice always is --
+/// empty residual prefix, `empty_prefix_is_identity: false`) completely
+/// unrewritten. #1219's own fix for the *sibling* crash (an `Object`
+/// target combined with a chained-slice-then-non-slice branch, see
+/// `test_1219_comma_grouped_noop_sibling_object_target_no_longer_crashes`)
+/// generalized to drop *every* `Noop`-classified branch from the comma
+/// group before navigation, which incidentally also fixes this crash --
+/// `Noop` classification never depends on `root`, so it's always safe to
+/// decide before navigation regardless of which specific shape produced
+/// it. The crash is gone, but the *result* still isn't what real yq gives:
+/// real yq leaves this whole combination completely unchanged (verified
+/// live against yq v4.53.3), while succinctly still applies the chained
+/// slice's own correct-in-isolation parent-key-drop rule to `.a` -- the
+/// same "no coherent rule to replicate" territory as the
+/// order-sensitivity gap below, now non-crashing but still a real
+/// divergence. If this is ever addressed, update this expectation.
 #[test]
-fn test_1223_bare_slice_sibling_object_target_characterize_preexisting_bug() -> Result<()> {
-    let (_out, stderr, code) = run_yq_stdin_with_stderr(
+fn test_1223_bare_slice_sibling_object_target_no_longer_crashes_but_still_diverges() -> Result<()> {
+    let (out, code) = run_yq_stdin(
         "del(.a[0:1], .[2:3])",
         r#"{"a":{"x":1,"y":2},"b":6,"c":9}"#,
-        &[],
+        &["-o=json", "-I=0"],
     )?;
-    assert_ne!(
-        code, 0,
-        "if this now succeeds, update this test (real yq leaves the document unchanged here)"
-    );
-    assert!(
-        stderr.contains("Cannot index object with object"),
-        "stderr: {stderr}"
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(
+        out.trim(),
+        r#"{"b":6,"c":9}"#,
+        "real yq gives {{\"a\":{{\"x\":1,\"y\":2}},\"b\":6,\"c\":9}} (fully unchanged) for this combination"
     );
     Ok(())
 }
@@ -16022,7 +16086,7 @@ fn test_1223_bare_slice_sibling_object_target_characterize_preexisting_bug() -> 
 /// #1223 follow-up (found by `/code-review`, filed separately): a comma
 /// branch reaching its trailing slice through an `Expr::Iterate` prefix
 /// (`.arr[][0:1]`) still crashes, because `navigate_read_only` (the prefix
-/// walker `yq_del_scalar_slice_parent_path` uses to confirm the prefix
+/// walker `yq_del_slice_outcome` uses to confirm the prefix
 /// actually exists) only understands `Field`/`Index` steps -- an
 /// `Iterate` step returns `None` immediately, so the rewrite silently
 /// declines and the branch reaches `resolve_dynamic_indexes` unrewritten.
@@ -16089,7 +16153,7 @@ fn test_1223_computed_key_with_trailing_slice_characterize_preexisting_bug() -> 
 /// separately-tracked gap rather than silently unasserted.
 ///
 /// #1219 changed *what* succinctly gets wrong here, as a side effect of
-/// wiring `yq_del_chained_slice_is_noop` into the multi-path branch (a bare
+/// wiring `yq_del_slice_outcome` into the multi-path branch (a bare
 /// `.[2:3]` sibling, with nothing else in its own path, is itself a no-op
 /// shape and now correctly drops out of the delete set on its own) —
 /// live-verified this happens to make the *second* ordering (`out_b`) match
@@ -16213,7 +16277,7 @@ fn test_1182_chained_scalar_slice_del_through_iterate_removes_parent_key_per_ele
 /// Two `.[]` steps before the trailing slice -- the per-element retry in
 /// `delete_at_path`'s `Expr::Iterate` arm fires independently at each
 /// nesting level (the first iterate's own `rest` still contains the second
-/// iterate, so `yq_del_scalar_slice_parent_path` correctly returns `None`
+/// iterate, so `yq_del_slice_outcome` correctly returns `NotApplicable`
 /// there and only fires once the walk reaches the second, innermost
 /// iterate). Live-verified against real yq.
 #[test]
@@ -16232,7 +16296,7 @@ fn test_1182_chained_scalar_slice_del_through_nested_iterate() -> Result<()> {
 }
 
 /// The per-element rewrite applies to an array-valued element exactly the
-/// same as a scalar one (#1162 widened `yq_del_scalar_slice_parent_path`
+/// same as a scalar one (#1162 widened `yq_del_slice_outcome`
 /// itself, so this per-element retry — reusing that same function — picks
 /// the widening up automatically with no `.[]`-specific change needed): a
 /// mixed array of array-valued and scalar-valued `.b` fields both lose the
@@ -16265,7 +16329,7 @@ fn test_1182_chained_scalar_slice_del_through_iterate_jq_mode_unaffected() -> Re
 
 /// `.[]` directly followed by the trailing slice, with no `Field`/`Index`
 /// between -- the element itself (not a field reached through it) is the
-/// scalar the rule applies to. `yq_del_scalar_slice_parent_path`'s
+/// scalar the rule applies to. `yq_del_slice_outcome`'s
 /// `prefix.len() == 0` case signals this back as `Expr::Identity`; the
 /// `Expr::Iterate` arm must special-case that as "remove this element from
 /// its container" rather than recursing `delete_at_path` on it (which would
