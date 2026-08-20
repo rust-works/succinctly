@@ -11472,7 +11472,7 @@ fn set_path(
             if exprs.len() == 1 {
                 set_path(root, &exprs[0], new_value, scalar_noop, container_noop)
             } else if let Some(split) = split_at_slice(exprs) {
-                match get_path_mut(root, split.before)? {
+                match get_path_mut(root, &split.before)? {
                     None => Ok(()),
                     Some(parent) => through_slice(
                         parent,
@@ -11698,9 +11698,9 @@ fn through_slice<E: From<EvalError>>(
 }
 
 /// Where a chained path crosses a slice, as [`split_at_slice`] found it.
-struct SliceSplit<'a> {
+struct SliceSplit {
     /// The components to navigate before reaching the slice.
-    before: &'a [Expr],
+    before: Vec<Expr>,
     start: Option<i64>,
     end: Option<i64>,
     /// Everything left to apply *inside* the slice, as one expression.
@@ -11712,22 +11712,37 @@ struct SliceSplit<'a> {
 /// A slice names a *range*, not a slot, so `get_path_mut` cannot navigate
 /// through one — `.a[1:2][0] = 9` would fail on the middle component — and the
 /// walker has to hand off to [`through_slice`] there instead.
-fn split_at_slice(exprs: &[Expr]) -> Option<SliceSplit<'_>> {
-    let at = exprs.iter().position(|e| matches!(e, Expr::Slice { .. }))?;
-    let Expr::Slice { start, end } = &exprs[at] else {
-        unreachable!("position matched a Slice")
+///
+/// Flattens via [`push_path_components`] before scanning, so a slice nested
+/// inside a parenthesized sub-path that is itself only one of several
+/// top-level components — `(.a[0:1])[0] = 9`, where `(.a[0:1])` arrives as a
+/// single `Expr::Pipe([Field("a"), Slice{..}])` slot — is still found (#1292).
+/// A single-element Pipe never reaches here: `set_path`'s own `Paren`/`Pipe`
+/// arms already unwrap that case before calling this function, so the slice
+/// would already be at the top level of a *fresh* call. This function only
+/// has to handle a compound sub-path sitting *alongside* other components.
+fn split_at_slice(exprs: &[Expr]) -> Option<SliceSplit> {
+    let mut flat = Vec::with_capacity(exprs.len());
+    for e in exprs {
+        push_path_components(&mut flat, e);
+    }
+    let at = flat.iter().position(|e| matches!(e, Expr::Slice { .. }))?;
+    let (start, end) = match &flat[at] {
+        Expr::Slice { start, end } => (*start, *end),
+        _ => unreachable!("position matched a Slice"),
     };
-    let rest = &exprs[at + 1..];
+    let rest = flat.split_off(at + 1);
+    flat.truncate(at);
     Some(SliceSplit {
-        before: &exprs[..at],
-        start: *start,
-        end: *end,
+        before: flat,
+        start,
+        end,
         // An empty tail means the slice itself is the target, which `Identity`
         // against the extracted sub-array says exactly.
         tail: if rest.is_empty() {
             Expr::Identity
         } else {
-            Expr::Pipe(rest.to_vec())
+            Expr::Pipe(rest)
         },
     })
 }
@@ -39539,6 +39554,36 @@ mod tests {
                 br#"{"a":{"c":5}}"#,
                 "((.a|.c)? | .y) = 9",
                 Err(r#"Cannot index number with string "y""#),
+            ),
+        ]);
+    }
+
+    #[test]
+    fn test_assign_slice_nested_in_a_parenthesized_non_terminal_component_1292() {
+        // #1292: `split_at_slice` only scanned the *top-level* `exprs` list
+        // `set_path`'s `Expr::Pipe` arm was called with -- a slice nested
+        // inside a parenthesized sub-path that is itself only one of
+        // several top-level components (`(.a[0:1])[0] = 9`, where
+        // `(.a[0:1])` arrives as a single `Expr::Pipe([Field("a"),
+        // Slice{..}])` slot) was invisible to that scan, so the slice never
+        // reached `through_slice` and the write fell to the generic
+        // "invalid path component" catch-all instead. `|=`/`del()` already
+        // handled this shape correctly, isolating the gap to `=`. All
+        // confirmed against real jq 1.7.1.
+        assert_outcomes(&[
+            (
+                br#"{"a":[1,2,3]}"#,
+                "(.a[0:1])[0] = 9",
+                Ok(r#"{"a":[9,2,3]}"#),
+            ),
+            // A plain top-level slice (no nesting) is unaffected.
+            (br#"{"a":[1,2,3]}"#, ".a[0:1] = [9]", Ok(r#"{"a":[9,2,3]}"#)),
+            // Nesting depth beyond one level of parens still flattens
+            // correctly.
+            (
+                br#"{"a":{"b":[1,2,3]}}"#,
+                "(((.a.b)[0:1]))[0] = 9",
+                Ok(r#"{"a":{"b":[9,2,3]}}"#),
             ),
         ]);
     }
