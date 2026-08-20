@@ -133,6 +133,44 @@ fn push_bracket(chain: &mut Vec<Expr>, bracket: Bracket) {
 /// `Pattern` tree-walker too.
 const MAX_PATTERN_DEPTH: usize = 256;
 
+/// Maximum recursion depth for a single `Expr` AST. Exceeding it returns a
+/// clean [`ParseError`] instead of recursing further.
+///
+/// Same hazard as [`MAX_PATTERN_DEPTH`], reached through a different
+/// construct (#1156): a filter like `-----...5`, `(((...5...)))` or
+/// `try try try ... 5` is buildable from query text alone, with no input
+/// document, so an unguarded recursion is a process-abort a client controls
+/// outright. Measured on `main` before this guard, `parse()` alone aborted
+/// with SIGABRT -- before any evaluation -- at 1835 nested parens in a
+/// release build and 366 in a debug one; unary minus and `try` were higher
+/// (8272/1157 and 6278/1003). 256 sits below the tightest of those with
+/// room to spare, and matches [`MAX_PATTERN_DEPTH`] rather than inventing a
+/// second number.
+///
+/// Guarding [`Parser::parse_primary`] alone is sufficient: it is the single
+/// point every nesting construct descends through -- parens re-enter via
+/// `parse_expr`, and unary minus and `try` recurse into it directly. Chained
+/// binary operators, pipes and comma chains are *not* affected, because
+/// those parse with a `while` loop rather than recursion, so a thousand-stage
+/// pipe never nests more than one level deep here.
+///
+/// Real jq fails gracefully rather than crashing on the same inputs
+/// (`jq: error: memory exhausted`, exit 3, at around 10000 nested parens),
+/// so matching its exact limit is not the point -- not aborting is.
+///
+/// **This bounds recursion depth, not stack bytes.** 256 is comfortably
+/// safe on the 8 MiB main thread the CLI runs on, in debug and release
+/// alike. A caller that drives the parser from a much smaller stack can
+/// still overflow below this limit: measured in debug on a 2 MiB thread
+/// (cargo's own test-harness size), nested parens and object constructors
+/// abort at around 96 levels, `try` at around 256, and unary minus not at
+/// all. The guard is still a strict improvement there -- without it *every*
+/// depth aborts -- but it is not a stack-size guarantee, which is why the
+/// tests below pin the limit on an explicitly sized thread rather than
+/// relying on whatever the harness provides. [`MAX_PATTERN_DEPTH`] carries
+/// the same caveat; the two deliberately share one number.
+const MAX_EXPR_DEPTH: usize = 256;
+
 /// Parser state.
 struct Parser<'a> {
     input: &'a str,
@@ -140,6 +178,8 @@ struct Parser<'a> {
     mode: ParserMode,
     /// Current `Pattern` recursion depth; see [`MAX_PATTERN_DEPTH`].
     pattern_depth: usize,
+    /// Current `Expr` recursion depth; see [`MAX_EXPR_DEPTH`].
+    expr_depth: usize,
 }
 
 impl<'a> Parser<'a> {
@@ -150,6 +190,7 @@ impl<'a> Parser<'a> {
             pos: 0,
             mode: ParserMode::Jq,
             pattern_depth: 0,
+            expr_depth: 0,
         }
     }
 
@@ -159,6 +200,7 @@ impl<'a> Parser<'a> {
             pos: 0,
             mode,
             pattern_depth: 0,
+            expr_depth: 0,
         }
     }
 
@@ -985,6 +1027,53 @@ impl<'a> Parser<'a> {
     /// so by the time control reaches here any such `?` is already gone;
     /// this only wraps a `?` still left over the whole term.
     fn parse_primary(&mut self) -> Result<Expr, ParseError> {
+        self.expr_depth += 1;
+        let result = if self.expr_depth > MAX_EXPR_DEPTH {
+            Err(ParseError::new(
+                format!("expression nesting exceeds depth limit of {MAX_EXPR_DEPTH}"),
+                self.pos,
+            ))
+        } else {
+            self.parse_primary_optional()
+        };
+        // Decremented on the error path too, so a caller that recovers from a
+        // `ParseError` higher up does not see a permanently inflated depth.
+        self.expr_depth -= 1;
+        result
+    }
+
+    /// Account for left-nesting built by a binary-operator loop.
+    ///
+    /// `parse_additive`, `parse_and` and their siblings iterate rather than
+    /// recurse, so [`Parser::parse_primary`]'s guard never sees them -- but
+    /// each iteration still wraps the accumulated `left` in another node, so
+    /// `1 + 1 + ... + 1` builds a chain-length-deep tree the evaluator and
+    /// `Drop` have to walk later. Measured on `main`, that aborted with
+    /// SIGABRT at 6206 terms in a release build and 596 in a debug one --
+    /// the same hazard class as the prefix constructs, just reached by
+    /// iteration, and trivially constructible either way.
+    ///
+    /// `parse_comparison` deliberately has no counter: jq's comparison
+    /// operators are non-associative, so it parses at most one of them and
+    /// cannot build a chain at all.
+    ///
+    /// `extra` is added to the current nesting depth rather than replacing
+    /// it, so a chain written inside parentheses is charged for both.
+    fn check_expr_nesting(&self, extra: usize) -> Result<(), ParseError> {
+        if self.expr_depth + extra > MAX_EXPR_DEPTH {
+            return Err(ParseError::new(
+                format!("expression nesting exceeds depth limit of {MAX_EXPR_DEPTH}"),
+                self.pos,
+            ));
+        }
+        Ok(())
+    }
+
+    /// The real `parse_primary` body, entered only through the depth-checked
+    /// wrapper above -- every recursive descent goes back through
+    /// `self.parse_primary()`, not this function, so the counter sees every
+    /// nesting level.
+    fn parse_primary_optional(&mut self) -> Result<Expr, ParseError> {
         let expr = self.parse_primary_inner()?;
         self.skip_ws();
         if self.peek() == Some('?') {
@@ -3658,6 +3747,9 @@ impl<'a> Parser<'a> {
     /// Parse multiplicative expressions: `expr * expr`, `expr / expr`, `expr % expr`
     fn parse_multiplicative(&mut self) -> Result<Expr, ParseError> {
         let mut left = self.parse_primary()?;
+        // Each iteration wraps `left` in another node, so this chain's own
+        // length is AST depth even though the loop never recurses (#1156).
+        let mut chain_depth = 0usize;
 
         loop {
             self.skip_ws();
@@ -3700,6 +3792,8 @@ impl<'a> Parser<'a> {
             };
             self.skip_ws();
             let right = self.parse_primary()?;
+            chain_depth += 1;
+            self.check_expr_nesting(chain_depth)?;
             left = Expr::Arithmetic {
                 op,
                 left: Box::new(left),
@@ -3713,6 +3807,9 @@ impl<'a> Parser<'a> {
     /// Parse additive expressions: `expr + expr`, `expr - expr`
     fn parse_additive(&mut self) -> Result<Expr, ParseError> {
         let mut left = self.parse_multiplicative()?;
+        // Each iteration wraps `left` in another node, so this chain's own
+        // length is AST depth even though the loop never recurses (#1156).
+        let mut chain_depth = 0usize;
 
         loop {
             self.skip_ws();
@@ -3732,6 +3829,8 @@ impl<'a> Parser<'a> {
             self.next();
             self.skip_ws();
             let right = self.parse_multiplicative()?;
+            chain_depth += 1;
+            self.check_expr_nesting(chain_depth)?;
             left = Expr::Arithmetic {
                 op,
                 left: Box::new(left),
@@ -3781,6 +3880,9 @@ impl<'a> Parser<'a> {
     /// Parse `and` expressions: `expr and expr`
     fn parse_and(&mut self) -> Result<Expr, ParseError> {
         let mut left = self.parse_comparison()?;
+        // Each iteration wraps `left` in another node, so this chain's own
+        // length is AST depth even though the loop never recurses (#1156).
+        let mut chain_depth = 0usize;
 
         loop {
             self.skip_ws();
@@ -3790,6 +3892,8 @@ impl<'a> Parser<'a> {
             self.consume_keyword("and");
             self.skip_ws();
             let right = self.parse_comparison()?;
+            chain_depth += 1;
+            self.check_expr_nesting(chain_depth)?;
             left = Expr::And(Box::new(left), Box::new(right));
         }
 
@@ -3799,6 +3903,9 @@ impl<'a> Parser<'a> {
     /// Parse `or` expressions: `expr or expr`
     fn parse_or(&mut self) -> Result<Expr, ParseError> {
         let mut left = self.parse_and()?;
+        // Each iteration wraps `left` in another node, so this chain's own
+        // length is AST depth even though the loop never recurses (#1156).
+        let mut chain_depth = 0usize;
 
         loop {
             self.skip_ws();
@@ -3808,6 +3915,8 @@ impl<'a> Parser<'a> {
             self.consume_keyword("or");
             self.skip_ws();
             let right = self.parse_and()?;
+            chain_depth += 1;
+            self.check_expr_nesting(chain_depth)?;
             left = Expr::Or(Box::new(left), Box::new(right));
         }
 
@@ -3817,6 +3926,9 @@ impl<'a> Parser<'a> {
     /// Parse alternative expressions: `expr // expr`
     fn parse_alternative(&mut self) -> Result<Expr, ParseError> {
         let mut left = self.parse_or()?;
+        // Each iteration wraps `left` in another node, so this chain's own
+        // length is AST depth even though the loop never recurses (#1156).
+        let mut chain_depth = 0usize;
 
         loop {
             self.skip_ws();
@@ -3832,6 +3944,8 @@ impl<'a> Parser<'a> {
             self.next();
             self.skip_ws();
             let right = self.parse_or()?;
+            chain_depth += 1;
+            self.check_expr_nesting(chain_depth)?;
             left = Expr::Alternative(Box::new(left), Box::new(right));
         }
 
@@ -6339,6 +6453,93 @@ mod tests {
             "unexpected error: {}",
             err.message
         );
+    }
+
+    /// Every prefix-recursive construct is capped, not just one (#1156).
+    ///
+    /// Before this guard `parse()` aborted the process with SIGABRT --
+    /// before any evaluation ran -- on all of these. Each is buildable from
+    /// query text alone with no input document, so the crash was fully
+    /// within a client's control.
+    /// Runs the body on a thread with a stack big enough for
+    /// [`MAX_EXPR_DEPTH`] levels. Cargo's harness gives each test 2 MiB,
+    /// which is smaller than the 8 MiB main thread the CLI actually uses and
+    /// too small for the heaviest constructs at this limit -- see
+    /// [`MAX_EXPR_DEPTH`]'s own note. Pinning the stack here keeps these
+    /// tests measuring the guard rather than the harness.
+    fn with_parser_stack(f: impl FnOnce() + Send + 'static) {
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(f)
+            .expect("spawn")
+            .join()
+            .expect("depth-guarded parse must not abort");
+    }
+
+    #[test]
+    fn test_expr_depth_limit_returns_parse_error_not_overflow_1156() {
+        with_parser_stack(|| {
+            let n = MAX_EXPR_DEPTH + 10;
+            for (label, src) in [
+                ("unary minus", format!("{}5", "-".repeat(n))),
+                ("parens", format!("{}5{}", "(".repeat(n), ")".repeat(n))),
+                ("try", format!("{}5", "try ".repeat(n))),
+                ("array", format!("{}{}", "[".repeat(n), "]".repeat(n))),
+                ("object", format!("{}5{}", "{a: ".repeat(n), "}".repeat(n))),
+            ] {
+                let err = parse(&src).expect_err("over-depth input must be a clean parse error");
+                assert!(
+                    err.message.contains("depth limit"),
+                    "{label}: unexpected error: {}",
+                    err.message
+                );
+            }
+        });
+    }
+
+    /// The same cap reaches chains built by *iteration*, not just recursion.
+    ///
+    /// `parse_additive` and friends loop rather than recurse, so
+    /// `parse_primary`'s own counter never sees them -- but `1 + 1 + ... + 1`
+    /// still builds a chain-length-deep tree. Left unguarded it aborted at
+    /// 6206 terms in release and 596 in debug, so a guard that only covered
+    /// the recursive constructs would have been trivially bypassable.
+    #[test]
+    fn test_binary_chain_depth_limit_returns_parse_error_1156() {
+        let n = MAX_EXPR_DEPTH + 10;
+        for op in ["+", "*", "and", "or", "//"] {
+            let src = vec!["1"; n].join(&format!(" {op} "));
+            let err =
+                parse(&src).expect_err("over-length binary chain must be a clean parse error");
+            assert!(
+                err.message.contains("depth limit"),
+                "{op}: unexpected error: {}",
+                err.message
+            );
+        }
+    }
+
+    /// Control: `pipe` and `comma` build a flat `Vec`, not a nested tree, so
+    /// they must stay uncapped -- a long pipeline is ordinary jq, and
+    /// charging it against a nesting budget would be a real regression.
+    #[test]
+    fn test_flat_chains_are_not_charged_against_expr_depth_1156() {
+        let n = MAX_EXPR_DEPTH * 4;
+        parse(&vec![".a"; n].join(" | ")).expect("a long pipeline is not nesting");
+        parse(&format!("[{}]", vec!["1"; n].join(", "))).expect("a long comma list is not nesting");
+    }
+
+    /// Control: just under the limit still parses, for the recursive and the
+    /// iterative shape alike.
+    #[test]
+    fn test_expr_depth_just_under_limit_still_parses_1156() {
+        with_parser_stack(|| {
+            let n = MAX_EXPR_DEPTH - 1;
+            parse(&format!("{}5{}", "(".repeat(n), ")".repeat(n)))
+                .expect("under-limit parens parse");
+            parse(&format!("{}5", "-".repeat(n))).expect("under-limit unary minus parses");
+            parse(&vec!["1"; n].join(" + ")).expect("under-limit chain parses");
+        });
     }
 
     /// Control: a pattern nested just under the limit still parses fine --
