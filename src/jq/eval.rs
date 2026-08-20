@@ -16163,15 +16163,36 @@ fn eval_owned_expr_ctrl<S: EvalSemantics>(
 /// live-verified jq semantics this preserves for a caller that can re-wrap
 /// its own successful final result via [`partial`]/[`finish_owned`]/
 /// [`finish_result`] when this is `Some`.
+///
+/// A thin wrapper over [`eval_owned_expr_full`]: this function's own
+/// contract is "callers need exactly one owned value", so a genuinely empty
+/// result collapses to `Null` here -- callers that instead need to tell
+/// "produced nothing" apart from "produced `null`" (#1280) use
+/// [`eval_owned_expr_full`] directly.
 fn eval_owned_expr_ctrl_full<S: EvalSemantics>(
     expr: &Expr,
     input: &OwnedValue,
     optional: bool,
 ) -> Result<(OwnedValue, Option<Control>), Control> {
+    eval_owned_expr_full::<S>(expr, input, optional)
+        .map(|opt| opt.unwrap_or((OwnedValue::Null, None)))
+}
+
+/// Like [`eval_owned_expr_ctrl_full`], but keeps a genuinely empty result --
+/// a `?`-swallowed type mismatch in [`eval_owned_fast_path`], or the slow
+/// path's own `QueryResult::None` -- distinguishable from a real `null`
+/// value instead of collapsing the two (#1280). Real jq's own path-position
+/// semantics treat a swallowed/absent result as *no output*, not `null`
+/// (`jq -cn '1 | .a?'` produces nothing at all); [`eval_owned_expr_ctrl_full`]
+/// cannot express that in its own contract ("exactly one value"), so this is
+/// the function any new caller needing the distinction should reach for.
+fn eval_owned_expr_full<S: EvalSemantics>(
+    expr: &Expr,
+    input: &OwnedValue,
+    optional: bool,
+) -> Result<Option<(OwnedValue, Option<Control>)>, Control> {
     if let Some(result) = eval_owned_fast_path::<S>(expr, input, optional) {
-        return result
-            .map(|v| (v.unwrap_or(OwnedValue::Null), None))
-            .map_err(Control::Error);
+        return result.map(|v| v.map(|v| (v, None))).map_err(Control::Error);
     }
 
     // Create a synthetic JSON from the owned value
@@ -16190,24 +16211,29 @@ fn eval_owned_expr_ctrl_full<S: EvalSemantics>(
     let cursor = index.root(json_bytes);
 
     match eval_single::<Vec<u64>, S>(expr, cursor.value(), optional).materialize_cursor() {
-        QueryResult::One(v) => Ok((to_owned(&v), None)),
+        QueryResult::One(v) => Ok(Some((to_owned(&v), None))),
         QueryResult::OneCursor(_) => unreachable!(),
-        QueryResult::Owned(v) => Ok((v, None)),
+        QueryResult::Owned(v) => Ok(Some((v, None))),
         QueryResult::Many(vs) => {
             if vs.len() == 1 {
-                Ok((to_owned(&vs[0]), None))
+                Ok(Some((to_owned(&vs[0]), None)))
             } else {
-                Ok((OwnedValue::Array(vs.iter().map(to_owned).collect()), None))
+                Ok(Some((
+                    OwnedValue::Array(vs.iter().map(to_owned).collect()),
+                    None,
+                )))
             }
         }
         QueryResult::ManyOwned(vs) => {
             if vs.len() == 1 {
-                Ok((vs.into_iter().next().unwrap(), None))
+                Ok(Some((vs.into_iter().next().unwrap(), None)))
             } else {
-                Ok((OwnedValue::Array(vs), None))
+                Ok(Some((OwnedValue::Array(vs), None)))
             }
         }
-        QueryResult::None => Ok((OwnedValue::Null, None)),
+        // The one behavior change from `eval_owned_expr_ctrl_full`'s own
+        // slow path (#1280): `None`, not `Ok(Some((Null, None)))`.
+        QueryResult::None => Ok(None),
         QueryResult::Error(e) => Err(Control::Error(e)),
         QueryResult::Break(label) => Err(Control::Break(label)),
         QueryResult::Halt(code) => Err(Control::Halt(code)),
@@ -16225,9 +16251,9 @@ fn eval_owned_expr_ctrl_full<S: EvalSemantics>(
         // above) is expected to apply it to its own final result.
         QueryResult::Partial(vs, control) => {
             if vs.len() == 1 {
-                Ok((vs.into_iter().next().unwrap(), Some(control)))
+                Ok(Some((vs.into_iter().next().unwrap(), Some(control))))
             } else {
-                Ok((OwnedValue::Array(vs), Some(control)))
+                Ok(Some((OwnedValue::Array(vs), Some(control))))
             }
         }
     }
@@ -16256,6 +16282,30 @@ fn eval_owned_expr<S: EvalSemantics>(
         // keeps its own `EvalEscape` variant, so `try`/`catch` never sees it.
         Control::Halt(code) => EvalEscape::Halt(code),
     })
+}
+
+/// Like [`eval_owned_expr`], but keeps a genuinely empty result -- a
+/// `?`-swallowed type mismatch, or a builtin's own zero-output result --
+/// distinguishable from a real `null` value (#1280), via
+/// [`eval_owned_expr_full`]. `eval_owned_expr` itself cannot express this:
+/// its `Result<OwnedValue, EvalEscape>` contract always carries exactly one
+/// value on the `Ok` side. Used by
+/// [`eval_pipe_with_path_context_internal`]'s `Builtin`/`Object`/`Array`/
+/// `Literal`/generic-fallback arms, so a comma/pipe branch that legitimately
+/// produces nothing (`(has("x"))?` on the wrong type, matching real jq's own
+/// `.a?` semantics) contributes zero outputs rather than a spurious `null`.
+fn eval_owned_expr_opt<S: EvalSemantics>(
+    expr: &Expr,
+    input: &OwnedValue,
+    optional: bool,
+) -> Result<Option<OwnedValue>, EvalEscape> {
+    eval_owned_expr_full::<S>(expr, input, optional)
+        .map(|opt| opt.map(|(v, _trailing)| v))
+        .map_err(|control| match control {
+            Control::Error(e) => e.into(),
+            Control::Break(label) => EvalEscape::Break(label),
+            Control::Halt(code) => EvalEscape::Halt(code),
+        })
 }
 
 /// Evaluate an expression with an OwnedValue as input, preserving the full
@@ -18264,7 +18314,13 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
         Expr::Builtin(builtin) => {
             // Handle other builtins that don't need special path handling
             match eval_builtin_owned::<S>(builtin, value, optional) {
-                Ok(result) => {
+                // #1280: a builtin that legitimately produced nothing (a
+                // `?`-swallowed type mismatch, or its own zero-output
+                // result) contributes zero outputs to this comma/pipe
+                // branch, matching real jq's own `.a?`-style empty-not-null
+                // path semantics -- not `QueryResult::Owned(Null)`.
+                Ok(None) => QueryResult::None,
+                Ok(Some(result)) => {
                     if rest.is_empty() {
                         QueryResult::Owned(result)
                     } else {
@@ -18287,8 +18343,14 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
         Expr::Object(_) | Expr::Array(_) | Expr::Literal(_) => {
             // Value-constructing expressions reset the path context
             // because we're now at the "root" of a newly constructed value
-            match eval_owned_expr::<S>(first, value, optional) {
-                Ok(result) => {
+            match eval_owned_expr_opt::<S>(first, value, optional) {
+                // #1280: a zero-output generator inside the construction
+                // (`{(empty): 1}`, `[empty]` behaves differently -- this is
+                // specifically the object-key-generator case) means the
+                // whole construction contributes zero outputs, matching real
+                // jq -- not a spurious `null`.
+                Ok(None) => QueryResult::None,
+                Ok(Some(result)) => {
                     if rest.is_empty() {
                         QueryResult::Owned(result)
                     } else {
@@ -18566,8 +18628,12 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
         _ => {
             // For other expressions, evaluate normally and continue
             // Note: This loses path context for complex expressions
-            match eval_owned_expr::<S>(first, value, optional) {
-                Ok(result) => {
+            match eval_owned_expr_opt::<S>(first, value, optional) {
+                // #1280: a legitimately-empty result (a `?`-swallowed type
+                // mismatch reached through this generic fallback) is zero
+                // outputs, matching real jq -- not a spurious `null`.
+                Ok(None) => QueryResult::None,
+                Ok(Some(result)) => {
                     if rest.is_empty() {
                         QueryResult::Owned(result)
                     } else {
@@ -18590,14 +18656,19 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
     }
 }
 
-/// Helper to evaluate a builtin with an OwnedValue
+/// Helper to evaluate a builtin with an OwnedValue. `Option`-returning
+/// (#1280), not [`eval_owned_expr`]'s always-one-value contract: a builtin
+/// that legitimately produces nothing under `?` (e.g. `(has("x"))?` on the
+/// wrong type) must stay distinguishable from one that produces `null`,
+/// since this function's only caller is a path-context arm that needs to
+/// treat the two differently.
 fn eval_builtin_owned<S: EvalSemantics>(
     builtin: &Builtin,
     value: &OwnedValue,
     optional: bool,
-) -> Result<OwnedValue, EvalEscape> {
-    // For most builtins, we can just delegate to eval_owned_expr
-    eval_owned_expr::<S>(&Expr::Builtin(builtin.clone()), value, optional)
+) -> Result<Option<OwnedValue>, EvalEscape> {
+    // For most builtins, we can just delegate to eval_owned_expr_opt
+    eval_owned_expr_opt::<S>(&Expr::Builtin(builtin.clone()), value, optional)
 }
 
 /// Builtin: path(expr) - return the path to values selected by expr
