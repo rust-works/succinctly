@@ -10770,7 +10770,11 @@ pub(crate) fn is_yq_scalar_slice_assign_path(path_expr: &Expr) -> bool {
 /// parent key, not the slice's own contents) needs the parent *container*
 /// in hand, which `through_slice` never has (it only ever sees the sliced
 /// value itself).
-fn yq_del_scalar_slice_parent_path(path_expr: &Expr, root: &OwnedValue) -> Option<Expr> {
+fn yq_del_scalar_slice_parent_path(
+    path_expr: &Expr,
+    root: &OwnedValue,
+    empty_prefix_is_identity: bool,
+) -> Option<Expr> {
     // `unwrap_path_component`, not a direct match or the narrower
     // `unwrap_paren`: a parenthesized chained target (`del((.a[0:1]))`)
     // must apply the same parent-key-delete rule as its bare form
@@ -10789,11 +10793,37 @@ fn yq_del_scalar_slice_parent_path(path_expr: &Expr, root: &OwnedValue) -> Optio
     let Expr::Pipe(exprs) = unwrap_path_component(path_expr).0 else {
         return None;
     };
-    let (last, _) = unwrap_path_component(exprs.last()?);
-    if !matches!(last, Expr::Slice { .. }) {
+    // #1219: real yq's rule strips a *maximal trailing run* of consecutive
+    // slices, not just one -- `del(.a[1:3][0:2])` drops `.a` entirely, same
+    // target as the single-slice `del(.a[0:2])`, live-verified against yq
+    // v4.53.3 (a chained slice-then-slice run of any length collapses to
+    // the same "drop what's before the run" target; a run of 3 behaves
+    // identically to a run of 2). `cut` is the index where that run begins.
+    let mut cut = exprs.len();
+    while cut > 0 && matches!(unwrap_path_component(&exprs[cut - 1]).0, Expr::Slice { .. }) {
+        cut -= 1;
+    }
+    if cut == exprs.len() {
+        // Last component isn't a slice at all -- this rule never applies,
+        // regardless of what's earlier in the path. `builtin_del`'s own
+        // `yq_del_chained_slice_is_noop` decides what happens instead
+        // (#1219: a slice anywhere in the path with something other than
+        // more trailing slices after it makes the whole `del()` a no-op).
         return None;
     }
-    let prefix = &exprs[..exprs.len() - 1];
+    let prefix = &exprs[..cut];
+    if prefix.is_empty() && !empty_prefix_is_identity {
+        // A bare trailing slice-run with *nothing* before it at all
+        // (`del(.[1:3][0:1])` on the root value itself, no leading
+        // `Field`/`Index`) live-verifies as a no-op, not "delete the root" --
+        // unlike the `Expr::Iterate` per-element case below, there is no
+        // parent key here to drop in the first place. Callers that walk a
+        // whole resolved path (not a per-element `rest` after `.[]`) pass
+        // `false` here so this returns `None` and lets
+        // `yq_del_chained_slice_is_noop` recognize the no-op instead of this
+        // function wrongly answering `Some(Expr::Identity)`.
+        return None;
+    }
     // Existence only, not type — #1162 confirmed live that real yq's rule
     // applies uniformly to every target type once the target actually
     // exists; `navigate_read_only` returning `None` (missing field/index)
@@ -10801,30 +10831,77 @@ fn yq_del_scalar_slice_parent_path(path_expr: &Expr, root: &OwnedValue) -> Optio
     // absent-path handling instead.
     navigate_read_only(root, prefix)?;
     Some(match prefix.len() {
-        // Unreachable from `builtin_del`'s own top-level call site:
-        // `resolve_dynamic_indexes`'s own `assemble()` never wraps a single
-        // resolved component in `Expr::Pipe` (a length-1 component list
-        // returns that component directly, `strip_resolved_optional` only
-        // strips wrappers *within* an existing `Pipe`, never collapses
-        // one), so `exprs.len() >= 2` always holds there and `prefix.len()`
-        // can never be `0` for that caller.
-        //
-        // *Is* reached from `delete_at_path`'s `Expr::Iterate` arm (#1182),
+        // Reached only when `empty_prefix_is_identity` is `true` --
+        // `delete_at_path`'s `Expr::Iterate` arm (#1182, generalized by
+        // #1219 to a whole trailing slice-run rather than just one slice),
         // which always wraps its `rest` in `Expr::Pipe` regardless of
         // length -- a bare `.[]` directly followed by the trailing slice
-        // (`del(.a[][0:1])`, no `Field`/`Index` between) resolves `prefix`
-        // to the empty slice, so `target` (from `navigate_read_only` with
-        // zero steps) is the element itself. `Expr::Identity` signals that
-        // case back to the caller: there is no parent *key* to drop here,
-        // the element itself is the thing to remove from its container --
-        // that caller special-cases this return value rather than
-        // recursing `delete_at_path` on it (which would just null the
-        // element in place via its own `Expr::Identity` arm, not remove
-        // it).
+        // run (`del(.a[][0:1])`, `del(.a[][1:3][0:1])`, no `Field`/`Index`
+        // between), resolves `prefix` to the empty slice, so `target` (from
+        // `navigate_read_only` with zero steps) is the element itself.
+        // `Expr::Identity` signals that case back to the caller: there is
+        // no parent *key* to drop here, the element itself is the thing to
+        // remove from its container -- that caller special-cases this
+        // return value rather than recursing `delete_at_path` on it (which
+        // would just null the element in place via its own `Expr::Identity`
+        // arm, not remove it).
         0 => Expr::Identity,
         1 => prefix[0].clone(),
         _ => Expr::Pipe(prefix.to_vec()),
     })
+}
+
+/// Whether a *resolved* `del()` path (already unwrapped to its `Pipe`
+/// component list, or a bare single component) contains a chained
+/// [`Expr::Slice`] that real yq's del() renders inert -- the *other* half of
+/// #1219, alongside [`yq_del_scalar_slice_parent_path`]'s trailing-run
+/// parent-key-drop rule above. Purely syntactic (no `root`/navigation
+/// needed): live-verified against yq v4.53.3 across every combination of
+/// leading `Field`/`Index`, trailing-run length, and what (if anything)
+/// follows the run, the whole call no-ops whenever:
+///
+/// - the path's *last* component isn't a slice at all (`del(.a[1:3][0])`,
+///   `del(.a[1:3][0].x)`, `del(.a[1:3][])`, `del(.a[1:3][0:2][0])` -- a
+///   trailing slice-run followed by anything non-slice makes the entire
+///   `del()` inert, not just that one step); or
+/// - the path *does* end in a slice-run, but what's left before that run
+///   either is empty (`del(.[1:3][0:1])`, a bare chained-slice-run with no
+///   leading `Field`/`Index` to drop) or itself contains another slice
+///   (`del(.a[0:2][1][3:5])`: the run is just the trailing `[3:5]`, but the
+///   residual prefix `.a[0:2][1]` still has a slice in it) -- in both cases
+///   `yq_del_scalar_slice_parent_path` already declines (returns `None`) for
+///   exactly this reason, so this function mirrors its own trailing-run
+///   walk rather than re-deriving a different one.
+///
+/// Not applicable to `delete_at_path`'s `Expr::Iterate` arm's per-element
+/// `rest`: an empty residual prefix there legitimately means "drop this
+/// element" (`Expr::Identity`, live-verified to hold for a trailing-run of
+/// any length, not just one slice), the opposite of this function's
+/// top-level "nothing to drop" reading of the same shape -- see
+/// `empty_prefix_is_identity`'s doc comment on the sibling function.
+fn yq_del_chained_slice_is_noop(path_expr: &Expr) -> bool {
+    let (unwrapped, _) = unwrap_path_component(path_expr);
+    let owned;
+    let exprs: &[Expr] = match unwrapped {
+        Expr::Pipe(list) => list,
+        other => {
+            owned = [other.clone()];
+            &owned
+        }
+    };
+    let is_slice = |e: &Expr| matches!(unwrap_path_component(e).0, Expr::Slice { .. });
+    if !exprs.iter().any(is_slice) {
+        return false;
+    }
+    let mut cut = exprs.len();
+    while cut > 0 && is_slice(&exprs[cut - 1]) {
+        cut -= 1;
+    }
+    if cut == exprs.len() {
+        return true;
+    }
+    let head = &exprs[..cut];
+    head.is_empty() || head.iter().any(is_slice)
 }
 
 /// Read-only navigation for [`yq_del_scalar_slice_parent_path`]'s prefix
@@ -20485,7 +20562,7 @@ fn rewrite_yq_del_comma_branches(expr: &Expr, root: &OwnedValue) -> Option<Expr>
                     if let Some(nested) = rewrite_yq_del_comma_branches(branch, root) {
                         nested
                     } else if !needs_path_prepass(branch) {
-                        yq_del_scalar_slice_parent_path(branch, root)
+                        yq_del_scalar_slice_parent_path(branch, root, false)
                             .unwrap_or_else(|| branch.clone())
                     } else {
                         branch.clone()
@@ -20594,14 +20671,30 @@ fn builtin_del<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     if paths.len() <= 1 {
         let mut result = result;
         for path in &paths {
-            // yq's chained-scalar-slice del() rule (#1116) — a *different*
-            // rule from #1101's no-op above: rewrite the path to delete the
-            // parent key outright, rather than walking the original path
-            // at all, when it applies. See
-            // `yq_del_scalar_slice_parent_path`'s doc comment.
+            // yq's chained-scalar-slice del() rule (#1116, generalized by
+            // #1219 to a whole trailing slice-run) — a *different* rule from
+            // #1101's no-op above: rewrite the path to delete the parent key
+            // outright, rather than walking the original path at all, when
+            // it applies. See `yq_del_scalar_slice_parent_path`'s doc
+            // comment. `false`: this walks the whole resolved path, not a
+            // per-element `rest` after `.[]`, so an empty residual prefix
+            // must defer to the no-op check below rather than deleting the
+            // root outright.
             let rewritten = (S::TAG == EvalTag::Yq)
-                .then(|| yq_del_scalar_slice_parent_path(path, &result))
+                .then(|| yq_del_scalar_slice_parent_path(path, &result, false))
                 .flatten();
+            // #1219: a chained slice with more path after it that *isn't*
+            // itself another trailing slice (`.a[1:3][0]`, `.a[1:3][0].x`,
+            // `.a[1:3][]`) real-yq no-ops entirely, live-verified — it does
+            // *not* fall through to walking the slice and then the rest of
+            // the path, which is what `delete_at_path`'s own per-step walk
+            // would otherwise do here and get wrong. Checked only once the
+            // parent-key-drop rewrite above has declined, same ordering as
+            // that rule: a chained slice-run always has one of these two
+            // outcomes, never a normal walk.
+            if rewritten.is_none() && S::TAG == EvalTag::Yq && yq_del_chained_slice_is_noop(path) {
+                continue;
+            }
             let path = rewritten.as_ref().unwrap_or(path);
             if let Err(e) = delete_at_path(&mut result, path, false, S::TAG == EvalTag::Yq) {
                 return if optional {
@@ -20628,11 +20721,23 @@ fn builtin_del<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // machinery this fix doesn't otherwise need to touch, so the rewrite
     // happens once, per path, before either ever sees it, rather than
     // teaching them the rule directly.
+    //
+    // #1219's *other* half (a chained slice-run followed by something that
+    // isn't itself a slice no-ops the whole `del()` call) is deliberately
+    // **not** applied here: unlike the single-path branch above, a no-op
+    // here can't just skip the loop iteration — it would need to drop this
+    // one sibling's steps from `flattened` while still deleting the others,
+    // and real yq's own answer for a multi-path `del()` mixing this shape
+    // with a sibling is untested territory, same class of gap #1223 already
+    // scoped out of `rewrite_yq_del_comma_branches` above. Left as a
+    // pre-existing gap for this branch specifically; tracked as a follow-up
+    // rather than guessed at here.
     let rewritten: Vec<Expr> = paths
         .iter()
         .map(|path| {
             if S::TAG == EvalTag::Yq {
-                yq_del_scalar_slice_parent_path(path, &result).unwrap_or_else(|| path.clone())
+                yq_del_scalar_slice_parent_path(path, &result, false)
+                    .unwrap_or_else(|| path.clone())
             } else {
                 path.clone()
             }
@@ -20832,8 +20937,9 @@ fn delete_at_path(
                     Expr::Iterate => match root {
                         OwnedValue::Array(arr) => {
                             // #1182: yq's chained-scalar-slice del() rule
-                            // (#1116) can't be applied upfront for this
-                            // shape -- the caller's own rewrite
+                            // (#1116, generalized by #1219 to a whole
+                            // trailing slice-run) can't be applied upfront
+                            // for this shape -- the caller's own rewrite
                             // (`yq_del_scalar_slice_parent_path`) only
                             // runs once, before this walk even starts,
                             // and its `navigate_read_only` prefix-peek
@@ -20849,23 +20955,39 @@ fn delete_at_path(
                             //
                             // `Some(Expr::Identity)` is a distinct signal
                             // from any other rewrite: it means the *element
-                            // itself* is the scalar the trailing slice would
-                            // have targeted (`.[]` directly followed by the
-                            // slice, no `Field`/`Index` between). There is
-                            // no parent key to drop one level down from an
-                            // `&mut` reference into this array slot --
+                            // itself* is the scalar the trailing slice-run
+                            // would have targeted (`.[]` directly followed
+                            // by the run, no `Field`/`Index` between --
+                            // `true` for `empty_prefix_is_identity`, unlike
+                            // the top-level callers). There is no parent key
+                            // to drop one level down from an `&mut`
+                            // reference into this array slot --
                             // `delete_at_path`'s own `Expr::Identity` arm
                             // would just null the element in place, not
                             // remove it, so this element's index is queued
                             // for removal from `arr` itself after the loop
                             // instead of being recursed into.
+                            //
+                            // #1219: when the rewrite declines *and* `rest`
+                            // is a chained slice-run followed by something
+                            // that isn't itself another trailing slice
+                            // (`.a[][1:3][0]`), real yq no-ops that element
+                            // outright rather than walking `rest` against
+                            // it, live-verified -- the element is left
+                            // completely untouched (neither removed nor
+                            // recursed into).
                             let mut remove_indices = Vec::new();
                             for (i, elem) in arr.iter_mut().enumerate() {
                                 let rewritten = yq_mode
-                                    .then(|| yq_del_scalar_slice_parent_path(&rest, elem))
+                                    .then(|| yq_del_scalar_slice_parent_path(&rest, elem, true))
                                     .flatten();
                                 if matches!(rewritten, Some(Expr::Identity)) {
                                     remove_indices.push(i);
+                                } else if rewritten.is_none()
+                                    && yq_mode
+                                    && yq_del_chained_slice_is_noop(&rest)
+                                {
+                                    // Leave this element untouched.
                                 } else {
                                     delete_at_path(
                                         elem,
@@ -20881,15 +21003,21 @@ fn delete_at_path(
                             Ok(())
                         }
                         OwnedValue::Object(map) => {
-                            // Same per-element rewrite and elem-is-target
-                            // removal as the array arm above.
+                            // Same per-element rewrite, elem-is-target
+                            // removal, and #1219 no-op as the array arm
+                            // above.
                             let mut remove_keys = Vec::new();
                             for (key, value) in map.iter_mut() {
                                 let rewritten = yq_mode
-                                    .then(|| yq_del_scalar_slice_parent_path(&rest, value))
+                                    .then(|| yq_del_scalar_slice_parent_path(&rest, value, true))
                                     .flatten();
                                 if matches!(rewritten, Some(Expr::Identity)) {
                                     remove_keys.push(key.clone());
+                                } else if rewritten.is_none()
+                                    && yq_mode
+                                    && yq_del_chained_slice_is_noop(&rest)
+                                {
+                                    // Leave this entry untouched.
                                 } else {
                                     delete_at_path(
                                         value,
