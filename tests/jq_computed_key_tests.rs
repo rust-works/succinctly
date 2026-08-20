@@ -774,6 +774,230 @@ fn test_components_after_the_last_computed_key_may_fan_out() {
     );
 }
 
+/// #888: a genuinely multi-branch computed key (not just the single-valued
+/// `.[.k]` above) ahead of a trailing bare iterate — `path()` alone was
+/// O(n^2) here (`resolve_dynamic_indexes` let `resolve_seq`'s fan-out loop
+/// fully enumerate the trailing `[]` into one static `Index(i)` component
+/// per array element, so a computed key with `k` branches ahead of an
+/// `n`-element array produced `k*n` resolved paths instead of `k`, and
+/// `builtin_path` re-walked every one of them from the document root);
+/// `del`/`=`/`|=` were already linear on the identical shape. See
+/// `benches/jq_write_path_bench.rs`'s `bench_computed_key_with_trailing_iterate`
+/// for the scaling regression test.
+#[test]
+fn test_computed_key_ahead_of_trailing_iterate_888() {
+    let doc = r#"{"items":[{"foo":[1,2]},{"foo":[3,4]}]}"#;
+    check(
+        doc,
+        "[path(.items[(0,1)].foo[])]",
+        Outcome::values(&[
+            r#"[["items",0,"foo",0],["items",0,"foo",1],["items",1,"foo",0],["items",1,"foo",1]]"#,
+        ]),
+    );
+    check(
+        doc,
+        "del(.items[(0,1)].foo[])",
+        Outcome::values(&[r#"{"items":[{"foo":[]},{"foo":[]}]}"#]),
+    );
+    check(
+        doc,
+        "(.items[(0,1)].foo[]) |= .+1",
+        Outcome::values(&[r#"{"items":[{"foo":[2,3]},{"foo":[4,5]}]}"#]),
+    );
+    check(
+        doc,
+        "(.items[(0,1)].foo[]) = 9",
+        Outcome::values(&[r#"{"items":[{"foo":[9,9]},{"foo":[9,9]}]}"#]),
+    );
+
+    // `?` on the trailing iterate still suppresses a non-container error one
+    // branch at a time — the other branch's elements still come through.
+    let mixed = r#"{"items":[{"foo":[1,2]},{"foo":5}]}"#;
+    check(
+        mixed,
+        "[path(.items[(0,1)].foo[]?)]",
+        Outcome::values(&[r#"[["items",0,"foo",0],["items",0,"foo",1]]"#]),
+    );
+    // Without `?`, a non-container branch still raises "Cannot iterate
+    // over" — wrapped in `[...]` so a partial prefix from the other branch
+    // can't turn this into a `Values` outcome instead of a clean `Error`.
+    check(
+        mixed,
+        "[path(.items[(0,1)].foo[])]",
+        Outcome::error("Cannot iterate over number (5)"),
+    );
+    check(
+        r#"{"items":[{"foo":1},{"foo":2}]}"#,
+        "path(.items[(0,1)].foo[])",
+        Outcome::error("Cannot iterate over number (1)"),
+    );
+
+    // A non-trailing iterate is untouched by the #888 fix — it still fans
+    // out through the ordinary multi-branch resolver, not this shortcut.
+    check(
+        r#"{"a":[{"b":{"x":1,"y":2}},{"b":{"x":3,"y":4}}]}"#,
+        r#"[path(.a[].b[("x","y")])]"#,
+        Outcome::values(&[r#"[["a",0,"b","x"],["a",1,"b","x"],["a",0,"b","y"],["a",1,"b","y"]]"#]),
+    );
+    check(
+        r#"{"a":[{"b":[{"c":1},{"c":2}]},{"b":[{"c":3},{"c":4}]}]}"#,
+        "[path(.a[(0,1)].b[].c)]",
+        Outcome::values(&[
+            r#"[["a",0,"b",0,"c"],["a",0,"b",1,"c"],["a",1,"b",0,"c"],["a",1,"b",1,"c"]]"#,
+        ]),
+    );
+
+    // A stacked trailing iterate (`.foo[][]`) strips more than one element —
+    // covers the strip loop running more than once, not a realistic query.
+    check(
+        r#"{"items":[{"foo":[[1,2],[3,4]]},{"foo":[[5,6]]}]}"#,
+        "[path(.items[(0,1)].foo[][])]",
+        Outcome::values(&[concat!(
+            r#"[["items",0,"foo",0,0],["items",0,"foo",0,1],"#,
+            r#"["items",0,"foo",1,0],["items",0,"foo",1,1],"#,
+            r#"["items",1,"foo",0,0],["items",1,"foo",0,1]]"#
+        )]),
+    );
+}
+
+/// #888: everything the trailing-iterate deferral must *not* change, pinned
+/// on `=`/`|=`/`del()` — the three callers that pass
+/// `defer_trailing_iterate: false` precisely because each case below breaks
+/// when they don't.
+///
+/// A first cut of #888 deferred for all four callers. The whole suite stayed
+/// green and every check on the PR passed; a 1,680-case differential sweep
+/// against jq 1.7.1 found 186 divergences. These are the smallest
+/// representative of each family, all captured from jq 1.7.1.
+#[test]
+fn test_trailing_iterate_deferral_is_read_only_888() {
+    // A stacked `[][]` is a working write in jq, not just a `path()` shape.
+    // Deferred, the walkers see two adjacent `Iterate` components and reject
+    // the whole path as an invalid path component.
+    check(
+        r#"{"a":{"x":[1]},"b":{"y":[2]}}"#,
+        r#".[("a","b")][][] = 9"#,
+        Outcome::values(&[r#"{"a":{"x":[9]},"b":{"y":[9]}}"#]),
+    );
+    check(
+        r#"{"a":{"x":[1]},"b":{"y":[2]}}"#,
+        r#".[("a","b")][][] |= 9"#,
+        Outcome::values(&[r#"{"a":{"x":[9]},"b":{"y":[9]}}"#]),
+    );
+    check(
+        r#"{"a":[[1,2]],"b":[[3]]}"#,
+        r#"del(.[("a","b")][][])"#,
+        Outcome::values(&[r#"{"a":[[]],"b":[[]]}"#]),
+    );
+
+    // `?` finishes during path *production*. A deferred `[]?` carries its
+    // marker into `set_path`, which auto-vivifies every component on the way
+    // to discovering there is nothing to iterate — inventing keys and array
+    // slots jq never creates, and suppressing the write-time failure jq
+    // raises.
+    check(
+        r#"{"a":7,"b":[1,2]}"#,
+        r#".[("b","nope")][]? = 1"#,
+        Outcome::values(&[r#"{"a":7,"b":[1,1]}"#]),
+    );
+    check(
+        r#"{"a":7,"b":[1,2]}"#,
+        r#".[("b","nope")][]? |= .+1"#,
+        Outcome::values(&[r#"{"a":7,"b":[2,3]}"#]),
+    );
+    // No branch resolves at all: the document comes back untouched, not with
+    // two fabricated null keys.
+    check(
+        r#"{"a":7,"b":[1,2]}"#,
+        r#".[("nope","nope2")][]? = 1"#,
+        Outcome::values(&[r#"{"a":7,"b":[1,2]}"#]),
+    );
+    // Same for an out-of-range numeric branch — jq does not pad the array.
+    check(
+        r#"{"a":7,"b":[1,2]}"#,
+        ".b[(0,5)][]? = 1",
+        Outcome::values(&[r#"{"a":7,"b":[1,2]}"#]),
+    );
+
+    // jq computes the whole path set against the pristine document, then
+    // applies it. Here the first branch's write turns `.x.y` into a number,
+    // and jq still applies the second branch's already-resolved path to it
+    // and fails. Deferred, the second branch re-expands `[]` against the
+    // *mutated* document instead — where `?` prunes it and the write
+    // silently succeeds (#498's clobber case).
+    check(
+        r#"{"x":{"y":[1,2]},"z":5}"#,
+        "(.x,.x.y)[]? = 9",
+        Outcome::error("Cannot index number with number"),
+    );
+    check(
+        r#"{"x":{"y":[1,2]},"z":5}"#,
+        "(.x,.x.y)[] = 9",
+        Outcome::error("Cannot index number with number"),
+    );
+
+    // Trackability and iterability are interleaved per branch by
+    // `resolve_seq`'s fan-out loop, so the *first* branch decides. Deferred,
+    // every branch's trackability is answered before any branch's
+    // iterability, and the later branch wins instead.
+    check(
+        r#"{"a":7}"#,
+        "del((.a,1)|.[])",
+        Outcome::error("Cannot iterate over number (7)"),
+    );
+    check(
+        r#"{"a":7}"#,
+        r#"del((.a,error("boom"))|.[])"#,
+        Outcome::error("Cannot iterate over number (7)"),
+    );
+    // Reverse the order and the untracked branch really is first, so its own
+    // wording is the right answer — this is the control for the case above,
+    // not a repeat of it.
+    check(
+        r#"{"a":7}"#,
+        "del((1,.a)|.[])",
+        Outcome::error("Invalid path expression near attempt to iterate through 1"),
+    );
+
+    // A static tail after the fan-out is still applied before the iterate.
+    check(
+        r#"{"a":null,"b":[1]}"#,
+        r#".[("a","b")].k[] = 9"#,
+        Outcome::error("Cannot iterate over null (null)"),
+    );
+}
+
+/// #888: `reject_untracked_at_terminal`'s `near_iterate` wording, which only
+/// the deferring caller (`path()`) can reach.
+///
+/// Once the trailing iterate is stripped, the branch never reaches
+/// `resolve_node`'s `Expr::Iterate` arm, so its `if !trackable` guard cannot
+/// raise — the terminal check has to spell the same sentence itself. Forcing
+/// that argument to `false` leaves the whole suite green apart from one
+/// incidental destructuring test, so this case exists to say what the
+/// argument is actually for.
+#[test]
+fn test_untracked_terminal_before_a_deferred_iterate_says_near_iterate_888() {
+    check(
+        "{}",
+        "path(1|.[])",
+        Outcome::error("Invalid path expression near attempt to iterate through 1"),
+    );
+    check(
+        "{}",
+        "[path((1,2)|.[])]",
+        Outcome::error("Invalid path expression near attempt to iterate through 1"),
+    );
+    // `del()` reaches the same sentence by the other road — it does not
+    // defer, so `resolve_node`'s own `Expr::Iterate` arm raises it. Pinned
+    // together so the two roads cannot drift apart.
+    check(
+        "{}",
+        "del(1|.[])",
+        Outcome::error("Invalid path expression near attempt to iterate through 1"),
+    );
+}
+
 /// A computed key is checked against the container it will actually index, not
 /// against the value the chain started from.
 ///
