@@ -15800,6 +15800,57 @@ fn test_1219_comma_grouped_all_noop_siblings_object_targets() -> Result<()> {
     Ok(())
 }
 
+/// #1219: the same all-siblings-`Noop` collapse as above, but reached
+/// through a *computed* key (`.[("a","z")]`) fanning out to two resolved
+/// paths in `builtin_del`'s `paths.len() > 1` branch, rather than a
+/// syntactic top-level `Comma` reaching `rewrite_yq_del_comma_branches`.
+/// These are two structurally distinct code paths that happen to share
+/// the same "every sibling filters out to empty" edge case -- flagged by
+/// review as untested since only the syntactic-comma variant had a pin.
+#[test]
+fn test_1219_computed_key_all_noop_siblings() -> Result<()> {
+    let (out, code) = run_yq_stdin(
+        r#"del(.[("a","z")][1:3][0])"#,
+        r#"{"a":[10,20,30,40],"z":[1,2,3,4]}"#,
+        &["-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), r#"{"a":[10,20,30,40],"z":[1,2,3,4]}"#);
+    Ok(())
+}
+
+/// #1219: a `DropParent`-classified chained slice whose *residual prefix*
+/// contains a multi-step `Expr::Optional` group (`.a?.b?[0:2]`) reconstructs
+/// correctly via `yq_del_slice_outcome`'s `wrap` closure -- each prefix
+/// step's own `optional` flag (from `flatten_delete_path`) is independently
+/// re-wrapped, reproducing the same swallow-on-mismatch behavior a single
+/// `Optional` around the whole group would give (an established precedent,
+/// see `splice_optional_group`, #1294). A mid-prefix type mismatch (`.a` is
+/// a scalar, not an object) is swallowed by `?` and the whole call no-ops;
+/// live-verified against yq v4.53.3.
+#[test]
+fn test_1219_optional_wrapped_multistep_prefix_swallows_mismatch() -> Result<()> {
+    let (out, code) = run_yq_stdin("del(.a?.b?[0:2])", r#"{"a":5}"#, &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), r#"{"a":5}"#);
+    Ok(())
+}
+
+/// #1219: the same `Optional`-wrapped-prefix shape when it *does* resolve
+/// cleanly -- drops `.a.b` entirely, the ordinary drop-parent rule, `?`
+/// never needing to swallow anything here.
+#[test]
+fn test_1219_optional_wrapped_multistep_prefix_drops_parent_key() -> Result<()> {
+    let (out, code) = run_yq_stdin(
+        "del(.a?.b?[0:2])",
+        r#"{"a":{"b":[10,20,30,40]}}"#,
+        &["-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), r#"{"a":{}}"#);
+    Ok(())
+}
+
 /// #1219: a chained slice hidden inside a parenthesized sub-path, combined
 /// with more path *outside* the parens (`(.a[0:1])[0:2]`), must get the
 /// same drop-parent-key treatment as the unparenthesized `del(.a[0:2])`.
