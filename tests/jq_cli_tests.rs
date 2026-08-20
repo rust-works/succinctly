@@ -13458,6 +13458,27 @@ fn test_path_context_generic_fallback_empty_source_swallows_to_empty_1280() -> R
     Ok(())
 }
 
+/// #1280's `ParentN` arm: a `parent(...)` call whose `n` argument produces
+/// zero outputs (`parent(empty)`) must contribute zero outputs itself, not
+/// fall through to the "expected number" type-error arm via a fabricated
+/// `Null`. This is the fourth call site the same review round found still
+/// routed through the old `eval_owned_expr` after the other three (Builtin,
+/// Object/Array/Literal, generic-fallback, covered above) were fixed --
+/// before the fix, `parent(empty), key` errored `expected number, got
+/// other` instead of printing just `key`'s own value. `parent` is a
+/// succinctly extension (no real-jq equivalent), so this is checked against
+/// succinctly's own contract, like the sibling test above it.
+#[test]
+fn test_path_context_parent_n_argument_empty_swallows_to_empty_1280() -> Result<()> {
+    let (out, err, code) = run_jq_full(
+        &["-c", ".a.b | parent(empty), key"],
+        Some(r#"{"a":{"b":1}}"#),
+    )?;
+    assert_eq!(code, 0, "err={err}");
+    assert_eq!(out.trim(), "\"b\"");
+    Ok(())
+}
+
 /// #1045 coverage: `flatten(depth)`'s `Ok(Some(_)) => ...type_error("number",
 /// "non-number")` arm -- a non-number depth argument, unconditional (no
 /// `optional` gate), unlike the negative-depth arm covered by
