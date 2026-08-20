@@ -20157,15 +20157,21 @@ fn delete_expr_array_paths(
         // a string root (where indexing/slicing is a legal *read*, so
         // resolution actually reaches this function even under `?`) still
         // errors identically with every sibling's own `?` added
-        // (`del(.[0:1]?, .[1:2]?)` on `"hi"`); a number/boolean/object root
-        // under `?` never reaches here at all -- `resolve_dynamic_indexes`'s
-        // own navigation fails first and, under `?`, swallows to a no-op
-        // before `flatten_delete_path` ever runs.
+        // (`del(.[0:1]?, .[1:2]?)` on `"hi"`).
         //
-        // *Which* sentence comes from the first sibling, because jq walks the
-        // paths in source order and dies on the first: `5 | del(.[0], .[1:2])`
-        // is `Cannot index number with number`, and the same two written the
-        // other way round is `… with object`.
+        // The `Slice { .. } => "object"`/catch-all `"number"` arms below
+        // could not be live-reached by any repro tried while fixing #1322
+        // (neither a bare-number root, `5 | del(.[0], .[1:2])`, nor a
+        // nested one, `{"a":5} | del(.a[0], .a[1:2])` -- both instead fail
+        // during `resolve_dynamic_indexes`'s own upstream navigation,
+        // before `flatten_delete_path`/this function ever runs, since
+        // indexing or slicing a number as a *read* is illegal the same way
+        // deleting through one is). Confirmed via a temporary debug probe
+        // that this function is never even called for either shape. Left
+        // as-is rather than removed -- proving *no* repro reaches them
+        // needs exhaustively tracing every `resolve_node` arm, out of
+        // #1322's own scope, and the string arm above shows this whole
+        // `match` is not uniformly dead.
         return Err(match &paths[0][start].component {
             Expr::Slice { .. } if matches!(value, OwnedValue::String(_)) => {
                 EvalError::cannot_delete_fields_from("string")
