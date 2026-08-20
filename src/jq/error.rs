@@ -862,7 +862,7 @@ impl EvalError {
     /// that the *filter* is not a path expression, not a runtime value
     /// error. `?` only suppresses failures raised while collecting a path
     /// (a missing key, an out-of-range index, ...); this survives it, the
-    /// same way [`Self::is_negative_index_out_of_bounds`] does for the write
+    /// same way [`Self::is_write_time_application_error`] does for the write
     /// side (#530: confirmed live — `path(("a")?)` still raises in jq). The
     /// lone call site that needs to tell the two apart is `resolve_node`'s
     /// bare-`?` arm in `eval.rs`.
