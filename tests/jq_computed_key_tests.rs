@@ -1876,13 +1876,15 @@ fn test_del_static_comma_type_error_still_errors_with_every_sibling_optional_132
     );
 }
 
-/// #1322's own dead-code gate covered the `Slice`/catch-all `Err` arms too
-/// (not just the string arm above), but neither is reachable through a
-/// *top-level* non-array root: `.[0]`/`.[1:2]` directly against `5` fails
-/// during `resolve_dynamic_indexes`'s own navigation before this function is
-/// ever called. A *nested* root reaches them instead -- `.a` is a valid read
-/// regardless of what value it holds, so resolution succeeds and hands
-/// `delete_expr_array_paths` the nested number to fail on.
+/// A companion to `test_del_static_comma_type_error_reports_the_first_
+/// sibling` above, but through a nested `.a` rather than a bare root --
+/// confirmed via a temporary debug probe that this does *not* reach
+/// `delete_expr_array_paths`'s `Slice`/catch-all `Err` arms either (see
+/// that function's own doc comment): `.a[0]`/`.a[1:2]` against a nested
+/// number fails during `resolve_dynamic_indexes`'s own upstream
+/// navigation, same as the bare-root case, just one level deeper. Kept as
+/// its own regression test regardless -- a real, live-verified-against-jq
+/// output this repo doesn't otherwise pin at the nested-field depth.
 #[test]
 fn test_del_static_comma_nested_number_type_error_reports_the_first_sibling_1322() {
     check(
