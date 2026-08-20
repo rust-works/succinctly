@@ -41676,21 +41676,29 @@ mod tests {
         // `through_slice` deliberately forces `terminal_write: true` for a
         // string target, keeping the OLD, unconditional "Cannot update
         // string slices" refusal there byte-for-byte unchanged -- NOT the
-        // new jq-mode fix above. This case is the same real-yq-diverges
-        // gap #1219 already tracks for a container target
-        // (`del(.a[1:3][0])` on an array): real yq silently no-ops it
-        // (confirmed live, `del(.a[0:1].b)` on `a: hello` leaves `a:
-        // hello` untouched), which is #1219's own scope to fix, not this
-        // issue's. Pinning the *unchanged* wrong message here so a future
-        // edit doesn't silently swap it for a different-but-still-wrong
-        // one and make this string case look fixed relative to #1219's
-        // still-open array/object case.
+        // new jq-mode fix above. At the time #1321 landed, this was the
+        // same real-yq-diverges gap #1219 tracked for a container target
+        // (`del(.a[1:3][0])` on an array), left open as "#1219's own scope
+        // to fix, not this issue's."
+        //
+        // #1219 has since landed and closes this string case too, as a
+        // side effect rather than a deliberate target: `yq_del_slice_
+        // outcome` classifies a chained-slice-then-non-slice path as
+        // `Noop` from its *shape* alone, before `builtin_del` ever calls
+        // `delete_at_path` -- so `through_slice`'s `terminal_write` forcing
+        // above is never reached for this query at all, regardless of
+        // `.a`'s type. The whole `del()` call now correctly no-ops,
+        // matching real yq exactly (confirmed live, `del(.a[0:1].b)` on
+        // `a: hello` leaves `a: hello` untouched) -- this test's own
+        // *previous* expectation (the old, unconditional "Cannot update
+        // string slices" error) is what's now stale, not this update.
         yq_query!(br#"{"a":"hello"}"#, r"del(.a[0:1].b)",
-            QueryResult::Error(e) => {
-                assert_eq!(e.message, "Cannot update string slices");
+            QueryResult::Owned(v) => {
+                assert_eq!(v.to_json(), r#"{"a":"hello"}"#);
             }
         );
-        // jq mode is unaffected by this yq-only gating.
+        // jq mode is unaffected by #1219's yq-only gating -- still the
+        // ordinary per-step error #1312/#1321 already established above.
         query!(br#"{"a":"hello"}"#, r"del(.a[0:1].b)",
             QueryResult::Error(e) => {
                 assert_eq!(e.message, r#"Cannot index string with string "b""#);
