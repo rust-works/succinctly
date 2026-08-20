@@ -16345,3 +16345,47 @@ fn test_destructuring_pattern_null_propagates_through_nested_object_1239() -> Re
     assert_eq!(out.trim(), "null");
     Ok(())
 }
+
+// #723 review round: input/inputs/input_line_number are jq-only -- the
+// CLI driver behind `succinctly yq` (yq_runner.rs) never seeds their shared
+// document queue, since they need real per-document loop coordination that
+// yq mode doesn't have. Before this fix, the parser/dispatch accepted them
+// unconditionally (no per-mode gating exists for any keyword in this
+// codebase), so `succinctly yq` silently misbehaved -- `input` reported a
+// spurious "break" on every document instead of only true exhaustion, and
+// `inputs` silently produced no output at all. Now they report a clear
+// "not supported in yq mode" error instead, restoring the pre-#723
+// "undefined function"-equivalent failure mode.
+
+#[test]
+fn test_yq_input_not_supported_723() -> Result<()> {
+    let (_out, stderr, code) = run_yq_stdin_with_stderr("input", "a: 1\n", &[])?;
+    assert_eq!(code, 1, "stderr: {stderr}");
+    assert!(
+        stderr.contains("input is not supported in yq mode"),
+        "{stderr}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_yq_inputs_not_supported_723() -> Result<()> {
+    let (_out, stderr, code) = run_yq_stdin_with_stderr("inputs", "a: 1\n", &[])?;
+    assert_eq!(code, 1, "stderr: {stderr}");
+    assert!(
+        stderr.contains("inputs is not supported in yq mode"),
+        "{stderr}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_yq_input_line_number_not_supported_723() -> Result<()> {
+    let (_out, stderr, code) = run_yq_stdin_with_stderr("input_line_number", "a: 1\n", &[])?;
+    assert_eq!(code, 1, "stderr: {stderr}");
+    assert!(
+        stderr.contains("input_line_number is not supported in yq mode"),
+        "{stderr}"
+    );
+    Ok(())
+}
