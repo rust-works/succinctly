@@ -20642,18 +20642,34 @@ fn rewrite_yq_del_comma_branches(expr: &Expr, root: &OwnedValue) -> Option<Expr>
         Expr::Comma(branches) => {
             let new_branches: Vec<Expr> = branches
                 .iter()
-                .map(|branch| {
+                .filter_map(|branch| {
                     if let Some(nested) = rewrite_yq_del_comma_branches(branch, root) {
-                        nested
+                        Some(nested)
                     } else if !needs_path_prepass(branch) {
                         match yq_del_slice_outcome(branch, root, false) {
-                            YqDelSliceOutcome::DropParent(rewritten) => rewritten,
-                            YqDelSliceOutcome::Noop | YqDelSliceOutcome::NotApplicable => {
-                                branch.clone()
-                            }
+                            YqDelSliceOutcome::DropParent(rewritten) => Some(rewritten),
+                            // A `Noop`-classified branch is inert *regardless*
+                            // of what `root` actually contains: every `Noop`
+                            // return in `yq_del_slice_outcome` happens before
+                            // its own `navigate_read_only` call, so the
+                            // classification is pure syntax, decidable without
+                            // ever touching the document. Drop it from the
+                            // comma group entirely here, rather than leaving
+                            // its raw, still-slice-bearing branch in place --
+                            // `resolve_dynamic_indexes`'s navigation has no
+                            // `?`-style tolerance for a type mismatch (`.a[1:3]`
+                            // against an `Object` `.a` hard-errors there), so a
+                            // Noop branch combined with an incompatible sibling
+                            // type used to crash the whole `del()` call instead
+                            // of correctly leaving just this branch untouched
+                            // (`del(.a[1:3][0], .c)` on `{"a":{"x":1},"c":9}` —
+                            // live-verified against yq v4.53.3: `.a` stays put,
+                            // only `.c` is deleted).
+                            YqDelSliceOutcome::Noop => None,
+                            YqDelSliceOutcome::NotApplicable => Some(branch.clone()),
                         }
                     } else {
-                        branch.clone()
+                        Some(branch.clone())
                     }
                 })
                 .collect();
