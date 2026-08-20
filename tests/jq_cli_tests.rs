@@ -13570,3 +13570,162 @@ fn test_deferred_trackability_matches_jq_986_989() {
     assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
     assert!(stdout.is_empty(), "stdout: {stdout}");
 }
+
+// #723: input/inputs/input_line_number. Every expected value below was
+// verified live against pinned jq 1.7.1 during implementation.
+
+/// `., input` on 3 documents: doc 1 is `.`'s own current input, `input`
+/// reads doc 2 (both output); the outer loop's *next* iteration is then doc
+/// 3 (already in sync with what `input` consumed), whose own `input` call
+/// finds nothing left and errors -- so this exits 5 despite all three
+/// values reaching stdout. Confirmed this exact shape live against jq
+/// 1.7.1: stdout `1`/`2`/`3` plus a `break` error on stderr, not a clean
+/// exit -- jq's own `input`/outer-loop interaction has the identical
+/// "last iteration's own `input` call exhausts" behavior this mirrors.
+#[test]
+fn test_jq_input_reads_next_document_723() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", "., input"], Some("1 2 3")).expect("input repro runs");
+    assert_eq!(code, 5, "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(stdout, "1\n2\n3\n");
+    assert!(stderr.contains("break"), "{stderr}");
+    Ok(())
+}
+
+/// jq's own exhaustion error is oddly spelled `break`, not a more
+/// descriptive "No more inputs" -- confirmed live against jq 1.7.1. The
+/// `:0` (not `:1`) is a separate, pre-existing quirk unrelated to #723:
+/// `succinctly jq`'s own location tracking reports line 0 for a document
+/// ending on the input's first line even without `input` involved at all
+/// (confirmed identical on `main` before this change, e.g. `echo '1 2' |
+/// jq '.,error'` reports `:0` for the first value too) -- not something
+/// this issue introduces or should silently paper over here.
+#[test]
+fn test_jq_input_exhausted_errors_with_break_723() {
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", "input"], Some("1")).expect("input-exhaustion repro runs");
+    assert_eq!(code, 5, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(stdout.is_empty(), "stdout: {stdout}");
+    assert!(
+        stderr.contains("jq: error (at <stdin>:0): break"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn test_jq_input_optional_catches_exhaustion_silently_723() -> Result<()> {
+    let (stdout, code) = run_jq_stdin("input?", "1", &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+#[test]
+fn test_jq_try_input_catch_catches_exhaustion_723() -> Result<()> {
+    let (stdout, code) = run_jq_stdin(r#"try input catch "caught""#, "1", &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "\"caught\"\n");
+    Ok(())
+}
+
+/// jq's own canonical `-n` streaming-aggregation idiom -- the primary
+/// real-world use case for `inputs`.
+#[test]
+fn test_jq_null_input_reduce_over_inputs_723() -> Result<()> {
+    let (stdout, code) = run_jq_stdin("reduce inputs as $x (0; .+$x)", "1 2 3", &["-cn"])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "6\n");
+    Ok(())
+}
+
+/// Unlike bare `input`, `inputs` never errors on exhaustion -- it's a
+/// generator that just stops.
+#[test]
+fn test_jq_inputs_stream_remaining_without_error_723() -> Result<()> {
+    let (stdout, code) = run_jq_stdin("inputs", "1 2 3", &["-c"])?;
+    assert_eq!(code, 0);
+    // The bare top-level loop already consumed document 1 as `.`'s own
+    // input before `inputs` ever ran, so only 2 and 3 remain.
+    assert_eq!(stdout, "2\n3\n");
+    Ok(())
+}
+
+#[test]
+fn test_jq_null_input_inputs_sees_every_document_723() -> Result<()> {
+    let (stdout, code) = run_jq_stdin("inputs", "1 2 3", &["-cn"])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "1\n2\n3\n");
+    Ok(())
+}
+
+#[test]
+fn test_jq_input_line_number_tracks_reads_723() -> Result<()> {
+    let (stdout, code) = run_jq_stdin("., input_line_number", "1\n2\n3\n", &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "1\n1\n2\n2\n3\n3\n");
+    Ok(())
+}
+
+#[test]
+fn test_jq_input_line_number_zero_before_any_read_723() -> Result<()> {
+    let (stdout, code) = run_jq_stdin("input_line_number", "1", &["-cn"])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "0\n");
+    Ok(())
+}
+
+/// A filter's own `input` call and the outer per-document loop share one
+/// queue (#723): a document `input` consumes mid-evaluation must never also
+/// be re-processed by the loop as a fresh top-level invocation.
+#[test]
+fn test_jq_input_and_outer_loop_share_one_queue_723() -> Result<()> {
+    let (stdout, code) = run_jq_stdin("(., input)", "1 2 3 4", &["-c"])?;
+    assert_eq!(code, 0);
+    // Doc 1 -> `.` = 1, `input` reads doc 2. Doc 3 -> `.` = 3, `input`
+    // reads doc 4. All four documents seen exactly once, in order.
+    assert_eq!(stdout, "1\n2\n3\n4\n");
+    Ok(())
+}
+
+#[test]
+fn test_jq_null_input_reduce_inputs_over_multiple_files_723() -> Result<()> {
+    let mut f1 = NamedTempFile::new()?;
+    write!(f1, "1")?;
+    let mut f2 = NamedTempFile::new()?;
+    write!(f2, "2")?;
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-cn",
+            "reduce inputs as $x (0; .+$x)",
+            f1.path().to_str().unwrap(),
+            f2.path().to_str().unwrap(),
+        ],
+        None,
+    )
+    .expect("multi-file inputs repro runs");
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(stdout, "3\n");
+    Ok(())
+}
+
+#[test]
+fn test_jq_halt_after_input_still_halts_723() -> Result<()> {
+    let (stdout, code) = run_jq_stdin("(input, halt)", "1 2 3", &["-c"])?;
+    assert_eq!(code, 0);
+    // `input` reads doc 2 and outputs it; `halt` then exits immediately,
+    // before the outer loop would otherwise move on to doc 3.
+    assert_eq!(stdout, "2\n");
+    Ok(())
+}
+
+/// `-n` without any of these builtins must keep working exactly as before
+/// (#723's own `uses_input_builtins` gate must not force a real read, or
+/// route through a different code path, for a filter that never
+/// mentions them).
+#[test]
+fn test_jq_null_input_unaffected_when_not_using_input_builtins_723() -> Result<()> {
+    let (stdout, code) = run_jq_stdin("1 + 1", "", &["-cn"])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "2\n");
+    Ok(())
+}

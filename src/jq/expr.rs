@@ -905,6 +905,18 @@ pub enum Builtin {
     // Phase 12: Additional builtins
     /// `now` - current Unix timestamp
     Now,
+    /// `input` - read and return the next input document, erroring once the
+    /// input stream is exhausted -- real jq's own error text there is
+    /// exactly `break` (confirmed live against jq 1.7.1), not the more
+    /// descriptive "No more inputs" the C source's internal name suggests
+    /// (#723)
+    Input,
+    /// `inputs` - generator yielding every remaining input document one at a
+    /// time, stopping (not erroring) once exhausted (#723)
+    Inputs,
+    /// `input_line_number` - the line number of the most recently read
+    /// input document (#723)
+    InputLineNumber,
     /// `abs` - absolute value (alias for fabs)
     Abs,
     /// `builtins` - list all builtin function names

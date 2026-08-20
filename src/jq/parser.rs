@@ -3393,6 +3393,18 @@ impl<'a> Parser<'a> {
             self.consume_keyword("builtins");
             return Ok(Some(Builtin::Builtins));
         }
+        if self.matches_keyword("inputs") {
+            self.consume_keyword("inputs");
+            return Ok(Some(Builtin::Inputs));
+        }
+        if self.matches_keyword("input_line_number") {
+            self.consume_keyword("input_line_number");
+            return Ok(Some(Builtin::InputLineNumber));
+        }
+        if self.matches_keyword("input") {
+            self.consume_keyword("input");
+            return Ok(Some(Builtin::Input));
+        }
 
         // Phase 13: Iteration control
         // limit(n; expr) - output at most n values from expr
