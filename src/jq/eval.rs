@@ -11151,7 +11151,7 @@ fn eval_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // `builtin_del` (#537) already separates `del(...)?` from a `?` written
     // inside the path.
     let mut pristine = to_owned(&input);
-    let paths = match resolve_dynamic_indexes::<S>(path_expr, &pristine) {
+    let paths = match resolve_dynamic_indexes::<S>(path_expr, &pristine, false) {
         Ok(paths) => paths,
         // `?` swallows only a genuine error; a halt always escapes, so
         // `(.[(halt_error(3))] = 1)?` still halts instead of becoming
@@ -11266,7 +11266,7 @@ fn eval_update<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // an outer `(.[-5] |= 9)?` needs exactly that swallowed. `update_path` is
     // always entered with `false` below; any `?` it still sees came from an
     // `Expr::Optional` node inside `path_expr` itself.
-    let paths = match resolve_dynamic_indexes::<S>(path_expr, &result) {
+    let paths = match resolve_dynamic_indexes::<S>(path_expr, &result, false) {
         Ok(paths) => paths,
         // `?` swallows only a genuine error; a halt always escapes — see the
         // matching comment in `eval_assign` (#791).
@@ -14755,9 +14755,45 @@ fn resolve_seq<'a, S: EvalSemantics>(
 /// sibling fix); the write-side callers (`=`, `|=`, `del()`) discard it and
 /// treat this exactly like a plain failure, matching jq's atomic write
 /// semantics.
+///
+/// `defer_trailing_iterate` asks for #888's optimization: leave a bare
+/// trailing iterate as one literal `Expr::Iterate` component per branch
+/// instead of enumerating it here (see the comment at the strip loop below
+/// for the O(n^2) it avoids). Only `builtin_path` may ask, and the reason is
+/// the same asymmetry the paragraph above describes. Deferring moves the
+/// iterate's *expansion* from resolve time — against `input`, which is the
+/// pristine document, one branch at a time in source order — to whenever the
+/// consumer walks the result. `path()` can absorb that: it only reads, and
+/// `builtin_path`'s own `walk_error.or(resolve_error)` restores jq's "a
+/// later step's failure outranks an earlier deferred one" ordering. The
+/// write-side callers cannot, on four counts measured against jq 1.7.1:
+///
+/// - `get_path_mut`/`update_path` reject two adjacent `Iterate` components
+///   as an invalid path component, so `(.[("a","b")][][]) = 9` — which jq
+///   applies happily — would stop working entirely.
+/// - The spliced-back components never pass through `assemble()`'s
+///   `strip_resolved_optional`, so a deferred `.foo[]?` would carry its `?`
+///   into `set_path`, which then suppresses a *write*-time failure jq raises
+///   — and auto-vivifies on the way there, so `.[("b","nope")][]? = 1`
+///   invents a `"nope": null` key jq never creates.
+/// - Each branch would expand against the document as it stands *after* the
+///   earlier branches' writes, not against `input`; jq computes the whole
+///   path set first and applies it after (#498's clobber case).
+/// - `reject_untracked_at_terminal` below answers trackability for every
+///   branch before any branch's iterability is tested, inverting the two
+///   against `resolve_seq`'s per-branch interleaving: `del((.a, 1) | .[])`
+///   on `{"a":7}` reports jq's "Cannot iterate over number (7)" only while
+///   the iterate is still a fan-out stage.
+///
+/// So this is `false` for `=`/`|=`/`del()`, which keeps them byte-identical
+/// to before #888. They pay for it: `del` on the same shape is quadratic too
+/// — not visible in #888's own table, which stopped at 16,000 elements, but
+/// 24.8s at 400,000 on `main` — tracked separately, since fixing it needs
+/// the four items above resolved rather than bypassed.
 fn resolve_dynamic_indexes<S: EvalSemantics>(
     expr: &Expr,
     input: &OwnedValue,
+    defer_trailing_iterate: bool,
 ) -> Result<Vec<Expr>, (Vec<Expr>, EvalEscape)> {
     if !needs_path_prepass(expr) {
         return Ok(vec![expr.clone()]);
@@ -14802,20 +14838,61 @@ fn resolve_dynamic_indexes<S: EvalSemantics>(
     /// `IndexExpr`/`SliceExpr` target, where its own tail is empty but the
     /// enclosing key still has to be navigated.
     ///
+    /// `near_iterate` picks the wording: `true` when a trailing bare iterate
+    /// was stripped off `branches`' own path expression and will be spliced
+    /// back on below (#888) — these branches are exactly the ones that would
+    /// otherwise have reached `resolve_node`'s own `Expr::Iterate` arm, whose
+    /// `if !trackable` guard raises `invalid_path_expression_near_iterate`,
+    /// not the generic message this function raises for every other shape.
+    /// Without it `path(1 | .[])` would report "Invalid path expression with
+    /// result 1" where jq says "near attempt to iterate through 1".
+    ///
     /// Branches already produced ahead of the offending one are kept and
     /// returned as the `Err` prefix, matching jq's never-un-emit streaming.
     fn reject_untracked_at_terminal(
         branches: Vec<PathBranch<'_>>,
+        near_iterate: bool,
     ) -> Result<Vec<PathBranch<'_>>, (Vec<PathBranch<'_>>, EvalEscape)> {
         let mut kept = Vec::with_capacity(branches.len());
         for branch in branches {
             if !branch.trackable {
-                let error = EvalError::invalid_path_expression(&branch.value).into();
+                let error = if near_iterate {
+                    EvalError::invalid_path_expression_near_iterate(&branch.value).into()
+                } else {
+                    EvalError::invalid_path_expression(&branch.value).into()
+                };
                 return Err((kept, error));
             }
             kept.push(branch);
         }
         Ok(kept)
+    }
+
+    /// Is this a bare trailing iterate — `Expr::Iterate` or
+    /// `Expr::Optional(Iterate)` (`.foo[]?`) — the shape `resolve_seq`'s
+    /// fan-out loop would otherwise fully enumerate one static `Index`
+    /// component at a time (#888, see below)?
+    fn is_bare_iterate(expr: &Expr) -> bool {
+        match expr {
+            Expr::Iterate => true,
+            Expr::Optional(inner) => matches!(inner.as_ref(), Expr::Iterate),
+            _ => false,
+        }
+    }
+
+    /// Splice a stripped trailing-iterate run back onto an already-assembled
+    /// static path expression. Only ever called with a non-empty `trailing`.
+    fn append_trailing(expr: Expr, trailing: &[Expr]) -> Expr {
+        let mut components = match expr {
+            Expr::Pipe(exprs) => exprs,
+            Expr::Identity => Vec::new(),
+            other => vec![other],
+        };
+        components.extend(trailing.iter().cloned());
+        match components.len() {
+            1 => components.into_iter().next().expect("len checked"),
+            _ => Expr::Pipe(components),
+        }
     }
 
     // The document `path()`/`=`/`|=`/`del()` were actually called on is
@@ -14825,9 +14902,61 @@ fn resolve_dynamic_indexes<S: EvalSemantics>(
     // is about the *input*; individual branches can still come back
     // untracked from `resolve_leaf`'s deferred catch-all (#986), which is
     // what `reject_untracked_at_terminal` above answers for.
-    match resolve_node::<S>(expr, input, true).and_then(reject_untracked_at_terminal) {
-        Ok(branches) => Ok(assemble(branches)),
-        Err((prefix, e)) => Err((assemble(prefix), e)),
+
+    // #888: a bare trailing iterate never needs its per-element *value* here
+    // — this function is always the terminal entry point (see
+    // `reject_untracked_at_terminal`'s own doc comment above), so nothing
+    // downstream of it ever consults one. Left inside `resolve_seq`'s
+    // fan-out loop, it gets fully enumerated into one static `Index(i)`
+    // branch per array element, turning a computed key ahead of it into
+    // O(element count) resolved expressions instead of one per *branch* —
+    // and `builtin_path` walks every one of those independently from the
+    // document root, re-cloning the same subtree each time, for O(n^2)
+    // overall. Stripping it here and re-attaching it as one literal
+    // component per (already-necessary) branch keeps the computed-key
+    // resolution itself unchanged and lets the iterate fan out exactly once
+    // per branch, natively, in `walk_path`'s own `Expr::Iterate` arm.
+    //
+    // `path()` only — `defer_trailing_iterate` is `false` for the write-side
+    // callers, whose walkers cannot take a deferred iterate; see this
+    // function's doc comment for the four ways that goes wrong.
+    let mut flat = Vec::new();
+    push_path_components(&mut flat, expr);
+    let mut trailing = Vec::new();
+    if defer_trailing_iterate {
+        while let Some(true) = flat.last().map(is_bare_iterate) {
+            trailing.push(flat.pop().expect("checked Some above"));
+        }
+    }
+
+    if trailing.is_empty() {
+        return match resolve_node::<S>(expr, input, true)
+            .and_then(|branches| reject_untracked_at_terminal(branches, false))
+        {
+            Ok(branches) => Ok(assemble(branches)),
+            Err((prefix, e)) => Err((assemble(prefix), e)),
+        };
+    }
+    trailing.reverse();
+
+    let reduced_expr = match flat.len() {
+        1 => flat.into_iter().next().expect("len checked"),
+        _ => Expr::Pipe(flat),
+    };
+    match resolve_node::<S>(&reduced_expr, input, true)
+        .and_then(|branches| reject_untracked_at_terminal(branches, true))
+    {
+        Ok(branches) => Ok(assemble(branches)
+            .into_iter()
+            .map(|e| append_trailing(e, &trailing))
+            .collect()),
+        Err((prefix, e)) => Err((
+            assemble(prefix)
+                .into_iter()
+                .map(|e| append_trailing(e, &trailing))
+                .collect(),
+            e,
+        )),
     }
 }
 
@@ -18378,7 +18507,7 @@ fn builtin_path<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // a later one errors (confirmed live) — so that prefix is walked below
     // exactly like a successful resolution, and only the *error* is deferred
     // to the end.
-    let (exprs, resolve_error) = match resolve_dynamic_indexes::<S>(expr, &owned) {
+    let (exprs, resolve_error) = match resolve_dynamic_indexes::<S>(expr, &owned, true) {
         Ok(exprs) => (exprs, None),
         Err((exprs, e)) => (exprs, Some(e)),
     };
@@ -19997,7 +20126,7 @@ fn builtin_del<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // Computed keys resolve against the original document; each becomes one
     // fully static path expression (Field/Index/Iterate components — see
     // `resolve_dynamic_indexes`).
-    let paths = match resolve_dynamic_indexes::<S>(path_expr, &result) {
+    let paths = match resolve_dynamic_indexes::<S>(path_expr, &result, false) {
         Ok(paths) => paths,
         // `?` swallows only a genuine error; a halt always escapes — see the
         // matching comment in `eval_assign` (#791).
