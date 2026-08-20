@@ -1876,6 +1876,25 @@ fn test_del_static_comma_type_error_still_errors_with_every_sibling_optional_132
     );
 }
 
+/// #1322 (found by `/code-review`): `delete_expr_paths_at` buckets siblings
+/// by shape and processes the indices bucket (`delete_expr_array_paths`)
+/// before the iterates bucket (`delete_expr_iterate_paths`) at the same
+/// `start`. Before this fix, if the dead `optional` gate had ever actually
+/// been live, an all-optional indices bucket would have returned early
+/// with `Ok(value)` unchanged, and processing would have continued into
+/// the iterates bucket instead of erroring here. Since `optional` is
+/// always `false` in practice this was never reachable, but pinning the
+/// combination directly guards against the ordering assumption silently
+/// changing.
+#[test]
+fn test_del_static_comma_mixed_indices_and_iterate_buckets_still_errors_1322() {
+    check(
+        r#""hi""#,
+        "del(.[0:1]?, .[]?)",
+        Outcome::error("Cannot delete fields from string"),
+    );
+}
+
 /// A companion to `test_del_static_comma_type_error_reports_the_first_
 /// sibling` above, but through a nested `.a` rather than a bare root --
 /// confirmed via a temporary debug probe that this does *not* reach

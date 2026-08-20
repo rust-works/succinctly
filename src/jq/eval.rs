@@ -20141,37 +20141,32 @@ fn delete_expr_array_paths(
     // dd2df4d1 removed it as believed-unreachable and #504's CI caught the
     // regression via `test_del_static_comma_type_error_reports_the_first_sibling`.
     if !matches!(value, OwnedValue::Array(_)) {
-        // A non-array container fails every path here identically. This
-        // used to be gated behind `paths.iter().all(|p| p[start].optional)`
-        // -- unconditionally always errors now, because that gate was dead
-        // (#1322): `resolve_dynamic_indexes`'s `assemble` strips every
-        // `Expr::Optional` wrapper via `strip_resolved_optional` before any
-        // comma-grouped `del()` path reaches `flatten_delete_path`, and
-        // `builtin_del`'s own call passes `optional: false` as
-        // `flatten_delete_path`'s starting value — so no `DeleteStep` this
-        // function ever sees can have `optional == true`, at any recursion
-        // depth, making that gate's `Ok(value)` arm permanently
-        // unreachable. Matches this repo's own "optional never forced true
-        // in nested calls" bug family (#928, #1003, #1034) -- confirmed live
-        // that removing the dead branch doesn't change any reachable output:
-        // a string root (where indexing/slicing is a legal *read*, so
-        // resolution actually reaches this function even under `?`) still
-        // errors identically with every sibling's own `?` added
-        // (`del(.[0:1]?, .[1:2]?)` on `"hi"`).
+        // A non-array container fails every path here identically, so a
+        // single non-optional path among the siblings has to raise even
+        // when others are optional -- this used to be gated behind
+        // `paths.iter().all(|p| p[start].optional)`, unconditionally
+        // errors now instead, because that gate was dead (#1322):
+        // `resolve_dynamic_indexes`'s `assemble` strips every
+        // `Expr::Optional` wrapper via `strip_resolved_optional` before
+        // any comma-grouped `del()` path reaches `flatten_delete_path`, so
+        // no `DeleteStep` here can ever carry `optional == true`. Fourth
+        // occurrence of this repo's "optional never forced true in nested
+        // calls" bug family (#928, #1003, #1034) -- a sibling instance in
+        // `delete_expr_iterate_paths` below, and the general fix (a
+        // `debug_assert` at `DeleteStep`'s own construction site instead
+        // of a fifth discovery), are tracked separately, out of scope
+        // here.
         //
-        // The `Slice { .. } => "object"`/catch-all `"number"` arms below
-        // could not be live-reached by any repro tried while fixing #1322
-        // (neither a bare-number root, `5 | del(.[0], .[1:2])`, nor a
-        // nested one, `{"a":5} | del(.a[0], .a[1:2])` -- both instead fail
-        // during `resolve_dynamic_indexes`'s own upstream navigation,
-        // before `flatten_delete_path`/this function ever runs, since
-        // indexing or slicing a number as a *read* is illegal the same way
-        // deleting through one is). Confirmed via a temporary debug probe
-        // that this function is never even called for either shape. Left
-        // as-is rather than removed -- proving *no* repro reaches them
-        // needs exhaustively tracing every `resolve_node` arm, out of
-        // #1322's own scope, and the string arm above shows this whole
-        // `match` is not uniformly dead.
+        // *Which* sentence comes from `paths[0]` specifically, because jq
+        // walks the paths in source order and dies on the first: the
+        // `Slice { .. } => "object"`/catch-all `"number"` arms below are
+        // themselves not known to be live-reachable (a bare or nested
+        // number root fails earlier, during `resolve_dynamic_indexes`'s
+        // own navigation, confirmed via a debug probe) -- kept rather than
+        // removed, since the string arm above proves this `match` is not
+        // uniformly dead and proving the other two arms are needs
+        // exhaustively tracing every `resolve_node` arm, out of #1322's
+        // own scope.
         return Err(match &paths[0][start].component {
             Expr::Slice { .. } if matches!(value, OwnedValue::String(_)) => {
                 EvalError::cannot_delete_fields_from("string")
@@ -20179,7 +20174,8 @@ fn delete_expr_array_paths(
             Expr::Slice { .. } => {
                 EvalError::cannot_index_with_type(owned_type_name(&value), "object")
             }
-            _ => EvalError::cannot_index_with_type(owned_type_name(&value), "number"),
+            Expr::Index(_) => EvalError::cannot_index_with_type(owned_type_name(&value), "number"),
+            _ => unreachable!("delete_expr_paths_at only dispatches Index/Slice paths here"),
         });
     }
 
