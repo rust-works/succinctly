@@ -45163,6 +45163,45 @@ mod tests {
         }
     }
 
+    /// #1280: `eval_owned_expr_full` is a near-verbatim copy of
+    /// `eval_owned_expr_ctrl_full`'s own slow-path match, so patch coverage
+    /// treats every arm as new -- three of its success arms
+    /// (`One`/`Many(len==1)`/`ManyOwned(len==1)`) aren't reached by any of
+    /// this PR's other tests (all of which hit `Owned` or the fixed `None`
+    /// case). Covered directly here, one expression per arm, found by
+    /// probing which shapes `eval_single`'s own materialization produces
+    /// for each: `if`'s branches route through a borrowed single cursor
+    /// value (`One`); a single-key object's `.[]` keeps its one borrowed
+    /// result in the `Many` collection rather than collapsing it (`Many`,
+    /// len 1); slicing then iterating a constructed array produces one
+    /// already-owned value still inside the `ManyOwned` collection
+    /// (`ManyOwned`, len 1).
+    #[test]
+    fn eval_owned_expr_full_one_and_len1_many_shapes_1280() {
+        let input = OwnedValue::Object(IndexMap::from([("a".to_string(), OwnedValue::Int(1))]));
+
+        // QueryResult::One
+        let expr = parse("if true then .a else . end").unwrap();
+        match eval_owned_expr_full::<JqSemantics>(&expr, &input, false) {
+            Ok(Some((v, None))) => assert_eq!(v.to_json(), "1"),
+            other => panic!("unexpected result: {other:?}"),
+        }
+
+        // QueryResult::Many, len() == 1
+        let expr = parse(".[]").unwrap();
+        match eval_owned_expr_full::<JqSemantics>(&expr, &input, false) {
+            Ok(Some((v, None))) => assert_eq!(v.to_json(), "1"),
+            other => panic!("unexpected result: {other:?}"),
+        }
+
+        // QueryResult::ManyOwned, len() == 1
+        let expr = parse("[1,2,3] | .[0:1][]").unwrap();
+        match eval_owned_expr_full::<JqSemantics>(&expr, &input, false) {
+            Ok(Some((v, None))) => assert_eq!(v.to_json(), "1"),
+            other => panic!("unexpected result: {other:?}"),
+        }
+    }
+
     /// #1164: `result_to_owned_ctrl` (backs 16 of this fix's builtins) is
     /// exercised by every CLI-level `..._1164` test above only via shapes
     /// that land in its `Owned`/`One`/`Partial` arms -- a builtin argument
