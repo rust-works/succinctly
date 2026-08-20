@@ -14153,8 +14153,7 @@ fn test_1088_path_reports_float_index_as_written() {
     .expect("from-data repro runs");
     assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
     assert_eq!(
-        stdout,
-        "[[\"a\",2.0],[\"a\",2.50],[\"a\",-1.0],[\"a\",-1.00],[\"a\",-1E+10]]\n",
+        stdout, "[[\"a\",2.0],[\"a\",2.50],[\"a\",-1.0],[\"a\",-1.00],[\"a\",-1E+10]]\n",
         "stderr: {stderr}"
     );
 
