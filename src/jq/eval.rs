@@ -20739,9 +20739,9 @@ mod remaining_inputs {
 
 /// Seeds the `input`/`inputs`/`input_line_number` queue (#723).
 ///
-/// The CLI driver's own entry point into [`remaining_inputs`], called once
-/// before evaluating any filter. A no-op under `no_std` (nothing to seed
-/// there).
+/// The CLI driver's own entry point into the (private) `remaining_inputs`
+/// module, called once before evaluating any filter. A no-op under
+/// `no_std` (nothing to seed there).
 #[cfg(feature = "std")]
 pub fn seed_remaining_inputs(documents: Vec<(OwnedValue, u32)>) {
     remaining_inputs::seed(documents);
@@ -20750,9 +20750,10 @@ pub fn seed_remaining_inputs(documents: Vec<(OwnedValue, u32)>) {
 /// Pops the next queued input document (#723).
 ///
 /// Exposed so the CLI driver's own per-document loop can share the exact
-/// same queue `input`/`inputs` draw from (see [`remaining_inputs::pop`]'s
-/// doc comment for why this must be one shared queue, not two cursors). A
-/// no-op under `no_std`.
+/// same queue `input`/`inputs` draw from (see `remaining_inputs::pop`'s own
+/// doc comment, `src/jq/eval.rs`, for why this must be one shared queue,
+/// not two cursors -- not doc-linkable from here since that module is
+/// private). A no-op under `no_std`.
 #[cfg(feature = "std")]
 pub fn pop_remaining_input() -> Option<(OwnedValue, u32)> {
     remaining_inputs::pop()
