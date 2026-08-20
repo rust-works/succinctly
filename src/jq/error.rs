@@ -893,6 +893,15 @@ impl EvalError {
         )
     }
 
+    /// `cannot modulo by 0` — real yq's own wording for an integer modulo
+    /// by zero (#1231), confirmed live against yq v4.53.3. Unlike jq's
+    /// [`Self::divisor_is_zero`], this is a fixed sentence with no embedded
+    /// operand values, and applies only to the integer case: a
+    /// float-involving modulo by zero returns NaN in yq, not an error.
+    pub fn yq_modulo_by_zero() -> Self {
+        Self::new("cannot modulo by 0")
+    }
+
     /// `<a> and <b> cannot have their containment checked`.
     pub fn containment_check(left: &OwnedValue, right: &OwnedValue) -> Self {
         Self::pair(left, right, "cannot have their containment checked")
