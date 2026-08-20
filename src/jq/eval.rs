@@ -10746,13 +10746,14 @@ pub(crate) fn is_yq_scalar_slice_assign_path(path_expr: &Expr) -> bool {
 /// `through_slice`).
 ///
 /// A *comma-grouped multi-path* `del()` combining this rule with an
-/// Object-typed sibling target can still hard-error before this function is
-/// ever reached (`del(.a[0:1], .c)` where `.a` is an object) — a pre-
-/// existing crash in `resolve_dynamic_indexes`'s own generic path
-/// validation for a top-level `Comma`, upstream of and unrelated to this
-/// function's own single-path rewrite, confirmed unaffected by #1162 either
-/// way (identical failure on `origin/main` before this fix). Not this
-/// function's bug to fix; tracked separately as #1223.
+/// Object-typed sibling target used to hard-error before this function was
+/// ever reached (`del(.a[0:1], .c)` where `.a` is an object) — a crash in
+/// `resolve_dynamic_indexes`'s own generic path navigation for a top-level
+/// `Comma`, upstream of and unrelated to this function's own single-path
+/// rewrite. Fixed by #1223, not here: `builtin_del` now calls this same
+/// function once per already-static `Comma` branch *before* handing the
+/// (rewritten) path to `resolve_dynamic_indexes`, so navigation never sees
+/// the crashing shape.
 ///
 /// Deliberately its own walker, not reusing `through_slice`: `del()` has no
 /// "edit closure producing a replacement value" to discard the result of —
@@ -20293,6 +20294,41 @@ fn builtin_del<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // path (`del(.a?)`) is unaffected — it's already a distinct
     // `Expr::Optional` node baked into `path_expr`, which the walkers still
     // honor on their own.
+
+    // yq's comma-grouped chained-slice del() pre-rewrite (#1223):
+    // `resolve_dynamic_indexes`'s own generic navigation raises a hard type
+    // error on a comma branch shaped like `.a[0:1]` when `.a` is an
+    // `Object` -- *before* `builtin_del` ever gets a resolved `paths` vector
+    // to apply the `yq_del_scalar_slice_parent_path` rewrite below (that
+    // rewrite runs on the navigation's *output*, too late to prevent the
+    // navigation's own crash). Apply the same rewrite to every branch that
+    // is already fully static (`!needs_path_prepass`) up front, so
+    // `.a[0:1]` becomes `.a` before navigation ever sees it. A branch that
+    // itself needs a prepass (a computed key) is left untouched -- it goes
+    // through the normal walk below, and the existing per-path rewrite
+    // still applies to its resolved output.
+    let rewritten_comma_path_expr: Expr;
+    let path_expr: &Expr = if S::TAG == EvalTag::Yq {
+        if let Expr::Comma(branches) = path_expr {
+            let new_branches: Vec<Expr> = branches
+                .iter()
+                .map(|branch| {
+                    if !needs_path_prepass(branch) {
+                        yq_del_scalar_slice_parent_path(branch, &result)
+                            .unwrap_or_else(|| branch.clone())
+                    } else {
+                        branch.clone()
+                    }
+                })
+                .collect();
+            rewritten_comma_path_expr = Expr::Comma(new_branches);
+            &rewritten_comma_path_expr
+        } else {
+            path_expr
+        }
+    } else {
+        path_expr
+    };
 
     // Computed keys resolve against the original document; each becomes one
     // fully static path expression (Field/Index/Iterate components — see
