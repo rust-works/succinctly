@@ -3352,9 +3352,9 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
         // Phase 12: Additional builtins
         Builtin::Now => builtin_now::<W>(),
-        Builtin::Input => builtin_input::<W>(),
-        Builtin::Inputs => builtin_inputs::<W>(),
-        Builtin::InputLineNumber => builtin_input_line_number::<W>(),
+        Builtin::Input => builtin_input::<W, S>(),
+        Builtin::Inputs => builtin_inputs::<W, S>(),
+        Builtin::InputLineNumber => builtin_input_line_number::<W, S>(),
         Builtin::Abs => builtin_fabs::<W>(value, optional), // abs is an alias for fabs
         Builtin::Builtins => builtin_builtins::<W>(),
         Builtin::Normals => builtin_normals::<W>(value),
@@ -20701,12 +20701,29 @@ mod remaining_inputs {
     }
 
     /// Drains every remaining document at once, for `inputs`'s eager
-    /// generator collection (matching `range`'s own eager-with-a-cap
-    /// convention elsewhere in this file -- this codebase has no lazy
-    /// generator machinery at the `Builtin` dispatch level, so `inputs`
-    /// doesn't invent one; `first(inputs)`/`limit(1; inputs)` draining more
-    /// than needed is the same accepted trade-off `range`'s own callers
-    /// already have).
+    /// generator collection -- this codebase has no lazy generator
+    /// machinery at the `Builtin` dispatch level, so `inputs` doesn't
+    /// invent one for just this case.
+    ///
+    /// Correction (code review, #723): an earlier version of this comment
+    /// compared this to `range`'s own eager-with-a-cap convention and called
+    /// over-draining "the same accepted trade-off." That analogy doesn't
+    /// hold. `range`'s over-computed values are cheap to regenerate and
+    /// simply discarded -- pure wasted CPU, invisible to the rest of the
+    /// program. This queue is a *shared, destructive, non-replayable*
+    /// resource: once `first(inputs)`/`limit(1; inputs)`/`any(inputs; ...)`
+    /// (any combinator this evaluator's own eager model computes-then-
+    /// truncates rather than short-circuits) triggers a full drain, every
+    /// document past the one actually kept is gone -- not just from this
+    /// call, but from the outer per-document loop and any later `input`
+    /// call too. Confirmed live: `first(inputs)` on 5 remaining documents
+    /// silently reads and discards all 5 instead of the 1 real jq's lazy
+    /// generator would leave the rest of the program to see. Filed as
+    /// follow-up issue #1309 (same root cause as, and bundled with, the
+    /// `-L` detection gap above) -- fixing it needs either real lazy
+    /// generator support in this evaluator or a way for a truncating
+    /// combinator to push documents it doesn't end up using back onto the
+    /// front of the queue, neither of which is a small change.
     pub fn drain_all() -> Vec<(OwnedValue, u32)> {
         let all: alloc::vec::Vec<_> = QUEUE.with(|q| q.borrow_mut().drain(..).collect());
         if let Some((_, line)) = all.last() {
@@ -20741,6 +20758,30 @@ pub fn pop_remaining_input() -> Option<(OwnedValue, u32)> {
     remaining_inputs::pop()
 }
 
+/// Code review's own doc-comment-vs-doc-comment cross-check catch (#723):
+/// `jq_runner.rs` is the only CLI driver that calls
+/// [`seed_remaining_inputs`]/[`pop_remaining_input`] before evaluating a
+/// filter -- `yq_runner.rs` never does, yet these three builtins parse and
+/// dispatch unconditionally for `YqSemantics` too (the parser has no
+/// per-mode keyword gating anywhere in this codebase to lean on instead).
+/// Without this check, `succinctly yq` would silently accept `input`/
+/// `inputs`/`input_line_number` syntax that can never produce a correct
+/// result -- confirmed live: `break` on every document for `input`, and
+/// silent empty output for `inputs`, instead of the "undefined function"
+/// parse-time-ish error real yq (and this codebase, pre-#723) gives for a
+/// genuinely unimplemented builtin. Wiring `yq_runner.rs` up to the same
+/// queue for real support is a larger, separate piece of work -- tracked as
+/// a follow-up; this keeps yq mode's failure mode honest in the meantime.
+fn input_builtins_unsupported_in_yq_mode<S: EvalSemantics>(name: &str) -> Option<EvalError> {
+    if S::TAG == EvalTag::Yq {
+        Some(EvalError::new(format!(
+            "{name} is not supported in yq mode"
+        )))
+    } else {
+        None
+    }
+}
+
 /// Builtin: input - read and return the next input document (#723), erroring
 /// with real jq's own exact text (`break`, confirmed live against jq 1.7.1 --
 /// not a more descriptive message) once the input stream is exhausted. A
@@ -20748,7 +20789,10 @@ pub fn pop_remaining_input() -> Option<(OwnedValue, u32)> {
 /// Break` (`label`/`break $label`) mechanism -- confirmed live that `input?`
 /// on exhaustion is silent (exit 0, no output) exactly like any other
 /// caught error, unlike an actual uncaught `label`/`break` mismatch.
-fn builtin_input<'a, W: Clone + AsRef<[u64]>>() -> QueryResult<'a, W> {
+fn builtin_input<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>() -> QueryResult<'a, W> {
+    if let Some(e) = input_builtins_unsupported_in_yq_mode::<S>("input") {
+        return QueryResult::Error(e);
+    }
     #[cfg(feature = "std")]
     {
         match remaining_inputs::pop() {
@@ -20770,7 +20814,10 @@ fn builtin_input<'a, W: Clone + AsRef<[u64]>>() -> QueryResult<'a, W> {
 /// if .=="break" then empty else error end`, and this collects the
 /// equivalent eagerly (see [`remaining_inputs::drain_all`]'s doc comment for
 /// why eager, not lazy, matches this codebase's own convention).
-fn builtin_inputs<'a, W: Clone + AsRef<[u64]>>() -> QueryResult<'a, W> {
+fn builtin_inputs<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>() -> QueryResult<'a, W> {
+    if let Some(e) = input_builtins_unsupported_in_yq_mode::<S>("inputs") {
+        return QueryResult::Error(e);
+    }
     #[cfg(feature = "std")]
     {
         let docs: Vec<OwnedValue> = remaining_inputs::drain_all()
@@ -20787,7 +20834,11 @@ fn builtin_inputs<'a, W: Clone + AsRef<[u64]>>() -> QueryResult<'a, W> {
 
 /// Builtin: input_line_number - the line number of the most recently read
 /// input document (#723), `0` before anything has been read.
-fn builtin_input_line_number<'a, W: Clone + AsRef<[u64]>>() -> QueryResult<'a, W> {
+fn builtin_input_line_number<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>() -> QueryResult<'a, W>
+{
+    if let Some(e) = input_builtins_unsupported_in_yq_mode::<S>("input_line_number") {
+        return QueryResult::Error(e);
+    }
     #[cfg(feature = "std")]
     {
         QueryResult::Owned(OwnedValue::Int(remaining_inputs::last_line() as i64))
@@ -22990,6 +23041,10 @@ fn builtin_builtins<'a, W: Clone + AsRef<[u64]>>() -> QueryResult<'a, W> {
         "halt_error/0",
         "halt_error/1",
         "stderr/0",
+        // Streaming input (#723)
+        "input/0",
+        "inputs/0",
+        "input_line_number/0",
         // Environment (arity 0-1)
         "env/0",
         "env/1",

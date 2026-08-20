@@ -673,14 +673,26 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
     // (#723) -- a conservative text-level check on the raw source rather than
     // an AST walk: every real use of any of the three necessarily contains
     // "input" as a contiguous substring (jq identifiers can't be split
-    // across an escape/continuation), so this never under-detects. A false
-    // positive (`.input` field access, an `"input"` string literal, a
-    // comment) only costs a missed fast-path optimization below, never a
-    // wrong result -- the opposite of an AST walk that missed a `Builtin`
-    // variant deep in some argument position, which would silently produce
-    // wrong output instead. Doesn't see inside an imported/included module's
-    // own definitions (`-L`) -- out of scope for this pass, filed as a
-    // follow-up.
+    // across an escape/continuation) *within this same source string*, so a
+    // direct top-level use is never under-detected. A false positive (`.input`
+    // field access, an `"input"` string literal, a comment) only costs a
+    // missed fast-path optimization below, never a wrong result.
+    //
+    // Known real gap, NOT just a theoretical one (code review, #723): this
+    // check runs on `filter_str` alone, before `module_loader.process_program`
+    // (below) inlines any `-L`/`import`/`include`-loaded module body. A call
+    // to `input`/`inputs`/`input_line_number` that only exists inside an
+    // imported module's own function -- never spelled out in `filter_str`
+    // itself -- is invisible here, so the filter wrongly takes the
+    // fast/lazy path and those builtins run against an unseeded queue,
+    // producing a *wrong result* (confirmed live: every document reports
+    // spurious exhaustion instead of only the true last one). Filed as
+    // follow-up issue #1309 rather than fixed here -- fixing it correctly
+    // means walking the expanded, post-module `expr` a few lines below
+    // instead of scanning source text, which needs the same exhaustive,
+    // no-wildcard `Expr`/`Builtin` match this file's own `contains_split_doc`
+    // (`yq_runner.rs`) already establishes as the safe pattern for this kind
+    // of check -- real work, not a one-line fix.
     let uses_input_builtins = filter_str.contains("input");
 
     // Parse the filter as a full program (with module directives)
@@ -949,12 +961,32 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
             // `-n`, `force_read_under_null_input` (passed above) made it
             // read the real documents instead of faking `[null]`, precisely
             // so they're available here.
-            let queue: Vec<(OwnedValue, u32)> = inputs
-                .iter()
-                .enumerate()
-                .map(|(idx, v)| (v.clone(), locations.get(idx).line.unwrap_or(0) as u32))
-                .collect();
-            jq::seed_remaining_inputs(queue);
+            //
+            // `!force_read_under_null_input` (TTY-safety suppressed the real
+            // read) is the one case where `inputs` isn't real data -- it's
+            // `get_inputs`'s own `[null]` placeholder for plain `-n`
+            // (review catch: seeding straight from `inputs` unconditionally
+            // fed that placeholder into the queue as if it were a genuine
+            // document, so `input` silently returned `null` instead of
+            // reporting exhausted). Seed nothing in that case instead --
+            // `input`/`inputs` then correctly see an empty queue, matching
+            // this function's own stated safety goal.
+            if args.null_input && !force_read_under_null_input {
+                jq::seed_remaining_inputs(Vec::new());
+            } else {
+                // Moves rather than clones: `inputs` isn't read again on
+                // this branch (the null-input arm below uses `OwnedValue::
+                // Null` directly; the non-null arm pops from the queue this
+                // seeds, not from `inputs`) -- review catch: an earlier
+                // version cloned every document here for no reason, doubling
+                // peak memory for the whole input set.
+                let queue: Vec<(OwnedValue, u32)> = inputs
+                    .into_iter()
+                    .enumerate()
+                    .map(|(idx, v)| (v, locations.get(idx).line.unwrap_or(0) as u32))
+                    .collect();
+                jq::seed_remaining_inputs(queue);
+            }
 
             if args.null_input {
                 // `.` is null exactly once, matching `-n`'s own existing
