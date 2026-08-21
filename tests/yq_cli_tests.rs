@@ -15678,15 +15678,18 @@ fn test_1331_comma_computed_key_and_static_optional_sibling_dedup() -> Result<()
     Ok(())
 }
 
-/// #1331: the other two tests above reach `delete_expr_array_paths`
-/// (Index/Slice siblings), not `delete_expr_iterate_paths` -- neither
-/// exercises the debug_assert added to that function specifically. Two
-/// top-level comma branches each ending in a `?`-marked bare iterate
-/// forces the multi-path walker's `Iterate` dispatch, verifying the
-/// invariant holds (this test would panic in a debug build if it didn't)
-/// as well as the ordinary "each array gets cleared" behavior.
+/// #1331: two top-level comma branches each ending in a `?`-marked bare
+/// iterate. This was originally meant to exercise `delete_expr_iterate_paths`'s
+/// own `debug_assert`, but a live debug probe (#1331's second review
+/// round) found it doesn't: `resolve_node` eagerly expands `.a[]`/`.b[]?`
+/// into concrete per-element `Index` components before `flatten_delete_path`
+/// ever runs, so this actually reaches `delete_expr_array_paths` (already
+/// covered above) -- see `delete_expr_iterate_paths`'s own doc comment and
+/// #1382 for whether that function is reachable via `del()` at all. Kept
+/// as a plain correctness regression test for this realistic input shape,
+/// not as coverage for that specific debug_assert.
 #[test]
-fn test_1331_comma_optional_iterate_siblings_reach_iterate_dispatch() -> Result<()> {
+fn test_1331_comma_optional_iterate_siblings_clear_both_arrays() -> Result<()> {
     let (out, code) = run_yq_stdin(
         "del(.a[]?, .b[]?)",
         "a: [1,2]\nb: [3,4,5]\n",
