@@ -998,6 +998,104 @@ fn test_untracked_terminal_before_a_deferred_iterate_says_near_iterate_888() {
     );
 }
 
+/// #1301: `del`'s sibling grouping is hashed now, not linearly scanned, and
+/// nothing about *which* sibling is visited first may change.
+///
+/// `del(.items[(0,1)].foo[])` was quadratic because `delete_expr_array_paths`
+/// and `delete_expr_object_paths` each kept their terminal keys and their
+/// recursion groups in an insertion-ordered `Vec` and scanned it linearly for
+/// a match — one O(siblings) scan per sibling. A computed key ahead of a
+/// trailing iterate makes every element its own sibling, so that scan never
+/// matched and never stopped early: 22.0s at 400,000 elements. Both are
+/// `IndexMap`/`IndexSet` now.
+///
+/// Insertion order is the whole reason for `IndexMap` over a `BTreeMap` here:
+/// `del` recurses into groups in source order and dies on the first that
+/// fails, so a container keyed in *sort* order would silently rewrite which
+/// error jq reports. Every expectation below is captured from jq 1.7.1.
+#[test]
+fn test_del_sibling_grouping_preserves_source_order_1301() {
+    // Group order follows the source, not the key: `(1,0)` visits index 1
+    // first. Harmless when both succeed...
+    check(
+        r#"[{"x":1,"y":2},{"x":3,"y":4}]"#,
+        "del(.[(1,0)].x)",
+        Outcome::values(&[r#"[{"y":2},{"y":4}]"#]),
+    );
+    // ...and load-bearing when one does not: the string at index 1 is
+    // reached before the object at index 0, so *its* error is the one jq
+    // reports. Sorting the groups would report neither.
+    check(
+        r#"[{"x":1},"s"]"#,
+        "del(.[(1,0)].x)",
+        Outcome::error(r#"Cannot index string with string "x""#),
+    );
+    // Same for object field groups, whose keys are also out of sort order.
+    check(
+        r#"{"b":{"k":1},"a":{"k":2}}"#,
+        r#"del(.[("b","a")].k)"#,
+        Outcome::values(&[r#"{"b":{},"a":{}}"#]),
+    );
+    // Nested on both levels, so the outer and inner groupings each have to
+    // keep their own order.
+    check(
+        "[[1,2],[3,4],[5,6]]",
+        "del(.[(2,0)][(1,0)])",
+        Outcome::values(&["[[],[3,4],[]]"]),
+    );
+
+    // The terminal `optional` merge survives the move to `entry()`: one
+    // occurrence marking a step optional still covers the other, whichever
+    // side it is written on (the argument-order dependence #477 fixed).
+    check(
+        "[1,2,3]",
+        "del(.[(0,5)], .[5]?)",
+        Outcome::values(&["[2,3]"]),
+    );
+    check(
+        "[1,2,3]",
+        "del(.[5]?, .[(0,5)])",
+        Outcome::values(&["[2,3]"]),
+    );
+
+    // A repeated key still collapses to one deletion rather than deleting
+    // twice — the dedupe the linear scan used to provide.
+    check("[1,2,3,4]", "del(.[(0,0,1)])", Outcome::values(&["[3,4]"]));
+
+    // The two arms of the shape that was quadratic, at more than one
+    // distinct key per container so the grouping actually has work to do.
+    check(
+        r#"{"items":[{"foo":{"a":1,"b":2}},{"foo":{"b":3,"c":4}}]}"#,
+        "del(.items[(0,1)].foo[])",
+        Outcome::values(&[r#"{"items":[{"foo":{}},{"foo":{}}]}"#]),
+    );
+    // Non-terminal groups, which are a separate loop from the terminal keys
+    // above and were quadratic in the same way.
+    check(
+        r#"{"items":[{"foo":[{"x":1},{"x":2}]},{"foo":[{"x":3}]}]}"#,
+        "del(.items[(0,1)].foo[].x)",
+        Outcome::values(&[r#"{"items":[{"foo":[{},{}]},{"foo":[{}]}]}"#]),
+    );
+
+    // No computed key needed to reach the same loop: a plain top-level comma
+    // already routes through the multi-path walker (#475), and the iterate
+    // ahead of it still enumerates one sibling per element. This shape was
+    // quadratic too -- 0.96s at 40,000 elements, 0.17s after -- which is why
+    // `bench_del_comma_through_iterate` exists.
+    check(
+        r#"{"foo":[{"a":1,"b":2,"c":3},{"a":4,"b":5,"c":6}]}"#,
+        "del(.foo[].a, .foo[].b)",
+        Outcome::values(&[r#"{"foo":[{"c":3},{"c":6}]}"#]),
+    );
+    // Array elements rather than object fields, and named out of order, so
+    // the index grouping has to keep source order here too.
+    check(
+        r#"{"foo":[[1,2,3],[4,5,6]]}"#,
+        "del(.foo[][2], .foo[][0])",
+        Outcome::values(&[r#"{"foo":[[2],[5]]}"#]),
+    );
+}
+
 /// A computed key is checked against the container it will actually index, not
 /// against the value the chain started from.
 ///

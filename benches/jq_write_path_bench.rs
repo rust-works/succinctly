@@ -83,6 +83,35 @@ fn computed_key_doc(n: usize) -> Vec<u8> {
     format!(r#"{{"items":[{one},{one}]}}"#).into_bytes()
 }
 
+/// [`computed_key_doc`]'s object-valued twin: `{"items": [{"foo": {"k0": 0,
+/// ...}}, {...}]}`. `del(.items[(0,1)].foo[])` over this routes the same
+/// per-element siblings into `delete_expr_object_paths`' grouping rather
+/// than `delete_expr_array_paths`', which is a separate copy of the same
+/// logic and was quadratic in the same way (#1301). `bench_del_object` does
+/// not cover it -- without a computed key, `del(.foo[])` takes
+/// `builtin_del`'s single-path route and never reaches the grouping at all.
+fn computed_key_object_doc(n: usize) -> Vec<u8> {
+    let one = object_doc(n);
+    let one = core::str::from_utf8(&one).unwrap();
+    format!(r#"{{"items":[{one},{one}]}}"#).into_bytes()
+}
+
+/// `{"foo": [{"a": 0, "b": 0, "c": 0}, ...]}` -- for the comma-through-iterate
+/// shape (`del(.foo[].a, .foo[].b)`), which needs no computed key at all to
+/// reach the multi-path delete walker: a top-level comma already routes there
+/// (#475), and the `[]` ahead of it still enumerates one sibling per element.
+fn comma_through_iterate_doc(n: usize) -> Vec<u8> {
+    let mut out = String::from(r#"{"foo":["#);
+    for i in 0..n {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str(&format!(r#"{{"a":{i},"b":{i},"c":{i}}}"#));
+    }
+    out.push_str("]}");
+    out.into_bytes()
+}
+
 /// Evaluate `expr` against `json`, asserting it produced exactly one
 /// non-error output (every shape benchmarked here is a single-document
 /// write or a `[path(...)]`-collected array, never a fan-out), and return
@@ -306,30 +335,31 @@ fn bench_computed_key_with_trailing_iterate(c: &mut Criterion) {
     group.finish();
 }
 
-/// The `del` half of the shape above, which #888 did **not** make linear.
+/// The `del` half of the shape above, which #888 did **not** make linear and
+/// #1301 since has.
 ///
-/// #888's own table reported `del`/`=`/`|=` as flat on this shape, but it
-/// stopped at 16,000 elements. `=` and `|=` really are linear; `del` is not
-/// -- it only looks flat because its constant is small enough that the
-/// quadratic term does not dominate until roughly 50,000 elements. Measured
-/// on an Apple M-series, release, total elements = 2n:
+/// #888's own table reported `del`/`=`/`|=` as flat here, but it stopped at
+/// 16,000 elements; `del`'s quadratic term did not dominate until roughly
+/// 50,000. The cause was **not** the trailing-iterate deferral `path()` got
+/// -- widening the computed key from 2 branches to 512 while holding the
+/// resolved-path count at 80,000 took `del` from 890ms to 95ms, which a
+/// deferral-shaped cost cannot do -- but `delete_expr_array_paths`'
+/// own sibling grouping, which scanned an insertion-ordered `Vec` linearly
+/// per sibling. Interleaved A/B, Apple M-series, release, total elements = 2n:
 ///
-/// | 2n      | del    | path  |
-/// |---------|--------|-------|
-/// | 20,000  | 0.10s  | 0.03s |
-/// | 50,000  | 0.54s  | 0.07s |
-/// | 100,000 | 1.51s  | 0.10s |
-/// | 200,000 | 5.98s  | 0.20s |
+/// | 2n      | before  | after  | path  |
+/// |---------|---------|--------|-------|
+/// | 20,000  |  0.07s  | 0.02s  | 0.03s |
+/// | 100,000 |  1.34s  | 0.09s  | 0.10s |
+/// | 200,000 |  5.92s  | 0.20s  | 0.20s |
+/// | 400,000 | 22.03s  | 0.38s  | 0.72s |
 ///
-/// So the sizes here are deliberately capped well below the other groups'
-/// `SIZES`, small enough to finish in reasonable time under that *existing*
-/// bug rather than chosen for statistical smoothness -- the same convention
-/// `bench_computed_key_with_trailing_iterate` used before #888 landed.
-/// Raise them to `SIZES` once `del` is linear here too.
+/// So this shares the other groups' `SIZES` now, where it used to be capped
+/// at 1,000/5,000/10,000 to finish in reasonable time under the bug.
 fn bench_del_computed_key_with_trailing_iterate(c: &mut Criterion) {
     let mut group = c.benchmark_group("jq_write_path_del_computed_key_trailing_iterate");
     let expr = parse("del(.items[(0,1)].foo[])").expect("must parse");
-    for &n in &[1_000usize, 5_000, 10_000] {
+    for &n in SIZES {
         let json = computed_key_doc(n);
 
         // Guard the premise: both `.items` entries must come back emptied,
@@ -367,6 +397,93 @@ fn bench_del_computed_key_with_trailing_iterate(c: &mut Criterion) {
     group.finish();
 }
 
+/// [`bench_del_computed_key_with_trailing_iterate`]'s object-tail twin,
+/// covering `delete_expr_object_paths`' half of #1301's fix. Interleaved
+/// A/B, Apple M-series, release, total elements = 2n: 20,000 0.18s -> 0.03s;
+/// 80,000 2.02s -> 0.12s.
+fn bench_del_computed_key_with_trailing_iterate_object(c: &mut Criterion) {
+    let mut group = c.benchmark_group("jq_write_path_del_computed_key_trailing_iterate_object");
+    let expr = parse("del(.items[(0,1)].foo[])").expect("must parse");
+    for &n in SIZES {
+        let json = computed_key_object_doc(n);
+
+        // Guard the premise, as the array twin does: both `.items` entries
+        // must come back with an emptied object, so a bug that turns this
+        // into a no-op fails here instead of reading as a speedup.
+        let OwnedValue::Object(doc) = eval_one(&expr, &json) else {
+            panic!("n={n}: query must produce an object");
+        };
+        let Some(OwnedValue::Array(items)) = doc.get("items") else {
+            panic!("n={n}: `.items` must survive as an array");
+        };
+        assert_eq!(items.len(), 2, "n={n}: both branches must survive");
+        for (i, item) in items.iter().enumerate() {
+            let OwnedValue::Object(item) = item else {
+                panic!("n={n}: `.items[{i}]` must stay an object");
+            };
+            let Some(OwnedValue::Object(entries)) = item.get("foo") else {
+                panic!("n={n}: `.items[{i}].foo` must stay an object");
+            };
+            assert!(
+                entries.is_empty(),
+                "n={n}: `.items[{i}].foo` must be emptied"
+            );
+        }
+
+        let index = JsonIndex::build(&json);
+        group.throughput(Throughput::Elements(2 * n as u64));
+        group.bench_with_input(BenchmarkId::from_parameter(n), &json, |b, json| {
+            b.iter(|| {
+                let cursor = index.root(black_box(json));
+                black_box(eval::<Vec<u64>, JqSemantics>(&expr, cursor))
+            });
+        });
+    }
+    group.finish();
+}
+
+/// The shape that reaches #1301's grouping without any computed key.
+///
+/// `del(.foo[].a, .foo[].b)` is an ordinary two-path comma, but the multi-path
+/// walker it routes through saw one `Index(i)` sibling per element all the
+/// same, and `delete_expr_array_paths`' *group* loop -- a different loop from
+/// the terminal one the computed-key groups above exercise -- scanned them
+/// linearly. Interleaved A/B, Apple M-series, release: 10,000 0.09s -> 0.04s;
+/// 20,000 0.28s -> 0.09s; 40,000 0.96s -> 0.17s (before, x3.0 and x3.5 per
+/// doubling; after, x1.95 and x1.92).
+fn bench_del_comma_through_iterate(c: &mut Criterion) {
+    let mut group = c.benchmark_group("jq_write_path_del_comma_through_iterate");
+    let expr = parse("del(.foo[].a, .foo[].b)").expect("must parse");
+    for &n in SIZES {
+        let json = comma_through_iterate_doc(n);
+
+        // Guard the premise: every element must lose `a` and `b` and keep `c`.
+        let OwnedValue::Object(doc) = eval_one(&expr, &json) else {
+            panic!("n={n}: query must produce an object");
+        };
+        let Some(OwnedValue::Array(items)) = doc.get("foo") else {
+            panic!("n={n}: `.foo` must survive as an array");
+        };
+        assert_eq!(items.len(), n, "n={n}: no element may be removed");
+        for (i, item) in items.iter().enumerate() {
+            let OwnedValue::Object(entries) = item else {
+                panic!("n={n}: `.foo[{i}]` must stay an object");
+            };
+            assert_eq!(entries.len(), 1, "n={n}: `.foo[{i}]` must keep exactly `c`");
+        }
+
+        let index = JsonIndex::build(&json);
+        group.throughput(Throughput::Elements(n as u64));
+        group.bench_with_input(BenchmarkId::from_parameter(n), &json, |b, json| {
+            b.iter(|| {
+                let cursor = index.root(black_box(json));
+                black_box(eval::<Vec<u64>, JqSemantics>(&expr, cursor))
+            });
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_del_array,
@@ -376,5 +493,7 @@ criterion_group!(
     bench_path_trailing_iterate,
     bench_computed_key_with_trailing_iterate,
     bench_del_computed_key_with_trailing_iterate,
+    bench_del_computed_key_with_trailing_iterate_object,
+    bench_del_comma_through_iterate,
 );
 criterion_main!(benches);
