@@ -4931,22 +4931,27 @@ fn test_document_overflow_literal_keys_preview_via_reindex_bridges_cli_939() -> 
 /// construction, and `tojson` -- all oracle-verified.
 #[test]
 fn test_as_binding_preserves_document_float_literal_spelling_945() -> Result<()> {
+    // plain re-emission
     let (stdout, _stderr, code) = run_jq_full(&["-c", ". as $x | $x"], Some("1.50"))?;
     assert_eq!(code, 0);
     assert_eq!(stdout.trim_end(), "1.50");
 
+    // tostring
     let (stdout, _stderr, code) = run_jq_full(&["-c", ". as $x | $x | tostring"], Some("1.50"))?;
     assert_eq!(code, 0);
     assert_eq!(stdout.trim_end(), "\"1.50\"");
 
+    // array construction
     let (stdout, _stderr, code) = run_jq_full(&["-c", ". as $x | [$x]"], Some("1.50"))?;
     assert_eq!(code, 0);
     assert_eq!(stdout.trim_end(), "[1.50]");
 
+    // object construction
     let (stdout, _stderr, code) = run_jq_full(&["-c", ". as $x | {v:$x}"], Some("1.50"))?;
     assert_eq!(code, 0);
     assert_eq!(stdout.trim_end(), "{\"v\":1.50}");
 
+    // tojson
     let (stdout, _stderr, code) = run_jq_full(&["-c", ". as $x | ($x|tojson)"], Some("1.50"))?;
     assert_eq!(code, 0);
     assert_eq!(stdout.trim_end(), "\"1.50\"");
