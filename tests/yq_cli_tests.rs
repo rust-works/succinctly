@@ -17643,3 +17643,66 @@ fn test_yaml_json_output_still_resolves_aliases_763() -> Result<()> {
     assert_eq!(output.trim(), r#"{"a":99,"b":99}"#);
     Ok(())
 }
+
+#[test]
+fn test_yaml_root_container_anchor_survives_the_dom_path_763() -> Result<()> {
+    // A navigated result whose own node is anchored keeps `&x`, but only
+    // because it's a container -- `write_leading_anchor`'s rule in
+    // `light.rs`, mirrored here. `-P` is what forces this through the DOM
+    // emitter rather than the streaming one.
+    let input = "a: &x\n  p: 1\nb: *x\n";
+    let (output, exit_code) = run_yq_stdin(".a", input, &["-P"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "&x\np: 1\n");
+
+    // Flow style takes the same branch with a space instead of a newline;
+    // `-P` flattens the flow to block, so read it through the streaming
+    // path to see the space form.
+    let (output, exit_code) = run_yq_stdin(".a", "a: &x {p: 1}\nb: *x\n", &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "&x {p: 1}\n");
+    Ok(())
+}
+
+#[test]
+fn test_yaml_bare_scalar_alias_result_is_materialized_on_the_dom_path_763() -> Result<()> {
+    // DELIBERATE DIVERGENCE, and the reason `output_value` has no root
+    // alias branch. Real yq prints `*x` for `.b` on `b: *x` -- an alias
+    // with no anchor anywhere, which it then cannot read back
+    // (`unknown anchor 'x' referenced`). A root `*name` can never satisfy
+    // the soundness gate, since its `&name` would have to be inside its own
+    // subtree and a cyclic anchor is rejected at index build. succinctly's
+    // streaming path still prints `*x` here; making the two agree is #1350.
+    let input = "a: &x 1\nb: *x\n";
+    let (output, exit_code) = run_yq_stdin(".b", input, &["-P"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "1\n");
+    Ok(())
+}
+
+#[test]
+fn test_yaml_flow_sequence_item_anchor_survives_a_write_763() -> Result<()> {
+    // The flow *array* arm, distinct from the flow mapping arm above: the
+    // anchor sits immediately before the item, with no `key:` to hang off.
+    let input = "l: [&x 1, *x]\n";
+    let (output, exit_code) = run_yq_stdin(".c = 1", input, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "l: [&x 1, *x]\nc: 1\n");
+    Ok(())
+}
+
+#[test]
+fn test_yaml_nested_alias_mark_is_dropped_at_its_own_path_763() -> Result<()> {
+    // Exercises the soundness gate's path bookkeeping: the mark it clears
+    // is two levels down, so it has to walk back to that exact node rather
+    // than the root. Object and array steps both, since they take separate
+    // branches.
+    let (output, exit_code) = run_yq_stdin(".o.b.p = 9", "o:\n  a: &x {p: 1}\n  b: *x\n", &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "o:\n  a: &x {p: 1}\n  b:\n    p: 9\n");
+
+    let (output, exit_code) = run_yq_stdin(".l[1].p = 9", "l:\n  - &x {p: 1}\n  - *x\n", &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "l:\n  - &x {p: 1}\n  - p: 9\n");
+    Ok(())
+}
