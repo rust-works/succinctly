@@ -3354,18 +3354,14 @@ pub fn format_float_yq(f: f64) -> String {
 /// prints `2` on YAML output but `2.0` on JSON output (compact and pretty
 /// always agree with each other, just not with YAML) -- confirmed against
 /// real yq v4.53.3 (issue #949). Nested (any object field, array element,
-/// or `-i` in-place edit), real yq instead emits an explicit `!!float`
-/// tag to keep the value's type unambiguous on reparse (`a: !!float 2`);
-/// succinctly's YAML emitters have no tag-emission mechanism to match
-/// that, so a nested position falls back to [`format_float_yq`]'s
-/// decimal-preserving spelling instead of calling this function --
-/// imperfect versus the oracle, but it doesn't silently change the
-/// value's inferred type from float to int on round trip the way this
-/// function's bare, untagged spelling would. Callers are responsible for
-/// making that root-vs-nested choice themselves (see the `depth`-gated
-/// call sites in `src/bin/succinctly/yq_runner.rs` and
-/// `src/jq/stream.rs`); this function always drops the point
-/// unconditionally.
+/// or `-i` in-place edit), real yq keeps this same shortest spelling but
+/// precedes it with an explicit `!!float` tag whenever the spelling would
+/// read back as an int (`a: !!float 2`) -- see
+/// [`format_float_yq_yaml_nested`], which wraps this function to do
+/// exactly that (#1090). This function itself always drops the point and
+/// never emits a tag, so it is the *root-position* formatter; callers own
+/// the root-vs-nested choice (see the `depth`-gated call sites in
+/// `src/bin/succinctly/yq_runner.rs` and `src/jq/stream.rs`).
 ///
 /// `f` must be finite, like [`format_float_yq`].
 #[must_use]
