@@ -367,9 +367,29 @@ const MAX_PRESERVABLE_FLOAT_DIGITS: usize = 17;
 ///   point or an exponent is unambiguous float syntax on its own (`1e2`
 ///   has no `.` but is still a float, not an overflowed integer), so
 ///   either is sufficient here.
-/// - **At most [`MAX_PRESERVABLE_FLOAT_DIGITS`] significant digits in the
-///   mantissa.** Exponent digits carry no precision (they're a magnitude,
-///   not a significand) and must not count toward this cap -- an earlier
+/// - **At most [`MAX_PRESERVABLE_FLOAT_DIGITS`] *significant* digits in the
+///   mantissa** ([`significant_mantissa_digit_count`]) -- every digit from
+///   the mantissa's first nonzero digit onward, the same "significant
+///   figures" rule scientific notation itself uses: a leading zero run
+///   (`0.007`, magnitude, not precision) never counts, however long it is,
+///   the same way an *integer* literal's own leading zeros wouldn't. Two
+///   consequences, both #1211:
+///   - A **zero-valued mantissa** has no nonzero digit at all, so it has
+///     zero significant digits by this same rule -- always within the cap,
+///     needing no separate carve-out. `0.00000000000000000000e-400`
+///     (issue #1211's own repro) stays preserved at any length, matching
+///     real yq; before this fix, counting every digit *including* the
+///     leading zeros silently fell back to a lossy `0` past 17 of them.
+///   - A mantissa with a **long leading-zero run before a handful of real
+///     digits** (`0.000000000000000012345678901234567`, 17 significant
+///     digits behind 17 leading zeros) is preserved too, on the identical
+///     reasoning -- confirmed live against the pinned oracle; the raw-count
+///     predecessor of this check rejected it purely because of magnitude,
+///     the same miscount #1211 reported, just needing one nonzero digit
+///     instead of zero to trigger.
+///
+///   Exponent digits carry no precision (they're a magnitude, not a
+///   significand) and must not count toward this cap either -- an earlier
 ///   version of this predicate counted every digit in `s` including the
 ///   exponent's, which rejected exactly-round-trippable literals like
 ///   `1.2345678901234567e10` (17 mantissa digits, but 19 counted) and
@@ -399,37 +419,44 @@ pub(super) fn is_preservable_float_literal(s: &str) -> bool {
         None => s,
     };
     (s.contains('.') || s.contains(['e', 'E']))
-        && (is_zero_mantissa(mantissa)
-            || mantissa.bytes().filter(u8::is_ascii_digit).count() <= MAX_PRESERVABLE_FLOAT_DIGITS)
+        && significant_mantissa_digit_count(mantissa) <= MAX_PRESERVABLE_FLOAT_DIGITS
         && is_json_number_syntax(s)
 }
 
-/// True if `mantissa` (a sign and a `.` ignored) is made up entirely of `0`
-/// digits — a zero-valued mantissa has no "significant digits" for
-/// [`MAX_PRESERVABLE_FLOAT_DIGITS`] to bound in the first place (#1211):
-/// every zero-mantissa spelling, however many digits long, represents the
-/// exact same value (`0`), so a longer one carries no extra precision the
-/// cap needs to protect against — unlike a nonzero mantissa, where digit
-/// count really does bound how much precision the source text claims.
-/// Real yq preserves a zero-mantissa literal verbatim at any length
-/// (confirmed live against the pinned oracle, `0.00000000000000000000e-400`
-/// included), matching this carve-out rather than the cap.
+/// Count of `mantissa`'s *significant* digits: every digit from the first
+/// nonzero digit onward (including any zero after it, whether between
+/// digits or trailing), ignoring a leading run of zeros before that first
+/// nonzero digit and ignoring sign/`.` characters throughout -- the same
+/// "significant figures" rule scientific notation itself uses (#1211). A
+/// mantissa with no nonzero digit at all -- a zero-valued spelling -- has
+/// zero significant digits by this definition, which is why it needs no
+/// separate carve-out from [`MAX_PRESERVABLE_FLOAT_DIGITS`]: it's already
+/// within any nonnegative cap.
 ///
-/// `false`, not a panic or `None`, for a mantissa with no digits at all
-/// (just a sign and/or `.`) — [`is_preservable_float_literal`]'s own
-/// leading `.`-or-exponent guard means this is called with `is_valid_number`
-/// (via `is_json_number_syntax`) shaped input in every real caller, but this
-/// function stays total over its own input rather than assuming that.
-fn is_zero_mantissa(mantissa: &str) -> bool {
-    let mut saw_digit = false;
+/// Ignores (does not count, does not reject) anything outside
+/// `0`-`9`/`.`/`+`/`-` -- this runs *before*
+/// [`is_preservable_float_literal`]'s own trailing `is_json_number_syntax`
+/// check (short-circuit `&&` evaluates left to right), so `mantissa` is
+/// **not** yet known to be valid number syntax at this point; this
+/// function stays total over arbitrary input rather than relying on a
+/// precondition its own caller doesn't actually establish until
+/// afterward. A malformed mantissa this function undercounts would still
+/// be caught by that later `is_json_number_syntax` check before `true`
+/// could ever propagate out of `is_preservable_float_literal` as a whole.
+fn significant_mantissa_digit_count(mantissa: &str) -> usize {
+    let mut count = 0usize;
+    let mut seen_nonzero = false;
     for b in mantissa.bytes() {
         match b {
-            b'0' => saw_digit = true,
-            b'.' | b'+' | b'-' => {}
-            _ => return false,
+            b'1'..=b'9' => {
+                seen_nonzero = true;
+                count += 1;
+            }
+            b'0' if seen_nonzero => count += 1,
+            _ => {} // leading zero, sign, '.', or (unreachable in practice) anything else
         }
     }
-    saw_digit
+    count
 }
 
 /// A normalized, JSON-safe equivalent spelling for `s`, for a `Float`
@@ -975,18 +1002,39 @@ mod tests {
         assert!(is_preservable_float_literal("0.000e-400"));
     }
 
-    /// #1211: a mantissa with even one nonzero digit is not a "zero
-    /// mantissa" -- the ordinary digit cap must still apply once the long
-    /// run of zeros is broken by a real digit, however few nonzero digits
-    /// there are relative to the zeros.
+    /// #1211: a leading run of zeros (before the first nonzero digit) never
+    /// counts toward the cap, the same "significant figures" rule the
+    /// all-zero case above gets -- confirmed live against the pinned oracle
+    /// for a case with real significant digits behind many leading zeros,
+    /// not just the all-zero case #1211 itself reported. The cap still
+    /// applies once there are genuinely too many *significant* digits.
     #[test]
-    fn preservable_float_literal_nonzero_digit_anywhere_keeps_the_cap() {
+    fn preservable_float_literal_leading_zeros_never_count_toward_the_cap() {
+        // A single nonzero digit, however many leading zeros precede it, is
+        // one significant digit -- well within the cap, same "significant
+        // figures" rule a zero mantissa gets (#1211). This is *not* a
+        // regression of the pre-#1211 raw-digit-count behavior: it's the
+        // adjacent bug that behavior also had (a real, live divergence from
+        // the pinned oracle, confirmed during this fix's own review), now
+        // fixed by the same change.
         let mostly_zeros_one_nonzero_digit = "0.".to_string() + &"0".repeat(30) + "1";
-        assert!(!is_preservable_float_literal(&format!(
+        assert!(is_preservable_float_literal(&format!(
             "{mostly_zeros_one_nonzero_digit}e-400"
         )));
-        // Below the cap with a single trailing nonzero digit: preservable,
-        // same as any other ordinary (non-zero-mantissa) case.
+        // The cap still applies once there are genuinely too many
+        // *significant* digits, leading zeros or not.
+        let over_cap_significant_digits =
+            "0.".to_string() + &"0".repeat(30) + &"1".repeat(MAX_PRESERVABLE_FLOAT_DIGITS + 1);
+        assert!(!is_preservable_float_literal(&format!(
+            "{over_cap_significant_digits}e-400"
+        )));
+        // Exactly at the cap, leading zeros or not: preservable.
+        let at_cap_significant_digits =
+            "0.".to_string() + &"0".repeat(30) + &"1".repeat(MAX_PRESERVABLE_FLOAT_DIGITS);
+        assert!(is_preservable_float_literal(&format!(
+            "{at_cap_significant_digits}e-400"
+        )));
+        // No leading zeros at all: unaffected by #1211, same as before.
         let short_mostly_zeros = "0.".to_string() + &"0".repeat(10) + "1";
         assert!(is_preservable_float_literal(&format!(
             "{short_mostly_zeros}e-400"
