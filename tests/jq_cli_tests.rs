@@ -5281,6 +5281,272 @@ fn test_array_wrapped_path_context_builtin_optional_is_atomic_1302() -> Result<(
     Ok(())
 }
 
+/// `needs_path_context` had no `Expr::StringInterpolation` arm (#1334), the
+/// same gap #1302 fixed for `Expr::Array` -- so `"k=\(key)"` silently
+/// stubbed `key` to `null` inside a `\(...)` slot, even once
+/// `needs_path_context` recursed into the slot correctly. #1302's own
+/// two-part fix (recurse in `needs_path_context`, *and* route the slot's own
+/// evaluation through the path-context evaluator during construction) is
+/// the exact template followed here. Verified live for internal consistency
+/// (`key`/`parent` are succinctly extensions, no oracle).
+#[test]
+fn test_string_interpolation_path_context_builtins_1334() -> Result<()> {
+    let (stdout, _, code) = run_jq_full(&["-c", ".a | \"k=\\(key)\""], Some(r#"{"a":1}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), r#""k=a""#);
+
+    // Multiple slots, plus literal text woven between them.
+    let (stdout, _, code) = run_jq_full(
+        &["-c", ".a | \"[\\(key)] parent=\\(parent)\""],
+        Some(r#"{"a":1}"#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), r#""[a] parent={\"a\":1}""#);
+
+    // Nested inside a longer pipe: `rest` after the string must see the
+    // newly constructed string as its fresh root (path reset), mirroring
+    // #1302's identical array-literal assertion.
+    let (stdout, _, code) = run_jq_full(&["-c", ".a | \"\\(key)\" | key"], Some(r#"{"a":1}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "null");
+
+    // A plain string (no path-context builtin inside) takes the original,
+    // unmodified code path and must be entirely unaffected.
+    let (stdout, _, code) = run_jq_full(&["-c", ".a | \"x\\(1)y\""], Some(r#"{"a":1}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), r#""x1y""#);
+
+    Ok(())
+}
+
+/// Exercises the non-`Owned` arms of the new `StringInterpolation` slot
+/// match -- mirrors #1302's identical `Array`-arm coverage
+/// (`test_array_wrapped_path_context_builtin_control_flow_1302`), one slot
+/// at a time. A slot construction is atomic *per slot*, not across the
+/// whole string: unlike `Array`'s single collection point, each `\(...)`
+/// slot embeds independently, so `break`/`halt`/an uncaught error from any
+/// one slot still aborts the entire surrounding string (nothing partial is
+/// ever embedded), matching `eval_string_interpolation`'s own existing
+/// early-return-on-control-signal behavior for the plain (non-path-context)
+/// case.
+#[test]
+fn test_string_interpolation_path_context_builtin_control_flow_1334() -> Result<()> {
+    // A multi-valued slot (`key, key`, a `Comma` of two path-context
+    // builtins) -- embeds just the *first* output, matching
+    // `eval_string_interpolation`'s own existing convention (the
+    // `QueryResult::ManyOwned` arm).
+    let (stdout, _, code) = run_jq_full(&["-c", ".a | \"[\\(key, key)]\""], Some(r#"{"a":1}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), r#""[a]""#);
+
+    // A bare `break` out of a slot (no prior output within that slot)
+    // aborts the whole string construction and unwinds past it to the
+    // enclosing label -- the comma's second branch ("reached") must never
+    // run.
+    let (stdout, _, code) = run_jq_full(
+        &[
+            "-c",
+            "label $out | ((.a | \"\\(key | break $out)\"), \"reached\")",
+        ],
+        Some(r#"{"a":1}"#),
+    )?;
+    assert_eq!(
+        code, 0,
+        "break must unwind to the label, not surface as an error"
+    );
+    assert_eq!(
+        stdout, "",
+        "break must discard the whole string, not emit it"
+    );
+
+    // Same, but with real output already produced within that one slot's
+    // own generator first (`key` succeeds with "a" before `break` fires) --
+    // exercises the `Partial(_, Control::Break(_))` arm rather than the
+    // bare one above.
+    let (stdout, _, code) = run_jq_full(
+        &[
+            "-c",
+            "label $out | ((.a | \"\\(key, break $out)\"), \"reached\")",
+        ],
+        Some(r#"{"a":1}"#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "");
+
+    // `halt_error(n)` from a slot, as that slot's very first output (no
+    // successful output preceding it within the slot), propagates its own
+    // exit code as a bare halt.
+    let (stdout, _, code) = run_jq_full(
+        &["-c", ".a | \"\\(key | halt_error(9))\""],
+        Some(r#"{"a":1}"#),
+    )?;
+    assert_eq!(code, 9);
+    assert_eq!(stdout, "");
+
+    // Same, but with real output already produced within that slot first --
+    // exercises the `Partial(_, Control::Halt(_))` arm rather than the bare
+    // one above.
+    let (stdout, _, code) = run_jq_full(
+        &["-c", ".a | \"\\(key, halt_error(9))\""],
+        Some(r#"{"a":1}"#),
+    )?;
+    assert_eq!(code, 9);
+    assert_eq!(stdout, "");
+
+    // A comma-grouped slot where real output is produced before an
+    // uncaught error -- exercises the `Partial(_, Control::Error(_))` arm
+    // (the un-guarded one, `optional == false`) rather than the bare
+    // `Error` arm the atomicity test below already covers.
+    let (_stdout, stderr, code) = run_jq_full(
+        &["-c", ".a | \"\\(key, error(\"boom\"))\""],
+        Some(r#"{"a":1}"#),
+    )?;
+    assert_eq!(code, 5);
+    assert!(stderr.contains("boom"), "stderr: {stderr}");
+
+    Ok(())
+}
+
+/// `?`-atomicity for the new `StringInterpolation` arm, built in from the
+/// start per #1302's own review lesson (its first cut needed a follow-up,
+/// #1333, to force the inner slot's `optional` to `false` so a genuine
+/// error surfaces for this arm's own catch instead of self-swallowing at
+/// the leaf) rather than left to be independently rediscovered here.
+#[test]
+fn test_string_interpolation_path_context_builtin_optional_is_atomic_1334() -> Result<()> {
+    // A slot that succeeds (`key`) before a later slot errors: `?` must
+    // discard the whole string, not embed a partial one.
+    let (stdout, _, code) = run_jq_full(
+        &["-c", ".a | \"k=\\(key)-\\(error(\"boom\"))\"?"],
+        Some(r#"{"a":1}"#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "");
+
+    // Without `?`, the same query still hard-errors.
+    let (_stdout, stderr, code) = run_jq_full(
+        &["-c", ".a | \"k=\\(key)-\\(error(\"boom\"))\""],
+        Some(r#"{"a":1}"#),
+    )?;
+    assert_eq!(code, 5);
+    assert!(stderr.contains("boom"), "stderr: {stderr}");
+
+    // A genuinely nested `?` *inside* a slot must still work on its own
+    // terms, independent of the interpolation's own (here absent) `?`.
+    let (stdout, _, code) = run_jq_full(
+        &["-c", ".a | \"k=\\(key)-\\((error(\"boom\"))?)\""],
+        Some(r#"{"a":1}"#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), r#""k=a-""#);
+
+    Ok(())
+}
+
+/// `needs_path_context` had no `Expr::FuncDef` arm (#1306), so a `def`
+/// scope's own `then` continuation -- even one as simple as `def f: 5; f,
+/// key` -- never routed into path-context evaluation at all: the whole
+/// pipe fell to the plain evaluator, which has no path tracking, and `key`
+/// stubbed to `null` regardless of what preceded the `def`. Recursing into
+/// `body`/`then` fixes the *routing* decision; a second, dedicated
+/// `eval_pipe_with_path_context_internal` arm was needed too (mirroring
+/// #1302's two-part shape again) because the plain evaluator's own
+/// `eval_func_def` unconditionally evaluates the expanded `then` via
+/// `eval_single`, which would otherwise still drop path context even once
+/// routing correctly entered path-context evaluation.
+#[test]
+fn test_func_def_path_context_builtins_1306() -> Result<()> {
+    // The issue's own repro: `key` as a comma sibling to a call, after a
+    // `def`.
+    let (stdout, _, code) = run_jq_full(&["-c", ".a | def f: 5; f, key"], Some(r#"{"a":1}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "5\n\"a\"\n");
+
+    // `key` reached directly through the def's own body, not just a
+    // comma sibling in `then` -- the `needs_path_context(body)` half of
+    // the fix, not just `needs_path_context(then)`.
+    let (stdout, _, code) = run_jq_full(&["-c", ".a | def f: key; f"], Some(r#"{"a":1}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), r#""a""#);
+
+    // Nested `def`s, each calling the next -- confirms the fix's recursive
+    // expansion (`expand_func_calls`, run again on the freshly expanded
+    // tree by this arm re-matching) doesn't stop after one level.
+    let (stdout, _, code) = run_jq_full(
+        &["-c", ".a.b | def f: key; def g: f; g"],
+        Some(r#"{"a":{"b":2}}"#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), r#""b""#);
+
+    // A plain `def` (no path-context builtin anywhere in body or then)
+    // takes the original, unmodified code path and must be unaffected.
+    let (stdout, _, code) = run_jq_full(&["-c", ".a | def f: . + 1; f"], Some(r#"{"a":1}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "2");
+
+    // A parenthesized `def` with a further pipe stage *after* the closing
+    // paren -- `Expr::Paren`'s own arm splices its inner expression (the
+    // `FuncDef`) in front of whatever already followed, so this is the one
+    // real-syntax shape where the new `FuncDef` arm's own `rest` is
+    // non-empty rather than always drained by `then`, exercising its
+    // `continue_rest_with_context` branch.
+    let (stdout, _, code) = run_jq_full(&["-c", ".a | (def f: 5; f) | key"], Some(r#"{"a":1}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), r#""a""#);
+
+    Ok(())
+}
+
+/// Documents a deliberate, narrow gap left open by #1306 rather than
+/// silently missed: `needs_path_context`'s new `FuncDef` arm is a cheap
+/// syntactic scan of `body`/`then` (no macro expansion), so a path-context
+/// builtin reaching the body *only* through a call argument
+/// (`def f(x): x; f(key)`) isn't detected -- the argument `key` never
+/// appears literally in `body` or `then`'s own text, only after
+/// substitution. Not covered by #1306's own repros; pinned here so a
+/// regression (this starting to silently resolve, without the routing
+/// decision being deliberately revisited) is visible rather than an
+/// unnoticed behavior change either way.
+#[test]
+fn test_func_def_path_context_argument_passing_is_a_known_gap_1306() -> Result<()> {
+    let (stdout, _, code) = run_jq_full(&["-c", ".a | def f(x): x; f(key)"], Some(r#"{"a":1}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "null");
+
+    Ok(())
+}
+
+/// Documents the other half of #1306's own repro as *not* a bug, contrary
+/// to the issue's initial expectation: a comma's branches are independent,
+/// each evaluated against the same starting `current_path` the comma
+/// itself received -- not threaded from one sibling's own navigation into
+/// the next, matching real jq's own comma semantics (confirmed live:
+/// `.a.b?, path(.)` on `{"a":{"b":null}}` is `null` then `[]`, not `null`
+/// then `["a","b"]` -- `path(.)` in the second branch reflects *its own*
+/// lack of navigation, unaffected by what the first branch did). succinctly's
+/// own `key` already established and tested this independence
+/// (`test_key_survives_comma_branches`, #715: `.[] | (key, key)` on a
+/// 2-element array is `["0","0","1","1"]`, not `["0","1","0","1"]` or any
+/// other cross-branch-aware shape) before #1306 was filed. `key`/`.a.b?` as
+/// top-level comma siblings with nothing preceding them share the same
+/// root `current_path` (empty) `key` alone at the root already returns
+/// `null` for -- so `null` here is that same, already-correct answer, not
+/// a regression of a real bug. See #1306's own comment thread for the
+/// full oracle comparison.
+#[test]
+fn test_func_def_key_comma_sibling_independence_is_not_a_bug_1306() -> Result<()> {
+    let (stdout, _, code) = run_jq_full(&["-c", ".a.b?, key"], Some(r#"{"a":{"b":null}}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "null\nnull\n");
+
+    let (stdout, _, code) = run_jq_full(&["-c", "key, .a.b?"], Some(r#"{"a":{"b":null}}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "null\nnull\n");
+
+    Ok(())
+}
+
 /// `keys_unsorted` stays lazy through `length`/`.[]`/`.[n]`/`first`/`last`
 /// (#140), backed by a new `JqValue::LazyKeysArray` output writer in
 /// `print_json`. Uses `run_jq_full` (the pre-built binary) to exercise that
