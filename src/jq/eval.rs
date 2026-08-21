@@ -10770,6 +10770,91 @@ fn is_yq_field_index_noop_scalar(target: &OwnedValue) -> bool {
     !is_owned_container(target) && !matches!(target, OwnedValue::Null)
 }
 
+/// Whether writing `path` (a single *resolved* assignment-target path, one
+/// `resolve_dynamic_indexes` entry) into `root` would be real yq's
+/// field/index/iterate scalar-target no-op (#1181): navigating every
+/// component *before* the last reaches a genuine scalar. When true for
+/// every resolved path, real yq discards the RHS/filter entirely rather
+/// than merely skipping the write (#1233, live-verified v4.53.3) --
+/// `eval_assign`'s own caller is what actually skips RHS evaluation; this
+/// only answers the per-path question.
+///
+/// `path` is flattened via [`push_path_components`] first -- the same
+/// flattener `split_at_slice` already uses internally -- rather than
+/// matched directly (bare component vs. `Expr::Pipe`), so a nested
+/// `Pipe`/`Paren`/`Optional` anywhere in the chain (`(.a|.b)[0] = v`,
+/// structurally the same target as `.a.b[0] = v`) is seen through
+/// uniformly instead of only when it already happens to be a flat `Pipe`
+/// list. Code review (#1233) found this the hard way: an earlier version
+/// handed the *raw*, unflattened components to `navigate_read_only` for
+/// the prefix walk, silently disagreeing with itself on two spellings of
+/// the identical target (`.a.b[0] = error(...)` correctly no-op'd while
+/// `(.a|.b)[0] = error(...)` didn't) -- the exact "mirroring a precedent
+/// without its fix" pattern `get_path_mut`'s own #1287/#1294 nested-`Pipe`
+/// splice already had to solve once for the write side. `?` anywhere in
+/// the chain (whole-path, terminal, or a middle component) is transparent
+/// through the same flattening + [`unwrap_path_component`] the checks
+/// below use -- `?` introduces no evaluation of its own to worry about
+/// reordering, and live-verified real yq no-ops each exactly the same as
+/// its unwrapped equivalent (`.a.b? = error("boom")` on `{"a":5}` is
+/// `{"a":5}`, matching plain `.a.b = error("boom")`).
+///
+/// The flattened list's *last* element still carries a bare, unresolved
+/// `Expr::Iterate` node when that's what the user wrote, not something
+/// further resolved into a concrete index -- `resolve_dynamic_indexes`'s
+/// static fast path (the only one this function's own callers ever reach
+/// it through, `!needs_path_prepass`) is a plain `Ok(vec![path_expr.clone()])`,
+/// so `.[] = v` stays `Expr::Iterate` verbatim, same as `.a`/`.a.b` stay
+/// `Expr::Field`. Treated identically to a terminal `Field`/`Index` here,
+/// matching `set_path`'s own `Expr::Iterate` arm, which applies the
+/// identical `is_yq_field_index_noop_scalar` check for exactly this case.
+fn yq_assign_is_total_noop(path: &Expr, root: &OwnedValue) -> bool {
+    let mut flat = Vec::new();
+    push_path_components(&mut flat, path);
+    // An empty flattened list is bare `Expr::Identity` (`. = v`) -- a
+    // direct overwrite, not indexing into anything.
+    let Some((last, prefix)) = flat.split_last() else {
+        return false;
+    };
+    // Deliberately excludes a path whose terminal component is a slice --
+    // `.[0:1] = v`'s own no-op (#1101/#1116) only ever skips the *write*,
+    // not the RHS (`.[0:1] = error("boom")` still genuinely errors,
+    // confirmed live and pinned by
+    // `test_slice_assign_scalar_noop_still_propagates_rhs_errors_1101`) --
+    // so a slice anywhere in the chain must never reach this fast path.
+    if flat.iter().any(|e| unwrap_path_component(e).0.is_slice()) {
+        return false;
+    }
+    // Defensive, not currently reachable: every leaf `push_path_components`
+    // can push here is one of `needs_path_prepass`'s own static-classified
+    // variants (`Field`/`Index`/`IndexNumber`/`Slice`/`SliceNumber`/
+    // `Iterate` -- `Identity` is dropped above, anything else fails the
+    // caller's own `!needs_path_prepass` gate before ever reaching this
+    // function), and the slice check just above already excludes
+    // `Slice`/`SliceNumber` wherever they appear, including as `last`. So
+    // by this point `last` can only be `Field`/`Index`/`IndexNumber`/
+    // `Iterate` -- confirmed via patch-coverage output (this arm's own
+    // branch never fires), not just assumed. Kept rather than removed:
+    // it's the one thing standing between a future new
+    // static-classified `Expr` variant (added to `needs_path_prepass`
+    // without a matching update here) and this function silently treating
+    // an unrelated shape as a valid no-op terminal.
+    if !matches!(
+        unwrap_path_component(last).0,
+        Expr::Field(_) | Expr::Index(_) | Expr::IndexNumber { .. } | Expr::Iterate
+    ) {
+        return false;
+    }
+    match navigate_read_only(root, prefix) {
+        Some(parent) => is_yq_field_index_noop_scalar(parent),
+        // An absent prefix (missing field/out-of-range index) isn't this
+        // predicate's case at all -- defer to the normal RHS evaluation
+        // and let `set_path`'s own existing `get_path_mut` report whatever
+        // it reports for a genuinely missing path.
+        None => false,
+    }
+}
+
 /// Whether a *resolved* assignment-target path (a `paths`/`delete_at_path`
 /// entry, already past `resolve_dynamic_indexes`, not the raw `path_expr`
 /// the user wrote) is a bare slice — `.[S:E]`, `.[S:E]?`, or `(.[S:E])` —
@@ -11325,6 +11410,121 @@ fn eval_rhs_once<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// closure `through_slice` actually runs; yq's array/string target just
 /// never fails there to demonstrate it.
 ///
+/// #1233: real yq's field/index/iterate scalar-target no-op discards the
+/// RHS/filter entirely, not just the write (live-verified v4.53.3: `5 | .a
+/// = error("boom")` is `5`, no error -- and the same for `+=`/`//=`, both
+/// of which pre-evaluate a value the same way `=` does). Shared by
+/// [`eval_assign`], [`eval_compound_assign`], and [`eval_alternative_assign`]
+/// -- each calls this *before* evaluating its own RHS, and skips that
+/// evaluation entirely (returning `input` unchanged) when it answers
+/// `Some`.
+///
+/// Only checked for a `path_expr` with no computed key/generator anywhere
+/// (`!needs_path_prepass`, the same guard `resolve_dynamic_indexes`'s own
+/// fast path already uses to skip `resolve_node` for the overwhelmingly
+/// common `.a`/`.a.b`/`.[0]`/`.[]`-shaped case) -- deliberately not widened
+/// to a genuinely dynamic path (a computed key, or a `Comma` LHS, both
+/// `needs_path_prepass`-true): resolving *those* is real evaluation, and
+/// moving it ahead of the RHS would risk reordering two independently
+/// observable things relative to jq's own model. Confirmed live this isn't
+/// hypothetical: real jq's `.[error("p")] = error("r")` reports `"r"` (RHS
+/// first) -- and real yq's *own* answer to the identical query is `"p"`
+/// (path first), a genuine, pre-existing, yq-vs-jq ordering divergence this
+/// fix does not attempt to fix (filed as #1412, not folded in here). A
+/// static path never actually evaluates `path_expr` at all
+/// (`resolve_dynamic_indexes`'s own fast path is a bare
+/// `Ok(vec![path_expr.clone()])`), so checking it here changes nothing
+/// observable for a query that doesn't qualify. Comma-LHS (`(.a, .b) = v`,
+/// real yq confirmed to no-op the same way when every branch does) is the
+/// one shape this leaves as a documented gap rather than a silent miss --
+/// see #1412.
+///
+/// "Discards the RHS entirely" is meant literally, not "evaluates it but
+/// discards the result" -- a `halt`/`break`/`stderr`/`debug` reachable only
+/// through a no-op'd RHS never fires either, matching the multi-output
+/// case already live-verified (`.a = (1, error("x"), 3)` on `5` no-ops
+/// without even computing the leading `1`, so evaluation demonstrably
+/// never starts, not just "starts and its result is thrown away"). Code
+/// review raised this as a possible behaviour-change concern by diffing
+/// against `main`'s pre-#1233 output for `halt`/`break`/`stderr` inside a
+/// no-op'd RHS -- but `main`'s answer there is exactly the bug #1233 was
+/// filed to fix (unconditionally evaluating a RHS real yq never touches),
+/// not a baseline to preserve. Real yq has no `halt`/`break`/`label`
+/// syntax at all (confirmed live: `lexer: invalid input text "halt"`), so
+/// there is no oracle to check this specific consequence against directly
+/// -- unlike `error()`, which is what the "never evaluates" premise is
+/// actually built on -- but treating every control signal uniformly rather
+/// than special-casing halt/break/side-effects to still fire is the
+/// internally consistent reading of that same premise.
+///
+/// `None` means "doesn't apply" for any reason (jq mode, a dynamic path, a
+/// resolve error, or a path that isn't a total no-op) -- the caller falls
+/// through to its own unchanged RHS-evaluation flow either way.
+fn yq_assign_skip_rhs<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    path_expr: &Expr,
+    input: &StandardJson<'_, W>,
+) -> Option<OwnedValue> {
+    match yq_assign_noop_check::<W, S>(path_expr, input) {
+        YqAssignNoopCheck::Skip(unchanged) => Some(unchanged),
+        YqAssignNoopCheck::Continue { .. } | YqAssignNoopCheck::NotChecked => None,
+    }
+}
+
+/// [`yq_assign_skip_rhs`]'s own result, plus (code review, #1233) the
+/// `pristine`/`paths` pair the check's own static-path resolution already
+/// computed when it turns out *not* to be a no-op -- an earlier version
+/// threw that work away on `None` and made every caller redo an identical
+/// `to_owned` + `resolve_dynamic_indexes` pass moments later, doubling a
+/// full O(document-size) DOM materialization on every non-no-op yq-mode
+/// static-path assignment (the common case). [`eval_assign`] is the one
+/// caller wired up to actually reuse `Continue`'s payload; the two
+/// `eval_update`-routed callers ([`eval_compound_assign`]/
+/// [`eval_alternative_assign`]) still go through the simpler
+/// [`yq_assign_skip_rhs`] wrapper above and pay the double cost --
+/// `eval_update` is shared with plain `|=` (which has no pre-check at all
+/// and no `pristine`/`paths` to hand it), so threading this through would
+/// mean widening its signature for every caller, not just these two.
+/// Filed as #1414 rather than done here.
+enum YqAssignNoopCheck {
+    /// Total no-op -- return this value unchanged, skip the RHS entirely.
+    Skip(OwnedValue),
+    /// Not a no-op, but the static-path resolution already ran to answer
+    /// that question -- reuse instead of re-deriving.
+    Continue {
+        pristine: OwnedValue,
+        paths: Vec<Expr>,
+    },
+    /// Doesn't apply at all (jq mode, or a genuinely dynamic path) --
+    /// nothing was resolved; the caller must do so itself, exactly as it
+    /// would have before this check existed.
+    NotChecked,
+}
+
+fn yq_assign_noop_check<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    path_expr: &Expr,
+    input: &StandardJson<'_, W>,
+) -> YqAssignNoopCheck {
+    if S::TAG != EvalTag::Yq || needs_path_prepass(path_expr) {
+        return YqAssignNoopCheck::NotChecked;
+    }
+    let pristine = to_owned(input);
+    // A static path (the only kind reaching this point) never actually
+    // evaluates `path_expr` -- `resolve_dynamic_indexes`'s own fast path
+    // is an unconditional `Ok(vec![path_expr.clone()])` -- so this can't
+    // fail in practice; falling back to `NotChecked` on the (unreachable)
+    // `Err` arm just means the caller re-derives from scratch, same as
+    // before this function existed.
+    let paths = match resolve_dynamic_indexes::<S>(path_expr, &pristine, false) {
+        Ok(paths) => paths,
+        Err(_) => return YqAssignNoopCheck::NotChecked,
+    };
+    if paths.iter().all(|p| yq_assign_is_total_noop(p, &pristine)) {
+        YqAssignNoopCheck::Skip(pristine)
+    } else {
+        YqAssignNoopCheck::Continue { pristine, paths }
+    }
+}
+
 /// `optional` is `=`'s own `?` (`(.a = 1)?`) -- see `eval_update`'s matching
 /// comment for why it is caught here at the call boundary rather than
 /// threaded into `set_path` as a starting flag. It swallows a failure but
@@ -11336,6 +11536,11 @@ fn eval_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     input: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
+    let yq_noop_check = yq_assign_noop_check::<_, S>(path_expr, &input);
+    if let YqAssignNoopCheck::Skip(unchanged) = yq_noop_check {
+        return QueryResult::Owned(unchanged);
+    }
+
     // Evaluate the RHS once, keeping every output instead of collapsing to
     // the first (#392). `terminal` carries a trailing `Error`/`Break` when
     // the stream didn't simply run out -- the same `Partial` shape every
@@ -11387,14 +11592,27 @@ fn eval_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // into empty output when the whole call is optional -- mirroring how
     // `builtin_del` (#537) already separates `del(...)?` from a `?` written
     // inside the path.
-    let mut pristine = to_owned(&input);
-    let paths = match resolve_dynamic_indexes::<S>(path_expr, &pristine, false) {
-        Ok(paths) => paths,
-        // `?` swallows only a genuine error; a halt always escapes, so
-        // `(.[(halt_error(3))] = 1)?` still halts instead of becoming
-        // `QueryResult::None` (#791).
-        Err((_, EvalEscape::Error(_))) if optional => return QueryResult::None,
-        Err((_, escape)) => return escape.into(),
+    // #1233 (code review): reuse `yq_noop_check`'s own resolution instead
+    // of redoing an identical `to_owned` + `resolve_dynamic_indexes` pass
+    // -- see `YqAssignNoopCheck::Continue`'s doc comment. Only the
+    // `NotChecked` case (jq mode, or a genuinely dynamic path) still needs
+    // to resolve here from scratch, exactly as this function always did
+    // before that check existed.
+    let (mut pristine, paths) = match yq_noop_check {
+        YqAssignNoopCheck::Continue { pristine, paths } => (pristine, paths),
+        YqAssignNoopCheck::Skip(_) => unreachable!("handled by the early return above"),
+        YqAssignNoopCheck::NotChecked => {
+            let pristine = to_owned(&input);
+            let paths = match resolve_dynamic_indexes::<S>(path_expr, &pristine, false) {
+                Ok(paths) => paths,
+                // `?` swallows only a genuine error; a halt always escapes,
+                // so `(.[(halt_error(3))] = 1)?` still halts instead of
+                // becoming `QueryResult::None` (#791).
+                Err((_, EvalEscape::Error(_))) if optional => return QueryResult::None,
+                Err((_, escape)) => return escape.into(),
+            };
+            (pristine, paths)
+        }
     };
 
     let last = paths.len().saturating_sub(1);
@@ -11550,6 +11768,20 @@ fn eval_compound_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     input: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
+    // #1233: same RHS-discarding no-op as `eval_assign` (see
+    // `yq_assign_skip_rhs`'s own doc comment) -- applies uniformly across
+    // every compound operator, not just `Add`, unlike the write-level
+    // `scalar_noop` gate further down (`matches!(op, AssignOp::Add)`),
+    // which answers a narrower, operator-specific question about what
+    // happens once the RHS *has* run. Live-verified against yq v4.53.3 for
+    // `+=`/`-=`/`*=`; `/=`/`%=` aren't real yq syntax at all (`'/' expects 2
+    // args but there is 1`), so their yq-mode answer is judged the same way
+    // `//=`'s own comment below judges it -- internal consistency with the
+    // already-correct, already-lazy `|=`, not an external-compat claim.
+    if let Some(unchanged) = yq_assign_skip_rhs::<_, S>(path_expr, &input) {
+        return QueryResult::Owned(unchanged);
+    }
+
     // Convert to update: .path op= value  becomes  .path |= . op value
     let arith_op = match op {
         AssignOp::Add => ArithOp::Add,
@@ -11613,6 +11845,19 @@ fn eval_alternative_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     input: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
+    // #1233: same RHS-discarding no-op as `eval_assign`/`eval_compound_assign`
+    // (see `yq_assign_skip_rhs`'s own doc comment). `//=` isn't real yq
+    // syntax at all (confirmed live, same as `/=`/`%=`), so this is judged
+    // by internal consistency with the already-correct, already-lazy `|=`
+    // this desugars to below, not an external-compat claim -- live-verified
+    // that the literal desugared equivalent (`.a |= (. // error("b"))`) is
+    // already correctly a no-op on a scalar target, so leaving `//=` itself
+    // to still evaluate its RHS eagerly would make two spellings of the
+    // identical operation disagree.
+    if let Some(unchanged) = yq_assign_skip_rhs::<_, S>(path_expr, &input) {
+        return QueryResult::Owned(unchanged);
+    }
+
     // Same root-vs-sub-value fix as eval_compound_assign: evaluate `value_expr`
     // once against the original input before splicing it into the filter.
     let rhs_value = match eval_rhs_once::<W, S>(value_expr, input.clone(), optional) {

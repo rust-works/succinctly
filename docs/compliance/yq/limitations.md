@@ -230,6 +230,33 @@ before one can be captured
 ([#1361](https://github.com/rust-works/succinctly/issues/1361)). Both predate
 [ADR-0017](../../adrs/adr-0017.md)'s mechanism and neither is anchor-specific.
 
+### Comma-grouped scalar-target assignment no-op
+
+[#1233](https://github.com/rust-works/succinctly/issues/1233) taught `=`/`+=`/`-=`/`*=`/`//=`
+that real yq's field/index/iterate scalar-target no-op ([#1181](https://github.com/rust-works/succinctly/issues/1181))
+discards the RHS entirely rather than merely skipping the write — but only for a *static*
+`path_expr` (no computed key, and no `Comma`). A comma-grouped LHS where every branch is
+itself a scalar-target no-op is real yq's identical behaviour, live-verified, that
+succinctly does not yet replicate:
+
+```bash
+$ echo 5 | yq            -o=json '(.a, .b) = error("boom")'   # 5, RHS never runs
+$ echo 5 | succinctly yq -o=json '(.a, .b) = error("boom")'   # Error: boom
+```
+
+Deliberately not covered by #1233's own fix: resolving a `Comma`-containing path *before*
+the RHS (which the fix needs to do, to decide whether to skip it) is real evaluation for
+that shape, unlike a bare static path (a pure, non-evaluating AST clone) — and moving real
+evaluation ahead of the RHS risks reordering two independently-observable things. That risk
+is not hypothetical: real jq's own `.[error(P)] = error(R)` reports `R` (RHS evaluated
+first) while real yq's identical query reports `P` (path first) — succinctly currently
+matches jq's ordering in both modes, a second, related divergence from real yq neither
+tracked before now. Both filed together as
+[#1412](https://github.com/rust-works/succinctly/issues/1412), which also notes a real fix
+for the ordering divergence would likely resolve the comma-LHS gap as a side effect (a full
+path-before-RHS reorder no longer needs the static-only safety gate #1233's own narrower
+fix relies on).
+
 ### Other categories
 
 Float and number formatting ([#1071](https://github.com/rust-works/succinctly/issues/1071),
