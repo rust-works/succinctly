@@ -12197,7 +12197,7 @@ fn test_self_recursive_def_rejects_past_expansion_depth_1016() -> Result<()> {
     )?;
     assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
     assert!(
-        stderr.contains("recursion too deep while expanding"),
+        stderr.contains("recursion depth exceeds limit of"),
         "stderr: {stderr:?}"
     );
     Ok(())
@@ -12236,7 +12236,7 @@ fn test_unconditional_self_recursive_def_rejects_cleanly_1016() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(&["-c", "def deep: [deep]; deep"], Some("null"))?;
     assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
     assert!(
-        stderr.contains("recursion too deep while expanding"),
+        stderr.contains("recursion depth exceeds limit of"),
         "stderr: {stderr:?}"
     );
     Ok(())
@@ -12256,6 +12256,36 @@ fn test_non_self_recursive_constructs_unaffected_by_expansion_guard_1016() -> Re
     let (stdout, stderr, code) = run_jq_full(&["-c", "[recurse]"], Some("[1,[2,[3]]]"))?;
     assert_eq!(code, 0, "stderr: {stderr:?}");
     assert_eq!(stdout.trim_end(), "[[1,[2,[3]]],1,[2,[3]],2,[3],3]");
+    Ok(())
+}
+
+/// #1016 code review: a `def` body with *more than one* syntactic self-call
+/// (branching self-recursion, e.g. naive `fib`) defeats a plain per-chain
+/// depth counter -- every structural arm visiting multiple children (`+`'s
+/// two operands here) passes the same depth to each, so `k` self-calls per
+/// level compound to `O(k^depth)` total substitutions even though no single
+/// chain exceeds the cap. Confirmed live before this fix: `def f: [f, f];
+/// f` consumed tens of GB and never terminated. `MAX_FUNC_EXPANSION_DEPTH`
+/// must bound *total* expansion work (a shared budget, not a per-chain
+/// value) to stay safe for this shape too -- this must return quickly with
+/// a clean error, not hang or exhaust memory. Real jq resolves `fib(3)`
+/// instantly (`2`); this guard's shared-budget design means even this
+/// shallow, everyday case can't succeed under static expansion (see
+/// `MAX_FUNC_EXPANSION_DEPTH`'s doc comment) -- but it must fail cleanly.
+#[test]
+fn test_branching_self_recursive_def_bounded_not_exponential_1016() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            "def fib(n): if n < 2 then n else fib(n-1) + fib(n-2) end; fib(3)",
+        ],
+        Some("null"),
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert!(
+        stderr.contains("recursion depth exceeds limit of"),
+        "stderr: {stderr:?}"
+    );
     Ok(())
 }
 
