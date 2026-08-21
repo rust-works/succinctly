@@ -11960,6 +11960,35 @@ fn through_slice<E: From<EvalError>>(
             edit(&mut throwaway)?;
             Ok(())
         }
+        // A `Null` target that reaches here (jq mode, or a yq operator that
+        // doesn't no-op — the arm above already claimed every yq-mode
+        // `Null`) still needs a real attempt, not a silent skip: real jq
+        // auto-vivifies a null slice target exactly like `setpath()`'s own
+        // `set_value_at_path` walker already does (#1340, confirmed live:
+        // `null | setpath([{"start":0,"end":1},"c"]; 9)` and this arm raise
+        // the identical "A slice of an array can only be assigned another
+        // array"). `edit` runs against a fresh `Null`, not an empty array,
+        // so a mid-chain field step recurses into *its own*
+        // auto-vivification (`Null` -> object) rather than immediately
+        // failing to index an array the way an already-empty array target
+        // does (`{} | .b[0:1].c = 9` on an *existing* empty `.b` still
+        // raises "Cannot index array with string", a different, correct
+        // message for a different shape) — only once `edit` is done does
+        // the result have to actually be an array to splice back. Never
+        // gated on `optional`: real jq's `?` does not suppress this either
+        // (`.b[0:1]? = 5` on absent `.b` still raises the same error,
+        // confirmed live) — `slice_assign_non_array()` is a write-time
+        // application error, the same family `set_path`'s own
+        // `Expr::Optional` arm already carves out of `?`'s reach.
+        OwnedValue::Null => {
+            let mut sub = OwnedValue::Null;
+            edit(&mut sub)?;
+            let OwnedValue::Array(items) = sub else {
+                return Err(EvalError::slice_assign_non_array().into());
+            };
+            *root = OwnedValue::Array(items);
+            Ok(())
+        }
         _ if optional => Ok(()),
         other => Err(EvalError::cannot_index_with_type(owned_type_name(other), "object").into()),
     }
@@ -42383,6 +42412,105 @@ mod tests {
         query!(br"[1,2,3,4]", r".[1:3][] |= .*10",
             QueryResult::Owned(v) => {
                 assert_eq!(v.to_json(), "[1,20,30,4]");
+            }
+        );
+    }
+
+    /// #1340: `through_slice`'s `Null` target used to be a silent
+    /// non-suppressible catch-all no-op-or-error before this fix, rather
+    /// than a real auto-vivification attempt -- `set_value_at_path`
+    /// (`setpath()`'s own walker) already got this right, and `through_slice`
+    /// (`=`/`|=`'s shared choke point) had drifted from it. Every case here
+    /// is oracle-verified against real jq 1.7.1.
+    #[test]
+    fn test_assign_slice_mid_chain_null_target_auto_vivifies_1340() {
+        // The issue's own repro: a further path step after an absent
+        // field's slice raises the tail's write-time application error
+        // instead of silently no-op'ing.
+        query!(br#"{"c":0}"#, r"(.b[0:1]? | .c) = 9",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "A slice of an array can only be assigned another array");
+            }
+        );
+        // Same without the `?` -- `?` never suppresses this class of error.
+        query!(br#"{"c":0}"#, r"(.b[0:1] | .c) = 9",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "A slice of an array can only be assigned another array");
+            }
+        );
+        query!(br#"{"c":0}"#, r".b[0:1]? = 5",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "A slice of an array can only be assigned another array");
+            }
+        );
+        // The terminal slice write itself still auto-vivifies successfully
+        // when the RHS genuinely is an array -- this was ALSO broken before
+        // this fix (it hard-errored with "Cannot index null with object"),
+        // even though it isn't the shape #1340 was filed against.
+        query!(br#"{"c":0}"#, r".b[0:1] = [1]",
+            QueryResult::Owned(v) => {
+                assert_eq!(v.to_json(), r#"{"c":0,"b":[1]}"#);
+            }
+        );
+        query!(br#"{"c":0}"#, r".b[0:1]? = [1]",
+            QueryResult::Owned(v) => {
+                assert_eq!(v.to_json(), r#"{"c":0,"b":[1]}"#);
+            }
+        );
+        // `|=` shares `through_slice`, so it shares the bug and the fix.
+        query!(br#"{"c":0}"#, r".b[0:1].c |= 9",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "A slice of an array can only be assigned another array");
+            }
+        );
+        query!(br#"{"c":0}"#, r".b[0:1] |= [1]",
+            QueryResult::Owned(v) => {
+                assert_eq!(v.to_json(), r#"{"c":0,"b":[1]}"#);
+            }
+        );
+        // A genuinely non-vivifiable scalar (not `Null`) with `?` on the
+        // slice is unaffected -- still an ordinary suppressed navigation
+        // failure, not a write-time application error.
+        query!(br"5", r"(.[0:1]? | .c) = 9",
+            QueryResult::Owned(v) => {
+                assert_eq!(v.to_json(), "5");
+            }
+        );
+        // A root that is already an array (not auto-vivified from `Null`)
+        // is unaffected -- still fails indexing the sliced array directly,
+        // a different, correct message for a different shape.
+        query!(br#"{"b":[10,20,30]}"#, r".b[0:1].c = 9",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, r#"Cannot index array with string "c""#);
+            }
+        );
+    }
+
+    /// #1340: yq mode's own `Null`-target no-op (`is_yq_slice_empty_container_
+    /// scalar`, #1101/#1116) sits in `through_slice`'s match *before* the new
+    /// `OwnedValue::Null` arm this fix adds, so it must keep matching `Null`
+    /// first and stay completely unaffected -- confirmed live against real
+    /// yq v4.53.3.
+    #[test]
+    fn test_assign_slice_mid_chain_null_target_yq_mode_unaffected_1340() {
+        yq_query!(br#"{"c":0}"#, r".b[0:1] = [1]",
+            QueryResult::Owned(v) => {
+                assert_eq!(v.to_json(), r#"{"c":0,"b":null}"#);
+            }
+        );
+        yq_query!(br#"{"c":0}"#, r".b[0:1] = 5",
+            QueryResult::Owned(v) => {
+                assert_eq!(v.to_json(), r#"{"c":0,"b":null}"#);
+            }
+        );
+        yq_query!(br#"{"c":0}"#, r".b[0:1].c = 9",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, r#"Cannot index array with string "c""#);
+            }
+        );
+        yq_query!(br#"{"c":0}"#, r"(.b[0:1]? | .c) = 9",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, r#"Cannot index array with string "c""#);
             }
         );
     }
