@@ -6905,11 +6905,62 @@ fn builtin_tonumber<W: Clone + AsRef<[u64]>>(
 pub(super) fn tonumber_from_str(s: &str) -> Result<OwnedValue, EvalError> {
     // jq's JSON parser skips surrounding whitespace, so `" 1 "` is 1.
     let trimmed = s.trim();
+    // Materialize a JSON-shaped number as a `NumberLiteral` so it keeps its
+    // *source spelling*, rather than collapsing it through a bare
+    // `parse::<i64>()`/`parse::<f64>()` pair. Both oracles preserve the
+    // spelling and both modes were wrong without this -- real jq 1.7.1
+    // renders `"2.50" | tonumber` as `2.50` and `"1e3"` as `1E+3`, real yq
+    // echoes `2.50` and `1e3` verbatim, while a bare `Float` collapsed all
+    // four to `2.5`/`1000`.
+    //
+    // It also keeps yq's `!!float` tagging correct without any notion of
+    // value provenance (#1090). Real yq tags a nested float exactly when the
+    // text it is about to print would read back as an int, so `tonumber`'s
+    // result is untagged (its spelling survives) while `(. | tonumber) + 0`
+    // is tagged (arithmetic replaced the spelling). `into_plain_number`,
+    // which every arithmetic op already calls, *is* that boundary --
+    // preserving the literal here is what puts the value on the correct side
+    // of it. Constructing a bare `Float` instead made `.b = (.a | tonumber)`
+    // on `a: "2.0"` print `!!float 2`, the regression that closed PR #1179.
+    //
+    // Gate on strict RFC 8259 number syntax, and *not* on
+    // `OwnedValue::from_number_bytes`: that decoder also recognizes this
+    // crate's internal overflow sentinels (`9e999e999` -> NaN, `8e999e999`
+    // -> Infinity), which are reachable here as ordinary user text. Real jq
+    // rejects all three outright ("Invalid numeric literal", confirmed live
+    // against 1.7.1), so routing user input through the bridge decoder would
+    // turn a documented error into a silent NaN.
+    //
+    // The bare `parse::<i64>`/`parse::<f64>` fallback below still handles
+    // every spelling JSON refuses but the oracles accept -- `007`, `+2.0`,
+    // `.5`, and the `inf`/`NaN` words -- unchanged, and keeps those on the
+    // plain `Int`/`Float` path where they belong (a
+    // `NumberLiteral(Float(inf), "inf")` would make `format_number_jq_compat`
+    // emit a bare `inf`, which is not a number in either output language).
+    if crate::json::validate::is_valid_number(trimmed.as_bytes()) {
+        return Ok(OwnedValue::from_number_literal(trimmed));
+    }
+    // A leading `+` is the one spelling both oracles accept that JSON does
+    // not, and that still has an exact JSON-safe equivalent: drop the sign
+    // and preserve the rest. Real jq renders `"+2.0" | tonumber` as `2.0`,
+    // which only a preserved literal can produce -- the `parse::<f64>`
+    // fallback below would yield a bare `Float` and print `2`. (yq echoes
+    // `+2.0` verbatim; that spelling cannot be stored, since a
+    // `NumberLiteral`'s text is re-read as JSON by the reindex bridge --
+    // the same constraint `preservable_float_literal_text` documents on the
+    // YAML side.)
+    if let Some(unsigned) = trimmed.strip_prefix('+') {
+        if crate::json::validate::is_valid_number(unsigned.as_bytes()) {
+            return Ok(OwnedValue::from_number_literal(unsigned));
+        }
+    }
     if let Ok(i) = trimmed.parse::<i64>() {
-        Ok(OwnedValue::Int(i))
-    } else if let Ok(f) = trimmed.parse::<f64>() {
-        Ok(OwnedValue::Float(f))
-    } else if parse_complete_json(trimmed).is_ok() {
+        return Ok(OwnedValue::Int(i));
+    }
+    if let Ok(f) = trimmed.parse::<f64>() {
+        return Ok(OwnedValue::Float(f));
+    }
+    if parse_complete_json(trimmed).is_ok() {
         Err(EvalError::cannot_parse_as_number(&OwnedValue::String(
             s.to_string(),
         )))
@@ -32954,17 +33005,39 @@ mod tests {
         );
     }
 
+    /// `tonumber` keeps the string's own spelling as a `NumberLiteral`
+    /// rather than collapsing it to a bare `Int`/`Float` (#1090): both
+    /// oracles preserve it (`"2.50" | tonumber` is `2.50` in jq 1.7.1 and
+    /// yq 4.53.3 alike), and in yq mode it is also what keeps the value on
+    /// the untagged side of `into_plain_number`'s arithmetic boundary, so a
+    /// converted float does not pick up a spurious `!!float` tag.
     #[test]
     fn test_builtin_tonumber() {
         query!(br#""42""#, "tonumber",
-            QueryResult::Owned(OwnedValue::Int(n)) => {
+            QueryResult::Owned(OwnedValue::NumberLiteral(NumberRepr::Int(n), literal)) => {
                 assert_eq!(n, 42);
+                assert_eq!(&*literal, "42");
             }
         );
 
         query!(br#""2.75""#, "tonumber",
-            QueryResult::Owned(OwnedValue::Float(f)) => {
+            QueryResult::Owned(OwnedValue::NumberLiteral(NumberRepr::Float(f), literal)) => {
                 assert!((f - 2.75).abs() < 0.001);
+                assert_eq!(&*literal, "2.75");
+            }
+        );
+
+        // A spelling JSON accepts is echoed verbatim, not renormalized.
+        query!(br#""2.50""#, "tonumber",
+            QueryResult::Owned(OwnedValue::NumberLiteral(_, literal)) => {
+                assert_eq!(&*literal, "2.50");
+            }
+        );
+
+        // A spelling JSON rejects still falls back to a plain number.
+        query!(br#""007""#, "tonumber",
+            QueryResult::Owned(v) => {
+                assert_eq!(v, OwnedValue::Int(7));
             }
         );
 

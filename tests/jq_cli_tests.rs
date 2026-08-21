@@ -14205,3 +14205,56 @@ fn test_1088_path_reports_float_index_as_written() {
         "{stderr}"
     );
 }
+
+/// #1090: `tonumber` preserves the string's own spelling instead of
+/// renormalizing it through `f64`. Every expectation below was read off
+/// real jq 1.7.1 -- succinctly previously collapsed `"2.50"` to `2.5` and
+/// `"1e3"` to `1000`.
+///
+/// This lives in the jq suite as well as the yq one because
+/// `tonumber_from_str` is shared by both evaluators, and the two apply
+/// *different* final formatters to the preserved literal: jq renormalizes
+/// through `format_number_jq_compat` (hence `1E+3`, not `1e3`), while yq
+/// echoes it verbatim. A change that satisfies only one oracle would look
+/// correct in half the test suite.
+#[test]
+fn test_tonumber_preserves_source_spelling_1090() {
+    for (input, expected) in [
+        (r#""2.0""#, "2.0\n"),
+        (r#""2.50""#, "2.50\n"),
+        (r#""1e3""#, "1E+3\n"),
+        (r#""1E5""#, "1E+5\n"),
+        (r#""2e0""#, "2\n"),
+        (r#""42""#, "42\n"),
+        // Spellings JSON rejects fall back to a plain number, matching jq.
+        (r#""007""#, "7\n"),
+        (r#"".5""#, "0.5\n"),
+        // A leading `+` has an exact JSON-safe equivalent, so the literal
+        // still survives -- a bare `Float` here would print `2`, not `2.0`.
+        (r#""+2.0""#, "2.0\n"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["tonumber"], Some(input))
+            .unwrap_or_else(|e| panic!("`{input} | tonumber` failed to run: {e}"));
+        assert_eq!(code, 0, "`{input}`\nstdout: {stdout}\nstderr: {stderr}");
+        assert_eq!(stdout, expected, "`{input}`\nstderr: {stderr}");
+    }
+}
+
+/// #1090 follow-on: preserving `tonumber`'s literal must not start
+/// accepting text real jq rejects. The internal overflow sentinels
+/// (`9e999e999` -> NaN, `8e999e999` -> Infinity) are ordinary user input
+/// here, and routing this builtin through `OwnedValue::from_number_bytes`
+/// -- which decodes them -- would silently turn jq's documented error into
+/// a NaN. Error wording confirmed against jq 1.7.1.
+#[test]
+fn test_tonumber_rejects_internal_overflow_sentinels_1090() {
+    for input in [r#""9e999e999""#, r#""8e999e999""#, r#""-8e999e999""#] {
+        let (stdout, stderr, code) = run_jq_full(&["tonumber"], Some(input))
+            .unwrap_or_else(|e| panic!("`{input} | tonumber` failed to run: {e}"));
+        assert_ne!(code, 0, "`{input}` should error\nstdout: {stdout}");
+        assert!(
+            stderr.contains("Invalid numeric literal"),
+            "`{input}`\nstderr: {stderr}"
+        );
+    }
+}
