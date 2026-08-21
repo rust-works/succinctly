@@ -26,6 +26,7 @@ These plans are kept for:
 | [jq-lazy-generator-consumers.md](jq-lazy-generator-consumers.md)     | Partial     | `src/jq/eval.rs`                  | Demand-driven sink for short-circuiting consumers |
 | [jq-duplicate-key-collapse.md](jq-duplicate-key-collapse.md)         | Implemented | `src/jq/`, `jq_runner.rs`         | jq-mode duplicate object key collapse             |
 | [jq-generator-argument-fanout.md](jq-generator-argument-fanout.md)   | Implemented | `src/jq/eval.rs`                  | One builtin result per generator-argument output  |
+| [decode-failure-routing.md](decode-failure-routing.md)               | Proposed    | `src/jq/`, `src/yaml/`            | Decode-failure error routing                      |
 
 ## Archived Plans
 
