@@ -17838,12 +17838,17 @@ fn test_yaml_root_container_anchor_survives_the_dom_path_763() -> Result<()> {
     assert_eq!(exit_code, 0);
     assert_eq!(output, "&x\np: 1\n");
 
-    // Flow style takes the same branch with a space instead of a newline;
-    // `-P` flattens the flow to block, so read it through the streaming
-    // path to see the space form.
-    let (output, exit_code) = run_yq_stdin(".a", "a: &x {p: 1}\nb: *x\n", &[])?;
-    assert_eq!(exit_code, 0);
-    assert_eq!(output, "&x {p: 1}\n");
+    // Flow style takes the same branch with a space instead of a newline.
+    // `--arg`, not `-P`, is what forces the DOM path here: `-P` would
+    // flatten the flow to block and never reach the space form.
+    for (input, expected) in [
+        ("a: &x {p: 1}\nb: *x\n", "&x {p: 1}\n"),
+        ("a: &x [1, 2]\nb: *x\n", "&x [1, 2]\n"),
+    ] {
+        let (output, exit_code) = run_yq_stdin(".a", input, &["--arg", "z", "y"])?;
+        assert_eq!(exit_code, 0, "input: {input}");
+        assert_eq!(output, expected, "input: {input}");
+    }
     Ok(())
 }
 
