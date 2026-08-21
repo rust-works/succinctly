@@ -14211,6 +14211,25 @@ fn test_object_slice_getpath_path_round_trip_1102() -> Result<()> {
     Ok(())
 }
 
+/// A malformed slice descriptor against an object target (a `start`/`end`
+/// that isn't a number or `null`) errors the same way it already does for
+/// `getpath`'s existing `Array`/`String` slice-descriptor arms, rather than
+/// silently accepting garbage bounds.
+#[test]
+fn test_object_slice_getpath_malformed_descriptor_errors_1102() -> Result<()> {
+    let (_out, stderr, code) = run_yq_stdin_with_stderr(
+        r#"getpath([{"start":"bad","end":2}])"#,
+        r#"{"a":1,"b":2}"#,
+        &["-o", "json"],
+    )?;
+    assert_eq!(code, 1, "stderr: {stderr}");
+    assert!(
+        stderr.contains("Array/string slice indices must be integers"),
+        "stderr: {stderr}"
+    );
+    Ok(())
+}
+
 /// Known, deliberate gap: slicing an object with a genuine duplicate YAML
 /// key silently collapses it, the same root cause as this repo's other
 /// duplicate-mapping-key gaps (`OwnedValue::Object`'s `IndexMap`
