@@ -708,10 +708,27 @@ fn query_result_to_owned_values(
     result: QueryResult<'_, Vec<u64>>,
     sink: &mut ErrorSink,
 ) -> Vec<OwnedValue> {
+    // A decode failure while materializing is an uncaught error like any
+    // other (#1247): report it and yield nothing, exactly as the
+    // `QueryResult::Error` arm below does.
+    macro_rules! materialized {
+        ($e:expr) => {
+            match $e {
+                Ok(v) => v,
+                Err(e) => {
+                    sink.report(DiagStyle::Yq, &e, &no_location());
+                    return Vec::new();
+                }
+            }
+        };
+    }
     match result {
-        QueryResult::One(v) => vec![generic_to_owned(&v)],
-        QueryResult::OneCursor(c) => vec![generic_to_owned(&c.value())],
-        QueryResult::Many(vs) => vs.iter().map(generic_to_owned).collect(),
+        QueryResult::One(v) => vec![materialized!(generic_to_owned(&v))],
+        QueryResult::OneCursor(c) => vec![materialized!(generic_to_owned(&c.value()))],
+        QueryResult::Many(vs) => materialized!(vs
+            .iter()
+            .map(generic_to_owned)
+            .collect::<core::result::Result<Vec<_>, _>>()),
         QueryResult::None => vec![],
         QueryResult::Error(e) => {
             sink.report(DiagStyle::Yq, &e, &no_location());
@@ -1314,13 +1331,28 @@ fn evaluate_yaml_cursor<W: AsRef<[u64]> + Clone>(
     // assignment-family expression against a document that actually has
     // aliases. Everything else (JSON, plain reads, alias-free YAML) pays
     // nothing beyond this one bool check.
+    // A decode failure anywhere in this function is an uncaught error like
+    // any other (#1247): report it and yield no documents, exactly as the
+    // `GenericResult::Error` arm below does.
+    macro_rules! materialized {
+        ($e:expr) => {
+            match $e {
+                Ok(v) => v,
+                Err(e) => {
+                    sink.report(DiagStyle::Yq, &e, &no_location());
+                    return Ok(Vec::new());
+                }
+            }
+        };
+    }
+
     let has_aliases = cursor.index().has_aliases();
-    let alias_sync_ctx = (is_alias_sensitive_assign(expr) && has_aliases).then(|| {
-        (
-            generic_to_owned(&cursor.value()),
-            collect_alias_groups(cursor),
-        )
-    });
+    let alias_sync_ctx = match (is_alias_sensitive_assign(expr) && has_aliases)
+        .then(|| generic_to_owned(&cursor.value()))
+    {
+        Some(pristine) => Some((materialized!(pristine), collect_alias_groups(cursor))),
+        None => None,
+    };
 
     // Snapshot the pristine presentation tree *before* evaluation too
     // (#739, ADR-0017): same shape-preserving-write gate as `alias_sync_ctx`
@@ -1329,8 +1361,12 @@ fn evaluate_yaml_cursor<W: AsRef<[u64]> + Clone>(
     // and only when the caller can use the result at all (`need_comments`).
     // `no_comments` below reconciles this against each result document once
     // evaluation finishes.
-    let presentation_sync_ctx = (need_comments && is_alias_sensitive_assign(expr))
-        .then(|| to_owned_with_comments(&cursor.value(), Some(&cursor)));
+    let presentation_sync_ctx = match (need_comments && is_alias_sensitive_assign(expr))
+        .then(|| to_owned_with_comments(&cursor.value(), Some(&cursor)))
+    {
+        Some(snapshot) => Some(materialized!(snapshot)),
+        None => None,
+    };
 
     let result = eval_with_cursor_using::<YqSemantics, _>(expr, cursor);
     // A value with no live cursor of its own (an assignment/`del()`
@@ -1354,7 +1390,7 @@ fn evaluate_yaml_cursor<W: AsRef<[u64]> + Clone>(
         if need_comments {
             to_owned_with_comments(&c.value(), Some(c))
         } else {
-            no_comments(generic_to_owned(&c.value()))
+            generic_to_owned(&c.value()).map(&no_comments)
         }
     };
 
@@ -1368,10 +1404,20 @@ fn evaluate_yaml_cursor<W: AsRef<[u64]> + Clone>(
     // arms are defensive/unreachable here today, kept for exhaustiveness
     // over the shared `GenericResult` enum.
     let mut docs = match result {
-        GenericResult::One(v) => Ok(vec![no_comments(generic_to_owned(&v))]),
-        GenericResult::OneCursor(c) => Ok(vec![owned_with_comments(&c)]),
-        GenericResult::Many(vs) => Ok(vs.iter().map(generic_to_owned).map(no_comments).collect()),
-        GenericResult::ManyCursor(cs) => Ok(cs.iter().map(owned_with_comments).collect()),
+        GenericResult::One(v) => Ok(vec![no_comments(materialized!(generic_to_owned(&v)))]),
+        GenericResult::OneCursor(c) => Ok(vec![materialized!(owned_with_comments(&c))]),
+        GenericResult::Many(vs) => Ok(materialized!(vs
+            .iter()
+            .map(generic_to_owned)
+            .collect::<core::result::Result<Vec<_>, _>>())
+        .into_iter()
+        .map(&no_comments)
+        .collect()),
+        GenericResult::ManyCursor(cs) => Ok(materialized!(cs
+            .iter()
+            .map(owned_with_comments)
+            .collect::<core::result::Result<Vec<_>, _>>(
+        ))),
         // This is the DOM/slow path (`evaluate_yaml_direct_filtered`'s
         // fallback), reached only when `can_use_m2_streaming` rejects the
         // expression or a flag (`--sort-keys`, color, `--tab`, `--slurp`,

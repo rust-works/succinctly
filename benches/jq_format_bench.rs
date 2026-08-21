@@ -51,6 +51,7 @@ fn run_generic(json: &[u8], expr: &Expr) -> usize {
     let cursor = index.root(json);
     eval_generic::eval_with_cursor(expr, cursor)
         .collect_owned()
+        .expect("materializes")
         .len()
 }
 

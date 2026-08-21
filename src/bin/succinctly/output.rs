@@ -42,7 +42,13 @@ pub use succinctly::yaml::format_float_yq;
 /// local to `yq_runner.rs` rather than a second variant here, since it's a
 /// yq-CLI-specific oracle quirk this shared helper has no business knowing
 /// about.
-pub fn json_bytes_to_owned_value(bytes: &[u8]) -> OwnedValue {
+///
+/// Fallible since #1247: a string that fails to decode raises instead of
+/// materializing as `null`. Every caller here re-serializes an *already
+/// decoded* `OwnedValue`, so in practice this cannot fail on those paths --
+/// but the signature says so rather than a comment promising it, and the
+/// `--argjson`/`--jsonargs` paths take genuinely external text.
+pub fn json_bytes_to_owned_value(bytes: &[u8]) -> Result<OwnedValue, EvalError> {
     let index = JsonIndex::build(bytes);
     let cursor = index.root(bytes);
     generic_to_owned(&cursor.value())

@@ -911,7 +911,18 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
                     had_output = true;
                     // For exit_status tracking, we need to check the last value
                     if args.exit_status {
-                        last_output = Some(result.materialize());
+                        // `-e` is the flag that forces materialization at
+                        // all, so it is where a decode failure first becomes
+                        // observable here (#1247). Report and skip the value
+                        // rather than letting an undecodable string count as
+                        // a truthiness answer; `sink` drives the exit code.
+                        match result.materialize() {
+                            Ok(owned) => last_output = Some(owned),
+                            Err(e) => {
+                                sink.report(DiagStyle::Jq, &e, &at);
+                                continue;
+                            }
+                        }
                     }
                     write_output_jq_value(&mut out, &result, &output_config)?;
                     // result is dropped here, freeing its memory immediately
@@ -1722,8 +1733,14 @@ fn validate_json_str(s: &str) -> serde_json::Result<()> {
 /// *normalized* copy but must still materialize the *original* text, see
 /// its own comment), so that one branch calls `validate_json_str`
 /// directly instead.
-fn validate_and_materialize_json(s: &str) -> serde_json::Result<OwnedValue> {
+fn validate_and_materialize_json(
+    s: &str,
+) -> serde_json::Result<core::result::Result<OwnedValue, EvalError>> {
     validate_json_str(s)?;
+    // Two nested results on purpose: the *outer* `Err` is serde's, and only
+    // it may trigger the caller's leading-zero retry. A decode failure
+    // (#1247) is not a validation failure serde could disagree about, so it
+    // must not be mistaken for one -- retrying would just fail again.
     Ok(crate::output::json_bytes_to_owned_value(s.as_bytes()))
 }
 
@@ -1748,7 +1765,8 @@ fn parse_json_value(s: &str) -> Result<OwnedValue> {
     }
 
     match validate_and_materialize_json(s) {
-        Ok(v) => Ok(v),
+        Ok(Ok(v)) => Ok(v),
+        Ok(Err(e)) => Err(anyhow::anyhow!("Invalid JSON: {s}: {e}")),
         Err(e) => {
             // Real jq's own number parser tolerates a leading zero
             // (`007`, `00`, `007.5`) that strict JSON doesn't (#1094) --
@@ -1767,7 +1785,8 @@ fn parse_json_value(s: &str) -> Result<OwnedValue> {
             if normalized == s || validate_json_str(&normalized).is_err() {
                 return Err(e).with_context(|| format!("Invalid JSON: {s}"));
             }
-            Ok(crate::output::json_bytes_to_owned_value(s.as_bytes()))
+            crate::output::json_bytes_to_owned_value(s.as_bytes())
+                .map_err(|e| anyhow::anyhow!("Invalid JSON: {s}: {e}"))
         }
     }
 }
@@ -1995,12 +2014,13 @@ fn parse_json_stream(s: &str) -> Result<Vec<OwnedValue>> {
         Err(e) => {
             let bytes = s.as_bytes();
             match find_json_values(bytes) {
-                Ok(spans) => Ok(spans
+                Ok(spans) => spans
                     .into_iter()
                     .map(|(start, end)| {
                         crate::output::json_bytes_to_owned_value(&bytes[start..end])
                     })
-                    .collect()),
+                    .collect::<core::result::Result<Vec<_>, _>>()
+                    .map_err(|de| anyhow::anyhow!("{de}")),
                 Err(_) => Err(e),
             }
         }
@@ -2037,7 +2057,10 @@ fn parse_json_stream_strict(s: &str) -> Result<Vec<OwnedValue>> {
             .iter()
             .position(|b| !b.is_ascii_whitespace())
             .map_or(prev_end, |offset| prev_end + offset);
-        values.push(crate::output::json_bytes_to_owned_value(&bytes[start..end]));
+        values.push(
+            crate::output::json_bytes_to_owned_value(&bytes[start..end])
+                .map_err(|e| anyhow::anyhow!("{e}"))?,
+        );
         prev_end = end;
     }
 
@@ -2103,11 +2126,20 @@ fn parse_json_seq(s: &str) -> Vec<OwnedValue> {
 
         // Try to parse as JSON, silently ignore failures
         if validate::validate(segment.as_bytes()).is_ok() {
-            values.push(crate::output::json_bytes_to_owned_value(segment.as_bytes()));
+            // See the sibling arm below: no error channel here by design.
+            if let Ok(v) = crate::output::json_bytes_to_owned_value(segment.as_bytes()) {
+                values.push(v);
+            }
         } else {
             let normalized = normalize_leading_zero_numbers(segment);
             if normalized != segment && validate_json_str(&normalized).is_ok() {
-                values.push(crate::output::json_bytes_to_owned_value(segment.as_bytes()));
+                // Skipped, not raised: this function has no error channel
+                // by design -- RFC 7464 says a malformed segment is dropped,
+                // which is the same answer for a segment that parses but
+                // won't decode (#1247).
+                if let Ok(v) = crate::output::json_bytes_to_owned_value(segment.as_bytes()) {
+                    values.push(v);
+                }
             }
             // Genuine parse failures are silently ignored per RFC 7464
         }
@@ -2198,14 +2230,34 @@ fn evaluate_input(
     // (at_offset, at_position builtins)
     let result = eval_with_cursor(expr, cursor);
 
+    // A decode failure while materializing a result is an uncaught error like
+    // any other (#1247): report it to `sink` and yield nothing, so the next
+    // input still runs and the exit code is still set (`ErrorSink`, #355).
+    // Mirrors the `GenericResult::Error` arm below.
+    macro_rules! materialized {
+        ($e:expr) => {
+            match $e {
+                Ok(v) => v,
+                Err(e) => {
+                    sink.report(DiagStyle::Jq, &e, at);
+                    return Ok(vec![]);
+                }
+            }
+        };
+    }
+
     // Convert result to Vec<OwnedValue>
     match result {
-        GenericResult::One(v) => Ok(vec![generic_to_owned(&v)]),
-        GenericResult::OneCursor(c) => Ok(vec![generic_to_owned(&c.value())]),
-        GenericResult::Many(vs) => Ok(vs.iter().map(generic_to_owned).collect()),
-        GenericResult::ManyCursor(cs) => {
-            Ok(cs.iter().map(|c| generic_to_owned(&c.value())).collect())
-        }
+        GenericResult::One(v) => Ok(vec![materialized!(generic_to_owned(&v))]),
+        GenericResult::OneCursor(c) => Ok(vec![materialized!(generic_to_owned(&c.value()))]),
+        GenericResult::Many(vs) => Ok(materialized!(vs
+            .iter()
+            .map(generic_to_owned)
+            .collect::<core::result::Result<Vec<_>, _>>())),
+        GenericResult::ManyCursor(cs) => Ok(materialized!(cs
+            .iter()
+            .map(|c| generic_to_owned(&c.value()))
+            .collect::<core::result::Result<Vec<_>, _>>())),
         // Fallback: materialize. This runner boundary never sees a
         // fast-pathed `keys`/`keys_unsorted | length`/`.[]`/`.[n]`/`first`/
         // `last` — those are fully resolved inside the evaluator's `Pipe`
@@ -2508,8 +2560,13 @@ fn write_output_jq_value<Out: Write, Wrd: Clone + AsRef<[u64]>>(
             print_json(out, value, &PreserveFormatter, config, 0)?;
         }
     } else {
-        // For complex output (pretty-print, sort_keys, colors), materialize first
-        let owned = value.materialize();
+        // For complex output (pretty-print, sort_keys, colors), materialize
+        // first -- and surface a decode failure rather than printing the
+        // empty string it used to become (#1247). `anyhow` is the only error
+        // channel this writer has; the message is preserved verbatim.
+        let owned = value
+            .materialize()
+            .map_err(|e| anyhow::anyhow!("{}", e.message))?;
         out.write_all(format_json(&owned, config).as_bytes())?;
     }
 

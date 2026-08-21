@@ -14399,3 +14399,68 @@ fn test_undecodable_object_key_does_not_hide_later_fields_1247() {
     assert_eq!(code, 0);
     assert_eq!(stdout.lines().last(), Some("2"));
 }
+
+/// #1247 core: a string scalar the semi-index accepted but that cannot be
+/// *decoded* must surface as a real jq error once anything materializes it,
+/// instead of silently becoming `null` (`eval_generic::to_owned`) or `""`
+/// (`lazy::cursor_to_owned`).
+///
+/// Every filter here materializes; each used to answer with a fabricated
+/// value at exit 0. `.a | length` is the sharpest case: it reported
+/// `null (null) has no length` -- a type error about a value that is a
+/// perfectly good string token, naming a symptom two steps removed from the
+/// cause.
+///
+/// Real jq rejects the document at parse time (exit 5). succinctly reaches
+/// the same exit code by a different route -- an uncaught evaluation error --
+/// because it never parses the whole document up front. Message text is
+/// therefore succinctly's own, and is asserted only for the decode reason.
+#[test]
+fn test_decode_failure_surfaces_as_error_1247() {
+    let doc = r#"{"a": "\ud800"}"#;
+    // Not `length` on the object itself: that answers from `fields.len()`
+    // without decoding a single key, which is a genuine fast path rather
+    // than a degrade -- it returns the same count jq would.
+    for filter in [
+        "to_entries",
+        "[.a] | sort",
+        ".a | length",
+        ".a | ascii_downcase",
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(doc))
+            .unwrap_or_else(|e| panic!("`{filter}` failed to run: {e}"));
+        assert_ne!(code, 0, "`{filter}` should fail\nstdout: {stdout}");
+        assert!(
+            stderr.contains("invalid unicode escape sequence"),
+            "`{filter}` should name the decode failure, not a downstream type error\nstderr: {stderr}"
+        );
+    }
+}
+
+/// #1247: an undecodable *key* raises too, and does not silently shrink the
+/// object. `to_entries` used to return one entry fewer than the document had
+/// -- `effective_fields`' dedup walk dropped any field whose key wouldn't
+/// decode, before anything could notice.
+#[test]
+fn test_decode_failure_in_key_surfaces_as_error_1247() {
+    let doc = r#"{"\ud800": 1, "b": 2}"#;
+    let (stdout, stderr, code) = run_jq_full(&["-c", "to_entries"], Some(doc))
+        .unwrap_or_else(|e| panic!("failed to run: {e}"));
+    assert_ne!(code, 0, "stdout: {stdout}");
+    assert!(
+        stderr.contains("in object key"),
+        "stderr should name the key as the site: {stderr}"
+    );
+}
+
+/// #1247 guard: the new check must not fire on anything that decodes
+/// cleanly, including the escapes and non-ASCII that look most like the
+/// failing case.
+#[test]
+fn test_valid_escapes_still_materialize_1247() {
+    let doc = r#"{"a": "é😀\n\t\"", "b": "café"}"#;
+    let (stdout, stderr, code) = run_jq_full(&["-c", "to_entries | length"], Some(doc))
+        .unwrap_or_else(|e| panic!("failed to run: {e}"));
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout.trim(), "2");
+}

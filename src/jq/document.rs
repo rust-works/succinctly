@@ -317,6 +317,29 @@ pub trait DocumentValue: Sized + Clone {
     /// Try to get as a string.
     fn as_str(&self) -> Option<Cow<'_, str>>;
 
+    /// Why a scalar that is structurally a string could not be *decoded* --
+    /// invalid UTF-8, an invalid escape, an invalid `\u` codepoint.
+    ///
+    /// [`as_str`](Self::as_str) collapses "not a string" and "a string this
+    /// document cannot hand back" into the same `None`, which is how a
+    /// decode failure used to reach a materializing conversion indis-
+    /// tinguishable from an unknown type and degrade silently to `null`
+    /// (#1098, #1247). This separates the two: `Some(reason)` means the
+    /// semi-index accepted the span as a string token but the bytes behind
+    /// it are not decodable, so a caller can raise a real error instead of
+    /// guessing.
+    ///
+    /// Returns a `&'static str` rather than a formatted message so the
+    /// check stays allocation-free and `no_std`-compatible; each format's
+    /// own error type owns the wording (`JsonError::message`,
+    /// `YamlStringError::message`), shared with its `Display`.
+    ///
+    /// Defaults to `None` -- correct for any implementation whose strings
+    /// cannot fail to decode.
+    fn string_decode_error(&self) -> Option<&'static str> {
+        None
+    }
+
     /// String form of this value when it appears as a mapping key.
     ///
     /// Unlike [`as_str`](Self::as_str), a key is always representable as a
@@ -456,13 +479,31 @@ pub trait DocumentFields: Sized + Clone {
         // implements the whole rule.
         let mut by_key: IndexMap<String, DocumentField<Self::Value, Self::Cursor>> =
             IndexMap::new();
+        let mut undecodable = Vec::new();
         while let Some((field, rest)) = fields.uncons() {
-            if let Some(key) = field.key_str() {
-                by_key.insert(key.into_owned(), field);
+            match field.key_str() {
+                Some(key) => {
+                    by_key.insert(key.into_owned(), field);
+                }
+                // A key with no string form *at all* is structurally
+                // malformed and still drops silently -- that is #1194's
+                // territory, unchanged. A key that IS a string but whose
+                // bytes won't decode must not drop: doing so deleted the
+                // whole field, so `to_entries` quietly returned one entry
+                // fewer than the document had (#1247). It can't take part in
+                // dedup -- it has no name to collide on -- so it is kept
+                // aside and appended, which is where a non-deduping format
+                // would have left it anyway. Callers either raise on it
+                // (`to_entries`, `to_owned`) or skip it exactly as before
+                // (`collect_paths_generic` re-tests `key_str`).
+                None if field.key.string_decode_error().is_some() => undecodable.push(field),
+                None => {}
             }
             fields = rest;
         }
-        by_key.into_values().collect()
+        let mut out: Vec<_> = by_key.into_values().collect();
+        out.extend(undecodable);
+        out
     }
 
     /// Count the number of fields.

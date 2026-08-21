@@ -1,6 +1,6 @@
 # Decode-failure error routing for `to_owned`/`cursor_to_owned` (#1247, #1242, #1194)
 
-**Status: partially implemented — Stages 1 and 2 landed, 3–5 outstanding.** This
+**Status: partially implemented — Stages 1–3 landed, 4–6 outstanding.** This
 document is the deliverable for
 [#1247](https://github.com/rust-works/succinctly/issues/1247), which was tiered Tier 3
 ("needs a design decision before implementation, not a same-pattern continuation of the
@@ -392,9 +392,40 @@ and the key to `""` — but the emitted document is parseable. *Why second:* emi
 unparseable output is a correctness bug independent of the whole `to_owned` question, and
 fixing it first means Stage 3's new error paths have a clean sink to fail into.
 
-**Stage 3 — make the `to_owned` family fallible (sites 11–16).** The main change. Wide
-diff, ~53 call sites of which 40 are mechanical. *Why third:* everything it can raise now
-has somewhere correct to go.
+**Stage 3 — make the `to_owned` family fallible (sites 11–16). ✅ landed.** The main
+change. *Why third:* everything it can raise now has somewhere correct to go.
+
+Implementation notes, all discovered while doing it:
+
+- **Detection needed a real signal, not an inference.** The plan assumed the catch-all
+  could infer "decode failure" from `type_name() == "string" && as_str().is_none()`.
+  That works but is indirect, and it re-creates exactly the ambiguity #1191 was about.
+  Added `DocumentValue::string_decode_error() -> Option<&'static str>` instead — a
+  provided method defaulting to `None`, overridden by JSON and YAML — so the two cases
+  `as_str()` conflates ("not a string" vs "a string this document can't hand back") are
+  separable at the source. The message text comes from `JsonError::message` /
+  `YamlStringError::message`, split out of each type's `Display` so there is one
+  definition rather than a second copy at an allocation-free call site.
+- **Three more silent-drop sites, all found by the compiler once the types changed.**
+  `DocumentFields::effective_fields`' dedup walk dropped any field whose key wouldn't
+  decode, so `to_entries` returned one entry fewer than the document had — the field
+  vanished before `to_entries`' own new check could see it. `lazy_keys_array_to_owned`
+  dropped the key from `keys`. `to_owned_with_comments` had the same key guard as its
+  two siblings.
+- **A misleading-error class, not just a silent one.** Every builtin's type dispatch is
+  a chain of `as_str()`/`as_array()`/… tests, so an undecodable string fails all of them
+  and lands in the same `else` as a genuine type mismatch: `.a | length` reported
+  `null (null) has no length` about a perfectly good string token. Added
+  `type_error_or_decode_failure`, used at the seven sites that report such a fall-through,
+  so the cause is named instead of a symptom two steps removed from it.
+- **One sanctioned lossy materialization remains**, `to_owned_for_diagnostic`, for the
+  call sites that materialize a value only to quote it into an error already being
+  raised. Split out as its own function with the rationale in its doc comment, so the
+  surviving lossy call doesn't read as an oversight.
+- **Not everything that looks like a degrade is one.** `length` on an object answers from
+  `fields.len()` without decoding, and `keys_unsorted` streams each key's raw byte span
+  verbatim. Neither loses data — both are the same raw-passthrough class as `jq '.'` —
+  so both were left alone, and the tests say why.
 
 **Stage 4 — the `StandardJson::Error` arms (sites 17–20).** Fixes `[xyz123] → [null]`,
 i.e. #1194's in-scope half. Small once Stage 3 exists.
@@ -403,6 +434,16 @@ i.e. #1194's in-scope half. Small once Stage 3 exists.
 U+FFFD, `yaml validate` grows a UTF-8 check. *Why last:* it is the only stage that adds
 work to every run, so it should be measured against a tree that is otherwise already
 correct, and it can be reverted independently if the perf gate fails.
+
+**Stage 6 — make the YAML streaming path loud (new, split out of Stage 2).** After
+Stages 2 and 3, `succinctly yq -o=json '.'` on a document with a bad *escape* still emits
+`{"b":null}` at exit 0: the streaming transcoder's only error channel is
+`core::fmt::Result`, which carries no message, so Stage 2 could make its output valid but
+not make it raise. Every *materializing* route (a `--arg`-forced DOM, a multi-result
+filter, `to_entries`, `length`) already raises. Closing the gap needs `stream_json_value`
+and its callers to carry a richer error than `fmt::Error` — a contained change, but its
+own one. Stage 5 removes the invalid-UTF-8 half of this case at the input boundary, so
+what Stage 6 is left with is bad escapes only.
 
 ## Non-goals (explicit, to prevent scope creep)
 
