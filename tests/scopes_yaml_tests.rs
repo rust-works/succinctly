@@ -120,7 +120,32 @@ fn pattern_matches_something(root: &Path, pattern: &str) -> bool {
     if !pattern.contains('/') && pattern.contains('*') {
         return matches_bare_wildcard(root, pattern);
     }
+    if let Some((dir, filename_glob)) = pattern.rsplit_once('/') {
+        if filename_glob.contains('*') {
+            return matches_wildcard_in_dir(root, dir, filename_glob);
+        }
+    }
     root.join(pattern).exists()
+}
+
+/// Resolves a `dir/prefix*suffix`-shaped pattern (a single `*` inside the
+/// final path segment, e.g. `"src/bin/succinctly/yq_*.rs"`) against real
+/// files directly inside `dir`.
+fn matches_wildcard_in_dir(root: &Path, dir: &str, filename_glob: &str) -> bool {
+    let Some((prefix, suffix)) = filename_glob.split_once('*') else {
+        return false;
+    };
+    let Ok(entries) = fs::read_dir(root.join(dir)) else {
+        return false;
+    };
+    entries.filter_map(Result::ok).any(|e| {
+        e.path().is_file() && {
+            let name = e.file_name().to_string_lossy().into_owned();
+            name.len() >= prefix.len() + suffix.len()
+                && name.starts_with(prefix)
+                && name.ends_with(suffix)
+        }
+    })
 }
 
 /// Resolves a `/**`-stripped prefix like `src/*/simd` against real
@@ -430,6 +455,27 @@ fn pattern_matches_something_stats_the_concrete_prefix() {
     assert!(pattern_matches_something(root, "src/*/simd/**"));
     assert!(pattern_matches_something(root, "*.md"));
     assert!(!pattern_matches_something(root, "*.rs"));
+}
+
+#[test]
+fn pattern_matches_something_supports_wildcard_filename_in_a_real_dir() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let root = tmp.path();
+    fs::create_dir_all(root.join("src/bin/succinctly")).unwrap();
+    fs::write(root.join("src/bin/succinctly/yq_runner.rs"), "").unwrap();
+
+    assert!(pattern_matches_something(
+        root,
+        "src/bin/succinctly/yq_*.rs"
+    ));
+    assert!(!pattern_matches_something(
+        root,
+        "src/bin/succinctly/xq_*.rs"
+    ));
+    assert!(!pattern_matches_something(
+        root,
+        "src/bin/nonexistent/yq_*.rs"
+    ));
 }
 
 #[test]
