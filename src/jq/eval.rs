@@ -20741,7 +20741,25 @@ fn delete_expr_array_paths(
     // element, and the linear `find`/scan these two used to do never matched,
     // so every sibling walked the whole growing list. 99.9% of a 200,000-element
     // run's samples sat in those two loops.
-    let mut terminal: IndexMap<ArrayStep, bool> = IndexMap::new();
+    //
+    // `IndexSet<ArrayStep>`, not `IndexMap<ArrayStep, bool>`: an earlier form
+    // (both here and in the pre-#1301 `Vec` version) also merged each step's
+    // `optional` flag (`*entry.or_insert(false) |= path[start].optional`) to
+    // cover every occurrence rather than just whichever sibling was inserted
+    // first. That merged bool had no reader -- the one consumer below
+    // (building `owned_keys` for `delete_keys`) already discarded it. Dropped,
+    // not because the flag can never be `true` here (#1331's investigation
+    // found the broader claim that it can't doesn't generalize past this
+    // specific dead-write site -- see `delete_expr_iterate_paths`'s own doc
+    // comment for the narrower, verified version of that claim), but because
+    // deleting a *terminal* index/slice always goes through `delete_keys`,
+    // which already silently skips a step naming nothing to delete
+    // (#415/#477) -- `optional` never had anything left to gate once it
+    // reached this merge, whether or not it was ever `true`. Order-
+    // independence for `del(.[(0,5)], .[5]?)` (either argument order) still
+    // holds: `IndexSet::insert` already dedupes a repeated `step` regardless
+    // of which occurrence's own `?` set the (now-untracked) flag.
+    let mut terminal: IndexSet<ArrayStep> = IndexSet::new();
     let mut groups: IndexMap<ArrayStep, Vec<&[DeleteStep]>> = IndexMap::new();
     for path in paths {
         let step = match &path[start].component {
@@ -20750,12 +20768,7 @@ fn delete_expr_array_paths(
             _ => unreachable!("delete_expr_paths_at only dispatches Index/Slice paths here"),
         };
         if path.len() == start + 1 {
-            // One occurrence of `step` marking it optional is enough to cover
-            // every other occurrence — merge rather than keep only whichever
-            // one was inserted first, which used to make the outcome depend on
-            // argument order (`del(.[(0,5)], .[5]?)` errored or not
-            // depending on which side `.[5]?` was written on).
-            *terminal.entry(step).or_insert(false) |= path[start].optional;
+            terminal.insert(step);
             continue;
         }
         groups.entry(step).or_default().push(*path);
@@ -20779,11 +20792,18 @@ fn delete_expr_array_paths(
         // any comma-grouped `del()` path reaches `flatten_delete_path`, so
         // no `DeleteStep` here can ever carry `optional == true`. Fourth
         // occurrence of this repo's "optional never forced true in nested
-        // calls" bug family (#928, #1003, #1034) -- a sibling instance in
-        // `delete_expr_iterate_paths` below, and the general fix (a
-        // `debug_assert` at `DeleteStep`'s own construction site instead
-        // of a fifth discovery), are tracked separately, out of scope
-        // here.
+        // calls" bug family (#928, #1003, #1034), and a sibling instance
+        // fixed the same way in `delete_expr_iterate_paths` below -- but
+        // #1331's investigation found the *general* form of this claim
+        // (a single `debug_assert` at `DeleteStep`'s own construction
+        // site in `flatten_delete_path`, covering every caller at once)
+        // does not hold: `DeleteStep.optional` genuinely is `true` in
+        // live-reachable input for `yq_del_slice_outcome`'s own internal
+        // use (`del(.a?[1:3])`, confirmed live), a different consumer of
+        // the same field that isn't reached through this comma-grouped
+        // machinery at all. Each site's own version of "is this ever
+        // true here" needs verifying on its own terms, not assumed to
+        // generalize from this one.
         //
         // *Which* sentence comes from `paths[0]` specifically, because jq
         // walks the paths in source order and dies on the first: the
@@ -20848,7 +20868,7 @@ fn delete_expr_array_paths(
     if !terminal.is_empty() {
         let owned_keys: Vec<OwnedValue> = terminal
             .iter()
-            .map(|(step, _)| match step {
+            .map(|step| match step {
                 ArrayStep::Index(idx) => OwnedValue::Int(*idx),
                 ArrayStep::Slice(s, e) => slice::literal_component(*s, *e),
             })
@@ -20881,12 +20901,35 @@ enum ArrayStep {
 /// is nothing to group. Either every path ends here, clearing the whole
 /// container, or every path continues, and each element/value recurses with
 /// the same sibling list.
+///
+/// `paths` here always traces back to [`resolve_dynamic_indexes`]'s own
+/// output, which strips every `Expr::Optional` wrapper via
+/// `strip_resolved_optional` before returning (#1331's own investigation
+/// confirmed this holds for every comma-grouped shape that can reach
+/// `delete_expr_paths_at`/this function at all, live-tested across field,
+/// index, and iterate steps -- including a mixed comma with one computed
+/// and one already-static branch, where `resolve_dynamic_indexes` still
+/// strips the static branch before this function ever sees it). So
+/// `optional` below is always `false` in practice; kept as a live value
+/// (not deleted) rather than hardcoded, with a `debug_assert` verifying the
+/// invariant rather than silently trusting it -- #1331 found that a
+/// sibling claim ("this can never be true") was wrong for a *different*
+/// consumer of the same `DeleteStep.optional` field
+/// ([`yq_del_slice_outcome`]'s own `wrap` closure, reachable via
+/// `del(.a?[1:3])`-shaped input), so this function's own narrower version
+/// of the claim is verified here rather than assumed to generalize.
 fn delete_expr_iterate_paths(
     value: OwnedValue,
     paths: &[&[DeleteStep]],
     start: usize,
 ) -> Result<OwnedValue, EvalError> {
     let optional = paths[0][start].optional;
+    debug_assert!(
+        !optional,
+        "delete_expr_iterate_paths: DeleteStep.optional should always be false here -- \
+         resolve_dynamic_indexes strips Expr::Optional before any comma-grouped del() path \
+         reaches this function (#1331)"
+    );
     if paths[0].len() == start + 1 {
         return match value {
             OwnedValue::Array(mut arr) => {

@@ -15643,6 +15643,41 @@ fn test_1116_chained_scalar_slice_del_with_optional() -> Result<()> {
     Ok(())
 }
 
+/// #1331: unlike the `?`-on-the-slice case above, `.a?[0:1]` puts the `?`
+/// on the *field* preceding the chained slice -- the shape that actually
+/// makes `yq_del_slice_outcome`'s own `DeleteStep.optional` (and its
+/// `wrap` closure) live-true, per #1331's own investigation. `.a` exists
+/// here, so the rewrite still drops it outright either way; this pins the
+/// same observable outcome as the unmarked form, guarding against a
+/// regression in `wrap`'s Optional-preserving rewrite (`Expr::Optional`
+/// wrapped back around the dropped parent key) changing this.
+#[test]
+fn test_1331_field_level_optional_before_chained_slice_del() -> Result<()> {
+    let (out, code) = run_yq_stdin("del(.a?[0:1])", r#"{"a":5,"b":6}"#, &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), r#"{"b":6}"#);
+    Ok(())
+}
+
+/// #1331: a comma of a computed-key branch (needing real path resolution)
+/// alongside an already-static branch carrying its own `?` -- the same
+/// shape `del(.[(0,5)], .[5]?)` that originally motivated merging each
+/// sibling's `optional` flag into `delete_expr_paths_at`'s `terminal`
+/// list (a merge #1331 found had no reader and removed). Both branches
+/// name index 5; deleting it twice (once via the generator, once via the
+/// redundant `?`-marked static index) must not error either way.
+#[test]
+fn test_1331_comma_computed_key_and_static_optional_sibling_dedup() -> Result<()> {
+    let (out, code) = run_yq_stdin(
+        "del(.[(0,5)], .[5]?)",
+        "[0,1,2,3,4,5]",
+        &["-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "[1,2,3,4]");
+    Ok(())
+}
+
 /// del()'s parent-key rule applies to an array target too (#1162 widened it
 /// from #1116's original scalar-only scope) — real yq drops the whole `a`
 /// key, not a partial 2-element range, whatever bounds are given (verified
