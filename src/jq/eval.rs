@@ -10766,10 +10766,20 @@ fn is_yq_field_index_noop_scalar(target: &OwnedValue) -> bool {
 /// the *assignment*-operator check above stays deliberately scoped to
 /// scalars, preserving succinctly's own working array/string
 /// slice-assignment rather than removing it to replicate what looks like a
-/// real-yq gap. `-=`/`*=` *error* instead of no-op'ing (confirmed live, with
-/// odd Go-internal-leak messages not worth replicating) — callers gate
-/// accordingly. `/=`, `%=`, `//=`, and `path(...)` aren't valid real-yq
-/// syntax at all, so there's no oracle to match for those.
+/// real-yq gap. `-=`/`*=` *error* instead of no-op'ing here (confirmed
+/// live, with odd Go-internal-leak messages not worth replicating) —
+/// callers gate accordingly. #1340 code review found this is only true
+/// for a scalar RHS on `*=` (`.b[0:1] *= 5` genuinely errors,
+/// `cannot multiply !!null with !!int`) -- an array RHS on `*=`, and
+/// `-=` with either RHS type, actually no-op with no error at all,
+/// live-verified against yq v4.53.3, but succinctly doesn't implement
+/// that path (its no-op mechanism runs the filter against a throwaway
+/// `[]` and propagates a genuine error when the arithmetic itself is
+/// undefined, e.g. `[] - 5`) -- left as a known, unfixed gap rather than
+/// folded into #1340's own jq-mode-only scope; see its own follow-up
+/// issue. `/=`, `%=`, `//=`, and `path(...)` aren't valid real-yq syntax
+/// at all, so there's no oracle to
+/// match for those.
 ///
 /// `del()`'s *own* bare-root no-op (`builtin_del`'s own call site) does
 /// **not** combine this with a type check the way assignment does — #1162
@@ -11415,11 +11425,13 @@ fn eval_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 ///
 /// `scalar_slice_noop` gates #1101's yq no-op check (see
 /// `is_yq_scalar_slice_assign_path`'s doc comment): `true` for a genuine
-/// `|=` and for `+=` (`AssignOp::Add`), `false` for `-=`/`*=`, which
-/// real yq errors on instead of no-op'ing for this same shape — verified
-/// live, not assumed, since both routes reduce to this same function via
-/// `eval_compound_assign`'s `.p op= v` -> `.p |= (. op v)` rewrite and
-/// would otherwise be indistinguishable once here.
+/// `|=` and for `+=` (`AssignOp::Add`), `false` for `-=`/`*=` — real yq's
+/// own no-op for these two doesn't run through this arm's "filter against
+/// a throwaway `[]`" mechanism at all (#1340 code review: `-=` genuinely
+/// does no-op live, just not via anything this codebase implements yet;
+/// `*=` genuinely errors), so both stay excluded here rather than one of
+/// them silently reaching this arm and erroring in a way this codebase
+/// happens to produce instead of the no-op real yq actually performs.
 fn eval_update<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     path_expr: &Expr,
     filter_expr: &Expr,
@@ -11516,6 +11528,21 @@ fn eval_compound_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // error instead for this same shape) — `eval_update` runs the filter
     // normally either way, only skipping the final write when this is
     // `true` and the resolved target qualifies.
+    //
+    // `-=` looked like it should join `Add` here too (real yq no-ops
+    // `.b[0:1] -= [1]` on an absent `.b` exactly like `+=`) until wider
+    // probing during #1340 code review found it doesn't generalize: real
+    // yq ALSO no-ops `.b[0:1] -= 5` (a *scalar* RHS) with no error at all,
+    // but this arm's own "run the filter against a throwaway `[]`, discard
+    // on success" mechanism (below, `is_yq_slice_empty_container_scalar`)
+    // does not replicate that — `[] - 5` is a genuine, undefined
+    // array-minus-number operation that errors for real, unlike `[] + 5`
+    // which happens to succeed and is what makes `+=`'s reuse of this same
+    // mechanism accidentally correct. Real yq's actual no-op for `-=`
+    // is not "run the filter and discard," it's something this codebase
+    // doesn't implement yet — left as `Add`-only, matching the original
+    // scope, with the corrected understanding recorded on
+    // `through_slice`'s own `Null` arm instead of folded in here.
     eval_update::<W, S>(
         path_expr,
         &filter,
@@ -11852,8 +11879,9 @@ struct SliceEditFlags {
     /// suppressing them via an inline `?`.
     optional: bool,
     /// yq's slice-assignment no-op (#1101/#1116) for a *scalar* target —
-    /// gated by the caller to exclude `-=`/`*=`, which real yq errors on
-    /// instead.
+    /// gated by the caller to exclude `-=`/`*=` (real yq's own behavior
+    /// for both diverges from this mechanism, #1340 — see
+    /// `eval_compound_assign`'s doc comment for the detail).
     scalar_noop: bool,
     /// yq's slice-assignment no-op (#1101/#1116/#1142) for a *container*
     /// (array/string) target — unconditional on the operator, unlike
@@ -11956,19 +11984,25 @@ fn through_slice<E: From<EvalError>>(
         // internal model, #1119's `eval_update` follow-up) so its own
         // errors/halt/break still propagate; only the write to `root` is
         // skipped. Callers gate `scalar_noop` to `false` for `-=`/`*=`,
-        // which real yq errors on instead (confirmed live).
+        // which real yq errors on instead (confirmed live for `*=`;
+        // #1340 code review found real yq actually no-ops `-=` with no
+        // error at all, but this arm's own "run the filter against `[]`"
+        // mechanism can't replicate that -- `[] - 5` is a real,
+        // undefined array-minus-number operation that errors here, unlike
+        // `[] + 5` which happens to succeed and is what makes `+=`'s
+        // identical mechanism accidentally correct. Left as a known,
+        // unfixed gap -- see #1340's own follow-up).
         _ if scalar_noop && is_yq_slice_empty_container_scalar(root) => {
             let mut throwaway = OwnedValue::Array(Vec::new());
             edit(&mut throwaway)?;
             Ok(())
         }
-        // A `Null` target that reaches here (jq mode, or a yq operator that
-        // doesn't no-op — the arm above already claimed every yq-mode
-        // `Null`) still needs a real attempt, not a silent skip: real jq
-        // auto-vivifies a null slice target exactly like `setpath()`'s own
-        // `set_value_at_path` walker already does (#1340, confirmed live:
-        // `null | setpath([{"start":0,"end":1},"c"]; 9)` and this arm raise
-        // the identical "A slice of an array can only be assigned another
+        // A `Null` target that reaches here in *jq* mode still needs a
+        // real attempt, not a silent skip: real jq auto-vivifies a null
+        // slice target exactly like `setpath()`'s own `set_value_at_path`
+        // walker already does (#1340, confirmed live: `null |
+        // setpath([{"start":0,"end":1},"c"]; 9)` and this arm raise the
+        // identical "A slice of an array can only be assigned another
         // array"). `edit` runs against a fresh `Null`, not an empty array,
         // so a mid-chain field step recurses into *its own*
         // auto-vivification (`Null` -> object) rather than immediately
@@ -11982,7 +12016,20 @@ fn through_slice<E: From<EvalError>>(
         // confirmed live) — `slice_assign_non_array()` is a write-time
         // application error, the same family `set_path`'s own
         // `Expr::Optional` arm already carves out of `?`'s reach.
-        OwnedValue::Null => {
+        //
+        // Gated on `!container_noop` (i.e. jq mode -- `container_noop` is
+        // `S::TAG == EvalTag::Yq` unconditionally, per every call site
+        // below) rather than firing unconditionally: an earlier version of
+        // this arm ran for yq mode too whenever the arm above didn't claim
+        // it (i.e. for `-=`/`*=`, both `scalar_noop == false`), which
+        // #1340 code review caught -- yq never auto-vivifies a null slice
+        // target the way jq does, so a yq-mode `Null` that isn't the
+        // arm-above's no-op has to fall through to the same catch-all
+        // every other unhandled yq shape here already does, leaving
+        // `-=`/`*=` on a null slice target exactly as unaffected by this
+        // fix as `#1340`'s own issue text was ever scoped to be (jq mode
+        // only) — not newly right, but not newly wrong either.
+        OwnedValue::Null if !container_noop => {
             let mut sub = OwnedValue::Null;
             edit(&mut sub)?;
             let OwnedValue::Array(items) = sub else {
@@ -12267,8 +12314,9 @@ fn update_path<S: EvalSemantics>(
                 // above (which is `container_noop`'s slice-only, #1101
                 // sibling, gated `false` for `-=`/`*=`) -- live-verified
                 // real yq no-ops `.a -= 1`/`.a *= 1` on a scalar root just
-                // the same as `.a |= f`, unlike the slice case where those
-                // two operators genuinely error instead.
+                // the same as `.a |= f`, unlike the slice case, which
+                // diverges for both operators in ways this codebase
+                // doesn't implement yet (#1340's own follow-up).
                 || (S::TAG == EvalTag::Yq && is_yq_field_index_noop_scalar(root))
             {
                 Ok(())
@@ -43844,6 +43892,41 @@ mod tests {
         yq_query!(br#"{"c":0}"#, r"(.b[0:1]? | .c) = 9",
             QueryResult::Error(e) => {
                 assert_eq!(e.message, r#"Cannot index array with string "c""#);
+            }
+        );
+    }
+
+    /// #1340 code review: an initial version of this fix's new `Null`
+    /// arm fired unconditionally, so yq's `-=`/`*=` (both `scalar_noop ==
+    /// false`, unclaimed by the arm above) fell into it too and started
+    /// attempting jq-style auto-vivification instead of their own,
+    /// different (already broken, pre-existing) yq behavior -- the arm is
+    /// now gated on `!container_noop` (jq mode only) specifically so this
+    /// can't happen. Pins that `-=`/`*=` on a null slice target, terminal
+    /// or mid-chain, are byte-for-byte identical to the pre-#1340-fix
+    /// baseline (verified against a build of `main` before this PR).
+    #[test]
+    fn test_assign_slice_mid_chain_null_target_yq_mode_sub_mul_unaffected_1340() {
+        for op in ["-=", "*="] {
+            yq_query!(br#"{"c":0}"#, &format!(".b[0:1] {op} 5"),
+                QueryResult::Error(e) => {
+                    assert_eq!(e.message, "Cannot index null with object");
+                }
+            );
+            yq_query!(br#"{"c":0}"#, &format!(".b[0:1].c {op} 9"),
+                QueryResult::Error(e) => {
+                    assert_eq!(e.message, "Cannot index null with object");
+                }
+            );
+        }
+        // jq mode is structurally unaffected either way: `scalar_slice_noop`
+        // only ever reaches `through_slice` gated by `S::TAG == EvalTag::Yq`
+        // (`eval_update`), and the new `Null` arm's own `!container_noop`
+        // guard is the same gate in the opposite direction -- both leave jq
+        // mode exactly as it already was.
+        query!(br#"{"c":0}"#, r".b[0:1] -= [1]",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "null (null) and array ([1]) cannot be subtracted");
             }
         );
     }
