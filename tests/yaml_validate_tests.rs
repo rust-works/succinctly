@@ -235,3 +235,41 @@ fn yq_without_validate_accepts_the_same_invalid_yaml() -> Result<()> {
     assert_eq!(code, 0);
     Ok(())
 }
+
+/// #1242: the strict YAML validator had no encoding check at all, so a
+/// document with a stray non-UTF-8 byte validated clean (exit 0) and then
+/// produced a scalar nothing could decode. The JSON validator has always
+/// checked this; the YAML one only walked the grammar over raw bytes.
+///
+/// Written as a file rather than through stdin because the helper takes
+/// `&str` and this input is deliberately not valid UTF-8.
+#[test]
+fn test_yaml_validate_rejects_invalid_utf8_1242() -> Result<()> {
+    let mut file = NamedTempFile::new()?;
+    file.write_all(b"a: 1\nb: \"x\xe4y\"\n")?;
+    file.flush()?;
+
+    let (_, stderr, code) = run_validate_file(file.path().to_str().unwrap(), &[])?;
+    assert_eq!(code, 1, "stderr: {stderr}");
+    assert!(
+        stderr.contains("UTF-8"),
+        "should name the encoding failure: {stderr}"
+    );
+    // Same byte offset real yq reports for this document (`offset 11`),
+    // rendered as the 1-based line/column this CLI uses everywhere else.
+    assert!(
+        stderr.contains("2:7"),
+        "should locate the offending byte: {stderr}"
+    );
+    Ok(())
+}
+
+/// #1242 guard: a document that is valid UTF-8 but uses multi-byte
+/// characters must still validate clean -- the new pass must not reject
+/// ordinary non-ASCII content.
+#[test]
+fn test_yaml_validate_accepts_multibyte_utf8_1242() -> Result<()> {
+    let (_, stderr, code) = run_validate_stdin("a: café\nb: 日本語\nc: 😀\n", &[])?;
+    assert_eq!(code, 0, "stderr: {stderr}");
+    Ok(())
+}
