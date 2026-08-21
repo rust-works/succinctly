@@ -33,7 +33,7 @@ use super::eval::{
 };
 use super::expr::{Builtin, Expr, FormatType};
 use super::slice::{slice_str, SliceBounds};
-use super::value::{NumberRepr, OwnedValue};
+use super::value::{parse_i64_or_f64, NumberRepr, OwnedValue};
 use crate::json::JsonIndex;
 
 /// Recursion-depth ceiling for [`to_owned`]/[`to_owned_cursor`]/
@@ -163,6 +163,87 @@ fn to_owned_at_depth<V: DocumentValue>(value: &V, depth: usize) -> OwnedValue {
         // copy of this conversion and to object/mapping keys too (see
         // #1098's own follow-up discussion) -- deferred as a properly
         // scoped design item rather than shipped as a panic.
+        OwnedValue::Null
+    }
+}
+
+/// Like [`to_owned`], but for a source that never preserves a number's
+/// exact spelling.
+///
+/// Real `yq`'s own `--input-format json` path (#978) collapses every
+/// number straight to `Int`/`Float` regardless of whether the filter
+/// touches it (or to `Null` on parse failure, matching
+/// [`OwnedValue::from_number_literal`]'s own fallback) instead of the
+/// `NumberLiteral` variant `to_owned` uses.
+///
+/// #999: `yq_runner::parse_input`'s JSON arm used to call `to_owned`
+/// (materializing every number as `NumberLiteral`, allocating a `Box<str>`
+/// per number to hold a spelling nothing downstream needed) and then walk
+/// the *entire* resulting tree a second time (`canonicalize_json_numbers`,
+/// rebuilding every `Array`/`Object` along the way, even subtrees with no
+/// numbers at all) just to strip that spelling back off. This does the
+/// same single walk `to_owned_at_depth` does, but never constructs the
+/// `NumberLiteral` variant in the first place, collapsing that into one
+/// pass.
+///
+/// A genuinely separate sibling of [`to_owned_at_depth`], not that function
+/// with an added `canonicalize: bool` parameter -- `to_owned_at_depth` is
+/// also called from this evaluator's own internal recursion (YAML explicit-
+/// tag resolution, `to_owned_cursor_at_depth`'s fallback a few functions
+/// up), which must keep preserving a document's own number spelling
+/// unconditionally; threading a flag through the shared function would risk
+/// a future internal call site silently inheriting `canonicalize: true` by
+/// copy-paste, breaking that guarantee outside the one JSON-input-parse
+/// call site meant to opt into it.
+pub fn to_owned_canonicalized_numbers<V: DocumentValue>(value: &V) -> OwnedValue {
+    to_owned_canonicalized_numbers_at_depth(value, 0)
+}
+
+fn to_owned_canonicalized_numbers_at_depth<V: DocumentValue>(
+    value: &V,
+    depth: usize,
+) -> OwnedValue {
+    assert_nesting_depth(depth);
+    if let Some(fields) = value.as_object() {
+        let mut map = IndexMap::new();
+        let mut f = fields;
+        while let Some((field, rest)) = f.uncons() {
+            if let Some(key) = field.key_str() {
+                map.insert(
+                    key.into_owned(),
+                    to_owned_canonicalized_numbers_at_depth(&field.value, depth + 1),
+                );
+            }
+            f = rest;
+        }
+        OwnedValue::Object(map)
+    } else if let Some(elements) = value.as_array() {
+        let mut items = Vec::new();
+        let mut elems = elements;
+        while let Some((elem, rest)) = elems.uncons() {
+            items.push(to_owned_canonicalized_numbers_at_depth(&elem, depth + 1));
+            elems = rest;
+        }
+        OwnedValue::Array(items)
+    } else if value.is_null() {
+        OwnedValue::Null
+    } else if let Some(b) = value.as_bool() {
+        OwnedValue::Bool(b)
+    } else if let Some(literal) = value.number_literal() {
+        match parse_i64_or_f64(&literal) {
+            Some(NumberRepr::Int(i)) => OwnedValue::Int(i),
+            Some(NumberRepr::Float(f)) => OwnedValue::Float(f),
+            None => OwnedValue::Null,
+        }
+    } else if let Some(i) = value.as_i64() {
+        OwnedValue::Int(i)
+    } else if let Some(f) = value.as_f64() {
+        OwnedValue::Float(f)
+    } else if let Some(s) = value.as_str() {
+        OwnedValue::String(s.into_owned())
+    } else {
+        // See `to_owned_at_depth`'s own `else` arm doc comment (#1098) --
+        // identical reasoning, unaffected by number canonicalization.
         OwnedValue::Null
     }
 }
@@ -9800,6 +9881,73 @@ mod tests {
             result.is_err(),
             "owned_from_standard_json should panic at depth 256"
         );
+    }
+
+    /// #999: `to_owned_canonicalized_numbers` is a genuinely separate
+    /// recursion from `to_owned` (not that function with a flag), so its
+    /// own `assert_nesting_depth` call needed its own pinning test rather
+    /// than relying on `to_owned_panics_past_nesting_depth_limit_998` above
+    /// to cover it by proxy -- same limit, same construction, its own guard.
+    #[test]
+    fn to_owned_canonicalized_numbers_panics_past_nesting_depth_limit_999() {
+        let json = linear_nest(255);
+        let index = JsonIndex::build(json.as_bytes());
+        let cursor = index.root(json.as_bytes());
+        let owned = to_owned_canonicalized_numbers(&cursor.value());
+        assert!(matches!(owned, OwnedValue::Object(_)));
+
+        let json = linear_nest(256);
+        let index = JsonIndex::build(json.as_bytes());
+        let cursor = index.root(json.as_bytes());
+        let value = cursor.value();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            to_owned_canonicalized_numbers(&value)
+        }));
+        assert!(
+            result.is_err(),
+            "to_owned_canonicalized_numbers should panic at depth 256"
+        );
+    }
+
+    /// #999: `to_owned_canonicalized_numbers` collapses every number
+    /// straight to `Int`/`Float`, unlike `to_owned`'s `NumberLiteral` --
+    /// pins the exact behavior the fused single-pass replaces
+    /// `to_owned` + `canonicalize_json_numbers`'s two-pass sequence with
+    /// (`yq_cli_tests.rs`'s golden/CLI tests cover the end-to-end CLI
+    /// behavior; this pins the library function's own contract directly,
+    /// including the parse-failure fallback).
+    #[test]
+    fn to_owned_canonicalized_numbers_collapses_number_literals() {
+        let json = br#"{"int": 1, "float": 1.50, "exp": 1e2, "neg": -3, "arr": [1.0, 2], "s": "x", "b": true, "n": null}"#;
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let owned = to_owned_canonicalized_numbers(&cursor.value());
+        let OwnedValue::Object(map) = owned else {
+            panic!("expected an object")
+        };
+        assert_eq!(map.get("int"), Some(&OwnedValue::Int(1)));
+        assert_eq!(map.get("float"), Some(&OwnedValue::Float(1.5)));
+        assert_eq!(map.get("exp"), Some(&OwnedValue::Float(100.0)));
+        assert_eq!(map.get("neg"), Some(&OwnedValue::Int(-3)));
+        assert_eq!(
+            map.get("arr"),
+            Some(&OwnedValue::Array(vec![
+                OwnedValue::Float(1.0),
+                OwnedValue::Int(2)
+            ]))
+        );
+        assert_eq!(map.get("s"), Some(&OwnedValue::String("x".to_string())));
+        assert_eq!(map.get("b"), Some(&OwnedValue::Bool(true)));
+        assert_eq!(map.get("n"), Some(&OwnedValue::Null));
+
+        // No `NumberLiteral` anywhere in the result -- every number
+        // collapsed, unlike `to_owned`'s own output for the same input.
+        for v in map.values() {
+            assert!(
+                !matches!(v, OwnedValue::NumberLiteral(..)),
+                "found a NumberLiteral in canonicalized output: {v:?}"
+            );
+        }
     }
 
     /// #1192: unlike `to_owned`/`to_owned_cursor` (this file, still silently
