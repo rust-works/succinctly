@@ -372,6 +372,10 @@ measured slice-by-slice rather than as one combined change.
    carve-outs (the `bare_navigation_primitive` check, the `is_untracked_navigation_error`
    distinction) that a mechanical "just propagate whatever came in" migration could silently
    break — read that arm's own doc comment in full before touching it.
+   `Expr::As`'s own gap (a variable bound *outside* `path(...)`'s argument, or from a source
+   that isn't a syntactic passthrough of `.`, losing trackability across the binding) was closed
+   by #844 — see `is_identity_passthrough` and `resolve_node`'s `Expr::TrackedVar` arm in
+   `src/jq/eval.rs`. The others in this list remain open.
 5. **`del`/assignment write-path semantics**, not just `path()`'s read-only output. #972's own
    revert (on a related but different fix in this same code region) was specifically about
    silent data corruption on the write path once multi-key index/slice fan-outs were involved.
