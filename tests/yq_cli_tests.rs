@@ -14772,6 +14772,217 @@ fn test_yq_iterate_assign_scalar_jq_mode_unaffected_1181() -> Result<()> {
     Ok(())
 }
 
+/// #1233: real yq's field/index/iterate scalar-target no-op (#1181) discards
+/// the RHS/filter entirely, not just the write -- `=` and every compound
+/// operator that pre-evaluates a value (`+=`/`-=`/`*=`/`//=`) previously
+/// still evaluated (and propagated an error from) the RHS before finding
+/// out the write itself was going to no-op. `|=` was already correct
+/// (`update_path`'s filter is lazy per resolved path), pinned as a
+/// regression guard alongside the fixed operators. Also covers `?`
+/// transparency (`.a?`/`.a.b?`), found live while closing this fix's own
+/// coverage gaps -- `yq_assign_is_total_noop` initially had no
+/// `Expr::Optional`/`Paren` handling at all, missing both shapes. Every
+/// shape verified live against yq v4.53.3.
+#[test]
+fn test_yq_scalar_target_noop_discards_rhs_1233() -> Result<()> {
+    // The issue's own root-scalar repro, plus every operator that shares
+    // eval_rhs_once's eager-evaluation mechanism.
+    for op in ["=", "+=", "-=", "*=", "//="] {
+        let (out, err, code) =
+            run_yq_stdin_with_stderr(&format!(".a {op} error(\"boom\")"), "5\n", &["-o", "json"])?;
+        assert_eq!(code, 0, "op={op} err={err}");
+        assert_eq!(out.trim(), "5", "op={op}");
+    }
+
+    // A multi-output RHS -- the whole call still no-ops, the mid-stream
+    // error never even runs.
+    let (out, err, code) =
+        run_yq_stdin_with_stderr(".a = (1, error(\"x\"), 3)", "5\n", &["-o", "json"])?;
+    assert_eq!(code, 0, "err={err}");
+    assert_eq!(out.trim(), "5");
+
+    // `.[] = v` on a scalar root -- the Iterate-terminal shape, not just
+    // Field/Index.
+    let (out, err, code) = run_yq_stdin_with_stderr(".[] = error(\"b\")", "5\n", &["-o", "json"])?;
+    assert_eq!(code, 0, "err={err}");
+    assert_eq!(out.trim(), "5");
+
+    // Nested: the scalar is reached through a real container prefix, not
+    // just at the root.
+    let (out, err, code) =
+        run_yq_stdin_with_stderr(".a.b = error(\"boom\")", "a: 5\n", &["-o", "json", "-I0"])?;
+    assert_eq!(code, 0, "err={err}");
+    assert_eq!(out.trim(), r#"{"a":5}"#);
+
+    // `?` wrapping the whole path is transparent -- `.a?` on a scalar root
+    // no-ops the same as bare `.a`.
+    let (out, err, code) =
+        run_yq_stdin_with_stderr(".a? = error(\"boom\")", "5\n", &["-o", "json"])?;
+    assert_eq!(code, 0, "err={err}");
+    assert_eq!(out.trim(), "5");
+
+    // `?` wrapping just the terminal component of a chain is transparent
+    // too -- `.a.b?` no-ops the same as `.a.b` when `.a` is the scalar.
+    let (out, err, code) =
+        run_yq_stdin_with_stderr(".a.b? = error(\"boom\")", "a: 5\n", &["-o", "json", "-I0"])?;
+    assert_eq!(code, 0, "err={err}");
+    assert_eq!(out.trim(), r#"{"a":5}"#);
+
+    // `|=` was already correct -- regression guard, not a new capability.
+    let (out, err, code) =
+        run_yq_stdin_with_stderr(".a |= error(\"boom\")", "5\n", &["-o", "json"])?;
+    assert_eq!(code, 0, "err={err}");
+    assert_eq!(out.trim(), "5");
+
+    // A real write (autovivify through `null`) must still evaluate and
+    // propagate the RHS -- this is not a no-op target.
+    let (_out, err, code) =
+        run_yq_stdin_with_stderr(".a = error(\"boom\")", "null\n", &["-o", "json"])?;
+    assert_ne!(code, 0);
+    assert!(err.contains("boom"), "err={err}");
+
+    // jq mode is unaffected -- the same query still hard-errors.
+    let (_out, err, code) = run_jq_stdin_with_stderr(".a = error(\"boom\")", "5", &["-c"])?;
+    assert_ne!(code, 0);
+    assert!(err.contains("boom"), "err={err}");
+
+    Ok(())
+}
+
+/// #1233 (deliberate non-goal, matching the issue's own plan): a scalar
+/// reached *before* the last path component (`.a.b.c` where `.a` is
+/// already the scalar) is #1232's own territory, not this fix's --
+/// `yq_assign_is_total_noop` only walks a resolved path's own prefix
+/// against the *original* root, so a path whose write-time no-op depth
+/// #1232 hasn't widened yet simply doesn't qualify here either, and this
+/// fix doesn't change that. Live-verified this still (unrelated to #1233)
+/// errors in real yq too, for the wrong reason (yq's error message differs
+/// from succinctly's) -- both are "still broken pending #1232", not a
+/// regression.
+#[test]
+fn test_yq_scalar_target_noop_pre_last_component_is_1232_territory_1233() -> Result<()> {
+    let (_out, err, code) =
+        run_yq_stdin_with_stderr(".a.b.c = error(\"boom\")", "a: 5\n", &["-o", "json"])?;
+    assert_ne!(code, 0);
+    assert!(err.contains("boom"), "err={err}");
+    Ok(())
+}
+
+/// #1233: `push_path_components` (the flattener `yq_assign_is_total_noop`
+/// uses) treats a bare `Expr::Identity` step as a no-op and drops it
+/// entirely, so a chain ending in `| .` (`(.a | .) = v`) flattens to
+/// exactly the same components as `.a` alone -- not, as an earlier draft
+/// of this test assumed, a shape the terminal-shape check rejects. Since
+/// `.a` on `{"a":5}` is a genuine write (the root is a container, not a
+/// no-op target), both spellings correctly evaluate the RHS here; the
+/// no-op case (where the trailing `| .` sits after a scalar-target chain)
+/// is covered by the sibling test below.
+#[test]
+fn test_yq_trailing_identity_in_chain_flattens_away_1233() -> Result<()> {
+    // `.a` on a container root is a real write either way -- confirms
+    // `(.a | .)` isn't spuriously treated as ineligible, it's genuinely
+    // the same (non-no-op) target as bare `.a`.
+    for query in [".a = error(\"boom\")", "(.a | .) = error(\"boom\")"] {
+        let (_out, err, code) = run_yq_stdin_with_stderr(query, "a: 5\n", &["-o", "json"])?;
+        assert_ne!(code, 0, "query={query}");
+        assert!(err.contains("boom"), "query={query} err={err}");
+    }
+
+    // A trailing `| .` after a genuinely scalar-target chain still no-ops,
+    // confirming the flattening (not just the terminal shape) is what
+    // makes the two spellings agree.
+    for query in [".a.b = error(\"boom\")", "(.a.b | .) = error(\"boom\")"] {
+        let (out, err, code) = run_yq_stdin_with_stderr(query, "a: 5\n", &["-o", "json", "-I0"])?;
+        assert_eq!(code, 0, "query={query} err={err}");
+        assert_eq!(out.trim(), r#"{"a":5}"#, "query={query}");
+    }
+
+    Ok(())
+}
+
+/// #1233: bare `. = v` (`Expr::Identity` as the *whole* resolved path,
+/// with an empty flattened list) is a direct overwrite of the root, not
+/// indexing into anything -- `yq_assign_is_total_noop`'s own
+/// `flat.split_last()` returning `None` covers exactly this case.
+#[test]
+fn test_yq_bare_identity_path_is_not_a_noop_1233() -> Result<()> {
+    let (_out, err, code) =
+        run_yq_stdin_with_stderr(". = error(\"boom\")", "5\n", &["-o", "json"])?;
+    assert_ne!(code, 0);
+    assert!(err.contains("boom"), "err={err}");
+    Ok(())
+}
+
+/// #1233 (code review): a nested `Pipe` inside the resolved path must
+/// answer the no-op question identically to the equivalent flat chain --
+/// `(.a|.b)[0] = v` and `.a.b[0] = v` are the same write target
+/// (`get_path_mut` already flattens both the same way, post-#1287/#1294),
+/// so `yq_assign_is_total_noop` must too. An earlier version of this fix
+/// matched `path` directly (bare component vs. already-flat `Expr::Pipe`)
+/// and handed the *raw*, unflattened components to `navigate_read_only`,
+/// which silently disagreed with itself on these two spellings --
+/// `.a.b[0] = error(...)` correctly no-op'd while `(.a|.b)[0] = error(...)`
+/// didn't, even though the actual *write* (verified below with a
+/// non-erroring RHS) is identical for both. Fixed by flattening via
+/// `push_path_components` (the same flattener `split_at_slice` already
+/// uses) before any check runs, mirroring the "mirroring a precedent
+/// without its fix" lesson `get_path_mut`'s own #1287/#1294 splice
+/// already had to learn once for the write side.
+#[test]
+fn test_yq_nested_pipe_in_resolved_path_matches_flat_chain_1233() -> Result<()> {
+    for query in [".a.b[0] = error(\"boom\")", "(.a|.b)[0] = error(\"boom\")"] {
+        let (out, err, code) =
+            run_yq_stdin_with_stderr(query, "a:\n  b: 5\n", &["-o", "json", "-I0"])?;
+        assert_eq!(code, 0, "query={query} err={err}");
+        assert_eq!(out.trim(), r#"{"a":{"b":5}}"#, "query={query}");
+    }
+
+    // Sanity: a non-erroring RHS confirms both spellings agree on the
+    // *write* too (both no-op it, matching #1181 -- `.a.b` is the scalar
+    // `5`, not an array, so `[0]` never gets a real target either way),
+    // not just on whether an error happens to surface.
+    for query in [".a.b[0] = 99", "(.a|.b)[0] = 99"] {
+        let (out, err, code) =
+            run_yq_stdin_with_stderr(query, "a:\n  b: 5\n", &["-o", "json", "-I0"])?;
+        assert_eq!(code, 0, "query={query} err={err}");
+        assert_eq!(out.trim(), r#"{"a":{"b":5}}"#, "query={query}");
+    }
+
+    Ok(())
+}
+
+/// #1233: the slice no-op (#1101/#1116) is a *different* mechanism that
+/// only skips the write, never the RHS -- `yq_assign_is_total_noop`
+/// deliberately excludes a slice-terminal path (`split_at_slice` checked
+/// first) so this fix's own no-op never accidentally swallows a slice
+/// assignment's genuinely-propagating error.
+#[test]
+fn test_yq_slice_assign_scalar_noop_still_propagates_rhs_error_unaffected_by_1233() -> Result<()> {
+    let (_out, err, code) =
+        run_yq_stdin_with_stderr(".[0:1] = error(\"boom\")", "5\n", &["-o", "json"])?;
+    assert_ne!(code, 0);
+    assert!(err.contains("boom"), "err={err}");
+    Ok(())
+}
+
+/// #1233 (deliberate non-goal, filed as #1412): a comma-grouped LHS where
+/// one branch is a genuine write must still evaluate (and propagate an
+/// error from) the RHS -- `yq_assign_is_total_noop`'s own gate
+/// (`!needs_path_prepass`) excludes every `Comma`-containing path from the
+/// fast path entirely, so this is really a regression guard on the
+/// *unchanged* existing flow, not new behavior.
+#[test]
+fn test_yq_comma_lhs_mixed_noop_and_real_write_still_evaluates_rhs_1233() -> Result<()> {
+    let (_out, err, code) = run_yq_stdin_with_stderr(
+        "(.a.x, .b.x) = error(\"boom\")",
+        "a: 5\nb: {}\n",
+        &["-o", "json"],
+    )?;
+    assert_ne!(code, 0);
+    assert!(err.contains("boom"), "err={err}");
+    Ok(())
+}
+
 // ============================================================================
 // @urid / @base64d scalar-stringification (#1109)
 // ============================================================================
