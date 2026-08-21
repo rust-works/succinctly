@@ -1206,7 +1206,7 @@ impl OwnedValue {
         Self::from_number_literal_boxed(literal.into())
     }
 
-    /// Like [`from_number_literal`](Self::from_number_literal), but parses
+    /// Like `from_number_literal` (private, this file only), but parses
     /// straight to a plain `Int`/`Float` (or [`Null`](Self::Null) on parse
     /// failure, same fallback) without ever wrapping `literal` in
     /// [`NumberLiteral`](Self::NumberLiteral) first.
