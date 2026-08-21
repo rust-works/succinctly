@@ -1020,7 +1020,16 @@ impl<'a, W: AsRef<[u64]>> JsonFields<'a, W> {
         let mut result = None;
         while let Some((field, rest)) = fields.uncons() {
             if let StandardJson::String(key) = field.key() {
-                if key.as_str().ok()? == name {
+                // An undecodable key (invalid UTF-8, an invalid escape, an
+                // invalid `\u` codepoint) is *skipped*, not treated as the
+                // end of the search. This `?` used to return from `find`
+                // itself, so a single such key hid every field after it from
+                // lookup -- `.b` answered `null` on `{"\ud800":1,"b":2}` --
+                // while `keys`/`length`, which don't decode, still reported
+                // them (#1247). Surfacing the decode failure as a real
+                // `EvalError` is tracked separately; this only stops one bad
+                // key destroying valid results.
+                if key.as_str().is_ok_and(|k| k == name) {
                     result = Some(field.value());
                 }
             }
@@ -1039,7 +1048,8 @@ impl<'a, W: AsRef<[u64]>> JsonFields<'a, W> {
         let mut result = None;
         while let Some((field, rest)) = fields.uncons() {
             if let StandardJson::String(key) = field.key() {
-                if key.as_str().ok()? == name {
+                // Same undecodable-key skip as `find` above (#1247).
+                if key.as_str().is_ok_and(|k| k == name) {
                     result = Some(field.value_cursor());
                 }
             }
@@ -2658,6 +2668,38 @@ mod tests {
                 }
             }
             _ => panic!("expected object"),
+        }
+    }
+
+    /// #1247: an object key that fails to decode must not end the field
+    /// search. `find`/`find_cursor` used to `?` out of the whole function on
+    /// the first undecodable key, so every *valid* field after it became
+    /// invisible to lookup -- `.b` answered `null` on `{"\ud800":1,"b":2}`
+    /// even though `keys`/`length`, which never decode, still reported `b`.
+    #[test]
+    fn test_object_find_skips_undecodable_key_1247() {
+        // Both halves of "fails to decode": an unpaired surrogate escape and
+        // a raw invalid UTF-8 byte. Each is a structurally valid `String`
+        // token that `as_str()` rejects.
+        let cases: [&[u8]; 2] = [br#"{"\ud800": 1, "b": 2}"#, b"{\"\xff\": 1, \"b\": 2}"];
+        for json in cases {
+            let index = JsonIndex::build(json);
+            let root = index.root(json);
+
+            let StandardJson::Object(fields) = root.value() else {
+                panic!("expected object");
+            };
+            match fields.find("b") {
+                Some(StandardJson::Number(n)) => assert_eq!(n.as_i64().unwrap(), 2),
+                other => panic!("expected number 2, got {other:?}"),
+            }
+            let cursor = fields
+                .find_cursor("b")
+                .expect("find_cursor should reach b past an undecodable key");
+            match cursor.value() {
+                StandardJson::Number(n) => assert_eq!(n.as_i64().unwrap(), 2),
+                other => panic!("expected number 2, got {other:?}"),
+            }
         }
     }
 

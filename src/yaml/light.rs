@@ -4277,7 +4277,12 @@ impl<'a, W: AsRef<[u64]>> YamlFields<'a, W> {
         let mut result = None;
         while let Some((field, rest)) = fields.uncons() {
             if let YamlValue::String(key) = field.key() {
-                if key.as_str().ok()? == name {
+                // Same undecodable-key skip as `JsonFields::find` in
+                // `src/json/light.rs` -- see that function for the full
+                // rationale (#1247). A mapping key that fails to decode is
+                // skipped rather than ending the search, so it can no longer
+                // hide valid later fields from lookup.
+                if key.as_str().is_ok_and(|k| k == name) {
                     result = Some(field.value());
                 }
             }
@@ -4296,7 +4301,9 @@ impl<'a, W: AsRef<[u64]>> YamlFields<'a, W> {
         let mut result = None;
         while let Some((field, rest)) = fields.uncons() {
             if let YamlValue::String(key) = field.key() {
-                if key.as_str().ok()? == name {
+                // Same undecodable-key skip as `find` above (#1247); see
+                // `JsonFields::find` in `src/json/light.rs` for the rationale.
+                if key.as_str().is_ok_and(|k| k == name) {
                     result = Some(field.value_cursor());
                 }
             }
@@ -7480,6 +7487,36 @@ mod tests {
             }
         } else {
             panic!("expected mapping");
+        }
+    }
+
+    #[test]
+    fn test_mapping_find_skips_undecodable_key_1247() {
+        // A key carrying a dangling non-continuable UTF-8 byte is a
+        // structurally valid scalar that `as_str()` cannot decode. It used to
+        // `?` out of `find` entirely, hiding the *valid* `b: 2` after it, so
+        // `.b` answered `null` while `keys` still listed `b` (#1247).
+        let yaml = b"\"a\xe4b\": 1\nb: 2\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let root = index.root(yaml);
+
+        let YamlValue::Mapping(fields) = first_doc(root) else {
+            panic!("expected mapping");
+        };
+        // Deliberately not `{other:?}` in these panics: `YamlValue`'s `Debug`
+        // reaches the shared index and prints it whole.
+        if let Some(YamlValue::String(s)) = fields.find("b") {
+            assert_eq!(&*s.as_str().unwrap(), "2");
+        } else {
+            panic!("find should reach b past an undecodable key");
+        }
+        let cursor = fields
+            .find_cursor("b")
+            .expect("find_cursor should reach b past an undecodable key");
+        if let YamlValue::String(s) = cursor.value() {
+            assert_eq!(&*s.as_str().unwrap(), "2");
+        } else {
+            panic!("find_cursor should reach the string scalar \"2\"");
         }
     }
 
