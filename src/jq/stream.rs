@@ -29,7 +29,7 @@ use super::value::{
     assert_value_tree_depth, format_number_jq_compat, infinite_float_preview_text,
     jq_bare_float_display, NumberRepr, OwnedValue,
 };
-use crate::yaml::{format_float_with_fraction, format_float_yq, format_float_yq_yaml};
+use crate::yaml::{format_float_with_fraction, format_float_yq_yaml, format_float_yq_yaml_nested};
 
 /// A value that can be streamed directly to output without intermediate allocation.
 ///
@@ -623,28 +623,22 @@ fn stream_owned_value_yaml_at_depth<W: core::fmt::Write>(
             out.write_str(super::nonfinite_display_string::<super::YqSemantics>(*f))
         }
         // Mirrors `emit_yaml_value_at_depth`'s identical depth split
-        // (yq_runner.rs, issue #949): real yq drops a computed whole
-        // float's decimal point only at document-root scalar position,
-        // and tags it (`!!float`) everywhere else to keep its type
-        // unambiguous on reparse -- a mechanism succinctly has no way to
-        // emit, so `format_float_yq`'s decimal-preserving fallback is the
-        // safer of the two available choices below root (also matching
-        // `emit_yaml_value_at_depth`'s nested-position fallback exactly,
-        // including its scientific-notation threshold for an
-        // extreme-magnitude nested value -- `format_float_with_fraction`
-        // alone has no such threshold and would diverge from the DOM path
-        // on that case). `can_use_m2_streaming` (yq_runner.rs) has no
-        // arithmetic arm, so this function is likely unreachable with a
-        // genuinely *computed* bare `Float` through any current CLI path
-        // -- kept in sync with the DOM path anyway for
-        // `StreamableValue::stream_yaml`'s other, non-CLI callers and to
-        // avoid a silent behavioral split if a future M2-eligible
-        // construct ever does carry one through (#1064 documents this
-        // same "unreachable but exhaustive" shape elsewhere in this
-        // codebase). An untouched literal keeps its own `.0` via the
-        // `NumberLiteral` arm below, unaffected by this.
+        // (yq_runner.rs, issues #949 and #1090): real yq drops a computed
+        // whole float's decimal point only at document-root scalar
+        // position, where it suppresses every tag; nested it keeps that
+        // same shortest spelling but precedes it with an explicit
+        // `!!float` tag whenever the spelling would read back as an int.
+        // `can_use_m2_streaming` (yq_runner.rs) has no arithmetic arm, so
+        // this function is likely unreachable with a genuinely *computed*
+        // bare `Float` through any current CLI path -- kept in sync with
+        // the DOM path anyway for `StreamableValue::stream_yaml`'s other,
+        // non-CLI callers and to avoid a silent behavioral split if a
+        // future M2-eligible construct ever does carry one through (#1064
+        // documents this same "unreachable but exhaustive" shape
+        // elsewhere in this codebase). An untouched literal keeps its own
+        // `.0` via the `NumberLiteral` arm below, unaffected by this.
         OwnedValue::Float(f) if depth == 0 => out.write_str(&format_float_yq_yaml(*f)),
-        OwnedValue::Float(f) => out.write_str(&format_float_yq(*f)),
+        OwnedValue::Float(f) => out.write_str(&format_float_yq_yaml_nested(*f)),
         OwnedValue::NumberLiteral(NumberRepr::Float(f), _) if f.is_nan() || f.is_infinite() => {
             out.write_str(super::nonfinite_display_string::<super::YqSemantics>(*f))
         }
@@ -1131,11 +1125,10 @@ mod tests {
     /// required to agree, matching real yq. An untouched literal still keeps
     /// its own `.0` via the sibling `NumberLiteral` variant, unaffected by
     /// this. A *nested* computed float (inside the array case below) keeps
-    /// its decimal point instead — real yq disambiguates a nested computed
-    /// float with an explicit `!!float` tag, which this codebase has no way
-    /// to emit, so falling back to the point-preserving spelling avoids
-    /// silently losing the value's float-ness on reparse (see
-    /// `format_float_yq_yaml`'s own doc comment for the full reasoning).
+    /// the same shortest spelling but gains an explicit `!!float` tag when
+    /// that spelling would read back as an int — real yq's own nested
+    /// disambiguation, added in #1090 (see `format_float_yq_yaml_nested`'s
+    /// doc comment for the full reasoning).
     #[test]
     fn test_stream_yaml_computed_whole_float_drops_decimal_point_949() {
         let mut buf = String::new();
@@ -1150,13 +1143,14 @@ mod tests {
             .unwrap();
         assert_eq!(buf, "-0");
 
-        // Nested (depth > 0): keeps the decimal point, unlike the root case
-        // above.
+        // Nested (depth > 0): same shortest spelling as the root case above,
+        // but tagged when it would otherwise read back as an int. `2.5`
+        // needs no tag — its own `.` is already unambiguous.
         buf.clear();
         OwnedValue::Array(vec![OwnedValue::Float(1.0), OwnedValue::Float(2.5)])
             .stream_yaml(&mut buf, IndentSpec::COMPACT, false)
             .unwrap();
-        assert_eq!(buf, "[1.0, 2.5]");
+        assert_eq!(buf, "[!!float 1, 2.5]");
 
         // Scientific-notation threshold agrees with the DOM path's
         // `format_float_yq_yaml` (and `format_float_yq`'s own JSON
