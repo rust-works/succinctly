@@ -19,7 +19,7 @@ use alloc::vec::Vec;
 #[cfg(test)]
 use std::borrow::Cow;
 
-use indexmap::IndexMap;
+use indexmap::{IndexMap, IndexSet};
 
 use super::slice::{self, SliceBounds};
 
@@ -15219,10 +15219,23 @@ fn resolve_seq<'a, S: EvalSemantics>(
 ///   the iterate is still a fan-out stage.
 ///
 /// So this is `false` for `=`/`|=`/`del()`, which keeps them byte-identical
-/// to before #888. They pay for it: `del` on the same shape is quadratic too
-/// — not visible in #888's own table, which stopped at 16,000 elements, but
-/// 24.8s at 400,000 on `main` — tracked separately, since fixing it needs
-/// the four items above resolved rather than bypassed.
+/// to before #888. What they pay for it is `k * n` resolved path expressions
+/// where `path()` gets `k` — linear in the element count, with a real
+/// constant (each path's components are deep-cloned again on the way to the
+/// walkers), but linear.
+///
+/// It is *not* what made `del` quadratic on this shape. #888's follow-up
+/// (#1301) recorded 24.8s at 400,000 here and attributed it to this gate;
+/// measuring it says otherwise. Holding the resolved-path count fixed at
+/// 80,000 while widening the computed key from 2 branches to 512 — so this
+/// function emits exactly as many paths every time — took `del` from 890ms
+/// to 95ms, and a profile put 99.9% of the samples in
+/// `delete_expr_array_paths`. The quadratic was that function's own sibling
+/// grouping, which scanned an insertion-ordered `Vec` linearly per sibling;
+/// it and its three siblings are `IndexMap`/`IndexSet` now, and `del` on the
+/// repro is 22.0s -> 0.38s at 400,000. The four items above remain the
+/// reason this flag is `false`; they are not a prerequisite for `del`'s
+/// scaling.
 fn resolve_dynamic_indexes<S: EvalSemantics>(
     expr: &Expr,
     input: &OwnedValue,
@@ -20521,30 +20534,27 @@ fn delete_expr_object_paths(
         delete_expr_paths_through_absent(paths, start + 1)?;
         return Ok(value);
     }
-    let mut terminal: Vec<&str> = Vec::new();
-    let mut groups: Vec<(&str, Vec<&[DeleteStep]>)> = Vec::new();
+    // Insertion-ordered *and* hashed (#1301). Both structures used to be a
+    // plain `Vec` scanned linearly for a match, which is O(siblings) per
+    // sibling — fine for the handful a hand-written comma produces, quadratic
+    // once a computed key ahead of a trailing iterate turns every element into
+    // its own sibling (`del(.items[(0,1)].foo[])` over an object-valued
+    // `.foo`). The insertion order is load-bearing, not incidental: the
+    // recursion below visits groups in source order, which is the order jq
+    // dies in, so `IndexMap`/`IndexSet` rather than a `BTreeMap` — they keep
+    // that order structurally instead of leaving it to a parallel side index.
+    let mut terminal: IndexSet<&str> = IndexSet::new();
+    let mut groups: IndexMap<&str, Vec<&[DeleteStep]>> = IndexMap::new();
     for path in paths {
         let Expr::Field(name) = &path[start].component else {
             unreachable!("delete_expr_paths_at only dispatches Field paths here")
         };
         let name = name.as_str();
         if path.len() == start + 1 {
-            if !terminal.contains(&name) {
-                terminal.push(name);
-            }
+            terminal.insert(name);
             continue;
         }
-        let mut appended = false;
-        for group in &mut groups {
-            if group.0 == name {
-                group.1.push(*path);
-                appended = true;
-                break;
-            }
-        }
-        if !appended {
-            groups.push((name, vec![*path]));
-        }
+        groups.entry(name).or_default().push(*path);
     }
 
     // Every path here is Field-kind, so `resolve_node` (invoked by
@@ -20602,8 +20612,15 @@ fn delete_expr_array_paths(
         delete_expr_paths_through_absent(paths, start + 1)?;
         return Ok(value);
     }
-    let mut terminal: Vec<(ArrayStep, bool)> = Vec::new();
-    let mut groups: Vec<(ArrayStep, Vec<&[DeleteStep]>)> = Vec::new();
+    // Insertion-ordered *and* hashed — see the matching comment in
+    // `delete_expr_object_paths` for why both properties are needed (#1301).
+    // This is the arm the issue's own repro lands on: `del(.items[(0,1)].foo[])`
+    // resolves the trailing `[]` into one distinct `Index(i)` sibling per
+    // element, and the linear `find`/scan these two used to do never matched,
+    // so every sibling walked the whole growing list. 99.9% of a 200,000-element
+    // run's samples sat in those two loops.
+    let mut terminal: IndexMap<ArrayStep, bool> = IndexMap::new();
+    let mut groups: IndexMap<ArrayStep, Vec<&[DeleteStep]>> = IndexMap::new();
     for path in paths {
         let step = match &path[start].component {
             Expr::Index(idx) | Expr::IndexNumber { idx, .. } => ArrayStep::Index(*idx),
@@ -20613,26 +20630,13 @@ fn delete_expr_array_paths(
         if path.len() == start + 1 {
             // One occurrence of `step` marking it optional is enough to cover
             // every other occurrence — merge rather than keep only whichever
-            // one was pushed first, which used to make the outcome depend on
+            // one was inserted first, which used to make the outcome depend on
             // argument order (`del(.[(0,5)], .[5]?)` errored or not
             // depending on which side `.[5]?` was written on).
-            match terminal.iter_mut().find(|(s, _)| *s == step) {
-                Some(entry) => entry.1 |= path[start].optional,
-                None => terminal.push((step, path[start].optional)),
-            }
+            *terminal.entry(step).or_insert(false) |= path[start].optional;
             continue;
         }
-        let mut appended = false;
-        for group in &mut groups {
-            if group.0 == step {
-                group.1.push(*path);
-                appended = true;
-                break;
-            }
-        }
-        if !appended {
-            groups.push((step, vec![*path]));
-        }
+        groups.entry(step).or_default().push(*path);
     }
 
     // Unlike the object case above, this is NOT dead code: `resolve_node`
@@ -20740,7 +20744,11 @@ fn delete_expr_array_paths(
 /// elements of the same array and have to reach [`delete_keys`] in one batch —
 /// see the comment there on why splitting them would compound overlapping
 /// ranges instead of unioning them.
-#[derive(Clone, Copy, PartialEq, Eq)]
+///
+/// `Hash` is for use as an [`IndexMap`] key in [`delete_expr_array_paths`]'s
+/// grouping (#1301) — a lookup accelerator only. It implies no meaningful
+/// ordering or identity beyond the `PartialEq` above.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum ArrayStep {
     Index(i64),
     Slice(Option<i64>, Option<i64>),
