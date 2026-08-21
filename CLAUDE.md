@@ -581,6 +581,7 @@ For detailed documentation on optimization techniques used in this project, see 
 - **Memory-bound effects do not port across architectures** — measure ARM *and* x86_64, and name the chip in every table. #106 was 6.1x on M4 Pro, 16.4x on Zen 4.
 - **Verify the box is idle; macOS load average lies** (read 1.4 on a machine using 2.4% CPU — it counts uninterruptible-wait threads). Never benchmark a laptop on battery.
 - **A benchmark cannot measure a shape it does not generate** — "all neutral" is not evidence. Add the generator pattern first.
+- **Attribute the cost before you A/B it.** A perf issue's named culprit is a hypothesis — #1213 and #1301 both named the wrong one. When the issue blames quantity A and you suspect B, build inputs holding A *provably constant* while varying B; if the time moves, A is not the term. #1301 blamed the resolved-path count, so holding it at 80,000 while widening the fan-out from 2 to 512 branches settled it in one table (890ms → 95ms). Unlike a profile, which only samples the window it runs in, that table has no escape hatch — and fitting its model predicts the post-fix floor before you change a line.
 
 **Recent YAML optimizations:**
 - ✅ P2.5 (Cached Type Checking): 1-17% improvement depending on nesting depth

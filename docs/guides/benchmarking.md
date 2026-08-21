@@ -859,6 +859,45 @@ Before trusting a neutral result, confirm the suite contains the shape the chang
 does not, add a pattern to `src/bin/succinctly/yaml_generators.rs` (or the JSON/DSV equivalent)
 and regenerate.
 
+### 8. Attribute the cost before you A/B it — hold one suspect quantity fixed
+
+Rules 1-7 assume you already know what to change. When a performance *issue* names a suspected
+cause, that is a hypothesis, not a diagnosis — and implementing its suggested fix before testing
+it can mean a large, unnecessary change that does not even address the real term. #1213 and #1301
+were both filed with a specific named culprit; both named the wrong one.
+
+When the issue blames quantity A and you suspect quantity B, construct inputs that **hold A
+provably constant while varying B**. If the time moves, A is not the term.
+
+#1301 reported `del(.items[(0,1)].foo[])` as O(n^2) and attributed it to the path resolver
+emitting `k*n` resolved paths instead of `k`. Holding total elements at 80,000 while widening the
+computed key from `k = 2` branches to `k = 512` keeps the resolver emitting exactly 80,000 paths
+in every row, while the sibling count within one container falls from 40,000 to 156:
+
+| k   | siblings per container | time  | model `82.5ms + 2.52e-7*(n^2/k)` |
+|-----|------------------------|-------|----------------------------------|
+| 2   | 40,000                 | 890ms | 890                              |
+| 8   | 10,000                 | 289ms | 284                              |
+| 32  | 2,500                  | 133ms | 133                              |
+| 128 | 625                    |  93ms |  92                              |
+| 512 | 156                    |  95ms |  85                              |
+
+A one-parameter model fit every row within ~3%, which located the term (`k*m^2`, the square of the
+per-container sibling count) and pointed at the four linear scans responsible. The resolver was
+never involved.
+
+Two things this buys that a profile does not:
+
+- **It cannot be argued with.** `sample`/`perf` only observe the window they run in, so "you
+  attached too late, the resolver had already finished" is a live objection to a profile. A table
+  where the blamed quantity is constant by construction has no such escape hatch.
+- **It gives you the shape of the term, and therefore a prediction.** Fitting `a + b*(n^2/k)`
+  yielded a floor of ~90ms at 80,000 elements *before any code changed*. The fix landed at 88ms.
+  A pre-registered target is much stronger evidence than a number admired afterwards.
+
+Report the fitted model alongside the measurements in the commit message and PR, not just in your
+own head — "the model fits all seven widths within 3%" is what makes a diagnosis reviewable.
+
 ### Building both halves on a remote box
 
 A source-only tarball plus a reverse patch of the commit under test is enough, with no pushing:
