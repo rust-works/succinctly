@@ -139,6 +139,17 @@ succinctly yq '.spec.containers[]' deployment.yaml service.yaml
 - [ ] `--explode-anchors` flag
 - [ ] Merge keys (`<<: *alias`)
 
+**Anchor/alias round-tripping (#763)**: YAML-target output re-emits
+`&anchor`/`*alias` on both the M2 cursor-streaming path and the DOM path a
+write (`=`, `|=`, `del()`) or a DOM-forcing flag (`-P`, `--arg`) takes —
+see [ADR-0017](../adrs/adr-0017.md)'s mechanism 2 and its #763 amendment.
+`-o=json` still expands aliases, matching real yq. Two deliberate
+divergences, both cases where real yq emits YAML it cannot itself re-read:
+deleting an anchor's own key materializes its aliases rather than leaving
+them dangling, and `--sort-keys` drops a mark it would reorder above its
+declaration. Not yet covered: true alias *node identity* (a write through
+an alias updates only that position, where yq mutates the shared node).
+
 **Partial** (#710): trailing same-line comments (`a: 1 # comment`) are
 captured and preserved through output, always-on (no `--preserve-comments`
 flag needed or planned) — but only on paths that keep a live YAML cursor
@@ -686,7 +697,8 @@ EXAMPLES:
 - [x] All jq operators work on YAML input
 - [x] Multi-document YAML supported
 - [x] YAML output format supported
-- [x] Anchors/aliases handled correctly
+- [x] Anchors/aliases handled correctly (values #711, syntax #763; alias
+      node *identity* is still a known gap — see Phase 3 above)
 - [x] Performance within 2x of Mike Farah's yq (actually **2-8x faster**)
 
 ---
@@ -711,6 +723,10 @@ This plan depends on the YAML parser implementation phases defined in [parsing/y
 
 2. **Anchor expansion default**: Expand aliases automatically or preserve structure?
    - *Decision*: Expand automatically (matches user expectations from jq) ✅ Implemented
+   - *Superseded (#712, #763)*: real yq preserves the structure, so YAML-target
+     output does too — on the streaming path (#712) and, since #763, on the DOM
+     path as well. Expansion survives only where the target format has no alias
+     syntax to preserve (`-o=json`).
 
 3. **Comment handling**: How to expose comments in queries?
    - *Decision*: Deferred - implement on user demand

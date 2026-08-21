@@ -284,6 +284,33 @@ printf 'a:\n  x: 1\nb:\n  x: 2\n  y: 3\n' | succinctly yq '.a *=n .b'  # a: {x: 
 
 Real yq's bare, 2-arg `sub(re; s)` replaces *every* match, not just the first — jq's `sub` = first match only, `gsub` = all matches; yq's bare `sub` behaves like jq's `gsub` unconditionally (`"aaa" | sub("a";"X")` => `"XXX"` in yq, `"Xaa"` in jq, confirmed against yq v4.53.3). `gsub` itself, and the 3-arg `sub(re;s;flags)` form, are unaffected by this and keep matching jq's model — the 3-arg form's real-yq semantics don't fit any hypothesis tried so far (#1122).
 
+### Anchor/alias preservation and its soundness rule (yq mode only)
+
+YAML-target output re-emits `&anchor`/`*alias` on both the cursor-streaming path and the
+DOM path taken by a write (`=`, `|=`, `+=`, `del()`) or a DOM-forcing flag (`-P`,
+`--arg`) — ADR-0017's mechanism 2, #763. `-o=json` still expands aliases, matching real
+yq. A node's mark rides `NodeMeta` in the `CommentTree` side-tree alongside its comment
+and style; `enforce_anchor_soundness` (`yq_runner.rs`) then drops any `*name` the
+document cannot resolve.
+
+**succinctly never emits YAML it cannot read back — real yq does.** A `*name` is written
+only when a matching `&name` exists, is emitted *earlier*, and holds an *equal* value.
+Real yq fails all three in ordinary use (both verified against v4.53.3):
+
+```bash
+printf 'a: &x 1\nb: *x\n' | yq 'del(.a)'          # b: *x   <- no &x anywhere; yq then
+                                                  #            rejects its own output with
+                                                  #            "unknown anchor 'x' referenced"
+printf 'a: &x 1\nb: *x\n' | succinctly yq 'del(.a)'   # b: 1
+```
+
+`--sort-keys` diverges the same way when sorting would move an alias above its
+declaration. The equal-value rule also contains a real gap rather than papering over it:
+succinctly's alias sync is one-directional (anchor → aliases), so a write *through* an
+alias (`.b.p = 9`) updates only `.b`, where yq mutates the shared node. Emitting `b: *x`
+there would silently discard the write, so the mark is dropped and the computed value
+printed instead. True alias node identity remains unimplemented.
+
 ### jq Position-Based Navigation (succinctly extension)
 
 Succinctly extends jq with position-based navigation builtins that allow jumping directly to a node at a specific byte offset or line/column position. This is unique to succinctly and not available in standard jq or yq.

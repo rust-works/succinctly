@@ -17551,3 +17551,278 @@ fn test_yq_input_line_number_not_supported_723() -> Result<()> {
     );
     Ok(())
 }
+
+// =============================================================================
+// Issue #763 - `&anchor`/`*alias` syntax must survive the DOM write path, not
+// just the M2 cursor-streaming identity path. ADR-0017's mechanism 2.
+//
+// Every expected string below is pinned against mikefarah/yq v4.53.3, run
+// directly against that binary rather than copied from the issue text (whose
+// reconciliation rules were explicitly labelled hypotheses). The two
+// deliberate divergences are called out individually and say what real yq
+// prints instead, and why succinctly doesn't.
+//
+// Distinct from the #711 family above, which asserts on values via `-o=json`
+// because the syntax didn't round-trip when it was written. Those tests stay
+// as they are; these are their YAML-syntax counterparts.
+// =============================================================================
+
+#[test]
+fn test_yaml_assign_to_anchor_keeps_anchor_and_alias_763() -> Result<()> {
+    // The issue's own repro. The write replaces the anchored node's value,
+    // not its identity, so `&x` stays and `b` stays an alias to it.
+    let input = "a: &x 1\nb: *x\n";
+    let (output, exit_code) = run_yq_stdin(".a = 99", input, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "a: &x 99\nb: *x\n");
+    Ok(())
+}
+
+#[test]
+fn test_yaml_assign_to_alias_detaches_it_but_keeps_anchor_763() -> Result<()> {
+    // Writing straight to the alias gives that position its own value, so it
+    // is no longer the same node; `&x` survives even though nothing refers
+    // to it any more (an unreferenced anchor is valid YAML, and yq keeps it).
+    let input = "a: &x 1\nb: *x\n";
+    let (output, exit_code) = run_yq_stdin(".b = 7", input, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "a: &x 1\nb: 7\n");
+    Ok(())
+}
+
+#[test]
+fn test_yaml_assign_unrelated_key_leaves_anchors_alone_763() -> Result<()> {
+    let input = "a: &x 1\nb: *x\n";
+    let (output, exit_code) = run_yq_stdin(".c = 3", input, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "a: &x 1\nb: *x\nc: 3\n");
+    Ok(())
+}
+
+#[test]
+fn test_yaml_compound_and_update_assign_keep_anchor_763() -> Result<()> {
+    // `+=` and `|=` reach the same write path as `=` and must not differ.
+    let input = "a: &x 1\nb: *x\n";
+    for filter in [".a += 1", ".a |= . + 1"] {
+        let (output, exit_code) = run_yq_stdin(filter, input, &[])?;
+        assert_eq!(exit_code, 0, "filter: {filter}");
+        assert_eq!(output, "a: &x 2\nb: *x\n", "filter: {filter}");
+    }
+    Ok(())
+}
+
+#[test]
+fn test_yaml_computed_key_assign_to_alias_detaches_it_763() -> Result<()> {
+    // `.["b"] = 5` resolves to the same path as `.b = 5` and must agree
+    // with it -- a computed key takes a different route to the write.
+    let input = "a: &x 1\nb: *x\n";
+    let (output, exit_code) = run_yq_stdin(r#".["b"] = 5"#, input, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "a: &x 1\nb: 5\n");
+    Ok(())
+}
+
+#[test]
+fn test_yaml_del_alias_keeps_unreferenced_anchor_763() -> Result<()> {
+    let input = "a: &x 1\nb: *x\n";
+    let (output, exit_code) = run_yq_stdin("del(.b)", input, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "a: &x 1\n");
+    Ok(())
+}
+
+#[test]
+fn test_yaml_del_anchor_materializes_the_alias_763() -> Result<()> {
+    // DELIBERATE DIVERGENCE. Real yq prints `b: *x\n` here -- an alias with
+    // no anchor left anywhere in the document, which yq itself then refuses
+    // to read back (`unknown anchor 'x' referenced`, verified against the
+    // pinned binary). `enforce_anchor_soundness` drops a mark it cannot
+    // resolve, so succinctly writes the value instead and its own output
+    // always re-parses.
+    let input = "a: &x 1\nb: *x\n";
+    let (output, exit_code) = run_yq_stdin("del(.a)", input, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "b: 1\n");
+
+    // The point of the divergence: feed it straight back in.
+    let (round_tripped, exit_code) = run_yq_stdin(".", &output, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(round_tripped, "b: 1\n");
+    Ok(())
+}
+
+#[test]
+fn test_yaml_write_inside_anchored_container_keeps_anchor_763() -> Result<()> {
+    // The anchored node is a container and the write lands inside it;
+    // `#711`'s value sync keeps `b` in step, so the alias is still emittable.
+    let input = "a: &x {p: 1}\nb: *x\n";
+    let (output, exit_code) = run_yq_stdin(".a.p = 9", input, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "a: &x {p: 9}\nb: *x\n");
+    Ok(())
+}
+
+#[test]
+fn test_yaml_write_through_alias_drops_the_mark_rather_than_the_write_763() -> Result<()> {
+    // DELIBERATE DIVERGENCE. Real yq models an alias as a shared node, so
+    // `.b.p = 9` mutates the anchor's own value and prints
+    // `a: &x {p: 9}\nb: *x\n`. succinctly's alias sync is one-directional
+    // (anchor -> aliases), so `.a` still holds `{p: 1}` here. Emitting
+    // `b: *x` on top of that would silently throw the write away and print
+    // `p: 1` back; the soundness gate sees the two values disagree and drops
+    // the mark instead, so the computed value survives. Tracked separately
+    // as the alias-identity follow-up.
+    let input = "a: &x {p: 1}\nb: *x\n";
+    let (output, exit_code) = run_yq_stdin(".b.p = 9", input, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "a: &x {p: 1}\nb:\n  p: 9\n");
+    Ok(())
+}
+
+#[test]
+fn test_yaml_deferred_container_anchor_survives_a_write_763() -> Result<()> {
+    // `&x` sits on the key's own line, before the newline that starts the
+    // container -- the DOM twin of `stream_yaml_value`'s mapping-field arm.
+    let input = "a: &x\n  p: 1\nb: *x\n";
+    let (output, exit_code) = run_yq_stdin(".c = 1", input, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "a: &x\n  p: 1\nb: *x\nc: 1\n");
+    Ok(())
+}
+
+#[test]
+fn test_yaml_sequence_item_anchor_survives_a_write_763() -> Result<()> {
+    let input = "l:\n  - &x 1\n  - *x\n";
+    let (output, exit_code) = run_yq_stdin(".c = 1", input, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "l:\n  - &x 1\n  - *x\nc: 1\n");
+    Ok(())
+}
+
+#[test]
+fn test_yaml_deferred_sequence_item_anchor_survives_a_write_763() -> Result<()> {
+    // An anchor on the item's own line takes the slot the compact `- ` form
+    // would use, so the value stays deferred to its own full-indent line.
+    let input = "l:\n  - &x\n    p: 1\n  - *x\n";
+    let (output, exit_code) = run_yq_stdin(".c = 1", input, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "l:\n  - &x\n    p: 1\n  - *x\nc: 1\n");
+    Ok(())
+}
+
+#[test]
+fn test_yaml_flow_style_anchor_alias_survives_a_write_763() -> Result<()> {
+    let input = "a: {x: &y 1, z: *y}\n";
+    let (output, exit_code) = run_yq_stdin(".c = 1", input, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "a: {x: &y 1, z: *y}\nc: 1\n");
+    Ok(())
+}
+
+#[test]
+fn test_yaml_anchors_survive_pretty_print_763() -> Result<()> {
+    // `-P` forces the DOM path for every query shape. It is documented as
+    // `... style = ""`, and anchor/alias syntax is identity, not style --
+    // real yq -P keeps both.
+    let input = "a: &x 1\nb: *x\n";
+    let (output, exit_code) = run_yq_stdin(".", input, &["-P"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "a: &x 1\nb: *x\n");
+    Ok(())
+}
+
+#[test]
+fn test_yaml_anchors_survive_arg_forced_dom_1133() -> Result<()> {
+    // #1133: a named variable forces the DOM path even for plain `.`.
+    let input = "k: &anc v\nb: *anc\n";
+    let (output, exit_code) = run_yq_stdin(".", input, &["--arg", "x", "y"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "k: &anc v\nb: *anc\n");
+    Ok(())
+}
+
+#[test]
+fn test_yaml_arg_forced_dom_no_longer_nulls_an_absent_anchor_1133() -> Result<()> {
+    // #1133's third repro, the one that lost data rather than syntax: the
+    // anchored value is absent, so the alias resolved to nothing and `b`
+    // printed as `null`. `b` now renders as `*anc` and never consults the
+    // value at all.
+    let input = "? k # key comment\n: &anc\nb: *anc\n";
+    let expected = "k: &anc # key comment\nb: *anc\n";
+    let (output, exit_code) = run_yq_stdin(".", input, &["--arg", "x", "y"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, expected);
+    Ok(())
+}
+
+#[test]
+fn test_yaml_select_true_keeps_anchors_786() -> Result<()> {
+    // #786's repro. Already correct before #763 (`select` is in
+    // `can_use_m2_streaming`'s allow-list, so this streams), pinned here so
+    // a future change to that allow-list has to route it through the DOM
+    // path's anchor support rather than silently regressing.
+    let input = "a: &anc\n  b: 1\nc: *anc\n";
+    let (output, exit_code) = run_yq_stdin("select(true)", input, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "a: &anc\n  b: 1\nc: *anc\n");
+    Ok(())
+}
+
+#[test]
+fn test_yaml_dom_output_matches_streaming_output_over_an_anchor_corpus_763() -> Result<()> {
+    // The strongest gate #1133 asks for: forcing the DOM path must not
+    // change a single byte of an identity query's output. `--arg` and `-P`
+    // are the two flags that force it while leaving the result a live
+    // cursor, so all three spellings have to agree.
+    let input = concat!(
+        "a: &x 1\n",
+        "b: *x\n",
+        "c: &y {p: 1, q: *x}\n",
+        "d: *y\n",
+        "l:\n",
+        "  - &z 1\n",
+        "  - *z\n",
+        "e: &w\n",
+        "  m: 1\n",
+        "f: *w\n",
+    );
+    let (streamed, exit_code) = run_yq_stdin(".", input, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(streamed, input, "identity must round-trip verbatim");
+
+    let (with_arg, exit_code) = run_yq_stdin(".", input, &["--arg", "x", "y"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(with_arg, streamed, "--arg must not change a byte");
+    Ok(())
+}
+
+#[test]
+fn test_yaml_sort_keys_drops_an_alias_it_would_reorder_above_its_anchor_763() -> Result<()> {
+    // DELIBERATE DIVERGENCE, and the reason the soundness gate walks in the
+    // emitter's own order. Sorting moves `a: *x` above `z: &x 1`; real yq
+    // emits exactly that (verified via `sort_keys(.)`, whose output it then
+    // cannot read back). Dropping the mark keeps the document loadable.
+    let input = "z: &x 1\na: *x\n";
+    let (output, exit_code) = run_yq_stdin(".c = 1", input, &["--sort-keys"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "a: 1\nc: 1\nz: &x 1\n");
+
+    let (round_tripped, exit_code) = run_yq_stdin(".", &output, &[])?;
+    assert_eq!(
+        exit_code, 0,
+        "succinctly must be able to re-read its own output"
+    );
+    assert_eq!(round_tripped, output);
+    Ok(())
+}
+
+#[test]
+fn test_yaml_json_output_still_resolves_aliases_763() -> Result<()> {
+    // JSON has no alias syntax, so `-o=json` must keep expanding them --
+    // matching real yq, and unchanged by any of the above.
+    let input = "a: &x 1\nb: *x\n";
+    let (output, exit_code) = run_yq_stdin(".a = 99", input, &["-o=json", "-I=0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), r#"{"a":99,"b":99}"#);
+    Ok(())
+}
