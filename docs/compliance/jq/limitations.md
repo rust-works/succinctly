@@ -3,7 +3,11 @@
 [Home](../../../) > [Docs](../../) > [Compliance](../) > jq Limitations
 
 This page records how closely succinctly's evaluator reproduces jq's *error messages*,
-measured against the pinned `jq` binary rather than asserted. Since
+measured against the pinned `jq` binary rather than asserted. It is one of the two pages
+[ADR-0018](../../adrs/adr-0018.md) obliges: that record makes jq-fidelity the rule for jq
+mode, permits divergence only under three named conditions, and requires every divergence to
+be written down — so **this page is the enumeration of exceptions to ADR-0018** for jq mode,
+as [yq Limitations](../yq/limitations.md) is for yq mode. Since
 [#158](https://github.com/rust-works/succinctly/issues/158) bound the raised value as
 `catch`'s input, the message text is readable from a filter — `try f catch (if
 test("Cannot index") then … else … end)` is a real jq idiom — so the wording is part of
@@ -577,8 +581,10 @@ diff.
 
 ## Depends On
 
+- [ADR-0018](../../adrs/adr-0018.md) - the fidelity rule this page enumerates exceptions to
 - [jq Evaluator](../../reference/jq-evaluator.md) - the evaluator raising these errors
 - [jq Language Support](../../reference/jq-language.md) - feature coverage matrix
+- [yq Limitations](../yq/limitations.md) - the yq-mode counterpart to this page
 
 ## Used By
 

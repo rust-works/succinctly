@@ -254,6 +254,25 @@ echo '{"a": {"x": 1}, "b": {"x": 2, "y": 3}}' | succinctly jq '.a *= .b'  # {"a"
 printf 'a: [1, 2]\nb: [3, 4]\n' | succinctly yq '.a *= .b'               # a: [3, 4]
 ```
 
+### The rule the divergence sections below are exceptions to
+
+**`succinctly jq` follows jq; `succinctly yq` follows yq — and the *mode* decides, never the
+input format.** Bug-for-bug fidelity is the default, a reference tool's own inconsistencies
+included. Divergence is permitted only where the reference emits output it cannot itself read
+back, where matching would corrupt data or discard a write, or where matching would take the
+host process down — and every divergence must be recorded in
+[docs/compliance/jq/limitations.md](docs/compliance/jq/limitations.md) or
+[docs/compliance/yq/limitations.md](docs/compliance/yq/limitations.md). Behavioural rules
+therefore belong on `EvalSemantics` (per-mode), not on per-format traits like
+`DocumentFields`.
+
+Never state a jq/yq behaviour from memory — capture it from the pinned binary (`/usr/bin/jq`
+1.7.1, Homebrew `yq` v4.53.3). That applies to "neither tool has this" as much as to any
+other claim: `--front-matter`, `--split-exp` and cross-file evaluation all look like
+succinctly extensions and are all real yq features (#715). Calling reference surface an
+extension is the costly direction of that mistake, because extensions are exempt from the
+divergence rule above. See [docs/adrs/adr-0018.md](docs/adrs/adr-0018.md).
+
 ### yq Merge-Flag Suffixes on `*`/`*=` (yq mode only)
 
 Real yq extends `*`/`*=` with combinable flag suffixes that control merge semantics. They go directly after `*` for the plain (non-assign) form, or after `*=` for the in-place form — never between `*` and `=` (`.a *+= .b` is not valid; the flags belong after the `=`):
@@ -310,8 +329,12 @@ printf 'a: &x 1\nb: *x\n' | yq 'del(.a)'          # b: *x   <- no &x anywhere; y
 printf 'a: &x 1\nb: *x\n' | succinctly yq 'del(.a)'   # b: 1
 ```
 
-`--sort-keys` diverges the same way when sorting would move an alias above its
-declaration. The equal-value rule also contains a real gap rather than papering over it:
+Real yq's `sort_keys` diverges the same way when sorting would move an alias above its
+declaration — and succinctly's own `--sort-keys` currently *reproduces* that unsound output,
+because the soundness pass doesn't reach the streaming path (#1350). That is a bug against
+the rule, not a second exception to it, so the "never" above is the intent and #1350 is the
+one place it does not hold. The equal-value rule also contains a real gap rather than
+papering over it:
 succinctly's alias sync is one-directional (anchor → aliases), so a write *through* an
 alias (`.b.p = 9`) updates only `.b`, where yq mutates the shared node. Emitting `b: *x`
 there would silently discard the write, so the mark is dropped and the computed value
