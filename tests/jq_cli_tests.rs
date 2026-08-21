@@ -21263,3 +21263,32 @@ fn test_jq_lazy_fanout_preserves_prefix_and_trailing_control_1531() -> Result<()
     assert_eq!(stdout.trim(), "1");
     Ok(())
 }
+
+/// #1247: an object key that fails to decode must not hide the *valid*
+/// fields after it. `JsonFields::find`/`find_cursor` used to `?` out of the
+/// whole search on the first undecodable key, so `.b` answered `null` here
+/// even though `keys_unsorted`/`length` -- which never decode a key -- both
+/// still reported `b`. That inconsistency is the reason this is worth an
+/// end-to-end test and not just a unit one: the two halves of the CLI
+/// disagreed with each other about whether the field existed.
+///
+/// Real jq rejects this document outright (`Invalid \uXXXX\uXXXX surrogate
+/// pair escape`, exit 5). Surfacing the decode failure as a real error is
+/// tracked separately (#1247's own remaining stages); this test pins only
+/// that one bad key no longer destroys valid results.
+#[test]
+fn test_undecodable_object_key_does_not_hide_later_fields_1247() {
+    let input = r#"{"\ud800": 1, "b": 2}"#;
+
+    let (stdout, stderr, code) = run_jq_full(&["-c", ".b"], Some(input))
+        .unwrap_or_else(|e| panic!("`.b` failed to run: {e}"));
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(stdout.trim(), "2", "stderr: {stderr}");
+
+    // The half that was already right, pinned so the two can't drift apart
+    // again in the other direction.
+    let (stdout, _, code) = run_jq_full(&["-c", "keys_unsorted, length"], Some(input))
+        .unwrap_or_else(|e| panic!("`keys_unsorted, length` failed to run: {e}"));
+    assert_eq!(code, 0);
+    assert_eq!(stdout.lines().last(), Some("2"));
+}
