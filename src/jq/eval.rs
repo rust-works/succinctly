@@ -8170,6 +8170,22 @@ fn builtin_getpath<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 };
                 current = OwnedValue::String(slice::slice_str(s, range));
             }
+            // yq mode only (#1102): completes the `getpath(path(x)) == x`
+            // round trip for an object-slice descriptor -- without this,
+            // `path(.[0:2])` on an object succeeds (the new
+            // `slice_owned_value_read` arm) but the descriptor it returns
+            // was unusable here, a narrower regression than the pre-#1102
+            // all-or-nothing error. Read-only, matching #1102's own scope --
+            // `setpath`/`delpaths` deliberately don't get the same
+            // treatment (#1157's write-side scope, not this one's).
+            (OwnedValue::Object(map), OwnedValue::Object(desc)) if S::TAG == EvalTag::Yq => {
+                let range = match SliceBounds::from_descriptor(desc) {
+                    Ok(bounds) => bounds.resolve_object_children(map.len()),
+                    Err(_) if optional => return QueryResult::None,
+                    Err(e) => return e.into(),
+                };
+                current = slice_object_children_at(map, range);
+            }
             _ if optional => return QueryResult::None,
             _ => {
                 return QueryResult::Error(EvalError::cannot_index(current.type_name(), &segment));
@@ -10737,12 +10753,14 @@ fn is_owned_container(target: &OwnedValue) -> bool {
 /// Whether `target` is one of the scalar shapes real yq treats as an empty
 /// container when it's the target of a *read* slice (`.[S:E]`, #1065) —
 /// null, any number representation, or a boolean. Object is deliberately
-/// excluded: real yq's own slicing there follows its internal AST
-/// child-node layout (`{"a":1,"b":2} | .[0:2]` -> `["a",1]`, alternating
-/// keys and values), not a clean "empty container" rule, and isn't
-/// replicated here (#1102). `Array`/`String` are excluded too — those
-/// already slice meaningfully and never reach this check's call sites for
-/// that reason (see [`slice_owned_value`]'s own `Array`/`String` arms).
+/// excluded from *this* rule: real yq's own slicing there follows its
+/// internal AST child-node layout instead (`{"a":1,"b":2} | .[0:2]` ->
+/// `["a",1]`, alternating keys and values), not a clean "empty container"
+/// rule — implemented separately, see `slice_owned_value_read`'s
+/// `OwnedValue::Object` arm and `slice::SliceBounds::resolve_object_children`
+/// (#1102). `Array`/`String` are excluded too — those already slice
+/// meaningfully and never reach this check's call sites for that reason
+/// (see [`slice_owned_value`]'s own `Array`/`String` arms).
 ///
 /// Deliberately its own free function, not folded into `slice_owned_value`:
 /// that function is *also* used by `resolve_slice_expr` for assignment
@@ -11208,18 +11226,48 @@ pub(crate) fn slice_owned_value_read<S: EvalSemantics>(
 /// [`SliceBounds::resolve_object_children`] for the exact, oracle-verified
 /// bound-resolution rule. Never errors: yq's own object slicing doesn't,
 /// regardless of how the bounds resolve.
-fn slice_object_as_yq_children(
+///
+/// `pub(crate)`: also called from `eval_generic.rs`'s `slice_one_generic`,
+/// the generic (computed-slice-bound) evaluator's own equivalent of this
+/// file's cursor-backed `Expr::Slice` arm — both need the same rule, one
+/// definition.
+pub(crate) fn slice_object_as_yq_children(
     map: &IndexMap<String, OwnedValue>,
     start: Option<i64>,
     end: Option<i64>,
 ) -> OwnedValue {
-    let mut children = Vec::with_capacity(map.len() * 2);
-    for (k, v) in map {
-        children.push(OwnedValue::String(k.clone()));
-        children.push(v.clone());
-    }
     let range = SliceBounds::from_literals(start, end).resolve_object_children(map.len());
-    OwnedValue::Array(children[range].to_vec())
+    slice_object_children_at(map, range)
+}
+
+/// [`slice_object_as_yq_children`]'s shared assembly step: materialize only
+/// the child-node slots `range` actually names, at an already-resolved
+/// `range`, rather than building the object's whole `2N`-length child list
+/// and then discarding everything outside it — `IndexMap::get_index` is
+/// O(1), so each wanted child costs one clone, not `2N` of them regardless
+/// of how narrow the slice is. Split out so [`builtin_getpath`]'s
+/// object-slice-descriptor arm (`{"start":s,"end":e}`, already resolved via
+/// [`SliceBounds::from_descriptor`]) can reuse the exact same logic instead
+/// of hand-copying it — the descriptor there carries bounds as `f64`, not
+/// the `i64` literals [`slice_object_as_yq_children`] itself takes, so it
+/// can't call that function directly.
+fn slice_object_children_at(
+    map: &IndexMap<String, OwnedValue>,
+    range: core::ops::Range<usize>,
+) -> OwnedValue {
+    let children: Vec<OwnedValue> = range
+        .map(|child_idx| {
+            let (k, v) = map
+                .get_index(child_idx / 2)
+                .expect("resolve_object_children never names an out-of-bounds entry");
+            if child_idx % 2 == 0 {
+                OwnedValue::String(k.clone())
+            } else {
+                v.clone()
+            }
+        })
+        .collect();
+    OwnedValue::Array(children)
 }
 
 /// Get element at index (supports negative indexing).

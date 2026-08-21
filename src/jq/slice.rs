@@ -82,9 +82,7 @@ impl SliceBounds {
     /// bounds are an *insertion point* on the write side, not an empty read.
     /// `[1,2,3] | setpath([{"start":2,"end":1}]; ["x"])` is `[1,2,"x",3]`.
     pub(crate) fn resolve(&self, len: usize) -> Range<usize> {
-        let start = clamp(self.start.map_or(0.0, f64::floor), len);
-        let end = clamp(self.end.map_or(len as f64, f64::ceil), len);
-        start..end.max(start)
+        self.resolve_with_end_default(len, len as f64)
     }
 
     /// The child-node range yq's own slicing of an *object* target names,
@@ -103,9 +101,20 @@ impl SliceBounds {
     /// `2N`). Reproduced anyway -- this repo pins oracle behaviour,
     /// including its own inconsistencies.
     pub(crate) fn resolve_object_children(&self, n_entries: usize) -> Range<usize> {
-        let child_count = n_entries * 2;
-        let start = clamp(self.start.map_or(0.0, f64::floor), child_count);
-        let end = clamp(self.end.map_or(n_entries as f64, f64::ceil), child_count);
+        self.resolve_with_end_default(n_entries * 2, n_entries as f64)
+    }
+
+    /// Shared bound-resolution body for [`resolve`](Self::resolve) and
+    /// [`resolve_object_children`](Self::resolve_object_children): both
+    /// clamp `start` and a *given* `end` the same way against `len`, and
+    /// differ only in what an *omitted* `end` defaults to before that same
+    /// clamp runs (`len` itself for a plain container, the entry count for
+    /// an object's child-node layout) -- kept as one body, not two
+    /// near-identical ones, per this crate's own "duplicated predicates
+    /// diverge silently" lesson.
+    fn resolve_with_end_default(&self, len: usize, end_default: f64) -> Range<usize> {
+        let start = clamp(self.start.map_or(0.0, f64::floor), len);
+        let end = clamp(self.end.map_or(end_default, f64::ceil), len);
         start..end.max(start)
     }
 }
