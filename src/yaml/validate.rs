@@ -148,8 +148,17 @@ pub enum YamlValidationErrorKind {
         /// What was expected.
         expected: &'static str,
     },
-    /// Invalid UTF-8 sequence.
-    InvalidUtf8,
+    /// The document is not valid UTF-8 (#1242).
+    ///
+    /// Previously declared but never constructed: the scanner reads bytes
+    /// and never decodes them, so nothing here could detect an encoding
+    /// error. `validate` now runs an explicit UTF-8 pass before the grammar
+    /// walk and reports through this variant, carrying the specific reason
+    /// (`Utf8ErrorKind::message`) rather than one flat string.
+    InvalidUtf8 {
+        /// Which UTF-8 rule the byte broke.
+        reason: &'static str,
+    },
     /// Container nesting depth exceeded the limit.
     NestingTooDeep {
         /// The configured limit.
@@ -211,7 +220,7 @@ impl fmt::Display for YamlValidationErrorKind {
             Self::UnexpectedEof { expected } => {
                 write!(f, "unexpected end of input, expected {expected}")
             }
-            Self::InvalidUtf8 => write!(f, "invalid UTF-8 sequence"),
+            Self::InvalidUtf8 { reason } => write!(f, "{reason}"),
             Self::NestingTooDeep { limit } => {
                 write!(f, "nesting depth exceeds limit of {limit}")
             }
@@ -266,6 +275,23 @@ enum LineKind {
 /// assert!(validate(b"[ a, , b ]\n").is_err());
 /// ```
 pub fn validate(input: &[u8]) -> Result<(), YamlValidationError> {
+    // Encoding before grammar (#1242): the scanner below reads bytes and
+    // never decodes them, so without this a document with a stray non-UTF-8
+    // byte validated clean and then produced a scalar nothing could decode.
+    // The JSON validator has always checked this (`validate_utf8_char`); the
+    // YAML one had no encoding check at all.
+    if let Err(err) = crate::text::utf8::validate_utf8(input) {
+        return Err(YamlValidationError {
+            kind: YamlValidationErrorKind::InvalidUtf8 {
+                reason: err.kind.message(),
+            },
+            position: Position {
+                offset: err.offset,
+                line: err.line,
+                column: err.column,
+            },
+        });
+    }
     Validator::new(input).validate()
 }
 
@@ -2110,7 +2136,9 @@ mod tests {
                 found: 'y',
             },
             UnexpectedEof { expected: "x" },
-            InvalidUtf8,
+            InvalidUtf8 {
+                reason: "invalid UTF-8 lead byte",
+            },
             NestingTooDeep { limit: 128 },
         ];
         for k in &kinds {

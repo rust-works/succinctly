@@ -380,7 +380,28 @@ fn yaml_validate_guard(
     validate: bool,
     filename: Option<&str>,
 ) -> Option<i32> {
-    if !validate || !matches!(format, InputFormat::Yaml | InputFormat::Auto) {
+    if !matches!(format, InputFormat::Yaml | InputFormat::Auto) {
+        return None;
+    }
+    // Encoding is checked *unconditionally*, not only under `--validate`
+    // (#1242). YAML 1.2 requires a UTF-8/16/32 stream and real yq rejects a
+    // document with a stray byte outright (`invalid trailing UTF-8 octet`,
+    // exit 1); succinctly used to accept it, index it, and then hand back
+    // `null` for the scalar that byte was in -- with `--validate` no help,
+    // since the strict validator had no encoding check either. The pass is
+    // whole-input SIMD UTF-8 validation, ~1.1 ms on 8.4 MB, so this is the
+    // one always-on cost the fix adds; the strict grammar walk below stays
+    // opt-in because it is roughly eight times dearer.
+    //
+    // Wording follows this crate's own `YAML parse error:` convention (see
+    // the `YamlIndex::build` failure path) rather than yq's `bad file '-':`
+    // shape, which succinctly already diverges from for every other parse
+    // error.
+    if let Err(err) = succinctly::text::utf8::validate_utf8(input) {
+        eprintln!("Error: YAML parse error: {err}");
+        return Some(exit_codes::FALSE_OR_NULL);
+    }
+    if !validate {
         return None;
     }
     match succinctly::yaml::validate::validate(input) {
