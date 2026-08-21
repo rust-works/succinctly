@@ -176,6 +176,13 @@ impl OutputConfig {
 /// number 5, matching real `yq` (#224). Every recursive call passes a
 /// cursor too (`field.value_cursor()`, `YamlElements::uncons_cursor`), so a
 /// tag on a nested element is never lost.
+///
+/// Materializes through `to_owned_value_for_json_bridge`, not the plain
+/// `to_owned_value`: everything this function builds is headed for
+/// [`evaluate_input`]'s `to_json_for_reindex::<JqSemantics>` round trip,
+/// the one bridge that would otherwise flatten a tag-forced `!!float 2`
+/// to an `Int` (#1176). That variant's doc comment explains why no other
+/// `ResolvedScalar -> OwnedValue` caller wants the same treatment.
 fn yaml_to_owned_value<W: AsRef<[u64]>>(cursor: YamlCursor<'_, W>) -> Result<OwnedValue> {
     match cursor.value() {
         YamlValue::String(s) => {
@@ -185,7 +192,7 @@ fn yaml_to_owned_value<W: AsRef<[u64]>>(cursor: YamlCursor<'_, W>) -> Result<Own
 
             if let Some(explicit) = cursor.explicit_tag() {
                 if let Some(resolved) = resolve_tagged(&str_value, explicit) {
-                    return Ok(resolved.to_owned_value(str_value));
+                    return Ok(resolved.to_owned_value_for_json_bridge(str_value));
                 }
             }
 
@@ -196,7 +203,7 @@ fn yaml_to_owned_value<W: AsRef<[u64]>>(cursor: YamlCursor<'_, W>) -> Result<Own
             }
 
             // Resolve plain scalars per the YAML 1.2 core schema
-            Ok(resolve_plain(&str_value).to_owned_value(str_value))
+            Ok(resolve_plain(&str_value).to_owned_value_for_json_bridge(str_value))
         }
         YamlValue::Mapping(fields) => {
             let mut map = IndexMap::new();

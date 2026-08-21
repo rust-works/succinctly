@@ -106,8 +106,64 @@ impl ResolvedScalar {
     /// (`light.rs`'s `write_resolved_scalar_as_json`/
     /// `stream_resolved_scalar_as_json`) are a different output type and
     /// weren't folded in here — see the #907 follow-up issue.
+    ///
+    /// A tag-forced float (`!!float 2`) stays a bare
+    /// [`OwnedValue::Float`] here, keeping the value's *text* out of it.
+    /// Only the one caller whose round trip cannot carry float-ness any
+    /// other way needs the re-spelling — see
+    /// [`to_owned_value_for_json_bridge`](Self::to_owned_value_for_json_bridge),
+    /// and that function's doc comment for why giving it to every caller
+    /// is wrong.
     #[must_use]
     pub fn to_owned_value(self, text: Cow<'_, str>) -> OwnedValue {
+        self.to_owned_value_with_bridge_respelling(text, false)
+    }
+
+    /// [`to_owned_value`](Self::to_owned_value) for a value about to cross
+    /// `yq_runner.rs`'s `evaluate_input` reindex bridge, which re-spells a
+    /// tag-forced float so its type survives that round trip (#1176).
+    ///
+    /// A *finite* float whose text a plain reader would type as something
+    /// other than `!!float` — i.e. one that is only a float because an
+    /// explicit tag forced it (`!!float 2`, `!!float 0x2A`) — has nowhere
+    /// left to carry that float-ness: neither spelling gate in
+    /// [`to_owned_value`](Self::to_owned_value) accepts an integer-shaped
+    /// mantissa, so it arrives at that bridge as a bare
+    /// [`OwnedValue::Float`], serializes as `2`, and reparses as an `Int`.
+    /// Reproducible with no `-i` at all, via `--slurp '.[0]'` on
+    /// `a: !!float 2`. Re-spelling with a forced decimal point puts the
+    /// type back into the literal itself, where the round trip preserves
+    /// it.
+    ///
+    /// **Only that one caller.** `evaluate_input` is the sole bridge in
+    /// the codebase that hardcodes `to_json_for_reindex::<JqSemantics>`
+    /// (deliberately — `YqSemantics` there re-breaks #978's
+    /// JSON-sourced-`1e2`-renders-as-`100` rule), and jq's plain-`Float`
+    /// fallback is the one that drops the point. Every other bridge is
+    /// `S`-gated and already spells a bare `Float` with
+    /// `format_float_with_fraction` under `YqSemantics`, so a tag-forced
+    /// float survives those untouched. Handing the re-spelling to
+    /// `eval_generic`'s cursor materialization and to `load()` as well
+    /// costs real oracle fidelity: their values reach string-producing
+    /// builtins, where real yq prints the scalar's own text, so
+    /// `!!float 2 | tostring` would answer `2.0` against yq's `2` (and
+    /// likewise `@yaml`, `@props`) — pinned by
+    /// `test_explicit_float_tag_respelling_stays_out_of_string_builtins_1090`
+    /// in `tests/yq_cli_tests.rs`.
+    ///
+    /// `.inf`/`.nan` stay on the bare-`Float` path: they have no decimal
+    /// spelling, and `resolve_plain` already types them `!!float`, so they
+    /// never need this anyway.
+    #[must_use]
+    pub fn to_owned_value_for_json_bridge(self, text: Cow<'_, str>) -> OwnedValue {
+        self.to_owned_value_with_bridge_respelling(text, true)
+    }
+
+    fn to_owned_value_with_bridge_respelling(
+        self,
+        text: Cow<'_, str>,
+        respell_tag_forced_float: bool,
+    ) -> OwnedValue {
         match self {
             Self::Null => OwnedValue::Null,
             Self::Bool(b) => OwnedValue::Bool(b),
@@ -117,29 +173,14 @@ impl ResolvedScalar {
             }
             Self::Float(f) => match preservable_float_literal_text(&text) {
                 Some(normalized) => OwnedValue::from_number_literal(&normalized),
-                // A *finite* float whose text a plain reader would type as
-                // something other than `!!float` -- i.e. one that is only a
-                // float because an explicit tag forced it (`!!float 2`,
-                // `!!float 0x2A`) -- has nowhere left to carry that
-                // float-ness: neither spelling gate above accepts an
-                // integer-shaped mantissa, so it falls through to a bare
-                // `OwnedValue::Float`, and `to_json_for_reindex`'s jq-mode
-                // fallback then serializes that as `2`, which reparses as an
-                // `Int`. The value silently changes type on the DOM route
-                // taken by `-i` and `--slurp` (#1176) -- reproducible with
-                // no `-i` at all via `--slurp '.[0]'` on `a: !!float 2`.
-                //
-                // Re-spelling it with a forced decimal point puts the type
-                // back into the literal itself, where the round trip
-                // preserves it, without touching the reindex bridge's own
-                // semantics gate (flipping that to `YqSemantics` is the
-                // obvious alternative and it re-breaks #978's
-                // JSON-sourced-`1e2`-renders-as-`100` rule).
-                //
-                // `is_finite` keeps `.inf`/`.nan` on the bare-`Float` path:
-                // they have no decimal spelling, and `resolve_plain` already
-                // types them `!!float` so they never need this anyway.
-                None if f.is_finite() && needs_explicit_float_tag(&text) => {
+                // The tag-forced-float re-spelling (#1176) -- gated to
+                // `to_owned_value_for_json_bridge`'s single caller, whose
+                // doc comment carries the full reasoning and the cost of
+                // applying it any wider.
+                None if respell_tag_forced_float
+                    && f.is_finite()
+                    && needs_explicit_float_tag(&text) =>
+                {
                     OwnedValue::from_number_literal(&super::format_float_with_fraction(f))
                 }
                 None => OwnedValue::Float(f),
@@ -470,7 +511,7 @@ pub(super) fn preservable_float_literal_text(s: &str) -> Option<String> {
 /// `resolve_plain`'s `-0` classification later makes both callers
 /// oracle-exact with no change to either.
 #[must_use]
-pub fn needs_explicit_float_tag(text: &str) -> bool {
+pub(crate) fn needs_explicit_float_tag(text: &str) -> bool {
     !matches!(resolve_plain(text), ResolvedScalar::Float(_))
 }
 
