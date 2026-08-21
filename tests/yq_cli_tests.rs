@@ -18037,3 +18037,130 @@ fn test_yq_reduce_foreach_accept_full_pattern_1201() -> Result<()> {
     assert_eq!(output.lines().collect::<Vec<_>>(), ["3", "10"]);
     Ok(())
 }
+
+/// #1247: a mapping key that fails to decode must not hide the *valid*
+/// fields after it. `YamlFields::find`/`find_cursor` used to `?` out of the
+/// whole search on the first undecodable key, so `.b` answered `null` here
+/// even though `keys` still listed `b`.
+///
+/// The key is `"a\qb"` -- `\q` is not a YAML escape, so the scalar is
+/// structurally valid but `as_str()` rejects it. Real yq rejects the whole
+/// document (`found unknown escape character`, exit 1); surfacing the decode
+/// failure as a real error is tracked separately. This pins only that one bad
+/// key no longer destroys valid results.
+#[test]
+fn test_undecodable_mapping_key_does_not_hide_later_fields_1247() -> Result<()> {
+    let input = "\"a\\qb\": 1\nb: 2\n";
+
+    let (output, exit_code) = run_yq_stdin(".b", input, &["-o", "json"])?;
+    assert_eq!(exit_code, 0, "output: {output:?}");
+    assert_eq!(output.trim(), "2");
+
+    let (output, exit_code) = run_yq_stdin("keys | length", input, &["-o", "json"])?;
+    assert_eq!(exit_code, 0, "output: {output:?}");
+    assert_eq!(output.trim(), "2");
+    Ok(())
+}
+
+/// #1247: a decode failure inside a YAML string must not leave a partially
+/// transcoded token behind in the JSON output, and must not pass silently
+/// once anything materializes the value.
+///
+/// The transcoders push the opening `"` -- and any prefix they already
+/// converted -- before they can discover a bad escape, and each caller's
+/// `Err(_)` arm then appended its own `null`/`""` fallback after it. The two
+/// concatenated into JSON that no parser could read, at exit 0:
+///
+/// ```text
+/// b: "x\qy"    ->  {"b": "xnull}      (value arm)
+/// "a\qb": 1    ->  {"a"": 1}          (key arm)
+/// ```
+///
+/// `\q` is not a YAML escape, so the scalar is structurally valid but
+/// undecodable. Real yq rejects the whole document (`found unknown escape
+/// character`, exit 1).
+///
+/// Two routes, deliberately different at this stage of #1247's design (see
+/// `docs/plan/decode-failure-routing.md`):
+///
+/// * the **materializing** routes raise a real error and exit non-zero;
+/// * the **streaming** routes still degrade to `null`/`""` -- but the
+///   document they emit is now parseable, which is what this test's first
+///   half pins. Making streaming loud too needs an error channel through
+///   `stream_json_value`'s `core::fmt::Result`, which is its own stage.
+#[test]
+fn test_decode_failure_does_not_corrupt_json_output_1247() -> Result<()> {
+    for (input, expected) in [
+        ("b: \"x\\qy\"\n", r#"{"b":null}"#),
+        ("\"a\\qb\": 1\n", r#"{"":1}"#),
+    ] {
+        // Streaming: still degrades, but the emitted JSON is valid. `-P`
+        // takes this route too -- it forces pretty-printing, not the DOM.
+        for extra in [
+            &["-o", "json", "-I", "0"][..],
+            &["-o", "json", "-I", "0", "-P"][..],
+        ] {
+            let (output, exit_code) = run_yq_stdin(".", input, extra)?;
+            assert_eq!(exit_code, 0, "args {extra:?}, output: {output:?}");
+            assert_eq!(output.trim(), expected, "args {extra:?}");
+        }
+
+        // Materializing: `--arg` forces the DOM path, and a multi-result
+        // filter loses its cursor to `GenericResult::Many`. Both raise.
+        for extra in [
+            &["-o", "json", "-I", "0", "--arg", "z", "y"][..],
+            &["-o", "json", "-I", "0"][..],
+        ] {
+            let filter = if extra.len() > 4 { "." } else { ".,." };
+            let (output, stderr, exit_code) = run_yq_split(filter, input, extra)?;
+            assert_eq!(exit_code, 1, "args {extra:?}, output: {output:?}");
+            assert!(
+                stderr.contains("invalid escape sequence"),
+                "args {extra:?}, stderr: {stderr}"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// #1242: `succinctly yq` accepted a document with a dangling
+/// non-continuable UTF-8 byte, indexed it, and handed back `null` for the
+/// scalar that byte was in -- at exit 0, with `--validate` no help because
+/// the strict validator had no encoding check either.
+///
+/// Real yq rejects it: `bad file '-': yaml: offset 11: invalid trailing
+/// UTF-8 octet`, exit 1. succinctly now rejects it at the same byte offset
+/// and the same exit code, worded in this crate's own `YAML parse error:`
+/// convention -- the one it already uses for every other YAML parse
+/// failure, rather than yq's `bad file` shape it has never matched.
+///
+/// The check is unconditional, not gated on `--validate`: YAML 1.2 requires
+/// a UTF-8/16/32 stream, so this is a parse error, not an opt-in strictness
+/// preference.
+#[test]
+fn test_yq_rejects_invalid_utf8_document_1242() -> Result<()> {
+    let mut file = tempfile::NamedTempFile::new()?;
+    std::io::Write::write_all(&mut file, b"a: 1\nb: \"x\xe4y\"\n")?;
+    std::io::Write::flush(&mut file)?;
+    let path = file.path().to_str().unwrap();
+
+    for extra in [&["-o", "json"][..], &["-o", "json", "--validate"][..]] {
+        let (output, exit_code) = run_yq_file(".", path, extra)?;
+        assert_eq!(exit_code, 1, "args {extra:?}, output: {output:?}");
+    }
+    Ok(())
+}
+
+/// #1242 guard: ordinary multi-byte content must still parse. The pass runs
+/// on every document, so a false positive here would reject real files.
+#[test]
+fn test_yq_accepts_multibyte_utf8_1242() -> Result<()> {
+    let (output, exit_code) = run_yq_stdin(
+        ".",
+        "a: café\nb: 日本語\nc: 😀\n",
+        &["-o", "json", "-I", "0"],
+    )?;
+    assert_eq!(exit_code, 0, "output: {output:?}");
+    assert_eq!(output.trim(), r#"{"a":"café","b":"日本語","c":"😀"}"#);
+    Ok(())
+}

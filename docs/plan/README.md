@@ -21,6 +21,7 @@ These plans are kept for:
 | [m2-benchmark-improvements.md](m2-benchmark-improvements.md)     | Proposed    | `yq_bench.rs`                     | Benchmark M2 streaming path    |
 | [simd-features.md](simd-features.md)                             | Current     | `src/yaml/simd/`                  | YAML SIMD feature flag matrix  |
 | [cspoppy.md](cspoppy.md)                                         | Implemented | `src/trees/bp.rs`, `src/bits/`    | Combined sampling, BP select   |
+| [decode-failure-routing.md](decode-failure-routing.md)           | Proposed    | `src/jq/`, `src/yaml/`            | Decode-failure error routing   |
 
 ## Archived Plans
 

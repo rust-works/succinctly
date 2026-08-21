@@ -848,11 +848,11 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
         // This preserves original number formatting like "4e4"
         let files = get_input_files(&args);
         let raw_inputs: Vec<Vec<u8>> = if files.is_empty() {
-            vec![read_stdin_bytes()?]
+            vec![utf8_lossy_document(read_stdin_bytes()?)]
         } else {
             files
                 .iter()
-                .map(|path| read_file_bytes(path))
+                .map(|path| read_file_bytes(path).map(utf8_lossy_document))
                 .collect::<Result<Vec<_>>>()?
         };
 
@@ -911,7 +911,18 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
                     had_output = true;
                     // For exit_status tracking, we need to check the last value
                     if args.exit_status {
-                        last_output = Some(result.materialize());
+                        // `-e` is the flag that forces materialization at
+                        // all, so it is where a decode failure first becomes
+                        // observable here (#1247). Report and skip the value
+                        // rather than letting an undecodable string count as
+                        // a truthiness answer; `sink` drives the exit code.
+                        match result.materialize() {
+                            Ok(owned) => last_output = Some(owned),
+                            Err(e) => {
+                                sink.report(DiagStyle::Jq, &e, &at);
+                                continue;
+                            }
+                        }
                     }
                     write_output_jq_value(&mut out, &result, &output_config)?;
                     // result is dropped here, freeing its memory immediately
@@ -1473,17 +1484,40 @@ impl InputLocations {
 
 /// Read stdin to string.
 fn read_stdin() -> Result<String> {
-    let mut buf = String::new();
-    std::io::stdin()
-        .read_to_string(&mut buf)
-        .context("Failed to read from stdin")?;
-    Ok(buf)
+    // Lossy, not `read_to_string`: that refused the whole input on a stray
+    // byte, reporting it as a *read* failure when the read had succeeded
+    // (#1247). See `utf8_lossy_document` for why jq substitutes here.
+    Ok(String::from_utf8_lossy(&read_stdin_bytes()?).into_owned())
 }
 
 /// Read a file to string.
 fn read_file(path: &Path) -> Result<String> {
-    std::fs::read_to_string(path)
-        .with_context(|| format!("Failed to read file: {}", path.display()))
+    // Lossy for the same reason as `read_stdin` above.
+    Ok(String::from_utf8_lossy(&read_file_bytes(path)?).into_owned())
+}
+
+/// Replace every invalid UTF-8 sequence in a *document* with U+FFFD, the
+/// way real jq does (#1247).
+///
+/// jq is the odd one out here: `yq` rejects a non-UTF-8 document outright
+/// (see `yq_runner::yaml_validate_guard`), but jq accepts it, substitutes
+/// the replacement character and exits 0 -- `{"a":"\xff\xfe"}` prints as
+/// `"\u{fffd}\u{fffd}"`. succinctly used to echo the raw bytes instead,
+/// which means it wrote invalid UTF-8 to stdout; the non-lazy path was
+/// worse still, refusing the file with `Failed to read file` when the read
+/// had in fact succeeded.
+///
+/// Valid input is returned untouched and unallocated -- the check is a
+/// whole-input SIMD pass (~1.1 ms on 8.4 MB) and only a document that
+/// actually fails it pays for a copy.
+///
+/// Document input only. `--raw-input` shares this path (jq substitutes
+/// there too), but DSV input, `--arg`/`--argjson` and `--rawfile` do not.
+fn utf8_lossy_document(raw: Vec<u8>) -> Vec<u8> {
+    match succinctly::text::utf8::validate_utf8(&raw) {
+        Ok(()) => raw,
+        Err(_) => String::from_utf8_lossy(&raw).into_owned().into_bytes(),
+    }
 }
 
 /// Read stdin to bytes.
@@ -1722,8 +1756,14 @@ fn validate_json_str(s: &str) -> serde_json::Result<()> {
 /// *normalized* copy but must still materialize the *original* text, see
 /// its own comment), so that one branch calls `validate_json_str`
 /// directly instead.
-fn validate_and_materialize_json(s: &str) -> serde_json::Result<OwnedValue> {
+fn validate_and_materialize_json(
+    s: &str,
+) -> serde_json::Result<core::result::Result<OwnedValue, EvalError>> {
     validate_json_str(s)?;
+    // Two nested results on purpose: the *outer* `Err` is serde's, and only
+    // it may trigger the caller's leading-zero retry. A decode failure
+    // (#1247) is not a validation failure serde could disagree about, so it
+    // must not be mistaken for one -- retrying would just fail again.
     Ok(crate::output::json_bytes_to_owned_value(s.as_bytes()))
 }
 
@@ -1748,7 +1788,8 @@ fn parse_json_value(s: &str) -> Result<OwnedValue> {
     }
 
     match validate_and_materialize_json(s) {
-        Ok(v) => Ok(v),
+        Ok(Ok(v)) => Ok(v),
+        Ok(Err(e)) => Err(anyhow::anyhow!("Invalid JSON: {s}: {e}")),
         Err(e) => {
             // Real jq's own number parser tolerates a leading zero
             // (`007`, `00`, `007.5`) that strict JSON doesn't (#1094) --
@@ -1767,7 +1808,8 @@ fn parse_json_value(s: &str) -> Result<OwnedValue> {
             if normalized == s || validate_json_str(&normalized).is_err() {
                 return Err(e).with_context(|| format!("Invalid JSON: {s}"));
             }
-            Ok(crate::output::json_bytes_to_owned_value(s.as_bytes()))
+            crate::output::json_bytes_to_owned_value(s.as_bytes())
+                .map_err(|e| anyhow::anyhow!("Invalid JSON: {s}: {e}"))
         }
     }
 }
@@ -1995,12 +2037,13 @@ fn parse_json_stream(s: &str) -> Result<Vec<OwnedValue>> {
         Err(e) => {
             let bytes = s.as_bytes();
             match find_json_values(bytes) {
-                Ok(spans) => Ok(spans
+                Ok(spans) => spans
                     .into_iter()
                     .map(|(start, end)| {
                         crate::output::json_bytes_to_owned_value(&bytes[start..end])
                     })
-                    .collect()),
+                    .collect::<core::result::Result<Vec<_>, _>>()
+                    .map_err(|de| anyhow::anyhow!("{de}")),
                 Err(_) => Err(e),
             }
         }
@@ -2037,7 +2080,10 @@ fn parse_json_stream_strict(s: &str) -> Result<Vec<OwnedValue>> {
             .iter()
             .position(|b| !b.is_ascii_whitespace())
             .map_or(prev_end, |offset| prev_end + offset);
-        values.push(crate::output::json_bytes_to_owned_value(&bytes[start..end]));
+        values.push(
+            crate::output::json_bytes_to_owned_value(&bytes[start..end])
+                .map_err(|e| anyhow::anyhow!("{e}"))?,
+        );
         prev_end = end;
     }
 
@@ -2103,11 +2149,20 @@ fn parse_json_seq(s: &str) -> Vec<OwnedValue> {
 
         // Try to parse as JSON, silently ignore failures
         if validate::validate(segment.as_bytes()).is_ok() {
-            values.push(crate::output::json_bytes_to_owned_value(segment.as_bytes()));
+            // See the sibling arm below: no error channel here by design.
+            if let Ok(v) = crate::output::json_bytes_to_owned_value(segment.as_bytes()) {
+                values.push(v);
+            }
         } else {
             let normalized = normalize_leading_zero_numbers(segment);
             if normalized != segment && validate_json_str(&normalized).is_ok() {
-                values.push(crate::output::json_bytes_to_owned_value(segment.as_bytes()));
+                // Skipped, not raised: this function has no error channel
+                // by design -- RFC 7464 says a malformed segment is dropped,
+                // which is the same answer for a segment that parses but
+                // won't decode (#1247).
+                if let Ok(v) = crate::output::json_bytes_to_owned_value(segment.as_bytes()) {
+                    values.push(v);
+                }
             }
             // Genuine parse failures are silently ignored per RFC 7464
         }
@@ -2198,14 +2253,34 @@ fn evaluate_input(
     // (at_offset, at_position builtins)
     let result = eval_with_cursor(expr, cursor);
 
+    // A decode failure while materializing a result is an uncaught error like
+    // any other (#1247): report it to `sink` and yield nothing, so the next
+    // input still runs and the exit code is still set (`ErrorSink`, #355).
+    // Mirrors the `GenericResult::Error` arm below.
+    macro_rules! materialized {
+        ($e:expr) => {
+            match $e {
+                Ok(v) => v,
+                Err(e) => {
+                    sink.report(DiagStyle::Jq, &e, at);
+                    return Ok(vec![]);
+                }
+            }
+        };
+    }
+
     // Convert result to Vec<OwnedValue>
     match result {
-        GenericResult::One(v) => Ok(vec![generic_to_owned(&v)]),
-        GenericResult::OneCursor(c) => Ok(vec![generic_to_owned(&c.value())]),
-        GenericResult::Many(vs) => Ok(vs.iter().map(generic_to_owned).collect()),
-        GenericResult::ManyCursor(cs) => {
-            Ok(cs.iter().map(|c| generic_to_owned(&c.value())).collect())
-        }
+        GenericResult::One(v) => Ok(vec![materialized!(generic_to_owned(&v))]),
+        GenericResult::OneCursor(c) => Ok(vec![materialized!(generic_to_owned(&c.value()))]),
+        GenericResult::Many(vs) => Ok(materialized!(vs
+            .iter()
+            .map(generic_to_owned)
+            .collect::<core::result::Result<Vec<_>, _>>())),
+        GenericResult::ManyCursor(cs) => Ok(materialized!(cs
+            .iter()
+            .map(|c| generic_to_owned(&c.value()))
+            .collect::<core::result::Result<Vec<_>, _>>())),
         // Fallback: materialize. This runner boundary never sees a
         // fast-pathed `keys`/`keys_unsorted | length`/`.[]`/`.[n]`/`first`/
         // `last` — those are fully resolved inside the evaluator's `Pipe`
@@ -2475,7 +2550,11 @@ fn standard_json_to_jq_value<'a, W: Clone + AsRef<[u64]>>(
             }
             JqValue::Object(map)
         }
-        StandardJson::Error(_) => JqValue::Null,
+        // See `eval_generic::to_owned_at_depth`'s own `is_error` arm
+        // (#1194/#1247): a structurally malformed value -- one the
+        // semi-index accepted as a span but could not classify as any JSON
+        // token -- raises rather than becoming `null`.
+        StandardJson::Error(msg) => return Err(EvalError::new(msg.to_string())),
     })
 }
 
@@ -2508,8 +2587,13 @@ fn write_output_jq_value<Out: Write, Wrd: Clone + AsRef<[u64]>>(
             print_json(out, value, &PreserveFormatter, config, 0)?;
         }
     } else {
-        // For complex output (pretty-print, sort_keys, colors), materialize first
-        let owned = value.materialize();
+        // For complex output (pretty-print, sort_keys, colors), materialize
+        // first -- and surface a decode failure rather than printing the
+        // empty string it used to become (#1247). `anyhow` is the only error
+        // channel this writer has; the message is preserved verbatim.
+        let owned = value
+            .materialize()
+            .map_err(|e| anyhow::anyhow!("{}", e.message))?;
         out.write_all(format_json(&owned, config).as_bytes())?;
     }
 
@@ -2886,6 +2970,20 @@ where
                         out.write_all(b"}")?;
                     }
                 }
+                // A structurally malformed value the semi-index accepted as
+                // a span but could not classify (`[xyz123]`, `[tru]`), still
+                // printed as `null` -- so this lazy output path disagrees
+                // with every materializing one, which now raises (#1194).
+                //
+                // Deliberately NOT raised here, and this was tried: `print_json`
+                // walks child cursors lazily and streams as it goes, so by the
+                // time a nested error is reached it has already written the
+                // opening `[`. Bailing produced a truncated document plus a
+                // generic exit 1, where the materializing routes give a clean
+                // diagnostic and exit 5 -- worse on every axis than the silent
+                // `null`. Needs the same error channel as the YAML streaming
+                // path; tracked together as Stage 6 in
+                // `docs/plan/decode-failure-routing.md`.
                 StandardJson::Error(_) => out.write_all(b"null")?,
             }
         }

@@ -3258,7 +3258,30 @@ fn transcode_fold_line_break_to_json(bytes: &[u8], mut i: usize, output: &mut St
 ///
 /// Returns true if the string was written as a JSON string (quoted),
 /// false if it should be treated as a scalar for type detection.
+///
+/// **All-or-nothing on failure.** The transcoders push the opening `"` -- and
+/// whatever prefix they already converted -- into `output` before they can
+/// discover a bad escape, and every caller's `Err(_)` arm then appends its own
+/// `null`/`""` fallback after it. The two concatenated into JSON that no parser
+/// could read (`{"b": "xnull}` for a value, `{"a"": 1}` for a key, both at exit
+/// 0 -- #1247). Rewinding to the entry length here fixes every call site at
+/// once instead of asking each to remember; the value still degrades to the
+/// caller's fallback, it just no longer corrupts the document around it.
 fn write_yaml_string_to_json(
+    output: &mut String,
+    s: &YamlString<'_>,
+) -> Result<bool, YamlStringError> {
+    let mark = output.len();
+    let result = write_yaml_string_to_json_at(output, s);
+    if result.is_err() {
+        output.truncate(mark);
+    }
+    result
+}
+
+/// The body of [`write_yaml_string_to_json`], which owns the rollback. Never
+/// call this directly -- a partial write escaping it is the bug above.
+fn write_yaml_string_to_json_at(
     output: &mut String,
     s: &YamlString<'_>,
 ) -> Result<bool, YamlStringError> {
@@ -3990,7 +4013,14 @@ fn stream_yaml_string_to_json<Out: core::fmt::Write>(
                 let s = core::str::from_utf8(bytes).map_err(|_| YamlStringError::InvalidUtf8)?;
                 stream_json_string(out, s).map_err(|_| YamlStringError::InvalidUtf8)?;
             } else {
-                stream_transcode_double_quoted_to_json(out, bytes)?;
+                // `Out` cannot be rewound the way `write_yaml_string_to_json`'s
+                // `String` can, so transcode into a scratch buffer and commit
+                // only once it succeeds (#1247). Only this branch pays the
+                // allocation: the fast path above decodes before it writes.
+                let mut committed = String::new();
+                stream_transcode_double_quoted_to_json(&mut committed, bytes)?;
+                out.write_str(&committed)
+                    .map_err(|_| YamlStringError::InvalidUtf8)?;
             }
             Ok(true)
         }
@@ -4002,7 +4032,12 @@ fn stream_yaml_string_to_json<Out: core::fmt::Write>(
                 let s = core::str::from_utf8(bytes).map_err(|_| YamlStringError::InvalidUtf8)?;
                 stream_json_string(out, s).map_err(|_| YamlStringError::InvalidUtf8)?;
             } else {
-                stream_transcode_single_quoted_to_json(out, bytes)?;
+                // Same commit-on-success rollback as the double-quoted arm
+                // above (#1247).
+                let mut committed = String::new();
+                stream_transcode_single_quoted_to_json(&mut committed, bytes)?;
+                out.write_str(&committed)
+                    .map_err(|_| YamlStringError::InvalidUtf8)?;
             }
             Ok(true)
         }
@@ -4277,7 +4312,12 @@ impl<'a, W: AsRef<[u64]>> YamlFields<'a, W> {
         let mut result = None;
         while let Some((field, rest)) = fields.uncons() {
             if let YamlValue::String(key) = field.key() {
-                if key.as_str().ok()? == name {
+                // Same undecodable-key skip as `JsonFields::find` in
+                // `src/json/light.rs` -- see that function for the full
+                // rationale (#1247). A mapping key that fails to decode is
+                // skipped rather than ending the search, so it can no longer
+                // hide valid later fields from lookup.
+                if key.as_str().is_ok_and(|k| k == name) {
                     result = Some(field.value());
                 }
             }
@@ -4296,7 +4336,9 @@ impl<'a, W: AsRef<[u64]>> YamlFields<'a, W> {
         let mut result = None;
         while let Some((field, rest)) = fields.uncons() {
             if let YamlValue::String(key) = field.key() {
-                if key.as_str().ok()? == name {
+                // Same undecodable-key skip as `find` above (#1247); see
+                // `JsonFields::find` in `src/json/light.rs` for the rationale.
+                if key.as_str().is_ok_and(|k| k == name) {
                     result = Some(field.value_cursor());
                 }
             }
@@ -5159,12 +5201,25 @@ pub enum YamlStringError {
     InvalidEscape,
 }
 
+impl YamlStringError {
+    /// The human-readable reason, as a `&'static str`.
+    ///
+    /// Split out of [`Display`](core::fmt::Display) (which now defers to it)
+    /// for the same reason as [`JsonError::message`](crate::json::light::JsonError::message):
+    /// one definition shared with the formatter instead of the same strings
+    /// restated at an allocation-free call site.
+    #[must_use]
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::InvalidUtf8 => "invalid UTF-8 in string",
+            Self::InvalidEscape => "invalid escape sequence",
+        }
+    }
+}
+
 impl core::fmt::Display for YamlStringError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::InvalidUtf8 => write!(f, "invalid UTF-8 in string"),
-            Self::InvalidEscape => write!(f, "invalid escape sequence"),
-        }
+        f.write_str(self.message())
     }
 }
 
@@ -6279,6 +6334,20 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentValue for YamlValue<'a, W> {
                     .as_str()
                     .map(|cow| Cow::Owned(cow.into_owned()))
             }),
+            _ => None,
+        }
+    }
+
+    fn string_decode_error(&self) -> Option<&'static str> {
+        match self {
+            YamlValue::String(s) => s.as_str().err().map(YamlStringError::message),
+            // Resolve the whole chain first, exactly as `as_str` above does
+            // and for the same reason (#1191): a 2+-hop alias to a string is
+            // still a string, and answering from a single hop would report
+            // "not a decode failure" for a target that genuinely is one.
+            YamlValue::Alias { target, .. } => {
+                target.and_then(|t| t.resolve_alias_chain()?.string_decode_error())
+            }
             _ => None,
         }
     }
@@ -7480,6 +7549,36 @@ mod tests {
             }
         } else {
             panic!("expected mapping");
+        }
+    }
+
+    #[test]
+    fn test_mapping_find_skips_undecodable_key_1247() {
+        // A key carrying a dangling non-continuable UTF-8 byte is a
+        // structurally valid scalar that `as_str()` cannot decode. It used to
+        // `?` out of `find` entirely, hiding the *valid* `b: 2` after it, so
+        // `.b` answered `null` while `keys` still listed `b` (#1247).
+        let yaml = b"\"a\xe4b\": 1\nb: 2\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let root = index.root(yaml);
+
+        let YamlValue::Mapping(fields) = first_doc(root) else {
+            panic!("expected mapping");
+        };
+        // Deliberately not `{other:?}` in these panics: `YamlValue`'s `Debug`
+        // reaches the shared index and prints it whole.
+        if let Some(YamlValue::String(s)) = fields.find("b") {
+            assert_eq!(&*s.as_str().unwrap(), "2");
+        } else {
+            panic!("find should reach b past an undecodable key");
+        }
+        let cursor = fields
+            .find_cursor("b")
+            .expect("find_cursor should reach b past an undecodable key");
+        if let YamlValue::String(s) = cursor.value() {
+            assert_eq!(&*s.as_str().unwrap(), "2");
+        } else {
+            panic!("find_cursor should reach the string scalar \"2\"");
         }
     }
 

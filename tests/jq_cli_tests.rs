@@ -14370,3 +14370,181 @@ fn test_tonumber_rejects_internal_overflow_sentinels_1090() {
         );
     }
 }
+
+/// #1247: an object key that fails to decode must not hide the *valid*
+/// fields after it. `JsonFields::find`/`find_cursor` used to `?` out of the
+/// whole search on the first undecodable key, so `.b` answered `null` here
+/// even though `keys_unsorted`/`length` -- which never decode a key -- both
+/// still reported `b`. That inconsistency is the reason this is worth an
+/// end-to-end test and not just a unit one: the two halves of the CLI
+/// disagreed with each other about whether the field existed.
+///
+/// Real jq rejects this document outright (`Invalid \uXXXX\uXXXX surrogate
+/// pair escape`, exit 5). Surfacing the decode failure as a real error is
+/// tracked separately (#1247's own remaining stages); this test pins only
+/// that one bad key no longer destroys valid results.
+#[test]
+fn test_undecodable_object_key_does_not_hide_later_fields_1247() {
+    let input = r#"{"\ud800": 1, "b": 2}"#;
+
+    let (stdout, stderr, code) = run_jq_full(&["-c", ".b"], Some(input))
+        .unwrap_or_else(|e| panic!("`.b` failed to run: {e}"));
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(stdout.trim(), "2", "stderr: {stderr}");
+
+    // The half that was already right, pinned so the two can't drift apart
+    // again in the other direction.
+    let (stdout, _, code) = run_jq_full(&["-c", "keys_unsorted, length"], Some(input))
+        .unwrap_or_else(|e| panic!("`keys_unsorted, length` failed to run: {e}"));
+    assert_eq!(code, 0);
+    assert_eq!(stdout.lines().last(), Some("2"));
+}
+
+/// #1247 core: a string scalar the semi-index accepted but that cannot be
+/// *decoded* must surface as a real jq error once anything materializes it,
+/// instead of silently becoming `null` (`eval_generic::to_owned`) or `""`
+/// (`lazy::cursor_to_owned`).
+///
+/// Every filter here materializes; each used to answer with a fabricated
+/// value at exit 0. `.a | length` is the sharpest case: it reported
+/// `null (null) has no length` -- a type error about a value that is a
+/// perfectly good string token, naming a symptom two steps removed from the
+/// cause.
+///
+/// Real jq rejects the document at parse time (exit 5). succinctly reaches
+/// the same exit code by a different route -- an uncaught evaluation error --
+/// because it never parses the whole document up front. Message text is
+/// therefore succinctly's own, and is asserted only for the decode reason.
+#[test]
+fn test_decode_failure_surfaces_as_error_1247() {
+    let doc = r#"{"a": "\ud800"}"#;
+    // Not `length` on the object itself: that answers from `fields.len()`
+    // without decoding a single key, which is a genuine fast path rather
+    // than a degrade -- it returns the same count jq would.
+    for filter in [
+        "to_entries",
+        "[.a] | sort",
+        ".a | length",
+        ".a | ascii_downcase",
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(doc))
+            .unwrap_or_else(|e| panic!("`{filter}` failed to run: {e}"));
+        assert_ne!(code, 0, "`{filter}` should fail\nstdout: {stdout}");
+        assert!(
+            stderr.contains("invalid unicode escape sequence"),
+            "`{filter}` should name the decode failure, not a downstream type error\nstderr: {stderr}"
+        );
+    }
+}
+
+/// #1247: an undecodable *key* raises too, and does not silently shrink the
+/// object. `to_entries` used to return one entry fewer than the document had
+/// -- `effective_fields`' dedup walk dropped any field whose key wouldn't
+/// decode, before anything could notice.
+#[test]
+fn test_decode_failure_in_key_surfaces_as_error_1247() {
+    let doc = r#"{"\ud800": 1, "b": 2}"#;
+    let (stdout, stderr, code) = run_jq_full(&["-c", "to_entries"], Some(doc))
+        .unwrap_or_else(|e| panic!("failed to run: {e}"));
+    assert_ne!(code, 0, "stdout: {stdout}");
+    assert!(
+        stderr.contains("in object key"),
+        "stderr should name the key as the site: {stderr}"
+    );
+}
+
+/// #1247 guard: the new check must not fire on anything that decodes
+/// cleanly, including the escapes and non-ASCII that look most like the
+/// failing case.
+#[test]
+fn test_valid_escapes_still_materialize_1247() {
+    let doc = r#"{"a": "é😀\n\t\"", "b": "café"}"#;
+    let (stdout, stderr, code) = run_jq_full(&["-c", "to_entries | length"], Some(doc))
+        .unwrap_or_else(|e| panic!("failed to run: {e}"));
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout.trim(), "2");
+}
+
+/// #1194 (the half in #1247's scope): a *structurally* malformed value --
+/// one the semi-index accepted as a span but could not classify as any JSON
+/// token -- must not materialize as `null`. `[xyz123]` came back as `[null]`
+/// at exit 0 where real jq raises `Invalid numeric literal` and exits 5.
+///
+/// Every materializing route raises now. The lazy output path (`.`, `.[0]`)
+/// still prints `null`: it streams as it walks, so by the time a nested
+/// error is reached the opening bracket is already written, and bailing
+/// there truncates the document. That is tracked as Stage 6 of #1247's
+/// design, not fixed here -- see `docs/plan/decode-failure-routing.md`.
+///
+/// `{invalid}` is NOT covered: `JsonFields::uncons` collapses a lone
+/// bareword leaf into "no more fields" at the semi-index layer, so no field
+/// is ever constructed to raise on, and the object simply reads as `{}`.
+/// That is #1194's remaining half and needs its own change.
+#[test]
+fn test_malformed_value_surfaces_as_error_1194() {
+    for doc in ["[xyz123]", "[tru]", "[1,zzz,3]"] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", "to_entries"], Some(doc))
+            .unwrap_or_else(|e| panic!("`{doc}` failed to run: {e}"));
+        assert_ne!(code, 0, "`{doc}` should fail\nstdout: {stdout}");
+        assert!(
+            !stderr.is_empty(),
+            "`{doc}` should carry a diagnostic: {stderr}"
+        );
+    }
+
+    // Evaluation continues past the bad value, per the `ErrorSink`
+    // convention (#355): the two good documents either side of it still
+    // produce output, and the exit code still reports the failure.
+    let (stdout, _, code) = run_jq_full(
+        &["-c", "to_entries"],
+        Some("{\"a\":1}\n[xyz123]\n{\"b\":2}\n"),
+    )
+    .unwrap_or_else(|e| panic!("failed to run: {e}"));
+    assert_ne!(code, 0);
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        [r#"[{"key":"a","value":1}]"#, r#"[{"key":"b","value":2}]"#]
+    );
+}
+
+/// #1247: jq is the odd oracle out on invalid UTF-8. `yq` rejects such a
+/// document outright (#1242); `jq` accepts it, substitutes U+FFFD and exits
+/// 0. succinctly did neither -- it echoed the raw bytes, writing invalid
+/// UTF-8 to stdout, and the non-lazy path refused the file entirely with
+/// `Failed to read file` when the read had in fact succeeded.
+///
+/// Asserted on bytes, not on a lossily-decoded string: the whole point is
+/// which bytes reach stdout.
+#[test]
+fn test_invalid_utf8_document_substitutes_replacement_char_1247() -> Result<()> {
+    let mut file = NamedTempFile::new()?;
+    file.write_all(b"{\"a\":\"\xff\xfe\",\"b\":1}")?;
+    file.flush()?;
+    let path = file.path().to_str().unwrap();
+
+    // Two U+FFFD, one per invalid byte -- exactly what jq 1.7.1 emits here.
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", ".a", path], None).unwrap_or_else(|e| panic!("failed to run: {e}"));
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout.trim(), "\"\u{fffd}\u{fffd}\"");
+
+    // The non-lazy path (`-S` forces materialized, sorted output) used to
+    // fail the read outright; it must agree with the lazy one now.
+    let (stdout, stderr, code) = run_jq_full(&["-c", "-S", ".", path], None)
+        .unwrap_or_else(|e| panic!("failed to run: {e}"));
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout.trim(), "{\"a\":\"\u{fffd}\u{fffd}\",\"b\":1}");
+    Ok(())
+}
+
+/// #1247 guard: the substitution pass must leave valid multi-byte content
+/// byte-for-byte alone -- it runs on every document, so a false positive
+/// would corrupt ordinary files.
+#[test]
+fn test_valid_multibyte_document_is_untouched_1247() {
+    let doc = r#"{"a":"café","b":"日本語","c":"😀"}"#;
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", "."], Some(doc)).unwrap_or_else(|e| panic!("failed to run: {e}"));
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout.trim(), doc);
+}

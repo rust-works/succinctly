@@ -134,7 +134,7 @@ fn bench_generic_index_json(c: &mut Criterion) {
                 "depth {depth} level {i} fixture must not error"
             );
             assert!(
-                probe.collect_owned().is_empty(),
+                probe.collect_owned().expect("materializes").is_empty(),
                 "depth {depth} level {i} fixture must produce no output"
             );
         }
@@ -146,7 +146,7 @@ fn bench_generic_index_json(c: &mut Criterion) {
                 for expr in &exprs {
                     let cursor = index.root(black_box(json));
                     let result = eval_with_cursor(expr, cursor);
-                    total += result.collect_owned().len();
+                    total += result.collect_owned().expect("materializes").len();
                 }
                 black_box(total)
             });
@@ -184,7 +184,7 @@ fn bench_generic_index_yaml(c: &mut Criterion) {
                 "depth {depth} level {i} fixture must not error"
             );
             assert!(
-                probe.collect_owned().is_empty(),
+                probe.collect_owned().expect("materializes").is_empty(),
                 "depth {depth} level {i} fixture must produce no output"
             );
         }
@@ -199,7 +199,7 @@ fn bench_generic_index_yaml(c: &mut Criterion) {
                         .first_child()
                         .expect("fixture has exactly one document");
                     let result = eval_with_cursor_using::<YqSemantics, _>(expr, cursor);
-                    total += result.collect_owned().len();
+                    total += result.collect_owned().expect("materializes").len();
                 }
                 black_box(total)
             });
