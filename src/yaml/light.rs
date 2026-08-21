@@ -7335,6 +7335,43 @@ mod tests {
         let _ = z.as_str();
     }
 
+    /// #1193/PR #1314 code review: `YamlCursor::tag`'s own `Alias` arm had
+    /// the identical self-recursive shape as the typed accessors above
+    /// (`t.tag()`, re-entering itself once per hop) -- found live via a
+    /// direct call to this method (not reachable through the yq CLI's own
+    /// `tag` builtin, which operates on an already-materialized value, not
+    /// a cursor -- see `resolve_alias_target_cursor`'s doc comment for the
+    /// other methods in the same boat). Confirms the fix resolves a
+    /// 50,000-hop chain without panicking or overflowing the stack.
+    #[test]
+    fn test_tag_resolves_deep_alias_chain_without_stack_overflow_1193() {
+        let yaml = build_alias_chain_yaml(50_000);
+        let index = YamlIndex::build(yaml.as_bytes()).unwrap();
+        let root = index.root(yaml.as_bytes());
+        let YamlValue::Mapping(fields) = first_doc(root) else {
+            panic!("expected root document to be a mapping");
+        };
+        let z_cursor = fields.find_cursor("z").expect("z field must exist");
+        assert_eq!(z_cursor.tag(), "!!str");
+    }
+
+    /// #1193/PR #1314 code review: the success-path test above never
+    /// exercises `MAX_ALIAS_CHAIN_DEPTH`'s own boundary for `tag()` -- see
+    /// `test_as_str_panics_past_max_alias_chain_depth_1191`'s matching
+    /// rationale and its `+ 2` note, which applies identically here.
+    #[test]
+    #[should_panic(expected = "nesting depth exceeds limit")]
+    fn test_tag_panics_past_max_alias_chain_depth_1193() {
+        let yaml = build_alias_chain_yaml(MAX_ALIAS_CHAIN_DEPTH + 2);
+        let index = YamlIndex::build(yaml.as_bytes()).unwrap();
+        let root = index.root(yaml.as_bytes());
+        let YamlValue::Mapping(fields) = first_doc(root) else {
+            panic!("expected root document to be a mapping");
+        };
+        let z_cursor = fields.find_cursor("z").expect("z field must exist");
+        let _ = z_cursor.tag();
+    }
+
     #[test]
     fn test_simple_mapping_navigation() {
         let yaml = b"name: Alice";
