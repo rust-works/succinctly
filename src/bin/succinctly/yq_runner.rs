@@ -1120,8 +1120,16 @@ fn write_split_result(
 
 /// One step of a path into a paired `OwnedValue`/[`CommentTree`] tree, used
 /// by [`enforce_anchor_soundness`] to revisit a node it decided to strip.
-enum TreeStep {
-    Key(String),
+///
+/// Borrows its key straight out of the `OwnedValue` being scanned rather
+/// than owning it: the scan pushes a step for every object field it walks,
+/// so an owned `String` here would be one allocation per field on every DOM
+/// emit. The borrow is sound because the value tree and the `CommentTree`
+/// the second pass mutates are two distinct objects (see
+/// [`enforce_anchor_soundness`]'s two parameters).
+#[derive(Clone, Copy)]
+enum TreeStep<'a> {
+    Key(&'a str),
     Index(usize),
 }
 
@@ -1152,18 +1160,25 @@ enum TreeStep {
 /// Anchor *declarations* are never dropped: an unreferenced `&x` is valid
 /// YAML and real `yq` keeps it (`yq 'del(.b)'` still prints `a: &x 1`).
 fn enforce_anchor_soundness(value: &OwnedValue, comments: &mut CommentTree, sort_keys: bool) {
-    let mut declared: IndexMap<&str, &OwnedValue> = IndexMap::new();
-    let mut unresolvable: Vec<Vec<TreeStep>> = Vec::new();
-    let mut path = Vec::new();
-    scan_anchor_soundness(
-        value,
-        comments,
-        sort_keys,
-        &mut declared,
-        &mut unresolvable,
-        &mut path,
-        0,
-    );
+    // Scoped so the scan's immutable borrow of `*comments` (and the anchor
+    // names `declared` keys on, which live in it) has certainly ended
+    // before the second pass takes a mutable one. The flagged paths borrow
+    // only from `value`, which the second pass never touches.
+    let unresolvable: Vec<Vec<TreeStep<'_>>> = {
+        let mut declared: IndexMap<&str, &OwnedValue> = IndexMap::new();
+        let mut unresolvable = Vec::new();
+        let mut path = Vec::new();
+        scan_anchor_soundness(
+            value,
+            comments,
+            sort_keys,
+            &mut declared,
+            &mut unresolvable,
+            &mut path,
+            0,
+        );
+        unresolvable
+    };
     for steps in &unresolvable {
         if let Some(node) = comment_tree_at_path_mut(comments, steps) {
             node.meta_mut().anchor = None;
@@ -1178,13 +1193,13 @@ fn enforce_anchor_soundness(value: &OwnedValue, comments: &mut CommentTree, sort
 /// straight out of `value` rather than cloning whole anchored subtrees; the
 /// flagged paths are applied in a second pass. Panics past
 /// `MAX_VALUE_TREE_DEPTH`, like every other walker over this pair.
-fn scan_anchor_soundness<'a>(
-    value: &'a OwnedValue,
-    comments: &'a CommentTree,
+fn scan_anchor_soundness<'v, 'c>(
+    value: &'v OwnedValue,
+    comments: &'c CommentTree,
     sort_keys: bool,
-    declared: &mut IndexMap<&'a str, &'a OwnedValue>,
-    unresolvable: &mut Vec<Vec<TreeStep>>,
-    path: &mut Vec<TreeStep>,
+    declared: &mut IndexMap<&'c str, &'v OwnedValue>,
+    unresolvable: &mut Vec<Vec<TreeStep<'v>>>,
+    path: &mut Vec<TreeStep<'v>>,
     depth: usize,
 ) {
     assert_value_tree_depth(depth);
@@ -1201,7 +1216,7 @@ fn scan_anchor_soundness<'a>(
         // MSRV is 1.73.
         Some(AnchorMark::Aliases(name)) if !matches!(declared.get(name.as_str()), Some(d) if *d == value) =>
         {
-            unresolvable.push(clone_steps(path));
+            unresolvable.push(path.clone());
         }
         Some(AnchorMark::Aliases(_)) => {}
         None => {}
@@ -1221,7 +1236,7 @@ fn scan_anchor_soundness<'a>(
             }
             for k in keys {
                 let Some(v) = fields.get(k) else { continue };
-                path.push(TreeStep::Key(k.clone()));
+                path.push(TreeStep::Key(k.as_str()));
                 scan_anchor_soundness(
                     v,
                     comments.field(k),
@@ -1253,27 +1268,18 @@ fn scan_anchor_soundness<'a>(
     }
 }
 
-fn clone_steps(path: &[TreeStep]) -> Vec<TreeStep> {
-    path.iter()
-        .map(|s| match s {
-            TreeStep::Key(k) => TreeStep::Key(k.clone()),
-            TreeStep::Index(i) => TreeStep::Index(*i),
-        })
-        .collect()
-}
-
 /// Mutable counterpart of [`CommentTree::field`]/[`CommentTree::at_index`],
 /// following a whole path. `None` if any step is missing — which cannot
 /// happen for a path [`scan_anchor_soundness`] just walked, but the
 /// accessors have no infallible form.
 fn comment_tree_at_path_mut<'t>(
     tree: &'t mut CommentTree,
-    steps: &[TreeStep],
+    steps: &[TreeStep<'_>],
 ) -> Option<&'t mut CommentTree> {
     let mut node = tree;
     for step in steps {
         node = match (node, step) {
-            (CommentTree::Object(_, fields, _), TreeStep::Key(k)) => fields.get_mut(k)?,
+            (CommentTree::Object(_, fields, _), TreeStep::Key(k)) => fields.get_mut(*k)?,
             (CommentTree::Array(_, items), TreeStep::Index(i)) => items.get_mut(*i)?,
             _ => return None,
         };
@@ -1306,13 +1312,13 @@ fn evaluate_yaml_cursor<W: AsRef<[u64]> + Clone>(
     // assignment-family expression against a document that actually has
     // aliases. Everything else (JSON, plain reads, alias-free YAML) pays
     // nothing beyond this one bool check.
-    let alias_sync_ctx =
-        (is_alias_sensitive_assign(expr) && cursor.index().has_aliases()).then(|| {
-            (
-                generic_to_owned(&cursor.value()),
-                collect_alias_groups(cursor),
-            )
-        });
+    let has_aliases = cursor.index().has_aliases();
+    let alias_sync_ctx = (is_alias_sensitive_assign(expr) && has_aliases).then(|| {
+        (
+            generic_to_owned(&cursor.value()),
+            collect_alias_groups(cursor),
+        )
+    });
 
     // Snapshot the pristine presentation tree *before* evaluation too
     // (#739, ADR-0017): same shape-preserving-write gate as `alias_sync_ctx`
@@ -1501,9 +1507,18 @@ fn evaluate_yaml_cursor<W: AsRef<[u64]> + Clone>(
     // run after `sync_aliased_paths` above, whose whole job is making an
     // alias's value agree with its anchor's again — running before it would
     // see stale values and drop marks that are about to become valid.
-    if let Ok(docs) = &mut docs {
-        for (value, comments) in docs.iter_mut() {
-            enforce_anchor_soundness(value, comments, sort_keys);
+    //
+    // `has_aliases` gates it the way it gates `alias_sync_ctx` above, and
+    // for a stronger reason than "probably nothing to do": this pass only
+    // ever clears `Aliases` marks and never touches a `Declares` one, so a
+    // document with no `*name` anywhere has nothing it *could* change. The
+    // walk is not free — it visits every node of the reconciled tree — and
+    // an alias-free document is the overwhelmingly common case.
+    if has_aliases {
+        if let Ok(docs) = &mut docs {
+            for (value, comments) in docs.iter_mut() {
+                enforce_anchor_soundness(value, comments, sort_keys);
+            }
         }
     }
 
