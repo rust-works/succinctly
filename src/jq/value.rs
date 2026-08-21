@@ -139,10 +139,12 @@ pub(crate) fn parse_i64_or_f64(s: &str) -> Option<NumberRepr> {
 /// subsumes #1171's separate leading-dot-gets-a-`0`-prefix rule, rather
 /// than needing its own case.
 fn strip_insignificant_leading_zero_and_plus(s: &str) -> String {
-    let (sign, rest) = match s.strip_prefix('-') {
-        Some(rest) => ("-", rest),
-        None => ("", s.strip_prefix('+').unwrap_or(s)),
-    };
+    // `strip_leading_sign` (#1304 code review): this was a fourth copy of
+    // the same "peel `-`, else peel `+`" shape `strip_leading_sign` was
+    // introduced to consolidate, left behind in the very pass meant to
+    // close that gap.
+    let (negative, rest) = strip_leading_sign(s);
+    let sign = if negative { "-" } else { "" };
     let (int_part, frac_part) = match rest.split_once('.') {
         Some((i, f)) => (i, Some(f)),
         None => (rest, None),
@@ -622,14 +624,19 @@ fn parse_literal_exponent(exp_text: &str) -> ExpParse {
 /// checks the first character once.
 ///
 /// Shared so "peel a leading sign off digit text" has exactly one
-/// implementation instead of three independently reimplementing it
-/// slightly differently (#106, #1304 code review): [`split_mantissa`]'s
-/// old `strip_prefix(['-', '+'])`, this function's old
+/// implementation instead of four independently reimplementing it
+/// slightly differently (#106, #1304 code review):
+/// [`strip_insignificant_leading_zero_and_plus`]'s old
+/// `strip_prefix('-')`/`strip_prefix('+')` match, [`split_mantissa`]'s old
+/// `strip_prefix(['-', '+'])`, [`parse_literal_exponent`]'s old
 /// `trim_start_matches('+')` + `starts_with('-')`, and
 /// [`assemble_scientific_from_raw_exponent`]'s old `strip_prefix('+')`
 /// then `strip_prefix('-')` were each correct today only because the
-/// lexer's own invariant happens to make all three equivalent -- nothing
-/// enforced that they'd stay in agreement if it ever didn't.
+/// lexer's own invariant happens to make all four equivalent -- nothing
+/// enforced that they'd stay in agreement if it ever didn't. (An initial
+/// pass at this consolidation missed the first of these four -- code
+/// review caught that the "three" this comment originally claimed left
+/// one copy standing in the very file being cleaned up.)
 fn strip_leading_sign(s: &str) -> (bool, &str) {
     match s.strip_prefix('-') {
         Some(rest) => (true, rest),
@@ -1110,24 +1117,36 @@ fn format_near_zero_literal(s: &str, exp_pos: usize, negative: bool) -> String {
             // underflow once `frac_len` is subtracted. `frac_len` is always
             // `>= 0` (`str::len()`), so this can only underflow toward
             // `i128::MIN`, never overflow toward `MAX`.
-            let (shifted_exp, sub_saturated) = match parsed_exp.value().checked_sub(frac_len) {
+            let (shifted_exp_value, sub_saturated) = match parsed_exp.value().checked_sub(frac_len)
+            {
                 Some(v) => (v, false),
                 None => (i128::MIN, true),
             };
-            if parsed_exp.is_saturated() || sub_saturated {
+            // Folded into an `ExpParse` and matched exhaustively below,
+            // mirroring the `Ok` arm above exactly, rather than a plain
+            // `if saturated || sub_saturated` boolean fork (#1304 code
+            // review: that was the identical unprotected-boolean pattern
+            // the `Ok` arm's own enum match exists to avoid, just
+            // relocated to this arm instead of actually closed).
+            let shifted_exp = if parsed_exp.is_saturated() || sub_saturated {
+                ExpParse::Saturated(shifted_exp_value)
+            } else {
+                ExpParse::Exact(shifted_exp_value)
+            };
+            match shifted_exp {
                 // Same reasoning as the `Ok` arm above; the all-zero-mantissa
                 // shift (`frac_len`) is dropped along with the exact-value
                 // path rather than folded into the raw text (see
                 // `assemble_scientific_from_raw_exponent`'s own doc comment
                 // on why the shift isn't attempted here).
-                return assemble_scientific_from_raw_exponent(sign, "0", &s[exp_pos + 1..]);
-            }
-            if shifted_exp == 0 {
-                format!("{sign}0")
-            } else if (-6..0).contains(&shifted_exp) {
-                format!("{sign}0.{}", "0".repeat((-shifted_exp) as usize))
-            } else {
-                assemble_scientific(sign, "0", shifted_exp)
+                ExpParse::Saturated(_) => {
+                    assemble_scientific_from_raw_exponent(sign, "0", &s[exp_pos + 1..])
+                }
+                ExpParse::Exact(0) => format!("{sign}0"),
+                ExpParse::Exact(shifted_exp) if (-6..0).contains(&shifted_exp) => {
+                    format!("{sign}0.{}", "0".repeat((-shifted_exp) as usize))
+                }
+                ExpParse::Exact(shifted_exp) => assemble_scientific(sign, "0", shifted_exp),
             }
         }
     }
