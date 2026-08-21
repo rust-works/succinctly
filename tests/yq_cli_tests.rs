@@ -18122,3 +18122,45 @@ fn test_decode_failure_does_not_corrupt_json_output_1247() -> Result<()> {
     }
     Ok(())
 }
+
+/// #1242: `succinctly yq` accepted a document with a dangling
+/// non-continuable UTF-8 byte, indexed it, and handed back `null` for the
+/// scalar that byte was in -- at exit 0, with `--validate` no help because
+/// the strict validator had no encoding check either.
+///
+/// Real yq rejects it: `bad file '-': yaml: offset 11: invalid trailing
+/// UTF-8 octet`, exit 1. succinctly now rejects it at the same byte offset
+/// and the same exit code, worded in this crate's own `YAML parse error:`
+/// convention -- the one it already uses for every other YAML parse
+/// failure, rather than yq's `bad file` shape it has never matched.
+///
+/// The check is unconditional, not gated on `--validate`: YAML 1.2 requires
+/// a UTF-8/16/32 stream, so this is a parse error, not an opt-in strictness
+/// preference.
+#[test]
+fn test_yq_rejects_invalid_utf8_document_1242() -> Result<()> {
+    let mut file = tempfile::NamedTempFile::new()?;
+    std::io::Write::write_all(&mut file, b"a: 1\nb: \"x\xe4y\"\n")?;
+    std::io::Write::flush(&mut file)?;
+    let path = file.path().to_str().unwrap();
+
+    for extra in [&["-o", "json"][..], &["-o", "json", "--validate"][..]] {
+        let (output, exit_code) = run_yq_file(".", path, extra)?;
+        assert_eq!(exit_code, 1, "args {extra:?}, output: {output:?}");
+    }
+    Ok(())
+}
+
+/// #1242 guard: ordinary multi-byte content must still parse. The pass runs
+/// on every document, so a false positive here would reject real files.
+#[test]
+fn test_yq_accepts_multibyte_utf8_1242() -> Result<()> {
+    let (output, exit_code) = run_yq_stdin(
+        ".",
+        "a: café\nb: 日本語\nc: 😀\n",
+        &["-o", "json", "-I", "0"],
+    )?;
+    assert_eq!(exit_code, 0, "output: {output:?}");
+    assert_eq!(output.trim(), r#"{"a":"café","b":"日本語","c":"😀"}"#);
+    Ok(())
+}

@@ -848,11 +848,11 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
         // This preserves original number formatting like "4e4"
         let files = get_input_files(&args);
         let raw_inputs: Vec<Vec<u8>> = if files.is_empty() {
-            vec![read_stdin_bytes()?]
+            vec![utf8_lossy_document(read_stdin_bytes()?)]
         } else {
             files
                 .iter()
-                .map(|path| read_file_bytes(path))
+                .map(|path| read_file_bytes(path).map(utf8_lossy_document))
                 .collect::<Result<Vec<_>>>()?
         };
 
@@ -1484,17 +1484,40 @@ impl InputLocations {
 
 /// Read stdin to string.
 fn read_stdin() -> Result<String> {
-    let mut buf = String::new();
-    std::io::stdin()
-        .read_to_string(&mut buf)
-        .context("Failed to read from stdin")?;
-    Ok(buf)
+    // Lossy, not `read_to_string`: that refused the whole input on a stray
+    // byte, reporting it as a *read* failure when the read had succeeded
+    // (#1247). See `utf8_lossy_document` for why jq substitutes here.
+    Ok(String::from_utf8_lossy(&read_stdin_bytes()?).into_owned())
 }
 
 /// Read a file to string.
 fn read_file(path: &Path) -> Result<String> {
-    std::fs::read_to_string(path)
-        .with_context(|| format!("Failed to read file: {}", path.display()))
+    // Lossy for the same reason as `read_stdin` above.
+    Ok(String::from_utf8_lossy(&read_file_bytes(path)?).into_owned())
+}
+
+/// Replace every invalid UTF-8 sequence in a *document* with U+FFFD, the
+/// way real jq does (#1247).
+///
+/// jq is the odd one out here: `yq` rejects a non-UTF-8 document outright
+/// (see `yq_runner::yaml_validate_guard`), but jq accepts it, substitutes
+/// the replacement character and exits 0 -- `{"a":"\xff\xfe"}` prints as
+/// `"\u{fffd}\u{fffd}"`. succinctly used to echo the raw bytes instead,
+/// which means it wrote invalid UTF-8 to stdout; the non-lazy path was
+/// worse still, refusing the file with `Failed to read file` when the read
+/// had in fact succeeded.
+///
+/// Valid input is returned untouched and unallocated -- the check is a
+/// whole-input SIMD pass (~1.1 ms on 8.4 MB) and only a document that
+/// actually fails it pays for a copy.
+///
+/// Document input only. `--raw-input` shares this path (jq substitutes
+/// there too), but DSV input, `--arg`/`--argjson` and `--rawfile` do not.
+fn utf8_lossy_document(raw: Vec<u8>) -> Vec<u8> {
+    match succinctly::text::utf8::validate_utf8(&raw) {
+        Ok(()) => raw,
+        Err(_) => String::from_utf8_lossy(&raw).into_owned().into_bytes(),
+    }
 }
 
 /// Read stdin to bytes.

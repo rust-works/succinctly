@@ -14506,3 +14506,45 @@ fn test_malformed_value_surfaces_as_error_1194() {
         [r#"[{"key":"a","value":1}]"#, r#"[{"key":"b","value":2}]"#]
     );
 }
+
+/// #1247: jq is the odd oracle out on invalid UTF-8. `yq` rejects such a
+/// document outright (#1242); `jq` accepts it, substitutes U+FFFD and exits
+/// 0. succinctly did neither -- it echoed the raw bytes, writing invalid
+/// UTF-8 to stdout, and the non-lazy path refused the file entirely with
+/// `Failed to read file` when the read had in fact succeeded.
+///
+/// Asserted on bytes, not on a lossily-decoded string: the whole point is
+/// which bytes reach stdout.
+#[test]
+fn test_invalid_utf8_document_substitutes_replacement_char_1247() -> Result<()> {
+    let mut file = NamedTempFile::new()?;
+    file.write_all(b"{\"a\":\"\xff\xfe\",\"b\":1}")?;
+    file.flush()?;
+    let path = file.path().to_str().unwrap();
+
+    // Two U+FFFD, one per invalid byte -- exactly what jq 1.7.1 emits here.
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", ".a", path], None).unwrap_or_else(|e| panic!("failed to run: {e}"));
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout.trim(), "\"\u{fffd}\u{fffd}\"");
+
+    // The non-lazy path (`-S` forces materialized, sorted output) used to
+    // fail the read outright; it must agree with the lazy one now.
+    let (stdout, stderr, code) = run_jq_full(&["-c", "-S", ".", path], None)
+        .unwrap_or_else(|e| panic!("failed to run: {e}"));
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout.trim(), "{\"a\":\"\u{fffd}\u{fffd}\",\"b\":1}");
+    Ok(())
+}
+
+/// #1247 guard: the substitution pass must leave valid multi-byte content
+/// byte-for-byte alone -- it runs on every document, so a false positive
+/// would corrupt ordinary files.
+#[test]
+fn test_valid_multibyte_document_is_untouched_1247() {
+    let doc = r#"{"a":"café","b":"日本語","c":"😀"}"#;
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", "."], Some(doc)).unwrap_or_else(|e| panic!("failed to run: {e}"));
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout.trim(), doc);
+}

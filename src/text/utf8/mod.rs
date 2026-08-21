@@ -81,16 +81,29 @@ pub enum Utf8ErrorKind {
     TruncatedSequence,
 }
 
+impl Utf8ErrorKind {
+    /// The human-readable reason, as a `&'static str`.
+    ///
+    /// Split out of [`Display`](core::fmt::Display) (which now defers to it)
+    /// so a caller needing the text without allocating shares one definition
+    /// with the formatter -- same shape as `JsonError::message` and
+    /// `YamlStringError::message`.
+    #[must_use]
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::InvalidLeadByte => "invalid UTF-8 lead byte",
+            Self::InvalidContinuationByte => "invalid UTF-8 continuation byte",
+            Self::OverlongEncoding => "overlong UTF-8 encoding",
+            Self::SurrogateCodepoint => "surrogate code point in UTF-8",
+            Self::OutOfRangeCodepoint => "code point above U+10FFFF",
+            Self::TruncatedSequence => "truncated UTF-8 sequence",
+        }
+    }
+}
+
 impl core::fmt::Display for Utf8ErrorKind {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::InvalidLeadByte => write!(f, "invalid UTF-8 lead byte"),
-            Self::InvalidContinuationByte => write!(f, "invalid UTF-8 continuation byte"),
-            Self::OverlongEncoding => write!(f, "overlong UTF-8 encoding"),
-            Self::SurrogateCodepoint => write!(f, "surrogate code point in UTF-8"),
-            Self::OutOfRangeCodepoint => write!(f, "code point above U+10FFFF"),
-            Self::TruncatedSequence => write!(f, "truncated UTF-8 sequence"),
-        }
+        f.write_str(self.message())
     }
 }
 

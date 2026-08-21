@@ -1,6 +1,6 @@
 # Decode-failure error routing for `to_owned`/`cursor_to_owned` (#1247, #1242, #1194)
 
-**Status: partially implemented — Stages 1–4 landed, 5–6 outstanding.** This
+**Status: partially implemented — Stages 1–5 landed, 6 outstanding.** This
 document is the deliverable for
 [#1247](https://github.com/rust-works/succinctly/issues/1247), which was tiered Tier 3
 ("needs a design decision before implementation, not a same-pattern continuation of the
@@ -444,10 +444,27 @@ a multi-value stream are still processed (`ErrorSink`, #355). Real jq aborts the
 at the parse error instead; succinctly's behaviour here is the more useful of the two and
 is a deliberate, tested divergence.
 
-**Stage 5 — UTF-8 at the boundary (sites 21–22, #1242).** yq rejects, jq replaces with
-U+FFFD, `yaml validate` grows a UTF-8 check. *Why last:* it is the only stage that adds
-work to every run, so it should be measured against a tree that is otherwise already
-correct, and it can be reverted independently if the perf gate fails.
+**Stage 5 — UTF-8 at the boundary (sites 21–22, #1242). ✅ landed.** yq rejects, jq
+replaces with U+FFFD, `yaml validate` grows a UTF-8 check. *Why last:* it is the only
+stage that adds work to every run, so it should be measured against a tree that is
+otherwise already correct, and it can be reverted independently if the perf gate fails.
+
+- **yq** rejects at the same byte offset and exit code as real yq, worded in this crate's
+  own `YAML parse error:` convention rather than yq's `bad file '-':` shape, which
+  succinctly has never matched for any other parse error. The check is unconditional, not
+  gated on `--validate`: YAML 1.2 requires a UTF-8/16/32 stream, so this is a parse error,
+  not an opt-in strictness preference.
+- **`yaml validate`** grew the check too, reusing the `InvalidUtf8` variant that had been
+  declared but never constructed — the scanner reads bytes and never decodes them, so
+  nothing could ever have produced it.
+- **jq** substitutes U+FFFD and exits 0, byte-identical to jq 1.7.1 on the probes above.
+  This also fixed two bugs in the opposite direction: the lazy path echoed the raw bytes,
+  writing invalid UTF-8 to stdout, and the non-lazy path refused the file outright with
+  `Failed to read file` when the read had in fact succeeded.
+- Scope is document input only. `--raw-input` shares the jq path (jq substitutes there
+  too); DSV input, `--arg`/`--argjson` and `--rawfile` are untouched.
+- Our `Utf8Error` offsets were checked against yq's for all six error kinds (invalid lead,
+  bad continuation, overlong, surrogate, out-of-range, truncated) and agree exactly.
 
 **Stage 6 — make the YAML streaming path loud (new, split out of Stage 2).** After
 Stages 2 and 3, `succinctly yq -o=json '.'` on a document with a bad *escape* still emits
