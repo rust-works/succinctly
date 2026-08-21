@@ -20901,20 +20901,31 @@ enum ArrayStep {
 ///
 /// `paths` here always traces back to [`resolve_dynamic_indexes`]'s own
 /// output, which strips every `Expr::Optional` wrapper via
-/// `strip_resolved_optional` before returning (#1331's own investigation
-/// confirmed this holds for every comma-grouped shape that can reach
-/// `delete_expr_paths_at`/this function at all, live-tested across field,
-/// index, and iterate steps -- including a mixed comma with one computed
-/// and one already-static branch, where `resolve_dynamic_indexes` still
-/// strips the static branch before this function ever sees it). So
-/// `optional` below is always `false` in practice; kept as a live value
-/// (not deleted) rather than hardcoded, with a `debug_assert` verifying the
-/// invariant rather than silently trusting it -- #1331 found that a
-/// sibling claim ("this can never be true") was wrong for a *different*
-/// consumer of the same `DeleteStep.optional` field
-/// ([`yq_del_slice_outcome`]'s own `wrap` closure, reachable via
-/// `del(.a?[1:3])`-shaped input), so this function's own narrower version
-/// of the claim is verified here rather than assumed to generalize.
+/// `strip_resolved_optional` before returning -- so `optional` below is
+/// always `false` in practice; kept as a live value (not deleted) rather
+/// than hardcoded, with a `debug_assert` verifying the invariant rather
+/// than silently trusting it (#1331 found that an identically-worded
+/// claim was wrong for a *different* consumer of the same
+/// `DeleteStep.optional` field -- [`yq_del_slice_outcome`]'s own `wrap`
+/// closure, reachable via `del(.a?[1:3])`-shaped input -- so each site's
+/// own version of the claim needs its own verification, not assumed to
+/// generalize).
+///
+/// This function itself may be entirely unreachable from `del()`'s own
+/// comma-grouped route: extensive live probing (#1331's second review
+/// round, three independent passes) found `resolve_node`'s own handling
+/// of `Expr::Iterate` eagerly expands a bare `.[]`/`.[]?` into concrete
+/// per-element `Field`/`Index` components *before* `flatten_delete_path`
+/// ever runs, for every shape tried -- meaning a literal `DeleteStep`
+/// carrying `Expr::Iterate` may never actually get constructed via
+/// `builtin_del`'s `paths.len() > 1` branch (the only external entry to
+/// `delete_expr_paths_at`) at all. Left as-is rather than removed:
+/// proving a function is *never* reachable, as opposed to not reachable
+/// via every input tried so far, needs more exhaustive verification than
+/// #1331's own scope covers -- filed as #1382 rather than assumed here.
+/// If genuinely dead, the `debug_assert` below (and the two `optional`-
+/// gated match arms further down, pre-dating this issue) are dead along
+/// with it, harmlessly.
 fn delete_expr_iterate_paths(
     value: OwnedValue,
     paths: &[&[DeleteStep]],
