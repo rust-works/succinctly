@@ -9,7 +9,9 @@ use succinctly::jq::escape::{
     escape_json_body as run_escaper, write_json_body_jq, write_json_body_jq_ascii,
     write_json_body_yq, write_json_body_yq_ascii,
 };
-use succinctly::jq::eval_generic::to_owned as generic_to_owned;
+use succinctly::jq::eval_generic::{
+    to_owned as generic_to_owned, to_owned_canonicalized_numbers as generic_to_owned_canonicalized,
+};
 use succinctly::jq::{
     assert_value_tree_depth, format_number_jq_compat, nonfinite_display_string, EvalError,
     JqSemantics, OwnedValue, StreamError,
@@ -33,14 +35,29 @@ pub use succinctly::yaml::format_float_yq;
 /// `jq_runner::parse_json_value`'s doc comment for why that pass can't
 /// simply reuse the `serde_json::Value` it produces.
 ///
-/// Shared by `jq_runner::parse_json_value` (`--argjson`/`--jsonargs`) and
-/// `yq_runner::parse_input`'s `InputFormat::Json` arm (the primary input
-/// path) -- previously two independent copies of the same three-line
-/// `JsonIndex::build`/`.root()`/`generic_to_owned` sequence (#1095 review).
+/// Used by `jq_runner::parse_json_value` (`--argjson`/`--jsonargs`), which
+/// needs the preserved spelling -- `yq_runner::parse_input`'s
+/// `InputFormat::Json` arm, which never does (#978), uses
+/// [`json_bytes_to_owned_value_canonicalized`] instead (#999; the two were
+/// one shared function, and briefly a second full-tree pass on top of it,
+/// before that issue split them).
 pub fn json_bytes_to_owned_value(bytes: &[u8]) -> OwnedValue {
     let index = JsonIndex::build(bytes);
     let cursor = index.root(bytes);
     generic_to_owned(&cursor.value())
+}
+
+/// Like [`json_bytes_to_owned_value`], but for a caller that never
+/// preserves a JSON number's exact source spelling regardless of whether
+/// the filter touches it (real `yq`'s own `--input-format json` path,
+/// #978) -- see [`generic_to_owned_canonicalized`]'s own doc comment for
+/// why this collapses straight to `Int`/`Float` in one pass rather than
+/// materializing `NumberLiteral` first and stripping it in a second
+/// (#999).
+pub fn json_bytes_to_owned_value_canonicalized(bytes: &[u8]) -> OwnedValue {
+    let index = JsonIndex::build(bytes);
+    let cursor = index.root(bytes);
+    generic_to_owned_canonicalized(&cursor.value())
 }
 
 /// Exit codes matching jq behavior

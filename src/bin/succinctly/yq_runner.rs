@@ -401,59 +401,23 @@ fn gather_input_sources(
     Ok(GatheredSources::Sources(sources))
 }
 
-/// Recursively collapses every `NumberLiteral` in `value` into a bare
-/// `Int`/`Float`, discarding the number's original source-text spelling.
-///
-/// Unlike YAML input (#918, correctly preserved), real `yq` never
-/// preserves a JSON-sourced number's exact spelling — `1.0` always renders
-/// as `1`, whether touched by the filter or not — most plausibly because
-/// its `--input-format json` path reads through Go's `encoding/json` into
-/// a plain `float64`, with no "untouched literal" concept at all (#978).
-/// `generic_to_owned` (this crate's shared `OwnedValue` materializer) has
-/// no such format-awareness — it's also `succinctly jq`'s own conversion,
-/// which correctly *does* preserve JSON literal spelling — so this stays
-/// local to `yq_runner.rs`'s own JSON-input call sites rather than
-/// touching that shared function.
-fn canonicalize_json_numbers(value: OwnedValue) -> OwnedValue {
-    canonicalize_json_numbers_at_depth(value, 0)
-}
-
-/// Panics past `succinctly::jq::MAX_VALUE_TREE_DEPTH` levels of nesting
-/// (#1017). Currently only reachable at a depth this deep via `value`
-/// already capped there by `generic_to_owned`'s own guard (#998, a
-/// tighter 256), since this function's only caller (`parse_input`'s JSON
-/// arm) feeds it that function's direct output -- defense-in-depth
-/// against that call chain changing, not a currently-live independent
-/// crash path.
-fn canonicalize_json_numbers_at_depth(value: OwnedValue, depth: usize) -> OwnedValue {
-    assert_value_tree_depth(depth);
-    match value {
-        OwnedValue::Array(items) => OwnedValue::Array(
-            items
-                .into_iter()
-                .map(|v| canonicalize_json_numbers_at_depth(v, depth + 1))
-                .collect(),
-        ),
-        OwnedValue::Object(fields) => OwnedValue::Object(
-            fields
-                .into_iter()
-                .map(|(k, v)| (k, canonicalize_json_numbers_at_depth(v, depth + 1)))
-                .collect(),
-        ),
-        other => other.into_plain_number(),
-    }
-}
-
 /// Parse input bytes according to the specified format.
 fn parse_input(bytes: &[u8], format: InputFormat) -> Result<Vec<OwnedValue>> {
     match format {
         InputFormat::Json => {
-            // Parse as JSON, then immediately drop the number-literal
-            // fidelity `json_bytes_to_owned_value` preserves -- real yq's
-            // own `--input-format json` path never keeps it either (#978).
-            Ok(vec![canonicalize_json_numbers(
-                crate::output::json_bytes_to_owned_value(bytes),
-            )])
+            // Real yq's own `--input-format json` path never preserves a
+            // JSON number's source spelling (#978) -- unlike YAML input
+            // (#918, correctly preserved). `json_bytes_to_owned_value_canonicalized`
+            // collapses every number straight to `Int`/`Float` in one pass
+            // (#999; this used to be `json_bytes_to_owned_value` -- which
+            // preserves spelling as `NumberLiteral`, needed by `succinctly
+            // jq`'s own conversion and `--argjson` -- followed by a second,
+            // now-removed full-tree pass, `canonicalize_json_numbers`, that
+            // walked the whole document again just to strip that spelling
+            // back off).
+            Ok(vec![
+                crate::output::json_bytes_to_owned_value_canonicalized(bytes),
+            ])
         }
         InputFormat::Yaml | InputFormat::Auto => {
             // Parse as YAML (Auto defaults to YAML when no extension hint)
@@ -4540,26 +4504,6 @@ mod tests {
         assert!(
             result.is_err(),
             "emit_yaml_value should panic at MAX_VALUE_TREE_DEPTH"
-        );
-    }
-
-    /// #1017: yq's JSON-input number canonicalization pass had no guard,
-    /// reachable the same way as every other value-tree walker guarded in
-    /// this PR — a value constructed with no adversarial document behind it.
-    #[test]
-    fn canonicalize_json_numbers_panics_past_nesting_depth_limit_1017() {
-        use succinctly::jq::MAX_VALUE_TREE_DEPTH;
-
-        let under = linear_array_nest(MAX_VALUE_TREE_DEPTH - 1);
-        let _ = canonicalize_json_numbers(under);
-
-        let over = linear_array_nest(MAX_VALUE_TREE_DEPTH);
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            canonicalize_json_numbers(over)
-        }));
-        assert!(
-            result.is_err(),
-            "canonicalize_json_numbers should panic at MAX_VALUE_TREE_DEPTH"
         );
     }
 
