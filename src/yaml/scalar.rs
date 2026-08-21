@@ -399,8 +399,37 @@ pub(super) fn is_preservable_float_literal(s: &str) -> bool {
         None => s,
     };
     (s.contains('.') || s.contains(['e', 'E']))
-        && mantissa.bytes().filter(u8::is_ascii_digit).count() <= MAX_PRESERVABLE_FLOAT_DIGITS
+        && (is_zero_mantissa(mantissa)
+            || mantissa.bytes().filter(u8::is_ascii_digit).count() <= MAX_PRESERVABLE_FLOAT_DIGITS)
         && is_json_number_syntax(s)
+}
+
+/// True if `mantissa` (a sign and a `.` ignored) is made up entirely of `0`
+/// digits — a zero-valued mantissa has no "significant digits" for
+/// [`MAX_PRESERVABLE_FLOAT_DIGITS`] to bound in the first place (#1211):
+/// every zero-mantissa spelling, however many digits long, represents the
+/// exact same value (`0`), so a longer one carries no extra precision the
+/// cap needs to protect against — unlike a nonzero mantissa, where digit
+/// count really does bound how much precision the source text claims.
+/// Real yq preserves a zero-mantissa literal verbatim at any length
+/// (confirmed live against the pinned oracle, `0.00000000000000000000e-400`
+/// included), matching this carve-out rather than the cap.
+///
+/// `false`, not a panic or `None`, for a mantissa with no digits at all
+/// (just a sign and/or `.`) — [`is_preservable_float_literal`]'s own
+/// leading `.`-or-exponent guard means this is called with `is_valid_number`
+/// (via `is_json_number_syntax`) shaped input in every real caller, but this
+/// function stays total over its own input rather than assuming that.
+fn is_zero_mantissa(mantissa: &str) -> bool {
+    let mut saw_digit = false;
+    for b in mantissa.bytes() {
+        match b {
+            b'0' => saw_digit = true,
+            b'.' | b'+' | b'-' => {}
+            _ => return false,
+        }
+    }
+    saw_digit
 }
 
 /// A normalized, JSON-safe equivalent spelling for `s`, for a `Float`
@@ -927,6 +956,40 @@ mod tests {
         let mantissa_over_cap = "1.".to_string() + &"1".repeat(MAX_PRESERVABLE_FLOAT_DIGITS);
         assert!(!is_preservable_float_literal(&format!(
             "{mantissa_over_cap}e1"
+        )));
+    }
+
+    /// #1211: a zero-mantissa literal has no "significant digits" for the
+    /// digit cap to bound -- every zero-mantissa spelling represents the
+    /// same value (`0`) regardless of length, so it stays preservable at
+    /// any length. Real yq preserves it verbatim too, confirmed live
+    /// (`0.00000000000000000000e-400` -- the issue's own repro).
+    #[test]
+    fn preservable_float_literal_zero_mantissa_ignores_the_digit_cap() {
+        let long_zero_mantissa = "0.".to_string() + &"0".repeat(100);
+        assert!(is_preservable_float_literal(&format!(
+            "{long_zero_mantissa}e-400"
+        )));
+        // A short zero mantissa (already worked before #1211) must stay
+        // preservable too -- the fix must not narrow this case.
+        assert!(is_preservable_float_literal("0.000e-400"));
+    }
+
+    /// #1211: a mantissa with even one nonzero digit is not a "zero
+    /// mantissa" -- the ordinary digit cap must still apply once the long
+    /// run of zeros is broken by a real digit, however few nonzero digits
+    /// there are relative to the zeros.
+    #[test]
+    fn preservable_float_literal_nonzero_digit_anywhere_keeps_the_cap() {
+        let mostly_zeros_one_nonzero_digit = "0.".to_string() + &"0".repeat(30) + "1";
+        assert!(!is_preservable_float_literal(&format!(
+            "{mostly_zeros_one_nonzero_digit}e-400"
+        )));
+        // Below the cap with a single trailing nonzero digit: preservable,
+        // same as any other ordinary (non-zero-mantissa) case.
+        let short_mostly_zeros = "0.".to_string() + &"0".repeat(10) + "1";
+        assert!(is_preservable_float_literal(&format!(
+            "{short_mostly_zeros}e-400"
         )));
     }
 
