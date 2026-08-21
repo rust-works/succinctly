@@ -843,15 +843,19 @@ arm; each independently mergeable and measurable.
    of risk — but it adds a closure frame per stage on top, and every stage's frame stays
    live across the stream. `MAX_EXPR_DEPTH`'s own doc warns it "is not a stack-size
    guarantee" and that some constructs abort at ~96 levels on cargo's 2 MiB test threads.
-   **Unverified.** No existing test drives a long pipe through the *evaluator* —
-   `tests/deep_nesting_valid_tests.rs` is entirely document depth. Add one, and run it
-   before merging Stage 2.
+   **Now guarded** by `test_long_pipe_and_comma_chains_evaluate_without_overflowing`
+   (PR #1389), which drives a 1024-stage pipe and a 1024-element comma list through the
+   evaluator — `tests/deep_nesting_valid_tests.rs` is entirely *document* depth and covers
+   neither. It passes today; re-run it after the lazy `Pipe` arm lands.
 7. **`first(.[])`'s pre-existing divergence.** `[{"a":1,"a":2}] | first(.[])` gives
    `{"a":1,"a":2}` here and `{"a":2}` in jq — #607's native generic arm producing a
    jq-divergence in jq mode. Out of scope, but Stage 2b touches that exact arm, so it will
    surface in review. File separately rather than fixing in passing; the arm presumably
    exists for yq's duplicate-key semantics and removing it needs its own yq sweep.
-   **Unverified** which yq behaviours depend on it.
+   **Filed as #1385** — where it also turns out to be broader than this one arm (`.`,
+   `.[]` and `.[0]` all preserve duplicate keys in jq mode), and the undocumented root of
+   the #1251/#1170/#443 symptom family. **Unverified** which yq behaviours depend on the
+   arm staying native.
 8. **`eval_each_owned`'s `pipe_of(rest)` allocation.** `eval_owned_pipe` already clones
    `exprs.to_vec()` per owned intermediate value; the lazy twin inherits that. A
    borrowed-slice variant would avoid it but is out of scope — do not "improve" it in the
@@ -944,10 +948,12 @@ differential gate at least as rigorous as #1282's.
 
 ## Follow-up issues
 
-Not yet filed. Once this document is reviewed, file one implementation issue per stage
-(mirroring #700 → #724/#725 and #1282 → #1284), linking back here:
+**Stage 1 is filed and implemented** as #1386 (PR #1389) — it blocks nothing and depends
+on nothing, so it did not wait for this document's review. The rest follow the #1282
+convention: file one implementation issue per stage once this document is reviewed
+(mirroring #700 → #724/#725 and #1282 → #1284), linking back here.
 
-1. **Stage 1** — characterization tests. Blocks nothing; ship immediately.
+1. **Stage 1** — characterization tests. **Filed: #1386. Implemented: PR #1389.**
 2. **Stage 2** — `eval_each` + 10 `eval.rs` consumers. Closes #820, most of #932.
    Depends on 1.
 3. **Stage 2b** — `eval_generic.rs`'s `first`/`last` arm, option (b). Depends on 2. Files
