@@ -6083,7 +6083,7 @@ mod tests {
         );
     }
 
-    /// #1061: `finish_slice`'s bounds fold through `fold_int_literal`, which
+    /// #1061: `finish_slice`'s bounds fold through `fold_slice_bound`, which
     /// itself delegates to `fold_index_key` -- so a slice bound at either
     /// boundary must inherit the same fix as a bare index, not just be
     /// exercised at the index call site.
