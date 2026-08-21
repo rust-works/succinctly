@@ -841,6 +841,14 @@ fn format_overflow_literal_mantissa(s: &str, exp_pos: usize, negative: bool) -> 
     // a redundant check here.
     if new_exp < digit_count {
         let full_mantissa_str = full_mantissa_if_capped(s, exp_pos, &mantissa_str, digit_count);
+        // Provably always `Some` here (not just usually): `full_mantissa_str`
+        // is uncapped whenever `full_mantissa_if_capped` had to re-derive at
+        // all, so its own digit count equals `digit_count` exactly, and
+        // `format_positive_shifted_plain`'s `split_pos > digits.len()` guard
+        // reduces to the `new_exp < digit_count` this branch already
+        // checked. Kept as `if let` rather than `.expect(..)` so a future
+        // change to either function's contract fails safe (falls to
+        // scientific) instead of panicking.
         if let Some(plain) =
             format_positive_shifted_plain(sign, &full_mantissa_str, new_exp, digit_count)
         {
