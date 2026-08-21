@@ -14370,3 +14370,424 @@ fn test_tonumber_rejects_internal_overflow_sentinels_1090() {
         );
     }
 }
+
+// Short-circuiting generator consumers and evaluation-time side effects
+// (#820, #932, #987; Stage 1 of `docs/plan/jq-lazy-generator-consumers.md`).
+//
+// Every expectation below was captured from the pinned oracle `/usr/bin/jq`
+// (jq-1.7.1-apple) and this crate's own `--release --features cli` binary at
+// `bd73d2436`, with stdout and stderr redirected *separately* -- `2>&1`
+// interleaves the two misleadingly, since stdout is buffered when piped but
+// stderr is not (same convention as the `halt`/`stderr` block above).
+//
+// `stderr` and `halt_error` are the only two builtins whose Rust
+// implementation performs I/O *at evaluation time* (`write_stderr`, via
+// `builtin_stderr`/`builtin_halt_error` in `src/jq/eval.rs`); `debug` and
+// `debug(msg)` are deliberate library-context no-ops, and `error(...)` carries
+// its payload in the result. So `stderr` is the only usable probe for "was
+// this sub-expression evaluated at all?" -- which is why #820's own original
+// `first(1, debug)` repro was a false negative.
+//
+// `input`/`inputs` are a second, *destructive* probe: they pop from the same
+// process-global queue the CLI's own per-document driver loop drains, so an
+// eagerly-evaluated discarded branch containing one silently eats a document.
+
+/// One CLI expectation: (args, stdin, stdout, stderr, exit code).
+///
+/// Named rather than inlined because the tuple trips clippy's
+/// `type_complexity` lint at the two `&[...]` tables below.
+type SideEffectCase = (
+    &'static [&'static str],
+    Option<&'static str>,
+    &'static str,
+    &'static str,
+    i32,
+);
+
+/// The shapes that already match jq, pinned *before* any laziness work.
+///
+/// This is the high-value half of Stage 1. The `eval_each` design's
+/// characteristic failure mode is stopping **too early** and suppressing a
+/// side effect real jq genuinely performs -- so this test, not the
+/// divergence test below, is what a too-eager `Demand::Stop` would break.
+/// Pinning it first follows #1284's precedent (guard rails before the change,
+/// not after).
+#[test]
+fn test_short_circuit_side_effect_shapes_already_match_jq_820() -> Result<()> {
+    let cases: &[SideEffectCase] = &[
+        // `limit(n)` pulls exactly `n` values, so a side effect sitting at
+        // position `n` IS reached. Stopping at the first would suppress it.
+        (
+            &["-cn", "limit(2; 1, stderr, 3)"],
+            None,
+            "1\nnull\n",
+            "null",
+            0,
+        ),
+        // `empty` contributes no output, so `isempty` is not yet satisfied
+        // when it reaches `stderr` -- the write must still happen.
+        (
+            &["-cn", "isempty(empty, stderr)"],
+            None,
+            "false\n",
+            "null",
+            0,
+        ),
+        (
+            &["-cn", r#"first(empty, ("B"|stderr))"#],
+            None,
+            "\"B\"\n",
+            "B",
+            0,
+        ),
+        // One output still means the producer ran to produce it.
+        (
+            &["-cn", r#"isempty(("B"|stderr))"#],
+            None,
+            "false\n",
+            "B",
+            0,
+        ),
+        // The side effect is in the *first* branch, which is always needed.
+        (&["-cn", "first(stderr, 1)"], None, "null\n", "null", 0),
+        // `n == 0` must not evaluate the operand at all.
+        (&["-cn", r#"[limit(0; ("B"|stderr))]"#], None, "[]\n", "", 0),
+        // Array construction is atomic in jq; laziness must not leak into it.
+        (
+            &["-cn", r#"isempty([1, ("B"|stderr)])"#],
+            None,
+            "false\n",
+            "B",
+            0,
+        ),
+        // `nth(2)` needs index 2, which IS the side-effecting branch.
+        (
+            &["-cn", r#"nth(2; 1,2,("B"|stderr),4)"#],
+            None,
+            "\"B\"\n",
+            "B",
+            0,
+        ),
+        // `all` short-circuits on a FALSY element, so a truthy element 1
+        // means element 2 is still reached. #932's text guesses `all` leaks
+        // like `any`; it does not -- real jq writes `5` here too. Only the
+        // `any` direction of `any_all_gen_cond` may ever stop early.
+        (
+            &["-c", "all(2, (5|stderr); .==2)"],
+            Some("2"),
+            "false\n",
+            "5",
+            0,
+        ),
+        // No match, so the generator must be exhausted.
+        (
+            &["-c", "any(9, (5|stderr); .==2)"],
+            Some("2"),
+            "false\n",
+            "5",
+            0,
+        ),
+        (&["-c", "IN(2, (5|stderr))"], Some("[2]"), "false\n", "5", 0),
+        // Already lazy today, and must stay lazy.
+        (
+            &["-cn", r#"false and ("B"|stderr)"#],
+            None,
+            "false\n",
+            "",
+            0,
+        ),
+        (
+            &["-cn", r#"if false then ("B"|stderr) else 1 end"#],
+            None,
+            "1\n",
+            "",
+            0,
+        ),
+        // A *bare* escape (zero prior output) must still propagate rather
+        // than be answered by the consumer (#882, #791, #867).
+        (&["-cn", r#"isempty("m"|halt_error(3))"#], None, "", "m", 3),
+        (&["-cn", "label $o|isempty(break $o)"], None, "", "", 0),
+        // ...but an escape AFTER an output must not, once `isempty` is
+        // satisfied: real jq never asks the generator for that second value.
+        (
+            &["-cn", "label $o | [isempty(1, break $o)]"],
+            None,
+            "[false]\n",
+            "",
+            0,
+        ),
+        // Under-satisfied consumers must still surface the trailing control.
+        (
+            &["-cn", "last(1,2,error(\"x\"))"],
+            None,
+            "",
+            "jq: error (at <unknown>): x",
+            5,
+        ),
+        (
+            &["-cn", "nth(5; 1,2,error(\"x\"))"],
+            None,
+            "",
+            "jq: error (at <unknown>): x",
+            5,
+        ),
+        (
+            &["-cn", "[limit(3;1,2,error(\"x\"),4)]"],
+            None,
+            "",
+            "jq: error (at <unknown>): x",
+            5,
+        ),
+        // Legitimate `input` use must stay unaffected by any laziness work:
+        // each run consumes exactly one extra document, pairing them up.
+        (
+            &["-c", "[., input] | map(.id)"],
+            Some(r#"{"id":1} {"id":2} {"id":3} {"id":4}"#),
+            "[1,2]\n[3,4]\n",
+            "",
+            0,
+        ),
+    ];
+
+    for (args, stdin, want_out, want_err, want_code) in cases {
+        let (stdout, stderr, code) = run_jq_full(args, *stdin)?;
+        assert_eq!(
+            (stdout.as_str(), stderr.trim_end_matches('\n'), code),
+            (*want_out, *want_err, *want_code),
+            "`{}` diverged from pinned jq 1.7.1",
+            args.join(" ")
+        );
+    }
+    Ok(())
+}
+
+/// jq's generator-argument backtracking genuinely RESUMES after the body
+/// runs, so an ordinary builtin's argument must never get a stopping sink.
+///
+/// `result_to_owned_ctrl`'s own doc comment (`src/jq/eval.rs`) records the
+/// desugaring -- `f(x)` is roughly `x as $b | body` -- and #833's
+/// `ltrimstr(("a", break $out))` repro. This test pins the *side-effect*
+/// half: real jq evaluates the second argument output, so `B` reaches stderr.
+/// Exactly one of `result_to_owned`'s 20 call sites (`builtin_halt_error`)
+/// may ever stop, and only because its body terminates the process.
+///
+/// The stdout halves deliberately differ: jq emits one result per argument
+/// output (`"bcabc"` then `"abcabc"`), succinctly only the first. That gap is
+/// #1279 -- the OPPOSITE bug to #820, and pinned here so laziness work does
+/// not silently deepen it.
+#[test]
+fn test_generator_argument_backtracking_still_evaluates_the_tail_1279() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r#"ltrimstr(("a", ("B"|stderr)))"#],
+        Some(r#""abcabc""#),
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    // The property that matters: jq DID evaluate the second argument output.
+    assert_eq!(stderr, "B", "the argument's tail must still be evaluated");
+    // Today's (wrong, #1279) stdout. jq gives "bcabc"\n"abcabc"\n.
+    assert_eq!(stdout, "\"bcabc\"\n");
+    Ok(())
+}
+
+/// The leaks themselves, asserting today's WRONG behaviour so the eventual
+/// fix's diff shows exactly which ones closed.
+///
+/// Each row records what real jq does in a comment; the assertion is
+/// succinctly's current output. When a stage of the #820 design lands, the
+/// corresponding rows flip to jq's column and move into the test above.
+#[test]
+fn test_short_circuit_side_effect_leaks_820_932_987() -> Result<()> {
+    let cases: &[SideEffectCase] = &[
+        // #820's own repro. jq: stderr empty.
+        (
+            &["-cn", r#"isempty(1, ("B"|stderr))"#],
+            None,
+            "false\n",
+            "B",
+            0,
+        ),
+        // The paren spelling, mentioned in no issue: `isempty(...)` eats only
+        // its own parens, so this is `IsEmpty(Paren(Comma(..)))`. jq: empty.
+        (
+            &["-cn", r#"isempty((1, ("B"|stderr)))"#],
+            None,
+            "false\n",
+            "B",
+            0,
+        ),
+        // jq: stderr empty for all three.
+        (&["-cn", r#"first(1, ("B"|stderr))"#], None, "1\n", "B", 0),
+        (
+            &["-cn", r#"limit(1; 1, ("B"|stderr))"#],
+            None,
+            "1\n",
+            "B",
+            0,
+        ),
+        (&["-cn", r#"nth(0; 1, ("B"|stderr))"#], None, "1\n", "B", 0),
+        // jq: stderr exactly one write (`1`), not two.
+        (
+            &["-c", "first(.[] | stderr)"],
+            Some("[1,2]"),
+            "1\n",
+            "12",
+            0,
+        ),
+        // Reached through a subtree that has already bounced to eval.rs.
+        (
+            &["-cn", r#"isempty(first(1, ("B"|stderr)))"#],
+            None,
+            "false\n",
+            "B",
+            0,
+        ),
+        // #932. jq: stderr empty for both.
+        (
+            &["-c", "any(2, (5|stderr); .==2)"],
+            Some("2"),
+            "true\n",
+            "5",
+            0,
+        ),
+        (&["-c", "IN(2, (5|stderr))"], Some("2"), "true\n", "5", 0),
+        (
+            &["-cn", "[IN((2,3); 2, (5|stderr))]"],
+            None,
+            "[true]\n",
+            "5",
+            0,
+        ),
+        // #820's halt_error repro. jq: stderr `o`, exit 1 -- the leaked `B`
+        // is written before the outer message.
+        (
+            &["-cn", r#""o" | halt_error(1, ("B"|stderr))"#],
+            None,
+            "",
+            "Bo",
+            1,
+        ),
+        // The same repro's nested form. #820's text reports `innerouter` /
+        // exit 1, which is STALE: #791's `Partial(_, Control::Halt)` arm in
+        // `result_to_owned_full` now fires before `builtin_halt_error` writes,
+        // so the inner halt wins outright. jq: `outer`, exit 1.
+        (
+            &["-cn", r#""outer" | halt_error(1, ("inner"|halt_error(2)))"#],
+            None,
+            "",
+            "inner",
+            2,
+        ),
+    ];
+
+    for (args, stdin, want_out, want_err, want_code) in cases {
+        let (stdout, stderr, code) = run_jq_full(args, *stdin)?;
+        assert_eq!(
+            (stdout.as_str(), stderr.trim_end_matches('\n'), code),
+            (*want_out, *want_err, *want_code),
+            "`{}` changed -- if a #820 stage landed, move this row into \
+             `test_short_circuit_side_effect_shapes_already_match_jq_820`",
+            args.join(" ")
+        );
+    }
+    Ok(())
+}
+
+/// #987: `path(paths(f))` runs `f` against a node real jq never visits.
+///
+/// jq's `path()` demands only `paths(f)`'s FIRST output and aborts on it, so
+/// node `3` is never reached and nothing is written. Note this is not comma
+/// laziness -- jq evaluates both branches of the `(stderr, true)` comma too.
+#[test]
+fn test_path_paths_filter_leaks_a_never_visited_node_987() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            "path(paths(if . == 3 then (stderr, true) else true end))",
+        ],
+        Some("[1,2,3]"),
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    // jq writes only the diagnostic; succinctly prefixes the leaked `3`.
+    assert!(
+        stderr.starts_with('3'),
+        "expected the leaked `3` before the diagnostic; stderr: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("Invalid path expression with result [0]"),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
+/// The same eagerness applied to `input`/`inputs` destroys data.
+///
+/// `input`/`inputs` pop from the process-global queue that the CLI's own
+/// per-document driver loop also drains, so a discarded branch containing one
+/// consumes documents that are then never processed -- exit 0, empty stderr,
+/// correct-looking output. This is why #820 is a `bug`, not an `enhancement`:
+/// it was filed when #723 had not yet implemented these builtins.
+///
+/// The `.id`-only control run is essential: without it, a future failure here
+/// could be mistaken for a parsing difference rather than lost documents.
+#[test]
+fn test_discarded_generator_branch_consumes_input_documents_820() -> Result<()> {
+    const DOCS: &str = r#"{"id":1} {"id":2} {"id":3} {"id":4}"#;
+
+    // Control: every document is processed when nothing consumes the queue.
+    let (stdout, stderr, code) = run_jq_full(&["-c", ".id"], Some(DOCS))?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(
+        stdout, "1\n2\n3\n4\n",
+        "control run must see all 4 documents"
+    );
+
+    // `input` in a discarded branch eats every other document.
+    // jq: [false,1] [false,2] [false,3] [false,4].
+    let (stdout, _, code) = run_jq_full(&["-c", "[isempty(1, input), .id]"], Some(DOCS))?;
+    assert_eq!(code, 0);
+    assert_eq!(
+        stdout, "[false,1]\n[false,3]\n",
+        "documents 2 and 4 were consumed"
+    );
+
+    // Same for `first`, which reaches it via `eval_generic`'s own arm.
+    // jq: [1,1] [1,2] [1,3] [1,4].
+    let (stdout, _, code) = run_jq_full(&["-c", "[first(1, input), .id]"], Some(DOCS))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "[1,1]\n[1,3]\n", "documents 2 and 4 were consumed");
+
+    // `inputs` (plural) drains the WHOLE queue from one discarded branch, so
+    // the loss scales with input size: N documents in, exactly 1 processed.
+    // jq: [false,1] [false,2] [false,3] [false,4].
+    let (stdout, _, code) = run_jq_full(&["-c", "[isempty(1, inputs), .id]"], Some(DOCS))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "[false,1]\n", "documents 2-4 were all consumed");
+
+    Ok(())
+}
+
+/// A long *pipe* driven through the evaluator, not just the parser.
+///
+/// `MAX_EXPR_DEPTH` deliberately does not charge flat pipe/comma chains
+/// (`src/jq/parser.rs`), and `test_flat_chains_are_not_charged_against_expr_depth_1156`
+/// pins that a 1024-stage pipe must parse. Nothing anywhere pinned that such
+/// a pipe also *evaluates* -- `tests/deep_nesting_valid_tests.rs` is entirely
+/// document depth. #820's design makes `eval_pipe` recursion deeper (one
+/// closure frame per stage on top of today's), so this is the guard rail for
+/// design Open Risk 6.
+#[test]
+fn test_long_pipe_and_comma_chains_evaluate_without_overflowing() -> Result<()> {
+    // Matches the parser test's bound (MAX_EXPR_DEPTH * 4).
+    let filter = vec![".a"; 1024].join(" | ");
+    let (stdout, stderr, code) = run_jq_full(&["-c", &filter], Some(r#"{"a":null}"#))?;
+    assert_eq!(code, 0, "1024-stage pipe: stderr: {stderr:?}");
+    assert_eq!(stdout, "null\n");
+
+    let filter = format!("[{}]", vec!["1"; 1024].join(", "));
+    let (stdout, stderr, code) = run_jq_full(&["-c", &filter], Some("null"))?;
+    assert_eq!(code, 0, "1024-element comma list: stderr: {stderr:?}");
+    assert_eq!(stdout.matches('1').count(), 1024);
+
+    Ok(())
+}
