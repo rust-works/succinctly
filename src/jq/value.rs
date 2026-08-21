@@ -352,17 +352,21 @@ pub fn format_number_jq_compat(raw: &[u8]) -> String {
     // invariant `format_overflow_literal_mantissa` relies on for its own
     // `unreachable!()`.
     //
-    // `exp_saturated` (`_`, ignored): `s` already parsed successfully to a
-    // finite, nonzero `f64` to reach this path at all (subnormal included,
-    // since #1206 folded that case in here too), so its written exponent
-    // digit string was in `i128`'s range long before it was in `f64`'s --
-    // unlike `format_near_zero_literal` (#1273), this path can't actually
-    // observe a saturated exponent in practice.
-    let Ok((mantissa_str, shifted_exp, digit_count, _exp_saturated)) =
-        normalize_extreme_literal_mantissa(s, exp_pos, Some(MAX_RENDERED_MANTISSA_DIGITS))
+    // `new_exp`'s saturation (ignored via `.value()`): `s` already parsed
+    // successfully to a finite, nonzero `f64` to reach this path at all
+    // (subnormal included, since #1206 folded that case in here too), so
+    // its written exponent digit string was in `i128`'s range long before
+    // it was in `f64`'s -- unlike `format_near_zero_literal` (#1273), this
+    // path can't actually observe a saturated exponent in practice.
+    let Ok(NormalizedMantissa {
+        mantissa_str,
+        new_exp,
+        digit_count,
+    }) = normalize_extreme_literal_mantissa(s, exp_pos, Some(MAX_RENDERED_MANTISSA_DIGITS))
     else {
         unreachable!("nonzero value implies normalize_extreme_literal_mantissa succeeds")
     };
+    let shifted_exp = new_exp.value();
     let sign = if value.is_sign_negative() { "-" } else { "" };
     if shifted_exp == 0 || (-6..=-1).contains(&shifted_exp) {
         // #1274: this window is *unconditionally* a decimal render --
@@ -463,13 +467,40 @@ pub(crate) fn jq_bare_float_display(f: f64) -> String {
     f.to_string()
 }
 
+/// Join a sign, an already-normalized mantissa, a negative-exponent flag,
+/// and the exponent's own unsigned magnitude text into jq's
+/// scientific-notation text (`{sign}{mantissa}E{+/-}{magnitude}`) -- the
+/// shared final step [`assemble_scientific`] and
+/// [`assemble_scientific_from_raw_exponent`] both build on, so the two
+/// can't independently drift on the `E+`/`E-` convention itself (#1304
+/// code review) even though they derive `negative`/`exp_magnitude` from
+/// different representations (a parsed `i128` vs. raw digit text).
+/// `exp_magnitude: impl Display` rather than a `&str` lets the numeric
+/// caller pass its `u128` magnitude directly with no extra allocation.
+fn assemble_scientific_with_sign(
+    sign: &str,
+    mantissa_str: &str,
+    negative_exp: bool,
+    exp_magnitude: impl core::fmt::Display,
+) -> String {
+    let exp_sign = if negative_exp { "-" } else { "+" };
+    format!("{sign}{mantissa_str}E{exp_sign}{exp_magnitude}")
+}
+
 /// Join a sign, an already-normalized mantissa, and an exponent into jq's
 /// scientific-notation text (`{sign}{mantissa}E{+/-}{exp}`) -- the shared
-/// final step of both the finite path above and the overflow path below, so
-/// the two can't independently drift on the `E+`/`E-` convention.
+/// final step of both the finite path above and the overflow path below.
+/// `exp.unsigned_abs()`, not `exp` directly via `i128::Display`'s own
+/// embedded `-` (#1304 code review): explicitly managing the sign the same
+/// way [`assemble_scientific_from_raw_exponent`] does lets both share
+/// [`assemble_scientific_with_sign`]'s one `E+`/`E-` decision instead of
+/// each reimplementing it -- and `unsigned_abs()`, not `.abs()`, is what
+/// stays correct at `exp == i128::MIN` (the saturation sentinel this
+/// module's own `checked_add`/`checked_sub` overflow fallbacks can
+/// produce), where `.abs()` would itself overflow `i128` but `u128` still
+/// holds the magnitude exactly.
 fn assemble_scientific(sign: &str, mantissa_str: &str, exp: i128) -> String {
-    let exp_sign = if exp >= 0 { "+" } else { "" };
-    format!("{sign}{mantissa_str}E{exp_sign}{exp}")
+    assemble_scientific_with_sign(sign, mantissa_str, exp < 0, exp.unsigned_abs())
 }
 
 /// Sibling of [`assemble_scientific`] for a saturated exponent (#1273): once
@@ -495,29 +526,52 @@ fn assemble_scientific(sign: &str, mantissa_str: &str, exp: i128) -> String {
 /// routes here on either. A perfectly shift-adjusted answer isn't reachable
 /// here without big-integer machinery, but an honestly-unshifted one beats
 /// a fabricated one.
+///
+/// #1304: unlike [`normalize_extreme_literal_mantissa`]'s
+/// `MAX_RENDERED_MANTISSA_DIGITS`-capped mantissa, `digits` here is echoed
+/// in full, uncapped -- a deliberate decision, not an oversight. Two things
+/// distinguish this from the mantissa case rather than calling for the
+/// identical treatment:
+/// - **Already gated behind an extreme condition.** This function only
+///   ever runs once the exponent has already saturated `i128`, i.e. the
+///   digit string is already at least ~39 characters long by construction
+///   -- unlike the mantissa, which is unbounded starting from the very
+///   *first* digit of any ordinary literal, so capping it protects the
+///   overwhelmingly common case. There is no comparably common case here
+///   to protect.
+/// - **Measured, not assumed, to cost proportionally, not
+///   super-linearly.** [`dump_truncated`](crate::jq::error) is the one
+///   caller (via [`format_near_zero_literal`] -> `describe`/`error(v)`
+///   messages) whose own contract wants preview cost independent of input
+///   size -- live-timed a 5,000,000-digit saturated exponent through it
+///   (`"0.005e-" + "9".repeat(5_000_000)` piped through `.[]` to trigger a
+///   `describe`d "cannot iterate" error): 0.17s, linear in the input's own
+///   size, not amplified -- the same "the input already had to contain
+///   that many bytes to trigger it, not an amplification" reasoning
+///   `MAX_RENDERED_MANTISSA_DIGITS`'s own doc comment already applies to
+///   its `None` (uncapped) case for callers that need every given digit.
+///   A cap here would additionally cost real correctness for the
+///   *ordinary* (non-preview) render path, which -- matching this crate's
+///   stated preserve-every-given-digit philosophy -- has no comparable
+///   reason to truncate an exponent it can otherwise echo exactly.
 fn assemble_scientific_from_raw_exponent(
     sign: &str,
     mantissa_str: &str,
     raw_exp_text: &str,
 ) -> String {
+    let (negative, digits) = strip_leading_sign(raw_exp_text);
     // Canonicalize like every other exponent-rendering path in this module
-    // (#1273 review): `assemble_scientific` never emits a leading zero
-    // (its exponent comes from `i128::Display`), so a raw echo that skips
-    // this strip would be the one place this formatter's output isn't
-    // leading-zero-free -- e.g. `1e-007...` echoing as `E-007...` instead
-    // of `E-7...`. `digits.is_empty()` is unreachable in practice (this
-    // function only runs on a genuinely saturated exponent, and an
-    // all-zero digit string always parses to exactly `0`, never
-    // saturating), but the fallback keeps this total rather than relying
-    // on that invariant.
-    let trimmed = raw_exp_text.strip_prefix('+').unwrap_or(raw_exp_text);
-    let (exp_sign, digits) = match trimmed.strip_prefix('-') {
-        Some(digits) => ("-", digits),
-        None => ("+", trimmed),
-    };
+    // (#1273 review): `assemble_scientific` never emits a leading zero, so
+    // a raw echo that skips this strip would be the one place this
+    // formatter's output isn't leading-zero-free -- e.g. `1e-007...`
+    // echoing as `E-007...` instead of `E-7...`. `digits.is_empty()` is
+    // unreachable in practice (this function only runs on a genuinely
+    // saturated exponent, and an all-zero digit string always parses to
+    // exactly `0`, never saturating), but the fallback keeps this total
+    // rather than relying on that invariant.
     let digits = digits.trim_start_matches('0');
     let digits = if digits.is_empty() { "0" } else { digits };
-    format!("{sign}{mantissa_str}E{exp_sign}{digits}")
+    assemble_scientific_with_sign(sign, mantissa_str, negative, digits)
 }
 
 /// Parse a literal's exponent digit string at wide (`i128`) precision,
@@ -550,17 +604,76 @@ fn assemble_scientific_from_raw_exponent(
 /// `format_number_jq_compat` call site silently treated an out-of-range
 /// exponent as exactly `0`, misrouting extreme-underflow literals into the
 /// "eliminate exponent" fast path before ever reaching this module).
-fn parse_literal_exponent(exp_text: &str) -> (i128, bool) {
+fn parse_literal_exponent(exp_text: &str) -> ExpParse {
     match exp_text.parse() {
-        Ok(v) => (v, false),
+        Ok(v) => ExpParse::Exact(v),
         Err(_) => {
-            let sentinel = if exp_text.trim_start_matches('+').starts_with('-') {
-                i128::MIN
-            } else {
-                i128::MAX
-            };
-            (sentinel, true)
+            let (negative, _) = strip_leading_sign(exp_text);
+            let sentinel = if negative { i128::MIN } else { i128::MAX };
+            ExpParse::Saturated(sentinel)
         }
+    }
+}
+
+/// Peel a single leading `+`/`-` off `s`, returning whether it was
+/// negative and the sign-stripped remainder -- the lexer guarantees at
+/// most one leading sign character on any digit text this module works
+/// with, so a leading `+`/`-` are mutually exclusive and this only ever
+/// checks the first character once.
+///
+/// Shared so "peel a leading sign off digit text" has exactly one
+/// implementation instead of three independently reimplementing it
+/// slightly differently (#106, #1304 code review): [`split_mantissa`]'s
+/// old `strip_prefix(['-', '+'])`, this function's old
+/// `trim_start_matches('+')` + `starts_with('-')`, and
+/// [`assemble_scientific_from_raw_exponent`]'s old `strip_prefix('+')`
+/// then `strip_prefix('-')` were each correct today only because the
+/// lexer's own invariant happens to make all three equivalent -- nothing
+/// enforced that they'd stay in agreement if it ever didn't.
+fn strip_leading_sign(s: &str) -> (bool, &str) {
+    match s.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, s.strip_prefix('+').unwrap_or(s)),
+    }
+}
+
+/// An `i128` exponent value together with whether it's the digit string's
+/// *exact* parse or a fixed sentinel standing in for a digit string too
+/// long for `i128` to hold at all (#1273) -- every caller of
+/// [`parse_literal_exponent`] and every field of
+/// [`NormalizedMantissa`] that carries an exponent uses this instead of a
+/// bare `i128` alongside a separately-tracked `bool`.
+///
+/// #1304 code review: the two were previously a `(i128, bool)` tuple, and
+/// the one call site that actually needs to tell them apart
+/// (`format_near_zero_literal`, the sole caller with no ceiling of its own
+/// to fall back on) matched the trailing `bool` positionally --
+/// `Ok((mantissa_str, _, _, true))` vs `Ok((.., false))` -- so a future
+/// edit that swapped which arm got `true`/`false` would compile cleanly
+/// and silently invert exact/saturated handling. Matching
+/// `ExpParse::Saturated(_)`/`ExpParse::Exact(new_exp)` by name instead
+/// makes that swap a compile error (unknown/mismatched variant) rather
+/// than a silent behavior inversion.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExpParse {
+    Exact(i128),
+    Saturated(i128),
+}
+
+impl ExpParse {
+    /// The numeric payload either way -- for a call site (`checked_add`/
+    /// `checked_sub` against a further shift, or a ceiling comparison like
+    /// `format_overflow_literal_mantissa`'s) that treats an exact and a
+    /// saturated value identically, since either way the value is already
+    /// past whatever ceiling the caller cares about.
+    fn value(self) -> i128 {
+        match self {
+            Self::Exact(v) | Self::Saturated(v) => v,
+        }
+    }
+
+    fn is_saturated(self) -> bool {
+        matches!(self, Self::Saturated(_))
     }
 }
 
@@ -571,11 +684,12 @@ fn parse_literal_exponent(exp_text: &str) -> (i128, bool) {
 /// hand-copied at each of its own call sites (#106).
 fn split_mantissa(s: &str, exp_pos: usize) -> (&str, &str) {
     let raw = &s[..exp_pos];
-    // Strip either sign: `+` is as insignificant to the mantissa's own
-    // magnitude as `-` already was here, and (unlike `-`) wasn't stripped at
-    // all before #1180 -- a leading `+` in `int_part` was misread as its
-    // significant leading digit.
-    let mantissa = raw.strip_prefix(['-', '+']).unwrap_or(raw);
+    // Strip either sign via `strip_leading_sign` (#1304): `+` is as
+    // insignificant to the mantissa's own magnitude as `-` already was
+    // here, and (unlike `-`) wasn't stripped at all before #1180 -- a
+    // leading `+` in `int_part` was misread as its significant leading
+    // digit.
+    let (_, mantissa) = strip_leading_sign(raw);
     mantissa.split_once('.').unwrap_or((mantissa, ""))
 }
 
@@ -628,22 +742,16 @@ const MAX_RENDERED_MANTISSA_DIGITS: usize = 100_000;
 /// Shift a literal's own mantissa digits (the text before `exp_pos`, i.e.
 /// before `e`/`E`) into jq's one-digit-before-the-point normalized form,
 /// and fold that shift into the literal's own written exponent -- returns
-/// `Ok((mantissa_str, new_exp, digit_count, exp_saturated))`, or
-/// `Err(frac_len)` if the mantissa is genuinely all-zero (`0.0e400`,
-/// `0.00e-400`), which has no magnitude to normalize against (`frac_len` is
-/// the fractional-digit count the `Err` caller needs for its own shift
-/// math, #1207 -- surfaced here rather than re-derived by every `Err`
-/// caller via a second `split_mantissa` call). `digit_count` is the
-/// mantissa's *true* (never truncated -- see `MAX_RENDERED_MANTISSA_DIGITS`
-/// below) significant-digit count, needed by `format_number_jq_compat`'s
-/// own plain-vs-scientific notation choice for a positive shifted exponent
-/// (#1244); it costs nothing extra to compute (`str::len()` is O(1)), so
-/// it's returned unconditionally rather than only on request. `exp_saturated`
-/// is [`parse_literal_exponent`]'s own saturation bit, passed through
-/// unconditionally for the same reason (#1273) -- only
+/// `Ok` with a [`NormalizedMantissa`], or `Err(frac_len)` if the mantissa is
+/// genuinely all-zero (`0.0e400`, `0.00e-400`), which has no magnitude to
+/// normalize against (`frac_len` is the fractional-digit count the `Err`
+/// caller needs for its own shift math, #1207 -- surfaced here rather than
+/// re-derived by every `Err` caller via a second `split_mantissa` call).
+/// `new_exp`'s [`ExpParse::Saturated`] case is [`parse_literal_exponent`]'s
+/// own saturation folded through unconditionally (#1273) -- only
 /// [`format_near_zero_literal`] actually inspects it (its other two callers
-/// both have a ceiling `new_exp` clears regardless of whether it's exact or
-/// a saturation sentinel).
+/// both have a ceiling `new_exp`'s value clears regardless of whether it's
+/// exact or a saturation sentinel, via [`ExpParse::value`]).
 /// Entirely via string manipulation on `s` rather than `log10`/`pow` on the
 /// parsed value, since the caller only reaches here when the parsed value
 /// has already lost the precision this exists to recover (`+/-infinity` on
@@ -671,7 +779,7 @@ fn normalize_extreme_literal_mantissa(
     s: &str,
     exp_pos: usize,
     mantissa_digit_cap: Option<usize>,
-) -> Result<(String, i128, i128, bool), i128> {
+) -> Result<NormalizedMantissa, i128> {
     let (int_part, frac_part) = split_mantissa(s, exp_pos);
 
     // Insignificant leading zeros (`007`) don't change which digit is the
@@ -732,11 +840,11 @@ fn normalize_extreme_literal_mantissa(
         )
     };
 
-    let (parsed_exp, exp_saturated) = parse_literal_exponent(&s[exp_pos + 1..]);
+    let parsed_exp = parse_literal_exponent(&s[exp_pos + 1..]);
     // `checked_add`, not `saturating_add` (#1273 review): a `parsed_exp`
-    // that's exact on its own (in range, `exp_saturated == false`) can
-    // still overflow once `shift` is folded in, if it lands within `shift`
-    // of `i128::MIN`/`MAX` -- `shift` is unbounded (the mantissa's own
+    // that's exact on its own (in range, `ExpParse::Exact`) can still
+    // overflow once `shift` is folded in, if it lands within `shift` of
+    // `i128::MIN`/`MAX` -- `shift` is unbounded (the mantissa's own
     // leading-zero-fraction-digit count, `k` above, is never capped by
     // `MAX_RENDERED_MANTISSA_DIGITS`, which only bounds what gets copied
     // into `rest`), so this is reachable with an ordinary ~39-digit
@@ -744,20 +852,50 @@ fn normalize_extreme_literal_mantissa(
     // this check, `0.005e-170141183460469231731687303715884105727`
     // (exponent = i128::MIN+1, a fully in-range parse; mantissa `0.005`
     // gives `shift = -2`) rendered `5E-170141183460469231731687303715884105728`
-    // -- the same fabricated sentinel `exp_saturated` alone was meant to
-    // catch, leaking through a second, uncaught saturation point.
-    let (new_exp, shift_saturated) = match parsed_exp.checked_add(shift) {
+    // -- the same fabricated sentinel a bare `ExpParse::Saturated` check
+    // alone was meant to catch, leaking through a second, uncaught
+    // saturation point.
+    let (new_exp_value, shift_saturated) = match parsed_exp.value().checked_add(shift) {
         Some(v) => (v, false),
         None => (if shift < 0 { i128::MIN } else { i128::MAX }, true),
     };
-    let exp_saturated = exp_saturated || shift_saturated;
+    let new_exp = if parsed_exp.is_saturated() || shift_saturated {
+        ExpParse::Saturated(new_exp_value)
+    } else {
+        ExpParse::Exact(new_exp_value)
+    };
 
     let mantissa_str = if rest.is_empty() {
         leading.to_string()
     } else {
         format!("{leading}.{rest}")
     };
-    Ok((mantissa_str, new_exp, digit_count, exp_saturated))
+    Ok(NormalizedMantissa {
+        mantissa_str,
+        new_exp,
+        digit_count,
+    })
+}
+
+/// [`normalize_extreme_literal_mantissa`]'s successful result: a literal's
+/// mantissa renormalized to jq's one-digit-before-the-point form, together
+/// with the exponent that shift folds into and the mantissa's own true
+/// (never-truncated) significant-digit count.
+///
+/// A named struct rather than the `(String, i128, i128, bool)` positional
+/// tuple this replaced (#1304 code review) -- see [`ExpParse`]'s own doc
+/// comment for the specific risk this and `parse_literal_exponent`'s return
+/// type both close off.
+struct NormalizedMantissa {
+    mantissa_str: String,
+    new_exp: ExpParse,
+    /// The mantissa's *true* (never truncated -- see
+    /// `MAX_RENDERED_MANTISSA_DIGITS`) significant-digit count, needed by
+    /// `format_number_jq_compat`'s own plain-vs-scientific notation choice
+    /// for a positive shifted exponent (#1244); it costs nothing extra to
+    /// compute (`str::len()` is O(1)), so it's returned unconditionally
+    /// rather than only on request.
+    digit_count: i128,
 }
 
 /// Re-derive `mantissa_str` without [`normalize_extreme_literal_mantissa`]'s
@@ -790,7 +928,10 @@ fn full_mantissa_if_capped<'a>(
     digit_count: i128,
 ) -> Cow<'a, str> {
     if digit_count > MAX_RENDERED_MANTISSA_DIGITS as i128 + 1 {
-        let Ok((full, _, _, _)) = normalize_extreme_literal_mantissa(s, exp_pos, None) else {
+        let Ok(NormalizedMantissa {
+            mantissa_str: full, ..
+        }) = normalize_extreme_literal_mantissa(s, exp_pos, None)
+        else {
             unreachable!("digit_count > 0 implies a nonzero mantissa was already found")
         };
         Cow::Owned(full)
@@ -819,16 +960,21 @@ fn format_overflow_literal_mantissa(s: &str, exp_pos: usize, negative: bool) -> 
     // never `+/-infinity` -- callers only reach this function when `value`
     // has already overflowed, which guarantees a nonzero mantissa.
     //
-    // `exp_saturated` (`_`, ignored): this function's own ceiling check
-    // just below fires regardless of whether `new_exp` is exact or a
-    // saturation sentinel -- either way it's past `1_000_000_000` -- so
-    // unlike `format_near_zero_literal` (#1273), there is no case here
-    // where the distinction changes what gets rendered.
-    let Ok((mantissa_str, new_exp, digit_count, _exp_saturated)) =
-        normalize_extreme_literal_mantissa(s, exp_pos, Some(MAX_RENDERED_MANTISSA_DIGITS))
+    // `new_exp`'s saturation (ignored via `.value()`): this function's own
+    // ceiling check just below fires regardless of whether `new_exp` is
+    // exact or a saturation sentinel -- either way it's past
+    // `1_000_000_000` -- so unlike `format_near_zero_literal` (#1273),
+    // there is no case here where the distinction changes what gets
+    // rendered.
+    let Ok(NormalizedMantissa {
+        mantissa_str,
+        new_exp,
+        digit_count,
+    }) = normalize_extreme_literal_mantissa(s, exp_pos, Some(MAX_RENDERED_MANTISSA_DIGITS))
     else {
         unreachable!("overflow implies a nonzero mantissa")
     };
+    let new_exp = new_exp.value();
 
     // jq's own literal-preserving text (as opposed to a computed value's
     // DBL_MAX text) only goes up to this exponent magnitude (decNumber's
@@ -937,17 +1083,25 @@ fn format_overflow_literal_mantissa(s: &str, exp_pos: usize, negative: bool) -> 
 fn format_near_zero_literal(s: &str, exp_pos: usize, negative: bool) -> String {
     let sign = if negative { "-" } else { "" };
     match normalize_extreme_literal_mantissa(s, exp_pos, Some(MAX_RENDERED_MANTISSA_DIGITS)) {
-        // #1273: this is the one caller with no ceiling of its own (see the
-        // doc comment above), so it's the one place a saturated exponent
-        // must not reach `assemble_scientific` -- that would display
-        // `parse_literal_exponent`'s fixed sentinel as if it were the
-        // literal's real exponent.
-        Ok((mantissa_str, _, _, true)) => {
-            assemble_scientific_from_raw_exponent(sign, &mantissa_str, &s[exp_pos + 1..])
-        }
-        Ok((mantissa_str, new_exp, _, false)) => assemble_scientific(sign, &mantissa_str, new_exp),
+        // #1273/#1304: this is the one caller with no ceiling of its own
+        // (see the doc comment above), so it's the one place a saturated
+        // exponent must not reach `assemble_scientific` -- that would
+        // display `parse_literal_exponent`'s fixed sentinel as if it were
+        // the literal's real exponent. Matched by variant name, not a
+        // positional trailing `bool` (#1304 code review) -- see
+        // `ExpParse`'s own doc comment for why.
+        Ok(NormalizedMantissa {
+            mantissa_str,
+            new_exp: ExpParse::Saturated(_),
+            ..
+        }) => assemble_scientific_from_raw_exponent(sign, &mantissa_str, &s[exp_pos + 1..]),
+        Ok(NormalizedMantissa {
+            mantissa_str,
+            new_exp: ExpParse::Exact(new_exp),
+            ..
+        }) => assemble_scientific(sign, &mantissa_str, new_exp),
         Err(frac_len) => {
-            let (parsed_exp, exp_saturated) = parse_literal_exponent(&s[exp_pos + 1..]);
+            let parsed_exp = parse_literal_exponent(&s[exp_pos + 1..]);
             // `checked_sub`, not `saturating_sub` (#1273 review, same
             // reasoning as `normalize_extreme_literal_mantissa`'s own
             // `checked_add` above): `frac_len` is document-controlled and
@@ -956,11 +1110,11 @@ fn format_near_zero_literal(s: &str, exp_pos: usize, negative: bool) -> String {
             // underflow once `frac_len` is subtracted. `frac_len` is always
             // `>= 0` (`str::len()`), so this can only underflow toward
             // `i128::MIN`, never overflow toward `MAX`.
-            let (shifted_exp, sub_saturated) = match parsed_exp.checked_sub(frac_len) {
+            let (shifted_exp, sub_saturated) = match parsed_exp.value().checked_sub(frac_len) {
                 Some(v) => (v, false),
                 None => (i128::MIN, true),
             };
-            if exp_saturated || sub_saturated {
+            if parsed_exp.is_saturated() || sub_saturated {
                 // Same reasoning as the `Ok` arm above; the all-zero-mantissa
                 // shift (`frac_len`) is dropped along with the exact-value
                 // path rather than folded into the raw text (see
