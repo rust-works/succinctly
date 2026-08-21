@@ -1728,7 +1728,7 @@ impl JsonError {
     ///
     /// Split out of [`Display`](core::fmt::Display) (which now defers to it)
     /// so a caller that needs the text without allocating -- notably
-    /// [`DocumentValue::string_decode_error`](crate::jq::document::DocumentValue::string_decode_error),
+    /// [`DocumentValue::string_decode_error`],
     /// which runs on a `no_std`-compatible path -- shares one definition with
     /// the formatter rather than restating the four strings next to it.
     #[must_use]
