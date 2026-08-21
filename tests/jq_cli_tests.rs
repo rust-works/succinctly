@@ -14633,6 +14633,26 @@ fn test_limit_path_mode_zero_output_bound_produces_no_output_1313() -> Result<()
     Ok(())
 }
 
+/// #1313 (code review): `resolve_limit`'s n-classification was missing the
+/// negative-float "unlimited passthrough" arm `eval_limit` already had
+/// (#983) -- `path(limit(-1.5; ...))` raised "limit requires non-negative
+/// integer" instead of agreeing with plain-value-mode `limit(-1.5; ...)`,
+/// which already correctly passed everything through. A pre-existing
+/// divergence between the two functions, unrelated to and not introduced by
+/// this issue's own zero-output-bound fix, but caught while both functions
+/// were already being edited for it.
+#[test]
+fn test_limit_path_mode_negative_float_bound_is_unlimited_passthrough_1313() -> Result<()> {
+    let (out, err, code) = run_jq_full(
+        &["-c", "path(limit(-1.5; .a,.b))"],
+        Some(r#"{"a":1,"b":2}"#),
+    )?;
+    assert_eq!(code, 0, "err={err}");
+    assert_eq!(out, "[\"a\"]\n[\"b\"]\n");
+
+    Ok(())
+}
+
 /// #1313: the plain value-mode sibling of the fix above -- `eval_limit`
 /// used `result_to_owned`, which collapses a zero-output bound into
 /// `result_to_owned_ctrl`'s own `Err("no value")` instead of the zero-output
@@ -14679,6 +14699,29 @@ fn test_compound_assign_empty_rhs_produces_no_output_1313() -> Result<()> {
     let (out, _err, code) = run_jq_full(&["-c", ".a += 5"], Some(r#"{"a":1}"#))?;
     assert_eq!(code, 0);
     assert_eq!(out.trim(), r#"{"a":6}"#);
+
+    Ok(())
+}
+
+/// #1313 (code review): an `optional`-swallowed RHS error is a distinct
+/// shape from a genuinely zero-output generator (`empty`, covered above),
+/// but reaches `eval_rhs_once` the same way -- `.a += (1/0)?` swallows the
+/// division error to zero output at `eval_single`'s own `?` handling, then
+/// `eval_rhs_once` sees `QueryResult::None` exactly as it would for `empty`,
+/// and the whole assignment correctly produces zero output rather than
+/// splicing `null` in and evaluating `. + null` (which used to be a type
+/// error, not a silent no-op -- this is a case where the old bug produced a
+/// hard error instead of a wrong value, but still diverged from jq).
+#[test]
+fn test_compound_assign_optional_swallowed_rhs_error_produces_no_output_1313() -> Result<()> {
+    let (out, err, code) = run_jq_full(&["-c", ".a += (1/0)?"], Some(r#"{"a":1}"#))?;
+    assert_eq!(code, 0, "err={err}");
+    assert_eq!(out, "");
+
+    // Without `?`, the same division-by-zero still hard-errors.
+    let (_out, err, code) = run_jq_full(&["-c", ".a += (1/0)"], Some(r#"{"a":1}"#))?;
+    assert_eq!(code, 5);
+    assert!(err.contains("divided"), "err={err}");
 
     Ok(())
 }
