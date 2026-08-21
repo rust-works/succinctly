@@ -540,6 +540,26 @@ pub(crate) fn needs_path_context(expr: &Expr) -> bool {
         // `label $out | file_index` silently dropped path context (#715
         // follow-up).
         Expr::Label { body, .. } => needs_path_context(body),
+        // `"...\(key)..."` (#1334): the same reasoning as `Array` above --
+        // a string interpolation slot is still just "evaluate this
+        // expression", so whatever it needs, the surrounding string needs
+        // too. Literal parts obviously never need it.
+        Expr::StringInterpolation(parts) => parts.iter().any(|part| match part {
+            StringPart::Literal(_) => false,
+            StringPart::Expr(inner) => needs_path_context(inner),
+        }),
+        // `def name(params): body; then` (#1306): the def itself doesn't
+        // need path context, but `then` might reference `key`/`parent`/...
+        // directly (`def f: 5; f, key`), and so might `body` if `then`
+        // ever calls `name` (`def f: key; .a | f`) -- recursing into both
+        // is a deliberately cheap, syntax-only approximation (no macro
+        // expansion here) that misses only one narrower case: a
+        // path-context builtin reaching `body` solely through a *call
+        // argument* (`def f(x): x; .a | f(key)`), which needs the actual
+        // substitution to see. Not covered by #1306's own repros, so left
+        // as a known gap rather than paying for a full
+        // `expand_func_calls` just to answer this routing question.
+        Expr::FuncDef { body, then, .. } => needs_path_context(body) || needs_path_context(then),
         _ => false,
     }
 }
@@ -11166,9 +11186,13 @@ pub fn eval_lenient<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// `.`/`.[]`/`.field` navigation, comparisons, `select(...)`, `map(...)`,
 /// `if`/`then`/`else`, `try`/`catch`, comma, and `label` (the same
 /// capability level `key`/`document_index` already have; an array literal
-/// gained this capability too, #1302 -- object literals, string
-/// interpolation, and user-defined functions remain out of scope, matching
-/// those builtins' own existing limits).
+/// gained this capability too, #1302, and a string interpolation slot and a
+/// `def` scope/function call both gained it in turn, #1334/#1306 -- object
+/// literals remain out of scope (#1332, its own multi-entry generator
+/// design pass), and a path-context builtin reaching a `def` only through a
+/// *call argument* (`def f(x): x; f(file_index)`) is a narrower, documented
+/// gap in `needs_path_context`'s own `FuncDef` arm rather than this
+/// function's limit).
 ///
 /// Routes through the ordinary evaluator, untouched, whenever `expr`
 /// doesn't reference `file_index`/`key`/`parent`/`path` anywhere
@@ -19035,6 +19059,154 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
                     &result,
                     file_origin,
                     &[],
+                    optional,
+                )
+            }
+        }
+        // `"...\(key)..."` (#1334): the `Array` arm's own reasoning above,
+        // applied to a string interpolation slot instead of an array
+        // element -- whatever a `\(...)` slot needs, the surrounding
+        // string needs too, and the generic fallback below (which builds
+        // the string via the plain, context-less `eval_string_interpolation`
+        // regardless) never gave it a chance to resolve.
+        //
+        // Matches `eval_string_interpolation`'s own existing "embed just
+        // the first output" convention for a multi-valued slot exactly --
+        // real jq instead fans out a `\(...)` slot's generator into one
+        // string per value, a separate, pre-existing, unrelated gap (not
+        // this fix's to close, #1403).
+        //
+        // Each slot's inner evaluation is deliberately run with `optional`
+        // forced to `false`, not the ambient value (#1302's `?`-atomicity
+        // lesson, carried over from the start rather than rediscovered
+        // here): otherwise a genuine error inside a slot could
+        // self-swallow at its own leaf-level `if optional` check before
+        // ever reaching this arm's own construction, corrupting
+        // `"a\(key, error("x"))"?` into a partial string instead of the
+        // whole interpolation being caught atomically. Forcing `false`
+        // lets a genuine error surface as a real `Error`/`Partial(_,
+        // Error)`, caught below using *this* arm's own `optional` -- the
+        // same evaluate-then-catch shape as the `Array` arm above.
+        Expr::StringInterpolation(parts)
+            if parts.iter().any(|part| match part {
+                StringPart::Literal(_) => false,
+                StringPart::Expr(inner) => needs_path_context(inner),
+            }) =>
+        {
+            let mut rendered = String::new();
+            for part in parts {
+                let inner = match part {
+                    StringPart::Literal(s) => {
+                        rendered.push_str(s);
+                        continue;
+                    }
+                    StringPart::Expr(inner) => inner,
+                };
+                let slot = eval_pipe_with_path_context_internal::<W, S>(
+                    core::slice::from_ref(inner),
+                    value,
+                    root,
+                    file_origin,
+                    current_path,
+                    false,
+                );
+                let s = match slot {
+                    QueryResult::Owned(v) => owned_to_string::<S>(&v),
+                    QueryResult::ManyOwned(vs) => {
+                        vs.first().map(owned_to_string::<S>).unwrap_or_default()
+                    }
+                    QueryResult::None => String::new(),
+                    QueryResult::Error(_) | QueryResult::Partial(_, Control::Error(_))
+                        if optional =>
+                    {
+                        return QueryResult::None;
+                    }
+                    QueryResult::Error(e) => return QueryResult::Error(e),
+                    QueryResult::Break(label) => return QueryResult::Break(label),
+                    QueryResult::Halt(code) => return QueryResult::Halt(code),
+                    QueryResult::Partial(_, Control::Error(e)) => return QueryResult::Error(e),
+                    QueryResult::Partial(_, Control::Break(label)) => {
+                        return QueryResult::Break(label);
+                    }
+                    QueryResult::Partial(_, Control::Halt(code)) => {
+                        return QueryResult::Halt(code);
+                    }
+                    QueryResult::One(_) | QueryResult::OneCursor(_) | QueryResult::Many(_) => {
+                        unreachable!(
+                            "eval_pipe_with_path_context_internal only ever produces \
+                             Owned/ManyOwned/None/Error/Break/Partial"
+                        )
+                    }
+                };
+                rendered.push_str(&s);
+            }
+            let result = OwnedValue::String(rendered);
+            if rest.is_empty() {
+                QueryResult::Owned(result)
+            } else {
+                eval_pipe_with_path_context_internal::<W, S>(
+                    rest,
+                    &result,
+                    &result,
+                    file_origin,
+                    &[],
+                    optional,
+                )
+            }
+        }
+        // `def name(params): body; then` (#1306): the plain evaluator's own
+        // `eval_func_def` expands every call to `name` within `then` into
+        // `body`, then evaluates the expanded tree via `eval_single` --
+        // unconditionally the *plain* evaluator, dropping path context even
+        // once the outer routing decision (`needs_path_context`'s own new
+        // `FuncDef` arm, above) correctly detects that this `def` needs it.
+        // Doing the identical expansion here, then continuing through
+        // *this* same path-context evaluator instead, is what lets
+        // `key`/`parent`/... resolve when reached through a function call
+        // or in a `then` continuation after one.
+        //
+        // Unconditional, no `needs_path_context` guard: unlike `Array`'s
+        // guarded arm above (whose un-guarded case falls to a *different*,
+        // cheaper generic path), there is no dedicated "doesn't need path
+        // context" fallback for `FuncDef` to preserve -- the alternative is
+        // the fully generic `_` catch-all at the bottom, which would expand
+        // and evaluate through `eval_owned_expr_opt` at identical cost
+        // anyway (it dispatches to `eval_func_def`, the same expansion).
+        // Recursing here instead costs nothing extra when the expansion
+        // turns out not to need path context either: the path-context
+        // evaluator's own generic fallback is exactly what `eval_func_def`
+        // itself would have done.
+        //
+        // No `?`-atomicity forcing needed here, unlike `Array`/
+        // `StringInterpolation` above: a `def` scope doesn't construct or
+        // collect a value of its own the way those do (`expanded_then`'s
+        // result *is* this arm's result, with nothing wrapping it) -- it's
+        // a simple delegation, the same shape as the `Paren` arm above,
+        // which also threads `optional` straight through unchanged.
+        Expr::FuncDef {
+            name,
+            params,
+            body,
+            then,
+        } => {
+            let expanded_then = expand_func_calls(then, name, params, body, None, 0);
+            let then_result = eval_pipe_with_path_context_internal::<W, S>(
+                core::slice::from_ref(&expanded_then),
+                value,
+                root,
+                file_origin,
+                current_path,
+                optional,
+            );
+            if rest.is_empty() {
+                then_result
+            } else {
+                continue_rest_with_context::<W, S>(
+                    then_result,
+                    rest,
+                    root,
+                    file_origin,
+                    current_path,
                     optional,
                 )
             }
@@ -45261,29 +45433,31 @@ mod tests {
 
     #[test]
     fn test_file_index_inside_user_defined_function() {
-        // `eval_owned_with_file_index`'s own doc comment: user-defined
-        // functions are out of scope for `--eval-all` path-context
-        // resolution, the same pre-existing limit `key`/`document_index`
-        // already have -- `needs_path_context` doesn't see through a
-        // `FuncCall`, so `.[] | f` never routes through path-context
-        // evaluation and `file_index` inside `f`'s body falls back to its
-        // default (0) rather than resolving per-element. This exercises
-        // `expand_func_calls`'s `FileIndex` arm (hit while inlining `f`'s
-        // body at call time), not per-element resolution --
-        // `test_file_index_continues_pipe_after_itself` covers that.
+        // User-defined functions used to be out of scope for `--eval-all`
+        // path-context resolution -- `needs_path_context` didn't see
+        // through a `FuncDef`, so `.[] | f` never routed through
+        // path-context evaluation and `file_index` inside `f`'s body fell
+        // back to its default (0) instead of resolving per-element. Fixed
+        // by #1306's `needs_path_context`/`eval_pipe_with_path_context_internal`
+        // `FuncDef` arms (added for `key`, but shared by every path-context
+        // builtin including this one): each element now correctly sees its
+        // own origin file (3 and 4) via `expand_func_calls`'s `FileIndex`
+        // arm, hit while inlining `f`'s body at call time -- not
+        // per-element resolution itself, `test_file_index_continues_pipe_after_itself`
+        // covers that.
         assert_eq!(
             eval_all_outputs(b"[10,20]", &[3, 4], "def f: file_index; .[] | f"),
-            vec!["0", "0"]
+            vec!["3", "4"]
         );
     }
 
     #[test]
     fn test_file_index_inside_parameterized_user_defined_function() {
-        // Same scope boundary as above, via `substitute_func_param`'s
+        // Same fix as above (#1306), via `substitute_func_param`'s
         // `FileIndex` arm instead of `expand_func_calls`'s.
         assert_eq!(
             eval_all_outputs(b"[10]", &[9], "def f($x): (file_index, $x); .[] | f(1)"),
-            vec!["0", "1"]
+            vec!["9", "1"]
         );
     }
 
