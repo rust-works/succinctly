@@ -1,6 +1,6 @@
 # Decode-failure error routing for `to_owned`/`cursor_to_owned` (#1247, #1242, #1194)
 
-**Status: partially implemented — Stages 1–3 landed, 4–6 outstanding.** This
+**Status: partially implemented — Stages 1–4 landed, 5–6 outstanding.** This
 document is the deliverable for
 [#1247](https://github.com/rust-works/succinctly/issues/1247), which was tiered Tier 3
 ("needs a design decision before implementation, not a same-pattern continuation of the
@@ -427,8 +427,22 @@ Implementation notes, all discovered while doing it:
   verbatim. Neither loses data — both are the same raw-passthrough class as `jq '.'` —
   so both were left alone, and the tests say why.
 
-**Stage 4 — the `StandardJson::Error` arms (sites 17–20).** Fixes `[xyz123] → [null]`,
-i.e. #1194's in-scope half. Small once Stage 3 exists.
+**Stage 4 — the `StandardJson::Error` arms (sites 17–20). ✅ landed.** Fixes
+`[xyz123] → [null]`, i.e. #1194's in-scope half. Small once Stage 3 exists: the arms
+raise with the semi-index's own message, which is more specific than anything
+reconstructible at the materializer.
+
+One site was reverted after being written. `print_json`'s `StandardJson::Error` arm
+(`jq_runner.rs`) walks child cursors lazily and streams as it goes, so by the time a
+nested error is reached it has already written the opening `[`. Bailing there produced a
+truncated document plus a generic exit 1, where every materializing route gives a clean
+diagnostic and exit 5 — worse on every axis than the silent `null` it replaced. Left as
+`null` with the reasoning in place, and folded into Stage 6, which is the same problem.
+
+Evaluation still continues past the bad value, so the good documents either side of it in
+a multi-value stream are still processed (`ErrorSink`, #355). Real jq aborts the whole run
+at the parse error instead; succinctly's behaviour here is the more useful of the two and
+is a deliberate, tested divergence.
 
 **Stage 5 — UTF-8 at the boundary (sites 21–22, #1242).** yq rejects, jq replaces with
 U+FFFD, `yaml validate` grows a UTF-8 check. *Why last:* it is the only stage that adds
