@@ -11248,7 +11248,14 @@ fn eval_rhs_once<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     match eval_single::<W, S>(expr, value, optional).materialize_cursor() {
         QueryResult::One(v) => Ok(to_owned(&v)),
         QueryResult::Owned(v) => Ok(v),
-        QueryResult::None => Ok(OwnedValue::Null),
+        // #1313: a genuinely zero-output RHS (`.a += empty`) makes the
+        // *whole* compound/alternative assignment produce zero output in
+        // real jq (`value as $value | ...` never binds), not a synthesized
+        // `null` spliced into the update filter -- `Err(QueryResult::None)`
+        // is this function's own early-return signal, so both callers'
+        // existing `Err(early_return) => return early_return` arm already
+        // does the right thing here with no change on their end.
+        QueryResult::None => Err(QueryResult::None),
         QueryResult::Error(e) => Err(QueryResult::Error(e)),
         QueryResult::Many(vs) => Ok(vs.first().map_or(OwnedValue::Null, to_owned)),
         QueryResult::ManyOwned(vs) => Ok(vs.into_iter().next().unwrap_or(OwnedValue::Null)),
@@ -13839,8 +13846,17 @@ fn resolve_limit<'a, S: EvalSemantics>(
     value: &'a OwnedValue,
     trackable: bool,
 ) -> PathResolveResult<'a> {
-    let n_value = eval_owned_expr_ctrl::<S>(n_expr, value, false)
-        .map_err(|control| (Vec::new(), control.into()))?;
+    // #1313: `eval_owned_expr_ctrl` (used elsewhere in this file) collapses
+    // a genuinely zero-output bound to `Null` by design -- which would fall
+    // into the `Null`/`Bool` "unlimited passthrough" arm below instead of
+    // jq's own `n as $n | ...` desugaring, where a zero-output `n` never
+    // even reaches `path(paths)` and the whole call produces zero output.
+    // `eval_owned_expr_full` keeps that distinction visible.
+    let n_value = match eval_owned_expr_full::<S>(n_expr, value, false) {
+        Ok(Some((v, _trailing))) => v,
+        Ok(None) => return Ok(Vec::new()),
+        Err(control) => return Err((Vec::new(), control.into())),
+    };
     let n = match n_value {
         OwnedValue::Int(i) | OwnedValue::NumberLiteral(NumberRepr::Int(i), _) if i >= 0 => {
             i as usize
@@ -17174,20 +17190,30 @@ fn eval_limit<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // not an error (#983; verified against jq 1.7.1: `limit(-1; 1,2,3)`
     // and `limit(null; 1,2,3)` both pass every value through unchanged).
     let n_result = eval_single::<W, S>(n_expr, value.clone(), optional);
-    let n = match result_to_owned(n_result) {
-        Ok(OwnedValue::Int(i) | OwnedValue::NumberLiteral(NumberRepr::Int(i), _)) if i >= 0 => {
+    // #1313: `result_to_owned` collapses a genuinely zero-output bound
+    // (`limit(empty; ...)`) into `result_to_owned_ctrl`'s own `Err("no
+    // value")` -- not real jq's behavior (`n as $n | ...` never binds, so
+    // the whole call produces zero output, not an error). `result_to_owned_full`
+    // (#1045) keeps that distinction visible; migrated the same way every
+    // other #1045-era caller already was (e.g. `builtin_ltrimstr` above).
+    let n = match result_to_owned_full(n_result) {
+        Ok(None) => return QueryResult::None,
+        Ok(Some((OwnedValue::Int(i) | OwnedValue::NumberLiteral(NumberRepr::Int(i), _), _)))
+            if i >= 0 =>
+        {
             i as usize
         }
         // A negative int, `null`, or a bool -- jq's total ordering places
         // all three below every positive number, so each takes the same
         // "no limit at all" branch of jq's own `def limit`, not an error
         // -- verified against jq 1.7.1 (#983).
-        Ok(
+        Ok(Some((
             OwnedValue::Int(_)
             | OwnedValue::NumberLiteral(NumberRepr::Int(_), _)
             | OwnedValue::Null
             | OwnedValue::Bool(_),
-        ) => {
+            _,
+        ))) => {
             return eval_single::<W, S>(expr, value, optional);
         }
         // Same for a negative float. A *positive* non-integer float (e.g.
@@ -17195,12 +17221,13 @@ fn eval_limit<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // foreach-decrement loop bounds it to 2 outputs; succinctly errors
         // instead) left untouched here -- out of #983's scope, which is
         // specifically the negative/null/bool "no limit" branch.
-        Ok(OwnedValue::Float(f) | OwnedValue::NumberLiteral(NumberRepr::Float(f), _))
-            if f < 0.0 =>
-        {
+        Ok(Some((
+            OwnedValue::Float(f) | OwnedValue::NumberLiteral(NumberRepr::Float(f), _),
+            _,
+        ))) if f < 0.0 => {
             return eval_single::<W, S>(expr, value, optional);
         }
-        Ok(_) => {
+        Ok(Some(_)) => {
             return QueryResult::Error(EvalError::new("limit requires non-negative integer"));
         }
         Err(e) => return e.into(),

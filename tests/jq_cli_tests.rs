@@ -14608,6 +14608,81 @@ fn test_path_context_parent_n_argument_wrong_type_errors_1280() -> Result<()> {
     Ok(())
 }
 
+/// #1313: `resolve_limit`'s own `n`-bound evaluation used `eval_owned_expr_ctrl`,
+/// which by design collapses a genuinely zero-output bound to `Null` --
+/// falling into the `Null`/`Bool` "unlimited passthrough" branch instead of
+/// jq's own `n as $n | ...` desugaring, where `n` producing zero outputs
+/// makes the whole call produce zero output. Both `path(...)` mode (this
+/// function) and plain value mode (`eval_limit`, the sibling test below)
+/// had the identical bug via two different collapsing helpers.
+#[test]
+fn test_limit_path_mode_zero_output_bound_produces_no_output_1313() -> Result<()> {
+    let (out, _err, code) = run_jq_full(
+        &["-c", "path(limit(empty; .a,.b))"],
+        Some(r#"{"a":1,"b":2}"#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "");
+
+    // Sanity: a normal bound is unaffected.
+    let (out, _err, code) =
+        run_jq_full(&["-c", "path(limit(1; .a,.b))"], Some(r#"{"a":1,"b":2}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "[\"a\"]\n");
+
+    Ok(())
+}
+
+/// #1313: the plain value-mode sibling of the fix above -- `eval_limit`
+/// used `result_to_owned`, which collapses a zero-output bound into
+/// `result_to_owned_ctrl`'s own `Err("no value")` instead of the zero-output
+/// case `result_to_owned_full` (#1045) already exists to distinguish (and
+/// every other #1045-migrated caller, e.g. `builtin_ltrimstr`, already
+/// uses).
+#[test]
+fn test_limit_value_mode_zero_output_bound_produces_no_output_1313() -> Result<()> {
+    let (out, _err, code) = run_jq_full(&["-c", "limit(empty; .a,.b)"], Some(r#"{"a":1,"b":2}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "");
+
+    // Sanity: negative/null/bool bounds still take the pre-existing
+    // "unlimited passthrough" branch (#983), unaffected by this fix.
+    let (out, _err, code) = run_jq_full(&["-c", "limit(-1; .a,.b)"], Some(r#"{"a":1,"b":2}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "1\n2\n");
+
+    Ok(())
+}
+
+/// #1313: `eval_rhs_once` (backing `+=`/`-=`/`*=`/`/=`/`%=`/`//=`) collapsed
+/// a genuinely zero-output RHS to `Null` and spliced it into the update
+/// filter (`. op null`), instead of real jq's `value as $value | ...`
+/// desugaring, where `value` producing zero outputs makes the whole
+/// assignment produce zero output. Covers every compound operator, plus
+/// `//=` (whose RHS is unconditional -- it's evaluated regardless of
+/// whether the current value is already truthy, since `//=`'s own
+/// short-circuiting is about which *filter result* wins per resolved path,
+/// not whether the RHS expression itself runs).
+#[test]
+fn test_compound_assign_empty_rhs_produces_no_output_1313() -> Result<()> {
+    for op in ["+=", "-=", "*=", "/=", "%="] {
+        let (out, err, code) = run_jq_full(&["-c", &format!(".a {op} empty")], Some(r#"{"a":2}"#))?;
+        assert_eq!(code, 0, "op={op} err={err}");
+        assert_eq!(out, "", "op={op}");
+    }
+
+    let (out, err, code) = run_jq_full(&["-c", ".a //= empty"], Some(r#"{"a":null}"#))?;
+    assert_eq!(code, 0, "err={err}");
+    assert_eq!(out, "");
+
+    // Sanity: a normal RHS is unaffected.
+    let (out, _err, code) = run_jq_full(&["-c", ".a += 5"], Some(r#"{"a":1}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), r#"{"a":6}"#);
+
+    Ok(())
+}
+
 /// #1045 coverage: `flatten(depth)`'s `Ok(Some(_)) => ...type_error("number",
 /// "non-number")` arm -- a non-number depth argument, unconditional (no
 /// `optional` gate), unlike the negative-depth arm covered by
