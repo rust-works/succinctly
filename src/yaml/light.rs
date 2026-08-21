@@ -3373,6 +3373,41 @@ pub fn format_float_yq_yaml(f: f64) -> String {
     format_float_yq_with(f, |f| f.to_string())
 }
 
+/// [`format_float_yq_yaml`] for a computed float at any **nested**
+/// (non-document-root) YAML position, prefixed with an explicit `!!float `
+/// tag whenever the bare spelling would read back as an int.
+///
+/// Real yq's rule here is a pure function of the node's *text*, not of how
+/// the value was produced: it emits the tag exactly when re-resolving the
+/// spelling it is about to print would not yield `!!float`. Oracle-verified
+/// against yq v4.53.3 over a 41-value sweep -- `1`, `0`, `-1`, `1000`,
+/// `100000` are tagged; `2.5`, `0.5`, `1e+06`, `1e-05`, `1e+10`, `1e+300`
+/// are not, their own `.`/`e` already being unambiguous. Placement is
+/// style-insensitive: block mapping, flow mapping (`{a: !!float 2}`) and
+/// block sequence (`- !!float 2`) all take the same unconditional prefix.
+///
+/// That text-only rule is why no value-provenance tracking is needed to
+/// match yq here, despite the shape of the problem suggesting otherwise:
+/// `OwnedValue`'s existing `Float`-versus-`NumberLiteral` split already
+/// draws the same line, since `into_plain_number` drops a `NumberLiteral`'s
+/// spelling on exactly the arithmetic that makes yq start tagging.
+///
+/// Document-root scalars are excluded because real yq suppresses *every*
+/// tag there, not just this one (`echo '!!str 5' | yq '.'` prints a bare
+/// `5`) -- callers keep making that root-vs-nested choice themselves via
+/// [`format_float_yq_yaml`], exactly as before (#949).
+///
+/// `f` must be finite, like [`format_float_yq_yaml`].
+#[must_use]
+pub fn format_float_yq_yaml_nested(f: f64) -> String {
+    let spelling = format_float_yq_yaml(f);
+    if super::scalar::needs_explicit_float_tag(&spelling) {
+        format!("!!float {spelling}")
+    } else {
+        spelling
+    }
+}
+
 /// Shared magnitude-threshold logic behind [`format_float_yq`] and
 /// [`format_float_yq_yaml`]: scientific notation (`e+NN`/`e-NN`) once the
 /// value's decimal exponent is `>= 6` or `<= -5`, otherwise
@@ -12558,5 +12593,69 @@ mod tests {
         assert_eq!(format_float_yq_yaml(-1_500_000.0), "-1.5e+06");
         assert_eq!(format_float_yq_yaml(1e100), "1e+100");
         assert_eq!(format_float_yq_yaml(1e-100), "1e-100");
+    }
+
+    /// [`format_float_yq_yaml_nested`]'s tag rule (#1090), pinned against
+    /// real yq v4.53.3. Each expectation below was read off the oracle with
+    /// `printf 'a: 1.0\n' | yq '.a = (.a * X)'`, which puts the computed
+    /// float at a nested (object-field) position.
+    ///
+    /// The rule is a pure function of the emitted *text*: tag exactly when
+    /// re-resolving that text would not yield `!!float`. Nothing here
+    /// depends on how the value was produced, which is why matching yq
+    /// needs no value-provenance tracking.
+    #[test]
+    fn test_format_float_yq_yaml_nested_1090() {
+        // Integer-shaped spellings would reparse as `!!int` -- tagged.
+        assert_eq!(format_float_yq_yaml_nested(1.0), "!!float 1");
+        assert_eq!(format_float_yq_yaml_nested(2.0), "!!float 2");
+        assert_eq!(format_float_yq_yaml_nested(0.0), "!!float 0");
+        assert_eq!(format_float_yq_yaml_nested(-1.0), "!!float -1");
+        assert_eq!(format_float_yq_yaml_nested(1000.0), "!!float 1000");
+        assert_eq!(format_float_yq_yaml_nested(100_000.0), "!!float 100000");
+
+        // A `.` or an exponent marker is already unambiguous -- untagged.
+        assert_eq!(format_float_yq_yaml_nested(2.5), "2.5");
+        assert_eq!(format_float_yq_yaml_nested(0.5), "0.5");
+        assert_eq!(format_float_yq_yaml_nested(0.00015), "0.00015");
+        assert_eq!(format_float_yq_yaml_nested(1_500_000.0), "1.5e+06");
+        assert_eq!(format_float_yq_yaml_nested(0.000015), "1.5e-05");
+        assert_eq!(format_float_yq_yaml_nested(1e10), "1e+10");
+        assert_eq!(format_float_yq_yaml_nested(1e100), "1e+100");
+        assert_eq!(format_float_yq_yaml_nested(1e-100), "1e-100");
+
+        // The one accepted divergence from the oracle: real yq leaves a
+        // computed negative zero bare (`-0`), because go-yaml resolves `-0`
+        // as `!!float`. `resolve_plain` calls it `!!int`, so tagging is what
+        // keeps *this* crate's emitter and reader in agreement -- the
+        // type-safe side of the disagreement. Fixing `resolve_plain`'s `-0`
+        // classification would make this byte-identical to yq with no change
+        // to `format_float_yq_yaml_nested` itself.
+        assert_eq!(format_float_yq_yaml_nested(-0.0), "!!float -0");
+    }
+
+    /// Whatever `format_float_yq_yaml_nested` emits must read back at the
+    /// same type -- the round-trip invariant the tag exists to protect, and
+    /// the reason the predicate is defined in terms of `resolve_plain`
+    /// rather than an independent scan for `.`/`e`.
+    #[test]
+    fn test_nested_float_spelling_round_trips_as_float_1090() {
+        for f in [
+            1.0, 2.0, 0.0, -0.0, -1.0, 1000.0, 100_000.0, 2.5, 0.5, 1e10, 1e-5, 1e100, -1e100,
+        ] {
+            let emitted = format_float_yq_yaml_nested(f);
+            let scalar = emitted.strip_prefix("!!float ").map_or_else(
+                || super::super::scalar::resolve_plain(&emitted),
+                |text| {
+                    super::super::scalar::resolve_tagged(text, "!!float")
+                        .expect("!!float is a core-schema tag")
+                },
+            );
+            assert!(
+                matches!(scalar, super::super::scalar::ResolvedScalar::Float(_)),
+                "{f} emitted as {emitted:?}, which reads back as {:?}",
+                scalar.tag()
+            );
+        }
     }
 }

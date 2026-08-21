@@ -117,6 +117,31 @@ impl ResolvedScalar {
             }
             Self::Float(f) => match preservable_float_literal_text(&text) {
                 Some(normalized) => OwnedValue::from_number_literal(&normalized),
+                // A *finite* float whose text a plain reader would type as
+                // something other than `!!float` -- i.e. one that is only a
+                // float because an explicit tag forced it (`!!float 2`,
+                // `!!float 0x2A`) -- has nowhere left to carry that
+                // float-ness: neither spelling gate above accepts an
+                // integer-shaped mantissa, so it falls through to a bare
+                // `OwnedValue::Float`, and `to_json_for_reindex`'s jq-mode
+                // fallback then serializes that as `2`, which reparses as an
+                // `Int`. The value silently changes type on the DOM route
+                // taken by `-i` and `--slurp` (#1176) -- reproducible with
+                // no `-i` at all via `--slurp '.[0]'` on `a: !!float 2`.
+                //
+                // Re-spelling it with a forced decimal point puts the type
+                // back into the literal itself, where the round trip
+                // preserves it, without touching the reindex bridge's own
+                // semantics gate (flipping that to `YqSemantics` is the
+                // obvious alternative and it re-breaks #978's
+                // JSON-sourced-`1e2`-renders-as-`100` rule).
+                //
+                // `is_finite` keeps `.inf`/`.nan` on the bare-`Float` path:
+                // they have no decimal spelling, and `resolve_plain` already
+                // types them `!!float` so they never need this anyway.
+                None if f.is_finite() && needs_explicit_float_tag(&text) => {
+                    OwnedValue::from_number_literal(&super::format_float_with_fraction(f))
+                }
                 None => OwnedValue::Float(f),
             },
             Self::Str => OwnedValue::String(text.into_owned()),
@@ -419,6 +444,34 @@ pub(super) fn preservable_float_literal_text(s: &str) -> Option<String> {
         .unwrap_or(mantissa);
     let normalized = format!("{mantissa}{exponent}");
     is_preservable_float_literal(&normalized).then_some(normalized)
+}
+
+/// Whether emitting `text` as a plain YAML scalar would lose its
+/// float-ness, so a `!!float` tag (or a float-shaped respelling) is needed
+/// to keep the value's type stable across a round trip.
+///
+/// Deliberately defined as "what [`resolve_plain`] — this crate's own
+/// reader — would say", rather than a hand-rolled scan for `.`/`e`. Two
+/// callers need the identical question answered and a second, independent
+/// spelling of YAML's float grammar would drift from the first (CLAUDE.md's
+/// #106 lesson: duplicated predicates diverge silently):
+/// - `format_float_yq_yaml_nested` (`light.rs`), deciding whether nested
+///   YAML output must precede a computed float with `!!float ` (#1090).
+/// - [`ResolvedScalar::to_owned_value`] below, deciding whether a
+///   tag-forced float needs a float-shaped literal to survive
+///   `to_json_for_reindex`'s JSON round trip (#1176).
+///
+/// Anchoring on `resolve_plain` also guarantees the emitter and the reader
+/// agree: whatever spelling this crate writes, this crate reads back at the
+/// same type. That costs one byte against real yq on exactly one value —
+/// yq resolves `-0` as `!!float` while `resolve_plain` calls it `!!int`, so
+/// a computed negative zero emits `!!float -0` here versus yq's bare `-0`.
+/// Tagging it is the type-safe side of that divergence, and fixing
+/// `resolve_plain`'s `-0` classification later makes both callers
+/// oracle-exact with no change to either.
+#[must_use]
+pub fn needs_explicit_float_tag(text: &str) -> bool {
+    !matches!(resolve_plain(text), ResolvedScalar::Float(_))
 }
 
 /// Force-resolves a scalar's value under an explicit YAML tag.
