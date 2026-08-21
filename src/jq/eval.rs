@@ -13393,18 +13393,13 @@ fn resolve_node<'a, S: EvalSemantics>(
         // raising `x`.
         Expr::Builtin(Builtin::Select(cond)) => {
             let (cond_outputs, escape) = eval_owned_multi_keep_partial::<S>(cond, value);
-            resolve_cond_fork(cond_outputs, escape, |truthy| {
+            resolve_cond_fork(cond_outputs, escape, |truthy, out| {
                 if truthy {
                     // `select` filters; it never navigates. The value handed
                     // back is the caller's own, so its trackability is too.
-                    Ok(vec![PathBranch::new(
-                        Vec::new(),
-                        Cow::Borrowed(value),
-                        trackable,
-                    )])
-                } else {
-                    Ok(Vec::new())
+                    out.push(PathBranch::new(Vec::new(), Cow::Borrowed(value), trackable));
                 }
+                None
             })
         }
         Expr::Builtin(
@@ -13466,9 +13461,18 @@ fn resolve_node<'a, S: EvalSemantics>(
             else_branch,
         } => {
             let (cond_outputs, escape) = eval_owned_multi_keep_partial::<S>(cond, value);
-            resolve_cond_fork(cond_outputs, escape, |truthy| {
+            resolve_cond_fork(cond_outputs, escape, |truthy, out| {
                 let branch = if truthy { then_branch } else { else_branch };
-                resolve_node::<S>(branch, value, trackable)
+                match resolve_node::<S>(branch, value, trackable) {
+                    Ok(branches) => {
+                        out.extend(branches);
+                        None
+                    }
+                    Err((prefix, e)) => {
+                        out.extend(prefix);
+                        Some(e)
+                    }
+                }
             })
         }
 
@@ -14262,35 +14266,39 @@ fn eval_recurse_cond<S: EvalSemantics>(
 /// position (#1023): both arms already evaluate `cond` via
 /// `eval_owned_multi_keep_partial` themselves (the one line the two of them
 /// share verbatim isn't worth extracting on its own), then hand-rolled the
-/// identical "iterate outputs, dispatch per truthiness, collect branches,
-/// propagate a branch's own error immediately, fall through to the
-/// `cond`-level escape only once the loop drains naturally" loop
-/// independently. `dispatch` receives each output's truthiness and returns
-/// this same [`PathResolveResult`] shape resolve_node itself uses, so
-/// `Select` (which never fails building its own branch) and `If` (which
-/// recurses into `resolve_node` and so genuinely can) both fit without a
-/// bool-parameter thicket.
+/// identical "iterate outputs, dispatch per truthiness into the same
+/// collected-branches buffer, propagate a branch's own error immediately,
+/// fall through to the `cond`-level escape only once the loop drains
+/// naturally" loop independently. `dispatch` receives each output's
+/// truthiness plus the shared `out` buffer to push/extend directly (so
+/// `Select`'s zero-or-one-branch case never allocates a throwaway `Vec` of
+/// its own the way an earlier draft of this helper did) and returns just
+/// the escape, if any -- `Select` (which never fails building its own
+/// branch) and `If` (which recurses into `resolve_node` and so genuinely
+/// can) both fit without a bool-parameter thicket.
+///
+/// The value-position analogue of this same `Select`/`If` unification is
+/// [`eval_fanout`], shared by `eval_if`/`builtin_select` (and mirrored a
+/// third time in `eval_pipe_with_path_context_internal`'s own `Select`
+/// arm) -- if a future fix to the fork-on-cond policy needs applying here,
+/// check whether it also needs applying there.
 ///
 /// Not a retrofit of [`eval_recurse_cond`] just above: that primitive is a
-/// one-way *gate* (push only on truthy, no way to express an `else` side,
-/// no per-output return value) built for `recurse(f; cond)`'s two callers,
-/// which need exactly that and nothing more. `Select`/`If` need genuine
-/// two-way dispatch with a fallible per-branch result, which is a different
-/// enough shape that unifying all four call sites under one signature was
-/// tried and rejected during this issue's own design pass — see #1023.
+/// one-way *gate* (push only on truthy, no way to express an `else` side)
+/// built for `recurse(f; cond)`'s two callers, which need exactly that and
+/// nothing more. `Select`/`If` need genuine two-way dispatch with a
+/// fallible per-branch result, which is a different enough shape that
+/// unifying all four call sites under one signature was tried and
+/// rejected during this issue's own design pass — see #1023.
 fn resolve_cond_fork<'a>(
     cond_outputs: Vec<OwnedValue>,
     cond_escape: Option<EvalEscape>,
-    mut dispatch: impl FnMut(bool) -> PathResolveResult<'a>,
+    dispatch: impl Fn(bool, &mut Vec<PathBranch<'a>>) -> Option<EvalEscape>,
 ) -> PathResolveResult<'a> {
     let mut out = Vec::new();
     for c in cond_outputs {
-        match dispatch(c.is_truthy()) {
-            Ok(branches) => out.extend(branches),
-            Err((prefix, e)) => {
-                out.extend(prefix);
-                return Err((out, e));
-            }
+        if let Some(e) = dispatch(c.is_truthy(), &mut out) {
+            return Err((out, e));
         }
     }
     path_result(out, cond_escape)

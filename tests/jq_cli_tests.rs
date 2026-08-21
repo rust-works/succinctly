@@ -12125,6 +12125,33 @@ fn test_resolve_node_select_keeps_cond_partial_fanout_before_error_1023() -> Res
     Ok(())
 }
 
+/// #1023: `Select`/`If` now share `resolve_cond_fork`'s implementation --
+/// CLAUDE.md's own "duplicated predicates diverge silently" rule asks for
+/// "one definition, plus a test that the call sites agree", not just that
+/// each independently matches jq in isolation (code review). `select(cond)`
+/// and `if cond then . else empty end` are the same operation expressed
+/// two ways, so running the identical partial-fanout-then-error cond
+/// through both and asserting they produce byte-identical output directly
+/// demonstrates the two arms can no longer silently diverge, since they
+/// now run through the same fork loop underneath.
+#[test]
+fn test_select_and_if_cond_fork_agree_with_each_other_1023() -> Result<()> {
+    let (select_stdout, select_stderr, select_code) =
+        run_jq_full(&["-c", r#"path(select(true, error("x")))"#], Some("null"))?;
+    let (if_stdout, if_stderr, if_code) = run_jq_full(
+        &["-c", r#"path(if (true, error("x")) then . else empty end)"#],
+        Some("null"),
+    )?;
+    assert_eq!(
+        select_code, if_code,
+        "select: {select_stderr:?} if: {if_stderr:?}"
+    );
+    assert_eq!(select_stdout, if_stdout);
+    assert!(select_stderr.contains('x'), "stderr: {select_stderr:?}");
+    assert!(if_stderr.contains('x'), "stderr: {if_stderr:?}");
+    Ok(())
+}
+
 // ============================================================================
 // #980: a `Comma`-fanned `//` left operand mixing a falsy/non-path sibling
 // with a path-shaped or truthy one used to raise a spurious error --
