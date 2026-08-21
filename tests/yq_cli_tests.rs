@@ -15076,20 +15076,118 @@ fn test_yq_scalar_target_noop_discards_rhs_1233() -> Result<()> {
     Ok(())
 }
 
-/// #1233 (deliberate non-goal, matching the issue's own plan): a scalar
-/// reached *before* the last path component (`.a.b.c` where `.a` is
-/// already the scalar) is #1232's own territory, not this fix's --
-/// `yq_assign_is_total_noop` only walks a resolved path's own prefix
-/// against the *original* root, so a path whose write-time no-op depth
-/// #1232 hasn't widened yet simply doesn't qualify here either, and this
-/// fix doesn't change that. Live-verified this still (unrelated to #1233)
-/// errors in real yq too, for the wrong reason (yq's error message differs
-/// from succinctly's) -- both are "still broken pending #1232", not a
-/// regression.
+/// #1232: a scalar reached *before* the last path component (`.a.b.c`
+/// where `.a` is already the scalar) now no-ops the same as the
+/// already-fixed terminal case, including discarding the RHS entirely
+/// (`error("boom")` never runs) -- the #1233-era version of this test
+/// pinned the opposite as a "deliberate non-goal, #1232's own territory",
+/// live-verified against yq v4.53.3 which no-ops cleanly here too (that
+/// earlier verification, claiming real yq also errored "for the wrong
+/// reason", does not reproduce against the pinned binary and was mistaken).
+/// Root cause was two separate walkers: `get_path_mut` (`=`'s own
+/// parent-navigation walker) had no yq-mode scalar-noop check on its
+/// `Field`/`Index` arms at all, and `yq_assign_is_total_noop` (#1233's
+/// eager-RHS-discard pre-check) only recognized a scalar hit at the
+/// *parent-of-terminal* position via `navigate_read_only`, which collapsed
+/// "hit a scalar mid-prefix" and "hit a missing key/out-of-range index"
+/// into the same `None` -- widened to a three-way `PrefixNavOutcome` so the
+/// pre-check can tell them apart.
 #[test]
-fn test_yq_scalar_target_noop_pre_last_component_is_1232_territory_1233() -> Result<()> {
+fn test_yq_scalar_target_noop_pre_last_component_1232() -> Result<()> {
+    for op in ["=", "+=", "-=", "*=", "//="] {
+        let (out, err, code) = run_yq_stdin_with_stderr(
+            &format!(".a.b.c {op} error(\"boom\")"),
+            "a: 5\n",
+            &["-o", "json", "-I0"],
+        )?;
+        assert_eq!(code, 0, "op={op} err={err}");
+        assert_eq!(out.trim(), r#"{"a":5}"#, "op={op}");
+    }
+
+    // `|=` was already lazy (`update_path` never reaches the filter for a
+    // path that no-ops before it), pinned as a regression guard alongside
+    // the eagerly-evaluating operators above.
+    let (out, err, code) = run_yq_stdin_with_stderr(
+        ".a.b.c |= error(\"boom\")",
+        "a: 5\n",
+        &["-o", "json", "-I0"],
+    )?;
+    assert_eq!(code, 0, "err={err}");
+    assert_eq!(out.trim(), r#"{"a":5}"#);
+
+    // The write itself (not just RHS-discard) no-ops too, with a
+    // non-erroring RHS.
+    let (out, err, code) =
+        run_yq_stdin_with_stderr(".a.b.c = 99", "a: 5\n", &["-o", "json", "-I0"])?;
+    assert_eq!(code, 0, "err={err}");
+    assert_eq!(out.trim(), r#"{"a":5}"#);
+
+    // jq mode is unaffected -- no such no-op rule exists there.
+    let (_out, err, code) = run_jq_stdin_with_stderr(".a.b.c = error(\"boom\")", "5", &["-c"])?;
+    assert_ne!(code, 0);
+    assert!(err.contains("boom"), "err={err}");
+
+    Ok(())
+}
+
+/// #1232: the fully-dynamic repro from the issue's own text -- a computed
+/// key chain (`.[$k1][$k2]`) that never touches a literal `Field`/`Index`
+/// node at all, falsifying "the no-op only needs to special-case a literal
+/// path component". `resolve_dynamic_indexes` folds `$k1`/`$k2` into
+/// concrete `Expr::IndexNumber` components before `get_path_mut` ever runs,
+/// so the *write* itself exercises the exact same fixed arms as the
+/// literal-path tests above.
+///
+/// RHS is a plain value here, not `error(...)` like the sibling tests --
+/// `yq_assign_noop_check` bails out to `NotChecked` for any path
+/// `needs_path_prepass` classifies as dynamic (computed keys), before ever
+/// calling `yq_assign_is_total_noop`, so the eager-RHS-discard optimization
+/// this fix's other tests pin doesn't reach a computed-key path at all,
+/// live-verified as *already* true for the terminal case #1233 covers
+/// (`0 as $k | .[$k] = error("boom")` on a scalar root still raises `boom`
+/// in succinctly where real yq no-ops silently) -- a real, separate gap,
+/// not something #1232 introduces or is scoped to fix. Filed as its own
+/// follow-up rather than folded in here.
+#[test]
+fn test_yq_scalar_target_noop_pre_last_component_dynamic_index_1232() -> Result<()> {
+    let (out, err, code) = run_yq_stdin_with_stderr(
+        "0 as $k1 | 1 as $k2 | .[$k1][$k2] = 99",
+        "5\n",
+        &["-o", "json"],
+    )?;
+    assert_eq!(code, 0, "err={err}");
+    assert_eq!(out.trim(), "5");
+    Ok(())
+}
+
+/// #1232: a mid-chain `Iterate` scalar hit (`.a[].b`, not just
+/// `Field`/`Index`) no-ops too -- covers `update_path`'s own separately-
+/// maintained `Pipe`-arm `Expr::Iterate` sub-arm, which had the identical
+/// gap as its `Field`/`Index` siblings (missing the yq-mode no-op check
+/// the *terminal* `Iterate` arm already had from #1181).
+#[test]
+fn test_yq_scalar_target_noop_pre_last_component_iterate_1232() -> Result<()> {
+    let (out, err, code) = run_yq_stdin_with_stderr(
+        ".a[].b |= error(\"boom\")",
+        "a: 5\n",
+        &["-o", "json", "-I0"],
+    )?;
+    assert_eq!(code, 0, "err={err}");
+    assert_eq!(out.trim(), r#"{"a":5}"#);
+    Ok(())
+}
+
+/// #1232: a missing key mid-prefix on a *real* container (not a scalar) is
+/// not this fix's no-op case -- `navigate_read_only`'s `PrefixNavOutcome::
+/// Absent` arm, distinct from the new `HitScalar` arm this fix adds.
+/// `.a` exists as `{}`, so `.a.b` isn't indexing into a scalar; the real
+/// write would autovivify `.b` (and then `.c`) same as jq, so the RHS must
+/// still evaluate and propagate its error, live-verified against yq
+/// v4.53.3.
+#[test]
+fn test_yq_missing_key_mid_prefix_on_real_container_is_not_a_noop_1232() -> Result<()> {
     let (_out, err, code) =
-        run_yq_stdin_with_stderr(".a.b.c = error(\"boom\")", "a: 5\n", &["-o", "json"])?;
+        run_yq_stdin_with_stderr(".a.b.c = error(\"boom\")", "a: {}\n", &["-o", "json"])?;
     assert_ne!(code, 0);
     assert!(err.contains("boom"), "err={err}");
     Ok(())
