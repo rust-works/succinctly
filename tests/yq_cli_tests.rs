@@ -2554,6 +2554,54 @@ fn test_yaml_anchor_alias_without_merge() -> Result<()> {
     Ok(())
 }
 
+/// #1191: `as_str()`'s `Alias` arm only unwrapped a single level of alias
+/// indirection, unlike its `type_name()`/`as_object()`/`as_array()`/
+/// `number_literal()` siblings, which all correctly recurse through a chain
+/// of any length. A string slice (`.[S:E]`) is one of the few call sites
+/// that goes through `as_str()` directly (`slice_one_generic`,
+/// `src/jq/eval_generic.rs`), so it's an observable way to exercise the bug:
+/// before this fix, `.z[0:2]` on a value reached through two alias hops
+/// silently gave `[]` (the "not a string, not an array either" empty-slice
+/// fallback) instead of slicing the resolved string, even though `.z | type`
+/// already correctly reported `"string"` for the exact same node -- the
+/// contradiction the issue itself calls out.
+#[test]
+fn test_yaml_chained_alias_as_str_slices_correctly_1191() -> Result<()> {
+    let input = "x: &a hello\ny: &b *a\nz: *b\n";
+    let (output, exit_code) = run_yq_stdin(".z[0:2]", input, &["-o=json"])?;
+    assert_eq!(exit_code, 0, "out: {output:?}");
+    assert_eq!(output.trim(), r#""he""#);
+    Ok(())
+}
+
+/// #1191: a single-hop alias (the case that already worked) must keep
+/// working identically after generalizing the `Alias` arm to recurse.
+#[test]
+fn test_yaml_single_hop_alias_as_str_slices_correctly_1191() -> Result<()> {
+    let input = "x: &a hello\ny: *a\n";
+    let (output, exit_code) = run_yq_stdin(".y[0:2]", input, &["-o=json"])?;
+    assert_eq!(exit_code, 0, "out: {output:?}");
+    assert_eq!(output.trim(), r#""he""#);
+    Ok(())
+}
+
+/// #1191: `type_name()` and `as_str()` must agree on a triply-chained alias
+/// -- the exact contradiction the issue reports (told it's a `"string"` by
+/// `type_name()`, but unable to read it as one via `as_str()`) must not
+/// reappear for a longer chain than the doubly-aliased case above.
+#[test]
+fn test_yaml_triple_hop_alias_as_str_slices_correctly_1191() -> Result<()> {
+    let input = "x: &a hello\ny: &b *a\nw: &c *b\nz: *c\n";
+    let (type_output, code) = run_yq_stdin(".z | type", input, &[])?;
+    assert_eq!(code, 0, "out: {type_output:?}");
+    assert_eq!(type_output.trim(), "string");
+
+    let (slice_output, code) = run_yq_stdin(".z[0:2]", input, &["-o=json"])?;
+    assert_eq!(code, 0, "out: {slice_output:?}");
+    assert_eq!(slice_output.trim(), r#""he""#);
+    Ok(())
+}
+
 // =============================================================================
 // Assignment through an anchor propagates to aliases (#711) - real yq treats
 // an anchor/alias pair as one shared node in the representation graph, so a

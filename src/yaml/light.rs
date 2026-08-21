@@ -6069,16 +6069,18 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentValue for YamlValue<'a, W> {
     fn as_str(&self) -> Option<Cow<'_, str>> {
         match self {
             YamlValue::String(s) => s.as_str().ok(),
+            // Recurse via `t.value().as_str()`, not a direct match against
+            // `YamlValue::String` -- an alias pointing at another alias
+            // (`y: &b *a` chained through `z: *b`) previously stopped after
+            // one hop and returned `None` even though `type_name()`/
+            // `as_object()`/`as_array()`/`number_literal()` all correctly
+            // resolve the same chain by recursing the same way this arm now
+            // does (#1191). `t.value()` is a temporary, so (as
+            // `number_literal`'s identical alias arm above also needs) any
+            // borrowed `Cow` it hands back must be made owned before the
+            // closure returns.
             YamlValue::Alias { target, .. } => {
-                // For aliases, we need to return an owned string since the
-                // target value is created temporarily
-                target.and_then(|t| {
-                    if let YamlValue::String(s) = t.value() {
-                        s.as_str().ok().map(|cow| Cow::Owned(cow.into_owned()))
-                    } else {
-                        None
-                    }
-                })
+                target.and_then(|t| t.value().as_str().map(|cow| Cow::Owned(cow.into_owned())))
             }
             _ => None,
         }
