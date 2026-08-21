@@ -7022,6 +7022,73 @@ fn test_trailing_content_after_flow_collection_reports_real_utf8_char_1187() -> 
     Ok(())
 }
 
+/// The other 7 `err_unexpected_char` call sites, none previously exercised
+/// by any test in this file -- each needs a real repro reaching that exact
+/// branch, not just an obviously-malformed document (this parser is
+/// forgiving in ways that make many "obviously wrong" inputs still parse).
+/// The 8th (`reject_trailing_flow_content`) is covered above; a 9th
+/// (`parse_block_scalar_header`'s catch-all) is unreachable via any input
+/// at all -- see that function's own comment for why.
+#[test]
+fn test_err_unexpected_char_remaining_call_sites_1187() -> Result<()> {
+    // `parse_compact_mapping_entry`: an alias-as-key inside a sequence item
+    // (`- *a : v`) doesn't skip the space before the colon the way a
+    // quoted/unquoted key does, so `looks_like_mapping_entry`'s more
+    // tolerant lookahead (which greenlit this as an entry) and the actual
+    // colon check disagree.
+    let (_, stderr, code) =
+        run_yq_stdin_with_stderr(".", "- &a 1\n- *a : 2\n", &["-o", "json", "-I0"])?;
+    assert_ne!(code, 0);
+    assert!(
+        stderr.contains("expected ':' after key in compact mapping"),
+        "stderr: {stderr}"
+    );
+
+    // `parse_mapping_entry`: same shape, block-mapping alias key, but with a
+    // comma instead of a space -- the alias-name scanner's terminator set
+    // stops at flow indicators (including `,`), while the lookahead that
+    // approved this as a mapping entry doesn't.
+    let (_, stderr, code) =
+        run_yq_stdin_with_stderr(".", "x: &a 1\n*a,b: 2\n", &["-o", "json", "-I0"])?;
+    assert_ne!(code, 0);
+    assert!(
+        stderr.contains("expected ':' after key"),
+        "stderr: {stderr}"
+    );
+
+    // `parse_implicit_flow_mapping_entry`: a `!tag` prefix on a bare
+    // `key: value` pair inside `[...]` -- the real tag scanner swallows the
+    // first `:` as part of the tag suffix, so the *second* `:` this
+    // function expects is missing.
+    let (_, stderr, code) = run_yq_stdin_with_stderr(".", "x: [!a: 1]\n", &["-o", "json", "-I0"])?;
+    assert_ne!(code, 0);
+    assert!(
+        stderr.contains("expected ':' in implicit flow mapping entry"),
+        "stderr: {stderr}"
+    );
+
+    // `parse_flow_mapping_inner`: a bare `]` as a flow-mapping value (valid
+    // flow-value syntax stops there, leaving `]` where `,`/`}` was
+    // expected).
+    let (_, stderr, code) = run_yq_stdin_with_stderr(".", "x: {a: ]}\n", &["-o", "json", "-I0"])?;
+    assert_ne!(code, 0);
+    assert!(
+        stderr.contains("expected ',' or '}' in flow mapping"),
+        "stderr: {stderr}"
+    );
+
+    // `parse_flow_mapping_inner` (the sibling arm): a bare `]` right after a
+    // flow-mapping key -- `]` is a valid key terminator even inside `{}`.
+    let (_, stderr, code) = run_yq_stdin_with_stderr(".", "x: {a]}\n", &["-o", "json", "-I0"])?;
+    assert_ne!(code, 0);
+    assert!(
+        stderr.contains("expected ':', ',' or '}' after key in flow mapping"),
+        "stderr: {stderr}"
+    );
+
+    Ok(())
+}
+
 /// #1186: a *tab* before a trailing comment after a flow collection's
 /// closing delimiter must be accepted exactly like the space case above,
 /// not misread as leading indentation on a re-entered "next line" that's

@@ -4692,6 +4692,17 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         let style = match self.peek() {
             Some(b'|') => BlockStyle::Literal,
             Some(b'>') => BlockStyle::Folded,
+            // Defensive and carries no coverage: this function is only ever
+            // reached via `parse_block_scalar`, and all three call sites of
+            // *that* (lines ~1313, ~3278, ~3935) already gate on
+            // `matches!(self.peek(), Some(b'|' | b'>'))` immediately before
+            // calling, with nothing in between that advances `self.pos` --
+            // `set_ib()`/`write_bp_open()` touch only the interest-bit/BP
+            // bitvectors. Kept as a backstop for any future caller that
+            // dispatches here without that guarantee (same reasoning as the
+            // two defensive arms in the main dispatch loop, see
+            // `parse_documents`'s own `Some(b'#')`/`Some(b'\n' | b'\r')`
+            // comment).
             _ => {
                 return Err(
                     self.err_unexpected_char(self.pos, "expected block scalar indicator (| or >)")
