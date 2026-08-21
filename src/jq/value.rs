@@ -1206,6 +1206,37 @@ impl OwnedValue {
         Self::from_number_literal_boxed(literal.into())
     }
 
+    /// Like [`from_number_literal`](Self::from_number_literal), but parses
+    /// straight to a plain `Int`/`Float` (or [`Null`](Self::Null) on parse
+    /// failure, same fallback) without ever wrapping `literal` in
+    /// [`NumberLiteral`](Self::NumberLiteral) first.
+    ///
+    /// `pub`, not `pub(crate)`: #999's own motivation for this function is
+    /// a caller (yq's own `--input-format json` path, #978) that lives in
+    /// the CLI binary crate, which only sees this library's `pub` surface.
+    /// `from_number_literal(literal).into_plain_number()` would still pay
+    /// for and immediately discard the `Box<str>` allocation
+    /// `from_number_literal` always makes -- exactly the cost a caller that
+    /// never wants the source spelling in the first place shouldn't have
+    /// to pay, and the reason this exists as its own function rather than
+    /// that two-call sequence.
+    pub fn from_number_literal_plain(literal: &str) -> Self {
+        Self::plain_number_from_repr(parse_i64_or_f64(literal))
+    }
+
+    /// The shared "parsed repr -> plain scalar" mapping
+    /// [`from_number_literal_plain`](Self::from_number_literal_plain) and
+    /// [`from_number_bytes`](Self::from_number_bytes)'s own final fallback
+    /// both need -- previously duplicated verbatim at each site (#999
+    /// review).
+    fn plain_number_from_repr(repr: Option<NumberRepr>) -> Self {
+        match repr {
+            Some(NumberRepr::Int(i)) => Self::Int(i),
+            Some(NumberRepr::Float(f)) => Self::Float(f),
+            None => Self::Null,
+        }
+    }
+
     /// Like [`from_number_literal`](Self::from_number_literal), but takes an
     /// already-owned `Box<str>` (e.g. from `JqValue::NumberLiteral`) instead
     /// of allocating a fresh one.
@@ -1318,11 +1349,7 @@ impl OwnedValue {
         let Ok(s) = core::str::from_utf8(bytes) else {
             return Self::Null;
         };
-        match parse_i64_or_f64(s) {
-            Some(NumberRepr::Int(i)) => Self::Int(i),
-            Some(NumberRepr::Float(f)) => Self::Float(f),
-            None => Self::Null,
-        }
+        Self::plain_number_from_repr(parse_i64_or_f64(s))
     }
 
     /// Collapse a [`NumberLiteral`](Self::NumberLiteral) into a plain
