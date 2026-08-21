@@ -8336,7 +8336,8 @@ fn dv_captures_at<'h>(
 /// finding it needs backtracking semantics (oniguruma's
 /// `ONIG_OPTION_FIND_NOT_EMPTY`) that Rust's non-backtracking `regex` crate
 /// has no equivalent for — the same category of gap as `l`'s missing
-/// `MatchKind::LeftmostLongest` (#920). Tracked as #922.
+/// `MatchKind::LeftmostLongest` (#920). Tracked as #922. Both gaps are
+/// accepted as permanent, documented limitations — see ADR-0019.
 #[cfg(feature = "regex")]
 struct JqRegex {
     re: regex::Regex,
@@ -8400,10 +8401,11 @@ fn build_regex(pattern: &str, flags: Option<&str>) -> Result<JqRegex, EvalError>
                 'p' => dot_matches_newline = true,
                 'g' => {}                     // global - handled at call site
                 'n' => suppress_empty = true, // suppress empty matches (#730)
-                // Recognized by real jq but not yet implemented here (#730):
+                // Recognized by real jq but not implemented here (#730):
                 // `l` (POSIX leftmost-longest) is accepted as a valid flag
                 // character, silently without effect, rather than raising
-                // the error below — see #920 for why this one stays open.
+                // the error below — see #920 and ADR-0019 for why this one
+                // stays open permanently.
                 'l' => {}
                 _ => {
                     // Real jq's own wording, and its own choice: the message
@@ -37570,8 +37572,9 @@ mod tests {
 
         // `n` (suppress empty matches, implemented below in
         // test_regex_n_flag_suppresses_empty_matches_730), `l` (POSIX
-        // leftmost-longest, not yet implemented — #920) and `p` are all
-        // real jq flag characters — they must not be rejected as unknown.
+        // leftmost-longest, permanently unimplemented — #920, ADR-0019)
+        // and `p` are all real jq flag characters — they must not be
+        // rejected as unknown.
         for flags in ["n", "l", "p"] {
             query!(br#""abc""#, &format!(r#"test("abc"; "{flags}")"#),
                 QueryResult::Owned(OwnedValue::Bool(b)) => {
@@ -37684,6 +37687,7 @@ mod tests {
         // alternation can require. Rust's non-backtracking `regex` crate
         // has no equivalent to oniguruma's `ONIG_OPTION_FIND_NOT_EMPTY`
         // (same root cause as #920's missing `MatchKind::LeftmostLongest`).
+        // Accepted as a permanent, documented limitation — see ADR-0019.
         //
         // This pins the *current, known-divergent* behavior rather than
         // jq's — verified live against jq 1.7.1, which returns `true`/a
