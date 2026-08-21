@@ -13393,14 +13393,19 @@ fn resolve_node<'a, S: EvalSemantics>(
         // raising `x`.
         Expr::Builtin(Builtin::Select(cond)) => {
             let (cond_outputs, escape) = eval_owned_multi_keep_partial::<S>(cond, value);
-            let branches: Vec<PathBranch<'a>> = cond_outputs
-                .into_iter()
-                .filter(OwnedValue::is_truthy)
-                // `select` filters; it never navigates. The value handed
-                // back is the caller's own, so its trackability is too.
-                .map(|_| PathBranch::new(Vec::new(), Cow::Borrowed(value), trackable))
-                .collect();
-            path_result(branches, escape)
+            resolve_cond_fork(cond_outputs, escape, |truthy| {
+                if truthy {
+                    // `select` filters; it never navigates. The value handed
+                    // back is the caller's own, so its trackability is too.
+                    Ok(vec![PathBranch::new(
+                        Vec::new(),
+                        Cow::Borrowed(value),
+                        trackable,
+                    )])
+                } else {
+                    Ok(Vec::new())
+                }
+            })
         }
         Expr::Builtin(
             builtin @ (Builtin::Values
@@ -13461,22 +13466,10 @@ fn resolve_node<'a, S: EvalSemantics>(
             else_branch,
         } => {
             let (cond_outputs, escape) = eval_owned_multi_keep_partial::<S>(cond, value);
-            let mut out = Vec::new();
-            for c in cond_outputs {
-                let branch = if c.is_truthy() {
-                    then_branch
-                } else {
-                    else_branch
-                };
-                match resolve_node::<S>(branch, value, trackable) {
-                    Ok(branches) => out.extend(branches),
-                    Err((prefix, e)) => {
-                        out.extend(prefix);
-                        return Err((out, e));
-                    }
-                }
-            }
-            path_result(out, escape)
+            resolve_cond_fork(cond_outputs, escape, |truthy| {
+                let branch = if truthy { then_branch } else { else_branch };
+                resolve_node::<S>(branch, value, trackable)
+            })
         }
 
         // `a // b`: resolve `a`, keep only its truthy branches — jq's `//`
@@ -13505,14 +13498,18 @@ fn resolve_node<'a, S: EvalSemantics>(
         // own outcome swallowed a `halt`/`break` the retry surfaced instead
         // of letting it escape, same review round).
         //
-        // Every other shape — a `Comma`-fanned `a` mixing a falsy/non-path
-        // sibling with a path-shaped or truthy one, any non-literal filter
-        // that merely *evaluates* to something falsy, ... — is not handled:
-        // this resolver's `Comma`/`If`/`Select` arms already commit to the
-        // first sibling's own failure eagerly, before `//`'s truthy filter
-        // ever gets a chance to see it, the same "resolve everything up
-        // front, not lazily per output" gap #820 tracks more generally;
-        // filed as #980 rather than solved here.
+        // A `Comma`-fanned `a` mixing a falsy/non-path sibling with a
+        // path-shaped or truthy one used to be the one shape this arm
+        // didn't handle (filed as #980): `Comma` used to commit to a
+        // sibling's own failure eagerly, before `//`'s truthy filter ever
+        // got a chance to see it. #1288's "`Expr::Comma` stops checking a
+        // position too early" fixed this incidentally, not this arm
+        // itself; confirmed live against jq 1.7.1, all eight shapes #980
+        // pinned (`path((.a, false) // .b)`, `path((false, .a) // .b)`,
+        // `path((.a, null) // .b)`, `path((null, false) // .b)`,
+        // `path((.x, .a) // .b)`, `path((false, false) // .b)`,
+        // `path((.a, false, .a) // .b)`, and the genuinely-still-erroring
+        // `path((.a, 1) // .b)`) now match.
         Expr::Alternative(left, right) => {
             if let Expr::Literal(lit) = unwrap_paren(left) {
                 if !literal_to_owned(lit).is_truthy() {
@@ -14259,6 +14256,44 @@ fn eval_recurse_cond<S: EvalSemantics>(
         }
     }
     cond_err
+}
+
+/// Shared `Select`/`If` "fork on cond, dispatch per output" step in path
+/// position (#1023): both arms already evaluate `cond` via
+/// `eval_owned_multi_keep_partial` themselves (the one line the two of them
+/// share verbatim isn't worth extracting on its own), then hand-rolled the
+/// identical "iterate outputs, dispatch per truthiness, collect branches,
+/// propagate a branch's own error immediately, fall through to the
+/// `cond`-level escape only once the loop drains naturally" loop
+/// independently. `dispatch` receives each output's truthiness and returns
+/// this same [`PathResolveResult`] shape resolve_node itself uses, so
+/// `Select` (which never fails building its own branch) and `If` (which
+/// recurses into `resolve_node` and so genuinely can) both fit without a
+/// bool-parameter thicket.
+///
+/// Not a retrofit of [`eval_recurse_cond`] just above: that primitive is a
+/// one-way *gate* (push only on truthy, no way to express an `else` side,
+/// no per-output return value) built for `recurse(f; cond)`'s two callers,
+/// which need exactly that and nothing more. `Select`/`If` need genuine
+/// two-way dispatch with a fallible per-branch result, which is a different
+/// enough shape that unifying all four call sites under one signature was
+/// tried and rejected during this issue's own design pass — see #1023.
+fn resolve_cond_fork<'a>(
+    cond_outputs: Vec<OwnedValue>,
+    cond_escape: Option<EvalEscape>,
+    mut dispatch: impl FnMut(bool) -> PathResolveResult<'a>,
+) -> PathResolveResult<'a> {
+    let mut out = Vec::new();
+    for c in cond_outputs {
+        match dispatch(c.is_truthy()) {
+            Ok(branches) => out.extend(branches),
+            Err((prefix, e)) => {
+                out.extend(prefix);
+                return Err((out, e));
+            }
+        }
+    }
+    path_result(out, cond_escape)
 }
 
 /// Item cap shared by every `recurse`-family explicit-stack walker
