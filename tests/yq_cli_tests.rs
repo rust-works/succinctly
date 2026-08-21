@@ -6993,6 +6993,35 @@ fn test_trailing_content_after_flow_collection_errors_878() -> Result<()> {
     Ok(())
 }
 
+/// #1187: the offending byte in a trailing-flow-content error must be a real
+/// UTF-8 decode, not a Latin-1 `byte as char` cast -- a multi-byte character
+/// used to render as mojibake (the cast's lead byte reinterpreted as its own
+/// Latin-1 code point) instead of itself. `reject_trailing_flow_content` is
+/// `err_unexpected_char`'s one caller that doesn't pass `self.pos` (it finds
+/// the offending byte via its own local scan cursor instead); the other
+/// seven call sites all share the exact same helper body, so this one site
+/// is representative of all eight.
+#[test]
+fn test_trailing_content_after_flow_collection_reports_real_utf8_char_1187() -> Result<()> {
+    let (_, stderr, code) =
+        run_yq_stdin_with_stderr(".", "a: [1, 2] 日\n", &["-o", "json", "-I0"])?;
+    assert_ne!(code, 0);
+    assert!(
+        stderr.contains("unexpected character '日'"),
+        "stderr: {stderr}"
+    );
+
+    // ASCII must be unaffected -- same rendering as before this fix.
+    let (_, stderr, code) = run_yq_stdin_with_stderr(".", "a: [1, 2] x\n", &["-o", "json", "-I0"])?;
+    assert_ne!(code, 0);
+    assert!(
+        stderr.contains("unexpected character 'x'"),
+        "stderr: {stderr}"
+    );
+
+    Ok(())
+}
+
 /// #1186: a *tab* before a trailing comment after a flow collection's
 /// closing delimiter must be accepted exactly like the space case above,
 /// not misread as leading indentation on a re-entered "next line" that's

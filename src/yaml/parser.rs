@@ -35,6 +35,7 @@ use std::collections::BTreeMap;
 use super::error::YamlError;
 use super::line_break::{is_line_break, line_break_len};
 use super::simd;
+use crate::text;
 
 /// Node type in the YAML structure tree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1010,6 +1011,37 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             line_start -= 1;
         }
         self.pos - line_start
+    }
+
+    /// Build a `YamlError::UnexpectedCharacter` for the byte at `offset`
+    /// (#1187): every one of this file's 8 call sites built this variant by
+    /// hand, and 7 of the 8 used `self.peek().map_or('\0', |b| b as char)`
+    /// -- a Latin-1 cast, not a real UTF-8 decode, so a multi-byte character
+    /// at the offending position rendered as mojibake instead of itself.
+    /// Decodes via [`crate::text::utf8::decode_code_point`] instead,
+    /// against the byte slice starting at `offset` (not just the one byte
+    /// `self.peek()`/`self.input[offset]` would give, which isn't enough to
+    /// decode a multi-byte sequence). Falls back to `'\0'` on EOF or
+    /// invalid UTF-8 at `offset`, matching the old code's EOF fallback
+    /// exactly and treating a malformed sequence the same way.
+    ///
+    /// Takes `offset` explicitly rather than reading `self.pos`: the one
+    /// site with a genuinely different call shape
+    /// ([`Self::reject_trailing_flow_content`]) finds the offending byte
+    /// via a local scan cursor, before `self.pos` itself has advanced past
+    /// it.
+    fn err_unexpected_char(&self, offset: usize, context: &'static str) -> YamlError {
+        let char = self
+            .input
+            .get(offset..)
+            .and_then(text::utf8::decode_code_point)
+            .and_then(|(cp, _len)| char::from_u32(cp))
+            .unwrap_or('\0');
+        YamlError::UnexpectedCharacter {
+            offset,
+            char,
+            context,
+        }
     }
 
     /// Check if at end of meaningful content on this line.
@@ -2511,11 +2543,9 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
 
         // Expect colon
         if self.peek() != Some(b':') {
-            return Err(YamlError::UnexpectedCharacter {
-                offset: self.pos,
-                char: self.peek().map_or('\0', |b| b as char),
-                context: "expected ':' after key in compact mapping",
-            });
+            return Err(
+                self.err_unexpected_char(self.pos, "expected ':' after key in compact mapping")
+            );
         }
         self.advance(); // Skip ':'
 
@@ -2771,11 +2801,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
 
         // Expect colon
         if self.peek() != Some(b':') {
-            return Err(YamlError::UnexpectedCharacter {
-                offset: self.pos,
-                char: self.peek().map_or('\0', |b| b as char),
-                context: "expected ':' after key",
-            });
+            return Err(self.err_unexpected_char(self.pos, "expected ':' after key"));
         }
         self.advance(); // Skip ':'
 
@@ -3812,11 +3838,9 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
 
         // Expect and skip colon
         if self.peek() != Some(b':') {
-            return Err(YamlError::UnexpectedCharacter {
-                offset: self.pos,
-                char: self.peek().map_or('\0', |b| b as char),
-                context: "expected ':' in implicit flow mapping entry",
-            });
+            return Err(
+                self.err_unexpected_char(self.pos, "expected ':' in implicit flow mapping entry")
+            );
         }
         self.advance();
         self.skip_flow_whitespace();
@@ -3999,11 +4023,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             self.pos = i;
             return Ok(());
         }
-        Err(YamlError::UnexpectedCharacter {
-            offset: i,
-            char: self.input[i] as char,
-            context: "after a flow collection's closing delimiter",
-        })
+        Err(self.err_unexpected_char(i, "after a flow collection's closing delimiter"))
     }
 
     /// Parse a flow sequence: `[item1, item2, ...]`
@@ -4039,11 +4059,9 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             if !first {
                 // Expect comma
                 if self.peek() != Some(b',') {
-                    return Err(YamlError::UnexpectedCharacter {
-                        offset: self.pos,
-                        char: self.peek().map_or('\0', |b| b as char),
-                        context: "expected ',' or ']' in flow sequence",
-                    });
+                    return Err(
+                        self.err_unexpected_char(self.pos, "expected ',' or ']' in flow sequence")
+                    );
                 }
                 self.advance(); // Skip `,`
                 self.skip_flow_whitespace();
@@ -4143,11 +4161,9 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             if !first {
                 // Expect comma
                 if self.peek() != Some(b',') {
-                    return Err(YamlError::UnexpectedCharacter {
-                        offset: self.pos,
-                        char: self.peek().map_or('\0', |b| b as char),
-                        context: "expected ',' or '}' in flow mapping",
-                    });
+                    return Err(
+                        self.err_unexpected_char(self.pos, "expected ',' or '}' in flow mapping")
+                    );
                 }
                 self.advance(); // Skip `,`
                 self.skip_flow_whitespace();
@@ -4222,11 +4238,10 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 // Null has no text end
                 self.write_bp_close();
             } else {
-                return Err(YamlError::UnexpectedCharacter {
-                    offset: self.pos,
-                    char: self.peek().map_or('\0', |b| b as char),
-                    context: "expected ':', ',' or '}' after key in flow mapping",
-                });
+                return Err(self.err_unexpected_char(
+                    self.pos,
+                    "expected ':', ',' or '}' after key in flow mapping",
+                ));
             }
 
             self.skip_flow_whitespace();
@@ -4678,11 +4693,9 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             Some(b'|') => BlockStyle::Literal,
             Some(b'>') => BlockStyle::Folded,
             _ => {
-                return Err(YamlError::UnexpectedCharacter {
-                    offset: self.pos,
-                    char: self.peek().map_or('\0', |b| b as char),
-                    context: "expected block scalar indicator (| or >)",
-                });
+                return Err(
+                    self.err_unexpected_char(self.pos, "expected block scalar indicator (| or >)")
+                );
             }
         };
         self.advance(); // consume indicator
