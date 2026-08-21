@@ -21845,3 +21845,47 @@ fn test_undecodable_mapping_key_does_not_hide_later_fields_1247() -> Result<()> 
     assert_eq!(output.trim(), "2");
     Ok(())
 }
+
+/// #1247: a decode failure inside a YAML string must not leave a partially
+/// transcoded token behind in the JSON output.
+///
+/// The transcoders push the opening `"` -- and any prefix they already
+/// converted -- before they can discover a bad escape, and each caller's
+/// `Err(_)` arm then appended its own `null`/`""` fallback after it. The two
+/// concatenated into JSON that no parser could read, at exit 0:
+///
+/// ```text
+/// b: "x\qy"    ->  {"b": "xnull}      (value arm)
+/// "a\qb": 1    ->  {"a"": 1}          (key arm)
+/// ```
+///
+/// `\q` is not a YAML escape, so the scalar is structurally valid but
+/// undecodable. Real yq rejects the whole document (`found unknown escape
+/// character`, exit 1); making succinctly do the same is a later stage of
+/// #1247's design. This pins only that whatever is emitted is *parseable* --
+/// the value still degrades to `null` and the key to `""`.
+#[test]
+fn test_decode_failure_does_not_corrupt_json_output_1247() -> Result<()> {
+    for (input, expected) in [
+        ("b: \"x\\qy\"\n", r#"{"b":null}"#),
+        ("\"a\\qb\": 1\n", r#"{"":1}"#),
+    ] {
+        // One route per distinct transcode call site: the streaming sink, the
+        // DOM sink a flag forces (`--arg`, `-P`), and the multi-result path
+        // that loses its cursor to `GenericResult::Many`.
+        for extra in [
+            &["-o", "json", "-I", "0"][..],
+            &["-o", "json", "-I", "0", "--arg", "z", "y"][..],
+            &["-o", "json", "-I", "0", "-P"][..],
+        ] {
+            let (output, exit_code) = run_yq_stdin(".", input, extra)?;
+            assert_eq!(exit_code, 0, "args {extra:?}, output: {output:?}");
+            assert_eq!(output.trim(), expected, "args {extra:?}");
+        }
+
+        let (output, exit_code) = run_yq_stdin(".,.", input, &["-o", "json", "-I", "0"])?;
+        assert_eq!(exit_code, 0, "output: {output:?}");
+        assert_eq!(output.lines().collect::<Vec<_>>(), [expected, expected]);
+    }
+    Ok(())
+}

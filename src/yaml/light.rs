@@ -3281,7 +3281,30 @@ fn transcode_fold_line_break_to_json(bytes: &[u8], mut i: usize, output: &mut St
 ///
 /// Returns true if the string was written as a JSON string (quoted),
 /// false if it should be treated as a scalar for type detection.
+///
+/// **All-or-nothing on failure.** The transcoders push the opening `"` -- and
+/// whatever prefix they already converted -- into `output` before they can
+/// discover a bad escape, and every caller's `Err(_)` arm then appends its own
+/// `null`/`""` fallback after it. The two concatenated into JSON that no parser
+/// could read (`{"b": "xnull}` for a value, `{"a"": 1}` for a key, both at exit
+/// 0 -- #1247). Rewinding to the entry length here fixes every call site at
+/// once instead of asking each to remember; the value still degrades to the
+/// caller's fallback, it just no longer corrupts the document around it.
 fn write_yaml_string_to_json(
+    output: &mut String,
+    s: &YamlString<'_>,
+) -> Result<bool, YamlStringError> {
+    let mark = output.len();
+    let result = write_yaml_string_to_json_at(output, s);
+    if result.is_err() {
+        output.truncate(mark);
+    }
+    result
+}
+
+/// The body of [`write_yaml_string_to_json`], which owns the rollback. Never
+/// call this directly -- a partial write escaping it is the bug above.
+fn write_yaml_string_to_json_at(
     output: &mut String,
     s: &YamlString<'_>,
 ) -> Result<bool, YamlStringError> {
@@ -4013,7 +4036,14 @@ fn stream_yaml_string_to_json<Out: core::fmt::Write>(
                 let s = core::str::from_utf8(bytes).map_err(|_| YamlStringError::InvalidUtf8)?;
                 stream_json_string(out, s).map_err(|_| YamlStringError::InvalidUtf8)?;
             } else {
-                stream_transcode_double_quoted_to_json(out, bytes)?;
+                // `Out` cannot be rewound the way `write_yaml_string_to_json`'s
+                // `String` can, so transcode into a scratch buffer and commit
+                // only once it succeeds (#1247). Only this branch pays the
+                // allocation: the fast path above decodes before it writes.
+                let mut committed = String::new();
+                stream_transcode_double_quoted_to_json(&mut committed, bytes)?;
+                out.write_str(&committed)
+                    .map_err(|_| YamlStringError::InvalidUtf8)?;
             }
             Ok(true)
         }
@@ -4025,7 +4055,12 @@ fn stream_yaml_string_to_json<Out: core::fmt::Write>(
                 let s = core::str::from_utf8(bytes).map_err(|_| YamlStringError::InvalidUtf8)?;
                 stream_json_string(out, s).map_err(|_| YamlStringError::InvalidUtf8)?;
             } else {
-                stream_transcode_single_quoted_to_json(out, bytes)?;
+                // Same commit-on-success rollback as the double-quoted arm
+                // above (#1247).
+                let mut committed = String::new();
+                stream_transcode_single_quoted_to_json(&mut committed, bytes)?;
+                out.write_str(&committed)
+                    .map_err(|_| YamlStringError::InvalidUtf8)?;
             }
             Ok(true)
         }

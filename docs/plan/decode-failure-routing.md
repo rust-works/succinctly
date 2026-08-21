@@ -1,13 +1,14 @@
 # Decode-failure error routing for `to_owned`/`cursor_to_owned` (#1247, #1242, #1194)
 
-**Status: design only, not implemented.** This document is the deliverable for
+**Status: partially implemented — Stages 1 and 2 landed, 3–5 outstanding.** This
+document is the deliverable for
 [#1247](https://github.com/rust-works/succinctly/issues/1247), which was tiered Tier 3
 ("needs a design decision before implementation, not a same-pattern continuation of the
 just-merged partial fix") and whose own tier-review comment asked for one design doc
 covering #1247 and [#1194](https://github.com/rust-works/succinctly/issues/1194) together.
 [#1242](https://github.com/rust-works/succinctly/issues/1242) was traced to the same
-swallow points and is covered here too. No code has been changed to implement this; see
-"Follow-up issues" at the bottom.
+swallow points and is covered here too. See "Staged delivery" for what has landed and
+"Follow-up issues" for what still needs tracking.
 
 Every claim below was verified against `main` @ `cedee4cbb` with a `--release --features
 cli` build and the pinned oracles (`/usr/bin/jq` 1.7.1, Homebrew `yq` v4). Where this
@@ -301,10 +302,19 @@ sites with the same partial-write-then-fallback shape, in three pairs
 | buffered `&mut String` (A) | ~2114 / fallback ~2133 | ~2147 / fallback ~2149 |
 | buffered `&mut String` (B) | ~2716 / fallback ~2736 | ~2750 / fallback ~2752 |
 
-The four buffered sites are fixable with no truncation at all: record `output.len()`
-before the call and `output.truncate(mark)` before falling back or raising. The two
-streaming sites need the transcode to run into a scratch `String` that is only written
-through on success.
+**Refined during implementation.** The prescription above was "record `output.len()`
+before the call and truncate at each of the four buffered call sites". That is the wrong
+place: it asks four callers to remember a rule none of them can see the need for. The
+rollback belongs *inside* `write_yaml_string_to_json`, which is the function that makes
+the partial write — it takes `&mut String`, so it can mark its own entry length and
+`truncate` back to it on any error path, fixing all four call sites at once and leaving
+nothing for a fifth caller to get wrong. Implemented that way.
+
+The two streaming sites take `Out: fmt::Write`, which cannot be rewound, so those do need
+a scratch `String` committed on success. Only the *slow* branch pays for it: the fast path
+(no `\`, `\n` or `\r` in the scalar) decodes before it writes anything and cannot
+partially fail, so it stays allocation-free — which matters, because this is P9's direct
+YAML→JSON streaming path.
 
 **Honest limitation:** for the streaming path, bytes already flushed for *earlier* parts
 of the record cannot be retracted. jq and yq can reject cleanly because they DOM-parse the
@@ -371,12 +381,14 @@ Each stage lands as its own PR with its own oracle-verified sweep. Stages 1 and 
 plain bug fixes with no signature churn and go first: they are the highest severity and
 lowest risk, and neither depends on the fallibility change.
 
-**Stage 1 — sibling-hiding `find` loops (sites 1–4).** No API change, no perf implication.
-*Why first:* a valid value silently disappearing from a lookup is worse than a malformed
-one becoming `null`, and this is a prerequisite for Stage 3.
+**Stage 1 — sibling-hiding `find` loops (sites 1–4). ✅ landed.** No API change, no perf
+implication. *Why first:* a valid value silently disappearing from a lookup is worse than
+a malformed one becoming `null`, and this is a prerequisite for Stage 3.
 
-**Stage 2 — invalid JSON output (sites 5–10).** Truncate-then-fallback for the four
-buffered sinks; scratch-buffer for the two streaming ones. *Why second:* emitting
+**Stage 2 — invalid JSON output (sites 5–10). ✅ landed.** Rollback inside
+`write_yaml_string_to_json` for the four buffered sinks; commit-on-success scratch buffer
+for the two streaming ones. Semantics are unchanged — the value still degrades to `null`
+and the key to `""` — but the emitted document is parseable. *Why second:* emitting
 unparseable output is a correctness bug independent of the whole `to_owned` question, and
 fixing it first means Stage 3's new error paths have a clean sink to fail into.
 

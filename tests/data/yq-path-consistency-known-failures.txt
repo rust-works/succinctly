@@ -9,13 +9,14 @@
 # the build. See issue #222 for why the paths must agree; entries here are
 # divergences whose root cause is a *different*, separately-tracked bug.
 #
-# Categories
-# ----------
-#   invalid-escape  Double-quoted string with an escape yq rejects outright
-#                 (\., \'). The non-validating loader accepts it, and the
-#                 streaming transcoder — already mid-string when it hits the
-#                 bad escape — cannot roll back, so it emits malformed JSON
-#                 where the OwnedValue path emits a clean null. -> #223
-
-55WF      invalid-escape    invalid \-escape; streaming emits malformed JSON, DOM emits null — #223
-HRE5      invalid-escape    invalid \-escape; streaming emits malformed JSON, DOM emits null — #223
+# Currently empty — every corpus case agrees across both paths.
+#
+# The one category this file ever held, `invalid-escape` (cases 55WF and HRE5),
+# was retired by #1247: a double-quoted string with an escape yq rejects (\.,
+# \') used to leave the streaming transcoder mid-string with no way to roll
+# back, so it emitted malformed JSON where the OwnedValue path emitted a clean
+# null. The transcoders now roll back to their entry position on failure --
+# `write_yaml_string_to_json` rewinds its own `&mut String`, and the streaming
+# pair commit through a scratch buffer only on success -- so both paths emit
+# the same null and the category has no members left. See
+# docs/plan/decode-failure-routing.md.
