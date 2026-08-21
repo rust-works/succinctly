@@ -70,7 +70,7 @@ pub enum Expr {
     /// folds to this instead.
     ///
     /// `start`/`end` are exactly the `Option<i64>` pair [`Expr::Slice`]
-    /// would have carried (the same bound-folding `fold_int_literal`
+    /// would have carried (the same bound-folding `fold_slice_bound`
     /// applies to each), and every step that *navigates* — reading,
     /// `setpath`, `del` — uses them and behaves identically. Only the
     /// rendering of the path component differs, which is why nearly every
@@ -1330,6 +1330,16 @@ impl Expr {
             } => (start_key.as_ref(), end_key.as_ref()),
             _ => (None, None),
         }
+    }
+
+    /// Whether this is a slice path component, `Expr::Slice` or its
+    /// float-bound sibling `Expr::SliceNumber` (#1326) -- one definition for
+    /// the callers that only need "is this a slice", so a boolean-only check
+    /// doesn't hand-copy the two-variant or-pattern a match arm that also
+    /// needs `start`/`end` still has to spell out itself (CLAUDE.md:
+    /// "duplicated predicates diverge silently", #106).
+    pub(crate) fn is_slice(&self) -> bool {
+        matches!(self, Self::Slice { .. } | Self::SliceNumber { .. })
     }
 
     /// Create an identity expression.

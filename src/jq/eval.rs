@@ -10789,9 +10789,8 @@ fn is_yq_field_index_noop_scalar(target: &OwnedValue) -> bool {
 /// own, unlike assignment's still-scalar-scoped rule above.
 pub(crate) fn is_yq_scalar_slice_assign_path(path_expr: &Expr) -> bool {
     match path_expr {
-        Expr::Slice { .. } | Expr::SliceNumber { .. } => true,
         Expr::Optional(inner) | Expr::Paren(inner) => is_yq_scalar_slice_assign_path(inner),
-        _ => false,
+        other => other.is_slice(),
     }
 }
 
@@ -10922,10 +10921,7 @@ fn yq_del_slice_outcome(
 ) -> YqDelSliceOutcome {
     let mut steps = Vec::new();
     flatten_delete_path(path_expr, false, &mut steps);
-    if !steps
-        .iter()
-        .any(|s| matches!(s.component, Expr::Slice { .. } | Expr::SliceNumber { .. }))
-    {
+    if !steps.iter().any(|s| s.component.is_slice()) {
         return YqDelSliceOutcome::NotApplicable;
     }
     // #1219: real yq's rule strips a *maximal trailing run* of consecutive
@@ -10935,12 +10931,7 @@ fn yq_del_slice_outcome(
     // the same "drop what's before the run" target; a run of 3 behaves
     // identically to a run of 2). `cut` is the index where that run begins.
     let mut cut = steps.len();
-    while cut > 0
-        && matches!(
-            steps[cut - 1].component,
-            Expr::Slice { .. } | Expr::SliceNumber { .. }
-        )
-    {
+    while cut > 0 && steps[cut - 1].component.is_slice() {
         cut -= 1;
     }
     if cut == steps.len() {
@@ -10949,10 +10940,7 @@ fn yq_del_slice_outcome(
         return YqDelSliceOutcome::Noop;
     }
     let prefix = &steps[..cut];
-    if prefix
-        .iter()
-        .any(|s| matches!(s.component, Expr::Slice { .. } | Expr::SliceNumber { .. }))
-    {
+    if prefix.iter().any(|s| s.component.is_slice()) {
         // An interior slice separated from the trailing run by something
         // else (`del(.a[0:2][1][3:5])`) still no-ops the whole call, even
         // though the path's last component is itself a slice.
@@ -12108,10 +12096,8 @@ fn split_at_slice(exprs: &[Expr]) -> Option<SliceSplit> {
     // top-level element whose own unwrapped core is none of `Slice`/`Pipe`
     // reaches the flattened list (and this scan) completely unchanged.
     if exprs.iter().all(|e| {
-        !matches!(
-            unwrap_path_component(e).0,
-            Expr::Slice { .. } | Expr::SliceNumber { .. } | Expr::Pipe(_)
-        )
+        let component = unwrap_path_component(e).0;
+        !component.is_slice() && !matches!(component, Expr::Pipe(_))
     }) {
         return None;
     }
@@ -12119,12 +12105,9 @@ fn split_at_slice(exprs: &[Expr]) -> Option<SliceSplit> {
     for e in exprs {
         push_path_components(&mut flat, e);
     }
-    let at = flat.iter().position(|e| {
-        matches!(
-            unwrap_path_component(e).0,
-            Expr::Slice { .. } | Expr::SliceNumber { .. }
-        )
-    })?;
+    let at = flat
+        .iter()
+        .position(|e| unwrap_path_component(e).0.is_slice())?;
     let (optional, start, end) = match unwrap_path_component(&flat[at]) {
         (Expr::Slice { start, end } | Expr::SliceNumber { start, end, .. }, optional) => {
             (optional, *start, *end)
@@ -12905,17 +12888,26 @@ fn key_to_path_component(
 /// `NumberLiteral` to plain `Float` for exactly the same reason. A negative
 /// float arriving from *data* keeps its spelling in both.
 fn numeric_path_component(idx: i64, key: &OwnedValue) -> Expr {
-    match key {
-        OwnedValue::Float(f) => Expr::IndexNumber {
-            idx,
-            key: NumberKey::Float(*f),
-        },
-        OwnedValue::NumberLiteral(NumberRepr::Float(f), text) => Expr::IndexNumber {
-            idx,
-            key: NumberKey::Literal(*f, text.clone()),
-        },
-        // `Int` and `NumberLiteral(Int, _)`: nothing to preserve.
-        _ => Expr::Index(idx),
+    match number_key_for(key) {
+        Some(key) => Expr::IndexNumber { idx, key },
+        None => Expr::Index(idx),
+    }
+}
+
+/// The [`NumberKey`] a resolved numeric value should preserve in `path()`
+/// output, if it's float-spelled -- the one match both
+/// [`numeric_path_component`] and [`numeric_slice_bound_key`] build on,
+/// instead of each hand-copying it (CLAUDE.md: "duplicated predicates
+/// diverge silently", #106).
+fn number_key_for(v: &OwnedValue) -> Option<NumberKey> {
+    match v {
+        OwnedValue::Float(f) => Some(NumberKey::Float(*f)),
+        OwnedValue::NumberLiteral(NumberRepr::Float(f), text) => {
+            Some(NumberKey::Literal(*f, text.clone()))
+        }
+        // `Int`, `NumberLiteral(Int, _)`, `Null` (slice's open-bound case):
+        // nothing to preserve.
+        _ => None,
     }
 }
 
@@ -12931,15 +12923,7 @@ fn numeric_path_component(idx: i64, key: &OwnedValue) -> Expr {
 /// already-resolved `i64` (from [`owned_bound_to_i64`]) when constructing
 /// the path component.
 fn numeric_slice_bound_key(v: &OwnedValue) -> Option<NumberKey> {
-    match v {
-        OwnedValue::Float(f) => Some(NumberKey::Float(*f)),
-        OwnedValue::NumberLiteral(NumberRepr::Float(f), text) => {
-            Some(NumberKey::Literal(*f, text.clone()))
-        }
-        // `Int`, `NumberLiteral(Int, _)`, `Null` (the open-bound case): nothing
-        // to preserve.
-        _ => None,
-    }
+    number_key_for(v)
 }
 
 /// The `OwnedValue` a static array-index component is reported as in a path.
@@ -12964,10 +12948,11 @@ fn index_component_value(idx: i64, key: Option<&NumberKey>) -> OwnedValue {
 
 /// The `OwnedValue` a static slice component's `{"start":s,"end":e}` path
 /// descriptor is reported as, one bound at a time -- the slice-bound sibling
-/// of [`index_component_value`] (#1326), shared by the same three sites
-/// ([`walk_path`], [`navigation_element`], and
-/// `eval_pipe_with_path_context_internal`) once each threads a slice
-/// component through it.
+/// of [`index_component_value`] (#1326), shared by [`walk_path`] and
+/// [`navigation_element`]. `eval_pipe_with_path_context_internal` has no
+/// `Expr::Slice`/`Expr::SliceNumber` arm at all -- a slice there falls
+/// through to that function's generic, path-context-losing fallback, a
+/// pre-existing gap #1326 doesn't touch.
 ///
 /// Each bound converts independently via [`index_component_value`] itself
 /// (an absent/integer-spelled bound and a float-spelled one are exactly the
@@ -14933,7 +14918,12 @@ fn resolve_slice_expr<'a, S: EvalSemantics>(
         return Err((
             Vec::new(),
             EvalError::invalid_path_expression_near_access(
-                &slice::literal_component(starts[0].0, ends[0].0),
+                &slice_component_value(
+                    starts[0].0,
+                    starts[0].1.as_ref(),
+                    ends[0].0,
+                    ends[0].1.as_ref(),
+                ),
                 value,
             )
             .into(),
@@ -14974,7 +14964,12 @@ fn resolve_slice_expr<'a, S: EvalSemantics>(
         return Err((
             Vec::new(),
             EvalError::invalid_path_expression_near_access(
-                &slice::literal_component(starts[0].0, ends[0].0),
+                &slice_component_value(
+                    starts[0].0,
+                    starts[0].1.as_ref(),
+                    ends[0].0,
+                    ends[0].1.as_ref(),
+                ),
                 first_value,
             )
             .into(),
@@ -15064,7 +15059,7 @@ type ResolvedSliceBound = (Option<i64>, Option<NumberKey>);
 ///
 /// Pairs each resolved `i64` with [`numeric_slice_bound_key`]'s answer for
 /// the same value (#1326) -- a genuinely *dynamic* bound (`.[$a:$b]`,
-/// `.[(1+1):]`) needs exactly the same key-preservation [`fold_int_literal`]'s
+/// `.[(1+1):]`) needs exactly the same key-preservation `fold_slice_bound`'s
 /// static sibling already gives a literal one, and this is where that value
 /// is still on hand to check.
 fn resolve_slice_bound<S: EvalSemantics>(
@@ -40864,6 +40859,43 @@ mod tests {
                 assert_eq!(
                     e.message,
                     "Invalid path expression near attempt to access element {\"start\":1,... of [1,2,3]"
+                );
+            }
+        );
+    }
+
+    /// Code review of #1326 found this test's own sibling above only ever
+    /// exercised `resolve_slice_expr`'s two `Invalid path expression`
+    /// sites (this one and `test_path_catch_handler_dynamic_slice_...`'s
+    /// getpath-laundering counterpart below) with integer bounds -- which
+    /// can't tell `slice::literal_component` (drops a `NumberKey`) apart
+    /// from the key-aware `slice_component_value` every other rendering
+    /// site already used, since an integer bound has no key to drop in the
+    /// first place. Both sites had in fact kept calling the key-blind
+    /// constructor and silently reported the resolved integer instead of a
+    /// float bound's own spelling -- caught only once review re-tested
+    /// with a float bound specifically. Confirmed against jq 1.7.1.
+    #[test]
+    fn test_path_catch_handler_dynamic_float_slice_keeps_bound_spelling_1326() {
+        query!(br#"{"a":10}"#, r"path(try (.a, error([1,2,3])) catch .[(0.5+1):2.5])",
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(prefix_json(&vs), [r#"["a"]"#]);
+                assert_eq!(
+                    e.message,
+                    "Invalid path expression near attempt to access element {\"start\":1.... of [1,2,3]"
+                );
+            }
+        );
+        // The `!trackable || !b.trackable` sibling check a few lines below
+        // the one above (#986) — reached via a `Pipe`'s own literal target
+        // rather than the passthrough-target special case — has the
+        // identical bug on the identical fix, confirmed as its own call
+        // site in the diff (not just the same line reached twice).
+        query!(br"null", r"path((1 | .)[1.5:3.5])",
+            QueryResult::Error(e) => {
+                assert_eq!(
+                    e.message,
+                    "Invalid path expression near attempt to access element {\"start\":1.... of 1"
                 );
             }
         );
