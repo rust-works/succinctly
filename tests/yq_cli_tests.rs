@@ -13971,9 +13971,9 @@ fn test_yq_equality_consuming_builtins_agree_with_strict_eq_950() -> Result<()> 
 // it's the target of a read slice (`.[S:E]`) rather than erroring (matching
 // jq's own behavior) or passing null through unchanged. Every case here is
 // pinned against the live real `yq` v4.53.3 binary. Object targets are
-// deliberately excluded (#1065's own follow-up, #1102) -- real yq's own
-// slicing there follows its internal AST child-node layout, not this
-// empty-container rule.
+// excluded from *this* rule -- real yq's own slicing there follows its
+// internal AST child-node layout instead, implemented separately below
+// (#1102).
 
 #[test]
 fn test_slice_number_scalar_is_empty_array_1065() -> Result<()> {
@@ -14060,6 +14060,137 @@ fn test_slice_owned_target_scalar_is_empty_array_1065() -> Result<()> {
 }
 
 // ============================================================================
+// yq slicing an object follows its own AST child-node layout (#1102)
+// ============================================================================
+//
+// Real yq's `.[S:E]` on an *object* target doesn't error, doesn't give `[]`,
+// and doesn't slice by key-insertion-order pairs -- it slices yq's own
+// internal AST child-node list, where a mapping's children alternate
+// key-node, value-node, key-node, value-node (`{"a":1,"b":2,"c":3} |
+// .[0:2]` -> `["a",1]`, the first *two children*, not the first pair).
+// `start`/a negative `end` fold and clamp against the child count `2N`, but
+// an *omitted* `end` defaults to the entry count `N`, not `2N` -- verified
+// against real yq v4.53.3 across 20+ probes on 3- and 4-entry objects (see
+// `SliceBounds::resolve_object_children`'s own doc comment for the full
+// matrix and the near-certain upstream-bug explanation). Real jq has no
+// object-slicing concept at all and keeps erroring -- this is yq mode only.
+
+#[test]
+fn test_object_slice_matches_ast_child_layout_matrix_1102() -> Result<()> {
+    let input = r#"{"a":1,"b":2,"c":3}"#;
+    let cases: &[(&str, &str)] = &[
+        (".[0:2]", r#"["a",1]"#),
+        (".[1:2]", "[1]"),
+        (".[:2]", r#"["a",1]"#),
+        (".[4:6]", r#"["c",3]"#),
+        (".[6:8]", "[]"),
+        (".[3:1]", "[]"),
+        (".[2:]", r#"["b"]"#),
+        (".[1:]", r#"[1,"b"]"#),
+        (".[0:]", r#"["a",1,"b"]"#),
+        (".[5:]", "[]"),
+        (".[0:-1]", r#"["a",1,"b",2,"c"]"#),
+        (".[0:99]", r#"["a",1,"b",2,"c",3]"#),
+        (".[-1:]", "[]"),
+        (".[-2:]", "[]"),
+        (".[-3:]", "[]"),
+        (".[-4:]", r#"["b"]"#),
+        (".[-5:]", r#"[1,"b"]"#),
+        (".[-6:]", r#"["a",1,"b"]"#),
+    ];
+    for (filter, expected) in cases {
+        let (out, code) = run_yq_stdin(filter, input, &["-o", "json", "-I0"])?;
+        assert_eq!(code, 0, "filter {filter}: out {out:?}");
+        assert_eq!(out.trim(), *expected, "filter {filter}");
+    }
+    Ok(())
+}
+
+/// The `end`-omitted-defaults-to-`N`-not-`2N` asymmetry, guarded against an
+/// "obvious" simplification (`end = 2N` for every omitted bound) on a
+/// 4-entry object so it isn't just a coincidence of `N=3`.
+#[test]
+fn test_object_slice_end_omitted_asymmetry_generalizes_1102() -> Result<()> {
+    let input = r#"{"a":1,"b":2,"c":3,"d":4}"#;
+
+    let (out, code) = run_yq_stdin(".[0:]", input, &["-o", "json", "-I0"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), r#"["a",1,"b",2]"#);
+
+    let (out, code) = run_yq_stdin(".[2:]", input, &["-o", "json", "-I0"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), r#"["b",2]"#);
+
+    let (out, code) = run_yq_stdin(".[-2:]", input, &["-o", "json", "-I0"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "[]");
+
+    Ok(())
+}
+
+#[test]
+fn test_object_slice_empty_object_and_nested_value_1102() -> Result<()> {
+    let (out, code) = run_yq_stdin(".[0:1]", "{}", &["-o", "json"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "[]");
+
+    let (out, code) = run_yq_stdin(".[0:2]", r#"{"a":{"z":9},"b":2}"#, &["-o", "json", "-I0"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), r#"["a",{"z":9}]"#);
+    Ok(())
+}
+
+/// Mirrors `test_slice_owned_target_scalar_is_empty_array_1065`'s shape (a
+/// bare literal in postfix-slice position, with arithmetic non-folding
+/// bounds) to reach `slice_owned_value_read`'s new `Object` arm via
+/// `eval_slice_expr`'s `Targets::Owned` branch specifically, not just the
+/// cursor-backed `Expr::Slice` arm every `.` -direct case above already
+/// exercises.
+#[test]
+fn test_object_slice_owned_target_1102() -> Result<()> {
+    let (out, code) = run_yq_stdin(
+        r#"({"a":1,"b":2})[(1-1):(2+0)]"#,
+        "",
+        &["-n", "-o", "json", "-I0"],
+    )?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), r#"["a",1]"#);
+    Ok(())
+}
+
+/// jq mode must be entirely unaffected -- real jq has no object-slicing
+/// concept and keeps erroring, so the `S::TAG == EvalTag::Yq` gate can't
+/// silently rot.
+#[test]
+fn test_object_slice_jq_mode_still_errors_1102() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_stdin_with_stderr(".[0:2]", r#"{"a":1,"b":2,"c":3}"#, &["-c"])?;
+    assert_eq!(code, 5, "stderr: {stderr}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+/// Known, deliberate gap: real yq's slice result keeps the source node's
+/// `!!map` tag in YAML output (`{"a":1,"b":2} | yq '.[0:2]'` prints
+/// `!!map\n- "a"\n- 1` on real yq). `OwnedValue` has no tag slot (#1090's
+/// whole subject), so this isn't reachable here -- `-o=json` output (what
+/// every case above exercises, and every realistic use of this operator)
+/// is unaffected, since the tag doesn't appear in JSON. Pinned here so a
+/// future #1090 fix doesn't silently change this without the gap being
+/// deliberately revisited.
+#[test]
+fn test_object_slice_yaml_output_known_tag_gap_1102() -> Result<()> {
+    let (out, code) = run_yq_stdin(".[0:2]", r#"{"a":1,"b":2,"c":3}"#, &[])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(
+        out.trim(),
+        "- a\n- 1",
+        "missing !!map tag is the known #1090 gap"
+    );
+    Ok(())
+}
+
+// ============================================================================
 // yq assigning through a scalar slice target is a silent no-op (#1101)
 // ============================================================================
 //
@@ -14075,9 +14206,10 @@ fn test_slice_owned_target_scalar_is_empty_array_1065() -> Result<()> {
 // never actually written or serialized). `-=`/`*=` are NOT no-ops for a
 // *scalar* target -- they error instead, with Go-internal-looking messages
 // this crate deliberately does not replicate (not a stable compatibility
-// target). Object is still deliberately unaffected -- see #1157/#1102 for
-// why replicating it needs real yq's own AST-child-layout read rule first
-// -- but array/string targets are *not* unaffected any more: #1142 widened
+// target). Object is still deliberately unaffected -- #1102 (see the new
+// section below) implements the read-side AST-child-layout rule #1157's
+// own write-side follow-up needs, but doesn't itself touch assignment --
+// but array/string targets are *not* unaffected any more: #1142 widened
 // this same no-op to them too (any operator, including `-=`/`*=`, unlike
 // the scalar case), and #1116 (PR #1151) separately widened the *scalar*
 // case here to any chain depth, not just the bare-root shape this section
@@ -16942,61 +17074,48 @@ fn test_1219_bare_slice_sibling_trailing_run_no_longer_crashes_but_still_diverge
     Ok(())
 }
 
-/// #1223 follow-up (found by `/code-review`, filed separately): a comma
+/// #1223 follow-up (found by `/code-review`, filed as #1325 item 2): a comma
 /// branch reaching its trailing slice through an `Expr::Iterate` prefix
-/// (`.arr[][0:1]`) still crashes, because `navigate_read_only` (the prefix
-/// walker `yq_del_slice_outcome` uses to confirm the prefix
-/// actually exists) only understands `Field`/`Index` steps -- an
-/// `Iterate` step returns `None` immediately, so the rewrite silently
-/// declines and the branch reaches `resolve_dynamic_indexes` unrewritten.
-/// Deliberately not attempted here: real yq's rule for *which* parent key
-/// to drop when the prefix fans out over multiple array elements (rather
-/// than naming one) isn't obviously "drop every element," and extending
-/// `navigate_read_only` to `Iterate` needs its own live verification before
-/// committing to an answer -- a separate, more involved fix than this PR's
-/// scope. If this is ever addressed, update this expectation.
+/// (`.arr[][0:1]`) used to crash with `Cannot index object with object`,
+/// because that error came from the *read* side ever attempting to slice an
+/// object at all -- unconditional before #1102 gave yq mode a real
+/// object-slicing rule. #1102 resolves this as a side effect, not by
+/// touching any `del()`-specific machinery: `.arr[][0:1]` now legitimately
+/// evaluates (each array element's own AST-child-list slice, `[0:1)` = the
+/// first child = that element's first key alone), and whatever `del()`
+/// mechanism previously only got a chance to run once navigation stopped
+/// erroring now runs to completion. Live-verified against real yq v4.53.3:
+/// `{"arr":[]}` -- both array elements dropped entirely, not just their
+/// first key -- matches exactly.
 #[test]
-fn test_1223_iterate_prefix_slice_sibling_characterize_preexisting_bug() -> Result<()> {
-    let (_out, stderr, code) = run_yq_stdin_with_stderr(
+fn test_1223_iterate_prefix_slice_sibling_now_matches_real_yq_1102() -> Result<()> {
+    let (out, code) = run_yq_stdin(
         "del(.arr[][0:1], .c)",
         r#"{"arr":[{"x":1,"y":2},{"x":3,"y":4}],"c":9}"#,
-        &[],
+        &["-o=json", "-I=0"],
     )?;
-    assert_ne!(code, 0, "if this now succeeds, update this test");
-    assert!(
-        stderr.contains("Cannot index object with object"),
-        "stderr: {stderr}"
-    );
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), r#"{"arr":[]}"#);
     Ok(())
 }
 
-/// #1223 follow-up (found by `/code-review`, filed separately): a branch
-/// that itself needs a computed-key prepass (`.[($k)][0:1]`) and *also*
-/// ends in a trailing slice still crashes -- `rewrite_yq_del_comma_
-/// branches` deliberately skips any branch where `needs_path_prepass` is
-/// `true` (the existing, pre-#1223 contract: such a branch resolves through
-/// the normal dynamic-index machinery, and the post-resolution rewrite at
-/// `builtin_del`'s own `paths.len() > 1` branch was expected to catch a
-/// trailing slice in its *resolved* output) -- but here the crash happens
-/// *during* that branch's own resolution, before any resolved output
-/// exists for the post-resolution rewrite to run on. A real fix needs
-/// `resolve_dynamic_indexes`'s own per-branch navigation to defer a
-/// trailing slice the same way the top-level fast path already does for a
-/// non-comma expression, which is `resolve_node`'s `Expr::Comma` arm, not
-/// `builtin_del`'s -- out of scope for this PR. If this is ever addressed,
-/// update this expectation.
+/// #1223 follow-up (found by `/code-review`, filed as #1325 item 3): a
+/// branch that itself needs a computed-key prepass (`.[($k)][0:1]`) and
+/// also ends in a trailing slice used to crash the same way, and for the
+/// same underlying reason, as the `Iterate`-prefix case above -- #1102's
+/// object-slicing rule resolves it as a side effect too, not by touching
+/// `resolve_dynamic_indexes`'s per-branch navigation at all. Live-verified
+/// against real yq v4.53.3 with `k=a yq 'del(.[env(k)][0:1], .c)'`: `{}` --
+/// both `.a` and `.c` dropped entirely -- matches exactly.
 #[test]
-fn test_1223_computed_key_with_trailing_slice_characterize_preexisting_bug() -> Result<()> {
-    let (_out, stderr, code) = run_yq_stdin_with_stderr(
+fn test_1223_computed_key_with_trailing_slice_now_matches_real_yq_1102() -> Result<()> {
+    let (out, code) = run_yq_stdin(
         r"del(.[($k)][0:1], .c)",
         r#"{"a":{"x":1,"y":2},"c":9}"#,
-        &["--arg", "k", "a"],
+        &["--arg", "k", "a", "-o=json", "-I=0"],
     )?;
-    assert_ne!(code, 0, "if this now succeeds, update this test");
-    assert!(
-        stderr.contains("Cannot index object with object"),
-        "stderr: {stderr}"
-    );
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "{}");
     Ok(())
 }
 

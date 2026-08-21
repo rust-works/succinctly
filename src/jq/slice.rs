@@ -86,6 +86,28 @@ impl SliceBounds {
         let end = clamp(self.end.map_or(len as f64, f64::ceil), len);
         start..end.max(start)
     }
+
+    /// The child-node range yq's own slicing of an *object* target names,
+    /// mirroring its internal AST layout (`[k0, v0, k1, v1, ..., k(N-1),
+    /// v(N-1)]`, length `2N` for an `N`-entry map) rather than key-value
+    /// pairs (#1102, yq mode only -- jq has no object-slicing concept at
+    /// all).
+    ///
+    /// Not `resolve(2 * n_entries)`: `start` and a *negative* `end` fold and
+    /// clamp against the child count `2N`, same as every other bound, but an
+    /// *omitted* `end` defaults to the entry count `N`, not `2N` --
+    /// verified against real yq v4.53.3 across 20+ probes on 3- and
+    /// 4-entry objects, and near-certainly an upstream bug (yq computing
+    /// the default end from `length`, which is `N` for a map, while
+    /// resolving a negative index against `len(node.Content)`, which is
+    /// `2N`). Reproduced anyway -- this repo pins oracle behaviour,
+    /// including its own inconsistencies.
+    pub(crate) fn resolve_object_children(&self, n_entries: usize) -> Range<usize> {
+        let child_count = n_entries * 2;
+        let start = clamp(self.start.map_or(0.0, f64::floor), child_count);
+        let end = clamp(self.end.map_or(n_entries as f64, f64::ceil), child_count);
+        start..end.max(start)
+    }
 }
 
 /// One `start`/`end` slot of a descriptor.

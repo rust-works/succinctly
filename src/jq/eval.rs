@@ -615,14 +615,14 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // across all three) rather than jq's own null-passthrough rule
             // or "not sliceable" error -- checked before the jq-only Null
             // arm below so this wins under yq mode. Object targets are
-            // deliberately excluded: real yq's own slicing there follows
-            // its internal AST child-node layout (`{"a":1,"b":2} | .[0:2]`
-            // -> `["a",1]`, alternating keys and values), not a clean
-            // "empty container" rule, and isn't replicated here (#1102).
-            // Assignment targets are a separate, unverified case -- real
-            // yq's own behavior there is a silent no-op, not this rule
-            // (#1101) -- see `is_yq_slice_empty_container_scalar`'s doc
-            // comment, which this arm mirrors.
+            // deliberately excluded from *this* rule: real yq's own slicing
+            // there follows its internal AST child-node layout instead (not
+            // a clean "empty container" rule) -- see the dedicated
+            // `StandardJson::Object` arm below (#1102). Assignment targets
+            // are a separate, unverified case -- real yq's own behavior
+            // there is a silent no-op, not this rule (#1101) -- see
+            // `is_yq_slice_empty_container_scalar`'s doc comment, which this
+            // arm mirrors.
             StandardJson::Null | StandardJson::Number(_) | StandardJson::Bool(_)
                 if S::TAG == EvalTag::Yq =>
             {
@@ -663,6 +663,18 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 }
 
                 QueryResult::Owned(OwnedValue::String(slice::slice_str(&s_str, range)))
+            }
+            // An object target reaches this cursor-backed arm before any
+            // `OwnedValue` is ever materialized -- `slice_owned_value_read`
+            // (#1102) only sees an object once one already exists. Route
+            // through the same rule by materializing here rather than
+            // re-deriving key/value-pair iteration against the cursor's own
+            // field type.
+            StandardJson::Object(_) if S::TAG == EvalTag::Yq => {
+                let OwnedValue::Object(map) = to_owned(&value) else {
+                    unreachable!("StandardJson::Object always materializes to OwnedValue::Object")
+                };
+                QueryResult::Owned(slice_object_as_yq_children(&map, *start, *end))
             }
             _ if optional => QueryResult::None,
             // jq models `.[a:b]` as indexing with `{"start":a,"end":b}`, so a
@@ -11167,12 +11179,13 @@ pub(crate) fn slice_owned_value(
 }
 
 /// Slice one `OwnedValue` target on the *read* path (`.[S:E]`), applying
-/// yq's empty-container-scalar rule (#1065) before falling back to
-/// `slice_owned_value`. Shared by `eval_slice_expr`'s `Targets::Owned` loop
-/// here and `eval_generic::eval_slice_expr`'s equivalent loop, so the rule
-/// has exactly one call site to keep in sync instead of two hand-copied
-/// ones — the same duplicated-predicate shape this codebase has already
-/// been bitten by once (see the crate's own optimization-lessons doc).
+/// yq's empty-container-scalar rule (#1065) and object AST-child-layout
+/// rule (#1102) before falling back to `slice_owned_value`. Shared by
+/// `eval_slice_expr`'s `Targets::Owned` loop here and
+/// `eval_generic::eval_slice_expr`'s equivalent loop, so both rules have
+/// exactly one call site to keep in sync instead of two hand-copied ones —
+/// the same duplicated-predicate shape this codebase has already been
+/// bitten by once (see the crate's own optimization-lessons doc).
 pub(crate) fn slice_owned_value_read<S: EvalSemantics>(
     target: &OwnedValue,
     start: Option<i64>,
@@ -11182,7 +11195,31 @@ pub(crate) fn slice_owned_value_read<S: EvalSemantics>(
     if S::TAG == EvalTag::Yq && is_yq_slice_empty_container_scalar(target) {
         return Ok(Some(OwnedValue::Array(Vec::new())));
     }
+    if let (EvalTag::Yq, OwnedValue::Object(map)) = (S::TAG, target) {
+        return Ok(Some(slice_object_as_yq_children(map, start, end)));
+    }
     slice_owned_value(target, start, end, optional)
+}
+
+/// yq's own slicing rule for an *object* target (#1102, yq mode only — real
+/// jq has no object-slicing concept at all and keeps erroring). Slices the
+/// object's internal AST child-node list (`[k0, v0, k1, v1, ...]`, keys
+/// emitted as strings) rather than key-value pairs — see
+/// [`SliceBounds::resolve_object_children`] for the exact, oracle-verified
+/// bound-resolution rule. Never errors: yq's own object slicing doesn't,
+/// regardless of how the bounds resolve.
+fn slice_object_as_yq_children(
+    map: &IndexMap<String, OwnedValue>,
+    start: Option<i64>,
+    end: Option<i64>,
+) -> OwnedValue {
+    let mut children = Vec::with_capacity(map.len() * 2);
+    for (k, v) in map {
+        children.push(OwnedValue::String(k.clone()));
+        children.push(v.clone());
+    }
+    let range = SliceBounds::from_literals(start, end).resolve_object_children(map.len());
+    OwnedValue::Array(children[range].to_vec())
 }
 
 /// Get element at index (supports negative indexing).
