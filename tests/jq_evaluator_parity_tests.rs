@@ -33,6 +33,7 @@ fn generic_outputs(json: &[u8], filter: &str) -> Vec<String> {
     let result = eval_generic::eval_with_cursor(&expr, cursor);
     result
         .collect_owned()
+        .expect("materializes")
         .iter()
         .map(succinctly::jq::OwnedValue::to_json)
         .collect()
@@ -657,7 +658,7 @@ fn assert_optional_parity_suppressed(json: &[u8], expr: &Expr) {
         "generic evaluator: {expr:?} should be suppressed"
     );
     assert!(
-        generic.collect_owned().is_empty(),
+        generic.collect_owned().expect("materializes").is_empty(),
         "generic evaluator: {expr:?} should yield nothing"
     );
 }

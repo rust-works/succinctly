@@ -383,6 +383,29 @@ pub trait DocumentValue: Sized + Clone {
     /// Try to get as a string.
     fn as_str(&self) -> Option<Cow<'_, str>>;
 
+    /// Why a scalar that is structurally a string could not be *decoded* --
+    /// invalid UTF-8, an invalid escape, an invalid `\u` codepoint.
+    ///
+    /// [`as_str`](Self::as_str) collapses "not a string" and "a string this
+    /// document cannot hand back" into the same `None`, which is how a
+    /// decode failure used to reach a materializing conversion indis-
+    /// tinguishable from an unknown type and degrade silently to `null`
+    /// (#1098, #1247). This separates the two: `Some(reason)` means the
+    /// semi-index accepted the span as a string token but the bytes behind
+    /// it are not decodable, so a caller can raise a real error instead of
+    /// guessing.
+    ///
+    /// Returns a `&'static str` rather than a formatted message so the
+    /// check stays allocation-free and `no_std`-compatible; each format's
+    /// own error type owns the wording (`JsonError::message`,
+    /// `YamlStringError::message`), shared with its `Display`.
+    ///
+    /// Defaults to `None` -- correct for any implementation whose strings
+    /// cannot fail to decode.
+    fn string_decode_error(&self) -> Option<&'static str> {
+        None
+    }
+
     /// String form of this value when it appears as a mapping key.
     ///
     /// Unlike [`as_str`](Self::as_str), a key is always representable as a

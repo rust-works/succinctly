@@ -5224,12 +5224,25 @@ pub enum YamlStringError {
     InvalidEscape,
 }
 
+impl YamlStringError {
+    /// The human-readable reason, as a `&'static str`.
+    ///
+    /// Split out of [`Display`](core::fmt::Display) (which now defers to it)
+    /// for the same reason as [`JsonError::message`](crate::json::light::JsonError::message):
+    /// one definition shared with the formatter instead of the same strings
+    /// restated at an allocation-free call site.
+    #[must_use]
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::InvalidUtf8 => "invalid UTF-8 in string",
+            Self::InvalidEscape => "invalid escape sequence",
+        }
+    }
+}
+
 impl core::fmt::Display for YamlStringError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::InvalidUtf8 => write!(f, "invalid UTF-8 in string"),
-            Self::InvalidEscape => write!(f, "invalid escape sequence"),
-        }
+        f.write_str(self.message())
     }
 }
 
@@ -6391,6 +6404,20 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentValue for YamlValue<'a, W> {
                     .as_str()
                     .map(|cow| Cow::Owned(cow.into_owned()))
             }),
+            _ => None,
+        }
+    }
+
+    fn string_decode_error(&self) -> Option<&'static str> {
+        match self {
+            YamlValue::String(s) => s.as_str().err().map(YamlStringError::message),
+            // Resolve the whole chain first, exactly as `as_str` above does
+            // and for the same reason (#1191): a 2+-hop alias to a string is
+            // still a string, and answering from a single hop would report
+            // "not a decode failure" for a target that genuinely is one.
+            YamlValue::Alias { target, .. } => {
+                target.and_then(|t| t.resolve_alias_chain()?.string_decode_error())
+            }
             _ => None,
         }
     }
