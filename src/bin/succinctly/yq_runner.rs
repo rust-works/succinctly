@@ -1465,23 +1465,19 @@ fn evaluate_yaml_cursor<W: AsRef<[u64]> + Clone>(
     // `need_comments`/`is_alias_sensitive_assign` — real `yq` does this
     // unconditionally, not just for shape-preserving writes.
     //
-    // The same is true of a bare scalar's own `&anchor` (#763): real `yq`
+    // A bare scalar's own `&anchor` goes the same way (#763): real `yq`
     // prints `1`, not `&x 1`, for `.a` on `a: &x 1` — already pinned by
-    // `test_yaml_bare_scalar_anchor_dropped_on_query_result_712`. An
-    // *alias* mark is the exception and survives: `yq '.b'` on `b: *x`
-    // prints `*x` (verified against the pinned binary), because there the
-    // alias *is* the whole result rather than decoration on it.
+    // `test_yaml_bare_scalar_anchor_dropped_on_query_result_712`. Clearing
+    // the whole `NodeMeta` here covers an alias mark too, which
+    // `enforce_anchor_soundness` below would drop regardless (see
+    // `output_value`'s own note on why a root `*name` is never emittable).
     if let Ok(docs) = &mut docs {
         for (value, comments) in docs.iter_mut() {
             if !matches!(value, OwnedValue::Object(_) | OwnedValue::Array(_)) {
-                let alias_mark = comments
-                    .alias_name()
-                    .map(|name| AnchorMark::Aliases(name.to_string()));
-                *comments = CommentTree::Leaf(NodeMeta {
-                    comment: comments.own().map(str::to_string),
-                    style: "",
-                    anchor: alias_mark,
-                });
+                *comments = CommentTree::Leaf(NodeMeta::from_comment_and_style(
+                    comments.own().map(str::to_string),
+                    "",
+                ));
             }
         }
     }
@@ -1644,12 +1640,19 @@ fn output_value<W: Write>(
         // `--raw-input`, `--split-exp`, ... Redundant with (but harmless
         // alongside) `evaluate_yaml_cursor`'s equivalent root-scalar pass
         // for the cursor-based DOM path specifically.
-        // An aliased root renders as `*name` whatever its resolved value is
-        // — checked before the raw-string shortcut below, which would
-        // otherwise print an aliased string's *target text* instead (#763).
-        let body = if let Some(name) = comments.alias_name() {
-            format!("*{name}")
-        } else if let OwnedValue::String(s) = value {
+        // No root case for an *alias* mark here, deliberately: a root
+        // `*name` can never survive `enforce_anchor_soundness`, because its
+        // `&name` would have to sit inside the alias's own subtree, and a
+        // cyclic anchor is rejected outright at index build
+        // (`YamlError::AliasCycle`). So the mark is always cleared before
+        // this point, and a branch for it would be dead code (#763).
+        //
+        // That does mean `succinctly yq '.b'` on `b: *x` prints `*x` (the
+        // streaming path) while `-P '.b'` prints the resolved value. Real
+        // yq prints `*x` for both — and cannot read either back
+        // (`unknown anchor 'x' referenced`). Making the streaming path
+        // agree with this one is issue #1350.
+        let body = if let OwnedValue::String(s) = value {
             s.clone()
         } else {
             // A root anchor is written only for a container, matching
