@@ -1905,6 +1905,13 @@ impl OwnedValue {
     /// it needs the same guard [`to_json`](Self::to_json) does.
     fn to_json_for_reindex_at_depth<S: EvalSemantics>(&self, depth: usize) -> String {
         assert_value_tree_depth(depth);
+        // Shared by both `NumberLiteral` arms below (infinite and finite):
+        // this function's callers (`reduce`/`foreach`/etc.'s per-iteration
+        // reindex bridge) can run it over the same unchanged value
+        // thousands of times, and a document-sourced literal is
+        // otherwise-unbounded text -- see each arm's own comment for why
+        // its particular fallback is safe.
+        const MAX_REUSED_LITERAL_LEN: usize = 256;
         match self {
             Self::Float(f) if f.is_nan() => NAN_SENTINEL.to_string(),
             Self::NumberLiteral(NumberRepr::Float(f), _) if f.is_nan() => NAN_SENTINEL.to_string(),
@@ -1925,17 +1932,13 @@ impl OwnedValue {
             // plain `Float`, handled by the arm above, never this one - so
             // no further shape-checking is needed for correctness.
             //
-            // The length cap *is* needed regardless of shape: the literal
-            // is otherwise-unbounded document text, and this function's
-            // callers (`reduce`/`foreach`/etc.'s per-iteration reindex
-            // bridge) can run it over the same unchanged value thousands of
-            // times - a bound this loose still comfortably covers any
-            // realistic overflow literal (reaching `f64::MAX` needs on the
-            // order of ~300 exponent digits at most) while keeping the
-            // *reused* case itself O(1)-ish rather than O(iterations x
-            // literal length) for a pathological one.
+            // The length cap (`MAX_REUSED_LITERAL_LEN` above) *is* needed
+            // regardless of shape: a bound this loose still comfortably
+            // covers any realistic overflow literal (reaching `f64::MAX`
+            // needs on the order of ~300 exponent digits at most) while
+            // keeping the *reused* case itself O(1)-ish rather than
+            // O(iterations x literal length) for a pathological one.
             Self::NumberLiteral(NumberRepr::Float(f), literal) if f.is_infinite() => {
-                const MAX_REUSED_LITERAL_LEN: usize = 256;
                 if literal.len() <= MAX_REUSED_LITERAL_LEN {
                     literal.to_string()
                 } else {
@@ -1959,7 +1962,31 @@ impl OwnedValue {
             // `eval_generic.rs` arm -- verified against real yq across
             // `[.a]`, `.a,.a`, `map_values(.)`, and `with_entries(.)`, with
             // zero jq-mode output change (21-query sweep against real jq).
-            Self::NumberLiteral(_, literal) => literal.to_string(),
+            //
+            // Same length cap as the infinite-literal arm above, and the
+            // same reason (#1211, found in that issue's own PR review):
+            // `is_preservable_float_literal` (`src/yaml/scalar.rs`) admits
+            // an arbitrarily long zero-mantissa or leading-zero-heavy
+            // literal (e.g. `0.` + 100,000 zeros), so this text is no
+            // longer bounded to `MAX_PRESERVABLE_FLOAT_DIGITS` the way it
+            // used to be incidentally. Without a cap here, a `reduce`/
+            // `foreach`/`while`/`until` loop touching such a value
+            // re-serializes the full literal on every iteration --
+            // measured live, wall time linear in iteration count for a
+            // 200,000-digit literal. Falls back to the parsed `NumberRepr`'s
+            // own bounded formatting (discarding the literal text, the
+            // finite-value analogue of `overflow_literal(*f)` above) rather
+            // than the general `to_json_at_depth`'s own `NumberLiteral` arm,
+            // which is not length-bounded either (it exists for one-shot
+            // output, not this function's per-iteration reuse).
+            Self::NumberLiteral(repr, literal) if literal.len() <= MAX_REUSED_LITERAL_LEN => {
+                literal.to_string()
+            }
+            Self::NumberLiteral(NumberRepr::Int(n), _) => format!("{n}"),
+            Self::NumberLiteral(NumberRepr::Float(f), _) if S::TAG == EvalTag::Yq => {
+                crate::yaml::format_float_with_fraction(*f)
+            }
+            Self::NumberLiteral(NumberRepr::Float(f), _) => jq_bare_float_display(*f),
             Self::Array(arr) => {
                 let elements: Vec<String> = arr
                     .iter()
@@ -3039,6 +3066,30 @@ mod tests {
         let huge_literal = format!("{}e400", "9".repeat(300));
         let lit = OwnedValue::NumberLiteral(NumberRepr::Float(f64::INFINITY), huge_literal.into());
         assert_eq!(lit.to_json_for_reindex::<JqSemantics>(), INFINITY_SENTINEL);
+    }
+
+    /// #1211's own PR review: `is_preservable_float_literal`
+    /// (`src/yaml/scalar.rs`) now admits an arbitrarily long zero-mantissa
+    /// or leading-zero-heavy literal, so a *finite* `NumberLiteral` is no
+    /// longer bounded to 17-ish digits the way it used to be incidentally.
+    /// Same concern, same fix shape as the infinite-literal test above:
+    /// short literals still reuse their own text; a pathologically long one
+    /// falls back to the parsed value's own bounded formatting instead of
+    /// paying O(its length) on every reindex-bridge call.
+    #[test]
+    fn test_to_json_for_reindex_bounds_an_unrealistically_long_finite_literal() {
+        let short_literal = "0.000e-400";
+        let lit = OwnedValue::NumberLiteral(NumberRepr::Float(0.0), short_literal.into());
+        assert_eq!(lit.to_json_for_reindex::<JqSemantics>(), short_literal);
+
+        let huge_zero_literal = format!("0.{}e-400", "0".repeat(200_000));
+        let lit = OwnedValue::NumberLiteral(NumberRepr::Float(0.0), huge_zero_literal.into());
+        let out = lit.to_json_for_reindex::<JqSemantics>();
+        assert!(
+            out.len() < 100,
+            "expected a short, bounded fallback, got {} bytes",
+            out.len()
+        );
     }
 
     #[test]
