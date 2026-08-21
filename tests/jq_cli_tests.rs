@@ -4913,6 +4913,100 @@ fn test_document_overflow_literal_keys_preview_via_reindex_bridges_cli_939() -> 
     Ok(())
 }
 
+// ============================================================================
+// #945: `. as $x | ...`/`literal as $x | ...` used to be suspected of
+// dropping a document literal's own source-text spelling (e.g. `1.50`
+// rendering back as `1.5`) once bound to `$x`. Re-verified post-merge
+// (2026-08-21): every shape below already matches jq 1.7.1 exactly on
+// `main` -- the fix was an incidental side effect of #1035/#1062 adding
+// `Literal::NumberLiteral(NumberRepr, String)` (mirroring
+// `OwnedValue::NumberLiteral`), not a deliberate fix for this issue, so
+// nothing previously guarded it. Pinned here per that comment's own
+// recommendation, before closing #945.
+// ============================================================================
+
+/// #945: a document-sourced float literal keeps its own spelling (`1.50`,
+/// not the collapsed `1.5`) once bound via `as $x`, across several
+/// consuming contexts -- plain re-emission, `tostring`, array/object
+/// construction, and `tojson` -- all oracle-verified.
+#[test]
+fn test_as_binding_preserves_document_float_literal_spelling_945() -> Result<()> {
+    let (stdout, _stderr, code) = run_jq_full(&["-c", ". as $x | $x"], Some("1.50"))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "1.50");
+
+    let (stdout, _stderr, code) = run_jq_full(&["-c", ". as $x | $x | tostring"], Some("1.50"))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "\"1.50\"");
+
+    let (stdout, _stderr, code) = run_jq_full(&["-c", ". as $x | [$x]"], Some("1.50"))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "[1.50]");
+
+    let (stdout, _stderr, code) = run_jq_full(&["-c", ". as $x | {v:$x}"], Some("1.50"))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "{\"v\":1.50}");
+
+    let (stdout, _stderr, code) = run_jq_full(&["-c", ". as $x | ($x|tojson)"], Some("1.50"))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "\"1.50\"");
+
+    Ok(())
+}
+
+/// #945: arithmetic on a bound literal correctly *collapses* its spelling
+/// (`1.50 + 0` becomes plain `1.5`, matching jq) -- the fix preserves
+/// source spelling only through pass-through contexts, not through actual
+/// computation, so this must not regress into over-preserving.
+#[test]
+fn test_as_binding_arithmetic_collapses_literal_spelling_945() -> Result<()> {
+    let (stdout, _stderr, code) = run_jq_full(&["-c", ". as $x | $x + 0"], Some("1.50"))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "1.5");
+    Ok(())
+}
+
+/// #945: an exponent-spelled literal (`1e2`, not `1.50`) is preserved the
+/// same way, both bare and inside an array -- the fix isn't specific to
+/// decimal-point spellings.
+#[test]
+fn test_as_binding_preserves_exponent_literal_spelling_945() -> Result<()> {
+    let (stdout, _stderr, code) = run_jq_full(&["-c", ". as $x | $x"], Some("1e2"))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "1E+2");
+
+    let (stdout, _stderr, code) = run_jq_full(&["-c", ". as $x | [$x]"], Some("1e2"))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "[1E+2]");
+    Ok(())
+}
+
+/// #945: a *query*-literal binding (`1.50 as $x | $x`, the value coming
+/// from the jq program text itself, not the input document) preserves
+/// spelling the same way as a document-sourced one above -- the
+/// "query-literal spelling loss" gap the 2026-08-21 comment flagged as
+/// likely-should-be-bundled turned out to already be closed too.
+#[test]
+fn test_as_binding_preserves_query_literal_spelling_945() -> Result<()> {
+    let (stdout, _stderr, code) = run_jq_full(&["-c", "1.50 as $x | $x"], Some("null"))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "1.50");
+    Ok(())
+}
+
+/// #945: binding a non-iterable literal and then trying to iterate it
+/// still raises jq's own "Cannot iterate over number" error, unaffected
+/// by the spelling-preservation fix -- confirms `as $x` still type-checks
+/// normally, this isn't a blanket "numbers become opaque" change.
+#[test]
+fn test_as_binding_non_iterable_literal_still_raises_945() -> Result<()> {
+    let (stdout, _stderr, code) =
+        run_jq_full(&["-c", "try (. as $x | $x[]) catch ."], Some("1.50"))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "\"Cannot iterate over number (1.50)\"");
+    Ok(())
+}
+
 /// `path`/`parent`/`parent(n)`/`key` used to silently answer `[]`/`{}`/`null`
 /// (the root-level defaults) whenever they weren't the very first pipe stage:
 /// the CLI's streaming evaluator (`eval_generic.rs`) bridged only the bare
