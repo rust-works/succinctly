@@ -269,8 +269,9 @@ fn tagged_type_name<V: DocumentValue>(value: &V, cursor: Option<V::Cursor>) -> &
 /// Which YAML anchor/alias syntax a node carried in the source document
 /// (issue #763, ADR-0017's mechanism 2).
 ///
-/// A node is at most one of the two: [`YamlCursor::anchor`] returns `None`
-/// for an alias node, and an alias node cannot itself declare an anchor.
+/// A node is at most one of the two: [`DocumentCursor::anchor`] returns
+/// `None` for an alias node, and an alias node cannot itself declare an
+/// anchor.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AnchorMark {
     /// `&name` — this node declares an anchor. The name is stored without
@@ -304,8 +305,8 @@ pub struct NodeMeta {
 }
 
 impl NodeMeta {
-    /// Metadata-free: no comment, no style, no anchor. `const` so
-    /// [`EMPTY_COMMENT_TREE`] can be a genuine `static`.
+    /// Metadata-free: no comment, no style, no anchor. `const` so the
+    /// module's empty-tree `static` can be built from it.
     pub const fn empty() -> Self {
         Self {
             comment: None,

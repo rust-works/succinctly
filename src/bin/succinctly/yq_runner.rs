@@ -1187,11 +1187,16 @@ fn scan_anchor_soundness<'a>(
         Some(AnchorMark::Declares(name)) => {
             declared.insert(name.as_str(), value);
         }
-        Some(AnchorMark::Aliases(name)) => {
-            if declared.get(name.as_str()).map(|d| *d == value) != Some(true) {
-                unresolvable.push(clone_steps(path));
-            }
+        // No such declaration yet (missing entirely, or emitted later than
+        // this alias), or one whose value has since diverged from this one.
+        // Spelled as a negated `matches!` rather than clippy's suggested
+        // `is_none_or`, which is stable only since 1.82 and this crate's
+        // MSRV is 1.73.
+        Some(AnchorMark::Aliases(name)) if !matches!(declared.get(name.as_str()), Some(d) if *d == value) =>
+        {
+            unresolvable.push(clone_steps(path));
         }
+        Some(AnchorMark::Aliases(_)) => {}
         None => {}
     }
     match value {
