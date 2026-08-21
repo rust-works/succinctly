@@ -13303,6 +13303,21 @@ fn test_yq_tostring_preserves_exponent_literal_1030() -> Result<()> {
     Ok(())
 }
 
+/// #1211: a zero-mantissa literal's fractional zero digits used to count
+/// toward `MAX_PRESERVABLE_FLOAT_DIGITS` the same way a nonzero mantissa's
+/// significant digits do, losing the literal entirely (falling back to a
+/// lossy `0`) past 17 digits -- even though every zero-mantissa spelling
+/// represents the same value regardless of length. Real yq preserves it
+/// verbatim at any length (confirmed live).
+#[test]
+fn test_yq_tostring_preserves_long_zero_mantissa_literal_1211() -> Result<()> {
+    let (stdout, code) =
+        run_yq_stdin(".a | tostring", "a: 0.00000000000000000000e-400\n", &["-r"])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "0.00000000000000000000e-400");
+    Ok(())
+}
+
 #[test]
 fn test_yq_at_json_preserves_exponent_literal_1030() -> Result<()> {
     let (stdout, code) = run_yq_stdin(".a | @json", "a: 1E5\n", &["-r"])?;
