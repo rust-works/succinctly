@@ -26315,6 +26315,19 @@ fn eval_func_def<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// branching self-recursive `def`s work at all is exactly the runtime-call
 /// architecture #1371 tracks -- this guard's job is only to make the
 /// failure clean and bounded, for every shape, not to make any shape work.
+///
+/// **Also known to not close**: chaining several small recursive `def`s,
+/// each calling the previous one as its base case (e.g. `def r0(n): ...;
+/// def r1(n): if n==0 then r0(n) else [r1(n-1)] end; def r2(n): if n==0
+/// then r1(n) else [r2(n-1)] end; r2(45)`), still causes unbounded memory
+/// blowup (multiple GB, confirmed live) -- `r1`'s own expansion clones a
+/// `body` that already embeds `r0`'s full ~50-node expansion, so `r1`'s own
+/// budget-bounded substitutions multiply that size rather than bounding it,
+/// and each further chained `def` repeats the multiplication. Neither
+/// `budget` (bounds hit *count*) nor `chain_depth` (bounds live *stack*
+/// depth, which stays modest for this breadth-wise, not depth-wise, blowup)
+/// catches it. Pre-existing on `main` (crashes there too, via SIGABRT
+/// instead), not introduced by this guard; tracked separately as #1381.
 const MAX_FUNC_EXPANSION_DEPTH: usize = 50;
 
 /// Caps `chain_depth` in [`expand_func_calls`]/[`expand_func_calls_in_builtin`]
@@ -26364,7 +26377,6 @@ const MAX_FUNC_EXPANSION_DEPTH: usize = 50;
 /// covers.
 const MAX_FUNC_EXPANSION_CHAIN_DEPTH: usize = 300;
 
-/// Expand function calls to a defined function by inlining the body.
 /// Builds an `Expr::Error` node carrying a plain string message, evaluated
 /// via [`eval_error`]'s `Expr::Error` arm the same way a real `error("...")`
 /// call would be -- the mechanism `expand_func_calls` uses to report a
@@ -26375,6 +26387,7 @@ fn expansion_error(msg: String) -> Expr {
     Expr::Error(Some(Box::new(Expr::Literal(Literal::String(msg)))))
 }
 
+/// Expand function calls to a defined function by inlining the body.
 fn expand_func_calls(
     expr: &Expr,
     func_name: &str,
@@ -26415,10 +26428,17 @@ fn expand_func_calls(
             // recursive call in substantial structure (nested arrays,
             // objects, pipes) between one self-reference and the next --
             // see that constant's own doc comment for why `budget` alone
-            // (below) cannot catch this.
+            // (below) cannot catch this. It is intentionally a single
+            // running total over the whole expression being expanded, not
+            // scoped to `func_name`'s own self-reference chain (code review
+            // asked about this): live stack depth at any moment includes
+            // *all* nesting the traversal is currently inside, including
+            // structure with nothing to do with this recursion, and that
+            // depth is real regardless of its source -- so the message
+            // below doesn't claim the nesting is `func_name`'s own doing.
             if chain_depth >= MAX_FUNC_EXPANSION_CHAIN_DEPTH {
                 return expansion_error(format!(
-                    "function {func_name} nesting exceeds depth limit of {MAX_FUNC_EXPANSION_CHAIN_DEPTH} while expanding"
+                    "expression nesting exceeds depth limit of {MAX_FUNC_EXPANSION_CHAIN_DEPTH} while expanding function {func_name}"
                 ));
             }
             // `budget` bounds *total substitution work*, shared by
@@ -26445,20 +26465,15 @@ fn expand_func_calls(
             // that resolution, e.g. the two `f`s inside `def f: [f, f];
             // f`'s own body) -- that case must keep sharing the same
             // counter, or the branching-explosion bug above comes back.
-            let fresh_cell;
-            let cell: &Cell<usize> = match budget {
-                Some(cell) => cell,
-                None => {
-                    fresh_cell = Cell::new(0);
-                    &fresh_cell
-                }
-            };
-            if cell.get() >= MAX_FUNC_EXPANSION_DEPTH {
+            let fresh_cell = Cell::new(0);
+            let cell = budget.unwrap_or(&fresh_cell);
+            let hits_so_far = cell.get();
+            if hits_so_far >= MAX_FUNC_EXPANSION_DEPTH {
                 return expansion_error(format!(
                     "function {func_name} recursion depth exceeds limit of {MAX_FUNC_EXPANSION_DEPTH} while expanding"
                 ));
             }
-            cell.set(cell.get() + 1);
+            cell.set(hits_so_far + 1);
             // Substitute parameters with arguments in the body
             let mut result = body.clone();
             // First, expand any nested function calls in the arguments
