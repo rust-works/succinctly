@@ -792,6 +792,11 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // In practice, variables are resolved by eval_as which substitutes them
             QueryResult::Error(EvalError::new(format!("undefined variable: ${name}")))
         }
+        // A frozen variable snapshot from `substitute_var_tracked` (#844).
+        // Outside `path()`/`del()`/assignment resolution this is just an
+        // ordinary bound value -- `resolve_node`'s own `Expr::TrackedVar`
+        // arm is what actually decides path-trackability.
+        Expr::TrackedVar(v) => QueryResult::Owned((**v).clone()),
         Expr::Loc { line } => {
             // $__loc__ returns {"file": "<stdin>", "line": N}
             // where N is the 1-based line number in the jq filter source
@@ -14987,9 +14992,20 @@ fn resolve_node<'a, S: EvalSemantics>(
         // completing — not nothing.
         Expr::As { expr, var, body } => {
             let (bound_values, trailing) = eval_owned_expr_fork::<S>(expr, value, false);
+            // #844: same bind-time gate as `eval_as` -- only a
+            // statically-verified passthrough of `.` is even a candidate
+            // for path()-trackability through this binding. The actual
+            // trackability decision is made lazily by `resolve_node`'s own
+            // `Expr::TrackedVar` arm, at each use site.
+            let wrap_tracked = is_identity_passthrough(expr);
             let mut out = Vec::new();
             for bound in bound_values {
-                match resolve_node::<S>(&substitute_var(body, var, &bound), value, trackable) {
+                let substituted = if wrap_tracked {
+                    substitute_var_tracked(body, var, &bound)
+                } else {
+                    substitute_var(body, var, &bound)
+                };
+                match resolve_node::<S>(&substituted, value, trackable) {
                     Ok(branches) => out.extend(branches),
                     Err((body_prefix, escape)) => {
                         out.extend(body_prefix);
@@ -15010,6 +15026,31 @@ fn resolve_node<'a, S: EvalSemantics>(
                 // `body` resolution, already in `out`) and exits cleanly,
                 // never raising the bogus error this arm used to produce.
                 Some(control) => Err((out, control.into())),
+            }
+        }
+
+        // #844: a frozen variable snapshot from a statically-verified
+        // identity-passthrough `as`-binding (see `is_identity_passthrough`
+        // and the two `substitute_var_tracked` call sites above). The
+        // static gate is only a *candidate* signal; the real trackability
+        // decision happens here, lazily, by re-deriving it fresh against
+        // this exact use site: `.` can change between bind time and here
+        // (intervening navigation elsewhere in the pipe), so trusting the
+        // bind-time proof alone could claim a path that doesn't actually
+        // resolve back to `path()`'s own root. Comparing the snapshot to
+        // the ambient `value` can only ever *under*-approximate real jq's
+        // trackability (fall back to untracked), never emit a wrong path:
+        // `getpath(value, [])` trivially equals `value`, so `path=[]` is a
+        // sound witness whenever the snapshot and the ambient value agree.
+        Expr::TrackedVar(marker_value) => {
+            if trackable && marker_value.as_ref() == value {
+                Ok(vec![PathBranch::new(
+                    Vec::new(),
+                    Cow::Borrowed(value),
+                    true,
+                )])
+            } else {
+                resolve_leaf::<S>(expr, value, trackable)
             }
         }
 
@@ -17022,12 +17063,71 @@ where
     result
 }
 
-/// Substitute a variable in an expression with a value.
-/// Returns a new expression with the variable replaced.
-fn substitute_var(expr: &Expr, var_name: &str, replacement: &OwnedValue) -> Expr {
+/// True if `expr` is nothing but `.`, statically -- gates whether an
+/// `as`-bound value is wrapped in `Expr::TrackedVar` at all (#844).
+///
+/// Real jq only ever preserves `path()` trackability through a variable
+/// bound from `.` itself, never from a literal, field access, or any other
+/// computation, regardless of what value it evaluates to (confirmed live:
+/// `0 as $x | path($x)` on input `0` still raises `Invalid path expression`
+/// in real jq, even though the bound value trivially equals `.` there). So
+/// this check is deliberately syntactic, not "does the value happen to
+/// match" -- that runtime check happens separately, in `resolve_node`'s own
+/// `Expr::TrackedVar` arm, once a marker actually reaches a use site.
+///
+/// `Expr::TrackedVar` counts as passthrough too, so a chain of pure
+/// bindings composes: `. as $x | $x as $y | path($y | ...)` still tracks
+/// `$y`, because by the time this predicate sees `$y`'s bind source, it has
+/// already been substituted into a `TrackedVar` from the outer binding.
+fn is_identity_passthrough(expr: &Expr) -> bool {
     match expr {
-        Expr::Var(name) if name == var_name => owned_to_expr(replacement),
+        Expr::Identity | Expr::TrackedVar(_) => true,
+        Expr::Paren(inner) => is_identity_passthrough(inner),
+        _ => false,
+    }
+}
+
+/// Substitute a variable in an expression with a value, without marking the
+/// replacement as path-trackable. This is the form used by destructuring,
+/// `--arg`/`--argjson` splicing, and any `as`-binding whose source isn't a
+/// statically-verified passthrough of `.` (see `is_identity_passthrough`).
+fn substitute_var(expr: &Expr, var_name: &str, replacement: &OwnedValue) -> Expr {
+    substitute_var_impl(expr, var_name, replacement, false)
+}
+
+/// Like `substitute_var`, but marks the replacement as an `Expr::TrackedVar`
+/// so `resolve_node` can recognize it as a path()-trackability candidate.
+/// Call only when `is_identity_passthrough` holds for the bind source --
+/// `resolve_node`'s own `Expr::TrackedVar` arm still gates actual
+/// trackability at use time by comparing the frozen value to its own
+/// ambient position, so wrapping here is a necessary but not sufficient
+/// condition for the substituted variable to end up trackable (#844).
+fn substitute_var_tracked(expr: &Expr, var_name: &str, replacement: &OwnedValue) -> Expr {
+    substitute_var_impl(expr, var_name, replacement, true)
+}
+
+/// Substitute a variable in an expression with a value.
+/// Returns a new expression with the variable replaced. `mark_trackable`
+/// selects whether a substituted `$var_name` becomes an `Expr::TrackedVar`
+/// (path()-trackability candidate) or a plain value-construction node --
+/// see `substitute_var`/`substitute_var_tracked` above, the only two
+/// callers that should pass a literal `false`/`true` here.
+fn substitute_var_impl(
+    expr: &Expr,
+    var_name: &str,
+    replacement: &OwnedValue,
+    mark_trackable: bool,
+) -> Expr {
+    match expr {
+        Expr::Var(name) if name == var_name => {
+            if mark_trackable {
+                Expr::TrackedVar(Box::new(replacement.clone()))
+            } else {
+                owned_to_expr(replacement)
+            }
+        }
         Expr::Var(_) => expr.clone(),
+        Expr::TrackedVar(v) => Expr::TrackedVar(v.clone()),
         Expr::Loc { line } => Expr::Loc { line: *line },
         Expr::Env => Expr::Env,
         Expr::Identity => Expr::Identity,
@@ -17056,104 +17156,238 @@ fn substitute_var(expr: &Expr, var_name: &str, replacement: &OwnedValue) -> Expr
         // Must recurse into `key`: variables are resolved by substitution, so
         // skipping it would leave `$k` in `.[$k]` unbound at eval time.
         Expr::IndexExpr { target, key } => Expr::IndexExpr {
-            target: Box::new(substitute_var(target, var_name, replacement)),
-            key: Box::new(substitute_var(key, var_name, replacement)),
+            target: Box::new(substitute_var_impl(
+                target,
+                var_name,
+                replacement,
+                mark_trackable,
+            )),
+            key: Box::new(substitute_var_impl(
+                key,
+                var_name,
+                replacement,
+                mark_trackable,
+            )),
         },
         // Same reasoning as `IndexExpr`: `$a`/`$b` in `.[$a:$b]` must resolve.
         Expr::SliceExpr { target, start, end } => Expr::SliceExpr {
-            target: Box::new(substitute_var(target, var_name, replacement)),
-            start: start
-                .as_deref()
-                .map(|e| Box::new(substitute_var(e, var_name, replacement))),
-            end: end
-                .as_deref()
-                .map(|e| Box::new(substitute_var(e, var_name, replacement))),
+            target: Box::new(substitute_var_impl(
+                target,
+                var_name,
+                replacement,
+                mark_trackable,
+            )),
+            start: start.as_deref().map(|e| {
+                Box::new(substitute_var_impl(
+                    e,
+                    var_name,
+                    replacement,
+                    mark_trackable,
+                ))
+            }),
+            end: end.as_deref().map(|e| {
+                Box::new(substitute_var_impl(
+                    e,
+                    var_name,
+                    replacement,
+                    mark_trackable,
+                ))
+            }),
         },
         Expr::RecursiveDescent => Expr::RecursiveDescent,
-        Expr::Optional(e) => Expr::Optional(Box::new(substitute_var(e, var_name, replacement))),
+        Expr::Optional(e) => Expr::Optional(Box::new(substitute_var_impl(
+            e,
+            var_name,
+            replacement,
+            mark_trackable,
+        ))),
         Expr::Pipe(exprs) => Expr::Pipe(
             exprs
                 .iter()
-                .map(|e| substitute_var(e, var_name, replacement))
+                .map(|e| substitute_var_impl(e, var_name, replacement, mark_trackable))
                 .collect(),
         ),
         Expr::Comma(exprs) => Expr::Comma(
             exprs
                 .iter()
-                .map(|e| substitute_var(e, var_name, replacement))
+                .map(|e| substitute_var_impl(e, var_name, replacement, mark_trackable))
                 .collect(),
         ),
-        Expr::Array(e) => Expr::Array(Box::new(substitute_var(e, var_name, replacement))),
-        Expr::Object(entries) => Expr::Object(
-            entries
-                .iter()
-                .map(|entry| {
-                    let new_key = match &entry.key {
-                        ObjectKey::Literal(s) => ObjectKey::Literal(s.clone()),
-                        ObjectKey::Expr(e) => {
-                            ObjectKey::Expr(Box::new(substitute_var(e, var_name, replacement)))
+        Expr::Array(e) => Expr::Array(Box::new(substitute_var_impl(
+            e,
+            var_name,
+            replacement,
+            mark_trackable,
+        ))),
+        Expr::Object(entries) => {
+            Expr::Object(
+                entries
+                    .iter()
+                    .map(|entry| {
+                        let new_key =
+                            match &entry.key {
+                                ObjectKey::Literal(s) => ObjectKey::Literal(s.clone()),
+                                ObjectKey::Expr(e) => ObjectKey::Expr(Box::new(
+                                    substitute_var_impl(e, var_name, replacement, mark_trackable),
+                                )),
+                            };
+                        ObjectEntry {
+                            key: new_key,
+                            value: substitute_var_impl(
+                                &entry.value,
+                                var_name,
+                                replacement,
+                                mark_trackable,
+                            ),
                         }
-                    };
-                    ObjectEntry {
-                        key: new_key,
-                        value: substitute_var(&entry.value, var_name, replacement),
-                    }
-                })
-                .collect(),
-        ),
+                    })
+                    .collect(),
+            )
+        }
         Expr::Literal(lit) => Expr::Literal(lit.clone()),
-        Expr::Paren(e) => Expr::Paren(Box::new(substitute_var(e, var_name, replacement))),
+        Expr::Paren(e) => Expr::Paren(Box::new(substitute_var_impl(
+            e,
+            var_name,
+            replacement,
+            mark_trackable,
+        ))),
         Expr::Arithmetic { op, left, right } => Expr::Arithmetic {
             op: *op,
-            left: Box::new(substitute_var(left, var_name, replacement)),
-            right: Box::new(substitute_var(right, var_name, replacement)),
+            left: Box::new(substitute_var_impl(
+                left,
+                var_name,
+                replacement,
+                mark_trackable,
+            )),
+            right: Box::new(substitute_var_impl(
+                right,
+                var_name,
+                replacement,
+                mark_trackable,
+            )),
         },
-        Expr::Negate(operand) => {
-            Expr::Negate(Box::new(substitute_var(operand, var_name, replacement)))
-        }
+        Expr::Negate(operand) => Expr::Negate(Box::new(substitute_var_impl(
+            operand,
+            var_name,
+            replacement,
+            mark_trackable,
+        ))),
         Expr::Compare { op, left, right } => Expr::Compare {
             op: *op,
-            left: Box::new(substitute_var(left, var_name, replacement)),
-            right: Box::new(substitute_var(right, var_name, replacement)),
+            left: Box::new(substitute_var_impl(
+                left,
+                var_name,
+                replacement,
+                mark_trackable,
+            )),
+            right: Box::new(substitute_var_impl(
+                right,
+                var_name,
+                replacement,
+                mark_trackable,
+            )),
         },
         Expr::And(l, r) => Expr::And(
-            Box::new(substitute_var(l, var_name, replacement)),
-            Box::new(substitute_var(r, var_name, replacement)),
+            Box::new(substitute_var_impl(
+                l,
+                var_name,
+                replacement,
+                mark_trackable,
+            )),
+            Box::new(substitute_var_impl(
+                r,
+                var_name,
+                replacement,
+                mark_trackable,
+            )),
         ),
         Expr::Or(l, r) => Expr::Or(
-            Box::new(substitute_var(l, var_name, replacement)),
-            Box::new(substitute_var(r, var_name, replacement)),
+            Box::new(substitute_var_impl(
+                l,
+                var_name,
+                replacement,
+                mark_trackable,
+            )),
+            Box::new(substitute_var_impl(
+                r,
+                var_name,
+                replacement,
+                mark_trackable,
+            )),
         ),
         Expr::Not => Expr::Not,
         Expr::Alternative(l, r) => Expr::Alternative(
-            Box::new(substitute_var(l, var_name, replacement)),
-            Box::new(substitute_var(r, var_name, replacement)),
+            Box::new(substitute_var_impl(
+                l,
+                var_name,
+                replacement,
+                mark_trackable,
+            )),
+            Box::new(substitute_var_impl(
+                r,
+                var_name,
+                replacement,
+                mark_trackable,
+            )),
         ),
         Expr::If {
             cond,
             then_branch,
             else_branch,
         } => Expr::If {
-            cond: Box::new(substitute_var(cond, var_name, replacement)),
-            then_branch: Box::new(substitute_var(then_branch, var_name, replacement)),
-            else_branch: Box::new(substitute_var(else_branch, var_name, replacement)),
+            cond: Box::new(substitute_var_impl(
+                cond,
+                var_name,
+                replacement,
+                mark_trackable,
+            )),
+            then_branch: Box::new(substitute_var_impl(
+                then_branch,
+                var_name,
+                replacement,
+                mark_trackable,
+            )),
+            else_branch: Box::new(substitute_var_impl(
+                else_branch,
+                var_name,
+                replacement,
+                mark_trackable,
+            )),
         },
         Expr::Try { expr, catch } => Expr::Try {
-            expr: Box::new(substitute_var(expr, var_name, replacement)),
-            catch: catch
-                .as_ref()
-                .map(|e| Box::new(substitute_var(e, var_name, replacement))),
+            expr: Box::new(substitute_var_impl(
+                expr,
+                var_name,
+                replacement,
+                mark_trackable,
+            )),
+            catch: catch.as_ref().map(|e| {
+                Box::new(substitute_var_impl(
+                    e,
+                    var_name,
+                    replacement,
+                    mark_trackable,
+                ))
+            }),
         },
         Expr::Error(msg) => Expr::Error(msg.clone()),
-        Expr::Builtin(b) => Expr::Builtin(substitute_var_in_builtin(b, var_name, replacement)),
+        Expr::Builtin(b) => Expr::Builtin(substitute_var_in_builtin(
+            b,
+            var_name,
+            replacement,
+            mark_trackable,
+        )),
         Expr::StringInterpolation(parts) => Expr::StringInterpolation(
             parts
                 .iter()
                 .map(|p| match p {
                     StringPart::Literal(s) => StringPart::Literal(s.clone()),
-                    StringPart::Expr(e) => {
-                        StringPart::Expr(Box::new(substitute_var(e, var_name, replacement)))
-                    }
+                    StringPart::Expr(e) => StringPart::Expr(Box::new(substitute_var_impl(
+                        e,
+                        var_name,
+                        replacement,
+                        mark_trackable,
+                    ))),
                 })
                 .collect(),
         ),
@@ -17163,15 +17397,30 @@ fn substitute_var(expr: &Expr, var_name: &str, replacement: &OwnedValue) -> Expr
             // Don't substitute if this `as` binds the same variable (shadowing)
             if var == var_name {
                 Expr::As {
-                    expr: Box::new(substitute_var(expr, var_name, replacement)),
+                    expr: Box::new(substitute_var_impl(
+                        expr,
+                        var_name,
+                        replacement,
+                        mark_trackable,
+                    )),
                     var: var.clone(),
                     body: body.clone(), // Don't substitute in body - shadowed
                 }
             } else {
                 Expr::As {
-                    expr: Box::new(substitute_var(expr, var_name, replacement)),
+                    expr: Box::new(substitute_var_impl(
+                        expr,
+                        var_name,
+                        replacement,
+                        mark_trackable,
+                    )),
                     var: var.clone(),
-                    body: Box::new(substitute_var(body, var_name, replacement)),
+                    body: Box::new(substitute_var_impl(
+                        body,
+                        var_name,
+                        replacement,
+                        mark_trackable,
+                    )),
                 }
             }
         }
@@ -17187,17 +17436,42 @@ fn substitute_var(expr: &Expr, var_name: &str, replacement: &OwnedValue) -> Expr
             // case of this same question).
             if pattern_binds_var(pattern, var_name) {
                 Expr::Reduce {
-                    input: Box::new(substitute_var(input, var_name, replacement)),
+                    input: Box::new(substitute_var_impl(
+                        input,
+                        var_name,
+                        replacement,
+                        mark_trackable,
+                    )),
                     pattern: pattern.clone(),
-                    init: Box::new(substitute_var(init, var_name, replacement)),
+                    init: Box::new(substitute_var_impl(
+                        init,
+                        var_name,
+                        replacement,
+                        mark_trackable,
+                    )),
                     update: update.clone(), // shadowed
                 }
             } else {
                 Expr::Reduce {
-                    input: Box::new(substitute_var(input, var_name, replacement)),
+                    input: Box::new(substitute_var_impl(
+                        input,
+                        var_name,
+                        replacement,
+                        mark_trackable,
+                    )),
                     pattern: pattern.clone(),
-                    init: Box::new(substitute_var(init, var_name, replacement)),
-                    update: Box::new(substitute_var(update, var_name, replacement)),
+                    init: Box::new(substitute_var_impl(
+                        init,
+                        var_name,
+                        replacement,
+                        mark_trackable,
+                    )),
+                    update: Box::new(substitute_var_impl(
+                        update,
+                        var_name,
+                        replacement,
+                        mark_trackable,
+                    )),
                 }
             }
         }
@@ -17210,51 +17484,151 @@ fn substitute_var(expr: &Expr, var_name: &str, replacement: &OwnedValue) -> Expr
         } => {
             if pattern_binds_var(pattern, var_name) {
                 Expr::Foreach {
-                    input: Box::new(substitute_var(input, var_name, replacement)),
+                    input: Box::new(substitute_var_impl(
+                        input,
+                        var_name,
+                        replacement,
+                        mark_trackable,
+                    )),
                     pattern: pattern.clone(),
-                    init: Box::new(substitute_var(init, var_name, replacement)),
+                    init: Box::new(substitute_var_impl(
+                        init,
+                        var_name,
+                        replacement,
+                        mark_trackable,
+                    )),
                     update: update.clone(),
                     extract: extract.clone(),
                 }
             } else {
                 Expr::Foreach {
-                    input: Box::new(substitute_var(input, var_name, replacement)),
+                    input: Box::new(substitute_var_impl(
+                        input,
+                        var_name,
+                        replacement,
+                        mark_trackable,
+                    )),
                     pattern: pattern.clone(),
-                    init: Box::new(substitute_var(init, var_name, replacement)),
-                    update: Box::new(substitute_var(update, var_name, replacement)),
-                    extract: extract
-                        .as_ref()
-                        .map(|e| Box::new(substitute_var(e, var_name, replacement))),
+                    init: Box::new(substitute_var_impl(
+                        init,
+                        var_name,
+                        replacement,
+                        mark_trackable,
+                    )),
+                    update: Box::new(substitute_var_impl(
+                        update,
+                        var_name,
+                        replacement,
+                        mark_trackable,
+                    )),
+                    extract: extract.as_ref().map(|e| {
+                        Box::new(substitute_var_impl(
+                            e,
+                            var_name,
+                            replacement,
+                            mark_trackable,
+                        ))
+                    }),
                 }
             }
         }
         Expr::Limit { n, expr } => Expr::Limit {
-            n: Box::new(substitute_var(n, var_name, replacement)),
-            expr: Box::new(substitute_var(expr, var_name, replacement)),
+            n: Box::new(substitute_var_impl(
+                n,
+                var_name,
+                replacement,
+                mark_trackable,
+            )),
+            expr: Box::new(substitute_var_impl(
+                expr,
+                var_name,
+                replacement,
+                mark_trackable,
+            )),
         },
-        Expr::FirstExpr(e) => Expr::FirstExpr(Box::new(substitute_var(e, var_name, replacement))),
-        Expr::LastExpr(e) => Expr::LastExpr(Box::new(substitute_var(e, var_name, replacement))),
+        Expr::FirstExpr(e) => Expr::FirstExpr(Box::new(substitute_var_impl(
+            e,
+            var_name,
+            replacement,
+            mark_trackable,
+        ))),
+        Expr::LastExpr(e) => Expr::LastExpr(Box::new(substitute_var_impl(
+            e,
+            var_name,
+            replacement,
+            mark_trackable,
+        ))),
         Expr::NthExpr { n, expr } => Expr::NthExpr {
-            n: Box::new(substitute_var(n, var_name, replacement)),
-            expr: Box::new(substitute_var(expr, var_name, replacement)),
+            n: Box::new(substitute_var_impl(
+                n,
+                var_name,
+                replacement,
+                mark_trackable,
+            )),
+            expr: Box::new(substitute_var_impl(
+                expr,
+                var_name,
+                replacement,
+                mark_trackable,
+            )),
         },
         Expr::Until { cond, update } => Expr::Until {
-            cond: Box::new(substitute_var(cond, var_name, replacement)),
-            update: Box::new(substitute_var(update, var_name, replacement)),
+            cond: Box::new(substitute_var_impl(
+                cond,
+                var_name,
+                replacement,
+                mark_trackable,
+            )),
+            update: Box::new(substitute_var_impl(
+                update,
+                var_name,
+                replacement,
+                mark_trackable,
+            )),
         },
         Expr::While { cond, update } => Expr::While {
-            cond: Box::new(substitute_var(cond, var_name, replacement)),
-            update: Box::new(substitute_var(update, var_name, replacement)),
+            cond: Box::new(substitute_var_impl(
+                cond,
+                var_name,
+                replacement,
+                mark_trackable,
+            )),
+            update: Box::new(substitute_var_impl(
+                update,
+                var_name,
+                replacement,
+                mark_trackable,
+            )),
         },
-        Expr::Repeat(e) => Expr::Repeat(Box::new(substitute_var(e, var_name, replacement))),
+        Expr::Repeat(e) => Expr::Repeat(Box::new(substitute_var_impl(
+            e,
+            var_name,
+            replacement,
+            mark_trackable,
+        ))),
         Expr::Range { from, to, step } => Expr::Range {
-            from: Box::new(substitute_var(from, var_name, replacement)),
-            to: to
-                .as_ref()
-                .map(|e| Box::new(substitute_var(e, var_name, replacement))),
-            step: step
-                .as_ref()
-                .map(|e| Box::new(substitute_var(e, var_name, replacement))),
+            from: Box::new(substitute_var_impl(
+                from,
+                var_name,
+                replacement,
+                mark_trackable,
+            )),
+            to: to.as_ref().map(|e| {
+                Box::new(substitute_var_impl(
+                    e,
+                    var_name,
+                    replacement,
+                    mark_trackable,
+                ))
+            }),
+            step: step.as_ref().map(|e| {
+                Box::new(substitute_var_impl(
+                    e,
+                    var_name,
+                    replacement,
+                    mark_trackable,
+                ))
+            }),
         },
         // Phase 9: Variables & Definitions
         Expr::AsPattern {
@@ -17267,12 +17641,22 @@ fn substitute_var(expr: &Expr, var_name: &str, replacement: &OwnedValue) -> Expr
             // alternative it might actually run under (#720).
             let shadowed = patterns.iter().any(|p| pattern_binds_var(p, var_name));
             Expr::AsPattern {
-                expr: Box::new(substitute_var(expr, var_name, replacement)),
+                expr: Box::new(substitute_var_impl(
+                    expr,
+                    var_name,
+                    replacement,
+                    mark_trackable,
+                )),
                 patterns: patterns.clone(),
                 body: if shadowed {
                     body.clone()
                 } else {
-                    Box::new(substitute_var(body, var_name, replacement))
+                    Box::new(substitute_var_impl(
+                        body,
+                        var_name,
+                        replacement,
+                        mark_trackable,
+                    ))
                 },
             }
         }
@@ -17290,16 +17674,26 @@ fn substitute_var(expr: &Expr, var_name: &str, replacement: &OwnedValue) -> Expr
                 body: if shadowed {
                     body.clone()
                 } else {
-                    Box::new(substitute_var(body, var_name, replacement))
+                    Box::new(substitute_var_impl(
+                        body,
+                        var_name,
+                        replacement,
+                        mark_trackable,
+                    ))
                 },
-                then: Box::new(substitute_var(then, var_name, replacement)),
+                then: Box::new(substitute_var_impl(
+                    then,
+                    var_name,
+                    replacement,
+                    mark_trackable,
+                )),
             }
         }
         Expr::FuncCall { name, args } => Expr::FuncCall {
             name: name.clone(),
             args: args
                 .iter()
-                .map(|a| substitute_var(a, var_name, replacement))
+                .map(|a| substitute_var_impl(a, var_name, replacement, mark_trackable))
                 .collect(),
         },
         Expr::NamespacedCall {
@@ -17311,26 +17705,66 @@ fn substitute_var(expr: &Expr, var_name: &str, replacement: &OwnedValue) -> Expr
             name: name.clone(),
             args: args
                 .iter()
-                .map(|a| substitute_var(a, var_name, replacement))
+                .map(|a| substitute_var_impl(a, var_name, replacement, mark_trackable))
                 .collect(),
         },
         // Assignment operators
         Expr::Assign { path, value } => Expr::Assign {
-            path: Box::new(substitute_var(path, var_name, replacement)),
-            value: Box::new(substitute_var(value, var_name, replacement)),
+            path: Box::new(substitute_var_impl(
+                path,
+                var_name,
+                replacement,
+                mark_trackable,
+            )),
+            value: Box::new(substitute_var_impl(
+                value,
+                var_name,
+                replacement,
+                mark_trackable,
+            )),
         },
         Expr::Update { path, filter } => Expr::Update {
-            path: Box::new(substitute_var(path, var_name, replacement)),
-            filter: Box::new(substitute_var(filter, var_name, replacement)),
+            path: Box::new(substitute_var_impl(
+                path,
+                var_name,
+                replacement,
+                mark_trackable,
+            )),
+            filter: Box::new(substitute_var_impl(
+                filter,
+                var_name,
+                replacement,
+                mark_trackable,
+            )),
         },
         Expr::CompoundAssign { op, path, value } => Expr::CompoundAssign {
             op: *op,
-            path: Box::new(substitute_var(path, var_name, replacement)),
-            value: Box::new(substitute_var(value, var_name, replacement)),
+            path: Box::new(substitute_var_impl(
+                path,
+                var_name,
+                replacement,
+                mark_trackable,
+            )),
+            value: Box::new(substitute_var_impl(
+                value,
+                var_name,
+                replacement,
+                mark_trackable,
+            )),
         },
         Expr::AlternativeAssign { path, value } => Expr::AlternativeAssign {
-            path: Box::new(substitute_var(path, var_name, replacement)),
-            value: Box::new(substitute_var(value, var_name, replacement)),
+            path: Box::new(substitute_var_impl(
+                path,
+                var_name,
+                replacement,
+                mark_trackable,
+            )),
+            value: Box::new(substitute_var_impl(
+                value,
+                var_name,
+                replacement,
+                mark_trackable,
+            )),
         },
 
         // Label-break
@@ -17341,7 +17775,12 @@ fn substitute_var(expr: &Expr, var_name: &str, replacement: &OwnedValue) -> Expr
             } else {
                 Expr::Label {
                     name: name.clone(),
-                    body: Box::new(substitute_var(body, var_name, replacement)),
+                    body: Box::new(substitute_var_impl(
+                        body,
+                        var_name,
+                        replacement,
+                        mark_trackable,
+                    )),
                 }
             }
         }
@@ -17365,6 +17804,7 @@ fn substitute_var_in_builtin(
     builtin: &Builtin,
     var_name: &str,
     replacement: &OwnedValue,
+    mark_trackable: bool,
 ) -> Builtin {
     match builtin {
         Builtin::Type => Builtin::Type,
@@ -17387,180 +17827,533 @@ fn substitute_var_in_builtin(
         Builtin::Utf8ByteLength => Builtin::Utf8ByteLength,
         Builtin::Keys => Builtin::Keys,
         Builtin::KeysUnsorted => Builtin::KeysUnsorted,
-        Builtin::Has(e) => Builtin::Has(Box::new(substitute_var(e, var_name, replacement))),
-        Builtin::In(e) => Builtin::In(Box::new(substitute_var(e, var_name, replacement))),
-        Builtin::UpperIn(e) => Builtin::UpperIn(Box::new(substitute_var(e, var_name, replacement))),
+        Builtin::Has(e) => Builtin::Has(Box::new(substitute_var_impl(
+            e,
+            var_name,
+            replacement,
+            mark_trackable,
+        ))),
+        Builtin::In(e) => Builtin::In(Box::new(substitute_var_impl(
+            e,
+            var_name,
+            replacement,
+            mark_trackable,
+        ))),
+        Builtin::UpperIn(e) => Builtin::UpperIn(Box::new(substitute_var_impl(
+            e,
+            var_name,
+            replacement,
+            mark_trackable,
+        ))),
         Builtin::UpperInSrc(src, s) => Builtin::UpperInSrc(
-            Box::new(substitute_var(src, var_name, replacement)),
-            Box::new(substitute_var(s, var_name, replacement)),
+            Box::new(substitute_var_impl(
+                src,
+                var_name,
+                replacement,
+                mark_trackable,
+            )),
+            Box::new(substitute_var_impl(
+                s,
+                var_name,
+                replacement,
+                mark_trackable,
+            )),
         ),
-        Builtin::Select(e) => Builtin::Select(Box::new(substitute_var(e, var_name, replacement))),
+        Builtin::Select(e) => Builtin::Select(Box::new(substitute_var_impl(
+            e,
+            var_name,
+            replacement,
+            mark_trackable,
+        ))),
         Builtin::Empty => Builtin::Empty,
-        Builtin::Map(e) => Builtin::Map(Box::new(substitute_var(e, var_name, replacement))),
-        Builtin::MapValues(e) => {
-            Builtin::MapValues(Box::new(substitute_var(e, var_name, replacement)))
-        }
+        Builtin::Map(e) => Builtin::Map(Box::new(substitute_var_impl(
+            e,
+            var_name,
+            replacement,
+            mark_trackable,
+        ))),
+        Builtin::MapValues(e) => Builtin::MapValues(Box::new(substitute_var_impl(
+            e,
+            var_name,
+            replacement,
+            mark_trackable,
+        ))),
         Builtin::Add => Builtin::Add,
         Builtin::Any => Builtin::Any,
-        Builtin::AnyF(e) => Builtin::AnyF(Box::new(substitute_var(e, var_name, replacement))),
+        Builtin::AnyF(e) => Builtin::AnyF(Box::new(substitute_var_impl(
+            e,
+            var_name,
+            replacement,
+            mark_trackable,
+        ))),
         Builtin::AnyCond(gen, cond) => Builtin::AnyCond(
-            Box::new(substitute_var(gen, var_name, replacement)),
-            Box::new(substitute_var(cond, var_name, replacement)),
+            Box::new(substitute_var_impl(
+                gen,
+                var_name,
+                replacement,
+                mark_trackable,
+            )),
+            Box::new(substitute_var_impl(
+                cond,
+                var_name,
+                replacement,
+                mark_trackable,
+            )),
         ),
         Builtin::All => Builtin::All,
-        Builtin::AllF(e) => Builtin::AllF(Box::new(substitute_var(e, var_name, replacement))),
+        Builtin::AllF(e) => Builtin::AllF(Box::new(substitute_var_impl(
+            e,
+            var_name,
+            replacement,
+            mark_trackable,
+        ))),
         Builtin::AllCond(gen, cond) => Builtin::AllCond(
-            Box::new(substitute_var(gen, var_name, replacement)),
-            Box::new(substitute_var(cond, var_name, replacement)),
+            Box::new(substitute_var_impl(
+                gen,
+                var_name,
+                replacement,
+                mark_trackable,
+            )),
+            Box::new(substitute_var_impl(
+                cond,
+                var_name,
+                replacement,
+                mark_trackable,
+            )),
         ),
         Builtin::Min => Builtin::Min,
         Builtin::Max => Builtin::Max,
-        Builtin::MinBy(e) => Builtin::MinBy(Box::new(substitute_var(e, var_name, replacement))),
-        Builtin::MaxBy(e) => Builtin::MaxBy(Box::new(substitute_var(e, var_name, replacement))),
+        Builtin::MinBy(e) => Builtin::MinBy(Box::new(substitute_var_impl(
+            e,
+            var_name,
+            replacement,
+            mark_trackable,
+        ))),
+        Builtin::MaxBy(e) => Builtin::MaxBy(Box::new(substitute_var_impl(
+            e,
+            var_name,
+            replacement,
+            mark_trackable,
+        ))),
         Builtin::AsciiDowncase => Builtin::AsciiDowncase,
         Builtin::AsciiUpcase => Builtin::AsciiUpcase,
-        Builtin::Ltrimstr(e) => {
-            Builtin::Ltrimstr(Box::new(substitute_var(e, var_name, replacement)))
-        }
-        Builtin::Rtrimstr(e) => {
-            Builtin::Rtrimstr(Box::new(substitute_var(e, var_name, replacement)))
-        }
-        Builtin::Startswith(e) => {
-            Builtin::Startswith(Box::new(substitute_var(e, var_name, replacement)))
-        }
-        Builtin::Endswith(e) => {
-            Builtin::Endswith(Box::new(substitute_var(e, var_name, replacement)))
-        }
-        Builtin::Split(e) => Builtin::Split(Box::new(substitute_var(e, var_name, replacement))),
-        Builtin::Join(e) => Builtin::Join(Box::new(substitute_var(e, var_name, replacement))),
-        Builtin::Contains(e) => {
-            Builtin::Contains(Box::new(substitute_var(e, var_name, replacement)))
-        }
-        Builtin::Inside(e) => Builtin::Inside(Box::new(substitute_var(e, var_name, replacement))),
+        Builtin::Ltrimstr(e) => Builtin::Ltrimstr(Box::new(substitute_var_impl(
+            e,
+            var_name,
+            replacement,
+            mark_trackable,
+        ))),
+        Builtin::Rtrimstr(e) => Builtin::Rtrimstr(Box::new(substitute_var_impl(
+            e,
+            var_name,
+            replacement,
+            mark_trackable,
+        ))),
+        Builtin::Startswith(e) => Builtin::Startswith(Box::new(substitute_var_impl(
+            e,
+            var_name,
+            replacement,
+            mark_trackable,
+        ))),
+        Builtin::Endswith(e) => Builtin::Endswith(Box::new(substitute_var_impl(
+            e,
+            var_name,
+            replacement,
+            mark_trackable,
+        ))),
+        Builtin::Split(e) => Builtin::Split(Box::new(substitute_var_impl(
+            e,
+            var_name,
+            replacement,
+            mark_trackable,
+        ))),
+        Builtin::Join(e) => Builtin::Join(Box::new(substitute_var_impl(
+            e,
+            var_name,
+            replacement,
+            mark_trackable,
+        ))),
+        Builtin::Contains(e) => Builtin::Contains(Box::new(substitute_var_impl(
+            e,
+            var_name,
+            replacement,
+            mark_trackable,
+        ))),
+        Builtin::Inside(e) => Builtin::Inside(Box::new(substitute_var_impl(
+            e,
+            var_name,
+            replacement,
+            mark_trackable,
+        ))),
         Builtin::First => Builtin::First,
         Builtin::Last => Builtin::Last,
-        Builtin::Nth(e) => Builtin::Nth(Box::new(substitute_var(e, var_name, replacement))),
+        Builtin::Nth(e) => Builtin::Nth(Box::new(substitute_var_impl(
+            e,
+            var_name,
+            replacement,
+            mark_trackable,
+        ))),
         Builtin::Reverse => Builtin::Reverse,
         Builtin::Flatten => Builtin::Flatten,
-        Builtin::FlattenDepth(e) => {
-            Builtin::FlattenDepth(Box::new(substitute_var(e, var_name, replacement)))
-        }
-        Builtin::GroupBy(e) => Builtin::GroupBy(Box::new(substitute_var(e, var_name, replacement))),
+        Builtin::FlattenDepth(e) => Builtin::FlattenDepth(Box::new(substitute_var_impl(
+            e,
+            var_name,
+            replacement,
+            mark_trackable,
+        ))),
+        Builtin::GroupBy(e) => Builtin::GroupBy(Box::new(substitute_var_impl(
+            e,
+            var_name,
+            replacement,
+            mark_trackable,
+        ))),
         Builtin::Unique => Builtin::Unique,
-        Builtin::UniqueBy(e) => {
-            Builtin::UniqueBy(Box::new(substitute_var(e, var_name, replacement)))
-        }
+        Builtin::UniqueBy(e) => Builtin::UniqueBy(Box::new(substitute_var_impl(
+            e,
+            var_name,
+            replacement,
+            mark_trackable,
+        ))),
         Builtin::Sort => Builtin::Sort,
-        Builtin::SortBy(e) => Builtin::SortBy(Box::new(substitute_var(e, var_name, replacement))),
+        Builtin::SortBy(e) => Builtin::SortBy(Box::new(substitute_var_impl(
+            e,
+            var_name,
+            replacement,
+            mark_trackable,
+        ))),
         Builtin::ToEntries => Builtin::ToEntries,
         Builtin::FromEntries => Builtin::FromEntries,
-        Builtin::WithEntries(e) => {
-            Builtin::WithEntries(Box::new(substitute_var(e, var_name, replacement)))
-        }
+        Builtin::WithEntries(e) => Builtin::WithEntries(Box::new(substitute_var_impl(
+            e,
+            var_name,
+            replacement,
+            mark_trackable,
+        ))),
         Builtin::ToString => Builtin::ToString,
         Builtin::ToNumber => Builtin::ToNumber,
         Builtin::ToJson => Builtin::ToJson,
         Builtin::FromJson => Builtin::FromJson,
         Builtin::Explode => Builtin::Explode,
         Builtin::Implode => Builtin::Implode,
-        Builtin::Test(e) => Builtin::Test(Box::new(substitute_var(e, var_name, replacement))),
-        Builtin::Indices(e) => Builtin::Indices(Box::new(substitute_var(e, var_name, replacement))),
-        Builtin::Index(e) => Builtin::Index(Box::new(substitute_var(e, var_name, replacement))),
-        Builtin::Rindex(e) => Builtin::Rindex(Box::new(substitute_var(e, var_name, replacement))),
-        Builtin::UpperIndex(e) => {
-            Builtin::UpperIndex(Box::new(substitute_var(e, var_name, replacement)))
-        }
+        Builtin::Test(e) => Builtin::Test(Box::new(substitute_var_impl(
+            e,
+            var_name,
+            replacement,
+            mark_trackable,
+        ))),
+        Builtin::Indices(e) => Builtin::Indices(Box::new(substitute_var_impl(
+            e,
+            var_name,
+            replacement,
+            mark_trackable,
+        ))),
+        Builtin::Index(e) => Builtin::Index(Box::new(substitute_var_impl(
+            e,
+            var_name,
+            replacement,
+            mark_trackable,
+        ))),
+        Builtin::Rindex(e) => Builtin::Rindex(Box::new(substitute_var_impl(
+            e,
+            var_name,
+            replacement,
+            mark_trackable,
+        ))),
+        Builtin::UpperIndex(e) => Builtin::UpperIndex(Box::new(substitute_var_impl(
+            e,
+            var_name,
+            replacement,
+            mark_trackable,
+        ))),
         Builtin::UpperIndexStream(stream, idx_expr) => Builtin::UpperIndexStream(
-            Box::new(substitute_var(stream, var_name, replacement)),
-            Box::new(substitute_var(idx_expr, var_name, replacement)),
+            Box::new(substitute_var_impl(
+                stream,
+                var_name,
+                replacement,
+                mark_trackable,
+            )),
+            Box::new(substitute_var_impl(
+                idx_expr,
+                var_name,
+                replacement,
+                mark_trackable,
+            )),
         ),
         Builtin::ToJsonStream => Builtin::ToJsonStream,
         Builtin::FromJsonStream => Builtin::FromJsonStream,
         Builtin::ToStream => Builtin::ToStream,
-        Builtin::FromStream(e) => {
-            Builtin::FromStream(Box::new(substitute_var(e, var_name, replacement)))
-        }
-        Builtin::TruncateStream(e) => {
-            Builtin::TruncateStream(Box::new(substitute_var(e, var_name, replacement)))
-        }
-        Builtin::GetPath(e) => Builtin::GetPath(Box::new(substitute_var(e, var_name, replacement))),
+        Builtin::FromStream(e) => Builtin::FromStream(Box::new(substitute_var_impl(
+            e,
+            var_name,
+            replacement,
+            mark_trackable,
+        ))),
+        Builtin::TruncateStream(e) => Builtin::TruncateStream(Box::new(substitute_var_impl(
+            e,
+            var_name,
+            replacement,
+            mark_trackable,
+        ))),
+        Builtin::GetPath(e) => Builtin::GetPath(Box::new(substitute_var_impl(
+            e,
+            var_name,
+            replacement,
+            mark_trackable,
+        ))),
         // Phase 16: Regex Functions
         Builtin::TestFlags(re, flags) => Builtin::TestFlags(
-            Box::new(substitute_var(re, var_name, replacement)),
-            Box::new(substitute_var(flags, var_name, replacement)),
+            Box::new(substitute_var_impl(
+                re,
+                var_name,
+                replacement,
+                mark_trackable,
+            )),
+            Box::new(substitute_var_impl(
+                flags,
+                var_name,
+                replacement,
+                mark_trackable,
+            )),
         ),
-        Builtin::Match(re) => Builtin::Match(Box::new(substitute_var(re, var_name, replacement))),
+        Builtin::Match(re) => Builtin::Match(Box::new(substitute_var_impl(
+            re,
+            var_name,
+            replacement,
+            mark_trackable,
+        ))),
         Builtin::MatchFlags(re, flags) => Builtin::MatchFlags(
-            Box::new(substitute_var(re, var_name, replacement)),
-            Box::new(substitute_var(flags, var_name, replacement)),
+            Box::new(substitute_var_impl(
+                re,
+                var_name,
+                replacement,
+                mark_trackable,
+            )),
+            Box::new(substitute_var_impl(
+                flags,
+                var_name,
+                replacement,
+                mark_trackable,
+            )),
         ),
-        Builtin::Capture(re) => {
-            Builtin::Capture(Box::new(substitute_var(re, var_name, replacement)))
-        }
+        Builtin::Capture(re) => Builtin::Capture(Box::new(substitute_var_impl(
+            re,
+            var_name,
+            replacement,
+            mark_trackable,
+        ))),
         Builtin::CaptureFlags(re, flags) => Builtin::CaptureFlags(
-            Box::new(substitute_var(re, var_name, replacement)),
-            Box::new(substitute_var(flags, var_name, replacement)),
+            Box::new(substitute_var_impl(
+                re,
+                var_name,
+                replacement,
+                mark_trackable,
+            )),
+            Box::new(substitute_var_impl(
+                flags,
+                var_name,
+                replacement,
+                mark_trackable,
+            )),
         ),
         Builtin::Sub(re, repl) => Builtin::Sub(
-            Box::new(substitute_var(re, var_name, replacement)),
-            Box::new(substitute_var(repl, var_name, replacement)),
+            Box::new(substitute_var_impl(
+                re,
+                var_name,
+                replacement,
+                mark_trackable,
+            )),
+            Box::new(substitute_var_impl(
+                repl,
+                var_name,
+                replacement,
+                mark_trackable,
+            )),
         ),
         Builtin::SubFlags(re, repl, flags) => Builtin::SubFlags(
-            Box::new(substitute_var(re, var_name, replacement)),
-            Box::new(substitute_var(repl, var_name, replacement)),
-            Box::new(substitute_var(flags, var_name, replacement)),
+            Box::new(substitute_var_impl(
+                re,
+                var_name,
+                replacement,
+                mark_trackable,
+            )),
+            Box::new(substitute_var_impl(
+                repl,
+                var_name,
+                replacement,
+                mark_trackable,
+            )),
+            Box::new(substitute_var_impl(
+                flags,
+                var_name,
+                replacement,
+                mark_trackable,
+            )),
         ),
         Builtin::Gsub(re, repl) => Builtin::Gsub(
-            Box::new(substitute_var(re, var_name, replacement)),
-            Box::new(substitute_var(repl, var_name, replacement)),
+            Box::new(substitute_var_impl(
+                re,
+                var_name,
+                replacement,
+                mark_trackable,
+            )),
+            Box::new(substitute_var_impl(
+                repl,
+                var_name,
+                replacement,
+                mark_trackable,
+            )),
         ),
         Builtin::GsubFlags(re, repl, flags) => Builtin::GsubFlags(
-            Box::new(substitute_var(re, var_name, replacement)),
-            Box::new(substitute_var(repl, var_name, replacement)),
-            Box::new(substitute_var(flags, var_name, replacement)),
+            Box::new(substitute_var_impl(
+                re,
+                var_name,
+                replacement,
+                mark_trackable,
+            )),
+            Box::new(substitute_var_impl(
+                repl,
+                var_name,
+                replacement,
+                mark_trackable,
+            )),
+            Box::new(substitute_var_impl(
+                flags,
+                var_name,
+                replacement,
+                mark_trackable,
+            )),
         ),
-        Builtin::Scan(re) => Builtin::Scan(Box::new(substitute_var(re, var_name, replacement))),
+        Builtin::Scan(re) => Builtin::Scan(Box::new(substitute_var_impl(
+            re,
+            var_name,
+            replacement,
+            mark_trackable,
+        ))),
         Builtin::ScanFlags(re, flags) => Builtin::ScanFlags(
-            Box::new(substitute_var(re, var_name, replacement)),
-            Box::new(substitute_var(flags, var_name, replacement)),
+            Box::new(substitute_var_impl(
+                re,
+                var_name,
+                replacement,
+                mark_trackable,
+            )),
+            Box::new(substitute_var_impl(
+                flags,
+                var_name,
+                replacement,
+                mark_trackable,
+            )),
         ),
         Builtin::SplitRegex(re, flags) => Builtin::SplitRegex(
-            Box::new(substitute_var(re, var_name, replacement)),
-            Box::new(substitute_var(flags, var_name, replacement)),
+            Box::new(substitute_var_impl(
+                re,
+                var_name,
+                replacement,
+                mark_trackable,
+            )),
+            Box::new(substitute_var_impl(
+                flags,
+                var_name,
+                replacement,
+                mark_trackable,
+            )),
         ),
-        Builtin::Splits(re) => Builtin::Splits(Box::new(substitute_var(re, var_name, replacement))),
+        Builtin::Splits(re) => Builtin::Splits(Box::new(substitute_var_impl(
+            re,
+            var_name,
+            replacement,
+            mark_trackable,
+        ))),
         Builtin::SplitsFlags(re, flags) => Builtin::SplitsFlags(
-            Box::new(substitute_var(re, var_name, replacement)),
-            Box::new(substitute_var(flags, var_name, replacement)),
+            Box::new(substitute_var_impl(
+                re,
+                var_name,
+                replacement,
+                mark_trackable,
+            )),
+            Box::new(substitute_var_impl(
+                flags,
+                var_name,
+                replacement,
+                mark_trackable,
+            )),
         ),
         // Phase 8 builtins
         Builtin::Recurse => Builtin::Recurse,
-        Builtin::RecurseF(f) => {
-            Builtin::RecurseF(Box::new(substitute_var(f, var_name, replacement)))
-        }
+        Builtin::RecurseF(f) => Builtin::RecurseF(Box::new(substitute_var_impl(
+            f,
+            var_name,
+            replacement,
+            mark_trackable,
+        ))),
         Builtin::RecurseCond(f, c) => Builtin::RecurseCond(
-            Box::new(substitute_var(f, var_name, replacement)),
-            Box::new(substitute_var(c, var_name, replacement)),
+            Box::new(substitute_var_impl(
+                f,
+                var_name,
+                replacement,
+                mark_trackable,
+            )),
+            Box::new(substitute_var_impl(
+                c,
+                var_name,
+                replacement,
+                mark_trackable,
+            )),
         ),
-        Builtin::Walk(f) => Builtin::Walk(Box::new(substitute_var(f, var_name, replacement))),
-        Builtin::IsValid(e) => Builtin::IsValid(Box::new(substitute_var(e, var_name, replacement))),
+        Builtin::Walk(f) => Builtin::Walk(Box::new(substitute_var_impl(
+            f,
+            var_name,
+            replacement,
+            mark_trackable,
+        ))),
+        Builtin::IsValid(e) => Builtin::IsValid(Box::new(substitute_var_impl(
+            e,
+            var_name,
+            replacement,
+            mark_trackable,
+        ))),
         // Phase 10 builtins
-        Builtin::Path(e) => Builtin::Path(Box::new(substitute_var(e, var_name, replacement))),
+        Builtin::Path(e) => Builtin::Path(Box::new(substitute_var_impl(
+            e,
+            var_name,
+            replacement,
+            mark_trackable,
+        ))),
         Builtin::PathNoArg => Builtin::PathNoArg,
         Builtin::Parent => Builtin::Parent,
-        Builtin::ParentN(e) => Builtin::ParentN(Box::new(substitute_var(e, var_name, replacement))),
+        Builtin::ParentN(e) => Builtin::ParentN(Box::new(substitute_var_impl(
+            e,
+            var_name,
+            replacement,
+            mark_trackable,
+        ))),
         Builtin::Paths => Builtin::Paths,
-        Builtin::PathsFilter(e) => {
-            Builtin::PathsFilter(Box::new(substitute_var(e, var_name, replacement)))
-        }
+        Builtin::PathsFilter(e) => Builtin::PathsFilter(Box::new(substitute_var_impl(
+            e,
+            var_name,
+            replacement,
+            mark_trackable,
+        ))),
         Builtin::LeafPaths => Builtin::LeafPaths,
         Builtin::SetPath(p, v) => Builtin::SetPath(
-            Box::new(substitute_var(p, var_name, replacement)),
-            Box::new(substitute_var(v, var_name, replacement)),
+            Box::new(substitute_var_impl(
+                p,
+                var_name,
+                replacement,
+                mark_trackable,
+            )),
+            Box::new(substitute_var_impl(
+                v,
+                var_name,
+                replacement,
+                mark_trackable,
+            )),
         ),
-        Builtin::DelPaths(e) => {
-            Builtin::DelPaths(Box::new(substitute_var(e, var_name, replacement)))
-        }
+        Builtin::DelPaths(e) => Builtin::DelPaths(Box::new(substitute_var_impl(
+            e,
+            var_name,
+            replacement,
+            mark_trackable,
+        ))),
         Builtin::Floor => Builtin::Floor,
         Builtin::Ceil => Builtin::Ceil,
         Builtin::Round => Builtin::Round,
@@ -17573,8 +18366,18 @@ fn substitute_var_in_builtin(
         Builtin::Exp10 => Builtin::Exp10,
         Builtin::Exp2 => Builtin::Exp2,
         Builtin::Pow(x, y) => Builtin::Pow(
-            Box::new(substitute_var(x, var_name, replacement)),
-            Box::new(substitute_var(y, var_name, replacement)),
+            Box::new(substitute_var_impl(
+                x,
+                var_name,
+                replacement,
+                mark_trackable,
+            )),
+            Box::new(substitute_var_impl(
+                y,
+                var_name,
+                replacement,
+                mark_trackable,
+            )),
         ),
         Builtin::Sin => Builtin::Sin,
         Builtin::Cos => Builtin::Cos,
@@ -17583,8 +18386,18 @@ fn substitute_var_in_builtin(
         Builtin::Acos => Builtin::Acos,
         Builtin::Atan => Builtin::Atan,
         Builtin::Atan2(x, y) => Builtin::Atan2(
-            Box::new(substitute_var(x, var_name, replacement)),
-            Box::new(substitute_var(y, var_name, replacement)),
+            Box::new(substitute_var_impl(
+                x,
+                var_name,
+                replacement,
+                mark_trackable,
+            )),
+            Box::new(substitute_var_impl(
+                y,
+                var_name,
+                replacement,
+                mark_trackable,
+            )),
         ),
         Builtin::Sinh => Builtin::Sinh,
         Builtin::Cosh => Builtin::Cosh,
@@ -17599,17 +18412,28 @@ fn substitute_var_in_builtin(
         Builtin::IsNormal => Builtin::IsNormal,
         Builtin::IsFinite => Builtin::IsFinite,
         Builtin::Debug => Builtin::Debug,
-        Builtin::DebugMsg(e) => {
-            Builtin::DebugMsg(Box::new(substitute_var(e, var_name, replacement)))
-        }
+        Builtin::DebugMsg(e) => Builtin::DebugMsg(Box::new(substitute_var_impl(
+            e,
+            var_name,
+            replacement,
+            mark_trackable,
+        ))),
         Builtin::Halt => Builtin::Halt,
         Builtin::Stderr => Builtin::Stderr,
         Builtin::HaltError => Builtin::HaltError,
-        Builtin::HaltErrorCode(e) => {
-            Builtin::HaltErrorCode(Box::new(substitute_var(e, var_name, replacement)))
-        }
+        Builtin::HaltErrorCode(e) => Builtin::HaltErrorCode(Box::new(substitute_var_impl(
+            e,
+            var_name,
+            replacement,
+            mark_trackable,
+        ))),
         Builtin::Env => Builtin::Env,
-        Builtin::EnvVar(e) => Builtin::EnvVar(Box::new(substitute_var(e, var_name, replacement))),
+        Builtin::EnvVar(e) => Builtin::EnvVar(Box::new(substitute_var_impl(
+            e,
+            var_name,
+            replacement,
+            mark_trackable,
+        ))),
         Builtin::EnvObject(name) => Builtin::EnvObject(name.clone()),
         Builtin::StrEnv(name) => Builtin::StrEnv(name.clone()),
         Builtin::NullLit => Builtin::NullLit,
@@ -17617,12 +18441,30 @@ fn substitute_var_in_builtin(
         Builtin::Ltrim => Builtin::Ltrim,
         Builtin::Rtrim => Builtin::Rtrim,
         Builtin::Transpose => Builtin::Transpose,
-        Builtin::BSearch(e) => Builtin::BSearch(Box::new(substitute_var(e, var_name, replacement))),
-        Builtin::ModuleMeta(e) => {
-            Builtin::ModuleMeta(Box::new(substitute_var(e, var_name, replacement)))
-        }
-        Builtin::Pick(e) => Builtin::Pick(Box::new(substitute_var(e, var_name, replacement))),
-        Builtin::Omit(e) => Builtin::Omit(Box::new(substitute_var(e, var_name, replacement))),
+        Builtin::BSearch(e) => Builtin::BSearch(Box::new(substitute_var_impl(
+            e,
+            var_name,
+            replacement,
+            mark_trackable,
+        ))),
+        Builtin::ModuleMeta(e) => Builtin::ModuleMeta(Box::new(substitute_var_impl(
+            e,
+            var_name,
+            replacement,
+            mark_trackable,
+        ))),
+        Builtin::Pick(e) => Builtin::Pick(Box::new(substitute_var_impl(
+            e,
+            var_name,
+            replacement,
+            mark_trackable,
+        ))),
+        Builtin::Omit(e) => Builtin::Omit(Box::new(substitute_var_impl(
+            e,
+            var_name,
+            replacement,
+            mark_trackable,
+        ))),
         Builtin::Tag => Builtin::Tag,
         Builtin::Anchor => Builtin::Anchor,
         Builtin::Style => Builtin::Style,
@@ -17636,7 +18478,12 @@ fn substitute_var_in_builtin(
         Builtin::Shuffle => Builtin::Shuffle,
         Builtin::Pivot => Builtin::Pivot,
         Builtin::SplitDoc => Builtin::SplitDoc,
-        Builtin::Del(e) => Builtin::Del(Box::new(substitute_var(e, var_name, replacement))),
+        Builtin::Del(e) => Builtin::Del(Box::new(substitute_var_impl(
+            e,
+            var_name,
+            replacement,
+            mark_trackable,
+        ))),
         // Phase 12 builtins (no args to substitute)
         Builtin::Now => Builtin::Now,
         Builtin::Input => Builtin::Input,
@@ -17648,32 +18495,69 @@ fn substitute_var_in_builtin(
         Builtin::Finites => Builtin::Finites,
         // Phase 13: Iteration control
         Builtin::Limit(n, e) => Builtin::Limit(
-            Box::new(substitute_var(n, var_name, replacement)),
-            Box::new(substitute_var(e, var_name, replacement)),
+            Box::new(substitute_var_impl(
+                n,
+                var_name,
+                replacement,
+                mark_trackable,
+            )),
+            Box::new(substitute_var_impl(
+                e,
+                var_name,
+                replacement,
+                mark_trackable,
+            )),
         ),
-        Builtin::FirstStream(e) => {
-            Builtin::FirstStream(Box::new(substitute_var(e, var_name, replacement)))
-        }
-        Builtin::LastStream(e) => {
-            Builtin::LastStream(Box::new(substitute_var(e, var_name, replacement)))
-        }
+        Builtin::FirstStream(e) => Builtin::FirstStream(Box::new(substitute_var_impl(
+            e,
+            var_name,
+            replacement,
+            mark_trackable,
+        ))),
+        Builtin::LastStream(e) => Builtin::LastStream(Box::new(substitute_var_impl(
+            e,
+            var_name,
+            replacement,
+            mark_trackable,
+        ))),
         Builtin::NthStream(n, e) => Builtin::NthStream(
-            Box::new(substitute_var(n, var_name, replacement)),
-            Box::new(substitute_var(e, var_name, replacement)),
+            Box::new(substitute_var_impl(
+                n,
+                var_name,
+                replacement,
+                mark_trackable,
+            )),
+            Box::new(substitute_var_impl(
+                e,
+                var_name,
+                replacement,
+                mark_trackable,
+            )),
         ),
-        Builtin::IsEmpty(e) => Builtin::IsEmpty(Box::new(substitute_var(e, var_name, replacement))),
+        Builtin::IsEmpty(e) => Builtin::IsEmpty(Box::new(substitute_var_impl(
+            e,
+            var_name,
+            replacement,
+            mark_trackable,
+        ))),
         // Phase 14: Recursive traversal (extends Phase 8)
         Builtin::RecurseDown => Builtin::RecurseDown,
         // Phase 15: Date/Time functions
         Builtin::Gmtime => Builtin::Gmtime,
         Builtin::Localtime => Builtin::Localtime,
         Builtin::Mktime => Builtin::Mktime,
-        Builtin::Strftime(e) => {
-            Builtin::Strftime(Box::new(substitute_var(e, var_name, replacement)))
-        }
-        Builtin::Strptime(e) => {
-            Builtin::Strptime(Box::new(substitute_var(e, var_name, replacement)))
-        }
+        Builtin::Strftime(e) => Builtin::Strftime(Box::new(substitute_var_impl(
+            e,
+            var_name,
+            replacement,
+            mark_trackable,
+        ))),
+        Builtin::Strptime(e) => Builtin::Strptime(Box::new(substitute_var_impl(
+            e,
+            var_name,
+            replacement,
+            mark_trackable,
+        ))),
         Builtin::Todate => Builtin::Todate,
         Builtin::Fromdate => Builtin::Fromdate,
         Builtin::Todateiso8601 => Builtin::Todateiso8601,
@@ -17681,9 +18565,12 @@ fn substitute_var_in_builtin(
 
         // Phase 17: Combinations
         Builtin::Combinations => Builtin::Combinations,
-        Builtin::CombinationsN(e) => {
-            Builtin::CombinationsN(Box::new(substitute_var(e, var_name, replacement)))
-        }
+        Builtin::CombinationsN(e) => Builtin::CombinationsN(Box::new(substitute_var_impl(
+            e,
+            var_name,
+            replacement,
+            mark_trackable,
+        ))),
 
         // Phase 18: Additional math functions
         Builtin::Trunc => Builtin::Trunc,
@@ -17693,25 +18580,58 @@ fn substitute_var_in_builtin(
 
         // Phase 20: Iteration control extension
         Builtin::Skip(n, e) => Builtin::Skip(
-            Box::new(substitute_var(n, var_name, replacement)),
-            Box::new(substitute_var(e, var_name, replacement)),
+            Box::new(substitute_var_impl(
+                n,
+                var_name,
+                replacement,
+                mark_trackable,
+            )),
+            Box::new(substitute_var_impl(
+                e,
+                var_name,
+                replacement,
+                mark_trackable,
+            )),
         ),
 
         // Phase 21: Extended Date/Time functions (yq)
         Builtin::FromUnix => Builtin::FromUnix,
         Builtin::ToUnix => Builtin::ToUnix,
-        Builtin::Tz(e) => Builtin::Tz(Box::new(substitute_var(e, var_name, replacement))),
+        Builtin::Tz(e) => Builtin::Tz(Box::new(substitute_var_impl(
+            e,
+            var_name,
+            replacement,
+            mark_trackable,
+        ))),
 
         // Phase 22: File operations (yq)
-        Builtin::Load(e) => Builtin::Load(Box::new(substitute_var(e, var_name, replacement))),
+        Builtin::Load(e) => Builtin::Load(Box::new(substitute_var_impl(
+            e,
+            var_name,
+            replacement,
+            mark_trackable,
+        ))),
 
         // Phase 23: Position-based navigation (succinctly extension)
-        Builtin::AtOffset(e) => {
-            Builtin::AtOffset(Box::new(substitute_var(e, var_name, replacement)))
-        }
+        Builtin::AtOffset(e) => Builtin::AtOffset(Box::new(substitute_var_impl(
+            e,
+            var_name,
+            replacement,
+            mark_trackable,
+        ))),
         Builtin::AtPosition(line, col) => Builtin::AtPosition(
-            Box::new(substitute_var(line, var_name, replacement)),
-            Box::new(substitute_var(col, var_name, replacement)),
+            Box::new(substitute_var_impl(
+                line,
+                var_name,
+                replacement,
+                mark_trackable,
+            )),
+            Box::new(substitute_var_impl(
+                col,
+                var_name,
+                replacement,
+                mark_trackable,
+            )),
         ),
     }
 }
@@ -17802,8 +18722,19 @@ fn eval_as<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // For each bound value, substitute and evaluate the body
     let mut all_results: Vec<OwnedValue> = Vec::new();
 
+    // #844: only a statically-verified passthrough of `.` is even a
+    // candidate for path()-trackability through this binding -- see
+    // `is_identity_passthrough`'s own doc comment. `resolve_node`'s
+    // `Expr::TrackedVar` arm still gates the actual trackability decision
+    // at use time, so wrapping here never risks emitting a wrong path.
+    let wrap_tracked = is_identity_passthrough(expr);
+
     for bound_val in bound_values {
-        let substituted_body = substitute_var(body, var, &bound_val);
+        let substituted_body = if wrap_tracked {
+            substitute_var_tracked(body, var, &bound_val)
+        } else {
+            substitute_var(body, var, &bound_val)
+        };
         match eval_single::<W, S>(&substituted_body, value.clone(), optional).materialize_cursor() {
             QueryResult::One(v) => all_results.push(to_owned(&v)),
             QueryResult::OneCursor(_) => unreachable!(),
@@ -28662,6 +29593,10 @@ fn expand_func_calls(
         ),
         Expr::Format(f) => Expr::Format(f.clone()),
         Expr::Var(v) => Expr::Var(v.clone()),
+        // Never produced by the parser or by `def` inlining -- only by
+        // variable substitution during evaluation, which runs after this
+        // pass. Trivial pass-through kept for exhaustiveness (#844).
+        Expr::TrackedVar(v) => Expr::TrackedVar(v.clone()),
         Expr::Loc { line } => Expr::Loc { line: *line },
         Expr::Env => Expr::Env,
         Expr::As {
@@ -29062,6 +29997,10 @@ fn substitute_func_param(expr: &Expr, param: &str, arg: &Expr) -> Expr {
         // A variable reference to the parameter becomes the argument expression
         Expr::Var(name) if name == param => arg.clone(),
         Expr::Var(_) => expr.clone(),
+        // Never produced by the parser or by `def` inlining -- only by
+        // variable substitution during evaluation, which runs after this
+        // pass. Trivial pass-through kept for exhaustiveness (#844).
+        Expr::TrackedVar(v) => Expr::TrackedVar(v.clone()),
         Expr::Loc { line } => Expr::Loc { line: *line },
         Expr::Env => Expr::Env,
         Expr::Identity => Expr::Identity,

@@ -415,6 +415,7 @@ fn rewrite_namespaced_calls(expr: Expr) -> Expr {
         | Expr::RecursiveDescent
         | Expr::Literal(_)
         | Expr::Var(_)
+        | Expr::TrackedVar(_)
         | Expr::Loc { .. }
         | Expr::Env
         | Expr::Not
