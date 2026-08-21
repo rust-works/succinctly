@@ -9950,6 +9950,40 @@ mod tests {
         }
     }
 
+    /// #999 review: `to_owned_canonicalized_numbers_at_depth`'s `as_i64`/
+    /// `as_f64` fallback arms (reached when `number_literal()` returns
+    /// `None`) looked unreachable via JSON at first glance -- but the
+    /// semi-index scanner accepts a *wider* set of number spans than
+    /// `is_valid_number`'s strict RFC 8259 check (#966's own doc comment on
+    /// `number_literal()`), and `as_i64`/`as_f64` parse that same raw span
+    /// with Rust's own, more lenient `str::parse`. A trailing- or
+    /// leading-dot span (`5.`, `.5`) is exactly that: RFC 8259 requires a
+    /// digit on both sides of the decimal point, so `is_valid_number`
+    /// rejects it and `number_literal()` returns `None` -- but Rust's
+    /// `f64::from_str` accepts both forms outright, so `as_f64` succeeds
+    /// where the strict path declined. Confirmed live (`succinctly yq
+    /// --input-format json 'to_entries'`) before writing this as a unit
+    /// test: real yq itself has no opinion here (Go's own JSON reader
+    /// rejects both spans as a parse error, unlike this crate's lenient
+    /// semi-indexer), so this pins *this* crate's own accepted behavior,
+    /// not an oracle-matched one.
+    #[test]
+    fn to_owned_canonicalized_numbers_falls_back_to_as_f64_for_lenient_spans() {
+        for json in [br#"{"n": 5.}"#.as_slice(), br#"{"n": .5}"#.as_slice()] {
+            let index = JsonIndex::build(json);
+            let cursor = index.root(json);
+            let owned = to_owned_canonicalized_numbers(&cursor.value());
+            let OwnedValue::Object(map) = owned else {
+                panic!("expected an object for {json:?}")
+            };
+            assert!(
+                matches!(map.get("n"), Some(OwnedValue::Float(_))),
+                "expected a Float for {json:?}, got {:?}",
+                map.get("n")
+            );
+        }
+    }
+
     /// #1192: unlike `to_owned`/`to_owned_cursor` (this file, still silently
     /// degrading to `OwnedValue::Null` -- see
     /// `test_to_owned_degrades_to_null_on_string_decode_failure_1098` above)
