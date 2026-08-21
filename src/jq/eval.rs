@@ -19976,27 +19976,51 @@ fn set_value_at_path(
             // jq reads a string slice but will not write one back -- but
             // that refusal is only correct once the slice itself *is* the
             // write. A chained path with more path after the slice
-            // (`rest` non-empty) needs the read-through substring handed
-            // to the recursive call instead, so *that* navigation's own
-            // outcome is the answer, not this refusal (#1338, mirroring
-            // #1321's identical `terminal_write` distinction in
-            // `through_slice` -- confirmed live:
+            // (`rest` non-empty) needs *that* continuation's own
+            // navigation to be the answer instead, not this refusal
+            // (#1338, mirroring #1321's identical `terminal_write`
+            // distinction in `through_slice` -- confirmed live:
             // `"hello" | setpath([{"start":0,"end":1},"b"]; 5)` matches
             // real jq's "Cannot index string with string \"b\"", not this
-            // refusal). A `String` value can never be indexed by any key
-            // type in this function's own dispatch -- every arm below
-            // either narrows to `Object`/`Array`/`Null` or falls to a
-            // catch-all `Err` -- so the recursive call always errors in
-            // practice; forwarded directly via `return`, with no `Ok` case
-            // to design a synthetic return value for.
-            if let OwnedValue::String(s) = &value {
+            // refusal).
+            //
+            // A `String` value can never be indexed by any key type in
+            // this function's own dispatch -- every arm below either
+            // narrows to `Object`/`Array`/`Null` or falls to a catch-all
+            // `Err` -- so *every* continuation of a string-sliced target
+            // ends in an error, fully determined by `rest`'s own
+            // structure alone. Found this out by first writing the
+            // obvious version -- read the actual substring, recurse into
+            // it, forward the result -- and having code review catch
+            // that it stack-overflows on a long chain of slice
+            // descriptors (recursion depth scales with `rest.len()`,
+            // unbounded) while also burning O(chain length x string
+            // length) time/memory materializing substrings nothing ever
+            // reads, since every one of them was destined to error
+            // anyway. This walks `rest` with a plain loop instead --
+            // O(remaining slice-descriptor count), no recursion, no
+            // substring ever built -- to find the exact same error the
+            // real read-through-and-recurse would have, without paying
+            // for it.
+            if matches!(value, OwnedValue::String(_)) {
                 if rest.is_empty() {
                     return Err(EvalError::cannot_update_string_slices());
                 }
-                let len = s.chars().count();
-                let range = bounds.resolve(len);
-                let sub = OwnedValue::String(slice::slice_str(s, range));
-                return set_value_at_path(sub, rest, new_val);
+                for next_key in rest {
+                    let OwnedValue::Object(desc) = next_key else {
+                        return Err(EvalError::cannot_index("string", next_key));
+                    };
+                    // Validates this key's own descriptor exactly as the
+                    // real recursive walk would have, one level deeper --
+                    // a malformed one still errors here, before ever
+                    // reaching the "cannot index a string" question.
+                    SliceBounds::from_descriptor(desc)?;
+                }
+                // Every remaining key was itself a well-formed slice
+                // descriptor with nothing else to disqualify it; the last
+                // one is a terminal write against the (never-materialized)
+                // sliced substring.
+                return Err(EvalError::cannot_update_string_slices());
             }
             // jq reads the child with `jv_get` before recursing, and a `null`
             // root reads as `null` rather than as an empty array — which is
@@ -37453,6 +37477,60 @@ mod tests {
                 br"[[1,2,3],[4,5,6]]",
                 r#"setpath([{"start":0,"end":1},0,0]; 99)"#,
                 Ok("[[99,2,3],[4,5,6]]"),
+            ),
+        ]);
+    }
+
+    /// #1338 follow-up: `set_value_at_path`'s first fix for the mid-chain
+    /// case above read the sliced substring and *recursed* into it to find
+    /// the continuation's error -- recursion depth scales with the number
+    /// of chained slice descriptors, unbounded, so a long enough chain
+    /// overflowed the stack (confirmed via a real crash before this test
+    /// existed). The current implementation walks `rest` with a plain
+    /// loop instead, so this must complete in bounded, non-recursive
+    /// space regardless of chain length -- 200k descriptors is comfortably
+    /// past where the old recursive version would have already crashed.
+    #[test]
+    fn test_setpath_string_slice_long_chain_does_not_overflow_the_stack_1338() {
+        let path: Vec<OwnedValue> = std::iter::repeat_with(|| {
+            let mut desc = IndexMap::new();
+            desc.insert("start".to_string(), OwnedValue::Int(0));
+            desc.insert("end".to_string(), OwnedValue::Int(1));
+            OwnedValue::Object(desc)
+        })
+        .take(200_000)
+        .collect();
+
+        let result = set_value_at_path(
+            OwnedValue::String("hello".into()),
+            &path,
+            OwnedValue::Int(5),
+        );
+
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "Cannot update string slices"
+        );
+    }
+
+    /// #1338: `setpath()`'s mid-chain string-slice error must agree with
+    /// its `=`/`|=` equivalent (`.a[0:1].b = v`, `through_slice`'s own
+    /// `terminal_write` distinction) — the same shared-case-table
+    /// discipline #486's autovivification test above established, so
+    /// `set_value_at_path` and `through_slice` can't silently drift apart
+    /// on this error message the way the original bug already did once.
+    #[test]
+    fn test_setpath_agrees_with_assign_on_mid_chain_string_slice_error_1338() {
+        assert_outcomes(&[
+            (
+                br#"{"a":"hello"}"#,
+                ".a[0:1].b = 5",
+                Err(r#"Cannot index string with string "b""#),
+            ),
+            (
+                br#"{"a":"hello"}"#,
+                r#".a |= setpath([{"start":0,"end":1},"b"]; 5)"#,
+                Err(r#"Cannot index string with string "b""#),
             ),
         ]);
     }
