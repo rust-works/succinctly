@@ -10876,12 +10876,16 @@ fn yq_assign_is_total_noop(path: &Expr, root: &OwnedValue) -> bool {
         return false;
     }
     match navigate_read_only(root, prefix) {
-        Some(parent) => is_yq_field_index_noop_scalar(parent),
-        // An absent prefix (missing field/out-of-range index) isn't this
-        // predicate's case at all -- defer to the normal RHS evaluation
-        // and let `set_path`'s own existing `get_path_mut` report whatever
-        // it reports for a genuinely missing path.
-        None => false,
+        PrefixNavOutcome::Resolved(parent) => is_yq_field_index_noop_scalar(parent),
+        // A scalar hit mid-prefix is a no-op regardless of what the
+        // terminal component was going to do (#1232) -- the scalar can't
+        // become a container no matter how much further path is left.
+        PrefixNavOutcome::HitScalar => true,
+        // An absent prefix (missing field/out-of-range index/`Null`) isn't
+        // this predicate's case at all -- defer to the normal RHS
+        // evaluation and let `set_path`'s own existing `get_path_mut`
+        // report whatever it reports for a genuinely missing path.
+        PrefixNavOutcome::Absent => false,
     }
 }
 
@@ -11111,7 +11115,10 @@ fn yq_del_slice_outcome(
     // is the only remaining reason to defer to `delete_at_path`'s own
     // absent-path handling instead.
     let prefix_components: Vec<Expr> = prefix.iter().map(|s| s.component.clone()).collect();
-    if navigate_read_only(root, &prefix_components).is_none() {
+    if !matches!(
+        navigate_read_only(root, &prefix_components),
+        PrefixNavOutcome::Resolved(_)
+    ) {
         return YqDelSliceOutcome::NotApplicable;
     }
     let wrap = |s: &DeleteStep| {
@@ -11127,23 +11134,56 @@ fn yq_del_slice_outcome(
     })
 }
 
-/// Read-only navigation for [`yq_del_slice_outcome`]'s prefix
-/// peek. Unlike `get_path_mut`, never autovivifies (a peek must not create
-/// structure the delete itself would otherwise leave untouched) and simply
-/// returns `None` for anything it can't resolve — a missing field, an
-/// out-of-bounds index, a wrong container type (including `Null`), or a
-/// step shape that can't appear in a resolved path's prefix before its own
-/// trailing slice. The caller treats `None` as "this rule doesn't apply,"
-/// deferring to `delete_at_path`'s own already-correct del()-through-absent
-/// handling rather than duplicating it here.
-fn navigate_read_only<'a>(root: &'a OwnedValue, steps: &[Expr]) -> Option<&'a OwnedValue> {
+/// Outcome of [`navigate_read_only`]'s prefix walk.
+///
+/// Three-way rather than [`navigate_read_only`]'s old binary `Option`
+/// (#1232): a step that can't continue splits into two outcomes real yq
+/// treats completely differently. Hitting a genuine scalar (`is_yq_field_
+/// index_noop_scalar`) while trying to `Field`/`Index` into it is a
+/// transitively-permanent no-op — the scalar never becomes a container no
+/// matter what the rest of the path was going to do, matching
+/// `get_path_mut`'s own post-#1232 `Field`/`Index` arms. A missing object
+/// key, an out-of-range array index, or `Null` (autovivifies), by contrast,
+/// is not settled at all — `get_path_mut` autovivifies straight through
+/// those and keeps going. Collapsing both into one `None` was exactly the
+/// gap #1232 found: `yq_assign_is_total_noop` (the only caller that cares
+/// about the distinction) treated a mid-prefix scalar hit the same as an
+/// unresolved parent, deferring to normal RHS evaluation and letting
+/// `.a.b.c = error("boom")` on `a: 5` raise `boom` where real yq no-ops
+/// silently (RHS never runs) — live-verified against yq v4.53.3.
+enum PrefixNavOutcome<'a> {
+    /// Every prefix step navigated an existing value.
+    Resolved(&'a OwnedValue),
+    /// A step tried to index into a real, non-`Null` scalar.
+    HitScalar,
+    /// Missing key, out-of-range index, `Null`, or a container-type
+    /// mismatch (e.g. `Field` on an `Array`) — the real write either
+    /// autovivifies through it or genuinely errors; either way this isn't
+    /// a settled no-op.
+    Absent,
+}
+
+/// Read-only navigation shared by [`yq_del_slice_outcome`]'s prefix peek and
+/// [`yq_assign_is_total_noop`]'s pre-RHS-evaluation check. Unlike
+/// `get_path_mut`, never autovivifies (a peek must not create structure the
+/// caller's own real walker would otherwise leave untouched) — see
+/// [`PrefixNavOutcome`] for what each non-`Resolved` outcome means and why
+/// there are two of them. `yq_del_slice_outcome` doesn't need the
+/// distinction (`del()`'s own scalar-root behavior is a separate, unscoped
+/// gap — #1411) and folds `HitScalar` back into "this rule doesn't apply",
+/// same as it always treated `None`.
+fn navigate_read_only<'a>(root: &'a OwnedValue, steps: &[Expr]) -> PrefixNavOutcome<'a> {
     let mut current = root;
     for step in steps {
         let (step, _optional) = unwrap_path_component(step);
         current = match step {
             Expr::Field(name) => match current {
-                OwnedValue::Object(map) => map.get(name)?,
-                _ => return None,
+                OwnedValue::Object(map) => match map.get(name) {
+                    Some(v) => v,
+                    None => return PrefixNavOutcome::Absent,
+                },
+                _ if is_yq_field_index_noop_scalar(current) => return PrefixNavOutcome::HitScalar,
+                _ => return PrefixNavOutcome::Absent,
             },
             Expr::Index(idx) | Expr::IndexNumber { idx, .. } => match current {
                 OwnedValue::Array(arr) => {
@@ -11152,15 +11192,16 @@ fn navigate_read_only<'a>(root: &'a OwnedValue, steps: &[Expr]) -> Option<&'a Ow
                     if actual >= 0 && (actual as usize) < arr.len() {
                         &arr[actual as usize]
                     } else {
-                        return None;
+                        return PrefixNavOutcome::Absent;
                     }
                 }
-                _ => return None,
+                _ if is_yq_field_index_noop_scalar(current) => return PrefixNavOutcome::HitScalar,
+                _ => return PrefixNavOutcome::Absent,
             },
-            _ => return None,
+            _ => return PrefixNavOutcome::Absent,
         };
     }
-    Some(current)
+    PrefixNavOutcome::Resolved(current)
 }
 
 /// Apply a resolved slice directly to an owned value.
@@ -12056,7 +12097,7 @@ fn set_path(
             if exprs.len() == 1 {
                 set_path(root, &exprs[0], new_value, scalar_noop, container_noop)
             } else if let Some(split) = split_at_slice(exprs) {
-                match get_path_mut(root, &split.before)? {
+                match get_path_mut(root, &split.before, scalar_noop)? {
                     None => Ok(()),
                     Some(parent) => through_slice(
                         parent,
@@ -12082,7 +12123,7 @@ fn set_path(
                 let parent_path = &exprs[..exprs.len() - 1];
                 let last_path = &exprs[exprs.len() - 1];
 
-                match get_path_mut(root, parent_path)? {
+                match get_path_mut(root, parent_path, scalar_noop)? {
                     None => Ok(()),
                     Some(parent) => {
                         set_path(parent, last_path, new_value, scalar_noop, container_noop)
@@ -12546,6 +12587,7 @@ fn split_at_slice(exprs: &[Expr]) -> Option<SliceSplit> {
 fn get_path_mut<'a>(
     root: &'a mut OwnedValue,
     path_parts: &[Expr],
+    scalar_noop: bool,
 ) -> Result<Option<&'a mut OwnedValue>, EvalError> {
     let mut current = root;
     // A working copy, not a plain slice iteration: `resolve_node`'s `?` arm
@@ -12592,7 +12634,14 @@ fn get_path_mut<'a>(
                 autovivify_object(current);
                 if let OwnedValue::Object(map) = current {
                     map.entry(name.clone()).or_insert(OwnedValue::Null)
-                } else if optional {
+                } else if optional
+                    // #1232: same terminal-position no-op #1181 gave
+                    // `set_path`'s own `Field` arm, applied here so a scalar
+                    // hit *before* the last path component (`.a.b = 99` on a
+                    // scalar root) no-ops instead of erroring while still
+                    // navigating toward the parent.
+                    || (scalar_noop && is_yq_field_index_noop_scalar(current))
+                {
                     return Ok(None);
                 } else {
                     return Err(EvalError::cannot_index_with_field(
@@ -12611,7 +12660,7 @@ fn get_path_mut<'a>(
                     // returns that error for a component this function can
                     // itself elect to suppress.
                     write_index(arr, *idx)?
-                } else if optional {
+                } else if optional || (scalar_noop && is_yq_field_index_noop_scalar(current)) {
                     return Ok(None);
                 } else {
                     return Err(EvalError::cannot_index_with_type(
@@ -12782,7 +12831,15 @@ fn update_path<S: EvalSemantics>(
                         if let OwnedValue::Object(map) = root {
                             let current = map.entry(name.clone()).or_insert(OwnedValue::Null);
                             update_path::<S>(current, &rest, filter_expr, optional, scalar_noop)
-                        } else if here {
+                        } else if here
+                            // #1232: this mid-chain arm is a separately-
+                            // maintained copy of the terminal `Expr::Field`
+                            // arm above, which already gained the #1181
+                            // no-op check -- applied here too so a scalar hit
+                            // *before* the last path component (`.a.b |= 99`
+                            // on a scalar root) no-ops instead of erroring.
+                            || (S::TAG == EvalTag::Yq && is_yq_field_index_noop_scalar(root))
+                        {
                             Ok(())
                         } else {
                             Err(
@@ -12801,7 +12858,9 @@ fn update_path<S: EvalSemantics>(
                                 optional,
                                 scalar_noop,
                             )
-                        } else if here {
+                        } else if here
+                            || (S::TAG == EvalTag::Yq && is_yq_field_index_noop_scalar(root))
+                        {
                             Ok(())
                         } else {
                             Err(
@@ -12823,7 +12882,11 @@ fn update_path<S: EvalSemantics>(
                             }
                             Ok(())
                         }
-                        _ if here => Ok(()),
+                        _ if here
+                            || (S::TAG == EvalTag::Yq && is_yq_field_index_noop_scalar(root)) =>
+                        {
+                            Ok(())
+                        }
                         _ => Err(EvalError::cannot_iterate(root).into()),
                     },
                     // `resolve_node`'s `?` arm emits `Optional(Pipe([…]))`
@@ -44244,6 +44307,7 @@ mod tests {
         let slot = get_path_mut(
             &mut root,
             &[Expr::Field("a".to_string()), Expr::Field("b".to_string())],
+            false,
         )
         .unwrap()
         .unwrap();
@@ -47632,7 +47696,7 @@ mod tests {
         #[test]
         fn test_get_path_mut_refuses_an_unresolved_key() {
             let mut root = OwnedValue::Null;
-            let err = get_path_mut(&mut root, &[unresolved()]).unwrap_err();
+            let err = get_path_mut(&mut root, &[unresolved()], false).unwrap_err();
             assert_eq!(
                 err.message,
                 "internal error: unresolved computed index in path component"
@@ -47729,7 +47793,7 @@ mod tests {
         #[test]
         fn test_get_path_mut_refuses_an_unresolved_slice() {
             let mut root = OwnedValue::Null;
-            let err = get_path_mut(&mut root, &[unresolved()]).unwrap_err();
+            let err = get_path_mut(&mut root, &[unresolved()], false).unwrap_err();
             assert_eq!(
                 err.message,
                 "internal error: unresolved computed slice in path component"
