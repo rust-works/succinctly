@@ -11,7 +11,7 @@ use alloc::vec::Vec;
 #[cfg(test)]
 use std::collections::BTreeMap;
 
-use super::value::NumberRepr;
+use super::value::{NumberRepr, OwnedValue};
 
 /// A jq expression representing a query path.
 #[derive(Debug, Clone, PartialEq)]
@@ -262,6 +262,15 @@ pub enum Expr {
 
     /// Variable reference: `$x`
     Var(String),
+
+    /// A frozen variable snapshot, synthesized only by variable
+    /// substitution (`substitute_var_tracked`/`substitute_var_impl` in
+    /// `eval.rs`) to replace an `Expr::Var` reference whose bind source
+    /// was, at bind time, a pure passthrough of `.` -- never produced by
+    /// the parser. `resolve_node`'s own arm for this variant decides
+    /// path-trackability lazily, by comparing this snapshot against the
+    /// ambient value it holds at the point of use (#844).
+    TrackedVar(Box<OwnedValue>),
 
     /// Location reference: `$__loc__`
     /// Returns `{"file": "<stdin>", "line": N}` where N is the 1-based line number

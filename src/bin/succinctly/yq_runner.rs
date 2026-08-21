@@ -2840,6 +2840,7 @@ fn contains_split_doc(expr: &Expr) -> bool {
         | Expr::Not
         | Expr::Format(_)
         | Expr::Var(_)
+        | Expr::TrackedVar(_)
         | Expr::Loc { .. }
         | Expr::Env
         | Expr::Break(_)
