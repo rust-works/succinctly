@@ -12197,7 +12197,7 @@ fn test_self_recursive_def_rejects_past_expansion_depth_1016() -> Result<()> {
     )?;
     assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
     assert!(
-        stderr.contains("recursion depth exceeds limit of"),
+        stderr.contains("recursion depth exceeds limit of 50"),
         "stderr: {stderr:?}"
     );
     Ok(())
@@ -12224,6 +12224,42 @@ fn test_self_recursive_def_accepts_depth_under_limit_1016() -> Result<()> {
     Ok(())
 }
 
+/// Pins the exact boundary rather than just "well under"/"well over": for
+/// this single-argument shape, `deep(49)` is the largest `n` that succeeds
+/// and `deep(50)` is the first that fails -- confirmed live. A future
+/// change to the budget check (e.g. `>` instead of `>=`, or a shifted
+/// increment) would silently move this boundary by one with nothing to
+/// catch it if only the "well within"/"well past" tests above existed.
+#[test]
+fn test_self_recursive_def_boundary_is_exactly_49_1016() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            "def deep(n): if n == 0 then . else [deep(n-1)] end; deep(49)",
+        ],
+        Some("null"),
+    )?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(
+        stdout.trim_end(),
+        format!("{}null{}", "[".repeat(49), "]".repeat(49))
+    );
+
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            "def deep(n): if n == 0 then . else [deep(n-1)] end; deep(50)",
+        ],
+        Some("null"),
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert!(
+        stderr.contains("recursion depth exceeds limit of 50"),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
 /// A zero-argument self-recursive `def` (no growing argument expression to
 /// substitute) is the *cheapest possible* case for `expand_func_calls`'s own
 /// recursion, yet still crashed at only ~383 levels in a debug build before
@@ -12236,7 +12272,7 @@ fn test_unconditional_self_recursive_def_rejects_cleanly_1016() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(&["-c", "def deep: [deep]; deep"], Some("null"))?;
     assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
     assert!(
-        stderr.contains("recursion depth exceeds limit of"),
+        stderr.contains("recursion depth exceeds limit of 50"),
         "stderr: {stderr:?}"
     );
     Ok(())
@@ -12283,7 +12319,7 @@ fn test_branching_self_recursive_def_bounded_not_exponential_1016() -> Result<()
     )?;
     assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
     assert!(
-        stderr.contains("recursion depth exceeds limit of"),
+        stderr.contains("recursion depth exceeds limit of 50"),
         "stderr: {stderr:?}"
     );
     Ok(())
@@ -12330,7 +12366,7 @@ fn test_thickly_wrapped_self_recursive_def_bounded_by_chain_depth_1016() -> Resu
     let (stdout, stderr, code) = run_jq_full(&["-c", &query], Some("null"))?;
     assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
     assert!(
-        stderr.contains("nesting exceeds depth limit of"),
+        stderr.contains("nesting exceeds depth limit of 300"),
         "stderr: {stderr:?}"
     );
     Ok(())
