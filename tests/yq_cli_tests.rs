@@ -21821,3 +21821,27 @@ fn test_lazy_keys_streaming_preserves_yaml_duplicates_1599() -> Result<()> {
 
     Ok(())
 }
+
+/// #1247: a mapping key that fails to decode must not hide the *valid*
+/// fields after it. `YamlFields::find`/`find_cursor` used to `?` out of the
+/// whole search on the first undecodable key, so `.b` answered `null` here
+/// even though `keys` still listed `b`.
+///
+/// The key is `"a\qb"` -- `\q` is not a YAML escape, so the scalar is
+/// structurally valid but `as_str()` rejects it. Real yq rejects the whole
+/// document (`found unknown escape character`, exit 1); surfacing the decode
+/// failure as a real error is tracked separately. This pins only that one bad
+/// key no longer destroys valid results.
+#[test]
+fn test_undecodable_mapping_key_does_not_hide_later_fields_1247() -> Result<()> {
+    let input = "\"a\\qb\": 1\nb: 2\n";
+
+    let (output, exit_code) = run_yq_stdin(".b", input, &["-o", "json"])?;
+    assert_eq!(exit_code, 0, "output: {output:?}");
+    assert_eq!(output.trim(), "2");
+
+    let (output, exit_code) = run_yq_stdin("keys | length", input, &["-o", "json"])?;
+    assert_eq!(exit_code, 0, "output: {output:?}");
+    assert_eq!(output.trim(), "2");
+    Ok(())
+}
