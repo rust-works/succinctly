@@ -341,8 +341,14 @@ impl NodeMeta {
 /// in `yq_runner.rs` — but not for *emitting* one: what the writer needs is
 /// purely per-node ("write `&x` here", "write `*x` there"), the same shape
 /// as comments and style. Carrying it here reuses the threading this tree
-/// already has through capture, reconciliation, emission, `--inplace` and
-/// `--split-exp`; see that ADR's amendment for the full argument.
+/// already has through capture, reconciliation, emission and `--split-exp`;
+/// see that ADR's amendment for the full argument.
+///
+/// Deliberately *not* `--inplace`, which never builds one of these at all:
+/// it evaluates through `evaluate_input` with [`CommentTree::empty`], so it
+/// drops comments, style and anchors alike (and skips #711's alias value
+/// sync). That is issue #1349, a gap in that route's own wiring rather than
+/// anything this tree can reach.
 ///
 /// `OwnedValue` itself carries no metadata — extending its enum would ripple
 /// through every match site in both the JSON and YAML evaluators for a
