@@ -2527,7 +2527,11 @@ fn standard_json_to_jq_value<'a, W: Clone + AsRef<[u64]>>(
             }
             JqValue::Object(map)
         }
-        StandardJson::Error(_) => JqValue::Null,
+        // See `eval_generic::to_owned_at_depth`'s own `is_error` arm
+        // (#1194/#1247): a structurally malformed value -- one the
+        // semi-index accepted as a span but could not classify as any JSON
+        // token -- raises rather than becoming `null`.
+        StandardJson::Error(msg) => return Err(EvalError::new(msg.to_string())),
     })
 }
 
@@ -2943,6 +2947,20 @@ where
                         out.write_all(b"}")?;
                     }
                 }
+                // A structurally malformed value the semi-index accepted as
+                // a span but could not classify (`[xyz123]`, `[tru]`), still
+                // printed as `null` -- so this lazy output path disagrees
+                // with every materializing one, which now raises (#1194).
+                //
+                // Deliberately NOT raised here, and this was tried: `print_json`
+                // walks child cursors lazily and streams as it goes, so by the
+                // time a nested error is reached it has already written the
+                // opening `[`. Bailing produced a truncated document plus a
+                // generic exit 1, where the materializing routes give a clean
+                // diagnostic and exit 5 -- worse on every axis than the silent
+                // `null`. Needs the same error channel as the YAML streaming
+                // path; tracked together as Stage 6 in
+                // `docs/plan/decode-failure-routing.md`.
                 StandardJson::Error(_) => out.write_all(b"null")?,
             }
         }

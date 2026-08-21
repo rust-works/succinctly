@@ -14464,3 +14464,45 @@ fn test_valid_escapes_still_materialize_1247() {
     assert_eq!(code, 0, "stderr: {stderr}");
     assert_eq!(stdout.trim(), "2");
 }
+
+/// #1194 (the half in #1247's scope): a *structurally* malformed value --
+/// one the semi-index accepted as a span but could not classify as any JSON
+/// token -- must not materialize as `null`. `[xyz123]` came back as `[null]`
+/// at exit 0 where real jq raises `Invalid numeric literal` and exits 5.
+///
+/// Every materializing route raises now. The lazy output path (`.`, `.[0]`)
+/// still prints `null`: it streams as it walks, so by the time a nested
+/// error is reached the opening bracket is already written, and bailing
+/// there truncates the document. That is tracked as Stage 6 of #1247's
+/// design, not fixed here -- see `docs/plan/decode-failure-routing.md`.
+///
+/// `{invalid}` is NOT covered: `JsonFields::uncons` collapses a lone
+/// bareword leaf into "no more fields" at the semi-index layer, so no field
+/// is ever constructed to raise on, and the object simply reads as `{}`.
+/// That is #1194's remaining half and needs its own change.
+#[test]
+fn test_malformed_value_surfaces_as_error_1194() {
+    for doc in ["[xyz123]", "[tru]", "[1,zzz,3]"] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", "to_entries"], Some(doc))
+            .unwrap_or_else(|e| panic!("`{doc}` failed to run: {e}"));
+        assert_ne!(code, 0, "`{doc}` should fail\nstdout: {stdout}");
+        assert!(
+            !stderr.is_empty(),
+            "`{doc}` should carry a diagnostic: {stderr}"
+        );
+    }
+
+    // Evaluation continues past the bad value, per the `ErrorSink`
+    // convention (#355): the two good documents either side of it still
+    // produce output, and the exit code still reports the failure.
+    let (stdout, _, code) = run_jq_full(
+        &["-c", "to_entries"],
+        Some("{\"a\":1}\n[xyz123]\n{\"b\":2}\n"),
+    )
+    .unwrap_or_else(|e| panic!("failed to run: {e}"));
+    assert_ne!(code, 0);
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        [r#"[{"key":"a","value":1}]"#, r#"[{"key":"b","value":2}]"#]
+    );
+}
