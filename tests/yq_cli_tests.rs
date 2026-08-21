@@ -8311,17 +8311,13 @@ fn test_jq_mode_computed_float_formatting_unaffected_by_997() -> Result<()> {
 // computed whole float's decimal point regardless of compact/pretty --
 // `test_compact_and_pretty_agree_on_whole_floats` above), YAML output of
 // the *same* computed value drops it -- but **only at document-root
-// scalar position**. Real yq v4.53.3 disambiguates a nested computed
-// float with an explicit `!!float` tag instead (`a: !!float 2`);
-// succinctly has no tag-emission mechanism to match that, so a nested
-// computed float here keeps its pre-existing decimal-point-preserving
-// spelling (`a: 2.0`) rather than dropping the point *without* a tag,
-// which would silently reparse as an int and lose the value's type --
-// worse than the pre-#949 status quo, not just non-byte-identical to the
-// oracle. Each root-scalar expectation was measured directly against the
-// pinned `yq` v4.53.3 binary; the nested-position fallback is
-// succinctly's own choice among its two imperfect options, not itself an
-// oracle-matched spelling (see `test_computed_whole_float_nested_yaml_output_keeps_type_949`).
+// scalar position**, where real yq suppresses every tag. Nested, real yq
+// keeps that same shortest spelling and precedes it with an explicit
+// `!!float` tag (`a: !!float 2`); #1090 added the tag-emission path, so
+// the nested expectations below are now the oracle's own bytes rather
+// than #949's type-preserving-but-not-identical `a: 2.0` fallback. Every
+// expectation in this section was measured directly against the pinned
+// `yq` v4.53.3 binary.
 // =============================================================================
 
 #[test]
@@ -8566,6 +8562,32 @@ fn test_tonumber_preserves_source_spelling_1090() -> Result<()> {
         let (out, code) = run_yq_stdin(".a | tonumber", &input, &[])?;
         assert_eq!(code, 0, "for {text:?}");
         assert_eq!(out.trim(), want, "for {text:?}");
+    }
+    Ok(())
+}
+
+/// #1090 follow-on: #1176's tag-forced-float re-spelling is scoped to the
+/// one materialization that crosses `evaluate_input`'s reindex bridge, and
+/// must not reach the cursor materialization that string-producing
+/// builtins read.
+///
+/// Real yq prints the scalar's own text in all three of these, so an
+/// `!!float 2` node answers `2`, not `2.0`. Handing
+/// `to_owned_value_for_json_bridge`'s re-spelling to every
+/// `ResolvedScalar -> OwnedValue` caller (the shape this fix's first draft
+/// shipped) silently moved all three off the oracle -- including
+/// `tostring | length`, which went from `1` to `3`. Every expectation
+/// below read off real yq v4.53.3.
+#[test]
+fn test_explicit_float_tag_respelling_stays_out_of_string_builtins_1090() -> Result<()> {
+    for (filter, want) in [
+        (".a | tostring", "2"),
+        (".a | @yaml", "2"),
+        (".a | tostring | length", "1"),
+    ] {
+        let (out, code) = run_yq_stdin(filter, "a: !!float 2\n", &[])?;
+        assert_eq!(code, 0, "for {filter:?}");
+        assert_eq!(out.trim(), want, "for {filter:?}");
     }
     Ok(())
 }
