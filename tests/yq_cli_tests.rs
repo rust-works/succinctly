@@ -8376,16 +8376,18 @@ fn test_literal_whole_float_unaffected_by_949_fix() -> Result<()> {
     Ok(())
 }
 
-/// The critical regression this fix's first draft shipped (caught by code
-/// review, not by real yq's own byte-for-byte spelling): applying the
-/// root-only decimal-point drop at *every* nesting depth turned a
-/// type-preserving-if-imperfect output (`a: 2.0`, reparses as `!!float`)
-/// into a type-losing one (`a: 2`, reparses as `!!int`) for the much more
-/// common real-world shape of incrementing a float field in place. Real
-/// yq itself never drops the point here -- it tags instead (`a: !!float
-/// 2`) -- so `a: 2.0` is the closer of succinctly's two available
-/// spellings; `a: 2` would be closer in byte count but wrong in type,
-/// which is the worse defect for a data-format round trip.
+/// A nested computed whole float must keep its float type on reparse.
+///
+/// #949's fix originally applied the root-only decimal-point drop at
+/// *every* nesting depth, turning a type-preserving output into a
+/// type-losing one (`a: 2`, reparses as `!!int`) for the common shape of
+/// incrementing a float field in place; it settled on `a: 2.0` as the
+/// type-safe spelling succinctly could actually emit. #1090 closes the
+/// remaining gap by emitting real yq's own spelling, `a: !!float 2`, which
+/// is byte-identical to the oracle *and* type-correct.
+///
+/// The `.a | tag` round-trip assertion below is the invariant that
+/// outlived both spellings and is the real point of this test.
 #[test]
 fn test_computed_whole_float_nested_yaml_output_keeps_type_949() -> Result<()> {
     for (filter, yaml) in [
@@ -8395,11 +8397,11 @@ fn test_computed_whole_float_nested_yaml_output_keeps_type_949() -> Result<()> {
     ] {
         let (out, code) = run_yq_stdin(filter, yaml, &[])?;
         assert_eq!(code, 0, "for {filter:?}");
-        assert_eq!(out.trim(), "a: 2.0", "for {filter:?}");
+        assert_eq!(out.trim(), "a: !!float 2", "for {filter:?}");
 
         // Round-trip: re-parsing the emitted YAML must still resolve to
         // `!!float`, not `!!int` -- the actual invariant this test
-        // protects, independent of the exact decimal spelling chosen.
+        // protects, independent of the exact spelling chosen.
         let (tag, tag_code) = run_yq_stdin(".a | tag", &out, &[])?;
         assert_eq!(tag_code, 0, "for {filter:?}");
         assert_eq!(tag.trim(), "!!float", "for {filter:?}");
@@ -8407,7 +8409,7 @@ fn test_computed_whole_float_nested_yaml_output_keeps_type_949() -> Result<()> {
 
     let (out, code) = run_yq_stdin("map(. + 1)", "- 1.0\n", &[])?;
     assert_eq!(code, 0);
-    assert_eq!(out.trim(), "- 2.0");
+    assert_eq!(out.trim(), "- !!float 2");
 
     Ok(())
 }
@@ -8415,13 +8417,19 @@ fn test_computed_whole_float_nested_yaml_output_keeps_type_949() -> Result<()> {
 /// `-i`/`--inplace` must stay type-idempotent: repeatedly incrementing a
 /// float field must never degrade it to an int-looking value, which would
 /// silently change downstream `tag`/`type` results after just one edit.
+///
+/// This is the case that gates #1090 on #1176. Once the first edit writes
+/// `a: !!float 2`, the second has to *read* that explicit tag back through
+/// the DOM route -- which used to flatten it to `Int` at the JSON reindex
+/// bridge, producing `a: 3` and losing the type after exactly one edit.
+/// Both halves have to be in place for this loop to hold.
 #[test]
 fn test_computed_whole_float_inplace_stays_float_typed_949() -> Result<()> {
     let mut file = NamedTempFile::new()?;
     writeln!(file, "a: 1.0")?;
     let path = file.path().to_path_buf();
 
-    for want in ["a: 2.0", "a: 3.0"] {
+    for want in ["a: !!float 2", "a: !!float 3"] {
         let status = Command::new(env!("CARGO_BIN_EXE_succinctly"))
             .args(["yq", "-i", ".a += 1"])
             .arg(&path)
@@ -8429,6 +8437,159 @@ fn test_computed_whole_float_inplace_stays_float_typed_949() -> Result<()> {
         assert!(status.success());
         assert_eq!(std::fs::read_to_string(&path)?.trim(), want);
     }
+    Ok(())
+}
+
+/// #1090: real yq's `!!float` placement is style-insensitive -- a block
+/// mapping, a flow mapping and a block sequence all take the same
+/// unconditional prefix, and nesting depth past the first makes no
+/// difference. All four expectations read off yq v4.53.3.
+#[test]
+fn test_nested_float_tag_is_style_insensitive_1090() -> Result<()> {
+    for (filter, input, want) in [
+        (".a += 1", "a: 1.0\n", "a: !!float 2"),
+        (".a += 1", "{a: 1.0}\n", "{a: !!float 2}"),
+        (".[0] += 1", "[1.0]\n", "[!!float 2]"),
+        (".[0] += 1", "- 1.0\n", "- !!float 2"),
+        (
+            ".a.b.c += 1",
+            "a:\n  b:\n    c: 1.0\n",
+            "a:\n  b:\n    c: !!float 2",
+        ),
+    ] {
+        let (out, code) = run_yq_stdin(filter, input, &[])?;
+        assert_eq!(code, 0, "for {filter:?} on {input:?}");
+        assert_eq!(out.trim(), want, "for {filter:?} on {input:?}");
+    }
+    Ok(())
+}
+
+/// #1090: the tag depends only on whether the emitted spelling would read
+/// back as an int -- never on the value's magnitude, sign, or how it was
+/// computed. Every row verified against real yq v4.53.3 via
+/// `printf 'a: 1.0\n' | yq '.a = (.a * X)'`.
+#[test]
+fn test_nested_float_tag_only_when_spelling_is_ambiguous_1090() -> Result<()> {
+    for (multiplier, want) in [
+        // Integer-shaped => tagged.
+        ("1", "a: !!float 1"),
+        ("0", "a: !!float 0"),
+        ("-1", "a: !!float -1"),
+        ("1000", "a: !!float 1000"),
+        ("100000", "a: !!float 100000"),
+        // Already unambiguous => bare.
+        ("2.5", "a: 2.5"),
+        ("0.5", "a: 0.5"),
+        ("1000000", "a: 1e+06"),
+        ("0.00001", "a: 1e-05"),
+        ("10000000000", "a: 1e+10"),
+    ] {
+        let filter = format!(".a = (.a * {multiplier})");
+        let (out, code) = run_yq_stdin(&filter, "a: 1.0\n", &[])?;
+        assert_eq!(code, 0, "for {filter:?}");
+        assert_eq!(out.trim(), want, "for {filter:?}");
+    }
+    Ok(())
+}
+
+/// #1090 must not leak outside nested YAML output. Real yq suppresses
+/// *every* tag at document-root scalar position (`echo '!!str 5' | yq '.'`
+/// prints a bare `5`), and JSON has no tag syntax at all -- so both keep
+/// their pre-#1090 spellings, verified against yq v4.53.3.
+#[test]
+fn test_nested_float_tag_does_not_leak_to_root_or_json_1090() -> Result<()> {
+    // Root scalar: bare, untagged, decimal point dropped (#949).
+    let (out, code) = run_yq_stdin(". + 1", "1.0\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "2");
+
+    // JSON output keeps the decimal point and never gains a tag.
+    for extra_args in [&["-o=json", "-I=0"][..], &["-o=json"][..]] {
+        let (out, code) = run_yq_stdin(".a += 1", "a: 1.0\n", extra_args)?;
+        assert_eq!(code, 0, "for {extra_args:?}");
+        assert!(
+            out.contains("2.0") && !out.contains("!!float"),
+            "for {extra_args:?}: {out:?}"
+        );
+    }
+
+    // `@json` and `tostring` are string-producing and likewise untagged
+    // (both spellings read off real yq v4.53.3, which unwraps a root
+    // scalar by default).
+    let (out, code) = run_yq_stdin(".a += 1 | @json", "a: 1.0\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), r#"{"a":2.0}"#);
+
+    let (out, code) = run_yq_stdin("(.a + 1) | tostring", "a: 1.0\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "2");
+
+    Ok(())
+}
+
+/// #1090: a converted float must *not* be tagged, because `tonumber`
+/// preserves the source spelling -- but the same value put through
+/// arithmetic must be, because arithmetic replaces that spelling.
+/// `into_plain_number` is the boundary, and this pins both sides of it.
+/// Both expectations verified against real yq v4.53.3.
+///
+/// This is the regression that closed PR #1179, which tagged every nested
+/// whole float regardless of spelling.
+#[test]
+fn test_tonumber_result_is_not_tagged_but_arithmetic_on_it_is_1090() -> Result<()> {
+    let (out, code) = run_yq_stdin(".b = (.a | tonumber)", "a: \"2.0\"\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "a: \"2.0\"\nb: 2.0");
+
+    let (out, code) = run_yq_stdin(".b = ((.a | tonumber) + 0)", "a: \"2.0\"\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "a: \"2.0\"\nb: !!float 2");
+
+    Ok(())
+}
+
+/// #1090: `tonumber` echoes the string's own spelling, matching real yq
+/// v4.53.3 -- it does not renormalize through `f64`. Before this, all four
+/// collapsed (`2.50` -> `2.5`, `1e3` -> `1000`).
+#[test]
+fn test_tonumber_preserves_source_spelling_1090() -> Result<()> {
+    for (text, want) in [
+        ("2.0", "2.0"),
+        ("2.50", "2.50"),
+        ("1.500", "1.500"),
+        ("1e3", "1e3"),
+        ("1E5", "1E5"),
+        ("2e0", "2e0"),
+        ("2", "2"),
+    ] {
+        let input = format!("a: \"{text}\"\n");
+        let (out, code) = run_yq_stdin(".a | tonumber", &input, &[])?;
+        assert_eq!(code, 0, "for {text:?}");
+        assert_eq!(out.trim(), want, "for {text:?}");
+    }
+    Ok(())
+}
+
+/// #1176: an explicit `!!float` tag on an int-shaped scalar must survive
+/// the DOM route's JSON reindex bridge. It used to reach the bridge as a
+/// bare `Float`, serialize as `2`, and reparse as an `Int` -- silently
+/// changing the value's type. Reproducible with no `-i` at all.
+///
+/// This gates #1090: once tag emission exists, succinctly's own output
+/// becomes an input of exactly this shape, so a second `-i` edit would
+/// otherwise lose the type (see
+/// `test_computed_whole_float_inplace_stays_float_typed_949`).
+#[test]
+fn test_explicit_float_tag_survives_reindex_bridge_1176() -> Result<()> {
+    // `--slurp` takes the same DOM route as `-i`, without a temp file.
+    let (out, code) = run_yq_stdin(".[0].a | tag", "a: !!float 2\n", &["--slurp"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "!!float");
+
+    let (out, code) = run_yq_stdin(".[0].a + 1 | tag", "a: !!float 2\n", &["--slurp"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "!!float");
+
     Ok(())
 }
 
