@@ -12434,6 +12434,24 @@ cover(1)"#,
     Ok(())
 }
 
+/// #1016 patch-coverage: `expand_func_calls`'s arity-mismatch check (right
+/// above the depth guard this PR adds, in the same `FuncCall` match arm)
+/// had zero direct test coverage anywhere in this crate before this PR --
+/// confirmed by grepping for its exact message. Calling a `def` with the
+/// wrong number of arguments must still surface that pre-existing, clean
+/// `EvalError` rather than reaching (or being masked by) the new depth
+/// guard added just below it in the same arm.
+#[test]
+fn test_func_call_arity_mismatch_reports_clean_error_1016() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-c", "def f(x): x; f(1;2)"], Some("null"))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert!(
+        stderr.contains("function f takes 1 arguments, got 2"),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
 /// #998: the bare identity `.` never materializes an `OwnedValue` tree (it
 /// stays lazy, streaming straight from the cursor via `print_json`), so
 /// `eval_generic::to_owned`'s own depth guard never gets a chance to fire
