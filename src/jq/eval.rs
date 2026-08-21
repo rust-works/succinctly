@@ -19973,9 +19973,30 @@ fn set_value_at_path(
                 return Err(EvalError::cannot_index(value.type_name(), key));
             }
             let bounds = SliceBounds::from_descriptor(desc)?;
-            // jq reads a string slice but will not write one back.
-            if matches!(value, OwnedValue::String(_)) {
-                return Err(EvalError::cannot_update_string_slices());
+            // jq reads a string slice but will not write one back -- but
+            // that refusal is only correct once the slice itself *is* the
+            // write. A chained path with more path after the slice
+            // (`rest` non-empty) needs the read-through substring handed
+            // to the recursive call instead, so *that* navigation's own
+            // outcome is the answer, not this refusal (#1338, mirroring
+            // #1321's identical `terminal_write` distinction in
+            // `through_slice` -- confirmed live:
+            // `"hello" | setpath([{"start":0,"end":1},"b"]; 5)` matches
+            // real jq's "Cannot index string with string \"b\"", not this
+            // refusal). A `String` value can never be indexed by any key
+            // type in this function's own dispatch -- every arm below
+            // either narrows to `Object`/`Array`/`Null` or falls to a
+            // catch-all `Err` -- so the recursive call always errors in
+            // practice; forwarded directly via `return`, with no `Ok` case
+            // to design a synthetic return value for.
+            if let OwnedValue::String(s) = &value {
+                if rest.is_empty() {
+                    return Err(EvalError::cannot_update_string_slices());
+                }
+                let len = s.chars().count();
+                let range = bounds.resolve(len);
+                let sub = OwnedValue::String(slice::slice_str(s, range));
+                return set_value_at_path(sub, rest, new_val);
             }
             // jq reads the child with `jv_get` before recursing, and a `null`
             // root reads as `null` rather than as an empty array — which is
@@ -37383,6 +37404,55 @@ mod tests {
                 br#"{"a": null}"#,
                 r#"setpath(["a", "b"]; 2)"#,
                 Ok(r#"{"a":{"b":2}}"#),
+            ),
+        ]);
+    }
+
+    /// #1338: a slice descriptor mid-`setpath()`-path over a string (more
+    /// path follows the slice) must report *that* continuation's own
+    /// navigation failure, not `set_value_at_path`'s terminal "cannot
+    /// update string slices" refusal -- mirrors #1321's identical
+    /// `terminal_write` distinction in `through_slice`/`.a[0:1].b = v`.
+    /// Every case here is oracle-verified against real jq 1.7.1.
+    #[test]
+    fn test_setpath_string_slice_mid_chain_reports_the_continuations_own_error_1338() {
+        assert_outcomes(&[
+            // The issue's own repro: field key after a string slice.
+            (
+                br#""hello""#,
+                r#"setpath([{"start":0,"end":1},"b"]; 5)"#,
+                Err(r#"Cannot index string with string "b""#),
+            ),
+            // Numeric key after a string slice.
+            (
+                br#""hello""#,
+                r#"setpath([{"start":0,"end":3},0]; 5)"#,
+                Err("Cannot index string with number"),
+            ),
+            // Terminal case unchanged: the slice IS the last path
+            // component, still refused unconditionally.
+            (
+                br#""hello""#,
+                r#"setpath([{"start":0,"end":1}]; "X")"#,
+                Err("Cannot update string slices"),
+            ),
+            // A second, nested slice descriptor after the first: still a
+            // *terminal* write relative to the read-through substring, so
+            // still refused -- not a `rest`-non-empty case at that inner
+            // level (oracle-verified: real jq refuses this identically).
+            (
+                br#""hello""#,
+                r#"setpath([{"start":0,"end":3},{"start":0,"end":1}]; "X")"#,
+                Err("Cannot update string slices"),
+            ),
+            // Regression check: an array target through the same mid-chain
+            // shape is unaffected by this fix (routes through the
+            // pre-existing `OwnedValue::Array(arr)` arm, not the new
+            // `String` one).
+            (
+                br"[[1,2,3],[4,5,6]]",
+                r#"setpath([{"start":0,"end":1},0,0]; 99)"#,
+                Ok("[[99,2,3],[4,5,6]]"),
             ),
         ]);
     }
