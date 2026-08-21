@@ -12289,6 +12289,53 @@ fn test_branching_self_recursive_def_bounded_not_exponential_1016() -> Result<()
     Ok(())
 }
 
+/// #1016 code review: sharing *one* global substitution counter for the
+/// entire `then` expression (an intermediate design between the per-chain
+/// counter and the final per-occurrence one) starves every later,
+/// syntactically-independent call to the same function once an earlier one
+/// has consumed the budget. Confirmed live before this fix: three
+/// completely independent, shallow calls to the same recursive `fact` --
+/// none of which come close to the depth limit on their own -- failed
+/// outright, while real jq 1.7.1 returns `[6,24,120]` for the same query.
+#[test]
+fn test_independent_sibling_calls_do_not_share_budget_1016() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            "def fact(n): if n <= 1 then 1 else n * fact(n-1) end; [fact(3), fact(4), fact(5)]",
+        ],
+        Some("null"),
+    )?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "[6,24,120]");
+    Ok(())
+}
+
+/// #1016 code review: `MAX_FUNC_EXPANSION_DEPTH` only bounds how many
+/// times the `FuncCall` self-reference arm fires, not the native stack
+/// depth needed to walk from one self-reference to the next -- a `def`
+/// body that wraps its recursive call in substantial structure (here, 20
+/// levels of array nesting) overflows the native stack (SIGABRT) well
+/// before that budget is anywhere near exhausted, confirmed live before
+/// this fix. `MAX_FUNC_EXPANSION_CHAIN_DEPTH` bounds raw recursion depth
+/// directly and must catch this case too, cleanly, not just the thin-body
+/// shape the other tests in this group use.
+#[test]
+fn test_thickly_wrapped_self_recursive_def_bounded_by_chain_depth_1016() -> Result<()> {
+    let wrap_open = "[".repeat(20);
+    let wrap_close = "]".repeat(20);
+    let query = format!(
+        "def deep(m): if m == 0 then . else {wrap_open}deep(m-1){wrap_close} end; deep(60)"
+    );
+    let (stdout, stderr, code) = run_jq_full(&["-c", &query], Some("null"))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert!(
+        stderr.contains("nesting exceeds depth limit of"),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
 /// #998: the bare identity `.` never materializes an `OwnedValue` tree (it
 /// stays lazy, streaming straight from the cursor via `print_json`), so
 /// `eval_generic::to_owned`'s own depth guard never gets a chance to fire
