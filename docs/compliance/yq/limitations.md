@@ -268,6 +268,39 @@ for the ordering divergence would likely resolve the comma-LHS gap as a side eff
 path-before-RHS reorder no longer needs the static-only safety gate #1233's own narrower
 fix relies on).
 
+### Dynamic-key and comma-grouped scalar-target assignment: the *write itself* fails
+
+[#1232](https://github.com/rust-works/succinctly/issues/1232) widened #1181's scalar-target
+no-op to a scalar hit *before* the last path component (`.a.b = 99` on a scalar `.a`
+no-ops), but only for the *static*-path walkers (`get_path_mut`/`set_path`/`update_path`).
+A path that needs the full `resolve_dynamic_indexes` pre-pass — a computed key, or a
+`Comma`-grouped LHS — resolves each component through a plain read evaluator with no yq
+scalar-noop awareness at all, so the boundary this section's *previous* entry describes
+("no computed key, and no `Comma`") is wider than just the RHS-discard optimization: for
+these paths the write genuinely fails, not just the optimization of skipping RHS
+evaluation:
+
+```bash
+$ printf 'a: 5\n' | yq            -o=json '"a" as $k | .[$k].b = 99'   # a: 5, no-op
+$ printf 'a: 5\n' | succinctly yq -o=json '"a" as $k | .[$k].b = 99'   # Error: Cannot index number with string "b"
+
+$ printf 'a: 5\nx: {}\n' | yq            -o=json '(.a.b, .x.y) = 99'   # a: 5, x: {y: 99} -- .x.y still writes
+$ printf 'a: 5\nx: {}\n' | succinctly yq -o=json '(.a.b, .x.y) = 99'   # Error: Cannot index number with string "b" -- .x.y write lost too
+```
+
+Both live-verified against yq v4.53.3, and confirmed unaffected by #1232's own fix (identical
+on `main` immediately before that PR). Filed as
+[#1419](https://github.com/rust-works/succinctly/issues/1419), which also covers the
+narrower, already-fixed-write case where only the RHS-discard *optimization* is missing
+(`0 as $k | .[$k] = error("boom")` on a scalar root still raises `boom` where real yq no-ops
+silently, even though the write itself — `.[$k] = 99` — already correctly no-ops).
+
+Separately, `get_path_mut` (the walker #1232 widened) has no `Expr::Iterate` arm at all, so
+a mid-chain `.[]` under plain `=` (`.a[].b = 99`) always errors "invalid path component" —
+in both jq and yq mode, and predating #1232 entirely (`|=`/`+=`/`-=`/`*=`/`del()` are
+unaffected). Filed as
+[#1418](https://github.com/rust-works/succinctly/issues/1418).
+
 ### Other categories
 
 Float and number formatting ([#1071](https://github.com/rust-works/succinctly/issues/1071),
