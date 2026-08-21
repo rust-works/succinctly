@@ -5867,6 +5867,11 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
     }
 
     #[inline]
+    fn alias(&self) -> Option<&str> {
+        YamlCursor::alias(self)
+    }
+
+    #[inline]
     fn explicit_tag(&self) -> Option<&str> {
         YamlCursor::explicit_tag(self)
     }

@@ -113,6 +113,19 @@ pub trait DocumentCursor: Sized + Copy + Clone {
         None
     }
 
+    /// Get the name of the anchor this node is an *alias* to, if it is one
+    /// (`*name` yields `Some("name")`, without the `*`).
+    ///
+    /// The dual of [`anchor`](Self::anchor): a node is at most one of the
+    /// two, and both return `None` for formats without an alias concept
+    /// (JSON). Only YAML cursors override this. Needed by the write path
+    /// (issue #763) — unlike the value accessors, which resolve *through*
+    /// an alias to its target, re-emitting `*name` requires knowing the
+    /// node is an alias before that resolution happens.
+    fn alias(&self) -> Option<&str> {
+        None
+    }
+
     /// Get the explicit YAML tag at this node, if any (e.g. `"!!str"`).
     ///
     /// Returns `None` when the node has no explicit tag, and for formats

@@ -14,7 +14,7 @@ use succinctly::jq::document::{
 };
 use succinctly::jq::eval_generic::{
     assert_nesting_depth, eval_with_cursor_using, to_owned as generic_to_owned,
-    to_owned_with_comments, CommentTree, GenericResult,
+    to_owned_with_comments, AnchorMark, CommentTree, GenericResult, NodeMeta,
 };
 use succinctly::jq::{
     self, assert_value_tree_depth, nonfinite_display_string, sync_aliased_paths, Builtin,
@@ -554,6 +554,7 @@ fn evaluate_yaml_direct_filtered(
     sink: &mut ErrorSink,
     need_comments: bool,
     strip_style: bool,
+    sort_keys: bool,
 ) -> Result<(Vec<Vec<ResultWithComments>>, usize)> {
     let index = YamlIndex::build(bytes).map_err(|e| anyhow::anyhow!("YAML parse error: {e}"))?;
     let root = index.root(bytes);
@@ -571,8 +572,14 @@ fn evaluate_yaml_direct_filtered(
                 };
 
                 if should_eval {
-                    let results =
-                        evaluate_yaml_cursor(cursor, expr, sink, need_comments, strip_style)?;
+                    let results = evaluate_yaml_cursor(
+                        cursor,
+                        expr,
+                        sink,
+                        need_comments,
+                        strip_style,
+                        sort_keys,
+                    )?;
                     // Only include documents that have results (select may filter them out)
                     if !results.is_empty() {
                         doc_results.push(results);
@@ -609,6 +616,7 @@ fn evaluate_yaml_direct_filtered(
                         sink,
                         need_comments,
                         strip_style,
+                        sort_keys,
                     )?;
                     Ok((vec![results], 1))
                 } else {
@@ -937,8 +945,7 @@ fn reconcile_presentation_at_depth(
     assert_value_tree_depth(depth);
     match (pristine_value, result_value) {
         (OwnedValue::Object(p_fields), OwnedValue::Object(r_fields)) => {
-            let own_comment = pristine_tree.own().map(str::to_string);
-            let own_style = pristine_tree.style();
+            let own_meta = pristine_tree.meta().clone();
             let mut fields = IndexMap::new();
             let mut key_comments = IndexMap::new();
             for (k, r_v) in r_fields {
@@ -961,18 +968,17 @@ fn reconcile_presentation_at_depth(
                 // (`emit_yaml_value`'s block-mapping arm) renders only the
                 // key and comment, silently dropping the write's value
                 // entirely (found in review).
-                if let CommentTree::Object(_, _, _, pristine_key_comments) = pristine_tree {
+                if let CommentTree::Object(_, _, pristine_key_comments) = pristine_tree {
                     if let Some((kc, _)) = pristine_key_comments.get(k) {
                         let value_absent = matches!(r_v, OwnedValue::Null);
                         key_comments.insert(k.clone(), (kc.clone(), value_absent));
                     }
                 }
             }
-            CommentTree::Object(own_comment, own_style, fields, key_comments)
+            CommentTree::Object(own_meta, fields, key_comments)
         }
         (OwnedValue::Array(p_items), OwnedValue::Array(r_items)) => {
-            let own_comment = pristine_tree.own().map(str::to_string);
-            let own_style = pristine_tree.style();
+            let own_meta = pristine_tree.meta().clone();
             let items = r_items
                 .iter()
                 .enumerate()
@@ -986,18 +992,20 @@ fn reconcile_presentation_at_depth(
                     None => CommentTree::empty(),
                 })
                 .collect();
-            CommentTree::Array(own_comment, own_style, items)
+            CommentTree::Array(own_meta, items)
         }
         // A kind change (container <-> scalar, or Object <-> Array) is a
         // fresh node with no presentation memory of its own.
         (OwnedValue::Object(_) | OwnedValue::Array(_), _)
         | (_, OwnedValue::Object(_) | OwnedValue::Array(_)) => CommentTree::empty(),
         // Both scalars, any variant/value: same node, only its value
-        // changed - its own comment and style survive.
-        _ => CommentTree::Leaf(
-            pristine_tree.own().map(str::to_string),
-            pristine_tree.style(),
-        ),
+        // changed - its own comment, style and anchor mark survive. Real
+        // `yq` keeps `&x` across `.a = 99` for the same reason it keeps the
+        // comment: the write overwrites the node's value, not its identity
+        // (#763). Whether a surviving `*x` mark is still *emittable* is a
+        // separate question, settled afterwards by
+        // [`enforce_anchor_soundness`] once the whole result is known.
+        _ => CommentTree::Leaf(pristine_tree.meta().clone()),
     }
 }
 
@@ -1103,6 +1111,164 @@ fn write_split_result(
         .with_context(|| format!("failed to write --split-exp output file: {filename}"))
 }
 
+/// One step of a path into a paired `OwnedValue`/[`CommentTree`] tree, used
+/// by [`enforce_anchor_soundness`] to revisit a node it decided to strip.
+enum TreeStep {
+    Key(String),
+    Index(usize),
+}
+
+/// Drop every `*alias` mark this document cannot actually resolve, so the
+/// YAML written out always re-reads as the same values succinctly would
+/// have printed without any anchor syntax at all (#763).
+///
+/// A mark survives only when all three hold, checked in the emitter's own
+/// traversal order:
+///
+/// 1. some node declares that anchor name in the output;
+/// 2. it is emitted **before** this one — a `*x` above its `&x` is a
+///    forward reference, which YAML forbids;
+/// 3. the value there equals the value here — otherwise writing `*x` would
+///    silently replace this node's real value with the anchor's.
+///
+/// This is deliberately a *divergence* from real `yq`, which fails all
+/// three in practice: `yq 'del(.a)'` on `a: &x 1\nb: *x` prints `b: *x`
+/// with no anchor left anywhere, and `yq` then rejects its own output with
+/// `unknown anchor 'x' referenced` (verified against the pinned binary).
+/// Rule 3 is also what keeps the gap in succinctly's own alias *value*
+/// model safe rather than wrong: a write *through* an alias (`.b.p = 9`)
+/// updates only `.b`, where real `yq` mutates the shared node, so the two
+/// sides no longer agree and the mark is dropped — printing `b: {p: 9}`
+/// (the value succinctly computed) instead of `b: *x` (which would discard
+/// the write entirely).
+///
+/// Anchor *declarations* are never dropped: an unreferenced `&x` is valid
+/// YAML and real `yq` keeps it (`yq 'del(.b)'` still prints `a: &x 1`).
+fn enforce_anchor_soundness(value: &OwnedValue, comments: &mut CommentTree, sort_keys: bool) {
+    let mut declared: IndexMap<&str, &OwnedValue> = IndexMap::new();
+    let mut unresolvable: Vec<Vec<TreeStep>> = Vec::new();
+    let mut path = Vec::new();
+    scan_anchor_soundness(
+        value,
+        comments,
+        sort_keys,
+        &mut declared,
+        &mut unresolvable,
+        &mut path,
+        0,
+    );
+    for steps in &unresolvable {
+        if let Some(node) = comment_tree_at_path_mut(comments, steps) {
+            node.meta_mut().anchor = None;
+        }
+    }
+}
+
+/// Pre-order half of [`enforce_anchor_soundness`]: record each declaration
+/// as it is reached and flag every alias that fails the three rules.
+///
+/// Reads the tree immutably so the surviving declarations can borrow
+/// straight out of `value` rather than cloning whole anchored subtrees; the
+/// flagged paths are applied in a second pass. Panics past
+/// `MAX_VALUE_TREE_DEPTH`, like every other walker over this pair.
+fn scan_anchor_soundness<'a>(
+    value: &'a OwnedValue,
+    comments: &'a CommentTree,
+    sort_keys: bool,
+    declared: &mut IndexMap<&'a str, &'a OwnedValue>,
+    unresolvable: &mut Vec<Vec<TreeStep>>,
+    path: &mut Vec<TreeStep>,
+    depth: usize,
+) {
+    assert_value_tree_depth(depth);
+    match comments.anchor_mark() {
+        // A repeated name shadows the earlier one for every *later* alias,
+        // matching YAML's own "most recent preceding anchor wins".
+        Some(AnchorMark::Declares(name)) => {
+            declared.insert(name.as_str(), value);
+        }
+        Some(AnchorMark::Aliases(name)) => {
+            if declared.get(name.as_str()).map(|d| *d == value) != Some(true) {
+                unresolvable.push(clone_steps(path));
+            }
+        }
+        None => {}
+    }
+    match value {
+        OwnedValue::Object(fields) => {
+            // Mirror the block-mapping arm's own ordering, so "emitted
+            // before" here means the same thing it will at write time. The
+            // flow arm doesn't sort, but a flow container's keys can only
+            // have come from source order, where a declaration always
+            // precedes its aliases (a forward reference is rejected at
+            // index build) — so walking sorted there can only drop a mark
+            // that would have been fine, never keep one that wouldn't.
+            let mut keys: Vec<&String> = fields.keys().collect();
+            if sort_keys {
+                keys.sort();
+            }
+            for k in keys {
+                let Some(v) = fields.get(k) else { continue };
+                path.push(TreeStep::Key(k.clone()));
+                scan_anchor_soundness(
+                    v,
+                    comments.field(k),
+                    sort_keys,
+                    declared,
+                    unresolvable,
+                    path,
+                    depth + 1,
+                );
+                path.pop();
+            }
+        }
+        OwnedValue::Array(items) => {
+            for (i, v) in items.iter().enumerate() {
+                path.push(TreeStep::Index(i));
+                scan_anchor_soundness(
+                    v,
+                    comments.at_index(i),
+                    sort_keys,
+                    declared,
+                    unresolvable,
+                    path,
+                    depth + 1,
+                );
+                path.pop();
+            }
+        }
+        _ => {}
+    }
+}
+
+fn clone_steps(path: &[TreeStep]) -> Vec<TreeStep> {
+    path.iter()
+        .map(|s| match s {
+            TreeStep::Key(k) => TreeStep::Key(k.clone()),
+            TreeStep::Index(i) => TreeStep::Index(*i),
+        })
+        .collect()
+}
+
+/// Mutable counterpart of [`CommentTree::field`]/[`CommentTree::at_index`],
+/// following a whole path. `None` if any step is missing — which cannot
+/// happen for a path [`scan_anchor_soundness`] just walked, but the
+/// accessors have no infallible form.
+fn comment_tree_at_path_mut<'t>(
+    tree: &'t mut CommentTree,
+    steps: &[TreeStep],
+) -> Option<&'t mut CommentTree> {
+    let mut node = tree;
+    for step in steps {
+        node = match (node, step) {
+            (CommentTree::Object(_, fields, _), TreeStep::Key(k)) => fields.get_mut(k)?,
+            (CommentTree::Array(_, items), TreeStep::Index(i)) => items.get_mut(*i)?,
+            _ => return None,
+        };
+    }
+    Some(node)
+}
+
 /// Evaluate a jq expression directly on a YAML cursor.
 ///
 /// This uses the generic evaluator to preserve position metadata (line/column).
@@ -1121,6 +1287,7 @@ fn evaluate_yaml_cursor<W: AsRef<[u64]> + Clone>(
     sink: &mut ErrorSink,
     need_comments: bool,
     strip_style: bool,
+    sort_keys: bool,
 ) -> Result<Vec<ResultWithComments>> {
     // Snapshot alias-sync context from the pristine document *before*
     // evaluation, only when it could possibly matter (#711): an
@@ -1285,19 +1452,34 @@ fn evaluate_yaml_cursor<W: AsRef<[u64]> + Clone>(
     // needs its own always-on, top-level-only pass, independent of
     // `need_comments`/`is_alias_sensitive_assign` — real `yq` does this
     // unconditionally, not just for shape-preserving writes.
+    //
+    // The same is true of a bare scalar's own `&anchor` (#763): real `yq`
+    // prints `1`, not `&x 1`, for `.a` on `a: &x 1` — already pinned by
+    // `test_yaml_bare_scalar_anchor_dropped_on_query_result_712`. An
+    // *alias* mark is the exception and survives: `yq '.b'` on `b: *x`
+    // prints `*x` (verified against the pinned binary), because there the
+    // alias *is* the whole result rather than decoration on it.
     if let Ok(docs) = &mut docs {
         for (value, comments) in docs.iter_mut() {
             if !matches!(value, OwnedValue::Object(_) | OwnedValue::Array(_)) {
-                *comments = CommentTree::Leaf(comments.own().map(str::to_string), "");
+                let alias_mark = comments
+                    .alias_name()
+                    .map(|name| AnchorMark::Aliases(name.to_string()));
+                *comments = CommentTree::Leaf(NodeMeta {
+                    comment: comments.own().map(str::to_string),
+                    style: "",
+                    anchor: alias_mark,
+                });
             }
         }
     }
 
     // `-P`/`--pretty-print` (#705) forces block/plain style regardless of
     // source — a real style-clearing step, not just "there's no style data
-    // to clear" like before #739's style tracking existed. Comments stay
-    // (`-P` only ever claimed to affect style), so this only touches the
-    // style slot of every node, not the tree shape.
+    // to clear" like before #739's style tracking existed. Comments and
+    // anchor marks stay (`-P` only ever claimed to affect style, and real
+    // `yq -P '.'` does keep `&x`/`*x`), so this only touches the style slot
+    // of every node, not the tree shape.
     if strip_style {
         if let Ok(docs) = &mut docs {
             for (_value, comments) in docs.iter_mut() {
@@ -1306,12 +1488,28 @@ fn evaluate_yaml_cursor<W: AsRef<[u64]> + Clone>(
         }
     }
 
+    // Last, once every other pass has settled the values and the marks:
+    // strip any `*alias` this document can no longer resolve (#763). Must
+    // run after `sync_aliased_paths` above, whose whole job is making an
+    // alias's value agree with its anchor's again — running before it would
+    // see stale values and drop marks that are about to become valid.
+    if let Ok(docs) = &mut docs {
+        for (value, comments) in docs.iter_mut() {
+            enforce_anchor_soundness(value, comments, sort_keys);
+        }
+    }
+
     docs
 }
 
 /// Recursively clear every node's style (issue #705's `-P` gate) while
-/// keeping its comments and tree shape untouched — see the `strip_style`
-/// call in [`evaluate_yaml_cursor`].
+/// keeping its comments, anchor marks and tree shape untouched — see the
+/// `strip_style` call in [`evaluate_yaml_cursor`].
+///
+/// Anchors deliberately survive `-P`: real `yq -P '.'` on
+/// `a: &x 1\nb: *x\n` still prints `a: &x 1\nb: *x` (verified against the
+/// pinned binary). `-P` is documented as `... style = ""`, and anchor/alias
+/// syntax is identity, not style (#763).
 fn strip_presentation_style(tree: &CommentTree) -> CommentTree {
     strip_presentation_style_at_depth(tree, 0)
 }
@@ -1324,19 +1522,21 @@ fn strip_presentation_style(tree: &CommentTree) -> CommentTree {
 /// currently-live independent crash path.
 fn strip_presentation_style_at_depth(tree: &CommentTree, depth: usize) -> CommentTree {
     assert_value_tree_depth(depth);
+    let meta = NodeMeta {
+        style: "",
+        ..tree.meta().clone()
+    };
     match tree {
-        CommentTree::Leaf(c, _) => CommentTree::Leaf(c.clone(), ""),
-        CommentTree::Array(c, _, items) => CommentTree::Array(
-            c.clone(),
-            "",
+        CommentTree::Leaf(_) => CommentTree::Leaf(meta),
+        CommentTree::Array(_, items) => CommentTree::Array(
+            meta,
             items
                 .iter()
                 .map(|v| strip_presentation_style_at_depth(v, depth + 1))
                 .collect(),
         ),
-        CommentTree::Object(c, _, fields, key_comments) => CommentTree::Object(
-            c.clone(),
-            "",
+        CommentTree::Object(_, fields, key_comments) => CommentTree::Object(
+            meta,
             fields
                 .iter()
                 .map(|(k, v)| (k.clone(), strip_presentation_style_at_depth(v, depth + 1)))
@@ -1432,10 +1632,31 @@ fn output_value<W: Write>(
         // `--raw-input`, `--split-exp`, ... Redundant with (but harmless
         // alongside) `evaluate_yaml_cursor`'s equivalent root-scalar pass
         // for the cursor-based DOM path specifically.
-        let body = if let OwnedValue::String(s) = value {
+        // An aliased root renders as `*name` whatever its resolved value is
+        // — checked before the raw-string shortcut below, which would
+        // otherwise print an aliased string's *target text* instead (#763).
+        let body = if let Some(name) = comments.alias_name() {
+            format!("*{name}")
+        } else if let OwnedValue::String(s) = value {
             s.clone()
         } else {
-            emit_yaml_value(value, comments, config, "", false)
+            // A root anchor is written only for a container, matching
+            // `YamlCursor::write_leading_anchor` in `light.rs` — real yq
+            // drops a bare scalar root's own `&x` (pinned by
+            // `test_yaml_bare_scalar_anchor_dropped_on_query_result_712`),
+            // and `evaluate_yaml_cursor`'s root-scalar pass has already
+            // cleared the mark for that case anyway.
+            let rendered = emit_yaml_value(value, comments, config, "", false);
+            match comments.declared_anchor() {
+                Some(anchor) if matches!(value, OwnedValue::Array(_) | OwnedValue::Object(_)) => {
+                    if is_flow_safe(value, comments) {
+                        format!("&{anchor} {rendered}")
+                    } else {
+                        format!("&{anchor}\n{rendered}")
+                    }
+                }
+                _ => rendered,
+            }
         };
         // Every non-root node's own trailing comment is appended by its
         // *parent* during `emit_yaml_value`'s recursion (see its Array/Object
@@ -1541,6 +1762,34 @@ fn is_flow_safe(value: &OwnedValue, comments: &CommentTree) -> bool {
     }
 }
 
+/// Whether this node's content is deferred to its own indented block below
+/// the `key:`/`-` that introduces it, rather than sharing that line.
+///
+/// The single definition of a test the block-mapping and block-sequence arms
+/// of [`emit_yaml_value_at_depth`] each used to spell inline — extracted
+/// because #763 adds a third reason to stay on one line: an aliased node
+/// renders as `*name`, so it is inline no matter how large the anchored
+/// value it points at happens to be. Getting that wrong renders `b: *x` as
+/// a block mapping with `*x` dangling above it.
+fn defers_to_own_block(value: &OwnedValue, comments: &CommentTree) -> bool {
+    comments.alias_name().is_none()
+        && !is_flow_safe(value, comments)
+        && (matches!(value, OwnedValue::Object(o) if !o.is_empty())
+            || matches!(value, OwnedValue::Array(a) if !a.is_empty()))
+}
+
+/// This node's `&name` anchor declaration as ` &name` (leading space), or
+/// `""` if it declares none (#763).
+///
+/// The leading space is part of the returned string because every call site
+/// appends it directly after a `:` or `-`, exactly as `write_deferred_value`
+/// in `light.rs` does for the streaming writer.
+fn anchor_decl_prefix(comments: &CommentTree) -> String {
+    comments
+        .declared_anchor()
+        .map_or_else(String::new, |name| format!(" &{name}"))
+}
+
 /// Format a node's own trailing comment (issue #710) as `" # text"`, or
 /// `""` if it has none — the single point of change for the separator
 /// convention shared by every `emit_yaml_value` call site that appends one
@@ -1610,6 +1859,20 @@ fn emit_yaml_value_at_depth(
     depth: usize,
 ) -> String {
     assert_value_tree_depth(depth);
+    // An alias renders as `*name` and never writes the value it resolves
+    // to — the DOM twin of `stream_yaml_value`'s own `YamlValue::Alias`
+    // arm in `light.rs` (#763). This has to come before the value dispatch
+    // below, not inside it: `to_owned` already cloned the *target's* value
+    // into this position, so by here an alias is indistinguishable from a
+    // plain copy by shape alone. Emitted structurally rather than as a
+    // string, since `yaml_quote_string` quotes anything starting with `*`.
+    //
+    // `enforce_anchor_soundness` has already cleared any mark that could
+    // not be resolved from this document, so reaching here guarantees a
+    // matching `&name` is emitted earlier in the output.
+    if let Some(name) = comments.alias_name() {
+        return format!("*{name}");
+    }
     match value {
         OwnedValue::Null => "null".to_string(),
         OwnedValue::Bool(b) => b.to_string(),
@@ -1652,14 +1915,22 @@ fn emit_yaml_value_at_depth(
                     .iter()
                     .enumerate()
                     .map(|(i, v)| {
-                        emit_yaml_value_at_depth(
+                        let elem_comments = comments.at_index(i);
+                        let item = emit_yaml_value_at_depth(
                             v,
-                            comments.at_index(i),
+                            elem_comments,
                             config,
                             indent,
                             true,
                             depth + 1,
-                        )
+                        );
+                        // `[&x 1, *x]` — a flow item's own anchor sits
+                        // immediately before it (#763), the DOM twin of
+                        // `write_yaml_child_inline` in `light.rs`.
+                        match elem_comments.declared_anchor() {
+                            Some(anchor) => format!("&{anchor} {item}"),
+                            None => item,
+                        }
                     })
                     .collect();
                 format!("[{}]", items.join(", "))
@@ -1670,11 +1941,28 @@ fn emit_yaml_value_at_depth(
                     .enumerate()
                     .map(|(i, v)| {
                         let elem_comments = comments.at_index(i);
-                        let elem_is_flow = is_flow_safe(v, elem_comments);
-                        if !elem_is_flow
-                            && (matches!(v, OwnedValue::Object(o) if !o.is_empty())
-                                || matches!(v, OwnedValue::Array(a) if !a.is_empty()))
-                        {
+                        if defers_to_own_block(v, elem_comments) {
+                            // An anchor written on the item's own line
+                            // (`- &x\n  ...`) takes the slot the compact
+                            // form would use, so the value stays deferred
+                            // to its own full-indent line — mirroring
+                            // `stream_yaml_value`'s sequence arm in
+                            // `light.rs`, which real yq is pinned against
+                            // (#763).
+                            if let Some(anchor) = elem_comments.declared_anchor() {
+                                let val_indent = format!("{indent}{}", config.indent_str);
+                                let val = emit_yaml_value_at_depth(
+                                    v,
+                                    elem_comments,
+                                    config,
+                                    &val_indent,
+                                    false,
+                                    depth + 1,
+                                );
+                                let val =
+                                    append_own_comment_line(val, elem_comments.own(), &val_indent);
+                                return format!("{indent}- &{anchor}\n{val}");
+                            }
                             // A non-empty mapping/sequence element renders
                             // in real yq's "compact" form: `- ` shares its
                             // line with the value's own first field/
@@ -1728,7 +2016,8 @@ fn emit_yaml_value_at_depth(
                                 depth + 1,
                             );
                             let comment_suffix = trailing_comment_suffix(elem_comments);
-                            format!("{indent}- {item}{comment_suffix}")
+                            let anchor = anchor_decl_prefix(elem_comments);
+                            format!("{indent}-{anchor} {item}{comment_suffix}")
                         }
                     })
                     .collect();
@@ -1744,15 +2033,18 @@ fn emit_yaml_value_at_depth(
                     .iter()
                     .map(|(k, v)| {
                         let key = yaml_quote_key(k);
+                        let field_comments = comments.field(k);
                         let val = emit_yaml_value_at_depth(
                             v,
-                            comments.field(k),
+                            field_comments,
                             config,
                             indent,
                             true,
                             depth + 1,
                         );
-                        format!("{key}: {val}")
+                        // `{x: &y 1, z: *y}` (#763).
+                        let anchor = anchor_decl_prefix(field_comments);
+                        format!("{key}:{anchor} {val}")
                     })
                     .collect();
                 format!("{{{}}}", entries.join(", "))
@@ -1773,14 +2065,12 @@ fn emit_yaml_value_at_depth(
                         let field_comments = comments.field(k);
                         let comment_suffix = trailing_comment_suffix(field_comments);
                         let val_indent = format!("{indent}{}", config.indent_str);
+                        let anchor = anchor_decl_prefix(field_comments);
                         // Check if value needs to be on next line - a
                         // flow-styled container stays on the key's own line
-                        // instead, the same as a scalar (#739).
-                        let field_is_flow = is_flow_safe(v, field_comments);
-                        if !field_is_flow
-                            && (matches!(v, OwnedValue::Object(m) if !m.is_empty())
-                                || matches!(v, OwnedValue::Array(a) if !a.is_empty()))
-                        {
+                        // instead, the same as a scalar (#739), and so does
+                        // an alias, however large its target (#763).
+                        if defers_to_own_block(v, field_comments) {
                             // A comment trailing the key's own line, when the
                             // value is deferred to the next line, belongs to
                             // the key, not the value (#765).
@@ -1802,12 +2092,20 @@ fn emit_yaml_value_at_depth(
                             );
                             let val =
                                 append_own_comment_line(val, field_comments.own(), &val_indent);
-                            format!("{indent}{key}:{key_comment_suffix}\n{val}")
+                            // `&x` goes before the key's own comment, not
+                            // after it: a `#` runs to end of line, so the
+                            // reverse order would bury the anchor inside the
+                            // comment text (#763).
+                            format!("{indent}{key}:{anchor}{key_comment_suffix}\n{val}")
                         } else if let Some(kc) = comments.key_comment_if_value_absent(k) {
                             // The deferred value materialized as nothing at
                             // all - the key's own comment stands alone with
-                            // no value token, matching real yq (#765).
-                            format!("{indent}{key}: {kc}")
+                            // no value token, matching real yq (#765). An
+                            // anchor on that absent value still writes
+                            // (`? k # c\n: &anc` -> `k: &anc # c`), the DOM
+                            // twin of `write_deferred_value`'s own rule
+                            // (#1077/#1113).
+                            format!("{indent}{key}:{anchor} {kc}")
                         } else {
                             let val = emit_yaml_value_at_depth(
                                 v,
@@ -1832,7 +2130,7 @@ fn emit_yaml_value_at_depth(
                             } else {
                                 comment_suffix
                             };
-                            format!("{indent}{key}: {val}{comment_suffix}")
+                            format!("{indent}{key}:{anchor} {val}{comment_suffix}")
                         }
                     })
                     .collect();
@@ -3281,6 +3579,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                             &mut sink,
                             need_comments,
                             args.pretty_print,
+                            output_config.sort_keys,
                         )?;
                         global_doc_index += num_docs;
                         for results in doc_results {
@@ -3859,6 +4158,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                         &mut sink,
                         need_comments,
                         args.pretty_print,
+                        output_config.sort_keys,
                     )?;
                     global_doc_index += num_docs;
                     all_results.push(doc_results);
@@ -4151,14 +4451,15 @@ mod tests {
         let mut obj_comments = IndexMap::new();
         obj_comments.insert(
             "k".to_string(),
-            CommentTree::Leaf(Some("# k trailing".to_string()), ""),
+            CommentTree::Leaf(NodeMeta::from_comment_and_style(
+                Some("# k trailing".to_string()),
+                "",
+            )),
         );
         let comments = CommentTree::Array(
-            None,
-            "",
+            NodeMeta::empty(),
             vec![CommentTree::Object(
-                Some("# obj trailing".to_string()),
-                "",
+                NodeMeta::from_comment_and_style(Some("# obj trailing".to_string()), ""),
                 obj_comments,
                 IndexMap::new(),
             )],
@@ -4367,6 +4668,7 @@ mod tests {
             None,
             &mut ErrorSink::default(),
             true,
+            false,
             false,
         )
         .unwrap();
@@ -4741,7 +5043,7 @@ mod tests {
     fn linear_comment_tree_nest(depth: usize) -> CommentTree {
         let mut t = CommentTree::empty();
         for _ in 0..depth {
-            t = CommentTree::Array(None, "", vec![t]);
+            t = CommentTree::Array(NodeMeta::empty(), vec![t]);
         }
         t
     }
