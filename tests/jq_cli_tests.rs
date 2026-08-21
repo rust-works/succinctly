@@ -12083,6 +12083,164 @@ fn test_resolve_node_alternative_falsy_literal_interacts_correctly_with_untracke
 }
 
 // ============================================================================
+// #1023: resolve_node's Select/If arms both hand-rolled the identical
+// "evaluate cond via eval_owned_multi_keep_partial, fork per output's
+// truthiness, collect branches, propagate a branch's own error immediately,
+// defer to the cond-level escape once the loop drains" shape. Unified
+// behind a shared resolve_cond_fork helper -- these tests pin that the
+// unification is behavior-preserving for both arms' pre-existing edge
+// cases (multi-output fork, partial-prefix-then-error), not just the
+// common case.
+// ============================================================================
+
+/// #1023: `Select`'s multi-output cond fork -- confirmed against jq 1.7.1,
+/// `path(select(false,false))` (three-arg `select` filters each output
+/// independently) is empty, and `path(select(true,true))` resolves twice
+/// (`[[],[]]`), matching `If`'s own #628 multi-output behavior next to it.
+#[test]
+fn test_resolve_node_select_multi_output_fork_1023() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-c", "[path(select(false,false))]"], Some("null"))?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "[]");
+
+    let (stdout, stderr, code) = run_jq_full(&["-c", "[path(select(true,true))]"], Some("null"))?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "[[],[]]");
+    Ok(())
+}
+
+/// #1023: `Select`'s own partial-prefix-then-error case (the counterpart
+/// to `test_resolve_node_if_keeps_cond_partial_fanout_before_error_896`
+/// just above, for the sibling arm this issue unifies with it) -- a truthy
+/// output already resolved before a later `cond` output errors must still
+/// surface that resolved branch, not discard it. Confirmed against jq
+/// 1.7.1: `path(select(true, error("x")))` prints `[]` before raising `x`.
+#[test]
+fn test_resolve_node_select_keeps_cond_partial_fanout_before_error_1023() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", r#"path(select(true, error("x")))"#], Some("null"))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "[]");
+    assert!(stderr.contains('x'));
+    Ok(())
+}
+
+// ============================================================================
+// #980: a `Comma`-fanned `//` left operand mixing a falsy/non-path sibling
+// with a path-shaped or truthy one used to raise a spurious error --
+// `Comma` committed to a sibling's own failure eagerly, before `//`'s
+// truthy filter ever got a chance to discard it. Fixed incidentally by
+// #1288's `Expr::Comma` fix, not by the `Alternative` arm itself; pinned
+// here (as its own closing comment asked) since nothing previously guarded
+// it, and #1023's neighboring refactor touches the same machinery cluster.
+// All eight shapes confirmed against jq 1.7.1.
+// ============================================================================
+
+/// #980: earlier falsy sibling, later path-shaped one.
+#[test]
+fn test_resolve_node_alternative_comma_falsy_then_path_sibling_980() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", "path((.a, false) // .b)"], Some(r#"{"a":10}"#))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "[\"a\"]");
+    Ok(())
+}
+
+/// #980: earlier path-shaped sibling, later falsy one -- order doesn't
+/// matter.
+#[test]
+fn test_resolve_node_alternative_comma_path_then_falsy_sibling_980() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", "path((false, .a) // .b)"], Some(r#"{"a":10}"#))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "[\"a\"]");
+    Ok(())
+}
+
+/// #980: a `null` sibling (falsy, distinct from `false`) is treated the
+/// same way.
+#[test]
+fn test_resolve_node_alternative_comma_path_then_null_sibling_980() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", "path((.a, null) // .b)"], Some(r#"{"a":10}"#))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "[\"a\"]");
+    Ok(())
+}
+
+/// #980: every sibling falsy (mixed `null`/`false`) -- `//` falls through
+/// to the right side entirely.
+#[test]
+fn test_resolve_node_alternative_comma_all_falsy_siblings_falls_through_980() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", "path((null, false) // .b)"], Some(r#"{"a":10}"#))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "[\"b\"]");
+
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", "path((false, false) // .b)"], Some(r#"{"a":10}"#))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "[\"b\"]");
+    Ok(())
+}
+
+/// #980: two path-shaped siblings, no falsy one involved at all -- both
+/// survive.
+#[test]
+fn test_resolve_node_alternative_comma_two_path_shaped_siblings_980() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "[path((.a, .c) // .b)]"],
+        Some(r#"{"a":10,"c":20}"#),
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "[[\"a\"],[\"c\"]]");
+    Ok(())
+}
+
+/// #980: a *missing* field (`.x`, absent from the input) is falsy (`null`)
+/// exactly like a literal `false` sibling -- discarded the same way, not a
+/// distinct "two path-shaped siblings" case despite `.x` itself being a
+/// navigation step. Confirmed against jq 1.7.1: `path((.x, .a) // .b)`
+/// prints only `["a"]`, the missing-field output never surviving `//`'s
+/// truthy filter.
+#[test]
+fn test_resolve_node_alternative_comma_missing_field_sibling_is_falsy_980() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", "[path((.x, .a) // .b)]"], Some(r#"{"a":10}"#))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "[[\"a\"]]");
+    Ok(())
+}
+
+/// #980: three siblings, falsy/path/falsy -- the fix must hold across more
+/// than two outputs, not just a pair.
+#[test]
+fn test_resolve_node_alternative_comma_three_siblings_mixed_980() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "[path((.a, false, .a) // .b)]"],
+        Some(r#"{"a":10}"#),
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "[[\"a\"],[\"a\"]]");
+    Ok(())
+}
+
+/// #980 boundary: a later sibling that is truthy but *not* path-shaped
+/// still raises -- the fix only lets *falsy* siblings through `//`'s
+/// filter uncontested, it doesn't exempt every non-path-shaped value.
+/// This is #845's own pre-existing behavior, unaffected by #980's fix;
+/// pinned here alongside the other seven shapes so the boundary between
+/// "silently filtered" and "still raises" is guarded in one place.
+#[test]
+fn test_resolve_node_alternative_comma_truthy_non_path_sibling_still_raises_980() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-c", "path((.a, 1) // .b)"], Some(r#"{"a":10}"#))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "[\"a\"]");
+    assert!(stderr.contains("Invalid path expression with result 1"));
+    Ok(())
+}
+
+// ============================================================================
 // #891: resolve_leaf's non-primitive fallback used a bespoke message for a
 // multi-output result (`range(3)` used bare inside `path(...)`) instead of
 // the same "#530" wording its single-output sibling already uses, naming
