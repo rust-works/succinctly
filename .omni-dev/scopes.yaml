@@ -19,6 +19,10 @@ scopes:
     description: "jq query language parser and evaluator"
     examples: ["jq: add array slicing", "jq: fix negative index"]
     file_patterns: ["src/jq/**"]
+  - name: "yq"
+    description: "yq CLI mode: YAML-flavoured query semantics and yq-oracle compatibility"
+    examples: ["yq: emit an explicit !!float tag on nested computed floats", "yq: match real yq's bare sub() replace-all"]
+    file_patterns: ["src/bin/succinctly/yq_*.rs", "tests/yq_*.rs", "tests/data/yq-golden/**", "benches/yq_*.rs", "docs/benchmarks/yq.md", "docs/reference/yq-language.md"]
   - name: "dsv"
     description: "DSV/CSV semi-indexing and parsing"
     examples: ["dsv: add BMI2 quote indexing", "dsv: fix delimiter escaping"]
