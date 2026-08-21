@@ -544,10 +544,7 @@ pub(crate) fn needs_path_context(expr: &Expr) -> bool {
         // a string interpolation slot is still just "evaluate this
         // expression", so whatever it needs, the surrounding string needs
         // too. Literal parts obviously never need it.
-        Expr::StringInterpolation(parts) => parts.iter().any(|part| match part {
-            StringPart::Literal(_) => false,
-            StringPart::Expr(inner) => needs_path_context(inner),
-        }),
+        Expr::StringInterpolation(parts) => string_interpolation_needs_path_context(parts),
         // `def name(params): body; then` (#1306): the def itself doesn't
         // need path context, but `then` might reference `key`/`parent`/...
         // directly (`def f: 5; f, key`), and so might `body` if `then`
@@ -562,6 +559,21 @@ pub(crate) fn needs_path_context(expr: &Expr) -> bool {
         Expr::FuncDef { body, then, .. } => needs_path_context(body) || needs_path_context(then),
         _ => false,
     }
+}
+
+/// Whether any `\(...)` slot in a string interpolation needs path context
+/// (#1334) -- one definition shared by [`needs_path_context`]'s own
+/// `StringInterpolation` arm (the routing question: does the *whole* pipe
+/// need path-context evaluation) and `eval_pipe_with_path_context_internal`'s
+/// matching arm's guard (the construction question: once already inside
+/// path-context evaluation, does *this* string need the dedicated arm, or
+/// can it fall to the cheaper generic fallback) -- so the two can't drift
+/// apart (CLAUDE.md: "duplicated predicates diverge silently", #106).
+fn string_interpolation_needs_path_context(parts: &[StringPart]) -> bool {
+    parts.iter().any(|part| match part {
+        StringPart::Literal(_) => false,
+        StringPart::Expr(inner) => needs_path_context(inner),
+    })
 }
 
 /// Evaluate a single expression against a JSON value.
@@ -19087,12 +19099,7 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
         // lets a genuine error surface as a real `Error`/`Partial(_,
         // Error)`, caught below using *this* arm's own `optional` -- the
         // same evaluate-then-catch shape as the `Array` arm above.
-        Expr::StringInterpolation(parts)
-            if parts.iter().any(|part| match part {
-                StringPart::Literal(_) => false,
-                StringPart::Expr(inner) => needs_path_context(inner),
-            }) =>
-        {
+        Expr::StringInterpolation(parts) if string_interpolation_needs_path_context(parts) => {
             let mut rendered = String::new();
             for part in parts {
                 let inner = match part {
@@ -19169,13 +19176,15 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
         // guarded arm above (whose un-guarded case falls to a *different*,
         // cheaper generic path), there is no dedicated "doesn't need path
         // context" fallback for `FuncDef` to preserve -- the alternative is
-        // the fully generic `_` catch-all at the bottom, which would expand
-        // and evaluate through `eval_owned_expr_opt` at identical cost
-        // anyway (it dispatches to `eval_func_def`, the same expansion).
-        // Recursing here instead costs nothing extra when the expansion
-        // turns out not to need path context either: the path-context
-        // evaluator's own generic fallback is exactly what `eval_func_def`
-        // itself would have done.
+        // the fully generic `_` catch-all at the bottom, which would run
+        // the identical `expand_func_calls` (it dispatches to
+        // `eval_func_def`) and then pay `eval_owned_expr_full`'s
+        // serialize-and-reparse round-trip on top, since `FuncDef` isn't in
+        // `eval_owned_fast_path`'s short list. Recursing here instead costs
+        // no more even when the expansion turns out not to need path
+        // context either -- the path-context evaluator's own generic
+        // fallback still reaches `eval_func_def` the same way, just without
+        // that extra round-trip.
         //
         // No `?`-atomicity forcing needed here, unlike `Array`/
         // `StringInterpolation` above: a `def` scope doesn't construct or

@@ -9223,6 +9223,31 @@ fn test_path_context_builtins_across_pipe_stages_554() -> Result<()> {
     Ok(())
 }
 
+/// yq-mode counterpart to `jq_cli_tests.rs`'s
+/// `test_string_interpolation_path_context_builtins_1334`/
+/// `test_func_def_path_context_builtins_1306` -- both new
+/// `needs_path_context`/`eval_pipe_with_path_context_internal` arms
+/// (`StringInterpolation`, `FuncDef`) live on the shared `<S: EvalSemantics>`
+/// evaluator #554's fix above already established this file needs its own
+/// coverage for, not just `jq_cli_tests.rs`'s (a jq-scoped fix to shared
+/// evaluator code can silently regress yq without a dedicated check).
+#[test]
+fn test_string_interpolation_and_func_def_path_context_yq_1334_1306() -> Result<()> {
+    let (output, code) = run_yq_stdin(r#".a | "k=\(key)""#, "a: 1\n", &["-o", "json", "-I0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#""k=a""#);
+
+    let (output, code) = run_yq_stdin(".a | def f: 5; f, key", "a: 1\n", &["-o", "json", "-I0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "5\n\"a\"\n");
+
+    let (output, code) = run_yq_stdin(".a | def f: key; f", "a: 1\n", &["-o", "json", "-I0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#""a""#);
+
+    Ok(())
+}
+
 /// `keys_unsorted` gained a lazy `GenericResult`/evaluator path shared with
 /// `jq` (#140); `yq_runner.rs`'s CLI output boundary now streams it lazily
 /// too, via `can_use_m2_streaming` admitting `Builtin::KeysUnsorted` and
