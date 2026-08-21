@@ -477,6 +477,19 @@ fn to_owned_canonicalizing_numbers_at_depth<V: DocumentValue>(
     } else if let Some(literal) = value.number_literal() {
         OwnedValue::from_number_literal_plain(&literal)
     } else if let Some(i) = value.as_i64() {
+        // #999 review: unlike `as_f64` below (reached by a lenient
+        // trailing-/leading-dot span like `5.`/`.5`, pinned by
+        // `to_owned_canonicalizing_numbers_falls_back_to_as_f64_for_lenient_spans`),
+        // this arm is unreachable for JSON specifically -- every lenient
+        // span `is_valid_number_rejects_lenient_semi_index_spans`
+        // (`json/validate.rs`) enumerates either succeeds via `as_f64` or
+        // fails both (live-probed exhaustively: `1.2.3`, `1-2`, `1e`,
+        // `1e+`, `-`, empty all materialize `null`, matching `to_owned`'s
+        // own behavior for the same inputs). Kept for structural symmetry
+        // with `to_owned_at_depth`, which this function otherwise mirrors
+        // exactly -- a future `DocumentValue` implementor passed here
+        // (there is none today; this function is private to this file)
+        // could still reach it.
         OwnedValue::Int(i)
     } else if let Some(f) = value.as_f64() {
         OwnedValue::Float(f)
