@@ -51547,4 +51547,120 @@ mod tests {
         assert_tag_agrees!(b"[1]", OwnedValue::Array(vec![OwnedValue::Int(1)]));
         assert_tag_agrees!(b"{}", OwnedValue::Object(IndexMap::new()));
     }
+
+    // #844: `path()` losing trackability through an `as`-bound variable
+    // whose source is a pure passthrough of `.` -- see
+    // `is_identity_passthrough` and `resolve_node`'s `Expr::TrackedVar` arm.
+    // All expected outputs below are confirmed against real jq 1.7.1.
+
+    /// The issue's own repro: `$orig` is bound one step *before* `path(...)`
+    /// even starts, from `.` itself. Real jq resolves this as `["b"]` --
+    /// succinctly used to raise "Invalid path expression near attempt to
+    /// access element \"b\" of {...}" instead, because `eval_as` (the
+    /// value-position `as` evaluator, entirely separate from `resolve_node`)
+    /// discarded `$orig`'s provenance before `path(...)` ever started
+    /// resolving.
+    #[test]
+    fn test_path_tracks_variable_bound_from_identity_outside_path_844() {
+        assert_eq!(
+            outputs(br#"{"a":1,"b":2}"#, r". as $orig | path($orig | .b)"),
+            [r#"["b"]"#]
+        );
+    }
+
+    /// Negative control: a variable bound from genuine navigation (`.a`,
+    /// not `.` itself) must keep raising -- real jq does not track it
+    /// either, and uses the same "near attempt" wording this fix must not
+    /// accidentally start suppressing. Confirmed against jq 1.7.1.
+    #[test]
+    fn test_path_does_not_track_variable_bound_from_navigation_844() {
+        query!(br#"{"a":{"c":5}}"#, r".a as $x | path($x | .c)",
+            QueryResult::Error(e) => {
+                assert_eq!(
+                    e.message,
+                    r#"Invalid path expression near attempt to access element "c" of {"c":5}"#
+                );
+            }
+        );
+    }
+
+    /// A `Comma` sibling untouched by the untracked variable must keep
+    /// resolving on its own merits -- this is the exact case that sank an
+    /// earlier, released attempt at #844: a naive fix that flips one
+    /// `trackable` flag for the whole substituted `body` would have
+    /// poisoned `.other.o` here too. Per-branch trackability (already
+    /// established by #986/#989) means `Expr::TrackedVar`'s own use-time
+    /// check only ever affects its own branch.
+    #[test]
+    fn test_path_comma_sibling_independent_of_untracked_variable_844() {
+        assert_eq!(
+            outputs(
+                br#"{"other":{"o":1},"a":{"c":5}}"#,
+                r"path(.a as $x | (.other.o, ($x | .c)))"
+            ),
+            [r#"["other","o"]"#]
+        );
+        query!(
+            br#"{"other":{"o":1},"a":{"c":5}}"#,
+            r"path(.a as $x | (.other.o, ($x | .c)))",
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(prefix_json(&vs), [r#"["other","o"]"#]);
+                assert_eq!(
+                    e.message,
+                    r#"Invalid path expression near attempt to access element "c" of {"c":5}"#
+                );
+            }
+        );
+    }
+
+    /// The same fix also has to cover a binding made *inside* `path()`'s
+    /// own argument -- `resolve_node`'s own `Expr::As` arm, a second,
+    /// independent call site of the same lossy `substitute_var` machinery
+    /// `eval_as` uses.
+    #[test]
+    fn test_path_tracks_variable_bound_from_identity_inside_path_844() {
+        assert_eq!(
+            outputs(br#"{"a":1,"b":2}"#, r"path(. as $x | $x.b)"),
+            [r#"["b"]"#]
+        );
+    }
+
+    /// Chained passthrough bindings compose: `is_identity_passthrough`
+    /// treats an already-substituted `Expr::TrackedVar` as a passthrough
+    /// too, so `$y` stays trackable even though its own bind source is
+    /// `$x`, not `.` directly.
+    #[test]
+    fn test_path_tracks_chained_passthrough_bindings_844() {
+        assert_eq!(
+            outputs(br#"{"a":1,"b":2}"#, r". as $x | $x as $y | path($y | .b)"),
+            [r#"["b"]"#]
+        );
+    }
+
+    /// The fix isn't `path()`-only: `resolve_dynamic_indexes`/`resolve_node`
+    /// back all four path-consuming entry points, so plain assignment and
+    /// `del()` through a passthrough-bound variable are fixed for free.
+    #[test]
+    fn test_assign_and_del_track_variable_bound_from_identity_844() {
+        assert_eq!(outputs(br#"{"a":1}"#, r". as $x | $x = 5"), ["5"]);
+        assert_eq!(outputs(br#"{"a":1}"#, r". as $x | del($x.a)"), ["{}"]);
+    }
+
+    /// Bind-time gate probe: real jq does *not* track a variable merely
+    /// because its bound value happens to equal the ambient position at
+    /// use time -- the bind *source* itself must be a syntactic passthrough
+    /// of `.`. `0 as $x | path($x)` on input `0` still raises in real jq
+    /// even though `$x`'s value trivially equals `.` -- confirmed live.
+    /// This is exactly what `is_identity_passthrough`'s bind-time gate (as
+    /// opposed to relying solely on `resolve_node`'s use-time
+    /// value-equality check) exists to prevent.
+    #[test]
+    fn test_path_does_not_track_variable_bound_from_literal_844() {
+        query!(b"0", r"0 as $x | path($x)",
+            QueryResult::Error(e) => {
+                assert!(e.is_invalid_path_expression());
+                assert_eq!(e.message, "Invalid path expression with result 0");
+            }
+        );
+    }
 }
