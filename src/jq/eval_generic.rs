@@ -266,12 +266,82 @@ fn tagged_type_name<V: DocumentValue>(value: &V, cursor: Option<V::Cursor>) -> &
         .map_or_else(|| value.type_name(), crate::yaml::ResolvedScalar::type_name)
 }
 
+/// Which YAML anchor/alias syntax a node carried in the source document
+/// (issue #763, ADR-0017's mechanism 2).
+///
+/// A node is at most one of the two: [`YamlCursor::anchor`] returns `None`
+/// for an alias node, and an alias node cannot itself declare an anchor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AnchorMark {
+    /// `&name` — this node declares an anchor. The name is stored without
+    /// the leading `&`.
+    Declares(String),
+    /// `*name` — this node is an alias referring to anchor `name`, stored
+    /// without the leading `*`. A node marked this way renders as `*name`
+    /// and its own value is not written at all.
+    Aliases(String),
+}
+
+/// Per-node presentation metadata: everything about *how* a node was
+/// written that its `OwnedValue` doesn't record.
+///
+/// Grouped into a struct rather than kept as loose tuple fields on
+/// [`CommentTree`] so the remaining slot this side-channel still owes —
+/// the explicit source tag the DOM path drops (#1132/#747) — can be added
+/// without a third pass over every construction site.
+#[derive(Debug, Clone, Default)]
+pub struct NodeMeta {
+    /// This node's trailing same-line comment, `#` and all (issue #710),
+    /// or `None` if it has none.
+    pub comment: Option<String>,
+    /// This node's YAML style (issue #739): `""` for block/plain, or
+    /// `"flow"`/`"double"`/`"single"`/`"literal"`/`"folded"` per
+    /// [`DocumentCursor::style`].
+    pub style: &'static str,
+    /// This node's `&anchor`/`*alias` syntax (issue #763), or `None` if it
+    /// carried neither.
+    pub anchor: Option<AnchorMark>,
+}
+
+impl NodeMeta {
+    /// Metadata-free: no comment, no style, no anchor. `const` so
+    /// [`EMPTY_COMMENT_TREE`] can be a genuine `static`.
+    pub const fn empty() -> Self {
+        Self {
+            comment: None,
+            style: "",
+            anchor: None,
+        }
+    }
+
+    /// The comment/style pair read straight off a live cursor, with no
+    /// anchor mark — the shape every caller predating #763 built.
+    pub fn from_comment_and_style(comment: Option<String>, style: &'static str) -> Self {
+        Self {
+            comment,
+            style,
+            anchor: None,
+        }
+    }
+}
+
 /// A shape-parallel tree of per-node presentation metadata.
 ///
-/// Trailing same-line comments (issue #710) and YAML style (issue #739;
+/// Trailing same-line comments (issue #710), YAML style (issue #739;
 /// `""` for block/plain, `"flow"`/`"double"`/`"single"`/`"literal"`/
-/// `"folded"` per [`DocumentCursor::style`]) — built alongside an
-/// `OwnedValue` by [`to_owned_with_comments`].
+/// `"folded"` per [`DocumentCursor::style`]), and `&anchor`/`*alias`
+/// syntax (issue #763) — built alongside an `OwnedValue` by
+/// [`to_owned_with_comments`], one [`NodeMeta`] per node.
+///
+/// ADR-0017 originally specified that anchor/alias identity must *not*
+/// ride this tree, on the grounds that a shape-parallel side-tree "has no
+/// notion of cross-tree identity". That holds for deciding whether a mark
+/// is still *valid* after a write — which is why that stays separate logic
+/// in `yq_runner.rs` — but not for *emitting* one: what the writer needs is
+/// purely per-node ("write `&x` here", "write `*x` there"), the same shape
+/// as comments and style. Carrying it here reuses the threading this tree
+/// already has through capture, reconciliation, emission, `--inplace` and
+/// `--split-exp`; see that ADR's amendment for the full argument.
 ///
 /// `OwnedValue` itself carries no metadata — extending its enum would ripple
 /// through every match site in both the JSON and YAML evaluators for a
@@ -296,50 +366,86 @@ fn tagged_type_name<V: DocumentValue>(value: &V, cursor: Option<V::Cursor>) -> &
 /// keeps metadata for every node whose value the write didn't touch.
 #[derive(Debug, Clone)]
 pub enum CommentTree {
-    /// A scalar (or any node with no comment-bearing children): this node's
-    /// own trailing comment, if any, and its style.
-    Leaf(Option<String>, &'static str),
-    /// An array: this node's own trailing comment (e.g. `a: [1,2] # c`,
-    /// which trails the whole array, not an element) and style, plus one
-    /// subtree per element in order.
-    Array(Option<String>, &'static str, Vec<Self>),
-    /// An object: this node's own trailing comment and style, one subtree
-    /// per field (keyed the same as the parallel `OwnedValue::Object`),
-    /// plus one key-scoped comment per field for a comment trailing the
-    /// *key's* own line when its value is deferred to a following line
-    /// (issue #765, e.g. `a: # comment\n  b: 1`) - distinct from the
-    /// field's value subtree's own comment, which `.a | line_comment` etc.
-    /// read instead. The `bool` alongside each comment is whether the
-    /// deferred value materialized as nothing at all (a sibling key
-    /// follows, or EOF) - see [`Self::key_comment_if_value_absent`].
+    /// A scalar (or any node with no comment-bearing children).
+    Leaf(NodeMeta),
+    /// An array: this node's own metadata (e.g. the comment in
+    /// `a: [1,2] # c`, which trails the whole array, not an element) plus
+    /// one subtree per element in order.
+    Array(NodeMeta, Vec<Self>),
+    /// An object: this node's own metadata, one subtree per field (keyed
+    /// the same as the parallel `OwnedValue::Object`), plus one key-scoped
+    /// comment per field for a comment trailing the *key's* own line when
+    /// its value is deferred to a following line (issue #765, e.g.
+    /// `a: # comment\n  b: 1`) - distinct from the field's value subtree's
+    /// own comment, which `.a | line_comment` etc. read instead. The `bool`
+    /// alongside each comment is whether the deferred value materialized as
+    /// nothing at all (a sibling key follows, or EOF) - see
+    /// [`Self::key_comment_if_value_absent`].
     Object(
-        Option<String>,
-        &'static str,
+        NodeMeta,
         IndexMap<String, Self>,
         IndexMap<String, (String, bool)>,
     ),
 }
 
 impl CommentTree {
-    /// The empty tree: no comment or style at this node, and (for
-    /// containers) no children — used where a caller has no cursor at all
-    /// (metadata-less by construction, e.g. a computed value).
+    /// The empty tree: no metadata at this node, and (for containers) no
+    /// children — used where a caller has no cursor at all (metadata-less
+    /// by construction, e.g. a computed value).
     pub const fn empty() -> Self {
-        Self::Leaf(None, "")
+        Self::Leaf(NodeMeta::empty())
+    }
+
+    /// This node's own presentation metadata.
+    pub fn meta(&self) -> &NodeMeta {
+        match self {
+            Self::Leaf(m) | Self::Array(m, _) | Self::Object(m, _, _) => m,
+        }
+    }
+
+    /// This node's own presentation metadata, mutably — used by the
+    /// post-evaluation passes in `yq_runner.rs` that clear one slot
+    /// (`-P`'s style strip, #763's soundness gate) without rebuilding the
+    /// surrounding tree.
+    pub fn meta_mut(&mut self) -> &mut NodeMeta {
+        match self {
+            Self::Leaf(m) | Self::Array(m, _) | Self::Object(m, _, _) => m,
+        }
     }
 
     /// This node's own trailing comment, if any.
     pub fn own(&self) -> Option<&str> {
-        match self {
-            Self::Leaf(c, _) | Self::Array(c, _, _) | Self::Object(c, _, _, _) => c.as_deref(),
-        }
+        self.meta().comment.as_deref()
     }
 
     /// This node's own YAML style (`""`, `"flow"`, `"double"`, `"single"`,
     /// `"literal"`, or `"folded"` — see [`DocumentCursor::style`]).
     pub fn style(&self) -> &'static str {
-        match self {
-            Self::Leaf(_, s) | Self::Array(_, s, _) | Self::Object(_, s, _, _) => s,
+        self.meta().style
+    }
+
+    /// This node's own `&anchor`/`*alias` mark, if it carried one (#763).
+    pub fn anchor_mark(&self) -> Option<&AnchorMark> {
+        self.meta().anchor.as_ref()
+    }
+
+    /// The anchor name this node is an alias *reference* to (`*name`), or
+    /// `None` if it declares an anchor or carries no mark at all. The
+    /// writer treats such a node as rendering to `*name` instead of its
+    /// own value, so this is the check that must come before any
+    /// value-shape dispatch.
+    pub fn alias_name(&self) -> Option<&str> {
+        match self.meta().anchor.as_ref() {
+            Some(AnchorMark::Aliases(name)) => Some(name),
+            _ => None,
+        }
+    }
+
+    /// The anchor name this node *declares* (`&name`), or `None`.
+    pub fn declared_anchor(&self) -> Option<&str> {
+        match self.meta().anchor.as_ref() {
+            Some(AnchorMark::Declares(name)) => Some(name),
+            _ => None,
         }
     }
 
@@ -347,7 +453,7 @@ impl CommentTree {
     /// `Array` or the index is out of range.
     pub fn at_index(&self, i: usize) -> &Self {
         match self {
-            Self::Array(_, _, items) => items.get(i).unwrap_or(&EMPTY_COMMENT_TREE),
+            Self::Array(_, items) => items.get(i).unwrap_or(&EMPTY_COMMENT_TREE),
             _ => &EMPTY_COMMENT_TREE,
         }
     }
@@ -356,7 +462,7 @@ impl CommentTree {
     /// `Object` or has no such key.
     pub fn field(&self, key: &str) -> &Self {
         match self {
-            Self::Object(_, _, fields, _) => fields.get(key).unwrap_or(&EMPTY_COMMENT_TREE),
+            Self::Object(_, fields, _) => fields.get(key).unwrap_or(&EMPTY_COMMENT_TREE),
             _ => &EMPTY_COMMENT_TREE,
         }
     }
@@ -368,7 +474,7 @@ impl CommentTree {
     /// trailing comment (issue #710).
     pub fn key_comment(&self, key: &str) -> Option<&str> {
         match self {
-            Self::Object(_, _, _, key_comments) => key_comments.get(key).map(|(c, _)| c.as_str()),
+            Self::Object(_, _, key_comments) => key_comments.get(key).map(|(c, _)| c.as_str()),
             _ => None,
         }
     }
@@ -385,7 +491,7 @@ impl CommentTree {
     /// the key, a different, unhandled case).
     pub fn key_comment_if_value_absent(&self, key: &str) -> Option<&str> {
         match self {
-            Self::Object(_, _, _, key_comments) => key_comments
+            Self::Object(_, _, key_comments) => key_comments
                 .get(key)
                 .filter(|(_, absent)| *absent)
                 .map(|(c, _)| c.as_str()),
@@ -398,7 +504,7 @@ impl CommentTree {
 /// can't be borrowed as `'static` from inside a generic method call
 /// argument like `Option::unwrap_or`) — used by [`CommentTree::at_index`]/
 /// [`CommentTree::field`] wherever there's no comment data to return.
-static EMPTY_COMMENT_TREE: CommentTree = CommentTree::Leaf(None, "");
+static EMPTY_COMMENT_TREE: CommentTree = CommentTree::Leaf(NodeMeta::empty());
 
 /// Convert a `DocumentValue` to an `OwnedValue` alongside a parallel [`CommentTree`].
 ///
@@ -423,6 +529,22 @@ fn to_owned_with_comments_at_depth<V: DocumentValue>(
     // getter: the write path re-emits this verbatim after one space.
     let own_comment = cursor.and_then(DocumentCursor::line_comment_raw);
     let own_style = cursor.map_or("", DocumentCursor::style);
+    // `&anchor`/`*alias` (#763). Checked alias-first: `anchor()` already
+    // returns `None` on an alias node, so the order can't actually
+    // mis-classify, but it states the precedence the writer relies on --
+    // an aliased node renders as `*name` and never writes its own value.
+    let own_anchor = cursor.and_then(|c| {
+        DocumentCursor::alias(c)
+            .map(|name| AnchorMark::Aliases(name.to_string()))
+            .or_else(|| {
+                DocumentCursor::anchor(c).map(|name| AnchorMark::Declares(name.to_string()))
+            })
+    });
+    let own_meta = NodeMeta {
+        comment: own_comment,
+        style: own_style,
+        anchor: own_anchor,
+    };
     if let Some(fields) = value.as_object() {
         let mut map = IndexMap::new();
         let mut comment_map = IndexMap::new();
@@ -460,7 +582,7 @@ fn to_owned_with_comments_at_depth<V: DocumentValue>(
         }
         (
             OwnedValue::Object(map),
-            CommentTree::Object(own_comment, own_style, comment_map, key_comment_map),
+            CommentTree::Object(own_meta, comment_map, key_comment_map),
         )
     } else if let Some(elements) = value.as_array() {
         let mut items = Vec::new();
@@ -478,13 +600,10 @@ fn to_owned_with_comments_at_depth<V: DocumentValue>(
         }
         (
             OwnedValue::Array(items),
-            CommentTree::Array(own_comment, own_style, comment_items),
+            CommentTree::Array(own_meta, comment_items),
         )
     } else {
-        (
-            to_owned_at_depth(value, depth),
-            CommentTree::Leaf(own_comment, own_style),
-        )
+        (to_owned_at_depth(value, depth), CommentTree::Leaf(own_meta))
     }
 }
 
