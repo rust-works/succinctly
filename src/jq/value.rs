@@ -396,13 +396,17 @@ pub fn format_number_jq_compat(raw: &[u8]) -> String {
     // 150,050 given digits. Reusing the capped `mantissa_str` from above
     // for a plain render this large would silently drop trailing digits
     // (see `format_positive_shifted_plain`'s doc comment on why that
-    // failure mode doesn't even return `None`) -- so, same as
-    // `format_overflow_literal_mantissa` (#1274), re-derive uncapped only
-    // once eligibility is confirmed cap-independently.
-    if shifted_exp > 0 && shifted_exp < digit_count {
-        let full_mantissa_str = full_mantissa_if_capped(s, exp_pos, &mantissa_str, digit_count);
+    // failure mode doesn't even return `None`) -- `try_positive_shifted_plain`
+    // (shared with `format_overflow_literal_mantissa`, #1274) re-derives
+    // uncapped only once eligibility is confirmed cap-independently. The
+    // `shifted_exp > 0` guard stays here rather than folding into the
+    // shared helper: unlike the overflow call site, this one can also see
+    // small/negative shifted exponents (already routed to
+    // `format_shifted_mantissa` above), so it's the one caller that
+    // actually needs it.
+    if shifted_exp > 0 {
         if let Some(plain) =
-            format_positive_shifted_plain(sign, &full_mantissa_str, shifted_exp, digit_count)
+            try_positive_shifted_plain(sign, s, exp_pos, shifted_exp, digit_count, &mantissa_str)
         {
             return plain;
         }
@@ -581,10 +585,14 @@ fn split_mantissa(s: &str, exp_pos: usize) -> (&str, &str) {
 /// [`normalize_extreme_literal_mantissa`] when a caller doesn't need every
 /// given digit rendered anyway (scientific notation only ever shows a
 /// bounded prefix). Bounding the *copy* is enough: `shift` only ever needs
-/// `int_part.len()` (an O(1) property read once leading zeros are trimmed),
-/// so truncating what gets copied into `rest` doesn't touch the exponent
-/// math's correctness, only how many digits past the first one actually get
-/// rendered.
+/// `int_part.len()` (an O(1) property read once leading zeros are trimmed
+/// -- the `trim_start_matches('0')` itself is an O(k) scan over any
+/// leading-zero run, #1180), so truncating what gets copied into `rest`
+/// doesn't touch the exponent math's correctness, only how many digits past
+/// the first one actually get rendered. The trim doesn't change the
+/// function's overall cost class either way: `format_number_jq_compat`'s
+/// own `s.parse::<f64>()` ahead of every call into this function already
+/// scans every byte of `s` once.
 ///
 /// Real jq preserves a literal's full given precision unconditionally --
 /// oracle-verified exact round-trips up to exactly this many significant
@@ -602,11 +610,19 @@ fn split_mantissa(s: &str, exp_pos: usize) -> (&str, &str) {
 /// fidelity the ordinary case actually needs.
 ///
 /// A caller whose own notation choice needs every given digit regardless of
-/// this cap -- [`format_overflow_literal_mantissa`]'s plain-notation retry,
-/// #1274 -- passes `None` to [`normalize_extreme_literal_mantissa`] instead
-/// of this constant, since plain notation's whole point is rendering every
-/// given digit; there is no bounded prefix to fall back on the way
-/// scientific notation has.
+/// this cap -- [`try_positive_shifted_plain`]'s and
+/// [`format_shifted_mantissa`]'s callers, #1274 -- passes `None` to
+/// [`normalize_extreme_literal_mantissa`] instead of this constant, since
+/// plain notation's whole point is rendering every given digit; there is no
+/// bounded prefix to fall back on the way scientific notation has. This
+/// deliberately reintroduces document-length-proportional cost for that
+/// specific case (a many-hundred-thousand-digit literal that turns out to
+/// be plain-eligible pays for rendering every one of those digits) rather
+/// than adding a second, independent cap -- because real jq itself has no
+/// such cap either (oracle-verified past 500,000 digits, no ceiling found),
+/// matching it exactly means matching its cost profile too, and the input
+/// already had to contain that many bytes to trigger it in the first place
+/// (linear cost in the attacker's own paid-for input, not an amplification).
 const MAX_RENDERED_MANTISSA_DIGITS: usize = 100_000;
 
 /// Shift a literal's own mantissa digits (the text before `exp_pos`, i.e.
@@ -746,9 +762,17 @@ fn normalize_extreme_literal_mantissa(
 
 /// Re-derive `mantissa_str` without [`normalize_extreme_literal_mantissa`]'s
 /// `MAX_RENDERED_MANTISSA_DIGITS` cap, but only when the cap could actually
-/// have truncated something (`digit_count` past it) -- when it's within the
-/// cap, `mantissa_str` already holds every given digit, so this avoids a
-/// wasted second pass over `s` in the overwhelmingly common case.
+/// have truncated something -- when it's within the cap, `mantissa_str`
+/// already holds every given digit, so this avoids a wasted second pass
+/// over `s` in the overwhelmingly common case. Truncation of `rest` only
+/// starts at `digit_count == cap + 2` (both branches of
+/// `normalize_extreme_literal_mantissa` copy up to `cap` digits *after* the
+/// mandatory leading one, so `digit_count == cap + 1` -- one leading digit
+/// plus exactly `cap` more -- is already complete); the `+ 1` below matches
+/// that exactly rather than the more conservative `digit_count > cap`,
+/// which would trigger one boundary value early on an already-untruncated
+/// mantissa (#1274 review, confirmed live: both give identical output at
+/// that boundary, but only this bound avoids the redundant re-derivation).
 ///
 /// Every caller that must echo every given digit verbatim --
 /// [`format_shifted_mantissa`]'s unconditional decimal window,
@@ -765,7 +789,7 @@ fn full_mantissa_if_capped<'a>(
     mantissa_str: &'a str,
     digit_count: i128,
 ) -> Cow<'a, str> {
-    if digit_count > MAX_RENDERED_MANTISSA_DIGITS as i128 {
+    if digit_count > MAX_RENDERED_MANTISSA_DIGITS as i128 + 1 {
         let Ok((full, _, _, _)) = normalize_extreme_literal_mantissa(s, exp_pos, None) else {
             unreachable!("digit_count > 0 implies a nonzero mantissa was already found")
         };
@@ -824,36 +848,25 @@ fn format_overflow_literal_mantissa(s: &str, exp_pos: usize, negative: bool) -> 
     // 400 significant digits were given (`shifted_exp` 399 `<` `digit_count`
     // 400) -- oracle-verified, code review on #1253.
     //
-    // #1274: decide eligibility first (cap-independent, since
-    // `new_exp`/`digit_count` never depend on `mantissa_digit_cap`), and
-    // only then fetch an uncapped mantissa via `full_mantissa_if_capped` --
-    // rather than just trying `mantissa_str` (capped, from above) and
+    // #1274: `try_positive_shifted_plain` (shared with
+    // `format_number_jq_compat`) decides eligibility first (cap-independent,
+    // since `new_exp`/`digit_count` never depend on `mantissa_digit_cap`),
+    // and only then fetches an uncapped mantissa via `full_mantissa_if_capped`
+    // -- rather than just trying `mantissa_str` (capped, from above) and
     // falling back to `None` -- since a capped mantissa can silently
     // *succeed* in `format_positive_shifted_plain` too when the split point
     // falls within the capped prefix, not just fail outright (see that
-    // function's own doc comment, and `full_mantissa_if_capped`'s). No
-    // `new_exp > 0` guard needed before calling it (unlike
-    // `format_number_jq_compat`'s own call site, which also sees
+    // function's own doc comment). No `new_exp > 0` guard needed here
+    // (unlike `format_number_jq_compat`'s own call site, which also sees
     // small/negative shifted exponents): overflow requires `|value| >
     // f64::MAX` (~1.8e308), so `new_exp` is always well past `300` by the
-    // time this function is ever reached -- its own `debug_assert!` on a
-    // positive shift is what would catch a violation of that invariant, not
-    // a redundant check here.
-    if new_exp < digit_count {
-        let full_mantissa_str = full_mantissa_if_capped(s, exp_pos, &mantissa_str, digit_count);
-        // Provably always `Some` here (not just usually): `full_mantissa_str`
-        // is uncapped whenever `full_mantissa_if_capped` had to re-derive at
-        // all, so its own digit count equals `digit_count` exactly, and
-        // `format_positive_shifted_plain`'s `split_pos > digits.len()` guard
-        // reduces to the `new_exp < digit_count` this branch already
-        // checked. Kept as `if let` rather than `.expect(..)` so a future
-        // change to either function's contract fails safe (falls to
-        // scientific) instead of panicking.
-        if let Some(plain) =
-            format_positive_shifted_plain(sign, &full_mantissa_str, new_exp, digit_count)
-        {
-            return plain;
-        }
+    // time this function is ever reached -- `format_positive_shifted_plain`'s
+    // own `debug_assert!` on a positive shift is what would catch a
+    // violation of that invariant, not a redundant check here.
+    if let Some(plain) =
+        try_positive_shifted_plain(sign, s, exp_pos, new_exp, digit_count, &mantissa_str)
+    {
+        return plain;
     }
 
     assemble_scientific(sign, &mantissa_str, new_exp)
@@ -910,6 +923,17 @@ fn format_overflow_literal_mantissa(s: &str, exp_pos: usize, negative: bool) -> 
 /// caller's `value.is_sign_negative()`) still needs applying in every arm --
 /// real jq keeps the sign throughout, since `log10(0)` is undefined
 /// (`-0e5` -> `-0E+5`, `-0e0` -> `-0`, `-0.0e-1` -> `-0.00`).
+///
+/// **#1274 review note:** every arm below feeds its mantissa to
+/// `assemble_scientific`/`assemble_scientific_from_raw_exponent`, both
+/// bounded-prefix consumers that are safe with a `Some(MAX_RENDERED_MANTISSA_DIGITS)`-capped
+/// `mantissa_str` -- this function is safe *because* it has no plain-decimal
+/// branch, not because anything here enforces that. If a future change ever
+/// adds one (mirroring `format_shifted_mantissa`'s `-6..=-1` window or
+/// `format_positive_shifted_plain`'s), it must fetch an uncapped mantissa
+/// via `full_mantissa_if_capped` first, the same as every other caller that
+/// needs to echo every given digit -- reusing `mantissa_str` directly would
+/// reintroduce exactly the silent-truncation bug this issue fixed.
 fn format_near_zero_literal(s: &str, exp_pos: usize, negative: bool) -> String {
     let sign = if negative { "-" } else { "" };
     match normalize_extreme_literal_mantissa(s, exp_pos, Some(MAX_RENDERED_MANTISSA_DIGITS)) {
@@ -1066,6 +1090,46 @@ fn format_positive_shifted_plain(
     }
     let (before, after) = digits.split_at(split_pos);
     Some(join_sign_digits_with_optional_point(sign, before, after))
+}
+
+/// Attempt [`format_positive_shifted_plain`], fetching an uncapped mantissa
+/// via [`full_mantissa_if_capped`] only once eligibility (`shifted_exp <
+/// digit_count`) is confirmed -- the shared "gate on cap-independent
+/// eligibility, fetch, render" sequence both [`format_number_jq_compat`]
+/// and [`format_overflow_literal_mantissa`] need. `mantissa_str` is the
+/// caller's own (possibly `MAX_RENDERED_MANTISSA_DIGITS`-capped) mantissa;
+/// it's used as-is only to decide there's nothing to fetch (`full_mantissa_if_capped`'s
+/// own within-cap fast path), never passed uncapped-required call sites
+/// directly.
+///
+/// #1274 review: this exact sequence, plus ~15 lines of near-duplicate
+/// prose explaining why the gate-then-fetch ordering matters, was
+/// duplicated between the two call sites before this helper existed --
+/// shared here so a future fix to this pattern lands in one place instead
+/// of two.
+///
+/// `format_positive_shifted_plain` is provably always `Some` once reached
+/// here (not just usually): `full_mantissa_str` is uncapped whenever
+/// `full_mantissa_if_capped` had to re-derive at all, so its own digit
+/// count equals `digit_count` exactly, and `format_positive_shifted_plain`'s
+/// `split_pos > digits.len()` guard reduces to the `shifted_exp <
+/// digit_count` this function already checked above. Still returns
+/// `Option<String>` rather than unwrapping internally, so a future change
+/// to either function's contract fails safe (caller falls back to
+/// scientific notation) instead of panicking.
+fn try_positive_shifted_plain(
+    sign: &str,
+    s: &str,
+    exp_pos: usize,
+    shifted_exp: i128,
+    digit_count: i128,
+    mantissa_str: &str,
+) -> Option<String> {
+    if shifted_exp >= digit_count {
+        return None;
+    }
+    let full_mantissa_str = full_mantissa_if_capped(s, exp_pos, mantissa_str, digit_count);
+    format_positive_shifted_plain(sign, &full_mantissa_str, shifted_exp, digit_count)
 }
 
 /// An owned JSON value.
