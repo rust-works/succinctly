@@ -1,0 +1,346 @@
+# yq Behavioural Conformance and Known Divergences
+
+[Home](../../../) > [Docs](../../) > [Compliance](../) > yq Limitations
+
+This page records where `succinctly yq` behaves differently from `mikefarah/yq`, and why.
+It is the yq-mode counterpart to
+[jq Error Message Conformance](../jq/limitations.md), and it exists because
+[ADR-0018](../../adrs/adr-0018.md) requires it: that record makes yq-fidelity the rule for
+yq mode, permits divergence only under three named conditions, and obliges every divergence
+to be written down. **This page is the enumeration of exceptions to ADR-0018.** A divergence
+that is not recorded here is not a decision — it is a bug nobody has found yet.
+
+Everything below was captured from the pinned binary at
+[`tests/data/yq-golden/YQ_VERSION`](../../../tests/data/yq-golden/YQ_VERSION) (**v4.53.3**),
+with the command shown. Per ADR-0018's rule 1, a claim about real yq's behaviour is
+inadmissible here unless it came from that binary — never from recall, and never from
+succinctly's own output.
+
+```bash
+./scripts/sync-yq-golden.sh          # recapture the golden fixtures from the pinned yq
+./scripts/sync-yq-golden.sh --check  # verify they have not drifted
+cargo test --features cli --test yq_golden_tests --test yq_cli_tests
+```
+
+For YAML *spec* conformance rather than yq behavioural fidelity, see
+[YAML Test Suite Conformance](../yaml/limitations.md) and
+[YAML 1.2 Compliance](../yaml/1.2.md). For feature coverage and the yq-only surface, see
+[yq Query Language Reference](../../reference/yq-language.md).
+
+## Scope note: this page is narrative, not a manifest
+
+The jq page is backed by a probe corpus
+([`tests/data/jq-error-probes.tsv`](../../../tests/data/jq-error-probes.tsv)) with a
+two-sided manifest check, so it cannot silently drift. **The yq side has no equivalent.**
+Golden fixtures and the `yq-drift` CI job pin the cases that *are* captured, but nothing
+enumerates the divergences the fixtures do not cover. This page is therefore maintained by
+discipline, and it records categories with representative live-verified examples rather than
+claiming to be exhaustive. The full current list of known yq-mode gaps is the open issue set
+whose titles begin `yq:` — forty-five at the time of writing. Building a yq divergence
+manifest to close this hole is worth its own issue.
+
+## Deliberate divergences (ADR-0018 rule 4)
+
+These are the cases where succinctly knowingly does not match real yq. Each is measured
+against the three permitted conditions — including the one below that fails them, which is
+labelled as such rather than grandfathered.
+
+### Anchor soundness: never emit YAML we cannot read back — rule 4(a)
+
+Real yq emits YAML that real yq then refuses to parse. Two ordinary cases:
+
+```bash
+$ printf 'a: &x 1\nb: *x\n' | yq 'del(.a)'
+b: *x
+$ printf 'a: &x 1\nb: *x\n' | yq 'del(.a)' | yq '.'
+Error: bad file '-': yaml: line 1, column 5: unknown anchor 'x' referenced
+
+$ printf 'b: &x 1\na: *x\n' | yq 'sort_keys(.)'
+a: *x
+b: &x 1
+$ printf 'b: &x 1\na: *x\n' | yq 'sort_keys(.)' | yq '.'
+Error: bad file '-': yaml: line 1, column 5: unknown anchor 'x' referenced
+```
+
+succinctly refuses to produce that output. `enforce_anchor_soundness`
+([src/bin/succinctly/yq_runner.rs](../../../src/bin/succinctly/yq_runner.rs), from
+[#763](https://github.com/rust-works/succinctly/issues/763)) emits a `*name` only when a
+matching `&name` exists, is emitted **earlier**, and holds an **equal** value; otherwise the
+mark is dropped and the value printed:
+
+```bash
+$ printf 'a: &x 1\nb: *x\n' | succinctly yq 'del(.a)'
+b: 1
+```
+
+The equal-value clause also covers a genuine gap rather than papering over it: succinctly's
+alias sync is one-directional (anchor → aliases), so a write *through* an alias (`.b.p = 9`)
+updates only that position where real yq mutates the shared node. Emitting `*x` there would
+silently discard the write, so the mark is dropped and the computed value printed — rule
+4(b). True alias node identity remains unimplemented
+([#1351](https://github.com/rust-works/succinctly/issues/1351)).
+
+**Known gap in this rule.** `enforce_anchor_soundness` takes a `sort_keys` argument and
+handles it correctly — but only on the DOM path. The cursor-streaming path never calls it,
+so succinctly currently reproduces the unsound output it is supposed to prevent. The two
+paths disagree on the same document, which is what makes the gap unambiguous:
+
+```bash
+$ printf 'b: &x 1\na: *x\n' | succinctly yq --sort-keys '.'        # streaming
+a: *x
+b: &x 1
+$ printf 'b: &x 1\na: *x\n' | succinctly yq --sort-keys -P '.'     # DOM-forced (-P)
+a: 1
+b: &x 1
+
+$ printf 'b: &x 1\na: *x\n' | succinctly yq --sort-keys '.' | succinctly yq '.'
+Error: YAML parse error: unknown anchor 'x' referenced at offset 3
+```
+
+That is [#1350](https://github.com/rust-works/succinctly/issues/1350) — a bug against this
+carve-out, not a second carve-out. Related open items in the same family:
+[#1359](https://github.com/rust-works/succinctly/issues/1359) (a write that changes a node's
+kind drops its `&anchor`, where real yq keeps it),
+[#1360](https://github.com/rust-works/succinctly/issues/1360) (NaN false-positives the
+equal-value rule), [#1352](https://github.com/rust-works/succinctly/issues/1352) and
+[#1353](https://github.com/rust-works/succinctly/issues/1353).
+
+### Merge-flag `+` and `d` combined — **no carve-out; this one is out of policy**
+
+Real yq's `*+d` applies the deep-merge *and* the append, doubling the right operand.
+succinctly gives `+` clean priority instead:
+
+```bash
+$ printf 'a: [1, 2]\nb: [3, 4]\n' > arr.yaml
+$ yq         -o=json -I=0 '.a *=+d .b | .a' arr.yaml    # [3,4,3,4]
+$ succinctly yq -o=json -I=0 '.a *=+d .b | .a' arr.yaml # [1,2,3,4]
+```
+
+This was accepted as a "documented simplification" of behaviour that is surprising and
+untested upstream. Under ADR-0018 rule 4 that is **not** a valid justification — the output
+is readable, no data is corrupted and no process dies, so none of the three conditions
+applies. It is recorded here as a divergence to be either fixed or re-justified, not as a
+settled decision. The plain (non-combined) flags all match real yq:
+
+| Filter | real yq | succinctly |
+|---|---|---|
+| `.a *= .b` | `[3,4]` | `[3,4]` ✓ |
+| `.a *=+ .b` | `[1,2,3,4]` | `[1,2,3,4]` ✓ |
+| `.a *=d .b` | `[3,4]` | `[3,4]` ✓ |
+| `.a *=+d .b` | `[3,4,3,4]` | `[1,2,3,4]` ✗ |
+
+## Input-spec divergences (below ADR-0018's scope)
+
+ADR-0018 adjudicates *evaluator and CLI behaviour*. A divergence originating in which inputs
+the parser accepts, or in how a plain scalar's type resolves against a published spec, sits
+below that line: it is settled by the spec succinctly targets and recorded on the relevant
+spec page, not by a rule-4 carve-out. This section exists so the case is not mistaken for one.
+
+### YAML 1.1 legacy numeric forms
+
+succinctly resolves plain scalars per the YAML **1.2** core schema
+([src/yaml/scalar.rs](../../../src/yaml/scalar.rs)); real yq still accepts several YAML 1.1
+numeric spellings:
+
+```bash
+$ for v in 1_000 0X2A 0o17 0b101 +0x1A; do printf "a: $v\n" | yq -o=json -I=0 '.a'; done
+1000
+42
+15
+Error: json: error calling MarshalJSON for type *yqlib.CandidateNode: … parsing "0b101": invalid syntax
+Error: json: error calling MarshalJSON for type *yqlib.CandidateNode: … parsing "+0x1A": invalid syntax
+```
+
+succinctly answers `"1_000"`, `"0X2A"`, `15`, `"0b101"`, `"+0x1A"` — the 1.2 reading, with
+the non-1.2 spellings staying strings. So it agrees with real yq on `0o17` and diverges on
+the other four. The full table lives in
+[YAML 1.2 Compliance § Differences from System yq](../yaml/1.2.md#differences-from-system-yq);
+it is cross-referenced rather than duplicated here.
+
+An earlier draft filed this under rule 4(a), which was wrong twice over: 4(a) is about output
+the reference cannot re-read, and an *error* is not such output; and even read generously it
+would cover only the last two spellings, leaving `1_000` → `1000` and `0X2A` → `42` —
+perfectly consumable output that succinctly simply declines to match — with no justification
+at all. The justification is the spec target, which is why the case belongs here.
+
+## Open divergences (bugs, not decisions)
+
+Representative cases, each live-verified. These are gaps to close, listed here so they are
+not rediscovered from scratch.
+
+### Duplicate mapping keys
+
+The subject of [ADR-0018](../../adrs/adr-0018.md)'s worked example. Real yq preserves
+duplicate keys almost everywhere but collapses them under iteration, and succinctly matches
+neither side consistently — and, worse, answers differently depending on whether the same
+logical document arrived as JSON or YAML:
+
+```bash
+$ printf '{"b":1,"a":2,"b":3}' > dup.json
+$ printf 'b: 1\na: 2\nb: 3\n'   > dup.yaml
+
+$ yq            -o=json -I=0 'length' dup.json   # 3
+$ succinctly yq -o=json -I=0 'length' dup.json   # 2   <- format leaking into behaviour
+$ succinctly yq -o=json -I=0 'length' dup.yaml   # 3
+
+$ yq            -o=json -I=0 '[.[]]' dup.yaml    # [3,2]   — iteration collapses
+$ succinctly yq -o=json -I=0 '[.[]]' dup.yaml    # [1,2,3]
+```
+
+ADR-0018 rule 2 identifies the cause — `DocumentFields::keys_dedup()`
+([src/jq/document.rs](../../../src/jq/document.rs)) gates on input *format* where the
+reference tools decide on *mode*.
+
+**Both divergences above are [#1398](https://github.com/rust-works/succinctly/issues/1398).**
+[#1385](https://github.com/rust-works/succinctly/issues/1385) is scoped to **jq mode** (its
+own body: *"In jq mode, `succinctly jq` emits duplicate JSON object keys verbatim"*) and
+names [#1342](https://github.com/rust-works/succinctly/issues/1342) (`paths(node_filter)`),
+[#1343](https://github.com/rust-works/succinctly/issues/1343) (`-s`/`--eval-all`/`-i` bypass
+the fix) and [#1344](https://github.com/rust-works/succinctly/issues/1344)
+(`tostream`/`walk`/`recurse`) as the yq-side continuation. None of the four covers the format
+leak or the missing `.[]` collapse, which is why #1398 exists — recording them here is the
+first half of ADR-0018 rule 6, and filing them is the second.
+
+Pulling the other way: [#442](https://github.com/rust-works/succinctly/issues/442),
+[#478](https://github.com/rust-works/succinctly/issues/478) and
+[#868](https://github.com/rust-works/succinctly/issues/868) are closed decisions that
+deliberately made output *preserve* duplicate keys. They stand for yq mode; ADR-0018 rules 2
+and 3 revise them for jq mode only.
+
+### 3-argument `sub(re; s; flags)`
+
+The bare 2-arg form matches (see the next section). The 3-arg form does not, and real yq's
+own behaviour here has resisted every hypothesis tried
+([#1122](https://github.com/rust-works/succinctly/issues/1122)) — it returns an empty string
+for a `"g"` flag and ignores `"i"` entirely, and its `gsub` does not accept a third argument
+at all:
+
+| Filter on `"aaa"` | real yq | succinctly |
+|---|---|---|
+| `sub("a";"X";"g")` | `""` | `"XXX"` |
+| `sub("A";"X";"i")` | `"aaa"` | `"Xaa"` |
+| `gsub("a";"X";"g")` | `Error: 1:1: lexer: invalid input text` | `"XXX"` |
+
+### Presentation metadata lost on two whole output routes
+
+Neither route builds a `CommentTree`, so both drop comments, style **and** anchors together:
+`--inplace` never builds one ([#1349](https://github.com/rust-works/succinctly/issues/1349)),
+and any filter yielding multiple results — anything containing a comma — loses its cursor
+before one can be captured
+([#1361](https://github.com/rust-works/succinctly/issues/1361)). Both predate
+[ADR-0017](../../adrs/adr-0017.md)'s mechanism and neither is anchor-specific.
+
+### Other categories
+
+Float and number formatting ([#1071](https://github.com/rust-works/succinctly/issues/1071),
+[#1129](https://github.com/rust-works/succinctly/issues/1129),
+[#1356](https://github.com/rust-works/succinctly/issues/1356),
+[#1358](https://github.com/rust-works/succinctly/issues/1358)), error-message rendering
+(succinctly's previews format via jq's rules rather than yq's verbatim echo —
+[#1055](https://github.com/rust-works/succinctly/issues/1055)), comment placement
+([#1079](https://github.com/rust-works/succinctly/issues/1079),
+[#1080](https://github.com/rust-works/succinctly/issues/1080),
+[#1085](https://github.com/rust-works/succinctly/issues/1085)), and the regex engine's
+zero-width-match handling
+([#1255](https://github.com/rust-works/succinctly/issues/1255) — real yq uses Go's
+`regexp`). Also see
+[yq Query Language Reference § Known Limitations](../../reference/yq-language.md#known-limitations)
+for the feature-level gaps (`*`/`+` are not cartesian generators; position builtins after DOM
+conversion).
+
+## Where the two modes deliberately differ from each other
+
+Not divergences — these are ADR-0018 rule 2 working correctly. The same filter text means
+different things in `sjq` and `syq` because the two reference tools disagree, and succinctly
+follows each one in its own mode. The behavioural axis is `EvalSemantics`
+([src/jq/eval.rs](../../../src/jq/eval.rs)) — eleven `const`s plus an `EvalTag` identity tag
+— together with a handful of `S::TAG` tests at individual call sites:
+
+| Behaviour | `succinctly jq` (jq 1.7.1) | `succinctly yq` (yq v4.53.3) |
+|---|---|---|
+| Bare 2-arg `sub(re; s)` | first match only (`"aaa"` → `"Xaa"`) | **every** match (`"aaa"` → `"XXX"`) |
+| `@uri`/`@base64`/`@html` on a container | JSON-encodes first (`[1,2]` → `"%5B1%2C2%5D"`) | errors, as real yq does |
+| `keys` | sorted | document order (yq's `keys` *is* `keys_unsorted`) |
+| Integer overflow | converts to float | wraps |
+| Division by zero | errors | infinity |
+| `%` on floats | truncates operands | float modulo |
+| `has()`/`in()` on a negative index | `false`; type mismatch errors | `true` unconditionally; type mismatch is `false` |
+| `array * array` | type error | replaces (plus the merge-flag suffixes) |
+| `array + non-array` | type error | appends as one element |
+| `null` in a `*` merge | every pairing errors | acts as an empty container |
+| `2.0 == 2` | `true` | `false` (strict int/float distinction) |
+| Bare `halt_error` exit code | `5` | `1` |
+| `7 + null` / `null - 7` | `7` / error | error / `7` |
+
+Ten of these rows are `EvalSemantics` constants, each carrying its live-verification note in
+the trait's doc comments — `7 + null` / `null - 7` is one row over two constants,
+`ADD_RIGHT_NULL_REQUIRES_CONCAT_TYPE` and `SUB_LEFT_NULL_IS_IDENTITY`. **Three are not.**
+Bare `sub` and container `@uri`/`@base64` are `S::TAG == EvalTag::Yq` tests at their call
+sites in [src/jq/eval.rs](../../../src/jq/eval.rs), and `keys` is rewritten to
+`KeysUnsorted` at parse time under `ParserMode::Yq`
+([src/jq/parser.rs](../../../src/jq/parser.rs)). More than forty `S::TAG` sites exist in
+`src/` in total.
+
+That split is the debt ADR-0018 rule 2 is aimed at, not a counterexample to it: a constant is
+discoverable from the trait definition, whereas a call-site test is discoverable only by
+grep — which is how a mode difference ends up re-derived instead of looked up. Prefer a
+constant for a new row, and lift a branch to one when you are already editing it. Either way,
+because a builtin generic over `S: EvalSemantics` is shared by both modes, any change to one
+must be verified in the other (ADR-0018 rule 2).
+
+## Extensions
+
+succinctly adds capabilities neither reference has — `at_offset`/`at_position`,
+`leaf_paths`, `@dsv`. Under ADR-0018 rule 5 these are a third category: permitted where
+marked as extensions and where they change the behaviour of no filter the reference also
+accepts. They are documented in
+[yq Query Language Reference](../../reference/yq-language.md) and in
+[CLAUDE.md](../../../CLAUDE.md), not here — an extension is not a divergence.
+
+**Not extensions, though a draft of this page listed them as such:** `--front-matter`,
+`--split-exp`, and cross-file evaluation. All three are real yq surface —
+`yq --help` lists `-f, --front-matter` and `-s, --split-exp`, and yq evaluates across
+multiple files under `eval-all` — and
+[#715](https://github.com/rust-works/succinctly/issues/715) filed all three together as
+*missing* yq features, not as succinctly inventions. They therefore carry an ordinary
+fidelity obligation. succinctly's `--split-exp` is long-only because its `-s` is already
+`--slurp`, which is a spelling divergence and belongs above, not here.
+
+Getting this backwards is worse than it looks: rule 5 exempts extensions from rule 4, so
+labelling reference surface an "extension" silently retires a fidelity obligation. Check
+`yq --help` before adding to the list above.
+
+## Provenance
+
+| Artifact | Path |
+|---|---|
+| Version pin | [`tests/data/yq-golden/YQ_VERSION`](../../../tests/data/yq-golden/YQ_VERSION) |
+| Golden fixtures | [`tests/data/yq-golden/cases/`](../../../tests/data/yq-golden/cases/) |
+| Golden harness | [`tests/yq_golden_tests.rs`](../../../tests/yq_golden_tests.rs) |
+| CLI behaviour tests | [`tests/yq_cli_tests.rs`](../../../tests/yq_cli_tests.rs) |
+| Sync script | [`scripts/sync-yq-golden.sh`](../../../scripts/sync-yq-golden.sh) |
+| Drift detector | `yq-drift` job in [`.github/workflows/ci.yml`](../../../.github/workflows/ci.yml) |
+| Mode-behaviour axis | [`src/jq/eval.rs`](../../../src/jq/eval.rs) (`EvalSemantics`) |
+
+The goldens are committed, so `cargo test` runs hermetically with no `yq` on PATH; the
+`yq-drift` job re-checks them against the pinned binary, so a yq upgrade surfaces as fixture
+churn rather than a silent mismatch.
+
+## Depends On
+
+- [ADR-0018](../../adrs/adr-0018.md) - the fidelity rule this page enumerates exceptions to
+- [ADR-0017](../../adrs/adr-0017.md) - presentation-metadata side-trees (anchors, comments, style)
+- [yq Query Language Reference](../../reference/yq-language.md) - feature coverage
+- [YAML 1.2 Compliance](../yaml/1.2.md) - scalar type resolution, incl. the 1.1 numeric forms
+
+## Used By
+
+- [yq benchmarks](../../benchmarks/yq.md) - comparison against `yq`
+
+## Source & Docs
+
+- [`src/jq/eval.rs`](../../../src/jq/eval.rs) - `EvalSemantics`, the per-mode behaviour axis
+- [`src/bin/succinctly/yq_runner.rs`](../../../src/bin/succinctly/yq_runner.rs) - `enforce_anchor_soundness`
+- [`src/jq/document.rs`](../../../src/jq/document.rs) - `DocumentFields`, incl. the `keys_dedup()` violation
+- [jq Limitations](../jq/limitations.md) - the jq-mode counterpart to this page
+- [mikefarah/yq](https://github.com/mikefarah/yq) - upstream reference
