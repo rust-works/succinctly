@@ -11172,6 +11172,17 @@ enum PrefixNavOutcome<'a> {
 /// distinction (`del()`'s own scalar-root behavior is a separate, unscoped
 /// gap — #1411) and folds `HitScalar` back into "this rule doesn't apply",
 /// same as it always treated `None`.
+///
+/// A second, hand-synchronized walker rather than a shared traversal
+/// `get_path_mut` itself could call — code review flagged this against the
+/// same "duplicated predicates diverge silently" lesson `is_owned_container`
+/// was factored out to avoid (#106). Kept separate anyway: the two have
+/// different write permissions (this one is read-only by design, the other
+/// mutates and autovivifies), so unifying them is a real redesign, not a
+/// mechanical extraction. If a future `Field`/`Index` arm gains a new
+/// container-mismatch case (or `OwnedValue` gains a variant) in one walker,
+/// mirror it here too — a drift would make `yq_assign_is_total_noop`
+/// disagree with what the real write does.
 fn navigate_read_only<'a>(root: &'a OwnedValue, steps: &[Expr]) -> PrefixNavOutcome<'a> {
     let mut current = root;
     for step in steps {
@@ -12628,20 +12639,25 @@ fn get_path_mut<'a>(
             continue;
         }
 
+        // #1232: same terminal-position no-op #1181 gave `set_path`'s own
+        // `Field`/`Index` arms, applied here so a scalar hit *before* the
+        // last path component (`.a.b = 99` on a scalar root) no-ops instead
+        // of erroring while still navigating toward the parent. Computed
+        // once per iteration rather than at each arm's own `else if`
+        // (previously duplicated across both): `autovivify_object`/
+        // `autovivify_array` below only ever convert `Null` into a
+        // container, and `is_yq_field_index_noop_scalar` already excludes
+        // `Null`, so the answer is identical whether checked before or
+        // after autovivification runs.
+        let noop_here = scalar_noop && is_yq_field_index_noop_scalar(current);
+
         current = match part {
             Expr::Identity => current,
             Expr::Field(name) => {
                 autovivify_object(current);
                 if let OwnedValue::Object(map) = current {
                     map.entry(name.clone()).or_insert(OwnedValue::Null)
-                } else if optional
-                    // #1232: same terminal-position no-op #1181 gave
-                    // `set_path`'s own `Field` arm, applied here so a scalar
-                    // hit *before* the last path component (`.a.b = 99` on a
-                    // scalar root) no-ops instead of erroring while still
-                    // navigating toward the parent.
-                    || (scalar_noop && is_yq_field_index_noop_scalar(current))
-                {
+                } else if optional || noop_here {
                     return Ok(None);
                 } else {
                     return Err(EvalError::cannot_index_with_field(
@@ -12660,7 +12676,7 @@ fn get_path_mut<'a>(
                     // returns that error for a component this function can
                     // itself elect to suppress.
                     write_index(arr, *idx)?
-                } else if optional || (scalar_noop && is_yq_field_index_noop_scalar(current)) {
+                } else if optional || noop_here {
                     return Ok(None);
                 } else {
                     return Err(EvalError::cannot_index_with_type(
@@ -12701,6 +12717,15 @@ fn update_path<S: EvalSemantics>(
     // recursive call. Bound once here rather than recomputed inline at each
     // `Expr::Slice` arm below, so the two can't drift out of sync.
     let container_noop = S::TAG == EvalTag::Yq;
+    // #1181/#1232's yq-mode scalar-target no-op, bound once for the same
+    // reason as `container_noop` above rather than repeated at each of this
+    // function's six `Field`/`Index`/`Iterate` arms (three terminal, three
+    // in the `Pipe` arm's own mid-chain duplicate). Safe to compute before
+    // any arm runs: every arm's own `autovivify_object`/`autovivify_array`
+    // call only ever converts a `Null` `root` into an (empty) container,
+    // and `is_yq_field_index_noop_scalar` already excludes `Null`, so the
+    // answer is identical whether checked before or after autovivification.
+    let noop_scalar = S::TAG == EvalTag::Yq && is_yq_field_index_noop_scalar(root);
     match path_expr {
         Expr::Identity => {
             // The filter runs as an ordinary sub-expression, not one
@@ -12749,7 +12774,7 @@ fn update_path<S: EvalSemantics>(
                 // the same as `.a |= f`, unlike the slice case, which
                 // diverges for both operators in ways this codebase
                 // doesn't implement yet (#1340's own follow-up).
-                || (S::TAG == EvalTag::Yq && is_yq_field_index_noop_scalar(root))
+                || noop_scalar
             {
                 Ok(())
             } else {
@@ -12766,7 +12791,7 @@ fn update_path<S: EvalSemantics>(
                     optional,
                     scalar_noop,
                 )
-            } else if optional || (S::TAG == EvalTag::Yq && is_yq_field_index_noop_scalar(root)) {
+            } else if optional || noop_scalar {
                 Ok(())
             } else {
                 Err(EvalError::cannot_index_with_type(owned_type_name(root), "number").into())
@@ -12807,9 +12832,7 @@ fn update_path<S: EvalSemantics>(
                     }
                     Ok(())
                 }
-                _ if optional || (S::TAG == EvalTag::Yq && is_yq_field_index_noop_scalar(root)) => {
-                    Ok(())
-                }
+                _ if optional || noop_scalar => Ok(()),
                 _ => Err(EvalError::cannot_iterate(root).into()),
             }
         }
@@ -12838,7 +12861,7 @@ fn update_path<S: EvalSemantics>(
                             // no-op check -- applied here too so a scalar hit
                             // *before* the last path component (`.a.b |= 99`
                             // on a scalar root) no-ops instead of erroring.
-                            || (S::TAG == EvalTag::Yq && is_yq_field_index_noop_scalar(root))
+                            || noop_scalar
                         {
                             Ok(())
                         } else {
@@ -12858,9 +12881,7 @@ fn update_path<S: EvalSemantics>(
                                 optional,
                                 scalar_noop,
                             )
-                        } else if here
-                            || (S::TAG == EvalTag::Yq && is_yq_field_index_noop_scalar(root))
-                        {
+                        } else if here || noop_scalar {
                             Ok(())
                         } else {
                             Err(
@@ -12882,11 +12903,7 @@ fn update_path<S: EvalSemantics>(
                             }
                             Ok(())
                         }
-                        _ if here
-                            || (S::TAG == EvalTag::Yq && is_yq_field_index_noop_scalar(root)) =>
-                        {
-                            Ok(())
-                        }
+                        _ if here || noop_scalar => Ok(()),
                         _ => Err(EvalError::cannot_iterate(root).into()),
                     },
                     // `resolve_node`'s `?` arm emits `Optional(Pipe([…]))`

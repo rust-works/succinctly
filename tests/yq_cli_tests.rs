@@ -15146,8 +15146,13 @@ fn test_yq_scalar_target_noop_pre_last_component_1232() -> Result<()> {
 /// live-verified as *already* true for the terminal case #1233 covers
 /// (`0 as $k | .[$k] = error("boom")` on a scalar root still raises `boom`
 /// in succinctly where real yq no-ops silently) -- a real, separate gap,
-/// not something #1232 introduces or is scoped to fix. Filed as its own
-/// follow-up rather than folded in here.
+/// not something #1232 introduces or is scoped to fix. Filed as #1419
+/// rather than folded in here (that issue also covers a more severe
+/// sibling: a *literal tail after* a resolved dynamic key, e.g.
+/// `"a" as $k | .[$k].b = 99`, fails the write itself, not just the
+/// RHS-discard optimization -- `resolve_node`'s own dynamic-path
+/// resolution has no yq scalar-noop awareness at all, unlike the
+/// static-path walkers `get_path_mut`/`update_path` this PR fixes).
 #[test]
 fn test_yq_scalar_target_noop_pre_last_component_dynamic_index_1232() -> Result<()> {
     let (out, err, code) = run_yq_stdin_with_stderr(
