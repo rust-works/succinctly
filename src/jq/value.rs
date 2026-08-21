@@ -20,9 +20,9 @@ use std::borrow::Cow;
 use indexmap::IndexMap;
 
 use super::escape::{escape_json_body, write_json_body_jq};
-#[cfg(test)]
-use super::eval::JqSemantics;
 use super::eval::{EvalSemantics, EvalTag};
+#[cfg(test)]
+use super::eval::{JqSemantics, YqSemantics};
 use super::expr::Literal;
 
 /// Recursion-depth ceiling for tree-walkers over an already-materialized
@@ -3083,8 +3083,20 @@ mod tests {
         assert_eq!(lit.to_json_for_reindex::<JqSemantics>(), short_literal);
 
         let huge_zero_literal = format!("0.{}e-400", "0".repeat(200_000));
-        let lit = OwnedValue::NumberLiteral(NumberRepr::Float(0.0), huge_zero_literal.into());
+        let lit =
+            OwnedValue::NumberLiteral(NumberRepr::Float(0.0), huge_zero_literal.clone().into());
         let out = lit.to_json_for_reindex::<JqSemantics>();
+        assert!(
+            out.len() < 100,
+            "expected a short, bounded fallback, got {} bytes",
+            out.len()
+        );
+
+        // Yq mode takes a separate branch for the same fallback
+        // (`format_float_with_fraction` instead of `jq_bare_float_display`,
+        // gated on `S::TAG`) -- must be bounded too.
+        let lit = OwnedValue::NumberLiteral(NumberRepr::Float(0.0), huge_zero_literal.into());
+        let out = lit.to_json_for_reindex::<YqSemantics>();
         assert!(
             out.len() < 100,
             "expected a short, bounded fallback, got {} bytes",
