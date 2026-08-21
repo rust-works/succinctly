@@ -3375,8 +3375,8 @@ fn write_f64(output: &mut String, f: f64) {
 /// If `canonicalize` and `resolved` is a finite `Float`, the value to
 /// re-serialize through bare `f64` `Display` instead of the scalar's own
 /// source-text spelling -- matching the DOM path's
-/// `canonicalize_json_numbers`/`OwnedValue::into_plain_number` baseline
-/// for JSON-sourced input (#996), not real yq's own threshold-switching
+/// `to_owned_canonicalizing_numbers`/`OwnedValue::from_number_literal_plain`
+/// baseline for JSON-sourced input (#996), not real yq's own threshold-switching
 /// convention for *computed* floats ([`format_float_yq`], a different,
 /// unrelated case -- see that function's own doc comment). `None`
 /// otherwise: the caller falls back to its own literal-preserving logic
@@ -3915,7 +3915,7 @@ fn stream_resolved_scalar_as_json<Out: core::fmt::Write>(
     // #996: real yq never preserves a JSON-sourced float's literal
     // spelling -- `1.50` becomes `1.5`, `1e2` becomes `100` -- matching
     // `OwnedValue::to_json`'s own bare `write!(out, "{f}")` for the DOM
-    // path's already-canonicalized `Float` variant (`canonicalize_json_numbers`
+    // path's already-canonicalized `Float` variant (`to_owned_canonicalizing_numbers`
     // in `yq_runner.rs`). Checked before the literal-preserving arms
     // below, which exist only for genuine YAML source text.
     if let Some(f) = json_sourced_canonical_float(resolved, canonicalize) {

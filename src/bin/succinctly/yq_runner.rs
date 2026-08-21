@@ -9,10 +9,12 @@ use indexmap::IndexMap;
 use std::io::{BufWriter, IsTerminal, Read, Write};
 use std::path::Path;
 
-use succinctly::jq::document::{DocumentCursor, DocumentFields, IndentSpec};
+use succinctly::jq::document::{
+    DocumentCursor, DocumentElements, DocumentFields, DocumentValue, IndentSpec,
+};
 use succinctly::jq::eval_generic::{
-    eval_with_cursor_using, to_owned as generic_to_owned, to_owned_with_comments, CommentTree,
-    GenericResult,
+    assert_nesting_depth, eval_with_cursor_using, to_owned as generic_to_owned,
+    to_owned_with_comments, CommentTree, GenericResult,
 };
 use succinctly::jq::{
     self, assert_value_tree_depth, nonfinite_display_string, sync_aliased_paths, Builtin,
@@ -401,23 +403,99 @@ fn gather_input_sources(
     Ok(GatheredSources::Sources(sources))
 }
 
+/// Materializes a `DocumentValue` into an `OwnedValue` the same way
+/// `eval_generic::to_owned` does, except every number collapses straight to
+/// `Int`/`Float` in this single walk rather than boxing a `NumberLiteral`
+/// first. Real yq's own `--input-format json` path never preserves a
+/// JSON-sourced number's exact spelling regardless of whether the filter
+/// touches it (#978) -- unlike YAML input (#918, correctly preserved) --
+/// so this used to be a second full pass here, `canonicalize_json_numbers`,
+/// over `to_owned`'s own already-materialized tree (rebuilding every
+/// `Array`/`Object` a second time, even subtrees with no numbers at all,
+/// just to strip the spelling `to_owned` had just boxed) (#999).
+///
+/// Kept local to this file rather than added to the shared
+/// `eval_generic`/`jq` library, which `to_owned` and every other
+/// `DocumentValue` materializer there live in and stay
+/// format/tool-agnostic: this is a yq-CLI-specific, `--input-format json`-
+/// specific oracle quirk (matching real yq's own number handling, not a
+/// property of JSON or of this evaluator in general), and the library's own
+/// `to_owned_at_depth` is also called from its internal recursion (YAML
+/// explicit-tag resolution), which must keep preserving a document's own
+/// number spelling unconditionally -- a `pub`, `DocumentValue`-generic
+/// twin living in the library next to it would be reachable (with no
+/// compiler guard) by a future YAML or `succinctly jq` call site, silently
+/// reintroducing the #918 bug this project was built to avoid (#999
+/// review). `OwnedValue::from_number_literal_plain` is the one small,
+/// clearly-scoped primitive the library exports for this -- everything
+/// else about the walk stays here, matching where `canonicalize_json_numbers`
+/// always lived before this fix, just fused into one pass instead of two.
+fn to_owned_canonicalizing_numbers<V: DocumentValue>(value: &V) -> OwnedValue {
+    to_owned_canonicalizing_numbers_at_depth(value, 0)
+}
+
+fn to_owned_canonicalizing_numbers_at_depth<V: DocumentValue>(
+    value: &V,
+    depth: usize,
+) -> OwnedValue {
+    // `assert_nesting_depth` (256, matching `eval_generic::to_owned_at_depth`
+    // exactly), not `assert_value_tree_depth` (384) -- this walks a
+    // `DocumentCursor`-backed `V` directly, the same recursion shape
+    // `to_owned_at_depth` guards with the tighter limit, not the looser
+    // guard the old two-pass code used for its *second* pass over an
+    // already-materialized `OwnedValue` tree (#999 review: reusing the
+    // looser guard here would have quietly raised the effective limit for
+    // `--input-format json` documents from 256 to 384, since this is now
+    // the only pass -- there's no first, 256-guarded `to_owned` call ahead
+    // of it anymore to bind the real ceiling).
+    assert_nesting_depth(depth);
+    if let Some(fields) = value.as_object() {
+        let mut map = IndexMap::new();
+        let mut f = fields;
+        while let Some((field, rest)) = f.uncons() {
+            if let Some(key) = field.key_str() {
+                map.insert(
+                    key.into_owned(),
+                    to_owned_canonicalizing_numbers_at_depth(&field.value, depth + 1),
+                );
+            }
+            f = rest;
+        }
+        OwnedValue::Object(map)
+    } else if let Some(elements) = value.as_array() {
+        let mut items = Vec::new();
+        let mut elems = elements;
+        while let Some((elem, rest)) = elems.uncons() {
+            items.push(to_owned_canonicalizing_numbers_at_depth(&elem, depth + 1));
+            elems = rest;
+        }
+        OwnedValue::Array(items)
+    } else if value.is_null() {
+        OwnedValue::Null
+    } else if let Some(b) = value.as_bool() {
+        OwnedValue::Bool(b)
+    } else if let Some(literal) = value.number_literal() {
+        OwnedValue::from_number_literal_plain(&literal)
+    } else if let Some(i) = value.as_i64() {
+        OwnedValue::Int(i)
+    } else if let Some(f) = value.as_f64() {
+        OwnedValue::Float(f)
+    } else if let Some(s) = value.as_str() {
+        OwnedValue::String(s.into_owned())
+    } else {
+        // Matches `to_owned_at_depth`'s own `else` arm (#1098) --
+        // unaffected by number canonicalization.
+        OwnedValue::Null
+    }
+}
+
 /// Parse input bytes according to the specified format.
 fn parse_input(bytes: &[u8], format: InputFormat) -> Result<Vec<OwnedValue>> {
     match format {
         InputFormat::Json => {
-            // Real yq's own `--input-format json` path never preserves a
-            // JSON number's source spelling (#978) -- unlike YAML input
-            // (#918, correctly preserved). `json_bytes_to_owned_value_canonicalized`
-            // collapses every number straight to `Int`/`Float` in one pass
-            // (#999; this used to be `json_bytes_to_owned_value` -- which
-            // preserves spelling as `NumberLiteral`, needed by `succinctly
-            // jq`'s own conversion and `--argjson` -- followed by a second,
-            // now-removed full-tree pass, `canonicalize_json_numbers`, that
-            // walked the whole document again just to strip that spelling
-            // back off).
-            Ok(vec![
-                crate::output::json_bytes_to_owned_value_canonicalized(bytes),
-            ])
+            let index = JsonIndex::build(bytes);
+            let cursor = index.root(bytes);
+            Ok(vec![to_owned_canonicalizing_numbers(&cursor.value())])
         }
         InputFormat::Yaml | InputFormat::Auto => {
             // Parse as YAML (Auto defaults to YAML when no extension hint)
@@ -559,10 +637,10 @@ fn evaluate_yaml_direct_filtered(
 /// - Only the *fallback* arm — a plain, already-literal-less `Float` — is
 ///   `S`-gated, and `YqSemantics` there is actively wrong for this call
 ///   site specifically: `parse_input`'s `--input-format json` path already
-///   collapses every `NumberLiteral` to a plain `Float`/`Int` via
-///   `canonicalize_json_numbers` (#978, matching real yq's "a JSON-sourced
-///   number never keeps its own spelling" convention) *before* the value
-///   ever reaches here — forcing `YqSemantics`'s decimal point back onto
+///   collapses every number straight to a plain `Float`/`Int` via
+///   `to_owned_canonicalizing_numbers` (#978, matching real yq's "a
+///   JSON-sourced number never keeps its own spelling" convention) *before*
+///   the value ever reaches here — forcing `YqSemantics`'s decimal point back onto
 ///   that already-canonicalized value reintroduced exactly the bug #978
 ///   fixed (`--slurp --input-format json '.'` on `{"a":1e2}` regressed from
 ///   `[{"a":100}]` to `[{"a":100.0}]`, caught by CI). `JqSemantics`'s bare
@@ -2060,7 +2138,7 @@ fn colorize_yaml(yaml: &str) -> String {
 /// `--argjson` flag at all, so there's no oracle to match on fidelity
 /// specifically, and yq's own `--input-format json` path already discards
 /// JSON-sourced number fidelity on purpose (#978,
-/// `canonicalize_json_numbers`). Adding fidelity only here would make
+/// `to_owned_canonicalizing_numbers`). Adding fidelity only here would make
 /// `--argjson` *inconsistent* with that established convention rather than
 /// fix a real divergence.
 fn parse_json_value(s: &str) -> Result<OwnedValue> {
@@ -2642,7 +2720,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
     // M2's performance *and* its incidental duplicate-key preservation
     // (#996) to fix a real bug: neither M2 streamer discarded a JSON
     // number's own decimal-point/exponent spelling the way the DOM path's
-    // `canonicalize_json_numbers` does (`1.50` stayed `1.50`, `1e2` became
+    // `to_owned_canonicalizing_numbers` does (`1.50` stayed `1.50`, `1e2` became
     // `100.0` instead of real yq's `100`). #996 fixed that at the source
     // instead — `YamlIndex::mark_json_sourced` (set below, right after
     // each M2-path `YamlIndex::build` call) makes `src/yaml/light.rs`'s
@@ -4505,6 +4583,144 @@ mod tests {
             result.is_err(),
             "emit_yaml_value should panic at MAX_VALUE_TREE_DEPTH"
         );
+    }
+
+    /// `{"k":{"k":...{}...}}`, `depth` levels of `"k"` nesting, terminating
+    /// in `{}` -- mirrors `eval_generic.rs`'s own `linear_nest`.
+    fn linear_json_nest(depth: usize) -> String {
+        format!("{}{{}}{}", "{\"k\":".repeat(depth), "}".repeat(depth))
+    }
+
+    /// #999: `to_owned_canonicalizing_numbers` is a genuinely separate
+    /// recursion from `to_owned` (kept local to this file rather than
+    /// added to the shared library, #999 review), so its own
+    /// `assert_nesting_depth` call needed its own pinning test. 255/256,
+    /// not `MAX_VALUE_TREE_DEPTH`'s 384: this walks a `DocumentCursor`
+    /// directly, the same recursion shape `to_owned_at_depth` guards with
+    /// the tighter `MAX_NESTING_DEPTH`, not the looser guard the old
+    /// two-pass code's *second* pass (over an already-materialized
+    /// `OwnedValue` tree) used.
+    #[test]
+    fn to_owned_canonicalizing_numbers_panics_past_nesting_depth_limit_999() {
+        let json = linear_json_nest(255);
+        let index = JsonIndex::build(json.as_bytes());
+        let cursor = index.root(json.as_bytes());
+        let owned = to_owned_canonicalizing_numbers(&cursor.value());
+        assert!(matches!(owned, OwnedValue::Object(_)));
+
+        let json = linear_json_nest(256);
+        let index = JsonIndex::build(json.as_bytes());
+        let cursor = index.root(json.as_bytes());
+        let value = cursor.value();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            to_owned_canonicalizing_numbers(&value)
+        }));
+        assert!(
+            result.is_err(),
+            "to_owned_canonicalizing_numbers should panic at depth 256"
+        );
+    }
+
+    /// #999: `to_owned_canonicalizing_numbers` collapses every number
+    /// straight to `Int`/`Float`, unlike `to_owned`'s `NumberLiteral` --
+    /// pins the exact behavior the fused single-pass replaces `to_owned` +
+    /// `canonicalize_json_numbers`'s two-pass sequence with
+    /// (`yq_cli_tests.rs`'s golden/CLI tests cover the end-to-end CLI
+    /// behavior; this pins the function's own contract directly).
+    #[test]
+    fn to_owned_canonicalizing_numbers_collapses_number_literals() {
+        let json = br#"{"int": 1, "float": 1.50, "exp": 1e2, "neg": -3, "arr": [1.0, 2], "s": "x", "b": true, "n": null}"#;
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let owned = to_owned_canonicalizing_numbers(&cursor.value());
+        let OwnedValue::Object(map) = owned else {
+            panic!("expected an object")
+        };
+        assert_eq!(map.get("int"), Some(&OwnedValue::Int(1)));
+        assert_eq!(map.get("float"), Some(&OwnedValue::Float(1.5)));
+        assert_eq!(map.get("exp"), Some(&OwnedValue::Float(100.0)));
+        assert_eq!(map.get("neg"), Some(&OwnedValue::Int(-3)));
+        assert_eq!(
+            map.get("arr"),
+            Some(&OwnedValue::Array(vec![
+                OwnedValue::Float(1.0),
+                OwnedValue::Int(2)
+            ]))
+        );
+        assert_eq!(map.get("s"), Some(&OwnedValue::String("x".to_string())));
+        assert_eq!(map.get("b"), Some(&OwnedValue::Bool(true)));
+        assert_eq!(map.get("n"), Some(&OwnedValue::Null));
+
+        // No `NumberLiteral` anywhere in the result -- every number
+        // collapsed, unlike `to_owned`'s own output for the same input.
+        for v in map.values() {
+            assert!(
+                !matches!(v, OwnedValue::NumberLiteral(..)),
+                "found a NumberLiteral in canonicalized output: {v:?}"
+            );
+        }
+    }
+
+    /// #999 review: `to_owned_canonicalizing_numbers_at_depth`'s `as_i64`/
+    /// `as_f64` fallback arms (reached when `number_literal()` returns
+    /// `None`) looked unreachable via JSON at first glance -- but the
+    /// semi-index scanner accepts a *wider* set of number spans than
+    /// `is_valid_number`'s strict RFC 8259 check (#966's own doc comment on
+    /// `number_literal()`), and `as_i64`/`as_f64` parse that same raw span
+    /// with Rust's own, more lenient `str::parse`. A trailing- or
+    /// leading-dot span (`5.`, `.5`) is exactly that: RFC 8259 requires a
+    /// digit on both sides of the decimal point, so `is_valid_number`
+    /// rejects it and `number_literal()` returns `None` -- but Rust's
+    /// `f64::from_str` accepts both forms outright, so `as_f64` succeeds
+    /// where the strict path declined. Confirmed live (`succinctly yq
+    /// --input-format json 'to_entries'`) before writing this as a unit
+    /// test: real yq itself has no opinion here (Go's own JSON reader
+    /// rejects both spans as a parse error, unlike this crate's lenient
+    /// semi-indexer), so this pins *this* crate's own accepted behavior,
+    /// not an oracle-matched one.
+    #[test]
+    fn to_owned_canonicalizing_numbers_falls_back_to_as_f64_for_lenient_spans() {
+        for json in [br#"{"n": 5.}"#.as_slice(), br#"{"n": .5}"#.as_slice()] {
+            let index = JsonIndex::build(json);
+            let cursor = index.root(json);
+            let owned = to_owned_canonicalizing_numbers(&cursor.value());
+            let OwnedValue::Object(map) = owned else {
+                panic!("expected an object for {json:?}")
+            };
+            assert!(
+                matches!(map.get("n"), Some(OwnedValue::Float(_))),
+                "expected a Float for {json:?}, got {:?}",
+                map.get("n")
+            );
+        }
+    }
+
+    /// #999 review: a lenient-but-unparseable span (multiple decimal
+    /// points, a bare minus, a trailing exponent marker with no digits, ...)
+    /// falls all the way through to the final `else` arm -- `as_i64`/
+    /// `as_f64` both decline too, since the raw text isn't a valid number by
+    /// any of Rust's own parsers either. Matches `to_owned`'s identical
+    /// degrade-to-`Null` behavior for the same inputs (confirmed live).
+    #[test]
+    fn to_owned_canonicalizing_numbers_degrades_unparseable_spans_to_null() {
+        for json in [
+            br#"{"n": 1.2.3}"#.as_slice(),
+            br#"{"n": 1-2}"#.as_slice(),
+            br#"{"n": 1e}"#.as_slice(),
+        ] {
+            let index = JsonIndex::build(json);
+            let cursor = index.root(json);
+            let owned = to_owned_canonicalizing_numbers(&cursor.value());
+            let OwnedValue::Object(map) = owned else {
+                panic!("expected an object for {json:?}")
+            };
+            assert_eq!(
+                map.get("n"),
+                Some(&OwnedValue::Null),
+                "expected Null for {json:?}, got {:?}",
+                map.get("n")
+            );
+        }
     }
 
     /// `depth` levels of single-child `CommentTree::Array` nesting, mirroring
