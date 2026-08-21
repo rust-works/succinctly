@@ -565,7 +565,7 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             eval_slice_expr::<W, S>(target, start, end, value, optional)
         }
 
-        Expr::Slice { start, end } => match value {
+        Expr::Slice { start, end } | Expr::SliceNumber { start, end, .. } => match value {
             StandardJson::Array(elements) => {
                 // Fast path: full slice [:] / [0:] returns the original array unchanged
                 if matches!(start, None | Some(0)) && end.is_none() {
@@ -10789,7 +10789,7 @@ fn is_yq_field_index_noop_scalar(target: &OwnedValue) -> bool {
 /// own, unlike assignment's still-scalar-scoped rule above.
 pub(crate) fn is_yq_scalar_slice_assign_path(path_expr: &Expr) -> bool {
     match path_expr {
-        Expr::Slice { .. } => true,
+        Expr::Slice { .. } | Expr::SliceNumber { .. } => true,
         Expr::Optional(inner) | Expr::Paren(inner) => is_yq_scalar_slice_assign_path(inner),
         _ => false,
     }
@@ -10924,7 +10924,7 @@ fn yq_del_slice_outcome(
     flatten_delete_path(path_expr, false, &mut steps);
     if !steps
         .iter()
-        .any(|s| matches!(s.component, Expr::Slice { .. }))
+        .any(|s| matches!(s.component, Expr::Slice { .. } | Expr::SliceNumber { .. }))
     {
         return YqDelSliceOutcome::NotApplicable;
     }
@@ -10935,7 +10935,12 @@ fn yq_del_slice_outcome(
     // the same "drop what's before the run" target; a run of 3 behaves
     // identically to a run of 2). `cut` is the index where that run begins.
     let mut cut = steps.len();
-    while cut > 0 && matches!(steps[cut - 1].component, Expr::Slice { .. }) {
+    while cut > 0
+        && matches!(
+            steps[cut - 1].component,
+            Expr::Slice { .. } | Expr::SliceNumber { .. }
+        )
+    {
         cut -= 1;
     }
     if cut == steps.len() {
@@ -10946,7 +10951,7 @@ fn yq_del_slice_outcome(
     let prefix = &steps[..cut];
     if prefix
         .iter()
-        .any(|s| matches!(s.component, Expr::Slice { .. }))
+        .any(|s| matches!(s.component, Expr::Slice { .. } | Expr::SliceNumber { .. }))
     {
         // An interior slice separated from the trailing run by something
         // else (`del(.a[0:2][1][3:5])`) still no-ops the whole call, even
@@ -11762,7 +11767,7 @@ fn set_path(
         // an array — that is the whole reason jq has a separate sentence for
         // it. An out-of-range range clamps rather than erroring, unlike the
         // `Expr::Index` arm above: `[1,2,3] | .[5:9] = ["x"]` appends.
-        Expr::Slice { start, end } => through_slice(
+        Expr::Slice { start, end } | Expr::SliceNumber { start, end, .. } => through_slice(
             root,
             *start,
             *end,
@@ -12105,7 +12110,7 @@ fn split_at_slice(exprs: &[Expr]) -> Option<SliceSplit> {
     if exprs.iter().all(|e| {
         !matches!(
             unwrap_path_component(e).0,
-            Expr::Slice { .. } | Expr::Pipe(_)
+            Expr::Slice { .. } | Expr::SliceNumber { .. } | Expr::Pipe(_)
         )
     }) {
         return None;
@@ -12114,11 +12119,16 @@ fn split_at_slice(exprs: &[Expr]) -> Option<SliceSplit> {
     for e in exprs {
         push_path_components(&mut flat, e);
     }
-    let at = flat
-        .iter()
-        .position(|e| matches!(unwrap_path_component(e).0, Expr::Slice { .. }))?;
+    let at = flat.iter().position(|e| {
+        matches!(
+            unwrap_path_component(e).0,
+            Expr::Slice { .. } | Expr::SliceNumber { .. }
+        )
+    })?;
     let (optional, start, end) = match unwrap_path_component(&flat[at]) {
-        (Expr::Slice { start, end }, optional) => (optional, *start, *end),
+        (Expr::Slice { start, end } | Expr::SliceNumber { start, end, .. }, optional) => {
+            (optional, *start, *end)
+        }
         _ => unreachable!("position matched a Slice"),
     };
     let rest = flat.split_off(at + 1);
@@ -12471,18 +12481,20 @@ fn update_path<S: EvalSemantics>(
                     // target for every operator, live-verified
                     // (`.a[1:3][] |= . * 10` on `a: [1,2,3,4]` stays
                     // unchanged).
-                    Expr::Slice { start, end } => through_slice(
-                        root,
-                        *start,
-                        *end,
-                        SliceEditFlags {
-                            optional: here,
-                            scalar_noop,
-                            container_noop,
-                            terminal_write: false,
-                        },
-                        |sub| update_path::<S>(sub, &rest, filter_expr, optional, scalar_noop),
-                    ),
+                    Expr::Slice { start, end } | Expr::SliceNumber { start, end, .. } => {
+                        through_slice(
+                            root,
+                            *start,
+                            *end,
+                            SliceEditFlags {
+                                optional: here,
+                                scalar_noop,
+                                container_noop,
+                                terminal_write: false,
+                            },
+                            |sub| update_path::<S>(sub, &rest, filter_expr, optional, scalar_noop),
+                        )
+                    }
                     _ => update_path::<S>(root, first, filter_expr, here, scalar_noop),
                 }
             }
@@ -12500,7 +12512,7 @@ fn update_path<S: EvalSemantics>(
         // yq mode: real yq's container no-op (#1142) applies here too,
         // unconditional on the operator -- see the Pipe-chain arm's
         // matching comment above for the full rationale.
-        Expr::Slice { start, end } => through_slice(
+        Expr::Slice { start, end } | Expr::SliceNumber { start, end, .. } => through_slice(
             root,
             *start,
             *end,
@@ -12579,6 +12591,7 @@ fn needs_path_prepass(expr: &Expr) -> bool {
         | Expr::Index(_)
         | Expr::IndexNumber { .. }
         | Expr::Slice { .. }
+        | Expr::SliceNumber { .. }
         | Expr::Iterate => false,
         Expr::Pipe(exprs) => exprs.iter().any(needs_path_prepass),
         Expr::Optional(inner) | Expr::Paren(inner) => needs_path_prepass(inner),
@@ -12906,6 +12919,29 @@ fn numeric_path_component(idx: i64, key: &OwnedValue) -> Expr {
     }
 }
 
+/// The [`NumberKey`] a resolved *slice bound* value should preserve, if
+/// any -- the slice-bound sibling of [`numeric_path_component`]'s
+/// key-detection half (#1326), for a genuinely dynamic bound
+/// (`.[$a:$b]`, `.[(1+1):]`) rather than a literal one.
+///
+/// Unlike an index, a slice bound has no single `Expr` variant carrying
+/// both the resolved `i64` and its own key together -- [`Expr::SliceNumber`]
+/// carries each bound's key as an independent optional field, so this
+/// returns just the key half; the caller pairs it with the bound's own
+/// already-resolved `i64` (from [`owned_bound_to_i64`]) when constructing
+/// the path component.
+fn numeric_slice_bound_key(v: &OwnedValue) -> Option<NumberKey> {
+    match v {
+        OwnedValue::Float(f) => Some(NumberKey::Float(*f)),
+        OwnedValue::NumberLiteral(NumberRepr::Float(f), text) => {
+            Some(NumberKey::Literal(*f, text.clone()))
+        }
+        // `Int`, `NumberLiteral(Int, _)`, `Null` (the open-bound case): nothing
+        // to preserve.
+        _ => None,
+    }
+}
+
 /// The `OwnedValue` a static array-index component is reported as in a path.
 ///
 /// The single definition of #1088's rendering rule, shared by all three
@@ -12924,6 +12960,31 @@ fn index_component_value(idx: i64, key: Option<&NumberKey>) -> OwnedValue {
             OwnedValue::NumberLiteral(NumberRepr::Float(*f), text.clone())
         }
     }
+}
+
+/// The `OwnedValue` a static slice component's `{"start":s,"end":e}` path
+/// descriptor is reported as, one bound at a time -- the slice-bound sibling
+/// of [`index_component_value`] (#1326), shared by the same three sites
+/// ([`walk_path`], [`navigation_element`], and
+/// `eval_pipe_with_path_context_internal`) once each threads a slice
+/// component through it.
+///
+/// Each bound converts independently via [`index_component_value`] itself
+/// (an absent/integer-spelled bound and a float-spelled one are exactly the
+/// `None`/`Some` split that function already draws) -- kept as two calls
+/// into the one shared per-number rule rather than a second hand-copied
+/// `match key { ... }`, per CLAUDE.md's "duplicated predicates diverge
+/// silently".
+fn slice_component_value(
+    start: Option<i64>,
+    start_key: Option<&NumberKey>,
+    end: Option<i64>,
+    end_key: Option<&NumberKey>,
+) -> OwnedValue {
+    slice::literal_component_from_values(
+        start.map_or(OwnedValue::Null, |i| index_component_value(i, start_key)),
+        end.map_or(OwnedValue::Null, |i| index_component_value(i, end_key)),
+    )
 }
 
 /// One resolved branch: the static path components reaching it, and the value
@@ -13219,6 +13280,7 @@ fn resolve_node<'a, S: EvalSemantics>(
                         | Expr::IndexNumber { .. }
                         | Expr::Iterate
                         | Expr::Slice { .. }
+                        | Expr::SliceNumber { .. }
                 );
                 let branches = match resolve_node::<S>(inner, value, trackable) {
                     Ok(branches) => branches,
@@ -13803,7 +13865,10 @@ fn navigation_element(component: &Expr) -> Option<OwnedValue> {
         Expr::Index(idx) | Expr::IndexNumber { idx, .. } => {
             Some(index_component_value(*idx, component.index_number_key()))
         }
-        Expr::Slice { start, end } => Some(slice::literal_component(*start, *end)),
+        Expr::Slice { start, end } | Expr::SliceNumber { start, end, .. } => {
+            let (start_key, end_key) = component.slice_number_keys();
+            Some(slice_component_value(*start, start_key, *end, end_key))
+        }
         _ => None,
     }
 }
@@ -13935,6 +14000,7 @@ fn resolve_leaf<'a, S: EvalSemantics>(
                 | Expr::Index(_)
                 | Expr::IndexNumber { .. }
                 | Expr::Slice { .. }
+                | Expr::SliceNumber { .. }
         )
     {
         let mut components = Vec::new();
@@ -14867,7 +14933,7 @@ fn resolve_slice_expr<'a, S: EvalSemantics>(
         return Err((
             Vec::new(),
             EvalError::invalid_path_expression_near_access(
-                &slice::literal_component(starts[0], ends[0]),
+                &slice::literal_component(starts[0].0, ends[0].0),
                 value,
             )
             .into(),
@@ -14908,7 +14974,7 @@ fn resolve_slice_expr<'a, S: EvalSemantics>(
         return Err((
             Vec::new(),
             EvalError::invalid_path_expression_near_access(
-                &slice::literal_component(starts[0], ends[0]),
+                &slice::literal_component(starts[0].0, ends[0].0),
                 first_value,
             )
             .into(),
@@ -14916,9 +14982,25 @@ fn resolve_slice_expr<'a, S: EvalSemantics>(
     }
 
     let mut out = Vec::with_capacity(starts.len() * ends.len() * target_branches.len());
-    for s in &starts {
-        for e in &ends {
-            let slice_expr = Expr::Slice { start: *s, end: *e };
+    for (s, s_key) in &starts {
+        for (e, e_key) in &ends {
+            // #1326: a genuinely dynamic bound (unlike a literal one, which
+            // the parser's own `fold_slice_bound` handles at parse time)
+            // keeps its float spelling the same way -- `Expr::SliceNumber`
+            // only when at least one side actually has a key to preserve,
+            // so an all-integer/absent-bound dynamic slice still produces
+            // the plain `Expr::Slice` every other match site already
+            // expects, unchanged.
+            let slice_expr = if s_key.is_some() || e_key.is_some() {
+                Expr::SliceNumber {
+                    start: *s,
+                    end: *e,
+                    start_key: s_key.clone(),
+                    end_key: e_key.clone(),
+                }
+            } else {
+                Expr::Slice { start: *s, end: *e }
+            };
             for PathBranch {
                 path: components,
                 value: target_value,
@@ -14969,22 +15051,37 @@ fn resolve_slice_expr<'a, S: EvalSemantics>(
     path_result(out, target_escape)
 }
 
+/// One resolved slice bound, paired with the [`NumberKey`] it should
+/// preserve in `path()` output if it's float-spelled (#1326) -- see
+/// [`resolve_slice_bound`].
+type ResolvedSliceBound = (Option<i64>, Option<NumberKey>);
+
 /// Evaluate one slice bound (`start` or `end`) in path context.
 ///
 /// Mirrors [`eval_slice_bound`] (read mode): a missing bound is a single
 /// `None` — "this side is open" — not an empty stream, and a resolved
 /// number is rounded the way [`owned_bound_to_i64`] documents.
+///
+/// Pairs each resolved `i64` with [`numeric_slice_bound_key`]'s answer for
+/// the same value (#1326) -- a genuinely *dynamic* bound (`.[$a:$b]`,
+/// `.[(1+1):]`) needs exactly the same key-preservation [`fold_int_literal`]'s
+/// static sibling already gives a literal one, and this is where that value
+/// is still on hand to check.
 fn resolve_slice_bound<S: EvalSemantics>(
     bound: &Option<Box<Expr>>,
     value: &OwnedValue,
     round: fn(f64) -> f64,
-) -> Result<Vec<Option<i64>>, EvalEscape> {
+) -> Result<Vec<ResolvedSliceBound>, EvalEscape> {
     let Some(expr) = bound else {
-        return Ok(vec![None]);
+        return Ok(vec![(None, None)]);
     };
     eval_owned_multi::<S>(expr, value)?
         .iter()
-        .map(|v| owned_bound_to_i64(v, round).map_err(EvalEscape::from))
+        .map(|v| {
+            owned_bound_to_i64(v, round)
+                .map(|i| (i, numeric_slice_bound_key(v)))
+                .map_err(EvalEscape::from)
+        })
         .collect()
 }
 
@@ -15605,6 +15702,17 @@ fn substitute_var(expr: &Expr, var_name: &str, replacement: &OwnedValue) -> Expr
         Expr::Slice { start, end } => Expr::Slice {
             start: *start,
             end: *end,
+        },
+        Expr::SliceNumber {
+            start,
+            end,
+            start_key,
+            end_key,
+        } => Expr::SliceNumber {
+            start: *start,
+            end: *end,
+            start_key: start_key.clone(),
+            end_key: end_key.clone(),
         },
         Expr::Iterate => Expr::Iterate,
         // Must recurse into `key`: variables are resolved by substitution, so
@@ -19364,10 +19472,11 @@ fn walk_path<S: EvalSemantics>(
                 optional,
             )?;
         }
-        Expr::Slice { start, end } => {
+        Expr::Slice { start, end } | Expr::SliceNumber { start, end, .. } => {
+            let (start_key, end_key) = expr.slice_number_keys();
             step_into::<S>(
                 expr,
-                slice::literal_component(*start, *end),
+                slice_component_value(*start, start_key, *end, end_key),
                 value,
                 current_path,
                 out,
@@ -20563,7 +20672,10 @@ fn delete_expr_paths_at(
             // two calls, `del(.[0:2], .[1:3])` on `[1,2,3,4]` would resolve
             // the second range against the already-shortened array and give
             // `[3]` where jq gives `[4]`.
-            Expr::Index(_) | Expr::IndexNumber { .. } | Expr::Slice { .. } => indices.push(path),
+            Expr::Index(_)
+            | Expr::IndexNumber { .. }
+            | Expr::Slice { .. }
+            | Expr::SliceNumber { .. } => indices.push(path),
             Expr::Iterate => iterates.push(path),
             // `flatten_delete_path` only ever leaves Field/Index/Slice/Iterate
             // components behind; anything else is a path shape `del` has
@@ -20764,7 +20876,9 @@ fn delete_expr_array_paths(
     for path in paths {
         let step = match &path[start].component {
             Expr::Index(idx) | Expr::IndexNumber { idx, .. } => ArrayStep::Index(*idx),
-            Expr::Slice { start, end } => ArrayStep::Slice(*start, *end),
+            Expr::Slice { start, end } | Expr::SliceNumber { start, end, .. } => {
+                ArrayStep::Slice(*start, *end)
+            }
             _ => unreachable!("delete_expr_paths_at only dispatches Index/Slice paths here"),
         };
         if path.len() == start + 1 {
@@ -20813,13 +20927,24 @@ fn delete_expr_array_paths(
         // exhaustively tracing every `resolve_node` arm, out of #1322's
         // own scope.
         return Err(match &paths[0][start].component {
-            Expr::Slice { .. } if matches!(value, OwnedValue::String(_)) => {
+            Expr::Slice { .. } | Expr::SliceNumber { .. }
+                if matches!(value, OwnedValue::String(_)) =>
+            {
                 EvalError::cannot_delete_fields_from("string")
             }
-            Expr::Slice { .. } => {
+            Expr::Slice { .. } | Expr::SliceNumber { .. } => {
                 EvalError::cannot_index_with_type(owned_type_name(&value), "object")
             }
-            Expr::Index(_) => EvalError::cannot_index_with_type(owned_type_name(&value), "number"),
+            // #1326: `Expr::IndexNumber` was already dispatched here
+            // alongside `Expr::Index` (both push to `indices` above), but
+            // had no arm of its own -- a float-spelled index reaching this
+            // error path (e.g. `del(.[2.0])` on a string) would have hit
+            // the catch-all `unreachable!()` instead of this same error,
+            // a pre-existing #1088 gap closed as a byproduct of adding
+            // `SliceNumber` here consistently.
+            Expr::Index(_) | Expr::IndexNumber { .. } => {
+                EvalError::cannot_index_with_type(owned_type_name(&value), "number")
+            }
             _ => unreachable!("delete_expr_paths_at only dispatches Index/Slice paths here"),
         });
     }
@@ -21313,7 +21438,7 @@ fn delete_at_path(
         // silently empty rather than an error — unlike the `Expr::Index` arm
         // above, jq does not refuse an out-of-range slice, so `[1,2,3] |
         // del(.[5:9])` is `[1,2,3]`.
-        Expr::Slice { start, end } => match root {
+        Expr::Slice { start, end } | Expr::SliceNumber { start, end, .. } => match root {
             OwnedValue::Array(arr) => {
                 let range = SliceBounds::from_literals(*start, *end).resolve(arr.len());
                 arr.drain(range);
@@ -21525,7 +21650,9 @@ fn delete_at_path(
                     // `=`/`|=` assignment, where a slice write auto-vivifies
                     // `null` instead of no-op'ing (a separate, documented
                     // divergence — see docs/compliance/jq/limitations.md).
-                    Expr::Slice { .. } if matches!(root, OwnedValue::Null) => {
+                    Expr::Slice { .. } | Expr::SliceNumber { .. }
+                        if matches!(root, OwnedValue::Null) =>
+                    {
                         delete_at_path_through_absent(&rest, optional, yq_mode)
                     }
                     // `scalar_noop`/`container_noop: false` — del()'s own
@@ -21577,18 +21704,20 @@ fn delete_at_path(
                     // make this string case look fixed relative to #1219's
                     // own array/object case when it isn't. jq mode is
                     // unaffected either way.
-                    Expr::Slice { start, end } => through_slice(
-                        root,
-                        *start,
-                        *end,
-                        SliceEditFlags {
-                            optional: here,
-                            scalar_noop: false,
-                            container_noop: false,
-                            terminal_write: yq_mode,
-                        },
-                        |sub| delete_at_path(sub, &rest, optional, yq_mode),
-                    ),
+                    Expr::Slice { start, end } | Expr::SliceNumber { start, end, .. } => {
+                        through_slice(
+                            root,
+                            *start,
+                            *end,
+                            SliceEditFlags {
+                                optional: here,
+                                scalar_noop: false,
+                                container_noop: false,
+                                terminal_write: yq_mode,
+                            },
+                            |sub| delete_at_path(sub, &rest, optional, yq_mode),
+                        )
+                    }
                     _ => delete_at_path(root, first, here, yq_mode),
                 }
             }
@@ -26678,6 +26807,17 @@ fn expand_func_calls(
             start: *start,
             end: *end,
         },
+        Expr::SliceNumber {
+            start,
+            end,
+            start_key,
+            end_key,
+        } => Expr::SliceNumber {
+            start: *start,
+            end: *end,
+            start_key: start_key.clone(),
+            end_key: end_key.clone(),
+        },
         Expr::Iterate => Expr::Iterate,
         Expr::IndexExpr { target, key } => Expr::IndexExpr {
             target: Box::new(expand_func_calls(
@@ -27384,6 +27524,17 @@ fn substitute_func_param(expr: &Expr, param: &str, arg: &Expr) -> Expr {
         Expr::Slice { start, end } => Expr::Slice {
             start: *start,
             end: *end,
+        },
+        Expr::SliceNumber {
+            start,
+            end,
+            start_key,
+            end_key,
+        } => Expr::SliceNumber {
+            start: *start,
+            end: *end,
+            start_key: start_key.clone(),
+            end_key: end_key.clone(),
         },
         Expr::Iterate => Expr::Iterate,
         Expr::IndexExpr { target, key } => Expr::IndexExpr {
@@ -46968,6 +47119,172 @@ mod tests {
             let pipe = Expr::Pipe(vec![unresolved(), Expr::Field("a".to_string())]);
             let _ = walk_path::<JqSemantics>(&pipe, &OwnedValue::Null, &[], &mut reached, false);
         }
+    }
+
+    /// #1326: `path()` keeps a float slice bound's own spelling, the same
+    /// way #1088 already does for a float array *index* -- every case here
+    /// is oracle-verified against real jq 1.7.1.
+    #[test]
+    fn test_path_reports_a_float_slice_bound_verbatim_1326() {
+        // The issue's own primary repro: a non-whole float bound, which
+        // cannot fold at parse time (`fold_index_key` only folds a
+        // whole-valued float, #1061) and so exercises the *dynamic*
+        // `Expr::SliceExpr` resolution path, not the static one.
+        query!(br"[1,2,3,4,5]", r"path(.[1.5:3.5])",
+            QueryResult::Owned(v) => {
+                assert_eq!(v.to_json(), r#"[{"start":1.5,"end":3.5}]"#);
+            }
+        );
+        // A whole-valued float bound *does* fold at parse time, exercising
+        // the static `Expr::SliceNumber` path instead -- both routes must
+        // agree.
+        query!(br"[1,2,3,4,5]", r"path(.[1.0:3.0])",
+            QueryResult::Owned(v) => {
+                assert_eq!(v.to_json(), r#"[{"start":1.0,"end":3.0}]"#);
+            }
+        );
+        // Only one bound float-spelled -- the other stays a plain integer.
+        query!(br"[1,2,3,4,5]", r"path(.[1.5:3])",
+            QueryResult::Owned(v) => {
+                assert_eq!(v.to_json(), r#"[{"start":1.5,"end":3}]"#);
+            }
+        );
+        query!(br"[1,2,3,4,5]", r"path(.[1:3.5])",
+            QueryResult::Owned(v) => {
+                assert_eq!(v.to_json(), r#"[{"start":1,"end":3.5}]"#);
+            }
+        );
+        // An open bound stays `null`, not a fabricated `0`/length.
+        query!(br"[1,2,3,4,5]", r"path(.[-1.5:])",
+            QueryResult::Owned(v) => {
+                assert_eq!(v.to_json(), r#"[{"start":-1.5,"end":null}]"#);
+            }
+        );
+        // A genuinely dynamic bound (`.[$a:$b]`) resolves through the same
+        // `Expr::SliceExpr` machinery as the literal non-whole case above,
+        // confirmed here via a variable binding rather than a literal.
+        query!(br"[1,2,3,4,5]", r"((1.5) as $a | (3.5) as $b | path(.[$a:$b]))",
+            QueryResult::Owned(v) => {
+                assert_eq!(v.to_json(), r#"[{"start":1.5,"end":3.5}]"#);
+            }
+        );
+        // #1088's negation rule applies identically to a slice bound: the
+        // parser's own `-1 * <literal>` split destroys jq's literal
+        // spelling before the slice is ever built, so the bound becomes a
+        // computed double -- which happens to *render* bare when whole
+        // (jq's own convention for a computed value, not evidence the key
+        // was dropped; `-3.5:-1.5` below, non-whole, keeps its `.5`).
+        query!(br"[1,2,3,4,5]", r"path(.[-3.0:-1.0])",
+            QueryResult::Owned(v) => {
+                assert_eq!(v.to_json(), r#"[{"start":-3,"end":-1}]"#);
+            }
+        );
+        query!(br"[1,2,3,4,5]", r"path(.[-3.5:-1.5])",
+            QueryResult::Owned(v) => {
+                assert_eq!(v.to_json(), r#"[{"start":-3.5,"end":-1.5}]"#);
+            }
+        );
+        // The resolved *value* (not just the path component) is unaffected
+        // -- reading, writing, and round-tripping through `setpath`/
+        // `getpath` all still use the truncated/rounded i64 bounds exactly
+        // as before.
+        query!(br"[1,2,3,4,5]", r".[1.5:3.5]",
+            QueryResult::Owned(v) => {
+                assert_eq!(v.to_json(), "[2,3,4]");
+            }
+        );
+        query!(br"[1,2,3,4,5]", r"path(.[1.5:3.5]) as $p | getpath($p)",
+            QueryResult::Owned(v) => {
+                assert_eq!(v.to_json(), "[2,3,4]");
+            }
+        );
+        query!(br"[1,2,3,4,5]", r#".[1.5:3.5] = ["x"]"#,
+            QueryResult::Owned(v) => {
+                assert_eq!(v.to_json(), r#"[1,"x",5]"#);
+            }
+        );
+    }
+
+    /// #1326: `Expr::SliceNumber` needs a rebuild arm in every AST walker
+    /// that reconstructs a filter's body, the same way #1088 already added
+    /// one for `Expr::IndexNumber` -- `substitute_var` (`E as $x | body`),
+    /// `expand_func_calls` (inlining a `def`), and `substitute_func_param`
+    /// (substituting a parameterized `def`'s own argument). Each jq-level
+    /// case here is end-to-end correct (oracle-verified against real jq
+    /// 1.7.1), but doesn't exercise these three functions' own rebuild
+    /// arms directly -- `path()` resolution apparently never routes a
+    /// `def`/`as`-bound body through them for these shapes, so the
+    /// dedicated direct-call tests just below are what actually pin the
+    /// arms themselves; these stay as end-to-end sanity checks.
+    #[test]
+    fn test_slice_number_survives_def_and_as_binding_1326() {
+        query!(br"[1,2,3,4,5]", r"path((1) as $x | .[1.5:3.5])",
+            QueryResult::Owned(v) => {
+                assert_eq!(v.to_json(), r#"[{"start":1.5,"end":3.5}]"#);
+            }
+        );
+        query!(br"[1,2,3,4,5]", r"def f: .[1.5:3.5]; path(f)",
+            QueryResult::Owned(v) => {
+                assert_eq!(v.to_json(), r#"[{"start":1.5,"end":3.5}]"#);
+            }
+        );
+        query!(br"[1,2,3,4,5]", r"def f(x): x | .[1.5:3.5]; path(f(.))",
+            QueryResult::Owned(v) => {
+                assert_eq!(v.to_json(), r#"[{"start":1.5,"end":3.5}]"#);
+            }
+        );
+    }
+
+    /// #1326: direct calls into `substitute_var`/`expand_func_calls`/
+    /// `substitute_func_param` with a hand-built `Expr::SliceNumber`,
+    /// pinning each walker's own rebuild arm regardless of whether any
+    /// particular jq-level construct happens to route through it today --
+    /// a `def`/`as`-bound body containing a bare `Expr::SliceNumber` is
+    /// exactly the shape each function's own doc comment describes
+    /// walking past.
+    #[test]
+    fn test_ast_rebuild_walkers_clone_slice_number_directly_1326() {
+        let slice_number = Expr::SliceNumber {
+            start: Some(1),
+            end: Some(3),
+            start_key: Some(NumberKey::Literal(1.5, "1.5".into())),
+            end_key: None,
+        };
+        assert_eq!(
+            substitute_var(&slice_number, "x", &OwnedValue::Int(9)),
+            slice_number
+        );
+        assert_eq!(
+            expand_func_calls(&slice_number, "f", &[], &Expr::Identity, None, 0),
+            slice_number
+        );
+        assert_eq!(
+            substitute_func_param(&slice_number, "x", &Expr::Identity),
+            slice_number
+        );
+    }
+
+    /// #1326 review: adding `Expr::SliceNumber` alongside `Expr::Slice` in
+    /// `delete_expr_array_paths`'s error-construction match exposed that
+    /// `Expr::IndexNumber` had no arm of its own there either -- a
+    /// pre-existing #1088 gap (a float-spelled index reaching this path
+    /// would have hit the catch-all `unreachable!()` instead of the same
+    /// error `Expr::Index` gets), closed as a byproduct rather than a
+    /// deliberate target. Called directly rather than through a jq query:
+    /// `5 | del(.[2.0])`-shaped repros exit through a different,
+    /// higher-level dispatch before ever reaching this specific match.
+    #[test]
+    fn test_delete_expr_array_paths_reports_index_number_like_plain_index_1326() {
+        let steps = [DeleteStep {
+            component: Expr::IndexNumber {
+                idx: 2,
+                key: NumberKey::Literal(2.0, "2.0".into()),
+            },
+            optional: false,
+        }];
+        let err =
+            delete_expr_array_paths(OwnedValue::Int(5), &[&steps], 0).expect_err("not an array");
+        assert_eq!(err.message, "Cannot index number with number");
     }
 
     // #694: `collect_owned()`/`eval_owned_multi` silently dropped a

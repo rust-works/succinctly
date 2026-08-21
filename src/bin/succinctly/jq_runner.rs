@@ -410,6 +410,7 @@ fn rewrite_namespaced_calls(expr: Expr) -> Expr {
         | Expr::Index(_)
         | Expr::IndexNumber { .. }
         | Expr::Slice { .. }
+        | Expr::SliceNumber { .. }
         | Expr::Iterate
         | Expr::RecursiveDescent
         | Expr::Literal(_)
