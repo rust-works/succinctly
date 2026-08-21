@@ -233,9 +233,32 @@ fn to_owned_canonicalized_numbers_at_depth<V: DocumentValue>(
         match parse_i64_or_f64(&literal) {
             Some(NumberRepr::Int(i)) => OwnedValue::Int(i),
             Some(NumberRepr::Float(f)) => OwnedValue::Float(f),
+            // `number_literal()` only returns `Some` for text
+            // `is_valid_number` (or its leading-zero-tolerant retry, #1149)
+            // already validated as RFC 8259 grammar, which always parses as
+            // at least `f64` -- checked exhaustively against
+            // `is_valid_number_rejects_lenient_semi_index_spans`'s own full
+            // enumeration (`json/validate.rs`) plus live probes of every
+            // entry there: none reach this arm. Kept as a fallback, not
+            // `unreachable!()`, since it mirrors `from_number_literal`'s own
+            // identical fallback rather than asserting an invariant that
+            // function doesn't itself assert.
             None => OwnedValue::Null,
         }
     } else if let Some(i) = value.as_i64() {
+        // #999 review: unlike `as_f64` below (reached by a lenient
+        // trailing-/leading-dot span like `5.`/`.5`, pinned by
+        // `to_owned_canonicalized_numbers_falls_back_to_as_f64_for_lenient_spans`),
+        // this arm is unreachable for JSON specifically -- every lenient
+        // span `is_valid_number_rejects_lenient_semi_index_spans` enumerates
+        // either succeeds via `as_f64` or fails both (live-probed
+        // exhaustively: `1.2.3`, `1-2`, `1e`, `1e+`, `-`, empty all
+        // materialize `null`, matching `to_owned`'s own behavior for the
+        // same inputs). Kept for structural symmetry with
+        // `to_owned_at_depth`, which this function otherwise mirrors
+        // exactly, and because `to_owned_canonicalized_numbers` is `pub`
+        // (not just an internal detail of the one JSON call site) -- a
+        // future `DocumentValue` implementor could still reach it.
         OwnedValue::Int(i)
     } else if let Some(f) = value.as_f64() {
         OwnedValue::Float(f)
@@ -9979,6 +10002,34 @@ mod tests {
             assert!(
                 matches!(map.get("n"), Some(OwnedValue::Float(_))),
                 "expected a Float for {json:?}, got {:?}",
+                map.get("n")
+            );
+        }
+    }
+
+    /// #999 review: a lenient-but-unparseable span (multiple decimal
+    /// points, a bare minus, a trailing exponent marker with no digits, ...)
+    /// falls all the way through to the final `else` arm -- `as_i64`/
+    /// `as_f64` both decline too, since the raw text isn't a valid number by
+    /// any of Rust's own parsers either. Matches `to_owned`'s identical
+    /// degrade-to-`Null` behavior for the same inputs (confirmed live).
+    #[test]
+    fn to_owned_canonicalized_numbers_degrades_unparseable_spans_to_null() {
+        for json in [
+            br#"{"n": 1.2.3}"#.as_slice(),
+            br#"{"n": 1-2}"#.as_slice(),
+            br#"{"n": 1e}"#.as_slice(),
+        ] {
+            let index = JsonIndex::build(json);
+            let cursor = index.root(json);
+            let owned = to_owned_canonicalized_numbers(&cursor.value());
+            let OwnedValue::Object(map) = owned else {
+                panic!("expected an object for {json:?}")
+            };
+            assert_eq!(
+                map.get("n"),
+                Some(&OwnedValue::Null),
+                "expected Null for {json:?}, got {:?}",
                 map.get("n")
             );
         }
