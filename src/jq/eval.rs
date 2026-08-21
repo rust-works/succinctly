@@ -6949,8 +6949,16 @@ pub(super) fn tonumber_from_str(s: &str) -> Result<OwnedValue, EvalError> {
     // `NumberLiteral`'s text is re-read as JSON by the reindex bridge --
     // the same constraint `preservable_float_literal_text` documents on the
     // YAML side.)
+    //
+    // The digit check is load-bearing, not defensive: `is_valid_number`
+    // accepts a leading `-` of its own, so a doubled sign (`+-1`) would
+    // otherwise strip to a perfectly valid `-1` and silently succeed where
+    // both oracles error out (jq 1.7.1: "Invalid numeric literal"; yq
+    // 4.53.3: "cannot convert node value [+-1] ... to number").
     if let Some(unsigned) = trimmed.strip_prefix('+') {
-        if crate::json::validate::is_valid_number(unsigned.as_bytes()) {
+        if unsigned.starts_with(|c: char| c.is_ascii_digit())
+            && crate::json::validate::is_valid_number(unsigned.as_bytes())
+        {
             return Ok(OwnedValue::from_number_literal(unsigned));
         }
     }

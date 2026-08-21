@@ -14240,6 +14240,30 @@ fn test_tonumber_preserves_source_spelling_1090() {
     }
 }
 
+/// #1090 follow-on: the leading-`+` retry must not turn a *doubled* sign
+/// into an accepted number. `is_valid_number` accepts a leading `-` of its
+/// own, so stripping the `+` off `"+-1"` leaves a perfectly valid `-1` --
+/// which real jq 1.7.1 rejects outright, and which this crate rejected
+/// before the retry existed. Error wording confirmed against jq 1.7.1.
+#[test]
+fn test_tonumber_rejects_doubled_sign_1090() {
+    for input in [
+        r#""+-1""#,
+        r#""+-1.5""#,
+        r#""+-0""#,
+        r#""+-1e3""#,
+        r#""-+1""#,
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["tonumber"], Some(input))
+            .unwrap_or_else(|e| panic!("`{input} | tonumber` failed to run: {e}"));
+        assert_ne!(code, 0, "`{input}` should error\nstdout: {stdout}");
+        assert!(
+            stderr.contains("Invalid numeric literal"),
+            "`{input}`\nstderr: {stderr}"
+        );
+    }
+}
+
 /// #1090 follow-on: preserving `tonumber`'s literal must not start
 /// accepting text real jq rejects. The internal overflow sentinels
 /// (`9e999e999` -> NaN, `8e999e999` -> Infinity) are ordinary user input
