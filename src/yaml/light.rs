@@ -452,16 +452,31 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
     /// rather than just the resolved value. `self` need not itself be an
     /// alias -- returns `self` unchanged (zero hops) if it isn't.
     ///
-    /// Kept as its own loop rather than
-    /// `self.resolve_alias_chain().map(|_| some_cursor)`: there is no
-    /// cursor to hand back from that method's own result (its loop
-    /// deliberately discards `current` once it has `current`'s `.value()`
-    /// -- see its own doc comment's efficiency finding, #1191 code
-    /// review), so reusing it here would mean re-deriving the target
-    /// cursor by some other means anyway. A `pub`, not `pub(crate)`,
-    /// visibility (unlike its sibling): `yaml_to_owned_value`
-    /// (`src/bin/succinctly/yq_runner.rs`) is a separate binary crate and
-    /// needs to call this directly.
+    /// Deliberately its own loop, not composed with `resolve_alias_chain`
+    /// in *either* direction, both for the same reason (avoiding a
+    /// redundant `.value()` call -- `#1191`'s own review already
+    /// established this cost is real and unconditional, not just on long
+    /// chains): `resolve_alias_chain` couldn't hand back a cursor even if
+    /// asked (its loop discards `current` once it has computed
+    /// `current.value()`, by design), and this method can't be *defined*
+    /// via `resolve_alias_chain().map(|_| cursor)` either, for the same
+    /// reason in reverse -- there is no cursor left to map from by the
+    /// time that method returns.
+    ///
+    /// This method's own 5 call sites still pay a version of that same
+    /// cost: each calls `resolved.<method>(...)`, and every one of those
+    /// methods opens with its own `match self.value() {...}` -- so
+    /// `.value()` on the terminal cursor is computed once by this loop's
+    /// exit check (and discarded) and once more by the method the caller
+    /// invokes. Unlike `resolve_alias_chain`'s callers, there is no way to
+    /// avoid this without threading an already-computed `YamlValue`
+    /// through 5 otherwise-cursor-only method signatures -- accepted as a
+    /// real but small (non-chain-scaling) cost, not benchmarked separately
+    /// from the fix as a whole.
+    ///
+    /// A `pub`, not `pub(crate)`, visibility (unlike its sibling):
+    /// `yaml_to_owned_value` (`src/bin/succinctly/yq_runner.rs`) is a
+    /// separate binary crate and needs to call this directly.
     ///
     /// Returns `None` only for a dangling (unresolvable) target. Panics
     /// past `MAX_ALIAS_CHAIN_DEPTH` (both private, not linkable from this
@@ -469,7 +484,12 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
     /// via the shared `assert_depth` -- the loop itself costs O(1) stack
     /// regardless of chain length, so this bound exists purely to cap the
     /// CPU time one call can be forced to spend on a pathologically long,
-    /// adversarially crafted chain.
+    /// adversarially crafted chain. `#[track_caller]`, matching
+    /// `resolve_alias_chain`'s own convention (and this crate's general
+    /// one, #1020 code review) so a panic through any of this method's 5
+    /// call sites is attributable rather than collapsing to this shared
+    /// loop's own line.
+    #[track_caller]
     pub fn resolve_alias_target_cursor(&self) -> Option<Self> {
         let mut current = *self;
         let mut depth = 0usize;

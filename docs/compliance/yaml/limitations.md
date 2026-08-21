@@ -199,6 +199,33 @@ Neither costs this page's conformance numbers anything: no case in the corpus co
 alias to an out-of-scope anchor, so the loader-alone reject figure, the accepted-but-invalid
 document count, and the `lax:anchors` row are unmoved by #372.
 
+### A third, differently-timed check: excessively long alias chains
+
+Unlike the cyclic and unknown-anchor cases above, an alias chain that is merely very long —
+`a0: &a0 v`, `a1: &a1 *a0`, `a2: &a2 *a1`, ... — is not rejected at `YamlIndex::build`
+time; the index builds successfully regardless of chain length. [#153](https://github.com/rust-works/succinctly/issues/153)'s
+cycle check only rejects a chain that revisits its own anchor, and a long non-cyclic chain
+never does. Before [#1193](https://github.com/rust-works/succinctly/issues/1193), *walking*
+such a chain (via `type`, `tostring`, `-o json` output, arithmetic, or any other query that
+resolves the aliased value) drove real, uncatchable stack overflow through several
+independent self-recursive code paths in `src/yaml/light.rs`, `src/bin/succinctly/yq_runner.rs`,
+and `src/jq/eval.rs` — the same underlying failure mode #153 fixed for cycles specifically,
+recurring for long-but-acyclic chains that #153's own check does not cover.
+
+The fix is a runtime ceiling, not a build-time rejection: `MAX_ALIAS_CHAIN_DEPTH` (65,536
+hops, `src/yaml/light.rs`) bounds every alias-resolving accessor to a clean `panic!` past
+that depth, rather than allowing the resolution loop to run unbounded. Because the fix
+converts what used to be self-recursion into an explicit iterative loop, the ceiling exists
+only to cap adversarial CPU time, not stack depth — the loop itself costs O(1) stack
+regardless of chain length. A chain within the limit resolves normally; one beyond it
+panics with a `nesting depth exceeds limit` message (a clean Rust panic, not a stack
+overflow) rather than crashing the process the way #1193's own repro did:
+
+```
+$ succinctly yq -o json '.' 70000-hop-chain.yaml
+thread 'main' panicked at ...: nesting depth exceeds limit of 65536
+```
+
 ### The other ways `YamlIndex::build` fails
 
 Structure aside, `build` still refuses input it has no reading for at all. None of these is
