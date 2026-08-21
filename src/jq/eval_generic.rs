@@ -173,12 +173,22 @@ fn to_owned_at_depth<V: DocumentValue>(value: &V, depth: usize) -> Result<OwnedV
         // used to sit in the `else` below (naming #1098 and PR #1190's
         // reverted `panic!`) described exactly this and is now resolved.
         Err(EvalError::new(reason.to_string()))
+    } else if value.is_error() {
+        // A *structurally* malformed value -- `[xyz123]`, `[tru]` -- which
+        // the semi-index accepted as a span but could not classify as any
+        // JSON token. It used to materialize as `null`, so `[xyz123]` came
+        // back as `[null]` at exit 0 where real jq raises a parse error
+        // (#1194). The semi-index's own message is more specific than
+        // anything reconstructible here, so it is passed through verbatim.
+        Err(EvalError::new(
+            value
+                .error_message()
+                .unwrap_or("malformed value in document")
+                .to_string(),
+        ))
     } else {
-        // Error values and any genuinely unknown type. The decode-failure
-        // case that used to share this arm now raises above (#1247); what
-        // remains is a *structurally* malformed value, which is #1194's
-        // territory and still degrades silently -- see
-        // `docs/plan/decode-failure-routing.md`.
+        // A genuinely unknown type: no format implements one today, so this
+        // is exhaustiveness rather than a live path.
         Ok(OwnedValue::Null)
     }
 }
@@ -1250,7 +1260,9 @@ fn owned_from_standard_json_at_depth<W: Clone + AsRef<[u64]>>(
             }
             OwnedValue::Object(map)
         }
-        StandardJson::Error(_) => OwnedValue::Null,
+        // See `to_owned_at_depth`'s own `is_error` arm (#1194/#1247): a
+        // structurally malformed value raises rather than becoming `null`.
+        StandardJson::Error(msg) => return Err(EvalError::new((*msg).to_string())),
     })
 }
 
