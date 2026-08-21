@@ -58,6 +58,45 @@ pub enum Expr {
         end: Option<i64>,
     },
 
+    /// Array slice whose *original number* has to survive into `path()`
+    /// output for at least one bound: `.[1.5:3.5]`, `.[1.0:3]`, `.[:3.00]`.
+    ///
+    /// The slice-bound sibling of [`Expr::IndexNumber`] (#1326, following
+    /// on from #1088): jq appends each resolved bound **verbatim** as the
+    /// path component, so a bound that still carries its own spelling keeps
+    /// it -- `path(.[1.5:3.5])` is `[{"start":1.5,"end":3.5}]`, not
+    /// `[{"start":1,"end":4}]`. [`Expr::Slice`]'s bare `Option<i64>` pair has
+    /// nowhere to put that, so a slice with at least one float-spelled bound
+    /// folds to this instead.
+    ///
+    /// `start`/`end` are exactly the `Option<i64>` pair [`Expr::Slice`]
+    /// would have carried (the same bound-folding `fold_int_literal`
+    /// applies to each), and every step that *navigates* — reading,
+    /// `setpath`, `del` — uses them and behaves identically. Only the
+    /// rendering of the path component differs, which is why nearly every
+    /// match site pairs the two arms:
+    /// `Expr::Slice { start, end } | Expr::SliceNumber { start, end, .. }`.
+    ///
+    /// A bound is only ever carried here when *its own* `NumberKey` is
+    /// `Some` — a slice with one float-spelled bound and one absent/plain
+    /// bound (`.[1.5:]`, `.[1.5:3]`) still reaches here with the other
+    /// key field `None`, not a synthesized one. A slice whose bounds are
+    /// *both* integer-spelled or absent never reaches here at all: it keeps
+    /// folding to plain [`Expr::Slice`], and the hot `.foo.bar[1:3]` path is
+    /// untouched. Nor does a negated bound (`.[-1.5:]`) — see [`NumberKey`].
+    SliceNumber {
+        /// The start bound every navigation step actually uses.
+        start: Option<i64>,
+        /// The end bound every navigation step actually uses.
+        end: Option<i64>,
+        /// The number the start bound is reported as, if it kept its own
+        /// spelling.
+        start_key: Option<NumberKey>,
+        /// The number the end bound is reported as, if it kept its own
+        /// spelling.
+        end_key: Option<NumberKey>,
+    },
+
     /// Iterate all elements: `.[]`
     Iterate,
 
@@ -99,10 +138,10 @@ pub enum Expr {
     /// this variant carries its own `target` instead of flattening into
     /// [`Expr::Pipe`]. `S` is evaluated outer, `T` middle, `E` inner.
     ///
-    /// A bound that fully folds to an integer literal never reaches here:
-    /// the parser keeps producing plain [`Expr::Slice`] whenever *both*
-    /// present bounds are constant, so the existing fast path and every
-    /// [`Expr::Slice`] match site are untouched.
+    /// A bound that fully folds to a constant never reaches here: the parser
+    /// keeps producing a static [`Expr::Slice`]/[`Expr::SliceNumber`]
+    /// whenever *both* present bounds are constant (#1326), so the existing
+    /// fast paths and every match site pairing those two are untouched.
     SliceExpr {
         /// The value being sliced — the postfix chain so far.
         target: Box<Self>,
@@ -1275,6 +1314,21 @@ impl Expr {
         match self {
             Self::IndexNumber { key, .. } => Some(key),
             _ => None,
+        }
+    }
+
+    /// The numbers this static slice component's two bounds report
+    /// themselves as in `path()` output, if either is anything other than
+    /// its own `i64` -- the slice-bound sibling of [`Self::index_number_key`]
+    /// (#1326), for the same reason: keeps the
+    /// `Expr::Slice { start, end } | Expr::SliceNumber { start, end, .. }`
+    /// or-pattern a single arm at the sites that render a path component.
+    pub(crate) fn slice_number_keys(&self) -> (Option<&NumberKey>, Option<&NumberKey>) {
+        match self {
+            Self::SliceNumber {
+                start_key, end_key, ..
+            } => (start_key.as_ref(), end_key.as_ref()),
+            _ => (None, None),
         }
     }
 

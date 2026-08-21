@@ -774,15 +774,22 @@ impl<'a> Parser<'a> {
     }
 
     /// Decide whether a slice's bounds are both constant (the existing
-    /// [`Expr::Slice`] fast path) or need runtime evaluation
-    /// ([`Expr::SliceExpr`], attached to a target by the caller — see
-    /// [`Bracket::DynamicSlice`]). Each bound folds independently, so
+    /// [`Expr::Slice`]/[`Expr::SliceNumber`] fast path) or need runtime
+    /// evaluation ([`Expr::SliceExpr`], attached to a target by the caller —
+    /// see [`Bracket::DynamicSlice`]). Each bound folds independently, so
     /// `.[1:.k]` (one literal, one dynamic) still becomes dynamic.
+    ///
+    /// #1326: a bound also carries its own `NumberKey` through
+    /// [`Self::fold_slice_bound`] when it's float-spelled -- if either
+    /// bound's fold produced one, the static result is
+    /// [`Expr::SliceNumber`] instead of plain [`Expr::Slice`], the same
+    /// per-bound-independence [`Self::fold_index_key`]'s own `IndexNumber`
+    /// fold established for indices (#1088).
     fn finish_slice(start: Option<Expr>, end: Option<Expr>) -> Bracket {
-        let start_i64 = start.as_ref().and_then(Self::fold_int_literal);
-        let end_i64 = end.as_ref().and_then(Self::fold_int_literal);
-        let start_dynamic = start.is_some() && start_i64.is_none();
-        let end_dynamic = end.is_some() && end_i64.is_none();
+        let start_folded = start.as_ref().and_then(Self::fold_slice_bound);
+        let end_folded = end.as_ref().and_then(Self::fold_slice_bound);
+        let start_dynamic = start.is_some() && start_folded.is_none();
+        let end_dynamic = end.is_some() && end_folded.is_none();
         if start_dynamic || end_dynamic {
             Bracket::DynamicSlice {
                 start,
@@ -790,10 +797,23 @@ impl<'a> Parser<'a> {
                 optional: false,
             }
         } else {
-            Bracket::Static(Expr::Slice {
-                start: start_i64,
-                end: end_i64,
-            })
+            let (start_i64, start_key) = start_folded.unzip();
+            let (end_i64, end_key) = end_folded.unzip();
+            let start_key = start_key.flatten();
+            let end_key = end_key.flatten();
+            if start_key.is_some() || end_key.is_some() {
+                Bracket::Static(Expr::SliceNumber {
+                    start: start_i64,
+                    end: end_i64,
+                    start_key,
+                    end_key,
+                })
+            } else {
+                Bracket::Static(Expr::Slice {
+                    start: start_i64,
+                    end: end_i64,
+                })
+            }
         }
     }
 
@@ -899,18 +919,22 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Fold a slice bound to an integer literal, seeing through parens.
+    /// Fold a slice bound to the `i64` every navigation step uses, seeing
+    /// through parens -- and, alongside it, the [`NumberKey`] a
+    /// float-spelled bound needs to keep its own spelling in `path()`
+    /// output (#1326, following #1088's identical rule for
+    /// [`Expr::IndexNumber`]).
     ///
-    /// [`Expr::IndexNumber`] counts (#1088): it contributes the same `i64` a
-    /// plain [`Expr::Index`] would, so every slice keeps exactly the shape
-    /// it had -- `path(.[1.0:3.0])` still reports `{"start":1,"end":3}`
-    /// here. That this diverges from jq, which keeps a float bound as
-    /// written (`{"start":1.0,"end":3.0}`), is the same gap #1088 closed for
-    /// indices and is tracked separately as #1326; folding both variants
-    /// identically here is what keeps #1088 from touching slices at all.
-    fn fold_int_literal(key: &Expr) -> Option<i64> {
-        match Self::fold_index_key(key) {
-            Some(Expr::Index(i) | Expr::IndexNumber { idx: i, .. }) => Some(i),
+    /// [`Self::fold_index_key`]'s two number-bearing variants both count: an
+    /// [`Expr::Index`] contributes its `i64` with no key (the bound folds to
+    /// plain [`Expr::Slice`] the same as it always has), and an
+    /// [`Expr::IndexNumber`] contributes the identical `i64` *plus* the key
+    /// that needs preserving -- `finish_slice` builds
+    /// [`Expr::SliceNumber`] once either bound's fold carries one.
+    fn fold_slice_bound(key: &Expr) -> Option<(i64, Option<NumberKey>)> {
+        match Self::fold_index_key(key)? {
+            Expr::Index(i) => Some((i, None)),
+            Expr::IndexNumber { idx, key } => Some((idx, Some(key))),
             _ => None,
         }
     }
@@ -5855,9 +5879,31 @@ mod tests {
             start: Some(1),
             end: Some(3),
         };
-        for src in [".[1:3]", ".[(1):3]", ".[1:(3)]", ".[1.0:3]", ".[1:3.0]"] {
+        for src in [".[1:3]", ".[(1):3]", ".[1:(3)]"] {
             assert_eq!(parse(src).unwrap(), expected, "`{src}`");
         }
+        // #1326: a float-spelled bound (even a whole-valued one) keeps its
+        // own spelling in `path()` output, so it folds to `Expr::SliceNumber`
+        // instead of the plain `Expr::Slice` above -- only the unaffected
+        // bound is `None`.
+        assert_eq!(
+            parse(".[1.0:3]").unwrap(),
+            Expr::SliceNumber {
+                start: Some(1),
+                end: Some(3),
+                start_key: Some(NumberKey::Literal(1.0, "1.0".into())),
+                end_key: None,
+            }
+        );
+        assert_eq!(
+            parse(".[1:3.0]").unwrap(),
+            Expr::SliceNumber {
+                start: Some(1),
+                end: Some(3),
+                start_key: None,
+                end_key: Some(NumberKey::Literal(3.0, "3.0".into())),
+            }
+        );
 
         // Open bounds too, including the negative that only the `[:n]` branch
         // ever sees.
@@ -5920,11 +5966,20 @@ mod tests {
                 key: NumberKey::Float(-1.0),
             }
         );
+        // #1326: the slice-bound sibling of the `IndexNumber` case above --
+        // negation destroys the *literal spelling* the same way, but the
+        // bound still keeps a `NumberKey::Float` rather than dropping to
+        // plain `Expr::Slice` (`path(.[-3.0:-1.0])` is `[{"start":-3,
+        // "end":-1}]`, not `.0`-suffixed, because a *computed* whole-valued
+        // double renders bare in jq's own convention -- confirmed live,
+        // matching real jq exactly).
         assert_eq!(
             parse(".[-3.0:-1.0]").unwrap(),
-            Expr::Slice {
+            Expr::SliceNumber {
                 start: Some(-3),
                 end: Some(-1),
+                start_key: Some(NumberKey::Float(-3.0)),
+                end_key: Some(NumberKey::Float(-1.0)),
             }
         );
         // A non-integral negative float still can't fold -- same as the

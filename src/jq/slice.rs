@@ -133,13 +133,29 @@ fn clamp(bound: f64, len: usize) -> usize {
 /// `[1,2,3] | path(.[-2:-1])` is `[{"start":-2,"end":-1}]`, and an omitted
 /// bound is `null`. jq resolves only when the component is finally applied to
 /// a container, which is what lets a path outlive the value it was taken from.
+///
+/// A plain `i64`-bound wrapper over [`literal_component_from_values`] --
+/// #1326's own float-bound-preserving callers build each bound's `OwnedValue`
+/// themselves (via `eval.rs`'s `index_component_value`, which needs
+/// [`super::expr::NumberKey`], a type this module deliberately stays
+/// agnostic of) and hand the pair straight to that instead.
 pub(crate) fn literal_component(start: Option<i64>, end: Option<i64>) -> OwnedValue {
-    let mut obj = IndexMap::with_capacity(2);
-    obj.insert(
-        "start".into(),
+    literal_component_from_values(
         start.map_or(OwnedValue::Null, OwnedValue::Int),
-    );
-    obj.insert("end".into(), end.map_or(OwnedValue::Null, OwnedValue::Int));
+        end.map_or(OwnedValue::Null, OwnedValue::Int),
+    )
+}
+
+/// [`literal_component`]'s shared assembly step: join two already-resolved
+/// bound values into jq's `{"start":s,"end":e}` slice descriptor. Exists
+/// separately so a caller that needs to report a bound as something other
+/// than a bare `OwnedValue::Int`/`Null` -- a float-spelled literal keeping
+/// its own text (#1326) -- doesn't have to hand-copy the object-assembly
+/// shape.
+pub(crate) fn literal_component_from_values(start: OwnedValue, end: OwnedValue) -> OwnedValue {
+    let mut obj = IndexMap::with_capacity(2);
+    obj.insert("start".into(), start);
+    obj.insert("end".into(), end);
     OwnedValue::Object(obj)
 }
 

@@ -2833,6 +2833,7 @@ fn contains_split_doc(expr: &Expr) -> bool {
         | Expr::Index(_)
         | Expr::IndexNumber { .. }
         | Expr::Slice { .. }
+        | Expr::SliceNumber { .. }
         | Expr::Iterate
         | Expr::Literal(_)
         | Expr::RecursiveDescent
