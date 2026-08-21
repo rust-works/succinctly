@@ -12175,6 +12175,90 @@ fn nested_arrays(depth: usize) -> String {
     format!("{}1{}", "[".repeat(depth), "]".repeat(depth))
 }
 
+/// #1016: a self-recursive `def` has no base case at expansion time --
+/// `expand_func_calls` statically substitutes `deep`'s body in place of
+/// each call *before* any evaluation happens, so it can't observe that
+/// `n == 0` will eventually hold and unrolls unconditionally. Confirmed
+/// live before this fix: `deep(1)` crashed with SIGABRT (stack overflow)
+/// even at the shallowest possible depth, since expansion never terminates
+/// on its own regardless of `n`'s actual value.
+///
+/// `n = 60` safely exceeds `MAX_FUNC_EXPANSION_DEPTH` (50), so this must
+/// still fail -- but cleanly, as a catchable `EvalError`, not a SIGABRT
+/// that takes the whole process down.
+#[test]
+fn test_self_recursive_def_rejects_past_expansion_depth_1016() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            "def deep(n): if n == 0 then . else [deep(n-1)] end; deep(60)",
+        ],
+        Some("null"),
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert!(
+        stderr.contains("recursion too deep while expanding"),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
+/// Companion to the above: a self-recursive `def` well within
+/// `MAX_FUNC_EXPANSION_DEPTH` must still evaluate correctly, byte-for-byte
+/// matching real jq 1.7.1's own output for the same query (confirmed live)
+/// -- the guard must not reject ordinary, ceiling-respecting recursion.
+#[test]
+fn test_self_recursive_def_accepts_depth_under_limit_1016() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            "def deep(n): if n == 0 then . else [deep(n-1)] end; deep(40)",
+        ],
+        Some("null"),
+    )?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(
+        stdout.trim_end(),
+        "[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[null]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]"
+    );
+    Ok(())
+}
+
+/// A zero-argument self-recursive `def` (no growing argument expression to
+/// substitute) is the *cheapest possible* case for `expand_func_calls`'s own
+/// recursion, yet still crashed at only ~383 levels in a debug build before
+/// this fix (measured while calibrating `MAX_FUNC_EXPANSION_DEPTH`) -- it
+/// has no base case at all, so it must hit the depth guard on every build,
+/// not just adversarially deep ones. Confirms the guard covers this shape
+/// too, not just the parameterized one above.
+#[test]
+fn test_unconditional_self_recursive_def_rejects_cleanly_1016() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-c", "def deep: [deep]; deep"], Some("null"))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert!(
+        stderr.contains("recursion too deep while expanding"),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
+/// Non-recursive `def`s, and defs that recurse via a hand-written `Builtin`
+/// (`recurse`, not a user-defined self-call), must stay completely
+/// unaffected by `MAX_FUNC_EXPANSION_DEPTH` -- confirms the guard is scoped
+/// to `expand_func_calls`'s own self-reference arm, not a blanket limit on
+/// every recursive-looking query.
+#[test]
+fn test_non_self_recursive_constructs_unaffected_by_expansion_guard_1016() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-c", "def inc: . + 1; 5 | inc"], Some("null"))?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "6");
+
+    let (stdout, stderr, code) = run_jq_full(&["-c", "[recurse]"], Some("[1,[2,[3]]]"))?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "[[1,[2,[3]]],1,[2,[3]],2,[3],3]");
+    Ok(())
+}
+
 /// #998: the bare identity `.` never materializes an `OwnedValue` tree (it
 /// stays lazy, streaming straight from the cursor via `print_json`), so
 /// `eval_generic::to_owned`'s own depth guard never gets a chance to fire

@@ -26219,12 +26219,61 @@ fn eval_func_def<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     optional: bool,
 ) -> QueryResult<'a, W> {
     // Substitute all calls to this function in `then` with the body
-    let expanded_then = expand_func_calls(then, name, params, body);
+    let expanded_then = expand_func_calls(then, name, params, body, 0);
     eval_single::<W, S>(&expanded_then, value, optional)
 }
 
+/// Caps how many times [`expand_func_calls`] will re-enter its own
+/// `FuncCall` self-reference arm while inlining one `def` (#1016).
+///
+/// `succinctly jq` evaluates `def name(params): body; then` by statically
+/// substituting each call to `name` with `body` (with `params` replaced by
+/// the call's arguments) -- entirely before any evaluation happens. For a
+/// self-recursive `def` (e.g. `def deep(n): if n == 0 then . else
+/// [deep(n-1)] end;`), the substituted `body` always contains another
+/// syntactic call to `name`, since expansion can't observe that a runtime
+/// condition like `n == 0` will eventually hold -- only real evaluation
+/// (which hasn't happened yet) could. Left unguarded, this unrolls forever
+/// and overflows the native stack; confirmed live (`def deep(n): if n == 0
+/// then . else [deep(n-1)] end; deep(1)` crashes with SIGABRT even at the
+/// shallowest possible depth, since expansion never terminates on its own).
+///
+/// **This does not, and cannot, match real jq's usable recursion depth.**
+/// jq evaluates function calls at runtime rather than expanding them
+/// statically, so a self-recursive `def` there costs one interpreter frame
+/// per call and works up to jq's own memory limits (confirmed live against
+/// jq 1.7.1: this issue's own `deep(n)` repro returns cleanly through at
+/// least `n = 10_000`). `expand_func_calls`'s substitution has a much
+/// steeper native-stack cost per level -- confirmed empirically (debug
+/// build, default thread stack, this crate's usual methodology for `MAX_*`
+/// ceilings) across several `def` shapes (1, 2, and 4 parameters; plain
+/// arithmetic and string/array/object bodies): even the *cheapest possible*
+/// case (a zero-argument `def deep: [deep]; deep`) crashes at only ~383
+/// levels, and every parameterized shape tested crashed between ~189 and
+/// ~192 -- each unrolling re-substitutes the *entire* argument expression
+/// from the level before into a fresh clone of `body`, so the tree being
+/// walked keeps growing with depth, unlike jq's own runtime call. Genuinely
+/// matching jq's depth needs a different evaluation strategy for self-
+/// recursive `def`s (real runtime calls, not static substitution) -- a
+/// real architectural change, filed separately as #1371, not this guard.
+///
+/// Picked with a wide safety margin below every crash observed above (the
+/// lowest was ~189) precisely because that margin has to absorb `def`
+/// bodies more expensive than anything tested here, not because legitimate
+/// use is expected to need this many levels. A `def` recursing deeper than
+/// this now gets a clean, catchable error -- worse than jq's own result
+/// (which would still succeed) but strictly better than a SIGABRT that
+/// takes the whole process down; see #1016 and #1371 for that gap.
+const MAX_FUNC_EXPANSION_DEPTH: usize = 50;
+
 /// Expand function calls to a defined function by inlining the body.
-fn expand_func_calls(expr: &Expr, func_name: &str, params: &[String], body: &Expr) -> Expr {
+fn expand_func_calls(
+    expr: &Expr,
+    func_name: &str,
+    params: &[String],
+    body: &Expr,
+    depth: usize,
+) -> Expr {
     match expr {
         Expr::FuncCall { name, args } if name == func_name => {
             // Check arity
@@ -26238,19 +26287,37 @@ fn expand_func_calls(expr: &Expr, func_name: &str, params: &[String], body: &Exp
                     args.len()
                 ))))));
             }
+            // #1016: a self-recursive `def` (e.g. `def deep(n): if n == 0
+            // then . else [deep(n-1)] end;`) has no base case at expansion
+            // time -- expansion is static AST substitution, run before any
+            // evaluation, so it can never observe that a runtime condition
+            // like `n == 0` will eventually hold. Each hop back into this
+            // arm re-substitutes the body, which (for a genuinely recursive
+            // `def`) always contains another syntactic call to `func_name`,
+            // so this would otherwise unroll forever and overflow the
+            // native stack -- see `MAX_FUNC_EXPANSION_DEPTH`'s doc comment.
+            // Same non-panicking `Expr::Error` shape as the arity check
+            // above, not a panic (#1098 established that panicking here is
+            // live-reachable through ordinary CLI usage, not just a
+            // theoretical safety net).
+            if depth >= MAX_FUNC_EXPANSION_DEPTH {
+                return Expr::Error(Some(Box::new(Expr::Literal(Literal::String(format!(
+                    "function {func_name} recursion too deep while expanding (exceeds {MAX_FUNC_EXPANSION_DEPTH} levels)"
+                ))))));
+            }
             // Substitute parameters with arguments in the body
             let mut result = body.clone();
             // First, expand any nested function calls in the arguments
             let expanded_args: Vec<Expr> = args
                 .iter()
-                .map(|a| expand_func_calls(a, func_name, params, body))
+                .map(|a| expand_func_calls(a, func_name, params, body, depth + 1))
                 .collect();
             // Then substitute each parameter
             for (param, arg) in params.iter().zip(expanded_args.iter()) {
                 result = substitute_func_param(&result, param, arg);
             }
             // Also expand any recursive calls in the result
-            expand_func_calls(&result, func_name, params, body)
+            expand_func_calls(&result, func_name, params, body, depth + 1)
         }
         // Recursively expand in all subexpressions
         Expr::Identity => Expr::Identity,
@@ -26266,105 +26333,123 @@ fn expand_func_calls(expr: &Expr, func_name: &str, params: &[String], body: &Exp
         },
         Expr::Iterate => Expr::Iterate,
         Expr::IndexExpr { target, key } => Expr::IndexExpr {
-            target: Box::new(expand_func_calls(target, func_name, params, body)),
-            key: Box::new(expand_func_calls(key, func_name, params, body)),
+            target: Box::new(expand_func_calls(target, func_name, params, body, depth)),
+            key: Box::new(expand_func_calls(key, func_name, params, body, depth)),
         },
         Expr::SliceExpr { target, start, end } => Expr::SliceExpr {
-            target: Box::new(expand_func_calls(target, func_name, params, body)),
+            target: Box::new(expand_func_calls(target, func_name, params, body, depth)),
             start: start
                 .as_deref()
-                .map(|e| Box::new(expand_func_calls(e, func_name, params, body))),
+                .map(|e| Box::new(expand_func_calls(e, func_name, params, body, depth))),
             end: end
                 .as_deref()
-                .map(|e| Box::new(expand_func_calls(e, func_name, params, body))),
+                .map(|e| Box::new(expand_func_calls(e, func_name, params, body, depth))),
         },
         Expr::RecursiveDescent => Expr::RecursiveDescent,
-        Expr::Optional(e) => {
-            Expr::Optional(Box::new(expand_func_calls(e, func_name, params, body)))
-        }
+        Expr::Optional(e) => Expr::Optional(Box::new(expand_func_calls(
+            e, func_name, params, body, depth,
+        ))),
         Expr::Pipe(exprs) => Expr::Pipe(
             exprs
                 .iter()
-                .map(|e| expand_func_calls(e, func_name, params, body))
+                .map(|e| expand_func_calls(e, func_name, params, body, depth))
                 .collect(),
         ),
         Expr::Comma(exprs) => Expr::Comma(
             exprs
                 .iter()
-                .map(|e| expand_func_calls(e, func_name, params, body))
+                .map(|e| expand_func_calls(e, func_name, params, body, depth))
                 .collect(),
         ),
-        Expr::Array(e) => Expr::Array(Box::new(expand_func_calls(e, func_name, params, body))),
+        Expr::Array(e) => Expr::Array(Box::new(expand_func_calls(
+            e, func_name, params, body, depth,
+        ))),
         Expr::Object(entries) => Expr::Object(
             entries
                 .iter()
                 .map(|entry| {
                     let new_key = match &entry.key {
                         ObjectKey::Literal(s) => ObjectKey::Literal(s.clone()),
-                        ObjectKey::Expr(e) => {
-                            ObjectKey::Expr(Box::new(expand_func_calls(e, func_name, params, body)))
-                        }
+                        ObjectKey::Expr(e) => ObjectKey::Expr(Box::new(expand_func_calls(
+                            e, func_name, params, body, depth,
+                        ))),
                     };
                     ObjectEntry {
                         key: new_key,
-                        value: expand_func_calls(&entry.value, func_name, params, body),
+                        value: expand_func_calls(&entry.value, func_name, params, body, depth),
                     }
                 })
                 .collect(),
         ),
         Expr::Literal(lit) => Expr::Literal(lit.clone()),
-        Expr::Paren(e) => Expr::Paren(Box::new(expand_func_calls(e, func_name, params, body))),
+        Expr::Paren(e) => Expr::Paren(Box::new(expand_func_calls(
+            e, func_name, params, body, depth,
+        ))),
         Expr::Arithmetic { op, left, right } => Expr::Arithmetic {
             op: *op,
-            left: Box::new(expand_func_calls(left, func_name, params, body)),
-            right: Box::new(expand_func_calls(right, func_name, params, body)),
+            left: Box::new(expand_func_calls(left, func_name, params, body, depth)),
+            right: Box::new(expand_func_calls(right, func_name, params, body, depth)),
         },
         Expr::Negate(operand) => Expr::Negate(Box::new(expand_func_calls(
-            operand, func_name, params, body,
+            operand, func_name, params, body, depth,
         ))),
         Expr::Compare { op, left, right } => Expr::Compare {
             op: *op,
-            left: Box::new(expand_func_calls(left, func_name, params, body)),
-            right: Box::new(expand_func_calls(right, func_name, params, body)),
+            left: Box::new(expand_func_calls(left, func_name, params, body, depth)),
+            right: Box::new(expand_func_calls(right, func_name, params, body, depth)),
         },
         Expr::And(l, r) => Expr::And(
-            Box::new(expand_func_calls(l, func_name, params, body)),
-            Box::new(expand_func_calls(r, func_name, params, body)),
+            Box::new(expand_func_calls(l, func_name, params, body, depth)),
+            Box::new(expand_func_calls(r, func_name, params, body, depth)),
         ),
         Expr::Or(l, r) => Expr::Or(
-            Box::new(expand_func_calls(l, func_name, params, body)),
-            Box::new(expand_func_calls(r, func_name, params, body)),
+            Box::new(expand_func_calls(l, func_name, params, body, depth)),
+            Box::new(expand_func_calls(r, func_name, params, body, depth)),
         ),
         Expr::Not => Expr::Not,
         Expr::Alternative(l, r) => Expr::Alternative(
-            Box::new(expand_func_calls(l, func_name, params, body)),
-            Box::new(expand_func_calls(r, func_name, params, body)),
+            Box::new(expand_func_calls(l, func_name, params, body, depth)),
+            Box::new(expand_func_calls(r, func_name, params, body, depth)),
         ),
         Expr::If {
             cond,
             then_branch,
             else_branch,
         } => Expr::If {
-            cond: Box::new(expand_func_calls(cond, func_name, params, body)),
-            then_branch: Box::new(expand_func_calls(then_branch, func_name, params, body)),
-            else_branch: Box::new(expand_func_calls(else_branch, func_name, params, body)),
+            cond: Box::new(expand_func_calls(cond, func_name, params, body, depth)),
+            then_branch: Box::new(expand_func_calls(
+                then_branch,
+                func_name,
+                params,
+                body,
+                depth,
+            )),
+            else_branch: Box::new(expand_func_calls(
+                else_branch,
+                func_name,
+                params,
+                body,
+                depth,
+            )),
         },
         Expr::Try { expr, catch } => Expr::Try {
-            expr: Box::new(expand_func_calls(expr, func_name, params, body)),
+            expr: Box::new(expand_func_calls(expr, func_name, params, body, depth)),
             catch: catch
                 .as_ref()
-                .map(|c| Box::new(expand_func_calls(c, func_name, params, body))),
+                .map(|c| Box::new(expand_func_calls(c, func_name, params, body, depth))),
         },
         Expr::Error(msg) => Expr::Error(msg.clone()),
-        Expr::Builtin(b) => Expr::Builtin(expand_func_calls_in_builtin(b, func_name, params, body)),
+        Expr::Builtin(b) => Expr::Builtin(expand_func_calls_in_builtin(
+            b, func_name, params, body, depth,
+        )),
         Expr::StringInterpolation(parts) => Expr::StringInterpolation(
             parts
                 .iter()
                 .map(|p| match p {
                     StringPart::Literal(s) => StringPart::Literal(s.clone()),
-                    StringPart::Expr(e) => {
-                        StringPart::Expr(Box::new(expand_func_calls(e, func_name, params, body)))
-                    }
+                    StringPart::Expr(e) => StringPart::Expr(Box::new(expand_func_calls(
+                        e, func_name, params, body, depth,
+                    ))),
                 })
                 .collect(),
         ),
@@ -26377,9 +26462,9 @@ fn expand_func_calls(expr: &Expr, func_name: &str, params: &[String], body: &Exp
             var,
             body: as_body,
         } => Expr::As {
-            expr: Box::new(expand_func_calls(expr, func_name, params, body)),
+            expr: Box::new(expand_func_calls(expr, func_name, params, body, depth)),
             var: var.clone(),
-            body: Box::new(expand_func_calls(as_body, func_name, params, body)),
+            body: Box::new(expand_func_calls(as_body, func_name, params, body, depth)),
         },
         Expr::Reduce {
             input,
@@ -26387,10 +26472,10 @@ fn expand_func_calls(expr: &Expr, func_name: &str, params: &[String], body: &Exp
             init,
             update,
         } => Expr::Reduce {
-            input: Box::new(expand_func_calls(input, func_name, params, body)),
+            input: Box::new(expand_func_calls(input, func_name, params, body, depth)),
             pattern: pattern.clone(),
-            init: Box::new(expand_func_calls(init, func_name, params, body)),
-            update: Box::new(expand_func_calls(update, func_name, params, body)),
+            init: Box::new(expand_func_calls(init, func_name, params, body, depth)),
+            update: Box::new(expand_func_calls(update, func_name, params, body, depth)),
         },
         Expr::Foreach {
             input,
@@ -26399,54 +26484,62 @@ fn expand_func_calls(expr: &Expr, func_name: &str, params: &[String], body: &Exp
             update,
             extract,
         } => Expr::Foreach {
-            input: Box::new(expand_func_calls(input, func_name, params, body)),
+            input: Box::new(expand_func_calls(input, func_name, params, body, depth)),
             pattern: pattern.clone(),
-            init: Box::new(expand_func_calls(init, func_name, params, body)),
-            update: Box::new(expand_func_calls(update, func_name, params, body)),
+            init: Box::new(expand_func_calls(init, func_name, params, body, depth)),
+            update: Box::new(expand_func_calls(update, func_name, params, body, depth)),
             extract: extract
                 .as_ref()
-                .map(|e| Box::new(expand_func_calls(e, func_name, params, body))),
+                .map(|e| Box::new(expand_func_calls(e, func_name, params, body, depth))),
         },
         Expr::Limit { n, expr } => Expr::Limit {
-            n: Box::new(expand_func_calls(n, func_name, params, body)),
-            expr: Box::new(expand_func_calls(expr, func_name, params, body)),
+            n: Box::new(expand_func_calls(n, func_name, params, body, depth)),
+            expr: Box::new(expand_func_calls(expr, func_name, params, body, depth)),
         },
-        Expr::FirstExpr(e) => {
-            Expr::FirstExpr(Box::new(expand_func_calls(e, func_name, params, body)))
-        }
-        Expr::LastExpr(e) => {
-            Expr::LastExpr(Box::new(expand_func_calls(e, func_name, params, body)))
-        }
+        Expr::FirstExpr(e) => Expr::FirstExpr(Box::new(expand_func_calls(
+            e, func_name, params, body, depth,
+        ))),
+        Expr::LastExpr(e) => Expr::LastExpr(Box::new(expand_func_calls(
+            e, func_name, params, body, depth,
+        ))),
         Expr::NthExpr { n, expr } => Expr::NthExpr {
-            n: Box::new(expand_func_calls(n, func_name, params, body)),
-            expr: Box::new(expand_func_calls(expr, func_name, params, body)),
+            n: Box::new(expand_func_calls(n, func_name, params, body, depth)),
+            expr: Box::new(expand_func_calls(expr, func_name, params, body, depth)),
         },
         Expr::Until { cond, update } => Expr::Until {
-            cond: Box::new(expand_func_calls(cond, func_name, params, body)),
-            update: Box::new(expand_func_calls(update, func_name, params, body)),
+            cond: Box::new(expand_func_calls(cond, func_name, params, body, depth)),
+            update: Box::new(expand_func_calls(update, func_name, params, body, depth)),
         },
         Expr::While { cond, update } => Expr::While {
-            cond: Box::new(expand_func_calls(cond, func_name, params, body)),
-            update: Box::new(expand_func_calls(update, func_name, params, body)),
+            cond: Box::new(expand_func_calls(cond, func_name, params, body, depth)),
+            update: Box::new(expand_func_calls(update, func_name, params, body, depth)),
         },
-        Expr::Repeat(e) => Expr::Repeat(Box::new(expand_func_calls(e, func_name, params, body))),
+        Expr::Repeat(e) => Expr::Repeat(Box::new(expand_func_calls(
+            e, func_name, params, body, depth,
+        ))),
         Expr::Range { from, to, step } => Expr::Range {
-            from: Box::new(expand_func_calls(from, func_name, params, body)),
+            from: Box::new(expand_func_calls(from, func_name, params, body, depth)),
             to: to
                 .as_ref()
-                .map(|e| Box::new(expand_func_calls(e, func_name, params, body))),
+                .map(|e| Box::new(expand_func_calls(e, func_name, params, body, depth))),
             step: step
                 .as_ref()
-                .map(|e| Box::new(expand_func_calls(e, func_name, params, body))),
+                .map(|e| Box::new(expand_func_calls(e, func_name, params, body, depth))),
         },
         Expr::AsPattern {
             expr,
             patterns,
             body: pattern_body,
         } => Expr::AsPattern {
-            expr: Box::new(expand_func_calls(expr, func_name, params, body)),
+            expr: Box::new(expand_func_calls(expr, func_name, params, body, depth)),
             patterns: patterns.clone(),
-            body: Box::new(expand_func_calls(pattern_body, func_name, params, body)),
+            body: Box::new(expand_func_calls(
+                pattern_body,
+                func_name,
+                params,
+                body,
+                depth,
+            )),
         },
         Expr::FuncDef {
             name: inner_name,
@@ -26462,8 +26555,10 @@ fn expand_func_calls(expr: &Expr, func_name: &str, params: &[String], body: &Exp
                 Expr::FuncDef {
                     name: inner_name.clone(),
                     params: inner_params.clone(),
-                    body: Box::new(expand_func_calls(inner_body, func_name, params, body)),
-                    then: Box::new(expand_func_calls(then, func_name, params, body)),
+                    body: Box::new(expand_func_calls(
+                        inner_body, func_name, params, body, depth,
+                    )),
+                    then: Box::new(expand_func_calls(then, func_name, params, body, depth)),
                 }
             }
         }
@@ -26473,7 +26568,7 @@ fn expand_func_calls(expr: &Expr, func_name: &str, params: &[String], body: &Exp
                 name: name.clone(),
                 args: args
                     .iter()
-                    .map(|a| expand_func_calls(a, func_name, params, body))
+                    .map(|a| expand_func_calls(a, func_name, params, body, depth))
                     .collect(),
             }
         }
@@ -26486,31 +26581,31 @@ fn expand_func_calls(expr: &Expr, func_name: &str, params: &[String], body: &Exp
             name: name.clone(),
             args: args
                 .iter()
-                .map(|a| expand_func_calls(a, func_name, params, body))
+                .map(|a| expand_func_calls(a, func_name, params, body, depth))
                 .collect(),
         },
         Expr::Assign { path, value } => Expr::Assign {
-            path: Box::new(expand_func_calls(path, func_name, params, body)),
-            value: Box::new(expand_func_calls(value, func_name, params, body)),
+            path: Box::new(expand_func_calls(path, func_name, params, body, depth)),
+            value: Box::new(expand_func_calls(value, func_name, params, body, depth)),
         },
         Expr::Update { path, filter } => Expr::Update {
-            path: Box::new(expand_func_calls(path, func_name, params, body)),
-            filter: Box::new(expand_func_calls(filter, func_name, params, body)),
+            path: Box::new(expand_func_calls(path, func_name, params, body, depth)),
+            filter: Box::new(expand_func_calls(filter, func_name, params, body, depth)),
         },
         Expr::CompoundAssign { op, path, value } => Expr::CompoundAssign {
             op: *op,
-            path: Box::new(expand_func_calls(path, func_name, params, body)),
-            value: Box::new(expand_func_calls(value, func_name, params, body)),
+            path: Box::new(expand_func_calls(path, func_name, params, body, depth)),
+            value: Box::new(expand_func_calls(value, func_name, params, body, depth)),
         },
         Expr::AlternativeAssign { path, value } => Expr::AlternativeAssign {
-            path: Box::new(expand_func_calls(path, func_name, params, body)),
-            value: Box::new(expand_func_calls(value, func_name, params, body)),
+            path: Box::new(expand_func_calls(path, func_name, params, body, depth)),
+            value: Box::new(expand_func_calls(value, func_name, params, body, depth)),
         },
 
         // Label-break
         Expr::Label { name, body: lbody } => Expr::Label {
             name: name.clone(),
-            body: Box::new(expand_func_calls(lbody, func_name, params, body)),
+            body: Box::new(expand_func_calls(lbody, func_name, params, body, depth)),
         },
         Expr::Break(name) => Expr::Break(name.clone()),
     }
@@ -26823,6 +26918,7 @@ fn expand_func_calls_in_builtin(
     func_name: &str,
     params: &[String],
     body: &Expr,
+    depth: usize,
 ) -> Builtin {
     match builtin {
         Builtin::Type => Builtin::Type,
@@ -26845,213 +26941,233 @@ fn expand_func_calls_in_builtin(
         Builtin::Utf8ByteLength => Builtin::Utf8ByteLength,
         Builtin::Keys => Builtin::Keys,
         Builtin::KeysUnsorted => Builtin::KeysUnsorted,
-        Builtin::Has(e) => Builtin::Has(Box::new(expand_func_calls(e, func_name, params, body))),
-        Builtin::In(e) => Builtin::In(Box::new(expand_func_calls(e, func_name, params, body))),
-        Builtin::UpperIn(e) => {
-            Builtin::UpperIn(Box::new(expand_func_calls(e, func_name, params, body)))
-        }
+        Builtin::Has(e) => Builtin::Has(Box::new(expand_func_calls(
+            e, func_name, params, body, depth,
+        ))),
+        Builtin::In(e) => Builtin::In(Box::new(expand_func_calls(
+            e, func_name, params, body, depth,
+        ))),
+        Builtin::UpperIn(e) => Builtin::UpperIn(Box::new(expand_func_calls(
+            e, func_name, params, body, depth,
+        ))),
         Builtin::UpperInSrc(src, s) => Builtin::UpperInSrc(
-            Box::new(expand_func_calls(src, func_name, params, body)),
-            Box::new(expand_func_calls(s, func_name, params, body)),
+            Box::new(expand_func_calls(src, func_name, params, body, depth)),
+            Box::new(expand_func_calls(s, func_name, params, body, depth)),
         ),
-        Builtin::Select(e) => {
-            Builtin::Select(Box::new(expand_func_calls(e, func_name, params, body)))
-        }
+        Builtin::Select(e) => Builtin::Select(Box::new(expand_func_calls(
+            e, func_name, params, body, depth,
+        ))),
         Builtin::Empty => Builtin::Empty,
-        Builtin::Map(e) => Builtin::Map(Box::new(expand_func_calls(e, func_name, params, body))),
-        Builtin::MapValues(e) => {
-            Builtin::MapValues(Box::new(expand_func_calls(e, func_name, params, body)))
-        }
+        Builtin::Map(e) => Builtin::Map(Box::new(expand_func_calls(
+            e, func_name, params, body, depth,
+        ))),
+        Builtin::MapValues(e) => Builtin::MapValues(Box::new(expand_func_calls(
+            e, func_name, params, body, depth,
+        ))),
         Builtin::Add => Builtin::Add,
         Builtin::Any => Builtin::Any,
-        Builtin::AnyF(e) => Builtin::AnyF(Box::new(expand_func_calls(e, func_name, params, body))),
+        Builtin::AnyF(e) => Builtin::AnyF(Box::new(expand_func_calls(
+            e, func_name, params, body, depth,
+        ))),
         Builtin::AnyCond(gen, cond) => Builtin::AnyCond(
-            Box::new(expand_func_calls(gen, func_name, params, body)),
-            Box::new(expand_func_calls(cond, func_name, params, body)),
+            Box::new(expand_func_calls(gen, func_name, params, body, depth)),
+            Box::new(expand_func_calls(cond, func_name, params, body, depth)),
         ),
         Builtin::All => Builtin::All,
-        Builtin::AllF(e) => Builtin::AllF(Box::new(expand_func_calls(e, func_name, params, body))),
+        Builtin::AllF(e) => Builtin::AllF(Box::new(expand_func_calls(
+            e, func_name, params, body, depth,
+        ))),
         Builtin::AllCond(gen, cond) => Builtin::AllCond(
-            Box::new(expand_func_calls(gen, func_name, params, body)),
-            Box::new(expand_func_calls(cond, func_name, params, body)),
+            Box::new(expand_func_calls(gen, func_name, params, body, depth)),
+            Box::new(expand_func_calls(cond, func_name, params, body, depth)),
         ),
         Builtin::Min => Builtin::Min,
         Builtin::Max => Builtin::Max,
-        Builtin::MinBy(e) => {
-            Builtin::MinBy(Box::new(expand_func_calls(e, func_name, params, body)))
-        }
-        Builtin::MaxBy(e) => {
-            Builtin::MaxBy(Box::new(expand_func_calls(e, func_name, params, body)))
-        }
+        Builtin::MinBy(e) => Builtin::MinBy(Box::new(expand_func_calls(
+            e, func_name, params, body, depth,
+        ))),
+        Builtin::MaxBy(e) => Builtin::MaxBy(Box::new(expand_func_calls(
+            e, func_name, params, body, depth,
+        ))),
         Builtin::AsciiDowncase => Builtin::AsciiDowncase,
         Builtin::AsciiUpcase => Builtin::AsciiUpcase,
-        Builtin::Ltrimstr(e) => {
-            Builtin::Ltrimstr(Box::new(expand_func_calls(e, func_name, params, body)))
-        }
-        Builtin::Rtrimstr(e) => {
-            Builtin::Rtrimstr(Box::new(expand_func_calls(e, func_name, params, body)))
-        }
-        Builtin::Startswith(e) => {
-            Builtin::Startswith(Box::new(expand_func_calls(e, func_name, params, body)))
-        }
-        Builtin::Endswith(e) => {
-            Builtin::Endswith(Box::new(expand_func_calls(e, func_name, params, body)))
-        }
-        Builtin::Split(e) => {
-            Builtin::Split(Box::new(expand_func_calls(e, func_name, params, body)))
-        }
-        Builtin::Join(e) => Builtin::Join(Box::new(expand_func_calls(e, func_name, params, body))),
-        Builtin::Contains(e) => {
-            Builtin::Contains(Box::new(expand_func_calls(e, func_name, params, body)))
-        }
-        Builtin::Inside(e) => {
-            Builtin::Inside(Box::new(expand_func_calls(e, func_name, params, body)))
-        }
+        Builtin::Ltrimstr(e) => Builtin::Ltrimstr(Box::new(expand_func_calls(
+            e, func_name, params, body, depth,
+        ))),
+        Builtin::Rtrimstr(e) => Builtin::Rtrimstr(Box::new(expand_func_calls(
+            e, func_name, params, body, depth,
+        ))),
+        Builtin::Startswith(e) => Builtin::Startswith(Box::new(expand_func_calls(
+            e, func_name, params, body, depth,
+        ))),
+        Builtin::Endswith(e) => Builtin::Endswith(Box::new(expand_func_calls(
+            e, func_name, params, body, depth,
+        ))),
+        Builtin::Split(e) => Builtin::Split(Box::new(expand_func_calls(
+            e, func_name, params, body, depth,
+        ))),
+        Builtin::Join(e) => Builtin::Join(Box::new(expand_func_calls(
+            e, func_name, params, body, depth,
+        ))),
+        Builtin::Contains(e) => Builtin::Contains(Box::new(expand_func_calls(
+            e, func_name, params, body, depth,
+        ))),
+        Builtin::Inside(e) => Builtin::Inside(Box::new(expand_func_calls(
+            e, func_name, params, body, depth,
+        ))),
         Builtin::First => Builtin::First,
         Builtin::Last => Builtin::Last,
-        Builtin::Nth(e) => Builtin::Nth(Box::new(expand_func_calls(e, func_name, params, body))),
+        Builtin::Nth(e) => Builtin::Nth(Box::new(expand_func_calls(
+            e, func_name, params, body, depth,
+        ))),
         Builtin::Reverse => Builtin::Reverse,
         Builtin::Flatten => Builtin::Flatten,
-        Builtin::FlattenDepth(e) => {
-            Builtin::FlattenDepth(Box::new(expand_func_calls(e, func_name, params, body)))
-        }
-        Builtin::GroupBy(e) => {
-            Builtin::GroupBy(Box::new(expand_func_calls(e, func_name, params, body)))
-        }
+        Builtin::FlattenDepth(e) => Builtin::FlattenDepth(Box::new(expand_func_calls(
+            e, func_name, params, body, depth,
+        ))),
+        Builtin::GroupBy(e) => Builtin::GroupBy(Box::new(expand_func_calls(
+            e, func_name, params, body, depth,
+        ))),
         Builtin::Unique => Builtin::Unique,
-        Builtin::UniqueBy(e) => {
-            Builtin::UniqueBy(Box::new(expand_func_calls(e, func_name, params, body)))
-        }
+        Builtin::UniqueBy(e) => Builtin::UniqueBy(Box::new(expand_func_calls(
+            e, func_name, params, body, depth,
+        ))),
         Builtin::Sort => Builtin::Sort,
-        Builtin::SortBy(e) => {
-            Builtin::SortBy(Box::new(expand_func_calls(e, func_name, params, body)))
-        }
+        Builtin::SortBy(e) => Builtin::SortBy(Box::new(expand_func_calls(
+            e, func_name, params, body, depth,
+        ))),
         Builtin::ToEntries => Builtin::ToEntries,
         Builtin::FromEntries => Builtin::FromEntries,
-        Builtin::WithEntries(e) => {
-            Builtin::WithEntries(Box::new(expand_func_calls(e, func_name, params, body)))
-        }
+        Builtin::WithEntries(e) => Builtin::WithEntries(Box::new(expand_func_calls(
+            e, func_name, params, body, depth,
+        ))),
         Builtin::ToString => Builtin::ToString,
         Builtin::ToNumber => Builtin::ToNumber,
         Builtin::ToJson => Builtin::ToJson,
         Builtin::FromJson => Builtin::FromJson,
         Builtin::Explode => Builtin::Explode,
         Builtin::Implode => Builtin::Implode,
-        Builtin::Test(e) => Builtin::Test(Box::new(expand_func_calls(e, func_name, params, body))),
-        Builtin::Indices(e) => {
-            Builtin::Indices(Box::new(expand_func_calls(e, func_name, params, body)))
-        }
-        Builtin::Index(e) => {
-            Builtin::Index(Box::new(expand_func_calls(e, func_name, params, body)))
-        }
-        Builtin::Rindex(e) => {
-            Builtin::Rindex(Box::new(expand_func_calls(e, func_name, params, body)))
-        }
-        Builtin::UpperIndex(e) => {
-            Builtin::UpperIndex(Box::new(expand_func_calls(e, func_name, params, body)))
-        }
+        Builtin::Test(e) => Builtin::Test(Box::new(expand_func_calls(
+            e, func_name, params, body, depth,
+        ))),
+        Builtin::Indices(e) => Builtin::Indices(Box::new(expand_func_calls(
+            e, func_name, params, body, depth,
+        ))),
+        Builtin::Index(e) => Builtin::Index(Box::new(expand_func_calls(
+            e, func_name, params, body, depth,
+        ))),
+        Builtin::Rindex(e) => Builtin::Rindex(Box::new(expand_func_calls(
+            e, func_name, params, body, depth,
+        ))),
+        Builtin::UpperIndex(e) => Builtin::UpperIndex(Box::new(expand_func_calls(
+            e, func_name, params, body, depth,
+        ))),
         Builtin::UpperIndexStream(stream, idx_expr) => Builtin::UpperIndexStream(
-            Box::new(expand_func_calls(stream, func_name, params, body)),
-            Box::new(expand_func_calls(idx_expr, func_name, params, body)),
+            Box::new(expand_func_calls(stream, func_name, params, body, depth)),
+            Box::new(expand_func_calls(idx_expr, func_name, params, body, depth)),
         ),
         Builtin::ToJsonStream => Builtin::ToJsonStream,
         Builtin::FromJsonStream => Builtin::FromJsonStream,
         Builtin::ToStream => Builtin::ToStream,
-        Builtin::FromStream(e) => {
-            Builtin::FromStream(Box::new(expand_func_calls(e, func_name, params, body)))
-        }
-        Builtin::TruncateStream(e) => {
-            Builtin::TruncateStream(Box::new(expand_func_calls(e, func_name, params, body)))
-        }
-        Builtin::GetPath(e) => {
-            Builtin::GetPath(Box::new(expand_func_calls(e, func_name, params, body)))
-        }
+        Builtin::FromStream(e) => Builtin::FromStream(Box::new(expand_func_calls(
+            e, func_name, params, body, depth,
+        ))),
+        Builtin::TruncateStream(e) => Builtin::TruncateStream(Box::new(expand_func_calls(
+            e, func_name, params, body, depth,
+        ))),
+        Builtin::GetPath(e) => Builtin::GetPath(Box::new(expand_func_calls(
+            e, func_name, params, body, depth,
+        ))),
         // Phase 16: Regex Functions
         Builtin::TestFlags(re, flags) => Builtin::TestFlags(
-            Box::new(expand_func_calls(re, func_name, params, body)),
-            Box::new(expand_func_calls(flags, func_name, params, body)),
+            Box::new(expand_func_calls(re, func_name, params, body, depth)),
+            Box::new(expand_func_calls(flags, func_name, params, body, depth)),
         ),
-        Builtin::Match(re) => {
-            Builtin::Match(Box::new(expand_func_calls(re, func_name, params, body)))
-        }
+        Builtin::Match(re) => Builtin::Match(Box::new(expand_func_calls(
+            re, func_name, params, body, depth,
+        ))),
         Builtin::MatchFlags(re, flags) => Builtin::MatchFlags(
-            Box::new(expand_func_calls(re, func_name, params, body)),
-            Box::new(expand_func_calls(flags, func_name, params, body)),
+            Box::new(expand_func_calls(re, func_name, params, body, depth)),
+            Box::new(expand_func_calls(flags, func_name, params, body, depth)),
         ),
-        Builtin::Capture(e) => {
-            Builtin::Capture(Box::new(expand_func_calls(e, func_name, params, body)))
-        }
+        Builtin::Capture(e) => Builtin::Capture(Box::new(expand_func_calls(
+            e, func_name, params, body, depth,
+        ))),
         Builtin::CaptureFlags(re, flags) => Builtin::CaptureFlags(
-            Box::new(expand_func_calls(re, func_name, params, body)),
-            Box::new(expand_func_calls(flags, func_name, params, body)),
+            Box::new(expand_func_calls(re, func_name, params, body, depth)),
+            Box::new(expand_func_calls(flags, func_name, params, body, depth)),
         ),
         Builtin::Sub(re, repl) => Builtin::Sub(
-            Box::new(expand_func_calls(re, func_name, params, body)),
-            Box::new(expand_func_calls(repl, func_name, params, body)),
+            Box::new(expand_func_calls(re, func_name, params, body, depth)),
+            Box::new(expand_func_calls(repl, func_name, params, body, depth)),
         ),
         Builtin::SubFlags(re, repl, flags) => Builtin::SubFlags(
-            Box::new(expand_func_calls(re, func_name, params, body)),
-            Box::new(expand_func_calls(repl, func_name, params, body)),
-            Box::new(expand_func_calls(flags, func_name, params, body)),
+            Box::new(expand_func_calls(re, func_name, params, body, depth)),
+            Box::new(expand_func_calls(repl, func_name, params, body, depth)),
+            Box::new(expand_func_calls(flags, func_name, params, body, depth)),
         ),
         Builtin::Gsub(re, repl) => Builtin::Gsub(
-            Box::new(expand_func_calls(re, func_name, params, body)),
-            Box::new(expand_func_calls(repl, func_name, params, body)),
+            Box::new(expand_func_calls(re, func_name, params, body, depth)),
+            Box::new(expand_func_calls(repl, func_name, params, body, depth)),
         ),
         Builtin::GsubFlags(re, repl, flags) => Builtin::GsubFlags(
-            Box::new(expand_func_calls(re, func_name, params, body)),
-            Box::new(expand_func_calls(repl, func_name, params, body)),
-            Box::new(expand_func_calls(flags, func_name, params, body)),
+            Box::new(expand_func_calls(re, func_name, params, body, depth)),
+            Box::new(expand_func_calls(repl, func_name, params, body, depth)),
+            Box::new(expand_func_calls(flags, func_name, params, body, depth)),
         ),
-        Builtin::Scan(re) => {
-            Builtin::Scan(Box::new(expand_func_calls(re, func_name, params, body)))
-        }
+        Builtin::Scan(re) => Builtin::Scan(Box::new(expand_func_calls(
+            re, func_name, params, body, depth,
+        ))),
         Builtin::ScanFlags(re, flags) => Builtin::ScanFlags(
-            Box::new(expand_func_calls(re, func_name, params, body)),
-            Box::new(expand_func_calls(flags, func_name, params, body)),
+            Box::new(expand_func_calls(re, func_name, params, body, depth)),
+            Box::new(expand_func_calls(flags, func_name, params, body, depth)),
         ),
         Builtin::SplitRegex(re, flags) => Builtin::SplitRegex(
-            Box::new(expand_func_calls(re, func_name, params, body)),
-            Box::new(expand_func_calls(flags, func_name, params, body)),
+            Box::new(expand_func_calls(re, func_name, params, body, depth)),
+            Box::new(expand_func_calls(flags, func_name, params, body, depth)),
         ),
-        Builtin::Splits(re) => {
-            Builtin::Splits(Box::new(expand_func_calls(re, func_name, params, body)))
-        }
+        Builtin::Splits(re) => Builtin::Splits(Box::new(expand_func_calls(
+            re, func_name, params, body, depth,
+        ))),
         Builtin::SplitsFlags(re, flags) => Builtin::SplitsFlags(
-            Box::new(expand_func_calls(re, func_name, params, body)),
-            Box::new(expand_func_calls(flags, func_name, params, body)),
+            Box::new(expand_func_calls(re, func_name, params, body, depth)),
+            Box::new(expand_func_calls(flags, func_name, params, body, depth)),
         ),
         Builtin::Recurse => Builtin::Recurse,
-        Builtin::RecurseF(f) => {
-            Builtin::RecurseF(Box::new(expand_func_calls(f, func_name, params, body)))
-        }
+        Builtin::RecurseF(f) => Builtin::RecurseF(Box::new(expand_func_calls(
+            f, func_name, params, body, depth,
+        ))),
         Builtin::RecurseCond(f, c) => Builtin::RecurseCond(
-            Box::new(expand_func_calls(f, func_name, params, body)),
-            Box::new(expand_func_calls(c, func_name, params, body)),
+            Box::new(expand_func_calls(f, func_name, params, body, depth)),
+            Box::new(expand_func_calls(c, func_name, params, body, depth)),
         ),
-        Builtin::Walk(f) => Builtin::Walk(Box::new(expand_func_calls(f, func_name, params, body))),
-        Builtin::IsValid(e) => {
-            Builtin::IsValid(Box::new(expand_func_calls(e, func_name, params, body)))
-        }
+        Builtin::Walk(f) => Builtin::Walk(Box::new(expand_func_calls(
+            f, func_name, params, body, depth,
+        ))),
+        Builtin::IsValid(e) => Builtin::IsValid(Box::new(expand_func_calls(
+            e, func_name, params, body, depth,
+        ))),
         // Phase 10 builtins
-        Builtin::Path(e) => Builtin::Path(Box::new(expand_func_calls(e, func_name, params, body))),
+        Builtin::Path(e) => Builtin::Path(Box::new(expand_func_calls(
+            e, func_name, params, body, depth,
+        ))),
         Builtin::PathNoArg => Builtin::PathNoArg,
         Builtin::Parent => Builtin::Parent,
-        Builtin::ParentN(e) => {
-            Builtin::ParentN(Box::new(expand_func_calls(e, func_name, params, body)))
-        }
+        Builtin::ParentN(e) => Builtin::ParentN(Box::new(expand_func_calls(
+            e, func_name, params, body, depth,
+        ))),
         Builtin::Paths => Builtin::Paths,
-        Builtin::PathsFilter(e) => {
-            Builtin::PathsFilter(Box::new(expand_func_calls(e, func_name, params, body)))
-        }
+        Builtin::PathsFilter(e) => Builtin::PathsFilter(Box::new(expand_func_calls(
+            e, func_name, params, body, depth,
+        ))),
         Builtin::LeafPaths => Builtin::LeafPaths,
         Builtin::SetPath(p, v) => Builtin::SetPath(
-            Box::new(expand_func_calls(p, func_name, params, body)),
-            Box::new(expand_func_calls(v, func_name, params, body)),
+            Box::new(expand_func_calls(p, func_name, params, body, depth)),
+            Box::new(expand_func_calls(v, func_name, params, body, depth)),
         ),
-        Builtin::DelPaths(e) => {
-            Builtin::DelPaths(Box::new(expand_func_calls(e, func_name, params, body)))
-        }
+        Builtin::DelPaths(e) => Builtin::DelPaths(Box::new(expand_func_calls(
+            e, func_name, params, body, depth,
+        ))),
         Builtin::Floor => Builtin::Floor,
         Builtin::Ceil => Builtin::Ceil,
         Builtin::Round => Builtin::Round,
@@ -27064,8 +27180,8 @@ fn expand_func_calls_in_builtin(
         Builtin::Exp10 => Builtin::Exp10,
         Builtin::Exp2 => Builtin::Exp2,
         Builtin::Pow(x, y) => Builtin::Pow(
-            Box::new(expand_func_calls(x, func_name, params, body)),
-            Box::new(expand_func_calls(y, func_name, params, body)),
+            Box::new(expand_func_calls(x, func_name, params, body, depth)),
+            Box::new(expand_func_calls(y, func_name, params, body, depth)),
         ),
         Builtin::Sin => Builtin::Sin,
         Builtin::Cos => Builtin::Cos,
@@ -27074,8 +27190,8 @@ fn expand_func_calls_in_builtin(
         Builtin::Acos => Builtin::Acos,
         Builtin::Atan => Builtin::Atan,
         Builtin::Atan2(x, y) => Builtin::Atan2(
-            Box::new(expand_func_calls(x, func_name, params, body)),
-            Box::new(expand_func_calls(y, func_name, params, body)),
+            Box::new(expand_func_calls(x, func_name, params, body, depth)),
+            Box::new(expand_func_calls(y, func_name, params, body, depth)),
         ),
         Builtin::Sinh => Builtin::Sinh,
         Builtin::Cosh => Builtin::Cosh,
@@ -27090,19 +27206,19 @@ fn expand_func_calls_in_builtin(
         Builtin::IsNormal => Builtin::IsNormal,
         Builtin::IsFinite => Builtin::IsFinite,
         Builtin::Debug => Builtin::Debug,
-        Builtin::DebugMsg(e) => {
-            Builtin::DebugMsg(Box::new(expand_func_calls(e, func_name, params, body)))
-        }
+        Builtin::DebugMsg(e) => Builtin::DebugMsg(Box::new(expand_func_calls(
+            e, func_name, params, body, depth,
+        ))),
         Builtin::Halt => Builtin::Halt,
         Builtin::Stderr => Builtin::Stderr,
         Builtin::HaltError => Builtin::HaltError,
-        Builtin::HaltErrorCode(e) => {
-            Builtin::HaltErrorCode(Box::new(expand_func_calls(e, func_name, params, body)))
-        }
+        Builtin::HaltErrorCode(e) => Builtin::HaltErrorCode(Box::new(expand_func_calls(
+            e, func_name, params, body, depth,
+        ))),
         Builtin::Env => Builtin::Env,
-        Builtin::EnvVar(e) => {
-            Builtin::EnvVar(Box::new(expand_func_calls(e, func_name, params, body)))
-        }
+        Builtin::EnvVar(e) => Builtin::EnvVar(Box::new(expand_func_calls(
+            e, func_name, params, body, depth,
+        ))),
         Builtin::EnvObject(name) => Builtin::EnvObject(name.clone()),
         Builtin::StrEnv(name) => Builtin::StrEnv(name.clone()),
         Builtin::NullLit => Builtin::NullLit,
@@ -27110,14 +27226,18 @@ fn expand_func_calls_in_builtin(
         Builtin::Ltrim => Builtin::Ltrim,
         Builtin::Rtrim => Builtin::Rtrim,
         Builtin::Transpose => Builtin::Transpose,
-        Builtin::BSearch(e) => {
-            Builtin::BSearch(Box::new(expand_func_calls(e, func_name, params, body)))
-        }
-        Builtin::ModuleMeta(e) => {
-            Builtin::ModuleMeta(Box::new(expand_func_calls(e, func_name, params, body)))
-        }
-        Builtin::Pick(e) => Builtin::Pick(Box::new(expand_func_calls(e, func_name, params, body))),
-        Builtin::Omit(e) => Builtin::Omit(Box::new(expand_func_calls(e, func_name, params, body))),
+        Builtin::BSearch(e) => Builtin::BSearch(Box::new(expand_func_calls(
+            e, func_name, params, body, depth,
+        ))),
+        Builtin::ModuleMeta(e) => Builtin::ModuleMeta(Box::new(expand_func_calls(
+            e, func_name, params, body, depth,
+        ))),
+        Builtin::Pick(e) => Builtin::Pick(Box::new(expand_func_calls(
+            e, func_name, params, body, depth,
+        ))),
+        Builtin::Omit(e) => Builtin::Omit(Box::new(expand_func_calls(
+            e, func_name, params, body, depth,
+        ))),
         Builtin::Tag => Builtin::Tag,
         Builtin::Anchor => Builtin::Anchor,
         Builtin::Style => Builtin::Style,
@@ -27131,7 +27251,9 @@ fn expand_func_calls_in_builtin(
         Builtin::Shuffle => Builtin::Shuffle,
         Builtin::Pivot => Builtin::Pivot,
         Builtin::SplitDoc => Builtin::SplitDoc,
-        Builtin::Del(e) => Builtin::Del(Box::new(expand_func_calls(e, func_name, params, body))),
+        Builtin::Del(e) => Builtin::Del(Box::new(expand_func_calls(
+            e, func_name, params, body, depth,
+        ))),
         // Phase 12 builtins (no args to expand)
         Builtin::Now => Builtin::Now,
         Builtin::Input => Builtin::Input,
@@ -27143,34 +27265,34 @@ fn expand_func_calls_in_builtin(
         Builtin::Finites => Builtin::Finites,
         // Phase 13: Iteration control
         Builtin::Limit(n, e) => Builtin::Limit(
-            Box::new(expand_func_calls(n, func_name, params, body)),
-            Box::new(expand_func_calls(e, func_name, params, body)),
+            Box::new(expand_func_calls(n, func_name, params, body, depth)),
+            Box::new(expand_func_calls(e, func_name, params, body, depth)),
         ),
-        Builtin::FirstStream(e) => {
-            Builtin::FirstStream(Box::new(expand_func_calls(e, func_name, params, body)))
-        }
-        Builtin::LastStream(e) => {
-            Builtin::LastStream(Box::new(expand_func_calls(e, func_name, params, body)))
-        }
+        Builtin::FirstStream(e) => Builtin::FirstStream(Box::new(expand_func_calls(
+            e, func_name, params, body, depth,
+        ))),
+        Builtin::LastStream(e) => Builtin::LastStream(Box::new(expand_func_calls(
+            e, func_name, params, body, depth,
+        ))),
         Builtin::NthStream(n, e) => Builtin::NthStream(
-            Box::new(expand_func_calls(n, func_name, params, body)),
-            Box::new(expand_func_calls(e, func_name, params, body)),
+            Box::new(expand_func_calls(n, func_name, params, body, depth)),
+            Box::new(expand_func_calls(e, func_name, params, body, depth)),
         ),
-        Builtin::IsEmpty(e) => {
-            Builtin::IsEmpty(Box::new(expand_func_calls(e, func_name, params, body)))
-        }
+        Builtin::IsEmpty(e) => Builtin::IsEmpty(Box::new(expand_func_calls(
+            e, func_name, params, body, depth,
+        ))),
         // Phase 14: Recursive traversal (extends Phase 8)
         Builtin::RecurseDown => Builtin::RecurseDown,
         // Phase 15: Date/Time functions
         Builtin::Gmtime => Builtin::Gmtime,
         Builtin::Localtime => Builtin::Localtime,
         Builtin::Mktime => Builtin::Mktime,
-        Builtin::Strftime(e) => {
-            Builtin::Strftime(Box::new(expand_func_calls(e, func_name, params, body)))
-        }
-        Builtin::Strptime(e) => {
-            Builtin::Strptime(Box::new(expand_func_calls(e, func_name, params, body)))
-        }
+        Builtin::Strftime(e) => Builtin::Strftime(Box::new(expand_func_calls(
+            e, func_name, params, body, depth,
+        ))),
+        Builtin::Strptime(e) => Builtin::Strptime(Box::new(expand_func_calls(
+            e, func_name, params, body, depth,
+        ))),
         Builtin::Todate => Builtin::Todate,
         Builtin::Fromdate => Builtin::Fromdate,
         Builtin::Todateiso8601 => Builtin::Todateiso8601,
@@ -27178,9 +27300,9 @@ fn expand_func_calls_in_builtin(
 
         // Phase 17: Combinations
         Builtin::Combinations => Builtin::Combinations,
-        Builtin::CombinationsN(e) => {
-            Builtin::CombinationsN(Box::new(expand_func_calls(e, func_name, params, body)))
-        }
+        Builtin::CombinationsN(e) => Builtin::CombinationsN(Box::new(expand_func_calls(
+            e, func_name, params, body, depth,
+        ))),
 
         // Phase 18: Additional math functions
         Builtin::Trunc => Builtin::Trunc,
@@ -27190,25 +27312,29 @@ fn expand_func_calls_in_builtin(
 
         // Phase 20: Iteration control extension
         Builtin::Skip(n, e) => Builtin::Skip(
-            Box::new(expand_func_calls(n, func_name, params, body)),
-            Box::new(expand_func_calls(e, func_name, params, body)),
+            Box::new(expand_func_calls(n, func_name, params, body, depth)),
+            Box::new(expand_func_calls(e, func_name, params, body, depth)),
         ),
 
         // Phase 21: Extended Date/Time functions (yq)
         Builtin::FromUnix => Builtin::FromUnix,
         Builtin::ToUnix => Builtin::ToUnix,
-        Builtin::Tz(e) => Builtin::Tz(Box::new(expand_func_calls(e, func_name, params, body))),
+        Builtin::Tz(e) => Builtin::Tz(Box::new(expand_func_calls(
+            e, func_name, params, body, depth,
+        ))),
 
         // Phase 22: File operations (yq)
-        Builtin::Load(e) => Builtin::Load(Box::new(expand_func_calls(e, func_name, params, body))),
+        Builtin::Load(e) => Builtin::Load(Box::new(expand_func_calls(
+            e, func_name, params, body, depth,
+        ))),
 
         // Phase 23: Position-based navigation (succinctly extension)
-        Builtin::AtOffset(e) => {
-            Builtin::AtOffset(Box::new(expand_func_calls(e, func_name, params, body)))
-        }
+        Builtin::AtOffset(e) => Builtin::AtOffset(Box::new(expand_func_calls(
+            e, func_name, params, body, depth,
+        ))),
         Builtin::AtPosition(line, col) => Builtin::AtPosition(
-            Box::new(expand_func_calls(line, func_name, params, body)),
-            Box::new(expand_func_calls(col, func_name, params, body)),
+            Box::new(expand_func_calls(line, func_name, params, body, depth)),
+            Box::new(expand_func_calls(col, func_name, params, body, depth)),
         ),
     }
 }
