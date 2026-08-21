@@ -3543,17 +3543,36 @@ fn slice_one_generic<S: EvalSemantics, V: DocumentValue>(
 }
 
 /// Evaluate a builtin function.
-/// Recursively collect every path in `value`'s tree, cursor-native (#868).
+/// Recursively collect paths in `value`'s tree, cursor-native (#868) — the
+/// shared walk behind both `paths` (`leaves_only: false`, a path for every
+/// node) and `leaf_paths` (`leaves_only: true`, a path only for a childless
+/// node -- `null` and empty `{}`/`[]` count as leaves too, unlike the
+/// `paths(scalars)` community recipe; see #771).
 ///
-/// Mirrors `eval.rs`'s `collect_paths`, but walks `V` directly via
-/// `as_object`/`as_array` and `effective_fields`/`collect_values` instead of
-/// an already-materialized `OwnedValue` -- the same reasoning `ToEntries`'s
-/// own native arm above gives: `builtin_paths`'s `to_owned(&value)` collapses
-/// duplicate YAML mapping keys into one `IndexMap` entry *before* the walk
-/// ever starts, so a repeated key only ever contributes one path there. Using
-/// `effective_fields` here applies each format's own duplicate-key rule
-/// during the walk itself (YAML: every occurrence; JSON: first position,
-/// last value, matching real jq) instead of an unconditional collapse.
+/// Mirrors `eval.rs`'s `collect_paths`/`collect_leaf_paths`, but walks `V`
+/// directly via `as_object`/`as_array` and `effective_fields`/`uncons`
+/// instead of an already-materialized `OwnedValue` -- the same reasoning
+/// `ToEntries`'s own native arm above gives: `builtin_paths`'s
+/// `to_owned(&value)` collapses duplicate YAML mapping keys into one
+/// `IndexMap` entry *before* the walk ever starts, so a repeated key only
+/// ever contributes one path there. Using `effective_fields` here applies
+/// each format's own duplicate-key rule during the walk itself (YAML: every
+/// occurrence; JSON: first position, last value, matching real jq) instead
+/// of an unconditional collapse. One shared walker rather than two near-copies
+/// (code review, #868): the two modes differ only in *when* a path is
+/// recorded, not in how the tree is traversed.
+///
+/// `current_path.push`/`.pop()` around each recursive call (rather than a
+/// clone-and-extend style) is safe here because every `push` is followed,
+/// after the recursive call returns, by exactly one matching `pop` on every
+/// exit path -- the sole early exit before a `push` (`key_str()` returning
+/// `None`) is a `continue` that skips straight to the next field without
+/// ever pushing.
+///
+/// The array branch walks `uncons()` directly rather than materializing
+/// `collect_values()`'s `Vec` first (code review, #868) -- arrays have no
+/// duplicate-key concept to reconcile, so there's nothing `effective_fields`
+/// buys here that a plain cons-list walk doesn't already give for free.
 ///
 /// Panics past [`MAX_NESTING_DEPTH`] levels of nesting, the same guard
 /// `to_owned`/`to_owned_cursor` already carry -- `current_path.len()` tracks
@@ -3563,43 +3582,15 @@ fn collect_paths_generic<V: DocumentValue>(
     value: &V,
     current_path: &mut Vec<OwnedValue>,
     paths: &mut Vec<OwnedValue>,
-) {
-    assert_nesting_depth(current_path.len());
-    if let Some(fields) = value.as_object() {
-        for field in fields.effective_fields() {
-            let Some(key) = field.key_str() else {
-                continue;
-            };
-            current_path.push(OwnedValue::String(key.into_owned()));
-            paths.push(OwnedValue::Array(current_path.clone()));
-            collect_paths_generic(&field.value, current_path, paths);
-            current_path.pop();
-        }
-    } else if let Some(elements) = value.as_array() {
-        for (i, elem) in elements.collect_values().into_iter().enumerate() {
-            current_path.push(OwnedValue::Int(i as i64));
-            paths.push(OwnedValue::Array(current_path.clone()));
-            collect_paths_generic(&elem, current_path, paths);
-            current_path.pop();
-        }
-    }
-}
-
-/// Cursor-native `leaf_paths` (#868), mirroring `eval.rs`'s `collect_leaf_paths`
-/// -- same tree-structural "leaf" definition (`null` and empty `{}`/`[]`
-/// count as leaves, unlike the `paths(scalars)` community recipe; see #771)
-/// and the same `effective_fields`-based duplicate-key handling
-/// [`collect_paths_generic`] uses, for the same reason.
-fn collect_leaf_paths_generic<V: DocumentValue>(
-    value: &V,
-    current_path: &mut Vec<OwnedValue>,
-    paths: &mut Vec<OwnedValue>,
+    leaves_only: bool,
 ) {
     assert_nesting_depth(current_path.len());
     if let Some(fields) = value.as_object() {
         let fields = fields.effective_fields();
         if fields.is_empty() {
-            paths.push(OwnedValue::Array(current_path.clone()));
+            if leaves_only {
+                paths.push(OwnedValue::Array(current_path.clone()));
+            }
             return;
         }
         for field in fields {
@@ -3607,20 +3598,32 @@ fn collect_leaf_paths_generic<V: DocumentValue>(
                 continue;
             };
             current_path.push(OwnedValue::String(key.into_owned()));
-            collect_leaf_paths_generic(&field.value, current_path, paths);
+            if !leaves_only {
+                paths.push(OwnedValue::Array(current_path.clone()));
+            }
+            collect_paths_generic(&field.value, current_path, paths, leaves_only);
             current_path.pop();
         }
     } else if let Some(elements) = value.as_array() {
         if elements.is_empty() {
-            paths.push(OwnedValue::Array(current_path.clone()));
+            if leaves_only {
+                paths.push(OwnedValue::Array(current_path.clone()));
+            }
             return;
         }
-        for (i, elem) in elements.collect_values().into_iter().enumerate() {
-            current_path.push(OwnedValue::Int(i as i64));
-            collect_leaf_paths_generic(&elem, current_path, paths);
+        let mut i = 0i64;
+        let mut rest = elements;
+        while let Some((elem, tail)) = rest.uncons() {
+            current_path.push(OwnedValue::Int(i));
+            if !leaves_only {
+                paths.push(OwnedValue::Array(current_path.clone()));
+            }
+            collect_paths_generic(&elem, current_path, paths, leaves_only);
             current_path.pop();
+            i += 1;
+            rest = tail;
         }
-    } else {
+    } else if leaves_only {
         paths.push(OwnedValue::Array(current_path.clone()));
     }
 }
@@ -4021,15 +4024,15 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
         }
 
         // Handled natively for the same reason as `ToEntries` above (#868):
-        // the fallback's `to_owned(&value)` merges duplicate YAML mapping
-        // keys before `collect_paths`/`collect_leaf_paths` ever walk the
-        // tree, so a repeated key only ever contributes one path there.
-        // `collect_paths_generic`/`collect_leaf_paths_generic` walk `value`
-        // directly, applying each format's own `effective_fields` rule at
-        // every nesting level, not just the root.
+        // the fallback's `to_owned_with_cursor` merges duplicate YAML
+        // mapping keys before `collect_paths`/`collect_leaf_paths` ever walk
+        // the tree, so a repeated key only ever contributes one path there.
+        // `collect_paths_generic` walks `value` directly, applying each
+        // format's own `effective_fields` rule at every nesting level, not
+        // just the root.
         Builtin::Paths => {
             let mut paths = Vec::new();
-            collect_paths_generic(&value, &mut Vec::new(), &mut paths);
+            collect_paths_generic(&value, &mut Vec::new(), &mut paths, false);
             collapse_vec(
                 paths,
                 || GenericResult::None,
@@ -4040,7 +4043,7 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
 
         Builtin::LeafPaths => {
             let mut paths = Vec::new();
-            collect_leaf_paths_generic(&value, &mut Vec::new(), &mut paths);
+            collect_paths_generic(&value, &mut Vec::new(), &mut paths, true);
             collapse_vec(
                 paths,
                 || GenericResult::None,
