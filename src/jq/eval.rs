@@ -18770,26 +18770,59 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
             }
         }
         Expr::Optional(inner) => {
-            // Optional - evaluate with optional=true
+            // This node *is* the `?` -- mirrors eval_try's Expr::Optional
+            // dispatch (`eval_try(inner, None, ...)`, eval.rs ~line 692),
+            // which evaluates the body and unconditionally converts an
+            // escaping Error or Break to nothing, keeping any prefix
+            // already produced before it (real jq's `(1, 2, error("x"))?`
+            // outputs `1`, `2`) -- Halt always escapes regardless (#791).
+            //
+            // `inner` is evaluated with `optional` forced to `false`, not
+            // broadcast from the ambient value, so a genuine error/break
+            // deep inside doesn't self-swallow at some leaf's own local
+            // `if optional` check before ever reaching this catch --
+            // mirrors the Array arm's identical fix (#1302) for the same
+            // reason. This catch point is the one place `?`'s suppression
+            // happens; it isn't gated on the ambient `optional` (unlike
+            // the Array arm's `if optional`) because that arm fires even
+            // with no enclosing `?` at all, whereas this arm only exists
+            // because the source literally has a `?` right here.
+            //
+            // Previously this arm broadcast `optional=true` into `inner`,
+            // and -- when `rest` was non-empty -- combined `[inner,
+            // ...rest]` into a single list evaluated under that same
+            // forced-true value, so `rest` (everything piped *after* the
+            // `?`) inherited the suppression too: `.a | (key)? |
+            // error("boom")` produced no output and no error at all,
+            // instead of real jq's error (#1335). `continue_rest_with_context`
+            // below instead threads the *ambient* `optional` into `rest`,
+            // matching every other arm here that continues into `rest`
+            // after producing an intermediate value.
+            let inner_result = eval_pipe_with_path_context_internal::<W, S>(
+                core::slice::from_ref(inner),
+                value,
+                root,
+                file_origin,
+                current_path,
+                false,
+            );
+            let caught = match inner_result {
+                QueryResult::Error(_) | QueryResult::Break(_) => QueryResult::None,
+                QueryResult::Partial(prefix, Control::Error(_) | Control::Break(_)) => {
+                    owned_vec_to_result(prefix)
+                }
+                other => other,
+            };
             if rest.is_empty() {
-                eval_pipe_with_path_context_internal::<W, S>(
-                    &[(**inner).clone()],
-                    value,
-                    root,
-                    file_origin,
-                    current_path,
-                    true,
-                )
+                caught
             } else {
-                let mut combined = vec![(**inner).clone()];
-                combined.extend(rest.iter().cloned());
-                eval_pipe_with_path_context_internal::<W, S>(
-                    &combined,
-                    value,
+                continue_rest_with_context::<W, S>(
+                    caught,
+                    rest,
                     root,
                     file_origin,
                     current_path,
-                    true,
+                    optional,
                 )
             }
         }

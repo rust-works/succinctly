@@ -5547,6 +5547,78 @@ fn test_func_def_key_comma_sibling_independence_is_not_a_bug_1306() -> Result<()
     Ok(())
 }
 
+/// `Expr::Optional`'s own dispatch in `eval_pipe_with_path_context_internal`
+/// broadcast `optional=true` into whatever it wrapped, with no catch of its
+/// own -- unlike the plain evaluator's `Expr::Optional` (`eval_try`) and the
+/// Array arm's own fix above (#1302). Two distinct symptoms, both from the
+/// same code:
+///
+/// 1. When the `?` had nothing after it in the pipe, a leaf-level `if
+///    optional` self-check deep inside the wrapped expression could produce
+///    a plausible-but-wrong value instead of this node genuinely catching an
+///    escaping error atomically.
+/// 2. When the `?` had a `rest` of the pipe after it, `rest` was combined
+///    into the *same* list evaluated under the forced `optional=true` --
+///    meaning an error *after* the `?`, which the `?` has nothing to do
+///    with, was also silently swallowed. `.a | (key)? | error("boom")`
+///    produced no output and no error at all, instead of real jq's error
+///    (confirmed against real jq's structurally identical
+///    `.a | (1)? | error("boom")`).
+///
+/// #1335's own posted repro (`(key == "a" and error("boom"))?`) turned out
+/// not to exercise this arm at all -- `needs_path_context` doesn't recurse
+/// into `Expr::And`/`Expr::Or` (filed separately as #1405), so that whole
+/// expression routes through the plain evaluator instead, where `key`
+/// silently stubs. These tests instead use constructs `needs_path_context`
+/// already recurses into (`Comma`, `Compare`, `Label`/`break`) to actually
+/// exercise the fixed code path.
+#[test]
+fn test_optional_dispatch_catches_atomically_not_broadcast_1335() -> Result<()> {
+    // The rest-leak: an error *after* the `?` must not be swallowed by it.
+    let (_stdout, stderr, code) =
+        run_jq_full(&["-c", ".a | (key)? | error(\"boom\")"], Some(r#"{"a":1}"#))?;
+    assert_eq!(code, 5);
+    assert!(stderr.contains("boom"), "stderr: {stderr}");
+
+    // Sibling positive case: `rest` still runs normally when nothing errors.
+    let (stdout, _, code) = run_jq_full(&["-c", ".a | (key)? | . + \"!\""], Some(r#"{"a":1}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "\"a!\"");
+
+    // A comma branch that succeeds (`key`) before a later branch errors:
+    // real jq's `?` keeps the already-produced prefix rather than discarding
+    // it (unlike the Array arm's atomicity above -- comma isn't atomic).
+    let (stdout, _, code) =
+        run_jq_full(&["-c", ".a | (key, error(\"boom\"))?"], Some(r#"{"a":1}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "\"a\"");
+
+    // Without `?`, the same query still hard-errors.
+    let (_stdout, stderr, code) =
+        run_jq_full(&["-c", ".a | key, error(\"boom\")"], Some(r#"{"a":1}"#))?;
+    assert_eq!(code, 5);
+    assert!(stderr.contains("boom"), "stderr: {stderr}");
+
+    // `?` also catches a `break` for an enclosing label -- matches real
+    // jq's `label $out | (1, break $out)?` (both implemented as bare `try`,
+    // which catches break the same way it catches a raised error).
+    let (stdout, _, code) = run_jq_full(
+        &["-c", "label $out | (.a | (key, break $out))?"],
+        Some(r#"{"a":1}"#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "\"a\"");
+
+    // Doubly-nested `?` still resolves correctly (ambient optional=true
+    // from the outer `?` reaching the inner one is harmless, not a forced
+    // broadcast introduced by this node itself).
+    let (stdout, _, code) = run_jq_full(&["-c", ".a | ((key)?)?"], Some(r#"{"a":1}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "\"a\"");
+
+    Ok(())
+}
+
 /// `keys_unsorted` stays lazy through `length`/`.[]`/`.[n]`/`first`/`last`
 /// (#140), backed by a new `JqValue::LazyKeysArray` output writer in
 /// `print_json`. Uses `run_jq_full` (the pre-built binary) to exercise that
