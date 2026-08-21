@@ -103,5 +103,6 @@ pub use parser::{
 };
 pub use stream::{StreamError, StreamStats, StreamableValue};
 pub use value::{
-    assert_value_tree_depth, format_number_jq_compat, NumberRepr, OwnedValue, MAX_VALUE_TREE_DEPTH,
+    assert_depth, assert_value_tree_depth, format_number_jq_compat, NumberRepr, OwnedValue,
+    MAX_VALUE_TREE_DEPTH,
 };
