@@ -21847,7 +21847,8 @@ fn test_undecodable_mapping_key_does_not_hide_later_fields_1247() -> Result<()> 
 }
 
 /// #1247: a decode failure inside a YAML string must not leave a partially
-/// transcoded token behind in the JSON output.
+/// transcoded token behind in the JSON output, and must not pass silently
+/// once anything materializes the value.
 ///
 /// The transcoders push the opening `"` -- and any prefix they already
 /// converted -- before they can discover a bad escape, and each caller's
@@ -21861,21 +21862,26 @@ fn test_undecodable_mapping_key_does_not_hide_later_fields_1247() -> Result<()> 
 ///
 /// `\q` is not a YAML escape, so the scalar is structurally valid but
 /// undecodable. Real yq rejects the whole document (`found unknown escape
-/// character`, exit 1); making succinctly do the same is a later stage of
-/// #1247's design. This pins only that whatever is emitted is *parseable* --
-/// the value still degrades to `null` and the key to `""`.
+/// character`, exit 1).
+///
+/// Two routes, deliberately different at this stage of #1247's design (see
+/// `docs/plan/decode-failure-routing.md`):
+///
+/// * the **materializing** routes raise a real error and exit non-zero;
+/// * the **streaming** routes still degrade to `null`/`""` -- but the
+///   document they emit is now parseable, which is what this test's first
+///   half pins. Making streaming loud too needs an error channel through
+///   `stream_json_value`'s `core::fmt::Result`, which is its own stage.
 #[test]
 fn test_decode_failure_does_not_corrupt_json_output_1247() -> Result<()> {
     for (input, expected) in [
         ("b: \"x\\qy\"\n", r#"{"b":null}"#),
         ("\"a\\qb\": 1\n", r#"{"":1}"#),
     ] {
-        // One route per distinct transcode call site: the streaming sink, the
-        // DOM sink a flag forces (`--arg`, `-P`), and the multi-result path
-        // that loses its cursor to `GenericResult::Many`.
+        // Streaming: still degrades, but the emitted JSON is valid. `-P`
+        // takes this route too -- it forces pretty-printing, not the DOM.
         for extra in [
             &["-o", "json", "-I", "0"][..],
-            &["-o", "json", "-I", "0", "--arg", "z", "y"][..],
             &["-o", "json", "-I", "0", "-P"][..],
         ] {
             let (output, exit_code) = run_yq_stdin(".", input, extra)?;
@@ -21883,9 +21889,20 @@ fn test_decode_failure_does_not_corrupt_json_output_1247() -> Result<()> {
             assert_eq!(output.trim(), expected, "args {extra:?}");
         }
 
-        let (output, exit_code) = run_yq_stdin(".,.", input, &["-o", "json", "-I", "0"])?;
-        assert_eq!(exit_code, 0, "output: {output:?}");
-        assert_eq!(output.lines().collect::<Vec<_>>(), [expected, expected]);
+        // Materializing: `--arg` forces the DOM path, and a multi-result
+        // filter loses its cursor to `GenericResult::Many`. Both raise.
+        for extra in [
+            &["-o", "json", "-I", "0", "--arg", "z", "y"][..],
+            &["-o", "json", "-I", "0"][..],
+        ] {
+            let filter = if extra.len() > 4 { "." } else { ".,." };
+            let (output, stderr, exit_code) = run_yq_split(filter, input, extra)?;
+            assert_eq!(exit_code, 1, "args {extra:?}, output: {output:?}");
+            assert!(
+                stderr.contains("invalid escape sequence"),
+                "args {extra:?}, stderr: {stderr}"
+            );
+        }
     }
     Ok(())
 }

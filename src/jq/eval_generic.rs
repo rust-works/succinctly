@@ -109,63 +109,77 @@ pub fn assert_nesting_depth(depth: usize) {
 /// because YAML scalars may have type coercion (e.g., unquoted "true" is a bool).
 ///
 /// Panics past [`MAX_NESTING_DEPTH`] levels of nesting (#998) rather than
-/// recursing unbounded and overflowing the call stack.
-pub fn to_owned<V: DocumentValue>(value: &V) -> OwnedValue {
+/// recursing unbounded and overflowing the call stack. That guard stays a
+/// `panic!` even though this function is now fallible: unbounded recursion is
+/// a different failure class from a data error, and routing it through
+/// `EvalError` would make a stack-overflow guard catchable by `try`/`catch`.
+///
+/// Returns `Err` when a scalar the semi-index accepted as a string token
+/// cannot be *decoded* (#1098, #1247) -- see
+/// [`DocumentValue::string_decode_error`].
+pub fn to_owned<V: DocumentValue>(value: &V) -> Result<OwnedValue, EvalError> {
     to_owned_at_depth(value, 0)
 }
 
-fn to_owned_at_depth<V: DocumentValue>(value: &V, depth: usize) -> OwnedValue {
+fn to_owned_at_depth<V: DocumentValue>(value: &V, depth: usize) -> Result<OwnedValue, EvalError> {
     assert_nesting_depth(depth);
     // Check containers first (arrays and objects have no type ambiguity)
     if let Some(fields) = value.as_object() {
         let mut map = IndexMap::new();
         let mut f = fields;
         while let Some((field, rest)) = f.uncons() {
+            // Before `key_str`, not after: YAML's `key_string` stringifies an
+            // undecodable key to `""` (#222's never-drop-a-key rule), so by
+            // the time `key_str` answers `Some`, the failure is already
+            // invisible. Wording matches the sibling `owned_from_standard_json`
+            // conversion #1192 fixed first.
+            if let Some(reason) = field.key.string_decode_error() {
+                return Err(EvalError::new(format!("{reason} in object key")));
+            }
             if let Some(key) = field.key_str() {
-                map.insert(key.into_owned(), to_owned_at_depth(&field.value, depth + 1));
+                map.insert(
+                    key.into_owned(),
+                    to_owned_at_depth(&field.value, depth + 1)?,
+                );
             }
             f = rest;
         }
-        OwnedValue::Object(map)
+        Ok(OwnedValue::Object(map))
     } else if let Some(elements) = value.as_array() {
         let mut items = Vec::new();
         let mut elems = elements;
         while let Some((elem, rest)) = elems.uncons() {
-            items.push(to_owned_at_depth(&elem, depth + 1));
+            items.push(to_owned_at_depth(&elem, depth + 1)?);
             elems = rest;
         }
-        OwnedValue::Array(items)
+        Ok(OwnedValue::Array(items))
     // Then check scalars in order of specificity
     } else if value.is_null() {
-        OwnedValue::Null
+        Ok(OwnedValue::Null)
     } else if let Some(b) = value.as_bool() {
-        OwnedValue::Bool(b)
+        Ok(OwnedValue::Bool(b))
     } else if let Some(literal) = value.number_literal() {
-        OwnedValue::from_number_literal(&literal)
+        Ok(OwnedValue::from_number_literal(&literal))
     } else if let Some(i) = value.as_i64() {
-        OwnedValue::Int(i)
+        Ok(OwnedValue::Int(i))
     } else if let Some(f) = value.as_f64() {
-        OwnedValue::Float(f)
+        Ok(OwnedValue::Float(f))
     } else if let Some(s) = value.as_str() {
-        OwnedValue::String(s.into_owned())
+        Ok(OwnedValue::String(s.into_owned()))
+    } else if let Some(reason) = value.string_decode_error() {
+        // The case this function used to swallow. `as_str` above answered
+        // `None`, but the value *is* a string token -- its bytes just don't
+        // decode. Raising here is #1247's core fix; the deferral comment that
+        // used to sit in the `else` below (naming #1098 and PR #1190's
+        // reverted `panic!`) described exactly this and is now resolved.
+        Err(EvalError::new(reason.to_string()))
     } else {
-        // Covers error values, any unknown types, and -- deliberately, see
-        // #1098 -- a string scalar that passed structural validation (the
-        // semi-index accepted its span as a `String` token) but failed to
-        // decode (invalid `\u` escape, invalid UTF-8, ...). A `PR #1190`
-        // attempt to make that last case panic instead was reverted: code
-        // review found it's reachable through completely ordinary CLI
-        // usage (any non-identity query over a document containing such a
-        // string), not just a theoretical library-only edge case, which
-        // turns a low-severity silent-`null` bug into a live crash --
-        // including mid-batch, defeating this crate's own documented
-        // "evaluation continues past one error" convention (`ErrorSink`,
-        // #355). A correct fix needs to route through `EvalError`/
-        // `ErrorSink` instead, applied consistently across every sibling
-        // copy of this conversion and to object/mapping keys too (see
-        // #1098's own follow-up discussion) -- deferred as a properly
-        // scoped design item rather than shipped as a panic.
-        OwnedValue::Null
+        // Error values and any genuinely unknown type. The decode-failure
+        // case that used to share this arm now raises above (#1247); what
+        // remains is a *structurally* malformed value, which is #1194's
+        // territory and still degrades silently -- see
+        // `docs/plan/decode-failure-routing.md`.
+        Ok(OwnedValue::Null)
     }
 }
 
@@ -184,36 +198,46 @@ fn to_owned_at_depth<V: DocumentValue>(value: &V, depth: usize) -> OwnedValue {
 ///
 /// Panics past [`MAX_NESTING_DEPTH`] levels of nesting (#998), same as
 /// [`to_owned`].
-pub fn to_owned_cursor<C: DocumentCursor>(cursor: &C) -> OwnedValue {
+pub fn to_owned_cursor<C: DocumentCursor>(cursor: &C) -> Result<OwnedValue, EvalError> {
     to_owned_cursor_at_depth(cursor, 0)
 }
 
-fn to_owned_cursor_at_depth<C: DocumentCursor>(cursor: &C, depth: usize) -> OwnedValue {
+fn to_owned_cursor_at_depth<C: DocumentCursor>(
+    cursor: &C,
+    depth: usize,
+) -> Result<OwnedValue, EvalError> {
     assert_nesting_depth(depth);
     let value = cursor.value();
     if let Some(fields) = value.as_object() {
         let mut map = IndexMap::new();
         let mut f = fields;
         while let Some((field, rest)) = f.uncons() {
+            // Same key ordering as `to_owned_at_depth` above, same reason.
+            if let Some(reason) = field.key.string_decode_error() {
+                return Err(EvalError::new(format!("{reason} in object key")));
+            }
             if let Some(key) = field.key_str() {
                 map.insert(
                     key.into_owned(),
-                    to_owned_cursor_at_depth(&field.value_cursor, depth + 1),
+                    to_owned_cursor_at_depth(&field.value_cursor, depth + 1)?,
                 );
             }
             f = rest;
         }
-        OwnedValue::Object(map)
+        Ok(OwnedValue::Object(map))
     } else if let Some(elements) = value.as_array() {
         let mut items = Vec::new();
         let mut elems = elements;
         while let Some((elem_cursor, rest)) = elems.uncons_cursor() {
-            items.push(to_owned_cursor_at_depth(&elem_cursor, depth + 1));
+            items.push(to_owned_cursor_at_depth(&elem_cursor, depth + 1)?);
             elems = rest;
         }
-        OwnedValue::Array(items)
+        Ok(OwnedValue::Array(items))
     } else {
-        cursor
+        // An applicable explicit tag resolves from the raw text and so can
+        // succeed where a plain decode would not; only the untagged fallback
+        // can raise.
+        match cursor
             .explicit_tag()
             .and_then(|tag| tagged_scalar_to_owned(tag, &value))
             .or_else(|| {
@@ -230,8 +254,10 @@ fn to_owned_cursor_at_depth<C: DocumentCursor>(cursor: &C, depth: usize) -> Owne
                 } else {
                     None
                 }
-            })
-            .unwrap_or_else(|| to_owned_at_depth(&value, depth))
+            }) {
+            Some(owned) => Ok(owned),
+            None => to_owned_at_depth(&value, depth),
+        }
     }
 }
 
@@ -254,10 +280,48 @@ fn tagged_scalar_to_owned<V: DocumentValue>(tag: &str, value: &V) -> Option<Owne
 /// applies to). Since `cursor.value()` and a separately-threaded `value`
 /// always describe the same node on every call site in this module, `value`
 /// itself is only needed for the `None` fallback.
-fn to_owned_with_cursor<V: DocumentValue>(value: &V, cursor: Option<V::Cursor>) -> OwnedValue {
+fn to_owned_with_cursor<V: DocumentValue>(
+    value: &V,
+    cursor: Option<V::Cursor>,
+) -> Result<OwnedValue, EvalError> {
     match cursor {
         Some(c) => to_owned_cursor(&c),
         None => to_owned(value),
+    }
+}
+
+/// [`to_owned_with_cursor`] for the one job that must not fail: rendering a
+/// value into the text of an error that is *already* being raised.
+///
+/// `EvalError::cannot_iterate(&v)` and friends materialize `v` only to quote
+/// it back to the user. Propagating a decode failure out of those call sites
+/// would mean abandoning a real, correctly-diagnosed error in order to report
+/// "the error message could not be built", which is strictly less useful --
+/// so a decode failure degrades to `null` here, on purpose, and the outer
+/// error still surfaces with its own accurate wording. This is the *only*
+/// sanctioned lossy materialization left in this module (#1247); every other
+/// caller takes the fallible one above.
+fn to_owned_for_diagnostic<V: DocumentValue>(value: &V, cursor: Option<V::Cursor>) -> OwnedValue {
+    to_owned_with_cursor(value, cursor).unwrap_or(OwnedValue::Null)
+}
+
+/// The error a builtin should raise when its type dispatch fell through.
+///
+/// Those dispatches are chains of `as_str()`/`as_array()`/`as_i64()`/...
+/// tests, so a string scalar whose bytes don't decode fails *every* one and
+/// lands in the same `else` as a genuine type mismatch. Reporting the type
+/// error there is actively misleading -- `{"a":"\ud800"} | .a | length` said
+/// `null (null) has no length` about a value that is a perfectly good string
+/// token, naming a symptom two steps removed from the cause. Check for the
+/// decode failure first and report that instead (#1247); everything else
+/// keeps the caller's own wording, which the jq oracle tests pin.
+fn type_error_or_decode_failure<V: DocumentValue>(
+    value: &V,
+    type_error: impl FnOnce() -> EvalError,
+) -> EvalError {
+    match value.string_decode_error() {
+        Some(reason) => EvalError::new(reason.to_string()),
+        None => type_error(),
     }
 }
 
@@ -539,7 +603,7 @@ static EMPTY_COMMENT_TREE: CommentTree = CommentTree::Leaf(NodeMeta::empty());
 pub fn to_owned_with_comments<V: DocumentValue>(
     value: &V,
     cursor: Option<&V::Cursor>,
-) -> (OwnedValue, CommentTree) {
+) -> Result<(OwnedValue, CommentTree), EvalError> {
     to_owned_with_comments_at_depth(value, cursor, 0)
 }
 
@@ -547,7 +611,7 @@ fn to_owned_with_comments_at_depth<V: DocumentValue>(
     value: &V,
     cursor: Option<&V::Cursor>,
     depth: usize,
-) -> (OwnedValue, CommentTree) {
+) -> Result<(OwnedValue, CommentTree), EvalError> {
     assert_nesting_depth(depth);
     // The raw (`#`-prefixed) form, not the stripped `line_comment` builtin
     // getter: the write path re-emits this verbatim after one space.
@@ -575,13 +639,17 @@ fn to_owned_with_comments_at_depth<V: DocumentValue>(
         let mut key_comment_map = IndexMap::new();
         let mut f = fields;
         while let Some((field, rest)) = f.uncons() {
+            // Same key ordering as `to_owned_at_depth`, same reason (#1247).
+            if let Some(reason) = field.key.string_decode_error() {
+                return Err(EvalError::new(format!("{reason} in object key")));
+            }
             if let Some(key) = field.key_str() {
                 let key = key.into_owned();
                 let (v, c) = to_owned_with_comments_at_depth(
                     &field.value,
                     Some(&field.value_cursor),
                     depth + 1,
-                );
+                )?;
                 map.insert(key.clone(), v);
                 comment_map.insert(key.clone(), c);
                 // A comment trailing the key's own line, when the value is
@@ -604,10 +672,10 @@ fn to_owned_with_comments_at_depth<V: DocumentValue>(
             }
             f = rest;
         }
-        (
+        Ok((
             OwnedValue::Object(map),
             CommentTree::Object(own_meta, comment_map, key_comment_map),
-        )
+        ))
     } else if let Some(elements) = value.as_array() {
         let mut items = Vec::new();
         let mut comment_items = Vec::new();
@@ -617,17 +685,20 @@ fn to_owned_with_comments_at_depth<V: DocumentValue>(
         while let Some((elem_cursor, rest)) = elems.uncons_cursor() {
             let elem_value = elem_cursor.value();
             let (v, c) =
-                to_owned_with_comments_at_depth(&elem_value, Some(&elem_cursor), depth + 1);
+                to_owned_with_comments_at_depth(&elem_value, Some(&elem_cursor), depth + 1)?;
             items.push(v);
             comment_items.push(c);
             elems = rest;
         }
-        (
+        Ok((
             OwnedValue::Array(items),
             CommentTree::Array(own_meta, comment_items),
-        )
+        ))
     } else {
-        (to_owned_at_depth(value, depth), CommentTree::Leaf(own_meta))
+        Ok((
+            to_owned_at_depth(value, depth)?,
+            CommentTree::Leaf(own_meta),
+        ))
     }
 }
 
@@ -638,11 +709,11 @@ fn to_owned_with_comments_at_depth<V: DocumentValue>(
 /// inspect a candidate's *contents*, only its shape, so a full recursive
 /// `to_owned` of a large navigated container is pure waste when it can only
 /// ever be rejected on type (#669).
-fn to_owned_key_shape<V: DocumentValue>(value: &V) -> OwnedValue {
+fn to_owned_key_shape<V: DocumentValue>(value: &V) -> Result<OwnedValue, EvalError> {
     if value.is_array() {
-        OwnedValue::Array(Vec::new())
+        Ok(OwnedValue::Array(Vec::new()))
     } else if value.is_object() {
-        OwnedValue::Object(IndexMap::new())
+        Ok(OwnedValue::Object(IndexMap::new()))
     } else {
         to_owned(value)
     }
@@ -653,12 +724,12 @@ fn to_owned_key_shape<V: DocumentValue>(value: &V) -> OwnedValue {
 /// still needs its scalar resolved through `to_owned_cursor` rather than the
 /// bare `to_owned`, or an explicit tag on the key/bound expression itself
 /// (`.a[.k]` where `.k` is `!!str 1`) is silently ignored.
-fn to_owned_key_shape_cursor<C: DocumentCursor>(cursor: &C) -> OwnedValue {
+fn to_owned_key_shape_cursor<C: DocumentCursor>(cursor: &C) -> Result<OwnedValue, EvalError> {
     let value = cursor.value();
     if value.is_array() {
-        OwnedValue::Array(Vec::new())
+        Ok(OwnedValue::Array(Vec::new()))
     } else if value.is_object() {
-        OwnedValue::Object(IndexMap::new())
+        Ok(OwnedValue::Object(IndexMap::new()))
     } else {
         to_owned_cursor(cursor)
     }
@@ -979,12 +1050,12 @@ impl<V: DocumentValue> LazySeq<V> {
     /// `[1,2,"x"]|map(.+1)` prints nothing to stdout, only the stderr
     /// diagnostic).
     pub fn materialize_atomic(self) -> Result<OwnedValue, Control> {
-        Ok(OwnedValue::Array(
-            self.drain_atomic()?
-                .iter()
-                .map(lazy_elem_to_owned)
-                .collect(),
-        ))
+        let items = self.drain_atomic()?;
+        let mut out = Vec::with_capacity(items.len());
+        for item in &items {
+            out.push(lazy_elem_to_owned(item).map_err(Control::Error)?);
+        }
+        Ok(OwnedValue::Array(out))
     }
 }
 
@@ -1021,10 +1092,10 @@ fn sequence_streamable_cursors<V: DocumentValue>(items: &[LazyElem<V>]) -> Optio
 /// The single conversion point shared by `materialize_atomic` and the
 /// `LazySeq` streaming arms' non-cursor fallback (#757), so the two can never
 /// disagree about how a drained item becomes a value.
-fn lazy_elem_to_owned<V: DocumentValue>(elem: &LazyElem<V>) -> OwnedValue {
+fn lazy_elem_to_owned<V: DocumentValue>(elem: &LazyElem<V>) -> Result<OwnedValue, EvalError> {
     match elem {
         LazyElem::Cursor(c) => to_owned_cursor(c),
-        LazyElem::Owned(o) => o.clone(),
+        LazyElem::Owned(o) => Ok(o.clone()),
     }
 }
 
@@ -1055,11 +1126,14 @@ fn into_lazy_items<V: DocumentValue>(
     result: GenericResult<V>,
 ) -> Result<Vec<LazyElem<V>>, Control> {
     match result {
-        GenericResult::One(v) => Ok(vec![LazyElem::Owned(to_owned(&v))]),
+        GenericResult::One(v) => Ok(vec![LazyElem::Owned(to_owned(&v).map_err(Control::Error)?)]),
         // Stays lazy: a `map(.foo)`-style navigational sub-expr keeps
         // composing without forcing materialization.
         GenericResult::OneCursor(c) => Ok(vec![LazyElem::Cursor(c)]),
-        GenericResult::Many(vs) => Ok(vs.iter().map(|v| LazyElem::Owned(to_owned(v))).collect()),
+        GenericResult::Many(vs) => vs
+            .iter()
+            .map(|v| Ok(LazyElem::Owned(to_owned(v).map_err(Control::Error)?)))
+            .collect(),
         GenericResult::ManyCursor(cs) => Ok(cs.into_iter().map(LazyElem::Cursor).collect()),
         GenericResult::LazyKeys {
             fields,
@@ -1499,6 +1573,38 @@ fn finish_fork_generic<V: DocumentValue>(
     }
 }
 
+/// Unwrap a fallible materialization inside a `GenericResult<V>`-returning
+/// function, turning a decode failure (#1247) into the `GenericResult::Error`
+/// arm that function's callers already handle.
+///
+/// A macro rather than `?` because these functions return `GenericResult<V>`
+/// directly -- the evaluator carries its errors in the value domain, not in a
+/// `Result` (see `GenericResult::Error`'s own docs).
+macro_rules! owned_or_err {
+    ($e:expr) => {
+        match $e {
+            Ok(v) => v,
+            Err(e) => return GenericResult::Error(e),
+        }
+    };
+}
+
+/// Unwrap a fallible materialization inside an `Option<Control>`-returning
+/// helper, turning a decode failure (#1247) into the same `Control::Error`
+/// those helpers already forward for `GenericResult::Error`.
+///
+/// A macro rather than a function because it has to `return` from the
+/// *caller*; `?` can't, since these helpers return `Option<Control>` where
+/// `None` means success.
+macro_rules! push_or_control {
+    ($e:expr) => {
+        match $e {
+            Ok(v) => v,
+            Err(e) => return Some(Control::Error(e)),
+        }
+    };
+}
+
 /// Append every output of a `GenericResult` stream to `out`, returning any
 /// terminating `Control` instead of collapsing to the first output the way
 /// the old `Expr::Compare` arm did. Mirrors [`super::eval::push_owned_values`]
@@ -1511,10 +1617,20 @@ fn push_generic_owned_values<V: DocumentValue>(
     out: &mut Vec<OwnedValue>,
 ) -> Option<Control> {
     match result.materialize_lazy() {
-        GenericResult::One(v) => out.push(to_owned(&v)),
-        GenericResult::OneCursor(c) => out.push(to_owned_cursor(&c)),
-        GenericResult::Many(vs) => out.extend(vs.iter().map(to_owned)),
-        GenericResult::ManyCursor(cs) => out.extend(cs.iter().map(to_owned_cursor)),
+        // A decode failure here is an uncaught error like any other the
+        // `GenericResult::Error` arm below already forwards (#1247).
+        GenericResult::One(v) => out.push(push_or_control!(to_owned(&v))),
+        GenericResult::OneCursor(c) => out.push(push_or_control!(to_owned_cursor(&c))),
+        GenericResult::Many(vs) => {
+            for v in &vs {
+                out.push(push_or_control!(to_owned(v)));
+            }
+        }
+        GenericResult::ManyCursor(cs) => {
+            for c in &cs {
+                out.push(push_or_control!(to_owned_cursor(c)));
+            }
+        }
         GenericResult::None => {}
         GenericResult::Owned(v) => out.push(v),
         GenericResult::ManyOwned(vs) => out.extend(vs),
@@ -1543,11 +1659,19 @@ fn push_generic_truthiness<V: DocumentValue>(
     out: &mut Vec<bool>,
 ) -> Option<Control> {
     match result {
-        GenericResult::One(v) => out.push(to_owned(&v).is_truthy()),
-        GenericResult::OneCursor(c) => out.push(to_owned_cursor(&c).is_truthy()),
-        GenericResult::Many(vs) => out.extend(vs.iter().map(|v| to_owned(v).is_truthy())),
+        GenericResult::One(v) => out.push(push_or_control!(to_owned(&v)).is_truthy()),
+        GenericResult::OneCursor(c) => {
+            out.push(push_or_control!(to_owned_cursor(&c)).is_truthy());
+        }
+        GenericResult::Many(vs) => {
+            for v in &vs {
+                out.push(push_or_control!(to_owned(v)).is_truthy());
+            }
+        }
         GenericResult::ManyCursor(cs) => {
-            out.extend(cs.iter().map(|c| to_owned_cursor(c).is_truthy()));
+            for c in &cs {
+                out.push(push_or_control!(to_owned_cursor(c)).is_truthy());
+            }
         }
         // A lazy keys array, materialized or not, sorted or not, is
         // array-shaped and therefore always truthy in jq (only `null`/
@@ -1600,11 +1724,19 @@ fn flatten_generic_results<V: DocumentValue>(
     let mut results = Vec::new();
     for r in items {
         match r.materialize_lazy() {
-            GenericResult::One(v) => results.push(to_owned(&v)),
-            GenericResult::OneCursor(c) => results.push(to_owned_cursor(&c)),
-            GenericResult::Many(rs) => results.extend(rs.iter().map(to_owned)),
+            GenericResult::One(v) => results.push(to_owned(&v).map_err(Control::Error)?),
+            GenericResult::OneCursor(c) => {
+                results.push(to_owned_cursor(&c).map_err(Control::Error)?);
+            }
+            GenericResult::Many(rs) => {
+                for r in &rs {
+                    results.push(to_owned(r).map_err(Control::Error)?);
+                }
+            }
             GenericResult::ManyCursor(cs) => {
-                results.extend(cs.iter().map(to_owned_cursor));
+                for c in &cs {
+                    results.push(to_owned_cursor(c).map_err(Control::Error)?);
+                }
             }
             GenericResult::None => {}
             GenericResult::Owned(o) => results.push(o),
@@ -1807,14 +1939,21 @@ impl<V: DocumentValue> GenericResult<V> {
     }
 
     /// Convert to OwnedValue for output.
-    pub fn into_owned(self) -> Option<OwnedValue> {
-        match self.materialize_lazy() {
-            Self::One(v) => Some(to_owned(&v)),
-            Self::OneCursor(c) => Some(to_owned_cursor(&c)),
-            Self::Many(vs) => Some(OwnedValue::Array(vs.iter().map(to_owned).collect())),
-            Self::ManyCursor(cs) => {
-                Some(OwnedValue::Array(cs.iter().map(to_owned_cursor).collect()))
-            }
+    ///
+    /// `Ok(None)` means "no single value to represent" (`None`, `Break`,
+    /// `Error`, `Halt`, `Partial` -- unchanged); `Err` means a value *was*
+    /// there but a scalar in it could not be decoded (#1247), which is a
+    /// different answer and must not collapse into the same `None`.
+    pub fn into_owned(self) -> Result<Option<OwnedValue>, EvalError> {
+        Ok(match self.materialize_lazy() {
+            Self::One(v) => Some(to_owned(&v)?),
+            Self::OneCursor(c) => Some(to_owned_cursor(&c)?),
+            Self::Many(vs) => Some(OwnedValue::Array(
+                vs.iter().map(to_owned).collect::<Result<_, _>>()?,
+            )),
+            Self::ManyCursor(cs) => Some(OwnedValue::Array(
+                cs.iter().map(to_owned_cursor).collect::<Result<_, _>>()?,
+            )),
             Self::None => None,
             Self::Error(_) => None,
             Self::Owned(o) => Some(o),
@@ -1827,19 +1966,22 @@ impl<V: DocumentValue> GenericResult<V> {
             Self::LazyKeys { .. } | Self::LazyIndexRange(_) | Self::LazySeq(_) => {
                 unreachable!("materialize_lazy() already normalized every lazy variant")
             }
-        }
+        })
     }
 
     /// Collect all results into a Vec of OwnedValues.
     ///
     /// A `Partial` collects its prefix — the whole point of #400/#494 is
     /// that those outputs are no longer discarded.
-    pub fn collect_owned(self) -> Vec<OwnedValue> {
-        match self.materialize_lazy() {
-            Self::One(v) => vec![to_owned(&v)],
-            Self::OneCursor(c) => vec![to_owned_cursor(&c)],
-            Self::Many(vs) => vs.iter().map(to_owned).collect(),
-            Self::ManyCursor(cs) => cs.iter().map(to_owned_cursor).collect(),
+    /// A decode failure is the one thing this does *not* swallow: `Err` says
+    /// a value was present but undecodable (#1247), which the existing
+    /// deliberate `Error(_) => vec![]` swallow above would otherwise hide.
+    pub fn collect_owned(self) -> Result<Vec<OwnedValue>, EvalError> {
+        Ok(match self.materialize_lazy() {
+            Self::One(v) => vec![to_owned(&v)?],
+            Self::OneCursor(c) => vec![to_owned_cursor(&c)?],
+            Self::Many(vs) => vs.iter().map(to_owned).collect::<Result<_, _>>()?,
+            Self::ManyCursor(cs) => cs.iter().map(to_owned_cursor).collect::<Result<_, _>>()?,
             Self::None => vec![],
             Self::Error(_) => vec![],
             Self::Owned(o) => vec![o],
@@ -1850,7 +1992,7 @@ impl<V: DocumentValue> GenericResult<V> {
             Self::LazyKeys { .. } | Self::LazyIndexRange(_) | Self::LazySeq(_) => {
                 unreachable!("materialize_lazy() already normalized every lazy variant")
             }
-        }
+        })
     }
 
     /// Check if this is an error.
@@ -1889,8 +2031,13 @@ impl<V: DocumentValue> GenericResult<V> {
 
         match self {
             Self::One(v) => {
-                // Convert to owned for streaming
-                let owned = to_owned(v);
+                // Convert to owned for streaming. A decode failure takes the
+                // same route as `Self::Error` below -- nothing reaches `out`,
+                // the diagnostic goes back for stderr and the exit code
+                // (#355, #1247) -- rather than streaming a silent `null`.
+                let Some(owned) = owned_or_stream_error(to_owned(v), &mut stats) else {
+                    return Ok(stats);
+                };
                 owned.stream_json(out, indent, sort_keys)?;
                 on_value(out)?;
                 stats.count = 1;
@@ -1906,8 +2053,15 @@ impl<V: DocumentValue> GenericResult<V> {
                 stats.any_truthy = !stats.last_was_falsy;
             }
             Self::Many(vs) => {
-                for v in vs {
-                    let owned = to_owned(v);
+                for (i, v) in vs.iter().enumerate() {
+                    // Keep the outputs already streamed and report the
+                    // failure, the same shape `Partial` uses for a mid-stream
+                    // `Control` (#400/#494, #1247) -- `count` is how many
+                    // actually reached `out`, not how many were asked for.
+                    let Some(owned) = owned_or_stream_error(to_owned(v), &mut stats) else {
+                        stats.count = i;
+                        return Ok(stats);
+                    };
                     owned.stream_json(out, indent, sort_keys)?;
                     on_value(out)?;
                     stats.last_was_falsy = owned.is_falsy();
@@ -1972,24 +2126,37 @@ impl<V: DocumentValue> GenericResult<V> {
             // arm (yq_runner.rs) for what actually routes a query here.
             Self::LazySeq(seq) => match seq.clone().drain_atomic() {
                 Ok(items) => {
-                    match sequence_streamable_cursors(&items) {
+                    let owned = match sequence_streamable_cursors(&items) {
                         Some(cursors) => {
                             V::Cursor::stream_sequence_json(&cursors, out, indent, sort_keys)?;
+                            true
                         }
-                        None => {
-                            OwnedValue::Array(items.iter().map(lazy_elem_to_owned).collect())
-                                .stream_json(out, indent, sort_keys)?;
-                        }
+                        None => match items
+                            .iter()
+                            .map(lazy_elem_to_owned)
+                            .collect::<Result<Vec<_>, _>>()
+                        {
+                            Ok(items) => {
+                                OwnedValue::Array(items).stream_json(out, indent, sort_keys)?;
+                                true
+                            }
+                            Err(e) => {
+                                stats.error = Some(stream_error(&e));
+                                false
+                            }
+                        },
+                    };
+                    if owned {
+                        on_value(out)?;
+                        stats.count = 1;
+                        // A `map` result is always an array, and every array is
+                        // truthy in jq — only `null`/`false` are falsy — so this
+                        // needs no per-value check (same reasoning as the
+                        // `LazyIndexRange` arm above, which is also always an
+                        // array).
+                        stats.last_was_falsy = false;
+                        stats.any_truthy = true;
                     }
-                    on_value(out)?;
-                    stats.count = 1;
-                    // A `map` result is always an array, and every array is
-                    // truthy in jq — only `null`/`false` are falsy — so this
-                    // needs no per-value check (same reasoning as the
-                    // `LazyIndexRange` arm above, which is also always an
-                    // array).
-                    stats.last_was_falsy = false;
-                    stats.any_truthy = true;
                 }
                 Err(control) => {
                     let (error, halt) = control_to_stream_outcome(&control);
@@ -2086,7 +2253,10 @@ impl<V: DocumentValue> GenericResult<V> {
 
         match self {
             Self::One(v) => {
-                let owned = to_owned(v);
+                // See `stream_json`'s own `One` arm (#355, #1247).
+                let Some(owned) = owned_or_stream_error(to_owned(v), &mut stats) else {
+                    return Ok(stats);
+                };
                 owned.stream_yaml(out, indent, sort_keys)?;
                 on_value(out)?;
                 stats.count = 1;
@@ -2106,8 +2276,15 @@ impl<V: DocumentValue> GenericResult<V> {
                 stats.any_truthy = !stats.last_was_falsy;
             }
             Self::Many(vs) => {
-                for v in vs {
-                    let owned = to_owned(v);
+                for (i, v) in vs.iter().enumerate() {
+                    // Keep the outputs already streamed and report the
+                    // failure, the same shape `Partial` uses for a mid-stream
+                    // `Control` (#400/#494, #1247) -- `count` is how many
+                    // actually reached `out`, not how many were asked for.
+                    let Some(owned) = owned_or_stream_error(to_owned(v), &mut stats) else {
+                        stats.count = i;
+                        return Ok(stats);
+                    };
                     owned.stream_yaml(out, indent, sort_keys)?;
                     on_value(out)?;
                     stats.last_was_falsy = owned.is_falsy();
@@ -2159,19 +2336,32 @@ impl<V: DocumentValue> GenericResult<V> {
             // the identical shape with the YAML writers substituted.
             Self::LazySeq(seq) => match seq.clone().drain_atomic() {
                 Ok(items) => {
-                    match sequence_streamable_cursors(&items) {
+                    let owned = match sequence_streamable_cursors(&items) {
                         Some(cursors) => {
                             V::Cursor::stream_sequence_yaml(&cursors, out, indent, sort_keys)?;
+                            true
                         }
-                        None => {
-                            OwnedValue::Array(items.iter().map(lazy_elem_to_owned).collect())
-                                .stream_yaml(out, indent, sort_keys)?;
-                        }
+                        None => match items
+                            .iter()
+                            .map(lazy_elem_to_owned)
+                            .collect::<Result<Vec<_>, _>>()
+                        {
+                            Ok(items) => {
+                                OwnedValue::Array(items).stream_yaml(out, indent, sort_keys)?;
+                                true
+                            }
+                            Err(e) => {
+                                stats.error = Some(stream_error(&e));
+                                false
+                            }
+                        },
+                    };
+                    if owned {
+                        on_value(out)?;
+                        stats.count = 1;
+                        stats.last_was_falsy = false;
+                        stats.any_truthy = true;
                     }
-                    on_value(out)?;
-                    stats.count = 1;
-                    stats.last_was_falsy = false;
-                    stats.any_truthy = true;
                 }
                 Err(control) => {
                     let (error, halt) = control_to_stream_outcome(&control);
@@ -2299,6 +2489,26 @@ fn write_index_range_yaml<W: core::fmt::Write>(
 
 /// Render an [`EvalError`] into the payload a streaming caller needs to
 /// reproduce jq's diagnostic on stderr (#355).
+/// Route a fallible materialization into [`StreamStats::error`], returning
+/// `None` when it failed so the caller can stop streaming.
+///
+/// Streaming never writes a diagnostic to `out` -- `out` is stdout, where it
+/// would be indistinguishable from a result -- so a decode failure (#1247)
+/// has to travel back in `stats` exactly as `GenericResult::Error` already
+/// does (#355).
+fn owned_or_stream_error(
+    result: Result<OwnedValue, EvalError>,
+    stats: &mut crate::jq::stream::StreamStats,
+) -> Option<OwnedValue> {
+    match result {
+        Ok(owned) => Some(owned),
+        Err(e) => {
+            stats.error = Some(stream_error(&e));
+            None
+        }
+    }
+}
+
 fn stream_error(e: &EvalError) -> crate::jq::stream::StreamError {
     crate::jq::stream::StreamError {
         message: e.message.clone(),
@@ -2371,7 +2581,7 @@ pub fn eval<V: DocumentValue>(expr: &Expr, value: V) -> GenericResult<V> {
 /// [`crate::jq::walk::uses_cursor_metadata_builtins`].
 pub fn eval_using<S: EvalSemantics, V: DocumentValue>(expr: &Expr, value: V) -> GenericResult<V> {
     if takes_input_queue_bridge(expr) {
-        let owned = to_owned_with_cursor(&value, None);
+        let owned = owned_or_err!(to_owned_with_cursor(&value, None));
         return eval_each_owned_collect::<S, V>(expr, &owned, false);
     }
     eval_single::<S, V>(expr, value, false, None)
@@ -2419,7 +2629,8 @@ pub fn eval_with_cursor_using<S: EvalSemantics, C: DocumentCursor>(
         // `to_owned_cursor` directly rather than `to_owned_with_cursor`: the
         // latter ignores its value argument whenever the cursor is `Some`, so
         // routing through it would compute a `cursor.value()` only to drop it.
-        return eval_each_owned_collect::<S, C::Value>(expr, &to_owned_cursor(&cursor), false);
+        let owned = owned_or_err!(to_owned_cursor(&cursor));
+        return eval_each_owned_collect::<S, C::Value>(expr, &owned, false);
     }
     eval_single::<S, C::Value>(expr, cursor.value(), false, Some(cursor))
 }
@@ -2462,13 +2673,33 @@ fn fold_pipe_stages<S: EvalSemantics, V: DocumentValue>(
                 let mut results = Vec::new();
                 for v in vs {
                     match eval_single::<S, _>(expr, v, optional, None).materialize_lazy() {
-                        GenericResult::One(r) => results.push(to_owned(&r)),
-                        GenericResult::OneCursor(c) => results.push(to_owned_cursor(&c)),
+                        // A decode failure keeps the prefix already
+                        // piped through, exactly as the `Error` arm
+                        // below does (#400/#494, #1247) -- not
+                        // `owned_or_err!`, which would discard it.
+                        GenericResult::One(r) => match to_owned(&r) {
+                            Ok(o) => results.push(o),
+                            Err(e) => return partial_generic(results, Control::Error(e)),
+                        },
+                        GenericResult::OneCursor(c) => match to_owned_cursor(&c) {
+                            Ok(o) => results.push(o),
+                            Err(e) => return partial_generic(results, Control::Error(e)),
+                        },
                         GenericResult::Many(rs) => {
-                            results.extend(rs.iter().map(to_owned));
+                            for r in &rs {
+                                match to_owned(r) {
+                                    Ok(o) => results.push(o),
+                                    Err(e) => return partial_generic(results, Control::Error(e)),
+                                }
+                            }
                         }
                         GenericResult::ManyCursor(cs) => {
-                            results.extend(cs.iter().map(to_owned_cursor));
+                            for c in &cs {
+                                match to_owned_cursor(c) {
+                                    Ok(o) => results.push(o),
+                                    Err(e) => return partial_generic(results, Control::Error(e)),
+                                }
+                            }
                         }
                         GenericResult::None => {}
                         // The outputs already piped through no longer
@@ -2970,15 +3201,13 @@ fn fold_lazy_seq_stage<S: EvalSemantics, V: DocumentValue>(
                         .collect(),
                 )
             } else {
-                GenericResult::ManyOwned(
-                    items
-                        .into_iter()
-                        .map(|item| match item {
-                            LazyElem::Cursor(c) => to_owned_cursor(&c),
-                            LazyElem::Owned(o) => o,
-                        })
-                        .collect(),
-                )
+                GenericResult::ManyOwned(owned_or_err!(items
+                    .into_iter()
+                    .map(|item| match item {
+                        LazyElem::Cursor(c) => to_owned_cursor(&c),
+                        LazyElem::Owned(o) => Ok(o),
+                    })
+                    .collect::<Result<Vec<_>, _>>()))
             }
         }
 
@@ -3441,10 +3670,9 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
             } else if optional {
                 GenericResult::None
             } else {
-                GenericResult::Error(EvalError::cannot_iterate_with(
-                    S::TAG,
-                    &to_owned_with_cursor(&value, cursor),
-                ))
+                GenericResult::Error(type_error_or_decode_failure(&value, || {
+                    EvalError::cannot_iterate_with(S::TAG, &to_owned_for_diagnostic(&value, cursor))
+                }))
             }
         }
 
@@ -3536,7 +3764,7 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
             // letting a later stage fall through `eval_builtin`'s per-builtin
             // fallback in isolation, which has no path to give it (#554).
             if exprs.iter().any(needs_path_context) {
-                let owned = to_owned_with_cursor(&value, cursor);
+                let owned = owned_or_err!(to_owned_with_cursor(&value, cursor));
                 return eval_on_owned::<S, _>(&Expr::Pipe(exprs.clone()), owned, optional);
             }
 
@@ -3571,9 +3799,11 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
         // Formats are pure functions of the value, so evaluate them here rather
         // than falling through to the catch-all, which would serialize the
         // value to JSON and rebuild a `JsonIndex` for every one (#124).
-        Expr::Format(format_type) => {
-            format_result::<S, _>(format_type, &to_owned_with_cursor(&value, cursor), optional)
-        }
+        Expr::Format(format_type) => format_result::<S, _>(
+            format_type,
+            &owned_or_err!(to_owned_with_cursor(&value, cursor)),
+            optional,
+        ),
 
         Expr::Builtin(builtin) => eval_builtin::<S, _>(builtin, value, optional, cursor),
 
@@ -3623,10 +3853,17 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
             let items: Vec<OwnedValue> = match eval_single::<S, _>(inner, value, optional, cursor)
                 .materialize_lazy()
             {
-                GenericResult::One(v) => vec![to_owned(&v)],
-                GenericResult::OneCursor(c) => vec![to_owned_cursor(&c)],
-                GenericResult::Many(vs) => vs.iter().map(to_owned).collect(),
-                GenericResult::ManyCursor(cs) => cs.iter().map(to_owned_cursor).collect(),
+                GenericResult::One(v) => vec![owned_or_err!(to_owned(&v))],
+                GenericResult::OneCursor(c) => vec![owned_or_err!(to_owned_cursor(&c))],
+                GenericResult::Many(vs) => {
+                    owned_or_err!(vs.iter().map(to_owned).collect::<Result<Vec<_>, _>>())
+                }
+                GenericResult::ManyCursor(cs) => {
+                    owned_or_err!(cs
+                        .iter()
+                        .map(to_owned_cursor)
+                        .collect::<Result<Vec<_>, _>>())
+                }
                 GenericResult::None => Vec::new(),
                 GenericResult::Owned(v) => vec![v],
                 GenericResult::ManyOwned(vs) => vs,
@@ -3715,7 +3952,7 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
         // Fall back to the full evaluator for complex expressions
         _ => {
             // Convert to OwnedValue, then to JSON, then evaluate with full evaluator
-            let owned = to_owned_with_cursor(&value, cursor);
+            let owned = owned_or_err!(to_owned_with_cursor(&value, cursor));
             let json_str = owned.to_json_for_reindex::<S>();
             let json_bytes = json_str.as_bytes();
             let index = JsonIndex::build(json_bytes);
@@ -4204,7 +4441,7 @@ fn eval_first_or_last_generic<S: EvalSemantics, V: DocumentValue>(
         && crate::jq::input_queue_is_active()
         && crate::jq::walk::uses_input_builtins(inner)
     {
-        let owned = to_owned_with_cursor(&value, cursor);
+        let owned = owned_or_err!(to_owned_with_cursor(&value, cursor));
         return eval_on_owned::<S, _>(&Expr::FirstExpr(Box::new(inner.clone())), owned, optional);
     }
 
@@ -4390,11 +4627,17 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
             pending_halt = Some(code);
             vs
         }
-        GenericResult::One(v) => vec![to_owned_key_shape(&v)],
-        GenericResult::OneCursor(c) => vec![to_owned_key_shape_cursor(&c)],
-        GenericResult::Many(vs) => vs.iter().map(to_owned_key_shape).collect(),
-        GenericResult::ManyCursor(cs) => cs.iter().map(to_owned_key_shape_cursor).collect(),
-        other => other.collect_owned(),
+        GenericResult::One(v) => vec![owned_or_err!(to_owned_key_shape(&v))],
+        GenericResult::OneCursor(c) => vec![owned_or_err!(to_owned_key_shape_cursor(&c))],
+        GenericResult::Many(vs) => owned_or_err!(vs
+            .iter()
+            .map(to_owned_key_shape)
+            .collect::<Result<Vec<_>, _>>()),
+        GenericResult::ManyCursor(cs) => owned_or_err!(cs
+            .iter()
+            .map(to_owned_key_shape_cursor)
+            .collect::<Result<Vec<_>, _>>()),
+        other => owned_or_err!(other.collect_owned()),
     };
     if keys.is_empty() {
         // `partial_generic`'s invariant (a non-empty prefix by construction)
@@ -4450,7 +4693,7 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
         | GenericResult::LazyKeys { .. }
         | GenericResult::LazyIndexRange(_)
         | GenericResult::LazySeq(_)) => {
-            let targets = owned.collect_owned();
+            let targets = owned_or_err!(owned.collect_owned());
             let mut out = Vec::with_capacity(keys.len() * targets.len());
             for k in &keys {
                 for t in &targets {
@@ -4485,7 +4728,7 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
             match index_one_generic::<V>(t.clone(), k, optional) {
                 GenericResult::OneCursor(c) => {
                     if any_owned {
-                        owned.push(to_owned_cursor(&c));
+                        owned.push(owned_or_err!(to_owned_cursor(&c)));
                     } else {
                         cursors.push(c);
                     }
@@ -4493,7 +4736,10 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
                 GenericResult::Owned(v) => {
                     if !any_owned {
                         any_owned = true;
-                        owned = cursors.iter().map(to_owned_cursor).collect();
+                        owned = owned_or_err!(cursors
+                            .iter()
+                            .map(to_owned_cursor)
+                            .collect::<Result<Vec<_>, _>>());
                         cursors.clear();
                     }
                     owned.push(v);
@@ -4506,7 +4752,10 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
                     let out = if any_owned {
                         owned
                     } else {
-                        cursors.iter().map(to_owned_cursor).collect()
+                        owned_or_err!(cursors
+                            .iter()
+                            .map(to_owned_cursor)
+                            .collect::<Result<Vec<_>, _>>())
                     };
                     return partial_generic(out, Control::Error(e));
                 }
@@ -4530,7 +4779,10 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
         let out = if any_owned {
             owned
         } else {
-            cursors.iter().map(to_owned_cursor).collect()
+            owned_or_err!(cursors
+                .iter()
+                .map(to_owned_cursor)
+                .collect::<Result<Vec<_>, _>>())
         };
         return partial_generic(out, Control::Halt(code));
     }
@@ -4610,7 +4862,7 @@ fn eval_slice_expr<S: EvalSemantics, V: DocumentValue>(
         | GenericResult::ManyOwned(_)
         | GenericResult::LazyKeys { .. }
         | GenericResult::LazyIndexRange(_)
-        | GenericResult::LazySeq(_)) => Targets::Owned(owned.collect_owned()),
+        | GenericResult::LazySeq(_)) => Targets::Owned(owned_or_err!(owned.collect_owned())),
     };
 
     // Start outer, end middle, target inner. The result is always owned:
@@ -4675,11 +4927,21 @@ fn eval_slice_bound<S: EvalSemantics, V: DocumentValue>(
         GenericResult::Halt(code) => return Err(Control::Halt(code)),
         GenericResult::None => return Ok(Vec::new()),
         GenericResult::Partial(_, control) => return Err(control),
-        GenericResult::One(v) => vec![to_owned_key_shape(&v)],
-        GenericResult::OneCursor(c) => vec![to_owned_key_shape_cursor(&c)],
-        GenericResult::Many(vs) => vs.iter().map(to_owned_key_shape).collect(),
-        GenericResult::ManyCursor(cs) => cs.iter().map(to_owned_key_shape_cursor).collect(),
-        other => other.collect_owned(),
+        GenericResult::One(v) => vec![to_owned_key_shape(&v).map_err(Control::Error)?],
+        GenericResult::OneCursor(c) => {
+            vec![to_owned_key_shape_cursor(&c).map_err(Control::Error)?]
+        }
+        GenericResult::Many(vs) => vs
+            .iter()
+            .map(to_owned_key_shape)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Control::Error)?,
+        GenericResult::ManyCursor(cs) => cs
+            .iter()
+            .map(to_owned_key_shape_cursor)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Control::Error)?,
+        other => other.collect_owned().map_err(Control::Error)?,
     };
     raw.iter()
         .map(|v| owned_bound_to_i64(v, round).map_err(Control::Error))
@@ -4705,9 +4967,10 @@ fn slice_one_generic<S: EvalSemantics, V: DocumentValue>(
     if let Some(elements) = target.as_array() {
         let items = elements.collect_values();
         let range = SliceBounds::from_literals(start, end).resolve(items.len());
-        return GenericResult::Owned(OwnedValue::Array(
-            items[range].iter().map(to_owned).collect(),
-        ));
+        return GenericResult::Owned(OwnedValue::Array(owned_or_err!(items[range]
+            .iter()
+            .map(to_owned)
+            .collect::<Result<Vec<_>, _>>())));
     }
     // yq's object AST-child-layout slicing rule (#1102) — mirrors
     // `eval.rs`'s cursor-backed `Expr::Slice` arm for the same target type;
@@ -4717,7 +4980,7 @@ fn slice_one_generic<S: EvalSemantics, V: DocumentValue>(
     // `IndexMap` `slice_object_as_yq_children` needs — same technique as
     // `eval.rs`'s own arm, for the same reason.
     if S::TAG == EvalTag::Yq && target.as_object().is_some() {
-        let OwnedValue::Object(map) = to_owned(&target) else {
+        let OwnedValue::Object(map) = owned_or_err!(to_owned(&target)) else {
             unreachable!("target.as_object() just confirmed this materializes to an Object")
         };
         return GenericResult::Owned(slice_object_as_yq_children(&map, start, end));
@@ -4934,12 +5197,12 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                 // dispatch path starts forcing `optional = true` here.
                 Some(control) => {
                     let prefix: Vec<OwnedValue> = match cursor {
-                        Some(c) => core::iter::repeat_with(|| to_owned_cursor(&c))
+                        Some(c) => owned_or_err!(core::iter::repeat_with(|| to_owned_cursor(&c))
                             .take(truthy_count)
-                            .collect(),
-                        None => core::iter::repeat_with(|| to_owned(&value))
+                            .collect::<Result<Vec<_>, _>>()),
+                        None => owned_or_err!(core::iter::repeat_with(|| to_owned(&value))
                             .take(truthy_count)
-                            .collect(),
+                            .collect::<Result<Vec<_>, _>>()),
                     };
                     partial_generic(prefix, control)
                 }
@@ -4982,10 +5245,9 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
             } else if optional {
                 GenericResult::None
             } else {
-                GenericResult::Error(EvalError::cannot_iterate_with(
-                    S::TAG,
-                    &to_owned_with_cursor(&value, cursor),
-                ))
+                GenericResult::Error(type_error_or_decode_failure(&value, || {
+                    EvalError::cannot_iterate_with(S::TAG, &to_owned_for_diagnostic(&value, cursor))
+                }))
             }
         }
 
@@ -4997,11 +5259,11 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                 use rand_chacha::ChaCha8Rng;
 
                 if let Some(elements) = value.as_array() {
-                    let mut values: Vec<OwnedValue> = elements
+                    let mut values: Vec<OwnedValue> = owned_or_err!(elements
                         .collect_cursors()
                         .iter()
                         .map(to_owned_cursor)
-                        .collect();
+                        .collect::<Result<Vec<_>, _>>());
                     let mut rng = ChaCha8Rng::from_rng(&mut rand::rng());
                     values.shuffle(&mut rng);
                     GenericResult::Owned(OwnedValue::Array(values))
@@ -5022,11 +5284,11 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
 
         Builtin::Pivot => {
             if let Some(elements) = value.as_array() {
-                let items: Vec<OwnedValue> = elements
+                let items: Vec<OwnedValue> = owned_or_err!(elements
                     .collect_cursors()
                     .iter()
                     .map(to_owned_cursor)
-                    .collect();
+                    .collect::<Result<Vec<_>, _>>());
                 if items.is_empty() {
                     return GenericResult::Owned(OwnedValue::Array(vec![]));
                 }
@@ -5146,9 +5408,9 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
             } else if optional {
                 GenericResult::None
             } else {
-                GenericResult::Error(EvalError::has_no_length(&to_owned_with_cursor(
-                    &value, cursor,
-                )))
+                GenericResult::Error(type_error_or_decode_failure(&value, || {
+                    EvalError::has_no_length(&to_owned_for_diagnostic(&value, cursor))
+                }))
             }
         }
 
@@ -5175,9 +5437,9 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
             } else if optional {
                 GenericResult::None
             } else {
-                GenericResult::Error(EvalError::has_no_keys(&to_owned_with_cursor(
-                    &value, cursor,
-                )))
+                GenericResult::Error(type_error_or_decode_failure(&value, || {
+                    EvalError::has_no_keys(&to_owned_for_diagnostic(&value, cursor))
+                }))
             }
         }
 
@@ -5199,9 +5461,9 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
             } else if optional {
                 GenericResult::None
             } else {
-                GenericResult::Error(EvalError::has_no_keys(&to_owned_with_cursor(
-                    &value, cursor,
-                )))
+                GenericResult::Error(type_error_or_decode_failure(&value, || {
+                    EvalError::has_no_keys(&to_owned_for_diagnostic(&value, cursor))
+                }))
             }
         }
 
@@ -5232,30 +5494,42 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
         // repeated key for a JSON-sourced document too.
         Builtin::ToEntries => {
             if let Some(elements) = value.as_array() {
-                let entries: Vec<OwnedValue> = elements
-                    .collect_cursors()
-                    .into_iter()
-                    .enumerate()
-                    .map(|(i, elem_cursor)| {
-                        let mut entry = IndexMap::new();
-                        entry.insert("key".to_string(), OwnedValue::Int(i as i64));
-                        entry.insert("value".to_string(), to_owned_cursor(&elem_cursor));
-                        OwnedValue::Object(entry)
-                    })
-                    .collect();
+                // A loop, not `.map(...).collect()`: `owned_or_err!` has to
+                // return from *this* function, which it cannot do from inside
+                // a closure (#1247).
+                let mut entries: Vec<OwnedValue> = Vec::new();
+                for (i, elem_cursor) in elements.collect_cursors().into_iter().enumerate() {
+                    let mut entry = IndexMap::new();
+                    entry.insert("key".to_string(), OwnedValue::Int(i as i64));
+                    entry.insert(
+                        "value".to_string(),
+                        owned_or_err!(to_owned_cursor(&elem_cursor)),
+                    );
+                    entries.push(OwnedValue::Object(entry));
+                }
                 GenericResult::Owned(OwnedValue::Array(entries))
             } else if let Some(fields) = value.as_object() {
-                let entries: Vec<OwnedValue> =
-                    effective_fields(&fields, S::COLLAPSE_DUPLICATE_KEYS)
-                        .into_iter()
-                        .filter_map(|field| {
-                            let key = field.key_str()?;
-                            let mut entry = IndexMap::new();
-                            entry.insert("key".to_string(), OwnedValue::String(key.into_owned()));
-                            entry.insert("value".to_string(), to_owned_cursor(&field.value_cursor));
-                            Some(OwnedValue::Object(entry))
-                        })
-                        .collect();
+                // A loop for the same reason as the array arm above.
+                let mut entries: Vec<OwnedValue> = Vec::new();
+                for field in effective_fields(&fields, S::COLLAPSE_DUPLICATE_KEYS) {
+                    // Key decode checked before `key_str`, as everywhere else
+                    // (#1247) -- YAML stringifies an undecodable key to `""`.
+                    if let Some(reason) = field.key.string_decode_error() {
+                        return GenericResult::Error(EvalError::new(format!(
+                            "{reason} in object key"
+                        )));
+                    }
+                    let Some(key) = field.key_str() else {
+                        continue;
+                    };
+                    let mut entry = IndexMap::new();
+                    entry.insert("key".to_string(), OwnedValue::String(key.into_owned()));
+                    entry.insert(
+                        "value".to_string(),
+                        owned_or_err!(to_owned_cursor(&field.value_cursor)),
+                    );
+                    entries.push(OwnedValue::Object(entry));
+                }
                 GenericResult::Owned(OwnedValue::Array(entries))
             } else {
                 // No `optional`-guarded arm here: `Builtin::ToEntries` isn't
@@ -5264,9 +5538,9 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                 // evaluates it at the ambient `optional` (normally `false`)
                 // and lets the outer `Expr::Optional`/`eval_try`-style catch
                 // convert the resulting `Error` to `None` once instead.
-                GenericResult::Error(EvalError::has_no_keys(&to_owned_with_cursor(
-                    &value, cursor,
-                )))
+                GenericResult::Error(type_error_or_decode_failure(&value, || {
+                    EvalError::has_no_keys(&to_owned_for_diagnostic(&value, cursor))
+                }))
             }
         }
 
@@ -5401,12 +5675,12 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
 
         Builtin::Reverse => {
             if let Some(elements) = value.as_array() {
-                let values: Vec<OwnedValue> = elements
+                let values: Vec<OwnedValue> = owned_or_err!(elements
                     .collect_cursors()
                     .iter()
                     .rev()
                     .map(to_owned_cursor)
-                    .collect();
+                    .collect::<Result<Vec<_>, _>>());
                 GenericResult::Owned(OwnedValue::Array(values))
             } else if optional {
                 GenericResult::None
@@ -5421,7 +5695,7 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
         Builtin::Empty => GenericResult::None,
 
         Builtin::ToString => {
-            let owned = to_owned_with_cursor(&value, cursor);
+            let owned = owned_or_err!(to_owned_with_cursor(&value, cursor));
             GenericResult::Owned(OwnedValue::String(owned_to_string::<S>(&owned)))
         }
 
@@ -5443,9 +5717,9 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
             } else if optional {
                 GenericResult::None
             } else {
-                GenericResult::Error(EvalError::cannot_parse_as_number(&to_owned_with_cursor(
-                    &value, cursor,
-                )))
+                GenericResult::Error(type_error_or_decode_failure(&value, || {
+                    EvalError::cannot_parse_as_number(&to_owned_for_diagnostic(&value, cursor))
+                }))
             }
         }
 
@@ -5574,7 +5848,7 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
 
         // For other builtins, fall back to full evaluator via JSON
         _ => {
-            let owned = to_owned_with_cursor(&value, cursor);
+            let owned = owned_or_err!(to_owned_with_cursor(&value, cursor));
             eval_on_owned::<S, _>(&Expr::Builtin(builtin.clone()), owned, optional)
         }
     }
@@ -5586,30 +5860,65 @@ mod tests {
     use super::super::value::NumberRepr;
     use super::*;
 
-    /// #1098: `JsonIndex::build`'s semi-index scan finds string quote/escape
-    /// *boundaries* but never decodes/validates the bytes between them --
-    /// that's deferred to `JsonString::as_str()`, called lazily by
-    /// `to_owned_at_depth`. So invalid UTF-8 inside a string span parses
-    /// and indexes fine (`JsonIndex::build` never errors), and only
-    /// degrades once materialization reaches it, here to `Null` for that
-    /// field -- pins the known, deliberate, low-severity gap this issue
-    /// describes (see `to_owned_at_depth`'s own `else` arm doc comment for
-    /// why a stricter fix was attempted and reverted; a panic here is
-    /// reachable via completely ordinary CLI usage, not just a library
-    /// caller feeding raw bytes directly, and defeats this crate's
-    /// "evaluation continues past one error" convention).
+    /// #1098/#1247: `JsonIndex::build`'s semi-index scan finds string
+    /// quote/escape *boundaries* but never decodes/validates the bytes
+    /// between them -- that's deferred to `JsonString::as_str()`, called
+    /// lazily by `to_owned_at_depth`. So invalid UTF-8 inside a string span
+    /// parses and indexes fine (`JsonIndex::build` never errors), and the
+    /// failure only becomes observable once materialization reaches it.
+    ///
+    /// This test used to assert the *degrade* (`Some(&OwnedValue::Null)`),
+    /// pinning it as a known, deliberate gap. #1247 closed it: the failure
+    /// now travels as an `EvalError` through `GenericResult::Error` /
+    /// `Control::Error`, which is what `to_owned_at_depth`'s own reverted
+    /// `panic!` attempt (PR #1190) was trying and failing to achieve --
+    /// evaluation still continues past the error rather than aborting the
+    /// process, so the `ErrorSink` convention (#355) holds.
     #[test]
-    fn test_to_owned_degrades_to_null_on_string_decode_failure_1098() {
+    fn test_to_owned_errors_on_string_decode_failure_1247() {
         use crate::json::JsonIndex;
         let json: &[u8] = b"{\"a\": \"\xff\xfe\"}";
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let value = cursor.value();
-        let owned = to_owned(&value);
+        let err = to_owned(&value).expect_err("an undecodable string must not materialize");
+        assert!(
+            err.message.contains("invalid UTF-8"),
+            "message: {}",
+            err.message
+        );
+    }
+
+    /// #1247: the same for an undecodable *key*, which used to drop the
+    /// whole field instead of degrading its value.
+    #[test]
+    fn test_to_owned_errors_on_object_key_decode_failure_1247() {
+        use crate::json::JsonIndex;
+        let json: &[u8] = b"{\"\xff\xfe\": 1}";
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+        let err = to_owned(&value).expect_err("an undecodable key must not materialize");
+        assert!(
+            err.message.contains("in object key"),
+            "message: {}",
+            err.message
+        );
+    }
+
+    /// #1247: a valid document still materializes unchanged -- the guard
+    /// against the new check firing on anything that decodes cleanly.
+    #[test]
+    fn test_to_owned_still_materializes_valid_input_1247() {
+        use crate::json::JsonIndex;
+        let json: &[u8] = br#"{"a": "x", "b": [1, "\u00e9"]}"#;
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let owned = to_owned(&cursor.value()).expect("valid input must materialize");
         let OwnedValue::Object(map) = owned else {
             panic!("expected an object");
         };
-        assert_eq!(map.get("a"), Some(&OwnedValue::Null));
+        assert_eq!(map.get("a"), Some(&OwnedValue::String("x".to_string())));
     }
     use crate::jq::parse;
     use crate::json::JsonIndex;
@@ -5660,7 +5969,7 @@ mod tests {
         let value = cursor.value();
 
         let result = eval(&Expr::Identity, value);
-        let owned = result.into_owned().unwrap();
+        let owned = result.into_owned().unwrap().unwrap();
 
         match owned {
             OwnedValue::Object(map) => {
@@ -5682,7 +5991,7 @@ mod tests {
         let value = cursor.value();
 
         let result = eval(&Expr::Field("name".to_string()), value);
-        let owned = result.into_owned().unwrap();
+        let owned = result.into_owned().unwrap().unwrap();
 
         assert_eq!(owned, OwnedValue::String("Alice".to_string()));
     }
@@ -5695,7 +6004,7 @@ mod tests {
         let value = cursor.value();
 
         let result = eval(&Expr::Index(1), value);
-        let owned = result.into_owned().unwrap();
+        let owned = result.into_owned().unwrap().unwrap();
 
         assert_eq!(owned, OwnedValue::Int(2));
     }
@@ -5708,7 +6017,7 @@ mod tests {
         let value = cursor.value();
 
         let result = eval(&Expr::Iterate, value);
-        let owned = result.collect_owned();
+        let owned = result.collect_owned().unwrap();
 
         assert_eq!(
             owned,
@@ -5730,7 +6039,7 @@ mod tests {
         assert!(matches!(result, GenericResult::LazyIndexRange(3)));
 
         assert_eq!(
-            result.collect_owned(),
+            result.collect_owned().unwrap(),
             vec![OwnedValue::Array(vec![
                 OwnedValue::Int(0),
                 OwnedValue::Int(1),
@@ -5743,7 +6052,7 @@ mod tests {
         let empty_cursor = empty_index.root(empty_json);
         let empty_result = eval(&Expr::Builtin(Builtin::KeysUnsorted), empty_cursor.value());
         assert_eq!(
-            empty_result.collect_owned(),
+            empty_result.collect_owned().unwrap(),
             vec![OwnedValue::Array(vec![])]
         );
     }
@@ -5801,7 +6110,7 @@ mod tests {
         let halt_expr = parse("halt_error(9)").unwrap();
         let halted = eval(&halt_expr, cursor.value());
         assert!(matches!(halted, GenericResult::Halt(9)));
-        assert_eq!(halted.collect_owned(), Vec::<OwnedValue>::new());
+        assert_eq!(halted.collect_owned().unwrap(), Vec::<OwnedValue>::new());
     }
 
     /// `eval_index_expr`'s `keys` match (#694): a `Partial`'s trailing
@@ -5927,7 +6236,7 @@ mod tests {
             value,
         );
         assert_eq!(
-            result.collect_owned(),
+            result.collect_owned().unwrap(),
             vec![
                 OwnedValue::Array(vec![OwnedValue::Int(0), OwnedValue::Int(1)]),
                 OwnedValue::Array(vec![OwnedValue::Int(0), OwnedValue::Int(1)]),
@@ -5943,7 +6252,7 @@ mod tests {
         let value = cursor.value();
 
         let result = eval(&Expr::Builtin(Builtin::Type), value);
-        let owned = result.into_owned().unwrap();
+        let owned = result.into_owned().unwrap().unwrap();
 
         assert_eq!(owned, OwnedValue::String("object".to_string()));
     }
@@ -5960,7 +6269,7 @@ mod tests {
         let value = cursor.value();
 
         let result = eval(&Expr::Builtin(Builtin::ToString), value);
-        let owned = result.into_owned().unwrap();
+        let owned = result.into_owned().unwrap().unwrap();
 
         assert_eq!(
             owned,
@@ -5987,7 +6296,7 @@ mod tests {
         let value = cursor.value();
 
         let result = eval(&Expr::Format(FormatType::Uri), value);
-        let owned = result.into_owned().unwrap();
+        let owned = result.into_owned().unwrap().unwrap();
 
         assert_eq!(
             owned,
@@ -6007,7 +6316,7 @@ mod tests {
         let value = cursor.value();
 
         let result = eval(&Expr::Format(FormatType::Uri), value);
-        let owned = result.into_owned().unwrap();
+        let owned = result.into_owned().unwrap().unwrap();
 
         assert_eq!(
             owned,
@@ -6023,7 +6332,7 @@ mod tests {
         let value = cursor.value();
 
         let result = eval(&Expr::Builtin(Builtin::Length), value);
-        let owned = result.into_owned().unwrap();
+        let owned = result.into_owned().unwrap().unwrap();
 
         assert_eq!(owned, OwnedValue::Int(5));
     }
@@ -6036,7 +6345,7 @@ mod tests {
         let value = cursor.value();
 
         let result = eval(&Expr::Builtin(Builtin::KeysUnsorted), value);
-        let owned = result.into_owned().unwrap();
+        let owned = result.into_owned().unwrap().unwrap();
 
         match owned {
             OwnedValue::Array(keys) => {
@@ -6058,7 +6367,7 @@ mod tests {
 
         let expr = crate::jq::parse("keys_unsorted | length").unwrap();
         let result = eval(&expr, value);
-        assert_eq!(result.into_owned().unwrap(), OwnedValue::Int(3));
+        assert_eq!(result.into_owned().unwrap().unwrap(), OwnedValue::Int(3));
     }
 
     #[test]
@@ -6073,7 +6382,7 @@ mod tests {
 
         let expr = crate::jq::parse("keys_unsorted | (length)").unwrap();
         let result = eval(&expr, value);
-        assert_eq!(result.into_owned().unwrap(), OwnedValue::Int(3));
+        assert_eq!(result.into_owned().unwrap().unwrap(), OwnedValue::Int(3));
     }
 
     #[test]
@@ -6086,7 +6395,7 @@ mod tests {
         let expr = crate::jq::parse("keys_unsorted | .[]").unwrap();
         let result = eval(&expr, value);
         assert_eq!(
-            result.collect_owned(),
+            result.collect_owned().unwrap(),
             vec![
                 OwnedValue::String("b".to_string()),
                 OwnedValue::String("a".to_string()),
@@ -6104,7 +6413,7 @@ mod tests {
 
         let expr = crate::jq::parse("keys_unsorted | .[]").unwrap();
         let result = eval(&expr, value);
-        assert_eq!(result.collect_owned(), Vec::<OwnedValue>::new());
+        assert_eq!(result.collect_owned().unwrap(), Vec::<OwnedValue>::new());
     }
 
     #[test]
@@ -6116,20 +6425,23 @@ mod tests {
 
         let expr = crate::jq::parse("keys_unsorted | .[0]").unwrap();
         assert_eq!(
-            eval(&expr, value.clone()).into_owned().unwrap(),
+            eval(&expr, value.clone()).into_owned().unwrap().unwrap(),
             OwnedValue::String("b".to_string())
         );
 
         let expr = crate::jq::parse("keys_unsorted | .[-1]").unwrap();
         assert_eq!(
-            eval(&expr, value.clone()).into_owned().unwrap(),
+            eval(&expr, value.clone()).into_owned().unwrap().unwrap(),
             OwnedValue::String("c".to_string())
         );
 
         // Out of bounds is `null`, never an error (#307), matching plain
         // array indexing.
         let expr = crate::jq::parse("keys_unsorted | .[10]").unwrap();
-        assert_eq!(eval(&expr, value).into_owned().unwrap(), OwnedValue::Null);
+        assert_eq!(
+            eval(&expr, value).into_owned().unwrap().unwrap(),
+            OwnedValue::Null
+        );
     }
 
     #[test]
@@ -6141,13 +6453,13 @@ mod tests {
 
         let expr = crate::jq::parse("keys_unsorted | first").unwrap();
         assert_eq!(
-            eval(&expr, value.clone()).into_owned().unwrap(),
+            eval(&expr, value.clone()).into_owned().unwrap().unwrap(),
             OwnedValue::String("b".to_string())
         );
 
         let expr = crate::jq::parse("keys_unsorted | last").unwrap();
         assert_eq!(
-            eval(&expr, value).into_owned().unwrap(),
+            eval(&expr, value).into_owned().unwrap().unwrap(),
             OwnedValue::String("c".to_string())
         );
     }
@@ -6161,12 +6473,15 @@ mod tests {
 
         let expr = crate::jq::parse("keys_unsorted | first").unwrap();
         assert_eq!(
-            eval(&expr, value.clone()).into_owned().unwrap(),
+            eval(&expr, value.clone()).into_owned().unwrap().unwrap(),
             OwnedValue::Null
         );
 
         let expr = crate::jq::parse("keys_unsorted | last").unwrap();
-        assert_eq!(eval(&expr, value).into_owned().unwrap(), OwnedValue::Null);
+        assert_eq!(
+            eval(&expr, value).into_owned().unwrap().unwrap(),
+            OwnedValue::Null
+        );
     }
 
     #[test]
@@ -6182,7 +6497,7 @@ mod tests {
         let expr = crate::jq::parse("keys_unsorted | .[] | ascii_upcase").unwrap();
         let result = eval(&expr, value.clone());
         assert_eq!(
-            result.collect_owned(),
+            result.collect_owned().unwrap(),
             vec![
                 OwnedValue::String("B".to_string()),
                 OwnedValue::String("A".to_string()),
@@ -6192,7 +6507,7 @@ mod tests {
 
         let expr = crate::jq::parse("keys_unsorted | .[0] | ascii_upcase").unwrap();
         assert_eq!(
-            eval(&expr, value).into_owned().unwrap(),
+            eval(&expr, value).into_owned().unwrap().unwrap(),
             OwnedValue::String("B".to_string())
         );
     }
@@ -6213,7 +6528,7 @@ mod tests {
         let result = eval(&expr, value.clone());
         assert!(matches!(result, GenericResult::LazySeq(_)));
         assert_eq!(
-            result.into_owned().unwrap(),
+            result.into_owned().unwrap().unwrap(),
             OwnedValue::Array(vec![
                 OwnedValue::String("B".to_string()),
                 OwnedValue::String("A".to_string()),
@@ -6227,7 +6542,7 @@ mod tests {
         // pass instead of the four-pass round trip.
         let expr = crate::jq::parse("keys_unsorted | select(length == 3)").unwrap();
         assert_eq!(
-            eval(&expr, value).into_owned().unwrap(),
+            eval(&expr, value).into_owned().unwrap().unwrap(),
             OwnedValue::Array(vec![
                 OwnedValue::String("b".to_string()),
                 OwnedValue::String("a".to_string()),
@@ -6255,19 +6570,19 @@ mod tests {
 
         let expr = crate::jq::parse("keys_unsorted | length").unwrap();
         assert_eq!(
-            eval(&expr, value.clone()).into_owned().unwrap(),
+            eval(&expr, value.clone()).into_owned().unwrap().unwrap(),
             OwnedValue::Int(10_000)
         );
 
         let expr = crate::jq::parse("keys_unsorted | .[9999]").unwrap();
         assert_eq!(
-            eval(&expr, value.clone()).into_owned().unwrap(),
+            eval(&expr, value.clone()).into_owned().unwrap().unwrap(),
             OwnedValue::String("k9999".to_string())
         );
 
         let expr = crate::jq::parse("keys_unsorted | last").unwrap();
         assert_eq!(
-            eval(&expr, value).into_owned().unwrap(),
+            eval(&expr, value).into_owned().unwrap().unwrap(),
             OwnedValue::String("k9999".to_string())
         );
     }
@@ -6281,7 +6596,7 @@ mod tests {
 
         let expr = crate::jq::parse("keys | length").unwrap();
         let result = eval(&expr, value);
-        assert_eq!(result.into_owned().unwrap(), OwnedValue::Int(3));
+        assert_eq!(result.into_owned().unwrap().unwrap(), OwnedValue::Int(3));
     }
 
     #[test]
@@ -6295,7 +6610,7 @@ mod tests {
 
         let expr = crate::jq::parse("keys | (length)").unwrap();
         let result = eval(&expr, value);
-        assert_eq!(result.into_owned().unwrap(), OwnedValue::Int(3));
+        assert_eq!(result.into_owned().unwrap().unwrap(), OwnedValue::Int(3));
     }
 
     #[test]
@@ -6306,7 +6621,10 @@ mod tests {
         let value = cursor.value();
 
         let expr = crate::jq::parse("keys | length").unwrap();
-        assert_eq!(eval(&expr, value).into_owned().unwrap(), OwnedValue::Int(0));
+        assert_eq!(
+            eval(&expr, value).into_owned().unwrap().unwrap(),
+            OwnedValue::Int(0)
+        );
     }
 
     #[test]
@@ -6324,7 +6642,7 @@ mod tests {
 
         let expr = crate::jq::parse("keys").unwrap();
         assert_eq!(
-            eval(&expr, value.clone()).into_owned().unwrap(),
+            eval(&expr, value.clone()).into_owned().unwrap().unwrap(),
             OwnedValue::Array(vec![
                 OwnedValue::String("a".to_string()),
                 OwnedValue::String("b".to_string()),
@@ -6334,7 +6652,7 @@ mod tests {
 
         let expr = crate::jq::parse("keys | .[]").unwrap();
         assert_eq!(
-            eval(&expr, value.clone()).collect_owned(),
+            eval(&expr, value.clone()).collect_owned().unwrap(),
             vec![
                 OwnedValue::String("a".to_string()),
                 OwnedValue::String("b".to_string()),
@@ -6344,25 +6662,25 @@ mod tests {
 
         let expr = crate::jq::parse("keys | .[0]").unwrap();
         assert_eq!(
-            eval(&expr, value.clone()).into_owned().unwrap(),
+            eval(&expr, value.clone()).into_owned().unwrap().unwrap(),
             OwnedValue::String("a".to_string())
         );
 
         let expr = crate::jq::parse("keys | .[-1]").unwrap();
         assert_eq!(
-            eval(&expr, value.clone()).into_owned().unwrap(),
+            eval(&expr, value.clone()).into_owned().unwrap().unwrap(),
             OwnedValue::String("c".to_string())
         );
 
         let expr = crate::jq::parse("keys | first").unwrap();
         assert_eq!(
-            eval(&expr, value.clone()).into_owned().unwrap(),
+            eval(&expr, value.clone()).into_owned().unwrap().unwrap(),
             OwnedValue::String("a".to_string())
         );
 
         let expr = crate::jq::parse("keys | last").unwrap();
         assert_eq!(
-            eval(&expr, value).into_owned().unwrap(),
+            eval(&expr, value).into_owned().unwrap().unwrap(),
             OwnedValue::String("c".to_string())
         );
     }
@@ -6385,7 +6703,7 @@ mod tests {
         let result = eval(&expr, value.clone());
         assert!(!matches!(result, GenericResult::LazySeq(_)));
         assert_eq!(
-            result.into_owned().unwrap(),
+            result.into_owned().unwrap().unwrap(),
             OwnedValue::Array(vec![
                 OwnedValue::String("A".to_string()),
                 OwnedValue::String("B".to_string()),
@@ -6395,7 +6713,7 @@ mod tests {
 
         let expr = crate::jq::parse("keys | select(length == 3)").unwrap();
         assert_eq!(
-            eval(&expr, value).into_owned().unwrap(),
+            eval(&expr, value).into_owned().unwrap().unwrap(),
             OwnedValue::Array(vec![
                 OwnedValue::String("a".to_string()),
                 OwnedValue::String("b".to_string()),
@@ -6422,7 +6740,7 @@ mod tests {
 
         let expr = crate::jq::parse("keys | length").unwrap();
         assert_eq!(
-            eval(&expr, value.clone()).into_owned().unwrap(),
+            eval(&expr, value.clone()).into_owned().unwrap().unwrap(),
             OwnedValue::Int(10_000)
         );
 
@@ -6433,7 +6751,7 @@ mod tests {
 
         let expr = crate::jq::parse("keys | .[0]").unwrap();
         assert_eq!(
-            eval(&expr, value).into_owned().unwrap(),
+            eval(&expr, value).into_owned().unwrap().unwrap(),
             OwnedValue::String(expected_keys[0].clone())
         );
     }
@@ -6455,10 +6773,13 @@ mod tests {
         ]);
 
         let expr = crate::jq::parse("keys").unwrap();
-        assert_eq!(eval(&expr, value.clone()).into_owned().unwrap(), expected);
+        assert_eq!(
+            eval(&expr, value.clone()).into_owned().unwrap().unwrap(),
+            expected
+        );
 
         let expr = crate::jq::parse("keys_unsorted").unwrap();
-        assert_eq!(eval(&expr, value).into_owned().unwrap(), expected);
+        assert_eq!(eval(&expr, value).into_owned().unwrap().unwrap(), expected);
     }
 
     #[test]
@@ -6469,7 +6790,10 @@ mod tests {
         let value = cursor.value();
 
         let expr = crate::jq::parse("keys_unsorted | length").unwrap();
-        assert_eq!(eval(&expr, value).into_owned().unwrap(), OwnedValue::Int(3));
+        assert_eq!(
+            eval(&expr, value).into_owned().unwrap().unwrap(),
+            OwnedValue::Int(3)
+        );
     }
 
     #[test]
@@ -6482,7 +6806,10 @@ mod tests {
         let value = cursor.value();
 
         let expr = crate::jq::parse("keys_unsorted | (length)").unwrap();
-        assert_eq!(eval(&expr, value).into_owned().unwrap(), OwnedValue::Int(3));
+        assert_eq!(
+            eval(&expr, value).into_owned().unwrap().unwrap(),
+            OwnedValue::Int(3)
+        );
     }
 
     #[test]
@@ -6495,7 +6822,7 @@ mod tests {
         let expr = crate::jq::parse("keys_unsorted | .[]").unwrap();
         let result = eval(&expr, value);
         assert_eq!(
-            result.collect_owned(),
+            result.collect_owned().unwrap(),
             vec![OwnedValue::Int(0), OwnedValue::Int(1), OwnedValue::Int(2)]
         );
     }
@@ -6509,7 +6836,7 @@ mod tests {
 
         let expr = crate::jq::parse("keys_unsorted | .[]").unwrap();
         let result = eval(&expr, value);
-        assert_eq!(result.collect_owned(), Vec::<OwnedValue>::new());
+        assert_eq!(result.collect_owned().unwrap(), Vec::<OwnedValue>::new());
     }
 
     #[test]
@@ -6521,20 +6848,23 @@ mod tests {
 
         let expr = crate::jq::parse("keys_unsorted | .[0]").unwrap();
         assert_eq!(
-            eval(&expr, value.clone()).into_owned().unwrap(),
+            eval(&expr, value.clone()).into_owned().unwrap().unwrap(),
             OwnedValue::Int(0)
         );
 
         let expr = crate::jq::parse("keys_unsorted | .[-1]").unwrap();
         assert_eq!(
-            eval(&expr, value.clone()).into_owned().unwrap(),
+            eval(&expr, value.clone()).into_owned().unwrap().unwrap(),
             OwnedValue::Int(2)
         );
 
         // Out of bounds is `null`, never an error (#307), matching plain
         // array indexing and the object `keys_unsorted` fast path.
         let expr = crate::jq::parse("keys_unsorted | .[10]").unwrap();
-        assert_eq!(eval(&expr, value).into_owned().unwrap(), OwnedValue::Null);
+        assert_eq!(
+            eval(&expr, value).into_owned().unwrap().unwrap(),
+            OwnedValue::Null
+        );
     }
 
     #[test]
@@ -6546,12 +6876,15 @@ mod tests {
 
         let expr = crate::jq::parse("keys_unsorted | first").unwrap();
         assert_eq!(
-            eval(&expr, value.clone()).into_owned().unwrap(),
+            eval(&expr, value.clone()).into_owned().unwrap().unwrap(),
             OwnedValue::Int(0)
         );
 
         let expr = crate::jq::parse("keys_unsorted | last").unwrap();
-        assert_eq!(eval(&expr, value).into_owned().unwrap(), OwnedValue::Int(2));
+        assert_eq!(
+            eval(&expr, value).into_owned().unwrap().unwrap(),
+            OwnedValue::Int(2)
+        );
     }
 
     #[test]
@@ -6563,12 +6896,15 @@ mod tests {
 
         let expr = crate::jq::parse("keys_unsorted | first").unwrap();
         assert_eq!(
-            eval(&expr, value.clone()).into_owned().unwrap(),
+            eval(&expr, value.clone()).into_owned().unwrap().unwrap(),
             OwnedValue::Null
         );
 
         let expr = crate::jq::parse("keys_unsorted | last").unwrap();
-        assert_eq!(eval(&expr, value).into_owned().unwrap(), OwnedValue::Null);
+        assert_eq!(
+            eval(&expr, value).into_owned().unwrap().unwrap(),
+            OwnedValue::Null
+        );
     }
 
     #[test]
@@ -6585,7 +6921,7 @@ mod tests {
         let result = eval(&expr, value.clone());
         assert!(matches!(result, GenericResult::LazySeq(_)));
         assert_eq!(
-            result.into_owned().unwrap(),
+            result.into_owned().unwrap().unwrap(),
             OwnedValue::Array(vec![
                 OwnedValue::Int(0),
                 OwnedValue::Int(10),
@@ -6595,7 +6931,7 @@ mod tests {
 
         let expr = crate::jq::parse("keys_unsorted | select(length == 3)").unwrap();
         assert_eq!(
-            eval(&expr, value).into_owned().unwrap(),
+            eval(&expr, value).into_owned().unwrap().unwrap(),
             OwnedValue::Array(vec![
                 OwnedValue::Int(0),
                 OwnedValue::Int(1),
@@ -6617,7 +6953,7 @@ mod tests {
         let result = eval(&expr, value);
         assert!(matches!(result, GenericResult::LazySeq(_)));
         assert_eq!(
-            result.into_owned().unwrap(),
+            result.into_owned().unwrap().unwrap(),
             OwnedValue::Array(vec![
                 OwnedValue::Int(2),
                 OwnedValue::Int(4),
@@ -6639,7 +6975,7 @@ mod tests {
         let result = eval(&expr, value);
         assert!(matches!(result, GenericResult::LazySeq(_)));
         assert_eq!(
-            result.into_owned().unwrap(),
+            result.into_owned().unwrap().unwrap(),
             OwnedValue::Array(vec![
                 OwnedValue::Int(2),
                 OwnedValue::Int(4),
@@ -6656,7 +6992,7 @@ mod tests {
         let value = cursor.value();
         let expr = crate::jq::parse("map(.)").unwrap();
         assert_eq!(
-            eval(&expr, value).into_owned().unwrap(),
+            eval(&expr, value).into_owned().unwrap().unwrap(),
             OwnedValue::Array(vec![])
         );
 
@@ -6666,7 +7002,7 @@ mod tests {
         let value = cursor.value();
         let expr = crate::jq::parse("map(.)").unwrap();
         assert_eq!(
-            eval(&expr, value).into_owned().unwrap(),
+            eval(&expr, value).into_owned().unwrap().unwrap(),
             OwnedValue::Array(vec![])
         );
     }
@@ -6684,7 +7020,7 @@ mod tests {
         let result = eval(&expr, value.clone());
         assert!(result.is_error());
 
-        let owned = crate::jq::eval_generic::to_owned(&value);
+        let owned = crate::jq::eval_generic::to_owned(&value).unwrap();
         let expected = EvalError::cannot_iterate(&owned);
         match result {
             GenericResult::Error(e) => assert_eq!(e.message, expected.message),
@@ -6712,7 +7048,7 @@ mod tests {
         let expr = crate::jq::parse("map(. + 1)?").unwrap();
         let result = eval(&expr, value);
         assert!(!result.is_error());
-        assert_eq!(result.into_owned(), None);
+        assert_eq!(result.into_owned().unwrap(), None);
 
         // Non-erroring case still returns the mapped array, not suppressed.
         let expr = crate::jq::parse("map(. + 1)").unwrap();
@@ -6720,7 +7056,7 @@ mod tests {
         let index_ok = JsonIndex::build(json_ok);
         let value_ok = index_ok.root(json_ok).value();
         assert_eq!(
-            eval(&expr, value_ok).into_owned().unwrap(),
+            eval(&expr, value_ok).into_owned().unwrap().unwrap(),
             OwnedValue::Array(vec![
                 OwnedValue::Int(2),
                 OwnedValue::Int(3),
@@ -6738,7 +7074,7 @@ mod tests {
                 .unwrap();
         let result2 = eval(&expr2, value2);
         assert!(!result2.is_error());
-        assert_eq!(result2.into_owned(), None);
+        assert_eq!(result2.into_owned().unwrap(), None);
     }
 
     #[test]
@@ -6788,7 +7124,7 @@ mod tests {
         let expr = crate::jq::parse("map(. + 1) | .[]").unwrap();
         let result = eval(&expr, value.clone());
         assert!(result.is_error());
-        assert_eq!(result.collect_owned(), Vec::<OwnedValue>::new());
+        assert_eq!(result.collect_owned().unwrap(), Vec::<OwnedValue>::new());
 
         // Same check at the `stream_json` boundary the CLI actually uses:
         // nothing streams to `out` before the diagnostic.
@@ -6814,7 +7150,7 @@ mod tests {
         let result = eval(&expr, value);
         assert!(matches!(result, GenericResult::LazySeq(_)));
         assert_eq!(
-            result.into_owned().unwrap(),
+            result.into_owned().unwrap().unwrap(),
             OwnedValue::Array(vec![
                 OwnedValue::Int(20),
                 OwnedValue::Int(30),
@@ -6838,13 +7174,13 @@ mod tests {
 
         let expr = crate::jq::parse("map(ascii_upcase) | length").unwrap();
         assert_eq!(
-            eval(&expr, value.clone()).into_owned().unwrap(),
+            eval(&expr, value.clone()).into_owned().unwrap().unwrap(),
             OwnedValue::Int(3)
         );
 
         let expr = crate::jq::parse("map(ascii_upcase) | .[]").unwrap();
         assert_eq!(
-            eval(&expr, value.clone()).collect_owned(),
+            eval(&expr, value.clone()).collect_owned().unwrap(),
             vec![
                 OwnedValue::String("B".to_string()),
                 OwnedValue::String("A".to_string()),
@@ -6854,13 +7190,13 @@ mod tests {
 
         let expr = crate::jq::parse("map(ascii_upcase) | first").unwrap();
         assert_eq!(
-            eval(&expr, value.clone()).into_owned().unwrap(),
+            eval(&expr, value.clone()).into_owned().unwrap().unwrap(),
             OwnedValue::String("B".to_string())
         );
 
         let expr = crate::jq::parse("map(ascii_upcase) | .[0]").unwrap();
         assert_eq!(
-            eval(&expr, value.clone()).into_owned().unwrap(),
+            eval(&expr, value.clone()).into_owned().unwrap().unwrap(),
             OwnedValue::String("B".to_string())
         );
 
@@ -6869,13 +7205,13 @@ mod tests {
         // asserting correctness only, not laziness.
         let expr = crate::jq::parse("map(ascii_upcase) | .[2]").unwrap();
         assert_eq!(
-            eval(&expr, value.clone()).into_owned().unwrap(),
+            eval(&expr, value.clone()).into_owned().unwrap().unwrap(),
             OwnedValue::String("C".to_string())
         );
 
         let expr = crate::jq::parse("map(ascii_upcase) | last").unwrap();
         assert_eq!(
-            eval(&expr, value).into_owned().unwrap(),
+            eval(&expr, value).into_owned().unwrap().unwrap(),
             OwnedValue::String("C".to_string())
         );
     }
@@ -6899,12 +7235,15 @@ mod tests {
 
         let expr = crate::jq::parse("map(. + 1) | first").unwrap();
         assert_eq!(
-            eval(&expr, value.clone()).into_owned().unwrap(),
+            eval(&expr, value.clone()).into_owned().unwrap().unwrap(),
             OwnedValue::Int(2)
         );
 
         let expr = crate::jq::parse("map(. + 1) | .[0]").unwrap();
-        assert_eq!(eval(&expr, value).into_owned().unwrap(), OwnedValue::Int(2));
+        assert_eq!(
+            eval(&expr, value).into_owned().unwrap().unwrap(),
+            OwnedValue::Int(2)
+        );
     }
 
     #[test]
@@ -6925,7 +7264,7 @@ mod tests {
         let value = index.root(json).value();
         let expr = crate::jq::parse("first(map(. + 1) | .[] | (. + 100))").unwrap();
         assert_eq!(
-            eval(&expr, value).into_owned().unwrap(),
+            eval(&expr, value).into_owned().unwrap().unwrap(),
             OwnedValue::Int(102)
         );
 
@@ -6938,7 +7277,10 @@ mod tests {
         let expr =
             crate::jq::parse(r#"first(keys | .[] | (if . == 2 then error("touched") else . end))"#)
                 .unwrap();
-        assert_eq!(eval(&expr, value).into_owned().unwrap(), OwnedValue::Int(0));
+        assert_eq!(
+            eval(&expr, value).into_owned().unwrap().unwrap(),
+            OwnedValue::Int(0)
+        );
 
         // `LazyKeys { sorted: false }` (`keys_unsorted`): document order is
         // `"z"`, `"a"` -- `error` on `"a"` would fire if the tail pulled
@@ -6951,7 +7293,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            eval(&expr, value).into_owned().unwrap(),
+            eval(&expr, value).into_owned().unwrap().unwrap(),
             OwnedValue::String("z".to_string())
         );
 
@@ -6969,7 +7311,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            eval(&expr, value).into_owned().unwrap(),
+            eval(&expr, value).into_owned().unwrap().unwrap(),
             OwnedValue::String("a".to_string())
         );
     }
@@ -6986,7 +7328,7 @@ mod tests {
         let expr =
             crate::jq::parse("keys_unsorted | map(ascii_upcase) | select(length == 3)").unwrap();
         assert_eq!(
-            eval(&expr, value).into_owned().unwrap(),
+            eval(&expr, value).into_owned().unwrap().unwrap(),
             OwnedValue::Array(vec![
                 OwnedValue::String("BB".to_string()),
                 OwnedValue::String("A".to_string()),
@@ -7017,7 +7359,7 @@ mod tests {
         let result = eval(&expr, value.clone());
         assert!(matches!(result, GenericResult::LazySeq(_)));
         // No partial prefix, even though `"a"` already succeeded.
-        assert_eq!(result.collect_owned(), Vec::<OwnedValue>::new());
+        assert_eq!(result.collect_owned().unwrap(), Vec::<OwnedValue>::new());
         assert!(eval(&expr, value.clone()).materialize_lazy().is_error());
 
         let expr = crate::jq::parse(
@@ -7028,7 +7370,7 @@ mod tests {
         // Same atomicity boundary as the `map`-alone case above: `"a"` does
         // NOT survive as a partial prefix once `.[]` is piped after `map`.
         assert!(result.is_error());
-        assert_eq!(result.collect_owned(), Vec::<OwnedValue>::new());
+        assert_eq!(result.collect_owned().unwrap(), Vec::<OwnedValue>::new());
     }
 
     /// Known, narrow, pre-existing gap (not a new regression from #724):
@@ -7068,19 +7410,19 @@ mod tests {
 
         let expr = crate::jq::parse("keys_unsorted | length").unwrap();
         assert_eq!(
-            eval(&expr, value.clone()).into_owned().unwrap(),
+            eval(&expr, value.clone()).into_owned().unwrap().unwrap(),
             OwnedValue::Int(10_000)
         );
 
         let expr = crate::jq::parse("keys_unsorted | .[9999]").unwrap();
         assert_eq!(
-            eval(&expr, value.clone()).into_owned().unwrap(),
+            eval(&expr, value.clone()).into_owned().unwrap().unwrap(),
             OwnedValue::Int(9999)
         );
 
         let expr = crate::jq::parse("keys_unsorted | last").unwrap();
         assert_eq!(
-            eval(&expr, value).into_owned().unwrap(),
+            eval(&expr, value).into_owned().unwrap().unwrap(),
             OwnedValue::Int(9999)
         );
     }
@@ -7100,7 +7442,7 @@ mod tests {
         ]);
 
         let result = eval(&expr, value);
-        let owned = result.into_owned().unwrap();
+        let owned = result.into_owned().unwrap().unwrap();
 
         assert_eq!(owned, OwnedValue::String("Alice".to_string()));
     }
@@ -7122,7 +7464,7 @@ mod tests {
         let value = mapping_cursor.value();
 
         let result = eval(&Expr::Identity, value);
-        let owned = result.into_owned().unwrap();
+        let owned = result.into_owned().unwrap().unwrap();
 
         match owned {
             OwnedValue::Object(map) => {
@@ -7163,7 +7505,7 @@ mod tests {
             value.clone(),
         );
         assert_eq!(
-            single_field.collect_owned(),
+            single_field.collect_owned().unwrap(),
             vec![
                 OwnedValue::String("string".to_string()),
                 OwnedValue::String("string".to_string()),
@@ -7175,7 +7517,7 @@ mod tests {
             value,
         );
         assert_eq!(
-            iterate_fields.collect_owned(),
+            iterate_fields.collect_owned().unwrap(),
             vec![
                 OwnedValue::String("string".to_string()),
                 OwnedValue::String("number".to_string()),
@@ -7216,7 +7558,7 @@ mod tests {
         let value = mapping_cursor.value();
 
         let result = eval(&crate::jq::parse(".a | shuffle").unwrap(), value);
-        match result.into_owned().unwrap() {
+        match result.into_owned().unwrap().unwrap() {
             OwnedValue::Array(items) => {
                 assert_eq!(items.len(), 2);
                 for item in &items {
@@ -7242,7 +7584,7 @@ mod tests {
         let value = mapping_cursor.value();
 
         let result = eval(&Expr::Field("name".to_string()), value);
-        let owned = result.into_owned().unwrap();
+        let owned = result.into_owned().unwrap().unwrap();
 
         assert_eq!(owned, OwnedValue::String("Alice".to_string()));
     }
@@ -7271,7 +7613,7 @@ mod tests {
         let value = mapping_cursor.value();
 
         let result = eval_using::<YqSemantics, _>(&Expr::Builtin(Builtin::ToEntries), value);
-        let owned = result.into_owned().unwrap();
+        let owned = result.into_owned().unwrap().unwrap();
 
         let expected_entry = |v: i64| {
             let mut entry = IndexMap::new();
@@ -7309,7 +7651,7 @@ mod tests {
         let value = mapping_cursor.value();
 
         let result = eval_using::<JqSemantics, _>(&Expr::Builtin(Builtin::ToEntries), value);
-        let owned = result.into_owned().unwrap();
+        let owned = result.into_owned().unwrap().unwrap();
 
         let mut entry = IndexMap::new();
         entry.insert("key".to_string(), OwnedValue::String("a".to_string()));
@@ -7342,7 +7684,7 @@ mod tests {
             &Expr::Array(Box::new(Expr::Builtin(Builtin::ToEntries))),
             value,
         );
-        let owned = result.into_owned().unwrap();
+        let owned = result.into_owned().unwrap().unwrap();
 
         let expected_entry = |v: i64| {
             let mut entry = IndexMap::new();
@@ -7383,7 +7725,7 @@ mod tests {
             ]),
             value,
         );
-        let owned = result.collect_owned();
+        let owned = result.collect_owned().unwrap();
 
         let expected_entry = |v: i64| {
             let mut entry = IndexMap::new();
@@ -7408,7 +7750,7 @@ mod tests {
         let value = cursor.value();
 
         let result = eval(&Expr::Builtin(Builtin::ToEntries), value);
-        let owned = result.into_owned().unwrap();
+        let owned = result.into_owned().unwrap().unwrap();
 
         let entry = |k: &str, v: i64| {
             let mut entry = IndexMap::new();
@@ -7436,7 +7778,7 @@ mod tests {
         let value = seq_cursor.value();
 
         let result = eval(&Expr::Builtin(Builtin::ToEntries), value);
-        let owned = result.into_owned().unwrap();
+        let owned = result.into_owned().unwrap().unwrap();
 
         let expected_entry = |i: i64, v: &str| {
             let mut entry = IndexMap::new();
@@ -7494,7 +7836,7 @@ mod tests {
 
         let expr = crate::jq::parse(r#"(.[] | if .==2 then error("boom") else . end)?"#).unwrap();
         let result = eval(&expr, value);
-        assert_eq!(result.collect_owned(), vec![OwnedValue::Int(1)]);
+        assert_eq!(result.collect_owned().unwrap(), vec![OwnedValue::Int(1)]);
     }
 
     #[test]
@@ -7518,7 +7860,7 @@ mod tests {
 
         let expr = crate::jq::parse(r#"(.[] | if .==1 then error("boom") else . end)?"#).unwrap();
         let result = eval(&expr, value);
-        assert_eq!(result.collect_owned(), Vec::<OwnedValue>::new());
+        assert_eq!(result.collect_owned().unwrap(), Vec::<OwnedValue>::new());
     }
 
     #[test]
@@ -7538,7 +7880,7 @@ mod tests {
         let expr = crate::jq::parse(r#"(.[] | if .==3 then error("boom") else . end)?"#).unwrap();
         let result = eval(&expr, value);
         assert_eq!(
-            result.collect_owned(),
+            result.collect_owned().unwrap(),
             vec![OwnedValue::Int(1), OwnedValue::Int(2)]
         );
     }
@@ -7558,7 +7900,7 @@ mod tests {
         let value = seq_cursor.value();
 
         let result = eval(&Expr::Index(1), value);
-        let owned = result.into_owned().unwrap();
+        let owned = result.into_owned().unwrap().unwrap();
 
         assert_eq!(owned, OwnedValue::Int(2));
     }
@@ -7595,7 +7937,7 @@ mod tests {
 
         // Use eval_with_cursor to preserve position metadata
         let result = eval_with_cursor(&Expr::Builtin(Builtin::Line), mapping_cursor);
-        let owned = result.into_owned().unwrap();
+        let owned = result.into_owned().unwrap().unwrap();
 
         // Mapping starts at line 1
         assert_eq!(owned, OwnedValue::Int(1));
@@ -7616,7 +7958,7 @@ mod tests {
 
         // Use eval_with_cursor to preserve position metadata
         let result = eval_with_cursor(&Expr::Builtin(Builtin::Column), mapping_cursor);
-        let owned = result.into_owned().unwrap();
+        let owned = result.into_owned().unwrap().unwrap();
 
         // Mapping starts at column 1
         assert_eq!(owned, OwnedValue::Int(1));
@@ -7641,7 +7983,7 @@ mod tests {
         let expr = crate::jq::parse(".a | anchor").unwrap();
         let result = eval_with_cursor(&expr, doc_cursor);
         assert_eq!(
-            result.into_owned().unwrap(),
+            result.into_owned().unwrap().unwrap(),
             OwnedValue::String("x".to_string())
         );
     }
@@ -7660,7 +8002,7 @@ mod tests {
         let expr = crate::jq::parse(".a | anchor").unwrap();
         let result = eval_with_cursor(&expr, doc_cursor);
         assert_eq!(
-            result.into_owned().unwrap(),
+            result.into_owned().unwrap().unwrap(),
             OwnedValue::String(String::new())
         );
     }
@@ -7679,14 +8021,14 @@ mod tests {
         let expr = crate::jq::parse(".a | style").unwrap();
         let result = eval_with_cursor(&expr, doc_cursor);
         assert_eq!(
-            result.into_owned().unwrap(),
+            result.into_owned().unwrap().unwrap(),
             OwnedValue::String("flow".to_string())
         );
 
         let expr = crate::jq::parse(".b | style").unwrap();
         let result = eval_with_cursor(&expr, doc_cursor);
         assert_eq!(
-            result.into_owned().unwrap(),
+            result.into_owned().unwrap().unwrap(),
             OwnedValue::String("double".to_string())
         );
     }
@@ -7707,13 +8049,13 @@ mod tests {
         // same as `line`/`column` above.
         let result = eval(&Expr::Builtin(Builtin::Anchor), value.clone());
         assert_eq!(
-            result.into_owned().unwrap(),
+            result.into_owned().unwrap().unwrap(),
             OwnedValue::String(String::new())
         );
 
         let result = eval(&Expr::Builtin(Builtin::Style), value);
         assert_eq!(
-            result.into_owned().unwrap(),
+            result.into_owned().unwrap().unwrap(),
             OwnedValue::String(String::new())
         );
     }
@@ -7735,7 +8077,7 @@ mod tests {
         let expr = parse(".a | anchor").unwrap();
         let result = eval_with_cursor(&expr, doc_cursor);
         assert_eq!(
-            result.into_owned().unwrap(),
+            result.into_owned().unwrap().unwrap(),
             OwnedValue::String(String::new())
         );
     }
@@ -7751,7 +8093,7 @@ mod tests {
         let expr = parse(".a | style").unwrap();
         let result = eval_with_cursor(&expr, doc_cursor);
         assert_eq!(
-            result.into_owned().unwrap(),
+            result.into_owned().unwrap().unwrap(),
             OwnedValue::String(String::new())
         );
     }
@@ -7770,7 +8112,7 @@ mod tests {
 
         // Using eval (not eval_with_cursor) loses position metadata
         let result = eval(&Expr::Builtin(Builtin::Line), value);
-        let owned = result.into_owned().unwrap();
+        let owned = result.into_owned().unwrap().unwrap();
 
         // Without cursor, line returns 0
         assert_eq!(owned, OwnedValue::Int(0));
@@ -7794,7 +8136,7 @@ mod tests {
         let expr = crate::jq::parse(".a | line_comment").unwrap();
         let result = eval_with_cursor(&expr, doc_cursor);
         assert_eq!(
-            result.into_owned().unwrap(),
+            result.into_owned().unwrap().unwrap(),
             OwnedValue::String("keep this".to_string())
         );
     }
@@ -7813,7 +8155,7 @@ mod tests {
         let expr = crate::jq::parse(".a | line_comment").unwrap();
         let result = eval_with_cursor(&expr, doc_cursor);
         assert_eq!(
-            result.into_owned().unwrap(),
+            result.into_owned().unwrap().unwrap(),
             OwnedValue::String(String::new())
         );
     }
@@ -7853,7 +8195,7 @@ mod tests {
         let expr = crate::jq::parse(".a | line_comment").unwrap();
         let result = eval_with_cursor(&expr, doc_cursor);
         assert_eq!(
-            result.into_owned().unwrap(),
+            result.into_owned().unwrap().unwrap(),
             OwnedValue::String("#keep this".to_string())
         );
     }
@@ -7873,7 +8215,7 @@ mod tests {
         // Using eval (not eval_with_cursor) loses position metadata, so
         // line_comment falls back to "" even though the source has one.
         let result = eval(&Expr::Builtin(Builtin::LineComment), value);
-        let owned = result.into_owned().unwrap();
+        let owned = result.into_owned().unwrap().unwrap();
         assert_eq!(owned, OwnedValue::String(String::new()));
     }
 
@@ -7890,7 +8232,7 @@ mod tests {
 
         let result = eval_with_cursor(&Expr::Builtin(Builtin::LineComment), field_cursor);
         assert_eq!(
-            result.into_owned().unwrap(),
+            result.into_owned().unwrap().unwrap(),
             OwnedValue::String(String::new())
         );
     }
@@ -7909,7 +8251,7 @@ mod tests {
         let cursor = index.root(json);
         let value = cursor.value();
 
-        let (owned, comments) = to_owned_with_comments(&value, Some(&cursor));
+        let (owned, comments) = to_owned_with_comments(&value, Some(&cursor)).unwrap();
         assert_eq!(
             owned,
             OwnedValue::Object(IndexMap::from([("a".to_string(), OwnedValue::Int(1))]))
@@ -7940,7 +8282,7 @@ mod tests {
 
         let expr = crate::jq::parse(".foo | line").unwrap();
         let result = eval_with_cursor(&expr, doc_cursor);
-        assert_eq!(result.into_owned().unwrap(), OwnedValue::Int(2));
+        assert_eq!(result.into_owned().unwrap().unwrap(), OwnedValue::Int(2));
     }
 
     #[test]
@@ -7957,7 +8299,7 @@ mod tests {
         let expr = crate::jq::parse(".[] | line").unwrap();
         let result = eval_with_cursor(&expr, doc_cursor);
         assert_eq!(
-            result.into_owned().unwrap(),
+            result.into_owned().unwrap().unwrap(),
             OwnedValue::Array(vec![
                 OwnedValue::Int(1),
                 OwnedValue::Int(2),
@@ -7981,7 +8323,7 @@ mod tests {
         let expr = crate::jq::parse(".[] | line").unwrap();
         let result = eval_with_cursor(&expr, doc_cursor);
         assert_eq!(
-            result.into_owned().unwrap(),
+            result.into_owned().unwrap().unwrap(),
             OwnedValue::Array(vec![
                 OwnedValue::Int(1),
                 OwnedValue::Int(2),
@@ -8009,13 +8351,16 @@ mod tests {
 
         let expr = crate::jq::parse("keys_unsorted | length").unwrap();
         assert_eq!(
-            eval_with_cursor(&expr, doc_cursor).into_owned().unwrap(),
+            eval_with_cursor(&expr, doc_cursor)
+                .into_owned()
+                .unwrap()
+                .unwrap(),
             OwnedValue::Int(3)
         );
 
         let expr = crate::jq::parse("keys_unsorted | .[]").unwrap();
         assert_eq!(
-            eval_with_cursor(&expr, doc_cursor).collect_owned(),
+            eval_with_cursor(&expr, doc_cursor).collect_owned().unwrap(),
             vec![
                 OwnedValue::String("b".to_string()),
                 OwnedValue::String("a".to_string()),
@@ -8025,19 +8370,28 @@ mod tests {
 
         let expr = crate::jq::parse("keys_unsorted | .[0]").unwrap();
         assert_eq!(
-            eval_with_cursor(&expr, doc_cursor).into_owned().unwrap(),
+            eval_with_cursor(&expr, doc_cursor)
+                .into_owned()
+                .unwrap()
+                .unwrap(),
             OwnedValue::String("b".to_string())
         );
 
         let expr = crate::jq::parse("keys_unsorted | first").unwrap();
         assert_eq!(
-            eval_with_cursor(&expr, doc_cursor).into_owned().unwrap(),
+            eval_with_cursor(&expr, doc_cursor)
+                .into_owned()
+                .unwrap()
+                .unwrap(),
             OwnedValue::String("b".to_string())
         );
 
         let expr = crate::jq::parse("keys_unsorted | last").unwrap();
         assert_eq!(
-            eval_with_cursor(&expr, doc_cursor).into_owned().unwrap(),
+            eval_with_cursor(&expr, doc_cursor)
+                .into_owned()
+                .unwrap()
+                .unwrap(),
             OwnedValue::String("c".to_string())
         );
     }
@@ -8058,7 +8412,10 @@ mod tests {
 
         let expr = crate::jq::parse("keys | length").unwrap();
         assert_eq!(
-            eval_with_cursor(&expr, doc_cursor).into_owned().unwrap(),
+            eval_with_cursor(&expr, doc_cursor)
+                .into_owned()
+                .unwrap()
+                .unwrap(),
             OwnedValue::Int(3)
         );
 
@@ -8066,7 +8423,10 @@ mod tests {
         // still be fully sorted (`a,b,c`), not document order (`b,a,c`).
         let expr = crate::jq::parse("keys").unwrap();
         assert_eq!(
-            eval_with_cursor(&expr, doc_cursor).into_owned().unwrap(),
+            eval_with_cursor(&expr, doc_cursor)
+                .into_owned()
+                .unwrap()
+                .unwrap(),
             OwnedValue::Array(vec![
                 OwnedValue::String("a".to_string()),
                 OwnedValue::String("b".to_string()),
@@ -8076,13 +8436,19 @@ mod tests {
 
         let expr = crate::jq::parse("keys | first").unwrap();
         assert_eq!(
-            eval_with_cursor(&expr, doc_cursor).into_owned().unwrap(),
+            eval_with_cursor(&expr, doc_cursor)
+                .into_owned()
+                .unwrap()
+                .unwrap(),
             OwnedValue::String("a".to_string())
         );
 
         let expr = crate::jq::parse("keys | last").unwrap();
         assert_eq!(
-            eval_with_cursor(&expr, doc_cursor).into_owned().unwrap(),
+            eval_with_cursor(&expr, doc_cursor)
+                .into_owned()
+                .unwrap()
+                .unwrap(),
             OwnedValue::String("c".to_string())
         );
     }
@@ -8103,31 +8469,43 @@ mod tests {
 
         let expr = crate::jq::parse("keys_unsorted | length").unwrap();
         assert_eq!(
-            eval_with_cursor(&expr, doc_cursor).into_owned().unwrap(),
+            eval_with_cursor(&expr, doc_cursor)
+                .into_owned()
+                .unwrap()
+                .unwrap(),
             OwnedValue::Int(3)
         );
 
         let expr = crate::jq::parse("keys_unsorted | .[]").unwrap();
         assert_eq!(
-            eval_with_cursor(&expr, doc_cursor).collect_owned(),
+            eval_with_cursor(&expr, doc_cursor).collect_owned().unwrap(),
             vec![OwnedValue::Int(0), OwnedValue::Int(1), OwnedValue::Int(2)]
         );
 
         let expr = crate::jq::parse("keys_unsorted | .[0]").unwrap();
         assert_eq!(
-            eval_with_cursor(&expr, doc_cursor).into_owned().unwrap(),
+            eval_with_cursor(&expr, doc_cursor)
+                .into_owned()
+                .unwrap()
+                .unwrap(),
             OwnedValue::Int(0)
         );
 
         let expr = crate::jq::parse("keys_unsorted | first").unwrap();
         assert_eq!(
-            eval_with_cursor(&expr, doc_cursor).into_owned().unwrap(),
+            eval_with_cursor(&expr, doc_cursor)
+                .into_owned()
+                .unwrap()
+                .unwrap(),
             OwnedValue::Int(0)
         );
 
         let expr = crate::jq::parse("keys_unsorted | last").unwrap();
         assert_eq!(
-            eval_with_cursor(&expr, doc_cursor).into_owned().unwrap(),
+            eval_with_cursor(&expr, doc_cursor)
+                .into_owned()
+                .unwrap()
+                .unwrap(),
             OwnedValue::Int(2)
         );
     }
@@ -8233,7 +8611,7 @@ mod tests {
         let result = eval_with_cursor(&expr, doc_cursor);
         assert!(matches!(result, GenericResult::LazySeq(_)));
         assert_eq!(
-            result.into_owned().unwrap(),
+            result.into_owned().unwrap().unwrap(),
             OwnedValue::Array(vec![
                 OwnedValue::String("B".to_string()),
                 OwnedValue::String("A".to_string()),
@@ -8257,7 +8635,7 @@ mod tests {
         let result = eval_with_cursor(&expr, doc_cursor);
         assert!(matches!(result, GenericResult::LazySeq(_)));
         assert_eq!(
-            result.into_owned().unwrap(),
+            result.into_owned().unwrap().unwrap(),
             OwnedValue::Array(vec![
                 OwnedValue::Int(0),
                 OwnedValue::Int(10),
@@ -8286,7 +8664,7 @@ mod tests {
         let result = eval_with_cursor(&expr, doc_cursor);
         assert!(matches!(result, GenericResult::LazySeq(_)));
         assert_eq!(
-            result.into_owned().unwrap(),
+            result.into_owned().unwrap().unwrap(),
             OwnedValue::Array(vec![
                 OwnedValue::String("B".to_string()),
                 OwnedValue::String("A".to_string()),
@@ -8312,7 +8690,7 @@ mod tests {
         let result = eval_with_cursor(&expr, doc_cursor);
         assert!(matches!(result, GenericResult::LazySeq(_)));
         assert_eq!(
-            result.into_owned().unwrap(),
+            result.into_owned().unwrap().unwrap(),
             OwnedValue::Array(vec![
                 OwnedValue::Int(2),
                 OwnedValue::Int(4),
@@ -8335,7 +8713,7 @@ mod tests {
         let expr = crate::jq::parse(".[] | select(. > 1) | line").unwrap();
         let result = eval_with_cursor(&expr, doc_cursor);
         assert_eq!(
-            result.into_owned().unwrap(),
+            result.into_owned().unwrap().unwrap(),
             OwnedValue::Array(vec![OwnedValue::Int(2), OwnedValue::Int(3)])
         );
     }
@@ -8359,7 +8737,7 @@ mod tests {
         let expr = crate::jq::parse(".containers[].image | line").unwrap();
         let result = eval_with_cursor(&expr, doc_cursor);
         assert_eq!(
-            result.into_owned().unwrap(),
+            result.into_owned().unwrap().unwrap(),
             OwnedValue::Array(vec![OwnedValue::Int(2), OwnedValue::Int(3)])
         );
     }
@@ -8377,7 +8755,7 @@ mod tests {
 
         let expr = crate::jq::parse(". | line").unwrap();
         let result = eval_with_cursor(&expr, doc_cursor);
-        assert_eq!(result.into_owned().unwrap(), OwnedValue::Int(1));
+        assert_eq!(result.into_owned().unwrap().unwrap(), OwnedValue::Int(1));
     }
 
     #[test]
@@ -8402,7 +8780,7 @@ mod tests {
         ]);
 
         let result = eval(&expr, value);
-        let owned = result.into_owned().unwrap();
+        let owned = result.into_owned().unwrap().unwrap();
 
         assert_eq!(owned, OwnedValue::String("Alice".to_string()));
     }
@@ -8422,7 +8800,7 @@ mod tests {
 
         // Use eval_with_cursor to preserve position metadata
         let result = eval_with_cursor(&Expr::Builtin(Builtin::DocumentIndex), mapping_cursor);
-        let owned = result.into_owned().unwrap();
+        let owned = result.into_owned().unwrap().unwrap();
 
         // Single document = index 0
         assert_eq!(owned, OwnedValue::Int(0));
@@ -8443,13 +8821,13 @@ mod tests {
 
         // Test document_index for each document
         let result1 = eval_with_cursor(&Expr::Builtin(Builtin::DocumentIndex), doc1);
-        assert_eq!(result1.into_owned().unwrap(), OwnedValue::Int(0));
+        assert_eq!(result1.into_owned().unwrap().unwrap(), OwnedValue::Int(0));
 
         let result2 = eval_with_cursor(&Expr::Builtin(Builtin::DocumentIndex), doc2);
-        assert_eq!(result2.into_owned().unwrap(), OwnedValue::Int(1));
+        assert_eq!(result2.into_owned().unwrap().unwrap(), OwnedValue::Int(1));
 
         let result3 = eval_with_cursor(&Expr::Builtin(Builtin::DocumentIndex), doc3);
-        assert_eq!(result3.into_owned().unwrap(), OwnedValue::Int(2));
+        assert_eq!(result3.into_owned().unwrap().unwrap(), OwnedValue::Int(2));
     }
 
     #[test]
@@ -8475,11 +8853,11 @@ mod tests {
         // Even from a child node, document_index returns the document's index
         if let Some(cursor) = name_value {
             let result = eval_with_cursor(&Expr::Builtin(Builtin::DocumentIndex), cursor);
-            assert_eq!(result.into_owned().unwrap(), OwnedValue::Int(1));
+            assert_eq!(result.into_owned().unwrap().unwrap(), OwnedValue::Int(1));
         } else {
             // Just test the doc directly
             let result = eval_with_cursor(&Expr::Builtin(Builtin::DocumentIndex), doc2);
-            assert_eq!(result.into_owned().unwrap(), OwnedValue::Int(1));
+            assert_eq!(result.into_owned().unwrap().unwrap(), OwnedValue::Int(1));
         }
     }
 
@@ -8498,7 +8876,7 @@ mod tests {
         // Parse 'di' and verify it works the same as document_index
         let expr = crate::jq::parse("di").unwrap();
         let result = eval_with_cursor(&expr, mapping_cursor);
-        assert_eq!(result.into_owned().unwrap(), OwnedValue::Int(0));
+        assert_eq!(result.into_owned().unwrap().unwrap(), OwnedValue::Int(0));
     }
 
     #[test]
@@ -8520,13 +8898,13 @@ mod tests {
             while let Some((cursor, rest)) = docs.uncons_cursor() {
                 let result = eval_with_cursor(&expr, cursor);
                 match result {
-                    GenericResult::One(v) => results.push(to_owned(&v)),
+                    GenericResult::One(v) => results.push(to_owned(&v).unwrap()),
                     // `select`'s truthy branch now forwards the cursor it
                     // was given (needed for `line`/`column` to survive a
                     // `select(...)`), so a match here is `OneCursor`, not
                     // `One` — see the `Builtin::Select` cursor-forwarding
                     // fix in `eval_builtin`.
-                    GenericResult::OneCursor(c) => results.push(to_owned_cursor(&c)),
+                    GenericResult::OneCursor(c) => results.push(to_owned_cursor(&c).unwrap()),
                     GenericResult::Owned(o) => results.push(o),
                     GenericResult::None => {} // Filtered out
                     _ => {}
@@ -8593,7 +8971,7 @@ mod tests {
 
         let result = eval_with_cursor(&expr, index.root(json));
         assert_eq!(
-            result.collect_owned(),
+            result.collect_owned().unwrap(),
             vec![
                 OwnedValue::Array(vec![
                     OwnedValue::Bool(true),
@@ -8620,19 +8998,19 @@ mod tests {
         // at_offset(0) should return the root object
         let expr = crate::jq::parse("at_offset(0)").unwrap();
         let result = eval_with_cursor(&expr, cursor);
-        let owned = result.into_owned().unwrap();
+        let owned = result.into_owned().unwrap().unwrap();
         assert!(matches!(owned, OwnedValue::Object(_)));
 
         // at_offset(10) should be inside the "Alice" string (offset 10 = 'l' in "Alice")
         let expr = crate::jq::parse("at_offset(10)").unwrap();
         let result = eval_with_cursor(&expr, cursor);
-        let owned = result.into_owned().unwrap();
+        let owned = result.into_owned().unwrap().unwrap();
         assert!(matches!(owned, OwnedValue::String(ref s) if s == "Alice"));
 
         // at_offset(27) should be the age number (30)
         let expr = crate::jq::parse("at_offset(27)").unwrap();
         let result = eval_with_cursor(&expr, cursor);
-        let owned = result.into_owned().unwrap();
+        let owned = result.into_owned().unwrap().unwrap();
         assert_eq!(owned, OwnedValue::Int(30));
     }
 
@@ -8649,13 +9027,13 @@ mod tests {
         // at_position(1; 1) should return the root object
         let expr = crate::jq::parse("at_position(1; 1)").unwrap();
         let result = eval_with_cursor(&expr, cursor);
-        let owned = result.into_owned().unwrap();
+        let owned = result.into_owned().unwrap().unwrap();
         assert!(matches!(owned, OwnedValue::Object(_)));
 
         // at_position(2; 3) should be the "name" key (line 2, col 3 = start of "name")
         let expr = crate::jq::parse("at_position(2; 3)").unwrap();
         let result = eval_with_cursor(&expr, cursor);
-        let owned = result.into_owned().unwrap();
+        let owned = result.into_owned().unwrap().unwrap();
         assert!(matches!(owned, OwnedValue::String(ref s) if s == "name"));
     }
 
@@ -8673,16 +9051,28 @@ mod tests {
         let via_getpath = crate::jq::parse(r#"at_offset(getpath(["n"]))"#).unwrap();
         let via_literal = crate::jq::parse("at_offset(2)").unwrap();
         assert_eq!(
-            eval_with_cursor(&via_getpath, cursor).into_owned().unwrap(),
-            eval_with_cursor(&via_literal, cursor).into_owned().unwrap(),
+            eval_with_cursor(&via_getpath, cursor)
+                .into_owned()
+                .unwrap()
+                .unwrap(),
+            eval_with_cursor(&via_literal, cursor)
+                .into_owned()
+                .unwrap()
+                .unwrap(),
         );
 
         let via_getpath =
             crate::jq::parse(r#"at_position(getpath(["l"]); getpath(["c"]))"#).unwrap();
         let via_literal = crate::jq::parse("at_position(1; 1)").unwrap();
         assert_eq!(
-            eval_with_cursor(&via_getpath, cursor).into_owned().unwrap(),
-            eval_with_cursor(&via_literal, cursor).into_owned().unwrap(),
+            eval_with_cursor(&via_getpath, cursor)
+                .into_owned()
+                .unwrap()
+                .unwrap(),
+            eval_with_cursor(&via_literal, cursor)
+                .into_owned()
+                .unwrap()
+                .unwrap(),
         );
     }
 
@@ -8724,7 +9114,7 @@ mod tests {
         // The "users" array starts at offset 10 (the '[' character)
         let expr = crate::jq::parse("at_offset(10) | .[0].name").unwrap();
         let result = eval_with_cursor(&expr, cursor);
-        let owned = result.into_owned().unwrap();
+        let owned = result.into_owned().unwrap().unwrap();
         assert!(matches!(owned, OwnedValue::String(ref s) if s == "Alice"));
     }
 
@@ -8916,8 +9306,10 @@ mod tests {
             .is_some_and(|e| e.message.contains("not in label")));
 
         // into_owned consumes; check the owned-family variants.
-        let owned: Vec<Option<OwnedValue>> =
-            results.into_iter().map(GenericResult::into_owned).collect();
+        let owned: Vec<Option<OwnedValue>> = results
+            .into_iter()
+            .map(|r| r.into_owned().unwrap())
+            .collect();
         assert_eq!(owned[2], Some(OwnedValue::Int(5))); // Owned
         assert_eq!(
             owned[3],
@@ -8973,7 +9365,7 @@ mod tests {
         ];
         let collected: Vec<Vec<OwnedValue>> = results
             .into_iter()
-            .map(GenericResult::collect_owned)
+            .map(|r| r.collect_owned().unwrap())
             .collect();
         assert_eq!(collected[0].len(), 3); // Many -> 3 elements
         assert_eq!(collected[1], vec![OwnedValue::Int(9)]); // ManyOwned
@@ -9007,7 +9399,7 @@ mod tests {
             .unwrap();
 
         let result2 = eval_with_cursor(&expr, index.root(json));
-        assert_eq!(result2.collect_owned(), vec![OwnedValue::Int(1)]);
+        assert_eq!(result2.collect_owned().unwrap(), vec![OwnedValue::Int(1)]);
     }
 
     #[test]
@@ -9083,10 +9475,13 @@ mod tests {
         let index = JsonIndex::build(json);
 
         let jq_result = eval_using::<JqSemantics, _>(&expr, index.root(json).value());
-        assert_eq!(jq_result.into_owned(), Some(OwnedValue::Int(1)));
+        assert_eq!(jq_result.into_owned().unwrap(), Some(OwnedValue::Int(1)));
 
         let yq_result = eval_using::<YqSemantics, _>(&expr, index.root(json).value());
-        assert_eq!(yq_result.into_owned(), Some(OwnedValue::Float(1.5)));
+        assert_eq!(
+            yq_result.into_owned().unwrap(),
+            Some(OwnedValue::Float(1.5))
+        );
     }
 
     #[test]
@@ -9110,7 +9505,10 @@ mod tests {
         let expr = crate::jq::parse(".[(1-1):(1+0)]").unwrap();
 
         let result = eval_using::<YqSemantics, _>(&expr, index.root(json).value());
-        assert_eq!(result.into_owned(), Some(OwnedValue::Array(Vec::new())));
+        assert_eq!(
+            result.into_owned().unwrap(),
+            Some(OwnedValue::Array(Vec::new()))
+        );
     }
 
     // Coverage follow-ups for #532: the tests above exercise the common
@@ -9134,7 +9532,7 @@ mod tests {
 
         let result = eval_with_cursor(&expr, index.root(json));
         assert_eq!(
-            result.collect_owned(),
+            result.collect_owned().unwrap(),
             vec![
                 OwnedValue::Int(1),
                 OwnedValue::Int(2),
@@ -9202,7 +9600,7 @@ mod tests {
         let result = eval_with_cursor(&expr, index.root(json));
         assert!(matches!(result, GenericResult::ManyCursor(_)));
         assert_eq!(
-            result.collect_owned(),
+            result.collect_owned().unwrap(),
             vec![OwnedValue::Int(1), OwnedValue::Int(2)]
         );
     }
@@ -9304,7 +9702,7 @@ mod tests {
         let first = eval(&crate::jq::parse("first(.)").unwrap(), value.clone());
         assert!(matches!(first, GenericResult::One(_)));
         assert_eq!(
-            first.collect_owned(),
+            first.collect_owned().unwrap(),
             vec![OwnedValue::Object(
                 core::iter::once(("a".to_string(), OwnedValue::Int(1))).collect()
             )]
@@ -9351,11 +9749,11 @@ mod tests {
             value.clone(),
         );
         assert!(matches!(first, GenericResult::One(_)));
-        assert_eq!(first.collect_owned(), vec![OwnedValue::Int(1)]);
+        assert_eq!(first.collect_owned().unwrap(), vec![OwnedValue::Int(1)]);
 
         let last = eval(&crate::jq::parse("last(select(true,true))").unwrap(), value);
         assert!(matches!(last, GenericResult::One(_)));
-        assert_eq!(last.collect_owned(), vec![OwnedValue::Int(1)]);
+        assert_eq!(last.collect_owned().unwrap(), vec![OwnedValue::Int(1)]);
     }
 
     // `GenericResult::stream_json`/`stream_yaml`'s `Self::One`/`Self::Many`
@@ -9619,7 +10017,7 @@ mod tests {
         );
         // `length` of the integer `1` is its absolute value, `1`.
         assert_eq!(
-            result.collect_owned(),
+            result.collect_owned().unwrap(),
             vec![OwnedValue::Int(1), OwnedValue::Int(1)]
         );
     }
@@ -9638,7 +10036,7 @@ mod tests {
         let result = eval(&crate::jq::parse("select(true,true)").unwrap(), value);
         assert!(matches!(result, GenericResult::Many(_)));
         assert_eq!(
-            result.collect_owned(),
+            result.collect_owned().unwrap(),
             vec![OwnedValue::Int(1), OwnedValue::Int(1)]
         );
     }
@@ -9660,7 +10058,7 @@ mod tests {
 
         let one = eval(&crate::jq::parse(".[(1-1):(1+1)]").unwrap(), value.clone());
         assert_eq!(
-            one.collect_owned(),
+            one.collect_owned().unwrap(),
             vec![OwnedValue::Array(vec![
                 OwnedValue::Int(1),
                 OwnedValue::Int(2)
@@ -9672,7 +10070,7 @@ mod tests {
             value,
         );
         assert_eq!(
-            many.collect_owned(),
+            many.collect_owned().unwrap(),
             vec![
                 OwnedValue::Array(vec![OwnedValue::Int(1), OwnedValue::Int(2)]),
                 OwnedValue::Array(vec![OwnedValue::Int(1), OwnedValue::Int(2)]),
@@ -9692,7 +10090,7 @@ mod tests {
 
         let result = eval_with_cursor(&expr, index.root(json));
         assert_eq!(
-            result.collect_owned(),
+            result.collect_owned().unwrap(),
             vec![
                 OwnedValue::Int(1),
                 OwnedValue::Null,
@@ -9717,7 +10115,7 @@ mod tests {
 
         let result = eval_with_cursor(&expr, index.root(json));
         assert_eq!(
-            result.collect_owned(),
+            result.collect_owned().unwrap(),
             vec![OwnedValue::Array(vec![
                 OwnedValue::Int(2),
                 OwnedValue::Int(3)
@@ -9738,7 +10136,7 @@ mod tests {
 
         let result = eval_with_cursor(&expr, index.root(json));
         assert_eq!(
-            result.collect_owned(),
+            result.collect_owned().unwrap(),
             vec![
                 OwnedValue::Array(vec![OwnedValue::Int(1), OwnedValue::Int(2)]),
                 OwnedValue::Array(vec![OwnedValue::Int(20), OwnedValue::Int(30)]),
@@ -9759,7 +10157,7 @@ mod tests {
 
         let result = eval_with_cursor(&expr, index.root(json));
         assert_eq!(
-            result.collect_owned(),
+            result.collect_owned().unwrap(),
             vec![OwnedValue::Array(vec![
                 OwnedValue::Int(2),
                 OwnedValue::Int(3)
@@ -9778,7 +10176,7 @@ mod tests {
 
         let result = eval_with_cursor(&expr, index.root(json));
         assert!(!result.is_error());
-        assert_eq!(result.collect_owned(), Vec::<OwnedValue>::new());
+        assert_eq!(result.collect_owned().unwrap(), Vec::<OwnedValue>::new());
     }
 
     #[test]
@@ -9792,7 +10190,7 @@ mod tests {
 
         let result = eval_with_cursor(&expr, index.root(json));
         assert!(!result.is_error());
-        assert_eq!(result.collect_owned(), Vec::<OwnedValue>::new());
+        assert_eq!(result.collect_owned().unwrap(), Vec::<OwnedValue>::new());
     }
 
     #[test]
@@ -9806,7 +10204,7 @@ mod tests {
 
         let result = eval_with_cursor(&expr, index.root(json));
         assert!(!result.is_error());
-        assert_eq!(result.collect_owned(), Vec::<OwnedValue>::new());
+        assert_eq!(result.collect_owned().unwrap(), Vec::<OwnedValue>::new());
     }
 
     #[test]
@@ -9865,7 +10263,9 @@ mod tests {
 
         let expr = crate::jq::parse(".a[:.k2]").unwrap();
         assert_eq!(
-            eval_with_cursor(&expr, index.root(json)).collect_owned(),
+            eval_with_cursor(&expr, index.root(json))
+                .collect_owned()
+                .unwrap(),
             vec![OwnedValue::Array(vec![
                 OwnedValue::Int(1),
                 OwnedValue::Int(2),
@@ -9875,7 +10275,9 @@ mod tests {
 
         let expr = crate::jq::parse(".a[.k1:]").unwrap();
         assert_eq!(
-            eval_with_cursor(&expr, index.root(json)).collect_owned(),
+            eval_with_cursor(&expr, index.root(json))
+                .collect_owned()
+                .unwrap(),
             vec![OwnedValue::Array(vec![
                 OwnedValue::Int(2),
                 OwnedValue::Int(3),
@@ -9905,7 +10307,7 @@ mod tests {
         let expr = crate::jq::parse("(empty)[(0+0):2]").unwrap();
         let result = eval_with_cursor(&expr, index.root(json));
         assert!(!result.is_error());
-        assert_eq!(result.collect_owned(), Vec::<OwnedValue>::new());
+        assert_eq!(result.collect_owned().unwrap(), Vec::<OwnedValue>::new());
     }
 
     #[test]
@@ -9919,7 +10321,7 @@ mod tests {
 
         let result = eval_with_cursor(&expr, index.root(json));
         assert_eq!(
-            result.collect_owned(),
+            result.collect_owned().unwrap(),
             vec![OwnedValue::Array(vec![
                 OwnedValue::Int(1),
                 OwnedValue::Int(2)
@@ -9957,7 +10359,7 @@ mod tests {
 
         let result = eval_with_cursor(&expr, index.root(json));
         assert_eq!(
-            result.collect_owned(),
+            result.collect_owned().unwrap(),
             vec![
                 OwnedValue::Array(vec![OwnedValue::Int(1), OwnedValue::Int(2)]),
                 OwnedValue::Array(vec![OwnedValue::Int(4), OwnedValue::Int(5)]),
@@ -9979,7 +10381,7 @@ mod tests {
         let expr = crate::jq::parse("(1+1)[(0+0):2]?").unwrap();
         let result = eval_with_cursor(&expr, index.root(json));
         assert!(!result.is_error());
-        assert_eq!(result.collect_owned(), Vec::<OwnedValue>::new());
+        assert_eq!(result.collect_owned().unwrap(), Vec::<OwnedValue>::new());
     }
 
     #[test]
@@ -9991,7 +10393,7 @@ mod tests {
         let expr = crate::jq::parse(".a[.k1:.k2]").unwrap();
 
         let result = eval_with_cursor(&expr, index.root(json));
-        assert_eq!(result.collect_owned(), vec![OwnedValue::Null]);
+        assert_eq!(result.collect_owned().unwrap(), vec![OwnedValue::Null]);
     }
 
     #[test]
@@ -10004,7 +10406,7 @@ mod tests {
 
         let result = eval_with_cursor(&expr, index.root(json));
         assert_eq!(
-            result.collect_owned(),
+            result.collect_owned().unwrap(),
             vec![OwnedValue::String("el".to_string())]
         );
     }
@@ -10020,7 +10422,7 @@ mod tests {
 
         let result = eval_with_cursor(&expr, index.root(json));
         assert_eq!(
-            result.collect_owned(),
+            result.collect_owned().unwrap(),
             vec![OwnedValue::Int(10), OwnedValue::Int(20)]
         );
     }
@@ -10041,7 +10443,7 @@ mod tests {
 
         let result = eval_with_cursor(&expr, index.root(json));
         assert_eq!(
-            result.collect_owned(),
+            result.collect_owned().unwrap(),
             vec![OwnedValue::Bool(true), OwnedValue::Bool(false)]
         );
     }
@@ -10061,7 +10463,7 @@ mod tests {
 
         let result = eval_with_cursor(&expr, index.root(json));
         assert_eq!(
-            result.collect_owned(),
+            result.collect_owned().unwrap(),
             vec![OwnedValue::Bool(true), OwnedValue::Bool(false)]
         );
     }
@@ -10077,7 +10479,7 @@ mod tests {
         let expr = Expr::Builtin(Builtin::Select(Box::new(Expr::Identity)));
 
         let result = eval(&expr, index.root(json).value());
-        assert_eq!(result.into_owned(), Some(OwnedValue::Int(5)));
+        assert_eq!(result.into_owned().unwrap(), Some(OwnedValue::Int(5)));
     }
 
     #[test]
@@ -10089,7 +10491,7 @@ mod tests {
         let expr = Expr::Builtin(Builtin::Select(Box::new(Expr::Identity)));
 
         let result = eval_with_cursor(&expr, index.root(json));
-        assert_eq!(result.into_owned(), Some(OwnedValue::Int(5)));
+        assert_eq!(result.into_owned().unwrap(), Some(OwnedValue::Int(5)));
     }
 
     #[test]
@@ -10103,7 +10505,7 @@ mod tests {
 
         let result = eval_with_cursor(&expr, index.root(json));
         assert_eq!(
-            result.into_owned(),
+            result.into_owned().unwrap(),
             Some(OwnedValue::Array(vec![
                 OwnedValue::Int(1),
                 OwnedValue::Int(2)
@@ -10118,7 +10520,7 @@ mod tests {
         let expr = Expr::Builtin(Builtin::Scalars);
 
         let result = eval_with_cursor(&expr, index.root(json));
-        assert_eq!(result.into_owned(), Some(OwnedValue::Int(5)));
+        assert_eq!(result.into_owned().unwrap(), Some(OwnedValue::Int(5)));
     }
 
     #[test]
@@ -10132,7 +10534,7 @@ mod tests {
         let expr = crate::jq::parse(".foo | line").unwrap();
 
         let result = eval_with_cursor(&expr, index.root(json));
-        assert_eq!(result.into_owned(), Some(OwnedValue::Int(2)));
+        assert_eq!(result.into_owned().unwrap(), Some(OwnedValue::Int(2)));
     }
 
     #[test]
@@ -10144,7 +10546,7 @@ mod tests {
         let expr = crate::jq::parse(".foo | column").unwrap();
 
         let result = eval_with_cursor(&expr, index.root(json));
-        assert_eq!(result.into_owned(), Some(OwnedValue::Int(10)));
+        assert_eq!(result.into_owned().unwrap(), Some(OwnedValue::Int(10)));
     }
 
     /// A `GenericResult` reduced to the parts these tests assert on, so the
@@ -10175,7 +10577,7 @@ mod tests {
             GenericResult::Partial(vs, Control::Break(l)) => {
                 Summary::Partial(json_of(&vs), Box::new(Summary::Break(l)))
             }
-            other => Summary::Values(json_of(&other.collect_owned())),
+            other => Summary::Values(json_of(&other.collect_owned().unwrap())),
         }
     }
 
@@ -10357,13 +10759,13 @@ mod tests {
 
         let expr = crate::jq::parse("([10,20,30])[.]").unwrap();
         assert_eq!(
-            eval(&expr, value.clone()).collect_owned(),
+            eval(&expr, value.clone()).collect_owned().unwrap(),
             vec![OwnedValue::Int(10)]
         );
 
         let expr = crate::jq::parse("([10,20,30])[select(true,true)]").unwrap();
         assert_eq!(
-            eval(&expr, value).collect_owned(),
+            eval(&expr, value).collect_owned().unwrap(),
             vec![OwnedValue::Int(10), OwnedValue::Int(10)]
         );
     }
@@ -10381,7 +10783,7 @@ mod tests {
 
         let expr = crate::jq::parse("([10,20,30])[.:2]").unwrap();
         assert_eq!(
-            eval(&expr, value.clone()).collect_owned(),
+            eval(&expr, value.clone()).collect_owned().unwrap(),
             vec![OwnedValue::Array(vec![
                 OwnedValue::Int(10),
                 OwnedValue::Int(20)
@@ -10390,7 +10792,7 @@ mod tests {
 
         let expr = crate::jq::parse("([10,20,30])[select(true,true):2]").unwrap();
         assert_eq!(
-            eval(&expr, value).collect_owned(),
+            eval(&expr, value).collect_owned().unwrap(),
             vec![
                 OwnedValue::Array(vec![OwnedValue::Int(10), OwnedValue::Int(20)]),
                 OwnedValue::Array(vec![OwnedValue::Int(10), OwnedValue::Int(20)]),
@@ -10410,7 +10812,9 @@ mod tests {
         let expr = crate::jq::parse(".arr[.starts[]:3]").unwrap();
 
         assert_eq!(
-            eval_with_cursor(&expr, index.root(json)).collect_owned(),
+            eval_with_cursor(&expr, index.root(json))
+                .collect_owned()
+                .unwrap(),
             vec![
                 OwnedValue::Array(vec![
                     OwnedValue::Int(1),
@@ -10524,7 +10928,7 @@ mod tests {
         let result = eval_using::<YqSemantics, _>(&expr, value);
         assert!(matches!(result, GenericResult::LazySeq(_)));
         assert_eq!(
-            result.into_owned().unwrap(),
+            result.into_owned().unwrap().unwrap(),
             // yq keeps float modulo (1.5), unlike jq's truncating modulo (1).
             OwnedValue::Array(vec![OwnedValue::Float(1.5)])
         );
@@ -10543,7 +10947,7 @@ mod tests {
 
         let expr = crate::jq::parse("map(.)").unwrap();
         assert_eq!(
-            eval(&expr, value).into_owned().unwrap(),
+            eval(&expr, value).into_owned().unwrap().unwrap(),
             OwnedValue::Array(vec![
                 OwnedValue::Int(1),
                 OwnedValue::Int(2),
@@ -10565,7 +10969,7 @@ mod tests {
         let value = index.root(json).value();
         let expr = crate::jq::parse("map(keys_unsorted)").unwrap();
         assert_eq!(
-            eval(&expr, value).into_owned().unwrap(),
+            eval(&expr, value).into_owned().unwrap().unwrap(),
             OwnedValue::Array(vec![
                 OwnedValue::Array(vec![OwnedValue::String("a".to_string())]),
                 OwnedValue::Array(vec![
@@ -10581,7 +10985,7 @@ mod tests {
         let value = index.root(json).value();
         let expr = crate::jq::parse("map(keys_unsorted)").unwrap();
         assert_eq!(
-            eval(&expr, value).into_owned().unwrap(),
+            eval(&expr, value).into_owned().unwrap().unwrap(),
             OwnedValue::Array(vec![
                 OwnedValue::Array(vec![OwnedValue::Int(0), OwnedValue::Int(1)]),
                 OwnedValue::Array(vec![
@@ -10598,7 +11002,7 @@ mod tests {
         let value = index.root(json).value();
         let expr = crate::jq::parse("map(select(. > 1))").unwrap();
         assert_eq!(
-            eval(&expr, value).into_owned().unwrap(),
+            eval(&expr, value).into_owned().unwrap().unwrap(),
             OwnedValue::Array(vec![OwnedValue::Int(2), OwnedValue::Int(3)])
         );
 
@@ -10609,7 +11013,7 @@ mod tests {
         let value = index.root(json).value();
         let expr = crate::jq::parse("map(1, 2)").unwrap();
         assert_eq!(
-            eval(&expr, value).into_owned().unwrap(),
+            eval(&expr, value).into_owned().unwrap().unwrap(),
             OwnedValue::Array(vec![OwnedValue::Int(1), OwnedValue::Int(2)])
         );
 
@@ -10622,7 +11026,7 @@ mod tests {
         let value = index.root(json).value();
         let expr = crate::jq::parse("map(.[])").unwrap();
         assert_eq!(
-            eval(&expr, value).into_owned().unwrap(),
+            eval(&expr, value).into_owned().unwrap().unwrap(),
             OwnedValue::Array(vec![
                 OwnedValue::Int(1),
                 OwnedValue::Int(2),
@@ -10639,7 +11043,7 @@ mod tests {
         let value = index.root(json).value();
         let expr = crate::jq::parse("map(keys_unsorted | map(ascii_upcase))").unwrap();
         assert_eq!(
-            eval(&expr, value).into_owned().unwrap(),
+            eval(&expr, value).into_owned().unwrap().unwrap(),
             OwnedValue::Array(vec![
                 OwnedValue::Array(vec![OwnedValue::String("A".to_string())]),
                 OwnedValue::Array(vec![
@@ -10695,7 +11099,7 @@ mod tests {
 
         let expr = crate::jq::parse("select(map(. + 1))").unwrap();
         assert_eq!(
-            eval(&expr, value.clone()).into_owned().unwrap(),
+            eval(&expr, value.clone()).into_owned().unwrap().unwrap(),
             OwnedValue::Array(vec![OwnedValue::Int(1), OwnedValue::Int(2)])
         );
 
@@ -10733,7 +11137,7 @@ mod tests {
         let result = eval(&expr, value);
         assert!(matches!(result, GenericResult::ManyCursor(_)));
         assert_eq!(
-            result.collect_owned(),
+            result.collect_owned().unwrap(),
             vec![OwnedValue::Int(1), OwnedValue::Int(2), OwnedValue::Int(3)]
         );
     }
@@ -10754,7 +11158,7 @@ mod tests {
         let result = eval(&expr, value);
         assert!(!matches!(result, GenericResult::ManyCursor(_)));
         assert_eq!(
-            result.collect_owned(),
+            result.collect_owned().unwrap(),
             vec![OwnedValue::Int(1), OwnedValue::Null]
         );
     }
@@ -10776,7 +11180,7 @@ mod tests {
         let expr = crate::jq::parse("map(.foo) | .[]").unwrap();
         let result = eval(&expr, value);
         assert!(result.is_error());
-        assert_eq!(result.collect_owned(), Vec::<OwnedValue>::new());
+        assert_eq!(result.collect_owned().unwrap(), Vec::<OwnedValue>::new());
     }
 
     #[test]
@@ -10789,7 +11193,10 @@ mod tests {
         let index = JsonIndex::build(json);
         let value = index.root(json).value();
         let expr = crate::jq::parse("map(.) | first").unwrap();
-        assert_eq!(eval(&expr, value).into_owned().unwrap(), OwnedValue::Null);
+        assert_eq!(
+            eval(&expr, value).into_owned().unwrap().unwrap(),
+            OwnedValue::Null
+        );
 
         let json = br"[1,2,3]";
         let index = JsonIndex::build(json);
@@ -10797,7 +11204,7 @@ mod tests {
         let expr = crate::jq::parse("map(.) | first").unwrap();
         let result = eval(&expr, value);
         assert!(matches!(result, GenericResult::OneCursor(_)));
-        assert_eq!(result.into_owned().unwrap(), OwnedValue::Int(1));
+        assert_eq!(result.into_owned().unwrap().unwrap(), OwnedValue::Int(1));
 
         let json = br"[42]";
         let index = JsonIndex::build(json);
@@ -10828,7 +11235,7 @@ mod tests {
         let result = eval(&expr, value.clone());
         assert!(matches!(result, GenericResult::LazySeq(_)));
         assert_eq!(
-            result.into_owned().unwrap(),
+            result.into_owned().unwrap().unwrap(),
             OwnedValue::Array(vec![
                 OwnedValue::Int(2),
                 OwnedValue::Int(4),
@@ -10840,7 +11247,7 @@ mod tests {
         let result = eval(&expr, value);
         assert!(matches!(result, GenericResult::LazySeq(_)));
         assert_eq!(
-            result.into_owned().unwrap(),
+            result.into_owned().unwrap().unwrap(),
             OwnedValue::Array(vec![
                 OwnedValue::Int(2),
                 OwnedValue::Int(4),
@@ -11034,7 +11441,7 @@ mod tests {
             GenericResult::Halt(code) => assert_eq!(*code, 3),
             other => panic!("expected Halt(3), got {other:?}"),
         }
-        assert_eq!(result.into_owned(), None);
+        assert_eq!(result.into_owned().unwrap(), None);
     }
 
     #[test]
@@ -11067,7 +11474,7 @@ mod tests {
             "the halt is never reached, not swallowed after being reached: {result:?}"
         );
         assert_eq!(
-            result.collect_owned(),
+            result.collect_owned().unwrap(),
             vec![OwnedValue::String("a".to_string())]
         );
     }
@@ -11116,9 +11523,9 @@ mod tests {
         let index = JsonIndex::build(json.as_bytes());
         let cursor = index.root(json.as_bytes());
         // Under the limit: succeeds.
-        let owned = to_owned(&cursor.value());
+        let owned = to_owned(&cursor.value()).unwrap();
         assert!(matches!(owned, OwnedValue::Object(_)));
-        let owned = to_owned_cursor(&cursor);
+        let owned = to_owned_cursor(&cursor).unwrap();
         assert!(matches!(owned, OwnedValue::Object(_)));
 
         let json = linear_nest(256);
@@ -11297,7 +11704,7 @@ mod tests {
         let expr = crate::jq::parse("keys_unsorted | sort").unwrap();
         let result = eval(&expr, value);
         assert_eq!(
-            result.into_owned().unwrap(),
+            result.into_owned().unwrap().unwrap(),
             OwnedValue::Array(vec![
                 OwnedValue::String("a".to_string()),
                 OwnedValue::String("b".to_string()),
@@ -11318,7 +11725,7 @@ mod tests {
         let expr = crate::jq::parse("keys_unsorted | (.[0], .[1])").unwrap();
         let result = eval(&expr, value);
         assert_eq!(
-            result.collect_owned(),
+            result.collect_owned().unwrap(),
             vec![
                 OwnedValue::String("b".to_string()),
                 OwnedValue::String("a".to_string()),
@@ -11339,7 +11746,7 @@ mod tests {
         let value = cursor.value();
         let expr = crate::jq::parse("reduce .[] as $x (0; $x)").unwrap();
         let result = eval(&expr, value);
-        assert_eq!(result.into_owned().unwrap(), OwnedValue::Int(3));
+        assert_eq!(result.into_owned().unwrap().unwrap(), OwnedValue::Int(3));
     }
 
     /// #1192: the `Ok` (all-succeed) side of `eval_single`'s fallback
@@ -11354,7 +11761,7 @@ mod tests {
         let expr = crate::jq::parse(r#"foreach range(3) as $i (""; . + "x"; .)"#).unwrap();
         let result = eval(&expr, value);
         assert_eq!(
-            result.collect_owned(),
+            result.collect_owned().unwrap(),
             vec![
                 OwnedValue::String("x".to_string()),
                 OwnedValue::String("xx".to_string()),
@@ -11377,7 +11784,7 @@ mod tests {
         let expr = crate::jq::parse("keys_unsorted | .").unwrap();
         let result = eval(&expr, value);
         assert_eq!(
-            result.into_owned().unwrap(),
+            result.into_owned().unwrap().unwrap(),
             OwnedValue::Array(vec![
                 OwnedValue::String("b".to_string()),
                 OwnedValue::String("a".to_string()),

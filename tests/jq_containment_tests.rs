@@ -88,6 +88,7 @@ fn generic_outcome(json: &[u8], filter: &str) -> Result<Vec<String>, String> {
     }
     Ok(result
         .collect_owned()
+        .expect("materializes")
         .iter()
         .map(OwnedValue::to_json)
         .collect())
@@ -290,7 +291,7 @@ fn optional_suppresses_the_error() {
             "generic evaluator: optional {filter} should be suppressed"
         );
         assert!(
-            generic.collect_owned().is_empty(),
+            generic.collect_owned().expect("materializes").is_empty(),
             "generic evaluator: optional {filter} should yield nothing"
         );
     }

@@ -15,6 +15,8 @@ use alloc::borrow::Cow;
 #[cfg(not(test))]
 use alloc::boxed::Box;
 #[cfg(not(test))]
+use alloc::format;
+#[cfg(not(test))]
 use alloc::string::{String, ToString};
 #[cfg(not(test))]
 use alloc::vec::Vec;
@@ -26,7 +28,7 @@ use std::borrow::Cow;
 use crate::json::light::{JsonCursor, StandardJson};
 
 use super::document::{effective_len, DistinctKeyCursors};
-
+use super::error::EvalError;
 use super::escape::write_json_body_jq;
 use super::expr::Literal;
 use super::value::{assert_value_tree_depth, infinite_float_preview_text, OwnedValue};
@@ -422,16 +424,19 @@ impl<'a, W: Clone + AsRef<[u64]>> JqValue<'a, W> {
     ///
     /// This recursively materializes all nested values. Use sparingly -
     /// prefer keeping values as cursors when possible.
-    pub fn materialize(&self) -> OwnedValue {
+    /// `Err` when a string scalar in the tree cannot be decoded (#1247) --
+    /// it used to materialize as an empty string, silently replacing the
+    /// value with something that compares, sorts and prints as real data.
+    pub fn materialize(&self) -> Result<OwnedValue, EvalError> {
         self.materialize_at_depth(0)
     }
 
     /// Panics past [`MAX_VALUE_TREE_DEPTH`](super::value::MAX_VALUE_TREE_DEPTH)
     /// levels of nesting (#1021, following #1005's precedent).
-    fn materialize_at_depth(&self, depth: usize) -> OwnedValue {
+    fn materialize_at_depth(&self, depth: usize) -> Result<OwnedValue, EvalError> {
         assert_value_tree_depth(depth);
-        match self {
-            JqValue::Cursor(c) => cursor_to_owned(c),
+        Ok(match self {
+            JqValue::Cursor(c) => cursor_to_owned(c)?,
             JqValue::Null => OwnedValue::Null,
             JqValue::Bool(b) => OwnedValue::Bool(*b),
             JqValue::Int(n) => OwnedValue::Int(*n),
@@ -442,33 +447,34 @@ impl<'a, W: Clone + AsRef<[u64]>> JqValue<'a, W> {
             JqValue::Array(arr) => OwnedValue::Array(
                 arr.iter()
                     .map(|v| v.materialize_at_depth(depth + 1))
-                    .collect(),
+                    .collect::<Result<_, _>>()?,
             ),
             JqValue::Object(obj) => OwnedValue::Object(
                 obj.iter()
-                    .map(|(k, v)| (k.clone(), v.materialize_at_depth(depth + 1)))
-                    .collect(),
+                    .map(|(k, v)| Ok((k.clone(), v.materialize_at_depth(depth + 1)?)))
+                    .collect::<Result<_, EvalError>>()?,
             ),
             JqValue::LazyKeysArray { fields, collapse } => {
-                lazy_keys_array_to_owned(fields, *collapse)
+                lazy_keys_array_to_owned(fields, *collapse)?
             }
             JqValue::LazyIndexRange(len) => lazy_index_range_to_owned(*len),
-        }
+        })
     }
 
     /// Convert to OwnedValue, consuming self.
     ///
     /// More efficient than `materialize()` when you don't need to keep the original.
-    pub fn into_owned(self) -> OwnedValue {
+    /// `Err` for the same reason [`materialize`](Self::materialize) does.
+    pub fn into_owned(self) -> Result<OwnedValue, EvalError> {
         self.into_owned_at_depth(0)
     }
 
     /// Panics past [`MAX_VALUE_TREE_DEPTH`](super::value::MAX_VALUE_TREE_DEPTH)
     /// levels of nesting (#1021, following #1005's precedent).
-    fn into_owned_at_depth(self, depth: usize) -> OwnedValue {
+    fn into_owned_at_depth(self, depth: usize) -> Result<OwnedValue, EvalError> {
         assert_value_tree_depth(depth);
-        match self {
-            JqValue::Cursor(c) => cursor_to_owned(&c),
+        Ok(match self {
+            JqValue::Cursor(c) => cursor_to_owned(&c)?,
             JqValue::Null => OwnedValue::Null,
             JqValue::Bool(b) => OwnedValue::Bool(b),
             JqValue::Int(n) => OwnedValue::Int(n),
@@ -479,18 +485,18 @@ impl<'a, W: Clone + AsRef<[u64]>> JqValue<'a, W> {
             JqValue::Array(arr) => OwnedValue::Array(
                 arr.into_iter()
                     .map(|v| v.into_owned_at_depth(depth + 1))
-                    .collect(),
+                    .collect::<Result<_, _>>()?,
             ),
             JqValue::Object(obj) => OwnedValue::Object(
                 obj.into_iter()
-                    .map(|(k, v)| (k, v.into_owned_at_depth(depth + 1)))
-                    .collect(),
+                    .map(|(k, v)| Ok((k, v.into_owned_at_depth(depth + 1)?)))
+                    .collect::<Result<_, EvalError>>()?,
             ),
             JqValue::LazyKeysArray { fields, collapse } => {
-                lazy_keys_array_to_owned(&fields, collapse)
+                lazy_keys_array_to_owned(&fields, collapse)?
             }
             JqValue::LazyIndexRange(len) => lazy_index_range_to_owned(len),
-        }
+        })
     }
 
     // =========================================================================
@@ -538,8 +544,14 @@ impl<'a, W: Clone + AsRef<[u64]>> JqValue<'a, W> {
                     let s = core::str::from_utf8(bytes).map_err(|_| core::fmt::Error)?;
                     out.write_str(s)
                 } else {
-                    // Fallback: materialize and serialize
-                    let owned = cursor_to_owned(c);
+                    // Fallback: materialize and serialize. `write_json` has
+                    // only `core::fmt::Error` to report with, which carries
+                    // no message -- but this branch is unreachable for a
+                    // decode failure anyway: it needs a cursor with no raw
+                    // byte span, and every JSON string token has one. The
+                    // `?` is here so a future shape that *can* fail cannot
+                    // silently print a wrong value (#1247).
+                    let owned = cursor_to_owned(c).map_err(|_| core::fmt::Error)?;
                     out.write_str(&owned.to_json())
                 }
             }
@@ -669,16 +681,19 @@ impl<'a, W: Clone + AsRef<[u64]>> JqValue<'a, W> {
 fn lazy_keys_array_to_owned<W: Clone + AsRef<[u64]>>(
     fields: &crate::json::light::JsonFields<'_, W>,
     collapse: bool,
-) -> OwnedValue {
+) -> Result<OwnedValue, EvalError> {
     let mut keys = Vec::new();
     for (key, _) in DistinctKeyCursors::new(fields, collapse) {
         if let StandardJson::String(k) = key {
-            if let Ok(s) = k.as_str() {
-                keys.push(OwnedValue::String(s.into_owned()));
-            }
+            // An undecodable key used to vanish from `keys` entirely, so the
+            // array silently came back short (#1247).
+            let s = k
+                .as_str()
+                .map_err(|e| EvalError::new(format!("{e} in object key")))?;
+            keys.push(OwnedValue::String(s.into_owned()));
         }
     }
-    OwnedValue::Array(keys)
+    Ok(OwnedValue::Array(keys))
 }
 
 /// Materialize a `JqValue::LazyIndexRange` into the `[0, 1, ..., len-1]`
@@ -700,54 +715,61 @@ fn lazy_index_range_to_owned(len: usize) -> OwnedValue {
 /// reaching this function directly. Confirmed live: `succinctly jq -e
 /// '.[0]'` on a 200,000-level-deep document raw-stack-overflowed (SIGABRT)
 /// even after `to_owned_cursor`'s own guard existed.
-fn cursor_to_owned<W: Clone + AsRef<[u64]>>(cursor: &JsonCursor<'_, W>) -> OwnedValue {
+fn cursor_to_owned<W: Clone + AsRef<[u64]>>(
+    cursor: &JsonCursor<'_, W>,
+) -> Result<OwnedValue, EvalError> {
     cursor_to_owned_at_depth(cursor, 0)
 }
 
 fn cursor_to_owned_at_depth<W: Clone + AsRef<[u64]>>(
     cursor: &JsonCursor<'_, W>,
     depth: usize,
-) -> OwnedValue {
+) -> Result<OwnedValue, EvalError> {
     super::eval_generic::assert_nesting_depth(depth);
-    match cursor.value() {
+    Ok(match cursor.value() {
         StandardJson::Null => OwnedValue::Null,
         StandardJson::Bool(b) => OwnedValue::Bool(b),
         StandardJson::Number(n) => OwnedValue::from_number_bytes(n.raw_bytes()),
-        StandardJson::String(s) => {
-            // `.ok()`, not a `panic!` on `Err`: see `to_owned_at_depth`'s
-            // sibling `else` arm doc comment in eval_generic.rs (#1098) for
-            // why a stricter fix here was attempted and reverted.
-            if let Ok(cow) = s.as_str() {
-                OwnedValue::String(cow.into_owned())
-            } else {
-                OwnedValue::String(String::new())
-            }
-        }
+        StandardJson::String(s) => OwnedValue::String(
+            // Was an empty string, which silently replaced the real value
+            // (#1098, #1247) -- the sibling `to_owned_at_depth` in
+            // eval_generic.rs swallowed the same case as `null`. Both raise
+            // now, with the wording #1192 established.
+            s.as_str()
+                .map_err(|e| EvalError::new(format!("{e}")))?
+                .into_owned(),
+        ),
         StandardJson::Array(_) => {
             // Use cursor navigation to iterate children
             let items: Vec<OwnedValue> = cursor
                 .children()
                 .map(|child| cursor_to_owned_at_depth(&child, depth + 1))
-                .collect();
+                .collect::<Result<_, _>>()?;
             OwnedValue::Array(items)
         }
         StandardJson::Object(fields) => {
             let mut map = IndexMap::new();
             for field in fields {
+                // A key that isn't a `String` token at all is *structurally*
+                // malformed and still drops the field silently -- #1194's
+                // territory, unchanged here. A key that is a string but
+                // won't decode used to drop the field just as quietly; that
+                // half raises now (#1247).
                 if let StandardJson::String(key_str) = field.key() {
-                    if let Ok(cow) = key_str.as_str() {
-                        let value_cursor = field.value_cursor();
-                        map.insert(
-                            cow.into_owned(),
-                            cursor_to_owned_at_depth(&value_cursor, depth + 1),
-                        );
-                    }
+                    let cow = key_str
+                        .as_str()
+                        .map_err(|e| EvalError::new(format!("{e} in object key")))?;
+                    let value_cursor = field.value_cursor();
+                    map.insert(
+                        cow.into_owned(),
+                        cursor_to_owned_at_depth(&value_cursor, depth + 1)?,
+                    );
                 }
             }
             OwnedValue::Object(map)
         }
         StandardJson::Error(_) => OwnedValue::Null,
-    }
+    })
 }
 
 // ============================================================================
@@ -884,7 +906,7 @@ mod tests {
             JqValue::null(),
         ]);
 
-        let owned = arr.materialize();
+        let owned = arr.materialize().unwrap();
         match owned {
             OwnedValue::Array(items) => {
                 assert_eq!(items.len(), 3);
@@ -918,28 +940,55 @@ mod tests {
         assert_eq!(val.as_f64(), Some(1.5));
     }
 
-    /// #1098: sibling of `eval_generic::to_owned`'s own regression test --
-    /// `JsonIndex::build`'s semi-index scan finds string quote/escape
-    /// boundaries without decoding/validating what's between them, so
-    /// invalid UTF-8 inside a string span indexes fine and only degrades,
-    /// here to an empty string, once `materialize`/`into_owned` reaches
-    /// `JsonString::as_str()`. Pins the known, deliberate gap -- see
-    /// `cursor_to_owned_at_depth`'s own `String` arm doc comment for why a
-    /// stricter (panic) fix was attempted and reverted.
+    /// #1098/#1247: sibling of `eval_generic::to_owned`'s own regression
+    /// test -- `JsonIndex::build`'s semi-index scan finds string
+    /// quote/escape boundaries without decoding/validating what's between
+    /// them, so invalid UTF-8 inside a string span indexes fine and only
+    /// surfaces once `materialize`/`into_owned` reaches
+    /// `JsonString::as_str()`.
+    ///
+    /// This test used to assert the *degrade* -- an empty string, which is
+    /// worse than the `null` its `eval_generic` sibling produced, because
+    /// `""` is a perfectly ordinary value that compares, sorts and prints
+    /// as real data. #1247 made both raise instead.
     #[test]
-    fn test_materialize_degrades_to_empty_string_on_decode_failure_1098() {
+    fn test_materialize_errors_on_decode_failure_1247() {
         use crate::json::JsonIndex;
 
         let json: &[u8] = b"{\"a\": \"\xff\xfe\"}";
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let val = JqValue::from_cursor(cursor);
-        assert_eq!(
-            val.materialize(),
-            OwnedValue::Object(IndexMap::from([(
-                "a".to_string(),
-                OwnedValue::String(String::new())
-            )]))
+        let err = val
+            .materialize()
+            .expect_err("an undecodable string must not materialize");
+        assert!(
+            err.message.contains("invalid UTF-8"),
+            "message: {}",
+            err.message
+        );
+        // `into_owned` is a separate walk of the same tree; it must agree.
+        let val: JqValue<'_, Vec<u64>> = JqValue::from_cursor(index.root(json));
+        assert!(val.into_owned().is_err());
+    }
+
+    /// #1247: an undecodable *key* used to drop its whole field silently,
+    /// so the object simply came back smaller.
+    #[test]
+    fn test_materialize_errors_on_object_key_decode_failure_1247() {
+        use crate::json::JsonIndex;
+
+        let json: &[u8] = b"{\"\xff\xfe\": 1}";
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let val = JqValue::from_cursor(cursor);
+        let err = val
+            .materialize()
+            .expect_err("an undecodable key must not materialize");
+        assert!(
+            err.message.contains("in object key"),
+            "message: {}",
+            err.message
         );
     }
 
@@ -1021,7 +1070,7 @@ mod tests {
     fn test_jqvalue_array_into_owned() {
         let arr: JqValue<'_, Vec<u64>> = JqValue::Array(vec![JqValue::Int(1), JqValue::Int(2)]);
         assert_eq!(
-            arr.into_owned(),
+            arr.into_owned().unwrap(),
             OwnedValue::Array(vec![OwnedValue::Int(1), OwnedValue::Int(2)])
         );
     }
@@ -1044,10 +1093,10 @@ mod tests {
         // `format_number_jq_compat`) -- so both give jq's spelling.
         let via_materialize: JqValue<'_, Vec<u64>> = JqValue::from_owned(owned.clone());
         assert!(matches!(via_materialize, JqValue::NumberLiteral(_)));
-        assert_eq!(via_materialize.materialize().to_json(), "1E+100");
+        assert_eq!(via_materialize.materialize().unwrap().to_json(), "1E+100");
 
         let via_into_owned: JqValue<'_, Vec<u64>> = JqValue::from_owned(owned.clone());
-        assert_eq!(via_into_owned.into_owned().to_json(), "1E+100");
+        assert_eq!(via_into_owned.into_owned().unwrap().to_json(), "1E+100");
 
         // `write_json`/`to_json_string`, by contrast, is this module's
         // documented format-*preserving* serializer (see the module doc and
@@ -1085,13 +1134,13 @@ mod tests {
     #[test]
     fn test_jqvalue_raw_number_into_owned() {
         let raw: JqValue<'_, Vec<u64>> = JqValue::RawNumber(b"4e4");
-        assert_eq!(raw.into_owned().to_json(), "4E+4");
+        assert_eq!(raw.into_owned().unwrap().to_json(), "4E+4");
     }
 
     #[test]
     fn test_jqvalue_raw_number_materialize() {
         let raw: JqValue<'_, Vec<u64>> = JqValue::RawNumber(b"4e4");
-        assert_eq!(raw.materialize().to_json(), "4E+4");
+        assert_eq!(raw.materialize().unwrap().to_json(), "4E+4");
     }
 
     #[test]
@@ -1108,11 +1157,11 @@ mod tests {
     #[test]
     fn test_jqvalue_lazy_index_range_materialize_and_into_owned() {
         let empty: JqValue<'_, Vec<u64>> = JqValue::LazyIndexRange(0);
-        assert_eq!(empty.materialize(), OwnedValue::Array(vec![]));
+        assert_eq!(empty.materialize().unwrap(), OwnedValue::Array(vec![]));
 
         let three: JqValue<'_, Vec<u64>> = JqValue::LazyIndexRange(3);
         assert_eq!(
-            three.materialize(),
+            three.materialize().unwrap(),
             OwnedValue::Array(vec![
                 OwnedValue::Int(0),
                 OwnedValue::Int(1),
@@ -1122,7 +1171,7 @@ mod tests {
 
         let three: JqValue<'_, Vec<u64>> = JqValue::LazyIndexRange(3);
         assert_eq!(
-            three.into_owned(),
+            three.into_owned().unwrap(),
             OwnedValue::Array(vec![
                 OwnedValue::Int(0),
                 OwnedValue::Int(1),
@@ -1154,12 +1203,12 @@ mod tests {
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let materialize_val: JqValue<'_, Vec<u64>> = JqValue::from_cursor(cursor);
-        assert_eq!(materialize_val.materialize().to_json(), "1E+100");
+        assert_eq!(materialize_val.materialize().unwrap().to_json(), "1E+100");
 
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let into_owned_val: JqValue<'_, Vec<u64>> = JqValue::from_cursor(cursor);
-        assert_eq!(into_owned_val.into_owned().to_json(), "1E+100");
+        assert_eq!(into_owned_val.into_owned().unwrap().to_json(), "1E+100");
     }
 
     /// Sibling of the number test above, for `cursor_to_owned_at_depth`'s
@@ -1176,7 +1225,7 @@ mod tests {
         let cursor = index.root(json);
         let materialize_val: JqValue<'_, Vec<u64>> = JqValue::from_cursor(cursor);
         assert_eq!(
-            materialize_val.materialize(),
+            materialize_val.materialize().unwrap(),
             OwnedValue::String("hello".to_string())
         );
 
@@ -1184,7 +1233,7 @@ mod tests {
         let cursor = index.root(json);
         let into_owned_val: JqValue<'_, Vec<u64>> = JqValue::from_cursor(cursor);
         assert_eq!(
-            into_owned_val.into_owned(),
+            into_owned_val.into_owned().unwrap(),
             OwnedValue::String("hello".to_string())
         );
     }
@@ -1210,7 +1259,7 @@ mod tests {
         use crate::jq::value::MAX_VALUE_TREE_DEPTH;
 
         let under = linear_jqvalue_nest(MAX_VALUE_TREE_DEPTH - 1);
-        assert!(matches!(under.materialize(), OwnedValue::Array(_)));
+        assert!(matches!(under.materialize().unwrap(), OwnedValue::Array(_)));
 
         // The `Object` arm is a separate match arm from `Array`'s, with its
         // own recursive `.map()` closure -- exercise it too so both arms are
@@ -1220,10 +1269,14 @@ mod tests {
             "a".to_string(),
             JqValue::Array(vec![JqValue::Null]),
         )]));
-        assert!(matches!(nested_object.materialize(), OwnedValue::Object(_)));
+        assert!(matches!(
+            nested_object.materialize().unwrap(),
+            OwnedValue::Object(_)
+        ));
 
         let over = linear_jqvalue_nest(MAX_VALUE_TREE_DEPTH);
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| over.materialize()));
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| over.materialize().unwrap()));
         assert!(
             result.is_err(),
             "materialize should panic at MAX_VALUE_TREE_DEPTH"
@@ -1237,7 +1290,7 @@ mod tests {
         use crate::jq::value::MAX_VALUE_TREE_DEPTH;
 
         let under = linear_jqvalue_nest(MAX_VALUE_TREE_DEPTH - 1);
-        assert!(matches!(under.into_owned(), OwnedValue::Array(_)));
+        assert!(matches!(under.into_owned().unwrap(), OwnedValue::Array(_)));
 
         // Exercise the `Object` arm too -- see `materialize`'s sibling test
         // above for why.
@@ -1245,10 +1298,14 @@ mod tests {
             "a".to_string(),
             JqValue::Array(vec![JqValue::Null]),
         )]));
-        assert!(matches!(nested_object.into_owned(), OwnedValue::Object(_)));
+        assert!(matches!(
+            nested_object.into_owned().unwrap(),
+            OwnedValue::Object(_)
+        ));
 
         let over = linear_jqvalue_nest(MAX_VALUE_TREE_DEPTH);
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| over.into_owned()));
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| over.into_owned().unwrap()));
         assert!(
             result.is_err(),
             "into_owned should panic at MAX_VALUE_TREE_DEPTH"

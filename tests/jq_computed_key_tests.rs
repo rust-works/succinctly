@@ -66,6 +66,7 @@ fn generic(json: &[u8], filter: &str) -> Outcome {
         other => Outcome::Values(
             other
                 .collect_owned()
+                .expect("materializes")
                 .iter()
                 .map(OwnedValue::to_json)
                 .collect(),

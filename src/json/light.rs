@@ -1723,14 +1723,28 @@ pub enum JsonError {
     InvalidUnicodeEscape,
 }
 
+impl JsonError {
+    /// The human-readable reason, as a `&'static str`.
+    ///
+    /// Split out of [`Display`](core::fmt::Display) (which now defers to it)
+    /// so a caller that needs the text without allocating -- notably
+    /// [`DocumentValue::string_decode_error`](crate::jq::document::DocumentValue::string_decode_error),
+    /// which runs on a `no_std`-compatible path -- shares one definition with
+    /// the formatter rather than restating the four strings next to it.
+    #[must_use]
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::InvalidUtf8 => "invalid UTF-8 in string",
+            Self::InvalidNumber => "invalid number format",
+            Self::InvalidEscape => "invalid escape sequence in string",
+            Self::InvalidUnicodeEscape => "invalid unicode escape sequence",
+        }
+    }
+}
+
 impl core::fmt::Display for JsonError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::InvalidUtf8 => write!(f, "invalid UTF-8 in string"),
-            Self::InvalidNumber => write!(f, "invalid number format"),
-            Self::InvalidEscape => write!(f, "invalid escape sequence in string"),
-            Self::InvalidUnicodeEscape => write!(f, "invalid unicode escape sequence"),
-        }
+        f.write_str(self.message())
     }
 }
 
@@ -1974,6 +1988,13 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentValue for StandardJson<'a, W> {
                     Some(&raw[1..raw.len() - 1])
                 }
             }
+            _ => None,
+        }
+    }
+
+    fn string_decode_error(&self) -> Option<&'static str> {
+        match self {
+            StandardJson::String(s) => s.as_str().err().map(JsonError::message),
             _ => None,
         }
     }
