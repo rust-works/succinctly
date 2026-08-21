@@ -27,9 +27,9 @@ use super::document::{
 use super::eval::{
     apply_compare_op, collapse_vec, eval as full_eval, format_owned,
     index_one_owned as index_owned_by_key, literal_to_owned, needs_path_context,
-    numeric_key_to_index, owned_bound_to_i64, owned_to_string, slice_owned_value_read,
-    tonumber_from_str, Control, EvalError, EvalSemantics, EvalTag, JqSemantics, QueryResult,
-    YqSemantics,
+    numeric_key_to_index, owned_bound_to_i64, owned_to_string, slice_object_as_yq_children,
+    slice_owned_value_read, tonumber_from_str, Control, EvalError, EvalSemantics, EvalTag,
+    JqSemantics, QueryResult, YqSemantics,
 };
 use super::expr::{Builtin, Expr, FormatType};
 use super::slice::{slice_str, SliceBounds};
@@ -3633,6 +3633,19 @@ fn slice_one_generic<S: EvalSemantics, V: DocumentValue>(
         return GenericResult::Owned(OwnedValue::Array(
             items[range].iter().map(to_owned).collect(),
         ));
+    }
+    // yq's object AST-child-layout slicing rule (#1102) — mirrors
+    // `eval.rs`'s cursor-backed `Expr::Slice` arm for the same target type;
+    // see `slice::SliceBounds::resolve_object_children`'s doc comment for
+    // the full, oracle-verified rule. Materializes via `to_owned` since
+    // `DocumentFields` only exposes a cons-list walk (`uncons`), not the
+    // `IndexMap` `slice_object_as_yq_children` needs — same technique as
+    // `eval.rs`'s own arm, for the same reason.
+    if S::TAG == EvalTag::Yq && target.as_object().is_some() {
+        let OwnedValue::Object(map) = to_owned(&target) else {
+            unreachable!("target.as_object() just confirmed this materializes to an Object")
+        };
+        return GenericResult::Owned(slice_object_as_yq_children(&map, start, end));
     }
     // yq's empty-container slicing rule (#1065) — see
     // `is_yq_slice_empty_container_scalar`'s doc comment for the full

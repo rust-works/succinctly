@@ -14158,6 +14158,80 @@ fn test_object_slice_owned_target_1102() -> Result<()> {
     Ok(())
 }
 
+/// Found by review: `eval_generic.rs`'s own `slice_one_generic` (the yq
+/// CLI's native handler for `Expr::SliceExpr`, i.e. *computed*, non-literal
+/// slice bounds) never got the object arm -- only `eval.rs`'s cursor-backed
+/// `Expr::Slice` (literal bounds) and the shared `slice_owned_value_read`
+/// (used by both evaluators' `Targets::Owned` loop) did. Literal bounds
+/// (`.[0:2]`) worked; computed bounds (`.[.from:.to]`) on the exact same
+/// object still errored, an internal inconsistency independent of whether
+/// real yq's own slice syntax supports computed bounds identically --
+/// succinctly's own two syntactic forms of the same operation must behave
+/// the same way once their bounds resolve to the same values, matching
+/// #1065's own established precedent of testing both forms.
+#[test]
+fn test_object_slice_computed_bounds_1102() -> Result<()> {
+    let (out, code) = run_yq_stdin(
+        ".items[] | .data[.from:.to]",
+        r#"{"items":[{"data":{"a":1,"b":2,"c":3},"from":0,"to":2}]}"#,
+        &["-o", "json", "-I0"],
+    )?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), r#"["a",1]"#);
+    Ok(())
+}
+
+/// Found by review: `path(.[S:E])` on an object used to succeed (the new
+/// `slice_owned_value_read` arm) while the descriptor it returned was
+/// unusable by `getpath` (whose own hand-rolled slice-descriptor dispatch
+/// had no `Object` arm) -- a narrower regression than the pre-#1102
+/// all-or-nothing error, breaking `getpath(path(x)) == x` for an object
+/// target specifically. Fixed by giving `builtin_getpath` the matching
+/// `Object`+descriptor arm, read-only (matching #1102's own scope) --
+/// `setpath`/`delpaths` deliberately don't get the same treatment (#1157's
+/// write-side scope, not this one's).
+#[test]
+fn test_object_slice_getpath_path_round_trip_1102() -> Result<()> {
+    let (out, code) = run_yq_stdin(
+        "getpath(path(.[0:2]))",
+        r#"{"a":1,"b":2,"c":3}"#,
+        &["-o", "json", "-I0"],
+    )?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), r#"["a",1]"#);
+
+    // Same round trip via a computed-bound descriptor, not just a literal.
+    let (out, code) = run_yq_stdin(
+        "getpath(path(.[(1-1):(1+1)]))",
+        r#"{"a":1,"b":2,"c":3}"#,
+        &["-o", "json", "-I0"],
+    )?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), r#"["a",1]"#);
+    Ok(())
+}
+
+/// Known, deliberate gap: slicing an object with a genuine duplicate YAML
+/// key silently collapses it, the same root cause as this repo's other
+/// duplicate-mapping-key gaps (`OwnedValue::Object`'s `IndexMap`
+/// representation cannot hold two entries with the same key at all) --
+/// unlike those other surfaces, there's no cursor-preserving alternative
+/// available here, since slicing inherently needs to reorder/subset the
+/// entries, not just stream them. Real yq keeps both `a` entries (verified
+/// live against yq v4.53.3: `["a",1,"b",2,"a",3]`, 6 children); succinctly
+/// silently drops the first one during the materialization slicing needs.
+#[test]
+fn test_object_slice_duplicate_key_known_gap_1102() -> Result<()> {
+    let (out, code) = run_yq_stdin(".[0:6]", "a: 1\nb: 2\na: 3\n", &["-o", "json", "-I0"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(
+        out.trim(),
+        r#"["a",3,"b",2]"#,
+        "duplicate key collapse is the known gap -- real yq keeps both a entries"
+    );
+    Ok(())
+}
+
 /// jq mode must be entirely unaffected -- real jq has no object-slicing
 /// concept and keeps erroring, so the `S::TAG == EvalTag::Yq` gate can't
 /// silently rot.
@@ -14171,13 +14245,15 @@ fn test_object_slice_jq_mode_still_errors_1102() -> Result<()> {
 }
 
 /// Known, deliberate gap: real yq's slice result keeps the source node's
-/// `!!map` tag in YAML output (`{"a":1,"b":2} | yq '.[0:2]'` prints
-/// `!!map\n- "a"\n- 1` on real yq). `OwnedValue` has no tag slot (#1090's
-/// whole subject), so this isn't reachable here -- `-o=json` output (what
-/// every case above exercises, and every realistic use of this operator)
-/// is unaffected, since the tag doesn't appear in JSON. Pinned here so a
-/// future #1090 fix doesn't silently change this without the gap being
-/// deliberately revisited.
+/// `!!map` tag in YAML output, and keeps the extracted key double-quoted
+/// (`{"a":1,"b":2} | yq '.[0:2]'` prints `!!map\n- "a"\n- 1` on real yq).
+/// `OwnedValue` has no tag or style slot at all -- not specific to slicing,
+/// every computed/constructed value in this codebase has the same gap --
+/// so neither is reachable here -- `-o=json` output (what every case above
+/// exercises, and every realistic use of this operator) is unaffected,
+/// since neither the tag nor the quoting style appears in JSON. Pinned
+/// here so a future fix doesn't silently change this without the gap being
+/// deliberately revisited. Filed as #1416.
 #[test]
 fn test_object_slice_yaml_output_known_tag_gap_1102() -> Result<()> {
     let (out, code) = run_yq_stdin(".[0:2]", r#"{"a":1,"b":2,"c":3}"#, &[])?;
@@ -14185,7 +14261,7 @@ fn test_object_slice_yaml_output_known_tag_gap_1102() -> Result<()> {
     assert_eq!(
         out.trim(),
         "- a\n- 1",
-        "missing !!map tag is the known #1090 gap"
+        "missing !!map tag and key quoting are the known #1416 gap"
     );
     Ok(())
 }

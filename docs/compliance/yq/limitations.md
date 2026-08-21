@@ -201,6 +201,17 @@ the fix) and [#1344](https://github.com/rust-works/succinctly/issues/1344)
 leak or the missing `.[]` collapse, which is why #1398 exists — recording them here is the
 first half of ADR-0018 rule 6, and filing them is the second.
 
+Object slicing (`.[S:E]` on an object, [#1102](https://github.com/rust-works/succinctly/issues/1102))
+is another surface this same root cause reaches: it must materialize the target object into
+an `OwnedValue::Object` (an `IndexMap`) to build yq's AST-child-list view before slicing it,
+which silently collapses a genuine duplicate key the same way `to_owned()` does everywhere
+else in this list — `a: 1\nb: 2\na: 3` sliced with `.[0:6]` real yq returns `["a",1,"b",2,"a",3]`
+(6 children, both `a` entries present); succinctly returns `["a",3,"b",2]` (4 elements, the
+first `a`/`1` pair gone). Unlike the other surfaces above, there is no cursor-preserving
+alternative available here — the operation inherently needs to reorder/slice the entries, not
+just stream them — so this one is a real limit of `OwnedValue::Object`'s representation, not
+a missed wiring like #1343/#1344.
+
 Pulling the other way: [#442](https://github.com/rust-works/succinctly/issues/442),
 [#478](https://github.com/rust-works/succinctly/issues/478) and
 [#868](https://github.com/rust-works/succinctly/issues/868) are closed decisions that
@@ -267,10 +278,15 @@ Float and number formatting ([#1071](https://github.com/rust-works/succinctly/is
 [#1055](https://github.com/rust-works/succinctly/issues/1055)), comment placement
 ([#1079](https://github.com/rust-works/succinctly/issues/1079),
 [#1080](https://github.com/rust-works/succinctly/issues/1080),
-[#1085](https://github.com/rust-works/succinctly/issues/1085)), and the regex engine's
+[#1085](https://github.com/rust-works/succinctly/issues/1085)), the regex engine's
 zero-width-match handling
 ([#1255](https://github.com/rust-works/succinctly/issues/1255) — real yq uses Go's
-`regexp`). Also see
+`regexp`), and a missing explicit-tag slot: `OwnedValue` has no field for it, so any
+computed/constructed value — including an object-slice result (#1102) — loses the source
+node's `!!map`/`!!seq` tag and quoting style in YAML output (`{"a":1,"b":2} | yq
+'.[0:2]'` is `!!map\n- "a"\n- 1` on real yq, plain `- a\n- 1` on succinctly); `-o=json`
+output is unaffected, since neither appears in JSON
+([#1416](https://github.com/rust-works/succinctly/issues/1416)). Also see
 [yq Query Language Reference § Known Limitations](../../reference/yq-language.md#known-limitations)
 for the feature-level gaps (`*`/`+` are not cartesian generators; position builtins after DOM
 conversion).
