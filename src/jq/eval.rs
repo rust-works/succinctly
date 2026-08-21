@@ -18769,35 +18769,48 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
                 )
             }
         }
-        Expr::Optional(inner) => {
-            // This node *is* the `?` -- mirrors eval_try's Expr::Optional
-            // dispatch (`eval_try(inner, None, ...)`, eval.rs ~line 692),
-            // which evaluates the body and unconditionally converts an
-            // escaping Error or Break to nothing, keeping any prefix
-            // already produced before it (real jq's `(1, 2, error("x"))?`
-            // outputs `1`, `2`) -- Halt always escapes regardless (#791).
-            //
-            // `inner` is evaluated with `optional` forced to `false`, not
-            // broadcast from the ambient value, so a genuine error/break
-            // deep inside doesn't self-swallow at some leaf's own local
-            // `if optional` check before ever reaching this catch --
-            // mirrors the Array arm's identical fix (#1302) for the same
-            // reason. This catch point is the one place `?`'s suppression
-            // happens; it isn't gated on the ambient `optional` (unlike
-            // the Array arm's `if optional`) because that arm fires even
-            // with no enclosing `?` at all, whereas this arm only exists
-            // because the source literally has a `?` right here.
-            //
-            // Previously this arm broadcast `optional=true` into `inner`,
-            // and -- when `rest` was non-empty -- combined `[inner,
-            // ...rest]` into a single list evaluated under that same
-            // forced-true value, so `rest` (everything piped *after* the
-            // `?`) inherited the suppression too: `.a | (key)? |
-            // error("boom")` produced no output and no error at all,
-            // instead of real jq's error (#1335). `continue_rest_with_context`
-            // below instead threads the *ambient* `optional` into `rest`,
-            // matching every other arm here that continues into `rest`
-            // after producing an intermediate value.
+        // This node *is* the `?`. Isolates `inner` with `optional` forced to
+        // `false` (the same technique the Array arm's #1302 fix uses, not
+        // eval_try's ambient-forwarding -- a leaf mustn't self-swallow
+        // before this catch runs), then catches an escaping Error/Break
+        // unconditionally here -- unlike the Array arm's `if optional` gate
+        // (that arm fires even with no enclosing `?`, e.g. plain `[key]`;
+        // this one only exists because the source has a literal `?` right
+        // here) -- and only Error/Break, not the Array arm's Error-only
+        // (array construction never atomizes Break either). Keeps any
+        // prefix already produced (real jq's `(1, 2, error("x"))?` outputs
+        // `1`, `2`); Halt is left to the `other => other` fallthrough below,
+        // so a `Partial(prefix, Halt(_))` keeps its prefix too, matching
+        // real jq's `(1, 2, halt)?` and `yq_runner.rs`'s top-level
+        // `query_result_to_owned_values` convention (the Array arm discards
+        // it instead, since a halted array never finished constructing).
+        //
+        // Isolating `inner` this way only works when nothing downstream
+        // needs the per-output `current_path` `inner` would have produced
+        // had it continued straight into `rest` -- `Field`/`Index`/`Iterate`
+        // (and friends) only compute+thread an updated path when they have
+        // a non-empty `rest` to recurse into; evaluated with an empty
+        // `rest` for isolation, they just return bare values, so
+        // `continue_rest_with_context` below would fan them into `rest`
+        // using the *stale*, pre-`inner` `current_path` instead of each
+        // output's real one (`.a | (.[])? | key` would wrongly report every
+        // element's key as `"a"` instead of its index). This is a
+        // pre-existing limitation of the isolate-then-continue shape shared
+        // by the `Comma`/`Try`/`Label` arms elsewhere in this function, not
+        // something new here -- filed as #1409 (needs a real
+        // path-preserving redesign of that shared shape) -- but this arm
+        // must not regress it for `Optional` specifically, so it only takes
+        // the fast, isolated path when `rest` doesn't consult path context
+        // in the first place, and otherwise falls back to evaluating
+        // `[inner, ...rest]` combined under a forced `optional=true` (this
+        // arm's pre-#1335 behavior), which still threads `current_path`
+        // correctly because it never leaves the same recursive call `Field`/
+        // `Index`/`Iterate` build `new_path` inside of. That fallback still
+        // carries the narrower, pre-existing "rest inherits suppression"
+        // gap #1335 fixes in the common case (also tracked in #1409), but
+        // that's strictly no worse than `main`'s current behavior for this
+        // rarer combination.
+        Expr::Optional(inner) if rest.is_empty() || !rest.iter().any(needs_path_context) => {
             let inner_result = eval_pipe_with_path_context_internal::<W, S>(
                 core::slice::from_ref(inner),
                 value,
@@ -18825,6 +18838,18 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
                     optional,
                 )
             }
+        }
+        Expr::Optional(inner) => {
+            let mut combined = vec![(**inner).clone()];
+            combined.extend(rest.iter().cloned());
+            eval_pipe_with_path_context_internal::<W, S>(
+                &combined,
+                value,
+                root,
+                file_origin,
+                current_path,
+                true,
+            )
         }
         Expr::Pipe(inner_exprs) => {
             // Flatten nested pipe - combine inner pipe with rest

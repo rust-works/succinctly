@@ -5599,9 +5599,10 @@ fn test_optional_dispatch_catches_atomically_not_broadcast_1335() -> Result<()> 
     assert_eq!(code, 5);
     assert!(stderr.contains("boom"), "stderr: {stderr}");
 
-    // `?` also catches a `break` for an enclosing label -- matches real
-    // jq's `label $out | (1, break $out)?` (both implemented as bare `try`,
-    // which catches break the same way it catches a raised error).
+    // `?` also catches a `break` for an enclosing label -- verified against
+    // jq 1.7.1: `label $out | (1, break $out)?` prints `1`, exit 0 (both
+    // implemented as bare `try`, which catches break the same way it
+    // catches a raised error).
     let (stdout, _, code) = run_jq_full(
         &["-c", "label $out | (.a | (key, break $out))?"],
         Some(r#"{"a":1}"#),
@@ -5615,6 +5616,40 @@ fn test_optional_dispatch_catches_atomically_not_broadcast_1335() -> Result<()> 
     let (stdout, _, code) = run_jq_full(&["-c", ".a | ((key)?)?"], Some(r#"{"a":1}"#))?;
     assert_eq!(code, 0);
     assert_eq!(stdout.trim(), "\"a\"");
+
+    Ok(())
+}
+
+/// A `?`-wrapped navigational `inner` (`.[]`/`.foo`) followed by a
+/// path-context builtin in `rest` must still thread each output's *own*
+/// `current_path`, not the stale pre-`?` one. Isolating `inner`'s evaluation
+/// with an empty `rest` (needed to scope the catch above to `inner` alone)
+/// discards path updates -- `Field`/`Index`/`Iterate` only compute and
+/// thread a new path when they have a non-empty `rest` to recurse into, so
+/// evaluated in isolation they just return bare values. Caught during
+/// review: naively isolating in every case turned `.a | (.[])? | key` from
+/// `0`, `1`, `2` into three wrongly-identical `"a"`s. The fix only takes the
+/// isolated path when `rest` doesn't consult path context in the first
+/// place (this arm's `if rest.is_empty() || !rest.iter().any(...)` guard);
+/// otherwise it falls back to evaluating `[inner, ...rest]` combined, which
+/// still threads `current_path` correctly (#1406).
+#[test]
+fn test_optional_wrapped_navigation_still_threads_path_into_rest_1335() -> Result<()> {
+    // `.[]` under `?`, `key` in `rest`: must report each element's own
+    // index, not a stale outer one.
+    let (stdout, _, code) = run_jq_full(&["-c", ".a | (.[])? | key"], Some(r#"{"a":[10,20,30]}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "0\n1\n2");
+
+    // Same shape via a field step instead of iteration.
+    let (stdout, _, code) = run_jq_full(&["-c", ".a | (.b)? | key"], Some(r#"{"a":{"b":1}}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "\"b\"");
+
+    // Without `?`, the same query is the baseline this must match.
+    let (stdout, _, code) = run_jq_full(&["-c", ".a | .[] | key"], Some(r#"{"a":[10,20,30]}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "0\n1\n2");
 
     Ok(())
 }
