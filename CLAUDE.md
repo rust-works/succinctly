@@ -618,6 +618,7 @@ For detailed documentation on optimization techniques used in this project, see 
 - **A benchmark cannot measure a shape it does not generate** — "all neutral" is not evidence. Add the generator pattern first.
 - **A share of runtime is not a comparison.** Name a baseline commit that predates the change being judged — not a sibling from the same series (#1514: "cut the probe from 10.4% to 3.9%" shipped inside a 2-3x regression).
 - **Measure a precheck where the guarded code is already fastest.** It is charged to every input including the ones it cannot help, so the workload with least work to save is where its cost shows (#1514: the same detector read +14% on record-shaped input and +141% on one wide object).
+- **Attribute the cost before you A/B it.** A perf issue's named culprit is a hypothesis — #1213 and #1301 both named the wrong one. When the issue blames quantity A and you suspect B, build inputs holding A *provably constant* while varying B; if the time moves, A is not the term. #1301 blamed the resolved-path count, so holding it at 80,000 while widening the fan-out from 2 to 512 branches settled it in one table (890ms → 95ms). Unlike a profile, which only samples the window it runs in, that table has no escape hatch — and fitting its model predicts the post-fix floor before you change a line.
 
 **Recent YAML optimizations:**
 - ✅ P2.5 (Cached Type Checking): 1-17% improvement depending on nesting depth
