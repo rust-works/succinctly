@@ -20784,27 +20784,24 @@ fn delete_expr_array_paths(
     if !matches!(value, OwnedValue::Array(_)) {
         // A non-array container fails every path here identically, so a
         // single non-optional path among the siblings has to raise even
-        // when others are optional -- this used to be gated behind
-        // `paths.iter().all(|p| p[start].optional)`, unconditionally
-        // errors now instead, because that gate was dead (#1322):
+        // when others are optional -- unconditional since #1322 found the
+        // old `paths.iter().all(|p| p[start].optional)` gate dead:
         // `resolve_dynamic_indexes`'s `assemble` strips every
-        // `Expr::Optional` wrapper via `strip_resolved_optional` before
-        // any comma-grouped `del()` path reaches `flatten_delete_path`, so
-        // no `DeleteStep` here can ever carry `optional == true`. Fourth
-        // occurrence of this repo's "optional never forced true in nested
-        // calls" bug family (#928, #1003, #1034), and a sibling instance
-        // fixed the same way in `delete_expr_iterate_paths` below -- but
-        // #1331's investigation found the *general* form of this claim
-        // (a single `debug_assert` at `DeleteStep`'s own construction
-        // site in `flatten_delete_path`, covering every caller at once)
-        // does not hold: `DeleteStep.optional` genuinely is `true` in
-        // live-reachable input for `yq_del_slice_outcome`'s own internal
-        // use (`del(.a?[1:3])`, confirmed live), a different consumer of
-        // the same field that isn't reached through this comma-grouped
-        // machinery at all. Each site's own version of "is this ever
-        // true here" needs verifying on its own terms, not assumed to
-        // generalize from this one.
-        //
+        // `Expr::Optional` before any comma-grouped `del()` path reaches
+        // `flatten_delete_path`, so no `DeleteStep` here can carry
+        // `optional == true`. Verified (not just asserted in a comment,
+        // #1331): see `delete_expr_iterate_paths`'s matching
+        // `debug_assert` below for the full rationale, including the one
+        // confirmed exception (`yq_del_slice_outcome`'s own `wrap`
+        // closure, a different, non-comma-grouped consumer of the same
+        // field) that this crate's usual "optional never forced true"
+        // pattern (#928/#1003/#1034) doesn't cover here.
+        debug_assert!(
+            !paths.iter().any(|p| p[start].optional),
+            "delete_expr_array_paths: no DeleteStep here should ever carry optional == true -- \
+             resolve_dynamic_indexes strips Expr::Optional before any comma-grouped del() path \
+             reaches this function (#1331)"
+        );
         // *Which* sentence comes from `paths[0]` specifically, because jq
         // walks the paths in source order and dies on the first: the
         // `Slice { .. } => "object"`/catch-all `"number"` arms below are

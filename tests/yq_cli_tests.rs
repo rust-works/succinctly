@@ -15678,6 +15678,25 @@ fn test_1331_comma_computed_key_and_static_optional_sibling_dedup() -> Result<()
     Ok(())
 }
 
+/// #1331: the other two tests above reach `delete_expr_array_paths`
+/// (Index/Slice siblings), not `delete_expr_iterate_paths` -- neither
+/// exercises the debug_assert added to that function specifically. Two
+/// top-level comma branches each ending in a `?`-marked bare iterate
+/// forces the multi-path walker's `Iterate` dispatch, verifying the
+/// invariant holds (this test would panic in a debug build if it didn't)
+/// as well as the ordinary "each array gets cleared" behavior.
+#[test]
+fn test_1331_comma_optional_iterate_siblings_reach_iterate_dispatch() -> Result<()> {
+    let (out, code) = run_yq_stdin(
+        "del(.a[]?, .b[]?)",
+        "a: [1,2]\nb: [3,4,5]\n",
+        &["-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), r#"{"a":[],"b":[]}"#);
+    Ok(())
+}
+
 /// del()'s parent-key rule applies to an array target too (#1162 widened it
 /// from #1116's original scalar-only scope) — real yq drops the whole `a`
 /// key, not a partial 2-element range, whatever bounds are given (verified
