@@ -466,6 +466,29 @@ otherwise already correct, and it can be reverted independently if the perf gate
 - Our `Utf8Error` offsets were checked against yq's for all six error kinds (invalid lead,
   bad continuation, overlong, surrogate, out-of-range, truncated) and agree exactly.
 
+**Measured cost of the always-on pass.** Interleaved A/B of the Stage 4 binary against the
+Stage 5 one, alternating order every repetition, min-of-9, gated first on byte-identical
+stdout and exit code for every case (all five identical):
+
+| case | before | after | delta |
+|------|--------|-------|-------|
+| `jq '.users[0].name'` 1 MB | 5.37 ms | 5.13 ms | −4.5% |
+| `jq '.users[0].name'` 8.4 MB | 17.23 ms | 17.96 ms | **+4.2%** |
+| `jq '.'` 1 MB | 16.91 ms | 16.98 ms | +0.4% |
+| `yq -o json '.'` 1 MB | 16.62 ms | 16.65 ms | +0.2% |
+| `yq -o json '.'` 10 MB | 126.19 ms | 126.80 ms | +0.5% |
+
+Worst case is +4.2%, on the cheapest query at the largest size — where a roughly fixed
+~1 ms pass is the largest fraction of the work. That is inside the +8% ceiling this
+document set before implementing. The −4.5% row is noise: the pass cannot make anything
+faster.
+
+**Still outstanding:** this ran on an Apple M5 Max laptop under a load average near 10,
+which CLAUDE.md's benchmarking discipline explicitly disqualifies for a final number. It
+is enough to show the cost is in the expected band and no worse; the formal interleaved
+A/B on the pinned bench machines (`johns-mac-mini` ARM, `terminus` x86_64) has **not**
+been run and should be before this is treated as settled.
+
 **Stage 6 — make the YAML streaming path loud (new, split out of Stage 2).** After
 Stages 2 and 3, `succinctly yq -o=json '.'` on a document with a bad *escape* still emits
 `{"b":null}` at exit 0: the streaming transcoder's only error channel is
