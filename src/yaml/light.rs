@@ -408,28 +408,19 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
     }
 
     /// Follow a chain of `Alias` nodes to the cursor of its final non-alias
-    /// target, iteratively rather than recursively (#1191 code review).
+    /// target, iteratively rather than recursively (#1191 code review, fixing
+    /// a real stack-overflow DoS in `as_str()`'s own alias resolution --
+    /// see `MAX_ALIAS_CHAIN_DEPTH`'s doc comment for the full rationale).
     /// `self` need not itself be an alias -- returns `self` unchanged (zero
     /// hops) if it isn't, so a call site can invoke this unconditionally on
     /// a resolved `Alias` target rather than checking first.
     ///
-    /// `as_str()`'s `Alias` arm below used to resolve one alias hop via
-    /// `target.and_then(|t| t.value().as_str())`, re-entering itself once
-    /// per hop -- the same self-recursive shape every other typed accessor
-    /// on [`YamlValue`] independently has. A syntactically valid, non-cyclic
-    /// chain of tens of thousands of anchored aliases drives real,
-    /// uncatchable stack overflow through that self-recursion; this is
-    /// separate from #153's build-time acyclicity check, which only rejects
-    /// a chain that revisits its own anchor, not one that is merely very
-    /// long.
-    ///
-    /// Returns `None` only for a dangling (unresolvable) target. Panics past
-    /// `MAX_ALIAS_CHAIN_DEPTH`, mirroring every other depth ceiling in this
-    /// crate ([`assert_depth`]) -- the loop itself costs O(1) stack
-    /// regardless of chain length, so this bound exists purely to cap the
-    /// CPU time one call can be forced to spend on a pathologically long,
-    /// adversarially crafted chain.
-    pub fn resolve_alias_chain(&self) -> Option<Self> {
+    /// Returns `None` only for a dangling (unresolvable) target. `#[track_caller]`
+    /// so a panic past `MAX_ALIAS_CHAIN_DEPTH` reports the caller's own
+    /// location, matching this crate's convention for every other panicking
+    /// depth guard.
+    #[track_caller]
+    pub(crate) fn resolve_alias_chain(&self) -> Option<Self> {
         let mut current = *self;
         let mut depth = 0usize;
         while let YamlValue::Alias { target, .. } = current.value() {
@@ -5776,18 +5767,31 @@ use crate::jq::document::{
     DocumentCursor, DocumentElements, DocumentField, DocumentFields, DocumentValue, IndentSpec,
 };
 
-/// Caps the number of alias hops [`YamlCursor::resolve_alias_chain`] will
-/// follow. Unlike this crate's other `MAX_*` depth ceilings
+/// Caps the number of alias hops `YamlCursor::resolve_alias_chain` will
+/// follow (#1191 code review) -- the single place this rule's rationale is
+/// stated; other doc comments in this module point back here rather than
+/// repeating it.
+///
+/// `as_str()`'s `Alias` arm used to resolve one hop via its own
+/// `target.and_then(|t| t.value().as_str())`, re-entering itself once per
+/// hop -- the same self-recursive shape every other typed accessor on
+/// [`YamlValue`] still independently has (#1193 tracks fixing those; out of
+/// scope here). A syntactically valid, non-cyclic chain of tens of
+/// thousands of anchored aliases drives real, uncatchable stack overflow
+/// through that kind of self-recursion; this is separate from #153's
+/// build-time acyclicity check, which only rejects a chain that revisits
+/// its own anchor, not one that is merely very long.
+///
+/// Unlike this crate's other `MAX_*` depth ceilings
 /// ([`eval_generic::MAX_NESTING_DEPTH`](crate::jq::eval_generic::MAX_NESTING_DEPTH),
 /// [`value::MAX_VALUE_TREE_DEPTH`](crate::jq::MAX_VALUE_TREE_DEPTH)), this one
 /// isn't tuned against a measured stack-overflow boundary --
 /// `resolve_alias_chain` is an explicit loop, not recursion, so it costs
-/// O(1) stack regardless of chain length (#1191 code review). It exists
-/// only to bound the CPU time one accessor call can be forced to spend on a
-/// pathologically long, adversarially-crafted alias chain; picked
-/// generously (no legitimate document plausibly nears it) rather than
-/// against any specific measurement.
-pub(crate) const MAX_ALIAS_CHAIN_DEPTH: usize = 65_536;
+/// O(1) stack regardless of chain length. It exists only to bound the CPU
+/// time one call can be forced to spend on a pathologically long,
+/// adversarially-crafted chain; picked generously (no legitimate document
+/// plausibly nears it) rather than against any specific measurement.
+const MAX_ALIAS_CHAIN_DEPTH: usize = 65_536;
 
 impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
     type Value = YamlValue<'a, W>;
@@ -5963,33 +5967,6 @@ impl<'a, W: AsRef<[u64]>> YamlValue<'a, W> {
             _ => Cow::Borrowed(""),
         }
     }
-
-    /// Follow a chain of `Alias` values to its final non-alias target,
-    /// iteratively rather than recursively (#1191 code review).
-    ///
-    /// `as_str()` below used to resolve one alias hop via its own
-    /// `target.and_then(|t| t.value().as_str())`, re-entering itself once
-    /// per hop -- a syntactically valid, non-cyclic chain of tens of
-    /// thousands of anchored aliases drives real, uncatchable stack
-    /// overflow through that self-recursion. This is separate from #153's
-    /// build-time acyclicity check, which only rejects a chain that
-    /// revisits its own anchor, not one that is merely very long.
-    ///
-    /// A thin wrapper around [`YamlCursor::resolve_alias_chain`] -- the
-    /// actual iterative walk -- rather than a second, separately-maintained
-    /// copy of the same loop.
-    ///
-    /// Returns `None` for a dangling (unresolvable) target, matching this
-    /// call site's pre-existing handling of a `None` target -- only the
-    /// depth bound ([`MAX_ALIAS_CHAIN_DEPTH`]) panics, since that path is
-    /// adversarial-input-only, mirroring [`assert_depth`]'s own convention
-    /// for every other depth ceiling in this crate.
-    fn resolve_alias_chain(&self) -> Option<Self> {
-        let YamlValue::Alias { target, .. } = self else {
-            return None;
-        };
-        Some(target.as_ref()?.resolve_alias_chain()?.value())
-    }
 }
 
 // FORMER KNOWN LIMITATION (#224, fixed by #747): the typed getters below
@@ -6143,27 +6120,22 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentValue for YamlValue<'a, W> {
     fn as_str(&self) -> Option<Cow<'_, str>> {
         match self {
             YamlValue::String(s) => s.as_str().ok(),
-            // Resolve the *entire* alias chain first via
-            // `resolve_alias_chain` (#1191 code review), not a direct match
-            // against `YamlValue::String` on a single hop -- an alias
-            // pointing at another alias (`y: &b *a` chained through
-            // `z: *b`) previously stopped after one hop and returned `None`
-            // even though `type_name()`/`as_object()`/`as_array()`/
-            // `number_literal()` all correctly resolve the same chain. A
-            // naive fix (self-recursing via `t.value().as_str()`, matching
-            // those siblings' own pre-existing shape) was tried first and
-            // caught by review: those siblings' self-recursion has no depth
-            // bound, and a syntactically valid, non-cyclic chain of tens of
-            // thousands of anchored aliases drives real, uncatchable stack
-            // overflow through it -- the same class of bug #1193 already
-            // tracks for those siblings, just reachable here too if this
-            // arm copied their shape verbatim. `resolve_alias_chain`'s
-            // iterative walk costs O(1) stack regardless of chain length.
-            // The resolved value is a temporary, so any borrowed `Cow` it
-            // hands back must still be made owned before this arm returns.
-            YamlValue::Alias { .. } => self
-                .resolve_alias_chain()
-                .and_then(|v| v.as_str().map(|cow| Cow::Owned(cow.into_owned()))),
+            // Resolve the *entire* alias chain first via the target
+            // cursor's own `resolve_alias_chain` (#1191 code review; see
+            // `MAX_ALIAS_CHAIN_DEPTH`'s doc comment for the full rationale
+            // and its explicit note that the other typed accessors --
+            // `type_name()`/`as_object()`/`as_array()`/`number_literal()` --
+            // still have the pre-existing bug this fixes only for
+            // `as_str()`), not a direct match against `YamlValue::String` on
+            // a single hop. The resolved value is a temporary, so any
+            // borrowed `Cow` it hands back must still be made owned before
+            // this arm returns.
+            YamlValue::Alias { target, .. } => target.and_then(|t| {
+                t.resolve_alias_chain()?
+                    .value()
+                    .as_str()
+                    .map(|cow| Cow::Owned(cow.into_owned()))
+            }),
             _ => None,
         }
     }
@@ -7195,6 +7167,39 @@ mod tests {
         };
         let z = fields.find("z").expect("z field must exist");
         assert_eq!(z.as_str().as_deref(), Some("hello"));
+    }
+
+    /// #1191 code review: the success-path test above never exercises
+    /// `MAX_ALIAS_CHAIN_DEPTH`'s own boundary, so an off-by-one in
+    /// `resolve_alias_chain`'s loop (e.g. `<=` vs `<`, or a shifted
+    /// increment) would go uncaught. A chain one hop *past* the ceiling must
+    /// panic cleanly (a controlled `assert_depth` failure), not silently
+    /// succeed and not stack-overflow.
+    #[test]
+    #[should_panic(expected = "nesting depth exceeds limit")]
+    fn test_as_str_panics_past_max_alias_chain_depth_1191() {
+        use crate::jq::document::DocumentValue;
+
+        let mut yaml = String::from("a0: &a0 hello\n");
+        // `z`'s own hop is consumed by `as_str`'s outer match before
+        // `resolve_alias_chain` ever runs, so the chain it walks (starting
+        // at `z`'s target) is one hop shorter than the full text below --
+        // `+ 2`, not `+ 1`, is what actually pushes that inner walk past
+        // `MAX_ALIAS_CHAIN_DEPTH` (confirmed empirically: `+ 1` still
+        // resolves successfully with room to spare).
+        let depth = MAX_ALIAS_CHAIN_DEPTH + 2;
+        for i in 1..depth {
+            yaml.push_str(&format!("a{i}: &a{i} *a{}\n", i - 1));
+        }
+        yaml.push_str(&format!("z: *a{}\n", depth - 1));
+
+        let index = YamlIndex::build(yaml.as_bytes()).unwrap();
+        let root = index.root(yaml.as_bytes());
+        let YamlValue::Mapping(fields) = first_doc(root) else {
+            panic!("expected root document to be a mapping");
+        };
+        let z = fields.find("z").expect("z field must exist");
+        let _ = z.as_str();
     }
 
     #[test]
