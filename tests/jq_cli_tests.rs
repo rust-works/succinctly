@@ -12372,6 +12372,68 @@ fn test_thickly_wrapped_self_recursive_def_bounded_by_chain_depth_1016() -> Resu
     Ok(())
 }
 
+/// #1016 patch-coverage: `expand_func_calls_in_builtin`'s ~150-arm match
+/// forwards `budget`/`chain_depth` identically at every arm, verified
+/// mechanically correct by /code-review's exhaustive line-by-line trace of
+/// every call site -- but a query only ever *reaches* the specific arms it
+/// happens to use, so most of that mechanical diff went untouched by any
+/// existing test. This wraps a self-recursive `def` around a broad, varied
+/// sample of `Builtin` variants (path/object, array, math, string, regex,
+/// streaming) spanning categories the existing #1016 tests never touch, to
+/// exercise a meaningfully wider slice of those arms in one pass rather
+/// than adding a near-duplicate test per builtin.
+#[test]
+fn test_self_recursive_def_wrapping_varied_builtins_1016() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            r#"def cover(x): if x == 0 then null else
+  [
+    cover(x-1),
+    ({"a":1} | has("a")),
+    ("a" | in({"a":1})),
+    ({"a":1} | path(.a)),
+    ({"a":1} | getpath(["a"])),
+    ({} | setpath(["a"]; 1)),
+    ({"a":1} | delpaths([["a"]])),
+    ([[1,2],[3]] | flatten),
+    ([3,1,2] | sort_by(.)),
+    ([1,1,2] | unique_by(.)),
+    ([1,2,3] | group_by(. % 2)),
+    ([1,2,3] | min_by(.)),
+    ([1,2,3] | max_by(.)),
+    (3.7 | floor),
+    (3.2 | ceil),
+    (3.5 | round),
+    (4 | sqrt),
+    (2 | exp),
+    (2 | log),
+    ("ABC" | ascii_downcase),
+    ("abc" | ascii_upcase),
+    ("abcdef" | ltrimstr("abc")),
+    ("abcdef" | rtrimstr("def")),
+    ("a,b,c" | split(",")),
+    ("abc" | test("b")),
+    ("abc" | match("b") | .string),
+    ("abc" | capture("(?<x>b)")),
+    ("aba" | sub("a";"X")),
+    ("aba" | gsub("a";"X")),
+    ([1,2,3] | limit(2; .[])),
+    ([1,[2,[3]]] | [recurse])
+  ]
+end;
+cover(1)"#,
+        ],
+        Some("null"),
+    )?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(
+        stdout.trim_end(),
+        r#"[null,true,true,["a"],1,{"a":1},{},[1,2,3],[1,2,3],[1,2],[[2],[1,3]],1,3,3,4,4,2,7.38905609893065,0.6931471805599453,"abc","ABC","def","abc",["a","b","c"],true,"b",{"x":"b"},"Xba","XbX",1,2,[[1,[2,[3]]],1,[2,[3]],2,[3],3]]"#
+    );
+    Ok(())
+}
+
 /// #998: the bare identity `.` never materializes an `OwnedValue` tree (it
 /// stays lazy, streaming straight from the cursor via `print_json`), so
 /// `eval_generic::to_owned`'s own depth guard never gets a chance to fire
