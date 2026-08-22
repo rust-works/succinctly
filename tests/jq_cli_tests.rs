@@ -17140,6 +17140,26 @@ fn test_short_circuit_side_effect_shapes_already_match_jq_820() -> Result<()> {
             "",
             0,
         ),
+        // The lazy arm's *interleaved* operand order, which is the one
+        // property `drain_result`'s own "one arm carries a stated exception"
+        // caveat rests on and the only row that catches a silent regression
+        // back to the eager loop while every stderr-suppression row above
+        // stays green. jq runs right's first output, then the whole left
+        // operand, then right's second -- `B A C A`; the eager
+        // `binary_fanout_core` finishes right first and writes `B C A A`.
+        // Distinct from the #1481 row in the leaks table below, which pins
+        // the *top-level* spelling of this same compare (it never reaches
+        // `eval_each`, so it keeps the eager order).
+        (
+            &[
+                "-cn",
+                r#"[all(("A"|stderr) == (("B"|stderr), ("C"|stderr)); true)]"#,
+            ],
+            None,
+            "[true]\n",
+            "BACA",
+            0,
+        ),
     ];
 
     for (args, stdin, want_out, want_err, want_code) in cases {
@@ -17255,6 +17275,49 @@ fn test_short_circuit_side_effect_leaks_820_932_987() -> Result<()> {
             "",
             "1jq: error (at <stdin>:0): Invalid path expression with result [0]",
             5,
+        ),
+        // ---- `binary_fanout_each` drops the OUTER operand's `pending` -----
+        // `resolve_leaf` is the one consumer that reads `Flow::Stopped`'s
+        // `pending`, and this pair pins the left/right asymmetry that falls
+        // out of `binary_fanout_each`'s `abort.unwrap_or(outer)`: a `Halt`
+        // an eager-fallback operand had already triggered survives from the
+        // INNER (left) operand and is dropped from the OUTER (right) one.
+        // The drop is deliberate -- see `binary_fanout_each`'s own doc
+        // comment -- and it is the half that lands on jq's verdict, since
+        // jq's fully lazy `path()` never evaluates the `halt_error` at all
+        // and raises the path error instead.
+        //
+        // Both rows still diverge, and by the same Stage 5 residual rather
+        // than anything Stage 4 introduced: `Expr::If` has no lazy arm, so
+        // the `halt_error` is evaluated and writes `x` where jq writes
+        // nothing. Once Stage 5 lands neither operand evaluates it at all,
+        // so both rows lose the `x`, the second row's halt stops preempting
+        // the path error, and both move into the table above.
+        //
+        // Right operand (outer): pending dropped, so the path error wins --
+        // jq's own exit code and message, plus the stray `x`.
+        (
+            &[
+                "-cn",
+                r#"path(1 == (if true then (1, ("x"|halt_error(3))) else empty end))"#,
+            ],
+            None,
+            "",
+            "xjq: error (at <unknown>): Invalid path expression with result true",
+            5,
+        ),
+        // Left operand (inner): pending kept, so the already-triggered halt
+        // wins and the path error is never raised. jq: exit 5, same message
+        // as the row above.
+        (
+            &[
+                "-cn",
+                r#"path((if true then (1, ("x"|halt_error(3))) else empty end) == 1)"#,
+            ],
+            None,
+            "",
+            "x",
+            3,
         ),
     ];
 
@@ -17474,6 +17537,69 @@ fn test_owned_pipe_stage_ahead_of_comma_stays_lazy() -> Result<()> {
     let (stdout, _, code) = run_jq_full(&["-cn", r#"limit(1; 1 | (1, ("B"|stderr)))"#], None)?;
     assert_eq!(code, 0);
     assert_eq!(stdout, "1\n");
+
+    Ok(())
+}
+
+/// The `Expr::Compare` half of the same data loss, closed by Stage 4 (#1459).
+///
+/// #1459 is filed as "Severity: Low (stray stderr write; no wrong output, no
+/// data loss)", and for its own `IN(src; s)` repro that is true. It is not
+/// true of the arm the fix actually adds: once a compare's operands can pop
+/// `input`, the eager fanout's discarded candidates eat documents the CLI's
+/// per-document driver loop then never processes -- exit 0, empty stderr,
+/// correct-*looking* output, half the input gone. That is the same silent
+/// data loss `test_discarded_generator_branch_consumes_input_documents_820`
+/// pins for the `Comma` arm, and this is its `Compare` counterpart.
+///
+/// Deliberately separate from the stderr tables above: every row there would
+/// stay green if `eval_each`'s `Expr::Compare` arm regressed to eager *only*
+/// for operands that pop documents, and this is the test that would not.
+///
+/// Live against jq 1.7.1 (and against `main` before Stage 4, which processed
+/// documents 1 and 3 only).
+#[test]
+fn test_compare_operand_consuming_input_documents_1459() -> Result<()> {
+    const DOCS: &str = r#"{"id":1} {"id":2} {"id":3} {"id":4}"#;
+
+    // Control: every document is processed when nothing consumes the queue.
+    let (stdout, stderr, code) = run_jq_full(&["-c", ".id"], Some(DOCS))?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(
+        stdout, "1\n2\n3\n4\n",
+        "control run must see all 4 documents"
+    );
+
+    // `isempty` stops the compare on its first pairing, so the `input` in
+    // the right operand's tail is never evaluated and never pops. Before
+    // Stage 4 this printed `[false,1]\n[false,3]\n` -- documents 2 and 4
+    // were eaten by a candidate whose value was then discarded.
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", "[isempty(.id == (1, input)), .id]"], Some(DOCS))?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(
+        stdout, "[false,1]\n[false,2]\n[false,3]\n[false,4]\n",
+        "isempty over a compare must not pop a document"
+    );
+
+    // `all` short-circuits on the first falsy pairing, same shape.
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", "[all(.id == (99, input); .), .id]"], Some(DOCS))?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(
+        stdout, "[false,1]\n[false,2]\n[false,3]\n[false,4]\n",
+        "all over a compare must not pop a document"
+    );
+
+    // `limit(1)` is satisfied by the first pairing, so right's tail is never
+    // demanded. The first document's own answer is `true` (1 == 1).
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", "[limit(1; .id == (1, input)), .id]"], Some(DOCS))?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(
+        stdout, "[true,1]\n[false,2]\n[false,3]\n[false,4]\n",
+        "limit over a compare must not pop a document"
+    );
 
     Ok(())
 }
