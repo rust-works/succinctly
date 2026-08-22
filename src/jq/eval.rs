@@ -29636,26 +29636,18 @@ fn builtin_omit<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         StandardJson::Array(elements) => {
             // For arrays, keep all indices except those in the omit list
             let arr: Vec<_> = (*elements).collect();
-            let len = arr.len() as i64;
 
+            // `resolve_read_index`, not a hand-rolled match+cast (#1383's own
+            // review): the two did the same negative-index/out-of-bounds
+            // resolution, but diverged on NaN -- the old inline `as i64`
+            // silently saturated `nan` to index 0 (Rust's documented
+            // saturating-cast behavior), so `omit([nan])` removed element 0
+            // instead of skipping the unresolvable key, unlike this array's
+            // own sibling `delete_keys` (`delpaths`), which already used
+            // `resolve_read_index` and correctly treats `nan` as no match.
             let omit_indices: BTreeSet<usize> = keys
                 .iter()
-                .filter_map(|k| {
-                    let idx = match k {
-                        OwnedValue::Int(i) => *i,
-                        OwnedValue::Float(f) => *f as i64,
-                        OwnedValue::NumberLiteral(NumberRepr::Int(i), _) => *i,
-                        OwnedValue::NumberLiteral(NumberRepr::Float(f), _) => *f as i64,
-                        _ => return None,
-                    };
-                    // Handle negative indices
-                    let actual_idx = if idx < 0 { len + idx } else { idx };
-                    if actual_idx >= 0 && actual_idx < len {
-                        Some(actual_idx as usize)
-                    } else {
-                        None // Out of bounds indices are ignored
-                    }
-                })
+                .filter_map(|k| resolve_read_index(k, arr.len()))
                 .collect();
 
             let result: Vec<OwnedValue> = arr
@@ -50650,6 +50642,19 @@ mod tests {
         query!(br#"["a", "b", "c"]"#, "omit([10, -10])",
             QueryResult::Owned(OwnedValue::Array(arr)) => {
                 // No indices removed - all out of bounds
+                assert_eq!(arr.len(), 3);
+            }
+        );
+    }
+
+    #[test]
+    fn test_omit_array_nan_index_ignored_1383() {
+        // `resolve_read_index` (used since #1383) treats a NaN key the same
+        // way `delete_keys`/`delpaths` already do -- unresolvable, silently
+        // skipped -- not "saturates to index 0" the way the array arm's own
+        // prior hand-rolled `as i64` cast did.
+        query!(br#"["a", "b", "c"]"#, "omit([nan])",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
                 assert_eq!(arr.len(), 3);
             }
         );
