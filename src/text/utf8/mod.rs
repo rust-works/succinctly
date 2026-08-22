@@ -445,7 +445,16 @@ pub fn sequence_length(lead_byte: u8) -> usize {
 
 /// Decode a UTF-8 code point from a byte slice.
 ///
-/// Returns `None` if the input is empty or contains an invalid sequence.
+/// Returns `None` if the input is empty or contains an invalid sequence --
+/// including an overlong encoding (a code point spelled with more bytes
+/// than RFC 3629 requires), a surrogate-range code point (U+D800-U+DFFF,
+/// reserved for UTF-16 and never valid in UTF-8), or a 4-byte sequence
+/// decoding past Unicode's own maximum (U+10FFFF). Applies the same bounds
+/// [`validate_utf8_scalar`] already validates against on its own byte-scan
+/// path (#1423) -- kept in sync manually since the two serve different
+/// callers (whole-buffer validation vs. single-sequence decode) and don't
+/// share a helper.
+///
 /// On success, returns the decoded code point and the number of bytes consumed.
 ///
 /// # Examples
@@ -461,6 +470,12 @@ pub fn sequence_length(lead_byte: u8) -> usize {
 ///
 /// // Empty input
 /// assert_eq!(decode_code_point(b""), None);
+///
+/// // Overlong 2-byte encoding of U+0000 -- rejected, not decoded as NUL
+/// assert_eq!(decode_code_point(&[0xC0, 0x80]), None);
+///
+/// // Surrogate code point (U+D800) -- rejected
+/// assert_eq!(decode_code_point(&[0xED, 0xA0, 0x80]), None);
 /// ```
 pub fn decode_code_point(input: &[u8]) -> Option<(u32, usize)> {
     if input.is_empty() {
@@ -481,7 +496,12 @@ pub fn decode_code_point(input: &[u8]) -> Option<(u32, usize)> {
             if !is_continuation_byte(b1) {
                 return None;
             }
-            ((lead as u32 & 0x1F) << 6) | (b1 as u32 & 0x3F)
+            let cp = ((lead as u32 & 0x1F) << 6) | (b1 as u32 & 0x3F);
+            // Overlong: a 2-byte sequence must encode U+0080 or higher.
+            if cp < 0x80 {
+                return None;
+            }
+            cp
         }
         3 => {
             let b1 = input[1];
@@ -489,7 +509,17 @@ pub fn decode_code_point(input: &[u8]) -> Option<(u32, usize)> {
             if !is_continuation_byte(b1) || !is_continuation_byte(b2) {
                 return None;
             }
-            ((lead as u32 & 0x0F) << 12) | ((b1 as u32 & 0x3F) << 6) | (b2 as u32 & 0x3F)
+            let cp = ((lead as u32 & 0x0F) << 12) | ((b1 as u32 & 0x3F) << 6) | (b2 as u32 & 0x3F);
+            // Overlong: a 3-byte sequence must encode U+0800 or higher.
+            if cp < 0x800 {
+                return None;
+            }
+            // Surrogate code points (U+D800-U+DFFF) are reserved for
+            // UTF-16 surrogate pairs and invalid in UTF-8.
+            if (0xD800..=0xDFFF).contains(&cp) {
+                return None;
+            }
+            cp
         }
         4 => {
             let b1 = input[1];
@@ -498,10 +528,19 @@ pub fn decode_code_point(input: &[u8]) -> Option<(u32, usize)> {
             if !is_continuation_byte(b1) || !is_continuation_byte(b2) || !is_continuation_byte(b3) {
                 return None;
             }
-            ((lead as u32 & 0x07) << 18)
+            let cp = ((lead as u32 & 0x07) << 18)
                 | ((b1 as u32 & 0x3F) << 12)
                 | ((b2 as u32 & 0x3F) << 6)
-                | (b3 as u32 & 0x3F)
+                | (b3 as u32 & 0x3F);
+            // Overlong: a 4-byte sequence must encode U+10000 or higher.
+            if cp < 0x10000 {
+                return None;
+            }
+            // Beyond Unicode's own maximum code point.
+            if cp > 0x10FFFF {
+                return None;
+            }
+            cp
         }
         _ => return None,
     };
@@ -1645,6 +1684,71 @@ mod tests {
         fn rejects_invalid_lead_byte() {
             // 0x80 is a continuation byte, never a lead -> sequence_length 0.
             assert_eq!(decode_code_point(&[0x80]), None);
+        }
+
+        /// #1423: an overlong encoding decodes "successfully" to its would-be
+        /// code point unless explicitly rejected -- same shapes as
+        /// `overlong_encoding`'s `validate_utf8` tests above, checked here
+        /// against `decode_code_point` specifically.
+        #[test]
+        fn rejects_overlong_encodings() {
+            // NUL (U+0000) as an overlong 2-byte sequence: C0 80.
+            assert_eq!(decode_code_point(&[0xC0, 0x80]), None);
+            // DEL (U+007F) as an overlong 2-byte sequence: C1 BF -- the
+            // issue's own repro, the highest code point still representable
+            // (and thus still tempting to "successfully" decode) in 2 bytes.
+            assert_eq!(decode_code_point(&[0xC1, 0xBF]), None);
+            // NUL as an overlong 3-byte sequence: E0 80 80.
+            assert_eq!(decode_code_point(&[0xE0, 0x80, 0x80]), None);
+            // U+07FF (highest 2-byte-representable code point) spelled as an
+            // overlong 3-byte sequence: E0 9F BF.
+            assert_eq!(decode_code_point(&[0xE0, 0x9F, 0xBF]), None);
+            // NUL as an overlong 4-byte sequence: F0 80 80 80.
+            assert_eq!(decode_code_point(&[0xF0, 0x80, 0x80, 0x80]), None);
+            // U+FFFF (highest 3-byte-representable code point) spelled as an
+            // overlong 4-byte sequence: F0 8F BF BF.
+            assert_eq!(decode_code_point(&[0xF0, 0x8F, 0xBF, 0xBF]), None);
+        }
+
+        /// #1423: a structurally well-formed 3-byte sequence that decodes
+        /// into the surrogate range must still be rejected -- surrogates are
+        /// reserved for UTF-16 and are never valid standalone UTF-8, even
+        /// though `char::from_u32` alone would already catch this one step
+        /// later (defense in depth, not a redundant check: this function's
+        /// own contract is "reject invalid UTF-8," and a surrogate sequence
+        /// is invalid UTF-8 regardless of what the caller does with the
+        /// numeric result).
+        #[test]
+        fn rejects_surrogate_code_points() {
+            // U+D800: first high surrogate, ED A0 80 -- the issue's own repro.
+            assert_eq!(decode_code_point(&[0xED, 0xA0, 0x80]), None);
+            // U+DBFF: last high surrogate.
+            assert_eq!(decode_code_point(&[0xED, 0xAF, 0xBF]), None);
+            // U+DC00: first low surrogate.
+            assert_eq!(decode_code_point(&[0xED, 0xB0, 0x80]), None);
+            // U+DFFF: last low surrogate.
+            assert_eq!(decode_code_point(&[0xED, 0xBF, 0xBF]), None);
+            // U+D7FF and U+E000 (just outside the surrogate range on each
+            // side) must still decode successfully -- the check is a closed
+            // range, not an off-by-one over- or under-reach.
+            assert_eq!(decode_code_point(&[0xED, 0x9F, 0xBF]), Some((0xD7FF, 3)));
+            assert_eq!(decode_code_point(&[0xEE, 0x80, 0x80]), Some((0xE000, 3)));
+        }
+
+        /// #1423: a 4-byte sequence can structurally encode past Unicode's
+        /// own maximum code point (U+10FFFF); this crate's `validate_utf8`
+        /// already rejects that shape (`Utf8ErrorKind::OutOfRangeCodepoint`)
+        /// and `decode_code_point` should agree rather than silently
+        /// decoding a value no real Unicode string could ever contain.
+        #[test]
+        fn rejects_out_of_range_code_point() {
+            // U+10FFFF (the real maximum) still decodes.
+            assert_eq!(
+                decode_code_point(&[0xF4, 0x8F, 0xBF, 0xBF]),
+                Some((0x10FFFF, 4))
+            );
+            // U+110000 (one past the maximum) must not.
+            assert_eq!(decode_code_point(&[0xF4, 0x90, 0x80, 0x80]), None);
         }
     }
 }
