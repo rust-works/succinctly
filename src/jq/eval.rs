@@ -29609,8 +29609,7 @@ fn builtin_omit<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     match &value {
         StandardJson::Object(fields) => {
             // For objects, keep all keys except those in the omit list
-            // Use a Vec for no_std compatibility (typical omit lists are small)
-            let omit_keys: Vec<&str> = keys
+            let omit_keys: BTreeSet<&str> = keys
                 .iter()
                 .filter_map(|k| {
                     if let OwnedValue::String(s) = k {
@@ -29639,8 +29638,7 @@ fn builtin_omit<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             let arr: Vec<_> = (*elements).collect();
             let len = arr.len() as i64;
 
-            // Use a Vec for no_std compatibility (typical omit lists are small)
-            let omit_indices: Vec<usize> = keys
+            let omit_indices: BTreeSet<usize> = keys
                 .iter()
                 .filter_map(|k| {
                     let idx = match k {
