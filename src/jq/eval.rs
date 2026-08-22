@@ -1823,6 +1823,16 @@ enum Flow {
     /// *keep* a `Halt`: its own comment argues at length that an
     /// already-triggered halt must not be downgraded into a catchable path
     /// error, which is exactly what discarding `pending` would do for it.
+    ///
+    /// **One producer carries a stated exception**, added with the
+    /// `Expr::Compare` lazy arm (#1459, Stage 4):
+    /// [`binary_fanout_each`] has two operands and can therefore be handed
+    /// two `pending`s, so it has to pick. It keeps the *inner* (left)
+    /// operand's and drops the *outer* (right) one's -- see its own doc
+    /// comment for why that is the half that lands on jq's verdict, and
+    /// `test_short_circuit_side_effect_leaks_820_932_987` for the pinned
+    /// left/right pair. So `resolve_leaf`'s rule holds for every arm that
+    /// can produce only one `pending`, which is every arm but that one.
     Stopped { pending: Option<Control> },
     /// Terminated in a control. Everything produced before it was already
     /// delivered to the sink.
@@ -2450,6 +2460,29 @@ fn binary_fanout_each<'a, W: Clone + AsRef<[u64]>>(
 
     // The inner verdict wins over the outer loop's `Stopped`, which is only
     // the echo of our own driver returning `Stop`.
+    //
+    // That also **discards the outer operand's own `Flow::Stopped`
+    // `pending`**, in the one shape where it can carry a payload: an eager
+    // fallback on the right that had already raised a control before this
+    // loop stopped it. `resolve_leaf` is the only consumer that reads
+    // `pending` at all, so the effect is confined to a `Halt` under
+    // `path(...)`, and there the drop is the half that agrees with jq --
+    // jq's own `path()` is lazy end to end, never evaluates the trailing
+    // `halt_error`, and raises its "Invalid path expression" instead:
+    //
+    //     path(1 == (if true then (1, ("x"|halt_error(3))) else empty end))
+    //         jq       exit 5, the path error       (nothing on stderr)
+    //         this     exit 5, the path error       (stray `x`: Stage 5)
+    //     path((if true then (1, ("x"|halt_error(3))) else empty end) == 1)
+    //         jq       exit 5, the path error
+    //         this     exit 3, the halt wins        <- inner keeps `pending`
+    //
+    // Left and right therefore answer differently, deliberately rather than
+    // by accident; both rows are pinned in
+    // `test_short_circuit_side_effect_leaks_820_932_987`. Preserving the
+    // outer `pending` instead would move the first row back to exit 3, away
+    // from jq. The residual `x` on both is Stage 5's (`Expr::If` has no lazy
+    // arm), not this loop's.
     abort.unwrap_or(outer)
 }
 
