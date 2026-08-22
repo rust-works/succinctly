@@ -2835,11 +2835,38 @@ where
                 StandardJson::Object(fields) => {
                     use succinctly::json::light::StandardJson as SJ;
                     let mut is_first = true;
+                    // #1385: jq collapses a repeated key to its first
+                    // position holding its last value, so the printer -- the
+                    // only place a cursor-backed object ever reaches output
+                    // -- must too. This is what makes `.`, `.[0]`,
+                    // `first(.[])` and `last(.[])` agree with jq at once:
+                    // they all diverged solely because the value reaching
+                    // here was still a cursor.
+                    //
+                    // `--preserve-input` (`!jq_compat`) keeps every
+                    // occurrence: preserving the input verbatim is that
+                    // extension's whole purpose, and ADR-0018 rule 5 allows
+                    // it since no reference-defined filter is perturbed.
+                    //
+                    // The probe is a raw-span scan with no allocation for an
+                    // ordinary object; only one that genuinely repeats a key
+                    // builds the collapsed list.
+                    let collapsed = if config.jq_compat && fields.has_duplicate_keys() {
+                        Some(fields.collapsed())
+                    } else {
+                        None
+                    };
+                    let fields_iter = || -> Box<dyn Iterator<Item = _>> {
+                        match &collapsed {
+                            Some(v) => Box::new(v.iter().copied()),
+                            None => Box::new(fields),
+                        }
+                    };
                     if fields.is_empty() {
                         out.write_all(b"{}")?;
                     } else if compact {
                         out.write_all(b"{")?;
-                        for field in fields {
+                        for field in fields_iter() {
                             if !is_first {
                                 out.write_all(b",")?;
                             }
@@ -2872,7 +2899,7 @@ where
                     } else {
                         out.write_all(b"{")?;
                         out.write_all(separator.as_bytes())?;
-                        for field in fields {
+                        for field in fields_iter() {
                             if !is_first {
                                 out.write_all(b",")?;
                                 out.write_all(separator.as_bytes())?;

@@ -6274,6 +6274,13 @@ mod tests {
         // Duplicate YAML mapping keys must survive `to_entries` unmerged,
         // matching real `yq` -- not collapse to the last occurrence via the
         // `to_owned()` fallback's `IndexMap` (#443).
+        //
+        // Explicitly `YqSemantics` since #1385: preservation is a property
+        // of yq *mode*, not of the YAML format. The bare `eval` helper this
+        // used to call is `JqSemantics`, which now collapses whatever format
+        // it is handed -- no CLI reaches that pairing (`sjq` reads JSON,
+        // `syq` evaluates under `YqSemantics`), but the library API allows
+        // it, and the mode is what decides.
         use crate::yaml::YamlIndex;
 
         let yaml = b"a: 1\na: 2\n";
@@ -6285,7 +6292,7 @@ mod tests {
             .expect("YAML document should have content");
         let value = mapping_cursor.value();
 
-        let result = eval(&Expr::Builtin(Builtin::ToEntries), value);
+        let result = eval_using::<YqSemantics, _>(&Expr::Builtin(Builtin::ToEntries), value);
         let owned = result.into_owned().unwrap();
 
         let expected_entry = |v: i64| {
@@ -6298,6 +6305,38 @@ mod tests {
             owned,
             OwnedValue::Array(vec![expected_entry(1), expected_entry(2)])
         );
+    }
+
+    /// #1385: the duplicate-key rule follows the evaluation *mode*, not the
+    /// input format. The same YAML mapping that preserves under
+    /// `YqSemantics` (the test above) collapses under `JqSemantics`.
+    ///
+    /// No CLI reaches this pairing -- `sjq` reads JSON and `syq` evaluates
+    /// under `YqSemantics` -- but the library API exposes it, and pinning it
+    /// is what stops the format gate from creeping back in: before #1385
+    /// `DocumentFields::keys_dedup()` answered `false` for `YamlFields`
+    /// whatever mode was asking, which is the violation ADR-0018 rule 2
+    /// names.
+    #[test]
+    fn test_yaml_generic_to_entries_collapses_under_jq_semantics_1385() {
+        use crate::yaml::YamlIndex;
+
+        let yaml = b"a: 1\na: 2\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let cursor = index.root(yaml);
+
+        let mapping_cursor = cursor
+            .first_child()
+            .expect("YAML document should have content");
+        let value = mapping_cursor.value();
+
+        let result = eval_using::<JqSemantics, _>(&Expr::Builtin(Builtin::ToEntries), value);
+        let owned = result.into_owned().unwrap();
+
+        let mut entry = IndexMap::new();
+        entry.insert("key".to_string(), OwnedValue::String("a".to_string()));
+        entry.insert("value".to_string(), OwnedValue::Int(2));
+        assert_eq!(owned, OwnedValue::Array(vec![OwnedValue::Object(entry)]));
     }
 
     /// #1168: `Expr::Array` had no native `eval_single` arm, so wrapping a
@@ -6320,7 +6359,8 @@ mod tests {
             .expect("YAML document should have content");
         let value = mapping_cursor.value();
 
-        let result = eval(
+        // `YqSemantics` since #1385 -- see the #443 test above.
+        let result = eval_using::<YqSemantics, _>(
             &Expr::Array(Box::new(Expr::Builtin(Builtin::ToEntries))),
             value,
         );
@@ -6357,7 +6397,8 @@ mod tests {
             .expect("YAML document should have content");
         let value = mapping_cursor.value();
 
-        let result = eval(
+        // `YqSemantics` since #1385 -- see the #443 test above.
+        let result = eval_using::<YqSemantics, _>(
             &Expr::Comma(vec![
                 Expr::Builtin(Builtin::ToEntries),
                 Expr::Builtin(Builtin::ToEntries),

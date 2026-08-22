@@ -2373,6 +2373,104 @@ fn test_preserve_input_computed_index_preserves_duplicate_keys() -> Result<()> {
     Ok(())
 }
 
+/// #1385: in jq mode a repeated object key collapses to its *first*
+/// position holding its *last* value. Every filter here was captured from
+/// the pin (`/usr/bin/jq`, jq-1.7.1) on `{"b":1,"a":2,"b":3}`; the golden
+/// corpus carries the same cases, this pins them at the CLI boundary where
+/// `--preserve-input`'s exemption below can sit beside them.
+#[test]
+fn test_duplicate_keys_collapse_last_wins_1385() -> Result<()> {
+    let input = r#"{"b":1,"a":2,"b":3}"#;
+    for (filter, expected) in [
+        (".", r#"{"b":3,"a":2}"#),
+        ("length", "2"),
+        ("keys", r#"["a","b"]"#),
+        ("keys_unsorted", r#"["b","a"]"#),
+        ("[.[]]", "[3,2]"),
+        ("[paths]", r#"[["b"],["a"]]"#),
+        ("to_entries|length", "2"),
+    ] {
+        let (out, code) = run_jq_stdin(filter, input, &["-c"])?;
+        assert_eq!(code, 0, "filter {filter}");
+        assert_eq!(out.trim(), expected, "filter {filter}");
+    }
+    Ok(())
+}
+
+/// #1385: the collapse is the printer's, not one filter's, so every
+/// cursor-preserving navigation reaches it — `.[0]`, `first`/`last` and a
+/// computed index all previously emitted both occurrences.
+#[test]
+fn test_duplicate_keys_collapse_through_navigation_1385() -> Result<()> {
+    let input = r#"[{"a":1,"a":2},{"b":3,"b":4}]"#;
+    for (filter, expected) in [
+        (".[]", "{\"a\":2}\n{\"b\":4}"),
+        (".[0]", r#"{"a":2}"#),
+        ("first(.[])", r#"{"a":2}"#),
+        ("last(.[])", r#"{"b":4}"#),
+        ("first", r#"{"a":2}"#),
+        ("last", r#"{"b":4}"#),
+        (".[(1-1)]", r#"{"a":2}"#),
+    ] {
+        let (out, _, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(code, 0, "filter {filter}");
+        assert_eq!(out.trim(), expected, "filter {filter}");
+    }
+    Ok(())
+}
+
+/// #1385: nesting and pretty-printing go through the same `print_json` arm,
+/// and a key repeated with a *different escape spelling* is still the same
+/// key — `"a\/b"` and `"a/b"` both decode to `a/b`, which the raw-span fast
+/// path cannot see, so it falls back to comparing decoded keys.
+#[test]
+fn test_duplicate_keys_collapse_nested_and_escaped_1385() -> Result<()> {
+    let (out, code) = run_jq_stdin(
+        ".",
+        r#"{"x":{"b":1,"a":2,"b":3},"y":[{"a":1,"a":2}]}"#,
+        &["-c"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), r#"{"x":{"b":3,"a":2},"y":[{"a":2}]}"#);
+
+    let (pretty, code) = run_jq_stdin(".", r#"{"a":1,"a":2}"#, &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(pretty, "{\n  \"a\": 2\n}\n");
+
+    let (escaped, code) = run_jq_stdin(".", r#"{"a\/b":1,"a/b":2}"#, &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(escaped.trim(), r#"{"a/b":2}"#);
+
+    Ok(())
+}
+
+/// #1385: the duplicate scan keys off a fixed-size stack buffer and spills
+/// to a heap `Vec` past it, so an object wider than that buffer exercises a
+/// different comparison path. 40 fields with the duplicate at the tail puts
+/// both the spill and the sorted compare in play.
+#[test]
+fn test_duplicate_keys_collapse_wide_object_1385() -> Result<()> {
+    let mut input = String::from("{");
+    for i in 0..40 {
+        input.push_str(&format!("\"k{i}\":{i},"));
+    }
+    input.push_str("\"k0\":999}");
+
+    let (out, code) = run_jq_stdin("length", &input, &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(
+        out.trim(),
+        "40",
+        "the repeated k0 must not be counted twice"
+    );
+
+    let (first, code) = run_jq_stdin(".k0", &input, &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(first.trim(), "999", "last occurrence wins");
+
+    Ok(())
+}
+
 #[test]
 fn test_jq_compat_default() -> Result<()> {
     // Test that jq-compat is now the default behavior
