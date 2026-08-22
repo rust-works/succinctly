@@ -203,16 +203,29 @@ fn dump_truncated_with(tag: EvalTag, value: &OwnedValue) -> String {
     // The sink stops the writer once the dump is known to exceed the budget;
     // writing into a `String` cannot fail for any other reason, so the returned
     // `Result` carries nothing `sink.overflowed` has not already recorded.
-    let _ = match tag {
-        EvalTag::Jq => stream_owned_value_json_jq(value, &mut sink),
-        EvalTag::Yq => stream_owned_value_json(value, &mut sink, 0, 0, ' ', false),
-    };
+    let _ = stream_value_preview(tag, value, &mut sink);
     if !sink.overflowed {
         return sink.buf;
     }
     sink.truncate_to(DUMP_KEEP);
     sink.buf.push_str("...");
     sink.buf
+}
+
+/// The one dispatch every `EvalTag`-aware preview call site shares (#1055):
+/// jq's error-message convention, or yq's real-output one reused as-is (see
+/// [`dump_truncated_with`]'s doc comment for why no bespoke yq formatter is
+/// needed). Factored out so [`dump_truncated_with`] and
+/// [`EvalError::from_value_with`] can't drift apart on it.
+fn stream_value_preview<W: core::fmt::Write>(
+    tag: EvalTag,
+    value: &OwnedValue,
+    out: &mut W,
+) -> core::fmt::Result {
+    match tag {
+        EvalTag::Jq => stream_owned_value_json_jq(value, out),
+        EvalTag::Yq => stream_owned_value_json(value, out, 0, 0, ' ', false),
+    }
 }
 
 /// A [`core::fmt::Write`] sink that keeps the first `cap` bytes written to it and
@@ -420,24 +433,21 @@ impl EvalError {
     /// same as real jq.
     ///
     /// jq-pinned shim (#1055): see [`dump_truncated`]'s doc comment; use
-    /// [`EvalError::from_value_in`] once `S: EvalSemantics` is in scope at the
+    /// [`EvalError::from_value_with`] once `S: EvalSemantics` is in scope at the
     /// call site.
     pub fn from_value(value: OwnedValue) -> Self {
-        Self::from_value_in(EvalTag::Jq, value)
+        Self::from_value_with(EvalTag::Jq, value)
     }
 
     /// Mode-aware sibling of [`EvalError::from_value`] (#1055): yq mode
     /// echoes a `NumberLiteral` verbatim here too, matching `.a | tostring`
     /// on the same value instead of reformatting it via jq's rules.
-    pub fn from_value_in(tag: EvalTag, value: OwnedValue) -> Self {
+    pub fn from_value_with(tag: EvalTag, value: OwnedValue) -> Self {
         let message = match &value {
             OwnedValue::String(s) => s.clone(),
             other => {
                 let mut message = String::new();
-                let _ = match tag {
-                    EvalTag::Jq => stream_owned_value_json_jq(other, &mut message),
-                    EvalTag::Yq => stream_owned_value_json(other, &mut message, 0, 0, ' ', false),
-                };
+                let _ = stream_value_preview(tag, other, &mut message);
                 message
             }
         };
@@ -681,14 +691,14 @@ impl EvalError {
     /// `Cannot iterate over <type> (<value>)`.
     ///
     /// jq-pinned shim (#1055): see [`dump_truncated`]'s doc comment; use
-    /// [`EvalError::cannot_iterate_in`] once `S: EvalSemantics` is in scope
+    /// [`EvalError::cannot_iterate_with`] once `S: EvalSemantics` is in scope
     /// at the call site.
     pub fn cannot_iterate(value: &OwnedValue) -> Self {
-        Self::cannot_iterate_in(EvalTag::Jq, value)
+        Self::cannot_iterate_with(EvalTag::Jq, value)
     }
 
     /// Mode-aware sibling of [`EvalError::cannot_iterate`] (#1055).
-    pub fn cannot_iterate_in(tag: EvalTag, value: &OwnedValue) -> Self {
+    pub fn cannot_iterate_with(tag: EvalTag, value: &OwnedValue) -> Self {
         Self::new(format!("Cannot iterate over {}", describe_with(tag, value)))
     }
 
