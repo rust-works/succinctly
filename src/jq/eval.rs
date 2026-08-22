@@ -9221,7 +9221,7 @@ fn builtin_match<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
     if global {
         // Stream one match object per match (jq's match(re;"g") is a generator)
-        let caps_vec = global_captures(&re, &input);
+        let caps_vec = global_captures::<S>(&re, &input);
         if caps_vec.is_empty() {
             return QueryResult::None;
         }
@@ -9326,13 +9326,37 @@ fn first_captures<'h>(re: &JqRegex, input: &'h str) -> Option<regex::Captures<'h
 /// jq's own behavior (verified live: `[scan(" *";"n")]` on `"a  b   c"`
 /// keeps only the two non-empty runs of spaces). Same known gap as
 /// `first_captures` (#922).
+///
+/// In yq mode, additionally reproduces Go `regexp`'s own global-replace
+/// semantics rather than Oniguruma's (#1255): Go skips an empty match that
+/// begins exactly where the previous *emitted* match ended, whereas
+/// Oniguruma (and jq mode here) allows it. Confirmed live against yq
+/// v4.53.3 across every zero-width-capable pattern shape tried (`a*`, `b*`,
+/// `""`, `x?`) — everything else (advance one rune past an empty match,
+/// leftmost-first, left-to-right scan) is identical between the two
+/// engines, so this is one extra skip condition in the loop, not a second
+/// regex engine. `next_match_step` already advances by one rune on an empty
+/// match regardless of this skip, so the skip only ever changes whether a
+/// match is *emitted*, never the scan position.
 #[cfg(feature = "regex")]
-fn global_captures<'h>(re: &JqRegex, input: &'h str) -> Vec<regex::Captures<'h>> {
+fn global_captures<'h, S: EvalSemantics>(re: &JqRegex, input: &'h str) -> Vec<regex::Captures<'h>> {
     let mut results = Vec::new();
     let mut start = 0usize;
+    let mut last_match_end: Option<usize> = None;
     while let Some((caps, accepted, next_start)) = next_match_step(re, input, start) {
         if accepted {
-            results.push(caps);
+            let m = caps
+                .get(0)
+                .expect("capture group 0 is always present on a match");
+            let (m_start, m_end) = (m.start(), m.end());
+            let is_empty_match = m_start == m_end;
+            let repeats_previous_match_end = last_match_end == Some(m_start);
+            let go_style_skip =
+                S::TAG == EvalTag::Yq && is_empty_match && repeats_previous_match_end;
+            if !go_style_skip {
+                last_match_end = Some(m_end);
+                results.push(caps);
+            }
         }
         start = next_start;
     }
@@ -9959,7 +9983,7 @@ fn builtin_capture_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
     if global {
         // Stream one captures object per match (jq's capture(re;"g") is a generator)
-        let objects: Vec<OwnedValue> = global_captures(&re, &input)
+        let objects: Vec<OwnedValue> = global_captures::<S>(&re, &input)
             .iter()
             .map(|caps| capture_object(&re, caps))
             .collect();
@@ -10112,7 +10136,7 @@ fn yq_sub_arity3_empty_replace<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Err(e) => return e.into(),
     };
 
-    let matches = global_captures(&re, &input);
+    let matches = global_captures::<S>(&re, &input);
     if matches.is_empty() {
         return QueryResult::Owned(OwnedValue::String(input));
     }
@@ -10181,21 +10205,26 @@ fn sub_with_resolved_pattern<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // scope note, split into its own follow-up as #1122) and are
     // deliberately left matching jq's model here.
     //
-    // Known gap this widens the reachable surface of, not one it
-    // introduces: `global_captures` below iterates zero-width matches
-    // (patterns that can match an empty string, e.g. `a*`) the way jq's
-    // Oniguruma engine does, which already diverged from real yq's Go
-    // `regexp` engine for `gsub` before this fix -- confirmed still
-    // present on `main` pre-#1069 (`"bab" | gsub("a*";"X")` gave
-    // `"XbXXbX"` there too, vs real yq's `"XbXbX"`). This fix makes bare
-    // `sub` reach the same already-imperfect iteration `gsub` always
-    // used, rather than introducing new zero-width-handling logic. See
-    // #1255.
-    let global =
-        flags.is_some_and(|f| f.contains('g')) || (S::TAG == EvalTag::Yq && flags.is_none());
+    // #1255 fixed `global_captures`'s zero-width-match iteration to match
+    // real yq's Go `regexp` engine (it skips an empty match that begins
+    // exactly where the previous emitted match ended; Oniguruma, and jq
+    // mode here, allow it) -- but only for genuine bare `sub` in yq mode
+    // (`flags.is_none()`, the branch below), not for this function's other
+    // caller, yq-mode `gsub`. `gsub` isn't a real yq builtin at any arity
+    // (confirmed live against yq v4.53.3, #1436 -- its lexer rejects
+    // `gsub(...)` outright), so there's no oracle to fix it *against*;
+    // per #1255's own scoping, an extension with nothing to diverge from
+    // stays on the jq-style iteration rather than guessing at intended
+    // semantics. `is_bare_sub` is the one place that distinction is made.
+    let is_bare_sub = S::TAG == EvalTag::Yq && flags.is_none();
+    let global = flags.is_some_and(|f| f.contains('g')) || is_bare_sub;
 
     if global {
-        let matches = global_captures(&re, &input);
+        let matches = if is_bare_sub {
+            global_captures::<YqSemantics>(&re, &input)
+        } else {
+            global_captures::<JqSemantics>(&re, &input)
+        };
         return match stitch_replacements_evaluated::<W, S>(
             replacement_expr,
             &re,
@@ -10489,11 +10518,16 @@ fn scan_with_resolved_pattern<'a, W: Clone + AsRef<[u64]>>(
         Err(e) => return e.into(),
     };
 
-    // Find all matches
+    // Find all matches. `scan` isn't a real yq builtin at all (confirmed
+    // live against yq v4.53.3, #1436 -- its lexer rejects `scan(...)`
+    // outright), so #1255's yq-mode Go-style zero-width fix doesn't apply
+    // here -- there's no oracle for succinctly's own yq-mode `scan`
+    // extension to diverge from, so it stays on the jq-style iteration
+    // unconditionally rather than guessing at intended semantics.
     let mut results = Vec::new();
     let capture_count = re.captures_len();
 
-    for caps in global_captures(&re, &input) {
+    for caps in global_captures::<JqSemantics>(&re, &input) {
         if capture_count > 1 {
             // Has capture groups - return array of captured strings
             let mut captured = Vec::new();
@@ -10555,8 +10589,16 @@ fn builtin_split_regex<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Err(e) => return e.into(),
     };
 
-    // Split by regex
-    let matches = global_captures(&re, &input);
+    // Split by regex. `split(re;flags)` *is* a real yq builtin, unlike
+    // `gsub`/`scan`/`splits` above -- but it has its own separate,
+    // still-unresolved mystery (#1439: real yq's 2-arg regex `split`
+    // doesn't do a regex split at all, e.g. it keeps matched delimiters as
+    // elements where jq's model discards them). #1255's zero-width fix
+    // alone wouldn't make this oracle-correct given that deeper algorithm
+    // mismatch, and guessing at how the two interact risks conflicting
+    // with #1439's eventual fix -- left on jq-style iteration and deferred
+    // to whoever picks up #1439, per #1255's own step-5 timeboxing.
+    let matches = global_captures::<JqSemantics>(&re, &input);
     let parts: Vec<OwnedValue> = stitch_split(&input, &matches)
         .into_iter()
         .map(OwnedValue::String)
@@ -10644,8 +10686,12 @@ fn splits_with_resolved_pattern<'a, W: Clone + AsRef<[u64]>>(
         Err(e) => return e.into(),
     };
 
-    // Split by regex and return as stream
-    let matches = global_captures(&re, &input);
+    // Split by regex and return as stream. `splits` isn't a real yq
+    // builtin at all (confirmed live against yq v4.53.3, #1436 -- its
+    // lexer rejects `splits(...)` outright), so #1255's yq-mode Go-style
+    // zero-width fix doesn't apply here for the same reason it doesn't for
+    // `scan`/`gsub` above -- no oracle to diverge from.
+    let matches = global_captures::<JqSemantics>(&re, &input);
     let parts: Vec<OwnedValue> = stitch_split(&input, &matches)
         .into_iter()
         .map(OwnedValue::String)

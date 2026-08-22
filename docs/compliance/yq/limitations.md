@@ -260,6 +260,28 @@ $ echo '"a1b2c"' | yq            -o=json 'split("[0-9]";"g")'   # ["a","1","b","
 $ echo '"a1b2c"' | succinctly yq -o=json 'split("[0-9]";"g")'   # ["a","b","c"] -- jq-modeled regex split
 ```
 
+### Global regex zero-width-match iteration — resolved, real yq uses Go's `regexp`
+
+[#1255](https://github.com/rust-works/succinctly/issues/1255) resolved a divergence in
+`global_captures` (the shared iteration `sub`, `match(re;"g")`, and `capture(re;"g")` all use):
+real yq's Go `regexp` engine skips an empty match that begins exactly where the previous
+*emitted* match ended; Oniguruma (jq's own engine, and jq mode here) allows it. Everything
+else — advance one rune past an empty match, leftmost-first, left-to-right scan — is
+identical between the two engines, so this is one extra skip condition in the loop, not a
+second regex engine:
+
+```bash
+$ echo '"bab"' | yq            'sub("a*"; "X")'   # "XbXbX"  (Go skips the empty match at pos 2)
+$ echo '"bab"' | succinctly yq 'sub("a*"; "X")'   # "XbXbX"  (matches)
+```
+
+Deliberately **not** extended to `gsub`/`scan`/`splits` (not real yq builtins at all, per
+#1436 — there's no oracle for succinctly's own yq-mode extensions to diverge from, so they
+stay on the jq-style iteration) or to `split(re;flags)` (a real yq builtin, but with its own
+separate, still-unresolved mystery, #1439 above — #1255's fix alone wouldn't make it
+oracle-correct given that deeper algorithm mismatch, so the two are deliberately decoupled
+rather than guessed at together).
+
 ### Regex flag grammar — `test`/`match`/`capture` fixed, `split` still open
 
 **Fixed by [#1426](https://github.com/rust-works/succinctly/issues/1426):** real yq doesn't
@@ -393,10 +415,8 @@ Float and number formatting ([#1071](https://github.com/rust-works/succinctly/is
 [#1055](https://github.com/rust-works/succinctly/issues/1055)), comment placement
 ([#1079](https://github.com/rust-works/succinctly/issues/1079),
 [#1080](https://github.com/rust-works/succinctly/issues/1080),
-[#1085](https://github.com/rust-works/succinctly/issues/1085)), the regex engine's
-zero-width-match handling
-([#1255](https://github.com/rust-works/succinctly/issues/1255) — real yq uses Go's
-`regexp`), and a missing explicit-tag slot: `OwnedValue` has no field for it, so any
+[#1085](https://github.com/rust-works/succinctly/issues/1085)), and a missing
+explicit-tag slot: `OwnedValue` has no field for it, so any
 computed/constructed value — including an object-slice result (#1102) — loses the source
 node's `!!map`/`!!seq` tag and quoting style in YAML output (`{"a":1,"b":2} | yq
 '.[0:2]'` is `!!map\n- "a"\n- 1` on real yq, plain `- a\n- 1` on succinctly); `-o=json`

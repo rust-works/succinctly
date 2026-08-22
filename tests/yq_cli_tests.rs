@@ -19548,3 +19548,176 @@ fn test_yq_regex_flag_grammar_container_flags_falls_through_unchanged_1426() -> 
     assert!(err.contains("is not a string"), "err={err}");
     Ok(())
 }
+
+// ============================================================================
+// #1255: yq mode's global regex replace/match/capture use Go `regexp`'s
+// zero-width-match iteration, not Oniguruma's -- real yq skips an empty
+// match that begins exactly where the previous emitted match ended;
+// Oniguruma (and jq mode) allow it. Every filter below is live-verified
+// against yq v4.53.3.
+// ============================================================================
+
+/// The issue's own primary repro: `a*` on `"bab"` has one non-empty match
+/// ("a") and would-be empty matches at every other position, but real yq
+/// skips the would-be empty match immediately after the real one.
+#[test]
+fn test_yq_sub_zero_width_a_star_1255() -> Result<()> {
+    let (output, code) = run_yq_stdin(r#"sub("a*"; "X")"#, "\"bab\"\n", &["-o", "json"])?;
+    assert_eq!(code, 0, "output: {output:?}");
+    assert_eq!(output.trim(), r#""XbXbX""#);
+    Ok(())
+}
+
+/// Same rule, pattern matches non-empty at the *start* instead of the
+/// middle -- the skip must trigger regardless of where in the scan the
+/// real match falls.
+#[test]
+fn test_yq_sub_zero_width_b_star_1255() -> Result<()> {
+    let (output, code) = run_yq_stdin(r#"sub("b*"; "Y")"#, "\"bab\"\n", &["-o", "json"])?;
+    assert_eq!(code, 0, "output: {output:?}");
+    assert_eq!(output.trim(), r#""YaY""#);
+    Ok(())
+}
+
+/// A pattern that *only* ever matches empty: no real match ever "ends" at
+/// a position another empty match could collide with (each subsequent
+/// scan position is one rune past the last), so every position gets a
+/// match -- this is the case the skip rule must NOT over-trigger on.
+#[test]
+fn test_yq_sub_zero_width_always_empty_pattern_1255() -> Result<()> {
+    let (output, code) = run_yq_stdin(r#"sub(""; "Z")"#, "\"bab\"\n", &["-o", "json"])?;
+    assert_eq!(code, 0, "output: {output:?}");
+    assert_eq!(output.trim(), r#""ZbZaZbZ""#);
+    Ok(())
+}
+
+/// `x?` never actually matches non-empty in an input with no `x` at all,
+/// so this is a variant of the always-empty case with a different pattern
+/// shape (optional-group rather than star).
+#[test]
+fn test_yq_sub_zero_width_optional_group_1255() -> Result<()> {
+    let (output, code) = run_yq_stdin(r#"sub("x?"; "-")"#, "\"bab\"\n", &["-o", "json"])?;
+    assert_eq!(code, 0, "output: {output:?}");
+    assert_eq!(output.trim(), r#""-b-a-b-""#);
+    Ok(())
+}
+
+/// Multi-byte (2-byte UTF-8) rune advance: the skip/advance arithmetic
+/// must step by *rune*, not byte, or this panics/mis-slices.
+#[test]
+fn test_yq_sub_zero_width_multibyte_rune_advance_1255() -> Result<()> {
+    let (output, code) = run_yq_stdin(
+        "sub(\"ä*\"; \"X\")",
+        "\"b\u{e4}b\"\n", // "bäb"
+        &["-o", "json"],
+    )?;
+    assert_eq!(code, 0, "output: {output:?}");
+    assert_eq!(output.trim(), r#""XbXbX""#);
+    Ok(())
+}
+
+/// Astral-plane (4-byte UTF-8) rune advance -- a stricter version of the
+/// multi-byte case above, since a byte-wise off-by-one here would panic on
+/// a non-char-boundary slice rather than just producing wrong output.
+#[test]
+fn test_yq_sub_zero_width_astral_plane_rune_advance_1255() -> Result<()> {
+    let (output, code) = run_yq_stdin(
+        "sub(\"😀*\"; \"X\")",
+        "\"b\u{1f600}b\"\n", // "b😀b"
+        &["-o", "json"],
+    )?;
+    assert_eq!(code, 0, "output: {output:?}");
+    assert_eq!(output.trim(), r#""XbXbX""#);
+    Ok(())
+}
+
+/// Regression guard: a non-zero-width pattern (no empty match possible)
+/// must be completely unaffected by this fix -- #1069's own global-replace
+/// behavior for bare `sub` stays intact.
+#[test]
+fn test_yq_sub_non_zero_width_unaffected_1255() -> Result<()> {
+    let (output, code) = run_yq_stdin(r#"sub("a"; "X")"#, "\"aaa\"\n", &["-o", "json"])?;
+    assert_eq!(code, 0, "output: {output:?}");
+    assert_eq!(output.trim(), r#""XXX""#);
+    Ok(())
+}
+
+/// Empty input is its own edge case for the "previous match end" tracking
+/// (there's exactly one position, 0, and no prior match to collide with).
+#[test]
+fn test_yq_sub_zero_width_empty_input_1255() -> Result<()> {
+    let (output, code) = run_yq_stdin(r#"sub("a*"; "X")"#, "\"\"\n", &["-o", "json"])?;
+    assert_eq!(code, 0, "output: {output:?}");
+    assert_eq!(output.trim(), r#""X""#);
+    Ok(())
+}
+
+/// `match(re;"g")` shares `global_captures` with bare `sub` -- confirm the
+/// fix reaches it too, not just the replace path.
+#[test]
+fn test_yq_match_global_zero_width_1255() -> Result<()> {
+    let (output, code) = run_yq_stdin(r#"[match("a*";"g").string]"#, "\"bab\"\n", &["-o", "json"])?;
+    assert_eq!(code, 0, "output: {output:?}");
+    let v: serde_json::Value = serde_json::from_str(&output)?;
+    assert_eq!(v, serde_json::json!(["", "a", ""]));
+    Ok(())
+}
+
+/// `capture(re;"g")` also shares `global_captures` -- same check as
+/// `match` above, via the capture-object path instead of the match-string
+/// path.
+#[test]
+fn test_yq_capture_global_zero_width_1255() -> Result<()> {
+    let (output, code) = run_yq_stdin(
+        r#"[capture("(?P<x>a*)";"g")]"#,
+        "\"bab\"\n",
+        &["-o", "json"],
+    )?;
+    assert_eq!(code, 0, "output: {output:?}");
+    let v: serde_json::Value = serde_json::from_str(&output)?;
+    assert_eq!(v, serde_json::json!([{"x": ""}, {"x": "a"}, {"x": ""}]));
+    Ok(())
+}
+
+/// #1122 interaction: yq's 3-arg `sub` deletes every match with `""`,
+/// which makes a zero-width match's presence-or-absence unobservable (an
+/// empty span deletes nothing either way) -- confirmed this composes
+/// correctly with #1255's fix rather than needing separate handling.
+#[test]
+fn test_yq_sub_3arg_zero_width_interaction_1255_1122() -> Result<()> {
+    let (output, code) = run_yq_stdin(r#"sub("a*"; "X"; "g")"#, "\"bab\"\n", &["-o", "json"])?;
+    assert_eq!(code, 0, "output: {output:?}");
+    assert_eq!(output.trim(), r#""bb""#);
+    Ok(())
+}
+
+/// `gsub` is not a real yq builtin at any arity (#1436) -- confirm it
+/// deliberately does NOT get #1255's fix (stays on jq/Oniguruma-style
+/// iteration, since there's no yq oracle for it to match).
+#[test]
+fn test_yq_gsub_extension_keeps_jq_style_zero_width_1255() -> Result<()> {
+    let (output, code) = run_yq_stdin(r#"gsub("a*"; "X")"#, "\"bab\"\n", &["-o", "json"])?;
+    assert_eq!(code, 0, "output: {output:?}");
+    assert_eq!(output.trim(), r#""XbXXbX""#);
+    Ok(())
+}
+
+/// jq-mode regression guard: jq's own `gsub` (Oniguruma-style) must stay
+/// completely untouched by this yq-only fix.
+#[test]
+fn test_jq_gsub_zero_width_unaffected_by_1255() -> Result<()> {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .arg("jq")
+        .arg("-c")
+        .arg(r#""bab" | gsub("a*";"X")"#)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()?;
+    if let Some(mut stdin) = cmd.stdin.take() {
+        stdin.write_all(b"null")?;
+    }
+    let output = cmd.wait_with_output()?;
+    let stdout = String::from_utf8(output.stdout)?;
+    assert_eq!(stdout.trim(), r#""XbXXbX""#);
+    Ok(())
+}
