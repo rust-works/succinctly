@@ -179,9 +179,7 @@
 #   zero-output    #1045's "zero outputs means zero results" contract, extended
 #                  to the ~16 builtins that still report a bare "no value".
 
-contains_arg_fanout                        fan-out          contains(x) uses only x's first output — #1279
 inside_arg_fanout                          fan-out          inside(x) uses only x's first output — #1279
-has_arg_fanout                             fan-out          has(x) uses only x's first output — #1279
 ltrimstr_rtrimstr_arg_fanout               fan-out          ltrimstr/rtrimstr use only the first argument output — #1279
 startswith_endswith_arg_fanout             fan-out          startswith/endswith use only the first argument output — #1279
 split_sep_arg_fanout                       fan-out          split(sep) uses only sep's first output — #1279
@@ -216,7 +214,6 @@ setpath_value_outer_path_inner_order       fanout-order     setpath(p; v): VALUE
 range_three_arg_fanout_order               fanout-order     range(from; to; by): from outer, to middle, by inner — #1279
 gsub_replacement_transpose_absence_padded  fanout-order     gsub's multi-output replacement transposes, padded by absence not null — #840/#1279
 
-contains_arg_fanout_error_after_output     trailing-escape  the prefix is emitted before the argument's trailing error — #1277
 getpath_arg_fanout_error_after_output      trailing-escape  the prefix is emitted before the argument's trailing error — #1277
 range_from_fanout_halt_after_output        trailing-escape  range emits 1..9 before the from-bound's halt — #1277
 nth_stream_n_fanout_halt_after_output      trailing-escape  nth emits 2 before n's halt — #1277

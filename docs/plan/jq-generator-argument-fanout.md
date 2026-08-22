@@ -2,7 +2,7 @@
 
 [Home](../../) > [Docs](../) > [Plan](./) > Generator-argument fan-out
 
-**Status: Stage 0 (oracle capture) merged; Stages 1-9 open.** This document is the
+**Status: Stages 0-1 merged; Stages 2-9 open.** This document is the
 deliverable for [#1279](https://github.com/rust-works/succinctly/issues/1279), whose tier
 review (2026-08-20) classified it Tier 3 — "changes evaluation *shape* rather than fixing
 a local mistake … wants a design doc first". It also scopes
@@ -14,8 +14,8 @@ generator-argument model resolves more than one of them". It does: see
 | Stage | What                                                              | Status |
 |-------|-------------------------------------------------------------------|--------|
 | 0     | Oracle capture: 48 pinned goldens + 4 must-not-regress guards      | ✅ merged |
-| 1     | `stream_outputs` + `ArgFanout` + `fanout_arg`; `contains`          | open   |
-| 2     | Group A, `finish_owned` family (15 builtins)                      | open   |
+| 1     | `stream_outputs` + `ArgFanout` + `fanout_arg`; `contains` + `has` | ✅ merged |
+| 2     | Group A, `finish_owned` family (14 remaining)                     | open   |
 | 3     | Group A, bespoke-body family (`indices`/`index`/`rindex`/`test`/`bsearch`) | open |
 | 3b    | `pow`/`atan2` (`get_number_from_result`)                          | open   |
 | 4     | `resolve_node`'s `GetPath` arm (path context)                     | open   |
@@ -236,10 +236,12 @@ an unremarked mode difference.
 
 ### The unpacker already exists
 
-`object_outputs` in `src/jq/eval.rs` is already the all-values unpacker:
-`QueryResult -> (Vec<OwnedValue>, Option<Control>)`, with bare escapes becoming an empty
-prefix and `Partial` splitting into its prefix and control. Its own doc comment says it is
-"fully general", and `string_part_outputs` already reuses it for #1403.
+`stream_outputs` in `src/jq/eval.rs` (named `object_outputs` before Stage 1) was already
+the all-values unpacker: `QueryResult -> (Vec<OwnedValue>, Option<Control>)`, with bare
+escapes becoming an empty prefix and `Partial` splitting into its prefix and control. Its
+own doc comment already said it was "fully general", and `string_part_outputs` already
+reused it for #1403 — so Stage 1 renamed it and generalised the doc rather than adding
+anything.
 
 Two consequences:
 
@@ -251,8 +253,7 @@ Two consequences:
   `result_to_owned_full` only because *that* function keeps one value and so has no honest
   prefix to emit.
 
-The work is to **rename it `stream_outputs`**, generalise its doc, and update its three
-existing callers. Everything new is the driver, not the unpacker.
+Everything new is the driver, not the unpacker.
 
 ### The drivers
 
