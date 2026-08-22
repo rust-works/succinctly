@@ -1783,18 +1783,19 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                         // Check if value needs newline
                         let value = field.value_cursor();
                         if is_yaml_cursor_container(&value) && value.style() != "flow" {
-                            // A comment trailing the key's own line, when
-                            // the value is deferred to the next line,
-                            // belongs to the key, not the value (#765).
-                            write_line_comment(out, field.key_cursor().line_comment_raw())?;
-                            // The anchor (if any) belongs on the same
-                            // line as the key, before the newline that
-                            // starts the container's own contents.
-                            if let Some(anchor) = value.anchor() {
-                                out.write_char(' ')?;
-                                out.write_char('&')?;
-                                out.write_str(anchor)?;
-                            }
+                            // The key's own trailing comment (#765), then
+                            // the anchor/tag -- both via the same helper
+                            // #1077/#1113's scalar/absent branch uses, so
+                            // this branch stops hand-writing (and dropping)
+                            // the tag, and stops mis-placing the anchor
+                            // after the comment instead of on its own line
+                            // (#1132).
+                            write_deferred_prefix(
+                                out,
+                                field.key_cursor().line_comment_raw(),
+                                value.anchor(),
+                                value.explicit_tag(),
+                            )?;
                             out.write_char('\n')?;
                             let child_indent = deeper_yaml_indent(indent, indent_spaces, unit);
                             out.write_str(&child_indent)?;
@@ -1921,9 +1922,11 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                         // pre-existing gap, out of scope for #785.)
                         let style = cursor.style();
                         if is_yaml_cursor_container(&cursor) && style != "flow" {
-                            if let Some(anchor) = cursor.anchor() {
-                                out.write_str("- &")?;
-                                out.write_str(anchor)?;
+                            let anchor = cursor.anchor();
+                            let tag = cursor.explicit_tag();
+                            if anchor.is_some() || tag.is_some() {
+                                out.write_char('-')?;
+                                write_deferred_prefix(out, None, anchor, tag)?;
                                 out.write_char('\n')?;
                                 let child_indent = deeper_yaml_indent(indent, indent_spaces, unit);
                                 out.write_str(&child_indent)?;
@@ -6484,6 +6487,53 @@ fn is_deferred_value_absent<W: AsRef<[u64]>>(value: &YamlCursor<'_, W>) -> bool 
     }
 }
 
+/// Writes a mapping key's own trailing comment (if any), then an anchor
+/// and/or explicit tag -- the part of a deferred value's rendering shared
+/// by the scalar/absent-value branch (`write_deferred_value`) and the
+/// container-value branch of `stream_yaml_value`'s block-style loop
+/// (#1132; previously duplicated by hand in the latter, which dropped the
+/// tag entirely and mis-placed the anchor after a key comment).
+///
+/// Two orderings, both verified against yq v4.53.3:
+/// - No key comment: ` &anchor` then ` !!tag` on the *current* line (the
+///   line the key's own `:` is on) -- #1077's original rule, unchanged.
+/// - Key comment present: the comment is written first, then a newline,
+///   then the anchor/tag on their own line -- at *absolute column 0*, not
+///   the key's own indent, confirmed even when the key itself is nested
+///   (`parent:\n  k: # c\n&anc\n    a: 1` is real yq's own output, not
+///   `parent:\n  k: # c\n  &anc\n    a: 1`).
+///
+/// `write_deferred_value` always passes `None` for `key_comment`: its own
+/// comment handling lives at its call site, unchanged from #1077/#1113, so
+/// this extraction can't regress it (verified: passing `None` reproduces
+/// that function's prior inline logic byte-for-byte).
+fn write_deferred_prefix<Out: core::fmt::Write>(
+    out: &mut Out,
+    key_comment: Option<&str>,
+    anchor: Option<&str>,
+    tag: Option<&str>,
+) -> core::fmt::Result {
+    if let Some(comment) = key_comment {
+        write_line_comment(out, Some(comment))?;
+        if anchor.is_some() || tag.is_some() {
+            out.write_char('\n')?;
+        }
+    } else if anchor.is_some() || tag.is_some() {
+        out.write_char(' ')?;
+    }
+    if let Some(anchor) = anchor {
+        out.write_char('&')?;
+        out.write_str(anchor)?;
+        if tag.is_some() {
+            out.write_char(' ')?;
+        }
+    }
+    if let Some(tag) = tag {
+        out.write_str(tag)?;
+    }
+    Ok(())
+}
+
 /// Writes a possibly-absent value's anchor, explicit tag, and (if not
 /// absent) its own rendering -- shared by the mapping-field and
 /// sequence-item branches of `stream_yaml_value`'s block-style loops,
@@ -6510,20 +6560,14 @@ fn write_deferred_value<Out: core::fmt::Write, W: AsRef<[u64]>>(
     let absent = is_deferred_value_absent(value);
     let anchor = value.anchor();
     let tag = if absent { value.explicit_tag() } else { None };
-    if anchor.is_some() || tag.is_some() || !absent {
-        out.write_char(' ')?;
-    }
-    if let Some(anchor) = anchor {
-        out.write_char('&')?;
-        out.write_str(anchor)?;
-        if tag.is_some() || !absent {
-            out.write_char(' ')?;
-        }
-    }
-    if let Some(tag) = tag {
-        out.write_str(tag)?;
-    }
+    write_deferred_prefix(out, None, anchor, tag)?;
     if !absent {
+        // Neither `write_deferred_prefix` nor the anchor/tag it may have
+        // just written know a value follows -- exactly one separator space
+        // always belongs here regardless of whether anchor/tag were
+        // present (`: value` or `: &anchor value`), matching the original,
+        // un-extracted logic's `|| !absent` conditions byte-for-byte.
+        out.write_char(' ')?;
         let child_indent = deeper_yaml_indent(indent, indent_spaces, unit);
         value.stream_yaml_value(out, &child_indent, indent_spaces, unit, sort_keys, false)?;
     }
@@ -6625,6 +6669,36 @@ fn write_yaml_child_inline<W: AsRef<[u64]>, Out: core::fmt::Write>(
         out.write_str(anchor)?;
         out.write_char(' ')?;
     }
+    // The flow-style twin of #1132's block-style tag loss: a container
+    // value's own `stream_yaml_value` dispatch below doesn't write an
+    // explicit tag itself, unlike a *scalar* value's, which already does
+    // (verified live: `{a: &anc !!str 1}` already round-trips its tag
+    // correctly, so this must stay container-only or a scalar's tag would
+    // be written twice). `is_container()`, not `is_yaml_cursor_container`
+    // (which excludes an *empty* container): `{a: &anc !!mytag {}}` drops
+    // its tag today too, same bug, and there's no separate scalar dispatch
+    // for an empty container to collide with.
+    if value.is_container() {
+        if let Some(tag) = value.explicit_tag() {
+            out.write_str(tag)?;
+            out.write_char(' ')?;
+        }
+    }
+    // A flow-context value that materializes as nothing at all still needs
+    // *some* token -- unlike block style, where #1077's `write_deferred_value`
+    // can just leave it out entirely -- because a following `,`/`}`/`]`
+    // needs something to close over. Real yq synthesizes a single-quoted
+    // empty string specifically (`''`) for this, not the double-quoted
+    // `""` its own scalar dispatch below would otherwise write for a
+    // *literal* empty string in the source (`{a: "", b: 1}` stays `""`) --
+    // confirmed live, both with and without an anchor (`{a: &anc, b: 1}`
+    // and `{a: , b: 1}` both give `''`). Not a general quoting-convention
+    // difference (#1115's own survey found every other empty-string
+    // position -- block value, flow/block sequence item, flow mapping key
+    // -- already matches real yq's `""`), just this one synthesized case.
+    if is_deferred_value_absent(&value) {
+        return out.write_str("''");
+    }
     value.stream_yaml_value(out, "", 0, unit, sort_keys, false)
 }
 
@@ -6687,10 +6761,18 @@ fn write_flow_last_item_comment<Out: core::fmt::Write>(
 /// each (#478); an `OwnedValue`-based `IndexMap` cannot represent those.
 ///
 /// Mirrors the `Sequence` block/flow-style rendering in `stream_yaml_value`
-/// exactly (same container-vs-scalar branching, same empty-sequence `"[]"`
-/// shortcut, same `#785` compact-form handling and per-item trailing-
-/// comment write) so multi-document slurped output matches single-document
-/// M2 streaming byte-for-byte.
+/// (same container-vs-scalar branching, same empty-sequence `"[]"`
+/// shortcut, same `#785` compact-form handling, same anchor/tag handling
+/// via `write_deferred_prefix`, and per-item trailing-comment write) so
+/// multi-document slurped output matches single-document M2 streaming --
+/// with one known exception: #1077's deferred-and-absent-value handling
+/// (an item's value materializing as nothing at all, e.g. `a:` with
+/// nothing following) is `stream_yaml_value`-only. A slurped document's own
+/// top-level scalar is never "deferred to a sibling" the way a
+/// mapping-field/sequence-item value can be — no repro reaching that shape
+/// through `--slurp`'s own construction has been found (#1115) — so this
+/// function doesn't special-case it. If one ever turns up, route through
+/// `write_deferred_value` here too.
 pub fn stream_yaml_sequence<'a, W, I, Out>(
     cursors: I,
     out: &mut Out,
@@ -6740,9 +6822,11 @@ where
             // general string form) is exact, not an approximation.
             let style = cursor.style();
             if is_yaml_cursor_container(&cursor) && style != "flow" {
-                if let Some(anchor) = cursor.anchor() {
-                    out.write_str("- &")?;
-                    out.write_str(anchor)?;
+                let anchor = cursor.anchor();
+                let tag = cursor.explicit_tag();
+                if anchor.is_some() || tag.is_some() {
+                    out.write_char('-')?;
+                    write_deferred_prefix(out, None, anchor, tag)?;
                     out.write_char('\n')?;
                     let child_indent = deeper_yaml_indent("", current_indent + indent_spaces, unit);
                     out.write_str(&child_indent)?;
