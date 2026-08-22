@@ -1040,6 +1040,18 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     /// ([`Self::reject_trailing_flow_content`]) finds the offending byte
     /// via a local scan cursor, before `self.pos` itself has advanced past
     /// it.
+    ///
+    /// The `None` (true-EOF) arm carries no coverage from any test, before
+    /// or after this helper's own introduction: two of the 8 call sites
+    /// (`parse_flow_sequence_inner`/`parse_flow_mapping_inner`'s comma
+    /// checks) have their own dedicated `self.peek().is_none()` ->
+    /// `YamlError::UnexpectedEof` guard immediately before reaching this
+    /// call, and the remaining key-colon sites are only ever entered once a
+    /// `looks_like_*_entry`-style lookahead has already confirmed a `:`
+    /// exists later in the input, making true EOF before finding *some*
+    /// byte structurally unlikely there too -- not verified with the same
+    /// rigor as `parse_block_scalar_header`'s catch-all below, so kept as a
+    /// real (not `unreachable!()`) fallback rather than a proven-dead one.
     fn err_unexpected_char(&self, offset: usize, context: &'static str) -> YamlError {
         let char = match self.input.get(offset) {
             None => '\0',
