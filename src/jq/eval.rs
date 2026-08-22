@@ -28,6 +28,7 @@ use core::cell::Cell;
 
 use indexmap::{IndexMap, IndexSet};
 
+use super::document::{effective_fields, effective_len};
 use super::slice::{self, SliceBounds};
 
 /// Which `EvalSemantics` implementor a value carries, as a runtime tag.
@@ -124,6 +125,27 @@ pub trait EvalSemantics: Copy + Default {
     /// operand still errors in both modes either way -- real yq has no
     /// symmetric identity for `-` the way it does for `null - x`.
     const SUB_LEFT_NULL_IS_IDENTITY: bool;
+    /// If true (jq, #1385), a repeated object key collapses to a single
+    /// field keeping its *first* position but its *last* value -- exactly
+    /// `IndexMap::insert` semantics. Live-verified against jq 1.7.1 and
+    /// 1.8.2: `{"b":1,"a":2,"b":3}` yields `{"b":3,"a":2}` for `.`, `2`
+    /// for `length`, `["a","b"]` for `keys` and `[3,2]` for `[.[]]`. jq
+    /// collapses when *building* the value, not when lexing -- its own
+    /// `--stream` still emits every occurrence -- so this is a property
+    /// of the value model, not of parsing.
+    ///
+    /// If false (yq), every occurrence is kept, distinct: duplicate
+    /// mapping keys are real data a YAML document can legitimately carry,
+    /// and real yq v4.53.3 preserves them for `.`, `length`, `to_entries`
+    /// and `keys` alike -- for a JSON-sourced document just as much as a
+    /// YAML-sourced one, which is why this rule belongs on the *mode*
+    /// axis rather than on the per-format `DocumentFields` trait where it
+    /// used to live (ADR-0018 rule 2). Real yq does collapse under `.[]`
+    /// alone; reproducing that lone inconsistency is #1398, not this flag.
+    ///
+    /// The jq CLI's `--preserve-input` extension keeps every occurrence
+    /// regardless, via its own `jq_compat` gate -- ADR-0018 rule 5.
+    const COLLAPSE_DUPLICATE_KEYS: bool;
 }
 
 /// jq-compatible evaluation semantics (default).
@@ -147,6 +169,7 @@ impl EvalSemantics for JqSemantics {
     const STRICT_NUMERIC_EQUALITY: bool = false;
     const ADD_RIGHT_NULL_REQUIRES_CONCAT_TYPE: bool = false;
     const SUB_LEFT_NULL_IS_IDENTITY: bool = false;
+    const COLLAPSE_DUPLICATE_KEYS: bool = true;
 }
 
 /// yq-compatible evaluation semantics.
@@ -172,6 +195,7 @@ impl EvalSemantics for YqSemantics {
     const STRICT_NUMERIC_EQUALITY: bool = true;
     const ADD_RIGHT_NULL_REQUIRES_CONCAT_TYPE: bool = true;
     const SUB_LEFT_NULL_IS_IDENTITY: bool = true;
+    const COLLAPSE_DUPLICATE_KEYS: bool = false;
 }
 
 use crate::json::light::{JsonCursor, JsonElements, JsonFields, StandardJson};
@@ -704,8 +728,15 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 let results: Vec<_> = elements.collect();
                 QueryResult::Many(results)
             }
+            // Duplicate keys collapse here in jq mode (#1385): the object
+            // jq iterates has already had a repeated key reduced to one
+            // member. yq keeps every occurrence, so `effective_fields`
+            // degenerates to the plain walk this used to do inline.
             StandardJson::Object(fields) => {
-                let results: Vec<_> = fields.map(|f| f.value()).collect();
+                let results: Vec<_> = effective_fields(&fields, S::COLLAPSE_DUPLICATE_KEYS)
+                    .into_iter()
+                    .map(|f| f.value)
+                    .collect();
                 QueryResult::Many(results)
             }
             _ if optional => QueryResult::None,
@@ -3589,7 +3620,7 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         }
 
         // Length & Keys
-        Builtin::Length => builtin_length::<W>(value, optional),
+        Builtin::Length => builtin_length::<W, S>(value, optional),
         Builtin::Utf8ByteLength => builtin_utf8bytelength(value, optional),
         Builtin::Keys => builtin_keys::<W>(value, optional, true),
         Builtin::KeysUnsorted => builtin_keys::<W>(value, optional, false),
@@ -3928,7 +3959,7 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 }
 
 /// Builtin: length
-fn builtin_length<W: Clone + AsRef<[u64]>>(
+fn builtin_length<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'_, W>,
     optional: bool,
 ) -> QueryResult<'_, W> {
@@ -3944,9 +3975,11 @@ fn builtin_length<W: Clone + AsRef<[u64]>>(
         StandardJson::Array(elements) => {
             QueryResult::Owned(OwnedValue::Int((*elements).count() as i64))
         }
-        StandardJson::Object(fields) => {
-            QueryResult::Owned(OwnedValue::Int((*fields).count() as i64))
-        }
+        // Distinct keys in jq mode (#1385); every occurrence in yq mode.
+        StandardJson::Object(fields) => QueryResult::Owned(OwnedValue::Int(effective_len(
+            fields,
+            S::COLLAPSE_DUPLICATE_KEYS,
+        ) as i64)),
         StandardJson::Number(n) => {
             // Length of a number is its absolute value.
             // checked_abs: i64::MIN has no i64 absolute value; use f64

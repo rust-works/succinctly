@@ -10,7 +10,7 @@ use std::io::{BufWriter, IsTerminal, Read, Write};
 use std::path::Path;
 
 use succinctly::jq::document::{
-    DocumentCursor, DocumentElements, DocumentFields, DocumentValue, IndentSpec,
+    effective_keys, DocumentCursor, DocumentElements, DocumentFields, DocumentValue, IndentSpec,
 };
 use succinctly::jq::eval_generic::{
     assert_nesting_depth, eval_with_cursor_using, to_owned as generic_to_owned,
@@ -1389,8 +1389,12 @@ fn evaluate_yaml_cursor<W: AsRef<[u64]> + Clone>(
         // Handled anyway for exhaustiveness and because the generic
         // evaluator is shared with `jq` (#140's `Pipe` dispatch is generic
         // over `V: DocumentValue`).
-        GenericResult::LazyKeys { fields, sorted } => {
-            let mut keys = fields.keys();
+        GenericResult::LazyKeys {
+            fields,
+            sorted,
+            collapse,
+        } => {
+            let mut keys = effective_keys(&fields, collapse);
             if sorted {
                 keys.sort();
             }
