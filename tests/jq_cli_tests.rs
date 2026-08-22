@@ -14263,23 +14263,25 @@ fn test_reduce_as_pattern_respects_pattern_depth_limit_1201() -> Result<()> {
 }
 
 /// #1201 deliberately scoped out `?//` alternatives in the `reduce`/`foreach`
-/// clause: real jq accepts them, but retrying an alternative after the body
-/// errors requires rolling the accumulator back to the element's pre-UPDATE
-/// value, which the fold can't express. Tracked by #1365.
-///
-/// This pins the *current* divergence so it can't drift silently -- it is
-/// expected to fail, and should be replaced by a behaviour test, when #1365
-/// lands.
+/// clause, tracked by #1365, which now implements them. Verified against
+/// jq 1.7.1: `[[1],{"a":2}]` -- `[1]` matches `[$a]` (a=1), `{"a":2}`
+/// doesn't match `[$a]` (type error) so falls to `{a:$a}` (a=2) -- 0+1=1,
+/// then 1+2=3.
 #[test]
-fn test_reduce_foreach_reject_pattern_alternatives_1201() -> Result<()> {
-    for query in [
-        "reduce .[] as [$a] ?// {a:$a} (0; . + $a)",
-        "foreach .[] as [$a] ?// {a:$a} (0; . + $a; .)",
-    ] {
-        let (out, err, code) = run_jq_full(&["-c", query], Some(r#"[[1],{"a":2}]"#))?;
-        assert_ne!(code, 0, "`{query}` should not compile\nout={out:?}");
-        assert!(err.contains("compile error"), "`{query}`\nerr={err}");
-    }
+fn test_reduce_foreach_accept_pattern_alternatives_1365() -> Result<()> {
+    let (out, err, code) = run_jq_full(
+        &["-c", "reduce .[] as [$a] ?// {a:$a} (0; . + $a)"],
+        Some(r#"[[1],{"a":2}]"#),
+    )?;
+    assert_eq!(code, 0, "err={err}");
+    assert_eq!(out.trim(), "3");
+
+    let (out, err, code) = run_jq_full(
+        &["-c", "[foreach .[] as [$a] ?// {a:$a} (0; . + $a; .)]"],
+        Some(r#"[[1],{"a":2}]"#),
+    )?;
+    assert_eq!(code, 0, "err={err}");
+    assert_eq!(out.trim(), "[1,3]");
     Ok(())
 }
 

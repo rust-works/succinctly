@@ -816,19 +816,19 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         }
         Expr::Reduce {
             input,
-            pattern,
+            patterns,
             init,
             update,
-        } => eval_reduce::<W, S>(input, pattern, init, update, value, optional),
+        } => eval_reduce::<W, S>(input, patterns, init, update, value, optional),
         Expr::Foreach {
             input,
-            pattern,
+            patterns,
             init,
             update,
             extract,
         } => eval_foreach::<W, S>(
             input,
-            pattern,
+            patterns,
             init,
             update,
             extract.as_deref(),
@@ -17496,15 +17496,16 @@ fn substitute_var_impl(
         }
         Expr::Reduce {
             input,
-            pattern,
+            patterns,
             init,
             update,
         } => {
-            // Shadowed if the pattern binds var_name anywhere (#1201; mirrors
-            // `Expr::AsPattern`'s own `pattern_binds_var` shadow check just
-            // above, since a bare `$var` binding is just the single-variable
-            // case of this same question).
-            if pattern_binds_var(pattern, var_name) {
+            // Shadowed if *any* alternative pattern binds var_name (#1201,
+            // #1365; mirrors `Expr::AsPattern`'s own `pattern_binds_var`
+            // shadow check just above, since a bare `$var` binding is just
+            // the single-variable, single-alternative case of this same
+            // question).
+            if patterns.iter().any(|p| pattern_binds_var(p, var_name)) {
                 Expr::Reduce {
                     input: Box::new(substitute_var_impl(
                         input,
@@ -17512,7 +17513,7 @@ fn substitute_var_impl(
                         replacement,
                         mark_trackable,
                     )),
-                    pattern: pattern.clone(),
+                    patterns: patterns.clone(),
                     init: Box::new(substitute_var_impl(
                         init,
                         var_name,
@@ -17529,7 +17530,7 @@ fn substitute_var_impl(
                         replacement,
                         mark_trackable,
                     )),
-                    pattern: pattern.clone(),
+                    patterns: patterns.clone(),
                     init: Box::new(substitute_var_impl(
                         init,
                         var_name,
@@ -17547,12 +17548,12 @@ fn substitute_var_impl(
         }
         Expr::Foreach {
             input,
-            pattern,
+            patterns,
             init,
             update,
             extract,
         } => {
-            if pattern_binds_var(pattern, var_name) {
+            if patterns.iter().any(|p| pattern_binds_var(p, var_name)) {
                 Expr::Foreach {
                     input: Box::new(substitute_var_impl(
                         input,
@@ -17560,7 +17561,7 @@ fn substitute_var_impl(
                         replacement,
                         mark_trackable,
                     )),
-                    pattern: pattern.clone(),
+                    patterns: patterns.clone(),
                     init: Box::new(substitute_var_impl(
                         init,
                         var_name,
@@ -17578,7 +17579,7 @@ fn substitute_var_impl(
                         replacement,
                         mark_trackable,
                     )),
-                    pattern: pattern.clone(),
+                    patterns: patterns.clone(),
                     init: Box::new(substitute_var_impl(
                         init,
                         var_name,
@@ -18845,10 +18846,110 @@ fn charge_budget(budget: &mut usize, what: &str) -> Option<Control> {
     None
 }
 
-/// Evaluate `reduce`: `reduce EXPR as $var (INIT; UPDATE)`.
+/// Try each `?//`-separated pattern alternative (#1365) for one `reduce`
+/// fold step, in order, against a single `input_val`.
+///
+/// Unlike [`try_pattern_alternatives`] (which backs `. as PATTERN ?//` and
+/// has no accumulator to roll back -- each alternative's body eval is
+/// independent), a `reduce` step's UPDATE reads the fold accumulator via
+/// `.`, so a failed alternative's effect on it has to be threaded through
+/// explicitly. The accumulator-threading rule here is verified against the pinned
+/// oracle (jq 1.7.1), not assumed -- and it is *not* "roll back to the
+/// pre-step accumulator and retry cleanly", which is what the pre-#1365
+/// single-pattern code's own shape (and `try_pattern_alternatives`'s
+/// unrelated, accumulator-free retry) would suggest. Instead:
+///
+/// - A **pattern-match failure** leaves `state` untouched (UPDATE never
+///   ran, so there is nothing to update it with) -- `reduce (5) as {a:$x}
+///   ?// $y (99; [., $x, $y])` is `[99,null,5]`: alt1's `{a:$x}` type-errors
+///   against `5` before UPDATE ever runs, and alt2 still sees `99`.
+/// - A **body `Error` or `Break`** still updates `state` first, exactly
+///   like a non-retried step (`update_vals.last()`, defaulting to `null`
+///   on zero output) -- *then* falls through. The next alternative resumes
+///   from whatever the failed attempt produced, not from the original
+///   accumulator: `reduce .[] as {a:$x} ?// {a:$y} (100; if $x==1 then
+///   error("boom") else .+$x+$y end)` on `[{"a":1},{"a":2}]` gives `1`
+///   then `3` -- alt1 errors with zero output (state resets to `null`),
+///   alt2 then computes `null+null+1` = `1` (jq's `null + n` = `n`), not
+///   `100+null+1` = `101`.
+/// - `Break` retrying at all (rather than propagating immediately) also
+///   diverges from `try_pattern_alternatives`'s own doc comment for `.
+///   as PATTERN ?//`, which claims break never retries there -- verified
+///   independently here: `label $out | (. as {a:$x} ?// {a:$y} | if
+///   $x==1 then break $out else [$x,$y] end)` on `{"a":1}` is `[null,1]`
+///   (alt2's output), not an uncaught break reaching `label $out`. That
+///   existing doc comment appears itself to be wrong; see #1365's filed
+///   follow-up rather than trusting it without live-checking, per this
+///   codebase's "never state a jq/yq behaviour from memory" rule.
+/// - `Halt` alone always propagates immediately, never retried.
+/// - The last alternative propagates its failure instead of falling
+///   through, whatever `state` it leaves behind is irrelevant (the caller
+///   never observes it once a `Control` aborts the fold).
+///
+/// Charges `budget` once per alternative whose pattern actually bound (not
+/// once per element, and not for a pattern-match failure, which never
+/// reaches UPDATE) -- each successful bind is a genuine extra evaluator
+/// invocation (#695).
+fn try_reduce_step_alternatives<S: EvalSemantics>(
+    patterns: &[Pattern],
+    all_var_names: &[String],
+    update: &Expr,
+    input_val: &OwnedValue,
+    acc_input: OwnedValue,
+    optional: bool,
+    budget: &mut usize,
+) -> (OwnedValue, Option<Control>) {
+    let invert_dedup = patterns.len() > 1;
+    let last_idx = patterns.len() - 1;
+    let mut state = acc_input;
+
+    for (i, pattern) in patterns.iter().enumerate() {
+        let is_last = i == last_idx;
+
+        let bindings = match extract_pattern_bindings(pattern, input_val, invert_dedup) {
+            Ok(b) => b,
+            Err(e) => {
+                if is_last {
+                    return (state, Some(Control::Error(e)));
+                }
+                continue;
+            }
+        };
+
+        if let Some(control) = charge_budget(budget, "reduce") {
+            return (state, Some(control));
+        }
+
+        let mut substituted = substitute_bindings(update, &bindings);
+        for var_name in all_var_names {
+            if !bindings.iter().any(|(name, _)| name == var_name) {
+                substituted = substitute_var(&substituted, var_name, &OwnedValue::Null);
+            }
+        }
+
+        let (update_vals, update_control) =
+            eval_owned_expr_fork::<S>(&substituted, &state, optional);
+        // Unconditional, mirroring the pre-#1365 single-pattern fold's own
+        // "acc = update_vals.into_iter().last()" -- run even when
+        // `update_control` is `Some(..)`, since a retried alternative
+        // resumes from exactly this value (see doc comment above).
+        state = update_vals.into_iter().last().unwrap_or(OwnedValue::Null);
+        match update_control {
+            None => return (state, None),
+            Some(Control::Error(_) | Control::Break(_)) if !is_last => {}
+            Some(control) => return (state, Some(control)),
+        }
+    }
+
+    unreachable!(
+        "patterns is non-empty by construction; the loop always returns on its last iteration"
+    )
+}
+
+/// Evaluate `reduce`: `reduce EXPR as PATTERN (?// PATTERN)* (INIT; UPDATE)`.
 fn eval_reduce<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     input: &Expr,
-    pattern: &Pattern,
+    patterns: &[Pattern],
     init: &Expr,
     update: &Expr,
     value: StandardJson<'a, W>,
@@ -18900,70 +19001,51 @@ fn eval_reduce<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             QueryResult::Partial(vs, control) => (vs, Some(control)),
         };
 
-    // Destructuring `pattern` (and substituting its bindings) into UPDATE
-    // only depends on `input_val`, not on which INIT fork is running --
-    // hoist it out of the INIT-fork loop so a query with N INIT outputs
-    // pays for the AST rebuild once per input element, not N times (#695).
-    // Skipped entirely when there are no INIT forks to consume it.
     if init_values.is_empty() {
         return finish_fork(Vec::new(), init_control, optional);
     }
-    // `Result`, not `Expr` -- a full destructuring pattern (#1201) can fail
-    // to match a given input element (`reduce .[] as {a:$a} (...)` on a
-    // non-object element), unlike the bare-`$var` case this replaces, which
-    // never fails. Computed eagerly per element (matching the existing
-    // per-element hoist above), but the failure itself is only surfaced
-    // when the loop below actually reaches that element -- see
-    // `substitute_pattern`'s own doc comment for why eager-computation-but-
-    // lazy-surfacing matters here.
-    let substituted_updates: Vec<Result<Expr, EvalError>> = input_values
-        .iter()
-        .map(|v| substitute_pattern(update, pattern, v))
-        .collect();
+
+    // Every name any alternative could bind (#1365) -- a name unbound by
+    // whichever alternative actually matches defaults to `null` in UPDATE,
+    // matching `eval_as_pattern`'s identical convention for `. as PATTERN
+    // ?//`. Patterns-only, so this is independent of both `input_values`
+    // and the INIT-fork loop -- hoisted the same way the pre-#1365 single-
+    // pattern destructuring was, just narrower (it can no longer also hoist
+    // the *destructuring itself*, since which alternative wins now depends
+    // on the accumulator UPDATE reads via `.`, which varies per INIT fork).
+    let mut all_var_names: Vec<String> = Vec::new();
+    for pattern in patterns {
+        collect_pattern_var_names(pattern, &mut all_var_names);
+    }
+    all_var_names.sort_unstable();
+    all_var_names.dedup();
 
     let mut outputs: Vec<OwnedValue> = Vec::new();
     // Shared across every INIT fork (#695), the same "whole tree, not
     // per-branch" accounting `WHILE_UNTIL_MAX_STEPS` uses.
     let mut budget = REDUCE_FOREACH_MAX_STEPS;
     for init_val in init_values {
-        // The accumulator is a variable UPDATE rebinds; a step whose UPDATE
-        // produces zero outputs leaves it unbound rather than ending the
-        // fold — `None` here models that, read back as `null` (jq's
-        // `LOADVN`), not as "this fork produces nothing" (#534). Verified:
-        // `reduce (1,2) as $x (0; if $x==2 then empty else .+$x end)` is
-        // `null`, not empty output.
-        let mut acc: Option<OwnedValue> = Some(init_val);
+        let mut acc = init_val;
         let mut aborted: Option<Control> = None;
-        for substituted in &substituted_updates {
-            if let Some(control) = charge_budget(&mut budget, "reduce") {
-                aborted = Some(control);
-                break;
-            }
-            let substituted = match substituted {
-                Ok(expr) => expr,
-                Err(e) => {
-                    aborted = Some(Control::Error(e.clone()));
-                    break;
-                }
-            };
-            // `acc` is unconditionally overwritten below, so moving it out
-            // (rather than cloning) is sound — nothing reads the old value
-            // again (#695).
-            let acc_input = acc.take().unwrap_or(OwnedValue::Null);
-            let (update_vals, update_control) =
-                eval_owned_expr_fork::<S>(substituted, &acc_input, optional);
-            // Only the last output of a multi-output UPDATE becomes the new
-            // accumulator — verified: `reduce (1,2) as $x (0; .+$x, .)` is
-            // `0`, not an error from folding an array.
-            acc = update_vals.into_iter().last();
-            if let Some(control) = update_control {
+        for input_val in &input_values {
+            let (new_acc, step_control) = try_reduce_step_alternatives::<S>(
+                patterns,
+                &all_var_names,
+                update,
+                input_val,
+                acc,
+                optional,
+                &mut budget,
+            );
+            acc = new_acc;
+            if let Some(control) = step_control {
                 aborted = Some(control);
                 break;
             }
         }
         match aborted {
             Some(control) => return finish_fork(outputs, Some(control), optional),
-            None => outputs.push(acc.unwrap_or(OwnedValue::Null)),
+            None => outputs.push(acc),
         }
     }
 
@@ -19262,9 +19344,136 @@ fn eval_owned_input<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 }
 
 /// Evaluate `foreach`: `foreach EXPR as $var (INIT; UPDATE)` or `foreach EXPR as $var (INIT; UPDATE; EXTRACT)`.
+/// Try each `?//`-separated pattern alternative (#1365) for one `foreach`
+/// step, in order, against a single `input_val`.
+///
+/// Only UPDATE participates in the `?//` retry -- the state-threading rule
+/// is identical to [`try_reduce_step_alternatives`]'s (a pattern-match
+/// failure leaves `state` untouched; a body `Error`/`Break` still updates
+/// it first, from whatever partial output that attempt produced, *then*
+/// falls through; `Halt` alone always propagates immediately) -- see that
+/// function's own doc comment for the oracle-verified rationale and repro,
+/// which applies here unchanged.
+///
+/// EXTRACT runs only once UPDATE has picked a winning alternative, fanning
+/// out over every one of UPDATE's (possibly multiple) outputs using that
+/// same alternative's bindings; an EXTRACT error/break/halt propagates
+/// directly, without retrying a different alternative. This is a
+/// deliberately narrower scope than real jq's own behavior: live-probing
+/// found that when EXTRACT itself errors, real jq retries by re-running
+/// UPDATE *again* with the next alternative, feeding it the failed EXTRACT
+/// call's own input as UPDATE's new state (`foreach .[] as {a:$x} ?//
+/// {a:$y} (0; .+1, .+2; if . == 2 then error("boom") else [$x,$y,.] end)`
+/// on `[{"a":1}]` is `[[1,null,1],[null,1,3],[null,1,4]]` -- the `3`/`4`
+/// only make sense as `.+1, .+2` re-run against state `2`, the failed
+/// EXTRACT call's own input). That interaction is substantially stranger
+/// than anything else `?//` does elsewhere in this codebase and reads as
+/// an accidental byproduct of jq's bytecode compilation rather than a
+/// designed behavior; reproducing it is left as a follow-up (#1365) rather
+/// than blocking this one on fully reverse-engineering it.
+///
+/// Appends every EXTRACT (or bare UPDATE, when EXTRACT is absent) output
+/// straight into `outputs` (mirroring `eval_foreach`'s own "the steps
+/// already produced don't vanish", #494) and charges `budget` once per
+/// UPDATE bind attempted plus once per EXTRACT call, matching the
+/// pre-#1365 accounting.
+#[allow(clippy::too_many_arguments)]
+fn try_foreach_step_alternatives<S: EvalSemantics>(
+    patterns: &[Pattern],
+    all_var_names: &[String],
+    update: &Expr,
+    extract: Option<&Expr>,
+    input_val: &OwnedValue,
+    state_input: OwnedValue,
+    optional: bool,
+    budget: &mut usize,
+    outputs: &mut Vec<OwnedValue>,
+) -> (OwnedValue, Option<Control>) {
+    let invert_dedup = patterns.len() > 1;
+    let last_idx = patterns.len() - 1;
+    let mut state = state_input;
+
+    for (i, pattern) in patterns.iter().enumerate() {
+        let is_last = i == last_idx;
+
+        let bindings = match extract_pattern_bindings(pattern, input_val, invert_dedup) {
+            Ok(b) => b,
+            Err(e) => {
+                if is_last {
+                    return (state, Some(Control::Error(e)));
+                }
+                continue;
+            }
+        };
+
+        if let Some(control) = charge_budget(budget, "foreach") {
+            return (state, Some(control));
+        }
+
+        let null_fill = |expr: &Expr| {
+            let mut substituted = substitute_bindings(expr, &bindings);
+            for var_name in all_var_names {
+                if !bindings.iter().any(|(name, _)| name == var_name) {
+                    substituted = substitute_var(&substituted, var_name, &OwnedValue::Null);
+                }
+            }
+            substituted
+        };
+        let substituted_update = null_fill(update);
+
+        let (update_vals, update_control) =
+            eval_owned_expr_fork::<S>(&substituted_update, &state, optional);
+        // Unconditional, mirroring `try_reduce_step_alternatives`'s own
+        // rule -- a retried alternative resumes from exactly this value.
+        state = update_vals.last().cloned().unwrap_or(OwnedValue::Null);
+
+        // EXTRACT (or the implicit identity when omitted) runs once per
+        // UPDATE output THIS alternative actually produced -- unconditionally,
+        // before checking `update_control` below, mirroring the pre-#1365
+        // code's own ordering: even an UPDATE that partially succeeds then
+        // errors still gets every one of its successful outputs extracted
+        // first (#494's "already-produced output doesn't vanish", applied
+        // per attempt, not just per element -- verified against the oracle:
+        // a partial attempt's own already-extracted output survives even
+        // when that same attempt goes on to fail and fall through to the
+        // next alternative; see this function's own doc comment).
+        let substituted_extract = extract.map(null_fill);
+        for update_val in &update_vals {
+            if let Some(ext_expr) = &substituted_extract {
+                // Charged separately from the UPDATE bind above: a single
+                // UPDATE can fan out into far more EXTRACT evals than
+                // there are source elements (#695), and that width needs
+                // its own accounting.
+                if let Some(control) = charge_budget(budget, "foreach") {
+                    return (state, Some(control));
+                }
+                let (ext_vals, ext_control) =
+                    eval_owned_expr_fork::<S>(ext_expr, update_val, optional);
+                outputs.extend(ext_vals);
+                if let Some(control) = ext_control {
+                    return (state, Some(control));
+                }
+            } else {
+                outputs.push(update_val.clone());
+            }
+        }
+
+        match update_control {
+            None => return (state, None),
+            Some(Control::Error(_) | Control::Break(_)) if !is_last => continue,
+            Some(control) => return (state, Some(control)),
+        }
+    }
+
+    unreachable!(
+        "patterns is non-empty by construction; the loop always returns on its last iteration"
+    )
+}
+
+/// Evaluate `foreach`: `foreach EXPR as PATTERN (?// PATTERN)* (INIT; UPDATE)` or `(INIT; UPDATE; EXTRACT)`.
 fn eval_foreach<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     input: &Expr,
-    pattern: &Pattern,
+    patterns: &[Pattern],
     init: &Expr,
     update: &Expr,
     extract: Option<&Expr>,
@@ -19319,124 +19528,43 @@ fn eval_foreach<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             QueryResult::Partial(vs, control) => (vs, Some(control)),
         };
 
-    // Same hoist as `eval_reduce`, plus EXTRACT: both only depend on
-    // `input_val`, never on which INIT fork or which UPDATE output is
-    // current (#695). Skipped entirely when there are no INIT forks to
-    // consume it.
+    // Same hoist as `eval_reduce`: skipped entirely when there are no
+    // INIT forks to consume it.
     if init_values.is_empty() {
         return finish_fork(Vec::new(), init_control, optional);
     }
-    // `extract_pattern_bindings` runs once per input element and its
-    // (possible) failure is shared by both UPDATE's and EXTRACT's own
-    // substitution below -- see `substitute_pattern`'s doc comment for why
-    // this needs to stay a `Result` per element rather than failing eagerly
-    // for the whole input stream, same as `eval_reduce`.
-    let bindings_per_element: Vec<Result<Vec<(String, OwnedValue)>, EvalError>> = input_values
-        .iter()
-        // `false`: reduce/foreach's own pattern never supports `?//` (#1201
-        // has no analogue for it), so this is always the ordinary,
-        // non-alternation dedup rule.
-        .map(|v| extract_pattern_bindings(pattern, v, false))
-        .collect();
-    let substituted_updates: Vec<Result<Expr, EvalError>> = bindings_per_element
-        .iter()
-        .map(|b| {
-            b.as_ref()
-                .map(|b| substitute_bindings(update, b))
-                .map_err(Clone::clone)
-        })
-        .collect();
-    let substituted_extracts: Option<Vec<Result<Expr, EvalError>>> = extract.map(|ext| {
-        bindings_per_element
-            .iter()
-            .map(|b| {
-                b.as_ref()
-                    .map(|b| substitute_bindings(ext, b))
-                    .map_err(Clone::clone)
-            })
-            .collect()
-    });
+
+    // Every name any alternative could bind (#1365) -- same convention as
+    // `eval_reduce`'s own hoist; see there for why this can no longer also
+    // hoist the destructuring itself.
+    let mut all_var_names: Vec<String> = Vec::new();
+    for pattern in patterns {
+        collect_pattern_var_names(pattern, &mut all_var_names);
+    }
+    all_var_names.sort_unstable();
+    all_var_names.dedup();
 
     let mut outputs: Vec<OwnedValue> = Vec::new();
     // Shared across every INIT fork (#695), the same "whole tree, not
     // per-branch" accounting `WHILE_UNTIL_MAX_STEPS` uses.
     let mut budget = REDUCE_FOREACH_MAX_STEPS;
     for init_val in init_values {
-        // The state is a variable UPDATE rebinds; a step whose UPDATE
-        // produces zero outputs leaves it unbound rather than ending the
-        // loop — `None` here models that, read back as `null` (jq's
-        // `LOADVN`), same rule as `reduce` (#534).
-        let mut state: Option<OwnedValue> = Some(init_val);
+        let mut state = init_val;
         let mut aborted: Option<Control> = None;
-        'input: for (idx, substituted_update) in substituted_updates.iter().enumerate() {
-            if let Some(control) = charge_budget(&mut budget, "foreach") {
-                aborted = Some(control);
-                break;
-            }
-            let substituted_update = match substituted_update {
-                Ok(expr) => expr,
-                Err(e) => {
-                    aborted = Some(Control::Error(e.clone()));
-                    break;
-                }
-            };
-            // `state` is unconditionally overwritten below, so moving it
-            // out (rather than cloning) is sound — nothing reads the old
-            // value again (#695).
-            let state_input = state.take().unwrap_or(OwnedValue::Null);
-            let (update_vals, update_control) =
-                eval_owned_expr_fork::<S>(substituted_update, &state_input, optional);
-            // EXTRACT (or the implicit identity when omitted) runs once per
-            // UPDATE output, fanning out independently of which output
-            // becomes the new state — verified: `[foreach (1,2) as $x (0;
-            // .+$x, .*100)]` is `[1,0,2,0]`.
-            for update_val in &update_vals {
-                if let Some(extracts) = &substituted_extracts {
-                    // Charged separately from the UPDATE step above: a
-                    // single UPDATE can fan out into far more EXTRACT evals
-                    // than there are source elements (#695), and that
-                    // width needs its own accounting or a single-element
-                    // input stream could still drive unbounded EXTRACT
-                    // work.
-                    if let Some(control) = charge_budget(&mut budget, "foreach") {
-                        aborted = Some(control);
-                        break 'input;
-                    }
-                    // Unreachable in practice: `extracts[idx]` shares its
-                    // per-element pattern bindings with `substituted_update`
-                    // at this same `idx` (both derived from the same
-                    // `bindings_per_element[idx]`, #1201), so if that
-                    // binding had failed, the `Err` match above would
-                    // already have aborted the loop before this element was
-                    // reached. Handled rather than `expect`-ed anyway: the
-                    // invariant is three parallel `Vec`s plus a `break`,
-                    // enforced by nothing the compiler checks, and this is
-                    // on a path an ordinary CLI query reaches.
-                    let ext_expr = match &extracts[idx] {
-                        Ok(expr) => expr,
-                        Err(e) => {
-                            aborted = Some(Control::Error(e.clone()));
-                            break 'input;
-                        }
-                    };
-                    let (ext_vals, ext_control) =
-                        eval_owned_expr_fork::<S>(ext_expr, update_val, optional);
-                    // The steps already produced no longer vanish (#494).
-                    outputs.extend(ext_vals);
-                    if let Some(control) = ext_control {
-                        aborted = Some(control);
-                        break 'input;
-                    }
-                } else {
-                    outputs.push(update_val.clone());
-                }
-            }
-            // Only the last output of a multi-output UPDATE carries forward
-            // as the new state for the next source element — verified:
-            // `[foreach (1) as $x (0; .+$x, .*100)]` is `[1,0]` (both
-            // extracted), but a following step would continue from `0`.
-            state = update_vals.into_iter().last();
-            if let Some(control) = update_control {
+        for input_val in &input_values {
+            let (new_state, step_control) = try_foreach_step_alternatives::<S>(
+                patterns,
+                &all_var_names,
+                update,
+                extract,
+                input_val,
+                state,
+                optional,
+                &mut budget,
+                &mut outputs,
+            );
+            state = new_state;
+            if let Some(control) = step_control {
                 aborted = Some(control);
                 break;
             }
@@ -28850,58 +28978,12 @@ fn collect_pattern_var_names(pattern: &Pattern, names: &mut Vec<String>) {
     }
 }
 
-/// Destructure `pattern` against `input_val`, then substitute the resulting
-/// bindings into `expr` -- `reduce`/`foreach`'s own pattern-binding
-/// counterpart to `try_pattern_alternatives`, but for exactly one pattern
-/// (no `?//` alternatives; real jq's grammar accepts them here too, but
-/// retrying an alternative after the body errors means rolling the
-/// accumulator back to this element's pre-UPDATE value -- something `. as
-/// PATTERN`'s independent-per-bound-value body never has to do, so
-/// `try_pattern_alternatives` has no analogue for it and #1201 doesn't
-/// attempt it; tracked by #1365) and no shared "unbound names default to
-/// null across alternatives" handling either, for the same reason.
-///
-/// The null-fill's absence is safe precisely *because* there's one pattern:
-/// on an `Ok` return `extract_pattern_bindings` binds every name the
-/// pattern mentions (absent object keys and past-the-end array indices come
-/// back as `OwnedValue::Null`, and a `null` input short-circuits to
-/// all-names-null), so the set `try_pattern_alternatives` would null-fill
-/// from is already exactly the set that came back bound.
-///
-/// Deliberately returns `Result` rather than eagerly `.unwrap()`-ing or
-/// propagating a `QueryResult` directly: both callers (`eval_reduce`,
-/// `eval_foreach`) build one of these per input element up front (mirroring
-/// the pre-#1201 `substitute_var(update, var, v)` map they replace), but
-/// must only surface a destructuring failure at the point their own
-/// per-element loop actually reaches that element -- not before, and not
-/// for elements after it that a `break`/`error` never lets the loop reach.
-/// `foreach`'s own per-step output (unlike `reduce`, which only ever emits
-/// the final accumulator) makes this eager-computation-but-lazy-surfacing
-/// split observable: `foreach (1,2,"bad",4) as {a:$a} (0; .+$a; .)` must
-/// still print `foreach`'s first two steps' outputs before erroring on the
-/// third, exactly like a real per-step `update`/`extract` error already
-/// does (confirmed live against jq 1.7.1).
-///
-/// `eval_foreach` needs the same bindings applied to *two* independent
-/// expressions (UPDATE and EXTRACT) per input element -- see
-/// `substitute_bindings` below, which this delegates to, so that caller can
-/// call `extract_pattern_bindings` once per element and reuse the result
-/// for both, rather than destructuring the same pattern against the same
-/// value twice.
-fn substitute_pattern(
-    expr: &Expr,
-    pattern: &Pattern,
-    input_val: &OwnedValue,
-) -> Result<Expr, EvalError> {
-    // `false`: this pattern never supports `?//` (its own caller is
-    // `eval_foreach`, per this function's own doc comment above).
-    let bindings = extract_pattern_bindings(pattern, input_val, false)?;
-    Ok(substitute_bindings(expr, &bindings))
-}
-
 /// Apply an already-extracted set of pattern bindings to `expr`, one
-/// `substitute_var` call per binding. See `substitute_pattern` (which
-/// wraps this for the single-expression case) for why this is split out.
+/// `substitute_var` call per binding -- shared by
+/// `try_reduce_step_alternatives` and `try_foreach_step_alternatives`,
+/// which each call `extract_pattern_bindings` once per alternative
+/// attempted and reuse the result across both null-fill and (for
+/// `foreach`) UPDATE/EXTRACT.
 fn substitute_bindings(expr: &Expr, bindings: &[(String, OwnedValue)]) -> Expr {
     let mut result = expr.clone();
     for (name, val) in bindings {
@@ -29718,7 +29800,7 @@ fn expand_func_calls(
         },
         Expr::Reduce {
             input,
-            pattern,
+            patterns,
             init,
             update,
         } => Expr::Reduce {
@@ -29730,7 +29812,7 @@ fn expand_func_calls(
                 budget,
                 chain_depth + 1,
             )),
-            pattern: pattern.clone(),
+            patterns: patterns.clone(),
             init: Box::new(expand_func_calls(
                 init,
                 func_name,
@@ -29750,7 +29832,7 @@ fn expand_func_calls(
         },
         Expr::Foreach {
             input,
-            pattern,
+            patterns,
             init,
             update,
             extract,
@@ -29763,7 +29845,7 @@ fn expand_func_calls(
                 budget,
                 chain_depth + 1,
             )),
-            pattern: pattern.clone(),
+            patterns: patterns.clone(),
             init: Box::new(expand_func_calls(
                 init,
                 func_name,
@@ -30242,21 +30324,21 @@ fn substitute_func_param(expr: &Expr, param: &str, arg: &Expr) -> Expr {
         }
         Expr::Reduce {
             input,
-            pattern,
+            patterns,
             init,
             update,
         } => {
-            if pattern_binds_var(pattern, param) {
+            if patterns.iter().any(|p| pattern_binds_var(p, param)) {
                 Expr::Reduce {
                     input: Box::new(substitute_func_param(input, param, arg)),
-                    pattern: pattern.clone(),
+                    patterns: patterns.clone(),
                     init: Box::new(substitute_func_param(init, param, arg)),
                     update: update.clone(),
                 }
             } else {
                 Expr::Reduce {
                     input: Box::new(substitute_func_param(input, param, arg)),
-                    pattern: pattern.clone(),
+                    patterns: patterns.clone(),
                     init: Box::new(substitute_func_param(init, param, arg)),
                     update: Box::new(substitute_func_param(update, param, arg)),
                 }
@@ -30264,15 +30346,15 @@ fn substitute_func_param(expr: &Expr, param: &str, arg: &Expr) -> Expr {
         }
         Expr::Foreach {
             input,
-            pattern,
+            patterns,
             init,
             update,
             extract,
         } => {
-            if pattern_binds_var(pattern, param) {
+            if patterns.iter().any(|p| pattern_binds_var(p, param)) {
                 Expr::Foreach {
                     input: Box::new(substitute_func_param(input, param, arg)),
-                    pattern: pattern.clone(),
+                    patterns: patterns.clone(),
                     init: Box::new(substitute_func_param(init, param, arg)),
                     update: update.clone(),
                     extract: extract.clone(),
@@ -30280,7 +30362,7 @@ fn substitute_func_param(expr: &Expr, param: &str, arg: &Expr) -> Expr {
             } else {
                 Expr::Foreach {
                     input: Box::new(substitute_func_param(input, param, arg)),
-                    pattern: pattern.clone(),
+                    patterns: patterns.clone(),
                     init: Box::new(substitute_func_param(init, param, arg)),
                     update: Box::new(substitute_func_param(update, param, arg)),
                     extract: extract
@@ -40031,6 +40113,51 @@ mod tests {
                 r"def f($a): foreach .[] as {a:$a} (0; .+$a; [.,$a]); f(100)"
             ),
             ["[9,9]"]
+        );
+    }
+
+    /// #1365: `reduce`/`foreach`'s `as` clause now accepts `?//`-separated
+    /// pattern alternatives, matching `. as PATTERN ?// ...`'s own grammar.
+    /// All four cases here are oracle-verified against jq 1.7.1.
+    #[test]
+    fn test_reduce_foreach_pattern_alternatives_1365() {
+        // Basic fallthrough: alt1 matches but the body errors on it
+        // (`$x` truthy), so alt2's bindings win instead. jq: `[null,1]`.
+        query!(br#"[{"a":1}]"#, r#"reduce .[] as {a:$x} ?// {a:$y} (0; if $x then error("boom") else [$x,$y] end)"#,
+            QueryResult::Owned(v) => {
+                assert_eq!(v.to_json(), "[null,1]");
+            }
+        );
+
+        // Cross-alternative null-fill: alt1 (`[$x,$y]`, an array pattern)
+        // wins outright (no error), so `$y` -- only bound by alt2 -- reads
+        // as `null` in the body. jq: `[1,null]`.
+        query!(br#"[{"a":1}]"#, r"reduce .[] as [$x,$y] ?// {a:$x} (0; [$x,$y])",
+            QueryResult::Owned(v) => {
+                assert_eq!(v.to_json(), "[1,null]");
+            }
+        );
+
+        // A pattern-match failure (not a body error) falls through too --
+        // and, distinctly, leaves the accumulator untouched for the next
+        // alternative, since UPDATE never even ran. jq: `[99,null,5]`.
+        query!(b"null", r"reduce (5) as {a:$x} ?// $y (99; [., $x, $y])",
+            QueryResult::Owned(v) => {
+                assert_eq!(v.to_json(), "[99,null,5]");
+            }
+        );
+
+        // foreach: the issue's own multi-element repro. Element 1 (`a:1`)
+        // makes alt1 error, so alt2 wins (state resets to `null` first,
+        // per the body-error accumulator rule); element 2 (`a:2`) matches
+        // alt1 directly, continuing from element 1's real output. jq:
+        // `[null,null,1]`, `[[null,null,1],2,null]`.
+        assert_eq!(
+            outputs(
+                br#"[{"a":1},{"a":2}]"#,
+                r#"foreach .[] as {a:$x} ?// {a:$y} (0; if $x==1 then error("boom") else [.,$x,$y] end; .)"#
+            ),
+            ["[null,null,1]", "[[null,null,1],2,null]"]
         );
     }
 

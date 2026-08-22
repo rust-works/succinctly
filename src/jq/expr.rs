@@ -300,13 +300,18 @@ pub enum Expr {
     Env,
 
     /// Reduce: `reduce .[] as $x (0; . + $x)`, or `reduce .[] as {a: $a} (0; . + $a)`
-    /// with a full destructuring pattern (#1201) -- `?//` alternatives are not
-    /// supported here, though real jq does accept them; see #1365.
+    /// with a full destructuring pattern (#1201), or with `?//`-separated
+    /// alternatives (`reduce .[] as [$a] ?// {a:$a} (0; . + $a)`, #1365) --
+    /// always at least one pattern, `patterns.len() == 1` for the common
+    /// non-`?//` case (mirroring `Expr::AsPattern`'s own always-a-`Vec`
+    /// shape, since neither node has an analogous bare-`$var` fast path
+    /// the way `Expr::As` is to `Expr::AsPattern`).
     Reduce {
         /// Input expression (what to iterate over)
         input: Box<Self>,
-        /// Binding pattern for each element (a bare `$var` is `Pattern::Var`)
-        pattern: Pattern,
+        /// Binding pattern alternatives for each element, tried in order
+        /// (a bare `$var` is `Pattern::Var`)
+        patterns: Vec<Pattern>,
         /// Initial accumulator value
         init: Box<Self>,
         /// Update expression (has access to accumulator via . and the pattern's bound variables)
@@ -314,13 +319,14 @@ pub enum Expr {
     },
 
     /// Foreach: `foreach .[] as $x (0; . + 1)` or `foreach .[] as $x (0; . + 1; .)`,
-    /// or with a full destructuring pattern in place of `$x` (#1201) -- same
-    /// `?//`-alternatives caveat as `Reduce` above.
+    /// or with a full destructuring pattern in place of `$x` (#1201), or
+    /// `?//`-separated alternatives (#1365) -- same always-a-`Vec` shape
+    /// as `Reduce` above.
     Foreach {
         /// Input expression
         input: Box<Self>,
-        /// Binding pattern for each element (a bare `$var` is `Pattern::Var`)
-        pattern: Pattern,
+        /// Binding pattern alternatives for each element, tried in order
+        patterns: Vec<Pattern>,
         /// Initial accumulator value
         init: Box<Self>,
         /// Update expression
