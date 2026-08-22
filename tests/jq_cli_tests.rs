@@ -11418,6 +11418,84 @@ fn test_as_pattern_alt_substituted_as_func_param_bind_expr_720() -> Result<()> {
     Ok(())
 }
 
+/// #1457: `break` inside a `?//` alternative's body falls through to the
+/// next alternative, exactly like `error(...)` -- confirmed live against
+/// jq 1.7.1. `try_pattern_alternatives`'s own prior doc comment claimed
+/// otherwise (that `break` propagates immediately, same as `halt`); this
+/// pins the corrected behavior so it can't silently regress. If alt1's
+/// `break $out` genuinely escaped uncaught, `label $out` would swallow the
+/// whole expression and produce no output at all -- instead alt2's own
+/// output survives, proving the break was caught and retried.
+#[test]
+fn test_as_pattern_alt_break_falls_through_like_error_1457() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            "label $out | (. as {a:$x} ?// {a:$y} | if $x==1 then break $out else [$x,$y] end)",
+        ],
+        Some(r#"{"a":1}"#),
+    )?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "[null,1]");
+    Ok(())
+}
+
+/// #1457: unlike `break`, `halt` inside a `?//` alternative's body still
+/// propagates immediately, terminating the process with no output --
+/// confirmed live against jq 1.7.1. Pins that the fix for `break` (above)
+/// didn't accidentally also start retrying `halt`.
+#[test]
+fn test_as_pattern_alt_halt_still_propagates_immediately_1457() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            ". as {a:$x} ?// {a:$y} | if $x==1 then halt else [$x,$y] end",
+        ],
+        Some(r#"{"a":1}"#),
+    )?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "");
+    Ok(())
+}
+
+/// #1457: a `break` in the genuinely *last* alternative still propagates
+/// (nothing left to fall through to) -- the same "last alternative's
+/// failure is the final outcome" rule `error` already had. Forces alt1 to
+/// fail via a real pattern-match type error (destructuring `5` as an
+/// object), so alt2's own `break` is reached and is the one that escapes.
+#[test]
+fn test_as_pattern_alt_break_in_last_alternative_still_propagates_1457() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            "label $out | (. as {a:$x} ?// $y | if $y==5 then break $out else [$x,$y] end)",
+        ],
+        Some("5"),
+    )?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "");
+    Ok(())
+}
+
+/// #1457: a body that's itself a generator keeps its own pre-break partial
+/// output even when that alternative ultimately loses and falls through --
+/// the same "partial output survives fallthrough" rule already pinned for
+/// `error` (see `try_pattern_alternatives`'s own doc comment), now also
+/// verified for `break`. Confirmed live against jq 1.7.1.
+#[test]
+fn test_as_pattern_alt_break_partial_output_survives_fallthrough_1457() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            "label $out | [(. as {a:$x} ?// {a:$y} | ($x, if $x == 1 then break $out else empty end))]",
+        ],
+        Some(r#"{"a":1}"#),
+    )?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "[1,null]");
+    Ok(())
+}
+
 /// `expand_func_calls`'s `Expr::AsPattern` arm: a call to a zero-arg
 /// function reached only by recursing into a `?//` binding's body.
 #[test]
