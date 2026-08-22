@@ -20461,6 +20461,23 @@ fn continue_rest_with_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // collapses to a bare `None` instead, since #1043 gave `eval_fanout`'s
     // tail match its missing `0 => None` arm.)
     match intermediate.materialize_cursor() {
+        // #1445 (code review): `rest.is_empty()` short-circuits straight to
+        // the terminal value instead of recursing into
+        // `eval_pipe_with_path_context_internal` purely to hit its own
+        // `exprs.is_empty()` base case, which would otherwise clone the
+        // value right back out on every call -- a real, measurable cost
+        // #1313's own conversion of `Expr::Builtin(_)`/`Object`/`Array`/
+        // `Literal`/the generic fallback onto this helper introduced for
+        // those three arms (a plain move before), now fixed at the source
+        // so all 14 call sites benefit, not just those three. `ManyOwned`/
+        // `Many` get the identical fix per element, not just the
+        // single-value `Owned`/`One` cases.
+        QueryResult::Owned(v) if rest.is_empty() => QueryResult::Owned(v),
+        QueryResult::One(v) if rest.is_empty() => QueryResult::Owned(to_owned(&v)),
+        QueryResult::ManyOwned(vs) if rest.is_empty() => owned_vec_to_result(vs),
+        QueryResult::Many(vs) if rest.is_empty() => {
+            owned_vec_to_result(vs.iter().map(to_owned).collect())
+        }
         QueryResult::Owned(v) => eval_pipe_with_path_context_internal::<W, S>(
             rest,
             &v,
@@ -21265,12 +21282,15 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
                 // path semantics -- not `QueryResult::Owned(Null)`.
                 Ok(None) => QueryResult::None,
                 // #1313: `continue_rest_with_context` (shared with the
-                // `Expr::Object`/`Array`/`Literal` arm above and the
-                // generic fallback below) replaces the old hand-rolled
-                // "if `rest` is empty, return; else recurse" -- unlike that
-                // arm, this one keeps the enclosing `root`/`current_path`
-                // unchanged (a builtin doesn't move navigational position),
-                // so no extra clone is needed here.
+                // `Expr::Object`/`Array`/`Literal` arm below and the
+                // generic fallback further below) replaces the old
+                // hand-rolled "if `rest` is empty, return; else recurse" --
+                // unlike that arm, this one keeps the enclosing `root`/
+                // `current_path` unchanged (a builtin doesn't move
+                // navigational position), so it needs no extra `.clone()`
+                // of its own the way that arm does. The helper's own
+                // `rest.is_empty()` fast path (#1445) is what keeps this
+                // arm's *value* move free too.
                 Ok(Some(result)) => continue_rest_with_context::<W, S>(
                     QueryResult::Owned(result),
                     rest,
@@ -21520,17 +21540,18 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
                 // jq -- not a spurious `null`.
                 Ok(None) => QueryResult::None,
                 // #1313: hands off to `continue_rest_with_context` (shared
-                // with the `Expr::Builtin(_)`/generic-fallback arms below)
-                // instead of hand-rolling "if `rest` is empty, return this
-                // value; else recurse" -- that helper's own base case
-                // (`eval_pipe_with_path_context_internal`'s `exprs.is_empty()`
-                // check) already produces the identical `QueryResult::
-                // Owned(result)` for an empty `rest`, one extra `.clone()`
-                // aside. `root` clones `result` rather than reusing the
-                // borrow the old code took twice for free: it's about to be
-                // moved into `intermediate` here, and this arm (unlike
-                // `Builtin`/the fallback below) needs the *new* value as
-                // `root`, not the enclosing one already in scope.
+                // with the `Expr::Builtin(_)` arm above and the generic
+                // fallback further below) instead of hand-rolling "if
+                // `rest` is empty, return this value; else recurse" --
+                // that helper's own `rest.is_empty()` fast path (#1445)
+                // returns the identical `QueryResult::Owned(result)` for
+                // an empty `rest` with no extra clone, matching what the
+                // pre-#1313 hand-rolled version did. `root` clones
+                // `result` rather than reusing the borrow the old code
+                // took twice for free: it's about to be moved into
+                // `intermediate` here, and this arm (unlike `Builtin`/the
+                // fallback) needs the *new* value as `root`, not the
+                // enclosing one already in scope.
                 Ok(Some(result)) => {
                     let root = result.clone();
                     continue_rest_with_context::<W, S>(
@@ -48013,6 +48034,99 @@ mod tests {
                         OwnedValue::String("2".to_string())
                     ]
                 );
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    /// #1445 (code review): a genuinely empty `rest` must return the
+    /// intermediate value directly rather than recursing into
+    /// `eval_pipe_with_path_context_internal` purely to hit its own
+    /// `exprs.is_empty()` base case -- that recursion clones the value
+    /// right back out on every call, a real cost with no test able to
+    /// catch it before this one (every other test here always appends a
+    /// further pipe stage). Doesn't assert on allocation count directly
+    /// (not observable from a black-box `QueryResult` comparison), but
+    /// pins the *value* each variant produces for `rest.is_empty()`,
+    /// which the fast path added by this fix must still match exactly.
+    #[test]
+    fn test_continue_rest_with_context_empty_rest_short_circuits_1445() {
+        let bytes: &[u8] = b"42";
+        let index = JsonIndex::build(bytes);
+        let cursor = index.root(bytes);
+        let sj = cursor.value();
+
+        // `Owned`
+        let result = continue_rest_with_context::<Vec<u64>, JqSemantics>(
+            QueryResult::Owned(OwnedValue::Int(42)),
+            &[],
+            &OwnedValue::Null,
+            None,
+            &[],
+            false,
+        );
+        match result {
+            QueryResult::Owned(OwnedValue::Int(42)) => {}
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        // `One` (borrowed cursor) -- still converts to `Owned` via
+        // `to_owned`, matching what the pre-#1445 recursive path already
+        // did, just without the extra clone. `to_owned` on a
+        // cursor-borrowed number preserves the source literal (`"42"`),
+        // not a plain `Int`, matching this crate's own established
+        // literal-preservation convention -- confirmed via a match on
+        // `NumberLiteral` rather than assuming `Int`.
+        let result = continue_rest_with_context::<Vec<u64>, JqSemantics>(
+            QueryResult::One(sj),
+            &[],
+            &OwnedValue::Null,
+            None,
+            &[],
+            false,
+        );
+        match result {
+            QueryResult::Owned(OwnedValue::NumberLiteral(NumberRepr::Int(42), ref lit)) => {
+                assert_eq!(&**lit, "42");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        // `ManyOwned`
+        let result = continue_rest_with_context::<Vec<u64>, JqSemantics>(
+            QueryResult::ManyOwned(vec![OwnedValue::Int(1), OwnedValue::Int(2)]),
+            &[],
+            &OwnedValue::Null,
+            None,
+            &[],
+            false,
+        );
+        match result {
+            QueryResult::ManyOwned(vs) => {
+                assert_eq!(vs, vec![OwnedValue::Int(1), OwnedValue::Int(2)]);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        // `Many` (borrowed cursor)
+        let bytes: &[u8] = br#"{"a": [1, 2]}"#;
+        let index = JsonIndex::build(bytes);
+        let cursor = index.root(bytes);
+        let many = match eval::<Vec<u64>, JqSemantics>(&parse(".a[]").unwrap(), cursor) {
+            QueryResult::Many(vs) => vs,
+            other => panic!("expected Many, got {other:?}"),
+        };
+        let result = continue_rest_with_context::<Vec<u64>, JqSemantics>(
+            QueryResult::Many(many),
+            &[],
+            &OwnedValue::Null,
+            None,
+            &[],
+            false,
+        );
+        match result {
+            QueryResult::ManyOwned(vs) => {
+                assert_eq!(vs, vec![OwnedValue::Int(1), OwnedValue::Int(2)]);
             }
             other => panic!("unexpected: {other:?}"),
         }
