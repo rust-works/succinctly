@@ -21941,27 +21941,30 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
     // routed through the shared helper (#1449), just with a different
     // `current_path` argument for the continuation.
     if matches!(first, Expr::Builtin(Builtin::Parent)) {
-        let parent_path = if current_path.is_empty() {
-            vec![]
-        } else {
-            current_path[..current_path.len() - 1].to_vec()
-        };
-        let parent_result = if current_path.is_empty() {
+        // `parent_path` borrows straight from `current_path` -- both this
+        // and `continue_rest_with_context` only ever need a `&[OwnedValue]`
+        // slice, never an owned one, so there's nothing to clone here
+        // (code review, #1449: routing this arm through the shared helper
+        // had accidentally turned the old code's on-demand `.to_vec()`,
+        // paid only when `rest` was non-empty, into an unconditional one).
+        let (parent_path, parent_result): (&[OwnedValue], _) = if current_path.is_empty() {
             // At root - return empty object (yq behavior)
-            QueryResult::Owned(OwnedValue::Object(IndexMap::new()))
+            (&[], QueryResult::Owned(OwnedValue::Object(IndexMap::new())))
         } else {
+            let parent_path = &current_path[..current_path.len() - 1];
             // Navigate from root to parent
-            match get_value_at_owned_path(root, &parent_path) {
+            let parent_result = match get_value_at_owned_path(root, parent_path) {
                 Some(parent_value) => QueryResult::Owned(parent_value),
                 None => QueryResult::Owned(OwnedValue::Object(IndexMap::new())),
-            }
+            };
+            (parent_path, parent_result)
         };
         return continue_rest_with_context::<W, S>(
             parent_result,
             rest,
             root,
             file_origin,
-            &parent_path,
+            parent_path,
             optional,
         );
     }
@@ -21992,18 +21995,21 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
             Err(escape) => return escape.into(),
         };
 
-        // Calculate parent path (n levels up)
-        let parent_path = if n >= current_path.len() {
-            vec![]
+        // Calculate parent path (n levels up). A borrowed slice, same
+        // zero-allocation reasoning as the plain `Parent` arm above
+        // (#1449) -- pre-existing here, not introduced by this PR, but
+        // fixed in passing since it's the identical pattern.
+        let parent_path: &[OwnedValue] = if n >= current_path.len() {
+            &[]
         } else {
-            current_path[..current_path.len() - n].to_vec()
+            &current_path[..current_path.len() - n]
         };
 
         let parent_result = if parent_path.is_empty() && n > 0 {
             // Gone past root - return empty object
             QueryResult::Owned(OwnedValue::Object(IndexMap::new()))
         } else {
-            match get_value_at_owned_path(root, &parent_path) {
+            match get_value_at_owned_path(root, parent_path) {
                 Some(parent_value) => QueryResult::Owned(parent_value),
                 None => QueryResult::Owned(OwnedValue::Object(IndexMap::new())),
             }
@@ -22016,7 +22022,7 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
             rest,
             root,
             file_origin,
-            &parent_path,
+            parent_path,
             optional,
         );
     }
