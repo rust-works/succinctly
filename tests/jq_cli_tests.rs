@@ -16789,6 +16789,15 @@ fn test_jq_truncating_combinators_do_not_drain_inputs_1309() -> Result<()> {
         // for the outer loop, which then repeats the pattern.
         ("., limit(1; inputs)", "1\n2\n3\n4\n5\n"),
         ("., nth(1; inputs)", "1\n3\n4\n"),
+        // `first` reaches a different evaluator from the rest -- it has a
+        // native `eval_generic` arm, so it needed its own delegation.
+        ("., first(inputs)", "1\n2\n3\n4\n5\n"),
+        ("., first(inputs, 1)", "1\n2\n3\n4\n5\n1\n"),
+        ("., first(1, inputs)", "1\n1\n2\n1\n3\n1\n4\n1\n5\n1\n"),
+        ("., first(inputs | . + 10)", "1\n12\n3\n14\n5\n"),
+        // `last` must still exhaust: it cannot know a value is the last one
+        // until the stream ends.
+        ("., last(inputs)", "1\n5\n"),
         // `any` stops at its first match, `all` at its first failure.
         ("., any(inputs; . > 2)", "1\ntrue\n4\ntrue\n"),
         ("., all(inputs; . > 2)", "1\nfalse\n3\ntrue\n"),
@@ -16814,13 +16823,28 @@ fn test_jq_truncating_combinators_do_not_drain_inputs_1309() -> Result<()> {
 /// `docs/compliance/jq/limitations.md`.
 #[test]
 fn test_jq_input_line_number_after_truncated_inputs_1309() -> Result<()> {
-    let (stdout, stderr, code) = run_jq_full(
-        &["-cn", "limit(1; inputs) | input_line_number"],
-        Some("1\n2\n3\n"),
-    )
-    .expect("truncated-line repro runs");
+    for filter in [
+        "limit(1; inputs) | input_line_number",
+        "first(inputs) | input_line_number",
+    ] {
+        let (stdout, stderr, code) =
+            run_jq_full(&["-cn", filter], Some("1\n2\n3\n")).expect("truncated-line repro runs");
+        assert_eq!(code, 0, "{filter}: stdout: {stdout}\nstderr: {stderr}");
+        assert_eq!(stdout, "1\n", "{filter}");
+    }
+    Ok(())
+}
+
+/// The gate on #1309's `first(...)` delegation must not fire for a filter
+/// that cannot consume inputs -- the bridge costs the subtree its cursor, and
+/// with it #607's duplicate-key fidelity. Pinned as a behavioural check on the
+/// common shape rather than on the gate itself, which is private.
+#[test]
+fn test_jq_first_without_input_builtins_keeps_the_cursor_path_1309() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", "first(.[])"], Some("[7,8,9]")).expect("first fast-path repro runs");
     assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
-    assert_eq!(stdout, "1\n");
+    assert_eq!(stdout, "7\n");
     Ok(())
 }
 

@@ -25850,6 +25850,11 @@ mod remaining_inputs {
         // next one still queued -- starts at 0 (matching real jq's own
         // `input_line_number` before anything has been read yet).
         static LAST_LINE: Cell<u32> = const { Cell::new(0) };
+        // Whether a CLI driver has seeded at all on this thread. Distinct from
+        // "the queue is non-empty": it stays true once the queue drains, and
+        // it is false in every embedding that never seeds (yq mode, library
+        // callers, the tests). See `is_active`.
+        static SEEDED: Cell<bool> = const { Cell::new(false) };
     }
 
     /// Replaces the queue's contents wholesale. Called once by the CLI driver
@@ -25858,6 +25863,20 @@ mod remaining_inputs {
     pub fn seed(documents: Vec<(OwnedValue, u32)>) {
         QUEUE.with(|q| *q.borrow_mut() = documents.into());
         LAST_LINE.with(|l| l.set(0));
+        SEEDED.with(|s| s.set(true));
+    }
+
+    /// Whether a CLI driver has seeded the queue on this thread.
+    ///
+    /// A one-load guard for callers that would otherwise pay to inspect the
+    /// filter on every document (`eval_generic`'s `first(...)` arm, #1309):
+    /// where this is false, no expression can consume an input document, so
+    /// there is nothing to protect and the expensive check is skipped.
+    /// Deliberately *not* "the queue is non-empty" -- an exhausted queue must
+    /// still route `first(inputs)` down the same path, or the answer would
+    /// change once the last document was read.
+    pub fn is_active() -> bool {
+        SEEDED.with(Cell::get)
     }
 
     /// Pops the next queued document, recording its line for
@@ -25898,6 +25917,28 @@ pub fn seed_remaining_inputs(documents: Vec<(OwnedValue, u32)>) {
 #[cfg(feature = "std")]
 pub fn pop_remaining_input() -> Option<(OwnedValue, u32)> {
     remaining_inputs::pop()
+}
+
+/// Whether a CLI driver has seeded the `input`/`inputs` queue on this thread
+/// (#1309).
+///
+/// Exposed for `eval_generic`, whose `first(...)` arm has to decide per
+/// document whether its operand could consume an input -- a question worth
+/// asking only where inputs exist to consume. `false` in yq mode, in library
+/// embeddings, and for every jq filter that never mentions an input builtin,
+/// which is what keeps the check off the hot `first(.[])` path. Always
+/// `false` under `no_std`, where there is no queue to seed.
+#[cfg(feature = "std")]
+pub fn input_queue_is_active() -> bool {
+    remaining_inputs::is_active()
+}
+
+/// Whether a CLI driver has seeded the `input`/`inputs` queue (#1309).
+///
+/// `no_std` has no queue, so nothing can ever consume an input document.
+#[cfg(not(feature = "std"))]
+pub const fn input_queue_is_active() -> bool {
+    false
 }
 
 /// Code review's own doc-comment-vs-doc-comment cross-check catch (#723):
