@@ -958,7 +958,9 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
                     // One row per line, so the row index is the line. Approximate
                     // for fields containing an embedded newline; jq has no DSV
                     // input mode, so there is no oracle to match here anyway.
-                    let at = InputLocation::at(file.as_deref(), row_idx + 1);
+                    // This path is gated on `!uses_input_builtins`, so nothing
+                    // here can move the shared queue's position: fixed.
+                    let at = ErrorAt::Fixed(InputLocation::at(file.as_deref(), row_idx + 1));
                     // Build JSON array for this row and write directly
                     let fields: Vec<OwnedValue> = row
                         .fields()
@@ -1156,7 +1158,7 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
             // `input`/`inputs` then correctly see an empty queue, matching
             // this function's own stated safety goal.
             if args.null_input && !force_read_under_null_input {
-                jq::seed_remaining_inputs(Vec::new());
+                jq::seed_remaining_inputs(Vec::new(), locations.exhausted());
             } else {
                 // Moves rather than clones: `inputs` isn't read again on
                 // this branch (the null-input arm below uses `OwnedValue::
@@ -1164,23 +1166,38 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
                 // seeds, not from `inputs`) -- review catch: an earlier
                 // version cloned every document here for no reason, doubling
                 // peak memory for the whole input set.
-                let queue: Vec<(OwnedValue, u32)> = inputs
+                //
+                // `locations` itself is *not* consumed: it stays alive as the
+                // file table `ErrorAt::Live` resolves the queue's opaque
+                // source tags against (#1309).
+                debug_assert_eq!(
+                    inputs.len(),
+                    locations.per_value().len(),
+                    "one location per queued document"
+                );
+                let queue: Vec<(OwnedValue, u32, u32)> = inputs
                     .into_iter()
-                    .enumerate()
-                    .map(|(idx, v)| (v, locations.get(idx).line.unwrap_or(0) as u32))
+                    .zip(locations.per_value().iter().copied())
+                    .map(|(v, (src, line))| (v, src, line))
                     .collect();
-                jq::seed_remaining_inputs(queue);
+                jq::seed_remaining_inputs(queue, locations.exhausted());
             }
 
             if args.null_input {
                 // `.` is null exactly once, matching `-n`'s own existing
                 // contract -- `input`/`inputs` inside the filter draw from
                 // the queue just seeded above, not from this invocation.
+                //
+                // `Live`, not `unknown()`: `-n` starts with nothing read, so
+                // the marker *is* `<unknown>` until the filter's own `input`
+                // moves it -- and once it does, jq names where the parser
+                // ended up. `printf '' | jq -n 'input'` reports `<stdin>:0`,
+                // not `<unknown>` (#1309, item 5).
                 let results = evaluate_input(
                     &OwnedValue::Null,
                     &expr,
                     &context,
-                    &InputLocation::unknown(),
+                    &ErrorAt::Live(&locations),
                     &mut sink,
                 )?;
                 for result in results {
@@ -1197,15 +1214,21 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
                 // same queue (#723): a document a filter's own `input` call
                 // consumes mid-evaluation is never also re-processed here as
                 // a fresh top-level invocation, and vice versa -- one shared
-                // cursor, not two kept in sync by hand. Loses the per-value
-                // filename `locations.get(idx)` would have carried (the
-                // queue only tracks line numbers, matching real jq's own
-                // `input_line_number`); accepted for this pass since
-                // `input`/`inputs` combined with multiple named input files
-                // is a narrow case, not the common single-stream one.
-                while let Some((input, line)) = jq::pop_remaining_input() {
-                    let at = InputLocation::at(None, line as usize);
-                    let results = evaluate_input(&input, &expr, &context, &at, &mut sink)?;
+                // cursor, not two kept in sync by hand.
+                //
+                // `ErrorAt::Live`, not a location captured here: the filter's
+                // own `input`/`inputs` calls move jq's input position during
+                // the very evaluation this loop kicks off, and jq's marker
+                // names where the parser ended up, not where this document
+                // started (#1309, item 4).
+                while let Some(input) = jq::pop_remaining_input() {
+                    let results = evaluate_input(
+                        &input,
+                        &expr,
+                        &context,
+                        &ErrorAt::Live(&locations),
+                        &mut sink,
+                    )?;
                     for result in results {
                         had_output = true;
                         last_output = Some(result.clone());
@@ -1219,7 +1242,9 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
             }
         } else {
             for (idx, input) in inputs.iter().enumerate() {
-                let at = locations.get(idx);
+                // Nothing on this branch can consume an input document, so
+                // the per-value location is fixed before evaluation.
+                let at = ErrorAt::Fixed(locations.get(idx));
                 let results = evaluate_input(input, &expr, &context, &at, &mut sink)?;
 
                 for result in results {
@@ -1643,11 +1668,85 @@ impl InputLocations {
     /// Location of the value at `idx`.
     pub fn get(&self, idx: usize) -> InputLocation {
         match self.per_value.get(idx) {
-            Some(&(src, line)) => InputLocation::at(
-                self.files.get(src as usize).and_then(Option::as_deref),
-                line as usize,
-            ),
+            Some(&(src, line)) => self.resolve(src, line),
             None => InputLocation::unknown(),
+        }
+    }
+
+    /// The `(source, line)` pairs, in input order, for seeding the shared
+    /// input queue (#1309). The queue carries the tag rather than the file
+    /// name; [`resolve`](Self::resolve) turns it back.
+    fn per_value(&self) -> &[(u32, u32)] {
+        &self.per_value
+    }
+
+    /// Turn a raw `(source, line)` -- as handed back by
+    /// `jq::current_input_location` -- into a printable location.
+    fn resolve(&self, src: u32, line: u32) -> InputLocation {
+        InputLocation::at(
+            self.files.get(src as usize).and_then(Option::as_deref),
+            line as usize,
+        )
+    }
+
+    /// Where jq's `(at ...)` marker settles once every input is consumed
+    /// (#1309, item 5).
+    ///
+    /// jq names the file its parser has open at EOF, which is the *last* file
+    /// on the command line -- at line 0 when that file contributed no document
+    /// of its own, and at its last document's line otherwise. Oracle-verified
+    /// against jq 1.7.1:
+    ///
+    /// ```text
+    /// jq -n 'input,input'       one.json empty.json  => empty.json:0
+    /// jq -n 'input,input'       empty.json one.json  => one.json:1
+    /// jq -n 'input,input,input' one.json two.json    => two.json:1
+    /// printf '' | jq -n 'input'                      => <stdin>:0
+    /// ```
+    ///
+    /// No files at all means stdin, whose tag is 0 and whose name is `None`,
+    /// so the same arithmetic yields `<stdin>`.
+    fn exhausted(&self) -> (u32, u32) {
+        let last_src = self.files.len().saturating_sub(1) as u32;
+        match self.per_value.last() {
+            Some(&(src, line)) if src == last_src => (last_src, line),
+            _ => (last_src, 0),
+        }
+    }
+}
+
+/// Where an evaluation's `(at ...)` marker should point.
+///
+/// Two shapes because the input-builtin path cannot know the answer up front.
+/// `input`/`inputs` move jq's current input position *during* the evaluation
+/// they are called from, and jq reports where the parser ended up rather than
+/// where the value in hand came from -- oracle-verified:
+/// `jq '[inputs] | .[0] | error("boom")' a b c` names **c**, not `.[0]`'s own
+/// **b** (#1309, item 4).
+///
+/// Reading the position after evaluation returns is sound because
+/// `evaluate_input` reports at most once per call: its `Error`, `Break`,
+/// `Halt` and `Partial` arms are mutually exclusive variants of one returned
+/// value, and an uncaught control ends the evaluation, so nothing can consume
+/// another document between the raise and the report.
+enum ErrorAt<'a> {
+    /// A position fixed before evaluation -- every path that cannot consume
+    /// input documents.
+    Fixed(InputLocation),
+    /// Resolved from the shared queue's live position at report time, against
+    /// the file table that owns the source tags.
+    Live(&'a InputLocations),
+}
+
+impl ErrorAt<'_> {
+    fn resolve(&self) -> InputLocation {
+        match self {
+            Self::Fixed(at) => at.clone(),
+            Self::Live(locations) => match jq::current_input_location() {
+                Some((src, line)) => locations.resolve(src, line),
+                // Nothing has been read yet, so there is no position to name.
+                None => InputLocation::unknown(),
+            },
         }
     }
 }
@@ -2364,7 +2463,7 @@ fn evaluate_input(
     input: &OwnedValue,
     expr: &jq::Expr,
     _context: &EvalContext,
-    at: &InputLocation,
+    at: &ErrorAt<'_>,
     sink: &mut ErrorSink,
 ) -> Result<Vec<OwnedValue>> {
     // Convert OwnedValue to JSON bytes for indexing
@@ -2417,11 +2516,11 @@ fn evaluate_input(
         GenericResult::LazySeq(seq) => match seq.materialize_atomic() {
             Ok(v) => Ok(vec![v]),
             Err(jq::Control::Error(e)) => {
-                sink.report(DiagStyle::Jq, &e, at);
+                sink.report(DiagStyle::Jq, &e, &at.resolve());
                 Ok(vec![])
             }
             Err(jq::Control::Break(label)) => {
-                sink.report_break(DiagStyle::Jq, &label, at);
+                sink.report_break(DiagStyle::Jq, &label, &at.resolve());
                 Ok(vec![])
             }
             Err(jq::Control::Halt(code)) => {
@@ -2431,13 +2530,13 @@ fn evaluate_input(
         },
         GenericResult::None => Ok(vec![]),
         GenericResult::Error(e) => {
-            sink.report(DiagStyle::Jq, &e, at);
+            sink.report(DiagStyle::Jq, &e, &at.resolve());
             Ok(vec![])
         }
         GenericResult::Owned(v) => Ok(vec![v]),
         GenericResult::ManyOwned(vs) => Ok(vs),
         GenericResult::Break(label) => {
-            sink.report_break(DiagStyle::Jq, &label, at);
+            sink.report_break(DiagStyle::Jq, &label, &at.resolve());
             Ok(vec![])
         }
         // `halt`/`halt_error` (#791): not a diagnostic, so no `sink.report*`
@@ -2451,11 +2550,11 @@ fn evaluate_input(
         // (#400, #494): report the diagnostic (which drives the exit code
         // via `sink`), but still return the prefix for the caller to print.
         GenericResult::Partial(vs, jq::Control::Error(e)) => {
-            sink.report(DiagStyle::Jq, &e, at);
+            sink.report(DiagStyle::Jq, &e, &at.resolve());
             Ok(vs)
         }
         GenericResult::Partial(vs, jq::Control::Break(label)) => {
-            sink.report_break(DiagStyle::Jq, &label, at);
+            sink.report_break(DiagStyle::Jq, &label, &at.resolve());
             Ok(vs)
         }
         GenericResult::Partial(vs, jq::Control::Halt(code)) => {
