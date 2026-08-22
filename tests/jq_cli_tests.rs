@@ -15621,6 +15621,10 @@ fn test_short_circuit_side_effect_shapes_already_match_jq_820() -> Result<()> {
         ),
         (&["-cn", r#"limit(1; 1, ("B"|stderr))"#], None, "1\n", "", 0),
         (&["-cn", r#"nth(0; 1, ("B"|stderr))"#], None, "1\n", "", 0),
+        // Closed by Stage 2b: `first` over a comma now stops at the first
+        // sibling that yields, inside `eval_generic`'s own native arm.
+        (&["-cn", r#"first(1, ("B"|stderr))"#], None, "1\n", "", 0),
+        (&["-cn", r#"first((1, ("B"|stderr)))"#], None, "1\n", "", 0),
         // Reached through a subtree that has already bounced into `eval.rs`,
         // so `eval_first_expr`'s own rewrite is what closes this one -- unlike
         // a bare `first(...)`, which `eval_generic` still intercepts natively
@@ -15710,14 +15714,10 @@ fn test_generator_argument_backtracking_still_evaluates_the_tail_1279() -> Resul
 #[test]
 fn test_short_circuit_side_effect_leaks_820_932_987() -> Result<()> {
     let cases: &[SideEffectCase] = &[
-        // `first(f)` has a NATIVE arm in `eval_generic.rs`
-        // (`eval_first_or_last_generic`, kept cursor-preserving for #607), and
-        // the CLI always enters `eval_generic` first -- so an `eval.rs`-only
-        // fix never reaches it. `limit`/`nth`/`isempty` have no generic arm
-        // and bounce to `eval.rs`, which is why they are fixed in the test
-        // above while these two are not. Closed by Stage 2b. jq: no stderr.
-        (&["-cn", r#"first(1, ("B"|stderr))"#], None, "1\n", "B", 0),
-        // jq writes exactly one `1`; the generic Comma arm runs both.
+        // `first(.[] | stderr)` is a *Pipe*, not a Comma, so Stage 2b's
+        // sibling walk does not reach it -- it needs real per-output
+        // backtracking inside `eval_generic` (design option (c), mirroring
+        // Demand/Item/Flow into that module). jq writes exactly one `1`.
         (
             &["-c", "first(.[] | stderr)"],
             Some("[1,2]"),
@@ -15820,15 +15820,15 @@ fn test_discarded_generator_branch_consumes_input_documents_820() -> Result<()> 
         "every document must still be processed"
     );
 
-    // STILL divergent until Stage 2b: `first(f)` is intercepted by
-    // `eval_generic`'s own native arm (kept cursor-preserving for #607), so it
-    // never reaches `eval.rs`'s now-lazy `eval_first_expr`.
-    // jq: [1,1] [1,2] [1,3] [1,4].
+    // FIXED by Stage 2b: `first` over a comma stops at the first sibling that
+    // yields, inside `eval_generic`'s own native arm -- so the discarded
+    // `input` branch is never evaluated here either. With this, every
+    // document-consuming shape #820 exposed matches jq.
     let (stdout, _, code) = run_jq_full(&["-c", "[first(1, input), .id]"], Some(DOCS))?;
+    assert_eq!(code, 0);
     assert_eq!(
-        (stdout.as_str(), code),
-        ("[1,1]\n[1,3]\n", 0),
-        "documents 2 and 4 are still consumed -- Stage 2b"
+        stdout, "[1,1]\n[1,2]\n[1,3]\n[1,4]\n",
+        "every document must still be processed"
     );
 
     Ok(())
