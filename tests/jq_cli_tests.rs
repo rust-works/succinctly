@@ -17226,8 +17226,9 @@ fn test_short_circuit_side_effect_leaks_820_932_987() -> Result<()> {
         // before the left, where jq interleaves them. Stage 4 made only
         // `eval_each`'s arm demand-aware, so a top-level compare keeps the
         // old order. jq writes `B`, `A`, `C`, `A`; succinctly writes `B`,
-        // `C`, `A`, `A`. Tracked separately -- with `input` operands the same
-        // ordering changes *values*, not just stderr.
+        // `C`, `A`, `A`. Tracked as #1481 -- with `input` operands the same
+        // ordering changes *values*, not just stderr, and the loop it lives
+        // in is shared with `Expr::Arithmetic`.
         (
             &["-cn", r#"[("A"|stderr) == (("B"|stderr), ("C"|stderr))]"#],
             None,
