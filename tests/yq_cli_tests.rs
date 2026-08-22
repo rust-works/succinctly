@@ -10837,6 +10837,181 @@ fn test_explicit_key_comment_keeps_anchor_and_tag_on_deferred_absent_value_1113(
 }
 
 // ============================================================================
+// Container-branch deferred value drops a tag, mis-places an anchor next to
+// an explicit key's comment (#1132)
+// ============================================================================
+//
+// `stream_yaml_value`'s container-style deferred-value branch (the sibling of
+// #1077/#1113's scalar/absent branch, for when the deferred value turns out
+// to be a present container rather than absent) used to hand-write only the
+// anchor and never consult `value.explicit_tag()`, and unconditionally
+// appended the anchor onto the same line as a floated key comment instead of
+// giving it its own line. Both are now routed through the same
+// `write_deferred_prefix` helper #1077/#1113's branch already used (via
+// `write_deferred_value`), extracted so both branches share one ordering
+// rule instead of hand-writing it twice. All four shapes below are pinned
+// against the live real `yq` binary (v4.53.3).
+
+/// The issue's own first repro: an explicit tag on a container-valued anchor
+/// used to be silently dropped.
+#[test]
+fn test_container_anchor_keeps_explicit_tag_1132() -> Result<()> {
+    let (out, code) = run_yq_stdin(".", "key: &anc !!mytag\n  a: 1\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "key: &anc !!mytag\n  a: 1\n");
+    Ok(())
+}
+
+/// The issue's own second repro: when an explicit key's own comment is
+/// present, the anchor moves to its own un-indented line immediately after
+/// the comment line -- it used to be appended after the comment text on the
+/// same line instead.
+#[test]
+fn test_container_anchor_moves_to_own_line_after_key_comment_1132() -> Result<()> {
+    let (out, code) = run_yq_stdin(".", "? k # key comment\n: &anc\n  a: 1\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "k: # key comment\n&anc\n  a: 1\n");
+    Ok(())
+}
+
+/// Regression guard (the control case the ordering split hinges on): with no
+/// key comment at all, the anchor stays on the key's own line, unaffected by
+/// the #1132 fix.
+#[test]
+fn test_container_anchor_stays_on_key_line_without_comment_1132() -> Result<()> {
+    let (out, code) = run_yq_stdin(".", "? k\n: &anc\n  a: 1\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "k: &anc\n  a: 1\n");
+    Ok(())
+}
+
+/// Both a tag and a key comment together: the tag follows the anchor on that
+/// same standalone line (the ordering the issue's plan flagged as unmeasured
+/// before implementing -- now measured against real yq).
+#[test]
+fn test_container_anchor_and_tag_move_to_own_line_after_key_comment_1132() -> Result<()> {
+    let (out, code) = run_yq_stdin(".", "? k # c\n: &anc !!mytag\n  a: 1\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "k: # c\n&anc !!mytag\n  a: 1\n");
+    Ok(())
+}
+
+/// Regression guard: the `write_deferred_prefix` extraction must leave the
+/// scalar/absent-value branch's own #1113 behavior byte-for-byte unchanged.
+#[test]
+fn test_scalar_absent_value_anchor_tag_comment_unchanged_after_1132_extraction() -> Result<()> {
+    let (out, code) = run_yq_stdin(".", "? k # key comment\n: &anc !!str\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "k: &anc !!str # key comment\n");
+    Ok(())
+}
+
+/// Alias round-trip: `*anc` still resolves and re-emits correctly once the
+/// anchor sits alongside a previously-dropped tag.
+#[test]
+fn test_container_anchor_tag_alias_round_trip_1132() -> Result<()> {
+    let (out, code) = run_yq_stdin(".", "key: &anc !!mytag\n  a: 1\nref: *anc\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "key: &anc !!mytag\n  a: 1\nref: *anc\n");
+    Ok(())
+}
+
+// ============================================================================
+// Flow-style anchor tag loss and quote style; `--slurp` doc-comment parity
+// claim (#1115)
+// ============================================================================
+//
+// Two independent findings from the same review: (1) `write_yaml_child_inline`
+// (the flow-style value writer) unconditionally wrote `&anchor` and never
+// consulted `value.explicit_tag()` -- the flow-style twin of #1132's
+// block-style tag loss, fixed the same way here. Its quote-style divergence
+// (succinctly's `""` vs real yq's `''` for a flow value that materializes as
+// nothing at all) is a distinct, narrower fix: real yq only does this for a
+// *synthesized* empty value, not for a literal empty string in the source,
+// which stays `""` on both sides -- confirmed live, so this isn't a general
+// quoting-convention change. (2) `stream_yaml_sequence`'s doc comment
+// overclaimed exact byte-for-byte parity with `stream_yaml_value`; #1077's
+// deferred-absent-anchor handling is unreachable through `--slurp`'s own
+// construction (a slurped document's own scalar is never deferred to a
+// sibling), so this is a doc-only fix with no behavior change to pin -- the
+// `--slurp` test below is that proof.
+
+/// The tag half of the issue's finding: a flow-style anchored container's
+/// explicit tag used to be silently dropped.
+#[test]
+fn test_flow_anchor_keeps_explicit_tag_1115() -> Result<()> {
+    let (out, code) = run_yq_stdin(".", "{a: &anc !!mytag {x: 1}}\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "{a: &anc !!mytag {x: 1}}\n");
+    Ok(())
+}
+
+/// The quote-style half: a flow-style value that materializes as nothing at
+/// all is rendered as a single-quoted empty string (`''`), matching real
+/// yq's own synthesized-empty-value convention -- not the double-quoted
+/// `""` succinctly (and real yq) both use for a literal empty string.
+#[test]
+fn test_flow_anchor_empty_value_uses_single_quotes_1115() -> Result<()> {
+    let (out, code) = run_yq_stdin(".", "{a: &anc, b: 1}\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "{a: &anc '', b: 1}\n");
+    Ok(())
+}
+
+/// Regression guard: a literal empty string in the source (not a
+/// synthesized deferred-absent value) keeps its double quotes in flow
+/// style, with or without an anchor -- the quote-style fix above must not
+/// widen into a general `""` -> `''` convention change.
+#[test]
+fn test_flow_literal_empty_string_keeps_double_quotes_1115() -> Result<()> {
+    let (out, code) = run_yq_stdin(".", "{a: \"\", b: 1}\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "{a: \"\", b: 1}\n");
+
+    let (out, code) = run_yq_stdin(".", "{a: &anc \"\", b: 1}\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "{a: &anc \"\", b: 1}\n");
+    Ok(())
+}
+
+/// Alias resolution through a flow-style anchored value still works after
+/// the tag fix.
+#[test]
+fn test_flow_anchor_alias_round_trip_1115() -> Result<()> {
+    let (out, code) = run_yq_stdin(".", "{a: &anc {x: 1}, b: *anc}\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "{a: &anc {x: 1}, b: *anc}\n");
+    Ok(())
+}
+
+/// `--slurp`'s output is unaffected by #1115's Part 2 (a doc-comment-only
+/// correction, since the shape it describes has no repro reachable through
+/// `--slurp`'s own construction) -- proof the doc-only change didn't alter
+/// behavior, using an anchored container item as the most adjacent shape to
+/// the one the (corrected) doc comment now names as unreachable.
+#[test]
+fn test_slurp_anchored_container_item_unaffected_by_1115_part2() -> Result<()> {
+    let mut file_a = NamedTempFile::new()?;
+    writeln!(file_a, "- &anc\n  a: 1")?;
+    let mut file_b = NamedTempFile::new()?;
+    writeln!(file_b, "- b: 2")?;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .arg("yq")
+        .arg("--slurp")
+        .arg(".")
+        .arg(file_a.path())
+        .arg(file_b.path())
+        .stdin(Stdio::null())
+        .output()?;
+    let stdout = String::from_utf8(output.stdout)?;
+
+    assert!(output.status.success());
+    assert_eq!(stdout, "- - &anc\n    a: 1\n- - b: 2\n");
+    Ok(())
+}
+
+// ============================================================================
 // Merge-flag suffixes on `*`/`*=` (#713)
 // ============================================================================
 
