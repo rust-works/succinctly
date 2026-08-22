@@ -11070,20 +11070,27 @@ fn test_as_pattern_alt_bind_expr_generator_fans_out_720() -> Result<()> {
     Ok(())
 }
 
-/// `break`/`halt`/empty output inside the body do *not* trigger
-/// fallthrough -- only a genuine `error(...)`/type error does. Confirmed
-/// live: `break` propagates cleanly with no output (not caught as a
-/// pattern/body failure), and `empty` is genuinely empty output, not an
-/// implicit retry signal.
+/// Empty output inside the body does *not* trigger fallthrough -- only a
+/// genuine `error(...)`/type error, or (since #1457) `break`, does.
+/// `empty` is genuinely empty output, not an implicit retry signal, and a
+/// matching alternative that legitimately produces nothing is not a
+/// "failure" the next alternative should override.
+///
+/// This test previously also asserted `break` here, under the claim that
+/// it behaves like `halt` (propagates immediately, never falls through).
+/// #1457 found and fixed that claim: `break` actually falls through like
+/// `error`, verified against the pinned oracle (jq 1.7.1). That sub-case
+/// was removed rather than corrected in place, since it happened to use
+/// the *same* body (`break $out`) for both alternatives -- a shape that
+/// can't distinguish "propagates immediately" from "falls through, then
+/// the last alternative's own break propagates" (both give the same empty
+/// final output), so it was passing on the old, wrong code by coincidence
+/// rather than actually exercising fallthrough. `break`'s real fallthrough
+/// behavior is now covered by the `_1457` tests below, which use different
+/// bodies per alternative specifically so the two behaviors are
+/// distinguishable.
 #[test]
-fn test_as_pattern_alt_break_and_empty_are_not_fallthrough_720() -> Result<()> {
-    let (stdout, _, code) = run_jq_full(
-        &["-c", "label $out | (. as {a: $a} ?// $a | (break $out))"],
-        Some(r#"{"a":1}"#),
-    )?;
-    assert_eq!(code, 0);
-    assert_eq!(stdout.trim_end(), "");
-
+fn test_as_pattern_alt_empty_is_not_fallthrough_720() -> Result<()> {
     let (stdout, _, code) =
         run_jq_full(&["-c", "[. as {a: $a} ?// $a | empty]"], Some(r#"{"a":1}"#))?;
     assert_eq!(code, 0);
