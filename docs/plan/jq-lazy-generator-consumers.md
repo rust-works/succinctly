@@ -264,7 +264,8 @@ reached *only* from consumers that genuinely need a prefix.
   is atomic in jq). They stay eager.
 - **jq's multi-output generator-argument fan-out for ordinary builtins** — `"abcabc" |
   ltrimstr(("a","b"))` yields two outputs in jq and one here. That is **#1279**, an
-  independent and opposite-direction bug (succinctly too *lazy* there, not too eager). The
+  independent and opposite-direction bug (succinctly too *lazy* there, not too eager),
+  designed in [jq-generator-argument-fanout.md](jq-generator-argument-fanout.md). The
   design below is careful not to make it worse; see [The `ltrimstr` trap](#the-ltrimstr-trap).
 - **`eval_generic.rs`'s `Expr::Comma`/`Expr::Pipe` arms.** Only its `first`/`last` arm is
   in scope (Stage 2b).
@@ -702,7 +703,8 @@ control never returns to the generator. Exactly two justifications qualify:
 
 `builtin_halt_error` is the **only** one of `result_to_owned`'s 20 production call sites
 that may change. (The missing-second-output half of that example is #1279, a separate
-issue this design must not make worse.)
+issue this design must not make worse, designed in
+[jq-generator-argument-fanout.md](jq-generator-argument-fanout.md).)
 
 ## How each consumer is rewritten
 
@@ -1066,7 +1068,8 @@ differential gate at least as rigorous as #1282's.
   #1283 cluster A (#1288); no longer a dependant.
 - [#1279](https://github.com/rust-works/succinctly/issues/1279) — generator-argument
   builtins not fanning out over a multi-output argument. The *opposite* bug, and the reason
-  the `ltrimstr` trap must be respected rather than "fixed" here.
+  the `ltrimstr` trap must be respected rather than "fixed" here. Designed in
+  [jq-generator-argument-fanout.md](jq-generator-argument-fanout.md).
 - [#723](https://github.com/rust-works/succinctly/issues/723) — implemented `input`/
   `inputs`, which is what turned this issue from a cosmetic leak into data loss.
 - [jq-path-trackability-deferral.md](jq-path-trackability-deferral.md) (#1282) — the
