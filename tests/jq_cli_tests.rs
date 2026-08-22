@@ -9442,6 +9442,255 @@ fn test_resolve_index_expr_indexes_targets_partial_fanout_before_its_own_error_8
     Ok(())
 }
 
+/// #972 Stage 1 precursor fix: `resolve_index_expr`/`resolve_slice_expr`
+/// compute `target`'s branches once, outside the key/bound loop, then cross
+/// them against every key/bound — so before this fix, a `target` escape
+/// still let every key/bound after the first contribute its own branch to
+/// the `Err` prefix, even though jq's `K as $k | E | .[$k]` compilation
+/// means `E`'s (the target's) whole generator — escape included — runs
+/// entirely inside the *first* key's iteration; the key generator is never
+/// resumed for a second key. Verified against jq 1.7.1: all four queries
+/// below print only the first key/bound's branch before raising.
+#[test]
+fn test_resolve_index_expr_prefix_matches_jq_when_target_escapes_972() -> Result<()> {
+    // Two keys, one target branch.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r#"path(select((true,error("t")))[("x","y")])"#],
+        Some(r#"{"x":9,"y":8}"#),
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[\"x\"]\n");
+    assert!(stderr.contains('t'), "stderr: {stderr:?}");
+
+    // Two keys, two target branches (full 2x2 cross product collapses to 1).
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r#"path(select((true,true,error("t")))[("x","y")])"#],
+        Some(r#"{"x":9,"y":8}"#),
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[\"x\"]\n[\"x\"]\n");
+    assert!(stderr.contains('t'), "stderr: {stderr:?}");
+
+    // Propagated through a static tail after the computed index.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r#"path(select((true,error("t")))[("x","y")].z)"#],
+        Some(r#"{"x":{"z":1},"y":{"z":2}}"#),
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[\"x\",\"z\"]\n");
+    assert!(stderr.contains('t'), "stderr: {stderr:?}");
+
+    // Slice bound cross product: 2 starts x 2 ends collapses to 1.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r#"path((select((true,error("t"))))[(0,1):(2,3)])"#],
+        Some("[10,20,30]"),
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[{\"start\":0,\"end\":2}]\n");
+    assert!(stderr.contains('t'), "stderr: {stderr:?}");
+
+    Ok(())
+}
+
+/// #972 Guard A: the exact shape that got PR #985 reverted for silent data
+/// corruption on the write side. Before the Stage 1 precursor fix above,
+/// `resolve_index_expr`'s untruncated `Err` prefix for
+/// `select((true,error("t")))[("x","y")]` was `[["x"],["y"]]` (length 2),
+/// which satisfied `limit(2)` and would have been promoted to a clean
+/// success — silently deleting both keys instead of raising. Verified
+/// against jq 1.7.1: `limit(2; ...)` still raises with the document
+/// untouched; `limit(1; ...)` correctly deletes only `"x"`.
+#[test]
+fn test_first_limit_path_truncation_does_not_overreach_index_fanout_972() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            r#"del(limit(2; select((true,error("t")))[("x","y")]))"#,
+        ],
+        Some(r#"{"x":9,"y":8}"#),
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert!(stderr.contains('t'), "stderr: {stderr:?}");
+
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            r#"del(limit(1; select((true,error("t")))[("x","y")]))"#,
+        ],
+        Some(r#"{"x":9,"y":8}"#),
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "{\"y\":8}\n");
+    assert_eq!(stderr, "");
+
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            r#"(limit(2; select((true,error("t")))[("x","y")])) = 99"#,
+        ],
+        Some(r#"{"x":9,"y":8}"#),
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert!(stderr.contains('t'), "stderr: {stderr:?}");
+
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            r#"(limit(1; select((true,error("t")))[("x","y")])) = 99"#,
+        ],
+        Some(r#"{"x":9,"y":8}"#),
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "{\"x\":99,\"y\":8}\n");
+    assert_eq!(stderr, "");
+
+    Ok(())
+}
+
+/// #972 Guard B: the exact shape that got PR #985 reverted for a silently
+/// truncated computed path. `resolve_seq`'s multi-stage fan-out (fixed by
+/// #1013 ahead of this reinstatement) must keep threading an escaping
+/// branch's own full prefix through every remaining dynamic stage, so
+/// `first(...)` truncates to the *correct*, complete path rather than a
+/// silently short one. Verified against jq 1.7.1.
+#[test]
+fn test_first_path_truncation_keeps_full_multistage_pipe_path_972() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r"path(first(.[]|.[]|.[]))"],
+        Some(r#"{"a":{"p":{"q":1}},"b":3}"#),
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[\"a\",\"p\",\"q\"]\n");
+    assert_eq!(stderr, "");
+
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r"path(first(.[]|.[]))"],
+        Some(r#"{"a":{"q":1},"b":3}"#),
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[\"a\",\"q\"]\n");
+    assert_eq!(stderr, "");
+
+    Ok(())
+}
+
+/// #972: `first(f)`/`limit(n; f)` in path position used to fully resolve
+/// `f` before truncating to `n` outputs, so an error/break/halt after the
+/// nth output still surfaced even though jq's generator would have stopped
+/// pulling from `f` already. All cases verified against jq 1.7.1.
+#[test]
+fn test_first_limit_truncate_keep_partial_path_resolvers_972() -> Result<()> {
+    let cases: &[(&str, &str, &str)] = &[
+        ("1", r#"path(first(select((true, error("x")))))"#, "[]\n"),
+        ("1", r#"path(limit(1; select((true, error("x")))))"#, "[]\n"),
+        (
+            "1",
+            r#"path(first(if (true,error("x")) then . else empty end))"#,
+            "[]\n",
+        ),
+        ("[1,2,3]", r#"path(first(.[(0,error("x"))]))"#, "[0]\n"),
+        (
+            r#"{"a":1}"#,
+            r#"path(first(getpath((["a"],error("x")))))"#,
+            "[\"a\"]\n",
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r#"path(first(recurse(if type=="object" then .[] else error("x") end)))"#,
+            "[]\n",
+        ),
+    ];
+    for (input, query, expected_stdout) in cases {
+        let (stdout, stderr, code) = run_jq_full(&["-c", query], Some(input))?;
+        assert_eq!(
+            code, 0,
+            "query {query:?}: stdout: {stdout:?} stderr: {stderr:?}"
+        );
+        assert_eq!(stdout, *expected_stdout, "query {query:?}");
+        assert_eq!(stderr, "", "query {query:?}");
+    }
+
+    // Write-side twins.
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            r#"del(first(recurse(if type=="object" then .[] else error("x") end)))"#,
+        ],
+        Some(r#"{"a":{"b":1}}"#),
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "null\n");
+    assert_eq!(stderr, "");
+
+    Ok(())
+}
+
+/// #972 Guard D: the under-satisfied / must-still-raise trap set — cases a
+/// too-aggressive truncation fix could wrongly silence. All verified
+/// against jq 1.7.1.
+#[test]
+fn test_first_limit_path_undersatisfied_still_raises_972() -> Result<()> {
+    // A bare escape (zero outputs) still propagates.
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", r#"path(first(select((error("x")))))"#], Some("1"))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert!(stderr.contains('x'), "stderr: {stderr:?}");
+
+    // limit(3; ...) over 2 outputs then an error is still under-satisfied.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r#"path(limit(3; select((true,true,error("x")))))"#],
+        Some("1"),
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[]\n[]\n");
+    assert!(stderr.contains('x'), "stderr: {stderr:?}");
+
+    // limit(0; ...) evaluates nothing.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r#"path(limit(0; select((true,error("x")))))"#],
+        Some("1"),
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(stderr, "");
+
+    Ok(())
+}
+
+/// #972 Guard E: `take_path_branches` drops `Halt` along with `Error`/
+/// `Break` once the consumer is satisfied, matching jq
+/// (`path(first(select((true, ("m"|halt_error(3))))))` is `[]`, exit 0).
+/// The `m` payload still reaches stderr — the resolver underneath is still
+/// eager, so its side effect has already fired by the time the escape is
+/// discarded — that residual leak is #987/#820's territory, not a #972
+/// regression.
+#[test]
+fn test_first_limit_path_drops_a_satisfied_halt_972() -> Result<()> {
+    let (stdout, _stderr, code) = run_jq_full(
+        &["-c", r#"path(first(select((true, ("m"|halt_error(3))))))"#],
+        Some("1"),
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?}");
+    assert_eq!(stdout, "[]\n");
+
+    // An UNDER-satisfied halt still surfaces (this is the trap: it's the
+    // consumer being satisfied that drops it, not the halt kind itself).
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            r#"path(limit(2; select((true,("m"|halt_error(3))))))"#,
+        ],
+        Some("1"),
+    )?;
+    assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[]\n");
+
+    Ok(())
+}
+
 /// #977: `resolve_seq`'s fan-out loop used to return an escaping element's
 /// partial prefix without ever applying a purely-static tail after it (a
 /// literal `.foo`/`[N]`/`[N:M]`, desugared to a flat `Pipe` at parse time —
