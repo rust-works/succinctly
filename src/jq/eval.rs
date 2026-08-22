@@ -495,6 +495,15 @@ pub(crate) fn needs_path_context(expr: &Expr) -> bool {
         Expr::Arithmetic { left, right, .. } => {
             needs_path_context(left) || needs_path_context(right)
         }
+        // Same reasoning as `Compare`/`Arithmetic` above (#1405): a
+        // `key`/`parent`/`file_index` can hide inside either operand of
+        // `and`/`or` too, e.g. `key == "a" and true`. Confirmed live this
+        // gap was previously reachable: `.a | (key == "a" and true)` gave
+        // `false` instead of `true` (`key` alone, outside the `and`,
+        // resolved correctly, isolating the gap to this arm being missing).
+        Expr::And(left, right) | Expr::Or(left, right) => {
+            needs_path_context(left) || needs_path_context(right)
+        }
         // Same reasoning as `Arithmetic` above: a `key`/`file_index` can
         // hide inside unary minus's single operand too, e.g.
         // `-(file_index)` (#1100). Without this arm the whole pipe reports
@@ -2334,6 +2343,66 @@ fn eval_negate_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     )
 }
 
+/// Shared body of `and`/`or` (#1405; extracted from the pre-existing
+/// `eval_boolean`, which had a path-context-tracking twin created for its
+/// own dedicated arm, the same operand-evaluation-strategy split
+/// [`binary_fanout_core`]/[`negate_fanout_core`] already established for
+/// the other operators above -- see [`binary_fanout_core`]'s own doc
+/// comment, which already notes `and`/`or`'s left-outer/right-on-demand
+/// shape is the "opposite nesting" case it doesn't cover, and the general
+/// risk of not extracting this: "two definitions of the same algorithm can
+/// drift, one does not".
+///
+/// Which truth value short-circuits: `false` for `and`, `true` for `or`.
+/// Both are generators, not scalar operators (#160). jq emits one boolean
+/// per (left output, right output) pair, with the left operand as the
+/// outer loop: `(true,false) and (true,false)` yields `true false false`
+/// because the second left output short-circuits. A left output that
+/// short-circuits contributes its boolean without evaluating the right
+/// operand at all, which is what makes `false and error("x")` yield
+/// `false` rather than raising.
+///
+/// The right operand is re-evaluated per left output rather than evaluated
+/// once and reused. That matches jq's backtracking, and it costs nothing
+/// in the common case where the left operand is single-output.
+///
+/// An error or a break in either operand no longer discards `out` (#400,
+/// #494): a left operand that errors after producing some truthy values
+/// (e.g. `(true,error("x")) and false`) still pairs those left values
+/// against the right operand before the error surfaces -- jq emits
+/// `false`, then errors -- so `left`'s own trailing control is held in
+/// `left_control` and only applied once the ordinary per-left-output loop
+/// has run its course. A control from evaluating the right operand for a
+/// given left output instead ends the whole expression immediately,
+/// matching jq's generator not asking for further left outputs once one
+/// pairing has failed. `eval_operand` closes over whichever evaluator
+/// (plain vs. path-context) its caller wants.
+fn boolean_fanout_core<'a, W: Clone + AsRef<[u64]>>(
+    mut eval_operand: impl FnMut(&Expr) -> QueryResult<'a, W>,
+    left: &Expr,
+    right: &Expr,
+    short_circuit: bool,
+) -> QueryResult<'a, W> {
+    let mut left_bools = Vec::new();
+    let left_control = push_truthiness(eval_operand(left), &mut left_bools);
+
+    let mut out = Vec::with_capacity(left_bools.len());
+    for left_bool in left_bools {
+        if left_bool == short_circuit {
+            out.push(short_circuit);
+            continue;
+        }
+        if let Some(control) = push_truthiness(eval_operand(right), &mut out) {
+            return partial(out.into_iter().map(OwnedValue::Bool).collect(), control);
+        }
+    }
+
+    match left_control {
+        Some(control) => partial(out.into_iter().map(OwnedValue::Bool).collect(), control),
+        None => bools_to_result(out),
+    }
+}
+
 fn eval_binary_fanout<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     left: &Expr,
     right: &Expr,
@@ -3218,28 +3287,8 @@ fn eval_or<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 }
 
 /// Shared body of `and` and `or`, which differ only in which truth value
-/// short-circuits: `false` for `and`, `true` for `or`.
-///
-/// Both are generators, not scalar operators (#160). jq emits one boolean per
-/// (left output, right output) pair, with the left operand as the outer loop:
-/// `(true,false) and (true,false)` yields `true false false` because the second
-/// left output short-circuits. A left output that short-circuits contributes
-/// its boolean without evaluating the right operand at all, which is what makes
-/// `false and error("x")` yield `false` rather than raising.
-///
-/// The right operand is re-evaluated per left output rather than evaluated once
-/// and reused. That matches jq's backtracking, and it costs nothing in the
-/// common case where the left operand is single-output.
-///
-/// An error or a break in either operand no longer discards `out` (#400,
-/// #494): a left operand that errors after producing some truthy values
-/// (e.g. `(true,error("x")) and false`) still pairs those left values against
-/// the right operand before the error surfaces — jq emits `false`, then
-/// errors — so `left`'s own trailing control is held in `left_control` and
-/// only applied once the ordinary per-left-output loop has run its course. A
-/// control from evaluating the right operand for a given left output instead
-/// ends the whole expression immediately, matching jq's generator not asking
-/// for further left outputs once one pairing has failed.
+/// short-circuits: `false` for `and`, `true` for `or`. See
+/// [`boolean_fanout_core`] for the full behavior this delegates to.
 fn eval_boolean<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     left: &Expr,
     right: &Expr,
@@ -3247,30 +3296,12 @@ fn eval_boolean<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     optional: bool,
     short_circuit: bool,
 ) -> QueryResult<'a, W> {
-    let mut left_bools = Vec::new();
-    let left_control = push_truthiness(
-        eval_single::<W, S>(left, value.clone(), optional),
-        &mut left_bools,
-    );
-
-    let mut out = Vec::with_capacity(left_bools.len());
-    for left_bool in left_bools {
-        if left_bool == short_circuit {
-            out.push(short_circuit);
-            continue;
-        }
-        if let Some(control) = push_truthiness(
-            eval_single::<W, S>(right, value.clone(), optional),
-            &mut out,
-        ) {
-            return partial(out.into_iter().map(OwnedValue::Bool).collect(), control);
-        }
-    }
-
-    match left_control {
-        Some(control) => partial(out.into_iter().map(OwnedValue::Bool).collect(), control),
-        None => bools_to_result(out),
-    }
+    boolean_fanout_core(
+        move |expr| eval_single::<W, S>(expr, value.clone(), optional),
+        left,
+        right,
+        short_circuit,
+    )
 }
 
 /// Evaluate boolean NOT.
@@ -21749,6 +21780,48 @@ fn build_string_parts_with_context<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     }
 }
 
+/// Path-context analog of `eval_boolean` (#1405): evaluate `left and right`
+/// (`short_circuit = false`) or `left or right` (`short_circuit = true`),
+/// routed through `eval_pipe_with_path_context_internal` instead of
+/// `eval_single` so `key`/`parent`/`file_index` nested in either operand
+/// still resolve against `root`/`current_path`/`file_origin`. Unlike
+/// [`eval_binary_fanout_with_path_context`] (used for `Arithmetic`/
+/// `Compare`, which always evaluate both operands), `and`/`or` are
+/// short-circuiting generators -- delegates to the same
+/// [`boolean_fanout_core`] `eval_boolean` itself uses (left-outer loop,
+/// per-left-output short-circuit test, right evaluated only on demand),
+/// with the operand-evaluation closure swapped for the path-context
+/// evaluator, matching [`eval_binary_fanout_with_path_context`]'s own
+/// relationship to `eval_binary_fanout`/[`binary_fanout_core`].
+#[allow(clippy::too_many_arguments)] // STYLE-0004: see eval_binary_fanout_with_path_context's
+                                     // own justification just above -- same established pattern.
+fn eval_boolean_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    left: &Expr,
+    right: &Expr,
+    value: &OwnedValue,
+    root: &OwnedValue,
+    file_origin: Option<&[usize]>,
+    current_path: &[OwnedValue],
+    optional: bool,
+    short_circuit: bool,
+) -> QueryResult<'a, W> {
+    boolean_fanout_core(
+        |expr| {
+            eval_pipe_with_path_context_internal::<W, S>(
+                core::slice::from_ref(expr),
+                value,
+                root,
+                file_origin,
+                current_path,
+                optional,
+            )
+        },
+        left,
+        right,
+        short_circuit,
+    )
+}
+
 /// Internal helper that also tracks the root value for parent navigation,
 /// and (for `--eval-all`, #715) an optional origin-file-index side table
 /// keyed by top-level array position, resolving `file_index`/`fileIndex`/`fi`.
@@ -22230,6 +22303,39 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
             // `ManyOwned`/`Partial`/`Break`, not just `Owned`/`None`/`Error`.
             continue_rest_with_context::<W, S>(
                 arith_result,
+                rest,
+                root,
+                file_origin,
+                current_path,
+                optional,
+            )
+        }
+        Expr::And(left, right) | Expr::Or(left, right) => {
+            // Same `key`/`parent`/`file_index`-inside-an-operand reasoning
+            // as `Arithmetic`/`Compare` (#1405) -- `key == "a" and true`
+            // previously evaluated both operands through `eval_single`
+            // (via `needs_path_context` not recursing into this arm at
+            // all), so `key` silently stubbed instead of resolving.
+            // `Expr::And`/`Expr::Or` share this arm (matching `matches!`
+            // to distinguish them below): both are the same short-
+            // circuiting shape, just with the short-circuit value flipped.
+            let bool_result = eval_boolean_with_path_context::<W, S>(
+                left,
+                right,
+                value,
+                root,
+                file_origin,
+                current_path,
+                optional,
+                matches!(first, Expr::Or(_, _)),
+            );
+            if rest.is_empty() {
+                return bool_result;
+            }
+            // Preserve root/current_path, same as `Arithmetic` above -- a
+            // boolean result isn't itself a navigable position.
+            continue_rest_with_context::<W, S>(
+                bool_result,
                 rest,
                 root,
                 file_origin,
@@ -48969,6 +49075,80 @@ mod tests {
             QueryResult::Error(e) => assert_eq!(e.message, "boom"),
             other => panic!("expected Error, got {other:?}"),
         }
+    }
+
+    /// #1405: `key`/`parent`/`file_index` nested inside `and`/`or` now
+    /// resolves instead of silently stubbing -- `needs_path_context` had
+    /// no `Expr::And`/`Expr::Or` arm, so the whole pipe never routed
+    /// through the path-context evaluator at all.
+    #[test]
+    fn test_and_or_operand_resolves_key_with_path_context_1405() {
+        assert_eq!(
+            outputs(br#"{"a":1}"#, r#".a | (key == "a" and true)"#),
+            vec!["true"]
+        );
+        assert_eq!(
+            outputs(br#"{"a":1}"#, r#".a | (key == "z" or key == "a")"#),
+            vec!["true"]
+        );
+    }
+
+    /// #1405: `and`/`or`'s existing right-operand-on-demand short-circuit
+    /// contract (already established for the plain evaluator's own
+    /// `eval_boolean`) must hold for the new path-context arm too --
+    /// `false and error(...)`/`true or error(...)` must not evaluate the
+    /// right operand at all, even though this pipe now routes through
+    /// `eval_pipe_with_path_context_internal` (because `key` needs it).
+    #[test]
+    fn test_and_or_short_circuit_still_skips_right_operand_with_path_context_1405() {
+        assert_eq!(
+            outputs(
+                br#"{"a":1}"#,
+                r#".a | (key == "z" and error("should not run"))"#
+            ),
+            vec!["false"]
+        );
+        assert_eq!(
+            outputs(
+                br#"{"a":1}"#,
+                r#".a | (key == "a" or error("should not run"))"#
+            ),
+            vec!["true"]
+        );
+    }
+
+    /// #1405: `file_index` inside `and`, exercised through the same
+    /// `eval_all_outputs`/multi-output-fanout harness the sibling
+    /// `Arithmetic`/`Compare` path-context tests (#822) use, confirming
+    /// the new arm's left-outer fanout composes correctly with
+    /// `--eval-all`'s own file-origin tracking, not just `key`'s simpler
+    /// `current_path`-only case above.
+    #[test]
+    fn test_and_multi_output_left_operand_fans_out_with_path_context_1405() {
+        assert_eq!(
+            eval_all_outputs(b"[10]", &[0], ".[] | (((1,2,3) > 1) and true), file_index"),
+            vec!["false", "true", "true", "0"]
+        );
+    }
+
+    /// #1405: this is the actual root cause behind #1335's own repro
+    /// (`(key == "a" and error("boom"))?` gave `false` instead of
+    /// suppressing to empty) -- `key` stubbing inside `and` silently
+    /// produced a false comparison instead of ever reaching the error, so
+    /// `eval_pipe_with_path_context_internal`'s `Expr::Optional` arm was
+    /// never even involved. With the gap fixed, the error genuinely fires
+    /// and `?` correctly suppresses it to empty output, not `false`.
+    #[test]
+    fn test_and_operand_error_suppressed_by_optional_with_path_context_1405() {
+        assert_eq!(
+            outputs(br#"{"a":1}"#, r#".a | (key == "a" and error("boom"))?"#),
+            Vec::<String>::new()
+        );
+        query!(br#"{"a":1}"#, r#".a | (key == "a" and error("boom"))"#,
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "boom");
+            }
+        );
     }
 
     #[test]

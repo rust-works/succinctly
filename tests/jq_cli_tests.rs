@@ -5677,12 +5677,15 @@ fn test_func_def_key_comma_sibling_independence_is_not_a_bug_1306() -> Result<()
 ///    `.a | (1)? | error("boom")`).
 ///
 /// #1335's own posted repro (`(key == "a" and error("boom"))?`) turned out
-/// not to exercise this arm at all -- `needs_path_context` doesn't recurse
-/// into `Expr::And`/`Expr::Or` (filed separately as #1405), so that whole
-/// expression routes through the plain evaluator instead, where `key`
-/// silently stubs. These tests instead use constructs `needs_path_context`
-/// already recurses into (`Comma`, `Compare`, `Label`/`break`) to actually
-/// exercise the fixed code path.
+/// not to exercise this arm at all when this fix landed -- `needs_path_context`
+/// didn't recurse into `Expr::And`/`Expr::Or` yet at the time (fixed
+/// separately by #1405), so that whole expression routed through the plain
+/// evaluator instead, where `key` silently stubbed. These tests instead use
+/// constructs `needs_path_context` already recursed into at the time
+/// (`Comma`, `Compare`, `Label`/`break`) to actually exercise the fixed
+/// code path; #1405's own repro is covered directly by
+/// `test_and_operand_error_suppressed_by_optional_with_path_context_1405`
+/// (`src/jq/eval.rs`) now that the gap is closed.
 #[test]
 fn test_optional_dispatch_catches_atomically_not_broadcast_1335() -> Result<()> {
     // The rest-leak: an error *after* the `?` must not be swallowed by it.
@@ -5727,6 +5730,47 @@ fn test_optional_dispatch_catches_atomically_not_broadcast_1335() -> Result<()> 
     let (stdout, _, code) = run_jq_full(&["-c", ".a | ((key)?)?"], Some(r#"{"a":1}"#))?;
     assert_eq!(code, 0);
     assert_eq!(stdout.trim(), "\"a\"");
+
+    Ok(())
+}
+
+/// #1405: `needs_path_context` didn't recurse into `Expr::And`/`Expr::Or`,
+/// so `key`/`parent`/`file_index` nested inside `and`/`or` silently stubbed
+/// instead of resolving -- the whole expression never routed through
+/// `eval_pipe_with_path_context_internal` at all. `key` alone (outside the
+/// `and`) resolving correctly is what isolates this to `and`/`or`
+/// specifically, not `key` itself. This is also the actual root cause
+/// behind #1335's own posted repro, noted in that test's own doc comment
+/// above.
+#[test]
+fn test_and_or_operand_resolves_path_context_builtins_1405() -> Result<()> {
+    let (stdout, _, code) =
+        run_jq_full(&["-c", ".a | (key == \"a\" and true)"], Some(r#"{"a":1}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "true");
+
+    let (stdout, _, code) = run_jq_full(
+        &["-c", ".a | (key == \"z\" or key == \"a\")"],
+        Some(r#"{"a":1}"#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "true");
+
+    // Sanity: `key` alone still resolves correctly, isolating the gap to
+    // `and`/`or` specifically.
+    let (stdout, _, code) = run_jq_full(&["-c", ".a | key"], Some(r#"{"a":1}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "\"a\"");
+
+    // #1335's own repro: the error now genuinely fires (since `key`
+    // resolves instead of stubbing to a false comparison), and `?`
+    // correctly suppresses it to empty output, not `false`.
+    let (stdout, _, code) = run_jq_full(
+        &["-c", ".a | (key == \"a\" and error(\"boom\"))?"],
+        Some(r#"{"a":1}"#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "");
 
     Ok(())
 }
