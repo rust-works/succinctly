@@ -218,19 +218,48 @@ Pulling the other way: [#442](https://github.com/rust-works/succinctly/issues/44
 deliberately made output *preserve* duplicate keys. They stand for yq mode; ADR-0018 rules 2
 and 3 revise them for jq mode only.
 
-### 3-argument `sub(re; s; flags)`
+### 3-argument `sub(re; s; flags)`, and a `split(re; flags)` sibling mystery
 
 The bare 2-arg form matches (see the next section). The 3-arg form does not, and real yq's
 own behaviour here has resisted every hypothesis tried
 ([#1122](https://github.com/rust-works/succinctly/issues/1122)) — it returns an empty string
 for a `"g"` flag and ignores `"i"` entirely, and its `gsub` does not accept a third argument
-at all:
+at all — indeed does not exist as a builtin at all, along with `scan`/`splits`
+([#1436](https://github.com/rust-works/succinctly/issues/1436), found during #1426's own
+investigation below):
 
 | Filter on `"aaa"` | real yq | succinctly |
 |---|---|---|
 | `sub("a";"X";"g")` | `""` | `"XXX"` |
 | `sub("A";"X";"i")` | `"aaa"` | `"Xaa"` |
 | `gsub("a";"X";"g")` | `Error: 1:1: lexer: invalid input text` | `"XXX"` |
+
+`split`'s 2-arg `split(re; flags)` form has an unrelated, equally unexplained mystery of its
+own ([#1439](https://github.com/rust-works/succinctly/issues/1439)) — it doesn't do a regex
+split at all:
+
+```bash
+$ echo '"a1b2c"' | yq            -o=json 'split("[0-9]";"g")'   # ["a","1","b","2","c"]
+$ echo '"a1b2c"' | succinctly yq -o=json 'split("[0-9]";"g")'   # ["a","b","c"] -- jq-modeled regex split
+```
+
+### Regex flag grammar — `test`/`match`/`capture` fixed, three siblings still open
+
+**Fixed by [#1426](https://github.com/rust-works/succinctly/issues/1426):** real yq doesn't
+use jq's flag grammar at all for `test`/`match`/`capture` — only `g` is a real flag; every
+other jq-style character (`i`/`x`/`s`/`m`/`n`/`l`/`p`, including `l`/`n`, ADR-0019's own
+permanent *jq*-mode gaps) is rejected, with `i` getting a distinct message pointing at yq's
+inline-pattern alternative:
+
+```bash
+$ echo '"abc"' | yq            -o=json 'test("abc";"l")'   # Error: unrecognised match params 'l', ...
+$ echo '"abc"' | succinctly yq -o=json 'test("abc";"l")'   # was: true (silently accepted); now: the same error
+```
+
+Deliberately **not** extended to `sub`/`split` (see the mysteries just above — applying this
+rule there without first understanding their actual argument semantics would be a new,
+unverified guess) or to `gsub`/`scan`/`splits` (not real yq builtins at all, per #1436 —
+flag validation is moot for a call real yq would reject before ever reaching it).
 
 ### Presentation metadata lost on two whole output routes
 
