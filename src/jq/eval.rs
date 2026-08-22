@@ -7084,6 +7084,115 @@ fn format_base64d<S: EvalSemantics>(
         s.as_str()
     };
 
+    // Decode 2, 3, or 4 already-decoded 6-bit values into 1, 2, or 3 output
+    // bytes. Shared by yq's own strict decoder below; jq's loop further down
+    // keeps its own separate, unmodified copy of this same math rather than
+    // calling this helper, since #1135's plan is explicit that the
+    // already-oracle-hardened jq path (#1120/#1146) must not move.
+    fn push_decoded_group(result: &mut Vec<u8>, vals: &[u8]) {
+        match vals.len() {
+            4 => {
+                let triple = ((vals[0] as u32) << 18)
+                    | ((vals[1] as u32) << 12)
+                    | ((vals[2] as u32) << 6)
+                    | (vals[3] as u32);
+                result.push(((triple >> 16) & 0xFF) as u8);
+                result.push(((triple >> 8) & 0xFF) as u8);
+                result.push((triple & 0xFF) as u8);
+            }
+            3 => {
+                let value = ((vals[0] as u32) << 12) | ((vals[1] as u32) << 6) | (vals[2] as u32);
+                result.push(((value >> 10) & 0xFF) as u8);
+                result.push(((value >> 2) & 0xFF) as u8);
+            }
+            2 => {
+                let value = ((vals[0] as u32) << 6) | (vals[1] as u32);
+                result.push(((value >> 4) & 0xFF) as u8);
+            }
+            _ => unreachable!("callers only ever pass 2, 3, or 4 decoded values"),
+        }
+    }
+
+    // yq mode (#1135): validate padding placement in place instead of jq's
+    // truncate-at-first-`=` model below. Confirmed live against yq v4.53.3:
+    // real yq processes the input (already whitespace-trimmed above) in
+    // strict 4-character quanta over the base64 alphabet, where `=` is
+    // legal only within the *final* quantum -- as its 3rd character (with
+    // the 4th then required to be `=` or simply the end of input) or its
+    // 4th character -- and any other placement (a leading `=`, `=` in a
+    // non-final quantum, or real content after a complete padded quantum)
+    // is rejected outright, unlike jq's lenient truncate-and-ignore-the-rest
+    // model. This issue originally described a "CR/LF skipped anywhere"
+    // rule too, but that turned out (on closer live verification) to be
+    // nothing more than this function's own yq-mode `.trim()` step above
+    // already stripping a *leading or trailing* run of whitespace before
+    // this code ever runs -- a `\n` genuinely embedded between real
+    // characters is rejected here like any other invalid byte, matching
+    // the oracle (`"Q\nQ==" | @base64d` errors in real yq even though the
+    // same characters minus the `\n` decode cleanly). Exact byte offsets in
+    // the emitted error deliberately don't chase Go's own streaming-decoder
+    // accounting (per this issue's own recommendation) -- only the
+    // accept/reject verdict and any decoded bytes need to match.
+    if S::TAG == EvalTag::Yq {
+        let bytes = trimmed.as_bytes();
+        let chunks: Vec<&[u8]> = bytes.chunks(4).collect();
+        let last_chunk_index = chunks.len().checked_sub(1);
+        let mut result = Vec::new();
+
+        for (chunk_index, chunk) in chunks.into_iter().enumerate() {
+            let chunk_start = chunk_index * 4;
+            let is_last = Some(chunk_index) == last_chunk_index;
+            let eq_pos = chunk.iter().position(|&b| b == b'=');
+
+            let real_len = match eq_pos {
+                None => chunk.len(),
+                Some(pos) => {
+                    if !is_last {
+                        return Err(EvalError::base64_illegal_data(chunk_start + pos));
+                    }
+                    if pos < 2 {
+                        // A leading `=` (1st or 2nd position) has too few
+                        // real characters before it to pair with.
+                        return Err(EvalError::base64_illegal_data(chunk_start + pos));
+                    }
+                    if pos == 2 && chunk.len() == 4 && chunk[3] != b'=' {
+                        // 3rd-position `=` requires the 4th to also be `=`
+                        // (or simply be absent -- the string ends at 3
+                        // characters).
+                        return Err(EvalError::base64_illegal_data(chunk_start + 3));
+                    }
+                    pos
+                }
+            };
+
+            if real_len == 1 {
+                // A lone trailing character is either genuinely too short
+                // (a valid base64 character with nothing left to pair it
+                // with -- position one past it, confirmed live: `"a"` ->
+                // byte 1, `"false"` -> byte 5) or itself an invalid
+                // character (position at it, not past it: `"abcd!"` ->
+                // byte 4, not 5) -- the same distinction jq mode's own
+                // trailing-remainder arm below already makes (#1146).
+                return Err(if decode_char(chunk[0]).is_some() {
+                    EvalError::base64_illegal_data(chunk_start + real_len)
+                } else {
+                    EvalError::base64_illegal_data(chunk_start)
+                });
+            }
+
+            let mut vals: Vec<u8> = Vec::with_capacity(real_len);
+            for (i, &b) in chunk[..real_len].iter().enumerate() {
+                vals.push(
+                    decode_char(b)
+                        .ok_or_else(|| EvalError::base64_illegal_data(chunk_start + i))?,
+                );
+            }
+            push_decoded_group(&mut result, &vals);
+        }
+
+        return Ok(owned_string_from_decoded_bytes(result));
+    }
+
     // Real jq truncates at the *first* `=` in the (whitespace-
     // trimmed) input, discarding it and everything after it --
     // not just within its own 4-character group, as an earlier
@@ -7121,19 +7230,12 @@ fn format_base64d<S: EvalSemantics>(
     // construction (it's already been truncated above), so none of
     // these arms need to special-case it the way the very first
     // version of this fix's 4-char arm alone used to.
-    // Mode-specific error wording (#1146): jq splits invalid-character vs
-    // too-short-trailing-group into two distinct messages
-    // (`base64_invalid_data`/`base64_trailing_byte`); yq uses one uniform,
-    // byte-position-based message (`base64_illegal_data`) for both. `pos`
-    // is this byte's own index within `trimmed` (`chunk_start + offset`),
-    // confirmed live to be the exact failing byte, not the chunk start.
-    let char_error = |pos: usize| -> EvalError {
-        if S::TAG == EvalTag::Yq {
-            EvalError::base64_illegal_data(pos)
-        } else {
-            EvalError::base64_invalid_data(value)
-        }
-    };
+    // jq-only from here down: yq mode already returned above (#1135), so
+    // this closure and the loop below it need only jq's own wording
+    // (`base64_invalid_data`/`base64_trailing_byte`, #1146) -- yq's
+    // uniform, byte-position-based `base64_illegal_data` lives entirely in
+    // the strict decoder above now.
+    let char_error = |_pos: usize| -> EvalError { EvalError::base64_invalid_data(value) };
 
     for (chunk_index, chunk) in prefix.chunks(4).enumerate() {
         let chunk_start = chunk_index * 4;
@@ -7168,22 +7270,16 @@ fn format_base64d<S: EvalSemantics>(
             _ => {
                 // A lone trailing byte is either genuinely too short (a
                 // valid base64 character with nothing left to pair it
-                // with) or itself an invalid character -- these are
-                // different failures in both oracles, live-verified:
-                // `"abcd!" | @base64d` is jq's "is not valid base64
-                // data" (not "trailing base64 byte found") and yq's
-                // "byte 4" (the '!' itself, not `prefix.len()` == 5).
+                // with) or itself an invalid character -- different jq
+                // wordings, live-verified: `"abcd!" | @base64d` is "is not
+                // valid base64 data" (not "trailing base64 byte found").
                 // Checking the byte's own validity first, rather than
                 // assuming every 1-length remainder is the "too short"
                 // case, keeps this arm's error selection consistent with
                 // the 2/3/4-length arms above, which already validate
                 // every byte before deciding anything.
                 return Err(if decode_char(chunk[0]).is_some() {
-                    if S::TAG == EvalTag::Yq {
-                        EvalError::base64_illegal_data(prefix.len())
-                    } else {
-                        EvalError::base64_trailing_byte(value)
-                    }
+                    EvalError::base64_trailing_byte(value)
                 } else {
                     char_error(chunk_start)
                 });
